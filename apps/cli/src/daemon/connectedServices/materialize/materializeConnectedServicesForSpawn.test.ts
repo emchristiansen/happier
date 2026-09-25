@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, symlink, writeFile } from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -1048,6 +1048,87 @@ describe('materializeConnectedServicesForSpawn', () => {
     expect('CLAUDE_CODE_SETUP_TOKEN' in result!.env).toBe(false);
     expect('CLAUDE_CODE_OAUTH_TOKEN' in result!.env).toBe(false);
     expect('ANTHROPIC_API_KEY' in result!.env).toBe(false);
+  });
+
+  it('links the native global CLAUDE.md into the Claude subscription config root across re-materialization', async () => {
+    const baseDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-test-'));
+    const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-server-test-'));
+    const sourceClaudeConfigDir = await mkdtemp(join(tmpdir(), 'happier-source-claude-config-test-'));
+    const canonicalGuidanceDir = await mkdtemp(join(tmpdir(), 'happier-canonical-guidance-test-'));
+    const canonicalGuidancePath = join(canonicalGuidanceDir, 'CLAUDE.md');
+    const nativeGuidancePath = join(sourceClaudeConfigDir, 'CLAUDE.md');
+    await writeFile(canonicalGuidancePath, '# Global guidance\n');
+    // Declaratively managed homes (e.g. home-manager) expose the native file as a symlink to a canonical store file.
+    await symlink(canonicalGuidancePath, nativeGuidancePath);
+    await writeFile(join(sourceClaudeConfigDir, 'settings.json'), '{"theme":"dark"}\n');
+    const buildOauthRecord = (now: number, accessToken: string) => buildConnectedServiceCredentialRecord({
+      now,
+      serviceId: 'claude-subscription',
+      profileId: 'work',
+      kind: 'oauth',
+      expiresAt: 123,
+      oauth: {
+        accessToken,
+        refreshToken: 'claude-refresh',
+        idToken: null,
+        scope: CLAUDE_SUBSCRIPTION_OAUTH_SCOPE,
+        tokenType: 'Bearer',
+        providerAccountId: 'acct',
+        providerEmail: 'user@example.com',
+      },
+    });
+    const materialize = async (materializationKey: string, now: number, accessToken: string) => {
+      const result = await materializeConnectedServicesForSpawn({
+        agentId: 'claude',
+        materializationKey,
+        activeServerDir,
+        baseDir,
+        recordsByServiceId: new Map([['claude-subscription', buildOauthRecord(now, accessToken)]]),
+        accountSettings: {
+          connectedServicesProviderStateSharingSettingsV1: {
+            v: 1,
+            defaults: {
+              configMode: 'linked',
+              stateMode: 'isolated',
+            },
+            byAgentId: {},
+            acknowledgedRisksByAgentId: {},
+          },
+        },
+        processEnv: {
+          HOME: tmpdir(),
+          CLAUDE_CONFIG_DIR: sourceClaudeConfigDir,
+        },
+      });
+      expect(result).not.toBeNull();
+      return result!.env.CLAUDE_CONFIG_DIR!;
+    };
+    const expectLinkedGlobalGuidance = async (claudeConfigDir: string) => {
+      const guidancePath = join(claudeConfigDir, 'CLAUDE.md');
+      // A copy would be a second file identity next to the ambient one and Claude Code would load it twice.
+      expect((await lstat(guidancePath)).isSymbolicLink()).toBe(true);
+      await expect(readlink(guidancePath)).resolves.toBe(nativeGuidancePath);
+      await expect(readFile(guidancePath, 'utf8')).resolves.toBe('# Global guidance\n');
+      expect((await readdir(claudeConfigDir)).filter((name) => name.startsWith('CLAUDE.md'))).toEqual(['CLAUDE.md']);
+    };
+
+    const firstConfigDir = await materialize('session-guidance-1', 10, 'claude-access');
+    await expectLinkedGlobalGuidance(firstConfigDir);
+
+    const secondConfigDir = await materialize('session-guidance-2', 10, 'claude-access');
+    expect(secondConfigDir).toBe(firstConfigDir);
+    await expectLinkedGlobalGuidance(secondConfigDir);
+
+    // A new credential forces the staged rebuild that replaces the whole config root.
+    await writeFile(join(secondConfigDir, 'pre-rebuild-marker'), 'dropped by the staged rebuild\n');
+    const rebuiltConfigDir = await materialize('session-guidance-3', 20, 'claude-access-rotated');
+    expect(rebuiltConfigDir).toBe(firstConfigDir);
+    await expect(lstat(join(rebuiltConfigDir, 'pre-rebuild-marker'))).rejects.toThrow();
+    await expectLinkedGlobalGuidance(rebuiltConfigDir);
+
+    // Replacing the link must never remove or rewrite the native or canonical guidance it points at.
+    expect((await lstat(nativeGuidancePath)).isSymbolicLink()).toBe(true);
+    await expect(readFile(canonicalGuidancePath, 'utf8')).resolves.toBe('# Global guidance\n');
   });
 
   it('refreshes caller-supplied Claude OAuth records before materializing a native home', async () => {
