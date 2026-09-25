@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, symlink, utimes, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -164,5 +164,71 @@ describe('syncClaudeConnectedServiceHome candidate session import reconciliation
     const manifest = await readConnectedServiceStateSharingManifest(targetDir);
     const mapping = manifest.sessionFileMappings.find((item) => item.vendorResumeId === VENDOR_RESUME_ID);
     expect(mapping?.destinationPath).toBe(canonicalPath);
+  });
+});
+
+describe('syncClaudeConnectedServiceHome global guidance', () => {
+  async function makeGuidanceFixture(): Promise<Readonly<{
+    homeDir: string;
+    sourceDir: string;
+    targetDir: string;
+    workspaceDir: string;
+  }>> {
+    const homeDir = await mkdtemp(join(tmpdir(), 'happier-claude-sync-home-'));
+    const sourceDir = await mkdtemp(join(tmpdir(), 'happier-claude-sync-source-'));
+    const targetDir = await mkdtemp(join(tmpdir(), 'happier-claude-sync-target-'));
+    const workspaceDir = await mkdtemp(join(tmpdir(), 'happier-claude-sync-workspace-'));
+    await writeFile(join(sourceDir, 'settings.json'), '{"theme":"dark"}\n');
+    await writeFile(join(workspaceDir, 'CLAUDE.md'), '# Workspace guidance\n');
+    await mkdir(join(workspaceDir, '.claude'), { recursive: true });
+    await writeFile(join(workspaceDir, '.claude', 'CLAUDE.md'), '# Workspace dot-claude guidance\n');
+    return { homeDir, sourceDir, targetDir, workspaceDir };
+  }
+
+  it('links the native CLAUDE.md while other config entries stay copied, and never materializes workspace guidance', async () => {
+    const { homeDir, sourceDir, targetDir, workspaceDir } = await makeGuidanceFixture();
+    await writeFile(join(sourceDir, 'CLAUDE.md'), '# Global guidance\n');
+
+    await syncClaudeConnectedServiceHome({
+      sourceEnv: { HOME: homeDir, CLAUDE_CONFIG_DIR: sourceDir },
+      targetDir,
+      sessionDirectory: workspaceDir,
+      sharingPolicyOverride: { configMode: 'copied', stateMode: 'isolated' },
+    });
+
+    expect((await lstat(join(targetDir, 'CLAUDE.md'))).isSymbolicLink()).toBe(true);
+    await expect(readlink(join(targetDir, 'CLAUDE.md'))).resolves.toBe(join(sourceDir, 'CLAUDE.md'));
+    await expect(readFile(join(targetDir, 'CLAUDE.md'), 'utf8')).resolves.toBe('# Global guidance\n');
+    expect((await lstat(join(targetDir, 'settings.json'))).isSymbolicLink()).toBe(false);
+    await expect(lstat(join(targetDir, '.claude'))).rejects.toThrow();
+    const manifest = await readConnectedServiceStateSharingManifest(targetDir);
+    expect(manifest.configEntries).toContain('CLAUDE.md');
+  });
+
+  it('materializes no global guidance when config sharing is isolated', async () => {
+    const { homeDir, sourceDir, targetDir, workspaceDir } = await makeGuidanceFixture();
+    await writeFile(join(sourceDir, 'CLAUDE.md'), '# Global guidance\n');
+
+    await syncClaudeConnectedServiceHome({
+      sourceEnv: { HOME: homeDir, CLAUDE_CONFIG_DIR: sourceDir },
+      targetDir,
+      sessionDirectory: workspaceDir,
+      sharingPolicyOverride: { configMode: 'isolated', stateMode: 'isolated' },
+    });
+
+    await expect(lstat(join(targetDir, 'CLAUDE.md'))).rejects.toThrow();
+  });
+
+  it('creates no dangling guidance link when the native config dir has no CLAUDE.md', async () => {
+    const { homeDir, sourceDir, targetDir, workspaceDir } = await makeGuidanceFixture();
+
+    await syncClaudeConnectedServiceHome({
+      sourceEnv: { HOME: homeDir, CLAUDE_CONFIG_DIR: sourceDir },
+      targetDir,
+      sessionDirectory: workspaceDir,
+      sharingPolicyOverride: { configMode: 'copied', stateMode: 'isolated' },
+    });
+
+    await expect(lstat(join(targetDir, 'CLAUDE.md'))).rejects.toThrow();
   });
 });

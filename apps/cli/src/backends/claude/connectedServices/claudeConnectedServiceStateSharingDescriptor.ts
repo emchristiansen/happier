@@ -15,6 +15,9 @@ export const claudeConnectedServiceStateSharingDescriptor = {
       { path: 'plugins', mode: 'linked_or_copied' },
       { path: 'rules', mode: 'linked_or_copied' },
       { path: 'skills', mode: 'linked_or_copied' },
+      // Global user memory. Always a link, even when config is copied: Claude Code dedupes it against the
+      // walk-up project memory by file identity, so a copy would be delivered twice for sessions under HOME.
+      { path: 'CLAUDE.md', mode: 'linked' },
     ],
   },
   state: {
