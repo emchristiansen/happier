@@ -33,10 +33,11 @@ export type RefreshedAuthRestartRequiredDiagnostic = Readonly<{
  * the event to the descriptor-driven restart handler.
  *
  * A session whose runtime cannot hot-apply the credential (`hot_apply_restart_required`) is left
- * to that restart handler instead of failing the whole event. Throwing here escaped the account
- * changes sync, so its cursor never saved and the daemon retried the same changes every ~2 s for
- * as long as such a session ran. What happens to the skipped session depends on its agent's
- * lifecycle descriptor, exactly as for any other refresh:
+ * to that restart handler instead of failing the whole event. Throwing here broke both callers for
+ * as long as such a session ran: the account changes sync failed before saving its cursor and kept
+ * retrying, and `/session-started` reconciliation (via `handleExternalCredentialUpdate`) answered
+ * 503. What happens to the skipped session depends on its agent's lifecycle descriptor, exactly as
+ * for any other refresh:
  * - Claude on `claude-subscription` needs no restart by design: its runners re-read the refreshed
  *   `.credentials.json` the daemon writes, and the descriptor exempts that service.
  * - Agents whose descriptor requires a restart get the handler's gated restart at a turn boundary.
