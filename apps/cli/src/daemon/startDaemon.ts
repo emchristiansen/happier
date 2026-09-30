@@ -275,6 +275,7 @@ import { prepareConnectedServiceAuthGroupCandidateForSwitch } from './connectedS
 import { ConnectedServiceAuthGroupQuotaProbeIncompleteError } from './connectedServices/accountGroups/switching/ConnectedServiceAuthGroupSwitchCoordinator';
 import { createConnectedServiceGroupMutationCurrentnessValidator } from './connectedServices/credentials/createConnectedServiceGroupMutationCurrentnessValidator';
 import { createConnectedServicesAuthUpdatedRestartHandler } from './connectedServices/refresh/createConnectedServicesAuthUpdatedRestartHandler';
+import { createRefreshedConnectedServiceAuthUpdatedHandler } from './connectedServices/refresh/createRefreshedConnectedServiceAuthUpdatedHandler';
 import {
   ConnectedServiceQuotasCoordinator,
   DEFAULT_CONNECTED_SERVICE_QUOTA_FETCH_TIMEOUT_MS,
@@ -7258,54 +7259,16 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       });
       const onAuthUpdated: NonNullable<
         ConstructorParameters<typeof ConnectedServiceRefreshCoordinator>[0]['onAuthUpdated']
-      > = async (event) => {
-        if (event.mutation === 'deleted') {
-          await restartAfterAuthUpdated(event);
-          return { appliedRuntimeIdentityKeys: new Set<string>() };
-        }
-
-        const appliedSessionIds = new Set<string>();
-        const appliedRuntimeIdentityKeys = new Set<string>();
-        for (const target of event.affectedTargets) {
-          const sessionId = String(target.sessionId ?? '').trim();
-          if (!sessionId || appliedSessionIds.has(sessionId)) continue;
-          const selection = target.selectionsByServiceId.get(event.binding.serviceId);
-          if (!selection) continue;
-          const activeProfileId = selection.kind === 'profile'
-            ? selection.profileId
-            : selection.activeProfileId;
-          if (activeProfileId !== event.binding.profileId) continue;
-
-          const result = await applyRefreshedConnectedServiceAuth({
-            sessionId,
-            serviceId: event.binding.serviceId,
-            groupId: selection.kind === 'group' ? selection.groupId : null,
-            activeProfileId,
-            generation: selection.kind === 'group' ? selection.generation : null,
-            credentialRevision: event.credentialRevision,
-            reason: event.trigger,
-            switchReason: 'automatic_runtime_failure',
-            fromProfileId: activeProfileId,
-          });
-          if (!result.ok) {
-            if (result.errorCode === 'restart_disallowed_by_execution_policy') continue;
-            throw new Error(`connected_service_refreshed_auth_application_failed:${result.errorCode ?? 'unknown'}`);
-          }
-          if (result.action !== 'hot_applied') continue;
-          appliedSessionIds.add(sessionId);
-          for (const affectedTarget of event.affectedTargets) {
-            if (
-              affectedTarget.sessionId === sessionId
-              && affectedTarget.pid === target.pid
-            ) {
-              appliedRuntimeIdentityKeys.add(affectedTarget.runtimeIdentityKey);
-            }
-          }
-        }
-
-        await restartAfterAuthUpdated(event);
-        return { appliedRuntimeIdentityKeys };
-      };
+      > = createRefreshedConnectedServiceAuthUpdatedHandler({
+        applyRefreshedAuth: applyRefreshedConnectedServiceAuth,
+        restartAfterAuthUpdated,
+        onRestartRequired: (diagnostic) => {
+          logger.warn(
+            '[DAEMON RUN] Refreshed connected-service credential could not be hot-applied; left to the lifecycle restart policy',
+            diagnostic,
+          );
+        },
+      });
       const refreshStartup = startConnectedServiceRefreshStartup({
         env: process.env,
         api,
