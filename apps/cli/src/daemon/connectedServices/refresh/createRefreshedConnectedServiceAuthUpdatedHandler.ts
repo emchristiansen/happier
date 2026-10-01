@@ -44,7 +44,8 @@ export type RefreshedAuthRestartRequiredDiagnostic = Readonly<{
  * - Codex (mode `hot_apply`), and OpenCode and Pi for the services their descriptors exempt, are
  *   NOT restarted: such a session keeps its previous credential. That was already so when this
  *   threw; it is now reported through `onRestartRequired` instead of looping.
- * Every other failure keeps its previous behaviour and still throws.
+ * Every other result keeps its previous handling: a session skipped under its execution policy
+ * (`restart_disallowed_by_execution_policy`) is still skipped, and any other failure still throws.
  */
 export function createRefreshedConnectedServiceAuthUpdatedHandler(params: Readonly<{
   applyRefreshedAuth: RefreshedConnectedServiceAuthApplication;
