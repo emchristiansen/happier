@@ -46,6 +46,7 @@ export interface SessionProviderInputConsumerSession {
     reason: 'unknown';
   }>) => Promise<boolean>) | undefined;
   waitForPendingEligibilityUpdate: (abortSignal?: AbortSignal) => Promise<boolean>;
+  waitForMetadataUpdate?: ((abortSignal?: AbortSignal) => Promise<boolean>) | undefined;
   readRuntimeActivitySnapshotTail?: (() => RuntimeActivitySnapshotTail) | undefined;
   waitForRuntimeActivitySnapshotTailChange?: ((sequence: number, signal?: AbortSignal) => Promise<boolean>) | undefined;
 }
@@ -279,6 +280,9 @@ export function createSessionProviderInputConsumer<Mode, Message>(
       }
     },
     waitForPendingEligibilityUpdate: (abortSignal) => opts.session.waitForPendingEligibilityUpdate(abortSignal),
+    ...(opts.session.waitForMetadataUpdate
+      ? { waitForMetadataUpdate: (abortSignal?: AbortSignal) => opts.session.waitForMetadataUpdate!(abortSignal) }
+      : {}),
     ...(opts.session.readRuntimeActivitySnapshotTail
       ? { readRuntimeActivitySnapshotTail: () => opts.session.readRuntimeActivitySnapshotTail!() }
       : {}),
@@ -407,6 +411,7 @@ export function createSessionProviderInputConsumer<Mode, Message>(
         providerInputBatchReserved = false;
         const batch = await waitForNextInput({
           ...opts,
+          onMetadataUpdate: waitOpts.onMetadataUpdate === undefined ? opts.onMetadataUpdate : waitOpts.onMetadataUpdate,
           session: admissionTrackedSession,
           abortSignal: waitOpts.abortSignal,
           isProviderInputAdmissionOpen: () => providerInputAdmissionOpen,
@@ -526,6 +531,8 @@ async function waitForNextInput<Mode, Message>(
     const wakePromise = waitForWakeSignal({
       messageQueue: opts.messageQueue,
       waitForPendingEligibilityUpdate: opts.session.waitForPendingEligibilityUpdate,
+      waitForMetadataUpdate: opts.session.waitForMetadataUpdate,
+      onMetadataUpdate: opts.onMetadataUpdate,
       controller,
       metadataWaitRetryBackoffMs,
     }).then((winner) => {
@@ -841,23 +848,47 @@ function logTerminalAuthDrainStop(opts: DrainPendingOptions, status: 401 | 403 |
 async function waitForWakeSignal<Mode, Message>(opts: {
   messageQueue?: MessageQueue2<Mode, Message>;
   waitForPendingEligibilityUpdate: (abortSignal?: AbortSignal) => Promise<boolean>;
+  waitForMetadataUpdate?: ((abortSignal?: AbortSignal) => Promise<boolean>) | undefined;
+  onMetadataUpdate?: ((abortSignal: AbortSignal) => void | Promise<void>) | null | undefined;
   controller: AbortController;
   metadataWaitRetryBackoffMs: number;
 }): Promise<WakeWinner> {
   const queueWait = opts.messageQueue
     ?.waitForMessagesSignal(opts.controller.signal)
     .then((hasMessages) => ({ kind: 'queue' as const, hasMessages }));
+  const waitForControls = () => opts.onMetadataUpdate && opts.waitForMetadataUpdate
+    ? opts.waitForMetadataUpdate(opts.controller.signal).then(
+      (ok) => ({ kind: 'controls' as const, ok }),
+      () => ({ kind: 'controls' as const, ok: false }),
+    )
+    : undefined;
+  let controlsWait = waitForControls();
   try {
     while (true) {
       if (opts.controller.signal.aborted) {
         return { kind: 'meta', ok: false };
       }
 
-      const metaWait = opts.waitForPendingEligibilityUpdate(opts.controller.signal).then(
+      const pendingWait = opts.waitForPendingEligibilityUpdate(opts.controller.signal).then(
         (ok) => ({ kind: 'meta' as const, ok }),
         () => ({ kind: 'meta' as const, ok: false }),
       );
-      const winner = await Promise.race([...(queueWait ? [queueWait] : []), metaWait]);
+      let winner: WakeWinner;
+      while (true) {
+        if (opts.controller.signal.aborted) return { kind: 'meta', ok: false };
+        const next = await Promise.race([
+          ...(queueWait ? [queueWait] : []), pendingWait,
+          ...(controlsWait ? [controlsWait] : []),
+        ]);
+        if (next.kind !== 'controls') {
+          winner = next;
+          break;
+        }
+        // Keep observing before the callback awaits provider I/O. Metadata controls never
+        // settle the Pending wake or authorize another materialization pass.
+        controlsWait = next.ok ? waitForControls() : undefined;
+        if (next.ok) await callMetadataUpdate(opts.onMetadataUpdate, opts.controller.signal);
+      }
       if (winner.kind !== 'meta' || winner.ok || opts.controller.signal.aborted) {
         return winner;
       }

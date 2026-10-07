@@ -15,11 +15,11 @@ Happier supports two ways of running Claude:
 Remote mode has **three implementations**, selected in that order: unified
 terminal when it is enabled, otherwise Agent SDK, otherwise legacy.
 
-| Runtime | How Happier drives Claude | Terminal to join? |
+| Runtime | How Happier drives Claude | Native Claude TUI in remote mode? |
 | --- | --- | --- |
 | **Unified terminal** (opt-in) | Happier hosts Claude Code's own TUI in a terminal session and types prompts into its composer, so the app and the terminal share one Claude Code run. | Yes |
-| **Agent SDK** (default) | Runs Claude through the official `@anthropic-ai/claude-agent-sdk` in a background process, publishing capabilities and optionally file checkpointing. | No |
-| **Legacy remote** (fallback) | The older SDK-like shim that spawns `claude` with a streaming output format and forwards hooks for session info. | No |
+| **Agent SDK** (default) | Runs Claude through the official `@anthropic-ai/claude-agent-sdk` in a background process, publishing capabilities and optionally file checkpointing. | No. An attachable Happier runner can switch to local mode. |
+| **Legacy remote** (fallback) | The older SDK-like shim that spawns `claude` with a streaming output format and forwards hooks for session info. | No. An attachable Happier runner can switch to local mode. |
 
 The unified terminal is off until you turn it on, and it changes enough about
 how a session behaves — steering, queued input, which runtime controls apply
@@ -41,7 +41,7 @@ Local control is started from the terminal. Use `happier attach <session-id>` on
 
 If you send a message from the app while Claude is locally controlled, Happier stores it in the pending queue first. When Claude is idle, Happier can switch back to remote control and process the queued message. If Claude is still working in the terminal, Happier waits until the local turn finishes or stops before switching, so the app message does not interrupt the current Claude turn.
 
-On machines with `tmux`, this is usually a tmux-backed attach flow. On Windows, use Happier’s Windows remote session mode (`Windows Terminal`, `Console`, or `Hidden`) instead of expecting tmux.
+On macOS and Linux, the selected terminal host can be tmux or zellij. Current development builds also support Herdr: starting `happier claude` inside Herdr reuses the current pane. On Windows, use Happier’s Windows remote session mode (`Windows Terminal`, `Console`, or `Hidden`).
 
 For the full workflow, see [Features → Attach to a running session](/sessions/attach-to-session).
 

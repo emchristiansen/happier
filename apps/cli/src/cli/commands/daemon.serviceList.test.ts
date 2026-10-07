@@ -2,8 +2,26 @@ import { join, dirname } from 'node:path';
 import * as fs from 'node:fs';
 import type { SpawnSyncReturns } from 'node:child_process';
 
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildLaunchdPlistXml, renderSystemdServiceUnit, renderWindowsScheduledTaskWrapperPs1 } from '@happier-dev/cli-common/service';
+
+const osHomeOverrides = vi.hoisted(() => ({
+  homeDir: null as string | null,
+  realHomeDir: null as string | null,
+}));
+
+// Home discovery is an OS boundary; keep the real CLI graph loaded for every assertion.
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  return {
+    ...actual,
+    homedir: vi.fn(() => osHomeOverrides.homeDir ?? actual.homedir()),
+    userInfo: vi.fn(() => {
+      const info = actual.userInfo();
+      return osHomeOverrides.realHomeDir === null ? info : { ...info, homedir: osHomeOverrides.realHomeDir };
+    }),
+  };
+});
 
 vi.mock('node:child_process', async () => {
   const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
@@ -77,6 +95,16 @@ function writeValidWindowsDaemonServiceDefinition(params: Readonly<{
 }
 
 describe('happier daemon service list', () => {
+  beforeEach(async () => {
+    osHomeOverrides.homeDir = null;
+    osHomeOverrides.realHomeDir = null;
+    const childProcess = await import('node:child_process');
+    // Successful empty OS enumeration; individual tests override real task results.
+    vi.mocked(childProcess.spawnSync).mockReturnValue({
+      pid: 0, output: [], stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), status: 0, signal: null,
+    });
+  });
+
   it('lists installed background services through the canonical service command', async () => {
     await withConfiguredDaemonTestHome(
       {
@@ -129,6 +157,47 @@ describe('happier daemon service list', () => {
               path: join(homeDir, '.config', 'systemd', 'user', 'happier-daemon.company.prod.service'),
             }),
           ]));
+        } finally {
+          output.restore();
+        }
+      },
+    );
+  });
+
+  it('reports which services the desktop app manages and that this CLI lets pinned services of several relays coexist', async () => {
+    await withConfiguredDaemonTestHome(
+      {
+        prefix: 'happier-service-list-managed-by-',
+        env: {
+          HAPPIER_DAEMON_SERVICE_PLATFORM: 'linux',
+          HAPPIER_DAEMON_SERVICE_USER_HOME_DIR: '',
+          HAPPIER_DAEMON_SERVICE_CHANNEL: 'stable',
+        },
+      },
+      async ({ homeDir }) => {
+        process.env.HAPPIER_DAEMON_SERVICE_USER_HOME_DIR = homeDir;
+        const unitDir = join(homeDir, '.config', 'systemd', 'user');
+        fs.mkdirSync(unitDir, { recursive: true });
+        writeValidLinuxDaemonServiceDefinition({ path: join(unitDir, 'happier-daemon.personal.service'), happierHomeDir: homeDir });
+        const desktopUnit = join(unitDir, 'happier-daemon.company.service');
+        writeValidLinuxDaemonServiceDefinition({ path: desktopUnit, happierHomeDir: homeDir });
+        fs.writeFileSync(
+          desktopUnit,
+          fs.readFileSync(desktopUnit, 'utf-8').replace('[Service]\n', '[Service]\nEnvironment=HAPPIER_DAEMON_SERVICE_MANAGED_BY=desktop\n'),
+          'utf-8',
+        );
+
+        const output = captureStdoutJsonOutput<{
+          capabilities?: { pinnedServiceCoexistence?: boolean };
+          entries?: Array<{ serverId?: string; managedBy?: string | null }>;
+        }>();
+        try {
+          await handleServiceCliCommand({ args: ['service', 'list', '--json'], rawArgv: [], terminalRuntime: null });
+
+          expect(output.json().capabilities).toEqual({ pinnedServiceCoexistence: true });
+          const byId = new Map((output.json().entries ?? []).map((entry) => [entry.serverId, entry]));
+          expect(byId.get('company')?.managedBy).toBe('desktop');
+          expect(byId.get('personal')?.managedBy).toBeNull();
         } finally {
           output.restore();
         }
@@ -681,6 +750,9 @@ describe('happier daemon service list', () => {
         const spawnSyncMock = vi.mocked(childProcess.spawnSync);
         spawnSyncMock.mockImplementation(((cmd: string, args?: readonly string[]) => {
           const argv = Array.isArray(args) ? args.map((a) => String(a ?? '')) : [];
+          if (cmd === 'schtasks' && argv.join(' ') === '/Query /FO CSV /NH') {
+            return { pid: 0, output: [], stdout: '', stderr: '', status: 0, signal: null } satisfies SpawnSyncReturns<string>;
+          }
           if (
             cmd === 'schtasks'
             && argv[0] === '/Query'
@@ -920,16 +992,7 @@ describe('happier daemon service list', () => {
   });
 
   it('uses the real OS user home for service listing when HOME is stack-isolated and no explicit override is set', async () => {
-    let mockedRealHomeDir = '';
-    vi.resetModules();
-    vi.doMock('node:os', async () => {
-      const actual = await vi.importActual<typeof import('node:os')>('node:os');
-      return {
-        ...actual,
-        homedir: vi.fn(() => '/isolated-stack-home'),
-        userInfo: vi.fn(() => ({ homedir: mockedRealHomeDir })),
-      };
-    });
+    osHomeOverrides.homeDir = '/isolated-stack-home';
 
     const output = captureStdoutJsonOutput<{
       entries?: Array<{
@@ -954,7 +1017,8 @@ describe('happier daemon service list', () => {
           },
         },
         async ({ homeDir }) => {
-          mockedRealHomeDir = join(homeDir, 'real-user-home');
+          const mockedRealHomeDir = join(homeDir, 'real-user-home');
+          osHomeOverrides.realHomeDir = mockedRealHomeDir;
           await writeDaemonSettingsFixture(homeDir);
 
           const unitPath = join(mockedRealHomeDir, '.config', 'systemd', 'user', 'happier-daemon.company.service');
@@ -964,8 +1028,7 @@ describe('happier daemon service list', () => {
             happierHomeDir: join(mockedRealHomeDir, '.happier'),
           });
 
-          const { handleDaemonCliCommand: handleCommand } = await import('./daemon');
-          await handleCommand({ args: ['daemon', 'service', 'list', '--json'], rawArgv: [], terminalRuntime: null });
+          await handleDaemonCliCommand({ args: ['daemon', 'service', 'list', '--json'], rawArgv: [], terminalRuntime: null });
 
           expect(output.json().entries).toEqual(expect.arrayContaining([
             expect.objectContaining({
@@ -979,8 +1042,8 @@ describe('happier daemon service list', () => {
       );
     } finally {
       output.restore();
-      vi.doUnmock('node:os');
-      vi.resetModules();
+      osHomeOverrides.homeDir = null;
+      osHomeOverrides.realHomeDir = null;
     }
   });
 });

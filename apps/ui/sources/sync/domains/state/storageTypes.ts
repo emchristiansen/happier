@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { PermissionMode, ModelMode } from "@/sync/domains/permissions/permissionTypes";
 import { 
+    CliUpdateFactsSchema,
     createAgentRuntimeDescriptorV1Schema,
     createAcpConfigOptionOverridesV1Schema,
     createAcpSessionModeOverrideV1Schema,
@@ -599,7 +600,10 @@ export const MachineMetadataSchema = z.object({
     daemonLastKnownStatus: z.enum(['running', 'shutting-down']).optional(),
     daemonLastKnownPid: z.number().optional(),
     shutdownRequestedAt: z.number().optional(),
-    shutdownSource: z.enum(['happy-app', 'happy-cli', 'os-signal', 'unknown']).optional()
+    shutdownSource: z.enum(['happy-app', 'happy-cli', 'os-signal', 'unknown']).optional(),
+    // K5 — this machine's Happier CLI update facts. Absent from daemons that predate them; a
+    // malformed value degrades to absent rather than failing the whole metadata record.
+    cliUpdate: CliUpdateFactsSchema.optional().catch(undefined),
 });
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>;

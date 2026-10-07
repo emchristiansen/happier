@@ -257,7 +257,8 @@ vi.mock('./lifecycle/heartbeat', () => ({
     startDaemonHeartbeatLoop: vi.fn(() => setInterval(() => {}, 60_000)),
 }));
 
-vi.mock('@/projectPath', () => ({
+vi.mock('@/projectPath', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@/projectPath')>(),
     projectPath: vi.fn(() => '/tmp/project'),
 }));
 

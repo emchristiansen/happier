@@ -821,13 +821,15 @@ run_relay_upgrade_smoke() {
       done
 
       echo "[npm-e2e-smoke] relay upgrade ($db_case): bootstrapping auth and capturing token..." >&2
-      "${compose_upgrade[@]}" --env-file "$upgrade_env_from" exec -T relay node /opt/happier-npm-e2e/bin/terminal-auth-approve.cjs \
-        --server-url "http://127.0.0.1:3005" \
-        --home-dir "/tmp/relay-upgrade-home" \
-        --active-server-id "relay_upgrade_${db_case}" \
-        >/dev/null
-
-      token="$("${compose_upgrade[@]}" --env-file "$upgrade_env_from" exec -T relay node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(String(j.token||""))' /tmp/relay-upgrade-home/servers/relay_upgrade_"${db_case}"/access.key)"
+      token="$("${compose_upgrade[@]}" --env-file "$upgrade_env_from" run --rm -T --no-deps -e "RELAY_UPGRADE_DB_CASE=$db_case" auth-bootstrap sh -lc '
+        set -eu
+        node /opt/happier-npm-e2e/bin/terminal-auth-approve.cjs \
+          --server-url http://relay:3005 \
+          --home-dir /tmp/relay-upgrade-home \
+          --active-server-id "relay_upgrade_${RELAY_UPGRADE_DB_CASE}" >/dev/null
+        node -e "const fs=require(\"fs\");const j=JSON.parse(fs.readFileSync(process.argv[1],\"utf8\"));process.stdout.write(String(j.token||\"\"))" \
+          "/tmp/relay-upgrade-home/servers/relay_upgrade_${RELAY_UPGRADE_DB_CASE}/access.key"
+      ')"
       if [[ -z "${token:-}" ]]; then
         echo "[npm-e2e-smoke] relay upgrade ($db_case): failed to get token from bootstrap" >&2
         exit 1
@@ -1067,8 +1069,13 @@ if [[ "$with_any_remote" == "1" ]]; then
 
     if [[ $status -ne 0 ]]; then
       echo "[npm-e2e-smoke] remote server smoke failed (exit $status)" >&2
+      echo "[npm-e2e-smoke] remote-server1 container state:" >&2
+      "${compose_remote[@]}" --env-file "$env_file" ps -a remote-server1 >&2 || true
       echo "[npm-e2e-smoke] remote-server1 logs:" >&2
       "${compose_remote[@]}" --env-file "$env_file" logs --no-color remote-server1 >&2 || true
+      echo "[npm-e2e-smoke] remote-server1 ssh diagnostics:" >&2
+      "${compose_remote[@]}" --env-file "$env_file" exec -T remote-server1 bash -lc \
+        'systemctl --no-pager status ssh.service sshd.service; journalctl --no-pager -u ssh.service -u sshd.service -n 60; /usr/sbin/sshd -t' >&2 || true
       if [[ "$remote_server_db" == "postgres" ]]; then
         echo "[npm-e2e-smoke] postgres logs:" >&2
         "${compose_remote[@]}" --env-file "$env_file" logs --no-color postgres >&2 || true

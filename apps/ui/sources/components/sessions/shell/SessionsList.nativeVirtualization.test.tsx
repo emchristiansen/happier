@@ -386,9 +386,6 @@ vi.mock('@/components/account/RecoveryKeyReminderBanner', () => ({
     RecoveryKeyReminderBanner: 'RecoveryKeyReminderBanner',
 }));
 
-vi.mock('@/components/ui/feedback/UpdateBanner', () => ({
-    UpdateBanner: 'UpdateBanner',
-}));
 
 vi.mock('@/components/ui/layout/layout', () => ({
     layout: { maxWidth: 1280 },

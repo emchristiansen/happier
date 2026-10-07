@@ -61,8 +61,20 @@ export async function waitForBackgroundStackReadiness({
   const readyTimeoutMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
     ? Number(timeoutMs)
     : 180_000;
+  let readinessServerUrl = internalServerUrl;
+  if (scriptPath === 'dev.mjs') {
+    const { flags, kv } = parseArgs(args);
+    readinessServerUrl = resolveDevServerConnection({
+      flags, kv, env,
+      resolvedLocalUrls: {
+        internalServerUrl,
+        publicServerUrl: internalServerUrl,
+        defaultPublicUrl: internalServerUrl,
+      },
+    }).internalServerUrl;
+  }
   const startedAt = Date.now();
-  await waitForHttpOk(`${internalServerUrl}/health`, {
+  await waitForHttpOk(`${readinessServerUrl}/health`, {
     timeoutMs: readyTimeoutMs,
     intervalMs: 300,
   });
@@ -79,7 +91,7 @@ export async function waitForBackgroundStackReadiness({
     }
     const remainingMs = Math.max(100, readyTimeoutMs - (Date.now() - startedAt));
     const daemonState = await checkDaemonStateImpl(cliHomeDir, {
-      serverUrl: internalServerUrl,
+      serverUrl: readinessServerUrl,
       env,
       stackName,
       pingTimeoutMs: Math.min(1_000, remainingMs),

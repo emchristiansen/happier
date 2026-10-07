@@ -142,7 +142,7 @@ describe('createAcpRuntime (session models)', () => {
     });
   });
 
-  it('attaches ACP model_config options to models derived from config options', async () => {
+  it('attaches ACP model_config options only to the observed model derived from config options', async () => {
     const backend = createFakeAcpRuntimeBackend();
     const { session, getMetadata } = createSessionClientWithMetadata({
       initialMetadata: createTestMetadata(),
@@ -228,19 +228,6 @@ describe('createAcpRuntime (session models)', () => {
       {
         id: 'gpt-5.5',
         name: 'GPT-5.5',
-        modelOptions: [
-          {
-            id: 'fast',
-            name: 'Fast',
-            category: 'model_config',
-            type: 'select',
-            currentValue: 'true',
-            options: [
-              { value: 'false', name: 'Off' },
-              { value: 'true', name: 'Fast' },
-            ],
-          },
-        ],
       },
     ]);
   });
@@ -310,6 +297,91 @@ describe('createAcpRuntime (session models)', () => {
         modelOptions: [expect.objectContaining({ id: 'reasoning_effort' })],
       }],
     });
+  });
+
+
+  it('flattens grouped model and effort choices while preserving the selected option value', async () => {
+    const backend = createFakeAcpRuntimeBackend();
+    const { session, getMetadata } = createSessionClientWithMetadata({ initialMetadata: createTestMetadata() });
+    const runtime = createAcpRuntime({
+      provider: 'copilot', directory: '/tmp', session, messageBuffer: new MessageBuffer(),
+      mcpServers: {}, permissionHandler: createApprovedPermissionHandler(),
+      onThinkingChange: () => {}, ensureBackend: async () => backend,
+    });
+    await runtime.startOrLoad({ resumeId: null });
+    backend.emit({ type: 'event', name: 'config_options_state', payload: { configOptions: [
+      { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'model-b', options: [
+        { group: 'vendor', name: 'Vendor', options: [{ value: 'model-a', name: 'A' }, { value: 'model-b', name: 'B' }] },
+      ] },
+      { id: 'reasoning_effort', name: 'Thinking', type: 'select', currentValue: 'high', options: [
+        { group: 'compute', name: 'Compute', options: [{ value: 'medium', name: 'Medium' }, { value: 'high', name: 'High' }] },
+      ] },
+    ] } });
+    expect(getMetadata().sessionModelsV1).toMatchObject({ currentModelId: 'model-b', availableModels: [
+      { id: 'model-a', name: 'A' },
+      { id: 'model-b', name: 'B', modelOptions: [{ id: 'reasoning_effort', currentValue: 'high', options: [
+        { value: 'medium', name: 'Medium' }, { value: 'high', name: 'High' },
+      ] }] },
+    ] });
+    expect(getMetadata().sessionModelsV1?.availableModels.map((model) => model.id)).toEqual(['model-a', 'model-b']);
+  });
+
+  it('preserves independently discovered model controls across current config updates', async () => {
+    const effort = {
+      id: 'reasoning_effort', name: 'Thinking', category: 'thought_level', type: 'select',
+      currentValue: 'high', options: [{ value: 'medium', name: 'Medium' }, { value: 'high', name: 'High' }],
+    };
+    const otherEffort = {
+      ...effort, currentValue: 'medium', options: [{ value: 'medium', name: 'Medium' }],
+    };
+    const backend = createFakeAcpRuntimeBackend();
+    const { session, getMetadata } = createSessionClientWithMetadata({
+      initialMetadata: createTestMetadata({ sessionModelsV1: {
+        v: 1, provider: 'copilot', updatedAt: 1, currentModelId: 'model-a',
+        availableModels: [
+          { id: 'model-a', name: 'A', modelOptions: [effort] },
+          { id: 'model-b', name: 'B', modelOptions: [otherEffort] },
+          { id: 'removed-model', name: 'Removed', modelOptions: [effort] },
+        ],
+      } }),
+    });
+    const runtime = createAcpRuntime({
+      provider: 'copilot', directory: '/tmp', session, messageBuffer: new MessageBuffer(),
+      mcpServers: {}, permissionHandler: createApprovedPermissionHandler(),
+      onThinkingChange: () => {}, ensureBackend: async () => backend,
+    });
+    await runtime.startOrLoad({ resumeId: null });
+    for (const currentValue of ['medium', 'high', null, 'high', 'empty']) {
+      const previousUpdatedAt = getMetadata().sessionModelsV1?.updatedAt;
+      backend.emit({ type: 'event', name: 'config_options_update', payload: { configOptions: currentValue === 'empty' ? [] : [
+        { id: 'model', name: 'Model', type: 'select', currentValue: 'model-a', options: [
+          { value: 'model-a', name: 'A' }, { value: 'model-b', name: 'B' },
+        ] },
+        ...(currentValue === null ? [] : [{ ...effort, currentValue }]),
+      ] } });
+      expect(getMetadata().sessionModelsV1?.availableModels).toEqual([
+        { id: 'model-a', name: 'A', ...(currentValue === null || currentValue === 'empty' ? {} : { modelOptions: [{ ...effort, currentValue }] }) },
+        { id: 'model-b', name: 'B', modelOptions: [otherEffort] },
+      ]);
+      if (currentValue === 'empty') expect(getMetadata().sessionModelsV1?.updatedAt).toBe(previousUpdatedAt);
+    }
+    backend.emit({ type: 'event', name: 'session_models_state', payload: {
+      currentModelId: 'model-c', availableModels: [{ id: 'model-c', name: 'C', modelOptions: [otherEffort] }],
+    } });
+    expect(getMetadata().sessionModelsV1?.availableModels).toEqual([
+      { id: 'model-c', name: 'C', modelOptions: [otherEffort] },
+    ]);
+    backend.emit({ type: 'event', name: 'config_options_update', payload: { configOptions: [
+      { id: 'model', name: 'Model', type: 'select', currentValue: 'model-c', options: [{ value: 'model-c', name: 'C' }] },
+      { ...effort, currentValue: 'medium' },
+    ] } });
+    expect(getMetadata().sessionModelsV1?.availableModels).toEqual([
+      { id: 'model-c', name: 'C', modelOptions: [{ ...effort, currentValue: 'medium' }] },
+    ]);
+    backend.emit({ type: 'event', name: 'config_options_update', payload: { configOptions: [
+      { id: 'model', name: 'Model', type: 'select', currentValue: 'model-c', options: [] },
+    ] } });
+    expect(getMetadata().sessionModelsV1?.availableModels).toEqual([]);
   });
 
   it('delegates setSessionModel to the backend when supported', async () => {

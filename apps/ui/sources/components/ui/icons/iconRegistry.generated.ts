@@ -355,6 +355,7 @@ export const ICON_REGISTRY = {
     'grid-four': GridFourIcon,
     'hammer': HammerIcon,
     'hand': HandIcon,
+    'hard-drive-download': DownloadIcon,
     'hard-drives': HardDrivesIcon,
     'heart': HeartIcon,
     'hourglass': HourglassIcon,

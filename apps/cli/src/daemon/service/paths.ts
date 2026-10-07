@@ -55,6 +55,8 @@ export type DaemonServiceInstallationSnapshot = Readonly<{
 
 export type DaemonServiceListEntry = Readonly<{
   serverId: string;
+  /** A pinned definition's baked `HAPPIER_ACTIVE_SERVER_ID` (the profile it serves). */
+  activeServerId?: string | null;
   name: string;
   relayUrl?: string | null;
   installed: boolean;
@@ -65,6 +67,8 @@ export type DaemonServiceListEntry = Readonly<{
   releaseChannel: PublicReleaseRingId;
   label: string;
   targetMode: DaemonServiceTargetMode;
+  /** `desktop` when the desktop app manages this service; `null`/absent means user-owned. */
+  managedBy?: 'desktop' | null;
   installedDefinitionMatchesExpected?: boolean;
 }>;
 

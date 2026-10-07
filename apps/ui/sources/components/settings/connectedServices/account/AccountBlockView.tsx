@@ -32,7 +32,7 @@ import type { ConnectedServiceCredentialHealthStatusV1, ConnectedServiceId } fro
 import type { ProviderAccountSubscriptionV1 } from '@happier-dev/protocol';
 import { t } from '@/text';
 
-import { resolveAccountCapacityRings, type AccountUsageRow } from './accountBlockModel';
+import { type AccountUsageRow, type CapacityRingDatum } from './accountBlockModel';
 import { ConnectedServiceCapacityAvatar, CONNECTED_SERVICE_GAUGE_BOX, CONNECTED_SERVICE_GAUGE_SIZE } from '../ConnectedServiceCapacityAvatar';
 import { Icon } from '@/components/ui/icons/Icon';
 
@@ -60,6 +60,7 @@ export type AccountBlockQuotaView = Readonly<{
     planLabel: string | null;
     usageRows: ReadonlyArray<AccountUsageRow>;
     capacityPct: number | null;
+    capacityRings: ReadonlyArray<CapacityRingDatum>;
     resetRows: ReadonlyArray<QuotaResetRow>;
     resetAvailableCount: number;
     pinnedMeterIds: ReadonlyArray<string>;
@@ -363,7 +364,7 @@ export const AccountBlockView = React.memo<AccountBlockViewProps>((props) => {
     // One concentric ring per usage limit (most-constrained outermost); the center
     // number is the overall capacity. No brand glyph/dot — every row here is the
     // same provider, so the logo would be noise.
-    const capacityRings = resolveAccountCapacityRings(quota?.usageRows ?? []);
+    const capacityRings = quota?.capacityRings ?? [];
     // A first snapshot that is still loading (no cached value yet) must read as
     // "loading" on the gauge, not as an empty "no usage" ring. This mirrors the
     // body skeleton's `loading && !hasSnapshot` signal so the avatar and body agree.
@@ -682,14 +683,16 @@ export const AccountBlockView = React.memo<AccountBlockViewProps>((props) => {
                                             />
                                     </Pressable>
                                 </View>
-                                <MeterBar
-                                    testID={`${testID}:meter:${row.meterId}`}
-                                    tone={row.tone}
-                                    // Remaining-first fill: matches the row's "% left" label and the
-                                    // capacity rings (battery model — see accountBlockModel).
-                                    fillFraction={row.remaining}
-                                    caption={row.detailLabel}
-                                />
+                                {row.remaining !== null ? (
+                                    <MeterBar
+                                        testID={`${testID}:meter:${row.meterId}`}
+                                        tone={row.tone}
+                                        // Remaining-first fill: matches the row's "% left" label and the
+                                        // capacity rings (battery model — see accountBlockModel).
+                                        fillFraction={row.remaining}
+                                        caption={row.detailLabel}
+                                    />
+                                ) : <Text style={styles.subscriptionMeta}>{row.detailLabel}</Text>}
                             </View>
                         </ItemGroupColumn>
                     ))}

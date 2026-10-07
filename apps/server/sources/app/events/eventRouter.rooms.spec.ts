@@ -220,3 +220,25 @@ describe("eventRouter (rooms)", () => {
         expect(socketEmissionPayloadBytesObserve).not.toHaveBeenCalled();
     });
 });
+
+
+describe('focused computer room query', () => {
+    afterEach(() => eventRouter.clearIo());
+    it('checks remote adapter socket data and excludes phone, daemon, legacy and blurred sockets', async () => {
+        const fetchSockets = vi.fn().mockResolvedValue([
+            { data: { clientType: 'user-scoped', clientPurpose: 'sync', uiFocus: { computer: false, focused: true } } },
+            { data: { clientType: 'machine-scoped', clientPurpose: 'sync', uiFocus: { computer: true, focused: true } } },
+            { data: { clientType: 'user-scoped', clientPurpose: 'sync' } },
+            { data: { clientType: 'user-scoped', clientPurpose: 'sync', uiFocus: { computer: true, focused: false } } },
+        ]);
+        const inRoom = vi.fn(() => ({ fetchSockets }));
+        // Boundary fixture: this query uses only the account-room socket-fetch API of Socket.IO.
+        eventRouter.setIo({ in: inRoom } as any);
+        expect(await eventRouter.hasFocusedComputerUi('account')).toBe(false);
+        expect(inRoom).toHaveBeenCalledWith('user-scoped:account');
+        fetchSockets.mockResolvedValue([{ data: { clientType: 'user-scoped', clientPurpose: 'sync', uiFocus: { computer: true, focused: true } } }]);
+        expect(await eventRouter.hasFocusedComputerUi('account')).toBe(true);
+        fetchSockets.mockRejectedValue(new Error('adapter unavailable'));
+        expect(await eventRouter.hasFocusedComputerUi('account')).toBe(false);
+    });
+});

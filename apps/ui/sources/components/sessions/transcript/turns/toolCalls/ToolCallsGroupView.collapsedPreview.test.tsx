@@ -445,7 +445,10 @@ describe('ToolCallsGroupView (collapsed preview)', () => {
             setExpanded: vi.fn(),
         });
 
-        const spinner = screen.findAllByType('ActivityIndicator' as any)[0];
+        // The header owns which color its spinner gets; how the spinner draws it depends on the
+        // user's loading indicator style.
+        const { ActivitySpinner } = await import('@/components/ui/feedback/ActivitySpinner');
+        const spinner = screen.findAllByType(ActivitySpinner)[0];
         expect(spinner?.props?.color).toBe('#555555');
     });
 

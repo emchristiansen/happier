@@ -10,7 +10,6 @@ describe('resolveAppShellChromeHost', () => {
         expect(resolveAppShellChromeHost({
             isAuthenticated: true,
             isDesktopPetOverlayWindow: false,
-            isWeb: true,
             isTauriDesktop: true,
             isTablet: true,
             isTerminalConnectRoute: true,
@@ -21,29 +20,26 @@ describe('resolveAppShellChromeHost', () => {
         expect(resolveAppShellChromeHost({
             isAuthenticated: true,
             isDesktopPetOverlayWindow: true,
-            isWeb: true,
             isTauriDesktop: true,
             isTablet: false,
             isTerminalConnectRoute: false,
         })).toBe('none');
     });
 
-    it('returns web-top-right for non-Tauri browser shells', () => {
+    it('hosts no root chrome in a browser: the sidebar Updates pill is the entry (R13 (e))', () => {
         expect(resolveAppShellChromeHost({
             isAuthenticated: true,
             isDesktopPetOverlayWindow: false,
-            isWeb: true,
             isTauriDesktop: false,
             isTablet: true,
             isTerminalConnectRoute: false,
-        })).toBe('web-top-right');
+        })).toBe('none');
     });
 
     it('does not place root update chrome over native mobile headers', () => {
         const params = {
             isAuthenticated: true,
             isDesktopPetOverlayWindow: false,
-            isWeb: false,
             isTauriDesktop: false,
             isTablet: false,
             isTerminalConnectRoute: false,
@@ -56,7 +52,6 @@ describe('resolveAppShellChromeHost', () => {
         expect(resolveAppShellChromeHost({
             isAuthenticated: false,
             isDesktopPetOverlayWindow: false,
-            isWeb: true,
             isTauriDesktop: true,
             isTablet: true,
             isTerminalConnectRoute: false,
@@ -67,7 +62,6 @@ describe('resolveAppShellChromeHost', () => {
         expect(resolveAppShellChromeHost({
             isAuthenticated: true,
             isDesktopPetOverlayWindow: false,
-            isWeb: true,
             isTauriDesktop: true,
             isTablet: false,
             isTerminalConnectRoute: false,
@@ -78,7 +72,6 @@ describe('resolveAppShellChromeHost', () => {
         expect(resolveAppShellChromeHost({
             isAuthenticated: true,
             isDesktopPetOverlayWindow: false,
-            isWeb: true,
             isTauriDesktop: true,
             isTablet: true,
             isTerminalConnectRoute: false,

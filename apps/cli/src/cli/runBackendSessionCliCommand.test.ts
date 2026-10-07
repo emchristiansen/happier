@@ -89,7 +89,7 @@ describe('runBackendSessionCliCommand', () => {
     expect(sessionCreated).toBe(true);
     expect(webhookSent).toBe(false);
     expect(fatalSpy).toHaveBeenCalledWith(startupError);
-    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.anything(), 'post-session startup failure');
+    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('post-session startup failure'));
     exitSpy.mockRestore();
   });
 

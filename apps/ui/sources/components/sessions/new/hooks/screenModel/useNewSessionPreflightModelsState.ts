@@ -8,18 +8,15 @@ import {
 
 import { getAgentCore, type AgentId } from '@/agents/catalog/catalog';
 import { resolveProviderAgentIdForBackendTarget } from '@/agents/backendCatalog/getResolvedBackendCatalogEntries';
-import { machineCapabilitiesInvoke } from '@/sync/ops/capabilities';
+import { discoverMachineModels } from '@/sync/ops/modelDiscovery';
 import { getModelOptionsForAgentTypeOrPreflight, type PreflightModelList } from '@/sync/domains/models/modelOptions';
 import { buildDynamicModelProbeCacheKey } from '@/sync/domains/models/dynamicModelProbeCacheKey';
-import { parsePreflightModelListFromProbeModelsResult } from '@/sync/domains/models/parsePreflightModelListFromProbeModelsResult';
 import {
-    DYNAMIC_MODEL_PROBE_ERROR_BACKOFF_MS,
-    DYNAMIC_MODEL_PROBE_STATIC_FALLBACK_RETRY_MS,
+    dynamicModelProbeRetryAt,
+    isDynamicModelProbeCacheFresh,
     readDynamicModelProbeCache,
-    runDynamicModelProbeDedupe,
-    writeDynamicModelProbeCacheError,
-    writeDynamicModelProbeCacheSuccess,
-    writeDynamicModelProbeCacheTransientSuccess,
+    subscribeDynamicModelProbeCache,
+    type DynamicModelProbeCacheEntry,
 } from '@/sync/domains/models/dynamicModelProbeCache';
 import {
     buildNewSessionCapabilityProbeContextKey,
@@ -27,11 +24,10 @@ import {
     type NewSessionCapabilityProbeContext,
 } from '@/components/sessions/new/modules/newSessionCapabilityProbeContext';
 import { NEW_SESSION_CAPABILITY_PROBE_TIMEOUT_MS } from '@/components/sessions/new/modules/newSessionCapabilityProbeTimeoutMs';
-import type { CapabilityId } from '@/sync/api/capabilities/capabilitiesProtocol';
-import { scheduleProbedResourceRetryAfterExpiry } from './probedResourceRetrySchedule';
 import { stableJsonStringify } from '@/utils/json/stableJsonStringify';
 
 export function useNewSessionPreflightModelsState(params: Readonly<{
+    enabled?: boolean;
     backendTarget: BackendTargetRefV1;
     selectedMachineId: string | null;
     capabilityServerId: string;
@@ -46,6 +42,7 @@ export function useNewSessionPreflightModelsState(params: Readonly<{
     probe: Readonly<{
         phase: 'idle' | 'loading' | 'refreshing';
         refreshedAt: number | null;
+        error: boolean;
         onRefresh?: () => void;
     }>;
 }> {
@@ -54,11 +51,11 @@ export function useNewSessionPreflightModelsState(params: Readonly<{
     const [probePhase, setProbePhase] = React.useState<'idle' | 'loading' | 'refreshing'>('idle');
     const [refreshedAt, setRefreshedAt] = React.useState<number | null>(null);
     const [refreshNonce, setRefreshNonce] = React.useState(0);
+    const [retryNonce, setRetryNonce] = React.useState(0);
+    const [probeError, setProbeError] = React.useState(false);
     const lastHandledRefreshNonceRef = React.useRef(0);
     const preflightModelsRef = React.useRef<PreflightModelList | null>(null);
-    const preflightModelsCacheableRef = React.useRef(true);
-    const refreshedAtRef = React.useRef<number | null>(null);
-    const lastScopeKeyRef = React.useRef<string | null>(null);
+    const lastCacheKeyRef = React.useRef<string | null>(null);
     const staticFallbackRetryRef = React.useRef<Readonly<{ scopeKey: string | null; attempts: number }> | null>(null);
 
     const onRefresh = React.useCallback(() => {
@@ -81,7 +78,7 @@ export function useNewSessionPreflightModelsState(params: Readonly<{
 
     const dynamicProbeEnabled = React.useMemo(() => {
         const core = getAgentCore(agentType);
-        return core.model.dynamicProbe !== 'static-only';
+        return core.model.dynamicProbe !== 'static-only' && core.model.supportsSelection === true;
     }, [agentType]);
 
     const backendTargetKey = React.useMemo(() => buildBackendTargetKey(backendTarget), [backendTarget]);
@@ -95,10 +92,8 @@ export function useNewSessionPreflightModelsState(params: Readonly<{
         () => params.probeContext?.capabilityParams ?? null,
         [probeContextKey],
     );
-    const connectedServicesKey = React.useMemo(
-        () => stableJsonStringify(params.connectedServices ?? null),
-        [params.connectedServices],
-    );
+    const connectedServicesKey = stableJsonStringify(params.connectedServices ?? null);
+    const connectedServices = React.useMemo(() => params.connectedServices, [connectedServicesKey]);
     const profileId = typeof params.profileId === 'string' && params.profileId.trim().length > 0
         ? params.profileId.trim()
         : null;
@@ -109,21 +104,6 @@ export function useNewSessionPreflightModelsState(params: Readonly<{
         ],
         [probeContextCacheKeySuffixParts, profileId],
     );
-
-    const probeScopeKey = React.useMemo(() => {
-        const machineId = String(params.selectedMachineId ?? '').trim();
-        if (!machineId) return null;
-        const serverId = String(params.capabilityServerId ?? '').trim() || 'active';
-        // Scope key excludes cwd so switching worktrees doesn't flash the dynamic model list.
-        return JSON.stringify([
-            'dynamicModelProbeScope',
-            serverId,
-            machineId,
-            backendTargetKey,
-            connectedServicesKey,
-            ...probeCacheKeySuffixParts,
-        ]);
-    }, [backendTargetKey, params.capabilityServerId, params.selectedMachineId, probeContextKey, probeCacheKeySuffixParts, connectedServicesKey]);
 
     const preflightModelsKey = React.useMemo(() => {
         return buildDynamicModelProbeCacheKey({
@@ -137,225 +117,116 @@ export function useNewSessionPreflightModelsState(params: Readonly<{
     }, [backendTargetKey, params.capabilityServerId, params.cwd, params.selectedMachineId, probeCacheKeySuffixParts, connectedServicesKey]);
 
     React.useEffect(() => {
-        preflightModelsRef.current = preflightModels;
-        refreshedAtRef.current = refreshedAt;
-    }, [preflightModels, refreshedAt]);
-
-    React.useEffect(() => {
-        if (!preflightModelsKey) {
-            setPreflightModels(null);
-            preflightModelsRef.current = null;
-            preflightModelsCacheableRef.current = true;
-            setPreflightModelsTargetKey(null);
-            setProbePhase('idle');
-            setRefreshedAt(null);
-            refreshedAtRef.current = null;
-            lastScopeKeyRef.current = probeScopeKey;
-            return;
-        }
-
         const core = getAgentCore(agentType);
-        if (core.model.dynamicProbe === 'static-only') {
-            // This provider intentionally does not support dynamic model probing; rely on catalog-only models.
-            // Clear any previously cached dynamic list for this scope so we don't render stale/unknown models.
-            lastScopeKeyRef.current = probeScopeKey;
-            if (preflightModelsRef.current !== null) {
-                setPreflightModels(null);
-                setPreflightModelsTargetKey(null);
-                preflightModelsRef.current = null;
-                preflightModelsCacheableRef.current = true;
-            }
-            if (refreshedAtRef.current !== null) {
-                setRefreshedAt(null);
-                refreshedAtRef.current = null;
-            }
-            setProbePhase('idle');
-            return;
-        }
-
-        let retryTimeout: ReturnType<typeof setTimeout> | null = null;
-        const shouldForceProbe = refreshNonce !== 0 && refreshNonce !== lastHandledRefreshNonceRef.current;
-        if (shouldForceProbe) {
-            lastHandledRefreshNonceRef.current = refreshNonce;
-        }
-
-        const cacheEntry = readDynamicModelProbeCache(preflightModelsKey);
-        const cached = cacheEntry?.kind === 'success' ? cacheEntry.value : null;
-        const cachedCanPersist = cacheEntry?.kind === 'success' && cacheEntry.cacheable !== false;
-        const scopeStable = lastScopeKeyRef.current !== null && probeScopeKey !== null && lastScopeKeyRef.current === probeScopeKey;
-        lastScopeKeyRef.current = probeScopeKey;
-        if (cached) {
-            setPreflightModels(cached);
-            preflightModelsRef.current = cached;
-            preflightModelsCacheableRef.current = cachedCanPersist;
-            setPreflightModelsTargetKey(backendTargetKey);
-            const cachedUpdatedAt = cacheEntry?.updatedAt ?? null;
-            setRefreshedAt(cachedUpdatedAt);
-            refreshedAtRef.current = cachedUpdatedAt;
-        } else if (!scopeStable) {
-            // Engine/machine/server scope changed: clear any previous list to avoid showing the wrong provider's models.
+        if (!preflightModelsKey || core.model.dynamicProbe === 'static-only' || core.model.supportsSelection !== true) {
             setPreflightModels(null);
-            setPreflightModelsTargetKey(null);
             preflightModelsRef.current = null;
-            preflightModelsCacheableRef.current = true;
-            refreshedAtRef.current = null;
-            setRefreshedAt(null);
-        }
-
-        const nowMs = Date.now();
-        if (!shouldForceProbe && cacheEntry && nowMs >= 0 && nowMs < cacheEntry.expiresAt) {
+            setPreflightModelsTargetKey(null);
             setProbePhase('idle');
-            retryTimeout = scheduleProbedResourceRetryAfterExpiry(cacheEntry, nowMs, () => {
-                setRefreshNonce((n) => n + 1);
-            });
-            return () => {
-                if (retryTimeout) clearTimeout(retryTimeout);
-            };
+            setProbeError(false);
+            setRefreshedAt(null);
+            lastCacheKeyRef.current = preflightModelsKey;
+            return;
         }
 
         let cancelled = false;
-        const run = async () => {
-            const core = getAgentCore(agentType);
-            if (core.model.supportsSelection !== true || !params.selectedMachineId) {
-                if (!cancelled) {
-                    setProbePhase('idle');
-                }
-                return;
-            }
-            const cwd = typeof params.cwd === 'string' ? params.cwd.trim() : '';
-
-            const hasExisting = Boolean(preflightModelsRef.current);
-            setProbePhase(hasExisting ? 'refreshing' : 'loading');
-            const attempt = await runDynamicModelProbeDedupe<Readonly<{
-                list: PreflightModelList;
-                cacheable: boolean;
-            }> | null>(preflightModelsKey, async () => {
-                const capabilityId: CapabilityId = `cli.${agentType}`;
-                const res = await machineCapabilitiesInvoke(params.selectedMachineId!, {
-                    id: capabilityId,
-                    method: 'probeModels',
-                    params: {
-                        timeoutMs: NEW_SESSION_CAPABILITY_PROBE_TIMEOUT_MS,
-                        backendTarget,
-                        ...(profileId ? { profileId } : {}),
-                        ...(probeContextCapabilityParams ? probeContextCapabilityParams : {}),
-                        ...(params.connectedServices ? { connectedServices: params.connectedServices } : {}),
-                        ...(cwd ? { cwd } : {}),
-                    },
-                }, {
-                    serverId: params.capabilityServerId,
-                });
-
-                if (!res.supported) return null;
-                if (!res.response.ok) return null;
-
-                const list = parsePreflightModelListFromProbeModelsResult(res.response.result);
-                if (!list) return null;
-
-                const result = res.response.result;
-                const resultRecord = result && typeof result === 'object' && !Array.isArray(result)
-                    ? result as Record<string, unknown>
-                    : null;
-                const source = typeof resultRecord?.source === 'string' ? resultRecord.source : null;
-                // When the CLI probe returns a static fallback (dynamic probe failed), do not persist it
-                // for a full day. Persisting it long-lived is what causes “Thinking/Speed only appear after refresh”.
-                const cacheable = resultRecord?.cacheable !== false && source !== 'static';
-                return { list, cacheable };
-            });
-
-            if (cancelled) return;
-            const commitNowMs = Date.now();
-            const list = attempt?.list ?? null;
-            if (list && attempt?.cacheable !== false) {
-                staticFallbackRetryRef.current = { scopeKey: probeScopeKey, attempts: 0 };
-                writeDynamicModelProbeCacheSuccess(preflightModelsKey, list, commitNowMs);
-                setPreflightModels(list);
-                preflightModelsCacheableRef.current = true;
+        let retryTimeout: ReturnType<typeof setTimeout> | null = null;
+        const cacheEntry = readDynamicModelProbeCache(preflightModelsKey);
+        const scopeStable = lastCacheKeyRef.current === preflightModelsKey;
+        lastCacheKeyRef.current = preflightModelsKey;
+        const applyEntry = (entry: DynamicModelProbeCacheEntry | null) => {
+            if (entry?.kind === 'success') {
+                setPreflightModels(entry.value);
+                preflightModelsRef.current = entry.value;
                 setPreflightModelsTargetKey(backendTargetKey);
-                setRefreshedAt(commitNowMs);
-                setProbePhase('idle');
-                return;
+                setRefreshedAt(entry.staticFallback ? null : entry.updatedAt);
             }
-            if (list && attempt?.cacheable === false && !cached) {
-                // Show the list (useful fallback) and retain it for same-runtime remounts, but retry soon
-                // and do not persist it across app restarts.
-                writeDynamicModelProbeCacheTransientSuccess(preflightModelsKey, list, commitNowMs);
-                writeDynamicModelProbeCacheError(preflightModelsKey, commitNowMs);
-                setPreflightModels(list);
-                preflightModelsCacheableRef.current = false;
-                setPreflightModelsTargetKey(backendTargetKey);
-                setRefreshedAt(commitNowMs);
-                setProbePhase('idle');
-                const state = staticFallbackRetryRef.current;
-                const scopeKey = probeScopeKey;
-                const attempts = state && state.scopeKey === scopeKey ? state.attempts : 0;
-                // Cap fast retries to avoid hammering the CLI when the provider genuinely cannot
-                // return a dynamic list right now (for example: logged out / offline).
-                if (attempts < 2) {
-                    staticFallbackRetryRef.current = { scopeKey, attempts: attempts + 1 };
-                    retryTimeout = setTimeout(() => {
-                        setRefreshNonce((n) => n + 1);
-                    }, DYNAMIC_MODEL_PROBE_STATIC_FALLBACK_RETRY_MS);
-                }
-                return;
-            }
-
-            if (cached) {
-                // Keep stale-but-usable model lists sticky if a refresh probe fails.
-                if (cachedCanPersist) {
-                    writeDynamicModelProbeCacheSuccess(preflightModelsKey, cached, commitNowMs);
-                }
-                setPreflightModels(cached);
-                preflightModelsCacheableRef.current = cachedCanPersist;
-                setPreflightModelsTargetKey(backendTargetKey);
-                setRefreshedAt(commitNowMs);
-                setProbePhase('idle');
-                return;
-            }
-
-            const stale = preflightModelsRef.current;
-            const staleUpdatedAt = refreshedAtRef.current;
-            if (stale && staleUpdatedAt) {
-                // When switching cwd/worktree, keep the last usable list on screen even if the new probe fails.
-                if (preflightModelsCacheableRef.current) {
-                    writeDynamicModelProbeCacheSuccess(preflightModelsKey, stale, commitNowMs);
-                } else {
-                    writeDynamicModelProbeCacheTransientSuccess(preflightModelsKey, stale, commitNowMs);
-                }
-                setPreflightModels(stale);
-                setPreflightModelsTargetKey(backendTargetKey);
-                setRefreshedAt(commitNowMs);
-                setProbePhase('idle');
-                return;
-            }
-
-            writeDynamicModelProbeCacheError(preflightModelsKey, commitNowMs);
-            setProbePhase('idle');
-            retryTimeout = setTimeout(() => {
-                setRefreshNonce((n) => n + 1);
-            }, DYNAMIC_MODEL_PROBE_ERROR_BACKOFF_MS);
+            setProbeError(entry?.kind === 'error' || (entry?.kind === 'success' && entry.errorUpdatedAt !== undefined));
         };
-
-        void run();
+        if (cacheEntry?.kind === 'success') {
+            applyEntry(cacheEntry);
+        } else {
+            if (!scopeStable) {
+                setPreflightModels(null);
+                preflightModelsRef.current = null;
+                setPreflightModelsTargetKey(null);
+                setRefreshedAt(null);
+            }
+            applyEntry(cacheEntry);
+        }
+        setProbePhase('idle');
+        const scheduleRetry = (entry: DynamicModelProbeCacheEntry | null) => {
+            if (retryTimeout) clearTimeout(retryTimeout);
+            retryTimeout = null;
+            if (params.enabled === false) return;
+            const retryAt = dynamicModelProbeRetryAt(entry);
+            if (retryAt === null) return;
+            const isStaticFallback = entry?.kind === 'success' && entry.staticFallback;
+            const state = staticFallbackRetryRef.current;
+            const attempts = state?.scopeKey === preflightModelsKey ? state.attempts : 0;
+            // Preserve the existing bounded fast retry lifecycle for failed static fallback.
+            if (isStaticFallback && attempts >= 2) return;
+            retryTimeout = setTimeout(() => {
+                if (isStaticFallback) staticFallbackRetryRef.current = { scopeKey: preflightModelsKey, attempts: attempts + 1 };
+                setRetryNonce((n) => n + 1);
+            }, Math.max(0, retryAt - Date.now()));
+        };
+        const unsubscribe = subscribeDynamicModelProbeCache(preflightModelsKey, () => {
+            const entry = readDynamicModelProbeCache(preflightModelsKey);
+            applyEntry(entry);
+            if (dynamicModelProbeRetryAt(entry) === null) staticFallbackRetryRef.current = null;
+            scheduleRetry(entry);
+        });
+        if (params.enabled === false) return unsubscribe;
+        const force = refreshNonce !== lastHandledRefreshNonceRef.current;
+        lastHandledRefreshNonceRef.current = refreshNonce;
+        if (!force && isDynamicModelProbeCacheFresh(cacheEntry)) {
+            scheduleRetry(cacheEntry);
+        } else {
+            setProbePhase(preflightModelsRef.current ? 'refreshing' : 'loading');
+            const cwd = typeof params.cwd === 'string' ? params.cwd.trim() : '';
+            void discoverMachineModels({
+                cacheKey: preflightModelsKey,
+                agentType,
+                machineId: params.selectedMachineId!,
+                serverId: params.capabilityServerId,
+                backendTarget,
+                bypassCache: force,
+                capabilityParams: {
+                    timeoutMs: NEW_SESSION_CAPABILITY_PROBE_TIMEOUT_MS,
+                    ...(profileId ? { profileId } : {}),
+                    ...probeContextCapabilityParams,
+                    ...(connectedServices ? { connectedServices } : {}),
+                    ...(cwd ? { cwd } : {}),
+                },
+            }).then((entry) => {
+                if (cancelled) return;
+                applyEntry(entry);
+                setProbePhase('idle');
+                if (dynamicModelProbeRetryAt(entry) === null) staticFallbackRetryRef.current = null;
+                scheduleRetry(entry);
+            });
+        }
         return () => {
             cancelled = true;
+            unsubscribe();
             if (retryTimeout) clearTimeout(retryTimeout);
         };
-    }, [agentType, backendTarget, backendTargetKey, preflightModelsKey, probeScopeKey, params.capabilityServerId, params.cwd, params.selectedMachineId, profileId, probeContextKey, refreshNonce, probeContextCapabilityParams, params.connectedServices]);
+    }, [agentType, backendTarget, backendTargetKey, preflightModelsKey, params.enabled, params.capabilityServerId, params.cwd, params.selectedMachineId, profileId, refreshNonce, retryNonce, probeContextCapabilityParams, connectedServices]);
 
+    const hasCurrentIdentity = lastCacheKeyRef.current === preflightModelsKey;
+    const currentModels = hasCurrentIdentity ? preflightModels : null;
     const modelOptions = React.useMemo(
-        () => getModelOptionsForAgentTypeOrPreflight({ agentType, preflight: preflightModels }),
-        [agentType, preflightModels],
+        () => getModelOptionsForAgentTypeOrPreflight({ agentType, preflight: currentModels }),
+        [agentType, currentModels],
     );
 
-    return {
-        preflightModels,
-        preflightModelsTargetKey,
-        modelOptions,
-        probe: {
-            phase: probePhase,
-            refreshedAt,
-            ...(dynamicProbeEnabled ? { onRefresh } : {}),
-        },
-    };
+    const probe = React.useMemo(() => ({
+        phase: probePhase,
+        refreshedAt: hasCurrentIdentity ? refreshedAt : null,
+        error: hasCurrentIdentity && probeError,
+        ...(dynamicProbeEnabled && preflightModelsKey && params.enabled !== false ? { onRefresh } : {}),
+    }), [hasCurrentIdentity, probePhase, refreshedAt, probeError, dynamicProbeEnabled, preflightModelsKey, params.enabled, onRefresh]);
+
+    return { preflightModels: currentModels, preflightModelsTargetKey: currentModels ? preflightModelsTargetKey : null, modelOptions, probe };
 }

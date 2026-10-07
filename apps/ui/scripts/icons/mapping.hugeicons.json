@@ -232,5 +232,6 @@
   "windows-logo": "WindowsNewIcon",
   "wrench": "Wrench01Icon",
   "x": "Cancel01Icon",
-  "x-circle": "CancelCircleIcon"
+  "x-circle": "CancelCircleIcon",
+  "hard-drive-download": "HardDriveDownloadIcon"
 }

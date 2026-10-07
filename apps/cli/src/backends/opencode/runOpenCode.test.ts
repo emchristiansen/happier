@@ -416,8 +416,8 @@ describe('runOpenCode', () => {
 
     await runOpenCode({ credentials, startedBy: 'terminal' });
 
-    const params = getLatestLocalControlParams() as { getServerBaseUrl?: () => Promise<string | null> } | null;
-    expect(params?.getServerBaseUrl).toBeTypeOf('function');
-    await expect(params?.getServerBaseUrl?.()).resolves.toBeNull();
+    const params = getLatestLocalControlParams() as { getServerTarget?: () => Promise<{ baseUrl: string } | null> } | null;
+    expect(params?.getServerTarget).toBeTypeOf('function');
+    await expect(params?.getServerTarget?.()).resolves.toBeNull();
   });
 });

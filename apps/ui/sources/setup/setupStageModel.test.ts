@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { SYSTEM_TASK_PROTOCOL_VERSION, type SystemTaskEvent } from '@happier-dev/protocol';
+import { createSetupCliChoicePromptData, SYSTEM_TASK_PROTOCOL_VERSION, type SystemTaskEvent } from '@happier-dev/protocol';
 
 import type { SystemTaskRunState } from '@/components/systemTasks/types';
 
@@ -261,10 +261,13 @@ describe('deriveSetupStageModel (INV3 — milestone-quantised)', () => {
         const mapped: Readonly<Record<string, string>> = {
             service_install_blocked: 'setupSurface.blockedServiceConflictStatus',
             service_consent_declined: 'setupSurface.blockedConsentDeclinedStatus',
+            account_consent_declined: 'setupSurface.blockedAccountKeptStatus',
+            account_changed_during_setup: 'setupSurface.blockedAccountChangedStatus',
             pairing_declined: 'setupSurface.blockedPairingDeclinedStatus',
             machine_id_unavailable: 'setupSurface.blockedPairingIncompleteStatus',
             cli_below_setup_floor: 'setupSurface.blockedCliOutdatedStatus',
             cli_override_below_setup_floor: 'setupSurface.blockedCliOutdatedStatus',
+            cli_own_missing: 'setupSurface.blockedCliOwnMissingStatus',
             cli_command_timeout: 'setupSurface.blockedCliUnresponsiveStatus',
             cli_spawn_failed: 'setupSurface.blockedCliUnavailableStatus',
             first_party_component_install_failed: 'setupSurface.acquisitionInstallFailed',
@@ -286,6 +289,89 @@ describe('deriveSetupStageModel (INV3 — milestone-quantised)', () => {
             expect(model.statusSentence).toBe(key);
             expect(JSON.stringify(model.statusSentence)).not.toContain('raw diagnostic');
         }
+    });
+
+    it('keeps the person\'s own too-old command line theirs: one sentence with the exact update command, never Update (R12)', () => {
+        const code = 'cli_own_below_setup_floor';
+        const named = deriveSetupStageModel(null, facts({
+            startFailure: { code, message: 'Your Happier CLI at /usr/local/bin/happier is version 0.2.5' },
+            ownCliUpdateCommand: 'npm install -g @happier-dev/cli@latest',
+        }));
+        expect(named.statusSentence).toEqual({
+            key: 'setupSurface.blockedCliOwnOutdatedStatus',
+            params: { command: 'npm install -g @happier-dev/cli@latest' },
+        });
+
+        // Where it came from is unknown: it says so without inventing a command.
+        const unknown = deriveSetupStageModel(null, facts({ startFailure: { code, message: 'old' } }));
+        expect(unknown.statusSentence).toBe('setupSurface.blockedCliOwnOutdatedUnknownStatus');
+    });
+
+    it('names the update command the run\'s own question named, when the kept CLI never answered a read (R12)', () => {
+        // The app-open read failed on that CLI, so there are no ambient facts; the executor's
+        // one-CLI question in this run named where it came from.
+        const run = runState({
+            status: 'failed',
+            events: [{
+                protocolVersion: SYSTEM_TASK_PROTOCOL_VERSION,
+                taskId: 'task_1',
+                tsMs: 1,
+                type: 'prompt',
+                stepId: 'setup.thisComputer.cliChoice',
+                message: 'Should Happier manage the command line on this computer?',
+                data: createSetupCliChoicePromptData({
+                    command: '/usr/local/bin/happier',
+                    version: null,
+                    origin: 'npm',
+                    removalCommand: 'npm uninstall -g @happier-dev/cli',
+                    updateCommand: 'npm install -g @happier-dev/cli@latest',
+                    belowSetupFloor: true,
+                    missing: false,
+                    keepBlockedBy: null,
+                }),
+            }],
+            result: { protocolVersion: SYSTEM_TASK_PROTOCOL_VERSION, taskId: 'task_1', ok: false, error: { code: 'cli_own_below_setup_floor', message: 'did not report a version' } },
+        });
+
+        expect(deriveSetupStageModel(run, facts()).statusSentence).toEqual({
+            key: 'setupSurface.blockedCliOwnOutdatedStatus',
+            params: { command: 'npm install -g @happier-dev/cli@latest' },
+        });
+    });
+
+    it('says a dismissed one-CLI question stopped setup before anything changed (R12)', () => {
+        const model = deriveSetupStageModel(null, facts({ startFailure: { code: 'cli_choice_unanswered', message: 'stopped' } }));
+        expect(model.statusSentence).toBe('setupSurface.blockedCliChoiceStatus');
+    });
+
+    it('names the channel when this computer follows a default channel with no CLI new enough yet (RV-9)', () => {
+        // The app adopted the default channel's CLI (D2); that channel's newest release is below
+        // setup's floor, so the one sentence says which channel it is waiting on.
+        const code = 'cli_default_channel_below_setup_floor';
+        const named = deriveSetupStageModel(null, facts({
+            startFailure: { code, message: 'default channel stable, newest 0.2.12' },
+            cliChannel: 'stable',
+        }));
+        expect(named.statusSentence).toEqual({
+            key: 'setupSurface.blockedCliChannelOutdatedStatus',
+            params: { channel: 'machine.thisComputer.cliChannelStable' },
+        });
+        expect(named.blocked?.message).toBe('default channel stable, newest 0.2.12');
+
+        // With the channel's newest version from the CLI's own update check, it names that too.
+        const versioned = deriveSetupStageModel(null, facts({
+            startFailure: { code, message: 'default channel stable, newest 0.2.10' },
+            cliChannel: 'stable',
+            cliLatestVersion: '0.2.10',
+        }));
+        expect(versioned.statusSentence).toEqual({
+            key: 'setupSurface.blockedCliChannelOutdatedVersionStatus',
+            params: { channel: 'machine.thisComputer.cliChannelStable', version: '0.2.10' },
+        });
+
+        // Without the channel fact it still says why, without naming one.
+        const unnamed = deriveSetupStageModel(null, facts({ startFailure: { code, message: null } }));
+        expect(unnamed.statusSentence).toBe('setupSurface.blockedCliOutdatedStatus');
     });
 
     it('treats a start failure as blocked before any task exists', () => {
@@ -317,6 +403,44 @@ describe('deriveSetupStageModel copy and announcements', () => {
 
         expect(connect.statusSentence).toEqual({ key: 'setupSurface.stageConnectStatus', params: { relay: RELAY } });
         expect(verify.statusSentence).toEqual({ key: 'setupSurface.stageVerifyStatus', params: { relay: RELAY } });
+    });
+
+    it('names the account as well as the relay while connecting, when the app knows it (R17)', () => {
+        const connect = deriveSetupStageModel(runState({
+            events: [progress('setup.thisComputer.configureRelay', 120)],
+        }), facts({ accountLabel: 'alice' }));
+
+        expect(connect.statusSentence).toEqual({ key: 'setupSurface.stageConnectStatusAs', params: { relay: RELAY, account: 'alice' } });
+    });
+
+    it('names the service step the executor is actually on: install, start and restart differ', () => {
+        const sentence = (...stepIds: string[]) => deriveSetupStageModel(
+            runState({ events: stepIds.map((stepId, index) => progress(stepId, 100 + index)) }),
+            facts(),
+        ).statusSentence;
+
+        expect(sentence('setup.thisComputer.installService')).toBe('setupSurface.stageServiceStatus');
+        expect(sentence('setup.thisComputer.installService', 'setup.thisComputer.startService')).toBe('setupSurface.stageServiceStartStatus');
+        // A relay move only reconfigures and restarts an existing service; it installs nothing.
+        expect(sentence('setup.thisComputer.configureRelay', 'setup.thisComputer.restartService')).toBe('setupSurface.stageServiceRestartStatus');
+        // The ancillary PATH report keeps the sentence of the service step it ran beside.
+        expect(sentence('setup.thisComputer.restartService', 'setup.thisComputer.pathExposure')).toBe('setupSurface.stageServiceRestartStatus');
+    });
+
+    it('titles a run that moves this computer to another relay as a move, not a first setup', () => {
+        const run = runState({ events: [progress('setup.thisComputer.restartService', 100)] });
+
+        expect(deriveSetupStageModel(run, facts()).title).toBe('setupSurface.workingTitle');
+        expect(deriveSetupStageModel(run, facts({ relayMove: true })).title).toEqual({
+            key: 'setupSurface.movingTitle', params: { relay: RELAY },
+        });
+        // A failure keeps its own honest title whatever the run was for.
+        const failed = runState({
+            status: 'failed',
+            events: [progress('setup.thisComputer.restartService', 100)],
+            result: { protocolVersion: SYSTEM_TASK_PROTOCOL_VERSION, taskId: 'task_1', ok: false, error: { code: 'cli_command_failed', message: 'x' } },
+        });
+        expect(deriveSetupStageModel(failed, facts({ relayMove: true })).title).toBe('setupSurface.blockedTitle');
     });
 
     it('announces the step position, never a percentage', () => {

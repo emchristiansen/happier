@@ -1,4 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { reloadConfiguration } from '@/configuration';
+import axios from 'axios';
 
 import type { Credentials } from '@/persistence';
 import type { initializeRuntimeOverridesSynchronizer as initializeRuntimeOverridesSynchronizerFn } from '@/agent/runtime/runtimeOverridesSynchronizer';
@@ -49,7 +54,7 @@ const testCredentials: Credentials = {
 
 let metadataUpdateDeferred: Deferred<void>;
 let currentMetadataVersion = 1;
-const getOrCreateSessionMock = vi.fn<() => Promise<StartupSessionResponse>>(async () => ({
+const getOrCreateSessionMock = vi.fn<(opts: { tag: string }) => Promise<StartupSessionResponse>>(async () => ({
     id: 'session-start',
     metadataVersion: currentMetadataVersion,
 }));
@@ -93,6 +98,7 @@ const runStartupCoordinatorMock = vi.fn(() => {
     throw new Error('fast-start coordinator should not run');
 });
 const claudeLocalMock = vi.fn(async () => undefined);
+let sessionClientConstructionError: Error | null = null;
 let lastResolveRunnerMcpServersParams: any = null;
 const probeClaudeInstalledRuntimeCapabilitiesMock = vi.fn(async () => ({
     supportsEffort: true,
@@ -114,16 +120,12 @@ vi.mock('@/ui/doctor', () => ({
     getEnvironmentInfo: vi.fn(() => ({})),
 }));
 
-vi.mock('@/api/offline/serverConnectionErrors', () => ({
-    connectionState: { setBackend: vi.fn(), notifyOffline: vi.fn() },
-    startOfflineReconnection: vi.fn(() => ({ cancel: vi.fn() })),
-}));
-
 vi.mock('@/agent/runtime/initializeBackendApiContext', () => ({
     initializeBackendApiContext: vi.fn(async () => ({
         api: {
             getOrCreateSession: getOrCreateSessionMock,
             sessionSyncClient: vi.fn(() => {
+                if (sessionClientConstructionError) throw sessionClientConstructionError;
                 lastSessionClient = {
                     onUserMessage: vi.fn(),
                     sendSessionEvent: vi.fn(),
@@ -283,6 +285,8 @@ vi.mock('@/backends/claude/claudeLocal', () => ({
     claudeLocal: claudeLocalMock,
 }));
 
+const { runClaude: runClaudeForOfflineContract } = await import('./runClaude');
+
 describe('runClaude startup metadata ordering', () => {
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
         void code;
@@ -299,6 +303,7 @@ describe('runClaude startup metadata ordering', () => {
             throw new Error('fast-start coordinator should not run');
         });
         claudeLocalMock.mockResolvedValue(undefined);
+        sessionClientConstructionError = null;
         lastSessionClient = null;
         lastRuntimeOverridesSynchronizerParams = null;
         lastResolveRunnerMcpServersParams = null;
@@ -317,6 +322,118 @@ describe('runClaude startup metadata ordering', () => {
 
     afterEach(() => {
         exitSpy.mockClear();
+    });
+
+    it('retries legacy offline startup against the same durable Session creation tag', async () => {
+        const happyHomeDir = await mkdtemp(join(tmpdir(), 'happier-claude-offline-owner-'));
+        vi.stubEnv('HAPPIER_HOME_DIR', happyHomeDir);
+        vi.stubEnv('HAPPIER_CLAUDE_UNIFIED_TERMINAL_PIN', '0');
+        reloadConfiguration();
+        // The health HTTP request and provider process are the genuine external boundaries.
+        const health = vi.spyOn(axios, 'get').mockResolvedValue({ status: 200 });
+        const localExit = createDeferred<void>();
+        claudeLocalMock.mockImplementation(async () => {
+            await localExit.promise;
+            return undefined;
+        });
+        sessionClientConstructionError = new Error('network-client-construction-failed');
+        const creationTags: string[] = [];
+        getOrCreateSessionMock.mockImplementation(async ({ tag }) => {
+            creationTags.push(tag);
+            return creationTags.length === 1 ? null : { id: tag, metadataVersion: 1 };
+        });
+        exitSpy.mockImplementation(() => { throw new Error('runner-exited'); });
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        const runner = runClaudeForOfflineContract(testCredentials, {
+            startedBy: 'daemon', startingMode: 'remote',
+            claudeRemoteMetaDefaults: { claudeUnifiedTerminalEnabled: false },
+        }).then(() => null, (error: unknown) => error);
+        try {
+            await vi.waitFor(() => expect(claudeLocalMock).toHaveBeenCalled());
+            await vi.advanceTimersByTimeAsync(20_000);
+            await vi.waitFor(() => expect(creationTags.length).toBeGreaterThanOrEqual(3), { timeout: 20_000 });
+            expect(new Set(creationTags).size).toBe(1);
+        } finally {
+            vi.useRealTimers();
+            localExit.resolve();
+            await runner;
+            health.mockRestore();
+            exitSpy.mockImplementation(() => undefined as never);
+            vi.unstubAllEnvs();
+            reloadConfiguration();
+            await rm(happyHomeDir, { recursive: true, force: true });
+        }
+    });
+
+    it('publishes an inherited Herdr terminal for same-pane unified Claude', async () => {
+        const { runClaude } = await import('./runClaude');
+        const runPromise = runClaude(testCredentials, {
+            startedBy: 'terminal',
+            startingMode: 'local',
+            terminalRuntime: {
+                mode: 'herdr', requested: 'herdr',
+                herdrSessionName: 'default', herdrSocketPath: '/tmp/herdr.sock',
+                herdrTerminalId: 'term_wrapper', herdrPaneId: 'w1:p8',
+            },
+            claudeRemoteMetaDefaults: {
+                claudeUnifiedTerminalEnabled: true,
+                claudeUnifiedTerminalHost: 'herdr',
+            },
+        }).then(() => 'resolved', (error) => error);
+
+        await waitFor(() => applyStartupMetadataUpdateToSessionMock.mock.calls.length === 1);
+        expect(createSessionMetadataMock).toHaveBeenCalledWith(expect.objectContaining({
+            terminalRuntime: expect.objectContaining({
+                mode: 'herdr',
+                requested: 'herdr',
+                herdrTerminalId: 'term_wrapper',
+                herdrPaneId: 'w1:p8',
+            }),
+        }));
+        metadataUpdateDeferred.resolve();
+        await expect(runPromise).resolves.toBe(stopAfterSeed);
+    }, 90_000);
+
+    it('allows a daemon-started local unified Claude runner only inside its complete Herdr terminal', async () => {
+        const { runClaude } = await import('./runClaude');
+        const runPromise = runClaude(testCredentials, {
+            startedBy: 'daemon',
+            startingMode: 'local',
+            terminalRuntime: {
+                mode: 'herdr', requested: 'herdr',
+                herdrSessionName: 'work', herdrSocketPath: '/tmp/herdr-work.sock',
+                herdrTerminalId: 'term_owned', herdrPaneId: 'w1:p9',
+            },
+            claudeRemoteMetaDefaults: {
+                claudeUnifiedTerminalEnabled: true,
+                claudeUnifiedTerminalHost: 'herdr',
+            },
+        }).then(() => 'resolved', (error) => error);
+
+        await waitFor(() => applyStartupMetadataUpdateToSessionMock.mock.calls.length === 1);
+        expect(createSessionMetadataMock).toHaveBeenCalledWith(expect.objectContaining({
+            startedBy: 'daemon',
+            terminalRuntime: expect.objectContaining({
+                mode: 'herdr',
+                requested: 'herdr',
+                herdrTerminalId: 'term_owned',
+                herdrPaneId: 'w1:p9',
+            }),
+        }));
+        metadataUpdateDeferred.resolve();
+        await expect(runPromise).resolves.toBe(stopAfterSeed);
+    }, 90_000);
+
+    it('rejects daemon-started local mode without a complete current Herdr terminal', async () => {
+        const { runClaude } = await import('./runClaude');
+
+        await expect(runClaude(testCredentials, {
+            startedBy: 'daemon',
+            startingMode: 'local',
+            terminalRuntime: { mode: 'herdr', requested: 'herdr' },
+        })).rejects.toThrow('Daemon-spawned sessions cannot use local/interactive mode');
+
+        expect(createSessionMetadataMock).not.toHaveBeenCalled();
     });
 
     it('waits for attach startup metadata writes before seeding runtime overrides', async () => {

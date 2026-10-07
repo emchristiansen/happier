@@ -107,9 +107,18 @@ hdev self update
 
 There is no separate public daemon installer endpoint today; the daemon rides with the matching CLI lane on that machine.
 
+After a successful `self update`, a daemon that lane's background service is running is restarted so it runs the new
+version. A daemon you started yourself (`happier daemon start`) and another lane's service are left running; restart
+those yourself when you are ready.
+
 ### Side-by-side installs (stable vs preview vs dev)
 
 You can install all three public lanes side-by-side (`happier`, `hprev`, `hdev`) without them overwriting each other.
+
+The unsuffixed `happier` command belongs to the lane you installed first, or the one you last picked with the
+installer's `--channel`. Installing or updating another lane — including a desktop app of another lane — adds only
+that lane's own command (`hprev`, `hdev`) and never changes what `happier` runs. The desktop app of another lane
+uses your default lane's CLI and its background service instead of installing a second one.
 
 Daemon runtime state is lane-scoped, and daemon services (LaunchAgent/systemd/Scheduled Task) use lane-scoped service identifiers.
 To inspect the exact service name/label/unit on your platform, run:

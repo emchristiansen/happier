@@ -11,6 +11,7 @@ import type {
 
 import { renderDoctorRepairReport } from './renderDoctorRepairReport';
 import { renderAuthentication } from './sections/renderAuthentication';
+import { warn } from '@happier-dev/cli-common/output';
 
 const cli: CurrentCliInfo = {
   releaseChannel: 'dev',
@@ -205,7 +206,7 @@ describe('renderDoctorRepairReport — card layout', () => {
     expect(mismatched).toMatch(/→.*service definition drifted/);
   });
 
-  it('card uses ● glyph for entries', () => {
+  it('marks a card that needs attention with the shared warning glyph', () => {
     const finding: RepairFinding = {
       kind: 'automatic_startup_stale_definition',
       severity: 'warning',
@@ -213,7 +214,7 @@ describe('renderDoctorRepairReport — card layout', () => {
       entry,
     };
     const out = renderDoctorRepairReport(makeReport({ findings: [finding] })).join('\n');
-    expect(out).toContain('●');
+    expect(out).toContain(warn());
   });
 });
 
@@ -224,7 +225,7 @@ describe('renderDoctorRepairReport — authentication evidence', () => {
         {
           serverId: 'cloud', serverName: 'Cloud', serverUrl: 'https://api.happier.dev',
           hasCredentials: true, isExpired: false, machineRegistered: true,
-          credentialEvidence: 'active-store',
+          credentialEvidence: 'inspected-store',
           isActive: true, reachability: 'unreachable',
         },
       ],
@@ -263,7 +264,7 @@ describe('renderDoctorRepairReport — authentication evidence', () => {
         {
           serverId: 'cloud', serverName: 'Cloud', serverUrl: 'https://api.happier.dev',
           hasCredentials: true, isExpired: false, machineRegistered: true,
-          credentialEvidence: 'active-store',
+          credentialEvidence: 'inspected-store',
           isActive: true, reachability: 'verified',
         },
         {

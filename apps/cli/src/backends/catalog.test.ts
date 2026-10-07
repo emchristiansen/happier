@@ -215,7 +215,6 @@ describe('AGENTS', () => {
     await expect(entry.getPreflightSessionControlsProbeAdapter!()).resolves.toMatchObject({
       probeModelsRaw: expect.any(Function),
       probeModesRaw: expect.any(Function),
-      cliModelsCommandArgs: ['models'],
       probeConfigOptionsRaw: expect.any(Function),
     });
   });

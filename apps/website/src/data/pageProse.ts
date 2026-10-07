@@ -167,7 +167,7 @@ export const PAGE_PROSE = {
         p1: "Everything else\nyou didn’t know you needed.",
     },
     footer: {
-        p0: "One open-source client for every coding agent — thirteen of them, run on your own computer, with your own subscriptions or API keys, end-to-end encrypted.",
+        p0: "One open-source client for your coding agents, run on your own computer with your own subscriptions or API keys, end-to-end encrypted.",
         p1: "© {BUILD_YEAR} Happier. Open source. Made with care.",
     },
     getStarted: {
@@ -242,8 +242,8 @@ export const PAGE_PROSE = {
         p1: "Every tool.\nOne interface.",
     },
     terminalPage: {
-        p0: "Three of the thirteen, and they do not behave the same way. Codex is exclusive — one driver at a time. OpenCode is not, and Claude Code can be either, depending on which runtime you start it under.",
-        p1: "The other ten agents Happier runs still start from the terminal with <1>happier <agent></1> and still appear on your phone. What they do not do is let you take the session back into their own TUI half way through.",
+        p0: "These three illustrate different hand-offs. Codex is exclusive — one driver at a time. OpenCode is not, and Claude Code can be either, depending on which runtime you start it under.",
+        p1: "Other agents can also start from the terminal with <1>happier <agent></1> and appear on your phone. Mid-session hand-off to a vendor TUI depends on the agent and runtime; check the current capability reference before relying on it.",
         p2: "Nothing on this page needs configuration if you start your sessions from the terminal — that path works the moment the CLI is installed. The settings that do need a decision are tmux integration, the Windows session mode and where the embedded terminal docks, and all three are in the <1>configuration reference</1>.",
         p3: "Feature",
         p4: "Keep your Claude Code, Codex and OpenCode terminals, or work from the app",

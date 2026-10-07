@@ -17,7 +17,7 @@ import {
     type SessionReminderPresetV1,
 } from '@/sync/domains/session/organization/sessionReminderPreset';
 import { t } from '@/text';
-import { SessionReminderPicker } from './SessionReminderPicker';
+import { isSessionReminderPickerAvailable, SessionReminderPicker } from './SessionReminderPicker';
 
 export type SessionReminderDateTimeResult = Readonly<{
     remindAt: number;
@@ -75,6 +75,7 @@ export function SessionReminderDateTimeModal(props: Readonly<{
     const validTimestamp = parsed !== null && parsed > props.nowMs ? parsed : null;
     const rule = validTimestamp === null ? null : inferSessionReminderPresetRule(validTimestamp, props.nowMs);
     const pickerValue = React.useMemo(() => new Date(parsed ?? initial.getTime()), [initial, parsed]);
+    const pickerAvailable = isSessionReminderPickerAvailable();
 
     const openPicker = React.useCallback((mode: 'date' | 'time') => {
         setPickerMode((current) => current === mode ? null : mode);
@@ -131,18 +132,18 @@ export function SessionReminderDateTimeModal(props: Readonly<{
                     <Text style={{ color: theme.colors.text.secondary, fontSize: 13 }}>{t('sessionsList.reminders.dateLabel')}</Text>
                     <View ref={dateAnchorRef} style={{ position: 'relative' }}>
                         <TextInput testID="session-reminder-date-input" accessibilityLabel={t('sessionsList.reminders.dateLabel')} value={dateValue} onChangeText={setDateValue} placeholder={t('sessionsList.reminders.datePlaceholder')} style={fieldStyle} />
-                        <Pressable testID="session-reminder-date-picker-button" accessibilityRole="button" accessibilityLabel={t('sessionsList.reminders.dateLabel')} hitSlop={8} onPress={() => openPicker('date')} style={({ pressed }) => ({ position: 'absolute', right: 4, top: 4, bottom: 4, width: 40, alignItems: 'center', justifyContent: 'center', opacity: pressed ? 0.55 : 1 })}>
+                        {pickerAvailable ? <Pressable testID="session-reminder-date-picker-button" accessibilityRole="button" accessibilityLabel={t('sessionsList.reminders.dateLabel')} hitSlop={8} onPress={() => openPicker('date')} style={({ pressed }) => ({ position: 'absolute', right: 4, top: 4, bottom: 4, width: 40, alignItems: 'center', justifyContent: 'center', opacity: pressed ? 0.55 : 1 })}>
                             <Icon name="calendar" size={18} color={theme.colors.text.secondary} />
-                        </Pressable>
+                        </Pressable> : null}
                     </View>
                 </View>
                 <View style={{ width: 132, gap: 7 }}>
                     <Text style={{ color: theme.colors.text.secondary, fontSize: 13 }}>{t('sessionsList.reminders.timeLabel')}</Text>
                     <View ref={timeAnchorRef} style={{ position: 'relative' }}>
                         <TextInput testID="session-reminder-time-input" accessibilityLabel={t('sessionsList.reminders.timeLabel')} value={timeValue} onChangeText={setTimeValue} placeholder="09:00" keyboardType="numbers-and-punctuation" style={fieldStyle} />
-                        <Pressable testID="session-reminder-time-picker-button" accessibilityRole="button" accessibilityLabel={t('sessionsList.reminders.timeLabel')} hitSlop={8} onPress={() => openPicker('time')} style={({ pressed }) => ({ position: 'absolute', right: 4, top: 4, bottom: 4, width: 40, alignItems: 'center', justifyContent: 'center', opacity: pressed ? 0.55 : 1 })}>
+                        {pickerAvailable ? <Pressable testID="session-reminder-time-picker-button" accessibilityRole="button" accessibilityLabel={t('sessionsList.reminders.timeLabel')} hitSlop={8} onPress={() => openPicker('time')} style={({ pressed }) => ({ position: 'absolute', right: 4, top: 4, bottom: 4, width: 40, alignItems: 'center', justifyContent: 'center', opacity: pressed ? 0.55 : 1 })}>
                             <Icon name="clock" size={18} color={theme.colors.text.secondary} />
-                        </Pressable>
+                        </Pressable> : null}
                     </View>
                 </View>
             </View>

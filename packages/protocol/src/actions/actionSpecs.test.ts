@@ -110,6 +110,12 @@ function sorted(values: readonly string[]): string[] {
 }
 
 describe('Action Spec Registry', () => {
+  it('does not advertise CLI-only localId on shared session send tools', () => {
+    const spec = getActionSpec('session.message.send');
+    const schema = z.toJSONSchema(spec.inputSchema, { target: 'draft-7' });
+    expect(schema.properties).not.toHaveProperty('localId');
+  });
+
   it('recommends current-session omission in execution-run start examples', () => {
     for (const actionId of [
       'review.start',

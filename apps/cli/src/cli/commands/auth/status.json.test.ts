@@ -41,12 +41,13 @@ describe('happier auth status --json', () => {
             v: number;
             ok: boolean;
             kind: string;
-            error?: { code?: string };
+            error?: { code?: string; serverId?: string };
           };
           expect(parsed.v).toBe(1);
           expect(parsed.ok).toBe(false);
           expect(parsed.kind).toBe('auth_status');
           expect(parsed.error?.code).toBe('not_authenticated');
+          expect(parsed.error?.serverId).toBe(configuration.activeServerId);
           expect(process.exitCode).toBe(1);
         } finally {
           output.restore();
@@ -170,12 +171,13 @@ describe('happier auth status --json', () => {
             v: number;
             ok: boolean;
             kind: string;
-            error?: { code?: string };
+            error?: { code?: string; serverId?: string };
           };
           expect(parsed.v).toBe(1);
           expect(parsed.ok).toBe(false);
           expect(parsed.kind).toBe('auth_status');
           expect(parsed.error?.code).toBe('not_authenticated');
+          expect(parsed.error?.serverId).toBe(configuration.activeServerId);
           expect(process.exitCode).toBe(1);
         } finally {
           await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
@@ -206,7 +208,7 @@ describe('happier auth status --json', () => {
           expect(req.headers.authorization).toBe('Bearer token_ephemeral_server');
           res.statusCode = 200;
           res.setHeader('content-type', 'application/json');
-          res.end(JSON.stringify({ id: 'acct_1', email: 'qa@example.test' }));
+          res.end(JSON.stringify({ id: 'acct_1', email: 'qa@example.test', username: 'qa' }));
         });
 
         await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
@@ -251,16 +253,28 @@ describe('happier auth status --json', () => {
           const parsed = JSON.parse(output.text().trim()) as {
             ok: boolean;
             kind: string;
-            data?: { authenticated?: boolean; machineId?: string; accountId?: string };
-            error?: { code?: string };
+            data?: { authenticated?: boolean; machineId?: string; accountId?: string; accountLabel?: string; relayHost?: string; serverId?: string };
+            error?: { code?: string; serverId?: string };
           };
           expect(parsed.ok).toBe(true);
           expect(parsed.kind).toBe('auth_status');
           expect(parsed.data?.authenticated).toBe(true);
+          expect(parsed.data?.serverId).toBe(configuration.activeServerId);
           expect(parsed.data?.machineId).toBe('mid_ephemeral');
           expect(parsed.data?.accountId).toBe('acct_1');
+          // The same identity the human output prints, so a person can compare it with the app.
+          expect(parsed.data?.accountLabel).toBe('qa');
+          expect(parsed.data?.relayHost).toBe(`127.0.0.1:${address.port}`);
           expect(parsed.error).toBeUndefined();
           expect(process.exitCode).toBe(0);
+
+          const human = captureConsoleText();
+          try {
+            await handleAuthCommand(['status', '--server-url', serverUrl]);
+            expect(human.text()).toContain(`Authenticated as qa (acct_1) on 127.0.0.1:${address.port}`);
+          } finally {
+            human.restore();
+          }
         } finally {
           await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
           output.restore();

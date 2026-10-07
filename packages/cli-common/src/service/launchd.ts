@@ -29,6 +29,11 @@ export function buildLaunchdPlistXml(params: Readonly<{
    */
   runAtLoad?: boolean;
   keepAliveOnFailure?: boolean;
+  /**
+   * The apps this job belongs to (`AssociatedBundleIdentifiers`): macOS System Settings › Login
+   * Items then shows the job under that app's name instead of an anonymous background item.
+   */
+  associatedBundleIdentifiers?: readonly string[];
   startIntervalSec?: number;
   startCalendarInterval?: Readonly<{ hour: number; minute: number }>;
 }>): string {
@@ -66,6 +71,11 @@ export function buildLaunchdPlistXml(params: Readonly<{
         `      <false/>\n` +
         `    </dict>\n`
       );
+
+  const bundleIds = (params.associatedBundleIdentifiers ?? []).map((id) => String(id ?? '').trim()).filter(Boolean);
+  const associatedBundleIdentifiersXml = bundleIds.length > 0
+    ? `\n    <key>AssociatedBundleIdentifiers</key>\n    <array>\n${bundleIds.map((id) => `      <string>${xmlEscape(id)}</string>`).join('\n')}\n    </array>\n`
+    : '';
 
   const intervalRaw = Number(params.startIntervalSec);
   const interval = Number.isFinite(intervalRaw) && intervalRaw > 0 ? Math.floor(intervalRaw) : 0;
@@ -110,7 +120,7 @@ ${programArgsXml}
 
     <key>RunAtLoad</key>
     ${params.runAtLoad === false ? '<false/>' : '<true/>'}
-${keepAlive}
+${associatedBundleIdentifiersXml}${keepAlive}
 ${startCalendarInterval || startInterval}
 ${abandonProcessGroupXml}
 ${workingDirXml}    <key>StandardOutPath</key>

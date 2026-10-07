@@ -11,6 +11,8 @@ import { Typography } from '@/constants/Typography';
 import { t } from '@/text';
 import type { SessionReminderPickerProps } from './SessionReminderPicker';
 
+export function isSessionReminderPickerAvailable(): boolean { return true; }
+
 const DAY_SIZE = 38;
 const MONDAY = new Date(2024, 0, 1, 12);
 

@@ -51,6 +51,7 @@ vi.mock('@/constants/Typography', () => ({
   Typography: {
     default: () => ({}),
     mono: () => ({}),
+    eyebrow: () => ({}),
   },
 }));
 
@@ -124,7 +125,10 @@ describe('SessionGettingStartedGuidanceView', () => {
     expect(expandedContent).not.toContain('happier server add');
     expect(expandedContent).toContain('https://api.company.example');
     expect(expandedContent).not.toContain('$ npm i -g @happier-dev/cli');
-    expect(expandedContent).toContain('curl -fsSL https://happier.dev/install | bash -s -- --yes');
+    // Desktop already installed the command line on this computer, so the terminal path starts at
+    // setup rather than re-teaching the install (U13).
+    expect(screen.findByTestId('session-getting-started-step-install_cli')).toBeNull();
+    expect(expandedContent).not.toContain('curl -fsSL https://happier.dev/install');
     expect(expandedContent).not.toContain('npm i -g @happier-dev/cli');
     expect(expandedContent).not.toContain('happier service install');
     expect(expandedContent).toContain('happier setup --relay "https://api.company.example"');

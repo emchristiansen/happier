@@ -10,7 +10,7 @@ import { installAgentInputCommonModuleMocks } from './agentInputTestHelpers';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
-const storageSettings: Settings = {
+const storageSettings: { -readonly [K in keyof Settings]: Settings[K] } = {
     ...settingsDefaults,
     profiles: [],
     agentInputEnterToSend: true,
@@ -332,12 +332,14 @@ describe('AgentInput (context usage badge)', () => {
 
     beforeEach(() => {
         captured.last = null;
+        storageSettings.sessionUsageGaugeLabels = false;
         windowDimensionsState.width = 800;
         windowDimensionsState.height = 600;
     });
 
-    it('renders the context badge from provider-reported context usage', async () => {
+    it.each([false, true])('renders provider-reported context and honors the global label preference (%s)', async (showLabels) => {
         captured.last = null;
+        storageSettings.sessionUsageGaugeLabels = showLabels;
         const { AgentInput } = await import('./AgentInput');
 
         const screen = await renderScreen(
@@ -368,6 +370,7 @@ describe('AgentInput (context usage badge)', () => {
         expect(screen.findByTestId('agent-input-context-usage-ring')).toBeTruthy();
         expect(screen.findByTestId('agent-input-context-usage-value')?.props.children).toBe('19');
         expect(String(badge?.props.accessibilityLabel ?? '')).toContain('38.7k/200k');
+        expect(Boolean(screen.findByTestId('agent-input-context-usage-label'))).toBe(showLabels);
 
         act(() => screen.tree.unmount());
     });
@@ -520,6 +523,7 @@ describe('AgentInput (context usage badge)', () => {
                 status: 'ok',
                 details: {},
             },
+            usageRings: [],
             allMeterRows: [
                 {
                     meterId: 'weekly',
@@ -571,8 +575,11 @@ describe('AgentInput (context usage badge)', () => {
 
         expect(screen.findByTestId('agent-input-provider-usage-popover')).toBeTruthy();
         expect(screen.findByTestId('agent-input-provider-usage-meter:weekly')).toBeTruthy();
-        const providerUsageOverlay = screen.findByType('FloatingOverlay');
-        expect(providerUsageOverlay?.props.scrollEnabled).toBe(false);
+        // Plain quota detail rows use the shared scroll owner; match their overlay by content.
+        const providerUsageOverlays = screen.findAll((node) => String(node.type) === 'FloatingOverlay'
+            && node.findAll((child) => child.props.testID === 'agent-input-provider-usage-meter:weekly').length > 0);
+        expect(providerUsageOverlays).toHaveLength(1);
+        expect(providerUsageOverlays[0]?.props.scrollEnabled).toBe(true);
         expect(screen.getTextContent()).toContain('Claude usage');
         expect(screen.getTextContent()).toContain('Work account');
         expect(screen.getTextContent()).toContain('18% left · resets in 2h');
@@ -620,6 +627,7 @@ describe('AgentInput (context usage badge)', () => {
                 status: 'ok',
                 details: {},
             },
+            usageRings: [],
             allMeterRows: [
                 {
                     meterId: 'weekly',

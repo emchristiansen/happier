@@ -1,12 +1,13 @@
 FROM node:22-bookworm
 
-ENV container=docker
+ENV container=docker SYSTEMD_LOG_TARGET=console SYSTEMD_LOG_LEVEL=info
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     bash \
     ca-certificates \
     curl \
+    dbus-user-session \
     git \
     openssh-server \
     procps \
@@ -30,8 +31,6 @@ WORKDIR /work
 COPY bin/ /opt/happier-npm-e2e/bin/
 
 STOPSIGNAL SIGRTMIN+3
-
-VOLUME ["/sys/fs/cgroup"]
 
 EXPOSE 22
 

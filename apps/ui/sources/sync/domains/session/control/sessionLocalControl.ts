@@ -1,4 +1,5 @@
 import type { Session, AgentState } from '@/sync/domains/state/storageTypes';
+import { resolveTerminalControlServiceabilityPolicy } from '@happier-dev/protocol';
 
 export type SessionLocalControlTopology = 'exclusive' | 'shared';
 
@@ -23,7 +24,9 @@ function readAgentStateLocalControl(agentState: AgentState | null | undefined): 
     const topology = raw.topology === 'shared' ? 'shared' : 'exclusive';
     const remoteWritable = normalizeBoolean(raw.remoteWritable) ?? false;
     const canAttach = normalizeBoolean(raw.canAttach) ?? (!attached);
-    const canDetach = normalizeBoolean(raw.canDetach) ?? attached;
+    // Shared release requires runner-owned custody. First-party writers emit
+    // this capability explicitly; retain the legacy exclusive-control fallback.
+    const canDetach = normalizeBoolean(raw.canDetach) ?? (topology === 'exclusive' && attached);
 
     return {
         attached,
@@ -35,7 +38,14 @@ function readAgentStateLocalControl(agentState: AgentState | null | undefined): 
 }
 
 export function getSessionLocalControlState(session: Session | null): SessionLocalControlState | null {
-    const state = readAgentStateLocalControl(session?.agentState ?? null);
+    // Agent state survives shutdown. Live controls require the current runner;
+    // preserved terminal-host recovery remains owned by terminal serviceability.
+    if (session?.active !== true) return null;
+    const serviceability = session.metadata?.terminal?.controlServiceabilityV1;
+    const terminalPolicy = resolveTerminalControlServiceabilityPolicy(serviceability);
+    if (terminalPolicy.hostPresence === 'retired' || serviceability?.state === 'recoverable_unservable') return null;
+
+    const state = readAgentStateLocalControl(session.agentState);
     if (state) return state;
 
     if (session?.agentState?.controlledByUser === true) {

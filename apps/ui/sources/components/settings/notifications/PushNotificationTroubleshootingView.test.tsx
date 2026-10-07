@@ -188,6 +188,25 @@ describe('PushNotificationTroubleshootingView', () => {
         expect(row?.props?.detail).toBe('settingsNotifications.pushTroubleshooting.devices.thisDevice');
     });
 
+    it('shows the native token error in the troubleshooting row', async () => {
+        const Notifications = await import('expo-notifications');
+        vi.mocked(Notifications.getPermissionsAsync).mockResolvedValue({
+            status: PermissionStatus.GRANTED,
+            expires: 'never',
+            granted: true,
+            canAskAgain: false,
+        } satisfies Awaited<ReturnType<typeof Notifications.getPermissionsAsync>>);
+        vi.mocked(Notifications.getExpoPushTokenAsync).mockRejectedValue(new Error('Firebase Installations API returned 403'));
+        fetchPushTokensMock.mockResolvedValue([]);
+
+        const { PushNotificationTroubleshootingView } = await import('./PushNotificationTroubleshootingView');
+        const screen = await renderSettingsView(<PushNotificationTroubleshootingView />);
+        await flushHookEffects({ cycles: 20 });
+
+        const tokenRow = screen.findRowByTitle('settingsNotifications.pushTroubleshooting.token.title');
+        expect(tokenRow?.props.subtitle).toContain('Firebase Installations API returned 403');
+    });
+
     it('deletes a stale token after confirmation', async () => {
         const Notifications = await import('expo-notifications');
         vi.mocked(Notifications.getPermissionsAsync).mockResolvedValue({

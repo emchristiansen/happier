@@ -9,7 +9,6 @@ const cliSourceRoot = resolve(localControlDir, '..', '..');
 
 const guardedFiles = [
   'agent/localControl/createAgentLocalControlState.ts',
-  'agent/localControl/createProviderAttachStatePublisher.ts',
   'agent/localControl/createLocalRemoteModeController.ts',
 ] as const;
 

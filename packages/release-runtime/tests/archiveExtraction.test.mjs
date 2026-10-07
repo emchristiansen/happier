@@ -1167,6 +1167,8 @@ test('extractArchivePayloadToDirectory rejects standalone tar symlinks and hardl
       }),
       /link/iu,
     );
+    assert.deepEqual((await readdir(rootDir)).filter((name) => name.includes('.extract-')), []);
+    await assert.rejects(stat(join(rootDir, 'extract-symlink')), { code: 'ENOENT' });
 
     await link(join(payloadDir, 'target'), join(payloadDir, 'hardlink'));
     const hardlinkArchivePath = join(rootDir, 'hardlink.tar.gz');
@@ -1182,6 +1184,8 @@ test('extractArchivePayloadToDirectory rejects standalone tar symlinks and hardl
       }),
       /link/iu,
     );
+    assert.deepEqual((await readdir(rootDir)).filter((name) => name.includes('.extract-')), []);
+    await assert.rejects(stat(join(rootDir, 'extract-hardlink')), { code: 'ENOENT' });
   } finally {
     await rm(rootDir, { recursive: true, force: true });
   }

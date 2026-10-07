@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { resolveTerminalHost } from './resolveTerminalHost';
 import type { TerminalHostAdapter, TerminalHostResolverPlatform } from './_types';
 
-function adapter(kind: 'tmux' | 'zellij' | 'windows_console'): TerminalHostAdapter {
+function adapter(kind: 'tmux' | 'zellij' | 'herdr' | 'windows_console'): TerminalHostAdapter {
   return {
     kind,
     createOrAttachHost: async () => {
@@ -21,6 +21,24 @@ function adapter(kind: 'tmux' | 'zellij' | 'windows_console'): TerminalHostAdapt
 }
 
 describe('resolveTerminalHost', () => {
+  it('uses Herdr only when explicitly selected and available', () => {
+    const result = resolveTerminalHost({
+      preference: 'herdr',
+      platform: { os: 'linux', arch: 'arm64' },
+      adapters: { herdr: adapter('herdr'), tmux: adapter('tmux') },
+      tmuxAvailable: true,
+      zellijAvailable: false,
+    });
+    expect(result).toMatchObject({ status: 'resolved', adapter: { kind: 'herdr' } });
+
+    expect(resolveTerminalHost({
+      preference: 'herdr',
+      platform: { os: 'linux', arch: 'arm64' },
+      adapters: { tmux: adapter('tmux') },
+      tmuxAvailable: true,
+      zellijAvailable: false,
+    })).toMatchObject({ status: 'disabled', reason: 'herdr_unavailable' });
+  });
   it('prefers tmux on POSIX auto when tmux is available', () => {
     const result = resolveTerminalHost({
       preference: 'auto',

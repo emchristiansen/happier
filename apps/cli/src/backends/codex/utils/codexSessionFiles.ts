@@ -5,14 +5,48 @@ import { join } from 'node:path';
 import { resolveConfiguredCodexHome } from '@/backends/codex/utils/resolveConfiguredCodexHome';
 
 const CODEX_NATIVE_SEARCH_MAX_DEPTH = 8;
+const CODEX_ROLLOUT_SUFFIX_PATTERN = /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(.+)\.jsonl$/i;
+const CODEX_ROLLOUT_ID_PATTERN = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}))?$/i;
+
+export type CodexRolloutFilename = Readonly<{
+  sessionId: string;
+  threadId?: string;
+  turnId?: string;
+}>;
+
+/** Parses all supported rollout suffixes and identifies UUID-based continuations. */
+export function parseCodexRolloutFilename(filePath: string): CodexRolloutFilename | null {
+  const name = filePath.split(/[/\\\\]/).pop() ?? '';
+  const suffix = CODEX_ROLLOUT_SUFFIX_PATTERN.exec(name)?.[1];
+  if (!suffix) return null;
+  const ids = CODEX_ROLLOUT_ID_PATTERN.exec(suffix);
+  return {
+    sessionId: suffix,
+    ...(ids?.[1] ? { threadId: ids[1] } : {}),
+    ...(ids?.[2] ? { turnId: ids[2] } : {}),
+  };
+}
 
 /**
- * Codex rollout file names are `rollout-<ISO-timestamp>-<sessionId>.jsonl`. A match for a vendor
- * resume id is an exact `-<id>.jsonl` SUFFIX on a `rollout-` prefixed name — never a substring of the
- * id (so `-6425384658.jsonl` does not match the full uuid) and never a non-rollout `session-<id>.jsonl`.
+ * Codex rollout file names are usually `rollout-<ISO-timestamp>-<sessionId>.jsonl`. Newer Codex
+ * continuations can append a turn UUID to the thread UUID (`<sessionId>_<turnId>`); both forms are
+ * accepted, but the thread id itself must remain an exact suffix component and never a substring.
  */
 export function isMatchingCodexRolloutFileName(name: string, vendorResumeId: string): boolean {
-  return name.startsWith('rollout-') && name.endsWith(`-${vendorResumeId}.jsonl`);
+  if (!name.startsWith('rollout-')) return false;
+  const parsed = parseCodexRolloutFilename(name);
+  return isMatchingCodexRolloutIdentity(parsed?.sessionId, vendorResumeId)
+    || isMatchingCodexRolloutIdentity(parsed?.threadId, vendorResumeId);
+}
+
+/** Matches discovered rollout identities while preserving exact boundaries for opaque IDs. */
+export function isMatchingCodexRolloutIdentity(candidateId: string | undefined, requestedId: string): boolean {
+  return candidateId === requestedId
+    || (isUuid(candidateId) && isUuid(requestedId) && candidateId.toLowerCase() === requestedId.toLowerCase());
+}
+
+function isUuid(value: string | undefined): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
 
 /**

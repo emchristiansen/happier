@@ -7,9 +7,13 @@ import {
   readAcquisitionFailureCause,
   redactAcquisitionDiagnostic,
   prepareFirstPartyComponentPayloadFromGitHubRelease,
+  readHappierCliChoiceSync,
   readInstalledVersionMarkersSync,
   resolveFirstPartyInstallLayout,
+  resolveForeignHappierCli,
   resolveInstalledFirstPartyComponentPaths,
+  resolveTerminalHappierCli,
+  type TerminalHappierCli,
   type FirstPartyComponentId,
   type PreparedFirstPartyComponentPayload,
   type FirstPartyAcquisitionOptions,
@@ -70,6 +74,21 @@ export function resolveExplicitOrInstalledLocalFirstPartyCommand(
     }
   }
 
+  // R12 — one CLI per computer. "Keep my own" names the CLI every task runs, even beside a managed
+  // copy still on disk. A kept CLI that disappeared is still this computer's answer (R13 b): using a
+  // leftover managed copy, or acquiring one, would switch CLIs behind the person's back, so it is
+  // the question setup asks first (`inspectLocalHappierCliChoice`) that decides what happens next.
+  const choice = params.componentId === 'happier-cli' ? readHappierCliChoiceSync({ processEnv }) : null;
+  if (choice?.mode === 'own') {
+    if (existsSync(choice.command)) {
+      return { command: choice.command, provenance: 'override' };
+    }
+    throw new SystemTaskExecutionError(
+      'cli_choice_required',
+      `The Happier CLI this computer keeps, at ${choice.command}, is no longer there. Choose which command line Happier uses to continue.`,
+    );
+  }
+
   try {
     const installed = resolveInstalledLocalFirstPartyCommand({
       componentId: params.componentId,
@@ -91,7 +110,36 @@ export function resolveExplicitOrInstalledLocalFirstPartyCommand(
     return { command: repoLocalPath, provenance: 'override' };
   }
 
+  // Until this computer answers R12's question, a `happier` the user installed is the CLI here:
+  // acquiring a managed one beside it — which any read would otherwise do — is exactly the second
+  // CLI the question exists to prevent. "Let Happier manage it" is what lets acquisition run.
+  if (params.componentId === 'happier-cli' && choice?.mode !== 'managed') {
+    const terminal = resolveTerminalLocalHappierCli(processEnv);
+    if (terminal && !terminal.managed) {
+      return { command: terminal.command, provenance: 'override' };
+    }
+  }
+
   return null;
+}
+
+/**
+ * A `happier` on the search path that this Happier home's managed layout did not place, found past
+ * the managed shim (R12/R13 b) — every other copy, for Settings to name and offer to remove.
+ */
+export function resolveForeignLocalHappierCli(processEnv: NodeJS.ProcessEnv): string | null {
+  return resolveForeignHappierCli({
+    binDir: resolveFirstPartyInstallLayout({ componentId: 'happier-cli', processEnv }).shimDir,
+    processEnv,
+  });
+}
+
+/** The `happier` a new terminal runs first — what the R12 question is about (RV3-1). */
+export function resolveTerminalLocalHappierCli(processEnv: NodeJS.ProcessEnv): TerminalHappierCli | null {
+  return resolveTerminalHappierCli({
+    binDir: resolveFirstPartyInstallLayout({ componentId: 'happier-cli', processEnv }).shimDir,
+    processEnv,
+  });
 }
 
 /**
@@ -103,7 +151,7 @@ export function resolveExplicitOrInstalledLocalFirstPartyCommand(
  * record was never acquired here, so it resolves as `override`: still runnable, but its pairing
  * approval is put to the user instead of granted unattended.
  */
-function resolveInstalledLocalFirstPartyCommand(params: Readonly<{
+export function resolveInstalledLocalFirstPartyCommand(params: Readonly<{
   componentId: FirstPartyComponentId;
   processEnv: NodeJS.ProcessEnv;
   releaseRing: PublicReleaseRingId;
@@ -195,6 +243,33 @@ function acquisitionFailureCode(
     : 'first_party_component_install_failed';
 }
 
+/**
+ * The named task failure for an acquisition that failed in `phase` (reported as a progress
+ * failure too). A named task failure — a version refusal, or one raised inside a dep — keeps its
+ * own code: relabelling it as an install failure would hide why the acquisition was refused.
+ */
+export function toAcquisitionFailure(params: Readonly<{
+  componentId: FirstPartyComponentId;
+  error: unknown;
+  phase: Parameters<NonNullable<FirstPartyAcquisitionOptions['onProgress']>>[0]['phase'];
+  onProgress: NonNullable<FirstPartyAcquisitionOptions['onProgress']>;
+}>): SystemTaskExecutionError {
+  const { error } = params;
+  if (error instanceof SystemTaskExecutionError) {
+    return error;
+  }
+  const message = error instanceof Error && error.message.trim()
+    ? error.message.trim()
+    : `Failed to acquire ${params.componentId}.`;
+  const failurePhase = error instanceof FirstPartyAcquisitionError ? error.phase : params.phase;
+  const failureCause = error instanceof FirstPartyAcquisitionError ? error.failureCause : readAcquisitionFailureCause(error);
+  params.onProgress({ phase: failurePhase, failure: { cause: failureCause } });
+  return new SystemTaskExecutionError(
+    acquisitionFailureCode(params.componentId, failurePhase),
+    redactAcquisitionDiagnostic(message),
+  );
+}
+
 export type LocalFirstPartyCommandAcquisitionDeps = Readonly<{
   preparePayload: (params: FirstPartyAcquisitionOptions & Readonly<{
     componentId: FirstPartyComponentId;
@@ -253,21 +328,7 @@ export async function acquireManagedLocalFirstPartyComponentCommand(
     });
   } catch (error) {
     params.signal?.throwIfAborted();
-    // A named task failure — the version refusal above, or one raised inside a dep — keeps its own
-    // code: relabelling it as an install failure would hide why the acquisition was refused.
-    if (error instanceof SystemTaskExecutionError) {
-      throw error;
-    }
-    const message = error instanceof Error && error.message.trim()
-      ? error.message.trim()
-      : `Failed to acquire ${params.componentId}.`;
-    const failurePhase = error instanceof FirstPartyAcquisitionError ? error.phase : phase;
-    const failureCause = error instanceof FirstPartyAcquisitionError ? error.failureCause : readAcquisitionFailureCause(error);
-    onProgress({ phase: failurePhase, failure: { cause: failureCause } });
-    throw new SystemTaskExecutionError(
-      acquisitionFailureCode(params.componentId, failurePhase),
-      redactAcquisitionDiagnostic(message),
-    );
+    throw toAcquisitionFailure({ componentId: params.componentId, error, phase, onProgress });
   } finally {
     if (prepared) {
       await prepared.cleanup().catch(() => undefined);

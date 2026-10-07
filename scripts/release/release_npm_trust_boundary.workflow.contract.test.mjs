@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -80,6 +80,8 @@ test('every npm credential-bearing job executes workflow-SHA control and only pu
     assert.equal(job.environment, 'release-shared', `${jobName} environment`);
     assert.equal(job.permissions?.['id-token'], 'write', `${jobName} provenance permission`);
     assertTrustedControlCheckout(job, jobName);
+    const setupNode = job.steps.find((step) => step.name === 'Setup Node (npm publish)');
+    assert.equal(setupNode?.with?.['registry-url'], 'https://registry.npmjs.org', `${jobName} registry configuration`);
 
     const source = JSON.stringify(job);
     assert.match(source, /scripts\/pipeline\/npm\/publish-tarball\.mjs/);

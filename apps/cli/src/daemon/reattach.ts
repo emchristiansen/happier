@@ -1,4 +1,5 @@
 import { ALLOWED_HAPPY_SESSION_PROCESS_TYPES } from './pidSafety';
+import { daemonProcessMatchesCurrentScope } from './ownership/daemonProcessScopeIdentity';
 import type { HappyProcessInfo } from './doctor';
 import type { DaemonSessionMarker } from './sessionRegistry';
 import { hashProcessCommand } from './sessionRegistry';
@@ -161,6 +162,7 @@ export function adoptSessionsFromMarkers(params: {
   readProcessInstanceFingerprint?: typeof readProcessInstanceFingerprintSync;
 }): AdoptSessionsFromMarkersResult {
   const happyPidToType = new Map(params.happyProcesses.map((p) => [p.pid, p.type] as const));
+  const happyPidToProcess = new Map(params.happyProcesses.map((p) => [p.pid, p] as const));
   const happyPidToCommandHash = new Map(params.happyProcesses.map((p) => [p.pid, hashProcessCommand(p.command)] as const));
   const happyPidToCommand = new Map(params.happyProcesses.map((p) => [p.pid, p.command] as const));
   const readProcessInstanceFingerprint = params.readProcessInstanceFingerprint ?? readProcessInstanceFingerprintSync;
@@ -171,6 +173,8 @@ export function adoptSessionsFromMarkers(params: {
   const respawnRestoreErrors: Array<{ pid: number; happySessionId: string; message: string }> = [];
 
   for (const marker of params.markers) {
+    const liveProcess = happyPidToProcess.get(marker.pid);
+    if (liveProcess && !daemonProcessMatchesCurrentScope(liveProcess)) continue;
     // Safety: avoid PID reuse adopting an unrelated process. Only adopt if PID currently looks
     // like a Happy session process (best-effort cross-platform via ps-list classification).
     const procType = happyPidToType.get(marker.pid);

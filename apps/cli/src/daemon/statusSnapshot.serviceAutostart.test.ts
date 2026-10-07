@@ -34,6 +34,7 @@ function writeInstalledUnit(declaredAutostart: string | null): string {
     '[Service]',
     'ExecStart=/opt/happier/happier daemon start-sync',
     'Environment=HAPPIER_DAEMON_STARTUP_SOURCE=background-service',
+    `Environment=HAPPIER_HOME_DIR=${process.env.HAPPIER_HOME_DIR}`,
     'Environment=HAPPIER_DAEMON_SERVICE_TARGET_MODE=default-following',
     ...(declaredAutostart === null
       ? []

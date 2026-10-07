@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { chmod, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { accountSettingsParse } from '@happier-dev/protocol';
+import { HAPPIER_CLAUDE_ENDPOINT_STATE_ENV_KEY } from '@/backends/claude/endpointRecovery/claudeEndpointArtifacts';
 
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { createExecutableShim } from '@/testkit/fs/executableShim';
@@ -33,6 +35,52 @@ afterEach(async () => {
 });
 
 describe('claudeDaemonSpawnHooks.validateSpawn', () => {
+  it('keeps the admitted unified selection after account defaults change', async () => {
+    const { claudeDaemonSpawnHooks } = await import('./spawnHooks');
+    for (const pinned of [true, false]) {
+      const selected = claudeDaemonSpawnHooks.resolveTerminalPresentation!({
+        host: 'tmux', runtimeSelection: {}, processEnv: {},
+        accountSettings: accountSettingsParse({ claudeUnifiedTerminalEnabled: pinned }),
+      });
+      expect(claudeDaemonSpawnHooks.resolveTerminalPresentation!({
+        host: 'tmux', runtimeSelection: {}, processEnv: selected.childEnv ?? {},
+        accountSettings: accountSettingsParse({ claudeUnifiedTerminalEnabled: !pinned }),
+      }).kind).toBe(selected.kind);
+    }
+  });
+  it('uses the current Herdr pane for unified Claude while preserving detached hosts elsewhere', async () => {
+    const { claudeDaemonSpawnHooks } = await import('./spawnHooks');
+    const selection = { host: 'herdr' as const, runtimeSelection: {}, processEnv: {} };
+    expect(claudeDaemonSpawnHooks.resolveTerminalPresentation?.({
+      ...selection,
+      accountSettings: accountSettingsParse({ claudeUnifiedTerminalEnabled: true }),
+    })).toMatchObject({
+      kind: 'runner',
+      startingMode: 'local',
+      childEnv: { HAPPIER_CLAUDE_UNIFIED_TERMINAL_PIN: '1' },
+    });
+    expect(claudeDaemonSpawnHooks.resolveTerminalPresentation?.({
+      host: 'tmux',
+      runtimeSelection: {},
+      processEnv: {},
+      accountSettings: accountSettingsParse({ claudeUnifiedTerminalEnabled: true }),
+    })).toMatchObject({ kind: 'provider', childEnv: { HAPPIER_CLAUDE_UNIFIED_TERMINAL_PIN: '1' } });
+    expect(claudeDaemonSpawnHooks.resolveTerminalPresentation?.({
+      ...selection,
+      accountSettings: accountSettingsParse({ claudeUnifiedTerminalEnabled: false }),
+    })).toMatchObject({ kind: 'runner', startingMode: 'remote', childEnv: { HAPPIER_CLAUDE_UNIFIED_TERMINAL_PIN: '0' } });
+  });
+
+  it('keeps a recoverable unified provider in its existing host after account settings change', async () => {
+    const { claudeDaemonSpawnHooks } = await import('./spawnHooks');
+    expect(claudeDaemonSpawnHooks.resolveTerminalPresentation?.({
+      host: 'herdr',
+      accountSettings: accountSettingsParse({ claudeUnifiedTerminalEnabled: false }),
+      runtimeSelection: {},
+      processEnv: { [HAPPIER_CLAUDE_ENDPOINT_STATE_ENV_KEY]: '{"attachmentId":"existing"}' },
+    })).toMatchObject({ kind: 'provider', childEnv: { HAPPIER_CLAUDE_UNIFIED_TERMINAL_PIN: '1' } });
+  });
+
   it('rejects spawn when claude is not resolvable', async () => {
     const homeDir = await createTempDir('happier-claude-spawnhooks-no-cli-home-');
     tempDirs.add(homeDir);

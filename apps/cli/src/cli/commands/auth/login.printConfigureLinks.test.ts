@@ -8,13 +8,13 @@ const authAndSetupMachineIfNeededMock = vi.hoisted(() => vi.fn(async (_options?:
   credentials: { token: 't1', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
 })));
 const validateStoredAuthTokenAgainstActiveServerMock = vi.hoisted(() =>
-  vi.fn<(token: string) => Promise<ActiveServerStoredTokenValidationResult>>(async () => ({ state: 'valid', httpStatus: 200, accountId: 'acct_test' })),
+  vi.fn<(token: string) => Promise<ActiveServerStoredTokenValidationResult>>(async () => ({ state: 'valid', httpStatus: 200, accountId: 'acct_test', accountLabel: null })),
 );
 const readCredentialsMock = vi.hoisted(() => vi.fn<() => Promise<Credentials | null>>(async () => null));
 const readSettingsMock = vi.hoisted(() => vi.fn<() => Promise<Partial<Settings>>>(async () => ({})));
 const clearCredentialsMock = vi.hoisted(() => vi.fn(async () => {}));
 const clearMachineIdMock = vi.hoisted(() => vi.fn(async () => {}));
-const stopDaemonMock = vi.hoisted(() => vi.fn(async () => {}));
+const stopDaemonMock = vi.hoisted(() => vi.fn(async () => ({ status: 'not_running' as const })));
 const reconcileBackgroundServicesMock = vi.hoisted(() => vi.fn(async () => true));
 
 vi.mock('@/ui/auth', () => ({
@@ -81,7 +81,7 @@ describe('happier auth login', () => {
       credentials: { token: 't1', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
     });
     validateStoredAuthTokenAgainstActiveServerMock.mockReset();
-    validateStoredAuthTokenAgainstActiveServerMock.mockResolvedValue({ state: 'valid', httpStatus: 200, accountId: 'acct_test' });
+    validateStoredAuthTokenAgainstActiveServerMock.mockResolvedValue({ state: 'valid', httpStatus: 200, accountId: 'acct_test', accountLabel: null });
     readCredentialsMock.mockReset();
     readCredentialsMock.mockResolvedValue(null);
     readSettingsMock.mockReset();
@@ -89,6 +89,7 @@ describe('happier auth login', () => {
     clearCredentialsMock.mockReset();
     clearMachineIdMock.mockReset();
     stopDaemonMock.mockReset();
+    stopDaemonMock.mockResolvedValue({ status: 'not_running' });
     reconcileBackgroundServicesMock.mockReset();
     reconcileBackgroundServicesMock.mockResolvedValue(true);
     process.exitCode = undefined;
@@ -105,7 +106,7 @@ describe('happier auth login', () => {
     let authMethodAtFlowStart: string | undefined;
     validateStoredAuthTokenAgainstActiveServerMock.mockImplementationOnce(async () => {
       authMethodAtFlowStart = process.env.HAPPIER_AUTH_METHOD;
-      return { state: 'valid', httpStatus: 200, accountId: 'acct_test' };
+      return { state: 'valid', httpStatus: 200, accountId: 'acct_test', accountLabel: null };
     });
     const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     try {
@@ -188,7 +189,7 @@ describe('happier auth login', () => {
       const { handleAuthLogin } = await import('./login');
       await handleAuthLogin([]);
       const output = consoleSpy.mock.calls.flat().map(String).join('\n');
-      expect(output.match(/Authentication successful/gu) ?? []).toHaveLength(1);
+      expect(output.match(/✓ Signed in$/gmu) ?? []).toHaveLength(1);
     } finally {
       consoleSpy.mockRestore();
     }

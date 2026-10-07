@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { act } from 'react-test-renderer';
 
-import { renderHook, standardCleanup } from '@/dev/testkit';
+import { createSessionFixture, renderHook, standardCleanup } from '@/dev/testkit';
 
 import { useAllMachines, useFirstVisibleMachineId, useLaunchSelectionMachines, useMachineCliDetectionTarget, useMachineDisplayById, useMachineListByServerId, useSessionChatFooterState, useSessionForkSupportSource } from '@/sync/domains/state/storage';
 import { storage } from '@/sync/domains/state/storageStore';
@@ -589,6 +589,48 @@ describe('useAllMachines', () => {
                 permissionsInUiWhileLocal: true,
             });
 
+            await hook.unmount();
+        } finally {
+            storage.setState(previousState);
+        }
+    });
+
+    it.each(['shared', 'exclusive'] as const)('retires and restores %s footer control through the real store', async (topology) => {
+        const previousState = storage.getState();
+        const session = createSessionFixture({
+            id: 's-control-lifecycle', active: true,
+            agentState: { controlledByUser: topology === 'exclusive', ...(topology === 'shared' ? {
+                localControl: { attached: true, topology, remoteWritable: true, canDetach: true },
+            } : {}) },
+        });
+        try {
+            storage.setState((state) => ({ sessions: { ...state.sessions, [session.id]: session } }));
+            const hook = await renderHook(() => useSessionChatFooterState(session.id), {
+                flushOptions: { cycles: 1, turns: 4 },
+            });
+            const attached = hook.getCurrent();
+            expect(attached?.localControl?.attached).toBe(true);
+            expect(attached?.controlledByUser).toBe(topology === 'exclusive');
+
+            await act(async () => {
+                storage.setState((state) => ({ sessions: { ...state.sessions, [session.id]: { ...session, active: false } } }));
+            });
+            expect(hook.getCurrent()).toMatchObject({ controlledByUser: false, localControl: null });
+
+            await act(async () => {
+                storage.setState((state) => ({ sessions: { ...state.sessions, [session.id]: session } }));
+            });
+            expect(hook.getCurrent()).toEqual(attached);
+
+            await act(async () => {
+                storage.setState((state) => ({ sessions: { ...state.sessions, [session.id]: {
+                    ...session, metadata: { ...session.metadata!, terminal: { mode: 'herdr',
+                        controlServiceabilityV1: { v: 1, attachmentId: 'retired-host', observedAt: 20,
+                            state: 'unknown', retired: true },
+                    } },
+                } } }));
+            });
+            expect(hook.getCurrent()).toMatchObject({ controlledByUser: false, localControl: null });
             await hook.unmount();
         } finally {
             storage.setState(previousState);

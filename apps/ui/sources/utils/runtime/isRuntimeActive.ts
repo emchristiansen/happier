@@ -1,4 +1,6 @@
 import { AppState, Platform } from 'react-native';
+import { readHostWindowFocus } from './readHostWindowFocus';
+import { isWebMobileHost } from '@/utils/platform/webMobileHeuristics';
 import { isTauriDesktop } from '@/utils/platform/tauri';
 
 export function isRuntimeActive(): boolean {
@@ -49,7 +51,7 @@ function readDocument(): (Document & {
 /**
  * Notifies when the runtime's active/inactive state may have changed: the app
  * moved between foreground and background, or (on web) the document was hidden
- * or shown.
+ * or shown. Focus publishers can opt into host window focus/blur signals.
  *
  * This is the single owner of "what counts as a lifecycle transition" that
  * `isRuntimeActive` reads. Every gated worker subscribes here instead of
@@ -59,7 +61,10 @@ function readDocument(): (Document & {
  * leave the state unchanged; a caller that needs edge semantics compares
  * `isRuntimeActive()` itself.
  */
-export function subscribeToRuntimeActiveChange(listener: () => void): () => void {
+export function subscribeToRuntimeActiveChange(
+    listener: () => void,
+    options?: Readonly<{ includeWindowFocus?: boolean }>,
+): () => void {
     const detach: Array<() => void> = [];
 
     const doc = readDocument();
@@ -67,6 +72,16 @@ export function subscribeToRuntimeActiveChange(listener: () => void): () => void
         doc.addEventListener('visibilitychange', listener);
         detach.push(() => {
             doc.removeEventListener?.('visibilitychange', listener);
+        });
+    }
+
+    const hostWindow = (globalThis as unknown as { window?: Window }).window;
+    if (options?.includeWindowFocus === true && typeof hostWindow?.addEventListener === 'function') {
+        hostWindow.addEventListener('focus', listener);
+        hostWindow.addEventListener('blur', listener);
+        detach.push(() => {
+            hostWindow.removeEventListener('focus', listener);
+            hostWindow.removeEventListener('blur', listener);
         });
     }
 
@@ -83,6 +98,15 @@ export function subscribeToRuntimeActiveChange(listener: () => void): () => void
         for (const stop of detach.splice(0)) {
             stop();
         }
+    };
+}
+
+/** Only an explicitly focused, visible computer window can mute another device's push. */
+export function readComputerUiFocusState(): Readonly<{ computer: boolean; focused: boolean }> {
+    const computer = Platform.OS === 'web' && (isTauriDesktop() || !isWebMobileHost());
+    return {
+        computer,
+        focused: computer && readDocument()?.visibilityState === 'visible' && readHostWindowFocus() === true,
     };
 }
 

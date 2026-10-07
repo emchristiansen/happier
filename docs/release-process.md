@@ -191,14 +191,40 @@ the combined parent. Each channel retains its own planning and final admission,
 which verifies that the shared evidence covers that channel's selected risks.
 They deliberately do not share built artifacts: preview and production
 embed different feature-policy environments and therefore require distinct
-candidate bytes. Same-channel releases still serialize, while the two channel
-calls use separate non-cancelling concurrency groups. Issues advance directly
+candidate bytes. Desktop candidate, finalized, and publication artifact names
+include the environment so downloads and asset preparation cannot select or
+merge the other channel's bytes. Nightly desktop recovery accepts its historical
+single-channel candidate names; candidate materialization still verifies the
+exact environment before bundling or signing. Mobile build artifacts include
+environment, platform, and effective profile; immediate APK publication uses
+the producer's artifact ID. Android store retry downloads historical collided
+AAB/APK artifacts separately and admits exactly one AAB with its adjacent
+candidate identity. OTA and release-note artifacts also include the environment.
+Same-channel releases still serialize, while the two channel calls use separate
+non-cancelling concurrency groups. Issues advance directly
 to `stage:stable` only after both channel workflows succeed.
 
 Use GitHub's failed-job rerun when workflow control is unchanged. If control
 changes, resume the combined operation from its prior run; each channel reads
 its own terminal status artifact and reuses only the verified work for that
 channel.
+
+Desktop recovery prefers that channel's unexpired finalized updater artifacts,
+bound to the exact origin run and SHA-256 archive digest. Restoring them does not
+rebuild, re-sign, or re-notarize their payloads. Missing finalized platforms use
+admitted unsigned candidates where available, otherwise build normally. The
+trusted recovery control still prepares the publication envelope, verifies all
+updater signatures, and runs the applicable desktop-setup gate before production
+publication. Full release callers forward the canonical resolver's admitted
+artifact maps and original run number; standalone nightly recovery retains its
+legacy single-channel artifact admission.
+
+For the same-source origin, the canonical resume resolver can also retain accepted
+OTA, native iOS/Android, and APK flows from exact channel-scoped successful jobs
+and their decisive successful steps. The original Expo action remains unchanged;
+only satisfied flows are skipped, and a partial native recovery builds only the
+missing platform. Missing, failed, skipped, or ambiguous evidence does not mark a
+flow complete. This admission is not proof of public App Store or Play availability.
 
 For a same-SHA transient failure, retain successful jobs and rerun only the
 failed jobs and their dependents:
@@ -230,6 +256,11 @@ directly as a substitute for the conductor.
 Issue availability is tracked by the mutually exclusive `stage:source`, `stage:dev`, `stage:preview`, and `stage:stable` labels documented in `docs/issue-triage.md`. Ordinary current-`dev` nightlies perform `source → dev`; preview, production, and combined releases perform the transitions above. Failed and dry-run releases move nothing. The reconciler re-reads each snapshotted issue, preserves unrelated labels, and skips closed or manually restaged issues. It never comments on or closes an issue.
 
 Deploy branches typically include `deploy/<env>/ui`, `deploy/<env>/server`, `deploy/<env>/website`, and `deploy/<env>/docs` (depending on what changed and which options you select).
+
+Release/deploy-ref promotion requests both Contents and Workflows write permission from
+the release app: moving a branch to a source commit can change `.github/workflows`
+even when the deployed component itself is unchanged. Asset-only publishing
+tokens retain their narrower scope.
 
 `website` and `docs` are independent release targets. Either may be selected
 without the other, and each has its own change decision, deploy job, status

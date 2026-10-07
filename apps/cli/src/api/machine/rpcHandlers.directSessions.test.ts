@@ -42,6 +42,15 @@ vi.mock('@/session/metadata/updateSessionMetadataWithRetry', () => ({
 }));
 
 import { registerMachineDirectSessionsRpcHandlers } from './rpcHandlers.directSessions';
+import { createActionOperationRunner } from '@/daemon/actionOperations/actionOperationRunner';
+import { createActionOperationStore } from '@/daemon/actionOperations/actionOperationStore';
+
+function registerWithActionOperations(params: Parameters<typeof registerMachineDirectSessionsRpcHandlers>[0]) {
+  const runner = createActionOperationRunner({ store: createActionOperationStore() });
+  registerMachineDirectSessionsRpcHandlers({ ...params, actionOperations: {
+    runner, getScope: async () => ({ accountId: 'account-1', machineId: 'm1' }),
+  } });
+}
 
 function jsonlLine(value: unknown): string {
   return `${JSON.stringify(value)}\n`;
@@ -121,20 +130,23 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
       },
     };
 
-    registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager, spawnSession, stopSession });
+    registerWithActionOperations({ rpcHandlerManager, spawnSession, stopSession });
 
     const handler = registered.get(RPC_METHODS.DAEMON_DIRECT_SESSION_TAKEOVER);
     expect(handler).toBeDefined();
 
+    const terminal = { mode: 'tmux', tmux: { sessionName: 'takeover', isolated: true, tmpDir: '/tmp/takeover-tmux' } };
     const res = await handler!({
       machineId: 'm1',
       sessionId: 'sess_happy_direct',
+      terminal,
     });
 
     expect(res).toEqual({ ok: true });
     expect(stopSession).not.toHaveBeenCalled();
     expect(spawnSession).toHaveBeenCalledWith(
       expect.objectContaining({
+        terminal,
         directory: '/tmp/direct-claude-worktree',
         backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
         existingSessionId: 'sess_happy_direct',
@@ -223,7 +235,7 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
     }), 'utf8');
 
     try {
-      registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager, spawnSession, stopSession });
+      registerWithActionOperations({ rpcHandlerManager, spawnSession, stopSession });
 
       const handler = registered.get(RPC_METHODS.DAEMON_DIRECT_SESSION_TAKEOVER);
       expect(handler).toBeDefined();
@@ -306,7 +318,7 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
     } as any;
 
     try {
-      registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager, spawnSession, stopSession });
+      registerWithActionOperations({ rpcHandlerManager, spawnSession, stopSession });
 
       const handler = registered.get(RPC_METHODS.DAEMON_DIRECT_SESSION_TAKEOVER);
       expect(handler).toBeDefined();
@@ -409,14 +421,16 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
       },
     } as any;
 
-    registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager, spawnSession, stopSession });
+    registerWithActionOperations({ rpcHandlerManager, spawnSession, stopSession });
 
     const handler = registered.get(RPC_METHODS.DAEMON_DIRECT_SESSION_TAKEOVER_PERSIST);
     expect(handler).toBeDefined();
 
+    const terminal = { mode: 'tmux', tmux: { sessionName: '', isolated: false, tmpDir: null } };
     const res = await handler!({
       machineId: 'm1',
       sessionId: 'sess_happy_persist',
+      terminal,
     });
 
     expect(res).toEqual({ ok: true, converted: true });
@@ -426,6 +440,7 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
     expect(spawnSession.mock.invocationCallOrder[0]).toBeLessThan(updateSessionMetadataWithRetryMock.mock.invocationCallOrder[0]);
     expect(spawnSession).toHaveBeenCalledWith(
       expect.objectContaining({
+        terminal,
         directory: '/tmp/direct-claude-persist-worktree',
         backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
         existingSessionId: 'sess_happy_persist',
@@ -510,7 +525,7 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
       },
     } as any;
 
-    registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager, spawnSession, stopSession });
+    registerWithActionOperations({ rpcHandlerManager, spawnSession, stopSession });
 
     const handler = registered.get(RPC_METHODS.DAEMON_DIRECT_SESSION_TAKEOVER_PERSIST);
     expect(handler).toBeDefined();
@@ -734,7 +749,7 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
       },
     } as any;
 
-    registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager, spawnSession, stopSession });
+    registerWithActionOperations({ rpcHandlerManager, spawnSession, stopSession });
 
     const handler = registered.get(RPC_METHODS.DAEMON_DIRECT_SESSION_TAKEOVER);
     expect(handler).toBeDefined();

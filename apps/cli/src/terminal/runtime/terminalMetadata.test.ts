@@ -3,6 +3,34 @@ import { describe, expect, it } from 'vitest';
 import { buildTerminalMetadataFromRuntimeFlags } from './terminalMetadata';
 
 describe('buildTerminalMetadataFromRuntimeFlags', () => {
+  it('publishes Herdr and Zellij modes for terminal-hosted runners', () => {
+    expect(buildTerminalMetadataFromRuntimeFlags({ mode: 'herdr', requested: 'herdr' })).toEqual({
+      mode: 'herdr', requested: 'herdr',
+    });
+    expect(buildTerminalMetadataFromRuntimeFlags({ mode: 'zellij', requested: 'zellij' })).toEqual({
+      mode: 'zellij', requested: 'zellij',
+    });
+  });
+
+  it('keeps the stable terminal identity of an inherited Herdr pane', () => {
+    expect(buildTerminalMetadataFromRuntimeFlags({
+      mode: 'herdr',
+      requested: 'herdr',
+      herdrSessionName: 'work',
+      herdrSocketPath: '/tmp/herdr-work.sock',
+      herdrTerminalId: 'term_42',
+      herdrPaneId: 'w1:p2',
+    })).toEqual({
+      mode: 'herdr',
+      requested: 'herdr',
+      herdr: {
+        sessionName: 'work',
+        socketPath: '/tmp/herdr-work.sock',
+        terminalId: 'term_42',
+        paneId: 'w1:p2',
+      },
+    });
+  });
   it('publishes the bound attachment identity for a tmux runtime', () => {
     expect(buildTerminalMetadataFromRuntimeFlags({
       mode: 'tmux',

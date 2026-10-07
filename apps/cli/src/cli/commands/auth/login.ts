@@ -1,4 +1,5 @@
 import chalk from 'chalk';
+import { cmd, definitionList, errorFrame, fail, ok, warn } from '@happier-dev/cli-common/output';
 import os from 'node:os';
 
 import { clearCredentials, clearMachineId } from '@/persistence';
@@ -28,7 +29,7 @@ function readWaitTimeoutSecondsFlag(args: readonly string[]): number | null {
   const raw = String(args[index + 1] ?? '').trim();
   const seconds = Number.parseInt(raw, 10);
   if (!Number.isFinite(seconds) || seconds <= 0) {
-    console.error(chalk.red('--wait-timeout needs a positive number of seconds, for example `--wait-timeout 300`.'));
+    console.error(fail(`--wait-timeout needs a positive number of seconds, for example ${cmd('--wait-timeout 300')}.`));
     process.exit(1);
   }
   return seconds;
@@ -46,7 +47,7 @@ export async function handleAuthLogin(args: string[]): Promise<void> {
   try {
     method = resolveAuthMethodFlag(args);
   } catch (error) {
-    console.error(chalk.red(error instanceof Error ? error.message : 'Invalid --method flag'));
+    console.error(fail(error instanceof Error ? error.message : 'Invalid --method flag'));
     process.exit(1);
   }
   if (method) process.env.HAPPIER_AUTH_METHOD = method;
@@ -64,26 +65,18 @@ export async function handleAuthLogin(args: string[]): Promise<void> {
   }
 
   if (forceAuth) {
-    console.log(chalk.yellow('Force authentication requested.'));
-    console.log(chalk.gray('This will:'));
-    console.log(chalk.gray('  • Clear existing credentials'));
-    console.log(chalk.gray('  • Clear machine ID'));
-    console.log(chalk.gray('  • Stop daemon if running'));
-    console.log(chalk.gray('  • Re-authenticate and register machine\n'));
+    console.log(warn('Signing in again from scratch'));
+    console.log(chalk.gray('  Clears the stored credentials and machine ID, stops the daemon, then signs in and registers this computer again.\n'));
 
-    try {
-      logger.debug('Stopping daemon for force auth...');
-      await stopDaemon();
-      console.log(chalk.gray('✓ Stopped daemon'));
-    } catch (error) {
-      logger.debug('Daemon was not running or failed to stop:', error);
-    }
+    logger.debug('Stopping daemon for force auth...');
+    const stopped = await stopDaemon();
+    console.log(ok(stopped.status === 'stopped' ? 'Stopped the daemon' : 'No daemon was running'));
 
     await clearCredentials();
-    console.log(chalk.gray('✓ Cleared credentials'));
+    console.log(ok('Cleared credentials'));
 
     await clearMachineId({ preserveReplacementCandidate: true, replacementReason: 'reauth' });
-    console.log(chalk.gray('✓ Cleared machine ID'));
+    console.log(ok('Cleared machine ID'));
 
     console.log('');
   }
@@ -95,22 +88,18 @@ export async function handleAuthLogin(args: string[]): Promise<void> {
     let existingCreds = readiness.credentials;
 
     if (readiness.unusableReason === 'credentials-rejected') {
-      console.log(chalk.yellow('⚠️  Stored credentials were rejected by the selected relay'));
-      console.log(chalk.gray('  Repairing local authentication state before logging in again...\n'));
-      try {
-        logger.debug('Stopping daemon before auth repair...');
-        await stopDaemon();
-        console.log(chalk.gray('✓ Stopped daemon'));
-      } catch (error) {
-        logger.debug('Daemon was not running or failed to stop during auth repair:', error);
-      }
+      console.log(warn('The selected relay rejected the stored credentials'));
+      console.log(chalk.gray('  Clearing them before signing in again.\n'));
+      logger.debug('Stopping daemon before auth repair...');
+      const stopped = await stopDaemon();
+      console.log(ok(stopped.status === 'stopped' ? 'Stopped the daemon' : 'No daemon was running'));
       await clearCredentials();
       await clearMachineId({ preserveReplacementCandidate: true, replacementReason: 'reauth' });
       existingCreds = null;
     }
 
     if (existingCreds && readiness.credentialState === 'unknown') {
-      console.log(chalk.yellow('⚠️  The selected relay did not answer, so the stored sign-in could not be verified'));
+      console.log(warn('The selected relay did not answer, so the stored sign-in could not be verified'));
       console.log(chalk.gray('  Stored credentials were kept unchanged.'));
       if (readiness.machineRegistered && callerIntent === 'standalone') {
         console.log(chalk.gray('  Retry this command when the relay is available.'));
@@ -125,40 +114,41 @@ export async function handleAuthLogin(args: string[]): Promise<void> {
       && readiness.machineRegistered
       && callerIntent === 'standalone'
     ) {
-      console.log(chalk.green('✓ Already authenticated'));
-      console.log(chalk.gray(`  Machine ID: ${readiness.machineId}`));
-      console.log(chalk.gray(`  Host: ${os.hostname()}`));
-      console.log(chalk.gray(`  Use 'happier auth login --force' to re-authenticate`));
+      console.log(ok('Already signed in'));
+      console.log(definitionList([
+        { label: 'Machine ID', value: String(readiness.machineId) },
+        { label: 'Host', value: os.hostname() },
+      ], { indent: '  ' }));
+      console.log(chalk.gray(`  Use ${cmd('happier auth login --force')} to sign in again.`));
       return;
     }
 
     if (existingCreds && !readiness.machineRegistered) {
-      console.log(chalk.yellow('⚠️  Credentials exist but machine ID is missing'));
-      console.log(chalk.gray('  This can happen if --auth flag was used previously'));
-      console.log(chalk.gray('  Fixing by setting up machine...\n'));
+      console.log(warn('Signed in, but this computer is not registered yet'));
+      console.log(chalk.gray('  This can happen if the --auth flag was used previously. Registering it now.\n'));
     }
 
     if (!existingCreds && !method && isLoopbackServerHost(configuration.serverUrl)) {
       process.env.HAPPIER_AUTH_METHOD = 'web';
-      console.log(chalk.yellow(`The selected relay (${configuration.serverUrl}) is only reachable from this computer.`));
+      console.log(warn(`The selected relay (${configuration.serverUrl}) is only reachable from this computer.`));
       console.log(chalk.gray("Using this computer's browser for the new sign-in request.\n"));
     }
   } else if (!method && isLoopbackServerHost(configuration.serverUrl)) {
     process.env.HAPPIER_AUTH_METHOD = 'web';
-    console.log(chalk.yellow(`The selected relay (${configuration.serverUrl}) is only reachable from this computer.`));
+    console.log(warn(`The selected relay (${configuration.serverUrl}) is only reachable from this computer.`));
     console.log(chalk.gray("Using this computer's browser for the new sign-in request.\n"));
   }
 
   try {
     const result = await authAndSetupMachineIfNeeded({ callerIntent });
-    console.log(chalk.green('\n✓ Authentication successful'));
-    console.log(chalk.gray(`  Machine ID: ${result.machineId}`));
+    console.log(ok('Signed in'));
+    console.log(definitionList([{ label: 'Machine ID', value: result.machineId }], { indent: '  ' }));
     const backgroundServiceReady = await reconcileDefaultFollowingBackgroundServicesAfterAuthentication();
     if (!backgroundServiceReady && callerIntent === 'setup-managed') {
       process.exitCode = 1;
     }
   } catch (error) {
-    console.error(chalk.red('Authentication failed:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(errorFrame('Sign-in failed', [error instanceof Error ? error.message : 'Unknown error']));
     process.exit(1);
   }
 }

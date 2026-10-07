@@ -28,6 +28,11 @@ export const OPENCODE_CONNECTED_SERVICE_SELECTION_IDENTITY_ENV = 'HAPPIER_OPENCO
  */
 export const OPENCODE_BINARY_IDENTITY_ENV = 'HAPPIER_OPENCODE_BINARY_IDENTITY';
 
+/** The existing launch identity is a SHA-256 hex digest, never a filesystem path. */
+export function isOpenCodeManagedServerLaunchFingerprint(value: string): boolean {
+  return /^[a-f0-9]{64}$/.test(value);
+}
+
 function hashEnvSecret(value: unknown): string {
   const raw = typeof value === 'string' ? value : '';
   if (!raw) return '';

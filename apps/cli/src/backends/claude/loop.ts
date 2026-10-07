@@ -140,8 +140,9 @@ interface LoopOptions {
     expectedExistingTerminalHostAttachmentId?: string
     onTerminalHostReady?: ((params: Readonly<{
         handle: import('@/integrations/terminalHost/_types').TerminalHostHandle;
+        lifecycle: 'owned' | 'borrowed';
         terminal: NonNullable<import('@/api/types').Metadata['terminal']>;
-        destroyOwnedHostForExplicitStop: () => Promise<void>;
+        stopTerminalHostForExplicitStop: () => Promise<void>;
     }>) => void | Promise<void>)
     signal?: AbortSignal
 }

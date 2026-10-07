@@ -91,8 +91,49 @@ function flattenArtifacts(value) {
   return flattened;
 }
 
+/**
+ * GitHub job metadata proves these current-origin flows only when control and candidate
+ * source are the same. It does not prove store public availability or a chained origin.
+ * @param {unknown} value
+ * @param {{ runId: number; workflowSha: string; sourceSha: string; expectedSourceSha?: string; operationId?: string; workflowPath: string; channel: string; requested: boolean; expoAction: string }} identity
+ */
+function resolveUiFlowCompletion(value, identity) {
+  const completed = { ota: false, nativeIos: false, nativeAndroid: false, apk: false };
+  if (!value || !identity.requested || !identity.operationId || identity.sourceSha !== identity.expectedSourceSha
+    || identity.sourceSha !== identity.workflowSha || !['preview', 'production'].includes(identity.channel)
+    || !['.github/workflows/release.yml', '.github/workflows/release-preview-and-production.yml'].includes(identity.workflowPath)) return completed;
+  const pages = Array.isArray(value) ? value : [value];
+  const jobs = pages.flatMap((page) => {
+    const entry = asRecord(page, 'resume jobs response');
+    return Array.isArray(entry.jobs) ? entry.jobs : [entry];
+  }).map((job) => asRecord(job, 'resume job'));
+  const prefix = identity.workflowPath === '.github/workflows/release-preview-and-production.yml'
+    ? `Publish ${identity.channel} channel / deploy_ui / ` : 'deploy_ui / ';
+  /** @param {string} name @param {string[]} stepNames */
+  const accepted = (name, stepNames) => {
+    const matches = jobs.filter((job) => job.name === `${prefix}${name}`);
+    if (matches.length !== 1) return false;
+    const job = matches[0];
+    if (!Number.isSafeInteger(job.id) || Number(job.id) < 1 || job.run_id !== identity.runId || job.head_sha !== identity.workflowSha
+      || job.status !== 'completed' || job.conclusion !== 'success' || !Array.isArray(job.steps)) return false;
+    return stepNames.every((stepName) => {
+      const matches = job.steps.filter((step) => step && typeof step === 'object' && step.name === stepName);
+      return matches.length === 1 && matches[0].status === 'completed' && matches[0].conclusion === 'success';
+    });
+  };
+  if (['ota', 'full'].includes(identity.expoAction)) {
+    completed.ota = accepted('promote', ['Publish Android OTA from validated bytes', 'Publish iOS OTA from validated bytes']);
+  }
+  if (['native', 'native_submit', 'full'].includes(identity.expoAction)) {
+    completed.nativeIos = accepted('Mobile native (local runner) / Build (ios)', ['EAS build (pipeline)']);
+    completed.nativeAndroid = accepted('Mobile native (local runner) / Build (android)', ['EAS build (pipeline)']);
+    completed.apk = accepted('Mobile APK release (local runner) / Sign and publish Android APK', ['Sign and publish APK with trusted control']);
+  }
+  return completed;
+}
+
 /** @param {Record<string, unknown>} artifact @param {number} runId @param {string} workflowSha */
-function inspectOriginArtifact(artifact, runId, workflowSha) {
+export function inspectReleaseResumeArtifact(artifact, runId, workflowSha) {
   if (!Number.isSafeInteger(artifact.id) || Number(artifact.id) < 1) {
     throw new Error('[release] resume artifact ID is invalid');
   }
@@ -105,26 +146,37 @@ function inspectOriginArtifact(artifact, runId, workflowSha) {
   return { id: Number(artifact.id), digest };
 }
 
-/** @param {unknown} artifacts @param {Record<string, unknown>} run @param {string} workflowSha */
-function resolveDesktopArtifacts(artifacts, run, workflowSha) {
+/** @param {unknown} artifacts @param {Record<string, unknown>} run @param {string} workflowSha @param {string} channel @param {boolean} allowLegacy */
+function resolveDesktopArtifacts(artifacts, run, workflowSha, channel, allowLegacy) {
   if (!Number.isSafeInteger(run.run_number) || Number(run.run_number) < 1) {
     throw new Error('[release] desktop origin run number must be a positive safe integer');
   }
   /** @type {Record<string, { id: number; digest: string }>} */
   const selected = {};
+  /** @type {Record<string, { id: number; digest: string }>} */
+  const finalized = {};
   const seen = new Set();
   for (const rawArtifact of flattenArtifacts(artifacts)) {
     const artifact = asRecord(rawArtifact, 'artifact');
-    if (typeof artifact.name !== 'string' || !artifact.name.startsWith('tauri-candidate-')) continue;
-    const platform = artifact.name.slice('tauri-candidate-'.length);
-    if (!BUNDLE_CANDIDATE_PLATFORMS.includes(platform)) throw new Error('[release] unknown desktop candidate artifact platform');
-    if (seen.has(platform)) throw new Error('[release] duplicate desktop candidate artifact');
-    seen.add(platform);
-    const admitted = inspectOriginArtifact(artifact, Number(run.id), workflowSha);
+    if (typeof artifact.name !== 'string') continue;
+    const prefix = ['tauri-candidate-', 'tauri-updates-'].find((value) => artifact.name.startsWith(value));
+    if (!prefix) continue;
+    const suffix = artifact.name.slice(prefix.length);
+    const environment = ['dev', 'preview', 'production'].find((value) => suffix.startsWith(`${value}-`));
+    if (environment && environment !== channel) continue;
+    // Only the released single-channel nightly predecessor used unscoped names.
+    if (!environment && !allowLegacy) throw new Error('[release] desktop artifact must be channel-scoped for a release origin');
+    const platform = environment ? suffix.slice(environment.length + 1) : suffix;
+    if (!BUNDLE_CANDIDATE_PLATFORMS.includes(platform)) throw new Error('[release] unknown desktop artifact platform');
+    const key = `${prefix}${platform}`;
+    if (seen.has(key)) throw new Error('[release] duplicate desktop artifact');
+    seen.add(key);
+    const admitted = inspectReleaseResumeArtifact(artifact, Number(run.id), workflowSha);
     if (typeof artifact.expired !== 'boolean') throw new Error('[release] desktop artifact expiry must be boolean');
-    if (!artifact.expired) selected[platform] = admitted;
+    if (!artifact.expired) (prefix === 'tauri-updates-' ? finalized : selected)[platform] = admitted;
   }
-  return { runNumber: Number(run.run_number), artifacts: selected };
+  return { runNumber: Number(run.run_number), artifacts: selected,
+    ...(!allowLegacy || Object.keys(finalized).length > 0 ? { finalizedArtifacts: finalized } : {}) };
 }
 
 /** @param {{ repository: string; artifactId: number; digest: string; archivePath: string }} input */
@@ -202,7 +254,7 @@ export function inspectReleaseResumeOrigin(input) {
   }
   const artifact = matches[0];
   if (artifact.expired !== false) throw new Error('[release] resume status artifact is expired');
-  const admitted = inspectOriginArtifact(artifact, runId, workflowSha);
+  const admitted = inspectReleaseResumeArtifact(artifact, runId, workflowSha);
   return { artifactDigest: admitted.digest, artifactId: admitted.id, workflowSha };
 }
 
@@ -212,6 +264,7 @@ export function inspectReleaseResumeOrigin(input) {
  *   artifacts: unknown;
  *   downloadedDigest: string;
  *   status: unknown;
+ *   jobs?: unknown;
  *   expected: { repository: string; workflowPath: string; channel: string; sourceSha?: string; operationId?: string; statusArtifactName?: string };
  * }} input
  */
@@ -375,7 +428,7 @@ export function resolveReleaseResume(input) {
   if (!Object.values(validated.versions).some(Boolean)) {
     throw new Error('[release] resume origin contains no verified immutable candidates to reuse');
   }
-  if (input.expected.workflowPath === '.github/workflows/release.yml') {
+  if (input.expected.workflowPath !== '.github/workflows/nightly-dev.yml') {
     for (const surfaceId of RESUMABLE_REQUESTED_SURFACES.keys()) {
       if (!seenRequestedSurfaces.has(surfaceId)) {
         throw new Error(`[release] release resume status is missing requested surface: ${surfaceId}`);
@@ -384,12 +437,18 @@ export function resolveReleaseResume(input) {
   }
   return {
     sourceSha: statusSourceSha,
-    ...(input.expected.workflowPath === '.github/workflows/nightly-dev.yml'
-      ? { desktop: resolveDesktopArtifacts(input.artifacts, originRun, inspected.workflowSha) } : {}),
+    uiCompleted: resolveUiFlowCompletion(input.jobs, {
+      runId: Number(originRun.id), workflowSha: inspected.workflowSha, sourceSha: statusSourceSha,
+      expectedSourceSha: input.expected.sourceSha, operationId: expectedOperationId, workflowPath: input.expected.workflowPath,
+      channel: input.expected.channel, requested: requested.deployUi, expoAction: resumeInputs.deployUi.expoAction,
+    }),
+    ...(input.expected.workflowPath === '.github/workflows/nightly-dev.yml' || (requested.deployUi && resumeInputs.deployUi.desktopMode !== 'none')
+      ? { desktop: resolveDesktopArtifacts(input.artifacts, originRun, inspected.workflowSha, input.expected.channel,
+        input.expected.workflowPath === '.github/workflows/nightly-dev.yml') } : {}),
     versions: validated.versions,
     requested,
     completed,
-    ...(input.expected.workflowPath === '.github/workflows/release.yml' ? { resumeInputs } : {}),
+    ...(input.expected.workflowPath !== '.github/workflows/nightly-dev.yml' ? { resumeInputs } : {}),
   };
 }
 
@@ -416,6 +475,7 @@ export async function main(argv = process.argv.slice(2)) {
       'origin-run-json': { type: 'string' },
       'artifacts-json': { type: 'string' },
       'status-json': { type: 'string' },
+      'jobs-json': { type: 'string' },
       'downloaded-digest': { type: 'string', default: '' },
       'expected-repository': { type: 'string' },
       'expected-workflow': { type: 'string' },
@@ -465,12 +525,14 @@ export async function main(argv = process.argv.slice(2)) {
       artifacts,
       downloadedDigest: String(values['downloaded-digest'] ?? ''),
       status: await readJson(String(values['status-json'] ?? '')),
+      jobs: values['jobs-json'] ? await readJson(values['jobs-json']) : undefined,
       expected,
     });
     await writeOutputs(outputPath, {
       source_sha: resolved.sourceSha,
       desktop_run_number: resolved.desktop?.runNumber ?? '',
       desktop_artifacts: JSON.stringify(resolved.desktop?.artifacts ?? {}),
+      desktop_finalized_artifacts: JSON.stringify(resolved.desktop?.finalizedArtifacts ?? {}),
       cli_version: resolved.versions.cli,
       stack_version: resolved.versions.stack,
       server_version: resolved.versions.server,
@@ -484,6 +546,10 @@ export async function main(argv = process.argv.slice(2)) {
       deploy_docs_complete: resolved.completed.deployDocs,
       deploy_server_complete: resolved.completed.deployServer,
       deploy_ui_complete: resolved.completed.deployUi,
+      ui_ota_complete: resolved.uiCompleted.ota,
+      ui_native_ios_complete: resolved.uiCompleted.nativeIos,
+      ui_native_android_complete: resolved.uiCompleted.nativeAndroid,
+      ui_apk_complete: resolved.uiCompleted.apk,
       deploy_website_complete: resolved.completed.deployWebsite,
       docker_complete: resolved.completed.docker,
       npm_complete: resolved.completed.npm,

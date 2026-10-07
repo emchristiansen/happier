@@ -14,7 +14,7 @@ describe('resolveCodexMcpPolicyForPermissionMode', () => {
     ['safe-yolo', { approvalPolicy: 'never', sandbox: 'workspace-write' }],
     ['yolo', { approvalPolicy: 'never', sandbox: 'danger-full-access' }],
     ['bypassPermissions', { approvalPolicy: 'never', sandbox: 'danger-full-access' }],
-    ['acceptEdits', { approvalPolicy: 'on-request', sandbox: 'workspace-write' }],
+    ['acceptEdits', { approvalPolicy: 'never', sandbox: 'workspace-write' }],
     ['plan', { approvalPolicy: 'untrusted', sandbox: 'workspace-write' }],
   ] satisfies Array<[PermissionMode, { approvalPolicy: string; sandbox: string }]>)(
     'maps %s to expected policy and sandbox',
@@ -31,7 +31,7 @@ describe('resolveCodexAppServerPolicyForPermissionMode', () => {
     ['safe-yolo', { approvalPolicy: { granular: { mcp_elicitations: true, request_permissions: true, rules: true, sandbox_approval: true, skill_approval: false } }, approvalsReviewer: 'auto_review', sandbox: 'workspace-write', sandboxPolicy: { type: 'workspaceWrite', writableRoots: ['__DIR__'], readOnlyAccess: { type: 'fullAccess' }, networkAccess: true, excludeTmpdirEnvVar: false, excludeSlashTmp: false } }],
     ['yolo', { approvalPolicy: 'never', sandbox: 'danger-full-access', sandboxPolicy: { type: 'dangerFullAccess' } }],
     ['bypassPermissions', { approvalPolicy: 'never', sandbox: 'danger-full-access', sandboxPolicy: { type: 'dangerFullAccess' } }],
-    ['acceptEdits', { approvalPolicy: { granular: { mcp_elicitations: true, request_permissions: true, rules: true, sandbox_approval: true, skill_approval: false } }, approvalsReviewer: 'user', sandbox: 'workspace-write', sandboxPolicy: { type: 'workspaceWrite', writableRoots: ['__DIR__'], readOnlyAccess: { type: 'fullAccess' }, networkAccess: true, excludeTmpdirEnvVar: false, excludeSlashTmp: false } }],
+    ['acceptEdits', { approvalPolicy: { granular: { mcp_elicitations: true, request_permissions: true, rules: true, sandbox_approval: true, skill_approval: false } }, approvalsReviewer: 'auto_review', sandbox: 'workspace-write', sandboxPolicy: { type: 'workspaceWrite', writableRoots: ['__DIR__'], readOnlyAccess: { type: 'fullAccess' }, networkAccess: true, excludeTmpdirEnvVar: false, excludeSlashTmp: false } }],
     ['plan', { approvalPolicy: { granular: { mcp_elicitations: true, request_permissions: true, rules: true, sandbox_approval: true, skill_approval: false } }, approvalsReviewer: 'user', sandbox: 'workspace-write', sandboxPolicy: { type: 'workspaceWrite', writableRoots: ['__DIR__'], readOnlyAccess: { type: 'fullAccess' }, networkAccess: true, excludeTmpdirEnvVar: false, excludeSlashTmp: false } }],
   ] satisfies Array<[
     PermissionMode,

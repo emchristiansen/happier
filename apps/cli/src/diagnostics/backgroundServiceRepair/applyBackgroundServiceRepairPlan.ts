@@ -1,4 +1,4 @@
-import { installDaemonService, uninstallDaemonService } from '@/daemon/service/installer';
+import { installDaemonService, readDaemonServicePreservedInstallOptions, uninstallDaemonService } from '@/daemon/service/installer';
 
 import type {
   BackgroundServiceRepairAction,
@@ -6,7 +6,9 @@ import type {
   BackgroundServiceRepairPlan,
 } from './types';
 
-type BackgroundServiceRepairRemovedService = Extract<BackgroundServiceRepairAction, Readonly<{ kind: 'remove-service' }>>['service'];
+type BackgroundServiceRepairRemovedService = Extract<BackgroundServiceRepairAction, Readonly<{ kind: 'remove-service' }>>['service'] & Readonly<{
+  preservedOptions: ReturnType<typeof readDaemonServicePreservedInstallOptions>;
+}>;
 type BackgroundServiceRepairDefaultInstall = Extract<BackgroundServiceRepairAction, Readonly<{ kind: 'install-default-following-service' }>>;
 type AttemptedDefaultInstall = Readonly<{
   action: BackgroundServiceRepairDefaultInstall;
@@ -35,6 +37,7 @@ export async function applyBackgroundServiceRepairPlan(
   try {
     for (const action of plan.actions) {
       if (action.kind === 'remove-service') {
+        const preservedOptions = readDaemonServicePreservedInstallOptions({ platform: runtime.platform, path: action.service.installedPath });
         await uninstallDaemonService({
           platform: runtime.platform,
           uid: runtime.uid ?? undefined,
@@ -47,7 +50,7 @@ export async function applyBackgroundServiceRepairPlan(
           installedPath: action.service.installedPath,
           runCommands: true,
         });
-        removedServices.push(action.service);
+        removedServices.push({ ...action.service, preservedOptions });
         executedActions.push(`remove:${action.service.label}`);
         continue;
       }
@@ -60,6 +63,7 @@ export async function applyBackgroundServiceRepairPlan(
         });
       }
       await installDaemonService({
+        ...removedServices.find((service) => service.installedPath === action.preserveFrom)?.preservedOptions,
         platform: runtime.platform,
         uid: runtime.uid ?? undefined,
         userHomeDir: runtime.userHomeDir,
@@ -107,6 +111,7 @@ export async function applyBackgroundServiceRepairPlan(
     for (const service of [...removedServices].reverse()) {
       try {
         await installDaemonService({
+          ...service.preservedOptions,
           platform: runtime.platform,
           uid: runtime.uid ?? undefined,
           userHomeDir: runtime.userHomeDir,

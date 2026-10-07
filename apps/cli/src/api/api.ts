@@ -47,6 +47,8 @@ import {
   shouldTreatGetOrCreateSessionErrorAsOffline,
 } from './client/offlineErrors';
 import {
+  normalizeSessionMetadataForRead,
+  projectSessionMetadataForWire,
   buildProviderAccountUsageRecordId,
   CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER,
   CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE,
@@ -448,8 +450,8 @@ export class ApiClient {
       try {
         const metadataPayload =
           desiredSessionEncryptionMode === 'plain'
-            ? JSON.stringify(opts.metadata)
-            : encodeBase64(encrypt(encryptionKey, encryptionVariant, opts.metadata));
+            ? JSON.stringify(projectSessionMetadataForWire(opts.metadata))
+            : encodeBase64(encrypt(encryptionKey, encryptionVariant, projectSessionMetadataForWire(opts.metadata)));
         const agentStatePayload =
           desiredSessionEncryptionMode === 'plain'
             ? (opts.state ? JSON.stringify(opts.state) : null)
@@ -503,10 +505,10 @@ export class ApiClient {
         sessionEncryptionKey = opened ?? this.credential.encryption.machineKey;
       }
 
-	      const metadata =
+	      const metadata = normalizeSessionMetadataForRead<Metadata>(
 	        sessionEncryptionMode === 'plain'
 	          ? JSON.parse(String(raw.metadata ?? 'null'))
-	          : decrypt(sessionEncryptionKey, encryptionVariant, decodeBase64(raw.metadata));
+	          : decrypt(sessionEncryptionKey, encryptionVariant, decodeBase64(raw.metadata)));
 	      const agentState =
 	        !raw.agentState
 	          ? null

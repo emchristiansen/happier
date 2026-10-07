@@ -22,6 +22,12 @@ installMachinesSettingsCommonModuleMocks({
             },
         });
     },
+    text: async () => {
+        const { createTextModuleMock } = await import('@/dev/testkit/mocks/text');
+        return createTextModuleMock({
+            translate: (key: string, params?: Record<string, unknown>) => (params ? `${key}:${JSON.stringify(params)}` : key),
+        });
+    },
 });
 
 vi.mock('@/components/ui/lists/ItemGroup', () => ({
@@ -120,6 +126,21 @@ describe('LocalCliPathExposureSection', () => {
         await harness.resolve('task_1:cli.pathExposure.ensure.v1', { changed: false, shellReloadHint: null, failure: null });
 
         expect(harness.screen.findByTestId('settings.localCliPath.status')?.props.subtitle).toBe('machine.cliPath.alreadyPresent');
+    });
+
+    it('says which other happier already answers in the terminal when nothing was added (R17/R6)', async () => {
+        const harness = await createHarness();
+        await harness.screen.pressByTestIdAsync('settings.localCliPath.add');
+        await harness.resolve('task_1:cli.pathExposure.ensure.v1', {
+            changed: false,
+            shellReloadHint: null,
+            failure: null,
+            existingCommand: '/opt/homebrew/bin/happier',
+        });
+
+        const subtitle = String(harness.screen.findByTestId('settings.localCliPath.status')?.props.subtitle ?? '');
+        expect(subtitle).toContain('machine.cliPath.existingCommand');
+        expect(subtitle).toContain('/opt/homebrew/bin/happier');
     });
 
     it('starts the remove task from the remove row and reports what was removed', async () => {

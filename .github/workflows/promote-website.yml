@@ -360,6 +360,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
+          permission-workflows: write
       - name: Promote exact release SHA
         id: promote_ref
         env:

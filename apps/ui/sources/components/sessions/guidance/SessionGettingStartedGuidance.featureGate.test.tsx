@@ -31,6 +31,7 @@ vi.mock('@/constants/Typography', () => ({
     Typography: {
         default: () => ({}),
         mono: () => ({}),
+        eyebrow: () => ({}),
     },
 }));
 

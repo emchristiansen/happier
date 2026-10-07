@@ -87,13 +87,16 @@ export function SetupMark(props: SetupMarkProps): React.ReactElement {
     const working = props.phase === 'working' || props.phase === 'checking';
     const activity = working ? resolveMotionPresentation('setupActivity', reducedMotion) : null;
 
-    // Danger belongs to the glyph that reports the failure. The arc keeps the progress ink: the
-    // stages that genuinely completed are still complete, and repainting them would claim
-    // otherwise.
+    // The mark is monochrome, like the primary actions beside it: progress is drawn in the primary
+    // text ink (black on light, near-white on dark), so the only colour on the surface is the one
+    // that means something. Danger belongs to the glyph that reports the failure. The arc keeps
+    // the progress ink: the stages that genuinely completed are still complete, and repainting
+    // them would claim otherwise.
+    const progressInk = theme.colors.text.primary;
     const glyphInk = props.phase === 'blocked'
         ? theme.colors.state.danger.foreground
-        : theme.colors.accent.blue;
-    const arcInk = theme.colors.accent.blue;
+        : progressInk;
+    const arcInk = progressInk;
     const track = activity === 'substitute'
         ? theme.colors.state.active.border
         : theme.colors.border.strong;

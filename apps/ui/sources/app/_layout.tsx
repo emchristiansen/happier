@@ -37,7 +37,9 @@ import { RealtimeProvider } from '@/realtime/RealtimeProvider';
 import { FaviconPermissionIndicator } from '@/components/web/FaviconPermissionIndicator';
 import { CommandPaletteProvider } from '@/components/appShell/commandPalette/CommandPaletteProvider';
 import { StatusBarProvider } from '@/components/ui/layout/StatusBarProvider';
-import { AppUpdateStatusTag } from '@/components/ui/feedback/AppUpdateStatusTag';
+import { UpdatesEntry } from '@/components/updates/UpdatesPopoverButton';
+import { UpdatesSummaryProvider } from '@/updates/useUpdatesSummary';
+import { UpdateFactsBackgroundRuntime } from '@/updates/UpdateFactsBackgroundRuntime';
 import { monkeyPatchConsoleForRemoteLoggingForFasterAiAutoDebuggingOnlyInLocalBuilds } from '@/utils/system/remoteLogger';
 import { installBugReportConsoleCapture } from '@/utils/system/bugReportLogBuffer';
 import { configureBugReportUserActionTrail } from '@/utils/system/bugReportActionTrail';
@@ -62,12 +64,14 @@ import { useResolvedDesktopWindowControls } from '@/components/navigation/shell/
 import { resolveAppShellChromeHost } from '@/components/appShell/resolveAppShellChromeHost';
 import { isDesktopPetOverlayWindowContext } from '@/components/pets/desktop/runtime/isDesktopPetOverlayWindowContext';
 import { isTauriDesktop } from '@/utils/platform/tauri';
+import { installTauriExternalLinkClicks } from '@/utils/url/installTauriExternalLinkClicks';
 import { useIsTablet } from '@/utils/platform/responsive';
 import { ThemePreferenceTransitionHost } from '@/components/settings/appearance/ThemePreferenceTransitionHost';
 import { useTauriMainWindowBackgroundColor } from '@/desktop/window/useTauriMainWindowBackgroundColor';
 import { OnboardingShowcaseAutoShowMount } from '@/onboarding/showcase';
 import { DesktopBackgroundServiceCloseGuard } from '@/setup/DesktopBackgroundServiceCloseGuard';
 import { DesktopLocalSetupWarmup } from '@/setup/DesktopLocalSetupWarmup';
+import { DesktopLocalSetupRuntime } from '@/setup/DesktopLocalSetupRuntime';
 import { DesktopMainContentDragSurface } from '@/components/navigation/desktopWindowChrome/DesktopMainContentDragSurface';
 import { useChromeSafeAreaInsets } from '@/components/ui/layout/useChromeSafeAreaInsets';
 import { loadExpoNotifications, type ExpoNotificationsModule } from '@/utils/platform/loadExpoNotifications';
@@ -578,6 +582,11 @@ async function loadFonts() {
 }
 
 function RootLayout() {
+    React.useEffect(() => {
+        if (Platform.OS === 'web' && isTauriDesktop()) {
+            return installTauriExternalLinkClicks();
+        }
+    }, []);
     const { theme } = useUnistyles();
     const isDesktopPetOverlayWindow = isDesktopPetOverlayWindowContext();
     useWebUiFontScale();
@@ -797,20 +806,10 @@ function RootAppShell(props: Readonly<{
     const appShellChromeHost = resolveAppShellChromeHost({
         isAuthenticated: auth.isAuthenticated,
         isDesktopPetOverlayWindow: props.isDesktopPetOverlayWindow,
-        isWeb: Platform.OS === 'web',
         isTauriDesktop: tauriDesktop,
         isTablet: props.isTablet,
         isTerminalConnectRoute: props.isTerminalConnectRoute,
     });
-    const sidebarShellUpdateIndicator =
-        appShellChromeHost === 'none'
-        && auth.isAuthenticated
-        && tauriDesktop
-        && props.isTablet
-        && !props.isTerminalConnectRoute
-        && !props.isDesktopPetOverlayWindow
-            ? <AppUpdateStatusTag testID="sidebar-shell-app-update-status-tag" />
-            : undefined;
     const shouldUseRootDesktopDragSurface =
         appShellChromeHost === 'unauth-shell'
         || appShellChromeHost === 'narrow-desktop-fallback';
@@ -818,6 +817,7 @@ function RootAppShell(props: Readonly<{
     const shellContent = (
         <View style={{ flex: 1, position: 'relative' }}>
             <ActionOperationRuntime enabled={auth.isAuthenticated && !props.isDesktopPetOverlayWindow} />
+            <UpdateFactsBackgroundRuntime enabled={auth.isAuthenticated && !props.isDesktopPetOverlayWindow} />
             {/*
               * R5/INV4 — deliberately NOT behind `auth.isAuthenticated`. This is the app's one
               * pre-auth mount: the moment the desktop window opens it starts acquiring the
@@ -833,24 +833,20 @@ function RootAppShell(props: Readonly<{
               * from anywhere in the app, signed in or not.
               */}
             <DesktopBackgroundServiceCloseGuard enabled={tauriDesktop && !props.isDesktopPetOverlayWindow} />
+            {/*
+              * R11 — the one setup lifecycle (inspection, quiet start, reconciliation, executor,
+              * readiness proof), mounted once at the authenticated desktop shell so a cold deep
+              * link gets the same app-open work as the Home. It renders nothing and blocks nothing;
+              * the Home presents it (`DesktopLocalSetupPanel`). Sign-out unmounts it, so the next
+              * sign-in starts a fresh first run.
+              */}
+            {tauriDesktop && auth.isAuthenticated && !props.isDesktopPetOverlayWindow ? <DesktopLocalSetupRuntime /> : null}
             {!props.isDesktopPetOverlayWindow ? <OnboardingShowcaseAutoShowMount /> : null}
             {appShellChromeHost === 'narrow-desktop-fallback' || appShellChromeHost === 'unauth-shell' ? (
                 <DesktopFallbackShellChrome safeArea={props.safeArea} />
-            ) : appShellChromeHost === 'web-top-right' ? (
-                <View
-                    pointerEvents="box-none"
-                    style={{
-                        position: 'absolute',
-                        top: props.safeArea.top + 12,
-                        right: props.safeArea.right + 16,
-                        zIndex: 10,
-                    }}
-                >
-                    <AppUpdateStatusTag testID="root-shell-app-update-status-tag" />
-                </View>
             ) : null}
             <View style={{ flex: 1 }}>
-                <SidebarNavigator desktopUpdateIndicator={sidebarShellUpdateIndicator} />
+                <SidebarNavigator />
             </View>
         </View>
     );
@@ -861,7 +857,8 @@ function RootAppShell(props: Readonly<{
             leftOffsetPx={0}
             style={{ flex: 1 }}
         >
-            {shellContent}
+            {/* One Updates summary for every always-mounted entry (sidebar, rail, header, Settings, tray). */}
+            <UpdatesSummaryProvider>{shellContent}</UpdatesSummaryProvider>
         </DesktopMainContentDragSurface>
     );
 }
@@ -891,7 +888,7 @@ function DesktopFallbackShellChrome(props: Readonly<{
                 {desktopWindowControls}
             </DesktopShellWindowControlsHost>
             <DesktopShellUpdateIndicatorHost>
-                <AppUpdateStatusTag testID="root-shell-app-update-status-tag" />
+                <UpdatesEntry variant="icon" testID="root-shell-updates-button" />
             </DesktopShellUpdateIndicatorHost>
         </View>
     );

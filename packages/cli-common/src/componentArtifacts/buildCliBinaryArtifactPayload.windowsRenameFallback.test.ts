@@ -93,6 +93,7 @@ describe('buildCliBinaryArtifactPayload Windows rename fallback', () => {
             ['apps', 'cli', 'scripts', 'ripgrep_launcher.cjs'],
             ['apps', 'cli', 'scripts', 'statusline_forwarder.cjs'],
             ['apps', 'cli', 'scripts', 'terminal_launch_spec_runner.cjs'],
+            ['apps', 'cli', 'scripts', 'process_tree.cjs'],
             ['apps', 'cli', 'scripts', 'node_pty_relay.cjs'],
             ['apps', 'cli', 'scripts', 'runtime', 'placeholder.txt'],
             ['apps', 'cli', 'scripts', 'shims', 'placeholder.txt'],
@@ -160,6 +161,7 @@ module.exports = { unpackTools };
         await expect(readFile(join(payloadDir, 'package-dist', 'index.mjs'), 'utf8')).resolves.toBe('export const cli = "fresh";\n');
         await expect(readFile(join(cliDistDir, 'index.mjs'), 'utf8')).resolves.toBe('export const cli = "fresh";\n');
         expect(existsSync(join(payloadDir, 'happier.exe'))).toBe(true);
+        await expect(readFile(join(payloadDir, 'scripts', 'process_tree.cjs'), 'utf8')).resolves.toBe('placeholder\n');
         expect(existsSync(join(payloadDir, 'tools', 'unpacked', 'rg.exe'))).toBe(true);
         expect(existsSync(join(payloadDir, 'tools', 'unpacked', 'ripgrep.node'))).toBe(false);
         expect(existsSync(join(payloadDir, 'tools', 'unpacked', 'zellij.exe'))).toBe(false);

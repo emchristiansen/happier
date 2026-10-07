@@ -11,10 +11,8 @@ import { Text } from '@/components/ui/text/Text';
 import { Typography } from '@/constants/Typography';
 import { useConnectedServiceQuotaSnapshot } from '@/hooks/server/connectedServices/useConnectedServiceQuotaSnapshot';
 import {
-    computeConnectedServiceQuotaGaugeViewModel,
     type ConnectedServiceQuotaGaugeLabelFormatter,
 } from '@/sync/domains/connectedServices/connectedServiceQuotaGauge';
-import { deriveAccountCapacityPct } from '@/sync/domains/connectedServices/deriveAccountCapacityPct';
 import { deriveAccountHealth, type AccountHealth } from '@/sync/domains/connectedServices/deriveAccountHealth';
 import { projectConnectedServiceQuotaSnapshotForLimitSelection } from '@/sync/domains/connectedServices/projectConnectedServiceQuotaSnapshotForLimitSelection';
 import type {
@@ -26,14 +24,14 @@ import { t } from '@/text';
 import { ConnectedServiceCapacityAvatar, CONNECTED_SERVICE_GAUGE_BOX } from '../ConnectedServiceCapacityAvatar';
 import { Icon } from '@/components/ui/icons/Icon';
 import {
-    resolveAccountCapacityRings,
-    resolveAccountUsageRows,
+    resolveAccountCapacityView,
     type CapacityRingDatum,
 } from '../account/accountBlockModel';
 import {
     parseConnectedServiceGroupViewModels,
     resolveConnectedServiceGroupMemberCredentialHealthStatus,
     resolveConnectedServiceGroupProfileTitle,
+    resolveConnectedServiceGroupStrategyLabel,
     type ConnectedServiceGroupMemberViewModel,
     type ConnectedServiceGroupProfileLike,
     type ConnectedServiceGroupViewModel,
@@ -52,6 +50,7 @@ const POOL_AVATAR_SIZE = 42;
  * strings are never surfaced here and a no-op formatter is correct.
  */
 const NOOP_GAUGE_LABEL_FORMATTER: ConnectedServiceQuotaGaugeLabelFormatter = {
+    unavailable: () => '',
     remaining: () => '',
     remainingWithReset: () => '',
     used: () => '',
@@ -94,7 +93,7 @@ function usePoolsScreenIsFocused(): boolean {
 export type SnapshotGauge = Readonly<{ capacityPct: number | null; rings: CapacityRingDatum[] }>;
 
 /**
- * Compute the gauge view-model ONCE from a snapshot and return both the overall
+ * Project account capacity ONCE from a snapshot and return both the overall
  * capacity (min remaining % across comparable meters) and the concentric rings
  * (one per limit, most-constrained outermost). A single pass keeps the row gauge
  * and the center % from ever drifting.
@@ -103,18 +102,7 @@ function deriveSnapshotGauge(
     snapshot: ReturnType<typeof useConnectedServiceQuotaSnapshot>['snapshot'],
 ): SnapshotGauge {
     if (!snapshot) return { capacityPct: null, rings: [] };
-    const viewModel = computeConnectedServiceQuotaGaugeViewModel({
-        snapshot,
-        windowMode: 'most_constrained',
-        // Capacity is time-independent; a stable `nowMs` keeps the memo dependency tight.
-        nowMs: snapshot.fetchedAt,
-        formatter: NOOP_GAUGE_LABEL_FORMATTER,
-    });
-    if (!viewModel) return { capacityPct: null, rings: [] };
-    return {
-        capacityPct: deriveAccountCapacityPct(viewModel.allMeterRows),
-        rings: resolveAccountCapacityRings(resolveAccountUsageRows(viewModel.allMeterRows)),
-    };
+    return resolveAccountCapacityView(snapshot.meters, snapshot.fetchedAt, NOOP_GAUGE_LABEL_FORMATTER);
 }
 
 export type PoolMemberResolution = Readonly<{
@@ -228,11 +216,7 @@ const PoolRow = React.memo(function PoolRow(props: Readonly<{
         })
         : null;
 
-    const strategyLabel = group.policy.strategy === 'manual'
-        ? t('connectedServices.detail.groups.strategyManual')
-        : group.policy.strategy === 'least_limited'
-            ? t('connectedServices.detail.groups.strategyLeastLimited')
-            : t('connectedServices.detail.groups.strategyPriority');
+    const strategyLabel = resolveConnectedServiceGroupStrategyLabel(group.policy.strategy);
 
     const warningVariant = healthToStateVariant(aggregateHealth);
 

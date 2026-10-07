@@ -11,7 +11,8 @@ import { t } from '@/text';
 import { useAutomationsSupport } from '@/hooks/server/useAutomationsSupport';
 import { Text } from '@/components/ui/text/Text';
 import { useConnectionHealth } from '@/components/navigation/connectionStatus/useConnectionHealth';
-import { AppUpdateStatusTag } from '@/components/ui/feedback/AppUpdateStatusTag';
+import { UpdatesPopoverButton } from '@/components/updates/UpdatesPopoverButton';
+import { useSharedUpdatesSummary } from '@/updates/useUpdatesSummary';
 import { Icon } from '@/components/ui/icons/Icon';
 import {
     shouldForceFreshNewSessionEntryFromPressEvent,
@@ -150,6 +151,7 @@ function HeaderRightNotAuth() {
 
 function HeaderLeft(props: { showAutomations: boolean }) {
     const router = useRouter();
+    const updates = useSharedUpdatesSummary();
     const styles = stylesheet;
     const { theme } = useUnistyles();
     const logo = (
@@ -163,11 +165,11 @@ function HeaderLeft(props: { showAutomations: boolean }) {
     );
     return (
         <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-            <AppUpdateStatusTag
-                testID="home-header-app-update-status-tag"
-                labelVariant="short"
-                fallback={logo}
-            />
+            {/* The phone's Updates entry sits where the logo is and pushes Settings › Updates; the
+                logo returns when there is nothing to act on. */}
+            {updates.visible ? (
+                <UpdatesPopoverButton summary={updates} variant="header" testID="home-header-updates-pill" />
+            ) : logo}
             {props.showAutomations ? (
                 <Pressable
                     onPress={() => router.push('/automations')}

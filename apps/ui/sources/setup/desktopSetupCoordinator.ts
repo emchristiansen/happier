@@ -1,4 +1,4 @@
-import type { SystemTaskResult, SystemTaskSpec } from '@happier-dev/protocol';
+import type { SystemTaskEvent, SystemTaskResult, SystemTaskSpec } from '@happier-dev/protocol';
 import { RPC_METHODS } from '@happier-dev/protocol/rpc';
 
 import { buildLocalMachineSetupSystemTaskSpec, type LocalMachineSetupTarget } from '@/components/systemTasks/buildLocalMachineSetupSystemTaskSpec';
@@ -12,18 +12,37 @@ import { resolveWebappUrlFromServerUrl } from '@/sync/domains/server/url/resolve
 import { machineRpcWithServerScope } from '@/sync/runtime/orchestration/serverScopedRpc/serverScopedMachineRpc';
 import { resolvePreferredPublicReleaseRingLabelForCurrentApp } from '@/sync/runtime/currentAppVariant';
 
+import { toRelayHostDisplay } from '@/sync/domains/server/url/serverUrlDisplay';
+
 import {
     readAlwaysMoveDefaultFollowingService,
+    readKeptBackgroundService,
     rememberAlwaysMoveDefaultFollowingService,
+    rememberKeptBackgroundService,
 } from './desktopRelayMovePreference';
 import {
+    daemonRelayMatchesExpectation,
     desktopLocalRuntimeConverged,
+    resolveThisComputerService,
+    type DesktopCliChannel,
+    type DesktopCliChoiceFacts,
+    type DesktopCliUpdateFacts,
     type DesktopLocalInspection,
     type DesktopLocalReadinessFacts,
+    type ThisComputerServiceRowFacts,
     type DesktopSetupExpectation,
+    type ThisComputerRelayService,
 } from './deriveDesktopLocalSetupSnapshot';
-import type { RelayReconciliationConsentAnswer } from './presentRelayReconciliationConsent';
-import { resolveRelayReconciliationConsent } from './relayReconciliationConsent';
+import type { RelayReconciliationConsentAnswer, ThisComputerMoveRequest } from './presentRelayReconciliationConsent';
+import {
+    daemonMovesToAnotherRelay,
+    identifyKeptBackgroundService,
+    keptBackgroundServiceApplies,
+    resolveRelayReconciliationConsent,
+    thisComputerCanConnectToo,
+    type RelayReconciliationDecision,
+} from './relayReconciliationConsent';
+import { resolveAppAccountLabel, resolveDaemonAccountLabel } from './thisComputerLabels';
 
 /**
  * The single desktop-side owner of local setup (plan §3.3).
@@ -36,14 +55,25 @@ import { resolveRelayReconciliationConsent } from './relayReconciliationConsent'
  * new target against the same immutable facts. A failed inspection is reported, not guessed
  * around, and the next `inspect()` retries it.
  *
- * `startSetup()` is the only path that builds the explicit-target executor spec (R3): it awaits
- * an in-flight inspection so two acquisitions never contend (C3), then hands the spec to the
- * caller's runner adapter, reporting whether the acquisition milestone is already met.
+ * `startSetup()` and `reconcile()` are the only paths that build the explicit-target executor spec
+ * (R3), and the one place this computer's daemon is asked about before it moves (UD5/D1): each
+ * awaits an in-flight inspection so two acquisitions never contend (C3), asks the one question the
+ * facts call for, then hands the spec to the caller's runner adapter.
  *
- * No persistence, no lock, no event bus, no generations, no scheduler.
+ * The only thing it keeps beyond this app open is the person's own answers, through the existing
+ * device-local preference owner ("always move", "keep it as is"). No lock, no event bus, no
+ * generations, no scheduler.
  */
 export type DesktopSetupStartOutcome = Readonly<{
     taskId: string;
+}>;
+
+/** One in-memory operation, retained by the shell's coordinator while its views come and go. */
+export type DesktopSetupRun = Readonly<{
+    taskId: string | null;
+    runner: SystemTaskRunner;
+    spec: SystemTaskSpec;
+    movesRelay: boolean;
 }>;
 
 /**
@@ -67,6 +97,16 @@ export type DesktopSetupVerificationOutcome =
 export type DesktopSetupObservedExpectation = DesktopSetupExpectation & Readonly<{ serverId: string }>;
 
 export type DesktopSetupCoordinator = Readonly<{
+    readSetupRun: () => DesktopSetupRun | null;
+    /** Opaque existing request/spec reference, stable before and after native task allocation. */
+    readSetupOperation: () => object | null;
+    readSetupStarting: () => boolean;
+    readSetupStartError: () => string | null;
+    launchSetupTask: (params: Readonly<{
+        runner: SystemTaskRunner;
+        spec: SystemTaskSpec;
+        onEvent: (event: SystemTaskEvent) => void;
+    }>) => Promise<string>;
     /**
      * The one ambient inspection. `fresh: true` is only for the post-setup proof (INV8): the
      * executor just changed the runtime, so the app re-reads instead of trusting task success.
@@ -97,6 +137,12 @@ export type DesktopSetupCoordinator = Readonly<{
     /** Existing task owner for a surface that needs progress; facts above stay unchanged. */
     readInspectionTaskId: () => string | null;
     /**
+     * A12-03/N-8 — the tray was pointed at or opened while this web UI runs (native
+     * `desktop_tray_refresh_requested`, already gated by the native side's one pointer bound):
+     * re-read so the menu lists current services. A demand while a read runs joins it.
+     */
+    refreshOnTrayPointer: () => void;
+    /**
      * What the app expected of this computer when the current facts were read — or, when the read
      * was warmed before sign-in, what the first signed-in reader expected of it. UD5 compares the
      * daemon against this, never against installation history (D7). `null` until an inspection
@@ -117,16 +163,40 @@ export type DesktopSetupCoordinator = Readonly<{
      * second read (D3/C3).
      */
     verifyCurrentTarget: (options?: Readonly<{ fresh?: boolean }>) => Promise<DesktopSetupVerificationOutcome>;
-    startSetup: (params: Readonly<{ start: (spec: SystemTaskSpec) => Promise<string> }>) => Promise<DesktopSetupStartOutcome>;
     /**
-     * R8/L7 — a **direct** Relay/Home preference change, or authentication completing after one.
-     * Runs the same preflight and the same idempotent executor as `startSetup`, after UD5 consent.
-     * Resolves `null` when the user chose to keep the service where it is.
+     * An explicit "set up / connect this computer". The person asked for the move, so a relay move
+     * needs no second question — but an ACCOUNT move still asks (D1), because the account the
+     * daemon is signed in as loses this computer. Resolves `null` when they chose to keep it.
      */
-    reconcile: (params: Readonly<{
-        start: (spec: SystemTaskSpec) => Promise<string>;
-        confirm: (request: Readonly<{ relayUrl: string }>) => Promise<RelayReconciliationConsentAnswer>;
-    }>) => Promise<DesktopSetupStartOutcome | null>;
+    startSetup: (params: DesktopSetupStartParams) => Promise<DesktopSetupStartOutcome | null>;
+    /**
+     * R8/L7 — a **direct** Relay/Home preference change, a relaunch whose daemon is elsewhere, or
+     * authentication completing after one. Runs the same preflight and the same idempotent executor
+     * as `startSetup`, after UD5/D1 consent — unless this device already chose to keep this daemon
+     * as it is (D5). Resolves `null` when the service stays where it is.
+     */
+    reconcile: (params: DesktopSetupStartParams) => Promise<DesktopSetupStartOutcome | null>;
+    /**
+     * Whether the executor run with this task id — launched by `startSetup`/`reconcile` — moves
+     * this computer's own service to another relay, decided once from the same facts the launch
+     * acted on. It belongs to that run, so a re-read mid-run (the post-setup proof) cannot re-title
+     * it. `false` for any other task, including one this coordinator did not launch.
+     */
+    readLaunchedRunMovesRelay: (taskId: string | null) => boolean;
+    /**
+     * F5 — whether a setup run is being launched (its question may be open) or the run this
+     * coordinator last launched has not settled. The one answer every other starter of this
+     * computer's services (the quiet start) consults, whichever surface launched the run.
+     */
+    isSetupActive: () => boolean;
+}>;
+
+export type DesktopSetupStartParams = Readonly<{
+    start: (spec: SystemTaskSpec) => Promise<string>;
+    /** The one ask. Defaults to the canonical presenter; a test or a headless caller may replace it. */
+    confirm?: (request: ThisComputerMoveRequest) => Promise<RelayReconciliationConsentAnswer>;
+    /** R12 — Settings › This computer › Command line's change action: ask the one-CLI question again. */
+    reconsiderCli?: boolean;
 }>;
 
 function readString(value: unknown): string | null {
@@ -163,6 +233,40 @@ function readCredentialState(value: unknown): DesktopLocalReadinessFacts['auth']
     return value === 'missing' || value === 'rejected' || value === 'valid' || value === 'unknown' ? value : null;
 }
 
+/** K1 — all four fields or nothing: a partial update answer proves no update. */
+function readCliUpdate(value: unknown): DesktopCliUpdateFacts | null {
+    const record = readRecord(value);
+    const currentVersion = readString(record.currentVersion);
+    if (!currentVersion || typeof record.updateAvailable !== 'boolean' || typeof record.managed !== 'boolean') {
+        return null;
+    }
+    return {
+        currentVersion,
+        latestVersion: readString(record.latestVersion),
+        updateAvailable: record.updateAvailable,
+        managed: record.managed,
+    };
+}
+
+/** R12 — unknown stays unknown: an unreadable answer is "nobody was asked, nothing else found". */
+function readCliChoice(value: unknown): DesktopCliChoiceFacts {
+    const record = readRecord(value);
+    const mode = record.mode === 'managed' || record.mode === 'own' ? record.mode : null;
+    const other = readRecord(record.otherCli);
+    const command = readString(other.command);
+    return {
+        mode,
+        otherCli: command
+            ? {
+                command,
+                origin: other.origin === 'npm' || other.origin === 'brew' ? other.origin : 'unknown',
+                removalCommand: readString(other.removalCommand),
+                updateCommand: readString(other.updateCommand),
+            }
+            : null,
+    };
+}
+
 function readRuntimeConvergence(value: unknown): DesktopLocalReadinessFacts['runtimeConvergence'] {
     const record = readRecord(value);
     const keys = ['controlReachable', 'serviceOwnsRunningDaemon', 'machineIdMatches', 'cliVersionMatches'] as const;
@@ -175,6 +279,10 @@ function readRuntimeConvergence(value: unknown): DesktopLocalReadinessFacts['run
         machineIdMatches: record.machineIdMatches === true,
         cliVersionMatches: record.cliVersionMatches === true,
     };
+}
+
+function readCliChannel(value: unknown): DesktopCliChannel | null {
+    return value === 'stable' || value === 'preview' || value === 'publicdev' ? value : null;
 }
 
 /** Projects `daemon.service.status.v1`'s result into the facts the entry policy reads. */
@@ -190,7 +298,7 @@ export function readDesktopLocalReadinessFacts(data: unknown): DesktopLocalReadi
     const auth = readRecord(record.auth);
     const service = readRecord(record.service);
     return {
-        acquisition: { command, provenance },
+        acquisition: { command, provenance, version: readString(acquisition.version), channel: readCliChannel(acquisition.channel) },
         server: {
             serverUrl: readString(server.serverUrl),
             publicServerUrl: readString(server.publicServerUrl),
@@ -201,6 +309,7 @@ export function readDesktopLocalReadinessFacts(data: unknown): DesktopLocalReadi
             credentialState: readCredentialState(auth.credentialState),
             validatedAccountId: readString(auth.validatedAccountId),
             accountId: readString(auth.accountId),
+            accountLabel: readString(auth.accountLabel),
             machineId: readString(auth.machineId),
         },
         service: {
@@ -210,10 +319,13 @@ export function readDesktopLocalReadinessFacts(data: unknown): DesktopLocalReadi
             targetMode: readServiceTargetMode(service.targetMode),
         },
         runtimeConvergence: readRuntimeConvergence(record.runtimeConvergence),
+        cliUpdate: readCliUpdate(readRecord(record.cli).update),
+        cliChoice: readCliChoice(readRecord(record.cli).choice),
     };
 }
 
-function inspectionFromResult(result: SystemTaskResult): DesktopLocalInspection {
+/** Projects a `daemon.service.status.v1` result into the one inspection (exported for the tray parity fixture). */
+export function inspectionFromResult(result: SystemTaskResult): DesktopLocalInspection {
     if (!result.ok) {
         return { status: 'failed', error: { code: result.error.code, message: result.error.message } };
     }
@@ -221,7 +333,91 @@ function inspectionFromResult(result: SystemTaskResult): DesktopLocalInspection 
     if (!facts) {
         return { status: 'failed', error: { code: 'invalid_status_result', message: 'The local inspection returned no acquisition facts.' } };
     }
-    return { status: 'resolved', facts };
+    const pinned = readPinnedServices(readRecord(result.data).pinnedServices);
+    const serviceRows = readServiceRows(readRecord(result.data).serviceRows);
+    return {
+        status: 'resolved',
+        facts,
+        pinnedServices: pinned?.services ?? null,
+        // The executor's ONE completeness signal; an older result without it is unknown, not whole.
+        pinnedServicesComplete: pinned?.complete === true,
+        pinnedServiceCoexistence: pinned?.coexistence === true,
+        pinnedServicesUnreadable: pinned?.unreadableRelayUrls ?? [],
+        managedServiceAutostart: readServiceAutostartMode(readRecord(result.data).managedServiceAutostart),
+        runningManagedServiceCount: readServiceCount(readRecord(result.data).runningManagedServiceCount),
+        serviceRows,
+    };
+}
+
+const SERVICE_ROW_STATES: ReadonlySet<string> = new Set(['connected', 'offline', 'needs_attention']);
+const SERVICE_ROW_ACTIONS: ReadonlySet<string> = new Set(['start', 'restart', 'stop']);
+
+/** A count the producer proved, or `null` (unknown): never a guessed zero. */
+function readServiceCount(value: unknown): number | null {
+    return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function readServiceRowMode(value: unknown): ThisComputerServiceRowFacts['serving'] | null {
+    return value === 'pinned' || value === 'default-following' ? value : null;
+}
+
+/**
+ * R16 — the executor's rows as sent. A row the app cannot read is dropped and claims nothing about
+ * its relay; bootstrap writes every row with the fields read here, so none is expected.
+ */
+function readServiceRows(value: unknown): readonly ThisComputerServiceRowFacts[] | null {
+    if (!Array.isArray(value)) {
+        return null;
+    }
+    return value.flatMap((entry): ThisComputerServiceRowFacts[] => {
+        const record = readRecord(entry);
+        const relayUrl = readString(record.relayUrl);
+        const state = typeof record.state === 'string' && SERVICE_ROW_STATES.has(record.state) ? record.state as ThisComputerServiceRowFacts['state'] : null;
+        const serving = readServiceRowMode(record.serving);
+        if (!relayUrl || !state || !serving) return [];
+        const actions = Array.isArray(record.actions)
+            ? record.actions.filter((action): action is ThisComputerServiceRowFacts['actions'][number] => typeof action === 'string' && SERVICE_ROW_ACTIONS.has(action))
+            : [];
+        return [{ relayUrl, state, appManaged: record.appManaged === true, serving, actions }];
+    });
+}
+
+/**
+ * One daemon per relay — each pinned service's facts, projected like the default-following one's.
+ * Unknown stays unknown: an executor that sent no list reads as `null`, and an entry the app cannot
+ * read makes the list incomplete, so nothing is claimed about relays the app cannot see and nothing
+ * that depends on the list is offered. `coexistence` is the CLI's `pinnedServiceCoexistence`
+ * capability (B-03): it gates only offering "Connect to … too", never which services are listed.
+ */
+function readPinnedServices(value: unknown): Readonly<{
+    services: readonly DesktopLocalReadinessFacts[];
+    complete: boolean;
+    coexistence: boolean;
+    unreadableRelayUrls: readonly string[];
+}> | null {
+    const record = readRecord(value);
+    if (!Array.isArray(record.services)) {
+        return null;
+    }
+    const services: DesktopLocalReadinessFacts[] = [];
+    let complete = record.complete === true;
+    for (const entry of record.services) {
+        const facts = readDesktopLocalReadinessFacts(entry);
+        if (!facts) {
+            // An entry the app cannot read is one more service it cannot see: known incomplete.
+            complete = false;
+            continue;
+        }
+        const managedBy = readRecord(entry).managedBy === 'desktop' ? 'desktop' : null;
+        services.push({ ...facts, service: { ...facts.service, managedBy } });
+    }
+    const unreadableRelayUrls = Array.isArray(record.unreadable)
+        ? record.unreadable.flatMap((entry) => {
+            const relayUrl = readString(readRecord(entry).relayUrl);
+            return relayUrl ? [relayUrl] : [];
+        })
+        : [];
+    return { services, complete, coexistence: record.coexistence === true, unreadableRelayUrls };
 }
 
 /**
@@ -258,6 +454,7 @@ function defaultMachineRpc(params: Readonly<{ machineId: string; serverId: strin
 
 const PENDING_INSPECTION: DesktopLocalInspection = { status: 'pending' };
 
+
 function readCurrentExpectation(): DesktopSetupObservedExpectation {
     const activeServer = getActiveServerSnapshot();
     return {
@@ -268,16 +465,71 @@ function readCurrentExpectation(): DesktopSetupObservedExpectation {
     };
 }
 
+/**
+ * The daemon on this computer that answers for the relay and account the app is on NOW — the
+ * relay's own pinned service when it has one here (one daemon per relay), else the default-following
+ * one. `null` until facts have settled. For surfaces that describe "this computer" on the app's
+ * relay: its machine id, its status, its update row.
+ */
+export function resolveThisComputerServiceForActiveRelay(inspection: DesktopLocalInspection): ThisComputerRelayService | null {
+    return inspection.status === 'resolved' ? resolveThisComputerService(inspection, readCurrentExpectation()) : null;
+}
+
+/**
+ * The move a consent question is about, named from the facts the decision used: hosts for a relay
+ * move, both accounts for an account move (U2/D1).
+ */
+function buildMoveRequest(
+    decision: Exclude<RelayReconciliationDecision, 'start' | 'leave_user_service'>,
+    inspection: DesktopLocalInspection,
+    target: DesktopSetupExpectation,
+): ThisComputerMoveRequest {
+    // The daemon the question is about: the one that serves (or would be moved to) this relay.
+    const facts = inspection.status === 'resolved' ? resolveThisComputerService(inspection, target)?.facts ?? null : null;
+    const toRelayHost = toRelayHostDisplay(target.relayUrl);
+    const fromRelayHost = facts?.server.serverUrl ? toRelayHostDisplay(facts.server.serverUrl) : null;
+    const connectToo = thisComputerCanConnectToo({ inspection, target }) ? { offerConnectToo: true as const } : {};
+    if (decision === 'confirm_relay' || !facts || !target.accountId) {
+        return { kind: 'relay', fromRelayHost, toRelayHost, ...connectToo };
+    }
+    return {
+        kind: 'account',
+        fromAccountLabel: resolveDaemonAccountLabel(facts.auth) ?? '',
+        toAccountLabel: resolveAppAccountLabel(target.accountId),
+        relayHost: toRelayHost,
+        fromRelayHost: daemonRelayMatchesExpectation(facts, target) ? null : fromRelayHost,
+        ...connectToo,
+    };
+}
+
+/** Which of this computer's services a setup run converges for the app's relay. */
+type SetupServiceTargetMode = ThisComputerRelayService['serviceTargetMode'];
+
+/** The service that serves `target` here now — the one a run that moves nothing converges. */
+function servingServiceTargetMode(inspection: DesktopLocalInspection, target: DesktopSetupExpectation): SetupServiceTargetMode {
+    if (inspection.status !== 'resolved') return 'default-following';
+    // An unreadable relay service is still that relay's own: a run converges it, never the default (R12-F1).
+    return resolveThisComputerService(inspection, target)?.serviceTargetMode ?? 'pinned';
+}
+
 export function createDesktopSetupCoordinator(deps: Readonly<{
     runner: () => SystemTaskRunner;
     /** INV10's canonical owner. Read-only, so it keeps its production default. */
     machineRpc?: (params: Readonly<{ machineId: string; serverId: string }>) => Promise<unknown>;
+    /** The one consent presenter (UD5/D1). */
+    confirm?: (request: ThisComputerMoveRequest) => Promise<RelayReconciliationConsentAnswer>;
 }>): DesktopSetupCoordinator {
     let inspection: Promise<DesktopLocalInspection> | null = null;
     let observedExpectation: DesktopSetupObservedExpectation | null = null;
     let snapshot: DesktopLocalInspection = PENDING_INSPECTION;
     let refreshing = false;
     let inspectionTaskId: string | null = null;
+    /** F5 — `startSetup`/`reconcile` calls between their start and the run they launch (or none). */
+    let launching = 0;
+    let setupRun: DesktopSetupRun | null = null;
+    let setupStartError: string | null = null;
+    let setupRequest: Promise<DesktopSetupStartOutcome | null> | null = null;
+    let setupOperation: object | null = null;
     const listeners = new Set<() => void>();
 
     const notify = (): void => {
@@ -286,7 +538,40 @@ export function createDesktopSetupCoordinator(deps: Readonly<{
         }
     };
 
-    const runInspection = async (): Promise<DesktopLocalInspection> => {
+    const launchSetupTask: DesktopSetupCoordinator['launchSetupTask'] = async ({ runner, spec, onEvent }) => {
+        launching += 1;
+        setupStartError = null;
+        if (!setupRequest) setupOperation = spec;
+        setupRun = { runner, spec, taskId: null, movesRelay: false };
+        notify();
+        try {
+            const taskId = await runner.start(spec);
+            setupRun = { runner, spec, taskId, movesRelay: false };
+            // This subscription belongs to the operation, not its initiating route. Replay also
+            // answers a prompt emitted between native start and the retained subscription.
+            let unsubscribe: (() => void) | null = null;
+            let settled = false;
+            unsubscribe = runner.subscribe(taskId, onEvent, (result) => {
+                settled = true;
+                unsubscribe?.();
+                // Setup outlives its initiating route. Its successful mutation invalidates the
+                // ambient facts for every reader, including one reopened after completion.
+                if (result.ok) void inspect({ fresh: true });
+                notify();
+            });
+            if (settled) unsubscribe();
+            notify();
+            return taskId;
+        } catch (error) {
+            setupStartError = error instanceof Error ? error.message : 'system_task_start_failed';
+            throw error;
+        } finally {
+            launching -= 1;
+            notify();
+        }
+    };
+
+    const runInspection = async (isCurrent: () => boolean): Promise<DesktopLocalInspection> => {
         // The facts are read against the app's identity as it is NOW, when the read is requested.
         // Recording it when the read settles instead would hide every server change that lands
         // inside the acquisition window from the relay-change discriminator: a navigation-,
@@ -299,8 +584,10 @@ export function createDesktopSetupCoordinator(deps: Readonly<{
         try {
             runner = deps.runner();
             taskId = await runner.start(buildLocalDaemonServiceSystemTaskSpec('daemon.service.status.v1'));
-            inspectionTaskId = taskId;
-            notify();
+            if (isCurrent()) {
+                inspectionTaskId = taskId;
+                notify();
+            }
         } catch (error) {
             return {
                 status: 'failed',
@@ -320,7 +607,10 @@ export function createDesktopSetupCoordinator(deps: Readonly<{
             refreshing = true;
             inspectionTaskId = null;
             notify();
-            inspection = runInspection().then((result) => {
+            const request: Promise<DesktopLocalInspection> = runInspection(() => inspection === request).then((result) => {
+                // An older read still answers its caller, but cannot replace facts or progress
+                // from a later read requested after setup changed this computer.
+                if (inspection !== request) return result;
                 if (result.status === 'failed') {
                     inspection = null;
                 }
@@ -329,7 +619,8 @@ export function createDesktopSetupCoordinator(deps: Readonly<{
                 notify();
                 return result;
             });
-            return inspection;
+            inspection = request;
+            return request;
         }
         if (observedExpectation !== null && observedExpectation.accountId === null) {
             // R5/INV4 — the pre-auth warm-up starts this read at app open, before the user has
@@ -350,8 +641,10 @@ export function createDesktopSetupCoordinator(deps: Readonly<{
         // identity the app is on at the moment the proof was asked for.
         const expected = readCurrentExpectation();
         const inspection = await inspect(options?.fresh ? { fresh: true } : undefined);
+        // The daemon that answers for this relay — the default-following one, or the relay's own
+        // pinned service — is the machine the proof asks.
         const machineId = inspection.status === 'resolved' && desktopLocalRuntimeConverged(inspection, expected)
-            ? inspection.facts.auth.machineId
+            ? resolveThisComputerService(inspection, expected)?.facts.auth.machineId ?? null
             : null;
         if (!machineId) {
             return { status: 'blocked', code: 'runtime_not_converged', inspection };
@@ -367,36 +660,185 @@ export function createDesktopSetupCoordinator(deps: Readonly<{
         return { status: 'verified', machineId, inspection };
     };
 
-    const startSetup: DesktopSetupCoordinator['startSetup'] = async (params) => {
-        const target = resolveDesktopSetupTarget();
+    /**
+     * Asks the one question the decision named and records the answer: the service the run then
+     * converges, or `null` for "Keep it as is" — remembered for exactly the daemon it was said
+     * about (D5). "always" is a relay answer and is never offered for an account move;
+     * "Connect to … too" gives the relay its own pinned service and is only ever an answer when it
+     * was offered.
+     */
+    const askToMove = async (
+        decision: Exclude<RelayReconciliationDecision, 'start' | 'leave_user_service'>,
+        ambient: DesktopLocalInspection,
+        target: DesktopSetupExpectation,
+        confirm: DesktopSetupStartParams['confirm'],
+    ): Promise<SetupServiceTargetMode | null> => {
+        // The presenter is loaded when a question is actually asked: the modal stack is not
+        // something the ambient read, or any coordinator reader, should pay for.
+        const ask = confirm ?? deps.confirm ?? (await import('./presentRelayReconciliationConsent')).presentRelayReconciliationConsent;
+        const request = buildMoveRequest(decision, ambient, target);
+        const answer = await ask(request);
+        if (answer === 'connectToo') {
+            return request.offerConnectToo ? 'pinned' : null;
+        }
+        if (answer === 'keep') {
+            const kept = identifyKeptBackgroundService(ambient);
+            if (kept) rememberKeptBackgroundService(kept);
+            return null;
+        }
+        if (answer === 'always' && decision === 'confirm_relay') {
+            rememberAlwaysMoveDefaultFollowingService();
+        }
+        return servingServiceTargetMode(ambient, target);
+    };
+
+    const readAmbient = async (): Promise<DesktopLocalInspection> => {
         // Awaiting an in-flight ambient read keeps two adjacent acquisitions from contending (C3).
-        // Its outcome is not consulted: a failed or rejected inspection must not block setup or
-        // repair, and a successful one proves nothing about the executor's own progress.
-        if (inspection) await inspection.catch(() => null);
-        const taskId = await params.start(buildLocalMachineSetupSystemTaskSpec(target));
+        // A failed or rejected inspection must not block setup or repair: it decides nothing.
+        const settled = inspection ? await inspection.catch(() => null) : null;
+        if (settled && settled.status === 'resolved' && settled.facts.auth.credentialState !== 'unknown') {
+            return settled;
+        }
+        // D1 is decided on facts that could see the daemon's account. Facts read while the relay
+        // was unreachable — or no facts at all — cannot, and the executor validates the account
+        // itself the moment the relay answers, so it would claim this computer with no question.
+        // One fresh read through the one inspection owner; if the relay still cannot be reached,
+        // the executor's own `auth status` answers `auth_unavailable` and it stops by name.
+        return await inspect({ fresh: true }).catch(() => settled ?? PENDING_INSPECTION);
+    };
+
+    const launch = async (
+        params: DesktopSetupStartParams,
+        target: LocalMachineSetupTarget,
+        ambient: DesktopLocalInspection,
+    ): Promise<DesktopSetupStartOutcome> => {
+        // A pinned run gives the relay its own service; it moves nothing.
+        const movesRelay = target.cliOnly !== true && target.serviceTargetMode !== 'pinned' && daemonMovesToAnotherRelay({
+            inspection: ambient,
+            target: { relayUrl: target.activeRelayUrl, localRelayUrl: target.activeLocalRelayUrl, accountId: target.expectedAccountId },
+        });
+        const spec = buildLocalMachineSetupSystemTaskSpec({
+            ...target,
+            ...(params.reconsiderCli ? { reconsiderCli: true } : {}),
+        });
+        const taskId = await params.start(spec);
+        setupRun = { runner: setupRun?.taskId === taskId ? setupRun.runner : deps.runner(), spec, taskId, movesRelay };
+        notify();
         return { taskId };
     };
 
-    const reconcile: DesktopSetupCoordinator['reconcile'] = async (params) => {
-        const ambient = inspection ? await inspection.catch(() => null) : null;
-        const decision = resolveRelayReconciliationConsent({
-            inspection: ambient ?? { status: 'pending' },
-            observedExpectation,
-            alwaysMoveDefaultFollowingService: readAlwaysMoveDefaultFollowingService(),
-        });
-        if (decision === 'confirm') {
-            const answer = await params.confirm({ relayUrl: readCurrentExpectation().relayUrl });
-            if (answer === 'keep') {
-                return null;
-            }
-            if (answer === 'always') {
-                rememberAlwaysMoveDefaultFollowingService();
-            }
-        }
-        return await startSetup(params);
+    /**
+     * What the run is told: which service it converges and, for an answered account move, the
+     * validated account that move is about (D1). "Connect to … too" replaces nobody's account: the
+     * other relay's daemon keeps it, and the executor still asks about the target relay's own
+     * saved credentials itself.
+     */
+    const runPlacement = (
+        decision: RelayReconciliationDecision,
+        ambient: DesktopLocalInspection,
+        target: DesktopSetupExpectation,
+        serviceTargetMode: SetupServiceTargetMode,
+    ): Readonly<{ replaceAccountId: string | null; serviceTargetMode?: 'pinned' }> => {
+        const replaced = decision === 'confirm_account' && ambient.status === 'resolved'
+            ? resolveThisComputerService(ambient, target)
+            : null;
+        return {
+            replaceAccountId: replaced && replaced.serviceTargetMode === serviceTargetMode ? replaced.facts.auth.validatedAccountId : null,
+            ...(serviceTargetMode === 'pinned' ? { serviceTargetMode: 'pinned' as const } : {}),
+        };
     };
 
+    const trackLaunch = (run: () => Promise<DesktopSetupStartOutcome | null>): Promise<DesktopSetupStartOutcome | null> => {
+        if (setupRequest) return setupRequest;
+        const active = setupRun?.taskId ? setupRun.runner.getSnapshot(setupRun.taskId) : null;
+        if (active && !active.result) return Promise.resolve({ taskId: active.taskId });
+        launching += 1;
+        setupStartError = null;
+        notify();
+        setupRequest = run().catch((error: unknown) => {
+            setupStartError = error instanceof Error ? error.message : 'system_task_start_failed';
+            throw error;
+        }).finally(() => {
+            launching -= 1;
+            setupRequest = null;
+            notify();
+        });
+        setupOperation = setupRequest;
+        notify();
+        return setupRequest;
+    };
+
+    const startSetupUntracked: DesktopSetupCoordinator['startSetup'] = async (params) => {
+        const target = resolveDesktopSetupTarget();
+        const ambient = await readAmbient();
+        const expectation: DesktopSetupExpectation = {
+            relayUrl: target.activeRelayUrl,
+            localRelayUrl: target.activeLocalRelayUrl,
+            accountId: target.expectedAccountId,
+        };
+        const decision = resolveRelayReconciliationConsent({
+            inspection: ambient,
+            observedExpectation,
+            target: expectation,
+            alwaysMoveDefaultFollowingService: readAlwaysMoveDefaultFollowingService(),
+        });
+        // H2 — the relay's own service here was set up by the user: nothing of the app's to converge.
+        if (decision === 'leave_user_service') {
+            // The CLI choice belongs to the home, independent of who owns this relay's service.
+            // The same executor handles it before any relay/auth/service convergence.
+            if (params.reconsiderCli) {
+                return await launch(params, { ...target, cliOnly: true }, ambient);
+            }
+            return null;
+        }
+        // An explicit request is the relay answer for a first setup; it is not an answer to taking
+        // this computer OFF a relay it serves (N1), nor to an account move (D1) — both are asked.
+        const asks = decision === 'confirm_account'
+            || (decision === 'confirm_relay' && daemonMovesToAnotherRelay({ inspection: ambient, target: expectation }));
+        const serviceTargetMode = asks
+            ? await askToMove(decision, ambient, expectation, params.confirm)
+            : servingServiceTargetMode(ambient, expectation);
+        if (serviceTargetMode === null) {
+            return null;
+        }
+        return await launch(params, { ...target, ...runPlacement(decision, ambient, expectation, serviceTargetMode) }, ambient);
+    };
+
+    const startSetup: DesktopSetupCoordinator['startSetup'] = (params) => trackLaunch(() => startSetupUntracked(params));
+
+    const reconcileUntracked: DesktopSetupCoordinator['reconcile'] = async (params) => {
+        const setupTarget = resolveDesktopSetupTarget();
+        const target = readCurrentExpectation();
+        const ambient = await readAmbient();
+        if (keptBackgroundServiceApplies({ inspection: ambient, target, kept: readKeptBackgroundService() })) {
+            return null;
+        }
+        const decision = resolveRelayReconciliationConsent({
+            inspection: ambient,
+            observedExpectation,
+            target,
+            alwaysMoveDefaultFollowingService: readAlwaysMoveDefaultFollowingService(),
+        });
+        if (decision === 'leave_user_service') {
+            return null;
+        }
+        const serviceTargetMode = decision === 'start'
+            ? servingServiceTargetMode(ambient, target)
+            : await askToMove(decision, ambient, target, params.confirm);
+        if (serviceTargetMode === null) {
+            return null;
+        }
+        return await launch(params, { ...setupTarget, ...runPlacement(decision, ambient, target, serviceTargetMode) }, ambient);
+    };
+
+    const reconcile: DesktopSetupCoordinator['reconcile'] = (params) => trackLaunch(() => reconcileUntracked(params));
+
     return {
+        readSetupRun: () => setupRun,
+        readSetupOperation: () => setupOperation,
+        readSetupStarting: () => launching > 0,
+        readSetupStartError: () => setupStartError,
+        launchSetupTask,
         inspect,
         subscribe: (listener) => {
             listeners.add(listener);
@@ -405,12 +847,19 @@ export function createDesktopSetupCoordinator(deps: Readonly<{
             };
         },
         readInspectionSnapshot: () => snapshot,
+        refreshOnTrayPointer: () => {
+            if (refreshing) return;
+            void inspect({ fresh: true });
+        },
         readInspectionRefreshing: () => refreshing,
         readInspectionTaskId: () => inspectionTaskId,
         readObservedExpectation: () => observedExpectation,
         verifyCurrentTarget,
         startSetup,
         reconcile,
+        readLaunchedRunMovesRelay: (taskId) => setupRun !== null && taskId !== null && setupRun.taskId === taskId && setupRun.movesRelay,
+        isSetupActive: () => launching > 0
+            || (setupRun?.taskId != null && setupRun.runner.getSnapshot(setupRun.taskId)?.result == null),
     };
 }
 

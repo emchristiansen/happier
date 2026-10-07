@@ -65,6 +65,7 @@ export async function listOpenCodeSessionCandidates(params: Readonly<{
           agentRuntimeDescriptorV1: buildOpenCodeAgentRuntimeDescriptor({
             backendMode: 'server',
             vendorSessionId: parsed.remoteSessionId,
+            managedServerLaunchFingerprint: client.getManagedServerIdentity()?.launchEnvFingerprint,
             ...(serverBaseUrl ? { serverBaseUrl } : {}),
             ...(serverBaseUrl ? { serverBaseUrlExplicit: true } : {}),
           }),

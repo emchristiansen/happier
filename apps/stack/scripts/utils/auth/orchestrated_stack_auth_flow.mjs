@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 
-import { createStepPrinter } from '../cli/progress.mjs';
+import { createStepPrinter } from '@happier-dev/cli-common/output';
 import { createFileLogForwarder } from '../cli/log_forwarder.mjs';
 import { resolveStackEnvPath } from '../paths/paths.mjs';
 import { getStackRuntimeStatePath, isPidAlive, readStackRuntimeStateFile } from '../stack/runtime_state.mjs';

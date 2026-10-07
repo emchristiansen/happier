@@ -157,3 +157,15 @@ describe('direct session follow lifecycle schemas', () => {
     });
   });
 });
+
+describe.each([
+  directSessionsRpc.DirectSessionTakeoverRequestSchema,
+  directSessionsRpc.DirectSessionTakeoverPersistRequestSchema,
+])('direct takeover terminal request', (schema) => {
+  it('accepts legacy requests and rejects invalid terminal settings at the RPC boundary', () => {
+    const request = { machineId: 'm1', sessionId: 's1' };
+    expect(schema.parse(request)).toEqual(request);
+    expect(schema.safeParse({ ...request, terminal: { mode: 'tmux', tmux: { isolated: 'true' } } }).success).toBe(false);
+    expect(schema.safeParse({ ...request, terminal: { mode: 'integrated' } }).success).toBe(false);
+  });
+});

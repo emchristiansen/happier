@@ -7,6 +7,7 @@ import { wantsJson, printJsonEnvelope, writeJsonStdout } from '@/cli/output/json
 import { hasFlag, readCommandPositionals } from '@/cli/commands/shared/argvFlags';
 import { resolveSessionTransportContext } from '@/session/services/resolveSessionTransportContext';
 import { startExecutionRunStream } from '@/session/services/executionRuns';
+import { cmd, fail } from '@happier-dev/cli-common/output';
 
 export async function cmdSessionRunStreamStart(
   argv: string[],
@@ -26,7 +27,7 @@ export async function cmdSessionRunStreamStart(
       await printJsonEnvelope({ ok: false, kind: 'session_run_stream_start', error: { code: 'not_authenticated' } });
       return;
     }
-    console.error(chalk.red('Error:'), 'Not authenticated. Run "happier auth login" first.');
+    console.error(fail(`Not signed in. Run ${cmd('happier auth login')} first.`));
     process.exit(1);
   }
 

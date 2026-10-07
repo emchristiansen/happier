@@ -149,6 +149,7 @@ describe('daemonServiceInventory', () => {
                     description: 'Happier Daemon',
                     execStart: ['/Users/tester/.happier/cli/current/happier', 'daemon', 'start-sync'],
                     env: {
+                        HAPPIER_HOME_DIR: runtime.happierHomeDir,
                         HAPPIER_DAEMON_STARTUP_SOURCE: 'background-service',
                         HAPPIER_PUBLIC_RELEASE_CHANNEL: 'stable',
                     },

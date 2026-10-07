@@ -2,10 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { captureConsoleText } from '@/testkit/logger/captureOutput';
 import { SESSION_CREATE_USAGE } from './create/parseSessionCreateSpawnOptions';
+import { handleSessionCommand } from './handleSessionCommand';
 
 describe('handleSessionCommand help output', () => {
   it('lists the direct session control subcommands and run subcommands', async () => {
-    const { handleSessionCommand } = await import('./handleSessionCommand');
     const output = captureConsoleText();
 
     try {
@@ -15,7 +15,7 @@ describe('handleSessionCommand help output', () => {
       expect(output.text()).toContain('happier resume [<session-id-or-prefix>]');
       expect(output.text()).toContain('happier session status <session-id-or-prefix-or-tag> [--live] [--json]');
       expect(output.text()).toContain(SESSION_CREATE_USAGE);
-      expect(output.text()).toContain('happier session send <session-id-or-prefix-or-tag> <message> [--permission-mode <mode>] [--model <model-id>] [--wait] [--timeout <seconds>] [--json]');
+      expect(output.text()).toContain('happier session send <session-id-or-prefix-or-tag> <message> [--local-id <id>] [--permission-mode <mode>] [--model <model-id>] [--wait] [--timeout <seconds>] [--json]');
       expect(output.text()).toContain('happier session wait <session-id-or-prefix-or-tag> [--timeout <seconds>] [--json]');
       expect(output.text()).toContain('happier session stop <session-id-or-prefix-or-tag> [--json]');
       expect(output.text()).toContain('happier session set-title <session-id-or-prefix-or-tag> <title> [--json]');
@@ -79,7 +79,6 @@ describe('handleSessionCommand help output', () => {
     [['run', 'stream-read', '--help'], 'happier session run stream-read <session-id-or-prefix-or-tag> <run-id> <stream-id>'],
     [['run', 'stream-cancel', '--help'], 'happier session run stream-cancel <session-id-or-prefix-or-tag> <run-id> <stream-id>'],
   ] as const)('prints usage for `%s` without prompting for credentials', async (argv, expectedUsage) => {
-    const { handleSessionCommand } = await import('./handleSessionCommand');
     const output = captureConsoleText();
     const readCredentialsFn = vi.fn(async () => {
       throw new Error('credentials must not be read for session help');

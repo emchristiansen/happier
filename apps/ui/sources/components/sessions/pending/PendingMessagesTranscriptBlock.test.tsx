@@ -105,7 +105,6 @@ installPendingMessagesCommonModuleMocks({
         return createUnistylesMock({
             theme: {
                 colors: {
-                    text: '#000',
                     textSecondary: '#666',
                     surfaceHighest: '#eee',
                     surface: '#fff',

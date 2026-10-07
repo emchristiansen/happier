@@ -1,14 +1,15 @@
 import { dirname, join } from 'node:path';
 import { chmod, mkdir, rename, writeFile } from 'node:fs/promises';
-import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import type { SpawnSyncReturns } from 'node:child_process';
 import { userInfo } from 'node:os';
 
-import { commandExistsOnPath } from '../process/index.js';
+import { commandExistsOnPath, spawnBackgroundSync } from '../process/index.js';
 import { buildLaunchdPlistXml } from './launchd.js';
 import { mergeServiceEnvWithPath } from './path.js';
 import { renderSystemdServiceUnit } from './systemd.js';
 import {
   buildReadWindowsScheduledTaskStatusPowerShellCommand,
+  buildRegisterWindowsUserScheduledTaskPowerShellCommand,
   buildRemoveWindowsScheduledTaskIfPresentPowerShellCommand,
   buildApplyWindowsScheduledTaskServicePolicyPowerShellCommand,
   buildStopWindowsScheduledTaskIfRunningPowerShellCommand,
@@ -381,9 +382,7 @@ export function planServiceAction(params: Readonly<{
     if (action === 'install') {
       if (!definitionPath) throw new Error('definitionPath is required for schtasks install');
       const ps = buildWindowsScheduledTaskPowerShellAction({ definitionPath });
-      const schedule = persistent
-        ? (mode === 'system' ? 'ONSTART' : 'ONLOGON')
-        : 'ONCE';
+      const schedule = persistent ? 'ONSTART' : 'ONCE';
       const args = [
         '/Create',
         '/F',
@@ -403,7 +402,14 @@ export function planServiceAction(params: Readonly<{
         ...(mode === 'system' ? ['/RU', 'SYSTEM', '/RL', 'HIGHEST'] : []),
       ];
       commands.push(stopIfRunning());
-      commands.push({ cmd: 'schtasks', args });
+      commands.push(mode === 'user'
+        ? {
+          cmd: 'powershell.exe',
+          args: windowsPowerShellCommandArgs(buildRegisterWindowsUserScheduledTaskPowerShellCommand({
+            qualifiedTaskName: name, definitionPath, persistent,
+          })),
+        }
+        : { cmd: 'schtasks', args });
       // schtasks has no restart/keep-alive switch, so the policy is applied to the
       // created task before it is first started.
       commands.push({
@@ -464,7 +470,7 @@ export async function applyServicePlan(plan: ServicePlan, options: Readonly<{ ru
     if (!commandExistsOnPath(c.cmd, { path: process.env.PATH })) {
       throw new Error(`[service] command not found: ${c.cmd}`);
     }
-    let res = spawnSync(c.cmd, [...c.args], {
+    let res = spawnBackgroundSync(c.cmd, c.args, {
       encoding: 'utf8',
       env: buildServiceCommandEnv({ cmd: c.cmd, args: c.args, env: process.env }),
     });
@@ -484,8 +490,8 @@ export async function applyServicePlan(plan: ServicePlan, options: Readonly<{ ru
     if (status !== 0 && !c.allowFail && c.cmd === 'launchctl') {
       const args = Array.isArray(c.args) ? c.args.map((a) => String(a ?? '')) : [];
       if (args[0] === 'bootstrap' && /^gui\/\d+$/.test(args[1] ?? '') && typeof status === 'number' && status === 5 && args[2]) {
-        spawnSync('launchctl', ['unload', '-w', args[2]], { encoding: 'utf8', env: process.env });
-        const loadRes = spawnSync('launchctl', ['load', '-w', args[2]], { encoding: 'utf8', env: process.env });
+        spawnBackgroundSync('launchctl', ['unload', '-w', args[2]], { encoding: 'utf8', env: process.env });
+        const loadRes = spawnBackgroundSync('launchctl', ['load', '-w', args[2]], { encoding: 'utf8', env: process.env });
         const loadStatus = typeof loadRes.status === 'number' ? loadRes.status : null;
         if (loadRes.error) {
           throw new Error(`[service] failed to run launchctl load: ${loadRes.error.message}`);
@@ -578,7 +584,7 @@ export function inspectServiceRegistration(params: Readonly<{
     args = [...windowsPowerShellCommandArgs(buildReadWindowsScheduledTaskStatusPowerShellCommand({ taskName, taskPath }))];
   }
   if (!commandExistsOnPath(cmd, { path: process.env.PATH })) throw new Error(`[service] command not found: ${cmd}`);
-  const res = spawnSync(cmd, args, { encoding: 'utf8', env: buildServiceCommandEnv({ cmd, args, env: process.env, uid }) });
+  const res = spawnBackgroundSync(cmd, args, { encoding: 'utf8', env: buildServiceCommandEnv({ cmd, args, env: process.env, uid }) });
   if (res.error) throw new Error(`[service] failed to inspect ${label}: ${res.error.message}`);
   const status = typeof res.status === 'number' ? res.status : null;
   const stdout = String(res.stdout ?? '').trim();
@@ -625,7 +631,7 @@ async function retryLaunchctlKickstart(params: Readonly<{ cmd: string; args: rea
     if (attempt > 0) {
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
-    const res = spawnSync(params.cmd, [...params.args], { encoding: 'utf8', env: process.env });
+    const res = spawnBackgroundSync(params.cmd, params.args, { encoding: 'utf8', env: process.env });
     if (res.error) return res;
     const status = typeof res.status === 'number' ? res.status : null;
     if (status === 0) return res;
@@ -633,7 +639,7 @@ async function retryLaunchctlKickstart(params: Readonly<{ cmd: string; args: rea
       return res;
     }
   }
-  return spawnSync(params.cmd, [...params.args], { encoding: 'utf8', env: process.env });
+  return spawnBackgroundSync(params.cmd, params.args, { encoding: 'utf8', env: process.env });
 }
 
 async function writeAtomicTextFile(path: string, contents: string, mode: number): Promise<void> {

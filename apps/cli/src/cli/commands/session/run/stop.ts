@@ -8,6 +8,7 @@ import { readCommandPositionals } from '@/cli/commands/shared/argvFlags';
 import { createCliActionExecutorFromCredentials } from '@/session/actions/createCliActionExecutorFromCredentials';
 import { normalizeActionExecuteResult } from '@/cli/commands/session/shared/normalizeActionExecuteResult';
 import { resolveSessionTransportContext } from '@/session/services/resolveSessionTransportContext';
+import { cmd, fail } from '@happier-dev/cli-common/output';
 
 export async function cmdSessionRunStop(
   argv: string[],
@@ -26,7 +27,7 @@ export async function cmdSessionRunStop(
       await printJsonEnvelope({ ok: false, kind: 'session_run_stop', error: { code: 'not_authenticated' } });
       return;
     }
-    console.error(chalk.red('Error:'), 'Not authenticated. Run "happier auth login" first.');
+    console.error(fail(`Not signed in. Run ${cmd('happier auth login')} first.`));
     process.exit(1);
   }
 

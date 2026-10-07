@@ -115,6 +115,7 @@ import {
   type QuotaProbeFreshProofResult,
 } from './proof/quotaProbeFreshProof';
 import type { ConnectedServiceRuntimeAuthApplyCapability } from '../credentials/lifecycleTypes';
+import type { ConnectedServiceQuotaCredentialRefreshOutcome } from '../refresh/refreshTypes';
 import {
   runtimeAuthApplyRequiresLiveIdentityProbe,
 } from '../accountGroups/switching/predictiveSoftSwitchPolicy';
@@ -156,9 +157,11 @@ import {
   deriveQuotaSnapshotStatus,
   extractActiveBindings,
   activeBindingMatchesRuntimeIdentity,
+  isRecord,
   isQuotaUnknownFallbackSnapshot,
   isQuotaAuthFailure,
   normalizeConnectedServiceQuotaGeneration,
+  QUOTA_AUTH_FAILURE_INCONCLUSIVE_PROBE_LIMIT,
   QUOTA_AUTH_FAILURE_REAUTH_CONSECUTIVE_FAILURES,
   readCredentialAccountIdentity,
   readFiniteNonNegativeMs,
@@ -634,6 +637,9 @@ export class ConnectedServiceQuotasCoordinator {
       this.failureStateByBindingKey.set(params.key, {
         consecutiveFailures,
         nextAllowedAt: params.now + Math.max(retryAfterMs, floorMs, 1),
+        ...(existing?.inconclusiveRefreshProbeCount !== undefined
+          ? { inconclusiveRefreshProbeCount: existing.inconclusiveRefreshProbeCount }
+          : {}),
       });
       return;
     }
@@ -643,6 +649,9 @@ export class ConnectedServiceQuotasCoordinator {
     this.failureStateByBindingKey.set(params.key, {
       consecutiveFailures,
       nextAllowedAt: params.now + jitteredMs,
+      ...(existing?.inconclusiveRefreshProbeCount !== undefined
+        ? { inconclusiveRefreshProbeCount: existing.inconclusiveRefreshProbeCount }
+        : {}),
     });
   }
 
@@ -2664,20 +2673,30 @@ export class ConnectedServiceQuotasCoordinator {
     const updateHealth = this.api.updateConnectedServiceCredentialHealth;
     if (typeof updateHealth !== 'function') return null;
     const bindingKey = this.makeBindingKey({ serviceId: input.serviceId, profileId: input.profileId });
+    const existingFailureState = this.failureStateByBindingKey.get(bindingKey);
     const consecutiveFailures = Math.max(
       1,
-      Math.trunc(this.failureStateByBindingKey.get(bindingKey)?.consecutiveFailures ?? 0) + 1,
+      Math.trunc(existingFailureState?.consecutiveFailures ?? 0) + 1,
     );
     const health = buildQuotaAuthFailureCredentialHealth(input.error, input.now, {
-      consecutiveFailuresBeforeCurrent: this.failureStateByBindingKey.get(bindingKey)?.consecutiveFailures ?? 0,
+      consecutiveFailuresBeforeCurrent: existingFailureState?.consecutiveFailures ?? 0,
     });
     if (shouldProbeCredentialRefreshForQuotaFailure(input.error, { consecutiveFailures })) {
-      const probe = await this.refreshConnectedServiceCredentialForQuota?.({
-        serviceId: input.serviceId,
-        profileId: input.profileId,
-        force: true,
-        reason: 'auth_failure',
-      }).catch(() => null);
+      const refreshProbe = this.refreshConnectedServiceCredentialForQuota;
+      let probe: ConnectedServiceQuotaCredentialRefreshOutcome | null = null;
+      if (refreshProbe) {
+        try {
+          probe = await refreshProbe({
+            serviceId: input.serviceId,
+            profileId: input.profileId,
+            force: true,
+            reason: 'auth_failure',
+          });
+        } catch {
+          // A failed probe is inconclusive. Keep the quota failure retryable and
+          // let the bounded probe counter decide when reconnection is required.
+        }
+      }
       if (probe?.reauthRequired === true) {
         // The refresh coordinator (canonical owner of refresh-failure health) proved this
         // credential needs reconnection — permanent provider auth failure (e.g. 401
@@ -2691,8 +2710,34 @@ export class ConnectedServiceQuotasCoordinator {
         // The refresh owner already persisted connected health for the newly
         // committed revision. The quota failure belongs to the predecessor
         // credential and must not overwrite that successful refresh result.
+        this.failureStateByBindingKey.delete(bindingKey);
         return 'connected';
       }
+      const providerStatus = isRecord(input.error) ? input.error.status : undefined;
+      const inconclusiveRefreshProbeCount = (existingFailureState?.inconclusiveRefreshProbeCount ?? 0) + 1;
+      if (
+        providerStatus !== 403
+        && inconclusiveRefreshProbeCount >= QUOTA_AUTH_FAILURE_INCONCLUSIVE_PROBE_LIMIT
+      ) {
+        const reconnectHealth: ConnectedServiceCredentialHealthV1 = {
+          ...health,
+          status: 'needs_reauth',
+          reconnectRequired: true,
+        };
+        await updateHealth.call(this.api, {
+          serviceId: input.serviceId,
+          profileId: input.profileId,
+          ...(input.expectedCredentialRevision
+            ? { expectedCredentialRevision: input.expectedCredentialRevision }
+            : {}),
+          health: reconnectHealth,
+        });
+        return reconnectHealth.status;
+      }
+      this.failureStateByBindingKey.set(bindingKey, {
+        ...(existingFailureState ?? { consecutiveFailures: 0, nextAllowedAt: input.now }),
+        inconclusiveRefreshProbeCount,
+      });
     }
     await updateHealth.call(this.api, {
       serviceId: input.serviceId,

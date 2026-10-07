@@ -113,6 +113,7 @@ export async function machineRpcWithServerScope<R, A>(params: ServerScopedMachin
         const context = await resolveServerScopedContext({
             machineId: params.machineId,
             serverId: params.serverId,
+            accountId: params.accountId,
             forceScoped: options?.forceScoped === true || params.preferScoped === true,
             timeoutMs: params.timeoutMs,
         });

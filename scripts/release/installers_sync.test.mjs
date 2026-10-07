@@ -88,7 +88,7 @@ test('syncInstallers projects the shared planet into canonical and published ins
   await mkdir(sourceDir, { recursive: true });
   for (const name of sourceFiles()) {
     const art = ['install.sh', 'install.ps1'].includes(name)
-      ? '# BEGIN GENERATED NUMERIC PLANET\n# stale planet\n# END GENERATED NUMERIC PLANET\n'
+      ? '# BEGIN GENERATED PLANET\n# stale planet\n# END GENERATED PLANET\n'
       : '';
     await writeFile(join(sourceDir, name), fixtureForSource(name) + art, 'utf8');
   }
@@ -101,7 +101,7 @@ test('syncInstallers projects the shared planet into canonical and published ins
   await syncInstallers({ sourceDir, targetDir, checkOnly: true });
   const sourcePath = join(sourceDir, 'install.sh');
   const cleanSource = await readFile(sourcePath, 'utf8');
-  const staleSource = cleanSource.replace(/(# BEGIN GENERATED NUMERIC PLANET\n)[\s\S]*?(# END GENERATED NUMERIC PLANET)/, '$1# stale planet\n$2');
+  const staleSource = cleanSource.replace(/(# BEGIN GENERATED PLANET\n)[\s\S]*?(# END GENERATED PLANET)/, '$1# stale planet\n$2');
   await writeFile(sourcePath, staleSource);
   await assert.rejects(syncInstallers({ sourceDir, targetDir, checkOnly: true }), /out of sync/);
   assert.equal(await readFile(sourcePath, 'utf8'), staleSource, '--check must never repair source implicitly');

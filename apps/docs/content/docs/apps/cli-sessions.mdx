@@ -27,7 +27,7 @@ Use **attach** when the session is still running and you want to reconnect to th
 happier attach <session-id>
 ```
 
-Use **resume** when the session is inactive but vendor-resumable:
+Use **resume** to continue a session without checking its state first:
 
 ```bash
 happier resume <session-id>
@@ -36,7 +36,7 @@ happier resume <session-id>
 Short version:
 
 - **attach** = reconnect to a running session
-- **resume** = reopen an inactive session through the provider/backend
+- **resume** = attach if running and attachable; otherwise reopen an inactive vendor-resumable session
 
 For the full workflows, see [Attach to a running session](/sessions/attach-to-session) and [Resume inactive sessions](/sessions/session-resume).
 
@@ -125,6 +125,18 @@ Notes:
 - `--permission-mode` lets you override the permission intent for a single send.
 - `--model` lets you target a specific model for that message when the backend supports it.
 - `--json` + explicit timeouts are recommended for scripts.
+
+### Choosing one message identity (`--local-id`)
+
+Development builds let CLI coordinators choose the message's `localId` before sending:
+
+```bash
+happier session send <session-id-or-prefix> "ping" --local-id 'board-wake-42' --json
+```
+
+Keep that exact ID when correlating the send result with session history or retrying a send.
+IDs must be nonblank and cannot begin with `-`. The relay rejects the reserved `agent-transition:` prefix.
+This override belongs to the CLI; MCP and voice tools continue using host-generated IDs.
 
 ## History
 

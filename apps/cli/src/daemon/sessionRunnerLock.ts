@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { readFileSync, unlinkSync } from 'node:fs';
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -12,6 +13,58 @@ import {
   type SessionRunnerProcessCommandHashReader,
   type SessionRunnerProcessInstanceFingerprintReader,
 } from './sessionRunnerProcessIdentity';
+
+type SessionRunnerOwnership = {
+  closed: boolean;
+  claims: Map<string, Promise<Extract<AcquireSessionRunnerLockResult, { ok: true }>>>;
+};
+
+const sessionRunnerOwnership = new AsyncLocalStorage<SessionRunnerOwnership>();
+
+/** Only primary CLI runners enter this scope; API clients and sidechains do not own runner locks. */
+export async function withSessionRunnerOwnership<T>(run: () => Promise<T>): Promise<T> {
+  const ownership: SessionRunnerOwnership = { closed: false, claims: new Map() };
+  return sessionRunnerOwnership.run(ownership, async () => {
+    try {
+      return await run();
+    } finally {
+      ownership.closed = true;
+      await Promise.all([...ownership.claims.values()].map(async (claim) => {
+        const lock = await claim.catch(() => null);
+        await lock?.release();
+      }));
+    }
+  });
+}
+
+/** Claim a resolved Session id before creating any runner-owned realtime client or startup writes. */
+export async function claimSessionRunnerOwnership(sessionId: string): Promise<void> {
+  const ownership = sessionRunnerOwnership.getStore();
+  if (!ownership) return;
+  if (ownership.closed) throw new Error('Session runner ownership scope has ended.');
+  const normalizedSessionId = sessionId.trim();
+  let claim = ownership.claims.get(normalizedSessionId);
+  if (!claim) {
+    claim = (async () => {
+      const lock = await acquireSessionRunnerLock({ sessionId: normalizedSessionId });
+      if (lock.ok) return lock;
+      if (lock.reason === 'already_running') {
+        throw new Error(`Session ${normalizedSessionId} is already running on this machine (pid=${lock.heldByPid}).`);
+      }
+      throw new Error(`Failed to acquire session runner lock for ${normalizedSessionId} (${lock.reason}).`);
+    })();
+    ownership.claims.set(normalizedSessionId, claim);
+  }
+  try {
+    await claim;
+    if (ownership.closed) throw new Error('Session runner ownership scope has ended.');
+  } catch (error) {
+    if (ownership.claims.get(normalizedSessionId) === claim) {
+      ownership.claims.delete(normalizedSessionId);
+    }
+    throw error;
+  }
+}
 
 type LockPayload = Readonly<{
   sessionId: string;

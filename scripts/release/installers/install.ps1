@@ -21,6 +21,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Resolve 8.3 TEMP names once before any process files reach the FileSystem provider.
+$InstallerTempDir = (Get-Item -LiteralPath ([System.IO.Path]::GetTempPath())).FullName
+
 if ($WithDaemon.IsPresent -and $WithoutDaemon.IsPresent) {
   throw "Specify either -WithDaemon or -WithoutDaemon, not both."
 }
@@ -418,8 +421,16 @@ function Test-InstallerRichHeaderAvailable {
   }
 }
 
+function Test-InstallerBrailleArtAvailable {
+  # The planet is drawn with Braille glyphs. The legacy console host has no font
+  # fallback for them; Windows Terminal (WT_SESSION) and hosts that identify
+  # themselves (TERM_PROGRAM, e.g. VS Code) do. Mirrors supportsBrailleArt() in
+  # packages/cli-common/src/output/planet.ts, which setup uses after this handoff.
+  return [bool]($env:WT_SESSION -or $env:TERM_PROGRAM)
+}
+
 function Write-InstallerHeader {
-  if (-not (Test-InstallerRichHeaderAvailable)) {
+  if (-not (Test-InstallerRichHeaderAvailable) -or -not (Test-InstallerBrailleArtAvailable)) {
     Write-Host "Happier"
     Write-Host "Start coding anywhere. Continue anywhere."
     Write-Host "Download -> Verify -> Install"
@@ -428,38 +439,38 @@ function Write-InstallerHeader {
     return
   }
 
-  # BEGIN GENERATED NUMERIC PLANET
+  # BEGIN GENERATED PLANET
   $rows = @(
-    '         8557531822         ',
-    '     751448095236608919     ',
-    '   9008479751008911184043   ',
-    '  134069691908745137496009  ',
-    ' 15908889374662814990040775 ',
-    '8460391940911977361087356084',
-    '3686579386469759261860770407',
-    '8426999911207303208277772263',
-    ' 91900644319441053135416199 ',
-    '  572641993727001697448951  ',
-    '   5488295512800135204007   ',
-    '     793254239790824733     ',
-    '         4203319290         '
+    "            $([char]0x2801)$([char]0x2804)$([char]0x2801)$([char]0x2804)$([char]0x2801)$([char]0x2804)$([char]0x2801)         ",
+    "        $([char]0x2801)$([char]0x2804)$([char]0x2805)$([char]0x2885)$([char]0x2895)$([char]0x2885)$([char]0x28d5)$([char]0x2885)$([char]0x2895)$([char]0x2885)$([char]0x2885)$([char]0x2885)$([char]0x2805)$([char]0x2804)$([char]0x2801)     ",
+    "      $([char]0x2801)$([char]0x2804)$([char]0x2895)$([char]0x28b5)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28df)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28fd)$([char]0x28ff)$([char]0x28f5)$([char]0x28f5)$([char]0x2885)$([char]0x2805)$([char]0x2804)$([char]0x2801)   ",
+    "      $([char]0x2801)$([char]0x2815)$([char]0x289c)$([char]0x28f5)$([char]0x28ff)$([char]0x28ff)$([char]0x28fd)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28df)$([char]0x28bf)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28b7)$([char]0x2885)$([char]0x2805)$([char]0x2804)$([char]0x2801) ",
+    "      $([char]0x2801)$([char]0x2895)$([char]0x289d)$([char]0x28b5)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28b7)$([char]0x2895)$([char]0x2805)$([char]0x2801)$([char]0x2804)",
+    "      $([char]0x2801)$([char]0x2805)$([char]0x289d)$([char]0x28bd)$([char]0x28bf)$([char]0x28ff)$([char]0x28df)$([char]0x28fd)$([char]0x28ff)$([char]0x28fd)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28fd)$([char]0x28f7)$([char]0x28ff)$([char]0x28df)$([char]0x28ff)$([char]0x28df)$([char]0x2885)$([char]0x2805)$([char]0x2804)",
+    "      $([char]0x2801)$([char]0x2805)$([char]0x2815)$([char]0x28ad)$([char]0x28bf)$([char]0x28ff)$([char]0x28ff)$([char]0x28bf)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x2895)$([char]0x2805)$([char]0x2805)",
+    "        $([char]0x2801)$([char]0x2891)$([char]0x2889)$([char]0x28bd)$([char]0x28b7)$([char]0x28f7)$([char]0x28ff)$([char]0x28bf)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28fd)$([char]0x28ff)$([char]0x28ff)$([char]0x289f)$([char]0x2805)$([char]0x2805)$([char]0x2804)",
+    "        $([char]0x2801)$([char]0x2805)$([char]0x2815)$([char]0x2899)$([char]0x28bd)$([char]0x28bd)$([char]0x28bf)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28df)$([char]0x28ff)$([char]0x289f)$([char]0x2815)$([char]0x2805)$([char]0x2801) ",
+    "          $([char]0x2801)$([char]0x2805)$([char]0x281c)$([char]0x289d)$([char]0x289d)$([char]0x28bd)$([char]0x28bf)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x289f)$([char]0x281d)$([char]0x2805)$([char]0x2801)$([char]0x2805)$([char]0x2801) ",
+    "            $([char]0x2801)$([char]0x2801)$([char]0x2811)$([char]0x2815)$([char]0x2815)$([char]0x281d)$([char]0x281d)$([char]0x281d)$([char]0x2815)$([char]0x2805)$([char]0x2801)$([char]0x2805)$([char]0x2801) $([char]0x2801) ",
+    "                $([char]0x2801)$([char]0x2801)$([char]0x2801)$([char]0x2801)$([char]0x2801) $([char]0x2801)     ",
+    "                            "
   )
   $rgbRows = @(
-    "         $([char]27)[38;2;245;184;102m8$([char]27)[38;2;250;187;104m5$([char]27)[38;2;251;188;105m5$([char]27)[38;2;251;188;105m7$([char]27)[38;2;251;188;105m5$([char]27)[38;2;251;188;105m3$([char]27)[38;2;249;187;104m1$([char]27)[38;2;246;184;103m8$([char]27)[38;2;242;181;101m2$([char]27)[38;2;236;177;98m2         $([char]27)[0m",
-    "     $([char]27)[38;2;225;162;116m7$([char]27)[38;2;235;169;121m5$([char]27)[38;2;241;173;124m1$([char]27)[38;2;242;174;124m4$([char]27)[38;2;242;174;124m4$([char]27)[38;2;242;174;124m8$([char]27)[38;2;242;174;124m0$([char]27)[38;2;242;174;124m9$([char]27)[38;2;242;174;124m5$([char]27)[38;2;242;174;124m2$([char]27)[38;2;242;174;124m3$([char]27)[38;2;242;174;124m6$([char]27)[38;2;242;174;124m6$([char]27)[38;2;239;172;123m0$([char]27)[38;2;235;169;121m8$([char]27)[38;2;231;166;118m9$([char]27)[38;2;225;162;115m1$([char]27)[38;2;215;155;111m9     $([char]27)[0m",
-    "   $([char]27)[38;2;211;145;130m9$([char]27)[38;2;220;151;136m0$([char]27)[38;2;226;155;139m0$([char]27)[38;2;231;159;142m8$([char]27)[38;2;232;160;143m4$([char]27)[38;2;232;160;143m7$([char]27)[38;2;232;160;143m9$([char]27)[38;2;232;160;143m7$([char]27)[38;2;232;160;143m5$([char]27)[38;2;232;160;143m1$([char]27)[38;2;232;160;143m0$([char]27)[38;2;232;160;143m0$([char]27)[38;2;232;160;143m8$([char]27)[38;2;232;160;143m9$([char]27)[38;2;232;160;143m1$([char]27)[38;2;232;160;143m1$([char]27)[38;2;229;158;142m1$([char]27)[38;2;226;155;139m8$([char]27)[38;2;221;152;137m4$([char]27)[38;2;216;149;134m0$([char]27)[38;2;210;145;130m4$([char]27)[38;2;201;138;124m3   $([char]27)[0m",
-    "  $([char]27)[38;2;199;130;146m1$([char]27)[38;2;207;135;151m3$([char]27)[38;2;212;139;155m4$([char]27)[38;2;217;142;158m0$([char]27)[38;2;221;144;161m6$([char]27)[38;2;223;146;163m9$([char]27)[38;2;223;146;163m6$([char]27)[38;2;223;146;163m9$([char]27)[38;2;223;146;163m1$([char]27)[38;2;223;146;163m9$([char]27)[38;2;223;146;163m0$([char]27)[38;2;223;146;163m8$([char]27)[38;2;223;146;163m7$([char]27)[38;2;223;146;163m4$([char]27)[38;2;223;146;163m5$([char]27)[38;2;223;146;163m1$([char]27)[38;2;222;145;162m3$([char]27)[38;2;219;143;160m7$([char]27)[38;2;216;141;158m4$([char]27)[38;2;213;139;155m9$([char]27)[38;2;208;136;152m6$([char]27)[38;2;204;133;149m0$([char]27)[38;2;198;130;145m0$([char]27)[38;2;191;125;139m9  $([char]27)[0m",
-    " $([char]27)[38;2;184;113;157m1$([char]27)[38;2;191;118;163m5$([char]27)[38;2;197;121;168m9$([char]27)[38;2;201;124;171m0$([char]27)[38;2;205;126;175m8$([char]27)[38;2;208;128;177m8$([char]27)[38;2;210;130;180m8$([char]27)[38;2;213;131;181m9$([char]27)[38;2;214;132;182m3$([char]27)[38;2;214;132;182m7$([char]27)[38;2;214;132;182m4$([char]27)[38;2;214;132;182m6$([char]27)[38;2;214;132;182m6$([char]27)[38;2;214;132;182m2$([char]27)[38;2;214;132;182m8$([char]27)[38;2;213;132;182m1$([char]27)[38;2;211;131;180m4$([char]27)[38;2;209;129;179m9$([char]27)[38;2;207;128;177m9$([char]27)[38;2;204;126;174m0$([char]27)[38;2;201;124;172m0$([char]27)[38;2;198;122;169m4$([char]27)[38;2;194;120;165m0$([char]27)[38;2;189;117;161m7$([char]27)[38;2;183;113;156m7$([char]27)[38;2;176;108;150m5 $([char]27)[0m",
-    "$([char]27)[38;2;164;95;162m8$([char]27)[38;2;173;100;171m4$([char]27)[38;2;179;104;177m6$([char]27)[38;2;184;106;182m0$([char]27)[38;2;188;108;185m3$([char]27)[38;2;191;110;189m9$([char]27)[38;2;194;112;191m1$([char]27)[38;2;196;113;193m9$([char]27)[38;2;198;114;195m4$([char]27)[38;2;199;115;197m0$([char]27)[38;2;200;116;198m9$([char]27)[38;2;201;116;198m1$([char]27)[38;2;201;116;199m1$([char]27)[38;2;201;116;198m9$([char]27)[38;2;201;116;198m7$([char]27)[38;2;200;115;197m7$([char]27)[38;2;199;115;196m3$([char]27)[38;2;197;114;195m6$([char]27)[38;2;195;113;193m1$([char]27)[38;2;193;112;191m0$([char]27)[38;2;191;110;188m8$([char]27)[38;2;188;109;186m7$([char]27)[38;2;185;107;183m3$([char]27)[38;2;182;105;179m5$([char]27)[38;2;178;102;175m6$([char]27)[38;2;173;100;170m0$([char]27)[38;2;166;96;164m8$([char]27)[38;2;157;90;154m4$([char]27)[0m",
-    "$([char]27)[38;2;151;86;177m3$([char]27)[38;2;159;91;187m6$([char]27)[38;2;165;94;193m8$([char]27)[38;2;169;96;198m6$([char]27)[38;2;172;98;202m5$([char]27)[38;2;175;100;205m7$([char]27)[38;2;177;101;208m9$([char]27)[38;2;179;102;210m3$([char]27)[38;2;181;103;212m8$([char]27)[38;2;182;104;214m6$([char]27)[38;2;183;104;215m4$([char]27)[38;2;184;105;216m6$([char]27)[38;2;184;105;216m9$([char]27)[38;2;184;105;216m7$([char]27)[38;2;184;105;215m5$([char]27)[38;2;183;104;215m9$([char]27)[38;2;182;104;213m2$([char]27)[38;2;181;103;212m6$([char]27)[38;2;179;102;210m1$([char]27)[38;2;177;101;208m8$([char]27)[38;2;175;100;206m6$([char]27)[38;2;173;98;203m0$([char]27)[38;2;170;97;199m7$([char]27)[38;2;167;95;196m7$([char]27)[38;2;163;93;191m0$([char]27)[38;2;159;90;186m4$([char]27)[38;2;153;87;180m0$([char]27)[38;2;146;83;172m7$([char]27)[0m",
-    "$([char]27)[38;2;132;87;170m8$([char]27)[38;2;141;93;181m4$([char]27)[38;2;146;96;187m2$([char]27)[38;2;149;99;192m6$([char]27)[38;2;153;101;196m9$([char]27)[38;2;155;102;199m9$([char]27)[38;2;157;104;202m9$([char]27)[38;2;159;105;205m9$([char]27)[38;2;161;106;206m1$([char]27)[38;2;162;107;208m1$([char]27)[38;2;163;107;209m2$([char]27)[38;2;163;108;210m0$([char]27)[38;2;163;108;210m7$([char]27)[38;2;163;108;210m3$([char]27)[38;2;163;108;210m0$([char]27)[38;2;162;107;209m3$([char]27)[38;2;162;107;208m2$([char]27)[38;2;161;106;206m0$([char]27)[38;2;159;105;205m8$([char]27)[38;2;158;104;203m2$([char]27)[38;2;156;103;200m7$([char]27)[38;2;154;101;197m7$([char]27)[38;2;151;100;194m7$([char]27)[38;2;148;98;190m7$([char]27)[38;2;145;96;186m2$([char]27)[38;2;142;94;182m2$([char]27)[38;2;137;91;177m6$([char]27)[38;2;130;86;167m3$([char]27)[0m",
-    " $([char]27)[38;2;121;93;171m9$([char]27)[38;2;126;97;179m1$([char]27)[38;2;130;100;184m9$([char]27)[38;2;133;102;189m0$([char]27)[38;2;135;104;192m0$([char]27)[38;2;137;105;195m6$([char]27)[38;2;139;107;197m4$([char]27)[38;2;140;108;199m4$([char]27)[38;2;141;108;201m3$([char]27)[38;2;142;109;202m1$([char]27)[38;2;143;109;202m9$([char]27)[38;2;143;110;203m4$([char]27)[38;2;143;110;203m4$([char]27)[38;2;143;110;203m1$([char]27)[38;2;142;109;202m0$([char]27)[38;2;142;109;201m5$([char]27)[38;2;141;108;200m3$([char]27)[38;2;140;107;198m1$([char]27)[38;2;138;106;196m3$([char]27)[38;2;136;105;193m5$([char]27)[38;2;134;103;191m4$([char]27)[38;2;133;102;188m1$([char]27)[38;2;131;100;185m6$([char]27)[38;2;128;98;182m1$([char]27)[38;2;125;96;177m9$([char]27)[38;2;120;92;170m9 $([char]27)[0m",
-    "  $([char]27)[38;2;107;95;168m5$([char]27)[38;2;111;99;174m7$([char]27)[38;2;113;101;179m2$([char]27)[38;2;116;104;183m6$([char]27)[38;2;118;105;186m4$([char]27)[38;2;119;107;188m1$([char]27)[38;2;121;108;190m9$([char]27)[38;2;122;109;192m9$([char]27)[38;2;122;110;193m3$([char]27)[38;2;123;110;194m7$([char]27)[38;2;123;110;194m2$([char]27)[38;2;123;110;194m7$([char]27)[38;2;123;110;194m0$([char]27)[38;2;123;110;193m0$([char]27)[38;2;122;109;192m1$([char]27)[38;2;121;108;191m6$([char]27)[38;2;120;108;190m9$([char]27)[38;2;120;107;188m7$([char]27)[38;2;118;106;187m4$([char]27)[38;2;117;105;185m4$([char]27)[38;2;115;103;182m8$([char]27)[38;2;113;101;179m9$([char]27)[38;2;111;99;174m5$([char]27)[38;2;107;95;168m1  $([char]27)[0m",
-    "   $([char]27)[38;2;91;96;161m5$([char]27)[38;2;95;100;169m4$([char]27)[38;2;98;103;173m8$([char]27)[38;2;100;105;177m8$([char]27)[38;2;101;106;179m2$([char]27)[38;2;102;108;181m9$([char]27)[38;2;103;109;183m5$([char]27)[38;2;104;109;184m5$([char]27)[38;2;105;110;185m1$([char]27)[38;2;105;110;186m2$([char]27)[38;2;105;110;186m8$([char]27)[38;2;105;110;186m0$([char]27)[38;2;105;110;186m0$([char]27)[38;2;105;110;185m1$([char]27)[38;2;104;109;184m3$([char]27)[38;2;103;109;183m5$([char]27)[38;2;102;108;181m2$([char]27)[38;2;101;106;179m0$([char]27)[38;2;100;105;177m4$([char]27)[38;2;98;103;173m0$([char]27)[38;2;95;100;169m0$([char]27)[38;2;91;96;161m7   $([char]27)[0m",
-    "     $([char]27)[38;2;78;97;156m7$([char]27)[38;2;81;101;164m9$([char]27)[38;2;84;104;168m3$([char]27)[38;2;85;106;171m2$([char]27)[38;2;86;107;173m5$([char]27)[38;2;87;108;175m4$([char]27)[38;2;87;109;176m2$([char]27)[38;2;88;109;177m3$([char]27)[38;2;88;110;177m9$([char]27)[38;2;88;110;177m7$([char]27)[38;2;88;109;177m9$([char]27)[38;2;87;109;176m0$([char]27)[38;2;87;108;175m8$([char]27)[38;2;86;107;173m2$([char]27)[38;2;85;106;171m4$([char]27)[38;2;84;104;168m7$([char]27)[38;2;81;101;164m3$([char]27)[38;2;78;97;156m3     $([char]27)[0m",
-    "         $([char]27)[38;2;66;99;154m4$([char]27)[38;2;68;102;158m2$([char]27)[38;2;69;104;161m0$([char]27)[38;2;70;104;162m3$([char]27)[38;2;70;105;163m3$([char]27)[38;2;70;105;163m1$([char]27)[38;2;70;104;162m9$([char]27)[38;2;69;104;161m2$([char]27)[38;2;68;102;158m9$([char]27)[38;2;66;99;154m0         $([char]27)[0m"
+    "            $([char]27)[38;2;143;109;59m$([char]0x2801)$([char]27)[38;2;158;120;63m$([char]0x2804)$([char]27)[38;2;144;110;59m$([char]0x2801)$([char]27)[38;2;157;120;63m$([char]0x2804)$([char]27)[38;2;143;109;59m$([char]0x2801)$([char]27)[38;2;152;116;61m$([char]0x2804)$([char]27)[38;2;139;106;58m$([char]0x2801)         $([char]27)[0m",
+    "        $([char]27)[38;2;153;114;63m$([char]0x2801)$([char]27)[38;2;182;130;73m$([char]0x2804)$([char]27)[38;2;181;134;71m$([char]0x2805)$([char]27)[38;2;206;151;78m$([char]0x2885)$([char]27)[38;2;211;157;78m$([char]0x2895)$([char]27)[38;2;216;173;92m$([char]0x2885)$([char]27)[38;2;222;172;89m$([char]0x28d5)$([char]27)[38;2;216;162;79m$([char]0x2885)$([char]27)[38;2;203;153;76m$([char]0x2895)$([char]27)[38;2;198;149;74m$([char]0x2885)$([char]27)[38;2;186;140;71m$([char]0x2885)$([char]27)[38;2;175;132;68m$([char]0x2885)$([char]27)[38;2;160;121;64m$([char]0x2805)$([char]27)[38;2;158;120;63m$([char]0x2804)$([char]27)[38;2;141;108;58m$([char]0x2801)     $([char]27)[0m",
+    "      $([char]27)[38;2;160;103;71m$([char]0x2801)$([char]27)[38;2;203;123;87m$([char]0x2804)$([char]27)[38;2;199;137;87m$([char]0x2895)$([char]27)[38;2;184;158;101m$([char]0x28b5)$([char]27)[38;2;220;194;121m$([char]0x28ff)$([char]27)[38;2;239;220;139m$([char]0x28ff)$([char]27)[38;2;252;232;145m$([char]0x28ff)$([char]0x28df)$([char]27)[38;2;254;234;145m$([char]0x28ff)$([char]27)[38;2;253;232;144m$([char]0x28ff)$([char]27)[38;2;255;232;142m$([char]0x28ff)$([char]27)[38;2;253;222;132m$([char]0x28fd)$([char]27)[38;2;247;209;118m$([char]0x28ff)$([char]27)[38;2;241;198;108m$([char]0x28f5)$([char]27)[38;2;223;171;87m$([char]0x28f5)$([char]27)[38;2;196;147;74m$([char]0x2885)$([char]27)[38;2;172;130;67m$([char]0x2805)$([char]27)[38;2;165;125;65m$([char]0x2804)$([char]27)[38;2;144;110;59m$([char]0x2801)   $([char]27)[0m",
+    "      $([char]27)[38;2;203;113;91m$([char]0x2801)$([char]27)[38;2;76;63;41m$([char]0x2815)$([char]27)[38;2;149;118;64m$([char]0x289c)$([char]27)[38;2;188;148;74m$([char]0x28f5)$([char]27)[38;2;230;187;95m$([char]0x28ff)$([char]27)[38;2;247;205;105m$([char]0x28ff)$([char]27)[38;2;253;214;111m$([char]0x28fd)$([char]27)[38;2;255;221;119m$([char]0x28ff)$([char]27)[38;2;255;225;124m$([char]0x28ff)$([char]27)[38;2;255;227;129m$([char]0x28ff)$([char]27)[38;2;255;229;134m$([char]0x28ff)$([char]27)[38;2;255;231;137m$([char]0x28df)$([char]27)[38;2;255;233;142m$([char]0x28bf)$([char]27)[38;2;255;232;140m$([char]0x28ff)$([char]27)[38;2;254;228;137m$([char]0x28ff)$([char]27)[38;2;248;207;116m$([char]0x28ff)$([char]27)[38;2;222;164;82m$([char]0x28b7)$([char]27)[38;2;194;145;73m$([char]0x2885)$([char]27)[38;2;170;129;66m$([char]0x2805)$([char]27)[38;2;159;121;63m$([char]0x2804)$([char]27)[38;2;142;108;58m$([char]0x2801) $([char]27)[0m",
+    "      $([char]27)[38;2;39;31;28m$([char]0x2801)$([char]27)[38;2;92;58;38m$([char]0x2895)$([char]27)[38;2;143;90;48m$([char]0x289d)$([char]27)[38;2;188;116;54m$([char]0x28b5)$([char]27)[38;2;211;134;59m$([char]0x28ff)$([char]27)[38;2;237;155;64m$([char]0x28ff)$([char]27)[38;2;250;169;68m$([char]0x28ff)$([char]27)[38;2;251;175;69m$([char]0x28ff)$([char]27)[38;2;254;182;71m$([char]0x28ff)$([char]27)[38;2;253;186;75m$([char]0x28ff)$([char]27)[38;2;255;192;79m$([char]0x28ff)$([char]27)[38;2;255;196;82m$([char]0x28ff)$([char]27)[38;2;255;200;87m$([char]0x28ff)$([char]27)[38;2;255;204;92m$([char]0x28ff)$([char]27)[38;2;255;208;97m$([char]0x28ff)$([char]27)[38;2;255;211;103m$([char]0x28ff)$([char]27)[38;2;254;207;106m$([char]0x28ff)$([char]27)[38;2;231;165;92m$([char]0x28b7)$([char]27)[38;2;192;135;76m$([char]0x2895)$([char]27)[38;2;171;124;69m$([char]0x2805)$([char]27)[38;2;152;116;62m$([char]0x2801)$([char]27)[38;2;144;107;60m$([char]0x2804)$([char]27)[0m",
+    "      $([char]27)[38;2;38;27;28m$([char]0x2801)$([char]27)[38;2;69;38;35m$([char]0x2805)$([char]27)[38;2;125;59;46m$([char]0x289d)$([char]27)[38;2;168;77;52m$([char]0x28bd)$([char]27)[38;2;201;94;55m$([char]0x28bf)$([char]27)[38;2;220;104;56m$([char]0x28ff)$([char]27)[38;2;241;118;56m$([char]0x28df)$([char]27)[38;2;245;124;54m$([char]0x28fd)$([char]27)[38;2;245;129;53m$([char]0x28ff)$([char]27)[38;2;248;134;54m$([char]0x28fd)$([char]27)[38;2;248;139;54m$([char]0x28ff)$([char]27)[38;2;249;145;55m$([char]0x28ff)$([char]27)[38;2;249;149;56m$([char]0x28ff)$([char]27)[38;2;253;155;58m$([char]0x28fd)$([char]27)[38;2;253;159;60m$([char]0x28f7)$([char]27)[38;2;254;168;66m$([char]0x28ff)$([char]27)[38;2;254;178;74m$([char]0x28df)$([char]27)[38;2;253;186;91m$([char]0x28ff)$([char]27)[38;2;212;133;88m$([char]0x28df)$([char]27)[38;2;179;115;77m$([char]0x2885)$([char]27)[38;2;159;107;69m$([char]0x2805)$([char]27)[38;2;145;97;64m$([char]0x2804)$([char]27)[0m",
+    "      $([char]27)[38;2;26;21;27m$([char]0x2801)$([char]27)[38;2;44;25;36m$([char]0x2805)$([char]27)[38;2;79;34;49m$([char]0x2815)$([char]27)[38;2;113;43;63m$([char]0x28ad)$([char]27)[38;2;150;53;72m$([char]0x28bf)$([char]27)[38;2;175;61;78m$([char]0x28ff)$([char]27)[38;2;196;69;78m$([char]0x28ff)$([char]27)[38;2;214;77;74m$([char]0x28bf)$([char]27)[38;2;219;80;73m$([char]0x28ff)$([char]27)[38;2;224;84;69m$([char]0x28ff)$([char]27)[38;2;224;87;66m$([char]0x28ff)$([char]27)[38;2;228;92;63m$([char]0x28ff)$([char]27)[38;2;233;97;61m$([char]0x28ff)$([char]27)[38;2;237;103;60m$([char]0x28ff)$([char]27)[38;2;240;109;59m$([char]0x28ff)$([char]27)[38;2;242;117;60m$([char]0x28ff)$([char]27)[38;2;245;130;64m$([char]0x28ff)$([char]27)[38;2;249;155;78m$([char]0x28ff)$([char]27)[38;2;214;117;95m$([char]0x28ff)$([char]27)[38;2;176;101;81m$([char]0x2895)$([char]27)[38;2;158;95;73m$([char]0x2805)$([char]27)[38;2;143;88;67m$([char]0x2805)$([char]27)[0m",
+    "        $([char]27)[38;2;38;25;44m$([char]0x2801)$([char]27)[38;2;47;31;65m$([char]0x2891)$([char]27)[38;2;74;37;82m$([char]0x2889)$([char]27)[38;2;83;40;99m$([char]0x28bd)$([char]27)[38;2;93;42;108m$([char]0x28b7)$([char]27)[38;2;104;45;115m$([char]0x28f7)$([char]27)[38;2;126;48;114m$([char]0x28ff)$([char]27)[38;2;145;50;106m$([char]0x28bf)$([char]27)[38;2;150;51;106m$([char]0x28ff)$([char]27)[38;2;160;53;101m$([char]0x28ff)$([char]27)[38;2;168;56;97m$([char]0x28ff)$([char]27)[38;2;179;60;94m$([char]0x28ff)$([char]27)[38;2;188;66;91m$([char]0x28ff)$([char]27)[38;2;195;75;89m$([char]0x28fd)$([char]27)[38;2;210;92;89m$([char]0x28ff)$([char]27)[38;2;227;127;97m$([char]0x28ff)$([char]27)[38;2;198;93;96m$([char]0x289f)$([char]27)[38;2;172;86;85m$([char]0x2805)$([char]27)[38;2;150;78;75m$([char]0x2805)$([char]27)[38;2;134;70;69m$([char]0x2804)$([char]27)[0m",
+    "        $([char]27)[38;2;20;23;34m$([char]0x2801)$([char]27)[38;2;22;28;46m$([char]0x2805)$([char]27)[38;2;26;39;75m$([char]0x2815)$([char]27)[38;2;32;50;106m$([char]0x2899)$([char]27)[38;2;33;57;126m$([char]0x28bd)$([char]27)[38;2;36;65;149m$([char]0x28bd)$([char]27)[38;2;38;65;157m$([char]0x28bf)$([char]27)[38;2;42;70;171m$([char]0x28ff)$([char]27)[38;2;47;67;169m$([char]0x28ff)$([char]27)[38;2;54;65;166m$([char]0x28ff)$([char]27)[38;2;61;61;159m$([char]0x28ff)$([char]27)[38;2;72;60;151m$([char]0x28ff)$([char]27)[38;2;85;61;143m$([char]0x28ff)$([char]27)[38;2;106;68;135m$([char]0x28df)$([char]27)[38;2;147;89;125m$([char]0x28ff)$([char]27)[38;2;190;95;108m$([char]0x289f)$([char]27)[38;2;170;69;92m$([char]0x2815)$([char]27)[38;2;151;64;82m$([char]0x2805)$([char]27)[38;2;140;65;74m$([char]0x2801) $([char]27)[0m",
+    "          $([char]27)[38;2;21;28;44m$([char]0x2801)$([char]27)[38;2;22;32;54m$([char]0x2805)$([char]27)[38;2;25;47;87m$([char]0x281c)$([char]27)[38;2;26;56;108m$([char]0x289d)$([char]27)[38;2;28;68;136m$([char]0x289d)$([char]27)[38;2;30;76;152m$([char]0x28bd)$([char]27)[38;2;33;88;178m$([char]0x28bf)$([char]27)[38;2;35;91;185m$([char]0x28ff)$([char]27)[38;2;38;95;191m$([char]0x28ff)$([char]27)[38;2;45;99;191m$([char]0x28ff)$([char]27)[38;2;61;106;185m$([char]0x28ff)$([char]27)[38;2;91;106;165m$([char]0x289f)$([char]27)[38;2;143;86;125m$([char]0x281d)$([char]27)[38;2;137;65;103m$([char]0x2805)$([char]27)[38;2;136;61;91m$([char]0x2801)$([char]27)[38;2;116;54;81m$([char]0x2805)$([char]27)[38;2;119;52;75m$([char]0x2801) $([char]27)[0m",
+    "            $([char]27)[38;2;18;23;38m$([char]0x2801)$([char]27)[38;2;17;28;55m$([char]0x2801)$([char]27)[38;2;17;32;68m$([char]0x2811)$([char]27)[38;2;17;34;75m$([char]0x2815)$([char]27)[38;2;18;41;92m$([char]0x2815)$([char]27)[38;2;22;52;115m$([char]0x281d)$([char]27)[38;2;31;64;126m$([char]0x281d)$([char]27)[38;2;74;80;147m$([char]0x281d)$([char]27)[38;2;89;78;129m$([char]0x2815)$([char]27)[38;2;98;63;118m$([char]0x2805)$([char]27)[38;2;104;61;108m$([char]0x2801)$([char]27)[38;2;89;54;95m$([char]0x2805)$([char]27)[38;2;94;53;88m$([char]0x2801) $([char]27)[38;2;91;49;77m$([char]0x2801) $([char]27)[0m",
+    "                $([char]27)[38;2;53;68;156m$([char]0x2801)$([char]27)[38;2;57;65;146m$([char]0x2801)$([char]27)[38;2;60;62;134m$([char]0x2801)$([char]27)[38;2;61;59;123m$([char]0x2801)$([char]27)[38;2;62;55;113m$([char]0x2801) $([char]27)[38;2;64;51;98m$([char]0x2801)     $([char]27)[0m",
+    "                            $([char]27)[0m"
   )
-  # END GENERATED NUMERIC PLANET
+  # END GENERATED PLANET
   $center = [int][Math]::Floor(($rows.Count - 1) / 2)
   $colors = @("Yellow", "Red", "Magenta", "Cyan", "Blue")
   $useColor = -not $env:NO_COLOR
@@ -513,10 +524,7 @@ function Write-InstallerStage {
     [Parameter(Mandatory = $true)] [string] $Name
   )
 
-  if ((Test-InstallerRichHeaderAvailable) -and -not $env:NO_COLOR) {
-    Write-Host ("[{0}]" -f $Name) -ForegroundColor Cyan
-    return
-  }
+  # The terminal's own foreground stays readable on dark and light backgrounds.
   Write-Host ("[{0}]" -f $Name)
 }
 
@@ -767,6 +775,22 @@ function Stop-InstallerProcessTree {
   }
 }
 
+function Remove-InstallerTemporaryFiles {
+  param (
+    [Parameter(Mandatory = $true)] [string[]] $Paths
+  )
+
+  foreach ($path in $Paths) {
+    try {
+      # Direct .NET deletion avoids short-name provider enumeration failures.
+      [System.IO.File]::Delete($path)
+    }
+    catch {
+      # Best-effort cleanup must not replace the command's result (e.g. a locked file).
+    }
+  }
+}
+
 function Invoke-InstallerCommandWithDaemonServiceContextCapturingOutputWithTimeout {
   param (
     [Parameter(Mandatory = $true)] [string] $CliPath,
@@ -781,8 +805,8 @@ function Invoke-InstallerCommandWithDaemonServiceContextCapturingOutputWithTimeo
   $previousDaemonServiceChannel = $env:HAPPIER_DAEMON_SERVICE_CHANNEL
   $previousInstallerDaemonServiceStrategy = $env:HAPPIER_INSTALLER_DAEMON_SERVICE_STRATEGY
   $runToken = [System.Guid]::NewGuid().ToString("N")
-  $stdoutPath = Join-Path $env:TEMP "happier-pre-install-$runToken.stdout.log"
-  $stderrPath = Join-Path $env:TEMP "happier-pre-install-$runToken.stderr.log"
+  $stdoutPath = Join-Path $InstallerTempDir "happier-pre-install-$runToken.stdout.log"
+  $stderrPath = Join-Path $InstallerTempDir "happier-pre-install-$runToken.stderr.log"
 
   try {
     $channelLabel = if ($Channel -eq "publicdev") { "dev" } else { $Channel }
@@ -800,6 +824,9 @@ function Invoke-InstallerCommandWithDaemonServiceContextCapturingOutputWithTimeo
     }
 
     $process = Start-Process -FilePath $CliPath -ArgumentList $CommandArgs -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -WindowStyle Hidden
+    # Windows PowerShell 5.1 needs a cached handle to retain redirected exit codes.
+    # https://github.com/PowerShell/PowerShell/issues/5421
+    $null = $process.Handle
     $completed = $process.WaitForExit($timeoutMs)
     if (-not $completed) {
       Stop-InstallerProcessTree -Process $process
@@ -825,8 +852,7 @@ function Invoke-InstallerCommandWithDaemonServiceContextCapturingOutputWithTimeo
     }
   }
   finally {
-    Remove-Item -Path $stdoutPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $stderrPath -Force -ErrorAction SilentlyContinue
+    Remove-InstallerTemporaryFiles -Paths @($stdoutPath, $stderrPath)
 
     if ($null -eq $previousHomeDir) {
       Remove-Item Env:HAPPIER_HOME_DIR -ErrorAction SilentlyContinue
@@ -930,18 +956,18 @@ function Get-InstalledBackgroundServiceInventory {
     if ($doctorPreflightResult.ExitCode -eq 0 -and $preflightJsonIsSupported -and -not $preflightLooksLikePlainReport) {
       $payload = $preflightOutput | ConvertFrom-Json
       $propertyNames = @($payload.PSObject.Properties.Name)
-      $entries = if ($propertyNames -contains 'entries') { @($payload.entries) } elseif ($propertyNames -contains 'existingServices') { @($payload.existingServices) } else { @() }
-      $services = if ($propertyNames -contains 'services') { @($payload.services) } elseif ($propertyNames -contains 'existingServices') { @($payload.existingServices) } else { @() }
+      $entries = @(if ($propertyNames -contains 'entries') { $payload.entries } elseif ($propertyNames -contains 'existingServices') { $payload.existingServices })
+      $services = @(if ($propertyNames -contains 'services') { $payload.services } elseif ($propertyNames -contains 'existingServices') { $payload.existingServices })
       if ($entries.Count -gt 0 -or $services.Count -gt 0 -or $propertyNames -contains 'existingServices' -or $propertyNames -contains 'entries' -or $propertyNames -contains 'services') {
         return @{
           Supported = $true
           RepairSupported = $true
-          Entries = $entries
+          Entries = @(if ($entries.Count -gt 0) { $entries } else { $services })
           Services = $services
           DaemonStatus = if ($propertyNames -contains 'daemonStatus') { $payload.daemonStatus } else { $null }
           DaemonRunning = if ($propertyNames -contains 'daemonRunning') { $payload.daemonRunning } else { $null }
           DefaultFollowingMatchesSelectedReleaseChannel = if ($propertyNames -contains 'defaultFollowingMatchesSelectedReleaseChannel') { $payload.defaultFollowingMatchesSelectedReleaseChannel } else { $null }
-          Relays = if ($propertyNames -contains 'relays') { @($payload.relays) } else { @() }
+          Relays = @(if ($propertyNames -contains 'relays') { $payload.relays })
           Payload = $payload
         }
       }
@@ -974,13 +1000,13 @@ function Get-InstalledBackgroundServiceInventory {
     }
     $payload = $serviceListResult.Output | ConvertFrom-Json
     $propertyNames = @($payload.PSObject.Properties.Name)
-    $entries = if ($propertyNames -contains 'entries') { @($payload.entries) } else { @() }
-    $services = if ($propertyNames -contains 'services') { @($payload.services) } else { @() }
+    $entries = @(if ($propertyNames -contains 'entries') { $payload.entries })
+    $services = @(if ($propertyNames -contains 'services') { $payload.services })
     if ($entries.Count -gt 0 -or $services.Count -gt 0 -or $propertyNames -contains 'entries' -or $propertyNames -contains 'services') {
       return @{
         Supported = $true
         RepairSupported = $false
-        Entries = $entries
+        Entries = @(if ($entries.Count -gt 0) { $entries } else { $services })
         Services = $services
         DaemonStatus = $null
         DaemonRunning = $null
@@ -1019,7 +1045,7 @@ function Get-InstalledBackgroundServiceInventory {
 
 function Test-BackgroundServiceInventoryHasDefaultFollowing {
   param (
-    [Parameter(Mandatory = $true)] [object[]] $Entries
+    [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Entries
   )
 
   return @($Entries | Where-Object { $_.targetMode -eq 'default-following' }).Count -gt 0
@@ -1027,7 +1053,7 @@ function Test-BackgroundServiceInventoryHasDefaultFollowing {
 
 function Get-BackgroundServiceDefaultFollowingChannel {
   param (
-    [Parameter(Mandatory = $true)] [object[]] $Entries
+    [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Entries
   )
 
   $entry = @($Entries | Where-Object { $_.targetMode -eq 'default-following' } | Select-Object -First 1)
@@ -1040,7 +1066,7 @@ function Get-BackgroundServiceDefaultFollowingChannel {
 
 function Test-BackgroundServiceInventoryHasMatchingDefaultFollowing {
   param (
-    [Parameter(Mandatory = $true)] [object[]] $Entries,
+    [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Entries,
     [Parameter()] $DefaultFollowingMatchesSelectedReleaseChannel = $null
   )
 
@@ -1145,7 +1171,7 @@ function Invoke-DoctorRepairIfSupported {
 
 function Resolve-ExistingBackgroundServiceInstallStrategy {
   param (
-    [Parameter(Mandatory = $true)] [object[]] $Entries,
+    [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Entries,
     [Parameter()] $DefaultFollowingMatchesSelectedReleaseChannel = $null
   )
 
@@ -2269,10 +2295,10 @@ function Invoke-InstallerPayloadPromotionWithTimeout {
 
   $timeoutMs = Resolve-InstallerPayloadPromotionTimeoutMs
   $runToken = [System.Guid]::NewGuid().ToString("N")
-  $runnerBinaryPath = Join-Path $env:TEMP "happier-payload-promotion-$runToken.exe"
-  $runnerScriptPath = Join-Path $env:TEMP "happier-payload-promotion-$runToken.ps1"
-  $stdoutPath = Join-Path $env:TEMP "happier-payload-promotion-$runToken.stdout.log"
-  $stderrPath = Join-Path $env:TEMP "happier-payload-promotion-$runToken.stderr.log"
+  $runnerBinaryPath = Join-Path $InstallerTempDir "happier-payload-promotion-$runToken.exe"
+  $runnerScriptPath = Join-Path $InstallerTempDir "happier-payload-promotion-$runToken.ps1"
+  $stdoutPath = Join-Path $InstallerTempDir "happier-payload-promotion-$runToken.stdout.log"
+  $stderrPath = Join-Path $InstallerTempDir "happier-payload-promotion-$runToken.stderr.log"
 
   $escapeSingleQuotedLiteral = {
     param([string] $Value)
@@ -2322,8 +2348,11 @@ finally {
     Set-Content -Path $runnerScriptPath -Value $runnerScript -Encoding utf8
 
     $powerShellExecutablePath = Resolve-InstallerPowerShellExecutablePath
-    $process = Start-Process -FilePath $powerShellExecutablePath -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runnerScriptPath) -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -WindowStyle Hidden
+    $process = Start-Process -FilePath $powerShellExecutablePath -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ('"{0}"' -f $runnerScriptPath)) -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -WindowStyle Hidden
 
+    # Windows PowerShell 5.1 needs a cached handle to retain redirected exit codes.
+    # https://github.com/PowerShell/PowerShell/issues/5421
+    $null = $process.Handle
     $completed = $process.WaitForExit($timeoutMs)
     if (-not $completed) {
       Stop-InstallerProcessTree -Process $process
@@ -2346,10 +2375,7 @@ finally {
     }
   }
   finally {
-    Remove-Item -Path $runnerBinaryPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $runnerScriptPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $stdoutPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $stderrPath -Force -ErrorAction SilentlyContinue
+    Remove-InstallerTemporaryFiles -Paths @($runnerBinaryPath, $runnerScriptPath, $stdoutPath, $stderrPath)
   }
 }
 
@@ -2376,13 +2402,23 @@ function Ensure-Minisign {
   $extractDir = Join-Path $TempRoot "minisign-extract"
   New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
   Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
-  $exe = Get-ChildItem -Path $extractDir -Filter "minisign.exe" -Recurse | Select-Object -First 1
-  if (-not $exe) {
-    throw "Failed to locate minisign.exe in bootstrap archive."
+  $osArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+  $archiveArchitecture = switch ($osArchitecture) {
+    "X64" { "x86_64" }
+    "Arm64" { "aarch64" }
+    default { throw "Unsupported Windows architecture for bundled minisign: $osArchitecture" }
   }
+  $exePath = Join-Path (Join-Path (Join-Path $extractDir "minisign-win64") $archiveArchitecture) "minisign.exe"
+  if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+    throw "Failed to locate the $archiveArchitecture minisign.exe in the bootstrap archive."
+  }
+  $exe = Get-Item -LiteralPath $exePath
 
   try {
-    & $exe.FullName --version *> $null
+    & $exe.FullName -v *> $null
+    if ($LASTEXITCODE -ne 0) {
+      throw "Downloaded minisign executable failed its version probe (exit $LASTEXITCODE)."
+    }
   }
   catch {
     Write-Warning "Downloaded minisign binary is not compatible with this system."

@@ -97,6 +97,7 @@ export type DirectSessionProviderOps = Readonly<{
   resolveTakeoverSpawnOptions?: (params: Readonly<{
     linked: LoadedLinkedDirectSession;
     sessionId: string;
+    transcriptStorage: 'direct' | 'persisted';
   }>) => Promise<SpawnSessionOptions | null>;
 }>;
 

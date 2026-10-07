@@ -19,8 +19,8 @@ vi.mock('@/components/inbox/cards/ApprovalInboxCard', () => ({ ApprovalInboxCard
 vi.mock('@/components/inbox/sessionAttention/InboxSessionAttentionGroupCard', () => ({ InboxSessionAttentionGroupCard: 'InboxSessionAttentionGroupCard' }));
 vi.mock('@/components/inbox/InboxSessionReviewRow', () => ({ InboxSessionReviewRow: 'InboxSessionReviewRow' }));
 vi.mock('@/components/inbox/InboxMarkAllReadButton', () => ({ InboxMarkAllReadButton: 'InboxMarkAllReadButton' }));
-vi.mock('@/components/inbox/InboxSection', () => ({
-    InboxSection: (props: Record<string, unknown>) => React.createElement('InboxSection', props, props.children as React.ReactNode),
+vi.mock('@/components/ui/lists/ListSection', () => ({
+    ListSection: (props: Record<string, unknown>) => React.createElement('ListSection', props, props.children as React.ReactNode),
 }));
 vi.mock('@/components/inbox/actionOperations/ActionOperationLedger', () => ({ ActionOperationRows: 'ActionOperationRows' }));
 vi.mock('@/components/sessions/shell/SessionListIdentity', () => ({
@@ -121,7 +121,7 @@ describe('InboxContent', () => {
         const { InboxContent } = await import('./InboxContent');
         const screen = await renderScreen(<InboxContent model={model} />);
 
-        const sections = screen.tree.root.findAllByType('InboxSection' as never);
+        const sections = screen.tree.root.findAllByType('ListSection' as never);
         expect(sections.map((section) => section.props.id)).toEqual([
             'errors',
             'ready',
@@ -143,7 +143,7 @@ describe('InboxContent', () => {
         const { InboxContent } = await import('./InboxContent');
         const screen = await renderScreen(<InboxContent model={model} presentation="popover" />);
 
-        const sections = screen.tree.root.findAllByType('InboxSection' as never);
+        const sections = screen.tree.root.findAllByType('ListSection' as never);
         expect(sections.every((section) => section.props.surface === 'flat')).toBe(true);
     });
 
@@ -152,7 +152,7 @@ describe('InboxContent', () => {
         const { InboxContent } = await import('./InboxContent');
         const screen = await renderScreen(<InboxContent model={model} />);
 
-        const sections = screen.tree.root.findAllByType('InboxSection' as never);
+        const sections = screen.tree.root.findAllByType('ListSection' as never);
         const errorSection = sections.find((section) => section.props.id === 'errors');
         const needsAttentionSection = sections.find((section) => section.props.id === 'needs-attention');
         const errorRows = errorSection?.findByType('ActionOperationRows' as never);

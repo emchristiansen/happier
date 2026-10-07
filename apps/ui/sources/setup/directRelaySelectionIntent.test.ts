@@ -67,6 +67,37 @@ describe('directRelaySelectionIntent (R8/INV7)', () => {
         }
     });
 
+    /**
+     * F6 — a choice is only the reason for the NEXT relay change while the app is still on the relay
+     * that was chosen. A pick that never became a relay change (a first-run onboarding pick, or a
+     * pick of the relay the app was already on) must not survive the app leaving that relay, or an
+     * ambient return later in the run would be spent as if the person had just chosen it.
+     */
+    it('keeps the choice through its own switch, and forgets it once the app moves to another relay (F6)', async () => {
+        const previousScope = process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+        process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = `test_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        try {
+            const profiles = await import('@/sync/domains/server/serverProfiles');
+            const chosen = profiles.upsertServerProfile({ serverUrl: 'https://chosen.example.test', name: 'Chosen' });
+            const other = profiles.upsertServerProfile({ serverUrl: 'https://other.example.test', name: 'Other' });
+            profiles.setActiveServerId(other.id, { scope: 'device' });
+
+            // The direct pick records, then switches to the relay it chose: still the reason.
+            recordDirectRelaySelectionIntent(chosen.id);
+            profiles.setActiveServerId(chosen.id, { scope: 'device' });
+            expect(consumeDirectRelaySelectionIntent(chosen.id)).toBe(true);
+
+            // A pick that is never spent (nothing drifted), then an ambient move away and back.
+            recordDirectRelaySelectionIntent(chosen.id);
+            profiles.setActiveServerId(other.id, { scope: 'device' });
+            profiles.setActiveServerId(chosen.id, { scope: 'device' });
+            expect(consumeDirectRelaySelectionIntent(chosen.id)).toBe(false);
+        } finally {
+            if (previousScope === undefined) delete process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+            else process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = previousScope;
+        }
+    });
+
     it('tells the gate a choice was made, even when the app is already on that relay (B1)', () => {
         // The counterexample: a notification moved the app to this relay, the gate refused to
         // repoint the daemon for it, and the user now picks the very same relay on purpose.

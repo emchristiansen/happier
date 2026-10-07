@@ -8,6 +8,10 @@ import { resolveDaemonStartupSourceServiceManagedState } from '@/daemon/ownershi
 import { evaluateCurrentDaemonOwner, type DaemonOwnerEvaluation } from '@/daemon/ownership/evaluateCurrentDaemonOwner';
 import { readDaemonState, readSettings } from '@/persistence';
 import { resolveDaemonServiceInstallationSnapshotFromEnv } from '@/daemon/service/cli';
+import { maybeRefreshCliUpdateCacheInBackground } from '@/cli/runtime/update/autoUpdateNotice';
+import { readCliUpdateFactsForThisCli } from '@/cli/runtime/update/cliUpdateFacts';
+import { compareVersions } from '@happier-dev/cli-common/update';
+import { projectPath } from '@/projectPath';
 
 export type DaemonStatusSnapshot = NonNullable<DoctorSnapshot['daemonStatus']>;
 export type DaemonRuntimeConvergence = NonNullable<DaemonStatusSnapshot['runtimeConvergence']>;
@@ -77,6 +81,26 @@ async function deriveRuntimeConvergence(params: Readonly<{
   };
 }
 
+/**
+ * This CLI's update state for the desktop's Update action (plan R17) and its K5 update facts
+ * (plan R13) — the same facts the daemon publishes in machine metadata. The status read is the
+ * ambient fast path, so it only reads the channel's cached daily check and, when that is stale,
+ * lets the existing background refresh run for the next read — never a network call here.
+ */
+function readCliUpdate(): DaemonStatusSnapshot['cliUpdate'] {
+  maybeRefreshCliUpdateCacheInBackground({
+    homeDir: configuration.happyHomeDir,
+    cliRootDir: projectPath(),
+    env: process.env,
+    publicReleaseRing: configuration.publicReleaseRing,
+  });
+  const facts = readCliUpdateFactsForThisCli();
+  return {
+    ...facts,
+    updateAvailable: facts.latestVersion !== null && compareVersions(facts.latestVersion, facts.currentVersion) > 0,
+  };
+}
+
 export async function readDaemonStatusSnapshot(): Promise<DaemonStatusSnapshot> {
   const [settings, authReadiness, daemonState] = await Promise.all([
     readSettings(),
@@ -139,7 +163,9 @@ export async function readDaemonStatusSnapshot(): Promise<DaemonStatusSnapshot> 
       accountId: readTokenSubject(credentials?.token),
       credentialState: authReadiness.credentialState,
       validatedAccountId: authReadiness.validatedAccountId,
+      accountLabel: authReadiness.validatedAccountLabel,
     },
     runtimeConvergence,
+    cliUpdate: readCliUpdate(),
   };
 }

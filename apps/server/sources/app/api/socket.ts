@@ -33,6 +33,7 @@ import { publishMachinePresenceSnapshot } from "@/app/presence/publishMachinePre
 import { describeLoggableError } from "@/utils/logging/describeLoggableError";
 import { registerSessionRuntimeActivitySnapshotSocketEvent } from "@/app/session/runtimeActivity/socketEvents";
 import { publishSessionPublisherLifecycleUpdate } from "@/app/session/runtimeActivity/publishPublisherLifecycleUpdate";
+import { registerUiFocusSocketEvent } from "./socket/registerUiFocusSocketEvent";
 import { readHappierSocketData } from "./socket/socketData";
 import { registerReleasedUiV021SessionEndSocketEvent } from "@/app/session/compatibility/registerReleasedUiV021SessionEndSocketEvent";
 
@@ -435,6 +436,7 @@ export function startSocket(app: Fastify) {
                 : undefined,
         );
         if (connection.connectionType === "user-scoped") {
+            registerUiFocusSocketEvent(socket);
             registerReleasedUiV021SessionEndSocketEvent({
                 socket,
                 accountId: userId,

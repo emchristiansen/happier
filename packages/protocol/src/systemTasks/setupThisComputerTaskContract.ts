@@ -25,6 +25,26 @@ export const SETUP_PAIRING_PROMPT_KIND = 'setup.pairThisComputer' as const;
 export const SETUP_SERVICE_CONSENT_PROMPT_KIND = 'setup.serviceConsent' as const;
 
 /**
+ * Prompt kind for claiming this computer from the account the target relay's credentials belong
+ * to (D1): the executor's own read of the credentials `auth wait --replace-existing` would replace.
+ */
+export const SETUP_ACCOUNT_CONSENT_PROMPT_KIND = 'setup.accountConsent' as const;
+
+/**
+ * D1 — the ONE account-match rule: pairing this computer to `expectedAccountId` would take it away
+ * from an account the relay validated. An unvalidated or absent account loses nothing. The app's
+ * early question and the executor's enforcement both decide with this.
+ */
+export function setupReplacesValidatedAccount(params: Readonly<{
+  validatedAccountId: string | null;
+  expectedAccountId: string | null;
+}>): boolean {
+  return params.validatedAccountId !== null
+    && params.expectedAccountId !== null
+    && params.validatedAccountId !== params.expectedAccountId;
+}
+
+/**
  * Where the CLI the executor is driving came from: this machine's desktop-managed install layout
  * (`managed`) or an explicit env/repo override (`override`).
  *
@@ -79,7 +99,27 @@ export type SetupServiceConsentPromptPayload = Readonly<{
   message: string | null;
   competingServices: readonly string[];
   servicesToRemove: readonly string[];
+  /**
+   * The installed service runs another CLI than the desktop-managed one, and applying switches it:
+   * `current` is the command it runs now (a user's npm/Homebrew `happier`, say), `replacement` the
+   * managed shim it would run. `null` (parsed) or absent (an older executor) when the CLI the
+   * service runs is unchanged.
+   */
+  runtimeReplacement?: SetupServiceRuntimeReplacement | null;
 }>;
+
+export type SetupServiceRuntimeReplacement = Readonly<{
+  current: string;
+  replacement: string;
+}>;
+
+function readRuntimeReplacement(value: unknown): SetupServiceRuntimeReplacement | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const current = readString(record, 'current');
+  const replacement = readString(record, 'replacement');
+  return current && replacement ? { current, replacement } : null;
+}
 
 function readString(record: Record<string, unknown>, key: string): string {
   const value = record[key];
@@ -199,6 +239,9 @@ export function createSetupServiceConsentPromptData(
     message: payload.message,
     competingServices: [...payload.competingServices],
     servicesToRemove: [...payload.servicesToRemove],
+    runtimeReplacement: payload.runtimeReplacement
+      ? { current: payload.runtimeReplacement.current, replacement: payload.runtimeReplacement.replacement }
+      : null,
   };
 }
 
@@ -214,5 +257,124 @@ export function parseSetupServiceConsentPromptData(
     message: readNullableString(record, 'message'),
     competingServices: readStringList(record.competingServices),
     servicesToRemove: readStringList(record.servicesToRemove),
+    runtimeReplacement: readRuntimeReplacement(record.runtimeReplacement),
   };
+}
+
+/** The account this computer's target-relay credentials are signed in as, and the one setup is for. */
+export type SetupAccountConsentPromptPayload = Readonly<{
+  currentAccountId: string;
+  /** The label the relay's profile gave that account, or `null` when it gave none. */
+  currentAccountLabel: string | null;
+  expectedAccountId: string;
+  /** The relay both accounts are on, minus any userinfo credentials. */
+  relayUrl: string;
+}>;
+
+/** Builds the complete account-consent prompt event data, discriminator included. */
+export function createSetupAccountConsentPromptData(payload: SetupAccountConsentPromptPayload): SystemTaskJsonObject {
+  return {
+    kind: SETUP_ACCOUNT_CONSENT_PROMPT_KIND,
+    currentAccountId: payload.currentAccountId,
+    currentAccountLabel: payload.currentAccountLabel,
+    expectedAccountId: payload.expectedAccountId,
+    relayUrl: stripRelayUrlCredentials(payload.relayUrl),
+  };
+}
+
+/** Recognises the account-consent prompt; `null` unless both accounts and the relay are named. */
+export function parseSetupAccountConsentPromptData(data: unknown): SetupAccountConsentPromptPayload | null {
+  const record = readPromptRecord(data, SETUP_ACCOUNT_CONSENT_PROMPT_KIND);
+  if (!record) return null;
+  const currentAccountId = readString(record, 'currentAccountId');
+  const expectedAccountId = readString(record, 'expectedAccountId');
+  const relayUrl = readString(record, 'relayUrl');
+  if (!currentAccountId || !expectedAccountId || !relayUrl) return null;
+  return {
+    currentAccountId,
+    currentAccountLabel: readNullableString(record, 'currentAccountLabel'),
+    expectedAccountId,
+    relayUrl,
+  };
+}
+
+/**
+ * Prompt kind for R12's one question: this computer already has a `happier` this app did not
+ * install. Asked before the executor writes anything, and only when no answer is recorded (or the
+ * recorded CLI of the user's own disappeared or is too old for setup).
+ */
+export const SETUP_CLI_CHOICE_PROMPT_KIND = 'setup.cliChoice' as const;
+
+/** `managed`: install the managed CLI and put it first. `own`: keep using the user's CLI. */
+export type SetupCliChoice = 'managed' | 'own';
+
+export type SetupCliOrigin = 'npm' | 'brew' | 'unknown';
+
+/** The CLI the question is about, named the way a person can find it. */
+export type SetupCliChoicePromptPayload = Readonly<{
+  /** Where that CLI resolves; a local filesystem path. */
+  command: string;
+  /** What `happier --version` answered; `null` when it answered nothing readable. */
+  version: string | null;
+  origin: SetupCliOrigin;
+  /** The command that removes that copy (shown, never run); `null` when its origin is unknown. */
+  removalCommand: string | null;
+  /** The command that updates that copy; `null` when its origin is unknown. */
+  updateCommand: string | null;
+  /** That CLI is older than desktop setup can drive, so keeping it cannot finish setup yet. */
+  belowSetupFloor: boolean;
+  /**
+   * The CLI this computer kept is no longer at `command` (R13 b). It is still the recorded answer,
+   * so it is asked about before anything is acquired in its place; keeping it means reinstalling it.
+   */
+  missing: boolean;
+  /**
+   * The managed `happier` a new terminal runs first through something Desktop did not create (the
+   * official installer's `~/.local/bin` link or its Windows `Path` entry), so keeping `command`
+   * could not make the terminal run it: "Keep my own" is not offered, and this path is what would
+   * have to go first (RV3-1). `null` when keeping it works.
+   */
+  keepBlockedBy: string | null;
+}>;
+
+function classifySetupCliOrigin(value: unknown): SetupCliOrigin {
+  return value === 'npm' || value === 'brew' ? value : 'unknown';
+}
+
+export function createSetupCliChoicePromptData(payload: SetupCliChoicePromptPayload): SystemTaskJsonObject {
+  return {
+    kind: SETUP_CLI_CHOICE_PROMPT_KIND,
+    command: payload.command,
+    version: payload.version,
+    origin: payload.origin,
+    removalCommand: payload.removalCommand,
+    updateCommand: payload.updateCommand,
+    belowSetupFloor: payload.belowSetupFloor,
+    missing: payload.missing,
+    keepBlockedBy: payload.keepBlockedBy,
+  };
+}
+
+/** Recognises the CLI-choice prompt; `null` unless it names the CLI it is about. */
+export function parseSetupCliChoicePromptData(data: unknown): SetupCliChoicePromptPayload | null {
+  const record = readPromptRecord(data, SETUP_CLI_CHOICE_PROMPT_KIND);
+  if (!record) return null;
+  const command = readString(record, 'command');
+  if (!command) return null;
+  return {
+    command,
+    version: readNullableString(record, 'version'),
+    origin: classifySetupCliOrigin(record.origin),
+    removalCommand: readNullableString(record, 'removalCommand'),
+    updateCommand: readNullableString(record, 'updateCommand'),
+    belowSetupFloor: record.belowSetupFloor === true,
+    missing: record.missing === true,
+    keepBlockedBy: readNullableString(record, 'keepBlockedBy'),
+  };
+}
+
+/** The app's answer (`{ choice }`); `null` when it gave none — the question was dismissed. */
+export function readSetupCliChoiceAnswer(answer: unknown): SetupCliChoice | null {
+  const choice = answer && typeof answer === 'object' ? (answer as { choice?: unknown }).choice : null;
+  return choice === 'managed' || choice === 'own' ? choice : null;
 }

@@ -60,6 +60,7 @@ posixOnly('cli.pathExposure system task handlers (POSIX)', () => {
       changed: true,
       shellReloadHint: expect.stringContaining(zshrcPath),
       failure: null,
+      existingCommand: null,
     });
     expect(await readFile(zshrcPath, 'utf8')).toContain(`export PATH="${join(homeDir, '.happier', 'bin')}:$PATH"`);
 

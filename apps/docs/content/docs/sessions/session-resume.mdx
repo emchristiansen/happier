@@ -18,7 +18,7 @@ This is different from:
 
 ## What “resume” means in Happier
 
-In Happier, resume is a strict workflow:
+For a stopped session, provider resume is a strict workflow:
 
 1. Happier finds the existing Happier session
 2. Happier checks whether that session is actually **vendor-resumable**
@@ -92,13 +92,17 @@ Use:
 
 ### Resume interactively
 
+<Callout type="info">
+  The combined attach/resume selector and attaching to running sessions through `happier resume` are available in current development builds.
+</Callout>
+
 ```bash
 happier resume
 ```
 
-In a real TTY, Happier opens an interactive selector and shows resumable inactive sessions sorted by recent activity.
+In a real TTY, Happier opens one selector for running sessions you can attach to and inactive sessions you can resume. Unavailable actions are shown with a reason.
 
-If your terminal does not support the interactive selector, Happier tells you to use `happier session list --resumable` and then resume by id.
+If your terminal does not support the interactive selector, list sessions with `happier session list` and continue by id.
 
 ### Resume by id
 
@@ -108,15 +112,15 @@ happier resume <session-id>
 
 You can pass a full session id or an unambiguous prefix.
 
-Happier then:
+If the session is running and attachable, Happier uses the same attachment as `happier attach <session-id>`. Otherwise, for a stopped session, Happier:
 
 1. resolves the session
-2. validates that it is inactive, not archived, and resumable
+2. validates that it is inactive, not archived, and vendor-resumable
 3. restores the session’s working directory
 4. resumes the provider session
 5. reconnects that provider session to the same Happier session
 
-If the session is active already, archived, missing its working directory, or not vendor-resumable, the command fails with a clear error.
+An active session that cannot be attached fails with a clear error; Happier does not start another agent as a fallback. Archived sessions and stopped sessions without the required resume information also fail.
 
 ## Resume status in the CLI table
 

@@ -214,6 +214,10 @@ describe('SessionDetailsPanel (keep mounted tabs)', () => {
             defaultView: {
                 getComputedStyle: () => ({ overflow: 'hidden', overflowY: 'hidden' }),
             },
+            // A real page also takes the stylesheets web components inject (e.g. the loading spinner).
+            getElementById: () => null,
+            createElement: (tagName: string) => ({ tagName: tagName.toUpperCase(), id: '', textContent: '' }),
+            head: { appendChild: (node: unknown) => node },
         };
 
         try {

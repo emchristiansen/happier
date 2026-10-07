@@ -109,6 +109,7 @@ import { Grid2X2Icon } from '@hugeicons/core-free-icons';
 import { GripVerticalIcon } from '@hugeicons/core-free-icons';
 import { HammerIcon } from '@hugeicons/core-free-icons';
 import { HandIcon } from '@hugeicons/core-free-icons';
+import { HardDriveDownloadIcon } from '@hugeicons/core-free-icons';
 import { HardDriveIcon } from '@hugeicons/core-free-icons';
 import { HeadingIcon } from '@hugeicons/core-free-icons';
 import { HeartIcon } from '@hugeicons/core-free-icons';
@@ -347,6 +348,7 @@ export const HUGE_ICON_REGISTRY = {
     'grid-four': Grid2X2Icon,
     'hammer': HammerIcon,
     'hand': HandIcon,
+    'hard-drive-download': HardDriveDownloadIcon,
     'hard-drives': HardDriveIcon,
     'heart': HeartIcon,
     'hourglass': HourglassIcon,

@@ -321,6 +321,36 @@ test('verify-artifacts requires explicit checksums when component envelopes coex
   }
 });
 
+test('opaque APK verification does not require binary-runtime build products', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'happier-verify-apk-'));
+  const artifactsDir = join(workspace, 'artifacts');
+  await mkdir(artifactsDir);
+  const loader = join(workspace, 'unavailable-binary-runtime.mjs');
+  // Model the package-resolution boundary of the release-runtime-only APK job,
+  // without deleting another worker's cli-common build products.
+  await writeFile(loader, `export async function resolve(specifier, context, nextResolve) {
+    if (specifier.startsWith('@happier-dev/cli-common')) {
+      throw Object.assign(new Error('Binary runtime package is not built in the opaque publisher'), { code: 'ERR_MODULE_NOT_FOUND' });
+    }
+    return nextResolve(specifier, context);
+  }\n`);
+  const apkPath = join(artifactsDir, 'happier-stable-android.apk');
+  const checksumsPath = join(artifactsDir, 'checksums-ui-mobile.txt');
+  const run = () => JSON.parse(execFileSync(process.execPath, [
+    '--experimental-loader', loader, verifyArtifactsPath,
+    '--artifacts-dir', artifactsDir, '--checksums', checksumsPath,
+  ], { cwd: repoRoot, encoding: 'utf8', stdio: 'pipe' }));
+  try {
+    await writeFile(apkPath, 'opaque APK fixture');
+    await writeFile(checksumsPath, `${await sha256(apkPath)}  ${basename(apkPath)}\n`);
+    assert.deepEqual(run().verified, [basename(apkPath)]);
+    await writeFile(apkPath, 'tampered APK');
+    assert.throws(run, /checksum mismatch/i);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test('verify-artifacts enforces required signatures only when requested', async () => {
   const artifactsDir = await mkdtemp(join(tmpdir(), 'happier-verify-signature-'));
   const checksumsPath = join(artifactsDir, 'checksums-happier-v1.2.3.txt');

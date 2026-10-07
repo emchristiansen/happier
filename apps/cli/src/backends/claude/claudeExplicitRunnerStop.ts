@@ -2,15 +2,15 @@ import type { RunnerTerminationEvent } from '@/agent/runtime/runnerTerminationOu
 
 export async function requestClaudeExplicitRunnerStop(input: Readonly<{
   unifiedTerminalEnabled: boolean;
-  destroyOwnedHostForExplicitStop: (() => Promise<void>) | null;
+  stopTerminalHostForExplicitStop: (() => Promise<void>) | null;
   requestTermination: (event: RunnerTerminationEvent) => void;
   whenTerminated: Promise<unknown>;
 }>): Promise<void> {
   if (input.unifiedTerminalEnabled) {
-    if (!input.destroyOwnedHostForExplicitStop) {
-      throw new Error('Claude Unified exact terminal-host disposal is unavailable');
+    if (!input.stopTerminalHostForExplicitStop) {
+      throw new Error('Claude Unified exact terminal-host stop is unavailable');
     }
-    await input.destroyOwnedHostForExplicitStop();
+    await input.stopTerminalHostForExplicitStop();
   }
 
   input.requestTermination({ kind: 'killSession' });

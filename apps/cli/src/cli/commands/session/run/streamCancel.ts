@@ -7,6 +7,7 @@ import { wantsJson, printJsonEnvelope } from '@/cli/output/jsonEnvelope';
 import { readCommandPositionals } from '@/cli/commands/shared/argvFlags';
 import { cancelExecutionRunStream } from '@/session/services/executionRuns';
 import { resolveSessionTransportContext } from '@/session/services/resolveSessionTransportContext';
+import { cmd, fail } from '@happier-dev/cli-common/output';
 
 export async function cmdSessionRunStreamCancel(
   argv: string[],
@@ -25,7 +26,7 @@ export async function cmdSessionRunStreamCancel(
       await printJsonEnvelope({ ok: false, kind: 'session_run_stream_cancel', error: { code: 'not_authenticated' } });
       return;
     }
-    console.error(chalk.red('Error:'), 'Not authenticated. Run "happier auth login" first.');
+    console.error(fail(`Not signed in. Run ${cmd('happier auth login')} first.`));
     process.exit(1);
   }
 

@@ -42,20 +42,22 @@ export const SessionAuthoringCheckoutCreationDraftV1Schema = z.object({
 }).strict();
 
 export const SessionAuthoringTerminalV1Schema = z.object({
-  mode: z.enum(['integrated', 'plain', 'tmux', 'windows_terminal', 'windows_console']).optional(),
+  mode: z.enum(['integrated', 'plain', 'tmux', 'zellij', 'herdr', 'windows_terminal', 'windows_console']).optional(),
   tmux: z.object({
     sessionName: z.string().optional(),
     isolated: z.boolean().optional(),
     tmpDir: z.union([z.string(), z.null()]).optional(),
   }).optional(),
+  herdr: z.object({ sessionName: z.string().optional() }).optional(),
 }).strict();
 
 export const SyncedSessionAuthoringTerminalV1Schema = z.object({
-  mode: z.enum(['integrated', 'plain', 'tmux', 'windows_terminal', 'windows_console']).optional(),
+  mode: z.enum(['integrated', 'plain', 'tmux', 'zellij', 'herdr', 'windows_terminal', 'windows_console']).optional(),
   tmux: z.object({
     sessionName: z.string().optional(),
     isolated: z.boolean().optional(),
   }).strict().optional(),
+  herdr: z.object({ sessionName: z.string().optional() }).strict().optional(),
 }).strict();
 
 export const SyncedSessionAuthoringConnectedServicesV1Schema = z.object({

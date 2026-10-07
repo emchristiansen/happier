@@ -8,6 +8,8 @@ import {
 
 import {
     publishCodexAppServerSessionControlsMetadata,
+    publishCodexAppServerRuntimeModelContextWindowMetadata,
+    readCodexAppServerSessionControls,
     resolveCodexAppServerCollaborationModeSelection,
 } from './sessionControlsMetadata';
 
@@ -647,7 +649,7 @@ describe('publishCodexAppServerSessionControlsMetadata', () => {
         });
     });
 
-    it('clears stale generic session control metadata when list endpoints return no usable items', async () => {
+    it('clears model membership after a successful empty model list while retaining failed mode observations', async () => {
         const client = {
             request: vi.fn(async (method: string) => {
                 if (method === 'collaborationMode/list') {
@@ -691,11 +693,29 @@ describe('publishCodexAppServerSessionControlsMetadata', () => {
             authMethod: 'oauth_cli',
         });
 
-        // If the list endpoints fail or return no usable items, keep the last known-good
-        // session controls metadata sticky so the UI does not lose dynamic controls.
         expect(getMetadata()[SESSION_MODES_STATE_KEY]).toEqual(seedMetadata[SESSION_MODES_STATE_KEY]);
-        expect(getMetadata()[SESSION_MODELS_STATE_KEY]).toEqual(seedMetadata[SESSION_MODELS_STATE_KEY]);
-        expect(getMetadata()[SESSION_CONFIG_OPTIONS_STATE_KEY]).toEqual(seedMetadata[SESSION_CONFIG_OPTIONS_STATE_KEY]);
+        expect(getMetadata()[SESSION_MODELS_STATE_KEY]).toMatchObject({ updatedAt: 789, availableModels: [] });
+        expect(getMetadata()[SESSION_CONFIG_OPTIONS_STATE_KEY]).toMatchObject({ updatedAt: 789, configOptions: [] });
+    });
+
+    it.each(['rejected', 'malformed'] as const)('distinguishes a %s model observation from successful empty discovery', async (failure) => {
+        const previous = { v: 1, provider: 'codex', updatedAt: 10, currentModelId: 'known', availableModels: [{ id: 'known', name: 'Known' }] };
+        const { session, getMetadata } = createSessionHarness({ [SESSION_MODELS_STATE_KEY]: previous });
+        const client = { request: async (method: string) => {
+            if (method !== 'model/list') return [];
+            if (failure === 'rejected') throw new Error('provider unavailable');
+            return { unexpected: [] };
+        } };
+        expect(await readCodexAppServerSessionControls({ client })).toMatchObject({ modelsObserved: false });
+        await publishCodexAppServerSessionControlsMetadata({ client, session, updatedAt: 50 });
+        expect(getMetadata()[SESSION_MODELS_STATE_KEY]).toEqual(previous);
+    });
+
+    it('does not renew catalog freshness when current model telemetry changes', async () => {
+        const previous = { v: 1, provider: 'codex', updatedAt: 10, currentModelId: 'known', availableModels: [{ id: 'known', name: 'Known' }] };
+        const { session, getMetadata } = createSessionHarness({ [SESSION_MODELS_STATE_KEY]: previous });
+        await publishCodexAppServerRuntimeModelContextWindowMetadata({ session, updatedAt: 50, currentModelId: 'known', contextWindowTokens: 100000 });
+        expect(getMetadata()[SESSION_MODELS_STATE_KEY]).toMatchObject({ updatedAt: 10, currentModelId: 'known', availableModels: [{ id: 'known', contextWindowTokens: 100000 }] });
     });
 
     it('prefers the provider default mode id when the collaboration mode list omits explicit current markers', async () => {
