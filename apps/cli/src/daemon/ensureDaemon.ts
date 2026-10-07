@@ -44,8 +44,14 @@ export function shouldEnsureDaemonForInvocation(params: Readonly<{ args: string[
 }
 
 export function shouldAutoStartDaemonAfterAuth(
-  params: Readonly<{ env: NodeJS.ProcessEnv; isDaemonProcess: boolean; startedBy: 'daemon' | 'terminal' }>,
+  params: Readonly<{
+    env: NodeJS.ProcessEnv;
+    isDaemonProcess: boolean;
+    startedBy: 'daemon' | 'terminal';
+    callerIntent?: 'standalone' | 'setup-managed';
+  }>,
 ): boolean {
+  if (params.callerIntent === 'setup-managed') return false;
   if (params.isDaemonProcess) return false;
   if (params.startedBy === 'daemon') return false;
   const raw = (params.env.HAPPIER_SESSION_AUTOSTART_DAEMON ?? '').toString().trim().toLowerCase();

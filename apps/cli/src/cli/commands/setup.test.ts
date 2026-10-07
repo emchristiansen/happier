@@ -32,7 +32,13 @@ let readiness: {
 let interactive = true;
 let relayInstallResultUrl: string | null = null;
 let tailscaleStatus: import('@happier-dev/cli-common/tailscale').TailscaleStatusSnapshot | null = null;
+let installedAgentIds = new Set<string>();
+const installInvocations: string[] = [];
+const installFailures = new Set<string>();
 const multipleChoiceAnswers: string[] = [];
+const multipleSelectionAnswers: string[][] = [];
+let multipleSelectionPromptCount = 0;
+let multipleSelectionOptions: readonly Readonly<{ id: string; description?: string }>[] = [];
 const multipleChoicePrompts: string[] = [];
 const promptInputAnswers: string[] = [];
 
@@ -75,7 +81,23 @@ vi.mock('@/server/serverProfiles', () => ({
 }));
 
 vi.mock('@/runtime/managedTools/providerCliResolution', () => ({
-  resolveProviderCliCommand: (agentId: string) => (agentId === 'claude' ? { command: 'claude' } : null),
+  resolveProviderCliCommand: (agentId: string) => (installedAgentIds.has(agentId) ? { command: agentId } : null),
+}));
+
+vi.mock('@/runtime/managedTools/invokeProviderCliInstall', () => ({
+  invokeProviderCliInstall: async ({ agentId }: { agentId: string }) => {
+    installInvocations.push(agentId);
+    if (installFailures.has(agentId)) {
+      return { ok: false, errorCode: 'install-failed', errorMessage: `${agentId} failed`, logPath: `/tmp/${agentId}.log` };
+    }
+    installedAgentIds.add(agentId);
+    return {
+      ok: true,
+      alreadyInstalled: false,
+      plan: { installMode: 'managed_package' },
+      logPath: null,
+    };
+  },
 }));
 
 vi.mock('@/integrations/tailscale/tailscaleStatus', () => ({
@@ -99,6 +121,11 @@ vi.mock('@/terminal/prompts/promptMultipleChoice', () => ({
   promptMultipleChoice: async (prompt: string) => {
     multipleChoicePrompts.push(prompt);
     return multipleChoiceAnswers.shift() ?? 'cloud';
+  },
+  promptMultipleSelection: async (_message: string, options: readonly Readonly<{ id: string; description?: string }>[]) => {
+    multipleSelectionPromptCount += 1;
+    multipleSelectionOptions = options;
+    return multipleSelectionAnswers.shift() ?? [];
   },
 }));
 
@@ -127,6 +154,9 @@ beforeEach(() => {
   spawned.length = 0;
   spawnedEnvs.length = 0;
   multipleChoiceAnswers.length = 0;
+  multipleSelectionAnswers.length = 0;
+  multipleSelectionPromptCount = 0;
+  multipleSelectionOptions = [];
   multipleChoicePrompts.length = 0;
   promptInputAnswers.length = 0;
   exitCodeByCommand = new Map();
@@ -135,6 +165,9 @@ beforeEach(() => {
   interactive = true;
   relayInstallResultUrl = null;
   tailscaleStatus = null;
+  installedAgentIds = new Set(['claude']);
+  installInvocations.length = 0;
+  installFailures.clear();
   installedServices = [];
   previousExitCode = process.exitCode;
   process.exitCode = undefined;
@@ -197,14 +230,26 @@ describe('happier setup — choosing a relay', () => {
 });
 
 describe('happier setup — readiness', () => {
-  it('leaves a fully configured machine alone', async () => {
+  it('re-enters the idempotent auth owner so a fully configured machine can reconcile its service', async () => {
     activeProfile = { serverUrl: 'https://api.happier.dev' };
     readiness = { authenticated: true, machineRegistered: true, credentialState: 'valid' };
 
     await handleSetupCliCommand(context([]));
 
-    expect(commandsRun()).toEqual([]);
-    expect(output.text()).toContain('already set up');
+    expect(commandsRun()).toEqual(['auth login --wait-timeout 300 --no-daemon-start']);
+    expect(output.text()).not.toContain('already set up');
+  });
+
+  it('keeps configured re-entry incomplete when service reconciliation still fails', async () => {
+    activeProfile = { serverUrl: 'https://api.happier.dev' };
+    readiness = { authenticated: true, machineRegistered: true, credentialState: 'valid' };
+    exitCodeByCommand.set('auth login --wait-timeout 300 --no-daemon-start', 1);
+
+    await handleSetupCliCommand(context([]));
+
+    expect(commandsRun()).toEqual(['auth login --wait-timeout 300 --no-daemon-start']);
+    expect(output.text()).not.toContain('Ready to start a coding session');
+    expect(process.exitCode).toBe(1);
   });
 
   it('does not call a machine with rejected credentials already set up', async () => {
@@ -247,9 +292,58 @@ describe('happier setup — readiness', () => {
 
     await handleSetupCliCommand(context([]));
 
-    expect(commandsRun()).toEqual(['auth login --wait-timeout 300']);
+    expect(commandsRun()).toEqual(['auth login --wait-timeout 300 --no-daemon-start']);
     expect(output.text().toLowerCase()).not.toContain('browser');
     expect(output.text().toLowerCase()).not.toContain('tailscale');
+  });
+
+  it('offers catalog-backed agent installation, installs the explicit choice, and re-detects it', async () => {
+    installedAgentIds.clear();
+    multipleSelectionAnswers.push(['codex']);
+
+    await handleSetupCliCommand(context(['--cloud']));
+
+    expect(installInvocations).toEqual(['codex']);
+    expect(multipleSelectionOptions.find((option) => option.id === 'codex')?.description).toContain('Happier-managed');
+    expect(output.text()).toContain('Installed OpenAI Codex CLI');
+    expect(output.text()).toContain('New session');
+    expect(output.text()).toContain('happier codex');
+    expect(output.text()).not.toContain('still need a coding agent');
+  });
+
+  it('does not force an agent upsell when one is already installed', async () => {
+    await handleSetupCliCommand(context(['--cloud']));
+
+    expect(multipleSelectionPromptCount).toBe(0);
+    expect(output.text()).toContain('happier claude');
+    expect(output.text()).toContain('Agent installation and sign-in are separate');
+  });
+
+  it('preserves install diagnostics and marks setup incomplete when a selected agent fails', async () => {
+    installedAgentIds.clear();
+    multipleSelectionAnswers.push(['codex']);
+    installFailures.add('codex');
+
+    await handleSetupCliCommand(context(['--cloud']));
+
+    expect(output.text()).toContain('codex failed');
+    expect(output.text()).toContain('/tmp/codex.log');
+    expect(output.text()).toContain('Setup stopped');
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('keeps successful selections installed when another selected agent fails', async () => {
+    installedAgentIds.clear();
+    multipleSelectionAnswers.push(['claude', 'codex']);
+    installFailures.add('codex');
+
+    await handleSetupCliCommand(context(['--cloud']));
+
+    expect(installInvocations).toEqual(['claude', 'codex']);
+    expect(installedAgentIds.has('claude')).toBe(true);
+    expect(output.text()).toContain('Installed Claude');
+    expect(output.text()).toContain('codex failed');
+    expect(process.exitCode).toBe(1);
   });
 });
 
@@ -270,9 +364,9 @@ describe('happier setup — a relay only this computer can reach', () => {
     await handleSetupCliCommand(context(['--this-computer']));
 
     expect(output.text()).toContain('reachable from this computer only');
-    expect(output.text()).toContain('this actual computer or VM');
-    expect(output.text()).toContain('Tailscale on both devices');
-    expect(output.text()).toContain('headless VM');
+    expect(output.text()).not.toContain('this actual computer or VM');
+    expect(output.text()).not.toContain('Tailscale on both devices');
+    expect(output.text()).not.toContain('headless VM');
     expect(output.text()).not.toContain('Your phone reaches this relay');
   });
 
@@ -310,6 +404,16 @@ describe('happier setup — handing the terminal back', () => {
     await handleSetupCliCommand(context(['--cloud']));
 
     expect(commandsRun()).toEqual(['server use cloud']);
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('does not claim setup complete when authentication reports incomplete service reconciliation', async () => {
+    exitCodeByCommand.set('auth login --wait-timeout 300 --no-daemon-start', 1);
+
+    await handleSetupCliCommand(context(['--cloud']));
+
+    expect(commandsRun()).toEqual(['auth login --wait-timeout 300 --no-daemon-start']);
+    expect(output.text()).not.toContain('Ready to start a coding session');
     expect(process.exitCode).toBe(1);
   });
 });

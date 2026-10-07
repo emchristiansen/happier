@@ -7,6 +7,7 @@ import type { SessionFoldersV1 } from '@/sync/domains/session/folders';
 import type { SessionListRenderableSession } from '@/sync/domains/session/listing/sessionListRenderable';
 import type { SessionOrganizationProjection } from '@/sync/domains/session/organization';
 import { syncPerformanceTelemetry } from '@/sync/runtime/syncPerformanceTelemetry';
+import { useVisibleSessionListViewData as useReminderListViewData } from './useVisibleSessionListViewData';
 
 function makeRenderableSession(id: string, overrides: Partial<SessionListRenderableSession> = {}): SessionListRenderableSession {
     return {
@@ -183,6 +184,14 @@ vi.mock('@/sync/store/hooks', async (importOriginal) => {
     };
 });
 
+vi.mock('@/sync/domains/session/listing/sessionListIndex', async (importOriginal) => {
+    const original = await importOriginal<typeof import('@/sync/domains/session/listing/sessionListIndex')>();
+    return {
+        ...original,
+        buildSessionListIndexFromViewData: vi.fn(original.buildSessionListIndexFromViewData),
+    };
+});
+
 describe('useVisibleSessionListViewData', () => {
     afterEach(async () => {
         sourceData.hideInactiveSessions = false;
@@ -228,6 +237,7 @@ describe('useVisibleSessionListViewData', () => {
         syncPerformanceTelemetry.configure({ enabled: false });
         syncPerformanceTelemetry.reset();
         vi.mocked((await import('@/sync/store/hooks')).buildSessionListShellViewItemSignature).mockClear();
+        vi.mocked((await import('@/sync/domains/session/listing/sessionListIndex')).buildSessionListIndexFromViewData).mockClear();
         standardCleanup();
     });
 
@@ -423,9 +433,11 @@ describe('useVisibleSessionListViewData', () => {
     });
 
     it('reuses visible rows when a session refresh replaces equivalent source row objects', async () => {
+        const { buildSessionListIndexFromViewData } = await import('@/sync/domains/session/listing/sessionListIndex');
         const { useVisibleSessionListViewData } = await import('./useVisibleSessionListViewData');
         const hook = await renderHook(() => useVisibleSessionListViewData());
         const first = hook.getCurrent();
+        vi.mocked(buildSessionListIndexFromViewData).mockClear();
 
         sourceData.activeData = sourceData.activeData.map((item) => (
             item.type === 'session'
@@ -435,15 +447,18 @@ describe('useVisibleSessionListViewData', () => {
         const second = await hook.rerender();
 
         expect(second).toBe(first);
+        expect(buildSessionListIndexFromViewData).toHaveBeenCalledTimes(1);
         await hook.unmount();
     });
 
     it('rebuilds the visible list without signature scans when a push replaces rows around unchanged sessions', async () => {
         const { buildSessionListShellViewItemSignature } = await import('@/sync/store/hooks');
+        const { buildSessionListIndexFromViewData } = await import('@/sync/domains/session/listing/sessionListIndex');
         const { useVisibleSessionListViewData } = await import('./useVisibleSessionListViewData');
         const hook = await renderHook(() => useVisibleSessionListViewData());
         const first = hook.getCurrent();
         vi.mocked(buildSessionListShellViewItemSignature).mockClear();
+        vi.mocked(buildSessionListIndexFromViewData).mockClear();
 
         // A session-list rebuild replaces every row object while unchanged sessions keep their
         // renderable identity, which is what the store hands consumers on a server push.
@@ -452,6 +467,7 @@ describe('useVisibleSessionListViewData', () => {
 
         expect(second).toBe(first);
         expect(buildSessionListShellViewItemSignature).not.toHaveBeenCalled();
+        expect(buildSessionListIndexFromViewData).toHaveBeenCalledTimes(1);
         await hook.unmount();
     });
 
@@ -474,11 +490,13 @@ describe('useVisibleSessionListViewData', () => {
             })),
         ];
         const { buildSessionListShellViewItemSignature } = await import('@/sync/store/hooks');
+        const { buildSessionListIndexFromViewData } = await import('@/sync/domains/session/listing/sessionListIndex');
         const { useVisibleSessionListViewData } = await import('./useVisibleSessionListViewData');
         const hook = await renderHook(() => useVisibleSessionListViewData());
         const first = hook.getCurrent();
         expect(first).toHaveLength(5);
         vi.mocked(buildSessionListShellViewItemSignature).mockClear();
+        vi.mocked(buildSessionListIndexFromViewData).mockClear();
 
         sourceData.activeData = sourceData.activeData.map((item) => (
             item.type === 'session' && item.session.id === 'session-c'
@@ -495,6 +513,9 @@ describe('useVisibleSessionListViewData', () => {
         expect(second?.[4]).toBe(first?.[4]);
         // Only the row that actually changed is worth a signature comparison.
         expect(vi.mocked(buildSessionListShellViewItemSignature).mock.calls).toHaveLength(2);
+        // The source-to-index build is required. A changed row that cannot be reused must not
+        // trigger two more full-list index builds solely to rediscover that fact.
+        expect(buildSessionListIndexFromViewData).toHaveBeenCalledTimes(1);
         await hook.unmount();
     });
 
@@ -1790,6 +1811,29 @@ describe('useVisibleSessionListViewData', () => {
         await hook.unmount();
     });
 
+    it.each(['global', 'withinGroups'] as const)('retains a cleared due reminder in its %s position until leaving the session', async (mode) => {
+        sourceData.sessionListAttentionPromotionMode = mode;
+        sourceData.activeData = [
+            { type: 'header', title: 'Today', headerKind: 'date', groupKey: 'server:server-a:day:2026-05-04', serverId: 'server-a' },
+            { type: 'session', session: makeRenderableSession('reminder-session', { seq: 4, lastViewedSessionSeq: 4 }), section: 'inactive', groupKey: 'server:server-a:day:2026-05-04', groupKind: 'date', serverId: 'server-a' },
+            { type: 'session', session: makeRenderableSession('quiet-session', { seq: 4, lastViewedSessionSeq: 4 }), section: 'inactive', groupKey: 'server:server-a:day:2026-05-04', groupKind: 'date', serverId: 'server-a' },
+        ];
+        sourceData.sessionOrganizationProjection = makeOrganizationProjection({
+            'reminder-session': { sessionId: 'reminder-session', standing: false, remindAt: 1, updatedAt: 10 },
+        });
+        const hook = await renderHook(({ activeSessionId }: { activeSessionId: string | null }) =>
+            useReminderListViewData('all', { activeSessionId }), { initialProps: { activeSessionId: null as string | null } });
+        const positions = (items: SessionListViewItem[] | null) => items?.map((item) => item.type === 'header'
+            ? `header:${item.headerKind}` : `${item.session.id}:${item.attentionPromotionReason ? 'attention' : 'normal'}`);
+        const before = positions(hook.getCurrent());
+        sourceData.sessionOrganizationProjection = makeOrganizationProjection({});
+        expect(positions(await hook.rerender({ activeSessionId: 'reminder-session' }))).toEqual(before);
+        expect(positions(await hook.rerender({ activeSessionId: null }))).not.toEqual(before);
+        expect(hook.getCurrent()?.find((item) => item.type === 'session' && item.session.id === 'reminder-session'))
+            .toHaveProperty('groupKind', 'date');
+        await hook.unmount();
+    });
+
     it('drops the session being viewed out of the attention band as soon as its standing is removed', async () => {
         sourceData.sessionListAttentionPromotionMode = 'global';
         sourceData.activeData = [
@@ -2140,6 +2184,69 @@ describe('useVisibleSessionListViewData', () => {
             'header:date',
             'session:normal-session:date:none',
         ]);
+        await remountedHook.unmount();
+    });
+
+    it('reuses an unchanged retained visible projection when the pane-state hook remounts', async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000_000);
+        syncPerformanceTelemetry.configure({
+            enabled: true,
+            slowThresholdMs: 1_000_000,
+            flushIntervalMs: 60_000,
+        });
+        syncPerformanceTelemetry.reset();
+
+        const { useVisibleSessionListPaneState } = await import('./useVisibleSessionListViewData');
+        const firstHook = await renderHook(() => useVisibleSessionListPaneState('all'));
+        const retainedSessionListViewData = firstHook.getCurrent().sessionListViewData;
+        expect(retainedSessionListViewData).not.toBeNull();
+        await firstHook.unmount();
+
+        // Re-subscribing to the canonical list projection can produce a fresh
+        // wrapper array even though every projected session is unchanged.
+        sourceData.activeData = sourceData.activeData.map((item) => ({ ...item }));
+        vi.setSystemTime(1_001_000);
+        const remountedHook = await renderHook(() => useVisibleSessionListPaneState('all', {
+            retainedSessionListViewData,
+        }));
+
+        expect(remountedHook.getCurrent().sessionListViewData).toBe(retainedSessionListViewData);
+        const visibleComputeEvent = syncPerformanceTelemetry.snapshot().events.find((event) =>
+            event.name === 'sync.sessions.list.visible.compute'
+        );
+        expect(visibleComputeEvent?.count).toBe(1);
+        await remountedHook.unmount();
+    });
+
+    it('keeps the recovered projection while remount-only retention options settle', async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000_000);
+        syncPerformanceTelemetry.configure({
+            enabled: true,
+            slowThresholdMs: 1_000_000,
+            flushIntervalMs: 60_000,
+        });
+        syncPerformanceTelemetry.reset();
+
+        const { useVisibleSessionListPaneState } = await import('./useVisibleSessionListViewData');
+        const firstHook = await renderHook(() => useVisibleSessionListPaneState('all'));
+        const retainedSessionListViewData = firstHook.getCurrent().sessionListViewData;
+        await firstHook.unmount();
+
+        let options: Parameters<typeof useVisibleSessionListPaneState>[1] = {
+            activeSessionId: 'session-a',
+            retainedSessionListViewData,
+        };
+        const remountedHook = await renderHook(() => useVisibleSessionListPaneState('all', options));
+        options = { activeSessionId: null };
+        await remountedHook.rerender();
+
+        expect(remountedHook.getCurrent().sessionListViewData).toBe(retainedSessionListViewData);
+        const visibleComputeEvent = syncPerformanceTelemetry.snapshot().events.find((event) =>
+            event.name === 'sync.sessions.list.visible.compute'
+        );
+        expect(visibleComputeEvent?.count).toBe(1);
         await remountedHook.unmount();
     });
 

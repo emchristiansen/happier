@@ -24,9 +24,11 @@ export const buildDetectContext: CapabilitiesDetectContextBuilder = async (reque
     const bypassCache = requests.some((r) =>
         (r.id.startsWith('cli.') || r.id === 'tool.executionRuns') && Boolean((r.params ?? {}).bypassCache)
     );
+    const verifyVersion = requests.some((r) => r.id.startsWith('cli.') && Boolean((r.params ?? {}).verifyVersion));
     const cliSnapshot = wantsCliOrTmux
         ? await detectCliSnapshotOnDaemonPath({
             ...(anyLogin ? { includeLoginStatus: true } : {}),
+            ...(verifyVersion ? { verifyVersion: true } : {}),
             ...(requestedCliNames.length > 0 ? { requestedCliNames } : {}),
             ...(bypassCache ? { bypassCache: true } : {}),
         })

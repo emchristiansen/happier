@@ -8,13 +8,17 @@ interface UserCardProps {
     onPress?: () => void;
     disabled?: boolean;
     subtitle?: string;
+    showDivider?: boolean;
+    density?: 'comfortable' | 'cozy' | 'compact' | 'tight';
 }
 
 export function UserCard({ 
     user, 
     onPress,
     disabled,
-    subtitle
+    subtitle,
+    showDivider,
+    density,
 }: UserCardProps) {
     const displayName = getDisplayName(user);
     const avatarUrl = user.avatar?.url || user.avatar?.path;
@@ -37,10 +41,12 @@ export function UserCard({
             title={displayName}
             subtitle={subtitleText}
             subtitleLines={1}
+            density={density}
             leftElement={avatarElement}
             onPress={onPress}
             showChevron={!!onPress}
             disabled={disabled}
+            showDivider={showDivider}
         />
     );
 }

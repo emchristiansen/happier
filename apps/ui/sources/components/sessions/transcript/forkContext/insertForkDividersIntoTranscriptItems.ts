@@ -73,6 +73,8 @@ function buildDivider(params: Readonly<{
 export function insertForkDividersIntoTranscriptItems<T extends ForkDividerTranscriptItem>(params: Readonly<{
     items: readonly T[];
     fork: ForkedTranscriptSnapshot;
+    /** All loaded source rows have been derived; absent rows were filtered, not deferred. */
+    sourceWindowComplete?: boolean;
 }>): Array<T | Extract<ChatListItem, { kind: 'fork-divider' }>> {
     // A boundary divider is CHROME FOR CONTENT: it labels the seam between an ancestor
     // segment and its child. With no rows there is no seam to label, and emitting one anyway
@@ -101,7 +103,41 @@ export function insertForkDividersIntoTranscriptItems<T extends ForkDividerTrans
         }
     });
 
-    for (let i = 0; i < params.fork.segments.length - 1; i += 1) {
+    let firstSourceSpan: SourceSpan | null = null;
+    let firstSourceSegmentIndex: number | undefined;
+    for (const item of params.items) {
+        const span = getItemSourceSpan(item);
+        const segmentIndex = span ? segmentIndexByMessageId.get(span.firstMessageId) : undefined;
+        if (span && segmentIndex !== undefined) {
+            firstSourceSpan = span;
+            firstSourceSegmentIndex = segmentIndex;
+            break;
+        }
+    }
+    if (firstSourceSegmentIndex === undefined || !firstSourceSpan) return [...params.items];
+
+    // Ancestry may be cached outside the currently derived row window. Its dividers
+    // belong there too; never move them to the first available descendant row.
+    let firstBoundaryParentIndex = firstSourceSegmentIndex;
+    const firstSegment = params.fork.segments[firstSourceSegmentIndex]!;
+    if (
+        firstSegment.isHistoryStartLoaded === true
+        && (params.sourceWindowComplete === true || firstSourceSpan.firstMessageId === firstSegment.messageIdsOldestFirst[0])
+    ) {
+        firstBoundaryParentIndex = Math.max(0, firstSourceSegmentIndex - 1);
+        // Known empty segments have coincident boundaries. An unloaded segment is
+        // not empty, so it cannot pull earlier ancestry into the visible window.
+        while (firstBoundaryParentIndex > 0) {
+            const segment = params.fork.segments[firstBoundaryParentIndex]!;
+            if (
+                segment.messageIdsOldestFirst.length > 0
+                || (segment.isHistoryStartLoaded !== true && segment.cutoffSeqInclusive !== 0)
+            ) break;
+            firstBoundaryParentIndex -= 1;
+        }
+    }
+
+    for (let i = firstBoundaryParentIndex; i < params.fork.segments.length - 1; i += 1) {
         const parent = params.fork.segments[i]!;
         const child = params.fork.segments[i + 1]!;
         boundaries.push({

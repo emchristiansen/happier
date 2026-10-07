@@ -18,6 +18,7 @@ export type CodexConnectedServiceRuntimeFailureKind =
   | 'account_changed'
   | 'refresh_failed'
   | 'permission_denied'
+  | 'plan'
   | 'unknown';
 
 export type CodexConnectedServiceRuntimeFailureClassification = Readonly<{
@@ -30,7 +31,8 @@ export type CodexConnectedServiceRuntimeFailureClassification = Readonly<{
   credentialRevision?: ConnectedServiceCredentialRevisionV1 | null;
   resetsAtMs: number | null;
   retryAfterMs: number | null;
-  quotaScope?: 'provider';
+  quotaScope?: 'provider' | 'model';
+  providerLimitId?: string | null;
   planType: string | null;
   rateLimits: unknown | null;
   sourceProviderAccountId?: string | null;
@@ -100,7 +102,8 @@ export function isCodexProviderCapacityFailure(value: unknown): boolean {
   const evidence = value instanceof Error
     ? { message: value.message }
     : readCodexProviderErrorRecord(value) ?? value;
-  return classifyProviderLimitEvidence(evidence) === 'capacity';
+  if (classifyProviderLimitEvidence(evidence) === 'capacity') return true;
+  return /\bapplication\s+network\s+permission\s+was\s+revoked\b/i.test(readErrorText(value));
 }
 
 function isStructuredUsageLimitCode(value: string | null): boolean {
@@ -129,8 +132,8 @@ function containsRefreshTokenFailureMessage(text: string): boolean {
     || /refresh\s+token\s+(?:(?:has\s+been|was)\s+)?(?:invalidated|revoked)/i.test(text);
 }
 
-function containsChatGptAccountModelIncompatibility(text: string): boolean {
-  return /\bmodel\b[\s\S]{0,180}\bnot supported\b[\s\S]{0,180}\busing Codex with a ChatGPT account\b/i.test(text);
+function readChatGptAccountUnsupportedModel(text: string): string | null {
+  return /The\s+['"]([^'"]+)['"]\s+model\s+is\s+not\s+supported\s+when\s+using\s+Codex\s+with\s+a\s+ChatGPT\s+account\./i.exec(text)?.[1]?.trim() || null;
 }
 
 function readResetAtMs(value: unknown): number | null {
@@ -160,6 +163,7 @@ function buildClassification(
     resetsAtMs?: number | null;
     retryAfterMs?: number | null;
     quotaScope?: CodexConnectedServiceRuntimeFailureClassification['quotaScope'];
+    providerLimitId?: string | null;
     planType?: string | null;
     rateLimits?: unknown | null;
     source: CodexConnectedServiceRuntimeFailureClassification['source'];
@@ -188,6 +192,7 @@ function buildClassification(
     resetsAtMs: params.resetsAtMs ?? null,
     retryAfterMs: params.retryAfterMs ?? null,
     ...(params.quotaScope ? { quotaScope: params.quotaScope } : {}),
+    ...(params.providerLimitId ? { providerLimitId: params.providerLimitId } : {}),
     planType: params.planType ?? null,
     rateLimits: params.rateLimits ?? null,
     ...(sourceProviderAccountId ? { sourceProviderAccountId } : {}),
@@ -234,10 +239,13 @@ export function classifyCodexConnectedServiceAuthFailure(
 
   if (!input.providerErrorPath) return null;
 
-  if (containsChatGptAccountModelIncompatibility(text)) {
+  const unsupportedModel = readChatGptAccountUnsupportedModel(text);
+  if (unsupportedModel) {
     return buildClassification(input, {
-      kind: 'permission_denied',
+      kind: 'plan',
       limitCategory: 'plan_invalid',
+      quotaScope: 'model',
+      providerLimitId: unsupportedModel,
       source: record ? 'structured_provider_error' : 'stable_provider_message',
     });
   }

@@ -45,13 +45,15 @@ function readToolResultError(result: unknown): string | null {
 
 function buildCompletedRequestPlaceholderResult(completed: unknown): unknown {
     const completedRecord = asRecord(completed);
-    const answerRecord = asRecord(completedRecord?.answers);
+    const answerRecord = asRecord(completedRecord?.structuredAnswersV1) ?? asRecord(completedRecord?.answers);
     if (!answerRecord) return 'Approved';
 
     const answers: Record<string, string> = {};
     for (const [question, answer] of Object.entries(answerRecord)) {
         if (typeof answer === 'string') {
             answers[question] = answer;
+        } else if (Array.isArray(answer) && answer.every((entry) => typeof entry === 'string')) {
+            answers[question] = answer.join(', ');
         }
     }
     return Object.keys(answers).length > 0 ? { answers } : 'Approved';

@@ -192,4 +192,28 @@ describe('SessionItem existing-session draft presentation', () => {
         const row = screen.findByTestId(`session-list-item-${SESSION_ID}`);
         expect(row?.props.accessibilityActions).toContainEqual({ name: 'deleteDraft', label: 'Delete draft' });
     });
+
+    it('keeps a compact clock visible in a narrow row without replacing its subtitle', async () => {
+        const { SessionItem } = await import('./SessionItem');
+        const session = createSession();
+        const rowModel = createSessionItemTestRowModel({
+            session,
+            serverId: 'server-a',
+            compact: true,
+            compactMinimal: true,
+            subtitleOverride: '/workspace/project',
+        });
+        const screen = await renderScreen(
+            <SessionItem
+                session={session}
+                rowModel={{
+                    ...rowModel,
+                    reminder: { state: 'scheduled', remindAt: Date.now() + 60_000 },
+                }}
+            />,
+        );
+
+        expect(screen.findByTestId(`session-list-reminder-indicator:${SESSION_ID}`)).not.toBeNull();
+        expect(rowModel.subtitle).toBe('/workspace/project');
+    });
 });

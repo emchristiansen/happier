@@ -52,6 +52,8 @@ Re-derive every accepted finding from primary evidence. Use `.agents/skills/veri
 
 ## Review availability and cadence
 
+Apply root waiting/recovery and validation-reuse policies. Resume an interrupted reviewer before replacing it, retaining completed findings and applicable execution evidence. A replacement brief identifies only the remaining review scope, relevant current changes, prior findings/evidence, and acceptance checks; preserve required reviewer independence. Quota/transport failure leaves the missing review pending, not failed on substance, and does not restart completed review lanes.
+
 - Advisory review may inspect moving, dirty, partial, or completed work at any time and report evidence-backed findings without a completeness verdict.
 - Formal independent review is normally batched at the fewest substantial integrated boundaries needed by the approved plan, plus explicit user-requested reviews and decision-material security/data/persistence/compatibility triggers that cannot safely wait. Do not invent per-lane, per-gate, per-commit, or per-microchange independent review gates.
 - Record a concise observed basis: plan revision when applicable, current HEAD and dirty-state acknowledgement, relevant paths/symbols/flows, checks run, and observed loaded source/build identity where relevant. Do not freeze or hash worktrees, create release-representation manifests, leases, receipts, custody records, or global invalidation machinery.

@@ -8,11 +8,20 @@ describe('probeSessionRunnerServiceability', () => {
     expect(resolveSessionRunnerResumeDecision({ state: 'runner_present', control: { state: 'servable' } })).toEqual({ action: 'adopt' });
     expect(resolveSessionRunnerResumeDecision({
       state: 'runner_present', control: { state: 'recoverable_unservable', reason: 'rpc_method_unavailable' },
-    })).toEqual({ action: 'fence', reason: 'rpc_method_unavailable' });
+    })).toEqual({ action: 'wait_for_exit', reason: 'rpc_method_unavailable' });
+    expect(resolveSessionRunnerResumeDecision({
+      state: 'runner_present', control: { state: 'unknown', reason: 'rpc_failed' },
+    })).toEqual({ action: 'wait_for_exit', reason: 'rpc_failed' });
     expect(resolveSessionRunnerResumeDecision({
       state: 'runner_present', control: { state: 'recoverable_unservable', reason: 'runtime_terminating' },
     })).toEqual({ action: 'wait_for_exit', reason: 'runtime_terminating' });
     expect(resolveSessionRunnerResumeDecision({ state: 'runner_absent' })).toEqual({ action: 'spawn' });
+    expect(resolveSessionRunnerResumeDecision({
+      state: 'runner_unknown', reason: 'runner_presence_unproven',
+    })).toEqual({ action: 'fence', reason: 'runner_presence_unproven' });
+    expect(resolveSessionRunnerResumeDecision({
+      state: 'runner_present', control: { state: 'unknown', reason: 'no_token' },
+    })).toEqual({ action: 'fence', reason: 'no_token' });
   });
   it('does not claim serviceability from a live matching PID alone', async () => {
     const tracked: TrackedSession = { startedBy: 'daemon', pid: 456, happySessionId: 'sess_1' };

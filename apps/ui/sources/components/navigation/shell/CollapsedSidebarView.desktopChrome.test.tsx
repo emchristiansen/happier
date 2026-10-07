@@ -12,6 +12,10 @@ const collapsedSidebarState = vi.hoisted(() => ({
     setSidebarCollapsed: vi.fn(),
 }));
 
+const inboxState = vi.hoisted(() => ({
+    model: { hasContent: true },
+}));
+
 const desktopWindowBridgeState = vi.hoisted(() => ({
     getDesktopWindowChromePolicy: vi.fn(),
     getDesktopWindowState: vi.fn(),
@@ -52,6 +56,18 @@ vi.mock('expo-image', () => ({
     Image: (props: Record<string, unknown>) => React.createElement('Image', props),
 }));
 
+vi.mock('@/components/inbox/InboxPopoverButton', () => ({
+    InboxPopoverButton: (props: Record<string, unknown>) => React.createElement('InboxPopoverButton', props),
+}));
+
+vi.mock('@/components/updates/UpdatesPopoverButton', () => ({
+    UpdatesEntry: (props: Record<string, unknown>) => React.createElement('UpdatesEntry', props),
+}));
+
+vi.mock('@/components/inbox/actionOperations/ActionOperationActivityButton', () => ({
+    ActionOperationActivityButton: (props: Record<string, unknown>) => React.createElement('ActionOperationActivityButton', props),
+}));
+
 vi.mock('@/utils/platform/responsive', () => ({
     useHeaderHeight: () => 56,
 }));
@@ -87,15 +103,15 @@ describe('CollapsedSidebarView desktop chrome', () => {
         const screen = await renderScreen(
             <CollapsedSidebarView
                 desktopWindowControls={<View testID="injected-collapsed-window-controls" />}
-                desktopUpdateIndicator={<View testID="injected-collapsed-update-indicator" />}
             />,
         );
 
         expect(screen.findByTestId('desktop-collapsed-shell-chrome')).toBeTruthy();
         expect(screen.findByTestId('desktop-window-controls-host')).toBeTruthy();
         expect(screen.findByTestId('injected-collapsed-window-controls')).toBeTruthy();
-        expect(screen.findByTestId('injected-collapsed-update-indicator')).toBeTruthy();
-        expect(screen.findAllByTestId('collapsed-sidebar-home-button')).toHaveLength(0);
+        // The logo stays; Updates is its own rail entry (R13 (e)), never a replacement for the logo.
+        expect(screen.findAllByTestId('collapsed-sidebar-home-button').length).toBeGreaterThan(0);
+        expect(screen.findByTestId('collapsed-sidebar-updates-button')?.props.variant).toBe('icon');
 
         await act(async () => {
             await pressTestInstanceAsync(screen.findByTestId('sidebar-expand-button'));
@@ -127,6 +143,30 @@ describe('CollapsedSidebarView desktop chrome', () => {
         const screen = await renderScreen(<CollapsedSidebarView />);
 
         expect(screen.findByTestId('sidebar-expand-button')?.props.accessibilityLabel).toBe('common.expand');
+    });
+
+    it('renders both Inbox and Activity in the collapsed rail when Inbox is available', async () => {
+        const { CollapsedSidebarView } = await import('./CollapsedSidebarView');
+        const screen = await renderScreen(
+            <CollapsedSidebarView inboxEnabled inboxSummary={inboxState.model as never} />,
+        );
+
+        const inboxButton = screen.findByType('InboxPopoverButton' as never);
+        expect(inboxButton.props).toMatchObject({
+            summary: inboxState.model,
+            testID: 'collapsed-sidebar-inbox-button',
+        });
+        expect(screen.findByTestId('collapsed-sidebar-action-operations')).toBeTruthy();
+    });
+
+    it('keeps action operations as the fallback when Inbox is unavailable', async () => {
+        const { CollapsedSidebarView } = await import('./CollapsedSidebarView');
+        const screen = await renderScreen(
+            <CollapsedSidebarView inboxEnabled={false} inboxSummary={inboxState.model as never} />,
+        );
+
+        expect(screen.findAllByType('InboxPopoverButton' as never)).toHaveLength(0);
+        expect(screen.findByTestId('collapsed-sidebar-action-operations')).toBeTruthy();
     });
 
     // The rail is the sidebar's CLOSED state, so its button opens rather than closes. It used to

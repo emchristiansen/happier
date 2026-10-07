@@ -84,6 +84,7 @@ export function createStorageModuleStub<TOverrides extends object>(overrides: TO
     const allSessionListRenderables = [] as ReturnType<StorageModule['useAllSessionListRenderables']>;
     const allAttentionSessions = [] as ReturnType<StorageModule['useAllSessionsForAttention']>;
     const allAttentionSessionListRenderables = [] as ReturnType<StorageModule['useAllSessionListRenderablesForAttention']>;
+    const sessionListViewDataByServerId = {} as ReturnType<StorageModule['useSessionListViewDataByServerId']>;
     const sessionOrganizationProjection = {
         schemaVersion: null,
         version: null,
@@ -173,6 +174,7 @@ export function createStorageModuleStub<TOverrides extends object>(overrides: TO
             sessionRpcAvailable: false,
         }),
         useAllMachines: () => allMachines,
+        useFirstVisibleMachineId: () => null,
         useLaunchSelectionMachines: () => launchSelectionMachines,
         useMachineDisplayById: () => machineDisplayById,
         useMachineCliDetectionTarget: () => ({
@@ -180,9 +182,11 @@ export function createStorageModuleStub<TOverrides extends object>(overrides: TO
             isOnline: false,
         }),
         useAllSessions: () => allSessions,
+        useFriendRequestCount: () => 0,
         useAllSessionListRenderables: () => allSessionListRenderables,
         useAllSessionsForAttention: () => allAttentionSessions,
         useAllSessionListRenderablesForAttention: () => allAttentionSessionListRenderables,
+        useSessionListViewDataByServerId: () => sessionListViewDataByServerId,
         useSessionOrganizationProjection: () => sessionOrganizationProjection,
         useMachine: () => null,
         useIsDataReady: () => true,

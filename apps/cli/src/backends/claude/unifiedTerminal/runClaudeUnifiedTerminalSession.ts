@@ -1,5 +1,4 @@
-import { rmdir, unlink } from 'node:fs/promises';
-import { basename, dirname } from 'node:path';
+import { createUnreadTerminalArtifactsCleanup } from '@/terminal/runtime/terminalLaunchSpec';
 
 import type {
   ClaudeUnifiedTerminalHost,
@@ -28,6 +27,7 @@ import {
 } from './createClaudeUnifiedHookLifecycleBridge';
 import { createReplayableHookSubscription } from './createReplayableHookSubscription';
 import { createClaudeUnifiedTranscriptBridge } from './createClaudeUnifiedTranscriptBridge';
+import { isClaudeMainChainCompactBoundary } from '../localControl/readClaudeTranscriptTurnSignal';
 import type { ClaudeRemoteSubagentFileCollector } from '../remote/sidechains/claudeRemoteSubagentFileCollector';
 import {
   createClaudeUnifiedTerminalReadinessBridge,
@@ -45,7 +45,7 @@ import {
   type ClaudeGoalRuntimeControls,
 } from '../goalControl/claudeGoalRuntimeControl';
 import { buildClaudeGoalCommand } from '../goalControl/claudeGoalCommand';
-import { createClaudeUnifiedPendingQueuePump } from './createClaudeUnifiedPendingQueuePump';
+import { createClaudeUnifiedPendingQueuePump, type ClaudeUnifiedPendingDeliveryState } from './createClaudeUnifiedPendingQueuePump';
 import {
   createClaudeUnifiedPromptInjector,
   type ClaudeUnifiedDraftGuardStarvationInfo,
@@ -137,18 +137,21 @@ import {
   isTerminalHostConfirmedDeadForRelaunch,
   type TerminalHostConfirmedDeadProbeResult,
 } from '@/integrations/terminalHost/livenessPolicy';
-import { TerminalHostStartupError } from '@/integrations/terminalHost/errors';
-import { createTerminalHostRegistry } from '@/integrations/terminalHost/registry';
+import { TerminalHostCreationError, TerminalHostStartupError, resolveTerminalHostLaunchFailure } from '@/integrations/terminalHost/errors';
+import { createDefaultTerminalHostRegistry } from '@/integrations/terminalHost/defaultRegistry';
 import { resolveTerminalHost } from '@/integrations/terminalHost/resolveTerminalHost';
-import { createTmuxTerminalHostAdapter, isTmuxAvailable } from '@/integrations/tmux';
+import { isTmuxAvailable } from '@/integrations/tmux';
 import { createPtyTerminalHostAdapter } from '@/integrations/pty';
-import { createZellijTerminalHostAdapter } from '@/integrations/zellij/adapter';
 import { createWindowsTerminalZellijForegroundClientLauncher } from '@/integrations/zellij/windowsForegroundClient';
 import { configuration } from '@/configuration';
 import {
   buildClaudeUnifiedTerminalSpawn,
   type ClaudeUnifiedTerminalSpawn,
 } from './buildClaudeUnifiedTerminalSpawn';
+import {
+  launchOwnedTerminalProcess,
+  type OwnedTerminalProcess,
+} from '@/terminal/runtime/ownedTerminalProcess';
 import { resolveZellijWindowsGuard } from '@/integrations/zellij/zellijWindowsGuards';
 import { resolveZellijRuntimeBinary } from '@/integrations/zellij/runtimeBinary';
 import {
@@ -179,6 +182,7 @@ type ClaudeUnifiedTerminalQueuedInput<Mode> = Readonly<{
    */
   providerAcceptancePending?: boolean | null;
   pendingProviderAction?: import('@/agent/runtime/modeMessageQueue').PendingProviderAction;
+  pendingRequestedAction?: import('@happier-dev/protocol').PendingRequestedActionV1;
 }>;
 
 type ClaudeUnifiedTerminalAcceptedInput<Mode> =
@@ -200,6 +204,13 @@ export class ClaudeUnifiedTerminalHostUnavailableError extends Error {
   }
 }
 
+export function resolveClaudeUnifiedInitialHostLivenessTimeoutMs(
+  explicitTimeoutMs: number | undefined,
+  startupReadinessTimeoutMs: number,
+): number {
+  return explicitTimeoutMs ?? startupReadinessTimeoutMs;
+}
+
 export type ClaudeUnifiedTerminalSessionOptions<Mode extends EnhancedMode = EnhancedMode> = Readonly<{
   path: string;
   happySessionId?: string | null | undefined;
@@ -216,6 +227,12 @@ export type ClaudeUnifiedTerminalSessionOptions<Mode extends EnhancedMode = Enha
   statuslineForwarder?: Readonly<{ port: number; secret: string }> | undefined;
   /** Exact surviving attachment authorized by validated endpoint-rebound recovery. */
   expectedExistingTerminalHostAttachmentId?: string | undefined;
+  /** Existing current terminal in which the provider child should run directly. */
+  currentTerminalHost?: Readonly<{
+    handle: TerminalHostHandle;
+    lifecycle: 'owned' | 'borrowed';
+  }> | undefined;
+  launchCurrentTerminalProcess?: ((params: Parameters<typeof launchOwnedTerminalProcess>[0]) => Promise<Pick<OwnedTerminalProcess, 'whenExited' | 'terminate'>>) | undefined;
   signal?: AbortSignal | undefined;
   initialMode?: Mode | undefined;
   nextMessage: () => Promise<ClaudeUnifiedTerminalQueuedInput<Mode> | null>;
@@ -330,6 +347,7 @@ export type ClaudeUnifiedTerminalSessionOptions<Mode extends EnhancedMode = Enha
   /** Canonical session-turn lifecycle probe for the arbiter's stale-turn recovery (Lane N2). */
   isCanonicalTurnActive?: (() => boolean) | undefined;
   /** Canonical Pending delivery-state probe used to reconcile ambiguous terminal custody. */
+  pendingDeliveryState?: ClaudeUnifiedPendingDeliveryState;
   resolvePromptDeliveryState?: ((batch: ClaudeUnifiedPromptBatch<Mode>) => import('./_types').ClaudeUnifiedPromptDeliveryState) | undefined;
   /**
    * Lane P (O-design Seam A): de-duplicated session-level steer availability tee from the steer
@@ -445,21 +463,24 @@ export type ClaudeUnifiedTerminalSessionOptions<Mode extends EnhancedMode = Enha
       | Readonly<{ action: 'surfaced_runtime_issue' }>
     >
   ) | undefined;
+  /** Exact host ownership is ready; provider initialization and composer readiness may still be pending. */
   onTerminalHostReady?: ((params: Readonly<{
     handle: TerminalHostHandle;
+    lifecycle: 'owned' | 'borrowed';
     terminal: NonNullable<Metadata['terminal']>;
-    destroyOwnedHostForExplicitStop: () => Promise<void>;
+    stopTerminalHostForExplicitStop: () => Promise<void>;
   }>) => void | Promise<void>) | undefined;
   /**
    * Publishes the exact host attachment as soon as the host owner has created and persisted it.
-   * This is intentionally separate from onTerminalHostReady, whose callback may be delayed until
-   * the controller has initialized (or never run on a startup failure).
+   * The exact-host callback runs first so a user can stop this attachment even while metadata
+   * publication or provider initialization is still pending.
    */
   publishTerminalHostMetadata?: ((terminal: NonNullable<Metadata['terminal']>) => void | Promise<void>) | undefined;
   persistTerminalHostAttachmentInfo?: ((params: Readonly<{
     sessionId: string;
     attachmentId: NonNullable<TerminalHostHandle['attachmentId']>;
     handle: TerminalHostHandle;
+    lifecycle: 'owned' | 'borrowed';
     terminal: NonNullable<Metadata['terminal']>;
   }>) => void | Promise<void>) | undefined;
   removeTerminalHostAttachmentInfo?: ((params: Readonly<{
@@ -576,7 +597,7 @@ function normalizeHostPreferenceForCurrentPlatform(
 function isClaudeUnifiedReusableTerminalHostKind(
   kind: TerminalHostKind,
 ): kind is Exclude<ClaudeUnifiedTerminalHostPreference, 'auto'> {
-  return kind === 'tmux' || kind === 'zellij';
+  return kind === 'tmux' || kind === 'zellij' || kind === 'herdr';
 }
 
 function disposeReplayableHookSubscription(
@@ -625,29 +646,20 @@ async function resolveDefaultHostAdapter(
     }
   }
   const resolvedZellijWindowsGuard = zellijWindowsGuard.status === 'ok' ? zellijWindowsGuard : null;
-  const adapters = createTerminalHostRegistry([
-    ...(windowsConsoleAdapter ? [windowsConsoleAdapter] : []),
-    ...(tmuxAvailable ? [createTmuxTerminalHostAdapter({ promptSubmitVerification })] : []),
-    ...(zellijBinary
-      ? [
-          createZellijTerminalHostAdapter({
-            zellijBinary,
-            happyHomeDir: configuration.happyHomeDir,
-            promptSubmitVerification,
-            defaultShell: resolvedZellijWindowsGuard?.shell,
-            ...(resolvedZellijWindowsGuard?.launchStrategy === 'foreground_windows_terminal'
-              ? {
-                  launchStrategy: {
-                    type: 'foregroundAttached',
-                    launchClient: createWindowsTerminalZellijForegroundClientLauncher(),
-                  } as const,
-                }
-              : {}),
-            actionTimeoutMs: configuration.claudeUnifiedTerminalHostActionTimeoutMs,
-          }),
-        ]
-      : []),
-  ]);
+  const adapters = await createDefaultTerminalHostRegistry({
+    promptSubmitVerification,
+    zellijBinary,
+    windowsConsoleAdapter,
+    zellijDefaultShell: resolvedZellijWindowsGuard?.shell,
+    ...(resolvedZellijWindowsGuard?.launchStrategy === 'foreground_windows_terminal'
+      ? {
+          zellijLaunchStrategy: {
+            type: 'foregroundAttached',
+            launchClient: createWindowsTerminalZellijForegroundClientLauncher(),
+          } as const,
+        }
+      : {}),
+  });
 
   return resolveTerminalHost({
     preference,
@@ -690,6 +702,9 @@ async function readExistingTerminalHostAttachment(params: Readonly<{
     sessionId,
   });
   if (!info) return null;
+  // Borrowed terminals are tied to the live wrapper process and are never recovery candidates.
+  // The current invocation may borrow its own verified foreground terminal below.
+  if (info.version === 3) return null;
   const handle = info.version === 2
     ? info.handle
     : buildLegacyTerminalAttachmentHostHandle(info, configuration.happyHomeDir);
@@ -704,15 +719,11 @@ async function readExistingTerminalHostAttachment(params: Readonly<{
 
 async function removeUnreadLaunchSpec(spawn: ClaudeUnifiedTerminalSpawn): Promise<void> {
   if (spawn.cleanupUnreadArtifacts) {
-    await spawn.cleanupUnreadArtifacts().catch(() => undefined);
+    await spawn.cleanupUnreadArtifacts();
     return;
   }
   if (!spawn.launchSpecPath) return;
-  await unlink(spawn.launchSpecPath).catch(() => undefined);
-  const specDir = dirname(spawn.launchSpecPath);
-  if (basename(specDir).startsWith('happier-terminal-launch-')) {
-    await rmdir(specDir).catch(() => undefined);
-  }
+  await createUnreadTerminalArtifactsCleanup({ launchSpecPath: spawn.launchSpecPath })();
 }
 
 function isClaudePromptInputExit(event: ClaudeUnifiedSessionEndEvent): boolean {
@@ -752,7 +763,7 @@ function bindProcessSignalCleanup(params: Readonly<{
     if (cleanupStarted) return;
     cleanupStarted = true;
     void params.dispose().catch((error) => {
-      logger.debug('[unified]: failed to dispose Claude unified terminal session during process signal cleanup', error);
+      logger.infoFile('[unified]: failed to dispose Claude unified terminal session during process signal cleanup', error);
     });
   };
 
@@ -775,11 +786,8 @@ function normalizeMessageBatch<Mode>(input: ClaudeUnifiedTerminalQueuedInput<Mod
     userMessageLocalIds: input.userMessageLocalIds ?? [],
     ...(input.providerAcceptancePending === true ? { providerAcceptancePending: true } : {}),
     ...(input.pendingProviderAction ? { pendingProviderAction: input.pendingProviderAction } : {}),
+    ...(input.pendingRequestedAction ? { pendingRequestedAction: input.pendingRequestedAction } : {}),
   };
-}
-
-function isCompactBoundaryTranscriptMessage(message: RawJSONLines): boolean {
-  return message.type === 'system' && (message as Record<string, unknown>).subtype === 'compact_boundary';
 }
 
 function isAcceptedPromptTranscriptCandidate(value: unknown): boolean {
@@ -853,6 +861,7 @@ function createInputConsumer<Mode>(
 async function persistTerminalHostAttachmentInfoIfAvailable(params: Readonly<{
   sessionId: string | null | undefined;
   handle: TerminalHostHandle;
+  lifecycle: 'owned' | 'borrowed';
   persist: NonNullable<ClaudeUnifiedTerminalSessionOptions['persistTerminalHostAttachmentInfo']>;
 }>): Promise<NonNullable<Metadata['terminal']> | null> {
   const sessionId = typeof params.sessionId === 'string' ? params.sessionId.trim() : '';
@@ -862,7 +871,7 @@ async function persistTerminalHostAttachmentInfoIfAvailable(params: Readonly<{
   const attachmentId = params.handle.attachmentId;
   if (!terminal || !attachmentId) return null;
 
-  await params.persist({ sessionId, attachmentId, handle: params.handle, terminal });
+  await params.persist({ sessionId, attachmentId, handle: params.handle, lifecycle: params.lifecycle, terminal });
   return terminal;
 }
 
@@ -870,6 +879,7 @@ async function persistDefaultTerminalHostAttachmentInfo(params: Readonly<{
   sessionId: string;
   attachmentId: NonNullable<TerminalHostHandle['attachmentId']>;
   handle: TerminalHostHandle;
+  lifecycle: 'owned' | 'borrowed';
   terminal: NonNullable<Metadata['terminal']>;
 }>): Promise<void> {
   await writeTerminalAttachmentInfo({
@@ -885,6 +895,7 @@ function mapClaudeComposerClearRefusalToProtocolStatus(
     case 'generating':
       return 'generating';
     case 'no_interactive_composer':
+    case 'usage_limit_wait':
       return 'not_safe';
     case 'permission_prompt':
     case 'permission_editor':
@@ -1146,8 +1157,15 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
     return spawn;
   };
   const fallbackSessionName = opts.createSessionName?.() ?? createDefaultSessionName();
-  const sessionName = existingTerminalHost?.handle.sessionName ?? fallbackSessionName;
+  const sessionName = hostResolution.adapter.kind === 'herdr'
+    ? (savedTerminalHost?.handle.kind === 'herdr' ? savedTerminalHost.handle.sessionName : 'default')
+    : existingTerminalHost?.handle.sessionName ?? fallbackSessionName;
   let handle: TerminalHostHandle | null = null;
+  let terminalHostLifecycle: 'owned' | 'borrowed' = 'owned';
+  let currentTerminalProcess: Pick<OwnedTerminalProcess, 'whenExited' | 'terminate'> | null = null;
+  // The process owner coalesces termination, retains success, and permits retry
+  // after failure. A second promise cache here would override that contract.
+  const terminateCurrentTerminalProcess = (): Promise<void> => currentTerminalProcess?.terminate() ?? Promise.resolve();
   let controller: ClaudeUnifiedController | null = null;
   let runtimeControlBridge: ClaudeUnifiedRuntimeControlBridge | null = null;
   let dialogChoiceScreenProbe: ClaudeUnifiedDialogChoiceScreenProbe | null = null;
@@ -1172,6 +1190,11 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
   };
   const runtimeAbortController = new AbortController();
   const processSignalAbortController = new AbortController();
+  const terminalSubmissionSignal = AbortSignal.any([
+    runtimeAbortController.signal,
+    processSignalAbortController.signal,
+    ...(opts.signal ? [opts.signal] : []),
+  ]);
   let fatalRuntimeError: unknown = null;
   const expectedProviderResumeSessionId =
     typeof opts.expectedProviderResumeSessionId === 'string'
@@ -1236,6 +1259,7 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
     abortController: processSignalAbortController,
     dispose: async () => {
       await controller?.dispose();
+      await terminateCurrentTerminalProcess();
     },
   });
   try {
@@ -1250,7 +1274,47 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
       && existingTerminalHost.attachmentId !== null
       && expectedExistingTerminalHostAttachmentId.length > 0
       && existingTerminalHost.attachmentId === expectedExistingTerminalHostAttachmentId;
-    if (shouldAdoptExistingTerminalHost && existingTerminalHost && hostResolution.adapter.adoptExistingHost) {
+    const requestedCurrentTerminalHost = opts.currentTerminalHost;
+    const currentTerminalAttachmentId = requestedCurrentTerminalHost?.handle.attachmentId?.trim() ?? '';
+    const currentTerminalMatchesSavedHost = existingTerminalHost === null
+      || (currentTerminalAttachmentId.length > 0
+        && existingTerminalHost.attachmentId === currentTerminalAttachmentId);
+    // Daemon-hosted Herdr binds the terminal before starting this runner. Seeing that
+    // exact saved attachment alongside the inherited current terminal is not recovery
+    // or adoption: Claude can be launched as this runner's child in the already-owned pane.
+    const currentTerminalHost = requestedCurrentTerminalHost && currentTerminalMatchesSavedHost
+      ? requestedCurrentTerminalHost
+      : undefined;
+    if (currentTerminalHost) {
+      if (currentTerminalHost.handle.kind !== hostResolution.adapter.kind) {
+        throw new TerminalHostStartupError({
+          hostKind: currentTerminalHost.handle.kind,
+          reason: 'startup_action_failed',
+          message: 'Current terminal host does not match the resolved terminal adapter',
+          diagnostics: { resolvedHostKind: hostResolution.adapter.kind },
+        });
+      }
+      const launchSpawn = await ensureSpawn();
+      ensureHookSubscription();
+      explicitResumeIdentityRequired = expectedProviderResumeSessionId !== null;
+      await opts.onProviderLaunchStarting?.();
+      handle = currentTerminalHost.handle.attachmentId
+        ? currentTerminalHost.handle
+        : { ...currentTerminalHost.handle, attachmentId: createTerminalAttachmentId() };
+      currentTerminalProcess = await (opts.launchCurrentTerminalProcess ?? launchOwnedTerminalProcess)({
+        spawn: launchSpawn,
+        cwd: opts.path,
+      });
+      terminalHostLifecycle = currentTerminalHost.lifecycle;
+      spawnArtifactsHandedOff = true;
+      void currentTerminalProcess.whenExited.then(
+        () => runtimeAbortController.abort('claude-unified-current-terminal-process-exited'),
+        (error) => {
+          fatalRuntimeError ??= error;
+          runtimeAbortController.abort(error);
+        },
+      );
+    } else if (shouldAdoptExistingTerminalHost && existingTerminalHost && hostResolution.adapter.adoptExistingHost) {
       try {
         const adoptedHandle = await hostResolution.adapter.adoptExistingHost(existingTerminalHost.handle);
         handle = adoptedHandle.attachmentId
@@ -1267,14 +1331,15 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
         ensureHookSubscription();
         explicitResumeIdentityRequired = expectedProviderResumeSessionId !== null;
         await opts.onProviderLaunchStarting?.();
+        spawnArtifactsHandedOff = true;
         handle = await hostResolution.adapter.createOrAttachHost({
-          sessionName: fallbackSessionName,
+          sessionName: hostResolution.adapter.kind === 'herdr' ? sessionName : fallbackSessionName,
+          ...(hostResolution.adapter.kind === 'herdr' ? { label: fallbackSessionName } : {}),
           workingDirectory: opts.path,
           spawnArgv: fallbackSpawn.spawnArgv,
           spawnEnv: fallbackSpawn.spawnEnv,
           isolatedEnv: true,
         });
-        spawnArtifactsHandedOff = true;
       }
     } else {
       if (existingTerminalHost) {
@@ -1289,6 +1354,7 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
         ensureHookSubscription();
         const createOptions = {
           sessionName,
+          ...(hostResolution.adapter.kind === 'herdr' ? { label: fallbackSessionName } : {}),
           workingDirectory: opts.path,
           spawnArgv: launchSpawn.spawnArgv,
           spawnEnv: launchSpawn.spawnEnv,
@@ -1296,28 +1362,87 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
         } as const;
         explicitResumeIdentityRequired = expectedProviderResumeSessionId !== null;
         await opts.onProviderLaunchStarting?.();
-        handle = await hostResolution.adapter.createOrAttachHost(createOptions);
         spawnArtifactsHandedOff = true;
+        handle = await hostResolution.adapter.createOrAttachHost(createOptions);
       }
     }
   } catch (error) {
+    const launchFailure = resolveTerminalHostLaunchFailure(error);
+    if (launchFailure && launchFailure.launchDisposition !== 'unconfirmed') {
+      spawnArtifactsHandedOff = false;
+    }
     removeProcessSignalCleanup?.();
     removeProcessSignalCleanup = null;
     disposeReplayableHookSubscription(hookSubscription);
-    if (spawn && !spawnArtifactsHandedOff) await removeUnreadLaunchSpec(spawn);
+    if (spawn && !spawnArtifactsHandedOff) {
+      try {
+        await removeUnreadLaunchSpec(spawn);
+      } catch (cleanupError) {
+        if (launchFailure) {
+          throw new TerminalHostCreationError([error, cleanupError], { launchDisposition: launchFailure.launchDisposition, cleanupIncomplete: true }, error instanceof Error ? error.message : 'Terminal host startup failed');
+        }
+        throw new AggregateError([error, cleanupError], 'Claude terminal startup failed with incomplete cleanup', { cause: error });
+      }
+    }
     throw error;
   }
   if (processSignalAbortController.signal.aborted) {
     removeProcessSignalCleanup?.();
     disposeReplayableHookSubscription(hookSubscription);
     if (spawn && !spawnArtifactsHandedOff) await removeUnreadLaunchSpec(spawn);
+    await terminateCurrentTerminalProcess();
     return;
   }
   const activeHandle = handle;
   const activeHookSubscription = hookSubscription ?? ensureHookSubscription();
+  let borrowedHostRelease: Promise<void> | null = null;
+  const releaseBorrowedTerminalHost = (
+    reason: 'provider_exit' | 'explicit_user_stop' | 'wrapper_exit',
+  ): Promise<void> => {
+    if (borrowedHostRelease) return borrowedHostRelease;
+    if (terminalHostLifecycle !== 'borrowed' || !activeHandle.attachmentId) return Promise.resolve();
+    const sessionId = typeof opts.happySessionId === 'string' ? opts.happySessionId.trim() : '';
+    if (!sessionId) return Promise.resolve();
+    const attachmentId = activeHandle.attachmentId;
+    const attempt = (async () => {
+      // Wrapper/Stop release requires positive owned-child termination. A provider-exit
+      // release already has physical exit evidence and must not signal a departed PID.
+      if (reason !== 'provider_exit') await terminateCurrentTerminalProcess();
+      const disposition = await executeTerminalHostDisposition({
+        happyHomeDir: configuration.happyHomeDir,
+        sessionId,
+        expectedAttachmentId: attachmentId,
+        intent: { kind: 'release_borrowed_host', reason },
+        ...(opts.readTerminalHostAttachmentInfo ? { readAttachmentInfo: opts.readTerminalHostAttachmentInfo } : {}),
+        ...(opts.removeTerminalHostAttachmentInfo
+          ? {
+              removeAttachmentInfo: async ({ sessionId: claimedSessionId, expectedAttachmentId, expectedTerminal }) => {
+                await opts.removeTerminalHostAttachmentInfo?.({
+                  sessionId: claimedSessionId,
+                  expectedAttachmentId: expectedAttachmentId as NonNullable<TerminalHostHandle['attachmentId']>,
+                  terminal: expectedTerminal,
+                });
+                return true;
+              },
+            }
+          : {}),
+      });
+      if (disposition.status !== 'retired') {
+        const failure = disposition.status === 'parked' ? disposition.reason : disposition.status;
+        throw new Error(`Claude Unified borrowed terminal release did not complete: ${failure}`);
+      }
+    })();
+    const guardedAttempt = attempt.catch((error) => {
+      if (borrowedHostRelease === guardedAttempt) borrowedHostRelease = null;
+      throw error;
+    });
+    borrowedHostRelease = guardedAttempt;
+    return guardedAttempt;
+  };
   const preserveActiveTerminalHost = async (
     reason: 'planned_runner_refresh' | 'wrapper_exit' | 'controller_failure' | 'auth_switch_handoff',
   ): Promise<void> => {
+    if (terminalHostLifecycle === 'borrowed') return;
     const sessionId = typeof opts.happySessionId === 'string' ? opts.happySessionId.trim() : '';
     if (!sessionId || !activeHandle.attachmentId) return;
     await executeTerminalHostDisposition({
@@ -1332,7 +1457,7 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
     });
   };
   let explicitStopHostDisposal: Promise<void> | null = null;
-  const destroyOwnedHostForExplicitStop = (): Promise<void> => {
+  const stopTerminalHostForExplicitStop = (): Promise<void> => {
     if (explicitStopHostDisposal) return explicitStopHostDisposal;
 
     const sessionId = typeof opts.happySessionId === 'string' ? opts.happySessionId.trim() : '';
@@ -1342,13 +1467,18 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
     }
 
     const attempt = (async () => {
+      if (terminalHostLifecycle === 'borrowed') {
+        await releaseBorrowedTerminalHost('explicit_user_stop');
+        return;
+      }
+      await terminateCurrentTerminalProcess();
       const disposition = await executeTerminalHostDisposition({
         happyHomeDir: configuration.happyHomeDir,
         sessionId,
         expectedAttachmentId: attachmentId,
         intent: { kind: 'destroy_owned_host', reason: 'explicit_user_stop' },
         adapter: hostResolution.adapter,
-        readAttachmentInfo: opts.readTerminalHostAttachmentInfo ?? readTerminalAttachmentInfo,
+        ...(opts.readTerminalHostAttachmentInfo ? { readAttachmentInfo: opts.readTerminalHostAttachmentInfo } : {}),
         ...(opts.removeTerminalHostAttachmentInfo
           ? {
               removeAttachmentInfo: async ({ sessionId: claimedSessionId, expectedAttachmentId, expectedTerminal }) => {
@@ -1409,9 +1539,17 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
     terminalAttachment = await persistTerminalHostAttachmentInfoIfAvailable({
       sessionId: opts.happySessionId,
       handle: activeHandle,
+      lifecycle: terminalHostLifecycle,
       persist: opts.persistTerminalHostAttachmentInfo ?? persistDefaultTerminalHostAttachmentInfo,
     });
     if (terminalAttachment) {
+      await opts.onTerminalHostReady?.({
+        handle: activeHandle,
+        lifecycle: terminalHostLifecycle,
+        terminal: terminalAttachment,
+        stopTerminalHostForExplicitStop,
+      });
+      if (opts.signal?.aborted || processSignalAbortController.signal.aborted) return;
       await opts.publishTerminalHostMetadata?.(terminalAttachment);
     } else {
       logger.debug('[unified]: terminal host metadata publication skipped; attachment identity unavailable', {
@@ -1421,7 +1559,7 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
         attachmentId: activeHandle.attachmentId,
       });
     }
-    if (processSignalAbortController.signal.aborted) {
+    if (opts.signal?.aborted || processSignalAbortController.signal.aborted) {
       return;
     }
 
@@ -1706,6 +1844,9 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
     const hostInputInjection: TerminalInputInjectionV1 = {
       hostKind: hostResolution.adapter.kind,
       injectUserPrompt: async (input, writeBoundary) => {
+        if (terminalSubmissionSignal.aborted) {
+          return { status: 'failed', reason: 'no_target', phase: 'before_write', duplicateRisk: 'none', recoverable: false };
+        }
         // Lane X: every text we attempt to write is recorded so a later leftover composer draft
         // can be exact-match classified as OUR OWN residue (vs an untouchable genuine user draft).
         ownComposerTextLog.record(input.text);
@@ -1721,9 +1862,10 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
           : undefined;
         let result: TerminalInputInjectionResult;
         try {
+          const sessionInput = { ...input, signal: terminalSubmissionSignal };
           result = adapterWriteBoundary
-            ? await hostResolution.adapter.injectUserPrompt(activeHandle, input, adapterWriteBoundary)
-            : await hostResolution.adapter.injectUserPrompt(activeHandle, input);
+            ? await hostResolution.adapter.injectUserPrompt(activeHandle, sessionInput, adapterWriteBoundary)
+            : await hostResolution.adapter.injectUserPrompt(activeHandle, sessionInput);
         } catch {
           result = {
             status: 'failed',
@@ -1771,7 +1913,14 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
     removeProcessSignalCleanup = bindProcessSignalCleanup({
       processSignals: opts.processSignals ?? process,
       abortController: processSignalAbortController,
-      dispose: () => controller?.dispose() ?? preserveActiveTerminalHost('wrapper_exit'),
+      dispose: async () => {
+        if (controller) {
+          await controller.dispose();
+        } else {
+          await preserveActiveTerminalHost('wrapper_exit');
+        }
+        await terminateCurrentTerminalProcess();
+      },
     });
     opts.setTurnInterrupt?.(() => hostResolution.adapter.interruptTurn(activeHandle));
     turnInterruptRegistered = true;
@@ -1977,6 +2126,9 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
             turnStateAtInjection: acceptance.turnStateAtInjection,
           });
         },
+        onPromptDeliveryRetired: (batch) => {
+          acceptedPromptTranscriptDiscovery.forgetRetiredPromptByBatch(batch);
+        },
         onPromptAccepted: (batch, acceptance) => {
           acceptedPromptTranscriptDiscovery.consumeAcceptedPromptByBatch({
             message: batch.message,
@@ -1993,6 +2145,19 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
               ? { appliedModelId: batch.mode.model.trim() }
               : {}),
           });
+          // Exact provider acceptance settles Pending custody even when the hook bridge is
+          // unusable. Fail the runtime only after settlement, including evidence received
+          // while the terminal write is still in flight; never invite replay of accepted input.
+          try {
+            assertClaudeUnifiedHookActivationBeforeTranscriptFallback({
+              hookPluginDir: opts.hookPluginDir,
+              hookSubscriptionConfigured: Boolean(opts.subscribeClaudeSessionHooks),
+              trustedHookActivationObserved,
+            });
+          } catch (error) {
+            fatalRuntimeError ??= error;
+            runtimeAbortController.abort(error);
+          }
         },
         // F-1: a batch still inside the arbiter when it is disposed (failed_terminal park,
         // host-death unwind, graceful teardown) must return to the session queue, mirroring
@@ -2011,6 +2176,7 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
               userMessageLocalIds: batch.userMessageLocalIds ?? [],
               ...(batch.providerAcceptancePending === true ? { providerAcceptancePending: true } : {}),
               ...(batch.pendingProviderAction ? { pendingProviderAction: batch.pendingProviderAction } : {}),
+              ...(batch.pendingRequestedAction ? { pendingRequestedAction: batch.pendingRequestedAction } : {}),
             });
           }
         },
@@ -2046,12 +2212,11 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
         unregisterPendingInputInterruptAndRunRuntimeControl =
           typeof unregister === 'function' ? unregister : null;
       }
-      // Claude `/goal` injection seam (P1-E3/P1-E4): a goal command becomes a literal user turn
-      // injected through the same arbiter as any prompt; the emitted `goal_status` attachment is
-      // the source of truth, so nothing here writes goal state into metadata. `currentInjectionMode`
-      // is read at injection time so the goal turn carries the live permission/plan mode.
+      // Claude `/goal` injection seam (P1-E3/P1-E4): a goal command is a terminal-local control
+      // injected through the same arbiter as prompts; the emitted `goal_status` attachment is
+      // the source of truth, so nothing here writes goal state into metadata.
       const injectGoalCommand = async (message: string): Promise<ClaudeGoalCommandDelivery> => {
-        await arbiter.enqueueUiMessage({ message, mode: currentInjectionMode, origin: { kind: 'rpc' } });
+        await arbiter.enqueueUiMessage({ message, origin: { kind: 'goal_control' } });
         await arbiter.drainWhenSafe();
         // The strongest delivery state the arbiter can PROVE: the command was drained from the queue
         // and written to the terminal. It cannot prove provider acceptance, so we never claim more.
@@ -2147,17 +2312,6 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
           return false;
         }
         acceptedPromptTranscriptDiscovery.reserveAcceptedPromptTranscriptEcho(match);
-        try {
-          assertClaudeUnifiedHookActivationBeforeTranscriptFallback({
-            hookPluginDir: opts.hookPluginDir,
-            hookSubscriptionConfigured: Boolean(opts.subscribeClaudeSessionHooks),
-            trustedHookActivationObserved,
-          });
-        } catch (error) {
-          fatalRuntimeError ??= error;
-          runtimeAbortController.abort(error);
-          return false;
-        }
         const matchKey = buildAcceptedTranscriptMatchKey(match);
         if (pendingAcceptedTranscriptMatchKeys.has(matchKey)) return true;
         pendingAcceptedTranscriptMatchKeys.add(matchKey);
@@ -2180,12 +2334,13 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
         return true;
       };
       const confirmCompactBoundaryPromptAcceptedFromTranscript = (message: RawJSONLines): boolean => {
-        if (!isCompactBoundaryTranscriptMessage(message)) return false;
+        if (!isClaudeMainChainCompactBoundary(message)) return false;
         void arbiter.confirmPromptAcceptedByProviderIf((batch) => isCompactSlashCommandPrompt(batch.message)).catch(() => undefined);
         return true;
       };
       const pendingQueuePump = createClaudeUnifiedPendingQueuePump<Mode>({
         inputConsumer,
+        pendingDeliveryState: opts.pendingDeliveryState,
         arbiter,
         // A batch pulled during the death/dispose unwind must be returned to the
         // owner's queue, never silently dropped into a dead session.
@@ -2197,6 +2352,7 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
             userMessageLocalIds: batch.userMessageLocalIds ?? [],
             ...(batch.providerAcceptancePending === true ? { providerAcceptancePending: true } : {}),
             ...(batch.pendingProviderAction ? { pendingProviderAction: batch.pendingProviderAction } : {}),
+            ...(batch.pendingRequestedAction ? { pendingRequestedAction: batch.pendingRequestedAction } : {}),
           });
         },
         onProviderAcceptancePendingPrompt: (batch) => {
@@ -2391,8 +2547,9 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
             loadCommittedClaudeJsonlMessageBaseline: opts.loadCommittedClaudeJsonlMessageBaseline,
             transcriptMissingWarningMs: configuration.claudeTranscriptMissingWarningMs,
             subscribeClaudeSessionHooks: activeHookSubscription.subscribe,
+            // Discover identity without settling Pending ahead of the ordered importer.
             classifyDiscoveredSession: ({ messages }) => (
-              confirmPromptAcceptedFromTranscript(messages) ? 'main' : null
+              acceptedPromptTranscriptDiscovery.findMatchingTranscript(messages) ? 'main' : null
             ),
           })
         : undefined;
@@ -2411,8 +2568,10 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
           logger.debug('[unified]: failed to dispose Claude unified controller dependency (non-fatal)', error);
         },
         initialLivenessTimeoutMs:
-          opts.initialHostLivenessTimeoutMs ??
-          Math.min(configuration.claudeUnifiedTerminalStartupReadinessTimeoutMs, 1_000),
+          resolveClaudeUnifiedInitialHostLivenessTimeoutMs(
+            opts.initialHostLivenessTimeoutMs,
+            configuration.claudeUnifiedTerminalStartupReadinessTimeoutMs,
+          ),
         initialLivenessPollMs:
           opts.initialHostLivenessPollMs ??
           Math.min(configuration.claudeUnifiedTerminalStartupReadinessPollMs, 50),
@@ -2507,11 +2666,6 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
           logger.debug('[unified]: failed to clear recovered terminal host health marker', error);
         });
       }
-      await opts.onTerminalHostReady?.({
-        handle: activeHandle,
-        terminal: terminalAttachment,
-        destroyOwnedHostForExplicitStop,
-      });
     }
     const waitSignals = [runtimeAbortController.signal, processSignalAbortController.signal];
     if (opts.signal) {
@@ -2522,6 +2676,7 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
       throw fatalRuntimeError;
     }
   } finally {
+    runtimeAbortController.abort('claude-unified-runtime-disposed');
     arbiterForResumeSummaryCompaction = null;
     if (turnInterruptRegistered) {
       opts.setTurnInterrupt?.(null);
@@ -2550,6 +2705,16 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
       await controller.dispose();
     } else {
       await preserveActiveTerminalHost('wrapper_exit');
+    }
+    if (currentTerminalProcess && terminalHostLifecycle !== 'borrowed') {
+      await terminateCurrentTerminalProcess().catch((error) => {
+        logger.infoFile('[unified]: failed to terminate current terminal provider process (non-fatal)', error);
+      });
+    }
+    if (terminalHostLifecycle === 'borrowed') {
+      await releaseBorrowedTerminalHost('wrapper_exit').catch((error) => {
+        logger.infoFile('[unified]: failed to release borrowed terminal attachment (non-fatal)', error);
+      });
     }
     activeHookSubscription.dispose();
   }

@@ -48,11 +48,21 @@ vi.mock('./apply', async () => {
 
 vi.mock('./resolveDaemonServiceInstallRuntimeTarget', () => ({
   resolveDaemonServiceInstallRuntimeTarget: resolveDaemonServiceInstallRuntimeTargetMock,
+  // No managed shim installed in these fixtures: no runtime replacement is ever proposed.
+  resolveManagedDaemonServiceShimPath: async () => null,
 }));
 
-vi.mock('./discoverInstalledDaemonServiceEntries', () => ({
-  discoverInstalledDaemonServiceEntries: discoverInstalledDaemonServiceEntriesMock,
-}));
+vi.mock('./discoverInstalledDaemonServiceEntries', async () => {
+  // Spread the real module: only discovery is faked here, and the installer also
+  // reads the installed definition's autostart declaration from this owner.
+  const actual = await vi.importActual<typeof import('./discoverInstalledDaemonServiceEntries')>(
+    './discoverInstalledDaemonServiceEntries',
+  );
+  return {
+    ...actual,
+    discoverInstalledDaemonServiceEntries: discoverInstalledDaemonServiceEntriesMock,
+  };
+});
 
 describe('installDaemonService conflict handling', () => {
   afterEach(() => {
@@ -692,6 +702,45 @@ describe('installDaemonService conflict handling', () => {
       targetMode: 'default-following',
       instanceId: 'default',
       strategy: 'replace-ring',
+      runCommands: false,
+    });
+
+    expect(planDaemonServiceUninstallMock).not.toHaveBeenCalled();
+    expect(applyDaemonServiceInstallPlanMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('installs a pinned service for one relay beside the pinned service of another relay on the same ring', async () => {
+    discoverInstalledDaemonServiceEntriesMock.mockResolvedValueOnce([
+      {
+        serverId: 'personal',
+        activeServerId: 'personal',
+        name: 'Personal',
+        relayUrl: 'https://personal.example.test',
+        installed: true,
+        path: '/home/tester/.config/systemd/user/happier-daemon.personal.service',
+        platform: 'linux',
+        mode: 'user',
+        happierHomeDir: '/home/tester/.happier',
+        releaseChannel: 'stable',
+        label: 'happier-daemon.personal',
+        targetMode: 'pinned',
+      },
+    ]);
+
+    const { installDaemonService } = await import('./installer');
+
+    await installDaemonService({
+      platform: 'linux',
+      uid: 123,
+      userHomeDir: '/home/tester',
+      happierHomeDir: '/home/tester/.happier',
+      channel: 'stable',
+      targetMode: 'pinned',
+      instanceId: 'company',
+      activeServerId: 'company',
+      serverUrl: 'https://company.example.test',
+      webappUrl: 'https://company.example.test',
+      publicServerUrl: 'https://company.example.test',
       runCommands: false,
     });
 

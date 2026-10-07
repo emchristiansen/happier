@@ -2,7 +2,7 @@ import type { AgentType } from '@/sync/domains/models/modelOptions';
 import type { Metadata } from '@/sync/domains/state/storageTypes';
 import { DEFAULT_AGENT_ID, getAgentCore, resolveAgentIdFromFlavor } from '@/agents/catalog/catalog';
 import { hasDynamicModelListForSession, getSelectableModelIdsForSession, supportsFreeformModelSelectionForSession } from '@/sync/domains/models/modelOptions';
-import { readSessionModelsState, readSessionModesState } from '@/sync/domains/sessionControl/readSessionControlMetadata';
+import { matchesSessionControlProvider, readSessionModelsState, readSessionModesState } from '@/sync/domains/sessionControl/readSessionControlMetadata';
 import { readSessionAppliedModelMetadataStateV1 } from '@happier-dev/agents';
 
 export type ModelApplyScope = 'live' | 'next_prompt' | 'spawn_only';
@@ -29,7 +29,7 @@ export function describeEffectiveModelMode(params: {
     const selectedModelId = typeof params.selectedModelId === 'string' ? params.selectedModelId.trim() : '';
     const hasExplicitSelection = selectedModelId.length > 0;
     const appliedModelState = readSessionAppliedModelMetadataStateV1(params.metadata);
-    const appliedModelId = appliedModelState?.provider === agentId
+    const appliedModelId = appliedModelState && matchesSessionControlProvider({ agentId, metadata: params.metadata, provider: appliedModelState.provider })
         ? appliedModelState.modelId.trim()
         : '';
     const resolvedSelectedModelId = hasExplicitSelection ? selectedModelId : core.model.defaultMode;

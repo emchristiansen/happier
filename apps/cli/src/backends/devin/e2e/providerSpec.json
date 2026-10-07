@@ -1,0 +1,21 @@
+{
+  "v": 1,
+  "id": "devin",
+  "enableEnvVar": "HAPPIER_E2E_PROVIDER_DEVIN",
+  "protocol": "acp",
+  "traceProvider": "devin",
+  "requiredBinaries": [
+    {
+      "bin": "devin",
+      "envOverride": "HAPPIER_E2E_PROVIDER_DEVIN_BIN",
+      "requireExists": true
+    }
+  ],
+  "auth": { "mode": "host" },
+  "cli": {
+    "subcommand": "devin",
+    "extraArgs": ["--started-by", "terminal"],
+    "env": { "HEADLESS": "1", "HAPPIER_VARIANT": "dev" },
+    "envFrom": { "HAPPIER_DEVIN_PATH": "HAPPIER_E2E_PROVIDER_DEVIN_BIN" }
+  }
+}

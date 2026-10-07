@@ -1,6 +1,7 @@
 import type { NewSessionDraftProjection } from '@/sync/ops/sessionDrafts/sessionDraftRepository';
 import { DEFAULT_AGENT_ID, resolveAgentIdFromFlavor } from '@/agents/catalog/catalog';
 import { t, type TranslationKey } from '@/text';
+import { resolveSessionDraftStatusKey } from './sessionDraftStatusPresentation';
 
 export type NewSessionDraftRowPresentation = Readonly<{
     title: string;
@@ -49,8 +50,9 @@ function resolveStatusKey(
     draft: NewSessionDraftProjection,
     names: NewSessionDraftSummaryNames,
 ): TranslationKey | null {
-    if (draft.status === 'conflict') return 'sessionDrafts.status.conflict';
-    if (draft.status === 'offline') return 'sessionDrafts.status.offline';
+    if (draft.status === 'conflict' || draft.status === 'offline' || draft.status === 'error') {
+        return resolveSessionDraftStatusKey(draft.status);
+    }
     const machineId = readNonblankString(readAuthoringValue(draft, 'machineId'));
     if (machineId && names.unavailableMachineIds?.has(machineId)) {
         return 'sessionDrafts.status.machineUnavailable';
@@ -58,7 +60,7 @@ function resolveStatusKey(
     if (names.attachmentNeedsAttentionDraftIds?.has(draft.draftId)) {
         return 'sessionDrafts.status.attachmentNeedsAttention';
     }
-    if (draft.status === 'pending') return 'sessionDrafts.status.syncing';
+    if (draft.status === 'pending') return resolveSessionDraftStatusKey(draft.status);
     return null;
 }
 

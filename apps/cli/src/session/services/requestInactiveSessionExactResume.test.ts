@@ -66,6 +66,51 @@ describe('requestInactiveSessionResume', () => {
     expect(callMachineRpc.mock.calls[0]?.[0]?.request).not.toHaveProperty('spawnNonce');
   });
 
+  it('uses the session-webhook lifecycle budget for the effectful spawn acknowledgement', async () => {
+    callMachineRpc.mockResolvedValue({ type: 'success', sessionId: 'session-1' });
+
+    await expect(requestInactiveSessionResume({
+      credentials,
+      sessionId: 'session-1',
+      localId: 'local-1',
+      rawSession: rawSession(),
+      metadata: {
+        agentId: 'claude',
+        machineId: 'machine-session',
+        path: '/repo',
+        claudeSessionId: 'provider-session-1',
+      },
+    })).resolves.toEqual({ ok: true });
+
+    expect(callMachineRpc).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'spawn-happy-session',
+      timeoutMs: 5 * 60_000,
+    }));
+  });
+
+  it('preserves an explicit positive spawn acknowledgement budget', async () => {
+    callMachineRpc.mockResolvedValue({ type: 'success', sessionId: 'session-1' });
+
+    await expect(requestInactiveSessionResume({
+      credentials,
+      sessionId: 'session-1',
+      localId: 'local-1',
+      rawSession: rawSession(),
+      metadata: {
+        agentId: 'claude',
+        machineId: 'machine-session',
+        path: '/repo',
+        claudeSessionId: 'provider-session-1',
+      },
+      timeoutMs: 12_345,
+    })).resolves.toEqual({ ok: true });
+
+    expect(callMachineRpc).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'spawn-happy-session',
+      timeoutMs: 12_345,
+    }));
+  });
+
   it('rejects an archived session before contacting its recorded machine', async () => {
     await expect(requestInactiveSessionResume({
       credentials,

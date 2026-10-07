@@ -92,6 +92,7 @@ describe('readAfterPiTranscript cursor contract', () => {
       });
       expect(capped.items).toHaveLength(1);
       expect(capped.truncated).toBe(true);
+      expect(capped).toMatchObject({ truncationReason: 'page_limit' });
       expectForwardCursor(capped.nextCursor, 2, 'bbbb0001');
     });
   });
@@ -134,6 +135,7 @@ describe('readAfterPiTranscript cursor contract', () => {
     });
     expect(afterBranchSwitch.items).toEqual([]);
     expect(afterBranchSwitch.truncated).toBe(true);
+    expect(afterBranchSwitch).toMatchObject({ truncationReason: 'source_discontinuity' });
     expect(afterBranchSwitch.nextCursor).not.toBeNull();
   });
 });

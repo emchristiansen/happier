@@ -49,11 +49,19 @@ export const STATUS_TRANSITION_TIMELINE = {
     totalMs: ENTER_DELAY_MS + SETTLE_MS,
 } as const;
 
-export type StatusTransitionProps = Readonly<{
+type StatusTransitionBox =
+    /** Side of a fixed square box, in px — the icon/spinner case. */
+    | Readonly<{ size: number; sizing?: never }>
+    /**
+     * A rectangular box laid out by this node, rendered invisibly and hidden from assistive tech:
+     * the widest thing the slot can show (e.g. a button label), so a button ↔ spinner ↔ check swap
+     * never changes the slot's width.
+     */
+    | Readonly<{ sizing: React.ReactNode; size?: never }>;
+
+export type StatusTransitionProps = StatusTransitionBox & Readonly<{
     /** Changing this is what starts a transition. Same key in, no motion. */
     transitionKey: string;
-    /** Side of the fixed box, in px. Both layers stack inside it, so nothing around it can move. */
-    size: number;
     /**
      * Scale the incoming layer starts at.
      *
@@ -75,6 +83,9 @@ const stylesheet = StyleSheet.create({
     box: {
         alignItems: 'center',
         justifyContent: 'center',
+    },
+    sizingLayer: {
+        opacity: 0,
     },
     layer: {
         // Written out rather than spread from `StyleSheet.absoluteFillObject` because the stacking
@@ -181,8 +192,20 @@ export function StatusTransition(props: StatusTransitionProps): React.ReactEleme
         <View
             testID={props.testID}
             pointerEvents="box-none"
-            style={[stylesheet.box, { width: props.size, height: props.size }]}
+            style={[stylesheet.box, props.size != null ? { width: props.size, height: props.size } : null]}
         >
+            {props.sizing != null ? (
+                <View
+                    pointerEvents="none"
+                    aria-hidden={true}
+                    accessibilityElementsHidden={true}
+                    importantForAccessibility="no-hide-descendants"
+                    style={stylesheet.sizingLayer}
+                    testID={props.testID != null ? `${props.testID}-sizing` : undefined}
+                >
+                    {props.sizing}
+                </View>
+            ) : null}
             {outgoing != null ? (
                 <Animated.View
                     key={outgoing.key}

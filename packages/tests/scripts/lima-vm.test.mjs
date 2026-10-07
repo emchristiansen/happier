@@ -6,6 +6,10 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
+import { createLimaTestEnv } from '../../../apps/stack/scripts/testkit/core/lima_guest_harness.mjs';
+
+const testEnv = createLimaTestEnv();
+
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 async function fileExists(path) {
@@ -107,10 +111,10 @@ async function runLimaVmHelperTest(hostOs) {
   const scriptPath = join(__dirname, 'lima-vm.sh');
 
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: join(homeDir, '.lima'),
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
   };
 
   const res = spawnSync('bash', [scriptPath, 'happy-test'], {

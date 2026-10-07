@@ -52,12 +52,15 @@ vi.mock('@/sync/ops/machineDirectSessions', () => ({
 }));
 
 const appStateAddListener = vi.hoisted(() => vi.fn(() => ({ remove: vi.fn() })));
+const platformOS = vi.hoisted(() => ({ current: 'web' as 'web' | 'ios' }));
 vi.mock('react-native', async () => {
     const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
     return createReactNativeWebMock(
         {
                                             Platform: {
-                                                OS: 'web',
+                                                get OS() {
+                                                    return platformOS.current;
+                                                },
                                             },
                                             AppState: {
                                                 currentState: 'active',
@@ -231,10 +234,34 @@ function expectApiSocketMessageRequest(params: {
   expect(searchParams.has('sidechainId')).toBe(false);
 }
 
+function expectApiSocketInitialMessageRequest(params: {
+  sessionId: string;
+  limit: string;
+}): void {
+  const requestPath = `/v1/sessions/${encodeURIComponent(params.sessionId)}/messages`;
+  const calls = apiSocketRequestMock.mock.calls as Array<[string, RequestInit | undefined]>;
+  const call = calls.find(([path]) => String(path).startsWith(`${requestPath}?`));
+  expect(call).toBeDefined();
+  if (!call) {
+    throw new Error(`Expected apiSocket request for ${requestPath}`);
+  }
+  const [path, init] = call;
+  expect(init).toEqual({ method: 'GET' });
+
+  const [, query = ''] = String(path).split('?');
+  const searchParams = new URLSearchParams(query);
+  expect(searchParams.get('scope')).toBe('main');
+  expect(searchParams.get('limit')).toBe(params.limit);
+  expect(searchParams.has('afterSeq')).toBe(false);
+  expect(searchParams.has('beforeSeq')).toBe(false);
+  expect(searchParams.has('sidechainId')).toBe(false);
+}
+
 describe('sync socket offline tracking', () => {
   const initialStorageState = storage.getState();
 
   beforeEach(() => {
+    platformOS.current = 'web';
     storage.setState(initialStorageState, true);
     clearActiveViewingSessionsForServerScopeReset();
     clearMountedSessionRealtimeScmConsumerScopes();
@@ -247,7 +274,7 @@ describe('sync socket offline tracking', () => {
     (sync as any).webSyncClientIdentity = null;
     (sync as any).syncTuning = loadSyncTuning();
     (sync as any).changesCursor = null;
-    (sync as any).directSessionTailCursorBySessionId.clear();
+    (sync as any).directSessionTailStateBySessionId.clear();
     (sync as any).directSessionOlderCursorBySessionId.clear();
     (sync as any).directSessionHasMoreOlderBySessionId.clear();
     (sync as any).safeCursorLagState = null;
@@ -366,6 +393,48 @@ describe('sync socket offline tracking', () => {
     await (sync as any).fetchMessages('s_tuned_page_size');
 
     expectApiSocketMessageRequest({ sessionId: 's_tuned_page_size', afterSeq: '20', limit: '42' });
+  }, 60_000);
+
+  it('uses the native transcript page size for the first viewport without shrinking catch-up pages', async () => {
+    platformOS.current = 'ios';
+    (sync as any).syncTuning = {
+      ...loadSyncTuning(),
+      sessionMessagesPageSize: 42,
+      transcriptNativeOlderMessagesPageSize: 37,
+    };
+
+    storage.setState((state) => ({
+      ...state,
+      sessions: {
+        ...state.sessions,
+        s_native_initial_page: {
+          id: 's_native_initial_page',
+          seq: 20,
+          encryptionMode: 'plain',
+          metadata: {},
+          agentState: null,
+        } as any,
+        s_native_catchup_page: {
+          id: 's_native_catchup_page',
+          seq: 21,
+          encryptionMode: 'plain',
+          metadata: {},
+          agentState: null,
+        } as any,
+      },
+    }), true);
+
+    seedMaterializedMessage('s_native_catchup_page', 20);
+    storage.getState().applyMessagesLoaded('s_native_catchup_page');
+    (sync as any).sessionMaterializedMaxSeqById = { s_native_catchup_page: 20 };
+    (sync as any).isForeground = true;
+    markSessionVisible('s_native_catchup_page');
+
+    await (sync as any).fetchMessages('s_native_initial_page');
+    await (sync as any).fetchMessages('s_native_catchup_page');
+
+    expectApiSocketInitialMessageRequest({ sessionId: 's_native_initial_page', limit: '37' });
+    expectApiSocketMessageRequest({ sessionId: 's_native_catchup_page', afterSeq: '20', limit: '42' });
   }, 60_000);
 
   it('uses deferred durable transcript seq for visible catch-up when the stored session seq is stale', async () => {
@@ -1580,7 +1649,7 @@ describe('sync socket offline tracking', () => {
     expect((sync as any).changesCursor).toBeNull();
   }, 60_000);
 
-  it('catches up loaded direct sessions on resume even when the account changes feed is empty', async () => {
+  it('catches up visible loaded direct sessions on resume even when the account changes feed is empty', async () => {
     upsertAndActivateServer({ serverUrl: 'http://localhost:53288', scope: 'tab' });
     fetchChangesMock.mockResolvedValue({
       status: 'ok' as const,
@@ -1642,7 +1711,7 @@ describe('sync socket offline tracking', () => {
       },
     }), true);
     saveProfile({ ...profileDefaults, id: 'test-account' });
-    storage.getState().applyMessagesLoaded('s1');
+    markSessionVisible('s1');
     (sync as any).credentials = { token: 'hdr.eyJzdWIiOiJ0ZXN0In0.sig', secret: 'secret' };
     (sync as any).serverID = 'test';
     (sync as any).encryption = {
@@ -1654,12 +1723,28 @@ describe('sync socket offline tracking', () => {
     (sync as any).isForeground = true;
     (sync as any).lastSocketDisconnectedAtMs = Date.now() - 1000;
 
+    // A loaded direct transcript includes its accepted source and cursor. Seed it
+    // through the real reader so resume exercises incremental catch-up, not an initial snapshot.
+    machineDirectSessionTranscriptPageMock.mockResolvedValueOnce({
+      ok: true,
+      items: [{
+        id: 'direct-msg-initial',
+        createdAtMs: 0,
+        raw: { role: 'user', content: { type: 'text', text: 'already loaded direct' } },
+      }],
+      nextCursor: null,
+      tailCursor: 'tail-0',
+      hasMore: false,
+    });
+    await sync.refreshSessionMessages('s1');
+    expect(storage.getState().sessionMessages.s1?.isLoaded).toBe(true);
+
     await (sync as any).resumeSync('socket-reconnect');
 
     expect(machineDirectSessionTranscriptReadAfterMock).toHaveBeenCalledWith(expect.objectContaining({
       machineId: 'm1',
       remoteSessionId: 'remote-1',
-      cursor: 'tail',
+      cursor: 'tail-0',
     }), expect.anything());
     const sessionMessages = storage.getState().sessionMessages.s1;
     const texts = (sessionMessages?.messageIdsOldestFirst ?? [])
@@ -1667,7 +1752,7 @@ describe('sync socket offline tracking', () => {
       .filter((message): message is NonNullable<typeof message> => Boolean(message))
       .filter((message) => message.kind === 'user-text')
       .map((message) => message.text);
-    expect(texts).toEqual(['caught up direct']);
+    expect(texts).toEqual(['already loaded direct', 'caught up direct']);
     const directReadServerId = String(machineDirectSessionTranscriptReadAfterMock.mock.calls[0]?.[1]?.serverId ?? '').trim();
     expect(loadDirectSessionTailCursor('s1', { serverScope: directReadServerId, accountId: 'test' })).toBe('tail-1');
   }, 60_000);

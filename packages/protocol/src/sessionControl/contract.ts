@@ -223,6 +223,7 @@ export const SessionSummarySchema = z.object({
   runtimeActivityObservedAt: z.number().int().nonnegative().nullable().optional(),
   runtimeActivityRevision: z.number().int().nonnegative().safe().optional(),
   pendingActivationAuthorization: PendingActivationAuthorizationV1Schema.optional(),
+  rollbackEligibleTurnStarts: z.array(z.number().int().nonnegative()).optional(),
 }).passthrough().superRefine(refineRuntimeActivityProjectionFields);
 export type SessionSummary = z.infer<typeof SessionSummarySchema>;
 
@@ -350,6 +351,7 @@ export const V2SessionRecordSchema = z
     runtimeActivityObservedAt: z.number().int().nonnegative().nullable().optional(),
     runtimeActivityRevision: z.number().int().nonnegative().safe().optional(),
     pendingActivationAuthorization: PendingActivationAuthorizationV1Schema.optional(),
+    rollbackEligibleTurnStarts: z.array(z.number().int().nonnegative()).optional(),
   })
   .passthrough()
   .superRefine(refineRuntimeActivityProjectionFields);

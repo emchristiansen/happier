@@ -60,7 +60,7 @@ if (appLocalConfigModule && typeof appLocalConfigModule === 'object') {
 
 const DEFAULTS = {
     ...EXPO_PROJECT_CONFIG,
-    linkHost: "app.happier.dev",
+    linkHost: "cloud.happier.dev",
 };
 
 // Allow opt-in overrides for local dev tooling without changing upstream defaults.
@@ -225,10 +225,13 @@ if (!process.env.EXPO_PUBLIC_HAPPIER_FEATURE_POLICY_ENV && resolvedFeaturePolicy
 }
 
 const linkHost = (process.env.EXPO_APP_LINK_HOST || DEFAULTS.linkHost).trim();
+const linkHosts = linkHost === DEFAULTS.linkHost
+    ? [linkHost, 'app.happier.dev']
+    : [linkHost];
 const iosAssociatedDomainsRaw = (process.env.EXPO_IOS_ASSOCIATED_DOMAINS || '').trim();
 const iosAssociatedDomains = iosAssociatedDomainsRaw
     ? iosAssociatedDomainsRaw.split(/[\s,]+/).map(v => v.trim()).filter(Boolean)
-    : [`applinks:${linkHost}`];
+    : linkHosts.map(host => `applinks:${host}`);
 
 // NOTE:
 // The URL scheme is used for deep linking *and* by the Expo development client launcher flow.
@@ -344,13 +347,11 @@ const baseExpoConfig = {
                 {
                     "action": "VIEW",
                     "autoVerify": true,
-                    "data": [
-                        {
-                            "scheme": "https",
-                            "host": linkHost,
-                            "pathPrefix": "/"
-                        }
-                    ],
+                    "data": linkHosts.map(host => ({
+                        "scheme": "https",
+                        "host": host,
+                        "pathPrefix": "/"
+                    })),
                     "category": ["BROWSABLE", "DEFAULT"]
                 }
             ] : []

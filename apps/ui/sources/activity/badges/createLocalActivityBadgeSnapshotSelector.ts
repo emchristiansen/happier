@@ -21,6 +21,7 @@ export type ActivityBadgeSessionOptions = Readonly<{
     showUnread: boolean;
     showPendingPermissionRequests: boolean;
     showPendingUserActionRequests: boolean;
+    showQueuedUserInput: boolean;
 }>;
 
 export type LocalActivityBadgeSnapshot = Readonly<{
@@ -80,6 +81,7 @@ function buildParamsSignature(params: LocalActivityBadgeSnapshotSelectorParams):
         params.sessionOptions.showUnread === false ? 0 : 1,
         params.sessionOptions.showPendingPermissionRequests === false ? 0 : 1,
         params.sessionOptions.showPendingUserActionRequests === false ? 0 : 1,
+        params.sessionOptions.showQueuedUserInput === false ? 0 : 1,
     ].join('\u001f');
 }
 
@@ -104,6 +106,7 @@ function buildSessionActivitySignature(session: Session): string {
         readNumber(readState?.sessionSeq) ?? '',
         readNumber(readState?.pendingActivityAt) ?? '',
         metadata?.systemSessionV1?.hidden === true ? 1 : 0,
+        readNumber(session.pendingCount) ?? '',
         readNumber(session.pendingBlockedCount) ?? '',
         readNumber(session.pendingPermissionRequestCount) ?? '',
         readNumber(session.pendingUserActionRequestCount) ?? '',
@@ -135,6 +138,7 @@ function buildRenderableActivitySignature(renderable: SessionListRenderableSessi
         renderable.hasPendingPermissionRequests === true ? 1 : 0,
         renderable.hasPendingUserActionRequests === true ? 1 : 0,
         readNumber(renderable.pendingRequestObservedAt) ?? '',
+        readNumber(renderable.pendingCount) ?? '',
         readNumber(renderable.pendingBlockedCount) ?? '',
     ].join('\u001f');
 }

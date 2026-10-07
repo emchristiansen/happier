@@ -1,5 +1,7 @@
 import {
   type SessionAgentTransitionSelectionV1,
+  type SessionContinuationInspectionBatchRequestV1,
+  type SessionContinuationInspectionBatchResultV1,
   type SessionContinuationInspectionRequestV1,
   type SessionContinuationInspectionV1,
 } from '@happier-dev/protocol';
@@ -126,9 +128,28 @@ export async function inspectSessionContinuation(params: Readonly<{
   credentials: Credentials;
   request: SessionContinuationInspectionRequestV1;
 }>): Promise<SessionContinuationInspectionV1> {
+  const result = await inspectSessionContinuations({
+    credentials: params.credentials,
+    request: {
+      v: 1,
+      sourceSessionId: params.request.sourceSessionId,
+      selections: [params.request.selection],
+    },
+  });
+  return result.inspections[0] ?? { type: 'unavailable', reason: 'unsupported_session' };
+}
+
+type SessionContinuationSource =
+  | Readonly<{ type: 'available'; sourceAgentId: string }>
+  | Readonly<{ type: 'unavailable'; reason: 'unsupported_session' }>;
+
+async function loadSessionContinuationSource(params: Readonly<{
+  credentials: Credentials;
+  sourceSessionId: string;
+}>): Promise<SessionContinuationSource> {
   const rawSession = await fetchSessionByIdCompat({
     token: params.credentials.token,
-    sessionId: params.request.sourceSessionId,
+    sessionId: params.sourceSessionId,
   }).catch((error: unknown) => {
     if (isAuthenticationError(error)) throw error;
     return null;
@@ -161,9 +182,18 @@ export async function inspectSessionContinuation(params: Readonly<{
     return { type: 'unavailable', reason: 'unsupported_session' };
   }
 
+  return { type: 'available', sourceAgentId };
+}
+
+function inspectSessionContinuationSelection(params: Readonly<{
+  source: SessionContinuationSource;
+  selection: SessionAgentTransitionSelectionV1;
+}>): SessionContinuationInspectionV1 {
+  if (params.source.type === 'unavailable') return params.source;
+
   const support = evaluateSessionContinuationTargetSupport({
-    selection: params.request.selection,
-    sourceAgentId: sourceAgentId as string,
+    selection: params.selection,
+    sourceAgentId: params.source.sourceAgentId,
   });
   if (support.type === 'unsupported' && support.code === 'target_unavailable') {
     return { type: 'unavailable', reason: 'target_unavailable' };
@@ -175,5 +205,21 @@ export async function inspectSessionContinuation(params: Readonly<{
     // `same_target` is reported as available-but-not-a-transition: the picker
     // shows the current Agent as selected rather than as an error.
     sameSessionTransition: support.type === 'supported',
+  };
+}
+
+export async function inspectSessionContinuations(params: Readonly<{
+  credentials: Credentials;
+  request: SessionContinuationInspectionBatchRequestV1;
+}>): Promise<SessionContinuationInspectionBatchResultV1> {
+  const source = await loadSessionContinuationSource({
+    credentials: params.credentials,
+    sourceSessionId: params.request.sourceSessionId,
+  });
+  return {
+    v: 1,
+    inspections: params.request.selections.map((selection) => (
+      inspectSessionContinuationSelection({ source, selection })
+    )),
   };
 }

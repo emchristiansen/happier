@@ -498,12 +498,12 @@ describe('ClaudeLocalPermissionBridge', () => {
     expect(client.agentState.requests.toolu_default_title_1).toBeUndefined();
   });
 
-  it('publishes Happier execution-run MCP tools as normal permission requests in default mode', async () => {
+  it('auto-approves recognized first-party Action transport calls in default mode', async () => {
     const { session, client } = createPermissionHandlerSessionStub('session-default-execution-run-permission-request');
     const bridge = new ClaudeLocalPermissionBridge(session, { responseTimeoutMs: 5_000 });
     bridge.activate();
 
-    const pending = bridge.handlePermissionHook({
+    const result = await bridge.handlePermissionHook({
       hook_event_name: 'PermissionRequest',
       tool_name: 'mcp__happier__execution_run_start',
       tool_input: {
@@ -518,16 +518,7 @@ describe('ClaudeLocalPermissionBridge', () => {
       tool_use_id: 'toolu_execution_run_start_default_1',
     });
 
-    await vi.advanceTimersByTimeAsync(0);
-    expect(client.agentState.requests.toolu_execution_run_start_default_1).toMatchObject({
-      tool: 'mcp__happier__execution_run_start',
-    });
-
-    const permissionHandler = client.rpcHandlerManager.getHandler('permission');
-    expect(permissionHandler).toBeDefined();
-    await permissionHandler?.({ id: 'toolu_execution_run_start_default_1', approved: true });
-
-    await expect(pending).resolves.toMatchObject({
+    expect(result).toMatchObject({
       continue: true,
       suppressOutput: true,
       hookSpecificOutput: {

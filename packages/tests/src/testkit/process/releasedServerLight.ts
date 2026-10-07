@@ -3,10 +3,7 @@ import { createReadStream, existsSync } from 'node:fs';
 import { chmod, lstat, mkdir, open, readFile, readdir, rename, rm } from 'node:fs/promises';
 import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 
-import {
-  extractReleasePayloadRootFromArchive,
-  resolveServerRuntimePrismaEngineFileName,
-} from '@happier-dev/cli-common/firstPartyRuntime';
+import { extractReleasePayloadRootFromArchive } from '@happier-dev/cli-common/firstPartyRuntime';
 
 import { waitForOkHealth } from '../http';
 import { reserveAvailablePort } from '../network/reserveAvailablePort';
@@ -344,7 +341,18 @@ function renderSqliteDatabaseUrl(databasePath: string, platform: NodeJS.Platform
 }
 
 function resolvePrismaEnginePath(runtimeRoot: string, platform: NodeJS.Platform | string, arch: string): string {
-  const engineName = resolveServerRuntimePrismaEngineFileName({ platform, arch });
+  const releaseOs = releaseOsForPlatform(platform);
+  const engineNameByTarget: Record<string, string> = {
+    'darwin-arm64': 'libquery_engine-darwin-arm64.dylib.node',
+    'darwin-x64': 'libquery_engine-darwin.dylib.node',
+    'linux-arm64': 'libquery_engine-linux-arm64-openssl-3.0.x.so.node',
+    'linux-x64': 'libquery_engine-debian-openssl-3.0.x.so.node',
+    'windows-x64': 'query_engine-windows.dll.node',
+  };
+  const engineName = engineNameByTarget[`${releaseOs}-${arch}`];
+  if (!engineName) {
+    throw new Error(`Released server v0.2.1 testkit does not know the Prisma engine for ${releaseOs}-${arch}`);
+  }
   return resolve(runtimeRoot, 'generated', 'sqlite-client', engineName);
 }
 

@@ -7,7 +7,7 @@ import {
 } from '@happier-dev/protocol';
 import type { AnyAgentRuntimeKindsManifest } from './runtimeKinds.js';
 
-export const AGENT_IDS = ['claude', 'codex', 'opencode', 'gemini', 'auggie', 'qwen', 'kimi', 'kilo', 'kiro', 'customAcp', 'pi', 'copilot', 'cursor', 'grok'] as const;
+export const AGENT_IDS = ['claude', 'codex', 'opencode', 'gemini', 'auggie', 'qwen', 'kimi', 'kilo', 'kiro', 'devin', 'customAcp', 'pi', 'copilot', 'cursor', 'grok', 'agy', 'fx', 'droid'] as const;
 export type AgentId = (typeof AGENT_IDS)[number];
 
 export const PERMISSION_MODES = SESSION_PERMISSION_MODES;
@@ -17,9 +17,9 @@ export type PermissionMode = (typeof PERMISSION_MODES)[number];
 /**
  * Provider-agnostic permission intent.
  *
- * This is the canonical concept we want to persist going forward. Provider-specific tokens
- * (e.g. Claude's `acceptEdits`, `bypassPermissions`) are treated as legacy aliases at input
- * boundaries and must not be persisted as the session's selected permission mode.
+ * Internal and compatible-wire representation after user input normalization. User-facing
+ * boundaries prefer `read_only`, `default`, `auto`, and `yolo`; the shared protocol parser
+ * maps those names and legacy provider tokens into these retained values.
  */
 export const PERMISSION_INTENTS = [
     'default',
@@ -51,6 +51,8 @@ export type AgentSessionAuthSwitchTransition =
     | 'same_connected_group';
 export type AgentSessionCapabilities = Readonly<{
     sessionListing: AgentSessionCapabilitySupportLevel;
+    /** Canonical generic transport for listing agent-owned sessions, when one exists. */
+    sessionListingSource?: 'acp' | 'provider-native';
     sessionFork: Readonly<{
         conversation: AgentSessionCapabilitySupportLevel;
         fromMessage: AgentSessionCapabilitySupportLevel;
@@ -73,10 +75,14 @@ export type VendorResumeIdField =
     | 'kimiSessionId'
     | 'kiloSessionId'
     | 'kiroSessionId'
+    | 'devinSessionId'
     | 'piSessionId'
     | 'copilotSessionId'
     | 'cursorSessionId'
-    | 'grokSessionId';
+    | 'grokSessionId'
+    | 'agySessionId'
+    | 'fxSessionId'
+    | 'droidSessionId';
 
 export type CloudVendorKey = 'openai' | 'anthropic' | 'gemini';
 export type CloudConnectTargetStatus = 'wired' | 'experimental';

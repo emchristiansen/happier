@@ -185,11 +185,18 @@ const SessionsListWrapperContent = React.memo((props: { pathname: string; surfac
         || paneStateSourceScopeKeyRef.current === sourceScopeKey;
     const paneStateMatchesStorageKind = paneStateStorageKindRef.current === null
         || paneStateStorageKindRef.current === storageKind;
+    const previousSurfaceDataActiveRef = React.useRef(surfaceOwnership.dataActive);
+    const isReactivatingRetainedSurface = surfaceOwnership.dataActive
+        && previousSurfaceDataActiveRef.current === false;
+    React.useLayoutEffect(() => {
+        previousSurfaceDataActiveRef.current = surfaceOwnership.dataActive;
+    }, [surfaceOwnership.dataActive]);
     const shouldSeedRetainedSessionListViewData = retainedPaneStateForActivation !== null
         && (
             !paneStateMatchesStorageKind
             || !paneStateMatchesSource
             || paneState.sessionListViewData === null
+            || (isReactivatingRetainedSurface && paneStateMatchesStorageKind && paneStateMatchesSource)
         );
     const paneStateOptions = React.useMemo<VisibleSessionListViewDataOptions>(() => {
         const retainedSessionListViewData = shouldSeedRetainedSessionListViewData

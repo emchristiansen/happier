@@ -7,7 +7,24 @@ import { commandExists, compileBunBinary, ensureFileExists, execOrThrow, resolve
 import { finalizeRuntimeArtifactPayload } from './finalizeRuntimeArtifactPayload.js';
 import { compilePrismaMigrateBinary } from './compilePrismaMigrateBinary.js';
 import { resolveRequestedServerDbProviders, resolveServerBinarySidecarEntries, type ServerComponent } from './serverSidecars.js';
-import { resolveServerRuntimePrismaEngineFileName } from '../firstPartyRuntime/serverRuntimeArtifactLayout.js';
+
+function resolvePrismaEngineFileNameForTarget(target: BinaryTarget): string {
+  const key = `${target.os}-${target.arch}`;
+  switch (key) {
+    case 'linux-x64':
+      return 'libquery_engine-debian-openssl-3.0.x.so.node';
+    case 'linux-arm64':
+      return 'libquery_engine-linux-arm64-openssl-3.0.x.so.node';
+    case 'darwin-x64':
+      return 'libquery_engine-darwin.dylib.node';
+    case 'darwin-arm64':
+      return 'libquery_engine-darwin-arm64.dylib.node';
+    case 'windows-x64':
+      return 'query_engine-windows.dll.node';
+    default:
+      throw new Error(`[component-artifacts] unsupported Prisma binary target: ${key}`);
+  }
+}
 
 async function ensureFile(path: string, message: string): Promise<void> {
   const info = await stat(path).catch(() => null);
@@ -26,10 +43,7 @@ async function validateServerPrismaEnginesForTarget({
   buildDbProviders: string;
 }): Promise<void> {
   const targetKey = `${target.os}-${target.arch}`;
-  const engineFileName = resolveServerRuntimePrismaEngineFileName({
-    platform: target.os,
-    arch: target.arch,
-  });
+  const engineFileName = resolvePrismaEngineFileNameForTarget(target);
   await ensureFile(
     join(payloadDir, 'node_modules', '.prisma', 'client', engineFileName),
     `[component-artifacts] missing postgres Prisma query engine for ${targetKey}: node_modules/.prisma/client/${engineFileName}`,

@@ -17,6 +17,12 @@ function createConfigurableBackend() {
     dispose: vi.fn(async () => undefined),
     setSessionModel,
     setSessionConfigOption,
+    getSessionConfigOptionsState: vi.fn(() => [{
+      id: 'model',
+      name: 'Model',
+      type: 'select',
+      currentValue: 'provider-model-high',
+    }]),
   } as unknown as AgentBackend;
   return { backend, setSessionModel, setSessionConfigOption, startSession, loadSession };
 }
@@ -87,6 +93,48 @@ describe('withExecutionRunBackendModelOptions', () => {
     expect(loaded.sessionId).toBe('session-loaded');
     expect(setSessionModel).toHaveBeenCalledWith('session-loaded', 'gpt-5.5');
     expect(setSessionConfigOption).toHaveBeenCalledWith('session-loaded', 'reasoning_effort', 'high');
+  });
+
+  it('uses the configured ACP option instead of legacy session/set_model when required by the provider', async () => {
+    const { backend, setSessionModel, setSessionConfigOption } = createConfigurableBackend();
+    const wrapped = withExecutionRunBackendModelOptions(backend, {
+      modelId: 'claude-sonnet-4.6',
+      modelApply: { method: 'config_option', configOptionId: 'model' },
+    });
+
+    await wrapped.startSession();
+
+    expect(setSessionModel).not.toHaveBeenCalled();
+    expect(setSessionConfigOption).toHaveBeenCalledWith('session-123', 'model', 'claude-sonnet-4.6');
+  });
+
+  it('lets a provider reversibly compose execution-run model controls into native config values', async () => {
+    const { backend, setSessionModel, setSessionConfigOption } = createConfigurableBackend();
+    const wrapped = withExecutionRunBackendModelOptions(backend, {
+      modelId: 'projected-model',
+      modelApply: { method: 'config_option', configOptionId: 'model' },
+      sessionConfigOptionOverrides: {
+        v: 1,
+        updatedAt: 1,
+        overrides: { reasoning_effort: { updatedAt: 1, value: 'max' } },
+      },
+      resolveSessionModelConfigUpdate: ({ modelId }) => ({
+        modelId: modelId === 'projected-model' ? 'provider-model-high' : modelId,
+      }),
+      resolveSessionConfigOptionUpdate: ({ configId, value }) => (
+        configId === 'reasoning_effort' && value === 'max'
+          ? { modelId: 'provider-model-max' }
+          : { configId, value }
+      ),
+    });
+
+    await wrapped.startSession();
+
+    expect(setSessionModel).not.toHaveBeenCalled();
+    expect(setSessionConfigOption.mock.calls).toEqual([
+      ['session-123', 'model', 'provider-model-high'],
+      ['session-123', 'model', 'provider-model-max'],
+    ]);
   });
 
   it('returns the backend untouched when no options are supplied', async () => {

@@ -6,6 +6,10 @@ import {
 } from "@happier-dev/protocol";
 import { normalizeStoredSessionRuntimeActivityProjection } from "@/app/session/runtimeActivity/projection";
 import { mapPendingActivationAuthorization } from "@/app/session/pending/pendingActivationAuthorization";
+import {
+    createSessionRollbackEligibleTurnsSelect,
+    readSessionTurnRollbackEligibleStarts,
+} from "@/app/session/turns/sessionRollbackEligibilityProjection";
 
 export function parseStoredSessionRuntimeIssue(value: string | null | undefined): V2SessionRecord["lastRuntimeIssue"] {
     if (!value) return null;
@@ -78,6 +82,7 @@ const V2_SESSION_LIST_ROW_BASE_SELECT = {
     pendingActivationRequestedAt: true,
     pendingActivationStatus: true,
     pendingActivationFailureCode: true,
+    turns: createSessionRollbackEligibleTurnsSelect(),
     dataEncryptionKey: true,
     active: true,
     lastActiveAt: true,
@@ -98,6 +103,7 @@ const {
     pendingActivationRequestedAt: _legacySelectPendingActivationRequestedAt,
     pendingActivationStatus: _legacySelectPendingActivationStatus,
     pendingActivationFailureCode: _legacySelectPendingActivationFailureCode,
+    turns: _legacySelectTurns,
     ...V2_SESSION_LIST_ROW_LEGACY_SELECT
 } = V2_SESSION_LIST_ROW_BASE_SELECT;
 
@@ -278,6 +284,7 @@ export function mapV2SessionListRow(params: Readonly<{ row: V2SessionListRowComp
         pendingBlockedCount: row.pendingBlockedCount,
         pendingVersion: row.pendingVersion,
         pendingActivationAuthorization: mapPendingActivationAuthorization(row),
+        rollbackEligibleTurnStarts: readSessionTurnRollbackEligibleStarts(row),
         dataEncryptionKey: isOwner
             ? encodeSessionDataEncryptionKey(row.dataEncryptionKey)
             : (viewerShare?.encryptedDataKey ? Buffer.from(viewerShare.encryptedDataKey).toString("base64") : null),

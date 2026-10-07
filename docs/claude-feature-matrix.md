@@ -21,7 +21,53 @@ This document captures the current low-level Claude implementation across the CL
 | Linked direct transcript source (`.claude/projects/...jsonl`) | `supported` | `apps/cli/src/backends/claude/session.ts`, `apps/cli/src/backends/claude/directSessions/listClaudeSessionCandidates.ts`, `apps/cli/src/backends/claude/directSessions/pageClaudeTranscript.ts`, `apps/cli/src/backends/claude/directSessions/readAfterClaudeTranscript.ts`, `apps/cli/src/backends/claude/directSessions/resolveClaudeDirectSessionFile.ts` | When transcript storage is `direct`, `session.ts` writes `directSessionV1`; browse/tail reads provider-owned JSONL directly and supports backward paging plus forward tail-follow. | Replace `directSessionV1` and Claude-specific file cursors with a shared transcript-source contract used by browse, takeover, and handoff. |
 | Sidechains, subagents, and team inbox | `partial` | `apps/cli/src/backends/claude/remote/sidechains/claudeTaskOutputSidechainImporter.ts`, `apps/cli/src/backends/claude/remote/sidechains/claudeRemoteSubagentFileCollector.ts`, `apps/cli/src/backends/claude/remote/teamInbox/claudeRemoteTeamInboxBridge.ts`, `apps/cli/src/backends/claude/utils/teamInbox/claudeTeamInboxCollector.ts`, `apps/ui/sources/sync/domains/session/participants/providers/claude/deriveClaudeTeamParticipants.ts`, `apps/ui/sources/components/tools/renderers/workflow/SubAgentRunView.tsx` | Remote mode has dedicated collectors for `Task` / `Agent` JSONL sidechains and team-inbox messages; UI then reconstructs team state, shutdown pruning, and run previews from normalized tool calls plus imported sidechain messages. | Centralize Claude sidechain/team normalization so CLI collectors and UI participant derivation stop re-encoding the same lifecycle rules. |
 
+Development-source transcript ingestion and UI normalization share
+`providers.claude.isClaudeInternalEventType` from `@happier-dev/agents` for
+non-conversation records, including Claude SDK `command_lifecycle` status events.
+Raw runtime observers receive these records before transcript filtering; filtering
+does not establish message acceptance or foreground activity. UI normalization also
+filters already-persisted internal records, while genuinely unknown output retains
+the unsupported-output diagnostic.
+
 ## Session lifecycle surfaces
+
+Development-source Unified Terminal delivery keeps observing canonical Pending
+eligibility while its submitted prompt awaits provider acceptance. External manual
+handling can retire that exact row without another Claude hook or terminal output;
+the existing arbiter then releases the submitted head and admits the next prompt
+without resending the retired input or manufacturing provider acceptance. The API
+session client owns exact custody reconciliation and publishes the same Pending
+wake when local custody changes.
+
+In development source, Unified Terminal publishes its exact-host stop capability
+as soon as the attachment is persisted, before metadata publication or provider
+initialization can block. Explicit stop still destroys only that owned attachment;
+stale attachment identities cannot destroy a replacement host.
+
+In development source, the remote Agent SDK runner treats a live root
+`message_start` from its owned session after a result as renewed foreground work.
+This covers resume streams that emit a prior result before processing the supplied
+prompt. The launcher starts the canonical turn and resets ready-notification
+tracking, and the runner restores thinking and steering state until the next
+result. Late deltas, replay, foreign-session messages, and child output alone do
+not reopen the foreground turn.
+
+Both remote runners use `remote/resultTurnBoundary.ts` to recognize a result with
+a positive integer `queued_turn_count`. That result ends one provider turn while
+another user turn remains queued, including after a nonfatal failed turn. The
+runners retain foreground ownership and continue consuming provider output until
+the terminal result; they preserve intermediate output and error diagnostics.
+Results from older providers without this field retain their existing behavior.
+
+Development-source SDK and local permission hooks share
+`utils/buildClaudePermissionHookResponse.ts` for response serialization.
+`PermissionRequest` approvals include `updatedInput` only when the arguments
+actually change: Claude rechecks supplied replacement arguments against ask and
+deny rules before applying `updatedPermissions`. Echoing the original arguments
+can therefore refuse an approved operation and skip its saved allow rule.
+Genuine rewrites remain subject to Claude's checks; `PreToolUse` still carries
+the input needed for `AskUserQuestion` answers. Claude's Auto classifier remains
+the permission authority before a request reaches these hooks.
 
 | Feature | Status | Exact source files | Current behavior / special cases | Unified architecture migration notes |
 | --- | --- | --- | --- | --- |

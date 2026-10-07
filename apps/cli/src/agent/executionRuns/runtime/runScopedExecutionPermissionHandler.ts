@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import type { AcpPermissionHandler } from '@/agent/acp/AcpBackend';
 
 export function createRunScopedExecutionPermissionHandler(params: Readonly<{
@@ -9,7 +11,11 @@ export function createRunScopedExecutionPermissionHandler(params: Readonly<{
 }> {
   const runId = String(params.runId ?? '').trim();
   if (!runId) throw new Error('Execution-run permission scope requires a non-blank runId');
-  const prefix = `execution-run:${encodeURIComponent(runId)}:`;
+  // Each wrapper belongs to one backend/controller occurrence. A resumable run can construct a
+  // successor backend with the same run id, and providers may reuse their request ids after load.
+  // Keep those occurrences distinct so the session coordinator cannot replay a retired decision.
+  const controllerOccurrenceId = randomUUID();
+  const prefix = `execution-run:${encodeURIComponent(runId)}:${encodeURIComponent(controllerOccurrenceId)}:`;
   const pendingRequestIds = new Set<string>();
   const scopedRequestId = (requestId: string) => `${prefix}${encodeURIComponent(requestId)}`;
 

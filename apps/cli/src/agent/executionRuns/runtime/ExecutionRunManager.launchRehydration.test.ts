@@ -102,6 +102,7 @@ describe('ExecutionRunManager — resume rehydrates the immutable launch record'
       sessionId: 'parent_1', intent: 'delegate', backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
       permissionMode: 'read_only', retentionPolicy: 'resumable', runClass: 'long_lived', ioMode: 'request_response',
     });
+    await expect.poll(() => manager.get(started.runId)?.resumeHandle?.kind).toBe('vendor_session.v1');
     await manager.stop(started.runId);
     await manager.waitForTerminal(started.runId);
     const backendCallsBeforeResume = createBackend.mock.calls.length;
@@ -153,6 +154,7 @@ describe('ExecutionRunManager — resume rehydrates the immutable launch record'
       connectedServicesEnv: { CODEX_HOME: '/start/root/codex-home' },
     });
 
+    await expect.poll(() => manager.get(started.runId)?.resumeHandle?.kind).toBe('vendor_session.v1');
     await manager.stop(started.runId);
     await manager.waitForTerminal(started.runId);
 
@@ -210,6 +212,7 @@ describe('ExecutionRunManager — resume rehydrates the immutable launch record'
       connectedServicesSelection: SELECTION,
       connectedServicesEnv: { CODEX_HOME: '/start/root/codex-home' },
     });
+    await expect.poll(() => manager.get(started.runId)?.resumeHandle?.kind).toBe('vendor_session.v1');
     await manager.stop(started.runId);
     await manager.waitForTerminal(started.runId);
 

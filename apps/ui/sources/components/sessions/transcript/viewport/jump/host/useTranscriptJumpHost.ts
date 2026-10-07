@@ -44,7 +44,7 @@ import type {
 import type { TranscriptLifecycleHost } from '@/components/sessions/transcript/viewport/lifecycle/lifecycleHost';
 import type { ScrollableChatListRef } from '@/components/sessions/transcript/viewport/transcriptScrollableListTypes';
 import type { LastNativeRestoreIndexCommand } from '@/components/sessions/transcript/viewport/transcriptScrollableListTypes';
-import type { TranscriptPrependOlderLoadSyncOptions } from '@/components/sessions/transcript/viewport/prepend/host/runTranscriptPrependOlderLoad';
+import type { TranscriptPrependOlderLoadResult, TranscriptPrependOlderLoadSyncOptions } from '@/components/sessions/transcript/viewport/prepend/host/runTranscriptPrependOlderLoad';
 import {
     executeTranscriptTargetWindowJump,
     isTranscriptTargetObservedAtAlignment,
@@ -254,6 +254,7 @@ export type TranscriptJumpHostDeps = Readonly<{
     executeViewportCommandWithAnimation(command: TranscriptViewportCommand, animated: boolean): boolean;
     forkedTranscriptEnabled: boolean;
     hasMoreOlderRef: MutableRef<boolean | null>;
+    observeOlderLoadResult(result: TranscriptPrependOlderLoadResult): void;
     invalidateViewportAnchorCapture(): void;
     isLoaded: boolean;
     isPinnedRef: MutableRef<boolean>;
@@ -374,6 +375,7 @@ export function useTranscriptJumpHost(deps: TranscriptJumpHostDeps): TranscriptJ
         executeViewportCommandWithAnimation,
         forkedTranscriptEnabled,
         hasMoreOlderRef,
+        observeOlderLoadResult,
         invalidateViewportAnchorCapture,
         isLoaded,
         isPinnedRef,
@@ -1187,6 +1189,7 @@ export function useTranscriptJumpHost(deps: TranscriptJumpHostDeps): TranscriptJ
                             ? await sync.loadOlderMessages(sessionId, syncLoadOlderOptions)
                             : await sync.loadOlderMessages(sessionId));
                     if (!isCurrentOperation()) return { status: 'aborted' };
+                    observeOlderLoadResult(loadOlderResult);
                     if (loadOlderResult.status === 'no_more') {
                         return { status: 'not-found', reason: 'exhausted' };
                     }
@@ -1276,6 +1279,7 @@ export function useTranscriptJumpHost(deps: TranscriptJumpHostDeps): TranscriptJ
         executeViewportCommandWithAnimation,
         forkedTranscriptEnabled,
         handleJumpLanded,
+        observeOlderLoadResult,
         invalidateViewportAnchorCapture,
         isPinnedRef,
         isTranscriptJumpTargetInRenderedWindow,

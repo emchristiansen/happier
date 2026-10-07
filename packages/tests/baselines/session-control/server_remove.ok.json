@@ -14,7 +14,7 @@
       "id": "cloud",
       "name": "Happier Cloud",
       "serverUrl": "https://api.happier.dev",
-      "webappUrl": "https://app.happier.dev",
+      "webappUrl": "https://cloud.happier.dev",
       "lastUsedAt": 1700000000000
     }
   }

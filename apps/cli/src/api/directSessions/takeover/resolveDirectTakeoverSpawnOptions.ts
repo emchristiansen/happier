@@ -1,4 +1,5 @@
 import type { SpawnSessionOptions } from '@/rpc/handlers/registerSessionHandlers';
+import type { Credentials } from '@/persistence';
 import { getDirectSessionProviderOps } from '@/backends/catalog';
 import {
   hasConnectedServiceBindings,
@@ -9,6 +10,7 @@ import {
 import { listSessionMarkers, type DaemonSessionMarker } from '@/daemon/sessionRegistry';
 import { directSessionMarkerMatches } from '@/api/directSessions/markers/readDirectSessionMarkerIdentity';
 import type { LoadedLinkedDirectSession } from './loadLinkedDirectSession';
+import { resolveSpawnConnectedServicesDefaultsForAccount } from '@/session/services/resolveSpawnConnectedServicesDefaultsForAccount';
 
 function markerMatchesDirectSession(
   marker: DaemonSessionMarker,
@@ -41,14 +43,37 @@ async function resolveTrackedConnectedServiceRuntimeSnapshot(
 export async function resolveDirectTakeoverSpawnOptions(params: Readonly<{
   linked: LoadedLinkedDirectSession;
   sessionId: string;
+  credentials: Credentials;
+  transcriptStorage?: 'direct' | 'persisted';
+  terminal?: SpawnSessionOptions['terminal'];
 }>): Promise<SpawnSessionOptions | null> {
-  const spawnOptions = await (await getDirectSessionProviderOps(params.linked.providerId)).resolveTakeoverSpawnOptions(params);
+  const providerOps = await getDirectSessionProviderOps(params.linked.providerId);
+  // A resume-only source (ACP session/list) owns no provider process to take over.
+  if (!providerOps.resolveTakeoverSpawnOptions) return null;
+  const spawnOptions = await providerOps.resolveTakeoverSpawnOptions({
+    ...params,
+    transcriptStorage: params.transcriptStorage ?? 'direct',
+  });
   if (!spawnOptions) return null;
-  const snapshot = mergeConnectedServiceRuntimeSnapshots(
+  const knownSnapshot = mergeConnectedServiceRuntimeSnapshots(
     readConnectedServiceRuntimeSnapshot(params.linked.metadata),
-    await resolveTrackedConnectedServiceRuntimeSnapshot(params.linked),
+    mergeConnectedServiceRuntimeSnapshots(
+      await resolveTrackedConnectedServiceRuntimeSnapshot(params.linked),
+      readConnectedServiceRuntimeSnapshot(spawnOptions),
+    ),
   );
-  return hasConnectedServiceBindings(snapshot)
-    ? { ...spawnOptions, ...snapshot }
-    : spawnOptions;
+  const accountDefaults = !hasConnectedServiceBindings(knownSnapshot) && spawnOptions.backendTarget
+    ? await resolveSpawnConnectedServicesDefaultsForAccount({
+      credentials: params.credentials,
+      backendTarget: spawnOptions.backendTarget,
+    })
+    : null;
+  const snapshot = hasConnectedServiceBindings(knownSnapshot)
+    ? knownSnapshot
+    : accountDefaults ?? {};
+  return {
+    ...spawnOptions,
+    ...(hasConnectedServiceBindings(snapshot) ? snapshot : {}),
+    ...(params.terminal ? { terminal: params.terminal } : {}),
+  };
 }

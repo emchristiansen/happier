@@ -17,6 +17,7 @@ import type { CloudConnectAuthenticateOptions } from '@/cloud/connectTypes';
 import { startOauthPkceWithPasteFallback } from '@/cloud/oauthPkceWithPasteFallback';
 import { promptInput } from '@/terminal/prompts/promptInput';
 import { resolveGeminiOauthClientId, resolveGeminiOauthClientSecret, resolveGeminiOauthTokenUrl } from '@/daemon/connectedServices/shared/oauthConfig';
+import { dim, fail, info, ok } from '@happier-dev/cli-common/output';
 
 export interface GeminiAuthTokens {
     access_token: string;
@@ -103,7 +104,7 @@ async function exchangeCodeForTokens(
  * @returns Promise resolving to GeminiAuthTokens with all token information
  */
 export async function authenticateGemini(opts?: CloudConnectAuthenticateOptions): Promise<GeminiAuthTokens> {
-    console.log('🚀 Starting Google Gemini authentication...');
+    console.log(info('Signing in to Google Gemini'));
 
     try {
         const mode = opts?.paste ? 'paste' : 'loopback';
@@ -122,7 +123,7 @@ export async function authenticateGemini(opts?: CloudConnectAuthenticateOptions)
                 if (usedFallback) {
                     console.log(`Port ${defaultPort} is in use, finding an available port...`);
                 }
-                console.log(`📡 Using callback port: ${port}`);
+                console.log(dim(`  Using callback port ${port}`));
             },
             buildAuthorizationUrl: ({ redirectUri, state, challenge }) => {
                 const clientId = resolveGeminiOauthClientId(process.env);
@@ -147,7 +148,7 @@ export async function authenticateGemini(opts?: CloudConnectAuthenticateOptions)
             promptForPastedRedirectUrl: () => promptInput('Paste redirect URL: '),
             openAuthorizationUrl: async ({ authorizationUrl }) => {
                 if (opts?.noOpen) return;
-                console.log('\n📋 Opening browser for authentication...');
+                console.log(info('Opening your browser to sign in'));
                 console.log('If browser doesn\'t open, visit this URL:');
                 console.log(`\n${authorizationUrl}\n`);
                 await openBrowser(authorizationUrl);
@@ -169,12 +170,11 @@ export async function authenticateGemini(opts?: CloudConnectAuthenticateOptions)
             },
         });
         
-        console.log('\n🎉 Authentication successful!');
-        console.log('✅ OAuth tokens received');
+        console.log(ok('Signed in to Google Gemini'));
         
         return tokens;
     } catch (error) {
-        console.error('\n❌ Failed to authenticate with Google');
+        console.error(fail('Could not sign in to Google'));
         throw error;
     }
 }

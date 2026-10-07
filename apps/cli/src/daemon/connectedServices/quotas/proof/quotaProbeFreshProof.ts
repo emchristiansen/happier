@@ -1,5 +1,5 @@
 import type { ConnectedServiceId, ConnectedServiceQuotaMeterV1, ConnectedServiceQuotaSnapshotV1 } from '@happier-dev/protocol';
-import { readConnectedServiceLimitCategoryV1 } from '@happier-dev/protocol';
+import { isConnectedServiceQuotaObservationFresh, readConnectedServiceLimitCategoryV1 } from '@happier-dev/protocol';
 
 import { normalizeQuotaMeter, selectEffectiveQuotaMeter } from '../normalization';
 import type { ProviderOutcomeProofKind } from '../../recovery/providerOutcomeProof';
@@ -134,7 +134,7 @@ export function resolveQuotaProbeFreshProof(input: Readonly<{
     : configuredMaxAgeMs;
   const maxAgeMs = Math.min(configuredMaxAgeMs, snapshotMaxAgeMs);
   const nowMs = Math.max(0, Math.trunc(input.nowMs));
-  if (fetchedAt > nowMs || nowMs - fetchedAt > maxAgeMs) {
+  if (!isConnectedServiceQuotaObservationFresh({ observedAtMs: fetchedAt, nowMs, maxAgeMs })) {
     return { status: 'no_proof', reason: 'stale_snapshot' };
   }
   if (input.snapshot.meters.length > 0 && input.snapshot.meters.every(isUnavailableMeter)) {

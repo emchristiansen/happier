@@ -364,6 +364,29 @@ export const SessionContinuationInspectionV1Schema = z.discriminatedUnion('type'
 export type SessionContinuationInspectionV1 = z.infer<typeof SessionContinuationInspectionV1Schema>;
 
 /**
+ * One picker projection asks about every target against the same source Session.
+ * The result array is positional: `inspections[i]` answers `selections[i]`.
+ */
+export const SessionContinuationInspectionBatchRequestV1Schema = z
+  .object({
+    v: z.literal(1),
+    sourceSessionId: z.string().trim().min(1),
+    selections: z.array(SessionAgentTransitionSelectionV1Schema).min(1),
+  })
+  .strict();
+export type SessionContinuationInspectionBatchRequestV1 =
+  z.infer<typeof SessionContinuationInspectionBatchRequestV1Schema>;
+
+export const SessionContinuationInspectionBatchResultV1Schema = z
+  .object({
+    v: z.literal(1),
+    inspections: z.array(SessionContinuationInspectionV1Schema),
+  })
+  .strict();
+export type SessionContinuationInspectionBatchResultV1 =
+  z.infer<typeof SessionContinuationInspectionBatchResultV1Schema>;
+
+/**
  * Machine reachability as the client already knows it, independent of this RPC.
  * Both trees expose `isMachineOnline(machine)` at
  * `apps/ui/sources/utils/sessions/machineUtils.ts`; `'unknown'` covers the case

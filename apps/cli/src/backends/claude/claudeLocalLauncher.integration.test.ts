@@ -242,19 +242,34 @@ describe('claudeLocalLauncher', () => {
     }
   });
 
-  it('surfaces Claude process errors to the UI', async () => {
-    const { session, sendSessionEvent } = createLocalHarness();
+  it('restores idle activity for owned local relaunches and retries while surfacing process errors', async () => {
+    let activityState = 'unknown';
+    const activityAtLaunch: string[] = [];
+    const { session, sendSessionEvent } = createLocalHarness({
+      providerTasks: {
+        report: async (snapshot) => { activityState = snapshot.state; },
+        markUnknown: async () => { activityState = 'unknown'; },
+        dispose: async () => {},
+      },
+    });
+    const activity = session.getProviderTaskRuntimeActivityAdapter()!;
+    await activity.activateObservation('previous-provider-observer-installed');
+    await activity.handleRuntimeLoss('previous-provider-stopped');
 
     mockClaudeLocal
       .mockImplementationOnce(async () => {
+        activityAtLaunch.push(activityState);
         throw new Error('boom');
       })
-      .mockImplementationOnce(async () => {});
+      .mockImplementationOnce(async () => {
+        activityAtLaunch.push(activityState);
+      });
 
     const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
     const result = await claudeLocalLauncher(session);
 
     expect(result).toEqual({ type: 'exit', code: 0 });
+    expect(activityAtLaunch).toEqual(['idle', 'idle']);
     expect(sendSessionEvent).toHaveBeenCalledWith(
       expect.objectContaining({
         type: 'message',
@@ -285,7 +300,7 @@ describe('claudeLocalLauncher', () => {
     expect(order).toEqual(['scanner-installed', 'runtime-offered', 'provider-started']);
     expect(providerTasks.report).toHaveBeenCalledWith(
       { state: 'idle', activeCount: 0 },
-      'claude-local-provider-observer-installed',
+      expect.any(String),
     );
   });
 

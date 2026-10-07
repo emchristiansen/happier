@@ -19,6 +19,7 @@ type SocketLike = Readonly<{
     on: (event: string, cb: (...args: any[]) => void) => void;
     off: (event: string, cb: (...args: any[]) => void) => void;
     timeout: (ms: number) => { emitWithAck: (event: string, payload: any) => Promise<unknown> };
+    emitWithAck: (event: string, payload: any) => Promise<unknown>;
     emit: (event: string, payload: any) => void;
 }>;
 
@@ -325,6 +326,7 @@ export function createServerScopedRpcSocketPool(overrides?: Partial<Deps>): Read
 
         return {
             timeout: (ms: number) => entry.socket.timeout(ms),
+            emitWithAck: (event: string, payload: any) => entry.socket.emitWithAck(event, payload),
             emit: (event: string, payload: any) => entry.socket.emit(event, payload),
             disconnect: () => releaseOnce(),
         };

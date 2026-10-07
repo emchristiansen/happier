@@ -240,6 +240,23 @@ describe('clearOwnLeftoverComposerDraft (C11: idle pre-injection own-leftover gu
     expect(result.status).toBe('provider_unavailable');
   });
 
+  it('never cancels the provider-owned usage-limit wait while trying to clear its own draft', async () => {
+    const sendClearKey = vi.fn(async () => undefined);
+    const result = await clearOwnLeftoverComposerDraft({
+      captureInputState: async () => ({ currentInput: [
+        idleScreen(OWN_TEXT),
+        '  ⚠ Usage limit reached · limit resets 5:10pm',
+        '    Continuing automatically at 5:10pm · esc to cancel',
+      ].join('\n') }),
+      sendClearKey,
+      ownComposerTexts: ownLog(OWN_TEXT),
+      wait: async () => undefined,
+    });
+
+    expect(result).toMatchObject({ status: 'blocked_non_input_state', blockedReason: 'usage_limit_wait' });
+    expect(sendClearKey).not.toHaveBeenCalled();
+  });
+
   it('reports blocked_non_input_state for composer-shaped dialog text instead of foreign_draft', async () => {
     const result = await clearOwnLeftoverComposerDraft({
       captureInputState: async () => ({

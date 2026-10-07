@@ -10,10 +10,8 @@
 import chalk from 'chalk';
 
 import { isPermissionMode, type PermissionMode } from '@/api/types';
-import {
-  PERMISSION_INTENTS,
-  parsePermissionModeAlias as parsePermissionModeAliasShared,
-} from '@happier-dev/agents';
+import { parsePermissionModeAlias as parsePermissionModeAliasShared } from '@happier-dev/agents';
+import { SESSION_PERMISSION_INTENT_INPUTS } from '@happier-dev/protocol';
 
 export interface ProviderSessionArgPartitionResult {
   readonly startedBy?: 'daemon' | 'terminal';
@@ -48,9 +46,9 @@ export interface ProviderSessionArgPartitionOptions {
 }
 
 const PERMISSION_MODE_EXAMPLES = [
-  '--permission-mode read-only',
+  '--permission-mode read_only',
+  '--permission-mode auto',
   '--permission-mode yolo',
-  '--permission-mode accept-edits',
 ] as const;
 
 function parsePermissionModeAlias(raw: string): PermissionMode | null {
@@ -194,12 +192,12 @@ export function partitionProviderSessionArgs(options: ProviderSessionArgPartitio
       const value = readRequiredValue(
         args,
         i,
-        `--permission-mode. Valid values: ${PERMISSION_INTENTS.join(', ')}. Examples: ${PERMISSION_MODE_EXAMPLES.join(' | ')}`,
+        `--permission-mode. Valid values: ${SESSION_PERMISSION_INTENT_INPUTS.join(', ')}. Examples: ${PERMISSION_MODE_EXAMPLES.join(' | ')}`,
       );
       const parsed = parsePermissionModeAlias(value);
       if (!parsed) {
         fail(
-          `Invalid --permission-mode value: ${value}. Valid values: ${PERMISSION_INTENTS.join(', ')}. Examples: ${PERMISSION_MODE_EXAMPLES.join(' | ')}`,
+          `Invalid --permission-mode value: ${value}. Valid values: ${SESSION_PERMISSION_INTENT_INPUTS.join(', ')}. Examples: ${PERMISSION_MODE_EXAMPLES.join(' | ')}`,
         );
       }
       permissionMode = parsed;
@@ -209,12 +207,12 @@ export function partitionProviderSessionArgs(options: ProviderSessionArgPartitio
     if (arg.startsWith('--permission-mode=')) {
       const value = arg.slice('--permission-mode='.length).trim();
       if (!value) {
-        fail(`Missing value for --permission-mode. Valid values: ${PERMISSION_INTENTS.join(', ')}`);
+        fail(`Missing value for --permission-mode. Valid values: ${SESSION_PERMISSION_INTENT_INPUTS.join(', ')}`);
       }
       const parsed = parsePermissionModeAlias(value);
       if (!parsed) {
         fail(
-          `Invalid --permission-mode value: ${value}. Valid values: ${PERMISSION_INTENTS.join(', ')}. Examples: ${PERMISSION_MODE_EXAMPLES.join(' | ')}`,
+          `Invalid --permission-mode value: ${value}. Valid values: ${SESSION_PERMISSION_INTENT_INPUTS.join(', ')}. Examples: ${PERMISSION_MODE_EXAMPLES.join(' | ')}`,
         );
       }
       permissionMode = parsed;

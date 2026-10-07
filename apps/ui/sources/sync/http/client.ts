@@ -12,7 +12,6 @@ import {
     waitForServerReachable,
 } from '@/sync/runtime/connectivity/serverReachabilitySupervisorPool';
 import {
-    readServerFetchWriteTimeoutMs,
     readServerReachabilityWaitTimeoutMs,
 } from '@/sync/runtime/connectivity/serverReachabilityTuning';
 import { observeUiClientUpgradeRequiredResponse } from '@/sync/runtime/clientCompatibility/uiClientUpgradeRequired';
@@ -67,20 +66,18 @@ type ServerFetchOptions = Readonly<{
     retry?: 'default' | 'none';
     /**
      * Per-request upper bound (ms) after which the request is aborted with a retryable
-     * `ServerFetchWriteTimeoutError`. When omitted, mutating requests (POST/PUT/PATCH/DELETE) use
-     * the canonical write timeout (`readServerFetchWriteTimeoutMs`) and reads stay unbounded here.
+     * `ServerFetchWriteTimeoutError`. Requests are unbounded when omitted; the operation
+     * owner must opt in only when it can safely classify and recover an ambiguous timeout.
      * Pass `0` to explicitly disable the bound for a single request.
      */
     timeoutMs?: number;
 }>;
 
-const MUTATING_HTTP_METHODS: ReadonlySet<string> = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
-
-function resolveRequestTimeoutMs(method: string, optionTimeoutMs: number | undefined): number {
+function resolveRequestTimeoutMs(optionTimeoutMs: number | undefined): number {
     if (typeof optionTimeoutMs === 'number' && Number.isFinite(optionTimeoutMs)) {
         return Math.max(0, Math.trunc(optionTimeoutMs));
     }
-    return MUTATING_HTTP_METHODS.has(method) ? readServerFetchWriteTimeoutMs() : 0;
+    return 0;
 }
 
 const inFlightControllers = new Set<AbortController>();
@@ -254,10 +251,9 @@ export async function serverFetch(
 
     const method = String(init?.method ?? 'GET').toUpperCase();
 
-    // Bound mutating requests so a stalled server (accepts, never responds) cannot hang the await
-    // forever — the silent message-loss class. On expiry we abort the in-flight request and surface
-    // a retryable ServerFetchWriteTimeoutError so the pending outbox re-POSTs with the same localId.
-    const effectiveTimeoutMs = resolveRequestTimeoutMs(method, options.timeoutMs);
+    // A request owner may opt into a bound when it can recover safely from an
+    // ambiguous timeout. Generic reads and writes remain unbounded here.
+    const effectiveTimeoutMs = resolveRequestTimeoutMs(options.timeoutMs);
     let didWriteTimeout = false;
     let writeTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
     if (effectiveTimeoutMs > 0) {

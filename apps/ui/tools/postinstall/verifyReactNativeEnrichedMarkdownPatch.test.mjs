@@ -81,8 +81,8 @@ test('DISCRIMINATES: restoring the obsolete global cache reset fails verificatio
     assert.equal(verifyReactNativeEnrichedMarkdownPatch({ packageDir }), false);
 });
 
-for (const scenario of ['missing streaming module', 'stale streaming renderer']) {
-    const repairable = scenario === 'missing streaming module';
+for (const scenario of ['missing streaming module', 'stale streaming renderer', 'stale native renderer ownership']) {
+    const repairable = scenario !== 'stale streaming renderer';
     test(`${repairable ? 'repairs' : 'rejects incompatible'} ${scenario} when the remaining patch is already applied`, (t) => {
         if (!fs.existsSync(INSTALLED_PACKAGE_DIR)) {
             t.skip('react-native-enriched-markdown is not installed');
@@ -108,6 +108,13 @@ for (const scenario of ['missing streaming module', 'stale streaming renderer'])
         fs.writeFileSync(path.join(fixtureDir, 'package.json'), '{"name":"partial-repair-fixture","private":true}\n');
         if (scenario === 'missing streaming module') {
             fs.rmSync(path.join(packageDir, 'lib', 'module', 'web', 'streamingReveal.js'));
+        } else if (scenario === 'stale native renderer ownership') {
+            // A tracked patch update does not update an already installed dependency.
+            const rendererPath = path.join(packageDir, 'ios', 'renderer', 'StrongRenderer.m');
+            const current = fs.readFileSync(rendererPath, 'utf8');
+            const stale = current.replace('__weak RendererFactory *_rendererFactory;', 'RendererFactory *_rendererFactory;');
+            assert.notEqual(stale, current, 'the installed native renderer must include the ownership fix');
+            fs.writeFileSync(rendererPath, stale);
         } else {
             // The live mirror syncs tracked patches but excludes node_modules. Its old
             // installed renderer still animated an overlapping old word and published

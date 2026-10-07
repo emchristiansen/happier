@@ -10,7 +10,9 @@ import type { AgentState, Metadata } from '@/api/types';
 import type {
   MaterializeNextPendingOptions,
   MaterializeNextPendingResult,
+  SessionClientPort,
 } from '@/api/session/sessionClientPort';
+import type { SessionProviderInputOutcomeObserver, SessionProviderInputOutcomeProducer } from '@/api/session/sessionClient';
 import type { PendingQueueReadOptions } from '@/api/session/pendingQueueReadPolicy';
 import type { ProviderOwnedUserMessageEchoClassifier } from '@/api/session/providerOwnedUserMessageEcho';
 import type { SessionRuntimeActivitySnapshotPublisher } from '@/session/runtimeActivity/types';
@@ -31,6 +33,13 @@ export type DeferredApiSessionTarget = Readonly<{
   recordClaudeJsonlMessageConsumed?: (message: unknown, meta?: unknown) => void;
   setProviderOwnedUserMessageEchoClassifier?: (classifier: ProviderOwnedUserMessageEchoClassifier | null) => void;
   fetchCommittedClaudeJsonlMessageBaseline?: (opts?: { take?: number }) => Promise<import('@/backends/claude/utils/claudeJsonlMessageKey').CommittedClaudeJsonlMessageBaseline>;
+  bindProviderInputOutcomeProducer?: (
+    producer: SessionProviderInputOutcomeProducer,
+  ) => SessionProviderInputOutcomeObserver;
+  hasPendingProviderInputAcceptance?: SessionClientPort['hasPendingProviderInputAcceptance'];
+  hasCanonicalPendingProviderInputDelivery?: SessionClientPort['hasCanonicalPendingProviderInputDelivery'];
+  blockPendingMessageDelivery?: SessionClientPort['blockPendingMessageDelivery'];
+  hasOnlyBlockedPendingWork?: SessionClientPort['hasOnlyBlockedPendingWork'];
   hasActiveCanonicalTurn?: () => boolean;
   fetchRecentTranscriptTextItemsForAcpImport?: (opts?: { take?: number }) => Promise<Array<{ role: 'user' | 'agent'; text: string }>>;
   sendAgentMessage: (provider: unknown, body: unknown, opts?: unknown) => void;
@@ -91,6 +100,7 @@ export class DeferredApiSessionClient {
     controls: Partial<SessionRuntimeControls>;
     targetDispose: (() => void) | null;
   }>();
+  private readonly pendingProviderInputBindings: Array<(target: DeferredApiSessionTarget) => void> = [];
   private target: DeferredApiSessionTarget | null = null;
   private attachPromise: Promise<void> | null = null;
   private flushInFlight: Promise<void> | null = null;
@@ -208,6 +218,41 @@ export class DeferredApiSessionClient {
       }
       await commit.call(target, _message, _meta);
     }, 'sendClaudeSessionMessageCommittedExact');
+  }
+
+  bindProviderInputOutcomeProducer(producer: SessionProviderInputOutcomeProducer): SessionProviderInputOutcomeObserver {
+    if (this.cancelled || this.runtimeTerminationStarted) return () => {};
+    let observe: SessionProviderInputOutcomeObserver | undefined;
+    const bind = (target: DeferredApiSessionTarget) => {
+      observe = target.bindProviderInputOutcomeProducer?.(producer);
+    };
+    if (this.target) bind(this.target);
+    else this.pendingProviderInputBindings.push(bind);
+
+    // Unified fast startup can bind before attach. Until the canonical client exists there
+    // is no claimed Pending delivery to settle; it alone validates and fences each producer.
+    return (outcome) => {
+      if (!this.cancelled && !this.runtimeTerminationStarted) observe?.(outcome);
+    };
+  }
+
+  hasPendingProviderInputAcceptance(localId: string): boolean {
+    return this.target?.hasPendingProviderInputAcceptance?.(localId) ?? false;
+  }
+
+  hasCanonicalPendingProviderInputDelivery(localId: string): boolean {
+    // Unknown custody must not be interpreted as an already settled delivery.
+    return this.target?.hasCanonicalPendingProviderInputDelivery?.(localId) ?? true;
+  }
+
+  hasOnlyBlockedPendingWork(): boolean {
+    return this.target?.hasOnlyBlockedPendingWork?.() ?? false;
+  }
+
+  async blockPendingMessageDelivery(
+    params: Parameters<NonNullable<SessionClientPort['blockPendingMessageDelivery']>>[0],
+  ): Promise<boolean> {
+    return await this.withAttachedTarget((target) => target.blockPendingMessageDelivery?.(params) ?? false, false);
   }
 
   hasActiveCanonicalTurn(): boolean {
@@ -581,6 +626,8 @@ export class DeferredApiSessionClient {
     this.target = _real;
     this.sessionId = _real.sessionId;
 
+    for (const bind of this.pendingProviderInputBindings.splice(0)) bind(_real);
+
     for (const [method, handler] of this.registeredHandlers.entries()) {
       _real.rpcHandlerManager.registerHandler(method, handler);
     }
@@ -619,6 +666,7 @@ export class DeferredApiSessionClient {
   cancel(): void {
     if (this.cancelled) return;
     this.cancelled = true;
+    this.pendingProviderInputBindings.length = 0;
     this.pendingWakeDebt = false;
 
     const entries = this.buffer;

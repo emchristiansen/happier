@@ -161,6 +161,11 @@ describe('DropdownMenu', () => {
     });
 
     it('closes the menu when an item is selected by default', async () => {
+        const scheduled: FrameRequestCallback[] = [];
+        vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+            scheduled.push(callback);
+            return scheduled.length;
+        });
         const { DropdownMenu } = await import('./DropdownMenu');
         const onOpenChange = vi.fn();
         const onSelect = vi.fn();
@@ -178,8 +183,128 @@ describe('DropdownMenu', () => {
             selectableResults?.props?.onPressItem?.({ id: 'a' });
         });
 
-        expect(onSelect).toHaveBeenCalledWith('a');
         expect(onOpenChange).toHaveBeenCalledWith(false);
+        expect(onSelect).not.toHaveBeenCalled();
+        act(() => scheduled.shift()?.(0));
+        expect(onSelect).toHaveBeenCalledWith('a');
+    });
+
+    it('commits a closing menu selection after the selection press has completed', async () => {
+        const scheduled: FrameRequestCallback[] = [];
+        vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+            scheduled.push(callback);
+            return scheduled.length;
+        });
+        const { DropdownMenu } = await import('./DropdownMenu');
+        const events: string[] = [];
+
+        const screen = await renderScreen(React.createElement(DropdownMenu, {
+            open: true,
+            onOpenChange: (open) => events.push(open ? 'open' : 'close'),
+            items: [{ id: 'open-modal', title: 'Open modal' }],
+            onSelect: () => events.push('select'),
+            trigger: React.createElement('View'),
+        }));
+
+        const selectableResults = screen.findByType('SelectableMenuResults' as any);
+        act(() => {
+            selectableResults?.props?.onPressItem?.({ id: 'open-modal' });
+        });
+
+        expect(events).toEqual(['close']);
+
+        act(() => scheduled.shift()?.(0));
+
+        expect(events).toEqual(['close', 'select']);
+    });
+
+    it('uses the same close-before-commit sequence for keyboard selection', async () => {
+        const scheduled: FrameRequestCallback[] = [];
+        vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+            scheduled.push(callback);
+            return scheduled.length;
+        });
+        handleSelectableKeyPressSpy.mockImplementationOnce((_key, onSelect) => {
+            onSelect({ id: 'open-modal' });
+        });
+        const { DropdownMenu } = await import('./DropdownMenu');
+        const events: string[] = [];
+
+        const screen = await renderScreen(React.createElement(DropdownMenu, {
+            open: true,
+            onOpenChange: (open) => events.push(open ? 'open' : 'close'),
+            items: [{ id: 'open-modal', title: 'Open modal' }],
+            onSelect: () => events.push('select'),
+            trigger: React.createElement('View'),
+            search: true,
+        }));
+        const event = {
+            nativeEvent: { key: 'Enter' },
+            preventDefault: vi.fn(),
+            stopPropagation: vi.fn(),
+        };
+        act(() => screen.findByType('TextInput' as any)?.props?.onKeyPress?.(event));
+
+        expect(events).toEqual(['close']);
+        act(() => scheduled.shift()?.(0));
+        expect(events).toEqual(['close', 'select']);
+    });
+
+    it('still commits a closing selection when requestAnimationFrame does not run', async () => {
+        vi.stubGlobal('requestAnimationFrame', vi.fn(() => 1));
+        const { DropdownMenu } = await import('./DropdownMenu');
+        const onSelect = vi.fn();
+
+        const screen = await renderScreen(React.createElement(DropdownMenu, {
+            open: true,
+            onOpenChange: vi.fn(),
+            items: [{ id: 'open-modal', title: 'Open modal' }],
+            onSelect,
+            trigger: React.createElement('View'),
+        }));
+
+        const selectableResults = screen.findByType('SelectableMenuResults' as any);
+        act(() => selectableResults?.props?.onPressItem?.({ id: 'open-modal' }));
+        expect(onSelect).not.toHaveBeenCalled();
+
+        await act(async () => {
+            await new Promise<void>((resolve) => setTimeout(resolve, 120));
+        });
+        expect(onSelect).toHaveBeenCalledWith('open-modal');
+    });
+
+    it('does not let the timeout fallback overtake an available animation frame', async () => {
+        const scheduled: FrameRequestCallback[] = [];
+        vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+            scheduled.push(callback);
+            return scheduled.length;
+        });
+        const { DropdownMenu } = await import('./DropdownMenu');
+        const onSelect = vi.fn();
+
+        const screen = await renderScreen(React.createElement(DropdownMenu, {
+            open: true,
+            onOpenChange: vi.fn(),
+            items: [{ id: 'open-modal', title: 'Open modal' }],
+            onSelect,
+            trigger: React.createElement('View'),
+        }));
+
+        vi.useFakeTimers();
+        try {
+            const selectableResults = screen.findByType('SelectableMenuResults' as any);
+            act(() => selectableResults?.props?.onPressItem?.({ id: 'open-modal' }));
+
+            await act(async () => {
+                await vi.advanceTimersByTimeAsync(0);
+            });
+            expect(onSelect).not.toHaveBeenCalled();
+
+            act(() => scheduled.shift()?.(0));
+            expect(onSelect).toHaveBeenCalledWith('open-modal');
+        } finally {
+            vi.useRealTimers();
+        }
     });
 
     it('keeps the menu open when closeOnSelect is false', async () => {
@@ -206,6 +331,11 @@ describe('DropdownMenu', () => {
     });
 
     it('opens submenu items without selecting the parent row', async () => {
+        const scheduled: FrameRequestCallback[] = [];
+        vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+            scheduled.push(callback);
+            return scheduled.length;
+        });
         const { DropdownMenu } = await import('./DropdownMenu');
         const onOpenChange = vi.fn();
         const onSelect = vi.fn();
@@ -241,7 +371,7 @@ describe('DropdownMenu', () => {
         expect(popovers[1]?.props?.anchorRef).toBe(submenuAnchorRef);
         expect(popovers[1]?.props?.placement).toBe('auto-horizontal');
         expect(popovers[1]?.props?.boundaryRef).toBeNull();
-        expect(popovers[1]?.props?.portal?.web).toEqual({ target: 'body' });
+        expect(popovers[1]?.props?.portal?.web).toBe(true);
 
         const results = screen.findAllByType('SelectableMenuResults' as any);
         expect(results).toHaveLength(2);
@@ -249,8 +379,13 @@ describe('DropdownMenu', () => {
             results[1]?.props?.onPressItem?.({ id: 'move-to-folder:root' });
         });
 
-        expect(onSelect).toHaveBeenCalledWith('move-to-folder:root');
+        expect(onOpenChange).not.toHaveBeenCalledWith(false);
+        expect(onSelect).not.toHaveBeenCalled();
+        act(() => scheduled.shift()?.(0));
         expect(onOpenChange).toHaveBeenCalledWith(false);
+        expect(onSelect).not.toHaveBeenCalled();
+        act(() => scheduled.shift()?.(1));
+        expect(onSelect).toHaveBeenCalledWith('move-to-folder:root');
     });
 
     it('waits for a submenu anchor before opening the submenu popover', async () => {

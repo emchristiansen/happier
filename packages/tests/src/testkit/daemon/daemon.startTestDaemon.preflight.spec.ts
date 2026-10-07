@@ -382,7 +382,7 @@ describe('startTestDaemon', () => {
           testDir,
           happyHomeDir: homeDir,
           env: {
-            HAPPIER_E2E_DAEMON_STARTUP_PHASE_TIMEOUT_MS: '5000',
+            HAPPIER_E2E_DAEMON_STARTUP_PHASE_TIMEOUT_MS: '250',
           },
         }).then(
           () => 'started',
@@ -393,7 +393,7 @@ describe('startTestDaemon', () => {
 
       expect(result).toBeInstanceOf(Error);
       expect(String((result as Error).message)).toContain('phase=waitForDaemonState');
-      expect(String((result as Error).message)).toContain('timeoutMs=5000');
+      expect(String((result as Error).message)).toContain('timeoutMs=250');
       expect(String((result as Error).message)).toContain('daemonStateExists=no');
     } finally {
       await rm(testDir, { recursive: true, force: true });
@@ -551,6 +551,10 @@ describe('startTestDaemon', () => {
 
       const staleProc = spawnDetachedTestProcess(process.execPath, [resolve(staleScriptDir, 'index.mjs'), 'daemon', 'start-sync'], {
         stdio: 'ignore',
+        env: {
+          ...process.env,
+          HAPPIER_HOME_DIR: homeDir,
+        },
       });
       stalePid = staleProc.pid ?? null;
       expect(typeof stalePid).toBe('number');
@@ -679,6 +683,10 @@ describe('startTestDaemon', () => {
         'start-sync',
       ], {
         stdio: 'ignore',
+        env: {
+          ...process.env,
+          HAPPIER_HOME_DIR: homeDir,
+        },
       });
       originalPid = original.pid ?? null;
       expect(typeof originalPid).toBe('number');

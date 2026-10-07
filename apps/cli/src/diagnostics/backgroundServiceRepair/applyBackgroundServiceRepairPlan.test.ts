@@ -10,7 +10,8 @@ const {
   uninstallDaemonServiceMock: vi.fn(async () => undefined),
 }));
 
-vi.mock('@/daemon/service/installer', () => ({
+vi.mock('@/daemon/service/installer', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/daemon/service/installer')>(),
   installDaemonService: installDaemonServiceMock,
   uninstallDaemonService: uninstallDaemonServiceMock,
 }));

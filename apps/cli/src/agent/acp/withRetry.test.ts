@@ -1,4 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+import { logger } from '@/ui/logger';
 
 import { withRetry } from './withRetry';
 
@@ -11,7 +13,7 @@ describe('withRetry', () => {
         throw thrown;
       },
       {
-        operationName: 'test',
+        operationName: 'Initialize',
         maxAttempts: 1,
         baseDelayMs: 1,
         maxDelayMs: 1,
@@ -38,9 +40,56 @@ describe('withRetry', () => {
         async () => {
           throw err;
         },
-        { operationName: 'test', maxAttempts: 1, baseDelayMs: 1, maxDelayMs: 1 },
+        { operationName: 'Initialize', maxAttempts: 1, baseDelayMs: 1, maxDelayMs: 1 },
       ),
     ).rejects.toBe(err);
   });
-});
 
+  it('does not retry errors rejected by the shared backoff classification', async () => {
+    const err = Object.assign(new Error('ambiguous timeout'), { retryable: false as const });
+    const operation = vi.fn(async () => {
+      throw err;
+    });
+
+    await expect(withRetry(operation, {
+      operationName: 'Initialize',
+      maxAttempts: 3,
+      baseDelayMs: 1,
+      maxDelayMs: 1,
+    })).rejects.toBe(err);
+
+    expect(operation).toHaveBeenCalledTimes(1);
+  });
+
+  it('logs bounded attempt metadata without serializing the rejected value', async () => {
+    const secret = 'Bearer must-not-appear-in-acp-retry-log';
+    const debugSpy = vi.spyOn(logger, 'debug').mockImplementation(() => undefined);
+    let attempt = 0;
+
+    await expect(withRetry(async () => {
+      attempt += 1;
+      if (attempt === 1) throw new Error(`fetch failed: ${secret}`);
+      return 'ok';
+    }, {
+      operationName: 'Initialize',
+      maxAttempts: 2,
+      baseDelayMs: 1,
+      maxDelayMs: 1,
+    })).resolves.toBe('ok');
+
+    const retryLogs = debugSpy.mock.calls.filter(
+      ([message]) => message === '[AcpBackend] Retrying ACP request after failure',
+    );
+    expect(retryLogs).toEqual([[
+      '[AcpBackend] Retrying ACP request after failure',
+      {
+        operation: 'Initialize',
+        failedAttempt: 1,
+        nextAttempt: 2,
+        maxAttempts: 2,
+        failureKind: 'transport',
+      },
+    ]]);
+    expect(JSON.stringify(retryLogs)).not.toContain(secret);
+  });
+});

@@ -1,4 +1,5 @@
 import type { Credentials } from '@/persistence';
+import type { Metadata } from '@/api/types';
 import { updateSessionMetadataWithRetry } from '@/session/metadata/updateSessionMetadataWithRetry';
 import { fetchSessionByIdCompat } from '@/session/transport/http/sessionsHttp';
 
@@ -6,19 +7,11 @@ import { clearTerminalControlServiceabilityProjection } from './terminalControlS
 
 export type ExactTerminalControlServiceabilityRetirement = 'retired' | 'superseded';
 
-export function requireExactTerminalControlServiceabilityRetirement(
-  result: ExactTerminalControlServiceabilityRetirement | void,
-): void {
-  if (result === 'superseded') {
-    throw new Error('terminal_control_serviceability_retirement_superseded');
-  }
-}
-
 export async function retireExactTerminalControlServiceability(params: Readonly<{
   credentials: Credentials;
   sessionId: string;
   attachmentId: string;
-  terminalMode: 'plain' | 'tmux' | 'zellij' | 'windows_terminal' | 'windows_console';
+  terminalMode: NonNullable<Metadata['terminal']>['mode'];
 }>): Promise<ExactTerminalControlServiceabilityRetirement> {
   const rawSession = await fetchSessionByIdCompat({
     token: params.credentials.token,

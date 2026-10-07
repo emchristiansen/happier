@@ -339,7 +339,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: 1.3.5
+          bun-version: 1.4.2
       - name: Install dependencies
         env:
           YARN_PRODUCTION: "false"
@@ -348,7 +348,7 @@ jobs:
           HAPPIER_EMBEDDED_POLICY_ENV: ${{ needs.prepare.outputs.embedded_policy_env }}
         uses: ./.github/actions/install-yarn-dependencies
         with:
-          args: --frozen-lockfile --ignore-engines
+          args: --frozen-lockfile --ignore-engines --ignore-platform
       - name: Build unsigned CLI archives
         env:
           MINISIGN_SECRET_KEY: ""
@@ -362,7 +362,7 @@ jobs:
             --channel "$CHANNEL" \
             --version "$VERSION"
           find dist/release-assets/cli -type f ! -name '*.tar.gz' -delete
-          test "$(find dist/release-assets/cli -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d ' ')" = "5"
+          test "$(find dist/release-assets/cli -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d ' ')" = "15"
       - name: Upload unsigned candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -413,7 +413,9 @@ jobs:
         with:
           args: --frozen-lockfile --ignore-engines --ignore-scripts
       - name: Build trusted release archive runtime
-        run: yarn workspace @happier-dev/release-runtime build
+        run: |
+          yarn workspace @happier-dev/release-runtime build
+          node scripts/workspaces/ensureWorkspacePackagesBuiltCli.mjs @happier-dev/cli-common
       - name: Require Apple signing and notarization credentials
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -440,7 +442,7 @@ jobs:
         with:
           name: cli-candidate-${{ needs.prepare.outputs.version }}-${{ needs.prepare.outputs.source_sha }}
           path: dist/release-assets/cli
-      - name: Sign, notarize, and verify exact CLI archive
+      - name: Sign, notarize, and verify CLI and optional component archives
         env:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
@@ -451,26 +453,32 @@ jobs:
           SIGNING_IDENTITY: ${{ steps.apple_id.outputs.identity }}
         run: |
           set -euo pipefail
-          ARCHIVE="${GITHUB_WORKSPACE}/dist/release-assets/cli/happier-v${VERSION}-${TARGET}.tar.gz"
-          PAYLOAD="happier-v${VERSION}-${TARGET}"
-          EVIDENCE="${GITHUB_WORKSPACE}/dist/notary/${PLATFORM_KEY}.cli.json"
-          node scripts/pipeline/release/notarize-standalone-binary.mjs \
-            --archive "${ARCHIVE}" \
-            --expected-payload "${PAYLOAD}" \
-            --identity "${SIGNING_IDENTITY}" \
-            --out "${EVIDENCE}" \
-            --refresh-cli-runtime-asset-manifest
-          VERIFY_DIR="${RUNNER_TEMP}/happier-verify-${PLATFORM_KEY}"
-          node scripts/pipeline/release/node-archive.mjs \
-            --extract-archive-path "${ARCHIVE}" \
-            --extract-dir "${VERIFY_DIR}"
-          node scripts/pipeline/release/notarize-standalone-binary.mjs \
-            --verify-evidence \
-            --payload "${VERIFY_DIR}/${PAYLOAD}" \
-            --evidence "${EVIDENCE}"
-          CLI_BIN="${VERIFY_DIR}/${PAYLOAD}/happier"
-          test -x "$CLI_BIN"
-          "$CLI_BIN" --version
+          for PRODUCT in happier happier-memory-runtime happier-difftastic; do
+            ARCHIVE="${GITHUB_WORKSPACE}/dist/release-assets/cli/${PRODUCT}-v${VERSION}-${TARGET}.tar.gz"
+            PAYLOAD="${PRODUCT}-v${VERSION}-${TARGET}"
+            SUFFIX="$PRODUCT"
+            if [ "$PRODUCT" = happier ]; then
+              SUFFIX=cli
+            fi
+            EVIDENCE="${GITHUB_WORKSPACE}/dist/notary/${PLATFORM_KEY}.${SUFFIX}.json"
+            NOTARIZE_ARGS=(--archive "${ARCHIVE}" --expected-payload "${PAYLOAD}" --identity "${SIGNING_IDENTITY}" --out "${EVIDENCE}")
+            if [ "$PRODUCT" = happier ]; then
+              NOTARIZE_ARGS+=(--refresh-cli-runtime-asset-manifest)
+            fi
+            node scripts/pipeline/release/notarize-standalone-binary.mjs "${NOTARIZE_ARGS[@]}"
+            VERIFY_DIR="${RUNNER_TEMP}/${PRODUCT}-verify-${PLATFORM_KEY}"
+            node scripts/pipeline/release/node-archive.mjs \
+              --extract-archive-path "${ARCHIVE}" \
+              --extract-dir "${VERIFY_DIR}"
+            node scripts/pipeline/release/notarize-standalone-binary.mjs \
+              --verify-evidence \
+              --payload "${VERIFY_DIR}/${PAYLOAD}" \
+              --evidence "${EVIDENCE}"
+            node --input-type=module -e '
+              import { smokeTestArchive } from "./scripts/pipeline/release/verify-artifacts.mjs";
+              await smokeTestArchive({ archivePath: process.argv[1] });
+            ' "${ARCHIVE}"
+          done
       - name: Clean Apple signing material
         if: always()
         env:
@@ -488,9 +496,13 @@ jobs:
           set -euo pipefail
           rm -rf dist/signed-leaf
           mkdir -p dist/signed-leaf
-          cp "dist/release-assets/cli/happier-v${VERSION}-${TARGET}.tar.gz" dist/signed-leaf/
-          cp "dist/notary/${PLATFORM_KEY}.cli.json" dist/signed-leaf/
-          cp "dist/notary/${PLATFORM_KEY}.cli.json.notary-log.json" dist/signed-leaf/
+          for PRODUCT in happier happier-memory-runtime happier-difftastic; do
+            SUFFIX="$PRODUCT"
+            if [ "$PRODUCT" = happier ]; then SUFFIX=cli; fi
+            cp "dist/release-assets/cli/${PRODUCT}-v${VERSION}-${TARGET}.tar.gz" dist/signed-leaf/
+            cp "dist/notary/${PLATFORM_KEY}.${SUFFIX}.json" dist/signed-leaf/
+            cp "dist/notary/${PLATFORM_KEY}.${SUFFIX}.json.notary-log.json" dist/signed-leaf/
+          done
       - name: Upload signed Darwin leaf and evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -550,10 +562,14 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          cp "dist/signed-darwin/happier-v${VERSION}-darwin-arm64.tar.gz" dist/release-assets/cli/
-          cp "dist/signed-darwin/happier-v${VERSION}-darwin-x64.tar.gz" dist/release-assets/cli/
-          cp "dist/signed-darwin/darwin-arm64.cli.json" dist/release-assets/cli/
-          cp "dist/signed-darwin/darwin-x64.cli.json" dist/release-assets/cli/
+          for PRODUCT in happier happier-memory-runtime happier-difftastic; do
+            SUFFIX="$PRODUCT"
+            if [ "$PRODUCT" = happier ]; then SUFFIX=cli; fi
+            for TARGET in darwin-arm64 darwin-x64; do
+              cp "dist/signed-darwin/${PRODUCT}-v${VERSION}-${TARGET}.tar.gz" dist/release-assets/cli/
+              cp "dist/signed-darwin/${TARGET}.${SUFFIX}.json" dist/release-assets/cli/
+            done
+          done
       - name: Create scoped release token
         id: app_token
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547
@@ -610,6 +626,15 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22.x
+      - name: Enable trusted control Yarn
+        uses: ./.github/actions/enable-corepack-yarn
+      - name: Install artifact verifier dependencies
+        uses: ./.github/actions/install-yarn-dependencies
+        env:
+          YARN_PRODUCTION: 'false'
+          npm_config_production: 'false'
+          HAPPIER_INSTALL_SCOPE: protocol,agents,release-runtime,cli-common
+          HAPPIER_UI_VENDOR_WEB_ASSETS: '0'
       - name: Install minisign
         uses: ./.github/actions/bootstrap-minisign
       - name: Create scoped release token

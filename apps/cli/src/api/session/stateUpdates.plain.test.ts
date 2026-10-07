@@ -5,8 +5,47 @@ import {
   updateSessionMetadataWithAck,
 } from './stateUpdates';
 import { logger } from '@/ui/logger';
+import type { Metadata } from '../types';
+import { decodeBase64, decrypt } from '../encryption';
+import { createTestMetadata } from '@/testkit/backends/sessionMetadata';
 
 describe('stateUpdates (plaintext sessions)', () => {
+  it.each(['plain', 'e2ee'] as const)('keeps Herdr metadata readable by released UIs across %s metadata acknowledgements', async (mode) => {
+    let metadata: Metadata | null = createTestMetadata({
+      path: '/tmp', host: 'localhost',
+      terminal: {
+        mode: 'herdr', requested: 'herdr',
+        herdr: { sessionName: 'work', socketPath: '/tmp/herdr.sock', terminalId: 'term_123' },
+      },
+    });
+    let version = 1;
+    const encryptionKey = new Uint8Array(32);
+    const socket = {
+      emitWithAck: async (_event: string, payload: { metadata: string; expectedVersion: number }) => {
+        const wire: unknown = mode === 'plain'
+          ? JSON.parse(payload.metadata)
+          : decrypt(encryptionKey, 'legacy', decodeBase64(payload.metadata));
+        expect(wire).toMatchObject({
+          name: 'renamed',
+          terminal: { mode: 'plain', hostKind: 'herdr', requested: 'plain', requestedHostKind: 'herdr' },
+        });
+        return { result: 'success', metadata: payload.metadata, version: payload.expectedVersion + 1 };
+      },
+    };
+    await updateSessionMetadataWithAck({
+      socket, sessionId: 's1', sessionEncryptionMode: mode,
+      encryptionKey, encryptionVariant: 'legacy',
+      getMetadata: () => metadata, setMetadata: (next) => { metadata = next; },
+      getMetadataVersion: () => version, setMetadataVersion: (next) => { version = next; },
+      syncSessionSnapshotFromServer: async () => {},
+      handler: (current) => ({ ...current, name: 'renamed' }),
+    });
+    expect(metadata?.terminal).toEqual({
+      mode: 'herdr', requested: 'herdr',
+      herdr: { sessionName: 'work', socketPath: '/tmp/herdr.sock', terminalId: 'term_123' },
+    });
+    expect(version).toBe(2);
+  });
   it('sends + applies plaintext metadata updates when session encryption mode is plain', async () => {
     const emitWithAck = vi.fn(async (_event: string, payload: any) => {
       expect(typeof payload.metadata).toBe('string');
@@ -282,27 +321,42 @@ describe('stateUpdates (plaintext sessions)', () => {
   });
 
   it('rejects metadata update acks that are neither success nor version mismatch', async () => {
-    const emitWithAck = vi.fn(async () => ({ result: 'error' }));
-    let metadata: any = { path: '/tmp', host: 'localhost' };
+    const privateServerError = 'fixture-private-server-error';
+    const emitWithAck = vi.fn(async () => ({ result: 'error', error: privateServerError }));
+    const initialMetadata = createTestMetadata({ path: '/private/workspace', host: 'localhost' });
+    let metadata: Metadata | null = initialMetadata;
     let version = 1;
+    const infoFile = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
 
-    await expect(updateSessionMetadataWithAck({
-      socket: { emitWithAck },
-      sessionId: 's1',
-      sessionEncryptionMode: 'plain',
-      encryptionKey: new Uint8Array(32),
-      encryptionVariant: 'legacy',
-      getMetadata: () => metadata,
-      setMetadata: (next) => {
-        metadata = next;
-      },
-      getMetadataVersion: () => version,
-      setMetadataVersion: (next) => {
-        version = next;
-      },
-      syncSessionSnapshotFromServer: async () => {},
-      handler: (current) => ({ ...current, path: '/tmp2' }),
-    })).rejects.toThrow(/metadata update failed/i);
+    try {
+      await expect(updateSessionMetadataWithAck({
+        socket: { emitWithAck },
+        sessionId: 's1',
+        sessionEncryptionMode: 'plain',
+        encryptionKey: new Uint8Array(32),
+        encryptionVariant: 'legacy',
+        getMetadata: () => metadata,
+        setMetadata: (next) => {
+          metadata = next;
+        },
+        getMetadataVersion: () => version,
+        setMetadataVersion: (next) => {
+          version = next;
+        },
+        syncSessionSnapshotFromServer: async () => {},
+        handler: (current) => ({ ...current, path: '/tmp2' }),
+      })).rejects.toMatchObject({ code: 'metadata_update_failed', retryable: false });
+      expect(metadata).toBe(initialMetadata);
+      expect(version).toBe(1);
+      expect(infoFile.mock.calls).toEqual([[
+        expect.any(String),
+        { phase: 'terminal_failure', operation: 'update-metadata', sessionId: 's1' },
+      ]]);
+      expect(JSON.stringify(infoFile.mock.calls)).not.toContain(privateServerError);
+      expect(JSON.stringify(infoFile.mock.calls)).not.toContain('/private/workspace');
+    } finally {
+      infoFile.mockRestore();
+    }
   });
 
   it('re-runs metadata updater against refreshed metadata after a version mismatch', async () => {

@@ -172,6 +172,14 @@ const USAGE_WINDOW_ID_KEYS = [
   'type',
 ] as const;
 
+const USAGE_WINDOW_PROVIDER_LIMIT_ID_KEYS = [
+  'provider_limit_id',
+  'providerLimitId',
+  'limit_id',
+  'limitId',
+  'id',
+] as const;
+
 const USAGE_WINDOW_WINDOW_KEYS = [
   'group',
   'window',
@@ -298,7 +306,8 @@ function formatWindowLabelSuffix(raw: string): string {
     .join(' ');
 }
 
-function resolveUsageWindowLabel(meterId: string): string {
+/** Label for a Claude subscription usage window (`five_hour`, `seven_day_*`, …); null for other ids. */
+export function resolveClaudeUsageWindowLabel(meterId: string): string | null {
   const known = WINDOW_LABELS[meterId];
   if (known) return known;
   for (const { prefix, label } of WINDOW_LABEL_PREFIXES) {
@@ -307,7 +316,11 @@ function resolveUsageWindowLabel(meterId: string): string {
       return suffix ? `${label} (${suffix})` : label;
     }
   }
-  return formatWindowLabelSuffix(meterId) || meterId;
+  return null;
+}
+
+function resolveUsageWindowLabel(meterId: string): string {
+  return resolveClaudeUsageWindowLabel(meterId) ?? (formatWindowLabelSuffix(meterId) || meterId);
 }
 
 function readNonEmptyStringProperty(
@@ -360,6 +373,41 @@ function readScopedUsageWindowModel(record: Record<string, unknown>): string | n
     'model_id',
     'modelId',
   ]);
+}
+
+function readScopedUsageWindowModelId(record: Record<string, unknown>): string | null {
+  const direct = readNonEmptyStringProperty(record, ['model_id', 'modelId']);
+  if (direct) return direct;
+  const directModel = record.model;
+  if (typeof directModel === 'string' && directModel.trim()) return directModel.trim();
+  if (isRecord(directModel)) {
+    const id = readNonEmptyStringProperty(directModel, ['id', 'model_id', 'modelId']);
+    if (id) return id;
+  }
+  const scope = isRecord(record.scope) ? record.scope : null;
+  if (!scope) return null;
+  const scopedModel = scope.model;
+  if (typeof scopedModel === 'string' && scopedModel.trim()) return scopedModel.trim();
+  if (isRecord(scopedModel)) return readNonEmptyStringProperty(scopedModel, ['id', 'model_id', 'modelId']);
+  return readNonEmptyStringProperty(scope, ['model_id', 'modelId']);
+}
+
+function readScopedUsageWindowModelDisplayName(record: Record<string, unknown>): string | null {
+  const direct = readNonEmptyStringProperty(record, ['model_display_name', 'modelDisplayName', 'model_name', 'modelName']);
+  if (direct) return direct;
+  const directModel = record.model;
+  if (isRecord(directModel)) {
+    const displayName = readNonEmptyStringProperty(directModel, ['display_name', 'displayName', 'name']);
+    if (displayName) return displayName;
+  }
+  const scope = isRecord(record.scope) ? record.scope : null;
+  if (!scope) return null;
+  const scopedModel = scope.model;
+  if (isRecord(scopedModel)) {
+    const displayName = readNonEmptyStringProperty(scopedModel, ['display_name', 'displayName', 'name']);
+    if (displayName) return displayName;
+  }
+  return readNonEmptyStringProperty(scope, ['model_display_name', 'modelDisplayName', 'model_name', 'modelName']);
 }
 
 function readFiniteNumberProperty(
@@ -486,16 +534,29 @@ function buildUsageWindowMeter(
   const utilizationPct = resolveUsageWindowUtilizationPct(window);
   const used = window ? readFiniteNumberProperty(window, USAGE_WINDOW_USED_KEYS) : null;
   const limit = window ? readFiniteNumberProperty(window, USAGE_WINDOW_LIMIT_KEYS) : null;
+  const providerLimitId = window
+    ? readNonEmptyStringProperty(window, USAGE_WINDOW_PROVIDER_LIMIT_ID_KEYS) ?? meterId
+    : meterId;
+  const modelId = window ? readScopedUsageWindowModelId(window) : null;
+  const modelDisplayName = window ? readScopedUsageWindowModelDisplayName(window) : null;
+  const rawKind = window ? readNonEmptyStringProperty(window, ['kind', 'type']) : null;
   return {
     meterId,
     label: resolveUsageWindowLabel(meterId),
+    ...(meterId === 'seven_day' || meterId.startsWith('seven_day_') ? { windowDurationMs: 604_800_000 }
+      : meterId === 'five_hour' || meterId.startsWith('five_hour_') ? { windowDurationMs: 18_000_000 } : {}),
     used,
     limit,
     unit: resolveUsageWindowUnit(window),
     utilizationPct,
+    providerLimitId,
+    ...(modelId ? { modelId } : {}),
     resetsAt: resolveUsageWindowResetAtMs(window),
     status: utilizationPct === null ? 'unavailable' : 'ok',
-    details: {},
+    details: {
+      ...(rawKind ? { rawScope: rawKind } : {}),
+      ...(modelDisplayName ? { modelDisplayName } : {}),
+    },
   };
 }
 

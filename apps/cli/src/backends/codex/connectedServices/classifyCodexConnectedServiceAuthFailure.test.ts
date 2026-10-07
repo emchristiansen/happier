@@ -25,8 +25,10 @@ describe('classifyCodexConnectedServiceAuthFailure', () => {
     });
 
     expect(result).toMatchObject({
-      kind: 'permission_denied',
+      kind: 'plan',
       limitCategory: 'plan_invalid',
+      quotaScope: 'model',
+      providerLimitId: 'gpt-5.6-sol',
       source: 'structured_provider_error',
     });
   });
@@ -46,8 +48,10 @@ describe('classifyCodexConnectedServiceAuthFailure', () => {
     });
 
     expect(result).toMatchObject({
-      kind: 'permission_denied',
+      kind: 'plan',
       limitCategory: 'plan_invalid',
+      quotaScope: 'model',
+      providerLimitId: 'gpt-5.6-sol',
       source: 'structured_provider_error',
     });
   });
@@ -368,6 +372,20 @@ describe('classifyCodexConnectedServiceAuthFailure', () => {
       limitCategory: 'capacity',
       quotaScope: 'provider',
       source: 'structured_provider_error',
+    });
+  });
+
+  it('classifies revoked application network permission as a transient provider failure', () => {
+    expect(classifyCodexConnectedServiceAuthFailure({
+      providerErrorPath: true,
+      error: new Error('Fatal error: application network permission was revoked'),
+      serviceId: 'openai-codex',
+      profileId: 'work',
+      groupId: 'pool',
+    })).toMatchObject({
+      kind: 'capacity',
+      limitCategory: 'capacity',
+      quotaScope: 'provider',
     });
   });
 

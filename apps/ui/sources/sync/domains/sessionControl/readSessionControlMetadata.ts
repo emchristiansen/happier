@@ -1,3 +1,5 @@
+import { readAcpConfiguredBackendV1FromMetadata } from '@happier-dev/protocol';
+import type { AgentId } from '@/agents/catalog/catalog';
 import {
     LEGACY_ACP_CONFIG_OPTIONS_STATE_KEY,
     LEGACY_ACP_CONFIG_OPTION_OVERRIDES_KEY,
@@ -73,4 +75,17 @@ export function readSessionConfigOptionOverridesState(
         keys: [SESSION_CONFIG_OPTION_OVERRIDES_KEY, LEGACY_ACP_CONFIG_OPTION_OVERRIDES_KEY],
         parse: parseSessionConfigOptionOverridesState,
     }) ?? null;
+}
+
+/** Match control metadata to the session's backend, preserving configured ACP identity. */
+export function matchesSessionControlProvider(params: Readonly<{
+    agentId: AgentId;
+    metadata: Metadata | null | undefined;
+    provider: string | null | undefined;
+}>): boolean {
+    const configuredBackend = readAcpConfiguredBackendV1FromMetadata(params.metadata);
+    const expectedProvider = configuredBackend
+        ? `acp:${configuredBackend.backendId}`
+        : params.agentId;
+    return params.provider === expectedProvider;
 }

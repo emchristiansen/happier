@@ -5,9 +5,15 @@ import type { Settings } from '@/sync/domains/settings/settings';
 
 import { resolveDirectBrowseSourceOptions } from './resolveDirectBrowseSourceOptions';
 
+/**
+ * Whether the resume-id picker can browse the provider's own sessions. Both a directly readable
+ * provider session store and a resume-only ACP `session/list` source qualify, because the picker
+ * only ever returns a vendor resume id for a new Happier-owned session.
+ */
 export function canBrowseDirectSessions(agentId: AgentId): boolean {
-    return getAgentCore(agentId).sessionStorage.direct === true
-        && typeof getAgentBehavior(agentId).directSessions?.browse?.getSourceOptions === 'function';
+    const browse = getAgentBehavior(agentId).directSessions?.browse;
+    if (typeof browse?.getSourceOptions !== 'function') return false;
+    return getAgentCore(agentId).sessionStorage.direct === true || browse.resumeOnly === true;
 }
 
 export function resolveDirectBrowseLockedSource(params: Readonly<{
@@ -15,11 +21,13 @@ export function resolveDirectBrowseLockedSource(params: Readonly<{
     agentOptionState?: Record<string, unknown> | null;
     profile: Pick<AccountProfile, 'connectedServicesV2'> | null | undefined;
     settings: Pick<Settings, 'connectedServicesProfileLabelByKey'>;
+    directory?: string | null;
 }>): DirectSessionsSource | null {
     const sourceOptions = resolveDirectBrowseSourceOptions({
         providerId: params.providerId,
         profile: params.profile,
         settings: params.settings,
+        directory: params.directory ?? null,
     });
     if (sourceOptions.length === 0) return null;
 

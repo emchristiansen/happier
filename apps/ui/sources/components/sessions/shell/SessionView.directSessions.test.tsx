@@ -8,6 +8,7 @@ import {
   ConnectedServiceQuotaSnapshotV1Schema,
   ProviderAccountUsageSnapshotV1Schema,
   SESSION_RUNNER_RUNTIME_STATE_FIELD_ID,
+  type ActionOperationSnapshotV1,
   type ProviderAccountUsageSnapshotV1,
   type SessionRunnerRuntimeStateV1,
 } from '@happier-dev/protocol';
@@ -15,6 +16,8 @@ import type { connectedServiceQuotaRecoveryCreditConsume } from '@/sync/ops/conn
 import type { RestartStaleSessionRunnerResult } from '@/sync/ops/sessionRunnerRestart';
 import type { SessionUsageLimitRecoveryOperationResult } from '@/sync/ops/sessionUsageLimitRecovery';
 
+import { actionOperationStore } from '@/sync/domains/actionOperations/actionOperationStore';
+import { createActionOperationFixture } from '@/dev/testkit/fixtures/actionOperationFixtures';
 import { AppPaneProvider } from '@/components/appShell/panes/AppPaneProvider';
 import { createDeferred, pressTestInstanceAsync, renderScreen, standardCleanup } from '@/dev/testkit';
 import { localSettingsDefaults, type LocalSettings } from '@/sync/domains/settings/localSettings';
@@ -42,7 +45,10 @@ const TEST_SESSION_DRAFT_ADDRESS = { kind: 'session' as const, sessionId: 's1' }
 
 const machineDirectSessionStatusGetSpy = vi.hoisted(() => vi.fn());
 const machineDirectSessionTakeoverSpy = vi.hoisted(() => vi.fn(async () => ({ ok: true })));
-const machineDirectSessionTakeoverPersistSpy = vi.hoisted(() => vi.fn(async () => ({ ok: true, converted: true })));
+const actionOperationRpcSpy = vi.hoisted(() => vi.fn());
+let operationAccountId = '';
+let operationTestIndex = 0;
+const syncRefreshSessionsSpy = vi.hoisted(() => vi.fn(async () => {}));
 const syncRefreshSessionMessagesSpy = vi.hoisted(() => vi.fn(async () => {}));
 const syncSubmitMessageSpy = vi.hoisted(() => vi.fn(async (..._args: unknown[]) => {}));
 const resumeSessionSpy = vi.hoisted(() => vi.fn(async (_options: unknown) => ({ type: 'success' as const, sessionId: 's1' })));
@@ -131,6 +137,7 @@ const publishSessionAcpConfigOptionOverrideToMetadataSpy = vi.hoisted(() => vi.f
 const modalAlertSpy = vi.hoisted(() => vi.fn());
 const routerPushSpy = vi.hoisted(() => vi.fn());
 const chatListPropsSpy = vi.hoisted(() => vi.fn());
+const transcriptIdsState = vi.hoisted(() => ({ ids: ['m1'] as string[] }));
 const chatHeaderPropsSpy = vi.hoisted(() => vi.fn());
 const chatHeaderHarnessState = vi.hoisted(() => ({ renderRightElement: false }));
 const voiceSurfacePropsSpy = vi.hoisted(() => vi.fn());
@@ -151,6 +158,7 @@ const featureEnabledState = vi.hoisted(() => ({
   'files.reviewComments': false,
   'sessions.usageLimitRecovery': false,
   'connectedServices.quotas': false,
+  'connectedServices.poolQuotaLimitSelection': false,
 }));
 const keyboardAvoidanceState = vi.hoisted(() => ({
   availablePanelHeight: undefined as number | undefined,
@@ -167,6 +175,10 @@ const draftHookState = vi.hoisted(() => ({
 const quotaSnapshotsState = vi.hoisted(() => ({
   current: {} as Record<string, any>,
   requestedProfiles: [] as ReadonlyArray<Readonly<{ serviceId: string; profileId: string }>>,
+}));
+const connectedServiceAuthGroupsState = vi.hoisted(() => ({
+  groups: [] as any[],
+  requestedServiceIds: [] as string[],
 }));
 const providerAccountUsageSnapshotsState = vi.hoisted(() => ({
   current: {} as Record<string, ProviderAccountUsageSnapshotV1 | null>,
@@ -359,12 +371,13 @@ installSessionShellCommonModuleMocks({
         useIsDataReady: () => true,
         useRealtimeStatus: () => 'connected',
         useSessionMessages: () => ({ messages: sessionMessagesState.current, isLoaded: true }),
-        useSessionTranscriptIds: () => ({ ids: ['m1'], isLoaded: true, hasRetainedContent: false }),
+        useSessionTranscriptIds: () => ({ ids: transcriptIdsState.ids, isLoaded: true, hasRetainedContent: false }),
         useSessionPendingMessages: () => ({ messages: [], discarded: [], isLoaded: true }),
         useWorkspaceReviewCommentsDrafts: () => reviewCommentDraftsState.current,
         useSessionReviewCommentsDrafts: () => reviewCommentDraftsState.current,
         useSessionUsage: () => null,
         useProfile: () => storageState.profile,
+        useActiveServerAccountScope: () => ({ ...TEST_SERVER_ACCOUNT_SCOPE, accountId: operationAccountId }),
         useLocalSetting: readLocalSetting,
         useLocalSettingMutable: <K extends keyof LocalSettings>(key: K) => [readLocalSetting(key), vi.fn<(value: LocalSettings[K]) => void>()],
         useSetting: readSetting,
@@ -393,8 +406,12 @@ vi.mock('@react-navigation/native', () => ({
   useIsFocused: () => true,
 }));
 
+const authContextState = vi.hoisted(() => ({
+  value: { credentials: { token: 't', secret: 's' } },
+}));
+
 vi.mock('@/auth/context/AuthContext', () => ({
-  useAuth: () => ({ credentials: { token: 't', secret: 's' } }),
+  useAuth: () => authContextState.value,
 }));
 
 vi.mock('@/hooks/server/connectedServices/useConnectedServiceQuotaSnapshots', () => ({
@@ -404,6 +421,13 @@ vi.mock('@/hooks/server/connectedServices/useConnectedServiceQuotaSnapshots', ()
       snapshotsByKey: quotaSnapshotsState.current,
       loadingByKey: {},
     };
+  },
+}));
+
+vi.mock('@/sync/api/account/apiConnectedServiceAuthGroupsV3', () => ({
+  listConnectedServiceAuthGroupsV3: async (_credentials: unknown, params: { serviceId: string }) => {
+    connectedServiceAuthGroupsState.requestedServiceIds.push(params.serviceId);
+    return connectedServiceAuthGroupsState.groups;
   },
 }));
 
@@ -607,7 +631,7 @@ vi.mock('@/sync/sync', () => ({
     publishSessionAcpSessionModeOverrideToMetadata: publishSessionAcpSessionModeOverrideToMetadataSpy,
     publishSessionAcpConfigOptionOverrideToMetadata: publishSessionAcpConfigOptionOverrideToMetadataSpy,
     publishSessionModelOverrideToMetadata: async () => {},
-    refreshSessions: async () => {},
+    refreshSessions: syncRefreshSessionsSpy,
     refreshSessionMessages: syncRefreshSessionMessagesSpy,
     refreshSessionForSubmit: async (sessionId: string) =>
       storageState.sessions[sessionId as keyof typeof storageState.sessions] ?? null,
@@ -630,10 +654,13 @@ vi.mock('@/sync/ops', async (importOriginal) => {
     sessionSwitch: vi.fn(async () => true),
   };
 });
-vi.mock('@/sync/ops/machineDirectSessions', () => ({
+vi.mock('@/sync/ops/machineDirectSessions', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/sync/ops/machineDirectSessions')>(),
   machineDirectSessionStatusGet: machineDirectSessionStatusGetSpy,
   machineDirectSessionTakeover: machineDirectSessionTakeoverSpy,
-  machineDirectSessionTakeoverPersist: machineDirectSessionTakeoverPersistSpy,
+}));
+vi.mock('@/sync/runtime/orchestration/serverScopedRpc/serverScopedMachineRpc', () => ({
+  machineRpcWithServerScope: actionOperationRpcSpy,
 }));
 vi.mock('@/sync/ops/sessionUsageLimitRecovery', () => ({
   sessionUsageLimitWaitResumeEnable: (sessionId: string, request?: unknown, opts?: unknown) =>
@@ -1057,6 +1084,7 @@ describe('SessionView (direct sessions)', () => {
     __resetConnectedServiceQuotaSnapshotStore();
     sessionRunnerRuntimeStatusRetention.clear();
     chatListPropsSpy.mockReset();
+    transcriptIdsState.ids = ['m1'];
     chatHeaderPropsSpy.mockReset();
     chatHeaderHarnessState.renderRightElement = false;
     voiceSurfacePropsSpy.mockReset();
@@ -1064,6 +1092,7 @@ describe('SessionView (direct sessions)', () => {
     featureEnabledState['files.reviewComments'] = false;
     featureEnabledState['sessions.usageLimitRecovery'] = false;
     featureEnabledState['connectedServices.quotas'] = false;
+    featureEnabledState['connectedServices.poolQuotaLimitSelection'] = false;
     keyboardAvoidanceState.availablePanelHeight = undefined;
     keyboardAvoidanceState.keyboardHeight = 0;
     settingsState.current = {};
@@ -1101,7 +1130,10 @@ describe('SessionView (direct sessions)', () => {
     clearWorkspaceReviewCommentDraftsSpy.mockReset();
     setWorkspaceReviewCommentDraftIncludedSpy.mockReset();
     machineDirectSessionTakeoverSpy.mockReset();
-    machineDirectSessionTakeoverPersistSpy.mockReset();
+    operationAccountId = `shell-import-${++operationTestIndex}`;
+    actionOperationRpcSpy.mockReset();
+    actionOperationRpcSpy.mockResolvedValue({ items: [], nextCursor: null });
+    syncRefreshSessionsSpy.mockReset();
     machineDirectSessionStatusGetSpy.mockReset();
     showDirectSessionTakeoverDialogSpy.mockReset();
     sendVoiceSessionComposerTextSpy.mockReset();
@@ -1114,6 +1146,8 @@ describe('SessionView (direct sessions)', () => {
     draftHookState.valuesBySessionId.clear();
     quotaSnapshotsState.current = {};
     quotaSnapshotsState.requestedProfiles = [];
+    connectedServiceAuthGroupsState.groups = [];
+    connectedServiceAuthGroupsState.requestedServiceIds = [];
     providerAccountUsageSnapshotsState.current = {};
     providerAccountUsageSnapshotsState.requestedRecordIds = [];
     storageState.sessions.s1 = {
@@ -2320,12 +2354,22 @@ describe('SessionView (direct sessions)', () => {
             groupId: 'backup-account',
             fetchedAtMs: 10_000,
           },
+          allWindows: [
+            { meterId: 'weekly', scope: 'Weekly', remainingPct: 42 },
+            { meterId: 'daily', scope: 'Daily', remainingPct: 55 },
+            { meterId: 'five_hour', scope: '5-hour', remainingPct: 70 },
+          ],
           effectiveMeterId: 'weekly',
           effectiveRemainingPct: 42,
         },
       },
     };
 
+    settingByKeyState.current.sessionProviderUsageGaugeWindowModes = ['weekly'];
+    settingByKeyState.current.connectedServicesQuotaPinnedMeterIdsByKey = {
+      'openai-codex/launch-profile': ['daily'],
+      'openai-codex/backup-profile': ['five_hour'],
+    };
     const screen = await renderSessionViewAndSettle();
 
     expect(findAgentInput(screen).props.providerUsageGauge).toEqual(expect.objectContaining({
@@ -2333,6 +2377,8 @@ describe('SessionView (direct sessions)', () => {
       providerDisplayName: 'connectedServices.serviceNames.openaiCodex',
       activeAccountDisplayLabel: 'backup-account',
     }));
+    expect(findAgentInput(screen).props.providerUsageGauge.usageRings.map((ring: { meterId: string }) => ring.meterId))
+      .toEqual(['weekly', 'five_hour']);
   });
 
   it('uses runtime quota evidence for provider usage title when no launch-time profile binding exists', async () => {
@@ -2477,6 +2523,12 @@ describe('SessionView (direct sessions)', () => {
         }],
       }],
     };
+    connectedServiceAuthGroupsState.groups = [{
+      groupId: 'happier',
+      activeProfileId: 'active-profile',
+      members: [],
+      policy: { quotaLimitSelection: { mode: 'all' } },
+    }];
     storageState.sessions.s1 = {
       ...storageState.sessions.s1,
       metadata: {
@@ -2528,6 +2580,63 @@ describe('SessionView (direct sessions)', () => {
       serviceId: 'openai-codex',
       activeAccountDisplayLabel: 'Active Codex account',
       ringValueLabel: '65',
+    }));
+  });
+
+  it('uses only the group-selected allowance in the session usage badge', async () => {
+    featureEnabledState['connectedServices.quotas'] = true;
+    featureEnabledState['connectedServices.poolQuotaLimitSelection'] = true;
+    storageState.profile = {
+      connectedServicesV2: [{
+        serviceId: 'openai-codex',
+        profiles: [{ profileId: 'active-profile', status: 'connected', kind: 'oauth' }],
+        groups: [{
+          groupId: 'happier',
+          activeProfileId: 'active-profile',
+          generation: 7,
+          memberProfileIds: ['active-profile'],
+        }],
+      }],
+    };
+    connectedServiceAuthGroupsState.groups = [{
+      groupId: 'happier',
+      activeProfileId: 'active-profile',
+      generation: 7,
+      members: [],
+      policy: { quotaLimitSelection: { mode: 'selected', providerLimitIds: ['standard'] } },
+    }];
+    storageState.sessions.s1 = {
+      ...storageState.sessions.s1,
+      metadata: {
+        ...storageState.sessions.s1.metadata,
+        connectedServices: {
+          bindingsByServiceId: {
+            'openai-codex': { source: 'connected', selection: 'group', groupId: 'happier' },
+          },
+        },
+      },
+    };
+    quotaSnapshotsState.current = {
+      'openai-codex/active-profile': {
+        v: 1,
+        serviceId: 'openai-codex',
+        profileId: 'active-profile',
+        fetchedAt: Date.now(),
+        staleAfterMs: 60_000,
+        planLabel: null,
+        accountLabel: 'Active Codex account',
+        meters: [
+          { meterId: 'standard:primary', providerLimitId: 'standard', label: 'Session', used: 20, limit: 100, unit: 'count', utilizationPct: null, resetsAt: null, status: 'ok', details: {} },
+          { meterId: 'spark:primary', providerLimitId: 'spark', label: 'Spark', used: 95, limit: 100, unit: 'count', utilizationPct: null, resetsAt: null, status: 'ok', details: {} },
+        ],
+      },
+    };
+
+    const screen = await renderSessionViewAndSettle();
+
+    expect(connectedServiceAuthGroupsState.requestedServiceIds).toContain('openai-codex');
+    expect(findAgentInput(screen).props.providerUsageGauge).toEqual(expect.objectContaining({
+      ringValueLabel: '80',
     }));
   });
 
@@ -2601,6 +2710,27 @@ describe('SessionView (direct sessions)', () => {
     }));
     expect(findAgentInput(screen).props.onProviderUsageRecoveryCreditPress).toBeUndefined();
     expect(screen.findByTestId('session-usageLimit-recovery-consumeResetCredit')).toBeNull();
+  });
+
+  it('combines global windows with the active connected account favorites', async () => {
+    featureEnabledState['connectedServices.quotas'] = true;
+    installConnectedServiceWorkProfileRecoveryCreditSession();
+    const snapshot = buildOpenAiCodexWorkQuotaSnapshot({ fetchedAt: 2_000, used: 82 });
+    quotaSnapshotsState.current = {
+      'openai-codex/work': { ...snapshot, meters: [
+        ...snapshot.meters,
+        { ...snapshot.meters[0]!, meterId: 'five_hour', label: '5-hour', windowDurationMs: 18_000_000, used: 30 },
+        { ...snapshot.meters[0]!, meterId: 'daily', label: 'Daily', windowDurationMs: 86_400_000, used: 95 },
+      ] },
+    };
+
+    settingByKeyState.current.connectedServicesQuotaPinnedMeterIdsByKey = { 'openai-codex/work': ['daily'] };
+    settingByKeyState.current.sessionProviderUsageGaugeWindowModes = ['weekly', 'session'];
+
+    const screen = await renderSessionViewAndSettle({ routeServerId: 'server-route-1' });
+    expect(findAgentInput(screen).props.providerUsageGauge.usageRings
+      .map((ring: { meterId: string; ringValueLabel: string }) => [ring.meterId, ring.ringValueLabel]))
+      .toEqual([['weekly', '18'], ['five_hour', '70'], ['daily', '5']]);
   });
 
   it('uses connected-service reset-credit consumption from the connected-service quota view for connected-service-bound account usage', async () => {
@@ -2878,7 +3008,9 @@ describe('SessionView (direct sessions)', () => {
     );
   });
 
-  it('passes direct takeover footer actions to the transcript when a linked direct session is not yet controlled', async () => {
+  it('passes direct takeover footer actions when an uncontrolled linked direct session has an empty transcript', async () => {
+    storageState.sessions.s1.seq = 0;
+    transcriptIdsState.ids = [];
     const screen = await renderSessionView();
 
     const latestChatListProps = chatListPropsSpy.mock.calls.at(-1)?.[0];
@@ -2898,6 +3030,49 @@ describe('SessionView (direct sessions)', () => {
     }, { serverId: 'server-1' });
     expect(modalAlertSpy).not.toHaveBeenCalled();
 
+  });
+
+  it.each([
+    { terminal: 'failed' as const, refreshFails: false },
+    { terminal: 'succeeded' as const, refreshFails: true },
+    { terminal: 'succeeded' as const, refreshFails: false },
+  ])('keeps the same footer through empty conversion to $terminal (refresh fails: $refreshFails)', async ({ terminal, refreshFails }) => {
+    storageState.sessions.s1.seq = 0;
+    transcriptIdsState.ids = [];
+    const running = createActionOperationFixture({ operationId: `import-${operationAccountId}`,
+      scope: { accountId: operationAccountId, machineId: 'machine-1', sessionId: 's1' },
+      cancellation: 'unsupported', progress: { kind: 'phase', phase: 'converting', label: 'Converting' } });
+    const screen = await renderSessionViewAndSettle();
+    actionOperationRpcSpy.mockResolvedValue({ ok: true, operation: running });
+    await act(async () => { chatListPropsSpy.mock.calls.at(-1)?.[0]?.directControlFooter.onRequestTakeOverPersist(); });
+    await flushHookEffects();
+    const { storage } = await import('@/sync/domains/state/storage');
+    const { directSessionV1: _removed, ...metadata } = storageState.sessions.s1.metadata;
+    storageState.sessions.s1 = { ...storageState.sessions.s1, metadata };
+    chatListPropsSpy.mockClear();
+    await act(async () => { storage.setState({ sessions: { ...storageState.sessions } }); });
+    await updateSessionViewAndSettle(screen);
+    const converting = chatListPropsSpy.mock.calls.at(-1)?.[0]?.directControlFooter;
+    expect(converting?.importOperation?.state).toBe('running');
+    expect(converting?.onRequestTakeOverDirect).toBeUndefined();
+    expect(converting?.onRequestTakeOverPersist).toBeUndefined();
+    const settled = { ...running, revision: 2, state: terminal, settledAt: 110,
+      ...(terminal === 'failed' ? { error: { errorCode: 'failed', error: 'conversion failed' } } : {}) } satisfies ActionOperationSnapshotV1;
+    if (refreshFails) syncRefreshSessionsSpy.mockRejectedValueOnce(new Error('refresh disconnected'));
+    await act(async () => { actionOperationStore.merge(settled); });
+    actionOperationRpcSpy.mockResolvedValue({ kind: 'found', operation: settled });
+    if (terminal === 'failed' || refreshFails) {
+      const recovered = chatListPropsSpy.mock.calls.at(-1)?.[0]?.directControlFooter;
+      expect(recovered?.importOperation?.state).toBe(terminal);
+      if (refreshFails) {
+        expect(recovered.importStatusError).not.toBeNull();
+        await act(async () => { await recovered.onRefreshImport(); });
+        expect(screen.findAll((node) => String(node.type) === 'ChatList')).toHaveLength(0);
+      }
+    } else {
+      expect(screen.findAll((node) => String(node.type) === 'ChatList')).toHaveLength(0);
+    }
+    await screen.unmount();
   });
 
   it('does not pass pending user action requests to AgentInput', async () => {
@@ -3869,7 +4044,7 @@ describe('SessionView (direct sessions)', () => {
     });
 
     expect(machineDirectSessionTakeoverSpy).not.toHaveBeenCalled();
-    expect(machineDirectSessionTakeoverPersistSpy).not.toHaveBeenCalled();
+    expect(actionOperationRpcSpy.mock.calls.some(([request]) => request.method === 'daemon.directSessions.takeoverPersist.start')).toBe(false);
     expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
 
     agentInput = findAgentInput(screen);
@@ -3912,6 +4087,11 @@ describe('SessionView (direct sessions)', () => {
     });
     const screen = await renderSessionView();
 
+    actionOperationRpcSpy.mockResolvedValue({ ok: true, operation: createActionOperationFixture({
+      operationId: `send-import-${operationAccountId}`,
+      scope: { accountId: operationAccountId, machineId: 'machine-1', sessionId: 's1' },
+      state: 'succeeded', settledAt: 110, cancellation: 'unsupported', result: { ok: true, converted: true },
+    }) });
     const agentInput = findAgentInput(screen);
     await act(async () => {
       agentInput.props.onChangeText('persist this');
@@ -3921,11 +4101,10 @@ describe('SessionView (direct sessions)', () => {
       await agentInput.props.onSend();
     });
 
-    expect(machineDirectSessionTakeoverPersistSpy).toHaveBeenCalledWith({
-      machineId: 'machine-1',
-      sessionId: 's1',
-      forceStop: true,
-    }, { serverId: 'server-1' });
+    expect(actionOperationRpcSpy).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'daemon.directSessions.takeoverPersist.start', serverId: 'server-1',
+      payload: expect.objectContaining({ machineId: 'machine-1', sessionId: 's1', forceStop: true, requestId: expect.any(String) }),
+    }));
     expect(syncSubmitMessageSpy).toHaveBeenCalledWith(
       's1',
       'persist this',

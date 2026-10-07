@@ -23,6 +23,15 @@ function findHostNodeByTestID(
     return screen.findAllByTestId(testID).find((node) => typeof node.type === 'string');
 }
 
+function hasAncestor(node: ReactTestInstance, ancestor: ReactTestInstance): boolean {
+    let current = node.parent;
+    while (current) {
+        if (current === ancestor) return true;
+        current = current.parent;
+    }
+    return false;
+}
+
 installUiListsCommonModuleMocks();
 
 vi.mock('@/components/ui/lists/ItemGroup', () => ({
@@ -195,6 +204,91 @@ describe('Item mode prop', () => {
             />,
         );
         expect(screen.findAllByProps({ name: 'caret-right' }).length).toBeGreaterThan(0);
+    });
+
+    it('keeps an interactive right accessory outside the activation owner without losing row accessibility actions', async () => {
+        const rowPress = vi.fn();
+        const accessoryPress = vi.fn();
+        const onAccessibilityAction = vi.fn();
+        const { Item } = await import('../Item');
+        const { Pressable, Text } = await import('react-native');
+        const screen = await renderScreen(
+            <Item
+                title="Review"
+                testID="review-row"
+                onPress={rowPress}
+                rightElement={(
+                    <Pressable testID="review-row-action" onPress={accessoryPress}>
+                        <Text>Mark read</Text>
+                    </Pressable>
+                )}
+                rightElementOutsidePressable
+                accessibilityActions={[{ name: 'markRead', label: 'Mark read' }]}
+                onAccessibilityAction={onAccessibilityAction}
+            />,
+        );
+
+        const row = findHostNodeByTestID(screen, 'review-row');
+        const accessory = findHostNodeByTestID(screen, 'review-row-action');
+        if (!row || !accessory) throw new Error('Expected row and accessory activation owners');
+
+        expect(row.type).toBe('Pressable');
+        expect(accessory.type).toBe('Pressable');
+        expect(hasAncestor(accessory, row)).toBe(false);
+        expect(row.props.accessibilityActions).toEqual([{ name: 'markRead', label: 'Mark read' }]);
+
+        await act(async () => {
+            row.props.onPress();
+            accessory.props.onPress();
+            row.props.onAccessibilityAction({ nativeEvent: { actionName: 'markRead' } });
+        });
+
+        expect(rowPress).toHaveBeenCalledOnce();
+        expect(accessoryPress).toHaveBeenCalledOnce();
+        expect(onAccessibilityAction).toHaveBeenCalledOnce();
+    });
+
+    it('paints split-row hover and press feedback on the full surface containing both controls', async () => {
+        const { Item } = await import('../Item');
+        const { Pressable, Text } = await import('react-native');
+        const screen = await renderScreen(
+            <Item
+                title="Review"
+                testID="split-row"
+                onPress={() => {}}
+                rightElement={(
+                    <Pressable testID="split-row-action" onPress={() => {}}>
+                        <Text>Mark read</Text>
+                    </Pressable>
+                )}
+                rightElementOutsidePressable
+            />,
+        );
+
+        const row = () => findHostNodeByTestID(screen, 'split-row');
+        const action = findHostNodeByTestID(screen, 'split-row-action');
+        if (!row() || !action || !row()!.parent) throw new Error('Expected split row surface and controls');
+
+        const initialSurface = row()!.parent!;
+        expect(initialSurface.type).toBe('View');
+        expect(hasAncestor(action, initialSurface)).toBe(true);
+        expect(flattenTestStyle(initialSurface.props.style).backgroundColor).toBe('transparent');
+
+        await act(async () => {
+            row()!.props.onHoverIn();
+        });
+        expect(flattenTestStyle(row()!.parent!.props.style).backgroundColor).toBe(lightTheme.colors.surface.pressed);
+
+        await act(async () => {
+            row()!.props.onHoverOut();
+            row()!.props.onPressIn();
+        });
+        expect(flattenTestStyle(row()!.parent!.props.style).backgroundColor).toBe(lightTheme.colors.surface.pressed);
+
+        await act(async () => {
+            row()!.props.onPressOut();
+        });
+        expect(flattenTestStyle(row()!.parent!.props.style).backgroundColor).toBe('transparent');
     });
 
     it('applies a hover background on web for interactive items', async () => {

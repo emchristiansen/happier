@@ -1,3 +1,5 @@
+import { readJsonlFileBackwardPage } from '@/api/directSessions/filePaging/jsonlBackwardPager';
+
 type ClaudeForwardCursorV1 = Readonly<{
   v: 1;
   kind: 'claudeForward';
@@ -7,6 +9,28 @@ type ClaudeForwardCursorV1 = Readonly<{
 
 export function encodeClaudeDirectForwardCursor(value: ClaudeForwardCursorV1): string {
   return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
+}
+
+export function encodeClaudeDirectTailCursor(params: Readonly<{ fileRelPath: string; offsetBytes: number | null }>): string {
+  if (params.offsetBytes === null) {
+    throw new Error('Cannot establish Claude transcript tail boundary within the JSONL read budget');
+  }
+  return encodeClaudeDirectForwardCursor({ v: 1, kind: 'claudeForward', fileRelPath: params.fileRelPath, offsetBytes: params.offsetBytes });
+}
+
+export async function readClaudeDirectTailCursor(params: Readonly<{
+  filePath: string;
+  fileRelPath: string;
+  maxBytes: number;
+  endOffsetBytes?: number;
+}>): Promise<string> {
+  const page = await readJsonlFileBackwardPage({
+    filePath: params.filePath,
+    endOffsetBytes: params.endOffsetBytes ?? null,
+    maxBytes: params.maxBytes,
+    maxItems: 1,
+  });
+  return encodeClaudeDirectTailCursor({ fileRelPath: params.fileRelPath, offsetBytes: page.tailOffsetBytes });
 }
 
 export function decodeClaudeDirectForwardCursor(raw: string): ClaudeForwardCursorV1 | null {

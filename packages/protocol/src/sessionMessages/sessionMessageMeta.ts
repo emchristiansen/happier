@@ -17,9 +17,16 @@ const SESSION_USER_MESSAGE_DELIVERY_INTENTS = new Set<SessionUserMessageDelivery
 ]);
 
 export const SESSION_USER_MESSAGE_DELIVERY_INTENT_META_KEY = 'happierDeliveryIntentV1';
+export const SESSION_TOOL_ANSWER_DELIVERY_KIND = 'tool-answer-delivery.v1';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+export function isSessionToolAnswerDeliveryMeta(meta: unknown): boolean {
+  if (!isRecord(meta)) return false;
+  const happier = meta.happier;
+  return isRecord(happier) && happier.kind === SESSION_TOOL_ANSWER_DELIVERY_KIND;
 }
 
 export function readSessionUserMessageDeliveryIntentMeta(

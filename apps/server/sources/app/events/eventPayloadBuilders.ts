@@ -200,6 +200,7 @@ export function buildUpdateSessionUpdate(
         latestTurnStatus?: PrimaryTurnStatusV1 | null;
         latestTurnStatusObservedAt?: number | null;
         lastRuntimeIssue?: SessionRuntimeIssueV1 | null;
+        rollbackEligibleTurnStarts?: readonly number[];
         runtimeActivityState?: SessionRuntimeActivityState | null;
         runtimeActivityRevision?: number;
         runtimeActivityActiveCount?: number;
@@ -252,6 +253,9 @@ export function buildUpdateSessionUpdate(
                 ? { latestTurnStatusObservedAt: projection.latestTurnStatusObservedAt ?? null }
                 : {}),
             ...(projection && 'lastRuntimeIssue' in projection ? { lastRuntimeIssue: projection.lastRuntimeIssue ?? null } : {}),
+            ...(Array.isArray(projection?.rollbackEligibleTurnStarts)
+                ? { rollbackEligibleTurnStarts: projection.rollbackEligibleTurnStarts }
+                : {}),
             ...(runtimeActivityProjection ?? {}),
             ...(typeof projection?.meaningfulActivityAt === "number" && Number.isFinite(projection.meaningfulActivityAt)
                 ? { meaningfulActivityAt: projection.meaningfulActivityAt }

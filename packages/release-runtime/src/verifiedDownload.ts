@@ -3,7 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { lookupSha256 } from './checksums.js';
-import { requestBytes, requestText } from './http.js';
+import { requestBytes, requestText, type DownloadProgress } from './http.js';
 import { verifyMinisign } from './minisign.js';
 
 type ReleaseAsset = Readonly<{ name: string; url: string }>;
@@ -15,12 +15,17 @@ export type ReleaseAssetBundle = Readonly<{
   checksumsSig: ReleaseAsset;
 }>;
 
-async function fetchText(url: string, { userAgent = 'happier-release-runtime' } = {}) {
-  return await requestText({ url, headers: { 'user-agent': userAgent } });
-}
+export type VerifiedDownloadProgress = Readonly<{
+  phase: 'downloading' | 'verifying';
+  receivedBytes?: number;
+  totalBytes?: number;
+}>;
 
-async function fetchBytes(url: string, { userAgent = 'happier-release-runtime' } = {}) {
-  return await requestBytes({ url, headers: { 'user-agent': userAgent } });
+export class ReleaseVerificationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ReleaseVerificationError';
+  }
 }
 
 function sha256Hex(bytes: Buffer) {
@@ -32,6 +37,8 @@ export async function downloadVerifiedReleaseAssetBundle(params: Readonly<{
   destDir: string;
   pubkeyFile: string;
   userAgent?: string;
+  signal?: AbortSignal;
+  onProgress?: (progress: VerifiedDownloadProgress) => void;
 }>): Promise<Readonly<{
   version: string;
   archiveName: string;
@@ -46,23 +53,32 @@ export async function downloadVerifiedReleaseAssetBundle(params: Readonly<{
   if (!pubkeyFile.trim()) throw new Error('[download] pubkeyFile is required');
 
   await mkdir(destDir, { recursive: true });
-
-  const checksumsText = await fetchText(bundle.checksums.url, { userAgent });
-  const sigFile = await fetchText(bundle.checksumsSig.url, { userAgent });
+  const requestOptions = { headers: { 'user-agent': userAgent }, signal: params.signal };
+  params.onProgress?.({ phase: 'downloading' });
+  const checksumsText = await requestText({ ...requestOptions, url: bundle.checksums.url });
+  const sigFile = await requestText({ ...requestOptions, url: bundle.checksumsSig.url });
+  params.onProgress?.({ phase: 'verifying' });
   const ok = verifyMinisign({ message: Buffer.from(checksumsText, 'utf-8'), pubkeyFile, sigFile });
   if (!ok) {
-    throw new Error('[download] signature verification failed for checksums file');
+    throw new ReleaseVerificationError('[download] signature verification failed for checksums file');
   }
 
   const expected = lookupSha256({ checksumsText, filename: bundle.archive.name });
-  const bytes = await fetchBytes(bundle.archive.url, { userAgent });
+  params.onProgress?.({ phase: 'downloading' });
+  const bytes = await requestBytes({
+    ...requestOptions,
+    url: bundle.archive.url,
+    onProgress: (progress: DownloadProgress) => params.onProgress?.({ phase: 'downloading', ...progress }),
+  });
+  params.signal?.throwIfAborted();
+  params.onProgress?.({ phase: 'verifying' });
   const actual = sha256Hex(bytes);
   if (actual !== expected) {
-    throw new Error(`[download] checksum verification failed for ${bundle.archive.name}`);
+    throw new ReleaseVerificationError(`[download] checksum verification failed for ${bundle.archive.name}`);
   }
 
   const archivePath = join(destDir, bundle.archive.name);
-  await writeFile(archivePath, bytes);
+  await writeFile(archivePath, bytes, { signal: params.signal });
   return {
     version: String(bundle.version ?? ''),
     archiveName: bundle.archive.name,

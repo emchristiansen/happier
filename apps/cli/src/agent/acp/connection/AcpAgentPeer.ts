@@ -4,12 +4,18 @@ import {
   type AuthenticateResponse,
   type CancelNotification,
   type ClientContext,
+  type CloseSessionRequest,
+  type CloseSessionResponse,
+  type DeleteSessionRequest,
+  type DeleteSessionResponse,
   type ForkSessionRequest,
   type ForkSessionResponse,
   type InitializeRequest,
   type InitializeResponse,
   type LoadSessionRequest,
   type LoadSessionResponse,
+  type ListSessionsRequest,
+  type ListSessionsResponse,
   type NewSessionRequest,
   type NewSessionResponse,
   type PromptRequest,
@@ -127,6 +133,25 @@ export class AcpAgentPeer {
     this.assertActive();
     return this.requestWithDiagnostics(
       () => this.context.request(methods.agent.session.load, params),
+    ).then((response) => response ?? {});
+  }
+
+  listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+    this.assertActive();
+    return this.requestWithDiagnostics(() => this.context.request(methods.agent.session.list, params));
+  }
+
+  deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+    this.assertActive();
+    return this.requestWithDiagnostics(
+      () => this.context.request(methods.agent.session.delete, params),
+    ).then((response) => response ?? {});
+  }
+
+  closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+    this.assertActive();
+    return this.requestWithDiagnostics(
+      () => this.context.request(methods.agent.session.close, params),
     ).then((response) => response ?? {});
   }
 

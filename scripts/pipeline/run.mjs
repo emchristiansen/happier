@@ -416,6 +416,11 @@ function repoRootFromHere() {
   return path.resolve(here, '..', '..');
 }
 
+function resolvePipelineRepoRoot() {
+  const requestedRoot = String(process.env.HAPPIER_PIPELINE_REPO_ROOT ?? '').trim();
+  return requestedRoot ? path.resolve(requestedRoot) : repoRootFromHere();
+}
+
 /**
  * @param {{ repoRoot: string; env: Record<string, string>; args: string[]; dryRun: boolean }} opts
  */
@@ -549,7 +554,7 @@ function runChecksPlan({ repoRoot, env, args, dryRun }) {
  */
 function runChecks({ repoRoot, env, args, dryRun }) {
   const scriptPath = path.join(repoRoot, 'scripts', 'pipeline', 'checks', 'run-checks.mjs');
-  const fullArgs = [scriptPath, ...args];
+  const fullArgs = ['--experimental-strip-types', scriptPath, ...args];
   if (dryRun) {
     console.log(`[pipeline] exec: node ${fullArgs.map((a) => JSON.stringify(a)).join(' ')}`);
   }
@@ -1037,7 +1042,7 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
 }
 
   async function main() {
-  const repoRoot = repoRootFromHere();
+  const repoRoot = resolvePipelineRepoRoot();
 
   const { argv, style } = parseGlobalCliFlags(process.argv.slice(2));
   const [subcommandRaw, ...rest] = argv;
@@ -2771,6 +2776,7 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
         'dump-view': { type: 'string', default: 'true' },
         'fingerprint-mode': { type: 'string', default: 'always' },
         'preflight-only': { type: 'boolean', default: false },
+        'testflight-distribution-mode': { type: 'string', default: 'inline' },
         'release-message': { type: 'string', default: '' },
         'runtime-version': { type: 'string', default: '' },
         'ui-version-bump': { type: 'string', default: '' },
@@ -2835,6 +2841,10 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
     }
     /** @type {'always' | 'if-changed'} */
     const fingerprintMode = fingerprintModeRaw;
+    const testflightDistributionMode = String(values['testflight-distribution-mode'] ?? '').trim().toLowerCase() || 'inline';
+    if (testflightDistributionMode !== 'inline' && testflightDistributionMode !== 'deferred') {
+      fail(`--testflight-distribution-mode must be 'inline' or 'deferred' (got: ${values['testflight-distribution-mode']})`);
+    }
     const releaseMessage = String(values['release-message'] ?? '').trim();
     const runtimeVersion = String(values['runtime-version'] ?? '').trim();
 
@@ -3290,7 +3300,9 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
             environment,
             env: mergedEnv,
           });
-          if (testflightDistribution.enabled) {
+          if (testflightDistribution.enabled && testflightDistributionMode === 'deferred') {
+            console.log('[pipeline] ui-mobile release: TestFlight external distribution deferred to the recovery workflow.');
+          } else if (testflightDistribution.enabled) {
             if (!dryRun && nativeBuildMode === 'cloud' && !cloudBuildPresence.ios) {
               console.log('[pipeline] ui-mobile release: skipping TestFlight external distribution (no iOS build was scheduled).');
             } else {

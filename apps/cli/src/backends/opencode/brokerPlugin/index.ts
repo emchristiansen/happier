@@ -25,12 +25,17 @@ export {
   OPEN_CODE_BROKER_ANTHROPIC_BETA,
   OPEN_CODE_BROKER_ANTHROPIC_SYSTEM_IDENTITY,
   buildOpenCodeBrokerPluginSource,
+  buildOpenCodeBrokerV2PluginSource,
 } from './openCodeBrokerPluginSource';
 export {
   resolveOpenCodeBrokerPluginDir,
   resolveOpenCodeConnectedConfigHomeDir,
   resolveOpenCodeBrokerPluginPath,
+  resolveOpenCodeV2BrokerPluginPath,
+  resolveOpenCodeV2BrokerPluginSourcePath,
+  buildOpenCodeV2BrokerConfigContent,
   ensureOpenCodeBrokerPluginAssets,
+  prepareOpenCodeConnectedAuthAssets,
 } from './openCodeBrokerPluginAssets';
 export {
   isOpenCodeBrokerLoadHandshakeConflicted,

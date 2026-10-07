@@ -11,8 +11,8 @@ import { describe, it, expect } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { spawnSync } from 'node:child_process';
-import { createTmuxTerminalHostAdapter, TmuxUtilities } from '@/integrations/tmux';
+import { spawn, spawnSync } from 'node:child_process';
+import { TmuxUtilities } from './TmuxUtilities';
 
 function isTmuxInstalled(): boolean {
     const result = spawnSync('tmux', ['-V'], { encoding: 'utf8' });
@@ -81,7 +81,9 @@ function writeDumpScript(dir: string): string {
             '    TMUX_TMPDIR: process.env.TMUX_TMPDIR,',
             '  },',
             '};',
-            'fs.writeFileSync(outFile, JSON.stringify(payload));',
+            "const pendingOutFile = `${outFile}.${process.pid}.tmp`;",
+            'fs.writeFileSync(pendingOutFile, JSON.stringify(payload));',
+            'fs.renameSync(pendingOutFile, outFile);',
             'if (keepAliveMs > 0) setTimeout(() => {}, keepAliveMs);',
             '',
         ].join('\n'),
@@ -135,7 +137,7 @@ type TmuxRunResult = {
     error: Error | undefined;
 };
 
-function runTmux(args: string[], options?: { env?: Record<string, string | undefined> }): TmuxRunResult {
+function isolatedTmuxEnvironment(overrides?: Record<string, string | undefined>): NodeJS.ProcessEnv {
     // Never inherit the user's existing tmux context (TMUX/TMUX_PANE) or TMUX_TMPDIR.
     // These tests must only ever talk to isolated servers created by the test itself.
     const env: NodeJS.ProcessEnv = { ...process.env };
@@ -143,12 +145,14 @@ function runTmux(args: string[], options?: { env?: Record<string, string | undef
     delete env.TMUX_PANE;
     delete env.TMUX_TMPDIR;
 
+    return { ...env, ...overrides };
+}
+
+function runTmux(args: string[], options?: { env?: Record<string, string | undefined> }): TmuxRunResult {
+
     const result = spawnSync('tmux', args, {
         encoding: 'utf8',
-        env: {
-            ...env,
-            ...(options?.env ?? {}),
-        } as NodeJS.ProcessEnv,
+        env: isolatedTmuxEnvironment(options?.env),
     });
     return {
         status: result.status,
@@ -171,27 +175,152 @@ function killIsolatedTmuxServer(socketPath: string): void {
     }
 }
 
-async function removeTmuxTempDir(dir: string): Promise<void> {
-    // tmux can release or recreate its socket entry briefly after kill-server exits.
-    // Retry the cleanup boundary at a fixed short interval. Node's built-in
-    // rmSync retry uses linear backoff, which exhausted its budget while late
-    // panes were still writing their final fixture output on faster runners.
-    const deadline = Date.now() + 5_000;
-    while (true) {
-        try {
-            rmSync(dir, { recursive: true, force: true });
-            return;
-        } catch (error) {
-            const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
-            if (!['EBUSY', 'ENOTEMPTY', 'EPERM'].includes(String(code)) || Date.now() >= deadline) {
-                throw error;
-            }
-            await new Promise((resolve) => setTimeout(resolve, 50));
-        }
-    }
+function removeIsolatedTmuxTempDir(dir: string): void {
+    // tmux kill-server can return while its pane processes are still retiring.
+    // Let Node retry the transient ENOTEMPTY/EBUSY cleanup race instead of
+    // turning a successful integration scenario into a teardown failure.
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
 
 describe.skipIf(!shouldRunTmuxIntegration())('tmux (real) integration tests (opt-in)', { timeout: 20_000 }, () => {
+    it('delivers once when provider staging and consumption outlast the terminal write budget', async () => {
+        const dir = mkShortTempDir('hp-tmux-delivery-');
+        const socketPath = join(dir, 'tmux.sock');
+        const utils = new TmuxUtilities('happy', undefined, socketPath);
+        const { createTmuxTerminalHostAdapter } = await import('./adapter');
+        const { createClaudePromptSubmitVerificationPolicy } = await import('@/backends/claude/unifiedTerminal/claudePromptSubmitVerification');
+        const adapter = createTmuxTerminalHostAdapter({ tmux: utils, promptSubmitVerification: createClaudePromptSubmitVerificationPolicy() });
+        const fixture = join(dir, 'slow-provider.cjs');
+        const receipt = join(dir, 'receipt.json');
+        const ready = join(dir, 'ready');
+        // The external TUI boundary consumes real bracketed paste and Enter over an isolated
+        // tmux PTY. Its delayed redraw reproduces the observed 20s staging / 10s consumption.
+        writeFileSync(fixture, [
+            "const fs = require('node:fs');",
+            'process.stdin.setRawMode(true); process.stdin.resume();',
+            'process.stdout.write("\\x1b[?2004h");',
+            'let input = "", prompt = "", enters = 0;',
+            'const draw = text => process.stdout.write("\\x1b[2J\\x1b[HClaude Code\\r\\n──────────\\r\\n❯ " + text + "\\r\\n──────────\\r\\n  ⏵⏵ bypass permissions on");',
+            'draw(""); fs.writeFileSync(process.argv[3], "ready");',
+            'process.stdin.on("data", bytes => {',
+            '  input += bytes.toString();',
+            '  const end = input.indexOf("\\x1b[201~");',
+            '  if (end >= 0) {',
+            '    prompt = input.slice(input.indexOf("\\x1b[200~") + 6, end); input = input.slice(end + 6);',
+            '    setTimeout(() => draw(prompt), 20_000);',
+            '  }',
+            '  if (input.includes("\\r")) {',
+            '    enters += input.split("\\r").length - 1; input = "";',
+            '    setTimeout(() => { fs.writeFileSync(process.argv[2], JSON.stringify({prompt, enters})); draw(""); }, 10_000);',
+            '  }',
+            '});',
+        ].join('\n'));
+        const lifetime = new AbortController();
+        try {
+            const handle = await adapter.createOrAttachHost({
+                sessionName: 'slow-provider', workingDirectory: dir,
+                spawnArgv: [process.execPath, fixture, receipt, ready], spawnEnv: {}, isolatedEnv: true,
+            });
+            await waitForFile(ready, 5_000);
+            const input = { text: 'loaded prompt', multiline: false,
+                origin: { kind: 'ui_pending' as const, nonce: 'slow-delivery' },
+                scheduling: { timeoutMs: 15_000 }, signal: lifetime.signal };
+            const result = await adapter.injectUserPrompt(handle, input);
+            expect(result).toMatchObject({ status: 'injected' });
+            expect(JSON.parse(readFileSync(receipt, 'utf8'))).toEqual({ prompt: input.text, enters: 1 });
+        } finally {
+            lifetime.abort();
+            killIsolatedTmuxServer(socketPath);
+            removeIsolatedTmuxTempDir(dir);
+        }
+    }, 60_000);
+
+    it.each([
+        [true, 'latest', false], [false, 'latest', false],
+        [true, 'smallest', false], [false, 'smallest', true],
+    ] as const)('uses configured detached geometry without borrowing another session client (exclusive=%s, policy=%s, local=%s)', async (requireNewSession, policy, localLatest) => {
+        const dir = mkShortTempDir('hp-tmux-size-');
+        const socketPath = join(dir, 'tmux.sock');
+        const utils = new TmuxUtilities('happy', undefined, socketPath);
+        const prefix = ['-S', socketPath];
+        const smallSession = 'small-client';
+        let client: ReturnType<typeof spawn> | undefined;
+        try {
+            expect(runTmux([...prefix, 'new-session', '-d', '-s', smallSession]).status).toBe(0);
+            expect(runTmux([...prefix, 'set-option', '-g', 'default-size', '110x32']).status).toBe(0);
+            expect(runTmux([...prefix, 'set-option', '-gw', 'window-size', policy]).status).toBe(0);
+            if (localLatest) {
+                expect(runTmux([...prefix, 'set-hook', '-g', 'after-new-window', 'set-option -w window-size latest']).status).toBe(0);
+            }
+            expect(runTmux([...prefix, 'set-option', '-w', '-t', smallSession, 'window-size', 'latest']).status).toBe(0);
+            client = spawn('tmux', [...prefix, '-C', 'attach-session', '-t', smallSession], {
+                env: isolatedTmuxEnvironment(), stdio: ['pipe', 'pipe', 'pipe'],
+            });
+            let clientOutput = '';
+            client.stdout?.on('data', chunk => { clientOutput += String(chunk); });
+            client.stderr?.on('data', chunk => { clientOutput += String(chunk); });
+            await waitForCondition(() => clientOutput.includes('%session-changed'), {
+                timeoutMs: 5_000, label: 'isolated control client attachment', debug: () => clientOutput,
+            });
+            client.stdin?.write('refresh-client -C 52,10\n');
+            const size = (target: string) => runTmux([...prefix, 'display-message', '-p', '-t', target, '#{window_width}x#{window_height}']).stdout.trim();
+            await waitForCondition(() => size(smallSession) === '52x10', {
+                timeoutMs: 5_000, label: 'small isolated client geometry', debug: () => clientOutput,
+            });
+
+            const result = await utils.spawnInTmux([process.execPath, '-e', 'setInterval(()=>{},1000)'], {
+                sessionName: 'detached-agent', requireNewSession,
+            });
+            expect(result.success).toBe(true);
+            expect(size(result.windowId ?? 'detached-agent')).toBe('110x32');
+            expect(runTmux([...prefix, 'show-options', '-wAv', '-t', result.windowId ?? 'detached-agent', 'window-size']).stdout.trim()).toBe(localLatest ? 'latest' : policy);
+            expect(size(smallSession)).toBe('52x10');
+            expect(runTmux([...prefix, 'show-options', '-w', '-t', result.windowId ?? 'detached-agent', 'window-size']).stdout.trim()).toBe(localLatest ? 'window-size latest' : '');
+            // Shared creation also creates the session's initial placeholder through ensureSessionExists.
+            if (!requireNewSession) {
+                expect(runTmux([...prefix, 'list-windows', '-t', 'detached-agent', '-F', '#{window_width}x#{window_height}']).stdout.trim().split('\n')).toEqual(['110x32', '110x32']);
+            }
+            client.stdin?.write(`switch-client -t detached-agent\nselect-window -t ${result.windowId}\nrefresh-client -C 52,10\n`);
+            await waitForCondition(() => size(result.windowId ?? 'detached-agent') === '52x10', {
+                timeoutMs: 5_000, label: 'attached client resizing after detached creation', debug: () => clientOutput,
+            });
+            expect(runTmux([...prefix, 'show-options', '-w', '-t', result.windowId ?? 'detached-agent', 'window-size']).stdout.trim()).toBe(localLatest ? 'window-size latest' : '');
+        } finally {
+            client?.stdin?.end();
+            client?.kill();
+            killIsolatedTmuxServer(socketPath);
+            removeIsolatedTmuxTempDir(dir);
+        }
+    });
+
+    it('owns only the optional client window in an existing selected tmux session', async () => {
+        const dir = mkShortTempDir('hp-tmux-presenter-');
+        const socketPath = join(dir, 'tmux.sock');
+        const utils = new TmuxUtilities('happy', undefined, socketPath);
+        const { createTmuxTerminalHostAdapter } = await import('./adapter');
+        const adapter = createTmuxTerminalHostAdapter({ tmux: utils });
+        const sessionName = `presenter-${process.pid}`;
+        try {
+            const original = await utils.spawnInTmux([process.execPath, '-e', 'setInterval(()=>{},1000)'], {
+                sessionName, windowName: 'original', cwd: dir,
+            }, {});
+            expect(original.success).toBe(true);
+            const before = await utils.executeTmuxCommand(['list-windows', '-t', sessionName, '-F', '#{window_id}']);
+            const options = { sessionName, label: 'optional-client', topology: 'shared' as const,
+                workingDirectory: dir, spawnArgv: [process.execPath, '-e', 'setInterval(()=>{},1000)'],
+                spawnEnv: {}, isolatedEnv: true };
+            const handle = await adapter.createOrAttachHost(options);
+            expect(handle.attachMetadata.topology).toBe('shared');
+            expect(handle.paneId).not.toBe(original.windowId);
+            await adapter.dispose(handle);
+            const windows = await utils.executeTmuxCommand(['list-windows', '-t', sessionName, '-F', '#{window_id}']);
+            if (!windows || !before) throw new Error('Isolated tmux window listing failed');
+            expect(windows.stdout.trim().split('\n')).toEqual(before.stdout.trim().split('\n'));
+        } finally {
+            killIsolatedTmuxServer(socketPath);
+            removeIsolatedTmuxTempDir(dir);
+        }
+    });
     it('spawnInTmux can start many windows concurrently without index-conflict failures', async () => {
         const dir = mkdtempSync(join(tmpdir(), 'happier-cli-tmux-it-'));
         const socketPath = join(dir, 'tmux.sock');
@@ -214,9 +343,11 @@ describe.skipIf(!shouldRunTmuxIntegration())('tmux (real) integration tests (opt
             );
 
             expect(results.every((r) => r.success)).toBe(true);
+            await Promise.all(Array.from({ length: 12 }, (_, i) =>
+                waitForFile(join(dir, `out-w${i + 1}.json`), 10_000)));
         } finally {
             killIsolatedTmuxServer(socketPath);
-            await removeTmuxTempDir(dir);
+            removeIsolatedTmuxTempDir(dir);
         }
     });
 
@@ -241,12 +372,16 @@ describe.skipIf(!shouldRunTmuxIntegration())('tmux (real) integration tests (opt
             expect(result.success).toBe(true);
             expect(typeof result.pid).toBe('number');
             expect(result.pid).toBeGreaterThan(0);
+            expect(result.windowId).toMatch(/^@\d+$/);
 
             // Ground truth: query tmux directly for the pane pid.
             const panes = runTmux(['-S', socketPath, 'list-panes', '-t', `${sessionName}:${windowName}`, '-F', '#{pane_pid}']);
             expect(panes.status).toBe(0);
             const listedPid = Number.parseInt(panes.stdout.trim(), 10);
             expect(listedPid).toBe(result.pid);
+            const listedWindowId = runTmux(['-S', socketPath, 'display-message', '-p', '-t', `${sessionName}:${windowName}`, '#{window_id}']);
+            expect(listedWindowId.status).toBe(0);
+            expect(listedWindowId.stdout.trim()).toBe(result.windowId);
 
             await waitForFile(outFile, 2_000);
             const payload = readDumpPayload(outFile);
@@ -261,7 +396,66 @@ describe.skipIf(!shouldRunTmuxIntegration())('tmux (real) integration tests (opt
         } finally {
             // Kill only the isolated server (never touch the user's default tmux server).
             killIsolatedTmuxServer(socketPath);
-            await removeTmuxTempDir(dir);
+            removeIsolatedTmuxTempDir(dir);
+        }
+    });
+
+    it('spawnInTmux parses -P/-F output when the client environment has no UTF-8 locale (regression: daemon launched over SSH)', async () => {
+        // tmux flags a command client as non-UTF-8 unless TMUX is set or LC_ALL/LC_CTYPE/LANG
+        // mention UTF-8, and then passes printed output through utf8_sanitize(), which turns
+        // the TAB separator in `#{pane_pid}\t#{window_id}` into `_`. A daemon started over SSH
+        // (no locale forwarded) reproduced this as `Failed to extract PID from tmux output: 5266_@9`.
+        const dir = mkdtempSync(join(tmpdir(), 'happier-cli-tmux-nolocale-it-'));
+        const socketPath = join(dir, 'tmux.sock');
+        const utils = new TmuxUtilities('happy', { LANG: '', LC_ALL: '', LC_CTYPE: '' }, socketPath);
+
+        try {
+            const scriptPath = writeDumpScript(dir);
+            const outFile = join(dir, 'out.json');
+            const sessionName = `happy-it-nolocale-${process.pid}-${Date.now()}`;
+            const windowName = 'pid';
+
+            const result = await utils.spawnInTmux(
+                [process.execPath, scriptPath, outFile, '5000', 'no-locale'],
+                { sessionName, windowName, cwd: dir },
+                {},
+            );
+
+            expect(result.error).toBeUndefined();
+            expect(result.success).toBe(true);
+            expect(result.pid).toBeGreaterThan(0);
+            expect(result.windowId).toMatch(/^@\d+$/);
+
+            const panes = runTmux(['-S', socketPath, 'list-panes', '-t', `${sessionName}:${windowName}`, '-F', '#{pane_pid}']);
+            expect(panes.status).toBe(0);
+            expect(Number.parseInt(panes.stdout.trim(), 10)).toBe(result.pid);
+        } finally {
+            killIsolatedTmuxServer(socketPath);
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it('captureCursorPosition returns the live pane cursor for a window-id target (regression: display-message operand order)', async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'happier-cli-tmux-cursor-it-'));
+        const socketPath = join(dir, 'tmux.sock');
+        const utils = new TmuxUtilities('happy', undefined, socketPath);
+
+        try {
+            const scriptPath = writeDumpScript(dir);
+            const outFile = join(dir, 'out.json');
+            const sessionName = `happy-it-cursor-${process.pid}-${Date.now()}`;
+            const result = await utils.spawnInTmux(
+                [process.execPath, scriptPath, outFile, '5000', 'cursor'],
+                { sessionName, windowName: 'cursor', cwd: dir },
+                {},
+            );
+            expect(result.success).toBe(true);
+
+            const cursor = await utils.captureCursorPosition(result.windowId!);
+            expect(cursor).toEqual({ x: expect.any(Number), y: expect.any(Number) });
+        } finally {
+            killIsolatedTmuxServer(socketPath);
+            rmSync(dir, { recursive: true, force: true });
         }
     });
 
@@ -269,6 +463,7 @@ describe.skipIf(!shouldRunTmuxIntegration())('tmux (real) integration tests (opt
         const dir = mkdtempSync(join(tmpdir(), 'happier-cli-tmux-owned-it-'));
         const socketPath = join(dir, 'tmux.sock');
         const utils = new TmuxUtilities('happy', undefined, socketPath);
+        const { createTmuxTerminalHostAdapter } = await import('./adapter');
         const adapter = createTmuxTerminalHostAdapter({ tmux: utils });
 
         try {
@@ -320,7 +515,7 @@ describe.skipIf(!shouldRunTmuxIntegration())('tmux (real) integration tests (opt
             if (runTmux(['-S', socketPath, 'list-sessions']).status === 0) {
                 killIsolatedTmuxServer(socketPath);
             }
-            await removeTmuxTempDir(dir);
+            removeIsolatedTmuxTempDir(dir);
         }
     });
 
@@ -356,7 +551,7 @@ describe.skipIf(!shouldRunTmuxIntegration())('tmux (real) integration tests (opt
             expect(payload.env?.BAR).toBe(env.BAR);
         } finally {
             killIsolatedTmuxServer(socketPath);
-            await removeTmuxTempDir(dir);
+            removeIsolatedTmuxTempDir(dir);
         }
     });
 
@@ -393,7 +588,7 @@ describe.skipIf(!shouldRunTmuxIntegration())('tmux (real) integration tests (opt
             expect(existsSync(sentinelFile)).toBe(false);
         } finally {
             killIsolatedTmuxServer(socketPath);
-            await removeTmuxTempDir(dir);
+            removeIsolatedTmuxTempDir(dir);
         }
     });
 
@@ -447,8 +642,8 @@ describe.skipIf(!shouldRunTmuxIntegration())('tmux (real) integration tests (opt
                     error: result.error?.message,
                 });
             }
-            await removeTmuxTempDir(tmuxTmpDir);
-            await removeTmuxTempDir(dir);
+            removeIsolatedTmuxTempDir(tmuxTmpDir);
+            removeIsolatedTmuxTempDir(dir);
         }
     });
 });

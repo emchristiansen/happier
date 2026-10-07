@@ -100,12 +100,12 @@ export async function installOrUpdateRelayRuntimeDefault(
 
   const serverBinaryPath = params.selfHostRelayBinaryOverride
     ? params.selfHostRelayBinaryOverride
-    : await ensureLocalFirstPartyComponentCommand({
+    : (await ensureLocalFirstPartyComponentCommand({
         componentId: 'happier-server',
         processEnv: process.env,
         envVarNames: ['HAPPIER_BOOTSTRAP_SELF_HOST_SERVER_PATH'],
         releaseRing,
-      });
+      })).command;
 
   return await engine.installOrUpdate({
     ...params,

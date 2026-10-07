@@ -273,6 +273,7 @@ describe('resolveSessionRuntimeSnapshot', () => {
     const result = resolveSessionRuntimeSnapshot({
       incomingOptions: baseIncomingOptions({
         backendTarget: { kind: 'configuredAcpBackend', backendId: 'custom-kiro' },
+        resume: 'unbound-incoming-provider-thread',
       }),
       persistedMetadata: {
         flavor: 'codex',
@@ -283,6 +284,108 @@ describe('resolveSessionRuntimeSnapshot', () => {
 
     expect(result.snapshot.vendorResumeId).toBeNull();
     expect(result.spawnOptions.resume).toBeUndefined();
+  });
+
+  it('restores only the configured ACP provider id bound to the exact backend target', () => {
+    const result = resolveSessionRuntimeSnapshot({
+      incomingOptions: baseIncomingOptions({
+        backendTarget: { kind: 'configuredAcpBackend', backendId: 'custom-kiro' },
+      }),
+      persistedMetadata: {
+        flavor: 'acp:stale-label',
+        acpConfiguredBackendV1: { v: 1, updatedAt: 1, backendId: 'custom-kiro', title: 'Custom Kiro' },
+        customAcpSessionId: ' provider-session-1 ',
+      },
+      trackedVendorResumeId: 'stale-tracked-id',
+    });
+
+    expect(result.snapshot.vendorResumeId).toEqual({ value: 'provider-session-1', updatedAt: null });
+    expect(result.spawnOptions.resume).toBe('provider-session-1');
+  });
+
+  it('drops the resume id when the persisted customAcp metadata belongs to a different configured backend', () => {
+    const result = resolveSessionRuntimeSnapshot({
+      incomingOptions: baseIncomingOptions({
+        backendTarget: { kind: 'configuredAcpBackend', backendId: 'custom-kiro' },
+      }),
+      persistedMetadata: {
+        acpConfiguredBackendV1: {
+          v: 1,
+          updatedAt: 1,
+          backendId: 'other-backend',
+          title: 'Other backend',
+        },
+        customAcpSessionId: 'acp-session-1',
+      },
+    });
+
+    expect(result.snapshot.vendorResumeId).toBeNull();
+    expect(result.spawnOptions.resume).toBeUndefined();
+  });
+
+  it.each([
+    ['tracked spawn resume', { trackedSpawnOptions: baseIncomingOptions({ resume: 'stale-resume' }) }],
+    ['tracked vendor resume', { trackedVendorResumeId: 'stale-resume' }],
+    ['persisted vendor resume', { persistedVendorResumeId: 'stale-resume' }],
+  ] as const)('rejects %s when exact configured metadata belongs to another target', (_label, source) => {
+    const result = resolveSessionRuntimeSnapshot({
+      incomingOptions: baseIncomingOptions({
+        backendTarget: { kind: 'configuredAcpBackend', backendId: 'custom-kiro' },
+      }),
+      persistedMetadata: {
+        acpConfiguredBackendV1: {
+          v: 1,
+          updatedAt: 1,
+          backendId: 'other-backend',
+          title: 'Other backend',
+        },
+        customAcpSessionId: 'other-session',
+      },
+      ...source,
+    });
+
+    expect(result.snapshot.vendorResumeId).toBeNull();
+    expect(result.spawnOptions.resume).toBeUndefined();
+  });
+
+  it('rejects tracked resume state from a changed target while accepting the exact persisted configured id', () => {
+    const result = resolveSessionRuntimeSnapshot({
+      incomingOptions: baseIncomingOptions({
+        backendTarget: { kind: 'configuredAcpBackend', backendId: 'custom-kiro' },
+      }),
+      trackedSpawnOptions: baseIncomingOptions({
+        backendTarget: { kind: 'configuredAcpBackend', backendId: 'other-backend' },
+        resume: 'other-session',
+      }),
+      trackedVendorResumeId: 'other-tracked-session',
+      persistedVendorResumeId: 'other-persisted-session',
+      persistedMetadata: {
+        acpConfiguredBackendV1: {
+          v: 1,
+          updatedAt: 1,
+          backendId: 'custom-kiro',
+          title: 'Custom Kiro',
+        },
+        customAcpSessionId: 'exact-session',
+      },
+    });
+
+    expect(result.spawnOptions.resume).toBe('exact-session');
+  });
+
+  it('retains legacy tracked resume compatibility for built-in targets', () => {
+    const result = resolveSessionRuntimeSnapshot({
+      incomingOptions: baseIncomingOptions({
+        backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+      }),
+      trackedSpawnOptions: baseIncomingOptions({
+        backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+        resume: 'tracked-codex-session',
+      }),
+      persistedMetadata: { flavor: 'claude', claudeSessionId: 'claude-session' },
+    });
+
+    expect(result.spawnOptions.resume).toBe('tracked-codex-session');
   });
 
   it('preserves incoming controls without timestamps when no persisted or tracked snapshot exists', () => {

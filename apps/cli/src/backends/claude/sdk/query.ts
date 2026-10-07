@@ -23,7 +23,6 @@ import {
     AbortError
 } from './types'
 import { getDefaultClaudeCodePath, getCleanEnv, logDebug, streamToStdin } from './utils'
-import type { ClaudeStdinRecordTransportOutcome } from './utils'
 import type { Writable } from 'node:stream'
 import { logger } from '@/ui/logger'
 import { createManagedChildProcess } from '@/subprocess/supervision/managedChildProcess'
@@ -296,10 +295,6 @@ export function query(config: {
     prompt: QueryPrompt
     options?: QueryOptions
     onMessageReceived?: (message: SDKMessage) => void
-    onPromptTransportOutcome?: (
-        message: unknown,
-        outcome: ClaudeStdinRecordTransportOutcome,
-    ) => void
 }): Query {
 	    const {
 	        prompt,
@@ -549,7 +544,6 @@ export function query(config: {
             prompt,
             child.stdin,
             config.options?.abort,
-            config.onPromptTransportOutcome,
         ).catch((error: unknown) => {
             query.setError(error instanceof Error ? error : new Error(String(error)))
             cleanup()

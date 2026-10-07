@@ -134,10 +134,6 @@ test.describe('ui e2e: plaintext mode + public share', () => {
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
         HAPPIER_FEATURE_ENCRYPTION__STORAGE_POLICY: 'optional',
         HAPPIER_FEATURE_ENCRYPTION__ALLOW_ACCOUNT_OPTOUT: '1',
-        // Make presence timeouts fast enough for UI E2E reconnect flows.
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
       },
     });
 
@@ -158,8 +154,8 @@ test.describe('ui e2e: plaintext mode + public share', () => {
     await server?.stop().catch(() => {});
   });
 
-  test('toggles account to plaintext, writes a plaintext session, and opens a public link', async ({ page, context }, testInfo) => {
-    test.setTimeout(420_000);
+  test('toggles account to plaintext, writes a plaintext session, and opens a public link', { tag: "@smoke" }, async ({ page, context }, testInfo) => {
+    test.setTimeout(180_000);
     if (!server || !ui) throw new Error('missing server/ui fixtures');
     if (!uiBaseUrl) throw new Error('missing ui base url');
 

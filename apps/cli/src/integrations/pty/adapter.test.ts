@@ -502,7 +502,7 @@ describe('createPtyTerminalHostAdapter', () => {
       paneAlive: true,
       paneDead: false,
     });
-    expect(fake.processes[0]?.writes).toEqual([prompt, '\r', '\r']);
+    expect(fake.processes[0]?.writes).toEqual([prompt, '\r']);
   });
 
   it('does not mistake Claude\'s submitted prompt row for an unsent Windows composer draft', async () => {

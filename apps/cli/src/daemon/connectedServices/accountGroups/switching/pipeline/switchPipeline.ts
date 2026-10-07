@@ -605,6 +605,8 @@ export type ConnectedServiceAuthGroupSwitchPipelineRequest = Readonly<{
   switchesThisTurn?: number;
   sessionSwitchesThisHour?: number;
   deadlineAtMs?: number;
+  /** A durable post-reset retry may re-adopt the active member, but only with fresh positive quota proof. */
+  allowCurrentProfileRetry?: boolean;
 }>;
 
 export type ConnectedServiceAuthGroupSwitchPipelinePhase =

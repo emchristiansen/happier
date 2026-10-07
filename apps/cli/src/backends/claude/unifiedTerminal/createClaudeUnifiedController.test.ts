@@ -257,16 +257,22 @@ describe('createClaudeUnifiedController', () => {
         }),
         dispose: vi.fn(),
       },
+      transcriptBridge: {
+        start: vi.fn(() => {
+          order.push('safety-observer-start');
+        }),
+        dispose: vi.fn(),
+      },
     });
 
     const runPromise = controller.run();
     await Promise.resolve();
 
-    expect(order).toEqual(['observer-start']);
+    expect(order).toEqual(['safety-observer-start', 'observer-start']);
 
     observerStartup.resolve();
     await runPromise;
-    expect(order).toEqual(['observer-start', 'pump-start']);
+    expect(order).toEqual(['safety-observer-start', 'observer-start', 'pump-start']);
   });
 
   it('does not start the pending queue pump when provider observer installation rejects', async () => {

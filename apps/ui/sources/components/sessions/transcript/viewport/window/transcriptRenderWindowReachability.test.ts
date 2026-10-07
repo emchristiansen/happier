@@ -180,7 +180,7 @@ describe('transcript render window reachability', () => {
         // row-2 anchors below the discontinuity floor but sits inside the live-tail island in
         // list order. Filtering it out leaves a hole the older gap row cannot describe.
         const items: TestItem[] = [item(10), item(2), item(11), item(12)];
-        const projection = project({ items, tailContiguousFloorSeq: 5 });
+        const projection = project({ items, tailContiguousBoundary: { kind: 'seq', seq: 5 } });
 
         expect(resolveSilentlyUnreachableIds(projection, items)).toEqual([]);
         // The older gap row stays: the discontinuity walk still has un-fetched older content
@@ -196,7 +196,7 @@ describe('transcript render window reachability', () => {
 
     it('still withholds the stale prefix below the tail floor behind an older gap row', () => {
         const items = [1, 2, 3, 4, 5, 6].map(item);
-        const projection = project({ items, tailContiguousFloorSeq: 4 });
+        const projection = project({ items, tailContiguousBoundary: { kind: 'seq', seq: 4 } });
 
         expect(resolveSilentlyUnreachableIds(projection, items)).toEqual([]);
         expect(projection.canonicalWindowedItems.map((entry) => entry.id)).toEqual([

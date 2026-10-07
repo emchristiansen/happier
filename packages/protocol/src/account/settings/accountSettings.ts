@@ -22,6 +22,7 @@ import {
   type NotificationChannelsV1,
 } from './notificationChannels.js';
 import { SESSION_PERMISSION_MODES } from '../../sessionMetadata/sessionPermissionModes.js';
+import { ClientEncryptionRequirementSchema } from '../../encryption/clientEncryptionRequirement.js';
 
 function rekeyLegacyBuiltInAgentMap<T>(raw: unknown): Record<string, T> {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
@@ -63,6 +64,8 @@ export const NotificationsSettingsV1Schema = z.preprocess(
     connectedServiceQuotaBlocked: z.boolean().default(true),
     connectedServiceQuotaRecovered: z.boolean().default(true),
     foregroundBehavior: ForegroundBehaviorSchema.default('full'),
+    // Missing on released clients: keep phone push delivery enabled.
+    mutePhoneWhenComputerFocused: z.boolean().optional(),
   })
   .catch({
     v: 1,
@@ -365,6 +368,7 @@ export const AccountSettingsSchema = z.preprocess(
         .min(0)
         .catch(ACCOUNT_SETTINGS_SUPPORTED_SCHEMA_VERSION)
         .default(ACCOUNT_SETTINGS_SUPPORTED_SCHEMA_VERSION),
+      clientEncryptionRequirementV1: ClientEncryptionRequirementSchema,
       backendEnabledByTargetKey: BackendEnabledByTargetKeySchema.default({}),
       backendCliSourcePreferenceByTargetKey: BackendCliSourcePreferenceByTargetKeySchema,
       scmIncludeCoAuthoredBy: z.boolean().optional().catch(undefined),

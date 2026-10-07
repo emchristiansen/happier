@@ -1,4 +1,4 @@
-import { readSharedManagedOpenCodeServerStateBestEffort } from '@/backends/opencode/server/sharedManagedServer';
+import { readSharedManagedOpenCodeServerStateBestEffort, readSharedManagedOpenCodeServerStateByLaunchFingerprintBestEffort } from '@/backends/opencode/server/sharedManagedServer';
 import { readOpenCodeSessionRuntimeHandleFromMetadata } from '@/backends/opencode/utils/opencodeSessionAffinity';
 
 export type OpenCodeProviderAttachTarget =
@@ -7,6 +7,7 @@ export type OpenCodeProviderAttachTarget =
       vendorSessionId: string;
       directory: string;
       baseUrl: string;
+      managedServerLaunchFingerprint?: string;
     }>
   | Readonly<{
       eligible: false;
@@ -67,6 +68,16 @@ export async function resolveOpenCodeProviderAttachTargetWithManagedServerFallba
   metadata: Record<string, unknown>;
   readManagedServerStateFn?: typeof readSharedManagedOpenCodeServerStateBestEffort;
 }>): Promise<OpenCodeProviderAttachTarget> {
+  const affinity = readOpenCodeSessionRuntimeHandleFromMetadata(params.metadata);
+  if (affinity.serverBaseUrl) return resolveOpenCodeProviderAttachTarget(params.metadata);
+  if (affinity.managedServerLaunchFingerprint !== null) {
+    const exactState = await readSharedManagedOpenCodeServerStateByLaunchFingerprintBestEffort(affinity.managedServerLaunchFingerprint);
+    if (!exactState) return { eligible: false, reason: 'Session managed OpenCode server affinity is unavailable.' };
+    const target = resolveOpenCodeProviderAttachTarget(params.metadata, { fallbackServerBaseUrl: exactState.baseUrl });
+    return target.eligible ? { ...target, managedServerLaunchFingerprint: affinity.managedServerLaunchFingerprint } : target;
+  }
+  // Predecessor metadata did not record managed affinity. Retain its local-context fallback;
+  // a recorded affinity above must never fall through to another account's ambient server.
   const managedState = await (params.readManagedServerStateFn ?? readSharedManagedOpenCodeServerStateBestEffort)().catch(() => null);
   return resolveOpenCodeProviderAttachTarget(params.metadata, {
     fallbackServerBaseUrl: managedState?.baseUrl ?? null,

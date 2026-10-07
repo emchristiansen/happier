@@ -58,6 +58,13 @@ installSettingsViewCommonModuleMocks({
     },
 });
 
+// The Settings › Updates row reads the native store-update status; this suite's storage module
+// mock spreads the real module before it has finished initialising, so pin that one read.
+vi.mock('@/hooks/ui/useNativeUpdate', () => ({
+    useNativeUpdateStatus: () => null,
+    useNativeUpdate: () => null,
+}));
+
 vi.mock('expo-image', () => ({
     Image: 'Image',
 }));
@@ -144,7 +151,8 @@ vi.mock('@/components/sessions/new/components/MachineCliGlyphs', () => ({
     MachineCliGlyphs: 'MachineCliGlyphs',
 }));
 
-vi.mock('@/agents/catalog/catalog', () => ({
+vi.mock('@/agents/catalog/catalog', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('@/agents/catalog/catalog')>()),
     DEFAULT_AGENT_ID: 'agent_default',
     getAgentCore: () => ({ uiConnectedService: { serviceId: 'anthropic', label: 'Anthropic', connectRoute: null } }),
     resolveAgentIdFromConnectedServiceId: () => null,

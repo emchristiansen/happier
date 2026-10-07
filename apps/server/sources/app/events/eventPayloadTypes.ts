@@ -119,6 +119,7 @@ export type UpdateEvent = {
     latestTurnStatus?: PrimaryTurnStatusV1 | null | undefined;
     latestTurnStatusObservedAt?: number | null | undefined;
     lastRuntimeIssue?: SessionRuntimeIssueV1 | null | undefined;
+    rollbackEligibleTurnStarts?: readonly number[] | undefined;
     runtimeActivityState?: SessionRuntimeActivityState | null | undefined;
     runtimeActivityRevision?: number | undefined;
     runtimeActivityActiveCount?: number | undefined;

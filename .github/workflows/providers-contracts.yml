@@ -129,12 +129,14 @@ jobs:
     with:
       select_jobs_explicitly: true
       run_ui: false
+      run_shared_packages: false
       run_server: false
       run_cli: false
       run_stack: false
       run_typecheck: false
       run_cli_daemon_e2e: false
       run_e2e_core: false
+      run_build_smoke: false
       run_providers: true
       providers_preset: ${{ inputs.preset }}
       providers_tier: ${{ inputs.tier }}

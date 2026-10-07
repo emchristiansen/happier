@@ -2,7 +2,7 @@ import type { AuthCredentials } from '@/auth/storage/tokenStorage';
 import type { Automation, AutomationRun } from '@/sync/domains/automations/automationTypes';
 import { listAutomations } from '@/sync/api/automations/apiAutomations';
 import { listAutomationRuns } from '@/sync/api/automations/apiAutomationRuns';
-import { isRuntimeFeatureEnabled } from '@/sync/domains/features/featureDecisionInputs';
+import { resolveRuntimeFeatureDecisionOrThrow } from '@/sync/domains/features/featureDecisionInputs';
 import { getActiveServerSnapshot } from '@/sync/domains/server/serverRuntime';
 
 export async function fetchAndApplyAutomations(params: {
@@ -20,13 +20,12 @@ export async function fetchAndApplyAutomations(params: {
     if (!shouldContinue()) return;
 
     const { serverId } = getActiveServerSnapshot();
-    const automationsEnabled = await isRuntimeFeatureEnabled({
+    const automationDecision = await resolveRuntimeFeatureDecisionOrThrow({
         featureId: 'automations',
         serverId,
-        timeoutMs: 400,
     });
     if (!shouldContinue()) return;
-    if (!automationsEnabled) {
+    if (automationDecision.state !== 'enabled') {
         return;
     }
 
@@ -75,13 +74,12 @@ export async function fetchAndApplyAutomationRuns(params: {
     if (!shouldContinue()) return { nextCursor: null };
 
     const { serverId } = getActiveServerSnapshot();
-    const automationsEnabled = await isRuntimeFeatureEnabled({
+    const automationDecision = await resolveRuntimeFeatureDecisionOrThrow({
         featureId: 'automations',
         serverId,
-        timeoutMs: 400,
     });
     if (!shouldContinue()) return { nextCursor: null };
-    if (!automationsEnabled) {
+    if (automationDecision.state !== 'enabled') {
         return { nextCursor: null };
     }
 

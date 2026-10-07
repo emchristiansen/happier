@@ -437,6 +437,79 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     expect((api as any).registerProviderAccountUsageSnapshotPlain).toHaveBeenCalledTimes(1);
   });
 
+  it('refreshes a persisted quota snapshot whose capture time is in the future', async () => {
+    const now = 1_000_000;
+    const credentials: Credentials = {
+      token: 'happy-token',
+      encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
+    };
+    const record = buildConnectedServiceCredentialRecord({
+      now,
+      serviceId: 'openai-codex',
+      profileId: 'work',
+      kind: 'oauth',
+      expiresAt: now + 60_000,
+      oauth: {
+        accessToken: 'access',
+        refreshToken: 'refresh',
+        idToken: null,
+        scope: null,
+        tokenType: null,
+        providerAccountId: 'acct',
+        providerEmail: 'user@example.com',
+      },
+    });
+    const poisoned = buildQuotaSnapshotFixture({
+      serviceId: 'openai-codex',
+      profileId: 'work',
+      now: now + 600_000,
+      remainingPct: 0,
+    });
+    const api = {
+      getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
+      getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => ({
+        content: { t: 'plain' as const, v: poisoned },
+        metadata: {
+          fetchedAt: poisoned.fetchedAt,
+          staleAfterMs: poisoned.staleAfterMs,
+          status: 'ok' as const,
+        },
+      })),
+      getConnectedServiceCredentialPlain: vi.fn(async () => ({ content: { t: 'plain' as const, v: record } })),
+      registerProviderAccountUsageSnapshotPlain: vi.fn(async () => {}),
+      getConnectedServiceQuotaSnapshotSealed: vi.fn(async () => null),
+      getConnectedServiceCredentialSealed: vi.fn(async () => null),
+      registerProviderAccountUsageSnapshotSealed: vi.fn(async () => {}),
+    } as unknown as QuotaApi;
+    const fetcher: ConnectedServiceQuotaFetcher = {
+      serviceId: 'openai-codex',
+      fetch: vi.fn(async () => buildQuotaSnapshotFixture({
+        serviceId: 'openai-codex',
+        profileId: 'work',
+        now,
+        remainingPct: 80,
+      })),
+    };
+    const coordinator = new ConnectedServiceQuotasCoordinator({
+      api,
+      credentials,
+      quotaFetchers: [fetcher],
+      now: () => now,
+      randomBytes: (length: number) => randomBytes(length),
+    });
+    coordinator.registerSpawnTarget({
+      pid: 123,
+      connectedServicesBindingsRaw: {
+        v: 1,
+        bindingsByServiceId: { 'openai-codex': { source: 'connected', profileId: 'work' } },
+      },
+    });
+
+    await coordinator.tickOnce();
+
+    expect(fetcher.fetch).toHaveBeenCalledTimes(1);
+  });
+
   it('consumes recovery credits through the quota fetcher and persists a refreshed plaintext snapshot', async () => {
     let now = 1_000_000;
     const accountUsageStore = createProviderAccountUsageStore();
@@ -8902,7 +8975,7 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   });
 
   it('emits quota blocked/recovered lifecycle transitions from live account-usage group-state changes', async () => {
-    const now = Date.parse('2026-06-11T10:00:00.000Z');
+    let now = Date.parse('2026-06-11T10:00:00.000Z');
     const resetAtMs = now + 500_000;
     const accountUsageStore = createProviderAccountUsageStore();
 
@@ -9042,12 +9115,13 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     });
     expect(onQuotaLifecycleTransition).toHaveBeenCalledTimes(1);
 
+    now += 1_000;
     const backupRecovered = buildProviderAccountUsageSnapshotFixture({
       serviceId: 'openai-codex',
       groupId: 'team',
       profileId: 'backup',
       groupGeneration: 4,
-      now: now + 1_000,
+      now,
       remainingPct: 80,
       resetsAt: now + 700_000,
     });
@@ -10101,29 +10175,44 @@ describe('ConnectedServiceQuotasCoordinator', () => {
       },
     });
 
-    for (const advanceMs of [0, 10_000, 20_000, 40_000, 60_000]) {
+    for (const advanceMs of [
+      0,
+      10_000,
+      20_000,
+      40_000,
+      60_000,
+      60_000,
+      60_000,
+      60_000,
+      60_000,
+      60_000,
+      60_000,
+      60_000,
+      60_000,
+      60_000,
+    ]) {
       now += advanceMs;
       await coordinator.tickOnce();
     }
 
-    expect(refreshConnectedServiceCredentialForQuota).toHaveBeenCalledTimes(1);
+    expect(refreshConnectedServiceCredentialForQuota).toHaveBeenCalledTimes(10);
     expect(refreshConnectedServiceCredentialForQuota).toHaveBeenLastCalledWith({
       serviceId: 'claude-subscription',
       profileId: 'work',
       force: true,
       reason: 'auth_failure',
     });
-    expect(api.updateConnectedServiceCredentialHealth).toHaveBeenCalledTimes(5);
-    expect(api.updateConnectedServiceCredentialHealth).toHaveBeenNthCalledWith(5, {
+    expect(api.updateConnectedServiceCredentialHealth).toHaveBeenCalledTimes(14);
+    expect(api.updateConnectedServiceCredentialHealth).toHaveBeenNthCalledWith(14, {
       serviceId: 'claude-subscription',
       profileId: 'work',
       expectedCredentialRevision: 'csr_abcdefghijklmnopqrstuv',
       health: {
         v: 1,
-        status: 'refresh_failed_retryable',
-        reconnectRequired: false,
-        lastRefreshAttemptAt: 1_130_000,
-        lastRefreshFailureAt: 1_130_000,
+        status: 'needs_reauth',
+        reconnectRequired: true,
+        lastRefreshAttemptAt: 1_670_000,
+        lastRefreshFailureAt: 1_670_000,
         lastRefreshFailureKind: 'provider_401',
         providerHttpStatus: 401,
       },

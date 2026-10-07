@@ -351,7 +351,6 @@ export function machinesRoutes(app: Fastify) {
                         ? new Uint8Array(Buffer.from(dataEncryptionKey, 'base64'))
                         : undefined;
 
-            const wantsMetadataUpdate = metadata !== machine.metadata;
             const wantsDaemonStateUpdate = typeof daemonState === 'string' && daemonState !== (machine.daemonState ?? null);
             const wantsDataEncryptionKeyUpdate =
                 nextDataEncryptionKey !== undefined
@@ -365,8 +364,7 @@ export function machinesRoutes(app: Fastify) {
             const wantsAutomaticReplacement = Boolean(verifiedInstallationIdentity?.replacesMachineId);
 
             if (
-                !wantsMetadataUpdate
-                && !wantsDaemonStateUpdate
+                !wantsDaemonStateUpdate
                 && !wantsDataEncryptionKeyUpdate
                 && !wantsInstallationUpdate
                 && !wantsAutomaticReplacement
@@ -398,7 +396,6 @@ export function machinesRoutes(app: Fastify) {
                     if (!current) return null;
                     if (current.revokedAt) return { error: 'machine_revoked' as const };
 
-                    const currentWantsMetadataUpdate = metadata !== current.metadata;
                     const currentWantsDaemonStateUpdate =
                         typeof daemonState === 'string' && daemonState !== (current.daemonState ?? null);
                     const currentWantsDataEncryptionKeyUpdate =
@@ -412,8 +409,7 @@ export function machinesRoutes(app: Fastify) {
                     const currentWantsAutomaticReplacement = Boolean(verifiedInstallationIdentity?.replacesMachineId);
 
                     if (
-                        !currentWantsMetadataUpdate
-                        && !currentWantsDaemonStateUpdate
+                        !currentWantsDaemonStateUpdate
                         && !currentWantsDataEncryptionKeyUpdate
                         && !currentWantsInstallationUpdate
                         && !currentWantsAutomaticReplacement
@@ -421,16 +417,16 @@ export function machinesRoutes(app: Fastify) {
                         return current;
                     }
 
-                    const updatedMachine = currentWantsMetadataUpdate
-                        || currentWantsDaemonStateUpdate
+                    // Registration metadata is create-only. Existing metadata also contains
+                    // user-owned fields such as displayName, and the server cannot merge its
+                    // encrypted value. Daemons refresh their owned fields through the versioned
+                    // machine-update-metadata socket after registration.
+                    const updatedMachine = currentWantsDaemonStateUpdate
                         || currentWantsDataEncryptionKeyUpdate
                         || currentWantsInstallationUpdate
                         ? await tx.machine.update({
                             where: { accountId_id: { accountId: userId, id } },
                             data: {
-                                ...(currentWantsMetadataUpdate
-                                    ? { metadata, metadataVersion: { increment: 1 } }
-                                    : {}),
                                 ...(currentWantsDaemonStateUpdate
                                     ? { daemonState, daemonStateVersion: { increment: 1 } }
                                     : {}),
@@ -445,8 +441,7 @@ export function machinesRoutes(app: Fastify) {
                         : current;
 
                     if (
-                        currentWantsMetadataUpdate
-                        || currentWantsDaemonStateUpdate
+                        currentWantsDaemonStateUpdate
                         || currentWantsDataEncryptionKeyUpdate
                         || currentWantsInstallationUpdate
                     ) {

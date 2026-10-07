@@ -82,10 +82,15 @@ export type StreamedTranscriptWriter = Readonly<{
   setCommitProvenance: (provenance: SessionTranscriptObservationProvenanceV1 | null) => void;
   enableDurableCommits: () => void;
   discard: () => void;
+  hasPendingSegments: () => boolean;
   flushAll: (opts: {
     reason: 'tool-call-boundary' | 'turn-end' | 'abort';
     interruptedReason?: string;
   }) => Promise<StreamedTranscriptFlushSummary>;
+  flushAllThroughDurableAdmission: (opts: {
+    reason: 'tool-call-boundary' | 'turn-end' | 'abort';
+    interruptedReason?: string;
+  }) => Promise<void>;
 }>;
 
 export type StreamedTranscriptSegmentFlushSummary = Readonly<{

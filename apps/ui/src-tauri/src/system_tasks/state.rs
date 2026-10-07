@@ -81,6 +81,19 @@ impl SystemTasksState {
             return Ok(());
         };
         if record.snapshot.result.is_none() {
+            // Byte samples are current state, not an event log. Keep phase boundaries and
+            // intervening prompts while replacing the last sample from this acquisition phase.
+            if let Some(index) = record
+                .snapshot
+                .events
+                .iter()
+                .rposition(|previous| previous.event_type == "cli.acquisition.progress")
+            {
+                let previous = &record.snapshot.events[index];
+                if replaceable_acquisition_sample(previous, &event) {
+                    record.snapshot.events.remove(index);
+                }
+            }
             record.snapshot.events.push(event);
             let max_events = self.inner.max_events_per_task;
             if record.snapshot.events.len() > max_events {
@@ -191,6 +204,31 @@ impl SystemTasksState {
     }
 }
 
+fn replaceable_acquisition_sample(previous: &SystemTaskEvent, next: &SystemTaskEvent) -> bool {
+    if next.event_type != "cli.acquisition.progress" || previous.step_id != next.step_id {
+        return false;
+    }
+    let (Some(previous_data), Some(next_data)) = (previous.data.as_ref(), next.data.as_ref())
+    else {
+        return false;
+    };
+    previous_data
+        .get("receivedBytes")
+        .and_then(|value| value.as_u64())
+        .is_some()
+        && next_data
+            .get("receivedBytes")
+            .and_then(|value| value.as_u64())
+            .is_some()
+        && previous_data.get("failure").is_none()
+        && next_data.get("failure").is_none()
+        && previous_data
+            .get("phase")
+            .and_then(|value| value.as_str())
+            .is_some()
+        && previous_data.get("phase") == next_data.get("phase")
+}
+
 fn evict_completed_tasks(task_store: &mut TaskStore, max_completed_tasks: usize) {
     while task_store.completed_task_ids.len() > max_completed_tasks {
         let Some(task_id) = task_store.completed_task_ids.pop_front() else {
@@ -285,6 +323,35 @@ mod tests {
         assert_eq!(snapshot.events[0].message.as_deref(), Some("first"));
         assert_eq!(snapshot.events[1].message.as_deref(), Some("second"));
         kill_test_child(child);
+    }
+
+    #[test]
+    fn acquisition_byte_samples_replace_each_other_without_evicting_milestones() {
+        let state = SystemTasksState::default();
+        let child = spawn_test_child();
+        state.insert_running_task("task_1", child.clone()).unwrap();
+        state
+            .append_event("task_1", build_event("task_1", "prepare"))
+            .unwrap();
+        for received in 0..1000 {
+            let mut event = build_event("task_1", "download");
+            event.event_type = "cli.acquisition.progress".to_string();
+            event.data =
+                Some(serde_json::json!({"phase": "downloading", "receivedBytes": received}));
+            state.append_event("task_1", event).unwrap();
+        }
+        state
+            .append_event("task_1", build_event("task_1", "unpack"))
+            .unwrap();
+        let snapshot = state.snapshot("task_1").unwrap();
+        kill_test_child(child);
+        assert_eq!(snapshot.events.len(), 3);
+        assert_eq!(snapshot.events[0].message.as_deref(), Some("prepare"));
+        assert_eq!(
+            snapshot.events[1].data.as_ref().unwrap()["receivedBytes"],
+            999
+        );
+        assert_eq!(snapshot.events[2].message.as_deref(), Some("unpack"));
     }
 
     #[test]

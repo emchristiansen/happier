@@ -9,12 +9,9 @@ import {
     WEB_START_ELLIPSIS_CONTAINER_TEXT_STYLE,
     WEB_START_ELLIPSIS_CONTENT_TEXT_STYLE,
 } from '@/components/ui/text/webStartEllipsisTextStyles';
-import { Avatar } from '@/components/ui/avatar/Avatar';
-import { AgentIcon } from '@/agents/registry/AgentIcon';
 import {
     DEFAULT_AGENT_ID,
     getAgentCore,
-    getAgentPickerIconScale,
     resolveAgentIdFromFlavor,
 } from '@/agents/catalog/catalog';
 import { resolveAgentIdFromSessionMetadata } from '@happier-dev/agents';
@@ -26,7 +23,6 @@ import type { SessionListSecondaryLineMode } from '@/sync/domains/session/listin
 import { Session } from '@/sync/domains/state/storageTypes';
 import { storage, useLocalSetting } from '@/sync/domains/state/storage';
 import type { SessionListRenderableSession } from '@/sync/domains/session/listing/sessionListRenderable';
-import { getSessionAvatarId } from '@/utils/sessions/sessionUtils';
 import { PinIcon, PinSlashIcon } from './sessionPinIcons';
 import { TagIcon } from './sessionTagIcons';
 import { DropdownMenu, type DropdownMenuItem } from '@/components/ui/forms/dropdown/DropdownMenu';
@@ -59,6 +55,7 @@ import { planSessionTagDisplay } from './sessionTagPlacement';
 import { useIsTablet } from '@/utils/platform/responsive';
 import type { SessionStatus } from '@/utils/sessions/sessionUtils';
 import { useSessionRowActionMenu } from './row/actionMenu/useSessionRowActionMenu';
+import { formatSessionAttentionReminderDateTime } from './row/actionMenu/sessionAttentionReminderAction';
 import { createSessionActionTarget } from '@/components/sessions/actions/sessionActionContext';
 import { executeSessionAction } from '@/components/sessions/actions/sessionActionExecution';
 import {
@@ -68,6 +65,11 @@ import {
 } from '@/components/sessions/actions/sessionActionIds';
 import { resolveKeyboardPlatform } from '@/keyboard/runtime';
 import { SessionListSelectionCheckbox } from './selection/SessionListSelectionCheckbox';
+import {
+    SessionListIdentity,
+    normalizeSessionListIdentityDisplay,
+    type SessionListIdentityDisplay,
+} from './SessionListIdentity';
 import { useOptionalSessionListSelectionRow } from './selection/SessionListSelectionContext';
 import { resolveSessionListSelectionPointerAction } from './selection/sessionListSelectionPointer';
 import {
@@ -84,23 +86,38 @@ import {
 } from '@/components/sessions/debug/sessionDebugMenuItem';
 import { useFeatureEnabled } from '@/hooks/server/useFeatureEnabled';
 import { canForkConversation } from '@/sync/domains/sessionFork/forkUiSupport';
-import { deferOnWeb } from '@/utils/platform/deferOnWeb';
 import { resolveMachineTargetForSessionFromState } from '@/sync/ops/sessionMachineTarget';
 import { fireAndForget } from '@/utils/system/fireAndForget';
-import type { SessionForkReplaySettingsSource } from '@/sync/domains/sessionFork/resolveSessionForkReplayOptions';
 
 const SESSION_LIST_MINIMAL_IDENTITY_GAP = 8;
 const CONTEXT_MENU_PRESS_SUPPRESSION_TIMEOUT_MS = 600;
 const CONTEXT_MENU_PRESS_IN_OPEN_DELAY_MS = 350;
-const CONTEXT_MENU_DEFERRED_ACTION_DELAY_MS = 0;
 const SESSION_IDENTITY_SKELETON_ANIMATION_MS = 900;
 const SESSION_FOLDER_ROW_CHROME_INDENT_BASE = 38;
 const SESSION_FOLDER_ROW_CHROME_INDENT_STEP = 12;
 const SESSION_FOLDER_ROW_INDENT_CAP = 3;
 const SESSION_DELETE_DRAFT_MENU_ITEM_ID = 'session-draft.delete';
 
+let sessionForkStrategyFlowModulePromise:
+    Promise<typeof import('@/components/sessions/fork/openSessionForkStrategyFlow')> | null = null;
+
+function loadSessionForkStrategyFlowModule() {
+    if (!sessionForkStrategyFlowModulePromise) {
+        sessionForkStrategyFlowModulePromise = import(
+            '@/components/sessions/fork/openSessionForkStrategyFlow'
+        ).catch((error: unknown) => {
+            sessionForkStrategyFlowModulePromise = null;
+            throw error;
+        });
+    }
+    return sessionForkStrategyFlowModulePromise;
+}
+
+function preloadSessionForkStrategyFlowModule(): void {
+    void loadSessionForkStrategyFlowModule().catch(() => undefined);
+}
+
 type SessionItemActivityTimeMode = 'meaningful' | 'updatedAt';
-type SessionItemIdentityDisplay = 'avatar' | 'agentLogo' | 'none';
 type SessionItemActiveColorMode = 'activityAndAttention' | 'attentionOnly' | 'allActive';
 type SessionItemWorkingIndicatorMode = 'spinner' | 'pulse';
 
@@ -147,7 +164,6 @@ type SessionItemBaseProps = Readonly<{
     onMoveUp?: () => void;
     onSelectFolderMoveMenuItem?: (itemId: string) => void;
     forkActionContext?: Readonly<{
-        settings: SessionForkReplaySettingsSource | null;
         replayEnabled: boolean;
         executionRunsEnabled: boolean;
     }>;
@@ -164,6 +180,7 @@ type SessionItemRenderProps = Omit<SessionItemBaseProps, 'activityTimeMode' | 's
     sessionSubtitle: string;
     pendingCount: number;
     draft: SessionListRowModel['draft'];
+    reminder: SessionListRowModel['reminder'];
     /** Live agent work in this session, already named. `null` unless the person opted in (R-8). */
     agentActivityLabel: string | null;
     isSessionIdentityLoading: boolean;
@@ -173,14 +190,10 @@ type SessionItemRenderProps = Omit<SessionItemBaseProps, 'activityTimeMode' | 's
     workingIndicatorMode: SessionItemWorkingIndicatorMode;
     workingIndicatorPaused?: boolean;
     rowAttentionAnimationEnabled: boolean;
-    sessionListIdentityDisplay: SessionItemIdentityDisplay;
+    sessionListIdentityDisplay: SessionListIdentityDisplay;
     sessionListActiveColorMode: SessionItemActiveColorMode;
     hideInactiveSessions: boolean;
 }>;
-
-function normalizeSessionItemIdentityDisplay(value: unknown): SessionItemIdentityDisplay {
-    return value === 'agentLogo' || value === 'none' ? value : 'avatar';
-}
 
 function normalizeSessionItemActiveColorMode(value: unknown): SessionItemActiveColorMode {
     switch (value) {
@@ -369,6 +382,19 @@ const stylesheet = StyleSheet.create((theme) => ({
         color: theme.colors.text.secondary,
         fontSize: 10,
         ...Typography.default('semiBold'),
+    },
+    reminderIndicator: {
+        width: 20,
+        height: 20,
+        borderRadius: 10,
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundColor: theme.colors.surface.inset,
+    },
+    reminderIndicatorCompact: {
+        width: 18,
+        height: 18,
+        borderRadius: 9,
     },
     draftPreviewText: {
         color: theme.colors.text.secondary,
@@ -588,14 +614,13 @@ const stylesheet = StyleSheet.create((theme) => ({
         gap: 3,
         marginTop: -1,
     },
+    // As wide as the attention indicator's own slot, so the 16 px working spinner keeps the line's
+    // gap to the status text instead of overhanging it.
     secondaryStatusDotContainer: {
         alignItems: 'center',
         justifyContent: 'center',
-        width: 12,
+        width: 16,
         height: 12,
-    },
-    secondaryStatusDotContainerCompact: {
-        width: 11,
     },
     secondaryStatusDotContainerMinimal: {
         width: 10,
@@ -688,6 +713,7 @@ const SessionItemContent = React.memo(
         sessionSubtitle,
         pendingCount,
         draft,
+        reminder,
         agentActivityLabel,
         isSessionIdentityLoading,
         activityTimeLabel,
@@ -827,37 +853,33 @@ const SessionItemContent = React.memo(
             agentSwitchingEnabled,
         });
         const openForkFlow = React.useCallback(() => {
-            deferOnWeb(() => {
-                fireAndForget((async () => {
-                    const { openSessionForkStrategyFlow } = await import(
-                        '@/components/sessions/fork/openSessionForkStrategyFlow'
-                    );
-                    const currentSession = storage.getState().sessions[resolvedSession.id] ?? resolvedSession;
-                    const reachableMachineTarget = resolveMachineTargetForSessionFromState(
-                        storage.getState(),
-                        resolvedSession.id,
-                    );
-                    openSessionForkStrategyFlow({
-                        sessionId: resolvedSession.id,
-                        forkSupportSource: currentSession,
-                        serverId: serverId ?? null,
-                        machineId: reachableMachineTarget?.machineId ?? currentSession.metadata?.machineId ?? null,
-                        forkPoint: { type: 'latest' },
-                        settings: forkActionContext?.settings ?? null,
-                        replayEnabled: forkActionContext?.replayEnabled === true,
-                        executionRunsEnabled: forkActionContext?.executionRunsEnabled === true,
-                        agentSwitchingEnabled,
-                        navigateToSession: (childSessionId, options) => {
-                            void navigateToSession(childSessionId, {
-                                serverId: options?.serverId ?? serverId ?? null,
-                            });
-                        },
-                        navigateToNewSession: (route) => {
-                            router.push(route as any);
-                        },
-                    });
-                })(), { tag: 'SessionItem.openSessionForkStrategyFlow' });
-            });
+            fireAndForget((async () => {
+                const { openSessionForkStrategyFlow } = await loadSessionForkStrategyFlowModule();
+                const currentSession = storage.getState().sessions[resolvedSession.id] ?? resolvedSession;
+                const reachableMachineTarget = resolveMachineTargetForSessionFromState(
+                    storage.getState(),
+                    resolvedSession.id,
+                );
+                openSessionForkStrategyFlow({
+                    sessionId: resolvedSession.id,
+                    forkSupportSource: currentSession,
+                    serverId: serverId ?? null,
+                    machineId: reachableMachineTarget?.machineId ?? currentSession.metadata?.machineId ?? null,
+                    forkPoint: { type: 'latest' },
+                    settings: storage.getState().settings,
+                    replayEnabled: forkActionContext?.replayEnabled === true,
+                    executionRunsEnabled: forkActionContext?.executionRunsEnabled === true,
+                    agentSwitchingEnabled,
+                    navigateToSession: (childSessionId, options) => {
+                        void navigateToSession(childSessionId, {
+                            serverId: options?.serverId ?? serverId ?? null,
+                        });
+                    },
+                    navigateToNewSession: (route) => {
+                        router.push(route as any);
+                    },
+                });
+            })(), { tag: 'SessionItem.openSessionForkStrategyFlow' });
         }, [
             agentSwitchingEnabled,
             forkActionContext,
@@ -976,8 +998,11 @@ const SessionItemContent = React.memo(
             isBeingDraggedRef.current = isBeingDragged === true;
         }, [isBeingDragged]);
         const handleRowPointerEnter = React.useCallback(() => {
+            if (showForkAction) {
+                preloadSessionForkStrategyFlowModule();
+            }
             setIsRowHovered(true);
-        }, []);
+        }, [showForkAction]);
 
         const handleRowPointerLeave = React.useCallback(() => {
             setIsRowHovered(false);
@@ -1102,7 +1127,7 @@ const SessionItemContent = React.memo(
                 setTagMenuEverOpened(true);
                 setTagMenuOpen(true);
             },
-            deferredContextActionDelayMs: CONTEXT_MENU_DEFERRED_ACTION_DELAY_MS,
+            reminder,
         });
 
         const handleSwipeAction = React.useCallback(async () => {
@@ -1140,9 +1165,6 @@ const SessionItemContent = React.memo(
             }
         }, [confirmDeleteDraft, onMoveDown, onMoveToFolder, onMoveToWorkspaceRoot, onMoveUp]);
 
-        const avatarId = React.useMemo(() => {
-            return getSessionAvatarId(resolvedSession);
-        }, [resolvedSession]);
         const pendingBadge = formatPendingCountBadge(pendingCount);
         const tagChipDensity: 'default' | 'compact' | 'minimal' = isMinimal ? 'minimal' : compact ? 'compact' : 'default';
         const sourceTagChips = React.useMemo(() => {
@@ -1225,7 +1247,6 @@ const SessionItemContent = React.memo(
         });
         const avatarSize = identityMetrics.slotSize;
         const agentLogoSize = identityMetrics.agentLogoSize;
-        const agentLogoId = resolveAgentIdFromFlavor(resolvedSession.metadata?.flavor) ?? DEFAULT_AGENT_ID;
         const normalizedFolderDepth = typeof folderDepth === 'number' && Number.isFinite(folderDepth)
             ? Math.max(0, Math.min(SESSION_FOLDER_ROW_INDENT_CAP, Math.trunc(folderDepth)))
             : 0;
@@ -1353,21 +1374,14 @@ const SessionItemContent = React.memo(
                                     { opacity: identitySkeletonOpacity },
                                 ]}
                             />
-                        ) : shouldRenderSessionListAvatar ? (
-                            <Avatar
-                                id={avatarId}
-                                size={avatarSize}
-                                monochrome={shouldRenderAvatarMonochrome}
-                                flavor={resolvedSession.metadata?.flavor}
-                                hasUnreadMessages={false}
-                            />
                         ) : (
-                            <AgentIcon
-                                agentId={agentLogoId}
-                                size={agentLogoSize}
+                            <SessionListIdentity
+                                session={resolvedSession}
+                                display={resolvedSessionListIdentityDisplay}
+                                avatarSize={avatarSize}
+                                agentLogoSize={agentLogoSize}
+                                monochrome={shouldRenderAvatarMonochrome}
                                 color={sessionTitleColor}
-                                style={{ transform: [{ scale: getAgentPickerIconScale(agentLogoId) }] }}
-                                testID={`session-list-agent-logo-${resolvedSession.id}`}
                             />
                         )}
                         {!isMinimal && shouldRenderSessionListAvatar && pendingBadge ? (
@@ -1437,6 +1451,24 @@ const SessionItemContent = React.memo(
                                 ) : null}
                             </View>
                         ) : null}
+                        {reminder ? (
+                            <View
+                                testID={`session-list-reminder-indicator:${resolvedSession.id}`}
+                                accessible={true}
+                                accessibilityRole="text"
+                                accessibilityLabel={`${t(reminder.state === 'due' ? 'sessionsList.reminders.due' : 'sessionsList.reminders.title')}, ${formatSessionAttentionReminderDateTime(reminder.remindAt, Date.now())}`}
+                                style={[
+                                    styles.reminderIndicator,
+                                    compact ? styles.reminderIndicatorCompact : null,
+                                ]}
+                            >
+                                <Icon
+                                    name="clock"
+                                    size={compact ? 11 : 12}
+                                    color={reminder.state === 'due' ? theme.colors.accent.orange : theme.colors.text.secondary}
+                                />
+                            </View>
+                        ) : null}
                     </View>
 
                     {draft && !compact && draft.preview ? (
@@ -1461,12 +1493,7 @@ const SessionItemContent = React.memo(
                                 testID={`session-list-status-subtitle-${resolvedSession.id}-${rowAttentionState}`}
                                 style={styles.secondaryLineRow}
                             >
-                                <View
-                                    style={[
-                                        styles.secondaryStatusDotContainer,
-                                        compact ? styles.secondaryStatusDotContainerCompact : null,
-                                    ]}
-                                >
+                                <View style={styles.secondaryStatusDotContainer}>
                                     {rowPresentation.attentionIndicator !== 'none' ? (
                                         <SessionRowAttentionIndicator
                                             indicator={rowPresentation.attentionIndicator}
@@ -1845,6 +1872,7 @@ function SessionItemFromRowModel(props: SessionItemProps & { rowModel: SessionLi
             sessionSubtitle={itemProps.subtitleOverride ?? rowModel.subtitle}
             pendingCount={rowModel.pendingCount}
             draft={rowModel.draft}
+            reminder={rowModel.reminder}
             agentActivityLabel={rowModel.agentActivityLabel}
             isSessionIdentityLoading={rowModel.isIdentityLoading}
             activityTimeLabel={rowModel.activity.label}
@@ -1853,7 +1881,7 @@ function SessionItemFromRowModel(props: SessionItemProps & { rowModel: SessionLi
             workingIndicatorMode={rowModel.workingIndicatorMode}
             workingIndicatorPaused={rowModel.workingIndicatorPaused}
             rowAttentionAnimationEnabled={itemProps.rowAttentionAnimationEnabled !== false}
-            sessionListIdentityDisplay={normalizeSessionItemIdentityDisplay(rowModel.identityDisplay)}
+            sessionListIdentityDisplay={normalizeSessionListIdentityDisplay(rowModel.identityDisplay)}
             sessionListActiveColorMode={normalizeSessionItemActiveColorMode(rowModel.activeColorMode)}
             hideInactiveSessions={itemProps.hideInactiveSessions ?? rowModel.hideInactiveSessions}
         />

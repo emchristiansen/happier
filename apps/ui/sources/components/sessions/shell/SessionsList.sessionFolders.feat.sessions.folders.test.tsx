@@ -213,9 +213,6 @@ vi.mock('@/components/account/RecoveryKeyReminderBanner', () => ({
     RecoveryKeyReminderBanner: 'RecoveryKeyReminderBanner',
 }));
 
-vi.mock('@/components/ui/feedback/UpdateBanner', () => ({
-    UpdateBanner: 'UpdateBanner',
-}));
 
 vi.mock('@/components/ui/forms/dropdown/DropdownMenu', () => ({
     DropdownMenu: (props: any) => React.createElement(

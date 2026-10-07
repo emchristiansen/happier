@@ -34,6 +34,7 @@ export async function runSupervisedRequest<T>(params: Readonly<{
     requireAuth,
     requireOnline,
   });
+  const probeReportScope = params.supervisor.captureProbeReportScope?.();
 
   try {
     const result = await params.request();
@@ -41,7 +42,8 @@ export async function runSupervisedRequest<T>(params: Readonly<{
       supervisor: params.supervisor,
       statusCode: params.readStatusCode?.(result) ?? null,
       hadAuth: requireAuth,
-      scope: outcomeSupervision,
+      probeReportScope,
+      outcomeSupervision,
     });
     return result;
   } catch (error) {
@@ -49,7 +51,8 @@ export async function runSupervisedRequest<T>(params: Readonly<{
       supervisor: params.supervisor,
       error,
       hadAuth: requireAuth,
-      scope: outcomeSupervision,
+      probeReportScope,
+      outcomeSupervision,
     });
     throw error;
   }

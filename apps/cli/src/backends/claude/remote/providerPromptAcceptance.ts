@@ -15,6 +15,7 @@ export type ClaudeRemoteProviderAcceptedPrompt<Mode = EnhancedMode> = Readonly<{
     userMessageLocalIds?: readonly string[] | null;
     providerAcceptancePending?: boolean;
     pendingProviderAction?: PendingProviderAction;
+    pendingRequestedAction?: import('@happier-dev/protocol').PendingRequestedActionV1;
 }>;
 
 export type ClaudeRemoteProviderPromptAttribution = Readonly<{
@@ -22,6 +23,7 @@ export type ClaudeRemoteProviderPromptAttribution = Readonly<{
     userMessageLocalIds: readonly string[];
     providerAcceptancePending: boolean;
     pendingProviderAction?: PendingProviderAction;
+    pendingRequestedAction?: import('@happier-dev/protocol').PendingRequestedActionV1;
 }>;
 
 export function readClaudeRemoteProviderPromptAttribution(
@@ -31,6 +33,7 @@ export function readClaudeRemoteProviderPromptAttribution(
         ...readClaudeRemoteProviderPromptAcceptance(prompt),
         providerAcceptancePending: prompt.providerAcceptancePending === true,
         ...(prompt.pendingProviderAction ? { pendingProviderAction: prompt.pendingProviderAction } : {}),
+        ...(prompt.pendingRequestedAction ? { pendingRequestedAction: prompt.pendingRequestedAction } : {}),
     };
 }
 
@@ -87,4 +90,45 @@ export function reportClaudeRemoteProviderPromptTransportFailure(
         kind,
         ...readClaudeRemoteProviderPromptAcceptance(prompt),
     })).catch(() => {});
+}
+
+/**
+ * Owns settlement for prompts claimed from Happier's durable pending queue.
+ *
+ * Direct Claude runtimes accept custody at their supported prompt-input API.
+ * Anything still tracked when the runtime exits never crossed that boundary and
+ * can be retried safely. Claude Unified's TUI injection has its own stronger
+ * settlement contract and deliberately does not use this tracker.
+ */
+export function createClaudeRemotePromptSettlementTracker(options: Readonly<{
+    onAccepted?: ClaudeRemoteProviderPromptAcceptedHandler | null;
+    onTransportFailure?: ClaudeRemoteProviderPromptTransportFailureHandler | null;
+}>) {
+    const unresolved = new Set<ClaudeRemoteProviderAcceptedPrompt>();
+
+    const remove = (prompt: ClaudeRemoteProviderAcceptedPrompt): boolean => unresolved.delete(prompt);
+    const rejectBeforeEffect = (prompt: ClaudeRemoteProviderAcceptedPrompt): void => {
+        if (!remove(prompt)) return;
+        reportClaudeRemoteProviderPromptTransportFailure(
+            options.onTransportFailure,
+            prompt,
+            'rejected_before_effect',
+        );
+    };
+
+    return {
+        track(prompt: ClaudeRemoteProviderAcceptedPrompt): void {
+            unresolved.add(prompt);
+        },
+        accept(prompt: ClaudeRemoteProviderAcceptedPrompt): void {
+            if (!remove(prompt)) return;
+            confirmClaudeRemoteProviderPromptAccepted(options.onAccepted, prompt);
+        },
+        rejectBeforeEffect,
+        settleUnresolved(): void {
+            for (const prompt of [...unresolved]) {
+                rejectBeforeEffect(prompt);
+            }
+        },
+    };
 }

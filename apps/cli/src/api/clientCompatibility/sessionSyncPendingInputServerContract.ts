@@ -4,7 +4,7 @@ import {
     SESSION_SYNC_PROTOCOL_VERSION_RUNTIME_ACTIVITY,
 } from '@happier-dev/protocol';
 
-import { normalizeBaseUrl } from '@/diagnostics/httpClient';
+import { observeServerFeaturesSnapshot } from '@/features/serverFeaturesClient';
 
 export type RuntimeActivityServerContract = 'v2' | 'legacy' | 'unsupported' | 'indeterminate';
 export type PendingInputServerContract = 'v1' | 'released_server_v0_2_1' | 'unsupported' | 'indeterminate';
@@ -146,32 +146,30 @@ export function createSessionSyncPendingInputServerContractController(options: R
             return result(probe, INDETERMINATE);
         }
 
-        const abortController = new AbortController();
-        const timer = setTimeout(() => abortController.abort(), timeoutMs);
-        timer.unref?.();
         try {
-            const response = await fetchImpl(`${normalizeBaseUrl(options.serverUrl)}/v1/features`, {
-                method: 'GET',
-                headers: { Authorization: `Bearer ${options.token}` },
-                redirect: 'manual',
-                signal: abortController.signal,
+            const snapshot = await observeServerFeaturesSnapshot({
+                serverUrl: options.serverUrl,
+                token: options.token,
+                timeoutMs,
+                fetchImpl,
             });
             if (!isCurrent(attempt) || probe.socket.connected !== true) {
                 return result(probe, INDETERMINATE);
             }
-            if (response.status === 401 || response.status === 403) {
+            if (
+                snapshot.status === 'error'
+                && (snapshot.httpStatus === 401 || snapshot.httpStatus === 403)
+            ) {
                 return result(probe, INDETERMINATE, 'auth_failed');
             }
-            if (!response.ok) return result(probe, INDETERMINATE);
-            const selection = resolveSessionServerCapabilities(await response.json());
+            if (snapshot.status !== 'ready') return result(probe, INDETERMINATE);
+            const selection = resolveSessionServerCapabilities(snapshot.features);
             if (!isCurrent(attempt) || probe.socket.connected !== true) {
                 return result(probe, INDETERMINATE);
             }
             return result(probe, selection);
         } catch {
             return result(probe, INDETERMINATE);
-        } finally {
-            clearTimeout(timer);
         }
     }
 

@@ -163,7 +163,7 @@ describe('sessionFileTransferRpcCaller', () => {
         // route selection and direct-route guarding, this may involve one or more feature reads per call.
         expect(getReadyServerFeaturesMock.mock.calls.length).toBeGreaterThanOrEqual(2);
         for (const [params] of getReadyServerFeaturesMock.mock.calls) {
-            expect(params).toEqual({ timeoutMs: 500, serverId: 'server-owned' });
+            expect(params).toEqual({ serverId: 'server-owned' });
         }
         expect(sessionRpcWithServerScopeMock).not.toHaveBeenCalled();
     });
@@ -185,7 +185,7 @@ describe('sessionFileTransferRpcCaller', () => {
         ).resolves.toEqual({ success: true, value: 'relayed' });
 
         expect(machineRPC).not.toHaveBeenCalled();
-        expect(getReadyServerFeaturesMock).toHaveBeenCalledWith({ timeoutMs: 500, serverId: 'server-owned' });
+        expect(getReadyServerFeaturesMock).toHaveBeenCalledWith({ serverId: 'server-owned' });
         expect(sessionRpcWithServerScopeMock).toHaveBeenCalledWith({
             sessionId: 'session-1',
             serverId: 'server-owned',
@@ -215,7 +215,7 @@ describe('sessionFileTransferRpcCaller', () => {
             errorCode: 'custom_error',
         });
 
-        expect(getReadyServerFeaturesMock).toHaveBeenCalledWith({ timeoutMs: 500, serverId: 'server-owned' });
+        expect(getReadyServerFeaturesMock).toHaveBeenCalledWith({ serverId: 'server-owned' });
         expect(sessionRpcWithServerScopeMock).not.toHaveBeenCalled();
     });
 

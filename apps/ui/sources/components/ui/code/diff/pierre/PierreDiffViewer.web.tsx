@@ -837,7 +837,7 @@ export const PierreDiffViewer = React.memo<DiffViewerProps>((props) => {
 
     const body = props.virtualized && !sharedVirtualizer ? (
         <Virtualizer
-            style={{ flex: '1 1 0%', minHeight: 0, maxHeight: 'inherit', overflowY: 'auto' }}
+            style={{ maxHeight: 'inherit', overflowY: 'auto' }}
         >
             {/* Pierre's virtualized instance retains its initial fileDiff; remount
                 only that inner renderer when the content hash changes. */}
@@ -864,17 +864,7 @@ export const PierreDiffViewer = React.memo<DiffViewerProps>((props) => {
     );
 
     const wrapperStyle = props.virtualized
-        ? ({
-            ...typographyStyle,
-            ...selectionStyle,
-            display: 'flex',
-            flex: '1 1 0%',
-            flexDirection: 'column',
-            minHeight: 0,
-            maxHeight: 'inherit',
-            overflow: 'hidden',
-            ...(!sharedVirtualizer ? { position: 'absolute', inset: 0 } : null),
-        } as React.CSSProperties)
+        ? ({ ...typographyStyle, ...selectionStyle, maxHeight: 'inherit' } as React.CSSProperties)
         : ({ ...typographyStyle, ...selectionStyle } as React.CSSProperties);
 
     return (

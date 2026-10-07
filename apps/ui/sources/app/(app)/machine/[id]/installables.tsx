@@ -120,7 +120,7 @@ export default function MachineInstallablesScreen() {
 
                 <ProviderSetupFlow machineId={machineId ?? null} serverId={serverId} />
 
-                {installables.map(({ entry, enabled, status, policy }) => {
+                {installables.map(({ entry, enabled, status, detectResult, policy }) => {
                     if (!enabled) return null;
                     return (
                         <InstallableDepInstaller
@@ -133,6 +133,7 @@ export default function MachineInstallablesScreen() {
                             depTitle={entry.title}
                             depIconName={entry.iconName as any}
                             depStatus={status}
+                            detectResult={detectResult}
                             capabilitiesStatus={detectedCapabilities.status}
                             extraItems={
                                 <>

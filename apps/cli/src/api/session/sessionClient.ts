@@ -8,7 +8,13 @@ import { backoff, delayUnrefAbortable } from '@/utils/time';
 import { LruSet } from '@/utils/collections/lru';
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers';
 import { createSerializedWorkQueueDiagnostics, type SerializedWorkDiagnosticContext } from '@/utils/serializedWorkQueueDiagnostics';
-import { isConditionalPendingSteerClaim, readPendingLocalId } from '@happier-dev/protocol';
+import {
+    isConditionalPendingSteerClaim,
+    normalizeSessionMetadataForRead,
+    projectSessionMetadataForWire,
+    readPendingLocalId,
+    redactBugReportSensitiveText,
+} from '@happier-dev/protocol';
 import { inferAgentIdFromSessionMetadata } from '@happier-dev/agents';
 import { configuration } from '@/configuration';
 import type { RawJSONLines } from '@/backends/claude/types';
@@ -40,6 +46,7 @@ import {
 } from '@/session/transport/http/sessionSystemRecordsHttp';
 import { createExecutionRunBackend } from '@/agent/executionRuns/runtime/createExecutionRunBackend';
 import { CodexLikePermissionHandler } from '@/agent/permissions/CodexLikePermissionHandler';
+import type { PermissionRequestPushSender } from '@/agent/permissions/BasePermissionHandler';
 import { SessionPermissionRpcRouter } from '@/agent/permissions/sessionPermissionRpcRouter';
 import { ExecutionBudgetRegistry } from '@/daemon/executionBudget/ExecutionBudgetRegistry';
 import { readCredentials, readAccountChangesCursor } from '@/persistence';
@@ -78,11 +85,15 @@ import {
     supportsRuntimeActivityV2,
     type SessionSyncPendingInputServerContractResult,
 } from '@/api/clientCompatibility/sessionSyncPendingInputServerContract';
-import { fetchSessionByIdCompat } from '@/session/transport/http/sessionsHttp';
+import { fetchSessionByIdCompat, fetchSessionTurnsProjection } from '@/session/transport/http/sessionsHttp';
 import type { SessionMessageCommitResult } from './sessionMessageCommitResult';
 
 export type SessionRuntimeActivityClientConfig = Readonly<{
     executionRunContributionHandle: SessionRuntimeActivityContributionHandle;
+}>;
+
+export type SessionPermissionNotificationConfig = Readonly<{
+    permissionRequestPushSender: PermissionRequestPushSender | null;
 }>;
 
 type SessionMessageCommitObservation = Readonly<{
@@ -162,6 +173,7 @@ import type {
     SessionSystemRecordNamespace,
     SessionSystemRecordUpsertRequest,
     SessionTranscriptObservationProvenanceV1,
+    SessionTurnsProjectionV1,
 } from '@happier-dev/protocol';
 import { calculateCost } from '@/utils/pricing';
 import { buildAcpAgentMessageEnvelope, shouldTraceAcpMessageType } from './acpMessageEnvelope';
@@ -176,7 +188,9 @@ import { buildUsageReportFromAcpTokenCount } from './acpTokenCountUsageReport';
 import {
     fetchLatestUserPermissionIntentFromEncryptedTranscript,
     fetchRecentTranscriptTextItemsForAcpImportFromServer,
+    type CommittedTranscriptIdentitySnapshot,
 } from './transcriptQueries';
+import { extractSemanticTranscriptItemFromDecryptedPayload } from '@/session/services/transcript/extractSemanticTranscriptItem';
 import {
     discardPendingQueueV2Messages,
     enqueuePendingQueueV2MessageViaHttp,
@@ -240,6 +254,8 @@ import {
 } from '@happier-dev/connection-supervisor';
 import { createLoopbackReadinessProbe } from '@/api/connection/createLoopbackReadinessProbe';
 import { createSessionSocketTransport } from './connection/createSessionSocketTransport';
+import { ensureSessionConnectionSupervisionActive } from './connection/ensureSessionConnectionSupervisionActive';
+import { SESSION_CONNECTION_STATE_EVENT } from './connection/sessionConnectionStateEvent';
 import { connectionState } from '@/api/offline/serverConnectionErrors';
 import {
     createAuthenticationHttpStatusError,
@@ -490,7 +506,18 @@ export function classifySessionTransportErrorToProbeResult(
     };
 }
 
-const SESSION_CONNECTION_STATE_EVENT = 'session-connection-state';
+function logSessionConnectionState(state: ManagedConnectionState): void {
+    logger.infoFile('[API] Session socket connection state', {
+        phase: state.phase,
+        reason: state.reason,
+        attempt: state.attempt,
+        nextRetryAt: state.nextRetryAt,
+        lastErrorMessage: state.lastErrorMessage
+            ? redactBugReportSensitiveText(state.lastErrorMessage)
+            : null,
+    });
+}
+
 const SESSION_PRESENCE_RECONNECT_REASSERT_DELAY_MS = 2_000;
 // How long a `thinking=true` keepalive may persist against an already-terminal turn status
 // before the publisher self-heals it to idle. Comfortably longer than a new turn's
@@ -551,6 +578,7 @@ export class ApiSessionClient extends EventEmitter {
     private readonly token: string;
     readonly sessionId: string;
     private metadata: Metadata | null;
+    private runtimeWorkingDirectory: string | null = null;
     private metadataVersion: number;
     private sessionSocketMachineId: string | undefined;
     private agentState: AgentState | null;
@@ -753,21 +781,10 @@ export class ApiSessionClient extends EventEmitter {
         wait: async (request: unknown) => {
             const rawTimeoutSeconds = readUnknownRecordProperty(request, 'timeoutSeconds');
 
-            const rawPollIntervalMs = readUnknownRecordProperty(request, 'pollIntervalMs');
-            const requestPollIntervalMs =
-                typeof rawPollIntervalMs === 'number' && Number.isFinite(rawPollIntervalMs) && rawPollIntervalMs > 0
-                    ? Math.min(60_000, rawPollIntervalMs)
-                    : null;
-            const envPollIntervalRaw = (process.env.HAPPIER_SESSION_RUN_WAIT_POLL_INTERVAL_MS ?? '').trim();
-            const envPollIntervalParsed = envPollIntervalRaw ? Number.parseInt(envPollIntervalRaw, 10) : NaN;
-            const envPollIntervalMs =
-                Number.isFinite(envPollIntervalParsed) && envPollIntervalParsed > 0 ? Math.min(60_000, envPollIntervalParsed) : 1_000;
-
             return await waitForExecutionRun({
                 ...this.getExecutionRunServiceContext(),
                 runId: String(readUnknownRecordProperty(request, 'runId') ?? ''),
                 timeoutMs: normalizeExecutionRunWaitTimeoutMs(rawTimeoutSeconds),
-                pollIntervalMs: requestPollIntervalMs ?? envPollIntervalMs,
             });
         },
     } as const;
@@ -778,6 +795,13 @@ export class ApiSessionClient extends EventEmitter {
      */
     getAgentStateSnapshot(): AgentState | null {
         return this.agentState;
+    }
+
+    async readSessionTurnsProjection(): Promise<SessionTurnsProjectionV1 | null> {
+        return await fetchSessionTurnsProjection({
+            token: this.token,
+            sessionId: this.sessionId,
+        });
     }
 
     beginTurnAssistantTextSnapshot(params?: {
@@ -887,7 +911,7 @@ export class ApiSessionClient extends EventEmitter {
             }, timeoutMs);
             timer.unref?.();
 
-            void supervisor.start().catch((error) => {
+            void ensureSessionConnectionSupervisionActive(supervisor).catch((error) => {
                 settle(() => reject(error));
             });
             check();
@@ -915,11 +939,12 @@ export class ApiSessionClient extends EventEmitter {
             token: string,
             session: Session,
             runtimeActivity?: SessionRuntimeActivityClientConfig,
+            permissionNotifications?: SessionPermissionNotificationConfig,
         ) {
 	        super()
 	        this.token = token;
 	        this.sessionId = session.id;
-	        this.metadata = session.metadata;
+	        this.metadata = normalizeSessionMetadataForRead(session.metadata);
 	        this.metadataVersion = session.metadataVersion;
             this.sessionSocketMachineId = resolveSessionSocketMachineIdForBootstrap(session.metadata);
             this.agentState = session.agentState;
@@ -979,14 +1004,20 @@ export class ApiSessionClient extends EventEmitter {
             logger: (msg, data) => logger.debug(msg, data),
             onRegistrationError: (error) => {
                 const probe = classifySessionTransportErrorToProbeResult(error);
-                if (probe) {
-                    this.sessionConnectionSupervisor?.reportProbeResult?.(probe);
+                const supervisor = this.sessionConnectionSupervisor;
+                const probeReportScope = supervisor?.captureProbeReportScope?.();
+                if (probe && probeReportScope) {
+                    supervisor?.reportProbeResult?.(probe, probeReportScope);
                 }
             },
         });
         this.executionRunPermissionHandler = new CodexLikePermissionHandler({
             session: this,
             logPrefix: '[ExecutionRun]',
+            pushSender: permissionNotifications?.permissionRequestPushSender ?? null,
+            getAccountSettings: () => getActiveAccountSettingsSnapshot()?.settings ?? null,
+            getAccountSettingsSecretsReadKeys: () =>
+                getActiveAccountSettingsSnapshot()?.settingsSecretsReadKeys ?? [],
         });
         const parentProvider = resolveSessionCatalogAgentId(this.metadata);
 
@@ -1076,12 +1107,13 @@ export class ApiSessionClient extends EventEmitter {
 
         registerExecutionRunHandlers(this.rpcHandlerManager, {
             sessionId: this.sessionId,
-            cwd: this.metadata?.path ?? process.cwd(),
+            cwd: this.resolveWorkingDirectory(),
+            resolveCwd: () => this.resolveWorkingDirectory(),
             serverUrl: configuration.serverUrl,
             parentProvider,
             createBackend: ({ runId, backendId, backendTarget, permissionMode, modelId, sessionConfigOptionOverrides, accountSettings, start, connectedServicesEnv, connectedServicesCleanup }) =>
                 createExecutionRunBackend({
-                    cwd: this.metadata?.path ?? process.cwd(),
+                    cwd: this.resolveWorkingDirectory(),
                     ...(runId ? { runId } : {}),
                     backendId,
                     backendTarget,
@@ -1134,10 +1166,11 @@ export class ApiSessionClient extends EventEmitter {
         });
 
         registerEphemeralTaskHandlers(this.rpcHandlerManager, {
-          workingDirectory: this.metadata?.path ?? process.cwd(),
+          workingDirectory: this.resolveWorkingDirectory(),
+          resolveWorkingDirectory: () => this.resolveWorkingDirectory(),
           createBackend: ({ backendId, permissionMode, backendTarget }) =>
             createExecutionRunBackend({
-              cwd: this.metadata?.path ?? process.cwd(),
+              cwd: this.resolveWorkingDirectory(),
               backendId,
               permissionMode,
               ...(backendTarget ? { backendTarget } : {}),
@@ -1203,6 +1236,7 @@ export class ApiSessionClient extends EventEmitter {
                 return readinessConvergence.promise;
             }
             const converge = async () => {
+                const probeReportScope = this.sessionConnectionSupervisor?.captureProbeReportScope?.();
                 const serverContract = await serverContractController.resolve({
                     sessionConnectionEpoch: epoch,
                     socket,
@@ -1234,7 +1268,7 @@ export class ApiSessionClient extends EventEmitter {
                         status: 'auth_failed',
                         statusCode: 401,
                         errorMessage: 'Authentication failed while resolving session compatibility',
-                    });
+                    }, probeReportScope);
                     return false;
                 }
 
@@ -1312,6 +1346,7 @@ export class ApiSessionClient extends EventEmitter {
             }),
             onStateChange: (state) => {
                 this.currentConnectionState = state;
+                logSessionConnectionState(state);
                 this.emit(SESSION_CONNECTION_STATE_EVENT, state);
             },
             onConnected: async () => {
@@ -1536,6 +1571,7 @@ export class ApiSessionClient extends EventEmitter {
         const hadMaterializedLocalId = this.hasMaterializedLocalId(localId);
         if (didClear || hadMaterializedLocalId) {
             this.deleteMaterializedLocalId(localId);
+            this.publishPendingEligibilityWake();
         }
         return didClear || hadMaterializedLocalId;
     }
@@ -1555,11 +1591,20 @@ export class ApiSessionClient extends EventEmitter {
     ): Promise<boolean> {
         if (!isTerminalPendingDeliveryNotFound(operation, error)) return false;
 
-        logger.debug('[pendingQueue] retained terminally absent canonical pending delivery without exact committed proof', {
+        const diagnostic = {
             sessionId: this.sessionId,
             localId,
             operation,
-        });
+        };
+        if (operation === 'accepted') {
+            logger.infoFile('[pendingQueue] accepted provider delivery remains unresolved', {
+                ...diagnostic,
+                reason: 'settlement_not_found_without_exact_commit',
+                error: serializeAcceptedPendingSettlementErrorForLog(error),
+            });
+        } else {
+            logger.debug('[pendingQueue] retained terminally absent canonical pending delivery without exact committed proof', diagnostic);
+        }
         if (operation === 'accepted' && this.canonicalPendingDeliveryByLocalId.has(localId)) {
             this.acceptedProviderInputLocalIds.add(localId);
         }
@@ -1626,6 +1671,14 @@ export class ApiSessionClient extends EventEmitter {
                 if (result.didResolve !== true && !hasExactCommittedReplay) {
                     // A live no-op cannot prove that this exact accepted row committed. Keep its
                     // claim visible for reconciliation; unrelated wakes must not become retry authority.
+                    logger.infoFile('[pendingQueue] accepted provider delivery remains unresolved', {
+                        sessionId: this.sessionId,
+                        localId,
+                        reason: 'settlement_noop_without_exact_commit',
+                        pendingCount: result.pendingQueueState?.pendingCount ?? null,
+                        pendingBlockedCount: result.pendingQueueState?.pendingBlockedCount ?? null,
+                        pendingVersion: result.pendingQueueState?.pendingVersion ?? null,
+                    });
                     return;
                 }
                 // This mutation targets one exact localId. A successful server settlement is the
@@ -1637,10 +1690,11 @@ export class ApiSessionClient extends EventEmitter {
                 this.recordCommittedUserMessageSeq(localId, resolvedSeq);
                 return;
             } catch (error) {
+                const serializedError = serializeAcceptedPendingSettlementErrorForLog(error);
                 logger.debug('[pendingQueue] accepted provider delivery resolution failed', {
                     sessionId: this.sessionId,
                     localId,
-                    error: serializeAcceptedPendingSettlementErrorForLog(error),
+                    error: serializedError,
                 });
                 if (!this.isAcceptedCanonicalPendingDeliveryOperationCurrent(authority)) return;
                 if (await this.retireStaleCanonicalPendingDeliveryAfterTerminalMiss(localId, 'accepted', error)) return;
@@ -1654,7 +1708,16 @@ export class ApiSessionClient extends EventEmitter {
                         && 'retryable' in error
                         && (error as { retryable?: unknown }).retryable === true,
                     );
-                    if ((!retryDirective && !isResponseLoss) || attempt > 0) return;
+                    if ((!retryDirective && !isResponseLoss) || attempt > 0) {
+                        logger.infoFile('[pendingQueue] accepted provider delivery remains unresolved', {
+                            sessionId: this.sessionId,
+                            localId,
+                            reason: 'settlement_error',
+                            attempt: attempt + 1,
+                            error: serializedError,
+                        });
+                        return;
+                    }
                     const retryAfterMs = retryDirective
                         ? Math.min(60_000, Math.max(250, retryDirective.retryAfterMs))
                         : 1_000;
@@ -1669,10 +1732,14 @@ export class ApiSessionClient extends EventEmitter {
         }
     }
 
-    private trackAcceptedCanonicalPendingDeliveryResolution(resolution: Promise<void>): void {
+    private trackAcceptedCanonicalPendingDeliveryResolution(
+        localId: string,
+        resolution: Promise<void>,
+    ): void {
         const tracked = resolution.catch((error) => {
-            logger.debug('[pendingQueue] accepted provider delivery resolution crashed', {
+            logger.infoFile('[pendingQueue] accepted provider delivery resolution crashed', {
                 sessionId: this.sessionId,
+                localId,
                 error: serializeAxiosErrorForLog(error),
             });
         });
@@ -1701,6 +1768,7 @@ export class ApiSessionClient extends EventEmitter {
             for (const localId of this.canonicalPendingDeliveryByLocalId.keys()) {
                 if (this.providerInputTerminalOutcomeByLocalId.get(localId) !== 'accepted') continue;
                 this.trackAcceptedCanonicalPendingDeliveryResolution(
+                    localId,
                     this.resolveAcceptedCanonicalPendingDelivery(localId, authority),
                 );
             }
@@ -1866,12 +1934,10 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private async reconcileCanonicalPendingDeliveriesBeforeMaterialization(): Promise<boolean> {
-        const blockingLocalIds = [...this.canonicalPendingDeliveryByLocalId.keys()]
-            .filter((localId) => (
-                this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted'
-                || !this.serverBlockedCanonicalPendingDeliveryLocalIds.has(localId)
-            ));
-        if (blockingLocalIds.length === 0) return true;
+        // Blocked delivery can still own an ambiguous terminal attempt. Reconcile its exact
+        // server identity too, so manual handling retires that custody without inventing acceptance.
+        const claimedLocalIds = [...this.canonicalPendingDeliveryByLocalId.keys()];
+        if (claimedLocalIds.length === 0) return true;
 
         try {
             const statuses = await listPendingQueueV2DeliveryStatusesFromServer({
@@ -1879,8 +1945,12 @@ export class ApiSessionClient extends EventEmitter {
                 sessionId: this.sessionId,
             });
             const statusByLocalId = new Map(statuses.map((entry) => [entry.localId, entry.status]));
-            for (const localId of blockingLocalIds) {
+            for (const localId of claimedLocalIds) {
                 const status = statusByLocalId.get(localId);
+                // While exact provider acceptance is actively settling, it is stronger evidence
+                // than an absent/archived Pending projection. Once that operation finishes, the
+                // ordinary terminal reconciliation may retire a genuinely stale claim.
+                if (this.acceptedCanonicalPendingDeliveryResolutionLocalIdsInFlight.has(localId)) continue;
                 if (status !== undefined && status !== 'discarded') continue;
                 if (!this.canonicalPendingDeliveryByLocalId.has(localId)) continue;
                 logger.debug('[pendingQueue] exact terminal server truth retired local provider custody', {
@@ -1897,7 +1967,7 @@ export class ApiSessionClient extends EventEmitter {
         } catch (error) {
             logger.debug('[pendingQueue] exact local provider custody reconciliation failed closed', {
                 sessionId: this.sessionId,
-                localIds: blockingLocalIds,
+                localIds: claimedLocalIds,
                 error: serializeAxiosErrorForLog(error),
             });
         }
@@ -2246,7 +2316,7 @@ export class ApiSessionClient extends EventEmitter {
     private kickSessionSocketReconnectForQueuedMessage(localId: string): void {
         const supervisor = this.sessionConnectionSupervisor;
         if (!supervisor) return;
-        void supervisor.start().catch((error) => {
+        void ensureSessionConnectionSupervisionActive(supervisor).catch((error) => {
             logger.debug('[API] Failed to restart session socket for queued message', {
                 localId,
                 error: serializeAxiosErrorForLog(error),
@@ -2257,7 +2327,7 @@ export class ApiSessionClient extends EventEmitter {
     private kickSessionSocketReconnectForDurableMutation(reason: string): void {
         const supervisor = this.sessionConnectionSupervisor;
         if (!supervisor) return;
-        void supervisor.start().catch((error) => {
+        void ensureSessionConnectionSupervisionActive(supervisor).catch((error) => {
             logger.debug('[API] Failed to restart session socket for durable mutation', {
                 reason,
                 error: serializeAxiosErrorForLog(error),
@@ -3224,20 +3294,16 @@ export class ApiSessionClient extends EventEmitter {
             this.markAgentQueueEchoSuppressedLocalId(localId);
             this.markAgentQueueDeliveredLocalId(localId);
         }
+        const deliveryInfo: SessionUserMessageDeliveryInfo = {
+            seq: typeof message?.seq === 'number' && Number.isFinite(message.seq) ? message.seq : null,
+            ...(opts.providerAcceptancePending ? { providerAcceptancePending: true } : {}),
+            ...(message?.providerAction ? { pendingProviderAction: message.providerAction } : {}),
+            ...(message?.requestedAction ? { pendingRequestedAction: message.requestedAction } : {}),
+        };
         if (this.pendingMessageCallback) {
-            await this.pendingMessageCallback(userMessage, {
-                seq: typeof message?.seq === 'number' && Number.isFinite(message.seq) ? message.seq : null,
-                ...(opts.providerAcceptancePending ? { providerAcceptancePending: true } : {}),
-                ...(message?.providerAction ? { pendingProviderAction: message.providerAction } : {}),
-            });
+            await this.pendingMessageCallback(userMessage, deliveryInfo);
         } else {
-            if (localId) {
-                this.bufferedPendingMessageDeliveryInfoByLocalId.set(localId, {
-                    seq: typeof message?.seq === 'number' && Number.isFinite(message.seq) ? message.seq : null,
-                    ...(opts.providerAcceptancePending ? { providerAcceptancePending: true } : {}),
-                    ...(message?.providerAction ? { pendingProviderAction: message.providerAction } : {}),
-                });
-            }
+            if (localId) this.bufferedPendingMessageDeliveryInfoByLocalId.set(localId, deliveryInfo);
             this.pendingMessages.push(userMessage);
         }
         return true;
@@ -4826,6 +4892,54 @@ export class ApiSessionClient extends EventEmitter {
         });
     }
 
+    async fetchCommittedTranscriptIdentitySnapshot(opts?: { sidechainId: string }): Promise<CommittedTranscriptIdentitySnapshot> {
+        const request = async (): Promise<CommittedTranscriptIdentitySnapshot> => {
+            const rows: Array<CommittedTranscriptIdentitySnapshot['rows'][number]> = [];
+            let complete = true;
+            let beforeSeq: number | undefined;
+            for (;;) {
+                const page = await fetchEncryptedTranscriptMessagesPage({
+                    token: this.token, sessionId: this.sessionId, limit: 500,
+                    ...(beforeSeq !== undefined ? { beforeSeq } : {}),
+                    scope: opts ? 'all' : 'main', roles: ['user', 'agent'],
+                });
+                for (const row of page.messages) {
+                    const stored = SessionMessageContentSchema.safeParse(row.content);
+                    if (!stored.success) { complete = false; continue; }
+                    let decoded: unknown;
+                    try { decoded = this.decodeStoredSessionMessageContent(stored.data); }
+                    catch { complete = false; continue; }
+                    if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) { complete = false; continue; }
+                    const item = extractSemanticTranscriptItemFromDecryptedPayload({
+                        decrypted: decoded, row, index: rows.length,
+                        options: { mode: 'transcript', transcriptRoles: ['user', 'assistant'] },
+                    }).item;
+                    if (!item || (item.role !== 'user' && item.role !== 'assistant')) continue;
+                    const payload = decoded as Record<string, unknown>;
+                    const meta = payload.meta && typeof payload.meta === 'object' && !Array.isArray(payload.meta)
+                        ? payload.meta as Record<string, unknown> : null;
+                    // Released imported user rows can carry sidechain identity only in metadata.
+                    // Read both forms rather than assuming the relay materialized the column.
+                    if (opts ? (row.sidechainId ?? meta?.sidechainId) !== opts.sidechainId
+                        : row.sidechainId || meta?.sidechainId) continue;
+                    rows.push({ localId: readNonBlankOpaqueIdentifier(row.localId), role: item.role === 'user' ? 'user' : 'agent',
+                        ...(item.provider ? { provider: item.provider } : {}), meta });
+                }
+                if (!page.hasMore) break;
+                if (page.messages.length === 0 || page.nextBeforeSeq === null
+                    || (beforeSeq !== undefined && page.nextBeforeSeq >= beforeSeq)) {
+                    complete = false;
+                    break;
+                }
+                beforeSeq = page.nextBeforeSeq;
+            }
+            return { rows, complete };
+        };
+        return this.sessionConnectionSupervisor
+            ? runSupervisedRequest({ supervisor: this.sessionConnectionSupervisor, requireAuth: true, requireOnline: false, request })
+            : request();
+    }
+
     async fetchCommittedClaudeJsonlMessageBaseline(opts?: { take?: number }): Promise<CommittedClaudeJsonlMessageBaseline> {
         const take = typeof opts?.take === 'number' && Number.isFinite(opts.take) && opts.take > 0
             ? Math.trunc(opts.take)
@@ -4994,6 +5108,7 @@ export class ApiSessionClient extends EventEmitter {
         const effectiveThinking = this.resolveKeepAliveThinkingWithTerminalGuard(thinking, Date.now());
         this.latestSessionPresence = { thinking: effectiveThinking, mode };
         const payload = this.createSessionAlivePayload(this.latestSessionPresence);
+        this.emit('local-presence', { thinking: effectiveThinking, mode });
 
         if (effectiveThinking) {
             void this.sessionTurnLifecycle.touchActiveTurn({ observedAt: payload.time }).catch((error) => {
@@ -5378,6 +5493,7 @@ export class ApiSessionClient extends EventEmitter {
             const authority = this.captureAcceptedCanonicalPendingDeliveryOperationAuthority(producerGeneration);
             if (!authority) return;
             this.trackAcceptedCanonicalPendingDeliveryResolution(
+                localId,
                 this.resolveAcceptedCanonicalPendingDelivery(localId, authority),
             );
             return;
@@ -5670,6 +5786,16 @@ export class ApiSessionClient extends EventEmitter {
         return this.metadata;
     }
 
+    setRuntimeWorkingDirectory(directory: string): void {
+        const normalized = directory.trim();
+        if (!normalized) return;
+        this.runtimeWorkingDirectory = normalized;
+    }
+
+    private resolveWorkingDirectory(): string {
+        return this.runtimeWorkingDirectory ?? this.metadata?.path ?? process.cwd();
+    }
+
     /**
      * Read-only snapshot of the last transcript message seq observed by this client.
      *
@@ -5774,6 +5900,7 @@ export class ApiSessionClient extends EventEmitter {
             // ignore
         }
         await this.sessionConnectionSupervisor?.stop();
+        this.emit('local-closed');
     }
 
     beginRuntimeTermination(): void {
@@ -5870,13 +5997,14 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private installSessionSocketEventHandlers(socket: Socket<ServerToClientEvents, ClientToServerEvents>): void {
+        const probeReportScope = this.sessionConnectionSupervisor?.captureProbeReportScope?.();
         socket.on('server:restarting', (payload: unknown) => {
             this.sessionConnectionSupervisor?.reportProbeResult?.({
                 status: 'retry_later',
                 retryAfterMs: readPlannedServerRestartRetryAfterMs(payload),
                 reason: 'server_restarting',
                 errorMessage: 'Server restart in progress',
-            });
+            }, probeReportScope);
         });
 
         socket.on(SOCKET_RPC_EVENTS.REQUEST, async (data: { method: string, params: unknown }, callback: (response: unknown) => void) => {
@@ -5998,8 +6126,8 @@ export class ApiSessionClient extends EventEmitter {
                 const nextMetadata = addDiscardedCommittedMessageLocalIds(current, uniqueNew);
                 const metadataPayload =
                     this.sessionEncryptionMode === 'plain'
-                        ? JSON.stringify(nextMetadata)
-                        : encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, nextMetadata));
+                        ? JSON.stringify(projectSessionMetadataForWire(nextMetadata))
+                        : encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, projectSessionMetadataForWire(nextMetadata)));
                 const answer = await emitSocketWithAck<any>({
                     socket: this.socket as any,
                     event: 'update-metadata',
@@ -6011,10 +6139,10 @@ export class ApiSessionClient extends EventEmitter {
                 });
 
                 if (answer.result === 'success') {
-                    this.metadata =
+                    this.metadata = normalizeSessionMetadataForRead<Metadata>(
                         this.sessionEncryptionMode === 'plain'
                             ? JSON.parse(String(answer.metadata ?? 'null'))
-                            : decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(answer.metadata));
+                            : decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(answer.metadata)));
                     this.metadataVersion = answer.version;
                     addedCount = uniqueNew.length;
                     return;
@@ -6023,10 +6151,10 @@ export class ApiSessionClient extends EventEmitter {
                 if (answer.result === 'version-mismatch') {
                     if (answer.version > this.metadataVersion) {
                         this.metadataVersion = answer.version;
-                        this.metadata =
+                        this.metadata = normalizeSessionMetadataForRead<Metadata>(
                             this.sessionEncryptionMode === 'plain'
                                 ? JSON.parse(String(answer.metadata ?? 'null'))
-                                : decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(answer.metadata));
+                                : decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(answer.metadata)));
                     }
                     throw new Error('Metadata version mismatch');
                 }
@@ -6218,9 +6346,8 @@ export class ApiSessionClient extends EventEmitter {
             didMaterialize: materializeResult.didMaterialize,
             authoritativeState: materializeResult.pendingQueueState ?? null,
         });
-        this.pendingQueueState = pendingStateUpdate.state;
-        if (pendingStateUpdate.changed) {
-            this.pendingWakeSeq += 1;
+        if (pendingStateUpdate.state.known) {
+            this.applyPendingQueueState(pendingStateUpdate.state);
         }
         if (this.closed || this.runtimeTerminationStarted) {
             return { didMaterialize: false, result: { type: 'retryable_transport' } };

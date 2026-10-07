@@ -297,6 +297,36 @@ describe('pageCodexTranscript', () => {
     expect(second.hasMore).toBe(false);
   });
 
+  it('classifies an invalid backward cursor as a source discontinuity', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-page-invalid-cursor-'));
+    const codexHome = join(root, 'codex-home');
+    const sessionsDir = join(codexHome, 'sessions');
+    await mkdir(sessionsDir, { recursive: true });
+    const sessionId = 'page-invalid-cursor-session';
+    await writeFile(
+      join(sessionsDir, `rollout-2026-01-02T00-00-00-${sessionId}.jsonl`),
+      responseItemLine({
+        timestamp: '2026-01-02T00:00:01.000Z',
+        payload: { type: 'message', role: 'assistant', content: [{ type: 'text', text: 'visible' }] },
+      }),
+      'utf8',
+    );
+
+    const page = await pageCodexTranscript({
+      source: { kind: 'codexHome', home: 'user' },
+      env: { CODEX_HOME: codexHome } as NodeJS.ProcessEnv,
+      activeServerDir: join(root, 'servers', 'cloud'),
+      remoteSessionId: sessionId,
+      direction: 'older',
+      cursor: 'invalid-cursor',
+      maxBytes: 1024,
+      maxItems: 10,
+    });
+
+    expect(page.truncated).toBe(true);
+    expect(page.truncationReason).toBe('source_discontinuity');
+  });
+
   it('maps Codex collaboration rollout events into generic SubAgent tool rows for direct transcripts', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-subagent-page-'));
     const codexHome = join(root, 'codex-home');

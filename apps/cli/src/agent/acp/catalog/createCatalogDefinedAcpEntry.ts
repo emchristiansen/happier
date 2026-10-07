@@ -1,10 +1,15 @@
-import { AGENTS_CORE, hasBuiltInAcpConfig, type AgentId } from '@happier-dev/agents';
+import {
+  AGENTS_CORE,
+  hasBuiltInAcpConfig,
+  type AgentId,
+} from '@happier-dev/agents';
 
 import type { AgentCatalogEntry } from '@/backends/types';
 
 import { createCatalogDefinedCliAuthSpec } from './auth/createCatalogDefinedCliAuthSpec';
 import { createCatalogDefinedAcpBackend } from './createCatalogDefinedAcpBackend';
 import { createCatalogDefinedCliDetect } from './createCatalogDefinedCliDetect';
+import { createAcpSessionListCatalogHook } from './createAcpSessionListCatalogHook';
 
 export function createCatalogDefinedAcpEntry(agentId: AgentId): AgentCatalogEntry {
   if (!hasBuiltInAcpConfig(agentId)) {
@@ -28,5 +33,7 @@ export function createCatalogDefinedAcpEntry(agentId: AgentId): AgentCatalogEntr
     getAcpBackendFactory: async () => {
       return (opts) => ({ backend: createCatalogDefinedAcpBackend(agentId, opts as never) });
     },
+    // The live handshake remains authoritative before `session/list` is dispatched.
+    ...createAcpSessionListCatalogHook(agentId),
   };
 }

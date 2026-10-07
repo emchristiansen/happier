@@ -205,7 +205,6 @@ async function renderRow(params: Readonly<{
     };
     const rowModel = buildSessionListRowModel({
         item,
-        dataIndex: 0,
         isFirst: true,
         isLast: true,
         isSingle: true,

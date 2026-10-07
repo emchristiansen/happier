@@ -9,8 +9,8 @@
  *   - cookieless_mode: 'always'. No cookie, no stored visitor id, no profile
  *     that survives a page load. This is what lets the policy say the sites set
  *     nothing on your device except your own refusal.
- *   - Do Not Track and Global Privacy Control are checked BEFORE init, so a
- *     browser that refuses is never even loaded into.
+ *   - Global Privacy Control is checked BEFORE init, so a browser that refuses
+ *     is never even loaded into.
  *   - api_host is a path on this origin. The `/ingest` route handler forwards to
  *     PostHog EU, so the page makes no third-party request.
  *   - No session recording, no surveys, no autocapture, no feature-flag round
@@ -44,6 +44,31 @@ let client: PostHog | null = null;
 let started = false;
 let loading = false;
 
+export type AnalyticsStatus =
+    | 'loading'
+    | 'active'
+    | 'opted-out'
+    | 'browser-refused'
+    | 'unavailable';
+
+let status: AnalyticsStatus = 'loading';
+const statusListeners = new Set<() => void>();
+
+function setAnalyticsStatus(next: AnalyticsStatus): void {
+    if (status === next) return;
+    status = next;
+    for (const listener of statusListeners) listener();
+}
+
+export function getAnalyticsStatus(): AnalyticsStatus {
+    return status;
+}
+
+export function subscribeAnalyticsStatus(listener: () => void): () => void {
+    statusListeners.add(listener);
+    return () => statusListeners.delete(listener);
+}
+
 /**
  * `navigator.globalPrivacyControl` ONLY, deliberately — `doNotTrack` used to be
  * checked here too and is not any more.
@@ -70,12 +95,14 @@ export function readOptOut(): boolean {
     }
 }
 
-function shouldCapture(): boolean {
-    return Boolean(POSTHOG_KEY) && !browserRefuses() && !readOptOut();
+export function isAnalyticsActive(): boolean {
+    return status === 'active';
 }
 
-export function isAnalyticsActive(): boolean {
-    return started;
+function captureBlockStatus(): Extract<AnalyticsStatus, 'opted-out' | 'browser-refused'> | null {
+    if (browserRefuses()) return 'browser-refused';
+    if (readOptOut()) return 'opted-out';
+    return null;
 }
 
 /**
@@ -91,6 +118,7 @@ export function optOut(): void {
         /* a browser that refuses storage still gets the in-memory switch below */
     }
     client?.set_config({ before_send: () => null });
+    setAnalyticsStatus('opted-out');
 }
 
 export function optIn(): void {
@@ -99,20 +127,43 @@ export function optIn(): void {
     } catch {
         /* ignore */
     }
-    client?.set_config({ before_send: undefined });
+    if (browserRefuses()) {
+        setAnalyticsStatus('browser-refused');
+        return;
+    }
+    if (client && started) {
+        client.set_config({ before_send: undefined });
+        setAnalyticsStatus('active');
+        return;
+    }
+    setAnalyticsStatus('loading');
     void start();
 }
 
 /** Boots PostHog once, lazily. Safe to call on every navigation. */
 export async function start(): Promise<void> {
     if (started || loading || typeof window === 'undefined') return;
-    if (!shouldCapture()) return;
+    const blocked = captureBlockStatus();
+    if (blocked) {
+        setAnalyticsStatus(blocked);
+        return;
+    }
+    if (!POSTHOG_KEY) {
+        setAnalyticsStatus('unavailable');
+        console.error('[analytics] NEXT_PUBLIC_POSTHOG_KEY is not set — docs analytics are unavailable.');
+        return;
+    }
+    setAnalyticsStatus('loading');
     loading = true;
     try {
         const { default: posthog } = await import('posthog-js');
         loading = false;
         // The visitor may have opted out while the chunk was loading.
-        if (!shouldCapture()) return;
+        const delayedBlock = captureBlockStatus();
+        if (delayedBlock) {
+            setAnalyticsStatus(delayedBlock);
+            return;
+        }
         client = posthog;
         posthog.init(POSTHOG_KEY, {
             api_host: INGEST_PATH,
@@ -145,16 +196,21 @@ export async function start(): Promise<void> {
 
             loaded: () => {
                 started = true;
+                setAnalyticsStatus('active');
             },
         });
         posthog.register({ site: SITE });
-    } catch {
+        started = true;
+        setAnalyticsStatus('active');
+    } catch (error: unknown) {
         loading = false;
+        setAnalyticsStatus('unavailable');
+        console.error('[analytics] failed to load PostHog', error);
     }
 }
 
 /** One `$pageview` per route. Called by the client component on pathname change. */
 export function capturePageview(): void {
-    if (!client || !started) return;
+    if (!client || status !== 'active') return;
     client.capture('$pageview', { site: SITE });
 }

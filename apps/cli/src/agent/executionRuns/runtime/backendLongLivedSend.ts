@@ -5,48 +5,14 @@ import type { ACPProvider } from '@/api/session/sessionMessageTypes';
 import type { AcpSendFn } from '@/agent/acp/bridge/acpSessionForwarding';
 import type { StreamedTranscriptWriterSession } from '@/api/session/streamedTranscriptWriter';
 import type { ExecutionRunState } from '@/agent/executionRuns/runtime/executionRunTypes';
-import type { ExecutionRunBackendController, ExecutionRunController } from '@/agent/executionRuns/controllers/types';
+import { resetExecutionRunBackendOutput, type ExecutionRunBackendController, type ExecutionRunController } from '@/agent/executionRuns/controllers/types';
 import type { FinishExecutionRun } from '@/agent/executionRuns/runtime/executionRunFinishRun';
 import { resumeBackendControllerForResumableRun } from '@/agent/executionRuns/runtime/resumeBackendController';
 import { isAbortLikeError, normalizeExecutionRunSendDelivery, resolveInFlightDeliveryAction } from '@/agent/executionRuns/runtime/turnDelivery';
-
-function readAbortRetryConfig(): { maxAttempts: number; delayMs: number } {
-  const parseIntOr = (raw: unknown, fallback: number): number => {
-    const n = typeof raw === 'string' ? Number.parseInt(raw, 10) : typeof raw === 'number' ? raw : NaN;
-    return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : fallback;
-  };
-  const parseDelayOr = (raw: unknown, fallback: number): number => {
-    const n = typeof raw === 'string' ? Number.parseInt(raw, 10) : typeof raw === 'number' ? raw : NaN;
-    return Number.isFinite(n) && n >= 0 ? Math.trunc(n) : fallback;
-  };
-
-  return {
-    maxAttempts: parseIntOr(process.env.HAPPIER_EXECUTION_RUN_ABORT_RETRY_ATTEMPTS, 2),
-    delayMs: parseDelayOr(process.env.HAPPIER_EXECUTION_RUN_ABORT_RETRY_DELAY_MS, 50),
-  };
-}
-
-async function sendPromptWithAbortRetry(args: Readonly<{
-  send: () => Promise<void>;
-  maxAttempts: number;
-  delayMs: number;
-}>): Promise<void> {
-  const attempts = Math.max(1, Math.trunc(args.maxAttempts));
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    try {
-      await args.send();
-      return;
-    } catch (e) {
-      if (!isAbortLikeError(e) || attempt >= attempts) throw e;
-      const delay = Math.max(0, Math.trunc(args.delayMs));
-      if (delay > 0) {
-        await new Promise((resolve) => setTimeout(resolve, delay));
-      } else {
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      }
-    }
-  }
-}
+import {
+  EXECUTION_RUN_SEND_OUTCOME_UNKNOWN_CODE,
+  EXECUTION_RUN_SEND_OUTCOME_UNKNOWN_MESSAGE,
+} from '@/agent/executionRuns/runtime/executionRunErrors';
 
 type BackendLongLivedRunSendArgs = Readonly<{
   runId: string;
@@ -136,6 +102,15 @@ export async function prepareBackendLongLivedRunResume(
 export async function sendBackendLongLivedRun(
   args: BackendLongLivedRunSendArgs,
 ): Promise<BackendLongLivedRunSendResult> {
+  const admittedController = args.controllers.get(args.runId) ?? null;
+  if (
+    args.params.resume !== true
+    && admittedController?.kind === 'backend'
+    && !admittedController.childSessionId
+    && admittedController.provisioningPromise
+  ) {
+    await admittedController.provisioningPromise;
+  }
   const prepared = args.params.resume === true
     ? await prepareBackendLongLivedRunResume(args)
     : readPreparedBackendController(args);
@@ -166,20 +141,35 @@ export async function sendPreparedBackendLongLivedRun(
   if (ctrl2.cancelled) return { ok: false, errorCode: 'execution_run_not_allowed', error: 'Not running' };
   const isCurrentController = (): boolean => args.controllers.get(args.runId) === ctrl2;
 
-  const abortRetry = readAbortRetryConfig();
-  let shouldRetryAbortSend = false;
-
   if (ctrl2.turnInFlight) {
+    // A provider-side failure after invocation cannot prove whether the input was accepted.
+    // Keep that exact turn's custody exclusive until completion or explicit stop settles it.
+    if (ctrl2.turnCancelReason === 'outcome_unknown') {
+      return { ok: false, errorCode: 'execution_run_busy', error: 'Run is busy' };
+    }
     const hasSteer = typeof ctrl2.backend.sendSteerPrompt === 'function';
     const action = resolveInFlightDeliveryAction({ delivery, hasSteer });
     if (action === 'busy') {
       return { ok: false, errorCode: 'execution_run_busy', error: 'Run is busy' };
     }
     if (action === 'steer') {
+      const activeEpoch = ctrl2.turnEpoch;
       try {
         await ctrl2.backend.sendSteerPrompt!(childSessionId, args.params.message);
-      } catch (e) {
-        return { ok: false, errorCode: 'execution_run_failed', error: e instanceof Error ? e.message : 'Steer failed' };
+      } catch {
+        if (
+          isCurrentController()
+          && ctrl2.turnInFlight
+          && ctrl2.turnEpoch === activeEpoch
+        ) {
+          ctrl2.turnCancelReason = 'outcome_unknown';
+          ctrl2.turnCancelEpoch = activeEpoch;
+        }
+        return {
+          ok: false,
+          errorCode: EXECUTION_RUN_SEND_OUTCOME_UNKNOWN_CODE,
+          error: EXECUTION_RUN_SEND_OUTCOME_UNKNOWN_MESSAGE,
+        };
       }
       await args.writeActivityMarker(args.runId, args.getNowMs(), { force: true });
       return { ok: true };
@@ -193,7 +183,6 @@ export async function sendPreparedBackendLongLivedRun(
     } catch {
       // best effort
     }
-    shouldRetryAbortSend = true;
   }
 
   if (typeof args.maxTurns === 'number' && ctrl2.turnCount >= args.maxTurns) {
@@ -203,9 +192,7 @@ export async function sendPreparedBackendLongLivedRun(
   const thisEpoch = ctrl2.turnEpoch + 1;
   ctrl2.turnEpoch = thisEpoch;
   ctrl2.turnInFlight = true;
-  ctrl2.buffer = '';
-  ctrl2.sidechainStreamBuffer = '';
-  ctrl2.sidechainStreamKey = '';
+  resetExecutionRunBackendOutput(ctrl2);
 
   ctrl2.turnCount += 1;
   // Persist the cumulative turn count so resuming cannot reset enforcement (for example maxTurns).
@@ -213,11 +200,9 @@ export async function sendPreparedBackendLongLivedRun(
   if (runAfterTurn) {
     args.runs.set(args.runId, { ...runAfterTurn, turnCount: ctrl2.turnCount });
   }
-  const sendPromise = Promise.resolve().then(() => sendPromptWithAbortRetry({
-    send: () => ctrl2.backend.sendPrompt(childSessionId, args.params.message),
-    maxAttempts: shouldRetryAbortSend ? abortRetry.maxAttempts : 1,
-    delayMs: abortRetry.delayMs,
-  }));
+  // Effectful provider admission is attempted once. Any untyped throw after invocation is
+  // outcome-unknown, so replaying the prompt here could execute the same input twice.
+  const sendPromise = Promise.resolve().then(() => ctrl2.backend.sendPrompt(childSessionId, args.params.message));
 
   const runCompletionLoop = async (): Promise<void> => {
     try {
@@ -225,7 +210,16 @@ export async function sendPreparedBackendLongLivedRun(
         await ctrl2.backend.waitForResponseComplete();
       }
 
-      if (ctrl2.turnEpoch === thisEpoch) ctrl2.turnInFlight = false;
+      if (ctrl2.turnEpoch === thisEpoch) {
+        ctrl2.turnInFlight = false;
+        if (
+          ctrl2.turnCancelReason === 'outcome_unknown'
+          && ctrl2.turnCancelEpoch === thisEpoch
+        ) {
+          ctrl2.turnCancelReason = null;
+          ctrl2.turnCancelEpoch = null;
+        }
+      }
       await ctrl2.streamWriter?.flushAll({ reason: 'turn-end' });
 
       // A stopped occurrence may be resumed again while this provider response is still pending.
@@ -253,6 +247,15 @@ export async function sendPreparedBackendLongLivedRun(
       }
 
       if (isAbortLikeError(e)) {
+        if (
+          ctrl2.turnCancelReason === 'outcome_unknown'
+          && ctrl2.turnCancelEpoch === thisEpoch
+        ) {
+          // Both provider admission and completion observation are ambiguous. Preserve custody
+          // for the existing terminal/liveness/stop owner instead of accepting another input.
+          await ctrl2.streamWriter?.flushAll({ reason: 'abort', interruptedReason: 'abort' });
+          return;
+        }
         // Long-lived runs are interactive: if a turn is cancelled/aborted, keep the run alive so
         // callers can retry or continue steering without losing the entire execution run.
         await ctrl2.streamWriter?.flushAll({ reason: 'abort', interruptedReason: 'abort' });
@@ -319,50 +322,28 @@ export async function sendPreparedBackendLongLivedRun(
     if (isCurrentController()) {
       await args.writeActivityMarker(args.runId, args.getNowMs(), { force: true }).catch(() => {});
     }
-  } catch (e: any) {
-    if (isAbortLikeError(e)) {
-      if (isCurrentController()) {
-        await args.writeActivityMarker(args.runId, args.getNowMs(), { force: true }).catch(() => {});
-      }
-      if (ctrl2.turnEpoch === thisEpoch) ctrl2.turnInFlight = false;
-      return { ok: false, errorCode: 'execution_run_failed', error: e instanceof Error ? e.message : 'Turn cancelled' };
+  } catch {
+    const stillOwnsTurn = (
+      isCurrentController()
+      && ctrl2.turnEpoch === thisEpoch
+    );
+    if (stillOwnsTurn) {
+      ctrl2.turnCancelReason = 'outcome_unknown';
+      ctrl2.turnCancelEpoch = thisEpoch;
     }
-
-    const message = e instanceof Error ? e.message : 'Execution failed';
     if (isCurrentController()) {
       await args.writeActivityMarker(args.runId, args.getNowMs(), { force: true }).catch(() => {});
-      const finishedAtMs = args.getNowMs();
-      await args.finishRun(
-        args.runId,
-        { status: 'failed', summary: message, finishedAtMs, error: { code: 'execution_run_failed', message } },
-        {
-          output: {
-            status: 'failed',
-            summary: message,
-            runId: run.runId,
-            callId: run.callId,
-            sidechainId: run.sidechainId,
-            finishedAtMs,
-            startedAtMs: run.startedAtMs,
-            error: { code: 'execution_run_failed', message },
-          },
-          isError: true,
-        },
-      );
     }
-    try {
-      await ctrl2.backend.dispose();
-    } catch {
-      // ignore
+    // Only the provider completion observer can safely release ambiguous prompt custody. A
+    // backend without one remains busy until its existing terminal/liveness/stop path settles.
+    if (stillOwnsTurn && ctrl2.backend.waitForResponseComplete) {
+      void runCompletionLoop();
     }
-    try {
-      await ctrl2.terminalMarkerWritePromise;
-    } catch {
-      // ignore
-    }
-    ctrl2.resolveTerminal();
-    if (isCurrentController()) args.controllers.delete(args.runId);
-    return { ok: false, errorCode: 'execution_run_failed', error: message };
+    return {
+      ok: false,
+      errorCode: EXECUTION_RUN_SEND_OUTCOME_UNKNOWN_CODE,
+      error: EXECUTION_RUN_SEND_OUTCOME_UNKNOWN_MESSAGE,
+    };
   }
 
   return { ok: true };

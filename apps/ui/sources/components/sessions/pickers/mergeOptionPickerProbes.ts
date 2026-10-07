@@ -31,6 +31,7 @@ export function mergeOptionPickerProbes(
 
     const merged: OptionPickerProbeState = {
         phase,
+        ...(candidates.some((candidate) => candidate.error === true) ? { error: true } : {}),
         ...(refreshFns.length > 0
             ? {
                 onRefresh: () => {
@@ -44,7 +45,7 @@ export function mergeOptionPickerProbes(
     };
 
     // If there's nothing to render, return undefined so consumers don't reserve space.
-    if (merged.phase === 'idle' && typeof merged.onRefresh !== 'function') {
+    if (merged.phase === 'idle' && !merged.error && typeof merged.onRefresh !== 'function') {
         return undefined;
     }
 

@@ -48,3 +48,18 @@ export function resolveCurrentBinaryTarget({
 export function resolveExecutableName({ baseName, target }: { baseName: string; target: BinaryTarget }): string {
   return `${baseName}${target.exeExt}`;
 }
+
+export function resolveCliToolsPlatformDir(target: BinaryTarget): string {
+  const targetKey = `${target.arch}-${target.os}`;
+  switch (targetKey) {
+    case 'arm64-darwin':
+    case 'x64-darwin':
+    case 'arm64-linux':
+    case 'x64-linux':
+      return targetKey;
+    case 'x64-windows':
+      return 'x64-win32';
+    default:
+      throw new Error(`[component-artifacts] unsupported CLI tools binary target: ${targetKey}`);
+  }
+}

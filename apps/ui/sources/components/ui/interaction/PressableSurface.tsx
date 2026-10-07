@@ -49,6 +49,8 @@ export type PressableSurfaceProps = Readonly<{
     styleOverride?: StyleProp<ViewStyle>;
     /** Portaled hover/keyboard-focus tooltip on web; a no-op elsewhere. */
     webTooltip?: string;
+    tooltipContent?: React.ReactNode;
+    tooltipPlacement?: 'top' | 'bottom' | 'left' | 'right';
     testID?: string;
 }>;
 
@@ -106,7 +108,7 @@ export const PressableSurface = React.memo((props: PressableSurfaceProps) => {
         >
             {props.children}
             {Platform.OS === 'web' && props.webTooltip && (hovered || ringVisible) ? (
-                <DeferredAnchoredTooltip activationKey={`${hovered}:${focused}`} anchorRef={anchorRef} label={props.webTooltip} testID={props.testID ? `${props.testID}-tooltip` : undefined} />
+                <DeferredAnchoredTooltip activationKey={`${hovered}:${focused}`} anchorRef={anchorRef} label={props.webTooltip} content={props.tooltipContent} placement={props.tooltipPlacement} testID={props.testID ? `${props.testID}-tooltip` : undefined} />
             ) : null}
             {ringMounted ? (
                 <FocusRing

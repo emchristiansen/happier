@@ -13,6 +13,7 @@ import {
 
 import { createRpcHandlerManager } from '../rpc/RpcHandlerManager';
 import { registerMachineRpcHandlers } from './rpcHandlers';
+import { resetServerFeaturesClientForTests } from '@/features/serverFeaturesClient';
 
 const createdRoots = new Set<string>();
 
@@ -33,6 +34,7 @@ function pngHeader(width: number, height: number): Buffer {
 }
 
 afterEach(() => {
+  resetServerFeaturesClientForTests();
   for (const root of createdRoots) {
     rmSync(root, { recursive: true, force: true });
   }

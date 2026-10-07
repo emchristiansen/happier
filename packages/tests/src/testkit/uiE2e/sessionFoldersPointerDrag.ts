@@ -32,6 +32,12 @@ async function scrollConnectedTestIdIntoView(
   throw new Error(`missing connected ${testId}`);
 }
 
+async function revealSessionReorderHandle(page: Page, sourceTestId: string): Promise<void> {
+  const sourceContainer = page.getByTestId(sourceTestId);
+  await sourceContainer.getByTestId('session-item-right-area').hover();
+  await sourceContainer.getByTestId('session-item-reorder-handle').waitFor({ state: 'visible' });
+}
+
 async function dispatchSessionTreePointerDrag(page: Page, params: Readonly<{
   sourceTestId: string;
   sourceChildTestId?: string;
@@ -39,11 +45,14 @@ async function dispatchSessionTreePointerDrag(page: Page, params: Readonly<{
   targetEdge: 'top' | 'middle' | 'bottom';
   scrollDuringDrag?: 'target-into-view' | 'autoscroll-bottom';
 }>): Promise<DragDispatchResult> {
-  await scrollConnectedTestIdIntoView(page, params.sourceTestId);
-  await page.getByTestId(params.sourceTestId).hover().catch(() => undefined);
-
   if (!params.scrollDuringDrag) {
     await scrollConnectedTestIdIntoView(page, params.targetTestId);
+  }
+  await scrollConnectedTestIdIntoView(page, params.sourceTestId);
+  if (params.sourceChildTestId === 'session-item-reorder-handle') {
+    await revealSessionReorderHandle(page, params.sourceTestId);
+  } else {
+    await page.getByTestId(params.sourceTestId).hover();
   }
 
   const scrollMetricsBefore = await page.evaluate((sourceTestId) => {
@@ -307,11 +316,11 @@ export async function dragSessionWithGeometryProbe(page: Page, params: Readonly<
 }>): Promise<DragGeometryProbe> {
   const sourceTestId = `session-list-item-${params.sessionId}`;
   await scrollConnectedTestIdIntoView(page, sourceTestId);
-  await page.getByTestId(sourceTestId).hover();
+  await revealSessionReorderHandle(page, sourceTestId);
   if (params.preScroll === 'target-into-view') {
     await scrollConnectedTestIdIntoView(page, params.targetTestId);
     await scrollConnectedTestIdIntoView(page, sourceTestId);
-    await page.getByTestId(sourceTestId).hover();
+    await revealSessionReorderHandle(page, sourceTestId);
   }
 
   const scrollTopBefore = await page.evaluate((sourceTestId) => {
@@ -661,7 +670,7 @@ export async function beginSteppedSessionDrag(page: Page, params: Readonly<{
 }>): Promise<SteppedSessionDrag> {
   const sourceTestId = `session-list-item-${params.sessionId}`;
   await scrollConnectedTestIdIntoView(page, sourceTestId);
-  await page.getByTestId(sourceTestId).hover();
+  await revealSessionReorderHandle(page, sourceTestId);
 
   const sourceHandle = page
     .getByTestId(sourceTestId)

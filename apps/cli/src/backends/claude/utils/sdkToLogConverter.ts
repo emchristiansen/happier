@@ -15,7 +15,7 @@ import type {
 import type { RawJSONLines } from '@/backends/claude/types'
 import type { PermissionMode } from '@/api/types'
 import { normalizeClaudeToolUseNamesInSdkMessage } from './normalizeClaudeToolUseNames'
-import { INTERNAL_CLAUDE_EVENT_TYPES } from './internalClaudeEventTypes'
+import { providers } from '@happier-dev/agents'
 import { buildClaudeSdkResultUsageTelemetry } from './sdkResultUsageTelemetry'
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers'
 
@@ -115,7 +115,7 @@ export class SDKToLogConverter {
      */
     convert(sdkMessage: SDKMessage): RawJSONLines | null {
         const rawType = (sdkMessage as any)?.type;
-        if (typeof rawType === 'string' && INTERNAL_CLAUDE_EVENT_TYPES.has(rawType)) {
+        if (providers.claude.isClaudeInternalEventType(rawType)) {
             return null;
         }
 

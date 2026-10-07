@@ -24,6 +24,7 @@ jobs:
       select_jobs_explicitly: true
       run_ui_e2e: false
       run_ui: false
+      run_shared_packages: false
       run_server: false
       run_server_db_contract: false
       run_cli: false
@@ -39,6 +40,7 @@ jobs:
       run_release_contracts: false
       run_installers_smoke: false
       run_binary_smoke: false
+      run_build_smoke: false
       run_self_host_systemd: true
       run_self_host_launchd: true
       run_self_host_schtasks: true

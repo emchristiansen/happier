@@ -1,15 +1,19 @@
 import type { PreflightSessionControlsProbeAdapter } from '@/capabilities/probes/preflightSessionControlsProbeAdapterTypes';
 import { killProcessTree } from '@/agent/runtime/process/killProcessTree';
-import { resolveProviderCliLaunchSpec } from '@/runtime/managedTools/requireProviderCliLaunchSpec';
+import {
+  resolveOpenCodeCliLaunchSpec,
+  type OpenCodeCliLaunchSpec,
+} from '@/backends/opencode/utils/resolveOpenCodeCliCommand';
+import { prepareOpenCodeConnectedAuthAssets } from '@/backends/opencode/brokerPlugin';
 import { resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process';
 import { spawn } from 'node:child_process';
 
 import { asRecord, normalizeString } from '../server/openCodeParsing';
-import { modelSupportsToolCalls } from '../server/openCodeModelParsing';
+import { isOpenCodeModelSelectable, modelSupportsReasoningVariants, parseOpenCodeModelId } from '../server/openCodeModelParsing';
 import { buildOpenCodeThinkingModelOptionsFromVariants } from '../modelOptions/openCodeThinkingModelOption';
 import { readContextWindowTokensFromModelRecord } from '@/backends/modelCapabilities/contextWindowTokens';
 
-type OpenCodeVerboseModelRecord = Readonly<{
+type OpenCodePreflightModelRecord = Readonly<{
   id?: string;
   providerID?: string;
   name?: string;
@@ -19,17 +23,10 @@ type OpenCodeVerboseModelRecord = Readonly<{
   variants?: unknown;
 }>;
 
-type OpenCodeVerboseModelBlock = Readonly<{
+type OpenCodePreflightModelBlock = Readonly<{
   fullId: string;
-  record: OpenCodeVerboseModelRecord;
+  record: OpenCodePreflightModelRecord;
 }>;
-
-function isOpenCodeVerboseModelIdLine(line: string): boolean {
-  const trimmed = line.trim();
-  if (!trimmed) return false;
-  // Example: openai/codex-mini-latest, openrouter/gemini-2.5-flash-preview:thinking
-  return /^[a-z0-9._:-]+\/[a-z0-9._:-]+$/i.test(trimmed);
-}
 
 function tryParseJsonObject(text: string): Record<string, unknown> | null {
   try {
@@ -65,16 +62,16 @@ function extractJsonBlockFromLines(lines: string[], startIndex: number): { jsonT
   return null;
 }
 
-function parseOpenCodeModelsVerboseOutput(outputRaw: string): OpenCodeVerboseModelBlock[] | null {
+function parseOpenCodeModelsVerboseOutput(outputRaw: string): OpenCodePreflightModelBlock[] | null {
   const output = typeof outputRaw === 'string' ? outputRaw : '';
-  if (!output.trim()) return null;
+  if (!output.trim()) return [];
 
   const lines = output.split('\n');
-  const parsed: OpenCodeVerboseModelBlock[] = [];
+  const parsed: OpenCodePreflightModelBlock[] = [];
 
   for (let i = 0; i < lines.length; i++) {
     const line = String(lines[i] ?? '').trim();
-    if (!isOpenCodeVerboseModelIdLine(line)) continue;
+    if (!line) continue;
 
     const fullId = line;
     let cursor = i + 1;
@@ -84,19 +81,22 @@ function parseOpenCodeModelsVerboseOutput(outputRaw: string): OpenCodeVerboseMod
         cursor += 1;
         continue;
       }
-      if (next.startsWith('{')) break;
-      cursor += 1;
+      break;
     }
-    if (cursor >= lines.length) continue;
+    if (cursor >= lines.length || !String(lines[cursor] ?? '').trim().startsWith('{')) continue;
 
     const block = extractJsonBlockFromLines(lines, cursor);
-    if (!block) continue;
+    if (!block) return null;
 
     const record = tryParseJsonObject(block.jsonText);
-    if (!record) {
-      i = block.endIndexInclusive;
-      continue;
-    }
+    if (!record) return null;
+
+    const parsedId = parseOpenCodeModelId(fullId);
+    if (
+      !parsedId
+      || parsedId.providerID !== normalizeString(record.providerID)
+      || parsedId.modelID !== normalizeString(record.id)
+    ) return null;
 
     parsed.push({ fullId, record });
     i = block.endIndexInclusive;
@@ -105,15 +105,61 @@ function parseOpenCodeModelsVerboseOutput(outputRaw: string): OpenCodeVerboseMod
   return parsed.length > 0 ? parsed : null;
 }
 
-async function probeOpenCodeModelsVerbose(params: Readonly<{
+function parseOpenCodeV2ModelsApiOutput(outputRaw: string): OpenCodePreflightModelBlock[] | null {
+  const envelope = tryParseJsonObject(outputRaw.trim());
+  if (!Array.isArray(envelope?.data)) return null;
+  if (envelope.data.length === 0) return [];
+
+  const parsed = envelope.data.flatMap((rawModel): OpenCodePreflightModelBlock[] => {
+    const record = asRecord(rawModel);
+    const providerID = normalizeString(record?.providerID);
+    const modelID = normalizeString(record?.id);
+    if (!record || !providerID || !modelID) return [];
+    return [{ fullId: `${providerID}/${modelID}`, record }];
+  });
+  return parsed.length > 0 ? parsed : null;
+}
+
+function buildOpenCodePreflightModels(
+  blocks: readonly OpenCodePreflightModelBlock[],
+): unknown[] {
+  const models = blocks
+    .map((block) => {
+      const record = block.record;
+      const fullId = block.fullId;
+      const model = parseOpenCodeModelId(fullId);
+      if (!model || !isOpenCodeModelSelectable({ ...model, modelRecord: record })) return null;
+      const name = normalizeString(record.name) || fullId;
+      const description = normalizeString(record.family) || normalizeString(record.providerID) || undefined;
+      const supportsReasoning = modelSupportsReasoningVariants(record);
+      const contextWindowTokens = readContextWindowTokensFromModelRecord(record);
+      const modelOptions = supportsReasoning
+        ? buildOpenCodeThinkingModelOptionsFromVariants(record.variants, null)
+        : null;
+      return {
+        id: fullId,
+        name,
+        ...(description ? { description } : {}),
+        ...(contextWindowTokens !== undefined ? { contextWindowTokens } : {}),
+        ...(modelOptions ? { modelOptions } : {}),
+      };
+    })
+    .filter((model): model is NonNullable<typeof model> => model !== null);
+
+  return models;
+}
+
+async function runOpenCodeModelsProbeCommand(params: Readonly<{
   cwd: string;
   timeoutMs: number;
-  processEnv?: NodeJS.ProcessEnv;
+  processEnv: NodeJS.ProcessEnv;
+  launch: OpenCodeCliLaunchSpec;
+  args: readonly string[];
+  parseOutput: (stdout: string) => OpenCodePreflightModelBlock[] | null;
 }>): Promise<unknown[] | null> {
-  const timeoutMs = Math.max(250, params.timeoutMs);
-  const launch = resolveProviderCliLaunchSpec('opencode', { processEnv: params.processEnv ?? process.env });
-  const command = launch?.command ?? 'opencode';
-  const args = [...(launch?.args ?? []), 'models', '--verbose'];
+  const timeoutMs = Math.max(1, params.timeoutMs);
+  const command = params.launch.command;
+  const args = [...params.launch.args, ...params.args];
 
   return await new Promise((resolve) => {
     let stdout = '';
@@ -133,7 +179,7 @@ async function probeOpenCodeModelsVerbose(params: Readonly<{
 
     const child = spawn(invocation.command, invocation.args, {
       cwd: params.cwd,
-      env: { ...(params.processEnv ?? process.env), CI: '1' },
+      env: { ...params.processEnv, CI: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
       windowsVerbatimArguments: invocation.windowsVerbatimArguments,
@@ -163,33 +209,9 @@ async function probeOpenCodeModelsVerbose(params: Readonly<{
       clearTimeout(timer);
       if (typeof code !== 'number' || code !== 0) return finish(null);
 
-      const blocks = parseOpenCodeModelsVerboseOutput(stdout);
+      const blocks = params.parseOutput(stdout);
       if (!blocks) return finish(null);
-
-      const models = blocks
-        .map((block) => {
-          const record = block.record;
-          if (!modelSupportsToolCalls(record)) return null;
-          const fullId = block.fullId;
-          const name = normalizeString(record.name) || fullId;
-          const description = normalizeString(record.family) || normalizeString(record.providerID) || undefined;
-          const capabilities = asRecord(record.capabilities);
-          const supportsReasoning = capabilities ? capabilities.reasoning === true : false;
-          const contextWindowTokens = readContextWindowTokensFromModelRecord(record);
-          const modelOptions = supportsReasoning
-            ? buildOpenCodeThinkingModelOptionsFromVariants(record.variants, null)
-            : null;
-          return {
-            id: fullId,
-            name,
-            ...(description ? { description } : {}),
-            ...(contextWindowTokens !== undefined ? { contextWindowTokens } : {}),
-            ...(modelOptions ? { modelOptions } : {}),
-          };
-        })
-        .filter((m): m is NonNullable<typeof m> => m !== null);
-
-      finish(models.length > 0 ? models : null);
+      finish(buildOpenCodePreflightModels(blocks));
     });
   });
 }
@@ -197,10 +219,44 @@ async function probeOpenCodeModelsVerbose(params: Readonly<{
 export const openCodePreflightModelsProbeAdapter: PreflightSessionControlsProbeAdapter = {
   connectedServiceAuth: 'materialized-env',
   failureCacheStrategy: 'cooldown',
-  // Fallback: if `models --verbose` parsing fails for any reason, the core probe can still
-  // populate the model list via the plain `models` command (without model-scoped options).
-  cliModelsCommandArgs: ['models'],
   probeModelsRaw: async ({ cwd, timeoutMs, processEnv }) => {
-    return await probeOpenCodeModelsVerbose({ cwd, timeoutMs, processEnv });
+    const deadlineMs = Date.now() + Math.max(1, timeoutMs);
+    const baseEnv = processEnv ?? process.env;
+    const launch = (() => {
+      try {
+        return resolveOpenCodeCliLaunchSpec(baseEnv);
+      } catch {
+        return null;
+      }
+    })();
+    if (!launch) return null;
+    const prepared = await prepareOpenCodeConnectedAuthAssets({
+      env: baseEnv,
+      apiGeneration: launch.apiGeneration,
+    }).catch(() => null);
+    if (!prepared) return null;
+    const probeEnv = prepared.openCodeConfigContent === undefined
+      ? baseEnv
+      : { ...baseEnv, OPENCODE_CONFIG_CONTENT: prepared.openCodeConfigContent };
+    const probe = async (
+      args: readonly string[],
+      parseOutput: (stdout: string) => OpenCodePreflightModelBlock[] | null,
+    ): Promise<unknown[] | null> => {
+      const remainingMs = deadlineMs - Date.now();
+      if (remainingMs <= 0) return null;
+      return await runOpenCodeModelsProbeCommand({
+        cwd,
+        timeoutMs: remainingMs,
+        processEnv: probeEnv,
+        launch,
+        args,
+        parseOutput,
+      });
+    };
+
+    return await probe(
+      ['api', 'get', '/api/model', '--standalone', '--param', `location[directory]=${cwd}`],
+      parseOpenCodeV2ModelsApiOutput,
+    ) ?? await probe(['models', '--verbose'], parseOpenCodeModelsVerboseOutput);
   },
 };

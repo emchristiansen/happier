@@ -151,6 +151,12 @@ For local presets and custom local models:
 
 Users do **not** need to install Python, Ollama, sentence-transformers, or another separate embeddings service.
 
+In current development builds, the inference runtime is downloaded on first use as well.
+You can preinstall it from [Installables](/extending/installables), then enable the selected
+model while online to cache its model files. Both must be present for offline local inference.
+Disabled embeddings and custom remote embeddings do not download the local runtime.
+Acquisition failures leave keyword search available; retry installation from Installables.
+
 ## Custom remote embeddings
 
 Advanced users can choose **Custom → OpenAI-compatible endpoint**.

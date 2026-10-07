@@ -114,42 +114,6 @@ describe('providerSettings', () => {
     });
   });
 
-  it('resolves Kimi ACP Python selector runtime extras from account settings', () => {
-    expect(
-      resolveProviderSpawnExtrasForRuntime({
-        agentId: 'kimi',
-        settings: { kimiAcpPythonSelector: 'poll' },
-        processEnv: {},
-      }),
-    ).toEqual({ kimiAcpPythonSelector: 'poll' });
-
-    expect(
-      resolveProviderSpawnExtrasForRuntime({
-        agentId: 'kimi',
-        settings: { kimiAcpPythonSelector: 'auto' },
-        processEnv: {},
-      }),
-    ).toEqual({});
-  });
-
-  it('lets an explicit Kimi ACP Python selector env override win over account settings', () => {
-    expect(
-      resolveProviderSpawnExtrasForRuntime({
-        agentId: 'kimi',
-        settings: { kimiAcpPythonSelector: 'poll' },
-        processEnv: { HAPPIER_KIMI_ACP_SELECTOR: 'auto' },
-      }),
-    ).toEqual({ kimiAcpPythonSelector: 'auto' });
-
-    expect(
-      resolveProviderSpawnExtrasForRuntime({
-        agentId: 'kimi',
-        settings: { kimiAcpPythonSelector: 'auto' },
-        processEnv: { HAPPIER_KIMI_ACP_SELECTOR: 'poll' },
-      }),
-    ).toEqual({ kimiAcpPythonSelector: 'poll' });
-  });
-
   it('builds Claude outgoing meta defaults from account settings', () => {
     const extras = resolveProviderOutgoingMessageMetaExtras({
       agentId: 'claude',

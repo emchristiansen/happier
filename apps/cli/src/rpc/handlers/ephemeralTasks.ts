@@ -18,6 +18,7 @@ export function registerEphemeralTaskHandlers(
   rpc: RpcHandlerRegistrar,
   ctx: Readonly<{
     workingDirectory: string;
+    resolveWorkingDirectory?: () => string;
     createBackend: (opts: { backendId: string; permissionMode: string; backendTarget?: BackendTargetRefV1 }) => AgentBackend;
     budgetRegistry?: ExecutionBudgetRegistry;
   }>,
@@ -69,7 +70,7 @@ export function registerEphemeralTaskHandlers(
       }
 
       const res = await runScmCommitMessageTask({
-        workingDirectory: ctx.workingDirectory,
+        workingDirectory: ctx.resolveWorkingDirectory?.() ?? ctx.workingDirectory,
         instructions,
         scope,
         maxFiles,

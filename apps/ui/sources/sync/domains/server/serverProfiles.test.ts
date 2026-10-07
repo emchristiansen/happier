@@ -310,18 +310,43 @@ describe('serverProfiles', () => {
         expect(profiles.getActiveServerId()).toBe('manual-id');
     });
 
-    it('seeds api.happier.dev on app.happier.dev web origin when no preconfigured env exists', async () => {
+    it.each(['https://cloud.happier.dev', 'https://app.happier.dev'])(
+        'seeds api.happier.dev on the hosted web origin %s when no preconfigured env exists',
+        async (webOrigin) => {
+            const scope = randomScope();
+            process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = scope;
+            delete process.env.EXPO_PUBLIC_HAPPY_SERVER_URL;
+            delete process.env.EXPO_PUBLIC_HAPPY_PRECONFIGURED_SERVERS;
+            stubWebRuntime(webOrigin);
+
+            const profiles = await importFresh();
+            const all = profiles.listServerProfiles();
+            expect(all.some((p) => p.serverUrl === 'https://api.happier.dev')).toBe(true);
+            expect(all.some((p) => p.serverUrl === webOrigin)).toBe(false);
+            expect(profiles.getActiveServerUrl()).toBe('https://api.happier.dev');
+        },
+    );
+
+    it('never treats the desktop webview origin as a relay', async () => {
+        // The desktop app's page is its own bundle (http://tauri.localhost on Windows, the Metro
+        // devUrl in `tauri dev`), not a relay: it must neither seed a profile nor become the local
+        // relay that desktop setup hands the CLI as `--local-server-url`.
         const scope = randomScope();
         process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = scope;
         delete process.env.EXPO_PUBLIC_HAPPY_SERVER_URL;
         delete process.env.EXPO_PUBLIC_HAPPY_PRECONFIGURED_SERVERS;
-        stubWebRuntime('https://app.happier.dev');
+        stubWebRuntime('http://tauri.localhost');
+        vi.stubGlobal('__TAURI_INTERNALS__', { invoke: async () => null });
 
         const profiles = await importFresh();
-        const all = profiles.listServerProfiles();
-        expect(all.some((p) => p.serverUrl === 'https://api.happier.dev')).toBe(true);
-        expect(all.some((p) => p.serverUrl === 'https://app.happier.dev')).toBe(false);
-        expect(profiles.getActiveServerUrl()).toBe('https://api.happier.dev');
+        const created = profiles.upsertServerProfile({ serverUrl: 'https://relay.example.test', name: 'Relay' });
+        profiles.setActiveServerId(created.id, { scope: 'device' });
+
+        expect(profiles.listServerProfiles().some((p) => p.serverUrl === 'http://tauri.localhost')).toBe(false);
+        expect(profiles.getActiveServerSnapshot()).toMatchObject({
+            serverUrl: 'https://relay.example.test',
+            activeLocalRelayUrl: null,
+        });
     });
 
     it('does not seed a same-origin server profile when EXPO_PUBLIC_HAPPY_SERVER_URL is set', async () => {

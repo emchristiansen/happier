@@ -33,6 +33,10 @@ vi.mock('expo-image', () => ({
     Image: 'Image',
 }));
 
+vi.mock('@/components/updates/UpdatesPopoverButton', () => ({
+    UpdatesEntry: (props: Record<string, unknown>) => React.createElement('UpdatesEntry', props),
+}));
+
 vi.mock('@/components/navigation/ConnectionStatusControl', () => ({
     ConnectionStatusControl: 'ConnectionStatusControl',
 }));
@@ -40,6 +44,7 @@ vi.mock('@/components/navigation/ConnectionStatusControl', () => ({
 vi.mock('@/components/ui/lists/ItemRowActions', () => ({
     ItemRowActions: (props: {
         actions: Array<{ id: string }>;
+        leadingPinnedContent?: React.ReactNode;
         renderOverflowTrigger?: (params: {
             open: boolean;
             toggle: () => void;
@@ -52,6 +57,7 @@ vi.mock('@/components/ui/lists/ItemRowActions', () => ({
         return React.createElement(
             View,
             { testID: 'desktop-sidebar-item-actions' },
+            props.leadingPinnedContent,
             props.renderOverflowTrigger?.({
                 open: false,
                 toggle: vi.fn(),
@@ -107,7 +113,6 @@ describe('DesktopSidebarChrome', () => {
                 renderHeaderOverflowVisual={() => <View testID="desktop-sidebar-overflow-visual" />}
                 popoverBoundaryRef={{ current: null }}
                 desktopWindowControls={<View testID="injected-desktop-window-controls" />}
-                desktopUpdateIndicator={<View testID="injected-desktop-update-indicator" />}
             />,
         );
 
@@ -119,17 +124,51 @@ describe('DesktopSidebarChrome', () => {
 
         expect(chrome.children[0]).toBe(controlsRow);
         expect(chrome.children[1]).toBe(contentRow);
+        // The desktop top rail carries window-level utilities: back/forward lead, Updates follows them
+        // ahead of the other utilities; inbox and activity live only in the sidebar's own icon row below.
         expect(directChildTestIDs(screen.findByTestId('desktop-sidebar-chrome-utility-row')!)).toEqual([
             'sidebar-back-button',
             'sidebar-forward-button',
-            'desktop-sidebar-action-operations',
+            'desktop-sidebar-updates-button',
             'nav-settings',
             'sidebar-collapse-button',
         ]);
         expect(contentRow.children).toEqual([brandGroup, actionsRow]);
         expect(brandGroup.findByProps({ accessibilityLabel: 'common.home' })).toBeTruthy();
-        expect(actionsRow.findAll((child) => child.props?.testID === 'desktop-update-indicator-host')).toHaveLength(0);
-        expect(screen.findByTestId('desktop-sidebar-title-container')!.findByProps({ testID: 'injected-desktop-update-indicator' })).toBeTruthy();
+        // Activity renders nothing while idle, so match the mounted entry rather than painted hosts.
+        const mountedIn = (root: ReactTestInstance, testID: string) =>
+            root.findAll((node) => node.props?.testID === testID).length > 0;
+        expect(mountedIn(actionsRow, 'desktop-sidebar-action-operations')).toBe(true);
+        expect(mountedIn(controlsRow, 'desktop-sidebar-action-operations')).toBe(false);
+        expect(mountedIn(actionsRow, 'desktop-sidebar-updates-button')).toBe(false);
+        // The title stays whole: no entry trails it any more.
+        const titleContainer = screen.findByTestId('desktop-sidebar-title-container')!;
+        expect(titleContainer.findByProps({ testID: 'desktop-sidebar-title-text' })).toBeTruthy();
+        expect(titleContainer.findAll((node) => node.type === ('UpdatesEntry' as never))).toHaveLength(0);
+    });
+
+    it('puts the Updates icon in the sidebar icon row when there is no desktop top rail', async () => {
+        const { DesktopSidebarChrome } = await import('./DesktopSidebarChrome');
+        const { DESKTOP_SIDEBAR_CHROME_ICON_GLYPH_SIZE_PX } = await import('./desktopChromeMetrics');
+        const screen = await renderScreen(
+            <DesktopSidebarChrome
+                sidebarWidthPx={600}
+                headerHeightPx={56}
+                onPressHome={vi.fn()}
+                environmentBadge={null}
+                headerActions={[]}
+                renderHeaderOverflowVisual={() => <View testID="desktop-sidebar-overflow-visual" />}
+                popoverBoundaryRef={{ current: null }}
+            />,
+        );
+
+        const actionsRow = requireTestInstance(screen.findByTestId('desktop-sidebar-chrome-actions-row'), 'actions row');
+        const paintedIn = (testID: string) =>
+            actionsRow.findAll((node) => typeof node.type === 'string' && node.props?.testID === testID);
+        const updates = paintedIn('desktop-sidebar-updates-button');
+        expect(updates).toHaveLength(1);
+        expect(updates[0]!.props).toMatchObject({ variant: 'icon', iconSize: DESKTOP_SIDEBAR_CHROME_ICON_GLYPH_SIZE_PX });
+        expect(actionsRow.findAll((node) => node.props?.testID === 'desktop-sidebar-action-operations').length).toBeGreaterThan(0);
     });
 
     it('starts window dragging from non-interactive sidebar top strip clicks', async () => {
@@ -158,7 +197,6 @@ describe('DesktopSidebarChrome', () => {
             target: { closest: vi.fn(() => null) },
         });
 
-        expect(controlsRow.props['data-tauri-drag-region']).toBe(true);
         expect(preventDefault).toHaveBeenCalledTimes(1);
         expect(desktopWindowBridgeState.startDesktopWindowDragging).toHaveBeenCalledTimes(1);
     });

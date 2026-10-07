@@ -1,7 +1,7 @@
 import React from 'react';
 
 import type { AgentId } from '@happier-dev/agents';
-import { AGENTS_CORE, getProviderCliRuntimeSpec } from '@happier-dev/agents';
+import { AGENTS_CORE, getBuiltInAcpConfig, getProviderCliRuntimeSpec } from '@happier-dev/agents';
 
 import type { Credentials } from '@/persistence';
 import type { PermissionMode } from '@/api/types';
@@ -28,8 +28,9 @@ export async function runCatalogDefinedAcpAgent(
   },
 ): Promise<void> {
   const displayTitle = normalizeDisplayTitle(agentId);
-  const backendOptionsResolver = await requireCatalogEntry(agentId)
-    .getAcpRuntimeBackendOptionsResolver?.();
+  const catalogEntry = requireCatalogEntry(agentId);
+  const backendOptionsResolver = await catalogEntry.getAcpRuntimeBackendOptionsResolver?.();
+  const sessionModelAdapter = await catalogEntry.getAcpRuntimeSessionModelAdapter?.();
   const TerminalDisplay = (props: Readonly<{
     messageBuffer: MessageBuffer;
     logPath?: string;
@@ -45,6 +46,8 @@ export async function runCatalogDefinedAcpAgent(
     agentMessageType: agentId,
     machineMetadata: initialMachineMetadata,
     terminalDisplay: TerminalDisplay,
+    // Same catalog declaration the ACP protocol owner enforces against the negotiated handshake.
+    declaredSessionLoadSupport: getBuiltInAcpConfig(agentId)?.supportsLoadSession === true,
     createRuntime: ({
       directory,
       machineId,
@@ -78,6 +81,7 @@ export async function runCatalogDefinedAcpAgent(
         },
         pendingQueueDrainMaxPopPerWake,
         providerInputConsumer,
+        ...(sessionModelAdapter ?? {}),
         ...(backendOptions ? { backendOptions } : {}),
       });
     },

@@ -5,7 +5,8 @@ import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import { getActionSpec, resolveEffectiveActionInputFields } from '@happier-dev/protocol';
 import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 
-import { buildResumeSessionExtrasFromUiState, DEFAULT_AGENT_ID, getAgentCore, resolveAgentIdFromFlavor } from '@/agents/catalog/catalog';
+import { buildResumeSessionExtrasFromUiState, DEFAULT_AGENT_ID, resolveAgentIdFromFlavor } from '@/agents/catalog/catalog';
+import { resolveBuiltInAgentTitle } from '@/agents/backendCatalog/getResolvedBackendCatalogEntries';
 import { useEnabledAgentIds } from '@/agents/hooks/useEnabledAgentIds';
 import { useResumeCapabilityOptions } from '@/agents/hooks/useResumeCapabilityOptions';
 import { useSessionMachineTarget } from '@/components/sessions/model/useSessionMachineTarget';
@@ -205,7 +206,7 @@ const SessionExecutionRunLauncherContent = React.memo((props: SessionExecutionRu
         return buildAvailableReviewEngineOptions({
             enabledAgentIds,
             executionRunsBackends,
-            resolveAgentLabel: (id) => t(getAgentCore(id as any).displayNameKey),
+            resolveAgentLabel: (id) => resolveBuiltInAgentTitle(id) ?? id,
         }).map((option) => ({
             value: option.id,
             label: option.label ?? option.id,

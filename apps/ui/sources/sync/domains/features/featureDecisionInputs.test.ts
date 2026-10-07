@@ -6,6 +6,7 @@ import { resetServerFeaturesClientForTests } from '@/sync/api/capabilities/serve
 import {
     isRuntimeFeatureEnabled,
     resolveRuntimeFeatureDecision,
+    resolveRuntimeFeatureDecisionOrThrow,
 } from './featureDecisionInputs';
 
 vi.mock('@/sync/domains/server/serverRuntime', () => ({
@@ -81,5 +82,22 @@ describe('featureDecisionInputs', () => {
         });
 
         expect(enabled).toBe(false);
+    });
+
+    it('preserves a transient probe failure as a retryable error for state-loading callers', async () => {
+        storage.getState().applySettingsLocal({
+            experiments: true,
+            featureToggles: { 'social.friends': true },
+        });
+        vi.stubGlobal('fetch', vi.fn(async () => {
+            throw new TypeError('network unavailable');
+        }) as unknown as typeof fetch);
+
+        await expect(resolveRuntimeFeatureDecisionOrThrow({
+            featureId: 'social.friends',
+        })).rejects.toMatchObject({
+            name: 'RuntimeFeatureDecisionUnavailableError',
+            retryable: true,
+        });
     });
 });

@@ -22,6 +22,7 @@ import type { AgentMessage } from '@/agent/core';
 import { CHANGE_TITLE_TOOL_NAME_ALIASES } from '@happier-dev/protocol/tools/v2';
 import { logger } from '@/ui/logger';
 import { filterJsonObjectOrArrayLine } from '@/agent/transport/utils/jsonStdoutFilter';
+import { classifyProviderOutputFailure } from '@/agent/runtime/classifyProviderOutputFailure';
 import { extractHappierToolsShellBridgeToolNameHint } from '@/agent/transport/utils/happierToolsShellBridgeToolNameHint';
 import {
   findToolNameFromId,
@@ -32,9 +33,6 @@ import {
 export const COPILOT_TIMEOUTS = {
   // Copilot may run auth checks or plugin setup on first ACP start. Be conservative.
   init: 90_000,
-  toolCall: 120_000,
-  investigation: 300_000,
-  think: 30_000,
   idle: 500,
 } as const;
 
@@ -76,12 +74,7 @@ export class CopilotTransport implements TransportHandler {
     const trimmed = text.trim();
     if (!trimmed) return { message: null };
 
-    if (
-      trimmed.toLowerCase().includes('authentication') ||
-      trimmed.toLowerCase().includes('unauthorized') ||
-      trimmed.toLowerCase().includes('not logged in') ||
-      trimmed.includes('401')
-    ) {
+    if (classifyProviderOutputFailure(trimmed).authenticationError) {
       const errorMessage: AgentMessage = {
         type: 'status',
         status: 'error',
@@ -169,10 +162,8 @@ export class CopilotTransport implements TransportHandler {
     return lowerId.includes('task') || (typeof toolKind === 'string' && toolKind.includes('task'));
   }
 
-  getToolCallTimeout(toolCallId: string, toolKind?: string): number {
-    if (this.isInvestigationTool(toolCallId, toolKind)) return COPILOT_TIMEOUTS.investigation;
-    if (toolKind === 'think') return COPILOT_TIMEOUTS.think;
-    return COPILOT_TIMEOUTS.toolCall;
+  getToolCallTimeout(_toolCallId: string, _toolKind?: string): number | null {
+    return null;
   }
 
   getIdleTimeout(): number {

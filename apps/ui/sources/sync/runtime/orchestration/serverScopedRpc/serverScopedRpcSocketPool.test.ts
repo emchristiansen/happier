@@ -9,6 +9,7 @@ function createFakeSocket(options: Readonly<{ disconnectEventDelayMs?: number }>
     socket: any;
     connectSpy: ReturnType<typeof vi.fn>;
     disconnectSpy: ReturnType<typeof vi.fn>;
+    emitWithAckSpy: ReturnType<typeof vi.fn>;
     emitEvent: (event: string, ...args: any[]) => void;
 }> {
     const listeners = new Map<string, Set<Listener>>();
@@ -46,6 +47,7 @@ function createFakeSocket(options: Readonly<{ disconnectEventDelayMs?: number }>
         emit('disconnect', 'io client disconnect');
     });
 
+    const emitWithAckSpy = vi.fn(async () => ({ ok: true }));
     const socket: any = {
         connected: false,
         on,
@@ -53,17 +55,44 @@ function createFakeSocket(options: Readonly<{ disconnectEventDelayMs?: number }>
         connect: connectSpy,
         disconnect: disconnectSpy,
         timeout: (_ms: number) => ({
-            emitWithAck: async () => ({ ok: true }),
+            emitWithAck: emitWithAckSpy,
         }),
+        emitWithAck: emitWithAckSpy,
         emit: vi.fn(),
     };
 
-    return { socket, connectSpy, disconnectSpy, emitEvent: emit };
+    return { socket, connectSpy, disconnectSpy, emitWithAckSpy, emitEvent: emit };
 }
 
 describe('serverScopedRpcSocketPool', () => {
     afterEach(() => {
         vi.useRealTimers();
+    });
+
+    it('exposes direct acknowledgement emission without adding a Socket.IO timeout', async () => {
+        const { socket, emitWithAckSpy } = createFakeSocket();
+        const pool = createServerScopedRpcSocketPool({
+            createSocket: () => socket,
+            reachability: {
+                waitForReachable: async () => {},
+                startReachability: async () => {},
+                reportUnreachable: () => {},
+                subscribeNetworkAllowed: () => () => {},
+            },
+            readIdleDisconnectMs: () => 0,
+        });
+        const client = await pool.acquire({
+            serverUrl: 'https://server.example.test',
+            token: 'token-a',
+            timeoutMs: 1_000,
+        });
+
+        await expect(client.emitWithAck('rpc-call', { value: 1 })).resolves.toEqual({ ok: true });
+        expect(emitWithAckSpy).toHaveBeenCalledWith('rpc-call', { value: 1 });
+
+        client.disconnect();
+        await pool.stopAll();
+        pool.resetForTests();
     });
 
     it('uses the canonical Socket.IO updates path', async () => {

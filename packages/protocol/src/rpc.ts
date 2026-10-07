@@ -51,7 +51,9 @@ export const RPC_METHODS = {
   DAEMON_PROMPT_REGISTRY_DOWNLOAD_FINALIZE: 'daemon.promptRegistry.download.finalize',
   DAEMON_PROMPT_REGISTRY_DOWNLOAD_ABORT: 'daemon.promptRegistry.download.abort',
   DAEMON_PROMPT_REGISTRY_INSTALL: 'daemon.promptRegistry.install',
+  DAEMON_DIRECT_SESSIONS_ACP_SESSION_LIST_CAPABILITY_GET: 'daemon.directSessions.acpSessionList.capability.get',
   DAEMON_DIRECT_SESSIONS_CANDIDATES_LIST: 'daemon.directSessions.candidates.list',
+  DAEMON_DIRECT_SESSION_CANDIDATE_DELETE: 'daemon.directSessions.candidate.delete',
   DAEMON_DIRECT_SESSION_LINK_ENSURE: 'daemon.directSessions.link.ensure',
   DAEMON_DIRECT_SESSION_ATTACH: 'daemon.directSessions.attach',
   DAEMON_DIRECT_SESSION_DETACH: 'daemon.directSessions.detach',
@@ -61,6 +63,7 @@ export const RPC_METHODS = {
   DAEMON_DIRECT_SESSION_TRANSCRIPT_READ_AFTER: 'daemon.directSessions.transcript.readAfter',
   DAEMON_DIRECT_SESSION_TAKEOVER: 'daemon.directSessions.takeover',
   DAEMON_DIRECT_SESSION_TAKEOVER_PERSIST: 'daemon.directSessions.takeoverPersist',
+  DAEMON_DIRECT_SESSION_TAKEOVER_PERSIST_START: 'daemon.directSessions.takeoverPersist.start',
   DAEMON_SESSION_GOAL_GET: 'daemon.sessionGoal.get',
   DAEMON_SESSION_GOAL_SET: 'daemon.sessionGoal.set',
   DAEMON_SESSION_GOAL_CLEAR: 'daemon.sessionGoal.clear',
@@ -101,6 +104,8 @@ export const RPC_METHODS = {
    * authority and persists nothing; the mutation revalidates every fact.
    */
   SESSION_CONTINUATION_INSPECT: 'session.continuation.inspect',
+  /** One source read/decrypt for every target shown by the Agent picker. */
+  SESSION_CONTINUATION_INSPECT_BATCH: 'session.continuation.inspectBatch',
   /**
    * Read-only rebuild of the activation brief one transition divider stands
    * for. Runs the same bounded context pass the transition ran, bounded by the
@@ -213,6 +218,7 @@ const SOCKET_RPC_PROVIDER_STARTING_METHODS = new Set<string>([
   RPC_METHODS.DAEMON_SESSION_HANDOFF_TARGET_RESUME_V2,
   RPC_METHODS.DAEMON_DIRECT_SESSION_TAKEOVER,
   RPC_METHODS.DAEMON_DIRECT_SESSION_TAKEOVER_PERSIST,
+  RPC_METHODS.DAEMON_DIRECT_SESSION_TAKEOVER_PERSIST_START,
 ]);
 
 function normalizeSocketRpcSessionId(value: unknown): string | null {
@@ -288,6 +294,7 @@ export const SESSION_RPC_METHODS = {
   SESSION_GOAL_SET: 'session.goal.set',
   SESSION_GOAL_CLEAR: 'session.goal.clear',
   SESSION_TERMINAL_COMPOSER_CLEAR: 'session.terminalComposer.clear',
+  SESSION_PROVIDER_CLI_ATTACH_PREPARE_V1: 'session.providerCliAttach.prepare.v1',
   SESSION_PENDING_INPUT_INTERRUPT_AND_RUN: 'session.pendingInput.interruptAndRun',
   SESSION_REVIEW_START_INLINE: 'session.review.startInline',
   SESSION_CONNECTED_SERVICE_AUTH_INVALIDATE_TRANSPORTS: 'session.connectedServiceAuth.invalidateTransports',
@@ -310,6 +317,7 @@ export const SESSION_RPC_METHODS = {
   EXECUTION_RUN_STOP: 'execution.run.stop',
   EXECUTION_RUN_LIST: 'execution.run.list',
   EXECUTION_RUN_GET: 'execution.run.get',
+  EXECUTION_RUN_WAIT: 'execution.run.wait',
   EXECUTION_RUN_ACTION: 'execution.run.action',
   SESSION_ROLLBACK: 'session.rollback',
   EPHEMERAL_TASK_RUN: 'ephemeral.task.run',

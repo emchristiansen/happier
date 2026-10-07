@@ -9,6 +9,7 @@ import {
 } from '@/sync/domains/session/listing/sessionListRenderable';
 import {
     deriveSessionRuntimePresentationState,
+    resolveNextSessionRuntimePresentationFreshnessAtMs,
     SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS,
 } from '@/sync/domains/session/attention/deriveSessionRuntimePresentationState';
 import { nowServerMs } from '@/sync/runtime/time';
@@ -221,14 +222,41 @@ export function createSessionListRuntimePriorityRowScopeSelector(
     const normalizedScopes = scopes.map(normalizeScope);
     const overlayState: SessionListRowStoreState = { activeServerId };
     let previousOutput: readonly SessionListRowStateSnapshotScope[] | null = null;
+    // Store notifications often replace the outer record while only one row
+    // changes. Keep the existing priority projection with its scoped input,
+    // and expire it at the runtime owner's boundary, including clock rewinds.
+    const priorityByScope: Array<Readonly<{
+        renderable: SessionListRenderableSession | undefined;
+        evaluatedAtMs: number;
+        validUntilMs: number | null;
+        isPriority: boolean;
+    }> | undefined> = [];
 
     return (state) => {
         const nowMs = nowServerMs();
         let nextOutput: SessionListRowStateSnapshotScope[] | null = null;
-        for (const scope of normalizedScopes) {
+        for (let index = 0; index < normalizedScopes.length; index += 1) {
+            const scope = normalizedScopes[index];
             if (!shouldReadActiveServerOverlay(overlayState, scope.serverId)) continue;
             const renderable = state.sessionListRenderables?.[scope.sessionId];
-            if (!isRuntimePriorityRenderable(renderable, nowMs)) continue;
+            let priority = priorityByScope[index];
+            if (
+                !priority
+                || priority.renderable !== renderable
+                || nowMs < priority.evaluatedAtMs
+                || (priority.validUntilMs !== null && nowMs >= priority.validUntilMs)
+            ) {
+                priority = {
+                    renderable,
+                    evaluatedAtMs: nowMs,
+                    validUntilMs: renderable
+                        ? resolveNextSessionRuntimePresentationFreshnessAtMs(renderable, nowMs)
+                        : null,
+                    isPriority: isRuntimePriorityRenderable(renderable, nowMs),
+                };
+                priorityByScope[index] = priority;
+            }
+            if (!priority.isPriority) continue;
             if (nextOutput === null) nextOutput = [];
             nextOutput.push(scope);
         }

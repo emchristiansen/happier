@@ -40,6 +40,7 @@ export const ProviderAuthenticationTerminalPane = React.memo(function ProviderAu
         machineRpcTargetAvailable,
         terminalKey,
         terminalRef: terminalRendererRef,
+        launch: props.authLaunch?.launch ?? null,
         initialCommand: props.authLaunch?.initialCommand
             ? buildTerminalAutoExitCommand(props.authLaunch.initialCommand, machine?.metadata?.platform)
             : null,

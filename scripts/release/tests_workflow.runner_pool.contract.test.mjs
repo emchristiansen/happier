@@ -191,7 +191,7 @@ test('manual test dispatch can opt approved non-secret Linux lanes into Blacksmi
     assert.ok(needs(tests.jobs[jobName]).includes('trusted_ref_guard'), `${jobName} must wait for runner admission`);
   }
 
-  for (const jobName of ['server', 'stack', 'release-contracts', 'binary-smoke', 'typecheck']) {
+  for (const jobName of ['server', 'stack', 'release-contracts', 'binary-smoke', 'build-smoke', 'typecheck']) {
     assert.equal(tests.jobs[jobName]['runs-on'], '${{ needs.trusted_ref_guard.outputs.ubuntu_2404 }}');
     assert.ok(needs(tests.jobs[jobName]).includes('trusted_ref_guard'), `${jobName} must wait for runner admission`);
   }

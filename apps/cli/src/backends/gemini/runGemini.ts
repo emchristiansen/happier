@@ -11,6 +11,7 @@ import os from 'node:os';
 import { resolve } from 'node:path';
 
 import { logger } from '@/ui/logger';
+import { isConditionalPendingSteerClaim } from '@happier-dev/protocol';
 import { resolveHasTTY } from '@/ui/tty/resolveHasTTY';
 import { Credentials } from '@/persistence';
 import { createSessionMetadata } from '@/agent/runtime/createSessionMetadata';
@@ -112,7 +113,6 @@ import type { ProviderEnforcedPermissionHandler } from '@/agent/permissions/Prov
 import { createProviderEnforcedPermissionHandler } from '@/agent/permissions/createProviderEnforcedPermissionHandler';
 import { parseSpecialCommand } from '@/cli/parsers/specialCommands';
 import { resolveGeminiQueuedPromptWithReplaySeed } from '@/backends/gemini/runtime/resolveGeminiQueuedPromptWithReplaySeed';
-import { formatGeminiPromptDebugSummary } from '@/backends/gemini/runtime/formatGeminiPromptDebugSummary';
 import { buildGeminiPromptForMessage } from '@/backends/gemini/utils/buildGeminiPromptForMessage';
 import { resolveGeminiSystemPromptText } from '@/backends/gemini/prompting/resolveGeminiSystemPromptText';
 import { resolveCliFeatureDecision } from '@/features/featureDecisionService';
@@ -252,6 +252,7 @@ export async function runGemini(opts: {
     state,
     existingSessionId: opts.existingSessionId,
     uiLogPrefix: '[gemini]',
+    terminalAgentLabel: 'gemini',
     startupMetadataOverrides: createStartupMetadataOverrides(opts),
     startupSideEffectsOrder: 'persist-first',
     allowOfflineStub: true,
@@ -413,21 +414,21 @@ export async function runGemini(opts: {
         reason,
       }) === true;
     };
-    if (
-      pendingProviderAction === 'steer'
-    ) {
-      if (!rejectPendingQueueInputBeforeProviderEffect('steering_unavailable') && deliveryInfo?.providerAcceptancePending !== true) {
-        const localIds = message.localId ? [message.localId] : [];
+    if (isConditionalPendingSteerClaim({
+      requestedAction: deliveryInfo?.pendingRequestedAction,
+      providerAction: pendingProviderAction,
+    })) {
+      if (!rejectPendingQueueInputBeforeProviderEffect('steering_unavailable')) {
         await session.blockPendingMessageDelivery?.({
-          localIds,
-          reason: 'steering_unavailable',
-          providerEffect: 'none',
+          localIds: message.localId ? [message.localId] : [],
+          reason: 'steering_unavailable', providerEffect: 'none',
         });
       }
       return;
     }
     const queueDeliveryOptions = {
-      ...(pendingProviderAction ? { pendingProviderAction } : {}),
+      ...(pendingProviderAction ? { pendingProviderAction: pendingProviderAction === 'steer' ? 'send' as const : pendingProviderAction } : {}),
+      ...(deliveryInfo?.pendingRequestedAction ? { pendingRequestedAction: deliveryInfo.pendingRequestedAction } : {}),
       userMessageLocalId: message.localId ?? null,
       providerAcceptancePending: deliveryInfo?.providerAcceptancePending === true,
     };
@@ -797,6 +798,9 @@ export async function runGemini(opts: {
 	        shouldAttemptPendingMaterialization: () => session.shouldAttemptPendingMaterialization?.() ?? true,
 	        reconcilePendingQueueState: (reconcileOpts) => session.reconcilePendingQueueState?.(reconcileOpts),
 	        waitForPendingEligibilityUpdate: (signal) => session.waitForPendingEligibilityUpdate(signal),
+	        ...(typeof session.waitForMetadataUpdate === 'function'
+	          ? { waitForMetadataUpdate: (signal?: AbortSignal) => session.waitForMetadataUpdate(signal) }
+	          : {}),
 	      },
 	      pendingDrainMaxPopPerWake: pendingQueueDrainMaxPopPerWake,
 	      resolvePendingQueueDeliveryTiming: () => resolveSessionPendingQueueDeliveryTiming(
@@ -1093,8 +1097,6 @@ export async function runGemini(opts: {
           shouldPrependAppendSystemPromptOnNextFreshSessionPrompt = builtPrompt.nextIsFirstMessage;
         }
 
-        logger.debug(formatGeminiPromptDebugSummary(promptToSend));
-
         const dispatchOutcome = await inputConsumer.runProviderInputDispatch({
           abortSignal: abortController.signal,
           dispatch: async () => {
@@ -1108,10 +1110,15 @@ export async function runGemini(opts: {
               prompt: promptToSend,
               messageBuffer,
               session,
-              onDebug: (msg) => logger.debug(msg),
+              onDebug: (msg, diagnostic) => {
+                if (diagnostic) {
+                  logger.debug(msg, diagnostic);
+                  return;
+                }
+                logger.debug(msg);
+              },
               maxRetries: 3,
               retryDelayMs: 2_000,
-              waitForResponseTimeoutMs: 120_000,
               onProviderPromptAccepted: confirmProviderAccepted,
               onProviderPromptAttemptStarted: () => {
                 didBeginProviderPromptAttempt = true;

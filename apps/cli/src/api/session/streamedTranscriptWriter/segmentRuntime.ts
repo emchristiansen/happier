@@ -3,6 +3,12 @@ import type { LiveDeliveryState } from './liveDeliveryState';
 import type { SessionTranscriptObservationProvenanceV1 } from '@happier-dev/protocol';
 import type { SessionMessageCommitResult } from '../sessionMessageCommitResult';
 
+export type DurableCommitFailureIncident = {
+  firstError: Record<string, unknown>;
+  count: number;
+  suppressedCount: number;
+};
+
 export type StreamedTranscriptSegmentState = 'streaming' | 'complete' | 'interrupted';
 
 export type StreamedTranscriptSegmentRuntime = {
@@ -24,6 +30,8 @@ export type StreamedTranscriptSegmentRuntime = {
   lastCommitFailedAtMs: number;
   lastCommitError: unknown | null;
   lastCommitResult: SessionMessageCommitResult | null;
+  durableCommitFailure: DurableCommitFailureIncident | null;
+  durableRetryNotBeforeMs: number;
   liveDelivery: LiveDeliveryState;
   additionalMeta: Record<string, unknown>;
   provenance?: SessionTranscriptObservationProvenanceV1;

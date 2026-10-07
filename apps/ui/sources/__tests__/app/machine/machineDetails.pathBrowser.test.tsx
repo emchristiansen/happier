@@ -31,6 +31,7 @@ const mockState = vi.hoisted(() => ({
     openMachinePathBrowserModalMock: vi.fn<(params: unknown) => Promise<string | null>>(async () => '/Users/test/project'),
     projectForSession: {} as Record<string, { key?: { machineId?: string; path?: string } } | null>,
     sessionsState: [] as Array<unknown>,
+    settingsState: {} as Record<string, unknown>,
 }));
 
 installMachineDetailsCommonModuleMocks({
@@ -50,7 +51,7 @@ installMachineDetailsCommonModuleMocks({
             },
             useSetting: () => false,
             useSettingMutable: () => [null, vi.fn()],
-            useSettings: () => ({}),
+            useSettings: () => mockState.settingsState,
         });
     },
 });
@@ -139,7 +140,6 @@ vi.mock('@/utils/path/pathUtils', () => ({
         return `${homeDir}/${trimmed}`;
     },
 }));
-vi.mock('@/sync/domains/settings/terminalSettings', () => ({ resolveTerminalSpawnOptions: () => ({}) }));
 vi.mock('@/sync/domains/session/spawn/windowsRemoteSessionConsole', () => ({ resolveWindowsRemoteSessionConsoleFromMachineMetadata: () => 'visible' }));
 vi.mock('@/sync/domains/session/spawn/windowsRemoteSessionLaunchMode', () => ({
     readMachineWindowsRemoteSessionLaunchMode: () => undefined,
@@ -151,9 +151,6 @@ vi.mock('@/agents/catalog/catalog', () => ({
     DEFAULT_AGENT_ID: 'codex',
     getAgentCore: () => ({ cli: { detectKey: 'codex' } }),
     isAgentId: () => true,
-}));
-vi.mock('@/components/ui/forms/dropdown/DropdownMenu', () => ({
-    DropdownMenu: () => null,
 }));
 vi.mock('@/sync/domains/session/spawn/windowsRemoteSessionLaunchModeOptions', () => ({
     WINDOWS_REMOTE_SESSION_LAUNCH_MODE_OPTIONS: [],
@@ -178,6 +175,9 @@ vi.mock('@/sync/ops/sessionMachineTarget', async (importOriginal) => {
     };
 });
 
+// Module preparation belongs to collection, not the interaction's per-test budget.
+const { default: PreparedMachineDetailScreen } = await import('@/app/(app)/machine/[id]');
+
 describe('MachineDetailScreen path browser', () => {
     beforeEach(() => {
         mockState.openMachinePathBrowserModalMock.mockClear();
@@ -189,6 +189,31 @@ describe('MachineDetailScreen path browser', () => {
             'machine-1': createMachineRecord(),
         };
         mockState.projectForSession = {};
+        mockState.settingsState = {};
+    });
+
+    it('shows the preserved additive host choice when an older UI removed the legacy tmux override', async () => {
+        const { settingsDefaults } = await import('@/sync/domains/settings/settings');
+        mockState.settingsState = {
+            ...settingsDefaults,
+            sessionTerminalHostByMachineId: { 'machine-1': 'herdr' },
+            sessionTmuxByMachineId: {},
+        };
+        const { default: MachineDetailScreen } = await import('@/app/(app)/machine/[id]');
+        const { DropdownMenu } = await import('@/components/ui/forms/dropdown/DropdownMenu');
+        const screen = await renderScreen(React.createElement(MachineDetailScreen));
+        expect(screen.findAllByType(DropdownMenu).some((menu) => menu.props.selectedId === 'herdr')).toBe(true);
+    });
+
+    it('shows the effective account terminal host when no machine override exists', async () => {
+        const { settingsDefaults } = await import('@/sync/domains/settings/settings');
+        mockState.settingsState = { ...settingsDefaults, sessionTerminalHost: 'herdr' };
+        const screen = await renderScreen(React.createElement(PreparedMachineDetailScreen));
+        const row = screen.findByTestId('machine-terminal-effective-host');
+        expect(row).not.toBeNull();
+        if (!row) throw new Error('Expected the inherited terminal-host summary');
+        expect(row.props.subtitle).toBe('Herdr');
+        expect(row.props.mode).toBe('info');
     });
 
     it('opens the shared path browser with the current absolute path preselected and writes the chosen folder relative to the machine home', async () => {

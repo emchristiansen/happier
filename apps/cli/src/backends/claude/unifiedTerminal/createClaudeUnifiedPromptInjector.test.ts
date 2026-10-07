@@ -3,6 +3,36 @@ import { describe, expect, it, vi } from 'vitest';
 import { createClaudeUnifiedPromptInjector } from './createClaudeUnifiedPromptInjector';
 
 describe('createClaudeUnifiedPromptInjector', () => {
+  it('maps the internal goal-control origin onto the terminal RPC transport origin', async () => {
+    const injectUserPrompt = vi.fn().mockResolvedValue({
+      status: 'injected',
+      at: 123,
+      bytesWritten: 11,
+    });
+    const injector = createClaudeUnifiedPromptInjector({
+      inputInjection: {
+        hostKind: 'tmux',
+        injectUserPrompt,
+      },
+      createNonce: () => 'goal-nonce',
+    });
+
+    await expect(
+      injector.injectPrompt({
+        message: '/goal clear',
+        origin: { kind: 'goal_control' },
+      }),
+    ).resolves.toMatchObject({ status: 'injected' });
+
+    expect(injectUserPrompt).toHaveBeenCalledWith(expect.objectContaining({
+      origin: {
+        kind: 'rpc',
+        clientId: undefined,
+        nonce: 'goal-nonce',
+      },
+    }));
+  });
+
   it('injects Claude multiline prompts without bracketed paste markers', async () => {
     const injectUserPrompt = vi.fn().mockResolvedValue({
       status: 'injected',

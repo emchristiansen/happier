@@ -92,6 +92,17 @@ function writePhysicalScroll(element: HTMLElement, top: number): void {
     if (element.scrollTop !== previousTop) element.dispatchEvent(new Event('scroll'));
 }
 
+function deliverBrowserScrollEventsAsynchronously(): void {
+    const dispatchEvent = HTMLElement.prototype.dispatchEvent;
+    vi.spyOn(HTMLElement.prototype, 'dispatchEvent').mockImplementation(function (this: HTMLElement, event: Event) {
+        if (event.type !== 'scroll') return dispatchEvent.call(this, event);
+        // Browser scroll events follow the physical write; they are not dispatched
+        // synchronously from scrollTo/scrollBy as in the default geometry harness.
+        setTimeout(() => dispatchEvent.call(this, event), 0);
+        return true;
+    });
+}
+
 function rows(count: number, prefix: string): Row[] {
     return Array.from({ length: count }, (_value, index) => ({
         height: index % 7 === 0 ? 420 : index % 3 === 0 ? 180 : 72,
@@ -195,6 +206,7 @@ function distanceFromLiveTail(element: HTMLElement): number {
 }
 
 type ReactFiberWithRef = Readonly<{
+    memoizedProps?: Readonly<{ value?: unknown }>;
     ref?: unknown;
     return?: ReactFiberWithRef | null;
 }>;
@@ -855,6 +867,7 @@ describe('Legend transcript renderer real installed-package lifecycle', () => {
 
     it('lets each production-keyed Legend mount own cold initial-tail placement without adapter writes', async () => {
         const consoleError = vi.spyOn(console, 'error');
+        deliverBrowserScrollEventsAsynchronously();
         const Renderer = legendListRenderer.Component;
         const render = (data: readonly Row[], dataKey: string) => (
             <Renderer
@@ -893,6 +906,7 @@ describe('Legend transcript renderer real installed-package lifecycle', () => {
         expect(scrollElement.scrollTop).toBe(
             Math.max(0, scrollElement.scrollHeight - scrollElement.clientHeight),
         );
+        expect(readInstalledLegendState(scrollElement).scroll).toBe(scrollElement.scrollTop);
 
         physicalScrollWrites.length = 0;
         await act(async () => {
@@ -909,6 +923,19 @@ describe('Legend transcript renderer real installed-package lifecycle', () => {
         expect(switchBackWritesByOwner.filter((owner) => owner === 'imperative-index')).toHaveLength(0);
         expect(switchBackWritesByOwner.filter((owner) => owner === 'imperative-offset')).toHaveLength(0);
         expect(switchBackWritesByOwner.filter((owner) => owner === 'maintain')).toHaveLength(0);
+        const reopenedScrollElement = findScrollElement();
+        expect(readInstalledLegendState(reopenedScrollElement).scroll).toBe(reopenedScrollElement.scrollTop);
+
+        await act(async () => {
+            root.render(render(rows(80, 'cold').map((row, index) => (
+                index === 77 ? { ...row, height: 72 } : row
+            )), 'session-b'));
+        });
+        await flushLegendWork();
+
+        expect(distanceFromLiveTail(reopenedScrollElement)).toBeLessThanOrEqual(1);
+        expect(readInstalledLegendState(reopenedScrollElement).scroll).toBe(reopenedScrollElement.scrollTop);
+        expect(readInstalledLegendState(reopenedScrollElement).endBuffered).toBe(79);
         expect(
             consoleError.mock.calls.filter((args) => (
                 args.some((value) => String(value).includes('Cannot update a component'))
@@ -959,6 +986,110 @@ describe('Legend transcript renderer real installed-package lifecycle', () => {
                 .map(classifyLegendPhysicalWrite)
                 .filter((owner) => owner === 'imperative-index' || owner === 'imperative-offset'),
         ).toHaveLength(0);
+    });
+
+    it('retains the accepted physical viewport after late bootstrap geometry settles', async () => {
+        const listRef = React.createRef<LegendListRef>();
+        deliverBrowserScrollEventsAsynchronously();
+        const scheduledFrames: Array<Readonly<{
+            callback: FrameRequestCallback;
+            id: number;
+        }>> = [];
+        let nextFrameId = 1;
+        vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+            const id = nextFrameId++;
+            scheduledFrames.push({ callback, id });
+            return id;
+        });
+        vi.stubGlobal('cancelAnimationFrame', (id: number) => {
+            const index = scheduledFrames.findIndex((frame) => frame.id === id);
+            if (index >= 0) scheduledFrames.splice(index, 1);
+        });
+        let loaded = false;
+        let data = rows(80, 'bootstrap-settle');
+        const render = () => (
+            <div id="real-legend-host" style={{ height: viewportHeight }}>
+                <LegendList
+                    data={data}
+                    estimatedItemSize={120}
+                    initialScrollAtEnd
+                    keyExtractor={(item: Row) => item.id}
+                    ListFooterComponent={renderRow({ item: { height: 24, id: 'bootstrap-footer' } })}
+                    maintainScrollAtEnd={{
+                        animated: false,
+                        isMaintainingScrollAtEnd: () => true,
+                        on: { dataChange: true, footerLayout: true, itemLayout: true, layout: true },
+                    }}
+                    maintainVisibleContentPosition={{ data: true, size: true }}
+                    onLoad={() => { loaded = true; }}
+                    recycleItems={false}
+                    ref={listRef}
+                    renderItem={renderRow}
+                    style={{ flex: 1, minHeight: 0 }}
+                />
+            </div>
+        );
+        await act(async () => {
+            root.render(render());
+            flushResizeObservers();
+        });
+        for (let pass = 0; pass < 48 && physicalScrollWrites.length === 0; pass += 1) {
+            await act(async () => {
+                flushResizeObservers();
+                const frame = scheduledFrames.shift();
+                frame?.callback(Date.now());
+                await vi.advanceTimersByTimeAsync(1);
+            });
+        }
+        expect(physicalScrollWrites.length).toBeGreaterThan(0);
+        expect(loaded).toBe(false);
+        const readBootstrapState = () => {
+            const element = findScrollElement();
+            const fiberKey = Object.keys(element).find((key) => key.startsWith('__reactFiber$'))!;
+            let fiber = (element as unknown as Record<string, unknown>)[fiberKey] as ReactFiberWithRef | undefined;
+            while (fiber) {
+                const context = fiber.memoizedProps?.value as { state?: {
+                    scroll: number;
+                    initialScroll?: unknown;
+                    initialScrollSession?: { bootstrap?: { scroll: number; mountFrameCount: number } };
+                    didFinishInitialScroll?: boolean;
+                } } | undefined;
+                if (context?.state && typeof context.state.scroll === 'number') return context.state;
+                fiber = fiber.return ?? undefined;
+            }
+            throw new Error('Legend context not found');
+        };
+        // The cached window changes while the prior initial dispatch is still completing.
+        // A real viewport-layout delivery rearms the bootstrap for its new last-item target.
+        data = data.slice(0, -1);
+        await act(async () => {
+            root.render(render());
+        });
+        viewportHeight = 601;
+        await act(async () => {
+            flushResizeObservers();
+            await Promise.resolve();
+        });
+        expect(readBootstrapState().initialScrollSession?.bootstrap).toBeDefined();
+        await act(async () => {
+            await vi.advanceTimersByTimeAsync(100);
+        });
+        // Finish the old dispatch and all remaining real frames, including the rearmed
+        // bootstrap's watchdog. No user event is needed to reconcile the accepted viewport.
+        for (let pass = 0; pass < 64 && scheduledFrames.length > 0; pass += 1) {
+            await act(async () => {
+                scheduledFrames.shift()!.callback(Date.now());
+                flushResizeObservers();
+                await vi.advanceTimersByTimeAsync(100);
+            });
+        }
+        expect(scheduledFrames).toHaveLength(0);
+
+        const element = findScrollElement();
+        const state = listRef.current!.getState();
+        expect(distanceFromLiveTail(element)).toBeLessThanOrEqual(1);
+        expect(state.scroll).toBe(element.scrollTop);
+        expect(state.endBuffered).toBe(data.length - 1);
     });
 
     it('reserves anchored underfilled entry from Legend maintenance before keyed handoff', async () => {
@@ -2308,6 +2439,63 @@ describe('Legend transcript renderer real installed-package lifecycle', () => {
             })}`,
         ).toBeLessThanOrEqual(1);
         expect(directScrollTopWrites).toHaveLength(0);
+    });
+
+    it('lands the live tail after a detached entry reconciles offscreen row geometry', async () => {
+        const listRef = React.createRef<LegendListRef>();
+        deliverBrowserScrollEventsAsynchronously();
+        let isMaintainingScrollAtEnd = false;
+        let widthVersion = 'entry-width';
+        const data = Array.from({ length: 20 }, (_value, index): Row => ({
+            height: index === 10 ? 10_000 : 80,
+            id: `detached-tail-landing-${index}`,
+        }));
+
+        await act(async () => {
+            root.render(
+                <div id="real-legend-host" style={{ height: viewportHeight }}>
+                    <LegendList
+                        data={data}
+                        estimatedItemSize={120}
+                        getEstimatedItemSize={(item: Row) => item.height === 10_000 ? item.height : 120}
+                        getItemSizeVersion={() => widthVersion}
+                        keyExtractor={(item: Row) => item.id}
+                        maintainScrollAtEnd={{
+                            animated: false,
+                            isMaintainingScrollAtEnd: () => isMaintainingScrollAtEnd,
+                        }}
+                        maintainVisibleContentPosition={{ data: true, size: true }}
+                        recycleItems={false}
+                        ref={listRef}
+                        renderItem={renderRow}
+                        style={{ flex: 1, minHeight: 0 }}
+                    />
+                </div>,
+            );
+        });
+        await flushLegendWork();
+
+        expect(listRef.current!.getState().sizes.get(data[0]!.id)).toBe(80);
+        act(() => {
+            void listRef.current!.scrollToIndex({ index: 10, viewOffset: -5_000, animated: false });
+        });
+        await flushLegendWork();
+
+        const element = findScrollElement();
+        expect(distanceFromLiveTail(element)).toBeGreaterThan(viewportHeight);
+        // The live width becomes known after entry. Offscreen measurements still
+        // carry the previous width until Legend revisits them while settling the jump.
+        widthVersion = 'measured-width';
+        isMaintainingScrollAtEnd = true;
+        let landed = false;
+        act(() => {
+            void listRef.current!.scrollToEnd({ animated: false }).then(() => { landed = true; });
+        });
+        await flushLegendWork();
+
+        expect(landed).toBe(true);
+        expect(distanceFromLiveTail(element)).toBeLessThanOrEqual(1);
+        expect(listRef.current!.getState().scroll).toBe(element.scrollTop);
     });
 
     it('lands a semantic held-end scrollToEnd before its promise resolves', async () => {

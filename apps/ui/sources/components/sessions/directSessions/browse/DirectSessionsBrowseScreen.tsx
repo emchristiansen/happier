@@ -13,7 +13,7 @@ import { ItemList } from '@/components/ui/lists/ItemList';
 import { PopoverScope } from '@/components/ui/popover';
 import { Modal } from '@/modal';
 import { useAllMachines } from '@/sync/domains/state/storage';
-import { machineDirectSessionLinkEnsure } from '@/sync/ops/machineDirectSessions';
+import { machineDirectSessionCandidateDelete, machineDirectSessionLinkEnsure } from '@/sync/ops/machineDirectSessions';
 import { useProfile, useSettings } from '@/sync/store/hooks';
 import type { Theme } from '@/theme';
 import { t } from '@/text';
@@ -120,6 +120,7 @@ export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
         lockScope ? 'locked' : sourceOptions[0]?.key ?? null
     ));
     const [linkingSessionId, setLinkingSessionId] = React.useState<string | null>(null);
+    const [deletingSessionId, setDeletingSessionId] = React.useState<string | null>(null);
     const [searchQuery, setSearchQuery] = React.useState('');
     const [candidateSearchTerm, setCandidateSearchTerm] = React.useState('');
     const [machineMenuOpen, setMachineMenuOpen] = React.useState(false);
@@ -217,7 +218,9 @@ export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
         loadingMore,
         searchAugmenting,
         error,
+        canDeleteCandidates,
         loadMore,
+        removeCandidate,
     } = useDirectBrowseCandidates({
         machineId: effectiveSelectedMachineId,
         serverId: lockScope?.serverId ?? null,
@@ -225,6 +228,38 @@ export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
         source: selectedSource,
         searchTerm: candidateSearchTerm,
     });
+
+    const providerLabel = selectedProviderId
+        ? t(getAgentCore(selectedProviderId).displayNameKey)
+        : '';
+
+    const handleDeleteCandidate = React.useCallback(async (candidate: DirectBrowseCandidate) => {
+        if (!effectiveSelectedMachineId || !selectedProviderId || !selectedSource || deletingSessionId) return;
+        setDeletingSessionId(candidate.remoteSessionId);
+        try {
+            const request = {
+                machineId: effectiveSelectedMachineId,
+                providerId: selectedProviderId,
+                source: selectedSource,
+                remoteSessionId: candidate.remoteSessionId,
+            };
+            const result = lockScope?.serverId
+                ? await machineDirectSessionCandidateDelete(request, { serverId: lockScope.serverId })
+                : await machineDirectSessionCandidateDelete(request);
+            if (!result.ok) {
+                Modal.alert(t('common.error'), result.error);
+                return;
+            }
+            removeCandidate(candidate.remoteSessionId);
+        } catch (deleteError) {
+            Modal.alert(
+                t('common.error'),
+                deleteError instanceof Error ? deleteError.message : t('directSessions.deleteCandidateFailed'),
+            );
+        } finally {
+            setDeletingSessionId(null);
+        }
+    }, [deletingSessionId, effectiveSelectedMachineId, lockScope?.serverId, removeCandidate, selectedProviderId, selectedSource]);
 
     const handleOpenCandidate = React.useCallback(async (candidate: DirectBrowseCandidate) => {
         if (!effectiveSelectedMachineId || !selectedProviderId || !selectedSource) return;
@@ -373,9 +408,13 @@ export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
                     loadingMore={loadingMore}
                     searchAugmenting={searchAugmenting}
                     linkingSessionId={linkingSessionId}
+                    deletingSessionId={deletingSessionId}
+                    canDeleteCandidates={canDeleteCandidates}
+                    providerLabel={providerLabel}
                     searchQuery={searchQuery}
                     onSearchQueryChange={setSearchQuery}
                     onSelectCandidate={(candidate) => { void handleOpenCandidate(candidate); }}
+                    onDeleteCandidate={(candidate) => { void handleDeleteCandidate(candidate); }}
                     onLoadMore={() => { void loadMore(); }}
                 />
             </ItemList>

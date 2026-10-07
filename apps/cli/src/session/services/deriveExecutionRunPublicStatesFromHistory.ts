@@ -2,6 +2,8 @@ import { AGENT_IDS } from '@happier-dev/agents';
 import {
     ExecutionRunPublicStateSchema,
     ExecutionRunLaunchOriginSchema,
+    ExecutionRunRequestedConfigurationSchema,
+    type ExecutionRunRequestedConfiguration,
     type ExecutionRunLaunchOrigin,
     type ExecutionRunPublicState,
 } from '@happier-dev/protocol';
@@ -16,6 +18,7 @@ type TranscriptExecutionRunState = Readonly<{
     backendTarget: Record<string, unknown> | null;
     displayTitle: string | null;
     launchOrigin: ExecutionRunLaunchOrigin | null;
+    requestedConfiguration: ExecutionRunRequestedConfiguration | null;
     permissionMode: string | null;
     retentionPolicy: string | null;
     runClass: string | null;
@@ -43,6 +46,11 @@ function readNumber(record: Record<string, unknown> | null, key: string): number
 
 function readLaunchOrigin(record: Record<string, unknown> | null): ExecutionRunLaunchOrigin | null {
     const parsed = ExecutionRunLaunchOriginSchema.safeParse(record?.launchOrigin);
+    return parsed.success ? parsed.data : null;
+}
+
+function readRequestedConfiguration(record: Record<string, unknown> | null): ExecutionRunRequestedConfiguration | null {
+    const parsed = ExecutionRunRequestedConfigurationSchema.safeParse(record?.requestedConfiguration);
     return parsed.success ? parsed.data : null;
 }
 
@@ -110,6 +118,7 @@ function toExecutionRunPublicState(state: TranscriptExecutionRunState): Executio
         backendTarget: state.backendTarget,
         ...(state.displayTitle ? { display: { title: state.displayTitle } } : {}),
         ...(state.launchOrigin ? { launchOrigin: state.launchOrigin } : {}),
+        ...(state.requestedConfiguration ? { requestedConfiguration: state.requestedConfiguration } : {}),
         permissionMode: state.permissionMode ?? 'unknown',
         retentionPolicy,
         runClass,
@@ -152,6 +161,11 @@ export function listExecutionRunPublicStatesFromHistoryRows(rows: readonly RawHi
             backendTarget: readBackendTarget(input, output) ?? current?.backendTarget ?? null,
             displayTitle: readString(input, 'label') ?? readString(output, 'label') ?? current?.displayTitle ?? null,
             launchOrigin: readLaunchOrigin(input) ?? readLaunchOrigin(output) ?? current?.launchOrigin ?? null,
+            requestedConfiguration:
+                readRequestedConfiguration(input)
+                ?? readRequestedConfiguration(output)
+                ?? current?.requestedConfiguration
+                ?? null,
             permissionMode: readString(input, 'permissionMode') ?? readString(output, 'permissionMode') ?? current?.permissionMode ?? null,
             retentionPolicy: readString(input, 'retentionPolicy') ?? readString(output, 'retentionPolicy') ?? current?.retentionPolicy ?? null,
             runClass: readString(input, 'runClass') ?? readString(output, 'runClass') ?? current?.runClass ?? null,

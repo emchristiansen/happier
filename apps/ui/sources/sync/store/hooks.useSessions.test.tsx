@@ -3,7 +3,7 @@ import { act } from 'react-test-renderer';
 
 import { flushHookEffects, renderHook, standardCleanup } from '@/dev/testkit';
 
-import { useSessionListViewData, useSessionListViewDataByServerId, useSessionRecentPathEntries, useSessions, useSessionsReady } from '@/sync/domains/state/storage';
+import { useAllSessionListRenderables, useAllSessions, useSessionListViewData, useSessionListViewDataByServerId, useSessionRecentPathEntries, useSessions, useSessionsReady } from '@/sync/domains/state/storage';
 import { storage } from '@/sync/domains/state/storageStore';
 import { projectManager } from '@/sync/runtime/orchestration/projectManager';
 import { decodeSessionRecentPathEntry } from '@/utils/sessions/recentPathEntries';
@@ -34,6 +34,83 @@ afterEach(() => {
 });
 
 describe('useSessions', () => {
+    it('reuses sorted all-session projections without walking unchanged records on unrelated store writes', async () => {
+        const previousState = storage.getState();
+        const originalObjectValues = Object.values.bind(Object);
+        let sessionRecordTraversals = 0;
+        let renderableRecordTraversals = 0;
+        try {
+            const session: Session = {
+                id: 'all-sessions-stable',
+                seq: 1,
+                createdAt: 1,
+                updatedAt: 2,
+                active: true,
+                activeAt: 2,
+                archivedAt: null,
+                metadata: { path: '/repo', host: 'localhost', machineId: 'm-1' },
+                metadataVersion: 1,
+                agentState: null,
+                agentStateVersion: 0,
+                thinking: false,
+                thinkingAt: 0,
+                presence: 'online',
+            };
+            const sessions = { [session.id]: session };
+            const renderable = {
+                id: session.id,
+                seq: session.seq,
+                createdAt: session.createdAt,
+                updatedAt: session.updatedAt,
+                active: session.active,
+                activeAt: session.activeAt,
+                archivedAt: session.archivedAt,
+                metadata: session.metadata,
+                metadataVersion: session.metadataVersion,
+                agentStateVersion: session.agentStateVersion,
+                thinking: session.thinking,
+                thinkingAt: session.thinkingAt,
+                presence: session.presence,
+            };
+            const renderables = { [session.id]: renderable };
+            storage.setState((state) => ({
+                ...state,
+                isDataReady: true,
+                sessions,
+                sessionListRenderables: renderables,
+            }));
+            const valuesSpy = vi.spyOn(Object, 'values').mockImplementation(((value: object) => {
+                if (value === sessions) sessionRecordTraversals += 1;
+                if (value === renderables) renderableRecordTraversals += 1;
+                return originalObjectValues(value);
+            }) as typeof Object.values);
+
+            const hook = await renderHook(() => ({
+                sessions: useAllSessions(),
+                renderables: useAllSessionListRenderables(),
+            }), { flushOptions: { cycles: 1, turns: 4 } });
+            const first = hook.getCurrent();
+            expect(first.sessions).toEqual([session]);
+            expect(first.renderables).toEqual([renderable]);
+            sessionRecordTraversals = 0;
+            renderableRecordTraversals = 0;
+
+            act(() => {
+                storage.setState((state) => ({ ...state }));
+            });
+
+            expect(hook.getCurrent().sessions).toBe(first.sessions);
+            expect(hook.getCurrent().renderables).toBe(first.renderables);
+            expect(sessionRecordTraversals).toBe(0);
+            expect(renderableRecordTraversals).toBe(0);
+
+            await hook.unmount();
+            valuesSpy.mockRestore();
+        } finally {
+            storage.setState(previousState);
+        }
+    });
+
     it('returns loaded sessions from the canonical sessions map when legacy sessionsData is absent', async () => {
         const previousState = storage.getState();
         try {
@@ -316,6 +393,61 @@ describe('useSessions', () => {
             expect(hook.getCurrent()).toBe(first);
             expect(renderCount).toBe(1);
 
+            await hook.unmount();
+        } finally {
+            storage.setState(previousState);
+        }
+    });
+
+    it('publishes placement freshness inputs without treating them as rendered row output', async () => {
+        const previousState = storage.getState();
+        try {
+            const now = Date.now();
+            const firstData: SessionListViewItem[] = [{
+                type: 'session',
+                section: 'active',
+                groupKey: 'server:server-a:active',
+                groupKind: 'active',
+                serverId: 'server-a',
+                session: {
+                    id: 's-freshness',
+                    seq: 1,
+                    createdAt: 10,
+                    updatedAt: 20,
+                    active: true,
+                    activeAt: now - 2_000,
+                    archivedAt: null,
+                    metadataVersion: 1,
+                    agentStateVersion: 1,
+                    metadata: { path: '/repo', host: 'localhost', machineId: 'm-1' },
+                    thinking: false,
+                    thinkingAt: 0,
+                    presence: 'online',
+                    latestTurnStatus: 'in_progress',
+                    latestTurnStatusObservedAt: now - 2_000,
+                },
+            }];
+            storage.setState((state) => ({ ...state, isDataReady: true, sessionListViewData: firstData }));
+            const hook = await renderHook(() => useSessionListViewData(), {
+                flushOptions: { cycles: 1, turns: 4 },
+            });
+            const first = hook.getCurrent();
+            const firstRow = firstData[0];
+            if (firstRow.type !== 'session') throw new Error('expected session test fixture');
+
+            await act(async () => {
+                storage.setState((state) => ({
+                    ...state,
+                    sessionListViewData: [{
+                        ...firstRow,
+                        session: { ...firstRow.session, activeAt: now - 1_000 },
+                    }],
+                }));
+            });
+
+            expect(hook.getCurrent()).not.toBe(first);
+            const currentRow = hook.getCurrent()?.[0];
+            expect(currentRow?.type === 'session' ? currentRow.session.activeAt : null).toBe(now - 1_000);
             await hook.unmount();
         } finally {
             storage.setState(previousState);

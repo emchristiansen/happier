@@ -28,4 +28,12 @@ describe('sessionMessages meta', () => {
       happierDeliveryIntentV1: '__future__',
     })).toBeNull();
   });
+
+  it('recognizes only the exact internal tool-answer delivery marker', () => {
+    expect(protocol.isSessionToolAnswerDeliveryMeta({
+      happier: { kind: protocol.SESSION_TOOL_ANSWER_DELIVERY_KIND, payload: { toolCallId: 'question-1' } },
+    })).toBe(true);
+    expect(protocol.isSessionToolAnswerDeliveryMeta({ happier: { kind: 'future-kind' } })).toBe(false);
+    expect(protocol.isSessionToolAnswerDeliveryMeta(null)).toBe(false);
+  });
 });

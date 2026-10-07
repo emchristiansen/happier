@@ -2,25 +2,10 @@ import { mkdir, open, readFile, stat, unlink } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 import { isOpenCodeServerPidAlive } from './openCodeServerProcessState';
-
-function resolveManagedServerStartTimeoutMsFromEnv(env: NodeJS.ProcessEnv): number {
-  const raw = typeof env.HAPPIER_OPENCODE_SERVER_START_TIMEOUT_MS === 'string'
-    ? env.HAPPIER_OPENCODE_SERVER_START_TIMEOUT_MS.trim()
-    : '';
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) return 30_000;
-  return Math.min(Math.floor(n), 120_000);
-}
+import { resolveOpenCodeManagedServerLockTimeoutMsFromEnv } from './openCodeManagedServerTimeouts';
 
 export function resolveOpenCodeServerLockTimeoutMsFromEnv(env: NodeJS.ProcessEnv): number {
-  const raw = typeof env.HAPPIER_OPENCODE_SERVER_LOCK_TIMEOUT_MS === 'string'
-    ? env.HAPPIER_OPENCODE_SERVER_LOCK_TIMEOUT_MS.trim()
-    : '';
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) {
-    return Math.max(20_000, Math.min(resolveManagedServerStartTimeoutMsFromEnv(env), 60_000));
-  }
-  return Math.min(Math.floor(n), 60_000);
+  return resolveOpenCodeManagedServerLockTimeoutMsFromEnv(env);
 }
 
 function resolveLockStaleAfterMsFromEnv(env: NodeJS.ProcessEnv): number {

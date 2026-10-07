@@ -1,0 +1,96 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import type { AgentBackend, SessionId } from '@/agent/core';
+
+const { createAcpBackend } = vi.hoisted(() => ({ createAcpBackend: vi.fn() }));
+
+vi.mock('@/agent/acp/createAcpBackend', () => ({ createAcpBackend }));
+vi.mock('@/runtime/managedTools/requireProviderCliLaunchSpec', () => ({
+  requireProviderCliLaunchSpec: () => ({ command: '/usr/local/bin/devin', args: [] }),
+}));
+
+import { createCatalogDefinedAcpBackend } from './createCatalogDefinedAcpBackend';
+
+function createBackend(): AgentBackend & { setSessionMode: ReturnType<typeof vi.fn> } {
+  return {
+    startSession: vi.fn(async () => ({ sessionId: 'started' as SessionId })),
+    loadSession: vi.fn(async (sessionId: SessionId) => ({ sessionId })),
+    sendPrompt: vi.fn(async () => {}),
+    cancel: vi.fn(async () => {}),
+    onMessage: vi.fn(),
+    dispose: vi.fn(async () => {}),
+    setSessionMode: vi.fn(async () => {}),
+  };
+}
+
+describe('createCatalogDefinedAcpBackend (Devin)', () => {
+  beforeEach(() => {
+    createAcpBackend.mockReset();
+  });
+
+  it('does not force a Devin permission mode for Happier default', async () => {
+    const backend = createBackend();
+    createAcpBackend.mockReturnValue(backend);
+
+    const created = createCatalogDefinedAcpBackend('devin' as never, {
+      cwd: '/workspace',
+      permissionMode: 'default',
+      mcpServers: { happier: { command: 'happier-mcp' } },
+    });
+
+    await created.startSession();
+
+    expect(backend.setSessionMode).not.toHaveBeenCalled();
+    expect(createAcpBackend).toHaveBeenCalledWith(expect.objectContaining({ mcpServers: undefined }));
+  });
+
+  it('forwards provider-owned process launch preparation to the ACP backend', () => {
+    const backend = createBackend();
+    const prepareProcessLaunch = vi.fn(async () => ({ env: { XDG_CONFIG_HOME: '/tmp/devin' } }));
+    createAcpBackend.mockReturnValue(backend);
+
+    createCatalogDefinedAcpBackend('devin' as never, {
+      cwd: '/workspace',
+      prepareProcessLaunch,
+    });
+
+    expect(createAcpBackend).toHaveBeenCalledWith(expect.objectContaining({ prepareProcessLaunch }));
+  });
+
+  it.each([
+    ['read-only', 'normal'],
+    ['safe-yolo', 'accept-edits'],
+    ['yolo', 'dangerous'],
+    ['plan', null],
+  ] as const)('applies explicit Happier mode %s as Devin ACP mode %s before returning', async (permissionMode, devinMode) => {
+    const backend = createBackend();
+    createAcpBackend.mockReturnValue(backend);
+
+    const created = createCatalogDefinedAcpBackend('devin' as never, {
+      cwd: '/workspace',
+      permissionMode,
+    });
+
+    await created.startSession();
+
+    if (devinMode === null) {
+      expect(backend.setSessionMode).not.toHaveBeenCalled();
+    } else {
+      expect(backend.setSessionMode).toHaveBeenCalledWith('started', devinMode);
+    }
+  });
+
+  it('reapplies the explicit Devin mode after loading a vendor session', async () => {
+    const backend = createBackend();
+    createAcpBackend.mockReturnValue(backend);
+
+    const created = createCatalogDefinedAcpBackend('devin' as never, {
+      cwd: '/workspace',
+      permissionMode: 'read-only',
+    });
+
+    await created.loadSession?.('resumed' as SessionId);
+
+    expect(backend.setSessionMode).toHaveBeenCalledWith('resumed', 'normal');
+  });
+});

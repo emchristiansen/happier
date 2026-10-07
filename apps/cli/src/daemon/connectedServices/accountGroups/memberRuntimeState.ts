@@ -3,7 +3,10 @@ import type {
   ConnectedServiceAuthGroupV1,
   ConnectedServiceId,
 } from '@happier-dev/protocol';
-import { clearConnectedServiceAuthGroupMemberRuntimeBlockers } from '@happier-dev/protocol';
+import {
+  clearConnectedServiceAuthGroupMemberRuntimeBlockers,
+  compareConnectedServiceQuotaObservationRecency,
+} from '@happier-dev/protocol';
 
 import { logger as defaultLogger } from '@/ui/logger';
 import { ConnectedServiceAuthGroupRuntimeStateRevisionConflictError } from '@/api/connectedServices/connectedServiceCredentialApi';
@@ -238,7 +241,12 @@ export function reconcileMemberRuntimeStateWithFreshQuotaEvidence(params: Readon
   const state = params.state;
   const quotaSnapshot = params.quotaSnapshot;
   const lastObservedAtMs = numberOrNull(state?.lastObservedAtMs);
-  if (!state || !quotaSnapshot || (lastObservedAtMs !== null && quotaSnapshot.capturedAtMs <= lastObservedAtMs)) return state;
+  if (!state || !quotaSnapshot) return state;
+  if (lastObservedAtMs !== null && compareConnectedServiceQuotaObservationRecency({
+    existingObservedAtMs: lastObservedAtMs,
+    incomingObservedAtMs: quotaSnapshot.capturedAtMs,
+    nowMs: params.nowMs,
+  }) !== 'incoming_newer') return state;
   if (quotaSnapshot.planUnavailable || resolveSnapshotEligibilityBlocker(quotaSnapshot, params.nowMs)) return state;
 
   let changed = false;
@@ -313,11 +321,19 @@ function resolveAuthFailureRetryAtMs(input: Readonly<{
   return cooldownMs === null ? null : input.observedAtMs + cooldownMs;
 }
 
+export const CONNECTED_SERVICE_MODEL_ENTITLEMENT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+function resolvePlanInvalidRetryAtMs(retryAtMs: number | null, observedAtMs: number): number {
+  return Math.max(retryAtMs ?? 0, observedAtMs + CONNECTED_SERVICE_MODEL_ENTITLEMENT_COOLDOWN_MS);
+}
+
 export function buildObservedFailureMemberRuntimeState(input: Readonly<{
   existing: ConnectedServiceAuthGroupMemberRuntimeState | null;
   policy: ConnectedServiceAuthGroupPolicyV1;
   reason: string;
   limitCategory?: string | null;
+  quotaScope?: string | null;
+  providerLimitId?: string | null;
   retryAtMs: number | null;
   planType: string | null | undefined;
   observedAtMs: number;
@@ -331,19 +347,36 @@ export function buildObservedFailureMemberRuntimeState(input: Readonly<{
     ...(existing.capacityLimitedUntilMs === undefined ? {} : { capacityLimitedUntilMs: existing.capacityLimitedUntilMs }),
     ...(existing.authInvalidUntilMs === undefined ? {} : { authInvalidUntilMs: existing.authInvalidUntilMs }),
     ...(existing.planUnavailableUntilMs === undefined ? {} : { planUnavailableUntilMs: existing.planUnavailableUntilMs }),
+    ...(existing.modelUnavailableUntilMsByModelId === undefined ? {} : { modelUnavailableUntilMsByModelId: existing.modelUnavailableUntilMsByModelId }),
     ...(existing.validationBlockedUntilMs === undefined ? {} : { validationBlockedUntilMs: existing.validationBlockedUntilMs }),
+    ...(existing.autoDisabledReason === undefined ? {} : { autoDisabledReason: existing.autoDisabledReason }),
+    ...(existing.lastFailureCode === undefined ? {} : { lastFailureCode: existing.lastFailureCode }),
     lastFailureKind: input.reason,
     lastObservedAtMs: input.observedAtMs,
     ...(input.planType ? { lastObservedPlanType: input.planType } : {}),
   };
+  const providerLimitId = input.providerLimitId?.trim();
+  if (
+    input.limitCategory === 'plan_invalid'
+    && input.quotaScope === 'model'
+    && providerLimitId
+  ) {
+    return {
+      ...state,
+      lastFailureCode: 'model_not_entitled',
+      modelUnavailableUntilMsByModelId: {
+        ...existing.modelUnavailableUntilMsByModelId,
+        [providerLimitId]: resolvePlanInvalidRetryAtMs(input.retryAtMs, input.observedAtMs),
+      },
+      ...(input.policy.autoDisablePlanInvalidAccounts === true
+        ? { autoDisabledReason: 'model_not_entitled' as const }
+        : {}),
+    };
+  }
   if (input.reason === 'permission_denied' && input.limitCategory === 'plan_invalid') {
     return {
       ...state,
-      planUnavailableUntilMs: resolveAuthFailureRetryAtMs({
-        policy: input.policy,
-        retryAtMs: input.retryAtMs,
-        observedAtMs: input.observedAtMs,
-      }),
+      planUnavailableUntilMs: resolvePlanInvalidRetryAtMs(input.retryAtMs, input.observedAtMs),
     };
   }
   switch (input.reason) {
@@ -367,7 +400,7 @@ export function buildObservedFailureMemberRuntimeState(input: Readonly<{
         }),
       };
     case 'plan':
-      return { ...state, planUnavailableUntilMs: input.retryAtMs };
+      return { ...state, planUnavailableUntilMs: resolvePlanInvalidRetryAtMs(input.retryAtMs, input.observedAtMs) };
     case 'validation':
       return { ...state, validationBlockedUntilMs: input.retryAtMs };
     default:

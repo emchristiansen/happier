@@ -478,7 +478,7 @@ describe('handleNewMessageSocketUpdate', () => {
         expect(onMessageGapDetected).not.toHaveBeenCalled();
     });
 
-    it('does not trigger catch-up when previous materialized seq is unknown (0)', async () => {
+    it('triggers catch-up from zero when an already-loaded empty transcript receives a later row', async () => {
         const { params, onMessageGapDetected } = buildHarness({
             updateData: buildUpdate({ sid: 's1', messageId: 'm5', messageSeq: 5 }),
             getSessionMaterializedMaxSeq: () => 0,
@@ -487,7 +487,7 @@ describe('handleNewMessageSocketUpdate', () => {
 
         await handleNewMessageSocketUpdate(params);
 
-        expect(onMessageGapDetected).not.toHaveBeenCalled();
+        expect(onMessageGapDetected).toHaveBeenCalledWith('s1', { prevMaterializedMaxSeq: 0, messageSeq: 5 });
     });
 
     it('falls back to invalidate messages when decryption fails for a loaded transcript', async () => {

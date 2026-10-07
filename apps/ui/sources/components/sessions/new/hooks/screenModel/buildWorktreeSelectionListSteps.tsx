@@ -433,6 +433,9 @@ export function buildWorktreeBranchOption(params: Readonly<{
 
 function buildBranchesResolver(params: WorktreeSelectionListBuilderParams, opts: Readonly<{ includeRemotes: boolean }>) {
     const remoteNames = resolveRemoteNamesFromSnapshot(params.snapshot);
+    const mainWorktreeBranch = params.snapshot?.repo.worktrees
+        ?.find((worktree) => worktree.isMain === true)
+        ?.branch ?? null;
     return async (_seed: string, _abortSignal: AbortSignal): Promise<SelectionListDynamicSectionResolveResult> => {
         if (params.machineId === null || params.machinePath === null) {
             return { options: [] };
@@ -442,9 +445,22 @@ function buildBranchesResolver(params: WorktreeSelectionListBuilderParams, opts:
             path: params.machinePath,
             includeRemotes: opts.includeRemotes,
         });
+        const matchingBranches = branches
+            .filter((branch) => (opts.includeRemotes ? branch.type === 'remote' : branch.type !== 'remote'));
+        const mainWorktreeBranches: ScmBranchListEntry[] = [];
+        const currentBranches: ScmBranchListEntry[] = [];
+        const remainingBranches: ScmBranchListEntry[] = [];
+        for (const branch of matchingBranches) {
+            if (branch.name === mainWorktreeBranch) {
+                mainWorktreeBranches.push(branch);
+            } else if (branch.isCurrent === true) {
+                currentBranches.push(branch);
+            } else {
+                remainingBranches.push(branch);
+            }
+        }
         return {
-            options: branches
-                .filter((branch) => (opts.includeRemotes ? branch.type === 'remote' : branch.type !== 'remote'))
+            options: [...mainWorktreeBranches, ...currentBranches, ...remainingBranches]
                 .map((branch) => buildWorktreeBranchOption({
                     branch,
                     snapshot: params.snapshot,

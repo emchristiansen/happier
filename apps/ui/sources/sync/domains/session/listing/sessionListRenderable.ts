@@ -170,6 +170,54 @@ export function deriveSessionListRenderableHasUnreadMessagesFromReadableSeq(
     });
 }
 
+export function deriveSessionListRenderableHasUnreadMessagesFromPatch(params: Readonly<{
+    renderable: SessionListRenderableSession;
+    patch: SessionListRenderablePatchFields;
+    explicitReadableSeq?: number | null;
+    recomputeUnread?: boolean;
+}>): boolean {
+    const { renderable, patch } = params;
+    if (
+        params.recomputeUnread !== true
+        && patch.metadata === undefined
+        && patch.lastViewedSessionSeq === undefined
+    ) {
+        return renderable.hasUnreadMessages === true;
+    }
+
+    const nextMetadata = patch.metadata === undefined ? renderable.metadata : patch.metadata;
+    const nextLastViewedSessionSeq = patch.lastViewedSessionSeq === undefined
+        ? renderable.lastViewedSessionSeq
+        : patch.lastViewedSessionSeq;
+    const projectedReadableSeq = resolveSessionReadableSeq({
+        messages: null,
+        sessionSeq: patch.seq ?? renderable.seq,
+        latestReadyEventSeq: patch.latestReadyEventSeq === undefined
+            ? renderable.latestReadyEventSeq
+            : patch.latestReadyEventSeq,
+        latestTurnStatus: patch.latestTurnStatus === undefined
+            ? renderable.latestTurnStatus
+            : patch.latestTurnStatus,
+        includeTerminalSessionSeq: true,
+    }) ?? 0;
+    const explicitReadableSeq = typeof params.explicitReadableSeq === 'number'
+        && Number.isFinite(params.explicitReadableSeq)
+        ? Math.max(0, Math.trunc(params.explicitReadableSeq))
+        : null;
+
+    return computeHasUnreadActivity({
+        sessionSeq: explicitReadableSeq === null
+            ? projectedReadableSeq
+            : Math.max(projectedReadableSeq, explicitReadableSeq),
+        pendingActivityAt: 0,
+        lastViewedSessionSeq: resolveLastViewedSessionSeq({
+            metadata: nextMetadata,
+            lastViewedSessionSeq: nextLastViewedSessionSeq,
+        }),
+        lastViewedPendingActivityAt: nextMetadata?.readStateV1?.pendingActivityAt,
+    });
+}
+
 /**
  * Work still open in this session — the same tally the session header's glyph, the composer chip
  * and the Agents tab badge read. One counter, one grouping rule, one description (R-8).
@@ -620,7 +668,7 @@ function isSessionRuntimeIssueV1(value: unknown): value is SessionRuntimeIssueV1
         && typeof issue.occurredAt === 'number';
 }
 
-function areSessionRuntimeIssuesEqual(
+export function areSessionRuntimeIssuesEqual(
     previous: SessionRuntimeIssueV1 | null,
     next: SessionRuntimeIssueV1 | null,
 ): boolean {
@@ -684,9 +732,30 @@ export function didSessionListRenderableEmbeddedListRowFieldsChange(
     // row-store overlays. Keep embedded list data structural/identity-focused
     // so live streaming does not republish the whole list array.
     if ((previous.metadataUnavailable === true) !== (next.metadataUnavailable === true)) return true;
-    if (!areSessionListRenderableMetadataEqual(previous.metadata, next.metadata)) return true;
+    if (!areSessionListRenderableEmbeddedRowMetadataEqual(previous.metadata, next.metadata)) return true;
 
     return false;
+}
+
+function areSessionListRenderableEmbeddedRowMetadataEqual(
+    previous: SessionListRenderableMetadata | null | undefined,
+    next: SessionListRenderableMetadata | null | undefined,
+): boolean {
+    if (previous === next) return true;
+    if (!previous || !next) return previous === next;
+    return (previous.name ?? null) === (next.name ?? null)
+        && (previous.summaryText ?? null) === (next.summaryText ?? null)
+        && previous.path === next.path
+        && (previous.homeDir ?? null) === (next.homeDir ?? null)
+        && (previous.host ?? null) === (next.host ?? null)
+        && (previous.machineId ?? null) === (next.machineId ?? null)
+        && (previous.flavor ?? null) === (next.flavor ?? null)
+        && (previous.directSessionV1?.v ?? null) === (next.directSessionV1?.v ?? null)
+        && (previous.directSessionV1?.providerId ?? null) === (next.directSessionV1?.providerId ?? null)
+        && (previous.readStateV1?.v ?? null) === (next.readStateV1?.v ?? null)
+        && (previous.readStateV1?.sessionSeq ?? null) === (next.readStateV1?.sessionSeq ?? null)
+        && (previous.readStateV1?.pendingActivityAt ?? null) === (next.readStateV1?.pendingActivityAt ?? null)
+        && (previous.hiddenSystemSession === true) === (next.hiddenSystemSession === true);
 }
 
 export function didSessionListRenderableAttentionPromotionFieldsChange(

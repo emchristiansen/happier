@@ -6,6 +6,15 @@ export type OpenCodePermissionValue = 'allow' | 'deny' | 'ask';
 
 const OPENCODE_READ_PERMISSIONS = ['read', 'glob', 'grep', 'list', 'ls'] as const;
 const OPENCODE_EDIT_PERMISSIONS = ['edit', 'write'] as const;
+export const OPENCODE_HAPPIER_MCP_ALWAYS_ALLOWED_TOOL_SUFFIXES = [
+  'change_title',
+  'session_title_set',
+  'action_execute',
+  'action_spec_search',
+  'action_spec_get',
+  'action_options_resolve',
+] as const;
+
 const OPENCODE_HAPPIER_ACTION_TOOL_NAME_ALIASES = [
   'action_execute',
   'happier_action_execute',

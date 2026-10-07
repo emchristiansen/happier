@@ -1,3 +1,4 @@
+import { UsageGaugeLabelsSettingsItem } from './UsageGaugeLabelsSettingsItem';
 import * as React from 'react';
 import { Platform, View } from 'react-native';
 import { useUnistyles } from 'react-native-unistyles';
@@ -377,6 +378,7 @@ export const SessionComposerSettingsView = React.memo(function SessionComposerSe
                     rightElement={<Switch value={alwaysShowContextSize} onValueChange={setAlwaysShowContextSize} />}
                     showChevron={false}
                 />
+                <UsageGaugeLabelsSettingsItem />
                 <Item
                     title={t('settingsAppearance.glass.composer')}
                     subtitle={t('settingsAppearance.glass.composerHint')}

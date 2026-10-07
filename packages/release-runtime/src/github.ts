@@ -2,12 +2,12 @@ import { requestJson } from './http.js';
 
 type FetchImpl = typeof fetch;
 
-function buildGitHubReleaseTagUrl(githubRepo: string, tag: string) {
+function buildGitHubReleaseTagUrl(githubRepo: string, tag: string, apiBaseUrl = 'https://api.github.com') {
   const repo = String(githubRepo ?? '').trim();
   const t = String(tag ?? '').trim();
   if (!repo) throw new Error('[github] githubRepo is required');
   if (!t) throw new Error('[github] tag is required');
-  return `https://api.github.com/repos/${repo}/releases/tags/${encodeURIComponent(t)}`;
+  return `${apiBaseUrl.replace(/\/$/, '')}/repos/${repo}/releases/tags/${encodeURIComponent(t)}`;
 }
 
 function buildGitHubLatestReleaseUrl(githubRepo: string) {
@@ -16,8 +16,8 @@ function buildGitHubLatestReleaseUrl(githubRepo: string) {
   return `https://api.github.com/repos/${repo}/releases/latest`;
 }
 
-function createHttpError(message: string, status: number) {
-  const err = new Error(message);
+function createHttpError(message: string, status: number, cause?: unknown) {
+  const err = new Error(message, { cause });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (err as any).status = status;
   return err;
@@ -49,21 +49,23 @@ function normalizeGitHubRequestError(params: Readonly<{
 }>): Error {
   const status = readHttpStatus(params.error) ?? 500;
   const message = params.error instanceof Error ? params.error.message : String(params.error);
-  return createHttpError(`${params.context}: ${message}`, status);
+  return createHttpError(`${params.context}: ${message}`, status, params.error);
 }
 
 export async function fetchGitHubReleaseByTag(params: Readonly<{
   githubRepo: string;
+  apiBaseUrl?: string;
   tag: string;
   userAgent?: string;
   githubToken?: string;
   fetchImpl?: FetchImpl;
   transientNotFoundAttempts?: number;
   retryDelayMs?: number;
+  signal?: AbortSignal;
 }>): Promise<unknown> {
   const userAgent = String(params.userAgent ?? '').trim() || 'happier-release-runtime';
   const token = String(params.githubToken ?? '').trim();
-  const url = buildGitHubReleaseTagUrl(params.githubRepo, params.tag);
+  const url = buildGitHubReleaseTagUrl(params.githubRepo, params.tag, params.apiBaseUrl);
   const headers: Record<string, string> = {
     'user-agent': userAgent,
     accept: 'application/vnd.github+json',
@@ -73,16 +75,18 @@ export async function fetchGitHubReleaseByTag(params: Readonly<{
   const attempts = Math.max(1, Math.floor(params.transientNotFoundAttempts ?? 3));
   const retryDelayMs = Math.max(0, Math.floor(params.retryDelayMs ?? 250));
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    params.signal?.throwIfAborted();
     try {
       if (params.fetchImpl) {
-        const response = await params.fetchImpl(url, { headers });
+        const response = await params.fetchImpl(url, { headers, signal: params.signal });
         if (!response.ok) {
           throw createHttpError(`[github] failed to resolve release tag ${params.tag} (${response.status})`, response.status);
         }
         return response.json();
       }
-      return await requestJson({ url, headers });
+      return await requestJson({ url, headers, signal: params.signal });
     } catch (error) {
+      params.signal?.throwIfAborted();
       const normalized = normalizeGitHubRequestError({
         context: `[github] failed to resolve release tag ${params.tag}`,
         error,

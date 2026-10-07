@@ -10,9 +10,9 @@ import {
 const field = <T,>(mutationId: string, value: T) => ({ mutationId, value });
 
 describe('readPendingMessageComposerSemanticDraftSnapshot', () => {
-    it('treats the repository canonical empty mentions array as an empty semantic draft', () => {
+    it('treats canonical default routing and empty mentions as semantically empty', () => {
         expect(isEmptyPendingMessageComposerSemanticDraftSnapshot({
-            recipient: undefined,
+            recipient: null,
             executionRunDelivery: undefined,
             structuredInputMentions: [],
         })).toBe(true);

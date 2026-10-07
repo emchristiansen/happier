@@ -141,7 +141,7 @@ describe('NewSessionDraftsSection', () => {
     it('does not delete or restore focus when launch custody begins while confirmation is open', async () => {
         let confirmDeletion!: (confirmed: boolean) => void;
         let deletionDisposition: 'deletable' | 'launch-custody' = 'deletable';
-        const deleteDraft = vi.fn(async () => undefined);
+        const deleteDraft = vi.fn(async () => true);
         const attempt = deleteNewSessionDraftAfterConfirmation({
             confirm: () => new Promise<boolean>((resolve) => {
                 confirmDeletion = resolve;
@@ -158,7 +158,7 @@ describe('NewSessionDraftsSection', () => {
     });
 
     it('does not issue another deletion or restore focus when the confirmed draft is already missing', async () => {
-        const deleteDraft = vi.fn(async () => undefined);
+        const deleteDraft = vi.fn(async () => true);
 
         await expect(deleteNewSessionDraftAfterConfirmation({
             confirm: async () => true,
@@ -166,6 +166,14 @@ describe('NewSessionDraftsSection', () => {
             deleteDraft,
         })).resolves.toBe(false);
         expect(deleteDraft).not.toHaveBeenCalled();
+    });
+
+    it('does not report deletion when the canonical draft owner cannot acknowledge the tombstone', async () => {
+        await expect(deleteNewSessionDraftAfterConfirmation({
+            confirm: async () => true,
+            readCurrentDraftDeletionDisposition: () => 'deletable',
+            deleteDraft: async () => false,
+        })).resolves.toBe(false);
     });
 
     it('renders a direct delete action and routes continue/delete by identity', async () => {

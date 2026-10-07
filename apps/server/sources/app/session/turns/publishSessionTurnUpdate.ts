@@ -25,6 +25,9 @@ export async function publishSessionTurnUpdate(params: {
 }): Promise<void> {
     if (!params.result.didApply) return;
     const skipSenderConnection = resolveSessionTurnUpdateSkipSenderConnection(params.connection);
+    const rollbackEligibleTurnStarts = "rollbackEligibleTurnStarts" in params.result
+        ? params.result.rollbackEligibleTurnStarts
+        : undefined;
     await Promise.all(params.result.participantCursors.map(async ({ accountId, cursor }) => {
         const payload = buildUpdateSessionUpdate(
             params.sessionId,
@@ -37,6 +40,9 @@ export async function publishSessionTurnUpdate(params: {
                 latestTurnStatus: params.result.latestTurnStatus,
                 latestTurnStatusObservedAt: params.result.latestTurnStatusObservedAt,
                 lastRuntimeIssue: params.result.lastRuntimeIssue,
+                ...(rollbackEligibleTurnStarts !== undefined
+                    ? { rollbackEligibleTurnStarts }
+                    : {}),
             },
         );
         eventRouter.emitUpdate({

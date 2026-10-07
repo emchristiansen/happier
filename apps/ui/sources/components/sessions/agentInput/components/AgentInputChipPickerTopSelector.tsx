@@ -23,7 +23,6 @@ export type AgentInputChipPickerTopSelectorProps = Readonly<{
     onFocusOption: (optionId: string) => void;
 }>;
 
-const PICKER_OPTION_SIZE = 36;
 const PICKER_OPTION_TOUCH_TARGET_SIZE = resolveAgentInputChipPickerOptionInteractiveTargetSize(Platform.OS);
 
 type WebHoverablePressableState = Readonly<{
@@ -111,7 +110,7 @@ const stylesheet = StyleSheet.create((theme) => ({
     },
     scrollContainer: {
         width: '100%',
-        minHeight: PICKER_OPTION_SIZE + 20,
+        minHeight: PICKER_OPTION_TOUCH_TARGET_SIZE + 20,
         backgroundColor: theme.colors.background.canvas,
     },
     scrollContent: {
@@ -122,8 +121,8 @@ const stylesheet = StyleSheet.create((theme) => ({
         paddingVertical: 10,
     },
     optionButton: {
-        width: PICKER_OPTION_SIZE,
-        height: PICKER_OPTION_SIZE,
+        width: PICKER_OPTION_TOUCH_TARGET_SIZE,
+        height: PICKER_OPTION_TOUCH_TARGET_SIZE,
         minWidth: PICKER_OPTION_TOUCH_TARGET_SIZE,
         minHeight: PICKER_OPTION_TOUCH_TARGET_SIZE,
         borderRadius: AGENT_INPUT_CHIP_PICKER_OPTION_ROW_RADIUS,

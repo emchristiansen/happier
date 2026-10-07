@@ -121,9 +121,15 @@ export async function handleAuthWait(argsRaw: string[]): Promise<void> {
         }
       : null;
   // If already authenticated, keep things idempotent (useful for scripts).
-  const existing = await readCredentials();
+  // `--replace-existing` skips only this early return so an authorized request
+  // is claimed and the ordinary pairing write + per-account machine id runs.
+  const replaceExisting = args.includes('--replace-existing');
+  const existing = replaceExisting ? null : await readCredentials();
   if (existing) {
     const { machineId } = await ensureMachineIdForCredentials(existing);
+    // This request is finished, whichever way it ended: drop its pending state — which holds the
+    // request's secret key and claim secret — exactly as the claiming paths below do.
+    await unlink(statePath).catch(() => {});
     await writeJsonStdout({
       success: true,
       token: existing.token,

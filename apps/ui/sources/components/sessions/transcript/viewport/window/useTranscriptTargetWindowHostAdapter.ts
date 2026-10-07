@@ -1,4 +1,5 @@
 import * as React from 'react';
+import type { SessionMessagesTailBoundary } from '@/sync/runtime/sessionMessagesTailDiscontinuity';
 
 import { applyTranscriptJumpResult } from '../jump/applyTranscriptJumpResult';
 import { resolveTranscriptJumpStrategy } from '../jump/resolveTranscriptJumpStrategy';
@@ -81,7 +82,8 @@ export function resolveTranscriptTargetWindowHostFacts<TItem extends TranscriptT
     isSeqLoaded?: (seq: number) => boolean;
     isSeqRangeLoaded?: (fromInclusive: number, toInclusive: number) => boolean;
     resolveSeq?: (item: TItem) => number | null | undefined;
-    tailContiguousFloorSeq?: number | null;
+    tailContiguousBoundary?: SessionMessagesTailBoundary | null;
+    resolveMessageIds?: (item: TItem) => readonly string[];
     windowState: TranscriptTargetWindowState;
 }>): TranscriptTargetWindowHostFacts<TItem> {
     const activeWindowState = params.windowState.isWindowMode ? params.windowState : null;
@@ -96,9 +98,7 @@ export function resolveTranscriptTargetWindowHostFacts<TItem extends TranscriptT
         : null;
     const tailFloorActive =
         activeWindowState === null &&
-        typeof params.tailContiguousFloorSeq === 'number' &&
-        Number.isFinite(params.tailContiguousFloorSeq) &&
-        params.tailContiguousFloorSeq > 0;
+        params.tailContiguousBoundary != null;
     const hasOmittedOlderSequenceItems = display
         ? hasOmittedSequenceItem({
             direction: 'older',
@@ -150,10 +150,11 @@ export function resolveTranscriptTargetWindowHostFacts<TItem extends TranscriptT
             older: olderGap,
         },
         hasMoreNewer: activeWindowState?.hasMoreNewer === true,
-        items: display?.items ?? boundTailItemsToContiguousFloor({
+        items: display?.items ?? boundTailItemsToContiguousBoundary({
             items: params.items,
             resolveSeq: params.resolveSeq,
-            tailContiguousFloorSeq: params.tailContiguousFloorSeq ?? null,
+            tailContiguousBoundary: params.tailContiguousBoundary ?? null,
+            resolveMessageIds: params.resolveMessageIds,
         }),
         targetWindowActive: activeWindowState !== null,
     };
@@ -164,7 +165,8 @@ export function resolveTranscriptTargetWindowHostFacts<TItem extends TranscriptT
  * catch-up gap tail-resets onto an existing loaded prefix, only content at or above the
  * floor is contiguous with the live tail. Tail display must not glue the stale prefix
  * onto the island; target-window display is unaffected (jumps below the floor render
- * through their own window). Rows without a seq are synthetic tail chrome and stay.
+ * through their own window). Opaque sources identify the island through materialized
+ * message IDs; absence of a seq is not evidence that a direct transcript row is chrome.
  *
  * The island opens at the first row at or above the floor and everything from there on is kept
  * whole. Decomposed item seqs are locally non-monotonic (a turn or tool group anchors on its
@@ -174,25 +176,29 @@ export function resolveTranscriptTargetWindowHostFacts<TItem extends TranscriptT
  * describe a hole punched below itself, so those rows were withheld with no affordance at all.
  * Only the stale prefix ahead of the island is still filtered, which is where the gap row is.
  */
-function boundTailItemsToContiguousFloor<TItem extends TranscriptTargetWindowDisplayItem>(params: Readonly<{
+function boundTailItemsToContiguousBoundary<TItem extends TranscriptTargetWindowDisplayItem>(params: Readonly<{
     items: readonly TItem[];
     resolveSeq?: (item: TItem) => number | null | undefined;
-    tailContiguousFloorSeq: number | null;
+    tailContiguousBoundary: SessionMessagesTailBoundary | null;
+    resolveMessageIds?: (item: TItem) => readonly string[];
 }>): readonly TItem[] {
-    const floorSeq = params.tailContiguousFloorSeq;
-    if (typeof floorSeq !== 'number' || !Number.isFinite(floorSeq) || floorSeq <= 0) return params.items;
+    const boundary = params.tailContiguousBoundary;
+    if (!boundary) return params.items;
     const resolveItemSeq = (item: TItem): number | null => {
         const rawSeq = params.resolveSeq ? params.resolveSeq(item) : item.seq;
         if (typeof rawSeq !== 'number' || !Number.isFinite(rawSeq) || rawSeq < 0) return null;
         return Math.trunc(rawSeq);
     };
+    const boundaryIds = new Set(boundary.kind === 'messageIds' ? boundary.messageIds : []);
+    const messageIdsForItem = (item: TItem) => params.resolveMessageIds?.(item) ?? [item.id];
     let islandStartIndex = params.items.length;
     for (let index = 0; index < params.items.length; index += 1) {
         const item = params.items[index];
         if (!item) continue;
-        // Rows without a seq are synthetic chrome: they never open the island.
-        const seq = resolveItemSeq(item);
-        if (seq !== null && seq >= floorSeq) {
+        const startsIsland = boundary.kind === 'seq'
+            ? (resolveItemSeq(item) ?? -1) >= boundary.seq
+            : messageIdsForItem(item).some((id) => boundaryIds.has(id));
+        if (startsIsland) {
             islandStartIndex = index;
             break;
         }
@@ -201,7 +207,7 @@ function boundTailItemsToContiguousFloor<TItem extends TranscriptTargetWindowDis
     // Ahead of the island: the stale prefix the floor exists to withhold, minus the synthetic
     // chrome that carries no seq of its own. From the island start: kept whole.
     const bounded = params.items.filter((item, index) => (
-        index >= islandStartIndex || resolveItemSeq(item) === null
+        index >= islandStartIndex || (boundary.kind === 'seq' ? resolveItemSeq(item) === null : messageIdsForItem(item).length === 0)
     ));
     return bounded.length === params.items.length ? params.items : bounded;
 }
@@ -210,14 +216,16 @@ export function useTranscriptTargetWindowHostAdapter<TItem extends TranscriptTar
     items: readonly TItem[];
     isSeqRangeLoaded?: (fromInclusive: number, toInclusive: number) => boolean;
     resolveSeq?: (item: TItem) => number | null | undefined;
-    tailContiguousFloorSeq?: number | null;
+    tailContiguousBoundary?: SessionMessagesTailBoundary | null;
+    resolveMessageIds?: (item: TItem) => readonly string[];
     windowState: TranscriptTargetWindowState;
 }>): TranscriptTargetWindowHostFacts<TItem> {
     return React.useMemo(() => resolveTranscriptTargetWindowHostFacts(params), [
         params.items,
         params.isSeqRangeLoaded,
         params.resolveSeq,
-        params.tailContiguousFloorSeq,
+        params.tailContiguousBoundary,
+        params.resolveMessageIds,
         params.windowState,
     ]);
 }

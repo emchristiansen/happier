@@ -19,6 +19,7 @@ import { buildEasBuildViewArgs } from './testflight-eas-cli-args.mjs';
 import { resolveExternalGroupSelections } from './testflight-group-resolution.mjs';
 import { readIosIpaMetadata } from './read-ios-ipa-metadata.mjs';
 import { ensureBetaReviewSubmission } from './testflight-beta-review.mjs';
+import { readTestflightBuildDetails } from './testflight-build-request.mjs';
 
 function fail(message) {
   console.error(message);
@@ -155,36 +156,6 @@ function loadExpoIosSubmitProfile({ repoRoot, submitProfile }) {
     );
   }
   return { ascAppId, ascApiKeyId, ascApiKeyIssuerId };
-}
-
-function normalizeBuildJsonPlatform(value) {
-  const platform = String(value ?? '').trim();
-  if (!platform) return '';
-  if (platform.toUpperCase() === 'IOS') return 'ios';
-  if (platform.toUpperCase() === 'ANDROID') return 'android';
-  return platform.toLowerCase();
-}
-
-function readBuildJsonDetails(buildJsonPath) {
-  const absolutePath = path.resolve(buildJsonPath);
-  if (!fs.existsSync(absolutePath)) fail(`--build-json path does not exist: ${absolutePath}`);
-  const parsed = JSON.parse(fs.readFileSync(absolutePath, 'utf8'));
-  const items = Array.isArray(parsed) ? parsed : [parsed];
-  for (const item of items) {
-    const id = String(item?.id ?? item?.buildId ?? '').trim();
-    const platform = normalizeBuildJsonPlatform(item?.platform);
-    const mode = String(item?.mode ?? '').trim().toLowerCase();
-    const artifactPath = String(item?.artifactPath ?? '').trim();
-    const buildNumber = String(item?.buildNumber ?? item?.appBuildVersion ?? item?.metadata?.buildNumber ?? '').trim();
-    const appVersion = String(item?.appVersion ?? item?.version ?? item?.metadata?.appVersion ?? '').trim();
-    if (id && (!platform || platform === 'ios')) {
-      return { easBuildId: id, artifactPath: '', buildNumber, appVersion };
-    }
-    if (mode === 'local' && (!platform || platform === 'ios')) {
-      return { easBuildId: '', artifactPath, buildNumber, appVersion };
-    }
-  }
-  fail(`Unable to resolve an iOS EAS build or local artifact from ${absolutePath}`);
 }
 
 function readEasBuildIdentity(buildPayload) {
@@ -477,7 +448,7 @@ async function main() {
   const buildJsonPath = String(values['build-json'] ?? '').trim();
   // Native-build dry-runs do not guarantee an output file. Ignore any pre-existing file too:
   // it may belong to an earlier build and must not decide whether this dry-run is valid.
-  const buildJsonDetails = buildJsonPath && !dryRun ? readBuildJsonDetails(buildJsonPath) : null;
+  const buildJsonDetails = buildJsonPath && !dryRun ? readTestflightBuildDetails({ buildJsonPath }) : null;
   const easBuildId = String(values['eas-build-id'] ?? '').trim() || String(buildJsonDetails?.easBuildId ?? '').trim();
   const artifactPath = String(buildJsonDetails?.artifactPath ?? '').trim();
   const easCliVersion =

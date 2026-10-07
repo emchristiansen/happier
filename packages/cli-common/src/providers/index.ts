@@ -1,11 +1,20 @@
 export type {
   InstallProviderCliResult,
+  ManagedInstallPromotionDeps,
   ProviderCliInstallCommand,
+  ProviderCliInstallIntent,
   ProviderCliInstallMode,
   ProviderCliInstallPlan,
   ProviderCliInstallPlanResult,
 } from './install.js';
-export { installProviderCli, planProviderCliInstall, resolvePlatformFromNodePlatform } from './install.js';
+export {
+  installProviderCli,
+  planProviderCliInstall,
+  promoteManagedInstallCandidate,
+  resolvePlatformFromNodePlatform,
+} from './install.js';
+export type { ProviderCliLatestVersionFacts, ProviderCliUpdateFacts } from './update.js';
+export { classifyProviderCliInstall, fetchProviderCliLatestVersion } from './update.js';
 export type {
   ProviderCliCommandResolution,
   ProviderCliResolutionSource,
@@ -18,6 +27,7 @@ export {
   readProviderCliOverride,
   resolveHomeDirFromEnvironment,
   resolveProviderCliCommand,
+  resolveProviderCliCommandCandidates,
   resolveProviderCliManagedCommandPath,
 } from './resolution.js';
 export {
@@ -37,6 +47,7 @@ export {
   ensureManagedPnpmCommand,
   managedPnpmBinPath,
   managedPnpmInstallDir,
+  readManagedPnpmMinimumReleaseAgeMs,
   resolveExistingPnpmCommand,
 } from './managedPnpm.js';
 export { resolveHappyHomeDirFromEnvironment } from './resolveHappyHomeDir.js';

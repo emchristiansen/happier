@@ -40,6 +40,7 @@ export type ClaudeModelEffortLevelsTracker = Readonly<{
  */
 export function createClaudeModelEffortLevelsTracker(params: Readonly<{
   resolveTimeoutMs: () => number;
+  accountSettings?: Readonly<Record<string, unknown>> | null;
 }>): ClaudeModelEffortLevelsTracker {
   let levels: readonly string[] = [];
   let modelId: string | null = null;
@@ -81,7 +82,10 @@ export function createClaudeModelEffortLevelsTracker(params: Readonly<{
     const resolution = { modelId: normalized, promise: Promise.resolve() };
     resolution.promise = (async () => {
       try {
-        const models = await resolveClaudeModelCatalog({ timeoutMs: params.resolveTimeoutMs() });
+        const models = await resolveClaudeModelCatalog({
+          timeoutMs: params.resolveTimeoutMs(),
+          accountSettings: params.accountSettings,
+        });
         // A newer model may have been selected while this lookup was in flight; a late resolve must
         // not publish the previous model's tiers under the current model.
         if (modelId !== normalized) return;

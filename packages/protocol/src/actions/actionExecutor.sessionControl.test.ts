@@ -96,6 +96,18 @@ describe('createActionExecutor (session control)', () => {
     }));
   });
 
+  it('rejects a caller-chosen local id outside the CLI surface', async () => {
+    const sessionSendMessage = vi.fn(async () => ({ ok: true }));
+    const executor = createExecutor({ sessionSendMessage });
+
+    await expect(executor.execute(
+      'session.message.send' as any,
+      { sessionId: 's1', message: 'Hello', localId: 'claim-1' },
+      { surface: 'mcp', defaultSessionId: null },
+    )).resolves.toEqual({ ok: false, errorCode: 'invalid_parameters', error: 'invalid_parameters' });
+    expect(sessionSendMessage).not.toHaveBeenCalled();
+  });
+
   it('preserves exact nonblank opaque model override bytes when sending a message', async () => {
     const sessionSendMessage = vi.fn(async () => ({ ok: true }));
     const executor = createExecutor({ sessionSendMessage });
@@ -264,7 +276,7 @@ describe('createActionExecutor (session control)', () => {
     expect(res).toEqual({ ok: true, result: { ok: true } });
     expect(sessionPermissionModeSet).toHaveBeenCalledWith({
       sessionId: 's1',
-      permissionMode: 'read_only',
+      permissionMode: 'read-only',
       serverId: 'server-a',
     });
   });
@@ -904,7 +916,7 @@ describe('createActionExecutor (session control)', () => {
     expect(sessionSendMessage).not.toHaveBeenCalled();
   });
 
-  it('clamps a session-agent message without an explicit override to the caller permission', async () => {
+  it('keeps a session-agent message override implicit while forwarding the caller permission ceiling', async () => {
     const sessionSendMessage = vi.fn(async () => ({ ok: true }));
     const executor = createExecutor({ sessionSendMessage });
 
@@ -919,9 +931,11 @@ describe('createActionExecutor (session control)', () => {
 
     expect(res).toEqual({ ok: true, result: { ok: true } });
     expect(sessionSendMessage).toHaveBeenCalledWith(expect.objectContaining({
-      permissionModeOverride: 'read-only',
       callerSurface: 'session_agent',
       callerPermissionMode: 'read-only',
+    }));
+    expect(sessionSendMessage).toHaveBeenCalledWith(expect.not.objectContaining({
+      permissionModeOverride: expect.anything(),
     }));
   });
 

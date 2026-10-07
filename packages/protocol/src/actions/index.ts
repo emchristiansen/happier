@@ -75,6 +75,7 @@ export {
 export {
   ACTION_TOOL_EXPOSURE_SURFACES,
   SESSION_AGENT_DIRECT_ACTION_TOOL_ALLOW_LIST,
+  SESSION_AGENT_SAFE_OBSERVATION_ACTION_IDS,
   isActionDirectToolExposedOn,
   isActionDiscoverableOnToolSurface,
   resolveActionToolExposureMode,

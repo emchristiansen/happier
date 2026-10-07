@@ -173,7 +173,7 @@ vi.mock('@/agents/catalog/catalog', () => ({
     getAgentCore: () => ({ displayNameKey: 'agents.codex', toolRendering: { hideUnknownToolsByDefault: false } }),
     getAgentBehavior: () => ({
         sessionUsage: {
-            supportsExactContextUsageBadge: false,
+            contextUsageBadge: 'hidden',
         },
     }),
 }));

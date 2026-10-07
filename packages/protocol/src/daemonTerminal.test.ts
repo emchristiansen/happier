@@ -34,3 +34,15 @@ describe('DaemonTerminalEnsureRequestSchema session attach launch', () => {
     }).success).toBe(false);
   });
 });
+
+describe('DaemonTerminalEnsureRequestSchema Happier CLI launch', () => {
+  it('accepts a typed current-runtime CLI launch without a caller-authored shell command', () => {
+    expect(DaemonTerminalEnsureRequestSchema.parse({
+      terminalKey: 'provider-login:machine-1:agy:primary',
+      launch: { kind: 'happier_cli', args: ['agy', 'auth', 'login'] },
+    })).toEqual({
+      terminalKey: 'provider-login:machine-1:agy:primary',
+      launch: { kind: 'happier_cli', args: ['agy', 'auth', 'login'] },
+    });
+  });
+});

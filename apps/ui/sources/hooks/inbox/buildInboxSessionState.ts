@@ -1,61 +1,180 @@
 import type { Session } from '@/sync/domains/state/storageTypes';
-import {
-    deriveActivityAttentionFlags,
-    resolveActivityAttentionSessions,
-    resolveActivityAttentionSessionsFromRecords,
-} from '@/activity/attention/activityAttentionSessions';
 import { listPendingPermissionRequests, listPendingUserActionRequests, type PendingPermissionRequest } from '@/utils/sessions/sessionUtils';
-import type { SessionListRenderableSession } from '@/sync/domains/session/listing/sessionListRenderable';
+import {
+    buildSessionListRenderableFromSession,
+    type SessionListRenderableSession,
+} from '@/sync/domains/session/listing/sessionListRenderable';
+import type { SessionListViewItem } from '@/sync/domains/session/listing/sessionListViewData';
 import { isUserFacingSession } from '@/sync/domains/session/listing/isUserFacingSession';
-import { deriveSessionRuntimePresentationState } from '@/sync/domains/session/attention/deriveSessionRuntimePresentationState';
+import {
+    resolveNextSessionRuntimePresentationFreshnessAtMs,
+    type DeriveSessionRuntimePresentationStateInput,
+} from '@/sync/domains/session/attention/deriveSessionRuntimePresentationState';
 import { readStoredSessionMessagesFromStateLike } from '@/sync/domains/messages/readStoredSessionMessages';
-import { forEachRecordValue } from '@/sync/store/sessionRecordProjection';
 import type { StorageState } from '@/sync/store/types';
+import type { SessionBulkActionTarget } from '@/components/sessions/actions/sessionBulkActionTypes';
+import { normalizeSessionListKeyParts } from '@/sync/domains/session/listing/sessionListKeyNormalization';
+import { areServerProfileIdentifiersEquivalent } from '@/sync/domains/server/serverProfiles';
+import {
+    projectSessionListPlacement,
+    type SessionListPlacementKind,
+} from '@/sync/domains/session/listing/placement/sessionListPlacementProjection';
+
+export type InboxActionRequiredReason = Extract<
+    SessionListPlacementKind,
+    'action_required' | 'permission_required'
+>;
+
+export type InboxReviewReason = Extract<SessionListPlacementKind, 'ready' | 'failed'>;
 
 export type InboxSessionAttentionEntry = Readonly<{
-    session: Session;
+    key: string;
+    serverId: string | null;
+    sessionId: string;
+    session: InboxAttentionSession;
+    reason: InboxActionRequiredReason;
     pendingPermissions: readonly PendingPermissionRequest[];
     pendingUserActions: readonly PendingPermissionRequest[];
 }>;
 
-export type InboxUnreadSession = Session | SessionListRenderableSession;
+export type InboxAttentionSession = Session | SessionListRenderableSession;
+export type InboxReviewSessionEntry = Readonly<{
+    key: string;
+    serverId: string | null;
+    sessionId: string;
+    session: InboxAttentionSession;
+    reason: InboxReviewReason;
+}>;
 
 export type InboxSessionState = Readonly<{
-    unreadSessions: InboxUnreadSession[];
+    reviewSessions: InboxReviewSessionEntry[];
     sessionsNeedingAttention: InboxSessionAttentionEntry[];
+    markAllReadTargets: SessionBulkActionTarget[];
+    sessionByKey: ReadonlyMap<string, Readonly<{
+        serverId: string | null;
+        sessionId: string;
+        session: InboxAttentionSession;
+    }>>;
+}>;
+
+export type InboxSessionSummary = Readonly<{
+    hasContent: boolean;
+    nextFreshnessAtMs: number | null;
 }>;
 
 type BuildInboxSessionStateInput =
     | readonly Session[]
     | Readonly<{
         sessions: readonly Session[];
-        sessionRows?: readonly InboxUnreadSession[];
+        sessionListViewDataByServerId?: Readonly<Record<string, readonly SessionListViewItem[] | null>>;
         sessionMessagesById?: StorageState['sessionMessages'];
         nowMs?: number;
     }>;
 
-export type InboxSessionContentRecordInput = Readonly<{
-    sessionsById: Readonly<Record<string, Session>>;
-    sessionRowsById?: Readonly<Record<string, InboxUnreadSession>>;
-    sessionMessagesById?: StorageState['sessionMessages'];
-    nowMs?: number;
-}>;
-
 function normalizeBuildInboxSessionStateInput(input: BuildInboxSessionStateInput): Readonly<{
     sessions: readonly Session[];
-    sessionRows: readonly InboxUnreadSession[];
+    sessionListViewDataByServerId: Readonly<Record<string, readonly SessionListViewItem[] | null>>;
     sessionMessagesById?: StorageState['sessionMessages'];
     nowMs: number;
 }> {
     if ('sessions' in input) {
         return {
             sessions: input.sessions,
-            sessionRows: input.sessionRows && input.sessionRows.length > 0 ? input.sessionRows : input.sessions,
+            sessionListViewDataByServerId: input.sessionListViewDataByServerId ?? {},
             sessionMessagesById: input.sessionMessagesById,
             nowMs: typeof input.nowMs === 'number' && Number.isFinite(input.nowMs) ? input.nowMs : Date.now(),
         };
     }
-    return { sessions: input, sessionRows: input, nowMs: Date.now() };
+    return { sessions: input, sessionListViewDataByServerId: {}, nowMs: Date.now() };
+}
+
+type InboxSessionAddress = Readonly<{
+    key: string;
+    serverId: string | null;
+    sessionId: string;
+}>;
+
+type InboxSessionCandidateEntry = Readonly<{
+    key: string;
+    serverId: string | null;
+    sessionId: string;
+    session: InboxAttentionSession;
+}>;
+
+function buildInboxSessionAddress(serverIdRaw: unknown, sessionIdRaw: unknown): InboxSessionAddress | null {
+    const parts = normalizeSessionListKeyParts(serverIdRaw, sessionIdRaw);
+    if (!parts.sessionId) return null;
+    return {
+        key: parts.sessionKey ?? parts.sessionId,
+        serverId: parts.serverId || null,
+        sessionId: parts.sessionId,
+    };
+}
+
+function indexSessionsById(sessions: readonly Session[]): ReadonlyMap<string, readonly Session[]> {
+    const sessionsById = new Map<string, Session[]>();
+    for (const session of sessions) {
+        const existing = sessionsById.get(session.id);
+        if (existing) {
+            existing.push(session);
+        } else {
+            sessionsById.set(session.id, [session]);
+        }
+    }
+    return sessionsById;
+}
+
+function findScopedSession(
+    sessionsById: ReadonlyMap<string, readonly Session[]>,
+    address: InboxSessionAddress,
+): Session | null {
+    if (!address.serverId) return null;
+    return sessionsById.get(address.sessionId)?.find((session) => (
+        Boolean(session.serverId)
+        && areServerProfileIdentifiersEquivalent(session.serverId, address.serverId)
+    )) ?? null;
+}
+
+function collectInboxSessionEntries(params: Readonly<{
+    sessions: readonly Session[];
+    sessionListViewDataByServerId: Readonly<Record<string, readonly SessionListViewItem[] | null>>;
+}>): InboxSessionCandidateEntry[] {
+    const entries: InboxSessionCandidateEntry[] = [];
+    const seenKeys = new Set<string>();
+    const scopedCacheSessionIds = new Set<string>();
+    const matchedHydratedSessions = new Set<Session>();
+    const sessionsById = indexSessionsById(params.sessions);
+
+    for (const [recordServerId, items] of Object.entries(params.sessionListViewDataByServerId)) {
+        const serverParts = normalizeSessionListKeyParts(recordServerId);
+        if (!serverParts.serverId || !items) continue;
+        for (const item of items) {
+            if (item.type !== 'session') continue;
+            const address = buildInboxSessionAddress(serverParts.serverId, item.session.id);
+            if (!address || seenKeys.has(address.key)) continue;
+            seenKeys.add(address.key);
+            scopedCacheSessionIds.add(address.sessionId);
+            const canonicalSession = findScopedSession(sessionsById, address);
+            if (canonicalSession) matchedHydratedSessions.add(canonicalSession);
+            if (item.session.archivedAt != null || canonicalSession?.archivedAt != null) continue;
+            entries.push({ ...address, session: canonicalSession ?? item.session });
+        }
+    }
+
+    for (const session of params.sessions) {
+        if (matchedHydratedSessions.has(session)) continue;
+        const address = buildInboxSessionAddress(session.serverId, session.id);
+        if (!address || seenKeys.has(address.key)) continue;
+        // A server-qualified list row is the only safe source of Home identity.
+        // Do not append a bare-id hydrated fallback beside it: the global hydrated
+        // map may currently belong to a different Home after a background commit.
+        if (!address.serverId && scopedCacheSessionIds.has(address.sessionId)) continue;
+        seenKeys.add(address.key);
+        if (session.archivedAt != null) continue;
+        entries.push({ ...address, session });
+    }
+
+    return entries;
 }
 
 function readMessagesForInboxSession(
@@ -66,42 +185,41 @@ function readMessagesForInboxSession(
     return readStoredSessionMessagesFromStateLike(sessionMessagesById[sessionId]);
 }
 
-function hasUnreadSessionAttention(
-    session: InboxUnreadSession,
-    sessionMessagesById?: StorageState['sessionMessages'],
-): boolean {
-    return deriveActivityAttentionFlags(session, {
-        showPendingPermissionRequests: false,
-        showPendingUserActionRequests: false,
-        showQueuedUserInput: false,
-        sessionMessagesById,
-    }).hasUnread;
-}
-
-function hasFreshPendingInboxAttention(params: Readonly<{
-    session: Session;
+function buildPendingInboxRuntimeInput(params: Readonly<{
+    session: InboxAttentionSession;
     pendingPermissions: readonly PendingPermissionRequest[];
     pendingUserActions: readonly PendingPermissionRequest[];
-    nowMs: number;
-}>): boolean {
-    if (params.pendingPermissions.length === 0 && params.pendingUserActions.length === 0) return false;
-    const runtimeStatus = deriveSessionRuntimePresentationState({
+}>): DeriveSessionRuntimePresentationStateInput {
+    const projectedPendingPermissions = 'agentState' in params.session
+        ? params.pendingPermissions.length > 0
+        : params.session.hasPendingPermissionRequests === true;
+    const projectedPendingUserActions = 'agentState' in params.session
+        ? params.pendingUserActions.length > 0
+        : params.session.hasPendingUserActionRequests === true;
+    return {
         active: params.session.active,
         activeAt: params.session.activeAt,
+        archivedAt: params.session.archivedAt,
         presence: params.session.presence,
         thinking: params.session.thinking,
         thinkingAt: params.session.thinkingAt,
         latestTurnStatus: params.session.latestTurnStatus,
         latestTurnStatusObservedAt: params.session.latestTurnStatusObservedAt,
+        latestReadyEventAt: params.session.latestReadyEventAt,
+        runtimeActivityState: params.session.runtimeActivityState,
+        runtimeActivityActiveCount: params.session.runtimeActivityActiveCount,
+        runtimeActivityObservedAt: params.session.runtimeActivityObservedAt,
+        runtimeActivityRevision: params.session.runtimeActivityRevision,
         meaningfulActivityAt: params.session.meaningfulActivityAt,
-        hasPendingPermissionRequests: params.pendingPermissions.length > 0,
-        hasPendingUserActionRequests: params.pendingUserActions.length > 0,
-        pendingRequestObservedAt: latestPendingRequestObservedAt([
-            ...params.pendingPermissions,
-            ...params.pendingUserActions,
-        ]),
-    }, params.nowMs);
-    return runtimeStatus.freshPermissionRequired || runtimeStatus.freshActionRequired;
+        hasPendingPermissionRequests: projectedPendingPermissions,
+        hasPendingUserActionRequests: projectedPendingUserActions,
+        pendingRequestObservedAt: 'agentState' in params.session
+            ? latestPendingRequestObservedAt([
+                ...params.pendingPermissions,
+                ...params.pendingUserActions,
+            ])
+            : params.session.pendingRequestObservedAt ?? null,
+    };
 }
 
 function latestPendingRequestObservedAt(requests: readonly PendingPermissionRequest[]): number | null {
@@ -114,120 +232,166 @@ function latestPendingRequestObservedAt(requests: readonly PendingPermissionRequ
     return latest;
 }
 
+function evaluateInboxSessionCandidate(params: Readonly<{
+    entry: InboxSessionCandidateEntry;
+    sessionMessagesById?: StorageState['sessionMessages'];
+    nowMs: number;
+}>) {
+    const { entry } = params;
+    if (!isUserFacingSession(entry.session)) return null;
+    const isHydrated = 'agentState' in entry.session;
+    const messages = isHydrated
+        ? readMessagesForInboxSession(params.sessionMessagesById, entry.sessionId)
+        : undefined;
+    const pendingPermissions = isHydrated
+        ? listPendingPermissionRequests(entry.session, messages)
+        : [];
+    const pendingUserActions = isHydrated
+        ? listPendingUserActionRequests(entry.session, messages)
+        : [];
+    const renderable = isHydrated
+        ? buildSessionListRenderableFromSession(entry.session, messages)
+        : entry.session;
+    const placement = projectSessionListPlacement({
+        session: renderable,
+        sessionKey: entry.key,
+        nowMs: params.nowMs,
+    });
+    const runtimeInput = buildPendingInboxRuntimeInput({
+        session: entry.session,
+        pendingPermissions,
+        pendingUserActions,
+    });
+    return {
+        pendingPermissions,
+        pendingUserActions,
+        renderable,
+        placement,
+        runtimeInput,
+    };
+}
+
 export function buildInboxSessionState(input: BuildInboxSessionStateInput): InboxSessionState {
-    const { sessions, sessionRows, sessionMessagesById, nowMs } = normalizeBuildInboxSessionStateInput(input);
+    const { sessions, sessionListViewDataByServerId, sessionMessagesById, nowMs } = normalizeBuildInboxSessionStateInput(input);
     const sessionsNeedingAttention: InboxSessionAttentionEntry[] = [];
-    const attentionSessionIds = new Set<string>();
+    const candidates = collectInboxSessionEntries({ sessions, sessionListViewDataByServerId });
+    const sessionByKey = new Map(candidates.map((entry) => [entry.key, {
+        serverId: entry.serverId,
+        sessionId: entry.sessionId,
+        session: entry.session,
+    }] as const));
 
-    for (const session of sessions) {
-        if (session.archivedAt != null) continue;
-        if (!isUserFacingSession(session)) continue;
-        const messages = readMessagesForInboxSession(sessionMessagesById, session.id);
-        const pendingPermissions = listPendingPermissionRequests(session, messages);
-        const pendingUserActions = listPendingUserActionRequests(session, messages);
-        if (!hasFreshPendingInboxAttention({
-            session,
-            pendingPermissions,
-            pendingUserActions,
+    const reviewSessions: InboxReviewSessionEntry[] = [];
+    const markAllReadTargets: SessionBulkActionTarget[] = [];
+    for (const entry of candidates) {
+        const evaluation = evaluateInboxSessionCandidate({
+            entry,
+            sessionMessagesById,
             nowMs,
-        })) continue;
-
-        attentionSessionIds.add(session.id);
-        sessionsNeedingAttention.push({
-            session,
+        });
+        if (!evaluation) continue;
+        const {
             pendingPermissions,
             pendingUserActions,
-        });
-    }
+            renderable,
+            placement,
+        } = evaluation;
 
-    const unreadCandidates = resolveActivityAttentionSessions({ sessions, sessionRows });
+        if (placement.kind === 'permission_required' || placement.kind === 'action_required') {
+            sessionsNeedingAttention.push({
+                key: entry.key,
+                serverId: entry.serverId,
+                sessionId: entry.sessionId,
+                session: entry.session,
+                reason: placement.kind,
+                pendingPermissions,
+                pendingUserActions,
+            });
+            continue;
+        }
 
-    const unreadSessions: InboxUnreadSession[] = [];
-    const unreadSessionIds = new Set<string>();
-    for (const session of unreadCandidates) {
-        if (!isUserFacingSession(session)) continue;
-        if (attentionSessionIds.has(session.id)) continue;
-        if (unreadSessionIds.has(session.id)) continue;
-        if (!hasUnreadSessionAttention(session, sessionMessagesById)) continue;
-        unreadSessionIds.add(session.id);
-        unreadSessions.push(session);
+        // Inbox is the review/action surface, not a second unread feed. The session
+        // list projection already owns precedence between working, completion,
+        // failure and raw unread state. Only terminal review placements belong here;
+        // plain unread and working remain in the session list until a turn completes.
+        if (placement.kind !== 'ready' && placement.kind !== 'failed') continue;
+        reviewSessions.push({ ...entry, reason: placement.kind });
+        if (placement.kind === 'ready' && renderable.hasUnreadMessages === true) {
+            markAllReadTargets.push({
+                key: entry.key,
+                sessionId: entry.sessionId,
+                serverId: entry.serverId,
+                readState: 'unread',
+            });
+        }
     }
 
     return {
-        unreadSessions,
+        reviewSessions,
         sessionsNeedingAttention,
+        markAllReadTargets,
+        sessionByKey,
     };
 }
 
 export function hasInboxSessionContent(input: BuildInboxSessionStateInput): boolean {
-    const { sessions, sessionRows, sessionMessagesById, nowMs } = normalizeBuildInboxSessionStateInput(input);
-    const attentionSessionIds = new Set<string>();
-
-    for (const session of sessions) {
-        if (session.archivedAt != null) continue;
-        if (!isUserFacingSession(session)) continue;
-        const messages = readMessagesForInboxSession(sessionMessagesById, session.id);
-        const pendingPermissions = listPendingPermissionRequests(session, messages);
-        const pendingUserActions = listPendingUserActionRequests(session, messages);
-        if (!hasFreshPendingInboxAttention({
-            session,
-            pendingPermissions,
-            pendingUserActions,
-            nowMs,
-        })) continue;
-        attentionSessionIds.add(session.id);
-        return true;
-    }
-
-    const unreadCandidates = resolveActivityAttentionSessions({ sessions, sessionRows });
-    const unreadSessionIds = new Set<string>();
-    for (const session of unreadCandidates) {
-        if (!isUserFacingSession(session)) continue;
-        if (attentionSessionIds.has(session.id)) continue;
-        if (unreadSessionIds.has(session.id)) continue;
-        if (!hasUnreadSessionAttention(session, sessionMessagesById)) continue;
-        unreadSessionIds.add(session.id);
-        return true;
-    }
-
-    return false;
+    return buildInboxSessionSummary(input).hasContent;
 }
 
-export function hasInboxSessionContentForRecords(input: InboxSessionContentRecordInput): boolean {
-    const nowMs = typeof input.nowMs === 'number' && Number.isFinite(input.nowMs)
-        ? input.nowMs
-        : Date.now();
-    const attentionSessionIds = new Set<string>();
-
-    forEachRecordValue(input.sessionsById, (session) => {
-        if (session.archivedAt != null) return;
-        if (!isUserFacingSession(session)) return;
-        const messages = readMessagesForInboxSession(input.sessionMessagesById, session.id);
-        const pendingPermissions = listPendingPermissionRequests(session, messages);
-        const pendingUserActions = listPendingUserActionRequests(session, messages);
-        if (!hasFreshPendingInboxAttention({
-            session,
-            pendingPermissions,
-            pendingUserActions,
-            nowMs,
-        })) return;
-        attentionSessionIds.add(session.id);
+function buildInboxSessionSummaryFromNormalizedInput(input: Readonly<{
+    sessions: readonly Session[];
+    sessionListViewDataByServerId: Readonly<Record<string, readonly SessionListViewItem[] | null>>;
+    sessionMessagesById?: StorageState['sessionMessages'];
+    nowMs: number;
+}>): InboxSessionSummary {
+    let hasContent = false;
+    let nextFreshnessAtMs: number | null = null;
+    const candidates = collectInboxSessionEntries({
+        sessions: input.sessions,
+        sessionListViewDataByServerId: input.sessionListViewDataByServerId,
     });
-    if (attentionSessionIds.size > 0) return true;
-
-    const unreadCandidates = resolveActivityAttentionSessionsFromRecords({
-        sessionsById: input.sessionsById,
-        sessionRowsById: input.sessionRowsById,
-    });
-    const unreadSessionIds = new Set<string>();
-    for (const session of unreadCandidates) {
-        if (!isUserFacingSession(session)) continue;
-        if (attentionSessionIds.has(session.id)) continue;
-        if (unreadSessionIds.has(session.id)) continue;
-        if (!hasUnreadSessionAttention(session, input.sessionMessagesById)) continue;
-        unreadSessionIds.add(session.id);
-        return true;
+    for (const entry of candidates) {
+        const evaluation = evaluateInboxSessionCandidate({
+            entry,
+            sessionMessagesById: input.sessionMessagesById,
+            nowMs: input.nowMs,
+        });
+        if (!evaluation) continue;
+        const { kind } = evaluation.placement;
+        if (
+            kind === 'permission_required'
+            || kind === 'action_required'
+            || kind === 'ready'
+            || kind === 'failed'
+        ) {
+            hasContent = true;
+        }
+        const freshnessAtMs = resolveNextSessionRuntimePresentationFreshnessAtMs(
+            evaluation.runtimeInput,
+            input.nowMs,
+        );
+        if (freshnessAtMs === null) continue;
+        nextFreshnessAtMs = nextFreshnessAtMs === null
+            ? freshnessAtMs
+            : Math.min(nextFreshnessAtMs, freshnessAtMs);
     }
+    return { hasContent, nextFreshnessAtMs };
+}
 
-    return false;
+export function buildInboxSessionSummary(input: BuildInboxSessionStateInput): InboxSessionSummary {
+    return buildInboxSessionSummaryFromNormalizedInput(normalizeBuildInboxSessionStateInput(input));
+}
+
+export function resolveNextInboxSessionStateFreshnessAtMs(input: Readonly<{
+    sessions: readonly Session[];
+    sessionListViewDataByServerId?: Readonly<Record<string, readonly SessionListViewItem[] | null>>;
+    sessionMessagesById?: StorageState['sessionMessages'];
+    nowMs: number;
+}>): number | null {
+    return buildInboxSessionSummaryFromNormalizedInput({
+        sessions: input.sessions,
+        sessionListViewDataByServerId: input.sessionListViewDataByServerId ?? {},
+        sessionMessagesById: input.sessionMessagesById,
+        nowMs: input.nowMs,
+    }).nextFreshnessAtMs;
 }

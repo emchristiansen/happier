@@ -253,9 +253,6 @@ export async function claudeLocalLauncher(
     let pendingQueueWatcher: { stop: () => void } | null = null;
     try {
         workflowActivitySource?.armStartupReconciliation();
-        await session.getProviderTaskRuntimeActivityAdapter()?.activateObservation(
-            'claude-local-provider-observer-installed',
-        );
         const clientEmitter = session.client as unknown as {
             getMetadataSnapshot?: () => Metadata | null | undefined;
             on?: (event: string, listener: () => void) => void;
@@ -454,6 +451,11 @@ export async function claudeLocalLauncher(
 
                 const { mcpConfigJson: baseMcpConfigJson } = await session.getOrCreateHappierMcpBridge();
                 try {
+                    // Every local attempt owns a fresh process. Reconcile its prelaunch inventory
+                    // through the same owner as Remote before reactivating the installed scanner.
+                    const runtimeActivity = session.getProviderTaskRuntimeActivityAdapter();
+                    await runtimeActivity?.publishBeforeRuntimeStart('claude-local-provider-not-started');
+                    await runtimeActivity?.activateObservation('claude-local-provider-observer-installed');
                     await claudeLocal({
                         path: session.path,
                         sessionId: resumeFromSessionId,

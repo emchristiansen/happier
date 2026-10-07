@@ -145,5 +145,12 @@
     "ogTitle": "把 Happier 中繼站架在你自己的 SSO 後面",
     "ogDescription": "一個你自己託管的中繼站，鎖在你的 GitHub 組織或 OIDC 群組上，有用戶端憑證、離職重新檢查，以及一份由你選擇的儲存政策。全部採 MIT 授權。",
     "ogImageAlt": "Happier 字標，下方寫著：一個用戶端，管每一個 AI 程式設計代理程式。"
+  },
+  "/download": {
+    "title": "下載 Happier：桌面端、行動端和 CLI",
+    "description": "下載 macOS、Windows、Linux、iOS 或 Android 版 Happier，或在執行代理程式的電腦上安裝 Happier CLI。",
+    "ogTitle": "為你的所有裝置下載 Happier",
+    "ogDescription": "桌面應用程式、行動應用程式、直接 APK，以及在你自己的電腦上執行代理程式的 CLI。所有版本都在一個頁面。",
+    "ogImageAlt": "Happier 字標，下方寫著：一個用戶端，管每一個 AI 程式設計代理程式。"
   }
 }

@@ -94,6 +94,7 @@ test('publish-cli-binaries rejects an invalid MINISIGN_SECRET_KEY before build w
         ...process.env,
         MINISIGN_SECRET_KEY: invalidSecret,
         MINISIGN_PASSPHRASE: 'x',
+        HAPPIER_RELEASE_PUBLISHED_VERSIONS_JSON: JSON.stringify({ github: {}, npm: {} }),
       },
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],

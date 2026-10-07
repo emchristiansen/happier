@@ -21,18 +21,22 @@ describe('providers: contract matrix (harness)', () => {
     { id: 'gemini', envVar: 'HAPPIER_E2E_PROVIDER_GEMINI', timeoutMs: 2_400_000 },
     { id: 'qwen', envVar: 'HAPPIER_E2E_PROVIDER_QWEN', timeoutMs: 1_200_000 },
     { id: 'kimi', envVar: 'HAPPIER_E2E_PROVIDER_KIMI', timeoutMs: 1_200_000 },
+    { id: 'devin', envVar: 'HAPPIER_E2E_PROVIDER_DEVIN', timeoutMs: 1_200_000 },
     { id: 'auggie', envVar: 'HAPPIER_E2E_PROVIDER_AUGGIE', timeoutMs: 1_200_000 },
     { id: 'pi', envVar: 'HAPPIER_E2E_PROVIDER_PI', timeoutMs: 1_200_000 },
     { id: 'cursor', envVar: 'HAPPIER_E2E_PROVIDER_CURSOR', timeoutMs: 2_400_000 },
     { id: 'grok', envVar: 'HAPPIER_E2E_PROVIDER_GROK', timeoutMs: 2_400_000 },
+    { id: 'agy', envVar: 'HAPPIER_E2E_PROVIDER_AGY', timeoutMs: 1_200_000 },
   ] as const;
 
   const providersEnabled = (process.env.HAPPIER_E2E_PROVIDERS ?? '').toString().trim() === '1';
   const disabledTimeoutMs = Math.max(...providerEnvVars.map((p) => p.timeoutMs));
 
   it('includes provider-specific ACP integrations in the opt-in provider matrix', () => {
+    expect(providerEnvVars.map((provider) => provider.id)).toContain('agy');
     expect(providerEnvVars.map((provider) => provider.id)).toContain('cursor');
     expect(providerEnvVars.map((provider) => provider.id)).toContain('cursor_acp_stub');
+    expect(providerEnvVars.map((provider) => provider.id)).toContain('devin');
     expect(providerEnvVars.map((provider) => provider.id)).toContain('grok');
     expect(providerEnvVars.map((provider) => provider.id)).toContain('grok_acp_stub');
   });

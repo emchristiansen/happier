@@ -40,7 +40,7 @@ describe('buildSessionTranscriptRetrievalInvocation', () => {
   });
 
   it('renders the CLI bridge form for a shell_bridge Agent, by the tool name the catalog binds', () => {
-    const render = buildSessionTranscriptRetrievalInvocation({ ...base, agentId: 'cursor' });
+    const render = buildSessionTranscriptRetrievalInvocation({ ...base, agentId: 'pi' });
     expect(render).not.toBeNull();
     const rendered = render!(4_200);
     expect(rendered).toContain("'tools' 'call'");

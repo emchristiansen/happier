@@ -25,6 +25,21 @@ describe('createClaudeUnifiedPromptEchoSuppressor', () => {
     expect(suppressor.shouldSuppressTranscriptMessage(userMessage('hello from ui', 1_200))).toBe(false);
   });
 
+  it('suppresses an accepted prompt echo that the provider wrapped in paste markers', () => {
+    // Claude Code 2.1.259 records a bracketed-paste prompt wrapped in its own paste markers. If
+    // the echo is not recognised it is forwarded as a second, visible transcript message showing
+    // the raw markers to the user (live incident 2026-09-18, session cmtyf86rp1a1ttm237czmr4ts).
+    const suppressor = createClaudeUnifiedPromptEchoSuppressor({
+      nowMs: () => 1_000,
+      acceptedPromptEchoWindowMs: 5_000,
+    });
+
+    suppressor.recordAcceptedPrompt({ message: 'first line\n\nsecond line' });
+
+    const wrappedEcho = '\n\n<pasted_content id="9b65">\nfirst line\n\nsecond line\n</pasted_content id="9b65">\n';
+    expect(suppressor.shouldSuppressTranscriptMessage(userMessage(wrappedEcho, 1_100))).toBe(true);
+  });
+
   it('does not suppress matching terminal-origin prompts after an accepted UI prompt echo expires', () => {
     const suppressor = createClaudeUnifiedPromptEchoSuppressor({
       nowMs: () => 10_000,

@@ -10,36 +10,10 @@ import {
   type ConnectedServiceQuotaFetcher,
   type ConnectedServiceQuotaFetcherDescriptor,
 } from '@/daemon/connectedServices/quotas/types';
-import { isRecord, normalizeNonEmptyString, normalizePct, resolveConnectedServiceQuotaAccountLabel } from '@/daemon/connectedServices/quotas/quotaNormalization';
+import { isRecord, normalizeNonEmptyString, resolveConnectedServiceQuotaAccountLabel } from '@/daemon/connectedServices/quotas/quotaNormalization';
 import { parseRetryAfterHeader } from '@/daemon/connectedServices/quotas/normalization';
 import { createOpenAiCodexSubscriptionFetcher } from './subscriptionFetcher';
-
-const RESET_AT_PLAUSIBILITY_FLOOR_TOLERANCE_MS = 24 * 60 * 60_000;
-
-function normalizeResetAtMs(value: unknown, nowMs: number): number | null {
-  const num = typeof value === 'number' ? value : Number(value);
-  if (!Number.isFinite(num) || num <= 0) return null;
-  // Heuristic: usage APIs commonly return unix seconds.
-  const epochMs = num > 1_000_000_000_000 ? Math.trunc(num) : Math.trunc(num * 1000);
-  // Sanity floor (RD-QUO-1): a relative-seconds value misparsed as an epoch lands in the
-  // 1970 era. Reject resets implausibly far in the past instead of persisting bogus data.
-  if (epochMs < nowMs - RESET_AT_PLAUSIBILITY_FLOOR_TOLERANCE_MS) return null;
-  return epochMs;
-}
-
-function normalizeWindowResetAtMs(window: Record<string, unknown> | null, nowMs: number): number | null {
-  if (!window) return null;
-  const absolute = normalizeResetAtMs(window.reset_at ?? window.resets_at ?? window.resetAt ?? window.resetsAt, nowMs);
-  if (absolute !== null) return absolute;
-  // Legacy relative shape: seconds-until-reset converted at fetch time.
-  const seconds = typeof window.resets_in_seconds === 'number'
-    ? window.resets_in_seconds
-    : typeof window.resetsInSeconds === 'number'
-      ? window.resetsInSeconds
-      : null;
-  if (seconds === null || !Number.isFinite(seconds) || seconds < 0) return null;
-  return Math.trunc(nowMs + seconds * 1000);
-}
+import { mapCodexRateLimitPayloadToQuotaMeters } from './mapCodexRateLimitSnapshot';
 
 function resolveAccountLabel(record: ConnectedServiceCredentialRecordV1): string | null {
   return resolveConnectedServiceQuotaAccountLabel(record);
@@ -278,11 +252,6 @@ export function createOpenAiCodexQuotaFetcher(params?: Readonly<{
 
       const planLabel = normalizeNonEmptyString(data.plan_type);
       const rateLimit = isRecord(data.rate_limit) ? data.rate_limit : null;
-      const primary = rateLimit && isRecord(rateLimit.primary_window) ? rateLimit.primary_window : null;
-      const secondary = rateLimit && isRecord(rateLimit.secondary_window) ? rateLimit.secondary_window : null;
-
-      const sessionPct = normalizePct(primary?.used_percent);
-      const weeklyPct = normalizePct(secondary?.used_percent);
       const recoveryCredits = mapCodexRateLimitResetCreditsToQuotaRecoveryCredits(rawResetCredits);
 
       return {
@@ -294,30 +263,13 @@ export function createOpenAiCodexQuotaFetcher(params?: Readonly<{
         planLabel,
         accountLabel: resolveAccountLabel(record),
         ...(recoveryCredits ? { recoveryCredits } : {}),
-        meters: [
-          {
-            meterId: 'session',
-            label: 'Session',
-            used: null,
-            limit: null,
-            unit: 'unknown',
-            utilizationPct: sessionPct,
-            resetsAt: normalizeWindowResetAtMs(primary, now),
-            status: sessionPct === null ? 'unavailable' : 'ok',
-            details: {},
-          },
-          {
-            meterId: 'weekly',
-            label: 'Weekly',
-            used: null,
-            limit: null,
-            unit: 'unknown',
-            utilizationPct: weeklyPct,
-            resetsAt: normalizeWindowResetAtMs(secondary, now),
-            status: weeklyPct === null ? 'unavailable' : 'ok',
-            details: {},
-          },
-        ],
+        meters: [...mapCodexRateLimitPayloadToQuotaMeters({
+          rate_limit: rateLimit,
+          additional_rate_limits: data.additional_rate_limits,
+        }, now, {
+          legacyPrimary: { meterId: 'session', label: 'Session' },
+          legacySecondary: { meterId: 'weekly', label: 'Weekly' },
+        })],
       };
     },
   };

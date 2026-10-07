@@ -70,6 +70,33 @@ describe('buildTerminalAttachmentMetadataFromHostHandle', () => {
     });
   });
 
+  it('round-trips a Herdr terminal using its stable terminal identity', () => {
+    const handle: TerminalHostHandle = {
+      kind: 'herdr',
+      sessionName: 'default',
+      paneId: 'w1:p2',
+      terminalId: 'term_123',
+      socketPath: '/tmp/herdr.sock',
+      attachMetadata: {
+        attachStrategy: 'terminal_host',
+        topology: 'shared',
+        locality: 'same_machine',
+        liveProbe: 'required',
+      },
+    };
+    const terminal = buildTerminalAttachmentMetadataFromHostHandle(handle);
+    expect(terminal).toEqual({
+      mode: 'herdr',
+      herdr: {
+        sessionName: 'default',
+        socketPath: '/tmp/herdr.sock',
+        terminalId: 'term_123',
+        paneId: 'w1:p2',
+      },
+    });
+    expect(terminal && buildTerminalHostHandleFromAttachmentMetadata(terminal)).toMatchObject(handle);
+  });
+
   it('reconstructs the versioned zellij socket root while accepting legacy markers', () => {
     expect(buildTerminalHostHandleFromAttachmentMetadata({
       mode: 'zellij',

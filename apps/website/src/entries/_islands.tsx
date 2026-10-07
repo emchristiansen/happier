@@ -64,4 +64,13 @@ export const ISLANDS: IslandMap = {
     ),
     'self-host': lazyIsland(() => import('../sections/SelfHost').then((m) => m.SelfHost)),
     'call-to-action': lazyIsland(() => import('../sections/CallToAction').then((m) => m.CallToAction)),
+
+    /*
+     * Lazy although it is /download's whole point: this map is shared by every
+     * entry, so a static name here would put the hub in every page's import
+     * graph for one page's behaviour. The cost is one dynamic chunk fetched
+     * right after mount, before the auto-redirect can fire — tens of
+     * milliseconds on the only page that ever loads it.
+     */
+    'download-hub': lazyIsland(() => import('../components/DownloadHub').then((m) => m.DownloadHub)),
 };

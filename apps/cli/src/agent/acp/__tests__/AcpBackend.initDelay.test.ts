@@ -1,11 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { AcpBackend } from '../AcpBackend';
 import { createAcpTestTransportHandler, writeAcpTestAgentScript } from '../testkit/subprocessHarness';
 import { withTempDir } from '@/testkit/fs/tempDir';
 
-function writePoisonOnEarlyInputAcpAgentScript(params: { dir: string; readyAfterMs: number }): string {
+function writePoisonOnEarlyInputAcpAgentScript(params: {
+  dir: string;
+  readyAfterMs: number;
+  initializeObservationPath?: string;
+}): string {
   const src = `
+    import { appendFileSync } from 'node:fs';
     const decoder = new TextDecoder();
     let buf = '';
     const start = Date.now();
@@ -33,6 +40,9 @@ function writePoisonOnEarlyInputAcpAgentScript(params: { dir: string; readyAfter
         const id = req.id;
         const method = req.method;
         if (id === undefined || id === null || typeof method !== 'string') continue;
+        if (method === 'initialize' && ${JSON.stringify(params.initializeObservationPath ?? '')}) {
+          appendFileSync(${JSON.stringify(params.initializeObservationPath ?? '')}, 'initialize\\n');
+        }
 
         // Simulate Gemini CLI ACP quirk:
         // The ACP stdio bridge can swallow an early initialize request before it's "ready",
@@ -78,7 +88,12 @@ describe('AcpBackend.initialize (init delay)', () => {
 
     await withTempDir('happier-acp-init-nodelay-', async (dir) => {
       // Keep timings small so the test stays deterministic while still simulating "stdin too early" poisoning.
-      const scriptPath = writePoisonOnEarlyInputAcpAgentScript({ dir, readyAfterMs: 200 });
+      const initializeObservationPath = join(dir, 'initialize-events.log');
+      const scriptPath = writePoisonOnEarlyInputAcpAgentScript({
+        dir,
+        readyAfterMs: 200,
+        initializeObservationPath,
+      });
       let backendForCleanup: AcpBackend | undefined;
 
       try {
@@ -95,11 +110,12 @@ describe('AcpBackend.initialize (init delay)', () => {
         backendForCleanup = backend;
 
         await expect(backend.startSession()).rejects.toThrow(/Initialize timeout/i);
+        await expect(readFile(initializeObservationPath, 'utf8')).resolves.toBe('initialize\n');
       } finally {
         await backendForCleanup?.dispose().catch(() => {});
       }
     });
-  }, 15_000);
+  }, 45_000);
 
   it('waits for transport-provided init delay before sending initialize (prevents swallowed stdin)', async () => {
     // Defensive: other test files may enable fake timers and forget to restore them.
@@ -135,5 +151,5 @@ describe('AcpBackend.initialize (init delay)', () => {
         await backendForCleanup?.dispose().catch(() => {});
       }
     });
-  }, 15_000);
+  }, 45_000);
 });

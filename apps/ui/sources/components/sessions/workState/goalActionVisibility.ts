@@ -17,8 +17,12 @@ export function resolveGoalStatusLabelKey(goal: SessionWorkStateItem | null):
     return 'session.workState.goal.statusActive';
 }
 
-export function canPauseOrResumeGoal(goal: SessionWorkStateItem | null): boolean {
-    return goal?.status === 'active' || goal?.status === 'paused';
+export type GoalPauseResumeAction = 'pause' | 'resume';
+
+export function resolveGoalPauseResumeAction(goal: SessionWorkStateItem | null): GoalPauseResumeAction | null {
+    if (goal?.status === 'active') return 'pause';
+    if (goal?.status === 'paused' || goal?.status === 'blocked') return 'resume';
+    return null;
 }
 
 export type GoalActionCapabilities = Readonly<{

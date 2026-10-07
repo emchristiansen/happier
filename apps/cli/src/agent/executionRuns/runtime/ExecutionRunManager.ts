@@ -2,7 +2,11 @@ import type { AgentBackend } from '@/agent/core/AgentBackend';
 import type { ACPProvider } from '@/api/session/sessionMessageTypes';
 import type { AcpSendFn } from '@/agent/acp/bridge/acpSessionForwarding';
 import type { StreamedTranscriptWriterSession } from '@/api/session/streamedTranscriptWriter';
-import { buildExecutionRunCompletionInputV1, type ExecutionRunUserTranscriptDirective } from '@happier-dev/protocol';
+import {
+  buildExecutionRunCompletionInputV1,
+  projectExecutionRunRequestedConfiguration,
+  type ExecutionRunUserTranscriptDirective,
+} from '@happier-dev/protocol';
 import type { ExecutionBudgetRegistry } from '@/daemon/executionBudget/ExecutionBudgetRegistry';
 import {
   type AcpConfigOptionOverridesV1,
@@ -52,6 +56,7 @@ import {
   writeExecutionRunActivityMarker,
 } from '@/agent/executionRuns/runtime/executionRunManager/activityMarkers';
 import { deriveExecutionRunRuntimeActivityContribution } from '@/agent/executionRuns/runtime/executionRunRuntimeActivity';
+import { readExecutionRunErrorCode } from '@/agent/executionRuns/runtime/executionRunErrors';
 import { logger } from '@/ui/logger';
 
 function readBoundedExternalSendAckTimeoutMs(): number {
@@ -62,9 +67,32 @@ function readBoundedExternalSendAckTimeoutMs(): number {
   return Math.min(parsed, 120_000);
 }
 
+function requestedConfigurationForRun(run: ExecutionRunState) {
+  return projectExecutionRunRequestedConfiguration({
+    modelId: run.launch?.modelId,
+    sessionConfigOptionOverrides: run.launch?.sessionConfigOptionOverrides,
+  });
+}
+
+async function awaitExecutionRunObservation<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return await promise;
+  signal.throwIfAborted();
+  let onAbort!: () => void;
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason ?? new Error('Execution run wait cancelled'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+  try {
+    return await Promise.race([promise, cancelled]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
 export class ExecutionRunManager {
   private readonly parentProvider: ACPProvider;
-  private readonly cwd: string;
+  private readonly resolveCwd: () => string;
   private readonly createBackend: (opts: {
     runId?: string;
     backendId: string;
@@ -103,6 +131,7 @@ export class ExecutionRunManager {
   private readonly markerWriteChains = new Map<string, Promise<void>>();
   private readonly terminalMarkerWritePromises = new Map<string, Promise<void>>();
   private readonly terminalRuntimeActivityPromises = new Map<string, Promise<void>>();
+  private readonly terminalStateWaiters = new Map<string, Set<Readonly<{ resolve: () => void }>>>();
   private readonly runLifecycleTails = new Map<string, Promise<void>>();
   private readonly voiceAgentManager: VoiceAgentManager;
   private readonly onPublicStateUpdated: ((run: ExecutionRunPublicState) => void) | null;
@@ -146,6 +175,9 @@ export class ExecutionRunManager {
       runId: existing.runId,
       callId: existing.callId,
       sidechainId: existing.sidechainId,
+      ...(requestedConfigurationForRun(existing)
+        ? { requestedConfiguration: requestedConfigurationForRun(existing) }
+        : {}),
     };
   }
 
@@ -207,9 +239,15 @@ export class ExecutionRunManager {
   ): Promise<void> {
     const terminal = this.publishRunRuntimeActivityTerminal(runId, reason, terminalStateOverride);
     this.terminalRuntimeActivityPromises.set(runId, terminal);
-    // The completion/drain APIs observe the original promise. This handler only prevents an
-    // unhandled rejection if a caller never waits; it does not convert failure into success.
-    void terminal.catch(() => {});
+    // Runtime activity is a derived projection, not execution-run terminal truth. Keep failures
+    // observable without making stop acknowledgements or terminal observers wait on the publisher.
+    void terminal.catch((error) => {
+      logger.warn('[EXECUTION RUN] Failed to publish terminal runtime activity', {
+        runId,
+        reason,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
     return terminal;
   }
 
@@ -236,6 +274,7 @@ export class ExecutionRunManager {
   constructor(opts: Readonly<{
     parentProvider: ACPProvider;
     cwd: string;
+    resolveCwd?: () => string;
     createBackend: (opts: {
       runId?: string;
       backendId: string;
@@ -281,7 +320,7 @@ export class ExecutionRunManager {
     }>) => Promise<readonly string[]>;
   }>) {
     this.parentProvider = opts.parentProvider;
-    this.cwd = opts.cwd;
+    this.resolveCwd = opts.resolveCwd ?? (() => opts.cwd);
     this.createBackend = opts.createBackend;
     this.sendAcp = opts.sendAcp;
     this.streamedTranscriptSession = opts.streamedTranscriptSession ?? null;
@@ -331,7 +370,7 @@ export class ExecutionRunManager {
           settings,
           profileId,
           sessionId,
-          workingDirectory: workingDirectory ?? this.cwd,
+          workingDirectory: workingDirectory ?? this.resolveCwd(),
         });
       },
       responseTimeoutMs: configuration.voiceAgentResponseTimeoutMs,
@@ -361,17 +400,43 @@ export class ExecutionRunManager {
     return this.runs.get(runId)?.latestToolResult ?? null;
   }
 
-  async waitForTerminal(runId: string): Promise<void> {
+  async waitForTerminal(
+    runId: string,
+    options?: Readonly<{ signal?: AbortSignal }>,
+  ): Promise<void> {
+    if (this.runs.get(runId)?.status === 'running') {
+      options?.signal?.throwIfAborted();
+      let resolve!: () => void;
+      let reject!: (error: unknown) => void;
+      const promise = new Promise<void>((settle, fail) => {
+        resolve = settle;
+        reject = fail;
+      });
+      const waiter = { resolve };
+      const waiters = this.terminalStateWaiters.get(runId) ?? new Set();
+      waiters.add(waiter);
+      this.terminalStateWaiters.set(runId, waiters);
+      const onAbort = () => reject(options?.signal?.reason ?? new Error('Execution run wait cancelled'));
+      options?.signal?.addEventListener('abort', onAbort, { once: true });
+      if (options?.signal?.aborted) onAbort();
+      if (this.runs.get(runId)?.status !== 'running') resolve();
+      try {
+        await promise;
+      } finally {
+        options?.signal?.removeEventListener('abort', onAbort);
+        const currentWaiters = this.terminalStateWaiters.get(runId);
+        currentWaiters?.delete(waiter);
+        if (currentWaiters?.size === 0) this.terminalStateWaiters.delete(runId);
+      }
+    }
     const ctrl = this.controllers.get(runId);
     if (ctrl) {
-      await ctrl.terminalPromise;
-      await ctrl.terminalMarkerWritePromise?.catch(() => {});
-      await this.terminalMarkerWritePromises.get(runId)?.catch(() => {});
-      await this.terminalRuntimeActivityPromises.get(runId);
+      await awaitExecutionRunObservation(ctrl.terminalPromise, options?.signal);
+      await awaitExecutionRunObservation(ctrl.terminalMarkerWritePromise?.catch(() => {}) ?? Promise.resolve(), options?.signal);
+      await awaitExecutionRunObservation(this.terminalMarkerWritePromises.get(runId)?.catch(() => {}) ?? Promise.resolve(), options?.signal);
       return;
     }
-    await this.terminalMarkerWritePromises.get(runId)?.catch(() => {});
-    await this.terminalRuntimeActivityPromises.get(runId);
+    await awaitExecutionRunObservation(this.terminalMarkerWritePromises.get(runId)?.catch(() => {}) ?? Promise.resolve(), options?.signal);
     // If there's no controller, the run is either unknown or already terminal.
     return;
   }
@@ -381,6 +446,7 @@ export class ExecutionRunManager {
     if (!run) return null;
     const ctrl = this.controllers.get(runId) ?? null;
     const availableActionIds = getExecutionRunAvailableActionIds(run, ctrl);
+    const requestedConfiguration = requestedConfigurationForRun(run);
     return ExecutionRunPublicStateSchema.parse({
       runId: run.runId,
       callId: run.callId,
@@ -389,6 +455,7 @@ export class ExecutionRunManager {
       backendTarget: run.backendTarget,
       ...(run.display ? { display: run.display } : {}),
       ...(run.launch?.launchOrigin ? { launchOrigin: run.launch.launchOrigin } : {}),
+      ...(requestedConfiguration ? { requestedConfiguration } : {}),
       permissionMode: run.permissionMode,
       retentionPolicy: run.retentionPolicy,
       runClass: run.runClass,
@@ -409,6 +476,7 @@ export class ExecutionRunManager {
     for (const run of this.runs.values()) {
       const ctrl = this.controllers.get(run.runId) ?? null;
       const availableActionIds = getExecutionRunAvailableActionIds(run, ctrl);
+      const requestedConfiguration = requestedConfigurationForRun(run);
       const parsed = ExecutionRunPublicStateSchema.parse({
         runId: run.runId,
         callId: run.callId,
@@ -417,6 +485,7 @@ export class ExecutionRunManager {
         backendTarget: run.backendTarget,
         ...(run.display ? { display: run.display } : {}),
         ...(run.launch?.launchOrigin ? { launchOrigin: run.launch.launchOrigin } : {}),
+        ...(requestedConfiguration ? { requestedConfiguration } : {}),
         permissionMode: run.permissionMode,
         retentionPolicy: run.retentionPolicy,
         runClass: run.runClass,
@@ -488,6 +557,13 @@ export class ExecutionRunManager {
       terminalMarkerWritePromises: this.terminalMarkerWritePromises,
     });
     const current = this.runs.get(runId);
+    if (!current || current.status !== 'running') {
+      const waiters = this.terminalStateWaiters.get(runId);
+      if (waiters) {
+        this.terminalStateWaiters.delete(runId);
+        for (const waiter of waiters) waiter.resolve();
+      }
+    }
     if (wasRunning && current && current.status !== 'running') {
       this.trackRunRuntimeActivityTerminal(runId, `execution_run_${current.status}`);
       if (current.notifyParentOnCompletion === true && this.enqueueParentSessionInput) {
@@ -653,6 +729,9 @@ export class ExecutionRunManager {
       }
       if (ctrl.cancelled) return { ok: false, errorCode: 'execution_run_not_allowed', error: 'Not running' };
       if (!ctrl.turnInFlight) return { ok: false, errorCode: 'execution_run_not_allowed', error: 'Not in flight' };
+      if (ctrl.turnCancelReason === 'outcome_unknown') {
+        return { ok: false, errorCode: 'execution_run_busy', error: 'Run is busy' };
+      }
 
       const delivery = params.delivery;
       const normalized = delivery === undefined ? 'prompt' : delivery;
@@ -678,7 +757,11 @@ export class ExecutionRunManager {
             ? normalized
             : 'prompt',
           resolve: () => finish({ ok: true }),
-          reject: (e: Error) => finish({ ok: false, errorCode: 'execution_run_failed', error: e.message }),
+          reject: (e: Error) => finish({
+            ok: false,
+            errorCode: readExecutionRunErrorCode(e) ?? 'execution_run_failed',
+            error: e.message,
+          }),
         } as const;
         ctrl.pendingExternalMessages.push(queuedMessage);
         if (ctrl.pendingExternalMessagesSignal) {
@@ -687,10 +770,13 @@ export class ExecutionRunManager {
         }
         const timeoutMs = readBoundedExternalSendAckTimeoutMs();
         timeoutHandle = setTimeout(() => {
+          timeoutHandle = null;
           const index = ctrl.pendingExternalMessages.indexOf(queuedMessage);
-          if (index >= 0) {
-            ctrl.pendingExternalMessages.splice(index, 1);
-          }
+          // This deadline bounds only time spent waiting for the bounded runner to adopt the
+          // message. Once shifted, the runner owns provider admission and its typed outcome;
+          // reporting busy after that point would invite a duplicate effect.
+          if (index < 0) return;
+          ctrl.pendingExternalMessages.splice(index, 1);
           finish({
             ok: false,
             errorCode: 'execution_run_busy',
@@ -878,16 +964,7 @@ export class ExecutionRunManager {
       finishRun: this.finishRun.bind(this),
       });
       if (!result.ok) return result;
-      try {
-        await this.terminalRuntimeActivityPromises.get(runId);
-        return result;
-      } catch (error) {
-        return {
-          ok: false,
-          errorCode: 'execution_run_runtime_activity_unavailable',
-          error: error instanceof Error ? error.message : 'Runtime activity terminal publication failed',
-        };
-      }
+      return result;
     });
   }
 

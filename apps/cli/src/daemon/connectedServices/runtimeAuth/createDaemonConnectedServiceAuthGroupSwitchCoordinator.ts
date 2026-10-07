@@ -54,6 +54,15 @@ type AuthGroupApi = Readonly<{
       state: ConnectedServiceAuthGroupMemberStateV1;
     }>>;
   }>): Promise<ConnectedServiceAuthGroupV1>;
+  updateConnectedServiceAuthGroupMember?(input: Readonly<{
+    serviceId: ConnectedServiceId;
+    groupId: string;
+    profileId: string;
+    enabled: boolean;
+    state?: ConnectedServiceAuthGroupMemberStateV1;
+    expectedGeneration: number;
+    expectedRuntimeStateRevision?: number;
+  }>): Promise<ConnectedServiceAuthGroupV1>;
   listConnectedServiceProfiles?(input: Readonly<{ serviceId: ConnectedServiceId }>): Promise<Readonly<{
     serviceId: ConnectedServiceId;
     profiles: ReadonlyArray<Readonly<{
@@ -494,29 +503,47 @@ export function createDaemonConnectedServiceAuthGroupSwitchCoordinator(params: R
       let policy = input.loaded.policy;
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
-          await params.api.updateConnectedServiceAuthGroupRuntimeState({
-            serviceId,
-            groupId: input.groupId,
-            expectedGeneration: generation,
-            expectedRuntimeStateRevision: runtimeStateRevision,
-            memberStates: [{
-              profileId: observedProfileId,
-              state: buildObservedFailureMemberRuntimeState({
-                existing: existingState,
-                policy,
-                reason: input.reason,
-                limitCategory: input.limitCategory,
-                retryAtMs: resolveRetryAtMs({
-                  retryAtMs: input.retryAtMs,
-                  retryAfterMs: input.retryAfterMs,
-                  resetsAtMs: input.resetsAtMs,
-                  nowMs: params.nowMs(),
-                }),
-                planType: input.planType,
-                observedAtMs: params.nowMs(),
-              }),
-            }],
+          const nextMemberState = buildObservedFailureMemberRuntimeState({
+            existing: existingState,
+            policy,
+            reason: input.reason,
+            limitCategory: input.limitCategory,
+            quotaScope: input.quotaScope,
+            providerLimitId: input.providerLimitId,
+            retryAtMs: resolveRetryAtMs({
+              retryAtMs: input.retryAtMs,
+              retryAfterMs: input.retryAfterMs,
+              resetsAtMs: input.resetsAtMs,
+              nowMs: params.nowMs(),
+            }),
+            planType: input.planType,
+            observedAtMs: params.nowMs(),
           });
+          if (
+            nextMemberState.autoDisabledReason === 'model_not_entitled'
+            && params.api.updateConnectedServiceAuthGroupMember
+          ) {
+            await params.api.updateConnectedServiceAuthGroupMember({
+              serviceId,
+              groupId: input.groupId,
+              profileId: observedProfileId,
+              enabled: false,
+              state: nextMemberState,
+              expectedGeneration: generation,
+              expectedRuntimeStateRevision: runtimeStateRevision,
+            });
+          } else {
+            await params.api.updateConnectedServiceAuthGroupRuntimeState({
+              serviceId,
+              groupId: input.groupId,
+              expectedGeneration: generation,
+              expectedRuntimeStateRevision: runtimeStateRevision,
+              memberStates: [{
+                profileId: observedProfileId,
+                state: nextMemberState,
+              }],
+            });
+          }
           return;
         } catch (error) {
           if (!(error instanceof ConnectedServiceAuthGroupRuntimeStateRevisionConflictError) || attempt === 1) throw error;

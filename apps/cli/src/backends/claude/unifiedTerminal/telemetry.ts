@@ -35,7 +35,7 @@ export type ClaudeUnifiedTelemetryEvent =
           inputByteLength?: number | undefined;
           inputNewlineCount?: number | undefined;
           writeTimeoutMs?: number | undefined;
-          originKind: 'ui_pending' | 'ui_immediate' | 'rpc';
+          originKind: 'ui_pending' | 'ui_immediate' | 'goal_control';
           inFlightSteer?: boolean | undefined;
         }>;
       }>
@@ -53,7 +53,7 @@ export type ClaudeUnifiedTelemetryEvent =
             | 'own_draft_clear_attempted'
             | 'starvation_escalated';
           reason?: TelemetryReason | undefined;
-          originKind: 'ui_pending' | 'ui_immediate' | 'rpc';
+          originKind: 'ui_pending' | 'ui_immediate' | 'goal_control';
           queuedBannerVisible?: boolean | undefined;
           composerDraftPresent?: boolean | undefined;
           /** Length of the composer draft blocking a steer (`user_draft` evidence, lane X). */
@@ -87,7 +87,7 @@ export type ClaudeUnifiedTelemetryEvent =
             | 'blocked_non_input_state'
             | undefined;
           consecutiveDeferrals?: number | undefined;
-          originKind: 'ui_pending' | 'ui_immediate' | 'rpc';
+          originKind: 'ui_pending' | 'ui_immediate' | 'goal_control';
         }>;
       }>
     | Readonly<{
@@ -194,7 +194,7 @@ export function emitClaudeUnifiedInjectionOutcome(
     inputByteLength?: number | undefined;
     inputNewlineCount?: number | undefined;
     writeTimeoutMs?: number | undefined;
-    originKind: 'ui_pending' | 'ui_immediate' | 'rpc';
+    originKind: 'ui_pending' | 'ui_immediate' | 'goal_control';
     inFlightSteer?: boolean | undefined;
   }>,
 ): void {

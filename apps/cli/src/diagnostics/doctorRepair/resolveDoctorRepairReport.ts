@@ -16,10 +16,8 @@ import type { DaemonServiceInventoryEntry } from '@/daemon/service/cli';
 import { resolveDaemonServiceCliRuntimeFromEnv, resolveDaemonServiceInventoryEntries } from '@/daemon/service/cli';
 import type { DoctorSnapshot } from '@/ui/doctorSnapshot';
 import { buildDoctorSnapshot } from '@/ui/doctorSnapshot';
-import { readCredentials, readSettings } from '@/persistence';
 
-import type { AuthSignalsForProfile } from './classifyAuth';
-import { checkAuthLive } from './authLiveCheck';
+import { resolveDoctorRepairAuthContext } from './resolveDoctorRepairAuthContext';
 import { buildDoctorRepairReport } from './buildDoctorRepairReport';
 import { readLatestRelayVersion } from './relayUpdateCheck';
 import type {
@@ -100,7 +98,7 @@ export async function resolveDoctorRepairReport(params: Readonly<{
     : null;
 
   const { activeServerUrl, authSignals, hasAnyServerProfile, targetProfileExists } =
-    await resolveAuthContext({ targetServerId });
+    await resolveDoctorRepairAuthContext({ targetServerId });
 
   // When `--server <id>` is set, the diagnostic operates against that
   // profile. `currentServerId` controls finding generation for things like
@@ -381,103 +379,4 @@ function buildLocalRelayEntries(snapshot: DoctorSnapshot | null): readonly Local
     });
   }
   return out;
-}
-
-/**
- * Assemble auth signals for every configured server profile + the active
- * server URL, reading from persisted settings. A `machineId` present in
- * `machineIdByServerId` is treated as "machine registered" for that profile.
- *
- * Live-check policy: when a non-empty token exists we make a single
- * `GET /v1/account/profile` call for the *active* profile only, with a 3s
- * timeout. A 401/403 flips `isExpired` to true; anything else leaves it
- * false so the `auth_expired_for_active_profile` finding doesn't false-fire
- * offline. Non-active profiles don't get a live check — their `isExpired`
- * remains unknown (false) here; expiry on those is surfaced lazily when
- * the user actually switches to them.
- */
-async function resolveAuthContext(params: Readonly<{
-  /**
-   * When set, the auth signals are built as if this profile were active —
-   * driving live-check, expiry, and `isActive` flags off it instead of
-   * `settings.activeServerId`. Surfaces absence: when no profile matches,
-   * `targetProfileExists` is `false`.
-   */
-  targetServerId: string | null;
-} > = { targetServerId: null }): Promise<Readonly<{
-  activeServerUrl: string | null;
-  authSignals: readonly AuthSignalsForProfile[];
-  hasAnyServerProfile: boolean;
-  /**
-   * `null` when no `targetServerId` was passed (unscoped report).
-   * `true` when the requested server profile exists in settings.
-   * `false` when the requested server profile is not configured — the
-   * caller emits `server_profile_missing` in this case.
-   */
-  targetProfileExists: boolean | null;
-}>> {
-  const [settings, credentials] = await Promise.all([
-    readSettings().catch(() => null),
-    readCredentials().catch(() => null),
-  ]);
-  const servers = settings?.servers ?? {};
-  const settingsActiveServerId = String(settings?.activeServerId ?? '').trim();
-  const machineIdByServerId = settings?.machineIdByServerId ?? {};
-  const lastTokenSubByServerId = settings?.lastTokenSubByServerId ?? {};
-  const profiles = Object.values(servers).filter((p): p is NonNullable<typeof p> => Boolean(p));
-  const hasAnyServerProfile = profiles.length > 0;
-
-  // When `--server <id>` is set, the report treats THAT profile as active
-  // for the purpose of finding generation. Settings aren't mutated; only
-  // the in-memory snapshot used to build this report.
-  const effectiveActiveServerId = params.targetServerId ?? settingsActiveServerId;
-  const activeProfile = profiles.find((p) => p.id === effectiveActiveServerId) ?? null;
-  const targetProfileExists = params.targetServerId === null
-    ? null
-    : activeProfile !== null;
-  const activeServerUrl = activeProfile?.serverUrl ?? configuration.serverUrl ?? null;
-
-  // Live expiry check for the active profile only. The credentials file is
-  // per-home, so `credentials.token` is the token we'd use against whichever
-  // profile is active. Reachability tells the renderer whether we actually
-  // confirmed the auth state — critical when the relay is down, so users
-  // don't see a misleading "signed in" when we couldn't verify.
-  const activeToken = String(credentials?.token ?? '').trim();
-  let activeExpired = false;
-  let activeReachability: 'verified' | 'unreachable' | 'not-probed' = 'not-probed';
-  if (activeProfile && activeProfile.id === settingsActiveServerId && activeToken) {
-    const result = await checkAuthLive({
-      serverUrl: activeProfile.serverUrl,
-      token: activeToken,
-    });
-    activeExpired = result === 'expired';
-    // 'ok' and 'expired' are both definitive answers from the server.
-    // 'unknown' means the server didn't respond — don't claim verified.
-    activeReachability = result === 'unknown' ? 'unreachable' : 'verified';
-  }
-
-  const signals: AuthSignalsForProfile[] = profiles.map((profile) => {
-    // Credentials are per-home, not per-profile, but we treat "has a known
-    // account sub recorded for this profile" as the best offline signal that
-    // the user has ever authenticated there. New profiles or replaced homes
-    // get no sub until first login.
-    const lastSub = String(lastTokenSubByServerId[profile.id] ?? '').trim();
-    const machineId = String(machineIdByServerId[profile.id] ?? '').trim();
-    const isActive = profile.id === effectiveActiveServerId;
-    const isPersistedActiveProfile = profile.id === settingsActiveServerId;
-    const hasCredentials = isPersistedActiveProfile ? activeToken.length > 0 : lastSub.length > 0;
-    return {
-      serverId: profile.id,
-      serverName: profile.name || profile.id,
-      serverUrl: profile.serverUrl,
-      hasCredentials,
-      isExpired: isActive ? activeExpired : false,
-      machineRegistered: machineId.length > 0,
-      credentialEvidence: isPersistedActiveProfile ? 'active-store' : 'historical-record',
-      isActive,
-      reachability: isActive ? activeReachability : 'not-probed',
-    };
-  });
-
-  return { activeServerUrl, authSignals: signals, hasAnyServerProfile, targetProfileExists };
 }

@@ -1,15 +1,21 @@
-import type { DirectTranscriptRawMessageV1 } from '@happier-dev/protocol';
+import {
+  resolveDirectTranscriptContinuation,
+  type DirectTranscriptRawMessageV1,
+  type DirectTranscriptTruncationReason,
+} from '@happier-dev/protocol';
 
 export type DirectTranscriptImportPage = Readonly<{
   items: DirectTranscriptRawMessageV1[];
   nextCursor: string | null;
   hasMore: boolean;
   truncated?: boolean;
+  truncationReason?: DirectTranscriptTruncationReason;
 }>;
 
 export async function loadDirectSessionTranscriptItems(params: Readonly<{
   readPage: (cursor: string | undefined) => Promise<DirectTranscriptImportPage>;
   maxPages?: number;
+  signal?: AbortSignal;
 }>): Promise<DirectTranscriptRawMessageV1[]> {
   const pages: DirectTranscriptRawMessageV1[][] = [];
   const maxPages = params.maxPages ?? 10_000;
@@ -17,9 +23,11 @@ export async function loadDirectSessionTranscriptItems(params: Readonly<{
   let complete = false;
 
   for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
+    params.signal?.throwIfAborted();
     const page = await params.readPage(cursor);
+    params.signal?.throwIfAborted();
 
-    if (page.truncated === true) {
+    if (resolveDirectTranscriptContinuation(page) === 'source_discontinuity') {
       pages.length = 0;
       cursor = undefined;
       continue;

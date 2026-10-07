@@ -23,10 +23,27 @@ import {
 } from '@/components/sessions/actions/sessionActionIds';
 import { createSessionActionDropdownItem } from '@/components/sessions/actions/sessionActionPresentation';
 import type { SessionActionTarget } from '@/components/sessions/actions/sessionActionTypes';
+import type { SessionReminderPresentation } from '@/sync/domains/session/organization/attentionStanding';
 
 import { buildSessionRowMoreMenuItems } from './buildSessionRowActionMenuItems';
 import type { SessionRowActionMenuState } from './sessionRowActionMenuTypes';
 import { Icon } from '@/components/ui/icons/Icon';
+import {
+    sessionClearAttentionReminderWithServerScope,
+    sessionSetAttentionReminderWithServerScope,
+} from '@/sync/ops/sessionOrganization';
+import {
+    resolveSessionAttentionReminderSelection,
+    SESSION_ATTENTION_REMINDER_MENU_ID,
+} from './sessionAttentionReminderAction';
+import { useSettingMutable } from '@/sync/domains/state/storage';
+import {
+    resolveSessionReminderPresetRule,
+    sessionReminderPresetRuleKey,
+    upsertSessionReminderPreset,
+    type SessionReminderPresetV1,
+} from '@/sync/domains/session/organization/sessionReminderPreset';
+import { showSessionReminderDateTimeModal, showSessionReminderPresetManagerModal } from './sessionReminderModals';
 
 function showActionError(error: unknown) {
     if (error instanceof HappyError) {
@@ -89,9 +106,10 @@ export function useSessionRowActionMenu(params: Readonly<{
     isNativeMobile: boolean;
     setContextMenuOpen: (open: boolean) => void;
     openTagsMenuFromContext: () => void;
-    deferredContextActionDelayMs: number;
+    reminder?: SessionReminderPresentation | null;
 }>): SessionRowActionMenuState {
     const target = params.target;
+    const [reminderPresets, setReminderPresets] = useSettingMutable('sessionReminderPresetsV1');
     const tagMenuItems = React.useMemo((): DropdownMenuItem[] => {
         return params.knownTags.map((tag) => ({
             id: tag,
@@ -229,6 +247,9 @@ export function useSessionRowActionMenu(params: Readonly<{
             leadingItems: params.leadingMenuItems,
             folderMoveMenuItems: params.folderMoveMenuItems,
             canMoveToFolder: typeof params.onMoveToFolder === 'function',
+            reminderPresets,
+            reminder: params.reminder,
+            reminderNowMs: Date.now(),
         });
         if (
             !params.isNativeMobile
@@ -255,6 +276,8 @@ export function useSessionRowActionMenu(params: Readonly<{
         params.onMoveToFolder,
         params.selectionModeActive,
         params.selectionModeAvailable,
+        reminderPresets,
+        params.reminder,
         target,
     ]);
 
@@ -273,6 +296,38 @@ export function useSessionRowActionMenu(params: Readonly<{
         }
         if (itemId.startsWith('move-to-folder:')) {
             params.onSelectFolderMoveMenuItem?.(itemId);
+            return;
+        }
+        if (itemId.startsWith(`${SESSION_ATTENTION_REMINDER_MENU_ID}:`)) {
+            const nowMs = Date.now();
+            const selection = resolveSessionAttentionReminderSelection(itemId, nowMs);
+            if (selection?.kind === 'current') return;
+            if (selection?.kind === 'remove') {
+                const result = await sessionClearAttentionReminderWithServerScope(target.sessionId, { serverId: target.serverId });
+                if (!result.success) Modal.alert(t('common.error'), result.message ?? t('errors.unknownError'));
+                return;
+            }
+            let remindAt = selection?.kind === 'timestamp' ? selection.remindAt : null;
+            let pendingPreset: SessionReminderPresetV1 | null = null;
+            if (selection?.kind === 'custom') {
+                const result = await showSessionReminderDateTimeModal(nowMs);
+                remindAt = result?.remindAt ?? null;
+                pendingPreset = result?.preset ?? null;
+            } else if (selection?.kind === 'preset') {
+                const preset = reminderPresets.find((candidate) => sessionReminderPresetRuleKey(candidate.rule) === selection.ruleKey);
+                remindAt = preset ? resolveSessionReminderPresetRule(preset.rule, nowMs) : null;
+            } else if (selection?.kind === 'manage_presets') {
+                const managed = await showSessionReminderPresetManagerModal(reminderPresets);
+                if (managed) setReminderPresets(managed);
+            }
+            if (remindAt !== null) {
+                const result = await sessionSetAttentionReminderWithServerScope(target.sessionId, remindAt, { serverId: target.serverId });
+                if (!result.success) {
+                    Modal.alert(t('common.error'), result.message ?? t('errors.unknownError'));
+                } else if (pendingPreset) {
+                    setReminderPresets(upsertSessionReminderPreset(reminderPresets, pendingPreset));
+                }
+            }
             return;
         }
         const readState = resolveManualReadStateFromSessionActionId(itemId);
@@ -315,6 +370,8 @@ export function useSessionRowActionMenu(params: Readonly<{
         params.onMoveToFolder,
         params.onSelectLeadingMenuItem,
         params.onSelectFolderMoveMenuItem,
+        reminderPresets,
+        setReminderPresets,
     ]);
 
     const contextMenuItems = React.useMemo((): DropdownMenuItem[] => {
@@ -375,13 +432,6 @@ export function useSessionRowActionMenu(params: Readonly<{
                 actionId: itemId,
                 onTogglePinned: params.onTogglePinned,
             }).catch(showActionError);
-            return;
-        }
-        if (itemId === SESSION_ACTION_RENAME_ID) {
-            params.setContextMenuOpen(false);
-            setTimeout(() => {
-                void handleMoreMenuSelect(itemId);
-            }, params.deferredContextActionDelayMs);
             return;
         }
         params.setContextMenuOpen(false);

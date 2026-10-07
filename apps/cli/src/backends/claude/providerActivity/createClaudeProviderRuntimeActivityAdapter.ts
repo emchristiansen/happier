@@ -56,6 +56,20 @@ export function createClaudeProviderRuntimeActivityAdapter(params: Readonly<{
     };
 
     return {
+        async publishBeforeRuntimeStart(reasonCode: string): Promise<void> {
+            if (!isCurrentRuntime()) return;
+            if (observationState === 'active' && !observationComplete) {
+                // The previous owned provider has stopped. Its lost observer cannot establish
+                // liveness for a new launch; only a zero-task inventory establishes prelaunch idle.
+                if (params.providerActivityLedger.hasActiveProviderTasks()) return;
+                observationState = 'inactive';
+                observationComplete = true;
+            }
+            if (observationState !== 'inactive' || !observationComplete) return;
+            // A launcher that has not started its owned provider process can publish its
+            // current inventory without claiming that the provider observer is installed.
+            await enqueueProjection(currentProjection(), reasonCode);
+        },
         async activateObservation(reasonCode: string): Promise<void> {
             if (!isCurrentRuntime() || observationState !== 'inactive') return;
             observationState = 'activating';

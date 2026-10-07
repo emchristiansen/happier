@@ -127,6 +127,92 @@ function readSessionListSessionById(data: readonly any[] | null, sessionId: stri
 }
 
 describe('sessions domain: sessionListViewData rebuild gating', () => {
+    it('does not let late whole-session applies regress versioned projections', async () => {
+        mockSessionPersistenceBoundaries();
+
+        const { syncPerformanceTelemetry } = await import('@/sync/runtime/syncPerformanceTelemetry');
+        const { createSessionsDomain } = await import('./sessions');
+        const { get, domain } = createHarness(createSessionsDomain, {
+            settings: {
+                groupInactiveSessionsByProject: false,
+                sessionListAttentionPromotionModeV1: 'global',
+            },
+        });
+        const current = {
+            id: 's1',
+            seq: 10,
+            createdAt: 1,
+            updatedAt: 1_000,
+            meaningfulActivityAt: 900,
+            active: true,
+            activeAt: 900,
+            archivedAt: null,
+            pendingVersion: 41,
+            pendingCount: 1,
+            pendingBlockedCount: 1,
+            metadata: { path: '/repo', name: 'Current' },
+            metadataVersion: 5,
+            agentState: { requests: { current: { id: 'current' } } },
+            agentStateVersion: 7,
+            thinking: false,
+            thinkingAt: 0,
+            presence: 'online' as const,
+            runtimeActivityState: 'idle' as const,
+            runtimeActivityActiveCount: 0,
+            runtimeActivityObservedAt: 800,
+            runtimeActivityRevision: 33,
+            latestTurnStatus: 'completed' as const,
+            latestTurnStatusObservedAt: 900,
+            latestReadyEventSeq: 10,
+            latestReadyEventAt: 900,
+        };
+
+        syncPerformanceTelemetry.configure({ enabled: true, slowThresholdMs: 1_000_000, flushIntervalMs: 60_000 });
+        try {
+            domain.applySessions([current]);
+            const initialList = get().sessionListViewData;
+            syncPerformanceTelemetry.reset();
+
+            domain.applySessions([{
+                ...current,
+                updatedAt: 1_100,
+                pendingVersion: 40,
+                pendingCount: 0,
+                pendingBlockedCount: 0,
+                metadata: { path: '/repo', name: 'Stale' },
+                metadataVersion: 4,
+                agentState: { requests: {} },
+                agentStateVersion: 6,
+                runtimeActivityState: 'active',
+                runtimeActivityActiveCount: 1,
+                runtimeActivityObservedAt: 700,
+                runtimeActivityRevision: 25,
+            }]);
+
+            expect(get().sessions.s1).toMatchObject({
+                pendingVersion: 41,
+                pendingCount: 1,
+                pendingBlockedCount: 1,
+                metadataVersion: 5,
+                metadata: { name: 'Current' },
+                agentStateVersion: 7,
+                agentState: { requests: { current: { id: 'current' } } },
+                runtimeActivityState: 'idle',
+                runtimeActivityActiveCount: 0,
+                runtimeActivityObservedAt: 800,
+                runtimeActivityRevision: 33,
+            });
+            expect(get().sessionListViewData).toBe(initialList);
+            const changed = syncPerformanceTelemetry.snapshot().events.find((event) =>
+                event.name === 'sync.store.sessions.apply.changed'
+            );
+            expect(changed?.fields.listRebuild).toBe(0);
+        } finally {
+            syncPerformanceTelemetry.configure({ enabled: false });
+            syncPerformanceTelemetry.reset();
+        }
+    });
+
     it('publishes changed renderable ids for incremental session-list consumers', async () => {
         mockSessionPersistenceBoundaries();
         const { createSessionsDomain } = await import('./sessions');
@@ -809,7 +895,7 @@ describe('sessions domain: sessionListViewData rebuild gating', () => {
             runtimeActivityState: 'idle',
             runtimeActivityRevision: 1,
             runtimeActivityActiveCount: 0,
-            runtimeActivityObservedAt: null,
+            runtimeActivityObservedAt: now - 10_000,
         } as any;
 
         try {

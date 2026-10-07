@@ -169,7 +169,7 @@ function compareSessionsStableNewestFirst(a: SessionListRenderableSession, b: Se
     return a.id.localeCompare(b.id);
 }
 
-function resolveSessionDateGroupingAt(session: SessionListRenderableSession): number {
+export function resolveSessionListDateGroupingAt(session: SessionListRenderableSession): number {
     return deriveSessionListMeaningfulActivityAt({
         sessionCreatedAt: session.createdAt,
         sessionMeaningfulActivityAt: session.meaningfulActivityAt ?? null,
@@ -180,8 +180,8 @@ function resolveSessionDateGroupingAt(session: SessionListRenderableSession): nu
 }
 
 function compareSessionsStableNewestUpdatedFirst(a: SessionListRenderableSession, b: SessionListRenderableSession): number {
-    const left = resolveSessionDateGroupingAt(a);
-    const right = resolveSessionDateGroupingAt(b);
+    const left = resolveSessionListDateGroupingAt(a);
+    const right = resolveSessionListDateGroupingAt(b);
     if (right !== left) return right - left;
     return a.id.localeCompare(b.id);
 }
@@ -559,7 +559,7 @@ function pushDateGroupsToList(params: Readonly<{
     };
 
     for (const session of sessions) {
-        const sessionDate = new Date(resolveSessionDateGroupingAt(session));
+        const sessionDate = new Date(resolveSessionListDateGroupingAt(session));
         const dateString = sessionDate.toDateString();
 
         if (currentDateString !== dateString) {

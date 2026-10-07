@@ -1,15 +1,16 @@
-import chalk from 'chalk';
 import { logger } from '@/ui/logger';
 import type { TerminalRuntimeFlags } from '@/terminal/runtime/terminalRuntimeFlags';
 import { commandRegistry } from '@/cli/commandRegistry';
 import { buildRootHelpText } from '@/cli/buildRootHelpText';
 import { isTmuxAllowedCommand } from '@/cli/commandSurfaceManifest';
 import { readStartedByArg } from '@/cli/readStartedByArg';
-import { requireCatalogEntry } from '@/backends/catalog';
+import { AGENTS, requireCatalogEntry } from '@/backends/catalog';
 import { DEFAULT_CATALOG_AGENT_ID } from '@/backends/types';
+import { resolveInheritedHerdrRuntime } from '@/terminal/runtime/inheritedHerdrRuntime';
 import { applyDaemonAutostartEnvForInvocation, shouldEnsureDaemonForInvocation } from '@/daemon/ensureDaemon';
 import { applyEphemeralServerSelectionFromPrefixArgs } from '@/server/serverSelection';
 import packageJson from '../../package.json';
+import { fail } from '@happier-dev/cli-common/output';
 
 export async function dispatchCli(params: Readonly<{
   args: string[];
@@ -37,7 +38,7 @@ export async function dispatchCli(params: Readonly<{
   try {
     args = await applyEphemeralServerSelectionFromPrefixArgs(args);
   } catch (error) {
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : String(error));
+    console.error(fail(error instanceof Error ? error.message : String(error)));
     process.exit(1);
     return;
   }
@@ -67,7 +68,7 @@ export async function dispatchCli(params: Readonly<{
       if (idx !== -1) args.splice(idx, 1);
     } else {
       if (subcommand && !isTmuxAllowedCommand(subcommand)) {
-        console.error(chalk.red('Error:'), '--tmux can only be used when starting a session.');
+        console.error(fail('--tmux can only be used when starting a session.'));
         process.exit(1);
         return;
       }
@@ -76,18 +77,26 @@ export async function dispatchCli(params: Readonly<{
         const { startHappyHeadlessInTmux } = await import('@/terminal/tmux/startHappyHeadlessInTmux');
         await startHappyHeadlessInTmux(args);
       } catch (error) {
-        console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
+        console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
         if (process.env.DEBUG) {
-          console.error(error)
+          console.error(error);
         }
-        process.exit(1)
+        process.exit(1);
       }
       return;
     }
   }
   const commandHandler = (subcommand ? commandRegistry[subcommand] : undefined);
   if (commandHandler) {
-    await commandHandler({ args, rawArgv, terminalRuntime });
+    const startsSession = subcommand === 'resume'
+      || Object.values(AGENTS).some((entry) => entry?.cliSubcommand === subcommand);
+    await commandHandler({
+      args,
+      rawArgv,
+      terminalRuntime: startsSession
+        ? await resolveInheritedHerdrRuntime({ terminalRuntime, env: process.env })
+        : terminalRuntime,
+    });
     return;
   }
 
@@ -96,5 +105,9 @@ export async function dispatchCli(params: Readonly<{
     throw new Error(`Default agent '${DEFAULT_CATALOG_AGENT_ID}' has no CLI command handler registered`);
   }
   const defaultHandler = await defaultEntry.getCliCommandHandler();
-  await defaultHandler({ args, rawArgv, terminalRuntime });
+  await defaultHandler({
+    args,
+    rawArgv,
+    terminalRuntime: await resolveInheritedHerdrRuntime({ terminalRuntime, env: process.env }),
+  });
 }

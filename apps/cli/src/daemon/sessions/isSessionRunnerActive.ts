@@ -139,28 +139,43 @@ export type SessionRunnerServiceabilityProbe =
 export type SessionRunnerResumeDecision =
   | Readonly<{ action: 'spawn' }>
   | Readonly<{ action: 'adopt' }>
-  | Readonly<{ action: 'wait_for_exit'; reason: 'runtime_terminating' }>
+  | Readonly<{
+      action: 'wait_for_exit';
+      reason: 'runtime_terminating' | 'rpc_method_unavailable' | 'rpc_failed';
+    }>
   | Readonly<{ action: 'fence'; reason: string }>;
 
 export function resolveSessionRunnerResumeDecision(probe: SessionRunnerServiceabilityProbe): SessionRunnerResumeDecision {
   if (probe.state === 'runner_absent') return { action: 'spawn' };
   if (probe.state === 'runner_unknown') return { action: 'fence', reason: probe.reason };
   if (probe.control.state === 'servable') return { action: 'adopt' };
-  if (probe.control.state === 'recoverable_unservable' && probe.control.reason === 'runtime_terminating') {
-    return { action: 'wait_for_exit', reason: 'runtime_terminating' };
+  if (
+    probe.control.reason === 'runtime_terminating'
+    || probe.control.reason === 'rpc_method_unavailable'
+    || probe.control.reason === 'rpc_failed'
+  ) {
+    return { action: 'wait_for_exit', reason: probe.control.reason };
   }
   return { action: 'fence', reason: probe.control.reason };
 }
 
-export async function probeSessionRunnerServiceability(params: Readonly<{
+type SessionRunnerPresenceProbeParams = Readonly<{
   sessionId: string;
   trackedSessions: Iterable<TrackedSession>;
-  probeCapability: () => Promise<SessionRunnerServiceability>;
   readProcessRunState?: ReadProcessRunState;
   getProcessCommandHash?: SessionRunnerProcessCommandHashReader;
   getProcessInstanceFingerprint?: SessionRunnerProcessInstanceFingerprintReader;
   readSessionRunnerLockStatus?: (args: { sessionId: string }) => Promise<SessionRunnerLockStatus>;
-}>): Promise<SessionRunnerServiceabilityProbe> {
+}>;
+
+export type SessionRunnerPresenceProbe =
+  | Readonly<{ state: 'runner_present' }>
+  | Exclude<SessionRunnerServiceabilityProbe, Readonly<{ state: 'runner_present' }>>;
+
+/** Presence admission without performing or inventing a capability RPC result. */
+export async function probeSessionRunnerPresence(
+  params: SessionRunnerPresenceProbeParams,
+): Promise<SessionRunnerPresenceProbe> {
   const sessionId = normalizeSessionId(params.sessionId);
   const trackedSessions = Array.from(params.trackedSessions);
   const readProcessRunState = params.readProcessRunState ?? readProcessRunStateDefault;
@@ -176,7 +191,7 @@ export async function probeSessionRunnerServiceability(params: Readonly<{
       getProcessInstanceFingerprint: params.getProcessInstanceFingerprint,
     });
     if (presence === 'present') {
-      return { state: 'runner_present', control: await params.probeCapability() };
+      return { state: 'runner_present' };
     }
     if (presence !== 'absent') {
       return { state: 'runner_unknown', reason: 'runner_presence_unproven' };
@@ -191,10 +206,19 @@ export async function probeSessionRunnerServiceability(params: Readonly<{
     readSessionRunnerLockStatus: readLockStatus,
   });
   if (lockPresence === 'present') {
-    return { state: 'runner_present', control: await params.probeCapability() };
+    return { state: 'runner_present' };
   }
   if (lockPresence === 'absent' || lockPresence === 'recoverable_stopped') {
     return { state: 'runner_absent' };
   }
   return { state: 'runner_unknown', reason: 'runner_presence_unproven' };
+}
+
+export async function probeSessionRunnerServiceability(params: SessionRunnerPresenceProbeParams & Readonly<{
+  probeCapability: () => Promise<SessionRunnerServiceability>;
+}>): Promise<SessionRunnerServiceabilityProbe> {
+  const presence = await probeSessionRunnerPresence(params);
+  return presence.state === 'runner_present'
+    ? { ...presence, control: await params.probeCapability() }
+    : presence;
 }

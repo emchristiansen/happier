@@ -248,8 +248,8 @@ describe('happy tools bridge extension args', () => {
     expect(JSON.parse(backend.options?.toolsBridgeConfigText ?? '{}')).toEqual(baseBridge.sessionConfig);
   });
 
-  it.each(['plan', 'read-only', 'safe-yolo'] as const)(
-    'keeps native bridge tools available when %s restricts Pi built-in tools',
+  it.each(['plan', 'read-only'] as const)(
+    'keeps native bridge tools available when %s restricts Pi tools',
     (permissionMode) => {
       process.env.PATH = '';
       process.env.HAPPIER_PI_PATH = createFakeBin('pi');
@@ -267,6 +267,22 @@ describe('happy tools bridge extension args', () => {
       expect(backend.options?.args?.[toolsFlagIndex + 1]?.split(',')).toContain('change_title');
     },
   );
+
+  it('leaves Pi native and extension tools unfiltered in Auto mode', () => {
+    process.env.PATH = '';
+    process.env.HAPPIER_PI_PATH = createFakeBin('pi');
+
+    const backend = createPiBackend({
+      cwd: '/tmp',
+      env: {},
+      permissionMode: 'safe-yolo',
+      happierSessionId: 'happy-session-1',
+      happyToolsBridge: baseBridge,
+    }) as unknown as { options?: { args?: string[] } };
+
+    expect(backend.options?.args).toContain(baseBridge.extensionPath);
+    expect(backend.options?.args).not.toContain('--tools');
+  });
 });
 
 describe('buildPiRpcArgs', () => {
@@ -281,18 +297,25 @@ describe('buildPiToolsForPermissionMode', () => {
   it.each([
     { mode: 'plan', expected: ['read', 'grep', 'find', 'ls'] },
     { mode: 'read-only', expected: ['read', 'grep', 'find', 'ls'] },
+    { mode: 'read_only', expected: ['read', 'grep', 'find', 'ls'] },
     { mode: 'default', expected: null },
-    { mode: 'safe-yolo', expected: ['read', 'edit', 'write', 'grep', 'find', 'ls'] },
-    { mode: 'acceptEdits', expected: ['read', 'edit', 'write', 'grep', 'find', 'ls'] },
+    { mode: 'auto', expected: null },
+    { mode: 'safe-yolo', expected: null },
+    { mode: 'workspace_write', expected: null },
+    { mode: 'acceptEdits', expected: null },
     { mode: 'yolo', expected: null },
     { mode: 'bypassPermissions', expected: null },
   ] as const)('maps $mode to tools list', ({ mode, expected }) => {
     expect(buildPiToolsForPermissionMode(mode)).toEqual(expected);
   });
+
+  it.each(['yolo!', 'definitely-unknown'] as const)('fails closed for unknown mode %s', (mode) => {
+    expect(buildPiToolsForPermissionMode(mode)).toEqual(['read', 'grep', 'find', 'ls']);
+  });
 });
 
 describe('buildPiRpcArgs', () => {
-  it.each([undefined, 'default', 'yolo', 'bypassPermissions'] as const)(
+  it.each([undefined, 'default', 'safe-yolo', 'acceptEdits', 'yolo', 'bypassPermissions'] as const)(
     'leaves the native Pi tool catalog unrestricted for permission mode %s',
     (permissionMode) => {
       expect(buildPiRpcArgs({ permissionMode })).toEqual(['--mode', 'rpc']);
@@ -302,8 +325,6 @@ describe('buildPiRpcArgs', () => {
   it.each([
     { mode: 'read-only', tools: 'read,grep,find,ls' },
     { mode: 'plan', tools: 'read,grep,find,ls' },
-    { mode: 'safe-yolo', tools: 'read,edit,write,grep,find,ls' },
-    { mode: 'acceptEdits', tools: 'read,edit,write,grep,find,ls' },
   ] as const)('keeps the explicit tool restriction for $mode', ({ mode, tools }) => {
     expect(buildPiRpcArgs({ permissionMode: mode })).toEqual([
       '--mode',

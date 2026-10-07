@@ -99,7 +99,10 @@ function readMemberRuntimeStates(input: Readonly<{
       allowUnconfirmedConfidence: input.allowUnconfirmedConfidence,
     });
     if (!decision.ok) return { status: 'insufficient_evidence', decision };
-    const projectedState = projectProviderAccountUsageSnapshotToAuthGroupRuntimeState(snapshot);
+    const projectedState = projectProviderAccountUsageSnapshotToAuthGroupRuntimeState(
+      snapshot,
+      input.group.policy.quotaLimitSelection,
+    );
     if (!projectedState) return { status: 'insufficient_evidence' };
     memberStatesByProfileId.set(
       member.profileId,

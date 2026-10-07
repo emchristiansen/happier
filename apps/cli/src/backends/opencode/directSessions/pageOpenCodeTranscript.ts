@@ -1,4 +1,4 @@
-import type { DirectSessionsSource, DirectTranscriptRawMessageV1 } from '@happier-dev/protocol';
+import type { DirectSessionsSource, DirectTranscriptRawMessageV1, DirectTranscriptTruncationReason } from '@happier-dev/protocol';
 
 import { createOpenCodeDirectClient } from './createOpenCodeDirectClient';
 import { mapOpenCodeMessageToDirectItem } from './mapOpenCodeMessageToDirectItem';
@@ -36,7 +36,7 @@ export async function pageOpenCodeTranscript(params: Readonly<{
   cursor?: string;
   maxBytes: number;
   maxItems: number;
-}>): Promise<Readonly<{ items: DirectTranscriptRawMessageV1[]; nextCursor: string | null; tailCursor: string | null; hasMore: boolean; truncated?: boolean }>> {
+}>): Promise<Readonly<{ items: DirectTranscriptRawMessageV1[]; nextCursor: string | null; tailCursor: string | null; hasMore: boolean; truncated?: boolean; truncationReason?: DirectTranscriptTruncationReason }>> {
   if (params.direction !== 'older') {
     return { items: [], nextCursor: null, tailCursor: null, hasMore: false };
   }
@@ -82,7 +82,13 @@ export async function pageOpenCodeTranscript(params: Readonly<{
     const nextEndIndex = firstReturnedIndex ?? startIndex;
     const hasMore = nextEndIndex > 0;
     const nextCursor = hasMore ? encodeBackwardCursor({ v: 1, kind: 'opencodeBackward', endIndex: nextEndIndex }) : null;
-    return { items, nextCursor, tailCursor, hasMore, ...(truncated ? { truncated } : {}) };
+    return {
+      items,
+      nextCursor,
+      tailCursor,
+      hasMore,
+      ...(truncated ? { truncated, truncationReason: 'page_limit' as const } : {}),
+    };
   } finally {
     await client.dispose().catch(() => {});
   }

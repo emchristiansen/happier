@@ -323,9 +323,6 @@ vi.mock('@/components/account/RecoveryKeyReminderBanner', () => ({
     RecoveryKeyReminderBanner: 'RecoveryKeyReminderBanner',
 }));
 
-vi.mock('@/components/ui/feedback/UpdateBanner', () => ({
-    UpdateBanner: 'UpdateBanner',
-}));
 
 vi.mock('@/utils/sessions/sessionUtils', async (importOriginal) => {
     const actual = await importOriginal<typeof import('@/utils/sessions/sessionUtils')>();

@@ -96,7 +96,8 @@ vi.mock('@/sync/domains/state/storageStore', () => ({
     storage: () => vi.fn(),
 }));
 
-vi.mock('@/sync/domains/profiles/profile', () => ({
+vi.mock('@/sync/domains/profiles/profile', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@/sync/domains/profiles/profile')>(),
     getDisplayName: () => null,
 }));
 

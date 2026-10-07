@@ -9,7 +9,6 @@ import {
     subscribeSessionDraft,
     type ExistingSessionDraftProjection,
 } from '@/sync/ops/sessionDrafts/sessionDraftRepository';
-import type { SessionListViewItem } from '@/sync/domains/session/listing/sessionListViewData';
 import {
     createSessionListRowStoreStateSelector,
     selectSessionListRowStateSnapshot,
@@ -34,7 +33,7 @@ import {
 import {
     buildCachedSessionListRowModel,
     createSessionListRowModelsCache,
-    resolveSessionListRowModelAdjacency,
+    type SessionListRowModelAdjacency,
 } from './buildSessionListRowModels';
 import { SessionListRow } from './SessionListRow';
 import type {
@@ -58,6 +57,7 @@ type SessionListRowMoveActionHandlers = Readonly<{
 
 export type SessionListRowModelBoundaryProps = Readonly<{
     activeServerId?: string | null;
+    adjacency: SessionListRowModelAdjacency;
     dataActive: boolean;
     dataIndex: number;
     dragEnabled: boolean;
@@ -75,7 +75,6 @@ export type SessionListRowModelBoundaryProps = Readonly<{
     getRowTogglePinnedHandler: (sessionKey: string) => () => void;
     groupKey: string;
     item: SessionListRowSessionItem;
-    items: ReadonlyArray<SessionListViewItem>;
     nativeContextMenuSessionKey: string | null;
     onDragCancel: (event: UseSessionInlineDragCancelEvent) => void;
     onDragStart: (sessionKey: string) => void;
@@ -263,18 +262,13 @@ const SessionListRowModelBoundaryContent = React.memo(function SessionListRowMod
             ? { preview: props.draftProjection.preview }
             : null,
     }), [props.draftProjection, storeSnapshot]);
-    const adjacency = React.useMemo(
-        () => resolveSessionListRowModelAdjacency(props.items, props.dataIndex),
-        [props.dataIndex, props.items],
-    );
     const rowModel = React.useMemo(() => buildCachedSessionListRowModel({
         item: props.item,
         snapshot,
-        dataIndex: props.dataIndex,
-        adjacency,
+        adjacency: props.adjacency,
         settings,
         cache: rowModelsCacheRef.current,
-    }), [adjacency, props.dataIndex, props.item, settings, snapshot]);
+    }), [props.adjacency, props.item, settings, snapshot]);
 
     useSessionListRuntimeWake(rowModel.nextRuntimeFreshnessAtMs, props.dataActive);
 
@@ -304,10 +298,12 @@ const SessionListRowModelBoundaryContent = React.memo(function SessionListRowMod
     const onDeleteDraft = React.useMemo(() => {
         const scope = props.draftScope;
         if (!scope || !props.draftProjection) return null;
-        return () => deleteSessionDraft({
-            scope,
-            address: { kind: 'session', sessionId: props.item.session.id },
-        });
+        return async () => {
+            await deleteSessionDraft({
+                scope,
+                address: { kind: 'session', sessionId: props.item.session.id },
+            });
+        };
     }, [props.draftProjection, props.draftScope, props.item.session.id]);
 
     return (

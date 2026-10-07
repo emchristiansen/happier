@@ -5,7 +5,7 @@ import { useUnistyles } from 'react-native-unistyles';
 import { useOpenSessionTarget } from '@/components/sessions/panes/open/useOpenSessionTarget';
 import { t } from '@/text';
 import { useOptionalSessionScreenTestId } from '../shell/sessionScreenTestIds';
-import { SESSION_HEADER_ICON_SIZE_PX } from '@/components/sessions/actions/sessionHeaderIconMetrics';
+import { resolveSessionHeaderActionTargetPx, SESSION_HEADER_ICON_SIZE_PX } from '@/components/sessions/actions/sessionHeaderIconMetrics';
 import { SessionHeaderIconWithCount } from '@/components/sessions/actions/SessionHeaderIconWithCount';
 import { Icon } from '@/components/ui/icons/Icon';
 
@@ -43,10 +43,9 @@ export const SessionHeaderSubagentsButton = React.memo((props: Readonly<{
         <Pressable
             testID={testId}
             onPress={onPress}
-            hitSlop={15}
             style={({ pressed }) => ({
-                width: 44,
-                height: 44,
+                width: resolveSessionHeaderActionTargetPx(),
+                height: resolveSessionHeaderActionTargetPx(),
                 alignItems: 'center',
                 justifyContent: 'center',
                 opacity: pressed ? 0.7 : 1,

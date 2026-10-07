@@ -7,10 +7,26 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 const artifactBoundary = vi.hoisted(() => ({
   materialize: vi.fn(),
 }));
-
-vi.mock('@/utils/fs/protectedTempTextArtifact', () => ({
-  materializeProtectedTempTextArtifact: artifactBoundary.materialize,
+const fsBoundary = vi.hoisted(() => ({
+  stat: vi.fn(),
 }));
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  fsBoundary.stat.mockImplementation(actual.stat);
+  return { ...actual, stat: fsBoundary.stat };
+});
+
+vi.mock('@/utils/fs/protectedTempTextArtifact', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/utils/fs/protectedTempTextArtifact')>();
+  return {
+    ...actual,
+    materializeProtectedTempTextArtifact: (params: Parameters<typeof actual.materializeProtectedTempTextArtifact>[0]) =>
+      params.prefix === 'happier-pi-append-system-prompt-'
+        ? artifactBoundary.materialize(params)
+        : actual.materializeProtectedTempTextArtifact(params),
+  };
+});
 
 import { PiRpcBackend } from './PiRpcBackend';
 
@@ -60,6 +76,9 @@ describe('PiRpcBackend process startup lifecycle', () => {
     await Promise.all(backends.splice(0).map((backend) => backend.dispose()));
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
     artifactBoundary.materialize.mockReset();
+    fsBoundary.stat.mockClear();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   it('does not publish or spawn an artifact that finishes materializing after disposal', async () => {
@@ -105,6 +124,166 @@ describe('PiRpcBackend process startup lifecycle', () => {
 
     await Promise.all([first, second]);
     expect(artifactBoundary.materialize).toHaveBeenCalledOnce();
+  });
+
+  it('preserves the five-minute session-open budget after a slow process startup', async () => {
+    let nowMs = 0;
+    vi.spyOn(Date, 'now').mockImplementation(() => nowMs);
+
+    const dir = mkdtempSync(join(tmpdir(), 'happier-pi-startup-budget-'));
+    dirs.push(dir);
+    const backend = new PiRpcBackend({
+      cwd: dir,
+      command: process.execPath,
+      args: [],
+    });
+    backends.push(backend);
+
+    const observedTimeouts: number[] = [];
+    const priv = backend as unknown as {
+      connectedBrokerPreflight: Promise<{ ready: true }> | null;
+      ensureProcess: () => Promise<void>;
+      sendCommand: (command: { type: string }, timeoutMs: number) => Promise<{
+        type: 'response';
+        command: string;
+        success: true;
+        data: Record<string, unknown>;
+      }>;
+    };
+    priv.connectedBrokerPreflight = Promise.resolve({ ready: true });
+    priv.ensureProcess = async () => {
+      nowMs = 61_000;
+    };
+    priv.sendCommand = async (command, timeoutMs) => {
+      if (command.type === 'get_state') observedTimeouts.push(timeoutMs);
+      return {
+        type: 'response',
+        command: command.type,
+        success: true,
+        data: command.type === 'get_state'
+          ? { sessionId: 'pi-slow-startup', model: { id: 'm', provider: 'p' } }
+          : {},
+      };
+    };
+
+    await expect(backend.startSession()).resolves.toEqual({ sessionId: 'pi-slow-startup' });
+    expect(observedTimeouts[0]).toBe(239_000);
+  });
+
+  it('fails at the aggregate session-open deadline and prevents a late process spawn', async () => {
+    vi.useFakeTimers();
+    const dir = mkdtempSync(join(tmpdir(), 'happier-pi-startup-timeout-'));
+    dirs.push(dir);
+    const artifact = deferred<{ path: string; cleanup: () => Promise<void> }>();
+    const cleanup = vi.fn(async () => undefined);
+    artifactBoundary.materialize.mockReturnValueOnce(artifact.promise);
+    const backend = new PiRpcBackend({
+      cwd: dir,
+      command: process.execPath,
+      args: [writeFakePi(dir)],
+      appendSystemPromptText: 'system prompt',
+    });
+    backends.push(backend);
+
+    const priv = backend as unknown as {
+      process: unknown | null;
+      processTransitionInFlight: Promise<void> | null;
+    };
+    const start = backend.startSession();
+    const settled = vi.fn();
+    void start.then(
+      () => settled('resolved'),
+      (error: unknown) => settled('rejected', error),
+    );
+    await vi.waitFor(() => expect(artifactBoundary.materialize).toHaveBeenCalledOnce());
+    const transition = priv.processTransitionInFlight;
+    expect(transition).not.toBeNull();
+
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    await Promise.resolve();
+    const settlementAtDeadline = settled.mock.calls[0]?.[0] ?? 'pending';
+
+    artifact.resolve({ path: join(dir, 'late-artifact.txt'), cleanup });
+    await transition;
+    await expect(start).rejects.toThrow('Pi session open timed out during process startup');
+    expect(settlementAtDeadline).toBe('rejected');
+    expect(priv.process).toBeNull();
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('applies the aggregate process-start deadline when resuming a session', async () => {
+    vi.useFakeTimers();
+    const dir = mkdtempSync(join(tmpdir(), 'happier-pi-resume-startup-timeout-'));
+    dirs.push(dir);
+    const artifact = deferred<{ path: string; cleanup: () => Promise<void> }>();
+    const cleanup = vi.fn(async () => undefined);
+    artifactBoundary.materialize.mockReturnValueOnce(artifact.promise);
+    const backend = new PiRpcBackend({
+      cwd: dir,
+      command: process.execPath,
+      args: [writeFakePi(dir)],
+      appendSystemPromptText: 'system prompt',
+    });
+    backends.push(backend);
+
+    const priv = backend as unknown as {
+      process: unknown | null;
+      processTransitionInFlight: Promise<void> | null;
+    };
+    const load = backend.loadSession('pi-startup');
+    const settled = vi.fn();
+    void load.then(
+      () => settled('resolved'),
+      (error: unknown) => settled('rejected', error),
+    );
+    await vi.waitFor(() => expect(artifactBoundary.materialize).toHaveBeenCalledOnce());
+    const transition = priv.processTransitionInFlight;
+    expect(transition).not.toBeNull();
+
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    await Promise.resolve();
+    const settlementAtDeadline = settled.mock.calls[0]?.[0] ?? 'pending';
+
+    artifact.resolve({ path: join(dir, 'late-artifact.txt'), cleanup });
+    await transition;
+    await expect(load).rejects.toThrow('Pi session open timed out during process startup');
+    expect(settlementAtDeadline).toBe('rejected');
+    expect(priv.process).toBeNull();
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('applies the aggregate deadline while discovering a resume session file', async () => {
+    vi.useFakeTimers();
+    const dir = mkdtempSync(join(tmpdir(), 'happier-pi-resume-discovery-timeout-'));
+    dirs.push(dir);
+    const discovery = deferred<{ isFile: () => boolean }>();
+    fsBoundary.stat.mockImplementationOnce(() => discovery.promise);
+    const backend = new PiRpcBackend({
+      cwd: dir,
+      command: process.execPath,
+      args: [writeFakePi(dir)],
+      appendSystemPromptText: 'system prompt',
+    });
+    backends.push(backend);
+
+    const priv = backend as unknown as { process: unknown | null };
+    const load = backend.loadSession(join(dir, 'pi-startup.jsonl'));
+    const settled = vi.fn();
+    void load.then(
+      () => settled('resolved'),
+      (error: unknown) => settled('rejected', error),
+    );
+    await vi.waitFor(() => expect(fsBoundary.stat).toHaveBeenCalledOnce());
+
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    await Promise.resolve();
+    const settlementAtDeadline = settled.mock.calls[0]?.[0] ?? 'pending';
+
+    discovery.resolve({ isFile: () => true });
+    await expect(load).rejects.toThrow('Pi session open timed out during session file discovery');
+    expect(settlementAtDeadline).toBe('rejected');
+    expect(artifactBoundary.materialize).not.toHaveBeenCalled();
+    expect(priv.process).toBeNull();
   });
 
   it('cleans the protected artifact when the Pi process cannot launch', async () => {

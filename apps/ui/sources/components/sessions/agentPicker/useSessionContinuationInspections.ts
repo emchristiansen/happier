@@ -5,7 +5,7 @@ import type {
     SessionContinuationMachinePresenceV1,
 } from '@happier-dev/protocol';
 
-import { inspectSessionContinuationOnMachine } from '@/sync/ops/sessionContinuationInspection';
+import { inspectSessionContinuationsOnMachine } from '@/sync/ops/sessionContinuationInspection';
 
 import type {
     SessionAgentContinuationInspectionState,
@@ -109,35 +109,34 @@ export function useSessionContinuationInspections(
         // Claim before awaiting so a re-render mid-flight cannot ask twice.
         for (const selection of pending) scope.asked.add(selectionKey(selection));
 
-        // Each answer is recorded on arrival rather than gathered into one batch.
-        // A batch is only as fast as its slowest target, and the rail decision now
-        // waits on these answers, so one target running out its transport timeout
-        // would hold every other target's answer — and the rail — behind it for the
-        // whole of that timeout.
+        // The daemon reads and decrypts the source Session once, then evaluates
+        // every target against that one canonical source. Publishing the ordered
+        // result once also prevents one state update and picker recomputation per
+        // Agent row. The compatibility adapter inside this operation falls back
+        // to the published single-target RPC only for an older daemon.
         //
         // No cancellation on cleanup: closing the picker mid-flight must still
-        // record the answer, or the claim above would strand the row on
+        // record the answers, or the claims above would strand the rows on
         // "checking" for the rest of the connection.
-        for (const selection of pending) {
-            const key = selectionKey(selection);
-            void inspectSessionContinuationOnMachine({
+        void inspectSessionContinuationsOnMachine({
                 machineId,
                 serverId,
                 sessionId,
-                selection,
+                selections: pending,
             })
-                .catch((): SessionAgentContinuationInspectionState => INDETERMINATE)
-                .then((result) => {
+                .catch(() => pending.map(() => INDETERMINATE))
+                .then((results) => {
                     // An answer read over a connection or machine state that no
                     // longer applies is discarded rather than shown.
                     if (scopeRef.current !== scope) return;
                     setAnswers((current) => {
                         const next = new Map(current);
-                        next.set(key, result);
+                        pending.forEach((selection, index) => {
+                            next.set(selectionKey(selection), results[index] ?? INDETERMINATE);
+                        });
                         return next;
                     });
                 });
-        }
     }, [demanded, machineId, offline, scopeKey, serverId, sessionId, targetsKey]);
 
     const read = React.useCallback((selection: SessionAgentTransitionSelectionV1): SessionAgentContinuationInspectionState => {

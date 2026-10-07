@@ -1,5 +1,7 @@
 import { AGENTS_CORE } from '@happier-dev/agents';
 
+import { createAcpSessionListCatalogHook } from '@/agent/acp/catalog/createAcpSessionListCatalogHook';
+
 import { checklists } from './cli/checklists';
 import type { AgentCatalogEntry } from '../types';
 
@@ -11,6 +13,7 @@ export const agent = {
   getCliDetect: async () => (await import('@/backends/auggie/cli/detect')).cliDetect,
   getCliAuthSpec: async () => (await import('@/backends/auggie/cli/auth/auggieCliAuthSpec')).auggieCliAuthSpec,
   vendorResumeSupport: AGENTS_CORE.auggie.resume.vendorResume,
+  ...createAcpSessionListCatalogHook('auggie'),
   getAcpBackendFactory: async () => {
     const { createAuggieBackend } = await import('@/backends/auggie/acp/backend');
     return (opts) => ({ backend: createAuggieBackend(opts as any) });

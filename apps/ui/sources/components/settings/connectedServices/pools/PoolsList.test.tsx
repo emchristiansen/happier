@@ -141,7 +141,7 @@ function lowCapacitySnapshot(profileId: string) {
     v: 1,
     serviceId: 'anthropic',
     profileId,
-    fetchedAt: 1,
+    fetchedAt: Date.now(),
     staleAfterMs: 60_000,
     planLabel: null,
     accountLabel: null,
@@ -157,6 +157,22 @@ function lowCapacitySnapshot(profileId: string) {
         status: 'ok',
         details: {},
       },
+    ],
+  });
+}
+
+function multiAllowanceSnapshot(profileId: string) {
+  return ConnectedServiceQuotaSnapshotV1Schema.parse({
+    v: 1,
+    serviceId: 'anthropic',
+    profileId,
+    fetchedAt: Date.now(),
+    staleAfterMs: 60_000,
+    planLabel: null,
+    accountLabel: null,
+    meters: [
+      { meterId: 'standard:primary', providerLimitId: 'standard', label: 'Session', used: 20, limit: 100, unit: 'count', utilizationPct: null, resetsAt: null, status: 'ok', details: {} },
+      { meterId: 'spark:primary', providerLimitId: 'spark', label: 'Spark', used: 95, limit: 100, unit: 'count', utilizationPct: null, resetsAt: null, status: 'ok', details: {} },
     ],
   });
 }
@@ -329,6 +345,33 @@ describe('PoolsList', () => {
     // rendered text of the count node rather than asserting its raw children.
     const warningCount = tree.findByTestId('connected-services-pool:pool-1:warnings:count');
     expect(flattenRenderedText(warningCount?.props.children)).toBe('1');
+  });
+
+  it('derives pool-row capacity from only the pool-selected allowance', async () => {
+    fetchAccountEncryptionModeSpy.mockResolvedValue({ mode: 'plain', updatedAt: 0 });
+    getConnectedServiceQuotaSnapshotPlainSpy.mockImplementation(async (_credentials, params) => (
+      multiAllowanceSnapshot(params.profileId)
+    ));
+
+    const tree = (await renderPools({
+      quotasEnabled: true,
+      groups: [buildGroup({
+        activeProfileId: 'work',
+        policy: {
+          autoSwitch: true,
+          strategy: 'priority',
+          quotaLimitSelection: { mode: 'selected', providerLimitIds: ['standard'] },
+        },
+        members: [{ profileId: 'work', enabled: true, priority: 100, state: {} }],
+      })],
+    })).tree;
+
+    await flushHookEffects({ turns: 6 });
+
+    expect(tree.findAllByTestId('connected-services-pool:pool-1:warnings:count')).toHaveLength(0);
+    expect(flattenRenderedText(
+      tree.findByTestId('connected-services-pool:pool-1:avatar:capacity')?.props.children,
+    )).toContain('80');
   });
 
   it('keeps quota probes idle while the pools screen is unfocused and resumes them on focus', async () => {

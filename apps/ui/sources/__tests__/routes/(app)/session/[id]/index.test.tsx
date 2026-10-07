@@ -8,7 +8,8 @@ import { installSessionRouteCommonModuleMocks } from './sessionRouteTestHelpers'
 const runAfterInteractionsSpy = vi.hoisted(() => vi.fn(() => () => {}));
 type MockRouteHydrationState =
     | Readonly<{ kind: 'available'; sessionId: string; serverId?: string }>
-    | Readonly<{ kind: 'loading'; sessionId: string; serverId?: string; reason: 'cold' }>;
+    | Readonly<{ kind: 'loading'; sessionId: string; serverId?: string; reason: 'cold' }>
+    | Readonly<{ kind: 'retrying'; sessionId: string; serverId?: string; cause: 'network' }>;
 const hydrateSessionForRouteSpy = vi.hoisted(
     () => vi.fn((sessionId: string, _tag: string, options?: { serverId?: string }): MockRouteHydrationState => ({
         kind: 'available',
@@ -234,6 +235,21 @@ describe('session route index', () => {
         expect(screen.findAllByType('ActivitySpinner')).toHaveLength(1);
         expect(screen.findAllByType('SessionView')).toHaveLength(0);
         expect(screen.findAllByType('SessionCockpitShell')).toHaveLength(0);
+    });
+
+    it('mounts the session shell when hydration is retrying so retry status and navigation remain available', async () => {
+        hydrateSessionForRouteSpy.mockReturnValue({ kind: 'retrying', sessionId: 'session-1', cause: 'network' });
+        const Route = await import('@/app/(app)/session/[id]');
+
+        const screen = await renderScreen(React.createElement(Route.default));
+
+        expect(screen.findAllByType('ActivitySpinner')).toHaveLength(0);
+        const sessionView = screen.findByType('SessionView' as never);
+        expect(sessionView.props.routeHydrationState).toEqual({
+            kind: 'retrying',
+            sessionId: 'session-1',
+            cause: 'network',
+        });
     });
 
     it('mounts the session view when an inactive session is hydrated into the store after the route starts loading', async () => {

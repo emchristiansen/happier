@@ -12,6 +12,12 @@ import { fireAndForget } from '@/utils/system/fireAndForget';
 
 interface AuthContextType {
     isAuthenticated: boolean;
+    /**
+     * Authentication completed during this app run (a login, not credentials restored at
+     * launch). Ephemeral by design: it is the one entry-context fact desktop setup reads to
+     * decide whether unresolved local facts already show the Home's checking panel (R14/R11).
+     */
+    authenticatedThisRun: boolean;
     credentials: AuthCredentials | null;
     login: (token: string, secret: string) => Promise<void>;
     loginWithCredentials: (credentials: AuthCredentials) => Promise<void>;
@@ -23,6 +29,7 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children, initialCredentials }: { children: ReactNode; initialCredentials: AuthCredentials | null }) {
     const [isAuthenticated, setIsAuthenticated] = useState(!!initialCredentials);
+    const [authenticatedThisRun, setAuthenticatedThisRun] = useState(false);
     const [credentials, setCredentials] = useState<AuthCredentials | null>(initialCredentials);
     const activeServerKeyRef = React.useRef<string | null>(null);
     const applyLocalSettings = useApplyLocalSettings();
@@ -43,6 +50,7 @@ export function AuthProvider({ children, initialCredentials }: { children: React
         }
         setCredentials(newCredentials);
         setIsAuthenticated(true);
+        setAuthenticatedThisRun(true);
         fireAndForget(syncSwitchServer(newCredentials), { tag: 'AuthContext.login.syncSwitchServer' });
     }, [applyLocalSettings]);
 
@@ -87,12 +95,13 @@ export function AuthProvider({ children, initialCredentials }: { children: React
     // `useAuth()` callers — including the root layout Stack subtree — on unrelated renders.
     const value = React.useMemo<AuthContextType>(() => ({
         isAuthenticated,
+        authenticatedThisRun,
         credentials,
         login,
         loginWithCredentials,
         logout,
         refreshFromActiveServer,
-    }), [isAuthenticated, credentials, login, loginWithCredentials, logout, refreshFromActiveServer]);
+    }), [isAuthenticated, authenticatedThisRun, credentials, login, loginWithCredentials, logout, refreshFromActiveServer]);
 
     // Update global auth state when local state changes
     useEffect(() => {

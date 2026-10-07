@@ -119,6 +119,7 @@ export async function handleConnectedServiceRuntimeAuthFailure(input: Readonly<{
   classification: ConnectedServiceRuntimeFailureClassification | null;
   switchesThisTurn: number;
   sessionSwitchesThisHour?: number;
+  allowCurrentProfileRetry?: boolean;
   switchCoordinator: SwitchCoordinatorLike;
   temporaryThrottleRecovery?: TemporaryThrottleRecoveryLike | null;
 }>): Promise<
@@ -221,7 +222,12 @@ export async function handleConnectedServiceRuntimeAuthFailure(input: Readonly<{
     action: input.classification.action,
     planType: input.classification.planType,
     switchesThisTurn: input.switchesThisTurn,
-    sessionSwitchesThisHour: input.sessionSwitchesThisHour,
+    ...(input.sessionSwitchesThisHour === undefined
+      ? {}
+      : { sessionSwitchesThisHour: input.sessionSwitchesThisHour }),
+    ...(input.allowCurrentProfileRetry === undefined
+      ? {}
+      : { allowCurrentProfileRetry: input.allowCurrentProfileRetry }),
   });
   return { status: 'switch_attempted', result };
 }

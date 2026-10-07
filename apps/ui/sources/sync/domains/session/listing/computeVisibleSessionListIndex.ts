@@ -17,8 +17,7 @@ import {
 import {
     applySessionListIndexAttentionPromotionWithinGroups,
     applySessionListIndexWorkingPlacementWithinGroups,
-    buildSessionListIndexAttentionPromotion,
-    buildSessionListIndexWorkingPlacement,
+    buildSessionListIndexGlobalPlacements,
 } from './attentionPromotion/sessionListIndexAttentionPromotion';
 import {
     normalizeSessionListAttentionPromotionMode,
@@ -461,25 +460,27 @@ function computeVisibleSessionListIndexUnmeasured(
     });
 
     const globalAttentionSource = pruneOrphanSessionListIndexHeaders(orderedWithPinnedFlags);
-    const attentionPromotion = buildSessionListIndexAttentionPromotion({
+    const globalPlacements = buildSessionListIndexGlobalPlacements({
         source: globalAttentionSource,
-        options: params.attentionPromotion,
+        attentionOptions: params.attentionPromotion,
+        workingOptions: params.workingPlacement,
+        retainedWorkingKeys: params.retainWorkingSessionKeys,
         resolveSessionRow: params.resolveSessionRow,
         nowMs: placementNowMs,
     });
-    const orderedWithoutGlobalAttention = attentionPromotion
-        ? pruneOrphanSessionListIndexHeaders(attentionPromotion.remainder)
+    const attentionPromotion = globalPlacements && globalPlacements.attentionPromotedCount > 0
+        ? {
+            attentionItems: globalPlacements.attentionItems,
+        }
+        : null;
+    const workingPlacement = globalPlacements && globalPlacements.workingPromotedCount > 0
+        ? {
+            workingItems: globalPlacements.workingItems,
+        }
+        : null;
+    const orderedWithoutGlobalWorking = globalPlacements
+        ? pruneOrphanSessionListIndexHeaders(globalPlacements.remainder)
         : globalAttentionSource;
-    const workingPlacement = buildSessionListIndexWorkingPlacement({
-        source: pruneOrphanSessionListIndexHeaders(orderedWithoutGlobalAttention),
-        options: params.workingPlacement,
-        retainedKeys: params.retainWorkingSessionKeys,
-        resolveSessionRow: params.resolveSessionRow,
-        nowMs: placementNowMs,
-    });
-    const orderedWithoutGlobalWorking = workingPlacement
-        ? pruneOrphanSessionListIndexHeaders(workingPlacement.remainder)
-        : orderedWithoutGlobalAttention;
 
     const { pinnedSessions, remainder: nonPinnedRemainder } = buildPinnedSessionListIndexItems({
         ordered: orderedWithoutGlobalWorking,

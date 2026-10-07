@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { logger } from '@/ui/logger';
 import type { AgentBackend, AgentMessage, McpServerConfig } from '@/agent';
 import type { AgentPromptPayload } from '@/agent/core/AgentPromptPayload';
+import type { InFlightSteerPromptOptions } from '@/agent/runtime/permission/bindPermissionModeQueue';
 import type { CatalogAgentId } from '@/backends/types';
 import {
   AcpPromptSubmissionPhaseError,
@@ -16,6 +17,7 @@ import {
   handleAcpModelOutputDelta,
   handleAcpStatusRunning,
 } from '@/agent/acp/bridge/acpCommonHandlers';
+import { reconcileModelOutput, type ModelOutputReconciliationState } from '@/agent/core/reconcileModelOutput';
 import { createAcpAgentMessageForwarder } from '@/agent/acp/bridge/createAcpAgentMessageForwarder';
 import { isThinkingToolName } from '@/agent/acp/bridge/thinkingToolCall';
 import { recordToolTraceEvent } from '@/agent/tools/trace/toolTrace';
@@ -29,7 +31,7 @@ import type { AcpRuntimeSessionClient } from '@/agent/acp/sessionClient';
 import { isAbortLikeError } from '@/agent/executionRuns/runtime/turnDelivery';
 import type { ACPMessageData } from '@/api/session/sessionMessageTypes';
 import type { AgentState, Metadata } from '@/api/types';
-import { getAgentModelConfig, getAgentSessionModeDescriptor, type AgentId } from '@happier-dev/agents';
+import { getAgentModelConfig, getAgentSessionModeDescriptor, readNewestSessionModelsMetadataStateV1, type AgentId } from '@happier-dev/agents';
 import { updateAgentStateBestEffort, updateMetadataBestEffort } from '@/api/session/sessionWritesBestEffort';
 import { createStreamedTranscriptWriter } from '@/api/session/streamedTranscriptWriter';
 import type { TurnAssistantPreviewTracker } from '@/agent/runtime/turnAssistantPreviewTracker';
@@ -48,6 +50,7 @@ import {
   PI_PROVIDER_SESSION_FAILURE_AFTER_PROMPT_ACCEPTANCE_DIAGNOSTIC,
 } from '@/agent/runtime/session/errors/classifyPrimarySessionRuntimeIssue';
 import {
+  applyObservedAcpModelOptions,
   collectAcpModelScopedConfigOptions,
   normalizeConfigOptionsArray,
   publishAcpSessionModelsState,
@@ -90,7 +93,6 @@ import {
 import { applyProviderSessionInfoUpdate } from '@/agent/acp/runtime/providerSessionInfoState';
 import { createSessionMediaTurnState } from '@/agent/acp/runtime/sessionMediaTurnState';
 
-const DEFAULT_SESSION_CONTROL_TIMEOUT_MS = 15_000;
 const ACP_FAILURE_TRACE_ENV = 'HAPPIER_ACP_FAILURE_TRACE';
 
 type RuntimeSessionMediaMessage = Extract<AgentMessage, { type: 'session-media' }>;
@@ -131,14 +133,6 @@ type DerivedSessionModelsFromConfigOptions = Readonly<{
     modelOptions?: ReadonlyArray<SessionConfigOption>;
   }>>;
 }>;
-
-function resolveSessionControlTimeoutMs(): number {
-  const raw = (process.env.HAPPIER_ACP_SESSION_CONTROL_TIMEOUT_MS ?? '').toString().trim();
-  if (!raw) return DEFAULT_SESSION_CONTROL_TIMEOUT_MS;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_SESSION_CONTROL_TIMEOUT_MS;
-  return Math.trunc(parsed);
-}
 
 function readAcpPromptFailureErrorMessage(error: unknown): string {
   return error instanceof Error
@@ -302,11 +296,7 @@ export type AcpRuntime = Readonly<{
   flushTurn: () => Promise<void>;
 }>;
 
-export type AcpRuntimeSteerPromptOptions = Readonly<{
-  localId?: string | null;
-  localIds?: readonly string[];
-  userMessageSeq?: number | null;
-  userMessageSeqs?: readonly number[];
+export type AcpRuntimeSteerPromptOptions = InFlightSteerPromptOptions & Readonly<{
   onProviderPromptAccepted?: () => void;
 }>;
 
@@ -548,7 +538,8 @@ export function createAcpRuntime(params: {
   }>) => SessionModelConfigUpdate;
   /**
    * Optional provider-owned derivation for ACP agents whose model config values encode
-   * model-scoped parameters (for example Cursor's `gpt-5.5[reasoning=medium]` values).
+   * model-scoped parameters. A supplied hook owns derivation: null means no catalog
+   * publication, including when a backend publishes its own merged model state.
    */
   deriveSessionModelsFromConfigOptions?: (
     configOptions: ReadonlyArray<SessionConfigOption>,
@@ -577,8 +568,7 @@ export function createAcpRuntime(params: {
     update: { title?: string | null; updatedAt?: string | null };
     observedAt: number;
   }> | null = null;
-  let accumulatedResponse = '';
-  let accumulatedAssistantSegmentResponse = '';
+  const modelOutputState: ModelOutputReconciliationState = { turnText: '', segmentText: '' };
   let accumulatedThinkingText = '';
   let isResponseInProgress = false;
   let taskStartedSent = false;
@@ -815,8 +805,8 @@ export function createAcpRuntime(params: {
         maxEntries: SESSION_MEDIA_MESSAGE_MAX_ENTRIES_V1,
       });
     }
-    accumulatedResponse = '';
-    accumulatedAssistantSegmentResponse = '';
+    modelOutputState.turnText = '';
+    modelOutputState.segmentText = '';
     accumulatedThinkingText = '';
     isResponseInProgress = false;
     taskStartedSent = false;
@@ -1328,24 +1318,7 @@ export function createAcpRuntime(params: {
 
       switch (msg.type) {
         case 'model-output': {
-          const fullText = typeof (msg as any).fullText === 'string' ? String((msg as any).fullText) : '';
-          let deltaRaw = typeof (msg as any).textDelta === 'string' ? String((msg as any).textDelta) : '';
-          if (!deltaRaw && fullText) {
-            const fullTextScope = msg.fullTextScope ?? 'turn';
-            const reconciledText = fullTextScope === 'segment'
-              ? accumulatedAssistantSegmentResponse
-              : accumulatedResponse;
-            if (fullText.startsWith(reconciledText)) {
-              deltaRaw = fullText.slice(reconciledText.length);
-            } else {
-              // Defensive: if a provider restarts and sends divergent fullText, restart snapshot reconciliation.
-              if (fullTextScope === 'turn') {
-                accumulatedResponse = '';
-              }
-              accumulatedAssistantSegmentResponse = '';
-              deltaRaw = fullText;
-            }
-          }
+          const deltaRaw = reconcileModelOutput(modelOutputState, msg);
           if (acpTraceMarkersEnabled && sessionId && deltaRaw.includes('ACP_STUB_')) {
             // Trace only deterministic stub markers (never arbitrary assistant text) so provider harness
             // can coordinate mid-turn steer without requiring tool-calls or vendor credentials.
@@ -1363,12 +1336,9 @@ export function createAcpRuntime(params: {
             messageBuffer: params.messageBuffer,
             getIsResponseInProgress: () => isResponseInProgress,
             setIsResponseInProgress: (value) => { isResponseInProgress = value; },
-            appendToAccumulatedResponse: (delta) => {
-              accumulatedResponse += delta;
-              accumulatedAssistantSegmentResponse += delta;
-            },
+            appendToAccumulatedResponse: () => {},
           });
-          params.turnAssistantPreviewTracker?.replace(accumulatedResponse);
+          params.turnAssistantPreviewTracker?.replace(modelOutputState.turnText);
 
           if (deltaRaw) {
             streamedTranscriptWriter.appendAssistantDelta(deltaRaw);
@@ -1440,7 +1410,7 @@ export function createAcpRuntime(params: {
             break;
           }
 
-          accumulatedAssistantSegmentResponse = '';
+          modelOutputState.segmentText = '';
           void streamedTranscriptWriter.flushAll({ reason: 'tool-call-boundary' });
           params.messageBuffer.addMessage(`Executing: ${msg.toolName}`, 'tool');
           recordToolCall(msg.callId, msg.toolName);
@@ -1603,7 +1573,7 @@ export function createAcpRuntime(params: {
           } catch (e) {
             logger.debug(`[${params.provider}] Failed to run permission-request hook (non-fatal)`, e);
           }
-          accumulatedAssistantSegmentResponse = '';
+          modelOutputState.segmentText = '';
           void streamedTranscriptWriter.flushAll({ reason: 'tool-call-boundary' }).finally(() => {
             forwarder.forward(msg);
           });
@@ -1688,16 +1658,17 @@ export function createAcpRuntime(params: {
               requireAvailableModels: true,
             });
           }
-          if (name === 'config_options_state' || name === 'config_options_update') {
+          if ((name === 'config_options_state' || name === 'config_options_update')
+            && Array.isArray(asRecord(msg.payload)?.configOptions)) {
             const payloadRecord = asRecord(msg.payload);
             const configOptions = normalizeConfigOptionsArray(payloadRecord?.configOptions);
             const derivedModels = (() => {
-              const providerDerivedModels = params.deriveSessionModelsFromConfigOptions?.(configOptions) ?? null;
-              if (providerDerivedModels) return providerDerivedModels;
+              if (params.deriveSessionModelsFromConfigOptions) {
+                return params.deriveSessionModelsFromConfigOptions(configOptions);
+              }
 
-              const modelOpt = configOptions.find(isAcpModelConfigOptionLike) as any;
-              if (!modelOpt || !Array.isArray(modelOpt.options) || modelOpt.options.length === 0) return null;
-              const modelScopedOptions = collectAcpModelScopedConfigOptions(configOptions);
+              const modelOpt = configOptions.find(isAcpModelConfigOptionLike);
+              if (!modelOpt || !Array.isArray(modelOpt.options)) return null;
 
               const currentValue = modelOpt.currentValue;
               const currentModelId =
@@ -1707,15 +1678,14 @@ export function createAcpRuntime(params: {
               if (!currentModelId) return null;
 
               const availableModels = modelOpt.options
-                .filter((opt: any) => opt && opt.value !== undefined && typeof opt.name === 'string')
-                .map((opt: any) => ({
+                .filter((opt) => opt.value !== undefined && typeof opt.name === 'string')
+                .map((opt) => ({
                   id: String(opt.value),
                   name: String(opt.name),
                   ...(typeof opt.description === 'string' ? { description: String(opt.description) } : {}),
-                  ...(modelScopedOptions.length > 0 ? { modelOptions: modelScopedOptions } : {}),
                 }))
-                .filter((m: any) => m.id && m.name);
-              if (availableModels.length === 0) return null;
+                .filter((m) => m.id && m.name);
+              if (modelOpt.options.length > 0 && availableModels.length === 0) return null;
 
               return { currentModelId, availableModels };
             })();
@@ -1752,13 +1722,30 @@ export function createAcpRuntime(params: {
                 };
                 next.acpConfigOptionsV1 = next.sessionConfigOptionsV1;
 
-                if (derivedModels) {
+                const previousModels = readNewestSessionModelsMetadataStateV1(metadata as unknown as Record<string, unknown>);
+                const modelSnapshot = derivedModels ?? (
+                  !params.deriveSessionModelsFromConfigOptions
+                    && Array.isArray(payloadRecord?.configOptions)
+                    && !configOptions.some(isAcpModelConfigOptionLike)
+                    && previousModels?.provider === params.provider
+                    ? previousModels
+                    : null
+                );
+                if (modelSnapshot) {
+                  const availableModels = params.deriveSessionModelsFromConfigOptions
+                    ? modelSnapshot.availableModels
+                    : applyObservedAcpModelOptions(
+                      modelSnapshot.availableModels,
+                      modelSnapshot.currentModelId,
+                      collectAcpModelScopedConfigOptions(configOptions),
+                      previousModels?.provider === params.provider ? previousModels.availableModels : [],
+                    );
                   next.sessionModelsV1 = {
                     v: 1,
                     provider: params.provider,
-                    updatedAt: now,
-                    currentModelId: derivedModels.currentModelId,
-                    availableModels: derivedModels.availableModels,
+                    updatedAt: derivedModels ? now : previousModels?.updatedAt ?? 0,
+                    currentModelId: modelSnapshot.currentModelId,
+                    availableModels,
                   };
                   next.acpSessionModelsV1 = next.sessionModelsV1;
                 }
@@ -1806,28 +1793,14 @@ export function createAcpRuntime(params: {
             }
           }
           if (name === 'current_model_update') {
-            const payloadRecord = asRecord(msg.payload);
-            const currentModelIdRaw = payloadRecord?.currentModelId;
-            const currentModelId = typeof currentModelIdRaw === 'string' ? currentModelIdRaw : '';
-            if (currentModelId) {
-              publishRuntimeMetadataBestEffort(
-                (metadata) => {
-                  const prev = (metadata as any).acpSessionModelsV1 as any;
-                  const availableModels = Array.isArray(prev?.availableModels) ? prev.availableModels : [];
-                  return {
-                    ...metadata,
-                    acpSessionModelsV1: {
-                      v: 1,
-                      provider: params.provider,
-                      updatedAt: Date.now(),
-                      currentModelId,
-                      availableModels,
-                    },
-                  };
-                },
-                'current_model_update',
-              );
-            }
+            publishAcpSessionModelsState({
+              session: { updateMetadata: (updater) => publishRuntimeMetadataBestEffort(updater, 'current_model_update') },
+              provider: params.provider,
+              payload: msg.payload,
+              logPrefix: `[${params.provider}]`,
+              reason: 'current_model_update',
+              preservePreviousAvailableModels: true,
+            });
           }
           if (name === 'thinking') {
             const payloadRecord = asRecord(msg.payload);
@@ -1936,31 +1909,17 @@ export function createAcpRuntime(params: {
     }
 
     if (b.setSessionMode) {
-      const controlTimeoutMs = resolveSessionControlTimeoutMs();
-      const timeoutPromise = new Promise<{ ok: false; error: Error }>((resolve) => {
-        const timer = setTimeout(
-          () => resolve({ ok: false, error: new Error('ACP session/set_mode timed out') }),
-          controlTimeoutMs,
-        );
-        timer.unref?.();
-      });
-
-      const outcome = await Promise.race([
-        b
-          .setSessionMode(activeSessionId, normalizedModeId)
-          .then(() => ({ ok: true as const }))
-          .catch((error) => ({ ok: false as const, error })),
-        timeoutPromise,
-      ]);
-      if (outcome.ok) return;
-
-      const e = outcome.error;
-      if (!b.setSessionConfigOption) throw e;
       try {
-        await b.setSessionConfigOption(activeSessionId, modeConfigOptionId, normalizedModeId);
+        await b.setSessionMode(activeSessionId, normalizedModeId);
         return;
-      } catch {
-        throw e;
+      } catch (error) {
+        if (!b.setSessionConfigOption) throw error;
+        try {
+          await b.setSessionConfigOption(activeSessionId, modeConfigOptionId, normalizedModeId);
+          return;
+        } catch {
+          throw error;
+        }
       }
     }
 
@@ -1977,7 +1936,6 @@ export function createAcpRuntime(params: {
     }
     const activeSessionId = sessionId;
 
-    const controlTimeoutMs = resolveSessionControlTimeoutMs();
     const modelConfigOptionId = (() => {
       try {
         return getAgentModelConfig(params.provider as AgentId).acpModelConfigOptionId ?? null;
@@ -2031,38 +1989,21 @@ export function createAcpRuntime(params: {
     }
 
     if (b.setSessionModel) {
-      const timeoutPromise = new Promise<{ ok: false; error: Error }>((resolve) => {
-        const timer = setTimeout(
-          () => resolve({ ok: false, error: new Error('ACP session/set_model timed out') }),
-          controlTimeoutMs,
-        );
-        timer.unref?.();
-      });
-
-      const outcome = await Promise.race([
-        b
-          .setSessionModel(activeSessionId, resolvedModelId)
-          .then(() => ({ ok: true as const }))
-          .catch((error) => ({ ok: false as const, error })),
-        timeoutPromise,
-      ]);
-      if (outcome.ok) {
-        await applyCompanionConfigUpdates();
-        return;
-      }
-
-      const e = outcome.error;
-      // Some ACP agents may not support `session/set_model` but may expose an equivalent
-      // `model` config option. Fall back best-effort; callers already treat this as non-fatal.
-      if (!b.setSessionConfigOption || !modelConfigOptionId) throw e;
-
       try {
-        await b.setSessionConfigOption(activeSessionId, modelConfigOptionId, resolvedModelId);
+        await b.setSessionModel(activeSessionId, resolvedModelId);
         await applyCompanionConfigUpdates();
         return;
-      } catch {
-        // If the fallback also fails, surface the original error so callers can retry.
-        throw e;
+      } catch (error) {
+        // A provider rejection has settled the primary request. Only then may the compatibility
+        // config-option path run; racing a timer here can duplicate an effect still in flight.
+        if (!b.setSessionConfigOption || !modelConfigOptionId) throw error;
+        try {
+          await b.setSessionConfigOption(activeSessionId, modelConfigOptionId, resolvedModelId);
+          await applyCompanionConfigUpdates();
+          return;
+        } catch {
+          throw error;
+        }
       }
     }
 
@@ -2530,39 +2471,42 @@ export function createAcpRuntime(params: {
     },
 
     async flushTurn(): Promise<void> {
-      await waitForPendingTurnBoundaryStreamFlush();
-      await drainPendingSessionMediaPersistence();
-      const unavailableSessionMedia = [...unavailableSessionMediaByDedupeKey.values()].flat();
-      const sessionMediaMeta = persistedSessionMediaItems.length > 0 || unavailableSessionMedia.length > 0
-        ? buildSessionMediaMeta(persistedSessionMediaItems, undefined, unavailableSessionMedia)
-        : null;
-      const attachedSessionMediaToAssistantRow = sessionMediaMeta
-        ? streamedTranscriptWriter.mergeAssistantMeta(sessionMediaMeta)
-        : false;
-      await streamedTranscriptWriter.flushAll(
-        turnAborted
-          ? { reason: 'abort', interruptedReason: 'turn-aborted' }
-          : { reason: 'turn-end' },
-      );
-      await abortPendingAcpPermissionRequests(
-        params.permissionHandler,
-        turnAborted ? 'ACP runtime turn aborted' : 'ACP runtime turn ended',
-        (error) => {
-          logger.debug(`[${params.provider}] Failed to abort pending permission requests at turn boundary`, error);
-        },
-      );
-      if (sessionMediaMeta && !attachedSessionMediaToAssistantRow && !turnAborted) {
-        await params.session.sendAgentMessageCommitted(
-          params.provider,
-          { type: 'message', message: '' },
-          { localId: randomUUID(), meta: sessionMediaMeta },
+      try {
+        await waitForPendingTurnBoundaryStreamFlush();
+        await drainPendingSessionMediaPersistence();
+        const unavailableSessionMedia = [...unavailableSessionMediaByDedupeKey.values()].flat();
+        const sessionMediaMeta = persistedSessionMediaItems.length > 0 || unavailableSessionMedia.length > 0
+          ? buildSessionMediaMeta(persistedSessionMediaItems, undefined, unavailableSessionMedia)
+          : null;
+        const attachedSessionMediaToAssistantRow = sessionMediaMeta
+          ? streamedTranscriptWriter.mergeAssistantMeta(sessionMediaMeta)
+          : false;
+        await streamedTranscriptWriter.flushAll(
+          turnAborted
+            ? { reason: 'abort', interruptedReason: 'turn-aborted' }
+            : { reason: 'turn-end' },
         );
+        await abortPendingAcpPermissionRequests(
+          params.permissionHandler,
+          turnAborted ? 'ACP runtime turn aborted' : 'ACP runtime turn ended',
+          (error) => {
+            logger.debug(`[${params.provider}] Failed to abort pending permission requests at turn boundary`, error);
+          },
+        );
+        if (sessionMediaMeta && !attachedSessionMediaToAssistantRow && !turnAborted) {
+          await params.session.sendAgentMessageCommitted(
+            params.provider,
+            { type: 'message', message: '' },
+            { localId: randomUUID(), meta: sessionMediaMeta },
+          );
+        }
+      } finally {
+        turnInFlight = false;
+        publishInFlightSteerCapabilities(false);
+        stopPendingPump();
+        params.onThinkingChange(false);
+        params.session.keepAlive(false, 'remote');
       }
-      turnInFlight = false;
-      publishInFlightSteerCapabilities(false);
-      stopPendingPump();
-      params.onThinkingChange(false);
-      params.session.keepAlive(false, 'remote');
       if (pendingTurnOutcome && pendingTurnOutcome.kind !== 'completed') {
         const providerTurnId = ensureCurrentTurnId();
         if (!taskStartedSent && params.session.sessionTurnLifecycle) {

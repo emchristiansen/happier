@@ -252,6 +252,7 @@ export type ReducerState = {
         cacheCreation: number;
         cacheRead: number;
         contextSize: number;
+        contextSizeIsReported: boolean;
         contextWindowTokens?: number;
         timestamp: number;
     };
@@ -291,6 +292,7 @@ export type ReducerResult = {
         cacheCreation: number;
         cacheRead: number;
         contextSize: number;
+        contextSizeIsReported: boolean;
         contextWindowTokens?: number;
     };
     hasReadyEvent?: boolean;
@@ -629,6 +631,7 @@ export function reducer(
             cacheCreation: state.latestUsage.cacheCreation,
             cacheRead: state.latestUsage.cacheRead,
             contextSize: state.latestUsage.contextSize,
+            contextSizeIsReported: state.latestUsage.contextSizeIsReported,
             ...(typeof state.latestUsage.contextWindowTokens === 'number'
                 ? { contextWindowTokens: state.latestUsage.contextWindowTokens }
                 : {})
@@ -666,10 +669,11 @@ function processUsageData(state: ReducerState, usage: UsageData, timestamp: numb
     // Only update if this is newer than the current latest usage
     if (!state.latestUsage || timestamp > state.latestUsage.timestamp) {
         const reportedContextWindowTokens = readContextWindowTokensFromUsage(usage);
+        const reportedContextUsedTokens = readContextUsedTokensFromUsage(usage);
         const contextWindowTokens = reportedContextWindowTokens ?? state.latestUsage?.contextWindowTokens ?? null;
         const derivedContextSize = (usage.cache_creation_input_tokens || 0) + (usage.cache_read_input_tokens || 0) + usage.input_tokens;
         const contextSize =
-            readContextUsedTokensFromUsage(usage) ??
+            reportedContextUsedTokens ??
             (reportedContextWindowTokens !== null ? state.latestUsage?.contextSize ?? 0 : derivedContextSize);
         state.latestUsage = {
             inputTokens: usage.input_tokens,
@@ -677,6 +681,7 @@ function processUsageData(state: ReducerState, usage: UsageData, timestamp: numb
             cacheCreation: usage.cache_creation_input_tokens || 0,
             cacheRead: usage.cache_read_input_tokens || 0,
             contextSize,
+            contextSizeIsReported: reportedContextUsedTokens !== null,
             ...(contextWindowTokens !== null ? { contextWindowTokens } : {}),
             timestamp: timestamp
         };
@@ -713,7 +718,11 @@ export function readReducerSidechainMessages(
     return messages;
 }
 
-function convertReducerMessageToMessage(reducerMsg: ReducerMessage, state: ReducerState): Message | null {
+function convertReducerMessageToMessage(
+    reducerMsg: ReducerMessage,
+    state: ReducerState,
+    ancestorMessageIds?: ReadonlySet<string>,
+): Message | null {
     const observationMetadata: TranscriptObservationMetadata = {
         ...(reducerMsg.sourceCreatedAt !== undefined ? { sourceCreatedAt: reducerMsg.sourceCreatedAt } : {}),
         ...(reducerMsg.sourceUpdatedAt !== undefined ? { sourceUpdatedAt: reducerMsg.sourceUpdatedAt } : {}),
@@ -754,6 +763,8 @@ function convertReducerMessageToMessage(reducerMsg: ReducerMessage, state: Reduc
             ...observationMetadata,
         };
     } else if (reducerMsg.role === 'agent' && reducerMsg.tool !== null) {
+        if (ancestorMessageIds?.has(reducerMsg.id)) return null;
+
         // Convert children recursively
         let childMessages: Message[] = [];
         const toolId = typeof reducerMsg.tool.id === 'string' ? reducerMsg.tool.id.trim() : '';
@@ -762,10 +773,14 @@ function convertReducerMessageToMessage(reducerMsg: ReducerMessage, state: Reduc
                 ? (!state.sidechains.has(toolId) && reducerMsg.realID ? reducerMsg.realID : toolId)
                 : reducerMsg.realID ?? null;
         let children = sidechainKey ? state.sidechains.get(sidechainKey) || [] : [];
-        for (let child of children) {
-            let childMessage = convertReducerMessageToMessage(child, state);
-            if (childMessage) {
-                childMessages.push(childMessage);
+        if (children.length > 0) {
+            const childAncestorMessageIds = new Set(ancestorMessageIds);
+            childAncestorMessageIds.add(reducerMsg.id);
+            for (let child of children) {
+                let childMessage = convertReducerMessageToMessage(child, state, childAncestorMessageIds);
+                if (childMessage) {
+                    childMessages.push(childMessage);
+                }
             }
         }
 

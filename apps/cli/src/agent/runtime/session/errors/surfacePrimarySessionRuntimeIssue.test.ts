@@ -41,13 +41,13 @@ describe('surfacePrimarySessionRuntimeIssue', () => {
       v: 1,
       scope: 'primary_session',
       status: 'failed',
-      code: 'auth_error',
-      source: 'auth_error',
+      code: 'provider_status_error',
+      source: 'provider_status_error',
       occurredAt: 123,
       sessionSeq: 7,
       provider: 'codex',
       providerTurnId: 'turn_1',
-      sanitizedPreview: 'Authentication failed',
+      sanitizedPreview: 'Provider reported an error',
     });
     expect(JSON.stringify(issue)).not.toContain('raw token');
     expect(sendAgentMessage).not.toHaveBeenCalled();

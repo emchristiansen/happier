@@ -1,0 +1,23 @@
+
+  Fable 5.1 writes better code and reports progress on long tasks. Switch
+  anytime with [38;2;177;185;249m/model[39m.
+
+[38;2;153;153;153m⏺[39m [38;2;153;153;153mAuto mode lets Claude handle permission prompts automatically — Claude[39m
+  [38;2;153;153;153mchecks each tool call for risky actions and prompt injection before [39m
+  [38;2;153;153;153mexecuting. Actions Claude identifies as safe are executed, while [39m
+  [38;2;153;153;153mactions Claude identifies as risky are blocked and Claude may try a [39m
+  [38;2;153;153;153mdifferent approach. Ideal for long-running tasks. Claude can make [39m
+  [38;2;153;153;153mmistakes that allow harmful commands to run, it's recommended to only [39m
+  [38;2;153;153;153muse in isolated environments. Shift+Tab to change mode.[39m
+
+[38;2;177;185;249m────────────────────────────────────────────────────────────────────────────────
+[39m [1m[38;2;177;185;249mUse Fable 5.1 at high effort by default?[0m
+
+   high is the default effort for Fable 5.1 and is recommended for most
+   coding tasks; xhigh spends more tokens per task. You can change this any
+   time with /effort.
+
+   [38;2;255;193;7mxhigh effort is ~1.4x the estimated cost of high (the default).[39m
+
+   [38;2;177;185;249m❯[39m [38;2;177;185;249mKeep xhigh[39m
+     Switch Fable 5.1 to high effort

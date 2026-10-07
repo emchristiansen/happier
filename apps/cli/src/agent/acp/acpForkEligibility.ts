@@ -1,6 +1,6 @@
 import { resolvePersistedCodexRuntimeIdentity } from '@happier-dev/agents';
 
-const ALWAYS_ACP_PROVIDERS = new Set(['auggie', 'qwen', 'kimi', 'kilo', 'gemini', 'copilot']);
+const ALWAYS_ACP_PROVIDERS = new Set(['auggie', 'qwen', 'kilo', 'gemini', 'copilot']);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);

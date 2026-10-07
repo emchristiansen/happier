@@ -101,8 +101,8 @@ function readNullableString(value: unknown): string | null | undefined {
     return typeof value === 'string' ? value : undefined;
 }
 
-function readRollbackEligibleTurnStarts(value: unknown): readonly number[] | null | undefined {
-    if (value === null) return null;
+function readRollbackEligibleTurnStarts(value: unknown): number[] | undefined {
+    if (value === null) return undefined;
     if (!Array.isArray(value)) return undefined;
 
     const starts: number[] = [];
@@ -229,7 +229,7 @@ function coerceLegacySessionRecord(raw: unknown): V2SessionRecord | null {
             || (raw.lastRuntimeIssue && typeof raw.lastRuntimeIssue === 'object')
                 ? raw.lastRuntimeIssue as V2SessionRecord['lastRuntimeIssue']
                 : undefined,
-        ...(rollbackEligibleTurnStarts !== undefined ? { rollbackEligibleTurnStarts } : {}),
+        rollbackEligibleTurnStarts,
         pendingCount: readNumber(raw.pendingCount) ?? undefined,
         pendingBlockedCount: readNumber(raw.pendingBlockedCount) ?? undefined,
         pendingVersion: readNumber(raw.pendingVersion) ?? undefined,

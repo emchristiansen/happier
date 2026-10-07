@@ -22,7 +22,14 @@ describe('actionToolExposure', () => {
   });
 
   it('keeps the session-agent action discovery bootstrap tools directly exposed', () => {
-    for (const id of ['action.spec.search', 'action.spec.get', 'action.options.resolve'] as const) {
+    for (const id of [
+      'action.spec.search',
+      'action.spec.get',
+      'action.options.resolve',
+      'execution.run.list',
+      'execution.run.get',
+      'execution.run.wait',
+    ] as const) {
       const spec = getActionSpec(id);
 
       expect(resolveActionToolExposureMode(spec, 'session_agent')).toBe('direct');

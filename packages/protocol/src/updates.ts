@@ -1,7 +1,11 @@
 import { z } from 'zod';
 import { PendingActivationAuthorizationV1Schema } from './sessionControl/pendingActivationAuthorizationV1.js';
 import { AccountSettingsV2GetResponseSchema } from './account/settings/accountSettingsApiV2.js';
-import { DirectTranscriptRawMessageV1Schema } from './directSessions/daemonRpcV1.js';
+import {
+  DirectTranscriptRawMessageV1Schema,
+  DirectTranscriptTruncationReasonSchema,
+  resolveDirectTranscriptContinuation,
+} from './directSessions/daemonRpcV1.js';
 import { ExecutionRunPublicStateSchema } from './executionRuns.js';
 import {
   SessionMessageAttentionImpactSchema,
@@ -359,10 +363,12 @@ export const DirectSessionTranscriptDeltaEphemeralSchema = z.object({
   fromCursor: z.string().min(1).nullable().optional(),
   nextCursor: z.string().min(1).nullable().optional(),
   truncated: z.boolean(),
+  truncationReason: DirectTranscriptTruncationReasonSchema.optional(),
 }).passthrough().superRefine((value, ctx) => {
   const advancesCursor = Object.prototype.hasOwnProperty.call(value, 'nextCursor');
+  const continuation = resolveDirectTranscriptContinuation(value);
   if (
-    value.truncated !== true
+    continuation !== 'source_discontinuity'
     && advancesCursor
     && (typeof value.fromCursor !== 'string' || value.fromCursor.trim().length === 0)
   ) {
@@ -370,6 +376,13 @@ export const DirectSessionTranscriptDeltaEphemeralSchema = z.object({
       code: z.ZodIssueCode.custom,
       message: 'fromCursor is required when nextCursor is present on non-truncated direct-session transcript deltas',
       path: ['fromCursor'],
+    });
+  }
+  if (continuation === 'page_limit' && typeof value.nextCursor !== 'string') {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'page-limit transcript continuation requires a next cursor',
+      path: ['nextCursor'],
     });
   }
 });

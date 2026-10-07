@@ -319,13 +319,6 @@ async function beginRuntimeAuthRecoveryIntake(input: Readonly<{
   }
 }
 
-function isCanonicalSessionId(value: unknown): value is string {
-  if (typeof value !== 'string') return false;
-  const normalized = value.trim();
-  if (!normalized) return false;
-  return !/^PID-\d+$/.test(normalized);
-}
-
 function safeTokenEquals(provided: string, expected: string): boolean {
   const hashA = createHash('sha256').update(provided).digest();
   const hashB = createHash('sha256').update(expected).digest();
@@ -1909,30 +1902,23 @@ export function createDaemonControlApp({
             ...(resolved.errorDetail ? { errorDetail: resolved.errorDetail } : {}),
           };
         }
-        if (resolved.status === 'pending') {
-          return {
-            success: true as const,
-            status: 'pending' as const,
-          };
+        if (resolved.status === 'unsupported') {
+          logger.warn('[CONTROL SERVER] Canonical spawn nonce resolution is unsupported; readiness remains pending', {
+            spawnNonce, reason: 'unsupported',
+          });
+          return { success: true as const, status: 'pending' as const };
         }
+        return { success: true as const, status: resolved.status };
       } catch (error) {
-        logger.warn('[CONTROL SERVER] Canonical spawn nonce resolution failed; falling back to tracked children', {
+        logger.warn('[CONTROL SERVER] Canonical spawn nonce resolution failed; readiness remains pending', {
           spawnNonce,
           error: readSafeDaemonControlErrorDiagnostic(error),
         });
+        return { success: true as const, status: 'pending' as const };
       }
     }
 
     const matches = getChildren().filter((child) => child.spawnOptions?.spawnNonce === spawnNonce);
-    const successMatch = matches.find((child) => isCanonicalSessionId(child.happySessionId));
-    if (successMatch && isCanonicalSessionId(successMatch.happySessionId)) {
-      return {
-        success: true as const,
-        status: 'success' as const,
-        sessionId: successMatch.happySessionId.trim(),
-      };
-    }
-
     if (matches.length > 0) {
       return {
         success: true as const,

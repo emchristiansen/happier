@@ -1211,6 +1211,86 @@ describe('computeVisibleSessionListIndex', () => {
         expect(result.filter((item) => item.type === 'session' && item.sessionId === 'pinned-working')).toHaveLength(1);
     });
 
+    it('classifies global attention and working placement in one row-resolution pass', () => {
+        const now = 1_000_000;
+        const groupKey = 'server:s1:active:project:repo';
+        const source: SessionListIndexItem[] = [
+            { type: 'header', headerKind: 'active', title: 'Active', serverId: 's1' },
+            { type: 'header', headerKind: 'project', title: '~/repo', serverId: 's1', groupKey },
+            { type: 'session', sessionId: 'ready', serverId: 's1', section: 'active', groupKey, groupKind: 'project' },
+            { type: 'session', sessionId: 'working', serverId: 's1', section: 'active', groupKey, groupKind: 'project' },
+            { type: 'session', sessionId: 'retained-working', serverId: 's1', section: 'active', groupKey, groupKind: 'project' },
+            { type: 'session', sessionId: 'idle', serverId: 's1', section: 'active', groupKey, groupKind: 'project' },
+        ];
+        const rows = {
+            's1:ready': makeSessionRow('ready', {
+                latestReadyEventSeq: 4,
+                latestReadyEventAt: now - 2_000,
+                lastViewedSessionSeq: 1,
+            }),
+            's1:working': makeSessionRow('working', {
+                active: true,
+                presence: 'online',
+                latestTurnStatus: 'in_progress',
+                latestTurnStatusObservedAt: now - 1_000,
+            }),
+            's1:retained-working': makeSessionRow('retained-working', {
+                active: true,
+                activeAt: now - SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS - 1,
+                presence: 'online',
+                latestTurnStatus: 'in_progress',
+                latestTurnStatusObservedAt: now - SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS - 1,
+            }),
+            's1:idle': makeSessionRow('idle'),
+        };
+        const common = {
+            source,
+            hideInactiveSessions: false,
+            pinnedSessionKeysV1: [],
+            sessionListGroupOrderV1: {},
+            sessionListOrderingModeV1: 'custom' as const,
+            presentation: { enabled: false, presentation: 'grouped' as const, selectedServerIds: [] },
+            attentionPromotion: { mode: 'global' as const },
+            nowMs: now,
+        };
+        const resolveRow = makeResolver(rows);
+
+        let attentionOnlyRowResolutions = 0;
+        computeVisibleSessionListIndex({
+            ...common,
+            resolveSessionRow: (serverId, sessionId) => {
+                attentionOnlyRowResolutions += 1;
+                return resolveRow(serverId, sessionId);
+            },
+        });
+
+        let combinedRowResolutions = 0;
+        const combined = computeVisibleSessionListIndex({
+            ...common,
+            resolveSessionRow: (serverId, sessionId) => {
+                combinedRowResolutions += 1;
+                return resolveRow(serverId, sessionId);
+            },
+            workingPlacement: { mode: 'global' },
+            retainWorkingSessionKeys: ['s1:retained-working'],
+        })!;
+
+        expect(combined.map((item) => item.type === 'header'
+            ? `h:${item.headerKind}`
+            : `s:${item.sessionId}:${item.groupKind ?? 'none'}:${item.attentionPromotionReason ?? item.workingPlacementReason ?? 'none'}`
+        )).toEqual([
+            'h:attention',
+            's:ready:attention:ready',
+            'h:working',
+            's:working:working:working',
+            's:retained-working:working:working-retained',
+            'h:active',
+            'h:project',
+            's:idle:project:none',
+        ]);
+        expect(combinedRowResolutions).toBe(attentionOnlyRowResolutions);
+    });
+
     it('promotes completed turns that are newer than the read cursor even without a ready event', () => {
         const groupKey = 'server:s1:day:2026-02-17';
         const source: SessionListIndexItem[] = [

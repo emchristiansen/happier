@@ -210,6 +210,56 @@ describe("providerAccountUsage storage", () => {
         expect((await readProviderAccountUsageRecord({ accountId: user.id, recordId: base.recordId }))?.snapshot?.subscription).toEqual(subscription);
     });
 
+    it("rejects future-dated writes and lets a current observation replace a previously persisted future clock", async () => {
+        const nowMs = Date.now();
+        const user = await db.account.create({ data: { publicKey: null, encryptionMode: "plain" }, select: { id: true } });
+        const recordKey = createProviderAccountUsageRecordKey();
+        const future = createUsageSnapshot({ fetchedAt: nowMs + 600_000, recordKey, planLabel: "poisoned" });
+        const current = createUsageSnapshot({ fetchedAt: nowMs, recordKey, planLabel: "recovered" });
+
+        await writeProviderAccountUsageRecord({
+            accountId: user.id,
+            recordId: future.recordId,
+            recordKey,
+            payloadMode: "plain_json_v1",
+            snapshot: future,
+            status: "ok",
+            fetchedAt: future.fetchedAtMs,
+            staleAfterMs: future.staleAfterMs,
+        });
+
+        await expect(writeProviderAccountUsageRecordWithPolicy({
+            accountId: user.id,
+            recordId: current.recordId,
+            recordKey,
+            payloadMode: "plain_json_v1",
+            snapshot: current,
+            status: "ok",
+            fetchedAt: current.fetchedAtMs,
+            staleAfterMs: current.staleAfterMs,
+        })).resolves.toBe("written");
+        await expect(readProviderAccountUsageRecord({ accountId: user.id, recordId: current.recordId }))
+            .resolves.toEqual(expect.objectContaining({
+                fetchedAt: nowMs,
+                snapshot: expect.objectContaining({ planLabel: "recovered" }),
+            }));
+
+        const futureOnlyKey = createProviderAccountUsageRecordKey({ accountSubjectId: "acct_future_only" });
+        const futureOnly = createUsageSnapshot({ fetchedAt: nowMs + 600_000, recordKey: futureOnlyKey, planLabel: "future-only" });
+        await expect(writeProviderAccountUsageRecordWithPolicy({
+            accountId: user.id,
+            recordId: futureOnly.recordId,
+            recordKey: futureOnlyKey,
+            payloadMode: "plain_json_v1",
+            snapshot: futureOnly,
+            status: "ok",
+            fetchedAt: futureOnly.fetchedAtMs,
+            staleAfterMs: futureOnly.staleAfterMs,
+        })).rejects.toThrow(ProviderAccountUsagePayloadInvariantError);
+        await expect(readProviderAccountUsageRecord({ accountId: user.id, recordId: futureOnly.recordId }))
+            .resolves.toBeNull();
+    });
+
     it("persists refresh-requested provider usage records without requiring a payload", async () => {
         const user = await db.account.create({ data: { publicKey: null, encryptionMode: "plain" }, select: { id: true } });
         const recordKey = createProviderAccountUsageRecordKey();

@@ -34,6 +34,7 @@ jobs:
     with:
       select_jobs_explicitly: true
       run_ui: false
+      run_shared_packages: false
       run_server: false
       run_server_db_contract: false
       run_cli: false
@@ -43,6 +44,7 @@ jobs:
       run_e2e_core: false
       run_installers_smoke: false
       run_binary_smoke: false
+      run_build_smoke: false
       run_providers: false
       providers_preset: all
       providers_tier: smoke
@@ -58,6 +60,7 @@ jobs:
     with:
       select_jobs_explicitly: true
       run_ui: false
+      run_shared_packages: false
       run_server: false
       run_server_db_contract: false
       run_cli: false
@@ -67,6 +70,7 @@ jobs:
       run_e2e_core: false
       run_installers_smoke: false
       run_binary_smoke: false
+      run_build_smoke: false
       run_providers: false
       providers_preset: all
       providers_tier: smoke

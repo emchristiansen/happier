@@ -7,6 +7,7 @@ import {
   type PublicReleaseRingLabel,
   type ReleaseRingId,
 } from '@happier-dev/release-runtime/releaseRings';
+import { ACCENT_HEX } from '@happier-dev/cli-common/output';
 
 /**
  * Canonical label color palette for public release channels.
@@ -17,7 +18,7 @@ import {
 function colorizePublicLabel(label: PublicReleaseRingLabel): string {
   if (label === 'stable') return chalk.green('stable');
   if (label === 'preview') return chalk.yellow('preview');
-  return chalk.cyan('dev');
+  return chalk.hex(ACCENT_HEX)('dev');
 }
 
 export function ringToPublicLabel(ring: ReleaseRingId): PublicReleaseRingLabel {

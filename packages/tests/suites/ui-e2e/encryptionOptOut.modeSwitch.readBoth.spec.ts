@@ -160,9 +160,6 @@ test.describe('ui e2e: encryption opt-out mode switching', () => {
         HAPPIER_FEATURE_ENCRYPTION__STORAGE_POLICY: 'optional',
         HAPPIER_FEATURE_ENCRYPTION__ALLOW_ACCOUNT_OPTOUT: '1',
         HAPPIER_FEATURE_SESSIONS_DRAFTS__ENABLED: '1',
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
       },
     });
 
@@ -183,9 +180,9 @@ test.describe('ui e2e: encryption opt-out mode switching', () => {
     await server?.stop().catch(() => {});
   });
 
-  test('switches modes and keeps old sessions readable (e2ee → plain → e2ee)', async ({ page }, testInfo) => {
+  test('switches modes and keeps old sessions readable (e2ee → plain → e2ee)', { tag: "@smoke" }, async ({ page }, testInfo) => {
     // This scenario performs two real account migrations and three daemon-backed session create/send flows.
-    test.setTimeout(600_000);
+    test.setTimeout(180_000);
     if (!server || !ui) throw new Error('missing server/ui fixtures');
     if (!uiBaseUrl) throw new Error('missing ui base url');
 

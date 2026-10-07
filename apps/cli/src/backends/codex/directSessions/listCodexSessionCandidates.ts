@@ -30,7 +30,7 @@ function decodeIndexCursor(raw: string | undefined): number {
 
 function resolveCodexDirectListAppServerBudgetMs(env: NodeJS.ProcessEnv): number {
   const raw = Number.parseInt(String(env.HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_LIST_TIMEOUT_MS ?? ''), 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 2_000;
+  return Number.isFinite(raw) && raw > 0 ? raw : 750;
 }
 
 function mergeCodexDirectSessionCandidate(params: Readonly<{

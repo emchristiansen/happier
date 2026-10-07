@@ -551,6 +551,50 @@ describe('runClaude fast-start', () => {
     }
   });
 
+  it('passes an inherited Herdr runtime to the unified terminal loop', async () => {
+    loopStarted = createDeferred<void>();
+    loopExit = createDeferred<number>();
+    lastLoopOpts = null;
+    autoSessionReady = true;
+    initResolved = false;
+    backendInitDelayMs = 0;
+    getOrCreateSessionSpy.mockImplementation(async () => ({ id: 'sess_herdr_borrowed', metadataVersion: 1 }));
+
+    const { runClaude } = await import('./runClaude');
+    const terminalRuntime = {
+      mode: 'herdr' as const,
+      requested: 'herdr' as const,
+      herdrSessionName: 'work',
+      herdrSocketPath: '/tmp/herdr-work.sock',
+      herdrTerminalId: 'term_wrapper',
+      herdrPaneId: 'w1:p8',
+    };
+    let testError: unknown = null;
+    const runPromise = runClaude(createLegacyCredentials(), {
+      startedBy: 'terminal',
+      startingMode: 'local',
+      terminalRuntime,
+      claudeRemoteMetaDefaults: {
+        claudeUnifiedTerminalEnabled: true,
+        claudeUnifiedTerminalHost: 'herdr',
+      },
+    }).catch((error) => {
+      testError = error;
+      loopStarted.resolve();
+    });
+
+    try {
+      await expect(waitFor(loopStarted.promise, loopStartWaitMs)).resolves.toBeUndefined();
+      if (testError) throw testError;
+      expect(lastLoopOpts?.terminalRuntime).toEqual(terminalRuntime);
+    } finally {
+      loopExit.resolve(0);
+      await runPromise;
+    }
+
+    if (testError) throw testError;
+  });
+
   it('does not complete true fast-start readiness before the selected model effort catalog settles', async () => {
     vi.resetModules();
     const catalogRequested = createDeferred<void>();

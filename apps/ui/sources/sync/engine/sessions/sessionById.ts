@@ -1,8 +1,10 @@
 import {
+  isSessionEncryptionModeAllowedByClientRequirement,
   listCompletedSessionTurns,
   SessionTurnsProjectionV1Schema,
   type SessionTurnsProjectionV1,
   type V2SessionByIdResponse,
+  type ClientEncryptionRequirement,
 } from '@happier-dev/protocol';
 
 import type { Metadata, Session } from '@/sync/domains/state/storageTypes';
@@ -121,9 +123,7 @@ async function readSessionByIdHttp(params: Readonly<{
   }
 }
 
-function listRollbackEligibleTurnStarts(projection: SessionTurnsProjectionV1 | null): readonly number[] | null {
-  if (!projection) return null;
-
+function listRollbackEligibleTurnStarts(projection: SessionTurnsProjectionV1): number[] {
   const starts: number[] = [];
   for (const turn of listCompletedSessionTurns(projection.turns)) {
     if (turn.rollback?.state !== 'eligible') continue;
@@ -186,6 +186,7 @@ export async function fetchAndApplySessionById(params: Readonly<{
   log: { log: (message: string) => void };
   timeoutMs?: number;
   includeTurnsProjection?: boolean;
+  clientEncryptionRequirement: ClientEncryptionRequirement;
 }>): Promise<{
   ok: boolean;
   session: (V2SessionByIdResponse['session'] & { metadata: Metadata | null }) | null;
@@ -275,6 +276,9 @@ export async function fetchAndApplySessionById(params: Readonly<{
   }
 
   const encryptionMode: 'e2ee' | 'plain' = row.encryptionMode === 'plain' ? 'plain' : 'e2ee';
+  if (!isSessionEncryptionModeAllowedByClientRequirement(params.clientEncryptionRequirement, encryptionMode)) {
+    return { ok: false, session: null, errorCode: 'client_e2ee_required' };
+  }
 
   if (encryptionMode === 'plain') {
     params.sessionDataKeys.delete(sessionId);
@@ -330,7 +334,9 @@ export async function fetchAndApplySessionById(params: Readonly<{
       request: params.request,
       log: params.log,
     });
-  const rollbackEligibleTurnStarts = listRollbackEligibleTurnStarts(sessionTurns);
+  const rollbackEligibleTurnStarts = sessionTurns
+    ? listRollbackEligibleTurnStarts(sessionTurns)
+    : undefined;
 
   const runtimeActivityProjection = resolveSessionRuntimeActivityProjectionFields({}, row);
   const nextSession = {
@@ -344,12 +350,8 @@ export async function fetchAndApplySessionById(params: Readonly<{
     agentState,
     accessLevel: normalizedAccessLevel,
     canApprovePermissions: row.share?.canApprovePermissions ?? undefined,
-    ...(sessionTurns
-      ? {
-        sessionTurns,
-        rollbackEligibleTurnStarts,
-      }
-      : {}),
+    ...(sessionTurns ? { sessionTurns } : {}),
+    rollbackEligibleTurnStarts: rollbackEligibleTurnStarts ? [...rollbackEligibleTurnStarts] : undefined,
   };
 
   const previousSession = params.getExistingSession?.(sessionId);
@@ -362,12 +364,8 @@ export async function fetchAndApplySessionById(params: Readonly<{
       ...row,
       serverId: typeof params.serverId === 'string' && params.serverId.trim().length > 0 ? params.serverId.trim() : undefined,
       metadata,
-      ...(sessionTurns
-        ? {
-          sessionTurns,
-          rollbackEligibleTurnStarts,
-        }
-        : {}),
+      ...(sessionTurns ? { sessionTurns } : {}),
+      rollbackEligibleTurnStarts: rollbackEligibleTurnStarts ? [...rollbackEligibleTurnStarts] : undefined,
     },
   };
 }

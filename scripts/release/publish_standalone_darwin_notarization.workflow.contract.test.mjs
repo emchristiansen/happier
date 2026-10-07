@@ -11,6 +11,15 @@ async function loadWorkflow(name) {
   return { raw, workflow: YAML.parse(raw) };
 }
 
+test('CLI candidate build installs the complete cross-target optional native package set', async () => {
+  const { workflow } = await loadWorkflow('publish-cli-binaries.yml');
+  const install = workflow.jobs.build_candidate.steps.find(
+    (step) => step.uses === './.github/actions/install-yarn-dependencies',
+  );
+
+  assert.match(String(install?.with?.args ?? ''), /(?:^|\s)--ignore-platform(?:\s|$)/);
+});
+
 test('fresh Darwin finalizers explicitly build the trusted archive runtime before extraction', async () => {
   for (const workflowName of [
     'publish-cli-binaries.yml',
@@ -98,7 +107,12 @@ for (const product of [
     assert.match(source, /APPLE_API_PRIVATE_KEY/);
     assert.match(source, /notarize-standalone-binary\.mjs/);
     assert.match(source, /--archive/);
-    assert.match(source, new RegExp(`${product.archiveProduct}-v`));
+    if (product.id === 'cli') {
+      assert.match(source, /for PRODUCT in happier happier-memory-runtime happier-difftastic/);
+      assert.match(source, /\$\{PRODUCT\}-v\$\{VERSION\}-\$\{TARGET\}/);
+    } else {
+      assert.match(source, new RegExp(`${product.archiveProduct}-v`));
+    }
     assert.match(source, /--expected-payload/);
     assert.match(source, /--identity/);
     assert.match(source, /--out/);
@@ -107,7 +121,12 @@ for (const product of [
     } else {
       assert.doesNotMatch(source, /--refresh-cli-runtime-asset-manifest/);
     }
-    assert.match(source, new RegExp(`matrix\\.platform_key.*?${product.evidenceSuffix}\\.json`, 's'));
+    if (product.id === 'cli') {
+      assert.match(source, /SUFFIX=cli/);
+      assert.match(source, /\$\{PLATFORM_KEY\}\.\$\{SUFFIX\}\.json/);
+    } else {
+      assert.match(source, new RegExp(`matrix\\.platform_key.*?${product.evidenceSuffix}\\.json`, 's'));
+    }
     assert.match(source, /--verify-evidence/);
     assert.match(source, /actions\/upload-artifact/);
 
@@ -115,8 +134,14 @@ for (const product of [
     const publishSource = JSON.stringify(publish);
     assert.match(publishSource, /actions\/download-artifact/);
     assert.match(publishSource, /--prepared-artifacts/);
-    assert.match(publishSource, new RegExp(`darwin-arm64\\.${product.evidenceSuffix}\\.json`));
-    assert.match(publishSource, new RegExp(`darwin-x64\\.${product.evidenceSuffix}\\.json`));
+    if (product.id === 'cli') {
+      assert.match(publishSource, /for PRODUCT in happier happier-memory-runtime happier-difftastic/);
+      assert.match(publishSource, /for TARGET in darwin-arm64 darwin-x64/);
+      assert.match(publishSource, /\$\{TARGET\}\.\$\{SUFFIX\}\.json/);
+    } else {
+      assert.match(publishSource, new RegExp(`darwin-arm64\\.${product.evidenceSuffix}\\.json`));
+      assert.match(publishSource, new RegExp(`darwin-x64\\.${product.evidenceSuffix}\\.json`));
+    }
     assert.doesNotMatch(
       publishSource,
       /--finalized-artifacts/,
@@ -237,12 +262,26 @@ test('Apple certificate import and identity resolution have one reusable workflo
   assert.ok(repoRoot.endsWith('/'));
 });
 
-test('the exact re-extracted finalized CLI executes on its native signing runner', async () => {
+test('every exact re-extracted finalized CLI product executes through the canonical smoke on its native signing runner', async () => {
   const { workflow } = await loadWorkflow('publish-cli-binaries.yml');
   const finalize = workflow.jobs?.finalize_darwin;
+  const buildStep = finalize?.steps?.find((step) => step.name === 'Build trusted release archive runtime');
   const signingStep = finalize?.steps?.find((step) => String(step.name ?? '').includes('Sign, notarize'));
+  assert.match(
+    String(buildStep?.run ?? ''),
+    /ensureWorkspacePackagesBuiltCli\.mjs @happier-dev\/cli-common/,
+    'the clean finalizer must build the canonical smoke verifier dependency before importing it',
+  );
   assert.ok(signingStep, 'missing CLI Darwin finalization step');
-  assert.match(String(signingStep.run ?? ''), /VERIFY_DIR/);
-  assert.match(String(signingStep.run ?? ''), /CLI_BIN/);
-  assert.match(String(signingStep.run ?? ''), /"\$CLI_BIN" --version/);
+  const source = String(signingStep.run ?? '');
+  const verifyEvidenceIndex = source.indexOf('--verify-evidence');
+  const smokeIndex = source.indexOf('smokeTestArchive');
+
+  assert.match(source, /for PRODUCT in happier happier-memory-runtime happier-difftastic/);
+  assert.match(source, /import \{ smokeTestArchive \} from ['"]\.\/scripts\/pipeline\/release\/verify-artifacts\.mjs['"]/);
+  assert.match(source, /smokeTestArchive\(\{ archivePath: process\.argv\[1\] \}\)/);
+  assert.doesNotMatch(source, /execute:\s*false|--skip-smoke/);
+  assert.ok(verifyEvidenceIndex >= 0, 'the finalized archive must retain notarization evidence verification');
+  assert.ok(smokeIndex > verifyEvidenceIndex, 'native execution must happen after signing and notarization verification');
+  assert.doesNotMatch(source, /"\$CLI_BIN" --version/, 'the release lane must not retain a CLI-only smoke bypass');
 });

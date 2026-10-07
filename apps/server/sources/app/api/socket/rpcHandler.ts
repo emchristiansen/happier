@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { log } from "@/utils/logging/log";
 import { Server, Socket } from "socket.io";
 import {
@@ -11,6 +12,8 @@ import {
 } from "@happier-dev/protocol/rpc";
 import {
     SOCKET_RPC_EVENTS,
+    SocketRpcCancellationPayloadSchema,
+    SocketRpcRequestIdSchema,
     SOCKET_RPC_TRANSPORT_RESPONSE_ENVELOPE_VERSION_V1,
     SocketRpcTransportResponseEnvelopeV1Schema,
 } from "@happier-dev/protocol/socketRpc";
@@ -33,6 +36,71 @@ import type {
 import { publishSessionPublisherLifecycleUpdate } from "@/app/session/runtimeActivity/publishPublisherLifecycleUpdate";
 
 const MAX_RPC_METHOD_NAME_LENGTH = 512;
+
+type ActiveSocketRpcCancellation = {
+    controller: AbortController;
+    targetRequestId: string;
+    targetSocketId: string | null;
+    targetCancellationSent: boolean;
+};
+
+function readOptionalSocketRpcRequestId(data: unknown): string | null | undefined {
+    if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
+    const requestId = (data as { requestId?: unknown }).requestId;
+    if (requestId === undefined) return undefined;
+    const parsed = SocketRpcRequestIdSchema.safeParse(requestId);
+    return parsed.success ? parsed.data : null;
+}
+
+function cancelActiveSocketRpcCall(params: Readonly<{
+    io: Server;
+    active: ActiveSocketRpcCancellation;
+}>): void {
+    if (!params.active.controller.signal.aborted) {
+        params.active.controller.abort(new Error("RPC request cancelled by caller"));
+    }
+    if (!params.active.targetSocketId || params.active.targetCancellationSent) return;
+    params.active.targetCancellationSent = true;
+    try {
+        params.io.to(params.active.targetSocketId).emit(SOCKET_RPC_EVENTS.CANCEL, {
+            requestId: params.active.targetRequestId,
+        });
+    } catch (error) {
+        log(
+            { module: "websocket", level: "warn" },
+            `RPC target cancellation failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+    }
+}
+
+async function awaitCancellableTargetResponse<T>(params: Readonly<{
+    io: Server;
+    cancellation?: ActiveSocketRpcCancellation;
+    targetSocketId: string;
+    submit: () => Promise<T>;
+}>): Promise<T> {
+    const active = params.cancellation;
+    if (!active) return await params.submit();
+    if (active.controller.signal.aborted) throw active.controller.signal.reason;
+    active.targetSocketId = params.targetSocketId;
+    if (active.controller.signal.aborted) {
+        cancelActiveSocketRpcCall({ io: params.io, active });
+        throw active.controller.signal.reason;
+    }
+    const submitted = params.submit();
+    let removeAbortListener = () => {};
+    const aborted = new Promise<never>((_resolve, reject) => {
+        const onAbort = () => reject(active.controller.signal.reason ?? new Error("RPC request cancelled by caller"));
+        active.controller.signal.addEventListener("abort", onAbort, { once: true });
+        removeAbortListener = () => active.controller.signal.removeEventListener("abort", onAbort);
+        if (active.controller.signal.aborted) onAbort();
+    });
+    try {
+        return await Promise.race([submitted, aborted]);
+    } finally {
+        removeAbortListener();
+    }
+}
 
 function normalizeRpcMethodName(value: unknown): string | null {
     if (typeof value !== 'string') return null;
@@ -190,6 +258,16 @@ export function rpcHandler(
         socketId: socket.id,
         ownedMethods,
     });
+    // Correlations are scoped to this authenticated caller socket. The relay
+    // maps each one to a fresh target id before forwarding.
+    const activeCancellations = new Map<string, ActiveSocketRpcCancellation>();
+
+    socket.on(SOCKET_RPC_EVENTS.CANCEL, (data: unknown) => {
+        const parsed = SocketRpcCancellationPayloadSchema.safeParse(data);
+        if (!parsed.success) return;
+        const active = activeCancellations.get(parsed.data.requestId);
+        if (active) cancelActiveSocketRpcCall({ io: ctx.io, active });
+    });
 
     const resolveUserRpcListeners = (mode: 'get' | 'ensure'): Map<string, Socket> => {
         const current = allRpcListeners.get(userId);
@@ -272,7 +350,28 @@ export function rpcHandler(
 
     // RPC call - Call an RPC method on another socket of the same user
     socket.on(SOCKET_RPC_EVENTS.CALL, async (data: any, callback: (response: any) => void) => {
+        let callerRequestId: string | undefined;
+        let cancellation: ActiveSocketRpcCancellation | undefined;
         try {
+            const parsedRequestId = readOptionalSocketRpcRequestId(data);
+            if (parsedRequestId === null) {
+                callback?.({ ok: false, error: "Invalid RPC request correlation" });
+                return;
+            }
+            callerRequestId = parsedRequestId;
+            if (callerRequestId) {
+                if (activeCancellations.has(callerRequestId)) {
+                    callback?.({ ok: false, error: "RPC request correlation is already active" });
+                    return;
+                }
+                cancellation = {
+                    controller: new AbortController(),
+                    targetRequestId: `rpc_${randomUUID()}`,
+                    targetSocketId: null,
+                    targetCancellationSent: false,
+                };
+                activeCancellations.set(callerRequestId, cancellation);
+            }
             const method = normalizeRpcMethodName(data?.method);
             const callParams = data?.params;
             const requestedTimeoutMs = data?.timeoutMs;
@@ -337,6 +436,7 @@ export function rpcHandler(
             const buildForwardedRequest = () => ({
                 method,
                 params: callParams,
+                ...(cancellation ? { requestId: cancellation.targetRequestId } : {}),
                 ...(rpcAuthorization ? { authorization: rpcAuthorization } : {}),
                 ...(explicitMachineStopRequest
                     ? {
@@ -511,10 +611,15 @@ export function rpcHandler(
                             }
                         }
 
-                        const response = await fallbackSocket.timeout(forwardTimeoutMs).emitWithAck(
-                            SOCKET_RPC_EVENTS.REQUEST,
-                            buildForwardedRequest(),
-                        );
+                        const response = await awaitCancellableTargetResponse({
+                            io: ctx.io,
+                            cancellation,
+                            targetSocketId: fallbackSocket.id,
+                            submit: async () => await fallbackSocket.timeout(forwardTimeoutMs).emitWithAck(
+                                SOCKET_RPC_EVENTS.REQUEST,
+                                buildForwardedRequest(),
+                            ),
+                        });
                         // Evaluated before the optional call: `callback?.(await ...)` would
                         // short-circuit its argument and skip the stop lifecycle entirely
                         // when the caller emitted without an acknowledgement.
@@ -588,10 +693,15 @@ export function rpcHandler(
                             return;
                         }
                     }
-                    const responses = await ctx.io.timeout(forwardTimeoutMs).to(targetSocketId).emitWithAck(
-                        SOCKET_RPC_EVENTS.REQUEST,
-                        buildForwardedRequest(),
-                    );
+                    const responses = await awaitCancellableTargetResponse({
+                        io: ctx.io,
+                        cancellation,
+                        targetSocketId,
+                        submit: async () => await ctx.io.timeout(forwardTimeoutMs).to(targetSocketId).emitWithAck(
+                            SOCKET_RPC_EVENTS.REQUEST,
+                            buildForwardedRequest(),
+                        ),
+                    });
                     if (Array.isArray(responses) && responses.length === 0) {
                         // The socket mapping exists in Redis, but no socket acknowledged the call.
                         // Treat this as method unavailable and clean up stale mapping.
@@ -674,10 +784,16 @@ export function rpcHandler(
                 }
 
                 // Forward the RPC request to the target socket using emitWithAck (single-process path).
-                const response = await targetSocket.timeout(forwardTimeoutMs).emitWithAck(
-                    SOCKET_RPC_EVENTS.REQUEST,
-                    buildForwardedRequest(),
-                );
+                const activeTargetSocket = targetSocket;
+                const response = await awaitCancellableTargetResponse({
+                    io: ctx.io,
+                    cancellation,
+                    targetSocketId: activeTargetSocket.id,
+                    submit: async () => await activeTargetSocket.timeout(forwardTimeoutMs).emitWithAck(
+                        SOCKET_RPC_EVENTS.REQUEST,
+                        buildForwardedRequest(),
+                    ),
+                });
 
                 const forwardedResponse = await forwardTargetResponse(response);
                 callback?.(forwardedResponse);
@@ -686,7 +802,11 @@ export function rpcHandler(
                 const errorMsg = error instanceof Error ? error.message : 'RPC call failed';
 
                 // Timeout or error occurred
-                if (redisRegistry.enabled && attemptedTargetSocketId) {
+                if (
+                    redisRegistry.enabled
+                    && attemptedTargetSocketId
+                    && !cancellation?.controller.signal.aborted
+                ) {
                     try {
                         await redisRegistry.removeSocketRegistration(targetUserId, method, attemptedTargetSocketId);
                     } catch {
@@ -707,10 +827,22 @@ export function rpcHandler(
                     error: 'Internal error'
                 });
             }
+        } finally {
+            if (
+                callerRequestId
+                && cancellation
+                && activeCancellations.get(callerRequestId) === cancellation
+            ) {
+                activeCancellations.delete(callerRequestId);
+            }
         }
     });
 
     socket.on('disconnect', () => {
+        for (const active of activeCancellations.values()) {
+            cancelActiveSocketRpcCall({ io: ctx.io, active });
+        }
+        activeCancellations.clear();
         const listeners = resolveUserRpcListeners('get');
         const methodsToRemove: string[] = [];
         for (const [method, registeredSocket] of listeners.entries()) {

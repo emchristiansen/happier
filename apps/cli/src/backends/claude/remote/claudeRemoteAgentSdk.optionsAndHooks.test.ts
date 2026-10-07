@@ -268,13 +268,19 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
         });
     });
 
-    it('passes effort when the mode specifies a reasoningEffort', async () => {
+    it.each([
+        { requestedModel: 'sonnet', runtimeModel: 'claude-sonnet-4-6', effort: 'low' },
+        { requestedModel: 'claude-opus-4-6', runtimeModel: 'claude-opus-4-6', effort: 'max' },
+    ])('passes effort when the mode specifies a reasoningEffort ($requestedModel/$effort)', async ({ requestedModel, runtimeModel, effort }) => {
         let capturedOptions: any = null;
+        const onEffectiveModel = vi.fn();
 
         const createQuery = vi.fn((_params: any) => {
             capturedOptions = _params.options;
             return {
                 async *[Symbol.asyncIterator]() {
+                    expect(onEffectiveModel).not.toHaveBeenCalled();
+                    yield { type: 'system', subtype: 'init', model: runtimeModel, session_id: 'effort-init' } as any;
                     yield { type: 'result' } as any;
                 },
                 close: vi.fn(),
@@ -292,7 +298,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
             didSendFirst = true;
             return {
                 message: 'hello',
-                mode: makeMode({ permissionMode: 'default', model: 'claude-opus-4-6', reasoningEffort: 'max' } as any),
+                mode: makeMode({ permissionMode: 'default', model: requestedModel, reasoningEffort: effort }),
             };
         });
 
@@ -308,12 +314,14 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
             onReady: () => {},
             onSessionFound: () => {},
             onMessage: () => {},
+            onEffectiveModel,
             createQuery,
         } as any);
 
         expect(capturedOptions).toBeTruthy();
-        expect(capturedOptions.model).toBe('claude-opus-4-6');
-        expect(capturedOptions.effort).toBe('max');
+        expect(capturedOptions.model).toBe(requestedModel);
+        expect(capturedOptions.effort).toBe(effort);
+        expect(onEffectiveModel).toHaveBeenCalledWith({ modelId: runtimeModel, reasoningEffort: effort });
     });
 
     it('passes ultracode through the --settings extraArg for xhigh-capable models', async () => {
@@ -1309,9 +1317,9 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
 
         expect(capturedOptions).toBeTruthy();
         expect(capturedOptions.settingSources).toEqual(['user', 'project', 'local']);
-        // When Happier resolves to 'default', we omit permissionMode from the Agent SDK options
-        // so the SDK honors the user's `permissions.defaultMode` from .claude/settings.json.
-        expect(capturedOptions).not.toHaveProperty('permissionMode');
+        // Agent SDK 0.2.123 converts an absent value to `--permission-mode default`, which
+        // overrides the user's settings. A runtime null is the SDK boundary's omit sentinel.
+        expect(capturedOptions.permissionMode).toBeNull();
     });
 
     it('forwards settingSources when explicitly set on the mode', async () => {
@@ -2473,7 +2481,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
         expect((await runOnce({ permissionMode: 'default', agentModeId: 'plan' }))?.allowDangerouslySkipPermissions).toBe(true);
     });
 
-    it('omits permissionMode when Happier resolves to default, but passes it for non-default modes', async () => {
+    it('uses the Agent SDK omit sentinel when Happier resolves to default, but passes non-default modes', async () => {
         let capturedOptions: any = null;
 
         const createQuery = vi.fn((_params: any) => {
@@ -2516,8 +2524,8 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
             return capturedOptions;
         };
 
-        // Default → no permissionMode key → SDK reads settings.json defaultMode
-        expect(await runOnce({ permissionMode: 'default' })).not.toHaveProperty('permissionMode');
+        // Default → null sentinel → no CLI flag → Claude reads settings.json defaultMode
+        expect((await runOnce({ permissionMode: 'default' }))?.permissionMode).toBeNull();
         // agentModeId === 'plan' still resolves to 'plan' (non-default), so it IS passed
         expect((await runOnce({ permissionMode: 'default', agentModeId: 'plan' }))?.permissionMode).toBe('plan');
         // Non-default explicit modes still forwarded
@@ -3133,7 +3141,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
                 setPermissionMode: vi.fn(),
                 setModel: vi.fn(),
                 setMaxThinkingTokens: vi.fn(),
-                supportedCommands: vi.fn(async () => [{ command: '/compact', description: 'Compact context' }]),
+                supportedCommands: vi.fn(async () => [{ name: 'compact', description: 'Compact context', argumentHint: '' }]),
                 supportedModels: vi.fn(async () => [{ id: 'm1', displayName: 'Model 1' }]),
             } as any;
         });
@@ -3158,8 +3166,8 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
 
         expect(onCapabilities).toHaveBeenCalledWith(
             expect.objectContaining({
-                slashCommands: ['/compact'],
-                slashCommandDetails: [{ command: '/compact', description: 'Compact context' }],
+                slashCommands: ['compact'],
+                slashCommandDetails: [{ command: 'compact', description: 'Compact context' }],
             }),
         );
     });
@@ -3199,6 +3207,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
                         claudeRemoteAdvancedOptionsJson: JSON.stringify({
                             plugins: [{ type: 'local', path: '/tmp/plugin' }],
                             hooks: { SessionStart: [] },
+                            pathToClaudeCodeExecutable: null,
                         }),
                     }),
                 }),
@@ -3209,6 +3218,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
             } as any);
 
             expect(capturedOptions?.plugins).toEqual([{ type: 'local', path: '/tmp/plugin' }]);
+            expect(capturedOptions?.pathToClaudeCodeExecutable).toBe('/tmp/claude');
             expect(capturedOptions?.hooks?.SessionStart?.[0]?.hooks?.length).toBe(1);
             expect(typeof capturedOptions?.debugFile).toBe('string');
             expect(capturedOptions?.debugFile).toMatch(/^\/tmp\/happier-claude-debug-artifacts\//);
@@ -3346,7 +3356,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
             suppressOutput: true,
             hookSpecificOutput: {
                 hookEventName: 'PermissionRequest',
-                decision: { behavior: 'allow', updatedInput, updatedPermissions },
+                decision: { behavior: 'allow', updatedPermissions },
             },
         });
     });

@@ -13,6 +13,7 @@ import type {
 } from '../terminalHost/_types';
 import { delay } from '@/utils/time';
 import { logger } from '@/ui/logger';
+import { TerminalHostCreationError } from '@/integrations/terminalHost/errors';
 
 import { createTmuxTerminalControlPort } from './control';
 import { resolveTmuxPromptSubmitDelayMs } from './env';
@@ -33,7 +34,9 @@ import { createTmuxTerminalHostHandle } from './hostHandle';
 const INPUT_STABILITY_DELAY_MS = 50;
 
 function targetFromHandle(handle: TerminalHostHandle): string {
-  return handle.paneId ? `${handle.sessionName}:${handle.paneId}` : handle.sessionName;
+  const ownedWindow = handle.paneId?.trim();
+  if (ownedWindow?.startsWith('@')) return ownedWindow;
+  return ownedWindow ? `${handle.sessionName}:${ownedWindow}` : handle.sessionName;
 }
 
 export function resolveTmuxCommandEnvironmentForHostHandle(
@@ -150,18 +153,20 @@ export function createTmuxTerminalHostAdapter(params?: Readonly<{
   const createOrAttachHost: TerminalHostAdapter['createOrAttachHost'] = async (opts) => {
     const result = await tmux.spawnInTmux([...opts.spawnArgv], {
       sessionName: opts.sessionName,
-      windowName: opts.sessionName,
+      windowName: opts.topology === 'shared' ? opts.label ?? opts.sessionName : opts.sessionName,
       cwd: opts.workingDirectory,
-      requireNewSession: true,
+      requireNewSession: opts.topology !== 'shared',
     }, { ...opts.spawnEnv });
     if (!result.success) {
-      throw new Error(result.error ?? 'Failed to create tmux terminal host');
+      const error = new Error(result.error ?? 'Failed to create tmux terminal host');
+      throw new TerminalHostCreationError([error], result, error.message);
     }
     return createTmuxTerminalHostHandle({
       attachmentId: randomUUID() as TerminalAttachmentId,
       sessionName: result.sessionName ?? opts.sessionName,
-      windowName: result.windowName,
-      topology: 'exclusive',
+      windowId: result.windowId ?? '',
+      topology: opts.topology ?? 'exclusive',
+      ...(opts.spawnEnv.TMUX_TMPDIR ? { tmuxTmpDir: opts.spawnEnv.TMUX_TMPDIR } : {}),
     });
   };
 
@@ -223,9 +228,11 @@ export function createTmuxTerminalHostAdapter(params?: Readonly<{
       const result = await pasteTextViaTmuxBuffer({
         target: targetFromHandle(handle),
         text: input.text,
+        signal: input.signal,
+        resolveDeliveryState: input.resolveDeliveryState,
         bufferName: createTmuxPromptBufferName(),
         submitDelayMs: resolveTmuxPromptSubmitDelayMs(),
-        submitRetryDelayMs: resolveTmuxPromptSubmitDelayMs(),
+        postSubmitSettleMs: resolveTmuxPromptSubmitDelayMs(),
         timeoutMs: input.scheduling.timeoutMs ?? resolveTerminalPromptWriteTimeoutMs(input.text),
         ...(writeBoundary
           ? {

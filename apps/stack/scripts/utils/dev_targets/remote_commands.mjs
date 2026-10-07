@@ -1,5 +1,7 @@
 import { resolveEffectiveDbProvider } from '../server/effective_db_provider.mjs';
 
+export const DEFAULT_REMOTE_STACK_STARTUP_TIMEOUT_MS = 30 * 60_000;
+
 function posixQuote(value) {
   return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
 }
@@ -299,7 +301,7 @@ function resolveRemoteStackInvocation(target, {
     ]),
     ...(stablePublicExpoPort == null ? [] : [`HAPPIER_STACK_EXPO_PUBLIC_PORT=${stablePublicExpoPort}`]),
     ...(expoPublicUrl && !resolveExpoPublicUrlOnTarget ? [`EXPO_PACKAGER_PROXY_URL=${expoPublicUrl}`] : []),
-    'HAPPIER_CLI_PKGROLL_TIMEOUT_MS=1800000',
+    `HAPPIER_CLI_PKGROLL_TIMEOUT_MS=${DEFAULT_REMOTE_STACK_STARTUP_TIMEOUT_MS}`,
     ...(normalizedServices.daemon && deferDaemonStartUntilCredentials
       ? ['HAPPIER_STACK_DAEMON_WAIT_FOR_AUTH=1']
       : []),

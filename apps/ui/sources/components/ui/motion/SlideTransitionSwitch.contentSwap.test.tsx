@@ -1,5 +1,6 @@
 import * as React from 'react';
-import { Text } from 'react-native';
+import { Text, TextInput } from 'react-native';
+import { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 
 import { renderScreen } from '@/dev/testkit';
@@ -9,14 +10,11 @@ vi.mock('react-native', async () => {
     return createReactNativeWebMock();
 });
 
-vi.mock('@/hooks/ui/useReducedMotionPreference', () => ({
-    useReducedMotionPreference: () => false,
-}));
-
 // Use a configurable spring stub so individual tests can choose whether to
 // fire the completion callback (committing the in-flight target) or not.
 const springControls = vi.hoisted(() => ({
     fireCallbackImmediately: false,
+    complete: null as ((finished?: boolean) => void) | null,
 }));
 
 vi.mock('react-native-reanimated', async () => {
@@ -32,6 +30,7 @@ vi.mock('react-native-reanimated', async () => {
     const runOnJS = <TArgs extends unknown[], TResult>(fn: (...args: TArgs) => TResult) => fn;
     const cancelAnimation = () => {};
     const withSpring = <T,>(value: T, _config?: unknown, callback?: (finished?: boolean) => void) => {
+        springControls.complete = callback ?? null;
         if (springControls.fireCallbackImmediately && callback) callback(true);
         return value;
     };
@@ -57,7 +56,37 @@ vi.mock('react-native-reanimated', async () => {
     };
 });
 
+function DraftEditor() {
+    const [value, setValue] = React.useState('seed');
+    return <TextInput testID="draft-editor" value={value} onChangeText={setValue} />;
+}
+
 describe('SlideTransitionSwitch (discrete adapter)', () => {
+    it.each(['forward', 'backward'] as const)('preserves the incoming draft when a %s transition settles', async (direction) => {
+        springControls.fireCallbackImmediately = false;
+        const { SlideTransitionSwitch } = await import('./SlideTransitionSwitch');
+        const screen = await renderScreen(
+            <SlideTransitionSwitch contentKey="a" direction={direction} reducedMotion={false}>
+                <Text>Previous</Text>
+            </SlideTransitionSwitch>,
+        );
+        await screen.update(
+            <SlideTransitionSwitch contentKey="b" direction={direction} reducedMotion={false}>
+                <DraftEditor />
+            </SlideTransitionSwitch>,
+        );
+        await act(async () => {
+            screen.changeTextByTestId('draft-editor', 'unsaved edit');
+        });
+        expect(screen.findByTestId('draft-editor')?.props.value).toBe('unsaved edit');
+
+        await act(async () => {
+            springControls.complete?.(true);
+        });
+
+        expect(screen.findByTestId('draft-editor')?.props.value).toBe('unsaved edit');
+    });
+
     it('mounts only the current slot when no transition is active', async () => {
         springControls.fireCallbackImmediately = false;
         const { SlideTransitionSwitch } = await import('./SlideTransitionSwitch');

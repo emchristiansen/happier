@@ -1,3 +1,5 @@
+import type { TerminalPromptInput } from './_types';
+
 const DEFAULT_POST_SUBMIT_SETTLE_MS = 50;
 const DEFAULT_PRE_SUBMIT_POLL_MS = 250;
 
@@ -47,20 +49,38 @@ export async function runTerminalPromptSubmission(params: Readonly<{
   submitEnter: (params: Readonly<{ remainingTimeoutMs?: number | undefined }>) => Promise<TerminalPromptSubmitCommandResult | void>;
   verifyAfterSubmit?: ((params: Readonly<{ promptText: string; remainingTimeoutMs?: number | undefined }>) => Promise<boolean>) | undefined;
   remainingTimeoutMs?: (() => number | undefined) | undefined;
+  signal?: AbortSignal | undefined;
+  resolveDeliveryState?: TerminalPromptInput['resolveDeliveryState'];
   wait?: ((delayMs: number) => Promise<void>) | undefined;
   stagingPollIntervalMs?: number | undefined;
-  submitRetryDelayMs?: number | undefined;
+  postSubmitSettleMs?: number | undefined;
 }>): Promise<TerminalPromptSubmissionResult> {
   let stagingWasProvenAtDeadline = false;
   const remainingOperationTimeoutMs = (): number | undefined => (
-    stagingWasProvenAtDeadline ? undefined : params.remainingTimeoutMs?.()
+    params.signal || stagingWasProvenAtDeadline ? undefined : params.remainingTimeoutMs?.()
   );
+  let submitMayHaveReachedPane = false;
+  const settledResult = (): TerminalPromptSubmissionResult | null => {
+    const deliveryState = params.resolveDeliveryState?.();
+    if (deliveryState === 'accepted') return { success: true };
+    if (!params.signal?.aborted && deliveryState !== 'retired') return null;
+    return {
+      success: false,
+      reason: 'verification_failed',
+      phase: submitMayHaveReachedPane ? 'after_enter_unknown' : 'after_write_before_enter',
+      duplicateRisk: 'possible',
+      submitMayHaveReachedPane,
+    };
+  };
+  // The session owns provider readiness. A successful write can sit in the provider's input
+  // queue while its event loop is busy; the write-command budget cannot decide its outcome.
+  // Callers without a session lifetime retain their explicitly bounded operation contract.
   const submitOnce = async (): Promise<TerminalPromptSubmitCommandResult> => normalizeSubmitResult(await params.submitEnter({
     remainingTimeoutMs: remainingOperationTimeoutMs(),
   }));
   const postSubmitSettleMs = Math.max(
     0,
-    Math.trunc(params.submitRetryDelayMs ?? DEFAULT_POST_SUBMIT_SETTLE_MS),
+    Math.trunc(params.postSubmitSettleMs ?? DEFAULT_POST_SUBMIT_SETTLE_MS),
   );
   const waitForPostSubmitSettle = async (): Promise<void> => {
     if (postSubmitSettleMs <= 0) return;
@@ -73,7 +93,9 @@ export async function runTerminalPromptSubmission(params: Readonly<{
       Math.trunc(params.stagingPollIntervalMs ?? DEFAULT_PRE_SUBMIT_POLL_MS),
     );
     while (true) {
-      const remainingTimeoutMs = params.remainingTimeoutMs?.();
+      const settled = settledResult();
+      if (settled) return settled;
+      const remainingTimeoutMs = remainingOperationTimeoutMs();
       try {
         if (await params.verifyStagedBeforeSubmit({
           promptText: params.promptText,
@@ -86,6 +108,8 @@ export async function runTerminalPromptSubmission(params: Readonly<{
           break;
         }
       } catch {
+        const settled = settledResult();
+        if (settled) return settled;
         return {
           success: false,
           reason: 'verification_failed',
@@ -94,6 +118,8 @@ export async function runTerminalPromptSubmission(params: Readonly<{
           submitMayHaveReachedPane: false,
         };
       }
+      const settledAfterCapture = settledResult();
+      if (settledAfterCapture) return settledAfterCapture;
       if (remainingTimeoutMs === 0) {
         return {
           success: false,
@@ -103,7 +129,7 @@ export async function runTerminalPromptSubmission(params: Readonly<{
           submitMayHaveReachedPane: false,
         };
       }
-      if (remainingTimeoutMs === undefined) {
+      if (remainingTimeoutMs === undefined && !params.signal) {
         return {
           success: false,
           reason: 'verification_failed',
@@ -112,7 +138,7 @@ export async function runTerminalPromptSubmission(params: Readonly<{
           submitMayHaveReachedPane: false,
         };
       }
-      await (params.wait ?? defaultWait)(Math.min(stagingPollIntervalMs, remainingTimeoutMs));
+      await (params.wait ?? defaultWait)(Math.min(stagingPollIntervalMs, remainingTimeoutMs ?? stagingPollIntervalMs));
     }
   }
 
@@ -137,7 +163,10 @@ export async function runTerminalPromptSubmission(params: Readonly<{
     return confirmation ? 'pending' : 'cleared';
   };
 
+  const settledBeforeEnter = settledResult();
+  if (settledBeforeEnter) return settledBeforeEnter;
   const submitted = await submitOnce();
+  submitMayHaveReachedPane = submitted !== 'failed';
   if (submitted === 'timeout') {
     return {
       success: false,
@@ -162,61 +191,39 @@ export async function runTerminalPromptSubmission(params: Readonly<{
   }
 
   await waitForPostSubmitSettle();
-  let verification = await verifyStableAbsence();
-  if (verification === 'failed') {
-    return {
-      success: false,
-      reason: 'verification_failed',
-      phase: 'after_enter_unknown',
-      duplicateRisk: 'likely',
-      submitMayHaveReachedPane: true,
-    };
-  }
-  if (verification === 'cleared') {
-    return { success: true };
-  }
+  while (true) {
+    const settled = settledResult();
+    if (settled) return settled;
+    const verification = await verifyStableAbsence();
+    const settledAfterCapture = settledResult();
+    if (settledAfterCapture) return settledAfterCapture;
+    if (verification === 'failed') {
+      return {
+        success: false,
+        reason: 'verification_failed',
+        phase: 'after_enter_unknown',
+        duplicateRisk: 'likely',
+        submitMayHaveReachedPane: true,
+      };
+    }
+    if (verification === 'cleared') return { success: true };
 
-  await waitForPostSubmitSettle();
-  const retried = await submitOnce();
-  if (retried === 'timeout') {
-    return {
-      success: false,
-      reason: 'timeout',
-      phase: 'after_enter_unknown',
-      duplicateRisk: 'likely',
-      submitMayHaveReachedPane: true,
-    };
+    // The screen can lag behind provider acceptance. Re-observe under the caller's
+    // session lifetime (or its explicit operation budget); another Enter based on a stale draft is not
+    // evidence-backed and can act on a different composer by the time it arrives.
+    const remainingTimeoutMs = remainingOperationTimeoutMs();
+    if ((remainingTimeoutMs === undefined && !params.signal) || remainingTimeoutMs === 0) {
+      return {
+        success: false,
+        reason: 'verification_failed',
+        phase: 'after_enter_unknown',
+        duplicateRisk: 'possible',
+        submitMayHaveReachedPane: true,
+      };
+    }
+    await (params.wait ?? defaultWait)(Math.min(
+      DEFAULT_PRE_SUBMIT_POLL_MS,
+      remainingTimeoutMs ?? DEFAULT_PRE_SUBMIT_POLL_MS,
+    ));
   }
-  if (retried === 'failed') {
-    return {
-      success: false,
-      reason: 'submit_failed',
-      phase: 'after_enter_unknown',
-      duplicateRisk: 'possible',
-      submitMayHaveReachedPane: true,
-    };
-  }
-
-  await waitForPostSubmitSettle();
-  verification = await verifyStableAbsence();
-  if (verification === 'failed') {
-    return {
-      success: false,
-      reason: 'verification_failed',
-      phase: 'after_enter_unknown',
-      duplicateRisk: 'likely',
-      submitMayHaveReachedPane: true,
-    };
-  }
-  if (verification === 'pending') {
-    return {
-      success: false,
-      reason: 'verification_failed',
-      phase: 'after_enter_unknown',
-      duplicateRisk: 'possible',
-      submitMayHaveReachedPane: true,
-    };
-  }
-
-  return { success: true };
 }

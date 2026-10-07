@@ -101,7 +101,6 @@ export function createSessionItemTestRowModel(
         serverName: input.serverName,
         treeRowId: `session:${serverId ?? 'local'}:${sessionId}`,
         testID: `session-list-item-${sessionId}`,
-        dataIndex: 0,
         session,
         status,
         statusSignature: `${status.state}|${status.isConnected ? 1 : 0}|${status.statusText}`,
@@ -143,6 +142,7 @@ export function createSessionItemTestRowModel(
         isSelected: input.selected ?? false,
         isPinned: input.pinned ?? false,
         isAttentionStanding: input.attentionStanding ?? false,
+        reminder: null,
         attentionStandingEnabled: input.attentionStandingEnabled ?? false,
         isArchived: session.archivedAt != null,
         isActive: session.active === true,
@@ -228,6 +228,19 @@ export function installSessionShellCommonModuleMocks(
 
         const { createUnistylesMock } = await import('@/dev/testkit/mocks/unistyles');
         return createUnistylesMock();
+    });
+
+    vi.mock('@/constants/Typography', async (importOriginal) => {
+        const original = await importOriginal<typeof import('@/constants/Typography')>();
+        return {
+            ...original,
+            Typography: new Proxy(original.Typography, {
+                get: (target, property, receiver) => {
+                    const value = Reflect.get(target, property, receiver);
+                    return typeof value === 'function' ? () => ({}) : value;
+                },
+            }),
+        };
     });
 
     vi.mock('@/text', async () => {

@@ -1,9 +1,16 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useSyncExternalStore } from 'react';
 import { usePathname } from 'next/navigation';
 
-import { capturePageview, isAnalyticsActive, optIn, optOut, readOptOut, start } from './analytics';
+import {
+    capturePageview,
+    getAnalyticsStatus,
+    optIn,
+    optOut,
+    start,
+    subscribeAnalyticsStatus,
+} from './analytics';
 
 /**
  * Boots analytics and records one pageview per route.
@@ -40,27 +47,21 @@ export function Analytics() {
  * writes to a device.
  */
 export function AnalyticsNotice() {
-    // Read on the client only: the server has no localStorage, and rendering a
-    // guess would swap the label under the reader on hydration.
-    const [mounted, setMounted] = useState(false);
-    const [optedOut, setOptedOut] = useState(false);
-    const [active, setActive] = useState(false);
+    const status = useSyncExternalStore(
+        subscribeAnalyticsStatus,
+        getAnalyticsStatus,
+        () => 'loading',
+    );
 
-    useEffect(() => {
-        setMounted(true);
-        setOptedOut(readOptOut());
-        setActive(isAnalyticsActive());
-    }, []);
+    if (status === 'loading') return null;
 
-    if (!mounted) return null;
+    const optedOut = status === 'opted-out';
 
     function toggle() {
         if (optedOut) {
             optIn();
-            setOptedOut(false);
         } else {
             optOut();
-            setOptedOut(true);
         }
     }
 
@@ -69,11 +70,13 @@ export function AnalyticsNotice() {
             <span>
                 {optedOut
                     ? 'Analytics are off for this browser.'
-                    : active
+                    : status === 'active'
                       ? 'Anonymous, cookieless page analytics — no identifier, no profile, first-party only.'
-                      : 'Analytics are off: your browser sends Do Not Track or Global Privacy Control.'}
+                      : status === 'browser-refused'
+                        ? 'Analytics are off because Global Privacy Control is enabled.'
+                        : 'Anonymous analytics are unavailable.'}
             </span>{' '}
-            {active || optedOut ? (
+            {status === 'active' || optedOut ? (
                 <button type="button" onClick={toggle} className="fd-analytics-toggle">
                     {optedOut ? 'Turn on' : 'Turn off'}
                 </button>

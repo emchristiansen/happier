@@ -50,6 +50,7 @@ describe('readSessionMetadataRuntimeDescriptor', () => {
       vendorSessionId: 'oc_runtime',
       serverBaseUrl: 'http://127.0.0.1:4096/',
       serverBaseUrlExplicit: true,
+      managedServerLaunchFingerprint: null,
     });
   });
 
@@ -191,6 +192,7 @@ describe('readSessionMetadataRuntimeDescriptor', () => {
       vendorSessionId: 'oc_1',
       serverBaseUrl: 'http://127.0.0.1:4096/',
       serverBaseUrlExplicit: true,
+      managedServerLaunchFingerprint: null,
     });
   });
 

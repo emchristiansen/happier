@@ -2,6 +2,8 @@ import type { VoiceAgentManager } from '@/agent/voice/agent/VoiceAgentManager';
 import type { ExecutionRunState } from '@/agent/executionRuns/runtime/executionRunTypes';
 import type { ExecutionRunController } from '@/agent/executionRuns/controllers/types';
 import type { FinishExecutionRun } from '@/agent/executionRuns/runtime/executionRunFinishRun';
+import { settleExecutionRunControllerOccurrence } from '@/agent/executionRuns/runtime/settleExecutionRunControllerOccurrence';
+import { logger } from '@/ui/logger';
 
 export async function stopExecutionRun(args: Readonly<{
   runId: string;
@@ -18,21 +20,22 @@ export async function stopExecutionRun(args: Readonly<{
   if (!ctrl) return { ok: false, errorCode: 'execution_run_not_allowed', error: 'Not running' };
 
   ctrl.cancelled = true;
-  if (ctrl.kind === 'backend') {
-    try {
+  const leafCancellation = Promise.resolve().then(async () => {
+    if (ctrl.kind === 'backend') {
       if (ctrl.childSessionId) {
         await ctrl.backend.cancel(ctrl.childSessionId);
       }
-    } catch {
-      // best effort
+      return;
     }
-  } else {
-    try {
-      await args.voiceAgentManager.stop({ voiceAgentId: ctrl.voiceAgentId });
-    } catch {
-      // best-effort
-    }
-  }
+    await args.voiceAgentManager.stop({ voiceAgentId: ctrl.voiceAgentId });
+  });
+  void leafCancellation.catch((error) => {
+    logger.warn('[EXECUTION RUN] Provider cancellation failed after host stop', {
+      runId: args.runId,
+      controllerKind: ctrl.kind,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
 
   const finishedAtMs = args.getNowMs();
   const output = {
@@ -47,20 +50,24 @@ export async function stopExecutionRun(args: Readonly<{
     finishedAtMs,
   };
 
-  await args.finishRun(args.runId, { status: 'cancelled', summary: 'Cancelled', finishedAtMs }, { output });
-  if (ctrl.kind === 'backend') {
+  try {
+    await args.finishRun(args.runId, { status: 'cancelled', summary: 'Cancelled', finishedAtMs }, { output });
+  } finally {
     try {
-      await ctrl.backend.dispose();
+      await ctrl.terminalMarkerWritePromise;
     } catch {
       // ignore
     }
+    if (ctrl.kind === 'backend') {
+      const leafDisposal = Promise.resolve().then(() => ctrl.backend.dispose());
+      void leafDisposal.catch((error) => {
+        logger.warn('[EXECUTION RUN] Backend disposal failed after host stop', {
+          runId: args.runId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+    settleExecutionRunControllerOccurrence(args.controllers, args.runId, ctrl);
   }
-  try {
-    await ctrl.terminalMarkerWritePromise;
-  } catch {
-    // ignore
-  }
-  ctrl.resolveTerminal();
-  args.controllers.delete(args.runId);
   return { ok: true };
 }

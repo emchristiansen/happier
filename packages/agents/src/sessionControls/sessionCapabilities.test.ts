@@ -144,7 +144,7 @@ describe('sessionCapabilities', () => {
     ).toBe('supported');
   });
 
-  it('downgrades opencode fork-from-message to server-only sessions', () => {
+  it('keeps ACP limited to conversation forks while server-native forks stay available', () => {
     expect(
       evaluateAgentSessionCapabilitySupport({
         agentId: 'opencode',
@@ -158,6 +158,14 @@ describe('sessionCapabilities', () => {
         agentId: 'opencode',
         capability: 'sessionFork.conversation',
         metadata: { opencodeBackendMode: 'acp' },
+      }),
+    ).toBe('supported');
+
+    expect(
+      evaluateAgentSessionCapabilitySupport({
+        agentId: 'opencode',
+        capability: 'sessionFork.conversation',
+        metadata: { opencodeBackendMode: 'server' },
       }),
     ).toBe('supported');
   });

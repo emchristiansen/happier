@@ -13,6 +13,37 @@ function createBuildJsonPath(t) {
   return path.join(tmpDir, 'eas_build.json');
 }
 
+for (const nativeBuildMode of ['local', 'cloud']) {
+  test(`ui-mobile-release defers TestFlight processing after ${nativeBuildMode} submission`, (t) => {
+    const buildJson = createBuildJsonPath(t);
+    const candidateRoot = path.join(path.dirname(buildJson), 'candidate');
+    // A separate candidate root exercises the current control entrypoint's actual root override
+    // without copying a checkout or replacing any internal build/submission logic.
+    fs.symlinkSync(repoRoot, candidateRoot, 'junction');
+    const out = execFileSync(process.execPath, [
+      path.join(repoRoot, 'scripts/pipeline/run.mjs'), 'ui-mobile-release',
+      '--environment', 'dev', '--action', 'native_submit', '--platform', 'ios', '--profile', 'dev',
+      '--native-build-mode', nativeBuildMode, '--build-json', buildJson,
+      '--testflight-distribution-mode', 'deferred', '--dry-run', '--secrets-source', 'env',
+    ], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        HAPPIER_PIPELINE_REPO_ROOT: candidateRoot,
+        EXPO_TOKEN: 'test-token',
+        APPLE_API_PRIVATE_KEY: '-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----\\n',
+        APP_STORE_CONNECT_PUBLICDEV_EXTERNAL_GROUPS: 'dev-group-id',
+      },
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000,
+    });
+    assert.match(out, /scripts\/pipeline\/expo\/native-build\.mjs/);
+    assert.ok(out.includes(path.join(candidateRoot, 'scripts/pipeline/expo/native-build.mjs')));
+    if (nativeBuildMode === 'local') assert.match(out, /scripts\/pipeline\/expo\/submit\.mjs/);
+    assert.match(out, /TestFlight external distribution deferred/i);
+    assert.doesNotMatch(out, /scripts\/pipeline\/expo\/testflight-distribute\.mjs/);
+  });
+}
+
 test('ui-mobile-release native_submit dry-run plans preview TestFlight distribution without cloud build metadata', (t) => {
   const buildJsonPath = createBuildJsonPath(t);
   const out = execFileSync(

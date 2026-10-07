@@ -13,11 +13,13 @@ export function createMcpActionChip(params: Readonly<{
     selectedCount: number;
     stabilityKey: string;
     popoverContent: AgentInputPopoverContent;
+    onIntent?: () => void;
     maxHeightCap?: number;
     maxWidthCap?: number;
 }>): AgentInputExtraActionChip {
     return {
         key: 'new-session-mcp',
+        onIntent: params.onIntent,
         stabilityKey: params.stabilityKey,
         controlId: 'mcp',
         collapsedContentPopover: {
@@ -35,6 +37,9 @@ export function createMcpActionChip(params: Readonly<{
                 ref={chipAnchorRef}
                 testID="new-session-mcp-chip"
                 onPress={() => toggleCollapsedPopover?.('new-session-mcp')}
+                onHoverIn={params.onIntent}
+                onPressIn={params.onIntent}
+                onFocus={params.onIntent}
                 hitSlop={{ top: 5, bottom: 10, left: 0, right: 0 }}
                 style={(pressed) => chipStyle(pressed.pressed)}
             >

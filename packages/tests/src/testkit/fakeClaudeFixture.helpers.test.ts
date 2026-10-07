@@ -12,6 +12,7 @@ import {
 } from '../../src/fixtures/fake-claude-code-cli.helpers.cjs';
 import {
   countFakeClaudeEventsAfterCurrentRunSentinel,
+  fakeClaudeEchoResponseText,
   fakeClaudeFixturePath,
 } from '../../src/testkit/fakeClaude';
 import { withTempDir } from '../../src/testkit/fs/tempDir';
@@ -235,6 +236,62 @@ describe('fake Claude fixture helpers', () => {
   it('returns the fake Claude JavaScript wrapper entrypoint path', () => {
     const fixturePath = fakeClaudeFixturePath();
     expect(fixturePath.endsWith('fake-claude-code-cli.js')).toBe(true);
+  });
+
+  it('can correlate SDK responses to prompts across separate provider processes', async () => {
+    async function runEchoProcess(prompt: string): Promise<string[]> {
+      const child = spawn(
+        process.execPath,
+        [fakeClaudeFixturePath(), '--output-format', 'stream-json', '--input-format', 'stream-json'],
+        {
+          env: {
+            ...process.env,
+            HAPPIER_E2E_FAKE_CLAUDE_SCENARIO: 'echo-user-text',
+          },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        },
+      );
+
+      const stdoutChunks: string[] = [];
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk: string) => stdoutChunks.push(chunk));
+      child.stdin.end(`${JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: prompt }] },
+      })}\n`);
+
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          child.kill('SIGTERM');
+          reject(new Error(`Timed out waiting for fake Claude echo response for ${JSON.stringify(prompt)}`));
+        }, 2_000);
+        child.on('error', (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+        child.on('exit', (code) => {
+          clearTimeout(timeout);
+          if (code !== 0) {
+            reject(new Error(`fake Claude echo process exited with code ${code}`));
+            return;
+          }
+          resolve();
+        });
+      });
+
+      return stdoutChunks
+        .join('')
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+        .flatMap((event) => Array.isArray(event?.message?.content) ? event.message.content : [])
+        .filter((part) => part?.type === 'text')
+        .map((part) => String(part.text));
+    }
+
+    await expect(runEchoProcess('first resumed prompt')).resolves.toContain(fakeClaudeEchoResponseText('first resumed prompt'));
+    await expect(runEchoProcess('second resumed prompt')).resolves.toContain(fakeClaudeEchoResponseText('second resumed prompt'));
   });
 
   it('answers the installed-runtime help probe and exits instead of entering interactive mode', async () => {

@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "agy",
+  "enableEnvVar": "HAPPIER_E2E_PROVIDER_AGY",
+  "protocol": "acp",
+  "traceProvider": "agy",
+  "auth": { "mode": "host" },
+  "cli": {
+    "subcommand": "agy",
+    "extraArgs": ["--started-by", "terminal"],
+    "env": { "HEADLESS": "1", "HAPPIER_VARIANT": "dev" }
+  }
+}

@@ -1,5 +1,7 @@
 import type { DropdownMenuItem } from '@/components/ui/forms/dropdown/DropdownMenu';
 import type { SessionActionTarget } from '@/components/sessions/actions/sessionActionTypes';
+import type { SessionReminderPresetV1 } from '@/sync/domains/session/organization/sessionReminderPreset';
+import type { SessionReminderPresentation } from '@/sync/domains/session/organization/attentionStanding';
 
 export type SessionRowMoreMenuBuildParams = Readonly<{
     target: SessionActionTarget;
@@ -7,6 +9,9 @@ export type SessionRowMoreMenuBuildParams = Readonly<{
     leadingItems?: readonly DropdownMenuItem[];
     folderMoveMenuItems?: readonly DropdownMenuItem[];
     canMoveToFolder?: boolean;
+    reminderPresets?: readonly SessionReminderPresetV1[];
+    reminder?: SessionReminderPresentation | null;
+    reminderNowMs?: number;
 }>;
 
 export type SessionRowActionMenuState = Readonly<{

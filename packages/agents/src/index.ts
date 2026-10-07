@@ -50,6 +50,7 @@ export {
 } from './tools.js';
 export {
   getAgentLocalControlCapability,
+  getAgentLocalControlCapabilityForSession,
   usesProviderAttachForLocalControl,
   type AgentLocalControlCapability,
 } from './localControl.js';
@@ -152,6 +153,8 @@ export {
   BUILT_IN_ACP_CONFIG,
   getBuiltInAcpConfig,
   hasBuiltInAcpConfig,
+  isBuiltInAcpSessionListingDeclared,
+  isAcpSessionListingDeclared,
   type BuiltInAcpConfig,
   type BuiltInAcpTransportProfile,
   type BuiltInAcpYesNoAuto,
@@ -186,9 +189,7 @@ export {
   type ClaudeUnifiedTerminalWorkspaceTrust,
   type ClaudeUnifiedTerminalWorkspaceTrustPolicy,
   normalizeCodexBackendMode,
-  normalizeKimiAcpPythonSelector,
   type CodexBackendMode,
-  type KimiAcpPythonSelector,
   getAllProviderSettingsDefinitions,
   getProviderSettingsDefinition,
   type ProviderSettingsDefinition,
@@ -335,6 +336,7 @@ export {
   normalizeAgentRuntimeKindOverride,
   resolveAgentConfiguredRuntimeKind,
   resolveAgentRuntimeControlSurfaceForSession,
+  resolveAgentRuntimeKindForSession,
   resolveCodexSessionBackendMode,
   resolveOpenCodeSessionBackendMode,
 } from './sessionControls/providerSessionBackends.js';
@@ -377,6 +379,7 @@ export {
   computeNextModelOverrideMetadataV1,
 } from './sessionControls/publish.js';
 export {
+  resolveProviderSessionIdForBackendTarget,
   resolveVendorResumeIdFromSessionMetadata,
   resolveAgentNativeTranscriptPathFromSessionMetadata,
   evaluateVendorResumeEligibility,
@@ -385,6 +388,8 @@ export {
 } from './sessionControls/vendorResumePolicy.js';
 export {
   evaluateExistingSessionAutomationEligibility,
+  resolveConfiguredAcpSessionResume,
+  type ConfiguredAcpSessionResumeResolution,
   type ExistingSessionAutomationEligibility,
   type ExistingSessionAutomationEligibilityReasonCode,
 } from './sessionControls/existingSessionAutomationPolicy.js';
@@ -422,8 +427,13 @@ export {
   getProviderCliBinaryNames,
   PROVIDER_CLI_RUNTIME_SPECS,
   getProviderCliRuntimeSpec,
+  resolveProviderCliLatestVersionSource,
+  resolveProviderCliNpmPackageName,
   type ProviderCliInstallCommand,
   type ProviderCliInstallPlatform,
+  type ProviderCliInstallSource,
+  type ProviderCliLatestVersionSource,
+  type ProviderCliNativeUpdateSpec,
   type ProviderCliManagedArchiveEntry,
   type ProviderCliManagedAssetNameByPlatform,
   type ProviderCliAlternativeBinaryIdentityProbe,

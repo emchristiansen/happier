@@ -1,11 +1,9 @@
 // @vitest-environment jsdom
-import { resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
-
 import React, { act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { describe, expect, it } from 'vitest';
 
+import { getVitestNodeBuiltin } from '@/dev/vitestNodeBuiltins';
 import { sanitizeEnrichedMarkdownLinkTargets } from './enrichedMarkdownLinkHandling';
 import { preprocessStreamingMarkdown } from '../streaming/preprocessStreamingMarkdown';
 
@@ -18,6 +16,12 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 const REVEAL_SELECTOR = '[data-happier-enriched-markdown-reveal="text"]';
 const LINK_LABEL = 'zlink-006';
+const { resolve } = getVitestNodeBuiltin<{
+    resolve: (...paths: string[]) => string;
+}>('node:path');
+const { pathToFileURL } = getVitestNodeBuiltin<{
+    pathToFileURL: (path: string) => URL;
+}>('node:url');
 
 type WebEnrichedMarkdownTextModule = Readonly<{
     EnrichedMarkdownText: React.ComponentType<{

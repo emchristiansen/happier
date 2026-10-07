@@ -70,6 +70,9 @@ const styles = StyleSheet.create((theme) => ({
     phoneContainer: {
         flex: 1,
     },
+    phoneHeaderContent: {
+        paddingHorizontal: 16,
+    },
     sidebarContentContainer: {
         flex: 1,
         flexBasis: 0,
@@ -127,7 +130,8 @@ const styles = StyleSheet.create((theme) => ({
     },
     titleContainer: {
         flex: 1,
-        alignItems: 'center',
+        alignItems: 'flex-start',
+        marginLeft: -4,
     },
     titleText: {
         fontSize: 16,
@@ -471,6 +475,7 @@ const PhoneTabbedMainViewContent = React.memo(function PhoneTabbedMainViewConten
                     title={<HeaderTitle activeTab={headerTab} />}
                     headerRight={() => <HeaderRight activeTab={headerTab} />}
                     headerLeft={() => <HeaderLogo />}
+                    headerContentStyle={styles.phoneHeaderContent}
                     headerShadowVisible={false}
                     headerTransparent={true}
                 />

@@ -145,7 +145,7 @@ AUTH_ANONYMOUS_SIGNUP_ENABLED=0
    - Make it mandatory for ongoing access: `AUTH_REQUIRED_LOGIN_PROVIDERS=<providerId>`
    - Disable anonymous signup if desired: `AUTH_ANONYMOUS_SIGNUP_ENABLED=false`
 5. Make sure the client app can return from OAuth:
-   - Web (required unless you use `https://app.happier.dev`): set `HAPPIER_WEBAPP_URL` (or `HAPPIER_WEBAPP_OAUTH_RETURN_URL_BASE`)
+   - Web (required unless you use `https://cloud.happier.dev`): set `HAPPIER_WEBAPP_URL` (or `HAPPIER_WEBAPP_OAUTH_RETURN_URL_BASE`)
    - Mobile deep link: set `HAPPIER_WEBAPP_OAUTH_RETURN_URL_BASE` and allow the scheme via `HAPPIER_OAUTH_RETURN_ALLOWED_SCHEMES` (e.g. `myapp`)
 6. Validate:
    - Restart the server (so it picks up env / config changes).
@@ -153,11 +153,11 @@ AUTH_ANONYMOUS_SIGNUP_ENABLED=0
    - If it doesn’t, double-check the redirect URL, issuer URL, and that `AUTH_SIGNUP_PROVIDERS` / `AUTH_REQUIRED_LOGIN_PROVIDERS` reference the same provider id. (For troubleshooting, you can also inspect `GET /v1/features`.)
 
 Note on “optional” web app URL env vars:
-- `HAPPIER_WEBAPP_URL` / `HAPPIER_WEBAPP_OAUTH_RETURN_URL_BASE` are only “optional” if you are using the hosted client at `https://app.happier.dev`.
+- `HAPPIER_WEBAPP_URL` / `HAPPIER_WEBAPP_OAUTH_RETURN_URL_BASE` are only “optional” if you are using the hosted client at `https://cloud.happier.dev`.
   - If you are self-hosting the web app, or using a local dev web UI, you must set one of these so the server can redirect back to your client after OAuth.
 
 Troubleshooting:
-- If you get redirected to `https://app.happier.dev` even after setting `HAPPIER_WEBAPP_URL`, the server likely rejected your configured return URL as unsafe. For local web dev, use `http://localhost:PORT` or `http://*.localhost:PORT` (or use `https://`).
+- If you get redirected to `https://cloud.happier.dev` even after setting `HAPPIER_WEBAPP_URL`, the server likely rejected your configured return URL as unsafe. For local web dev, use `http://localhost:PORT` or `http://*.localhost:PORT` (or use `https://`).
 
 ## “Custom providers” beyond OIDC
 

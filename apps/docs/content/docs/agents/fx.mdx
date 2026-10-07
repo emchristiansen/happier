@@ -1,0 +1,52 @@
+---
+title: FX CLI (experimental)
+description: Run FX through Happier with ACP sessions, dynamic models and modes, MCP tools, resume, and execution runs.
+---
+
+Happier runs your locally installed FX CLI through `fx acp`. The interactive
+`fx` command is a separate terminal surface. Happier does not claim that an
+interactive FX session and an ACP session share identity.
+
+## What you need first
+
+Install FX with the [official installation guide](https://fx.sh/docs/getting-started/installation),
+then authenticate on the machine where Happier runs:
+
+```bash
+fx login
+fx status
+```
+
+FX can also use `AI_GATEWAY_API_KEY` or another credential source supported by
+its current authentication settings.
+
+## Start and resume sessions
+
+```bash
+happier fx
+```
+
+Happier supports fresh and resumed FX sessions, cancellation, execution runs,
+and FX's advertised model and mode controls. Happier does not maintain a
+separate static FX model list; the choices shown in the app come from ACP.
+
+When creating a new session, the **Resume** field can browse session IDs that
+`fx acp` reports through ACP `session/list` for the selected directory and pick
+one to resume. These entries are resume-only. Listing them does not establish
+that they are interactive-terminal sessions, and Happier does not provide live
+takeover, writer safety, transcript following or import, or terminal attachment
+for them.
+
+FX combines MCP servers selected for the Happier session with approved project
+servers. See [MCP servers](/extending/mcp-servers) for the shared setup flow.
+
+## When it goes wrong
+
+- Run `fx doctor` when startup, credentials, or saved sessions fail.
+- Run `fx models --json` to inspect models available to the active credential.
+- If `fx` is not found after installation, start a new shell or add `~/.local/bin` to `PATH`.
+
+## Related
+
+- [Agent capabilities](/agents/capabilities)
+- [Model and engine selection](/agents/model-and-engine-selection)

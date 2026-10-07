@@ -236,7 +236,7 @@ export function useTranscriptRootDerivedItems(params: Readonly<{
                     actionDrafts,
                 });
                 if (!forkedTranscriptEnabled || !fork) return base;
-                return insertForkDividersIntoTranscriptItems({ items: base, fork }) as ChatTranscriptListItem[];
+                return insertForkDividersIntoTranscriptItems({ items: base, fork, sourceWindowComplete: true }) as ChatTranscriptListItem[];
             }
 
             const trailing = buildChatListItems({
@@ -253,7 +253,11 @@ export function useTranscriptRootDerivedItems(params: Readonly<{
             const turnItems: ForkDividerTranscriptItem[] = turns.map((t) => ({ kind: 'turn', id: t.id, turn: t }));
             const base: ForkDividerTranscriptItem[] = [...turnItems, ...trailing];
             if (!forkedTranscriptEnabled || !fork) return base;
-            return insertForkDividersIntoTranscriptItems({ items: base, fork }) as ChatTranscriptListItem[];
+            return insertForkDividersIntoTranscriptItems({
+                items: base,
+                fork,
+                sourceWindowComplete: turnsCache !== null && isTranscriptTurnsBuildCacheComplete(turnsCache),
+            }) as ChatTranscriptListItem[];
         });
     }, [
         actionDrafts,

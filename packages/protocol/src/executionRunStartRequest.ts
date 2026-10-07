@@ -5,6 +5,7 @@ import { ConnectedServiceBindingsV1Schema } from './connect/connectedServiceBind
 import { HappierReplayStrategySchema } from './sessionContinueWithReplay.js';
 import { LlmTaskRunnerConfigV1Schema } from './llmTasks/llmTaskRunnerConfigV1.js';
 import { AcpConfigOptionOverridesV1Schema } from './sessionMetadata/metadataOverridesV1.js';
+import { ExecutionRunRequestedConfigurationSchema } from './executionRunRequestedConfiguration.js';
 import {
   HappierReplayRecentMessagesCountSchema,
   HappierReplayWireMaxSeedCharsSchema,
@@ -158,9 +159,10 @@ export const ExecutionRunStartRequestSchema = z.object({
   replay: ExecutionRunReplaySeedRequestSchema.optional(),
   /**
    * Optional per-target connected-services selection for the run (profile|group per serviceId).
-   * Absent means the run defaults exactly like session spawn defaulting (account defaults).
+   * Absent means the run defaults exactly like session spawn defaulting (account defaults). Null is
+   * the explicit all-services native opt-out produced by the agent-friendly `"native"` shorthand.
    */
-  connectedServices: ConnectedServiceBindingsV1Schema.optional(),
+  connectedServices: ConnectedServiceBindingsV1Schema.nullable().optional(),
   /**
    * Bare per-service default tokens (RO-F5): serviceIds asking for their STORED account default. Set by
    * the action boundary alongside `connectedServices` so the run-start owner resolves each named
@@ -177,5 +179,6 @@ export const ExecutionRunStartResponseSchema = z.object({
   runId: z.string().min(1),
   callId: z.string().min(1),
   sidechainId: z.string().min(1),
+  requestedConfiguration: ExecutionRunRequestedConfigurationSchema.optional(),
 }).passthrough();
 export type ExecutionRunStartResponse = z.infer<typeof ExecutionRunStartResponseSchema>;

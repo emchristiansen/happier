@@ -190,9 +190,9 @@ Before proposing an agent-authored public comment on a Happier GitHub issue, res
 gh api user --jq .login
 ```
 
-Use the returned login in a standalone final line of every comment: `cc: @<local-gh-login>`. Resolve this identity with ordinary `gh`, never `yarn ghops`: `ghops` is deliberately authenticated as the bot that transports issue reads and writes, not the local maintainer who should receive notifications. Do not substitute the bot login, repository owner, operating-system username, Git author, a hardcoded handle, or a previously observed account. If ordinary `gh` is unavailable, unauthenticated, or returns no login, stop before posting and ask the user to authenticate with `gh auth login` or explicitly supply the mention target.
+Use the returned login in a standalone final line of every comment: `_Posted on behalf of @<local-gh-login>._` Resolve this identity with ordinary `gh`, never `yarn ghops`: `ghops` is deliberately authenticated as the account that transports issue reads and writes, not the local maintainer who authorized and stands behind the comment. Do not substitute the transport login, repository owner, operating-system username, Git author, a hardcoded handle, or a previously observed account. If ordinary `gh` is unavailable, unauthenticated, or returns no login, stop before posting and ask the user to authenticate with `gh auth login` or explicitly supply the attribution target.
 
-This direct mention keeps the local maintainer participating in the issue conversation. Apply it to initial responses, evidence requests, progress updates, release updates, and closure recommendations. Under exact authorization, include the resolved line in the complete preview and never add it afterward. Under standing authorization, resolve it immediately before each comment and keep it inside the delegated comment payload. Do not omit it based on inferred subscription status, an earlier mention, or prior participation. This rule applies to issue comments, not issue bodies or release automation's label-only mutations. Use a different handle or omit the line only when the applicable exact or standing authorization permits that variation.
+This attribution makes the human authorization behind the transported comment explicit, while its direct mention keeps the local maintainer participating in the issue conversation. Apply it to initial responses, evidence requests, progress updates, release updates, and closure recommendations. Under exact authorization, include the resolved line in the complete preview and never add it afterward. Under standing authorization, resolve it immediately before each comment and keep it inside the delegated comment payload. Do not omit it based on inferred subscription status, an earlier mention, or prior participation. This rule applies to issue comments, not issue bodies or release automation's label-only mutations. Use a different handle or omit the line only when the applicable exact or standing authorization permits that variation.
 
 ### Voice and identity
 
@@ -318,7 +318,7 @@ Comment on an issue:
 
 ```bash
 local_gh_login="$(gh api user --jq .login)"
-comment_body="$(printf 'Update: ...\n\ncc: @%s' "$local_gh_login")"
+comment_body="$(printf 'Update: ...\n\n_Posted on behalf of @%s._' "$local_gh_login")"
 yarn ghops api repos/happier-dev/happier/issues/123/comments -f "body=$comment_body"
 ```
 

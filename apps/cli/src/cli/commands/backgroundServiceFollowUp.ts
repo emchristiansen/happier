@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { resolveServingThisComputerService } from '@happier-dev/cli-common/service';
 import type { DaemonServiceListEntry } from '@/daemon/service/cli';
 import { resolveDaemonServiceCliRuntimeFromEnv } from '@/daemon/service/cli';
 import { resolveInstalledDaemonServiceInventoryForCurrentRelay } from '@/daemon/ownership/daemonServiceInventory';
@@ -355,6 +356,61 @@ export async function runDefaultFollowingBackgroundServiceServerChangeFollowUp(p
 }
 
 /**
+ * What the relay selection means for this computer's background services. The default-following
+ * service follows the selection — unless the selected relay already has its own pinned service
+ * (one daemon per relay): both would own that relay's lifecycle directory, so the default service
+ * does not start a second daemon for it and stays idle while that relay is selected, and the
+ * relay's own service keeps serving it.
+ */
+export type ServerSelectionBackgroundServiceOutcome = Readonly<{
+    defaultFollowingService: 'not-installed' | 'follows-selected-relay' | 'idle-selected-relay-has-own-service';
+    selectedRelayServices: readonly Readonly<{ label: string; path: string; managedBy: 'desktop' | null }>[];
+}>;
+
+export function resolveServerSelectionBackgroundServiceOutcome(
+    services: readonly DaemonServiceListEntry[],
+): ServerSelectionBackgroundServiceOutcome {
+    const selectedRelayServices = services
+        .filter((service) => service.installed && service.targetMode === 'pinned')
+        .map((service) => ({ label: service.label, path: service.path, managedBy: service.managedBy ?? null }));
+    const defaultInstalled = services.some((service) => service.installed && isDefaultFollowingService(service));
+    // The inventory owner already scopes these installed definitions to the selected relay.
+    const selected = resolveServingThisComputerService({
+        defaultFollowing: { eligible: defaultInstalled, value: null },
+        pinned: selectedRelayServices.map((service) => ({ eligible: true, value: service })),
+    });
+    const defaultFollowingService = !defaultInstalled
+        ? 'not-installed'
+        : selected?.serving === 'pinned'
+            ? 'idle-selected-relay-has-own-service'
+            : 'follows-selected-relay';
+    return { defaultFollowingService, selectedRelayServices };
+}
+
+/**
+ * The outcome for the relay this process now selects, for `--json` callers of a selection command.
+ * `null` when this computer's services could not be read (the selection itself already succeeded).
+ */
+export async function resolveServerSelectionBackgroundServiceOutcomeForCurrentRelay(): Promise<ServerSelectionBackgroundServiceOutcome | null> {
+    try {
+        const runtime = resolveDaemonServiceCliRuntimeFromEnv({ processEnv: process.env });
+        return resolveServerSelectionBackgroundServiceOutcome(await resolveInstalledDaemonServiceInventoryForCurrentRelay(runtime));
+    } catch {
+        return null;
+    }
+}
+
+function renderSelectedRelayHasOwnServiceGuidance(params: Readonly<{
+    targetServerUrl: string;
+    outcome: ServerSelectionBackgroundServiceOutcome;
+}>): readonly string[] {
+    return [
+        `${params.targetServerUrl} already has its own background service on this computer (${params.outcome.selectedRelayServices.map((service) => service.label).join(', ')}), which keeps serving it.`,
+        'The default background service will not start a second daemon for that relay: it keeps running on the previous relay until it next restarts, and then stays idle while this relay is selected.',
+    ];
+}
+
+/**
  * Canonical reconciliation for "the active relay just changed".
  *
  * A default-following background service resolves the active relay once, at
@@ -372,7 +428,15 @@ export async function runServerSelectionBackgroundServiceFollowUp(params: Readon
 
     const runtime = resolveDaemonServiceCliRuntimeFromEnv({ processEnv: process.env });
     const services = await resolveInstalledDaemonServiceInventoryForCurrentRelay(runtime);
-    if (resolveInstalledDefaultFollowingDaemonServiceModes(services).length === 0) {
+    const outcome = resolveServerSelectionBackgroundServiceOutcome(services);
+    if (outcome.defaultFollowingService === 'not-installed') {
+        return;
+    }
+    if (outcome.defaultFollowingService === 'idle-selected-relay-has-own-service') {
+        // Restarting the default service now would only take it off the previous relay.
+        for (const line of renderSelectedRelayHasOwnServiceGuidance({ targetServerUrl: params.targetServerUrl, outcome })) {
+            console.log(line);
+        }
         return;
     }
 

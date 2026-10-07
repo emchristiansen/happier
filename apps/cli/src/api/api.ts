@@ -17,6 +17,7 @@ import { ApiMachineClient } from './apiMachine';
 import { decodeBase64, encodeBase64, encrypt, decrypt } from './encryption';
 import { PushNotificationClient } from './pushNotifications';
 import { configuration } from '@/configuration';
+import { assertSessionEncryptionModeAllowedByEffectiveClientRequirement } from '@/settings/accountSettings/resolveEffectiveClientEncryptionRequirement';
 import { Credentials } from '@/persistence';
 
 import { resolveMachineEncryptionContext, resolveSessionEncryptionContext } from './client/encryptionKey';
@@ -46,9 +47,12 @@ import {
   shouldTreatGetOrCreateSessionErrorAsOffline,
 } from './client/offlineErrors';
 import {
+  normalizeSessionMetadataForRead,
+  projectSessionMetadataForWire,
   buildProviderAccountUsageRecordId,
   CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER,
   CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE,
+  appendConnectedServiceAuthGroupReaderCapabilities,
   ConnectedServiceAuthGroupErrorResponseV1Schema,
   ConnectedServiceAuthGroupResponseV1Schema,
   ConnectedServiceCredentialHealthV1Schema,
@@ -70,6 +74,7 @@ import {
 import type {
   ConnectedServiceCredentialRecordV1,
   ConnectedServiceAuthGroupV1,
+  ConnectedServiceAuthGroupMemberStateV1,
   ConnectedServiceAuthGroupRuntimeStatePatchRequestV1,
   ConnectedServiceCredentialHealthV1,
   ConnectedServiceCredentialHealthStatusV1,
@@ -410,8 +415,8 @@ export class ApiClient {
     const { desiredSessionEncryptionMode, serverSupportsFeatureSnapshot } = await resolveSessionCreateEncryptionMode({
       token: this.credential.token,
       serverBaseUrl,
-      featuresTimeoutMs: 800,
-      accountTimeoutMs: 10_000,
+      featuresTimeoutMs: configuration.sessionControlHttpTimeoutMs,
+      accountTimeoutMs: configuration.sessionControlHttpTimeoutMs,
     });
 
     const resolvePositiveIntEnv = (raw: string | undefined, fallback: number, bounds: { min: number; max: number }): number => {
@@ -445,8 +450,8 @@ export class ApiClient {
       try {
         const metadataPayload =
           desiredSessionEncryptionMode === 'plain'
-            ? JSON.stringify(opts.metadata)
-            : encodeBase64(encrypt(encryptionKey, encryptionVariant, opts.metadata));
+            ? JSON.stringify(projectSessionMetadataForWire(opts.metadata))
+            : encodeBase64(encrypt(encryptionKey, encryptionVariant, projectSessionMetadataForWire(opts.metadata)));
         const agentStatePayload =
           desiredSessionEncryptionMode === 'plain'
             ? (opts.state ? JSON.stringify(opts.state) : null)
@@ -480,6 +485,7 @@ export class ApiClient {
 
       const sessionEncryptionMode: 'e2ee' | 'plain' =
         (raw as any)?.encryptionMode === 'plain' ? 'plain' : 'e2ee';
+      assertSessionEncryptionModeAllowedByEffectiveClientRequirement(sessionEncryptionMode);
 
       // Prefer the session's published data key, but keep backward compatibility with
       // older sessions that have no dataEncryptionKey (machineKey-as-session-key fallback).
@@ -499,10 +505,10 @@ export class ApiClient {
         sessionEncryptionKey = opened ?? this.credential.encryption.machineKey;
       }
 
-	      const metadata =
+	      const metadata = normalizeSessionMetadataForRead<Metadata>(
 	        sessionEncryptionMode === 'plain'
 	          ? JSON.parse(String(raw.metadata ?? 'null'))
-	          : decrypt(sessionEncryptionKey, encryptionVariant, decodeBase64(raw.metadata));
+	          : decrypt(sessionEncryptionKey, encryptionVariant, decodeBase64(raw.metadata)));
 	      const agentState =
 	        !raw.agentState
 	          ? null
@@ -749,7 +755,9 @@ export class ApiClient {
     session: Session,
     runtimeActivity?: import('./session/sessionClient').SessionRuntimeActivityClientConfig,
   ): ApiSessionClient {
-    return new ApiSessionClient(this.credential.token, session, runtimeActivity);
+    return new ApiSessionClient(this.credential.token, session, runtimeActivity, {
+      permissionRequestPushSender: this.pushClient,
+    });
   }
 
   machineSyncClient(
@@ -1004,7 +1012,7 @@ export class ApiClient {
 
     try {
       const response = await axios.post(
-        `${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/active-profile`,
+        appendConnectedServiceAuthGroupReaderCapabilities(`${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/active-profile`),
         {
           profileId: params.activeProfileId,
           expectedGeneration,
@@ -1068,7 +1076,7 @@ export class ApiClient {
 
     try {
       const response = await axios.patch(
-        `${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/runtime-state`,
+        appendConnectedServiceAuthGroupReaderCapabilities(`${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/runtime-state`),
         {
           ...(expectedGeneration === undefined ? {} : { expectedGeneration }),
           ...(expectedRuntimeStateRevision === undefined ? {} : { expectedRuntimeStateRevision }),
@@ -1133,7 +1141,7 @@ export class ApiClient {
 
     try {
       const response = await axios.post(
-        `${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/members`,
+        appendConnectedServiceAuthGroupReaderCapabilities(`${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/members`),
         {
           profileId: params.profileId,
           ...(params.priority === undefined ? {} : { priority: params.priority }),
@@ -1179,7 +1187,9 @@ export class ApiClient {
     profileId: string;
     priority?: number;
     enabled?: boolean;
+    state?: ConnectedServiceAuthGroupMemberStateV1;
     expectedGeneration: number;
+    expectedRuntimeStateRevision?: number;
   }): Promise<ConnectedServiceAuthGroupV1> {
     const expectedGeneration = assertConnectedServiceExpectedGeneration(
       params.expectedGeneration,
@@ -1192,11 +1202,15 @@ export class ApiClient {
 
     try {
       const response = await axios.patch(
-        `${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/members/${profileId}`,
+        appendConnectedServiceAuthGroupReaderCapabilities(`${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/members/${profileId}`),
         {
           ...(params.priority === undefined ? {} : { priority: params.priority }),
           ...(params.enabled === undefined ? {} : { enabled: params.enabled }),
+          ...(params.state === undefined ? {} : { state: params.state }),
           expectedGeneration,
+          ...(params.expectedRuntimeStateRevision === undefined
+            ? {}
+            : { expectedRuntimeStateRevision: params.expectedRuntimeStateRevision }),
         },
         {
           headers: {
@@ -1220,6 +1234,13 @@ export class ApiClient {
         const parsed = ConnectedServiceAuthGroupErrorResponseV1Schema.safeParse(error.response.data);
         if (parsed.success && parsed.data.error === 'connect_group_generation_conflict' && parsed.data.generation !== undefined) {
           throw new ConnectedServiceAuthGroupGenerationConflictError(parsed.data.generation);
+        }
+        if (
+          parsed.success
+          && parsed.data.error === 'connect_group_runtime_state_revision_conflict'
+          && parsed.data.runtimeStateRevision !== undefined
+        ) {
+          throw new ConnectedServiceAuthGroupRuntimeStateRevisionConflictError(parsed.data.runtimeStateRevision);
         }
       }
       logServerEndpointFailure({
@@ -1248,7 +1269,7 @@ export class ApiClient {
 
     try {
       const response = await axios.delete(
-        `${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/members/${profileId}`,
+        appendConnectedServiceAuthGroupReaderCapabilities(`${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/members/${profileId}`),
         {
           headers: {
             'Authorization': `Bearer ${this.credential.token}`,

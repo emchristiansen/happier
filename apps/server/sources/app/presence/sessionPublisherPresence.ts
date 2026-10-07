@@ -40,6 +40,7 @@ export type RegisterPublisherResult =
 export type TouchPublisherResult =
     | { status: "touched"; committedFence: Date; activeAt: Date; participantCursors: readonly SessionParticipantCursor[] }
     | { status: "unregistered" }
+    | { status: "stale_observation" }
     | { status: "superseded" }
     | { status: "rejected"; reason: "not_found" | "unauthorized" | "archived" };
 export type ClosePublisherResult =
@@ -125,7 +126,7 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
         return await lock.inLock(operation, options);
     };
 
-    const registerOnce = async (binding: PublisherBinding, completeSnapshot: SessionRuntimeActivitySnapshot): Promise<RegisterPublisherResult> => {
+    const registerOnce = async (binding: PublisherBinding, completeSnapshot: SessionRuntimeActivitySnapshot, observedAt?: Date): Promise<RegisterPublisherResult> => {
         return await inTx(async (tx): Promise<RegisterPublisherResult> => {
             const session = await tx.session.findUnique({
                 where: { id: binding.sessionId },
@@ -149,7 +150,7 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
             });
             if (activity.status === "rejected") return activity;
 
-            const committedFence = new Date(Math.max(now().getTime(), session.lastActiveAt.getTime() + 1));
+            const committedFence = new Date(Math.max((observedAt ?? now()).getTime(), session.lastActiveAt.getTime() + 1));
             const publisherGeneration = session.publisherGeneration + 1n;
             const updated = await tx.session.updateMany({
                 where: {
@@ -171,10 +172,10 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
         });
     };
 
-    const registerWithRetry = async (binding: PublisherBinding, completeSnapshot: SessionRuntimeActivitySnapshot): Promise<RegisterPublisherResult> => {
+    const registerWithRetry = async (binding: PublisherBinding, completeSnapshot: SessionRuntimeActivitySnapshot, observedAt?: Date): Promise<RegisterPublisherResult> => {
         for (let attempt = 0; attempt < 2; attempt += 1) {
             try {
-                return await registerOnce(binding, completeSnapshot);
+                return await registerOnce(binding, completeSnapshot, observedAt);
             } catch (error) {
                 if (!(error instanceof RegistrationContentionError)) throw error;
             }
@@ -186,8 +187,9 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
         socket: object;
         binding: PublisherBinding;
         completeSnapshot: SessionRuntimeActivitySnapshot;
+        observedAt?: Date;
     }>): Promise<RegisterPublisherResult> => {
-        const result = await registerWithRetry(params.binding, params.completeSnapshot);
+        const result = await registerWithRetry(params.binding, params.completeSnapshot, params.observedAt);
         if (result.status === "registered") {
             registrations.set(params.socket, {
                 binding: { ...params.binding },
@@ -198,16 +200,24 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
         return result;
     };
 
-    const registerPublisher = async (params: Readonly<{ socket: object; binding: PublisherBinding; completeActivitySnapshot: SessionRuntimeActivitySnapshot | unknown }>): Promise<RegisterPublisherResult> => {
+    const registerPublisher = async (params: Readonly<{ socket: object; binding: PublisherBinding; completeActivitySnapshot: SessionRuntimeActivitySnapshot | unknown; observedAt?: Date }>): Promise<RegisterPublisherResult> => {
         const completeSnapshot = parseSessionRuntimeActivitySnapshot(params.completeActivitySnapshot);
         const intentKey = publisherIntentKey(params.binding, completeSnapshot);
         const existing = registrationAttempts.get(params.socket);
         if (existing?.intentKey === intentKey) return await existing.promise;
-        const attempt = serialize(params.socket, async () => await registerAndRememberPublisher({
-            socket: params.socket,
-            binding: params.binding,
-            completeSnapshot,
-        }));
+        const attempt = serialize(params.socket, async (): Promise<RegisterPublisherResult> => {
+            const registration = registrations.get(params.socket);
+            // A snapshot may have registered this socket after the heartbeat's unregistered touch.
+            if (params.observedAt && registration && params.observedAt.getTime() <= registration.committedFence.getTime()) {
+                return { status: "rejected", reason: "contention" };
+            }
+            return await registerAndRememberPublisher({
+                socket: params.socket,
+                binding: params.binding,
+                completeSnapshot,
+                observedAt: params.observedAt,
+            });
+        });
         const registrationAttempt = { intentKey, promise: attempt } satisfies RegistrationAttempt;
         registrationAttempts.set(params.socket, registrationAttempt);
         try {
@@ -449,15 +459,18 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
         return count > 0;
     };
 
-    const touchPublisher = async (params: Readonly<{ socket: object }>): Promise<TouchPublisherResult> => {
+    const touchPublisher = async (params: Readonly<{ socket: object; observedAt?: Date }>): Promise<TouchPublisherResult> => {
         return await serialize(params.socket, async (): Promise<TouchPublisherResult> => {
             if (closeResults.has(params.socket)) return { status: "superseded" };
             const registration = registrations.get(params.socket);
             if (!registration) return { status: "unregistered" };
+            if (params.observedAt && params.observedAt.getTime() <= registration.committedFence.getTime()) {
+                return { status: "stale_observation" };
+            }
 
             const participantUserIds = await authorizeSessionScopedMachineBinding(registration.binding);
             if (participantUserIds === null) return { status: "rejected", reason: "unauthorized" };
-            const fastFence = new Date(Math.max(now().getTime(), registration.committedFence.getTime() + 1));
+            const fastFence = new Date(Math.max((params.observedAt ?? now()).getTime(), registration.committedFence.getTime() + 1));
             if (await extendLivePublisherFence(registration, fastFence)) {
                 const cursors = await readAccountChangeCursors({ accountIds: participantUserIds });
                 registrations.set(params.socket, {
@@ -500,7 +513,7 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
                     return { status: "superseded" };
                 }
 
-                const committedFence = new Date(Math.max(now().getTime(), session.lastActiveAt.getTime() + 1));
+                const committedFence = new Date(Math.max((params.observedAt ?? now()).getTime(), session.lastActiveAt.getTime() + 1));
                 const updated = await tx.session.updateMany({
                     where: {
                         id: registration.binding.sessionId,

@@ -4,11 +4,37 @@ import { dirname, join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ensureLocalFirstPartyComponentCommand } from './localFirstPartyCommand.js';
+import { installVersionedPayload, writeHappierCliChoice } from '@happier-dev/cli-common/firstPartyRuntime';
+
+import { ensureLocalFirstPartyComponentCommand, resolveExplicitOrInstalledLocalFirstPartyCommand } from './localFirstPartyCommand.js';
 
 describe('ensureLocalFirstPartyComponentCommand', () => {
     afterEach(() => {
         vi.clearAllMocks();
+    });
+
+    it('keeps non-CLI acquisition failures provider-neutral', async () => {
+        const rootDir = mkdtempSync(join(tmpdir(), 'hsetup-server-acquisition-failure-'));
+        const preparePayload = vi.fn(async () => {
+            throw new Error('release unavailable');
+        });
+
+        try {
+            await expect(ensureLocalFirstPartyComponentCommand({
+                componentId: 'happier-server',
+                releaseRing: 'stable',
+                processEnv: {
+                    HAPPIER_HOME_DIR: join(rootDir, 'home'),
+                    HAPPIER_STACK_REPO_DIR: join(rootDir, 'elsewhere'),
+                    PATH: '',
+                },
+            }, {
+                preparePayload,
+                installPayload: vi.fn(),
+            })).rejects.toMatchObject({ code: 'first_party_component_install_failed' });
+        } finally {
+            rmSync(rootDir, { recursive: true, force: true });
+        }
     });
 
     it('prefers the repo-local hstack command before attempting a payload download', async () => {
@@ -29,6 +55,7 @@ describe('ensureLocalFirstPartyComponentCommand', () => {
 
             await expect(ensureLocalFirstPartyComponentCommand({
                 componentId: 'hstack',
+                releaseRing: 'stable',
                 processEnv: {
                     HAPPIER_HOME_DIR: join(rootDir, 'home'),
                     HAPPIER_STACK_REPO_DIR: repoRoot,
@@ -37,7 +64,7 @@ describe('ensureLocalFirstPartyComponentCommand', () => {
             }, {
                 preparePayload,
                 installPayload,
-            })).resolves.toBe(hstackPath);
+            })).resolves.toEqual({ command: hstackPath, provenance: 'override' });
 
             expect(preparePayload).not.toHaveBeenCalled();
             expect(installPayload).not.toHaveBeenCalled();
@@ -64,6 +91,7 @@ describe('ensureLocalFirstPartyComponentCommand', () => {
 
             await expect(ensureLocalFirstPartyComponentCommand({
                 componentId: 'happier-cli',
+                releaseRing: 'stable',
                 processEnv: {
                     HAPPIER_HOME_DIR: join(rootDir, 'home'),
                     HAPPIER_STACK_REPO_DIR: repoRoot,
@@ -72,10 +100,145 @@ describe('ensureLocalFirstPartyComponentCommand', () => {
             }, {
                 preparePayload,
                 installPayload,
-            })).resolves.toBe(happierPath);
+            })).resolves.toEqual({ command: happierPath, provenance: 'override' });
 
             expect(preparePayload).not.toHaveBeenCalled();
             expect(installPayload).not.toHaveBeenCalled();
+        } finally {
+            rmSync(rootDir, { recursive: true, force: true });
+        }
+    });
+
+    it('refuses managed provenance for a binary planted under the install root with no install record', () => {
+        // A local process can create `~/.happier/cli/current/<binary>` before anything was ever
+        // acquired. Nothing verified it, so it must never be classified `managed` — automatic
+        // pairing approval hands a managed CLI the account content key (R13/INV2/D4).
+        const rootDir = mkdtempSync(join(tmpdir(), 'hsetup-planted-binary-'));
+        const happyHomeDir = join(rootDir, 'home');
+        const plantedPath = join(happyHomeDir, 'cli', 'current', 'happier');
+
+        try {
+            mkdirSync(dirname(plantedPath), { recursive: true });
+            writeFileSync(plantedPath, '#!/usr/bin/env node\n', 'utf8');
+            chmodSync(plantedPath, 0o755);
+
+            expect(resolveExplicitOrInstalledLocalFirstPartyCommand({
+                componentId: 'happier-cli',
+                releaseRing: 'stable',
+                processEnv: { HAPPIER_HOME_DIR: happyHomeDir, HAPPIER_STACK_REPO_DIR: join(rootDir, 'elsewhere') },
+            })).toEqual({ command: plantedPath, provenance: 'override' });
+        } finally {
+            rmSync(rootDir, { recursive: true, force: true });
+        }
+    });
+
+    it('reports a real managed install as managed and env/repo overrides as override', async () => {
+        const rootDir = mkdtempSync(join(tmpdir(), 'hsetup-provenance-'));
+        const happyHomeDir = join(rootDir, 'home');
+        const managedPath = join(happyHomeDir, 'cli', 'current', 'happier');
+        const repoRoot = join(rootDir, 'repo');
+        const repoPath = join(repoRoot, 'apps', 'cli', 'bin', 'happier.mjs');
+        const envPath = join(rootDir, 'env-happier');
+        const stagedPayloadRoot = join(rootDir, 'staged');
+
+        try {
+            for (const path of [repoPath, envPath]) {
+                mkdirSync(dirname(path), { recursive: true });
+                writeFileSync(path, '#!/usr/bin/env node\n', 'utf8');
+                chmodSync(path, 0o755);
+            }
+
+            // The real install path: it writes the payload under `versions/<versionId>` and
+            // records `current.version` beside it. That record is what `managed` means.
+            mkdirSync(stagedPayloadRoot, { recursive: true });
+            writeFileSync(join(stagedPayloadRoot, 'happier'), '#!/usr/bin/env node\n', 'utf8');
+            chmodSync(join(stagedPayloadRoot, 'happier'), 0o755);
+            await installVersionedPayload({
+                componentId: 'happier-cli',
+                versionId: '0.2.13',
+                payloadRoot: stagedPayloadRoot,
+                releaseRing: 'stable',
+                processEnv: { HAPPIER_HOME_DIR: happyHomeDir },
+            });
+
+            expect(resolveExplicitOrInstalledLocalFirstPartyCommand({
+                componentId: 'happier-cli',
+                releaseRing: 'stable',
+                envVarNames: ['HAPPIER_BOOTSTRAP_CLI_PATH'],
+                processEnv: { HAPPIER_HOME_DIR: happyHomeDir, HAPPIER_STACK_REPO_DIR: repoRoot, HAPPIER_BOOTSTRAP_CLI_PATH: envPath },
+            })).toEqual({ command: envPath, provenance: 'override' });
+
+            expect(resolveExplicitOrInstalledLocalFirstPartyCommand({
+                componentId: 'happier-cli',
+                releaseRing: 'stable',
+                envVarNames: ['HAPPIER_BOOTSTRAP_CLI_PATH'],
+                processEnv: { HAPPIER_HOME_DIR: happyHomeDir, HAPPIER_STACK_REPO_DIR: repoRoot },
+            })).toEqual({ command: managedPath, provenance: 'managed' });
+
+            rmSync(join(happyHomeDir, 'cli', 'versions'), { recursive: true, force: true });
+            rmSync(managedPath, { force: true });
+            expect(resolveExplicitOrInstalledLocalFirstPartyCommand({
+                componentId: 'happier-cli',
+                releaseRing: 'stable',
+                processEnv: { HAPPIER_HOME_DIR: happyHomeDir, HAPPIER_STACK_REPO_DIR: repoRoot },
+            })).toEqual({ command: repoPath, provenance: 'override' });
+
+            expect(resolveExplicitOrInstalledLocalFirstPartyCommand({
+                componentId: 'happier-cli',
+                releaseRing: 'preview',
+                processEnv: { HAPPIER_HOME_DIR: happyHomeDir, HAPPIER_STACK_REPO_DIR: join(rootDir, 'elsewhere') },
+            })).toBeNull();
+        } finally {
+            rmSync(rootDir, { recursive: true, force: true });
+        }
+    });
+
+    it('resolves the one CLI this computer chose, and never acquires past a CLI the user installed (R12)', async () => {
+        const rootDir = mkdtempSync(join(tmpdir(), 'hsetup-cli-choice-'));
+        const happyHomeDir = join(rootDir, 'home');
+        const npmBin = join(rootDir, 'npm-global', 'bin');
+        const npmHappier = join(npmBin, 'happier');
+        const managedPath = join(happyHomeDir, 'cli', 'current', 'happier');
+        const stagedPayloadRoot = join(rootDir, 'staged');
+        const processEnv = { HAPPIER_HOME_DIR: happyHomeDir, HAPPIER_STACK_REPO_DIR: join(rootDir, 'elsewhere'), PATH: npmBin };
+        const resolve = () => resolveExplicitOrInstalledLocalFirstPartyCommand({ componentId: 'happier-cli', releaseRing: 'stable', processEnv });
+
+        try {
+            mkdirSync(npmBin, { recursive: true });
+            writeFileSync(npmHappier, '#!/bin/sh\n', 'utf8');
+            chmodSync(npmHappier, 0o755);
+
+            // Nobody was asked yet: the CLI on PATH answers, so no read acquires a second one.
+            expect(resolve()).toEqual({ command: npmHappier, provenance: 'override' });
+
+            // "Let Happier manage it" with nothing installed yet: acquisition runs.
+            await writeHappierCliChoice({ choice: { mode: 'managed' }, processEnv });
+            expect(resolve()).toBeNull();
+
+            mkdirSync(stagedPayloadRoot, { recursive: true });
+            writeFileSync(join(stagedPayloadRoot, 'happier'), '#!/bin/sh\n', 'utf8');
+            chmodSync(join(stagedPayloadRoot, 'happier'), 0o755);
+            await installVersionedPayload({
+                componentId: 'happier-cli',
+                versionId: '0.2.13',
+                payloadRoot: stagedPayloadRoot,
+                releaseRing: 'stable',
+                processEnv,
+            });
+            expect(resolve()).toEqual({ command: managedPath, provenance: 'managed' });
+
+            // "Keep my own": that CLI wins even over a managed copy still on disk.
+            await writeHappierCliChoice({ choice: { mode: 'own', command: npmHappier }, processEnv });
+            expect(resolve()).toEqual({ command: npmHappier, provenance: 'override' });
+
+            // The kept CLI disappeared (R13 b): still this computer's answer, so neither the managed
+            // copy left on disk nor a fresh acquisition stands in for it — the question comes first.
+            rmSync(npmHappier, { force: true });
+            expect(resolve).toThrow(expect.objectContaining({ code: 'cli_choice_required', message: expect.stringContaining(npmHappier) }));
+            await expect(ensureLocalFirstPartyComponentCommand(
+                { componentId: 'happier-cli', releaseRing: 'stable', processEnv },
+                { preparePayload: async () => { throw new Error('must not acquire'); } },
+            )).rejects.toMatchObject({ code: 'cli_choice_required' });
         } finally {
             rmSync(rootDir, { recursive: true, force: true });
         }

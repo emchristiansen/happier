@@ -7,7 +7,7 @@ import { repoRootDir } from '../paths';
 import { reserveAvailablePort } from '../network/reserveAvailablePort';
 import { runLoggedCommand } from './spawnProcess';
 import { yarnCommand } from './commands';
-import { applyUiWebExpoNodeHeapEnv, readPositiveEnvInt } from './uiWebEnv';
+import { readPositiveEnvInt } from './uiWebEnv';
 import type { StartedUiWeb } from './uiWebTypes';
 
 export function resolveUiWebExportRootDir(env: NodeJS.ProcessEnv = process.env): string {
@@ -125,7 +125,7 @@ async function withUiWebExportLock<T>(
 }
 
 export function resolveUiWebExportBuildTimeoutMs(env: NodeJS.ProcessEnv): number {
-  return readPositiveEnvInt(env.HAPPIER_E2E_UI_WEB_EXPORT_TIMEOUT_MS, 600_000);
+  return readPositiveEnvInt(env.HAPPIER_E2E_UI_WEB_EXPORT_TIMEOUT_MS, 240_000);
 }
 
 export function resolveUiWebExportLockTimeoutMs(env: NodeJS.ProcessEnv): number {
@@ -160,7 +160,7 @@ function buildRuntimeConfig(env: NodeJS.ProcessEnv): UiWebRuntimeConfig {
 
 function buildExportEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const debug = String(env.EXPO_PUBLIC_DEBUG ?? '1').trim() || '1';
-  return applyUiWebExpoNodeHeapEnv({
+  return {
     ...process.env,
     ...env,
     CI: '1',
@@ -174,7 +174,7 @@ function buildExportEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     EXPO_PUBLIC_SERVER_URL: '',
     EXPO_PUBLIC_HAPPY_STORAGE_SCOPE: '',
     EXPO_PUBLIC_HAPPIER_SYNC_TUNING_JSON: '',
-  });
+  };
 }
 
 export function resolveUiWebExportSourceFingerprint(): string {

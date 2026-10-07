@@ -23,7 +23,7 @@ describe('Claude PermissionHandler - Happier MCP session-control tools', () => {
     expect(client.agentState.requests['toolu_change_title_default_1']).toBeUndefined();
   });
 
-  it('publishes Happier execution-run MCP tools as normal permission requests in default mode', async () => {
+  it('auto-allows recognized first-party Action transport calls in default mode', async () => {
     const { session, client } = createPermissionHandlerSessionStub('execution-run-default-permission-request');
     const { PermissionHandler } = await import('./permissionHandler');
     const handler = new PermissionHandler(session);
@@ -31,7 +31,7 @@ describe('Claude PermissionHandler - Happier MCP session-control tools', () => {
     const mode: EnhancedMode = { permissionMode: 'default' };
     const signal = new AbortController();
 
-    const pending = handler.handleToolCall(
+    const result = await handler.handleToolCall(
       'mcp__happier__execution_run_start',
       {
         intent: 'delegate',
@@ -46,21 +46,26 @@ describe('Claude PermissionHandler - Happier MCP session-control tools', () => {
       { signal: signal.signal, toolUseId: 'toolu_execution_run_default_1' },
     );
 
-    await Promise.resolve();
-    expect(client.agentState.requests['toolu_execution_run_default_1']).toMatchObject({
-      tool: 'mcp__happier__execution_run_start',
-    });
-
-    const permissionRpc = client.rpcHandlerManager.getHandler('permission');
-    expect(permissionRpc).toBeDefined();
-    await permissionRpc?.({ id: 'toolu_execution_run_default_1', approved: true } as any);
-
-    await expect(pending).resolves.toMatchObject({ behavior: 'allow' });
+    expect(result).toMatchObject({ behavior: 'allow' });
     expect(client.agentState.requests['toolu_execution_run_default_1']).toBeUndefined();
-    expect(client.agentState.completedRequests['toolu_execution_run_default_1']).toMatchObject({
-      status: 'approved',
-      tool: 'mcp__happier__execution_run_start',
-    });
+  });
+
+  it('does not auto-allow an opaque action_execute payload', async () => {
+    const { session, client } = createPermissionHandlerSessionStub('unknown-action-still-prompts');
+    const { PermissionHandler } = await import('./permissionHandler');
+    const handler = new PermissionHandler(session);
+    const signal = new AbortController();
+
+    const pending = handler.handleToolCall(
+      'mcp__happier__action_execute',
+      { actionId: 'not.a.known.action', input: {} },
+      { permissionMode: 'default' },
+      { signal: signal.signal, toolUseId: 'toolu_unknown_action_1' },
+    );
+    await Promise.resolve();
+    expect(client.agentState.requests.toolu_unknown_action_1).toBeDefined();
+    await client.rpcHandlerManager.getHandler('permission')?.({ id: 'toolu_unknown_action_1', approved: false } as any);
+    await expect(pending).resolves.toMatchObject({ behavior: 'deny' });
   });
 
   it('auto-allows first-party Happier MCP tools when Happier action approval is the gate', async () => {

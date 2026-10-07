@@ -101,7 +101,7 @@ export function buildConnectedServiceAuthGroupSwitchStateFromAccountUsage(input:
     if (!profileId) continue;
     const snapshot = snapshotsByProfileId.get(profileId) ?? null;
     const projectedState = snapshot
-      ? projectProviderAccountUsageSnapshotToAuthGroupRuntimeState(snapshot)
+      ? projectProviderAccountUsageSnapshotToAuthGroupRuntimeState(snapshot, input.group.policy.quotaLimitSelection)
       : null;
     memberStatesByProfileId.set(
       profileId,

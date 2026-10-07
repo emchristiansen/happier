@@ -40,6 +40,7 @@ import {
   type PermissionEscalationDecision,
 } from './permissionPrivilege.js';
 import type { ActionsSettingsV1 } from './actionSettings.js';
+import { readPendingLocalId } from '../sessionMessages/pendingLocalId.js';
 import type { ReviewStartInput } from '../reviews/reviewStart.js';
 import type { AcpConfigOptionOverridesV1 } from '../sessionMetadata/metadataOverridesV1.js';
 import type { ConnectedServiceBindingsV1 } from '../connect/connectedServiceBindings.js';
@@ -266,6 +267,7 @@ export type ActionExecutorDeps = Readonly<{
   sessionSendMessage: (args: Readonly<{
     sessionId: string;
     message: string;
+    localId?: string;
     requestedAction: PendingRequestedActionV1;
     permissionModeOverride?: string;
     modelOverride?: string | null;
@@ -1695,7 +1697,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
             : {};
         const connectedServicesByTarget = new Map<
           string,
-          Readonly<{ bindings: ConnectedServiceBindingsV1 | undefined; defaultServiceIds: readonly string[] }>
+          Readonly<{ bindings: ConnectedServiceBindingsV1 | null | undefined; defaultServiceIds: readonly string[] }>
         >();
         for (const backendTargetKey of backendTargetKeys) {
           const rawSelection = Object.prototype.hasOwnProperty.call(connectedServicesByBackendTargetKey, backendTargetKey)
@@ -1745,7 +1747,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
                 runClass: (parsed.data as any).runClass ?? 'bounded',
                 ioMode: (parsed.data as any).ioMode ?? 'request_response',
                 launchOrigin: resolveExecutionRunLaunchOrigin(ctx),
-                ...(connectedServices ? { connectedServices } : {}),
+                ...(connectedServices !== undefined ? { connectedServices } : {}),
                 ...(connectedServicesDefaultServiceIds.length > 0
                   ? { connectedServicesDefaultServiceIds }
                   : {}),
@@ -1924,7 +1926,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
             if (!normalized.ok) {
               return { ok: false, errorCode: 'invalid_parameters', error: normalized.error };
             }
-            if (normalized.bindings) {
+            if (normalized.bindings !== undefined) {
               request.connectedServices = normalized.bindings;
             } else {
               delete request.connectedServices;
@@ -2022,7 +2024,6 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
           const res = await deps.executionRunWait(sessionId, {
             runId: (parsed.data as any).runId,
             ...(typeof (parsed.data as any).timeoutSeconds === 'number' ? { timeoutSeconds: (parsed.data as any).timeoutSeconds } : {}),
-            ...(typeof (parsed.data as any).pollIntervalMs === 'number' ? { pollIntervalMs: (parsed.data as any).pollIntervalMs } : {}),
           }, opts);
           return { ok: true, result: res };
         }
@@ -2224,17 +2225,21 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
         if (actionId === 'session.message.send') {
           const sessionId = resolveSessionIdFromInput(parsed.data, ctx);
           if (!sessionId) return { ok: false, errorCode: 'session_not_selected', error: 'session_not_selected' };
+          const localIdRaw = (parsed.data as Record<string, unknown>).localId;
+          const localId = readPendingLocalId(localIdRaw);
+          if (localIdRaw !== undefined && (
+            ctx.surface !== 'cli'
+            || localId === null
+          )) {
+            return { ok: false, errorCode: 'invalid_parameters', error: 'invalid_parameters' };
+          }
           const serverId = resolveServerIdForSession(deps, ctx, sessionId);
           const modelOverrideRaw = Object.prototype.hasOwnProperty.call(parsed.data, 'modelOverride')
             ? (parsed.data as any).modelOverride
             : undefined;
           const permissionOverrideRaw = (parsed.data as any).permissionModeOverride;
-          const permissionModeForAgent = isSessionAgentCaller(ctx)
-            && !(typeof permissionOverrideRaw === 'string' && permissionOverrideRaw.trim().length > 0)
-              ? ctx.callerPermissionMode ?? 'default'
-              : permissionOverrideRaw;
-          const permissionDecision = typeof permissionModeForAgent === 'string' && permissionModeForAgent.trim().length > 0
-            ? assertSessionAgentPermission(ctx, permissionModeForAgent)
+          const permissionDecision = typeof permissionOverrideRaw === 'string' && permissionOverrideRaw.trim().length > 0
+            ? assertSessionAgentPermission(ctx, permissionOverrideRaw)
             : null;
           if (permissionDecision?.ok === false) {
             return createPermissionPolicyResult(ctx, permissionDecision);
@@ -2242,6 +2247,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
           const res = await deps.sessionSendMessage({
             sessionId,
             message: (parsed.data as any).message,
+            ...(localId !== null ? { localId } : {}),
             requestedAction: PendingRequestedActionV1Schema.parse(
               parsed.data.requestedAction ?? { v: 1, kind: 'steer_if_active' },
             ),

@@ -15,6 +15,7 @@ import {
 } from './unifiedTerminal/startupLifecycle';
 import {
     createClaudeInFlightSteerCapabilityPublisher,
+    publishClaudeInFlightSteerBackendUnsupported,
     type ClaudeInFlightSteerAvailabilitySnapshot,
 } from './unifiedTerminal/createClaudeInFlightSteerCapabilityPublisher';
 import {
@@ -114,7 +115,7 @@ import { isClaudeExplicitDiffToolInput } from './utils/isClaudeExplicitDiffToolI
 import {
     buildClaudeSessionModelsMetadataFromSupportedModels,
 } from './remote/buildClaudeSessionModelsMetadataFromSupportedModels';
-import { applyClaudeEffectiveModelUpdate } from './sessionModels/effectiveModelUpdate';
+import { applyClaudeEffectiveModelUpdate, type ClaudeEffectiveModelObservation } from './sessionModels/effectiveModelUpdate';
 import {
     createStreamedTranscriptWriter,
     type StreamedTranscriptWriter,
@@ -701,7 +702,7 @@ export async function claudeRemoteLauncher(
     };
     const reportClaudeSubscriptionAccessTokenRefreshCapability = (runner: ClaudeRemoteRunnerKind): void => {
         const metadata = session.client.getMetadataSnapshot?.();
-        const sessionId = session.sessionId?.trim();
+        const sessionId = session.client.sessionId?.trim();
         if (!metadata || !sessionId) return;
         void reportSessionToDaemonIfRunning({
             sessionId,
@@ -861,6 +862,7 @@ export async function claudeRemoteLauncher(
         if (effectiveModelId) {
             applyClaudeEffectiveModelUpdate({
                 client: session.client,
+                reconcileModels: session.reconcileSessionModels,
                 modelId: effectiveModelId,
                 source: 'sdk',
                 logPrefix: '[remote]',
@@ -1269,12 +1271,15 @@ export async function claudeRemoteLauncher(
                 ? null
                 : { unavailableUntilMs };
         };
-        const surfaceRemoteRateLimitRuntimeIssue = async (details: NormalizedProviderUsageLimitDetailsV1): Promise<void> => {
+        const surfaceRemoteRateLimitRuntimeIssue = async (
+            details: NormalizedProviderUsageLimitDetailsV1,
+            observedWindows?: readonly NormalizedProviderUsageLimitDetailsV1[],
+        ): Promise<void> => {
             recordPrimaryProviderUnavailableForPromptDelivery(details);
-            await surfaceClaudeRateLimitRuntimeIssue(session, details, '[remote]');
+            await surfaceClaudeRateLimitRuntimeIssue(session, details, '[remote]', { observedWindows });
         };
-        const recordRemoteQuotaEvidence = async (details: NormalizedProviderUsageLimitDetailsV1): Promise<void> => {
-            await recordClaudeRateLimitQuotaEvidence(session, details, '[remote]');
+        const recordRemoteQuotaEvidence = async (windows: readonly NormalizedProviderUsageLimitDetailsV1[]): Promise<void> => {
+            await recordClaudeRateLimitQuotaEvidence(session, windows, '[remote]');
         };
         // Initial goal (P1-E4): consumed once from the daemon-provided env so the FIRST unified
         // launch injects `/goal <objective>`; a park/respawn relaunch must not re-inject it.
@@ -1298,6 +1303,13 @@ export async function claudeRemoteLauncher(
             return false;
         };
         while (!exitReason) {
+            if (activeRuntimeModeKind === 'agentSdk' || activeRuntimeModeKind === 'legacy') {
+                // Each owned provider launch waits for Pending before starting its observer.
+                // Publish idle after a stopped local/remote provider as well as on first entry.
+                await session.getProviderTaskRuntimeActivityAdapter()?.publishBeforeRuntimeStart(
+                    'claude-remote-provider-not-started',
+                );
+            }
             logger.debug('[remote]: launch');
             messageBuffer.addMessage('═'.repeat(40), 'status');
 
@@ -1439,6 +1451,7 @@ export async function claudeRemoteLauncher(
                         userMessageLocalIds: batch.userMessageLocalIds,
                         providerAcceptancePending: batch.providerAcceptancePending,
                         pendingProviderAction: batch.pendingProviderAction,
+                        pendingRequestedAction: batch.pendingRequestedAction,
                     });
 
                 const resolveQueuedPromptForProvider = async (
@@ -1695,6 +1708,7 @@ export async function claudeRemoteLauncher(
                             (metadata) => {
                                 const modelsMetadata = buildClaudeSessionModelsMetadataFromSupportedModels({
                                     modelsRaw: caps.models,
+                                    reconcileModels: session.reconcileSessionModels,
                                     metadata,
                                 });
                                 return {
@@ -1711,6 +1725,10 @@ export async function claudeRemoteLauncher(
                     onThinkingChange: session.onThinkingChange,
                     claudeArgs: session.claudeArgs,
                     onMessage,
+                    onEffectiveModel: (facts: ClaudeEffectiveModelObservation) => applyClaudeEffectiveModelUpdate({
+                        client: session.client, reconcileModels: session.reconcileSessionModels,
+                        ...facts, source: 'sdk', logPrefix: '[remote]',
+                    }),
                     isWorkflowProviderTaskId: (taskId: string) => (
                         workflowActivitySource?.isWorkflowOwnedProviderTaskId(taskId) === true
                     ),
@@ -1730,11 +1748,11 @@ export async function claudeRemoteLauncher(
                         workflowActivitySource?.observeTranscriptMessage(value, observation);
                     },
                     onWorkStateSnapshot: publishWorkStateSnapshot,
-                    onRateLimitEvent: async (details: NormalizedProviderUsageLimitDetailsV1) => {
-                        await surfaceRemoteRateLimitRuntimeIssue(details);
+                    onRateLimitEvent: async (details: NormalizedProviderUsageLimitDetailsV1, observedWindows: readonly NormalizedProviderUsageLimitDetailsV1[]) => {
+                        await surfaceRemoteRateLimitRuntimeIssue(details, observedWindows);
                     },
-                    onQuotaEvidence: async (details: NormalizedProviderUsageLimitDetailsV1) => {
-                        await recordRemoteQuotaEvidence(details);
+                    onQuotaEvidence: async (windows: readonly NormalizedProviderUsageLimitDetailsV1[]) => {
+                        await recordRemoteQuotaEvidence(windows);
                     },
                     // Unified terminal usage-limit evidence is detected by the hook lifecycle
                     // bridge and surfaced through onUsageLimitDetails (the legacy/agent-SDK
@@ -1862,6 +1880,9 @@ export async function claudeRemoteLauncher(
                         if (isUnifiedTerminalTranscriptActive()) {
                             return unifiedBinding.sessionOptions.onProviderPromptStarted?.();
                         }
+                        if (activeRemoteRunnerKind === 'agentSdk') {
+                            return beginPromptTurn();
+                        }
                         beginReadyNotificationTurn();
                         return undefined;
                     },
@@ -1872,14 +1893,17 @@ export async function claudeRemoteLauncher(
                         activeRemoteRunnerKind = runner;
                         disposeAgentSdkInFlightSteerCapabilityPublisher(agentSdkInFlightSteerCapabilityPublisher);
                         agentSdkInFlightSteerCapabilityPublisher = null;
+                        inFlightSteerAvailabilitySnapshot = { available: false, reason: 'unsafe_window' };
                         if (runner === 'agentSdk') {
                             agentSdkInFlightSteerCapabilityPublisher = createClaudeInFlightSteerCapabilityPublisher({
                                 session: session.client,
                                 isCanonicalTurnActive: () => session.client.hasActiveCanonicalTurn?.() ?? true,
                                 terminalComposerControls: false,
                             });
-                            inFlightSteerAvailabilitySnapshot = { available: false, reason: 'unsafe_window' };
                             agentSdkInFlightSteerCapabilityPublisher.publish(inFlightSteerAvailabilitySnapshot);
+                        }
+                        if (runner === 'legacy') {
+                            publishClaudeInFlightSteerBackendUnsupported({ session: session.client });
                         }
                         if (runner === null) return;
                         remoteProviderInputOutcomes = createClaudeRemoteProviderInputOutcomeBridge(session.client);
@@ -1970,6 +1994,7 @@ export async function claudeRemoteLauncher(
                         };
                         const sharedTerminalCallbacks = createClaudeUnifiedTerminalSharedCallbacks({
                             sessionClient: session.client,
+                            reconcileModels: session.reconcileSessionModels,
                             observeInFlightSteerAvailabilitySnapshot,
                             sustainedPendingDeliveryBlockHandler,
                             dialogChoiceBroker,

@@ -58,7 +58,7 @@ import {
 import { projectManager } from '../../runtime/orchestration/projectManager';
 import { syncPerformanceTelemetry } from '../../runtime/syncPerformanceTelemetry';
 import { isModelMode, type PermissionMode } from '@/sync/domains/permissions/permissionTypes';
-import { isModelSelectableForSession } from '@/sync/domains/models/modelOptions';
+import { isModelSelectableForSession, type SessionModelOptionsContext } from '@/sync/domains/models/modelOptions';
 import { resolveAgentIdFromFlavor } from '@/agents/registry/registryCore';
 import { parsePermissionIntentAlias, resolveMetadataStringOverrideStateV1, resolvePermissionIntentFromSessionMetadata } from '@happier-dev/agents';
 import {
@@ -69,6 +69,7 @@ import {
     resolveSessionRuntimePresenceFields,
     SESSION_RESUMING_PRESENTATION_TIMEOUT_MS,
 } from '../../domains/session/attention/deriveSessionRuntimePresentationState';
+import { resolveMergedSessionRuntimeActivityProjectionFields } from '../../engine/sessions/sessionRuntimeActivityProjection';
 import { setActiveServerSessionListCache } from '../sessionListCache';
 import { getActiveServerSnapshot } from '../../domains/server/serverRuntime';
 import { areScmWorkingSnapshotsEquivalentIgnoringFetchedAt } from '@/scm/sync/snapshotDiff';
@@ -97,6 +98,7 @@ import {
 import { clearAgentInputLocalUiStateForSession } from '@/sync/domains/input/draftValues/agentInputLocalUiStateStore';
 import { deleteSessionDraft } from '@/sync/ops/sessionDrafts/sessionDraftRepository';
 import { fireAndForget } from '@/utils/system/fireAndForget';
+import { hasRecordValues } from '../sessionRecordProjection';
 import {
     createWarmCacheSaveScheduler,
     WARM_CACHE_PROGRESS_SAVE_DEBOUNCE_MS,
@@ -187,7 +189,7 @@ export type SessionsDomain = {
     clearSessionThinkingGrace: (sessionId: string) => void;
     markSessionViewed: (sessionId: string) => void;
     updateSessionPermissionMode: (sessionId: string, mode: PermissionMode) => void;
-    updateSessionModelMode: (sessionId: string, mode: SessionModelMode) => void;
+    updateSessionModelMode: (sessionId: string, mode: SessionModelMode, context?: SessionModelOptionsContext) => void;
     upsertSessionReviewCommentDraft: (sessionId: string, draft: ReviewCommentDraft) => void;
     setSessionReviewCommentDraftIncluded: (sessionId: string, commentId: string, included: boolean) => void;
     deleteSessionReviewCommentDraft: (sessionId: string, commentId: string) => void;
@@ -258,6 +260,7 @@ type SessionsDomainDependencies = {
     machines: Record<string, Machine>;
     machineDisplayById: Record<string, import('../../domains/machines/machineDisplayRenderable').MachineDisplayRenderable>;
     sessionMessages: Record<string, SessionMessages>;
+    sessionMessagesHistoryStartLoaded: Record<string, true>;
     profile: { id: string };
     // Keep resilient: older settings payloads (or partial boot states) may not yet include this key.
     settings: {
@@ -423,6 +426,55 @@ function resolveOrderedSessionApply(
             latestTurnStatus: previousSession.latestTurnStatus,
             latestTurnStatusObservedAt: previousSession.latestTurnStatusObservedAt,
         });
+    }
+
+    const previousMetadataVersion = normalizeSessionOrderingNumber(previousSession.metadataVersion);
+    const incomingMetadataVersion = normalizeSessionOrderingNumber(incomingSession.metadataVersion);
+    if (
+        previousMetadataVersion !== null
+        && incomingMetadataVersion !== null
+        && incomingMetadataVersion < previousMetadataVersion
+    ) {
+        applyPatch({
+            metadata: previousSession.metadata,
+            metadataVersion: previousSession.metadataVersion,
+        });
+    }
+
+    const previousAgentStateVersion = normalizeSessionOrderingNumber(previousSession.agentStateVersion);
+    const incomingAgentStateVersion = normalizeSessionOrderingNumber(incomingSession.agentStateVersion);
+    if (
+        previousAgentStateVersion !== null
+        && incomingAgentStateVersion !== null
+        && incomingAgentStateVersion < previousAgentStateVersion
+    ) {
+        applyPatch({
+            agentState: previousSession.agentState,
+            agentStateVersion: previousSession.agentStateVersion,
+        });
+    }
+
+    const previousPendingVersion = normalizeSessionOrderingNumber(previousSession.pendingVersion);
+    const incomingPendingVersion = normalizeSessionOrderingNumber(incomingSession.pendingVersion);
+    if (
+        previousPendingVersion !== null
+        && incomingPendingVersion !== null
+        && incomingPendingVersion < previousPendingVersion
+    ) {
+        applyPatch({
+            pendingVersion: previousSession.pendingVersion,
+            pendingCount: previousSession.pendingCount,
+            pendingBlockedCount: previousSession.pendingBlockedCount,
+            pendingActivationAuthorization: previousSession.pendingActivationAuthorization,
+        });
+    }
+
+    const mergedRuntimeActivity = resolveMergedSessionRuntimeActivityProjectionFields(
+        previousSession,
+        incomingSession,
+    );
+    if (mergedRuntimeActivity) {
+        applyPatch(mergedRuntimeActivity);
     }
 
     if (isIncomingOrderingTimestampOlder(incomingSession.pendingRequestObservedAt, previousSession.pendingRequestObservedAt)) {
@@ -749,7 +801,7 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
             let mergedRenderables: Record<string, SessionListRenderableSession> = state.sessionListRenderables;
             let updatedSessionMessages = state.sessionMessages;
             let needsSessionListViewDataRebuild = state.sessionListViewData === null;
-            let needsProjectManagerUpdate = Object.keys(state.sessions).length === 0;
+            let needsProjectManagerUpdate = !hasRecordValues(state.sessions);
             let changedSessionCount = 0;
             let changedRenderableCount = 0;
             const changedConsumerSessionIds = new Set<string>();
@@ -835,8 +887,8 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                 // State-aware on purpose: an explicit CLEAR is an override with a
                 // timestamp, not an absent key. The Agent transition writes one when the
                 // armed switch chose no model, and it is the only thing that can retire a
-                // client-local selection made for the DEPARTED Agent — the selectability
-                // clamp below cannot, because a freeform-capable target (Claude) accepts
+                // client-local selection made for the DEPARTED Agent — membership validation
+                // alone cannot, because a freeform-capable target (Claude) accepts
                 // any id, so the source Agent's model survived the cutover, named the
                 // composer chip and was handed to the target's resume.
                 const modelOverride = resolveMetadataStringOverrideStateV1(session.metadata, 'modelOverrideV1', 'modelId');
@@ -864,21 +916,10 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                     }
                 }
 
-                const resolvedAgentId = resolveAgentIdFromFlavor(session.metadata?.flavor);
-                if (
-                    resolvedAgentId &&
-                    mergedModelMode !== 'default' &&
-                    !isModelSelectableForSession(resolvedAgentId, session.metadata, mergedModelMode)
-                ) {
-                    mergedModelMode = 'default';
-                    if (typeof mergedModelModeUpdatedAt !== 'number' || !Number.isFinite(mergedModelModeUpdatedAt)) {
-                        if (typeof metadataModelUpdatedAt === 'number' && Number.isFinite(metadataModelUpdatedAt)) {
-                            mergedModelModeUpdatedAt = metadataModelUpdatedAt;
-                        } else {
-                            mergedModelModeUpdatedAt = nowServerMs();
-                        }
-                    }
-                }
+                // A saved or synced choice has already been requested. Session model lists
+                // can lag fresh discovery, so omission is not provider rejection. Admission
+                // is checked by updateSessionModelMode; newer overrides/tombstones above
+                // still replace the choice when the session or Agent changes.
 
                 let mergedThinkingGraceUntil = existingThinkingGraceUntil;
                 if (presence !== 'online') {
@@ -1284,24 +1325,23 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                     : state.sessionListViewDataByServerId,
             };
             if (didImmediateWarmCacheRelevantRenderableChange) {
-                const previousRenderableCount = Object.keys(state.sessionListRenderables ?? {}).length;
-                if (previousRenderableCount === 0) {
+                if (!hasRecordValues(state.sessionListRenderables ?? {})) {
                     measureSessionApplyPhase(
                         'sync.store.sessions.apply.warmCache',
                         () => ({ renderables: Object.keys(nextState.sessionListRenderables ?? {}).length }),
                         () => saveWarmSessionCacheImmediately(nextState as SessionsDomain & SessionsDomainDependencies),
                     );
                 } else {
-                    syncPerformanceTelemetry.count('sync.store.sessions.apply.warmCache.deferred', {
+                    syncPerformanceTelemetry.countLazy('sync.store.sessions.apply.warmCache.deferred', () => ({
                         renderables: Object.keys(nextState.sessionListRenderables ?? {}).length,
                         immediate: 1,
-                    });
+                    }));
                     scheduleWarmSessionCacheSave(nextState as SessionsDomain & SessionsDomainDependencies);
                 }
             } else if (didDeferredWarmCacheRelevantRenderableChange) {
-                syncPerformanceTelemetry.count('sync.store.sessions.apply.warmCache.deferred', {
+                syncPerformanceTelemetry.countLazy('sync.store.sessions.apply.warmCache.deferred', () => ({
                     renderables: Object.keys(nextState.sessionListRenderables ?? {}).length,
-                });
+                }));
                 scheduleWarmSessionCacheSave(nextState as SessionsDomain & SessionsDomainDependencies);
             }
                 return nextState;
@@ -1312,7 +1352,7 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                 state,
                 incomingRenderables: sessions,
             });
-            syncPerformanceTelemetry.count('sync.store.sessions.renderables.replace', {
+            syncPerformanceTelemetry.countLazy('sync.store.sessions.renderables.replace', () => ({
                 incoming: sessions.length,
                 previous: Object.keys(state.sessionListRenderables ?? {}).length,
                 changed: plan.changedCount,
@@ -1324,7 +1364,7 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                 staleMetadataPreserved: plan.staleMetadataPreservedCount,
                 stalePendingFlagsPreserved: plan.stalePendingFlagsPreservedCount,
                 warmCacheRelevant: plan.didWarmCacheRelevantRenderableChange ? 1 : 0,
-            });
+            }));
 
             if (plan.noop) {
                 return state;
@@ -1358,12 +1398,12 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                     () => saveWarmSessionCacheImmediately(next as SessionsDomain & SessionsDomainDependencies),
                 );
             } else if (plan.didDeferredWarmCacheRelevantRenderableChange) {
-                syncPerformanceTelemetry.count('sync.store.sessions.renderables.replace.warmCache.deferred', {
+                syncPerformanceTelemetry.countLazy('sync.store.sessions.renderables.replace.warmCache.deferred', () => ({
                     renderables: Object.keys(next.sessionListRenderables ?? {}).length,
                     incoming: sessions.length,
                     changed: plan.changedCount,
                     removed: plan.removedCount,
-                });
+                }));
                 scheduleWarmSessionCacheSave(next as SessionsDomain & SessionsDomainDependencies);
             }
             return next;
@@ -1376,7 +1416,7 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                 state,
                 incomingRenderables: sessions,
             });
-            syncPerformanceTelemetry.count('sync.store.sessions.renderables.merge', {
+            syncPerformanceTelemetry.countLazy('sync.store.sessions.renderables.merge', () => ({
                 incoming: sessions.length,
                 previous: Object.keys(state.sessionListRenderables ?? {}).length,
                 changed: plan.changedCount,
@@ -1388,7 +1428,7 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                 staleMetadataPreserved: plan.staleMetadataPreservedCount,
                 stalePendingFlagsPreserved: plan.stalePendingFlagsPreservedCount,
                 warmCacheRelevant: plan.didWarmCacheRelevantRenderableChange ? 1 : 0,
-            });
+            }));
 
             if (plan.noop) {
                 return state;
@@ -1420,11 +1460,11 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                     () => saveWarmSessionCacheImmediately(next as SessionsDomain & SessionsDomainDependencies),
                 );
             } else if (plan.didDeferredWarmCacheRelevantRenderableChange) {
-                syncPerformanceTelemetry.count('sync.store.sessions.renderables.merge.warmCache.deferred', {
+                syncPerformanceTelemetry.countLazy('sync.store.sessions.renderables.merge.warmCache.deferred', () => ({
                     renderables: Object.keys(next.sessionListRenderables ?? {}).length,
                     incoming: sessions.length,
                     changed: plan.changedCount,
-                });
+                }));
                 scheduleWarmSessionCacheSave(next as SessionsDomain & SessionsDomainDependencies);
             }
             return next;
@@ -1471,21 +1511,21 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
             });
 
             if (plan.didImmediateWarmCacheRelevantRenderableChange) {
-                syncPerformanceTelemetry.count('sync.store.sessions.renderables.patch.warmCache.deferred', {
+                syncPerformanceTelemetry.countLazy('sync.store.sessions.renderables.patch.warmCache.deferred', () => ({
                     renderables: Object.keys(nextState.sessionListRenderables ?? {}).length,
                     patches: patches.length,
                     changed: plan.changedCount,
                     missing: plan.missingCount,
                     immediate: 1,
-                });
+                }));
                 scheduleWarmSessionCacheSave(nextState as SessionsDomain & SessionsDomainDependencies);
             } else if (plan.didDeferredWarmCacheRelevantRenderableChange) {
-                syncPerformanceTelemetry.count('sync.store.sessions.renderables.patch.warmCache.deferred', {
+                syncPerformanceTelemetry.countLazy('sync.store.sessions.renderables.patch.warmCache.deferred', () => ({
                     renderables: Object.keys(nextState.sessionListRenderables ?? {}).length,
                     patches: patches.length,
                     changed: plan.changedCount,
                     missing: plan.missingCount,
-                });
+                }));
                 scheduleWarmSessionCacheSave(nextState as SessionsDomain & SessionsDomainDependencies);
             }
             return nextState;
@@ -1867,7 +1907,7 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                 sessions: updatedSessions
             };
         }),
-	        updateSessionModelMode: (sessionId: string, mode: SessionModelMode) => set((state) => {
+	        updateSessionModelMode: (sessionId: string, mode: SessionModelMode, context?: SessionModelOptionsContext) => set((state) => {
 	            const session = state.sessions[sessionId];
 	            if (!session) return state;
 	
@@ -1876,7 +1916,7 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                 const candidate: SessionModelMode = (normalized || 'default') as any;
                 const resolvedAgentId = resolveAgentIdFromFlavor(session.metadata?.flavor);
                 const effectiveMode: SessionModelMode =
-                    resolvedAgentId && candidate !== 'default' && !isModelSelectableForSession(resolvedAgentId, session.metadata, candidate)
+                    resolvedAgentId && candidate !== 'default' && !isModelSelectableForSession(resolvedAgentId, session.metadata, candidate, context)
                         ? 'default'
                         : candidate;
 	
@@ -2094,6 +2134,7 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
             // Remove session messages if they exist, along with the module-scoped
             // derived caches that root the transcript outside the store.
             const { [sessionId]: deletedMessages, ...remainingSessionMessages } = state.sessionMessages;
+            const { [sessionId]: _deletedCoverage, ...remainingHistoryStartLoaded } = state.sessionMessagesHistoryStartLoaded ?? {};
             clearSessionTranscriptDerivedCachesForSession(sessionId);
 
             // Remove session source-control status if it exists
@@ -2156,6 +2197,7 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                 // The only durable record that this id is gone rather than merely uncached.
                 deletedSessionIds: { ...state.deletedSessionIds, [sessionId]: true as const },
                 sessionMessages: remainingSessionMessages,
+                sessionMessagesHistoryStartLoaded: remainingHistoryStartLoaded,
                 sessionScmStatus: remainingScmStatus,
                 sessionRepositoryTreeExpandedPathsBySessionId: remainingTreeState,
                 reviewCommentsDraftsBySessionId: remainingReviewDrafts,

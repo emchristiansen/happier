@@ -80,6 +80,21 @@ export function applyAccountSettingsCompatibilityMigrations<TSettings extends Re
         const parsed = z.record(z.string(), SessionTmuxMachineOverrideSchema).safeParse(input.terminalTmuxByMachineId);
         if (parsed.success) next.sessionTmuxByMachineId = parsed.data;
     }
+    // Development Herdr settings previously nested the host in the released
+    // tmux map. Normalize retained input once; current writers only use the
+    // additive top-level map, which older UI edits preserve.
+    if (!('sessionTerminalHostByMachineId' in input)) {
+        const legacyMap = input.sessionTmuxByMachineId;
+        if (legacyMap && typeof legacyMap === 'object' && !Array.isArray(legacyMap)) {
+            const hosts: Record<string, 'zellij' | 'herdr'> = {};
+            for (const [machineId, value] of Object.entries(legacyMap)) {
+                if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+                const host = (value as Record<string, unknown>).terminalHost;
+                if (host === 'zellij' || host === 'herdr') hosts[machineId] = host;
+            }
+            next.sessionTerminalHostByMachineId = hosts;
+        }
+    }
     if (!('sessionMessageSendMode' in input) && 'messageSendMode' in input) {
         const parsed = z.enum(['agent_queue', 'interrupt', 'server_pending'] as const).safeParse(input.messageSendMode);
         if (parsed.success) next.sessionMessageSendMode = parsed.data;

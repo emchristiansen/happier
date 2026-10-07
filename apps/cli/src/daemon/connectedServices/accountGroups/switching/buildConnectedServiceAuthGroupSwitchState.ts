@@ -91,6 +91,7 @@ export function buildConnectedServiceAuthGroupSwitchState(input: Readonly<{
     serviceId: input.group.serviceId,
     groupId: input.group.groupId,
     capturedAtMs: input.nowMs,
+    quotaLimitSelection: input.group.policy.quotaLimitSelection,
   });
   return buildConnectedServiceAuthGroupSwitchStateFromMemberRuntimeStates({
     group: input.group,

@@ -2,7 +2,7 @@ import * as React from 'react';
 
 import { useFeatureEnabled } from '@/hooks/server/useFeatureEnabled';
 import { getActiveServerSnapshot } from '@/sync/domains/server/serverRuntime';
-import { useAllMachines } from '@/sync/domains/state/storage';
+import { useFirstVisibleMachineId } from '@/sync/domains/state/storage';
 import { fetchDaemonMemoryStatus } from '@/sync/domains/memory/fetchDaemonMemoryStatus';
 import { isDaemonMemorySearchUsable } from '@/sync/domains/memory/isDaemonMemorySearchUsable';
 import { searchDaemonMemory } from '@/sync/domains/memory/searchDaemonMemory';
@@ -40,11 +40,6 @@ function buildCandidateSignature(candidateSessionKeys: ReadonlySet<string>): str
     return [...candidateSessionKeys].sort().join('\u0001');
 }
 
-function readFirstMachineId(machines: ReturnType<typeof useAllMachines>): string | null {
-    const machineId = machines[0]?.id;
-    return typeof machineId === 'string' && machineId.trim().length > 0 ? machineId.trim() : null;
-}
-
 function resolveRefreshingMemorySearchState(
     current: SessionListMemorySearchAugmentationState,
     normalizedQuery: string,
@@ -71,20 +66,29 @@ export type SessionListMemorySearchAugmentationState = Readonly<{
 
 export function useSessionListMemorySearchAugmentation(input: Readonly<{
     searchQuery: string;
-    candidateSessionKeys: ReadonlySet<string>;
+    getCandidateSessionKeys: () => ReadonlySet<string>;
     enabled?: boolean;
 }>): SessionListMemorySearchAugmentationState {
     const memorySearchEnabled = useFeatureEnabled('memory.search');
-    const machines = useAllMachines();
-    const machineId = readFirstMachineId(machines);
     const serverId = getActiveServerSnapshot().serverId;
     const normalizedQuery = input.searchQuery.trim();
-    const candidateSignature = React.useMemo(
-        () => buildCandidateSignature(input.candidateSessionKeys),
-        [input.candidateSessionKeys],
+    const searchDemanded = input.enabled !== false
+        && memorySearchEnabled
+        && normalizedQuery.length >= SESSION_LIST_MEMORY_SEARCH_MIN_QUERY_LENGTH
+        && Boolean(serverId);
+    const machineId = useFirstVisibleMachineId(searchDemanded);
+    const candidateSessionKeys = React.useMemo(
+        () => searchDemanded && machineId
+            ? input.getCandidateSessionKeys()
+            : EMPTY_MEMORY_MATCHED_SESSION_KEYS,
+        [input.getCandidateSessionKeys, machineId, searchDemanded],
     );
-    const candidateSessionKeysRef = React.useRef(input.candidateSessionKeys);
-    candidateSessionKeysRef.current = input.candidateSessionKeys;
+    const candidateSignature = React.useMemo(
+        () => buildCandidateSignature(candidateSessionKeys),
+        [candidateSessionKeys],
+    );
+    const candidateSessionKeysRef = React.useRef(candidateSessionKeys);
+    candidateSessionKeysRef.current = candidateSessionKeys;
     const requestIdRef = React.useRef(0);
     const [state, setState] = React.useState<SessionListMemorySearchAugmentationState>({
         memoryMatchedSessionKeys: EMPTY_MEMORY_MATCHED_SESSION_KEYS,

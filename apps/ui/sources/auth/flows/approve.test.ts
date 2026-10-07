@@ -62,6 +62,19 @@ describe('authApprove', () => {
         expect(parsed.response).toBe(encodeBase64(answerV2));
     });
 
+    it('addresses both requests at the explicit endpoint when one is given', async () => {
+        mocks.serverFetch.mockResolvedValueOnce(jsonResponse({ status: 'pending', supportsV2: true }));
+        mocks.serverFetch.mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+        await authApprove('token', new Uint8Array([1, 2]), new Uint8Array(), new Uint8Array([5, 6]), {
+            endpointUrl: 'https://relay.example.test/',
+        });
+
+        const requestedPaths = mocks.serverFetch.mock.calls.map((call) => String(call[0]));
+        expect(requestedPaths[0]).toMatch(/^https:\/\/relay\.example\.test\/v1\/auth\/request\/status\?publicKey=/);
+        expect(requestedPaths[1]).toBe('https://relay.example.test/v1/auth/response');
+    });
+
     it('supports lazy v1 payloads when v2 is unavailable', async () => {
         const token = 'token';
         const publicKey = new Uint8Array([1, 2, 3, 4]);

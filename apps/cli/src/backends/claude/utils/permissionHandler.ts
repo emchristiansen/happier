@@ -27,7 +27,9 @@ import { cloneStringKeyedRecordToNullProto } from '@/api/session/agentStateRecor
 import type { Metadata } from '@/api/types';
 import { resolveAgentRequestKind } from '@/agent/permissions/requestKind';
 import { isToolAllowedForSession } from '@/agent/permissions/permissionToolIdentifier';
-import { shouldSuppressProviderPermissionForHappierApproval } from '@/agent/tools/happierTools/resolveHappierActionForMcpToolName';
+import {
+    isSafeFirstPartyHappierActionToolCall,
+} from '@/agent/tools/happierTools/resolveHappierActionForMcpToolName';
 import { applyAllowedToolsToAllowlist, applyUpdatedPermissionsToAllowlist, seedAllowlistFromCompletedRequests } from '@/agent/permissions/applyPermissionAllowlistUpdates';
 import {
     AgentStateRequestStore,
@@ -700,12 +702,7 @@ export class PermissionHandler {
 
         if (
             !isInteractiveTool(toolName)
-            && shouldSuppressProviderPermissionForHappierApproval({
-                toolName,
-                input: rewrittenInput,
-                accountSettings: this.session.accountSettings ?? null,
-                surface: 'session_agent',
-            }).suppress
+            && isSafeFirstPartyHappierActionToolCall({ toolName, input: rewrittenInput })
         ) {
             return { behavior: 'allow', updatedInput: rewrittenInput as Record<string, unknown> };
         }

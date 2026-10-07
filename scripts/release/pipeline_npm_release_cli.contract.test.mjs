@@ -27,7 +27,11 @@ test('pipeline CLI can npm-release in dry-run using env-only secrets', async () 
     ],
     {
       cwd: repoRoot,
-      env: { ...process.env, NPM_TOKEN: 'npm-token' },
+      env: {
+        ...process.env,
+        NPM_TOKEN: 'npm-token',
+        HAPPIER_RELEASE_PUBLISHED_VERSIONS_JSON: JSON.stringify({ github: {}, npm: {} }),
+      },
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 30_000,

@@ -33,6 +33,8 @@ export function useNewSessionMcpSelection(params: Readonly<{
     const [mcpPreviewLoading, setMcpPreviewLoading] = React.useState(false);
     const [mcpPreviewError, setMcpPreviewError] = React.useState<string | null>(null);
     const [mcpPreviewUnsupported, setMcpPreviewUnsupported] = React.useState(false);
+    const [previewDemanded, setPreviewDemanded] = React.useState(false);
+    const demandPreview = React.useCallback(() => setPreviewDemanded(true), []);
 
     React.useEffect(() => {
         setMcpPreviewUnsupported(false);
@@ -104,6 +106,7 @@ export function useNewSessionMcpSelection(params: Readonly<{
 
     React.useEffect(() => {
         let cancelled = false;
+        if (!previewDemanded) return;
         if (!mcpServersEnabled || !params.selectedMachineId || params.selectedPath.trim().length === 0) {
             setMcpPreview(null);
             setMcpPreviewError(null);
@@ -167,6 +170,7 @@ export function useNewSessionMcpSelection(params: Readonly<{
         };
     }, [
         mcpServersEnabled,
+        previewDemanded,
         params.agentType,
         params.mcpSelection,
         params.selectedMachineId,
@@ -236,6 +240,7 @@ export function useNewSessionMcpSelection(params: Readonly<{
             label: chipLabel,
             selectedCount,
             stabilityKey: chipStabilityKey,
+            onIntent: demandPreview,
             popoverContent: ({ maxHeight }) => (
                 <NewSessionMcpSelectionContent
                     {...contentProps}
@@ -245,7 +250,7 @@ export function useNewSessionMcpSelection(params: Readonly<{
             maxHeightCap: 760,
             maxWidthCap: 620,
         });
-    }, [chipLabel, chipStabilityKey, contentProps, mcpServersEnabled, selectedCount]);
+    }, [chipLabel, chipStabilityKey, contentProps, demandPreview, mcpServersEnabled, selectedCount]);
 
     return { mcpChip, mcpPreview, mcpPreviewLoading };
 }

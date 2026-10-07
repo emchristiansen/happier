@@ -33,7 +33,7 @@ export function readClaudeActiveTerminalMode(input: Readonly<{
 export function readClaudeActiveUnifiedTerminalHost(input: Readonly<{
   terminalRuntime?: TerminalRuntimeFlags | null;
   metadata?: Metadata | Record<string, unknown> | null;
-}>): 'tmux' | 'zellij' | null {
+}>): 'tmux' | 'zellij' | 'herdr' | null {
   const mode = readClaudeActiveTerminalMode(input);
-  return mode === 'tmux' || mode === 'zellij' ? mode : null;
+  return mode === 'tmux' || mode === 'zellij' || mode === 'herdr' ? mode : null;
 }

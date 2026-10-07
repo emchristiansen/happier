@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -19,6 +19,7 @@ const rl = readline.createInterface({ input: process.stdin });
 const out = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
 
 let thinkingLevel = 'medium';
+let catalogPublished = false;
 
 rl.on('line', (line) => {
   let command;
@@ -29,6 +30,12 @@ rl.on('line', (line) => {
       out({ id: command.id, type: 'response', command: 'new_session', success: true, data: { cancelled: false } });
       break;
     case 'get_state':
+      if (!catalogPublished) {
+        catalogPublished = true;
+        process.stderr.write(JSON.stringify({ type: 'happier-pi-model-catalog', models: [
+          { id: 'gpt-5.4', provider: 'openai', name: 'GPT-5.4', reasoning: true }
+        ] }) + '\\n');
+      }
       out({
         id: command.id,
         type: 'response',
@@ -97,9 +104,23 @@ describe('PiRpcBackend (thinking level)', () => {
     backend.onMessage((m) => messages.push(m));
 
     const started = await backend.startSession();
+    await backend.waitForSessionModels();
+    const initialModelState = messages.find((m) => m.type === 'event' && m.name === 'session_models_state');
+    if (initialModelState?.type !== 'event') throw new Error('Missing initial model observation');
+    const initialObservedAt = (initialModelState.payload as { observedAt: number }).observedAt;
     messages.length = 0;
 
     await (backend as any).setSessionConfigOption(started.sessionId, 'reasoning_effort', 'high');
+
+    await vi.waitFor(() => {
+      const latestModelState = [...messages]
+        .reverse()
+        .find((m) => m.type === 'event' && (m as any).name === 'session_models_state') as any;
+      expect(latestModelState?.payload?.availableModels?.[0]?.modelOptions?.[0]).toMatchObject({
+        id: 'reasoning_effort',
+        currentValue: 'high',
+      });
+    }, { timeout: 10_000 });
 
     const modelState = [...messages]
       .reverse()
@@ -111,5 +132,6 @@ describe('PiRpcBackend (thinking level)', () => {
       type: 'select',
       currentValue: 'high',
     });
+    expect(modelState.payload.observedAt).toBe(initialObservedAt);
   });
 });

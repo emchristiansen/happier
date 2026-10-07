@@ -1,12 +1,12 @@
 ---
 name: happier-testing
-description: Repo-specific TDD and test-validation workflow for Happier changes, with lane selection, fixture policy, and anti-flake guardrails.
+description: Author, change, review, delete, or audit Happier tests through observable contracts, canonical testkits, risk-selected validation, and safe subsystem cleanup. Use for behavior-changing TDD and for test-infrastructure or test-pruning work.
 metadata: {"openclaw":{"homepage":"https://github.com/happier-dev/happier"}}
 ---
 
 # Happier Testing And TDD
 
-Use this skill for behavior-changing work in this repository, especially when changes touch shared runtime contracts, CLI/server/UI flows, or any lane that historically accumulates stale fixtures.
+Use this skill whenever work adds, changes, reviews, deletes, or audits tests, fixtures, testkits, lane wiring, or validation behavior. It is the single test-quality owner; CI failure collection remains in `.agents/skills/happier-ci-stabilize`.
 
 ## Goal
 
@@ -23,10 +23,13 @@ Apply strict RED-GREEN-REFACTOR while following Happier-specific lane, fixture, 
 - Consolidate overlapping tests instead of stacking new ones on top.
 
 2. **Classify failures correctly**
-- `production bug`: runtime behavior is wrong
-- `test drift`: assertions/fixtures assume an obsolete contract
-- `harness drift`: helpers/mocks/testkit no longer match real runtime wiring
-- `infra/resource issue`: disk, Docker, stale child processes, or similar environment failures
+- `production defect`: runtime behavior is wrong
+- `stale test or expectation`: assertions/fixtures assume an obsolete contract
+- `harness or mock defect`: helpers/mocks/testkit do not represent real runtime wiring
+- `release-control or setup defect`: workflow admission, permissions, generated prerequisites, or configuration are wrong
+- `external service or configuration defect`: an external dependency, credential, account, or published state is unavailable or invalid
+- `resource or timeout defect`: the owning resource budget, cleanup, runner, or lifecycle bound is wrong
+- `inconclusive`: available evidence cannot yet identify the owning class
 
 3. **RED**
 - Write or update the smallest relevant test first.
@@ -41,8 +44,8 @@ Apply strict RED-GREEN-REFACTOR while following Happier-specific lane, fixture, 
 - Keep file responsibilities focused.
 
 6. **Broaden validation**
-- After a targeted green run in a shared area, rerun one broader related lane.
-- Before handoff, rerun the touched package typecheck/build-enforcing lane and the relevant repo lanes.
+- After focused GREEN, run risk-selected adjacent checks; batch expensive package/build and broader checks at the coherent integration boundary under root **Validation**. Reuse applicable execution evidence under that policy instead of rerunning it for each handoff.
+- Intermediate handoffs name any deferred check, later owning boundary, and prerequisite. Final handoffs require applicable successful evidence for each required lane or report the missing gate blocked.
 - Validate the current moving source and the existing development stack. Feature validation must not create, freeze, pack, install, identify, or certify a separate release representation; archive production and publication verification belong only to release automation during an explicitly dispatched release.
 
 ## Test Value Gate
@@ -51,11 +54,24 @@ Apply strict RED-GREEN-REFACTOR while following Happier-specific lane, fixture, 
 - TDD proves an observable contract; it does not require a new test for every changed function, branch, helper, or file.
 - Prefer strengthening or consolidating the canonical owner-level test over adding overlapping coverage.
 - One discriminating test is more valuable than many shallow permutations. Add cases only for materially different contracts, boundaries, or failure modes.
-- A useful test distinguishes the intended implementation from at least one plausible incorrect implementation. Prove it by execution rather than by reading: for load-bearing assertions, delete or invert the behavior and confirm the test goes red for that reason. A test never observed failing is not evidence.
+- A useful test distinguishes the intended implementation from at least one plausible incorrect implementation. A meaningful original RED proves sensitivity while it still exercises the relevant defect. If that evidence is absent or no longer applicable, demonstrate the failure with a focused mutation/reproduction through the owner boundary; do not repeat a mutation merely for another handoff. Preserve unrelated shared edits.
 - When a check passes too easily or contradicts visible behavior, challenge the observation method before trusting the system. Verify that fixture state reaches the deciding branch, the assertion reads the field production writes (accessor-backed objects such as `Headers` do not expose plain properties), the instrument can observe the claimed cost or state, and the code under test cannot swallow its own failure and read as a pass.
 - Do not add runtime tests that merely restate TypeScript types, mirror implementation structure, assert pass-through wiring or incidental call counts, or police wording, formatting, raw styles, or example values.
 - Exercise real internal behavior through the canonical/public owner boundary whenever practical.
 - Remove or consolidate redundant tests introduced or exposed by the change.
+
+Before retaining or adding a test, answer all four questions:
+
+1. Which observable behavior, invariant, released contract, or reachable material risk does it protect?
+2. Which plausible implementation mistake would make it fail?
+3. Why does a stronger existing owner-level test not already catch that mistake?
+4. Does the test require a production export, reset, dependency injection seam, or mode that no production caller needs?
+
+A missing answer is a review signal, not an automatic deletion verdict. Static inspection remains valid when it is the cheapest independent proof of a public API, generated artifact, package boundary, workflow permission/trust contract, migration, security property, or platform configuration and survives behavior-preserving refactoring.
+
+## Test Audit And Mechanical Cleanup
+
+For an explicit test-pruning, test-infrastructure, or whole-subsystem audit, read [test-audit.md](references/test-audit.md). Audit one canonical owner or subsystem at a time. Use deterministic analyzers and codemods for mechanical repetition, but keep contract value, keeper selection, compatibility obligations, and deletion decisions evidence-led.
 
 ## Compatibility Contract Gate
 
@@ -87,7 +103,7 @@ CLI lane rule:
 - Do not partially mock central shared modules such as `@/sync/domains/state/storage`.
 - Prefer package-local shared factories/testkits for repeated boundary mocks.
 - Keep cross-repo primitives in `packages/tests/src/testkit`.
-- Before adding a new helper or mock family, inspect the codebase for the existing canonical testkit/helper for that boundary.
+- Before adding a new helper or mock family, inspect the codebase for the existing canonical testkit/helper for that boundary. On a structural fixture/setup mismatch, trace the real producer-to-consumer input graph before another rerun; repair coherent fixtures rather than adding internal stubs one failure at a time.
 - Prefer reusing, extending, generalizing, or extracting from canonical helpers over introducing similar-but-different variants.
 - When a new canonical helper replaces older local variants, migrate or remove the overlapping variants instead of leaving parallel helper families behind.
 - Be careful with repeat-offender boundaries: prefer canonical helpers over fresh inline mocks for UI boundaries such as `expo-router`, `@/text`, `@/modal`, `react-native`, and `react-native-unistyles`; prefer existing server route/DB harnesses over direct storage mocks when available.
@@ -114,11 +130,12 @@ CLI lane rule:
 
 ## Anti-Flake Process Rules
 
-- Keep only one active rerun per spec/lane.
+- Within this task and its delegates, reuse an active run of the same spec/lane instead of launching an equivalent rerun. Follow root waiting/recovery policy; this requires no cross-session monitor coordination.
 - If a runner hangs or is killed, inspect whether the failure is repo-owned, harness-owned, or environmental before retrying blindly.
 - When shared process helpers change, rerun a broader lane that can reveal leaked handles or child-process cleanup regressions.
 - Before starting Metro/Playwright in a shared development VM, inspect current compiler, Vitest, and Metro load. A bundle-fetch timeout while several unrelated compilers or Metro servers saturate the same VM is not valid RED evidence. Wait for capacity or use the configured execution target, then rerun the same command; do not encode local contention as a larger repository timeout.
 - Preserve the runner's original stack, phase label, browser diagnostics, and focused artifacts. If the hosted log omits the deciding state, download the bounded Playwright shard artifact before rerunning; inspect metadata first and avoid blindly fetching oversized diagnostics trees.
+- When a failure involves a timeout, retry count, request/body cap, or other bound, first prove which lifecycle or resource owner should govern it. Do not turn one slow run or fixture size into a new production limit. A deciding regression test should show reuse of the canonical budget/boundary and accept valid work beyond the incorrect local cutoff it replaces.
 
 ## Live Validation Gates
 
@@ -127,7 +144,7 @@ Host-test green alone is not shippable for user-visible behavior; this skill own
 - Treat live gates (managed-stack browser QA, argent device QA) as ship gates for UI-visible changes; write or extend host tests from what the live loop taught, afterwards.
 - For daemon/session/provider/API behavior that depends on real process, transport, authentication, persistence, or provider semantics, run the named composed CLI/API/daemon recipe when the authorized environment is available. Corridor tests do not replace this gate.
 - If a defect family escapes host tests twice, stop adding host tests and switch to live-in-the-loop: fix → load and identify the updated build/bundle/module actually consumed → replay the exact failing recipe → verify live, closing each defect with a live PASS against that observed basis in the same session.
-- When a full-suite result is used as a release/ship gate, or shared-state leakage/order dependence is a material risk, run it twice back-to-back before calling it deterministic.
+- Reuse an applicable successful full-suite result; release use alone does not require running it twice. Repeat the affected lane when investigating nondeterminism, shared-state leakage, order dependence, or when an explicit release protocol requires independent execution. Two passes are evidence, not proof of determinism.
 - If a documented memory-heavy UI host suite OOMs at the default heap, rerun with `NODE_OPTIONS=--max-old-space-size=8192` instead of silently narrowing the lane.
 - Device QA must pin bundle identity when stale Metro state could invalidate the result: full Metro reload, Fast Refresh off, and a module probe.
 
@@ -139,5 +156,5 @@ When reporting testing work, summarize:
 - failing area and classification
 - root cause
 - targeted RED/GREEN evidence
-- broader lane rerun performed
+- broader validation performed or applicable evidence reused; outstanding checks and prerequisites
 - residual risk, if any

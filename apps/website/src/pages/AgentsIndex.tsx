@@ -41,9 +41,9 @@ export function AgentsIndex() {
                 title={PAGE_PROSE.agentsIndex.p8}
                 standfirst={
                     <>
-                        {AGENTS.length} command-line coding agents, on your own computers, with your
-                        own subscriptions and API keys — in one open-source app that runs on your
-                        phone, your browser and your desktop.
+                        Explore {AGENTS.length} detailed agent guides, with more shipped integrations
+                        listed below. They run on your own computers, with your own subscriptions and
+                        API keys, in one open-source app for phone, browser and desktop.
                     </>
                 }
             />

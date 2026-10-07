@@ -130,6 +130,7 @@ describe('resolveConnectedServiceQuotaProfileRefForSession', () => {
         })).toEqual({
             serviceId: 'openai-codex',
             profileId: 'member-a',
+            groupId: 'codex-main',
             credentialHealthStatus: 'connected',
             provenance: 'connected_binding_group',
         });
@@ -173,6 +174,7 @@ describe('resolveConnectedServiceQuotaProfileRefForSession', () => {
         })).toEqual({
             serviceId: 'openai-codex',
             profileId: 'member-a',
+            groupId: 'codex-main',
             credentialHealthStatus: 'refresh_failed_retryable',
             provenance: 'connected_binding_group',
         });

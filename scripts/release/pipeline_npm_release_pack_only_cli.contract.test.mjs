@@ -32,7 +32,11 @@ test('pipeline CLI npm-release supports --mode pack (no publish) in dry-run', as
     ],
     {
       cwd: repoRoot,
-      env: { ...process.env, NPM_TOKEN: 'npm-token' },
+      env: {
+        ...process.env,
+        NPM_TOKEN: 'npm-token',
+        HAPPIER_RELEASE_PUBLISHED_VERSIONS_JSON: JSON.stringify({ github: {}, npm: {} }),
+      },
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 30_000,

@@ -212,9 +212,10 @@ function shouldSurfaceRecoveryIssue(params: Readonly<{
     // `runtimeWorking` only proves the runtime is live and ticking thinking/in-progress signals; it is
     // NOT proof that the provider accepted the recovered state or moved to a fresh quota. An unproven,
     // in-progress recovery (waiting-for-reset / provider-outcome-waiting / action-required / exhausted)
-    // must stay visible even while the runtime resumes "working" after a local switch. Only genuine
-    // provider activity after the issue (`hasActivityAfterRuntimeIssue`) proves the recovery resolved.
-    if (params.hasActivityAfterRuntimeIssue === true && params.latestTurnStatus !== 'cancelled') return false;
+    // must stay visible even while the runtime resumes "working" after a local switch. Provider
+    // activity only proves recovery once the current lifecycle has advanced to an in-progress turn;
+    // terminal text emitted by the failed turn (including the provider's own limit notice) does not.
+    if (params.hasActivityAfterRuntimeIssue === true && params.latestTurnStatus === 'in_progress') return false;
     if (
         params.latestTurnStatus != null
         && params.latestTurnStatus !== 'failed'

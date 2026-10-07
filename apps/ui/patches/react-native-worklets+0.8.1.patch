@@ -1,0 +1,218 @@
+diff --git a/node_modules/react-native-worklets/lib/module/memory/serializable.native.js b/node_modules/react-native-worklets/lib/module/memory/serializable.native.js
+index 0baf8b9..ad91852 100644
+--- a/node_modules/react-native-worklets/lib/module/memory/serializable.native.js
++++ b/node_modules/react-native-worklets/lib/module/memory/serializable.native.js
+@@ -293,14 +293,18 @@ function cloneInitializer(value, shouldPersistRemote = false, depth = 0) {
+ function cloneArray(value, shouldPersistRemote, depth) {
+   const clonedElements = value.map(element => createSerializable(element, shouldPersistRemote, depth + 1));
+   const clone = WorkletsModule.createSerializableArray(clonedElements, shouldPersistRemote);
+-  serializableMappingCache.set(value, clone);
++  if (shouldPersistRemote) {
++    serializableMappingCache.set(value, clone);
++  } else {
++    serializableMappingCache.setWeak(value, clone);
++  }
+   serializableMappingCache.set(clone);
+   freezeObjectInDev(value);
+   return clone;
+ }
+ function cloneRemoteFunction(value) {
+   const clone = WorkletsModule.createSerializableFunction(value);
+-  serializableMappingCache.set(value, clone);
++  serializableMappingCache.setWeak(value, clone);
+   serializableMappingCache.set(clone);
+   freezeObjectInDev(value);
+   return clone;
+@@ -373,7 +377,11 @@ function cloneContextObject(value) {
+ function clonePlainJSObject(value, shouldPersistRemote, depth) {
+   const clonedProps = cloneObjectProperties(value, shouldPersistRemote, depth);
+   const clone = WorkletsModule.createSerializableObject(clonedProps, shouldPersistRemote, value);
+-  serializableMappingCache.set(value, clone);
++  if (shouldPersistRemote) {
++    serializableMappingCache.set(value, clone);
++  } else {
++    serializableMappingCache.setWeak(value, clone);
++  }
+   serializableMappingCache.set(clone);
+   freezeObjectInDev(value);
+   return clone;
+@@ -386,7 +394,7 @@ function cloneMap(value) {
+     clonedValues.push(createSerializable(element));
+   }
+   const clone = WorkletsModule.createSerializableMap(clonedKeys, clonedValues);
+-  serializableMappingCache.set(value, clone);
++  serializableMappingCache.setWeak(value, clone);
+   serializableMappingCache.set(clone);
+   freezeObjectInDev(value);
+   return clone;
+@@ -397,7 +405,7 @@ function cloneSet(value) {
+     clonedElements.push(createSerializable(element));
+   }
+   const clone = WorkletsModule.createSerializableSet(clonedElements);
+-  serializableMappingCache.set(value, clone);
++  serializableMappingCache.setWeak(value, clone);
+   serializableMappingCache.set(clone);
+   freezeObjectInDev(value);
+   return clone;
+@@ -537,6 +545,9 @@ function freezeObjectInDev(value) {
+     Object.defineProperty(value, key, {
++      // Recreated weak clones must reuse these guards. In Hermes a new getter
++      // otherwise retains the previous descriptor and its getter environment.
++      configurable: false,
+       get() {
+         return element;
+       },
+       set() {
+         logger.warn(`Tried to modify key \`${key}\` of an object which has been already passed to a worklet. See
+diff --git a/node_modules/react-native-worklets/lib/module/memory/serializableMappingCache.native.js b/node_modules/react-native-worklets/lib/module/memory/serializableMappingCache.native.js
+index 63a81c1..98450d8 100644
+--- a/node_modules/react-native-worklets/lib/module/memory/serializableMappingCache.native.js
++++ b/node_modules/react-native-worklets/lib/module/memory/serializableMappingCache.native.js
+@@ -20,10 +20,27 @@ For convenience we moved this cache to a separate file so it doesn't scare us wi
+ */
+
+ const cache = new WeakMap();
++function isWeakSerializableRef(value) {
++  const WeakRefConstructor = globalThis.WeakRef;
++  return WeakRefConstructor !== undefined && value instanceof WeakRefConstructor;
++}
+ export const serializableMappingCache = {
+   set(serializable, serializableRef) {
+     cache.set(serializable, serializableRef || serializableMappingFlag);
+   },
+-  get: cache.get.bind(cache)
++  // Native children can root callbacks whose closures reach the weak key.
++  // Only reconstructible clones use weak values; explicit bindings and remote
++  // persistent state must remain strongly mapped to preserve their identity.
++  setWeak(serializable, serializableRef) {
++    if (globalThis.WeakRef) {
++      cache.set(serializable, new WeakRef(serializableRef));
++    } else {
++      cache.set(serializable, serializableRef);
++    }
++  },
++  get(serializable) {
++    const cached = cache.get(serializable);
++    return isWeakSerializableRef(cached) ? cached.deref() : cached;
++  }
+ };
+ //# sourceMappingURL=serializableMappingCache.native.js.map
+diff --git a/node_modules/react-native-worklets/lib/typescript/memory/serializableMappingCache.native.d.ts b/node_modules/react-native-worklets/lib/typescript/memory/serializableMappingCache.native.d.ts
+index 9ba11b9..3824459 100644
+--- a/node_modules/react-native-worklets/lib/typescript/memory/serializableMappingCache.native.d.ts
++++ b/node_modules/react-native-worklets/lib/typescript/memory/serializableMappingCache.native.d.ts
+@@ -8,6 +8,7 @@ import type { SerializableRef } from './types';
+ export declare const serializableMappingFlag: unique symbol;
+ export declare const serializableMappingCache: {
+     set(serializable: object, serializableRef?: SerializableRef): void;
+-    get: (key: object) => symbol | SerializableRef | undefined;
++    setWeak(serializable: object, serializableRef: SerializableRef): void;
++    get(serializable: object): SerializableRef | symbol | undefined;
+ };
+ //# sourceMappingURL=serializableMappingCache.native.d.ts.map
+\ No newline at end of file
+diff --git a/node_modules/react-native-worklets/src/memory/serializable.native.ts b/node_modules/react-native-worklets/src/memory/serializable.native.ts
+index a48d2fd..a2616c2 100644
+--- a/node_modules/react-native-worklets/src/memory/serializable.native.ts
++++ b/node_modules/react-native-worklets/src/memory/serializable.native.ts
+@@ -426,7 +426,11 @@ function cloneArray<T extends unknown[]>(
+     clonedElements,
+     shouldPersistRemote
+   ) as SerializableRef<T>;
+-  serializableMappingCache.set(value, clone);
++  if (shouldPersistRemote) {
++    serializableMappingCache.set(value, clone);
++  } else {
++    serializableMappingCache.setWeak(value, clone);
++  }
+   serializableMappingCache.set(clone);
+
+   freezeObjectInDev(value);
+@@ -437,7 +441,7 @@ function cloneRemoteFunction<TArgs extends unknown[], TReturn>(
+   value: (...args: TArgs) => TReturn
+ ): SerializableRef<TReturn> {
+   const clone = WorkletsModule.createSerializableFunction(value);
+-  serializableMappingCache.set(value, clone);
++  serializableMappingCache.setWeak(value, clone);
+   serializableMappingCache.set(clone);
+
+   freezeObjectInDev(value);
+@@ -558,7 +562,11 @@ function clonePlainJSObject<TValue extends object>(
+     shouldPersistRemote,
+     value
+   ) as SerializableRef<TValue>;
+-  serializableMappingCache.set(value, clone);
++  if (shouldPersistRemote) {
++    serializableMappingCache.set(value, clone);
++  } else {
++    serializableMappingCache.setWeak(value, clone);
++  }
+   serializableMappingCache.set(clone);
+
+   freezeObjectInDev(value);
+@@ -578,7 +586,7 @@ function cloneMap<TValue extends Map<unknown, unknown>>(
+     clonedKeys,
+     clonedValues
+   ) as SerializableRef<TValue>;
+-  serializableMappingCache.set(value, clone);
++  serializableMappingCache.setWeak(value, clone);
+   serializableMappingCache.set(clone);
+
+   freezeObjectInDev(value);
+@@ -595,7 +603,7 @@ function cloneSet<TValue extends Set<unknown>>(
+   const clone = WorkletsModule.createSerializableSet(
+     clonedElements
+   ) as SerializableRef<TValue>;
+-  serializableMappingCache.set(value, clone);
++  serializableMappingCache.setWeak(value, clone);
+   serializableMappingCache.set(clone);
+
+   freezeObjectInDev(value);
+@@ -774,6 +782,9 @@ function freezeObjectInDev<TValue extends object>(value: TValue) {
+     Object.defineProperty(value, key, {
++      // Recreated weak clones must reuse these guards. In Hermes a new getter
++      // otherwise retains the previous descriptor and its getter environment.
++      configurable: false,
+       get() {
+         return element;
+       },
+       set() {
+         logger.warn(
+diff --git a/node_modules/react-native-worklets/src/memory/serializableMappingCache.native.ts b/node_modules/react-native-worklets/src/memory/serializableMappingCache.native.ts
+index f270194..464caac 100644
+--- a/node_modules/react-native-worklets/src/memory/serializableMappingCache.native.ts
++++ b/node_modules/react-native-worklets/src/memory/serializableMappingCache.native.ts
+@@ -21,11 +21,31 @@ During cloning we use `Object.entries` to iterate over the keys which throws an
+ For convenience we moved this cache to a separate file so it doesn't scare us with red squiggles.
+ */
+
+-const cache = new WeakMap<object, SerializableRef | symbol>();
++const cache = new WeakMap<object, SerializableRef | WeakRef<SerializableRef> | symbol>();
++
++function isWeakSerializableRef(value: unknown): value is WeakRef<SerializableRef> {
++  const WeakRefConstructor = globalThis.WeakRef;
++  return WeakRefConstructor !== undefined && value instanceof WeakRefConstructor;
++}
+
+ export const serializableMappingCache = {
+   set(serializable: object, serializableRef?: SerializableRef): void {
+     cache.set(serializable, serializableRef || serializableMappingFlag);
+   },
+-  get: cache.get.bind(cache),
++  // Native children can root callbacks whose closures reach the weak key.
++  // Only reconstructible clones use weak values; explicit bindings and remote
++  // persistent state must remain strongly mapped to preserve their identity.
++  setWeak(serializable: object, serializableRef: SerializableRef): void {
++    if (globalThis.WeakRef) {
++      cache.set(serializable, new WeakRef(serializableRef));
++    } else {
++      cache.set(serializable, serializableRef);
++    }
++  },
++  get(serializable: object): SerializableRef | symbol | undefined {
++    const cached = cache.get(serializable);
++    return isWeakSerializableRef(cached)
++      ? cached.deref()
++      : cached;
++  },
+ };

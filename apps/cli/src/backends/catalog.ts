@@ -6,10 +6,12 @@ import {
 } from '@happier-dev/protocol';
 import { BUILT_IN_CATALOG_DEFINED_ACP_AGENTS } from '@/agent/acp/catalog';
 import { agent as auggie } from '@/backends/auggie';
+import { agent as agy } from '@/backends/agy';
 import { agent as claude } from '@/backends/claude';
 import { agent as codex } from '@/backends/codex';
 import { agent as copilot } from '@/backends/copilot';
 import { agent as cursor } from '@/backends/cursor';
+import { agent as devin } from '@/backends/devin';
 import { agent as gemini } from '@/backends/gemini';
 import { agent as grok } from '@/backends/grok';
 import { agent as kimi } from '@/backends/kimi';
@@ -50,6 +52,7 @@ import {
 import type {
   ProviderTerminalAttachmentControlProbe,
   ProviderTerminalAttachmentRetirementHook,
+  TerminalAttachmentControlDescriptorStatus,
 } from './types';
 
 export type { AgentCatalogEntry, AgentChecklistContributions, CatalogAgentId, CliDetectSpec } from './types';
@@ -68,6 +71,8 @@ export const AGENTS: Partial<Record<CatalogAgentId, AgentCatalogEntry>> = {
   pi,
   copilot,
   cursor,
+  devin,
+  agy,
 };
 
 export function requireCatalogEntry(agentId: CatalogAgentId): AgentCatalogEntry {
@@ -89,12 +94,14 @@ export const notifyTerminalAttachmentRetiredThroughCatalog: ProviderTerminalAtta
   await Promise.all(hooks.map(async (hook) => await hook(params)));
 };
 
-export async function hasTerminalAttachmentControlDescriptorThroughCatalog(
+export async function resolveTerminalAttachmentControlDescriptorStatusThroughCatalog(
   agentId: AgentId | null | undefined,
   params: Parameters<ProviderTerminalAttachmentControlProbe>[0],
-): Promise<boolean> {
+): Promise<TerminalAttachmentControlDescriptorStatus> {
   const entry = AGENTS[resolveCatalogAgentId(agentId)];
-  return await entry?.hasTerminalAttachmentControlDescriptor?.(params) ?? false;
+  const probe = entry?.hasTerminalAttachmentControlDescriptor;
+  if (!probe) return 'not_applicable';
+  return await probe(params) ? 'available' : 'missing';
 }
 
 const cachedVendorResumeSupportPromises = new Map<CatalogAgentId, Promise<VendorResumeSupportFn>>();

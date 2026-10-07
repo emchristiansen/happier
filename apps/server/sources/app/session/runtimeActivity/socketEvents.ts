@@ -16,6 +16,7 @@ import {
 
 import type { SessionParticipantCursor } from '@/app/session/changeTracking/markSessionParticipantsChanged';
 import type { createSessionPublisherPresence } from '@/app/presence/sessionPublisherPresence';
+import { resolvePresenceTimeoutConfig } from '@/app/presence/timeout';
 import { describeLoggableError } from '@/utils/logging/describeLoggableError';
 import { warn } from '@/utils/logging/log';
 
@@ -39,10 +40,10 @@ const RELEASED_ALIVE_PERSISTENCE_INTERVAL_MS = 60_000;
  */
 const RELEASED_ALIVE_RETRY_BACKOFF_BASE_MS = 1_000;
 
-function resolveReleasedAliveRetryBackoffMs(consecutiveUnproductiveAttempts: number): number {
+function resolveReleasedAliveRetryBackoffMs(consecutiveUnproductiveAttempts: number, maxBackoffMs: number): number {
     if (consecutiveUnproductiveAttempts <= 1) return 0;
     const exponential = RELEASED_ALIVE_RETRY_BACKOFF_BASE_MS * 2 ** (consecutiveUnproductiveAttempts - 2);
-    return Math.min(RELEASED_ALIVE_PERSISTENCE_INTERVAL_MS, exponential);
+    return Math.min(maxBackoffMs, exponential);
 }
 
 async function serializeReleasedAliveOperation<T>(
@@ -77,6 +78,8 @@ export function registerSessionRuntimeActivitySnapshotSocketEvent(params: Readon
     nowMs?: () => number;
 }>): void {
     const nowMs = params.nowMs ?? (() => Date.now());
+    // Bound retained observations by expiry without changing the default settled-write cadence.
+    const observationRefreshWindowMs = resolvePresenceTimeoutConfig().sessionTimeoutMs / 2;
     const publishParticipants = async (published: Readonly<{
         participantCursors: readonly SessionParticipantCursor[];
         projection?: SessionRuntimeActivityProjection;
@@ -140,17 +143,37 @@ export function registerSessionRuntimeActivitySnapshotSocketEvent(params: Readon
     let legacyAliveInFlight = false;
     let nextLegacyAliveAttemptAtMs: number | null = null;
     let consecutiveUnproductiveLegacyAliveAttempts = 0;
+    let pendingLegacyAliveAtMs: number | null = null;
+    let legacyAliveTimer: ReturnType<typeof setTimeout> | null = null;
+    let legacyAliveStopped = false;
+
+    const clearPendingLegacyAlive = (): void => {
+        pendingLegacyAliveAtMs = null;
+        if (legacyAliveTimer !== null) clearTimeout(legacyAliveTimer);
+        legacyAliveTimer = null;
+    };
+    const stopLegacyAlive = (): void => {
+        legacyAliveStopped = true;
+        clearPendingLegacyAlive();
+    };
+    params.socket.on('disconnect', stopLegacyAlive);
 
     /** Arm the next allowed attempt from the outcome of the one that just settled. */
-    const armLegacyAliveAttemptWindow = (persisted: boolean): void => {
+    const armLegacyAliveAttemptWindow = (persisted: boolean, observedAtMs: number): void => {
         if (persisted) {
             consecutiveUnproductiveLegacyAliveAttempts = 0;
-            nextLegacyAliveAttemptAtMs = nowMs() + RELEASED_ALIVE_PERSISTENCE_INTERVAL_MS;
+            nextLegacyAliveAttemptAtMs = Math.min(
+                nowMs() + RELEASED_ALIVE_PERSISTENCE_INTERVAL_MS,
+                observedAtMs + observationRefreshWindowMs,
+            );
             return;
         }
         consecutiveUnproductiveLegacyAliveAttempts += 1;
         nextLegacyAliveAttemptAtMs = nowMs()
-            + resolveReleasedAliveRetryBackoffMs(consecutiveUnproductiveLegacyAliveAttempts);
+            + resolveReleasedAliveRetryBackoffMs(
+                consecutiveUnproductiveLegacyAliveAttempts,
+                Math.min(RELEASED_ALIVE_PERSISTENCE_INTERVAL_MS, observationRefreshWindowMs),
+            );
     };
 
     params.socket.on(SESSION_RUNTIME_ACTIVITY_SNAPSHOT_EVENT, async (value, acknowledge) => {
@@ -202,12 +225,14 @@ export function registerSessionRuntimeActivitySnapshotSocketEvent(params: Readon
             acknowledge?.({ status: 'rejected', reason: 'invalid_request' });
             return;
         }
+        clearPendingLegacyAlive();
         try {
             const result = await serializeReleasedAliveOperation(
                 params.presence,
                 async () => await params.presence.closePublisher({ socket: params.socket }),
             );
             if (result.status === 'closed') {
+                stopLegacyAlive();
                 await publishTransitionOnce('close', {
                     participantCursors: result.participantCursors,
                     active: false,
@@ -232,28 +257,40 @@ export function registerSessionRuntimeActivitySnapshotSocketEvent(params: Readon
         }
     });
 
-    params.socket.on(SESSION_PUBLISHER_LEGACY_ALIVE_EVENT, async (value) => {
-        const alive = SessionPublisherLegacyAliveSchema.safeParse(value);
-        if (!alive.success || alive.data.sid !== params.binding.sessionId) return;
-        if (legacyAliveInFlight) return;
-        if (nextLegacyAliveAttemptAtMs !== null && nowMs() < nextLegacyAliveAttemptAtMs) return;
+    const flushLegacyAlive = async (): Promise<void> => {
+        if (legacyAliveStopped || legacyAliveInFlight || pendingLegacyAliveAtMs === null) return;
+        if (nextLegacyAliveAttemptAtMs !== null && nowMs() < nextLegacyAliveAttemptAtMs) {
+            if (legacyAliveTimer === null) {
+                legacyAliveTimer = setTimeout(async () => {
+                    legacyAliveTimer = null;
+                    await flushLegacyAlive();
+                }, nextLegacyAliveAttemptAtMs - nowMs());
+                legacyAliveTimer.unref();
+            }
+            return;
+        }
+        const observedAtMs = pendingLegacyAliveAtMs;
+        clearPendingLegacyAlive();
         legacyAliveInFlight = true;
         try {
             const persisted = await serializeReleasedAliveOperation(params.presence, async () => {
-                const touched = await params.presence.touchPublisher({ socket: params.socket });
+                if (legacyAliveStopped) return { status: 'unchanged' as const };
+                const observedAt = new Date(observedAtMs);
+                const touched = await params.presence.touchPublisher({ socket: params.socket, observedAt });
                 if (touched.status === 'touched') {
                     return { status: 'touched' as const, touched };
                 }
-                if (touched.status !== 'unregistered') return { status: 'unchanged' as const };
+                if (touched.status !== 'unregistered' || legacyAliveStopped) return { status: 'unchanged' as const };
                 const registered = await params.presence.registerPublisher({
                     socket: params.socket,
                     binding: params.binding,
                     completeActivitySnapshot: { state: 'unknown', activeCount: 0 },
+                    observedAt,
                 });
                 if (registered.status !== 'registered') return { status: 'unchanged' as const };
                 return { status: 'registered' as const, registered };
             });
-            armLegacyAliveAttemptWindow(persisted.status !== 'unchanged');
+            armLegacyAliveAttemptWindow(persisted.status !== 'unchanged', observedAtMs);
             if (persisted.status === 'touched') {
                 await publishParticipants({
                     participantCursors: persisted.touched.participantCursors,
@@ -271,7 +308,7 @@ export function registerSessionRuntimeActivitySnapshotSocketEvent(params: Readon
                 });
             }
         } catch (error) {
-            armLegacyAliveAttemptWindow(false);
+            armLegacyAliveAttemptWindow(false, observedAtMs);
             warn(
                 { module: 'session-publisher-presence', error: describeLoggableError(error) },
                 'Failed to adapt released session-alive event',
@@ -280,18 +317,28 @@ export function registerSessionRuntimeActivitySnapshotSocketEvent(params: Readon
             // once the backoff armed above elapses.
         } finally {
             legacyAliveInFlight = false;
+            await flushLegacyAlive();
         }
+    };
+
+    params.socket.on(SESSION_PUBLISHER_LEGACY_ALIVE_EVENT, async (value) => {
+        const alive = SessionPublisherLegacyAliveSchema.safeParse(value);
+        if (!alive.success || alive.data.sid !== params.binding.sessionId || legacyAliveStopped) return;
+        pendingLegacyAliveAtMs = nowMs();
+        await flushLegacyAlive();
     });
 
     params.socket.on(SESSION_PUBLISHER_LEGACY_END_EVENT, async (value) => {
         const ended = SessionPublisherLegacyEndSchema.safeParse(value);
         if (!ended.success || ended.data.sid !== params.binding.sessionId) return;
+        clearPendingLegacyAlive();
         try {
             const result = await serializeReleasedAliveOperation(
                 params.presence,
                 async () => await params.presence.closePublisher({ socket: params.socket }),
             );
             if (result.status !== 'closed') return;
+            stopLegacyAlive();
             await publishTransitionOnce('close', {
                 participantCursors: result.participantCursors,
                 active: false,

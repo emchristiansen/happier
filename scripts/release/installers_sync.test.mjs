@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -78,6 +78,33 @@ test('syncInstallers copies all installer artifacts to website public directory'
     const actual = await readFile(join(targetDir, name), 'utf8');
     assert.equal(actual, expectedFixtureForTarget(name));
   }
+});
+
+test('syncInstallers projects the shared planet into canonical and published installers and checks source drift', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'happier-installer-planet-sync-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourceDir = join(root, 'source');
+  const targetDir = join(root, 'target');
+  await mkdir(sourceDir, { recursive: true });
+  for (const name of sourceFiles()) {
+    const art = ['install.sh', 'install.ps1'].includes(name)
+      ? '# BEGIN GENERATED PLANET\n# stale planet\n# END GENERATED PLANET\n'
+      : '';
+    await writeFile(join(sourceDir, name), fixtureForSource(name) + art, 'utf8');
+  }
+  await syncInstallers({ sourceDir, targetDir });
+  for (const name of ['install.sh', 'install.ps1']) {
+    const canonical = await readFile(join(sourceDir, name), 'utf8');
+    assert.doesNotMatch(canonical, /stale planet/, 'canonical installers must use the shared frame projection');
+    assert.equal(await readFile(join(targetDir, name), 'utf8'), canonical);
+  }
+  await syncInstallers({ sourceDir, targetDir, checkOnly: true });
+  const sourcePath = join(sourceDir, 'install.sh');
+  const cleanSource = await readFile(sourcePath, 'utf8');
+  const staleSource = cleanSource.replace(/(# BEGIN GENERATED PLANET\n)[\s\S]*?(# END GENERATED PLANET)/, '$1# stale planet\n$2');
+  await writeFile(sourcePath, staleSource);
+  await assert.rejects(syncInstallers({ sourceDir, targetDir, checkOnly: true }), /out of sync/);
+  assert.equal(await readFile(sourcePath, 'utf8'), staleSource, '--check must never repair source implicitly');
 });
 
 test('syncInstallers publishes preview and dev shortcut endpoints', () => {

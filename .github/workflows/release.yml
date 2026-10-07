@@ -703,6 +703,7 @@ jobs:
     if: ${{ inputs.dry_run != true && inputs.waive_ci != true && needs.plan.outputs.publish_server_runtime_needed == 'true' && needs.plan.outputs.risk_mysql_contract == 'true' }}
     permissions:
       contents: read
+      pull-requests: read
     uses: ./.github/workflows/extended-db-tests.yml
     with:
       checkout_sha: ${{ needs.plan.outputs.source_sha }}
@@ -1096,10 +1097,10 @@ jobs:
 
   deploy_ui:
     if: always() && needs.resolve_resume.result == 'success' && needs.deploy_plan.outputs.deploy_ui_resume_complete != 'true' && needs.plan.result == 'success' && needs.prepare_release_candidate.result == 'success' && needs.verify_release_candidates.result == 'success' && inputs.dry_run != true && needs.deploy_plan.outputs.deploy_ui_requested == 'true' && ((inputs.environment == 'production' && needs.promote_main.result == 'success') || (inputs.environment == 'preview' && needs.promote_preview.result == 'success'))
-    needs: [resolve_resume, plan, promote_preview, promote_main, deploy_plan, prepare_release_candidate, verify_release_candidates]
+    needs: [resolve_resume, plan, promote_preview, promote_main, deploy_plan, prepare_release_candidate, verify_release_candidates, publish_cli_binaries]
     permissions:
       contents: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/promote-ui.yml
     secrets: inherit
     with:
@@ -1112,7 +1113,16 @@ jobs:
       deploy_web: ${{ needs.deploy_plan.outputs.deploy_ui_web == 'true' }}
       expo_action: ${{ needs.deploy_plan.outputs.deploy_ui_expo_action }}
       desktop_mode: ${{ needs.deploy_plan.outputs.deploy_ui_desktop_mode }}
+      candidate_cli_version: ${{ needs.publish_cli_binaries.result == 'success' && needs.publish_cli_binaries.outputs.version || '' }}
       release_notes_id: ${{ inputs.release_notes_id }}
+      resume_desktop_artifacts: ${{ needs.resolve_resume.outputs.desktop_artifacts }}
+      resume_desktop_finalized_artifacts: ${{ needs.resolve_resume.outputs.desktop_finalized_artifacts }}
+      resume_desktop_run_number: ${{ needs.resolve_resume.outputs.desktop_run_number }}
+      resume_source_sha: ${{ needs.resolve_resume.outputs.source_sha }}
+      ui_ota_complete: ${{ needs.resolve_resume.outputs.ui_ota_complete == 'true' && needs.resolve_resume.outputs.deploy_ui_expo_action == inputs.ui_expo_action }}
+      ui_native_ios_complete: ${{ needs.resolve_resume.outputs.ui_native_ios_complete == 'true' && needs.resolve_resume.outputs.deploy_ui_expo_action == inputs.ui_expo_action }}
+      ui_native_android_complete: ${{ needs.resolve_resume.outputs.ui_native_android_complete == 'true' && needs.resolve_resume.outputs.deploy_ui_expo_action == inputs.ui_expo_action }}
+      ui_apk_complete: ${{ needs.resolve_resume.outputs.ui_apk_complete == 'true' && needs.resolve_resume.outputs.deploy_ui_expo_action == inputs.ui_expo_action }}
 
   deploy_server:
     if: always() && needs.resolve_resume.result == 'success' && needs.resolve_resume.outputs.deploy_server_complete != 'true' && needs.plan.result == 'success' && needs.prepare_release_candidate.result == 'success' && needs.verify_release_candidates.result == 'success' && needs.promote_server_runtime.result == 'success' && inputs.dry_run != true && needs.deploy_plan.outputs.deploy_server_requested == 'true' && ((inputs.environment == 'production' && needs.promote_main.result == 'success') || (inputs.environment == 'preview' && needs.promote_preview.result == 'success'))
@@ -1213,9 +1223,11 @@ jobs:
       candidate_ui_web_version: ${{ needs.publish_ui_web.outputs.version }}
       verify_stack_release: ${{ needs.publish_hstack_binaries.result == 'success' }}
       validation_profile: ${{ needs.plan.outputs.validation_profile }}
-      risk_cli_upgrade: ${{ needs.plan.outputs.risk_cli_upgrade == 'true' }}
-      risk_session_continuity: ${{ needs.plan.outputs.risk_session_continuity == 'true' }}
-      risk_relay_upgrade: ${{ needs.plan.outputs.risk_relay_upgrade == 'true' }}
+      # An earlier attempt may already have advanced the target branch, erasing its risk diff.
+      # Recheck applicable upgrade suites on resume; the registry still checks candidate inputs.
+      risk_cli_upgrade: ${{ needs.plan.outputs.risk_cli_upgrade == 'true' || inputs.resume_run_id != '' }}
+      risk_session_continuity: ${{ needs.plan.outputs.risk_session_continuity == 'true' || inputs.resume_run_id != '' }}
+      risk_relay_upgrade: ${{ needs.plan.outputs.risk_relay_upgrade == 'true' || inputs.resume_run_id != '' }}
       include_validation_suites: ${{ inputs.include_validation_suites }}
       waive_validation_suites: ${{ inputs.waive_validation_suites }}
 
@@ -1438,6 +1450,82 @@ jobs:
           (inputs.environment != 'production' && vars.HAPPIER_SERVER_API_PREVIEW_VERSION_URL == ''))
         run: |
           echo 'The server deployment was accepted, but this environment has no canonical API version URL configured; loaded-runtime identity remains unobserved.' >> "$GITHUB_STEP_SUMMARY"
+
+  publish_homebrew_tap:
+    name: Publish the Homebrew formula to the tap
+    # Renders Formula/happier.rb from the verified stable cli-v<version> release (real asset URLs,
+    # sha256 from its signed checksums) and commits it to the tap through the release bot app.
+    # A no-op until the tap exists: set the repository variable HOMEBREW_TAP_REPO_NAME (e.g.
+    # `homebrew-tap`) only after the tap repo is created and the release bot app is installed on it.
+    # The desktop cask lives in homebrew/cask, where BrewTestBot's autobump owns version bumps.
+    # A resumed release whose CLI promotion the origin run already verified skips
+    # promote_cli_binaries; the resume owner's completion and version stand in for it.
+    needs: [resolve_resume, publish_cli_binaries, promote_cli_binaries, release_verify]
+    if: >-
+      always() &&
+      inputs.environment == 'production' &&
+      inputs.dry_run != true &&
+      vars.HOMEBREW_TAP_REPO_NAME != '' &&
+      needs.release_verify.result == 'success' &&
+      (needs.promote_cli_binaries.result == 'success' || needs.resolve_resume.outputs.cli_rolling_complete == 'true') &&
+      (needs.publish_cli_binaries.outputs.version || needs.resolve_resume.outputs.cli_version) != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout trusted workflow control bytes
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.x
+      - name: Render the formula from the published release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CLI_VERSION: ${{ needs.publish_cli_binaries.outputs.version || needs.resolve_resume.outputs.cli_version }}
+        run: |
+          set -euo pipefail
+          node scripts/pipeline/release/render-homebrew-packages.mjs \
+            --cli-version "$CLI_VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --out-dir "$RUNNER_TEMP/homebrew"
+      - name: Create GitHub App token for the tap
+        id: tap_token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ vars.HOMEBREW_TAP_REPO_NAME }}
+          permission-contents: write
+      - name: Commit Formula/happier.rb when it changed
+        env:
+          GH_TOKEN: ${{ steps.tap_token.outputs.token }}
+          TAP_REPO: ${{ github.repository_owner }}/${{ vars.HOMEBREW_TAP_REPO_NAME }}
+          CLI_VERSION: ${{ needs.publish_cli_binaries.outputs.version || needs.resolve_resume.outputs.cli_version }}
+        run: |
+          set -euo pipefail
+          rendered="$RUNNER_TEMP/homebrew/Formula/happier.rb"
+          path="Formula/happier.rb"
+          current_sha=""
+          if gh api "repos/$TAP_REPO/contents/$path" > "$RUNNER_TEMP/tap-current.json" 2>/dev/null; then
+            current_sha="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).sha)' "$RUNNER_TEMP/tap-current.json")"
+            node -e 'const f=require("fs");const j=JSON.parse(f.readFileSync(process.argv[1],"utf8"));f.writeFileSync(process.argv[2],Buffer.from(j.content,"base64"))' \
+              "$RUNNER_TEMP/tap-current.json" "$RUNNER_TEMP/tap-current.rb"
+            if cmp -s "$RUNNER_TEMP/tap-current.rb" "$rendered"; then
+              echo "The tap already carries happier $CLI_VERSION." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+          args=(-X PUT "repos/$TAP_REPO/contents/$path" -f "message=happier $CLI_VERSION" -f "content=$(base64 -w0 "$rendered")")
+          if [ -n "$current_sha" ]; then args+=(-f "sha=$current_sha"); fi
+          gh api "${args[@]}" --jq '.commit.html_url' | tee -a "$GITHUB_STEP_SUMMARY"
 
   advance_release_issues:
     name: Advance issues to the released channel

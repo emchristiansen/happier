@@ -130,7 +130,7 @@ export function CockpitTabBar<TSurface extends string>(props: CockpitTabBarProps
                             key={tab.id}
                             testID={`${props.tabTestIdPrefix}${tab.id}`}
                             onPress={() => props.onSurfacePress(tab.id)}
-                            hitSlop={8}
+                            hitSlop={{ top: 8, bottom: 8 }}
                             // The visible label is optional (`tabBarShowLabels` defaults off), so the
                             // accessible name has to come from the definition rather than from a child
                             // Text that may not be rendered — otherwise the default bar is a row of

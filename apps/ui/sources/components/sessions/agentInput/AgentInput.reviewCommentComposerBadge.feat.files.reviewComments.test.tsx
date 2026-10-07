@@ -140,7 +140,7 @@ vi.mock('@/agents/catalog/catalog', () => ({
     }),
     getAgentBehavior: () => ({
         sessionUsage: {
-            supportsExactContextUsageBadge: false,
+            contextUsageBadge: 'hidden',
         },
     }),
 }));

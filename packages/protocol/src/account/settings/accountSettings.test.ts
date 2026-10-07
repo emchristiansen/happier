@@ -850,3 +850,12 @@ describe('isExpoPushNotificationChannelEnabled', () => {
     })).toBe(true);
   });
 });
+
+
+describe('focused computer notification preference', () => {
+  it('keeps suppression off for legacy/malformed settings and preserves explicit opt-in', () => {
+    expect(accountSettingsParse({}).notificationsSettingsV1.mutePhoneWhenComputerFocused).not.toBe(true);
+    expect(accountSettingsParse({ notificationsSettingsV1: { mutePhoneWhenComputerFocused: 'true' } }).notificationsSettingsV1.mutePhoneWhenComputerFocused).not.toBe(true);
+    expect(accountSettingsParse({ notificationsSettingsV1: { mutePhoneWhenComputerFocused: true } }).notificationsSettingsV1.mutePhoneWhenComputerFocused).toBe(true);
+  });
+});

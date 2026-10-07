@@ -1006,7 +1006,7 @@ await server.connect(new StdioServerTransport());
     if (provider.protocol !== 'acp') {
       throw new Error(`acp_set_model_dynamic only supports ACP providers (got ${provider.protocol})`);
     }
-    if (!['opencode', 'kilo', 'auggie', 'codex', 'cursor', 'grok_acp_stub'].includes(provider.id)) {
+    if (!['opencode', 'kilo', 'auggie', 'codex', 'cursor', 'grok_acp_stub', 'devin', 'fx', 'droid', 'kimi'].includes(provider.id)) {
       throw new Error(`acp_set_model_dynamic requires dynamic model providers (got ${provider.id})`);
     }
 

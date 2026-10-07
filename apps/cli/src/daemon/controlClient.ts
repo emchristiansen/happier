@@ -9,7 +9,7 @@ import { Metadata } from '@/api/types';
 import { projectPath } from '@/projectPath';
 import { existsSync, readFileSync, statSync } from 'fs';
 import { configuration } from '@/configuration';
-import { probeDaemonAuthenticatedControl } from './controlLiveness';
+import { inspectDaemonPublicationPresence, probeDaemonAuthenticatedControl, type DaemonPublicationPresenceInspection } from './controlLiveness';
 import type { SpawnDaemonSessionRequest } from '@/rpc/handlers/spawnSessionOptionsContract';
 import { DEFAULT_SESSION_WEBHOOK_TIMEOUT_MS } from '@/daemon/spawn/waitForSessionWebhook';
 import {
@@ -68,7 +68,7 @@ import {
   StopSessionResultSchema,
   type StopSessionResult,
 } from './sessions/stopSessionContract';
-import { readProcessRunState } from './processRunState';
+import { isPidAliveBySignal, readProcessRunState } from './processRunState';
 import { classifyDaemonLifecycleProcessByPid } from './doctor';
 
 export type DaemonControlRequestOptions = {
@@ -131,9 +131,9 @@ function resolveDaemonStateAgeMs(state: unknown): number | null {
   return null;
 }
 
-function resolveDaemonLockMtimeMs(): number | null {
+function resolveDaemonLockMtimeMs(lockFile = configuration.daemonLockFile): number | null {
   try {
-    const stat = statSync(configuration.daemonLockFile);
+    const stat = statSync(lockFile);
     if (Number.isFinite(stat.mtimeMs)) {
       return stat.mtimeMs;
     }
@@ -143,8 +143,8 @@ function resolveDaemonLockMtimeMs(): number | null {
   return null;
 }
 
-function resolveDaemonLockAgeMs(): number | null {
-  const mtimeMs = resolveDaemonLockMtimeMs();
+function resolveDaemonLockAgeMs(lockFile = configuration.daemonLockFile): number | null {
+  const mtimeMs = resolveDaemonLockMtimeMs(lockFile);
   return mtimeMs === null ? null : Math.max(0, Date.now() - mtimeMs);
 }
 
@@ -167,8 +167,15 @@ function resolvePositiveIntValue(
 function resolveDaemonControlTimeoutMs(path: string, options: DaemonControlRequestOptions): number | null {
   if (options.timeoutMs === null) return null;
   if (options.timeoutMs !== undefined) {
-    return resolvePositiveIntValue(options.timeoutMs, DEFAULT_DAEMON_HTTP_TIMEOUT_MS, { min: 100, max: 300_000 });
+    return resolvePositiveIntValue(options.timeoutMs, DEFAULT_DAEMON_HTTP_TIMEOUT_MS, {
+      min: 100,
+      max: path === EXECUTION_RUN_CONNECTED_SERVICE_MATERIALIZE_PATH ? 600_000 : 300_000,
+    });
   }
+
+  // Runner exit and terminal retirement belong to the daemon Stop lifecycle. An
+  // explicitly supplied caller timeout/signal still applies above and at fetch.
+  if (path === '/stop-session') return null;
 
   if (path === '/spawn-session') {
     const rawSpawnTimeout = process.env[DAEMON_SPAWN_HTTP_TIMEOUT_ENV_KEY];
@@ -223,15 +230,13 @@ export type DaemonRunningInspection =
   | { status: 'starting'; pid: number }
   | { status: 'running'; state: DaemonPersistedState };
 
-async function inspectDaemonLockStartupProgress(): Promise<DaemonRunningInspection | null> {
-  const lockPid = readDaemonLockPid();
+export async function inspectDaemonLockStartupProgress(lockFile = configuration.daemonLockFile, options: Readonly<{ unobservablePidIsUnverified?: boolean }> = {}): Promise<Readonly<{ status: 'starting' | 'unverified'; pid: number }> | null> {
+  const lockPid = readDaemonLockPid(lockFile);
   if (!lockPid) return null;
 
-  try {
-    process.kill(lockPid, 0);
-  } catch {
+  if (!isPidAliveBySignal(lockPid)) {
     admittedDaemonStartupLocks.delete(lockPid);
-    return null;
+    return options.unobservablePidIsUnverified ? { status: 'unverified', pid: lockPid } : null;
   }
 
   const ownerProcess = await classifyDaemonLifecycleProcessByPid(lockPid)
@@ -242,7 +247,7 @@ async function inspectDaemonLockStartupProgress(): Promise<DaemonRunningInspecti
       return null;
     }
 
-    const lockMtimeMs = resolveDaemonLockMtimeMs();
+    const lockMtimeMs = resolveDaemonLockMtimeMs(lockFile);
     if (lockMtimeMs !== null && admittedDaemonStartupLocks.get(lockPid) === lockMtimeMs) {
       const runState = await readProcessRunState(lockPid);
       if (runState === 'dead' || runState === 'zombie') {
@@ -253,17 +258,17 @@ async function inspectDaemonLockStartupProgress(): Promise<DaemonRunningInspecti
       return { status: 'starting', pid: lockPid };
     }
 
-    const lockAgeMs = resolveDaemonLockAgeMs();
+    const lockAgeMs = resolveDaemonLockAgeMs(lockFile);
     if (lockAgeMs !== null && lockAgeMs <= DAEMON_LOCK_UNCLASSIFIED_STARTUP_GRACE_MS) {
       logger.debug('[DAEMON RUN] Daemon lock is held by a fresh live unclassified process before state was written, treating startup as in progress');
       return { status: 'starting', pid: lockPid };
     }
 
-    logger.debug('[DAEMON RUN] Daemon lock is held by a stale live unclassified process before state was written, ignoring startup lock');
-    return null;
+    logger.debug('[DAEMON RUN] Daemon lock is held by a stale live unclassified process before state was written; stop ownership remains unverified');
+    return { status: 'unverified', pid: lockPid };
   }
 
-  const lockMtimeMs = resolveDaemonLockMtimeMs();
+  const lockMtimeMs = resolveDaemonLockMtimeMs(lockFile);
   if (lockMtimeMs !== null) admittedDaemonStartupLocks.set(lockPid, lockMtimeMs);
   logger.debug('[DAEMON RUN] Daemon lock is held by a live daemon before state was written, treating startup as in progress');
   return { status: 'starting', pid: lockPid };
@@ -273,7 +278,7 @@ export async function inspectDaemonRunningStateAndCleanupStaleState(): Promise<D
   const state = await readDaemonState();
   if (!state) {
     const lockStartup = await inspectDaemonLockStartupProgress();
-    if (lockStartup) return lockStartup;
+    if (lockStartup?.status === 'starting') return { status: 'starting', pid: lockStartup.pid };
     return { status: 'not-running' };
   }
 
@@ -286,6 +291,19 @@ export async function inspectDaemonRunningStateAndCleanupStaleState(): Promise<D
     process.kill(state.pid, 0);
   } catch (error) {
     if ((error as NodeJS.ErrnoException)?.code === 'ESRCH') {
+      if (state.controlToken) {
+        const hiddenPidLiveness = await probeDaemonAuthenticatedControl({
+          pid: state.pid,
+          httpPort: state.httpPort,
+          controlToken: state.controlToken,
+          timeoutMs: resolveDaemonPingTimeoutMs(),
+        });
+        if (hiddenPidLiveness === 'unreachable') return { status: 'starting', state };
+        if (hiddenPidLiveness === 'running') {
+          logger.debug('[DAEMON RUN] Daemon PID is hidden from this pid namespace but authenticated control answered, treating daemon as running');
+          return { status: 'running', state };
+        }
+      }
       logger.debug('[DAEMON RUN] Daemon PID is definitively not running, leaving daemon-owned state for startup replacement');
       return { status: 'not-running' };
     }
@@ -315,9 +333,10 @@ export async function inspectDaemonRunningStateAndCleanupStaleState(): Promise<D
         logger.debug('[DAEMON RUN] Daemon /ping rejected control token, preserving daemon-owned state for startup replacement');
         return { status: 'not-running' };
       }
-      if (liveness === 'pid_not_running') {
-        logger.debug('[DAEMON RUN] Daemon PID stopped during authenticated liveness probe, leaving daemon-owned state for startup replacement');
-        return { status: 'not-running' };
+      if (liveness === 'control_not_running') {
+        return ownerProcess.kind === 'not_daemon'
+          ? { status: 'not-running' }
+          : { status: 'starting', state };
       }
       if (liveness === 'running') {
         return { status: 'running', state };
@@ -358,16 +377,6 @@ async function daemonPost(path: string, body?: any, options: DaemonPostOptions =
   const state = await readDaemonState();
   if (!state?.httpPort) {
     const errorMessage = 'No daemon running, no state file found';
-    logger.debug(`[CONTROL CLIENT] ${errorMessage}`);
-    return {
-      error: errorMessage
-    };
-  }
-
-  try {
-    process.kill(state.pid, 0);
-  } catch (error) {
-    const errorMessage = 'Daemon is not running, file is stale';
     logger.debug(`[CONTROL CLIENT] ${errorMessage}`);
     return {
       error: errorMessage
@@ -704,11 +713,14 @@ export async function refreshDaemonClaudeSubscriptionAnthropicAuthTokensForBridg
 /**
  * A1: materialization is real work (staged home copy + a possible OAuth refresh + group selection),
  * so the materialize call gets its OWN bounded timeout instead of riding the generic 10s daemonPost
- * default — a 10s client abandonment while the daemon succeeds seconds later was the leak window.
- * Session precedent: the spawn webhook wait allows 5min; this defaults tighter at 2min.
+ * default. The daemon's serialized materialization owner may legitimately spend up to six minutes
+ * waiting behind an older root operation before beginning its own bounded refresh/copy/promotion
+ * work. A shorter client deadline abandons valid work, triggers compensating release, and makes the
+ * run start fail under load even though the daemon can still complete. Keep the client deadline at
+ * the existing ten-minute cap so it covers both phases while still bounding a genuinely stuck call.
  */
 const EXECUTION_RUN_CS_MATERIALIZE_TIMEOUT_ENV_KEY = 'HAPPIER_EXECUTION_RUN_CS_MATERIALIZE_TIMEOUT_MS';
-const DEFAULT_EXECUTION_RUN_CS_MATERIALIZE_TIMEOUT_MS = 120_000;
+const DEFAULT_EXECUTION_RUN_CS_MATERIALIZE_TIMEOUT_MS = 600_000;
 
 export function resolveExecutionRunConnectedServiceMaterializeTimeoutMs(
   env: NodeJS.ProcessEnv = process.env,
@@ -819,8 +831,11 @@ export async function listDaemonSessions(): Promise<any[]> {
   return result.children || [];
 }
 
-export async function stopDaemonSession(sessionId: string): Promise<StopSessionResult> {
-  const result = await daemonPost('/stop-session', { sessionId });
+export async function stopDaemonSession(
+  sessionId: string,
+  options: DaemonControlRequestOptions = {},
+): Promise<StopSessionResult> {
+  const result = await daemonPost('/stop-session', { sessionId }, options);
   return StopSessionResultSchema.parse(result);
 }
 
@@ -1046,101 +1061,187 @@ export async function isDaemonRunningCurrentlyInstalledHappyVersion(params: Read
   }
 }
 
-function readDaemonLockPid(): number | null {
+function readDaemonLockPid(lockFile = configuration.daemonLockFile, throwOnReadFailure = false): number | null {
   try {
-    if (!existsSync(configuration.daemonLockFile)) {
+    if (!throwOnReadFailure && !existsSync(lockFile)) {
       return null;
     }
 
-    const raw = readFileSync(configuration.daemonLockFile, 'utf-8').trim();
+    const raw = readFileSync(lockFile, 'utf-8').trim();
     const pid = Number.parseInt(raw, 10);
     if (!Number.isFinite(pid) || pid <= 0) {
       return null;
     }
 
     return pid;
-  } catch {
+  } catch (error) {
+    if (throwOnReadFailure && (error as NodeJS.ErrnoException | null)?.code !== 'ENOENT') throw error;
     return null;
   }
 }
 
-async function forceKillKnownDaemonPid(pid: number): Promise<void> {
+export type DaemonStopResult = Readonly<
+  | { status: 'not_running' }
+  | { status: 'stopped'; method: 'graceful' | 'force' }
+>;
+
+export type DaemonStopIncompleteReason =
+  | 'startup_in_progress'
+  | 'process_identity_unverified'
+  | 'graceful_stop_unconfirmed'
+  | 'force_kill_unconfirmed'
+  | 'control_client_failure';
+
+/** The process may retain local custody, so consumers must surface this failure. */
+export class DaemonStopIncompleteError extends Error {
+  readonly code = 'daemon_stop_incomplete';
+  readonly reason: DaemonStopIncompleteReason;
+  readonly pid: number | undefined;
+
+  constructor(input: Readonly<{ reason: DaemonStopIncompleteReason; pid?: number }>) {
+    super(input.pid === undefined
+      ? `Daemon stop is incomplete (${input.reason})`
+      : `Daemon stop is incomplete for PID ${input.pid} (${input.reason})`);
+    this.name = 'DaemonStopIncompleteError';
+    this.reason = input.reason;
+    this.pid = input.pid;
+  }
+}
+
+export function isDaemonStopIncompleteError(error: unknown): error is DaemonStopIncompleteError {
+  return error instanceof DaemonStopIncompleteError
+    || (typeof error === 'object' && error !== null
+      && (error as { code?: unknown }).code === 'daemon_stop_incomplete');
+}
+
+async function forceKillKnownDaemonPid(pid: number, observation?: PublishedDaemonOwnerObservation): Promise<DaemonStopResult> {
+  if (!isPidAliveBySignal(pid)) {
+    if (observation && await observation.isPresent()) {
+      throw new DaemonStopIncompleteError({ reason: 'process_identity_unverified', pid });
+    }
+    return { status: 'not_running' };
+  }
   const ownerProcess = await classifyDaemonLifecycleProcessByPid(pid)
     .catch(() => ({ kind: 'unknown' as const }));
   if (ownerProcess.kind !== 'daemon') {
-    logger.warn(`[CONTROL CLIENT] Refusing to force-kill PID ${pid} (does not look like a happier daemon process)`);
-    return;
+    throw new DaemonStopIncompleteError({ reason: 'process_identity_unverified', pid });
   }
 
   try {
     process.kill(pid, 'SIGTERM');
     await waitForProcessDeath(pid, 2000).catch(() => {});
-    try {
-      process.kill(pid, 0);
+    if (isPidAliveBySignal(pid)) {
       process.kill(pid, 'SIGKILL');
-    } catch {
-      // already exited
+      await waitForProcessDeath(pid, 2000).catch(() => {});
     }
-    logger.debug('Force killed daemon (SIGTERM/SIGKILL)');
   } catch (error) {
-    logger.debug('Daemon already dead');
+    logger.debug('[CONTROL CLIENT] Force stop signal failed', error);
   }
+  if (isPidAliveBySignal(pid)) {
+    throw new DaemonStopIncompleteError({ reason: 'force_kill_unconfirmed', pid });
+  }
+  return { status: 'stopped', method: 'force' };
 }
 
-export async function forceStopKnownDaemonPid(pid: number): Promise<void> {
-  await forceKillKnownDaemonPid(pid);
+export async function forceStopKnownDaemonPid(pid: number): Promise<DaemonStopResult> {
+  return await forceKillKnownDaemonPid(pid);
 }
 
-export async function stopDaemon(params: { stopSessions?: boolean } = {}) {
+export async function stopDaemon(params: { stopSessions?: boolean } = {}): Promise<DaemonStopResult> {
   try {
     const state = await readDaemonState();
     if (!state) {
       const lockStartup = await inspectDaemonLockStartupProgress();
       if (lockStartup) {
-        logger.debug('[CONTROL CLIENT] Daemon is still starting without state; refusing to stop startup lock PID');
-        return;
+        throw new DaemonStopIncompleteError({
+          reason: lockStartup.status === 'starting' ? 'startup_in_progress' : 'process_identity_unverified',
+          pid: lockStartup.pid,
+        });
       }
-
       const lockPid = readDaemonLockPid();
-      if (!lockPid) {
-        logger.debug('No daemon state found');
-        return;
-      }
-
-      logger.debug(`No daemon state found; falling back to daemon lock PID ${lockPid}`);
-      await forceKillKnownDaemonPid(lockPid);
-      return;
+      return lockPid ? await forceKillKnownDaemonPid(lockPid) : { status: 'not_running' };
     }
+    const observation = observePublishedDaemonOwner(state);
+    if (!await observation.isPresent()) return { status: 'not_running' };
 
-    logger.debug(`Stopping daemon with PID ${state.pid}`);
-
-    // Try HTTP graceful stop
     try {
       await stopDaemonHttp({ stopSessions: params.stopSessions === true });
-
-      // Wait for daemon to die
-      await waitForProcessDeath(state.pid, resolveDaemonStopWaitForDeathTimeoutMs());
-      logger.debug('Daemon stopped gracefully via HTTP');
-      return;
+      observation.acknowledgeStop();
+      await waitForProcessDeath(state.pid, resolveDaemonStopWaitForDeathTimeoutMs(), observation);
+      return { status: 'stopped', method: 'graceful' };
     } catch (error) {
-      logger.debug('HTTP stop failed, will force kill', error);
+      logger.debug('[CONTROL CLIENT] HTTP stop failed; checking verified force stop', error);
     }
-
-    await forceKillKnownDaemonPid(state.pid);
+    return await forceKillKnownDaemonPid(state.pid, observation);
   } catch (error) {
-    logger.debug('Error stopping daemon', error);
+    if (isDaemonStopIncompleteError(error)) throw error;
+    logger.debug('[CONTROL CLIENT] Error stopping daemon', error);
+    throw new DaemonStopIncompleteError({ reason: 'control_client_failure' });
   }
 }
 
-async function waitForProcessDeath(pid: number, timeout: number): Promise<void> {
+export async function inspectPublishedDaemonPresence(
+  state: Readonly<{ pid: number; httpPort: number; controlToken?: string }>,
+): Promise<DaemonPublicationPresenceInspection> {
+  return await inspectDaemonPublicationPresence({ ...state, timeoutMs: resolveDaemonPingTimeoutMs() });
+}
+
+export type PublishedDaemonOwnerObservation = Readonly<{
+  isPresent: () => Promise<boolean>;
+  hasHiddenPid: () => boolean;
+  acknowledgeStop: () => void;
+}>;
+
+/** Stop observes the existing lock before requesting shutdown; it never owns cleanup. */
+export function observePublishedDaemonOwner(
+  state: Readonly<{ pid: number; httpPort: number; controlToken?: string }>,
+  lockFile = configuration.daemonLockFile,
+  options: Readonly<{ unobservablePidIsUnverified?: boolean }> = {},
+): PublishedDaemonOwnerObservation {
+  let observedLock = false;
+  let hiddenPid = false;
+  let unobservablePid = false;
+  try {
+    observedLock = readDaemonLockPid(lockFile, true) === state.pid;
+  } catch {
+    // No readable matching lifecycle lock means hidden-process exit cannot be confirmed.
+  }
+  return {
+    hasHiddenPid: () => hiddenPid,
+    acknowledgeStop: () => { if (unobservablePid) hiddenPid = true; },
+    async isPresent() {
+      const inspection = await inspectPublishedDaemonPresence(state);
+      if (inspection.status === 'running') {
+        if (inspection.hiddenPid) hiddenPid = true;
+        return true;
+      }
+      if (inspection.status === 'unverified') {
+        unobservablePid = true;
+        return true;
+      }
+      // Ordinary dead publications remain absent. Stricter cleanup proof applies
+      // only after authenticated control established the hidden owner in this operation.
+      if (!hiddenPid) return options.unobservablePidIsUnverified === true;
+      if (!observedLock) return true;
+      // Control closes before final cleanup. Only release of the observed owner lock
+      // proves that the existing shutdown sequence reached its final exit phase.
+      try {
+        const lockPid = readDaemonLockPid(lockFile, true);
+        return lockPid === state.pid || (lockPid === null && existsSync(lockFile));
+      } catch {
+        return true;
+      }
+    },
+  };
+}
+
+async function waitForProcessDeath(pid: number, timeout: number, observation?: PublishedDaemonOwnerObservation): Promise<void> {
+  const isPresent = () => observation ? observation.isPresent() : Promise.resolve(isPidAliveBySignal(pid));
   const start = Date.now();
   while (Date.now() - start < timeout) {
-    try {
-      process.kill(pid, 0);
-      await new Promise(resolve => setTimeout(resolve, 100));
-    } catch {
-      return; // Process is dead
-    }
+    if (!await isPresent()) return;
+    await new Promise(resolve => setTimeout(resolve, 100));
   }
+  if (!await isPresent()) return;
   throw new Error('Process did not die within timeout');
 }

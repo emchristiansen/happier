@@ -169,7 +169,8 @@ vi.mock('@/sync/api/account/apiVendorTokens', () => ({
     disconnectVendorToken: vi.fn(async () => {}),
 }));
 
-vi.mock('@/sync/domains/profiles/profile', () => ({
+vi.mock('@/sync/domains/profiles/profile', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@/sync/domains/profiles/profile')>(),
     getDisplayName: () => 'Test User',
     getAvatarUrl: () => null,
     getBio: () => '',

@@ -1,0 +1,37 @@
+---
+title: Factory Droid CLI (experimental)
+description: Run Factory Droid through Happier with ACP sessions, dynamic controls, MCP tools, resume, and execution runs.
+---
+
+Happier runs your locally installed Factory Droid CLI through
+`droid exec --output-format acp`. The ordinary `droid` command remains the
+interactive terminal surface.
+
+## What you need first
+
+Install Droid with the [official Factory guide](https://docs.factory.ai/ide-integrations).
+Then start `droid` on the machine where Happier runs and complete the browser
+login flow when prompted. You can instead provide `FACTORY_API_KEY` in the
+runtime environment.
+
+## Start and resume sessions
+
+```bash
+happier droid
+```
+
+Happier supports fresh and resumed sessions, cancellation, execution runs, MCP
+tools, and the models, reasoning choices, and autonomy modes Droid advertises
+through ACP. Happier does not copy a static model list or guess a mode that the
+running Droid version did not advertise.
+
+## When it goes wrong
+
+- Run `droid --version` in the same environment as the Happier daemon.
+- Reopen `droid` to repair browser login, or verify `FACTORY_API_KEY` is present.
+- If a model or reasoning choice is missing, confirm that Droid advertises it to ACP.
+
+## Related
+
+- [Agent capabilities](/agents/capabilities)
+- [Provider authentication](/agents/provider-authentication)

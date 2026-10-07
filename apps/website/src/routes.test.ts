@@ -3,6 +3,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { AGENTS } from './data/agents';
+import { ANDROID_APK_URL, ANDROID_PLAY_URL, APP_STORE_URL } from './data/downloads';
 import { ROUTES, fileForRoute, findRoute, headTagsFor, routeManifest } from './routes';
 
 /**
@@ -15,6 +16,16 @@ import { ROUTES, fileForRoute, findRoute, headTagsFor, routeManifest } from './r
  */
 
 const REDIRECTS = readFileSync(path.resolve(__dirname, '../public/_redirects'), 'utf8');
+
+function redirectTarget(source: string): string | undefined {
+    for (const line of REDIRECTS.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const [candidate, target] = trimmed.split(/\s+/);
+        if (candidate === source) return target;
+    }
+    return undefined;
+}
 
 describe('route table', () => {
     it('gives every route a unique path', () => {
@@ -161,5 +172,16 @@ describe('route table', () => {
 
     it('never adds the SPA catch-all', () => {
         expect(REDIRECTS).not.toMatch(/^\s*\/\*\s+\/index\.html\s+200/m);
+    });
+
+    it('keeps the security page locally owned instead of shadowing it with a redirect', () => {
+        expect(findRoute('/security')).toBeDefined();
+        expect(redirectTarget('/security')).toBeUndefined();
+    });
+
+    it('keeps durable mobile short links on their canonical store and APK targets', () => {
+        expect(redirectTarget('/appstore')).toBe(APP_STORE_URL);
+        expect(redirectTarget('/playstore')).toBe(ANDROID_PLAY_URL);
+        expect(redirectTarget('/apk')).toBe(ANDROID_APK_URL);
     });
 });

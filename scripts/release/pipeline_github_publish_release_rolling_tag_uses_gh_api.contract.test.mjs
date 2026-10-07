@@ -80,6 +80,14 @@ if [ "$1" = "api" ]; then
     echo "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     exit 0
   fi
+  if echo "$*" | grep -q "repos/test/test/releases/tags/dev-test --jq .id"; then
+    echo "123"
+    exit 0
+  fi
+  if echo "$*" | grep -q "repos/test/test/releases/123 --jq .target_commitish"; then
+    echo "0123456789abcdef0123456789abcdef01234567"
+    exit 0
+  fi
   exit 0
 fi
 
@@ -135,6 +143,12 @@ exit 0
   assert.match(log, /\s-F\s+force=true\b/);
   assert.doesNotMatch(log, /\s-f\s+force=true\b/);
   assert.match(log, /gh release create dev-test --prerelease --title Dev Test --notes Approved exact candidate notes\./);
+  assert.match(
+    log,
+    /gh api -X PATCH repos\/test\/test\/releases\/123 -f target_commitish=0123456789abcdef0123456789abcdef01234567/,
+    'the rolling GitHub Release object must bind the same exact SHA as its tag ref',
+  );
+  assert.match(log, /gh api repos\/test\/test\/releases\/123 --jq \.target_commitish/);
   assert.match(log, /gh release edit dev-test --title Dev Test --notes Approved exact candidate notes\./);
   assert.doesNotMatch(log, /--generate-notes/);
   assert.doesNotMatch(log, /Rolling dev build\.|Full diff:|### Commits/);

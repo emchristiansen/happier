@@ -85,6 +85,7 @@ async function loadProviderWithModules(
 }
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   vi.clearAllMocks();
   vi.resetModules();
   vi.unmock('node:module');
@@ -261,6 +262,22 @@ describe('createNodePtyProvider', () => {
     expect(spawned).toBe(pty);
     expect(nodePty.spawn).toHaveBeenCalledTimes(1);
     expect(homebridge.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses the existing external fallback on POSIX Bun instead of the non-writable Homebridge backend', async () => {
+    vi.stubGlobal('Bun', {});
+    const externalPty = createFakeProcess();
+    const homebridgePty = createFakeProcess();
+    const { provider } = await loadProviderWithModules({
+      'node-pty': { spawn: () => { throw new Error('native unavailable'); } },
+      '@homebridge/node-pty-prebuilt-multiarch': { spawn: () => homebridgePty },
+    }, {
+      platform: 'linux',
+      fallbackProvider: { spawn: () => externalPty },
+      fallbackBackendName: 'python-relay',
+    });
+
+    expect(provider.spawn({ file: '/bin/sh', args: [], options: {} })).toBe(externalPty);
   });
 
   it('uses homebridge when node-pty is missing', async () => {

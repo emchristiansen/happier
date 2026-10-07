@@ -24,7 +24,7 @@ type PendingRow = {
 type AuthStatus = 401 | 403;
 type SupervisedClientInternals = Readonly<{
   currentConnectionState: ManagedConnectionState;
-  sessionConnectionSupervisor: ManagedConnectionSupervisor & Required<Pick<ManagedConnectionSupervisor, 'reportProbeResult'>>;
+  sessionConnectionSupervisor: ManagedConnectionSupervisor & Required<Pick<ManagedConnectionSupervisor, 'captureProbeReportScope' | 'reportProbeResult'>>;
 }>;
 
 async function expectAuthenticationRejection(promise: Promise<unknown>, status: AuthStatus): Promise<void> {
@@ -195,17 +195,18 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
     expect(reportProbeResult).toHaveBeenCalledWith(expect.objectContaining({
       status: 'auth_failed',
       statusCode: 401,
-    }));
+    }), expect.any(Object));
     await expectSessionAuthFailed(client);
   });
 
   it('fails pending list calls before HTTP when the session supervisor is auth_failed', async () => {
     const client = await createClient();
-    supervisedInternals(client).sessionConnectionSupervisor.reportProbeResult({
+    const supervisor = supervisedInternals(client).sessionConnectionSupervisor;
+    supervisor.reportProbeResult({
       status: 'auth_failed',
       statusCode: 401,
       errorMessage: 'expired token',
-    });
+    }, supervisor.captureProbeReportScope());
 
     await expectSessionAuthFailed(client);
     await expectAuthenticationRejection(client.listPendingMessageQueueV2LocalIds(), 401);
@@ -241,18 +242,19 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
     expect(reportProbeResult).toHaveBeenCalledWith(expect.objectContaining({
       status: 'auth_failed',
       statusCode: 403,
-    }));
+    }), expect.any(Object));
     await expectSessionAuthFailed(client);
   });
 
   it('fails pending discard calls before HTTP when the session supervisor is auth_failed', async () => {
     pendingRows = [{ localId: 'a', status: 'queued', deliveryState: null }];
     const client = await createClient();
-    supervisedInternals(client).sessionConnectionSupervisor.reportProbeResult({
+    const supervisor = supervisedInternals(client).sessionConnectionSupervisor;
+    supervisor.reportProbeResult({
       status: 'auth_failed',
       statusCode: 401,
       errorMessage: 'expired token',
-    });
+    }, supervisor.captureProbeReportScope());
 
     await expectSessionAuthFailed(client);
     await expectAuthenticationRejection(client.discardPendingMessageQueueV2All({ reason: 'manual' }), 401);

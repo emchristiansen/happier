@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { Platform, View, useWindowDimensions } from 'react-native';
 import { MultiPaneHostWithBottom } from '@/components/ui/panels/MultiPaneHostWithBottom';
-import { resolvePaneLayout } from '@/components/ui/panels/paneBreakpoints';
+import { resolvePaneLayout, type ResolvePaneLayoutInput } from '@/components/ui/panels/paneBreakpoints';
 import { resolveBottomPaneLayout } from '@/components/ui/panels/resolveBottomPaneLayout';
 import { useDeviceType } from '@/utils/platform/responsive';
 import { useLocalSetting, useLocalSettingMutable } from '@/sync/domains/state/storage';
@@ -9,6 +9,8 @@ import { useAppPaneContext } from './AppPaneProvider';
 import { PANE_SIZING_DEFAULTS, resolveDockedPaneSizing, resolveScaledPaneHeightPx, resolveScaledPaneHeightPxUncapped, resolveScaledPaneWidthPx, resolveScaledPaneWidthPxUncapped } from './layout/paneSizing';
 import { resolveMultiPaneDeviceType } from './layout/resolveMultiPaneDeviceType';
 import { applyPaneFocusModeLayoutOverride } from './layout/applyPaneFocusModeLayoutOverride';
+import { useAppPaneActionRailVisible } from './hooks/useAppPaneActionRailVisible';
+import { PaneActionRailContext, PANE_ACTION_RAIL_WIDTH } from './PaneActionRailContext';
 
 export type AppPaneScopeHostProps = Readonly<{
     scopeId: string;
@@ -23,7 +25,7 @@ export const AppPaneScopeHost = React.memo((props: AppPaneScopeHostProps) => {
     const deviceType = useDeviceType();
     const multiPaneDeviceType = resolveMultiPaneDeviceType({ platform: Platform.OS, deviceType });
     const { width: windowWidthPx, height: windowHeightPx } = useWindowDimensions();
-    const [containerWidthPx, setContainerWidthPx] = React.useState<number>(windowWidthPx);
+    const [hostWidthPx, setContainerWidthPx] = React.useState<number>(windowWidthPx);
     const [containerHeightPx, setContainerHeightPx] = React.useState<number>(windowHeightPx);
     const [rightDragWidthPx, setRightDragWidthPx] = React.useState<number | null>(null);
     const [detailsDragWidthPx, setDetailsDragWidthPx] = React.useState<number | null>(null);
@@ -59,6 +61,8 @@ export const AppPaneScopeHost = React.memo((props: AppPaneScopeHostProps) => {
         && (rightOpen || detailsOpen);
 
     const driver = React.useMemo(() => getDriver(props.scopeId), [driverRegistryVersion, getDriver, props.scopeId]);
+    const showActionRail = useAppPaneActionRailVisible(props.scopeId);
+    const containerWidthPx = Math.max(0, hostWidthPx - (showActionRail ? PANE_ACTION_RAIL_WIDTH : 0));
 
     // `MultiPaneHost` uses pane node presence as the logical "open" signal. Keep the
     // nodes null when closed so hidden layouts don't accidentally mount expensive panes.
@@ -169,7 +173,7 @@ export const AppPaneScopeHost = React.memo((props: AppPaneScopeHostProps) => {
         storedEffectiveRightDockWidthPx,
     ]);
 
-    const resolvedLayoutBase = resolvePaneLayout({
+    const paneLayoutInput = {
         containerWidthPx,
         deviceType: multiPaneDeviceType,
         multiPaneEnabled,
@@ -183,7 +187,9 @@ export const AppPaneScopeHost = React.memo((props: AppPaneScopeHostProps) => {
         detailsMinPx: PANE_SIZING_DEFAULTS.details.minPx,
         rightPreferredPx: rightPreferredPxForLayout,
         detailsPreferredPx: detailsPreferredPxForLayout,
-    });
+    } satisfies ResolvePaneLayoutInput;
+
+    const resolvedLayoutBase = resolvePaneLayout(paneLayoutInput);
 
     const resolvedLayout = applyPaneFocusModeLayoutOverride({
         paneFocusModeActive,
@@ -191,6 +197,14 @@ export const AppPaneScopeHost = React.memo((props: AppPaneScopeHostProps) => {
         detailsOpen,
         baseLayout: resolvedLayoutBase,
     });
+    // A closed sidebar is hidden too; project its open layout before deciding whether Review must yield.
+    const rightPaneHiddenByDetails = detailsOpen && applyPaneFocusModeLayoutOverride({
+        paneFocusModeActive,
+        rightOpen: true,
+        detailsOpen,
+        baseLayout: resolvePaneLayout({ ...paneLayoutInput, rightOpen: true }),
+    }).right === 'hidden';
+    const railContext = React.useMemo(() => ({ visible: showActionRail, contentWidthPx: containerWidthPx, rightPaneHiddenByDetails }), [showActionRail, containerWidthPx, rightPaneHiddenByDetails]);
 
     // NOTE: When both panes are open on narrow widths, `resolvePaneLayout` can return `overlayStack`
     // with `right: 'hidden'` + `details: 'overlay'`. We intentionally keep the right pane "open"
@@ -387,8 +401,9 @@ export const AppPaneScopeHost = React.memo((props: AppPaneScopeHostProps) => {
     }, [containerHeightPx, setBottomPaneHeightBasisPx, setBottomPaneHeightPx]);
 
     return (
+        <PaneActionRailContext.Provider value={railContext}>
         <View
-            style={{ flex: 1, minHeight: 0, minWidth: 0 }}
+            style={{ flex: 1, minHeight: 0, minWidth: 0, flexDirection: 'row' }}
             onLayout={(event) => {
                 const next = Math.round(event?.nativeEvent?.layout?.width ?? 0);
                 if (Number.isFinite(next) && next > 0) {
@@ -427,6 +442,8 @@ export const AppPaneScopeHost = React.memo((props: AppPaneScopeHostProps) => {
                 onCommitBottomDockHeightPx={onCommitBottomDockHeightPx}
                 onDragBottomDockHeightPx={setBottomDragHeightPx}
             />
+            {showActionRail ? driver?.renderActionRail?.({ scopeId: props.scopeId }) : null}
         </View>
+        </PaneActionRailContext.Provider>
     );
 });

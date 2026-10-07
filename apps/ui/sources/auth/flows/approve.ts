@@ -8,18 +8,42 @@ interface AuthRequestStatus {
 
 export type AuthApproveResult = 'approved' | 'already_authorized' | 'not_found';
 
+/** The relay accepted the request but no response payload the caller offered was compatible. */
+export class AuthApproveUnsupportedResponseError extends Error {
+    constructor() {
+        super('Failed to approve auth request: no compatible response payload available');
+        this.name = 'AuthApproveUnsupportedResponseError';
+    }
+}
+
 type AuthApproveAnswer = Uint8Array | (() => Uint8Array);
+
+export type AuthApproveOptions = Readonly<{
+    /**
+     * Address both requests at this exact relay instead of the focused one. `serverFetch` refuses
+     * an authenticated request whose origin differs from the active server, so a caller holding a
+     * target-scoped token (desktop setup approval) fails closed rather than posting that token to
+     * whichever relay happens to be focused.
+     */
+    endpointUrl?: string;
+}>;
+
+function resolveAuthRequestPath(path: string, endpointUrl: string | undefined): string {
+    const base = String(endpointUrl ?? '').trim().replace(/\/+$/, '');
+    return base ? `${base}${path}` : path;
+}
 
 export async function authApprove(
     token: string,
     publicKey: Uint8Array,
     answerV1: AuthApproveAnswer,
     answerV2: AuthApproveAnswer,
+    options: AuthApproveOptions = {},
 ): Promise<AuthApproveResult> {
     const publicKeyBase64 = encodeBase64(publicKey);
     
     // First, check the auth request status
-    const statusResponse = await serverFetch(`/v1/auth/request/status?publicKey=${encodeURIComponent(publicKeyBase64)}`, {
+    const statusResponse = await serverFetch(resolveAuthRequestPath(`/v1/auth/request/status?publicKey=${encodeURIComponent(publicKeyBase64)}`, options.endpointUrl), {
         method: 'GET',
     }, { includeAuth: false });
     if (!statusResponse.ok) {
@@ -62,10 +86,10 @@ export async function authApprove(
         }
 
         if (!responsePayload) {
-            throw new Error('Failed to approve auth request: no compatible response payload available');
+            throw new AuthApproveUnsupportedResponseError();
         }
 
-        const response = await serverFetch('/v1/auth/response', {
+        const response = await serverFetch(resolveAuthRequestPath('/v1/auth/response', options.endpointUrl), {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${token}`,

@@ -2,11 +2,14 @@ import * as React from 'react';
 
 import {
     buildAcpConfigOptionOverridesV1FromConfigOptions,
+    type AccountProfile,
     type FeatureDecision,
     type SessionAgentTransitionSelectionV1,
 } from '@happier-dev/protocol';
 
+import { getAgentCore } from '@/agents/catalog/catalog';
 import type { ResolvedBackendCatalogEntry } from '@/agents/backendCatalog/getResolvedBackendCatalogEntries';
+import { resolveNewSessionConnectedServicesBindingsForAgent } from '@/components/sessions/new/modules/connectedServicesNewSessionBindings';
 import {
     APPLIED_RUNTIME_MARKER_ICON,
     APPLIED_RUNTIME_MARKER_RAIL_SIZE,
@@ -18,7 +21,6 @@ import { announceAccessibilityMessage } from '@/components/ui/accessibility/anno
 import { Icon } from '@/components/ui/icons/Icon';
 import { randomUUID } from '@/platform/randomUUID';
 import { t } from '@/text';
-import { isHoverCapablePrimaryPointer } from '@/utils/platform/webMobileHeuristics';
 
 import { existingSessionDraftSemanticValues } from '@/sync/domains/input/drafts/existingSessionDraftSemanticValues';
 import {
@@ -170,6 +172,9 @@ export type SessionAgentPickerTargetDetailContext = Readonly<{
     machineId: string | null;
     cwd: string | null;
     profileId?: string | null;
+    accountProfileConnectedServicesV2?: AccountProfile['connectedServicesV2'];
+    connectedServicesFeatureEnabled?: boolean;
+    accountGroupsFeatureEnabled?: boolean;
 }>;
 
 /**
@@ -293,9 +298,8 @@ export type InSessionAgentPickerControls = Readonly<{
     /** Captures the exact canonical user-message request before transition dispatch. */
     recordArmedContinuationSubmission: (submission: SessionArmedAgentContinuationSubmission) => boolean;
     /**
-     * The reader is reaching for the Agent chip — hovering it, focusing it, or
-     * pressing it down. Continuation support is inspected from here, so a Session
-     * whose picker is never approached asks its machine nothing.
+     * The picker descriptor became active through hover, focus, press, or an
+     * overflow action. This is the single demand signal for live inspection.
      */
     onAgentPickerIntent: () => void;
     /**
@@ -382,9 +386,6 @@ export function useInSessionAgentPickerControls(
     const draftSnapshot = React.useSyncExternalStore(subscribeToDraft, readDraftSnapshot, readDraftSnapshot);
 
     const currentAgentAppliedStatus = resolveAppliedRuntimeStatus(params.currentAgentSessionActive);
-    // Read once per mount rather than at module evaluation: this file is reached
-    // from the session shell, and importing it must not touch `window`.
-    const pointerCanSignalIntent = React.useMemo(() => isHoverCapablePrimaryPointer(), []);
 
     const [armed, setArmed] = React.useState<ArmedAgentContinuation | null>(null);
     const persistedArmedContinuation = draftSessionId === null
@@ -424,20 +425,13 @@ export function useInSessionAgentPickerControls(
     // Whether the composer's Agent picker is on screen. Its only job is to scope
     // the rail decision below to one open popover.
     const [pickerVisible, setPickerVisible] = React.useState(false);
-    // Whether the reader has reached for the Agent chip on this Session yet.
-    // One-way: an answer is cached for the whole connection, so there is nothing to
-    // give back by forgetting the intent that bought it.
-    const [pickerApproached, setPickerApproached] = React.useState(false);
+    // One-way demand for this mounted descriptor. A visible chip, keyboard focus,
+    // pointer hover, press, or collapsed-overflow action all route here. Merely
+    // mounting the composer never inspects its machine.
+    const [pickerDemanded, setPickerDemanded] = React.useState(false);
     const signalAgentPickerIntent = React.useCallback(() => {
-        setPickerApproached((current) => (current ? current : true));
+        setPickerDemanded(true);
     }, []);
-
-    // A Session the reader already armed HAS been approached — in an earlier mount,
-    // with the choice carried across it by the draft. Demanding the gesture again
-    // would leave the composer promising "Continue with {Agent}" while the rail it
-    // depends on is still undecided, so the persisted arm is its own intent signal.
-    const hasPersistedArmedContinuation = persistedArmedContinuation !== undefined;
-
     const targetEntries = React.useMemo(() => entries.filter((entry) => (
         entry.targetKey !== source.currentBackendTargetKey
     )), [entries, source.currentBackendTargetKey]);
@@ -473,31 +467,16 @@ export function useInSessionAgentPickerControls(
             : []
     ), [featureEnabled, sessionReason, targetEntries, targetSelectionByTargetKey]);
 
-    // The rail decision has to be settled BEFORE the popover paints, or the
-    // popover opens at one width and then grows by the width of the rail. That is
-    // the same defect as a rail appearing and vanishing, seen as geometry.
-    //
-    // Asking when the popover opens is structurally too late: the machine round
-    // trip and the popover's own mount take about the same time, so which one wins
-    // is a coin flip, and the reader sees the loser.
-    //
-    // So the question is asked on APPROACH instead. A pointer has to travel over
-    // the Agent chip to click it and a keyboard has to focus it, which is a real
-    // head start; where the primary pointer can give none — a finger — the
-    // question falls back to being asked as soon as the rail is a live possibility
-    // for this Session, because a late rail is a worse outcome than an early ask.
-    //
-    // It is never asked for every Session regardless. `inspectableTargetAgentIds`
-    // is already empty for a closed gate, a read-only or external Session and one
-    // with no other Agent; the inspection hook never calls a machine it knows is
-    // offline; and one answer serves the whole realtime connection.
+    // Inspect only after this descriptor is approached or opened. The batch owner
+    // still asks every currently visible target together, and keeps the released
+    // single-target RPC solely as its old-daemon fallback.
     const inspections = useSessionContinuationInspections({
         sessionId,
         machine: params.machine,
         machinePresence: source.machinePresence,
         targetSelections: inspectableTargetSelections,
         demanded: inspectableTargetSelections.length > 0
-            && (pickerApproached || hasPersistedArmedContinuation || !pointerCanSignalIntent),
+            && (pickerDemanded || persistedArmedContinuation !== undefined),
     });
     const readInspection = inspections.read;
 
@@ -546,23 +525,24 @@ export function useInSessionAgentPickerControls(
     // steady answer, and a rail frozen on the optimistic pending value would be a
     // list of dead rows, which is worse still.
     //
-    // So the decision moves in one direction per open. It starts at "no rail",
-    // becomes "rail" the moment one target is proven switchable, and settles at
-    // "no rail" once every target has answered and none was. Whichever it reaches
-    // first is what that popover keeps until it closes. In practice the answers
-    // arrive while the popover is still mounting, so the reader sees a decided
-    // popover; a warm cache — every reopen on the same connection — decides
-    // before the first render.
+    // So the decision moves in one direction per open. It starts without a rail,
+    // publishes the current batch result as soon as one target is proven
+    // switchable, and then keeps that rail until close. A later reconnect or
+    // presence change cannot remove the cancellation gesture from an open picker.
     //
     // While the picker is closed the live value is used directly: nothing is on
     // screen to disturb, and the next open must start from the truth.
     const railLatchRef = React.useRef<Readonly<{ open: boolean; decided: boolean | null }>>(
         { open: false, decided: null },
     );
+    if (pickerVisible && railOffersRowsNow && railLatchRef.current.decided !== true) {
+        railLatchRef.current = { open: true, decided: true };
+    }
     const railOffersRows = pickerVisible
         ? railLatchRef.current.decided === true
         : railOffersRowsNow;
     const onAgentPickerVisibilityChange = React.useCallback((visible: boolean) => {
+        if (visible) signalAgentPickerIntent();
         // The visibility event, rather than a later render, defines a popover's
         // semantic start. A close and reopen batched by React must therefore
         // take a fresh snapshot instead of carrying the prior open's geometry.
@@ -573,7 +553,7 @@ export function useInSessionAgentPickerControls(
             };
         }
         setPickerVisible(visible);
-    }, [railOffersRowsNow]);
+    }, [railOffersRowsNow, signalAgentPickerIntent]);
 
     // UI rail visibility and arm validity deliberately diverge during a fresh
     // inspection. A changed runtime pair turns every cached answer into
@@ -879,6 +859,15 @@ export function useInSessionAgentPickerControls(
                         capabilityServerId: params.detail.capabilityServerId,
                         cwd: params.detail.cwd,
                         profileId: params.detail.profileId ?? null,
+                        connectedServices: resolveNewSessionConnectedServicesBindingsForAgent({
+                            agentId: entry.providerAgentId,
+                            agentCore: getAgentCore(entry.providerAgentId),
+                            agentOptionState: null,
+                            accountProfileConnectedServicesV2: params.detail.accountProfileConnectedServicesV2 ?? [],
+                            settings: params.detail.settings,
+                            connectedServicesFeatureEnabled: params.detail.connectedServicesFeatureEnabled === true,
+                            accountGroupsFeatureEnabled: params.detail.accountGroupsFeatureEnabled === true,
+                        }).connectedServicesBindingsPayload,
                         settings: params.detail.settings,
                         // The same disclosure, told truthfully for this Session:
                         // an empty transcript has no conversation to carry, so the

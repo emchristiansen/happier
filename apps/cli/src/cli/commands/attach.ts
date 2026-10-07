@@ -1,21 +1,33 @@
 import chalk from 'chalk';
 
-import { inferAgentIdFromSessionMetadata, type AgentId } from '@happier-dev/agents';
+import {
+  getAgentLocalControlCapabilityForSession,
+  inferAgentIdFromSessionMetadata,
+  type AgentId,
+} from '@happier-dev/agents';
 
 import { getProviderAttachOps } from '@/backends/catalog';
+import type { ProviderAttachOps } from '@/backends/types';
+import type { Metadata } from '@/api/types';
 import { configuration } from '@/configuration';
 import { readCredentials, readSettings, type Credentials, type Settings } from '@/persistence';
 import { resolveSessionIdOrPrefix } from '@/session/query/resolveSessionId';
 import { fetchSessionById, fetchSessionsPage, type RawSessionListRow, type RawSessionRecord } from '@/session/transport/http/sessionsHttp';
-import { tryDecryptSessionMetadata } from '@/session/transport/encryption/sessionEncryptionContext';
-import { createProviderAttachStatePublisher } from '@/agent/localControl/createProviderAttachStatePublisher';
+import { tryDecryptSessionMetadata, resolveSessionEncryptionContextFromCredentials, resolveSessionStoredContentEncryptionMode } from '@/session/transport/encryption/sessionEncryptionContext';
+import { callSessionRpc } from '@/session/transport/rpc/sessionRpc';
+import { probeSessionRunnerPresence } from '@/daemon/sessions/isSessionRunnerActive';
+import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
 import {
   readTerminalAttachmentInfo,
+  readTerminalAttachmentState,
+  terminalAttachmentMatchesTerminal,
   type TerminalAttachmentInfo,
 } from '@/terminal/attachment/terminalAttachmentInfo';
 import { isTmuxAvailable } from '@/integrations/tmux';
 import { runTmuxAttach } from '@/terminal/attachment/tmuxAttach';
 import { runZellijAttach } from '@/terminal/attachment/zellijAttach';
+import { runHerdrAttach } from '@/terminal/attachment/herdrAttach';
+import { runTerminalHostAttach } from '@/terminal/attachment/runTerminalHostAttach';
 import { focusWindowsTerminalWindow } from '@/terminal/attachment/windowsTerminalAttach';
 import { focusWindowsConsoleWindow } from '@/terminal/attachment/windowsConsoleAttach';
 import { canUseInkSelector, runSessionActionSelector } from '@/ui/ink/runSessionActionSelector';
@@ -25,13 +37,14 @@ import {
   explainAttachIneligibility,
   type AgentAttachStrategyForExplainer,
 } from '@/session/attach/explainAttachIneligibility';
-import { getAgentLocalControlCapability } from '@happier-dev/agents';
 import { bootstrapAccountSettingsContext } from '@/settings/accountSettings/bootstrapAccountSettingsContext';
-import { accountSettingsParse } from '@happier-dev/protocol';
+import { accountSettingsParse, SessionProviderCliAttachPrepareResultV1Schema } from '@happier-dev/protocol';
 import { hostname } from 'node:os';
+import { resolveInheritedHerdrRuntime } from '@/terminal/runtime/inheritedHerdrRuntime';
 import { buildAttachSelectionModel, formatAttachIneligibilityFooter } from './attachInteractiveSelection';
 
 import type { CommandContext } from '@/cli/commandRegistry';
+import { cmd, fail, neutral } from '@happier-dev/cli-common/output';
 
 type AttachCommandDeps = Readonly<{
   readCredentialsFn?: () => Promise<Credentials | null>;
@@ -58,6 +71,9 @@ type AttachCommandDeps = Readonly<{
     sessionId: string;
     terminal: NonNullable<TerminalAttachmentInfo['terminal']>;
   }) => Promise<number>;
+  runHerdrAttachFn?: (params: {
+    terminal: NonNullable<TerminalAttachmentInfo['terminal']>;
+  }) => Promise<number>;
   runWindowsTerminalAttachFn?: (params: {
     sessionId: string;
     terminal: NonNullable<TerminalAttachmentInfo['terminal']>;
@@ -70,8 +86,9 @@ type AttachCommandDeps = Readonly<{
     agentId: AgentId;
     sessionId: string;
     metadata: Record<string, unknown>;
+    prepareProviderCliAttach?: Parameters<ProviderAttachOps['runAttach']>[0]['prepareProviderCliAttach'];
+    terminalClient?: Parameters<ProviderAttachOps['runAttach']>[0]['terminalClient'];
   }) => Promise<number | false>;
-  createProviderAttachStatePublisherFn?: typeof createProviderAttachStatePublisher;
   canUseInkSelectorFn?: () => boolean;
   selectAttachableSessionIdFn?: (params: {
     rows: SessionActionSelectorRow[];
@@ -96,12 +113,12 @@ async function defaultRunWindowsTerminalAttach(params: {
   terminal: NonNullable<TerminalAttachmentInfo['terminal']>;
 }): Promise<number> {
   if (process.platform !== 'win32') {
-    console.error(chalk.red('Error:'), 'Windows Terminal attach is only available on Windows.');
+    console.error(fail('Windows Terminal attach is only available on Windows.'));
     return 1;
   }
   const windowId = params.terminal.windows?.windowId;
   if (typeof windowId !== 'string' || windowId.trim().length === 0) {
-    console.error(chalk.red('Error:'), 'Session does not include a Windows Terminal window id.');
+    console.error(fail('Session does not include a Windows Terminal window id.'));
     return 1;
   }
   return await focusWindowsTerminalWindow({ windowId });
@@ -111,19 +128,19 @@ async function defaultRunWindowsConsoleAttach(params: {
   terminal: NonNullable<TerminalAttachmentInfo['terminal']>;
 }): Promise<number> {
   if (process.platform !== 'win32') {
-    console.error(chalk.red('Error:'), 'Windows console attach is only available on Windows.');
+    console.error(fail('Windows console attach is only available on Windows.'));
     return 1;
   }
   const pid = params.terminal.windows?.pid;
   if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) {
-    console.error(chalk.red('Error:'), 'Session does not include a Windows console process id.');
+    console.error(fail('Session does not include a Windows console process id.'));
     return 1;
   }
   return await focusWindowsConsoleWindow({ pid });
 }
 
 function printMissingAttachInfo(sessionId: string): void {
-  console.error(chalk.red('Error:'), `No local attachment info found for session ${sessionId}.`);
+  console.error(fail(`No local attachment info found for session ${sessionId}.`));
   console.error(chalk.gray('This usually means the session was not started with an attachable terminal host, or it was started on another machine.'));
 }
 
@@ -214,15 +231,14 @@ export async function handleAttachCommand(
     isTmuxAvailableFn: deps.isTmuxAvailableFn,
   }));
   const runZellijAttachFn = deps.runZellijAttachFn ?? runZellijAttach;
+  const runHerdrAttachFn = deps.runHerdrAttachFn ?? runHerdrAttach;
   const runWindowsTerminalAttachFn = deps.runWindowsTerminalAttachFn ?? defaultRunWindowsTerminalAttach;
   const runWindowsConsoleAttachFn = deps.runWindowsConsoleAttachFn ?? defaultRunWindowsConsoleAttach;
-  const runProviderAttachFn = deps.runProviderAttachFn ?? (async ({ agentId, sessionId, metadata }) => {
+  const runProviderAttachFn = deps.runProviderAttachFn ?? (async ({ agentId, sessionId, metadata, prepareProviderCliAttach, terminalClient }) => {
     const providerAttachOps = await getProviderAttachOps(agentId);
     if (!providerAttachOps) return 1;
-    return await providerAttachOps.runAttach({ sessionId, metadata });
+    return await providerAttachOps.runAttach({ sessionId, metadata, prepareProviderCliAttach, terminalClient });
   });
-  const createProviderAttachStatePublisherFn =
-    deps.createProviderAttachStatePublisherFn ?? createProviderAttachStatePublisher;
   const canUseInkSelectorFn = deps.canUseInkSelectorFn ?? canUseInkSelector;
   const selectAttachableSessionIdFn = deps.selectAttachableSessionIdFn ?? selectAttachableSessionId;
 
@@ -232,7 +248,7 @@ export async function handleAttachCommand(
 
   if (isInteractive) {
     if (!canUseInkSelectorFn()) {
-      console.error(chalk.red('Error:'), 'Interactive attach is not available (raw TTY mode not supported).');
+      console.error(fail('Interactive attach is not available (raw TTY mode not supported).'));
       console.log('');
       console.log('Hint: run `happier session list --active` and then `happier attach <session-id>`.');
       process.exit(1);
@@ -240,7 +256,7 @@ export async function handleAttachCommand(
 
     credentialsForInteractive = await (deps.readCredentialsFn ?? readCredentials)();
     if (!credentialsForInteractive) {
-      console.error(chalk.red('Error:'), 'Not authenticated. Run "happier auth login" first.');
+      console.error(fail(`Not signed in. Run ${cmd('happier auth login')} first.`));
       process.exit(1);
     }
 
@@ -275,7 +291,7 @@ export async function handleAttachCommand(
       footerHint,
     });
     if (selected.type === 'cancelled') {
-      console.log(chalk.blue('Attach cancelled'));
+      console.log(neutral('Attach cancelled'));
       return;
     }
     if (selected.type === 'none') {
@@ -290,7 +306,7 @@ export async function handleAttachCommand(
   }
 
   if (!sessionIdOrPrefix) {
-    console.error(chalk.red('Error:'), 'Missing session ID.');
+    console.error(fail('Missing session ID.'));
     console.log('');
     console.log('Usage: happier attach <sessionId>');
     process.exit(1);
@@ -325,7 +341,10 @@ export async function handleAttachCommand(
       const tmuxAvailable = await (deps.isTmuxAvailableFn ?? isTmuxAvailable)().catch(() => false);
       const agentId = eligibility.agentId ?? null;
       const agentAttachStrategy: AgentAttachStrategyForExplainer = agentId
-        ? (getAgentLocalControlCapability(agentId)?.attachStrategy ?? 'unsupported')
+        ? (getAgentLocalControlCapabilityForSession({
+            agentId,
+            metadata: eligibility.metadata,
+          })?.attachStrategy ?? 'unsupported')
         : null;
       const explanation = explainAttachIneligibility({
         eligibility,
@@ -334,66 +353,124 @@ export async function handleAttachCommand(
         tmuxAvailable,
         agentAttachStrategy,
       });
-      console.error(chalk.red('Error:'), explanation.fullReason);
+      console.error(fail(explanation.fullReason));
       if (explanation.nextStepHint) {
         console.error(chalk.gray(explanation.nextStepHint));
       }
       process.exit(1);
     }
 
-    if (eligibility.attachStrategy === 'provider_attach') {
-      const statePublisher = createProviderAttachStatePublisherFn({
+    const attachNativeProvider = async (terminalClient?: Parameters<ProviderAttachOps['runAttach']>[0]['terminalClient']) => {
+      if (!eligibility.metadata) return 1;
+      return await runProviderAttachFn({
         agentId: eligibility.agentId,
         sessionId: resolvedSessionId,
-        credentials: context.credentials,
-        rawSession: context.rawSession,
-      });
-      if (statePublisher) {
-        await statePublisher.publishAttached(true).catch(() => {});
-      }
-      let exitCode: number | false;
-      try {
-        exitCode = await runProviderAttachFn({
-          agentId: eligibility.agentId,
+        metadata: eligibility.metadata,
+        terminalClient,
+        prepareProviderCliAttach: async (request) => SessionProviderCliAttachPrepareResultV1Schema.parse(await callSessionRpc({
+          token: context.credentials.token,
           sessionId: resolvedSessionId,
-          metadata: eligibility.metadata,
-        });
-      } finally {
-        if (statePublisher) {
-          await statePublisher.publishAttached(false).catch(() => {});
-        }
-      }
+          mode: resolveSessionStoredContentEncryptionMode(context.rawSession),
+          ctx: resolveSessionEncryptionContextFromCredentials(context.credentials, context.rawSession),
+          method: `${resolvedSessionId}:${SESSION_RPC_METHODS.SESSION_PROVIDER_CLI_ATTACH_PREPARE_V1}`,
+          request,
+        })),
+      });
+    };
+    if (eligibility.attachStrategy === 'provider_attach') {
+      // Ordinary independent native clients do not acquire managed detach custody.
+      const exitCode = await attachNativeProvider();
       if (!isAttachSuccess(exitCode)) process.exit(typeof exitCode === 'number' ? exitCode : 1);
       return;
     }
 
-    let exitCode = 0;
-    switch (eligibility.plan.type) {
-      case 'tmux':
-        exitCode = await runTmuxAttachFn({
-          sessionId: resolvedSessionId,
-          terminal: eligibility.terminal,
-          refreshRemoteControl: shouldRefreshRemoteControlOnAttach(eligibility.metadata),
-        });
-        break;
-      case 'zellij':
-        exitCode = await runZellijAttachFn({
-          sessionId: resolvedSessionId,
-          terminal: eligibility.terminal,
-        });
-        break;
-      case 'windows_terminal_host':
-        exitCode = await runWindowsTerminalAttachFn({
-          sessionId: resolvedSessionId,
-          terminal: eligibility.terminal,
-        });
-        break;
-      case 'windows_console_host':
-        exitCode = await runWindowsConsoleAttachFn({
-          sessionId: resolvedSessionId,
-          terminal: eligibility.terminal,
-        });
-        break;
+    const restoreManagedTerminal = async (expectedTerminal?: NonNullable<Metadata['terminal']>) => {
+      const restored = await callSessionRpc({
+        token: context.credentials.token, sessionId: resolvedSessionId,
+        mode: resolveSessionStoredContentEncryptionMode(context.rawSession),
+        ctx: resolveSessionEncryptionContextFromCredentials(context.credentials, context.rawSession),
+        method: `${resolvedSessionId}:switch`, request: { to: 'local' },
+      });
+      if (restored !== true) throw new Error('Failed to restore the managed terminal attachment.');
+      const current = await readTerminalAttachmentInfoFn({ happyHomeDir: configuration.happyHomeDir, sessionId: resolvedSessionId });
+      if (!current || (current.version === 1
+        ? !expectedTerminal || !terminalAttachmentMatchesTerminal(current, expectedTerminal)
+        : current.handle.attachmentId !== current.attachmentId)) {
+        throw new Error('The restored managed terminal has no exact attachment.');
+      }
+      return current.terminal;
+    };
+    let terminal = eligibility.terminal;
+    const localControl = getAgentLocalControlCapabilityForSession({
+      agentId: eligibility.agentId,
+      metadata: eligibility.metadata,
+    });
+    if (localControl?.topology === 'shared' && localControl.attachStrategy === 'provider_attach') {
+      const recorded = terminal.mode === 'herdr' ? terminal.herdr : null;
+      const presence = await probeSessionRunnerPresence({ sessionId: resolvedSessionId, trackedSessions: [] });
+      const retiredControl = terminal.controlServiceabilityV1;
+      const retiredCandidate = !localInfo && retiredControl?.retired === true
+        && retiredControl.reason === 'attachment_retired' && Boolean(retiredControl.attachmentId)
+        && (await readTerminalAttachmentState({ happyHomeDir: configuration.happyHomeDir, sessionId: resolvedSessionId })).status === 'absent';
+      if (recorded?.paneId && ((localInfo && localInfo.version !== 1) || retiredCandidate) && process.env.HERDR_ENV === '1'
+        && process.env.HERDR_SOCKET_PATH === recorded.socketPath && process.env.HERDR_PANE_ID === recorded.paneId
+        && presence.state === 'runner_present') {
+        const inherited = await resolveInheritedHerdrRuntime({ terminalRuntime: { mode: 'herdr', herdrSessionName: recorded.sessionName },
+          env: { ...process.env } });
+        if (inherited?.herdrTerminalId && (inherited.herdrTerminalId !== recorded.terminalId || retiredCandidate)
+          && inherited.herdrSocketPath === recorded.socketPath && inherited.herdrPaneId === recorded.paneId) {
+          // The current shell is a restoration candidate, not an owned pane. The
+          // strict prepare owner admits the actual native launcher before status rebinding.
+          const code = await attachNativeProvider({ ...recorded, paneId: recorded.paneId, terminalId: inherited.herdrTerminalId });
+          if (!isAttachSuccess(code)) process.exit(typeof code === 'number' ? code : 1);
+          return;
+        }
+      }
+    }
+    if (eligibility.attachStrategy === 'managed_provider_attach') {
+      const terminal = await restoreManagedTerminal();
+      const exitCode = await runTerminalHostAttach({ sessionId: resolvedSessionId, terminal, refreshRemoteControl: true },
+        { runTmuxAttachFn, runZellijAttachFn, runHerdrAttachFn });
+      if (exitCode === null) throw new Error('The restored managed terminal is not attachable.');
+      if (exitCode !== 0) process.exit(exitCode);
+      return;
+    }
+    if (localControl?.topology === 'shared' && localControl.attachStrategy === 'provider_attach') {
+      const presence = await probeSessionRunnerPresence({ sessionId: resolvedSessionId, trackedSessions: [] });
+      // Host attachment focuses the controller's pane; only its switch owner can restore the managed TUI.
+      const canOpenRestorationCandidate = eligibility.terminal.mode === 'herdr'
+        && Boolean(eligibility.terminal.herdr?.paneId?.trim())
+        && presence.state === 'runner_absent';
+      // Opening an admitted local candidate can activate its saved resume. It
+      // cannot rebind the Session; a present or unproven runner keeps RPC admission.
+      if (!canOpenRestorationCandidate) {
+        terminal = await restoreManagedTerminal(eligibility.terminal);
+      }
+    }
+
+    const hostExitCode = await runTerminalHostAttach({
+      sessionId: resolvedSessionId,
+      terminal,
+      refreshRemoteControl: shouldRefreshRemoteControlOnAttach(eligibility.metadata),
+    }, { runTmuxAttachFn, runZellijAttachFn, runHerdrAttachFn });
+    let exitCode = hostExitCode ?? 0;
+    if (hostExitCode === null) {
+      switch (eligibility.plan.type) {
+        case 'windows_terminal_host':
+          exitCode = await runWindowsTerminalAttachFn({
+            sessionId: resolvedSessionId,
+            terminal,
+          });
+          break;
+        case 'windows_console_host':
+          exitCode = await runWindowsConsoleAttachFn({
+            sessionId: resolvedSessionId,
+            terminal,
+          });
+          break;
+        default:
+          throw new Error('No terminal attach implementation is available for this session.');
+      }
     }
     if (exitCode !== 0) process.exit(exitCode);
     return;
@@ -405,18 +482,19 @@ export async function handleAttachCommand(
     process.exit(1);
   }
 
-  let exitCode = 0;
-  if (terminal.mode === 'tmux') {
-    exitCode = await runTmuxAttachFn({ sessionId: resolvedSessionId, terminal });
-  } else if (terminal.mode === 'zellij') {
-    exitCode = await runZellijAttachFn({ sessionId: resolvedSessionId, terminal });
-  } else if (terminal.mode === 'windows_terminal') {
-    exitCode = await runWindowsTerminalAttachFn({ sessionId: resolvedSessionId, terminal });
-  } else if (terminal.mode === 'windows_console') {
-    exitCode = await runWindowsConsoleAttachFn({ sessionId: resolvedSessionId, terminal });
-  } else {
-    console.error(chalk.red('Error:'), 'Session was not started in tmux.');
-    process.exit(1);
+  const hostExitCode = await runTerminalHostAttach({ sessionId: resolvedSessionId, terminal }, {
+    runTmuxAttachFn, runZellijAttachFn, runHerdrAttachFn,
+  });
+  let exitCode = hostExitCode ?? 0;
+  if (hostExitCode === null) {
+    if (terminal.mode === 'windows_terminal') {
+      exitCode = await runWindowsTerminalAttachFn({ sessionId: resolvedSessionId, terminal });
+    } else if (terminal.mode === 'windows_console') {
+      exitCode = await runWindowsConsoleAttachFn({ sessionId: resolvedSessionId, terminal });
+    } else {
+      console.error(fail('Session was not started in an attachable terminal host.'));
+      process.exit(1);
+    }
   }
   if (exitCode !== 0) process.exit(exitCode);
 }
@@ -425,7 +503,7 @@ export async function handleAttachCliCommand(context: CommandContext): Promise<v
   try {
     await handleAttachCommand(context.args.slice(1));
   } catch (error) {
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     if (process.env.DEBUG) {
       console.error(error);
     }

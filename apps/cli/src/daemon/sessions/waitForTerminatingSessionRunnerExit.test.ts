@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { waitForTerminatingSessionRunnerExit } from './waitForTerminatingSessionRunnerExit';
 
 describe('waitForTerminatingSessionRunnerExit', () => {
-  it('waits only for an explicitly terminating runner and returns the first settled probe', async () => {
+  it('keeps polling an explicitly terminating runner until process evidence proves it absent', async () => {
     let nowMs = 0;
     const probe = vi.fn()
       .mockResolvedValueOnce({
@@ -26,8 +26,9 @@ describe('waitForTerminatingSessionRunnerExit', () => {
     expect(probe).toHaveBeenCalledTimes(2);
   });
 
-  it('does not wait for an unknown or unsupported live runner', async () => {
-    const probe = vi.fn();
+  it('waits for an unresponsive live runner and returns once its process exits', async () => {
+    let nowMs = 0;
+    const probe = vi.fn().mockResolvedValue({ state: 'runner_absent' as const });
     const initialProbe = {
       state: 'runner_present' as const,
       control: { state: 'unknown' as const, reason: 'rpc_failed' as const },
@@ -37,7 +38,29 @@ describe('waitForTerminatingSessionRunnerExit', () => {
       probe,
       timeoutMs: 100,
       pollIntervalMs: 10,
-    })).resolves.toBe(initialProbe);
-    expect(probe).not.toHaveBeenCalled();
+      now: () => nowMs,
+      sleep: async (delayMs) => { nowMs += delayMs; },
+    })).resolves.toEqual({ state: 'runner_absent' });
+    expect(probe).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a persistently live unresponsive runner fenced when the bounded wait expires', async () => {
+    let nowMs = 0;
+    const unresponsiveProbe = {
+      state: 'runner_present' as const,
+      control: { state: 'recoverable_unservable' as const, reason: 'rpc_method_unavailable' as const },
+    };
+    const probe = vi.fn().mockResolvedValue(unresponsiveProbe);
+
+    await expect(waitForTerminatingSessionRunnerExit({
+      initialProbe: unresponsiveProbe,
+      probe,
+      timeoutMs: 25,
+      pollIntervalMs: 10,
+      now: () => nowMs,
+      sleep: async (delayMs) => { nowMs += delayMs; },
+    })).resolves.toEqual(unresponsiveProbe);
+    expect(probe).toHaveBeenCalledTimes(3);
+    expect(nowMs).toBe(25);
   });
 });

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { FastifyReply } from "fastify";
 import { type Fastify } from "../../types";
 import { eventRouter } from "@/app/events/eventRouter";
 import { refreshSessionParticipantBadgePushes } from "@/app/activity/refreshAccountActivityBadgePushes";
@@ -62,6 +63,18 @@ function getOptionalErrorCode(value: unknown): string | undefined {
     if (!("code" in value)) return undefined;
     const code = (value as { code?: unknown }).code;
     return typeof code === "string" && code.length > 0 ? code : undefined;
+}
+
+function sendTransactionUnavailable(
+    reply: FastifyReply,
+    result: Readonly<{ error: "transaction-unavailable"; retryAfterMs: number; correlationId?: string }>,
+) {
+    reply.header("Retry-After", String(Math.max(1, Math.ceil(result.retryAfterMs / 1_000))));
+    return reply.code(503).send({
+        error: result.error,
+        retryAfterMs: result.retryAfterMs,
+        ...(result.correlationId ? { correlationId: result.correlationId } : {}),
+    });
 }
 
 export function sessionPendingRoutes(app: Fastify) {
@@ -195,6 +208,7 @@ export function sessionPendingRoutes(app: Fastify) {
                       ...(admissionMode ? { admissionMode } : {}),
                       requestedAction,
                       ...(resumeWhenAvailable === true ? { resumeWhenAvailable: true as const } : {}),
+                      ...(typeof request.id === "string" ? { diagnosticCorrelationId: request.id } : {}),
                   })
                 : enqueuePendingMessage({
                       actorUserId: request.userId,
@@ -206,6 +220,7 @@ export function sessionPendingRoutes(app: Fastify) {
                       ...(admissionMode ? { admissionMode } : {}),
                       requestedAction,
                       ...(resumeWhenAvailable === true ? { resumeWhenAvailable: true as const } : {}),
+                      ...(typeof request.id === "string" ? { diagnosticCorrelationId: request.id } : {}),
                   }));
 
             if (!res.ok) {
@@ -218,6 +233,7 @@ export function sessionPendingRoutes(app: Fastify) {
                 if (res.error === "forbidden") return reply.code(403).send({ error: res.error });
                 if (res.error === "session-not-found") return reply.code(404).send({ error: res.error });
                 if (res.error === "requested-action-conflict") return reply.code(409).send({ error: res.error });
+                if (res.error === "transaction-unavailable") return sendTransactionUnavailable(reply, res);
                 return reply.code(500).send({ error: res.error });
             }
 
@@ -359,14 +375,7 @@ export function sessionPendingRoutes(app: Fastify) {
                 if (res.error === "forbidden") return reply.code(403).send({ error: res.error });
                 if (res.error === "session-not-found") return reply.code(404).send({ error: res.error });
                 if (res.error === "delivery-settlement-conflict") return reply.code(409).send({ error: res.error });
-                if (res.error === "transaction-unavailable") {
-                    reply.header("Retry-After", String(Math.max(1, Math.ceil(res.retryAfterMs / 1_000))));
-                    return reply.code(503).send({
-                        error: res.error,
-                        retryAfterMs: res.retryAfterMs,
-                        ...(res.correlationId ? { correlationId: res.correlationId } : {}),
-                    });
-                }
+                if (res.error === "transaction-unavailable") return sendTransactionUnavailable(reply, res);
                 return reply.code(500).send({ error: res.error });
             }
 

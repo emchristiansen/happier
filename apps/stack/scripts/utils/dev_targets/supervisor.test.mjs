@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import {
   resolveDefaultRemoteServerPort,
+  resolveRemoteServerReadyTimeoutMs,
   startStackDevTargets,
   startStackDevTargetsInBackground,
 } from './supervisor.mjs';
@@ -75,6 +76,14 @@ test('default remote tunnel port varies by Stack process instance', () => {
   assert.notEqual(first, replacement);
   assert.ok(first >= 40_000 && first <= 59_999);
   assert.ok(replacement >= 40_000 && replacement <= 59_999);
+});
+
+test('remote server readiness covers the remote package-roll startup budget', () => {
+  assert.equal(resolveRemoteServerReadyTimeoutMs({}), 1_800_000);
+  assert.equal(
+    resolveRemoteServerReadyTimeoutMs({ HAPPIER_STACK_SERVER_READY_TIMEOUT_MS: '90000' }),
+    90_000,
+  );
 });
 
 test('authoritative remote server retires the prior target owner and becomes running only after stable-tunnel readiness', async () => {
@@ -1142,6 +1151,7 @@ test('a failed target retries while another target is still preparing', async ()
   let markWindowsPreparationStarted;
   let markLinuxWorkerStarted;
   let linuxProbeAttempts = 0;
+  const linuxTunnels = [];
   const windowsPreparationPending = new Promise((resolve) => {
     releaseWindowsPreparation = resolve;
   });
@@ -1198,6 +1208,7 @@ test('a failed target retries while another target is still preparing', async ()
         },
         spawnProcess: ({ label, command, args, env }) => {
           const worker = { label, command, args, env, exitCode: null };
+          if (label === 'remote:linux' && args.includes('-N')) linuxTunnels.push(worker);
           if (label === 'remote:linux' && !args.includes('-N')) markLinuxWorkerStarted();
           return worker;
         },
@@ -1220,6 +1231,11 @@ test('a failed target retries while another target is still preparing', async ()
       retriedBeforeWindowsFinished,
       true,
       'the failed Linux target should not wait for the unrelated Windows preparation',
+    );
+    assert.equal(
+      linuxTunnels.length,
+      1,
+      'a transient reverse-forward refusal must not replace the live tunnel',
     );
   } finally {
     releaseWindowsPreparation?.({ code: 0 });
@@ -1309,7 +1325,9 @@ test('dev target supervisor owns Mutagen publication, remote bootstrap, auth see
     assert.doesNotMatch(workerSpawn.args.join(' '), /-R /);
     assert.ok(
       calls.filter((call) => call.command === 'ssh' || call.command === 'scp')
-        .every((call) => call.args.includes('-F') && call.args.includes('ControlMaster=no')),
+        .every((call) => call.args.includes('-F')
+          && call.args.includes('ControlMaster=no')
+          && call.args.includes('ControlPath=none')),
     );
     assert.match(
       calls.find((call) => call.command === 'mutagen' && call.args.includes('start')).env.MUTAGEN_SSH_PATH,

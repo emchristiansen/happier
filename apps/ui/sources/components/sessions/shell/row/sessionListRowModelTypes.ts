@@ -5,7 +5,7 @@ import type { SessionMessages } from '@/sync/store/domains/messages';
 import type { SessionPending } from '@/sync/store/domains/pending';
 import type { SessionStatus } from '@/utils/sessions/sessionUtils';
 import type { SessionListSecondaryLineMode } from '@/sync/domains/session/listing/deriveSessionListActivity';
-import type { SessionAttentionStandingPolicy } from '@/sync/domains/session/organization/attentionStanding';
+import type { SessionAttentionStandingPolicy, SessionReminderPresentation } from '@/sync/domains/session/organization/attentionStanding';
 import type { SessionRowAttentionState, SessionRowDensity, SessionRowPresentation } from './resolveSessionRowPresentation';
 
 export type SessionListRowSessionItem = Extract<SessionListViewItem, { type: 'session' }>;
@@ -86,7 +86,6 @@ export type SessionListRowModel = Readonly<{
     serverName?: string;
     treeRowId: string;
     testID: string;
-    dataIndex: number;
     session: Session | SessionListRenderableSession;
     status: SessionStatus;
     statusSignature: string;
@@ -121,6 +120,8 @@ export type SessionListRowModel = Readonly<{
      * remove it from Needs attention.
      */
     isAttentionStanding: boolean;
+    /** The canonical reminder state; rows and menus must never re-derive it independently. */
+    reminder: SessionReminderPresentation | null;
     attentionStandingEnabled: boolean;
     isArchived: boolean;
     isActive: boolean;

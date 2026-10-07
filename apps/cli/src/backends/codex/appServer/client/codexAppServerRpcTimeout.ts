@@ -1,5 +1,8 @@
-const STARTUP_RPC_METHODS = new Set(['initialize', 'thread/start']);
+const STARTUP_RPC_METHODS = new Set(['initialize']);
 const LONG_RUNNING_RPC_METHODS = new Set([
+    // Starting a thread is side-effecting admission. A timeout cannot establish whether Codex
+    // accepted it, and loaded starts can legitimately exceed the ordinary startup RPC budget.
+    'thread/start',
     'thread/resume',
     'thread/fork',
     'conversation/fork',
@@ -16,9 +19,10 @@ function clampRpcTimeoutMs(rawValue: unknown, fallbackMs: number, maxMs: number)
 }
 
 export function readCodexAppServerRpcTimeoutMs(env?: NodeJS.ProcessEnv): number {
-    // 5s is too low for app-server calls like model/mode listing on cold start or under load.
-    // Keep it bounded but generous by default.
-    return clampRpcTimeoutMs(env?.HAPPIER_CODEX_APP_SERVER_RPC_TIMEOUT_MS, 15_000, 60_000);
+    // Catalog, control, and account reads share the session-control load profile. A 15s cutoff
+    // caused healthy app-server requests to fail during contention, so keep the default generous
+    // while retaining a bounded operator override for genuinely slow local providers.
+    return clampRpcTimeoutMs(env?.HAPPIER_CODEX_APP_SERVER_RPC_TIMEOUT_MS, 60_000, 10 * 60_000);
 }
 
 export function readCodexAppServerStartupRpcTimeoutMs(env?: NodeJS.ProcessEnv, baseTimeoutMs?: number): number {

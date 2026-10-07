@@ -1,87 +1,19 @@
-/**
- * Kimi ACP Backend - Kimi CLI agent via ACP.
- *
- * Kimi CLI must be installed and available in PATH.
- * ACP mode: `kimi acp`
- */
+import { createCatalogDefinedAcpBackend, type CatalogDefinedAcpBackendOptions } from '@/agent/acp/catalog/createCatalogDefinedAcpBackend';
+import type { AgentBackend } from '@/agent/core';
+import { requireCurrentKimiRuntime } from '@/backends/kimi/cli/runtimeDiscovery';
 
-import { writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+export type KimiBackendOptions = CatalogDefinedAcpBackendOptions;
 
-import { AcpBackend, type AcpBackendOptions, type AcpPermissionHandler } from '@/agent/acp/AcpBackend';
-import type { AgentBackend, AgentFactoryOptions, McpServerConfig } from '@/agent/core';
-import { normalizePermissionModeToIntent } from '@/agent/runtime/permission/permissionModeCanonical';
-import type { PermissionMode } from '@/api/types';
-import { kimiTransport } from '@/backends/kimi/acp/transport';
-import { resolveKimiAcpPythonSelectorChildEnv } from '@/backends/kimi/acp/pythonSelectorEnv';
-import { requireProviderCliLaunchSpec } from '@/runtime/managedTools/requireProviderCliLaunchSpec';
-import type { KimiAcpPythonSelector } from '@happier-dev/agents';
-
-function buildReadOnlyAgentFilePath(): string {
-  return join(tmpdir(), `happier-kimi-${process.pid}-readonly-agent.yaml`);
-}
-
-function ensureReadOnlyAgentFile(): string {
-  const path = buildReadOnlyAgentFilePath();
-  const content =
-    `version: 1\n` +
-    `agent:\n` +
-    `  extend: default\n` +
-    `  name: happier-read-only\n` +
-    `  exclude_tools:\n` +
-    `    - \"kimi_cli.tools.shell:Shell\"\n` +
-    `    - \"kimi_cli.tools.file:WriteFile\"\n` +
-    `    - \"kimi_cli.tools.file:StrReplaceFile\"\n`;
-  writeFileSync(path, content, { encoding: 'utf8' });
-  return path;
-}
-
-export interface KimiBackendOptions extends AgentFactoryOptions {
-  mcpServers?: Record<string, McpServerConfig>;
-  permissionHandler?: AcpPermissionHandler;
-  permissionMode?: PermissionMode;
-  kimiAcpPythonSelector?: KimiAcpPythonSelector;
-}
-
+/** Current Kimi uses the shared ACP backend; only executable classification is provider-owned. */
 export function createKimiBackend(options: KimiBackendOptions): AgentBackend {
-  const intent = normalizePermissionModeToIntent(options.permissionMode ?? 'default') ?? 'default';
-  const processEnv = { ...process.env, ...options.env };
-  const launch = requireProviderCliLaunchSpec('kimi', { processEnv });
-  const childEnv = resolveKimiAcpPythonSelectorChildEnv({
-    selector: options.kimiAcpPythonSelector ?? processEnv.HAPPIER_KIMI_ACP_SELECTOR,
-    env: options.env,
-    inheritedEnv: processEnv,
-  });
-
-  const args: string[] = ['--work-dir', options.cwd];
-
-  if (intent === 'yolo' || intent === 'bypassPermissions') {
-    args.push('--yolo');
-  }
-
-  if (intent === 'read-only' || intent === 'plan') {
-    args.push('--agent-file', ensureReadOnlyAgentFile());
-  }
-
-  args.push('acp');
-
-  const backendOptions: AcpBackendOptions = {
-    agentName: 'kimi',
-    cwd: options.cwd,
-    command: launch.command,
-    args: [...launch.args, ...args],
-    env: {
-      ...childEnv,
-      // Keep output clean; ACP must own stdout.
-      NODE_ENV: 'production',
-      DEBUG: '',
+  return createCatalogDefinedAcpBackend('kimi', {
+    ...options,
+    prepareProcessLaunch: async () => {
+      const runtime = await requireCurrentKimiRuntime({
+        processEnv: { ...process.env, ...options.env },
+        cwd: options.cwd,
+      });
+      return { command: runtime.command, args: ['acp'] };
     },
-    // Kimi ACP rejects MCP server startup; avoid attaching servers.
-    mcpServers: undefined,
-    permissionHandler: options.permissionHandler,
-    transportHandler: kimiTransport,
-  };
-
-  return new AcpBackend(backendOptions);
+  });
 }

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { clearConnectedServiceAuthGroupMemberRuntimeBlockers } from "@happier-dev/protocol";
 
 import { db } from "@/storage/db";
 import { inTx, type Tx } from "@/storage/inTx";
@@ -29,8 +30,14 @@ export type DeleteConnectedServiceCredentialResult =
     | "storage_mode_mismatch"
     | Readonly<{ type: "superseded"; credentialRevision: string }>;
 export type AuthGroupGenerationConflictResult = Readonly<{ type: "generation_conflict"; generation: number }>;
+export type AuthGroupRuntimeStateRevisionConflictResult = Readonly<{
+    type: "runtime_state_revision_conflict";
+    runtimeStateRevision: number;
+}>;
 export type CreateAuthGroupMemberResult = "created" | "group_not_found" | "profile_not_found" | AuthGroupGenerationConflictResult;
-export type UpdateAuthGroupMemberResult = "updated" | "unchanged" | "not_found" | AuthGroupGenerationConflictResult;
+export type UpdateAuthGroupMemberResult = "updated" | "unchanged" | "not_found"
+    | AuthGroupGenerationConflictResult
+    | AuthGroupRuntimeStateRevisionConflictResult;
 export type DeleteAuthGroupMemberResult = "deleted" | "not_found" | AuthGroupGenerationConflictResult;
 
 type AuthGroupMemberRow = Readonly<{
@@ -449,7 +456,9 @@ export async function updateAuthGroupMemberAndBumpGenerationInTx(tx: Tx, params:
     profileId: string;
     priority?: number;
     enabled?: boolean;
+    state?: AuthGroupMemberState;
     expectedGeneration: number;
+    expectedRuntimeStateRevision?: number;
 }): Promise<UpdateAuthGroupMemberResult> {
     const group = await tx.connectedServiceAuthGroup.findUnique({
         where: {
@@ -463,14 +472,24 @@ export async function updateAuthGroupMemberAndBumpGenerationInTx(tx: Tx, params:
             id: true,
             activeProfileId: true,
             generation: true,
+            runtimeStateRevision: true,
             members: {
-                select: { id: true, profileId: true, priority: true, enabled: true },
+                select: { id: true, profileId: true, priority: true, enabled: true, stateJson: true },
             },
         },
     });
     if (!group) return "not_found";
     if (group.generation !== params.expectedGeneration) {
         return { type: "generation_conflict", generation: group.generation };
+    }
+    if (
+        params.expectedRuntimeStateRevision !== undefined
+        && group.runtimeStateRevision !== params.expectedRuntimeStateRevision
+    ) {
+        return {
+            type: "runtime_state_revision_conflict",
+            runtimeStateRevision: group.runtimeStateRevision,
+        };
     }
 
     const member = group.members.find((candidate) => candidate.profileId === params.profileId) ?? null;
@@ -490,20 +509,60 @@ export async function updateAuthGroupMemberAndBumpGenerationInTx(tx: Tx, params:
         ? group.activeProfileId
         : resolveFirstEnabledMemberProfileId(nextMembers);
     const changesActiveProfile = group.activeProfileId !== nextActiveProfileId;
-    if (!changesCandidate && !changesActiveProfile) return "unchanged";
+    const clearAutomaticDisableState = params.state === undefined && params.enabled === true
+        && member.enabled === false
+        && (() => {
+            if (!member.stateJson) return null;
+            try {
+                const state = ConnectedServiceAuthGroupMemberStateSchema.parse(JSON.parse(member.stateJson));
+                return state.autoDisabledReason === "model_not_entitled"
+                    ? clearConnectedServiceAuthGroupMemberRuntimeBlockers(state)
+                    : null;
+            } catch {
+                return null;
+            }
+        })();
+    const nextMemberState = params.state ?? clearAutomaticDisableState;
+    const nextMemberStateJson = nextMemberState ? JSON.stringify(nextMemberState) : null;
+    const changesRuntimeState = nextMemberState !== null
+        && nextMemberStateJson !== member.stateJson;
+    if (!changesCandidate && !changesActiveProfile && !changesRuntimeState) return "unchanged";
+
+    const expectedRuntimeStateRevision = changesRuntimeState
+        ? params.expectedRuntimeStateRevision ?? group.runtimeStateRevision
+        : null;
 
     const generationUpdate = await tx.connectedServiceAuthGroup.updateMany({
-        where: { id: group.id, generation: params.expectedGeneration },
+        where: {
+            id: group.id,
+            generation: params.expectedGeneration,
+            ...(expectedRuntimeStateRevision === null
+                ? {}
+                : { runtimeStateRevision: expectedRuntimeStateRevision }),
+        },
         data: {
             generation: { increment: 1 },
+            ...(changesRuntimeState
+                ? { runtimeStateRevision: { increment: 1 } }
+                : {}),
             ...(changesActiveProfile ? { activeProfileId: nextActiveProfileId } : {}),
         },
     });
     if (generationUpdate.count !== 1) {
         const current = await tx.connectedServiceAuthGroup.findUnique({
             where: { id: group.id },
-            select: { generation: true },
+            select: { generation: true, runtimeStateRevision: true },
         });
+        if (
+            expectedRuntimeStateRevision !== null
+            && current?.generation === group.generation
+            && current.runtimeStateRevision !== expectedRuntimeStateRevision
+        ) {
+            return {
+                type: "runtime_state_revision_conflict",
+                runtimeStateRevision: current.runtimeStateRevision,
+            };
+        }
         return { type: "generation_conflict", generation: current?.generation ?? group.generation };
     }
 
@@ -512,6 +571,7 @@ export async function updateAuthGroupMemberAndBumpGenerationInTx(tx: Tx, params:
         data: {
             ...(params.priority !== undefined ? { priority: params.priority } : {}),
             ...(params.enabled !== undefined ? { enabled: params.enabled } : {}),
+            ...(changesRuntimeState ? { stateJson: nextMemberStateJson } : {}),
         },
     });
     return "updated";

@@ -5,6 +5,7 @@ import {
     type SessionWorkspaceOrderV1,
 } from '@/sync/domains/session/listing/sessionWorkspaceOrderStateV1';
 import type { ReorderSessionOrganizationRequest } from '@happier-dev/protocol';
+import type { SessionAttentionStanding } from '@happier-dev/protocol';
 
 import type { SessionOrganizationProjection } from './types';
 import { buildSessionOrganizationTagLabelById } from './tagLabels';
@@ -14,7 +15,7 @@ export type SessionOrganizationListViewState = Readonly<{
     sessionFoldersV1: SessionFoldersV1;
     sessionFolderAssignmentsBySessionKey: Record<string, string | null>;
     sessionTagsV1: Record<string, readonly string[]>;
-    attentionStandingOverridesBySessionKey: Record<string, boolean>;
+    attentionStandingOverridesBySessionKey: Record<string, SessionAttentionStanding>;
     sessionListGroupOrderV1: Record<string, readonly string[]>;
     sessionWorkspaceOrderV1: SessionWorkspaceOrderV1;
     workspaceLabelsV1: Record<string, string>;
@@ -195,7 +196,7 @@ export function buildSessionOrganizationListViewState(params: Readonly<{
     const attentionStandingOverridesBySessionKey = Object.fromEntries(
         Object.entries(projection.attentionStandingsBySessionId).map(([sessionId, standing]) => [
             buildServerSessionKey(serverId, sessionId),
-            standing.standing,
+            standing,
         ]),
     );
     const sessionFolderAssignmentsBySessionKey = Object.fromEntries(

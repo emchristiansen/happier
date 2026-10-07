@@ -6,7 +6,10 @@ import {
     resolveSessionListSecondaryLineMode,
 } from '@/sync/domains/session/listing/deriveSessionListActivity';
 import type { SessionListRenderableSession } from '@/sync/domains/session/listing/sessionListRenderable';
-import { resolveSessionAttentionStanding } from '@/sync/domains/session/organization/attentionStanding';
+import {
+    resolveSessionAttentionStanding,
+    resolveSessionReminderPresentation,
+} from '@/sync/domains/session/organization/attentionStanding';
 import { resolveLastViewedSessionSeq } from '@/sync/domains/session/readCursor/resolveLastViewedSessionSeq';
 import { resolveSessionReadableSeq } from '@/sync/domains/session/readCursor/resolveSessionReadableSeq';
 import type { Session } from '@/sync/domains/state/storageTypes';
@@ -42,7 +45,6 @@ import type {
 export type BuildSessionListRowModelInput = Readonly<{
     item: SessionListRowSessionItem;
     state?: Partial<SessionListRowStateSnapshot>;
-    dataIndex: number;
     isFirst: boolean;
     isLast: boolean;
     isSingle: boolean;
@@ -372,12 +374,18 @@ export function buildSessionListRowModel(input: BuildSessionListRowModelInput): 
             resolveSessionActivityComposerTranslate(),
         )
         : null;
-    const nextRuntimeFreshnessAtMs = resolveNextRuntimeFreshnessAtMs(resolvedSession, settings.runtimeNowMs);
+    const standingRecord = settings.attentionStandingPolicy.overridesBySessionKey[rowKey];
+    const reminder = resolveSessionReminderPresentation(standingRecord, settings.runtimeNowMs);
+    const reminderWakeAtMs = reminder?.state === 'scheduled' ? reminder.remindAt : null;
+    const runtimeWakeAtMs = resolveNextRuntimeFreshnessAtMs(resolvedSession, settings.runtimeNowMs);
+    const nextRuntimeFreshnessAtMs = runtimeWakeAtMs === null
+        ? reminderWakeAtMs
+        : reminderWakeAtMs === null ? runtimeWakeAtMs : Math.min(runtimeWakeAtMs, reminderWakeAtMs);
     const isArchived = resolvedSession.archivedAt != null;
     const isPinned = item.pinned === true || settings.pinnedSessionKeys.includes(rowKey);
     // The STORED instruction, resolved through the policy owner, never the placement reason: a
     // standing session that is currently placed for being unread must still offer to be removed.
-    const isAttentionStanding = resolveSessionAttentionStanding(settings.attentionStandingPolicy, rowKey);
+    const isAttentionStanding = resolveSessionAttentionStanding(settings.attentionStandingPolicy, rowKey, settings.runtimeNowMs);
     const title = getSessionName(resolvedSession);
 
     return {
@@ -387,7 +395,6 @@ export function buildSessionListRowModel(input: BuildSessionListRowModelInput): 
         serverName: item.serverName,
         treeRowId: serverId ? treeRowId.session(serverId, sessionId) : `session:${sessionId}`,
         testID: `session-list-item-${sessionId}`,
-        dataIndex: input.dataIndex,
         session: resolvedSession,
         status,
         statusSignature: buildStatusSignature(status, nextRuntimeFreshnessAtMs),
@@ -428,6 +435,7 @@ export function buildSessionListRowModel(input: BuildSessionListRowModelInput): 
         isSelected: (item as SessionListRowSessionItem & { selected?: boolean }).selected === true,
         isPinned,
         isAttentionStanding,
+        reminder,
         attentionStandingEnabled: settings.attentionStandingEnabled,
         isArchived,
         isActive: resolvedSession.active === true,

@@ -1,4 +1,5 @@
 import { logger } from '@/ui/logger'
+import { normalizeSessionMetadataForRead, projectSessionMetadataForWire } from '@happier-dev/protocol';
 import { backoff } from '@/utils/time';
 import { emitSocketWithAck } from '@/session/transport/shared/socketAck';
 import type { AgentState, Metadata } from '../types';
@@ -105,8 +106,8 @@ export async function updateSessionMetadataWithAckResult<TResult>(opts: {
         });
         const metadataPayload =
             opts.sessionEncryptionMode === 'plain'
-                ? JSON.stringify(updated)
-                : encodeBase64(encrypt(opts.encryptionKey, opts.encryptionVariant, updated));
+                ? JSON.stringify(projectSessionMetadataForWire(updated))
+                : encodeBase64(encrypt(opts.encryptionKey, opts.encryptionVariant, projectSessionMetadataForWire(updated)));
         const answer = await emitSocketWithAck<any>({
             socket: opts.socket,
             event: 'update-metadata',
@@ -118,10 +119,10 @@ export async function updateSessionMetadataWithAckResult<TResult>(opts: {
         });
 
         if (answer.result === 'success') {
-            const next =
+            const next = normalizeSessionMetadataForRead<Metadata>(
                 opts.sessionEncryptionMode === 'plain'
                     ? JSON.parse(String(answer.metadata ?? 'null'))
-                    : decrypt(opts.encryptionKey, opts.encryptionVariant, decodeBase64(answer.metadata));
+                    : decrypt(opts.encryptionKey, opts.encryptionVariant, decodeBase64(answer.metadata)));
             logger.debug('[API] updateMetadata success', {
                 version: answer.version,
                 hasModeOverride: Boolean((next as Record<string, unknown> | null)?.acpSessionModeOverrideV1),
@@ -137,10 +138,10 @@ export async function updateSessionMetadataWithAckResult<TResult>(opts: {
         if (answer.result === 'version-mismatch') {
             if (answer.version > opts.getMetadataVersion()) {
                 opts.setMetadataVersion(answer.version);
-                const next =
+                const next = normalizeSessionMetadataForRead<Metadata>(
                     opts.sessionEncryptionMode === 'plain'
                         ? JSON.parse(String(answer.metadata ?? 'null'))
-                        : decrypt(opts.encryptionKey, opts.encryptionVariant, decodeBase64(answer.metadata));
+                        : decrypt(opts.encryptionKey, opts.encryptionVariant, decodeBase64(answer.metadata)));
                 logger.debug('[API] updateMetadata version-mismatch', {
                     version: answer.version,
                     hasModeOverride: Boolean((next as Record<string, unknown> | null)?.acpSessionModeOverrideV1),
@@ -158,6 +159,14 @@ export async function updateSessionMetadataWithAckResult<TResult>(opts: {
             'metadata_update_failed',
             false,
         );
+    }).catch((error: unknown) => {
+        // Report only the settled operation, never metadata or an untrusted ACK/transport payload.
+        logger.infoFile('[API] session_metadata_update_failed', {
+            phase: 'terminal_failure',
+            operation: 'update-metadata',
+            sessionId: opts.sessionId,
+        });
+        throw error;
     });
 }
 

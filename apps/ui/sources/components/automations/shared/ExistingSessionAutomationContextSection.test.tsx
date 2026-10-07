@@ -134,7 +134,7 @@ describe('ExistingSessionAutomationContextSection', () => {
         );
 
         expect(capturedItems).toEqual([
-            { title: 'Backend', subtitle: 'codex' },
+            { title: 'Backend', subtitle: 'Codex' },
             { title: 'Encryption', subtitle: 'End-to-end encrypted' },
             { title: 'Transcript', subtitle: 'Direct' },
             { title: 'Machine', subtitle: 'Leeroy Mac' },

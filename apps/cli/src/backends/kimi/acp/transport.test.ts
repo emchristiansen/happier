@@ -92,6 +92,14 @@ describe('KimiTransport handleStderr', () => {
     expect(asStatusErrorMessage(result.message).detail).toContain('Authentication');
   });
 
+  it('does not treat an incidental 401 identifier as authentication failure', () => {
+    const transport = new KimiTransport();
+    expect(transport.handleStderr(
+      '[agy-acp] WARN: failed to decode gen_metadata 401: cant skip wire type 6',
+      { activeToolCalls: new Set(), hasActiveInvestigation: false },
+    )).toEqual({ message: null });
+  });
+
   it('keeps rate-limit diagnostics in stderr without turning them into UI errors', () => {
     const transport = new KimiTransport();
     expect(
