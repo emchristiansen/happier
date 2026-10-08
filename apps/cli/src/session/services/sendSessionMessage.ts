@@ -50,7 +50,7 @@ export type SendSessionMessageResult =
        * from `unsupported`, which claims this Session or daemon cannot do it at
        * all — see `InactiveSessionResumeResult`.
        */
-      code: 'session_not_found' | 'session_id_ambiguous' | 'session_lookup_timeout' | 'session_archived' | 'permission_escalation_denied' | 'unsupported' | 'resume_failed' | 'timeout' | 'wait_failed';
+      code: 'session_not_found' | 'session_id_ambiguous' | 'session_lookup_timeout' | 'session_data_key_unopenable' | 'session_archived' | 'permission_escalation_denied' | 'unsupported' | 'resume_failed' | 'timeout' | 'wait_failed';
       candidates?: string[];
       message?: string;
     }>;
@@ -421,8 +421,12 @@ export async function sendSessionMessage(params: Readonly<{
   const sessionTarget = await resolveSessionTransportContext({
     credentials: params.credentials,
     idOrPrefix: params.idOrPrefix,
+    requireOpenSessionDataKey: true,
   });
   if (!sessionTarget.ok) {
+    if (sessionTarget.code === 'session_data_key_unopenable') {
+      return { ok: false, code: sessionTarget.code };
+    }
     return {
       ok: false,
       code: sessionTarget.code,

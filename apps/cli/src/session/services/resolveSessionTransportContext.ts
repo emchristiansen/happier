@@ -1,4 +1,5 @@
 import type { Credentials } from '@/persistence';
+import { openSessionDataEncryptionKey } from '@/api/client/openSessionDataEncryptionKey';
 import type {
     SessionEncryptionContext,
     SessionStoredContentEncryptionMode,
@@ -26,6 +27,15 @@ export type ResolveSessionTransportContextResult =
           candidates?: string[];
           sessionId?: string;
       };
+
+export type ResolveSessionSendTransportContextResult =
+    | ResolveSessionTransportContextResult
+    | { ok: false; code: 'session_data_key_unopenable'; sessionId: string };
+
+type ResolveSessionTransportContextParams = Readonly<{
+    credentials: Credentials;
+    idOrPrefix: string;
+}>;
 
 const DEFAULT_SESSION_E2EE_DEK_FETCH_RETRY_ATTEMPTS = 3;
 const DEFAULT_SESSION_E2EE_DEK_FETCH_RETRY_DELAY_MS = 100;
@@ -112,10 +122,15 @@ async function fetchSessionTransportRecord(params: Readonly<{
     return rawSession;
 }
 
-export async function resolveSessionTransportContext(params: Readonly<{
-    credentials: Credentials;
-    idOrPrefix: string;
-}>): Promise<ResolveSessionTransportContextResult> {
+export function resolveSessionTransportContext(
+    params: ResolveSessionTransportContextParams & Readonly<{ requireOpenSessionDataKey: true }>,
+): Promise<ResolveSessionSendTransportContextResult>;
+export function resolveSessionTransportContext(
+    params: ResolveSessionTransportContextParams & Readonly<{ requireOpenSessionDataKey?: never }>,
+): Promise<ResolveSessionTransportContextResult>;
+export async function resolveSessionTransportContext(
+    params: ResolveSessionTransportContextParams & Readonly<{ requireOpenSessionDataKey?: true }>,
+): Promise<ResolveSessionSendTransportContextResult> {
     const resolved = await resolveSessionIdOrPrefix({
         credentials: params.credentials,
         idOrPrefix: params.idOrPrefix,
@@ -140,11 +155,26 @@ export async function resolveSessionTransportContext(params: Readonly<{
         };
     }
 
+    const mode = resolveSessionStoredContentEncryptionMode(rawSession);
+    // Send must not admit ciphertext sealed with a fallback key when the
+    // session explicitly publishes a key this credential cannot open.
+    if (params.requireOpenSessionDataKey && mode === 'e2ee' && params.credentials.encryption.type === 'dataKey') {
+        const publishedDataKey = typeof rawSession.dataEncryptionKey === 'string'
+            ? rawSession.dataEncryptionKey.trim()
+            : '';
+        if (publishedDataKey.length > 0 && !openSessionDataEncryptionKey({
+            credential: params.credentials,
+            encryptedDataEncryptionKeyBase64: publishedDataKey,
+        })) {
+            return { ok: false, code: 'session_data_key_unopenable', sessionId: resolved.sessionId };
+        }
+    }
+
     return {
         ok: true,
         sessionId: resolved.sessionId,
         rawSession,
         ctx: resolveSessionEncryptionContextFromCredentials(params.credentials, rawSession),
-        mode: resolveSessionStoredContentEncryptionMode(rawSession),
+        mode,
     };
 }

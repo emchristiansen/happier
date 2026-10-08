@@ -1403,3 +1403,139 @@ describe('sendSessionMessage', () => {
         expect(sendSessionMessageViaSocketCommitted).not.toHaveBeenCalled();
     });
 });
+
+// Exercise the real resolver, encryption and admission owners together. Only HTTP
+// and stdout are replaced; fixtures contain synthetic keys and credentials.
+describe('sendSessionMessage encryption admission', () => {
+    const sessionId = 'c111111111111111111111111';
+    const text = 'A message for the session';
+    const previousExitCode = process.exitCode;
+
+    beforeEach(() => {
+        vi.resetModules();
+        vi.doUnmock('./resolveSessionTransportContext');
+        vi.doUnmock('@/session/transport/http/sessionsHttp');
+        vi.doUnmock('@/api/session/pendingQueueV2Transport');
+        vi.doUnmock('./requestInactiveSessionResume');
+        vi.doUnmock('@/api/session/fetchEncryptedTranscriptWindow');
+        vi.doUnmock('@/api/session/transcriptMessageLookup');
+        vi.doUnmock('@/session/transport/rpc/sessionRpc');
+        vi.doUnmock('@/session/transport/socket/sessionSocketAgentState');
+        vi.doUnmock('@/session/transport/socket/sessionSocketSendMessage');
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.resetModules();
+        process.exitCode = previousExitCode;
+    });
+
+    async function prepareSession(kind: 'wrong recipient' | 'published DEK' | 'absent DEK' | 'legacy' | 'plain') {
+        const { deriveBoxPublicKeyFromSeed, sealEncryptedDataKeyEnvelopeV1 } = await import('@happier-dev/protocol');
+        const { encodeBase64, encrypt } = await import('@/api/encryption');
+        const { createSessionRecordFixture } = await import('@/testkit/backends/sessionFixtures');
+        const machineKey = new Uint8Array(32).fill(7);
+        const publicKey = deriveBoxPublicKeyFromSeed(machineKey);
+        const sessionKey = kind === 'absent DEK' || kind === 'legacy' ? machineKey : new Uint8Array(32).fill(9);
+        const credentials: import('@/persistence').Credentials = {
+            token: 'token_test',
+            encryption: kind === 'legacy'
+                ? { type: 'legacy', secret: machineKey }
+                : { type: 'dataKey', machineKey, publicKey },
+        };
+        const dataEncryptionKey = kind === 'absent DEK'
+            ? null
+            : encodeBase64(sealEncryptedDataKeyEnvelopeV1({
+                dataKey: sessionKey,
+                recipientPublicKey: kind === 'wrong recipient' || kind === 'plain' || kind === 'legacy'
+                    ? deriveBoxPublicKeyFromSeed(new Uint8Array(32).fill(8))
+                    : publicKey,
+                randomBytes: (length) => new Uint8Array(length).fill(3),
+            }), 'base64');
+        const metadata = { permissionMode: 'default' };
+        const session = createSessionRecordFixture({
+            id: sessionId, encryptionMode: kind === 'plain' ? 'plain' : 'e2ee',
+            dataEncryptionKey,
+            metadata: kind === 'plain' ? JSON.stringify(metadata)
+                : encodeBase64(encrypt(sessionKey, kind === 'legacy' ? 'legacy' : 'dataKey', metadata), 'base64'),
+        });
+        const axios = (await import('axios')).default;
+        vi.spyOn(axios, 'get').mockImplementation(async (url) => {
+            if (String(url).endsWith(`/v2/sessions/${sessionId}`)) {
+                return { status: 200, data: { session } };
+            }
+            throw new Error(`Unexpected HTTP GET: ${url}`);
+        });
+        const post = vi.spyOn(axios, 'post').mockImplementation(async (url) => {
+            if (String(url).endsWith(`/v2/sessions/${sessionId}/pending`)) {
+                return { status: 200, data: { didWrite: true } };
+            }
+            throw new Error(`Unexpected HTTP POST: ${url}`);
+        });
+        return { credentials, sessionKey, post };
+    }
+
+    it('refuses an unopenable published DEK before any admission POST', async () => {
+        const { credentials, post } = await prepareSession('wrong recipient');
+        const { sendSessionMessage } = await import('./sendSessionMessage');
+        expect(await sendSessionMessage({
+            credentials, idOrPrefix: sessionId, message: text, wait: false,
+            timeoutMs: 1000, resumeInactiveSession: false,
+        })).toEqual({ ok: false, code: 'session_data_key_unopenable' });
+        expect(post).not.toHaveBeenCalled();
+    });
+
+    it('prints the refusal as a JSON failure with a nonzero CLI exit code', async () => {
+        const { credentials, post } = await prepareSession('wrong recipient');
+        const { captureStdoutJsonOutput } = await import('@/testkit/logger/captureOutput');
+        const { cmdSessionSend } = await import('@/cli/commands/session/send');
+        process.exitCode = 0;
+        const output = captureStdoutJsonOutput();
+        try {
+            await cmdSessionSend(['send', sessionId, text, '--json'], {
+                readCredentialsFn: async () => credentials,
+            });
+            expect(output.json()).toMatchObject({
+                v: 1, ok: false, kind: 'session_send', error: { code: 'session_data_key_unopenable' },
+            });
+            expect(process.exitCode).toBe(1);
+            expect(post).not.toHaveBeenCalled();
+        } finally {
+            output.restore();
+        }
+    });
+
+    it.each(['published DEK', 'absent DEK', 'legacy'] as const)('sends decryptable ciphertext for %s', async (kind) => {
+        const { credentials, sessionKey, post } = await prepareSession(kind);
+        const { sendSessionMessage } = await import('./sendSessionMessage');
+        const { decodeBase64, decrypt } = await import('@/api/encryption');
+        expect(await sendSessionMessage({
+            credentials, idOrPrefix: sessionId, message: text, wait: false,
+            timeoutMs: 1000, localId: 'local-encryption-test', resumeInactiveSession: false,
+        })).toEqual({ ok: true, sessionId, localId: 'local-encryption-test', waited: false });
+        expect(post).toHaveBeenCalledTimes(1);
+        const body = post.mock.calls[0]?.[1];
+        expect(body).toMatchObject({ localId: 'local-encryption-test', messageRole: 'user' });
+        if (!body || typeof body !== 'object' || !('ciphertext' in body) || typeof body.ciphertext !== 'string') {
+            throw new Error('Expected an encrypted Pending admission body');
+        }
+        expect(decrypt(sessionKey, kind === 'legacy' ? 'legacy' : 'dataKey', decodeBase64(body.ciphertext)))
+            .toMatchObject({ role: 'user', content: { type: 'text', text } });
+        if (kind === 'published DEK' && credentials.encryption.type === 'dataKey') {
+            expect(decrypt(credentials.encryption.machineKey, 'dataKey', decodeBase64(body.ciphertext))).toBeNull();
+        }
+    });
+
+    it('keeps plain admission independent of an unusable DEK', async () => {
+        const { credentials, post } = await prepareSession('plain');
+        const { sendSessionMessage } = await import('./sendSessionMessage');
+        expect(await sendSessionMessage({
+            credentials, idOrPrefix: sessionId, message: text, wait: false,
+            timeoutMs: 1000, resumeInactiveSession: false,
+        })).toMatchObject({ ok: true, sessionId });
+        expect(post).toHaveBeenCalledTimes(1);
+        expect(post.mock.calls[0]?.[1]).toMatchObject({
+            content: { t: 'plain', v: { role: 'user', content: { type: 'text', text } } },
+        });
+    });
+});
