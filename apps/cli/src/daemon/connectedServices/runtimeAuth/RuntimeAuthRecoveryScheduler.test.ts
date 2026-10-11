@@ -2617,8 +2617,10 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     });
   });
 
-  it('does not dead-letter repeated local completions while provider outcome proof is pending', async () => {
+  it('waits for untargeted provider proof without repeating the credential rotation', async () => {
     let nowMs = 1_000;
+    const recover = vi.fn(async () => ({ status: 'credential_refreshed', restartRequested: true }));
+    const recordDiagnostic = vi.fn();
     const scheduler = new RuntimeAuthRecoveryScheduler({
       nowMs: () => nowMs,
       baseBackoffMs: 100,
@@ -2626,7 +2628,8 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       jitterMs: () => 0,
       maxAttempts: 2,
       providerOutcomePendingWaitMs: 250,
-      recover: async () => ({ status: 'credential_refreshed', restartRequested: true }),
+      recover,
+      recordDiagnostic,
     });
 
     await scheduler.enqueueApplyFailure({
@@ -2654,6 +2657,11 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       expect(intent?.status).not.toBe('exhausted');
       nowMs += 250;
     }
+    expect(recover).toHaveBeenCalledTimes(1);
+    expect(recordDiagnostic.mock.calls.filter(([event]) =>
+      event.event === 'runtime_auth_recovery_delayed'
+        && event.reason === 'recovery_unproven_awaiting_provider_outcome',
+    )).toHaveLength(5);
   });
 
   it('keeps a credential-refresh continuation targeted and bounded while provider proof is absent', async () => {

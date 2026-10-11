@@ -174,6 +174,77 @@ afterEach(() => {
     });
   });
 
+  it('keeps checking other bindings across ticks while one credential read never settles', async () => {
+    const baseDir = await mkdtemp(join(tmpdir(), 'happier-refresh-pending-'));
+    let finishPendingRead!: () => void;
+    const pendingRead = new Promise<null>((resolve) => {
+      finishPendingRead = () => resolve(null);
+    });
+    const reads: string[] = [];
+    const api = {
+      getConnectedServiceCredentialSealed: vi.fn(async (input: { profileId: string }) => {
+        reads.push(input.profileId);
+        return input.profileId === 'pending' ? await pendingRead : null;
+      }),
+    } as unknown as ApiClient;
+    completeCredentialAuthorityBoundaryFixture(api);
+    const coordinator = new ConnectedServiceRefreshCoordinator({
+      api,
+      credentials: { token: 'fixture-token', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) } },
+      machineIdProvider: () => 'machine-1',
+      activeServerDir: baseDir,
+      baseDir,
+      refreshWindowMs: 60_000,
+      refreshLeaseMs: 30_000,
+      now: () => Date.now(),
+    });
+    coordinator.registerSpawnTarget({
+      pid: 1,
+      sessionId: 'session-1',
+      agentId: 'codex',
+      materializationKey: 'session-pending-refresh',
+      connectedServicesBindingsRaw: { v: 1, bindingsByServiceId: {
+        'openai-codex': { source: 'connected', selection: 'profile', profileId: 'pending' },
+        'claude-subscription': { source: 'connected', selection: 'profile', profileId: 'healthy' },
+      } },
+    });
+    const warning = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers();
+    try {
+      let tickSettled = false;
+      const tick = coordinator.tickOnce().then(
+        () => { tickSettled = true; },
+        () => { tickSettled = true; },
+      );
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(reads).toContain('healthy');
+      expect(tickSettled).toBe(true);
+      await tick;
+
+      reads.length = 0;
+      await coordinator.tickOnce();
+      expect(reads).toContain('healthy');
+      expect(reads).not.toContain('pending');
+      expect(warning).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        serviceId: 'openai-codex', profileId: 'pending', ageMs: 30_000,
+      }));
+      const warningCount = warning.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(30_000);
+      await coordinator.tickOnce();
+      expect(warning.mock.calls.length).toBeGreaterThan(warningCount);
+
+      finishPendingRead();
+      await vi.advanceTimersByTimeAsync(0);
+      reads.length = 0;
+      await coordinator.tickOnce();
+      expect(reads).toContain('pending');
+    } finally {
+      finishPendingRead();
+      vi.useRealTimers();
+      warning.mockRestore();
+    }
+  });
+
   it('refreshes an expiring openai-codex credential and re-materializes for active spawn targets', async () => {
     const baseDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-refresh-'));
     const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-server-refresh-'));
@@ -1733,7 +1804,7 @@ afterEach(() => {
   // member binding must neither treat the active token as stale nor write its own credential into
   // the shared home (live incident 2026-07-08: member-vs-active fingerprint confusion caused a
   // cross-account clobber of the pool home plus a 30s restart loop).
-  async function buildGroupHomeOwnershipHarness() {
+  async function buildGroupHomeOwnershipHarness(clock?: () => number) {
     const baseDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-group-owner-'));
     const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-server-group-owner-'));
     const sourceHomeDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-source-group-owner-'));
@@ -1821,7 +1892,7 @@ afterEach(() => {
       baseDir,
       refreshWindowMs: 60_000,
       refreshLeaseMs: 30_000,
-      now: () => now,
+      now: () => clock?.() ?? now,
       processEnv: { HOME: sourceHomeDir },
       onAuthUpdated,
     });
@@ -2002,6 +2073,51 @@ afterEach(() => {
     }
 
     expect(harness.onAuthUpdated).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains a pending rotation across scheduled ticks without rotating it again', async () => {
+    let nowMs = 1_000_000;
+    const harness = await buildGroupHomeOwnershipHarness(() => nowMs);
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ access_token: 'rotated-access', refresh_token: 'rotated-refresh', expires_in: 3600 }),
+    }));
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+    let releaseDistribution!: () => void;
+    const distributionReleased = new Promise<void>((resolve) => { releaseDistribution = resolve; });
+    let observeDistributionStarted!: () => void;
+    const distributionStarted = new Promise<void>((resolve) => { observeDistributionStarted = resolve; });
+    harness.onAuthUpdated.mockImplementation(async () => {
+      observeDistributionStarted();
+      await distributionReleased;
+    });
+    const owner = harness.coordinator.refreshConnectedServiceCredentialForSpawnPreflight({
+      serviceId: 'claude-subscription', profileId: 'workA', force: true,
+    });
+    const warning = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    try {
+      await distributionStarted;
+      vi.useFakeTimers();
+      let tickSettled = false;
+      const tick = harness.coordinator.tickOnce().then(() => { tickSettled = true; });
+      nowMs += 30_000;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(tickSettled).toBe(true);
+      await tick;
+      await harness.coordinator.tickOnce();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(warning).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        profileId: 'workA', ageMs: 30_000, awaitStage: 'auth_updated_notification',
+      }));
+      expect(warning).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        profileId: 'workB', ageMs: 30_000, awaitStage: 'shared_group_binding',
+      }));
+    } finally {
+      releaseDistribution();
+      vi.useRealTimers();
+      await owner;
+      warning.mockRestore();
+    }
   });
 
   it('reports a successful old-member refresh as superseded when the session materializes current group truth', async () => {
