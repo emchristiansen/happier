@@ -1,12 +1,22 @@
 import { mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { replaceDirectoryAtomically } from './replaceDirectoryAtomically';
 
+const fsBoundary = vi.hoisted(() => ({ rename: vi.fn<typeof import('node:fs/promises').rename>() }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  fsBoundary.rename.mockImplementation(actual.rename);
+  return { ...actual, rename: fsBoundary.rename };
+});
+beforeEach(async () => {
+  const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+  fsBoundary.rename.mockReset().mockImplementation(actual.rename);
+});
 const roots: string[] = [];
-afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
+afterEach(async () => { vi.restoreAllMocks(); await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'codex-home-promotion-'));
   roots.push(root);
@@ -49,6 +59,23 @@ describe('atomic home promotion runtime custody', () => {
     expect((await stat(lockPath)).ino).toBe(before.ino);
     expect(await readFile(join(targetDir, 'codex-home', 'provided'), 'utf8')).toBe('old provided data');
     expect(await readdir(root)).toEqual(['target']);
+  });
+
+  it('merges an unprovided runtime directory recreated after promotion without replacing staged names', async () => {
+    const { targetDir, stagedDir } = await fixture();
+    const { rename } = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    const oldLock = await stat(join(targetDir, 'codex-home', 'tmp', 'arg0', '.lock'));
+    fsBoundary.rename.mockImplementation(async (source, destination) => {
+      await rename(source, destination);
+      if (source === stagedDir && destination === targetDir) {
+        await mkdir(join(targetDir, 'codex-home', 'tmp'), { recursive: true });
+        await writeFile(join(targetDir, 'codex-home', 'tmp', 'new-runtime-entry'), 'new runtime data');
+      }
+    });
+    await replaceDirectoryAtomically({ stagedDir, targetDir, preserveUnprovidedEntries: [{ root: 'codex-home', exclude: ['owned'] }] });
+    expect((await stat(join(targetDir, 'codex-home', 'tmp', 'arg0', '.lock'))).ino).toBe(oldLock.ino);
+    expect(await readFile(join(targetDir, 'codex-home', 'tmp', 'new-runtime-entry'), 'utf8')).toBe('new runtime data');
+    expect(await readFile(join(targetDir, 'codex-home', 'provided'), 'utf8')).toBe('new provided data');
   });
 
   it('does not preserve runtime entries for callers that do not opt in', async () => {
