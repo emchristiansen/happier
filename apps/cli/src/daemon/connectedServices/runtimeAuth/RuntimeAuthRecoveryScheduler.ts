@@ -890,6 +890,19 @@ function buildRuntimeAuthRecoveryAttemptId(reportId: string | undefined): string
   return `runtime-auth-attempt:${digest}`;
 }
 
+function hasExplicitRuntimeAuthRecoveryEpochChange(
+  previous: RuntimeAuthRecoveryIntent,
+  next: RuntimeAuthRecoveryIntent,
+): boolean {
+  const previousSourceKey = previous.classification.sourceKey;
+  const nextSourceKey = next.classification.sourceKey;
+  return typeof previousSourceKey === 'string'
+    && previousSourceKey.length > 0
+    && typeof nextSourceKey === 'string'
+    && nextSourceKey.length > 0
+    && previousSourceKey !== nextSourceKey;
+}
+
 function mergeRuntimeAuthRecoveryIntent(
   previous: RuntimeAuthRecoveryIntent | null,
   next: RuntimeAuthRecoveryIntent,
@@ -909,14 +922,7 @@ function mergeRuntimeAuthRecoveryIntent(
     return next.lastSettledTransition === 'working' ? next : previous;
   }
   const sameEvidence = hasSameRuntimeAuthRecoveryEvidence(previous, next);
-  const previousSourceKey = previous.classification.sourceKey;
-  const nextSourceKey = next.classification.sourceKey;
-  const hasExplicitNewEvidenceEpoch = typeof previousSourceKey === 'string'
-    && previousSourceKey.length > 0
-    && typeof nextSourceKey === 'string'
-    && nextSourceKey.length > 0
-    && previousSourceKey !== nextSourceKey;
-  if (!sameEvidence && hasExplicitNewEvidenceEpoch) return next;
+  if (!sameEvidence && hasExplicitRuntimeAuthRecoveryEpochChange(previous, next)) return next;
   if (!sameEvidence && previous.status !== 'checking' && previous.status !== 'resumed_awaiting_proof') return next;
   return {
     ...next,
@@ -1068,6 +1074,12 @@ function mergeRuntimeAuthRecoveryWakeWrite(input: Readonly<{
     // Observation proves nothing about failure evidence admitted after its
     // claim. Preserve that intake's recovery phase and remove only this wake's
     // observation increment, so it cannot relatch proof or consume a retry.
+    // A replacement epoch did not inherit this increment. Legacy records may
+    // acquire their first attempt identity during same-epoch intake, so only an
+    // existing identity mismatch or the shared source-epoch rule rejects it.
+    const countBelongsToObservedEpoch = !hasExplicitRuntimeAuthRecoveryEpochChange(input.base, input.current)
+      && (input.base.attemptId === undefined || input.current.attemptId === input.base.attemptId);
+    if (!countBelongsToObservedEpoch) return input.current;
     const observationIncrement = Math.max(0, input.base.attemptCount - input.next.attemptCount);
     return { ...input.current,
       attemptCount: Math.max(0, input.current.attemptCount - observationIncrement),
