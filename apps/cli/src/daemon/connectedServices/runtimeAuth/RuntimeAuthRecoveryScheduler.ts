@@ -1116,14 +1116,10 @@ function isStaleProfileReplayForPendingProofTarget(input: Readonly<{
   return Boolean(failingProfileId && failingProfileId !== currentTargetProfileId);
 }
 
-function isUntargetedProviderOutcomeProofWaitRefresh(input: Readonly<{
-  intent: RuntimeAuthRecoveryIntent;
-  pendingTarget: RuntimeAuthPendingProofTarget | null;
-}>): boolean {
-  return input.intent.lastError === RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR
-    && input.pendingTarget === null
-    && input.intent.pendingTargetProfileId === null
-    && input.intent.pendingTargetGeneration === null;
+function isUntargetedProviderOutcomeProofWait(intent: RuntimeAuthRecoveryIntent): boolean {
+  return intent.lastError === RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR
+    && intent.pendingTargetProfileId == null
+    && intent.pendingTargetGeneration == null;
 }
 
 // Handler verdict: the replayed recovery no longer applies (e.g. the group already moved
@@ -1193,9 +1189,13 @@ export class RuntimeAuthRecoveryScheduler {
           : intent.status,
       getNextRetryAtMs: (intent) => intent.nextRetryAtMs,
       getAttemptCount: (intent) => intent.attemptCount,
-      getMaxAttempts: (intent) => isRuntimeAuthDurableWaitIntent(intent)
-        ? Number.MAX_SAFE_INTEGER
-        : intent.maxAttempts,
+      // Proof observations do not run recovery attempts. The durable scheduler
+      // treats zero as no attempt ceiling; targeted recovery keeps its budget.
+      getMaxAttempts: (intent) => isUntargetedProviderOutcomeProofWait(intent)
+        ? 0
+        : isRuntimeAuthDurableWaitIntent(intent)
+          ? Number.MAX_SAFE_INTEGER
+          : intent.maxAttempts,
       terminalRecordRetentionMs: DEFAULT_RUNTIME_AUTH_RECOVERY_TERMINAL_RECORD_RETENTION_MS,
       getTerminalPruneReferenceMs: (intent) => intent.terminalAtMs ?? intent.armedAtMs,
       markChecking: (intent, attemptCount) => ({
@@ -1273,6 +1273,25 @@ export class RuntimeAuthRecoveryScheduler {
       }),
       recover: async (intent) => {
         try {
+          // Local repair already completed. Untargeted wakes can observe the
+          // durable proof wait, but must not rotate again to manufacture proof.
+          // The wait outcome retains the state and emits the regular delayed
+          // diagnostic on every wake until provider-outcome evidence arrives.
+          if (isUntargetedProviderOutcomeProofWait(intent)) {
+            return {
+              status: 'wait',
+              exhaustOnMaxAttempt: false,
+              lastError: RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR,
+              intent: {
+                ...intent,
+                status: 'resumed_awaiting_proof',
+                attemptCount: Math.max(0, intent.attemptCount - 1),
+              },
+              ...(this.providerOutcomePendingWaitMs === null
+                ? {}
+                : { nextRetryAtMs: deps.nowMs() + this.providerOutcomePendingWaitMs }),
+            };
+          }
           const result = await deps.recover({
             sessionId: intent.sessionId,
             switchesThisTurn: intent.switchesThisTurn,
@@ -1337,10 +1356,12 @@ export class RuntimeAuthRecoveryScheduler {
             // additionally bounded by maxCoalescedReplays when the target profile
             // keeps changing under the same durable recovery.
             const coalescedReplayCount = intent.coalescedReplayCount ?? 0;
-            const rollbackAttempt = isUntargetedProviderOutcomeProofWaitRefresh({ intent, pendingTarget })
-              || (coalescedReplay && coalescedReplayCount < this.maxCoalescedReplays);
+            const rollbackAttempt = coalescedReplay && coalescedReplayCount < this.maxCoalescedReplays;
             return {
               status: 'wait',
+              exhaustOnMaxAttempt: pendingTarget !== null
+                || intent.pendingTargetProfileId != null
+                || intent.pendingTargetGeneration != null,
               lastError: RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR,
               intent: {
                 ...intent,

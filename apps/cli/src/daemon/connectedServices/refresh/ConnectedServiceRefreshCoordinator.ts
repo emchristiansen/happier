@@ -201,6 +201,13 @@ export class ConnectedServiceCredentialRefreshError extends Error {
 }
 
 export class ConnectedServiceRefreshCoordinator {
+  private readonly scheduledBindingTasks = new Map<string, Readonly<{
+    binding: BoundProfile;
+    startedAtMs: number;
+    groupKeys: ReadonlySet<string>;
+    isWaitingForSharedGroup: () => boolean;
+    completion: Promise<void>;
+  }>>();
   private readonly runtimeRegistry: ConnectedServiceRuntimeRegistry;
   private readonly inFlightRefreshes = new Map<string, Readonly<{
     credentialReady: Promise<ConnectedServiceCredentialRefreshResult>;
@@ -307,25 +314,122 @@ export class ConnectedServiceRefreshCoordinator {
   async tickOnce(): Promise<void> {
     const now = this.params.now();
     const unique = new Map<string, BoundProfile>();
+    const groupKeysByBinding = new Map<string, Set<string>>();
     const errors: unknown[] = [];
 
     for (const target of this.runtimeRegistry.listRefreshTargets()) {
       for (const binding of target.bindings) {
         unique.set(bindingKey(binding), binding);
+        const selection = target.selectionsByServiceId.get(binding.serviceId);
+        if (selection?.kind === 'group') {
+          const key = bindingKey(binding);
+          const groupKeys = groupKeysByBinding.get(key) ?? new Set<string>();
+          groupKeys.add(`${binding.serviceId}::${selection.groupId}`);
+          groupKeysByBinding.set(key, groupKeys);
+        }
       }
     }
 
-    for (const binding of unique.values()) {
+    // Retained rotations also stay observable if their last session unregisters.
+    for (const task of this.scheduledBindingTasks.values()) {
+      if (now - task.startedAtMs >= this.params.refreshLeaseMs) {
+        this.warnPendingScheduledBinding(task.binding, task.startedAtMs);
+      }
+    }
+
+    // One retained task per binding; distinct bindings already have independent
+    // server refresh leases. A pending task keeps custody of its rotation even
+    // after the scheduling budget expires, without holding up later ticks.
+    await Promise.all(Array.from(unique.values(), async (binding) => {
       try {
-        await this.maybeRefreshBinding(binding, now);
+        await this.checkScheduledBinding(binding, now, groupKeysByBinding.get(bindingKey(binding)) ?? new Set());
       } catch (error) {
         errors.push(error);
       }
-    }
+    }));
 
     if (errors.length > 0) {
       throw new AggregateError(errors, 'Connected services refresh tick failed');
     }
+  }
+
+  private async checkScheduledBinding(binding: BoundProfile, now: number, groupKeys: ReadonlySet<string>): Promise<void> {
+    const key = bindingKey(binding);
+    const existing = this.scheduledBindingTasks.get(key);
+    if (existing) {
+      return;
+    }
+
+    // Divergent member bindings can materialize the same canonical group home.
+    // Recheck its staleness after the earlier binding completes rather than
+    // repairing and notifying twice. Independent group/profile work proceeds.
+    const sharedGroupTasks = Array.from(this.scheduledBindingTasks.values()).filter((task) =>
+      Array.from(groupKeys).some((groupKey) => task.groupKeys.has(groupKey)),
+    );
+    let waitingForSharedGroup = sharedGroupTasks.length > 0;
+    let schedulingBudgetExpired = false;
+    const task = {
+      binding,
+      startedAtMs: now,
+      groupKeys,
+      isWaitingForSharedGroup: () => waitingForSharedGroup,
+      completion: Promise.resolve()
+        .then(async () => {
+          await Promise.allSettled(sharedGroupTasks.map((pending) => pending.completion));
+          waitingForSharedGroup = false;
+          await this.maybeRefreshBinding(binding, this.params.now());
+        })
+        .catch((error: unknown) => {
+          if (schedulingBudgetExpired) {
+            logger.warn('[ConnectedServiceRefresh] Pending scheduled binding failed', {
+              serviceId: binding.serviceId, profileId: binding.profileId, error,
+            });
+          }
+          throw error;
+        })
+        .finally(() => {
+          if (this.scheduledBindingTasks.get(key) === task) {
+            this.scheduledBindingTasks.delete(key);
+          }
+        }),
+    };
+    this.scheduledBindingTasks.set(key, task);
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        task.completion,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            schedulingBudgetExpired = true;
+            this.warnPendingScheduledBinding(binding, task.startedAtMs);
+            resolve();
+          }, this.params.refreshLeaseMs);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private warnPendingScheduledBinding(binding: BoundProfile, startedAtMs: number): void {
+    const key = bindingKey(binding);
+    const awaitStage = this.scheduledBindingTasks.get(key)?.isWaitingForSharedGroup()
+      ? 'shared_group_binding'
+      : this.inFlightRefreshAuthUpdatedNotifications.has(key)
+        ? 'auth_updated_notification'
+        : this.inFlightRefreshRematerializations.has(key)
+          ? 'rematerialization'
+          : this.inFlightRefreshes.has(key)
+            ? 'credential_refresh_completion'
+            : 'credential_check';
+    logger.warn('[ConnectedServiceRefresh] Scheduled binding still pending', {
+      serviceId: binding.serviceId,
+      profileId: binding.profileId,
+      ageMs: Math.max(0, this.params.now() - startedAtMs),
+      awaitStage,
+    });
   }
 
   async refreshOpenAiCodexChatGptTokensForBridge(input: Readonly<{

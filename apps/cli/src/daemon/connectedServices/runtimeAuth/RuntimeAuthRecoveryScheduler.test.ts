@@ -2617,7 +2617,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     });
   });
 
-  it('waits for untargeted provider proof without repeating the credential rotation', async () => {
+  it.each([1, 2])('waits for untargeted provider proof without repeating the credential rotation (max attempts %i)', async (maxAttempts) => {
     let nowMs = 1_000;
     const recover = vi.fn(async () => ({ status: 'credential_refreshed', restartRequested: true }));
     const recordDiagnostic = vi.fn();
@@ -2626,7 +2626,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       baseBackoffMs: 100,
       maxBackoffMs: 1_000,
       jitterMs: () => 0,
-      maxAttempts: 2,
+      maxAttempts,
       providerOutcomePendingWaitMs: 250,
       recover,
       recordDiagnostic,

@@ -198,7 +198,7 @@ afterEach(() => {
       refreshLeaseMs: 30_000,
       now: () => Date.now(),
     });
-    coordinator.registerSpawnTarget({
+    const target: Parameters<typeof coordinator.registerSpawnTarget>[0] = {
       pid: 1,
       sessionId: 'session-1',
       agentId: 'codex',
@@ -207,7 +207,8 @@ afterEach(() => {
         'openai-codex': { source: 'connected', selection: 'profile', profileId: 'pending' },
         'claude-subscription': { source: 'connected', selection: 'profile', profileId: 'healthy' },
       } },
-    });
+    };
+    coordinator.registerSpawnTarget(target);
     const warning = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     vi.useFakeTimers();
     try {
@@ -233,8 +234,14 @@ afterEach(() => {
       await coordinator.tickOnce();
       expect(warning.mock.calls.length).toBeGreaterThan(warningCount);
 
+      coordinator.unregisterPid(1);
+      const warningCountBeforeUnregister = warning.mock.calls.length;
+      await coordinator.tickOnce();
+      expect(warning.mock.calls.length).toBeGreaterThan(warningCountBeforeUnregister);
+
       finishPendingRead();
       await vi.advanceTimersByTimeAsync(0);
+      coordinator.registerSpawnTarget(target);
       reads.length = 0;
       await coordinator.tickOnce();
       expect(reads).toContain('pending');
@@ -2097,6 +2104,7 @@ afterEach(() => {
     const warning = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     try {
       await distributionStarted;
+      const fetchCountAfterRotation = fetchMock.mock.calls.length;
       vi.useFakeTimers();
       let tickSettled = false;
       const tick = harness.coordinator.tickOnce().then(() => { tickSettled = true; });
@@ -2105,7 +2113,8 @@ afterEach(() => {
       expect(tickSettled).toBe(true);
       await tick;
       await harness.coordinator.tickOnce();
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(fetchCountAfterRotation);
+      expect(harness.api.registerConnectedServiceCredentialSealed).toHaveBeenCalledTimes(1);
       expect(warning).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
         profileId: 'workA', ageMs: 30_000, awaitStage: 'auth_updated_notification',
       }));
