@@ -1067,24 +1067,25 @@ function mergeRuntimeAuthRecoveryWakeWrite(input: Readonly<{
       ? input.next
       : input.current;
   }
-  if (hasSameRuntimeAuthFailureFields(input.current, input.base)) return input.next;
   if (input.reason === 'waiting'
-    && isUntargetedProviderOutcomeProofWait(input.base)
-    && !hasSameRuntimeAuthRecoveryEvidence(input.current, input.base)) {
-    // Observation proves nothing about failure evidence admitted after its
-    // claim. Preserve that intake's recovery phase and remove only this wake's
-    // observation increment, so it cannot relatch proof or consume a retry.
-    // The claim assigns even legacy records a stable identity atomically. A
-    // replacement epoch cannot inherit this observation increment.
+    && isUntargetedProviderOutcomeProofWait(input.base)) {
+    // Equal failure evidence can belong to a replacement attempt. Fence every
+    // observation before the equality shortcuts or generic phase merge. The
+    // atomic claim gives legacy records an identity; absent IDs never match.
     const countBelongsToObservedEpoch = input.base.attemptId !== undefined
       && input.current.attemptId === input.base.attemptId
       && !hasExplicitRuntimeAuthRecoveryEpochChange(input.base, input.current);
     if (!countBelongsToObservedEpoch) return input.current;
-    const observationIncrement = Math.max(0, input.base.attemptCount - input.next.attemptCount);
-    return { ...input.current,
-      attemptCount: Math.max(0, input.current.attemptCount - observationIncrement),
-    };
+    if (!hasSameRuntimeAuthRecoveryEvidence(input.current, input.base)) {
+      // Changed evidence in this attempt retains its recovery phase and loses
+      // only this wake's observation increment, rather than a real retry.
+      const observationIncrement = Math.max(0, input.base.attemptCount - input.next.attemptCount);
+      return { ...input.current,
+        attemptCount: Math.max(0, input.current.attemptCount - observationIncrement),
+      };
+    }
   }
+  if (hasSameRuntimeAuthFailureFields(input.current, input.base)) return input.next;
   const keepLatestFailureMessage = input.reason === 'waiting' || input.reason === 'delayed';
   return {
     ...input.next,

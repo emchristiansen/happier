@@ -2910,6 +2910,85 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     }
   });
 
+  it.each([{ stableSource: false, legacy: false }, { stableSource: true, legacy: false }, { stableSource: true, legacy: true }])('preserves replacement work when evidence returns to the old classification (stable source $stableSource, legacy $legacy)', async ({ stableSource, legacy }) => {
+    const maxAttempts = 3;
+    const directory = await mkdtemp(join(tmpdir(), 'runtime-auth-proof-returned-evidence-'));
+    const filePath = join(directory, 'intents.json');
+    const baseStore = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath);
+    const claimStarted = createDeferred<void>();
+    const releaseClaim = createDeferred<void>();
+    let holdNextClaim = false;
+    const heldStore: DurableRecoveryStore<RuntimeAuthRecoveryIntent> = {
+      ...baseStore,
+      transact: async <TResult>(key: string, transaction: (current: Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null }>) => Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null; result: TResult }>) => {
+        let claimed = false;
+        const result = await baseStore.transact!<TResult>(key, (current) => {
+          const next = transaction(current);
+          claimed = current.effectClaimToken === null && next.effectClaimToken !== null;
+          return next;
+        });
+        if (holdNextClaim && claimed) {
+          holdNextClaim = false;
+          claimStarted.resolve();
+          await releaseClaim.promise;
+        }
+        return result;
+      },
+    };
+    let nowMs = 1_000;
+    const recover = vi.fn(async () => ({ status: 'credential_refreshed', restartRequested: true }));
+    const createScheduler = (store: DurableRecoveryStore<RuntimeAuthRecoveryIntent>) => new RuntimeAuthRecoveryScheduler({
+      nowMs: () => nowMs, maxAttempts, providerOutcomePendingWaitMs: 250,
+      recover, durableStore: store,
+    });
+    const first = createScheduler(heldStore);
+    const second = createScheduler(createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath));
+    let oldWake: Promise<unknown> | undefined;
+    const sessionId = 'session-proof-returned-evidence';
+    const recoveryKey = buildRuntimeAuthRecoveryKey({ sessionId, serviceId: 'openai-codex', profileId: 'primary', groupId: 'team' });
+    const begin = (scheduler: RuntimeAuthRecoveryScheduler, reportId: string, sourceKey: string, kind: 'usage_limit' | 'auth_expired' = 'usage_limit') => scheduler.beginClassifiedFailure({
+      reportId, sessionId, switchesThisTurn: 1,
+      classification: classificationFor({ sourceKey, kind }),
+    });
+    try {
+      await begin(first, 'old-report-a', 'source-a');
+      await first.wakeByKey({ recoveryKey, reason: 'manual' });
+      if (legacy) {
+        const { attemptId: _attemptId, ...legacyIntent } = first.readByKey(recoveryKey)!;
+        await baseStore.write(recoveryKey, legacyIntent);
+      }
+      nowMs += 250;
+      holdNextClaim = true;
+      oldWake = first.wakeByKey({ recoveryKey, reason: 'manual' });
+      await claimStarted.promise;
+      await begin(second, 'replacement-report-b', stableSource ? 'source-a' : 'source-b', 'auth_expired');
+      await begin(second, 'new-report-a', 'source-a');
+      const newAttemptId = second.readByKey(recoveryKey)?.attemptId;
+      expect(second.readByKey(recoveryKey)).toMatchObject({ attemptCount: 0 });
+      await second.markDurableWaitForResultByKey({
+        recoveryKey, expectedAttemptId: newAttemptId,
+        classificationFailureKind: 'usage_limit', classificationResetsAtMs: null,
+        result: { status: 'no_eligible_member', generation: 12, groupExhausted: true, retryAtMs: 9_000, excluded: [] },
+      });
+      releaseClaim.resolve();
+      await oldWake;
+      expect(second.readByKey(recoveryKey)).toMatchObject({
+        attemptId: newAttemptId, status: 'waiting', attemptCount: 1,
+        lastError: 'no_eligible_member', nextRetryAtMs: 9_000,
+        classification: { sourceKey: 'source-a' },
+      });
+      nowMs = 9_000;
+      await second.wakeByKey({ recoveryKey, reason: 'manual' });
+      expect(recover).toHaveBeenCalledTimes(2);
+    } finally {
+      releaseClaim.resolve();
+      await oldWake;
+      first.dispose();
+      second.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it.each(['explicit', 'classification'] as const)('preserves replacement work after legacy identity adoption (%s)', async (replacement) => {
     const maxAttempts = 3;
     const directory = await mkdtemp(join(tmpdir(), 'runtime-auth-proof-legacy-hops-'));
