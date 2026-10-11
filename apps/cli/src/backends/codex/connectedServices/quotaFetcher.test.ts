@@ -29,7 +29,7 @@ describe('createOpenAiCodexQuotaFetcher', () => {
           ok: true,
           json: async () => ({
             rate_limit: {
-              primary_window: { used_percent: 10, reset_at: 1700000000 },
+              primary_window: { limit_window_seconds: 18000, used_percent: 10, reset_at: 1700000000 },
             },
           }),
         };
@@ -91,8 +91,8 @@ describe('createOpenAiCodexQuotaFetcher', () => {
       json: async () => ({
         plan_type: 'pro',
         rate_limit: {
-          primary_window: { used_percent: 10, reset_at: 1700000000 },
-          secondary_window: { used_percent: 25, reset_at: 1700003600 },
+          primary_window: { limit_window_seconds: 18000, used_percent: 10, reset_at: 1700000000 },
+          secondary_window: { limit_window_seconds: 604800, used_percent: 25, reset_at: 1700003600 },
         },
       }),
     }));
@@ -134,8 +134,8 @@ describe('createOpenAiCodexQuotaFetcher', () => {
       json: async () => ({
         plan_type: 'pro',
         rate_limit: {
-          primary_window: { used_percent: 10, reset_at: 1700000000 },
-          secondary_window: { used_percent: 25, reset_at: 1700003600 },
+          primary_window: { limit_window_seconds: 18000, used_percent: 10, reset_at: 1700000000 },
+          secondary_window: { limit_window_seconds: 604800, used_percent: 25, reset_at: 1700003600 },
         },
       }),
     }));
@@ -196,7 +196,7 @@ describe('createOpenAiCodexQuotaFetcher', () => {
           json: async () => ({
             plan_type: 'pro',
             rate_limit: {
-              primary_window: { used_percent: 100, reset_at: '2026-06-17T12:00:00.000Z' },
+              primary_window: { limit_window_seconds: 18000, used_percent: 100, reset_at: '2026-06-17T12:00:00.000Z' },
             },
             rate_limit_reset_credits: { available_count: 1 },
           }),
@@ -381,7 +381,7 @@ describe('createOpenAiCodexQuotaFetcher', () => {
       ok: true,
       json: async () => ({
         rate_limit: {
-          primary_window: { used_percent: 55, reset_at: 1700000000 },
+          primary_window: { limit_window_seconds: 18000, used_percent: 55, reset_at: 1700000000 },
         },
       }),
     }));
@@ -466,9 +466,9 @@ describe('createOpenAiCodexQuotaFetcher', () => {
         plan_type: 'pro',
         rate_limit: {
           // Legacy relative shape: no absolute reset, only seconds-until-reset.
-          primary_window: { used_percent: 100, window_minutes: 300, resets_in_seconds: 1_800 },
+          primary_window: { limit_window_seconds: 18000, used_percent: 100, window_minutes: 300, resets_in_seconds: 1_800 },
           // A relative value misparsed as an epoch would land in 1970 — must be dropped.
-          secondary_window: { used_percent: 25, reset_at: 86_400 },
+          secondary_window: { limit_window_seconds: 604800, used_percent: 25, reset_at: 86_400 },
         },
       }),
     }));
@@ -498,5 +498,30 @@ describe('createOpenAiCodexQuotaFetcher', () => {
       { meterId: 'session', resetsAt: now + 1_800_000 },
       { meterId: 'weekly', resetsAt: null },
     ]);
+  });
+});
+
+
+describe('Codex reported window identity', () => {
+  it.each([
+    { primary: { limit_window_seconds: 604800, used_percent: 25 }, secondary: { limit_window_seconds: 18000, used_percent: 10 }, ids: ['weekly', 'session'], percentages: [25, 10] },
+    { primary: { limit_window_seconds: 18000, used_percent: 25 }, secondary: { limit_window_seconds: 18000, used_percent: 10 }, ids: ['session_primary_window', 'session_secondary_window'], percentages: [25, 10] },
+    { primary: { limit_window_seconds: 3600, used_percent: '25' }, secondary: { used_percent: null }, ids: ['codex_primary_window', 'codex_secondary_window'], percentages: [null, null] },
+    { primary: { limit_window_seconds: '18000', used_percent: false }, secondary: undefined, ids: ['codex_primary_window'], percentages: [null] },
+    { primary: undefined, secondary: undefined, ids: ['codex_unknown'], percentages: [null] },
+  ])('uses the reported duration without inventing identity or utilization: $ids', async ({ primary, secondary, ids, percentages }) => {
+    const now = 1_000_000;
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({ rate_limit: { primary_window: primary, secondary_window: secondary } }) })));
+    try {
+      const record = buildConnectedServiceCredentialRecord({
+        now, serviceId: 'openai-codex', profileId: 'synthetic', kind: 'oauth', expiresAt: now + 60_000,
+        oauth: { accessToken: 'synthetic-at', refreshToken: 'synthetic-rt', idToken: null, scope: null, tokenType: null, providerAccountId: null, providerEmail: null },
+      });
+      const snapshot = await createOpenAiCodexQuotaFetcher().fetch({ record, now, signal: new AbortController().signal });
+      expect(snapshot?.meters.map((meter) => meter.meterId)).toEqual(ids);
+      expect(snapshot?.meters.map((meter) => meter.utilizationPct)).toEqual(percentages);
+      expect(snapshot?.meters.every((meter) => meter.providerLimitId === undefined)).toBe(true);
+      expect(ConnectedServiceQuotaSnapshotV1Schema.safeParse(snapshot).success).toBe(true);
+    } finally { vi.unstubAllGlobals(); }
   });
 });

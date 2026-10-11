@@ -5,7 +5,7 @@ import { dirname } from 'node:path';
 
 import { withJsonOwnerFileLock } from '@/utils/fs/jsonOwnerFileLock';
 
-import type { DurableRecoveryStore } from './DurableBackoffRecoveryScheduler';
+import type { DurableRecoveryStore, TransactionalRecoveryStore } from './DurableBackoffRecoveryScheduler';
 
 type RecoveryIntentFileSnapshot = Readonly<{
   v: 1;
@@ -66,7 +66,7 @@ async function withRecoveryIntentFileLock<TResult>(
 export function createRecoveryIntentFileStore<TIntent>(
   filePath: string,
   options: RecoveryIntentFileStoreOptions = {},
-): DurableRecoveryStore<TIntent> {
+): TransactionalRecoveryStore<TIntent> {
   let persistSequence = 0;
   let writeQueue: Promise<void> = Promise.resolve();
   const intentsByRecoveryKey = new Map<string, unknown>();

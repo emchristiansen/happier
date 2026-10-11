@@ -8,6 +8,12 @@ import { CURRENT_FLAGSHIP_CLAUDE_MODEL_ID } from './providers/claude/flagshipMod
 const cursorAgentId = 'cursor' as AgentId;
 
 describe('agent model config', () => {
+  it('offers Opus 5.5 with the installed context and effort defaults', () => {
+    expect(getAgentStaticModels('claude')[0]).toMatchObject({
+      id: 'claude-opus-5-5', contextWindowTokens: 1_000_000,
+      modelOptions: expect.arrayContaining([expect.objectContaining({ id: 'reasoning_effort', currentValue: 'medium' })]),
+    });
+  });
   it('covers every canonical agent', () => {
     expect(Object.keys(AGENT_MODEL_CONFIG).sort()).toEqual([...AGENT_IDS].sort());
     for (const agentId of AGENT_IDS) {
@@ -114,8 +120,8 @@ describe('agent model config', () => {
     expect(claude.staticModels?.map((model) => model.id)).toEqual(claude.allowedModes);
     expect(gemini.staticModels?.map((model) => model.id)).toEqual(gemini.allowedModes);
     expect(claudeModels[0]).toMatchObject({
-      id: 'claude-opus-5',
-      name: 'Opus 5',
+      id: 'claude-opus-5-5',
+      name: 'Opus 5.5',
       description: expect.any(String),
       contextWindowTokens: 1_000_000,
     });
