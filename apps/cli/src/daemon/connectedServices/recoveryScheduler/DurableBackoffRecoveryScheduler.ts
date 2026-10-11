@@ -28,6 +28,37 @@ export type DurableRecoveryStore<TIntent> = Readonly<{
   prune?: (predicate: (entry: Readonly<{ recoveryKey: string; value: unknown }>) => boolean) => Promise<ReadonlyArray<string>> | ReadonlyArray<string>;
 }>;
 
+export type TransactionalRecoveryStore<TIntent> = DurableRecoveryStore<TIntent> & Readonly<{
+  transact: NonNullable<DurableRecoveryStore<TIntent>['transact']>;
+}>;
+
+function createMemoryTransactionalRecoveryStore<TIntent>(): TransactionalRecoveryStore<TIntent> {
+  const rows = new Map<string, Readonly<{ intent: TIntent; effectClaimToken: string | null }>>();
+  const transact: TransactionalRecoveryStore<TIntent>['transact'] = (key, transaction) => {
+    const next = transaction(rows.get(key) ?? { intent: null, effectClaimToken: null });
+    if (next.intent === null) rows.delete(key);
+    else rows.set(key, { intent: next.intent, effectClaimToken: next.effectClaimToken });
+    return next.result;
+  };
+  return {
+    read: (key) => rows.get(key)?.intent ?? null,
+    readAll: () => [...rows].map(([key, row]) => [key, row.intent] as const),
+    write: (key, intent) => { transact(key, (current) => ({ ...current, intent, result: undefined })); },
+    merge: (key, next, merge) => transact(key, (current) => {
+      const intent = merge(current.intent, next);
+      return { ...current, intent, result: intent };
+    }),
+    remove: (key) => { rows.delete(key); },
+    transact,
+  };
+}
+
+type DurableRecoveryObservation<TIntent> = Readonly<{
+  intent: TIntent;
+  retryAtMs: number;
+  reason: string;
+}>;
+
 export type DurableRecoveryOutcome<TIntent> =
   | Readonly<{ status: 'success'; intent?: TIntent }>
   | Readonly<{ status: 'wait'; nextRetryAtMs?: number | null; lastError?: string | null; intent?: TIntent; exhaustOnMaxAttempt?: boolean }>
@@ -62,6 +93,7 @@ type DurableWakePreparation<TIntent> =
   | Readonly<{ status: 'checking' }>
   | Readonly<{ status: 'delayed'; intent: TIntent; retryAtMs: number; reason: string }>
   | Readonly<{ status: 'exhausted'; intent: TIntent }>
+  | (Readonly<{ status: 'observed' }> & DurableRecoveryObservation<TIntent>)
   | Readonly<{ status: 'claimed'; intent: TIntent }>;
 
 type TimerHandle = ReturnType<typeof setTimeout>;
@@ -71,7 +103,6 @@ type DurableBackoffRecoverySchedulerDeps<TIntent> = Readonly<{
   baseBackoffMs?: number;
   maxBackoffMs?: number;
   jitterMs?: () => number;
-  store?: DurableRecoveryStore<TIntent>;
   normalizeIntent: (value: unknown) => TIntent | null;
   getStatus: (intent: TIntent) => DurableRecoveryStatus;
   getNextRetryAtMs: (intent: TIntent) => number | null;
@@ -102,7 +133,11 @@ type DurableBackoffRecoverySchedulerDeps<TIntent> = Readonly<{
   onSuperseded?: (input: Readonly<{ sessionId: string; intent: TIntent; reason: string | null }>) => void;
   onExhausted?: (input: Readonly<{ sessionId: string; intent: TIntent; lastError: string | null }>) => void;
   onDelayed?: (input: Readonly<{ sessionId: string; intent: TIntent; retryAtMs: number; reason: string }>) => void;
-}>;
+}> & (
+  | Readonly<{ store?: DurableRecoveryStore<TIntent>; observeBeforeEffectClaim?: undefined }>
+  | Readonly<{ store?: TransactionalRecoveryStore<TIntent>;
+      observeBeforeEffectClaim: (intent: TIntent) => DurableRecoveryObservation<TIntent> | null }>
+);
 
 const defaultBaseBackoffMs = 1_000;
 const defaultMaxBackoffMs = 60_000;
@@ -128,8 +163,12 @@ export class DurableBackoffRecoveryScheduler<TIntent> {
   private readonly maxBackoffMs: number;
   private readonly terminalRecordRetentionMs: number | null;
   private disposed = false;
+  private readonly deps: DurableBackoffRecoverySchedulerDeps<TIntent>;
 
-  constructor(private readonly deps: DurableBackoffRecoverySchedulerDeps<TIntent>) {
+  constructor(deps: DurableBackoffRecoverySchedulerDeps<TIntent>) {
+    this.deps = deps.observeBeforeEffectClaim
+      ? { ...deps, store: deps.store ?? createMemoryTransactionalRecoveryStore<TIntent>() }
+      : deps;
     this.baseBackoffMs = normalizePositiveInteger(deps.baseBackoffMs, defaultBaseBackoffMs);
     this.maxBackoffMs = Math.max(
       this.baseBackoffMs,
@@ -594,6 +633,14 @@ export class DurableBackoffRecoveryScheduler<TIntent> {
           };
         }
         const currentMaxAttempts = this.deps.getMaxAttempts(currentIntent);
+        const observation = this.deps.observeBeforeEffectClaim?.(currentIntent);
+        if (observation) {
+          return {
+            intent: observation.intent,
+            effectClaimToken: null,
+            result: { status: 'observed' as const, ...observation },
+          };
+        }
         if (currentMaxAttempts > 0 && this.deps.getAttemptCount(currentIntent) >= currentMaxAttempts) {
           const exhaustedAttempt = this.deps.markChecking(
             currentIntent,
@@ -620,6 +667,15 @@ export class DurableBackoffRecoveryScheduler<TIntent> {
       })
       : null;
     if (durablePreparation) {
+      if (durablePreparation.status === 'observed') {
+        // The observation committed atomically without claiming an effect.
+        // Later authoritative writes own state; never settle this snapshot again.
+        const current = this.readByKeyPassive(input.recoveryKey);
+        if (current) this.schedule(input.recoveryKey, current);
+        this.deps.onDelayed?.({ sessionId, intent: durablePreparation.intent,
+          retryAtMs: durablePreparation.retryAtMs, reason: durablePreparation.reason });
+        return { status: 'waiting' };
+      }
       if (durablePreparation.status === 'inactive' || durablePreparation.status === 'cancelled') {
         this.clearTimer(input.recoveryKey);
         return { status: 'inactive' };
