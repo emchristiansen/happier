@@ -4,7 +4,7 @@ import { classifyDaemonServerWorkError } from '@/daemon/serverWork/classifyDaemo
 import {
   DurableBackoffRecoveryScheduler,
   type DurableRecoveryGateResult,
-  type DurableRecoveryStore,
+  type TransactionalRecoveryStore,
 } from '../recoveryScheduler/DurableBackoffRecoveryScheduler';
 import {
   CONNECTED_SERVICE_UX_DIAGNOSTIC_CODES,
@@ -151,7 +151,7 @@ export type RuntimeAuthRecoverySchedulerDeps = Readonly<{
   }>) => Promise<unknown>;
   gate?: (input: Readonly<{ sessionId: string; intent: RuntimeAuthRecoveryIntent }>) => DurableRecoveryGateResult;
   recordDiagnostic?: (event: RuntimeAuthRecoveryDiagnostic) => void;
-  durableStore?: DurableRecoveryStore<RuntimeAuthRecoveryIntent>;
+  durableStore?: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent>;
 }>;
 
 type RetryDecision =
@@ -286,7 +286,15 @@ function normalizeIntent(value: unknown): RuntimeAuthRecoveryIntent | null {
     profileId: readString(value.profileId),
     groupId: readString(value.groupId),
     resumePromptMode: readResumePromptMode(value.resumePromptMode),
-    status: value.status,
+    // An accepted durable deadline remains recovery work, even in a record
+    // written by an older stale proof settlement. Normalize before gate errors
+    // can replace the diagnostic that identifies that work.
+    status: value.status === 'resumed_awaiting_proof'
+      && (value.lastError === 'no_eligible_member'
+        || value.lastError === 'switch_limit_reached'
+        || value.lastError === 'awaiting_limit_reset')
+      ? 'waiting'
+      : value.status,
     armedAtMs,
     nextRetryAtMs,
     attemptCount,
@@ -890,6 +898,19 @@ function buildRuntimeAuthRecoveryAttemptId(reportId: string | undefined): string
   return `runtime-auth-attempt:${digest}`;
 }
 
+function hasExplicitRuntimeAuthRecoveryEpochChange(
+  previous: RuntimeAuthRecoveryIntent,
+  next: RuntimeAuthRecoveryIntent,
+): boolean {
+  const previousSourceKey = previous.classification.sourceKey;
+  const nextSourceKey = next.classification.sourceKey;
+  return typeof previousSourceKey === 'string'
+    && previousSourceKey.length > 0
+    && typeof nextSourceKey === 'string'
+    && nextSourceKey.length > 0
+    && previousSourceKey !== nextSourceKey;
+}
+
 function mergeRuntimeAuthRecoveryIntent(
   previous: RuntimeAuthRecoveryIntent | null,
   next: RuntimeAuthRecoveryIntent,
@@ -909,14 +930,7 @@ function mergeRuntimeAuthRecoveryIntent(
     return next.lastSettledTransition === 'working' ? next : previous;
   }
   const sameEvidence = hasSameRuntimeAuthRecoveryEvidence(previous, next);
-  const previousSourceKey = previous.classification.sourceKey;
-  const nextSourceKey = next.classification.sourceKey;
-  const hasExplicitNewEvidenceEpoch = typeof previousSourceKey === 'string'
-    && previousSourceKey.length > 0
-    && typeof nextSourceKey === 'string'
-    && nextSourceKey.length > 0
-    && previousSourceKey !== nextSourceKey;
-  if (!sameEvidence && hasExplicitNewEvidenceEpoch) return next;
+  if (!sameEvidence && hasExplicitRuntimeAuthRecoveryEpochChange(previous, next)) return next;
   if (!sameEvidence && previous.status !== 'checking' && previous.status !== 'resumed_awaiting_proof') return next;
   return {
     ...next,
@@ -934,7 +948,14 @@ function mergeRuntimeAuthRecoveryIntent(
       previous.pendingVisibleEvents,
       next.pendingVisibleEvents,
     ),
-    status: previous.status,
+    // A gate delay is not new provider evidence. Repeated intake must retain a
+    // completed repair, but changed evidence can arm recovery in the same epoch.
+    status: !sameEvidence && isUntargetedProviderOutcomeProofWait(previous)
+      ? 'waiting'
+      : previous.status,
+    lastError: sameEvidence && isUntargetedProviderOutcomeProofWait(previous)
+      ? previous.lastError
+      : next.lastError,
     nextRetryAtMs: sameEvidence
       ? previous.nextRetryAtMs ?? next.nextRetryAtMs
       : mergeRuntimeAuthNextRetryAtMs(previous, next),
@@ -1054,7 +1075,32 @@ function mergeRuntimeAuthRecoveryWakeWrite(input: Readonly<{
       ? input.next
       : input.current;
   }
-  if (hasSameRuntimeAuthFailureFields(input.current, input.base)) return input.next;
+  const currentPolicy = normalizeIntent(input.current);
+  const claimedPolicy = normalizeIntent(input.base);
+  // Delivery acknowledgments mutate this outbox during provider work. They
+  // change no recovery policy and must neither cause a retry nor be resurrected.
+  const { pendingVisibleEvents: _currentOutbox, ...currentFields } = currentPolicy ?? {};
+  const { pendingVisibleEvents: _claimedOutbox, ...claimedFields } = claimedPolicy ?? {};
+  if (input.reason === 'waiting'
+    && !isDeepStrictEqual(currentFields, claimedFields)) {
+    // Observations no longer claim or settle. A real attempt may install its
+    // result only over its unchanged claim snapshot. Accepted intake/results
+    // own their phase, targets and retry policy; completed real work is charged.
+    return input.current.status === 'checking'
+      ? { ...input.current, status: 'waiting' }
+      : input.current;
+  }
+  if (hasSameRuntimeAuthFailureFields(input.current, input.base)) {
+    if (input.reason !== 'waiting') return input.next;
+    const { pendingVisibleEvents: _nextOutbox, ...nextFields } = input.next;
+    const newDeliveries = input.next.pendingVisibleEvents?.filter((event) => (
+      !input.base.pendingVisibleEvents?.some((previous) => isDeepStrictEqual(previous, event))
+    ));
+    const pendingVisibleEvents = mergeRuntimeAuthRecoveryPendingVisibleEvents(
+      input.current.pendingVisibleEvents, newDeliveries,
+    );
+    return { ...nextFields, ...(pendingVisibleEvents ? { pendingVisibleEvents } : {}) };
+  }
   const keepLatestFailureMessage = input.reason === 'waiting' || input.reason === 'delayed';
   return {
     ...input.next,
@@ -1116,14 +1162,10 @@ function isStaleProfileReplayForPendingProofTarget(input: Readonly<{
   return Boolean(failingProfileId && failingProfileId !== currentTargetProfileId);
 }
 
-function isUntargetedProviderOutcomeProofWaitRefresh(input: Readonly<{
-  intent: RuntimeAuthRecoveryIntent;
-  pendingTarget: RuntimeAuthPendingProofTarget | null;
-}>): boolean {
-  return input.intent.lastError === RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR
-    && input.pendingTarget === null
-    && input.intent.pendingTargetProfileId === null
-    && input.intent.pendingTargetGeneration === null;
+function isUntargetedProviderOutcomeProofWait(intent: RuntimeAuthRecoveryIntent): boolean {
+  return intent.status === 'resumed_awaiting_proof'
+    && intent.pendingTargetProfileId == null
+    && intent.pendingTargetGeneration == null;
 }
 
 // Handler verdict: the replayed recovery no longer applies (e.g. the group already moved
@@ -1193,17 +1235,41 @@ export class RuntimeAuthRecoveryScheduler {
           : intent.status,
       getNextRetryAtMs: (intent) => intent.nextRetryAtMs,
       getAttemptCount: (intent) => intent.attemptCount,
-      getMaxAttempts: (intent) => isRuntimeAuthDurableWaitIntent(intent)
-        ? Number.MAX_SAFE_INTEGER
-        : intent.maxAttempts,
+      // Proof observations do not run recovery attempts. The durable scheduler
+      // treats zero as no attempt ceiling; targeted recovery keeps its budget.
+      getMaxAttempts: (intent) => isUntargetedProviderOutcomeProofWait(intent)
+        ? 0
+        : isRuntimeAuthDurableWaitIntent(intent)
+          ? Number.MAX_SAFE_INTEGER
+          : intent.maxAttempts,
+      observeBeforeEffectClaim: (intent) => {
+        if (!isUntargetedProviderOutcomeProofWait(intent)) return null;
+        const retryAtMs = this.providerOutcomePendingWaitMs === null
+          ? deps.nowMs() + this.baseBackoffMs
+          : deps.nowMs() + this.providerOutcomePendingWaitMs;
+        return {
+          intent: { ...intent, attemptId: intent.attemptId ?? buildRuntimeAuthRecoveryAttemptId(undefined), nextRetryAtMs: retryAtMs,
+            lastError: RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR },
+          retryAtMs,
+          reason: RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR,
+        };
+      },
       terminalRecordRetentionMs: DEFAULT_RUNTIME_AUTH_RECOVERY_TERMINAL_RECORD_RETENTION_MS,
       getTerminalPruneReferenceMs: (intent) => intent.terminalAtMs ?? intent.armedAtMs,
       markChecking: (intent, attemptCount) => ({
         ...intent,
         v: 2,
+        // DurableBackoffRecoveryScheduler commits this state and the effect
+        // claim in one transaction; legacy identity cannot lag its claim.
+        attemptId: intent.attemptId ?? buildRuntimeAuthRecoveryAttemptId(undefined),
         status: 'checking',
         lastSettledTransition: mergeRuntimeAuthRecoveryTransition(intent.lastSettledTransition, 'working'),
         attemptCount,
+        // A gate can replace lastError while retaining the proof-wait state.
+        // Carry that phase through the generic scheduler's checking transition.
+        lastError: isUntargetedProviderOutcomeProofWait(intent)
+          ? RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR
+          : intent.lastError,
       }),
       markWaiting: (intent, input) => withRuntimeAuthWaitPresentation({
         ...intent,
@@ -1337,10 +1403,12 @@ export class RuntimeAuthRecoveryScheduler {
             // additionally bounded by maxCoalescedReplays when the target profile
             // keeps changing under the same durable recovery.
             const coalescedReplayCount = intent.coalescedReplayCount ?? 0;
-            const rollbackAttempt = isUntargetedProviderOutcomeProofWaitRefresh({ intent, pendingTarget })
-              || (coalescedReplay && coalescedReplayCount < this.maxCoalescedReplays);
+            const rollbackAttempt = coalescedReplay && coalescedReplayCount < this.maxCoalescedReplays;
             return {
               status: 'wait',
+              exhaustOnMaxAttempt: pendingTarget !== null
+                || intent.pendingTargetProfileId != null
+                || intent.pendingTargetGeneration != null,
               lastError: RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR,
               intent: {
                 ...intent,

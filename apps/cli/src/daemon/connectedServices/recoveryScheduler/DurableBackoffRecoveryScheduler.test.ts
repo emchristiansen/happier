@@ -40,6 +40,35 @@ function createDeferred<T>(): {
 }
 
 describe('DurableBackoffRecoveryScheduler', () => {
+  it.each(['memory', 'file'] as const)('observes atomically without a claim or retry charge (%s)', async (storage) => {
+    const directory = await mkdtemp(join(tmpdir(), 'durable-atomic-observation-'));
+    const store = storage === 'file' ? createRecoveryIntentFileStore<TestIntent>(join(directory, 'intents.json')) : undefined;
+    const recover = vi.fn(async () => ({ status: 'wait' as const }));
+    const markChecking = vi.fn((intent: TestIntent, attemptCount: number) => ({ ...intent, status: 'checking' as const, attemptCount }));
+    const onDelayed = vi.fn();
+    const scheduler = new DurableBackoffRecoveryScheduler<TestIntent>({
+      nowMs: () => 1_000, store, normalizeIntent: (value) => value as TestIntent,
+      getStatus: (intent) => intent.status, getNextRetryAtMs: (intent) => intent.nextRetryAtMs,
+      getAttemptCount: (intent) => intent.attemptCount, getMaxAttempts: (intent) => intent.maxAttempts,
+      markChecking, markWaiting: (intent, input) => ({ ...intent, status: 'waiting', ...input }),
+      markCancelled: (intent) => ({ ...intent, status: 'cancelled' }),
+      markExhausted: (intent) => ({ ...intent, status: 'exhausted' }), recover, onDelayed,
+      observeBeforeEffectClaim: (intent) => ({ intent: { ...intent, nextRetryAtMs: 9_000 }, retryAtMs: 9_000, reason: 'awaiting_proof' }),
+    });
+    try {
+      await scheduler.upsertByKey({ sessionId: 'session', recoveryKey: 'key', intent: createIntent() });
+      await scheduler.wakeByKey({ recoveryKey: 'key', reason: 'manual' });
+      expect(scheduler.readByKeyPassive('key')).toMatchObject({ status: 'waiting', attemptCount: 0, nextRetryAtMs: 9_000 });
+      expect(recover).not.toHaveBeenCalled(); expect(markChecking).not.toHaveBeenCalled();
+      expect(onDelayed).toHaveBeenCalledWith(expect.objectContaining({ retryAtMs: 9_000, reason: 'awaiting_proof' }));
+      if (store) {
+        expect(await store.transact('key', (current) => ({ ...current, result: current.effectClaimToken }))).toBeNull();
+      }
+    } finally {
+      scheduler.dispose(); await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it('lets only one of two durable scheduler controllers execute recovery for a key', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'happier-durable-recovery-claim-'));
     const filePath = join(dir, 'recovery.json');
