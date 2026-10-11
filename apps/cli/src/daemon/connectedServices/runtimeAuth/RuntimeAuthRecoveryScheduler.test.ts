@@ -2747,7 +2747,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     } finally { scheduler.dispose(); }
   });
 
-  it.each([{ maxAttempts: 2, legacy: false }, { maxAttempts: 3, legacy: false }, { maxAttempts: 2, legacy: true }])('preserves changed failure intake across an older proof wake (max attempts $maxAttempts, legacy $legacy)', async ({ maxAttempts, legacy }) => {
+  it.each([{ maxAttempts: 2, legacy: false, hydrate: false }, { maxAttempts: 3, legacy: false, hydrate: false }, { maxAttempts: 2, legacy: true, hydrate: false }, { maxAttempts: 2, legacy: true, hydrate: true }])('preserves changed failure intake across an older proof wake (max attempts $maxAttempts, legacy $legacy, hydrate $hydrate)', async ({ maxAttempts, legacy, hydrate }) => {
     const directory = await mkdtemp(join(tmpdir(), 'runtime-auth-proof-intake-race-'));
     const filePath = join(directory, 'intents.json');
     const baseStore = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath);
@@ -2777,7 +2777,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       nowMs: () => nowMs, maxAttempts, providerOutcomePendingWaitMs: 250,
       recover, durableStore: store,
     });
-    const first = createScheduler(heldStore);
+    let first = createScheduler(heldStore);
     const second = createScheduler(createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath));
     let oldWake: Promise<unknown> | undefined;
     const enqueue = (scheduler: RuntimeAuthRecoveryScheduler, kind: 'usage_limit' | 'auth_expired') =>
@@ -2794,11 +2794,20 @@ describe('RuntimeAuthRecoveryScheduler', () => {
         const key = buildRuntimeAuthRecoveryKey({ sessionId: 'session-racing-proof', serviceId: 'openai-codex', profileId: 'primary', groupId: 'team' });
         const { attemptId: _attemptId, ...legacyIntent } = first.readByKey(key)!;
         await baseStore.write(key, legacyIntent);
+        if (hydrate) {
+          first.dispose();
+          first = createScheduler(heldStore);
+          await first.hydratePassive();
+          expect(first.readByKey(key)?.attemptId).toBeUndefined();
+        }
       }
       nowMs += 250;
       holdNextClaim = true;
       oldWake = first.wake({ sessionId: 'session-racing-proof', reason: 'manual' });
       await claimStarted.promise;
+      const claimedAttemptId = first.read('session-racing-proof')?.attemptId;
+      expect(claimedAttemptId).toBeDefined();
+      expect(second.read('session-racing-proof')).toMatchObject({ status: 'checking', attemptId: claimedAttemptId });
       await enqueue(second, 'auth_expired');
       expect(second.read('session-racing-proof')).toMatchObject({
         status: 'waiting', classification: { kind: 'auth_expired' },
@@ -2806,7 +2815,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       releaseClaim.resolve();
       await oldWake;
       expect(second.read('session-racing-proof')).toMatchObject({
-        status: 'waiting', classification: { kind: 'auth_expired' }, attemptCount: 1,
+        status: 'waiting', classification: { kind: 'auth_expired' }, attemptCount: 1, attemptId: claimedAttemptId,
       });
       nowMs += 250;
       await second.wake({ sessionId: 'session-racing-proof', reason: 'manual' });
@@ -2890,6 +2899,85 @@ describe('RuntimeAuthRecoveryScheduler', () => {
         attemptId: newAttemptId, status: 'waiting', attemptCount: 1,
         lastError: 'no_eligible_member', nextRetryAtMs: 9_000,
         classification: { sourceKey: 'new-provider-report' },
+      });
+      expect(recover).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseClaim.resolve();
+      await oldWake;
+      first.dispose();
+      second.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['explicit', 'classification'] as const)('preserves replacement work after legacy identity adoption (%s)', async (replacement) => {
+    const maxAttempts = 3;
+    const directory = await mkdtemp(join(tmpdir(), 'runtime-auth-proof-legacy-hops-'));
+    const filePath = join(directory, 'intents.json');
+    const baseStore = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath);
+    const claimStarted = createDeferred<void>();
+    const releaseClaim = createDeferred<void>();
+    let holdNextClaim = false;
+    const heldStore: DurableRecoveryStore<RuntimeAuthRecoveryIntent> = {
+      ...baseStore,
+      transact: async <TResult>(key: string, transaction: (current: Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null }>) => Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null; result: TResult }>) => {
+        let claimed = false;
+        const result = await baseStore.transact!<TResult>(key, (current) => {
+          const next = transaction(current);
+          claimed = current.effectClaimToken === null && next.effectClaimToken !== null;
+          return next;
+        });
+        if (holdNextClaim && claimed) {
+          holdNextClaim = false;
+          claimStarted.resolve();
+          await releaseClaim.promise;
+        }
+        return result;
+      },
+    };
+    let nowMs = 1_000;
+    const recover = vi.fn(async () => ({ status: 'credential_refreshed', restartRequested: true }));
+    const createScheduler = (store: DurableRecoveryStore<RuntimeAuthRecoveryIntent>) => new RuntimeAuthRecoveryScheduler({
+      nowMs: () => nowMs, maxAttempts, providerOutcomePendingWaitMs: 250,
+      recover, durableStore: store,
+    });
+    const first = createScheduler(heldStore);
+    const second = createScheduler(createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath));
+    let oldWake: Promise<unknown> | undefined;
+    const sessionId = 'session-proof-legacy-hops';
+    const recoveryKey = buildRuntimeAuthRecoveryKey({ sessionId, serviceId: 'openai-codex', profileId: 'primary', groupId: 'team' });
+    const begin = (scheduler: RuntimeAuthRecoveryScheduler, reportId: string, sourceKey: string | undefined, kind: 'usage_limit' | 'auth_expired' = 'usage_limit') => scheduler.beginClassifiedFailure({
+      reportId, sessionId, switchesThisTurn: 1,
+      classification: classificationFor({ sourceKey, kind }),
+    });
+    try {
+      await begin(first, 'old-report', undefined);
+      await first.wakeByKey({ recoveryKey, reason: 'manual' });
+      const { attemptId: _attemptId, ...legacyIntent } = first.readByKey(recoveryKey)!;
+      await baseStore.write(recoveryKey, legacyIntent);
+      nowMs += 250;
+      holdNextClaim = true;
+      oldWake = first.wakeByKey({ recoveryKey, reason: 'manual' });
+      await claimStarted.promise;
+      await begin(second, 'first-new-report', 'source-a');
+      expect(second.readByKey(recoveryKey)).toMatchObject({ status: 'waiting', attemptCount: 2 });
+      const adoptedAttemptId = second.readByKey(recoveryKey)?.attemptId;
+      const kind = replacement === 'explicit' ? 'usage_limit' : 'auth_expired';
+      await begin(second, 'replacement-report', replacement === 'explicit' ? 'source-b' : 'source-a', kind);
+      const newAttemptId = second.readByKey(recoveryKey)?.attemptId;
+      expect(newAttemptId).not.toBe(adoptedAttemptId);
+      expect(second.readByKey(recoveryKey)).toMatchObject({ attemptCount: 0 });
+      await second.markDurableWaitForResultByKey({
+        recoveryKey, expectedAttemptId: newAttemptId,
+        classificationFailureKind: kind, classificationResetsAtMs: null,
+        result: { status: 'no_eligible_member', generation: 12, groupExhausted: true, retryAtMs: 9_000, excluded: [] },
+      });
+      expect(second.readByKey(recoveryKey)).toMatchObject({ attemptCount: 1, lastError: 'no_eligible_member' });
+      releaseClaim.resolve();
+      await oldWake;
+      expect(second.readByKey(recoveryKey)).toMatchObject({
+        attemptId: newAttemptId, status: 'waiting', attemptCount: 1,
+        lastError: 'no_eligible_member', nextRetryAtMs: 9_000,
       });
       expect(recover).toHaveBeenCalledTimes(1);
     } finally {

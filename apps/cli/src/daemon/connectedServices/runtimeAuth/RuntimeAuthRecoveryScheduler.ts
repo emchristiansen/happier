@@ -1074,11 +1074,11 @@ function mergeRuntimeAuthRecoveryWakeWrite(input: Readonly<{
     // Observation proves nothing about failure evidence admitted after its
     // claim. Preserve that intake's recovery phase and remove only this wake's
     // observation increment, so it cannot relatch proof or consume a retry.
-    // A replacement epoch did not inherit this increment. Legacy records may
-    // acquire their first attempt identity during same-epoch intake, so only an
-    // existing identity mismatch or the shared source-epoch rule rejects it.
-    const countBelongsToObservedEpoch = !hasExplicitRuntimeAuthRecoveryEpochChange(input.base, input.current)
-      && (input.base.attemptId === undefined || input.current.attemptId === input.base.attemptId);
+    // The claim assigns even legacy records a stable identity atomically. A
+    // replacement epoch cannot inherit this observation increment.
+    const countBelongsToObservedEpoch = input.base.attemptId !== undefined
+      && input.current.attemptId === input.base.attemptId
+      && !hasExplicitRuntimeAuthRecoveryEpochChange(input.base, input.current);
     if (!countBelongsToObservedEpoch) return input.current;
     const observationIncrement = Math.max(0, input.base.attemptCount - input.next.attemptCount);
     return { ...input.current,
@@ -1232,6 +1232,9 @@ export class RuntimeAuthRecoveryScheduler {
       markChecking: (intent, attemptCount) => ({
         ...intent,
         v: 2,
+        // DurableBackoffRecoveryScheduler commits this state and the effect
+        // claim in one transaction; legacy identity cannot lag its claim.
+        attemptId: intent.attemptId ?? buildRuntimeAuthRecoveryAttemptId(undefined),
         status: 'checking',
         lastSettledTransition: mergeRuntimeAuthRecoveryTransition(intent.lastSettledTransition, 'working'),
         attemptCount,
