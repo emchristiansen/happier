@@ -204,9 +204,12 @@ export class ConnectedServiceRefreshCoordinator {
   private readonly scheduledBindingTasks = new Map<string, Readonly<{
     binding: BoundProfile;
     startedAtMs: number;
-    groupKeys: ReadonlySet<string>;
-    isWaitingForSharedGroup: () => boolean;
     completion: Promise<void>;
+  }>>();
+  private readonly homeOwnershipTails = new Map<string, Promise<void>>();
+  private readonly bindingHomeWork = new Map<string, Readonly<{
+    homeIdentities: ReadonlyArray<string>;
+    stage: 'shared_home_wait' | 'home_freshness_and_materialization';
   }>>();
   private readonly runtimeRegistry: ConnectedServiceRuntimeRegistry;
   private readonly inFlightRefreshes = new Map<string, Readonly<{
@@ -314,19 +317,11 @@ export class ConnectedServiceRefreshCoordinator {
   async tickOnce(): Promise<void> {
     const now = this.params.now();
     const unique = new Map<string, BoundProfile>();
-    const groupKeysByBinding = new Map<string, Set<string>>();
     const errors: unknown[] = [];
 
     for (const target of this.runtimeRegistry.listRefreshTargets()) {
       for (const binding of target.bindings) {
         unique.set(bindingKey(binding), binding);
-        const selection = target.selectionsByServiceId.get(binding.serviceId);
-        if (selection?.kind === 'group') {
-          const key = bindingKey(binding);
-          const groupKeys = groupKeysByBinding.get(key) ?? new Set<string>();
-          groupKeys.add(`${binding.serviceId}::${selection.groupId}`);
-          groupKeysByBinding.set(key, groupKeys);
-        }
       }
     }
 
@@ -342,7 +337,7 @@ export class ConnectedServiceRefreshCoordinator {
     // after the scheduling budget expires, without holding up later ticks.
     await Promise.all(Array.from(unique.values(), async (binding) => {
       try {
-        await this.checkScheduledBinding(binding, now, groupKeysByBinding.get(bindingKey(binding)) ?? new Set());
+        await this.checkScheduledBinding(binding, now);
       } catch (error) {
         errors.push(error);
       }
@@ -353,30 +348,19 @@ export class ConnectedServiceRefreshCoordinator {
     }
   }
 
-  private async checkScheduledBinding(binding: BoundProfile, now: number, groupKeys: ReadonlySet<string>): Promise<void> {
+  private async checkScheduledBinding(binding: BoundProfile, now: number): Promise<void> {
     const key = bindingKey(binding);
     const existing = this.scheduledBindingTasks.get(key);
     if (existing) {
       return;
     }
 
-    // Divergent member bindings can materialize the same canonical group home.
-    // Recheck its staleness after the earlier binding completes rather than
-    // repairing and notifying twice. Independent group/profile work proceeds.
-    const sharedGroupTasks = Array.from(this.scheduledBindingTasks.values()).filter((task) =>
-      Array.from(groupKeys).some((groupKey) => task.groupKeys.has(groupKey)),
-    );
-    let waitingForSharedGroup = sharedGroupTasks.length > 0;
     let schedulingBudgetExpired = false;
     const task = {
       binding,
       startedAtMs: now,
-      groupKeys,
-      isWaitingForSharedGroup: () => waitingForSharedGroup,
       completion: Promise.resolve()
         .then(async () => {
-          await Promise.allSettled(sharedGroupTasks.map((pending) => pending.completion));
-          waitingForSharedGroup = false;
           await this.maybeRefreshBinding(binding, this.params.now());
         })
         .catch((error: unknown) => {
@@ -415,20 +399,21 @@ export class ConnectedServiceRefreshCoordinator {
 
   private warnPendingScheduledBinding(binding: BoundProfile, startedAtMs: number): void {
     const key = bindingKey(binding);
-    const awaitStage = this.scheduledBindingTasks.get(key)?.isWaitingForSharedGroup()
-      ? 'shared_group_binding'
-      : this.inFlightRefreshAuthUpdatedNotifications.has(key)
+    const homeWork = this.bindingHomeWork.get(key);
+    const awaitStage = homeWork?.stage
+      ?? (this.inFlightRefreshAuthUpdatedNotifications.has(key)
         ? 'auth_updated_notification'
         : this.inFlightRefreshRematerializations.has(key)
           ? 'rematerialization'
           : this.inFlightRefreshes.has(key)
             ? 'credential_refresh_completion'
-            : 'credential_check';
+            : 'credential_check');
     logger.warn('[ConnectedServiceRefresh] Scheduled binding still pending', {
       serviceId: binding.serviceId,
       profileId: binding.profileId,
       ageMs: Math.max(0, this.params.now() - startedAtMs),
       awaitStage,
+      ...(homeWork ? { homeIdentities: homeWork.homeIdentities } : {}),
     });
   }
 
@@ -856,8 +841,15 @@ export class ConnectedServiceRefreshCoordinator {
     if (result.status === 'refresh_failed') {
       throw new ConnectedServiceCredentialRefreshError(result.diagnostic);
     }
-    if (result.status === 'not_needed' && await this.hasStaleMaterializedHomeForBinding(binding, result, now)) {
-      await this.distributeRefreshedBinding(binding);
+    if (result.status === 'not_needed') {
+      const plan = this.captureHomePlan(binding);
+      const repair = await this.withHomeOwnership(binding, plan, async () => {
+        if (!await this.hasStaleMaterializedHomeForBinding(binding, result, this.params.now(), plan.targets)) return null;
+        return await this.rematerializeTargetsForPlan(binding, plan.targets);
+      });
+      // Callbacks may join a rotation or start a respawn. Release home ownership
+      // first so they cannot create a home -> rotation lock-order inversion.
+      if (repair) await this.notifyAuthUpdatedForRefreshedBinding(binding, null, repair.rematerializedTargets);
     }
     // A 'refreshed' result already distributed BY CONSTRUCTION on the completion path (RR-1).
   }
@@ -866,8 +858,8 @@ export class ConnectedServiceRefreshCoordinator {
     binding: BoundProfile,
     result: ConnectedServiceCredentialRefreshResult,
     now: number,
+    targets: ReadonlyArray<SpawnTarget>,
   ): Promise<boolean> {
-    const targets = this.runtimeRegistry.listRefreshTargets();
     const agentIds = new Set(targets.map((target) => target.agentId));
     if (agentIds.size === 0) return false;
 
@@ -1703,10 +1695,77 @@ export class ConnectedServiceRefreshCoordinator {
     }
   }
 
-  private async rematerializeTargetsForBindingDetailed(binding: BoundProfile): Promise<RematerializedTargetsResult> {
-    const affected = this.runtimeRegistry.listRefreshTargets().filter((target) =>
+  private captureHomePlan(binding: BoundProfile): Readonly<{
+    targets: ReadonlyArray<SpawnTarget>;
+    homeIdentities: ReadonlyArray<string>;
+  }> {
+    const targets = this.runtimeRegistry.listRefreshTargets().filter((target) =>
       target.bindings.some((b) => b.serviceId === binding.serviceId && b.profileId === binding.profileId),
     );
+    const homeIdentities = new Set<string>();
+    for (const target of targets) {
+      // Materialization applies every service in the captured target, not just
+      // the binding that triggered it. Reserve all those resources together.
+      for (const member of target.bindings) {
+        const selection = target.selectionsByServiceId.get(member.serviceId);
+        homeIdentities.add(JSON.stringify(selection?.kind === 'group'
+          ? [member.serviceId, 'group', selection.groupId]
+          : [member.serviceId, 'profile', member.profileId]));
+      }
+    }
+    return { targets, homeIdentities: [...homeIdentities].sort() };
+  }
+
+  private async withHomeOwnership<T>(
+    binding: BoundProfile,
+    plan: ReturnType<ConnectedServiceRefreshCoordinator['captureHomePlan']>,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    // Atomic reservation of the whole captured plan: predecessors are always
+    // earlier reservations, so overlapping multi-home plans cannot form cycles.
+    // This owner never rotates credentials; lower materialization locks and
+    // revision fencing remain unchanged. Auth callbacks run after its release.
+    const predecessors = plan.homeIdentities.flatMap((home) => {
+      const previous = this.homeOwnershipTails.get(home);
+      return previous ? [previous] : [];
+    });
+    let release!: () => void;
+    const completion = new Promise<void>((resolve) => { release = resolve; });
+    for (const home of plan.homeIdentities) this.homeOwnershipTails.set(home, completion);
+    const key = bindingKey(binding);
+    const waiting = { homeIdentities: plan.homeIdentities, stage: 'shared_home_wait' as const };
+    const active = { homeIdentities: plan.homeIdentities, stage: 'home_freshness_and_materialization' as const };
+    this.bindingHomeWork.set(key, waiting);
+    if (predecessors.length > 0) {
+      logger.warn('[ConnectedServiceRefresh] Waiting for shared home ownership', {
+        serviceId: binding.serviceId, profileId: binding.profileId,
+        homeIdentities: plan.homeIdentities, awaitStage: waiting.stage,
+      });
+    }
+    try {
+      await Promise.allSettled(predecessors);
+      this.bindingHomeWork.set(key, active);
+      return await work();
+    } finally {
+      if (this.bindingHomeWork.get(key) === active || this.bindingHomeWork.get(key) === waiting) {
+        this.bindingHomeWork.delete(key);
+      }
+      for (const home of plan.homeIdentities) {
+        if (this.homeOwnershipTails.get(home) === completion) this.homeOwnershipTails.delete(home);
+      }
+      release();
+    }
+  }
+
+  private async rematerializeTargetsForBindingDetailed(binding: BoundProfile): Promise<RematerializedTargetsResult> {
+    const plan = this.captureHomePlan(binding);
+    return await this.withHomeOwnership(binding, plan, () => this.rematerializeTargetsForPlan(binding, plan.targets));
+  }
+
+  private async rematerializeTargetsForPlan(
+    binding: BoundProfile,
+    affected: ReadonlyArray<SpawnTarget>,
+  ): Promise<RematerializedTargetsResult> {
     const rematerialized: SpawnTarget[] = [];
     const failed: RematerializedTargetFailure[] = [];
     const canonicalGroupStateReads = new Map<

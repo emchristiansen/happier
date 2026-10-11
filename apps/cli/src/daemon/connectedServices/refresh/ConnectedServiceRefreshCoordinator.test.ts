@@ -26,6 +26,7 @@ import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '../connectedServic
 import { normalizeMaterializationKeyForPath } from '../materialize/normalizeMaterializationKeyForPath';
 import { buildDefaultConnectedServiceCredentialLifecycleDescriptor } from '../credentials/lifecycleTypes';
 import { ConnectedServiceRuntimeRegistry } from '../runtimeRegistry/registry';
+import { resolveConnectedServiceCredentialLifecycleDescriptor } from '@/backends/catalog';
 import { computeConnectedServiceAccessTokenFingerprint } from './credentialFreshness/tokenFingerprint';
 
 const { spawnSpy } = vi.hoisted(() => ({
@@ -1811,7 +1812,10 @@ afterEach(() => {
   // member binding must neither treat the active token as stale nor write its own credential into
   // the shared home (live incident 2026-07-08: member-vs-active fingerprint confusion caused a
   // cross-account clobber of the pool home plus a 30s restart loop).
-  async function buildGroupHomeOwnershipHarness(clock?: () => number) {
+  async function buildGroupHomeOwnershipHarness(
+    clock?: () => number,
+    resolveLifecycleDescriptor?: typeof resolveConnectedServiceCredentialLifecycleDescriptor,
+  ) {
     const baseDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-group-owner-'));
     const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-server-group-owner-'));
     const sourceHomeDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-source-group-owner-'));
@@ -1891,6 +1895,7 @@ afterEach(() => {
     }) as unknown as typeof fetch);
 
     const onAuthUpdated = vi.fn();
+    const runtimeRegistry = new ConnectedServiceRuntimeRegistry();
     const coordinator = new ConnectedServiceRefreshCoordinator({
       api,
       credentials,
@@ -1900,6 +1905,8 @@ afterEach(() => {
       refreshWindowMs: 60_000,
       refreshLeaseMs: 30_000,
       now: () => clock?.() ?? now,
+      runtimeRegistry,
+      resolveLifecycleDescriptor,
       processEnv: { HOME: sourceHomeDir },
       onAuthUpdated,
     });
@@ -1977,6 +1984,7 @@ afterEach(() => {
       coordinator,
       onAuthUpdated,
       groupConfigDir,
+      runtimeRegistry,
       now,
       api,
       setCanonicalGroupState(activeProfileId: string, generation: number) {
@@ -2084,7 +2092,21 @@ afterEach(() => {
 
   it('retains a pending rotation across scheduled ticks without rotating it again', async () => {
     let nowMs = 1_000_000;
-    const harness = await buildGroupHomeOwnershipHarness(() => nowMs);
+    let observeMemberFreshness!: () => void;
+    const memberFreshnessChecked = new Promise<void>((resolve) => { observeMemberFreshness = resolve; });
+    const harness = await buildGroupHomeOwnershipHarness(() => nowMs, async (agentId) => {
+      const descriptor = await resolveConnectedServiceCredentialLifecycleDescriptor(agentId);
+      const maintenance = descriptor.materializedHomeMaintenance;
+      const hasStale = maintenance?.hasStaleMaterializedHomeForBinding;
+      if (!maintenance || !hasStale) return descriptor;
+      return { ...descriptor, materializedHomeMaintenance: { ...maintenance,
+        hasStaleMaterializedHomeForBinding: async (input) => {
+          const stale = await hasStale(input);
+          if (input.binding.profileId === 'workB') observeMemberFreshness();
+          return stale;
+        },
+      } };
+    });
     const fetchMock = vi.fn(async () => ({
       ok: true,
       json: async () => ({ access_token: 'rotated-access', refresh_token: 'rotated-refresh', expires_in: 3600 }),
@@ -2118,9 +2140,10 @@ afterEach(() => {
       expect(warning).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
         profileId: 'workA', ageMs: 30_000, awaitStage: 'auth_updated_notification',
       }));
-      expect(warning).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
-        profileId: 'workB', ageMs: 30_000, awaitStage: 'shared_group_binding',
-      }));
+      vi.useRealTimers();
+      // A waiting auth callback retains rotation custody but no home owner.
+      await memberFreshnessChecked;
+      expect(harness.onAuthUpdated).toHaveBeenCalledTimes(1);
     } finally {
       releaseDistribution();
       vi.useRealTimers();
@@ -2177,6 +2200,103 @@ afterEach(() => {
     const credential = JSON.parse(await readFile(join(harness.groupConfigDir, '.credentials.json'), 'utf8'));
     expect(credential.claudeAiOauth.accessToken).toBe('active-access');
     expect(harness.onAuthUpdated).not.toHaveBeenCalled();
+  });
+
+  it('serializes shared-home freshness after a retained binding joins the group', async () => {
+    let nowMs = 1_000_000;
+    let releaseRead!: () => void;
+    const readReleased = new Promise<void>((resolve) => { releaseRead = resolve; });
+    let observeRead!: () => void;
+    const readStarted = new Promise<void>((resolve) => { observeRead = resolve; });
+    let releaseFreshness!: () => void;
+    const freshnessReleased = new Promise<void>((resolve) => { releaseFreshness = resolve; });
+    let observeFreshness!: () => void;
+    const freshnessStarted = new Promise<void>((resolve) => { observeFreshness = resolve; });
+    const freshnessProfiles: string[] = [];
+    const harness = await buildGroupHomeOwnershipHarness(() => nowMs, async (agentId) => {
+      const descriptor = await resolveConnectedServiceCredentialLifecycleDescriptor(agentId);
+      const maintenance = descriptor.materializedHomeMaintenance;
+      const hasStale = maintenance?.hasStaleMaterializedHomeForBinding;
+      if (!maintenance || !hasStale) return descriptor;
+      return { ...descriptor, materializedHomeMaintenance: {
+        ...maintenance,
+        hasStaleMaterializedHomeForBinding: async (input) => {
+          freshnessProfiles.push(input.binding.profileId);
+          if (input.binding.profileId === 'workB') {
+            observeFreshness();
+            await freshnessReleased;
+          }
+          return await hasStale(input);
+        },
+      } };
+    });
+    const targetA = harness.runtimeRegistry.listRefreshTargets().find((target) => target.pid === 127)!;
+    const targetB = harness.runtimeRegistry.listRefreshTargets().find((target) => target.pid === 128)!;
+    const restoreTarget = (target: typeof targetA) => harness.coordinator.registerSpawnTarget({
+      ...target,
+      connectedServicesBindingsRaw: { v: 1, bindingsByServiceId: {
+        'claude-subscription': { source: 'connected', selection: 'group', groupId: 'pool',
+          profileId: target.pid === 127 ? 'workA' : 'workB' },
+      } },
+      connectedServiceSelectionsEnv: {
+        [HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY]: JSON.stringify([...target.selectionsByServiceId.values()]),
+      },
+    });
+    harness.coordinator.unregisterPid(128);
+    harness.coordinator.registerSpawnTarget({ ...targetA,
+      connectedServicesBindingsRaw: { v: 1, bindingsByServiceId: {
+        'claude-subscription': { source: 'connected', selection: 'profile', profileId: 'workA' },
+      } },
+      connectedServiceSelectionsEnv: { [HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY]: '[]' },
+    });
+    const readCredential = vi.mocked(harness.api.getConnectedServiceCredentialSealed).getMockImplementation()!;
+    let firstRead = true;
+    vi.mocked(harness.api.getConnectedServiceCredentialSealed).mockImplementation(async (input) => {
+      if (input.profileId === 'workA' && firstRead) {
+        firstRead = false;
+        observeRead();
+        await readReleased;
+      }
+      return await readCredential(input);
+    });
+    await writeClaudeCodeCredentialsFile({ claudeConfigDir: harness.groupConfigDir,
+      payload: { claudeAiOauth: { accessToken: 'dead-old-access', expiresAt: harness.now + 60 * 60_000,
+        scopes: ['user:inference', 'user:profile', 'user:sessions:claude_code'] } },
+      preserveNewerExistingCredential: false,
+    });
+    const warning = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    vi.useFakeTimers();
+    try {
+      const firstTick = harness.coordinator.tickOnce();
+      await readStarted;
+      nowMs += 30_000;
+      await vi.advanceTimersByTimeAsync(30_000);
+      await firstTick;
+      restoreTarget(targetA);
+      restoreTarget(targetB);
+      const secondTick = harness.coordinator.tickOnce();
+      await freshnessStarted;
+      releaseRead();
+      nowMs += 30_000;
+      await vi.advanceTimersByTimeAsync(30_000);
+      await secondTick;
+      expect(freshnessProfiles).toEqual(['workB']);
+      expect(warning).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        profileId: 'workA', awaitStage: 'shared_home_wait',
+        homeIdentities: [JSON.stringify(['claude-subscription', 'group', 'pool'])],
+      }));
+      releaseFreshness();
+      vi.useRealTimers();
+      await expect.poll(() => harness.onAuthUpdated.mock.calls.length).toBe(1);
+      await expect.poll(() => freshnessProfiles).toEqual(['workB', 'workA']);
+      await harness.coordinator.tickOnce();
+      expect(harness.onAuthUpdated).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseRead();
+      releaseFreshness();
+      vi.useRealTimers();
+      warning.mockRestore();
+    }
   });
 
   it('repairs a stale shared group home with the CANONICAL active credential exactly once', async () => {

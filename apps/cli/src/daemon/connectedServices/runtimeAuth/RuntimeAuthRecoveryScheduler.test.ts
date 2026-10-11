@@ -2664,6 +2664,89 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     )).toHaveLength(5);
   });
 
+  it.each([
+    [1, 'local_server_storm'], [2, 'local_server_storm'],
+    [1, 'daemon_lifecycle_unavailable'], [2, 'daemon_lifecycle_unavailable'],
+  ] as const)('preserves durable untargeted proof wait through a %s-attempt %s gate', async (maxAttempts, reason) => {
+    const directory = await mkdtemp(join(tmpdir(), 'runtime-auth-proof-gate-'));
+    const durableStore = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(join(directory, 'intents.json'));
+    let nowMs = 1_000;
+    let gateClosed = false;
+    const recover = vi.fn(async () => ({ status: 'credential_refreshed', restartRequested: true }));
+    const createScheduler = () => new RuntimeAuthRecoveryScheduler({
+      nowMs: () => nowMs,
+      baseBackoffMs: 100,
+      maxBackoffMs: 1_000,
+      jitterMs: () => 0,
+      maxAttempts,
+      providerOutcomePendingWaitMs: 250,
+      durableStore,
+      recover,
+      gate: () => gateClosed
+        ? { status: 'delayed', reason, retryAtMs: nowMs + 250 }
+        : { status: 'open' },
+    });
+    let scheduler = createScheduler();
+    try {
+      await scheduler.enqueueApplyFailure({
+        sessionId: 'session-proof-gate',
+        switchesThisTurn: 1,
+        classification: classification(),
+        result: { status: 'generation_apply_failed', errorCode: 'hot_apply_failed',
+          diagnostics: { underlyingError: 'timeout of 5000ms exceeded' } },
+      });
+      await expect(scheduler.wake({ sessionId: 'session-proof-gate', reason: 'manual' }))
+        .resolves.toEqual({ status: 'waiting' });
+      nowMs += 250;
+      gateClosed = true;
+      await expect(scheduler.wake({ sessionId: 'session-proof-gate', reason: 'manual' }))
+        .resolves.toEqual({ status: 'waiting' });
+      expect(scheduler.read('session-proof-gate')).toMatchObject({
+        status: 'resumed_awaiting_proof', lastError: reason, attemptCount: 1,
+      });
+      scheduler.dispose();
+      scheduler = createScheduler();
+      expect(scheduler.hydratePassive()).toEqual([expect.objectContaining({
+        status: 'resumed_awaiting_proof', lastError: reason, attemptCount: 1,
+      })]);
+      nowMs += 250;
+      gateClosed = false;
+      await expect(scheduler.wake({ sessionId: 'session-proof-gate', reason: 'manual' }))
+        .resolves.toEqual({ status: 'waiting' });
+      expect(recover).toHaveBeenCalledTimes(1);
+      expect(scheduler.read('session-proof-gate')).toMatchObject({ status: 'resumed_awaiting_proof', attemptCount: 1 });
+    } finally {
+      scheduler.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('reopens an untargeted proof wait for changed failure evidence without a source epoch', async () => {
+    let nowMs = 1_000;
+    const recover = vi.fn(async () => ({ status: 'credential_refreshed', restartRequested: true }));
+    const scheduler = new RuntimeAuthRecoveryScheduler({ nowMs: () => nowMs,
+      maxAttempts: 3, providerOutcomePendingWaitMs: 250, recover });
+    const enqueue = (kind: 'usage_limit' | 'auth_expired') => scheduler.enqueueApplyFailure({
+      sessionId: 'session-new-failure', switchesThisTurn: 1,
+      classification: classificationFor({ kind }),
+      result: { status: 'generation_apply_failed', errorCode: 'hot_apply_failed',
+        diagnostics: { underlyingError: 'timeout of 5000ms exceeded' } },
+    });
+    try {
+      await enqueue('usage_limit');
+      await scheduler.wake({ sessionId: 'session-new-failure', reason: 'manual' });
+      // Repeated evidence keeps the completed repair; changed evidence permits a new attempt.
+      await enqueue('usage_limit');
+      nowMs += 250;
+      await scheduler.wake({ sessionId: 'session-new-failure', reason: 'manual' });
+      expect(recover).toHaveBeenCalledTimes(1);
+      await enqueue('auth_expired');
+      nowMs += 250;
+      await scheduler.wake({ sessionId: 'session-new-failure', reason: 'manual' });
+      expect(recover).toHaveBeenCalledTimes(2);
+    } finally { scheduler.dispose(); }
+  });
+
   it('keeps a credential-refresh continuation targeted and bounded while provider proof is absent', async () => {
     let nowMs = 1_000;
     const scheduler = new RuntimeAuthRecoveryScheduler({

@@ -934,7 +934,14 @@ function mergeRuntimeAuthRecoveryIntent(
       previous.pendingVisibleEvents,
       next.pendingVisibleEvents,
     ),
-    status: previous.status,
+    // A gate delay is not new provider evidence. Repeated intake must retain a
+    // completed repair, but changed evidence can arm recovery in the same epoch.
+    status: !sameEvidence && isUntargetedProviderOutcomeProofWait(previous)
+      ? 'waiting'
+      : previous.status,
+    lastError: sameEvidence && isUntargetedProviderOutcomeProofWait(previous)
+      ? previous.lastError
+      : next.lastError,
     nextRetryAtMs: sameEvidence
       ? previous.nextRetryAtMs ?? next.nextRetryAtMs
       : mergeRuntimeAuthNextRetryAtMs(previous, next),
@@ -1117,7 +1124,8 @@ function isStaleProfileReplayForPendingProofTarget(input: Readonly<{
 }
 
 function isUntargetedProviderOutcomeProofWait(intent: RuntimeAuthRecoveryIntent): boolean {
-  return intent.lastError === RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR
+  return (intent.status === 'resumed_awaiting_proof'
+      || intent.lastError === RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR)
     && intent.pendingTargetProfileId == null
     && intent.pendingTargetGeneration == null;
 }
@@ -1204,6 +1212,11 @@ export class RuntimeAuthRecoveryScheduler {
         status: 'checking',
         lastSettledTransition: mergeRuntimeAuthRecoveryTransition(intent.lastSettledTransition, 'working'),
         attemptCount,
+        // A gate can replace lastError while retaining the proof-wait state.
+        // Carry that phase through the generic scheduler's checking transition.
+        lastError: isUntargetedProviderOutcomeProofWait(intent)
+          ? RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR
+          : intent.lastError,
       }),
       markWaiting: (intent, input) => withRuntimeAuthWaitPresentation({
         ...intent,
