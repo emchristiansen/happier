@@ -377,6 +377,7 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
       await replaceDirectoryAtomically({
         stagedDir: attemptRoot,
         targetDir: rootDir,
+        preserveUnprovidedEntries: materialized.preserveUnprovidedEntriesAcrossPromotion ?? [],
         afterPromote: async () => {
           await materialized.afterPromote?.({
             env: materializedEnv,

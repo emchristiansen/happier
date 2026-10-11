@@ -137,6 +137,12 @@ function withClaude1mContextVariant(model: AgentModelDescriptor): AgentModelDesc
 
 const CLAUDE_STATIC_MODELS = Object.freeze(([
   {
+    id: 'claude-opus-5-5',
+    name: 'Opus 5.5',
+    description: 'Latest highest-capability Claude model for the hardest coding and reasoning tasks.',
+    contextWindowTokens: 1_000_000,
+  },
+  {
     id: 'claude-opus-5',
     name: 'Opus 5',
     description: 'Latest highest-capability Claude model for the hardest coding and reasoning tasks.',

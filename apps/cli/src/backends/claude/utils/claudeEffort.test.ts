@@ -8,6 +8,10 @@ import {
 } from './claudeEffort';
 
 describe('buildClaudeEffortCliArgs', () => {
+  it('forwards explicit high for Opus 5.5 while omitting its medium default', () => {
+    expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-5-5', effort: 'high' })).toEqual(['--effort', 'high']);
+    expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-5-5', effort: 'medium' })).toEqual([]);
+  });
   it('treats Fable 5 high as the default effort', () => {
     expect(buildClaudeEffortCliArgs({ modelId: 'claude-fable-5', effort: 'high' })).toEqual([]);
     expect(buildClaudeEffortCliArgs({ modelId: 'claude-fable-5', effort: 'xhigh' })).toEqual(['--effort', 'xhigh']);

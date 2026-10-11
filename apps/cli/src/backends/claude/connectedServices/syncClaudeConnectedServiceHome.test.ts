@@ -166,3 +166,29 @@ describe('syncClaudeConnectedServiceHome candidate session import reconciliation
     expect(mapping?.destinationPath).toBe(canonicalPath);
   });
 });
+
+
+describe('Claude global guidance identity', () => {
+  it.each(['linked', 'copied'] as const)('links global guidance under %s config policy', async (configMode) => {
+    const { homeDir, targetDir, ambientDir } = await makeSelfSourceHome();
+    await writeFile(join(ambientDir, 'CLAUDE.md'), 'Synthetic global guidance\n');
+    await syncClaudeConnectedServiceHome({
+      sourceEnv: { HOME: homeDir, CLAUDE_CONFIG_DIR: ambientDir }, targetDir,
+      sharingPolicyOverride: { configMode, stateMode: 'isolated' },
+    });
+    expect((await lstat(join(targetDir, 'CLAUDE.md'))).isSymbolicLink()).toBe(true);
+    expect(await realpath(join(targetDir, 'CLAUDE.md'))).toBe(await realpath(join(ambientDir, 'CLAUDE.md')));
+    await writeFile(join(ambientDir, 'CLAUDE.md'), 'Changed synthetic guidance\n');
+    expect(await readFile(join(targetDir, 'CLAUDE.md'), 'utf8')).toBe('Changed synthetic guidance\n');
+  });
+
+  it('does not import global guidance under isolated config policy', async () => {
+    const { homeDir, targetDir, ambientDir } = await makeSelfSourceHome();
+    await writeFile(join(ambientDir, 'CLAUDE.md'), 'Synthetic global guidance\n');
+    await syncClaudeConnectedServiceHome({
+      sourceEnv: { HOME: homeDir, CLAUDE_CONFIG_DIR: ambientDir }, targetDir,
+      sharingPolicyOverride: { configMode: 'isolated', stateMode: 'isolated' },
+    });
+    await expect(lstat(join(targetDir, 'CLAUDE.md'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+});
