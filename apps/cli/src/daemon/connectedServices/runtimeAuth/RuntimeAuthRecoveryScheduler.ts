@@ -1062,6 +1062,17 @@ function mergeRuntimeAuthRecoveryWakeWrite(input: Readonly<{
       : input.current;
   }
   if (hasSameRuntimeAuthFailureFields(input.current, input.base)) return input.next;
+  if (input.reason === 'waiting'
+    && isUntargetedProviderOutcomeProofWait(input.base)
+    && !hasSameRuntimeAuthRecoveryEvidence(input.current, input.base)) {
+    // Observation proves nothing about failure evidence admitted after its
+    // claim. Preserve that intake's recovery phase and remove only this wake's
+    // observation increment, so it cannot relatch proof or consume a retry.
+    const observationIncrement = Math.max(0, input.base.attemptCount - input.next.attemptCount);
+    return { ...input.current,
+      attemptCount: Math.max(0, input.current.attemptCount - observationIncrement),
+    };
+  }
   const keepLatestFailureMessage = input.reason === 'waiting' || input.reason === 'delayed';
   return {
     ...input.next,

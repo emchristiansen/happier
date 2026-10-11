@@ -2747,6 +2747,75 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     } finally { scheduler.dispose(); }
   });
 
+  it.each([2, 3])('preserves changed failure intake across an older proof wake (max attempts %i)', async (maxAttempts) => {
+    const directory = await mkdtemp(join(tmpdir(), 'runtime-auth-proof-intake-race-'));
+    const filePath = join(directory, 'intents.json');
+    const baseStore = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath);
+    const claimStarted = createDeferred<void>();
+    const releaseClaim = createDeferred<void>();
+    let holdNextClaim = false;
+    const heldStore: DurableRecoveryStore<RuntimeAuthRecoveryIntent> = {
+      ...baseStore,
+      transact: async <TResult>(key: string, transaction: (current: Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null }>) => Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null; result: TResult }>) => {
+        let claimed = false;
+        const result = await baseStore.transact!<TResult>(key, (current) => {
+          const next = transaction(current);
+          claimed = current.effectClaimToken === null && next.effectClaimToken !== null;
+          return next;
+        });
+        if (holdNextClaim && claimed) {
+          holdNextClaim = false;
+          claimStarted.resolve();
+          await releaseClaim.promise;
+        }
+        return result;
+      },
+    };
+    let nowMs = 1_000;
+    const recover = vi.fn(async () => ({ status: 'credential_refreshed', restartRequested: true }));
+    const createScheduler = (store: DurableRecoveryStore<RuntimeAuthRecoveryIntent>) => new RuntimeAuthRecoveryScheduler({
+      nowMs: () => nowMs, maxAttempts, providerOutcomePendingWaitMs: 250,
+      recover, durableStore: store,
+    });
+    const first = createScheduler(heldStore);
+    const second = createScheduler(createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath));
+    let oldWake: Promise<unknown> | undefined;
+    const enqueue = (scheduler: RuntimeAuthRecoveryScheduler, kind: 'usage_limit' | 'auth_expired') =>
+      scheduler.enqueueApplyFailure({ sessionId: 'session-racing-proof', switchesThisTurn: 1,
+        classification: classificationFor({ kind }),
+        result: { status: 'generation_apply_failed', errorCode: 'hot_apply_failed',
+          diagnostics: { underlyingError: 'timeout of 5000ms exceeded' } },
+      });
+    try {
+      await enqueue(first, 'usage_limit');
+      await first.wake({ sessionId: 'session-racing-proof', reason: 'manual' });
+      expect(recover).toHaveBeenCalledTimes(1);
+      nowMs += 250;
+      holdNextClaim = true;
+      oldWake = first.wake({ sessionId: 'session-racing-proof', reason: 'manual' });
+      await claimStarted.promise;
+      await enqueue(second, 'auth_expired');
+      expect(second.read('session-racing-proof')).toMatchObject({
+        status: 'waiting', classification: { kind: 'auth_expired' },
+      });
+      releaseClaim.resolve();
+      await oldWake;
+      expect(second.read('session-racing-proof')).toMatchObject({
+        status: 'waiting', classification: { kind: 'auth_expired' }, attemptCount: 1,
+      });
+      nowMs += 250;
+      await second.wake({ sessionId: 'session-racing-proof', reason: 'manual' });
+      expect(recover).toHaveBeenCalledTimes(2);
+      expect(recover).toHaveBeenNthCalledWith(2, expect.objectContaining({ classification: expect.objectContaining({ kind: 'auth_expired' }) }));
+    } finally {
+      releaseClaim.resolve();
+      await oldWake;
+      first.dispose();
+      second.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it('keeps a credential-refresh continuation targeted and bounded while provider proof is absent', async () => {
     let nowMs = 1_000;
     const scheduler = new RuntimeAuthRecoveryScheduler({
