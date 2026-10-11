@@ -4,7 +4,7 @@ import { classifyDaemonServerWorkError } from '@/daemon/serverWork/classifyDaemo
 import {
   DurableBackoffRecoveryScheduler,
   type DurableRecoveryGateResult,
-  type DurableRecoveryStore,
+  type TransactionalRecoveryStore,
 } from '../recoveryScheduler/DurableBackoffRecoveryScheduler';
 import {
   CONNECTED_SERVICE_UX_DIAGNOSTIC_CODES,
@@ -151,7 +151,7 @@ export type RuntimeAuthRecoverySchedulerDeps = Readonly<{
   }>) => Promise<unknown>;
   gate?: (input: Readonly<{ sessionId: string; intent: RuntimeAuthRecoveryIntent }>) => DurableRecoveryGateResult;
   recordDiagnostic?: (event: RuntimeAuthRecoveryDiagnostic) => void;
-  durableStore?: DurableRecoveryStore<RuntimeAuthRecoveryIntent>;
+  durableStore?: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent>;
 }>;
 
 type RetryDecision =
@@ -286,7 +286,15 @@ function normalizeIntent(value: unknown): RuntimeAuthRecoveryIntent | null {
     profileId: readString(value.profileId),
     groupId: readString(value.groupId),
     resumePromptMode: readResumePromptMode(value.resumePromptMode),
-    status: value.status,
+    // An accepted durable deadline remains recovery work, even in a record
+    // written by an older stale proof settlement. Normalize before gate errors
+    // can replace the diagnostic that identifies that work.
+    status: value.status === 'resumed_awaiting_proof'
+      && (value.lastError === 'no_eligible_member'
+        || value.lastError === 'switch_limit_reached'
+        || value.lastError === 'awaiting_limit_reset')
+      ? 'waiting'
+      : value.status,
     armedAtMs,
     nextRetryAtMs,
     attemptCount,
@@ -1067,25 +1075,32 @@ function mergeRuntimeAuthRecoveryWakeWrite(input: Readonly<{
       ? input.next
       : input.current;
   }
+  const currentPolicy = normalizeIntent(input.current);
+  const claimedPolicy = normalizeIntent(input.base);
+  // Delivery acknowledgments mutate this outbox during provider work. They
+  // change no recovery policy and must neither cause a retry nor be resurrected.
+  const { pendingVisibleEvents: _currentOutbox, ...currentFields } = currentPolicy ?? {};
+  const { pendingVisibleEvents: _claimedOutbox, ...claimedFields } = claimedPolicy ?? {};
   if (input.reason === 'waiting'
-    && isUntargetedProviderOutcomeProofWait(input.base)) {
-    // Equal failure evidence can belong to a replacement attempt. Fence every
-    // observation before the equality shortcuts or generic phase merge. The
-    // atomic claim gives legacy records an identity; absent IDs never match.
-    const countBelongsToObservedEpoch = input.base.attemptId !== undefined
-      && input.current.attemptId === input.base.attemptId
-      && !hasExplicitRuntimeAuthRecoveryEpochChange(input.base, input.current);
-    if (!countBelongsToObservedEpoch) return input.current;
-    if (!hasSameRuntimeAuthRecoveryEvidence(input.current, input.base)) {
-      // Changed evidence in this attempt retains its recovery phase and loses
-      // only this wake's observation increment, rather than a real retry.
-      const observationIncrement = Math.max(0, input.base.attemptCount - input.next.attemptCount);
-      return { ...input.current,
-        attemptCount: Math.max(0, input.current.attemptCount - observationIncrement),
-      };
-    }
+    && !isDeepStrictEqual(currentFields, claimedFields)) {
+    // Observations no longer claim or settle. A real attempt may install its
+    // result only over its unchanged claim snapshot. Accepted intake/results
+    // own their phase, targets and retry policy; completed real work is charged.
+    return input.current.status === 'checking'
+      ? { ...input.current, status: 'waiting' }
+      : input.current;
   }
-  if (hasSameRuntimeAuthFailureFields(input.current, input.base)) return input.next;
+  if (hasSameRuntimeAuthFailureFields(input.current, input.base)) {
+    if (input.reason !== 'waiting') return input.next;
+    const { pendingVisibleEvents: _nextOutbox, ...nextFields } = input.next;
+    const newDeliveries = input.next.pendingVisibleEvents?.filter((event) => (
+      !input.base.pendingVisibleEvents?.some((previous) => isDeepStrictEqual(previous, event))
+    ));
+    const pendingVisibleEvents = mergeRuntimeAuthRecoveryPendingVisibleEvents(
+      input.current.pendingVisibleEvents, newDeliveries,
+    );
+    return { ...nextFields, ...(pendingVisibleEvents ? { pendingVisibleEvents } : {}) };
+  }
   const keepLatestFailureMessage = input.reason === 'waiting' || input.reason === 'delayed';
   return {
     ...input.next,
@@ -1148,8 +1163,7 @@ function isStaleProfileReplayForPendingProofTarget(input: Readonly<{
 }
 
 function isUntargetedProviderOutcomeProofWait(intent: RuntimeAuthRecoveryIntent): boolean {
-  return (intent.status === 'resumed_awaiting_proof'
-      || intent.lastError === RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR)
+  return intent.status === 'resumed_awaiting_proof'
     && intent.pendingTargetProfileId == null
     && intent.pendingTargetGeneration == null;
 }
@@ -1228,6 +1242,18 @@ export class RuntimeAuthRecoveryScheduler {
         : isRuntimeAuthDurableWaitIntent(intent)
           ? Number.MAX_SAFE_INTEGER
           : intent.maxAttempts,
+      observeBeforeEffectClaim: (intent) => {
+        if (!isUntargetedProviderOutcomeProofWait(intent)) return null;
+        const retryAtMs = this.providerOutcomePendingWaitMs === null
+          ? deps.nowMs() + this.baseBackoffMs
+          : deps.nowMs() + this.providerOutcomePendingWaitMs;
+        return {
+          intent: { ...intent, attemptId: intent.attemptId ?? buildRuntimeAuthRecoveryAttemptId(undefined), nextRetryAtMs: retryAtMs,
+            lastError: RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR },
+          retryAtMs,
+          reason: RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR,
+        };
+      },
       terminalRecordRetentionMs: DEFAULT_RUNTIME_AUTH_RECOVERY_TERMINAL_RECORD_RETENTION_MS,
       getTerminalPruneReferenceMs: (intent) => intent.terminalAtMs ?? intent.armedAtMs,
       markChecking: (intent, attemptCount) => ({
@@ -1313,25 +1339,6 @@ export class RuntimeAuthRecoveryScheduler {
       }),
       recover: async (intent) => {
         try {
-          // Local repair already completed. Untargeted wakes can observe the
-          // durable proof wait, but must not rotate again to manufacture proof.
-          // The wait outcome retains the state and emits the regular delayed
-          // diagnostic on every wake until provider-outcome evidence arrives.
-          if (isUntargetedProviderOutcomeProofWait(intent)) {
-            return {
-              status: 'wait',
-              exhaustOnMaxAttempt: false,
-              lastError: RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR,
-              intent: {
-                ...intent,
-                status: 'resumed_awaiting_proof',
-                attemptCount: Math.max(0, intent.attemptCount - 1),
-              },
-              ...(this.providerOutcomePendingWaitMs === null
-                ? {}
-                : { nextRetryAtMs: deps.nowMs() + this.providerOutcomePendingWaitMs }),
-            };
-          }
           const result = await deps.recover({
             sessionId: intent.sessionId,
             switchesThisTurn: intent.switchesThisTurn,

@@ -10,7 +10,7 @@ import {
 } from './RuntimeAuthRecoveryScheduler';
 import { buildRuntimeAuthRecoveryKey } from './recoveryKey/runtimeAuthRecoveryKey';
 import type { ConnectedServiceRuntimeFailureClassification } from './types';
-import type { DurableRecoveryStore } from '../recoveryScheduler/DurableBackoffRecoveryScheduler';
+import type { TransactionalRecoveryStore } from '../recoveryScheduler/DurableBackoffRecoveryScheduler';
 import { createRecoveryIntentFileStore } from '../recoveryScheduler/recoveryIntentFileStore';
 
 function classification(): ConnectedServiceRuntimeFailureClassification {
@@ -329,7 +329,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     const baseStore = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath);
     const baseTransact = baseStore.transact!;
     let blockNextTransaction = false;
-    const blockedSettlementStore: DurableRecoveryStore<RuntimeAuthRecoveryIntent> = {
+    const blockedSettlementStore: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent> = {
       ...baseStore,
       transact: async <TResult>(
         recoveryKey: string,
@@ -559,7 +559,19 @@ describe('RuntimeAuthRecoveryScheduler', () => {
   it('atomically merges same-evidence attempts across two scheduler controllers sharing one durable store', async () => {
     const values = new Map<string, RuntimeAuthRecoveryIntent>();
     let mergeChain = Promise.resolve();
-    const durableStore = {
+    const claims = new Map<string, string>();
+    const durableStore: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent> = {
+      transact: async <TResult>(key: string, transaction: (current: Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null }>) => Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null; result: TResult }>) => {
+        let result!: TResult;
+        mergeChain = mergeChain.then(() => {
+          const next = transaction({ intent: values.get(key) ?? null, effectClaimToken: claims.get(key) ?? null });
+          if (next.intent === null) values.delete(key); else values.set(key, next.intent);
+          if (next.effectClaimToken === null) claims.delete(key); else claims.set(key, next.effectClaimToken);
+          result = next.result;
+        });
+        await mergeChain;
+        return result;
+      },
       read: (key: string) => values.get(key) ?? null,
       readAll: () => [...values.entries()] as ReadonlyArray<readonly [string, RuntimeAuthRecoveryIntent]>,
       write: (key: string, intent: RuntimeAuthRecoveryIntent) => {
@@ -571,12 +583,12 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       merge: async (
         key: string,
         next: RuntimeAuthRecoveryIntent,
-        merge: (previous: RuntimeAuthRecoveryIntent | null, next: RuntimeAuthRecoveryIntent) => RuntimeAuthRecoveryIntent,
+        merge: (previous: RuntimeAuthRecoveryIntent | null, next: RuntimeAuthRecoveryIntent) => RuntimeAuthRecoveryIntent | null,
       ) => {
-        let merged!: RuntimeAuthRecoveryIntent;
+        let merged!: RuntimeAuthRecoveryIntent | null;
         mergeChain = mergeChain.then(() => {
           merged = merge(values.get(key) ?? null, next);
-          values.set(key, merged);
+          if (merged === null) values.delete(key); else values.set(key, merged);
         });
         await mergeChain;
         return merged;
@@ -2754,13 +2766,14 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     const claimStarted = createDeferred<void>();
     const releaseClaim = createDeferred<void>();
     let holdNextClaim = false;
-    const heldStore: DurableRecoveryStore<RuntimeAuthRecoveryIntent> = {
+    const heldStore: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent> = {
       ...baseStore,
       transact: async <TResult>(key: string, transaction: (current: Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null }>) => Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null; result: TResult }>) => {
         let claimed = false;
         const result = await baseStore.transact!<TResult>(key, (current) => {
           const next = transaction(current);
-          claimed = current.effectClaimToken === null && next.effectClaimToken !== null;
+          claimed = (current.effectClaimToken === null && next.effectClaimToken !== null)
+            || (next.result as { status?: string } | null)?.status === 'observed';
           return next;
         });
         if (holdNextClaim && claimed) {
@@ -2773,7 +2786,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     };
     let nowMs = 1_000;
     const recover = vi.fn(async () => ({ status: 'credential_refreshed', restartRequested: true }));
-    const createScheduler = (store: DurableRecoveryStore<RuntimeAuthRecoveryIntent>) => new RuntimeAuthRecoveryScheduler({
+    const createScheduler = (store: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent>) => new RuntimeAuthRecoveryScheduler({
       nowMs: () => nowMs, maxAttempts, providerOutcomePendingWaitMs: 250,
       recover, durableStore: store,
     });
@@ -2807,7 +2820,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       await claimStarted.promise;
       const claimedAttemptId = first.read('session-racing-proof')?.attemptId;
       expect(claimedAttemptId).toBeDefined();
-      expect(second.read('session-racing-proof')).toMatchObject({ status: 'checking', attemptId: claimedAttemptId });
+      expect(second.read('session-racing-proof')).toMatchObject({ status: 'resumed_awaiting_proof', attemptId: claimedAttemptId });
       await enqueue(second, 'auth_expired');
       expect(second.read('session-racing-proof')).toMatchObject({
         status: 'waiting', classification: { kind: 'auth_expired' },
@@ -2838,13 +2851,14 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     const claimStarted = createDeferred<void>();
     const releaseClaim = createDeferred<void>();
     let holdNextClaim = false;
-    const heldStore: DurableRecoveryStore<RuntimeAuthRecoveryIntent> = {
+    const heldStore: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent> = {
       ...baseStore,
       transact: async <TResult>(key: string, transaction: (current: Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null }>) => Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null; result: TResult }>) => {
         let claimed = false;
         const result = await baseStore.transact!<TResult>(key, (current) => {
           const next = transaction(current);
-          claimed = current.effectClaimToken === null && next.effectClaimToken !== null;
+          claimed = (current.effectClaimToken === null && next.effectClaimToken !== null)
+            || (next.result as { status?: string } | null)?.status === 'observed';
           return next;
         });
         if (holdNextClaim && claimed) {
@@ -2857,7 +2871,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     };
     let nowMs = 1_000;
     const recover = vi.fn(async () => ({ status: 'credential_refreshed', restartRequested: true }));
-    const createScheduler = (store: DurableRecoveryStore<RuntimeAuthRecoveryIntent>) => new RuntimeAuthRecoveryScheduler({
+    const createScheduler = (store: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent>) => new RuntimeAuthRecoveryScheduler({
       nowMs: () => nowMs, maxAttempts, providerOutcomePendingWaitMs: 250,
       recover, durableStore: store,
     });
@@ -2910,21 +2924,160 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     }
   });
 
-  it.each([{ stableSource: false, legacy: false }, { stableSource: true, legacy: false }, { stableSource: true, legacy: true }])('preserves replacement work when evidence returns to the old classification (stable source $stableSource, legacy $legacy)', async ({ stableSource, legacy }) => {
+  it.each([false, true])('preserves a superseded legacy effect claim without release or refund (legacy %s)', async (legacy) => {
+    const directory = await mkdtemp(join(tmpdir(), 'runtime-auth-legacy-claim-'));
+    const filePath = join(directory, 'intents.json');
+    const store = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath);
+    const recover = vi.fn(async () => ({ status: 'credential_refreshed', restartRequested: true }));
+    const first = new RuntimeAuthRecoveryScheduler({ nowMs: () => 1_000, recover, durableStore: store });
+    const second = new RuntimeAuthRecoveryScheduler({ nowMs: () => 1_000, recover,
+      durableStore: createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath) });
+    const sessionId = 'session-legacy-claim';
+    const recoveryKey = buildRuntimeAuthRecoveryKey({ sessionId, serviceId: 'openai-codex', profileId: 'primary', groupId: 'team' });
+    try {
+      await first.beginClassifiedFailure({ sessionId, reportId: 'old-report', switchesThisTurn: 1,
+        classification: classificationFor({ sourceKey: 'old-source' }) });
+      await first.wakeByKey({ recoveryKey, reason: 'manual' });
+      const { attemptId, ...oldIntent } = first.readByKey(recoveryKey)!;
+      await store.transact(recoveryKey, () => ({ intent: { ...oldIntent,
+        ...(legacy ? {} : { attemptId }), status: 'checking', attemptCount: 2 },
+        effectClaimToken: 'opaque-legacy-claim', result: undefined }));
+      await first.wakeByKey({ recoveryKey, reason: 'manual' });
+      expect(first.readByKey(recoveryKey)).toMatchObject({ status: 'checking', attemptCount: 2 });
+      await second.beginClassifiedFailure({ sessionId, reportId: 'new-report', switchesThisTurn: 1,
+        classification: classificationFor({ sourceKey: 'new-source', kind: 'auth_expired' }) });
+      const newAttemptId = second.readByKey(recoveryKey)?.attemptId;
+      await second.markDurableWaitForResultByKey({ recoveryKey, expectedAttemptId: newAttemptId,
+        classificationResetsAtMs: null,
+        result: { status: 'no_eligible_member', groupExhausted: true, excluded: [], retryAtMs: 9_000 } });
+      const newer = second.readByKey(recoveryKey);
+      await first.wakeByKey({ recoveryKey, reason: 'manual' });
+      expect(second.readByKey(recoveryKey)).toEqual(newer);
+      const claim = await store.transact(recoveryKey, (current) => ({ ...current, result: current.effectClaimToken }));
+      expect(claim).toBe('opaque-legacy-claim');
+      expect(second.readByKey(recoveryKey)).toMatchObject({ attemptId: newAttemptId, status: 'waiting', attemptCount: 1, nextRetryAtMs: 9_000 });
+      expect(recover).toHaveBeenCalledTimes(1);
+    } finally {
+      first.dispose(); second.dispose(); await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['changed_intake', 'changed_durable', 'same_durable', 'target', 'outbox'] as const)('preserves accepted policy during a real recovery (%s)', async (policy) => {
+    const directory = await mkdtemp(join(tmpdir(), 'runtime-auth-real-settlement-'));
+    const filePath = join(directory, 'intents.json');
+    const store = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath);
+    const recoveryStarted = createDeferred<void>();
+    const releaseRecovery = createDeferred<void>();
+    let holdRecovery = true;
+    let nowMs = 1_000;
+    const recover = vi.fn(async () => {
+      if (holdRecovery) {
+        holdRecovery = false;
+        recoveryStarted.resolve();
+        await releaseRecovery.promise;
+      }
+      return { status: 'credential_refreshed', restartRequested: true };
+    });
+    const createScheduler = () => new RuntimeAuthRecoveryScheduler({ nowMs: () => nowMs,
+      maxAttempts: 3, providerOutcomePendingWaitMs: 250, recover,
+      durableStore: createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath) });
+    const first = createScheduler();
+    const second = createScheduler();
+    const sessionId = 'session-real-settlement';
+    const recoveryKey = buildRuntimeAuthRecoveryKey({ sessionId, serviceId: 'openai-codex', profileId: 'primary', groupId: 'team' });
+    let oldWake: Promise<unknown> | undefined;
+    try {
+      await first.beginClassifiedFailure({ sessionId, reportId: 'initial-report', switchesThisTurn: 1,
+        classification: classificationFor({ sourceKey: 'stable-source' }) });
+      if (policy === 'outbox') {
+        await first.markDurableWaitForResultByKey({ recoveryKey, classificationResetsAtMs: null,
+          result: { status: 'no_eligible_member', groupExhausted: true, excluded: [], retryAtMs: 9_000 } });
+      }
+      oldWake = first.wakeByKey({ recoveryKey, reason: 'manual' });
+      await recoveryStarted.promise;
+      const attemptId = second.readByKey(recoveryKey)?.attemptId;
+      const kind = policy.startsWith('changed') ? 'auth_expired' : 'usage_limit';
+      if (policy !== 'outbox') {
+        await second.beginClassifiedFailure({ sessionId, reportId: 'concurrent-report', switchesThisTurn: 1,
+          classification: classificationFor({ sourceKey: 'stable-source', kind }) });
+      }
+      if (policy.endsWith('durable')) {
+        await second.markDurableWaitForResultByKey({ recoveryKey, expectedAttemptId: attemptId,
+          classificationFailureKind: kind, classificationResetsAtMs: null,
+          result: { status: 'no_eligible_member', groupExhausted: true, excluded: [], retryAtMs: 9_000 } });
+      } else if (policy === 'target') {
+        await second.markAwaitingProviderOutcomeProofForResultByKey({ recoveryKey, expectedAttemptId: attemptId,
+          result: { status: 'switched', activeProfileId: 'next-profile', generation: 2 } });
+      }
+      if (policy === 'outbox') {
+        expect(second.readByKey(recoveryKey)?.pendingVisibleEvents?.length).toBeGreaterThan(0);
+        await second.drainPendingVisibleEvents(async () => {});
+      }
+      const beforeSettlement = second.readByKey(recoveryKey)!;
+      releaseRecovery.resolve();
+      await oldWake;
+      expect(second.readByKey(recoveryKey)).toMatchObject({
+        attemptId, attemptCount: policy.endsWith('durable') || policy === 'outbox' ? 2 : 1,
+        classification: { kind },
+        status: policy === 'target' || policy === 'outbox' ? 'resumed_awaiting_proof' : 'waiting',
+        pendingTargetProfileId: policy === 'target' ? 'next-profile' : null,
+        pendingTargetGeneration: policy === 'target' ? 2 : null,
+        nextRetryAtMs: policy === 'outbox' ? 1_250 : beforeSettlement.nextRetryAtMs,
+      });
+      nowMs = 9_000;
+      await second.wakeByKey({ recoveryKey, reason: 'manual' });
+      expect(recover).toHaveBeenCalledTimes(policy === 'outbox' ? 1 : 2);
+      if (policy === 'outbox') {
+        expect(second.readByKey(recoveryKey)?.pendingVisibleEvents?.some((event) => event.transition === 'working')).not.toBe(true);
+      }
+    } finally {
+      releaseRecovery.resolve();
+      await oldWake;
+      first.dispose(); second.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('honors an inherited durable deadline even when its phase says proof wait', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'runtime-auth-inherited-durable-'));
+    const filePath = join(directory, 'intents.json');
+    const store = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath);
+    let nowMs = 1_000;
+    const recover = vi.fn(async () => ({ status: 'credential_refreshed', restartRequested: true }));
+    const first = new RuntimeAuthRecoveryScheduler({ nowMs: () => nowMs, recover, durableStore: store });
+    const recoveryKey = buildRuntimeAuthRecoveryKey({ sessionId: 'session-inherited-durable', serviceId: 'openai-codex', profileId: 'primary', groupId: 'team' });
+    try {
+      await first.beginClassifiedFailure({ sessionId: 'session-inherited-durable', switchesThisTurn: 1, classification: classification() });
+      await first.wakeByKey({ recoveryKey, reason: 'manual' });
+      await store.write(recoveryKey, { ...first.readByKey(recoveryKey)!, status: 'resumed_awaiting_proof',
+        lastError: 'no_eligible_member', nextRetryAtMs: 9_000 });
+      nowMs = 8_999;
+      await first.wakeByKey({ recoveryKey, reason: 'timer' });
+      expect(recover).toHaveBeenCalledTimes(1);
+      nowMs = 9_000;
+      await first.wakeByKey({ recoveryKey, reason: 'timer' });
+      expect(recover).toHaveBeenCalledTimes(2);
+    } finally {
+      first.dispose(); await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([{ resultKind: 'durable', legacy: false }, { resultKind: 'durable', legacy: true }, { resultKind: 'target', legacy: false }, { resultKind: 'target', legacy: true }] as const)('preserves newer same-attempt results across an old proof observation (result $resultKind, legacy $legacy)', async ({ resultKind, legacy }) => {
     const maxAttempts = 3;
-    const directory = await mkdtemp(join(tmpdir(), 'runtime-auth-proof-returned-evidence-'));
+    const directory = await mkdtemp(join(tmpdir(), 'runtime-auth-proof-same-attempt-result-'));
     const filePath = join(directory, 'intents.json');
     const baseStore = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath);
     const claimStarted = createDeferred<void>();
     const releaseClaim = createDeferred<void>();
     let holdNextClaim = false;
-    const heldStore: DurableRecoveryStore<RuntimeAuthRecoveryIntent> = {
+    const heldStore: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent> = {
       ...baseStore,
       transact: async <TResult>(key: string, transaction: (current: Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null }>) => Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null; result: TResult }>) => {
         let claimed = false;
         const result = await baseStore.transact!<TResult>(key, (current) => {
           const next = transaction(current);
-          claimed = current.effectClaimToken === null && next.effectClaimToken !== null;
+          claimed = (current.effectClaimToken === null && next.effectClaimToken !== null)
+            || (next.result as { status?: string } | null)?.status === 'observed';
           return next;
         });
         if (holdNextClaim && claimed) {
@@ -2937,7 +3090,95 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     };
     let nowMs = 1_000;
     const recover = vi.fn(async () => ({ status: 'credential_refreshed', restartRequested: true }));
-    const createScheduler = (store: DurableRecoveryStore<RuntimeAuthRecoveryIntent>) => new RuntimeAuthRecoveryScheduler({
+    const createScheduler = (store: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent>) => new RuntimeAuthRecoveryScheduler({
+      nowMs: () => nowMs, maxAttempts, providerOutcomePendingWaitMs: 250,
+      recover, durableStore: store,
+    });
+    const first = createScheduler(heldStore);
+    const second = createScheduler(createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath));
+    let oldWake: Promise<unknown> | undefined;
+    const sessionId = 'session-proof-same-attempt-result';
+    const recoveryKey = buildRuntimeAuthRecoveryKey({ sessionId, serviceId: 'openai-codex', profileId: 'primary', groupId: 'team' });
+    const begin = (scheduler: RuntimeAuthRecoveryScheduler, reportId: string, sourceKey: string, kind: 'usage_limit' | 'auth_expired' = 'usage_limit') => scheduler.beginClassifiedFailure({
+      reportId, sessionId, switchesThisTurn: 1,
+      classification: classificationFor({ sourceKey, kind }),
+    });
+    try {
+      await begin(first, 'old-report-a', 'source-a');
+      await first.wakeByKey({ recoveryKey, reason: 'manual' });
+      if (legacy) {
+        const { attemptId: _attemptId, ...legacyIntent } = first.readByKey(recoveryKey)!;
+        await baseStore.write(recoveryKey, legacyIntent);
+      }
+      nowMs += 250;
+      holdNextClaim = true;
+      oldWake = first.wakeByKey({ recoveryKey, reason: 'manual' });
+      await claimStarted.promise;
+      const claimedAttemptId = second.readByKey(recoveryKey)?.attemptId;
+      expect(claimedAttemptId).toBeDefined();
+      if (resultKind === 'durable') {
+        await begin(second, 'duplicate-report', 'source-a');
+        expect(second.readByKey(recoveryKey)?.attemptId).toBe(claimedAttemptId);
+        await second.markDurableWaitForResultByKey({
+          recoveryKey, expectedAttemptId: claimedAttemptId,
+          classificationFailureKind: 'usage_limit', classificationResetsAtMs: null,
+          result: { status: 'no_eligible_member', generation: 12, groupExhausted: true, retryAtMs: 9_000, excluded: [] },
+        });
+      } else {
+        await second.markAwaitingProviderOutcomeProofForResultByKey({
+          recoveryKey, expectedAttemptId: claimedAttemptId,
+          result: { status: 'switched', activeProfileId: 'next-profile', generation: 2 },
+        });
+      }
+      const expected = resultKind === 'durable'
+        ? { attemptId: claimedAttemptId, status: 'waiting', attemptCount: 2,
+          lastError: 'no_eligible_member', nextRetryAtMs: 9_000 }
+        : { attemptId: claimedAttemptId, status: 'resumed_awaiting_proof', attemptCount: 1,
+          pendingTargetProfileId: 'next-profile', pendingTargetGeneration: 2, nextRetryAtMs: 1_500 };
+      releaseClaim.resolve();
+      await oldWake;
+      expect(second.readByKey(recoveryKey)).toMatchObject(expected);
+      nowMs = expected.nextRetryAtMs;
+      await second.wakeByKey({ recoveryKey, reason: 'manual' });
+      expect(recover).toHaveBeenCalledTimes(2);
+    } finally {
+      releaseClaim.resolve();
+      await oldWake;
+      first.dispose();
+      second.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([{ stableSource: false, legacy: false }, { stableSource: true, legacy: false }, { stableSource: true, legacy: true }])('preserves replacement work when evidence returns to the old classification (stable source $stableSource, legacy $legacy)', async ({ stableSource, legacy }) => {
+    const maxAttempts = 3;
+    const directory = await mkdtemp(join(tmpdir(), 'runtime-auth-proof-returned-evidence-'));
+    const filePath = join(directory, 'intents.json');
+    const baseStore = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath);
+    const claimStarted = createDeferred<void>();
+    const releaseClaim = createDeferred<void>();
+    let holdNextClaim = false;
+    const heldStore: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent> = {
+      ...baseStore,
+      transact: async <TResult>(key: string, transaction: (current: Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null }>) => Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null; result: TResult }>) => {
+        let claimed = false;
+        const result = await baseStore.transact!<TResult>(key, (current) => {
+          const next = transaction(current);
+          claimed = (current.effectClaimToken === null && next.effectClaimToken !== null)
+            || (next.result as { status?: string } | null)?.status === 'observed';
+          return next;
+        });
+        if (holdNextClaim && claimed) {
+          holdNextClaim = false;
+          claimStarted.resolve();
+          await releaseClaim.promise;
+        }
+        return result;
+      },
+    };
+    let nowMs = 1_000;
+    const recover = vi.fn(async () => ({ status: 'credential_refreshed', restartRequested: true }));
+    const createScheduler = (store: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent>) => new RuntimeAuthRecoveryScheduler({
       nowMs: () => nowMs, maxAttempts, providerOutcomePendingWaitMs: 250,
       recover, durableStore: store,
     });
@@ -2997,13 +3238,14 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     const claimStarted = createDeferred<void>();
     const releaseClaim = createDeferred<void>();
     let holdNextClaim = false;
-    const heldStore: DurableRecoveryStore<RuntimeAuthRecoveryIntent> = {
+    const heldStore: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent> = {
       ...baseStore,
       transact: async <TResult>(key: string, transaction: (current: Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null }>) => Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null; result: TResult }>) => {
         let claimed = false;
         const result = await baseStore.transact!<TResult>(key, (current) => {
           const next = transaction(current);
-          claimed = current.effectClaimToken === null && next.effectClaimToken !== null;
+          claimed = (current.effectClaimToken === null && next.effectClaimToken !== null)
+            || (next.result as { status?: string } | null)?.status === 'observed';
           return next;
         });
         if (holdNextClaim && claimed) {
@@ -3016,7 +3258,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     };
     let nowMs = 1_000;
     const recover = vi.fn(async () => ({ status: 'credential_refreshed', restartRequested: true }));
-    const createScheduler = (store: DurableRecoveryStore<RuntimeAuthRecoveryIntent>) => new RuntimeAuthRecoveryScheduler({
+    const createScheduler = (store: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent>) => new RuntimeAuthRecoveryScheduler({
       nowMs: () => nowMs, maxAttempts, providerOutcomePendingWaitMs: 250,
       recover, durableStore: store,
     });
@@ -3039,7 +3281,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       oldWake = first.wakeByKey({ recoveryKey, reason: 'manual' });
       await claimStarted.promise;
       await begin(second, 'first-new-report', 'source-a');
-      expect(second.readByKey(recoveryKey)).toMatchObject({ status: 'waiting', attemptCount: 2 });
+      expect(second.readByKey(recoveryKey)).toMatchObject({ status: 'waiting', attemptCount: 1 });
       const adoptedAttemptId = second.readByKey(recoveryKey)?.attemptId;
       const kind = replacement === 'explicit' ? 'usage_limit' : 'auth_expired';
       await begin(second, 'replacement-report', replacement === 'explicit' ? 'source-b' : 'source-a', kind);
