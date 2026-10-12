@@ -944,6 +944,22 @@ function mergeRuntimeAuthRecoveryIntent(
     return next.lastSettledTransition === 'working' ? next : previous;
   }
   const sameEvidence = hasSameRuntimeAuthRecoveryEvidence(previous, next);
+  if (sameEvidence && next.lastSettledTransition === 'working') {
+    // This report joins the existing pending attempt; it does not replace its
+    // policy. Preserve every attempt fact so a duplicate cannot manufacture a
+    // policy change under an outstanding claim or consume a manual-check refund.
+    return {
+      ...previous,
+      lastSettledTransition: mergeRuntimeAuthRecoveryTransition(
+        previous.lastSettledTransition,
+        next.lastSettledTransition,
+      ),
+      pendingVisibleEvents: mergeRuntimeAuthRecoveryPendingVisibleEvents(
+        previous.pendingVisibleEvents,
+        next.pendingVisibleEvents,
+      ),
+    };
+  }
   if (!sameEvidence && hasExplicitRuntimeAuthRecoveryEpochChange(previous, next)) return next;
   if (!sameEvidence && previous.status !== 'checking' && previous.status !== 'resumed_awaiting_proof') return next;
   return {

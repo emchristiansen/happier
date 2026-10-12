@@ -51,6 +51,26 @@ function createDeferred<T>(): {
   return { promise, resolve, reject };
 }
 
+function holdCommittedRecoveryClaim(baseStore: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent>) {
+  const committed = createDeferred<void>();
+  const release = createDeferred<void>();
+  let holdNextClaim = false;
+  const store: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent> = {
+    ...baseStore,
+    transact: async (key, transaction) => {
+      const result = await baseStore.transact(key, transaction);
+      if (holdNextClaim && typeof result === 'object' && result !== null
+        && 'status' in result && result.status === 'claimed') {
+        holdNextClaim = false;
+        committed.resolve();
+        await release.promise;
+      }
+      return result;
+    },
+  };
+  return { store, committed, release, holdNext: () => { holdNextClaim = true; } };
+}
+
 describe('RuntimeAuthRecoveryScheduler', () => {
   it.each(['checking', 'waiting'] as const)('coalesces manual mode changes after an existing claim (%s)', async (status) => {
     const dir = await mkdtemp(join(tmpdir(), 'happier-claimed-mode-'));
@@ -173,6 +193,113 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       expect(pending).toEqual(['Usage limits are lifted. Continue where you left off.']);
       expect(scheduler.read('proof-wait')).toMatchObject({ status: 'exhausted', attemptCount: 3 });
     } finally { scheduler.dispose(); }
+  });
+
+  it.each([
+    { duplicate: false, reason: 'manual' as const },
+    { duplicate: true, reason: 'manual' as const },
+    { duplicate: true, reason: 'timer' as const },
+  ])('retains admitted check policy through concurrent duplicate intake (%o)', async ({ duplicate, reason }) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const dir = await mkdtemp(join(tmpdir(), 'happier-continuation-duplicate-'));
+    const filePath = join(dir, 'recovery.json');
+    const baseStore = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath);
+    const held = holdCommittedRecoveryClaim(baseStore);
+    let nowMs = 1000;
+    const continueAfterUsageLimitReset = vi.fn(async () => ({ ok: true, status: 'continuation_enqueued' }));
+    const deps = { nowMs: () => nowMs, maxAttempts: 3, providerOutcomePendingWaitMs: 100,
+      jitterMs: () => 0, continueAfterUsageLimitReset, recover: async () => ({ status: 'credential_refreshed' }) };
+    const scheduler = new RuntimeAuthRecoveryScheduler({ ...deps, durableStore: held.store });
+    const intakeOwner = new RuntimeAuthRecoveryScheduler({ ...deps,
+      durableStore: createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath) });
+    let wake: Promise<Readonly<{ status: string }>> | undefined;
+    try {
+      const intake = { sessionId: 'duplicate-continuation', reportId: 'first-report', switchesThisTurn: 0,
+        classification: classificationFor({ groupId: null, resetsAtMs: 1000, sourceKey: 'same-source' }) };
+      await scheduler.beginClassifiedFailure(intake);
+      await scheduler.wake({ sessionId: intake.sessionId, reason: 'manual' });
+      nowMs = reason === 'manual' ? 1020 : 1100;
+      held.holdNext();
+      wake = scheduler.wake({ sessionId: intake.sessionId, reason });
+      await held.committed.promise;
+      if (duplicate) await intakeOwner.beginClassifiedFailure({ ...intake, reportId: 'second-report' });
+      held.release.resolve();
+      await wake;
+      const afterManual = scheduler.read(intake.sessionId);
+      nowMs += 20;
+      await scheduler.wake({ sessionId: intake.sessionId, reason: 'manual' });
+      const afterNext = scheduler.read(intake.sessionId);
+      expect([afterManual, afterNext]).toEqual([
+        expect.objectContaining({ status: 'resumed_awaiting_proof', attemptCount: reason === 'manual' ? 1 : 2,
+          proofWaitPhase: 'usage_limit_continuation', nextRetryAtMs: reason === 'manual' ? 1100 : 1200 }),
+        expect.objectContaining({ status: 'resumed_awaiting_proof', attemptCount: reason === 'manual' ? 1 : 2,
+          proofWaitPhase: 'usage_limit_continuation', nextRetryAtMs: reason === 'manual' ? 1100 : 1200 }),
+      ]);
+      expect(continueAfterUsageLimitReset).toHaveBeenCalledOnce();
+    } finally {
+      held.release.resolve();
+      await wake;
+      scheduler.dispose(); intakeOwner.dispose();
+      try { await rm(dir, { recursive: true, force: true }); } finally { vi.useRealTimers(); }
+    }
+  });
+
+  it.each(['none', 'acknowledge', 'duplicate'] as const)('preserves in-band continuation manual-check budget under %s', async (action) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const dir = await mkdtemp(join(tmpdir(), 'happier-inband-continuation-'));
+    const filePath = join(dir, 'recovery.json');
+    const held = holdCommittedRecoveryClaim(createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath));
+    let nowMs = 1000;
+    const continueAfterUsageLimitReset = vi.fn(async () => ({ ok: true, status: 'continuation_enqueued' }));
+    const deps = { nowMs: () => nowMs, maxAttempts: 3, providerOutcomePendingWaitMs: 60_000,
+      jitterMs: () => 0, continueAfterUsageLimitReset, recover: async () => { throw new Error('Unexpected generic recovery'); } };
+    const scheduler = new RuntimeAuthRecoveryScheduler({ ...deps, durableStore: held.store });
+    const intakeOwner = new RuntimeAuthRecoveryScheduler({ ...deps,
+      durableStore: createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath) });
+    let wake: Promise<Readonly<{ status: string }>> | undefined;
+    try {
+      const intake = { sessionId: 'inband-continuation', reportId: 'initial-report', switchesThisTurn: 0,
+        classification: classificationFor({ groupId: null, resetsAtMs: 2000, sourceKey: 'same-source' }) };
+      await scheduler.beginClassifiedFailure(intake);
+      const key = buildRuntimeAuthRecoveryKey({ sessionId: intake.sessionId, ...intake.classification });
+      await scheduler.markDurableWaitForResultByKey({ recoveryKey: key,
+        result: { status: 'recovery_action_required', action: { kind: 'profile_action_required', reason: 'usage_limit' } },
+        classificationFailureKind: 'usage_limit', classificationResetsAtMs: 2000 });
+      expect(scheduler.readByKey(key)).toMatchObject({ attemptCount: 1, nextRetryAtMs: 2000 });
+      nowMs = 2000;
+      await scheduler.wake({ sessionId: intake.sessionId, reason: 'manual' });
+      expect(scheduler.readByKey(key)).toMatchObject({ attemptCount: 2,
+        proofWaitPhase: 'usage_limit_continuation', nextRetryAtMs: 62_000 });
+      nowMs = 18_000;
+      held.holdNext();
+      wake = scheduler.wake({ sessionId: intake.sessionId, reason: 'manual' });
+      await held.committed.promise;
+      expect(intakeOwner.readByKey(key)).toMatchObject({ status: 'checking', attemptCount: 3 });
+      if (action === 'duplicate') await intakeOwner.beginClassifiedFailure({ ...intake, reportId: 'later-report' });
+      if (action === 'acknowledge') {
+        expect(intakeOwner.readByKey(key)?.pendingVisibleEvents?.length).toBeGreaterThan(0);
+        await intakeOwner.drainPendingVisibleEvents(async () => {});
+      }
+      held.release.resolve();
+      await wake;
+      const afterManual = scheduler.readByKey(key);
+      nowMs = 18_010;
+      await scheduler.wake({ sessionId: intake.sessionId, reason: 'manual' });
+      const afterNext = scheduler.readByKey(key);
+      expect([afterManual, afterNext]).toEqual([
+        expect.objectContaining({ status: 'resumed_awaiting_proof', attemptCount: 2,
+          proofWaitPhase: 'usage_limit_continuation', nextRetryAtMs: 62_000 }),
+        expect.objectContaining({ status: 'resumed_awaiting_proof', attemptCount: 2,
+          proofWaitPhase: 'usage_limit_continuation', nextRetryAtMs: 62_000 }),
+      ]);
+      if (action === 'acknowledge') expect(afterManual?.pendingVisibleEvents).toBeUndefined();
+      expect(continueAfterUsageLimitReset).toHaveBeenCalledOnce();
+    } finally {
+      held.release.resolve();
+      await wake;
+      scheduler.dispose(); intakeOwner.dispose();
+      try { await rm(dir, { recursive: true, force: true }); } finally { vi.useRealTimers(); }
+    }
   });
 
   it('preserves an admitted continuation through a gate delay and durable reload', async () => {
