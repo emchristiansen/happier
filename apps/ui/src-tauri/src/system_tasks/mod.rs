@@ -11,6 +11,7 @@ use protocol::{
     rewrite_result_task_id, OutputPayload, SystemTaskResult,
 };
 use serde::Serialize;
+use crate::background_command::background_command;
 use state::{SharedChild, SystemTaskSnapshot};
 use std::io::{BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -20,6 +21,17 @@ use std::thread;
 use tauri::{AppHandle, Emitter, State};
 
 const MAX_STDOUT_LINE_BYTES: usize = 16 * 1024;
+
+/// R16 — tells hsetup which desktop app launched it (the bundle identifier), so the services it
+/// installs for that app name it and macOS Login Items attributes them to Happier.
+const DESKTOP_BUNDLE_ID_ENV: &str = "HAPPIER_DESKTOP_BUNDLE_ID";
+static DESKTOP_BUNDLE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Called once at app start with the app's identifier (`tauri.conf.json` `identifier`, which is
+/// the macOS bundle identifier).
+pub fn set_desktop_bundle_id(identifier: &str) {
+    let _ = DESKTOP_BUNDLE_ID.set(identifier.to_string());
+}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +64,82 @@ pub async fn start_system_task(
     monitor_child_output(app, system_tasks, task_id.clone(), child, stdout);
 
     Ok(StartSystemTaskResponse { task_id })
+}
+
+/// How a task the native side ran for itself ended.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum NativeTaskOutcome {
+    Succeeded(Option<serde_json::Value>),
+    Failed { code: String, message: String },
+}
+
+/// Runs one system task for the native side itself (the tray in menu-bar mode, where no web UI
+/// exists to start it), through the same hsetup executor and output protocol as
+/// [`start_system_task`], and blocks the calling thread until its result. It is only ever used for
+/// tasks that never prompt: stdin is closed after the spec, so a prompt would read end-of-input
+/// and fail by name instead of waiting for an answer nobody can give.
+pub(crate) fn run_system_task_for_native(app: &AppHandle, spec_json: &str) -> NativeTaskOutcome {
+    let failed = |code: &str, message: String| NativeTaskOutcome::Failed {
+        code: code.to_string(),
+        message,
+    };
+    if let Err(message) = parse_system_task_spec_json(spec_json) {
+        return failed("invalid_spec", message);
+    }
+    let hsetup_path = match hsetup_path::resolve_hsetup_path(app) {
+        Ok(path) => path,
+        Err(message) => return failed("executor_unavailable", message),
+    };
+    let mut child = match spawn_hsetup_child(&hsetup_path, spec_json) {
+        Ok(child) => child,
+        Err(message) => return failed("executor_unavailable", message),
+    };
+    drop(child.stdin.take());
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return failed(
+            "executor_unavailable",
+            "Failed to capture system task stdout.".to_string(),
+        );
+    };
+    let outcome = read_native_task_outcome(&mut BufReader::new(stdout));
+    if outcome.is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    outcome.unwrap_or_else(|| {
+        failed(
+            "executor_ended_without_result",
+            "System task executor exited without a final result.".to_string(),
+        )
+    })
+}
+
+fn read_native_task_outcome<R: std::io::BufRead>(reader: &mut R) -> Option<NativeTaskOutcome> {
+    let mut buffer = Vec::new();
+    loop {
+        match read_json_line(reader, &mut buffer, MAX_STDOUT_LINE_BYTES) {
+            Ok(ReadJsonLine::Line(line)) => match parse_output_line(&line) {
+                Some(OutputPayload::Result(SystemTaskResult::Success(result))) => {
+                    return Some(NativeTaskOutcome::Succeeded(result.data));
+                }
+                Some(OutputPayload::Result(SystemTaskResult::Failure(result))) => {
+                    return Some(NativeTaskOutcome::Failed {
+                        code: result.error.code,
+                        message: result.error.message,
+                    });
+                }
+                _ => {}
+            },
+            Ok(ReadJsonLine::LimitExceeded) => {
+                return Some(NativeTaskOutcome::Failed {
+                    code: "output_limit_exceeded".to_string(),
+                    message: "System task executor exceeded the output limit.".to_string(),
+                })
+            }
+            Ok(ReadJsonLine::Eof) | Err(_) => return None,
+        }
+    }
 }
 
 #[tauri::command]
@@ -399,7 +487,7 @@ fn resolve_home_dir() -> Option<PathBuf> {
 }
 
 fn open_system_task_log_path(path: &Path) -> Result<(), String> {
-    let status = Command::new(resolve_open_log_path_program())
+    let status = background_command(resolve_open_log_path_program())
         .arg(path)
         .status()
         .map_err(|error| format!("Failed to open log path: {error}"))?;
@@ -468,7 +556,10 @@ fn spawn_hsetup_child(hsetup_path: &Path, spec_json: &str) -> Result<Child, Stri
 }
 
 fn create_hsetup_run_command(hsetup_path: &Path) -> Command {
-    let mut command = Command::new(hsetup_path);
+    let mut command = background_command(hsetup_path);
+    if let Some(bundle_id) = DESKTOP_BUNDLE_ID.get() {
+        command.env(DESKTOP_BUNDLE_ID_ENV, bundle_id);
+    }
     command
         .arg("system-tasks")
         .arg("run")
@@ -481,16 +572,15 @@ fn create_hsetup_run_command(hsetup_path: &Path) -> Command {
 #[cfg(test)]
 mod tests {
     use super::{
-        monitor_child_output_with_emitters, request_child_cancel, send_prompt_answer_to_task,
-        spawn_hsetup_child,
+        monitor_child_output_with_emitters, read_native_task_outcome, request_child_cancel,
+        send_prompt_answer_to_task, spawn_hsetup_child, NativeTaskOutcome,
     };
     use crate::system_tasks::SystemTasksState;
     use std::fs;
     use std::io::Read;
     use std::io::{BufRead, BufReader};
     use std::path::PathBuf;
-    use std::sync::mpsc;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::thread;
     use std::time::Duration;
     use std::time::Instant;
@@ -502,7 +592,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn spawned_hsetup_receives_spec_over_stdin_without_putting_it_in_argv() {
-        let _env_guard = env_lock().lock().expect("env lock should not be poisoned");
+        let _env_guard = env_lock();
         let temp_dir = create_temp_dir("system-task-stdin");
         let script_path = temp_dir.join("inspect-hsetup.sh");
         fs::write(
@@ -539,7 +629,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn request_child_cancel_does_not_depend_on_shell_path_resolution() {
-        let _env_guard = env_lock().lock().expect("env lock should not be poisoned");
+        let _env_guard = env_lock();
         let temp_dir = create_temp_dir("system-task-cancel");
         let script_path = temp_dir.join("trap-term.sh");
         fs::write(&script_path, "#!/bin/sh\nwhile :; do :; done\n").expect("script should write");
@@ -568,9 +658,24 @@ mod tests {
         let _ = fs::remove_dir_all(temp_dir);
     }
 
-    fn env_lock() -> &'static Mutex<()> {
+    fn env_lock() -> MutexGuard<'static, ()> {
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK.get_or_init(|| Mutex::new(()))
+        // This mutex only serializes environment access; a failed test cannot corrupt ().
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn env_serialization_survives_a_panicking_test() {
+        let failure = std::panic::catch_unwind(|| {
+            let _env_guard = env_lock();
+            panic!("simulate a failed assertion while holding the environment lock");
+        });
+        assert!(failure.is_err());
+
+        let _env_guard = env_lock();
     }
 
     fn create_temp_dir(prefix: &str) -> PathBuf {
@@ -586,7 +691,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn prompt_answers_can_be_sent_to_running_hsetup_tasks_over_stdin() {
-        let _env_guard = env_lock().lock().expect("env lock should not be poisoned");
+        let _env_guard = env_lock();
         let temp_dir = create_temp_dir("system-task-prompt-answer");
         let script_path = temp_dir.join("prompt.sh");
         fs::write(
@@ -604,13 +709,7 @@ mod tests {
             spawn_hsetup_child(&script_path, spec_json).expect("child should start successfully");
 
         let stdout = child.stdout.take().expect("stdout should be piped");
-        let reader = BufReader::new(stdout);
-        let (tx, rx) = mpsc::channel::<String>();
-        thread::spawn(move || {
-            for line in reader.lines().flatten() {
-                let _ = tx.send(line);
-            }
-        });
+        let mut lines = BufReader::new(stdout).lines();
 
         let child = std::sync::Arc::new(std::sync::Mutex::new(child));
         let state = SystemTasksState::default();
@@ -618,20 +717,31 @@ mod tests {
             .insert_running_task("task_1", child.clone())
             .expect("task should insert");
 
-        let first_line = rx
-            .recv_timeout(Duration::from_secs(1))
+        // Wait for protocol output, not a wall-clock assumption about child scheduling.
+        let first_line = lines
+            .next()
+            .expect("stdout should remain open until the prompt")
             .expect("should receive prompt event");
         assert!(first_line.contains("\"type\":\"prompt\""));
+        assert!(
+            child
+                .lock()
+                .expect("child mutex should not be poisoned")
+                .try_wait()
+                .expect("child state should be readable")
+                .is_none(),
+            "child should still be waiting for the answer"
+        );
 
         send_prompt_answer_to_task(&state, "task_1", r#"{"trusted":true}"#)
             .expect("answer should be sent");
 
-        let start = Instant::now();
-        let second_line = rx
-            .recv_timeout(Duration::from_secs(1))
+        let second_line = lines
+            .next()
+            .expect("stdout should remain open until the result")
             .expect("should receive completion result after answering");
-        assert!(start.elapsed() < Duration::from_secs(1));
         assert!(second_line.contains("\"ok\":true"));
+        assert!(second_line.contains("\"received\":true"));
 
         let status = child
             .lock()
@@ -771,7 +881,7 @@ mod tests {
 
     #[test]
     fn normalize_system_task_log_path_accepts_paths_inside_happier_root() {
-        let _env_guard = env_lock().lock().expect("env lock should not be poisoned");
+        let _env_guard = env_lock();
         let temp_dir = create_temp_dir("system-task-log-path");
         let home_dir = temp_dir.join("home");
         let allowed_root = home_dir.join(".happier");
@@ -800,7 +910,7 @@ mod tests {
 
     #[test]
     fn normalize_system_task_log_path_rejects_paths_outside_happier_root() {
-        let _env_guard = env_lock().lock().expect("env lock should not be poisoned");
+        let _env_guard = env_lock();
         let temp_dir = create_temp_dir("system-task-log-path-outside");
         let home_dir = temp_dir.join("home");
         let allowed_root = home_dir.join(".happier");
@@ -821,5 +931,35 @@ mod tests {
 
         assert!(error.contains("outside the allowed root"));
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_native_run_skips_events_and_returns_the_final_result() {
+        let output = concat!(
+            r#"{"protocolVersion":1,"taskId":"t","tsMs":1,"type":"progress","stepId":"s","message":null,"data":null}"#,
+            "\n",
+            r#"{"protocolVersion":1,"taskId":"t","ok":true,"data":{"serviceInstalled":true}}"#,
+            "\n",
+        );
+        let outcome = read_native_task_outcome(&mut std::io::Cursor::new(output.as_bytes()));
+        assert_eq!(
+            outcome,
+            Some(NativeTaskOutcome::Succeeded(Some(
+                serde_json::json!({ "serviceInstalled": true })
+            )))
+        );
+
+        let failed = r#"{"protocolVersion":1,"taskId":"t","ok":false,"error":{"code":"service_user_owned","message":"left as it is"}}"#;
+        assert_eq!(
+            read_native_task_outcome(&mut std::io::Cursor::new(failed.as_bytes())),
+            Some(NativeTaskOutcome::Failed {
+                code: "service_user_owned".to_string(),
+                message: "left as it is".to_string(),
+            })
+        );
+        assert_eq!(
+            read_native_task_outcome(&mut std::io::Cursor::new(b"not json\n".as_slice())),
+            None
+        );
     }
 }

@@ -19,10 +19,10 @@ Four things. Three are quick; the first is the one people miss.
    does not run your agent in the cloud. A laptop that sleeps stops the session.
    If you want work to survive the lid closing, use a desktop, a VPS, or a box
    that stays plugged in.
-2. **A coding agent CLI, installed and signed in on that computer.** Happier
-   ships none of them and detects what is already there. If `claude` (or
-   `codex`, or `opencode`) does not run in your terminal today, it will not run
-   through Happier either.
+2. **A coding agent CLI on that computer.** The upcoming 0.2 setup flow can
+   offer supported agents from Happier's catalog and install your choice, or
+   let you skip and install one later. Installation does not sign the agent in:
+   its own authentication must also be ready before it can code.
 3. **A Happier account**, created in the app or the web client — not from the
    terminal. The CLI's login is an *approval* step against a client you are
    already signed in to.
@@ -32,7 +32,7 @@ You do **not** need a server of your own, Node.js or npm, or a custom app build.
 
 ## 1. Get a client
 
-Install the app, or just open [app.happier.dev](https://app.happier.dev/) —
+Install the app, or just open [cloud.happier.dev](https://cloud.happier.dev/) —
 the web client is the whole product and needs no install. Create your account
 there.
 
@@ -123,6 +123,14 @@ the very end.
 
 ## 4. Start your first session
 
+In the app, choose **New session**, select the connected computer and project,
+then choose an agent and start the session. The background service on that
+computer must still be running and the relay must be reachable; the app
+controls the session, but the agent process runs beside your repository on the
+selected computer.
+
+Or start from a terminal in the project:
+
 ```bash
 happier
 ```
@@ -130,6 +138,10 @@ happier
 That starts a session with Claude Code, the default agent. To use another, name
 it: `happier codex`, `happier opencode`, `happier cursor`. The session appears
 in your client within a second or two, and you can drive it from there.
+
+If you skipped agent setup, the computer is connected but is not yet ready to
+run coding sessions. Install an agent, complete its own sign-in, and then start
+the session from the app or CLI.
 
 ## 5. Confirm it all worked
 

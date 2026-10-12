@@ -1,9 +1,16 @@
 import type { UnistylesThemes } from 'react-native-unistyles';
+import type { ConnectedServiceQuotaMeterV1 } from '@happier-dev/protocol';
 
 import type { MeterTone } from '@/components/ui/lists/MeterBar';
 import type { StatusPillVariant } from '@/components/ui/status/StatusPill';
 import type { AccountHealth } from '@/sync/domains/connectedServices/deriveAccountHealth';
-import type { ConnectedServiceQuotaGaugeMeterRow } from '@/sync/domains/connectedServices/connectedServiceQuotaGauge';
+import {
+    buildConnectedServiceQuotaGaugeMeterRows,
+    selectComparableConnectedServiceQuotaMeters,
+    type ConnectedServiceQuotaGaugeMeterRow,
+    type ConnectedServiceQuotaGaugeLabelFormatter,
+} from '@/sync/domains/connectedServices/connectedServiceQuotaGauge';
+import { deriveAccountCapacityPct } from '@/sync/domains/connectedServices/deriveAccountCapacityPct';
 import { resolveQuotaTone } from '@/sync/domains/connectedServices/resolveQuotaTone';
 import { resolveQuotaToneColor } from '@/sync/domains/connectedServices/resolveQuotaToneColor';
 
@@ -27,7 +34,7 @@ export type AccountUsageRow = Readonly<{
      * left). A consumption fill next to a "left" label reads inverted (user decision 2026-07-10,
      * reverting 5ad4d06be).
      */
-    remaining: number;
+    remaining: number | null;
     detailLabel: string;
 }>;
 
@@ -39,7 +46,7 @@ function clamp01(value: number): number {
 }
 
 /**
- * Map the gauge's comparable meter rows onto the AccountBlock USAGE rows. Tone is
+ * Map the gauge's reported meter rows onto the AccountBlock USAGE rows. Tone is
  * derived from the SAME `resolveQuotaTone` owner the meter bars and health dot
  * use; `remaining` feeds both the capacity indicators and the MeterBar fill so
  * the row can never disagree with its own "% left" label.
@@ -52,7 +59,7 @@ export function resolveAccountUsageRows(
         meterId: row.meterId,
         label: row.label,
         tone: resolveQuotaTone(row.remainingPct),
-        remaining: clamp01(row.remainingPct / 100),
+        remaining: row.remainingPct === null ? null : clamp01(row.remainingPct / 100),
         detailLabel: row.detailRightLabel,
     }));
 }
@@ -83,6 +90,21 @@ export function resolveAccountHealthDotColor(theme: Theme, health: AccountHealth
 /** One concentric capacity-ring: `ratio` is the remaining-capacity fraction it fills. */
 export type CapacityRingDatum = Readonly<{ ratio: number; tone: MeterTone }>;
 
+/** Display-only windows never become capacity candidates; the gauge owner chooses the family. */
+export function resolveAccountCapacityView(
+    meters: readonly ConnectedServiceQuotaMeterV1[],
+    nowMs: number,
+    formatter: ConnectedServiceQuotaGaugeLabelFormatter,
+): Readonly<{ capacityPct: number | null; rings: CapacityRingDatum[] }> {
+    const rows = buildConnectedServiceQuotaGaugeMeterRows(
+        selectComparableConnectedServiceQuotaMeters(meters), nowMs, formatter,
+    );
+    return {
+        capacityPct: deriveAccountCapacityPct(rows),
+        rings: resolveAccountCapacityRings(resolveAccountUsageRows(rows)),
+    };
+}
+
 /**
  * Beyond this the avatar's concentric rings become illegibly thin, so we only
  * render the most-constrained few.
@@ -99,7 +121,7 @@ export function resolveAccountCapacityRings(
     usageRows: ReadonlyArray<AccountUsageRow>,
 ): CapacityRingDatum[] {
     return usageRows
-        .map((row) => ({ ratio: row.remaining, tone: row.tone }))
+        .flatMap((row) => row.remaining === null ? [] : [{ ratio: row.remaining, tone: row.tone }])
         .sort((a, b) => a.ratio - b.ratio)
         .slice(0, MAX_CAPACITY_RINGS);
 }

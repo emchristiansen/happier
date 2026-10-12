@@ -1,4 +1,6 @@
 import {
+    SessionContinuationInspectionBatchRequestV1Schema,
+    SessionContinuationInspectionBatchResultV1Schema,
     SessionContinuationInspectionRequestV1Schema,
     SessionContinuationInspectionV1Schema,
     type SessionAgentTransitionSelectionV1,
@@ -31,6 +33,7 @@ const OPERATION_UNAVAILABLE: SessionContinuationInspectionQueryV1 = {
     status: 'answered',
     inspection: { type: 'unavailable', reason: 'operation_unavailable' },
 };
+const INDETERMINATE: SessionContinuationInspectionQueryV1 = { status: 'indeterminate' };
 
 export type InspectSessionContinuationOnMachineInput = Readonly<{
     /** The machine hosting the Session. Inspection is only meaningful there. */
@@ -38,6 +41,13 @@ export type InspectSessionContinuationOnMachineInput = Readonly<{
     serverId: string | null;
     sessionId: string;
     selection: SessionAgentTransitionSelectionV1;
+}>;
+
+export type InspectSessionContinuationsOnMachineInput = Readonly<{
+    machineId: string;
+    serverId: string | null;
+    sessionId: string;
+    selections: readonly SessionAgentTransitionSelectionV1[];
 }>;
 
 /**
@@ -70,4 +80,46 @@ export async function inspectSessionContinuationOnMachine(
     // A daemon that answered with a shape this client cannot read is not an old
     // daemon and is not offline. Say nothing rather than say the wrong thing.
     return parsed.success ? { status: 'answered', inspection: parsed.data } : { status: 'indeterminate' };
+}
+
+/**
+ * Resolves the whole Agent-picker projection through one source Session read.
+ * Older daemons retain the published single-target operation as the narrow
+ * compatibility fallback; all domain decisions still come from that owner.
+ */
+export async function inspectSessionContinuationsOnMachine(
+    input: InspectSessionContinuationsOnMachineInput,
+): Promise<readonly SessionContinuationInspectionQueryV1[]> {
+    if (input.selections.length === 0) return [];
+    const payload = SessionContinuationInspectionBatchRequestV1Schema.parse({
+        v: 1,
+        sourceSessionId: input.sessionId,
+        selections: input.selections,
+    });
+    let raw: unknown;
+    try {
+        raw = await machineRpcWithServerScope<unknown, typeof payload>({
+            machineId: input.machineId,
+            serverId: input.serverId,
+            method: RPC_METHODS.SESSION_CONTINUATION_INSPECT_BATCH,
+            payload,
+        });
+    } catch (error) {
+        if (readRpcErrorCode(error) === RPC_ERROR_CODES.METHOD_NOT_AVAILABLE) {
+            return await Promise.all(input.selections.map(async (selection) => (
+                await inspectSessionContinuationOnMachine({
+                    machineId: input.machineId,
+                    serverId: input.serverId,
+                    sessionId: input.sessionId,
+                    selection,
+                })
+            )));
+        }
+        return input.selections.map(() => INDETERMINATE);
+    }
+    const parsed = SessionContinuationInspectionBatchResultV1Schema.safeParse(raw);
+    if (!parsed.success || parsed.data.inspections.length !== input.selections.length) {
+        return input.selections.map(() => INDETERMINATE);
+    }
+    return parsed.data.inspections.map((inspection) => ({ status: 'answered', inspection }));
 }

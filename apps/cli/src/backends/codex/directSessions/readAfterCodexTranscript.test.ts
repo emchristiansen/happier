@@ -192,6 +192,52 @@ describe('readAfterCodexTranscript', () => {
     expect(secondPoll.nextCursor).toBe(firstPoll.nextCursor);
   });
 
+  it('reports a raw JSONL page bound when non-renderable rows precede a visible item', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-tail-raw-page-limit-'));
+    const codexHome = join(root, 'codex-home');
+    const sessionsDir = join(codexHome, 'sessions');
+    await mkdir(sessionsDir, { recursive: true });
+
+    const sessionId = 'raw-page-limit-session';
+    const filePath = join(sessionsDir, `rollout-2026-01-02T00-00-00-${sessionId}.jsonl`);
+    const params = {
+      source: { kind: 'codexHome' as const, home: 'user' as const },
+      env: { CODEX_HOME: codexHome } as NodeJS.ProcessEnv,
+      activeServerDir: join(root, 'servers', 'cloud'),
+      remoteSessionId: sessionId,
+      maxBytes: 1024 * 1024,
+      maxItems: 1,
+    };
+    await writeFile(
+      filePath,
+      sessionMetaLine({ id: sessionId, timestamp: '2026-01-02T00:00:00.000Z', cwd: '/repo/raw-page-limit' }),
+      'utf8',
+    );
+    const tail = await readAfterCodexTranscript({ ...params, cursor: 'tail' });
+
+    await appendFile(
+      filePath,
+      sessionMetaLine({ id: sessionId, timestamp: '2026-01-02T00:00:01.000Z', cwd: '/repo/raw-page-limit' })
+        + sessionMetaLine({ id: sessionId, timestamp: '2026-01-02T00:00:02.000Z', cwd: '/repo/raw-page-limit' })
+        + sessionMetaLine({ id: sessionId, timestamp: '2026-01-02T00:00:03.000Z', cwd: '/repo/raw-page-limit' })
+        + responseItemLine({
+          timestamp: '2026-01-02T00:00:04.000Z',
+          payload: { type: 'message', role: 'assistant', content: [{ type: 'text', text: 'visible after bounded metadata' }] },
+        }),
+      'utf8',
+    );
+
+    const bounded = await readAfterCodexTranscript({ ...params, cursor: tail.nextCursor! });
+    expect(bounded.items).toEqual([]);
+    expect(bounded).toMatchObject({ truncated: true, truncationReason: 'page_limit' });
+    expect(bounded.nextCursor).toBeTruthy();
+
+    const resumed = await readAfterCodexTranscript({ ...params, cursor: bounded.nextCursor! });
+    expect(resumed.items).toHaveLength(1);
+    expect(JSON.stringify(resumed.items[0] ?? null)).toContain('visible after bounded metadata');
+    expect(resumed.truncated).toBe(false);
+  });
+
   it('continues from the last delivered unread line when maxItems truncates a readAfter batch', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-tail-batch-progress-'));
     const codexHome = join(root, 'codex-home');
@@ -246,6 +292,7 @@ describe('readAfterCodexTranscript', () => {
     expect(firstBatch.items).toHaveLength(1);
     expect(JSON.stringify(firstBatch.items[0] ?? null)).toContain('first unread item');
     expect(firstBatch.truncated).toBe(true);
+    expect(firstBatch).toMatchObject({ truncationReason: 'page_limit' });
     expect(firstBatch.nextCursor).toBeTruthy();
 
     const secondBatch = await readAfterCodexTranscript({

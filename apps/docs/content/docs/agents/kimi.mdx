@@ -1,20 +1,19 @@
 ---
-title: Kimi
-description: Configure Kimi in Happier via ACP-backed local runtime integration.
+title: Kimi Code
+description: Configure the current Kimi Code CLI in Happier through its standard ACP server.
 ---
 
-Happier supports Kimi as a local CLI-backed provider.
+Use the current Kimi Code CLI from Happier through `kimi acp` in your project directory.
 
 <Callout type="info">
-  Kimi is an **experimental** integration. It works and people use it
-  daily, but its surface is younger than Claude, Codex or OpenCode and is
-  more likely to change. What it supports today is in
-  [Agent capabilities](/agents/capabilities).
+  The transition to current Kimi Code described here is in development.
+  Authenticated session and mode behavior still needs live validation.
+  Kimi remains an experimental integration in Happier.
 </Callout>
 
 ## Requirements
 
-- Kimi CLI installed locally.
+- Current Kimi Code CLI installed locally.
 - Binary available on `PATH` (or set `HAPPIER_KIMI_PATH`).
 
 ## Install Kimi
@@ -28,16 +27,18 @@ happier install provider kimi
 Or install it yourself (macOS / Linux):
 
 ```bash
-curl -LsSf https://code.kimi.com/install.sh | bash
+curl -LsSf https://code.kimi.com/kimi-code/install.sh | bash
 kimi --version
 ```
 
 Windows (PowerShell):
 
 ```powershell
-Invoke-RestMethod https://code.kimi.com/install.ps1 | Invoke-Expression
+Invoke-RestMethod https://code.kimi.com/kimi-code/install.ps1 | Invoke-Expression
 kimi --version
 ```
+
+On Windows, install Git for Windows first. If Git Bash is outside its default location, set `KIMI_SHELL_PATH` to its `bash.exe`, as described in the [official installation guide](https://moonshotai.github.io/kimi-code/en/guides/getting-started).
 
 ## Local authentication in Happier
 
@@ -45,7 +46,7 @@ Kimi supports launching its native setup/login flow from:
 
 - **Settings → AI & Agents → AI backends → Kimi**
 
-Happier opens Kimi and sends `/setup` for you.
+Happier opens the native `kimi login` flow for you.
 
 Auth-status detection for Kimi is currently conservative, so Happier may still show **Unknown** even though the login flow is available.
 
@@ -59,9 +60,18 @@ happier kimi
 
 ## Notes
 
-- Resume availability is session-specific in Happier and depends on valid resume metadata plus the current backend/settings.
-- Model, mode, and permission behavior can still vary by installed Kimi runtime.
+- Kimi advertises list, load, fork, close, delete, and cancellation in its [ACP capability reference](https://moonshotai.github.io/kimi-code/en/reference/kimi-acp). Happier consumes supported methods through its shared ACP runtime; advertised vendor methods do not imply a dedicated control in every Happier client.
+- When creating a new session, the **Resume** field can browse session IDs reported by `kimi acp` through ACP `session/list`, filtered to the selected directory, and use one as the session to resume. Those entries are resume-only. Listing them does not establish that Kimi's interactive terminal uses the same IDs, and Happier does not provide live takeover, writer safety, transcript following or import, or terminal attachment for them. When the live Kimi ACP connection also advertises `session/delete`, the resume picker offers a confirmed delete action for the provider-owned candidate. This does not delete a persisted Happier session.
+- Models come from the active ACP session. Happier does not translate them into top-level Kimi flags.
+- MCP servers use standard ACP descriptors, including stdio, HTTP, and SSE transports supported by Kimi.
+- Permission-mode mappings are not advertised until they have authenticated live proof.
 - Tool calls are normalized to canonical Happier tool renderers.
+
+Update an existing current installation with:
+
+```bash
+kimi upgrade
+```
 
 ## Troubleshooting
 
@@ -70,6 +80,16 @@ If Kimi is not detected:
 1. Verify `kimi --version` works.
 2. Restart Happier.
 3. Set `HAPPIER_KIMI_PATH` if needed.
+
+### Legacy `kimi-cli` detected
+
+The retired Python `kimi-cli` has a different ACP capability shape and is not launched as current Kimi Code. Install the current CLI, then run this migration yourself:
+
+```bash
+kimi migrate
+```
+
+Happier never runs migration automatically. An explicit `HAPPIER_KIMI_PATH` is still capability-classified; it does not bypass this check.
 
 ## Related
 

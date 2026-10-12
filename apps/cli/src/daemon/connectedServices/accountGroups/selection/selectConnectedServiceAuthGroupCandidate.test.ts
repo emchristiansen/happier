@@ -8,6 +8,7 @@ import {
   isConnectedServiceAuthGroupSoftSwitchCandidateMeaningfullyBetter,
   reconcileMemberRuntimeStateWithFreshQuotaEvidence,
   reconcileMemberRuntimeStateWithPositiveEvidence,
+  resolveConnectedServiceAuthGroupSoftSwitchSourceEvidence,
   selectConnectedServiceAuthGroupCandidate,
   resolveConnectedServiceAuthGroupQuotaResetCandidates,
   type ConnectedServiceAuthGroupMemberRuntimeState,
@@ -64,8 +65,8 @@ function member(profileId: string, priority: number, createdAtMs: number) {
 describe('DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1', () => {
   it('is derived from the protocol schema default and stays in lockstep with it', () => {
     // Split-brain hygiene: the daemon default must not diverge from the protocol schema default.
-    // The protocol default strategy is `least_limited`; a hardcoded `priority` literal is drift.
-    expect(DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1.strategy).toBe('least_limited');
+    // The strategy comes from the canonical protocol default.
+    expect(DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1.strategy).toBe('expiry_first');
     expect(DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1).toEqual(
       ConnectedServiceAuthGroupPolicyV1Schema.parse({}),
     );
@@ -73,6 +74,21 @@ describe('DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1', () => {
 });
 
 describe('selectConnectedServiceAuthGroupCandidate', () => {
+  it('excludes a member only for the model whose entitlement cooldown is active', () => {
+    const params = {
+      nowMs: 1_000,
+      quotaFreshnessMs: 60_000,
+      activeProfileId: null,
+      policy: ConnectedServiceAuthGroupPolicyV1Schema.parse({}),
+      members: [member('primary', 1, 1), member('backup', 2, 2)],
+      memberStatesByProfileId: new Map([
+        ['primary', { modelUnavailableUntilMsByModelId: { 'gpt-5.6-sol': 86_401_000 } }],
+      ]),
+    } as const;
+
+    expect(selectConnectedServiceAuthGroupCandidate({ ...params, providerLimitId: 'gpt-5.6-sol' }).selected?.profileId).toBe('backup');
+    expect(selectConnectedServiceAuthGroupCandidate({ ...params, providerLimitId: 'gpt-5.6-terra' }).selected?.profileId).toBe('primary');
+  });
   it('does not treat the active profile as a meaningfully better soft-switch target', () => {
     expect(isConnectedServiceAuthGroupSoftSwitchCandidateMeaningfullyBetter({
       activeProfileId: 'active',
@@ -784,6 +800,28 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
     expect(result.excluded).not.toContainEqual(expect.objectContaining({
       profileId: 'blocked-but-usable',
     }));
+  });
+
+  it('does not treat a future-dated quota observation as fresh soft-switch evidence', () => {
+    expect(resolveConnectedServiceAuthGroupSoftSwitchSourceEvidence({
+      activeProfileId: 'active',
+      policy: {
+        ...basePolicy,
+        softSwitchRemainingPercent: 15,
+      },
+      memberStatesByProfileId: new Map([[
+        'active',
+        {
+          quotaSnapshot: {
+            capturedAtMs: 10_000,
+            effectiveMeterId: 'weekly',
+            effectiveRemainingPercent: 0,
+          },
+        },
+      ]]),
+      nowMs: 1_000,
+      quotaFreshnessMs: 60_000,
+    })).toEqual({ status: 'unknown', reason: 'missing_fresh_quota_snapshot' });
   });
 
   it('keeps a true fresh secondary quota blocker and uses its fresh reset instead of stale persisted reset', () => {

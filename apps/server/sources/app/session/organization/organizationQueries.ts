@@ -220,7 +220,7 @@ export async function fetchSessionOrganizationSnapshot(params: Readonly<{
                     session: createVisibleUnarchivedOrganizationSessionWhere(params.accountId),
                 },
                 orderBy: { sessionId: "asc" },
-                select: { sessionId: true, standing: true, updatedAt: true },
+                select: { sessionId: true, standing: true, remindAt: true, updatedAt: true },
             })
             : Promise.resolve(null),
     ]);
@@ -247,6 +247,15 @@ export async function fetchSessionOrganizationSnapshot(params: Readonly<{
         tagAssignments: [...groupedTagAssignments.entries()].map(([sessionId, tagIds]) => ({ sessionId, tagIds })),
         orderEntries: validOrderEntries.map(mapSessionOrganizationOrderEntry),
         labels: labels.map(mapSessionOrganizationLabel),
-        ...(attentionStandings ? { attentionStandings: attentionStandings.map(mapSessionAttentionStanding) } : {}),
+        ...(attentionStandings ? {
+            attentionStandings: attentionStandings.map((row) => {
+                const mapped = mapSessionAttentionStanding(row);
+                if (params.request.includeAttentionReminderTimes) return mapped;
+                if (row.remindAt && row.remindAt.getTime() > Date.now()) {
+                    return { sessionId: mapped.sessionId, standing: false, updatedAt: mapped.updatedAt };
+                }
+                return { sessionId: mapped.sessionId, standing: mapped.standing, updatedAt: mapped.updatedAt };
+            }),
+        } : {}),
     });
 }

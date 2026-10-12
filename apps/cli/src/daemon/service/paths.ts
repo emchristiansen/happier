@@ -12,6 +12,7 @@ import {
   resolveWindowsDaemonServiceLogPaths,
   resolveWindowsDaemonTaskName,
   resolveWindowsDaemonWrapperPath,
+  type DaemonServiceAutostartMode,
   type DaemonServiceMode,
   type DaemonServiceTargetMode,
 } from './plan';
@@ -38,10 +39,24 @@ export type DaemonServiceInstallationSnapshot = Readonly<{
   platform: SupportedPlatform;
   installed: boolean;
   installedPath: string;
+  /** The service label a daemon started by this installation reports in its state. */
+  label: string;
+  /**
+   * Whether the installed definition follows the default relay or is pinned to one profile.
+   * `null` when nothing readable is installed here, so the mode is unknown rather than assumed.
+   */
+  targetMode: DaemonServiceTargetMode | null;
+  /**
+   * Whether the installed definition starts the daemon at login. `null` when nothing readable is
+   * installed here or the definition predates the declaration — unknown, never `at-login`.
+   */
+  autostart: DaemonServiceAutostartMode | null;
 }>;
 
 export type DaemonServiceListEntry = Readonly<{
   serverId: string;
+  /** A pinned definition's baked `HAPPIER_ACTIVE_SERVER_ID` (the profile it serves). */
+  activeServerId?: string | null;
   name: string;
   relayUrl?: string | null;
   installed: boolean;
@@ -52,6 +67,8 @@ export type DaemonServiceListEntry = Readonly<{
   releaseChannel: PublicReleaseRingId;
   label: string;
   targetMode: DaemonServiceTargetMode;
+  /** `desktop` when the desktop app manages this service; `null`/absent means user-owned. */
+  managedBy?: 'desktop' | null;
   installedDefinitionMatchesExpected?: boolean;
 }>;
 

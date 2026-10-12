@@ -3,6 +3,7 @@ import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { configuration } from '@/configuration';
+import { stripInheritedConnectedServiceEnvironment } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 import type { BackendIsolationBundle, BackendIsolationRequest } from './types';
 
 function readDefinedProcessEnv(): Record<string, string> {
@@ -37,7 +38,7 @@ export function resolveBackendIsolationBundle(request: BackendIsolationRequest):
 
   return {
     env: {
-      ...readDefinedProcessEnv(),
+      ...stripInheritedConnectedServiceEnvironment(readDefinedProcessEnv()),
       XDG_STATE_HOME: xdgState,
       XDG_CACHE_HOME: xdgCache,
       XDG_DATA_HOME: xdgData,

@@ -343,8 +343,16 @@ export function setupLinkFor(agent: AgentRecord): string | null {
  * was in neither list — took their place.
  */
 export const UNLISTED_AGENTS: Record<string, string> = {
+    devin:
+        'Devin CLI is in the current Happier build. It has a setup and troubleshooting guide in the Happier docs, but no separate marketing page here yet; use happier devin on the agent machine.',
     customAcp:
         'Custom ACP is not a vendor integration, it is the door for the ones we have not built: any CLI that speaks the Agent Client Protocol can be added as a backend of your own. There is no page because what it can do is whatever your CLI implements, and a page about that would be a page about your code. The Happier docs cover the configuration.',
+    agy:
+        'Antigravity is available experimentally through happier agy. The Happier docs explain its separate ACP-server login and the interactive CLI; this site does not have a dedicated marketing page for it yet.',
+    fx:
+        'FX CLI is available experimentally through happier fx. Its Happier docs guide covers installation, authentication, ACP sessions, and current limits; this site does not have a dedicated marketing page for it yet.',
+    droid:
+        'Factory Droid is available experimentally through happier droid. The Happier docs explain its ACP session and authentication setup; this site does not have a dedicated marketing page for it yet.',
 };
 
 /**
@@ -387,7 +395,7 @@ export const UPCOMING_AGENTS: ReadonlyArray<UpcomingAgent> = [
         // The trailing clause here used to read "and we would rather say that
         // than let a search result imply otherwise" — our editorial reasoning,
         // addressed to the reader. The fact stands on its own.
-        note: 'Google’s Antigravity CLI is coming in the next version — a terminal-hosted backend that will run on a Gemini credential. It is not in the build you can install today.',
+        note: 'Happier 0.2 already has experimental Antigravity support under the agy command. The separate antigravity integration being developed for v0.3 is not in the current build; see the current Happier docs for agy setup.',
     },
     {
         availability: 'upcoming',
@@ -590,7 +598,7 @@ export const AGENTS: ReadonlyArray<AgentRecord> = [
             },
             {
                 q: 'Which devices can open a session?',
-                a: 'iOS, Android, the desktop app on macOS, Windows and Linux, and app.happier.dev in a browser. They all sign in to the same account and see the same session list.',
+                a: 'iOS, Android, the desktop app on macOS, Windows and Linux, and cloud.happier.dev in a browser. They all sign in to the same account and see the same session list.',
             },
         ],
     },
@@ -608,7 +616,7 @@ export const AGENTS: ReadonlyArray<AgentRecord> = [
         managedSource: null,
         runtime: {
             localControl: { kind: 'none' },
-            toolsDelivery: 'shell-bridge',
+            toolsDelivery: 'native-mcp',
             connectedServices: [],
             terminalPromptInjection: false,
         },
@@ -714,7 +722,7 @@ export const AGENTS: ReadonlyArray<AgentRecord> = [
         managedSource: '@github/copilot',
         runtime: {
             localControl: { kind: 'none' },
-            toolsDelivery: 'shell-bridge',
+            toolsDelivery: 'native-mcp',
             connectedServices: [],
             terminalPromptInjection: false,
         },
@@ -745,7 +753,7 @@ export const AGENTS: ReadonlyArray<AgentRecord> = [
             },
             {
                 q: 'Do I need the mobile app?',
-                a: 'No. app.happier.dev is a full client in a browser, and the desktop app covers macOS, Windows and Linux. The mobile apps are for when the browser is not the thing in your hand.',
+                a: 'No. cloud.happier.dev is a full client in a browser, and the desktop app covers macOS, Windows and Linux. The mobile apps are for when the browser is not the thing in your hand.',
             },
             {
                 q: 'Is Happier a GitHub product?',
@@ -767,7 +775,7 @@ export const AGENTS: ReadonlyArray<AgentRecord> = [
         managedSource: '@qwen-code/qwen-code',
         runtime: {
             localControl: { kind: 'none' },
-            toolsDelivery: 'shell-bridge',
+            toolsDelivery: 'native-mcp',
             connectedServices: [],
             terminalPromptInjection: false,
         },
@@ -813,14 +821,14 @@ export const AGENTS: ReadonlyArray<AgentRecord> = [
         name: 'Kimi CLI',
         vendor: 'Moonshot AI',
         binary: 'kimi',
-        vendorDocs: 'https://code.kimi.com',
-        vendorSetupGuide: 'https://kimi.moonshot.cn/docs/cli',
+        vendorDocs: 'https://moonshotai.github.io/kimi-code/en/',
+        vendorSetupGuide: 'https://moonshotai.github.io/kimi-code/en/guides/getting-started',
         happierDocsPath: '/agents/kimi',
         installKind: 'vendor-script',
         managedSource: null,
         runtime: {
-            localControl: { kind: 'none' },
-            toolsDelivery: 'shell-bridge',
+            localControl: { kind: 'tmux', topology: 'exclusive' },
+            toolsDelivery: 'native-mcp',
             connectedServices: [],
             terminalPromptInjection: false,
         },
@@ -873,7 +881,7 @@ export const AGENTS: ReadonlyArray<AgentRecord> = [
         managedSource: '@kilocode/cli',
         runtime: {
             localControl: { kind: 'none' },
-            toolsDelivery: 'shell-bridge',
+            toolsDelivery: 'native-mcp',
             connectedServices: [],
             terminalPromptInjection: false,
         },
@@ -907,7 +915,7 @@ export const AGENTS: ReadonlyArray<AgentRecord> = [
             },
             {
                 q: 'Can I use Kilo from a browser?',
-                a: 'Yes. app.happier.dev is a full client, including the file browser and the diff view, so a locked-down laptop with nothing installed on it can still read and steer a session running elsewhere.',
+                a: 'Yes. cloud.happier.dev is a full client, including the file browser and the diff view, so a locked-down laptop with nothing installed on it can still read and steer a session running elsewhere.',
             },
             {
                 q: 'How is this different from SSH into a tmux session?',
@@ -1004,7 +1012,7 @@ export const AGENTS: ReadonlyArray<AgentRecord> = [
         managedSource: '@augmentcode/auggie',
         runtime: {
             localControl: { kind: 'none' },
-            toolsDelivery: 'shell-bridge',
+            toolsDelivery: 'native-mcp',
             connectedServices: [],
             terminalPromptInjection: false,
         },
@@ -1098,7 +1106,7 @@ export const AGENTS: ReadonlyArray<AgentRecord> = [
             },
             {
                 q: 'Does it work on an iPad?',
-                a: 'Yes — the iOS app runs on iPad, and app.happier.dev works in Safari if you would rather not install anything. Both are clients onto the session running on your computer.',
+                a: 'Yes — the iOS app runs on iPad, and cloud.happier.dev works in Safari if you would rather not install anything. Both are clients onto the session running on your computer.',
             },
         ],
     },

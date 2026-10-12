@@ -9,6 +9,7 @@ import { resolveCodexCliInvocation } from '../../utils/resolveCodexCliInvocation
 import { appendCodexCliConfigOverridesArgs } from '../../utils/appendCodexCliConfigOverridesArgs';
 import { resolveConfiguredCodexConfigTomlPath } from '../../utils/resolveConfiguredCodexHome';
 import { createCodexAppServerJsonLineReader } from './codexAppServerJsonLineReader';
+import { createCodexUnixWebSocket, type CodexUnixWebSocket } from './createCodexUnixWebSocket';
 import { readCodexAppServerRequestTimeoutMs } from './codexAppServerRpcTimeout';
 import {
     sanitizeCodexAppServerRpcDiagnosticString,
@@ -67,6 +68,16 @@ type PendingRequest = Readonly<{
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
 }>;
+
+function toError(error: unknown): Error {
+    return error instanceof Error ? error : new Error(String(error));
+}
+
+function decodeWebSocketTextPayload(payload: unknown): string {
+    if (typeof payload === 'string') return payload;
+    if (Buffer.isBuffer(payload)) return payload.toString('utf8');
+    throw new Error('Codex app-server WebSocket returned an unsupported text payload');
+}
 
 export class CodexAppServerJsonLineTooLargeError extends Error {
     readonly maxChars: number;
@@ -299,7 +310,7 @@ function resolveRequestTimeoutMs(defaultTimeoutMs: number | null, options?: Code
     return Number.isFinite(override) && override > 0 ? Math.max(250, override) : defaultTimeoutMs;
 }
 
-function sanitizeCodexAppServerEnv(processEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function sanitizeCodexAppServerEnv(processEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     return {
         ...processEnv,
         CODEX_THREAD_ID: undefined,
@@ -360,38 +371,74 @@ export async function createCodexAppServerClient(params: Readonly<{
     configOverrides?: ReadonlyArray<string>;
     disableUserMcpServers?: boolean;
     initializeRequestOptions?: CodexAppServerRequestOptions;
+    onCleanup?: (cleanup: () => Promise<void>) => void;
+    transport?:
+        | Readonly<{ kind: 'stdio' }>
+        | Readonly<{ kind: 'daemonProxy' }>
+        | Readonly<{ kind: 'unixWebSocket'; socketPath: string }>;
 }>): Promise<DisposableCodexAppServerClient> {
+    params.initializeRequestOptions?.signal?.throwIfAborted();
     const sourceProcessEnv = params.processEnv ?? process.env;
     const rpcLogger = createRpcLogger(sourceProcessEnv);
     const processEnv = sanitizeCodexAppServerEnv(sourceProcessEnv);
-    const baseInvocation = await resolveCodexCliInvocation({
-        args: ['app-server', '--listen', 'stdio://'],
-        cwd: params.cwd,
-        processEnv,
-        overrideEnvVarKeys: ['HAPPIER_CODEX_APP_SERVER_BIN', 'HAPPIER_CODEX_TUI_BIN', 'HAPPY_CODEX_TUI_BIN'],
-        targetLabel: 'Codex app-server',
-    });
-
+    const transport = params.transport ?? { kind: 'stdio' };
     const baseOverrides = params.disableUserMcpServers === true
         ? readCodexMcpServerKeysFromConfigToml(processEnv).map((key) => `mcp_servers.${key}.enabled=false`)
         : [];
+    let child: ReturnType<typeof spawn> | null = null;
+    let webSocket: CodexUnixWebSocket | null = null;
+    let connectionReady = Promise.resolve();
+    if (transport.kind === 'unixWebSocket') {
+        webSocket = createCodexUnixWebSocket(transport.socketPath);
+        const socket = webSocket;
+        connectionReady = new Promise<void>((resolve, reject) => {
+            const onOpen = () => {
+                socket.removeListener('error', onError);
+                socket.removeListener('close', onCloseBeforeOpen);
+                resolve();
+            };
+            const onError = (error: unknown) => {
+                socket.removeListener('open', onOpen);
+                socket.removeListener('close', onCloseBeforeOpen);
+                reject(toError(error));
+            };
+            const onCloseBeforeOpen = () => {
+                socket.removeListener('open', onOpen);
+                socket.removeListener('error', onError);
+                reject(new Error('Codex app-server WebSocket closed before connecting'));
+            };
+            socket.once('open', onOpen);
+            socket.once('error', onError);
+            socket.once('close', onCloseBeforeOpen);
+        });
+    } else {
+        const baseInvocation = await resolveCodexCliInvocation({
+            args: transport.kind === 'daemonProxy'
+                ? ['app-server', 'proxy']
+                : ['app-server', '--listen', 'stdio://'],
+            cwd: params.cwd,
+            processEnv,
+            overrideEnvVarKeys: ['HAPPIER_CODEX_APP_SERVER_BIN', 'HAPPIER_CODEX_TUI_BIN', 'HAPPY_CODEX_TUI_BIN'],
+            targetLabel: 'Codex app-server',
+        });
+        const invocation = appendCodexCliConfigOverridesArgs(baseInvocation, [...baseOverrides, ...(params.configOverrides ?? [])]);
+        params.initializeRequestOptions?.signal?.throwIfAborted();
+        const windowsInvocation = resolveWindowsCommandInvocation({
+            command: invocation.command,
+            args: invocation.args,
+            resolveCommandOnPath: true,
+        });
+        child = spawn(windowsInvocation.command, windowsInvocation.args, {
+            cwd: params.cwd ?? process.cwd(),
+            env: processEnv,
+            stdio: ['pipe', 'pipe', 'pipe'],
+            windowsHide: true,
+            windowsVerbatimArguments: windowsInvocation.windowsVerbatimArguments,
+        });
 
-    const invocation = appendCodexCliConfigOverridesArgs(baseInvocation, [...baseOverrides, ...(params.configOverrides ?? [])]);
-    const windowsInvocation = resolveWindowsCommandInvocation({
-        command: invocation.command,
-        args: invocation.args,
-        resolveCommandOnPath: true,
-    });
-    const child = spawn(windowsInvocation.command, windowsInvocation.args, {
-        cwd: params.cwd ?? process.cwd(),
-        env: processEnv,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        windowsHide: true,
-        windowsVerbatimArguments: windowsInvocation.windowsVerbatimArguments,
-    });
-
-    if (!child.stdin || !child.stdout || !child.stderr) {
-        throw new Error('Failed to start Codex app-server with piped stdio');
+        if (!child.stdin || !child.stdout || !child.stderr) {
+            throw new Error('Failed to start Codex app-server with piped stdio');
+        }
     }
 
     const state: MessageQueueState = {
@@ -441,7 +488,15 @@ export async function createCodexAppServerClient(params: Readonly<{
             throw new Error(`Failed to serialize Codex app-server ${method} message: ${reason}`);
         }
         const nextWrite = writeChain.then(async () => {
-            const stdin = child.stdin;
+            await connectionReady;
+            if (webSocket) {
+                const socket = webSocket;
+                await new Promise<void>((resolve, reject) => {
+                    socket.send(payload.slice(0, -1), (error) => error ? reject(error) : resolve());
+                });
+                return;
+            }
+            const stdin = child?.stdin;
             if (!stdin || stdin.writableEnded || stdin.destroyed) {
                 throw state.fatalError ?? createDisposedError();
             }
@@ -495,13 +550,20 @@ export async function createCodexAppServerClient(params: Readonly<{
         }
     };
 
-    let terminateChildPromise: Promise<void> | null = null;
-    const terminateChild = (): Promise<void> => {
-        if (terminateChildPromise) return terminateChildPromise;
+    let terminateTransportPromise: Promise<void> | null = null;
+    const terminateTransport = (): Promise<void> => {
+        if (terminateTransportPromise) return terminateTransportPromise;
+        if (webSocket) {
+            webSocket.terminate();
+            terminateTransportPromise = closedPromise;
+            return terminateTransportPromise;
+        }
         // Snapshot and terminate descendants before closing stdio. Ending stdin first can let a
         // JavaScript launcher exit and re-parent its native Codex child before the tree walk.
-        terminateChildPromise = killProcessTree(child, { graceMs: 250 }).catch(() => undefined);
-        return terminateChildPromise;
+        terminateTransportPromise = child
+            ? killProcessTree(child, { graceMs: 250 }).catch(() => undefined)
+            : Promise.resolve();
+        return terminateTransportPromise;
     };
 
     const failWith = (error: unknown, options?: Readonly<{ terminateChild?: boolean }>): void => {
@@ -511,7 +573,7 @@ export async function createCodexAppServerClient(params: Readonly<{
         failPendingRequests(fatalFailure);
         reportExit(fatalFailure);
         if (options?.terminateChild === false || disposing) return;
-        void terminateChild();
+        void terminateTransport();
     };
 
     const handleIncomingMessage = (message: JsonRpcMessage): void => {
@@ -604,37 +666,59 @@ export async function createCodexAppServerClient(params: Readonly<{
         },
     );
 
-    child.stdin.on('error', (error) => {
-        failWith(error);
-    });
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => {
-        if (state.fatalError) return;
-        try {
-            jsonLineReader.push(chunk);
-        } catch (error) {
-            failWith(new Error(`Invalid Codex app-server JSON output: ${error instanceof Error ? error.message : String(error)}`));
-        }
-    });
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk: string) => {
-        if (stderrBuffer.length >= maxStderrChars) return;
-        stderrBuffer = (stderrBuffer + chunk).slice(0, maxStderrChars);
-    });
-    child.once('error', (error) => {
-        failWith(new Error(`Failed to launch Codex app-server: ${error.message}`));
-    });
-    child.once('close', (code, signal) => {
-        resolveClosed?.();
-        if (disposing) {
-            return;
-        }
-        const suffix = stderrBuffer.trim()
-            ? `\n${sanitizeCodexAppServerRpcDiagnosticString(stderrBuffer.trim())}`
-            : '';
-        const failure = new Error(`Codex app-server exited before completing the request (code=${code ?? 'null'} signal=${signal ?? 'null'})${suffix}`);
-        failWith(failure, { terminateChild: false });
-    });
+    if (webSocket) {
+        webSocket.on('message', (payload: unknown, isBinary: unknown) => {
+            if (state.fatalError) return;
+            try {
+                if (isBinary === true) throw new Error('Codex app-server returned an unexpected binary WebSocket frame');
+                jsonLineReader.push(`${decodeWebSocketTextPayload(payload)}\n`);
+            } catch (error) {
+                failWith(new Error(`Invalid Codex app-server JSON output: ${toError(error).message}`));
+            }
+        });
+        webSocket.on('error', (error: unknown) => {
+            failWith(new Error(`Codex app-server WebSocket failed: ${toError(error).message}`));
+        });
+        webSocket.once('close', (code: unknown, reason: unknown) => {
+            resolveClosed?.();
+            if (disposing) return;
+            const details = Buffer.isBuffer(reason) ? reason.toString('utf8').trim() : '';
+            const failure = new Error(
+                `Codex app-server WebSocket closed before completing the request (code=${String(code ?? 'unknown')})${details ? `: ${details}` : ''}`,
+            );
+            failWith(failure, { terminateChild: false });
+        });
+    } else if (child?.stdin && child.stdout && child.stderr) {
+        child.stdin.on('error', (error) => {
+            failWith(error);
+        });
+        child.stdout.setEncoding('utf8');
+        child.stdout.on('data', (chunk: string) => {
+            if (state.fatalError) return;
+            try {
+                jsonLineReader.push(chunk);
+            } catch (error) {
+                failWith(new Error(`Invalid Codex app-server JSON output: ${error instanceof Error ? error.message : String(error)}`));
+            }
+        });
+        child.stderr.setEncoding('utf8');
+        child.stderr.on('data', (chunk: string) => {
+            if (stderrBuffer.length >= maxStderrChars) return;
+            stderrBuffer = (stderrBuffer + chunk).slice(0, maxStderrChars);
+        });
+        child.once('error', (error) => {
+            failWith(new Error(`Failed to launch Codex app-server: ${error.message}`));
+        });
+        child.once('close', (code, signal) => {
+            resolveClosed?.();
+            if (disposing) return;
+            const suffix = stderrBuffer.trim()
+                ? `\n${sanitizeCodexAppServerRpcDiagnosticString(stderrBuffer.trim())}`
+                : '';
+            const failure = new Error(`Codex app-server exited before completing the request (code=${code ?? 'null'} signal=${signal ?? 'null'})${suffix}`);
+            failWith(failure, { terminateChild: false });
+        });
+    }
 
     const request = async (
         method: string,
@@ -753,12 +837,13 @@ export async function createCodexAppServerClient(params: Readonly<{
         failWaiters(state, disposedError);
         failPendingRequests(disposedError);
         disposePromise = (async () => {
-            await terminateChild();
+            await terminateTransport();
             await closedPromise;
             await rpcLogger.flush().catch(() => undefined);
         })();
         return await disposePromise;
     };
+    params.onCleanup?.(() => dispose());
 
     const onExit = (handler: CodexAppServerExitHandler): (() => void) => {
         if (reportedExitFailure) {

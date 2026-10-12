@@ -19,6 +19,17 @@ function createMetadata(overrides: Partial<Metadata> = {}): Metadata {
 }
 
 describe('sessionModeControl', () => {
+  it('reads configured ACP modes only for the session backend', async () => {
+    const { computeSessionModePickerControl } = await import('./sessionModeControl');
+    const metadata = createMetadata({
+      acpConfiguredBackendV1: { v: 1, backendId: 'custom-one', title: 'Custom', updatedAt: 1 },
+      sessionModesV1: { v: 1, provider: 'acp:custom-one', updatedAt: 1, currentModeId: 'build', availableModes: [{ id: 'build', name: 'Build' }] },
+    });
+    expect(computeSessionModePickerControl({ agentId: 'customAcp', metadata })?.effectiveModeId).toBe('build');
+    metadata.acpConfiguredBackendV1 = { v: 1, backendId: 'custom-two', title: 'Other', updatedAt: 2 };
+    expect(computeSessionModePickerControl({ agentId: 'customAcp', metadata })).toBeNull();
+  });
+
   it('supportsSessionModeOverrides reflects agent catalog intent', async () => {
     const { supportsSessionModeOverrides } = await import('./sessionModeControl');
     expect(supportsSessionModeOverrides('opencode')).toBe(true);

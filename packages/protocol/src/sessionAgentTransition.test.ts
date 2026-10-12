@@ -10,6 +10,8 @@ import {
   SessionAgentTransitionRequestV1Schema,
   SessionAgentTransitionResultV1Schema,
   SessionAgentTransitionSelectionV1Schema,
+  SessionContinuationInspectionBatchRequestV1Schema,
+  SessionContinuationInspectionBatchResultV1Schema,
   SessionContinuationInspectionRequestV1Schema,
   SessionContinuationInspectionV1Schema,
   resolveSessionContinuationUnavailablePresentationV1,
@@ -244,6 +246,37 @@ describe('session agent transition — result union', () => {
 });
 
 describe('session continuation inspection', () => {
+  it('defines one ordered batch request and result for a picker projection', () => {
+    expect(SessionContinuationInspectionBatchRequestV1Schema.parse({
+      v: 1,
+      sourceSessionId: 'sess_01',
+      selections: [
+        { v: 1, agentId: 'codex' },
+        { v: 1, agentId: 'gemini' },
+      ],
+    })).toEqual({
+      v: 1,
+      sourceSessionId: 'sess_01',
+      selections: [
+        { v: 1, agentId: 'codex' },
+        { v: 1, agentId: 'gemini' },
+      ],
+    });
+    expect(SessionContinuationInspectionBatchResultV1Schema.parse({
+      v: 1,
+      inspections: [
+        { type: 'available', protocolVersion: 1, sameSessionTransition: true },
+        { type: 'unavailable', reason: 'target_unavailable' },
+      ],
+    })).toEqual({
+      v: 1,
+      inspections: [
+        { type: 'available', protocolVersion: 1, sameSessionTransition: true },
+        { type: 'unavailable', reason: 'target_unavailable' },
+      ],
+    });
+  });
+
   it('accepts and rejects the inspection request vectors', () => {
     expectAllParse(SessionContinuationInspectionRequestV1Schema, V.inspection.request.valid);
     expectAllReject(SessionContinuationInspectionRequestV1Schema, V.inspection.request.invalid);

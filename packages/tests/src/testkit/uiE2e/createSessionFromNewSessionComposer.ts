@@ -131,9 +131,14 @@ export async function openNewSessionMachineSelection(
 
   }
 
+  const pickerUrl = new URL(`${params.uiBaseUrl}/new/pick/machine`);
+  const currentUrl = new URL(params.page.url());
+  if (normalizePathname(currentUrl.toString()) === '/new') {
+    pickerUrl.search = currentUrl.search;
+  }
   await gotoDomContentLoadedWithPathFallback(
     params.page,
-    `${params.uiBaseUrl}/new/pick/machine`,
+    pickerUrl.toString(),
     '/new/pick/machine',
     routeFallbackWaitMs,
   );

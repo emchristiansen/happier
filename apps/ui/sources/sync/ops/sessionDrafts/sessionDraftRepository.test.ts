@@ -92,6 +92,24 @@ function uuid(value: number): string {
 }
 
 describe('sessionDraftRepository', () => {
+    it('does not acknowledge a destructive delete while sync is enabled without an authoritative transport', async () => {
+        const repository = createSessionDraftRepository({
+            storage: createMemoryStorage(),
+            cipher: plainCipher(),
+            syncEnabled: true,
+        });
+        const address = { kind: 'newSession' as const, draftId: uuid(990) };
+        repository.writeNewSessionDraft({
+            scope,
+            draftId: address.draftId,
+            patch: { text: 'keep me' },
+            materializationIntent: 'userEdit',
+        });
+
+        await expect(repository.deleteSessionDraft({ scope, address })).resolves.toBe(false);
+        expect(repository.getSessionDraftSnapshot(scope, address)).not.toBeNull();
+    });
+
     it('retains opaque envelope fields and the predecessor entry pointer when editing a hydrated scope', () => {
         const storage = createMemoryStorage();
         const repository = createSessionDraftRepository({ storage, cipher: plainCipher(), syncEnabled: false });

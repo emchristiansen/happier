@@ -323,7 +323,9 @@ describe('startHappyServer (MCP integration)', () => {
       expect(names.has('subagents_plan_start')).toBe(false);
       expect(names.has('subagents_delegate_start')).toBe(false);
       expect(names.has('execution_run_start')).toBe(false);
-      expect(names.has('execution_run_get')).toBe(false);
+      expect(names.has('execution_run_list')).toBe(true);
+      expect(names.has('execution_run_get')).toBe(true);
+      expect(names.has('execution_run_wait')).toBe(true);
       expect(names.has('execution_run_action')).toBe(false);
 
       const delegateSpecRaw = await client.callTool({

@@ -1,4 +1,8 @@
-import type { ConnectedServiceQuotaSnapshotV1 } from '@happier-dev/protocol';
+import {
+  compareConnectedServiceQuotaObservationRecency,
+  isConnectedServiceQuotaObservationAtOrBeforeNow,
+  type ConnectedServiceQuotaSnapshotV1,
+} from '@happier-dev/protocol';
 
 export type ShouldPersistQuotaSnapshotStatus = 'ok' | 'unavailable' | 'estimated' | 'error';
 
@@ -16,15 +20,28 @@ export function shouldPersistQuotaSnapshot(input: Readonly<{
     status: ShouldPersistQuotaSnapshotStatus;
   }>;
   minFreshnessRefreshMs: number;
+  nowMs?: number;
 }>): Readonly<{ persist: boolean; reason: string }> {
+  const nowMs = readFiniteNonNegative(input.nowMs) ?? Date.now();
+  const incomingFetchedAt = readFetchedAt(input.incoming.snapshot);
+  if (!isConnectedServiceQuotaObservationAtOrBeforeNow({ observedAtMs: incomingFetchedAt, nowMs })) {
+    return { persist: false, reason: 'future' };
+  }
   const previous = input.previous;
   if (!previous) return { persist: true, reason: 'first_snapshot' };
 
-  const incomingFetchedAt = readFetchedAt(input.incoming.snapshot);
   const previousFetchedAt = Number.isFinite(previous.fetchedAt)
     ? previous.fetchedAt
     : readFetchedAt(previous.snapshot);
-  if (incomingFetchedAt < previousFetchedAt) return { persist: false, reason: 'stale' };
+  const recency = compareConnectedServiceQuotaObservationRecency({
+    existingObservedAtMs: previousFetchedAt,
+    incomingObservedAtMs: incomingFetchedAt,
+    nowMs,
+  });
+  if (recency === 'incoming_older') return { persist: false, reason: 'stale' };
+  if (!isConnectedServiceQuotaObservationAtOrBeforeNow({ observedAtMs: previousFetchedAt, nowMs })) {
+    return { persist: true, reason: 'clock_recovered' };
+  }
 
   const refreshRequestedAt = readFiniteNonNegative(previous.refreshRequestedAt);
   if (refreshRequestedAt !== null && refreshRequestedAt > previousFetchedAt && incomingFetchedAt >= refreshRequestedAt) {

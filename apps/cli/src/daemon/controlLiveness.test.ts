@@ -8,10 +8,12 @@ describe('probeDaemonAuthenticatedControl', () => {
     vi.unstubAllGlobals();
   });
 
-  it('treats only ESRCH as definitive PID absence', async () => {
+  it('keeps hidden ownership unverified when the control request fails without evidence of absence', async () => {
     const pidError = Object.assign(new Error('no such process'), { code: 'ESRCH' });
     vi.spyOn(process, 'kill').mockImplementation(() => { throw pidError; });
-    const fetchMock = vi.fn();
+    const fetchMock = vi.fn(async () => {
+      throw new TypeError('fetch failed');
+    });
     vi.stubGlobal('fetch', fetchMock);
 
     await expect(probeDaemonAuthenticatedControl({
@@ -19,8 +21,39 @@ describe('probeDaemonAuthenticatedControl', () => {
       httpPort: 43213,
       controlToken: 'token-123',
       timeoutMs: 1_000,
-    })).resolves.toBe('pid_not_running');
-    expect(fetchMock).not.toHaveBeenCalled();
+    })).resolves.toBe('unreachable');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets authenticated control prove liveness when the daemon PID is hidden from this pid namespace', async () => {
+    const pidError = Object.assign(new Error('no such process'), { code: 'ESRCH' });
+    vi.spyOn(process, 'kill').mockImplementation(() => { throw pidError; });
+    let observedToken: string | null = null;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      observedToken = String((init?.headers as Record<string, string> | undefined)?.['x-happier-daemon-token'] ?? '');
+      return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
+    }));
+
+    await expect(probeDaemonAuthenticatedControl({
+      pid: 987_654_321,
+      httpPort: 43213,
+      controlToken: 'token-123',
+      timeoutMs: 1_000,
+    })).resolves.toBe('running');
+    expect(observedToken).toBe('token-123');
+  });
+
+  it('does not let an unauthenticated answer resurrect a hidden PID', async () => {
+    const pidError = Object.assign(new Error('no such process'), { code: 'ESRCH' });
+    vi.spyOn(process, 'kill').mockImplementation(() => { throw pidError; });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 401 })));
+
+    await expect(probeDaemonAuthenticatedControl({
+      pid: 987_654_321,
+      httpPort: 43213,
+      controlToken: 'token-123',
+      timeoutMs: 1_000,
+    })).resolves.toBe('unauthorized');
   });
 
   it.each([
@@ -59,4 +92,23 @@ describe('probeDaemonAuthenticatedControl', () => {
       timeoutMs: 1_000,
     })).resolves.toBe(expected);
   });
+  it.each([
+    ['Node', Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect refused'), { code: 'ECONNREFUSED' }) })],
+    // Bun 1.3.11 native closed-listener probe emits this direct code, without cause.
+    ['Bun', Object.assign(new Error('Unable to connect'), { code: 'ConnectionRefused' })],
+  ] as const)('distinguishes a %s refused endpoint from transient hidden-PID control failures and recovers', async (_runtime, connectionRefused) => {
+    vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('PID hidden'), { code: 'ESRCH' }); });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('{}', { status: 500 }))
+      .mockRejectedValueOnce(new DOMException('request timed out', 'TimeoutError'))
+      .mockRejectedValueOnce(connectionRefused)
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'ok' }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const input = { pid: 43210, httpPort: 43213, controlToken: 'token-123', timeoutMs: 1_000 };
+    await expect(probeDaemonAuthenticatedControl(input)).resolves.toBe('unreachable');
+    await expect(probeDaemonAuthenticatedControl(input)).resolves.toBe('unreachable');
+    await expect(probeDaemonAuthenticatedControl(input)).resolves.toBe('control_not_running');
+    await expect(probeDaemonAuthenticatedControl(input)).resolves.toBe('running');
+  });
+
 });

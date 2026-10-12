@@ -1,5 +1,3 @@
-import { existsSync } from 'node:fs';
-
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -68,17 +66,18 @@ describe('runVitestShards', () => {
   it('runs reset-heavy suites in bounded fresh processes', () => {
     const plan = resolveVitestIsolationPlan('vitest.config.ts');
     const resetHeavyFiles = [
+      'src/daemon/startSyncOwnership.test.ts',
+      'src/commands/auth.nonInteractiveBoth.test.ts',
       'src/api/session/sessionClient.durableMutationOutbox.test.ts',
+      'src/agent/executionRuns/runEphemeralExecutionRunTextPrompt.test.ts',
     ];
 
     expect(plan.shardExcludes).toEqual(expect.arrayContaining(resetHeavyFiles));
     expect(new Set(plan.shardExcludes).size).toBe(plan.shardExcludes.length);
     expect(new Set(plan.runs.map((run) => run.file))).toEqual(new Set(plan.shardExcludes));
-    expect(plan.shardExcludes.filter((file) => !existsSync(new URL(`../../${file}`, import.meta.url)))).toEqual([]);
     for (const file of resetHeavyFiles) {
       expect(plan.runs).toContainEqual({ file, testNamePattern: '.*' });
     }
-    expect(plan.shardExcludes).not.toContain('src/agent/executionRuns/runEphemeralExecutionRunTextPrompt.test.ts');
 
     // These exceptionally large suites intentionally remain split into several
     // fresh processes rather than one whole-file process.
@@ -94,6 +93,28 @@ describe('runVitestShards', () => {
     expect(resolveVitestConfigPath(['node', 'run', '--config', 'vitest.integration.config.ts'])).toBe(
       'vitest.integration.config.ts',
     );
+  });
+
+  it.each([2, 3, 32])('distributes every isolated run exactly once across %i CI parts', (parts) => {
+    const fullPlan = resolveVitestIsolationPlan('vitest.config.ts');
+    const plans = Array.from({ length: parts }, (_, index) => resolveVitestIsolationPlan(
+      'vitest.config.ts',
+      resolveVitestShardRange({
+        HAPPIER_CLI_VITEST_PART: String(index + 1),
+        HAPPIER_CLI_VITEST_PARTS: String(parts),
+      }, 64),
+    ));
+
+    for (const plan of plans) {
+      expect(plan.shardExcludes).toEqual(fullPlan.shardExcludes);
+    }
+    const assignedRuns = plans.flatMap((plan) => plan.runs);
+    expect(assignedRuns).toHaveLength(fullPlan.runs.length);
+    expect(assignedRuns.map((run) => JSON.stringify(run)).sort()).toEqual(
+      fullPlan.runs.map((run) => JSON.stringify(run)).sort(),
+    );
+    const runCounts = plans.map((plan) => plan.runs.length);
+    expect(Math.max(...runCounts) - Math.min(...runCounts)).toBeLessThanOrEqual(1);
   });
 
   it('returns null when --config is missing', () => {

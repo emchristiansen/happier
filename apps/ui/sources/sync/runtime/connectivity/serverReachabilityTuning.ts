@@ -15,17 +15,15 @@ export function readServerReachabilityProbeTimeoutMs(): number {
 }
 
 /**
- * Upper bound (ms) for a mutating `serverFetch` request (POST/PUT/PATCH/DELETE). A stalled server
- * that accepts the connection but never responds must NOT hang the write forever — that is the
- * silent message-loss class. When it fires, the write rejects with a retryable
- * `ServerFetchWriteTimeoutError` so the pending outbox retries instead of losing the message.
- * 0 disables the bound (reverts to the previous unbounded behavior).
+ * Upper bound for durable pending-outbox writes. The outbox owns the idempotency
+ * key and retry semantics that make an ambiguous timeout recoverable; generic
+ * writes must not inherit this policy.
  */
 export function readServerFetchWriteTimeoutMs(): number {
     const raw = String(process.env.EXPO_PUBLIC_HAPPIER_SERVER_WRITE_TIMEOUT_MS ?? '').trim();
-    if (!raw) return 15_000;
+    if (!raw) return 120_000;
     const parsed = Number.parseInt(raw, 10);
-    if (!Number.isFinite(parsed)) return 15_000;
+    if (!Number.isFinite(parsed)) return 120_000;
     return Math.max(0, Math.min(10 * 60_000, parsed));
 }
 

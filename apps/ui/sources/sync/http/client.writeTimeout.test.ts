@@ -84,7 +84,11 @@ describe('serverFetch write timeout', () => {
         }));
 
         const { serverFetch } = await import('./client');
-        const promise = serverFetch('/v2/sessions/s1/pending', { method: 'POST', body: '{}' });
+        const promise = serverFetch(
+            '/v2/sessions/s1/pending',
+            { method: 'POST', body: '{}' },
+            { timeoutMs: 50 },
+        );
         const assertion = expect(promise).rejects.toMatchObject({
             name: 'ServerFetchWriteTimeoutError',
             retryable: true,

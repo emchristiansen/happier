@@ -69,6 +69,8 @@ describe('ProviderEnforcedPermissionHandler always-auto-approve matching', () =>
     await expect(handler.handleToolCall('safe-3', 'happier_change_title', {})).resolves.toEqual({ decision: 'approved' });
     await expect(handler.handleToolCall('safe-4', 'mcp__happier__session_title_set', {})).resolves.toEqual({ decision: 'approved' });
     await expect(handler.handleToolCall('safe-5', 'happier_action_execute', { actionId: 'session.title.set' })).resolves.toEqual({ decision: 'approved' });
+    await expect(handler.handleToolCall('safe-6', 'mcp__happier__execution_run_wait', { runId: 'run-1' })).resolves.toEqual({ decision: 'approved' });
+    await expect(handler.handleToolCall('safe-7', 'happier_action_execute', { actionId: 'execution.run.get', input: { runId: 'run-1' } })).resolves.toEqual({ decision: 'approved' });
     const misleadingIdPending = handler.handleToolCall('mcp__happier__change_title-1', 'other', {});
     expect(session.agentState.requests['mcp__happier__change_title-1']).toBeTruthy();
     await session.rpcHandlerManager.handlers.get('permission')?.({
@@ -78,13 +80,17 @@ describe('ProviderEnforcedPermissionHandler always-auto-approve matching', () =>
     });
     await expect(misleadingIdPending).resolves.toEqual({ decision: 'denied' });
 
-    const executionRunPending = handler.handleToolCall('execution-run-1', 'mcp__happier__execution_run_start', {
+    await expect(handler.handleToolCall('execution-run-1', 'mcp__happier__execution_run_start', {
       intent: 'delegate',
       backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+    })).resolves.toEqual({ decision: 'approved' });
+
+    const unknownActionPending = handler.handleToolCall('unknown-action-1', 'happier_action_execute', {
+      actionId: 'not.a.known.action',
     });
-    expect(session.agentState.requests['execution-run-1']).toBeTruthy();
-    await session.rpcHandlerManager.handlers.get('permission')?.({ id: 'execution-run-1', approved: true, decision: 'approved' });
-    await expect(executionRunPending).resolves.toEqual({ decision: 'approved' });
+    expect(session.agentState.requests['unknown-action-1']).toBeTruthy();
+    await session.rpcHandlerManager.handlers.get('permission')?.({ id: 'unknown-action-1', approved: false, decision: 'denied' });
+    await expect(unknownActionPending).resolves.toEqual({ decision: 'denied' });
 
     const pending = handler.handleToolCall('pending-1', 'think_malware', {});
     expect(session.agentState.requests['pending-1']).toBeTruthy();
@@ -219,12 +225,12 @@ describe('ProviderEnforcedPermissionHandler always-auto-approve matching', () =>
     expect(handler.getImmediateDecision('spec-search-1', 'action_spec_search', {})).toEqual({ decision: 'approved' });
     expect(handler.getImmediateDecision('spec-search-2', 'mcp__happier__action_spec_search', {})).toEqual({ decision: 'approved' });
     expect(handler.getImmediateDecision('spec-search-3', 'happier_action_spec_search', {})).toEqual({ decision: 'approved' });
-    expect(handler.getImmediateDecision('execution-run-1', 'mcp__happier__execution_run_start', {})).toBeNull();
-    expect(handler.getImmediateDecision('execution-run-2', 'mcp__happier__subagents_delegate_start', {})).toBeNull();
+    expect(handler.getImmediateDecision('execution-run-1', 'mcp__happier__execution_run_start', {})).toEqual({ decision: 'approved' });
+    expect(handler.getImmediateDecision('execution-run-2', 'mcp__happier__subagents_delegate_start', {})).toEqual({ decision: 'approved' });
     expect(handler.getImmediateDecision('perm-1', 'bash', { command: 'pwd' })).toBeNull();
   });
 
-  it('suppresses provider-enforced prompts for first-party Happier tools when action approval is required', async () => {
+  it('admits first-party Action transport while leaving custom MCP tools to provider permission', async () => {
     const session = new FakeSession();
     const handler = new ProviderEnforcedPermissionHandler(session as any, {
       logPrefix: '[Test]',
@@ -256,7 +262,7 @@ describe('ProviderEnforcedPermissionHandler always-auto-approve matching', () =>
     await expect(pending).resolves.toEqual({ decision: 'approved' });
   });
 
-  it('prompts for action_execute when Happier approval is not required', async () => {
+  it('admits a safe action_execute transport independently of Action approval settings', async () => {
     const session = new FakeSession();
     const handler = new ProviderEnforcedPermissionHandler(session as any, {
       logPrefix: '[Test]',
@@ -275,43 +281,12 @@ describe('ProviderEnforcedPermissionHandler always-auto-approve matching', () =>
 
     expect(handler.getImmediateDecision('action-execute-1', 'happier_action_execute', {
       actionId: 'session.list',
-    })).toBeNull();
+    })).toEqual({ decision: 'approved' });
 
-    const pending = handler.handleToolCall('action-execute-1', 'happier_action_execute', {
-      actionId: 'session.list',
-    });
-    expect(session.agentState.requests['action-execute-1']).toEqual(
-      expect.objectContaining({ tool: 'happier_action_execute' }),
-    );
-    await session.rpcHandlerManager.handlers.get('permission')?.({
-      id: 'action-execute-1',
-      approved: true,
-      decision: 'approved',
-    });
-    await expect(pending).resolves.toEqual({ decision: 'approved' });
-  });
-
-  it('suppresses action_execute provider prompts when Happier approval is required', async () => {
-    const session = new FakeSession();
-    const handler = new ProviderEnforcedPermissionHandler(session as any, {
-      logPrefix: '[Test]',
-      getAccountSettings: () => ({
-        actionsSettingsV1: {
-          v: 1,
-          actions: {
-            'session.list': {
-              disabledSurfaces: [],
-              approvalRequiredSurfaces: ['session_agent'],
-            },
-          },
-        },
-      } as any),
-    });
-
-    await expect(handler.handleToolCall('action-execute-approval-1', 'happier_action_execute', {
+    await expect(handler.handleToolCall('action-execute-1', 'happier_action_execute', {
       actionId: 'session.list',
     })).resolves.toEqual({ decision: 'approved' });
-    expect(session.agentState.requests['action-execute-approval-1']).toBeFalsy();
+    expect(session.agentState.requests['action-execute-1']).toBeFalsy();
   });
 
   it('keeps the immediate-decision probe side-effect free until handleToolCall records the approval', async () => {

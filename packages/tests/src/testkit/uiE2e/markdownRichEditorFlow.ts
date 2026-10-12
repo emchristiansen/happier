@@ -203,8 +203,11 @@ export async function openFileInDetailsPane(params: Readonly<{
   await expect(params.page.getByTestId('session-composer-input')).toHaveCount(1, { timeout: 120_000 });
   await expect(rightPaneLocator(params.page)).toHaveCount(1, { timeout: 120_000 });
 
-  await params.page.getByTestId('session-rightpanel-tab:files').click();
-  await expect(rightPaneLocator(params.page).getByTestId('session-rightpanel-surface-files')).toHaveCount(1, {
+  const filesSurface = rightPaneLocator(params.page).getByTestId('session-rightpanel-surface-files');
+  if (!(await filesSurface.isVisible().catch(() => false))) {
+    await params.page.getByTestId('session-action-rail:files').click();
+  }
+  await expect(filesSurface).toHaveCount(1, {
     timeout: 120_000,
   });
 

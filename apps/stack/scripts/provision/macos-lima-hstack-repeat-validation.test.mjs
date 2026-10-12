@@ -6,6 +6,10 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
+import { createLimaTestEnv, limaGuestExec } from '../testkit/core/lima_guest_harness.mjs';
+
+const testEnv = createLimaTestEnv();
+
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 async function fileExists(path) {
@@ -134,18 +138,7 @@ test('macos lima repeat-validation wrapper records per-run artifacts for repeate
       '    if [[ "${1:-}" == "--" ]]; then',
       '      shift',
       '    fi',
-      '    if [[ "${1:-}" == "env" ]]; then',
-      '      shift',
-      '      while [[ $# -gt 0 && "$1" == *=* ]]; do',
-      '        export "$1"',
-      '        shift',
-      '      done',
-      '      if [[ "${1:-}" == "bash" && "${2:-}" == "-lc" ]]; then',
-      '        shift 2',
-      '        exec bash -c "${1:-}"',
-      '      fi',
-      '    fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -158,10 +151,10 @@ test('macos lima repeat-validation wrapper records per-run artifacts for repeate
 
   const scriptPath = join(__dirname, 'macos-lima-hstack-repeat-validation.sh');
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     HSTACK_RAW_BASE: 'https://example.test/apps/stack',
     HSTACK_VERSION: '0.9.0-test',
     HSTACK_REPEAT_COUNT: '2',
@@ -325,7 +318,7 @@ test('macos lima repeat-validation wrapper writes summary.json with failureReaso
       '        exit 42',
       '      fi',
       '    fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -338,10 +331,10 @@ test('macos lima repeat-validation wrapper writes summary.json with failureReaso
 
   const scriptPath = join(__dirname, 'macos-lima-hstack-repeat-validation.sh');
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     HSTACK_RAW_BASE: 'https://example.test/apps/stack',
     HSTACK_VERSION: '0.9.0-test',
     HSTACK_REPEAT_COUNT: '2',

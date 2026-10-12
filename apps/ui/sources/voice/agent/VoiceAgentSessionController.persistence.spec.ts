@@ -1050,13 +1050,13 @@ describe('VoiceAgentSessionController (persistence)', () => {
   });
 
   it('fails fast when a global hidden voice binding points at a target flavor without local control support', async () => {
-    state.sessions.s_kimi = {
-      id: 's_kimi',
+    state.sessions.s_gemini = {
+      id: 's_gemini',
       updatedAt: 1,
       active: true,
       presence: 'online',
       modelMode: 'default',
-      metadata: { flavor: 'kimi' },
+      metadata: { flavor: 'gemini' },
     };
 
     const { VOICE_AGENT_GLOBAL_SESSION_ID, createVoiceAgentSessionController, voiceSessionBindingStore } =
@@ -1066,7 +1066,7 @@ describe('VoiceAgentSessionController (persistence)', () => {
       controlSessionId: VOICE_AGENT_GLOBAL_SESSION_ID,
       conversationSessionId: 'sys_voice',
       transcriptMode: 'native_session',
-      targetSessionId: 's_kimi',
+      targetSessionId: 's_gemini',
       updatedAt: 1,
     });
     const controller = createVoiceAgentSessionController();

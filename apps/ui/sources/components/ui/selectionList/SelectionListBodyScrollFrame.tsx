@@ -32,17 +32,20 @@ const styles = StyleSheet.create(() => ({
         flexDirection: 'column',
         flexShrink: 1,
         flexGrow: 1,
+        minHeight: 0,
     },
     bodyScrollHost: {
         // The fade-overlay host is a relative-positioned parent so the
         // absolute-positioned gradient overlays anchor to the scroll viewport.
         flexShrink: 1,
         flexGrow: 1,
+        minHeight: 0,
         position: 'relative',
     },
     bodyScroll: {
         flexShrink: 1,
         flexGrow: 1,
+        minHeight: 0,
     },
     bodyScrollContent: {
         flexDirection: 'column',

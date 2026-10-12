@@ -10,14 +10,28 @@ export const SOCKET_RPC_EVENTS = {
   ERROR: 'rpc-error',
   CALL: 'rpc-call',
   REQUEST: 'rpc-request',
+  CANCEL: 'rpc-cancel',
   MACHINE_TRANSFER_ENVELOPE: 'machine-transfer-envelope',
 } as const;
 
 export type SocketRpcEvent = (typeof SOCKET_RPC_EVENTS)[keyof typeof SOCKET_RPC_EVENTS];
 
+/**
+ * Opaque, short-lived transport correlation. The authenticated relay replaces
+ * caller values before dispatch so one caller cannot cancel another's work.
+ */
+export const SocketRpcRequestIdSchema = z.string().trim().min(1).max(160);
+
+export const SocketRpcCancellationPayloadSchema = z.object({
+  requestId: SocketRpcRequestIdSchema,
+}).strict();
+
+export type SocketRpcCancellationPayload = z.infer<typeof SocketRpcCancellationPayloadSchema>;
+
 export type SocketRpcRequestPayload = Readonly<{
   method: string;
   params: unknown;
+  requestId?: string;
   authorization?: SocketRpcAuthorizationContext;
   transportResponseEnvelopeVersion?: 1;
 }>;

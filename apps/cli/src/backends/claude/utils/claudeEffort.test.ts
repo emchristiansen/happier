@@ -24,7 +24,8 @@ describe('buildClaudeEffortCliArgs', () => {
   });
 
   it('treats the generic opus alias as the current flagship Claude model for default effort resolution', () => {
-    expect(buildClaudeEffortCliArgs({ modelId: 'opus', effort: 'high' })).toEqual([]);
+    expect(buildClaudeEffortCliArgs({ modelId: 'opus', effort: 'medium' })).toEqual([]);
+    expect(buildClaudeEffortCliArgs({ modelId: 'opus', effort: 'high' })).toEqual(['--effort', 'high']);
     expect(buildClaudeEffortCliArgs({ modelId: 'opus', effort: 'xhigh' })).toEqual(['--effort', 'xhigh']);
   });
 
@@ -154,7 +155,7 @@ describe('resolveModeEffortLevelsForModel', () => {
 describe('resolveClaudeDefaultEffortForModel', () => {
   it('resolves the model default effort with alias and [1m] tolerance', () => {
     expect(resolveClaudeDefaultEffortForModel('claude-fable-5')).toBe('high');
-    expect(resolveClaudeDefaultEffortForModel('opus')).toBe('high');
+    expect(resolveClaudeDefaultEffortForModel('opus')).toBe('medium');
     expect(resolveClaudeDefaultEffortForModel('claude-opus-4-7[1m]')).toBe('xhigh');
     expect(resolveClaudeDefaultEffortForModel('claude-haiku-4-5')).toBeNull();
   });

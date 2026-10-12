@@ -21,7 +21,7 @@ installNavigationShellCommonModuleMocks({
     storage: async (importOriginal) => {
         const { createPartialStorageModuleMock } = await import('@/dev/testkit/mocks/storage');
         return createPartialStorageModuleMock(importOriginal, {
-            useFriendRequests: () => [],
+            useFriendRequestCount: () => 0,
         });
     },
 });

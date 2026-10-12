@@ -241,7 +241,7 @@ Advanced:
 
 Only **production** variant has deep linking configured:
 
-- **Production**: `https://app.happier.dev/*`
+- **Production**: `https://cloud.happier.dev/*`
 - **Development**: No deep linking
 - **Preview**: No deep linking
 

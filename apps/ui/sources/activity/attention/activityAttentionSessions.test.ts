@@ -146,15 +146,16 @@ describe('hasActivityAttention', () => {
         expect(hasActivityAttention(decryptable, attentionOptions())).toBe(true);
     });
 
-    it('does not treat ordinary queued user input as attention', () => {
+    it('treats queued user input as attention only when the badge option is enabled', () => {
         const session = createLiveCaughtUpSession({ pendingCount: 4 });
 
-        const flags = deriveActivityAttentionFlags(session, attentionOptions());
+        const enabledOptions = { ...attentionOptions(), showQueuedUserInput: true };
+        const disabledOptions = { ...attentionOptions(), showQueuedUserInput: false };
+        const flags = deriveActivityAttentionFlags(session, enabledOptions);
 
-        // The queued input is observed — it is deliberately not an attention
-        // reason, so a rule that folded it into the badge would fail here.
         expect(flags.hasQueuedUserInput).toBe(true);
-        expect(hasActivityAttention(session, attentionOptions())).toBe(false);
+        expect(hasActivityAttention(session, enabledOptions)).toBe(true);
+        expect(hasActivityAttention(session, disabledOptions)).toBe(false);
     });
 
     it('treats blocked pending delivery as attention even alongside ordinary queued input', () => {

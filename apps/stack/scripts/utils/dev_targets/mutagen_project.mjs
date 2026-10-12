@@ -40,6 +40,12 @@ const DEFAULT_IGNORES = [
   // Expo prebuild generates this entire Git-ignored tree for the target's
   // native identity and toolchain. Replication would undo its Info.plist.
   'apps/ui/ios',
+  // Desktop preparation owns these generated sidecars and their JS runtime companions.
+  // Replicating a local build would replace the target-native executable after Cargo builds it.
+  'apps/ui/src-tauri/binaries',
+  'apps/ui/src-tauri/systemTasks',
+  'apps/ui/src-tauri/ssh',
+  'apps/ui/src-tauri/integrations',
   'apps/ui/android/app/build',
   'apps/ui/android/build',
   'apps/ui/android/.gradle',

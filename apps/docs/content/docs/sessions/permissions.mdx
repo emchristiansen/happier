@@ -5,7 +5,7 @@ description: Choose how much access your agent has (CLI + app), and how changes 
 
 ## What permissions control
 
-Permissions determine **how often Happier asks for approval** when an agent wants to run tools (like editing files or running commands), and how restrictive the session environment should be.
+Permissions express **how much autonomy you want Happier to request** when an agent uses tools such as file edits or commands. The exact approval and sandbox behavior depends on the selected provider and runtime.
 
 You can set permissions in two places:
 
@@ -18,12 +18,12 @@ Happier stores your choice in the session so it stays consistent when you open t
 
 These are the modes you may see in the CLI and/or the app:
 
-- **Default**: uses the provider’s normal behavior (ask when needed).
-- **Read-only**: the agent can read and inspect, but write-like actions are denied.
-- **Safe YOLO**: automatically allows read-like actions; asks for approval before write-like actions.
-- **YOLO**: skips approvals as much as the provider allows (full speed, least safe).
+- **Read-only** (`read_only`): requests a read-only posture and denies write-like actions when Happier is the approver.
+- **Default** (`default`): uses the provider’s normal behavior.
+- **Auto** (`auto`): requests automatic tool use according to the provider's closest supported policy.
+- **YOLO** (`yolo`): skips approvals as much as the provider allows (full speed, least safe).
 
-Not every provider supports every mode. When a mode isn’t supported, Happier will **fall back** to the closest supported behavior and show you the **Effective** policy in the UI.
+Not every provider realizes each intent the same way. Auto does **not** universally mean that writes are confined to the workspace; consult the provider notes below for the behavior of the runtime you use.
 
 Legacy note:
 
@@ -135,7 +135,7 @@ happier gemini --model gemini-2.5-pro
 In a session, open the input settings and pick a model from the **Model** section.
 
 For ACP providers that advertise supported models, Happier will show the provider’s live list.
-For providers without a live list (like Claude Code), Happier may allow entering a **custom model id**.
+Some providers also allow entering a **custom model id**, including Claude Code.
 
 ### Model apply behavior (what happens after you change it)
 
@@ -144,6 +144,7 @@ Model changes are capability-driven and provider-specific:
 - **Claude**: applies on the next prompt (no session restart required).
 - **Codex (MCP)**: model is decided when the MCP session starts; changing model means starting a new MCP session.
 - **Codex/OpenCode/Kilo/Auggie (ACP)**: Happier applies model changes live when `session/set_model` is supported; otherwise it falls back to provider config options when available.
+- **Devin (ACP)**: Happier reads the live model choices from Devin's `model` config option and applies a change with `session/set_config_option`.
 - **Gemini (ACP)**: model changes may require recreating the underlying ACP process; Happier preserves context using replay/history so the session still continues.
 
 For the full guide to engine picking, dynamic/static model lists, custom model ids, model-specific options, and favorite models, see [Model and engine selection](/agents/model-and-engine-selection).
@@ -154,7 +155,7 @@ Start a session with a permission mode:
 
 ```bash
 happier codex --permission-mode read-only
-happier codex --permission-mode safe-yolo
+happier codex --permission-mode auto
 happier claude --permission-mode yolo
 ```
 
@@ -165,27 +166,19 @@ For new sessions, prefer:
 
 ### Aliases (you can use the words you already know)
 
-The CLI accepts common aliases and resolves each to a canonical mode:
+The preferred cross-provider input vocabulary is `read_only`, `default`, `auto`, and `yolo`. The CLI also accepts older Happier spellings and provider-native aliases:
 
 | You pass | You get |
 | --- | --- |
-| `ask`, `prompt`, `normal` | `default` |
-| `readonly`, `read`, `ro`, `no-tools` | `read-only` |
-| `accept-edits` | `acceptEdits` |
-| `safe`, `workspace`, `workspace-write`, `auto-edit`, `auto` | `safe-yolo` |
-| `full`, `full-access`, `danger`, `danger-full-access`, `bypass`, `dont-ask` | `yolo` |
-| `bypass-permissions` | `bypassPermissions` |
+| `default`, `ask`, `prompt`, `normal` | Default |
+| `read_only`, `read-only`, `readonly`, `read`, `ro`, `no-tools` | Read-only |
+| `auto`, `workspace_write`, `workspace-write`, `safe-yolo`, `safe`, `workspace`, `auto-edit`, `acceptEdits`, `accept-edits` | Auto |
+| `yolo`, `full`, `full-access`, `danger`, `danger-full-access`, `bypass`, `dont-ask`, `bypassPermissions`, `bypass-permissions` | YOLO |
 
-`auto` is the row worth reading twice. It resolves to `safe-yolo`, which lets the
-agent write inside the workspace without asking each time. If what you wanted was
-"ask when needed", pass `ask` or `normal`.
-
-There is a second step after this one. An agent that has no distinct mode for a
-canonical value narrows it further when the session starts: both Claude and the
-Codex-like agents fold `acceptEdits` into `safe-yolo` and `bypassPermissions`
-into `yolo`, and Claude additionally treats `plan` as read-only. So the table
-above is what the CLI parses, and what your agent actually runs is that value
-narrowed to the modes it supports.
+Older clients and stored session metadata can still use the compatible `read-only`,
+`safe-yolo`, `acceptEdits`, and `bypassPermissions` wire spellings. Happier normalizes
+all of these through the same permission-intent parser before applying a provider's
+own policy. Legacy `plan` permission metadata is handled as described above.
 
 If you pass an unknown value, Happier prints the supported list and examples.
 
@@ -195,10 +188,8 @@ If you pass an unknown value, Happier prints the supported list and examples.
 
 In a session, open the **permission chip** (shield) and pick a mode.
 
-The picker shows:
-
-- a short description of each mode, and
-- an **Effective** line that explains what the selected mode means for the current provider/session.
+The picker shows a short description of each mode. Provider/runtime behavior can
+still narrow or reinterpret the selected intent, as described in the provider notes.
 
 ### Action approvals are separate
 
@@ -353,7 +344,19 @@ In Happier, **permissions remain the primary control** for Codex. Happier maps y
 
 Model IDs can also vary by Codex build and account. If model selection isn’t shown in the app for your Codex session, you can still set it via the CLI (when supported by your installed Codex backend).
 
-The UI’s **Effective** line is the source of truth for what your current session will do.
+The selected intent is portable, while its realization depends on the active Codex backend's approval and sandbox policies.
+
+### Devin (experimental)
+
+Devin sessions and execution runs use the installed, machine-authenticated Devin CLI through `devin acp`. Happier maps explicit permission choices to Devin's advertised modes:
+
+- **Default** sends no permission override, so Devin keeps the user's configured permission behavior.
+- **Read only** uses `ask`.
+- **Auto** (the canonical `safe-yolo` intent) uses `smart`.
+- **YOLO** uses `bypass`.
+- **Plan** uses `plan`.
+
+Happier can resume Devin sessions and switch among the live model choices reported by the CLI. Happier delivers the built-in Happier tools and your selected MCP servers through a protected, process-scoped Devin MCP configuration because Devin currently ignores MCP servers supplied in the standard ACP session request and exposes no direct per-process MCP flag. Execution runs use this same native launch path: Happier lazily resolves one run-scoped set of MCP servers and supplies it when the Devin process starts. This MCP setup is independent of **Default** permission behavior; leaving permissions at **Default** still sends no permission override. Your existing user-level Devin MCP servers are merged into the temporary configuration under the platform's native config root (`XDG_CONFIG_HOME` on macOS/Linux or `APPDATA` on Windows), while other Devin and Cognition config entries are linked into it. If linking fails, Happier stops the launch instead of copying provider state into a stale snapshot. Happier removes the temporary root when the agent process ends and does not modify the MCP configuration in your home directory or project. Devin still loads non-colliding project and project-local MCP servers normally; if one shadows a session-selected server name, Happier stops before launch with an actionable error instead of silently running the project definition.
 
 ### Claude
 
@@ -368,7 +371,13 @@ While Claude is in plan mode:
 - Happier still surfaces permission prompts normally
 - **Exit Plan Mode** is surfaced as a user-action request with plan-specific approval choices
 
-If the Effective line is different from what you expected, treat the Effective line as source of truth for that session.
+### Pi
+
+Pi uses an explicit tool allowlist for Read-only (and compatible legacy Plan
+permission metadata). For Auto, Default, and YOLO, Happier does not pass Pi's
+`--tools` option, so Pi retains its full native catalog, including its platform
+shell and installed extension/custom tools such as subagents. Auto is therefore
+not a workspace-confinement boundary for Pi.
 
 ## Remembering a shell command
 

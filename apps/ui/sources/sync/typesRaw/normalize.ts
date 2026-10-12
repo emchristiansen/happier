@@ -1,3 +1,4 @@
+import { providers } from '@happier-dev/agents';
 import type { SessionMessageRole } from '@happier-dev/protocol';
 
 import type { MessageMeta } from '../domains/messages/messageMetaTypes';
@@ -10,6 +11,7 @@ import {
 import { markUnsupportedContentMeta } from '../domains/messages/unsupportedContentMeta';
 import { hasSessionMediaRenderItems } from '../domains/sessionMedia/sessionMediaMessageMeta';
 import { rawRecordSchema, type AgentEvent, type RawAgentContent, type RawRecord, type UsageData } from './schemas';
+import { isSessionToolAnswerDeliveryMeta } from '@happier-dev/protocol';
 import { buildUsageDataFromTokenCountMessage } from './tokenCountUsage';
 
 // Normalized types
@@ -354,6 +356,7 @@ export function normalizeRawMessage(
             };
     }
     const raw = parsed.data as RawRecord;
+    if (raw.role === 'user' && isSessionToolAnswerDeliveryMeta(raw.meta)) return null;
 
     const toolResultContentToText = (content: unknown): string => {
         if (content === null || content === undefined) return '';
@@ -566,8 +569,14 @@ export function normalizeRawMessage(
                 } satisfies NormalizedMessage;
             }
 
-            // Progress records are transport-level status updates and are not rendered in transcript.
-            if (raw.content.data.type === 'progress' || raw.content.data.type === 'tool_progress') {
+            // Use the same provider-owned exclusions as live SDK and JSONL ingestion, including
+            // internal events persisted by older writers. Unknown event types remain visible.
+            if (providers.claude.isClaudeInternalEventType(raw.content.data.type)) {
+                return null;
+            }
+
+            // Progress can carry sidechain data used by CLI observers, but is not a UI row.
+            if (raw.content.data.type === 'progress') {
                 return null;
             }
 

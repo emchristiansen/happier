@@ -1,6 +1,6 @@
 import { resolveUiConfig } from "../api/uiConfig";
 
-export const DEFAULT_WEBAPP_URL = "https://app.happier.dev";
+export const DEFAULT_WEBAPP_URL = "https://cloud.happier.dev";
 
 export function normalizeHttpUrl(raw: string): string | null {
     const value = String(raw ?? "").trim();

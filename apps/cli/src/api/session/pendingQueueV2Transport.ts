@@ -743,7 +743,7 @@ export async function readPendingQueueV2ActivationEligibilityFromServer(params: 
     const exact = pending.find((entry) => entry.localId === params.requestId);
     if (!exact) return 'missing';
     return exact.messageRole === 'user'
-        && exact.requestedAction?.kind === 'send_now'
+        && exact.requestedAction !== null
         && exact.deliveryStatus.status === 'queued'
         ? 'eligible'
         : 'ineligible';

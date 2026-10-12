@@ -78,6 +78,7 @@ import { ExternalLinkIcon } from '@hugeicons/core-free-icons';
 import { EyeIcon } from '@hugeicons/core-free-icons';
 import { File01Icon } from '@hugeicons/core-free-icons';
 import { FileCodeIcon } from '@hugeicons/core-free-icons';
+import { FileDiffIcon } from '@hugeicons/core-free-icons';
 import { FileDownloadIcon } from '@hugeicons/core-free-icons';
 import { FileEmpty01Icon } from '@hugeicons/core-free-icons';
 import { FileMinusIcon } from '@hugeicons/core-free-icons';
@@ -108,6 +109,7 @@ import { Grid2X2Icon } from '@hugeicons/core-free-icons';
 import { GripVerticalIcon } from '@hugeicons/core-free-icons';
 import { HammerIcon } from '@hugeicons/core-free-icons';
 import { HandIcon } from '@hugeicons/core-free-icons';
+import { HardDriveDownloadIcon } from '@hugeicons/core-free-icons';
 import { HardDriveIcon } from '@hugeicons/core-free-icons';
 import { HeadingIcon } from '@hugeicons/core-free-icons';
 import { HeartIcon } from '@hugeicons/core-free-icons';
@@ -317,6 +319,7 @@ export const HUGE_ICON_REGISTRY = {
     'file-arrow-up': FileUploadIcon,
     'file-code': FileCodeIcon,
     'file-dashed': FileEmpty01Icon,
+    'file-diff': FileDiffIcon,
     'file-minus': FileMinusIcon,
     'file-plus': FilePlusIcon,
     'file-text': File01Icon,
@@ -345,6 +348,7 @@ export const HUGE_ICON_REGISTRY = {
     'grid-four': Grid2X2Icon,
     'hammer': HammerIcon,
     'hand': HandIcon,
+    'hard-drive-download': HardDriveDownloadIcon,
     'hard-drives': HardDriveIcon,
     'heart': HeartIcon,
     'hourglass': HourglassIcon,

@@ -2,7 +2,7 @@ import type { AuthCredentials } from '@/auth/storage/tokenStorage';
 import type { UserProfile } from '@/sync/domains/social/friendTypes';
 import { getFriendsList } from '@/sync/api/social/apiFriends';
 import { getActiveServerSnapshot } from '@/sync/domains/server/serverRuntime';
-import { isRuntimeFeatureEnabled } from '@/sync/domains/features/featureDecisionInputs';
+import { resolveRuntimeFeatureDecisionOrThrow } from '@/sync/domains/features/featureDecisionInputs';
 
 export async function fetchAndApplyFriends(params: {
     credentials: AuthCredentials | null | undefined;
@@ -16,14 +16,13 @@ export async function fetchAndApplyFriends(params: {
     if (!shouldContinue()) return;
 
     const activeServer = getActiveServerSnapshot();
-    const enabled = await isRuntimeFeatureEnabled({
+    const decision = await resolveRuntimeFeatureDecisionOrThrow({
         featureId: 'social.friends',
         serverId: activeServer.serverId,
-        timeoutMs: 400,
     });
     if (!shouldContinue()) return;
 
-    if (!enabled) {
+    if (decision.state !== 'enabled') {
         return;
     }
 

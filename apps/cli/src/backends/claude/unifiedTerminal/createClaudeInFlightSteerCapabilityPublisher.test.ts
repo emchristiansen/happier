@@ -87,6 +87,8 @@ describe('createClaudeInFlightSteerCapabilityPublisher (lane P, O-design Seam A)
 
     publisher.publish({ available: true, reason: null });
 
+    expect(captured.state.capabilities?.inFlightSteer).toBe(true);
+    expect(captured.state.capabilities?.inFlightSteerSupported).toBe(true);
     expect(captured.state.capabilities?.inFlightSteerAvailable).toBe(true);
     expect(captured.state.capabilities?.terminalComposerClearSupported).toBeUndefined();
     expect(captured.state.capabilities?.terminalComposerDraftPresent).toBeUndefined();

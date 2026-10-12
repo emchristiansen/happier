@@ -6,7 +6,11 @@ import type { ACPProvider } from '@/api/session/sessionMessageTypes';
 import type { AcpSendFn } from '@/agent/acp/bridge/acpSessionForwarding';
 import { resolveExecutionRunIntentProfile } from '@/agent/executionRuns/profiles/intentRegistry';
 import type { ExecutionRunStructuredMeta } from '@/agent/executionRuns/profiles/ExecutionRunIntentProfile';
-import type { AcpConfigOptionOverridesV1, BackendTargetRefV1 } from '@happier-dev/protocol';
+import {
+  projectExecutionRunRequestedConfiguration,
+  type AcpConfigOptionOverridesV1,
+  type BackendTargetRefV1,
+} from '@happier-dev/protocol';
 import type {
   ExecutionRunManagerStartParams,
   ExecutionRunStartResult,
@@ -28,19 +32,9 @@ import {
   resolveExecutionRunBuiltInAgentId,
   resolveExecutionRunRuntimeBackendId,
 } from '@/agent/executionRuns/runtime/backendTargets';
+import { settleExecutionRunControllerOccurrence } from '@/agent/executionRuns/runtime/settleExecutionRunControllerOccurrence';
 
 type SendAcp = AcpSendFn;
-
-export function settleExecutionRunControllerOccurrence<T extends Readonly<{ resolveTerminal(): void }>>(
-  controllers: Map<string, T>,
-  runId: string,
-  controller: T,
-): void {
-  controller.resolveTerminal();
-  if (controllers.get(runId) === controller) {
-    controllers.delete(runId);
-  }
-}
 
 type FinishRunNext = Omit<
   ExecutionRunState,
@@ -78,20 +72,21 @@ function normalizeVoiceAgentModelId(value: unknown): string {
 }
 
 /**
- * QA2-F04: backend session PROVISIONING (process spawn + vendor handshake) must be bounded even when
- * the run itself is unbounded (boundedTimeoutMs=null is an intentional default). A backend whose
- * startSession/loadSession never settles otherwise leaves the run "running" forever with no process,
- * no error, and no stop affordance. Generous default: a cold backend CLI boot can take minutes.
+ * Backend session provisioning owns process spawn plus the complete provider handshake. The
+ * backend adapters already surface process exit and their own phase-specific readiness failures;
+ * this is only the final aggregate backstop for an adapter that never settles at all. Keep it well
+ * above observed loaded starts so it does not terminate valid admission work.
  */
 const BACKEND_PROVISION_TIMEOUT_ENV_KEY = 'HAPPIER_EXECUTION_RUN_BACKEND_PROVISION_TIMEOUT_MS';
-const DEFAULT_BACKEND_PROVISION_TIMEOUT_MS = 5 * 60_000;
+const DEFAULT_BACKEND_PROVISION_TIMEOUT_MS = 30 * 60_000;
+const MAX_NODE_TIMER_DELAY_MS = 2_147_483_647;
 
 function readBackendProvisionTimeoutMs(): number {
   const raw = process.env[BACKEND_PROVISION_TIMEOUT_ENV_KEY];
   if (typeof raw !== 'string' || raw.trim().length === 0) return DEFAULT_BACKEND_PROVISION_TIMEOUT_MS;
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_BACKEND_PROVISION_TIMEOUT_MS;
-  return Math.min(parsed, 30 * 60_000);
+  return Math.min(parsed, MAX_NODE_TIMER_DELAY_MS);
 }
 
 export class ExecutionRunBackendProvisionTimeoutError extends Error {
@@ -106,16 +101,33 @@ export class ExecutionRunBackendProvisionTimeoutError extends Error {
 async function awaitBackendProvisionBounded<T>(
   provision: Promise<T>,
   backendId: string,
+  onLateProvision: (value: T) => void | Promise<void>,
 ): Promise<T> {
   const timeoutMs = readBackendProvisionTimeoutMs();
   let timer: NodeJS.Timeout | undefined;
+  let observationOpen = true;
+  const observedProvision = provision.then(
+    async (value) => {
+      if (observationOpen) return value;
+      await onLateProvision(value);
+      return value;
+    },
+    async (error: unknown) => {
+      if (observationOpen) throw error;
+      return await new Promise<T>(() => {});
+    },
+  );
   const backstop = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new ExecutionRunBackendProvisionTimeoutError({ backendId, timeoutMs })), timeoutMs);
+    timer = setTimeout(() => {
+      observationOpen = false;
+      reject(new ExecutionRunBackendProvisionTimeoutError({ backendId, timeoutMs }));
+    }, timeoutMs);
     timer.unref?.();
   });
   try {
-    return await Promise.race([provision, backstop]);
+    return await Promise.race([observedProvision, backstop]);
   } finally {
+    observationOpen = false;
     clearTimeout(timer);
   }
 }
@@ -172,6 +184,16 @@ export async function startExecutionRun(args: Readonly<{
   const runId = `run_${randomUUID()}`;
   const callId = `subagent_run_${randomUUID()}`;
   const sidechainId = callId;
+  const requestedConfiguration = projectExecutionRunRequestedConfiguration({
+    modelId: args.params.modelId,
+    sessionConfigOptionOverrides: args.params.sessionConfigOptionOverrides,
+  });
+  const startResult: ExecutionRunStartResult = {
+    runId,
+    callId,
+    sidechainId,
+    ...(requestedConfiguration ? { requestedConfiguration } : {}),
+  };
 
   const depth = (() => {
     const parentRunId = typeof args.params.parentRunId === 'string' ? args.params.parentRunId.trim() : '';
@@ -200,6 +222,7 @@ export async function startExecutionRun(args: Readonly<{
   // than ambient auth + default model. Safe inputs only — no credentials/env values/closures.
   const launch = {
     ...(args.params.launchOrigin ? { launchOrigin: args.params.launchOrigin } : {}),
+    ...(requestedConfiguration ? { requestedConfiguration } : {}),
     ...(args.params.modelId ? { modelId: args.params.modelId } : {}),
     ...(args.params.sessionConfigOptionOverrides
       ? { sessionConfigOptionOverrides: args.params.sessionConfigOptionOverrides }
@@ -296,6 +319,7 @@ export async function startExecutionRun(args: Readonly<{
         ...(typeof args.params.intentInput !== 'undefined' ? { intentInput: args.params.intentInput } : {}),
         ...(args.params.display ? { display: args.params.display } : {}),
         ...(args.params.launchOrigin ? { launchOrigin: args.params.launchOrigin } : {}),
+        ...(requestedConfiguration ? { requestedConfiguration } : {}),
         permissionMode: args.params.permissionMode,
         retentionPolicy: args.params.retentionPolicy,
         runClass: args.params.runClass,
@@ -407,7 +431,7 @@ export async function startExecutionRun(args: Readonly<{
       args.controllers.set(runId, ctrl);
       controllerOccurrence = ctrl;
       await args.writeActivityMarker(runId, args.getNowMs(), { force: true }).catch(() => {});
-      return { runId, callId, sidechainId };
+      return startResult;
     }
 
     const backend = args.createBackend({
@@ -477,58 +501,107 @@ export async function startExecutionRun(args: Readonly<{
 
     backend.onMessage(onMessage);
 
+    const settleProvisionedSessionAfterCancellation = async (childSessionId: SessionId): Promise<void> => {
+      try {
+        await backend.cancel(childSessionId);
+      } catch {
+        // Best effort: dispose below remains the authoritative backend teardown.
+      }
+      try {
+        await backend.dispose();
+      } catch {
+        // Best effort
+      }
+      settleExecutionRunControllerOccurrence(args.controllers, runId, ctrl);
+    };
+
+    const provisionBackendController = async (): Promise<SessionId | null> => {
+      const childSessionId = await awaitBackendProvisionBounded((async () => {
+        const handle = args.params.retentionPolicy === 'resumable' ? (args.params.resumeHandle ?? null) : null;
+        const wantsResume =
+          handle?.kind === 'vendor_session.v1' && areExecutionRunBackendTargetsEqual(handle.backendTarget, args.params.backendTarget)
+            ? handle.vendorSessionId
+            : null;
+        if (wantsResume) {
+          if (!backend.loadSessionWithReplayCapture && !backend.loadSession) {
+            const error: Error & { code?: string } = new Error('Backend does not support resume');
+            error.code = 'execution_run_not_allowed';
+            throw error;
+          }
+          const loaded = backend.loadSessionWithReplayCapture
+            ? await backend.loadSessionWithReplayCapture(wantsResume as any)
+            : await backend.loadSession!(wantsResume as any);
+          return loaded.sessionId;
+        }
+        const started = await backend.startSession();
+        return started.sessionId;
+      })(), backendId, settleProvisionedSessionAfterCancellation);
+      if (ctrl.cancelled || args.controllers.get(runId) !== ctrl) {
+        await settleProvisionedSessionAfterCancellation(childSessionId);
+        return null;
+      }
+      ctrl.childSessionId = childSessionId;
+
+      const existing = args.runs.get(runId);
+      if (existing && args.params.retentionPolicy === 'resumable' && backendSupportsResume) {
+        args.runs.set(runId, {
+          ...existing,
+          resumeHandle: { kind: 'vendor_session.v1', backendTarget: args.params.backendTarget, vendorSessionId: childSessionId },
+        });
+        await args.writeActivityMarker(runId, args.getNowMs(), { force: true }).catch(() => {});
+        args.onPublicStateUpdated?.(runId);
+      }
+      return childSessionId;
+    };
+
+    const failBackendProvisioning = async (error: unknown): Promise<void> => {
+      const message = error instanceof Error ? error.message : 'Execution failed';
+      const finishedAtMs = args.getNowMs();
+      const code = error instanceof VoiceAgentError
+        ? error.code
+        : error instanceof ExecutionRunBackendProvisionTimeoutError
+          ? error.code
+          : 'execution_run_failed';
+      try {
+        await args.finishRun(
+          runId,
+          { status: 'failed', summary: message, finishedAtMs, error: { code, message } },
+          {
+            output: {
+              status: 'failed',
+              summary: message,
+              runId,
+              callId,
+              sidechainId,
+              backendId,
+              intent: args.params.intent,
+              startedAtMs,
+              finishedAtMs,
+              error: { code, message },
+            },
+            isError: true,
+          },
+        );
+      } catch {
+        // Best effort
+      }
+      try {
+        await ctrl.backend.dispose();
+      } catch {
+        // Best effort
+      }
+      settleExecutionRunControllerOccurrence(args.controllers, runId, ctrl);
+    };
+
     if (args.params.runClass === 'bounded') {
       // Provision the backend session and run kickoff asynchronously so the caller can dismiss
       // the UI draft card immediately after the SubAgentRun tool-call is injected.
       void (async () => {
         try {
-          // QA2-F04: bound provisioning — a never-settling backend start must fail the run, not
-          // leave it "running" forever with no process and no stop affordance.
-          const childSessionId = await awaitBackendProvisionBounded((async () => {
-            const handle = args.params.retentionPolicy === 'resumable' ? (args.params.resumeHandle ?? null) : null;
-            const wantsResume =
-              handle?.kind === 'vendor_session.v1' && areExecutionRunBackendTargetsEqual(handle.backendTarget, args.params.backendTarget)
-                ? handle.vendorSessionId
-                : null;
-            if (wantsResume) {
-              if (!backend.loadSessionWithReplayCapture && !backend.loadSession) {
-                const err: any = new Error('Backend does not support resume');
-                err.code = 'execution_run_not_allowed';
-                throw err;
-              }
-              const loaded = backend.loadSessionWithReplayCapture
-                ? await backend.loadSessionWithReplayCapture(wantsResume as any)
-                : await backend.loadSession!(wantsResume as any);
-              return loaded.sessionId;
-            }
-            const started = await backend.startSession();
-            return started.sessionId;
-          })(), backendId);
-          if (ctrl.cancelled || args.controllers.get(runId) !== ctrl) {
-            try {
-              await backend.cancel(childSessionId);
-            } catch {
-              // Best effort: dispose below remains the authoritative backend teardown.
-            }
-            try {
-              await backend.dispose();
-            } catch {
-              // Best effort
-            }
-            settleExecutionRunControllerOccurrence(args.controllers, runId, ctrl);
-            return;
-          }
-          ctrl.childSessionId = childSessionId;
-
-          const existing = args.runs.get(runId);
-          if (existing && args.params.retentionPolicy === 'resumable' && backendSupportsResume) {
-            args.runs.set(runId, {
-              ...existing,
-              resumeHandle: { kind: 'vendor_session.v1', backendTarget: args.params.backendTarget, vendorSessionId: childSessionId },
-            });
-            void args.writeActivityMarker(runId, args.getNowMs(), { force: true }).catch(() => {});
-            args.onPublicStateUpdated?.(runId);
-          }
+          // QA2-F04: a never-settling backend start must fail the admitted run rather than leave it
+          // running forever with no provider process.
+          const childSessionId = await provisionBackendController();
+          if (!childSessionId) return;
 
           void args
             .executeBoundedRun({ runId, callId, sidechainId, startedAtMs, params: args.params })
@@ -536,105 +609,49 @@ export async function startExecutionRun(args: Readonly<{
               // Ensure terminal promise resolves even if executeBoundedRun throws unexpectedly.
               settleExecutionRunControllerOccurrence(args.controllers, runId, ctrl);
             });
-        } catch (e: any) {
-          const message = e instanceof Error ? e.message : 'Execution failed';
-          const finishedAtMs = args.getNowMs();
-          const code = e instanceof VoiceAgentError
-      ? e.code
-      : e instanceof ExecutionRunBackendProvisionTimeoutError
-        ? e.code
-        : 'execution_run_failed';
-          try {
-            await args.finishRun(
-              runId,
-              { status: 'failed', summary: message, finishedAtMs, error: { code, message } },
-              {
-                output: {
-                  status: 'failed',
-                  summary: message,
-                  runId,
-                  callId,
-                  sidechainId,
-                  backendId,
-                  intent: args.params.intent,
-                  startedAtMs,
-                  finishedAtMs,
-                  error: { code, message },
-                },
-                isError: true,
-              },
-            );
-          } catch {
-            // best effort
-          }
-          try {
-            await ctrl.backend.dispose();
-          } catch {
-            // best effort
-          }
-          settleExecutionRunControllerOccurrence(args.controllers, runId, ctrl);
+        } catch (error: unknown) {
+          await failBackendProvisioning(error);
         }
       })();
 
-      return { runId, callId, sidechainId };
+      return startResult;
     }
 
-    // Long-lived runs are expected to be usable immediately after start(); await session provisioning
-    // so follow-up execution.run.send calls don't race the vendor session startup. Bounded (QA2-F04):
-    // a hung provisioning must fail the run instead of hanging start() and leaking a running entry.
-    const childSessionId = await awaitBackendProvisionBounded((async () => {
-      const handle = args.params.retentionPolicy === 'resumable' ? (args.params.resumeHandle ?? null) : null;
-      const wantsResume =
-        handle?.kind === 'vendor_session.v1' && areExecutionRunBackendTargetsEqual(handle.backendTarget, args.params.backendTarget)
-          ? handle.vendorSessionId
-          : null;
-      if (wantsResume) {
-        if (!backend.loadSessionWithReplayCapture && !backend.loadSession) {
-          const err: any = new Error('Backend does not support resume');
-          err.code = 'execution_run_not_allowed';
-          throw err;
+    // The admitted run and its daemon marker already own the durable identity. Provision the
+    // provider occurrence behind that handle so slow vendor startup cannot make execution.run.start
+    // ambiguous. The controller's promise is also the canonical ordering point for sends that
+    // arrive before the child session exists; stop continues to act on this same controller.
+    const provisioningPromise = (async (): Promise<void> => {
+      try {
+        const childSessionId = await provisionBackendController();
+        if (!childSessionId) return;
+
+        if (typeof args.params.instructions === 'string' && args.params.instructions.trim().length > 0) {
+          const start = {
+            sessionId: args.params.sessionId,
+            runId,
+            callId,
+            sidechainId,
+            intent: args.params.intent,
+            backendId,
+            backendTarget: args.params.backendTarget,
+            instructions: args.params.instructions ?? '',
+            permissionMode: args.params.permissionMode,
+            retentionPolicy: args.params.retentionPolicy,
+            runClass: args.params.runClass,
+            ioMode: args.params.ioMode,
+            startedAtMs,
+          } as const;
+          const profile = resolveExecutionRunIntentProfile(args.params.intent);
+          await args.send(runId, { message: profile.buildPrompt(start) });
         }
-        const loaded = backend.loadSessionWithReplayCapture
-          ? await backend.loadSessionWithReplayCapture(wantsResume as any)
-          : await backend.loadSession!(wantsResume as any);
-        return loaded.sessionId;
+      } catch (error: unknown) {
+        await failBackendProvisioning(error);
       }
-      const started = await backend.startSession();
-      return started.sessionId;
-    })(), backendId);
-    ctrl.childSessionId = childSessionId;
-
-    const existing = args.runs.get(runId);
-    if (existing && args.params.retentionPolicy === 'resumable' && backendSupportsResume) {
-      args.runs.set(runId, {
-        ...existing,
-        resumeHandle: { kind: 'vendor_session.v1', backendTarget: args.params.backendTarget, vendorSessionId: childSessionId },
-      });
-      await args.writeActivityMarker(runId, args.getNowMs(), { force: true }).catch(() => {});
-      args.onPublicStateUpdated?.(runId);
-    }
-
-    if (typeof args.params.instructions === 'string' && args.params.instructions.trim().length > 0) {
-      const start = {
-        sessionId: args.params.sessionId,
-        runId,
-        callId,
-        sidechainId,
-        intent: args.params.intent,
-        backendId,
-        backendTarget: args.params.backendTarget,
-        instructions: args.params.instructions ?? '',
-        permissionMode: args.params.permissionMode,
-        retentionPolicy: args.params.retentionPolicy,
-        runClass: args.params.runClass,
-        ioMode: args.params.ioMode,
-        startedAtMs,
-      } as const;
-      const profile = resolveExecutionRunIntentProfile(args.params.intent);
-      await args.send(runId, { message: profile.buildPrompt(start) });
-    }
-
-    return { runId, callId, sidechainId };
+    })();
+    ctrl.provisioningPromise = provisioningPromise;
+    void provisioningPromise;
+    return startResult;
   } catch (e: any) {
     const message = e instanceof Error ? e.message : 'Execution failed';
     const finishedAtMs = args.getNowMs();

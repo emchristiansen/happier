@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 
 import {
     ANDROID_APK_URL,
+    ANDROID_PLAY_URL,
     APP_STORE_URL,
     DESKTOP_PLATFORMS,
     RELEASE_PUBKEY,
@@ -34,11 +35,11 @@ describe('download URLs', () => {
         ]);
     });
 
-    // `play.google.com/store/apps/details?id=dev.happier` is a 404 and always
-    // has been; `id=dev.happier.app` is a closed track that 404s for anyone who
-    // is not an opted-in tester. Neither belongs in a badge. Android goes to the
-    // APK, which is where 2,056 people have already gone.
-    it('never links a Google Play store listing', () => {
+    // The public Play listing is ANDROID_PLAY_URL and nothing else. These
+    // constants must stay what their names say — `id=dev.happier` was a 404
+    // that shipped in a badge once, so a Play URL turning up in the APK, App
+    // Store or desktop constants is a swapped constant, not a new feature.
+    it('keeps the Play listing out of every non-Play download constant', () => {
         const surfaces = [ANDROID_APK_URL, APP_STORE_URL, ...DESKTOP_PLATFORMS.map((p) => p.href)];
         for (const url of surfaces) {
             expect(url).not.toContain('play.google.com/store');
@@ -52,16 +53,18 @@ describe('download URLs', () => {
         );
     });
 
-    it('keeps static public download surfaces on the canonical stable APK', () => {
+    it('keeps static public download surfaces on the canonical public Play listing', () => {
         const staticSurfaces = {
             'index.html': readFileSync(new URL('../../index.html', import.meta.url), 'utf8'),
             'public/llms.txt': readFileSync(new URL('../../public/llms.txt', import.meta.url), 'utf8'),
         };
 
         for (const [name, surface] of Object.entries(staticSurfaces)) {
-            expect(surface.includes(ANDROID_APK_URL), `${name} must link the stable APK`).toBe(true);
+            expect(surface.includes(ANDROID_PLAY_URL), `${name} must link Google Play`).toBe(true);
+            expect(surface.includes('play.google.com/store/apps/details?id=dev.happier"'), `${name} must not use the old package id`).toBe(false);
             expect(surface.includes('/ui-mobile-preview/'), `${name} must not link a preview APK`).toBe(false);
         }
+        expect(staticSurfaces['public/llms.txt']).toContain(ANDROID_APK_URL);
     });
 
     // The key printed on the page must be the key the installer verifies

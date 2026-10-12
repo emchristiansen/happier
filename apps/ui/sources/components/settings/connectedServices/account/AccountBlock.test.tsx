@@ -303,6 +303,24 @@ describe('AccountBlock', () => {
         expect(screen.findByTestId('acct:reset-use:pc-1')).toBeTruthy();
     });
 
+    it('shows only the allowance selected by the owning pool', async () => {
+        quotaHookState.value = buildQuotaResult({
+            snapshot: buildSnapshot({
+                meters: [
+                    { meterId: 'standard:primary', providerLimitId: 'standard', label: 'Session', used: null, limit: null, unit: 'unknown', utilizationPct: 20, resetsAt: null, status: 'ok', details: {} },
+                    { meterId: 'spark:primary', providerLimitId: 'spark', label: 'Spark', used: null, limit: null, unit: 'unknown', utilizationPct: 95, resetsAt: null, status: 'ok', details: {} },
+                ],
+            }),
+        });
+
+        const screen = await renderAccountBlock({
+            quotaLimitSelection: { mode: 'selected', providerLimitIds: ['standard'] },
+        });
+
+        expect(screen.findByTestId('acct:meter:standard:primary')).toBeTruthy();
+        expect(screen.findAllByTestId('acct:meter:spark:primary')).toHaveLength(0);
+    });
+
     it('confirms before consuming a reset and skips consume when cancelled', async () => {
         modalState.confirmResult = false;
         const quota = buildQuotaResult();

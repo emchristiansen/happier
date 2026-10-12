@@ -5,9 +5,11 @@ import { join } from 'node:path';
 import { executeSystemTask } from '@happier-dev/cli-common/systemTasks';
 import { describe, expect, it, vi } from 'vitest';
 
+import { createDefaultInteractiveKinds } from '../bin/hsetup.js';
 import { createHsetupSystemTaskRegistry } from './registry.js';
 
 function createFakeHappierCli(scenario: Readonly<{
+  cliVersion?: string;
   serverCurrent?: Record<string, unknown>;
   authStatus?: Record<string, unknown>;
   authRequests?: readonly Record<string, unknown>[];
@@ -25,6 +27,8 @@ function createFakeHappierCli(scenario: Readonly<{
   const logPath = join(rootDir, 'invocations.log');
 
   writeFileSync(statePath, JSON.stringify({
+    // The real CLI answers `--version`; the tasks read it to state which CLI answered.
+    cliVersion: scenario.cliVersion ?? '0.2.13',
     serverCurrent: scenario.serverCurrent ?? {
       ok: true,
       kind: 'server_current',
@@ -104,6 +108,11 @@ const command = argv.join(' ');
 
 function printJson(value) {
   process.stdout.write(JSON.stringify(value) + '\\n');
+}
+
+if (command === '--version') {
+  process.stdout.write(state.cliVersion + '\\n');
+  process.exit(0);
 }
 
 if (command === 'server current --json') {
@@ -361,389 +370,39 @@ if (argv[0] === 'status' && argv[1] === '--json') {
   };
 }
 
-async function executeSetupThisComputerTask(): Promise<Awaited<ReturnType<typeof executeSystemTask>>> {
-  return await executeSystemTask({
-    spec: {
-      protocolVersion: 1,
-      kind: 'setup.thisComputer.v1',
-      params: {
-        surface: 'desktop.ui',
-        target: 'thisComputer',
-      },
-    },
-    taskId: 'task_setup_1',
-    registry: createHsetupSystemTaskRegistry(),
-    now: () => 1700000000000,
-    emitEvent() {},
-  });
-}
-
 describe('createHsetupSystemTaskRegistry', () => {
-  it('runs setup.thisComputer.v1 with deterministic step ids and returns a machine id', async () => {
-    const fakeCli = createFakeHappierCli({});
-    const previousCliPath = process.env.HAPPIER_BOOTSTRAP_CLI_PATH;
-    const previousStatePath = process.env.HAPPIER_FAKE_CLI_STATE_PATH;
-    const previousLogPath = process.env.HAPPIER_FAKE_CLI_LOG_PATH;
-    const events: unknown[] = [];
-    try {
-      process.env.HAPPIER_BOOTSTRAP_CLI_PATH = fakeCli.cliPath;
-      process.env.HAPPIER_FAKE_CLI_STATE_PATH = join(fakeCli.cliPath, '..', 'scenario.json');
-      process.env.HAPPIER_FAKE_CLI_LOG_PATH = join(fakeCli.cliPath, '..', 'invocations.log');
+  it('dispatches local setup only through the interactive map, and no longer answers the deleted relay repair kind', () => {
+    const registry = createHsetupSystemTaskRegistry();
+    const interactiveKinds = createDefaultInteractiveKinds();
 
-      const result = await executeSystemTask({
-        spec: {
-          protocolVersion: 1,
-          kind: 'setup.thisComputer.v1',
-          params: {
-            surface: 'desktop.ui',
-            target: 'thisComputer',
-          },
-        },
-        taskId: 'task_setup_1',
-        registry: createHsetupSystemTaskRegistry(),
-        now: () => 1700000000000,
-        emitEvent(event) {
-          events.push(event);
-        },
-      });
-
-      expect(events).toEqual([
-        expect.objectContaining({ type: 'progress', stepId: 'setup.thisComputer.resolveRelay' }),
-        expect.objectContaining({ type: 'progress', stepId: 'setup.thisComputer.checkAuth' }),
-        expect.objectContaining({ type: 'progress', stepId: 'setup.thisComputer.configureRelay' }),
-        expect.objectContaining({ type: 'progress', stepId: 'setup.thisComputer.installService' }),
-        expect.objectContaining({ type: 'progress', stepId: 'setup.thisComputer.startService' }),
-        expect.objectContaining({ type: 'progress', stepId: 'setup.thisComputer.verifyService' }),
-      ]);
-      expect(result).toEqual({
-        protocolVersion: 1,
-        taskId: 'task_setup_1',
-        ok: true,
-        data: {
-          machineId: 'machine-local-1',
-        },
-      });
-      expect(fakeCli.readInvocations()).toEqual([
-        ['server', 'current', '--json'],
-        ['auth', 'status', '--json'],
-        ['server', 'set', '--server-url', 'https://relay.example.test', '--webapp-url', 'https://app.example.test', '--json'],
-        ['daemon', 'service', 'install', '--json'],
-        ['daemon', 'service', 'start', '--json'],
-        ['daemon', 'status', '--json'],
-      ]);
-    } finally {
-      restoreEnvVar('HAPPIER_BOOTSTRAP_CLI_PATH', previousCliPath);
-      restoreEnvVar('HAPPIER_FAKE_CLI_STATE_PATH', previousStatePath);
-      restoreEnvVar('HAPPIER_FAKE_CLI_LOG_PATH', previousLogPath);
-      fakeCli.cleanup();
-    }
-  });
-
-  it('requests auth and waits for approval when auth is missing', async () => {
-    const fakeCli = createFakeHappierCli({
-      authStatus: {
-        ok: false,
-        kind: 'auth_status',
-        error: {
-          code: 'not_authenticated',
-        },
-      },
-      authWaits: [
-        {
-          success: true,
-          machineId: 'machine-local-auth-1',
-        },
-      ],
-      daemonStatuses: [
-        {
-          server: {
-            serverUrl: 'https://relay.example.test',
-            localServerUrl: null,
-            publicServerUrl: 'https://relay.example.test',
-            webappUrl: 'https://app.example.test',
-          },
-          daemon: {
-            running: true,
-            pid: 4321,
-          },
-          service: {
-            installed: true,
-            running: true,
-          },
-          auth: {
-            authenticated: true,
-            machineRegistered: true,
-            machineId: 'machine-local-auth-1',
-            needsAuth: false,
-          },
-        },
-      ],
-    });
-    const previousCliPath = process.env.HAPPIER_BOOTSTRAP_CLI_PATH;
-    const previousStatePath = process.env.HAPPIER_FAKE_CLI_STATE_PATH;
-    const previousLogPath = process.env.HAPPIER_FAKE_CLI_LOG_PATH;
-    const events: unknown[] = [];
-    try {
-      process.env.HAPPIER_BOOTSTRAP_CLI_PATH = fakeCli.cliPath;
-      process.env.HAPPIER_FAKE_CLI_STATE_PATH = join(fakeCli.cliPath, '..', 'scenario.json');
-      process.env.HAPPIER_FAKE_CLI_LOG_PATH = join(fakeCli.cliPath, '..', 'invocations.log');
-
-      const result = await executeSystemTask({
-        spec: {
-          protocolVersion: 1,
-          kind: 'setup.thisComputer.v1',
-          params: {
-            surface: 'desktop.ui',
-            target: 'thisComputer',
-          },
-        },
-        taskId: 'task_setup_1',
-        registry: createHsetupSystemTaskRegistry(),
-        now: () => 1700000000000,
-        emitEvent(event) {
-          events.push(event);
-        },
-      });
-
-      expect(events).toEqual([
-        expect.objectContaining({ type: 'progress', stepId: 'setup.thisComputer.resolveRelay' }),
-        expect.objectContaining({ type: 'progress', stepId: 'setup.thisComputer.checkAuth' }),
-        expect.objectContaining({ type: 'progress', stepId: 'setup.thisComputer.configureRelay' }),
-        expect.objectContaining({ type: 'prompt', stepId: 'setup.thisComputer.auth.request' }),
-        expect.objectContaining({ type: 'progress', stepId: 'setup.thisComputer.auth.wait' }),
-        expect.objectContaining({ type: 'progress', stepId: 'setup.thisComputer.installService' }),
-        expect.objectContaining({ type: 'progress', stepId: 'setup.thisComputer.startService' }),
-        expect.objectContaining({ type: 'progress', stepId: 'setup.thisComputer.verifyService' }),
-      ]);
-      expect(result).toEqual({
-        protocolVersion: 1,
-        taskId: 'task_setup_1',
-        ok: true,
-        data: {
-          machineId: 'machine-local-auth-1',
-        },
-      });
-      expect(fakeCli.readInvocations()).toEqual([
-        ['server', 'current', '--json'],
-        ['auth', 'status', '--json'],
-        ['server', 'set', '--server-url', 'https://relay.example.test', '--webapp-url', 'https://app.example.test', '--json'],
-        ['auth', 'request', '--json'],
-        ['auth', 'wait', '--public-key', 'public-key-local-1', '--json'],
-        ['daemon', 'service', 'install', '--json'],
-        ['daemon', 'service', 'start', '--json'],
-        ['daemon', 'status', '--json'],
-      ]);
-    } finally {
-      restoreEnvVar('HAPPIER_BOOTSTRAP_CLI_PATH', previousCliPath);
-      restoreEnvVar('HAPPIER_FAKE_CLI_STATE_PATH', previousStatePath);
-      restoreEnvVar('HAPPIER_FAKE_CLI_LOG_PATH', previousLogPath);
-      fakeCli.cleanup();
-    }
-  });
-
-  it('fails setup.thisComputer.v1 when local pairing does not expose a public key', async () => {
-    const fakeCli = createFakeHappierCli({
-      authStatus: {
-        ok: true,
-        kind: 'auth_status',
-        data: {
-          authenticated: true,
-          machineRegistered: false,
-        },
-      },
-      authRequests: [
-        {},
-      ],
-    });
-    const previousCliPath = process.env.HAPPIER_BOOTSTRAP_CLI_PATH;
-    const previousStatePath = process.env.HAPPIER_FAKE_CLI_STATE_PATH;
-    const previousLogPath = process.env.HAPPIER_FAKE_CLI_LOG_PATH;
-    try {
-      process.env.HAPPIER_BOOTSTRAP_CLI_PATH = fakeCli.cliPath;
-      process.env.HAPPIER_FAKE_CLI_STATE_PATH = join(fakeCli.cliPath, '..', 'scenario.json');
-      process.env.HAPPIER_FAKE_CLI_LOG_PATH = join(fakeCli.cliPath, '..', 'invocations.log');
-
-      const result = await executeSetupThisComputerTask();
-
-      expect(result).toEqual({
-        protocolVersion: 1,
-        taskId: 'task_setup_1',
-        ok: false,
-        error: {
-          code: 'invalid_cli_response',
-          message: 'Received an invalid auth request response.',
-        },
-      });
-      expect(fakeCli.readInvocations()).toEqual([
-        ['server', 'current', '--json'],
-        ['auth', 'status', '--json'],
-        ['server', 'set', '--server-url', 'https://relay.example.test', '--webapp-url', 'https://app.example.test', '--json'],
-        ['auth', 'request', '--json'],
-      ]);
-    } finally {
-      restoreEnvVar('HAPPIER_BOOTSTRAP_CLI_PATH', previousCliPath);
-      restoreEnvVar('HAPPIER_FAKE_CLI_STATE_PATH', previousStatePath);
-      restoreEnvVar('HAPPIER_FAKE_CLI_LOG_PATH', previousLogPath);
-      fakeCli.cleanup();
-    }
-  });
-
-  it('completes setup.thisComputer.v1 by pairing locally when already authenticated but no machine id is registered yet', async () => {
-    const fakeCli = createFakeHappierCli({
-      authStatus: {
-        ok: true,
-        kind: 'auth_status',
-        data: {
-          authenticated: true,
-          machineRegistered: false,
-        },
-      },
-      authRequests: [
-        {
-          publicKey: 'public-key-local-2',
-        },
-      ],
-      authWaits: [
-        {
-          success: true,
-          machineId: 'machine-local-2',
-        },
-      ],
-      daemonStatuses: [
-        {
-          server: {
-            serverUrl: 'https://relay.example.test',
-            localServerUrl: null,
-            publicServerUrl: 'https://relay.example.test',
-            webappUrl: 'https://app.example.test',
-          },
-          daemon: {
-            running: true,
-            pid: 9876,
-          },
-          service: {
-            installed: true,
-            running: true,
-          },
-          auth: {
-            authenticated: true,
-            machineRegistered: true,
-            machineId: 'machine-local-2',
-            needsAuth: false,
-          },
-        },
-      ],
-    });
-    const previousCliPath = process.env.HAPPIER_BOOTSTRAP_CLI_PATH;
-    const previousStatePath = process.env.HAPPIER_FAKE_CLI_STATE_PATH;
-    const previousLogPath = process.env.HAPPIER_FAKE_CLI_LOG_PATH;
-    const events: unknown[] = [];
-    try {
-      process.env.HAPPIER_BOOTSTRAP_CLI_PATH = fakeCli.cliPath;
-      process.env.HAPPIER_FAKE_CLI_STATE_PATH = join(fakeCli.cliPath, '..', 'scenario.json');
-      process.env.HAPPIER_FAKE_CLI_LOG_PATH = join(fakeCli.cliPath, '..', 'invocations.log');
-
-      const result = await executeSetupThisComputerTask();
-
-      expect(result).toEqual({
-        protocolVersion: 1,
-        taskId: 'task_setup_1',
-        ok: true,
-        data: {
-          machineId: 'machine-local-2',
-        },
-      });
-      expect(fakeCli.readInvocations()).toEqual([
-        ['server', 'current', '--json'],
-        ['auth', 'status', '--json'],
-        ['server', 'set', '--server-url', 'https://relay.example.test', '--webapp-url', 'https://app.example.test', '--json'],
-        ['auth', 'request', '--json'],
-        ['auth', 'approve', '--public-key', 'public-key-local-2', '--json'],
-        ['auth', 'wait', '--public-key', 'public-key-local-2', '--json'],
-        ['daemon', 'service', 'install', '--json'],
-        ['daemon', 'service', 'start', '--json'],
-        ['daemon', 'status', '--json'],
-      ]);
-    } finally {
-      restoreEnvVar('HAPPIER_BOOTSTRAP_CLI_PATH', previousCliPath);
-      restoreEnvVar('HAPPIER_FAKE_CLI_STATE_PATH', previousStatePath);
-      restoreEnvVar('HAPPIER_FAKE_CLI_LOG_PATH', previousLogPath);
-      fakeCli.cleanup();
-    }
-  });
-
-  it('fails setup.thisComputer.v1 when the daemon service is not ready after setup', async () => {
-    const fakeCli = createFakeHappierCli({
-      daemonStatuses: Array.from({ length: 8 }, () => ({
-        server: {
-          serverUrl: 'https://relay.example.test',
-          localServerUrl: null,
-          publicServerUrl: 'https://relay.example.test',
-          webappUrl: 'https://app.example.test',
-        },
-        daemon: {
-          running: false,
-          pid: null,
-        },
-        service: {
-          installed: false,
-          running: false,
-        },
-        auth: {
-          authenticated: true,
-          machineRegistered: false,
-          machineId: null,
-          needsAuth: true,
-        },
-      })),
-    });
-    const previousCliPath = process.env.HAPPIER_BOOTSTRAP_CLI_PATH;
-    const previousStatePath = process.env.HAPPIER_FAKE_CLI_STATE_PATH;
-    const previousLogPath = process.env.HAPPIER_FAKE_CLI_LOG_PATH;
-    const previousTimeoutMs = process.env.HAPPIER_BOOTSTRAP_SETUP_THIS_COMPUTER_SERVICE_READY_TIMEOUT_MS;
-    const previousPollMs = process.env.HAPPIER_BOOTSTRAP_SETUP_THIS_COMPUTER_SERVICE_READY_POLL_MS;
-    try {
-      process.env.HAPPIER_BOOTSTRAP_CLI_PATH = fakeCli.cliPath;
-      process.env.HAPPIER_FAKE_CLI_STATE_PATH = join(fakeCli.cliPath, '..', 'scenario.json');
-      process.env.HAPPIER_FAKE_CLI_LOG_PATH = join(fakeCli.cliPath, '..', 'invocations.log');
-      process.env.HAPPIER_BOOTSTRAP_SETUP_THIS_COMPUTER_SERVICE_READY_TIMEOUT_MS = '150';
-      process.env.HAPPIER_BOOTSTRAP_SETUP_THIS_COMPUTER_SERVICE_READY_POLL_MS = '20';
-
-      const result = await executeSetupThisComputerTask();
-
-      expect(result).toEqual({
-        protocolVersion: 1,
-        taskId: 'task_setup_1',
-        ok: false,
-        error: {
-          code: 'daemon_service_not_ready',
-          message: 'Daemon service did not reach a ready state for the selected Relay.',
-        },
-      });
-      expect(fakeCli.readInvocations()).toContainEqual(['daemon', 'status', '--json']);
-    } finally {
-      restoreEnvVar('HAPPIER_BOOTSTRAP_CLI_PATH', previousCliPath);
-      restoreEnvVar('HAPPIER_FAKE_CLI_STATE_PATH', previousStatePath);
-      restoreEnvVar('HAPPIER_FAKE_CLI_LOG_PATH', previousLogPath);
-      restoreEnvVar('HAPPIER_BOOTSTRAP_SETUP_THIS_COMPUTER_SERVICE_READY_TIMEOUT_MS', previousTimeoutMs);
-      restoreEnvVar('HAPPIER_BOOTSTRAP_SETUP_THIS_COMPUTER_SERVICE_READY_POLL_MS', previousPollMs);
-      fakeCli.cleanup();
-    }
+    expect(Object.keys(interactiveKinds)).toContain('setup.thisComputer.v1');
+    expect(registry.has('setup.thisComputer.v1')).toBe(false);
+    expect(registry.has('relay.connectBackgroundService.v1')).toBe(false);
+    // INV1, literally: no kind is registered in both dispatch maps. `runHsetupCli` prefers the
+    // interactive map for every kind in it, so a registry twin can never run — it is a second
+    // entry nothing can reach, which is the same dead-registration defect the plan names in 0.3.
+    expect(Object.keys(interactiveKinds).filter((kind) => registry.has(kind))).toEqual([]);
+    expect(registry.has('remote.ssh.bootstrapMachine.v1')).toBe(false);
   });
 
   it('runs daemon.service.status.v1 and reports the local daemon status snapshot', async () => {
     const fakeCli = createFakeHappierCli({
       daemonStatuses: [
         {
+          // Mirrors `readDaemonStatusSnapshot`'s own shape (the doctor snapshot's daemon-status
+          // block, which the bootstrap reader now parses with that schema).
           server: {
+            activeServerId: 'cloud',
             serverUrl: 'https://relay.example.test',
             localServerUrl: null,
             publicServerUrl: 'https://relay.example.test',
             webappUrl: 'https://app.example.test',
+            comparableKey: 'relay.example.test',
           },
           daemon: {
             running: true,
             pid: 4321,
+            httpPort: 43117,
           },
           service: {
             installed: true,
@@ -754,6 +413,7 @@ describe('createHsetupSystemTaskRegistry', () => {
             machineRegistered: true,
             machineId: 'machine-local-1',
             needsAuth: false,
+            accountId: 'acct_local',
           },
         },
       ],
@@ -782,7 +442,7 @@ describe('createHsetupSystemTaskRegistry', () => {
         emitEvent() {},
       });
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         protocolVersion: 1,
         taskId: 'task_daemon_status_1',
         ok: true,
@@ -791,6 +451,12 @@ describe('createHsetupSystemTaskRegistry', () => {
           daemonRunning: true,
           needsAuth: false,
           machineId: 'machine-local-1',
+          // Acquisition is stated, not implied: this run resolved an override CLI.
+          acquisition: { command: fakeCli.cliPath, provenance: 'override', version: '0.2.13', channel: null },
+          server: { serverUrl: 'https://relay.example.test', publicServerUrl: 'https://relay.example.test' },
+          service: { installed: true, running: true },
+          // A CLI that emits no runtimeConvergence leaves the running daemon unknown.
+          runtimeConvergence: null,
         },
       });
       expect(fakeCli.readInvocations()).toContainEqual(['daemon', 'status', '--json']);
@@ -806,15 +472,20 @@ describe('createHsetupSystemTaskRegistry', () => {
     const fakeCli = createFakeHappierCli({
       daemonStatuses: [
         {
+          // Mirrors `readDaemonStatusSnapshot`'s own shape (the doctor snapshot's daemon-status
+          // block, which the bootstrap reader now parses with that schema).
           server: {
+            activeServerId: 'cloud',
             serverUrl: 'https://relay.example.test',
             localServerUrl: null,
             publicServerUrl: 'https://relay.example.test',
             webappUrl: 'https://app.example.test',
+            comparableKey: 'relay.example.test',
           },
           daemon: {
             running: true,
             pid: 4321,
+            httpPort: 43117,
           },
           service: {
             installed: true,
@@ -825,18 +496,24 @@ describe('createHsetupSystemTaskRegistry', () => {
             machineRegistered: true,
             machineId: 'machine-local-1',
             needsAuth: false,
+            accountId: 'acct_local',
           },
         },
         {
+          // Mirrors `readDaemonStatusSnapshot`'s own shape (the doctor snapshot's daemon-status
+          // block, which the bootstrap reader now parses with that schema).
           server: {
+            activeServerId: 'cloud',
             serverUrl: 'https://relay.example.test',
             localServerUrl: null,
             publicServerUrl: 'https://relay.example.test',
             webappUrl: 'https://app.example.test',
+            comparableKey: 'relay.example.test',
           },
           daemon: {
             running: true,
             pid: 4321,
+            httpPort: 43117,
           },
           service: {
             installed: true,
@@ -847,6 +524,7 @@ describe('createHsetupSystemTaskRegistry', () => {
             machineRegistered: true,
             machineId: 'machine-local-1',
             needsAuth: false,
+            accountId: 'acct_local',
           },
         },
       ],
@@ -875,7 +553,7 @@ describe('createHsetupSystemTaskRegistry', () => {
         emitEvent() {},
       });
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         protocolVersion: 1,
         taskId: 'task_daemon_start_1',
         ok: true,
@@ -886,8 +564,13 @@ describe('createHsetupSystemTaskRegistry', () => {
           machineId: 'machine-local-1',
         },
       });
+      // One version read for the whole run: the readiness re-read reuses the CLI this run already
+      // resolved instead of resolving and versioning the CLI again on every poll.
       expect(fakeCli.readInvocations()).toEqual([
+        ['--version'],
         ['daemon', 'status', '--json'],
+        // The pinned services the app also manages (one login-start setting), each started on its own.
+        ['daemon', 'service', 'list', '--json'],
         ['daemon', 'service', 'start', '--json'],
         ['daemon', 'status', '--json'],
       ]);
@@ -1004,314 +687,6 @@ describe('createHsetupSystemTaskRegistry', () => {
 
     expect(controlled).toEqual(['start']);
     expect(result.ok).toBe(true);
-  });
-
-  it('runs relay.connectBackgroundService.v1 through the drift repair handler', async () => {
-    const events: unknown[] = [];
-    const result = await executeSystemTask({
-      spec: {
-        protocolVersion: 1,
-        kind: 'relay.connectBackgroundService.v1',
-        params: {
-          activeRelayUrl: 'https://relay.example.test',
-          activeWebappUrl: 'https://app.example.test',
-          activeLocalRelayUrl: null,
-          surface: 'desktop.ui',
-        },
-      },
-      taskId: 'task_drift_1',
-      registry: createHsetupSystemTaskRegistry({
-        relayDriftRepair: {
-          async connectBackgroundService(params) {
-            return {
-              repaired: true,
-              relayUrl: params.activeRelayUrl,
-            };
-          },
-        },
-      }),
-      now: () => 1700000000000,
-      emitEvent(event) {
-        events.push(event);
-      },
-    });
-
-    expect(result).toEqual({
-      protocolVersion: 1,
-      taskId: 'task_drift_1',
-      ok: true,
-      data: {
-        repaired: true,
-        relayUrl: 'https://relay.example.test',
-      },
-    });
-    expect(events).toEqual([
-      expect.objectContaining({
-        type: 'progress',
-        stepId: 'relay.drift.repair.start',
-      }),
-    ]);
-  });
-
-  it('repairs relay.connectBackgroundService.v1 by pairing and verifying daemon readiness when auth is still needed', async () => {
-    const fakeCli = createFakeHappierCli({
-      authStatus: {
-        ok: true,
-        kind: 'auth_status',
-        data: {
-          authenticated: true,
-          machineRegistered: false,
-        },
-      },
-      authRequests: [
-        {
-          publicKey: 'public-key-drift-1',
-        },
-      ],
-      authWaits: [
-        {
-          success: true,
-          machineId: 'machine-drift-1',
-        },
-      ],
-      daemonStatuses: [
-        {
-          server: {
-            serverUrl: 'https://relay.example.test',
-            localServerUrl: null,
-            publicServerUrl: 'https://relay.example.test',
-            webappUrl: 'https://app.example.test',
-          },
-          daemon: {
-            running: true,
-            pid: 4567,
-          },
-          service: {
-            installed: true,
-            running: true,
-          },
-          auth: {
-            authenticated: true,
-            machineRegistered: true,
-            machineId: 'machine-drift-1',
-            needsAuth: false,
-          },
-        },
-      ],
-    });
-    const previousCliPath = process.env.HAPPIER_BOOTSTRAP_CLI_PATH;
-    const previousStatePath = process.env.HAPPIER_FAKE_CLI_STATE_PATH;
-    const previousLogPath = process.env.HAPPIER_FAKE_CLI_LOG_PATH;
-    try {
-      process.env.HAPPIER_BOOTSTRAP_CLI_PATH = fakeCli.cliPath;
-      process.env.HAPPIER_FAKE_CLI_STATE_PATH = join(fakeCli.cliPath, '..', 'scenario.json');
-      process.env.HAPPIER_FAKE_CLI_LOG_PATH = join(fakeCli.cliPath, '..', 'invocations.log');
-
-      const result = await executeSystemTask({
-        spec: {
-          protocolVersion: 1,
-          kind: 'relay.connectBackgroundService.v1',
-          params: {
-            activeRelayUrl: 'https://relay.example.test',
-            activeWebappUrl: 'https://app.example.test',
-            activeLocalRelayUrl: null,
-            surface: 'desktop.ui',
-          },
-        },
-        taskId: 'task_drift_repair_1',
-        registry: createHsetupSystemTaskRegistry(),
-        now: () => 1700000000000,
-        emitEvent() {},
-      });
-
-      expect(result).toEqual({
-        protocolVersion: 1,
-        taskId: 'task_drift_repair_1',
-        ok: true,
-        data: {
-          repaired: true,
-          activeRelayUrl: 'https://relay.example.test',
-          activeWebappUrl: 'https://app.example.test',
-          activeLocalRelayUrl: null,
-          machineId: 'machine-drift-1',
-        },
-      });
-      expect(fakeCli.readInvocations()).toEqual([
-        ['server', 'set', '--server-url', 'https://relay.example.test', '--webapp-url', 'https://app.example.test', '--json'],
-        ['auth', 'status', '--json'],
-        ['auth', 'request', '--json'],
-        ['auth', 'approve', '--public-key', 'public-key-drift-1', '--json'],
-        ['auth', 'wait', '--public-key', 'public-key-drift-1', '--json'],
-        ['daemon', 'service', 'install', '--json'],
-        ['daemon', 'service', 'start', '--json'],
-        ['daemon', 'status', '--json'],
-      ]);
-    } finally {
-      restoreEnvVar('HAPPIER_BOOTSTRAP_CLI_PATH', previousCliPath);
-      restoreEnvVar('HAPPIER_FAKE_CLI_STATE_PATH', previousStatePath);
-      restoreEnvVar('HAPPIER_FAKE_CLI_LOG_PATH', previousLogPath);
-      fakeCli.cleanup();
-    }
-  });
-
-  it('returns prompt_required when remote.ssh.bootstrapMachine.v1 needs host trust', async () => {
-    const events: unknown[] = [];
-    const result = await executeSystemTask({
-      spec: {
-        protocolVersion: 1,
-        kind: 'remote.ssh.bootstrapMachine.v1',
-        params: {
-          ssh: {
-            target: 'dev@example.test',
-            auth: 'agent',
-          },
-          relay: {
-            relayUrl: 'https://relay.example.test',
-          },
-          serviceMode: 'user',
-        },
-      },
-      taskId: 'task_bootstrap_1',
-      registry: createHsetupSystemTaskRegistry({
-        remoteSshBootstrap: {
-          async resolveHostTrust() {
-            return {
-              status: 'prompt',
-              promptKind: 'sshHostTrust',
-              promptMessage: 'Trust the remote SSH host key',
-              promptData: {
-                host: 'example.test',
-                fingerprint: 'SHA256:test',
-                knownHostKey: 'example.test ssh-ed25519 AAAAB3NzaC1yc2EAAAADAQABAAABAQ',
-              },
-              accept: async () => undefined,
-            };
-          },
-        },
-      }),
-      now: () => 1700000000000,
-      emitEvent(event) {
-        events.push(event);
-      },
-    });
-
-    expect(events).toEqual([
-      expect.objectContaining({
-        type: 'progress',
-        stepId: 'ssh.trust',
-        message: 'Verifying SSH host trust',
-      }),
-      expect.objectContaining({
-        type: 'prompt',
-        stepId: 'ssh.hostTrust',
-        message: 'Trust the remote SSH host key',
-        data: {
-          kind: 'ssh.trustHost',
-          host: 'example.test',
-          fingerprint: 'SHA256:test',
-          knownHostKey: 'example.test ssh-ed25519 AAAAB3NzaC1yc2EAAAADAQABAAABAQ',
-        },
-      }),
-    ]);
-    expect(result).toEqual({
-      protocolVersion: 1,
-      taskId: 'task_bootstrap_1',
-      ok: false,
-      error: {
-        code: 'prompt_required',
-        message: 'Trust the remote SSH host key',
-      },
-    });
-  });
-
-  it('completes remote.ssh.bootstrapMachine.v1 when desktop prompt resolutions are provided up front', async () => {
-    const events: unknown[] = [];
-    const result = await executeSystemTask({
-      spec: {
-        protocolVersion: 1,
-        kind: 'remote.ssh.bootstrapMachine.v1',
-        params: {
-          ssh: {
-            target: 'dev@example.test',
-            auth: 'agent',
-          },
-          relay: {
-            relayUrl: 'https://relay.example.test',
-          },
-          serviceMode: 'user',
-          promptResolution: {
-            hostTrust: {
-              kind: 'ssh.trustHost',
-              fingerprint: 'SHA256:test',
-            },
-            authApproval: {
-              publicKey: 'pub-key',
-            },
-          },
-        },
-      },
-      taskId: 'task_bootstrap_2',
-      registry: createHsetupSystemTaskRegistry({
-        remoteSshBootstrap: {
-          async resolveHostTrust() {
-            return {
-              status: 'prompt',
-              promptKind: 'ssh.trustHost',
-              promptMessage: 'Trust the remote SSH host key',
-              promptData: {
-                host: 'example.test',
-                fingerprint: 'SHA256:test',
-              },
-              accept: async () => undefined,
-            };
-          },
-          async installRemoteCli() {},
-          async approveLocalAuthRequest() {},
-          async runRemoteCommand({ label }) {
-            if (label === 'auth.status') {
-              return { ok: true, data: { authenticated: false } };
-            }
-            if (label === 'server.configure') {
-              return { ok: true, data: { configured: true } };
-            }
-            if (label === 'auth.request') {
-              return { ok: true, data: { publicKey: 'pub-key' } };
-            }
-            if (label === 'auth.wait') {
-              return { ok: true, data: { machineId: 'machine-remote-1' } };
-            }
-            if (label === 'daemon.service.install') {
-              return { ok: true, data: { installed: true } };
-            }
-            if (label === 'daemon.service.start') {
-              return { ok: true, data: { started: true } };
-            }
-            throw new Error(`Unexpected remote command: ${label}`);
-          },
-        },
-      }),
-      now: () => 1700000000000,
-      emitEvent(event) {
-        events.push(event);
-      },
-    });
-
-    expect(events.map((event) => (event as { stepId?: string }).stepId)).toEqual([
-      'ssh.trust',
-      'ssh.installCli',
-      'ssh.auth.request',
-      'ssh.auth.wait',
-      'ssh.complete',
-    ]);
-    expect(result).toEqual({
-      protocolVersion: 1,
-      taskId: 'task_bootstrap_2',
-      ok: true,
-      data: {
-        publicKey: 'pub-key',
-        machineId: 'machine-remote-1',
-      },
-    });
   });
 
   it('runs secureAccess.tailscale.v1 with the existing tailnet-only serve URL when tailscale is already ready', async () => {
@@ -1553,6 +928,67 @@ describe('createHsetupSystemTaskRegistry', () => {
       restoreEnvVar('HAPPIER_TAILSCALE_BIN', previousTailscaleBin);
       restoreEnvVar('HAPPIER_TAILSCALE_INSTALL_MODE', previousInstallMode);
       vi.unstubAllGlobals();
+    }
+  });
+});
+
+const posixDescribe = process.platform === 'win32' ? describe.skip : describe;
+
+posixDescribe('createHsetupSystemTaskRegistry cli.pathExposure kinds', () => {
+  it('adds the managed CLI bin dir to the shell profile through the registry and removes it again', async () => {
+    const homeDir = mkdtempSync(join(tmpdir(), 'hsetup-registry-cli-path-'));
+    const previousHome = process.env.HOME;
+    const previousShell = process.env.SHELL;
+    const previousHappierHome = process.env.HAPPIER_HOME_DIR;
+    const previousNoPathUpdate = process.env.HAPPIER_NO_PATH_UPDATE;
+    const previousPath = process.env.PATH;
+    const zshrcPath = join(homeDir, '.zshrc');
+    writeFileSync(zshrcPath, '# mine\n', 'utf8');
+    try {
+      process.env.HOME = homeDir;
+      process.env.SHELL = '/bin/zsh';
+      process.env.HAPPIER_HOME_DIR = join(homeDir, '.happier');
+      process.env.PATH = '';
+      delete process.env.HAPPIER_NO_PATH_UPDATE;
+      const registry = createHsetupSystemTaskRegistry();
+      const params = { surface: 'desktop.ui', target: { kind: 'local' }, mode: 'user' };
+
+      const ensured = await executeSystemTask({
+        spec: { protocolVersion: 1, kind: 'cli.pathExposure.ensure.v1', params },
+        taskId: 'task_cli_path_ensure_1',
+        registry,
+        now: () => 1700000000000,
+        emitEvent() {},
+      });
+      expect(ensured).toEqual({
+        protocolVersion: 1,
+        taskId: 'task_cli_path_ensure_1',
+        ok: true,
+        data: {
+          changed: true,
+          shellReloadHint: expect.stringContaining(zshrcPath),
+          failure: null,
+          existingCommand: null,
+        },
+      });
+      expect(readFileSync(zshrcPath, 'utf8')).toContain(`export PATH="${join(homeDir, '.happier', 'bin')}:$PATH"`);
+
+      const removed = await executeSystemTask({
+        spec: { protocolVersion: 1, kind: 'cli.pathExposure.remove.v1', params },
+        taskId: 'task_cli_path_remove_1',
+        registry,
+        now: () => 1700000000000,
+        emitEvent() {},
+      });
+      expect(removed).toMatchObject({ ok: true, data: { removed: true, failure: null } });
+      expect(readFileSync(zshrcPath, 'utf8')).toBe('# mine\n');
+    } finally {
+      restoreEnvVar('HOME', previousHome);
+      restoreEnvVar('SHELL', previousShell);
+      restoreEnvVar('HAPPIER_HOME_DIR', previousHappierHome);
+      restoreEnvVar('HAPPIER_NO_PATH_UPDATE', previousNoPathUpdate);
+      restoreEnvVar('PATH', previousPath);
+      rmSync(homeDir, { recursive: true, force: true });
     }
   });
 });

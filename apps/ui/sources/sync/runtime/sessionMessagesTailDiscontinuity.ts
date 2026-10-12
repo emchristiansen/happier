@@ -18,11 +18,32 @@
  * Stacked resets (another large gap while a hole is still open) keep the DEEPEST prefix:
  * the walk restarts from the newest island and must bridge all the way down. Intermediate
  * islands are re-covered by the walk via the seq-merge dedupe.
+ *
+ * Opaque sources use the same record lifecycle with their existing older-page cursor.
+ * Raw source IDs certify overlap; materialized IDs only locate the connected display
+ * suffix, since several source rows can be absorbed into one rendered message.
  */
-export type SessionMessagesTailDiscontinuity = Readonly<{
+export type SequenceSessionMessagesTailDiscontinuity = Readonly<{
+    kind: 'seq';
     prefixMaxSeq: number;
     walkCursor: number;
 }>;
+
+export type OpaqueSessionMessagesTailDiscontinuity = Readonly<{
+    kind: 'opaque';
+    /** Raw source witnesses, never reducer/display identities. */
+    prefixMessageIds: readonly string[];
+    prefixMaterializedMessageIds: readonly string[];
+    walkCursor: string | null;
+    boundaryMessageIds: readonly string[];
+}>;
+
+export type SessionMessagesTailDiscontinuity = SequenceSessionMessagesTailDiscontinuity | OpaqueSessionMessagesTailDiscontinuity;
+
+/** Display-only projection of the same gap; cursors remain owned by Sync. */
+export type SessionMessagesTailBoundary =
+    | Readonly<{ kind: 'seq'; seq: number }>
+    | Readonly<{ kind: 'messageIds'; messageIds: readonly string[] }>;
 
 function normalizeSeq(value: unknown): number | null {
     if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return null;
@@ -30,10 +51,10 @@ function normalizeSeq(value: unknown): number | null {
 }
 
 export function openTailDiscontinuityFromSnapshot(params: Readonly<{
-    prev: SessionMessagesTailDiscontinuity | null;
+    prev: SequenceSessionMessagesTailDiscontinuity | null;
     prefixMaxSeq: number;
     snapshotMinSeq: number;
-}>): SessionMessagesTailDiscontinuity | null {
+}>): SequenceSessionMessagesTailDiscontinuity | null {
     const prefixMaxSeq = normalizeSeq(params.prefixMaxSeq);
     const snapshotMinSeq = normalizeSeq(params.snapshotMinSeq);
     // No prior materialized content: the snapshot IS the contiguous suffix.
@@ -43,16 +64,17 @@ export function openTailDiscontinuityFromSnapshot(params: Readonly<{
     if (snapshotMinSeq <= prefixMaxSeq + 1) return params.prev;
 
     return {
+        kind: 'seq',
         prefixMaxSeq: params.prev ? params.prev.prefixMaxSeq : prefixMaxSeq,
         walkCursor: snapshotMinSeq,
     };
 }
 
 export function applyTailDiscontinuityOlderPage(params: Readonly<{
-    prev: SessionMessagesTailDiscontinuity;
+    prev: SequenceSessionMessagesTailDiscontinuity;
     pageMinSeq: number | null;
     nextBeforeSeq: number | null;
-}>): SessionMessagesTailDiscontinuity | null {
+}>): SequenceSessionMessagesTailDiscontinuity | null {
     const pageMinSeq = normalizeSeq(params.pageMinSeq);
     const nextBeforeSeq = normalizeSeq(params.nextBeforeSeq);
     // Empty terminal page: nothing exists below the walk cursor any more (server-side
@@ -66,5 +88,65 @@ export function applyTailDiscontinuityOlderPage(params: Readonly<{
     const walkCursor = Math.min(params.prev.walkCursor, candidate);
     if (walkCursor <= params.prev.prefixMaxSeq + 1) return null;
     if (walkCursor === params.prev.walkCursor) return params.prev;
-    return { prefixMaxSeq: params.prev.prefixMaxSeq, walkCursor };
+    return { kind: 'seq', prefixMaxSeq: params.prev.prefixMaxSeq, walkCursor };
+}
+
+function intersects(left: readonly string[], right: readonly string[]): boolean {
+    const ids = new Set(left);
+    return right.some((id) => ids.has(id));
+}
+
+function islandBoundaryIds(prefixIds: readonly string[], pageIds: readonly string[]): readonly string[] {
+    const prefix = new Set(prefixIds);
+    return [...new Set(pageIds)].filter((id) => !prefix.has(id));
+}
+
+export function openTailDiscontinuityFromOpaqueSnapshot(params: Readonly<{
+    prev: OpaqueSessionMessagesTailDiscontinuity | null;
+    prefixMessageIds: readonly string[];
+    prefixMaterializedMessageIds: readonly string[];
+    snapshotMessageIds: readonly string[];
+    snapshotMaterializedMessageIds: readonly string[];
+    nextCursor: string | null;
+}>): OpaqueSessionMessagesTailDiscontinuity | null {
+    const prefixMessageIds = params.prev?.prefixMessageIds ?? params.prefixMessageIds;
+    if (intersects(prefixMessageIds, params.snapshotMessageIds)) return null;
+    // Overlap with the currently accepted island does not restart an older open walk.
+    if (intersects(params.prefixMessageIds, params.snapshotMessageIds)) return params.prev;
+    if (prefixMessageIds.length === 0 || params.snapshotMessageIds.length === 0) return params.prev;
+    const prefixMaterializedMessageIds = params.prev?.prefixMaterializedMessageIds ?? params.prefixMaterializedMessageIds;
+    return {
+        kind: 'opaque',
+        prefixMessageIds,
+        prefixMaterializedMessageIds,
+        walkCursor: params.nextCursor,
+        // A rewritten tool result can update a prefix row without bridging the source hole.
+        boundaryMessageIds: islandBoundaryIds(prefixMaterializedMessageIds, params.snapshotMaterializedMessageIds),
+    };
+}
+
+export function applyTailDiscontinuityOpaqueOlderPage(params: Readonly<{
+    prev: OpaqueSessionMessagesTailDiscontinuity;
+    pageMessageIds: readonly string[];
+    pageMaterializedMessageIds: readonly string[];
+    nextCursor: string | null;
+}>): OpaqueSessionMessagesTailDiscontinuity | null {
+    if (intersects(params.prev.prefixMessageIds, params.pageMessageIds)) return null;
+    if (params.nextCursor === params.prev.walkCursor) return params.prev;
+    const candidates = islandBoundaryIds(params.prev.prefixMaterializedMessageIds, params.pageMaterializedMessageIds);
+    const unchangedBoundary = candidates.length === 0 || (candidates.length === params.prev.boundaryMessageIds.length
+        && candidates.every((id, index) => id === params.prev.boundaryMessageIds[index]));
+    const boundaryMessageIds = unchangedBoundary ? params.prev.boundaryMessageIds : candidates;
+    // Terminal exhaustion stops the existing network pager, but leaves the display gap truthful.
+    return { ...params.prev, walkCursor: params.nextCursor, boundaryMessageIds };
+}
+
+/** Accepted forward rows can make an invisible island visible, but cannot bridge its source hole. */
+export function applyTailDiscontinuityOpaqueForwardPage(params: Readonly<{
+    prev: OpaqueSessionMessagesTailDiscontinuity;
+    pageMaterializedMessageIds: readonly string[];
+}>): OpaqueSessionMessagesTailDiscontinuity {
+    if (params.prev.boundaryMessageIds.length > 0) return params.prev;
+    const boundaryMessageIds = islandBoundaryIds(params.prev.prefixMaterializedMessageIds, params.pageMaterializedMessageIds);
+    return boundaryMessageIds.length === 0 ? params.prev : { ...params.prev, boundaryMessageIds };
 }

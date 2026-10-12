@@ -72,10 +72,12 @@ function resolveVendorResumeIdFromImportedClaudeSession(
 
 async function removeClaudeCredentialEntries(
   targetDir: string,
-  opts?: Readonly<{ preserveNativeCredentialFile?: boolean }>,
+  opts?: Readonly<{ preserveNativeAuthFiles?: boolean }>,
 ): Promise<void> {
   for (const entry of CLAUDE_CREDENTIAL_HOME_ENTRIES) {
-    if (opts?.preserveNativeCredentialFile === true && entry === '.credentials.json') continue;
+    // The native-auth owner reconciles these target-owned files separately. Configuration
+    // refresh must neither delete them nor import their counterparts from the source home.
+    if (opts?.preserveNativeAuthFiles === true && (entry === '.credentials.json' || entry === '.claude.json')) continue;
     await rm(join(targetDir, entry), { recursive: true, force: true });
   }
 }
@@ -408,7 +410,7 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
   targetDir: string;
   accountSettings?: AccountSettings | Readonly<Record<string, unknown>> | null;
   sessionDirectory?: string | null;
-  preserveNativeCredentialFile?: boolean | undefined;
+  preserveNativeAuthFiles?: boolean | undefined;
   sharingPolicyOverride?: ConnectedServicesProviderStateSharingPolicyV1 | null | undefined;
   vendorResumeId?: string | null | undefined;
   candidatePersistedSessionFile?: string | null | undefined;
@@ -466,7 +468,7 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
     }
 
     const removeCredentialEntriesOptions = {
-      preserveNativeCredentialFile: params.preserveNativeCredentialFile === true,
+      preserveNativeAuthFiles: params.preserveNativeAuthFiles === true,
     };
     await removeClaudeCredentialEntries(params.targetDir, removeCredentialEntriesOptions);
 
@@ -520,6 +522,7 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
       sourceEnv: params.sourceEnv,
       targetDir: params.targetDir,
       sessionDirectory: params.sessionDirectory ?? process.cwd(),
+      preserveExistingOauthAccountProjection: params.preserveNativeAuthFiles === true,
     });
     await writeConnectedServiceStateSharingManifest(params.targetDir, {
       ...applyResult.manifest,

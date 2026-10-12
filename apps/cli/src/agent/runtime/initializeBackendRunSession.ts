@@ -18,6 +18,7 @@ import {
 import { mergeSessionMetadataForStartup } from '@/agent/runtime/mergeSessionMetadataForStartup'
 import { readSessionAttachMetadataIdentityPolicyFromEnv } from '@/agent/runtime/readSessionAttachMetadataIdentityPolicyFromEnv'
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers'
+import { claimSessionRunnerOwnership } from '@/daemon/sessionRunnerLock'
 import { createSessionRuntimeActivity } from '@/session/runtimeActivity/createSessionRuntimeActivity'
 import type {
   RuntimeActivityApplicability,
@@ -31,6 +32,7 @@ import {
   reportSessionToDaemonIfRunning,
   sendTerminalFallbackMessageIfNeeded,
 } from '@/agent/runtime/startupSideEffects'
+import { bindHerdrAgentIfNeeded } from '@/integrations/herdr/bindManagedSession'
 import {
   createPendingFirstInputCommitter,
 } from '@/daemon/spawn/pendingFirstInput'
@@ -42,6 +44,8 @@ export interface InitializeBackendRunSessionOptions {
   state: AgentState
   existingSessionId?: string
   uiLogPrefix: string
+  /** Present only when this runner's own terminal represents the agent session. */
+  terminalAgentLabel?: string
   startupMetadataOverrides: {
     permissionModeOverride: PermissionModeOverride
     acpSessionModeOverride?: AcpSessionModeOverride
@@ -247,6 +251,8 @@ export async function initializeBackendRunSession(
     ?? readSessionAttachMetadataIdentityPolicyFromEnv()
     ?? null
   const terminal = opts.metadata.terminal
+  const terminalAgentBindingRequiresDaemonAttachment = terminal?.mode === 'herdr'
+    && (!terminal.herdr?.sessionName || !terminal.herdr.socketPath || !terminal.herdr.terminalId)
   const startDaemonReport = async (sessionId: string, metadata: Metadata, mode: DaemonReportMode): Promise<void> => {
     const reportPromise = (async () => {
       await opts.waitForDaemonReportReadiness?.()
@@ -273,19 +279,32 @@ export async function initializeBackendRunSession(
     metadata: Metadata,
     daemonReportMode: DaemonReportMode,
   ): Promise<void> => {
+    const bindTerminalAgent = async () => {
+      if (!opts.terminalAgentLabel) return
+      await bindHerdrAgentIfNeeded({
+        session: sessionToUse,
+        sessionId,
+        agent: opts.terminalAgentLabel,
+        terminal,
+      })
+    }
     if (startupSideEffectsOrder === 'persist-first') {
-      await persistTerminalAttachmentInfoIfNeededFn({ sessionId, terminal })
+      await persistTerminalAttachmentInfoIfNeededFn({ sessionId, terminal, startedBy: opts.metadata.startedBy })
+      if (!terminalAgentBindingRequiresDaemonAttachment) await bindTerminalAgent()
       sendTerminalFallbackMessageIfNeededFn({ session: sessionToUse, terminal })
       await startDaemonReport(sessionId, metadata, daemonReportMode)
+      if (terminalAgentBindingRequiresDaemonAttachment) await bindTerminalAgent()
       return
     }
 
     await startDaemonReport(sessionId, metadata, daemonReportMode)
-    await persistTerminalAttachmentInfoIfNeededFn({ sessionId, terminal })
+    await persistTerminalAttachmentInfoIfNeededFn({ sessionId, terminal, startedBy: opts.metadata.startedBy })
+    await bindTerminalAgent()
     sendTerminalFallbackMessageIfNeededFn({ session: sessionToUse, terminal })
   }
 
   if (existingSessionId) {
+    await claimSessionRunnerOwnership(existingSessionId)
     const baseSession = await createBaseSessionForAttachFn({
       existingSessionId,
       metadata: opts.metadata,
@@ -356,6 +375,7 @@ export async function initializeBackendRunSession(
     metadata: opts.metadata,
     state: opts.state,
   })
+  if (response) await claimSessionRunnerOwnership(response.id)
 
   if (!response && !opts.allowOfflineStub) {
     throw new Error('Failed to create session')

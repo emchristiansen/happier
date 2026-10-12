@@ -227,9 +227,9 @@ describe('core e2e: daemon tmux spawn → attach → Claude remote↔local switc
       // Assert tmux now has the target window active.
       const parts = target.split(':');
       expect(parts.length).toBeGreaterThanOrEqual(2);
-      const windowName = parts[1];
-      expect(windowName.length).toBeGreaterThan(0);
-      const windows = spawnSync('tmux', ['list-windows', '-t', tmuxSessionName, '-F', '#{window_active} #{window_name}'], {
+      const windowId = parts[1];
+      expect(windowId).toMatch(/^@\d+$/);
+      const windows = spawnSync('tmux', ['list-windows', '-t', tmuxSessionName, '-F', '#{window_active} #{window_id}'], {
         env: { ...process.env, TMUX_TMPDIR: tmuxTmpDir, TMUX: `${socketPath},0,0` },
         encoding: 'utf8',
       });
@@ -239,7 +239,7 @@ describe('core e2e: daemon tmux spawn → attach → Claude remote↔local switc
         .map((l) => l.trim())
         .filter(Boolean)
         .find((l) => l.startsWith('1 '));
-      expect(active).toBe(`1 ${windowName}`);
+      expect(active).toBe(`1 ${windowId}`);
 
       // Switch remote → local via encrypted RPC, then verify local Claude spawn occurred (fake logs).
       const ui = createUserScopedSocketCollector(server.baseUrl, auth.token);

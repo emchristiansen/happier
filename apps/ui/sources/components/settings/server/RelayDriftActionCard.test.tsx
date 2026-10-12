@@ -59,7 +59,7 @@ function createSnapshot(overrides: Partial<SystemTaskRunState> = {}): SystemTask
     return {
         taskId: 'task_1',
         status: 'running',
-        currentStepId: 'relay.connectBackgroundService.configureRelay',
+        currentStepId: 'setup.thisComputer.configureRelay',
         latestMessage: 'executor message',
         awaitingInput: false,
         cancelRequested: false,
@@ -89,7 +89,7 @@ describe('RelayDriftActionCard', () => {
 
         expect(screen.findByTestId('relay-drift-banner')).toBeTruthy();
         expect(screen.findByTestId('system-task-progress-card')).toBeTruthy();
-        expect(screen.findByTestId('system-task-step-label')?.props.children).toBe('server.relayDrift.progressStepConfigureRelay');
+        expect(screen.findByTestId('system-task-step-label')?.props.children).toBe('settings.machineSetupStageConnect');
         expect(screen.findByTestId('system-task-message')?.props.children).toBe('executor message');
         const textNodes = screen.tree.findAllByType('Text' as any);
         expect(textNodes.some((node: any) => node.props.children === 'server.relayDrift.progressTitle')).toBe(true);

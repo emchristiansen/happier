@@ -35,7 +35,7 @@ export const claudeDirectSessionProviderOps: DirectSessionProviderOps = {
   },
   readAfterTranscript: async ({ source, remoteSessionId, cursor, maxBytes, maxItems }) => {
     const res = await readAfterClaudeTranscript({ source, remoteSessionId, cursor, maxBytes, maxItems });
-    return { items: res.items, nextCursor: res.nextCursor ?? null, truncated: res.truncated === true };
+    return { ...res, nextCursor: res.nextCursor ?? null, truncated: res.truncated === true };
   },
   acquireFollowLease: async ({ source, remoteSessionId }) => createPollingDirectSessionFollowLease({
     readAfterTranscript: ({ cursor, maxBytes, maxItems }) =>

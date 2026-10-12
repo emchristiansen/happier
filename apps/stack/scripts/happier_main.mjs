@@ -25,9 +25,11 @@ import {
 } from './runtime/launch/resolveCliRuntimeLaunchSpec.mjs';
 import { resolveJavaScriptRuntimeCommand } from '@happier-dev/cli-common/providers/managedJavaScriptRuntime';
 import {
+  assertStackServerProfileReconciled,
   buildStackServerProfileSetArgs,
   deriveEnvServerIdFromUrl,
   readActiveServerUrlsFromCliSettings,
+  shouldVerifyStackServerProfileReconciliation,
 } from './utils/stack/server_profile_reconciliation.mjs';
 
 function isNodeRuntimeEntrypoint(entrypoint) {
@@ -39,6 +41,7 @@ function runCliProfileReconciliation({ resolvedCli, env, cliHomeDir, internalSer
   const serverId = String(env.HAPPIER_ACTIVE_SERVER_ID ?? '').trim();
   if (!serverId) return;
   const args = buildStackServerProfileSetArgs({ serverId, internalServerUrl, publicServerUrl });
+  const verifyPersistedProfile = shouldVerifyStackServerProfileReconciliation(cliHomeDir);
   const reconciliationEnv = { ...env, HAPPIER_DEFER_SERVER_SELECTION_FOLLOW_UP: '1' };
   const result =
     resolvedCli.kind === 'runtime'
@@ -50,6 +53,14 @@ function runCliProfileReconciliation({ resolvedCli, env, cliHomeDir, internalSer
   if (result.error || result.status !== 0) {
     const detail = result.error instanceof Error ? result.error.message : `exit=${result.status ?? 'unknown'}`;
     throw new Error(`[happier] failed to refresh the stack-owned relay profile before launch (${detail}).`);
+  }
+  if (verifyPersistedProfile) {
+    assertStackServerProfileReconciled({
+      homeDir: cliHomeDir,
+      serverId,
+      internalServerUrl,
+      publicServerUrl,
+    });
   }
 }
 

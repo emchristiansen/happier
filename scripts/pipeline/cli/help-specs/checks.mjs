@@ -30,7 +30,7 @@ export const COMMAND_HELP_CHECKS = {
   },
 
   checks: {
-    summary: 'Run the local CI check suite (parity with GitHub Actions).',
+    summary: 'Run selected local checks and report all independent failures.',
     usage:
       'node scripts/pipeline/run.mjs checks --profile <none|fast|full|custom> [--custom-checks <csv>] [--install-deps <auto|true|false>] [--dry-run]',
     options: [
@@ -41,6 +41,9 @@ export const COMMAND_HELP_CHECKS = {
     ],
     bullets: [
       'Use this when iterating on CI locally instead of waiting for GitHub runners.',
+      'Custom selects exactly the named lanes: unit,integration,typecheck,release_contracts,ui_e2e,e2e_core,e2e_core_slow,server_db_contract,stress,build_website,build_docs,cli_smoke_linux,release_assets_e2e,self_host_systemd,self_host_launchd,self_host_schtasks,self_host_daemon.',
+      'fast/full preserve local coverage; hosted fast/release/deep also select platform jobs. Self-host checks require explicit custom opt-in locally.',
+      'e2e_core_slow includes the fast core lane. release_contracts includes installer synchronization checks. Dependency installation remains a prerequisite.',
       'Uses your local toolchain; if GitHub differs, prefer running checks in a clean container/VM.',
     ],
     examples: [
@@ -63,4 +66,3 @@ export const COMMAND_HELP_CHECKS = {
     examples: ['node scripts/pipeline/run.mjs smoke-cli --skip-build false'],
   },
 };
-

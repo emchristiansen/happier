@@ -1,7 +1,10 @@
+import { writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import {
   BUG_REPORT_DEFAULT_ISSUE_OWNER,
   BUG_REPORT_DEFAULT_ISSUE_REPO,
+  buildBugReportExportBundle,
+  serializeBugReportExportBundle,
   buildBugReportFallbackIssueUrl as buildFallbackIssueUrl,
   formatBugReportFallbackIssueBody as formatFallbackIssueBody,
   appendBugReportReporterToSummary,
@@ -49,6 +52,13 @@ type BugReportSubmittedResult = {
   artifactCount: number;
 };
 
+type BugReportExportedResult = {
+  mode: 'exported';
+  outputPath: string;
+  diagnosticsIncluded: boolean;
+  artifactCount: number;
+};
+
 type BugReportFallbackResult = {
   mode: 'fallback';
   issueUrl: string;
@@ -59,7 +69,7 @@ type BugReportFallbackResult = {
   errorMessage?: string;
 };
 
-export type BugReportCommandResult = BugReportSubmittedResult | BugReportFallbackResult;
+export type BugReportCommandResult = BugReportSubmittedResult | BugReportExportedResult | BugReportFallbackResult;
 
 export type BugReportCommandDependencies = {
   getActiveServerProfile: () => Promise<Pick<ServerProfile, 'id' | 'name' | 'serverUrl' | 'webappUrl'>>;
@@ -75,6 +85,7 @@ export type BugReportCommandDependencies = {
   }) => Promise<{ issues: BugReportSimilarIssue[] }>;
   isInteractiveTerminal: () => boolean;
   promptInput: (question: string) => Promise<string>;
+  writeExportFile: (path: string, contents: string) => Promise<void>;
 };
 
 const DEFAULT_DEPS: BugReportCommandDependencies = {
@@ -92,6 +103,9 @@ const DEFAULT_DEPS: BugReportCommandDependencies = {
     }),
   isInteractiveTerminal,
   promptInput,
+  writeExportFile: async (path, contents) => {
+    await writeFile(path, contents, 'utf8');
+  },
 };
 
 async function resolveRequiredField(input: {
@@ -282,7 +296,7 @@ export async function runBugReportCommand(
     return result;
   };
 
-  if (!feature.enabled || !providerUrl) {
+  if ((!feature.enabled || !providerUrl) && !parsed.exportPath) {
     return buildFallback(
       featureFetchError ? 'feature-fetch-failed' : 'feature-disabled',
       featureFetchError,
@@ -290,13 +304,14 @@ export async function runBugReportCommand(
   }
 
   let existingIssueNumber: number | undefined = parsed.existingIssueNumber ?? undefined;
-  if (!existingIssueNumber && interactive && !parsed.skipSimilarIssues) {
+  if (providerUrl && !existingIssueNumber && interactive && !parsed.skipSimilarIssues) {
     const query = [title, summary, currentBehavior ?? '', expectedBehavior ?? '']
       .map((part) => String(part).trim())
       .filter(Boolean)
       .join('\n')
       .slice(0, 1200);
-    try {
+    if (providerUrl) {
+      try {
         const similar = await deps.searchSimilarIssues({
           providerUrl,
           owner: BUG_REPORT_DEFAULT_ISSUE_OWNER,
@@ -304,18 +319,19 @@ export async function runBugReportCommand(
           query,
           limit: 8,
         });
-      if (similar.issues.length > 0) {
-        const answer = (await deps.promptInput(formatSimilarIssuesPrompt(similar.issues))).trim();
-        if (answer) {
-          const selected = Number(answer);
-          if (!Number.isFinite(selected) || !Number.isInteger(selected) || selected <= 0) {
-            throw new Error(`Invalid issue number: ${answer}`);
+        if (similar.issues.length > 0) {
+          const answer = (await deps.promptInput(formatSimilarIssuesPrompt(similar.issues))).trim();
+          if (answer) {
+            const selected = Number(answer);
+            if (!Number.isFinite(selected) || !Number.isInteger(selected) || selected <= 0) {
+              throw new Error(`Invalid issue number: ${answer}`);
+            }
+            existingIssueNumber = selected;
           }
-          existingIssueNumber = selected;
         }
+      } catch {
+        // If search fails, proceed without blocking bug report submission.
       }
-    } catch {
-      // If search fails, proceed without blocking bug report submission.
     }
   }
 
@@ -355,10 +371,30 @@ export async function runBugReportCommand(
     },
   };
 
+  if (parsed.exportPath) {
+    const bundle = buildBugReportExportBundle({
+      form,
+      environment,
+      artifacts: diagnostics.artifacts,
+    });
+    await deps.writeExportFile(parsed.exportPath, serializeBugReportExportBundle(bundle));
+    return {
+      mode: 'exported',
+      outputPath: parsed.exportPath,
+      diagnosticsIncluded: includeDiagnostics,
+      artifactCount: diagnostics.artifacts.length,
+    };
+  }
+
+  const submitProviderUrl = providerUrl;
+  if (!submitProviderUrl) {
+    return buildFallback('feature-disabled', null);
+  }
+
   let submitted: { reportId: string; issueNumber: number; issueUrl: string };
   try {
     submitted = await deps.submitBugReport({
-      providerUrl,
+      providerUrl: submitProviderUrl,
       timeoutMs: feature.uploadTimeoutMs,
       form,
       artifacts: diagnostics.artifacts,

@@ -38,6 +38,7 @@ export function useAgentInputCoreControlHandlers(params: Readonly<{
     agentLabel?: string | null;
     hasAgentPickerOptions: boolean;
     onAgentClick?: () => void;
+    onAgentPickerIntent?: () => void;
     onPermissionModeChange?: (mode: PermissionMode) => void;
     onPermissionClick?: () => void;
     sessionModeChipInteraction?: ChipOptionInteraction<string> | null;
@@ -125,6 +126,7 @@ export function useAgentInputCoreControlHandlers(params: Readonly<{
 
     const handleAgentPress = React.useCallback(() => {
         hapticsLight();
+        params.onAgentPickerIntent?.();
         if (params.hasAgentPickerOptions) {
             params.setShowActionMenu(false);
             params.closeSelectionOverlay('permission');
@@ -136,6 +138,7 @@ export function useAgentInputCoreControlHandlers(params: Readonly<{
         params.closeSelectionOverlay,
         params.hasAgentPickerOptions,
         params.onAgentClick,
+        params.onAgentPickerIntent,
         params.setShowActionMenu,
         params.toggleSelectionOverlay,
     ]);

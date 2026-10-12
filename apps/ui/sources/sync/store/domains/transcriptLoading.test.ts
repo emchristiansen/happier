@@ -1,24 +1,33 @@
 import { describe, expect, it } from 'vitest';
+import { createStore } from 'zustand/vanilla';
 
 import { createTranscriptLoadingDomain, type TranscriptLoadingDomain } from './transcriptLoading';
 
-/**
- * Minimal in-memory harness mirroring the zustand set/get contract so the domain
- * can be exercised without the full storage store. This tests the REAL domain
- * reducer/action logic (no internal mocks) per repo testing rules.
- */
 function createHarness() {
-    let state = {} as TranscriptLoadingDomain;
-    const set = (partial: TranscriptLoadingDomain | Partial<TranscriptLoadingDomain> | ((s: TranscriptLoadingDomain) => TranscriptLoadingDomain | Partial<TranscriptLoadingDomain>)) => {
-        const next = typeof partial === 'function' ? partial(state) : partial;
-        state = { ...state, ...next };
-    };
-    const get = () => state;
-    state = createTranscriptLoadingDomain<TranscriptLoadingDomain>({ set, get });
-    return { get };
+    const store = createStore<TranscriptLoadingDomain>((set, get) => createTranscriptLoadingDomain({ set, get }));
+    return { get: store.getState, subscribe: store.subscribe };
 }
 
 describe('transcriptLoading domain', () => {
+    it('keeps one stable boundary projection for equivalent sequence and identity updates', () => {
+        const { get, subscribe } = createHarness();
+        let notifications = 0;
+        subscribe(() => { notifications += 1; });
+        get().setSessionTailContiguousBoundary('s1', { kind: 'seq', seq: 5 });
+        get().setSessionTailContiguousBoundary('s1', { kind: 'seq', seq: 5 });
+        expect(get().getSessionTailContiguousFloorSeq('s1')).toBe(5);
+        get().setSessionTailContiguousBoundary('s1', { kind: 'messageIds', messageIds: ['tail'] });
+        const boundary = get().getSessionTailContiguousBoundary('s1');
+        get().setSessionTailContiguousBoundary('s1', { kind: 'messageIds', messageIds: ['tail'] });
+        expect(get().getSessionTailContiguousBoundary('s1')).toBe(boundary);
+        expect(get().getSessionTailContiguousFloorSeq('s1')).toBeNull();
+        expect(get().getSessionTailContiguousBoundary('s2')).toBeNull();
+        get().setSessionTailContiguousBoundary('s1', null);
+        get().setSessionTailContiguousBoundary('s1', null);
+        expect(notifications).toBe(3);
+        expect(get().sessionTailContiguousBoundary).toEqual({});
+    });
+
     it('fails closed: unknown session is not catching up', () => {
         const { get } = createHarness();
         expect(get().isSessionCatchingUpNewer('unknown-session')).toBe(false);

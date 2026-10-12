@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createConnectedServiceSwitchDeferralQueue } from './connectedServices/sessionAuthSwitch/connectedServiceSwitchDeferralQueue';
 import {
   doesRestartCompletionProvePreviousRunnerRetired,
-  continueAfterSupersededRuntimeAuthFailure,
+  isSupersededRuntimeAuthFailure,
   settleSupersedingRuntimeAuthGenerationForSource,
   resolveConnectedServiceContinuationInterruptionForSwitch,
   resolveConnectedServiceContinuationOriginId,
@@ -75,11 +75,8 @@ describe('startDaemon connected-service continuation composition', () => {
     })).toBeNull();
   });
 
-  it('reconciles exact current account truth before continuing a superseded interrupted report', async () => {
-    const continueAfterRuntimeAuthSwitch = vi.fn(async () => {});
-    const reconcileCurrentRuntimeAuthTarget = vi.fn(async () => true);
-
-    await expect(continueAfterSupersededRuntimeAuthFailure({
+  it('keeps a tuple-mismatch superseded report passive', async () => {
+    expect(isSupersededRuntimeAuthFailure({
       result: {
         status: 'recovery_superseded',
         reason: 'source_tuple_mismatch',
@@ -87,72 +84,11 @@ describe('startDaemon connected-service continuation composition', () => {
         groupId: 'group-a',
         profileId: 'profile-stale',
       },
-      sessionId: 'session-1',
-      interruptedOriginId: 'runtime-auth-report:origin-a',
-      continueAfterRuntimeAuthSwitch,
-      reconcileCurrentRuntimeAuthTarget,
-    })).resolves.toBe(true);
-
-    expect(reconcileCurrentRuntimeAuthTarget).toHaveBeenCalledWith({
-      sessionId: 'session-1',
-      serviceId: 'openai-codex',
-      groupId: 'group-a',
-    });
-    expect(continueAfterRuntimeAuthSwitch).toHaveBeenCalledOnce();
-    expect(continueAfterRuntimeAuthSwitch).toHaveBeenCalledWith({
-      sessionId: 'session-1',
-      attemptId: 'runtime-auth-report:origin-a',
-      action: 'hot_applied',
-    });
+    })).toBe(true);
   });
 
-  it('keeps a superseded interrupted report passive when exact current account truth is not adopted', async () => {
-    const continueAfterRuntimeAuthSwitch = vi.fn(async () => {});
-
-    await expect(continueAfterSupersededRuntimeAuthFailure({
-      result: {
-        status: 'recovery_superseded',
-        reason: 'source_tuple_mismatch',
-        serviceId: 'openai-codex',
-        groupId: 'group-a',
-        profileId: 'profile-stale',
-      },
-      sessionId: 'session-1',
-      interruptedOriginId: 'runtime-auth-report:origin-a',
-      continueAfterRuntimeAuthSwitch,
-      reconcileCurrentRuntimeAuthTarget: async () => false,
-    })).resolves.toBe(true);
-
-    expect(continueAfterRuntimeAuthSwitch).not.toHaveBeenCalled();
-  });
-
-  it('reconciles a superseded runtime even when there is no continuation origin to enqueue', async () => {
-    const continueAfterRuntimeAuthSwitch = vi.fn(async () => {});
-    const reconcileCurrentRuntimeAuthTarget = vi.fn(async () => true);
-
-    await expect(continueAfterSupersededRuntimeAuthFailure({
-      result: {
-        status: 'recovery_superseded',
-        reason: 'source_tuple_mismatch',
-        serviceId: 'openai-codex',
-        groupId: 'group-a',
-        profileId: 'profile-stale',
-      },
-      sessionId: 'session-1',
-      interruptedOriginId: null,
-      continueAfterRuntimeAuthSwitch,
-      reconcileCurrentRuntimeAuthTarget,
-    })).resolves.toBe(true);
-
-    expect(reconcileCurrentRuntimeAuthTarget).toHaveBeenCalledOnce();
-    expect(continueAfterRuntimeAuthSwitch).not.toHaveBeenCalled();
-  });
-
-  it('reconciles current group truth before continuing an identity-poor interrupted report', async () => {
-    const continueAfterRuntimeAuthSwitch = vi.fn(async () => {});
-    const reconcileCurrentRuntimeAuthTarget = vi.fn(async () => true);
-
-    await expect(continueAfterSupersededRuntimeAuthFailure({
+  it('keeps an identity-poor superseded report passive', async () => {
+    expect(isSupersededRuntimeAuthFailure({
       result: {
         status: 'recovery_superseded',
         reason: 'source_tuple_unavailable',
@@ -160,42 +96,7 @@ describe('startDaemon connected-service continuation composition', () => {
         groupId: 'group-a',
         profileId: 'profile-stale',
       },
-      sessionId: 'session-1',
-      interruptedOriginId: 'runtime-auth-report:origin-a',
-      continueAfterRuntimeAuthSwitch,
-      reconcileCurrentRuntimeAuthTarget,
-    })).resolves.toBe(true);
-
-    expect(reconcileCurrentRuntimeAuthTarget).toHaveBeenCalledWith({
-      sessionId: 'session-1',
-      serviceId: 'openai-codex',
-      groupId: 'group-a',
-    });
-    expect(continueAfterRuntimeAuthSwitch).toHaveBeenCalledWith({
-      sessionId: 'session-1',
-      attemptId: 'runtime-auth-report:origin-a',
-      action: 'hot_applied',
-    });
-  });
-
-  it('keeps an identity-poor report passive when current group truth cannot be reconciled', async () => {
-    const continueAfterRuntimeAuthSwitch = vi.fn(async () => {});
-
-    await expect(continueAfterSupersededRuntimeAuthFailure({
-      result: {
-        status: 'recovery_superseded',
-        reason: 'source_tuple_unavailable',
-        serviceId: 'openai-codex',
-        groupId: 'group-a',
-        profileId: 'profile-stale',
-      },
-      sessionId: 'session-1',
-      interruptedOriginId: 'runtime-auth-report:origin-a',
-      continueAfterRuntimeAuthSwitch,
-      reconcileCurrentRuntimeAuthTarget: async () => false,
-    })).resolves.toBe(true);
-
-    expect(continueAfterRuntimeAuthSwitch).not.toHaveBeenCalled();
+    })).toBe(true);
   });
 
   it('reconsumes a superseding runtime-auth target through the existing generation consumer', async () => {

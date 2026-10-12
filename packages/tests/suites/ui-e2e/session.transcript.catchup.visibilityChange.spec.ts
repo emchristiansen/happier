@@ -179,9 +179,6 @@ test.describe('ui e2e: transcript background/foreground catch-up (visibility)', 
       extraEnv: {
         HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys,providers.claude.unifiedTerminal',
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
       },
     });
 
@@ -220,7 +217,7 @@ test.describe('ui e2e: transcript background/foreground catch-up (visibility)', 
   });
 
   test('catches up transcript after simulated tab hidden/visible', async ({ page }) => {
-    test.setTimeout(540_000);
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
     await installViewportTelemetryOverride(page);
@@ -361,8 +358,10 @@ test.describe('ui e2e: transcript background/foreground catch-up (visibility)', 
     const transcript = page.getByTestId('transcript-chat-list');
     await transcript.hover();
 
-    // Seed enough messages to make the list scrollable.
-    for (let i = 0; i < 24; i += 1) {
+    // Seed a bounded number of messages to make the list scrollable. Each message is sent through
+    // the real CLI boundary, so keeping this to the minimum useful set avoids spending the whole
+    // test budget on repeated process startup while preserving the unpinned/JTB contract below.
+    for (let i = 0; i < 12; i += 1) {
       const message = `seed scroll ${i} ${run.runId}`;
       const sendEnvelope = await runCliJson({
         testDir,

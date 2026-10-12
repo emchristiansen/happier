@@ -1,12 +1,18 @@
+import * as childProcess from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { waitFor } from '../timing';
 import { isProcessAlive, terminateProcessTreeByPid } from './processTree';
 import { spawnLoggedProcess } from './spawnProcess';
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof childProcess>();
+  return { ...actual, spawnSync: vi.fn(actual.spawnSync) };
+});
 
 async function waitForMarker(path: string, timeoutMs = 10_000): Promise<{ childPid: number; grandchildPid: number }> {
   const deadline = Date.now() + timeoutMs;
@@ -29,6 +35,39 @@ async function waitForMarker(path: string, timeoutMs = 10_000): Promise<{ childP
 }
 
 describe('spawnLoggedProcess', () => {
+  it('bounds steady-state process-table scans while retaining descendant cleanup', async () => {
+    if (process.platform === 'win32') return;
+
+    const rootDir = await mkdtemp(join(tmpdir(), 'happier-spawn-observation-'));
+    // The OS process-list boundary is empty; the polling and cleanup lifecycle stay real.
+    const snapshot = vi.mocked(childProcess.spawnSync).mockReturnValue({
+      pid: 0, output: [null, '', null], stdout: '', stderr: '', status: 0, signal: null,
+    });
+    vi.useFakeTimers();
+    const proc = spawnLoggedProcess({
+      command: process.execPath,
+      args: ['-e', 'setInterval(() => {}, 1000)'],
+      cwd: rootDir,
+      stdoutPath: join(rootDir, 'stdout.log'),
+      stderrPath: join(rootDir, 'stderr.log'),
+    });
+
+    try {
+      vi.advanceTimersByTime(1_000);
+      expect(snapshot.mock.calls.length).toBeGreaterThan(0);
+      snapshot.mockClear();
+      vi.advanceTimersByTime(1_000);
+      // Reuse the established 0.3 steady observation budget: four snapshots/second.
+      expect(snapshot.mock.calls.length).toBeGreaterThan(0);
+      expect(snapshot.mock.calls.length).toBeLessThanOrEqual(4);
+    } finally {
+      vi.useRealTimers();
+      snapshot.mockRestore();
+      await proc.stop();
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
   it('stops detached descendants even after the direct child has already exited', async () => {
     if (process.platform === 'win32') {
       return;

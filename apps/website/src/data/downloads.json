@@ -31,7 +31,7 @@
     "androidApkUrl": "https://github.com/happier-dev/happier/releases/download/ui-mobile-stable/happier-android.apk",
     "androidPlayTestingOptInUrl": "https://play.google.com/apps/testing/dev.happier.app",
     "androidPlayUrl": "https://play.google.com/store/apps/details?id=dev.happier.app",
-    "webAppUrl": "https://app.happier.dev/",
+    "webAppUrl": "https://cloud.happier.dev/",
     "docsUrl": "https://docs.happier.dev/",
     "guidesUrl": "https://guides.happier.dev/",
     "githubRepoUrl": "https://github.com/happier-dev/happier",

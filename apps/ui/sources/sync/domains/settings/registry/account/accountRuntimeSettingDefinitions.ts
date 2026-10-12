@@ -153,6 +153,12 @@ export const ExecutionRunsGuidanceEntrySchema = z.object({
 });
 
 export const ACCOUNT_RUNTIME_SETTING_DEFINITIONS = defineSettingDefinitions({
+    sessionTerminalHostByMachineId: {
+        schema: z.record(z.string(), z.enum(['zellij', 'herdr'])).default({}),
+        default: {},
+        description: 'Per-machine non-tmux terminal hosts; legacy tmux selections remain authoritative',
+        storageScope: 'account',
+    },
     sessionReplaySummaryRunnerV1: {
         schema: LlmTaskRunnerConfigV1Schema.nullable(),
         default: null,

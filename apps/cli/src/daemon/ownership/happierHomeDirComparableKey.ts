@@ -1,3 +1,9 @@
+/** Unknown homes never establish authority over an installed service. */
+export function happierHomeDirsMatch(left: string | null | undefined, right: string | null | undefined): boolean {
+  const leftKey = resolveHappierHomeDirComparableKey(left);
+  return leftKey !== null && leftKey === resolveHappierHomeDirComparableKey(right);
+}
+
 export function resolveHappierHomeDirComparableKey(homeDir: string | null | undefined): string | null {
   let value = String(homeDir ?? '').trim();
   if (!value) {

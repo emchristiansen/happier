@@ -335,6 +335,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
 
     const snapshot = await fetcher.fetch({ record, now, signal: new AbortController().signal });
     expect(snapshot?.meters.find((meter) => meter.meterId === 'seven_day_fable')).toMatchObject({
+      windowDurationMs: 604_800_000,
       label: 'Weekly (Fable)',
       utilizationPct: 61,
       resetsAt: Date.parse('2026-02-24T00:00:00Z'),
@@ -390,6 +391,19 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
               surface: null,
             },
           },
+          {
+            kind: 'weekly_scoped',
+            group: 'weekly',
+            percent: 31,
+            resets_at: '2026-07-07T19:59:59.748308+00:00',
+            scope: {
+              model: {
+                id: null,
+                display_name: 'Opus',
+              },
+              surface: null,
+            },
+          },
         ],
       }),
     }));
@@ -419,11 +433,21 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
 
     const snapshot = await fetcher.fetch({ record, now, signal: new AbortController().signal });
     expect(snapshot?.meters.find((meter) => meter.meterId === 'seven_day_fable')).toMatchObject({
+      providerLimitId: 'seven_day_fable',
       label: 'Weekly (Fable)',
       utilizationPct: 22,
       resetsAt: Date.parse('2026-07-07T19:59:59.748308+00:00'),
       status: 'ok',
+      details: { rawScope: 'weekly_scoped', modelDisplayName: 'Fable' },
     });
+    expect(snapshot?.meters.find((meter) => meter.meterId === 'seven_day_fable')).not.toHaveProperty('modelId');
+    expect(snapshot?.meters.find((meter) => meter.meterId === 'seven_day_opus')).toMatchObject({
+      providerLimitId: 'seven_day_opus',
+      label: 'Weekly (Opus)',
+      utilizationPct: 31,
+      details: { rawScope: 'weekly_scoped', modelDisplayName: 'Opus' },
+    });
+    expect(snapshot?.meters.find((meter) => meter.meterId === 'seven_day_opus')).not.toHaveProperty('modelId');
     expect(snapshot?.meters.find((meter) => meter.meterId === 'five_hour')).toMatchObject({
       utilizationPct: 63,
     });

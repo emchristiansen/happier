@@ -1,10 +1,13 @@
 import { chmodSync, mkdirSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import { INSTALLABLE_KEYS } from '@happier-dev/protocol';
 
 import type { Credentials } from '@/persistence';
 import { DEFAULT_MEMORY_SETTINGS, readMemorySettingsFromDisk, type MemorySettingsV1 } from '@/settings/memorySettings';
 import { configuration } from '@/configuration';
+import { subscribeOptionalRuntimeInstallSuccess } from '@/installables/runtime/optionalRuntimeInstallables';
+import { subscribeActiveAccountSettingsSnapshot } from '@/settings/accountSettings/activeAccountSettingsSnapshot';
 
 import { resolveMemoryIndexPaths } from './memoryIndexPaths';
 import { openSummaryShardIndexDb, type SummaryShardIndexDbHandle } from './summaryShardIndexDb';
@@ -163,12 +166,31 @@ export async function startMemoryWorker(params: Readonly<{
   const settingsSecretsReadKeys = deriveSettingsSecretsReadKeysForCredentials(params.credentials);
   let embeddingsDiagnostics: OperationalMemoryEmbeddingsDiagnostics =
     buildUnavailableMemoryEmbeddingsDiagnostics(DEFAULT_MEMORY_SETTINGS.embeddings);
+  let embeddingsResolutionEpoch: Readonly<{
+    settings: MemorySettingsV1;
+    promise: Promise<EmbeddingsProviderResolution | null>;
+  }> | null = null;
+  let unsubscribeOptionalRuntimeInstallSuccess = () => {};
+  let unsubscribeAccountSettingsSnapshot = () => {};
 
-  const refreshEmbeddingsDiagnostics = async (): Promise<EmbeddingsProviderResolution | null> => {
-    const embeddings = resolveOperationalMemoryEmbeddingsSettings(settings.embeddings);
+  const resolveEmbeddingsDiagnosticsForSettings = async (
+    requestedSettings: MemorySettingsV1,
+  ): Promise<EmbeddingsProviderResolution | null> => {
+    const embeddings = resolveOperationalMemoryEmbeddingsSettings(requestedSettings.embeddings);
     if (!embeddings?.enabled || !embeddings.providerConfig || !embeddings.providerKind || !embeddings.modelId) {
-      embeddingsDiagnostics = buildUnavailableMemoryEmbeddingsDiagnostics(settings.embeddings);
+      embeddingsDiagnostics = buildUnavailableMemoryEmbeddingsDiagnostics(requestedSettings.embeddings);
       return null;
+    }
+
+    if (embeddings.providerKind === 'local_transformers') {
+      embeddingsDiagnostics = {
+        mode: embeddings.mode,
+        presetId: embeddings.presetId,
+        providerKind: embeddings.providerKind,
+        modelId: embeddings.modelId,
+        runtimeState: 'downloading',
+        usingFallback: true,
+      };
     }
 
     const cacheDir = join(paths.modelsDir, 'transformers');
@@ -184,6 +206,13 @@ export async function startMemoryWorker(params: Readonly<{
       cacheDir,
       settingsSecretsReadKeys,
     });
+    if (stopped) return null;
+    if (settings !== requestedSettings) {
+      // A model download can finish writing after disable deleted its cache. Replay the
+      // same disabled-settings cleanup, without reviving the obsolete diagnostics.
+      if (!settings.enabled && settings.deleteOnDisable) await applySettings(settings);
+      return null;
+    }
     embeddingsDiagnostics = {
       mode: resolution.mode,
       presetId: resolution.presetId,
@@ -194,6 +223,41 @@ export async function startMemoryWorker(params: Readonly<{
     };
     return resolution;
   };
+
+  const refreshEmbeddingsDiagnostics = (): Promise<EmbeddingsProviderResolution | null> => {
+    const requestedSettings = settings;
+    // A settings object is one provider-resolution epoch. Periodic indexing reuses its
+    // settled failure; memory-policy publication, reload, explicit ensure, or successful
+    // runtime installation starts the next deliberate attempt.
+    if (embeddingsResolutionEpoch?.settings === requestedSettings) {
+      return embeddingsResolutionEpoch.promise;
+    }
+    const promise = resolveEmbeddingsDiagnosticsForSettings(requestedSettings);
+    embeddingsResolutionEpoch = { settings: requestedSettings, promise };
+    return promise;
+  };
+
+  const retryEmbeddingsAfterExternalStateChange = (failureMessage: string): void => {
+    if (stopped) return;
+    embeddingsResolutionEpoch = null;
+    void refreshEmbeddingsDiagnostics().catch((error: unknown) => {
+      if (stopped) return;
+      logger.warn(failureMessage, {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+  };
+
+  unsubscribeAccountSettingsSnapshot = subscribeActiveAccountSettingsSnapshot(() => {
+    if (resolveOperationalMemoryEmbeddingsSettings(settings.embeddings)?.providerKind !== 'local_transformers') return;
+    retryEmbeddingsAfterExternalStateChange('[memoryWorker] Embeddings initialization after account-settings refresh failed');
+  });
+
+  unsubscribeOptionalRuntimeInstallSuccess = subscribeOptionalRuntimeInstallSuccess((key) => {
+    if (key !== INSTALLABLE_KEYS.LOCAL_EMBEDDINGS || stopped) return;
+    if (resolveOperationalMemoryEmbeddingsSettings(settings.embeddings)?.providerKind !== 'local_transformers') return;
+    retryEmbeddingsAfterExternalStateChange('[memoryWorker] Embeddings initialization after runtime installation failed');
+  });
 
   const hasCustomDeps = Boolean(params.deps);
   const deps =
@@ -318,6 +382,10 @@ export async function startMemoryWorker(params: Readonly<{
   const stop = () => {
     if (stopped) return;
     stopped = true;
+    unsubscribeOptionalRuntimeInstallSuccess();
+    unsubscribeOptionalRuntimeInstallSuccess = () => {};
+    unsubscribeAccountSettingsSnapshot();
+    unsubscribeAccountSettingsSnapshot = () => {};
     stopLoop();
     try {
       tier1?.close();
@@ -544,7 +612,15 @@ export async function startMemoryWorker(params: Readonly<{
       deep = null;
     }
 
-    await refreshEmbeddingsDiagnostics();
+    // Provider resolution coalesces initialization and owns failure/fallback diagnostics.
+    // Do not hold daemon RPC registration or settings responses behind native/model downloads.
+    void refreshEmbeddingsDiagnostics().catch((error: unknown) => {
+      if (stopped || settings !== next) return;
+      embeddingsDiagnostics = { ...embeddingsDiagnostics, runtimeState: 'error', usingFallback: true };
+      logger.warn('[memoryWorker] Embeddings initialization failed; using keyword-search fallback', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
 
     // Background indexing runs only in daemon mode.
     if (configuration.isDaemonProcess) {

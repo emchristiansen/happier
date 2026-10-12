@@ -6,6 +6,7 @@ import {
   ExecutionRunIntentSchema,
   ExecutionRunIoModeSchema,
   ExecutionRunLaunchOriginSchema,
+  ExecutionRunRequestedConfigurationSchema,
   normalizeLegacyExecutionRunBackendTargetInput,
   ExecutionRunResumeHandleSchema,
   ExecutionRunRetentionPolicySchema,
@@ -38,6 +39,7 @@ const DaemonExecutionRunMarkerSchemaCore = z.object({
   backendTarget: BackendTargetRefSchema,
   display: ExecutionRunDisplaySchema.optional(),
   launchOrigin: ExecutionRunLaunchOriginSchema.optional(),
+  requestedConfiguration: ExecutionRunRequestedConfigurationSchema.optional(),
 
   runClass: ExecutionRunClassSchema,
   ioMode: ExecutionRunIoModeSchema,

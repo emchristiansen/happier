@@ -120,6 +120,7 @@ function buildSnapshotRequestFromQuery(query: unknown): unknown {
         "includeAllFolderAssignments",
         "includeAllTagAssignments",
         "includeAttentionStandings",
+        "includeAttentionReminderTimes",
     ]) {
         if (!addOptionalBooleanQueryField(request, key, record[key])) return { [key]: invalidQueryValue };
     }
@@ -222,7 +223,7 @@ export function registerSessionOrganizationRoutes(app: Fastify) {
             return reply.code(400).send({ error: "invalid-session-attention-standing" });
         }
 
-        const visible = parsedBody.data.standing === null
+        const visible = parsedBody.data.standing === null || parsedBody.data.remindAt === null
             ? await canAccessSyncedSessionForOrganization({
                 accountId: request.userId,
                 sessionId: parsedParams.data.sessionId,

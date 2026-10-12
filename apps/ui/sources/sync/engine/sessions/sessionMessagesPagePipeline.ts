@@ -19,6 +19,13 @@ export type SessionMessagesEncryption = {
 
 export type SessionMessagesEncryptionMode = 'e2ee' | 'plain';
 
+export class SessionMessagePageDecryptionError extends Error {
+    constructor() {
+        super('Session message page could not be fully decrypted');
+        this.name = 'SessionMessagePageDecryptionError';
+    }
+}
+
 export type DecryptedSessionMessage = Readonly<{
     id: string;
     seq?: number | null;
@@ -63,6 +70,7 @@ export type SessionMessagesPagePipelineResult = Readonly<{
     rawSeqs: readonly number[];
     normalizedMessages: readonly NormalizedMessage[];
     skippedMissingSession: boolean;
+    skippedSuperseded?: boolean;
     debugDecryptStats: Readonly<{
         fetched: number;
         toDecrypt: number;
@@ -321,6 +329,22 @@ function emptyPageForDirection(direction: MessagePageDirection): ApiSessionMessa
     };
 }
 
+function skippedPageResult(direction: MessagePageDirection, reason: 'missing-session' | 'superseded'): SessionMessagesPagePipelineResult {
+    return {
+        applied: 0,
+        page: emptyPageForDirection(direction),
+        appliedMessageIds: [],
+        appliedSeqs: [],
+        rawSeqs: [],
+        normalizedMessages: [],
+        skippedMissingSession: reason === 'missing-session',
+        skippedSuperseded: reason === 'superseded',
+        debugDecryptStats: {
+            fetched: 0, toDecrypt: 0, decryptedEntries: 0, decryptedWithContent: 0, normalized: 0, sample: null,
+        },
+    };
+}
+
 export async function runSessionMessagesPagePipeline(params: {
     sessionId: string;
     purpose: MessagePagePurpose;
@@ -328,8 +352,12 @@ export async function runSessionMessagesPagePipeline(params: {
     lifecyclePolicy: LifecyclePolicy;
     getSessionEncryption: (sessionId: string) => SessionMessagesEncryption | null;
     isSessionKnown?: (sessionId: string) => boolean;
+    shouldContinue?: () => boolean;
     request: (path: string) => Promise<Response>;
     sessionReceivedMessages: Map<string, Map<string, number>>;
+    /** Repair admits selected identities and already-known neighbors, never unseen spill. */
+    messageIds?: ReadonlySet<string>;
+    isMessageMaterialized?: (messageId: string, localId: string | null) => boolean;
     applyMessages: (sessionId: string, messages: NormalizedMessage[]) => void;
     onTaskLifecycleEvent?: (event: TaskLifecycleEvent) => void;
     onMessagesPage?: (page: ApiSessionMessagesResponse) => void;
@@ -338,25 +366,10 @@ export async function runSessionMessagesPagePipeline(params: {
 } & SessionMessagesPageOptions): Promise<SessionMessagesPagePipelineResult> {
     if (params.isSessionKnown?.(params.sessionId) === false) {
         writeSyncDebugLog(params.log, `💬 session message page: Session ${params.sessionId} is not known on this server; skipping page fetch`);
-        const page = emptyPageForDirection(params.page.direction);
-        return {
-            applied: 0,
-            page,
-            appliedMessageIds: [],
-            appliedSeqs: [],
-            rawSeqs: [],
-            normalizedMessages: [],
-            skippedMissingSession: true,
-            debugDecryptStats: {
-                fetched: 0,
-                toDecrypt: 0,
-                decryptedEntries: 0,
-                decryptedWithContent: 0,
-                normalized: 0,
-                sample: null,
-            },
-        };
+        return skippedPageResult(params.page.direction, 'missing-session');
     }
+
+    if (params.shouldContinue?.() === false) return skippedPageResult(params.page.direction, 'superseded');
 
     const encryption = resolveSessionMessagesEncryption(params);
     if (!encryption) {
@@ -368,7 +381,7 @@ export async function runSessionMessagesPagePipeline(params: {
         request: params.request,
         page: params.page,
     });
-    params.onMessagesPage?.(data);
+    if (params.shouldContinue?.() === false) return skippedPageResult(params.page.direction, 'superseded');
     recordMessagePageTelemetry(params.purpose, data.messages.length);
 
     let existingMessages = params.sessionReceivedMessages.get(params.sessionId);
@@ -379,6 +392,8 @@ export async function runSessionMessagesPagePipeline(params: {
 
     const messagesToDecrypt: ApiMessage[] = [];
     for (const msg of orderedMessagesForDirection(data.messages, params.page.direction)) {
+        if (params.messageIds && !params.messageIds.has(msg.id)
+            && !existingMessages.has(msg.id) && params.isMessageMaterialized?.(msg.id, msg.localId ?? null) !== true) continue;
         const msgUpdatedAt = typeof msg.updatedAt === 'number' ? msg.updatedAt : msg.createdAt;
         const existingUpdatedAt = existingMessages.get(msg.id);
         if (existingUpdatedAt === undefined || msgUpdatedAt > existingUpdatedAt) {
@@ -394,8 +409,20 @@ export async function runSessionMessagesPagePipeline(params: {
         messagesToDecrypt,
         params,
     );
+    if (params.shouldContinue?.() === false) return skippedPageResult(params.page.direction, 'superseded');
+
+    // A successful HTTP response is not proof that its rows were materialized. Do not
+    // move a paging cursor past an unavailable encrypted row: retry the same page.
+    if (messagesToDecrypt.some((message, index) => (
+        !decryptedMessages[index]
+        || (message.content.t === 'encrypted' && decryptedMessages[index]?.content === null)
+    ))) {
+        throw new SessionMessagePageDecryptionError();
+    }
 
     const normalizedMessages: NormalizedMessage[] = [];
+    const receivedRevisions = new Map<string, number>();
+    const lifecycleEvents: TaskLifecycleEvent[] = [];
     let decryptedWithContent = 0;
     measureMessageNormalization(params.purpose, decryptedMessages.length, () => {
         for (let i = 0; i < decryptedMessages.length; i++) {
@@ -406,16 +433,10 @@ export async function runSessionMessagesPagePipeline(params: {
             }
 
             const inputMessage = messagesToDecrypt[i];
-            const inputWasEncrypted = inputMessage?.content?.t === 'encrypted';
             const inputUpdatedAt = inputMessage
                 ? (typeof inputMessage.updatedAt === 'number' ? inputMessage.updatedAt : inputMessage.createdAt)
                 : decrypted.createdAt;
-            if (decrypted.content !== null || !inputWasEncrypted) {
-                existingMessages.set(decrypted.id, inputUpdatedAt);
-            }
-            if (inputWasEncrypted && decrypted.content === null) {
-                continue;
-            }
+            receivedRevisions.set(decrypted.id, inputUpdatedAt);
             if (isLegacyMemoryArtifactTranscriptRow(decrypted)) {
                 continue;
             }
@@ -425,7 +446,7 @@ export async function runSessionMessagesPagePipeline(params: {
             ) {
                 const lifecycleEvent = getTaskLifecycleEventFromRawContent(decrypted.content, decrypted.createdAt);
                 if (lifecycleEvent) {
-                    params.onTaskLifecycleEvent?.(lifecycleEvent);
+                    lifecycleEvents.push(lifecycleEvent);
                 }
             }
             const normalized = normalizeRawMessage(decrypted.id, decrypted.localId, decrypted.createdAt, decrypted.content, {
@@ -453,6 +474,14 @@ export async function runSessionMessagesPagePipeline(params: {
         normalizedMessages,
         params.applyMessages,
     );
+
+    for (const event of lifecycleEvents) params.onTaskLifecycleEvent?.(event);
+    for (const [id, revision] of receivedRevisions) {
+        existingMessages.set(id, Math.max(existingMessages.get(id) ?? 0, revision));
+    }
+    // Pagination, coverage, and display-floor consumers must observe committed rows,
+    // never a raw response while decryption/application is still outstanding.
+    params.onMessagesPage?.(data);
 
     return {
         applied: normalizedMessages.length,

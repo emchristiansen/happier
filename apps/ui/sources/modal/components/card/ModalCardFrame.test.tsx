@@ -258,4 +258,18 @@ describe('ModalCardFrame', () => {
         }
         expect(bodyScrollView.type).toBe('ScrollView');
     });
+
+    it('keeps card footers divider-free and scopes their buttons to the compact size', async () => {
+        const { renderScreen } = await import('@/dev/testkit');
+        const { RoundButton } = await import('@/components/ui/buttons/RoundButton');
+        const { ModalCardFrame } = await import('./ModalCardFrame');
+        const screen = await renderScreen(React.createElement(ModalCardFrame, {
+            children: React.createElement('Child'),
+            footer: React.createElement(RoundButton, { title: 'Save' }),
+        }));
+
+        expect(flattenStyle(screen.findByTestId('modal-card-footer')?.props.style).borderTopWidth).toBeUndefined();
+        const saveLabel = screen.findAllByType('Text').find((node) => node.props.children === 'Save');
+        expect(flattenStyle(saveLabel?.props.style).fontSize).toBe(14);
+    });
 });

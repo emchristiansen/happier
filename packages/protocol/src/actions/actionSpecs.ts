@@ -11,6 +11,7 @@ import { PromptAssetInstallModeV1Schema, PromptAssetScopeV1Schema } from '../pro
 import { BackendTargetKeySchema, BackendTargetRefSchema, buildBackendTargetKey, parseBackendTargetKey } from '../backendTargets/backendTargetRef.js';
 import { ExecutionRunListRequestSchema } from '../executionRunListRequest.js';
 import { ExecutionRunStartRequestSchema } from '../executionRunStartRequest.js';
+import { MAX_EXECUTION_RUN_OBSERVATION_TIMEOUT_SECONDS } from '../executionRunObservationTimeout.js';
 import { SessionRollbackTargetSchema } from '../sessionRollback.js';
 import { SessionForkRpcParamsSchema } from '../sessionFork.js';
 import { PendingFirstInputV1Schema } from '../spawnSession.js';
@@ -29,7 +30,10 @@ import { PendingRequestedActionV1Schema } from '../sessionMessages/pendingReques
 import { SessionWorkStateStatusV1Schema } from '../sessionWorkState/sessionWorkStateV1.js';
 import { STRUCTURED_QUESTION_LIMITS } from '../tools/structuredQuestionAnswersV1.js';
 import { AcpConfigOptionOverridesV1Schema } from '../sessionMetadata/metadataOverridesV1.js';
-import { SessionPermissionModeInputSchema } from '../sessionMetadata/sessionPermissionModes.js';
+import {
+  SESSION_PERMISSION_INTENT_INPUTS,
+  SessionPermissionModeInputSchema,
+} from '../sessionMetadata/sessionPermissionModes.js';
 import { AgentRuntimeDescriptorV1Schema } from '../sessionMetadata/agentRuntimeDescriptorV1.js';
 import { SessionMcpSelectionV1Schema } from '../mcpServers/sessionSelectionV1.js';
 import { ConnectedServiceBindingsV1Schema } from '../connect/connectedServiceBindings.js';
@@ -38,7 +42,7 @@ import {
   findSpawnConfigOptionAliasConflicts,
 } from './sessionSpawnConfigOptions.js';
 import {
-  EXECUTION_RUN_ACTION_PERMISSION_MODES,
+  EXECUTION_RUN_ACTION_PERMISSION_INPUTS,
   EXECUTION_RUN_ACTION_PERMISSION_MODE_DESCRIPTION,
   ExecutionRunActionPermissionModeSchema,
 } from './executionRunActionPermissionMode.js';
@@ -231,6 +235,7 @@ export const ActionSpecSchema = z.object({
     .optional(),
   prompting: ActionPromptingSchema.optional(),
   operation: ActionOperationDeclarationV1Schema.optional(),
+  sideEffectClass: z.enum(['none', 'read', 'write', 'external', 'danger']).optional(),
   toolExposure: ActionToolExposureSchema.optional(),
   contextualDefaults: ActionContextualDefaultsSchema.optional(),
   approval: ActionApprovalSchema,
@@ -260,7 +265,7 @@ const SessionTitleSetInputSchema = z.object({
 
 const SessionPermissionModeSetInputSchema = z.object({
   sessionId: z.string().min(1),
-  permissionMode: z.string().trim().min(1),
+  permissionMode: SessionPermissionModeInputSchema,
 }).passthrough();
 
 const SessionModelSetInputSchema = z.object({
@@ -448,7 +453,7 @@ const IntentStartCommonSchema = z.object({
   // A per-target entry wins over the blanket `connectedServices` for that target.
   connectedServicesByBackendTargetKey: z.record(z.string().min(1), z.unknown()).optional(),
   waitForCompletion: z.boolean().optional(),
-  waitTimeoutSeconds: z.number().int().min(1).optional(),
+  waitTimeoutSeconds: z.number().int().min(1).max(MAX_EXECUTION_RUN_OBSERVATION_TIMEOUT_SECONDS).optional(),
 }).passthrough();
 
 const PlanStartInputSchema = IntentStartCommonSchema.extend({
@@ -483,7 +488,7 @@ const ExecutionRunStartInputSchema = z.object({
   backendTarget: BackendTargetRefSchema,
   instructions: z.string().optional(),
   display: z.unknown().optional(),
-  permissionMode: z.string().min(1),
+  permissionMode: ExecutionRunActionPermissionModeSchema,
   retentionPolicy: z.enum(['ephemeral', 'resumable']),
   runClass: z.enum(['bounded', 'long_lived']),
   ioMode: z.enum(['request_response', 'streaming']),
@@ -506,7 +511,7 @@ const ExecutionRunStartInputSchema = z.object({
   // a profile default binds to that profile, a pool default binds to that pool — no silent upgrade).
   connectedServices: z.unknown().optional(),
   waitForCompletion: z.boolean().optional(),
-  waitTimeoutSeconds: z.number().int().min(1).optional(),
+  waitTimeoutSeconds: z.number().int().min(1).max(MAX_EXECUTION_RUN_OBSERVATION_TIMEOUT_SECONDS).optional(),
 }).passthrough();
 
 const ExecutionRunGetInputSchema = ExecutionRunIdInputSchema.extend({
@@ -524,8 +529,7 @@ const ExecutionRunActionInputSchema = ExecutionRunIdInputSchema.extend({
 }).passthrough();
 
 const ExecutionRunWaitInputSchema = ExecutionRunIdInputSchema.extend({
-  timeoutSeconds: z.number().int().min(1).optional(),
-  pollIntervalMs: z.number().int().min(100).max(60_000).optional(),
+  timeoutSeconds: z.number().int().min(1).max(MAX_EXECUTION_RUN_OBSERVATION_TIMEOUT_SECONDS).optional(),
 }).passthrough();
 
 const SessionOpenInputSchema = z.object({
@@ -567,12 +571,13 @@ const SessionHandoffInputSchema = z.object({
 }).passthrough();
 
 const SessionSpawnTerminalInputSchema = z.object({
-  mode: z.enum(['plain', 'tmux', 'windows_terminal', 'windows_console']).optional(),
+  mode: z.enum(['plain', 'tmux', 'zellij', 'herdr', 'windows_terminal', 'windows_console']).optional(),
   tmux: z.object({
     sessionName: z.string().optional(),
     isolated: z.boolean().optional(),
     tmpDir: z.string().nullable().optional(),
   }).strict().optional(),
+  herdr: z.object({ sessionName: z.string().optional() }).strict().optional(),
 }).strict();
 
 function normalizeSpawnTargetAlias(value: string): string {
@@ -1312,7 +1317,7 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
         {
           path: 'connectedServices',
           title: 'Connected services (account/pool)',
-          description: 'Optional. Bind these runs to a connected account or pool instead of the runner\'s inherited account. Simple form: "openai-codex:group:<poolId>" (a pool — auto-rotates when autoSwitch is enabled), "openai-codex:<profileId>" (a single account), "openai-codex:native" (opt out), or a full { v:1, bindingsByServiceId } object. Applies to every target; omit to use each account\'s configured default exactly as stored (literal: a profile default binds to that profile, a pool default to that pool — no silent upgrade; to rotate, store a pool default or pass a pool selection).',
+          description: 'Optional. Bind these runs to a connected account or pool instead of the runner\'s inherited account. Use "native" to suppress all connected-service inheritance. Per-service forms remain available: "openai-codex:group:<poolId>" (a pool — auto-rotates when autoSwitch is enabled), "openai-codex:<profileId>" (a single account), "openai-codex:native" (native for that service), or a full { v:1, bindingsByServiceId } object. Applies to every target; omit to use each account\'s configured default exactly as stored (literal: a profile default binds to that profile, a pool default to that pool — no silent upgrade; to rotate, store a pool default or pass a pool selection).',
           widget: 'text',
           optionsSourceId: 'execution.runs.connected_services.available',
         },
@@ -1372,7 +1377,7 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
           title: 'Permission mode',
           description: EXECUTION_RUN_ACTION_PERMISSION_MODE_DESCRIPTION,
           widget: 'select',
-          options: EXECUTION_RUN_ACTION_PERMISSION_MODES.map((value) => ({ value, label: value })),
+          options: EXECUTION_RUN_ACTION_PERMISSION_INPUTS.map((value) => ({ value, label: value })),
         },
         {
           path: 'modelId',
@@ -1390,7 +1395,7 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
         {
           path: 'connectedServices',
           title: 'Connected services (account/pool)',
-          description: 'Optional. Bind these runs to a connected account or pool instead of the runner\'s inherited account. Simple form: "openai-codex:group:<poolId>" (a pool — auto-rotates when autoSwitch is enabled), "openai-codex:<profileId>" (a single account), "openai-codex:native" (opt out), or a full { v:1, bindingsByServiceId } object. Applies to every target; omit to use each account\'s configured default exactly as stored (literal: a profile default binds to that profile, a pool default to that pool — no silent upgrade; to rotate, store a pool default or pass a pool selection).',
+          description: 'Optional. Bind these runs to a connected account or pool instead of the runner\'s inherited account. Use "native" to suppress all connected-service inheritance. Per-service forms remain available: "openai-codex:group:<poolId>" (a pool — auto-rotates when autoSwitch is enabled), "openai-codex:<profileId>" (a single account), "openai-codex:native" (native for that service), or a full { v:1, bindingsByServiceId } object. Applies to every target; omit to use each account\'s configured default exactly as stored (literal: a profile default binds to that profile, a pool default to that pool — no silent upgrade; to rotate, store a pool default or pass a pool selection).',
           widget: 'text',
           optionsSourceId: 'execution.runs.connected_services.available',
         },
@@ -1447,7 +1452,7 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
         {
           path: 'connectedServices',
           title: 'Connected services (account/pool)',
-          description: 'Optional. Bind the run to a connected account or pool instead of the runner\'s inherited account. Simple form: "openai-codex:group:<poolId>" (a pool — auto-rotates when autoSwitch is enabled), "openai-codex:<profileId>" (a single account), "openai-codex:native" (opt out), or a full { v:1, bindingsByServiceId } object. Omit to use the account\'s configured default exactly as stored (literal: a profile default binds to that profile, a pool default to that pool — no silent upgrade; to rotate, store a pool default or pass a pool selection).',
+          description: 'Optional. Bind the run to a connected account or pool instead of the runner\'s inherited account. Use "native" to suppress all connected-service inheritance for the run. Per-service forms remain available: "openai-codex:group:<poolId>" (a pool — auto-rotates when autoSwitch is enabled), "openai-codex:<profileId>" (a single account), "openai-codex:native" (native for that service), or a full { v:1, bindingsByServiceId } object. Omit to use the account\'s configured default exactly as stored (literal: a profile default binds to that profile, a pool default to that pool — no silent upgrade; to rotate, store a pool default or pass a pool selection).',
           widget: 'text',
           optionsSourceId: 'execution.runs.connected_services.available',
         },
@@ -1484,7 +1489,7 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
     bindings: { mcpToolName: 'execution_run_start' },
     examples: {
       mcp: {
-        argsExample: '{"intent":"voice_agent","backendTarget":{"kind":"builtInAgent","agentId":"codex"},"instructions":"Summarize recent changes.","permissionMode":"read_only","retentionPolicy":"ephemeral","runClass":"bounded","ioMode":"request_response"}',
+        argsExample: '{"intent":"voice_agent","backendTarget":{"kind":"builtInAgent","agentId":"codex"},"instructions":"Summarize recent changes.","permissionMode":"auto","retentionPolicy":"ephemeral","runClass":"bounded","ioMode":"request_response"}',
       },
     },
     surfaces: {
@@ -1503,7 +1508,14 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
         { path: 'intent', title: 'Intent', widget: 'text', required: true },
         { path: 'backendTarget', title: 'Backend target (json)', widget: 'textarea', required: true },
         { path: 'instructions', title: 'Instructions', widget: 'textarea' },
-        { path: 'permissionMode', title: 'Permission mode', widget: 'text', required: true },
+        {
+          path: 'permissionMode',
+          title: 'Permission intent',
+          description: EXECUTION_RUN_ACTION_PERMISSION_MODE_DESCRIPTION,
+          widget: 'select',
+          required: true,
+          options: EXECUTION_RUN_ACTION_PERMISSION_INPUTS.map((value) => ({ value, label: value })),
+        },
         { path: 'retentionPolicy', title: 'Retention policy', widget: 'text', required: true },
         { path: 'runClass', title: 'Run class', widget: 'text', required: true },
         { path: 'ioMode', title: 'IO mode', widget: 'text', required: true },
@@ -1530,7 +1542,7 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
         {
           path: 'connectedServices',
           title: 'Connected services (account/pool)',
-          description: 'Optional. Bind the run to a connected account or pool instead of the runner\'s inherited account. Simple form: "openai-codex:group:<poolId>" (a pool — auto-rotates when autoSwitch is enabled), "openai-codex:<profileId>" (a single account), "openai-codex:native" (opt out), or a full { v:1, bindingsByServiceId } object. Omit to use the account\'s configured default exactly as stored (literal: a profile default binds to that profile, a pool default to that pool — no silent upgrade; to rotate, store a pool default or pass a pool selection).',
+          description: 'Optional. Bind the run to a connected account or pool instead of the runner\'s inherited account. Use "native" to suppress all connected-service inheritance for the run. Per-service forms remain available: "openai-codex:group:<poolId>" (a pool — auto-rotates when autoSwitch is enabled), "openai-codex:<profileId>" (a single account), "openai-codex:native" (native for that service), or a full { v:1, bindingsByServiceId } object. Omit to use the account\'s configured default exactly as stored (literal: a profile default binds to that profile, a pool default to that pool — no silent upgrade; to rotate, store a pool default or pass a pool selection).',
           widget: 'text',
           optionsSourceId: 'execution.runs.connected_services.available',
         },
@@ -1547,6 +1559,7 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
     prompting: { voiceHotPath: true },
     slash: { tokens: ['/h.runs'] },
     bindings: { voiceClientToolName: 'listExecutionRuns', mcpToolName: 'execution_run_list' },
+    sideEffectClass: 'read',
     inputHints: {
       title: 'List execution runs',
       fields: [
@@ -1591,6 +1604,7 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
     placements: ['run_list', 'run_card', 'command_palette'],
     prompting: { voiceHotPath: true },
     bindings: { voiceClientToolName: 'getExecutionRun', mcpToolName: 'execution_run_get' },
+    sideEffectClass: 'read',
     examples: {
       voice: { argsExample: '{"sessionId":"{{sessionId}}","runId":"run_123","includeStructured":false}' },
     },
@@ -1703,6 +1717,7 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
     approval: APPROVAL_RESULT_REQUIRED,
     placements: [],
     bindings: { mcpToolName: 'execution_run_wait' },
+    sideEffectClass: 'read',
     examples: {
       mcp: { argsExample: '{"sessionId":"{{sessionId}}","runId":"run_123"}' },
     },
@@ -1721,7 +1736,6 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
         { path: 'sessionId', title: 'Session id', widget: 'text' },
         { path: 'runId', title: 'Run id', widget: 'text', required: true },
         { path: 'timeoutSeconds', title: 'Timeout seconds (optional)', widget: 'text' },
-        { path: 'pollIntervalMs', title: 'Poll interval (ms)', widget: 'text' },
       ],
     },
     inputSchema: ExecutionRunWaitInputSchema,
@@ -2338,7 +2352,7 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
   {
     id: 'session.permission_mode.set',
     title: 'Set session permission mode',
-    description: 'Update the permission intent (read_only/workspace_write/etc) for the specified session.',
+    description: `Update the permission intent (${SESSION_PERMISSION_INTENT_INPUTS.join('/')}) for the specified session. Compatible aliases are accepted.`,
     safety: 'safe',
     approval: APPROVAL_RESULT_NONE,
     placements: [],
@@ -2507,6 +2521,8 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
     description: 'Get the editable session goal when the provider supports native goals.',
     safety: 'safe',
     approval: APPROVAL_RESULT_REQUIRED,
+    contextualDefaults: { sessionId: 'current_session' },
+    toolExposure: { session_agent: 'direct' },
     placements: [],
     bindings: { mcpToolName: 'session_goal_get' },
     examples: {
@@ -2533,6 +2549,8 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
     description: 'Set or update the native session goal.',
     safety: 'safe',
     approval: APPROVAL_RESULT_NONE,
+    contextualDefaults: { sessionId: 'current_session' },
+    toolExposure: { session_agent: 'direct' },
     placements: [],
     bindings: { mcpToolName: 'session_goal_set' },
     examples: {
@@ -2563,7 +2581,9 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
     title: 'Clear session goal',
     description: 'Clear the native session goal.',
     safety: 'safe',
-    approval: APPROVAL_RESULT_NONE,
+    approval: APPROVAL_RESULT_REQUIRED,
+    contextualDefaults: { sessionId: 'current_session' },
+    toolExposure: { session_agent: 'direct' },
     placements: [],
     bindings: { mcpToolName: 'session_goal_clear' },
     examples: {

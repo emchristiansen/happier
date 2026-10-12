@@ -27,8 +27,9 @@ describe('InvalidateSync.awaitQueue', () => {
             sync.invalidate();
 
             let resolved = false;
-            const promise = sync.awaitQueue({ timeoutMs: 1000 }).then(() => {
+            const promise = sync.awaitQueue({ timeoutMs: 1000 }).then((outcome) => {
                 resolved = true;
+                return outcome;
             });
 
             await vi.advanceTimersByTimeAsync(999);
@@ -37,12 +38,21 @@ describe('InvalidateSync.awaitQueue', () => {
             await vi.runOnlyPendingTimersAsync();
             expect(resolved).toBe(true);
 
-            await promise;
+            await expect(promise).resolves.toEqual({ status: 'wait_budget_expired' });
         });
     });
 });
 
 describe('InvalidateSync.invalidateAndAwait', () => {
+    it('rejects when its refresh cycle ends in a terminal error', async () => {
+        const error = Object.assign(new Error('not retryable'), { retryable: false });
+        const sync = new InvalidateSync(async () => {
+            throw error;
+        });
+
+        await expect(sync.invalidateAndAwait()).rejects.toBe(error);
+    });
+
     it('resolves after its own refresh cycle when another invalidation is queued', async () => {
         const firstRun = createDeferred<void>();
         const secondRun = createDeferred<void>();

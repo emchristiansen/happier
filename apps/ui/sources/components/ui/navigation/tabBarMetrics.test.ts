@@ -17,6 +17,10 @@ describe('resolveTabBarMetrics', () => {
         expect(compact.tabMinWidth).toBeLessThan(regular.tabMinWidth);
     });
 
+    it('keeps compact Android tabs at least 48dp wide', () => {
+        expect(resolveTabBarMetrics('compact', false, 'android').tabMinWidth).toBe(48);
+    });
+
     it('adds vertical padding in icon-only mode for a balanced height', () => {
         expect(resolveTabBarMetrics('regular', false).tabPaddingVertical)
             .toBeGreaterThan(resolveTabBarMetrics('regular', true).tabPaddingVertical);

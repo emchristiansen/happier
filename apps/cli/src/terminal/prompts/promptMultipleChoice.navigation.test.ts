@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { promptMultipleChoice } from './promptMultipleChoice';
+import { promptMultipleChoice, promptMultipleSelection } from './promptMultipleChoice';
 import type { promptInput } from './promptInput';
 
 describe('promptMultipleChoice arrow navigation', () => {
@@ -43,5 +43,44 @@ describe('promptMultipleChoice arrow navigation', () => {
       promptInputFn,
       renderMessage: (_seconds, selectedId) => `selected=${selectedId}`,
     })).resolves.toBe('third');
+  });
+});
+
+describe('promptMultipleSelection keyboard navigation', () => {
+  it('toggles multiple rows and submits them together', async () => {
+    const promptInputFn = vi.fn(async (_prompt: string, config?: Parameters<typeof import('./promptInput').promptInput>[1]) => {
+      config?.animation?.onToggle?.();
+      config?.animation?.onMove?.(1);
+      config?.animation?.onToggle?.();
+      return config?.animation?.answerOnEmpty?.() ?? '';
+    });
+    await expect(promptMultipleSelection('Choose agents', [
+      { id: 'claude', label: 'Claude Code' },
+      { id: 'codex', label: 'Codex' },
+      { id: 'skip', label: 'Skip for now', kind: 'skip' },
+    ] as const, { promptInputFn })).resolves.toEqual(['claude', 'codex']);
+  });
+
+  it('supports numbered/id fallback and explicit skip without animation callbacks', async () => {
+    const answers = ['1,codex', 'skip'];
+    const promptInputFn = vi.fn(async (_prompt: string) => answers.shift() ?? 'skip');
+    const options = [
+      { id: 'claude', label: 'Claude Code' },
+      { id: 'codex', label: 'Codex' },
+      { id: 'skip', label: 'Skip for now', kind: 'skip' as const },
+    ];
+    await expect(promptMultipleSelection('Choose agents', options, { promptInputFn })).resolves.toEqual(['claude', 'codex']);
+    await expect(promptMultipleSelection('Choose agents', options, { promptInputFn })).resolves.toEqual([]);
+    expect(promptInputFn.mock.calls[0]?.[0]).toContain('comma-separated numbers or ids');
+  });
+
+  it('does not reinterpret exhausted invalid static answers as Skip', async () => {
+    const promptInputFn = vi.fn(async (_prompt: string) => 'not-an-agent');
+
+    await expect(promptMultipleSelection('Choose agents', [
+      { id: 'claude', label: 'Claude Code' },
+      { id: 'skip', label: 'Skip for now', kind: 'skip' },
+    ] as const, { promptInputFn })).rejects.toThrow('Invalid selection');
+    expect(promptInputFn).toHaveBeenCalledTimes(3);
   });
 });

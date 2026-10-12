@@ -22,8 +22,6 @@ export type TranscriptPrependOlderLoadSyncOptions = Readonly<{
 export async function runTranscriptPrependOlderLoad(params: Readonly<{
     clearOlderLoadSpinnerDelay: () => void;
     hasActiveEntrySliceWindow: () => boolean;
-    hasMoreOlder: boolean | null;
-    hasMoreOlderRef: MutableRef<boolean | null>;
     hideOlderLoadSpinner: () => void;
     isReady: boolean;
     loadOlderInFlight: MutableRef<boolean>;
@@ -33,7 +31,6 @@ export async function runTranscriptPrependOlderLoad(params: Readonly<{
     prependHost: TranscriptPrependHost;
     revealEntrySliceWindow: () => number;
     resolveSyncLoadOlderOptions: () => TranscriptPrependOlderLoadSyncOptions | null;
-    setHasMoreOlder: (value: boolean) => void;
     setIsLoadingOlder: (value: boolean) => void;
     showOlderLoadSpinner: () => void;
 }>): Promise<TranscriptPrependOlderLoadResult | null> {
@@ -41,11 +38,7 @@ export async function runTranscriptPrependOlderLoad(params: Readonly<{
     if (!params.isReady) return null;
     const showLoadingIndicator = options.showLoadingIndicator !== false;
     const preservePrependViewport = options.preservePrependViewport !== false;
-    if (
-        params.loadOlderInFlight.current ||
-        params.hasMoreOlderRef.current === false ||
-        params.hasMoreOlder === false
-    ) {
+    if (params.loadOlderInFlight.current) {
         if (params.loadOlderInFlight.current && showLoadingIndicator && options.loadingIndicatorDelayMs === 0) {
             params.showOlderLoadSpinner();
         }
@@ -73,7 +66,7 @@ export async function runTranscriptPrependOlderLoad(params: Readonly<{
                 loadCompleted = true;
                 return {
                     loaded: revealed,
-                    hasMore: params.hasMoreOlderRef.current ?? true,
+                    hasMore: true,
                     status: 'loaded',
                 };
             }
@@ -90,13 +83,6 @@ export async function runTranscriptPrependOlderLoad(params: Readonly<{
             });
         }
         loadCompleted = true;
-        if (result.status === 'no_more') {
-            params.hasMoreOlderRef.current = false;
-            params.setHasMoreOlder(false);
-        } else if (result.status === 'loaded' || result.status === 'not_ready' || result.status === 'in_flight') {
-            params.hasMoreOlderRef.current = result.hasMore;
-            params.setHasMoreOlder(result.hasMore);
-        }
         return result;
     } finally {
         if (Platform.OS === 'web' && !loadCompleted) {

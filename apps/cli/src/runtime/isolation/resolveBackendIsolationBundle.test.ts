@@ -16,6 +16,11 @@ describe('resolveBackendIsolationBundle', () => {
       XDG_STATE_HOME: process.env.XDG_STATE_HOME,
       XDG_CACHE_HOME: process.env.XDG_CACHE_HOME,
       XDG_DATA_HOME: process.env.XDG_DATA_HOME,
+      OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+      CODEX_HOME: process.env.CODEX_HOME,
+      HAPPIER_CONNECTED_SERVICE_SELECTIONS_JSON: process.env.HAPPIER_CONNECTED_SERVICE_SELECTIONS_JSON,
+      HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_JSON: process.env.HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_JSON,
+      HAPPIER_CONNECTED_SERVICE_TARGET_MATERIALIZED_ROOT: process.env.HAPPIER_CONNECTED_SERVICE_TARGET_MATERIALIZED_ROOT,
     };
     try {
       process.env.HAPPIER_HOME_DIR = homeDir;
@@ -27,6 +32,11 @@ describe('resolveBackendIsolationBundle', () => {
       process.env.XDG_STATE_HOME = join(homeDir, 'real-state');
       process.env.XDG_CACHE_HOME = join(homeDir, 'real-cache');
       process.env.XDG_DATA_HOME = join(homeDir, 'real-data');
+      process.env.OPENAI_API_KEY = 'parent-connected-secret';
+      process.env.CODEX_HOME = join(homeDir, 'parent-connected-codex');
+      process.env.HAPPIER_CONNECTED_SERVICE_SELECTIONS_JSON = JSON.stringify([{ serviceId: 'openai-codex', source: 'connected' }]);
+      process.env.HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_JSON = JSON.stringify(['OPENAI_API_KEY', 'CODEX_HOME']);
+      process.env.HAPPIER_CONNECTED_SERVICE_TARGET_MATERIALIZED_ROOT = join(homeDir, 'parent-connected-root');
 
       const { reloadConfiguration } = await import('@/configuration');
       reloadConfiguration();
@@ -49,6 +59,11 @@ describe('resolveBackendIsolationBundle', () => {
       expect(bundle.env.HAPPIER_OPENCODE_SERVER_TURN_INACTIVITY_TIMEOUT_MS).toBe('123456');
       expect(bundle.env.HOME).toBe(join(homeDir, 'real-home'));
       expect(bundle.env.XDG_CONFIG_HOME).toBe(join(homeDir, 'real-config'));
+      expect(bundle.env.OPENAI_API_KEY).toBeUndefined();
+      expect(bundle.env.CODEX_HOME).toBeUndefined();
+      expect(bundle.env.HAPPIER_CONNECTED_SERVICE_SELECTIONS_JSON).toBeUndefined();
+      expect(bundle.env.HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_JSON).toBeUndefined();
+      expect(bundle.env.HAPPIER_CONNECTED_SERVICE_TARGET_MATERIALIZED_ROOT).toBeUndefined();
     } finally {
       vi.resetModules();
       await rm(homeDir, { recursive: true, force: true });

@@ -6,6 +6,7 @@ import { apiSocket } from '../api/session/apiSocket';
 import { createRpcCallError, isRpcMethodNotAvailableError, readRpcErrorCode as readSessionRpcErrorCode } from '../runtime/rpcErrors';
 import { assertRpcResponseWithSuccess } from '../runtime/assertRpcResponseWithSuccess';
 import { buildResumeHappySessionRpcParams, type ResumeHappySessionRpcParams } from '../domains/session/resume/resumeSessionPayload';
+import { resolveTerminalSpawnOptions } from '../domains/settings/terminalSettings';
 import { readForkSessionRpcTimeoutMsFromEnv, readSpawnSessionRpcTimeoutMsFromEnv } from '../domains/session/spawn/spawnSessionRpcTimeout';
 import { randomUUID } from '@/platform/randomUUID';
 import { storage } from '../domains/state/storage';
@@ -292,10 +293,12 @@ async function runResumeSession(
                 ? undefined
                 : (SessionAuthoringValueV1Schema.shape.connectedServices.parse(connectedServices) as SessionAuthoringValueV1['connectedServices']);
         const parsedConnectedServices = parsedConnectedServicesRaw == null ? undefined : parsedConnectedServicesRaw;
+        const terminal = resolveTerminalSpawnOptions({ settings: storage.getState().settings, machineId });
         const params: ResumeHappySessionRpcParams = buildResumeHappySessionRpcParams({
             sessionId,
             directory,
             backendTarget,
+            ...(terminal ? { terminal } : {}),
             ...(resume ? { resume } : {}),
             ...(environmentVariables ? { environmentVariables } : {}),
             ...(parsedConnectedServices !== undefined ? { connectedServices: parsedConnectedServices } : {}),

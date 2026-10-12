@@ -68,6 +68,7 @@ vi.mock('@happier-dev/connection-supervisor', () => ({
       await params.onConnected?.();
     },
     stop: async () => {},
+    captureProbeReportScope: () => ({ generation: 1 }),
     reportProbeResult: (...args: unknown[]) => supervisorReportProbeResult?.(...args),
   }),
 }));
@@ -172,7 +173,7 @@ describe('ApiSessionClient (HAPPIER_TRANSCRIPT_STORAGE=direct)', () => {
       retryAfterMs: 7_000,
       reason: 'server_restarting',
       errorMessage: 'Server restart in progress',
-    });
+    }, { generation: 1 });
   });
 
   it('does not reject the reconnect hook when queued replay fails', async () => {

@@ -20,6 +20,7 @@ describe('readOpenCodeSessionAffinityFromMetadata', () => {
       backendMode: 'server',
       serverBaseUrl: 'http://127.0.0.1:4096/',
       serverBaseUrlExplicit: true,
+      managedServerLaunchFingerprint: null,
     });
   });
 });

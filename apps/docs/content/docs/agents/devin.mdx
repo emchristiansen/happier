@@ -1,0 +1,77 @@
+---
+title: Devin CLI (experimental)
+description: Configure Devin CLI in Happier, including authentication, permissions, models, resume, execution runs, and MCP tools.
+---
+
+Happier runs the locally installed Devin CLI through its ACP server for normal
+sessions and execution runs. For execution runs, Happier lazily resolves one
+run-scoped set of Happier MCP servers and supplies it through Devin's native
+process-scoped MCP configuration when the Devin process starts.
+
+## Requirements and authentication
+
+Install Devin CLI using the
+[official Devin CLI guide](https://docs.devin.ai/work-with-devin/devin-cli),
+make sure `devin` is available on `PATH`, and authenticate on the machine where
+Happier runs:
+
+```bash
+devin auth login
+devin auth status
+```
+
+You can also open the native login flow and refresh its status from
+**Settings → AI & Agents → AI backends → Devin**.
+
+## Start and resume sessions
+
+```bash
+happier devin
+```
+
+Happier supports new sessions, vendor resume, follow-up messages, cancellation,
+live model changes through Devin's ACP `model` config option, and execution
+runs. When Devin advertises a family through reversible combined identifiers
+such as `swe-2-medium`, `swe-2-high`, and `swe-2-max`, Happier presents one
+model with a structured **Reasoning effort** control. If Devin also advertises
+every matching standard and fast variant, Happier adds a **Speed** control with
+**Standard** and **Fast** choices. Incomplete or ambiguous families remain as
+separate model choices rather than being guessed.
+
+## Permissions
+
+Happier maps explicit choices to Devin's advertised modes:
+
+- **Default** sends no override and preserves your Devin configuration.
+- **Read only** uses `ask`.
+- **Auto** (the canonical `safe-yolo` intent) uses `smart`.
+- **YOLO** uses `bypass`.
+- **Plan** uses `plan`.
+
+## MCP tools
+
+Devin supports MCP natively through its layered
+`mcp_config.json` files. Its
+ACP server currently ignores ACP's standard per-session `mcpServers` input and
+does not expose a direct MCP launch flag. Happier therefore merges the selected
+session tools—or the lazily resolved, run-scoped tools for an execution run—with
+your user-level Devin MCP servers in a protected temporary config root, starts
+Devin against that root, and removes it when the process ends. Untouched Devin
+and Cognition config entries are projected into that root with symlinks
+(directory junctions on Windows); only the merged `mcp_config.json` is
+process-private. If those links cannot be created, Happier stops the launch
+instead of copying provider state into a stale snapshot. Your normal config
+files are not modified by Happier.
+
+Project and project-local Devin MCP servers still load. If one uses the same
+name as a Happier-selected session server, Happier stops before launch instead
+of allowing the higher-priority project entry to silently replace it.
+
+For shared MCP setup and session selection, see [MCP servers](/extending/mcp-servers).
+
+## Troubleshooting
+
+- Run `devin version` and `devin auth status` on the agent machine.
+- If a model is unavailable, run `devin models list` under the same account.
+- If an MCP tool is missing, check for a same-named entry in
+  `.devin/mcp_config.json` or `.devin/mcp_config.local.json`.

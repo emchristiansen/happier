@@ -171,7 +171,7 @@ describe('transcript entry slice reachability', () => {
     it('announces the tail discontinuity floor with an older gap row on web', () => {
         // The one web tail-mode withholding path. It removes a contiguous OLDER prefix and always
         // pairs it with the affordance, so it cannot produce a hole between two visible rows.
-        const projection = project({ tailContiguousFloorSeq: 5 });
+        const projection = project({ tailContiguousBoundary: { kind: 'seq', seq: 5 } });
 
         expect(presentedIds(projection)).toEqual([
             'transcript-window-gap:tail:older',

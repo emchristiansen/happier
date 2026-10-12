@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -6,7 +6,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
     installVersionedPayload,
+    readInstalledVersionMarkers,
     resolveDefaultManagedReleaseChannelStatePath,
+    resolveFirstPartyInstallLayout,
 } from './index.js';
 
 async function createPayload(
@@ -28,28 +30,109 @@ async function readJsonReleaseChannel(path: string): Promise<string> {
 }
 
 describe('installVersionedPayload default release-channel persistence', () => {
-    it('writes the effective default release channel for stable and preview installs', async () => {
+    it('rejects cancellation before installation without changing the current payload, shims, or markers', async () => {
+        const homeDir = await mkdtemp(join(tmpdir(), 'happier-install-cancel-before-'));
+        const env = { ...process.env, HAPPIER_HOME_DIR: homeDir };
+        const layout = resolveFirstPartyInstallLayout({ componentId: 'happier-cli', processEnv: env });
+        const binaryName = process.platform === 'win32' ? 'happier.exe' : 'happier';
+        try {
+            await installVersionedPayload({
+                componentId: 'happier-cli', versionId: '1.0.0', processEnv: env,
+                payloadRoot: await createPayload(homeDir, '1.0.0', 'original-version', binaryName),
+            });
+            const controller = new AbortController();
+            controller.abort();
+            const phases: string[] = [];
+            await expect(installVersionedPayload({
+                componentId: 'happier-cli', versionId: '2.0.0', processEnv: env,
+                payloadRoot: await createPayload(homeDir, '2.0.0', 'cancelled-version', binaryName),
+                signal: controller.signal, onProgress: ({ phase }) => { phases.push(phase); },
+            })).rejects.toMatchObject({ name: 'AbortError' });
+            expect(phases).toEqual([]);
+            expect(await readInstalledVersionMarkers(layout)).toEqual({ currentVersionId: '1.0.0', previousVersionId: null });
+            expect(await readdir(layout.versionsDir)).toEqual(['1.0.0']);
+            expect(await readFile(join(layout.currentPath, binaryName), 'utf8')).toBe('original-version');
+            expect(await readFile(join(layout.shimDir, binaryName), 'utf8')).toBe('original-version');
+            expect(await readJsonReleaseChannel(resolveDefaultManagedReleaseChannelStatePath({ processEnv: env }))).toBe('stable');
+        } finally {
+            await rm(homeDir, { recursive: true, force: true });
+        }
+    });
+
+    it('finishes promotion and finalization when cancellation arrives after installation starts', async () => {
+        const homeDir = await mkdtemp(join(tmpdir(), 'happier-install-cancel-during-'));
+        const env = { ...process.env, HAPPIER_HOME_DIR: homeDir };
+        const layout = resolveFirstPartyInstallLayout({ componentId: 'happier-cli', channel: 'preview', processEnv: env });
+        const executableSuffix = process.platform === 'win32' ? '.exe' : '';
+        const binaryName = `happier${executableSuffix}`;
+        try {
+            await installVersionedPayload({
+                componentId: 'happier-cli', versionId: '1.0.0', processEnv: env,
+                payloadRoot: await createPayload(homeDir, '1.0.0', 'stable-version', binaryName),
+            });
+            const controller = new AbortController();
+            const phases: string[] = [];
+            await installVersionedPayload({
+                componentId: 'happier-cli', versionId: '2.0.0-preview.1', channel: 'preview', processEnv: env,
+                payloadRoot: await createPayload(homeDir, '2.0.0-preview.1', 'preview-version', binaryName),
+                signal: controller.signal,
+                onProgress: ({ phase }) => {
+                    phases.push(phase);
+                    if (phase === 'installing') controller.abort();
+                },
+            });
+            expect(controller.signal.aborted).toBe(true);
+            expect(phases).toEqual(['installing', 'finalizing']);
+            expect(await readInstalledVersionMarkers(layout)).toEqual({ currentVersionId: '2.0.0-preview.1', previousVersionId: null });
+            expect(await readFile(join(layout.currentPath, binaryName), 'utf8')).toBe('preview-version');
+            expect(await readFile(join(layout.shimDir, `hprev${executableSuffix}`), 'utf8')).toBe('preview-version');
+            // The installed stable CLI stays the default command (D2).
+            expect(await readFile(join(layout.shimDir, binaryName), 'utf8')).toBe('stable-version');
+            expect(await readJsonReleaseChannel(resolveDefaultManagedReleaseChannelStatePath({ processEnv: env }))).toBe('stable');
+        } finally {
+            await rm(homeDir, { recursive: true, force: true });
+        }
+    });
+
+    it('keeps the installed default channel when another channel is acquired, and sets it on first install or explicit selection', async () => {
         const homeDir = await mkdtemp(join(tmpdir(), 'happier-install-versioned-payload-channel-'));
         const env = { ...process.env, HAPPIER_HOME_DIR: homeDir };
         const statePath = resolveDefaultManagedReleaseChannelStatePath({ processEnv: env });
+        const binaryName = process.platform === 'win32' ? 'happier.exe' : 'happier';
+        const defaultShimPath = join(homeDir, 'bin', binaryName);
 
         try {
-            await installVersionedPayload({
-                componentId: 'happier-cli',
-                versionId: '1.0.0',
-                payloadRoot: await createPayload(homeDir, '1.0.0', 'stable-version'),
-                processEnv: env,
-            });
-            expect(await readJsonReleaseChannel(statePath)).toBe('stable');
-
+            // First install on an empty machine: preview becomes the default.
             await installVersionedPayload({
                 componentId: 'happier-cli',
                 versionId: '2.0.0-preview.1',
-                payloadRoot: await createPayload(homeDir, '2.0.0-preview.1', 'preview-version'),
+                payloadRoot: await createPayload(homeDir, '2.0.0-preview.1', 'preview-version', binaryName),
                 processEnv: env,
                 channel: 'preview',
             });
             expect(await readJsonReleaseChannel(statePath)).toBe('preview');
+            expect(await readFile(defaultShimPath, 'utf8')).toBe('preview-version');
+
+            // Acquiring stable (a stable app, a stable self-update) never repoints `happier`.
+            await installVersionedPayload({
+                componentId: 'happier-cli',
+                versionId: '1.0.0',
+                payloadRoot: await createPayload(homeDir, '1.0.0', 'stable-version', binaryName),
+                processEnv: env,
+            });
+            expect(await readJsonReleaseChannel(statePath)).toBe('preview');
+            expect(await readFile(defaultShimPath, 'utf8')).toBe('preview-version');
+
+            // The installer's explicit channel choice still selects the default.
+            await installVersionedPayload({
+                componentId: 'happier-cli',
+                versionId: '1.0.1',
+                payloadRoot: await createPayload(homeDir, '1.0.1', 'stable-selected', binaryName),
+                processEnv: env,
+                selectAsDefaultReleaseChannel: true,
+            });
+            expect(await readJsonReleaseChannel(statePath)).toBe('stable');
+            expect(await readFile(defaultShimPath, 'utf8')).toBe('stable-selected');
         } finally {
             await rm(homeDir, { recursive: true, force: true });
         }
@@ -78,6 +161,7 @@ describe('installVersionedPayload default release-channel persistence', () => {
                 payloadRoot: await createPayload(homeDir, '2.0.0-preview.1', 'preview-version'),
                 processEnv: env,
                 channel: 'preview',
+                selectAsDefaultReleaseChannel: true,
             })).rejects.toThrow();
 
             expect(await readJsonReleaseChannel(statePath)).toBe('stable');

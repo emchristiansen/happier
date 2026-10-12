@@ -1,11 +1,12 @@
 import {
-  getAgentLocalControlCapability,
+  getAgentLocalControlCapabilityForSession,
   inferAgentIdFromSessionMetadata,
   type AgentId,
 } from '@happier-dev/agents';
 import { compareMachineHosts } from '@happier-dev/protocol';
 
 import { getProviderAttachOps } from '@/backends/catalog';
+import { probeSessionRunnerPresence } from '@/daemon/sessions/isSessionRunnerActive';
 import type { Credentials } from '@/persistence';
 import type { TerminalAttachmentInfo } from '@/terminal/attachment/terminalAttachmentInfo';
 import { createTerminalAttachPlan, type TerminalAttachPlan } from '@/terminal/attachment/terminalAttachPlan';
@@ -26,6 +27,14 @@ export type CliSessionAttachEligibilityReasonCode =
   | 'terminal_not_attachable';
 
 export type CliSessionAttachEligibility =
+  | Readonly<{
+      eligible: true;
+      agentId: AgentId;
+      attachStrategy: 'managed_provider_attach';
+      attachScope: 'local';
+      metadata: Record<string, unknown>;
+      terminal: NonNullable<Metadata['terminal']>;
+    }>
   | Readonly<{
       eligible: true;
       agentId: AgentId;
@@ -146,16 +155,6 @@ export async function evaluateCliSessionAttachEligibility(params: Readonly<{
       metadata: null,
     };
   }
-  if (params.rawSession.active !== true) {
-    return {
-      eligible: false,
-      agentId: null,
-      reasonCode: 'inactive',
-      reason: 'Session is not active and cannot be attached.',
-      metadata: null,
-    };
-  }
-
   const metadata = asRecord(tryDecryptSessionMetadata({
     credentials: params.credentials,
     rawSession: params.rawSession,
@@ -172,11 +171,32 @@ export async function evaluateCliSessionAttachEligibility(params: Readonly<{
     };
   }
 
-  const localControl = agentId ? getAgentLocalControlCapability(agentId) : null;
+  const localControl = agentId ? getAgentLocalControlCapabilityForSession({ agentId, metadata }) : null;
   const sessionMachineId = readMachineId(metadata);
   const sessionHost = readHost(metadata);
   const metadataTerminal = readMetadataTerminal(metadata);
   const hasLocalTerminalEvidence = params.localAttachmentInfo !== null;
+  const sameHostAsCurrentMachine = compareMachineHosts(sessionHost, params.currentMachineHost ?? null);
+  const sameMachineIdentity = Boolean(sessionMachineId && params.currentMachineId && sessionMachineId === params.currentMachineId);
+  const candidate = params.localAttachmentInfo?.terminal ?? metadataTerminal;
+  const hasLocalHerdrRestorationCandidate = candidate?.mode === 'herdr'
+    && candidate.controlServiceabilityV1?.retired !== true
+    && Boolean(candidate.herdr?.paneId?.trim())
+    && (hasLocalTerminalEvidence || Boolean(sessionMachineId && (sameHostAsCurrentMachine || sameMachineIdentity)));
+  if (params.rawSession.active !== true) {
+    // A recorded public pane is only a restoration candidate. Opening it does
+    // not authenticate or bind the resumed runner to this Happier session.
+    if (localControl && hasLocalHerdrRestorationCandidate) {
+      return buildTerminalAttachEligibility({
+        metadata, localAttachmentInfo: params.localAttachmentInfo, metadataTerminal,
+        insideTmux: params.insideTmux, currentTmuxSocketPath: params.currentTmuxSocketPath ?? null,
+      });
+    }
+    return {
+      eligible: false, agentId, reasonCode: 'inactive',
+      reason: 'Session is not active and cannot be attached.', metadata,
+    };
+  }
   if (!localControl) {
     return {
       eligible: false,
@@ -188,6 +208,27 @@ export async function evaluateCliSessionAttachEligibility(params: Readonly<{
   }
 
   if (localControl.attachStrategy === 'provider_attach') {
+    // The relay's active bit can outlive its controller. Only positive local
+    // runner absence permits opening recorded metadata as a cold candidate.
+    if (params.localAttachmentInfo || (hasLocalHerdrRestorationCandidate
+      && (await probeSessionRunnerPresence({ sessionId: params.rawSession.id, trackedSessions: [] })).state === 'runner_absent')) {
+      const hosted = buildTerminalAttachEligibility({
+        metadata,
+        localAttachmentInfo: params.localAttachmentInfo,
+        metadataTerminal,
+        insideTmux: params.insideTmux,
+        currentTmuxSocketPath: params.currentTmuxSocketPath ?? null,
+      });
+      if (hosted.eligible) return hosted;
+    }
+    const selectedHost = metadataTerminal?.mode === 'plain' ? metadataTerminal.requested : metadataTerminal?.mode;
+    if (agentId && metadataTerminal && localControl.topology === 'shared' && metadata.startedBy === 'daemon'
+      && sameMachineIdentity && (selectedHost === 'tmux' || selectedHost === 'zellij' || selectedHost === 'herdr')) {
+      // Availability is not runner custody: the live runner's authenticated Switch RPC
+      // must admit and prepare the selected client before any terminal can be focused.
+      return { eligible: true, agentId, attachStrategy: 'managed_provider_attach', attachScope: 'local', metadata,
+        terminal: metadataTerminal };
+    }
     if (!agentId) {
       return {
         eligible: false,
@@ -209,6 +250,7 @@ export async function evaluateCliSessionAttachEligibility(params: Readonly<{
     }
 
     const evaluation = await providerAttachOps.evaluateEligibility({
+      sessionId: params.rawSession.id,
       metadata,
       currentMachineId: params.currentMachineId,
       sessionMachineId,
@@ -243,8 +285,6 @@ export async function evaluateCliSessionAttachEligibility(params: Readonly<{
     };
   }
 
-  const sameHostAsCurrentMachine = compareMachineHosts(sessionHost, params.currentMachineHost ?? null);
-  const sameMachineIdentity = Boolean(sessionMachineId && params.currentMachineId && sessionMachineId === params.currentMachineId);
   if (hasLocalTerminalEvidence || (metadataTerminal !== null && sessionMachineId && (sameHostAsCurrentMachine || sameMachineIdentity))) {
     return buildTerminalAttachEligibility({
       metadata,

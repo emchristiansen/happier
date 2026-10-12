@@ -57,6 +57,9 @@ export async function runConfiguredAcpBackend(
     agentMessageType: `acp:${backend.backendId}`,
     machineMetadata: initialMachineMetadata,
     terminalDisplay: TerminalDisplay,
+    // Same configured-backend declaration the ACP protocol owner enforces against the
+    // negotiated handshake, so a backend that promises resume never silently starts fresh.
+    declaredSessionLoadSupport: backend.capabilities.supportsLoadSession,
     beforeInitializeSession: ({ metadata }) => {
       Object.assign(metadata, buildConfiguredAcpBackendSessionMetadata({
         backendId: backend.backendId,

@@ -564,6 +564,38 @@ describe("session publisher presence on SQLite", () => {
         });
     });
 
+    it("does not replace a newer snapshot registration fence with a delayed heartbeat observation", async () => {
+        const seeded = await seed();
+        let clock = new Date(seeded.fence.getTime() + 20);
+        const presence = createSessionPublisherPresence({ now: () => clock });
+        const socket = {};
+        await presence.publishSnapshot({
+            socket,
+            binding: seeded.binding,
+            completeSnapshot: { state: "active", activeCount: 1 },
+        });
+        const registered = await db.session.findUniqueOrThrow({
+            where: { id: seeded.binding.sessionId },
+            select: { active: true, lastActiveAt: true, publisherGenerationLastActiveAt: true, runtimeActivityRevision: true },
+        });
+        clock = new Date(seeded.fence.getTime() + 60_000);
+        await expect(presence.touchPublisher({
+            socket,
+            observedAt: new Date(seeded.fence.getTime() + 10),
+        })).resolves.toEqual({ status: "stale_observation" });
+        // A heartbeat can have observed "unregistered" before the snapshot acquired this socket.
+        await expect(presence.registerPublisher({
+            socket,
+            binding: seeded.binding,
+            completeActivitySnapshot: { state: "unknown", activeCount: 0 },
+            observedAt: new Date(seeded.fence.getTime() + 10),
+        })).resolves.toEqual({ status: "rejected", reason: "contention" });
+        await expect(db.session.findUniqueOrThrow({
+            where: { id: seeded.binding.sessionId },
+            select: { active: true, lastActiveAt: true, publisherGenerationLastActiveAt: true, runtimeActivityRevision: true },
+        })).resolves.toEqual(registered);
+    });
+
     it("does not let a stopped publisher heartbeat itself active again", async () => {
         const seeded = await seed();
         const presence = createSessionPublisherPresence({ now: () => new Date(seeded.fence.getTime() + 10) });

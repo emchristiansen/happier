@@ -20,10 +20,9 @@ import {
 } from '@/agent/permissions/BasePermissionHandler';
 import type { ToolTraceProtocol } from '@/agent/tools/trace/toolTrace';
 import {
-  resolveHappierActionForMcpToolName,
-  shouldSuppressProviderPermissionForHappierApproval,
+  isSafeFirstPartyHappierActionToolCall,
 } from '@/agent/tools/happierTools/resolveHappierActionForMcpToolName';
-import type { AccountSettings, ActionId } from '@happier-dev/protocol';
+import type { AccountSettings } from '@happier-dev/protocol';
 import { shouldDenyAgentSessionTitleToolCall } from './codingPromptTitlePermission';
 import { resolveSessionCodingPromptSettingsFromSession } from '../prompting/coding/resolveSessionCodingPromptSettings';
 import { resolveAgentRequestKind } from './requestKind';
@@ -57,13 +56,6 @@ const DEFAULT_ALWAYS_AUTO_APPROVE_TOOL_NAME_INCLUDES = [
   'read_text_file',
   'write_text_file',
 ] as const;
-
-const ALWAYS_AUTO_APPROVE_HAPPIER_ACTION_IDS = new Set<ActionId>([
-  'session.title.set',
-  'action.spec.search',
-  'action.spec.get',
-  'action.options.resolve',
-]);
 
 function isFullAccessPermissionMode(mode: PermissionMode): boolean {
   return mode === 'yolo' || mode === 'bypassPermissions';
@@ -117,8 +109,7 @@ export class ProviderEnforcedPermissionHandler extends BasePermissionHandler {
   }
 
   private isAlwaysAutoApprove(toolName: string, input: unknown): boolean {
-    const happierActionId = resolveHappierActionForMcpToolName({ toolName, input });
-    if (happierActionId && ALWAYS_AUTO_APPROVE_HAPPIER_ACTION_IDS.has(happierActionId)) return true;
+    if (isSafeFirstPartyHappierActionToolCall({ toolName, input })) return true;
     return isTrustedAlwaysAutoApproveToolName(toolName, this.alwaysAutoApproveToolNameIncludes);
   }
 
@@ -144,13 +135,7 @@ export class ProviderEnforcedPermissionHandler extends BasePermissionHandler {
     if (this.isAlwaysAutoApprove(toolName, input)) {
       return { decision: 'approved' };
     }
-    const approvalSuppression = shouldSuppressProviderPermissionForHappierApproval({
-      toolName,
-      input,
-      accountSettings: this.getAccountSettingsSnapshot(),
-      surface: 'session_agent',
-    });
-    return approvalSuppression.suppress ? { decision: 'approved' } : null;
+    return null;
   }
 
   async handleToolCall(toolCallId: string, toolName: string, input: unknown): Promise<PermissionResult> {

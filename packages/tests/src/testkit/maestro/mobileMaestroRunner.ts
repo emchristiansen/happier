@@ -186,14 +186,16 @@ async function stopCapturedLogProcess(params: Readonly<{
   timeoutMs: number;
   isClosed: () => boolean;
 }>): Promise<void> {
-  if (!params.isClosed()) {
+  // Failed spawn has no process to signal, even before its asynchronous error arrives.
+  const hasSpawnedProcess = typeof params.child.pid === 'number' && params.child.pid > 0;
+  if (hasSpawnedProcess && !params.isClosed()) {
     params.child.kill('SIGTERM');
   }
   await Promise.race([
     params.closeSignal,
     sleep(params.timeoutMs),
   ]);
-  if (!params.isClosed()) {
+  if (hasSpawnedProcess && !params.isClosed()) {
     params.child.kill('SIGKILL');
     await Promise.race([
       params.closeSignal,
@@ -281,9 +283,6 @@ function startAndroidLogcatCapture(params: Readonly<{
     stop: async () => {
       if (stopped) return;
       stopped = true;
-      if (!child.killed) {
-        child.kill('SIGTERM');
-      }
       const timeoutMs = readPositiveInteger(
         params.env.HAPPIER_E2E_ANDROID_LOGCAT_STOP_TIMEOUT_MS,
         DEFAULT_ANDROID_LOGCAT_STOP_TIMEOUT_MS,
@@ -352,9 +351,6 @@ function startIosSimulatorLogCapture(params: Readonly<{
     stop: async () => {
       if (stopped) return;
       stopped = true;
-      if (!child.killed) {
-        child.kill('SIGTERM');
-      }
       const timeoutMs = readPositiveInteger(
         params.env.HAPPIER_E2E_IOS_SIMULATOR_LOG_STOP_TIMEOUT_MS,
         DEFAULT_IOS_SIMULATOR_LOG_STOP_TIMEOUT_MS,

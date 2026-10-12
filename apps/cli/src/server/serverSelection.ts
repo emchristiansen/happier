@@ -58,7 +58,7 @@ function deriveProfileNameFromServerUrl(serverUrl: string): string {
 
 function deriveDefaultWebappUrl(serverUrl: string): string {
   if (serverUrl.replace(/\/+$/, '') === 'https://api.happier.dev') {
-    return 'https://app.happier.dev';
+    return 'https://cloud.happier.dev';
   }
   return new URL(serverUrl).origin;
 }

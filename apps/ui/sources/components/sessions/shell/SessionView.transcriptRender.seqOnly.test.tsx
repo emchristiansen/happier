@@ -579,10 +579,9 @@ vi.mock('@/sync/domains/permissions/permissionModeApply', () => ({
 vi.mock('@/sync/domains/sessionControl/sessionModeControl', () => ({
     supportsSessionModeOverrides: () => false,
 }));
-vi.mock('@/sync/domains/session/control/localControlSwitch', () => ({
+vi.mock('@/sync/domains/session/control/localControlSwitch', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/sync/domains/session/control/localControlSwitch')>()),
     shouldRenderChatTimelineForSession: (args: any) => shouldRenderChatTimelineForSessionMock(args),
-    shouldRequestRemoteControl: () => false,
-    shouldRequestRemoteControlAfterPendingEnqueue: () => false,
 }));
 vi.mock('@/sync/runtime/time', () => ({
     nowServerMs: () => 0,
@@ -976,6 +975,8 @@ describe('SessionView (transcript rendering for seq-only sessions)', () => {
                 await vi.runOnlyPendingTimersAsync();
             });
             chatListRenderSpy.mockClear();
+            surfaceMountSpy.mockClear();
+            surfaceUnmountSpy.mockClear();
             shouldRenderChatTimelineForSessionMock.mockClear();
             fetchPendingMessagesSpy.mockClear();
 
@@ -993,7 +994,8 @@ describe('SessionView (transcript rendering for seq-only sessions)', () => {
                 await vi.runOnlyPendingTimersAsync();
             });
 
-            expect(chatListRenderSpy).not.toHaveBeenCalled();
+            expect(surfaceMountSpy).not.toHaveBeenCalled();
+            expect(surfaceUnmountSpy).not.toHaveBeenCalled();
             expect(shouldRenderChatTimelineForSessionMock).not.toHaveBeenCalled();
             expect(fetchPendingMessagesSpy).toHaveBeenCalledWith('s1');
 

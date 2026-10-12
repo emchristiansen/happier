@@ -132,6 +132,13 @@ export function hasAgentInputCollapsedOptionsPopoverContent(
 export type AgentInputExtraActionChip = Readonly<{
     key: string;
     /**
+     * Signals that the reader is reaching for this control, whether through its
+     * visible chip or the collapsed action menu. Expensive detail owned by the
+     * control can wait for this signal instead of loading while the control is
+     * closed.
+     */
+    onIntent?: () => void;
+    /**
      * Data revision for render/popover closures captured by this descriptor.
      * Presentation owners may retain a descriptor while this key is unchanged,
      * but must replace it when the key changes.

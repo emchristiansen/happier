@@ -28,6 +28,7 @@ import { resolveTranscriptUtteranceIdentity } from '@/components/sessions/transc
 import { TranscriptHotTail } from '@/components/sessions/transcript/segments/TranscriptHotTail';
 import { WebTranscriptSplitFooter } from '@/components/sessions/transcript/web/WebTranscriptSplitFooter';
 import { OlderLoadProgressOverlay } from '@/components/sessions/transcript/OlderLoadProgressOverlay';
+import { OlderLoadContinuationOverlay } from '@/components/sessions/transcript/OlderLoadContinuationOverlay';
 import { CatchUpProgressOverlay } from '@/components/sessions/transcript/CatchUpProgressOverlay';
 import { resolveTranscriptListShellEdgeSlots } from '@/components/sessions/transcript/viewport/shell/transcriptListShellEdgeSlots';
 import {
@@ -519,6 +520,8 @@ export type TranscriptItemsEdgeSlotsDeps = Readonly<{
     mainTranscriptListShellFrame: Parameters<typeof resolveTranscriptListShellEdgeSlots>[0]['frame'];
     onRequestSwitchToRemote: ChatListInternalProps['onRequestSwitchToRemote'];
     olderPaginationIsLoadingOlder: boolean;
+    olderPaginationCanContinue: boolean;
+    onContinueOlderPagination: () => void;
     prependRangeReservePx: number;
     renderTranscriptItemAtIndex: (item: ChatTranscriptListItem, index: number) => React.ReactNode;
     sessionId: string;
@@ -543,6 +546,8 @@ export function useTranscriptItemsEdgeSlots(deps: TranscriptItemsEdgeSlotsDeps) 
         mainTranscriptListShellFrame,
         onRequestSwitchToRemote,
         olderPaginationIsLoadingOlder,
+        olderPaginationCanContinue,
+        onContinueOlderPagination,
         prependRangeReservePx,
         renderTranscriptItemAtIndex,
         sessionId,
@@ -626,10 +631,13 @@ export function useTranscriptItemsEdgeSlots(deps: TranscriptItemsEdgeSlotsDeps) 
         visualTopNode: listHeaderNode,
         visualBottomNode: flashListFooterNode,
     }), [flashListFooterNode, listHeaderNode, mainTranscriptListShellFrame]);
-    const olderLoadOverlay =
-        (olderPaginationIsLoadingOlder || isLoadingOlder) && !showFirstPaintPlaceholder ? (
-            <OlderLoadProgressOverlay />
-        ) : null;
+    const olderLoadOverlay = showFirstPaintPlaceholder
+        ? null
+        : (olderPaginationIsLoadingOlder || isLoadingOlder)
+            ? <OlderLoadProgressOverlay />
+            : olderPaginationCanContinue
+                ? <OlderLoadContinuationOverlay onContinue={onContinueOlderPagination} />
+                : null;
     const catchUpOverlay = (
         <CatchUpProgressOverlay
             isCatchingUp={showCatchUpOverlay}

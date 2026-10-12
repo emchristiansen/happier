@@ -6,7 +6,7 @@ import { createRunDirs } from '../../src/testkit/runDir';
 import { startServerLight, type StartedServer } from '../../src/testkit/process/serverLight';
 import { resolveUiWebBeforeAllTimeoutMs, startUiWeb, type StartedUiWeb } from '../../src/testkit/process/uiWeb';
 import { type StartedDaemon } from '../../src/testkit/daemon/daemon';
-import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
+import { fakeClaudeEchoResponseText, fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
 import {
   createSessionFromNewSessionComposer,
   reloadCreatedSessionFromNewSessionComposer,
@@ -63,12 +63,12 @@ async function forkFromFirstMessageMatching(params: { page: Page; containsText: 
   throw new Error(`Timed out waiting for fork navigation (url=${params.page.url()})`);
 }
 
-async function sendPromptAndWaitForOk(params: { page: Page; prompt: string; okNumber: number; timeoutMs?: number }): Promise<void> {
+async function sendPromptAndWaitForEcho(params: { page: Page; prompt: string; timeoutMs?: number }): Promise<void> {
   const timeoutMs = params.timeoutMs ?? 180_000;
   await params.page.locator('textarea[data-testid="session-composer-input"]:visible').fill(params.prompt);
   await params.page.locator('textarea[data-testid="session-composer-input"]:visible').press('Enter');
   await expect(params.page.getByText(params.prompt).first()).toHaveCount(1, { timeout: 60_000 });
-  await expect(params.page.getByText(`FAKE_CLAUDE_OK_${params.okNumber}`).first()).toBeVisible({ timeout: timeoutMs });
+  await expect(params.page.getByText(fakeClaudeEchoResponseText(params.prompt)).first()).toBeVisible({ timeout: timeoutMs });
 }
 
 async function nudgeTranscriptScrollToTop(page: Page): Promise<void> {
@@ -133,6 +133,7 @@ test.describe('ui e2e: fork ancestor paging across segments', () => {
   });
 
   test('loads older ancestor messages when scrolling past fork cutoff', async ({ page }) => {
+    // CI 36709793378: this journey passed in 216s; retain its longer test budget.
     test.setTimeout(900_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
@@ -158,6 +159,7 @@ test.describe('ui e2e: fork ancestor paging across segments', () => {
         HOME: cliHomeDir,
         HAPPIER_CLAUDE_PATH: fakeClaudePath,
         HAPPIER_E2E_FAKE_CLAUDE_LOG: fakeClaudeLogPath,
+        HAPPIER_E2E_FAKE_CLAUDE_SCENARIO: 'echo-user-text',
         HAPPIER_E2E_FAKE_CLAUDE_SESSION_ID: `fake-claude-session-${run.runId}`,
         HAPPIER_E2E_FAKE_CLAUDE_INVOCATION_ID: `fake-claude-invocation-${run.runId}`,
       },
@@ -176,12 +178,12 @@ test.describe('ui e2e: fork ancestor paging across segments', () => {
     const { sessionId: parentSessionId } = parentSession;
 
     await reloadCreatedSessionFromNewSessionComposer({ page, session: parentSession });
-    await expect(page.getByText('FAKE_CLAUDE_OK_1').first()).toBeVisible({ timeout: 180_000 });
+    await expect(page.getByText(fakeClaudeEchoResponseText(marker0)).first()).toBeVisible({ timeout: 180_000 });
 
     // Create enough turns to exceed a single transcript page (SESSION_MESSAGES_PAGE_SIZE=150).
     // Each turn yields a user + assistant message, so 80 turns ensures >150 total rows.
     for (let i = 1; i <= 80; i += 1) {
-      await sendPromptAndWaitForOk({ page, prompt: `PARENT_MARKER_${i} ${run.runId}`, okNumber: i + 1 });
+      await sendPromptAndWaitForEcho({ page, prompt: `PARENT_MARKER_${i} ${run.runId}` });
     }
 
     await ensureReplayForkEnabled({ page, uiBaseUrl, session: parentSession });

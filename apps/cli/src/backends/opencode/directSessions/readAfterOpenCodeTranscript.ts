@@ -5,13 +5,15 @@ import { decodeOpenCodeDirectAfterCursor, encodeOpenCodeDirectAfterCursor } from
 import { mapOpenCodeMessageToDirectItem } from './mapOpenCodeMessageToDirectItem';
 import { measureDirectTranscriptItemBytes } from './measureDirectTranscriptItemBytes';
 
+import type { DirectSessionTranscriptReadAfter } from '@/backends/directSessions/providerOps';
+
 export async function readAfterOpenCodeTranscript(params: Readonly<{
   source: DirectSessionsSource;
   remoteSessionId: string;
   cursor: string;
   maxBytes: number;
   maxItems: number;
-}>): Promise<Readonly<{ items: DirectTranscriptRawMessageV1[]; nextCursor: string | null; truncated: boolean }>> {
+}>): Promise<DirectSessionTranscriptReadAfter> {
   const client = await createOpenCodeDirectClient(params.source);
 
   try {
@@ -29,7 +31,7 @@ export async function readAfterOpenCodeTranscript(params: Readonly<{
 
     const decoded = decodeOpenCodeDirectAfterCursor(params.cursor);
     if (!decoded) {
-      return { items: [], nextCursor: null, truncated: true };
+      return { items: [], nextCursor: null, truncated: true, truncationReason: 'source_discontinuity' };
     }
 
     if (decoded.nextIndex > rawMessages.length) {
@@ -37,6 +39,7 @@ export async function readAfterOpenCodeTranscript(params: Readonly<{
         items: [],
         nextCursor: encodeOpenCodeDirectAfterCursor({ v: 1, kind: 'opencodeAfter', nextIndex: rawMessages.length }),
         truncated: true,
+        truncationReason: 'source_discontinuity',
       };
     }
 
@@ -72,10 +75,12 @@ export async function readAfterOpenCodeTranscript(params: Readonly<{
     const nextIndex = decoded.nextIndex + consumedCount;
     const nextCursor = encodeOpenCodeDirectAfterCursor({ v: 1, kind: 'opencodeAfter', nextIndex });
 
+    const hasMore = truncated || nextIndex < rawMessages.length;
     return {
       items,
       nextCursor,
-      truncated: truncated || nextIndex < rawMessages.length,
+      truncated: hasMore,
+      ...(hasMore ? { truncationReason: 'page_limit' as const } : {}),
     };
   } finally {
     await client.dispose().catch(() => {});

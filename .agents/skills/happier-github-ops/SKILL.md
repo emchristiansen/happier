@@ -190,9 +190,9 @@ Before proposing an agent-authored public comment on a Happier GitHub issue, res
 gh api user --jq .login
 ```
 
-Use the returned login in a standalone final line of every comment: `cc: @<local-gh-login>`. Resolve this identity with ordinary `gh`, never `yarn ghops`: `ghops` is deliberately authenticated as the bot that transports issue reads and writes, not the local maintainer who should receive notifications. Do not substitute the bot login, repository owner, operating-system username, Git author, a hardcoded handle, or a previously observed account. If ordinary `gh` is unavailable, unauthenticated, or returns no login, stop before posting and ask the user to authenticate with `gh auth login` or explicitly supply the mention target.
+Use the returned login in a standalone final line of every comment: `_Posted on behalf of @<local-gh-login>._` Resolve this identity with ordinary `gh`, never `yarn ghops`: `ghops` is deliberately authenticated as the account that transports issue reads and writes, not the local maintainer who authorized and stands behind the comment. Do not substitute the transport login, repository owner, operating-system username, Git author, a hardcoded handle, or a previously observed account. If ordinary `gh` is unavailable, unauthenticated, or returns no login, stop before posting and ask the user to authenticate with `gh auth login` or explicitly supply the attribution target.
 
-This direct mention keeps the local maintainer participating in the issue conversation. Apply it to initial responses, evidence requests, progress updates, release updates, and closure recommendations. Under exact authorization, include the resolved line in the complete preview and never add it afterward. Under standing authorization, resolve it immediately before each comment and keep it inside the delegated comment payload. Do not omit it based on inferred subscription status, an earlier mention, or prior participation. This rule applies to issue comments, not issue bodies or release automation's label-only mutations. Use a different handle or omit the line only when the applicable exact or standing authorization permits that variation.
+This attribution makes the human authorization behind the transported comment explicit, while its direct mention keeps the local maintainer participating in the issue conversation. Apply it to initial responses, evidence requests, progress updates, release updates, and closure recommendations. Under exact authorization, include the resolved line in the complete preview and never add it afterward. Under standing authorization, resolve it immediately before each comment and keep it inside the delegated comment payload. Do not omit it based on inferred subscription status, an earlier mention, or prior participation. This rule applies to issue comments, not issue bodies or release automation's label-only mutations. Use a different handle or omit the line only when the applicable exact or standing authorization permits that variation.
 
 ### Voice and identity
 
@@ -268,6 +268,8 @@ These labels are intended to keep the public roadmap curated and consistent:
 - `type: bug`, `type: feature`, `type: task` (recommended)
 - `source: bug-report` (applied automatically by the bug-report service)
 
+Before deciding this transition, apply the [source verification and handoff decision](../../../docs/issue-triage.md#source-verification-and-handoff-decision). It defines the deciding correction evidence and the normal paired addition of `stage:source` and removal of `needs:maintainer`, including infrastructure-blocked checks. Keep unrun checks explicit; do not turn the source label into full CI or release certification.
+
 For an open issue with a complete correction integrated and verified on canonical `dev`, the next authorized GitHub mutation must add `stage:source` and remove any conflicting `stage:*` label. Omit this only when the issue is already at the same or a higher verified stage, or the evidence-backed disposition establishes that no correction exists to release; state the reason in the preview or post-action report. Do not apply the label before integration, infer a later stage, or silently omit the pending proposal when mutation authority is absent.
 
 Roadmap inclusion is opt-in. Do not add `roadmap`, add a project item, or change project fields unless exact authorization or a bounded standing grant explicitly includes roadmap changes for that issue set.
@@ -318,7 +320,7 @@ Comment on an issue:
 
 ```bash
 local_gh_login="$(gh api user --jq .login)"
-comment_body="$(printf 'Update: ...\n\ncc: @%s' "$local_gh_login")"
+comment_body="$(printf 'Update: ...\n\n_Posted on behalf of @%s._' "$local_gh_login")"
 yarn ghops api repos/happier-dev/happier/issues/123/comments -f "body=$comment_body"
 ```
 

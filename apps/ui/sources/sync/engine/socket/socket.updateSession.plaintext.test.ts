@@ -8,7 +8,11 @@ import { clearMountedSessionRealtimeTranscriptConsumers } from '@/sync/runtime/s
 import { useVoiceTargetStore } from '@/voice/runtime/voiceTargetStore';
 import { voiceSessionBindingStore } from '@/voice/sessionBinding/voiceSessionBindingStore';
 import { syncPerformanceTelemetry } from '@/sync/runtime/syncPerformanceTelemetry';
-import { flushActivityUpdates, handleUpdateContainer } from './socket';
+import {
+    flushActivityUpdates,
+    handleUpdateContainer,
+    resetSocketSessionProjectionStateForServerScope,
+} from './socket';
 
 const initialStorageState = storage.getInitialState();
 type HandleUpdateContainerParams = Parameters<typeof handleUpdateContainer>[0];
@@ -67,6 +71,7 @@ function buildBaseParams(overrides: Partial<HandleUpdateContainerBaseParams> = {
 
 describe('socket update handling: plaintext update-session', () => {
     beforeEach(() => {
+        resetSocketSessionProjectionStateForServerScope();
         clearActiveViewingSessionsForServerScopeReset();
         clearMountedSessionRealtimeTranscriptConsumers();
         useVoiceTargetStore.setState({
@@ -115,6 +120,96 @@ describe('socket update handling: plaintext update-session', () => {
                 activeAt: 150,
             }),
         ]);
+    });
+
+    it.each(['hydrated', 'cache-only'] as const)('does not resurrect %s working state from an equal-timestamp heartbeat after a stop', async (kind) => {
+        vi.useFakeTimers();
+        const session = {
+            ...buildSession('s_delayed_working_heartbeat'),
+            updatedAt: 200,
+            activeAt: 100,
+            thinking: true,
+            thinkingAt: 100,
+        };
+        if (kind === 'hydrated') {
+            storage.getState().applySessions([session]);
+        } else {
+            storage.getState().replaceSessionListRenderables([{ ...session, archivedAt: null }]);
+        }
+        const applySessions = storage.getState().applySessions;
+        flushActivityUpdates({
+            updates: new Map([[session.id, {
+                type: 'activity', id: session.id, active: true, activeAt: 200, thinking: false,
+            }]]),
+            applySessions,
+        });
+        await vi.advanceTimersByTimeAsync(16);
+        expect(storage.getState().sessionListRenderables[session.id].thinking).toBe(false);
+
+        flushActivityUpdates({
+            updates: new Map([[session.id, {
+                type: 'activity', id: session.id, active: true, activeAt: 200, thinking: true,
+            }]]),
+            applySessions,
+        });
+        await vi.advanceTimersByTimeAsync(16);
+        expect(storage.getState().sessionListRenderables[session.id].thinking).toBe(false);
+
+        flushActivityUpdates({
+            updates: new Map([[session.id, {
+                type: 'activity', id: session.id, active: true, activeAt: 201, thinking: true,
+            }]]),
+            applySessions,
+        });
+        await vi.advanceTimersByTimeAsync(16);
+        expect(storage.getState().sessionListRenderables[session.id].thinking).toBe(true);
+    });
+
+    it('applies cache-only working-to-online activity after a newer durable projection', async () => {
+        vi.useFakeTimers();
+        const session = {
+            ...buildSession('s_cached_working_to_online'),
+            updatedAt: 200,
+            activeAt: 100,
+            thinking: true,
+            thinkingAt: 100,
+            archivedAt: null,
+        };
+        storage.getState().replaceSessionListRenderables([session]);
+        flushActivityUpdates({
+            updates: new Map([[session.id, {
+                type: 'activity', id: session.id, active: true, activeAt: 150, thinking: false,
+            }]]),
+            applySessions: storage.getState().applySessions,
+        });
+        await vi.advanceTimersByTimeAsync(16);
+        expect(storage.getState().sessionListRenderables[session.id]).toMatchObject({
+            active: true, activeAt: 150, thinking: false, thinkingAt: 150,
+        });
+    });
+
+    it('rechecks a queued cache-only working heartbeat against a stop published before its flush', async () => {
+        vi.useFakeTimers();
+        const session = {
+            ...buildSession('s_cached_queued_working'),
+            updatedAt: 100,
+            activeAt: 100,
+            thinkingAt: 100,
+            archivedAt: null,
+        };
+        storage.getState().replaceSessionListRenderables([session]);
+        flushActivityUpdates({
+            updates: new Map([[session.id, {
+                type: 'activity', id: session.id, active: true, activeAt: 200, thinking: true,
+            }]]),
+            applySessions: storage.getState().applySessions,
+        });
+        storage.getState().applySessionListRenderablePatches([{
+            sessionId: session.id,
+            patch: { thinking: false, thinkingAt: 200, activeAt: 200, updatedAt: 200 },
+        }]);
+        await vi.advanceTimersByTimeAsync(16);
+        expect(storage.getState().sessionListRenderables[session.id].thinking).toBe(false);
     });
 
     afterEach(() => {
@@ -176,12 +271,70 @@ describe('socket update handling: plaintext update-session', () => {
         }
     });
 
+    it('projects retained hidden session updates without hydrating or publishing detailed state', async () => {
+        const sessionId = 's_retained_hidden_projection';
+        storage.getState().applySessions([buildSession(sessionId)]);
+        storage.getState().replaceSessionListRenderables([{
+            id: sessionId,
+            seq: 1,
+            createdAt: 1,
+            updatedAt: 1,
+            active: true,
+            activeAt: 1,
+            archivedAt: null,
+            metadataVersion: 1,
+            agentStateVersion: 1,
+            metadata: { path: '/tmp', host: 'localhost' },
+            thinking: false,
+            thinkingAt: 0,
+            presence: 'online',
+        }]);
+        const markSessionStateHydrationDeferred = vi.fn();
+        const params = buildBaseParams({ markSessionStateHydrationDeferred });
+
+        await handleUpdateContainer({
+            ...params,
+            updateData: {
+                id: 'u_retained_hidden_projection',
+                seq: 10,
+                createdAt: 1_234,
+                body: {
+                    t: 'update-session',
+                    id: sessionId,
+                    metadata: {
+                        version: 2,
+                        value: JSON.stringify({ path: '/work', host: 'devbox', name: 'Projected title' }),
+                    },
+                    agentState: {
+                        version: 2,
+                        value: JSON.stringify({ controlledByUser: false, requests: { stale: { id: 'stale' } } }),
+                    },
+                    pendingPermissionRequestCount: 0,
+                    pendingUserActionRequestCount: 0,
+                },
+            },
+        });
+
+        expect(storage.getState().sessionListRenderables[sessionId]).toEqual(expect.objectContaining({
+            metadataVersion: 2,
+            metadata: expect.objectContaining({ name: 'Projected title' }),
+            updatedAt: 1_234,
+        }));
+        expect(storage.getState().sessions[sessionId]).toEqual(expect.objectContaining({
+            metadataVersion: 1,
+            agentStateVersion: 1,
+        }));
+        expect(markSessionStateHydrationDeferred).toHaveBeenCalledWith(sessionId);
+        expect((params.applySessions as unknown as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
+    });
+
     it('does not overwrite a newer title when a lower-version metadata payload arrives (hydrated path)', async () => {
         storage.getState().applySessions([{
             ...buildSession('s_meta_version_guard'),
             metadata: { path: '/tmp', host: 'localhost', name: 'Newer title' },
             metadataVersion: 5,
         }]);
+        markSessionVisible('s_meta_version_guard');
         const params = buildBaseParams();
 
         await handleUpdateContainer({
@@ -219,6 +372,7 @@ describe('socket update handling: plaintext update-session', () => {
             metadata: { path: '/tmp', host: 'localhost', name: 'Original title' },
             metadataVersion: 2,
         }]);
+        markSessionVisible('s_meta_version_apply');
 
         // Equal version is a no-op: metadata is not re-applied.
         const equalParams = buildBaseParams();
@@ -335,7 +489,7 @@ describe('socket update handling: plaintext update-session', () => {
         }
     });
 
-    it('hydrates hidden encrypted metadata while deferring agentState when no full transcript consumer is active', async () => {
+    it('defers hidden encrypted metadata while applying only public session-list projections', async () => {
         storage.getState().applySessions([{
             ...buildSession('s1'),
             encryptionMode: 'e2ee',
@@ -349,8 +503,7 @@ describe('socket update handling: plaintext update-session', () => {
         const decryptMetadata = vi.fn(async () => ({
             path: '/work',
             host: 'devbox',
-            title: 'Renamed session',
-            summary: 'Updated list summary',
+            name: 'Renamed session',
         }));
         const decryptAgentState = vi.fn(async () => ({ controlledByUser: true, requests: {} }));
         const params = buildBaseParams({
@@ -388,29 +541,88 @@ describe('socket update handling: plaintext update-session', () => {
             },
         });
 
-        expect(decryptMetadata).toHaveBeenCalledTimes(1);
+        expect(decryptMetadata).not.toHaveBeenCalled();
         expect(decryptAgentState).not.toHaveBeenCalled();
         expect(markSessionStateHydrationDeferred).toHaveBeenCalledWith('s1');
         const applySessionsSpy = params.applySessions as unknown as ReturnType<typeof vi.fn>;
-        expect(applySessionsSpy).toHaveBeenCalledTimes(1);
-        const updatedSession = applySessionsSpy.mock.calls[0]?.[0]?.[0] as Session;
-        expect(updatedSession).toEqual(expect.objectContaining({
-            pendingPermissionRequestCount: 0,
-            pendingUserActionRequestCount: 0,
+        expect(applySessionsSpy).not.toHaveBeenCalled();
+        expect(storage.getState().sessionListRenderables.s1).toEqual(expect.objectContaining({
+            hasPendingPermissionRequests: false,
+            hasPendingUserActionRequests: false,
             latestReadyEventSeq: 12,
             latestReadyEventAt: 1_950,
             latestTurnStatus: 'completed',
             latestTurnStatusObservedAt: 1_950,
             meaningfulActivityAt: 1_950,
-            metadata: {
-                path: '/work',
-                host: 'devbox',
-                title: 'Renamed session',
-                summary: 'Updated list summary',
-            },
-            metadataVersion: 2,
+            metadata: expect.objectContaining({ path: '/tmp', host: 'localhost' }),
+            metadataVersion: 1,
+            agentStateVersion: 1,
+        }));
+        expect(storage.getState().sessions.s1).toEqual(expect.objectContaining({
+            metadataVersion: 1,
             agentState: { controlledByUser: false, requests: {} },
             agentStateVersion: 1,
+        }));
+    });
+
+    it('decrypts only the leading and latest trailing visible cache-only metadata projection in a burst', async () => {
+        vi.useFakeTimers();
+        const sessionId = 's_visible_cache_only_metadata_burst';
+        markSessionVisible(sessionId);
+        storage.getState().replaceSessionListRenderables([{
+            id: sessionId,
+            seq: 1,
+            createdAt: 1,
+            updatedAt: 1,
+            active: true,
+            activeAt: 1,
+            archivedAt: null,
+            metadata: { path: '/tmp', host: 'localhost' },
+            metadataVersion: 1,
+            agentStateVersion: 1,
+            thinking: false,
+            thinkingAt: 0,
+            presence: 'online',
+        }]);
+        const decryptMetadata = vi.fn(async (version: number) => ({
+            path: '/work',
+            host: 'devbox',
+            name: `Title ${version}`,
+        }));
+        const params = buildBaseParams({
+            encryption: {
+                getSessionEncryption: () => ({ decryptMetadata }),
+                getMachineEncryption: () => null,
+                removeSessionEncryption: () => {},
+            } as unknown as HandleUpdateContainerBaseParams['encryption'],
+        });
+
+        for (const version of [2, 3, 4]) {
+            await handleUpdateContainer({
+                ...params,
+                updateData: {
+                    id: `u_visible_cache_only_metadata_burst_${version}`,
+                    seq: 10 + version,
+                    createdAt: 2_000 + version,
+                    body: {
+                        t: 'update-session',
+                        id: sessionId,
+                        metadata: { version, value: `encrypted-metadata-${version}` },
+                    },
+                },
+            });
+        }
+
+        expect(decryptMetadata).toHaveBeenCalledTimes(1);
+        expect(decryptMetadata).toHaveBeenLastCalledWith(2, 'encrypted-metadata-2');
+
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        expect(decryptMetadata).toHaveBeenCalledTimes(2);
+        expect(decryptMetadata).toHaveBeenLastCalledWith(4, 'encrypted-metadata-4');
+        expect(storage.getState().sessionListRenderables[sessionId]).toEqual(expect.objectContaining({
+            metadataVersion: 4,
+            metadata: expect.objectContaining({ name: 'Title 4' }),
         }));
     });
 
@@ -427,6 +639,7 @@ describe('socket update handling: plaintext update-session', () => {
         }]);
         const decryptAgentState = vi.fn(async () => ({ controlledByUser: false, requests: {} }));
         const onSessionVisible = vi.fn();
+        const markSessionStateHydrationDeferred = vi.fn();
         const params = buildBaseParams({
             encryption: {
                 getSessionEncryption: () => ({
@@ -437,6 +650,7 @@ describe('socket update handling: plaintext update-session', () => {
                 removeSessionEncryption: () => {},
             } as unknown as HandleUpdateContainerBaseParams['encryption'],
             onSessionVisible,
+            markSessionStateHydrationDeferred,
         });
 
         await handleUpdateContainer({
@@ -459,16 +673,19 @@ describe('socket update handling: plaintext update-session', () => {
 
         expect(decryptAgentState).not.toHaveBeenCalled();
         expect(onSessionVisible).not.toHaveBeenCalled();
+        expect(markSessionStateHydrationDeferred).toHaveBeenCalledWith('s1');
         const applySessionsSpy = params.applySessions as unknown as ReturnType<typeof vi.fn>;
-        expect(applySessionsSpy).toHaveBeenCalledTimes(1);
-        const updatedSession = applySessionsSpy.mock.calls[0]?.[0]?.[0] as Session;
-        expect(updatedSession).toEqual(expect.objectContaining({
-            agentState: { controlledByUser: false, requests: {} },
+        expect(applySessionsSpy).not.toHaveBeenCalled();
+        expect(storage.getState().sessionListRenderables.s1).toEqual(expect.objectContaining({
             agentStateVersion: 1,
-            pendingPermissionRequestCount: 0,
-            pendingUserActionRequestCount: 0,
+            hasPendingPermissionRequests: false,
+            hasPendingUserActionRequests: false,
             latestTurnStatus: 'completed',
             latestTurnStatusObservedAt: 2_050,
+        }));
+        expect(storage.getState().sessions.s1).toEqual(expect.objectContaining({
+            agentState: { controlledByUser: false, requests: {} },
+            agentStateVersion: 1,
         }));
     });
 
@@ -646,6 +863,7 @@ describe('socket update handling: plaintext update-session', () => {
             lastViewedSessionSeq: 2,
             latestReadyEventSeq: 3,
         }]);
+        markSessionVisible('s1');
         const onReadyProjectionAdvance = vi.fn();
         const applySessions = vi.fn<HandleUpdateContainerBaseParams['applySessions']>((sessions) => {
             storage.getState().applySessions(sessions.map((session) => ({
@@ -681,6 +899,7 @@ describe('socket update handling: plaintext update-session', () => {
     it('applies the first durable session update immediately and coalesces trailing updates without dropping queued fields', async () => {
         vi.useFakeTimers();
         storage.getState().applySessions([buildSession('s1')]);
+        markSessionVisible('s1');
         const appliedBatches: Session[][] = [];
         const applySessions = vi.fn<HandleUpdateContainerBaseParams['applySessions']>((sessions) => {
             const nextSessions = sessions.map((session) => ({
@@ -854,6 +1073,7 @@ describe('socket update handling: plaintext update-session', () => {
     it('drops queued durable session updates when the session is deleted before the coalesced flush', async () => {
         vi.useFakeTimers();
         storage.getState().applySessions([buildSession('s1')]);
+        markSessionVisible('s1');
         const applySessions = vi.fn<HandleUpdateContainerBaseParams['applySessions']>((sessions) => {
             storage.getState().applySessions(sessions.map((session) => ({
                 ...session,
@@ -1930,6 +2150,117 @@ describe('socket update handling: plaintext update-session', () => {
         expect((params.applySessions as unknown as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
     });
 
+    it('coalesces cache-only metadata versions when only non-rendered read-state time changes', async () => {
+        vi.useFakeTimers();
+        storage.getState().replaceSessionListRenderables([{
+            id: 's_cached_metadata_clock_only',
+            seq: 9,
+            createdAt: 1,
+            updatedAt: 1,
+            active: false,
+            activeAt: 1,
+            archivedAt: null,
+            metadataVersion: 1,
+            agentStateVersion: 0,
+            metadata: {
+                path: '/tmp',
+                host: 'localhost',
+                readStateV1: { v: 1, sessionSeq: 1, pendingActivityAt: 0, updatedAt: 1 },
+            },
+            latestReadyEventSeq: 9,
+            hasUnreadMessages: true,
+            thinking: false,
+            thinkingAt: 0,
+            presence: 1,
+        }]);
+
+        const params = buildBaseParams();
+        await handleUpdateContainer({
+            ...params,
+            updateData: {
+                id: 'u_cached_metadata_clock_only',
+                seq: 10,
+                createdAt: 2,
+                body: {
+                    t: 'update-session',
+                    id: 's_cached_metadata_clock_only',
+                    metadata: {
+                        version: 2,
+                        value: JSON.stringify({
+                            path: '/tmp',
+                            host: 'localhost',
+                            readStateV1: { v: 1, sessionSeq: 1, pendingActivityAt: 0, updatedAt: 2 },
+                        }),
+                    },
+                },
+            },
+        });
+
+        expect(storage.getState().sessionListRenderables.s_cached_metadata_clock_only?.metadataVersion).toBe(1);
+        await vi.runAllTimersAsync();
+        expect(storage.getState().sessionListRenderables.s_cached_metadata_clock_only?.metadataVersion).toBe(2);
+    });
+
+    it('drops queued cache-only metadata hydration when the session is deleted', async () => {
+        vi.useFakeTimers();
+        const sessionId = 's_deleted_before_metadata_hydration';
+        const buildRenderable = (metadataVersion: number) => ({
+            id: sessionId,
+            seq: 9,
+            createdAt: 1,
+            updatedAt: 1,
+            active: false,
+            activeAt: 1,
+            archivedAt: null,
+            metadataVersion,
+            agentStateVersion: 0,
+            metadata: { path: `/version-${metadataVersion}`, host: 'localhost' },
+            thinking: false,
+            thinkingAt: 0,
+            presence: 1,
+        });
+        storage.getState().replaceSessionListRenderables([buildRenderable(1)]);
+        const params = buildBaseParams();
+        const applyMetadataVersion = async (version: number) => {
+            await handleUpdateContainer({
+                ...params,
+                updateData: {
+                    id: `u_metadata_${version}`,
+                    seq: 9 + version,
+                    createdAt: version,
+                    body: {
+                        t: 'update-session',
+                        id: sessionId,
+                        metadata: {
+                            version,
+                            value: JSON.stringify({ path: `/version-${version}`, host: 'localhost' }),
+                        },
+                    },
+                },
+            });
+        };
+
+        await applyMetadataVersion(2);
+        await applyMetadataVersion(3);
+        await handleUpdateContainer({
+            ...params,
+            updateData: {
+                id: 'u_delete_before_metadata_hydration',
+                seq: 13,
+                createdAt: 4,
+                body: { t: 'delete-session', sid: sessionId },
+            },
+        });
+        storage.getState().replaceSessionListRenderables([buildRenderable(1)]);
+
+        await vi.runAllTimersAsync();
+
+        expect(storage.getState().sessionListRenderables[sessionId]).toEqual(expect.objectContaining({
+            metadata: expect.objectContaining({ path: '/version-1' }),
+            metadataVersion: 1,
+        }));
+    });
+
     it('applies urgent cache-only pending projection immediately after queued non-urgent progress', async () => {
         vi.useFakeTimers();
         storage.getState().replaceSessionListRenderables([
@@ -2272,6 +2603,52 @@ describe('socket update handling: plaintext update-session', () => {
         expect((params.applySessions as unknown as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
     });
 
+    it('does not apply plaintext cache-only metadata while this client requires E2EE', async () => {
+        storage.getState().applySettingsLocal({
+            clientEncryptionRequirementLocalV1: 'require_e2ee',
+        });
+        storage.getState().replaceSessionListRenderables([
+            {
+                id: 's_cached_plaintext_blocked',
+                seq: 1,
+                createdAt: 1,
+                updatedAt: 1,
+                active: true,
+                activeAt: 1,
+                archivedAt: null,
+                metadataVersion: 1,
+                agentStateVersion: 0,
+                metadata: { path: '/before', host: 'localhost' },
+                thinking: false,
+                thinkingAt: 0,
+                presence: 'online',
+            },
+        ]);
+
+        const params = buildBaseParams();
+        await handleUpdateContainer({
+            ...params,
+            updateData: {
+                id: 'u_plain_metadata_cache_only_blocked',
+                seq: 14,
+                createdAt: 1238,
+                body: {
+                    t: 'update-session',
+                    id: 's_cached_plaintext_blocked',
+                    metadata: { version: 2, value: JSON.stringify({ path: '/after', host: 'devbox' }) },
+                },
+            },
+        });
+
+        expect(storage.getState().sessionListRenderables['s_cached_plaintext_blocked']).toEqual(
+            expect.objectContaining({
+                metadata: expect.objectContaining({ path: '/before', host: 'localhost' }),
+                metadataVersion: 1,
+            }),
+        );
+        expect((params.applySessions as unknown as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
+    });
+
     it('recomputes cache-only unread state after metadata read-state updates are applied', async () => {
         storage.getState().replaceSessionListRenderables([
             {
@@ -2333,7 +2710,7 @@ describe('socket update handling: plaintext update-session', () => {
         expect((params.applySessions as unknown as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
     });
 
-    it('patches cache-only encrypted metadata while deferring hidden encrypted agentState', async () => {
+    it('defers cache-only encrypted metadata and agent state while applying public projections', async () => {
         storage.getState().replaceSessionListRenderables([
             {
                 id: 's_cached_encrypted_metadata',
@@ -2354,6 +2731,7 @@ describe('socket update handling: plaintext update-session', () => {
 
         const decryptMetadata = vi.fn(async () => ({ path: '/work', host: 'devbox', name: 'Renamed' }));
         const decryptAgentState = vi.fn(async () => ({ controlledByUser: true }));
+        const markSessionStateHydrationDeferred = vi.fn();
         const params = buildBaseParams({
             encryption: {
                 getSessionEncryption: () => ({
@@ -2363,6 +2741,7 @@ describe('socket update handling: plaintext update-session', () => {
                 getMachineEncryption: () => null,
                 removeSessionEncryption: () => {},
             } as unknown as HandleUpdateContainerBaseParams['encryption'],
+            markSessionStateHydrationDeferred,
         });
 
         await handleUpdateContainer({
@@ -2382,12 +2761,13 @@ describe('socket update handling: plaintext update-session', () => {
             },
         });
 
-        expect(decryptMetadata).toHaveBeenCalledTimes(1);
+        expect(decryptMetadata).not.toHaveBeenCalled();
         expect(decryptAgentState).not.toHaveBeenCalled();
+        expect(markSessionStateHydrationDeferred).toHaveBeenCalledWith('s_cached_encrypted_metadata');
         expect(storage.getState().sessionListRenderables['s_cached_encrypted_metadata']).toEqual(
             expect.objectContaining({
-                metadata: expect.objectContaining({ path: '/work', host: 'devbox', name: 'Renamed' }),
-                metadataVersion: 2,
+                metadata: expect.objectContaining({ path: '/tmp', host: 'localhost' }),
+                metadataVersion: 1,
                 agentStateVersion: 1,
                 latestTurnStatus: 'completed',
                 latestTurnStatusObservedAt: 1239,

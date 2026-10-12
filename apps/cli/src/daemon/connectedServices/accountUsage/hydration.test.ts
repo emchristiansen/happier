@@ -205,6 +205,34 @@ describe('hydrateProviderAccountUsageStoreFromCurrentSources', () => {
     expect(store.resolveBySource(source)?.recordId).toBe(snapshot.recordId);
   });
 
+  it('hydrates future-dated evidence as stale and schedules a bounded refresh', async () => {
+    const snapshot = createUsageSnapshot();
+    const store = createProviderAccountUsageStore();
+    const nowMs = snapshot.fetchedAtMs - 60_000;
+
+    const result = await hydrateProviderAccountUsageStoreFromCurrentSources({
+      sources: [source],
+      resolveRecordIdForSource: async () => createSourceResolution(snapshot),
+      api: {
+        getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
+        getProviderAccountUsageSnapshotPlain: vi.fn(async () => ({
+          content: { t: 'plain' as const, v: snapshot },
+          sources: [source],
+        })),
+      },
+      credentials: createCredentials(),
+      store,
+      nowMs,
+    });
+
+    expect(result.dispositions).toEqual([{
+      source,
+      status: 'hydrated_stale',
+      recordId: snapshot.recordId,
+    }]);
+    expect(result.refreshSources).toEqual([source]);
+  });
+
   it('returns missing current sources for refresh without mutating the store', async () => {
     const store = createProviderAccountUsageStore();
 

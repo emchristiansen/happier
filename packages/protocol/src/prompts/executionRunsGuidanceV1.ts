@@ -1,4 +1,5 @@
 import { buildBackendTargetKey, type BackendTargetRefV1 } from '../backendTargets/backendTargetRef.js';
+import { MAX_EXECUTION_RUN_OBSERVATION_TIMEOUT_SECONDS } from '../executionRunObservationTimeout.js';
 
 type ExecutionRunsGuidanceIntentV1 = 'review' | 'plan' | 'delegate';
 
@@ -34,7 +35,7 @@ Use the current backend's native subagent facility by default. Treat generic req
 - In a session-agent call, omit \`sessionId\` to use the current invoking session. Supply it only for an intentional explicit cross-session target.
 - Resolve dependent values through \`action_options_resolve\` (the \`action.options.resolve\` action) with the partial action draft. Backend targets select provider/backend implementations, not parallelism slots. Respect the requested backend, model, account, and service.
 - A typed retryable rate limit may be retried; backend substitution requires authorization.
-- Use start-and-wait or \`execution.run.wait\` for bounded observation. A wait timeout means the run may still be active.`;
+- Use start-and-wait or the direct \`execution_run_wait\` MCP tool for one event-driven observation. After start returns a run id, prefer the direct \`execution_run_wait\`, \`execution_run_get\`, and \`execution_run_list\` tools over wrapping those Actions in \`action_execute\`; their read-only nature can be classified without an automatic approval review. Bound each MCP wait to at most ${MAX_EXECUTION_RUN_OBSERVATION_TIMEOUT_SECONDS} seconds and repeat the event wait if the run remains active. Do not poll \`execution.run.get\` or \`execution.run.list\`. A wait timeout means the run may still be active.`;
 
 export function buildExecutionRunsGuidanceBlockV1(params: Readonly<{
   entries: readonly ExecutionRunsGuidanceEntryV1[];

@@ -1,18 +1,30 @@
-import { writeFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
 import expoConstantsStub from './expoConstantsStub';
 import expoModulesCoreStub from './expoModulesCoreStub';
 import * as reactNativeRootStub from './reactNativeStub';
 import reactNativeInternalProxy from './reactNativeInternalStub';
 import reactNativeVirtualizedListsStub from './reactNativeVirtualizedListsStub';
+import { getVitestNodeBuiltin } from './vitestNodeBuiltins';
 
 type NodeModuleWithLoader = {
     _load?: (...args: unknown[]) => unknown;
     _extensions?: Record<string, (mod: { exports: unknown }, filename: string) => void>;
 };
+
+type NodeBuiltinModule = Readonly<{
+    createRequire: (filename: string | URL) => (id: string) => unknown;
+}>;
+
+type NodeBuiltinPath = Readonly<{
+    resolve: (...paths: string[]) => string;
+}>;
+
+type NodeBuiltinUrl = Readonly<{
+    fileURLToPath: (url: string | URL) => string;
+}>;
+
+type NodeBuiltinFs = Readonly<{
+    writeFileSync: (path: string, data: string) => void;
+}>;
 
 export type VitestRnShimOptions = Readonly<{
     traceFile?: string | null;
@@ -48,7 +60,13 @@ export function installVitestRnShim(options: VitestRnShimOptions = {}): void {
     globalState[SHIM_INSTALLED_KEY] = true;
 
     const traceFile = options.traceFile ?? process.env.VITEST_TRACE_LOAD ?? null;
-    const nodeRequire = createRequire(import.meta.url);
+    // Vitest transforms setup files in jsdom's client mode. Static `node:*` imports are replaced
+    // with browser-external shims there even though the test still runs inside Node. Resolve the
+    // genuine builtins from the host process so this shared setup works in both node and jsdom.
+    const { createRequire } = getVitestNodeBuiltin<NodeBuiltinModule>('node:module');
+    const { resolve } = getVitestNodeBuiltin<NodeBuiltinPath>('node:path');
+    const { fileURLToPath } = getVitestNodeBuiltin<NodeBuiltinUrl>('node:url');
+    const { writeFileSync } = getVitestNodeBuiltin<NodeBuiltinFs>('node:fs');
     const sourcesDir = (() => {
         try {
             const url = new URL('..', import.meta.url);
@@ -60,6 +78,16 @@ export function installVitestRnShim(options: VitestRnShimOptions = {}): void {
         // Fall back to the UI workspace root.
         return resolve(process.cwd(), 'sources');
     })();
+    const requireBase = (() => {
+        try {
+            const url = new URL(import.meta.url);
+            if (url.protocol === 'file:') return url;
+        } catch {
+            // ignore
+        }
+        return resolve(sourcesDir, 'dev', 'vitestRnShim.ts');
+    })();
+    const nodeRequire = createRequire(requireBase);
     const Module = nodeRequire('node:module') as NodeModuleWithLoader;
     const recentLoads: string[] = [];
 

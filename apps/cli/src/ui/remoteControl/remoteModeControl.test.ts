@@ -72,6 +72,15 @@ describe('resolveRemoteModeControlSurface', () => {
     ).toBe('static');
   });
 
+  it.each(['zellij', 'herdr'])('uses a static control surface for daemon-started %s sessions with a TTY', (terminalMode) => {
+    expect(resolveRemoteModeControlSurface({
+      stdoutIsTTY: true,
+      stdinIsTTY: true,
+      startedBy: 'daemon',
+      terminalMode,
+    })).toBe('static');
+  });
+
   it('keeps daemon-started plain sessions non-interactive', () => {
     expect(
       resolveRemoteModeControlSurface({

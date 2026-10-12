@@ -22,12 +22,14 @@ import type {
 } from './pendingQueueV2Transport';
 import type {
   PendingProviderAction,
+  PendingRequestedActionV1,
   SessionTranscriptObservationProvenanceV1,
   SessionPendingQueueDeliveryTiming,
   SessionSystemRecord,
   SessionSystemRecordKind,
   SessionSystemRecordNamespace,
   SessionSystemRecordUpsertRequest,
+  SessionTurnsProjectionV1,
 } from '@happier-dev/protocol';
 import type { EphemeralSendResult } from './ephemeralSendOutcome';
 import type { RuntimeActivitySnapshotTail } from './mutations/createSessionMutationOutbox';
@@ -75,6 +77,7 @@ export type SessionUserMessageDeliveryInfo = Readonly<{
   seq: number | null;
   providerAcceptancePending?: boolean | undefined;
   pendingProviderAction?: PendingProviderAction | undefined;
+  pendingRequestedAction?: PendingRequestedActionV1 | undefined;
 }>;
 
 export interface SessionClientPort {
@@ -110,6 +113,7 @@ export interface SessionClientPort {
   hasActiveCanonicalTurn?(): boolean;
   fetchCommittedClaudeJsonlMessageBaseline?(opts?: { take?: number }): Promise<import('@/backends/claude/utils/claudeJsonlMessageKey').CommittedClaudeJsonlMessageBaseline>;
   fetchRecentTranscriptTextItemsForAcpImport?(opts?: { take?: number }): Promise<Array<{ role: 'user' | 'agent'; text: string }>>;
+  fetchCommittedTranscriptIdentitySnapshot?(): Promise<import('./transcriptQueries').CommittedTranscriptIdentitySnapshot>;
   sendAgentMessage(provider: ACPProvider, body: ACPMessageData, opts?: { localId?: string; meta?: Record<string, unknown> }): void;
   sendAgentMessageCommitted(provider: ACPProvider, body: ACPMessageData, opts: { localId: string; meta?: Record<string, unknown> }): Promise<void>;
   sendAgentMessageEphemeral?(
@@ -149,6 +153,7 @@ export interface SessionClientPort {
     ctx?: SessionEncryptionContext;
   }>;
   getAgentStateSnapshot?(): AgentState | null;
+  readSessionTurnsProjection?(): Promise<SessionTurnsProjectionV1 | null>;
   sessionTurnLifecycle?: SessionTurnLifecycleController;
 
   keepAlive(thinking: boolean, mode: 'local' | 'remote'): void;

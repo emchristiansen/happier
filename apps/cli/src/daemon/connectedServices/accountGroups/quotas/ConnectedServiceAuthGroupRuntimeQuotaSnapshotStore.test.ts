@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore } from './ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore';
 import {
@@ -37,6 +37,10 @@ function quotaSnapshot(input: Readonly<{
 }
 
 describe('ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('stores runtime quota snapshots per service/group/profile and exposes candidate runtime state', () => {
     const store = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
 
@@ -92,6 +96,8 @@ describe('ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore', () => {
             remainingPct: 0,
             resetAtMs: 5_000,
             providerLimitId: 'primary_window',
+            windowDurationMs: null,
+            reliable: true,
           },
         ],
         exhausted: true,
@@ -164,6 +170,8 @@ describe('ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore', () => {
             remainingPct: 30,
             resetAtMs: 7_000,
             providerLimitId: null,
+            windowDurationMs: null,
+            reliable: true,
           },
           {
             meterId: 'weekly',
@@ -171,6 +179,8 @@ describe('ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore', () => {
             remainingPct: 5,
             resetAtMs: 9_000,
             providerLimitId: null,
+            windowDurationMs: null,
+            reliable: true,
           },
         ],
         exhausted: false,
@@ -319,6 +329,8 @@ describe('ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore', () => {
             remainingPct: 0,
             resetAtMs: 10_000,
             providerLimitId: 'server_overloaded',
+            windowDurationMs: null,
+            reliable: true,
           },
         ],
         exhausted: false,
@@ -378,6 +390,29 @@ describe('ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore', () => {
       groupId: 'main',
       capturedAtMs: 2_500,
     }).get('primary')?.quotaSnapshot?.effectiveRemainingPercent).toBe(85);
+  });
+
+  it('replaces a retained future-dated snapshot with a current observation', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const store = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
+
+    store.recordProfileSnapshot({
+      serviceId: 'openai-codex',
+      profileId: 'primary',
+      snapshot: quotaSnapshot({ profileId: 'primary', fetchedAt: 100_000, utilizationPct: 100 }),
+    });
+    store.recordProfileSnapshot({
+      serviceId: 'openai-codex',
+      profileId: 'primary',
+      snapshot: quotaSnapshot({ profileId: 'primary', fetchedAt: 10_000, utilizationPct: 10 }),
+    });
+
+    expect(store.getSnapshot({
+      serviceId: 'openai-codex',
+      groupId: 'main',
+      profileId: 'primary',
+    })).toMatchObject({ fetchedAt: 10_000 });
   });
 
   it('makes high-utilization Claude passive quota evidence fresh for predictive soft switching', () => {

@@ -24,8 +24,7 @@ import {
     type ClaudeCompletionEvent,
 } from './contextCompactionEvents';
 import {
-    confirmClaudeRemoteProviderPromptAccepted,
-    reportClaudeRemoteProviderPromptTransportFailure,
+    createClaudeRemotePromptSettlementTracker,
     type ClaudeRemoteProviderAcceptedPrompt,
     type ClaudeRemoteProviderPromptAcceptedHandler,
     type ClaudeRemoteProviderPromptTransportFailureHandler,
@@ -34,6 +33,8 @@ import type { createClaudeProviderRuntimeActivityAdapter } from './providerActiv
 import { isClaudeLegacyRequiredHookObservationFailure } from './remote/runtimeActivityEvidence';
 import { materializeClaudeMcpConfigArgsForSpawn } from './utils/materializeClaudeMcpConfigArgsForSpawn';
 import { normalizeCurrentHappierSessionId } from '@/agent/runtime/session/currentSessionIdEnv';
+import { hasClaudeQueuedUserTurns } from './remote/resultTurnBoundary';
+import type { ClaudeEffectiveModelObservation } from './sessionModels/effectiveModelUpdate';
 
 function buildClaudeEffortArgs(params: Readonly<{
     modelId: unknown;
@@ -149,6 +150,7 @@ export async function claudeRemote(opts: {
     onSessionFound: (id: string) => void,
     onThinkingChange?: (thinking: boolean) => void,
     onMessage: (message: SDKMessage) => void,
+    onEffectiveModel?: (facts: ClaudeEffectiveModelObservation) => void,
     onCompletionEvent?: (event: ClaudeCompletionEvent) => void,
     onSessionReset?: () => void,
     setUserMessageSender?: (sender: ((message: SDKUserMessage) => void) | null) => void,
@@ -198,6 +200,14 @@ export async function claudeRemote(opts: {
         return;
     }
 
+    const promptSettlements = createClaudeRemotePromptSettlementTracker({
+        onAccepted: opts.onPromptAcceptedByProvider,
+        onTransportFailure: opts.onPromptTransportFailure,
+    });
+    promptSettlements.track(initial);
+
+    try {
+
     // Handle special commands
     const specialCommand = parseSpecialCommand(initial.message);
 
@@ -209,6 +219,7 @@ export async function claudeRemote(opts: {
         if (opts.onSessionReset) {
             opts.onSessionReset();
         }
+        promptSettlements.accept(initial);
         return;
     }
 
@@ -306,44 +317,11 @@ export async function claudeRemote(opts: {
         }
     };
 
-    type ProviderInputEnvelope = Readonly<{
-        message: SDKUserMessage;
-        acceptedPrompt?: ClaudeRemoteProviderAcceptedPrompt<EnhancedMode>;
-    }>;
-    const messages = new PushableAsyncIterable<ProviderInputEnvelope>();
-    const pendingPromptByMessage = new WeakMap<object, ClaudeRemoteProviderAcceptedPrompt<EnhancedMode>>();
-    const providerMessages: AsyncIterable<SDKUserMessage> = {
-        async *[Symbol.asyncIterator]() {
-            for await (const envelope of messages) {
-                if (envelope.acceptedPrompt) {
-                    pendingPromptByMessage.set(envelope.message, envelope.acceptedPrompt);
-                }
-                yield envelope.message;
-            }
-        },
-    };
+    const messages = new PushableAsyncIterable<SDKUserMessage>();
     // Start the loop
     const response = query({
-        prompt: providerMessages,
+        prompt: messages,
         options: sdkOptions,
-        onPromptTransportOutcome: (message, outcome) => {
-            if (!message || typeof message !== 'object') return;
-            const acceptedPrompt = pendingPromptByMessage.get(message);
-            if (!acceptedPrompt) return;
-            pendingPromptByMessage.delete(message);
-            if (outcome === 'accepted') {
-                confirmClaudeRemoteProviderPromptAccepted(
-                    opts.onPromptAcceptedByProvider,
-                    acceptedPrompt,
-                );
-                return;
-            }
-            reportClaudeRemoteProviderPromptTransportFailure(
-                opts.onPromptTransportFailure,
-                acceptedPrompt,
-                outcome,
-            );
-        },
         onMessageReceived: (message) => {
             if (isClaudeHookLifecycleStreamMessage(message)) return;
             logger.debugLargeJson(`[claudeRemote] Message ${message.type}`, message);
@@ -352,17 +330,15 @@ export async function claudeRemote(opts: {
     });
     opts.onWorkflowActivityObserverReady?.();
     await opts.runtimeActivityAdapter?.activateObservation('claude-legacy-provider-observer-installed');
-    opts.setUserMessageSender?.((message: SDKUserMessage) => messages.push({ message }));
+    opts.setUserMessageSender?.((message: SDKUserMessage) => messages.push(message));
     messages.push({
+        type: 'user',
         message: {
-            type: 'user',
-            message: {
-                role: 'user',
-                content: initial.message,
-            },
+            role: 'user',
+            content: initial.message,
         },
-        acceptedPrompt: initial,
     });
+    promptSettlements.accept(initial);
 
     const interruptTurn = async (): Promise<void> => {
         try {
@@ -393,6 +369,9 @@ export async function claudeRemote(opts: {
                 updateThinking(true);
 
                 const systemInit = message as SDKSystemMessage;
+                if (typeof systemInit.model === 'string' && systemInit.model.trim() && effortArgs[1]) {
+                    opts.onEffectiveModel?.({ modelId: systemInit.model.trim(), reasoningEffort: effortArgs[1] });
+                }
                 if (systemInit.session_id) {
                     currentProviderSessionId = systemInit.session_id;
                     // Do not block on filesystem writes here.
@@ -408,6 +387,9 @@ export async function claudeRemote(opts: {
 
             // Handle result messages
             if (message.type === 'result') {
+                // The CLI already owns these sends; keep draining its result stream rather
+                // than waiting for another Pending message while that work is still running.
+                if (hasClaudeQueuedUserTurns(message)) continue;
                 updateThinking(false);
                 logger.debug('[claudeRemote] Result received, exiting claudeRemote');
 
@@ -427,11 +409,10 @@ export async function claudeRemote(opts: {
                     messages.end();
                     return;
                 }
+                promptSettlements.track(next);
                 mode = next.mode;
-                messages.push({
-                    message: { type: 'user', message: { role: 'user', content: next.message } },
-                    acceptedPrompt: next,
-                });
+                messages.push({ type: 'user', message: { role: 'user', content: next.message } });
+                promptSettlements.accept(next);
             }
 
             // Handle tool result
@@ -460,6 +441,11 @@ export async function claudeRemote(opts: {
         updateThinking(false);
     }
     } finally {
-        await materializedMcpConfig.cleanup();
+        // File retirement is nonfatal to the completed provider outcome. Its owner
+        // records incomplete cleanup by default; do not mask an existing turn error.
+        await materializedMcpConfig.cleanup().catch(() => undefined);
+    }
+    } finally {
+        promptSettlements.settleUnresolved();
     }
 }

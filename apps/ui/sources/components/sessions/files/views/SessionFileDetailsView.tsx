@@ -598,7 +598,6 @@ export function SessionFileDetailsView(props: SessionFileDetailsViewProps) {
             <View
                 style={{
                     flex: 1,
-                    minHeight: 0,
                     position: 'relative',
                     width: '100%',
                     ...(constrainWidth ? { maxWidth: layout.maxWidth, alignSelf: 'center' } : { maxWidth: '100%' }),
@@ -673,6 +672,10 @@ export function SessionFileDetailsView(props: SessionFileDetailsViewProps) {
                             filePath={filePath}
                             imagePreviewUri={imagePreviewUri}
                             imagePreviewSvgXml={imagePreviewSvgXml}
+                            sessionId={sessionId}
+                            videoMimeType={fileContent?.binaryMime?.startsWith('video/') ? fileContent.binaryMime : null}
+                            videoPreviewRevision={fileContent?.binaryPreviewRevision}
+                            isActive={isActive}
                         />
                     </ScrollView>
                 ) : (
@@ -725,7 +728,6 @@ export function SessionFileDetailsView(props: SessionFileDetailsViewProps) {
 const styles = StyleSheet.create((theme) => ({
     container: {
         flex: 1,
-        minHeight: 0,
         backgroundColor: theme.colors.surface.base,
     },
     noticeBanner: {

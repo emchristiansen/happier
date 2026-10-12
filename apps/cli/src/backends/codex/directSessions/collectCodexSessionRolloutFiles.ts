@@ -1,6 +1,9 @@
 import { readdir, stat } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 
+import { readCodexSessionMetaFromRollout } from '../localControl/rolloutDiscovery';
+import { isMatchingCodexRolloutFileName, isMatchingCodexRolloutIdentity, parseCodexRolloutFilename } from '../utils/codexSessionFiles';
+
 export type CodexRolloutFile = Readonly<{ filePath: string; fileRelPath: string; sortMs: number; mtimeMs: number }>;
 
 function parseRolloutTimestampFromFilename(filePath: string): number | null {
@@ -89,9 +92,8 @@ async function collectRolloutMatchesFromFlatDir(params: Readonly<{ codexHome: st
     if (!entry.isFile()) continue;
     const name = typeof entry.name === 'string' ? entry.name : String(entry.name);
     if (!name.startsWith('rollout-') || !name.endsWith('.jsonl')) continue;
-    if (!name.includes(params.remoteSessionId)) continue;
-
     const filePath = join(params.dir, name);
+    if (!(await isMatchingRolloutFile(filePath, params.remoteSessionId))) continue;
     try {
       const s = await stat(filePath);
       const fromName = parseRolloutTimestampFromFilename(filePath);
@@ -105,6 +107,19 @@ async function collectRolloutMatchesFromFlatDir(params: Readonly<{ codexHome: st
   }
 
   return matches;
+}
+
+async function isMatchingRolloutMetadata(filePath: string, remoteSessionId: string): Promise<boolean> {
+  const metadata = await readCodexSessionMetaFromRollout(filePath);
+  const metadataId = typeof metadata?.id === 'string' ? metadata.id.trim() : '';
+  if (!metadataId) return false;
+  return isMatchingCodexRolloutIdentity(metadataId, remoteSessionId);
+}
+
+async function isMatchingRolloutFile(filePath: string, remoteSessionId: string): Promise<boolean> {
+  if (isMatchingCodexRolloutFileName(filePath.split(/[/\\\\]/).pop() ?? '', remoteSessionId)) return true;
+  if (parseCodexRolloutFilename(filePath)?.threadId) return false;
+  return isMatchingRolloutMetadata(filePath, remoteSessionId);
 }
 
 export async function collectCodexSessionRolloutFiles(params: Readonly<{ codexHome: string; remoteSessionId: string }>): Promise<CodexRolloutFile[]> {
@@ -146,7 +161,7 @@ export async function collectCodexSessionRolloutFiles(params: Readonly<{ codexHo
       }
       if (!entry.isFile()) continue;
       if (!name.startsWith('rollout-') || !name.endsWith('.jsonl')) continue;
-      if (!name.includes(params.remoteSessionId)) continue;
+      if (!(await isMatchingRolloutFile(full, params.remoteSessionId))) continue;
       try {
         const s = await stat(full);
         const fromName = parseRolloutTimestampFromFilename(full);

@@ -94,7 +94,7 @@ function areWorkspaceRefsEqual(
         && previous.rootPath === next.rootPath;
 }
 
-function areSessionListIndexItemsEqual(
+export function areSessionListIndexItemsEqual(
     previous: SessionListIndexItem | null | undefined,
     next: SessionListIndexItem | null | undefined,
 ): boolean {
@@ -141,6 +141,47 @@ function areSessionListIndexItemsEqual(
         && (previousHint?.rootPath ?? null) === (nextHint?.rootPath ?? null)
         && areWorkspaceRefsEqual(previous.workspace ?? null, next.workspace ?? null)
         && areMachineDisplayRenderablesEqual(previous.machine ?? null, next.machine ?? null);
+}
+
+export function buildSessionListIndexItemFromViewItem(item: SessionListViewItem): SessionListIndexItem {
+    if (item.type === 'header') {
+        return {
+            type: 'header',
+            title: item.title,
+            headerKind: item.headerKind,
+            groupKey: item.groupKey,
+            workspaceKey: item.workspaceKey,
+            seedSessionId: item.seedSessionId ?? null,
+            workspaceScopeHint: item.workspaceScopeHint ?? null,
+            serverId: item.serverId,
+            serverName: item.serverName,
+            subtitle: item.subtitle,
+            machine: item.machine,
+            folderId: item.folderId,
+            folderDepth: item.depth,
+            workspace: item.workspace,
+        };
+    }
+
+    return {
+        type: 'session',
+        sessionId: item.session.id,
+        storageKind: getSessionStorageKind(item.session),
+        section: item.section,
+        groupKey: item.groupKey,
+        groupKind: item.groupKind,
+        pinned: item.pinned,
+        variant: item.variant,
+        archivedAt: item.session.archivedAt ?? null,
+        keepVisibleWhenInactive: item.session.keepVisibleWhenInactive === true,
+        attentionPromotionReason: item.attentionPromotionReason,
+        workingPlacementReason: item.workingPlacementReason,
+        serverId: item.serverId,
+        serverName: item.serverName,
+        folderId: item.folderId,
+        folderDepth: item.folderDepth,
+        workspace: item.workspace,
+    };
 }
 
 /**
@@ -235,51 +276,7 @@ export function buildSessionListIndexFromViewData(
 
     let didChange = false;
     const next = items.map((item) => {
-        if (item.type === 'header') {
-            const nextItem: SessionListIndexItem = {
-                type: 'header',
-                title: item.title,
-                headerKind: item.headerKind,
-                groupKey: item.groupKey,
-                workspaceKey: item.workspaceKey,
-                seedSessionId: item.seedSessionId ?? null,
-                workspaceScopeHint: item.workspaceScopeHint ?? null,
-                serverId: item.serverId,
-                serverName: item.serverName,
-                subtitle: item.subtitle,
-                machine: item.machine,
-                folderId: item.folderId,
-                folderDepth: item.depth,
-                workspace: item.workspace,
-            };
-            const key = buildSessionListIndexNodeId(nextItem);
-            const previousItem = previousByKey?.get(key) ?? null;
-            if (previousItem && areSessionListIndexItemsEqual(previousItem, nextItem)) {
-                return previousItem;
-            }
-            didChange = true;
-            return nextItem;
-        }
-
-        const nextItem: SessionListIndexItem = {
-            type: 'session',
-            sessionId: item.session.id,
-            storageKind: getSessionStorageKind(item.session),
-            section: item.section,
-            groupKey: item.groupKey,
-            groupKind: item.groupKind,
-            pinned: item.pinned,
-            variant: item.variant,
-            archivedAt: item.session.archivedAt ?? null,
-            keepVisibleWhenInactive: item.session.keepVisibleWhenInactive === true,
-            attentionPromotionReason: item.attentionPromotionReason,
-            workingPlacementReason: item.workingPlacementReason,
-            serverId: item.serverId,
-            serverName: item.serverName,
-            folderId: item.folderId,
-            folderDepth: item.folderDepth,
-            workspace: item.workspace,
-        };
+        const nextItem = buildSessionListIndexItemFromViewItem(item);
         const key = buildSessionListIndexNodeId(nextItem);
         const previousItem = previousByKey?.get(key) ?? null;
         if (previousItem && areSessionListIndexItemsEqual(previousItem, nextItem)) {

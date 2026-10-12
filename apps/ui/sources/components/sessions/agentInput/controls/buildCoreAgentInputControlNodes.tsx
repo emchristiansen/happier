@@ -53,9 +53,8 @@ export function buildCoreAgentInputControlNodes(params: Readonly<{
     agentChipAnchorRef: React.RefObject<View | null>;
     agentLabel: string;
     engineLabel: string;
-    /** Hover/focus/press-in on the Agent chip, before the picker opens. */
-    onAgentIntent?: () => void;
     onAgentPress: () => void;
+    onAgentIntent?: () => void;
     machineChipAnchorRef: React.RefObject<View | null>;
     onMachinePress?: () => void;
     machineName?: string | null;

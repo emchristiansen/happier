@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -12,6 +12,37 @@ function jsonlLine(value: unknown): string {
 }
 
 describe('pageClaudeTranscript', () => {
+  it('fails observably when the existing oversized-line budget cannot establish a safe tail', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-claude-direct-page-'));
+    const configDir = join(root, '.claude');
+    const sessionFile = join(configDir, 'projects', 'proj-a', 'sess-1.jsonl');
+    await mkdir(join(configDir, 'projects', 'proj-a'), { recursive: true });
+    await writeFile(sessionFile, JSON.stringify({ text: 'x'.repeat(8 * 1024 * 1024) }).slice(0, -1), 'utf8');
+    const params = { source: { kind: 'claudeConfig' as const, configDir, projectId: 'proj-a' }, env: {}, remoteSessionId: 'sess-1', maxBytes: 1024, maxItems: 1 };
+
+    await expect(pageClaudeTranscript({ ...params, direction: 'older' })).rejects.toThrow(/tail boundary/);
+    await expect(readAfterClaudeTranscript({ ...params, cursor: 'tail' })).rejects.toThrow(/tail boundary/);
+  });
+
+  it.each([true, false])('delivers a terminal message completed after the latest-page snapshot (earlier message: %s)', async (hasEarlierMessage) => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-claude-direct-page-'));
+    const configDir = join(root, '.claude');
+    const sessionFile = join(configDir, 'projects', 'proj-a', 'sess-1.jsonl');
+    await mkdir(join(configDir, 'projects', 'proj-a'), { recursive: true });
+    const complete = hasEarlierMessage ? jsonlLine({ type: 'user', uuid: 'u1', message: { content: 'before' } }) : '';
+    const pending = JSON.stringify({ type: 'user', uuid: 'u2', message: { content: 'completed after snapshot' } });
+    await writeFile(sessionFile, complete + pending.slice(0, -1), 'utf8');
+    const params = { source: { kind: 'claudeConfig' as const, configDir, projectId: 'proj-a' }, env: {}, remoteSessionId: 'sess-1', maxBytes: 1024, maxItems: 1 };
+
+    const page = await pageClaudeTranscript({ ...params, direction: 'older' });
+    expect(page.items).toHaveLength(hasEarlierMessage ? 1 : 0);
+    expect(page.tailCursor).toBeTruthy();
+    await appendFile(sessionFile, pending.slice(-1) + '\n', 'utf8');
+
+    const followed = await readAfterClaudeTranscript({ ...params, cursor: page.tailCursor! });
+    expect(followed.items.map((item) => item.raw)).toEqual([{ role: 'user', content: { type: 'text', text: 'completed after snapshot' } }]);
+  });
+
   it('pages a Claude session JSONL file from newest backwards', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-claude-direct-page-'));
     const configDir = join(root, '.claude');

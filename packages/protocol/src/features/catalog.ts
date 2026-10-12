@@ -87,6 +87,24 @@ const FEATURE_CATALOG_DEFINITION = {
     dependencies: ['connectedServices.accountFallback', 'connectedServices.quotas'],
     representation: 'server',
   },
+  'connectedServices.autoDisablePlanInvalid': {
+    description: 'Opt-in automatic pool-member disable after a model-entitlement failure.',
+    defaultFailMode: 'fail_closed',
+    dependencies: ['connectedServices.accountFallback'],
+    representation: 'server',
+  },
+  'connectedServices.poolQuotaLimitSelection': {
+    description: 'Provider-limit-aware quota selection for connected service account pools.',
+    defaultFailMode: 'fail_closed',
+    dependencies: ['connectedServices.accountFallback', 'connectedServices.quotas'],
+    representation: 'server',
+  },
+  'connectedServices.poolExpiryFirst': {
+    description: 'Expiry-first selection strategy for connected service account pools.',
+    defaultFailMode: 'fail_closed',
+    dependencies: ['connectedServices.accountGroups'],
+    representation: 'server',
+  },
   channelBridges: {
     description: 'Channel bridge integrations (Telegram/Discord/etc).',
     defaultFailMode: 'fail_closed',

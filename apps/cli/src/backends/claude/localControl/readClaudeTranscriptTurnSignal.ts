@@ -76,14 +76,21 @@ function isSyntheticNoResponseClosure(message: RawJSONLines, content: unknown): 
   return typeof text === 'string' && text.trim() === SYNTHETIC_NO_RESPONSE_TEXT;
 }
 
+export function isClaudeSidechainTranscriptMessage(message: RawJSONLines): boolean {
+  return readBooleanFlag(message, 'isSidechain');
+}
+
+export function isClaudeMainChainCompactBoundary(message: RawJSONLines): boolean {
+  return !isClaudeSidechainTranscriptMessage(message)
+    && message.type === 'system'
+    && readStringFlag(message, 'subtype') === 'compact_boundary';
+}
+
 export function readClaudeTranscriptTurnSignal(message: RawJSONLines): LocalTurnLifecycleEvent | null {
-  if (readBooleanFlag(message, 'isSidechain')) return null;
+  if (isClaudeSidechainTranscriptMessage(message)) return null;
 
   if (message.type === 'system') {
-    const subtype = typeof (message as Record<string, unknown>).subtype === 'string'
-      ? String((message as Record<string, unknown>).subtype)
-      : '';
-    if (subtype === 'compact_boundary') {
+    if (isClaudeMainChainCompactBoundary(message)) {
       if (readCompactBoundaryTrigger(message) === 'auto') {
         return {
           type: 'continuation_detected',

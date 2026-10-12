@@ -166,6 +166,25 @@ describe('sessionControl contract exports', () => {
     expect(summaryParsed.data.runtimeActivityActiveCount).toBe(2);
   });
 
+  it('declares rollback eligibility sequence facts on session summaries and records', () => {
+    expect(typeof (protocol as any).SessionSummarySchema.shape.rollbackEligibleTurnStarts?.safeParse).toBe('function');
+    expect(typeof (protocol as any).V2SessionRecordSchema.shape.rollbackEligibleTurnStarts?.safeParse).toBe('function');
+    expect((protocol as any).V2SessionRecordSchema.safeParse({
+      id: 'sess_rollback_projection',
+      seq: 7,
+      createdAt: 1,
+      updatedAt: 2,
+      active: false,
+      activeAt: 0,
+      metadata: '{}',
+      metadataVersion: 1,
+      agentState: null,
+      agentStateVersion: 1,
+      dataEncryptionKey: null,
+      rollbackEligibleTurnStarts: [1, 4],
+    }).data.rollbackEligibleTurnStarts).toEqual([1, 4]);
+  });
+
   it('exports and validates session turn schemas', () => {
     expect(typeof (protocol as any).SessionTurnMutationV1Schema?.safeParse).toBe('function');
     expect(typeof (protocol as any).SessionTurnsProjectionV1Schema?.safeParse).toBe('function');

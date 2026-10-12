@@ -3,63 +3,8 @@ import { join } from 'node:path';
 import { getProjectPath } from '@/backends/claude/utils/path';
 import type { EnhancedMode } from '@/backends/claude/loop';
 import type { PermissionResult } from '@/backends/claude/sdk/types';
+import { buildClaudePermissionHookResponse } from '@/backends/claude/utils/buildClaudePermissionHookResponse';
 import { resolveClaudePermissionHookTimeoutSeconds } from '@/backends/claude/utils/permissionHookTimeout';
-
-function toPermissionRequestHookResult(result: PermissionResult): Record<string, unknown> {
-  if (result.behavior === 'allow') {
-    return {
-      continue: true,
-      suppressOutput: true,
-      hookSpecificOutput: {
-        hookEventName: 'PermissionRequest',
-        decision: {
-          behavior: 'allow',
-          updatedInput: result.updatedInput,
-          ...(typeof result.updatedPermissions !== 'undefined' ? { updatedPermissions: result.updatedPermissions } : {}),
-        },
-      },
-    };
-  }
-
-  return {
-    continue: true,
-    suppressOutput: true,
-    hookSpecificOutput: {
-      hookEventName: 'PermissionRequest',
-      decision: {
-        behavior: 'deny',
-        message: result.message,
-        ...(result.interrupt !== undefined ? { interrupt: result.interrupt } : {}),
-      },
-    },
-    ...(result.message ? { systemMessage: result.message } : {}),
-  };
-}
-
-function toPreToolUseHookResult(result: PermissionResult): Record<string, unknown> {
-  if (result.behavior === 'allow') {
-    return {
-      continue: true,
-      suppressOutput: true,
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'allow',
-        updatedInput: result.updatedInput,
-      },
-    };
-  }
-
-  return {
-    continue: true,
-    suppressOutput: true,
-    hookSpecificOutput: {
-      hookEventName: 'PreToolUse',
-      permissionDecision: 'deny',
-      ...(result.message ? { permissionDecisionReason: result.message } : {}),
-    },
-    ...(result.message ? { systemMessage: result.message } : {}),
-  };
-}
 
 function readString(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null;
@@ -122,9 +67,7 @@ export function buildClaudeAgentSdkHooks(params: Readonly<{
         blockedPath: readString(payload.blocked_path) ?? readString(payload.blockedPath),
         decisionReason: readString(payload.decision_reason) ?? readString(payload.decisionReason),
       });
-      return hookEventName === 'PreToolUse'
-        ? toPreToolUseHookResult(result)
-        : toPermissionRequestHookResult(result);
+      return buildClaudePermissionHookResponse({ hookEventName, toolInput, decision: result });
     };
   const hooks = {
     SessionStart: [
@@ -168,7 +111,7 @@ export function buildClaudeAgentSdkHooks(params: Readonly<{
     SubagentStart: [buildObservationHook()],
     SubagentStop: [buildObservationHook()],
     PermissionRequest: [{
-      matcher: '',
+      matcher: '*',
       hooks: [buildPermissionHook('PermissionRequest')],
       timeout: permissionHookTimeoutSeconds,
     }],

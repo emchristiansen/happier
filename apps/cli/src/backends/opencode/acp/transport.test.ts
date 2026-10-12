@@ -142,6 +142,15 @@ describe('OpenCodeTransport handleStderr', () => {
     expect(asStatusErrorMessage(result.message).detail).toContain('Authentication error');
   });
 
+  it('uses contextual auth evidence instead of broad authentication keywords', () => {
+    const transport = new OpenCodeTransport();
+    const context = { activeToolCalls: new Set<string>(), hasActiveInvestigation: false };
+
+    expect(transport.handleStderr('Authentication metadata row 401', context)).toEqual({ message: null });
+    expect(asStatusErrorMessage(transport.handleStderr('Token refresh failed: 401', context).message).detail)
+      .toContain('Authentication error');
+  });
+
   it('emits actionable model-not-found errors', () => {
     const transport = new OpenCodeTransport();
     const result = transport.handleStderr('Model not found', {

@@ -1,37 +1,56 @@
 import * as React from 'react';
-import { Pressable, View } from 'react-native';
+import { View } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import { Text } from '@/components/ui/text/Text';
 import { t } from '@/text';
 import { SessionContextChips } from '@/components/sessions/context/SessionContextChips';
 import { Icon } from '@/components/ui/icons/Icon';
+import { IconAction } from '@/components/ui/buttons/IconAction';
+import {
+    SessionListIdentity,
+    type SessionListIdentityDisplay,
+} from '@/components/sessions/shell/SessionListIdentity';
+import { SESSION_LIST_ROW_IDENTITY_METRICS } from '@/components/sessions/shell/sessionListRowDensity';
+import type { SessionListRenderableSession } from '@/sync/domains/session/listing/sessionListRenderable';
+import type { Session } from '@/sync/domains/state/storageTypes';
 
 export const InboxSessionAttentionHeader = React.memo(function InboxSessionAttentionHeader(props: Readonly<{
+    session: Session | SessionListRenderableSession;
+    identityDisplay: SessionListIdentityDisplay;
     sessionTitle: string;
     machineLabel: string | null;
-    pathLabel: string | null;
+    workspaceLabel: string | null;
     onOpenSession: () => void;
 }>) {
     const { theme } = useUnistyles();
 
     return (
         <View style={styles.container}>
+            <SessionListIdentity
+                session={props.session}
+                display={props.identityDisplay}
+                avatarSize={SESSION_LIST_ROW_IDENTITY_METRICS.compact.slotSize}
+                agentLogoSize={SESSION_LIST_ROW_IDENTITY_METRICS.compact.agentLogoSize}
+                color={theme.colors.text.primary}
+                testID={`inbox.session_attention.${props.session.id}.identity`}
+            />
             <View style={styles.titleColumn}>
                 <Text style={styles.title} numberOfLines={1}>
                     {props.sessionTitle}
                 </Text>
-                <SessionContextChips machineLabel={props.machineLabel} pathLabel={props.pathLabel} />
+                <SessionContextChips machineLabel={props.machineLabel} pathLabel={props.workspaceLabel} />
             </View>
 
-            <Pressable
+            <IconAction
                 accessibilityRole="button"
                 accessibilityLabel={t('common.open')}
                 onPress={props.onOpenSession}
-                style={({ pressed }) => [styles.openButton, pressed && styles.openButtonPressed]}
+                size="lg"
+                hitSlop={3}
             >
                 <Icon name="arrow-square-out" size={16} color={theme.colors.text.primary} />
-            </Pressable>
+            </IconAction>
         </View>
     );
 });
@@ -54,18 +73,5 @@ const styles = StyleSheet.create((theme) => ({
         fontSize: 16,
         fontWeight: '700',
         color: theme.colors.text.primary,
-    },
-    openButton: {
-        width: 32,
-        height: 32,
-        borderRadius: 10,
-        alignItems: 'center',
-        justifyContent: 'center',
-        borderWidth: 1,
-        borderColor: theme.colors.border.default,
-        backgroundColor: theme.colors.surface.base,
-    },
-    openButtonPressed: {
-        backgroundColor: theme.colors.surface.pressedOverlay,
     },
 }));

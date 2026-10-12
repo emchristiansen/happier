@@ -118,6 +118,21 @@ describe("sessionRoutes v2 sessions snapshot", () => {
         expect(mapped.latestTurnStatusObservedAt).toBe(1_234);
     });
 
+    it("exposes rollback-eligible turn starts from the selected turn relation", () => {
+        const mapped = mapV2SessionListRow({
+            userId: "u1",
+            row: {
+                ...pagedSessionRow("s_rollback_projection"),
+                turns: [
+                    { rollbackState: "eligible", transcriptAnchorsJson: JSON.stringify({ startUserMessageSeq: 8 }) },
+                    { rollbackState: "eligible", transcriptAnchorsJson: JSON.stringify({ startUserMessageSeq: 2 }) },
+                ],
+            } as any,
+        });
+
+        expect(mapped.rollbackEligibleTurnStarts).toEqual([2, 8]);
+    });
+
     it("exposes durable attention and live-work projection fields on v2 session rows", () => {
         const now = new Date(1_000);
         const mapped = mapV2SessionListRow({

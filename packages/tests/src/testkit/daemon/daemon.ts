@@ -13,6 +13,7 @@ import {
 } from '../process/processOwnershipLease';
 import { spawnLoggedProcess, type SpawnedProcess } from '../process/spawnProcess';
 import { resolveCliTestLaunchSpec, shouldUseCliSourceEntrypoint } from '../process/cliLaunchSpec';
+import { sanitizeCliTestEnv } from '../process/cliTestEnv';
 import { DEFAULT_CLI_DIST_BUILD_TIMEOUT_MS } from '../process/cliDist';
 import { terminateProcessTreeByPid } from '../process/processTree';
 import { resolveDaemonSessionMarkerDirs } from './sessionMarkerDirs';
@@ -580,7 +581,7 @@ export function resolveTestDaemonOwnershipLeasesDir(rootDir: string = repoRootDi
 }
 
 export function sanitizeDaemonEnvForSpawn(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const sanitized = { ...env };
+  const sanitized = sanitizeCliTestEnv(env);
   // Source-entrypoint E2E runs must not inherit a stack's pinned-dist fast path.
   if (shouldUseCliSourceEntrypoint(sanitized)) {
     sanitized.HAPPIER_CLI_SUBPROCESS_PREFER_TSX = '1';
@@ -596,12 +597,6 @@ export function sanitizeDaemonEnvForSpawn(env: NodeJS.ProcessEnv): NodeJS.Proces
   delete sanitized.HAPPY_SESSION_ATTACH_FILE;
   delete sanitized.HAPPIER_STACK_TOOL_TRACE_FILE;
   delete sanitized.HAPPY_STACK_TOOL_TRACE_FILE;
-  // Test harness must not inherit host daemon/server selection overrides.
-  // These can force a different active server id than the seeded test credentials
-  // and cause false auth-gated daemon startup failures in non-interactive continuity lanes.
-  delete sanitized.HAPPIER_ACTIVE_SERVER_ID;
-  delete sanitized.HAPPIER_DAEMON_SERVICE_INSTANCE_ID;
-  delete sanitized.HAPPIER_DAEMON_SERVICE_SERVER_URL;
   if (sanitized.HAPPIER_DISABLE_CAFFEINATE === undefined || sanitized.HAPPIER_DISABLE_CAFFEINATE === '') {
     sanitized.HAPPIER_DISABLE_CAFFEINATE = '1';
   }

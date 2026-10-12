@@ -288,6 +288,28 @@ describe('projectSessionListPlacement', () => {
         });
     });
 
+    it('keeps blocked-delivery ordering stable across unrelated transport updates', () => {
+        const previous = makeSession({
+            pendingBlockedCount: 1,
+            pendingRequestObservedAt: null,
+            meaningfulActivityAt: 1_500,
+            createdAt: 100,
+            updatedAt: 2_000,
+            hasPendingUserActionRequests: false,
+            hasPendingPermissionRequests: false,
+        });
+        const next = { ...previous, updatedAt: 3_000 };
+
+        expect(projectSessionListPlacement({ nowMs: 10_000, session: previous })).toMatchObject({
+            kind: 'action_required',
+            timestamp: 1_500,
+        });
+        expect(projectSessionListPlacement({ nowMs: 10_000, session: next })).toMatchObject({
+            kind: 'action_required',
+            timestamp: 1_500,
+        });
+    });
+
     it('promotes generic unread activity when an older ready event is already behind the read cursor', () => {
         expect(projectSessionListPlacement({
             nowMs: 10_000,

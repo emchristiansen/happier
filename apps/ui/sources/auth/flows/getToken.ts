@@ -10,7 +10,7 @@ import { AuthErrorCodeSchema, readServerEnabledBit } from '@happier-dev/protocol
 const CONTENT_KEY_BINDING_PREFIX = new TextEncoder().encode('Happy content key v1\u0000');
 
 export async function authGetToken(secret: Uint8Array) {
-    const serverFeatures = await getReadyServerFeatures({ timeoutMs: 800 });
+    const serverFeatures = await getReadyServerFeatures();
     if (serverFeatures) {
         // Backward compatibility:
         // - New servers explicitly advertise `features.auth.login.keyChallenge.enabled`.

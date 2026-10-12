@@ -161,7 +161,13 @@ function SegmentedTabBarInner<T extends string>(props: SegmentedTabBarProps<T>) 
                             } : {})}
                             testID={props.testIDPrefix ? `${props.testIDPrefix}:${tab.id}` : undefined}
                             onPress={() => props.onSelectTab(tab.id)}
-                            style={[styles.tab, compact ? styles.tabCompact : null, active ? styles.tabActive : null, Platform.OS === 'web' ? WEB_FOCUS_OUTLINE_RESET : null]}
+                            style={[
+                                styles.tab,
+                                compact ? styles.tabCompact : null,
+                                Platform.OS === 'android' ? { minHeight: 48 } : null,
+                                active ? styles.tabActive : null,
+                                Platform.OS === 'web' ? WEB_FOCUS_OUTLINE_RESET : null,
+                            ]}
                             accessibilityRole="tab"
                             accessibilityState={{ selected: active }}
                             aria-selected={active}

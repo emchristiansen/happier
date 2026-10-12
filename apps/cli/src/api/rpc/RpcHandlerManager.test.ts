@@ -230,6 +230,38 @@ describe('RpcHandlerManager.handleRequest (plaintext)', () => {
     const res = await rpc.handleRequest({ method: 'sess_1:missing.method', params: {} });
     expect(res).toEqual({ error: RPC_ERROR_MESSAGES.METHOD_NOT_FOUND, errorCode: RPC_ERROR_CODES.METHOD_NOT_FOUND });
   });
+
+  it('aborts the exact active handler when the relay cancels its transport request', async () => {
+    const rpc = new RpcHandlerManager({
+      scopePrefix: 'sess_1',
+      encryptionKey: new Uint8Array(32),
+      encryptionVariant: 'dataKey',
+      encryptionMode: 'plain',
+      logger: () => {},
+    });
+    let observedSignal: AbortSignal | null = null;
+    rpc.registerHandler('demo.wait', async (...args: unknown[]) => {
+      observedSignal = (args[2] as { signal?: AbortSignal } | undefined)?.signal ?? null;
+      if (!observedSignal) return { error: 'missing transport cancellation signal' };
+      return await new Promise<never>((_resolve, reject) => {
+        observedSignal!.addEventListener('abort', () => reject(observedSignal!.reason), { once: true });
+      });
+    });
+    const boundary = createSocketEventBoundary();
+    rpc.onSocketConnect(boundary.socket);
+
+    const response = rpc.handleRequest({
+      method: 'sess_1:demo.wait',
+      params: {},
+      requestId: 'target-request-1',
+    });
+    await vi.waitFor(() => expect(observedSignal).not.toBeNull());
+
+    boundary.trigger(SOCKET_RPC_EVENTS.CANCEL, { requestId: 'target-request-1' });
+
+    await expect(response).resolves.toEqual({ error: 'RPC request cancelled by caller' });
+    expect(rpc.getInFlightRequestCount()).toBe(0);
+  });
 });
 
 describe('RpcHandlerManager.handleRequest (encrypted)', () => {

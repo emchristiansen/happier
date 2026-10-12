@@ -2,6 +2,11 @@ import { TERMINAL_INPUT_QUIET_PERIOD_MS } from '@/agent/runtime/terminal/injecti
 import type { TerminalHostAdapter, TerminalHostHandle } from '@/integrations/terminalHost/_types';
 import { delayUnrefAbortable } from '@/utils/time';
 
+import {
+  classifyClaudeStartupRefusal,
+  type ClaudeStartupRefusal,
+} from '../claudeStartupRefusal';
+
 import type {
   ClaudeUnifiedInputArbiter,
   ClaudeUnifiedStartableDisposable,
@@ -58,6 +63,39 @@ export function isClaudeUnifiedTerminalReadinessTimeoutError(
   return Boolean(error)
     && typeof error === 'object'
     && (error as { code?: unknown }).code === 'claude_unified_terminal_readiness_timeout';
+}
+
+/**
+ * Claude refused to start, so readiness will never arrive. This is not a timeout: waiting out the
+ * readiness window would only delay a verdict the provider already gave, and relaunching with the
+ * same arguments reproduces it exactly. Carries the classified refusal so the launcher can offer
+ * the fix instead of spending relaunches on it.
+ */
+export class ClaudeUnifiedTerminalProviderRefusedStartError extends Error {
+  readonly code = 'claude_unified_terminal_provider_refused_start';
+  readonly refusal: ClaudeStartupRefusal;
+  readonly handle: TerminalHostHandle;
+  readonly diagnostics: Readonly<{ screenTail: string | null }> | undefined;
+
+  constructor(params: Readonly<{
+    refusal: ClaudeStartupRefusal;
+    handle: TerminalHostHandle;
+    diagnostics?: Readonly<{ screenTail: string | null }> | undefined;
+  }>) {
+    super(`Claude refused to start (${params.refusal.code})`);
+    this.name = 'ClaudeUnifiedTerminalProviderRefusedStartError';
+    this.refusal = params.refusal;
+    this.handle = params.handle;
+    this.diagnostics = params.diagnostics;
+  }
+}
+
+export function isClaudeUnifiedTerminalProviderRefusedStartError(
+  error: unknown,
+): error is ClaudeUnifiedTerminalProviderRefusedStartError {
+  return Boolean(error)
+    && typeof error === 'object'
+    && (error as { code?: unknown }).code === 'claude_unified_terminal_provider_refused_start';
 }
 
 function sanitizeScreenTail(text: string | null): string | null {
@@ -277,7 +315,7 @@ export function createClaudeUnifiedTerminalReadinessBridge(opts: Readonly<{
       try {
         liveness = await awaitReadinessOperation(opts.hostAdapter.evaluateLiveness(opts.handle));
       } catch (error: unknown) {
-        endHumanDialogWait();
+        // An unavailable observation does not resolve an outstanding human choice.
         if (isClaudeUnifiedTerminalReadinessTimeoutError(error)) throw error;
         if (!(await continueAfterDelay())) return;
         continue;
@@ -286,7 +324,7 @@ export function createClaudeUnifiedTerminalReadinessBridge(opts: Readonly<{
       if (disposed || abortSignal.aborted) return;
       lastLivenessPaneAlive = liveness.paneAlive;
       if (!liveness.paneAlive) {
-        endHumanDialogWait();
+        if (!liveness.probeInconclusive) endHumanDialogWait();
         if (!(await continueAfterDelay())) return;
         continue;
       }
@@ -296,7 +334,7 @@ export function createClaudeUnifiedTerminalReadinessBridge(opts: Readonly<{
         try {
           inputState = await awaitReadinessOperation(opts.hostAdapter.captureInputState(opts.handle));
         } catch (error: unknown) {
-          endHumanDialogWait();
+          // Keep a confirmed human wait until a readable screen or definitive host death.
           if (isClaudeUnifiedTerminalReadinessTimeoutError(error)) throw error;
           if (!(await continueAfterDelay())) return;
           continue;
@@ -310,6 +348,17 @@ export function createClaudeUnifiedTerminalReadinessBridge(opts: Readonly<{
         const screenState = parseClaudeScreenState(inputState.currentInput, { cursor: inputState.cursor });
         opts.onScreenObserved?.({ screenState });
         recordScreenProgress(screenState.text);
+        // A refusal is the provider's final answer for these launch arguments, printed before any
+        // session exists. Readiness can never arrive, so fail now with the classified cause rather
+        // than waiting out the window and reporting a timeout the launcher would then retry.
+        const refusal = classifyClaudeStartupRefusal({ text: screenState.text });
+        if (refusal) {
+          throw new ClaudeUnifiedTerminalProviderRefusedStartError({
+            refusal,
+            handle: opts.handle,
+            diagnostics: { screenTail: sanitizeScreenTail(screenState.text) },
+          });
+        }
         if (opts.resolveStartupDialog) {
           const resolution = await awaitReadinessOperation(opts.resolveStartupDialog({
             screenState,

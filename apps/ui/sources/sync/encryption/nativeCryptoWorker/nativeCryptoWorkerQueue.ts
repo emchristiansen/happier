@@ -3,7 +3,6 @@ import type { SyncPerformanceTelemetry } from '@/sync/runtime/syncPerformanceTel
 import {
     recordNativeCryptoWorkerAppStateActive,
     recordNativeCryptoWorkerAppStateQuiescent,
-    recordNativeCryptoWorkerQueueBackpressure,
     recordNativeCryptoWorkerQueueDepth,
     recordNativeCryptoWorkerQueueWait,
 } from './nativeCryptoWorkerTelemetry';
@@ -29,7 +28,6 @@ export type NativeCryptoWorkerBatchQueueEnqueueOptions = Readonly<{
 
 export type NativeCryptoWorkerBatchQueueOptions<T, R> = Readonly<{
     maxBatchSize: number;
-    maxPendingItems?: number;
     operation?: NativeCryptoWorkerOperation;
     dispatchKind?: NativeCryptoWorkerBatchDispatchKind;
     telemetry?: SyncPerformanceTelemetry;
@@ -96,25 +94,6 @@ const lifecycleState: NativeCryptoWorkerQueueLifecycleState = {
 let nextQueueId = 1;
 const queueWakeups = new Set<() => void>();
 const queueStats = new Map<number, NativeCryptoWorkerQueueStats>();
-
-export class NativeCryptoWorkerQueueBackpressureError extends Error {
-    readonly code = 'native_crypto_worker_queue_backpressure';
-    readonly operation: NativeCryptoWorkerOperation | undefined;
-    readonly queueDepth: number;
-    readonly capacity: number;
-
-    constructor(params: Readonly<{
-        operation?: NativeCryptoWorkerOperation;
-        queueDepth: number;
-        capacity: number;
-    }>) {
-        super('Native crypto worker queue is full');
-        this.name = 'NativeCryptoWorkerQueueBackpressureError';
-        this.operation = params.operation;
-        this.queueDepth = params.queueDepth;
-        this.capacity = params.capacity;
-    }
-}
 
 export class NativeCryptoWorkerQueueCancelledError extends Error {
     readonly code = 'native_crypto_worker_queue_cancelled';
@@ -325,7 +304,6 @@ export function createNativeCryptoWorkerBatchQueue<T, R>(
     options: NativeCryptoWorkerBatchQueueOptions<T, R>,
 ): NativeCryptoWorkerBatchQueue<T, R> {
     const maxBatchSize = Math.max(1, Math.trunc(options.maxBatchSize));
-    const maxPendingItems = Math.max(1, Math.trunc(options.maxPendingItems ?? maxBatchSize));
     const dispatchKind = options.dispatchKind ?? 'regular';
     const pending: Array<QueueEntry<T, R>> = [];
     let draining = false;
@@ -344,29 +322,6 @@ export function createNativeCryptoWorkerBatchQueue<T, R>(
         return options.telemetryEnabled === true
             && options.operation !== undefined
             && options.telemetry?.isEnabled() === true;
-    }
-
-    function pendingCapacity(): number {
-        return draining || inFlightCount > 0
-            ? maxPendingItems
-            : maxBatchSize + maxPendingItems;
-    }
-
-    function rejectForBackpressure(reject: (reason: unknown) => void): void {
-        const capacity = pendingCapacity();
-        if (shouldRecordTelemetry()) {
-            recordNativeCryptoWorkerQueueBackpressure(options.telemetry!, {
-                operation: options.operation!,
-                queueDepth: pending.length,
-                inFlightCount,
-                capacity,
-            });
-        }
-        reject(new NativeCryptoWorkerQueueBackpressureError({
-            operation: options.operation,
-            queueDepth: pending.length,
-            capacity,
-        }));
     }
 
     function rejectForCancellation(entry: QueueEntry<T, R>): void {
@@ -475,10 +430,6 @@ export function createNativeCryptoWorkerBatchQueue<T, R>(
                     reject(new NativeCryptoWorkerQueueCancelledError({
                         operation: options.operation,
                     }));
-                    return;
-                }
-                if (pending.length >= pendingCapacity()) {
-                    rejectForBackpressure(reject);
                     return;
                 }
                 pending.push({ item, signal: enqueueOptions.signal, enqueuedAtMs: now(), resolve, reject });

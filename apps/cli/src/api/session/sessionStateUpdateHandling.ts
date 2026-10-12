@@ -1,4 +1,5 @@
 import {
+    normalizeSessionMetadataForRead,
     mergeSessionRuntimeActivityProjection,
     parseSessionRuntimeActivityProjectionFields,
     type SessionRuntimeActivityProjection,
@@ -242,7 +243,7 @@ export function handleSessionStateUpdate(params: {
                 encryptionVariant: params.encryptionVariant,
             });
             if (decodedMetadata.ok) {
-                metadata = decodedMetadata.value;
+                metadata = normalizeSessionMetadataForRead(decodedMetadata.value);
                 metadataVersion = body.metadata.version;
                 params.onMetadataUpdated();
             }

@@ -184,6 +184,36 @@ describe('createOpenAiCodexQuotaFetcher', () => {
     }
   });
 
+  it('preserves additional provider allowance ids from the HTTP usage response', async () => {
+    const now = 1_000_000;
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        plan_type: 'pro',
+        rate_limit: { primary_window: { used_percent: 10 } },
+        additional_rate_limits: [{
+          limit_name: 'GPT-5.3-Codex-Spark',
+          metered_feature: 'codex_bengalfox',
+          rate_limit: {
+            primary_window: { used_percent: 80 },
+            secondary_window: { used_percent: 35 },
+          },
+        }],
+      }),
+    })) as unknown as typeof fetch);
+    const record = buildConnectedServiceCredentialRecord({
+      now, serviceId: 'openai-codex', profileId: 'work', kind: 'oauth', expiresAt: now + 60_000,
+      oauth: { accessToken: 'at', refreshToken: 'rt', idToken: null, scope: null, tokenType: null, providerAccountId: 'acct', providerEmail: null },
+    });
+    const snapshot = await createOpenAiCodexQuotaFetcher({ usageUrl: 'https://quota.test/usage', resetCreditsUrl: null })
+      .fetch({ record, now, signal: new AbortController().signal });
+    expect(snapshot?.meters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ meterId: 'session', providerLimitId: 'session', utilizationPct: 10 }),
+      expect.objectContaining({ meterId: 'codex_bengalfox:primary', providerLimitId: 'codex_bengalfox', label: 'GPT-5.3-Codex-Spark · Primary', utilizationPct: 80 }),
+      expect.objectContaining({ meterId: 'codex_bengalfox:secondary', providerLimitId: 'codex_bengalfox', label: 'GPT-5.3-Codex-Spark · Secondary', utilizationPct: 35 }),
+    ]));
+  });
+
   it('fetches Codex reset-credit collection details with connected account headers', async () => {
     const now = 1_768_000_000_000;
     const usageUrl = 'https://quota.happier.dev/openai-codex/usage';

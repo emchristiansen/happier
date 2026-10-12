@@ -75,6 +75,7 @@ describe('FeatureGatesSchema', () => {
           accountGroups: { enabled: true },
           accountFallback: { enabled: true },
           autoQuotaReset: { enabled: true },
+          poolQuotaLimitSelection: { enabled: true },
           subscription: { enabled: true },
         },
         sessions: {
@@ -88,6 +89,7 @@ describe('FeatureGatesSchema', () => {
     expect(readServerEnabledBit(parsed, 'connectedServices.accountGroups')).toBe(true);
     expect(readServerEnabledBit(parsed, 'connectedServices.accountFallback')).toBe(true);
     expect(readServerEnabledBit(parsed, 'connectedServices.autoQuotaReset')).toBe(true);
+    expect(readServerEnabledBit(parsed, 'connectedServices.poolQuotaLimitSelection')).toBe(true);
     expect(readServerEnabledBit(parsed, 'connectedServices.subscription')).toBe(true);
     expect(readServerEnabledBit(parsed, 'sessions.usageLimitRecovery')).toBe(true);
   });
@@ -102,6 +104,7 @@ describe('FeatureGatesSchema', () => {
     expect(readServerEnabledBit(parsed, 'connectedServices.accountGroups')).toBe(false);
     expect(readServerEnabledBit(parsed, 'connectedServices.accountFallback')).toBe(false);
     expect(readServerEnabledBit(parsed, 'connectedServices.autoQuotaReset')).toBe(false);
+    expect(readServerEnabledBit(parsed, 'connectedServices.poolQuotaLimitSelection')).toBe(false);
     expect(readServerEnabledBit(parsed, 'connectedServices.subscription')).toBe(false);
     expect(readServerEnabledBit(parsed, 'sessions.drafts')).toBe(false);
   });

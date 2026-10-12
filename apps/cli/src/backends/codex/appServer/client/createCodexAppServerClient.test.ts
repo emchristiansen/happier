@@ -1,8 +1,10 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { join } from 'node:path';
 import * as childProcess from 'node:child_process';
 
 import { describe, expect, it, vi } from 'vitest';
+import { WebSocketServer } from 'ws-node';
 
 import { waitForCondition } from '@/testkit/async/waitFor';
 import { withTempDir } from '@/testkit/fs/tempDir';
@@ -25,6 +27,95 @@ vi.mock('node:child_process', async (importOriginal) => {
 });
 
 describe('createCodexAppServerClient', () => {
+    it('uses the Codex daemon proxy transport without starting another app-server', async () => {
+        await withTempDir('happier-codex-app-server-client-daemon-proxy-', async (root) => {
+            const fakeAppServer = await writeFakeCodexAppServerScript({
+                dir: root,
+                bodyLines: [
+                    'for await (const line of rl) {',
+                    '  if (!line.trim()) continue;',
+                    '  const msg = JSON.parse(line);',
+                    '  if (msg.method === "initialize") {',
+                    '    process.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + "\\n");',
+                    '    continue;',
+                    '  }',
+                    '  if (msg.method === "thread/loaded/list") {',
+                    '    process.stdout.write(JSON.stringify({ id: msg.id, result: { data: ["thread-1"] } }) + "\\n");',
+                    '  }',
+                    '}',
+                ],
+            });
+            const spawn = vi.mocked(childProcess.spawn);
+            spawn.mockClear();
+            const client = await createCodexAppServerClient({
+                processEnv: createCodexAppServerProcessEnv(fakeAppServer),
+                transport: { kind: 'daemonProxy' },
+            });
+            try {
+                await expect(client.request('thread/loaded/list')).resolves.toEqual({ data: ['thread-1'] });
+                expect(spawn.mock.calls[0]?.[1]).toEqual([
+                    fakeAppServer,
+                    'app-server',
+                    'proxy',
+                ]);
+                expect(spawn.mock.calls[0]?.[2]).toEqual(expect.objectContaining({
+                    stdio: ['pipe', 'pipe', 'pipe'],
+                }));
+            } finally {
+                await client.dispose();
+            }
+        });
+    });
+
+    it('speaks JSON-RPC over the shared app-server Unix WebSocket', async () => {
+        await withTempDir('happier-codex-app-server-client-websocket-', async (root) => {
+            const socketPath = process.platform === 'win32'
+                ? `\\\\.\\pipe\\happier-codex-test-${process.pid}-${Date.now()}`
+                : join(root, 'app-server.sock');
+            const httpServer = createServer();
+            const webSocketServer = new WebSocketServer({
+                server: httpServer,
+                // Codex's tungstenite endpoint closes the handshake when clients offer
+                // permessage-deflate, so keep this fixture aligned with that real boundary.
+                verifyClient: (info, done) => done(info.req.headers['sec-websocket-extensions'] === undefined),
+            });
+            webSocketServer.on('connection', (socket) => {
+                socket.on('message', (payload) => {
+                    if (!Buffer.isBuffer(payload)) return;
+                    const message = JSON.parse(payload.toString('utf8')) as { id?: number; method?: string };
+                    if (message.method === 'initialize') {
+                        socket.send(JSON.stringify({ id: message.id, result: {} }));
+                    } else if (message.method === 'test/ping') {
+                        socket.send(JSON.stringify({ id: message.id, result: { pong: true } }));
+                    }
+                });
+            });
+            await new Promise<void>((resolve, reject) => {
+                httpServer.once('error', reject);
+                httpServer.listen(socketPath, resolve);
+            });
+
+            const spawn = vi.mocked(childProcess.spawn);
+            spawn.mockClear();
+            const client = await createCodexAppServerClient({
+                transport: { kind: 'unixWebSocket', socketPath },
+            });
+            try {
+                await expect(client.request('test/ping')).resolves.toEqual({ pong: true });
+                expect(spawn).not.toHaveBeenCalled();
+            } finally {
+                await client.dispose();
+                await new Promise<void>((resolve, reject) => {
+                    webSocketServer.close((error?: Error): void => {
+                        if (error) reject(error);
+                        else resolve();
+                    });
+                });
+                await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+            }
+        });
+    });
+
     it('settles pending requests and reports stdin failure without an uncaught stream error', async () => {
         await withTempDir('happier-codex-app-server-client-stdin-error-', async (root) => {
             const fakeAppServer = await writeFakeCodexAppServerScript({
@@ -586,7 +677,7 @@ describe('createCodexAppServerClient', () => {
         });
     });
 
-    it('uses the startup RPC timeout for slow thread/start requests', async () => {
+    it('keeps side-effecting thread/start alive past the startup RPC timeout', async () => {
         await withTempDir('happier-codex-app-server-client-thread-start-timeout-', async (root) => {
             const fakeAppServer = await writeFakeCodexAppServerScript({
                 dir: root,
@@ -613,7 +704,7 @@ describe('createCodexAppServerClient', () => {
             const client = await createCodexAppServerClient({
                 processEnv: createCodexAppServerProcessEnv(fakeAppServer, {
                     HAPPIER_CODEX_APP_SERVER_RPC_TIMEOUT_MS: '250',
-                    HAPPIER_CODEX_APP_SERVER_STARTUP_RPC_TIMEOUT_MS: '5000',
+                    HAPPIER_CODEX_APP_SERVER_STARTUP_RPC_TIMEOUT_MS: '250',
                 }),
             });
 

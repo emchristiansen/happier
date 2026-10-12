@@ -50,6 +50,7 @@ export async function subscribeSseJson<T>(params: Readonly<{
   headers?: Record<string, string>;
   signal: AbortSignal;
   readIdleTimeoutMs?: number | null;
+  onOpen?: () => void;
   onMessage: (msg: T, meta: { id?: string }) => void;
 }>): Promise<SseJsonSubscription<T>> {
   const controller = new AbortController();
@@ -78,6 +79,7 @@ export async function subscribeSseJson<T>(params: Readonly<{
       if (!response.body) {
         throw new Error('OpenCode SSE response missing body');
       }
+      params.onOpen?.();
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();

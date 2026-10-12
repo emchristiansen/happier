@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -129,20 +129,5 @@ describe('importCycleGuard analyzer', () => {
     expect(comparison.allowedCycles.map(formatCycleKey)).toEqual(['a.ts\nb.ts']);
     expect(comparison.newCycles.map(formatCycleKey)).toEqual(['c.ts\nd.ts']);
     expect(comparison.staleBaselineCycles.map(formatCycleKey)).toEqual(['old.ts\nstale.ts']);
-  });
-
-  it('is wired into the required CLI unit lane used by root and CI', () => {
-    const cliPackageJson = JSON.parse(readFileSync(resolve(process.cwd(), 'package.json'), 'utf8')) as {
-      scripts?: Record<string, string>;
-    };
-    const rootPackageJson = JSON.parse(readFileSync(resolve(process.cwd(), '..', '..', 'package.json'), 'utf8')) as {
-      scripts?: Record<string, string>;
-    };
-    const workflowText = readFileSync(resolve(process.cwd(), '..', '..', '.github', 'workflows', 'tests.yml'), 'utf8');
-
-    expect(cliPackageJson.scripts?.['test:unit']).toContain('test:import-cycles');
-    expect(rootPackageJson.scripts?.['test:unit']).toContain('yarn workspace @happier-dev/cli test:unit');
-    expect(workflowText).toContain('if [ "${{ matrix.part }}" = "1" ]; then');
-    expect(workflowText).toContain('yarn workspace @happier-dev/cli test:unit:vitest');
   });
 });

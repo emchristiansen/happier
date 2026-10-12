@@ -10,6 +10,7 @@ import {
   createClaudeLocalLifecycleTracker,
   isClaudeTaskNotificationUserPromptHook,
 } from '../localControl/claudeLocalLifecycleTracker';
+import { isClaudeMainChainCompactBoundary } from '../localControl/readClaudeTranscriptTurnSignal';
 import {
   type createClaudeProviderActivityLedger,
 } from '../providerActivity/createClaudeProviderActivityLedger';
@@ -127,12 +128,6 @@ function readHookRequestId(data: SessionHookData): string {
     || readHookString(data, 'request_id')
     || readHookString(data, 'requestId')
     || readHookString(data, 'id');
-}
-
-function readSystemSubtype(message: RawJSONLines): string {
-  if (message.type !== 'system') return '';
-  const raw = (message as Record<string, unknown>).subtype;
-  return typeof raw === 'string' ? raw : '';
 }
 
 export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
@@ -605,17 +600,16 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
             const submittedPrompt = readHookString(data, 'prompt');
             const normalizedSubmittedPrompt = normalizeClaudeUnifiedPromptIdentityText(submittedPrompt);
             if (normalizedSubmittedPrompt && opts.arbiter.confirmPromptAcceptedByProviderIf) {
-              // UserPromptSubmit is authenticated provider evidence. Correlate its exact prompt
-              // before waiting for turn-end arming: a queued steer may be submitted by Claude at
-              // the same boundary, with this hook arriving before any separate idle observation.
-              // Exact matching keeps terminal custody/output from settling a neighbor Pending row.
+              // Claude can emit UserPromptSubmit before a steer leaves its native queue. The
+              // arbiter preserves that custody until the ordered transcript proves consumption;
+              // an exact hook can still accept a prompt injected to start a new turn.
               let matchedBatch: ClaudeUnifiedPromptBatch | null = null;
               void opts.arbiter.confirmPromptAcceptedByProviderIf((batch) => {
                 const matches =
                   normalizeClaudeUnifiedPromptIdentityText(batch.message) === normalizedSubmittedPrompt;
                 if (matches) matchedBatch = batch;
                 return matches;
-              }).then((confirmed) => {
+              }, 'prompt_submit').then((confirmed) => {
                 if (!confirmed || !matchedBatch || !opts.onAcceptedPromptSubmitEvidence) return;
                 const sessionId = readHookString(data, 'session_id') || readHookString(data, 'sessionId');
                 const promptId = readHookString(data, 'prompt_id') || readHookString(data, 'promptId');
@@ -680,7 +674,7 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
     },
     observeTranscript(message) {
       noteTurnStallProgress();
-      if (readSystemSubtype(message) === 'compact_boundary') {
+      if (isClaudeMainChainCompactBoundary(message)) {
         observeCompactionCompleted();
       }
       if (isClaudeRuntimeAuthFailureEvidence(message)) {

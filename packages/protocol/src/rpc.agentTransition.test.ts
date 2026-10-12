@@ -31,9 +31,12 @@ describe('session.agentTransition RPC classification', () => {
   });
 
   it('leaves the read-only continuation inspection unclassified', () => {
-    expect(resolveSocketRpcSessionWriteAuthorizationMethod(RPC_METHODS.SESSION_CONTINUATION_INSPECT))
-      .toBeNull();
-    expect(resolveSocketRpcProviderStartingMethod(RPC_METHODS.SESSION_CONTINUATION_INSPECT))
-      .toBeNull();
+    for (const method of [
+      RPC_METHODS.SESSION_CONTINUATION_INSPECT,
+      RPC_METHODS.SESSION_CONTINUATION_INSPECT_BATCH,
+    ]) {
+      expect(resolveSocketRpcSessionWriteAuthorizationMethod(method)).toBeNull();
+      expect(resolveSocketRpcProviderStartingMethod(method)).toBeNull();
+    }
   });
 });

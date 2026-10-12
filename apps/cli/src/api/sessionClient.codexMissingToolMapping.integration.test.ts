@@ -15,6 +15,7 @@ vi.mock('socket.io-client', () => ({
 vi.mock('@/ui/logger', () => ({
     logger: {
         debug: mockLoggerDebug,
+        infoFile: vi.fn(),
     },
 }));
 

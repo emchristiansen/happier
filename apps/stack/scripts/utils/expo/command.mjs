@@ -1,4 +1,6 @@
 import { join } from 'node:path';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 
 import { ensureDepsInstalled, ensureWorkspacePackagesBuiltForComponent } from '../proc/pm.mjs';
 import { run } from '../proc/proc.mjs';
@@ -9,6 +11,24 @@ import { pathExists } from '../fs/fs.mjs';
 import { applyExpoNodeHeapEnv } from './expoNodeHeapEnv.mjs';
 
 const DEFAULT_EXPO_EXPORT_MAX_WORKERS_NONINTERACTIVE = 1;
+
+export async function withExpoPreparationEnv(envIn, action) {
+  if (typeof action !== 'function') {
+    throw new TypeError('withExpoPreparationEnv requires an action function');
+  }
+  const env = { ...(envIn ?? process.env) };
+  const scratchBase = String(env.TMPDIR ?? env.TMP ?? env.TEMP ?? tmpdir()).trim() || tmpdir();
+  await mkdir(scratchBase, { recursive: true });
+  const scratchDir = await mkdtemp(join(scratchBase, 'happier-expo-preparation-'));
+  env.TMPDIR = scratchDir;
+  env.TMP = scratchDir;
+  env.TEMP = scratchDir;
+  try {
+    return await action(env);
+  } finally {
+    await rm(scratchDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
 
 async function resolveExpoBin(runnerDir) {
   const workspaceBin = join(runnerDir, 'node_modules', '.bin', 'expo');
@@ -114,9 +134,11 @@ export async function expoExec({
 }) {
   const runnerDir = dir;
   const cwd = projectDir ?? runnerDir;
-  await ensureDepsInstalled(runnerDir, ensureDepsLabel, { quiet, env });
   const workspaceDepsDir = projectDir ?? runnerDir;
-  await ensureWorkspacePackagesBuiltForComponent(workspaceDepsDir, { quiet, env });
+  await withExpoPreparationEnv(env, async (preparationEnv) => {
+    await ensureDepsInstalled(runnerDir, ensureDepsLabel, { quiet, env: preparationEnv });
+    await ensureWorkspacePackagesBuiltForComponent(workspaceDepsDir, { quiet, env: preparationEnv });
+  });
   const expoBin = await resolveExpoBin(runnerDir);
   const effectiveEnv = applyExpoNodeHeapEnv(env, {
     envKey: 'HAPPIER_STACK_EXPO_MAX_OLD_SPACE_SIZE_MB',
@@ -138,9 +160,11 @@ export async function expoSpawn({
 }) {
   const runnerDir = dir;
   const cwd = projectDir ?? runnerDir;
-  await ensureDepsInstalled(runnerDir, ensureDepsLabel, { quiet, env });
   const workspaceDepsDir = projectDir ?? runnerDir;
-  await ensureWorkspacePackagesBuiltForComponent(workspaceDepsDir, { quiet, env });
+  await withExpoPreparationEnv(env, async (preparationEnv) => {
+    await ensureDepsInstalled(runnerDir, ensureDepsLabel, { quiet, env: preparationEnv });
+    await ensureWorkspacePackagesBuiltForComponent(workspaceDepsDir, { quiet, env: preparationEnv });
+  });
   const expoBin = await resolveExpoBin(runnerDir);
   const effectiveEnv = applyExpoNodeHeapEnv(env, {
     envKey: 'HAPPIER_STACK_EXPO_MAX_OLD_SPACE_SIZE_MB',

@@ -9,6 +9,8 @@ export type ServerScopedMachineRpcParams<A> = Readonly<{
     method: string;
     payload: A;
     serverId?: string | null;
+    /** When present, scoped credentials must belong to this initiating account. */
+    accountId?: string | null;
     timeoutMs?: number;
     preferScoped?: boolean;
     authorization?: SocketRpcAuthorizationContext;
@@ -64,6 +66,7 @@ export type ScopedSocketConnectParams = Readonly<{
 
 export type ScopedSocketClient = Readonly<{
     timeout: (ms: number) => { emitWithAck: (event: string, payload: any) => Promise<unknown> };
+    emitWithAck: (event: string, payload: any) => Promise<unknown>;
     emit: (event: string, payload: any) => void;
     disconnect: () => void;
 }>;

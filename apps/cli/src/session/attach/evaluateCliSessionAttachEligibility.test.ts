@@ -1,11 +1,16 @@
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
+import { projectSessionMetadataForWire } from '@happier-dev/protocol';
 
 import type { Credentials } from '@/persistence';
 import { createSessionRecordFixture } from '@/testkit/backends/sessionFixtures';
+import { withTempDir } from '@/testkit/fs/tempDir';
+import { createEnvKeyScope } from '@/testkit/env/envScope';
+import { reloadConfiguration } from '@/configuration';
+import { acquireSessionRunnerLock, sessionRunnerLockPathForSessionId } from '@/daemon/sessionRunnerLock';
 import { evaluateCliSessionAttachEligibility } from './evaluateCliSessionAttachEligibility';
 
 const credentials: Credentials = {
@@ -24,6 +29,75 @@ afterEach(() => {
 });
 
 describe('evaluateCliSessionAttachEligibility', () => {
+  it.each(['live', 'unknown'] as const)('retains native provider admission for an active recorded Herdr pane with %s runner custody', async (runner) => {
+    await withTempDir('happier-herdr-active-attach-', async (home) => {
+      const env = createEnvKeyScope(['HAPPIER_HOME_DIR']);
+      env.patch({ HAPPIER_HOME_DIR: home });
+      reloadConfiguration();
+      const sessionId = 'sid_active_recorded_herdr';
+      const lock = runner === 'live' ? await acquireSessionRunnerLock({ sessionId, happyHomeDir: home }) : null;
+      if (lock) expect(lock.ok).toBe(true);
+      try {
+        if (runner === 'unknown') {
+          const lockPath = sessionRunnerLockPathForSessionId({ sessionId, happyHomeDir: home });
+          if (!lockPath) throw new Error('Expected canonical runner lock path');
+          await mkdir(dirname(lockPath), { recursive: true });
+          await writeFile(lockPath, '{malformed', 'utf8');
+        }
+        const rawSession = createSessionRecordFixture({
+          id: sessionId, active: true, encryptionMode: 'plain',
+          metadata: JSON.stringify(projectSessionMetadataForWire({
+            flavor: 'opencode', machineId: 'machine-local', path: home,
+            opencodeSessionId: 'same-native-session', opencodeBackendMode: 'server',
+            opencodeServerBaseUrl: 'http://127.0.0.1:4096/', opencodeServerBaseUrlExplicit: true,
+            terminal: { mode: 'herdr', herdr: {
+              sessionName: 'work', socketPath: '/herdr/work.sock', paneId: 'w1:p2', terminalId: 'old-terminal',
+            } },
+          })),
+        });
+        await expect(evaluateCliSessionAttachEligibility({
+          credentials, rawSession, currentMachineId: 'machine-local',
+          localAttachmentInfo: null, insideTmux: false,
+        })).resolves.toMatchObject({ eligible: true, attachStrategy: 'provider_attach' });
+      } finally {
+        if (lock?.ok) await lock.release();
+        env.restore();
+        reloadConfiguration();
+      }
+    });
+  });
+
+  it.each(['local', 'remote', 'missing-pane', 'archived', 'retired'] as const)(
+    'opens inactive preserved Herdr panes only as local restoration candidates (%s)',
+    async (state) => {
+      const rawSession = {
+        ...createSessionRecordFixture({
+          id: 'sid_cold_herdr', active: false, encryptionMode: 'plain',
+          metadata: JSON.stringify(projectSessionMetadataForWire({
+            flavor: 'claude', machineId: state === 'remote' ? 'machine-remote' : 'machine-local',
+            host: state === 'remote' ? 'remote-host' : 'local-host', path: '/project',
+            terminal: { mode: 'herdr', ...(state === 'retired' ? { controlServiceabilityV1: {
+              v: 1, state: 'unknown', observedAt: 1, retired: true,
+            } } : {}), herdr: {
+              sessionName: 'work', socketPath: '/herdr/work.sock', terminalId: 'old-terminal',
+              ...(state === 'missing-pane' ? {} : { paneId: 'w1:p2' }),
+            } },
+          })),
+        }),
+        ...(state === 'archived' ? { archivedAt: 1 } : {}),
+      };
+      const eligibility = await evaluateCliSessionAttachEligibility({
+        credentials, rawSession, currentMachineId: 'machine-local', currentMachineHost: 'local-host',
+        localAttachmentInfo: null, insideTmux: false,
+      });
+      if (state === 'local') {
+        expect(eligibility).toMatchObject({ eligible: true, attachStrategy: 'terminal_host', attachScope: 'local' });
+      } else {
+        expect(eligibility).toMatchObject({ eligible: false });
+      }
+    },
+  );
+
   it('rejects sessions from a different physical host even when synced tmux metadata exists', async () => {
     const rawSession = createSessionRecordFixture({
       id: 'sid_remote_tmux_1',
@@ -225,6 +299,75 @@ describe('evaluateCliSessionAttachEligibility', () => {
     });
   });
 
+  it.each(['devin', 'kimi'] as const)(
+    'accepts tmux-backed %s terminal attach through the shared local-control policy',
+    async (agentId) => {
+      const rawSession = createSessionRecordFixture({
+        id: `sid_local_${agentId}_tmux_1`,
+        active: true,
+        encryptionMode: 'plain',
+        metadata: JSON.stringify({
+          machineId: 'machine-local',
+          flavor: agentId,
+          host: 'leeroy-mbp',
+          path: '/tmp/workspace',
+          terminal: {
+            mode: 'tmux',
+            requested: 'tmux',
+            tmux: { target: `happy:${agentId}-session-1` },
+          },
+        }),
+      });
+
+      await expect(evaluateCliSessionAttachEligibility({
+        credentials,
+        rawSession,
+        currentMachineId: 'machine-local',
+        currentMachineHost: 'leeroy-mbp.local',
+        localAttachmentInfo: null,
+        insideTmux: false,
+      })).resolves.toMatchObject({
+        eligible: true,
+        attachStrategy: 'terminal_host',
+        agentId,
+        attachScope: 'local',
+        plan: expect.objectContaining({ type: 'tmux', target: `happy:${agentId}-session-1` }),
+      });
+    },
+  );
+
+  it('keeps terminal attach unavailable for an unsupported provider', async () => {
+    const rawSession = createSessionRecordFixture({
+      id: 'sid_local_gemini_tmux_1',
+      active: true,
+      encryptionMode: 'plain',
+      metadata: JSON.stringify({
+        machineId: 'machine-local',
+        flavor: 'gemini',
+        host: 'leeroy-mbp',
+        path: '/tmp/workspace',
+        terminal: {
+          mode: 'tmux',
+          requested: 'tmux',
+          tmux: { target: 'happy:gemini-session-1' },
+        },
+      }),
+    });
+
+    await expect(evaluateCliSessionAttachEligibility({
+      credentials,
+      rawSession,
+      currentMachineId: 'machine-local',
+      currentMachineHost: 'leeroy-mbp.local',
+      localAttachmentInfo: null,
+      insideTmux: false,
+    })).resolves.toMatchObject({
+      eligible: false,
+      agentId: 'gemini',
+      reasonCode: 'local_control_unsupported',
+    });
+  });
+
   it('accepts provider-attach sessions on the current machine without local terminal attachment state', async () => {
     const rawSession = createSessionRecordFixture({
       id: 'sid_local_opencode_1',
@@ -252,6 +395,48 @@ describe('evaluateCliSessionAttachEligibility', () => {
       attachStrategy: 'provider_attach',
       agentId: 'opencode',
       attachScope: 'local',
+    });
+  });
+
+  it('attaches to an existing Herdr pane for a server-backed OpenCode session', async () => {
+    const rawSession = createSessionRecordFixture({
+      id: 'sid_hosted_opencode_1',
+      active: true,
+      encryptionMode: 'plain',
+      metadata: JSON.stringify({
+        machineId: 'machine-local',
+        flavor: 'opencode',
+        path: '/tmp/opencode-workspace',
+        opencodeSessionId: 'opencode-session-1',
+        opencodeBackendMode: 'server',
+        opencodeServerBaseUrl: 'http://127.0.0.1:4096/',
+        opencodeServerBaseUrlExplicit: true,
+      }),
+    });
+
+    await expect(evaluateCliSessionAttachEligibility({
+      credentials,
+      rawSession,
+      currentMachineId: 'machine-local',
+      localAttachmentInfo: {
+        version: 1,
+        sessionId: 'sid_hosted_opencode_1',
+        terminal: {
+          mode: 'herdr',
+          requested: 'herdr',
+          herdr: {
+            sessionName: 'default',
+            socketPath: '/tmp/herdr.sock',
+            terminalId: 'term_1',
+          },
+        },
+        updatedAt: Date.now(),
+      },
+      insideTmux: false,
+    })).resolves.toMatchObject({
+      eligible: true,
+      attachStrategy: 'terminal_host',
+      plan: { type: 'herdr', terminalId: 'term_1' },
     });
   });
 
@@ -292,7 +477,7 @@ describe('evaluateCliSessionAttachEligibility', () => {
     });
   });
 
-  it('treats a local attachment marker as authoritative local ownership for OpenCode provider attach', async () => {
+  it('uses an existing local terminal host for an OpenCode session', async () => {
     const stateDir = await mkdtemp(join(tmpdir(), 'happier-opencode-attach-local-marker-'));
     process.env.HAPPIER_OPENCODE_SERVER_STATE_PATH = join(stateDir, 'managed-server.json');
     await writeFile(process.env.HAPPIER_OPENCODE_SERVER_STATE_PATH, JSON.stringify({
@@ -332,9 +517,10 @@ describe('evaluateCliSessionAttachEligibility', () => {
       insideTmux: false,
     })).resolves.toMatchObject({
       eligible: true,
-      attachStrategy: 'provider_attach',
+      attachStrategy: 'terminal_host',
       agentId: 'opencode',
       attachScope: 'local',
+      plan: expect.objectContaining({ type: 'tmux', target: 'happy:opencode-1' }),
     });
   });
 

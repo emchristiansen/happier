@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { sanitizeBugReportUrl } from '../bugReports/sanitize.js';
+import { CliUpdateFactsSchema } from '../machines/cliUpdateFacts.js';
 
 const NonEmptyString = z.string().trim().min(1);
 const PublicReleaseChannelLabelSchema = z.enum(['stable', 'preview', 'dev']);
@@ -23,6 +24,8 @@ const HappierServiceBackendSchema = z.enum([
 ]);
 const HappierServiceVerificationSchema = z.enum(['verified', 'candidate']);
 const HappierServiceTargetModeSchema = z.enum(['pinned', 'default-following']);
+/** The CLI's own autostart vocabulary (`DaemonServiceAutostartMode`), not a boolean. */
+const HappierServiceAutostartModeSchema = z.enum(['at-login', 'on-demand']);
 const HappierWarningSeveritySchema = z.enum(['info', 'warning', 'error']);
 
 function sanitizeUrl(raw: string): string {
@@ -42,6 +45,24 @@ export const DoctorSnapshotServerProfileSchema = z.object({
 });
 
 export type DoctorSnapshotServerProfile = z.infer<typeof DoctorSnapshotServerProfileSchema>;
+
+export const DoctorSnapshotDaemonCredentialStateSchema = z.enum(['missing', 'rejected', 'valid', 'unknown']);
+
+export type DoctorSnapshotDaemonCredentialState = z.infer<typeof DoctorSnapshotDaemonCredentialStateSchema>;
+
+/**
+ * Facts about the daemon that is actually running, derived by the CLI from its
+ * authenticated control endpoint and owner evaluation rather than from the files
+ * beside it. Optional because older CLIs did not emit it.
+ */
+export const DoctorSnapshotDaemonRuntimeConvergenceSchema = z.object({
+  controlReachable: z.boolean(),
+  serviceOwnsRunningDaemon: z.boolean(),
+  machineIdMatches: z.boolean(),
+  cliVersionMatches: z.boolean(),
+});
+
+export type DoctorSnapshotDaemonRuntimeConvergence = z.infer<typeof DoctorSnapshotDaemonRuntimeConvergenceSchema>;
 
 export const DoctorSnapshotDaemonStatusSchema = z.object({
   server: z.object({
@@ -66,6 +87,18 @@ export const DoctorSnapshotDaemonStatusSchema = z.object({
   service: z.object({
     installed: z.boolean(),
     running: z.boolean(),
+    /**
+     * Whether the installed background service follows the default relay or is pinned to one
+     * profile. `null` means no readable definition proved a mode; absent means the CLI that
+     * answered predates this field. Neither may be read as `default-following`.
+     */
+    targetMode: HappierServiceTargetModeSchema.nullable().optional(),
+    /**
+     * Whether the installed background service starts the daemon at login. `null` means the
+     * installed definition declared no mode; absent means the CLI that answered predates this
+     * field. Neither may be read as `at-login`.
+     */
+    autostart: HappierServiceAutostartModeSchema.nullable().optional(),
   }),
   auth: z.object({
     authenticated: z.boolean(),
@@ -73,7 +106,28 @@ export const DoctorSnapshotDaemonStatusSchema = z.object({
     machineId: NonEmptyString.nullable(),
     needsAuth: z.boolean(),
     accountId: NonEmptyString.nullable(),
+    credentialState: DoctorSnapshotDaemonCredentialStateSchema.optional(),
+    validatedAccountId: NonEmptyString.nullable().optional(),
+    /**
+     * How the validated account's profile names it for people (username, else display name), so
+     * a surface can say which account this computer is signed in as. `null` when the relay did
+     * not validate the token or the profile has no name; absent from older CLIs.
+     */
+    accountLabel: NonEmptyString.nullable().optional(),
   }),
+  runtimeConvergence: DoctorSnapshotDaemonRuntimeConvergenceSchema.optional(),
+  /**
+   * The answering CLI's own update state from its cached daily check (`happier self check`),
+   * filtered to its release channel. Never a network read; `null` when no check has cached a
+   * result yet, absent from older CLIs. The K5 facts (`CliUpdateFactsSchema`: channel, install
+   * source, update command, remote-update support, last outcome) extend it and are absent from
+   * CLIs that predate them.
+   */
+  cliUpdate: z.object({
+    currentVersion: NonEmptyString,
+    latestVersion: NonEmptyString.nullable(),
+    updateAvailable: z.boolean(),
+  }).extend(CliUpdateFactsSchema.omit({ currentVersion: true, latestVersion: true }).partial().shape).nullable().optional(),
 });
 
 export type DoctorSnapshotDaemonStatus = z.infer<typeof DoctorSnapshotDaemonStatusSchema>;

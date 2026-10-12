@@ -5,31 +5,24 @@ import { StyleSheet } from 'react-native-unistyles';
 import type { Session } from '@/sync/domains/state/storageTypes';
 import type { PendingPermissionRequest } from '@/utils/sessions/sessionUtils';
 
-import { useNavigateToSession } from '@/hooks/session/useNavigateToSession';
-import { useMachine } from '@/sync/domains/state/storage';
-import { readDisplayMachineIdForSession, readDisplayPathForSession } from '@/sync/ops/sessionMachineTarget';
 import { PermissionPromptCard } from '@/components/tools/shell/permissions/PermissionPromptCard';
 import { UserActionPromptCard } from '@/components/tools/shell/userActions/UserActionPromptCard';
 import { deriveTranscriptInteractionFromSession } from '@/utils/sessions/deriveTranscriptInteraction';
-import { getMachineDisplayName } from '@/utils/sessions/machineUtils';
-import { formatPathRelativeToHome, getSessionName } from '@/utils/sessions/sessionUtils';
+import { getSessionName } from '@/utils/sessions/sessionUtils';
 import { InboxSessionAttentionHeader } from './InboxSessionAttentionHeader';
+import type { SessionListIdentityDisplay } from '@/components/sessions/shell/SessionListIdentity';
 
 export const InboxSessionAttentionGroupCard = React.memo(function InboxSessionAttentionGroupCard(props: Readonly<{
     session: Session;
+    serverId: string | null;
     permissionRequests: readonly PendingPermissionRequest[];
     userActionRequests: readonly PendingPermissionRequest[];
+    machineLabel: string | null;
+    workspaceName: string | null;
+    identityDisplay: SessionListIdentityDisplay;
+    onOpenSession: () => void;
+    showDivider?: boolean;
 }>) {
-    const navigateToSession = useNavigateToSession();
-    const machineId = readDisplayMachineIdForSession({
-        sessionId: props.session.id,
-        metadata: props.session.metadata ?? null,
-    });
-    const machine = useMachine(machineId);
-    const displayPath = readDisplayPathForSession({
-        sessionId: props.session.id,
-        metadata: props.session.metadata ?? null,
-    });
     const transcriptInteraction = React.useMemo(() => {
         return deriveTranscriptInteractionFromSession({
             accessLevel: props.session.accessLevel,
@@ -47,12 +40,14 @@ export const InboxSessionAttentionGroupCard = React.memo(function InboxSessionAt
     }
 
     return (
-        <View testID={`inbox.session_attention.${props.session.id}`} style={styles.container}>
+        <View testID={`inbox.session_attention.${props.serverId ?? 'local'}.${props.session.id}`}>
             <InboxSessionAttentionHeader
                 sessionTitle={getSessionName(props.session)}
-                machineLabel={getMachineDisplayName(machine)}
-                pathLabel={displayPath ? formatPathRelativeToHome(displayPath, props.session.metadata?.homeDir ?? undefined) : null}
-                onOpenSession={() => { void navigateToSession(props.session.id); }}
+                machineLabel={props.machineLabel}
+                workspaceLabel={props.workspaceName}
+                session={props.session}
+                identityDisplay={props.identityDisplay}
+                onOpenSession={props.onOpenSession}
             />
 
             <View style={styles.items}>
@@ -80,23 +75,20 @@ export const InboxSessionAttentionGroupCard = React.memo(function InboxSessionAt
                     />
                 ))}
             </View>
+            {props.showDivider ? <View style={styles.divider} /> : null}
         </View>
     );
 });
 
 const styles = StyleSheet.create((theme) => ({
-    container: {
-        marginHorizontal: 16,
-        marginBottom: 12,
-        borderRadius: 16,
-        borderWidth: 1,
-        borderColor: theme.colors.border.default,
-        backgroundColor: theme.colors.surface.elevated,
-        overflow: 'hidden',
-    },
     items: {
         gap: 12,
         paddingHorizontal: 16,
         paddingBottom: 16,
+    },
+    divider: {
+        height: 1,
+        marginLeft: 16,
+        backgroundColor: theme.colors.border.default,
     },
 }));

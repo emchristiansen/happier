@@ -61,4 +61,68 @@ describe('createCatalogDefinedCliAuthSpec', () => {
       source: 'command',
     });
   });
+
+  it('detects logged-in Devin auth without exposing command output', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-devin-auth-'));
+    tempDirs.push(dir);
+
+    const scriptPath = join(dir, 'devin.js');
+    await writeFile(
+      scriptPath,
+      '#!/usr/bin/env node\nprocess.stdout.write("Authenticated as agent@example.com");\n',
+      'utf8',
+    );
+    await chmod(scriptPath, 0o755);
+
+    const spec = createCatalogDefinedCliAuthSpec('devin');
+    const detectAuthStatus = spec.detectAuthStatus;
+    expect(detectAuthStatus).toBeTypeOf('function');
+    if (!detectAuthStatus) throw new Error('expected detectAuthStatus');
+
+    await expect(detectAuthStatus({ resolvedPath: scriptPath })).resolves.toEqual({
+      state: 'logged_in',
+      method: 'oauth_cli',
+      source: 'command',
+    });
+  });
+
+  it('recognizes Devin 3000.10 logged-out output even though the command exits successfully', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-devin-auth-missing-'));
+    tempDirs.push(dir);
+
+    const scriptPath = join(dir, 'devin.js');
+    await writeFile(
+      scriptPath,
+      '#!/usr/bin/env node\nprocess.stdout.write("Not logged in.\\n  Credentials path: /private/credentials.toml\\nRun `devin auth login` to authenticate.\\n");\n',
+      'utf8',
+    );
+    await chmod(scriptPath, 0o755);
+
+    const detectAuthStatus = createCatalogDefinedCliAuthSpec('devin').detectAuthStatus;
+    if (!detectAuthStatus) throw new Error('expected detectAuthStatus');
+
+    await expect(detectAuthStatus({ resolvedPath: scriptPath })).resolves.toEqual({
+      state: 'logged_out',
+      reason: 'missing_credentials',
+      source: 'command',
+    });
+  });
+
+  it('does not misreport a crashing Devin auth probe as logged out', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-devin-auth-crash-'));
+    tempDirs.push(dir);
+
+    const scriptPath = join(dir, 'devin.js');
+    await writeFile(scriptPath, '#!/usr/bin/env node\nprocess.stderr.write("panic"); process.exit(101);\n', 'utf8');
+    await chmod(scriptPath, 0o755);
+
+    const detectAuthStatus = createCatalogDefinedCliAuthSpec('devin').detectAuthStatus;
+    if (!detectAuthStatus) throw new Error('expected detectAuthStatus');
+
+    await expect(detectAuthStatus({ resolvedPath: scriptPath })).resolves.toEqual({
+      state: 'unknown',
+      reason: 'probe_failed',
+      source: 'command',
+    });
+  });
 });

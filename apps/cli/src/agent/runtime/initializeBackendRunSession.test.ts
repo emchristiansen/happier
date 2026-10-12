@@ -737,6 +737,7 @@ describe('initializeBackendRunSession', () => {
         text: 'Commit me through Pending.',
         localId: 'spawn-first:stable-nonce',
         meta: { model: 'opus', profileId: 'profile-work', source: 'ui', sentFrom: 'cli' },
+        requestedAction: { v: 1, kind: 'send_now' },
       })
       expect(events).toEqual(['pending-committed', 'daemon-report'])
       expect(process.env.HAPPIER_DAEMON_PENDING_FIRST_INPUT).toBeUndefined()
@@ -789,6 +790,7 @@ describe('initializeBackendRunSession', () => {
         text: 'Commit after runtime readiness.',
         localId: 'spawn-first:runtime-ready',
         meta: { source: 'ui', sentFrom: 'cli' },
+        requestedAction: { v: 1, kind: 'send_now' },
       })
       expect(process.env.HAPPIER_DAEMON_PENDING_FIRST_INPUT).toBeUndefined()
     } finally {

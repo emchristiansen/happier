@@ -5,12 +5,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { findGestureByKind, renderHook, renderScreen, standardCleanup } from '@/dev/testkit';
 import type { SessionListViewItem } from '@/sync/domains/state/storage';
 import { localSettingsDefaults, type LocalSettings } from '@/sync/domains/settings/localSettings';
+import { settingsDefaults } from '@/sync/domains/settings/settings';
 import { clearTempData, peekTempData, type NewSessionData } from '@/utils/sessions/tempDataStore';
 import { installSessionShellCommonModuleMocks } from './sessionShellTestHelpers';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 let platformOs: 'ios' | 'android' | 'web' = 'ios';
+let forbidWholeSettingsSubscription = false;
 let mockPathname = '';
 let isTabletDevice = false;
 let pinnedSessionKeysV1: string[] = [];
@@ -32,6 +34,8 @@ const sessionOrganizationOps = vi.hoisted(() => ({
 const keyboardShortcutHandlersRef = vi.hoisted(() => ({
     current: null as Record<string, (() => void)> | null,
 }));
+const sessionListRenderableReadSpy = vi.hoisted(() => vi.fn());
+const sessionListRenderablesForSubscriptionTests: Record<string, any> = {};
 
 let sessionTagsV1: Record<string, string[]> = {};
 const setSessionTagsV1 = vi.fn();
@@ -40,10 +44,13 @@ const setWorkspaceLabelsV1 = vi.fn();
 let collapsedGroupKeysV1: Record<string, boolean> = {};
 const setCollapsedGroupKeysV1 = vi.fn();
 let sessionFolderViewModeV1: 'off' | 'tree' = 'off';
+let foldersFeatureEnabled = true;
+const folderFeatureListeners = new Set<() => void>();
 const setSessionFolderViewModeV1 = vi.fn();
 let sessionFoldersV1: any = { v: 1, folders: [] };
 const setSessionFoldersV1 = vi.fn();
 let sessionListOrderingModeV1: 'custom' | 'created' | 'updated' = 'custom';
+let sessionListIdentityDisplay: 'avatar' | 'agentLogo' | 'none' = 'avatar';
 const setSessionListOrderingModeV1 = vi.fn();
 let sessionFolderAssignmentsBySessionKey: Record<string, string | null> = {};
 let rememberLastProjectSessionSelections: boolean | null = null;
@@ -251,6 +258,14 @@ let storageState: any = {
             metadata: { displayName: 'Other workstation', host: 'other.local' },
         },
     },
+    sessionListRenderables: new Proxy(sessionListRenderablesForSubscriptionTests, {
+        get: (target, property, receiver) => {
+            if (typeof property === 'string') {
+                sessionListRenderableReadSpy(property);
+            }
+            return Reflect.get(target, property, receiver);
+        },
+    }),
     getProjectForSession: (sessionId: string) =>
         sessionId === 'sess_a'
             ? {
@@ -334,13 +349,6 @@ vi.mock('react-native-worklets', () => ({
     scheduleOnRN: (fn: (...args: any[]) => void, ...args: any[]) => fn(...args),
 }));
 
-vi.mock('@/constants/Typography', async (importOriginal) => ({
-    ...(await importOriginal<typeof import('@/constants/Typography')>()),
-    Typography: new Proxy({} as Record<string, () => Record<string, never>>, {
-        get: () => () => ({}),
-    }),
-}));
-
 vi.mock('@/components/ui/icons/Icon', () => ({
     Icon: 'Icon',
     ICON_SIZE: { xs: 14, sm: 16, md: 20, lg: 24, xl: 29 },
@@ -380,9 +388,6 @@ vi.mock('@/components/account/RecoveryKeyReminderBanner', () => ({
     RecoveryKeyReminderBanner: 'RecoveryKeyReminderBanner',
 }));
 
-vi.mock('@/components/ui/feedback/UpdateBanner', () => ({
-    UpdateBanner: 'UpdateBanner',
-}));
 
 vi.mock('@/components/ui/layout/layout', () => ({
     layout: { maxWidth: 1280 },
@@ -497,9 +502,16 @@ installSessionShellCommonModuleMocks({
                 useSetting: (key: string) => {
                     if (key === 'compactSessionView') return false;
                     if (key === 'compactSessionViewMinimal') return false;
+                    if (key === 'sessionListIdentityDisplay') return sessionListIdentityDisplay;
                     if (key === 'sessionTagsEnabled') return true;
                     if (key === 'rememberLastProjectSessionSelections') return rememberLastProjectSessionSelections;
                     return null;
+                },
+                useSettings: () => {
+                    if (forbidWholeSettingsSubscription) {
+                        throw new Error('SessionsList must subscribe only to settings that affect its rendered output');
+                    }
+                    return settingsDefaults;
                 },
                 useHasUnreadMessages: () => false,
                 useAllMachines: () => allMachines,
@@ -624,7 +636,13 @@ vi.mock('@/hooks/server/useEffectiveServerSelection', () => ({
 }));
 
 vi.mock('@/hooks/server/useFeatureDecision', () => ({
-    useFeatureDecision: () => ({ state: 'enabled' }),
+    useFeatureDecision: (featureId: string) => {
+        const enabled = React.useSyncExternalStore(
+            React.useCallback((listener: () => void) => { folderFeatureListeners.add(listener); return () => { folderFeatureListeners.delete(listener); }; }, []),
+            () => featureId === 'sessions.folders' ? foldersFeatureEnabled : true,
+        );
+        return { state: enabled ? 'enabled' : 'disabled' };
+    },
 }));
 
 let mockVisibleSessionListViewData: any[] | null = [
@@ -801,8 +819,10 @@ describe('SessionsList (native virtualization)', () => {
         workspaceLabelsV1 = {};
         collapsedGroupKeysV1 = {};
         sessionFolderViewModeV1 = 'off';
+        foldersFeatureEnabled = true;
         sessionFoldersV1 = { v: 1, folders: [] };
         sessionListOrderingModeV1 = 'custom';
+        sessionListIdentityDisplay = 'avatar';
         sessionFolderAssignmentsBySessionKey = {};
         rememberLastProjectSessionSelections = null;
         organizationProjectionCache = null;
@@ -851,6 +871,10 @@ describe('SessionsList (native virtualization)', () => {
         sessionOrganizationOps.setSessionPin.mockClear();
         sessionOrganizationOps.setSessionTagLabels.mockClear();
         keyboardShortcutHandlersRef.current = null;
+        sessionListRenderableReadSpy.mockClear();
+        for (const sessionId of Object.keys(sessionListRenderablesForSubscriptionTests)) {
+            delete sessionListRenderablesForSubscriptionTests[sessionId];
+        }
         routerPushSpy.mockClear();
         mockAllowedServerIds = ['server_a'];
         mockActiveServerId = 'server_a';
@@ -878,6 +902,31 @@ describe('SessionsList (native virtualization)', () => {
         expect(first.props.isLast).toBe(false);
         expect(second.props.isFirst).toBe(false);
         expect(second.props.isLast).toBe(true);
+    });
+
+    it('defers bulk action targets until selection opens and rebuilds current targets when reopened', async () => {
+        const { SessionsList } = await import('./SessionsList');
+        const { SessionListSelectionStoreProvider } = await import('./selection/SessionListSelectionContext');
+        const { SessionListSelectionActionBarHost } = await import('./selection/SessionListSelectionActionBar');
+        const screen = await renderSessionsList();
+        const store = screen.root.findByType(SessionListSelectionStoreProvider).props.store;
+        const readTargets = () => screen.root.findByType(SessionListSelectionActionBarHost).props.targetsByKey;
+
+        // This is the unused bulk model, not the virtualized row projection.
+        expect(readTargets().size).toBe(0);
+        await act(async () => { store.enter('server_a:sess_a'); });
+        expect(readTargets().size).toBe(2);
+        expect(readTargets().get('server_a:sess_a').tags).toEqual([]);
+        await act(async () => { store.selectAllVisible(); });
+        expect(store.getSnapshot().count).toBe(2);
+        await act(async () => { store.exit(); });
+        expect(readTargets().size).toBe(0);
+
+        sessionTagsV1 = { 'server_a:sess_a': ['updated-while-closed'] };
+        await screen.update(<SessionsList />);
+        expect(readTargets().size).toBe(0);
+        await act(async () => { store.enter('server_a:sess_a'); });
+        expect(readTargets().get('server_a:sess_a').tags).toEqual(['updated-while-closed']);
     });
 
     it('expands the header search input and collapses it on blur when empty', async () => {
@@ -1548,6 +1597,15 @@ describe('SessionsList (native virtualization)', () => {
         expect(updatedList.props.ListFooterComponent).toBe(initialListFooterComponent);
     });
 
+    it('does not subscribe the list surface to the complete settings record', async () => {
+        forbidWholeSettingsSubscription = true;
+        try {
+            await renderSessionsList();
+        } finally {
+            forbidWholeSettingsSubscription = false;
+        }
+    });
+
     it('keeps native list chrome callbacks stable when an equivalent session-list refresh has no folder breadcrumbs', async () => {
         platformOs = 'android';
 
@@ -1621,12 +1679,40 @@ describe('SessionsList (native virtualization)', () => {
         expect(updatedRow.props.resolveDropResult).toBe(initialRow.props.resolveDropResult);
         expect(updatedRow.props.onRegisterTreeRowBounds).toBe(initialRow.props.onRegisterTreeRowBounds);
         expect(updatedRow.props.onUnregisterTreeRowBounds).toBe(initialRow.props.onUnregisterTreeRowBounds);
-        expect(updatedRow.props.folderMoveMenuItems).toBe(initialRow.props.folderMoveMenuItems);
         expect(updatedRow.props.onMoveToFolder).toBe(initialRow.props.onMoveToFolder);
         expect(updatedRow.props.onMoveToWorkspaceRoot).toBe(initialRow.props.onMoveToWorkspaceRoot);
         expect(updatedRow.props.onMoveUp).toBe(initialRow.props.onMoveUp);
         expect(updatedRow.props.onMoveDown).toBe(initialRow.props.onMoveDown);
-        expect(updatedRow.props.onSelectFolderMoveMenuItem).toBe(initialRow.props.onSelectFolderMoveMenuItem);
+    });
+
+    it('updates mounted row folder actions when the folder gate changes with folder view off', async () => {
+        const screen = await renderSessionsList();
+        expect(findSessionItem(screen, 'sess_a')?.props.onMoveToFolder).toEqual(expect.any(Function));
+        await act(async () => { foldersFeatureEnabled = false; folderFeatureListeners.forEach((listener) => listener()); });
+        expect(findSessionItem(screen, 'sess_a')?.props.onMoveToFolder).toBeUndefined();
+        await act(async () => { foldersFeatureEnabled = true; folderFeatureListeners.forEach((listener) => listener()); });
+        expect(findSessionItem(screen, 'sess_a')?.props.onMoveToFolder).toEqual(expect.any(Function));
+    });
+
+    it('invalidates mounted native rows when a row presentation setting changes', async () => {
+        const screen = await renderSessionsList();
+        const initialList = expectPresent(
+            screen.root.findAll((node) => String(node.type) === 'FlashListCompat')[0],
+            'expected native FlashListCompat',
+        );
+        const initialExtraData = initialList.props.extraData;
+        const { SessionsList } = await import('./SessionsList');
+
+        sessionListIdentityDisplay = 'none';
+        mockPathname = '/sessions';
+        await screen.update(<SessionsList />);
+
+        const updatedList = expectPresent(
+            screen.root.findAll((node) => String(node.type) === 'FlashListCompat')[0],
+            'expected updated native FlashListCompat',
+        );
+        expect(updatedList.props.extraData).not.toBe(initialExtraData);
+        expect(updatedList.props.extraData.sessionListIdentityDisplay).toBe('none');
     });
 
     it('keeps native FlashList structural data stable when a row overlay update changes one row model', async () => {
@@ -1767,7 +1853,6 @@ describe('SessionsList (native virtualization)', () => {
         expect(secondRow.props.onMoveToWorkspaceRoot).toBe(firstRow.props.onMoveToWorkspaceRoot);
         expect(secondRow.props.onMoveUp).toBe(firstRow.props.onMoveUp);
         expect(secondRow.props.onMoveDown).toBe(firstRow.props.onMoveDown);
-        expect(secondRow.props.onSelectFolderMoveMenuItem).toBe(firstRow.props.onSelectFolderMoveMenuItem);
         expect(secondRow.props.tags).toBe(firstRow.props.tags);
         expect(secondRow.props.allKnownTags).toBe(firstRow.props.allKnownTags);
     });
@@ -2128,6 +2213,22 @@ describe('SessionsList (native virtualization)', () => {
         expect(setSessionMruOrderV1).not.toHaveBeenCalled();
     });
 
+    it('keeps disabled folder commands inert when invoked by keyboard', async () => {
+        mockPathname = '/session/sess_a';
+        foldersFeatureEnabled = false;
+        sessionFolderAssignmentsBySessionKey = { 'server_a:sess_a': 'planning' };
+        await renderSessionsList();
+        const { Modal } = await import('@/modal');
+        vi.mocked(Modal.show).mockClear();
+        vi.mocked(Modal.alert).mockClear();
+        await act(async () => {
+            keyboardShortcutHandlersRef.current?.['sessions.row.moveToFolder']?.();
+            keyboardShortcutHandlersRef.current?.['sessions.row.moveToWorkspaceRoot']?.();
+        });
+        expect(Modal.show).not.toHaveBeenCalled();
+        expect(Modal.alert).not.toHaveBeenCalled();
+    });
+
     it('registers visible session shortcut handlers through the keyboard provider', async () => {
         mockPathname = '/session/sess_a';
 
@@ -2189,6 +2290,7 @@ describe('SessionsList (native virtualization)', () => {
             'expected native FlashListCompat',
         );
         const activeData = list.props.data;
+        const activeExtraData = list.props.extraData;
         const nextSession = {
             id: 'sess_hidden_refresh',
             active: true,
@@ -2227,6 +2329,9 @@ describe('SessionsList (native virtualization)', () => {
             'expected inactive native FlashListCompat',
         );
         expect(inactiveList.props.data).toBe(activeData);
+        expect(inactiveList.props.extraData).not.toBe(activeExtraData);
+        expect(inactiveList.props.extraData.sessionListSurfaceDataActive).toBe(false);
+        const inactiveExtraData = inactiveList.props.extraData;
 
         await screen.update(
             <SessionsList
@@ -2243,7 +2348,31 @@ describe('SessionsList (native virtualization)', () => {
             'expected reactivated native FlashListCompat',
         );
         expect(reactivatedList.props.data).not.toBe(activeData);
+        expect(reactivatedList.props.extraData).not.toBe(inactiveExtraData);
+        expect(reactivatedList.props.extraData.sessionListSurfaceDataActive).toBe(true);
         expect(reactivatedList.props.data.some((item: any) => item.type === 'session' && item.session.id === 'sess_hidden_refresh')).toBe(true);
+    });
+
+    it('does not read runtime-priority rows while the list surface is inactive', async () => {
+        sessionListRenderablesForSubscriptionTests.sess_a = {
+            ...sessionA,
+            id: 'sess_a',
+        };
+        sessionListRenderablesForSubscriptionTests.sess_b = {
+            ...sessionB,
+            id: 'sess_b',
+            hasPendingUserActionRequests: true,
+            pendingRequestObservedAt: 10,
+        };
+
+        await renderSessionsListWithSurfaceOwnership({
+            ownerKey: 'phone-root',
+            visible: true,
+            interactive: false,
+            dataActive: false,
+        });
+
+        expect(sessionListRenderableReadSpy).not.toHaveBeenCalled();
     });
 
     it('does not expose a load-more handler when the surface is not data-active', async () => {
@@ -2274,6 +2403,21 @@ describe('SessionsList (native virtualization)', () => {
         );
 
         expect(list.props.maintainVisibleContentPosition).toEqual({ disabled: true });
+    });
+
+    it('delivers handled control taps while the native search keyboard is open', async () => {
+        const screen = await renderSessionsListWithSurfaceOwnership({
+            ownerKey: 'phone-root',
+            visible: true,
+            interactive: true,
+            dataActive: true,
+        });
+        const list = expectPresent(
+            screen.root.findAll((node) => String(node.type) === 'FlashListCompat')[0],
+            'expected native FlashListCompat',
+        );
+
+        expect(list.props.keyboardShouldPersistTaps).toBe('handled');
     });
 
     it('refreshes sessions from native pull-to-refresh and keeps the indicator active while pending', async () => {
@@ -2329,19 +2473,64 @@ describe('SessionsList (native virtualization)', () => {
         expect(refreshedList.props.refreshControl.props.refreshing).toBe(false);
     });
 
-    it('does not expose native pull-to-refresh when the surface is not data-active', async () => {
+    it('keeps native pull-to-refresh mounted but disabled across inactive focus transitions', async () => {
         const screen = await renderSessionsListWithSurfaceOwnership({
             ownerKey: 'phone-root',
-            visible: false,
-            interactive: false,
-            dataActive: false,
+            visible: true,
+            interactive: true,
+            dataActive: true,
         });
-        const list = expectPresent(
+        const activeList = expectPresent(
             screen.root.findAll((node) => String(node.type) === 'FlashListCompat')[0],
             'expected native FlashListCompat',
         );
+        expect(activeList.props.refreshControl?.props).toMatchObject({
+            enabled: true,
+            refreshing: false,
+        });
+        expect(activeList.props.refreshControl?.props?.onRefresh).toBeTypeOf('function');
 
-        expect(list.props.refreshControl).toBeUndefined();
+        const { SessionsList } = await import('./SessionsList');
+        await screen.update(
+            <SessionsList
+                surfaceOwnership={{
+                    ownerKey: 'phone-root',
+                    visible: true,
+                    interactive: false,
+                    dataActive: false,
+                }}
+            />,
+        );
+        const inactiveList = expectPresent(
+            screen.root.findAll((node) => String(node.type) === 'FlashListCompat')[0],
+            'expected inactive native FlashListCompat',
+        );
+        expect(inactiveList.props.refreshControl?.props).toMatchObject({
+            enabled: false,
+            refreshing: false,
+        });
+        expect(inactiveList.props.refreshControl?.props?.onRefresh).toBeUndefined();
+
+        await screen.update(
+            <SessionsList
+                surfaceOwnership={{
+                    ownerKey: 'phone-root',
+                    visible: true,
+                    interactive: true,
+                    dataActive: true,
+                }}
+            />,
+        );
+        const focusedList = expectPresent(
+            screen.root.findAll((node) => String(node.type) === 'FlashListCompat')[0],
+            'expected focused native FlashListCompat',
+        );
+
+        expect(focusedList.props.refreshControl?.props).toMatchObject({
+            enabled: true,
+            refreshing: false,
+        });
+        expect(focusedList.props.refreshControl?.props?.onRefresh).toBeTypeOf('function');
     });
 
     it('deduplicates native pull-to-refresh while a session refresh is already pending', async () => {
@@ -2572,6 +2761,55 @@ describe('SessionsList (native virtualization)', () => {
         });
         expect(hook.getCurrent().hasMultipleMachines).toBe(true);
 
+        await hook.unmount();
+    });
+
+    it('preserves the canonical folder-presented list instead of projecting folders again', async () => {
+        sessionFolderViewModeV1 = 'tree';
+        sessionFoldersV1 = {
+            v: 1,
+            folders: [{
+                id: 'folder-planning',
+                workspace: {
+                    t: 'workspaceScope',
+                    serverId: 'server_a',
+                    machineId: 'machine-target',
+                    rootPath: '/Volumes/target/repo',
+                },
+                parentId: null,
+                name: 'Planning',
+                createdAt: 1,
+                updatedAt: 1,
+            }],
+        };
+        const folderPresentedData = [
+            {
+                type: 'header',
+                title: 'Planning',
+                headerKind: 'folder',
+                groupKey: 'server:server_a:project:repo:folder:folder-planning',
+                folderId: 'folder-planning',
+                depth: 0,
+                serverId: 'server_a',
+            },
+            {
+                type: 'session',
+                session: sessionA,
+                section: 'active',
+                groupKey: 'server:server_a:project:repo:folder:folder-planning',
+                groupKind: 'folder',
+                folderId: 'folder-planning',
+                folderDepth: 1,
+                serverId: 'server_a',
+            },
+        ] as SessionListViewItem[];
+        const { useSessionListViewState } = await import('./view-state/useSessionListViewState');
+        const hook = await renderHook(() => useSessionListViewState({
+            data: folderPresentedData,
+            pathname: '',
+        }));
+
+        expect(hook.getCurrent().folderPresentedData).toBe(folderPresentedData);
         await hook.unmount();
     });
 

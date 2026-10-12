@@ -710,87 +710,24 @@ async function enableSelectedModelFastSpeed(page: Page, uiBaseUrl: string): Prom
     await ensureOnNewSessionComposer(page, uiBaseUrl);
 }
 
-async function readVisibleSessionModeOptionTestIds(page: Page): Promise<string[]> {
-    // Phase 11 SelectionList migration: `agent-input-simple-option:*` is gone; the shared
-    // SelectionList popover emits options under `selection-list:session-mode-root:option:<id>`.
-    const selectorPrefixes = ['agent-input-session-mode-option:', 'selection-list:session-mode-root:option:'];
-    const ids = await Promise.all(
-        selectorPrefixes.map(async (prefix) => {
-            return page.locator(`[data-testid^="${prefix}"]`).evaluateAll((nodes) => {
-                return nodes
-                    .map((node) => node.getAttribute('data-testid'))
-                    .filter((value): value is string => typeof value === 'string' && value.length > 0);
-            });
-        }),
-    );
-    return ids.flat();
-}
-
-async function clickSessionModeOption(page: Page, optionId: string): Promise<void> {
-    const overlayOption = page.getByTestId(`agent-input-session-mode-option:${optionId}`);
-    try {
-        await expect(overlayOption).toHaveCount(1, { timeout: 120_000 });
-        await overlayOption.click();
-        return;
-    } catch {
-        // fall through to the simple surface
-    }
-
-    // Phase 11 SelectionList migration: `agent-input-simple-option:*` was deleted with
-    // `AgentInputSelectionSimpleList.tsx`. The shared SelectionList popover emits each option
-    // under `selection-list:<step-id>:option:<id>`. For session mode the step is
-    // `session-mode-root` (see AgentInputOverlayLayer.tsx).
-    const simpleOption = page.getByTestId(`selection-list:session-mode-root:option:${optionId}`);
-    try {
-        await expect(simpleOption).toHaveCount(1, { timeout: 120_000 });
-        await simpleOption.click();
-    } catch (error) {
-        const visibleOptionIds = await readVisibleSessionModeOptionTestIds(page).catch(() => []);
-        throw new Error(
-            `Expected session mode option ${optionId}, but visible options were: ${
-                visibleOptionIds.length > 0 ? visibleOptionIds.join(', ') : '(none)'
-            }`,
-            { cause: error as Error },
-        );
-    }
-}
-
 async function ensureSessionMode(page: Page, optionId: 'plan' | 'default'): Promise<void> {
     const modeChip = page.getByTestId('agent-input-session-mode-chip');
     await expect(modeChip).toHaveCount(1, { timeout: 60_000 });
 
-    const expectedLabel = optionId === 'plan' ? /plan/i : /default/i;
-    const readChipText = async () => (await modeChip.textContent().catch(() => '')) ?? '';
-
-    if (expectedLabel.test(await readChipText())) return;
-
-    // If the chip opens a picker, the option elements will appear; otherwise the chip cycles modes.
+    const selectedMode = page.getByTestId(`agent-input-session-mode-chip-label:${optionId}`);
+    if (await selectedMode.count()) return;
+    // This fixture advertises exactly Default and Plan, so the canonical chip
+    // interaction cycles between them. Await the asynchronous metadata projection
+    // after one click; another click can undo the selection while the old label
+    // is still rendered.
     await modeChip.click();
-    if (expectedLabel.test(await readChipText())) return;
-
-    // Phase 11 SelectionList migration: `agent-input-simple-option:*` is gone; the shared
-    // SelectionList popover emits options under `selection-list:session-mode-root:option:<id>`.
-    const anyModeOption = page.locator('[data-testid^="agent-input-session-mode-option:"], [data-testid^="selection-list:session-mode-root:option:"]').first();
-    try {
-        await expect(anyModeOption).toHaveCount(1, { timeout: 1_500 });
-        await clickSessionModeOption(page, optionId);
-        await page.keyboard.press('Escape').catch(() => {});
-        return;
-    } catch {
-        // fall through to cycle behavior
-    }
-
-    for (let i = 0; i < 4; i += 1) {
-        await modeChip.click();
-        if (expectedLabel.test(await readChipText())) return;
-        await page.waitForTimeout(100);
-    }
-
-    throw new Error(`Failed to set session mode to ${optionId}; chip text was: ${(await readChipText()) || '(empty)'}`);
+    await expect(selectedMode).toHaveCount(1, { timeout: 60_000 });
 }
 
 test.describe('ui e2e: Codex app-server dynamic controls', () => {
-    test.describe.configure({ mode: 'serial' });
+    // Apply the budget before Playwright resolves the page fixture. On a retry, runner setup can
+    // exceed Playwright's 30s default before the test body gets a chance to call setTimeout().
+    test.describe.configure({ mode: 'serial', timeout: 540_000 });
 
     const suiteDir = run.testDir('session-codex-app-server-dynamic-controls-suite');
 
@@ -808,11 +745,6 @@ test.describe('ui e2e: Codex app-server dynamic controls', () => {
             extraEnv: {
                 HAPPIER_E2E_PROVIDER_USE_SERVER_SOURCE_ENTRYPOINT: '1',
                 HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys',
-                // Presence updates are throttled in the DB; keep the presence timeout comfortably above
-                // that threshold so the UI doesn't briefly classify the daemon machine as "offline".
-                HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-                HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '300000',
-                HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
                 // UI e2e runs after workspace typechecks/builds in the pipeline runner; avoid
                 // expensive shared-deps/provider-generation work here to reduce beforeAll flake.
                 HAPPIER_E2E_PROVIDER_SKIP_SERVER_SHARED_DEPS_BUILD: '1',
@@ -849,7 +781,6 @@ test.describe('ui e2e: Codex app-server dynamic controls', () => {
     });
 
     test('uses preflight Codex app-server controls on /new before the first prompt', async ({ page }) => {
-        test.setTimeout(540_000);
         if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
         const testDir = resolve(join(suiteDir, 't1-codex-app-server-preflight-controls'));
@@ -904,7 +835,6 @@ test.describe('ui e2e: Codex app-server dynamic controls', () => {
     });
 
     test('applies live Codex app-server mode and model changes to the next session turn', async ({ page }) => {
-        test.setTimeout(540_000);
         if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
         const testDir = resolve(join(suiteDir, 't2-codex-app-server-live-controls'));
@@ -988,7 +918,6 @@ test.describe('ui e2e: Codex app-server dynamic controls', () => {
     });
 
     test('shows the eligible Codex app-server Fast control for the selected model and applies it on the first turn', async ({ page }) => {
-        test.setTimeout(540_000);
         if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
         const testDir = resolve(join(suiteDir, 't3-codex-app-server-speed-controls'));

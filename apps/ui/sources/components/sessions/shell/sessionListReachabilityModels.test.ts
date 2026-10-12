@@ -161,6 +161,54 @@ describe('buildSessionListReachabilityModels', () => {
         });
     });
 
+    it('reuses retained reachability models across a list remount', async () => {
+        const {
+            buildSessionListReachabilityModels,
+            createSessionListReachabilityModelsCache,
+        } = await import('./sessionListReachabilityModels');
+
+        mockStorageState = {
+            sessions: {},
+            machines: {},
+            getProjectForSession: () => null,
+        };
+        const items = [{
+            type: 'session',
+            serverId: 'server-a',
+            session: {
+                id: 'retained-session',
+                metadata: {
+                    machineId: 'machine-a',
+                    path: '/Users/test/workspace/retained',
+                    homeDir: '/Users/test',
+                    host: 'a.local',
+                },
+            },
+        }] as any;
+        const machinesById = {
+            'machine-a': {
+                id: 'machine-a',
+                title: 'Machine A',
+                subtitle: 'a.local',
+                metadata: { host: 'a.local', displayName: 'Machine A' },
+            } as any,
+        };
+        const first = buildSessionListReachabilityModels({
+            cache: createSessionListReachabilityModelsCache(),
+            items,
+            machinesById,
+            workspaceLabelsV1: { 'server-a:machine-a:/Users/test/workspace': 'Workspace' },
+        });
+        const second = buildSessionListReachabilityModels({
+            cache: createSessionListReachabilityModelsCache(),
+            items,
+            machinesById,
+            workspaceLabelsV1: { 'server-a:machine-a:/Users/test/workspace': 'Workspace' },
+        });
+
+        expect(second).toBe(first);
+    });
+
     it('keeps reachability display scoped when two visible servers share a session id', async () => {
         const { buildSessionListReachabilityModels } = await import('./sessionListReachabilityModels');
 

@@ -126,7 +126,7 @@ export async function resolveEmbeddingsProvider(params: Readonly<{
         usingFallback: false,
       };
     } catch (error) {
-      logger.debug('[memoryWorker] Embeddings provider init failed (best-effort)', {
+      logger.warn('[memoryWorker] Embeddings unavailable; using keyword-search fallback', {
         providerKind,
         modelId,
         message: error instanceof Error ? error.message : String(error),

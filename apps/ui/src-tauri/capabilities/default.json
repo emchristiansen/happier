@@ -7,17 +7,25 @@
   ],
   "permissions": [
     "core:default",
+    "deep-link:default",
     "http:default",
     "notification:default",
     "core:window:allow-set-background-color",
     "core:window:allow-set-badge-count",
     "core:window:allow-set-badge-label",
     "dialog:allow-open",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://*" },
+        { "url": "http://*" },
+        { "url": "mailto:*" }
+      ]
+    },
     "allow-desktop-fetch-update",
+    "allow-desktop-download-update",
     "allow-desktop-install-update",
     "allow-desktop-pick-ssh-identity-file",
-    "allow-desktop-get-autostart-enabled",
-    "allow-desktop-set-autostart-enabled",
     "allow-desktop-set-tray-state",
     "allow-sync-desktop-pet-overlay-state",
     "allow-desktop-pet-overlay-read-window-state",
@@ -36,6 +44,7 @@
     "allow-desktop-close-window",
     "allow-desktop-show-main-window",
     "allow-desktop-start-window-dragging",
+    "allow-desktop-finish-shutdown",
     {
       "identifier": "http:default",
       "allow": [

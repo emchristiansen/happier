@@ -4,7 +4,11 @@ import type {
     ProviderAccountUsageSnapshotV1,
     SealedProviderAccountUsageSnapshotV1,
 } from "@happier-dev/protocol";
-import { mergeProviderAccountSubscription } from "@happier-dev/protocol";
+import {
+    compareConnectedServiceQuotaObservationRecency,
+    isConnectedServiceQuotaObservationAtOrBeforeNow,
+    mergeProviderAccountSubscription,
+} from "@happier-dev/protocol";
 import { isPrismaErrorCode, type TransactionClient } from "@/storage/prisma";
 
 import { inTx } from "@/storage/inTx";
@@ -77,6 +81,10 @@ function buildWriteParams(
 async function writeProviderAccountUsageRecordWithPolicyInClient(
     params: ProviderAccountUsageWritePolicyParams & Readonly<{ client: ProviderAccountUsagePolicyClient }>,
 ): Promise<"written" | "noop" | "stale"> {
+    const nowMs = Date.now();
+    if (!isConnectedServiceQuotaObservationAtOrBeforeNow({ observedAtMs: params.fetchedAt, nowMs })) {
+        throw new ProviderAccountUsagePayloadInvariantError("Provider account usage observation time must not be in the future");
+    }
     const account = await params.client.account.findUnique({
         where: { id: params.accountId },
         select: { publicKey: true, encryptionMode: true },
@@ -107,7 +115,11 @@ async function writeProviderAccountUsageRecordWithPolicyInClient(
 
         const existingFingerprint = normalizeFingerprint(existing.metadata?.materialFingerprint);
         const existingFetchedAt = existing.fetchedAt ?? null;
-        const isNewer = existingFetchedAt === null || params.fetchedAt > existingFetchedAt;
+        const isNewer = existingFetchedAt === null || compareConnectedServiceQuotaObservationRecency({
+            existingObservedAtMs: existingFetchedAt,
+            incomingObservedAtMs: params.fetchedAt,
+            nowMs,
+        }) === "incoming_newer";
         const clearsRefreshRequest = shouldClearRefreshRequest(existing.refreshRequestedAt, params.fetchedAt);
         const preservesRefreshRequest = shouldPreserveRefreshRequest(existing.refreshRequestedAt, params.fetchedAt);
 

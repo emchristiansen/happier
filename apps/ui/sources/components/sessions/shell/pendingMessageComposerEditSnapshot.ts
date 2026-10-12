@@ -52,7 +52,7 @@ export function readPendingMessageComposerSemanticDraftSnapshot(
 export function isEmptyPendingMessageComposerSemanticDraftSnapshot(
     snapshot: PendingMessageComposerSemanticDraftSnapshot,
 ): boolean {
-    return typeof snapshot.recipient === 'undefined'
+    return (typeof snapshot.recipient === 'undefined' || snapshot.recipient === null)
         && typeof snapshot.executionRunDelivery === 'undefined'
         && (
             typeof snapshot.structuredInputMentions === 'undefined'

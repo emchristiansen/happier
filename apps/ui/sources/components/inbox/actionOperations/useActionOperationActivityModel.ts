@@ -11,8 +11,10 @@ import {
     useActionOperationObservations,
     useActionOperationsNeedAttention,
     useAllActionOperations,
+    useInboxActionOperationEntries,
     useUnavailableActionOperationIds,
 } from '@/sync/domains/actionOperations/useActionOperations';
+import type { InboxActionOperationEntry } from '@/sync/domains/actionOperations/actionOperationSelectors';
 import { actionOperationStore } from '@/sync/domains/actionOperations/actionOperationStore';
 import { actionOperationReentry } from '@/sync/domains/actionOperations/actionOperationReentry';
 import { getMachineDisplayName } from '@/utils/sessions/machineUtils';
@@ -26,6 +28,7 @@ import type { ActionOperationObservationPresentation } from './actionOperationPr
 
 export type ActionOperationActivityModel = Readonly<{
     operations: readonly ActionOperationSnapshotV1[];
+    inboxEntries: readonly InboxActionOperationEntry[];
     activeCount: number;
     hasAttention: boolean;
     observationForOperation: (operation: ActionOperationSnapshotV1) => ActionOperationObservationPresentation;
@@ -58,6 +61,7 @@ export function resolveActionOperationSessionNameById(
 export function useActionOperationActivityModel(): ActionOperationActivityModel {
     const accountId = useActiveServerAccountScope()?.accountId ?? '';
     const operations = useAllActionOperations(accountId);
+    const inboxEntries = useInboxActionOperationEntries(accountId);
     const observations = useActionOperationObservations(accountId);
     const unavailableOperationIds = useUnavailableActionOperationIds(accountId);
     const storeHasAttention = useActionOperationsNeedAttention(accountId);
@@ -112,8 +116,9 @@ export function useActionOperationActivityModel(): ActionOperationActivityModel 
         return machine ? getMachineDisplayName(machine) : null;
     }, [machineById, sessionNameById]);
     const markVisibleTerminalSeen = React.useCallback(() => {
-        actionOperationStore.markAllTerminalSeen();
-    }, []);
+        if (!accountId) return;
+        actionOperationStore.markAccountTerminalSeen(accountId);
+    }, [accountId]);
     const clearRecent = React.useCallback(() => {
         if (!accountId) return;
         const preserveOperationIds = new Set(
@@ -124,15 +129,29 @@ export function useActionOperationActivityModel(): ActionOperationActivityModel 
         actionOperationStore.dismissRecent(accountId, { preserveOperationIds });
     }, [accountId, operations]);
     const dismissOperation = React.useCallback((operationId: string) => {
-        actionOperationStore.dismissUnavailable(operationId);
-    }, []);
+        const entry = inboxEntries.find((candidate) => candidate.operation.operationId === operationId);
+        if (!entry) return;
+        if (entry.reason === 'status_unavailable') {
+            actionOperationStore.dismissUnavailable(operationId);
+            return;
+        }
+        if (entry.reason === 'setup_needs_attention') {
+            actionOperationReentry.acknowledgeSetupNeedsAttention(entry.operation);
+            actionOperationStore.markSeen(operationId);
+            return;
+        }
+        actionOperationStore.markSeen(operationId);
+    }, [inboxEntries]);
     const canDismissOperation = React.useCallback(
-        (operation: ActionOperationSnapshotV1) => unavailableOperationIds.has(operation.operationId),
-        [unavailableOperationIds],
+        (operation: ActionOperationSnapshotV1) => inboxEntries.some(
+            (entry) => entry.operation.operationId === operation.operationId,
+        ),
+        [inboxEntries],
     );
 
     return React.useMemo(() => ({
         operations,
+        inboxEntries,
         activeCount,
         hasAttention,
         observationForOperation,
@@ -151,5 +170,6 @@ export function useActionOperationActivityModel(): ActionOperationActivityModel 
         dismissOperation,
         observationForOperation,
         operations,
+        inboxEntries,
     ]);
 }

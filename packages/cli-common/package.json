@@ -21,6 +21,17 @@
       "require": "./cliDistBuildManifest.cjs",
       "default": "./cliDistBuildManifest.cjs"
     },
+    "./nodePtySpawnHelperPermissions": {
+      "types": "./nodePtySpawnHelperPermissions.d.cts",
+      "import": "./nodePtySpawnHelperPermissions.cjs",
+      "require": "./nodePtySpawnHelperPermissions.cjs",
+      "default": "./nodePtySpawnHelperPermissions.cjs"
+    },
+    "./planetFrame": {
+      "types": "./planetFrame.d.mts",
+      "import": "./planetFrame.mjs",
+      "default": "./planetFrame.mjs"
+    },
     "./workspaceLockLease": {
       "types": "./workspaceLockLease.d.mts",
       "import": "./workspaceLockLease.mjs",
@@ -118,6 +129,11 @@
     "./systemTasks": {
       "types": "./dist/systemTasks/index.d.ts",
       "default": "./dist/systemTasks/index.js"
+    },
+    "./windowsCommandInvocation": {
+      "types": "./windowsCommandInvocation.d.mts",
+      "import": "./windowsCommandInvocation.mjs",
+      "default": "./windowsCommandInvocation.mjs"
     }
   },
   "scripts": {

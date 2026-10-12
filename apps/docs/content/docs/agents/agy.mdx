@@ -1,0 +1,69 @@
+---
+title: Antigravity CLI (experimental)
+description: Configure Antigravity in Happier, including authentication, the pinned ACP server install, resume, execution runs, and MCP tools.
+---
+
+Happier runs Antigravity through the official pinned `agy_acp_server` ACP transport for normal sessions and execution runs. The interactive `agy` CLI stays a separate system-first terminal surface, with its own login and session IDs.
+
+## Requirements and authentication
+
+Install the interactive Antigravity CLI using the [official Antigravity CLI guide](https://antigravity.google/docs/cli/install), and make sure `agy` is available on `PATH` for local terminal control. Happier sessions need a separate login to the ACP server. In development builds with the ACP login command, run this on the machine where Happier runs:
+
+```bash
+happier agy auth login
+```
+
+Follow the Google login link printed in the terminal. Wait for the command to confirm completion before starting a session. The ACP server stores its own credentials and authentication choice; logging into the interactive `agy` CLI does not sign it in. Subsequent Happier sessions use that saved choice without opening the login command again.
+
+You can also open this ACP login flow from **Settings → AI & Agents → AI backends → Antigravity**. Happier does not probe Antigravity authentication in the background, so the app may continue to show **Unknown** after login.
+
+For another authentication method, pass `--method oauth-business`, `--method gemini-api-key`, or `--method agent-platform`. Configure the chosen method's environment and ACP settings on the same machine; API keys are read by the ACP server from its environment, not from command-line arguments. Use the same `GEMINI_HOME` for login and the daemon if you override it.
+
+When the browser runs on a different computer, keep the login command running and forward the port from the login URL's `redirect_uri` to the agent machine. For example, for port 12345, run `ssh -N -L 12345:127.0.0.1:12345 user@agent-host` on the browser computer before opening the link. The server chooses the port for each login attempt. Press Ctrl+C to cancel login.
+
+## Pinned ACP server install
+
+Happier background-installs the official pinned `agy_acp_server` v1.1.1 platform archive
+when you select Antigravity, and launch reuses that same install instead of downloading twice.
+Integrity is verified by SHA-256 on every download, extraction reuses the shared
+archive helpers, and the executable bit is set on Unix. A corrupt or missing artifact
+fails visibly, and the next launch re-runs the authoritative ensure to recover.
+
+Linux launches add the required `--uid=` platform arg. Platforms without a published
+v1.1.1 archive fail clearly instead of being emulated.
+
+## Start and resume sessions
+
+```bash
+happier agy
+```
+
+Happier supports new sessions, vendor resume, follow-up messages, cancellation,
+live model changes through the agent-advertised ACP `model` config option, and execution
+runs. Models, modes, and MCP tools come from negotiated agent state rather than a
+static list.
+
+## Permissions
+
+Happier sends no static permission-mode override for Antigravity and preserves your agent
+configuration unless you choose otherwise in the session.
+
+## MCP tools
+
+Happier passes its MCP server list through the standard ACP session request for Antigravity
+sessions. For shared MCP setup and session selection, see [MCP servers](/extending/mcp-servers).
+
+## Troubleshooting
+
+- Run `agy --version` on the agent machine to confirm the interactive CLI is installed.
+- For `Authentication required`, run `happier agy auth login` on that machine and wait for successful completion. An interactive CLI login alone does not authenticate ACP.
+- If the ACP server is missing, reselect Antigravity in the app and watch the install progress,
+  then retry launch.
+- If a model is unavailable, retry after the ACP handshake completes; the model list is
+  provider-advertised.
+
+## Related
+
+- [Agent capabilities](/agents/capabilities) — compare Antigravity's current session, model, media, and tool support.
+- [Provider authentication](/agents/provider-authentication) — how Happier presents provider-owned login flows.
+- [Subagents and execution runs](/extending/subagents) — run Antigravity in Happier-managed non-interactive workflows.

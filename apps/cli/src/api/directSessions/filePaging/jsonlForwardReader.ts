@@ -18,6 +18,7 @@ export async function readJsonlFileForward(params: Readonly<{
   nextOffsetBytes: number;
   truncated: boolean;
   reachedEnd: boolean;
+  hitPageLimit: boolean;
 }>> {
   const maxBytes = Math.max(1, Math.trunc(params.maxBytes));
   const maxItems = Math.max(1, Math.trunc(params.maxItems));
@@ -32,12 +33,12 @@ export async function readJsonlFileForward(params: Readonly<{
     const s = await stat(params.filePath);
     fileSize = s.size;
   } catch {
-    return { items: [], nextOffsetBytes: 0, truncated: true, reachedEnd: true };
+    return { items: [], nextOffsetBytes: 0, truncated: true, reachedEnd: true, hitPageLimit: false };
   }
 
   const offsetBytes = Math.max(0, Math.trunc(params.offsetBytes));
   if (offsetBytes > fileSize) {
-    return { items: [], nextOffsetBytes: 0, truncated: true, reachedEnd: true };
+    return { items: [], nextOffsetBytes: 0, truncated: true, reachedEnd: true, hitPageLimit: false };
   }
 
   const fh = await open(params.filePath, 'r');
@@ -107,5 +108,7 @@ export async function readJsonlFileForward(params: Readonly<{
   }
 
   const reachedEnd = carry.length === 0 && nextReadOffset >= fileSize;
-  return { items, nextOffsetBytes: carryStartOffset, truncated: false, reachedEnd };
+  // An incomplete terminal line alone is not a backlog: retain its start until the writer completes it.
+  const hitPageLimit = !reachedEnd && (items.length >= maxItems || nextReadOffset < fileSize);
+  return { items, nextOffsetBytes: carryStartOffset, truncated: false, reachedEnd, hitPageLimit };
 }

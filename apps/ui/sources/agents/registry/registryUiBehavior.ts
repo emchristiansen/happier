@@ -12,7 +12,7 @@ import type { AgentId } from './registryCore';
 import { AGENT_IDS, getAgentCore, resolveAgentIdFromFlavor } from './registryCore';
 import type { CapabilityDetectResult, CapabilityId } from '@/sync/api/capabilities/capabilitiesProtocol';
 import type { ResumeCapabilityOptions } from '@/agents/runtime/resumeCapabilities';
-import type { TranslationKey } from '@/text';
+import { t, type TranslationKey } from '@/text';
 import type { Settings } from '@/sync/domains/settings/settings';
 import type { Session } from '@/sync/domains/state/storageTypes';
 import type { NonSteerablePayloadReason } from '@/sync/domains/session/control/submitMode';
@@ -23,9 +23,10 @@ import { CLAUDE_UI_BEHAVIOR_OVERRIDE } from '@/agents/providers/claude/uiBehavio
 import { AUGGIE_UI_BEHAVIOR_OVERRIDE } from '@/agents/providers/auggie/uiBehavior';
 import { OPENCODE_UI_BEHAVIOR_OVERRIDE } from '@/agents/providers/opencode/uiBehavior';
 import { PI_UI_BEHAVIOR_OVERRIDE } from '@/agents/providers/pi/uiBehavior';
+import { AGY_UI_BEHAVIOR_OVERRIDE } from '@/agents/providers/agy/uiBehavior';
 import { CUSTOM_ACP_UI_BEHAVIOR_OVERRIDE } from '@/agents/providers/customAcp/uiBehavior';
 import type { AgentInputExtraActionChip } from '@/components/sessions/agentInput';
-import { resolveAgentIdFromSessionMetadata } from '@happier-dev/agents';
+import { isAcpSessionListingDeclared, resolveAgentIdFromSessionMetadata } from '@happier-dev/agents';
 import type { PendingInputServerWireMode } from '@/sync/engine/pending/pendingInputServerWireContract';
 import { resolveSessionGoalExecutionCapabilities } from '@/sync/domains/session/control/sessionGoalExecutionCapabilities';
 
@@ -103,7 +104,17 @@ export type AgentUiBehavior = Readonly<{
         includeInSessionGettingStartedCliExamples?: boolean;
     }>;
     sessionUsage?: Readonly<{
-        supportsExactContextUsageBadge?: boolean;
+        /**
+         * How the composer may show context usage for this agent.
+         * - `derived`: the protocol's per-message usage record (input + cache tokens) is the active
+         *   context, so the composer derives it whenever the producer does not report
+         *   `context_used_tokens` explicitly.
+         * - `reportedOnly`: the agent's token rows are not per-message usage (e.g. cumulative thread
+         *   totals kept for account usage snapshots), so only an explicitly reported context size may
+         *   be shown.
+         * - `hidden`: never show the badge.
+         */
+        contextUsageBadge?: 'derived' | 'reportedOnly' | 'hidden';
     }>;
     workState?: Readonly<{
         supportsEditableGoals?: (ctx: {
@@ -153,10 +164,18 @@ export type AgentUiBehavior = Readonly<{
     directSessions?: Readonly<{
         browse?: Readonly<{
             order?: number;
+            /**
+             * The browse sources only produce a vendor resume id for a new Happier session. Linking,
+             * takeover, following and transcript reading are unsupported, so these providers are
+             * offered in the resume-id picker and withheld from the link/open browse list.
+             */
+            resumeOnly?: boolean;
             getSourceOptions?: (ctx: {
                 agentId: AgentId;
                 profile: Pick<AccountProfile, 'connectedServicesV2'> | null | undefined;
                 settings: Settings;
+                /** Directory the new session will run in, when the caller has already chosen one. */
+                directory?: string | null;
             }) => readonly DirectBrowseSourceOption[];
             resolveLockedSourceOption?: (ctx: {
                 agentId: AgentId;
@@ -319,7 +338,7 @@ function buildDefaultAgentUiBehavior(agentId: AgentId): AgentUiBehavior {
 
     return {
         sessionUsage: {
-            supportsExactContextUsageBadge: true,
+            contextUsageBadge: 'derived',
         },
         permissions: {
             footer: {
@@ -332,6 +351,25 @@ function buildDefaultAgentUiBehavior(agentId: AgentId): AgentUiBehavior {
         newSession: {
             supportsTranscriptStorageMode: ({ storageMode }) => getAgentCore(agentId).sessionStorage[storageMode] === true,
         },
+        // Agents whose ACP server declares `session/list` expose their own sessions as resume
+        // candidates through the one generic source; no provider-owned module is needed.
+        ...(isAcpSessionListingDeclared(agentId)
+            ? {
+                directSessions: {
+                    browse: {
+                        resumeOnly: true,
+                        getSourceOptions: ({ directory }) => [{
+                            key: 'acp:sessionList',
+                            label: t('directSessions.browseSourceAcpAgentSessions'),
+                            source: {
+                                kind: 'acpSessionList',
+                                ...(directory ? { cwd: directory } : {}),
+                            },
+                        }],
+                    },
+                },
+            }
+            : {}),
     };
 }
 
@@ -342,6 +380,7 @@ const AGENTS_UI_BEHAVIOR_OVERRIDES: Readonly<Partial<Record<AgentId, AgentUiBeha
     auggie: AUGGIE_UI_BEHAVIOR_OVERRIDE,
     pi: PI_UI_BEHAVIOR_OVERRIDE,
     customAcp: CUSTOM_ACP_UI_BEHAVIOR_OVERRIDE,
+    agy: AGY_UI_BEHAVIOR_OVERRIDE,
 });
 
 export const AGENTS_UI_BEHAVIOR: Readonly<Record<AgentId, AgentUiBehavior>> = Object.freeze(

@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { UsageSchema } from '@/api/usage'
 import { SOCKET_RPC_EVENTS, type SocketRpcRequestPayload as ProtocolSocketRpcRequestPayload } from '@happier-dev/protocol/socketRpc'
-import { SentFromSchema } from '@happier-dev/protocol'
+import { CliUpdateFactsSchema, SentFromSchema } from '@happier-dev/protocol'
 import type { ExecutionRunPublicState } from '@happier-dev/protocol'
 import type {
   AcpConfigOptionOverridesV1,
@@ -161,6 +161,7 @@ export interface ServerToClientEvents {
   session: (data: SessionBroadcast) => void
   'server:restarting': (data: { retryAfterMs?: number }) => void
   [SOCKET_RPC_EVENTS.REQUEST]: (data: SocketRpcRequestPayload, callback: (response: unknown) => void) => void
+  [SOCKET_RPC_EVENTS.CANCEL]: (data: { requestId: string }) => void
   [SOCKET_RPC_EVENTS.REGISTERED]: (data: { method: string }) => void
   [SOCKET_RPC_EVENTS.UNREGISTERED]: (data: { method: string }) => void
   [SOCKET_RPC_EVENTS.ERROR]: (data: { type: string, error: string }) => void
@@ -279,6 +280,7 @@ export interface ClientToServerEvents {
   [SOCKET_RPC_EVENTS.REGISTER]: (data: { method: string }) => void
   [SOCKET_RPC_EVENTS.UNREGISTER]: (data: { method: string }) => void
   [SOCKET_RPC_EVENTS.CALL]: (data: SocketRpcCallPayload, callback: (response: SocketRpcCallResponse) => void) => void
+  [SOCKET_RPC_EVENTS.CANCEL]: (data: { requestId: string }) => void
   'usage-report': (data: {
     key: string
     sessionId: string
@@ -331,6 +333,8 @@ export const MachineMetadataSchema = z.object({
   happyLibDir: z.string(),
   daemonTerminalSessionAttachSupported: z.boolean().optional(),
   daemonSessionGoalControlsSupported: z.boolean().optional(),
+  /** K5 — this machine's first-party CLI update facts (plan R13); absent from older daemons. */
+  cliUpdate: CliUpdateFactsSchema.optional(),
 })
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>
@@ -554,6 +558,7 @@ export type Metadata = {
     serviceIds: ConnectedServiceId[],
   },
   codexSessionId?: string, // Codex session/conversation ID (uuid)
+  customAcpSessionId?: string, // Configured ACP backend session ID (vendor resume)
   codexBackendMode?: 'mcp' | 'acp' | 'appServer',
   agentRuntimeDescriptorV1?: unknown,
   // Compact, count-only workflow activity headline (CWF3). The live invalidation pointer to durable
@@ -585,6 +590,7 @@ export type Metadata = {
   kimiSessionId?: string, // Kimi ACP session ID (opaque)
   kiloSessionId?: string, // Kilo ACP session ID (opaque)
   kiroSessionId?: string, // Kiro ACP session ID (opaque)
+  devinSessionId?: string, // Devin ACP session ID (opaque)
   piSessionId?: string, // Pi RPC session ID (opaque)
   piSessionFile?: string, // Absolute Pi session file path (preferred resume primitive)
   sessionUsageLimitRecoveryV1?: SessionUsageLimitRecoveryV1,

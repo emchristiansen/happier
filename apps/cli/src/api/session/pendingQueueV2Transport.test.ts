@@ -1551,7 +1551,7 @@ describe('pendingQueueV2Transport', () => {
         );
     });
 
-    it('requires the exact queued user send-now row for inactive-session activation', async () => {
+    it('requires the exact queued user row with a valid requested action for authorized activation', async () => {
         mockGet.mockResolvedValueOnce({
             data: {
                 pending: [
@@ -1577,7 +1577,7 @@ describe('pendingQueueV2Transport', () => {
         mockGet.mockResolvedValueOnce({
             data: {
                 pending: [{
-                    localId: 'wrong-action',
+                    localId: 'authorized-enqueue',
                     messageRole: 'user',
                     requestedAction: { v: 1, kind: 'enqueue' },
                     deliveryStatus: { status: 'queued' },
@@ -1585,7 +1585,20 @@ describe('pendingQueueV2Transport', () => {
             },
         });
         await expect(readPendingQueueV2ActivationEligibilityFromServer({
-            token: 'token', sessionId: 'session-1', requestId: 'wrong-action',
+            token: 'token', sessionId: 'session-1', requestId: 'authorized-enqueue',
+        })).resolves.toBe('eligible');
+
+        mockGet.mockResolvedValueOnce({
+            data: {
+                pending: [{
+                    localId: 'missing-action',
+                    messageRole: 'user',
+                    deliveryStatus: { status: 'queued' },
+                }],
+            },
+        });
+        await expect(readPendingQueueV2ActivationEligibilityFromServer({
+            token: 'token', sessionId: 'session-1', requestId: 'missing-action',
         })).resolves.toBe('ineligible');
 
         mockGet.mockResolvedValueOnce({ data: { pending: [] } });

@@ -218,6 +218,10 @@ Call `session_permission_mode_set`:
 }
 ```
 
+Permission-intent inputs prefer `read_only`, `default`, `auto`, and `yolo`.
+Older `read-only`, `safe-yolo`, `workspace_write`, `acceptEdits`, and
+`bypassPermissions` aliases remain accepted for mixed-version compatibility.
+
 ### Start an execution run (plan/review/delegate/voice agent)
 
 Call `execution_run_start` to start a structured Happier-managed run in a session. It requires an `intent` plus a backend target.
@@ -229,9 +233,17 @@ Example:
   "sessionId": "sess_123",
   "intent": "plan",
   "backendTarget": { "kind": "builtInAgent", "agentId": "claude" },
-  "instructions": "Plan a safe refactor and list risks."
+  "instructions": "Plan a safe refactor and list risks.",
+  "permissionMode": "auto",
+  "retentionPolicy": "ephemeral",
+  "runClass": "bounded",
+  "ioMode": "request_response"
 }
 ```
+
+`execution_run_start.permissionMode` accepts the same preferred permission
+inputs. To preserve mixed-version execution-run contracts, Auto is returned and
+stored using the established `workspace_write` wire value.
 
 The backend target selects which provider/backend runs the execution run. It is not a capacity slot. If you choose multiple backend targets through an action that supports that shape, Happier starts one managed run per selected provider/backend.
 

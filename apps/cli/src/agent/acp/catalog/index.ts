@@ -5,4 +5,6 @@ import { createCatalogDefinedAcpEntry } from './createCatalogDefinedAcpEntry';
 export const BUILT_IN_CATALOG_DEFINED_ACP_AGENTS = {
   customAcp: createCatalogDefinedAcpEntry('customAcp'),
   kiro: createCatalogDefinedAcpEntry('kiro'),
-} as const satisfies Record<'customAcp' | 'kiro', AgentCatalogEntry>;
+  fx: createCatalogDefinedAcpEntry('fx'),
+  droid: createCatalogDefinedAcpEntry('droid'),
+} as const satisfies Record<'customAcp' | 'kiro' | 'fx' | 'droid', AgentCatalogEntry>;

@@ -42,6 +42,32 @@ async function waitForStatus(
 describe('ExecutionRunManager backend provisioning bound (QA2-F04)', () => {
   afterEach(() => {
     delete process.env[PROVISION_TIMEOUT_ENV_KEY];
+    vi.useRealTimers();
+  });
+
+  it('does not terminate an admitted run at the obsolete five minute provisioning cutoff', async () => {
+    vi.useFakeTimers();
+    const manager = new ExecutionRunManager({
+      parentProvider: 'claude',
+      cwd: process.cwd(),
+      createBackend: () => createNeverProvisioningBackend(),
+      sendAcp: () => {},
+    });
+
+    const started = await manager.start({
+      sessionId: 'session-1',
+      intent: 'delegate',
+      backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+      instructions: 'Do the thing.',
+      permissionMode: 'read_only',
+      retentionPolicy: 'ephemeral',
+      runClass: 'bounded',
+      ioMode: 'request_response',
+    });
+
+    await vi.advanceTimersByTimeAsync(5 * 60_000 + 1);
+
+    expect(manager.getPublic(started.runId)?.status).toBe('running');
   });
 
   it('fails a bounded run whose backend session provisioning never settles', async () => {
@@ -74,7 +100,46 @@ describe('ExecutionRunManager backend provisioning bound (QA2-F04)', () => {
     expect(run?.error?.code).toBe('execution_run_backend_provision_timeout');
   });
 
-  it('fails a long-lived run start whose backend session provisioning never settles', async () => {
+  it('cancels and disposes a backend session that appears after the provisioning timeout', async () => {
+    process.env[PROVISION_TIMEOUT_ENV_KEY] = '200';
+    let resolveSession!: (value: { sessionId: SessionId }) => void;
+    const session = new Promise<{ sessionId: SessionId }>((resolve) => {
+      resolveSession = resolve;
+    });
+    const cancel = vi.fn(async () => {});
+    const dispose = vi.fn(async () => {});
+    const manager = new ExecutionRunManager({
+      parentProvider: 'claude',
+      cwd: process.cwd(),
+      createBackend: () => ({
+        startSession: () => session,
+        async sendPrompt() {},
+        cancel,
+        onMessage() {},
+        dispose,
+        async waitForResponseComplete() {},
+      }),
+      sendAcp: () => {},
+    });
+    const started = await manager.start({
+      sessionId: 'session-1',
+      intent: 'delegate',
+      backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+      instructions: 'Do the thing.',
+      permissionMode: 'read_only',
+      retentionPolicy: 'ephemeral',
+      runClass: 'bounded',
+      ioMode: 'request_response',
+    });
+    await manager.waitForTerminal(started.runId);
+
+    resolveSession({ sessionId: 'late-provider-session' as SessionId });
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledWith('late-provider-session'));
+    expect(dispose).toHaveBeenCalledTimes(2);
+    expect(manager.get(started.runId)?.status).toBe('failed');
+  });
+
+  it('returns a long-lived run handle before provisioning times out, then fails the admitted run', async () => {
     process.env[PROVISION_TIMEOUT_ENV_KEY] = '200';
     const manager = new ExecutionRunManager({
       parentProvider: 'claude',
@@ -83,7 +148,7 @@ describe('ExecutionRunManager backend provisioning bound (QA2-F04)', () => {
       sendAcp: () => {},
     });
 
-    await expect(manager.start({
+    const started = await manager.start({
       sessionId: 'session-1',
       intent: 'delegate',
       backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
@@ -92,9 +157,12 @@ describe('ExecutionRunManager backend provisioning bound (QA2-F04)', () => {
       retentionPolicy: 'resumable',
       runClass: 'long_lived',
       ioMode: 'request_response',
-    })).rejects.toThrow(/provision/iu);
+    });
 
-    // The run entry must be terminal (failed), not leaked as running.
+    expect(manager.get(started.runId)?.status).toBe('running');
+    await manager.waitForTerminal(started.runId);
+
+    // The asynchronously provisioning run must eventually be terminal, not leaked as running.
     const runs = manager.listPublic();
     expect(runs.length).toBe(1);
     expect(runs[0]?.status).toBe('failed');
@@ -129,10 +197,11 @@ describe('ExecutionRunManager backend provisioning bound (QA2-F04)', () => {
       permissionMode: 'read_only', retentionPolicy: 'resumable', runClass: 'long_lived', ioMode: 'request_response',
     });
 
-    await expect(manager.start({
+    const timedOut = await manager.start({
       sessionId: 'session-1', intent: 'delegate', backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
       permissionMode: 'read_only', retentionPolicy: 'resumable', runClass: 'long_lived', ioMode: 'request_response',
-    })).rejects.toThrow(/provision/iu);
+    });
+    await manager.waitForTerminal(timedOut.runId);
 
     expect(manager.get(sibling.runId)?.status).toBe('running');
     expect(reports).toContainEqual({ state: 'active', activeCount: 2 });

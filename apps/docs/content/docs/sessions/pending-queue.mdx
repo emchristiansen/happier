@@ -108,7 +108,7 @@ This is the best option when you want to:
 
 Local control means the provider TUI is active in your terminal. Remote control means Happier is driving the same provider session in the background for the app.
 
-For **Claude** and **Codex**, local control is exclusive. While the provider TUI owns the session, Happier does not inject app messages directly into that terminal process. Instead:
+For **Claude**, and for Codex sessions on Windows, using ACP, or using an older Codex CLI, local control is exclusive. While the provider TUI owns the session, Happier does not inject app messages directly into that terminal process. Instead:
 
 - the app stores the message in the session pending queue,
 - the local Happier process watches for pending messages,
@@ -117,7 +117,7 @@ For **Claude** and **Codex**, local control is exclusive. While the provider TUI
 
 This avoids interrupting an in-progress local Claude or Codex turn. Without this wait, sending an app message into a busy terminal TUI could cancel or corrupt the current provider turn.
 
-For **OpenCode**, local control is shared. The OpenCode TUI and Happier app can both stay connected to the same OpenCode session, so app messages do not need the same exclusive-control handoff path.
+For **OpenCode**, and for App Server sessions using Codex CLI 0.131.0 or newer on macOS or Linux, local control is shared. The provider TUI and Happier app stay connected to the same provider session, so app messages do not need the exclusive-control handoff path merely because a TUI is attached.
 
 You can always review queued messages from the **Pending messages** sheet before they run.
 

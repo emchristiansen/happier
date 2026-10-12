@@ -67,7 +67,7 @@ export type ClaudeUnifiedDraftGuardStarvationInfo = Readonly<{
   guardStatus: ClaudeUnifiedDraftGuardBlockerStatus;
   blockedReason?: string | undefined;
   isCanonicalTurnActive?: boolean | undefined;
-  originKind: 'ui_pending' | 'ui_immediate' | 'rpc';
+  originKind: 'ui_pending' | 'ui_immediate' | 'goal_control';
   userMessageLocalIds?: readonly string[] | undefined;
 }>;
 
@@ -304,8 +304,11 @@ export function createClaudeUnifiedPromptInjector<Mode = unknown>(opts: Readonly
       const input = {
         text,
         multiline,
+        resolveDeliveryState: options?.resolveDeliveryState,
         origin: {
-          kind: batch.origin.kind,
+          // The terminal-host boundary classifies where the write came from; keep its generic RPC
+          // vocabulary while the Claude arbiter retains the goal-control semantic needed for custody.
+          kind: batch.origin.kind === 'goal_control' ? 'rpc' : batch.origin.kind,
           clientId: batch.origin.clientId,
           nonce: batch.origin.nonce ?? createNonce(),
         },

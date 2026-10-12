@@ -104,8 +104,10 @@ describe('buildInactiveSessionResumeSpawnOptions', () => {
         backendId: 'custom-kiro',
         title: 'Custom Kiro',
       },
+      customAcpSessionId: 'provider-session-1',
     })).toMatchObject({
       backendTarget: { kind: 'configuredAcpBackend', backendId: 'custom-kiro' },
+      resume: 'provider-session-1',
     });
   });
 

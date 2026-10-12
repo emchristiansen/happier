@@ -37,6 +37,7 @@ export const COMMAND_HELP_EXPO = {
       '--dump-view <bool>                 Optional; debug EAS build view.',
       "--fingerprint-mode <always|if-changed> (default: always). Skips cloud native builds when the EAS fingerprint matches the latest finished build for that profile/platform.",
       '--preflight-only                  For native_submit, validate the configured external TestFlight groups without building or submitting.',
+      '--testflight-distribution-mode <inline|deferred> (default: inline). Hosted builds defer Apple processing/group attachment to the existing recovery workflow.',
       '--release-message <text>           Optional; passed to APK release publish.',
       '--ui-version-bump <patch|minor|major> Optional; bump apps/ui marketing version before builds.',
       '--ui-version <x.y.z>               Optional; set apps/ui marketing version before builds.',

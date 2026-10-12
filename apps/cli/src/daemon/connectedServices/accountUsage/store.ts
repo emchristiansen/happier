@@ -1,5 +1,6 @@
 import {
   ConnectedServiceUsageSourceV1Schema,
+  compareConnectedServiceQuotaObservationRecency,
   mergeProviderAccountSubscription,
   ProviderAccountUsageSnapshotV1Schema,
   type ConnectedServiceUsageSourceV1,
@@ -135,8 +136,15 @@ export function createProviderAccountUsageStore(): ProviderAccountUsageStore {
       ? mergeSources(existingSources, normalized.sources)
       : existingSources;
 
-    const olderUsage = existing !== undefined && parsed.fetchedAtMs < existing.fetchedAtMs;
-    const usage = olderUsage ? existing : parsed;
+    const recency = existing
+      ? compareConnectedServiceQuotaObservationRecency({
+          existingObservedAtMs: existing.fetchedAtMs,
+          incomingObservedAtMs: parsed.fetchedAtMs,
+          nowMs: Date.now(),
+        })
+      : 'incoming_newer';
+    const olderUsage = recency === 'incoming_older' || recency === 'incoming_future';
+    const usage = olderUsage && existing ? existing : parsed;
     const subscription = mergeProviderAccountSubscription(existing?.subscription, parsed.subscription);
     const next = ProviderAccountUsageSnapshotV1Schema.parse({
       ...usage,
@@ -152,9 +160,12 @@ export function createProviderAccountUsageStore(): ProviderAccountUsageStore {
         },
     });
     const snapshotAdvanced = !existing
-      || parsed.fetchedAtMs > existing.fetchedAtMs
-      || computeProviderAccountUsageSnapshotMaterialRevision(next)
-        !== computeProviderAccountUsageSnapshotMaterialRevision(existing);
+      || recency === 'incoming_newer'
+      || (
+        recency !== 'incoming_future'
+        && computeProviderAccountUsageSnapshotMaterialRevision(next)
+          !== computeProviderAccountUsageSnapshotMaterialRevision(existing)
+      );
     if (snapshotAdvanced) snapshotsByRecordId.set(targetRecordId, next);
     if (sourceLinked || !existing) setRecordSources(targetRecordId, sources);
     if (targetRecordId !== parsed.recordId) {

@@ -95,8 +95,8 @@ describe('buildSessionOrganizationListViewState', () => {
         });
 
         expect(state.attentionStandingOverridesBySessionKey).toEqual({
-            'server-a:s1': true,
-            'server-a:s2': false,
+            'server-a:s1': { sessionId: 's1', standing: true, updatedAt: 20 },
+            'server-a:s2': { sessionId: 's2', standing: false, updatedAt: 21 },
         });
     });
 

@@ -8,6 +8,14 @@ import { Session } from './session';
 import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import type { EnhancedMode } from './loop';
 import { getProjectPath } from './utils/path';
+import { PermissionHandler } from './utils/permissionHandler';
+import { syncClaudePermissionModeFromMetadata } from './utils/syncPermissionModeFromMetadata';
+import { createClaudeUnifiedTerminalMetadataModeApplier } from './unifiedTerminal/metadataRuntimeModeApplier';
+import { createClaudeUnifiedRuntimeControlBridge } from './unifiedTerminal/runtimeControlIntegration';
+import { createClaudeUnifiedTuiControlController } from './unifiedTerminal/tuiControls/controller';
+import { createFakeControlPort } from './unifiedTerminal/tuiControls/fakeControlPort';
+import { createClaudeSettingsGuard } from './unifiedTerminal/tuiControls/settingsGuard';
+import { DEFAULT_CLAUDE_TUI_CONTROL_TIMINGS } from './unifiedTerminal/tuiControls/types';
 import type {
   SessionRuntimeActivityContributionHandle,
 } from '@/session/runtimeActivity/types';
@@ -212,6 +220,83 @@ function createTempClaudeTranscript(
 }
 
 describe('Session', () => {
+  it('synchronizes the accepted Session permission intent instead of stale metadata and ignores absent intent', async () => {
+    let metadata = createMetadataStub({ permissionMode: 'safe-yolo', permissionModeUpdatedAt: 10 });
+    const session = createSession(createSessionClientStub({ getMetadataSnapshot: () => metadata }));
+    session.lastPermissionMode = 'yolo';
+    session.lastPermissionModeUpdatedAt = 20;
+    const handler = new PermissionHandler(session);
+    try {
+      expect(syncClaudePermissionModeFromMetadata({ session, permissionHandler: handler })).toBe('yolo');
+      expect(session.lastPermissionModeUpdatedAt).toBe(20);
+      await expect(handler.handleToolCall('Write', { file_path: '/tmp/example.txt', content: 'x' }, {
+        permissionMode: 'default',
+      }, { signal: new AbortController().signal, toolUseId: 'current-session-permission-write' })).resolves.toMatchObject({ behavior: 'allow' });
+      metadata = createMetadataStub();
+      expect(syncClaudePermissionModeFromMetadata({ session, permissionHandler: handler })).toBeNull();
+    } finally {
+      handler.dispose();
+      session.cleanup();
+    }
+  });
+
+  it('applies unified-compatible remote-launcher permission controls after the approval watcher already adopted the same update', async () => {
+    const metadata = createMetadataStub({ permissionMode: 'safe-yolo', permissionModeUpdatedAt: 20 });
+    // The network broadcast reaches the approval watcher before the idle provider consumer.
+    let broadcast: ((updated: boolean) => void) | undefined;
+    const session = createSession(createSessionClientStub({
+      getMetadataSnapshot: () => metadata,
+      waitForMetadataUpdate: (signal) => new Promise<boolean>((resolve) => {
+        broadcast = resolve;
+        signal?.addEventListener('abort', () => resolve(false), { once: true });
+      }),
+    }));
+    session.lastPermissionMode = 'default';
+    session.lastPermissionModeUpdatedAt = 10;
+    const handler = new PermissionHandler(session);
+    const configDir = mkdtempSync(join(tmpdir(), 'claude-metadata-permission-'));
+    writeFileSync(join(configDir, 'settings.json'), '{}', 'utf8');
+    const idle = ['╭─────╮', '│ >   │', '╰─────╯', '  ? for shortcuts'].join('\n');
+    const accept = ['╭─────╮', '│ >   │', '╰─────╯', '  ⏵⏵ accept edits on (shift+tab to cycle)'].join('\n');
+    const port = createFakeControlPort({ captures: [idle, accept] });
+    const controller = createClaudeUnifiedTuiControlController({
+      port,
+      featureEnabled: true,
+      settingsGuard: createClaudeSettingsGuard({ configDir }),
+      wait: async () => undefined,
+      timings: DEFAULT_CLAUDE_TUI_CONTROL_TIMINGS,
+      nowMs: () => 1000,
+    });
+    const currentMode: EnhancedMode = { permissionMode: 'default', claudeUnifiedTerminalEnabled: true };
+    const bridge = createClaudeUnifiedRuntimeControlBridge({
+      controller,
+      emitRuntimeConfigOutcome: () => {},
+      startupMode: currentMode,
+    });
+    const applyMetadata = createClaudeUnifiedTerminalMetadataModeApplier({
+      getCurrentMode: () => currentMode,
+      getApplier: () => bridge.applyOutOfBand,
+    });
+    try {
+      broadcast?.(true);
+      await vi.waitFor(() => expect(session.lastPermissionModeUpdatedAt).toBe(20));
+      // The retained unified-compatible remote-launcher callback uses this helper and applier.
+      // Current direct-unified entry uses a separate permission bridge and is exempt.
+      const updated = syncClaudePermissionModeFromMetadata({ session, permissionHandler: handler });
+      if (updated) await applyMetadata(updated);
+      expect(port.sentKeys).toEqual(['ShiftTab']);
+
+      const repeated = syncClaudePermissionModeFromMetadata({ session, permissionHandler: handler });
+      if (repeated) await applyMetadata(repeated);
+      expect(port.sentKeys).toEqual(['ShiftTab']);
+    } finally {
+      handler.dispose();
+      await bridge.dispose();
+      session.cleanup();
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
   it('owns unavailable group truth from runtime control registration through cleanup', async () => {
     const unregister = vi.fn();
     const registerSessionRuntimeControls = vi.fn((

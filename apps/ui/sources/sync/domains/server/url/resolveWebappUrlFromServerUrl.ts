@@ -9,7 +9,7 @@ export function resolveWebappUrlFromServerUrl(serverUrl: string): string {
         }
         const origin = parsed.origin.replace(/\/+$/, '');
         if (origin === 'https://api.happier.dev') {
-            return 'https://app.happier.dev';
+            return 'https://cloud.happier.dev';
         }
         return origin;
     } catch {

@@ -60,6 +60,13 @@ export function useDraft(
     const lastSessionScope = useRef<ServerAccountScope | null>(null);
     const latestValue = useRef<string>(value);
     const autosaveSkip = useRef<Readonly<{ sessionId: string; value: string }> | null>(null);
+    const observedRepositoryDraftRef = useRef<Readonly<{
+        serverId: string;
+        accountId: string;
+        sessionId: string;
+        present: boolean;
+        text: string | null;
+    }> | null>(null);
     const routeFocused = useIsFocused();
     const active = options.active ?? routeFocused;
     const session = sessionId ? storage.getState().sessions[sessionId] : null;
@@ -212,12 +219,17 @@ export function useDraft(
     }, []);
 
     const adoptPersistedDraftText = useCallback((draft: string) => {
+        if (saveTimeoutRef.current) {
+            clearTimeout(saveTimeoutRef.current);
+            saveTimeoutRef.current = null;
+        }
         if (latestValue.current !== draft) {
             latestValue.current = draft;
             onChange(draft);
         }
         lastSavedValue.current = draft;
-    }, [onChange]);
+        if (sessionId) autosaveSkip.current = { sessionId, value: draft };
+    }, [onChange, sessionId]);
 
     const persistSeededDraftText = useCallback((draft: string) => {
         if (latestValue.current !== draft) {
@@ -237,7 +249,39 @@ export function useDraft(
         // against the repository's current snapshot instead of the snapshot captured by the
         // render that scheduled this effect; adopting that older snapshot rolls the composer
         // back to a prefix the user has already advanced beyond.
-        const currentStoredDraft = readDraftSnapshot()?.document.composer.text.value ?? null;
+        const currentSnapshot = readDraftSnapshot();
+        const currentStoredDraft = currentSnapshot?.document.composer.text.value ?? null;
+        const previousRepositoryDraft = observedRepositoryDraftRef.current;
+        const isSameRepositoryAddress = Boolean(
+            scope
+            && previousRepositoryDraft
+            && previousRepositoryDraft.serverId === scope.serverId
+            && previousRepositoryDraft.accountId === scope.accountId
+            && previousRepositoryDraft.sessionId === sessionId,
+        );
+        const repositoryDraftWasRemoved = Boolean(
+            active
+            && isSameRepositoryAddress
+            && previousRepositoryDraft?.present
+            && currentSnapshot === null,
+        );
+        const repositoryDraftTextWasCleared = Boolean(
+            active
+            && isSameRepositoryAddress
+            && previousRepositoryDraft?.present
+            && previousRepositoryDraft.text !== ''
+            && currentSnapshot !== null
+            && currentStoredDraft === '',
+        );
+        if (scope && active) {
+            observedRepositoryDraftRef.current = {
+                serverId: scope.serverId,
+                accountId: scope.accountId,
+                sessionId,
+                present: currentSnapshot !== null,
+                text: currentStoredDraft,
+            };
+        }
 
         const previousSessionId = lastSessionId.current;
         const previousScope = lastSessionScope.current;
@@ -281,6 +325,15 @@ export function useDraft(
         }
 
         if (!active) return;
+
+        // A repository tombstone is an authoritative remote clear once this mounted composer
+        // has observed the draft. Initial absence is not a clear signal: it may precede scope
+        // hydration or an initial prompt. Pending/conflicted local edits remain materialized by
+        // the repository, and the value check protects any caller-owned edit not yet published.
+        if ((repositoryDraftWasRemoved || repositoryDraftTextWasCleared) && currentValue === lastSavedValue.current) {
+            adoptPersistedDraftText('');
+            return;
+        }
 
         const externalDraft = currentStoredDraft && currentStoredDraft.trim() ? currentStoredDraft : null;
         if (externalDraft != null && externalDraft === currentValue && lastSavedValue.current !== externalDraft && !activeSessionInitialPrompt) {

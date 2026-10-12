@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { cp, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, readdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -10,6 +10,7 @@ import { withOptionalCliSharedDepsBuildLock } from './optionalWorkspaceBundleLoc
 import { main as rmDist } from './rmDist.mjs';
 import { collectPkgrollInputPaths, runPkgrollBuild } from './runPkgrollBuild.mjs';
 import { DEFAULT_CLI_RUNTIME_IMPORT_TIMEOUT_MS } from './runtimeImportProbePolicy.mjs';
+import { rmDirSafeSync } from './rmDirSafe.mjs';
 import { DEFAULT_CLI_NODE_HEAP_MB, upsertMaxOldSpaceSize } from './withNodeHeapLimit.mjs';
 
 function resolveBuildOutput(env = process.env) {
@@ -25,14 +26,15 @@ function resolveCliBuildVersion(env = process.env) {
 async function reclaimAbandonedCliBuildDirs(packageRoot, activeOutputDir) {
   const activeOutputPath = resolve(packageRoot, activeOutputDir);
   const entries = await readdir(packageRoot, { withFileTypes: true });
-  await Promise.all(entries
+  for (const entryPath of entries
     .filter((entry) => (
       entry.name.startsWith('dist.staging.')
       || entry.name.startsWith('.tmp.hstack-cli-build-source.')
     ) && (entry.isDirectory() || entry.isSymbolicLink()))
     .map((entry) => resolve(packageRoot, entry.name))
-    .filter((entryPath) => entryPath !== activeOutputPath)
-    .map((entryPath) => rm(entryPath, { recursive: true, force: true })));
+    .filter((candidatePath) => candidatePath !== activeOutputPath)) {
+    rmDirSafeSync(entryPath);
+  }
 }
 
 async function createImmutableBuildSource({ packageRoot, buildVersion = '' }) {
@@ -48,7 +50,9 @@ async function createImmutableBuildSource({ packageRoot, buildVersion = '' }) {
   // TypeScript retain the package-local node_modules resolution ancestry.
   const snapshotRoot = await mkdtemp(join(packageRoot, '.tmp.hstack-cli-build-source.'));
   try {
-    for (const relativePath of ['package.json', 'tsconfig.json', 'tsconfig.build.json', 'src']) {
+    // Runtime imports resolve shipped sidecars from this generation's package
+    // root, so admission must use the same scripts as the compiled source.
+    for (const relativePath of ['package.json', 'tsconfig.json', 'tsconfig.build.json', 'src', 'scripts']) {
       const sourcePath = join(packageRoot, relativePath);
       if (!existsSync(sourcePath)) continue;
       await cp(sourcePath, join(snapshotRoot, relativePath), { recursive: true });
@@ -59,14 +63,18 @@ async function createImmutableBuildSource({ packageRoot, buildVersion = '' }) {
       await writeFile(packageJsonPath, `${JSON.stringify({ ...packageJson, version: buildVersion }, null, 2)}\n`, 'utf8');
     }
   } catch (error) {
-    await rm(snapshotRoot, { recursive: true, force: true }).catch(() => {});
+    try {
+      rmDirSafeSync(snapshotRoot);
+    } catch {
+      // Preserve the source-snapshot creation error when best-effort cleanup also fails.
+    }
     throw error;
   }
   return {
     packageRoot: snapshotRoot,
     packageJsonPath: join(snapshotRoot, 'package.json'),
     async cleanup() {
-      await rm(snapshotRoot, { recursive: true, force: true });
+      rmDirSafeSync(snapshotRoot);
     },
   };
 }
@@ -116,7 +124,7 @@ export function probeDistRuntimeImport(entrypoint, options = {}) {
     const stderr = String(result.stderr ?? '').trim();
     throw new Error(
       `CLI staged runtime import probe failed (code=${result.status}, signal=${result.signal ?? 'none'}).`
-      + (stderr ? `\n${stderr.split('\n').slice(-8).join('\n')}` : ''),
+      + (stderr ? `\n${stderr}` : ''),
     );
   }
 }
@@ -229,7 +237,11 @@ async function buildCliDistUnlocked(options = {}) {
   } finally {
     await immutableSource.cleanup().catch(() => {});
     if (builderOwnsOutput) {
-      await rm(resolvedOutputDir, { recursive: true, force: true }).catch(() => {});
+      try {
+        rmDirSafeSync(resolvedOutputDir);
+      } catch {
+        // Best effort: never replace the build result with a staging cleanup failure.
+      }
     }
   }
 }

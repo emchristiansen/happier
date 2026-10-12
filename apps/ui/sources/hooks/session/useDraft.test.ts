@@ -734,6 +734,60 @@ describe('useDraft', () => {
     harness.unmount();
   });
 
+  it('adopts an authoritative remote draft deletion and does not resurrect it on browser blur', async () => {
+    const fakeVisibilityDocument = installFakeVisibilityDocument();
+    const fakeWindowLifecycle = installFakeWindowLifecycleEvents();
+    const harness = await renderHarness({ initialSessionId: 's1' });
+
+    try {
+      expect(harness.getCurrent().value).toBe('draft-1');
+      updateSessionDraftSpy.mockClear();
+      draftRepositoryHarness.flush.mockClear();
+
+      sessionsById = {
+        ...sessionsById,
+        s1: { draft: null, metadata: {} },
+      };
+      await act(async () => {
+        draftRepositoryHarness.notify('s1');
+      });
+      await flushHookEffects({ cycles: 1, turns: 1 });
+
+      expect(harness.getCurrent().value).toBe('');
+
+      fakeVisibilityDocument.setVisibilityState('visible');
+      await act(async () => {
+        fakeWindowLifecycle.dispatch('blur');
+      });
+      await flushHookEffects({ cycles: 1, turns: 1 });
+
+      expect(sessionsById.s1?.draft).toBeNull();
+      expect(updateSessionDraftSpy).not.toHaveBeenCalledWith('s1', 'draft-1');
+    } finally {
+      harness.unmount();
+      fakeWindowLifecycle.restore();
+      fakeVisibilityDocument.restore();
+    }
+  });
+
+  it('adopts a remote text clear when another meaningful draft field keeps the document present', async () => {
+    const harness = await renderHarness({ initialSessionId: 's1' });
+    expect(harness.getCurrent().value).toBe('draft-1');
+
+    sessionsById = {
+      ...sessionsById,
+      // An empty string represents a still-materialized repository document in this harness.
+      s1: { draft: '', metadata: {} },
+    };
+    await act(async () => {
+      draftRepositoryHarness.notify('s1');
+    });
+    await flushHookEffects({ cycles: 1, turns: 1 });
+
+    expect(harness.getCurrent().value).toBe('');
+    harness.unmount();
+  });
+
   it('replaces the composer when an external draft update arrives and there are no unsaved local edits', async () => {
     sessionsById = {
       s1: { draft: 'draft-1', metadata: {} },

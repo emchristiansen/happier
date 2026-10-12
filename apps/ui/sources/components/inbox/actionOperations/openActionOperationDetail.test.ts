@@ -1,10 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ActionOperationSnapshotV1 } from '@happier-dev/protocol';
 
-import { createActionOperationStore } from '@/sync/domains/actionOperations/actionOperationStore';
+import {
+    actionOperationStore,
+    createActionOperationStore,
+} from '@/sync/domains/actionOperations/actionOperationStore';
 import { selectActionOperationObservationForOperation } from '@/sync/domains/actionOperations/actionOperationSelectors';
+import { actionOperationReentry } from '@/sync/domains/actionOperations/actionOperationReentry';
 
-import { refreshActionOperationDetail } from './openActionOperationDetail';
+import { openActionOperationDetail, refreshActionOperationDetail } from './openActionOperationDetail';
 
 const lightweight: ActionOperationSnapshotV1 = {
     version: 1,
@@ -20,6 +24,25 @@ const lightweight: ActionOperationSnapshotV1 = {
 };
 
 describe('action operation detail reopen', () => {
+    it('acknowledges a terminal Inbox operation after its registered origin opens', () => {
+        const open = vi.fn();
+        const operation = {
+            ...lightweight,
+            operationId: 'operation-origin-ack',
+            requestId: 'request-origin-ack',
+            state: 'failed' as const,
+        };
+        actionOperationReentry.registerOrigin({
+            requestId: operation.requestId,
+            origin: { resolve: () => open },
+        });
+        actionOperationStore.merge(operation);
+
+        expect(openActionOperationDetail(operation.operationId)).toBeNull();
+        expect(open).toHaveBeenCalledOnce();
+        expect(actionOperationStore.getState().terminalSeenAtById.has(operation.operationId)).toBe(true);
+    });
+
     it('gets and merges the full snapshot every time detail opens', async () => {
         const store = createActionOperationStore();
         const full = { ...lightweight, result: { type: 'success', sessionId: 'session-created' } };

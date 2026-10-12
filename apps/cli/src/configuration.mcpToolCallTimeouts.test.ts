@@ -7,6 +7,7 @@ describe('configuration MCP tool call timeouts', () => {
     'HAPPIER_HOME_DIR',
     'HAPPIER_MCP_TOOL_CALL_TIMEOUT_MS',
     'HAPPIER_MCP_EXECUTION_RUN_WAIT_TIMEOUT_GRACE_MS',
+    'HAPPIER_CODEX_HAPPIER_MCP_TOOL_CALL_TIMEOUT_MS',
   ] as const;
   let envScope = createEnvKeyScope(envKeys);
   const tempDirs: string[] = [];
@@ -31,6 +32,7 @@ describe('configuration MCP tool call timeouts', () => {
     setHomeDir();
     delete process.env.HAPPIER_MCP_TOOL_CALL_TIMEOUT_MS;
     delete process.env.HAPPIER_MCP_EXECUTION_RUN_WAIT_TIMEOUT_GRACE_MS;
+    delete process.env.HAPPIER_CODEX_HAPPIER_MCP_TOOL_CALL_TIMEOUT_MS;
 
     const configMod = await import('./configuration');
     configMod.reloadConfiguration();
@@ -38,17 +40,20 @@ describe('configuration MCP tool call timeouts', () => {
     expect(configMod.configuration.mcpToolCallTimeoutMs).toBe(100_000_000);
     expect(configMod.configuration.mcpToolCallTimeoutMs).toBeGreaterThan(60_000);
     expect(configMod.configuration.mcpExecutionRunWaitTimeoutGraceMs).toBe(60_000);
+    expect(configMod.configuration.codexHappierMcpToolCallTimeoutMs).toBe(3_720_000);
   });
 
   it('reads MCP tool call timeout overrides from configuration env', async () => {
     setHomeDir();
     process.env.HAPPIER_MCP_TOOL_CALL_TIMEOUT_MS = '240000';
     process.env.HAPPIER_MCP_EXECUTION_RUN_WAIT_TIMEOUT_GRACE_MS = '45000';
+    process.env.HAPPIER_CODEX_HAPPIER_MCP_TOOL_CALL_TIMEOUT_MS = '7230500';
 
     const configMod = await import('./configuration');
     configMod.reloadConfiguration();
 
     expect(configMod.configuration.mcpToolCallTimeoutMs).toBe(240_000);
     expect(configMod.configuration.mcpExecutionRunWaitTimeoutGraceMs).toBe(45_000);
+    expect(configMod.configuration.codexHappierMcpToolCallTimeoutMs).toBe(7_230_500);
   });
 });

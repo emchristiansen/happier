@@ -15,6 +15,7 @@ const SELECTOR_PARAMS = {
         showUnread: true,
         showPendingPermissionRequests: true,
         showPendingUserActionRequests: true,
+        showQueuedUserInput: true,
     },
 } as const;
 

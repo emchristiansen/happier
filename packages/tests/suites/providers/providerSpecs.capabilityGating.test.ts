@@ -30,11 +30,11 @@ describe('providers: scenario capability gating', () => {
     expect(qwen!.scenarioRegistry.tiers.extended).not.toContain('permission_mode_yolo_outside_workspace');
   });
 
-  it('does not require ACP resume-load scenarios for kimi', async () => {
+  it('covers Kimi negotiated load-resume without claiming unverified history import', async () => {
     const providers = await loadProvidersFromCliSpecs();
     const kimi = providers.find((p) => p.id === 'kimi');
     expect(kimi).toBeTruthy();
-    expect(kimi!.scenarioRegistry.tiers.extended).not.toContain('acp_resume_load_session');
+    expect(kimi!.scenarioRegistry.tiers.extended).toContain('acp_resume_load_session');
     expect(kimi!.scenarioRegistry.tiers.extended).not.toContain('acp_resume_fresh_session_imports_history');
   });
 
@@ -57,11 +57,11 @@ describe('providers: scenario capability gating', () => {
     expect(acpPermissions?.outsideWorkspaceWriteMustCompleteByMode?.['safe-yolo']).toBe(true);
   });
 
-  it('allows kimi host-auth fallback by default', async () => {
+  it('uses the existing Kimi Code host authentication state', async () => {
     const providers = await loadProvidersFromCliSpecs();
     const kimi = providers.find((provider) => provider.id === 'kimi');
     expect(kimi).toBeTruthy();
-    expect(kimi!.auth?.mode).toBe('auto');
+    expect(kimi!.auth?.mode).toBe('host');
   });
 
   it('keeps gemini extended coverage focused on ACP capability/model inventory', async () => {

@@ -12,6 +12,7 @@ import type {
 export interface ServerToDaemonEvents {
   update: (data: Update) => void;
   [SOCKET_RPC_EVENTS.REQUEST]: (data: SocketRpcRequestPayload, callback: (response: unknown) => void) => void;
+  [SOCKET_RPC_EVENTS.CANCEL]: (data: { requestId: string }) => void;
   [SOCKET_RPC_EVENTS.REGISTERED]: (data: { method: string }) => void;
   [SOCKET_RPC_EVENTS.UNREGISTERED]: (data: { method: string }) => void;
   [SOCKET_RPC_EVENTS.ERROR]: (data: { type: string; error: string }) => void;
@@ -47,5 +48,6 @@ export interface DaemonToServerEvents {
     data: SocketRpcCallPayload,
     callback: (response: SocketRpcCallResponse) => void
   ) => void;
+  [SOCKET_RPC_EVENTS.CANCEL]: (data: { requestId: string }) => void;
   [SOCKET_RPC_EVENTS.MACHINE_TRANSFER_ENVELOPE]: (data: MachineTransferSendEnvelope) => void;
 }

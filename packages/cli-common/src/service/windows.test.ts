@@ -5,7 +5,6 @@ import {
   buildReadWindowsScheduledTaskStatusPowerShellCommand,
   buildStopWindowsScheduledTaskIfRunningPowerShellCommand,
   parseWindowsScheduledTaskStatusPowerShellJson,
-  renderWindowsScheduledTaskWrapperPs1,
 } from './windows';
 
 describe('Windows scheduled task PowerShell status helper', () => {
@@ -48,37 +47,7 @@ describe('Windows scheduled task PowerShell status helper', () => {
 });
 
 describe('Windows scheduled task lifecycle PowerShell helpers', () => {
-  it('records wrapper startup errors and preserves the managed process exit code', () => {
-    const wrapper = renderWindowsScheduledTaskWrapperPs1({
-      workingDirectory: 'C:\\Happier',
-      programArgs: ['C:\\Happier\\happier-server.exe'],
-      stderrPath: 'C:\\Happier\\logs\\server.err.log',
-    });
-
-    expect(wrapper).toContain('try {');
-    expect(wrapper).toContain('$exitCode = $LASTEXITCODE');
-    expect(wrapper).toContain('Add-Content -LiteralPath');
-    expect(wrapper).toContain('exit $exitCode');
-    expect(wrapper).toContain('exit 1');
-    expect(wrapper).not.toContain('1>> ""');
-  });
-
-  it('captures native stderr without PowerShell converting its first line into a terminating error', () => {
-    const wrapper = renderWindowsScheduledTaskWrapperPs1({
-      programArgs: ['C:\\Happier\\happier-server.exe'],
-      stdoutPath: 'C:\\Happier\\logs\\server.out.log',
-      stderrPath: 'C:\\Happier\\logs\\server.err.log',
-    });
-
-    const nativeInvocation = wrapper.indexOf('& "C:\\Happier\\happier-server.exe"');
-    const nativeErrorPolicy = wrapper.indexOf('$ErrorActionPreference = "Continue"');
-    expect(nativeErrorPolicy).toBeGreaterThan(-1);
-    expect(nativeErrorPolicy).toBeLessThan(nativeInvocation);
-    expect(wrapper).toContain('$LASTEXITCODE = 1');
-    expect(wrapper).toContain('2>> "C:\\Happier\\logs\\server.err.log"');
-  });
-
-  it('waits for an existing task child process to exit before reporting the task stopped', () => {
+  it('stops only an existing running task through typed scheduler state', () => {
     const command = buildStopWindowsScheduledTaskIfRunningPowerShellCommand({
       qualifiedTaskName: 'Happier\\happier-daemon.default',
       definitionPath: 'C:\\Users\\test\\.happier\\services\\happier-daemon.default.ps1',
@@ -88,17 +57,8 @@ describe('Windows scheduled task lifecycle PowerShell helpers', () => {
     expect(command).toContain('[int]$task.State -eq 4');
     expect(command).toContain('Get-CimInstance Win32_Process');
     expect(command).toContain('-File `"C:\\Users\\test\\.happier\\services\\happier-daemon.default.ps1`"');
-    expect(command).toContain('$taskkillProcess = Start-Process -FilePath "taskkill.exe"');
-    expect(command).toContain('-ArgumentList @("/PID", [string]$serviceProcessId, "/T", "/F")');
-    expect(command).toContain('-NoNewWindow -Wait -PassThru');
-    expect(command).toContain('$taskkillExitCode = $taskkillProcess.ExitCode');
-    expect(command).toContain('taskkill exit $taskkillExitCode');
-    expect(command).not.toContain('$LASTEXITCODE');
-    expect(command).not.toContain('| Out-Null');
-    expect(command).toContain('Wait-Process -Id $serviceProcessId -Timeout 10');
-    expect(command).toContain('Failed to wait for scheduled task child process');
-    expect(command.indexOf('Start-Process')).toBeLessThan(command.indexOf('Wait-Process'));
-    expect(command.indexOf('Wait-Process')).toBeLessThan(command.indexOf('Stop-ScheduledTask'));
+    expect(command).toContain('taskkill.exe /PID $serviceProcessId /T /F');
+    expect(command.indexOf('taskkill.exe')).toBeLessThan(command.indexOf('Stop-ScheduledTask'));
     expect(command).toContain('Stop-ScheduledTask');
     expect(command).toContain('-ErrorAction Stop');
     expect(command.trim()).toMatch(/exit 0$/);

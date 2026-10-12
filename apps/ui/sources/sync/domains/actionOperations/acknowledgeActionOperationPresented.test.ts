@@ -36,4 +36,5 @@ describe('acknowledgeActionOperationPresented', () => {
         expect(acknowledgeActionOperationPresented(operation('running'), store)).toBe(false);
         expect(markSeen).not.toHaveBeenCalled();
     });
+
 });

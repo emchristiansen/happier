@@ -20,23 +20,6 @@ describe('resolveAgentProbeVariant', () => {
     expect(apiKeyProfile).not.toBe(nativeProfile);
   });
 
-  it('uses the effective probe environment when partitioning Kimi by ACP selector', () => {
-    const profileSelector = resolveAgentProbeVariant({
-      agentId: 'kimi',
-      accountSettings: { kimiAcpPythonSelector: 'auto' },
-      processEnv: { HAPPIER_KIMI_ACP_SELECTOR: 'poll' },
-    });
-    const settingsSelector = resolveAgentProbeVariant({
-      agentId: 'kimi',
-      accountSettings: { kimiAcpPythonSelector: 'auto' },
-      processEnv: {},
-    });
-
-    expect(profileSelector).toContain('poll');
-    expect(settingsSelector).toContain('auto');
-    expect(profileSelector).not.toBe(settingsSelector);
-  });
-
   it('partitions the Claude models probe cache by connected account', () => {
     const profileA = resolveAgentProbeVariant({
       agentId: 'claude',

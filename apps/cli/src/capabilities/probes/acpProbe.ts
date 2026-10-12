@@ -1,4 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { stat } from 'node:fs/promises';
 import {
     ndJsonStream,
     PROTOCOL_VERSION,
@@ -35,13 +37,21 @@ function buildAcpProbeCacheKey(params: {
     cwd: string;
     timeoutMs: number;
     agentName: string;
+    env: NodeJS.ProcessEnv;
+    executableIdentity: string;
 }): string {
     const command = String(params.command ?? '').trim();
     const cwd = String(params.cwd ?? '').trim();
     const agentName = String(params.agentName ?? '').trim();
     const timeoutMs = Number.isFinite(params.timeoutMs) ? String(params.timeoutMs) : '';
     const args = Array.isArray(params.args) ? params.args.map((a) => String(a ?? '')).join('\u0000') : '';
-    return `${agentName}:${timeoutMs}:${command}:${cwd}:${args}`;
+    // Profile credentials and runtime selectors can change the handshake. Keep values
+    // out of the cache key itself, and canonicalize insertion order and unset entries.
+    const environment = Object.entries(params.env)
+        .filter((entry): entry is [string, string] => entry[1] !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right));
+    const envIdentity = createHash('sha256').update(JSON.stringify(environment)).digest('hex');
+    return `${agentName}:${timeoutMs}:${command}:${cwd}:${args}:${envIdentity}:${params.executableIdentity}`;
 }
 
 async function terminateProcess(child: ChildProcess): Promise<void> {
@@ -57,18 +67,27 @@ export async function probeAcpAgentCapabilities(params: {
     timeoutMs?: number;
 }): Promise<AcpProbeResult> {
     const timeoutMs = typeof params.timeoutMs === 'number' ? params.timeoutMs : 2500;
-    const cacheKey = buildAcpProbeCacheKey({
+    const env = { ...process.env, ...params.env };
+    // Replacing/upgrading an executable at the same path invalidates its handshake.
+    // If it cannot be inspected (including a bare PATH command), probe normally
+    // without caching; a stat failure is not evidence about ACP capabilities.
+    const executableIdentity = await stat(params.command).then((entry) =>
+        JSON.stringify([entry.dev, entry.ino, entry.size, entry.mtimeMs, entry.ctimeMs]),
+    ).catch(() => null);
+    const cacheKey = executableIdentity === null ? null : buildAcpProbeCacheKey({
         command: params.command,
         args: params.args,
         cwd: params.cwd,
         timeoutMs,
         agentName: params.transport.agentName,
+        env,
+        executableIdentity,
     });
-    const cached = acpProbeCache.get(cacheKey);
+    const cached = cacheKey === null ? undefined : acpProbeCache.get(cacheKey);
     if (cached?.kind === 'success' && acpProbeCache.isFresh(cached)) return cached.value;
 
-    return await acpProbeCache.runDedupe(cacheKey, async () => {
-        const cached2 = acpProbeCache.get(cacheKey);
+    const runProbe = async (): Promise<AcpProbeResult> => {
+        const cached2 = cacheKey === null ? undefined : acpProbeCache.get(cacheKey);
         if (cached2?.kind === 'success' && acpProbeCache.isFresh(cached2)) return cached2.value;
 
     const checkedAt = Date.now();
@@ -77,7 +96,6 @@ export async function probeAcpAgentCapabilities(params: {
     let connection: AcpClientConnection | null = null;
     let spawnErrorPromise: Promise<never> | null = null;
     try {
-        const env = { ...process.env, ...params.env };
         const invocation = resolveWindowsCommandInvocation({
             command: params.command,
             args: params.args,
@@ -200,12 +218,12 @@ export async function probeAcpAgentCapabilities(params: {
         ]);
 
         const result: AcpProbeResult = { ok: true, checkedAt, agentCapabilities: initResponse.agentCapabilities };
-        acpProbeCache.setSuccess(cacheKey, result, { ttlMs: ACP_PROBE_SUCCESS_TTL_MS });
+        if (cacheKey !== null) acpProbeCache.setSuccess(cacheKey, result, { ttlMs: ACP_PROBE_SUCCESS_TTL_MS });
         return result;
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const result: AcpProbeResult = { ok: false, checkedAt, error: { message } };
-        acpProbeCache.setSuccess(cacheKey, result, { ttlMs: ACP_PROBE_ERROR_TTL_MS });
+        if (cacheKey !== null) acpProbeCache.setSuccess(cacheKey, result, { ttlMs: ACP_PROBE_ERROR_TTL_MS });
         return result;
     } finally {
         connection?.close();
@@ -214,5 +232,6 @@ export async function probeAcpAgentCapabilities(params: {
             await terminateProcess(child);
         }
     }
-    });
+    };
+    return cacheKey === null ? await runProbe() : await acpProbeCache.runDedupe(cacheKey, runProbe);
 }

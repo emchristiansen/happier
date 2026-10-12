@@ -51,10 +51,6 @@ vi.mock('./utils/resolveClaudeCliPath', () => ({
 type RemoteOptions = Parameters<(typeof import('./claudeRemote'))['claudeRemote']>[0];
 type QueryCall = Readonly<{
   prompt?: AsyncIterable<SDKUserMessage>;
-  onPromptTransportOutcome?: (
-    message: SDKUserMessage,
-    outcome: 'accepted' | 'rejected_before_effect' | 'effect_may_have_occurred',
-  ) => void;
   options?: Readonly<{
     resume?: string;
     continue?: boolean;
@@ -247,14 +243,12 @@ describe('claudeRemote', () => {
     expect((call?.options as any)?.canCallTool).toBeUndefined();
   });
 
-  it('confirms provider acceptance after the legacy SDK reports successful prompt transport', async () => {
+  it('confirms provider acceptance when the legacy query input takes custody', async () => {
     const onPromptAcceptedByProvider = vi.fn();
     mockQuery.mockImplementation((config: QueryCall & { prompt: AsyncIterable<SDKUserMessage> }) => ({
       async *[Symbol.asyncIterator]() {
         const consumed = await config.prompt[Symbol.asyncIterator]().next();
-        if (!consumed.done) {
-          config.onPromptTransportOutcome?.(consumed.value, 'accepted');
-        }
+        if (consumed.done) throw new Error('expected prompt input');
         yield resultMessage();
       },
     }));
@@ -430,12 +424,14 @@ describe('claudeRemote', () => {
   });
 
   it('injects --effort when the mode specifies a non-default reasoningEffort', async () => {
-    mockQuery.mockReturnValue(messageStream(resultMessage()));
+    const onEffectiveModel = vi.fn();
+    mockQuery.mockReturnValue(messageStream({ ...systemInitMessage('effort-init'), model: 'claude-opus-4-6' }, resultMessage()));
 
     const { claudeRemote } = await import('./claudeRemote');
 
     await claudeRemote(
       createBaseOptions({
+        onEffectiveModel,
         nextMessage: async () => ({
           message: 'hello',
           mode: defaultMode({ model: 'claude-opus-4-6', reasoningEffort: 'medium' }),
@@ -446,6 +442,7 @@ describe('claudeRemote', () => {
     expect(mockQuery).toHaveBeenCalledTimes(1);
     const call = mockQuery.mock.calls[0]?.[0] as QueryCall | undefined;
     expect(call?.options?.extraArgs).toEqual(['--effort', 'medium']);
+    expect(onEffectiveModel).toHaveBeenCalledWith({ modelId: 'claude-opus-4-6', reasoningEffort: 'medium' });
   });
 
   it('injects --effort high for Opus 4.7 because xhigh is the model default', async () => {

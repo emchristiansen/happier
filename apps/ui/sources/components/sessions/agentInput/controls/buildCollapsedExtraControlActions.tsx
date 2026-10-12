@@ -37,6 +37,7 @@ export function buildCollapsedExtraControlActions(params: Readonly<{
                 label: chip.collapsedOptionsPopover.label ?? chip.collapsedOptionsPopover.title,
                 icon: chip.collapsedOptionsPopover.icon?.(params.tint) ?? null,
                 onPress: () => {
+                    chip.onIntent?.();
                     params.dismiss();
                     params.resetCorePopovers?.();
                     params.openCollapsedOptionsPopover(chip.key);
@@ -48,6 +49,7 @@ export function buildCollapsedExtraControlActions(params: Readonly<{
                 label: chip.collapsedContentPopover.label ?? chip.collapsedContentPopover.title,
                 icon: chip.collapsedContentPopover.icon?.(params.tint) ?? null,
                 onPress: () => {
+                    chip.onIntent?.();
                     params.dismiss();
                     params.resetCorePopovers?.();
                     params.openCollapsedOptionsPopover(chip.key);

@@ -89,6 +89,34 @@ describe('createSessionListRenderableProjectionPatchCoalescer', () => {
         expect(renderables.get('s1')).toEqual(buildRenderable('s1'));
     });
 
+    it('resets queued patches and leading windows without applying stale work', () => {
+        const renderables = new Map<string, SessionListRenderableSession>([
+            ['s1', buildRenderable('s1')],
+        ]);
+        const appliedUpdatedAt: number[] = [];
+        const coalescer = createSessionListRenderableProjectionPatchCoalescer<number>({
+            getConfig: () => ({ enabled: true, windowMs: 100, maxBatchSize: 10 }),
+            readRenderable: (sessionId) => renderables.get(sessionId),
+            buildPatch: ({ payload }) => ({ updatedAt: payload }),
+            applyPatches: (patches) => {
+                for (const { sessionId, patch } of patches) {
+                    const previous = renderables.get(sessionId);
+                    if (!previous) continue;
+                    const next = { ...previous, ...patch, id: previous.id };
+                    renderables.set(sessionId, next);
+                    appliedUpdatedAt.push(next.updatedAt);
+                }
+            },
+        });
+
+        coalescer.enqueue('s1', 2, { deferLeadingPatch: true });
+        coalescer.reset();
+        vi.advanceTimersByTime(100);
+        coalescer.enqueue('s1', 3);
+
+        expect(appliedUpdatedAt).toEqual([3]);
+    });
+
     it('records telemetry for coalesced patches suppressed as no-ops', () => {
         const renderables = new Map<string, SessionListRenderableSession>([
             ['s1', buildRenderable('s1')],

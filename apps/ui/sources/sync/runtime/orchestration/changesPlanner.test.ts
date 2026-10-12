@@ -100,6 +100,7 @@ describe('planSyncActionsFromChanges', () => {
             sessionId: 's1',
             minSeq: 10,
             messageIds: ['m10', 'm15'],
+            messageSeqs: { m10: 10, m15: 15 },
         }]);
     });
 

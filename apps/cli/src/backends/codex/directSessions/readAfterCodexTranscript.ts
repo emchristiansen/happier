@@ -1,4 +1,5 @@
-import type { DirectSessionsSource, DirectTranscriptRawMessageV1 } from '@happier-dev/protocol';
+import type { DirectSessionsSource } from '@happier-dev/protocol';
+import type { DirectSessionTranscriptReadAfter } from '@/backends/directSessions/providerOps';
 
 import { resolveCodexHomesForDirectSessionsSource } from './resolveCodexHomesForDirectSessionsSource';
 import { decodeCodexDirectForwardCursor, encodeCodexDirectForwardCursor } from './codexDirectForwardCursor';
@@ -38,7 +39,7 @@ export async function readAfterCodexTranscript(params: Readonly<{
   cursor: string;
   maxBytes: number;
   maxItems: number;
-}>): Promise<Readonly<{ items: DirectTranscriptRawMessageV1[]; nextCursor: string | null; truncated: boolean }>> {
+}>): Promise<DirectSessionTranscriptReadAfter> {
   const env = params.env ?? process.env;
   const homes = await resolveCodexHomesForDirectSessionsSource({
     source: params.source,

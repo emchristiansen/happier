@@ -14,6 +14,7 @@ import type {
 import type { AgentMessage } from '@/agent/core';
 import { CHANGE_TITLE_TOOL_NAME_ALIASES } from '@happier-dev/protocol/tools/v2';
 import { filterJsonObjectOrArrayLine } from '@/agent/transport/utils/jsonStdoutFilter';
+import { classifyProviderOutputFailure } from '@/agent/runtime/classifyProviderOutputFailure';
 import {
   findToolNameFromId,
   findToolNameFromInputFields,
@@ -22,9 +23,6 @@ import {
 
 export const AUGGIE_TIMEOUTS = {
   init: 60_000,
-  toolCall: 120_000,
-  investigation: 600_000,
-  think: 30_000,
   idle: 500,
 } as const;
 
@@ -83,8 +81,7 @@ export class AuggieTransport implements TransportHandler {
 
     // Avoid being clever; we mainly need stdout hygiene for ACP.
     // Emit actionable auth hints when possible.
-    const lower = trimmed.toLowerCase();
-    if (lower.includes('unauthorized') || lower.includes('authentication') || lower.includes('api key') || lower.includes('token')) {
+    if (classifyProviderOutputFailure(trimmed).authenticationError) {
       const errorMessage: AgentMessage = {
         type: 'status',
         status: 'error',
@@ -124,13 +121,8 @@ export class AuggieTransport implements TransportHandler {
     return toolName;
   }
 
-  getToolCallTimeout(toolCallId: string, toolKind?: string): number {
-    const lowerId = toolCallId.toLowerCase();
-    if (lowerId.includes('investigat') || lowerId.includes('index') || lowerId.includes('search')) {
-      return AUGGIE_TIMEOUTS.investigation;
-    }
-    if (toolKind === 'think') return AUGGIE_TIMEOUTS.think;
-    return AUGGIE_TIMEOUTS.toolCall;
+  getToolCallTimeout(_toolCallId: string, _toolKind?: string): number | null {
+    return null;
   }
 
   getIdleTimeout(): number {

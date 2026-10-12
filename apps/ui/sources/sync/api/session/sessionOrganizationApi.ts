@@ -175,6 +175,7 @@ function buildSnapshotQuery(request: Partial<SessionOrganizationSnapshotRequest>
     appendBooleanParam(params, 'includeAllFolderAssignments', request.includeAllFolderAssignments);
     appendBooleanParam(params, 'includeAllTagAssignments', request.includeAllTagAssignments);
     appendBooleanParam(params, 'includeAttentionStandings', request.includeAttentionStandings);
+    appendBooleanParam(params, 'includeAttentionReminderTimes', request.includeAttentionReminderTimes);
     appendArrayParam(params, 'assignmentSessionIds', request.assignmentSessionIds);
     appendArrayParam(params, 'folderIds', request.folderIds);
     appendArrayParam(params, 'tagIds', request.tagIds);

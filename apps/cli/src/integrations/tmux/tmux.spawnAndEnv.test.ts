@@ -163,8 +163,8 @@ describe('TmuxUtilities.spawnInTmux', () => {
             }
 
             if (cmd[0] === 'has-session') return { returncode: 0, stdout: '', stderr: '', command: cmd };
-            if (cmd[0] === 'new-session') return { returncode: 0, stdout: '4242\n', stderr: '', command: cmd };
-            if (cmd[0] === 'new-window') return { returncode: 0, stdout: '4242\n', stderr: '', command: cmd };
+            if (cmd[0] === 'new-session') return { returncode: 0, stdout: '4242\t@7\n', stderr: '', command: cmd };
+            if (cmd[0] === 'new-window') return { returncode: 0, stdout: '4242\t@7\n', stderr: '', command: cmd };
             return { returncode: 0, stdout: '', stderr: '', command: cmd };
         }
     }
@@ -240,6 +240,7 @@ describe('TmuxUtilities.spawnInTmux', () => {
             success: true,
             sessionName: 'owned-session',
             windowName: 'provider',
+            windowId: '@7',
             pid: 4242,
         });
         const createSessionCall = tmux.calls.find((call) => call.cmd[0] === 'new-session');
@@ -248,7 +249,7 @@ describe('TmuxUtilities.spawnInTmux', () => {
             '-d',
             '-P',
             '-F',
-            '#{pane_pid}',
+            '#{pane_pid}\t#{window_id}',
             '-s',
             'owned-session',
             '-n',
@@ -366,7 +367,7 @@ describe('TmuxUtilities.spawnInTmux', () => {
                 if (this.newWindowAttempts === 1) {
                     return { returncode: 1, stdout: '', stderr: 'create window failed: index 1 in use.', command: cmd };
                 }
-                return { returncode: 0, stdout: '4242\n', stderr: '', command: cmd };
+                return { returncode: 0, stdout: '4242\t@7\n', stderr: '', command: cmd };
             }
         }
 
@@ -391,7 +392,7 @@ describe('TmuxUtilities.spawnInTmux', () => {
                     const tIndex = cmd.indexOf('-t');
                     const target = tIndex >= 0 ? cmd[tIndex + 1] : undefined;
                     if (target === 'my-session:3') {
-                        return { returncode: 0, stdout: '4242\n', stderr: '', command: cmd };
+                        return { returncode: 0, stdout: '4242\t@7\n', stderr: '', command: cmd };
                     }
                     return { returncode: 1, stdout: '', stderr: 'create window failed: index 1 in use.', command: cmd };
                 }
@@ -430,7 +431,7 @@ describe('TmuxUtilities.spawnInTmux', () => {
                     const tIndex = cmd.indexOf('-t');
                     const target = tIndex >= 0 ? cmd[tIndex + 1] : undefined;
                     if (target === 'my-session:2') {
-                        return { returncode: 0, stdout: '4242\n', stderr: '', command: cmd };
+                        return { returncode: 0, stdout: '4242\t@7\n', stderr: '', command: cmd };
                     }
                     return { returncode: 1, stdout: '', stderr: 'create window failed: index 1 in use.', command: cmd };
                 }
@@ -467,7 +468,7 @@ describe('TmuxUtilities.spawnInTmux', () => {
                     const tIndex = cmd.indexOf('-t');
                     const target = tIndex >= 0 ? cmd[tIndex + 1] : undefined;
                     if (target === 'my-session:2') {
-                        return { returncode: 0, stdout: '4242\n', stderr: '', command: cmd };
+                        return { returncode: 0, stdout: '4242\t@7\n', stderr: '', command: cmd };
                     }
                     if (this.attempts === 1) {
                         return { returncode: 1, stdout: '', stderr: 'create window failed: index 1 in use.', command: cmd };

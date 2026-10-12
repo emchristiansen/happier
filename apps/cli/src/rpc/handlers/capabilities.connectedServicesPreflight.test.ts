@@ -45,6 +45,38 @@ afterEach(() => {
 });
 
 describe('capabilities.invoke connected-service preflight', () => {
+  it('probes native Codex auth without requiring a connected-service credential', async () => {
+    vi.resetModules();
+    tempDir = mkdtempSync(join(tmpdir(), 'happier-capability-native-preflight-'));
+    process.env.HAPPIER_HOME_DIR = tempDir;
+    process.env.HAPPIER_CODEX_APP_SERVER_BIN = fileURLToPath(
+      new URL('../../backends/codex/preflight/__fixtures__/fakeCodexAppServer.mjs', import.meta.url),
+    );
+    vi.doMock('@/persistence', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('@/persistence')>()),
+      readCredentials: vi.fn(async () => null),
+    }));
+
+    const { reloadConfiguration } = await import('@/configuration');
+    reloadConfiguration();
+    const { registerCapabilitiesHandlers } = await import('./capabilities');
+    const { createEncryptedRpcTestClient } = await import('./encryptedRpc.testkit');
+    const { call } = createEncryptedRpcTestClient({
+      scopePrefix: 'machine-test',
+      encryptionKey: new Uint8Array(32).fill(7),
+      logger: () => undefined,
+      registerHandlers: (manager) => registerCapabilitiesHandlers(manager),
+    });
+    const response = await call(RPC_METHODS.CAPABILITIES_INVOKE, {
+      id: 'cli.codex', method: 'probeModels',
+      params: {
+        cwd: tempDir, timeoutMs: 5_000,
+        connectedServices: { v: 1, bindingsByServiceId: { 'openai-codex': { source: 'native' } } },
+      },
+    });
+    expect(response).toMatchObject({ ok: true, result: { source: 'dynamic' } });
+  }, 90_000);
+
   it('resolves the selected backend profile environment and encrypted Saved Secret before probing controls', async () => {
     vi.resetModules();
     tempDir = mkdtempSync(join(tmpdir(), 'happier-capability-profile-preflight-'));

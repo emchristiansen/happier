@@ -35,6 +35,10 @@ import {
 } from "./v2SessionListPage";
 import { createV2SessionListInitialPage } from "./v2SessionListInitialPage";
 import { createV2SessionListServerTiming } from "./v2SessionListServerTiming";
+import {
+    createSessionRollbackEligibleTurnsSelect,
+    readSessionTurnRollbackEligibleStarts,
+} from "@/app/session/turns/sessionRollbackEligibilityProjection";
 
 const V2_ACTIVE_SESSION_LIST_QUERYSTRING_SCHEMA = z.object({
     limit: z.coerce.number().int().min(1)
@@ -103,6 +107,7 @@ const V1_SESSION_LIST_ROW_SELECT = {
     pendingActivationRequestedAt: true,
     pendingActivationStatus: true,
     pendingActivationFailureCode: true,
+    turns: createSessionRollbackEligibleTurnsSelect(),
     active: true,
     lastActiveAt: true,
 } as const satisfies Prisma.SessionSelect;
@@ -201,6 +206,7 @@ export function registerSessionListingRoutes(app: Fastify) {
                 pendingBlockedCount: v.pendingBlockedCount,
                 pendingVersion: v.pendingVersion,
                 pendingActivationAuthorization: mapPendingActivationAuthorization(v),
+                rollbackEligibleTurnStarts: readSessionTurnRollbackEligibleStarts(v),
                 dataEncryptionKey: encodeSessionDataEncryptionKey(v.dataEncryptionKey),
                 lastMessage: null,
             })),
@@ -233,6 +239,7 @@ export function registerSessionListingRoutes(app: Fastify) {
                     pendingBlockedCount: v.pendingBlockedCount,
                     pendingVersion: v.pendingVersion,
                     pendingActivationAuthorization: mapPendingActivationAuthorization(v),
+                    rollbackEligibleTurnStarts: readSessionTurnRollbackEligibleStarts(v),
                     dataEncryptionKey:
                         v.encryptionMode === "plain"
                             ? null

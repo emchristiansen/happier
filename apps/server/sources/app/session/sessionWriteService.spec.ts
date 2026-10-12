@@ -2615,7 +2615,7 @@ describe("sessionWriteService", () => {
                 observedAt: BigInt(200),
                 appliedAt: BigInt(201),
             });
-            currentTx.sessionTurn.findMany.mockResolvedValue([{
+            currentTx.sessionTurn.findMany.mockResolvedValueOnce([{
                 turnId: "turn-1",
                 provider: "codex",
                 providerTurnId: null,
@@ -2838,7 +2838,7 @@ describe("sessionWriteService", () => {
                 });
             currentTx.sessionShare.findUnique.mockResolvedValue(null);
             currentTx.sessionTurnMutationReceipt.findUnique.mockResolvedValue(null);
-            currentTx.sessionTurn.findMany.mockResolvedValue([{
+            currentTx.sessionTurn.findMany.mockResolvedValueOnce([{
                 turnId: "turn-1",
                 provider: "codex",
                 providerTurnId: "provider-turn-1",
@@ -3238,7 +3238,7 @@ describe("sessionWriteService", () => {
                 });
             currentTx.sessionShare.findUnique.mockResolvedValue(null);
             currentTx.sessionTurnMutationReceipt.findUnique.mockResolvedValue(null);
-            currentTx.sessionTurn.findMany.mockResolvedValue([{
+            currentTx.sessionTurn.findMany.mockResolvedValueOnce([{
                 turnId: "turn-1",
                 provider: "codex",
                 providerTurnId: "provider-turn-1",
@@ -3253,7 +3253,7 @@ describe("sessionWriteService", () => {
                 providerRollbackOrdinal: null,
                 rollbackUpdatedAt: null,
                 lastMutationId: "mutation-completed",
-            }]);
+            }]).mockResolvedValueOnce([]);
             currentTx.sessionTurn.update.mockResolvedValue({});
             currentTx.sessionTurnMutationReceipt.create.mockResolvedValue({});
             currentTx.session.update.mockResolvedValue({});
@@ -3294,6 +3294,7 @@ describe("sessionWriteService", () => {
                 latestTurnStatus: "completed",
                 latestTurnStatusObservedAt: 200,
                 lastRuntimeIssue: null,
+                rollbackEligibleTurnStarts: [],
             });
         });
 

@@ -57,6 +57,42 @@ rl.on('line', (line) => {
   return scriptPath;
 }
 
+function makeFakePiRpcHangingIntrospectionScript(dir: string): string {
+  const scriptPath = join(dir, 'fake-pi-rpc-hanging-introspection.js');
+  const script = `
+const readline = require('node:readline');
+
+const rl = readline.createInterface({ input: process.stdin });
+const out = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
+
+rl.on('line', (line) => {
+  let command;
+  try { command = JSON.parse(line); } catch { return; }
+
+  if (command.type === 'get_state') {
+    out({
+      id: command.id,
+      type: 'response',
+      command: 'get_state',
+      success: true,
+      data: {
+        sessionId: 'pi-session-1',
+        sessionFile: process.env.SESSION_FILE_PATH,
+        model: { id: 'gpt-4o-mini', provider: 'openai', name: 'GPT-4o mini' },
+      },
+    });
+    return;
+  }
+
+  if (command.type === 'get_available_models' || command.type === 'get_commands') return;
+  out({ id: command.id, type: 'response', command: command.type, success: true, data: {} });
+});
+`;
+  writeFileSync(scriptPath, script, 'utf8');
+  chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
 describe('PiRpcBackend introspection failures', () => {
   let workDir: string | null = null;
   let backend: PiRpcBackend | null = null;
@@ -96,5 +132,38 @@ describe('PiRpcBackend introspection failures', () => {
     const started = await backend.startSession();
     expect(started.sessionId).toBe('pi-session-1');
   });
-});
 
+  it('does not block startSession on hanging best-effort runtime introspection', async () => {
+    workDir = makeTempDir('happier-pi-introspection-hang-');
+    const piDir = join(workDir, 'pi-agent');
+    const sessionsDir = join(piDir, 'sessions', '--workdir--');
+    const authPath = join(piDir, 'auth.json');
+    const sessionPath = join(sessionsDir, '2026-02-18T00-00-00-000Z_pi-session-1.jsonl');
+
+    mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
+    writeFileSync(authPath, JSON.stringify({ 'openai-codex': { type: 'oauth', access: 'a', refresh: 'r', expires: 999999999 } }) + '\n');
+    writeFileSync(sessionPath, '{"role":"system","content":[{"type":"text","text":"stub"}]}' + '\n');
+
+    const fake = makeFakePiRpcHangingIntrospectionScript(workDir);
+    backend = new PiRpcBackend({
+      cwd: workDir,
+      command: process.execPath,
+      args: [fake],
+      env: {
+        PI_CODING_AGENT_DIR: piDir,
+        SESSION_FILE_PATH: sessionPath,
+      },
+    });
+
+    const startOutcome = backend.startSession().then(
+      (value) => ({ status: 'started' as const, value }),
+      (error: unknown) => ({ status: 'failed' as const, error }),
+    );
+    const outcome = await Promise.race([
+      startOutcome,
+      new Promise<{ status: 'blocked' }>((resolve) => setTimeout(() => resolve({ status: 'blocked' }), 10_000)),
+    ]);
+
+    expect(outcome).toMatchObject({ status: 'started', value: { sessionId: 'pi-session-1' } });
+  }, 20_000);
+});

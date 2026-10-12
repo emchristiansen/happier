@@ -9,6 +9,8 @@ Canonical lanes:
 - `yarn test` — fast unit lane across apps.
 - `yarn test:import-cycles` — CLI runtime import-cycle guard, also enforced by the CLI unit lane.
 - `yarn test:integration` — orchestration-heavy app integration lane.
+- `yarn test:shared-packages:local` — all-settled shared-package checks, also run by the Shared Package Unit Tests CI job.
+- `yarn test:cli:slow` — CLI slow tests, also enforced by CLI CI part 1.
 - `yarn test:e2e:core:fast` — default local core e2e loop.
 - `yarn test:e2e:core:slow` — long orchestration core e2e.
 - `yarn test:e2e:ui` — Playwright UI/browser e2e exercising real UI + server + CLI/daemon flows.
@@ -16,6 +18,27 @@ Canonical lanes:
 - `yarn test:db-contract:docker` — server DB contract via Docker.
 
 Use the smallest relevant subset during RED/GREEN loops. Before handoff, run the touched package typecheck/build-enforcing lane and at least one broader relevant lane when shared contracts are touched.
+
+## Choose checks by the changed contract
+
+| Change | Focused loop | Integration boundary |
+| --- | --- | --- |
+| Package behavior | Existing owner test through real internal logic | Package typecheck and the affected unit/integration lane |
+| Shared schema, catalog, or testkit | Shared owner tests plus an affected consumer | Relevant consumer lanes; producer-only green is insufficient |
+| UI flow, layout mode, or selector | Relevant component test | Existing Playwright scenario with explicit viewport, mode, and permissions |
+| Process, port, daemon, or session lifecycle | Existing process/testkit test | Owning integration lane; ephemeral ports and observed readiness, not fixed sleeps |
+| CI selection, sharding, or root commands | Workflow/runner contracts and selected-file inventory | Prove complete, non-overlapping coverage and a failing final result when any required check fails |
+| Installer, packaging, or release control | Canonical source contracts | Candidate-dependent smoke/update and publication checks after the actual artifact exists |
+
+Use shared boundary fixtures and real internal owners. A changed internal export is not a reason to expand a local mock; inventory its callers and update the owning fixture once. Assert stable outcomes rather than old implementation spelling. Remove redundant or obsolete assertions only after identifying the behavior they formerly protected.
+
+Root unit and integration commands collect failures across independent workspaces instead of stopping at the first red package. Package preparation remains a prerequisite; aggregate failure collection cannot expose behavior behind an unavailable build, database, or candidate. Do not call an unexecuted lane successful.
+
+For broad local collection, inspect `node scripts/pipeline/run.mjs checks --profile fast --dry-run` first. For a focused rerun, use a workspace command or `checks --profile custom --custom-checks integration,typecheck --install-deps false`. Custom selection is exact, not an implicit full baseline. The checks owner collects independent failures and returns nonzero; install failure still stops dependent checks.
+
+Local and hosted profiles share selection policy ownership in `scripts/pipeline/checks/lib/checks-profile.mjs`, but are not interchangeable matrices: local profiles preserve local toolchain coverage; hosted profiles include platform/runner jobs. Read the current command help or workflow inputs instead of assuming a local `fast` result certifies hosted `release` coverage. In 0.3, route these commands through `hstack-exec`; its public test scripts already do so.
+
+Collect one complete reachable failure set, fix deterministic clusters locally, then rerun affected lanes. Use one final required hosted profile for the coherent source, not a full graph per test edit. Reuse successful evidence when source, dependencies, configuration, command, and environment remain applicable. New source or a previously unreachable candidate boundary can legitimately expose another failure.
 
 ## TypeScript toolchain
 

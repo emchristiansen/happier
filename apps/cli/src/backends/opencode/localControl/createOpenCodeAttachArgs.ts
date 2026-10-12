@@ -2,6 +2,8 @@ import path from 'node:path';
 
 import { expandHomeDirPath } from '@/utils/path/expandHomeDirPath';
 
+import type { OpenCodeAttachCliDialect } from './resolveOpenCodeAttachCliDialect';
+
 /**
  * Canonicalize the attach `--dir` so it matches the directory the OpenCode server associates with
  * the session. OpenCode's attached-TUI applies a client-side directory drop-filter on incoming
@@ -35,12 +37,28 @@ export function createOpenCodeAttachArgs(params: Readonly<{
   baseUrl: string;
   directory: string;
   sessionId: string;
+  /** Dialect of the CLI/server pair being attached; see `resolveOpenCodeAttachCliDialect`. */
+  dialect: OpenCodeAttachCliDialect;
 }>): string[] {
+  const directory = canonicalizeAttachDirectory(params.directory);
+  // Released OpenCode 2 has no `attach` subcommand and no `--dir` flag: the root command carries
+  // `--server`/`--session` and chdirs into the optional positional directory.
+  if (params.dialect === 'v2') {
+    return [
+      '--server',
+      params.baseUrl,
+      '--session',
+      params.sessionId,
+      // The positional directory is chdir-ed by the root handler; an empty value must be omitted
+      // rather than passed as an empty argument.
+      ...(directory.length > 0 ? [directory] : []),
+    ];
+  }
   return [
     'attach',
     params.baseUrl,
     '--dir',
-    canonicalizeAttachDirectory(params.directory),
+    directory,
     '--session',
     params.sessionId,
   ];

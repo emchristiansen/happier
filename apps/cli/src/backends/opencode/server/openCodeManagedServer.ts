@@ -6,28 +6,30 @@ import { basename } from 'node:path';
 import { resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process';
 
 import { logger } from '@/ui/logger';
-import { requireProviderCliLaunchSpec } from '@/runtime/managedTools/requireProviderCliLaunchSpec';
+import { resolveOpenCodeCliLaunchSpec } from '@/backends/opencode/utils/resolveOpenCodeCliCommand';
 
-import { resolveOpenCodeServerAuthHeadersFromEnv } from './openCodeServerAuth';
+import { resolveOpenCodeServerAuthHeaders } from './openCodeServerAuth';
+import {
+  resolveOpenCodeManagedServerLaunchCredential,
+  resolveOpenCodeManagedServerReadinessCredentials,
+} from './openCodeManagedServerCredential';
 import {
   resolveOpenCodeManagedServerChildEnv,
-  OPENCODE_CONNECTED_SERVICE_SELECTION_IDENTITY_ENV,
 } from './openCodeManagedServerEnv';
 import {
   OPEN_CODE_BROKER_LOAD_NONCE_ENV,
-  OPEN_CODE_BROKER_PROVIDERS,
-  OPEN_CODE_BROKER_SELECTIONS_ENV,
-  parseOpenCodeBrokerSelections,
 } from '@/backends/opencode/brokerPlugin/openCodeBrokerPluginEnv';
-import { ensureOpenCodeBrokerPluginAssets } from '@/backends/opencode/brokerPlugin/openCodeBrokerPluginAssets';
+import {
+  prepareOpenCodeConnectedAuthAssets,
+} from '@/backends/opencode/brokerPlugin/openCodeBrokerPluginAssets';
 import { resolveOpenCodeManagedServerTrackedPid } from './resolveOpenCodeManagedServerTrackedPid';
 import { terminateManagedOpenCodeServerPidBestEffort } from './terminateManagedOpenCodeServerPidBestEffort';
 import { waitForOpenCodeServerHealth } from './waitForOpenCodeServerHealth';
-import { readPositiveIntEnv } from '@/utils/readPositiveIntEnv';
 import {
   createOpenCodeManagedServerLogCapture,
   pruneOpenCodeManagedServerLogs,
 } from './managedServerLogs';
+import { resolveOpenCodeManagedServerStartTimeoutMsFromEnv } from './openCodeManagedServerTimeouts';
 
 async function resolveEphemeralPort(hostname: string): Promise<number> {
   return await new Promise<number>((resolve, reject) => {
@@ -45,34 +47,36 @@ async function resolveEphemeralPort(hostname: string): Promise<number> {
   });
 }
 
-function resolveOpenCodeCommand(): Readonly<{ command: string; args: readonly string[] }> {
-  const launch = requireProviderCliLaunchSpec('opencode');
-  return { command: launch.command, args: launch.args };
-}
-
 /**
  * For connected (config-isolated) sessions only, ensure the Happier-owned config home exists and the
  * broker plugin file(s) referenced by the materialized `OPENCODE_CONFIG_CONTENT` are written. Keyed
  * on the selection-identity env so NATIVE sessions (no selection identity) are a strict no-op and
  * keep loading the user's own config/plugins.
  */
-async function ensureConnectedOpenCodeBrokerAssetsBeforeSpawn(env: NodeJS.ProcessEnv): Promise<string | null> {
-  if (typeof env[OPENCODE_CONNECTED_SERVICE_SELECTION_IDENTITY_ENV] !== 'string') return null;
-  const selections = parseOpenCodeBrokerSelections(env[OPEN_CODE_BROKER_SELECTIONS_ENV]);
-  const providers = OPEN_CODE_BROKER_PROVIDERS.filter((provider) => selections[provider]);
+async function ensureConnectedOpenCodeBrokerAssetsBeforeSpawn(
+  env: NodeJS.ProcessEnv,
+  apiGeneration: 'auto' | 'v2',
+): Promise<Readonly<{ brokerLoadNonce: string | null; openCodeConfigContent?: string }>> {
+  const prepared = await prepareOpenCodeConnectedAuthAssets({ env, apiGeneration });
   let brokerLoadNonce: string | null = null;
-  if (providers.length > 0) {
+  if (prepared.providers.length > 0) {
     brokerLoadNonce = randomUUID();
     env[OPEN_CODE_BROKER_LOAD_NONCE_ENV] = brokerLoadNonce;
   }
-  await ensureOpenCodeBrokerPluginAssets({ providers });
-  return brokerLoadNonce;
+  return {
+    brokerLoadNonce,
+    ...(prepared.openCodeConfigContent ? { openCodeConfigContent: prepared.openCodeConfigContent } : {}),
+  };
 }
 
 export async function startManagedOpenCodeServer(params: Readonly<{
   hostname?: string;
   port?: number;
   timeoutMs?: number;
+  signal?: AbortSignal;
+  onCleanup?: (cleanup: () => Promise<void>) => void;
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
   xdgRootDir?: string | null;
   isolateConfig?: boolean;
   /** Override the durable-log directory (defaults to `configuration.logsDir`). */
@@ -84,6 +88,13 @@ export async function startManagedOpenCodeServer(params: Readonly<{
     pid: number;
     logPath: string;
     brokerLoadNonce?: string;
+    apiGeneration: 'auto' | 'v2';
+    /**
+     * Minted password this managed child is protected with, for the state owner to retain. Absent when
+     * the child inherited an operator-configured password: that credential is re-derived from the
+     * environment (keeping its username override) instead of being written down.
+     */
+    authPassword?: string;
   }>) => void | Promise<void>;
 }> = {}): Promise<{
   baseUrl: string;
@@ -91,19 +102,34 @@ export async function startManagedOpenCodeServer(params: Readonly<{
   close: () => Promise<void>;
   logPath: string;
   brokerLoadNonce?: string;
+  apiGeneration: 'auto' | 'v2';
+  authPassword?: string;
 }> {
+  params.signal?.throwIfAborted();
+  const processEnv = { ...(params.env ?? process.env) };
   const hostname = typeof params.hostname === 'string' && params.hostname.trim().length > 0 ? params.hostname.trim() : '127.0.0.1';
   const port = typeof params.port === 'number' && Number.isFinite(params.port) && params.port > 0
     ? Math.floor(params.port)
     : await resolveEphemeralPort(hostname);
+  params.signal?.throwIfAborted();
   const timeoutMs = typeof params.timeoutMs === 'number' && Number.isFinite(params.timeoutMs) && params.timeoutMs > 0
     ? Math.floor(params.timeoutMs)
-    : (readPositiveIntEnv('HAPPIER_OPENCODE_SERVER_START_TIMEOUT_MS') ?? 30_000);
+    : resolveOpenCodeManagedServerStartTimeoutMsFromEnv(processEnv);
 
-  const launch = resolveOpenCodeCommand();
+  const launch = resolveOpenCodeCliLaunchSpec(processEnv);
   const cmd = launch.command;
   const args = [...launch.args, `serve`, `--hostname=${hostname}`, `--port=${port}`];
-  const healthHeaders = resolveOpenCodeServerAuthHeadersFromEnv();
+  // Released OpenCode 2 password-protects every `serve`, generating an unknowable secret when the
+  // environment supplies none. Mint the credential BEFORE spawning so the child is protected with a
+  // password this launch can authenticate with; the caller retains it in the managed-server state so
+  // later readers of THIS server can too.
+  const launchCredential = resolveOpenCodeManagedServerLaunchCredential(processEnv);
+  const readinessCredentials = resolveOpenCodeManagedServerReadinessCredentials({
+    env: processEnv,
+    launchCredential: launchCredential.credential,
+  });
+  const healthHeaders = resolveOpenCodeServerAuthHeaders(readinessCredentials.v1);
+  const v2HealthHeaders = resolveOpenCodeServerAuthHeaders(readinessCredentials.v2);
 
   logger.debug('[OpenCodeServer] Spawning managed server', { cmd, args });
 
@@ -113,12 +139,20 @@ export async function startManagedOpenCodeServer(params: Readonly<{
   // Connected sessions (selection identity present) are config-isolated: ensure the Happier-owned
   // empty config home exists and write the broker plugin file(s) before spawn. Native sessions have
   // no selection identity ⇒ this is a no-op ⇒ native HOME/XDG/config/plugins remain untouched.
-  const brokerLoadNonce = await ensureConnectedOpenCodeBrokerAssetsBeforeSpawn(process.env);
+  const brokerAssets = await ensureConnectedOpenCodeBrokerAssetsBeforeSpawn(
+    processEnv,
+    launch.apiGeneration,
+  );
+  const brokerLoadNonce = brokerAssets.brokerLoadNonce;
+  params.signal?.throwIfAborted();
 
   const childEnv = resolveOpenCodeManagedServerChildEnv({
-    baseEnv: process.env,
+    baseEnv: brokerAssets.openCodeConfigContent
+      ? { ...processEnv, OPENCODE_CONFIG_CONTENT: brokerAssets.openCodeConfigContent }
+      : processEnv,
     xdgRootDir: xdgRootDir.length > 0 ? xdgRootDir : null,
     isolateConfig,
+    authCredential: launchCredential.credential,
   });
   const invocation = resolveWindowsCommandInvocation({
     command: cmd,
@@ -129,6 +163,7 @@ export async function startManagedOpenCodeServer(params: Readonly<{
 
   const proc = spawn(invocation.command, invocation.args, {
     env: childEnv,
+    ...(params.cwd ? { cwd: params.cwd } : {}),
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: true,
     ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
@@ -184,12 +219,13 @@ export async function startManagedOpenCodeServer(params: Readonly<{
     closePromise = (async () => {
       try {
         if (trackedPid > 0) {
-          try {
-            await terminateManagedOpenCodeServerPidBestEffort(trackedPid);
-            return;
-          } catch {
-            // fall through to direct kill
+          const terminated = await terminateManagedOpenCodeServerPidBestEffort(trackedPid);
+          if (!terminated) {
+            throw Object.assign(new Error('Owned OpenCode server termination could not be verified'), {
+              code: 'open_code_server_termination_incomplete',
+            });
           }
+          return;
         }
         try {
           proc.kill();
@@ -199,21 +235,26 @@ export async function startManagedOpenCodeServer(params: Readonly<{
       } finally {
         await logCapture.close().catch(() => {});
       }
-    })();
+    })().catch((error: unknown) => {
+      logger.infoFile('[OpenCodeServer] Owned native server cleanup failed');
+      throw error;
+    });
     await closePromise;
   };
+  params.onCleanup?.(close);
 
+  let detectedApiGeneration = launch.apiGeneration;
   await new Promise<void>((resolve, reject) => {
     const tag = randomUUID();
     const timer = setTimeout(() => {
-      void close();
+      void close().catch(() => undefined);
       reject(new Error(`Timeout waiting for OpenCode server to start after ${timeoutMs}ms (${tag}). Log: ${logPath}. Output:\n${readStartupOutput()}`));
     }, timeoutMs);
     timer.unref?.();
 
     proc.on('exit', (code, signal) => {
       clearTimeout(timer);
-      void close();
+      void close().catch(() => undefined);
       const codeLabel = code ?? 'unknown';
       const signalLabel = signal ?? 'none';
       reject(new Error(
@@ -223,22 +264,36 @@ ${readStartupOutput()}`,
     });
     proc.on('error', (error) => {
       clearTimeout(timer);
-      void close();
+      void close().catch(() => undefined);
       reject(error);
     });
 
-    void waitForOpenCodeServerHealth({ baseUrl, timeoutMs, pollIntervalMs: 200, headers: healthHeaders })
+    void waitForOpenCodeServerHealth({
+      signal: params.signal,
+      baseUrl,
+      timeoutMs,
+      pollIntervalMs: 200,
+      headers: healthHeaders,
+      v2Headers: v2HealthHeaders,
+      apiGeneration: launch.apiGeneration,
+      onReady: (apiGeneration) => {
+        detectedApiGeneration = apiGeneration;
+      },
+    })
       .then(() => {
         clearTimeout(timer);
         resolve();
       })
       .catch((error) => {
         clearTimeout(timer);
-        void close();
+        void close().catch(() => undefined);
         const message = error instanceof Error ? error.message : String(error);
         reject(new Error(`OpenCode server did not become healthy: ${message}. Log: ${logPath}. Output:
 ${readStartupOutput()}`));
       });
+  }).catch(async (error: unknown) => {
+    await close();
+    throw error;
   });
 
   // Readiness reached: stop growing the bounded startup buffer; the log listeners keep draining and
@@ -255,6 +310,10 @@ ${readStartupOutput()}`));
     // keep the spawned pid best-effort
   }
   logCapture.recordTrackedPid(trackedPid);
+  if (params.signal?.aborted) {
+    await close();
+    params.signal.throwIfAborted();
+  }
 
   try {
     await params.onSpawned?.({
@@ -262,6 +321,8 @@ ${readStartupOutput()}`));
       pid: trackedPid,
       logPath,
       ...(brokerLoadNonce ? { brokerLoadNonce } : {}),
+      apiGeneration: detectedApiGeneration,
+      ...(launchCredential.retainedPassword ? { authPassword: launchCredential.retainedPassword } : {}),
     });
   } catch (error) {
     await close();
@@ -281,5 +342,7 @@ ${readStartupOutput()}`));
     close,
     logPath,
     ...(brokerLoadNonce ? { brokerLoadNonce } : {}),
+    apiGeneration: detectedApiGeneration,
+    ...(launchCredential.retainedPassword ? { authPassword: launchCredential.retainedPassword } : {}),
   };
 }

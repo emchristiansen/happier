@@ -1017,7 +1017,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
 
   it('logs text-free materialization decisions with steerability metadata', async () => {
     const abortController = new AbortController();
-    const debugSpy = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+    const infoFileSpy = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
     const materializeNextPendingMessageSafely = vi
       .fn<() => Promise<MaterializeNextPendingResult>>()
       .mockResolvedValue({
@@ -1042,7 +1042,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
 
     await expect(consumer.waitForNextInput({ abortSignal: abortController.signal })).resolves.toBeNull();
 
-    expect(debugSpy).toHaveBeenCalledWith('[pendingQueue] input consumer materialization decision', {
+    expect(infoFileSpy).toHaveBeenCalledWith('[pendingQueue] input consumer materialization decision', {
       activeTurnSteerability: 'steerable',
       localId: 'local-secret',
       reconcileWhenEmpty: 'skip',
@@ -1050,7 +1050,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
       seq: 33,
       source: 'waitForNextInput',
     });
-    expect(debugSpy.mock.calls).not.toEqual(expect.arrayContaining([
+    expect(infoFileSpy.mock.calls).not.toEqual(expect.arrayContaining([
       expect.arrayContaining([
         expect.any(String),
         expect.objectContaining({ content: expect.anything() }),

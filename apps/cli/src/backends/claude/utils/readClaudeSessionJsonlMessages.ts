@@ -2,7 +2,7 @@ import { logger } from '@/ui/logger';
 import { tryReadTextFileTail } from '@/agent/runtime/readTextFileTail';
 
 import type { RawJSONLines } from '../types';
-import { INTERNAL_CLAUDE_EVENT_TYPES } from './internalClaudeEventTypes';
+import { providers } from '@happier-dev/agents';
 import { parseRawJsonLinesObject } from './parseRawJsonLines';
 
 /**
@@ -21,7 +21,7 @@ export async function readClaudeSessionJsonlMessages(params: Readonly<{
    */
   maxBytes?: number;
   /** Observes every parsed JSONL value before conversation/internal filtering. */
-  onJsonValue?: ((value: unknown) => void) | undefined;
+  onJsonValue?: ((value: unknown, source: Readonly<{ lineStartOffsetBytes: number }>) => void) | undefined;
 }>): Promise<RawJSONLines[]> {
   logger.debug(`[${params.logLabel}] Reading session file: ${params.sessionFilePath}`);
 
@@ -36,22 +36,26 @@ export async function readClaudeSessionJsonlMessages(params: Readonly<{
 
   const lines = tail.tail.split('\n');
   const candidateLines = tail.truncated ? lines.slice(1) : lines;
+  // Count from the complete-line suffix: a truncated tail may start inside a UTF-8 character.
+  let nextLineOffsetBytes = tail.totalBytes - Buffer.byteLength(candidateLines.join('\n'));
   const messages: RawJSONLines[] = [];
   for (const line of candidateLines) {
+    const lineStartOffsetBytes = nextLineOffsetBytes;
+    nextLineOffsetBytes += Buffer.byteLength(line) + 1;
     try {
       if (line.trim() === '') continue;
       const raw = JSON.parse(line);
       try {
-        params.onJsonValue?.(raw);
+        params.onJsonValue?.(raw, { lineStartOffsetBytes });
       } catch (observerError) {
         logger.debug(`[${params.logLabel}] Error observing raw message: ${observerError}`);
       }
 
-      if (raw?.type && INTERNAL_CLAUDE_EVENT_TYPES.has(String(raw.type))) {
+      const parsed = parseRawJsonLinesObject(raw);
+      if (providers.claude.isClaudeInternalEventType(parsed?.type ?? raw?.type)) {
         continue;
       }
 
-      const parsed = parseRawJsonLinesObject(raw);
       if (!parsed) {
         continue;
       }

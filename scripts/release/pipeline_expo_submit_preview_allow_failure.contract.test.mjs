@@ -11,10 +11,14 @@ function writeExecutable(filePath, content) {
   fs.writeFileSync(filePath, content, { encoding: 'utf8', mode: 0o700 });
 }
 
-test('expo submit attempts every requested prerelease platform but reports any submission failure', () => {
+test('expo submit attempts every requested prerelease platform but reports any submission failure', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'happier-pipeline-expo-submit-fail-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const binDir = path.join(dir, 'bin');
   fs.mkdirSync(binDir, { recursive: true });
+  const uiDir = path.join(dir, 'apps', 'ui');
+  fs.mkdirSync(uiDir, { recursive: true });
+  fs.copyFileSync(path.join(repoRoot, 'apps', 'ui', 'eas.json'), path.join(uiDir, 'eas.json'));
 
   const npxPath = path.join(binDir, 'npx');
   writeExecutable(
@@ -45,7 +49,7 @@ test('expo submit attempts every requested prerelease platform but reports any s
         '--platform',
         'all',
       ],
-      { cwd: repoRoot, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 },
+      { cwd: dir, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 },
     );
 
     assert.equal(result.status, 1, result.stderr || result.stdout);

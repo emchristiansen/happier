@@ -13,11 +13,11 @@ type DaemonStartupServiceConflictEvaluation =
     | Readonly<{ kind: 'installed-background-service-conflict'; services: readonly DaemonServiceListEntry[] }>;
 const {
     evaluateDaemonStartupServiceConflictMock,
-    reapSameHomeDaemonOrphansBeforeStartMock,
+    reapCurrentLifecycleDaemonOrphansBeforeStartMock,
     renderDaemonInstalledServiceConflictMock,
 } = vi.hoisted(() => ({
     evaluateDaemonStartupServiceConflictMock: vi.fn(async (): Promise<DaemonStartupServiceConflictEvaluation> => ({ kind: 'none' })),
-    reapSameHomeDaemonOrphansBeforeStartMock: vi.fn(async () => ({
+    reapCurrentLifecycleDaemonOrphansBeforeStartMock: vi.fn(async () => ({
         stoppedPids: [],
         preservedPids: [],
         failedPids: [],
@@ -39,7 +39,7 @@ vi.mock('./multiDaemon', async (importOriginal) => {
     const actual = await importOriginal<typeof import('./multiDaemon')>();
     return {
         ...actual,
-        reapSameHomeDaemonOrphansBeforeStart: reapSameHomeDaemonOrphansBeforeStartMock,
+        reapCurrentLifecycleDaemonOrphansBeforeStart: reapCurrentLifecycleDaemonOrphansBeforeStartMock,
     };
 });
 
@@ -76,22 +76,27 @@ describe('startDaemon ownership preflight', () => {
         'HAPPIER_DAEMON_SERVICE_USER_HOME_DIR',
         'HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR',
         'HAPPIER_DAEMON_SERVICE_CHANNEL',
+        // Inherited from a dev-stack shell it would move this daemon's lifecycle state to the stack's directory.
+        'HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID',
     ]);
     let currentProcessDaemonFixtureAlive = true;
     const fetchMock = vi.fn();
 
     beforeEach(() => {
+        envScope.patch({ HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID: undefined });
         processListenersBeforeTest = daemonLifecycleProcessEvents.map((event) => [event, process.rawListeners(event)] as const);
         currentProcessDaemonFixtureAlive = true;
         fetchMock.mockReset();
         fetchMock.mockImplementation(async (input: string | URL | Request) => {
             const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url);
+            if (url.pathname === '/ping' && !currentProcessDaemonFixtureAlive) {
+                throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('Control closed'), { code: 'ECONNREFUSED' }) });
+            }
             if (url.pathname === '/stop') currentProcessDaemonFixtureAlive = false;
-            return {
-                ok: true,
+            return new Response(JSON.stringify(url.pathname === '/ping' ? { status: 'ok' } : { success: true }), {
                 status: 200,
-                text: async () => JSON.stringify({ success: true }),
-            } as Response;
+                headers: { 'Content-Type': 'application/json' },
+            });
         });
         vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
             if (pid === process.pid && (signal === 0 || signal === undefined) && !currentProcessDaemonFixtureAlive) {
@@ -105,7 +110,7 @@ describe('startDaemon ownership preflight', () => {
     afterEach(() => {
         for (const [event, originalListeners] of processListenersBeforeTest) {
             const retainedListeners = new Set(originalListeners);
-            for (const listener of process.rawListeners(event)) {
+            for (const listener of process.rawListeners(event) as Array<(...args: any[]) => void>) {
                 if (!retainedListeners.has(listener)) {
                     process.removeListener(event, listener);
                 }
@@ -123,8 +128,8 @@ describe('startDaemon ownership preflight', () => {
                 'If you want to start a manual daemon, stop or replace the installed background service first.',
             ],
         }));
-        reapSameHomeDaemonOrphansBeforeStartMock.mockReset();
-        reapSameHomeDaemonOrphansBeforeStartMock.mockImplementation(async () => ({
+        reapCurrentLifecycleDaemonOrphansBeforeStartMock.mockReset();
+        reapCurrentLifecycleDaemonOrphansBeforeStartMock.mockImplementation(async () => ({
             stoppedPids: [],
             preservedPids: [],
             failedPids: [],
@@ -134,7 +139,7 @@ describe('startDaemon ownership preflight', () => {
         vi.resetModules();
     });
 
-    it('reaps same-home daemon orphans before waiting for auth setup', async () => {
+    it('reaps lifecycle-scope daemon orphans before waiting for auth setup', async () => {
         await withTempDir('happier-start-daemon-orphan-reaper-', async (homeDir) => {
             envScope.patch({
                 HAPPIER_HOME_DIR: homeDir,
@@ -147,9 +152,9 @@ describe('startDaemon ownership preflight', () => {
 
             await expect(startDaemon()).resolves.toBeUndefined();
 
-            expect(reapSameHomeDaemonOrphansBeforeStartMock).toHaveBeenCalledTimes(1);
+            expect(reapCurrentLifecycleDaemonOrphansBeforeStartMock).toHaveBeenCalledTimes(1);
             expect(waitForInitialCredentialsMock).toHaveBeenCalledTimes(1);
-            expect(reapSameHomeDaemonOrphansBeforeStartMock.mock.invocationCallOrder[0]).toBeLessThan(
+            expect(reapCurrentLifecycleDaemonOrphansBeforeStartMock.mock.invocationCallOrder[0]).toBeLessThan(
                 waitForInitialCredentialsMock.mock.invocationCallOrder[0],
             );
         });

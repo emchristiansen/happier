@@ -17,6 +17,24 @@ function createConnection(testAgent: ReturnType<typeof agent>) {
 }
 
 describe('AcpAgentPeer', () => {
+  it('owns the standard ACP list, close, and delete session methods', async () => {
+    const observed: string[] = [];
+    const testAgent = agent({ name: 'peer-session-controls-agent' })
+      .onRequest('session/list', () => { observed.push('list'); return { sessions: [], nextCursor: null }; })
+      .onRequest('session/close', () => { observed.push('close'); return {}; })
+      .onRequest('session/delete', () => { observed.push('delete'); return {}; });
+    const connection = createConnection(testAgent);
+    try {
+      await connection.peer.listSessions({ cwd: '/tmp' });
+      await connection.peer.closeSession({ sessionId: 'session-1' });
+      await connection.peer.deleteSession({ sessionId: 'session-1' });
+      expect(observed).toEqual(['list', 'close', 'delete']);
+    } finally {
+      connection.close();
+      await connection.closed;
+    }
+  });
+
   it('cancels an outgoing extension request and rejects promptly when its signal aborts', async () => {
     let observedCancellation = false;
     let resolveStarted: (() => void) | null = null;

@@ -8,6 +8,7 @@ import {
 } from '@/runtime/resolveRuntimeEntrypointArgv';
 import { isEmbeddedBunBundlePath } from '@/runtime/js/isEmbeddedBunBundlePath';
 import { logger } from '@/ui/logger';
+import { isBun } from '@/utils/runtime';
 import { createNodePtyRelayProvider } from './nodePtyRelayProvider';
 import { createPythonPtyRelayProvider } from './pythonPtyRelayProvider';
 
@@ -325,7 +326,12 @@ export function createNodePtyProvider(params?: Readonly<{
   };
 
   const nodePty = tryResolveModule('node-pty');
-  const homebridgePty = tryResolveModule('@homebridge/node-pty-prebuilt-multiarch');
+  // Homebridge's POSIX backend writes through tty.ReadStream, which is not
+  // writable in Bun. Let the existing external relay handle native failures
+  // instead of returning a terminal whose first input write will fail.
+  const homebridgePty = platform !== 'win32' && isBun()
+    ? null
+    : tryResolveModule('@homebridge/node-pty-prebuilt-multiarch');
   const nativeCandidates = [nodePty, homebridgePty];
   const preferred = nativeCandidates.find((candidate) => candidate !== null) ?? null;
   const fallback = nativeCandidates.find((candidate) => candidate !== null && candidate !== preferred) ?? null;

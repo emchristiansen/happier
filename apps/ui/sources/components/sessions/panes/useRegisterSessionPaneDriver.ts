@@ -4,6 +4,7 @@ import type { PaneDriver } from '@/components/appShell/panes/types';
 import { SessionRightPanel } from './SessionRightPanel';
 import { SessionBottomPanel } from './bottom/SessionBottomPanel';
 import { SessionDetailsPanel } from './SessionDetailsPanel';
+import { SessionActionRail } from './SessionActionRail';
 import { resolveSessionPaneScopeId } from './sessionPaneScopeId';
 
 type SessionPaneScopedProps = Readonly<{ sessionId: string; scopeId: string }>;
@@ -51,6 +52,7 @@ export function useRegisterSessionPaneDriver(sessionId: string): string {
         if (!registerDriver) return;
         const driver: PaneDriver = {
             scopeId,
+            renderActionRail: () => React.createElement(SessionActionRail, { sessionId, scopeId }),
             renderRightPane: () => React.createElement(SessionRightPanel, { sessionId, scopeId }),
             renderDetailsPane: () => React.createElement(SessionDetailsPanel, { sessionId, scopeId }),
             renderBottomPane: () => React.createElement(SessionBottomPanel, { sessionId, scopeId }),

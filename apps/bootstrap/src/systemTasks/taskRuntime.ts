@@ -1,12 +1,30 @@
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { runCommandCapture as runProcessCommandCapture } from '@happier-dev/cli-common/process';
 
 export interface CommandExecutionResult {
   status: number;
+  signal?: NodeJS.Signals;
   stdout: string;
   stderr: string;
 }
+
+export class CommandTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(command: string, timeoutMs: number) {
+    super(`Command timed out after ${Math.round(timeoutMs / 1000)}s: ${command}`);
+    this.name = 'CommandTimeoutError';
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
+ * The ring names a caller may send. `normalizeBootstrapChannel` maps everything else to `stable`,
+ * so every parser that accepts a caller-supplied channel checks it against this list first and
+ * names it in the failure — a typo'd ring otherwise silently reads or starts the wrong CLI.
+ */
+export const ACCEPTED_BOOTSTRAP_CHANNELS: readonly string[] = ['stable', 'preview', 'dev', 'publicdev'];
 
 export function normalizeBootstrapChannel(raw: unknown): Readonly<{
   commandChannel: 'stable' | 'preview' | 'dev';
@@ -22,50 +40,40 @@ export function normalizeBootstrapChannel(raw: unknown): Readonly<{
   return { commandChannel: 'stable', releaseChannel: 'stable' };
 }
 
+/**
+ * Bootstrap's contract over the process owner's `runCommandCapture`: resolves
+ * `{ status, stdout, stderr }` (a signal-terminated child reports status 1 plus its signal),
+ * rejects with `CommandTimeoutError` after `timeoutMs` (default 60 s, zero delegates the deadline), and rejects
+ * with the spawn error when the command cannot start.
+ */
 export async function runCommandCapture(params: Readonly<{
   command: string;
   args: readonly string[];
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }>): Promise<CommandExecutionResult> {
-  return await new Promise((resolve, reject) => {
-    const child = spawn(params.command, [...params.args], {
-      env: params.env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const stdoutChunks: Buffer[] = [];
-    const stderrChunks: Buffer[] = [];
-    let settled = false;
-    const timeout = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      child.kill('SIGTERM');
-      reject(new Error(`Command timed out: ${params.command}`));
-    }, Number.isFinite(params.timeoutMs) ? Math.max(1, Math.floor(params.timeoutMs as number)) : 60_000);
-
-    child.stdout.on('data', (chunk: Buffer | string) => {
-      stdoutChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    });
-    child.stderr.on('data', (chunk: Buffer | string) => {
-      stderrChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    });
-    child.on('error', (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      reject(error);
-    });
-    child.on('close', (status) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      resolve({
-        status: typeof status === 'number' ? status : 1,
-        stdout: Buffer.concat(stdoutChunks).toString('utf8'),
-        stderr: Buffer.concat(stderrChunks).toString('utf8'),
-      });
-    });
+  const timeoutMs = params.timeoutMs === 0 ? 0
+    : Number.isFinite(params.timeoutMs) ? Math.max(1, Math.floor(params.timeoutMs as number)) : 60_000;
+  // A Windows command shim (an npm `happier.cmd`) cannot be spawned directly; the process owner's
+  // invocation runs it through cmd.exe and is a no-op for everything else and on other platforms.
+  const result = await runProcessCommandCapture({
+    cmd: params.command,
+    args: params.args,
+    env: params.env,
+    timeoutMs,
+    signal: params.signal,
+    resolveCommandOnPath: false,
   });
+  if (result.kind === 'timed-out') throw new CommandTimeoutError(params.command, timeoutMs);
+  if (result.kind === 'aborted') throw result.error;
+  if (result.kind === 'spawn-failed') throw result.error;
+  return {
+    status: typeof result.status === 'number' ? result.status : 1,
+    ...(result.signal ? { signal: result.signal } : {}),
+    stdout: result.stdout,
+    stderr: result.stderr,
+  };
 }
 
 export function parseFirstJsonObject(text: string): unknown {

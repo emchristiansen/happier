@@ -956,29 +956,30 @@ export class SessionDraftRepository {
         return true;
     }
 
-    async deleteSessionDraft(params: Readonly<{ scope: SessionDraftRepositoryScope; address: SessionDraftAddressV1 }>): Promise<void> {
+    async deleteSessionDraft(params: Readonly<{ scope: SessionDraftRepositoryScope; address: SessionDraftAddressV1 }>): Promise<boolean> {
         if (this.storage.prepare) await this.storage.prepare();
         const replica = this.readReplica(params.scope, params.address);
-        if (!replica) return;
+        if (!replica) return false;
         const runtime = this.syncRuntime(params.scope);
         if (!runtime) {
-            if (this.runtime.syncEnabled) return;
+            if (this.runtime.syncEnabled) return false;
             this.deleteReplica(params.scope, params.address);
             if (this.storage.flush) await this.flushStorage(params.scope);
-            return;
+            return true;
         }
         const result = await runtime.transport.mutate({
             address: params.address,
             expectedRevision: replica.baseRevision,
             content: null,
         });
-        if (!this.isCurrentRuntime(runtime)) return;
+        if (!this.isCurrentRuntime(runtime)) return false;
         if (result.status === 'updated') {
             this.deleteReplica(params.scope, params.address);
         } else {
             await this.materializeExact(params.scope, params.address);
         }
         if (this.storage.flush) await this.flushStorage(params.scope);
+        return result.status === 'updated';
     }
 
     flushSessionDraft(params: Readonly<{ scope: SessionDraftRepositoryScope; address: SessionDraftAddressV1 }>): Promise<SessionDraftFlushResult> {
@@ -1243,6 +1244,7 @@ export class SessionDraftRepository {
                 remoteDocument = await this.openRequiredDocument(runtime, response.record);
             } catch (error) {
                 if (!this.isCurrentRuntime(runtime)) return;
+                if (isSessionDraftContextUnavailableError(error)) throw error;
                 this.writeLatestReplicaStatus(scope, address, 'error');
                 throw error;
             }

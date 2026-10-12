@@ -20,27 +20,19 @@ function resolveEnvRecord(): Record<string, string> {
 }
 
 function resolveRemoteBridgeInvocation(): { command: string; args: string[]; env?: Record<string, string> } {
-  const distEntrypoint = join(projectPath(), 'dist', 'mcp', 'bridges', 'remoteMcpStdioBridge.mjs');
-  if (existsSync(distEntrypoint)) {
+  const sourceEntrypoint = join(projectPath(), 'src', 'mcp', 'bridges', 'remoteMcpStdioBridge.ts');
+  const tsxHook = resolveTsxImportHookPath();
+  if (existsSync(sourceEntrypoint) && tsxHook) {
     return {
       command: process.execPath,
-      args: [distEntrypoint],
+      args: ['--no-warnings', '--no-deprecation', '--import', tsxHook, sourceEntrypoint],
+      env: { TSX_TSCONFIG_PATH: resolveCliTsxTsconfigPath() },
     };
   }
 
-  const sourceEntrypoint = join(projectPath(), 'src', 'mcp', 'bridges', 'remoteMcpStdioBridge.ts');
-  const tsxHook = resolveTsxImportHookPath();
-  if (!tsxHook) {
-    throw new Error('Expected tsx import hook to be resolvable when the built remote bridge entrypoint is unavailable');
-  }
-
-  return {
-    command: process.execPath,
-    args: ['--no-warnings', '--no-deprecation', '--import', tsxHook, sourceEntrypoint],
-    env: {
-      TSX_TSCONFIG_PATH: resolveCliTsxTsconfigPath(),
-    },
-  };
+  const distEntrypoint = join(projectPath(), 'dist', 'mcp', 'bridges', 'remoteMcpStdioBridge.mjs');
+  if (existsSync(distEntrypoint)) return { command: process.execPath, args: [distEntrypoint] };
+  throw new Error('Expected a source or built remote bridge entrypoint');
 }
 
 describe('MCP runtime config hardening', () => {
@@ -73,7 +65,7 @@ describe('MCP runtime config hardening', () => {
     }
   });
 
-  it('unlinks remote bridge config files only when they are tmp + prefixed', async () => {
+  it('leaves remote bridge config files under the materializer control', async () => {
     const bridgeInvocation = resolveRemoteBridgeInvocation();
 
     const safeTmp = await mkdtemp(join(tmpdir(), 'happier-mcp-remote-bridge-test-'));
@@ -95,7 +87,7 @@ describe('MCP runtime config hardening', () => {
     });
 
     expect(safeExitCode).not.toBe(0);
-    expect(existsSync(safeConfigPath)).toBe(false);
+    expect(existsSync(safeConfigPath)).toBe(true);
     await rm(safeTmp, { recursive: true, force: true });
 
     const outsideRoot = join(projectPath(), '.project', 'tmp', 'mcp-remote-bridge-tests');

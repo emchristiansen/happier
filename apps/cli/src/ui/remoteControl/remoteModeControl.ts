@@ -34,7 +34,11 @@ export function resolveRemoteModeControlSurface(params: Readonly<{
 }>): RemoteModeControlSurface {
   if (!params.stdoutIsTTY || !params.stdinIsTTY) return 'none';
   if (params.startedBy === 'daemon') {
-    return params.terminalMode === 'tmux' ? 'static' : 'none';
+    return params.terminalMode === 'tmux'
+      || params.terminalMode === 'zellij'
+      || params.terminalMode === 'herdr'
+      ? 'static'
+      : 'none';
   }
   return 'ink';
 }

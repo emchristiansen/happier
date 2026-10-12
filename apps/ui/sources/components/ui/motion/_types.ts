@@ -29,6 +29,10 @@ export type SlideTransitionFrameProps = Readonly<{
     previous?: React.ReactNode;
     /** Rendered when present; positioned at +distance at progress=0. */
     next?: React.ReactNode;
+    /** Stable content identities preserve mounted state when a layer changes role. */
+    currentKey?: React.Key;
+    previousKey?: React.Key;
+    nextKey?: React.Key;
     /**
      * Caller-driven progress in -1..1. Adapters own this signal.
      *  - progress = 0 → only `current` visible at center

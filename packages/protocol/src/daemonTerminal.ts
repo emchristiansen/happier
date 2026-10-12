@@ -23,6 +23,10 @@ export const DaemonTerminalLaunchIntentSchema = z.discriminatedUnion('kind', [
     kind: z.literal('session_attach'),
     sessionId: z.string().trim().min(1).max(512),
   }),
+  z.object({
+    kind: z.literal('happier_cli'),
+    args: z.array(z.string().min(1).max(1024)).min(1).max(64),
+  }),
 ]);
 export type DaemonTerminalLaunchIntent = z.infer<typeof DaemonTerminalLaunchIntentSchema>;
 

@@ -13,6 +13,7 @@ import type { PermissionRequestCoordinatorStore } from '@/agent/permissions/perm
 import type { Session } from '../session';
 import type { PermissionHookData, PermissionHookResponse, SessionHookData } from '../utils/startHookServer';
 import type { PermissionRpcConsumerOutcome } from '../utils/permissionRpcRouter';
+import { buildClaudePermissionHookResponse } from '../utils/buildClaudePermissionHookResponse';
 import { mapToClaudeMode } from '../utils/permissionMode';
 import { deepEqual } from '@/utils/deterministicJson';
 import type { PermissionRpcPayload } from '../utils/permissionRpc';
@@ -23,7 +24,9 @@ import { resolvePermissionIntentFromMetadataSnapshot } from '@/agent/runtime/per
 import { normalizePermissionModeToIntent } from '@/agent/runtime/permission/permissionModeCanonical';
 import { waitForSessionMetadataRetryBackoff } from '@/agent/runtime/sessionMetadataWaitRetryBackoff';
 import { isDefaultWriteLikeToolName } from '@/agent/permissions/writeLikeToolNameHeuristics';
-import { shouldSuppressProviderPermissionForHappierApproval } from '@/agent/tools/happierTools/resolveHappierActionForMcpToolName';
+import {
+    isSafeFirstPartyHappierActionToolCall,
+} from '@/agent/tools/happierTools/resolveHappierActionForMcpToolName';
 import {
     CLAUDE_LOCAL_PERMISSION_BRIDGE_REQUEST_SOURCE,
     CLAUDE_LOCAL_PERMISSION_BRIDGE_STOPPED_REASON,
@@ -239,13 +242,7 @@ export class ClaudeLocalPermissionBridge {
         const policyDecision = this.computePolicyDecision(toolName);
         if (
             !this.isInteractiveTool(toolName)
-            && policyDecision !== 'deny'
-            && shouldSuppressProviderPermissionForHappierApproval({
-                toolName,
-                input: toolInput,
-                accountSettings: this.session.accountSettings ?? null,
-                surface: 'session_agent',
-            }).suppress
+            && isSafeFirstPartyHappierActionToolCall({ toolName, input: toolInput })
         ) {
             const hookResponse = this.buildAllowHookResponse({ hookEventName, toolInput });
             this.completeRequest({
@@ -384,72 +381,26 @@ export class ClaudeLocalPermissionBridge {
         updatedInput?: Record<string, unknown>;
         updatedPermissions?: unknown;
     }): PermissionHookResponse {
-        if (params.hookEventName === 'PreToolUse') {
-            const baseUpdatedInput =
-                params.updatedInput
-                ?? (params.toolInput && typeof params.toolInput === 'object' && !Array.isArray(params.toolInput)
-                    ? params.toolInput as Record<string, unknown>
-                    : undefined);
-            return {
-                continue: true,
-                suppressOutput: true,
-                hookSpecificOutput: {
-                    hookEventName: 'PreToolUse',
-                    permissionDecision: 'allow',
-                    ...(baseUpdatedInput ? { updatedInput: baseUpdatedInput } : {}),
-                },
-            };
-        }
-
-        return {
-            continue: true,
-            suppressOutput: true,
-            hookSpecificOutput: {
-                hookEventName: 'PermissionRequest',
-                decision: {
-                    behavior: 'allow',
-                    ...(params.updatedInput ? { updatedInput: params.updatedInput } : {}),
-                    ...(typeof params.updatedPermissions !== 'undefined' ? { updatedPermissions: params.updatedPermissions } : {}),
-                },
+        return buildClaudePermissionHookResponse({
+            hookEventName: params.hookEventName,
+            toolInput: params.toolInput,
+            decision: {
+                behavior: 'allow',
+                updatedInput: params.updatedInput,
+                updatedPermissions: params.updatedPermissions,
             },
-        };
+        });
     }
 
     private buildDenyHookResponse(params: {
         hookEventName: ClaudePermissionHookEventName;
         reason?: string;
     }): PermissionHookResponse {
-        if (params.hookEventName === 'PreToolUse') {
-            return {
-                continue: true,
-                suppressOutput: true,
-                hookSpecificOutput: {
-                    hookEventName: 'PreToolUse',
-                    permissionDecision: 'deny',
-                    ...(typeof params.reason === 'string' && params.reason.length > 0
-                        ? { permissionDecisionReason: params.reason }
-                        : {}),
-                },
-                ...(typeof params.reason === 'string' && params.reason.length > 0
-                    ? { systemMessage: params.reason }
-                    : {}),
-            };
-        }
-
-        return {
-            continue: true,
-            suppressOutput: true,
-            hookSpecificOutput: {
-                hookEventName: 'PermissionRequest',
-                decision: {
-                    behavior: 'deny',
-                    ...(typeof params.reason === 'string' && params.reason.length > 0 ? { message: params.reason } : {}),
-                },
-            },
-            ...(typeof params.reason === 'string' && params.reason.length > 0
-                ? { systemMessage: params.reason }
-                : {}),
-        };
+        return buildClaudePermissionHookResponse({
+            hookEventName: params.hookEventName,
+            toolInput: undefined,
+            decision: { behavior: 'deny', message: params.reason },
+        });
     }
 
     private computePolicyDecision(toolName: string): 'prompt' | 'allow' | 'deny' {

@@ -1,5 +1,6 @@
 import type { AcpCatalogSettingsV1, BackendTargetRefV1 } from '@happier-dev/protocol';
 
+import { resolveBuiltInAgentTitle } from '@/agents/backendCatalog/getResolvedBackendCatalogEntries';
 import { normalizeAcpCatalogSettingsV1 } from '@/sync/domains/acpCatalog/normalizeAcpCatalogSettingsV1';
 import { storage } from '@/sync/domains/state/storage';
 
@@ -15,7 +16,9 @@ export function resolveExecutionRunBackendLabel(
     catalog?: AcpCatalogSettingsV1 | null,
 ): string | null {
     if (!backendTarget) return null;
-    if (backendTarget.kind === 'builtInAgent') return backendTarget.agentId;
+    if (backendTarget.kind === 'builtInAgent') {
+        return resolveBuiltInAgentTitle(backendTarget.agentId) ?? backendTarget.agentId;
+    }
     return resolveConfiguredBackendLabel(
         backendTarget,
         catalog

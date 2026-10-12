@@ -162,6 +162,7 @@ function isSwitchableGroupIssue(kind: ConnectedServiceRecoveryPolicyIssue['kind'
     || kind === 'auth_expired'
     || kind === 'refresh_failed'
     || kind === 'permission_denied'
+    || kind === 'plan'
     || kind === 'unknown';
 }
 

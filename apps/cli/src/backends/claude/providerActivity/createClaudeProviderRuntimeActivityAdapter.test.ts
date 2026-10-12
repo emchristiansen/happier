@@ -22,6 +22,88 @@ function harness() {
 }
 
 describe('createClaudeProviderRuntimeActivityAdapter', () => {
+    it('publishes prelaunch inventory without installing the provider observer', async () => {
+        const { adapter, reports } = harness();
+
+        await adapter.publishBeforeRuntimeStart('provider-not-started');
+        expect(reports).toEqual([{ state: 'idle', activeCount: 0 }]);
+        await adapter.observeActivity({
+            activity: { type: 'started', sessionId: 's1', taskId: 'installation-task' },
+            evidence: 'live',
+        });
+        expect(reports).toEqual([{ state: 'idle', activeCount: 0 }]);
+        await adapter.activateObservation('observer-installed');
+        expect(reports.at(-1)).toEqual({ state: 'active', activeCount: 1 });
+    });
+
+    it('preserves observed tasks when publishing prelaunch inventory', async () => {
+        const { adapter, reports } = harness();
+        await adapter.observeActivity({
+            activity: { type: 'started', sessionId: 's1', taskId: 'existing-task' },
+            evidence: 'live',
+        });
+        await adapter.publishBeforeRuntimeStart('provider-not-started');
+        expect(reports).toEqual([{ state: 'active', activeCount: 1 }]);
+    });
+
+    it('does not clear observation loss before an observer was installed', async () => {
+        const { adapter, reports, markUnknown } = harness();
+        await adapter.handleRuntimeLoss('observer-lost');
+        const reportsBefore = [...reports];
+        const unknownOffersBefore = markUnknown.mock.calls.length;
+        await adapter.publishBeforeRuntimeStart('replacement-provider-not-started');
+        expect(reports).toEqual(reportsBefore);
+        expect(markUnknown.mock.calls).toHaveLength(unknownOffersBefore);
+    });
+
+    it('publishes idle before restarting an owned provider after the stopped local observer lost activity', async () => {
+        const { adapter, reports, markUnknown } = harness();
+        await adapter.activateObservation('local-observer-installed');
+        await adapter.handleRuntimeLoss('claude_process_exit');
+        expect(markUnknown).toHaveBeenCalledOnce();
+        expect(reports).toHaveLength(1);
+
+        await adapter.publishBeforeRuntimeStart('remote-provider-not-started');
+        expect(reports).toEqual([
+            { state: 'idle', activeCount: 0 },
+            { state: 'idle', activeCount: 0 },
+        ]);
+        await adapter.activateObservation('remote-observer-installed');
+        await adapter.observeActivity({
+            activity: { type: 'started', sessionId: 's1', taskId: 'remote-task' }, evidence: 'live',
+        });
+        expect(reports.at(-1)).toEqual({ state: 'active', activeCount: 1 });
+    });
+
+    it('does not claim prelaunch idle when the stopped provider has unresolved task evidence', async () => {
+        const { adapter, reports, markUnknown } = harness();
+        await adapter.activateObservation('local-observer-installed');
+        await adapter.observeActivity({
+            activity: { type: 'started', sessionId: 's1', taskId: 'existing-task' }, evidence: 'live',
+        });
+        await adapter.handleRuntimeLoss('claude_process_exit');
+        const reportsBefore = [...reports];
+
+        await adapter.publishBeforeRuntimeStart('remote-provider-not-started');
+        expect(reports).toEqual(reportsBefore);
+        expect(markUnknown).toHaveBeenCalledOnce();
+    });
+
+    it('does not publish prelaunch inventory through an obsolete runtime binding', async () => {
+        const reports: SessionRuntimeActivityContribution[] = [];
+        const adapter = createClaudeProviderRuntimeActivityAdapter({
+            providerActivityLedger: createClaudeProviderActivityLedger(),
+            contributionHandle: {
+                report: async (snapshot) => { reports.push(snapshot); },
+                markUnknown: async () => {},
+                dispose: async () => {},
+            },
+            isCurrentRuntime: () => false,
+        });
+        await adapter.publishBeforeRuntimeStart('obsolete-provider');
+        expect(reports).toEqual([]);
+    });
+
     it('fences the prior production binding without publishing before its observer is installed', async () => {
         const contributionHandle = {
             report: vi.fn(async () => {}),

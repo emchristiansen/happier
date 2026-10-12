@@ -212,5 +212,6 @@ export function hasActivityAttention(
         || flags.hasPendingPermissionRequests
         || flags.hasPendingUserActionRequests
         || flags.hasBlockedPendingDelivery
+        || flags.hasQueuedUserInput
     );
 }

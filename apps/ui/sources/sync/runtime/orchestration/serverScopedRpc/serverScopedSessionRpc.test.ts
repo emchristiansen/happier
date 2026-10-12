@@ -106,6 +106,91 @@ describe('sessionRpcWithServerScope', () => {
     expect(createEphemeralSocketSpy).not.toHaveBeenCalled();
   });
 
+  it('preserves an explicit unbounded RPC lifetime for the active server', async () => {
+    getActiveServerSnapshotSpy.mockReturnValue({
+      serverId: 'server-a',
+      serverUrl: 'https://server-a.example.test',
+      kind: 'custom',
+      generation: 1,
+    });
+    sessionRpcSpy.mockResolvedValue({ ok: true });
+
+    const { sessionRpcWithServerScope } = await import('./serverScopedSessionRpc');
+    await expect(sessionRpcWithServerScope({
+      sessionId: 'session-1',
+      method: 'method-watch',
+      payload: { value: 1 },
+      timeoutMs: null,
+    })).resolves.toEqual({ ok: true });
+
+    expect(sessionRpcSpy).toHaveBeenCalledWith(
+      'session-1',
+      'method-watch',
+      { value: 1 },
+      { timeoutMs: null },
+    );
+  });
+
+  it('keeps scoped connection setup bounded while preserving an unbounded RPC lifetime', async () => {
+    getActiveServerSnapshotSpy.mockReturnValue({
+      serverId: 'server-a',
+      serverUrl: 'https://server-a.example.test',
+      kind: 'custom',
+      generation: 1,
+    });
+    listServerProfilesSpy.mockReturnValue([
+      { id: 'server-b', serverUrl: 'https://server-b.example.test', name: 'Server B' },
+    ]);
+    getCredentialsSpy.mockResolvedValue({ token: tokenForSub('account-b'), secret: 'secret-b' });
+    createEncryptionSpy.mockResolvedValue({
+      decryptEncryptionKey: vi.fn(async () => null),
+      initializeSessions: vi.fn(async () => {}),
+      getSessionEncryption: vi.fn(() => null),
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(createServerFetchWithReachabilityProbe(async () => ({
+        ok: true,
+        json: async () => ({
+          session: {
+            ...sessionListByIdFixture,
+            encryptionMode: 'plain',
+            dataEncryptionKey: null,
+          },
+        }),
+      }))),
+    );
+
+    const emitWithAck = vi.fn(async () => ({ ok: true, result: { watched: true } }));
+    const timeout = vi.fn(() => ({ emitWithAck }));
+    const fakeSocket = {
+      timeout,
+      emitWithAck,
+      emit: vi.fn(),
+      disconnect: vi.fn(),
+    };
+    createEphemeralSocketSpy.mockResolvedValueOnce(fakeSocket);
+
+    const { sessionRpcWithServerScope } = await import('./serverScopedSessionRpc');
+    await expect(sessionRpcWithServerScope({
+      sessionId: 'session-1',
+      serverId: 'server-b',
+      method: 'method-watch',
+      payload: { value: 1 },
+      timeoutMs: null,
+    })).resolves.toEqual({ watched: true });
+
+    expect(createEphemeralSocketSpy).toHaveBeenCalledWith(expect.objectContaining({
+      timeoutMs: 30_000,
+    }));
+    expect(timeout).not.toHaveBeenCalled();
+    expect(emitWithAck).toHaveBeenCalledWith(SOCKET_RPC_EVENTS.CALL, {
+      method: 'session-1:method-watch',
+      params: { value: 1 },
+    });
+    expect(fakeSocket.disconnect).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps exact issuance replayable when the active session RPC fails before socket emission', async () => {
     getActiveServerSnapshotSpy.mockReturnValue({
       serverId: 'server-a',

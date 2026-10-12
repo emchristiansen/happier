@@ -3,11 +3,18 @@ import * as React from 'react';
 import type { ActionOperationSnapshotV1, ActionOperationStateV1 } from '@happier-dev/protocol';
 
 import {
+    createActionOperationActivitySummarySelector,
+    createInboxActionOperationEntriesSelector,
+    createInboxActionOperationSummarySelector,
     createActionOperationSelector,
+    type ActionOperationActivitySummary,
+    type InboxActionOperationEntry,
+    type InboxActionOperationSummary,
     selectActionOperationObservation,
     selectActionOperationObservationForOperation,
     selectActionOperationsNeedAttention,
 } from './actionOperationSelectors';
+import { actionOperationReentry } from './actionOperationReentry';
 import {
     actionOperationStore,
     type ActionOperationObservation,
@@ -91,6 +98,7 @@ export function createUnavailableActionOperationIdsSelector(accountId: string) {
 
 export function useActionOperations(scope: ActionOperationScope & Readonly<{
     sessionId?: string;
+    actionId?: string;
     states?: readonly ActionOperationStateV1[];
 }>): readonly ActionOperationSnapshotV1[] {
     const statesKey = scope.states?.join('\u0001') ?? '';
@@ -98,6 +106,7 @@ export function useActionOperations(scope: ActionOperationScope & Readonly<{
         scope.accountId,
         scope.machineId,
         scope.sessionId,
+        scope.actionId,
         statesKey,
     ]);
     return React.useSyncExternalStore(
@@ -124,11 +133,71 @@ export function useAllActionOperations(accountId: string): readonly ActionOperat
     );
 }
 
+export function useInboxActionOperationEntries(accountId: string): readonly InboxActionOperationEntry[] {
+    const selector = React.useMemo(
+        () => createInboxActionOperationEntriesSelector(
+            accountId,
+            actionOperationReentry.resolvePresentation,
+        ),
+        [accountId],
+    );
+    React.useSyncExternalStore(
+        actionOperationReentry.subscribe,
+        actionOperationReentry.getRevision,
+        actionOperationReentry.getRevision,
+    );
+    return React.useSyncExternalStore(
+        actionOperationStore.subscribe,
+        () => selector(actionOperationStore.getState()),
+        () => selector(actionOperationStore.getState()),
+    );
+}
+
+export function useInboxActionOperationSummary(accountId: string): InboxActionOperationSummary {
+    const selector = React.useMemo(
+        () => createInboxActionOperationSummarySelector(
+            accountId,
+            actionOperationReentry.resolvePresentation,
+        ),
+        [accountId],
+    );
+    React.useSyncExternalStore(
+        actionOperationReentry.subscribe,
+        actionOperationReentry.getRevision,
+        actionOperationReentry.getRevision,
+    );
+    return React.useSyncExternalStore(
+        actionOperationStore.subscribe,
+        () => selector(actionOperationStore.getState()),
+        () => selector(actionOperationStore.getState()),
+    );
+}
+
 export function useActionOperationsNeedAttention(accountId: string): boolean {
     return React.useSyncExternalStore(
         actionOperationStore.subscribe,
         () => selectActionOperationsNeedAttention(actionOperationStore.getState(), accountId),
         () => selectActionOperationsNeedAttention(actionOperationStore.getState(), accountId),
+    );
+}
+
+export function useActionOperationActivitySummary(accountId: string): ActionOperationActivitySummary {
+    const selector = React.useMemo(
+        () => createActionOperationActivitySummarySelector(
+            accountId,
+            actionOperationReentry.resolvePresentation,
+        ),
+        [accountId],
+    );
+    React.useSyncExternalStore(
+        actionOperationReentry.subscribe,
+        actionOperationReentry.getRevision,
+        actionOperationReentry.getRevision,
+    );
+    return React.useSyncExternalStore(
+        actionOperationStore.subscribe,
+        () => selector(actionOperationStore.getState()),
+        () => selector(actionOperationStore.getState()),
     );
 }
 

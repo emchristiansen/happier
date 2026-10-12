@@ -814,10 +814,10 @@ describe('sessionUsageLimitRecoveryPresentation', () => {
         expect(presentation?.banner.primaryAction.kind).toBe('switch_account_now');
     });
 
-    it('hides recovery once the provider produces genuine activity after the issue (proven recovery)', () => {
+    it('keeps the current failed recovery visible when the provider emits its terminal limit notice', () => {
         const issue = usageIssue('claude', null);
 
-        expect(buildSessionUsageLimitRecoveryPresentation({
+        const presentation = buildSessionUsageLimitRecoveryPresentation({
             featureEnabled: true,
             latestTurnStatus: 'failed',
             issue,
@@ -827,9 +827,9 @@ describe('sessionUsageLimitRecoveryPresentation', () => {
             rememberedMode: 'ask',
             translate: (key) => key,
             formatTime: (value) => String(value),
-        })).toBeNull();
+        });
 
-        expect(buildSessionUsageLimitStatusBadgePresentation({
+        const badge = buildSessionUsageLimitStatusBadgePresentation({
             featureEnabled: true,
             latestTurnStatus: 'failed',
             issue,
@@ -838,7 +838,10 @@ describe('sessionUsageLimitRecoveryPresentation', () => {
             hasActivityAfterRuntimeIssue: true,
             translate: (key) => key,
             formatTime: (value) => String(value),
-        })).toBeNull();
+        });
+
+        expect(presentation?.banner.testID).toBe('session-usageLimit-recovery');
+        expect(badge?.key).toBe('session-usage-limit-recovery');
     });
 
     it('hides recovery once the durable recovery intent is cancelled, even while working', () => {
@@ -879,12 +882,12 @@ describe('sessionUsageLimitRecoveryPresentation', () => {
         })).toBeNull();
     });
 
-    it('does not render a stale usage-limit issue after later meaningful session activity', () => {
+    it('hides recovery after a new in-progress turn produces meaningful provider activity', () => {
         const issue = usageIssue('claude', null);
 
         expect(buildSessionUsageLimitRecoveryPresentation({
             featureEnabled: true,
-            latestTurnStatus: 'failed',
+            latestTurnStatus: 'in_progress',
             issue,
             recovery: null,
             hasActivityAfterRuntimeIssue: true,
@@ -895,7 +898,7 @@ describe('sessionUsageLimitRecoveryPresentation', () => {
 
         expect(buildSessionUsageLimitStatusBadgePresentation({
             featureEnabled: true,
-            latestTurnStatus: 'failed',
+            latestTurnStatus: 'in_progress',
             issue,
             recovery: null,
             hasActivityAfterRuntimeIssue: true,

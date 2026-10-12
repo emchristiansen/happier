@@ -50,6 +50,11 @@ export const desktopSidebarChromeStyles = StyleSheet.create((theme) => ({
         position: 'relative',
         zIndex: 1,
     },
+    inlineUtilityRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 4,
+    },
     windowControlsHost: {
         flexShrink: 0,
         minWidth: DESKTOP_WINDOW_CONTROLS_SLOT_MIN_WIDTH_PX,

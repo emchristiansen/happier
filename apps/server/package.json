@@ -1,6 +1,6 @@
 {
   "name": "@happier-dev/server",
-  "version": "0.2.12",
+  "version": "0.2.16",
   "repository": "https://github.com/happier-dev/happier.git",
   "author": "Leeroy Brun <leeroy.brun@gmail.com>",
   "license": "MIT",
@@ -9,7 +9,7 @@
   "scripts": {
     "tsc": "node ../../scripts/workspaces/runTypeScriptCli.mjs",
     "build:shared": "node ./scripts/buildSharedDeps.mjs",
-    "prebuild": "yarn -s build:shared",
+    "prebuild": "yarn -s postinstall:real",
     "pretest": "yarn -s build:shared && yarn -s schema:sync:check --quiet",
     "build": "node ../../scripts/workspaces/runTypeScriptCli.mjs --noEmit",
     "typecheck:runtime": "yarn -s build:shared && node ../../scripts/workspaces/runTypeScriptCli.mjs -p tsconfig.runtime.json --noEmit",

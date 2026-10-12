@@ -959,11 +959,96 @@ test('extractArchivePayloadToDirectory restricts extraction to declared entry ro
   }
 });
 
+test('extractArchivePayloadToDirectory rejects unsafe tar paths and prefix conflicts before writing output', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'release-runtime-extract-tar-paths-'));
+  try {
+    const createPaxRecord = (key, value) => {
+      const body = `${key}=${value}\n`;
+      let declaredByteLength = Buffer.byteLength(body) + 3;
+      while (true) {
+        const record = `${declaredByteLength} ${body}`;
+        const actualByteLength = Buffer.byteLength(record);
+        if (actualByteLength === declaredByteLength) return record;
+        declaredByteLength = actualByteLength;
+      }
+    };
+    const cases = [
+      {
+        label: 'absolute',
+        entries: [{ name: '/outside.txt', contents: 'escape' }],
+        pattern: /absolute|empty path/iu,
+      },
+      {
+        label: 'traversal',
+        entries: [{ name: 'package/../outside.txt', contents: 'escape' }],
+        pattern: /non-portable path/iu,
+      },
+      {
+        label: 'pax-traversal',
+        entries: [
+          {
+            name: 'PaxHeader',
+            type: 'x',
+            contents: createPaxRecord('path', '../outside-pax.txt'),
+          },
+          { name: 'safe.txt', contents: 'escape' },
+        ],
+        pattern: /non-portable path/iu,
+      },
+      {
+        label: 'file-prefix',
+        entries: [
+          { name: 'package/owner', contents: 'file' },
+          { name: 'package/owner/child', contents: 'child' },
+        ],
+        pattern: /prefix|file.*directory|directory.*file/iu,
+      },
+      {
+        label: 'case-fold-collision',
+        entries: [
+          { name: 'package/Dist/tool', contents: 'first' },
+          { name: 'package/dist/other', contents: 'second' },
+        ],
+        pattern: /collision|duplicate/iu,
+      },
+      {
+        label: 'windows-invalid',
+        entries: [{ name: 'package/payload:stream', contents: 'ads' }],
+        pattern: /windows-invalid/iu,
+      },
+    ];
+
+    for (const { label, entries, pattern } of cases) {
+      const archivePath = join(rootDir, `${label}.tar.gz`);
+      const extractDir = join(rootDir, `extract-${label}`);
+      await writeFile(archivePath, createTarGzip(entries));
+      await assert.rejects(
+        extractArchivePayloadToDirectory({
+          archiveName: `${label}.tar.gz`,
+          archivePath,
+          extractDir,
+        }),
+        pattern,
+      );
+      await assert.rejects(stat(extractDir), { code: 'ENOENT' });
+    }
+  } finally {
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test('extractArchivePayloadToDirectory honors cancellation and timeout before publishing output', async () => {
   const rootDir = await mkdtemp(join(tmpdir(), 'release-runtime-extract-abort-'));
   try {
     const archivePath = join(rootDir, 'payload.tar.gz');
+    const inFlightArchivePath = join(rootDir, 'in-flight.tar.gz');
     await writeFile(archivePath, createTarGzip([{ name: 'tool', contents: 'payload' }]));
+    await writeFile(inFlightArchivePath, createTarGzip(
+      Array.from({ length: 4000 }, (_, index) => ({
+        name: `payload/${index.toString().padStart(4, '0')}.txt`,
+        contents: 'payload',
+      })),
+    ));
     const controller = new AbortController();
     controller.abort(new Error('caller stopped extraction'));
 
@@ -985,8 +1070,18 @@ test('extractArchivePayloadToDirectory honors cancellation and timeout before pu
       }),
       /timed out/iu,
     );
+    const inFlightController = new AbortController();
+    const inFlightExtraction = extractArchivePayloadToDirectory({
+      archiveName: 'in-flight.tar.gz',
+      archivePath: inFlightArchivePath,
+      extractDir: join(rootDir, 'extract-in-flight'),
+      signal: inFlightController.signal,
+    });
+    setImmediate(() => inFlightController.abort(new Error('caller stopped extraction')));
+    await assert.rejects(inFlightExtraction, /aborted/iu);
     await assert.rejects(stat(join(rootDir, 'extract-aborted')), { code: 'ENOENT' });
     await assert.rejects(stat(join(rootDir, 'extract-timeout')), { code: 'ENOENT' });
+    await assert.rejects(stat(join(rootDir, 'extract-in-flight')), { code: 'ENOENT' });
   } finally {
     await rm(rootDir, { recursive: true, force: true });
   }
@@ -1072,6 +1167,8 @@ test('extractArchivePayloadToDirectory rejects standalone tar symlinks and hardl
       }),
       /link/iu,
     );
+    assert.deepEqual((await readdir(rootDir)).filter((name) => name.includes('.extract-')), []);
+    await assert.rejects(stat(join(rootDir, 'extract-symlink')), { code: 'ENOENT' });
 
     await link(join(payloadDir, 'target'), join(payloadDir, 'hardlink'));
     const hardlinkArchivePath = join(rootDir, 'hardlink.tar.gz');
@@ -1087,6 +1184,8 @@ test('extractArchivePayloadToDirectory rejects standalone tar symlinks and hardl
       }),
       /link/iu,
     );
+    assert.deepEqual((await readdir(rootDir)).filter((name) => name.includes('.extract-')), []);
+    await assert.rejects(stat(join(rootDir, 'extract-hardlink')), { code: 'ENOENT' });
   } finally {
     await rm(rootDir, { recursive: true, force: true });
   }

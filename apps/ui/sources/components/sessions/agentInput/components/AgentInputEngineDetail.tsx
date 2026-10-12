@@ -154,7 +154,7 @@ export function AgentInputEngineDetail(props: AgentInputEngineDetailProps) {
             <OptionPickerOverlay
               title={t("agentInput.model.title")}
               summary={props.modelSummary}
-              notes={props.modelNotes ?? []}
+              notes={props.modelProbe?.error ? [...(props.modelNotes ?? []), t("errors.unknownError")] : props.modelNotes ?? []}
               options={resolvedModelOptions}
               selectedValue={props.selectedModelId ?? "default"}
               emptyText={

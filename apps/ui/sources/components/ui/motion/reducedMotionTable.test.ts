@@ -23,7 +23,7 @@ describe('reduced-motion mapping table', () => {
             expect(resolveMotionPresentation(animation, false)).toBe('animate');
             expect(typeof resolveMotionPresentation(animation, true)).toBe('string');
         }
-        expect(MOTION_ANIMATIONS).toHaveLength(9);
+        expect(MOTION_ANIMATIONS).toHaveLength(10);
     });
 
     it('derives every spring-backed row from the spring table instead of restating it', () => {
@@ -65,6 +65,9 @@ describe('reduced-motion mapping table', () => {
             // Slowed, never stopped: this is the only remaining evidence of liveness once the
             // spinner has been substituted out.
             elapsedTick: 'slowCadence',
+            // The travelling highlight inside the setup mark is replaced by a static tint on the
+            // ring track: the surface still says "working" without anything moving.
+            setupActivity: 'substitute',
         });
     });
 

@@ -60,7 +60,7 @@ import {
 } from '@/components/sessions/actions/sessionActionIds';
 import { buildSessionMetadataStabilitySignature } from '@/sync/domains/session/metadata/sessionMetadataStability';
 import { getSessionName } from '@/utils/sessions/sessionUtils';
-import { SESSION_HEADER_ICON_SIZE_PX } from '@/components/sessions/actions/sessionHeaderIconMetrics';
+import { resolveSessionHeaderActionTargetPx, SESSION_HEADER_ICON_SIZE_PX } from '@/components/sessions/actions/sessionHeaderIconMetrics';
 import { Icon } from '@/components/ui/icons/Icon';
 import { emitSessionResumeRequest } from '@/components/sessions/model/sessionResumeRequests';
 
@@ -540,13 +540,12 @@ function SessionHeaderActionMenuInner(props: SessionHeaderActionMenuProps) {
       trigger={({ toggle }) => (
             <Pressable
               onPress={toggle}
-              hitSlop={15}
               testID="session-header-action-menu-trigger"
               accessibilityRole="button"
               accessibilityLabel={t('session.actionMenu.openA11y')}
               style={({ pressed }) => ({
-                width: 44,
-                height: 44,
+                width: resolveSessionHeaderActionTargetPx(),
+                height: resolveSessionHeaderActionTargetPx(),
                 alignItems: 'center',
             justifyContent: 'center',
             opacity: pressed ? 0.7 : 1,

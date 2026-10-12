@@ -1,5 +1,6 @@
 import {
   ConnectedServiceUsageSourceV1Schema,
+  isConnectedServiceQuotaObservationFresh,
   ProviderAccountUsageRecordIdSchema,
   ProviderAccountUsageSnapshotV1Schema,
   openSealedProviderAccountUsageSnapshot as decryptProviderAccountUsageSnapshot,
@@ -224,8 +225,11 @@ export async function hydrateProviderAccountUsageStoreFromCurrentSources(input: 
     hydratedRecordIds.add(parsedRecordId.data);
     const fetchedAtMs = resolved?.fetchedAt ?? hydrated.snapshot.fetchedAtMs;
     const staleAfterMs = resolved?.staleAfterMs ?? hydrated.snapshot.staleAfterMs;
-    const staleAtMs = fetchedAtMs + staleAfterMs;
-    const isFresh = nowMs < staleAtMs;
+    const isFresh = isConnectedServiceQuotaObservationFresh({
+      observedAtMs: fetchedAtMs,
+      nowMs,
+      maxAgeMs: staleAfterMs,
+    });
     dispositions.push({
       source,
       status: isFresh ? 'hydrated_fresh' : 'hydrated_stale',

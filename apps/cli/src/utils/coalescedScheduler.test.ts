@@ -11,6 +11,41 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => voi
 }
 
 describe('createCoalescedScheduler', () => {
+  it('coalesces a synchronous trigger from the active drain without starting a competing drain', async () => {
+    let drains = 0;
+    const gate = deferred();
+    const scheduler = createCoalescedScheduler({
+      drain: async () => {
+        drains += 1;
+        if (drains === 1) {
+          scheduler.trigger();
+          await gate.promise;
+        }
+      },
+    });
+    const flush = scheduler.flush();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const drainsBeforeRelease = drains;
+    gate.resolve();
+    await flush;
+    expect(drainsBeforeRelease).toBe(1);
+    expect(drains).toBe(2);
+  });
+
+  it('rejects a flush barrier when its drain fails and remains usable for a later flush', async () => {
+    const failure = new Error('metadata write failed');
+    const errors: unknown[] = [];
+    let available = false;
+    const scheduler = createCoalescedScheduler({
+      drain: async () => { if (!available) throw failure; },
+      onError: (error) => { errors.push(error); },
+    });
+    await expect(scheduler.flush()).rejects.toBe(failure);
+    expect(errors).toEqual([failure]);
+    available = true;
+    await expect(scheduler.flush()).resolves.toBeUndefined();
+  });
+
   it('runs a single drain per trigger when idle', async () => {
     let drains = 0;
     const scheduler = createCoalescedScheduler({

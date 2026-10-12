@@ -6,7 +6,10 @@ import { readTerminalAttachmentInfo } from '@/terminal/attachment/terminalAttach
 import type { SessionRunnerEntrypointIdentity } from '../sessionRunnerRuntime/types';
 import { resolveSessionRunnerRuntimeState } from '../sessionRunnerRuntime/resolveRuntimeState';
 import { resolveSessionRunnerEntrypointIdentityFromProcessCommand } from '../sessionRunnerRuntime/resolveRunnerEntrypointIdentity';
-import { resolveSessionRunnerRestartEligibility } from '../sessionRunnerRuntime/resolveRestartEligibility';
+import {
+  resolveSessionRunnerRestartEligibility,
+  shouldRefreshSessionRunnerResumeIdentity,
+} from '../sessionRunnerRuntime/resolveRestartEligibility';
 import type {
   PlannedRunnerRestartMode,
   PlannedRunnerRestartNotSignaledReason,
@@ -29,6 +32,10 @@ type RequestRestart = (input: Readonly<{
 
 type RestartSessionRunnerEndpointSummary = NonNullable<RestartSessionRunnerResult['previous']>;
 type ResolveActivityDisabledReason = (sessionId: string) => SessionRunnerRestartDisabledReason | null;
+type RefreshTrackedSessionRuntimeSnapshot = (input: Readonly<{
+  sessionId: string;
+  tracked: TrackedSession;
+}>) => Promise<void>;
 
 export type RestartSessionRunnerCompletion =
   | Readonly<{ ok: true; next?: RestartSessionRunnerEndpointSummary }>
@@ -159,11 +166,20 @@ export async function restartSessionRunnerOnCurrentRuntime(input: Readonly<{
   currentIdentity: SessionRunnerEntrypointIdentity;
   requestRestart: RequestRestart;
   resolveActivityDisabledReason?: ResolveActivityDisabledReason;
+  refreshTrackedSessionRuntimeSnapshot?: RefreshTrackedSessionRuntimeSnapshot;
   readTerminalAttachmentInfo?: typeof readTerminalAttachmentInfo;
 }>): Promise<RestartSessionRunnerResult> {
   const sessionId = normalizeString(input.request.sessionId);
   const tracked = input.tracked ?? null;
-  const contextFailure = validateRestartContext({ request: input.request, tracked });
+  let contextFailure = validateRestartContext({ request: input.request, tracked });
+  if (
+    contextFailure?.reasonCode === 'missing_resume_identity'
+    && shouldRefreshSessionRunnerResumeIdentity(tracked)
+    && input.refreshTrackedSessionRuntimeSnapshot
+  ) {
+    await input.refreshTrackedSessionRuntimeSnapshot({ sessionId, tracked });
+    contextFailure = validateRestartContext({ request: input.request, tracked });
+  }
   if (contextFailure) return contextFailure;
   if (!tracked) return skipped('not_found', sessionId);
 
@@ -246,6 +262,7 @@ export async function restartAllSessionRunnersOnCurrentRuntime(input: Readonly<{
   trackedSessions: ReadonlyArray<TrackedSession>;
   requestRestart: RequestRestart;
   resolveActivityDisabledReason?: ResolveActivityDisabledReason;
+  refreshTrackedSessionRuntimeSnapshot?: RefreshTrackedSessionRuntimeSnapshot;
 }>): Promise<RestartAllSessionRunnersResult> {
   const results: RestartSessionRunnerResult[] = [];
   for (const tracked of input.trackedSessions) {
@@ -262,6 +279,9 @@ export async function restartAllSessionRunnersOnCurrentRuntime(input: Readonly<{
       currentIdentity: input.currentIdentity,
       requestRestart: input.requestRestart,
       ...(input.resolveActivityDisabledReason ? { resolveActivityDisabledReason: input.resolveActivityDisabledReason } : {}),
+      ...(input.refreshTrackedSessionRuntimeSnapshot
+        ? { refreshTrackedSessionRuntimeSnapshot: input.refreshTrackedSessionRuntimeSnapshot }
+        : {}),
     }));
   }
 

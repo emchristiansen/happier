@@ -15,7 +15,7 @@ import { openCodeTransport } from '@/backends/opencode/acp/transport';
 import { logger } from '@/ui/logger';
 import type { PermissionMode } from '@/api/types';
 import { buildOpenCodeFamilyPermissionEnv } from '@/backends/openCodeFamily/permission/openCodeFamilyPermissionEnv';
-import { requireProviderCliLaunchSpec } from '@/runtime/managedTools/requireProviderCliLaunchSpec';
+import { resolveOpenCodeCliLaunchSpec } from '@/backends/opencode/utils/resolveOpenCodeCliCommand';
 import { parseBooleanEnv } from '@happier-dev/protocol';
 
 export interface OpenCodeBackendOptions extends AgentFactoryOptions {
@@ -47,7 +47,7 @@ export function createOpenCodeBackend(options: OpenCodeBackendOptions): AgentBac
     if (raw === 'DEBUG' || raw === 'INFO' || raw === 'WARN' || raw === 'ERROR') return raw;
     return 'ERROR';
   })();
-  const launch = requireProviderCliLaunchSpec('opencode', { processEnv: mergedEnv });
+  const launch = resolveOpenCodeCliLaunchSpec(mergedEnv);
 
   const backendOptions: AcpBackendOptions = {
     agentName: 'opencode',

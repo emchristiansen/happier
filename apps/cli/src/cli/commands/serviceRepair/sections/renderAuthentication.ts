@@ -68,7 +68,8 @@ function renderProfileBlock(p: AuthProfileSnapshot, invoker: string): string[] {
   const status = statusFor(p);
   const g = glyphForStatus(status);
   const marker = p.isActive ? ' (active)' : '';
-  const nameDisplay = p.isActive ? severity.action(p.serverName + marker) : p.serverName;
+  const profileLabel = p.serverName === p.serverId ? p.serverId : `${p.serverName} [${p.serverId}]`;
+  const nameDisplay = p.isActive ? severity.action(profileLabel + marker) : profileLabel;
   const statusWord = statusWordFor(status);
   const statusRendered = status === 'signed-in' && p.reachability !== 'unreachable'
     ? severity.success(statusWord)

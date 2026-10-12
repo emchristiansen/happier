@@ -91,6 +91,7 @@ export const agent = {
     await (await import('@/backends/codex/utils/resolveCodexNativeSessionLogPath'))
       .resolveCodexNativeSessionLogPath({ vendorResumeId }),
   getDirectSessionProviderOps: async () => (await import('@/backends/codex/directSessions/providerOps')).codexDirectSessionProviderOps,
+  getProviderAttachOps: async () => (await import('@/backends/codex/attach/providerAttachOps')).codexProviderAttachOps,
   getSessionGoalControlAdapter: async () => codexAppServerGoalControlAdapter,
   getSessionCatalogControlAdapter: async () => codexAppServerCatalogControlAdapter,
   getSessionUsageLimitRecoveryControlAdapter: async () => codexAppServerUsageLimitRecoveryControlAdapter,

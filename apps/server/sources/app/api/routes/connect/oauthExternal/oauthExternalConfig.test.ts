@@ -3,6 +3,11 @@ import { describe, expect, it } from 'vitest';
 import { resolveWebAppOAuthReturnUrlFromEnv, resolveWebAppOAuthReturnUrlFromRequestHeaders } from './oauthExternalConfig';
 
 describe('resolveWebAppOAuthReturnUrlFromEnv', () => {
+  it('uses the preferred hosted client when no web app URL is configured', () => {
+    expect(resolveWebAppOAuthReturnUrlFromEnv({}, 'github'))
+      .toBe('https://cloud.happier.dev/oauth/github');
+  });
+
   it('derives the web app base URL from the canonical public server URL when local UI is served and HAPPIER_WEBAPP_URL is unset', () => {
     expect(resolveWebAppOAuthReturnUrlFromEnv({
       HAPPIER_PUBLIC_SERVER_URL: 'https://stack.example.test/base/',

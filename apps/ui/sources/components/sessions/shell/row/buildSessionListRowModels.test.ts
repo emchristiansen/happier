@@ -6,6 +6,7 @@ import { SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS } from '@/sync/domains/session/a
 import {
     buildCachedSessionListRowModel,
     createSessionListRowModelsCache,
+    resolveSessionListRowModelAdjacency,
 } from './buildSessionListRowModels';
 import { sessionTagKey } from '../sessionTagUtils';
 import type {
@@ -20,6 +21,16 @@ const EMPTY_ROW_STATE: SessionListRowStateSnapshot = {
     messages: undefined,
     pending: undefined,
 };
+
+describe('resolveSessionListRowModelAdjacency', () => {
+    it('reuses the canonical adjacency value when list identity changes without changing neighbors', () => {
+        const session = createSessionItem(createRenderable('stable-adjacency'));
+        const first = resolveSessionListRowModelAdjacency([session], 0);
+        const second = resolveSessionListRowModelAdjacency([{ ...session }], 0);
+
+        expect(second).toBe(first);
+    });
+});
 
 function createRenderable(
     id: string,
@@ -127,7 +138,6 @@ describe('buildCachedSessionListRowModel', () => {
         const first = buildCachedSessionListRowModel({
             item,
             snapshot: EMPTY_ROW_STATE,
-            dataIndex: 0,
             adjacency,
             settings,
             cache,
@@ -142,7 +152,6 @@ describe('buildCachedSessionListRowModel', () => {
         const second = buildCachedSessionListRowModel({
             item,
             snapshot: EMPTY_ROW_STATE,
-            dataIndex: 0,
             adjacency,
             settings: createSettings({
                 ...settings,
@@ -169,7 +178,6 @@ describe('buildCachedSessionListRowModel', () => {
         const standing = buildCachedSessionListRowModel({
             item: createSessionItem(session, { attentionPromotionReason: 'standing' }),
             snapshot: EMPTY_ROW_STATE,
-            dataIndex: 0,
             adjacency,
             settings,
             cache,
@@ -179,7 +187,6 @@ describe('buildCachedSessionListRowModel', () => {
         const removed = buildCachedSessionListRowModel({
             item: createSessionItem(session),
             snapshot: EMPTY_ROW_STATE,
-            dataIndex: 0,
             adjacency,
             settings,
             cache,
@@ -202,7 +209,6 @@ describe('buildCachedSessionListRowModel', () => {
         const before = buildCachedSessionListRowModel({
             item,
             snapshot: EMPTY_ROW_STATE,
-            dataIndex: 0,
             adjacency,
             settings: createSettings({ attentionStandingEnabled: true }),
             cache,
@@ -212,7 +218,6 @@ describe('buildCachedSessionListRowModel', () => {
         const after = buildCachedSessionListRowModel({
             item,
             snapshot: EMPTY_ROW_STATE,
-            dataIndex: 0,
             adjacency,
             settings: createSettings({
                 attentionStandingEnabled: true,
@@ -225,6 +230,33 @@ describe('buildCachedSessionListRowModel', () => {
         });
 
         expect(after.isAttentionStanding).toBe(true);
+    });
+
+    it('rebuilds only the row whose reminder changed', () => {
+        const cache = createSessionListRowModelsCache();
+        const firstItem = createSessionItem(createRenderable('s1'));
+        const secondItem = createSessionItem(createRenderable('s2'));
+        const adjacency = { isFirst: true, isLast: true, isSingle: true };
+        const initialSettings = createSettings();
+        const firstBefore = buildCachedSessionListRowModel({ item: firstItem, snapshot: EMPTY_ROW_STATE, adjacency, settings: initialSettings, cache });
+        const secondBefore = buildCachedSessionListRowModel({ item: secondItem, snapshot: EMPTY_ROW_STATE, adjacency, settings: initialSettings, cache });
+        const firstKey = sessionTagKey(String(firstItem.serverId), 's1');
+        const remindAt = Date.now() + 60_000;
+        const reminderSettings = createSettings({
+            attentionStandingPolicy: {
+                defaultStanding: false,
+                overridesBySessionKey: {
+                    [firstKey]: { standing: false, remindAt, updatedAt: 1 },
+                },
+            },
+        });
+
+        const firstAfter = buildCachedSessionListRowModel({ item: firstItem, snapshot: EMPTY_ROW_STATE, adjacency, settings: reminderSettings, cache });
+        const secondAfter = buildCachedSessionListRowModel({ item: secondItem, snapshot: EMPTY_ROW_STATE, adjacency, settings: reminderSettings, cache });
+
+        expect(firstAfter).not.toBe(firstBefore);
+        expect(firstAfter.reminder).toEqual({ state: 'scheduled', remindAt });
+        expect(secondAfter).toBe(secondBefore);
     });
 
     it('rebuilds a row when its working placement reason changes', () => {
@@ -241,7 +273,6 @@ describe('buildCachedSessionListRowModel', () => {
         const retained = buildCachedSessionListRowModel({
             item: createSessionItem(session, { groupKind: 'working', workingPlacementReason: 'working-retained' }),
             snapshot: EMPTY_ROW_STATE,
-            dataIndex: 0,
             adjacency,
             settings,
             cache,
@@ -251,7 +282,6 @@ describe('buildCachedSessionListRowModel', () => {
         const live = buildCachedSessionListRowModel({
             item: createSessionItem(session, { groupKind: 'working', workingPlacementReason: 'working' }),
             snapshot: EMPTY_ROW_STATE,
-            dataIndex: 0,
             adjacency,
             settings,
             cache,

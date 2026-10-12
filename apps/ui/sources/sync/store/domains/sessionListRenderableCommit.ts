@@ -1,5 +1,8 @@
 import type { MachineDisplayRenderable } from '../../domains/machines/machineDisplayRenderable';
-import type { SessionListViewItem } from '../../domains/session/listing/sessionListViewData';
+import {
+    resolveSessionListDateGroupingAt,
+    type SessionListViewItem,
+} from '../../domains/session/listing/sessionListViewData';
 import {
     didSessionListRenderableEmbeddedListRowFieldsChange,
     didSessionListRenderableStructuralFieldsChange,
@@ -121,7 +124,10 @@ export function didSessionListRenderableListViewFieldsChangeForSettings(
     if (didSessionListRenderableStructuralFieldsChange(previous, next)) {
         return true;
     }
-    if (!previous || previous.updatedAt === next.updatedAt) {
+    if (!previous) {
+        return true;
+    }
+    if (resolveSessionListDateGroupingAt(previous) === resolveSessionListDateGroupingAt(next)) {
         return false;
     }
     return isSessionListDateGroupingForRenderable(previous, settings)
@@ -275,8 +281,12 @@ export function applySessionListRenderableCommitPlan<S extends SessionListRender
     const previousCachedSessionListViewData = cacheServerId
         ? input.state.sessionListViewDataByServerId[cacheServerId] ?? null
         : null;
+    const canReuseUpdatedActiveViewForCache = shouldUpdateActiveView
+        && previousCachedSessionListViewData === input.state.sessionListViewData;
     const refreshedCachedSessionListViewData = input.plan.needsSessionListViewDataRebuild
         ? rebuiltSessionListViewData
+        : canReuseUpdatedActiveViewForCache
+            ? sessionListViewData
         : refreshSessionListViewDataRowsForRenderables({
             sessionListViewData: previousCachedSessionListViewData,
             renderables: input.plan.nextRenderables,

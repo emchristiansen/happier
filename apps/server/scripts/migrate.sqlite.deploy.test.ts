@@ -28,7 +28,7 @@ describe("migrate.sqlite.deploy.ts", () => {
 
     beforeEach(async () => {
         tmpDir = await mkdtemp(join(tmpdir(), "happier-server-light-deploy-"));
-        lightDataDir = join(tmpDir, "happy server light");
+        lightDataDir = join(tmpDir, "happy server #light");
         serverRoot = join(tmpDir, "server");
         migrationsDir = join(serverRoot, "prisma", "sqlite", "migrations");
         await mkdir(lightDataDir, { recursive: true });
@@ -71,7 +71,7 @@ describe("migrate.sqlite.deploy.ts", () => {
 
         const databasePath = join(lightDataDir, "happier-server-light.sqlite");
         expect(env.DATABASE_URL).toBe(
-            `file:${databasePath}?socket_timeout=30&connection_limit=1`,
+            `${pathToFileURL(databasePath).href}?socket_timeout=30&connection_limit=1`,
         );
         expect(schemaSyncCalls).toEqual([serverRoot]);
 
@@ -92,7 +92,7 @@ describe("migrate.sqlite.deploy.ts", () => {
             db.close();
         }
 
-        const encodedDirExists = await stat(join(tmpDir, "happy%20server%20light"))
+        const encodedDirExists = await stat(join(tmpDir, "happy%20server%20%23light"))
             .then(() => true)
             .catch(() => false);
         expect(encodedDirExists).toBe(false);

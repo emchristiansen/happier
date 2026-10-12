@@ -816,6 +816,18 @@ describe('transcript target-window host adapter', () => {
 });
 
 describe('tail contiguous floor (tail-reset discontinuity display)', () => {
+    it('keeps an unresolved opaque boundary explicit without treating seqless messages as chrome', () => {
+        const items = [{ id: 'old' }, { id: 'chrome' }];
+        const facts = resolveTranscriptTargetWindowHostFacts({
+            items,
+            resolveMessageIds: (item) => item.id === 'chrome' ? [] : [item.id],
+            tailContiguousBoundary: { kind: 'messageIds', messageIds: [] },
+            windowState: inactiveState,
+        });
+        expect(facts.items.map((item) => item.id)).toEqual(['chrome']);
+        expect(facts.gaps.older?.id).toBe('transcript-window-gap:tail:older');
+    });
+
     const activeWindowState: TranscriptTargetWindowState = {
         activatedAtMs: 1,
         hasMoreNewer: false,
@@ -840,7 +852,7 @@ describe('tail contiguous floor (tail-reset discontinuity display)', () => {
                 { id: 't-1951', seq: 1951 },
                 { id: 't-2000', seq: 2000 },
             ],
-            tailContiguousFloorSeq: 1951,
+            tailContiguousBoundary: { kind: 'seq', seq: 1951 },
             windowState: inactiveState,
         });
         expect(facts.targetWindowActive).toBe(false);
@@ -862,7 +874,7 @@ describe('tail contiguous floor (tail-reset discontinuity display)', () => {
         ];
         const floored = resolveTranscriptTargetWindowHostFacts({
             items,
-            tailContiguousFloorSeq: 1951,
+            tailContiguousBoundary: { kind: 'seq', seq: 1951 },
             windowState: inactiveState,
         });
         expect(floored.items.map((item) => item.id)).toEqual(['synthetic', 't-1951']);
@@ -870,7 +882,7 @@ describe('tail contiguous floor (tail-reset discontinuity display)', () => {
 
         const unfloored = resolveTranscriptTargetWindowHostFacts({
             items,
-            tailContiguousFloorSeq: null,
+            tailContiguousBoundary: null,
             windowState: inactiveState,
         });
         expect(unfloored.items).toBe(items);
@@ -885,7 +897,7 @@ describe('tail contiguous floor (tail-reset discontinuity display)', () => {
                 { id: 'w-7', seq: 7 },
                 { id: 't-1951', seq: 1951 },
             ],
-            tailContiguousFloorSeq: 1951,
+            tailContiguousBoundary: { kind: 'seq', seq: 1951 },
             windowState: activeWindowState,
         });
         expect(facts.targetWindowActive).toBe(true);

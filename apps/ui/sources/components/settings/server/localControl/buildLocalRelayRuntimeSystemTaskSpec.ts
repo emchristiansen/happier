@@ -1,5 +1,7 @@
 import { SYSTEM_TASK_PROTOCOL_VERSION, type SystemTaskSpec } from '@happier-dev/protocol';
 
+import { resolvePreferredPublicReleaseRingLabelForCurrentApp } from '@/sync/runtime/currentAppVariant';
+
 type LocalRelayRuntimeTaskKind =
     | 'relay.runtime.status.v1'
     | 'relay.runtime.installOrUpdate.v1'
@@ -8,7 +10,6 @@ type LocalRelayRuntimeTaskKind =
 
 const LOCAL_RELAY_RUNTIME_PARAMS = {
     target: { kind: 'local' as const },
-    channel: 'stable' as const,
     mode: 'user' as const,
 };
 
@@ -16,6 +17,9 @@ export function buildLocalRelayRuntimeSystemTaskSpec(kind: LocalRelayRuntimeTask
     return {
         protocolVersion: SYSTEM_TASK_PROTOCOL_VERSION,
         kind,
-        params: LOCAL_RELAY_RUNTIME_PARAMS,
+        params: {
+            ...LOCAL_RELAY_RUNTIME_PARAMS,
+            channel: resolvePreferredPublicReleaseRingLabelForCurrentApp(),
+        },
     };
 }

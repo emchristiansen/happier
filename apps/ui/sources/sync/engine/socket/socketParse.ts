@@ -1,11 +1,14 @@
 import { z } from 'zod';
 import {
     DirectTranscriptRawMessageV1Schema,
+    DirectTranscriptTruncationReasonSchema,
+    resolveDirectTranscriptContinuation,
     SessionMessageRoleSchema,
     SessionStoredMessageContentSchema,
 } from '@happier-dev/protocol';
 import type {
     DirectTranscriptRawMessageV1,
+    DirectTranscriptTruncationReason,
     SessionMessageRole,
     SessionStoredMessageContent,
 } from '@happier-dev/protocol';
@@ -51,6 +54,7 @@ export type DirectSessionTranscriptUpdatedEphemeralUpdate = Readonly<{
     nextCursor?: string | null;
     tailCursor?: string | null;
     truncated?: boolean;
+    truncationReason?: DirectTranscriptTruncationReason;
 }>;
 
 export type ParsedEphemeralUpdate =
@@ -100,11 +104,13 @@ const DirectSessionTranscriptUpdatedEphemeralUpdateSchema = z.object({
     nextCursor: z.string().nullable().optional(),
     tailCursor: z.string().nullable().optional(),
     truncated: z.boolean().optional(),
+    truncationReason: DirectTranscriptTruncationReasonSchema.optional(),
 }).passthrough().superRefine((value, ctx) => {
     const advancesCursor = Object.prototype.hasOwnProperty.call(value, 'nextCursor')
         || Object.prototype.hasOwnProperty.call(value, 'tailCursor');
+    const continuation = resolveDirectTranscriptContinuation(value);
     if (
-        value.truncated !== true
+        continuation !== 'source_discontinuity'
         && advancesCursor
         && (typeof value.fromCursor !== 'string' || value.fromCursor.trim().length === 0)
     ) {
@@ -112,6 +118,13 @@ const DirectSessionTranscriptUpdatedEphemeralUpdateSchema = z.object({
             code: z.ZodIssueCode.custom,
             message: 'fromCursor is required when a cursor is present on non-truncated direct-session transcript deltas',
             path: ['fromCursor'],
+        });
+    }
+    if (continuation === 'page_limit' && typeof value.nextCursor !== 'string') {
+        ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: 'page-limit transcript continuation requires a next cursor',
+            path: ['nextCursor'],
         });
     }
 });

@@ -53,18 +53,18 @@ vi.mock('@/hooks/session/useNavigateToSession', () => ({
 const modalPromptSpy = vi.fn(async () => null as string | null);
 const sessionRenameSpy = vi.fn(async () => ({ success: true }));
 const openSessionForkStrategyFlowSpy = vi.fn();
+const sessionForkFlowModuleLoadedSpy = vi.fn();
 
 vi.mock('@/hooks/server/useFeatureEnabled', () => ({
     useFeatureEnabled: () => false,
 }));
 
-vi.mock('@/components/sessions/fork/openSessionForkStrategyFlow', () => ({
-    openSessionForkStrategyFlow: (...args: unknown[]) => openSessionForkStrategyFlowSpy(...args),
-}));
-
-vi.mock('@/utils/platform/deferOnWeb', () => ({
-    deferOnWeb: (callback: () => void) => callback(),
-}));
+vi.mock('@/components/sessions/fork/openSessionForkStrategyFlow', () => {
+    sessionForkFlowModuleLoadedSpy();
+    return {
+        openSessionForkStrategyFlow: (...args: unknown[]) => openSessionForkStrategyFlowSpy(...args),
+    };
+});
 
 function hasRenameMenuItem(items: unknown): boolean {
     if (!Array.isArray(items)) return false;
@@ -243,7 +243,6 @@ describe('SessionItem context menu press suppression', () => {
                 variant="default"
                 compact={false}
                 forkActionContext={{
-                    settings: {},
                     replayEnabled: true,
                     executionRunsEnabled: false,
                 }}
@@ -260,6 +259,7 @@ describe('SessionItem context menu press suppression', () => {
             title: 'sessionInfo.forkSession',
             subtitle: undefined,
         });
+        await vi.waitFor(() => expect(sessionForkFlowModuleLoadedSpy).toHaveBeenCalledTimes(1));
 
         await act(async () => {
             await dropdown.props.onSelect('session.fork');
@@ -660,8 +660,7 @@ describe('SessionItem context menu press suppression', () => {
         expect(itemPressable.props.onLongPress).toBeUndefined();
     });
 
-    it('opens the rename prompt after the native context menu close turn', async () => {
-        vi.useFakeTimers();
+    it('closes the native context menu before delegating the rename selection', async () => {
         modalPromptSpy.mockResolvedValueOnce('Renamed Session');
 
         const session = createSessionFixture({
@@ -695,13 +694,6 @@ describe('SessionItem context menu press suppression', () => {
         });
 
         expect(onNativeContextMenuOpenChange).toHaveBeenCalledWith(false);
-        expect(modalPromptSpy).not.toHaveBeenCalled();
-
-        await act(async () => {
-            vi.advanceTimersByTime(0);
-            await Promise.resolve();
-        });
-
         expect(modalPromptSpy).toHaveBeenCalledTimes(1);
         expect(sessionRenameSpy).toHaveBeenCalledWith('sess_rename', 'Renamed Session', { serverId: 'server_a' });
     });

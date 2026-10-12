@@ -1,26 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { readSharedManagedOpenCodeServerStateBestEffort } from './sharedManagedServer';
+
 vi.mock('./openCodeSse', () => ({
   subscribeSseJson: vi.fn(),
 }));
 
-vi.mock('./sharedManagedServer', () => ({
+vi.mock('./sharedManagedServer', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./sharedManagedServer')>(),
   ensureSharedManagedOpenCodeServerBaseUrl: vi.fn(),
-  isLoopbackManagedOpenCodeBaseUrl: (rawBaseUrl: string) => {
-    const value = rawBaseUrl.trim();
-    if (!value) return false;
-    try {
-      const url = new URL(value);
-      if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
-      const port = Number.parseInt(url.port, 10);
-      if (!Number.isFinite(port) || port <= 0) return false;
-      const host = url.hostname.toLowerCase();
-      return host === 'localhost' || host === '::1' || host.startsWith('127.');
-    } catch {
-      return false;
-    }
-  },
-  readSharedManagedOpenCodeServerStateBestEffort: vi.fn(),
+  readSharedManagedOpenCodeServerStateBestEffort: vi.fn(async () => null),
+  readSharedManagedOpenCodeServerStateByBaseUrlBestEffort: vi.fn(async () => null),
 }));
 
 type FakeResponse = {
@@ -51,6 +41,7 @@ describe('createOpenCodeServerRuntimeClient.subscribeGlobalEvents', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    vi.mocked(readSharedManagedOpenCodeServerStateBestEffort).mockResolvedValue(null);
 
     for (const key of [
       'HAPPIER_OPENCODE_SERVER_URL',
@@ -147,8 +138,124 @@ describe('createOpenCodeServerRuntimeClient.subscribeGlobalEvents', () => {
     await client.dispose();
   });
 
+  it.each([
+    {
+      initialGeneration: 'v1',
+      replacementGeneration: 'v2',
+      disconnect: 'error',
+      initialEventPath: '/event?directory=%2Ftmp',
+      replacementEventPath: '/api/event',
+      replacementSessionPath: '/api/session?directory=%2Ftmp&order=asc',
+      replacementBoundary: { type: 'server.connected', data: {} },
+      // Released wire frame from the real v2.0.15 binary (`/api/event`): streamed parts are
+      // identified by (assistantMessageID, ordinal), not the preview `textID`.
+      replacementEvent: {
+        type: 'session.text.delta',
+        data: { sessionID: 'ses_1', assistantMessageID: 'msg_1', ordinal: 0, delta: 'v2' },
+      },
+      expectedEventType: 'message.part.delta',
+    },
+    {
+      initialGeneration: 'v2',
+      replacementGeneration: 'v1',
+      disconnect: 'eof',
+      initialEventPath: '/api/event',
+      replacementEventPath: '/event?directory=%2Ftmp',
+      replacementSessionPath: '/session?directory=%2Ftmp',
+      replacementBoundary: { type: 'server.connected', properties: {} },
+      replacementEvent: { type: 'session.status', properties: { sessionID: 'ses_1', status: { type: 'busy' } } },
+      expectedEventType: 'session.status',
+    },
+  ] as const)(
+    're-probes an external same-URL server after reconnect changes $initialGeneration to $replacementGeneration',
+    async ({
+      initialGeneration,
+      replacementGeneration,
+      disconnect,
+      initialEventPath,
+      replacementEventPath,
+      replacementSessionPath,
+      replacementBoundary,
+      replacementEvent,
+      expectedEventType,
+    }) => {
+      let activeGeneration: 'v1' | 'v2' = initialGeneration;
+      const requestedPaths: string[] = [];
+      const fetchSpy = vi.fn(async (input: string | URL | Request) => {
+        const url = new URL(String(input));
+        requestedPaths.push(`${url.pathname}${url.search}`);
+        if (url.pathname === '/api/health') {
+          return createResponse({
+            ok: activeGeneration === 'v2',
+            status: activeGeneration === 'v2' ? 200 : 404,
+            statusText: activeGeneration === 'v2' ? 'OK' : 'Not Found',
+            body: activeGeneration === 'v2' ? { healthy: true } : { error: 'not found' },
+          }) as any;
+        }
+        if (url.pathname === '/global/health') {
+          return createResponse({
+            ok: activeGeneration === 'v1',
+            status: activeGeneration === 'v1' ? 200 : 404,
+            statusText: activeGeneration === 'v1' ? 'OK' : 'Not Found',
+            body: activeGeneration === 'v1' ? { healthy: true, version: 'test' } : { error: 'not found' },
+          }) as any;
+        }
+        if (url.pathname === '/api/session') return createOkJsonResponse({ data: [] }) as any;
+        if (url.pathname === '/session') return createOkJsonResponse([]) as any;
+        return createOkJsonResponse({}) as any;
+      });
+      vi.stubGlobal('fetch', fetchSpy as any);
+
+      const { subscribeSseJson } = await import('./openCodeSse');
+      const subscribeMock = subscribeSseJson as unknown as ReturnType<typeof vi.fn>;
+      let settleFirstDone!: () => void;
+      const firstDone = new Promise<void>((resolve, reject) => {
+        settleFirstDone = disconnect === 'error'
+          ? () => reject(new Error('socket hang up'))
+          : resolve;
+      });
+      subscribeMock
+        .mockImplementationOnce(async () => ({ close: vi.fn(), done: firstDone }))
+        .mockImplementationOnce(async (params: any) => {
+          params.onMessage(replacementBoundary);
+          params.onMessage(replacementEvent);
+          let resolveDone!: () => void;
+          const done = new Promise<void>((resolve) => {
+            resolveDone = resolve;
+          });
+          params.signal?.addEventListener?.('abort', () => resolveDone(), { once: true });
+          return { close: vi.fn(() => resolveDone()), done };
+        });
+
+      const { createOpenCodeServerRuntimeClient } = await import('./client');
+      const client = await createOpenCodeServerRuntimeClient({ directory: '/tmp', messageBuffer: { push: () => {} } as any });
+      const onEvent = vi.fn();
+      const controller = new AbortController();
+      await client.subscribeGlobalEvents({ signal: controller.signal, onEvent });
+
+      expect(new URL(String(subscribeMock.mock.calls[0]?.[0]?.url)).pathname + new URL(String(subscribeMock.mock.calls[0]?.[0]?.url)).search).toBe(initialEventPath);
+      activeGeneration = replacementGeneration;
+      settleFirstDone();
+
+      await expect.poll(() => subscribeMock.mock.calls.length).toBe(2);
+      const replacementUrl = new URL(String(subscribeMock.mock.calls[1]?.[0]?.url));
+      expect(`${replacementUrl.pathname}${replacementUrl.search}`).toBe(replacementEventPath);
+      await expect.poll(() => onEvent.mock.calls.some(([event]) => event.payload.type === expectedEventType)).toBe(true);
+
+      await expect(client.sessionList()).resolves.toEqual([]);
+      expect(requestedPaths).toContain(replacementSessionPath);
+
+      controller.abort();
+      await client.dispose();
+    },
+  );
+
   it('reopens the instance event stream and requires a fresh boundary when the directory changes', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => createOkJsonResponse({ healthy: true, version: 'test' })) as any);
+    vi.stubGlobal('fetch', vi.fn(async (url: any) => createOkJsonResponse(
+      String(url).includes('/global/health')
+        ? { healthy: true, version: 'test' }
+        : {},
+    )) as any);
 
     const { subscribeSseJson } = await import('./openCodeSse');
     const subscribeMock = subscribeSseJson as unknown as ReturnType<typeof vi.fn>;
@@ -180,6 +287,7 @@ describe('createOpenCodeServerRuntimeClient.subscribeGlobalEvents', () => {
     const onEvent = vi.fn();
     const controller = new AbortController();
     await client.subscribeGlobalEvents({ signal: controller.signal, onEvent });
+    await expect.poll(() => subscribeMock.mock.calls.length).toBe(1);
 
     expect(client.setDirectoryOverride('/tmp/right')).toBe(true);
     expect(firstClose).toHaveBeenCalledTimes(1);
@@ -306,7 +414,7 @@ describe('createOpenCodeServerRuntimeClient.subscribeGlobalEvents', () => {
     const fetchSpy = vi.fn(async (url: any) => {
       const urlStr = String(url);
       if (urlStr.includes('127.0.0.1:9999') && urlStr.includes('/global/health')) {
-        return createResponse({ ok: false, status: 502, statusText: 'Bad Gateway', body: { healthy: false } }) as any;
+        return createOkJsonResponse({ healthy: true, version: 'test' }) as any;
       }
       if (urlStr.includes('127.0.0.1:10000') && urlStr.includes('/global/health')) {
         return createOkJsonResponse({ healthy: true, version: 'test' }) as any;
@@ -445,6 +553,7 @@ describe('createOpenCodeServerRuntimeClient managed-server identity change signa
   beforeEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    vi.mocked(readSharedManagedOpenCodeServerStateBestEffort).mockResolvedValue(null);
     for (const key of [
       'HAPPIER_OPENCODE_SERVER_URL',
       'HAPPIER_OPENCODE_SSE_RECONNECT_BASE_DELAY_MS',
@@ -465,6 +574,68 @@ describe('createOpenCodeServerRuntimeClient managed-server identity change signa
         process.env[key] = value;
       }
     }
+  });
+
+  it.each([
+    ['auto', '/event?directory=%2Ftmp'],
+    ['v2', '/api/event'],
+  ] as const)('keeps the managed %s launch hint coherent across SSE reconnects', async (apiGeneration, expectedEventPath) => {
+    const fetchSpy = vi.fn(async (url: any) => {
+      if (apiGeneration === 'auto') {
+        return String(url).includes('/global/health')
+          ? createOkJsonResponse({ healthy: true, version: 'test' }) as any
+          : createResponse({ ok: false, status: 404, statusText: 'Not Found', body: {} }) as any;
+      }
+      return createOkJsonResponse({ healthy: true }) as any;
+    });
+    vi.stubGlobal('fetch', fetchSpy as any);
+
+    const { ensureSharedManagedOpenCodeServerBaseUrl, readSharedManagedOpenCodeServerStateBestEffort } = await import('./sharedManagedServer');
+    const ensureMock = ensureSharedManagedOpenCodeServerBaseUrl as unknown as ReturnType<typeof vi.fn>;
+    const readMock = readSharedManagedOpenCodeServerStateBestEffort as unknown as ReturnType<typeof vi.fn>;
+    const managedState = {
+      baseUrl: 'http://127.0.0.1:9999',
+      pid: process.pid,
+      startedAtMs: 1,
+      ownerToken: 'gen-A',
+      apiGeneration,
+    };
+    ensureMock.mockResolvedValueOnce(managedState.baseUrl);
+    readMock.mockResolvedValue(managedState);
+
+    const { subscribeSseJson } = await import('./openCodeSse');
+    const subscribeMock = subscribeSseJson as unknown as ReturnType<typeof vi.fn>;
+    let rejectFirstDone!: (error: unknown) => void;
+    const firstDone = new Promise<void>((_resolve, reject) => {
+      rejectFirstDone = reject;
+    });
+    subscribeMock
+      .mockImplementationOnce(async () => ({ close: vi.fn(), done: firstDone }))
+      .mockImplementationOnce(async (params: any) => {
+        let resolveDone!: () => void;
+        const done = new Promise<void>((resolve) => {
+          resolveDone = resolve;
+        });
+        params.signal?.addEventListener?.('abort', () => resolveDone(), { once: true });
+        return { close: vi.fn(() => resolveDone()), done };
+      });
+
+    const { createOpenCodeServerRuntimeClient } = await import('./client');
+    const client = await createOpenCodeServerRuntimeClient({ directory: '/tmp', messageBuffer: { push: () => {} } as any });
+    const probesAfterConstruction = fetchSpy.mock.calls.length;
+    const controller = new AbortController();
+    await client.subscribeGlobalEvents({ signal: controller.signal, onEvent: vi.fn() });
+    rejectFirstDone(new Error('socket hang up'));
+
+    await expect.poll(() => subscribeMock.mock.calls.length).toBe(2);
+    expect(subscribeMock.mock.calls.map(([params]) => {
+      const url = new URL(String(params.url));
+      return `${url.pathname}${url.search}`;
+    })).toEqual([expectedEventPath, expectedEventPath]);
+    expect(fetchSpy).toHaveBeenCalledTimes(probesAfterConstruction);
+
+    controller.abort();
+    await client.dispose();
   });
 
   it('emits a sse_reconnect_state_refresh change when reconnect observes a new managed-server generation', async () => {
@@ -588,8 +759,8 @@ describe('createOpenCodeServerRuntimeClient managed-server identity change signa
     });
     vi.stubGlobal('fetch', fetchSpy as any);
 
-    const { readSharedManagedOpenCodeServerStateBestEffort } = await import('./sharedManagedServer');
-    const readMock = readSharedManagedOpenCodeServerStateBestEffort as unknown as ReturnType<typeof vi.fn>;
+    const { readSharedManagedOpenCodeServerStateByBaseUrlBestEffort } = await import('./sharedManagedServer');
+    const readMock = readSharedManagedOpenCodeServerStateByBaseUrlBestEffort as unknown as ReturnType<typeof vi.fn>;
 
     const changes: unknown[] = [];
     const { createOpenCodeServerRuntimeClient } = await import('./client');
@@ -599,9 +770,10 @@ describe('createOpenCodeServerRuntimeClient managed-server identity change signa
       onManagedServerIdentityChanged: (change) => changes.push(change),
     });
 
-    // Explicit URL mode is not managed: identity is null and state is never read.
+    // Explicit URL mode does not adopt managed lifecycle identity. A loopback URL does perform one
+    // state read so an exact managed endpoint can consume its retained credential safely.
     expect(client.getManagedServerIdentity()).toBeNull();
-    expect(readMock).not.toHaveBeenCalled();
+    expect(readMock).toHaveBeenCalledWith('http://127.0.0.1:9999');
     expect(changes).toHaveLength(0);
 
     await client.dispose();

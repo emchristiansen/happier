@@ -3,9 +3,16 @@ import { describe, expect, it } from 'vitest';
 import { loadProvidersFromCliSpecs } from '../../src/testkit/providers/specs/providerSpecs';
 
 describe('providers: ACP permission prompt matrix in provider specs', () => {
-  it('defines toolPermissionPromptsByMode for each ACP provider', async () => {
+  it('defines complete permission matrices for each provider that schedules permission-mode scenarios', async () => {
     const providers = await loadProvidersFromCliSpecs();
-    const acpProviders = providers.filter((provider) => provider.protocol === 'acp');
+    const acpProviders = providers.filter((provider) => {
+      if (provider.protocol !== 'acp') return false;
+      const scenarioIds = [
+        ...provider.scenarioRegistry.tiers.smoke,
+        ...provider.scenarioRegistry.tiers.extended,
+      ];
+      return scenarioIds.some((scenarioId) => scenarioId.startsWith('permission_mode_'));
+    });
     expect(acpProviders.length).toBeGreaterThan(0);
 
     for (const provider of acpProviders) {
@@ -31,5 +38,18 @@ describe('providers: ACP permission prompt matrix in provider specs', () => {
       expect(typeof outsideWriteMustCompleteByMode['read-only']).toBe('boolean');
       expect(typeof outsideWriteMustCompleteByMode.yolo).toBe('boolean');
     }
+  });
+
+  it('keeps Droid permission behavior unverified instead of scheduling unsafe matrix scenarios', async () => {
+    const providers = await loadProvidersFromCliSpecs();
+    const droid = providers.find((provider) => provider.id === 'droid');
+    expect(droid).toBeTruthy();
+    expect(droid?.permissions?.acp?.toolPermissionPromptsByMode).toBeUndefined();
+    expect(droid?.permissions?.acp?.outsideWorkspaceWriteAllowedByMode).toBeUndefined();
+    expect(droid?.permissions?.acp?.outsideWorkspaceWriteMustCompleteByMode).toBeUndefined();
+    expect([
+      ...(droid?.scenarioRegistry.tiers.smoke ?? []),
+      ...(droid?.scenarioRegistry.tiers.extended ?? []),
+    ].some((scenarioId) => scenarioId.startsWith('permission_mode_'))).toBe(false);
   });
 });

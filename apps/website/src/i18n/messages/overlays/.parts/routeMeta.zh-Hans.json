@@ -145,5 +145,12 @@
     "ogTitle": "自托管 Happier 的 relay，放在你自己的 SSO 之后",
     "ogDescription": "一个由你托管的 relay，锁定到你的 GitHub 组织或 OIDC 群组，带客户端证书、离职重新校验，以及由你选择的存储策略。全部 MIT 许可。",
     "ogImageAlt": "Happier 字标，下方写着：一个客户端，面向每一个 AI 编码智能体。"
+  },
+  "/download": {
+    "title": "下载 Happier：桌面端、移动端和 CLI",
+    "description": "下载 macOS、Windows、Linux、iOS 或 Android 版 Happier，或在运行智能体的电脑上安装 Happier CLI。",
+    "ogTitle": "为你的所有设备下载 Happier",
+    "ogDescription": "桌面应用、移动应用、直接 APK，以及在你自己的电脑上运行智能体的 CLI。所有构建都在一个页面。",
+    "ogImageAlt": "Happier 字标，下方写着：一个客户端，面向每一个 AI 编码智能体。"
   }
 }

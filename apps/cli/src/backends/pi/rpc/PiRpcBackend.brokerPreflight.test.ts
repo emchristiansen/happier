@@ -36,7 +36,7 @@ type PrivateBrokerGateBackend = {
   stopRpcProcessForRestart: () => Promise<void>;
   restartAndContinue: () => Promise<void>;
   maybeRestartForUpdatedAuthJson: () => Promise<void> | null;
-  createPendingTurn: () => Promise<void>;
+  resolvePendingTurn: () => boolean;
 };
 
 const SESSION_ID = 'pi-session-broker-gate';
@@ -245,8 +245,12 @@ describe('PiRpcBackend connected-service broker preflight (fail-closed)', () => 
     priv.ensureProcess = async () => {
       trackers.ensureProcessReached = true;
     };
-    // Resolve the turn immediately so the prompt path completes without a live Pi process.
-    priv.createPendingTurn = () => Promise.resolve();
+    const sendCommand = priv.sendCommand;
+    priv.sendCommand = async (command) => {
+      const response = await sendCommand(command);
+      if (command.type === 'prompt') queueMicrotask(() => priv.resolvePendingTurn());
+      return response;
+    };
 
     await expect(sendPrompt('hello')).resolves.toBeUndefined();
     // The preflight did not gate a native session: execution reached the process and sent the prompt.
@@ -272,7 +276,6 @@ describe('PiRpcBackend connected-service broker preflight (fail-closed)', () => 
     priv.ensureProcess = async () => {
       trackers.ensureProcessReached = true;
     };
-    priv.createPendingTurn = () => Promise.resolve();
 
     const promptResult = sendPrompt('hello');
     await waitForHook('auth restart', () => releaseRestart);
@@ -301,7 +304,6 @@ describe('PiRpcBackend connected-service broker preflight (fail-closed)', () => 
       });
       priv.connectedBrokerPreflight = Promise.resolve({ ready: false, reason: 'broker_load_nonce_not_observed' });
     };
-    priv.createPendingTurn = () => Promise.resolve();
 
     const promptResult = sendPrompt('hello');
     await waitForHook('ensureProcess', () => releaseEnsureProcess);

@@ -8,7 +8,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { resolveLightDataDir, resolveLightDatabaseDir } from "@/flavors/light/env";
 import { resolveLightSqliteBusyTimeoutMsFromEnv } from "@/flavors/light/sqliteConnectionConfig";
-import { log } from "@/utils/logging/log";
+import { log, warn } from "@/utils/logging/log";
 import { acquirePgliteDirLock } from "./locks/pgliteLock";
 export type TransactionClient = PrismaNamespace.TransactionClient;
 export type PrismaClientType = PrismaClientInstance;
@@ -230,10 +230,22 @@ export async function initDbSqlite(): Promise<void> {
         throw new Error("Database client is not initialized after initDbFromGeneratedClient(sqlite).");
     }
     await applySqliteRuntimePragmas(_db, process.env);
+    const diagnostics = resolveSqliteStartupDiagnosticsFromEnv(process.env);
     log(
-        { module: "storage", event: "sqlite-startup-diagnostics", sqlite: resolveSqliteStartupDiagnosticsFromEnv(process.env) },
+        { module: "storage", event: "sqlite-startup-diagnostics", sqlite: diagnostics },
         "SQLite startup diagnostics",
     );
+    if (diagnostics.ignoredDatabaseUrlQueryParameters.length > 0) {
+        warn(
+            {
+                module: "storage",
+                event: "sqlite-unsupported-url-query-parameters",
+                ignoredDatabaseUrlQueryParameters: diagnostics.ignoredDatabaseUrlQueryParameters,
+                databaseUrlPoolAcquisitionTimeoutStatus: diagnostics.databaseUrlPoolAcquisitionTimeoutStatus,
+            },
+            "SQLite ignores unsupported database URL query parameters; pool acquisition remains unbounded",
+        );
+    }
 }
 
 function resolveLightPgliteDirFromEnv(env: NodeJS.ProcessEnv): string {
@@ -339,6 +351,8 @@ export type SqliteStartupDiagnostics = Readonly<{
     databaseUrlSocketTimeoutSeconds: number | null;
     databaseUrlConnectionLimit: number | null;
     databaseUrlConnectionLimitStatus: SqliteDatabaseUrlConnectionLimitStatus;
+    databaseUrlPoolAcquisitionTimeoutStatus: "unbounded";
+    ignoredDatabaseUrlQueryParameters: readonly string[];
 }>;
 
 // Cap the WAL file retained after a checkpoint. SQLite's default (-1) means "no limit",
@@ -423,6 +437,9 @@ export function resolveSqliteStartupDiagnosticsFromEnv(env: NodeJS.ProcessEnv): 
     const databaseUrlConnectionLimit = parsePositiveInteger(rawConnectionLimit);
     const databaseUrlConnectionLimitStatus: SqliteDatabaseUrlConnectionLimitStatus =
         rawConnectionLimit === null ? "missing" : databaseUrlConnectionLimit === null ? "invalid" : "configured";
+    const ignoredDatabaseUrlQueryParameters = [
+        ...(readSqliteDatabaseUrlSearchParam(env, "pool_timeout") !== null ? ["pool_timeout"] : []),
+    ];
 
     return {
         provider: "sqlite",
@@ -433,6 +450,8 @@ export function resolveSqliteStartupDiagnosticsFromEnv(env: NodeJS.ProcessEnv): 
         databaseUrlSocketTimeoutSeconds: parsePositiveInteger(readSqliteDatabaseUrlSearchParam(env, "socket_timeout")),
         databaseUrlConnectionLimit,
         databaseUrlConnectionLimitStatus,
+        databaseUrlPoolAcquisitionTimeoutStatus: "unbounded",
+        ignoredDatabaseUrlQueryParameters,
     };
 }
 

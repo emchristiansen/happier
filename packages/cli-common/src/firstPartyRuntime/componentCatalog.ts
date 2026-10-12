@@ -10,6 +10,8 @@ export const FIRST_PARTY_COMPONENT_IDS = [
   'happier-daemon',
   'happier-server',
   'hstack',
+  'happier-memory-runtime',
+  'happier-difftastic',
 ] as const;
 
 export type FirstPartyComponentId = (typeof FIRST_PARTY_COMPONENT_IDS)[number];
@@ -99,6 +101,32 @@ export const firstPartyComponentCatalog = {
     installShims: ['hstack'],
     prefersManagedNodeFallback: false,
   },
+  'happier-memory-runtime': {
+    id: 'happier-memory-runtime',
+    runtimeKind: 'node-runtime-payload',
+    executableBaseName: 'happier-memory-runtime',
+    releaseProductName: 'happier-memory-runtime',
+    rollingReleasePrefix: 'cli',
+    installRootName: 'memory-runtime',
+    retainVersions: SHARED_VERSION_RETENTION,
+    nodeEntrypointRelativePath: 'node_modules/@huggingface/transformers/dist/transformers.node.mjs',
+    binaryRelativePath: '',
+    installShims: [],
+    prefersManagedNodeFallback: false,
+  },
+  'happier-difftastic': {
+    id: 'happier-difftastic',
+    runtimeKind: 'binary',
+    executableBaseName: 'difft',
+    releaseProductName: 'happier-difftastic',
+    rollingReleasePrefix: 'cli',
+    installRootName: 'difftastic',
+    retainVersions: SHARED_VERSION_RETENTION,
+    nodeEntrypointRelativePath: null,
+    binaryRelativePath: 'difft',
+    installShims: [],
+    prefersManagedNodeFallback: false,
+  },
 } as const satisfies Record<FirstPartyComponentId, FirstPartyComponentCatalogEntry>;
 
 export function getFirstPartyComponentCatalogEntry(
@@ -126,7 +154,7 @@ export function resolveFirstPartyComponentPublicReleaseVariant(params: Readonly<
     throw new Error(`Public release ring ${params.channel} does not define a rolling release suffix`);
   }
 
-  const defaultInstallShims = params.channel === 'stable'
+  const defaultInstallShims = params.channel === 'stable' || entry.installShims.length === 0
     ? entry.installShims
     : [`${entry.executableBaseName}-${suffix}`];
 

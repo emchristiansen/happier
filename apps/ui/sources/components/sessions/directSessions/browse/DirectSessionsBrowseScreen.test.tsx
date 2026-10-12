@@ -1,6 +1,6 @@
 import * as React from 'react';
 import { act } from 'react-test-renderer';
-import type { DirectSessionsCandidatesListResponse } from '@happier-dev/protocol';
+import type { DirectSessionCandidateDeleteResponse, DirectSessionsCandidatesListResponse } from '@happier-dev/protocol';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushHookEffects, renderScreen } from '@/dev/testkit';
 import { createPassThroughModule } from '@/dev/testkit/mocks/components';
@@ -37,9 +37,14 @@ const linkEnsureSpy = vi.hoisted(() => vi.fn(async () => ({
     sessionId: 'happy-session-1',
     created: true,
 })));
+const candidateDeleteSpy = vi.hoisted(() => vi.fn(async (): Promise<DirectSessionCandidateDeleteResponse> => ({
+    ok: true as const,
+    deleted: true as const,
+})));
 const routerPushSpy = vi.hoisted(() => vi.fn());
 const routerNavigateSpy = vi.hoisted(() => vi.fn());
 const modalAlertSpy = vi.hoisted(() => vi.fn());
+const modalConfirmSpy = vi.hoisted(() => vi.fn(async () => true));
 const profileMock = vi.hoisted(() => ({
     connectedServicesV2: [
         {
@@ -73,7 +78,6 @@ installNewSessionComponentsCommonModuleMocks({
     unistyles: () => createUnistylesMock({
         theme: {
             colors: {
-                text: '#000',
                 textSecondary: '#666',
                 textTertiary: '#444',
                 divider: '#ddd',
@@ -94,6 +98,7 @@ installNewSessionComponentsCommonModuleMocks({
     modal: () => createModalModuleMock({
         spies: {
             alert: modalAlertSpy,
+            confirm: modalConfirmSpy,
         },
     }).module,
     storage: () => createStorageModuleStub({
@@ -110,6 +115,9 @@ vi.mock('@/sync/store/hooks', () => ({
 vi.mock('@/components/ui/lists/ItemList', () => createPassThroughModule(['ItemList']));
 vi.mock('@/components/ui/lists/ItemGroup', () => createPassThroughModule(['ItemGroup']));
 vi.mock('@/components/ui/lists/Item', () => createPassThroughModule(['Item']));
+vi.mock('@/components/ui/lists/ItemRowActions', () => ({
+    ItemRowActions: (props: Record<string, unknown>) => React.createElement('ItemRowActions', props),
+}));
 vi.mock('@/components/ui/forms/dropdown/DropdownMenu', () => createPassThroughModule(['DropdownMenu']));
 vi.mock('@/components/ui/popover', () => createPassThroughModule(['PopoverScope']));
 vi.mock('@/components/ui/text/Text', () => createPassThroughModule(['Text', 'TextInput']));
@@ -119,6 +127,7 @@ vi.mock('@/components/ui/status/StatusDot', () => ({
 
 vi.mock('@/sync/ops/machineDirectSessions', () => ({
     machineDirectSessionsCandidatesList: candidatesListSpy,
+    machineDirectSessionCandidateDelete: candidateDeleteSpy,
     machineDirectSessionLinkEnsure: linkEnsureSpy,
 }));
 
@@ -155,6 +164,20 @@ function findDropdownMenuByTriggerTestId(
     return screen.findAllByType('DropdownMenu').find((node) => node.props?.itemTrigger?.itemProps?.testID === testID);
 }
 
+type CandidateActionsProps = Readonly<{
+    deleting: boolean;
+    onDelete: () => void | Promise<void>;
+}>;
+
+function findCandidateActionsProps(
+    screen: { findByTestId: (testID: string) => { props: Record<string, any> } | null },
+    remoteSessionId: string,
+): CandidateActionsProps | undefined {
+    const rightElement = screen.findByTestId(`direct-session-candidate:${remoteSessionId}`)?.props.rightElement;
+    const children = React.Children.toArray(rightElement?.props?.children) as React.ReactElement<CandidateActionsProps>[];
+    return children.find((child) => typeof child?.props?.onDelete === 'function')?.props;
+}
+
 describe('DirectSessionsBrowseScreen', () => {
     beforeEach(() => {
         machinesState = [
@@ -163,9 +186,12 @@ describe('DirectSessionsBrowseScreen', () => {
         ];
         candidatesListSpy.mockClear();
         linkEnsureSpy.mockClear();
+        candidateDeleteSpy.mockClear();
         routerPushSpy.mockClear();
         routerNavigateSpy.mockClear();
         modalAlertSpy.mockClear();
+        modalConfirmSpy.mockClear();
+        modalConfirmSpy.mockResolvedValue(true);
     });
 
     it('loads candidates for the default machine and provider', async () => {
@@ -692,5 +718,158 @@ describe('DirectSessionsBrowseScreen', () => {
         expect(onPickRemoteSessionId).toHaveBeenCalledWith('codex-session-1');
         expect(routerPushSpy).not.toHaveBeenCalled();
         expect(linkEnsureSpy).not.toHaveBeenCalled();
+    });
+
+    it('hides provider deletion when the candidate listing did not negotiate it', async () => {
+        candidatesListSpy.mockResolvedValueOnce({
+            ok: true,
+            candidates: [{ remoteSessionId: 'remote-1', title: 'Provider session', updatedAtMs: 1 }],
+            nextCursor: null,
+            capabilities: { deleteCandidate: false },
+        });
+        const { DirectSessionsBrowseScreen } = await directSessionsBrowseScreenModulePromise;
+        const screen = await renderScreen(
+            <DirectSessionsBrowseScreen
+                interaction="pickRemoteSessionId"
+                lockScope={{
+                    machineId: 'machine-1',
+                    providerId: 'kimi',
+                    source: { kind: 'acpSessionList', cwd: '/work/repo' },
+                }}
+            />,
+        );
+        await flushHookEffects();
+
+        expect(screen.findAllByType('ItemRowActions')).toHaveLength(0);
+        expect(candidateDeleteSpy).not.toHaveBeenCalled();
+    });
+
+    it('confirms and deletes one provider-owned candidate, showing pending state and removing only after success', async () => {
+        candidatesListSpy.mockResolvedValueOnce({
+            ok: true,
+            candidates: [{ remoteSessionId: 'remote-1', title: 'Provider session', updatedAtMs: 1 }],
+            nextCursor: null,
+            capabilities: { deleteCandidate: true },
+        });
+        let resolveDelete!: (value: { ok: true; deleted: true }) => void;
+        const pendingDelete = new Promise<{ ok: true; deleted: true }>((resolve) => { resolveDelete = resolve; });
+        candidateDeleteSpy.mockImplementationOnce(() => pendingDelete);
+
+        const { DirectSessionsBrowseScreen } = await directSessionsBrowseScreenModulePromise;
+        const screen = await renderScreen(
+            <DirectSessionsBrowseScreen
+                interaction="pickRemoteSessionId"
+                lockScope={{
+                    machineId: 'machine-1',
+                    serverId: 'server-1',
+                    providerId: 'kimi',
+                    source: { kind: 'acpSessionList', cwd: '/work/repo' },
+                }}
+            />,
+        );
+        await flushHookEffects();
+
+        const candidateActions = findCandidateActionsProps(screen, 'remote-1');
+        expect(candidateActions).toBeTruthy();
+
+        await act(async () => {
+            candidateActions?.onDelete();
+        });
+        expect(candidateDeleteSpy).toHaveBeenCalledWith({
+            machineId: 'machine-1',
+            providerId: 'kimi',
+            source: { kind: 'acpSessionList', cwd: '/work/repo' },
+            remoteSessionId: 'remote-1',
+        }, { serverId: 'server-1' });
+        expect(screen.findByTestId('direct-session-candidate:remote-1')?.props.loading).toBe(true);
+
+        await act(async () => {
+            resolveDelete({ ok: true, deleted: true });
+            await pendingDelete;
+        });
+        expect(screen.findByTestId('direct-session-candidate:remote-1')).toBeNull();
+        expect(candidateDeleteSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('disables every provider delete action while keeping pending loading on only the deleting row', async () => {
+        candidatesListSpy.mockResolvedValueOnce({
+            ok: true,
+            candidates: [
+                { remoteSessionId: 'remote-1', title: 'First provider session', updatedAtMs: 2 },
+                { remoteSessionId: 'remote-2', title: 'Second provider session', updatedAtMs: 1 },
+            ],
+            nextCursor: null,
+            capabilities: { deleteCandidate: true },
+        });
+        let resolveDelete!: (value: { ok: true; deleted: true }) => void;
+        const pendingDelete = new Promise<{ ok: true; deleted: true }>((resolve) => { resolveDelete = resolve; });
+        candidateDeleteSpy.mockImplementationOnce(() => pendingDelete);
+
+        const { DirectSessionsBrowseScreen } = await directSessionsBrowseScreenModulePromise;
+        const screen = await renderScreen(
+            <DirectSessionsBrowseScreen
+                interaction="pickRemoteSessionId"
+                lockScope={{
+                    machineId: 'machine-1',
+                    providerId: 'kimi',
+                    source: { kind: 'acpSessionList', cwd: '/work/repo' },
+                }}
+            />,
+        );
+        await flushHookEffects();
+
+        await act(async () => {
+            findCandidateActionsProps(screen, 'remote-1')?.onDelete();
+        });
+
+        expect(findCandidateActionsProps(screen, 'remote-1')?.deleting).toBe(true);
+        expect(findCandidateActionsProps(screen, 'remote-2')?.deleting).toBe(true);
+        expect(screen.findByTestId('direct-session-candidate:remote-1')?.props.loading).toBe(true);
+        expect(screen.findByTestId('direct-session-candidate:remote-2')?.props.loading).toBe(false);
+
+        await act(async () => {
+            resolveDelete({ ok: true, deleted: true });
+            await pendingDelete;
+        });
+        expect(findCandidateActionsProps(screen, 'remote-2')?.deleting).toBe(false);
+        expect(screen.findByTestId('direct-session-candidate:remote-2')?.props.loading).toBe(false);
+    });
+
+    it('preserves a provider candidate and makes retry available after deletion fails', async () => {
+        candidatesListSpy.mockResolvedValueOnce({
+            ok: true,
+            candidates: [{ remoteSessionId: 'remote-1', title: 'Provider session', updatedAtMs: 1 }],
+            nextCursor: null,
+            capabilities: { deleteCandidate: true },
+        });
+        candidateDeleteSpy.mockResolvedValueOnce({
+            ok: false,
+            errorCode: 'internal_error',
+            error: 'provider refused deletion',
+        });
+
+        const { DirectSessionsBrowseScreen } = await directSessionsBrowseScreenModulePromise;
+        const screen = await renderScreen(
+            <DirectSessionsBrowseScreen
+                interaction="pickRemoteSessionId"
+                lockScope={{
+                    machineId: 'machine-1',
+                    providerId: 'kimi',
+                    source: { kind: 'acpSessionList', cwd: '/work/repo' },
+                }}
+            />,
+        );
+        await flushHookEffects();
+
+        const candidateActions = findCandidateActionsProps(screen, 'remote-1');
+        await act(async () => {
+            candidateActions?.onDelete();
+            await Promise.resolve();
+            await Promise.resolve();
+        });
+
+        expect(screen.findByTestId('direct-session-candidate:remote-1')).toBeTruthy();
+        expect(modalAlertSpy).toHaveBeenCalledWith('common.error', 'provider refused deletion');
+        expect(findCandidateActionsProps(screen, 'remote-1')?.deleting).toBe(false);
     });
 });

@@ -7,6 +7,8 @@ import type {
   invokeProviderCliInstall as invokeProviderCliInstallDefault,
 } from '@/runtime/managedTools/invokeProviderCliInstall';
 import type { runDoctorCommand as runDoctorCommandDefault } from '@/ui/doctor';
+import { createStepPrinter, fail } from '@happier-dev/cli-common/output';
+import { describeProviderCliInstallMode, runProviderCliInstallStep } from '@/runtime/managedTools/providerCliInstallStep';
 
 function usage(): string {
   return [
@@ -50,27 +52,6 @@ function isAgentId(value: string): value is AgentId {
   return (AGENT_IDS as readonly string[]).includes(value);
 }
 
-function printProviderInstallResult(
-  providerId: AgentId,
-  result: Awaited<ReturnType<typeof invokeProviderCliInstallDefault>>,
-  log: InstallCliDeps['log'],
-): void {
-  if (!result.ok) return;
-  const runtimeSpec = getProviderCliRuntimeSpec(providerId);
-  if (result.alreadyInstalled) {
-    log(`${runtimeSpec.title} is already installed.`);
-  } else if (result.plan.installMode === 'vendor_recipe') {
-    log(`Installed ${runtimeSpec.title}.`);
-  } else if (result.plan.installMode === 'github_release_binary') {
-    log(`Installed ${runtimeSpec.title} via managed release binary.`);
-  } else if (result.plan.installMode === 'managed_package') {
-    log(`Installed ${runtimeSpec.title} via managed package runtime.`);
-  }
-  if (result.logPath) {
-    log(`Install log: ${result.logPath}`);
-  }
-}
-
 export async function runInstallCliCommand(
   context: CommandContext,
   deps: InstallCliDeps = {
@@ -92,7 +73,7 @@ export async function runInstallCliCommand(
     if (subcommand === 'provider') {
       const providerIdRaw = context.args[2]?.trim() ?? '';
       if (!providerIdRaw) {
-        deps.error(chalk.red('Error:'), 'Missing provider id.');
+        deps.error(fail('Missing provider id.'));
         deps.log(usage());
         deps.exit(1);
         return;
@@ -102,21 +83,23 @@ export async function runInstallCliCommand(
         return;
       }
       if (!isAgentId(providerIdRaw)) {
-        deps.error(chalk.red('Error:'), `Unknown provider id: ${providerIdRaw}`);
+        deps.error(fail(`Unknown provider id: ${providerIdRaw}`));
         deps.log(usage());
         deps.exit(1);
         return;
       }
 
       const flags = parseProviderInstallFlags(context.args.slice(3));
-      const result = await deps.invokeProviderCliInstall({
+      // A dry run installs nothing, so it prints its plan instead of an install step.
+      const steps = createStepPrinter({ enabled: !flags.dryRun });
+      const result = await runProviderCliInstallStep(steps, getProviderCliRuntimeSpec(providerIdRaw).title, () => deps.invokeProviderCliInstall({
         agentId: providerIdRaw,
         params: flags,
         env: process.env,
         nodePlatform: process.platform,
-      });
+      }));
       if (!result.ok) {
-        deps.error(chalk.red('Error:'), result.errorMessage);
+        deps.error(fail(result.errorMessage));
         if (result.logPath) {
           deps.log(`Install log: ${result.logPath}`);
         }
@@ -124,24 +107,26 @@ export async function runInstallCliCommand(
         return;
       }
       if (flags.dryRun) {
-        deps.log(`Dry run: would install ${result.plan.title} via ${result.plan.installMode}.`);
+        deps.log(`Dry run: would install ${result.plan.title} via ${describeProviderCliInstallMode(result.plan.installMode)}.`);
         if (result.logPath) {
           deps.log(`Install log: ${result.logPath}`);
         }
         return;
       }
-      printProviderInstallResult(providerIdRaw, result, deps.log);
+      if (result.logPath) {
+        deps.log(`Install log: ${result.logPath}`);
+      }
       return;
     }
     if (subcommand === 'help' || subcommand === '--help' || subcommand === '-h') {
       deps.log(usage());
       return;
     }
-    deps.error(chalk.red('Error:'), `Unknown install subcommand: ${subcommand}`);
+    deps.error(fail(`Unknown install subcommand: ${subcommand}`));
     deps.log(usage());
     deps.exit(1);
   } catch (error) {
-    deps.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    deps.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     if (process.env.DEBUG) {
       deps.error(error);
     }

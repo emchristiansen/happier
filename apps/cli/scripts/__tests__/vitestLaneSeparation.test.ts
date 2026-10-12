@@ -38,15 +38,14 @@ describe('Vitest lane separation', () => {
 
         const fastScripts = [
             packageJson.scripts?.['test:unit'],
+            packageJson.scripts?.['test:unit:vitest'],
             packageJson.scripts?.['test:integration'],
         ].join('\n');
 
-        expect(packageJson.scripts?.['test:unit']).toContain(
-            'test:unit:vitest',
-        );
         expect(packageJson.scripts?.['test:unit:vitest']).toBe(
             'node scripts/runVitestShards.mjs --config vitest.config.ts',
         );
+        expect(packageJson.scripts?.['test:unit']).toContain('test:unit:vitest');
         expect(packageJson.scripts?.['test:unit']).not.toContain(
             'vitest run --config vitest.config.ts',
         );

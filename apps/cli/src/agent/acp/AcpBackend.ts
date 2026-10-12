@@ -17,6 +17,7 @@ import {
   type InitializeResponse,
   type NewSessionRequest,
   type ForkSessionRequest,
+  type ListSessionsRequest,
   type LoadSessionRequest,
   type PromptRequest,
   type PromptResponse,
@@ -45,7 +46,7 @@ import {
   resolveAcpAuthenticationSelection,
   type AcpAuthentication,
 } from './AcpAuthentication';
-import { normalizeAcpConfigOptionChoices } from './configOptionChoiceNormalization';
+import { isAcpModeConfigOptionLike, normalizeAcpConfigOptionChoices } from './configOptionChoiceNormalization';
 import {
   readNonBlankSessionControlIdentifier,
   readSessionControlValueId,
@@ -58,6 +59,7 @@ import {
   type ToolNameContext,
   DefaultTransport,
 } from '../transport';
+import { classifyProviderOutputFailure } from '@/agent/runtime/classifyProviderOutputFailure';
 import {
   type SessionUpdate,
   type HandlerContext,
@@ -77,7 +79,7 @@ import {
   markToolCallRunningAfterPermission,
   markToolCallWaitingForPermission,
 } from './sessionUpdateHandlers';
-import { withRetry } from './withRetry';
+import { createAcpRequestFailureLogRecord, withRetry } from './withRetry';
 import { nodeToWebStreams } from './nodeToWebStreams';
 import { buildAcpSpawnSpec } from './acpSpawn';
 import { killProcessTree } from '@/agent/runtime/process/killProcessTree';
@@ -108,6 +110,10 @@ import { mapStopReasonToAcpTurnOutcome, readPromptStopReason } from './backend/t
 import { abortPendingAcpPermissionRequests } from './backend/permissions/acpPermissionFinalization';
 import { SessionControlApplyError } from '@/agent/runtime/sessionControlApplyError';
 import { buildAcpPromptContentBlocks } from './prompt/buildAcpPromptContentBlocks';
+import type {
+  InFlightSteerDeliveryIdentity,
+  InFlightSteerPromptOptions,
+} from '@/agent/runtime/permission/bindPermissionModeQueue';
 import {
   createAcpClientConnection,
   type AcpClientConnection,
@@ -271,6 +277,15 @@ const RETRY_CONFIG = {
   maxDelayMs: 5000,
 } as const;
 
+class AcpStartupTimeoutError extends Error {
+  readonly retryable = false;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'AcpStartupTimeoutError';
+  }
+}
+
 /**
  * Extended RequestPermissionRequest with additional fields that may be present
  */
@@ -382,6 +397,10 @@ export type SessionModelState = {
 };
 
 export type AcpSessionModelAdapter = Readonly<{
+  projectModelId?: (params: Readonly<{
+    modelId: string;
+    modelState: Readonly<SessionModelState> | null;
+  }>) => string;
   projectModel?: (params: Readonly<{
     rawModel: Readonly<Record<string, unknown>>;
     normalizedModel: Readonly<SessionModel>;
@@ -390,6 +409,19 @@ export type AcpSessionModelAdapter = Readonly<{
     rawModel: Readonly<Record<string, unknown>>;
     normalizedModelOptions: ReadonlyArray<SessionConfigOption>;
   }>) => ReadonlyArray<SessionConfigOption>;
+  projectModelState?: (params: Readonly<{
+    normalizedModelState: Readonly<SessionModelState>;
+  }>) => Readonly<SessionModelState>;
+  deriveModelStateFromConfigOptions?: (params: Readonly<{
+    configOptions: ReadonlyArray<SessionConfigOption>;
+  }>) => Readonly<SessionModelState> | null;
+  resolveModelUpdate?: (params: Readonly<{
+    modelId: string;
+    modelState: Readonly<SessionModelState> | null;
+  }>) => Readonly<{
+    modelId: string;
+    requestMeta?: Readonly<Record<string, unknown>>;
+  }> | undefined;
   resolveConfigOptionModelUpdate?: (params: Readonly<{
     configId: string;
     value: SessionConfigOptionValueId;
@@ -483,7 +515,7 @@ function normalizeSessionConfigOptions(raw: ReadonlyArray<unknown>): SessionConf
       currentValue,
       ...(description ? { description } : {}),
       ...(category ? { category } : {}),
-      ...(options.length > 0 ? { options } : {}),
+      ...(options.length > 0 || optionsRaw?.length === 0 ? { options } : {}),
     });
   }
 
@@ -681,6 +713,14 @@ export interface AcpBackendOptions {
   /** Environment variables to pass to the agent */
   env?: NodeJS.ProcessEnv;
 
+  /** Provider-owned, process-scoped launch materialization performed immediately before spawn. */
+  prepareProcessLaunch?: () => Promise<Readonly<{
+    command?: string;
+    args?: readonly string[];
+    env?: NodeJS.ProcessEnv;
+    cleanup?: () => void | Promise<void>;
+  }>>;
+
   /** Inherited process environment variables to remove before provider env overrides are applied */
   unsetEnv?: readonly string[];
 
@@ -716,25 +756,27 @@ export interface AcpBackendOptions {
   /** Provider-owned projection/application for model metadata not standardized by ACP. */
   sessionModelAdapter?: AcpSessionModelAdapter;
 
+  /** False hides and rejects mode controls when the provider's semantics are not supported. */
+  sessionModesEnabled?: boolean;
+
   /** Provider-owned in-flight steer extension. Omit to retain the ACP session/prompt contract. */
   inFlightSteer?: AcpInFlightSteerAdapter;
 
   /** Provider-owned projection for non-standard prompt usage fields and accounting semantics. */
   promptUsageAdapter?: AcpPromptUsageAdapter;
+
+  /** Configured-catalog policy for session/load. Undefined retains built-in provider behavior. */
+  declaredSessionLoadSupport?: boolean;
 }
 
-export type AcpSteerDeliveryIdentity = Readonly<{
-  localId?: string | null;
-  localIds?: readonly string[];
-  userMessageSeq?: number | null;
-  userMessageSeqs?: readonly number[];
-}>;
+export type AcpSteerDeliveryIdentity = InFlightSteerDeliveryIdentity;
 
 export type AcpInFlightSteerAdapter = Readonly<{
   method: string;
   buildParams(input: Readonly<{
     sessionId: string;
     prompt: string;
+    content: readonly ContentBlock[];
     deliveryIdentity?: AcpSteerDeliveryIdentity;
   }>): unknown;
   isAccepted(response: unknown): boolean;
@@ -754,11 +796,71 @@ export type AcpPromptUsageAdapter = Readonly<{
 }>;
 
 /**
+ * Session lifecycle methods the live agent advertised during `initialize`. The catalog declaration
+ * only permits Happier to offer a surface; this handshake result is the runtime authority and every
+ * optional session method is checked against it before dispatch.
+ */
+export type NegotiatedAcpSessionCapabilities = Readonly<{
+  list: boolean;
+  close: boolean;
+  delete: boolean;
+}>;
+
+const NO_NEGOTIATED_ACP_SESSION_CAPABILITIES: NegotiatedAcpSessionCapabilities = Object.freeze({
+  list: false,
+  close: false,
+  delete: false,
+});
+
+/** A session method the agent's own handshake did not advertise; never retried against the agent. */
+export class AcpSessionCapabilityNotNegotiatedError extends Error {
+  constructor(readonly agentName: string, readonly acpMethod: string) {
+    super(
+      `ACP agent '${agentName}' is declared to support ${acpMethod} but did not negotiate it during ACP initialize.`,
+    );
+    this.name = 'AcpSessionCapabilityNotNegotiatedError';
+  }
+}
+
+export type AcpListedSession = Readonly<{
+  /** Provider-owned opaque identifier, preserved byte-for-byte after nonblank validation. */
+  sessionId: string;
+  cwd: string | null;
+  title: string | null;
+  updatedAtMs: number | null;
+}>;
+
+export type AcpSessionListPage = Readonly<{
+  sessions: readonly AcpListedSession[];
+  nextCursor: string | null;
+  canDelete: boolean;
+}>;
+
+function readAcpNegotiatedSessionCapabilities(agentCapabilities: unknown): NegotiatedAcpSessionCapabilities {
+  const sessionCapabilities = asRecord(asRecord(agentCapabilities)?.sessionCapabilities);
+  if (!sessionCapabilities) return NO_NEGOTIATED_ACP_SESSION_CAPABILITIES;
+  // ACP advertises each session method as an object; omitted and null both mean unsupported.
+  const advertises = (key: string): boolean => asRecord(sessionCapabilities[key]) !== null;
+  return Object.freeze({
+    list: advertises('list'),
+    close: advertises('close'),
+    delete: advertises('delete'),
+  });
+}
+
+function readAcpListedSessionUpdatedAtMs(value: unknown): number | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
  * ACP backend using the official @agentclientprotocol/sdk
  */
 export class AcpBackend implements AgentBackend {
   private listeners: AgentMessageHandler[] = [];
   private process: ChildProcess | null = null;
+  private processLaunchCleanup: (() => void | Promise<void>) | null = null;
   private stderrAppender: BoundedTextFileAppender | null = null;
   private readonly summarizeStderrForLogs = createAcpStderrLogSummarizer();
   private readonly recentStderrSummaries: string[] = [];
@@ -766,7 +868,10 @@ export class AcpBackend implements AgentBackend {
   private readonly sessionUpdateShapeLogger = createEventShapeLoggerForLog({ logger, scope: 'acp-backend' });
   private connection: AcpClientConnection | null = null;
   private acpSessionId: string | null = null;
+  private negotiatedSessionCapabilities: NegotiatedAcpSessionCapabilities = NO_NEGOTIATED_ACP_SESSION_CAPABILITIES;
+  private negotiatedSessionLoadSupport: boolean | null = null;
   private disposed = false;
+  private disposePromise: Promise<void> | null = null;
   private replayCapture: AcpReplayCapture | null = null;
   /** Sole tool lifecycle/merge/timeout/finalization owner. */
   private readonly toolCalls: AcpToolCallTracker;
@@ -799,6 +904,10 @@ export class AcpBackend implements AgentBackend {
 
   getSessionConfigOptionsState(): ReadonlyArray<SessionConfigOption> | null {
     return this.sessionConfigOptionsState;
+  }
+
+  getNegotiatedSessionLoadSupport(): boolean | null {
+    return this.negotiatedSessionLoadSupport;
   }
 
   getLastTurnOutcome(): AcpTurnOutcome | null {
@@ -931,7 +1040,7 @@ export class AcpBackend implements AgentBackend {
   }
 
   private createStartupTimeoutError(operationName: string, timeoutMs: number): Error {
-    return new Error(
+    return new AcpStartupTimeoutError(
       `${operationName} timeout after ${timeoutMs}ms - ${this.transport.agentName} did not respond${this.buildStartupFailureDiagnosticSuffix()}`,
     );
   }
@@ -956,6 +1065,8 @@ export class AcpBackend implements AgentBackend {
     this.process = null;
     this.connection = null;
     this.acpSessionId = null;
+    this.negotiatedSessionCapabilities = NO_NEGOTIATED_ACP_SESSION_CAPABILITIES;
+    this.negotiatedSessionLoadSupport = null;
 
     connection?.close();
 
@@ -976,6 +1087,18 @@ export class AcpBackend implements AgentBackend {
     }
 
     await connection?.closed.catch(() => undefined);
+    await this.cleanupPreparedProcessLaunch();
+  }
+
+  private async cleanupPreparedProcessLaunch(): Promise<void> {
+    const cleanup = this.processLaunchCleanup;
+    this.processLaunchCleanup = null;
+    if (!cleanup) return;
+    try {
+      await cleanup();
+    } catch (error) {
+      logger.debug('[AcpBackend] Failed to clean up prepared process launch state (non-fatal)', error);
+    }
   }
 
   private buildSpawnEnv(): NodeJS.ProcessEnv {
@@ -1034,25 +1157,34 @@ export class AcpBackend implements AgentBackend {
     };
   }
 
-  private async createConnectionAndInitialize(params: { operationId: string }): Promise<{ initTimeout: number }> {
+  private async createConnectionAndInitialize(params: { operationId: string }): Promise<{
+    initTimeout: number;
+    negotiatedSessionLoadSupport: boolean;
+    negotiatedSessionCapabilities: NegotiatedAcpSessionCapabilities;
+  }> {
     logger.debug(`[AcpBackend] Starting process + initializing connection (op=${params.operationId})`);
 
     if (this.process || this.connection) {
       throw new Error('ACP backend is already initialized');
     }
 
+    this.negotiatedSessionLoadSupport = null;
+
     this.resetExtensionAbortControllerForTurn();
     this.recentStderrSummaries.length = 0;
     this.lastProcessExitDetail = null;
 
     try {
+      const preparedLaunch = await this.options.prepareProcessLaunch?.();
+      this.processLaunchCleanup = preparedLaunch?.cleanup ?? null;
+
       // Spawn the ACP agent process.
       // Use cross-spawn so Windows quoting/.cmd resolution is handled safely without joining args.
       const spec = buildAcpSpawnSpec({
-        command: this.options.command,
-        args: this.options.args || [],
+        command: preparedLaunch?.command ?? this.options.command,
+        args: preparedLaunch?.args ? [...preparedLaunch.args] : (this.options.args || []),
         cwd: this.options.cwd,
-        env: this.buildSpawnEnv(),
+        env: { ...this.buildSpawnEnv(), ...preparedLaunch?.env },
       });
 
 	    this.process = spawn(spec.command, spec.args, spec.options);
@@ -1251,18 +1383,18 @@ export class AcpBackend implements AgentBackend {
 
             const analysisText = trimmed.length > 5000 ? trimmed.slice(0, 5000) : trimmed;
             const lower = analysisText.toLowerCase();
+            const outputFailure = classifyProviderOutputFailure(analysisText);
             const looksLikeError =
-              lower.startsWith('error') ||
+              lower.startsWith('error:') ||
               lower.includes('error:') ||
               lower.includes('exception') ||
               lower.includes('traceback') ||
               lower.includes('invalid_request') ||
               lower.includes('invalid request') ||
-              lower.includes('unauthorized') ||
               lower.includes('forbidden') ||
               lower.includes('permission denied') ||
-              (/\b(4\d\d|5\d\d)\b/.test(lower) &&
-                (lower.includes('http') || lower.includes('status') || lower.includes('error') || lower.includes('request'))) ||
+              outputFailure.authenticationError ||
+              outputFailure.providerStatusFailure ||
               (lower.includes('exceeds') && lower.includes('bytes') && trimmed.includes('>'));
             if (!looksLikeError) return;
 
@@ -1576,6 +1708,12 @@ export class AcpBackend implements AgentBackend {
     );
 
     logger.debug(`[AcpBackend] Initialize completed`);
+    const initResponseRecord = asRecord(initResponse);
+    const agentCapabilities = asRecord(initResponseRecord?.agentCapabilities);
+    const negotiatedSessionLoadSupport = agentCapabilities?.loadSession === true;
+    const negotiatedSessionCapabilities = readAcpNegotiatedSessionCapabilities(agentCapabilities);
+    this.negotiatedSessionCapabilities = negotiatedSessionCapabilities;
+    this.negotiatedSessionLoadSupport = negotiatedSessionLoadSupport;
 
     if (this.options.authentication) {
       const advertisedMethodIds = new Set<string>();
@@ -1634,9 +1772,12 @@ export class AcpBackend implements AgentBackend {
       logger.debug(`[AcpBackend] Authenticate completed`);
     }
 
-    return { initTimeout };
+    return { initTimeout, negotiatedSessionLoadSupport, negotiatedSessionCapabilities };
   } catch (error) {
-    logger.debug('[AcpBackend] Initialization failed; cleaning up process/connection', error);
+    logger.debug(
+      '[AcpBackend] Initialization failed; cleaning up process/connection',
+      createAcpRequestFailureLogRecord({ operation: 'Initialize', error }),
+    );
     await this.cleanupInitializedProcessConnection({ graceMs: 250 });
     throw error;
   }
@@ -1722,12 +1863,16 @@ export class AcpBackend implements AgentBackend {
 
     } catch (error) {
       // Log to file only, not console
-      logger.debug('[AcpBackend] Error starting session:', error);
+      logger.debug(
+        '[AcpBackend] Error starting session:',
+        createAcpRequestFailureLogRecord({ operation: 'StartSession', error }),
+      );
       this.emit({ 
         type: 'status', 
         status: 'error', 
         detail: error instanceof Error ? error.message : String(error) 
       });
+      await this.cleanupInitializedProcessConnection({ graceMs: 250 });
       throw error;
     }
   }
@@ -1741,6 +1886,9 @@ export class AcpBackend implements AgentBackend {
     if (!normalized) {
       throw new Error('Session ID is required');
     }
+    if (this.options.declaredSessionLoadSupport === false) {
+      throw new Error(`Configured ACP backend '${this.options.agentName}' does not support session/load.`);
+    }
 
     this.emit({ type: 'status', status: 'starting' });
     // Reset per-session caches
@@ -1749,7 +1897,12 @@ export class AcpBackend implements AgentBackend {
     this.toolCalls.reset();
 
     try {
-      const { initTimeout } = await this.createConnectionAndInitialize({ operationId: randomUUID() });
+      const { initTimeout, negotiatedSessionLoadSupport } = await this.createConnectionAndInitialize({ operationId: randomUUID() });
+      if (this.options.declaredSessionLoadSupport === true && !negotiatedSessionLoadSupport) {
+        throw new Error(
+          `Configured ACP backend '${this.options.agentName}' advertises session/load in its catalog but did not negotiate loadSession during ACP initialize.`,
+        );
+      }
 
       const loadSessionRequest: LoadSessionRequest = {
         sessionId: normalized,
@@ -1802,7 +1955,10 @@ export class AcpBackend implements AgentBackend {
       this.emitIdleStatus();
       return { sessionId: normalized };
     } catch (error) {
-      logger.debug('[AcpBackend] Error loading session:', error);
+      logger.debug(
+        '[AcpBackend] Error loading session:',
+        createAcpRequestFailureLogRecord({ operation: 'LoadSession', error }),
+      );
       this.emit({
         type: 'status',
         status: 'error',
@@ -1876,7 +2032,10 @@ export class AcpBackend implements AgentBackend {
 
       return { sessionId: forkedSessionId };
     } catch (error) {
-      logger.debug('[AcpBackend] Error forking session:', error);
+      logger.debug(
+        '[AcpBackend] Error forking session:',
+        createAcpRequestFailureLogRecord({ operation: 'ForkSession', error }),
+      );
       this.emit({
         type: 'status',
         status: 'error',
@@ -1884,6 +2043,78 @@ export class AcpBackend implements AgentBackend {
       });
       throw error;
     }
+  }
+
+  /**
+   * List the agent's own sessions through ACP `session/list`.
+   *
+   * The returned identifiers are opaque provider bytes and are only valid as resume input for a new
+   * Happier-owned ACP session. Listing implies nothing about takeover, following, writer safety,
+   * terminal attachment, or transcript availability.
+   */
+  async listSessions(params: Readonly<{ cwd?: string | null; cursor?: string | null }> = {}): Promise<AcpSessionListPage> {
+    if (this.disposed) {
+      throw new Error('Backend has been disposed');
+    }
+
+    const negotiated = this.connection
+      ? this.negotiatedSessionCapabilities
+      : (await this.createConnectionAndInitialize({ operationId: randomUUID() })).negotiatedSessionCapabilities;
+    if (!negotiated.list) {
+      throw new AcpSessionCapabilityNotNegotiatedError(this.transport.agentName, 'session/list');
+    }
+
+    const cwd = typeof params.cwd === 'string' && params.cwd.trim().length > 0 ? params.cwd : null;
+    const cursor = readNonBlankOpaqueIdentifier(params.cursor);
+    const request: ListSessionsRequest = {
+      ...(cwd ? { cwd } : {}),
+      ...(cursor ? { cursor } : {}),
+    };
+
+    const response = await this.connection!.peer.listSessions(request);
+    const listed = Array.isArray(response?.sessions) ? response.sessions : [];
+    const sessions: AcpListedSession[] = [];
+    for (const entry of listed) {
+      const record = asRecord(entry);
+      // A blank identifier cannot be resumed; surfacing it would offer a broken candidate.
+      const sessionId = readNonBlankOpaqueIdentifier(record?.sessionId);
+      if (!sessionId) continue;
+      const title = typeof record?.title === 'string' && record.title.trim().length > 0 ? record.title : null;
+      const listedCwd = typeof record?.cwd === 'string' && record.cwd.trim().length > 0 ? record.cwd : null;
+      sessions.push({
+        sessionId,
+        cwd: listedCwd,
+        title,
+        updatedAtMs: readAcpListedSessionUpdatedAtMs(record?.updatedAt),
+      });
+    }
+
+    return {
+      sessions,
+      nextCursor: readNonBlankOpaqueIdentifier(response?.nextCursor),
+      canDelete: negotiated.delete,
+    };
+  }
+
+  /** Delete one provider-owned session through ACP `session/delete`. */
+  async deleteSession(params: Readonly<{ sessionId: SessionId }>): Promise<void> {
+    if (this.disposed) {
+      throw new Error('Backend has been disposed');
+    }
+
+    const sessionId = readNonBlankOpaqueIdentifier(params.sessionId);
+    if (!sessionId) {
+      throw new Error('Session ID is required');
+    }
+
+    const negotiated = this.connection
+      ? this.negotiatedSessionCapabilities
+      : (await this.createConnectionAndInitialize({ operationId: randomUUID() })).negotiatedSessionCapabilities;
+    if (!negotiated.delete) {
+      throw new AcpSessionCapabilityNotNegotiatedError(this.transport.agentName, 'session/delete');
+    }
+
+    await this.connection!.peer.deleteSession({ sessionId });
   }
 
   /**
@@ -2126,6 +2357,7 @@ export class AcpBackend implements AgentBackend {
       }
 
       if (sessionUpdateType === 'current_mode_update') {
+        if (this.options.sessionModesEnabled === false) return;
         const modeId = readCurrentModeId(update);
         if (modeId && this.sessionModeState) {
           this.sessionModeState = {
@@ -2150,10 +2382,19 @@ export class AcpBackend implements AgentBackend {
         if (modelId && this.sessionModelState) {
           this.sessionModelState = {
             ...this.sessionModelState,
-            currentModelId: modelId,
+            currentModelId: this.options.sessionModelAdapter?.projectModelId?.({
+              modelId,
+              modelState: this.sessionModelState,
+            }) ?? modelId,
           };
         }
-        this.emit({ type: 'event', name: 'current_model_update', payload: { currentModelId: modelId ?? '' } });
+        const projectedModelId = modelId
+          ? this.options.sessionModelAdapter?.projectModelId?.({
+              modelId,
+              modelState: this.sessionModelState,
+            }) ?? modelId
+          : '';
+        this.emit({ type: 'event', name: 'current_model_update', payload: { currentModelId: projectedModelId } });
         return;
       }
 
@@ -2161,8 +2402,12 @@ export class AcpBackend implements AgentBackend {
         const configOptionsCandidate = (update as any).configOptions;
         const configOptionsRaw = Array.isArray(configOptionsCandidate) ? configOptionsCandidate : null;
         if (configOptionsRaw) {
-          const next = normalizeSessionConfigOptions(configOptionsRaw);
+          const next = this.normalizeSupportedSessionConfigOptions(configOptionsRaw);
           this.sessionConfigOptionsState = next;
+          const modelState = this.options.sessionModelAdapter?.deriveModelStateFromConfigOptions?.({
+            configOptions: next,
+          });
+          if (modelState) this.sessionModelState = modelState;
         }
         this.emit({
           type: 'event',
@@ -2344,6 +2589,7 @@ export class AcpBackend implements AgentBackend {
   }
 
   private seedSessionModesFromSessionResponse(sessionResponse: unknown): void {
+    if (this.options.sessionModesEnabled === false) return;
     const response = asRecord(sessionResponse);
     if (!response) return;
     const modesRaw = asRecord(response.modes);
@@ -2410,10 +2656,19 @@ export class AcpBackend implements AgentBackend {
       })
       .filter((model): model is SessionModel => Boolean(model));
 
-    if (availableModels.length === 0) return;
+    if (availableModelsRaw.length > 0 && availableModels.length === 0) return;
 
-    this.sessionModelState = { currentModelId, availableModels };
+    const normalizedModelState: SessionModelState = { currentModelId, availableModels };
+    this.sessionModelState = this.options.sessionModelAdapter?.projectModelState?.({ normalizedModelState })
+      ?? normalizedModelState;
     this.emit({ type: 'event', name: 'session_models_state', payload: this.sessionModelState });
+  }
+
+  private normalizeSupportedSessionConfigOptions(raw: ReadonlyArray<unknown>): SessionConfigOption[] {
+    const options = normalizeSessionConfigOptions(raw);
+    return this.options.sessionModesEnabled === false
+      ? options.filter((option) => !isAcpModeConfigOptionLike(option))
+      : options;
   }
 
   private seedSessionConfigOptionsFromSessionResponse(sessionResponse: unknown): void {
@@ -2424,8 +2679,13 @@ export class AcpBackend implements AgentBackend {
     const configOptionsRaw: unknown[] | null = Array.isArray(configOptionsCandidate) ? configOptionsCandidate : null;
     if (!configOptionsRaw) return;
 
-    const configOptions = normalizeSessionConfigOptions(configOptionsRaw);
+    const configOptions = this.normalizeSupportedSessionConfigOptions(configOptionsRaw);
     this.sessionConfigOptionsState = configOptions;
+    const modelState = this.options.sessionModelAdapter?.deriveModelStateFromConfigOptions?.({ configOptions });
+    if (modelState) {
+      this.sessionModelState = modelState;
+      this.emit({ type: 'event', name: 'session_models_state', payload: modelState });
+    }
     this.emit({ type: 'event', name: 'config_options_state', payload: { configOptions } });
   }
 
@@ -2453,6 +2713,10 @@ export class AcpBackend implements AgentBackend {
     if (!normalizedConfigId) {
       throw new Error('Config ID is required');
     }
+    if (this.options.sessionModesEnabled === false
+      && !this.sessionConfigOptionsState?.some((option) => option.id === normalizedConfigId)) {
+      throw SessionControlApplyError.definitive(new Error('Config option is unavailable or disabled by provider policy'));
+    }
 
     const normalizedValueId = normalizeConfigOptionValueId(valueId);
     if (normalizedValueId === null) {
@@ -2475,7 +2739,7 @@ export class AcpBackend implements AgentBackend {
         this.sessionModelState = {
           ...this.sessionModelState,
           availableModels: this.sessionModelState.availableModels.map((model) =>
-            model.id === modelUpdate.modelId && model.modelOptions
+            model.id === this.sessionModelState?.currentModelId && model.modelOptions
               ? {
                   ...model,
                   modelOptions: model.modelOptions.map((option) =>
@@ -2508,12 +2772,7 @@ export class AcpBackend implements AgentBackend {
     const configOptionsCandidate = response?.configOptions;
     const configOptionsRaw = Array.isArray(configOptionsCandidate) ? configOptionsCandidate : null;
     if (configOptionsRaw) {
-      const next = normalizeSessionConfigOptions(configOptionsRaw);
-      this.sessionConfigOptionsState = next.map((option) =>
-        option.id === normalizedConfigId
-          ? { ...option, currentValue: normalizedValueId }
-          : option
-      );
+      this.sessionConfigOptionsState = this.normalizeSupportedSessionConfigOptions(configOptionsRaw);
     } else if (this.sessionConfigOptionsState) {
       this.sessionConfigOptionsState = this.sessionConfigOptionsState.map((option) =>
         option.id === normalizedConfigId
@@ -2521,10 +2780,17 @@ export class AcpBackend implements AgentBackend {
           : option
       );
     }
+    if (this.sessionConfigOptionsState) {
+      const modelState = this.options.sessionModelAdapter?.deriveModelStateFromConfigOptions?.({
+        configOptions: this.sessionConfigOptionsState,
+      });
+      if (modelState) this.sessionModelState = modelState;
+    }
+    if (!this.sessionConfigOptionsState) return;
     this.emit({
       type: 'event',
       name: 'config_options_update',
-      payload: { configOptions: this.sessionConfigOptionsState ?? [] },
+      payload: { configOptions: this.sessionConfigOptionsState },
     });
   }
 
@@ -3223,15 +3489,15 @@ export class AcpBackend implements AgentBackend {
   async sendSteerPrompt(
     sessionId: SessionId,
     prompt: string,
-    deliveryIdentity?: AcpSteerDeliveryIdentity,
+    options?: InFlightSteerPromptOptions,
   ): Promise<void> {
-    await this.sendSteerPromptWithEvidence(sessionId, prompt, deliveryIdentity);
+    await this.sendSteerPromptWithEvidence(sessionId, prompt, options);
   }
 
   async sendSteerPromptWithEvidence(
     sessionId: SessionId,
     prompt: string,
-    deliveryIdentity?: AcpSteerDeliveryIdentity,
+    options?: InFlightSteerPromptOptions,
   ): Promise<AcpPromptSubmissionEvidence> {
     if (this.disposed) {
       throw new Error('Backend has been disposed');
@@ -3248,13 +3514,36 @@ export class AcpBackend implements AgentBackend {
       throw new Error('Session ID does not match the active ACP session');
     }
 
+    const connection = this.connection;
+    const turnGeneration = this.turnGeneration;
+    // Native extensions may queue input between turns; projection must not outlive a turn that was open.
+    const turnWasClosed = this.isTurnGenerationClosed(turnGeneration);
+    const { metadata, ...deliveryIdentity } = options ?? {};
+    const content = await buildAcpPromptContentBlocks({
+      cwd: this.options.cwd,
+      text: prompt,
+      metadata,
+    });
+    if (
+      this.disposed
+      || this.connection !== connection
+      || this.acpSessionId !== normalizedSessionId
+      || this.turnGeneration !== turnGeneration
+      || (!turnWasClosed && this.isTurnGenerationClosed(turnGeneration))
+    ) {
+      throw toAcpPromptSubmissionPhaseError(
+        'rejected_before_effect',
+        new Error('ACP steer is no longer current'),
+      );
+    }
     if (this.options.inFlightSteer) {
-      const response = await this.connection.peer.requestExtension(
+      const response = await connection.peer.requestExtension(
         this.options.inFlightSteer.method,
         this.options.inFlightSteer.buildParams({
           sessionId: normalizedSessionId,
           prompt,
-          ...(deliveryIdentity === undefined ? {} : { deliveryIdentity }),
+          content,
+          ...(options === undefined ? {} : { deliveryIdentity }),
         }),
       );
       if (!this.options.inFlightSteer.isAccepted(response)) {
@@ -3263,18 +3552,16 @@ export class AcpBackend implements AgentBackend {
       return { kind: 'accepted_without_exact_final_response' };
     }
 
-    const contentBlock: ContentBlock = { type: 'text', text: prompt };
     const promptRequest: PromptRequest = {
       sessionId: this.acpSessionId,
-      prompt: [contentBlock],
+      prompt: content,
     };
 
     // Intentionally do not toggle `waitingForResponse` or tool-call counters here.
     // This method is used for in-flight steering while a primary prompt is already running.
-    const turnGeneration = this.turnGeneration;
     const transportWriteReceipt = this.createAcpPromptTransportWriteReceipt(this.acpSessionId);
     const transportWriteSentinel = Symbol('acp-steer-transport-write');
-    const promptPromise = this.connection.peer.prompt(promptRequest);
+    const promptPromise = connection.peer.prompt(promptRequest);
     const finalResponseEvidence: Promise<AcpPromptExactFinalResponseEvidence> = promptPromise
       .then((response): AcpPromptExactFinalResponseEvidence => {
         this.handlePromptResponseForTurn(response, turnGeneration, () => {});
@@ -3311,6 +3598,9 @@ export class AcpBackend implements AgentBackend {
   }
 
   async setSessionMode(sessionId: SessionId, modeId: string): Promise<void> {
+    if (this.options.sessionModesEnabled === false) {
+      throw SessionControlApplyError.definitive(new Error('Session modes are disabled by provider policy'));
+    }
     if (this.disposed) {
       throw new Error('Backend has been disposed');
     }
@@ -3365,17 +3655,34 @@ export class AcpBackend implements AgentBackend {
       throw new Error('Model ID is required');
     }
 
+    let modelUpdate: ReturnType<NonNullable<AcpSessionModelAdapter['resolveModelUpdate']>>;
+    try {
+      modelUpdate = this.options.sessionModelAdapter?.resolveModelUpdate?.({
+        modelId: normalizedModelId,
+        modelState: this.sessionModelState,
+      });
+    } catch (error) {
+      throw SessionControlApplyError.definitive(error);
+    }
+    const providerModelId = modelUpdate?.modelId ?? normalizedModelId;
+    const providerRequestMeta = modelUpdate?.requestMeta ?? requestMeta;
+
     await applyAcpSessionControl(() => this.connection!.peer.setSessionModelLegacy({
       sessionId: normalizedSessionId,
-      modelId: normalizedModelId,
-      ...(requestMeta && Object.keys(requestMeta).length > 0 ? { _meta: requestMeta } : {}),
+      modelId: providerModelId,
+      ...(providerRequestMeta && Object.keys(providerRequestMeta).length > 0 ? { _meta: providerRequestMeta } : {}),
     }));
 
+    const projectedModelId = this.options.sessionModelAdapter?.projectModelId?.({
+      modelId: providerModelId,
+      modelState: this.sessionModelState,
+    })
+      ?? normalizedModelId;
     if (this.sessionModelState) {
-      this.sessionModelState = { ...this.sessionModelState, currentModelId: normalizedModelId };
+      this.sessionModelState = { ...this.sessionModelState, currentModelId: projectedModelId };
     }
 
-    this.emit({ type: 'event', name: 'current_model_update', payload: { currentModelId: normalizedModelId } });
+    this.emit({ type: 'event', name: 'current_model_update', payload: { currentModelId: projectedModelId } });
   }
 
   /**
@@ -3669,10 +3976,14 @@ export class AcpBackend implements AgentBackend {
   }
 
   async dispose(): Promise<void> {
-    if (this.disposed) return;
-    
-    logger.debug('[AcpBackend] Disposing backend');
+    if (this.disposePromise) return await this.disposePromise;
     this.disposed = true;
+    this.disposePromise = Promise.resolve().then(() => this.disposeResources());
+    return await this.disposePromise;
+  }
+
+  private async disposeResources(): Promise<void> {
+    logger.debug('[AcpBackend] Disposing backend');
 
     if (this.waitingForResponse || this.responseCompletionTimeout) {
       this.failPendingResponseWait(makeAbortError('Backend disposed'));
@@ -3700,6 +4011,19 @@ export class AcpBackend implements AgentBackend {
       } catch (error) {
         logger.debug('[AcpBackend] Error during graceful shutdown:', error);
       }
+      // Killing the local process only releases local resources. An agent that advertises
+      // `session/close` owns session resources beyond this process (a remote/cloud session, a
+      // shared worker), so release them explicitly before the transport goes away.
+      if (this.negotiatedSessionCapabilities.close) {
+        try {
+          await Promise.race([
+            this.connection.peer.closeSession({ sessionId: this.acpSessionId }),
+            new Promise((resolve) => setTimeout(resolve, 2000)),
+          ]);
+        } catch (error) {
+          logger.debug('[AcpBackend] Error closing ACP session during shutdown:', error);
+        }
+      }
     }
 
     const connection = this.connection;
@@ -3716,6 +4040,7 @@ export class AcpBackend implements AgentBackend {
       }
     }
     await connection?.closed.catch(() => undefined);
+    await this.cleanupPreparedProcessLaunch();
 
     // Clear timeouts
     if (this.postPromptCompletionIdleTimeout) {
@@ -3734,6 +4059,7 @@ export class AcpBackend implements AgentBackend {
     this.listeners = [];
     this.connection = null;
     this.acpSessionId = null;
+    this.negotiatedSessionCapabilities = NO_NEGOTIATED_ACP_SESSION_CAPABILITIES;
     this.toolCalls.dispose();
     await this.plans.reset();
     this.planStatePublisher = null;

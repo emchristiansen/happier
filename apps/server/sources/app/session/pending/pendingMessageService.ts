@@ -119,7 +119,7 @@ function readPrismaErrorCode(error: unknown): string | null {
 }
 
 type PendingOperationErrorContext = Readonly<{
-    operation: "delete" | "provider-acceptance";
+    operation: "enqueue" | "delete" | "provider-acceptance";
     sessionId: string;
     localId: string;
     diagnosticCorrelationId?: string;
@@ -300,7 +300,8 @@ export type EnqueuePendingMessageResult =
         badgeAttentionChanged: false;
         participantCursors: [];
       }
-    | { ok: false; error: "session-not-found" | "forbidden" | "invalid-params" | "requested-action-conflict" | "internal"; code?: EncryptionPolicyRejectionCode };
+    | { ok: false; error: "session-not-found" | "forbidden" | "invalid-params" | "requested-action-conflict" | "internal"; code?: EncryptionPolicyRejectionCode }
+    | { ok: false; error: "transaction-unavailable"; retryAfterMs: number; correlationId?: string };
 
 export async function enqueuePendingMessage(params: {
     actorUserId: string;
@@ -312,6 +313,7 @@ export async function enqueuePendingMessage(params: {
     requestedAction: PendingRequestedActionV1;
     /** Arm the Session's existing one-shot activation authorization without changing row delivery priority. */
     resumeWhenAvailable?: true;
+    diagnosticCorrelationId?: string;
 } & (
     | Readonly<{ ciphertext: string; content?: never }>
     | Readonly<{ content: PrismaJson.SessionPendingMessageContent; ciphertext?: never }>
@@ -609,7 +611,30 @@ export async function enqueuePendingMessage(params: {
                 ...(activationTarget ? { activationTarget } : {}),
             };
         });
-    } catch {
+    } catch (error) {
+        if (isTransactionAcquisitionUnavailableError(error)) {
+            const underlyingError = error.cause;
+            reportPendingOperationError({
+                operation: "enqueue",
+                sessionId,
+                localId,
+                diagnosticCorrelationId: params.diagnosticCorrelationId,
+                error: underlyingError,
+            }, "pending delivery transaction acquisition failed");
+            return {
+                ok: false,
+                error: "transaction-unavailable",
+                retryAfterMs: 1_000,
+                ...(params.diagnosticCorrelationId ? { correlationId: params.diagnosticCorrelationId } : {}),
+            };
+        }
+        reportPendingOperationError({
+            operation: "enqueue",
+            sessionId,
+            localId,
+            diagnosticCorrelationId: params.diagnosticCorrelationId,
+            error,
+        }, "pending delivery operation failed");
         return { ok: false, error: "internal" };
     }
 }

@@ -28,9 +28,12 @@ const TARGETS = [
     ...desktopAssets,
     downloads.desktopReleasesPage,
 
-    // Mobile
+    // Mobile. The Play listing is also the target of the /playstore short link
+    // (public/_redirects, printed as a QR code on marketing assets), and the
+    // App Store URL is /appstore's — a pulled listing must fail this check.
     downloads.appStoreUrl,
     downloads.androidApkUrl,
+    downloads.androidPlayUrl,
 
     // Installer + trust surface
     'https://happier.dev/install',

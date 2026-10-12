@@ -4,6 +4,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 
 import { createSessionPublisherPresence } from '@/app/presence/sessionPublisherPresence';
 import { expireSessionPublisherCandidates } from '@/app/presence/sessionPublisherPresenceTimeout';
+import { resolvePresenceTimeoutConfig, runPresenceTimeoutTick } from '@/app/presence/timeout';
 import { applySessionTurnMutation } from '@/app/session/sessionWriteService';
 import { db } from '@/storage/db';
 import { inTx } from '@/storage/inTx';
@@ -447,13 +448,16 @@ describe('Runtime Activity snapshot socket event on SQLite', () => {
 
     it('coalesces successful released alive persistence while the committed reachability fence is fresh', async () => {
         const seeded = await seed();
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
         const handlers = new Map<string, Handler>();
         const socket = { on: vi.fn((event: string, handler: Handler) => { handlers.set(event, handler); }) };
         const publishedValues: unknown[] = [];
+        const presence = createSessionPublisherPresence({ now: () => new Date(Date.now()) });
+        const binding = { accountId: seeded.ownerId, machineId: seeded.machineId, sessionId: seeded.sessionId };
         registerSessionRuntimeActivitySnapshotSocketEvent({
             socket,
-            presence: createSessionPublisherPresence(),
-            binding: { accountId: seeded.ownerId, machineId: seeded.machineId, sessionId: seeded.sessionId },
+            presence,
+            binding,
             publish: async (published) => { publishedValues.push(published); },
         });
         const aliveHandler = handlers.get('session-alive');
@@ -469,8 +473,8 @@ describe('Runtime Activity snapshot socket event on SQLite', () => {
             });
             expect(publishedValues).toHaveLength(2);
 
-            now.mockReturnValue(observedAt + 1_000);
-            await aliveHandler({ sid: seeded.sessionId, time: observedAt + 1_000, thinking: false, mode: 'remote' });
+            now.mockReturnValue(observedAt + 59_999);
+            await aliveHandler({ sid: seeded.sessionId, time: observedAt + 59_999, thinking: false, mode: 'remote' });
             await expect(db.session.findUniqueOrThrow({
                 where: { id: seeded.sessionId },
                 select: { lastActiveAt: true },
@@ -478,72 +482,237 @@ describe('Runtime Activity snapshot socket event on SQLite', () => {
             expect(publishedValues).toHaveLength(2);
 
             now.mockReturnValue(observedAt + 60_000);
-            await aliveHandler({ sid: seeded.sessionId, time: observedAt + 60_000, thinking: false, mode: 'remote' });
-            const refreshed = await db.session.findUniqueOrThrow({
-                where: { id: seeded.sessionId },
-                select: { lastActiveAt: true },
+            await vi.advanceTimersByTimeAsync(60_000);
+            await vi.waitFor(async () => {
+                const refreshed = await db.session.findUniqueOrThrow({
+                    where: { id: seeded.sessionId },
+                    select: { lastActiveAt: true },
+                });
+                expect(refreshed.lastActiveAt.getTime()).toBe(observedAt + 59_999);
+                expect(publishedValues).toHaveLength(4);
             });
-            expect(refreshed.lastActiveAt.getTime()).toBeGreaterThan(registered.lastActiveAt.getTime());
-            expect(publishedValues).toHaveLength(4);
+            expect(vi.getTimerCount()).toBe(0);
+
+            // Sustained released idle cadence keeps the default one-write-per-minute budget,
+            // even when the trailing write persists an observation from the preceding tick.
+            for (let elapsedMs = 75_000; elapsedMs <= 180_000; elapsedMs += 15_000) {
+                now.mockReturnValue(observedAt + elapsedMs);
+                await vi.advanceTimersByTimeAsync(15_000);
+                await presence.resolveCurrentPublisher({ socket, binding });
+                await vi.waitFor(async () => {
+                    const persisted = await db.session.findUniqueOrThrow({
+                        where: { id: seeded.sessionId }, select: { lastActiveAt: true },
+                    });
+                    const expectedObservationMs = elapsedMs < 120_000 ? 59_999 : Math.floor(elapsedMs / 60_000) * 60_000 - 15_000;
+                    expect(persisted.lastActiveAt.getTime()).toBe(observedAt + expectedObservationMs);
+                    expect(publishedValues).toHaveLength(2 * (Math.floor(elapsedMs / 60_000) + 1));
+                });
+                await aliveHandler({ sid: seeded.sessionId, time: observedAt + elapsedMs, thinking: false, mode: 'remote' });
+            }
         } finally {
+            await handlers.get('disconnect')?.(undefined);
             now.mockRestore();
+            vi.useRealTimers();
         }
     });
 
-    it('drops overlapping released alive events while one touch is unresolved and accepts the next heartbeat after settlement', async () => {
+    it.each([
+        { sessionTimeoutMs: 35_000, thinkingUntilMs: 0, idleSpacingMs: 15_000 },
+        { sessionTimeoutMs: 60_000, thinkingUntilMs: 0, idleSpacingMs: 15_000 },
+        { sessionTimeoutMs: 20_000, thinkingUntilMs: 8_000, idleSpacingMs: 16_000 },
+    ])('keeps released heartbeats reachable with a $sessionTimeoutMs ms presence expiry after thinking until $thinkingUntilMs ms', async ({ sessionTimeoutMs, thinkingUntilMs, idleSpacingMs }) => {
+        process.env.HAPPIER_PRESENCE_SESSION_TIMEOUT_MS = String(sessionTimeoutMs);
+        process.env.HAPPIER_PRESENCE_TIMEOUT_TICK_MS = '1000';
+        const timeoutConfig = resolvePresenceTimeoutConfig();
         const seeded = await seed();
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        const handlers = new Map<string, Handler>();
+        const socket = { on: vi.fn((event: string, handler: Handler) => { handlers.set(event, handler); }) };
+        const startedAt = Date.parse('2026-07-22T08:00:00.000Z');
+        let clockMs = startedAt;
+        const now = vi.spyOn(Date, 'now').mockImplementation(() => clockMs);
+        registerSessionRuntimeActivitySnapshotSocketEvent({
+            socket,
+            presence: createSessionPublisherPresence({ now: () => new Date(clockMs) }),
+            binding: { accountId: seeded.ownerId, machineId: seeded.machineId, sessionId: seeded.sessionId },
+            publish: async () => {},
+            nowMs: () => clockMs,
+        });
+        const alive = handlers.get('session-alive');
+        if (!alive) throw new Error('expected released alive handler');
+        // cli-v0.2.12 / cli-v0.2.12-preview.1 at a357c655: createSessionAlivePayload
+        // emits this vector. The 2s heartbeat loop takes 16s to meet the 15s idle cadence
+        // after thinking stops, so the transition must not assume fixed heartbeat spacing.
+        let lastHeartbeatAtMs = startedAt;
+        const heartbeat = async () => {
+            lastHeartbeatAtMs = clockMs;
+            await alive({
+                sid: seeded.sessionId, time: clockMs, thinking: clockMs - startedAt < thinkingUntilMs, mode: 'remote',
+            });
+        };
+
+        try {
+            await heartbeat();
+            for (let elapsedMs = timeoutConfig.tickMs; elapsedMs <= sessionTimeoutMs * 2; elapsedMs += timeoutConfig.tickMs) {
+                clockMs = startedAt + elapsedMs;
+                // Check the expiry owner before a coincident heartbeat, so ordering cannot hide
+                // a stale durable fence that already permits an active publisher to be expired.
+                await runPresenceTimeoutTick(timeoutConfig);
+                await expect(db.session.findUniqueOrThrow({
+                    where: { id: seeded.sessionId },
+                    select: { active: true },
+                })).resolves.toEqual({ active: true });
+                await vi.advanceTimersByTimeAsync(timeoutConfig.tickMs);
+                const heartbeatDue = elapsedMs <= thinkingUntilMs
+                    ? elapsedMs % 2_000 === 0
+                    : (elapsedMs - thinkingUntilMs) % idleSpacingMs === 0;
+                if (heartbeatDue) await heartbeat();
+            }
+
+            clockMs += sessionTimeoutMs / 2;
+            await vi.advanceTimersByTimeAsync(sessionTimeoutMs / 2);
+            await vi.waitFor(async () => {
+                const persisted = await db.session.findUniqueOrThrow({
+                    where: { id: seeded.sessionId },
+                    select: { lastActiveAt: true },
+                });
+                expect(persisted.lastActiveAt.getTime()).toBe(lastHeartbeatAtMs);
+            });
+            clockMs = lastHeartbeatAtMs + sessionTimeoutMs - 1;
+            await runPresenceTimeoutTick(timeoutConfig);
+            await expect(db.session.findUniqueOrThrow({
+                where: { id: seeded.sessionId }, select: { active: true },
+            })).resolves.toEqual({ active: true });
+            clockMs += 1;
+            await runPresenceTimeoutTick(timeoutConfig);
+            await expect(db.session.findUniqueOrThrow({
+                where: { id: seeded.sessionId },
+                select: { active: true },
+            })).resolves.toEqual({ active: false });
+        } finally {
+            now.mockRestore();
+            vi.useRealTimers();
+        }
+    });
+
+    it.each(['session-runtime-activity-close', 'session-end', 'disconnect', 'replacement'])(
+        'discards queued heartbeat work after %s without changing the successor fence',
+        async (event) => {
+            const seeded = await seed();
+            vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+            let clockMs = Date.parse('2026-07-22T08:00:00.000Z');
+            const handlers = new Map<string, Handler>();
+            const socket = { on: vi.fn((name: string, handler: Handler) => { handlers.set(name, handler); }) };
+            const presence = createSessionPublisherPresence({ now: () => new Date(clockMs) });
+            const binding = { accountId: seeded.ownerId, machineId: seeded.machineId, sessionId: seeded.sessionId };
+            registerSessionRuntimeActivitySnapshotSocketEvent({
+                socket, presence, binding, publish: async () => {}, nowMs: () => clockMs,
+            });
+            try {
+                await handlers.get('session-alive')?.({ sid: seeded.sessionId, time: clockMs, thinking: false });
+                clockMs += 1_000;
+                await handlers.get('session-alive')?.({ sid: seeded.sessionId, time: clockMs, thinking: false });
+                clockMs += 1_000;
+                if (event === 'replacement') {
+                    await presence.registerPublisher({ socket: {}, binding, completeActivitySnapshot: { state: 'unknown', activeCount: 0 } });
+                } else {
+                    await handlers.get(event)?.(event === 'session-runtime-activity-close'
+                        ? { sessionId: seeded.sessionId }
+                        : { sid: seeded.sessionId, time: clockMs }, () => {});
+                    if (event === 'disconnect') await presence.forgetDisconnectedPublisher({ socket });
+                    expect(vi.getTimerCount()).toBe(0);
+                }
+                const settled = await db.session.findUniqueOrThrow({
+                    where: { id: seeded.sessionId }, select: { active: true, lastActiveAt: true },
+                });
+                expect(settled.active).toBe(event === 'replacement' || event === 'disconnect');
+                clockMs += 60_000;
+                await vi.advanceTimersByTimeAsync(60_000);
+                // Drain the real per-socket owner after the scheduled touch has entered it.
+                await presence.resolveCurrentPublisher({ socket, binding });
+                await expect(db.session.findUniqueOrThrow({
+                    where: { id: seeded.sessionId }, select: { active: true, lastActiveAt: true },
+                })).resolves.toEqual(settled);
+                expect(vi.getTimerCount()).toBe(0);
+            } finally {
+                vi.useRealTimers();
+            }
+        },
+    );
+
+    it.each([false, true])('retains the newest in-flight heartbeat without reviving a replaced publisher (replacement: %s)', async (replacePublisher) => {
+        const seeded = await seed();
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
         const handlers = new Map<string, Handler>();
         const socket = { on: vi.fn((event: string, handler: Handler) => { handlers.set(event, handler); }) };
         const publishedValues: unknown[] = [];
+        const startedAt = Date.parse('2026-07-22T08:00:00.000Z');
+        let clockMs = startedAt;
+        const presence = createSessionPublisherPresence({ now: () => new Date(clockMs) });
+        const binding = { accountId: seeded.ownerId, machineId: seeded.machineId, sessionId: seeded.sessionId };
+        let holdPublication = false;
+        let publicationEntered!: () => void;
+        const publicationStarted = new Promise<void>((resolve) => { publicationEntered = resolve; });
+        let releasePublication!: () => void;
+        const publicationRelease = new Promise<void>((resolve) => { releasePublication = resolve; });
         registerSessionRuntimeActivitySnapshotSocketEvent({
-            socket,
-            presence: createSessionPublisherPresence(),
-            binding: { accountId: seeded.ownerId, machineId: seeded.machineId, sessionId: seeded.sessionId },
-            publish: async (published) => { publishedValues.push(published); },
+            socket, presence, binding, nowMs: () => clockMs,
+            // Hold only the network fanout boundary; persistence and authority remain real.
+            publish: async (published) => {
+                publishedValues.push(published);
+                if (holdPublication) {
+                    publicationEntered();
+                    await publicationRelease;
+                }
+            },
         });
         const aliveHandler = handlers.get('session-alive');
         if (!aliveHandler) throw new Error('expected released alive handler');
-        const observedAt = Date.parse('2026-07-22T08:00:00.000Z');
-        const now = vi.spyOn(Date, 'now').mockReturnValue(observedAt);
-        const alive = { sid: seeded.sessionId, time: observedAt, thinking: false, mode: 'remote' } as const;
+        const alive = { sid: seeded.sessionId, time: startedAt, thinking: false, mode: 'remote' } as const;
 
         try {
             await aliveHandler(alive);
             publishedValues.length = 0;
-            now.mockReturnValue(observedAt + 60_000);
+            clockMs = startedAt + 60_000;
+            holdPublication = true;
+            const inFlightAlive = aliveHandler(alive);
+            await publicationStarted;
+            for (const offset of [1_000, 2_000]) {
+                clockMs = startedAt + 60_000 + offset;
+                await aliveHandler(alive);
+            }
+            clockMs = startedAt + 63_000;
+            if (replacePublisher) {
+                await presence.registerPublisher({ socket: {}, binding, completeActivitySnapshot: { state: 'unknown', activeCount: 0 } });
+            }
+            holdPublication = false;
+            releasePublication();
+            await inFlightAlive;
+            expect(publishedValues).toHaveLength(2);
 
-            let resolveHolderEntered!: () => void;
-            const holderEntered = new Promise<void>((resolve) => { resolveHolderEntered = resolve; });
-            let releaseHolder!: () => void;
-            const holderRelease = new Promise<void>((resolve) => { releaseHolder = resolve; });
-            const holder = inTx(async () => {
-                resolveHolderEntered();
-                await holderRelease;
+            clockMs = startedAt + 120_000;
+            await vi.advanceTimersByTimeAsync(60_000);
+            await presence.resolveCurrentPublisher({ socket, binding });
+            await vi.waitFor(async () => {
+                const persisted = await db.session.findUniqueOrThrow({
+                    where: { id: seeded.sessionId }, select: { active: true, lastActiveAt: true },
+                });
+                expect(persisted).toEqual({
+                    active: true,
+                    lastActiveAt: new Date(startedAt + (replacePublisher ? 63_000 : 62_000)),
+                });
+                expect(publishedValues).toHaveLength(replacePublisher ? 2 : 4);
             });
-            await holderEntered;
-
-            const overlappingHeartbeats = [1, 2, 3, 4].map((offset) => aliveHandler({
-                ...alive,
-                time: alive.time + offset,
-            }));
-            releaseHolder();
-            await holder;
-            await Promise.all(overlappingHeartbeats);
-
-            expect(publishedValues).toHaveLength(2);
-
-            await aliveHandler({ ...alive, time: alive.time + 5 });
-            expect(publishedValues).toHaveLength(2);
-            now.mockReturnValue(observedAt + 120_000);
-            await aliveHandler({ ...alive, time: alive.time + 6 });
-            expect(publishedValues).toHaveLength(4);
+            expect(vi.getTimerCount()).toBe(0);
         } finally {
-            now.mockRestore();
+            releasePublication();
+            vi.useRealTimers();
         }
     });
 
     it('recovers on the next released alive heartbeat after SQLite transaction acquisition is exhausted', async () => {
         process.env.HAPPIER_DB_TX_MAX_RETRIES = '0';
+        // Values below the transaction owner's 1000ms minimum fall back to 5000ms.
         process.env.HAPPIER_DB_TX_MAX_WAIT_MS = '1000';
         process.env.HAPPIER_DB_TX_TIMEOUT_MS = '2000';
 
@@ -615,10 +784,15 @@ describe('Runtime Activity snapshot socket event on SQLite', () => {
         })).resolves.toEqual(recovered);
     });
 
-    it('backs off released alive persistence after repeated failures instead of retrying every heartbeat', async () => {
+    it.each([
+        { sessionTimeoutMs: 600_000, retryCeilingMs: 60_000 },
+        { sessionTimeoutMs: 35_000, retryCeilingMs: 17_500 },
+    ])('bounds released alive retry backoff to $retryCeilingMs ms for a $sessionTimeoutMs ms presence expiry', async ({ sessionTimeoutMs, retryCeilingMs }) => {
+        process.env.HAPPIER_PRESENCE_SESSION_TIMEOUT_MS = String(sessionTimeoutMs);
         process.env.HAPPIER_DB_TX_MAX_RETRIES = '0';
-        process.env.HAPPIER_DB_TX_MAX_WAIT_MS = '200';
-        // The holder transaction must outlive both failing attempts; an expiring holder would free
+        // Values below the transaction owner's 1000ms minimum fall back to 5000ms.
+        process.env.HAPPIER_DB_TX_MAX_WAIT_MS = '1000';
+        // The holder transaction must outlive all failing attempts; an expiring holder would free
         // the connection and let a heartbeat persist for the wrong reason.
         process.env.HAPPIER_DB_TX_TIMEOUT_MS = '30000';
 
@@ -661,21 +835,24 @@ describe('Runtime Activity snapshot socket event on SQLite', () => {
         try {
             // A first failure still retries on the very next heartbeat: a one-off transient error
             // must recover immediately.
-            await heartbeat();
-            await heartbeat();
-            await expect(db.session.findUniqueOrThrow({
-                where: { id: seeded.sessionId },
-                select: { active: true, lastActiveAt: true },
-            })).resolves.toEqual(initial);
+            for (const advanceMs of [0, 0, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000]) {
+                heartbeatClockMs += advanceMs;
+                await heartbeat();
+            }
         } finally {
             releaseHolder();
             await expect(holder).rejects.toBe(holderReleased);
         }
+        await expect(db.session.findUniqueOrThrow({
+            where: { id: seeded.sessionId },
+            select: { active: true, lastActiveAt: true },
+        })).resolves.toEqual(initial);
 
         // Repeated failures must arm a backoff. Retrying on every 2s heartbeat multiplies write
         // pressure by 6-30x exactly while the database is saturated, which is what caused the
         // saturation to persist instead of draining. The database is healthy again here, so a
         // heartbeat inside the backoff window must be skipped by the throttle, not by the failure.
+        heartbeatClockMs += retryCeilingMs - 1;
         await heartbeat();
         await expect(db.session.findUniqueOrThrow({
             where: { id: seeded.sessionId },
@@ -683,7 +860,7 @@ describe('Runtime Activity snapshot socket event on SQLite', () => {
         })).resolves.toEqual(initial);
 
         // ...and the backoff must be bounded: once it elapses the publisher recovers.
-        heartbeatClockMs += 60_000;
+        heartbeatClockMs += 1;
         await heartbeat();
         const recovered = await db.session.findUniqueOrThrow({
             where: { id: seeded.sessionId },
@@ -749,7 +926,7 @@ describe('Runtime Activity snapshot socket event on SQLite', () => {
         })).resolves.toBe(sockets.length);
     });
 
-    it('orders exact close behind an already accepted released alive backlog', async () => {
+    it.each(['session-runtime-activity-close', 'disconnect'])('does not revive a publisher after %s during an accepted released alive backlog', async (terminalEvent) => {
         const blocker = await seed();
         const target = await seed();
         const presence = createSessionPublisherPresence();
@@ -812,18 +989,19 @@ describe('Runtime Activity snapshot socket event on SQLite', () => {
             mode: 'remote',
         });
         const closeAcknowledge = vi.fn();
-        const targetClose = targetHandlers.get('session-runtime-activity-close')?.(
-            { sessionId: target.sessionId },
-            closeAcknowledge,
-        );
+        const targetClose = terminalEvent === 'disconnect'
+            ? (async () => {
+                await targetHandlers.get('disconnect')?.(undefined);
+                await presence.forgetDisconnectedPublisher({ socket: targetSocket });
+            })()
+            : targetHandlers.get(terminalEvent)?.({ sessionId: target.sessionId }, closeAcknowledge);
 
         releaseBlocker();
         await Promise.all([heldBlockerOperation, blockerAlive, targetAlive, targetClose]);
 
-        expect(closeAcknowledge).toHaveBeenCalledWith({
-            status: 'closed',
-            sessionId: target.sessionId,
-        });
+        if (terminalEvent !== 'disconnect') {
+            expect(closeAcknowledge).toHaveBeenCalledWith({ status: 'closed', sessionId: target.sessionId });
+        }
         await expect(db.session.findUniqueOrThrow({
             where: { id: target.sessionId },
             select: { active: true, runtimeActivityState: true },

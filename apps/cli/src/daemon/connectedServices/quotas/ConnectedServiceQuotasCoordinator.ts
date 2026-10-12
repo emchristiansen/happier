@@ -6,6 +6,7 @@ import {
   ConnectedServiceCredentialRevisionV1Schema,
   readConnectedServiceCredentialRevisionBoundaryV1,
   ConnectedServiceUsageSourceV1Schema,
+  isConnectedServiceQuotaObservationFresh,
   isConnectedServiceCredentialHealthStatusUsable,
   type ConnectedServiceAuthGroupRuntimeStatePatchRequestV1,
   type ConnectedServiceAuthGroupV1,
@@ -114,6 +115,7 @@ import {
   type QuotaProbeFreshProofResult,
 } from './proof/quotaProbeFreshProof';
 import type { ConnectedServiceRuntimeAuthApplyCapability } from '../credentials/lifecycleTypes';
+import type { ConnectedServiceQuotaCredentialRefreshOutcome } from '../refresh/refreshTypes';
 import {
   runtimeAuthApplyRequiresLiveIdentityProbe,
 } from '../accountGroups/switching/predictiveSoftSwitchPolicy';
@@ -155,9 +157,11 @@ import {
   deriveQuotaSnapshotStatus,
   extractActiveBindings,
   activeBindingMatchesRuntimeIdentity,
+  isRecord,
   isQuotaUnknownFallbackSnapshot,
   isQuotaAuthFailure,
   normalizeConnectedServiceQuotaGeneration,
+  QUOTA_AUTH_FAILURE_INCONCLUSIVE_PROBE_LIMIT,
   QUOTA_AUTH_FAILURE_REAUTH_CONSECUTIVE_FAILURES,
   readCredentialAccountIdentity,
   readFiniteNonNegativeMs,
@@ -633,6 +637,9 @@ export class ConnectedServiceQuotasCoordinator {
       this.failureStateByBindingKey.set(params.key, {
         consecutiveFailures,
         nextAllowedAt: params.now + Math.max(retryAfterMs, floorMs, 1),
+        ...(existing?.inconclusiveRefreshProbeCount !== undefined
+          ? { inconclusiveRefreshProbeCount: existing.inconclusiveRefreshProbeCount }
+          : {}),
       });
       return;
     }
@@ -642,6 +649,9 @@ export class ConnectedServiceQuotasCoordinator {
     this.failureStateByBindingKey.set(params.key, {
       consecutiveFailures,
       nextAllowedAt: params.now + jitteredMs,
+      ...(existing?.inconclusiveRefreshProbeCount !== undefined
+        ? { inconclusiveRefreshProbeCount: existing.inconclusiveRefreshProbeCount }
+        : {}),
     });
   }
 
@@ -653,12 +663,13 @@ export class ConnectedServiceQuotasCoordinator {
     if (input.snapshot.serviceId !== input.serviceId) {
       return { status: 'suppressed', reason: 'service_id_mismatch' };
     }
+    const now = Math.max(0, Math.trunc(this.now()));
 
     await this.recordFetchedQuotaSnapshotAsAccountUsage({
       serviceId: input.serviceId,
       profileId: input.profileId,
       snapshot: input.snapshot,
-      now: Math.max(0, Math.trunc(this.now())),
+      now,
       persistDurably: false,
     });
 
@@ -670,6 +681,7 @@ export class ConnectedServiceQuotasCoordinator {
       previous,
       incoming: { snapshot: input.snapshot, fingerprint: materialFingerprint, status },
       minFreshnessRefreshMs: this.quotaPersistenceMinFreshnessRefreshMs,
+      nowMs: now,
     });
     if (!materiality.persist) return { status: 'suppressed', reason: materiality.reason };
 
@@ -2466,6 +2478,7 @@ export class ConnectedServiceQuotasCoordinator {
       serviceId: input.serviceId,
       groupId: input.groupId,
       capturedAtMs: input.now,
+      quotaLimitSelection: input.group.policy.quotaLimitSelection,
     }).get(input.profileId) ?? null;
     const quotaSnapshot = runtimeState?.quotaSnapshot ?? null;
     if (!quotaSnapshot) return null;
@@ -2660,20 +2673,30 @@ export class ConnectedServiceQuotasCoordinator {
     const updateHealth = this.api.updateConnectedServiceCredentialHealth;
     if (typeof updateHealth !== 'function') return null;
     const bindingKey = this.makeBindingKey({ serviceId: input.serviceId, profileId: input.profileId });
+    const existingFailureState = this.failureStateByBindingKey.get(bindingKey);
     const consecutiveFailures = Math.max(
       1,
-      Math.trunc(this.failureStateByBindingKey.get(bindingKey)?.consecutiveFailures ?? 0) + 1,
+      Math.trunc(existingFailureState?.consecutiveFailures ?? 0) + 1,
     );
     const health = buildQuotaAuthFailureCredentialHealth(input.error, input.now, {
-      consecutiveFailuresBeforeCurrent: this.failureStateByBindingKey.get(bindingKey)?.consecutiveFailures ?? 0,
+      consecutiveFailuresBeforeCurrent: existingFailureState?.consecutiveFailures ?? 0,
     });
     if (shouldProbeCredentialRefreshForQuotaFailure(input.error, { consecutiveFailures })) {
-      const probe = await this.refreshConnectedServiceCredentialForQuota?.({
-        serviceId: input.serviceId,
-        profileId: input.profileId,
-        force: true,
-        reason: 'auth_failure',
-      }).catch(() => null);
+      const refreshProbe = this.refreshConnectedServiceCredentialForQuota;
+      let probe: ConnectedServiceQuotaCredentialRefreshOutcome | null = null;
+      if (refreshProbe) {
+        try {
+          probe = await refreshProbe({
+            serviceId: input.serviceId,
+            profileId: input.profileId,
+            force: true,
+            reason: 'auth_failure',
+          });
+        } catch {
+          // A failed probe is inconclusive. Keep the quota failure retryable and
+          // let the bounded probe counter decide when reconnection is required.
+        }
+      }
       if (probe?.reauthRequired === true) {
         // The refresh coordinator (canonical owner of refresh-failure health) proved this
         // credential needs reconnection — permanent provider auth failure (e.g. 401
@@ -2687,8 +2710,34 @@ export class ConnectedServiceQuotasCoordinator {
         // The refresh owner already persisted connected health for the newly
         // committed revision. The quota failure belongs to the predecessor
         // credential and must not overwrite that successful refresh result.
+        this.failureStateByBindingKey.delete(bindingKey);
         return 'connected';
       }
+      const providerStatus = isRecord(input.error) ? input.error.status : undefined;
+      const inconclusiveRefreshProbeCount = (existingFailureState?.inconclusiveRefreshProbeCount ?? 0) + 1;
+      if (
+        providerStatus !== 403
+        && inconclusiveRefreshProbeCount >= QUOTA_AUTH_FAILURE_INCONCLUSIVE_PROBE_LIMIT
+      ) {
+        const reconnectHealth: ConnectedServiceCredentialHealthV1 = {
+          ...health,
+          status: 'needs_reauth',
+          reconnectRequired: true,
+        };
+        await updateHealth.call(this.api, {
+          serviceId: input.serviceId,
+          profileId: input.profileId,
+          ...(input.expectedCredentialRevision
+            ? { expectedCredentialRevision: input.expectedCredentialRevision }
+            : {}),
+          health: reconnectHealth,
+        });
+        return reconnectHealth.status;
+      }
+      this.failureStateByBindingKey.set(bindingKey, {
+        ...(existingFailureState ?? { consecutiveFailures: 0, nextAllowedAt: input.now }),
+        inconclusiveRefreshProbeCount,
+      });
     }
     await updateHealth.call(this.api, {
       serviceId: input.serviceId,
@@ -2925,6 +2974,7 @@ export class ConnectedServiceQuotasCoordinator {
     });
     let outcome: ConnectedServiceGroupQuotaProbeResult = result('complete');
     let activeProfileId: string | null = null;
+    let quotaLimitSelection: ConnectedServiceAuthGroupV1['policy']['quotaLimitSelection'];
     const runtimeQuotaSnapshots = this.runtimeQuotaSnapshots;
     try {
       if (!groupId || profileIds.length === 0) return outcome;
@@ -2964,6 +3014,7 @@ export class ConnectedServiceQuotasCoordinator {
         signal: deadlineAtMs === null ? undefined : deadlineController.signal,
       });
       activeProfileId = group?.activeProfileId?.trim() || null;
+      quotaLimitSelection = group?.policy.quotaLimitSelection;
       if (deadlineExceeded()) {
         outcome = result('incomplete', 'deadline_exceeded');
         return outcome;
@@ -3127,6 +3178,7 @@ export class ConnectedServiceQuotasCoordinator {
             serviceId,
             groupId,
             capturedAtMs: Math.max(0, Math.trunc(this.now())),
+            quotaLimitSelection,
           }).get(activeProfileId)?.quotaSnapshot ?? null
         : null;
       this.recordDiagnostic?.({
@@ -3296,7 +3348,11 @@ export class ConnectedServiceQuotasCoordinator {
     if (!Number.isFinite(fetchedAt) || !Number.isFinite(staleAfterMs) || fetchedAt <= 0 || staleAfterMs <= 0) return false;
     const policyMinPollIntervalMs = readFiniteNonNegativeMs(input.fetcher.pollPolicy?.minPollIntervalMs) ?? 0;
     const effectiveStaleAfterMs = Math.max(staleAfterMs, policyMinPollIntervalMs);
-    return !input.forcedRefresh && input.now < fetchedAt + effectiveStaleAfterMs;
+    return !input.forcedRefresh && isConnectedServiceQuotaObservationFresh({
+      observedAtMs: fetchedAt,
+      nowMs: input.now,
+      maxAgeMs: effectiveStaleAfterMs,
+    });
   }
 
   private shouldForceQuotaRefresh(existing: ExistingQuotaSnapshotResponse): boolean {

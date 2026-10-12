@@ -6,6 +6,7 @@ describe('settingsParse provider plugin defaults', () => {
     it('includes Claude provider defaults when no settings are persisted', () => {
         const settings = settingsParse({});
 
+        expect((settings as any).claudeDynamicModelProbeEnabled).toBe(true);
         expect((settings as any).claudeRemoteAgentSdkEnabled).toBe(true);
         expect((settings as any).claudeRemoteSettingSources).toBe('user_project');
         expect((settings as any).claudeRemoteSettingSourcesV2).toEqual(['user', 'project', 'local']);
@@ -55,6 +56,14 @@ describe('settingsParse provider plugin defaults', () => {
         } as any);
 
         expect((settings as any).claudeRemoteAgentSdkEnabled).toBe(false);
+    });
+
+    it('respects the Claude dynamic model discovery opt-out', () => {
+        const settings = settingsParse({
+            claudeDynamicModelProbeEnabled: false,
+        } as any);
+
+        expect((settings as any).claudeDynamicModelProbeEnabled).toBe(false);
     });
 
     it('rejects invalid JSON payloads for JSON provider setting fields', () => {

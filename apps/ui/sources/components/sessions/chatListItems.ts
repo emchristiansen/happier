@@ -4,6 +4,7 @@ import type { SessionActionDraft } from '@/sync/domains/sessionActions/sessionAc
 import { isToolCallMessageGroupableInTranscript } from '@/components/sessions/transcript/toolCalls/isToolCallMessageGroupableInTranscript';
 import { filterVisibleContextCompactionLifecycleMessageIds } from '@/components/sessions/transcript/events/contextCompactionLifecycleProjection';
 import type { PendingPermissionRequest } from '@/utils/sessions/sessionUtils';
+import { isSessionToolAnswerDeliveryMeta } from '@happier-dev/protocol';
 import {
     isCommittedTranscriptMessageHiddenByCrossover,
     isPendingTranscriptMessageHiddenByCrossover,
@@ -81,6 +82,12 @@ export type ChatListItemsBuildCache = Readonly<{
 
 function normalizeSeq(seq: unknown): number | null {
     return typeof seq === 'number' && Number.isFinite(seq) ? Math.trunc(seq) : null;
+}
+
+function isPendingToolAnswerDelivery(message: PendingMessage): boolean {
+    return isSessionToolAnswerDeliveryMeta(message.rawRecord?.meta)
+        && message.pendingDeliveryStatus !== 'blocked'
+        && message.sendState !== 'failed';
 }
 
 function isPrefix(params: Readonly<{ prefix: readonly string[]; full: readonly string[] }>): boolean {
@@ -225,7 +232,7 @@ export function buildChatListItems(opts: {
         pendingMessages: opts.pendingMessages,
         discardedMessages: opts.discardedMessages,
     });
-    const pending = opts.pendingMessages.filter((p) => !isPendingTranscriptMessageHiddenByCrossover(p, crossover));
+    const pending = opts.pendingMessages.filter((p) => !isPendingToolAnswerDelivery(p) && !isPendingTranscriptMessageHiddenByCrossover(p, crossover));
     const discarded = Array.isArray(opts.discardedMessages) ? opts.discardedMessages : [];
     const items: ChatListItem[] = [];
     const visibleMessageIds = new Set(filterVisibleContextCompactionLifecycleMessageIds(opts.messageIdsOldestFirst, opts.messagesById));
@@ -417,7 +424,7 @@ export function buildChatListItemsCached(opts: {
         pendingMessages: opts.pendingMessages,
         discardedMessages: opts.discardedMessages,
     });
-    const pending = opts.pendingMessages.filter((p) => !isPendingTranscriptMessageHiddenByCrossover(p, crossover));
+    const pending = opts.pendingMessages.filter((p) => !isPendingToolAnswerDelivery(p) && !isPendingTranscriptMessageHiddenByCrossover(p, crossover));
     const discarded = Array.isArray(opts.discardedMessages) ? opts.discardedMessages : [];
     const pendingUserActionItems = buildPendingUserActionItems(
         opts.pendingUserActionRequests,

@@ -1,4 +1,6 @@
+import type { SessionModelOptionsContext } from '@/sync/domains/models/modelOptions';
 import type { TodoState } from '@/sync/domains/todos/todoOps';
+import type { TranscriptLoadingDomain } from './domains/transcriptLoading';
 
 import type { DecryptedArtifact } from '../domains/artifacts/artifactTypes';
 import type { Automation, AutomationRun } from '../domains/automations/automationTypes';
@@ -137,7 +139,7 @@ export interface SessionsDomainSlice {
     clearSessionThinkingGrace: (sessionId: string) => void;
     markSessionViewed: (sessionId: string) => void;
     updateSessionPermissionMode: (sessionId: string, mode: PermissionMode) => void;
-    updateSessionModelMode: (sessionId: string, mode: SessionModelMode) => void;
+    updateSessionModelMode: (sessionId: string, mode: SessionModelMode, context?: SessionModelOptionsContext) => void;
     deleteSession: (sessionId: string) => void;
 }
 
@@ -163,6 +165,8 @@ export interface MachinesDomainSlice {
 
 export interface MessagesDomainSlice {
     sessionMessages: Record<string, SessionMessages>;
+    sessionMessagesHistoryStartLoaded: Record<string, true>;
+    markSessionMessagesHistoryStartLoaded: (sessionId: string) => void;
     applyMessages: (sessionId: string, messages: NormalizedMessage[]) => {
         changed: string[];
         hasReadyEvent: boolean;
@@ -189,15 +193,7 @@ export interface PendingDomainSlice {
     removePendingMessage: (sessionId: string, pendingId: string) => void;
 }
 
-export interface TranscriptLoadingDomainSlice {
-    sessionCatchUpNewerInFlight: Record<string, number>;
-    sessionTailContiguousFloorSeq: Record<string, number>;
-    isSessionCatchingUpNewer: (sessionId: string) => boolean;
-    beginSessionCatchUpNewer: (sessionId: string) => void;
-    endSessionCatchUpNewer: (sessionId: string) => void;
-    getSessionTailContiguousFloorSeq: (sessionId: string) => number | null;
-    setSessionTailContiguousFloorSeq: (sessionId: string, floorSeq: number | null) => void;
-}
+export type TranscriptLoadingDomainSlice = TranscriptLoadingDomain;
 
 export interface RealtimeDomainSlice {
     realtimeStatus: RealtimeStatus;
@@ -242,6 +238,7 @@ export interface TodosDomainSlice {
 
 export interface ArtifactsDomainSlice {
     artifacts: Record<string, DecryptedArtifact>;
+    artifactsLoaded: boolean;
     applyArtifacts: (artifacts: DecryptedArtifact[]) => void;
     addArtifact: (artifact: DecryptedArtifact) => void;
     updateArtifact: (artifact: DecryptedArtifact) => void;

@@ -210,23 +210,36 @@ export function spawnLoggedProcess(params: {
   const stderr = createWriteStream(params.stderrPath, { flags: 'w' });
   const observedDescendantPids = new Set<number>();
   const detachCleanup = attachExitCleanup(child, () => [...observedDescendantPids]);
-  const descendantPoller = process.platform === 'win32'
-    ? null
-    : setInterval(() => {
-      if (typeof child.pid !== 'number' || child.pid <= 0) return;
-      for (const pid of collectDescendantPids(child.pid)) {
-        observedDescendantPids.add(pid);
-      }
-    }, 1);
+  let descendantPoller: ReturnType<typeof setTimeout> | null = null;
+  let descendantPollerActive = process.platform !== 'win32';
+  const pollStartedAtMs = Date.now();
+  // Match the established testkit policy: capture short-lived startup wrappers,
+  // then leave the event loop available instead of spawning synchronous ps every millisecond.
+  const fastPollWindowMs = 1_000;
+  const fastPollMs = 25;
+  const slowPollMs = 250;
+  const pollDescendants = () => {
+    if (!descendantPollerActive) return;
+    if (typeof child.pid === 'number' && child.pid > 0) {
+      for (const pid of collectDescendantPids(child.pid)) observedDescendantPids.add(pid);
+    }
+    const nextDelay = Date.now() - pollStartedAtMs < fastPollWindowMs ? fastPollMs : slowPollMs;
+    descendantPoller = setTimeout(pollDescendants, nextDelay);
+    descendantPoller.unref?.();
+  };
+  if (descendantPollerActive) pollDescendants();
 
-  descendantPoller?.unref?.();
+  const stopDescendantPolling = () => {
+    descendantPollerActive = false;
+    if (descendantPoller) clearTimeout(descendantPoller);
+    descendantPoller = null;
+  };
 
   child.stdout?.pipe(stdout);
   child.stderr?.pipe(stderr);
 
   const stop = async (signal: NodeJS.Signals = 'SIGTERM') => {
-    descendantPoller?.unref?.();
-    descendantPoller && clearInterval(descendantPoller);
+    stopDescendantPolling();
 
     if (typeof child.pid === 'number' && child.pid > 0) {
       for (const pid of collectDescendantPids(child.pid)) {
@@ -270,7 +283,7 @@ export function spawnLoggedProcess(params: {
   };
 
   child.once('exit', () => {
-    if (descendantPoller) clearInterval(descendantPoller);
+    stopDescendantPolling();
     if (params.cleanupDescendantsOnExit !== false && observedDescendantPids.size > 0) {
       void terminateProcessTreeByPid(child.pid ?? 0, {
         graceMs: 0,

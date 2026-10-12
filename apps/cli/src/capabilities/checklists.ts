@@ -61,6 +61,8 @@ function buildChecklists(): Record<ChecklistId, CapabilityDetectRequest[]> {
             { id: 'tool.windowsTerminal' },
             { id: 'tool.executionRuns' },
             { id: CODEX_ACP_DEP_ID },
+            { id: 'dep.local-embeddings' },
+            { id: 'dep.difftastic' },
         ],
         ...resumeChecklistEntries,
     } satisfies Record<ChecklistId, CapabilityDetectRequest[]>;

@@ -23,7 +23,7 @@ on:
           - blacksmith-linux-4vcpu
           - blacksmith-linux-8vcpu
       custom_checks:
-        description: "Custom — Comma-separated checks used only when profile=custom (ui,ui_e2e,wsrepl_lima,mobile_e2e_android,mobile_e2e_ios,server,cli,stack,typecheck,daemon_e2e,e2e_core,e2e_core_slow,server_db_contract,providers,stress,release_contracts,installers_smoke,binary_smoke,daemon_continuity,session_continuity,release_assets_docker,self_host_systemd,self_host_launchd,self_host_schtasks,self_host_daemon,extended_db)"
+        description: "Custom — Comma-separated checks used only when profile=custom (ui,ui_e2e,wsrepl_lima,mobile_e2e_android,mobile_e2e_ios,shared_packages,server,cli,stack,typecheck,daemon_e2e,e2e_core,e2e_core_slow,server_db_contract,providers,stress,release_contracts,installers_smoke,binary_smoke,build_smoke,daemon_continuity,session_continuity,cli_update_continuity,release_assets_docker,self_host_systemd,self_host_launchd,self_host_schtasks,self_host_daemon,extended_db)"
         required: false
         default: ""
         type: string
@@ -41,6 +41,24 @@ on:
           - stable
           - preview
           - dev
+      installers_source:
+        description: "Installers — Test the published channel or this run's shared CLI build"
+        required: true
+        default: published-channel
+        type: choice
+        options:
+          - published-channel
+          - local-build
+      cli_update_to_source:
+        description: "CLI update — Target source for explicit continuity checks"
+        required: false
+        default: local-build
+        type: string
+      cli_update_to_ref:
+        description: "CLI update — Target ref for explicit continuity checks"
+        required: false
+        default: "."
+        type: string
       providers_preset:
         description: "Providers — Preset (when providers enabled)"
         required: true
@@ -76,6 +94,7 @@ jobs:
       run_mobile_e2e_android: ${{ steps.flags.outputs.run_mobile_e2e_android }}
       run_mobile_e2e_ios: ${{ steps.flags.outputs.run_mobile_e2e_ios }}
       run_ui: ${{ steps.flags.outputs.run_ui }}
+      run_shared_packages: ${{ steps.flags.outputs.run_shared_packages }}
       run_server: ${{ steps.flags.outputs.run_server }}
       run_cli: ${{ steps.flags.outputs.run_cli }}
       run_stack: ${{ steps.flags.outputs.run_stack }}
@@ -89,6 +108,8 @@ jobs:
       run_release_contracts: ${{ steps.flags.outputs.run_release_contracts }}
       run_installers_smoke: ${{ steps.flags.outputs.run_installers_smoke }}
       run_binary_smoke: ${{ steps.flags.outputs.run_binary_smoke }}
+      run_build_smoke: ${{ steps.flags.outputs.run_build_smoke }}
+      run_cli_update_continuity: ${{ steps.flags.outputs.run_cli_update_continuity }}
       run_daemon_continuity: ${{ steps.flags.outputs.run_daemon_continuity }}
       run_session_continuity: ${{ steps.flags.outputs.run_session_continuity }}
       run_release_assets_docker: ${{ steps.flags.outputs.run_release_assets_docker }}
@@ -98,176 +119,23 @@ jobs:
       run_self_host_daemon: ${{ steps.flags.outputs.run_self_host_daemon }}
       run_extended_db: ${{ steps.flags.outputs.run_extended_db }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.x
       - name: Compute flags
         id: flags
         env:
           PROFILE: ${{ inputs.profile }}
           CUSTOM: ${{ inputs.custom_checks }}
           UI_E2E_SPECS: ${{ inputs.ui_e2e_specs }}
-        run: |
-          set -euo pipefail
-          profile="${PROFILE}"
-          custom="${CUSTOM}"
-          ui_e2e_specs="${UI_E2E_SPECS}"
-
-          selected=''
-          errors=''
-          unknown_list=''
-          saw_empty=false
-
-          add_error() {
-            errors="${errors}${errors:+$'\n'}$1"
-          }
-
-          trim() {
-            local value="$1"
-            value="${value#"${value%%[![:space:]]*}"}"
-            value="${value%"${value##*[![:space:]]}"}"
-            printf '%s' "$value"
-          }
-
-          has() {
-            local key="$1"
-            case ",${selected}," in
-              *",${key},"*) return 0 ;;
-              *) return 1 ;;
-            esac
-          }
-
-          case "${profile}" in
-            fast) selection='ui,server,cli,stack,typecheck,e2e_core' ;;
-            release) selection='ui,ui_e2e,server,cli,stack,typecheck,daemon_e2e,e2e_core,server_db_contract,release_contracts,installers_smoke,binary_smoke' ;;
-            deep) selection='ui,ui_e2e,wsrepl_lima,mobile_e2e_android,mobile_e2e_ios,server,cli,stack,typecheck,daemon_e2e,e2e_core,e2e_core_slow,server_db_contract,stress,release_contracts,installers_smoke,binary_smoke,daemon_continuity,session_continuity,release_assets_docker,self_host_systemd,self_host_launchd,self_host_schtasks,self_host_daemon,extended_db' ;;
-            custom) selection="${custom}" ;;
-            *) add_error "unsupported profile: ${profile}"; selection='' ;;
-          esac
-
-          if [ "${profile}" = "custom" ] && [ -z "${custom}" ]; then
-            add_error "profile=custom requires custom_checks"
-          elif [ -n "${selection}" ]; then
-            remaining="${selection},"
-            while [[ "$remaining" == *,* ]]; do
-              token="${remaining%%,*}"
-              remaining="${remaining#*,}"
-              token="$(trim "$token")"
-              if [ -z "$token" ]; then
-                saw_empty=true
-                continue
-              fi
-              token="$(printf '%s' "$token" | tr '[:upper:]' '[:lower:]')"
-              case "$token" in
-                ui|ui_e2e|wsrepl_lima|mobile_e2e_android|mobile_e2e_ios|server|cli|stack|typecheck|daemon_e2e|e2e_core|e2e_core_slow|server_db_contract|providers|stress|release_contracts|installers_smoke|binary_smoke|daemon_continuity|session_continuity|release_assets_docker|self_host_systemd|self_host_launchd|self_host_schtasks|self_host_daemon|extended_db)
-                  if ! has "$token"; then
-                    selected="${selected}${selected:+,}${token}"
-                  fi
-                  ;;
-                *) unknown_list="${unknown_list}${unknown_list:+, }${token}" ;;
-              esac
-            done
-          fi
-          if [ "$saw_empty" = true ]; then
-            add_error "empty custom_checks token; remove repeated, leading, or trailing commas"
-          fi
-          if [ -n "${unknown_list}" ]; then
-            add_error "unknown custom_checks: ${unknown_list}"
-          fi
-          if [ -n "${ui_e2e_specs}" ] && [ "${profile}" != "custom" ]; then
-            add_error "profile=custom is required when ui_e2e_specs is set"
-          fi
-          if [ -n "${ui_e2e_specs}" ] && ! has ui_e2e; then
-            add_error "custom_checks must include ui_e2e when ui_e2e_specs is set"
-          fi
-          case "${ui_e2e_specs}" in
-            *$'\n'*|*$'\r'*) add_error "ui_e2e_specs must be a single comma-separated line" ;;
-          esac
-          if [ -n "${errors}" ]; then
-            while IFS= read -r error; do echo "::error::${error}" >&2; done <<< "${errors}"
-            exit 1
-          fi
-
-          run_ui_e2e=false
-          run_wsrepl_lima=false
-          run_mobile_e2e_android=false
-          run_mobile_e2e_ios=false
-          run_ui=false
-          run_server=false
-          run_cli=false
-          run_stack=false
-          run_typecheck=false
-          run_cli_daemon_e2e=false
-          run_e2e_core=false
-          run_e2e_core_slow=false
-          run_server_db_contract=false
-          run_providers=false
-          run_stress=false
-          run_release_contracts=false
-          run_installers_smoke=false
-          run_binary_smoke=false
-          run_daemon_continuity=false
-          run_session_continuity=false
-          run_release_assets_docker=false
-          run_self_host_systemd=false
-          run_self_host_launchd=false
-          run_self_host_schtasks=false
-          run_self_host_daemon=false
-          run_extended_db=false
-
-          if has ui; then run_ui=true; fi
-          if has ui_e2e; then run_ui_e2e=true; fi
-          if has wsrepl_lima; then run_wsrepl_lima=true; fi
-          if has mobile_e2e_android; then run_mobile_e2e_android=true; fi
-          if has mobile_e2e_ios; then run_mobile_e2e_ios=true; fi
-          if has server; then run_server=true; fi
-          if has cli; then run_cli=true; fi
-          if has stack; then run_stack=true; fi
-          if has typecheck; then run_typecheck=true; fi
-          if has daemon_e2e; then run_cli_daemon_e2e=true; fi
-          if has e2e_core; then run_e2e_core=true; fi
-          if has e2e_core_slow; then run_e2e_core=true; run_e2e_core_slow=true; fi
-          if has server_db_contract; then run_server_db_contract=true; fi
-          if has providers; then run_providers=true; fi
-          if has stress; then run_stress=true; fi
-          if has release_contracts; then run_release_contracts=true; fi
-          if has installers_smoke; then run_installers_smoke=true; fi
-          if has binary_smoke; then run_binary_smoke=true; fi
-          if has daemon_continuity; then run_daemon_continuity=true; fi
-          if has session_continuity; then run_session_continuity=true; fi
-          if has release_assets_docker; then run_release_assets_docker=true; fi
-          if has self_host_systemd; then run_self_host_systemd=true; fi
-          if has self_host_launchd; then run_self_host_launchd=true; fi
-          if has self_host_schtasks; then run_self_host_schtasks=true; fi
-          if has self_host_daemon; then run_self_host_daemon=true; fi
-          if has extended_db; then run_extended_db=true; fi
-
-          {
-            echo "run_ui_e2e=${run_ui_e2e}"
-            echo "ui_e2e_specs=${ui_e2e_specs}"
-            echo "run_wsrepl_lima=${run_wsrepl_lima}"
-            echo "run_mobile_e2e_android=${run_mobile_e2e_android}"
-            echo "run_mobile_e2e_ios=${run_mobile_e2e_ios}"
-            echo "run_ui=${run_ui}"
-            echo "run_server=${run_server}"
-            echo "run_cli=${run_cli}"
-            echo "run_stack=${run_stack}"
-            echo "run_typecheck=${run_typecheck}"
-            echo "run_cli_daemon_e2e=${run_cli_daemon_e2e}"
-            echo "run_e2e_core=${run_e2e_core}"
-            echo "run_e2e_core_slow=${run_e2e_core_slow}"
-            echo "run_server_db_contract=${run_server_db_contract}"
-            echo "run_providers=${run_providers}"
-            echo "run_stress=${run_stress}"
-            echo "run_release_contracts=${run_release_contracts}"
-            echo "run_installers_smoke=${run_installers_smoke}"
-            echo "run_binary_smoke=${run_binary_smoke}"
-            echo "run_daemon_continuity=${run_daemon_continuity}"
-            echo "run_session_continuity=${run_session_continuity}"
-            echo "run_release_assets_docker=${run_release_assets_docker}"
-            echo "run_self_host_systemd=${run_self_host_systemd}"
-            echo "run_self_host_launchd=${run_self_host_launchd}"
-            echo "run_self_host_schtasks=${run_self_host_schtasks}"
-            echo "run_self_host_daemon=${run_self_host_daemon}"
-            echo "run_extended_db=${run_extended_db}"
-          } >> "$GITHUB_OUTPUT"
+        run: node scripts/pipeline/checks/resolve-checks-plan.mjs --target hosted
 
   release_actor_guard:
     needs: [trusted_ref_guard]
@@ -287,7 +155,6 @@ jobs:
         uses: ./.github/actions/release-actor-guard
         with:
           team_slug: release-admins
-          trusted_actors: happier-bot
           app_id: ${{ secrets.RELEASE_BOT_APP_ID }}
           private_key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
 
@@ -317,6 +184,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      actions: read
     uses: ./.github/workflows/tests.yml
     secrets: inherit
     with:
@@ -327,6 +195,7 @@ jobs:
       run_mobile_e2e_android: ${{ needs.resolve.outputs.run_mobile_e2e_android == 'true' }}
       run_mobile_e2e_ios: ${{ needs.resolve.outputs.run_mobile_e2e_ios == 'true' }}
       run_ui: ${{ needs.resolve.outputs.run_ui == 'true' }}
+      run_shared_packages: ${{ needs.resolve.outputs.run_shared_packages == 'true' }}
       run_server: ${{ needs.resolve.outputs.run_server == 'true' }}
       run_cli: ${{ needs.resolve.outputs.run_cli == 'true' }}
       run_stack: ${{ needs.resolve.outputs.run_stack == 'true' }}
@@ -342,9 +211,13 @@ jobs:
       run_release_contracts: ${{ needs.resolve.outputs.run_release_contracts == 'true' }}
       run_installers_smoke: ${{ needs.resolve.outputs.run_installers_smoke == 'true' }}
       installers_channel: ${{ inputs.installers_channel }}
-      installers_source: local-build
-      installers_ref: .
+      installers_source: ${{ inputs.installers_source }}
+      installers_ref: ${{ inputs.installers_source == 'local-build' && '.' || inputs.installers_channel }}
       run_binary_smoke: ${{ needs.resolve.outputs.run_binary_smoke == 'true' }}
+      run_build_smoke: ${{ needs.resolve.outputs.run_build_smoke == 'true' }}
+      run_cli_update_continuity: ${{ needs.resolve.outputs.run_cli_update_continuity == 'true' }}
+      cli_update_to_source: ${{ inputs.cli_update_to_source }}
+      cli_update_to_ref: ${{ inputs.cli_update_to_ref }}
       run_daemon_continuity: ${{ needs.resolve.outputs.run_daemon_continuity == 'true' }}
       run_session_continuity: ${{ needs.resolve.outputs.run_session_continuity == 'true' }}
       run_release_assets_docker: ${{ needs.resolve.outputs.run_release_assets_docker == 'true' }}
@@ -417,6 +290,8 @@ jobs:
     if: ${{ needs.resolve.outputs.run_extended_db == 'true' }}
     permissions:
       contents: read
+      pull-requests: read
+      actions: read
     uses: ./.github/workflows/extended-db-tests.yml
     with:
       select_jobs_explicitly: true

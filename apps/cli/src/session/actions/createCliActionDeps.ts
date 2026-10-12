@@ -5,6 +5,7 @@ import {
   buildBackendTargetKey,
   getActionSpec,
   listNativeReviewEngines,
+  normalizeSessionMetadataForRead,
   SESSION_USAGE_LIMIT_RECOVERY_METADATA_KEY,
   SessionUsageLimitRecoveryV1Schema,
   buildStructuredQuestionAnswerPayload,
@@ -89,10 +90,7 @@ import {
   stopExecutionRun,
   waitForExecutionRun,
 } from '@/session/services/executionRuns';
-import {
-  normalizeExecutionRunWaitPollIntervalMs,
-  normalizeExecutionRunWaitTimeoutMs,
-} from '@/session/services/executionRunWaitTiming';
+import { normalizeExecutionRunWaitTimeoutMs } from '@/session/services/executionRunWaitTiming';
 import { resolveSessionTransportContext } from '@/session/services/resolveSessionTransportContext';
 import { fetchSessionById, fetchSessionByIdCompat, type RawSessionRecord } from '@/session/transport/http/sessionsHttp';
 import { callSessionRpc } from '@/session/transport/rpc/sessionRpc';
@@ -226,7 +224,7 @@ function readSessionMetadata(params: Readonly<{
 }>): Record<string, unknown> | null {
   const raw = params.rawSession?.metadata;
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-    return raw as Record<string, unknown>;
+    return normalizeSessionMetadataForRead(raw as Record<string, unknown>);
   }
   if (typeof raw !== 'string' || raw.trim().length === 0 || !params.mode) {
     return null;
@@ -239,7 +237,7 @@ function readSessionMetadata(params: Readonly<{
       value: raw,
     });
     return decrypted && typeof decrypted === 'object' && !Array.isArray(decrypted)
-      ? decrypted as Record<string, unknown>
+      ? normalizeSessionMetadataForRead(decrypted as Record<string, unknown>)
       : null;
   } catch {
     return null;
@@ -644,22 +642,15 @@ export function createCliActionDeps(params: Readonly<{
   const sessionTransportCache = new Map<string, ResolvedSessionTransport>();
   let usageLimitRecoveryFeatureEnabledPromise: Promise<boolean> | null = null;
   let accountProfilePromise: Promise<Awaited<ReturnType<typeof fetchAccountProfile>> | null> | null = null;
-  const actionFeatureDecisionPromises = new Map<FeatureId, Promise<boolean>>();
   const ambiguousSpawnActionRequestIds = new Set<string>();
 
   const resolveActionFeatureEnabled = async (featureId: FeatureId): Promise<boolean> => {
-    const cached = actionFeatureDecisionPromises.get(featureId);
-    if (cached) return await cached;
-    const promise = resolveCliFeatureDecisionForServer({
+    const resolved = await resolveCliFeatureDecisionForServer({
       featureId,
       env: process.env,
       serverUrl: resolveServerHttpBaseUrl(),
-      timeoutMs: 800,
-    })
-      .then((resolved) => resolved.decision.state === 'enabled')
-      .catch(() => false);
-    actionFeatureDecisionPromises.set(featureId, promise);
-    return await promise;
+    });
+    return resolved.decision.state === 'enabled';
   };
 
   const readActionAccountSettings = async (): Promise<Readonly<Record<string, unknown>>> => {
@@ -1291,12 +1282,6 @@ export function createCliActionDeps(params: Readonly<{
         return { ok: false, code: transport.code, ...(transport.candidates ? { candidates: transport.candidates } : {}) };
       }
 
-      const pollIntervalEnvRaw = (process.env.HAPPIER_SESSION_RUN_WAIT_POLL_INTERVAL_MS ?? '').trim();
-      const pollIntervalMs =
-        typeof (request as any)?.pollIntervalMs === 'number'
-          ? normalizeExecutionRunWaitPollIntervalMs((request as any).pollIntervalMs)
-          : normalizeExecutionRunWaitPollIntervalMs(pollIntervalEnvRaw);
-
       return await waitForExecutionRun({
         token: params.token,
         sessionId: transport.sessionId,
@@ -1304,7 +1289,6 @@ export function createCliActionDeps(params: Readonly<{
         ctx: transport.ctx,
         runId: String((request as any)?.runId ?? ''),
         timeoutMs: normalizeExecutionRunWaitTimeoutMs((request as any)?.timeoutSeconds),
-        pollIntervalMs,
       });
     },
     reviewStartInline: async ({ sessionId, input }) => {
@@ -1618,7 +1602,7 @@ export function createCliActionDeps(params: Readonly<{
     },
     ...(approvalsStore ?? {}),
     ...inventoryDeps,
-    sessionSendMessage: async ({ sessionId, message, requestedAction, wait, timeoutSeconds, permissionModeOverride, modelOverride }) => {
+    sessionSendMessage: async ({ sessionId, message, localId, requestedAction, wait, timeoutSeconds, permissionModeOverride, modelOverride, callerSurface, callerPermissionMode }) => {
       if (!params.credentials) {
         return { ok: false, errorCode: 'not_authenticated', error: 'not_authenticated' };
       }
@@ -1640,11 +1624,15 @@ export function createCliActionDeps(params: Readonly<{
         credentials: params.credentials,
         idOrPrefix: sessionId,
         message: String(message ?? ''),
+        ...(localId ? { localId } : {}),
         requestedAction,
         wait: normalizedWait,
         timeoutMs: normalizedTimeoutSeconds * 1000,
         ...(normalizedPermissionModeOverride
           ? { permissionModeOverride: normalizedPermissionModeOverride }
+          : {}),
+        ...(callerSurface === 'session_agent'
+          ? { permissionModeCeiling: readValidPermissionMode(callerPermissionMode) ?? 'default' }
           : {}),
         ...(modelOverride === null
           ? { modelOverride: null }

@@ -20,6 +20,7 @@
  *   versionNotesSubject: string;
  *   notarizationEvidenceSuffix: 'cli' | 'hstack' | 'server';
  *   artifactTargets: ReadonlyArray<Readonly<{ os: string; arch: string }>>;
+ *   optionalComponentProducts?: readonly string[];
  * }} BinaryPublishProductSpec
  */
 
@@ -33,6 +34,8 @@ export const BINARY_PUBLISH_TARGETS = Object.freeze([
 
 /** @type {ReadonlyArray<BinaryPublishProductSpec['id']>} */
 export const BINARY_PUBLISH_PRODUCT_IDS = Object.freeze(['cli', 'hstack', 'server']);
+
+export const CLI_OPTIONAL_COMPONENT_PRODUCTS = Object.freeze(['happier-memory-runtime', 'happier-difftastic']);
 
 /** @type {Readonly<Record<BinaryPublishProductSpec['id'], Readonly<BinaryPublishProductSpec>>>} */
 const PRODUCT_SPECS = Object.freeze({
@@ -55,6 +58,7 @@ const PRODUCT_SPECS = Object.freeze({
     versionNotesSubject: 'CLI',
     notarizationEvidenceSuffix: 'cli',
     artifactTargets: BINARY_PUBLISH_TARGETS,
+    optionalComponentProducts: CLI_OPTIONAL_COMPONENT_PRODUCTS,
   }),
   hstack: Object.freeze({
     id: 'hstack',

@@ -14,8 +14,19 @@ import type {
  * @template TResponse - The response data type
  */
 export type RpcHandler<TRequest = any, TResponse = any> = (
-    data: TRequest
+    data: TRequest,
 ) => TResponse | Promise<TResponse>;
+
+/**
+ * Optional transport lifecycle context passed as a handler's third argument.
+ * The second argument is intentionally left available for the 0.2 local-call
+ * compatibility contract used by session handoff handlers.
+ */
+export type RpcHandlerContext = Readonly<{
+    signal: AbortSignal;
+    /** Validated relay-minted transport correlation for this target request. */
+    transportRequestId?: string;
+}>;
 
 export type RpcHandlerRegistrar = Readonly<{
     registerHandler: <TRequest = any, TResponse = any>(
@@ -25,7 +36,11 @@ export type RpcHandlerRegistrar = Readonly<{
 }>;
 
 export type RpcHandlerInvoker = Readonly<{
-    invokeLocal: (method: string, params: unknown) => Promise<unknown>;
+    invokeLocal: (
+        method: string,
+        params: unknown,
+        options?: Readonly<{ signal?: AbortSignal }>,
+    ) => Promise<unknown>;
 }>;
 
 export type RpcHandlerManagerLike = RpcHandlerRegistrar & RpcHandlerInvoker;

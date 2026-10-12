@@ -6,7 +6,7 @@
  * OpenCode ACP is expected to speak JSON-RPC over ndJSON on stdout.
  * This transport focuses on:
  * - Conservative stdout filtering (JSON objects/arrays only)
- * - Reasonable init/tool timeouts
+ * - A bounded initialization timeout
  * - Heuristics for mapping OpenCode "other" tool names to concrete tool names
  * - Basic stderr classification (auth/model errors)
  *
@@ -28,6 +28,7 @@ import type {
 import type { AgentMessage } from '@/agent/core';
 import { logger } from '@/ui/logger';
 import { filterJsonObjectOrArrayLine } from '@/agent/transport/utils/jsonStdoutFilter';
+import { classifyProviderOutputFailure } from '@/agent/runtime/classifyProviderOutputFailure';
 import {
   findToolNameFromId,
   findToolNameFromInputFields,
@@ -42,9 +43,6 @@ export const OPENCODE_TIMEOUTS = {
    * Prefer a conservative init timeout to avoid false failures.
    */
   init: 60_000,
-  toolCall: 120_000,
-  investigation: 300_000,
-  think: 30_000,
   // OpenCode can emit post-tool assistant chunks in staggered bursts with >1s gaps.
   // Keep idle detection conservative enough to avoid prematurely finalizing strict-JSON turns.
   idle: 1_500,
@@ -162,11 +160,7 @@ export class OpenCodeTransport implements TransportHandler {
     }
 
     // Authentication error - show actionable message.
-    if (
-      lower.includes('authentication') ||
-      lower.includes('unauthorized') ||
-      lower.includes('api key')
-    ) {
+    if (classifyProviderOutputFailure(trimmed).authenticationError) {
       const errorMessage: AgentMessage = {
         type: 'status',
         status: 'error',
@@ -389,10 +383,8 @@ export class OpenCodeTransport implements TransportHandler {
     );
   }
 
-  getToolCallTimeout(toolCallId: string, toolKind?: string): number {
-    if (this.isInvestigationTool(toolCallId, toolKind)) return OPENCODE_TIMEOUTS.investigation;
-    if (toolKind === 'think') return OPENCODE_TIMEOUTS.think;
-    return OPENCODE_TIMEOUTS.toolCall;
+  getToolCallTimeout(_toolCallId: string, _toolKind?: string): number | null {
+    return null;
   }
 
   getIdleTimeout(): number {

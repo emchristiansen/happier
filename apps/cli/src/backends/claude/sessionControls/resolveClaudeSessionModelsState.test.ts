@@ -34,7 +34,7 @@ describe('resolveClaudeSessionModelsState', () => {
       expect.objectContaining({
         v: 1,
         provider: 'claude',
-        updatedAt: 456,
+        updatedAt: 0,
         currentModelId: 'claude-sonnet-4-6',
         availableModels: expect.arrayContaining([
           expect.objectContaining({

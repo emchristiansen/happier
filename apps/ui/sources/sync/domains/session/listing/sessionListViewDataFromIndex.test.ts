@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildSessionListIndexFromViewData, type SessionListIndexItem } from './sessionListIndex';
+import {
+    areSessionListIndexItemsEqual,
+    buildSessionListIndexFromViewData,
+    buildSessionListIndexItemFromViewItem,
+    type SessionListIndexItem,
+} from './sessionListIndex';
 import type { SessionListRenderableSession } from './sessionListRenderable';
 import type { SessionListViewItem } from './sessionListViewData';
 import { buildSessionListViewDataFromIndex } from './sessionListViewDataFromIndex';
@@ -135,6 +140,80 @@ describe('buildSessionListViewDataFromIndex', () => {
         ]);
         expect(result?.[2]).toBe(source[0]);
         expect(result?.[3]).toBe(source[1]);
+    });
+
+    it('preserves index meaning through reordered folder rows and machine-backed headers', () => {
+        const workspace = {
+            t: 'workspaceScope' as const,
+            serverId: 'server-a',
+            machineId: 'machine-a',
+            rootPath: '/repo',
+        };
+        const machine = {
+            id: 'machine-a',
+            updatedAt: 10,
+            active: true,
+            activeAt: 10,
+            revokedAt: null,
+            metadataVersion: 1,
+            metadata: { displayName: 'Build host', host: 'host-a', homeDir: '/home/a' },
+        };
+        const source: SessionListViewItem[] = [
+            {
+                type: 'header',
+                title: 'Workspace',
+                headerKind: 'folder',
+                groupKey: 'folder:server-a:workspace-a:folder-a',
+                workspaceKey: 'workspace-a',
+                folderId: 'folder-a',
+                depth: 1,
+                workspace,
+                machine,
+                serverId: 'server-a',
+            },
+            {
+                type: 'session',
+                session: makeRenderable('a'),
+                section: 'inactive',
+                groupKey: 'folder:server-a:workspace-a:folder-a',
+                groupKind: 'folder',
+                folderId: 'folder-a',
+                folderDepth: 2,
+                workspace,
+                serverId: 'server-a',
+            },
+            {
+                type: 'session',
+                session: makeRenderable('b'),
+                section: 'inactive',
+                groupKey: 'folder:server-a:workspace-a:folder-a',
+                groupKind: 'folder',
+                folderId: 'folder-a',
+                folderDepth: 2,
+                workspace,
+                serverId: 'server-a',
+            },
+        ];
+        const sourceIndex = buildSessionListIndexFromViewData(source) as SessionListIndexItem[];
+        const header = sourceIndex[0] as Extract<SessionListIndexItem, { type: 'header' }>;
+        const computedIndex: SessionListIndexItem[] = [
+            { ...header, machine: { ...machine, activeAt: 20 } },
+            sourceIndex[2]!,
+            sourceIndex[1]!,
+        ];
+
+        const result = buildSessionListViewDataFromIndex({
+            index: computedIndex,
+            source,
+            sourceIndex,
+        });
+
+        expect(result?.map((item) => item.type === 'header' ? `header:${item.machine?.activeAt}` : item.session.id))
+            .toEqual(['header:20', 'b', 'a']);
+        expect(result?.every((item, index) => areSessionListIndexItemsEqual(
+            buildSessionListIndexItemFromViewItem(item),
+            computedIndex[index],
+        ))).toBe(true);
     });
 
     describe('previous-row identity', () => {

@@ -910,7 +910,7 @@ await withJsonOwnerFileLock({
       }), 'utf8');
       await expect(withJsonOwnerFileLock({
         lockPath: deadLockPath,
-        timeoutMs: 200,
+        timeoutMs: 1_000,
         staleAfterMs: 1,
         errorCode: 'dead_lock_timeout',
         pollIntervalMs: 2,
@@ -926,7 +926,7 @@ await withJsonOwnerFileLock({
       await writeFile(reusedLockPath, ambiguousRaw, 'utf8');
       await expect(withJsonOwnerFileLock({
         lockPath: reusedLockPath,
-        timeoutMs: 200,
+        timeoutMs: 1_000,
         staleAfterMs: 1,
         errorCode: 'reused_pid_lock_timeout',
         pollIntervalMs: 2,

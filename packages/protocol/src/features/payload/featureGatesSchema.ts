@@ -63,6 +63,9 @@ export const FeatureGatesSchema = z.object({
       accountGroups: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
       accountFallback: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
       autoQuotaReset: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
+      autoDisablePlanInvalid: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
+      poolQuotaLimitSelection: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
+      poolExpiryFirst: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
     })
     .optional()
     .default({
@@ -72,6 +75,9 @@ export const FeatureGatesSchema = z.object({
       accountGroups: DEFAULT_GATE_DISABLED,
       accountFallback: DEFAULT_GATE_DISABLED,
       autoQuotaReset: DEFAULT_GATE_DISABLED,
+      autoDisablePlanInvalid: DEFAULT_GATE_DISABLED,
+      poolQuotaLimitSelection: DEFAULT_GATE_DISABLED,
+      poolExpiryFirst: DEFAULT_GATE_DISABLED,
     }),
   channelBridges: z
     .object({

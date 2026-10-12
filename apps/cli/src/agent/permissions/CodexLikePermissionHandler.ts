@@ -18,7 +18,9 @@ import {
   type PendingRequest,
 } from '@/agent/permissions/BasePermissionHandler';
 import { resolvePermissionIntentFromMetadataSnapshot } from '@/agent/runtime/permission/permissionModeFromMetadata';
-import { shouldSuppressProviderPermissionForHappierApproval } from '@/agent/tools/happierTools/resolveHappierActionForMcpToolName';
+import {
+  isSafeFirstPartyHappierActionToolCall,
+} from '@/agent/tools/happierTools/resolveHappierActionForMcpToolName';
 import type { ToolTraceProtocol } from '@/agent/tools/trace/toolTrace';
 import type { AccountSettings } from '@happier-dev/protocol';
 import { isDefaultWriteLikeToolName } from './writeLikeToolNameHeuristics';
@@ -128,15 +130,11 @@ export class CodexLikePermissionHandler extends BasePermissionHandler {
     }
 
     const isAlwaysAutoApprove =
-      this.isAlwaysAutoApproveTool(toolName) || this.isHappierToolsShellBridgeToolCall(toolName, input);
+      this.isAlwaysAutoApproveTool(toolName, input) || this.isHappierToolsShellBridgeToolCall(toolName, input);
 
     if ((permissionMode === 'read-only' || permissionMode === 'plan') && !isAlwaysAutoApprove && this.isWriteLikeToolName(toolName)) {
       logger.debug(`${this.getLogPrefix()} Denying tool ${toolName} (${toolCallId}) in ${permissionMode} mode`);
       return { decision: 'denied' };
-    }
-
-    if (this.shouldSuppressForHappierActionApproval(toolName, input)) {
-      return { decision: 'approved' };
     }
 
     if (this.isAllowedForSession(toolName, input)) {
@@ -163,8 +161,9 @@ export class CodexLikePermissionHandler extends BasePermissionHandler {
     this.setPermissionMode(resolved.intent, resolved.updatedAt);
   }
 
-  private isAlwaysAutoApproveTool(toolName: string): boolean {
-    return isTrustedAlwaysAutoApproveToolName(toolName);
+  private isAlwaysAutoApproveTool(toolName: string, input: unknown): boolean {
+    return isTrustedAlwaysAutoApproveToolName(toolName)
+      || isSafeFirstPartyHappierActionToolCall({ toolName, input });
   }
 
   private isHappierToolsShellBridgeToolCall(toolName: string, input: unknown): boolean {
@@ -179,24 +178,25 @@ export class CodexLikePermissionHandler extends BasePermissionHandler {
     const parsed = parseTrustedHappierToolsShellBridgeCommand(command);
     if (!parsed) return false;
     if (parsed.kind === 'list') return true;
-    return parsed.source === 'happier' && AUTO_APPROVE_HAPPIER_SHELL_BRIDGE_TOOLS.has(parsed.tool);
+    if (parsed.source !== 'happier') return false;
+    if (AUTO_APPROVE_HAPPIER_SHELL_BRIDGE_TOOLS.has(parsed.tool)) return true;
+    if (parsed.argsJson == null) return false;
+    try {
+      return isSafeFirstPartyHappierActionToolCall({
+        toolName: parsed.tool,
+        input: JSON.parse(parsed.argsJson),
+      });
+    } catch {
+      return false;
+    }
   }
 
   private isFullAutoApproveMode(permissionMode: PermissionMode): boolean {
     return permissionMode === 'yolo' || permissionMode === 'bypassPermissions';
   }
 
-  private shouldSuppressForHappierActionApproval(toolName: string, input: unknown): boolean {
-    return shouldSuppressProviderPermissionForHappierApproval({
-      toolName,
-      input,
-      accountSettings: this.getAccountSettingsSnapshot(),
-      surface: 'session_agent',
-    }).suppress;
-  }
-
   private shouldAutoApprove(toolName: string, input: unknown, permissionMode: PermissionMode): boolean {
-    if (this.isAlwaysAutoApproveTool(toolName)) return true;
+    if (this.isAlwaysAutoApproveTool(toolName, input)) return true;
     if (this.isHappierToolsShellBridgeToolCall(toolName, input)) return true;
 
     switch (permissionMode) {
@@ -262,18 +262,12 @@ export class CodexLikePermissionHandler extends BasePermissionHandler {
     }
 
     const isAlwaysAutoApprove =
-      this.isAlwaysAutoApproveTool(toolName) || this.isHappierToolsShellBridgeToolCall(toolName, input);
+      this.isAlwaysAutoApproveTool(toolName, input) || this.isHappierToolsShellBridgeToolCall(toolName, input);
 
     if ((permissionMode === 'read-only' || permissionMode === 'plan') && !isAlwaysAutoApprove && this.isWriteLikeToolName(toolName)) {
       logger.debug(`${this.getLogPrefix()} Denying tool ${toolName} (${toolCallId}) in ${permissionMode} mode`);
       this.recordAutoDecision(toolCallId, toolName, input, 'denied');
       return { decision: 'denied' };
-    }
-
-    if (this.shouldSuppressForHappierActionApproval(toolName, input)) {
-      logger.debug(`${this.getLogPrefix()} Auto-approving Happier MCP tool ${toolName} (${toolCallId}) because Happier action approval is required`);
-      this.recordAutoDecision(toolCallId, toolName, input, 'approved');
-      return { decision: 'approved' };
     }
 
     // Respect user "don't ask again for session" choices captured via our permission UI.

@@ -4,6 +4,7 @@ import { CodexLikePermissionHandler } from './CodexLikePermissionHandler';
 import { SessionPermissionRpcRouter } from './sessionPermissionRpcRouter';
 import { createRunScopedExecutionPermissionHandler } from '@/agent/executionRuns/runtime/runScopedExecutionPermissionHandler';
 import { createExecutionRunPermissionHandler } from '@/agent/executionRuns/policy/executionRunPermissionDecision';
+import { PUBLIC_RPC_HANDLER_ERROR_CODES } from '@happier-dev/protocol/rpcErrors';
 
 class FakeRpcHandlerManager {
   handlers = new Map<string, (payload: any) => any>();
@@ -136,6 +137,78 @@ describe('CodexLikePermissionHandler', () => {
     });
   });
 
+  it('accepts a structured question answer after a completed turn resets the handler', async () => {
+    const session = new FakeSession();
+    const handler = new CodexLikePermissionHandler({ session: session as any, logPrefix: '[Test]' });
+    const previous = handler.handleToolCall('previous-turn-question', 'AskUserQuestion', {
+      questions: [{ question: 'Previous?', options: [{ label: 'Yes' }] }],
+    });
+    handler.reset();
+    await expect(previous).rejects.toThrow('Session reset');
+
+    const pending = handler.handleToolCall('next-turn-question', 'AskUserQuestion', {
+      questions: [{ question: 'Continue?', options: [{ label: 'Yes' }] }],
+    });
+    const rpc = session.rpcHandlerManager.handlers.get('session.structuredQuestion.respond.v1');
+    expect(rpc).toBeDefined();
+
+    try {
+      await expect(rpc!({
+        id: 'previous-turn-question',
+        structuredAnswersV1: { 'Previous?': ['Yes'] },
+      })).rejects.toMatchObject({
+        rpcErrorCode: PUBLIC_RPC_HANDLER_ERROR_CODES.STRUCTURED_QUESTION_RECEIVER_NOT_OWNER,
+      });
+      await rpc!({ id: 'next-turn-question', structuredAnswersV1: { 'Continue?': ['Yes'] } });
+      await expect(pending).resolves.toEqual({
+        decision: 'approved',
+        answers: { 'Continue?': ['Yes'] },
+      });
+      expect(session.agentState.requests['next-turn-question']).toBeUndefined();
+    } finally {
+      handler.reset();
+      await pending.catch(() => undefined);
+    }
+  });
+
+  it('keeps a structured question answerable until its completed state is acknowledged', async () => {
+    const session = new FakeSession();
+    const originalUpdate = session.updateAgentState.bind(session);
+    let rejectCompletion = true;
+    let rejectCompletionWrite: ((error: Error) => void) | null = null;
+    vi.spyOn(session, 'updateAgentState').mockImplementation((updater) => {
+      const next = updater(session.agentState);
+      if (rejectCompletion && next.completedRequests?.['question-ack']) {
+        return new Promise<void>((_resolve, reject) => { rejectCompletionWrite = reject; });
+      }
+      return originalUpdate(updater);
+    });
+    const handler = new CodexLikePermissionHandler({ session: session as any, logPrefix: '[Test]' });
+    const pending = handler.handleToolCall('question-ack', 'AskUserQuestion', {
+      questions: [{ question: 'Proceed?', options: [{ label: 'Yes' }] }],
+    });
+    const rpc = session.rpcHandlerManager.handlers.get('session.structuredQuestion.respond.v1');
+    expect(rpc).toBeDefined();
+
+    const firstAnswer = rpc!({
+      id: 'question-ack',
+      structuredAnswersV1: { 'Proceed?': ['Yes'] },
+    });
+    expect(await settledState(firstAnswer)).toBe('pending');
+    expect(await settledState(pending)).toBe('pending');
+    expect(rejectCompletionWrite).not.toBeNull();
+    rejectCompletionWrite!(new Error('session socket disconnected'));
+    await expect(firstAnswer).rejects.toBeDefined();
+    expect(await settledState(pending)).toBe('pending');
+    expect(session.agentState.requests['question-ack']).toBeDefined();
+
+    rejectCompletion = false;
+    await rpc!({ id: 'question-ack', structuredAnswersV1: { 'Proceed?': ['Yes'] } });
+    await expect(pending).resolves.toEqual({ decision: 'approved', answers: { 'Proceed?': ['Yes'] } });
+    expect(session.agentState.requests['question-ack']).toBeUndefined();
+    expect(session.agentState.completedRequests['question-ack']?.structuredAnswersV1).toEqual({ 'Proceed?': ['Yes'] });
+  });
+
   it('prompts for write-like tools in safe-yolo mode', async () => {
     const session = new FakeSession();
     const handler = new CodexLikePermissionHandler({ session: session as any, logPrefix: '[Test]' });
@@ -230,6 +303,38 @@ describe('CodexLikePermissionHandler', () => {
     runB.dispose('Test cleanup');
     await expect(stopB).resolves.toEqual({ decision: 'abort' });
     await expect(approvalB).resolves.toEqual({ decision: 'abort' });
+    owner.reset();
+  });
+
+  it('does not replay a retired execution-run occurrence approval into its replacement', async () => {
+    const session = new FakeSession();
+    const owner = new CodexLikePermissionHandler({ session: session as any, logPrefix: '[ExecutionRun]' });
+    const retired = createRunScopedExecutionPermissionHandler({ runId: 'run-resumed', handler: owner });
+
+    const retiredApproval = retired.handler.handleToolCall('call_reused', 'Write', { path: '/tmp/same' });
+    const retiredRequestId = Object.keys(session.agentState.requests)[0];
+    const rpc = session.rpcHandlerManager.handlers.get('permission');
+    expect(retiredRequestId).toBeDefined();
+    expect(rpc).toBeDefined();
+    await rpc!({ id: retiredRequestId, approved: true, decision: 'approved' });
+    await expect(retiredApproval).resolves.toEqual({ decision: 'approved' });
+    retired.dispose('Execution run occurrence retired');
+
+    const replacement = createRunScopedExecutionPermissionHandler({ runId: 'run-resumed', handler: owner });
+    const replacementApproval = replacement.handler.handleToolCall('call_reused', 'Write', { path: '/tmp/same' });
+    const replacementRequestId = Object.keys(session.agentState.requests)[0];
+
+    expect(replacementRequestId).toBeDefined();
+    expect(replacementRequestId).not.toBe(retiredRequestId);
+    expect(await settledState(replacementApproval)).toBe('pending');
+
+    await rpc!({ id: retiredRequestId, approved: true, decision: 'approved' });
+    expect(await settledState(replacementApproval)).toBe('pending');
+
+    await rpc!({ id: replacementRequestId, approved: true, decision: 'approved' });
+    await expect(replacementApproval).resolves.toEqual({ decision: 'approved' });
+
+    replacement.dispose('Test cleanup');
     owner.reset();
   });
 
@@ -392,6 +497,40 @@ describe('CodexLikePermissionHandler', () => {
         decision: 'approved',
       }),
     );
+  });
+
+  it('auto-approves safe first-party Action transport calls in default mode', async () => {
+    const session = new FakeSession();
+    const handler = new CodexLikePermissionHandler({ session: session as any, logPrefix: '[Test]' });
+
+    await expect(handler.handleToolCall(
+      'observe-direct',
+      'mcp__happier__execution_run_wait',
+      { runId: 'run-1' },
+    )).resolves.toEqual({ decision: 'approved' });
+    await expect(handler.handleToolCall(
+      'observe-dynamic',
+      'mcp__happier__action_execute',
+      { actionId: 'execution.run.get', input: { runId: 'run-1' } },
+    )).resolves.toEqual({ decision: 'approved' });
+    await expect(handler.handleToolCall(
+      'write-dynamic',
+      'mcp__happier__action_execute',
+      { actionId: 'execution.run.start', input: {} },
+    )).resolves.toEqual({ decision: 'approved' });
+
+    const unknown = handler.handleToolCall(
+      'unknown-dynamic',
+      'mcp__happier__action_execute',
+      { actionId: 'not.a.known.action', input: {} },
+    );
+    expect(session.agentState.requests['unknown-dynamic']).toBeDefined();
+    await session.rpcHandlerManager.handlers.get('permission')?.({
+      id: 'unknown-dynamic',
+      approved: false,
+      decision: 'denied',
+    });
+    await expect(unknown).resolves.toEqual({ decision: 'denied' });
   });
 
   it('does not use the tool call id or a tool-name substring as authority', async () => {

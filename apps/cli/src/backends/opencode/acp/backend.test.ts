@@ -157,6 +157,28 @@ describe('createOpenCodeBackend command resolution', () => {
     expect(backend.options.env.NODE_ENV).toBe('production');
     expect(backend.options.env.DEBUG).toBe('');
   });
+
+  it('uses the selected V2 command when stable and V2 are both installed', () => {
+    if (process.platform === 'win32') return;
+    const workDir = makeTempDir('happier-opencode-backend-generation-');
+    tempDirs.push(workDir);
+    const binDir = join(workDir, 'bin');
+    mkdirSync(binDir, { recursive: true });
+    makeUnixExecutable({ dir: binDir, name: 'opencode', content: '#!/bin/sh\nexit 0\n' });
+    const v2 = makeUnixExecutable({ dir: binDir, name: 'opencode2', content: '#!/bin/sh\nexit 0\n' });
+
+    const backend = createOpenCodeBackend({
+      cwd: workDir,
+      env: {
+        PATH: binDir,
+        HAPPIER_OPENCODE_PATH: '',
+        HAPPIER_OPENCODE_CLI_GENERATION: 'v2',
+      },
+    }) as unknown as AcpBackendLike;
+
+    expect(backend.options.command).toBe(v2);
+    expectDefaultAcpArgs(backend.options.args);
+  });
 });
 
 describe('createOpenCodeBackend OPENCODE_CONFIG_CONTENT handling', () => {

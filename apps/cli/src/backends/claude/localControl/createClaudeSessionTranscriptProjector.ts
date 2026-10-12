@@ -27,6 +27,10 @@ import {
 } from '../contextCompactionEvents';
 import { applyClaudeEffectiveModelUpdate } from '../sessionModels/effectiveModelUpdate';
 import { readClaudeMainChainAssistantModelId } from '../sessionModels/readClaudeMainChainAssistantModelId';
+import {
+  isClaudeMainChainCompactBoundary,
+  isClaudeSidechainTranscriptMessage,
+} from './readClaudeTranscriptTurnSignal';
 
 type ClaudeLocalWorkStateSnapshot = ReturnType<typeof buildClaudeTodoWriteWorkState>
   & Readonly<{ ownedSourceFamilies?: readonly string[] }>;
@@ -89,10 +93,6 @@ function readCompactCommandMarkerKind(message: RawJSONLines): CompactCommandMark
   if (texts.some((text) => text.includes('<command-name>/compact</command-name>'))) return 'local-command';
   if (texts.some((text) => text.trim() === '/compact')) return 'plain';
   return null;
-}
-
-function readSystemSubtype(message: RawJSONLines): string | null {
-  return message.type === 'system' ? readString((message as Record<string, unknown>).subtype) : null;
 }
 
 export function createClaudeSessionTranscriptProjector(params: Readonly<{
@@ -245,6 +245,7 @@ export function createClaudeSessionTranscriptProjector(params: Readonly<{
     if (!modelId) return;
     applyClaudeEffectiveModelUpdate({
       client: params.session.client,
+      reconcileModels: params.session.reconcileSessionModels,
       modelId,
       source: 'transcript',
       logPrefix: params.logPrefix,
@@ -258,7 +259,9 @@ export function createClaudeSessionTranscriptProjector(params: Readonly<{
     sequence: ++compactionSequence,
   });
   const maybeEmitCompactionEvents = (message: RawJSONLines): void => {
-    if (readSystemSubtype(message) === 'compact_boundary') {
+    if (isClaudeSidechainTranscriptMessage(message)) return;
+
+    if (isClaudeMainChainCompactBoundary(message)) {
       const messageRecord = message as Record<string, unknown>;
       const providerSessionId = readString(messageRecord.session_id);
       const providerEventId = buildClaudeCompactBoundaryEventIdentity({

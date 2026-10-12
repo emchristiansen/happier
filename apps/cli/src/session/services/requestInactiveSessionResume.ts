@@ -7,6 +7,7 @@ import { RPC_METHODS } from '@happier-dev/protocol/rpc';
 import { isRpcMethodNotAvailableError, isRpcMethodNotFoundError } from '@happier-dev/protocol/rpcErrors';
 
 import { buildInactiveSessionResumeSpawnOptions } from '@/daemon/sessions/runtimeSnapshot/buildInactiveSessionResumeSpawnOptions';
+import { DEFAULT_SESSION_WEBHOOK_TIMEOUT_MS } from '@/daemon/spawn/waitForSessionWebhook';
 import type { Credentials } from '@/persistence';
 import type { RawSessionRecord } from '@/session/transport/http/sessionsHttp';
 import { callMachineRpc } from '@/session/transport/rpc/machineRpc';
@@ -173,6 +174,11 @@ export async function ensureSessionRuntimeForPendingInput(
   }
 
   const startedAtMs = Date.now();
+  const timeoutMs = typeof params.timeoutMs === 'number'
+    && Number.isFinite(params.timeoutMs)
+    && params.timeoutMs > 0
+    ? params.timeoutMs
+    : DEFAULT_SESSION_WEBHOOK_TIMEOUT_MS;
   const readinessSpawnNonce = params.waitForReady === true
     ? `inactive-session.resume:${params.sessionId}:${params.localId}`
     : undefined;
@@ -183,7 +189,7 @@ export async function ensureSessionRuntimeForPendingInput(
       machineId,
       method: RPC_METHODS.SPAWN_HAPPY_SESSION,
       request: buildMachineResumeRequest(options, readinessSpawnNonce),
-      ...(params.timeoutMs ? { timeoutMs: params.timeoutMs } : {}),
+      timeoutMs,
     });
     const responseSessionId = response && typeof response === 'object'
       ? readNonEmptyString((response as { sessionId?: unknown }).sessionId)
@@ -213,9 +219,7 @@ export async function ensureSessionRuntimeForPendingInput(
       return { ok: true };
     }
 
-    const remainingTimeoutMs = typeof params.timeoutMs === 'number'
-      ? Math.max(0, params.timeoutMs - (Date.now() - startedAtMs))
-      : undefined;
+    const remainingTimeoutMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
     if (remainingTimeoutMs === 0) {
       return {
         ok: false,
@@ -235,10 +239,10 @@ export async function ensureSessionRuntimeForPendingInput(
           machineId,
           method: RPC_METHODS.DAEMON_SPAWN_SESSION_RESOLVE,
           request: { spawnNonce: nonce },
-          ...(typeof remainingTimeoutMs === 'number' ? { timeoutMs: remainingTimeoutMs } : {}),
+          timeoutMs: remainingTimeoutMs,
         }),
       ),
-      ...(typeof remainingTimeoutMs === 'number' ? { timeoutMs: remainingTimeoutMs } : {}),
+      timeoutMs: remainingTimeoutMs,
     });
     if (ready.type !== 'success' || ready.sessionId !== params.sessionId) {
       return {

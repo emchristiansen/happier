@@ -3215,3 +3215,172 @@ index 3a297c5..95da4b2 100644
    callbacks: RendererCallbacks;
    capabilities: RenderCapabilities;
    renderChildren: (node: ASTNode) => ReactNode;
+diff --git a/node_modules/react-native-enriched-markdown/ios/renderer/BlockquoteRenderer.m b/node_modules/react-native-enriched-markdown/ios/renderer/BlockquoteRenderer.m
+--- a/node_modules/react-native-enriched-markdown/ios/renderer/BlockquoteRenderer.m
++++ b/node_modules/react-native-enriched-markdown/ios/renderer/BlockquoteRenderer.m
+@@ -11,5 +11,5 @@
+
+ @implementation BlockquoteRenderer {
+-  RendererFactory *_rendererFactory;
++  __weak RendererFactory *_rendererFactory;
+   StyleConfig *_config;
+ }
+diff --git a/node_modules/react-native-enriched-markdown/ios/renderer/CodeBlockRenderer.m b/node_modules/react-native-enriched-markdown/ios/renderer/CodeBlockRenderer.m
+--- a/node_modules/react-native-enriched-markdown/ios/renderer/CodeBlockRenderer.m
++++ b/node_modules/react-native-enriched-markdown/ios/renderer/CodeBlockRenderer.m
+@@ -9,5 +9,5 @@
+
+ @implementation CodeBlockRenderer {
+-  RendererFactory *_rendererFactory;
++  __weak RendererFactory *_rendererFactory;
+   StyleConfig *_config;
+ }
+diff --git a/node_modules/react-native-enriched-markdown/ios/renderer/CodeRenderer.m b/node_modules/react-native-enriched-markdown/ios/renderer/CodeRenderer.m
+--- a/node_modules/react-native-enriched-markdown/ios/renderer/CodeRenderer.m
++++ b/node_modules/react-native-enriched-markdown/ios/renderer/CodeRenderer.m
+@@ -10,5 +10,5 @@
+
+ @implementation CodeRenderer {
+-  RendererFactory *_rendererFactory;
++  __weak RendererFactory *_rendererFactory;
+   StyleConfig *_config;
+ }
+diff --git a/node_modules/react-native-enriched-markdown/ios/renderer/ENRMImageRenderer.m b/node_modules/react-native-enriched-markdown/ios/renderer/ENRMImageRenderer.m
+--- a/node_modules/react-native-enriched-markdown/ios/renderer/ENRMImageRenderer.m
++++ b/node_modules/react-native-enriched-markdown/ios/renderer/ENRMImageRenderer.m
+@@ -10,5 +10,4 @@
+
+ @implementation ENRMImageRenderer {
+-  RendererFactory *_rendererFactory;
+   StyleConfig *_config;
+ }
+@@ -17,5 +16,4 @@
+ {
+   if (self = [super init]) {
+-    _rendererFactory = rendererFactory;
+     _config = (StyleConfig *)config;
+   }
+diff --git a/node_modules/react-native-enriched-markdown/ios/renderer/ENRMMathInlineRenderer.m b/node_modules/react-native-enriched-markdown/ios/renderer/ENRMMathInlineRenderer.m
+--- a/node_modules/react-native-enriched-markdown/ios/renderer/ENRMMathInlineRenderer.m
++++ b/node_modules/react-native-enriched-markdown/ios/renderer/ENRMMathInlineRenderer.m
+@@ -11,5 +11,4 @@
+
+ @implementation ENRMMathInlineRenderer {
+-  RendererFactory *_rendererFactory;
+   StyleConfig *_config;
+ }
+@@ -18,5 +17,4 @@
+ {
+   if (self = [super init]) {
+-    _rendererFactory = rendererFactory;
+     _config = (StyleConfig *)config;
+   }
+diff --git a/node_modules/react-native-enriched-markdown/ios/renderer/ENRMSpoilerRenderer.m b/node_modules/react-native-enriched-markdown/ios/renderer/ENRMSpoilerRenderer.m
+--- a/node_modules/react-native-enriched-markdown/ios/renderer/ENRMSpoilerRenderer.m
++++ b/node_modules/react-native-enriched-markdown/ios/renderer/ENRMSpoilerRenderer.m
+@@ -6,5 +6,5 @@
+
+ @implementation ENRMSpoilerRenderer {
+-  RendererFactory *_rendererFactory;
++  __weak RendererFactory *_rendererFactory;
+ }
+
+diff --git a/node_modules/react-native-enriched-markdown/ios/renderer/EmphasisRenderer.m b/node_modules/react-native-enriched-markdown/ios/renderer/EmphasisRenderer.m
+--- a/node_modules/react-native-enriched-markdown/ios/renderer/EmphasisRenderer.m
++++ b/node_modules/react-native-enriched-markdown/ios/renderer/EmphasisRenderer.m
+@@ -8,5 +8,5 @@
+
+ @implementation EmphasisRenderer {
+-  RendererFactory *_rendererFactory;
++  __weak RendererFactory *_rendererFactory;
+   StyleConfig *_config;
+ }
+diff --git a/node_modules/react-native-enriched-markdown/ios/renderer/HeadingRenderer.m b/node_modules/react-native-enriched-markdown/ios/renderer/HeadingRenderer.m
+--- a/node_modules/react-native-enriched-markdown/ios/renderer/HeadingRenderer.m
++++ b/node_modules/react-native-enriched-markdown/ios/renderer/HeadingRenderer.m
+@@ -21,5 +21,5 @@
+
+ @implementation HeadingRenderer {
+-  RendererFactory *_rendererFactory;
++  __weak RendererFactory *_rendererFactory;
+   StyleConfig *_config;
+ }
+diff --git a/node_modules/react-native-enriched-markdown/ios/renderer/LinkRenderer.m b/node_modules/react-native-enriched-markdown/ios/renderer/LinkRenderer.m
+--- a/node_modules/react-native-enriched-markdown/ios/renderer/LinkRenderer.m
++++ b/node_modules/react-native-enriched-markdown/ios/renderer/LinkRenderer.m
+@@ -7,5 +7,5 @@
+
+ @implementation LinkRenderer {
+-  RendererFactory *_rendererFactory;
++  __weak RendererFactory *_rendererFactory;
+   StyleConfig *_config;
+ }
+diff --git a/node_modules/react-native-enriched-markdown/ios/renderer/ListItemRenderer.m b/node_modules/react-native-enriched-markdown/ios/renderer/ListItemRenderer.m
+--- a/node_modules/react-native-enriched-markdown/ios/renderer/ListItemRenderer.m
++++ b/node_modules/react-native-enriched-markdown/ios/renderer/ListItemRenderer.m
+@@ -22,5 +22,5 @@
+
+ @implementation ListItemRenderer {
+-  RendererFactory *_rendererFactory;
++  __weak RendererFactory *_rendererFactory;
+   StyleConfig *_config;
+ }
+diff --git a/node_modules/react-native-enriched-markdown/ios/renderer/ListRenderer.m b/node_modules/react-native-enriched-markdown/ios/renderer/ListRenderer.m
+--- a/node_modules/react-native-enriched-markdown/ios/renderer/ListRenderer.m
++++ b/node_modules/react-native-enriched-markdown/ios/renderer/ListRenderer.m
+@@ -8,5 +8,5 @@
+
+ @implementation ListRenderer {
+-  RendererFactory *_rendererFactory;
++  __weak RendererFactory *_rendererFactory;
+   StyleConfig *_config;
+   BOOL _isOrdered;
+diff --git a/node_modules/react-native-enriched-markdown/ios/renderer/ParagraphRenderer.m b/node_modules/react-native-enriched-markdown/ios/renderer/ParagraphRenderer.m
+--- a/node_modules/react-native-enriched-markdown/ios/renderer/ParagraphRenderer.m
++++ b/node_modules/react-native-enriched-markdown/ios/renderer/ParagraphRenderer.m
+@@ -7,5 +7,5 @@
+
+ @implementation ParagraphRenderer {
+-  RendererFactory *_rendererFactory;
++  __weak RendererFactory *_rendererFactory;
+   StyleConfig *_config;
+ }
+diff --git a/node_modules/react-native-enriched-markdown/ios/renderer/RendererFactory.m b/node_modules/react-native-enriched-markdown/ios/renderer/RendererFactory.m
+--- a/node_modules/react-native-enriched-markdown/ios/renderer/RendererFactory.m
++++ b/node_modules/react-native-enriched-markdown/ios/renderer/RendererFactory.m
+@@ -28,4 +28,5 @@
+ @implementation RendererFactory {
+   StyleConfig *_config;
++  // AttributedRenderer owns this factory; cached renderers must not retain it.
+   NSMutableDictionary<NSNumber *, id<NodeRenderer>> *_cache;
+ }
+diff --git a/node_modules/react-native-enriched-markdown/ios/renderer/StrikethroughRenderer.m b/node_modules/react-native-enriched-markdown/ios/renderer/StrikethroughRenderer.m
+--- a/node_modules/react-native-enriched-markdown/ios/renderer/StrikethroughRenderer.m
++++ b/node_modules/react-native-enriched-markdown/ios/renderer/StrikethroughRenderer.m
+@@ -6,5 +6,5 @@
+
+ @implementation StrikethroughRenderer {
+-  RendererFactory *_rendererFactory;
++  __weak RendererFactory *_rendererFactory;
+   StyleConfig *_config;
+ }
+diff --git a/node_modules/react-native-enriched-markdown/ios/renderer/StrongRenderer.m b/node_modules/react-native-enriched-markdown/ios/renderer/StrongRenderer.m
+--- a/node_modules/react-native-enriched-markdown/ios/renderer/StrongRenderer.m
++++ b/node_modules/react-native-enriched-markdown/ios/renderer/StrongRenderer.m
+@@ -8,5 +8,5 @@
+
+ @implementation StrongRenderer {
+-  RendererFactory *_rendererFactory;
++  __weak RendererFactory *_rendererFactory;
+   StyleConfig *_config;
+ }
+diff --git a/node_modules/react-native-enriched-markdown/ios/renderer/UnderlineRenderer.m b/node_modules/react-native-enriched-markdown/ios/renderer/UnderlineRenderer.m
+--- a/node_modules/react-native-enriched-markdown/ios/renderer/UnderlineRenderer.m
++++ b/node_modules/react-native-enriched-markdown/ios/renderer/UnderlineRenderer.m
+@@ -6,5 +6,5 @@
+
+ @implementation UnderlineRenderer {
+-  RendererFactory *_rendererFactory;
++  __weak RendererFactory *_rendererFactory;
+   StyleConfig *_config;
+ }

@@ -6,14 +6,19 @@ export type DeferredTranscriptMarker = Readonly<{
     messageId?: string;
 }>;
 
+export type DeferredTranscriptGap = Readonly<{
+    afterSeq: number;
+    throughSeq: number;
+}>;
+
 export type DeferredTranscriptState = Readonly<{
     knownRemoteSeqBySessionId: Readonly<Record<string, number>>;
     deferredDurableSeqBySessionId: Readonly<Record<string, number>>;
     staleMessageIdsBySessionId: Readonly<Record<string, readonly string[]>>;
-    // Lowest seq among rows edited while hidden — the lower bound for the targeted refetch
-    // region (refetch newer from `minSeq - 1`) so reopening repairs the edited rows without
-    // wiping paginated older history.
+    staleMessageSeqsBySessionId: Readonly<Record<string, Readonly<Record<string, number>>>>;
+    // Retain the lower bound for snapshots and the exact hints for bounded sparse repair.
     staleMinSeqBySessionId: Readonly<Record<string, number>>;
+    gapsBySessionId: Readonly<Record<string, DeferredTranscriptGap>>;
 }>;
 
 export function createDeferredTranscriptState(): DeferredTranscriptState {
@@ -21,7 +26,9 @@ export function createDeferredTranscriptState(): DeferredTranscriptState {
         knownRemoteSeqBySessionId: {},
         deferredDurableSeqBySessionId: {},
         staleMessageIdsBySessionId: {},
+        staleMessageSeqsBySessionId: {},
         staleMinSeqBySessionId: {},
+        gapsBySessionId: {},
     };
 }
 
@@ -29,6 +36,63 @@ function normalizeSeq(value: number | null | undefined): number | null {
     return typeof value === 'number' && Number.isFinite(value)
         ? Math.max(0, Math.trunc(value))
         : null;
+}
+
+export function readTranscriptGap(state: DeferredTranscriptState, sessionId: string): DeferredTranscriptGap | null {
+    return state.gapsBySessionId[sessionId] ?? null;
+}
+
+export function markTranscriptGap(
+    state: DeferredTranscriptState,
+    sessionId: string,
+    gap: Readonly<{ afterSeq: number; throughSeq: number | null }>,
+): DeferredTranscriptState {
+    const afterSeq = normalizeSeq(gap.afterSeq);
+    const throughSeq = normalizeSeq(gap.throughSeq);
+    if (!sessionId || afterSeq === null || throughSeq === null || throughSeq <= afterSeq) return state;
+    const current = readTranscriptGap(state, sessionId);
+    const next = {
+        afterSeq: Math.min(current?.afterSeq ?? afterSeq, afterSeq),
+        throughSeq: Math.max(current?.throughSeq ?? throughSeq, throughSeq),
+    };
+    if (current?.afterSeq === next.afterSeq && current.throughSeq === next.throughSeq) return state;
+    return { ...state, gapsBySessionId: { ...state.gapsBySessionId, [sessionId]: next } };
+}
+
+/**
+ * A live row can advance materialized max without covering the interval before it.
+ * Only a connected successful page (or a snapshot transferred to the existing tail
+ * discontinuity owner) can advance this gap. An exhausted main page also covers the
+ * captured session-wide hint: intervening sequence numbers may belong to sidechains.
+ */
+export function acknowledgeTranscriptGap(
+    state: DeferredTranscriptState,
+    sessionId: string,
+    coverage: Readonly<{
+        afterSeq: number;
+        expectedGap: DeferredTranscriptGap | null;
+        page: Readonly<{ messages: readonly Readonly<{ seq: number }>[]; nextAfterSeq?: number | null }>;
+    }>,
+): DeferredTranscriptState {
+    const current = readTranscriptGap(state, sessionId);
+    if (!current || coverage.afterSeq > current.afterSeq) return state;
+    const coveredThroughSeq = Math.max(
+        coverage.page.messages.reduce((maxSeq, message) => Math.max(maxSeq, normalizeSeq(message.seq) ?? 0), coverage.afterSeq),
+        // Do not acknowledge a gap learned while the HTTP request was in flight.
+        coverage.page.nextAfterSeq == null ? (coverage.expectedGap?.throughSeq ?? coverage.afterSeq) : coverage.afterSeq,
+    );
+    if (coveredThroughSeq >= current.throughSeq) {
+        const { [sessionId]: _gap, ...gapsBySessionId } = state.gapsBySessionId;
+        return { ...state, gapsBySessionId };
+    }
+    if (coveredThroughSeq <= current.afterSeq) return state;
+    return {
+        ...state,
+        gapsBySessionId: {
+            ...state.gapsBySessionId,
+            [sessionId]: { ...current, afterSeq: coveredThroughSeq },
+        },
+    };
 }
 
 export function markDeferredTranscriptRemoteSeq(
@@ -83,11 +147,16 @@ export function markTranscriptStale(
     const staleMinSeqBySessionId = nextMinSeq === existingMinSeq
         ? remoteState.staleMinSeqBySessionId
         : { ...remoteState.staleMinSeqBySessionId, ...(nextMinSeq !== undefined ? { [sessionId]: nextMinSeq } : {}) };
+    const existingSeqs = remoteState.staleMessageSeqsBySessionId[sessionId] ?? {};
+    // A repeated same-row edit is new demand even when its sequence is unchanged.
+    // The immutable snapshot also survives clear/recreate without counter reuse.
+    const staleMessageSeqsBySessionId = {
+        ...remoteState.staleMessageSeqsBySessionId,
+        [sessionId]: { ...existingSeqs, ...(normalizedSeq === null ? {} : { [marker.messageId]: normalizedSeq }) },
+    };
     const existing = remoteState.staleMessageIdsBySessionId[sessionId] ?? [];
     if (existing.includes(marker.messageId)) {
-        return staleMinSeqBySessionId === remoteState.staleMinSeqBySessionId
-            ? remoteState
-            : { ...remoteState, staleMinSeqBySessionId };
+        return { ...remoteState, staleMinSeqBySessionId, staleMessageSeqsBySessionId };
     }
     return {
         ...remoteState,
@@ -96,6 +165,7 @@ export function markTranscriptStale(
             [sessionId]: [...existing, marker.messageId],
         },
         staleMinSeqBySessionId,
+        staleMessageSeqsBySessionId,
     };
 }
 
@@ -117,34 +187,34 @@ export function readStaleTranscriptMinSeq(
     return normalizeSeq(state.staleMinSeqBySessionId[sessionId]);
 }
 
-export function readDeferredTranscriptDurableSeq(state: DeferredTranscriptState, sessionId: string): number | null {
-    return normalizeSeq(state.deferredDurableSeqBySessionId[sessionId]);
+export function readStaleTranscriptMessageSeqs(
+    state: DeferredTranscriptState,
+    sessionId: string,
+): Readonly<Record<string, number>> {
+    return state.staleMessageSeqsBySessionId[sessionId] ?? {};
 }
 
-function areStringArraysEqual(a: readonly string[], b: readonly string[]): boolean {
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) {
-        if (a[i] !== b[i]) return false;
-    }
-    return true;
+export function readDeferredTranscriptDurableSeq(state: DeferredTranscriptState, sessionId: string): number | null {
+    return normalizeSeq(state.deferredDurableSeqBySessionId[sessionId]);
 }
 
 export function acknowledgeStaleTranscriptRepair(
     state: DeferredTranscriptState,
     sessionId: string,
-    expected: Readonly<{ messageIds: readonly string[]; minSeq: number | null }>,
+    expectedMessageSeqs: Readonly<Record<string, number>>,
 ): DeferredTranscriptState {
     const currentMessageIds = state.staleMessageIdsBySessionId[sessionId] ?? [];
     if (currentMessageIds.length === 0) return state;
-    if (!areStringArraysEqual(currentMessageIds, expected.messageIds)) return state;
-    if (readStaleTranscriptMinSeq(state, sessionId) !== expected.minSeq) return state;
+    if (state.staleMessageSeqsBySessionId[sessionId] !== expectedMessageSeqs) return state;
 
     const { [sessionId]: _stale, ...staleMessageIdsBySessionId } = state.staleMessageIdsBySessionId;
     const { [sessionId]: _staleMinSeq, ...staleMinSeqBySessionId } = state.staleMinSeqBySessionId;
+    const { [sessionId]: _staleMessageSeqs, ...staleMessageSeqsBySessionId } = state.staleMessageSeqsBySessionId;
     return {
         ...state,
         staleMessageIdsBySessionId,
         staleMinSeqBySessionId,
+        staleMessageSeqsBySessionId,
     };
 }
 
@@ -156,16 +226,22 @@ export function clearDeferredTranscriptStateForSession(
         !(sessionId in state.deferredDurableSeqBySessionId)
         && !(sessionId in state.staleMessageIdsBySessionId)
         && !(sessionId in state.staleMinSeqBySessionId)
+        && !(sessionId in state.staleMessageSeqsBySessionId)
+        && !(sessionId in state.gapsBySessionId)
     ) {
         return state;
     }
     const { [sessionId]: _deferred, ...deferredDurableSeqBySessionId } = state.deferredDurableSeqBySessionId;
     const { [sessionId]: _stale, ...staleMessageIdsBySessionId } = state.staleMessageIdsBySessionId;
     const { [sessionId]: _staleMinSeq, ...staleMinSeqBySessionId } = state.staleMinSeqBySessionId;
+    const { [sessionId]: _staleMessageSeqs, ...staleMessageSeqsBySessionId } = state.staleMessageSeqsBySessionId;
+    const { [sessionId]: _gap, ...gapsBySessionId } = state.gapsBySessionId;
     return {
         ...state,
         deferredDurableSeqBySessionId,
         staleMessageIdsBySessionId,
         staleMinSeqBySessionId,
+        staleMessageSeqsBySessionId,
+        gapsBySessionId,
     };
 }

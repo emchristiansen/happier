@@ -137,6 +137,7 @@ export function createWorkflowActivityPublisher(params: Readonly<{
   // current record write fails (keep its previous committed pointer instead of advancing).
   const committedByRun = new Map<string, CommittedRunState>();
   const seededRunIds = new Set<string>();
+  let lastPublishedHeadlineFingerprint: string | null = null;
 
   async function seedCommittedRunState(runId: string): Promise<void> {
     if (committedByRun.has(runId) || seededRunIds.has(runId) || !params.readCommittedRunSnapshot) return;
@@ -241,7 +242,7 @@ export function createWorkflowActivityPublisher(params: Readonly<{
       entries.push(...projectWorkflowRunAgentActivityEntries(state.display));
     }
     const publishedAt = now();
-    await params.writeHeadlines({
+    const bundle: SessionActivityHeadlineBundle = {
       workflow: buildSessionWorkflowActivityHeadline({
         backendId: params.backendId,
         ...(params.agentId ? { agentId: params.agentId } : {}),
@@ -255,7 +256,18 @@ export function createWorkflowActivityPublisher(params: Readonly<{
         entries,
         ...(params.recentEntriesLimit !== undefined ? { recentEntriesLimit: params.recentEntriesLimit } : {}),
       }),
+    };
+    // A failed record retry leaves the durable-backed projection unchanged. Its publication clock
+    // is not new activity: exclude only that clock so retries do not churn session metadata.
+    const fingerprint = JSON.stringify({
+      workflow: { ...bundle.workflow, updatedAt: 0 },
+      agentActivity: { ...bundle.agentActivity, updatedAt: 0 },
     });
+    if (fingerprint !== lastPublishedHeadlineFingerprint) {
+      await params.writeHeadlines(bundle);
+      // Remember successful writes only; a rejected metadata write must remain retryable.
+      lastPublishedHeadlineFingerprint = fingerprint;
+    }
     return { failedRunIds, permanentFailedRunIds };
   }
 

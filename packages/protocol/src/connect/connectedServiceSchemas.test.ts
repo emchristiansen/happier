@@ -298,6 +298,7 @@ describe('connectedServiceSchemas', () => {
                     details: {
                         code: 'near_limit',
                         rawScope: 'account:weekly',
+                        modelDisplayName: 'GPT 5',
                     },
                 },
             ],
@@ -332,6 +333,7 @@ describe('connectedServiceSchemas', () => {
             details: expect.objectContaining({
                 code: 'near_limit',
                 rawScope: 'account:weekly',
+                modelDisplayName: 'GPT 5',
             }),
         }));
     });
@@ -605,17 +607,50 @@ describe('connectedServiceSchemas', () => {
         for (const name of ['ConnectedServiceAuthGroupPolicyV1Schema', 'ConnectedServiceAuthGroupPolicyPatchV1Schema']) {
             const schema = expectSchema(name);
             expect(schema.parse({})).not.toHaveProperty('autoUseQuotaResetsWhenExhausted');
+            expect(schema.parse({})).not.toHaveProperty('autoDisablePlanInvalidAccounts');
             expect(schema.parse({ autoUseQuotaResetsWhenExhausted: true })).toMatchObject({ autoUseQuotaResetsWhenExhausted: true });
             expect(schema.parse({ autoUseQuotaResetsWhenExhausted: false })).toMatchObject({ autoUseQuotaResetsWhenExhausted: false });
             expect(schema.safeParse({ autoUseQuotaResetsWhenExhausted: 'true' }).success).toBe(false);
+            expect(schema.parse({ autoDisablePlanInvalidAccounts: true })).toMatchObject({ autoDisablePlanInvalidAccounts: true });
+            expect(schema.safeParse({ autoDisablePlanInvalidAccounts: 'true' }).success).toBe(false);
         }
+    });
+
+    it('accepts only canonical optional quota-limit selections', () => {
+        for (const name of ['ConnectedServiceAuthGroupPolicyV1Schema', 'ConnectedServiceAuthGroupPolicyPatchV1Schema']) {
+            const schema = expectSchema(name);
+            expect(schema.parse({})).not.toHaveProperty('quotaLimitSelection');
+            expect(schema.parse({ quotaLimitSelection: { mode: 'all', providerLimitIds: [] } })).toMatchObject({
+                quotaLimitSelection: { mode: 'all', providerLimitIds: [] },
+            });
+            expect(schema.parse({ quotaLimitSelection: { mode: 'selected', providerLimitIds: ['spark', 'standard'] } })).toMatchObject({
+                quotaLimitSelection: { mode: 'selected', providerLimitIds: ['spark', 'standard'] },
+            });
+            expect(schema.safeParse({ quotaLimitSelection: { mode: 'all', providerLimitIds: ['spark'] } }).success).toBe(false);
+            expect(schema.safeParse({ quotaLimitSelection: { mode: 'selected', providerLimitIds: [] } }).success).toBe(false);
+            expect(schema.safeParse({ quotaLimitSelection: { mode: 'selected', providerLimitIds: [' spark ', 'spark'] } }).success).toBe(false);
+        }
+    });
+
+    it('appends CORS-safe auth-group reader capabilities without replacing existing query parameters', () => {
+        const appendReaderCapabilities = (schemas as Record<string, unknown>)
+            .appendConnectedServiceAuthGroupReaderCapabilities;
+        expect(typeof appendReaderCapabilities).toBe('function');
+        expect((appendReaderCapabilities as (path: string) => string)('/v3/connect/openai-codex/groups')).toBe(
+            '/v3/connect/openai-codex/groups?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1',
+        );
+        expect((appendReaderCapabilities as (path: string) => string)(
+            '/v3/connect/openai-codex/groups/main/members/work?expectedGeneration=4',
+        )).toBe(
+            '/v3/connect/openai-codex/groups/main/members/work?expectedGeneration=4&happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1',
+        );
     });
 
     it('parses the default connected-service account group policy', () => {
         const ConnectedServiceAuthGroupPolicyV1Schema = expectSchema('ConnectedServiceAuthGroupPolicyV1Schema');
         expect(ConnectedServiceAuthGroupPolicyV1Schema.parse({ v: 1 })).toEqual({
             v: 1,
-            strategy: 'least_limited',
+            strategy: 'expiry_first',
             autoSwitch: false,
             switchOn: {
                 usageLimit: true,
@@ -645,6 +680,7 @@ describe('connectedServiceSchemas', () => {
         expect(ConnectedServiceAuthGroupPolicyV1Schema.safeParse({ v: 1, strategy: 'round_robin' }).success).toBe(false);
         // Existing pools that persisted an explicit `priority` strategy must NOT be silently migrated.
         expect(ConnectedServiceAuthGroupPolicyV1Schema.parse({ v: 1, strategy: 'priority' }).strategy).toBe('priority');
+        expect(ConnectedServiceAuthGroupPolicyV1Schema.parse({ v: 1, strategy: 'least_limited' }).strategy).toBe('least_limited');
         // Removed no-op fields are dropped, not carried, on the parsed policy.
         const parsedPolicy = ConnectedServiceAuthGroupPolicyV1Schema.parse({ v: 1 });
         expect(parsedPolicy).not.toHaveProperty('recoveryPromptMode');
@@ -961,6 +997,21 @@ describe('connectedServiceSchemas', () => {
             enabled: false,
             expectedGeneration: 4,
         });
+        expect(ConnectedServiceAuthGroupMemberPatchRequestV1Schema.parse({
+            enabled: false,
+            state: { autoDisabledReason: 'model_not_entitled' },
+            expectedGeneration: 4,
+            expectedRuntimeStateRevision: 2,
+        })).toEqual({
+            enabled: false,
+            state: { autoDisabledReason: 'model_not_entitled' },
+            expectedGeneration: 4,
+            expectedRuntimeStateRevision: 2,
+        });
+        expect(ConnectedServiceAuthGroupMemberPatchRequestV1Schema.safeParse({
+            state: { autoDisabledReason: 'model_not_entitled' },
+            expectedGeneration: 4,
+        }).success).toBe(false);
         expect(ConnectedServiceAuthGroupMemberPatchRequestV1Schema.safeParse({
             enabled: false,
         }).success).toBe(false);

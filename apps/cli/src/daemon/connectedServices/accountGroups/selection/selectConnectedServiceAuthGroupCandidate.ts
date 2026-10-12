@@ -1,8 +1,11 @@
 import type { ProviderLimitCategory } from '../../quotas/normalization';
 import {
   ConnectedServiceAuthGroupPolicyV1Schema,
+  isConnectedServiceQuotaObservationFresh,
   isConnectedServiceCredentialHealthStatusUsable,
   type ConnectedServiceCredentialHealthStatusV1,
+  type ProviderAccountSubscriptionV1,
+  type ConnectedServiceAuthGroupPolicyV1 as ProtocolConnectedServiceAuthGroupPolicyV1,
 } from '@happier-dev/protocol';
 import {
   reconcileMemberRuntimeStateWithFreshQuotaEvidence,
@@ -16,34 +19,12 @@ export {
   type ConnectedServiceAuthGroupPositiveEvidence,
 } from '../memberRuntimeState';
 
-export type ConnectedServiceAuthGroupPolicyV1 = Readonly<{
-  v: 1;
-  strategy: 'priority' | 'least_limited' | 'manual';
-  autoSwitch: boolean;
-  switchOn: Readonly<{
-    usageLimit: boolean;
-    authExpired: boolean;
-    accountChanged: boolean;
-    refreshFailure: boolean;
-  }>;
-  cooldownMs: number;
-  honorProviderResetsAt: boolean;
-  autoRestorePrimaryWhenReset: boolean;
-  autoUseQuotaResetsWhenExhausted?: boolean;
-  maxSwitchesPerTurn: number;
-  maxSwitchesPerSessionHour: number;
-  softSwitchRemainingPercent: number;
-  probeIfSnapshotOlderThanMs: number;
-  preTurnProbeMode: 'never' | 'when_stale' | 'always_for_group';
-  preTurnProbeOrder: 'current_first_then_candidates' | 'candidates_first_then_current';
-  recoveryMode: 'off' | 'wait_until_reset' | 'switch_then_resume' | 'switch_or_wait';
-  resumePromptMode: 'standard' | 'off' | 'custom';
-}>;
+export type ConnectedServiceAuthGroupPolicyV1 = Readonly<ProtocolConnectedServiceAuthGroupPolicyV1>;
 
 /**
  * Derived from the protocol schema default so the daemon default never drifts from the canonical
  * `ConnectedServiceAuthGroupPolicyV1Schema` (single source of truth for policy defaults, including
- * `strategy: 'least_limited'`). A hardcoded literal here was a latent split-brain against the
+ * `strategy: 'expiry_first'`). A hardcoded literal here was a latent split-brain against the
  * schema. The daemon never writes policy back, so no migration is required.
  */
 export const DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1: ConnectedServiceAuthGroupPolicyV1 =
@@ -62,6 +43,8 @@ export type ConnectedServiceAuthGroupQuotaMeterSnapshot = Readonly<{
   remainingPct: number | null;
   resetAtMs: number | null;
   providerLimitId: string | null;
+  windowDurationMs?: number | null;
+  reliable?: boolean;
 }>;
 
 export type ConnectedServiceAuthGroupQuotaSnapshot = Readonly<{
@@ -74,6 +57,7 @@ export type ConnectedServiceAuthGroupQuotaSnapshot = Readonly<{
 }>;
 
 export type ConnectedServiceAuthGroupMemberRuntimeState = Readonly<{
+  subscription?: ProviderAccountSubscriptionV1;
   credentialHealthStatus?: ConnectedServiceCredentialHealthStatusV1 | null;
   cooldownStartedAtMs?: number | null;
   cooldownUntilMs?: number | null;
@@ -83,15 +67,19 @@ export type ConnectedServiceAuthGroupMemberRuntimeState = Readonly<{
   capacityLimitedUntilMs?: number | null;
   authInvalidUntilMs?: number | null;
   planUnavailableUntilMs?: number | null;
+  modelUnavailableUntilMsByModelId?: Readonly<Record<string, number>>;
   validationBlockedUntilMs?: number | null;
   providerResetsAtMs?: number | null;
   lastFailureKind?: string | null;
+  lastFailureCode?: string | null;
+  autoDisabledReason?: 'model_not_entitled' | null;
   lastObservedAtMs?: number | null;
   quotaSnapshot?: ConnectedServiceAuthGroupQuotaSnapshot | null;
 }>;
 
 export type ConnectedServiceAuthGroupCandidate = ConnectedServiceAuthGroupMember & Readonly<{
   leastLimitedScore: number | null;
+  preferenceDeadlineMs?: number | null;
 }>;
 
 export type ConnectedServiceAuthGroupCandidateSelection = Readonly<{
@@ -293,15 +281,11 @@ function isQuotaSnapshotWithinFreshnessWindow(
   nowMs: number,
   quotaFreshnessMs: number,
 ): boolean {
-  return nowMs - snapshot.capturedAtMs <= quotaFreshnessMs;
-}
-
-function isSnapshotNewerThanFailure(
-  snapshot: ConnectedServiceAuthGroupQuotaSnapshot,
-  state: ConnectedServiceAuthGroupMemberRuntimeState | null,
-): boolean {
-  const lastObservedAtMs = numberOrNull(state?.lastObservedAtMs);
-  return lastObservedAtMs === null || snapshot.capturedAtMs > lastObservedAtMs;
+  return isConnectedServiceQuotaObservationFresh({
+    observedAtMs: snapshot.capturedAtMs,
+    nowMs,
+    maxAgeMs: quotaFreshnessMs,
+  });
 }
 
 function meterHasRemainingQuota(meter: ConnectedServiceAuthGroupQuotaMeterSnapshot): boolean {
@@ -627,6 +611,38 @@ function resolveSoftSwitchPreferredCandidate(params: Readonly<{
   return betterCandidate ?? current;
 }
 
+function compareLeastLimited(left: ConnectedServiceAuthGroupCandidate, right: ConnectedServiceAuthGroupCandidate): number {
+  const leftScore = left.leastLimitedScore;
+  const rightScore = right.leastLimitedScore;
+  if (leftScore !== null && rightScore !== null && leftScore !== rightScore) return rightScore - leftScore;
+  if (leftScore !== null && rightScore === null) return -1;
+  if (leftScore === null && rightScore !== null) return 1;
+  return comparePriority(left, right);
+}
+
+function resolvePreferenceDeadline(
+  snapshot: ConnectedServiceAuthGroupQuotaSnapshot | null,
+  subscription: ProviderAccountSubscriptionV1 | undefined,
+  nowMs: number,
+): number | null {
+  // Prefer the long allowance, not an incidental short-window reset. When duration is
+  // unknown, use the existing effective allowance rather than guessing from labels.
+  const usable = (snapshot?.meters ?? []).filter((meter) => meter.limitCategory === 'usage_limit'
+    && meter.reliable !== false && meter.remainingPct !== null && meter.remainingPct > 0);
+  const longestDuration = Math.max(0, ...usable.map((meter) => meter.windowDurationMs ?? 0));
+  const relevant = longestDuration > 0
+    ? usable.filter((meter) => meter.windowDurationMs === longestDuration)
+    : usable.filter((meter) => meter.meterId === snapshot?.effectiveMeterId);
+  const deadlines = relevant.map((meter) => meter.resetAtMs)
+    .filter((date): date is number => date !== null && Number.isFinite(date) && date > nowMs);
+  if (subscription?.status === 'subscribed' && subscription.renewal === 'off'
+    && subscription.observedAtMs <= nowMs && nowMs - subscription.observedAtMs <= subscription.staleAfterMs
+    && subscription.currentPeriodEndAtMs !== undefined && subscription.currentPeriodEndAtMs > nowMs) {
+    deadlines.push(subscription.currentPeriodEndAtMs);
+  }
+  return deadlines.length > 0 ? Math.min(...deadlines) : null;
+}
+
 export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
   nowMs: number;
   quotaFreshnessMs: number;
@@ -636,6 +652,7 @@ export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
   memberStatesByProfileId: ReadonlyMap<string, ConnectedServiceAuthGroupMemberRuntimeState>;
   allowCurrentProfileRetry?: boolean;
   unavailableProfileIds?: ReadonlySet<string>;
+  providerLimitId?: string | null;
 }>): ConnectedServiceAuthGroupCandidateSelection {
   if (params.policy.strategy === 'manual') {
     return {
@@ -708,6 +725,21 @@ export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
         profileId: member.profileId,
         decision: 'excluded',
         exclusionReason: 'credential_unavailable',
+        quotaEvidence,
+      });
+      continue;
+    }
+    const providerLimitId = params.providerLimitId?.trim();
+    const modelUnavailableUntilMs = providerLimitId
+      ? numberOrNull(effectiveState?.modelUnavailableUntilMsByModelId?.[providerLimitId])
+      : null;
+    if (modelUnavailableUntilMs !== null && modelUnavailableUntilMs > params.nowMs) {
+      excluded.push({ profileId: member.profileId, reason: 'plan_unavailable', retryAtMs: modelUnavailableUntilMs });
+      decisionTraceCandidates.push({
+        profileId: member.profileId,
+        decision: 'excluded',
+        exclusionReason: 'plan_unavailable',
+        retryAtMs: modelUnavailableUntilMs,
         quotaEvidence,
       });
       continue;
@@ -814,20 +846,25 @@ export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
     candidates.push({
       ...member,
       leastLimitedScore: resolveLeastLimitedScore(quotaSnapshot),
+      ...(params.policy.strategy === 'expiry_first' ? {
+        preferenceDeadlineMs: resolvePreferenceDeadline(quotaSnapshot, state?.subscription, params.nowMs),
+      } : {}),
     });
   }
 
-  if (params.policy.strategy === 'least_limited') {
+  if (params.policy.strategy === 'expiry_first') {
     candidates.sort((left, right) => {
-      const leftScore = left.leastLimitedScore;
-      const rightScore = right.leastLimitedScore;
-      if (leftScore !== null && rightScore !== null && leftScore !== rightScore) {
-        return rightScore - leftScore;
+      const leftAdequate = left.leastLimitedScore !== null && left.leastLimitedScore > params.policy.softSwitchRemainingPercent;
+      const rightAdequate = right.leastLimitedScore !== null && right.leastLimitedScore > params.policy.softSwitchRemainingPercent;
+      if (leftAdequate !== rightAdequate) return leftAdequate ? -1 : 1;
+      if (leftAdequate && rightAdequate) {
+        const deadlineDifference = (left.preferenceDeadlineMs ?? Infinity) - (right.preferenceDeadlineMs ?? Infinity);
+        if (deadlineDifference < 0 || deadlineDifference > 0) return deadlineDifference;
       }
-      if (leftScore !== null && rightScore === null) return -1;
-      if (leftScore === null && rightScore !== null) return 1;
-      return comparePriority(left, right);
+      return compareLeastLimited(left, right);
     });
+  } else if (params.policy.strategy === 'least_limited') {
+    candidates.sort(compareLeastLimited);
   } else {
     candidates.sort(comparePriority);
   }

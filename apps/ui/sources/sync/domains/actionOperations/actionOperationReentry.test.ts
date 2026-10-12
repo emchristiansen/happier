@@ -189,6 +189,16 @@ describe('action operation state-aware re-entry', () => {
         expect(registry.resolvePresentation(operation('succeeded'))).toEqual({
             kind: 'setup_needs_attention',
         });
+
+        expect(registry.acknowledgeSetupNeedsAttention(operation('succeeded'))).toBe(true);
+        expect(registry.resolvePresentation(operation('succeeded'))).toBeNull();
+        expect(registry.acknowledgeSetupNeedsAttention(operation('succeeded'))).toBe(false);
+        expect(registry.canAutomaticallyReenterNewSession(operation('succeeded'))).toBe(false);
+        expect(registry.resolve(operation('succeeded'), { hasDraft })).toEqual({
+            kind: 'session',
+            sessionId: 'session-1',
+            serverId: 'server-1',
+        });
     });
 
     it.each(['failed', 'cancelled'] as const)('reopens the editable form after %s', (state) => {

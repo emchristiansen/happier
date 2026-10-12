@@ -7,10 +7,8 @@ const WINDOWS_UNC_PREFIX = '\\\\';
 const WINDOWS_EXTENDED_LENGTH_UNC_PREFIX = '\\\\?\\UNC\\';
 const WINDOWS_DEVICE_PREFIX = '\\\\.\\';
 const WINDOWS_DRIVE_ABSOLUTE_PATH_PATTERN = /^[a-zA-Z]:\\/;
-const RUNTIME_REMOVAL_MAX_ATTEMPTS = 6;
-const RUNTIME_REMOVAL_RETRY_DELAY_MS = 25;
-const WINDOWS_RUNTIME_REMOVAL_MAX_ATTEMPTS = 101;
-const WINDOWS_RUNTIME_REMOVAL_RETRY_DELAY_MS = 100;
+const BACKUP_CLEANUP_MAX_ATTEMPTS = 6;
+const BACKUP_CLEANUP_RETRY_DELAY_MS = 25;
 
 export function toWindowsExtendedLengthPathForFs(
     pathLike: string,
@@ -102,25 +100,16 @@ async function sleep(ms: number): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export async function removeRuntimePayloadPath(
-    path: string,
-    platform: NodeJS.Platform = process.platform,
-): Promise<void> {
-    const maxAttempts = platform === 'win32'
-        ? WINDOWS_RUNTIME_REMOVAL_MAX_ATTEMPTS
-        : RUNTIME_REMOVAL_MAX_ATTEMPTS;
-    const retryDelayMs = platform === 'win32'
-        ? WINDOWS_RUNTIME_REMOVAL_RETRY_DELAY_MS
-        : RUNTIME_REMOVAL_RETRY_DELAY_MS;
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+export async function removeRuntimePayloadPath(path: string): Promise<void> {
+    for (let attempt = 1; attempt <= BACKUP_CLEANUP_MAX_ATTEMPTS; attempt += 1) {
         try {
             await rm(toRuntimeFsPath(path), { recursive: true, force: true });
             return;
         } catch (error) {
-            if (!isRetryableRenameError(error) || attempt === maxAttempts) {
+            if (!isRetryableRenameError(error) || attempt === BACKUP_CLEANUP_MAX_ATTEMPTS) {
                 throw error;
             }
-            await sleep(retryDelayMs);
+            await sleep(BACKUP_CLEANUP_RETRY_DELAY_MS);
         }
     }
 }

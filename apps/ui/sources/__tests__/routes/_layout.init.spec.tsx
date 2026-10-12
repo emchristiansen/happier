@@ -35,6 +35,7 @@ const notificationNativeState = vi.hoisted(() => ({
     unavailable: false,
 }));
 const chromeSafeAreaWarmupMock = vi.hoisted(() => vi.fn(() => ({ top: 0, bottom: 0, left: 0, right: 0 })));
+const desktopSetupInspectMock = vi.hoisted(() => vi.fn(async () => ({ status: 'pending' as const })));
 
 const { fromModuleMock, trackingState, fontAwesomeFontMock, ioniconsFontMock } = vi.hoisted(() => ({
     fromModuleMock: vi.fn(),
@@ -139,11 +140,38 @@ vi.mock('@/boot/resolveBootCredentials', () => ({
 vi.mock('@/utils/platform/tauri', () => ({
     isTauriDesktop: () => shellChromeState.isTauriDesktop,
     invokeTauri: vi.fn(),
-    listenTauriEvent: vi.fn(),
+    // Mirrors the real contract: `listenTauriEvent` is async, so it always resolves an unlisten
+    // function. A bare `vi.fn()` resolves nothing and breaks every listener registered at boot.
+    listenTauriEvent: vi.fn(async () => () => {}),
 }));
 
 vi.mock('@/utils/platform/responsive', () => ({
     useIsTablet: () => shellChromeState.isTablet,
+}));
+
+vi.mock('@/setup/desktopSetupCoordinator', () => ({
+    desktopSetupCoordinator: {
+        inspect: desktopSetupInspectMock,
+        readObservedExpectation: () => null,
+        startSetup: vi.fn(),
+        reconcile: vi.fn(),
+    },
+}));
+
+/**
+ * The Tauri external-link installer patches `window.open`, a DOM boundary this node harness does
+ * not have; the root only has to call it, which is not what these cases observe.
+ */
+vi.mock('@/utils/url/installTauriExternalLinkClicks', () => ({
+    installTauriExternalLinkClicks: () => () => {},
+}));
+
+/**
+ * R11 — the one setup lifecycle's mount. Probed as an element: its own behaviour is proven with the
+ * real gate in `setup/useDesktopLocalSetupGate.test.tsx`; this file owns only where it is mounted.
+ */
+vi.mock('@/setup/DesktopLocalSetupRuntime', () => ({
+    DesktopLocalSetupRuntime: () => React.createElement('DesktopLocalSetupRuntime'),
 }));
 
 vi.mock('@/components/pets/desktop/runtime/isDesktopPetOverlayWindowContext', () => ({
@@ -333,11 +361,21 @@ vi.mock('@/components/ui/layout/StatusBarProvider', () => ({
     StatusBarProvider: () => null,
 }));
 
-vi.mock('@/components/ui/feedback/AppUpdateStatusTag', () => {
+vi.mock('@/updates/UpdateFactsBackgroundRuntime', () => ({
+    UpdateFactsBackgroundRuntime: () => null,
+}));
+
+// The root layout's Updates summary host; its classification has its own owner tests.
+vi.mock('@/updates/useUpdatesSummary', () => ({
+    UpdatesSummaryProvider: ({ children }: { children: React.ReactNode }) => children,
+    useSharedUpdatesSummary: () => ({ actionableCount: 0, failedCount: 0, runningCount: 0, phase: 'none', status: 'upToDate', visible: false }),
+}));
+
+vi.mock('@/components/updates/UpdatesPopoverButton', () => {
     const React = require('react');
     return {
-        AppUpdateStatusTag: (props: Record<string, unknown>) =>
-            React.createElement('AppUpdateStatusTag', props),
+        UpdatesEntry: (props: Record<string, unknown>) =>
+            React.createElement('UpdatesEntry', props),
     };
 });
 
@@ -409,6 +447,7 @@ describe('app/_layout init resilience', () => {
         sentryWrapMock.mockClear();
         routerPushMock.mockClear();
         chromeSafeAreaWarmupMock.mockClear();
+        desktopSetupInspectMock.mockClear();
         consumeRestartBugReportIntentMock.mockClear();
         if (previousSentryDsn === undefined) delete process.env.EXPO_PUBLIC_SENTRY_DSN;
         else process.env.EXPO_PUBLIC_SENTRY_DSN = previousSentryDsn;
@@ -841,12 +880,12 @@ describe('app/_layout init resilience', () => {
         expect(fontInitErrors).toHaveLength(0);
     });
 
-    it('renders the web top-right update tag outside Tauri desktop', async () => {
+    it('floats no update chrome over web content: the sidebar pill is the one entry (R13 (e))', async () => {
         shellChromeState.isTauriDesktop = false;
 
         const screen = await renderSettledRootLayout();
 
-        expect(screen.findAllByTestId('root-shell-app-update-status-tag').length).toBeGreaterThan(0);
+        expect(screen.findAllByTestId('root-shell-updates-button')).toHaveLength(0);
         expect(screen.findAllByTestId('desktop-fallback-shell-chrome')).toHaveLength(0);
     });
 
@@ -858,7 +897,7 @@ describe('app/_layout init resilience', () => {
 
         expect(screen.findAllByTestId('desktop-fallback-shell-chrome')).toHaveLength(1);
         expect(screen.findAllByTestId('desktop-window-controls-host')).toHaveLength(1);
-        expect(screen.findAllByTestId('root-shell-app-update-status-tag').length).toBeGreaterThan(0);
+        expect(screen.findAllByTestId('root-shell-updates-button').length).toBeGreaterThan(0);
         const dragSurface = screen.findByTestId('desktop-main-content-drag-surface');
         expect(dragSurface?.props.enabled).toBe(true);
         expect(dragSurface?.props.leftOffsetPx).toBe(0);
@@ -884,12 +923,11 @@ describe('app/_layout init resilience', () => {
         shellChromeState.isTablet = true;
 
         const screen = await renderSettledRootLayout();
-        const sidebarNavigator = screen.tree.findByType('SidebarNavigator' as any);
+        expect(screen.tree.findAllByType('SidebarNavigator' as any)).toHaveLength(1);
 
         expect(screen.findAllByTestId('desktop-fallback-shell-chrome')).toHaveLength(0);
-        expect(screen.findAllByTestId('root-shell-app-update-status-tag')).toHaveLength(0);
+        expect(screen.findAllByTestId('root-shell-updates-button')).toHaveLength(0);
         expect(screen.findByTestId('desktop-main-content-drag-surface')?.props.enabled).toBe(false);
-        expect(sidebarNavigator.props.desktopUpdateIndicator).toBeTruthy();
     });
 
     it('moves Tauri desktop chrome to the sidebar host after live auth changes from unauthenticated boot', async () => {
@@ -898,11 +936,10 @@ describe('app/_layout init resilience', () => {
         authContextState.liveIsAuthenticated = true;
 
         const screen = await renderSettledRootLayout();
-        const sidebarNavigator = screen.tree.findByType('SidebarNavigator' as any);
+        expect(screen.tree.findAllByType('SidebarNavigator' as any)).toHaveLength(1);
 
         expect(screen.findAllByTestId('desktop-fallback-shell-chrome')).toHaveLength(0);
-        expect(screen.findAllByTestId('root-shell-app-update-status-tag')).toHaveLength(0);
-        expect(sidebarNavigator.props.desktopUpdateIndicator).toBeTruthy();
+        expect(screen.findAllByTestId('root-shell-updates-button')).toHaveLength(0);
     });
 
     it('renders fallback desktop controls and update tag when authenticated Tauri desktop is narrow', async () => {
@@ -914,7 +951,7 @@ describe('app/_layout init resilience', () => {
 
         expect(screen.findAllByTestId('desktop-fallback-shell-chrome')).toHaveLength(1);
         expect(screen.findAllByTestId('desktop-window-controls-host')).toHaveLength(1);
-        expect(screen.findAllByTestId('root-shell-app-update-status-tag').length).toBeGreaterThan(0);
+        expect(screen.findAllByTestId('root-shell-updates-button').length).toBeGreaterThan(0);
         const dragSurface = screen.findByTestId('desktop-main-content-drag-surface');
         expect(dragSurface?.props.enabled).toBe(true);
         expect(dragSurface?.props.leftOffsetPx).toBe(0);
@@ -929,8 +966,84 @@ describe('app/_layout init resilience', () => {
         const screen = await renderSettledRootLayout();
 
         expect(screen.findAllByTestId('desktop-fallback-shell-chrome')).toHaveLength(0);
-        expect(screen.findAllByTestId('root-shell-app-update-status-tag')).toHaveLength(0);
+        expect(screen.findAllByTestId('root-shell-updates-button')).toHaveLength(0);
         expect(screen.findByTestId('desktop-main-content-drag-surface')?.props.enabled).toBe(false);
         expect(syncRestoreMock).toHaveBeenCalledWith({ token: 'token', secret: 'secret' });
+    });
+
+    it('warms the local readiness inspection as soon as the desktop app opens, before anyone signs in (R5/INV4)', async () => {
+        // The whole point of R5: acquisition and the read-only inspection are local Tauri IPC, so
+        // they must not wait for authentication. Before this mount existed the only caller sat
+        // behind the authenticated root, so every user paid the full round trip after login.
+        bootCredentialsState.value = null;
+        shellChromeState.isTauriDesktop = true;
+
+        const screen = await renderSettledRootLayout();
+
+        expect(screen.findAllByTestId('desktop-fallback-shell-chrome')).toHaveLength(1);
+        expect(desktopSetupInspectMock).toHaveBeenCalledTimes(1);
+        // INV4: invisible. The warm-up renders nothing, so no setup chrome reaches the welcome screen.
+        expect(screen.findAllByTestId('setup-surface')).toHaveLength(0);
+    });
+
+    it('warms the inspection exactly once across re-renders of the root shell', async () => {
+        bootCredentialsState.value = null;
+        shellChromeState.isTauriDesktop = true;
+        shellChromeState.isTablet = true;
+
+        const screen = await renderSettledRootLayout();
+        const RootLayout = (await import('@/app/_layout')).default;
+        shellChromeState.isTablet = false;
+        await screen.update(React.createElement(RootLayout));
+        const { flushHookEffects } = await import('@/dev/testkit');
+        await flushHookEffects();
+
+        expect(desktopSetupInspectMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('never warms local readiness off Tauri desktop or in the pet overlay window', async () => {
+        shellChromeState.isTauriDesktop = false;
+        await renderSettledRootLayout();
+        expect(desktopSetupInspectMock).not.toHaveBeenCalled();
+
+        const { standardCleanup } = await import('@/dev/testkit');
+        standardCleanup();
+        shellChromeState.isTauriDesktop = true;
+        desktopPetOverlayWindowState.value = true;
+        await renderSettledRootLayout();
+
+        expect(desktopSetupInspectMock).not.toHaveBeenCalled();
+    });
+
+    it('runs the one setup lifecycle at the authenticated desktop shell, whatever route opened the app (R11)', async () => {
+        // A cold deep link never renders the Home route, so a lifecycle mounted there skipped the
+        // inspection, the quiet start and readiness for every launch that did not land on `/`.
+        bootCredentialsState.value = { token: 'token', secret: 'secret' };
+        shellChromeState.isTauriDesktop = true;
+        mockedPathname = '/settings';
+
+        const screen = await renderSettledRootLayout();
+
+        expect(screen.tree.findAllByType('DesktopLocalSetupRuntime' as any)).toHaveLength(1);
+    });
+
+    it('never mounts the setup lifecycle before sign-in, off desktop, or in the pet overlay window', async () => {
+        const { standardCleanup } = await import('@/dev/testkit');
+        shellChromeState.isTauriDesktop = true;
+        bootCredentialsState.value = null;
+        const unauthenticated = await renderSettledRootLayout();
+        expect(unauthenticated.tree.findAllByType('DesktopLocalSetupRuntime' as any)).toHaveLength(0);
+
+        standardCleanup();
+        bootCredentialsState.value = { token: 'token', secret: 'secret' };
+        shellChromeState.isTauriDesktop = false;
+        const web = await renderSettledRootLayout();
+        expect(web.tree.findAllByType('DesktopLocalSetupRuntime' as any)).toHaveLength(0);
+
+        standardCleanup();
+        shellChromeState.isTauriDesktop = true;
+        desktopPetOverlayWindowState.value = true;
+        const overlay = await renderSettledRootLayout();
+        expect(overlay.tree.findAllByType('DesktopLocalSetupRuntime' as any)).toHaveLength(0);
     });
 });

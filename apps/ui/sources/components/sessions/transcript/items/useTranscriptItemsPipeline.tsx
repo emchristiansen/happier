@@ -22,7 +22,9 @@ import {
 import type { TranscriptTargetWindowState } from '@/components/sessions/transcript/viewport/window/transcriptTargetWindowTypes';
 import {
     resolveTranscriptLiveTailAnchor,
+    collectTranscriptNavigationMessageIdsForItem,
 } from '@/components/sessions/transcript/viewport/lifecycle/transcriptRowClassification';
+import type { SessionMessagesTailBoundary } from '@/sync/runtime/sessionMessagesTailDiscontinuity';
 import {
     buildTranscriptRowShellSignature,
     resolveTranscriptItemActiveThinkingMessageId,
@@ -111,7 +113,7 @@ export type TranscriptItemsPipelineDeps = Readonly<{
     sessionId: string;
     sessionThinking: boolean;
     setEntrySliceWindow: React.Dispatch<React.SetStateAction<{ sessionId: string; anchorRowId: string } | null>>;
-    tailContiguousFloorSeq?: number | null;
+    tailContiguousBoundary?: SessionMessagesTailBoundary | null;
     targetWindowActiveRef: Ref<boolean>;
     targetWindowState?: TranscriptTargetWindowState;
     transcriptNativeHotTailItemCount: number;
@@ -154,7 +156,7 @@ export function useTranscriptItemsPipeline(deps: TranscriptItemsPipelineDeps) {
         sessionId,
         sessionThinking,
         setEntrySliceWindow,
-        tailContiguousFloorSeq,
+        tailContiguousBoundary,
         targetWindowActiveRef,
         targetWindowState,
         transcriptNativeHotTailItemCount,
@@ -243,7 +245,8 @@ export function useTranscriptItemsPipeline(deps: TranscriptItemsPipelineDeps) {
             rendererKind,
             resolveSeq: jumpWindowFacts.resolveTargetWindowItemSeq,
             sessionId,
-            tailContiguousFloorSeq: tailContiguousFloorSeq ?? null,
+            tailContiguousBoundary: tailContiguousBoundary ?? null,
+            resolveMessageIds: collectTranscriptNavigationMessageIdsForItem,
             targetWindowState: targetWindowState ?? jumpWindowFacts.sessionTargetWindowState,
             transcriptNativeHotTailItemCount,
             transcriptWebHotTailItemCount,
@@ -259,7 +262,7 @@ export function useTranscriptItemsPipeline(deps: TranscriptItemsPipelineDeps) {
         rendererKind,
         projectionLiveTailAnchorMessageId,
         sessionId,
-        tailContiguousFloorSeq,
+        tailContiguousBoundary,
         targetWindowState,
         transcriptNativeHotTailItemCount,
         transcriptWebHotTailItemCount,

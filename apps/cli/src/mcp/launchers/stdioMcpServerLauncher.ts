@@ -3,9 +3,6 @@ import { readFile } from 'node:fs/promises';
 
 import { z } from 'zod';
 
-import { removeConsumedMcpRuntimeConfigFile } from '../runtime/isSafeTmpMcpConfigFilePath';
-
-const STDIO_LAUNCHER_CONFIG_PREFIX = 'happier-mcp-stdio-launcher';
 
 const StdioMcpServerLauncherConfigSchema = z.object({
   command: z.string().min(1),
@@ -29,10 +26,6 @@ async function readLauncherConfig(configPath: string): Promise<StdioMcpServerLau
   return StdioMcpServerLauncherConfigSchema.parse(JSON.parse(raw));
 }
 
-async function deleteLauncherConfigFile(configPath: string): Promise<void> {
-  await removeConsumedMcpRuntimeConfigFile(configPath, STDIO_LAUNCHER_CONFIG_PREFIX);
-}
-
 export async function runStdioMcpServerLauncher(): Promise<void> {
   const configPath = typeof process.env.HAPPIER_MCP_STDIO_LAUNCHER_CONFIG_FILE === 'string'
     ? process.env.HAPPIER_MCP_STDIO_LAUNCHER_CONFIG_FILE
@@ -46,12 +39,9 @@ export async function runStdioMcpServerLauncher(): Promise<void> {
   try {
     config = await readLauncherConfig(configPath);
   } catch (err) {
-    await deleteLauncherConfigFile(configPath);
     writeStderr(`[happier-mcp-stdio-launcher] Failed to read config: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(2);
   }
-
-  await deleteLauncherConfigFile(configPath);
 
   const child = spawn(config.command, config.args, {
     cwd: config.cwd,

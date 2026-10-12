@@ -334,7 +334,7 @@ class ApiSocket {
         sessionId: string,
         method: string,
         params: A,
-        options?: { timeoutMs?: number; onIssued?: () => void },
+        options?: { timeoutMs?: number | null; onIssued?: () => void },
     ): Promise<R> {
         const sessionEncryptionMode = readSessionEncryptionModeFromLocalState(sessionId);
         const usePlaintextParams = sessionEncryptionMode === 'plain';
@@ -359,7 +359,7 @@ class ApiSocket {
             buildSocketRpcCallPayload({
                 method: `${sessionId}:${method}`,
                 payload: encryptedParams,
-                timeoutMs: options?.timeoutMs,
+                timeoutMs: typeof options?.timeoutMs === 'number' ? options.timeoutMs : undefined,
             }),
             options,
         );
@@ -449,7 +449,7 @@ class ApiSocket {
     async emitWithAck<T = any>(
         event: string,
         data: any,
-        opts?: { timeoutMs?: number; onIssued?: () => void },
+        opts?: { timeoutMs?: number | null; onIssued?: () => void },
     ): Promise<T> {
         if (this.currentConnectionState.phase === 'auth_failed') {
             throw createNotAuthenticatedError();
@@ -464,7 +464,7 @@ class ApiSocket {
                 : this.socket;
             opts?.onIssued?.();
             const ackPromise = socketEmission.emitWithAck(event, data) as Promise<T>;
-            return await raceSocketIoAckTimeout(ackPromise, timeoutMs);
+            return await raceSocketIoAckTimeout(ackPromise, timeoutMs ?? undefined);
         } catch (error) {
             throw await this.coerceAckTimeoutAuthError(error);
         }
@@ -504,7 +504,8 @@ class ApiSocket {
         const canDedupe =
             (method === 'GET' || method === 'HEAD')
             && !hasBody
-            && !hasSignal;
+            && !hasSignal
+            && options?.cache !== 'no-store';
 
         const requestKey = canDedupe
             // Intentionally exclude `snapshot.generation` from the de-dupe key so concurrent callers still share

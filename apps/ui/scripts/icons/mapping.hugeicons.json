@@ -1,4 +1,5 @@
 {
+  "file-diff": "FileDiffIcon",
   "archive": "Archive01Icon",
   "arrow-arc-left": "ArrowTurnBackwardIcon",
   "arrow-circle-down": "CircleArrowDown01Icon",
@@ -231,5 +232,6 @@
   "windows-logo": "WindowsNewIcon",
   "wrench": "Wrench01Icon",
   "x": "Cancel01Icon",
-  "x-circle": "CancelCircleIcon"
+  "x-circle": "CancelCircleIcon",
+  "hard-drive-download": "HardDriveDownloadIcon"
 }

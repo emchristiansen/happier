@@ -3,6 +3,32 @@ import { describe, expect, it } from 'vitest';
 import { validateDirectMachineSource } from './validateDirectMachineSource';
 
 describe('validateDirectMachineSource', () => {
+  it.each(['auggie', 'qwen', 'kilo', 'devin', 'kimi', 'copilot', 'fx'] as const)(
+    'accepts the generic ACP session-list source for declared provider %s',
+    (providerId) => {
+      expect(
+        validateDirectMachineSource({
+          providerId,
+          source: { kind: 'acpSessionList' },
+          env: {},
+        }),
+      ).toEqual({ ok: true, source: { kind: 'acpSessionList' } });
+    },
+  );
+
+  it.each(['agy', 'droid'] as const)(
+    'rejects the generic ACP session-list source for provider %s without an upstream listing contract',
+    (providerId) => {
+      expect(
+        validateDirectMachineSource({
+          providerId: providerId as never,
+          source: { kind: 'acpSessionList' },
+          env: {},
+        }),
+      ).toEqual({ ok: false, error: 'provider/source mismatch' });
+    },
+  );
+
   it('rejects Codex connectedService source ids with path traversal segments', () => {
     expect(
       validateDirectMachineSource({

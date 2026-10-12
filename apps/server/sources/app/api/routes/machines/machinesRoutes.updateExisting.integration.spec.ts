@@ -123,4 +123,41 @@ describe("machinesRoutes (update existing machine)", () => {
             }),
         );
     });
+
+    it("preserves existing metadata when daemon registration refreshes daemon state", async () => {
+        const { machinesRoutes } = await import("./machinesRoutes");
+        const route = createRouteTestBuilder({
+            method: "POST",
+            path: "/v1/machines",
+            registerRoutes(app) {
+                machinesRoutes(app as any);
+            },
+        });
+
+        const { response } = await route.invoke(
+            {
+                userId: "u1",
+                body: {
+                    id: "m1",
+                    metadata: "daemon-bootstrap-meta",
+                    daemonState: "daemon-state-new",
+                },
+            },
+        );
+
+        expect(txDbMocks.db.machine.update).toHaveBeenCalledWith(expect.objectContaining({
+            where: { accountId_id: { accountId: "u1", id: "m1" } },
+            data: {
+                daemonState: "daemon-state-new",
+                daemonStateVersion: { increment: 1 },
+            },
+        }));
+        expect(response).toEqual(expect.objectContaining({
+            machine: expect.objectContaining({
+                metadata: "meta-old",
+                metadataVersion: 1,
+                daemonState: "daemon-state-new",
+            }),
+        }));
+    });
 });

@@ -56,7 +56,10 @@ export function AutomationsScreen() {
         void refresh();
     }, [refresh]);
 
-    if (loading) {
+    // Keep an already-hydrated catalog visible while the authoritative refresh
+    // is pending. Slow, non-time-sensitive reads must not temporarily turn a
+    // usable list into a blank loading surface.
+    if (loading && automations.length === 0) {
         return (
             <View style={styles.loadingContainer}>
                 <ActivitySpinner size="small" color={theme.colors.text.secondary} />

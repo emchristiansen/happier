@@ -2,9 +2,8 @@ import * as React from 'react';
 import { Platform } from 'react-native';
 import { router } from 'expo-router';
 import { useUnistyles } from 'react-native-unistyles';
-import type { SystemTaskResult } from '@happier-dev/protocol';
 
-import { SystemTaskProgressCard, useSystemTaskSnapshot } from '@/components/systemTasks';
+import { SystemTaskProgressCard } from '@/components/systemTasks';
 import { resolveThisComputerSetupFollowUp, useThisComputerSetupTask } from '@/components/systemTasks/useThisComputerSetupTask';
 import { isSystemTaskBridgeUnavailableError, readSystemTaskStartErrorMessage } from '@/components/systemTasks/systemTaskStartError';
 import { ProviderSetupFlow } from '@/components/settings/providers/setup/ProviderSetupFlow';
@@ -18,6 +17,10 @@ import { Item } from '@/components/ui/lists/Item';
 import { ItemGroup } from '@/components/ui/lists/ItemGroup';
 import { ItemList } from '@/components/ui/lists/ItemList';
 import { Modal } from '@/modal';
+import { desktopSetupCoordinator, type DesktopSetupVerificationFailure } from '@/setup/desktopSetupCoordinator';
+import { presentSetupServiceConsent } from '@/setup/presentSetupServiceConsent';
+import { presentUnmanagedCliConsent } from '@/setup/presentUnmanagedCliConsent';
+import { getActiveServerAccountScope } from '@/sync/domains/scope/activeServerAccountScope';
 import { getActiveServerSnapshot, upsertServerProfile } from '@/sync/domains/server/serverProfiles';
 import { setPendingSetupIntent } from '@/sync/domains/pending/pendingSetupIntent';
 import { t } from '@/text';
@@ -25,14 +28,13 @@ import { setClipboardStringSafe } from '@/utils/ui/clipboard';
 import { isTauriDesktop } from '@/utils/platform/tauri';
 
 import { DesktopOnlySetupNotice } from './DesktopOnlySetupNotice';
+import { LocalCliPathExposureSection } from './localControl/LocalCliPathExposureSection';
 import { LocalDaemonControlSection } from './localControl/LocalDaemonControlSection';
-import { buildLocalDaemonServiceSystemTaskSpec } from './localControl/buildLocalDaemonServiceSystemTaskSpec';
 import { RemoteSshMachineSetupSection } from './RemoteSshMachineSetupSection';
 import { upsertActivateAndSwitchServer } from '@/sync/domains/server/activeServerSwitch';
 import { Icon } from '@/components/ui/icons/Icon';
 
 type MachineSetupFlowScreenProps = Readonly<{
-    autoStartLocalTask?: boolean;
     embedded?: boolean;
     initialProviderMachineId?: string | null;
     mode?: 'full' | 'localOnly' | 'remoteOnly';
@@ -50,30 +52,18 @@ function resolveLocalSetupStartErrorSubtitle(startError: string): string {
     return t('settings.systemTaskStartFailed');
 }
 
-type LocalDaemonStatusData = Readonly<{
-    serviceInstalled: boolean;
-    daemonRunning: boolean;
-    needsAuth: boolean;
-    machineId: string | null;
-}>;
-
-function readLocalDaemonStatusData(result: SystemTaskResult | null): LocalDaemonStatusData | null {
-    if (!result?.ok) {
-        return null;
-    }
-
-    const data = result.data as Record<string, unknown> | undefined;
-    if (!data) {
-        return null;
-    }
-
-    return {
-        serviceInstalled: data.serviceInstalled === true,
-        daemonRunning: data.daemonRunning === true,
-        needsAuth: data.needsAuth === true,
-        machineId: typeof data.machineId === 'string' && data.machineId.trim().length > 0 ? data.machineId.trim() : null,
-    };
-}
+/**
+ * Where this screen's readiness proof stands. Both entry points — finishing setup here, and
+ * adopting whatever is already on this computer — ask the coordinator's ONE
+ * `verifyCurrentTarget()` (INV8 + INV10). Neither reads `machineId` off a task result: a service
+ * command can succeed while the running daemon carries the wrong identity, while ownership has
+ * not converged, or while the relay cannot reach this computer at all.
+ */
+type LocalReadiness =
+    | Readonly<{ status: 'idle' }>
+    | Readonly<{ status: 'verifying'; source: 'setup' | 'adopt' }>
+    | Readonly<{ status: 'verified'; machineId: string }>
+    | Readonly<{ status: 'blocked'; source: 'setup' | 'adopt'; code: DesktopSetupVerificationFailure }>;
 
 export const MachineSetupFlowScreen = React.memo(function MachineSetupFlowScreen(props: MachineSetupFlowScreenProps) {
     const isRemoteOnly = props.mode === 'remoteOnly';
@@ -108,28 +98,58 @@ const DesktopMachineSetupFlowScreen = React.memo(function DesktopMachineSetupFlo
         relayRuntimeUrl: string | null;
     }> | null>(null);
     const showRemoteSetup = isRemoteOnly ? true : (isLocalOnly ? false : showRemoteSetupState);
+    // This screen starts the one setup executor too, so it answers the executor's prompts through
+    // the same owners the drift banner and the local daemon control use (C6). Starting it unwired
+    // declines its own pairing request by name, so the user presses "set up this computer" and the
+    // task dead-ends. Install ownership rides the executor's own prompt (INV2/R13); a CLI this
+    // app's install path did not place is put to the user rather than silently refused.
+    const activeServerSnapshot = getActiveServerSnapshot();
+    const expectedAccountId = getActiveServerAccountScope()?.accountId ?? null;
     const {
         activeTaskSnapshot,
         cancel,
-        completedMachineId,
-        runner,
         start,
         startError,
     } = useThisComputerSetupTask({
-        autoStart: !isBrowserWeb && !isRemoteOnly && props.autoStartLocalTask,
-        onSucceeded: (snapshot) => {
-            const machineId = (snapshot.result?.ok
-                ? (snapshot.result.data as { machineId?: unknown } | undefined)?.machineId
-                : null);
-            props.onLocalSetupSucceeded?.(typeof machineId === 'string' && machineId.trim().length > 0 ? machineId.trim() : null);
+        ...(expectedAccountId
+            ? {
+                authRequestApproval: {
+                    expectedRelayUrl: activeServerSnapshot.serverUrl,
+                    expectedAccountId,
+                    serverId: activeServerSnapshot.serverId,
+                },
+            }
+            : {}),
+        onServiceConsentRequired: presentSetupServiceConsent,
+        onUnmanagedCliConsentRequired: presentUnmanagedCliConsent,
+        onSucceeded: () => {
+            void verifyLocalReadinessRef.current?.('setup');
         },
         ...(props.runner ? { runner: props.runner } : {}),
     });
-    const [adoptTaskId, setAdoptTaskId] = React.useState<string | null>(null);
-    const adoptTaskSnapshot = useSystemTaskSnapshot(runner, adoptTaskId);
-    const [adoptedMachineId, setAdoptedMachineId] = React.useState<string | null>(null);
-    const handledAdoptResultTaskIdRef = React.useRef<string | null>(null);
+    const [localReadiness, setLocalReadiness] = React.useState<LocalReadiness>({ status: 'idle' });
     const copyFeedback = useTemporaryCopyFeedback();
+
+    const onLocalSetupSucceeded = props.onLocalSetupSucceeded;
+    const verifyLocalReadiness = React.useCallback(async (source: 'setup' | 'adopt') => {
+        setLocalReadiness({ status: 'verifying', source });
+        // Successful setup already refreshes the shared facts through the operation owner.
+        // Adoption separately asks what is on this computer right now.
+        const outcome = await desktopSetupCoordinator.verifyCurrentTarget({ fresh: source === 'adopt' });
+        if (outcome.status === 'verified') {
+            setLocalReadiness({ status: 'verified', machineId: outcome.machineId });
+            onLocalSetupSucceeded?.(outcome.machineId);
+            return;
+        }
+        setLocalReadiness({ status: 'blocked', source, code: outcome.code });
+        if (source === 'adopt') {
+            Modal.alert(t('common.error'), t('settings.machineSetupAdoptExistingNotReady'));
+        }
+    }, [onLocalSetupSucceeded]);
+    // The task hook's `onSucceeded` is captured before the callback exists; the ref keeps one
+    // owner of the proof rather than a second copy of it inside the task options.
+    const verifyLocalReadinessRef = React.useRef<((source: 'setup' | 'adopt') => Promise<void>) | null>(null);
+    verifyLocalReadinessRef.current = verifyLocalReadiness;
 
     const localSetupFollowUp = React.useMemo(() => {
         return resolveThisComputerSetupFollowUp(activeTaskSnapshot?.result ?? null);
@@ -146,9 +166,7 @@ const DesktopMachineSetupFlowScreen = React.memo(function DesktopMachineSetupFlo
             ...activeTaskSnapshot,
             awaitingInput: true,
             status: 'running' as const,
-            latestMessage: localSetupFollowUp === 'auth'
-                ? t('server.relayDrift.progressStepAuthenticate')
-                : activeTaskSnapshot.latestMessage,
+            latestMessage: t('server.relayDrift.progressStepAuthenticate'),
         };
     }, [activeTaskSnapshot, localSetupFollowUp]);
 
@@ -159,7 +177,6 @@ const DesktopMachineSetupFlowScreen = React.memo(function DesktopMachineSetupFlo
             // startError state is rendered below
         }
     }, [start]);
-    const activeServerSnapshot = getActiveServerSnapshot();
     const knownLocalRelayUrl = React.useMemo(() => resolveKnownLocalRelayUrl({
         activeServerUrl: activeServerSnapshot.serverUrl,
         activeLocalRelayUrl: activeServerSnapshot.activeLocalRelayUrl,
@@ -171,7 +188,8 @@ const DesktopMachineSetupFlowScreen = React.memo(function DesktopMachineSetupFlo
         setLocalRelayUrl((current) => current === nextRelayUrl ? current : nextRelayUrl);
     }, []);
     const remoteRelayRuntimeUrl = remoteCompletedMachine?.relayRuntimeUrl ?? null;
-    const providerMachineId = remoteCompletedMachine?.machineId ?? completedMachineId ?? adoptedMachineId ?? props.initialProviderMachineId ?? null;
+    const verifiedLocalMachineId = localReadiness.status === 'verified' ? localReadiness.machineId : null;
+    const providerMachineId = remoteCompletedMachine?.machineId ?? verifiedLocalMachineId ?? props.initialProviderMachineId ?? null;
     const providerServerId = remoteCompletedMachine?.machineId
         ? remoteCompletedMachine.serverId ?? undefined
         : undefined;
@@ -231,39 +249,14 @@ const DesktopMachineSetupFlowScreen = React.memo(function DesktopMachineSetupFlo
         router.push(`/settings/server?url=${encodeURIComponent(relayUrl)}&auto=1`);
     }, [activeServerSnapshot.serverUrl]);
 
-    const handleApprovePairingLocalSetup = React.useCallback(() => {
-        router.push('/inbox');
-    }, []);
-
-    React.useEffect(() => {
-        if (!adoptTaskSnapshot?.result || handledAdoptResultTaskIdRef.current === adoptTaskSnapshot.taskId) {
-            return;
-        }
-
-        handledAdoptResultTaskIdRef.current = adoptTaskSnapshot.taskId;
-        const status = readLocalDaemonStatusData(adoptTaskSnapshot.result);
-        if (!status) {
-            return;
-        }
-
-        if (!status.serviceInstalled || !status.daemonRunning || status.needsAuth || !status.machineId) {
-            Modal.alert(t('common.error'), t('settings.machineSetupAdoptExistingNotReady'));
-            return;
-        }
-
-        setAdoptedMachineId(status.machineId);
-        props.onLocalSetupSucceeded?.(status.machineId);
-    }, [adoptTaskSnapshot, props]);
-
     const handleAdoptExistingInstallation = React.useCallback(async () => {
         try {
-            const taskId = await runner.start(buildLocalDaemonServiceSystemTaskSpec('daemon.service.status.v1'));
-            setAdoptTaskId(taskId);
+            await verifyLocalReadiness('adopt');
         } catch (error) {
             const message = readSystemTaskStartErrorMessage(error);
             Modal.alert(t('common.error'), message ?? t('settings.systemTaskStartFailed'));
         }
-    }, [runner]);
+    }, [verifyLocalReadiness]);
 
     const handleSwitchToRemoteRelay = React.useCallback(async () => {
         if (!remoteRelayRuntimeUrl) {
@@ -366,36 +359,39 @@ const DesktopMachineSetupFlowScreen = React.memo(function DesktopMachineSetupFlo
                 />
             ) : null}
 
-            {!isBrowserWeb && !isRemoteOnly && adoptTaskSnapshot ? (
-                <SystemTaskProgressCard
-                    title={t('settings.machineSetupAdoptExistingProgressTitle')}
-                    snapshot={adoptTaskSnapshot}
-                    onCancel={adoptTaskSnapshot.result ? undefined : () => {
-                        if (!adoptTaskSnapshot.taskId) {
-                            return;
-                        }
-                        void runner.cancel(adoptTaskSnapshot.taskId);
-                    }}
-                />
+            {!isBrowserWeb && !isRemoteOnly && localReadiness.status === 'verifying' ? (
+                <ItemGroup title={t('settings.machineSetupAdoptExistingProgressTitle')}>
+                    <Item
+                        testID="settings.machineSetup.localReadinessVerifying"
+                        title={t('setupSurface.stageVerifyStatus', { relay: activeServerSnapshot.serverUrl })}
+                        showChevron={false}
+                        mode="info"
+                    />
+                </ItemGroup>
+            ) : null}
+
+            {!isBrowserWeb && !isRemoteOnly && localReadiness.status === 'blocked' && localReadiness.source === 'setup' ? (
+                <ItemGroup title={t('common.error')}>
+                    <Item
+                        testID="settings.machineSetup.localReadinessBlocked"
+                        title={t('setupSurface.blockedTitle')}
+                        subtitle={localReadiness.code === 'machine_unreachable'
+                            ? t('setupSurface.unreachableStatus', { relay: activeServerSnapshot.serverUrl })
+                            : t('setupSurface.notConvergedStatus', { relay: activeServerSnapshot.serverUrl })}
+                        showChevron={false}
+                        mode="info"
+                    />
+                </ItemGroup>
             ) : null}
 
             {!isBrowserWeb && !isRemoteOnly && localSetupFollowUp ? (
                 <ItemGroup title={t('common.next')}>
-                    {localSetupFollowUp === 'auth' ? (
-                        <Item
-                            testID="settings.machineSetup.localSetupFollowUp.authenticate"
-                            title={t('common.authenticate')}
-                            subtitle={t('server.relayDrift.bannerNeedsAuthDescription', { activeRelayUrl: activeServerSnapshot.serverUrl })}
-                            onPress={handleAuthenticateLocalSetup}
-                        />
-                    ) : (
-                        <Item
-                            testID="settings.machineSetup.localSetupFollowUp.approvePairing"
-                            title={t('settings.machineSetupRemotePromptApproveAction')}
-                            subtitle={t('inbox.approvals')}
-                            onPress={handleApprovePairingLocalSetup}
-                        />
-                    )}
+                    <Item
+                        testID="settings.machineSetup.localSetupFollowUp.authenticate"
+                        title={t('common.authenticate')}
+                        subtitle={t('server.relayDrift.bannerNeedsAuthDescription', { activeRelayUrl: activeServerSnapshot.serverUrl })}
+                        onPress={handleAuthenticateLocalSetup}
+                    />
                 </ItemGroup>
             ) : null}
 
@@ -455,6 +451,7 @@ const DesktopMachineSetupFlowScreen = React.memo(function DesktopMachineSetupFlo
             {!isBrowserWeb && !isRemoteOnly ? (
                 <>
                     <LocalDaemonControlSection runner={props.runner} />
+                    <LocalCliPathExposureSection runner={props.runner} />
                     <LocalRelayRuntimeControlSection
                         runner={props.runner}
                         onStatusChange={handleLocalRelayStatusChange}

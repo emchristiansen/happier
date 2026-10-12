@@ -254,6 +254,16 @@ describe('readClaudeTranscriptTurnSignal', () => {
 
     expect(
       readClaudeTranscriptTurnSignal({
+        type: 'system',
+        uuid: 'sidechain-compact-boundary',
+        isSidechain: true,
+        subtype: 'compact_boundary',
+        session_id: 'claude-sidechain-session',
+      } as any),
+    ).toBeNull();
+
+    expect(
+      readClaudeTranscriptTurnSignal({
         type: 'user',
         uuid: 'tool-result',
         message: {

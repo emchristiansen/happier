@@ -620,6 +620,44 @@ describe('restartSessionRunnerOnCurrentRuntime', () => {
     expect(result.status).toBe('dry_run_restartable');
     expect(requestRestart).not.toHaveBeenCalled();
   });
+
+  it('refreshes a missing tracked resume identity before deciding restart eligibility', async () => {
+    const requestRestart = vi.fn(async () => ({ signaled: true }));
+    const tracked = trackedSession({
+      vendorResumeId: undefined,
+      spawnOptions: {
+        directory: '/tmp/workspace',
+        backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+      },
+    });
+    const refreshTrackedSessionRuntimeSnapshot = vi.fn(async () => {
+      tracked.vendorResumeId = 'codex-thread-from-persisted-metadata';
+    });
+
+    const result = await restartSessionRunnerOnCurrentRuntime({
+      request: {
+        sessionId: 'sess-1',
+        mode: 'force_current_cli',
+        dryRun: true,
+        reason: 'daemon_restart_session_runners_command',
+      },
+      tracked,
+      currentIdentity: currentIdentity('0.2.11'),
+      requestRestart,
+      refreshTrackedSessionRuntimeSnapshot,
+    });
+
+    expect(refreshTrackedSessionRuntimeSnapshot).toHaveBeenCalledExactlyOnceWith({
+      sessionId: 'sess-1',
+      tracked,
+    });
+    expect(result).toEqual(expect.objectContaining({
+      ok: true,
+      status: 'dry_run_restartable',
+      sessionId: 'sess-1',
+    }));
+    expect(requestRestart).not.toHaveBeenCalled();
+  });
 });
 
 describe('restartAllSessionRunnersOnCurrentRuntime', () => {

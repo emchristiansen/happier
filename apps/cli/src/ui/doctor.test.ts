@@ -4,8 +4,7 @@ import {
     hasDaemonOwnerMismatchForCurrentInvocation,
     maskValue,
     redactDaemonStateForDisplay,
-    shouldShowGlobalProcessInventory,
-} from './doctor';
+    shouldShowGlobalProcessInventory, formatDaemonIdentityLines } from './doctor';
 
 describe('doctor redaction', () => {
     it('does not treat ${VAR:-default} templates as safe', () => {
@@ -113,5 +112,34 @@ describe('doctor daemon owner formatting', () => {
                 startedWithPublicReleaseChannel: 'preview',
             },
         })).toBe(true);
+    });
+});
+
+describe('doctor daemon identity lines', () => {
+    it('names the relay host and the validated account so it can be compared with the app', () => {
+        const status = {
+            server: {
+                activeServerId: 'custom',
+                serverUrl: 'https://relay.example.test',
+                localServerUrl: null,
+                publicServerUrl: 'https://relay.example.test',
+                webappUrl: 'https://app.example.test',
+                comparableKey: 'relay.example.test',
+            },
+            daemon: { running: true, pid: 1, httpPort: 2 },
+            service: { installed: true, running: true },
+            auth: {
+                authenticated: true,
+                machineRegistered: true,
+                machineId: 'm1',
+                needsAuth: false,
+                accountId: 'acct_b',
+                validatedAccountId: 'acct_b',
+                accountLabel: 'bea',
+            },
+        };
+        expect(formatDaemonIdentityLines(status)).toEqual(['  Relay: relay.example.test', '  Account: bea (acct_b)']);
+        expect(formatDaemonIdentityLines({ ...status, auth: { ...status.auth, validatedAccountId: null, accountLabel: null } }))
+            .toEqual(['  Relay: relay.example.test']);
     });
 });

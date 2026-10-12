@@ -111,10 +111,13 @@ describe('AgentInputChipPickerTopSelector', () => {
 
         const codexStyle = flattenStyle(codexButton?.props.style({ pressed: false }));
         const claudeStyle = flattenStyle(claudeButton?.props.style({ pressed: false }));
-        expect(codexStyle.width).toBe(36);
-        expect(codexStyle.height).toBe(36);
         expect(codexStyle.minWidth).toBeGreaterThanOrEqual(44);
         expect(codexStyle.minHeight).toBeGreaterThanOrEqual(44);
+        // The declared size must match the enforced minimum. When width/height are smaller,
+        // Yoga measures the horizontal ScrollView from the smaller flex bases before the
+        // minimum expands each button, leaving the final options beyond its legal scroll end.
+        expect(codexStyle.width).toBe(codexStyle.minWidth);
+        expect(codexStyle.height).toBe(codexStyle.minHeight);
         expect(codexStyle.backgroundColor).toEqual(expect.any(String));
         expect(Boolean(codexStyle.boxShadow || codexStyle.elevation)).toBe(true);
         expect(claudeStyle.backgroundColor).toBe('transparent');

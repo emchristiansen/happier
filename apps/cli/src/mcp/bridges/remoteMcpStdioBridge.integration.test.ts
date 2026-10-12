@@ -288,6 +288,19 @@ describe('remoteMcpStdioBridge', () => {
       client = null;
       expect(Date.now() - closeStartedAt).toBeLessThan(1_500);
 
+      const relaunchedTransport = new StdioClientTransport({
+        command: bridgeInvocation.command,
+        args: bridgeInvocation.args,
+        env: {
+          ...resolveEnvRecord(),
+          ...(bridgeInvocation.env ?? {}),
+          HAPPIER_MCP_REMOTE_BRIDGE_CONFIG_FILE: configPath,
+        },
+      });
+      client = new Client({ name: 'bridge-relaunch-test', version: '1.0.0' }, { capabilities: {} });
+      await client.connect(relaunchedTransport);
+      expect((await client.listTools()).tools.map((tool) => tool.name)).toContain('echo');
+
     } finally {
       httpServer.releaseRememberResult();
       await client?.close().catch(() => {});
@@ -346,7 +359,7 @@ describe('remoteMcpStdioBridge', () => {
     }
   });
 
-  it('removes the config file when startup fails before the remote connect succeeds', async () => {
+  it('preserves the config file when startup fails before the remote connect succeeds', async () => {
     const tmp = await mkdtemp(join(tmpdir(), 'happier-mcp-bridge-it-'));
     try {
       const configPath = join(tmp, 'happier-mcp-remote-bridge.it.json');
@@ -376,7 +389,7 @@ describe('remoteMcpStdioBridge', () => {
       });
 
       expect(exitCode).not.toBe(0);
-      await expect(access(configPath)).rejects.toThrow();
+      await expect(access(configPath)).resolves.toBeUndefined();
     } finally {
       await rm(tmp, { recursive: true, force: true });
     }

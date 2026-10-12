@@ -85,6 +85,22 @@ describe('partitionProviderSessionArgs', () => {
     expect(result.providerArgs).toEqual([]);
   });
 
+  it('presents the cross-provider permission vocabulary when input is invalid', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(process, 'exit').mockImplementation((code?: string | number | null): never => {
+      throw new Error(`exit:${code ?? 0}`);
+    });
+
+    expect(() => partitionProviderSessionArgs({
+      args: ['pi', '--permission-mode', 'not-a-mode'],
+      providerSubcommand: 'pi',
+    })).toThrow('exit:1');
+
+    const message = String(error.mock.calls[0]?.[0] ?? '');
+    expect(message).toContain('Valid values: read_only, default, auto, yolo');
+    expect(message).toContain('--permission-mode auto');
+  });
+
   it('recognizes Codex native -V as a provider version request', () => {
     const result = partitionProviderSessionArgs({
       args: ['codex', '-V'],

@@ -7,6 +7,12 @@ import type { ActionOperationSnapshotV1 } from '@happier-dev/protocol';
 import { renderScreen } from '@/dev/testkit';
 import { actionOperationStore } from '@/sync/domains/actionOperations/actionOperationStore';
 
+const storageHooks = vi.hoisted(() => ({
+    useAllMachines: vi.fn(() => []),
+    useAllSessionListRenderables: vi.fn(() => []),
+    useAllSessions: vi.fn(() => []),
+}));
+
 vi.mock('react-native', async () => {
     const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
     return createReactNativeWebMock();
@@ -23,9 +29,9 @@ vi.mock('@/sync/domains/state/storage', async () => {
     const { createStorageModuleStub } = await import('@/dev/testkit/mocks/storage');
     return createStorageModuleStub({
         useActiveServerAccountScope: () => ({ accountId: 'account-1', serverId: 'server-1' }),
-        useAllMachines: () => [],
-        useAllSessions: () => [],
-        useAllSessionListRenderables: () => [],
+        useAllMachines: storageHooks.useAllMachines,
+        useAllSessions: storageHooks.useAllSessions,
+        useAllSessionListRenderables: storageHooks.useAllSessionListRenderables,
     });
 });
 
@@ -171,6 +177,28 @@ describe('ActionOperationActivityButtonView', () => {
 });
 
 describe('ActionOperationActivityButton', () => {
+    it('does not mount detail-only subscriptions until the popover opens', async () => {
+        const active = operation({ operationId: 'operation-lazy-details' });
+        actionOperationStore.merge(active);
+        storageHooks.useAllMachines.mockClear();
+        storageHooks.useAllSessions.mockClear();
+        storageHooks.useAllSessionListRenderables.mockClear();
+
+        const { ActionOperationActivityButton } = await import('./ActionOperationActivityButton');
+        const screen = await renderScreen(<ActionOperationActivityButton />);
+
+        expect(storageHooks.useAllMachines).not.toHaveBeenCalled();
+        expect(storageHooks.useAllSessions).not.toHaveBeenCalled();
+        expect(storageHooks.useAllSessionListRenderables).not.toHaveBeenCalled();
+
+        await screen.pressByTestIdAsync('action-operation-activity-button');
+
+        expect(storageHooks.useAllMachines).toHaveBeenCalledOnce();
+        expect(storageHooks.useAllSessions).toHaveBeenCalledOnce();
+        expect(storageHooks.useAllSessionListRenderables).toHaveBeenCalledOnce();
+        expect(screen.findByTestId(`action-operation-row-${active.operationId}`)).not.toBeNull();
+    });
+
     it('marks terminal operations seen when the model-backed popover opens', async () => {
         const terminal = operation({
             operationId: 'operation-model-backed',

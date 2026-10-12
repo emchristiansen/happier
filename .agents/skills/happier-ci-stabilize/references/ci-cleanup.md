@@ -60,7 +60,7 @@ Before treating a local timeout as product evidence, check whether the developme
 ## Workflow simplification
 
 - Keep one canonical command per lane and let local/manual/automatic workflows call it.
-- Keep runner-pool selection as an input to the reusable workflow. Blacksmith is a manual accelerator for approved non-secret Linux lanes, not a fork of CI; the same job graph and commands must continue to work on GitHub-hosted runners.
+- Keep runner-pool selection as an input to the reusable workflow. GitHub-hosted runners are the default. Blacksmith is a manual accelerator only with explicit current approval and confirmed included budget for eligible non-secret Linux lanes, not a fork of CI; it has no automatic fallback. If it is unavailable or exhausted, make a new otherwise-identical `tests-dispatch.yml` run with `runner_pool=github`. The same job graph and commands must continue to work on GitHub-hosted runners.
 - Use matrices only for real platform/configuration differences.
 - Size a shard matrix from the canonical test inventory and recent elapsed-time evidence. Verify every configured shard is non-empty with the runner's list mode, and remove empty shards rather than paying a full checkout/install/browser setup for no coverage. More shards are not automatically faster when runner capacity is lower than the matrix or when the framework partitions by test count instead of measured duration.
 - Keep result aggregators tiny and free of dependency installation.
@@ -71,6 +71,8 @@ Before treating a local timeout as product evidence, check whether the developme
 - Do not add retries around release mutations unless the operation is proven idempotent or state reconciliation precedes retry.
 
 Measure cleanup by fewer competing owners, fewer repeated fixtures, faster time to the first deciding failure, and fewer expensive full reruns—not by raw test-count reduction.
+
+For a subsystem-sized pruning campaign, use `.agents/skills/happier-testing/references/test-audit.md`. Use codemods only for mechanically provable migrations after previewing their full match set; test value and keeper selection remain owner-level judgments. Prefer report-only smell analyzers with ratcheting baselines over an immediate repository-wide ban.
 
 When a live E2E surface is stale, use boundary evidence in order: confirm the producer state changed, confirm a fresh transport request and response occurred, then inspect the active DOM/rendered bytes. If the producer and transport are fresh but the active DOM is old, correct and test the renderer boundary; do not add more polling, invalidate unrelated stores, or raise the assertion timeout.
 

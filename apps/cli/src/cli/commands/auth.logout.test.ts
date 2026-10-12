@@ -4,19 +4,43 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mkdirSync, existsSync } from 'node:fs';
 
-vi.mock('node:readline', () => ({
-  createInterface: () => ({
-    question: (_prompt: string, cb: (answer: string) => void) => cb('y'),
-    close: () => {},
-  }),
-}));
+vi.mock('node:readline', async () => {
+  const { EventEmitter } = await import('node:events');
+  return {
+    createInterface: () => Object.assign(new EventEmitter(), {
+      question: (_prompt: string, cb: (answer: string) => void) => cb('y'),
+      close: () => {},
+    }),
+  };
+});
 
 import { reloadConfiguration } from '@/configuration';
 import { readSettings } from '@/persistence';
+import { spawnStoppableHttpDaemon, withConfiguredDaemonTestHome, writeDaemonStateFixture } from '@/daemon/testkit/fakeDaemonLifecycle.testkit';
 
 import { handleAuthCommand } from './auth';
+import { reserveEphemeralPort, waitForHttpReady } from '@/testkit/http/portUtils';
 
 describe('happier auth logout', () => {
+  it('keeps the home and credentials when logout-all cannot confirm daemon shutdown', async () => {
+    await withConfiguredDaemonTestHome({ prefix: 'auth-logout-incomplete-' }, async ({ homeDir }) => {
+      const port = await reserveEphemeralPort();
+      const child = spawnStoppableHttpDaemon(port, 500);
+      const statePath = await writeDaemonStateFixture(homeDir, 'removed', { pid: child.pid, httpPort: port });
+      const credentialsPath = join(homeDir, 'servers', 'removed', 'access.key');
+      await writeFile(credentialsPath, 'preserve-me');
+      try {
+        expect(await waitForHttpReady(port)).toBe(true);
+        await expect(handleAuthCommand(['logout', '--all'])).rejects.toThrow(/daemon stop is incomplete/i);
+        expect(existsSync(statePath)).toBe(true);
+        expect(await readFile(credentialsPath, 'utf8')).toBe('preserve-me');
+        expect(process.kill(child.pid, 0)).toBe(true);
+      } finally {
+        await child.kill();
+      }
+    });
+  });
+
   it('logs out only from the active server by default', async () => {
     const home = await mkdtemp(join(tmpdir(), 'happier-auth-logout-'));
     const prevHome = process.env.HAPPIER_HOME_DIR;

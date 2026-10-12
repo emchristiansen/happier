@@ -30,6 +30,11 @@ const firstUploadMarker = ${JSON.stringify(firstUploadMarker)};
 const asset = ${JSON.stringify(asset)};
 fs.appendFileSync(logFile, \`gh \${args.join(' ')}\\n\`);
 
+if (args[0] === 'release' && args[1] === 'view' && args.includes('isDraft')) {
+  process.stdout.write('true');
+  process.exit(0);
+}
+
 if (args[0] === 'release' && args[1] === 'upload') {
   try {
     fs.closeSync(fs.openSync(firstUploadMarker, 'wx'));

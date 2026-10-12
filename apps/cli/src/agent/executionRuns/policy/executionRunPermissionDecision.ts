@@ -4,6 +4,7 @@ import { isTrustedAlwaysAutoApproveToolName } from '@/agent/permissions/alwaysAu
 import { extractShellCommand } from '@/agent/permissions/permissionToolIdentifier';
 
 import { permissionModeForExecutionRunPolicy } from '@/agent/executionRuns/policy/permissionModeForExecutionRunPolicy';
+import { createExecutionRunInteractionUnavailableError } from '@/agent/executionRuns/runtime/executionRunErrors';
 
 const EXECUTION_RUN_EXTRA_WRITE_LIKE_TOOL_NAMES = new Set([
   'external_directory',
@@ -79,7 +80,7 @@ export function createExecutionRunPermissionHandler(args: Readonly<{
         && !shouldAlwaysApproveExecutionRunTool(toolName)
         && isExecutionRunWriteLikeToolName(toolName)
       ) {
-        if (!args.interactiveHandler) return { decision: 'denied' };
+        if (!args.interactiveHandler) throw createExecutionRunInteractionUnavailableError();
         return args.interactiveHandler.handleToolCall(toolCallId, toolName, input, {
           permissionMode: permissionModeForExecutionRunPolicy(args.permissionMode),
         });

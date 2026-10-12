@@ -222,37 +222,14 @@ The router implements recipient filters so updates go only to interested connect
 
 ## Presence and activity
 
-```mermaid
-flowchart LR
-    subgraph "High Frequency"
-        Events[session-alive / machine-alive]
-        Cache[Activity Cache]
-    end
+The current development server has separate session and machine presence owners:
 
-    subgraph "Batched Writes"
-        Batch[Batch Processor]
-        DB[(Postgres)]
-    end
+- Machine heartbeats use the existing ActivityCache/batched persistence path in `sources/app/presence`.
+- Released `session-alive` events enter `sources/app/session/runtimeActivity/socketEvents.ts`. The adapter delegates authorization, registration, and conditional liveness writes to `createSessionPublisherPresence`; machine batching is not a second session-presence writer.
+- Session heartbeat coalescing retains the latest server-received observation. Its next flush deadline is the earlier of 60 seconds after the preceding write settles and half the configured session expiry after that write's observation time. This preserves the default write budget while bounding durable observation age for short expiries. Delayed writes retain the observation time rather than inventing a newer heartbeat. Close/disconnect clears pending work, and generation/fence checks prevent a replaced publisher from refreshing its successor. Database failures remain observable and use the adapter's retry backoff; coalescing cannot guarantee liveness during an outage.
+- `runPresenceTimeoutTick` reads durable timestamps and conditionally expires the observed session fence. Session and machine expiry default to ten minutes, with a separate timeout-loop tick; these are not a ten-minute flush timer. Runtime activity snapshots describe agent activity separately from reachability.
 
-    subgraph "Timeout Loop"
-        Timer[10 min timer]
-        Offline[Mark Inactive]
-        Emit[Emit offline update]
-    end
-
-    Events --> |debounce| Cache
-    Cache --> |batch| Batch --> DB
-    Timer --> Cache
-    Cache --> |stale entries| Offline --> DB
-    Offline --> Emit
-```
-
-Presence is handled in `sources/app/presence`:
-- `session-alive` and `machine-alive` events are debounced in memory (ActivityCache).
-- Database writes are batched to reduce write load.
-- A timeout loop marks sessions/machines inactive after 10 minutes of silence and emits an offline ephemeral update.
-
-This splits high-frequency presence from durable storage updates.
+These are development-source semantics, not a claim that every published server already contains them.
 
 ## Storage and persistence
 ### Database (Prisma)

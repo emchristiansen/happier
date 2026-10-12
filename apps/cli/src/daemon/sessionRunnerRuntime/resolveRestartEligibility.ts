@@ -19,12 +19,19 @@ function hasSpawnOptions(tracked: TrackedSession): boolean {
   return !!normalizeString(tracked.spawnOptions?.directory);
 }
 
-function hasResumeContext(tracked: TrackedSession): boolean {
+export function hasSessionRunnerResumeIdentity(tracked: TrackedSession): boolean {
   return !!(
     normalizeString(tracked.spawnOptions?.resume) ||
     normalizeString(tracked.vendorResumeId) ||
     normalizeString(tracked.spawnOptions?.existingSessionId)
   );
+}
+
+export function shouldRefreshSessionRunnerResumeIdentity(
+  tracked: TrackedSession | null | undefined,
+): tracked is TrackedSession {
+  if (!tracked || hasSessionRunnerResumeIdentity(tracked)) return false;
+  return resolveSessionRunnerRestartEligibility(tracked).disabledReason === 'missing_resume_identity';
 }
 
 function isWindowsHostedRunner(tracked: TrackedSession): boolean {
@@ -43,7 +50,9 @@ export function resolveSessionRunnerRestartEligibility(
   }
   if (!isActiveTrackedRunner(tracked)) return { eligible: false, disabledReason: 'not_active' };
   if (!hasSpawnOptions(tracked)) return { eligible: false, disabledReason: 'missing_spawn_options' };
-  if (!hasResumeContext(tracked)) return { eligible: false, disabledReason: 'missing_resume_identity' };
+  if (!hasSessionRunnerResumeIdentity(tracked)) {
+    return { eligible: false, disabledReason: 'missing_resume_identity' };
+  }
   if (isWindowsHostedRunner(tracked)) return { eligible: false, disabledReason: 'windows_hosted_runner' };
   return { eligible: true, disabledReason: null };
 }

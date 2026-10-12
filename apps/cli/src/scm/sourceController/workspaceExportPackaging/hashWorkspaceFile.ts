@@ -5,11 +5,12 @@ export async function hashWorkspaceFile(params: Readonly<{
     filePath: string;
     assertCanContinue?: () => void | Promise<void>;
 }>): Promise<string> {
+    await params.assertCanContinue?.();
+
     const hash = createHash('sha256');
     const stream = createReadStream(params.filePath);
 
     try {
-        await params.assertCanContinue?.();
         for await (const chunk of stream) {
             await params.assertCanContinue?.();
             hash.update(chunk);

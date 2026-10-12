@@ -12,6 +12,20 @@ export const SESSION_PERMISSION_MODES = [
 
 export type SessionPermissionMode = (typeof SESSION_PERMISSION_MODES)[number];
 
+/**
+ * Provider-neutral permission names presented at user/action input boundaries.
+ *
+ * Readers and persisted session metadata retain the older `read-only` / `safe-yolo`
+ * spellings for mixed-version compatibility. {@link parseSessionPermissionModeAlias}
+ * translates these names and supported legacy aliases into that wire representation.
+ */
+export const SESSION_PERMISSION_INTENT_INPUTS = [
+  'read_only',
+  'default',
+  'auto',
+  'yolo',
+] as const;
+
 const SESSION_PERMISSION_MODE_SET = new Set<string>(SESSION_PERMISSION_MODES);
 
 function normalizeSessionPermissionModeToken(raw: string): string {

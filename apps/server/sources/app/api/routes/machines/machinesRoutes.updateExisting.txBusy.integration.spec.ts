@@ -77,7 +77,7 @@ describe("machinesRoutes (update existing machine, tx busy)", () => {
                 body: {
                     id: "m1",
                     metadata: "meta-new",
-                    daemonState: undefined,
+                    daemonState: "state-new",
                 },
             },
         );

@@ -20,10 +20,6 @@ import { useHydrateSessionForRoute } from '@/hooks/session/useHydrateSessionForR
 import { useActiveServerSnapshot } from '@/hooks/server/useActiveServerSnapshot';
 import { markSessionRouteEnteredForSessionUiTelemetry } from '@/sync/runtime/performance/sessionUiTelemetry';
 import {
-    isSessionRouteHydrationAvailable,
-    isSessionRouteHydrationPending,
-} from '@/sync/domains/session/sessionRouteHydrationState';
-import {
     getStorage,
     readSessionLastMobileSurfaceFromMap,
     storage,
@@ -157,7 +153,6 @@ export default React.memo(() => {
         `SessionRoute.ensureSessionVisible gen=${activeServerGeneration}`,
         routeScope.hydrationOptions,
     );
-    const sessionHydrated = isSessionRouteHydrationAvailable(routeHydrationState);
     const sessionCached = storage((state) => {
         return Boolean(selectSessionViewShellSessionForRouteState(
             {
@@ -182,7 +177,7 @@ export default React.memo(() => {
         return <SessionInvalidLinkFallback />;
     }
 
-    if (isSessionRouteHydrationPending(routeHydrationState) && !sessionCached && !authRecoveryActive) {
+    if (routeHydrationState.kind === 'loading' && !sessionCached && !authRecoveryActive) {
         return (
             <View testID="session-route-loading" style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
                 <ActivitySpinner size="small" />

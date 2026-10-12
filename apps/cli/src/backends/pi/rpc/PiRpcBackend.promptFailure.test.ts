@@ -38,6 +38,7 @@ function makeFakePiRpcProcessScript(dir: string): string {
 const readline = require('node:readline');
 const rl = readline.createInterface({ input: process.stdin });
 const out = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
+let catalogPublished = false;
 
 rl.on('line', (line) => {
   let command;
@@ -52,6 +53,13 @@ rl.on('line', (line) => {
       out({ id: command.id, type: 'response', command: 'new_session', success: true, data: { cancelled: false } });
       break;
     case 'get_state':
+      if (!catalogPublished) {
+        catalogPublished = true;
+        process.stderr.write(JSON.stringify({ type: 'happier-pi-model-catalog', models: [
+          { id: 'gpt-4o-mini', provider: 'openai', name: 'GPT-4o mini' },
+          { id: 'unnamed-model', provider: 'local' }
+        ] }) + '\\n');
+      }
       out({
         id: command.id,
         type: 'response',
@@ -213,6 +221,9 @@ rl.on('line', (line) => {
         type: 'response',
         command: 'prompt',
         success: false,
+        retryable: true,
+        attempt: 2,
+        maxAttempts: 3,
         error: 'Provider session failed'
       });
       break;
@@ -779,7 +790,7 @@ rl.on('line', (line) => {
             provider: 'openai-codex',
             model: 'gpt-5.6-luna',
             stopReason: 'error',
-            errorMessage: '401: {"error":{"code":"provider_auth_failed","message":"Credential sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa was rejected"},"request_body":"secret prompt payload"}'
+            errorMessage: '401: {"error":{"code":"provider_auth_failed","message":"Credential sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa was rejected; echoed request marker PI_PROVIDER_PROMPT_ECHO_7f9a"},"request_body":"secret prompt payload"}'
           }
         });
         out({ type: 'agent_end', willRetry: false });
@@ -1710,10 +1721,22 @@ describe('PiRpcBackend prompt error handling', () => {
           expect.objectContaining({
             classification: 'pi_provider_failure',
             providerCode: 'pi_provider_session_error',
-            sanitizedPreview: 'Pi provider rejected the prompt before acceptance without details',
+            runtimeProvider: 'openai-codex',
+            runtimeModelId: 'openai-codex/gpt-5.5',
+            failureRecord: expect.objectContaining({
+              type: 'response',
+              command: 'prompt',
+              success: false,
+              retryable: true,
+              attempt: 2,
+              maxAttempts: 3,
+              keys: ['id', 'type', 'command', 'success', 'retryable', 'attempt', 'maxAttempts', 'error'],
+            }),
           }),
         ],
       ]);
+      expect(warnSpy.mock.calls.filter(([message]) => message === '[pi] Provider turn failed')[0]?.[1])
+        .not.toHaveProperty('sanitizedPreview');
     } finally {
       warnSpy.mockRestore();
       await backend.dispose();
@@ -2048,12 +2071,13 @@ describe('PiRpcBackend prompt error handling', () => {
       const status = messages.find((message) => message?.type === 'status' && message.status === 'error');
       expect(status?.detail).toContain('code=provider_auth_failed');
       expect(status?.detail).toContain('message=Credential [REDACTED] was rejected');
+      expect(status?.detail).toContain('PI_PROVIDER_PROMPT_ECHO_7f9a');
 
       expect(readProviderFailureToolResults(messages)).toEqual([
         expect.objectContaining({
           type: 'tool-result',
           toolName: 'terminal-output',
-          result: 'Pi provider reported provider failure after prompt acceptance: code=provider_auth_failed, status=401, message=Credential [REDACTED] was rejected',
+          result: expect.stringContaining('PI_PROVIDER_PROMPT_ECHO_7f9a'),
           isError: true,
           callId: expect.any(String),
         }),
@@ -2064,12 +2088,23 @@ describe('PiRpcBackend prompt error handling', () => {
       expect(logCalls[0]?.[1]).toMatchObject({
         classification: 'pi_provider_failure',
         providerCode: 'provider_auth_failed',
-        sanitizedPreview: expect.stringContaining('Credential [REDACTED] was rejected'),
+        runtimeProvider: 'openai-codex',
+        runtimeModelId: 'openai-codex/gpt-5.6-luna',
+        failureRecord: expect.objectContaining({
+          type: 'message_end',
+          messageShape: expect.objectContaining({
+            provider: 'openai-codex',
+            model: 'gpt-5.6-luna',
+            stopReason: 'error',
+          }),
+        }),
       });
+      expect(logCalls[0]?.[1]).not.toHaveProperty('sanitizedPreview');
 
-      const serialized = JSON.stringify({ messages, logCalls });
-      expect(serialized).not.toContain('sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
-      expect(serialized).not.toContain('secret prompt payload');
+      const serializedLogs = JSON.stringify(logCalls);
+      expect(serializedLogs).not.toContain('PI_PROVIDER_PROMPT_ECHO_7f9a');
+      expect(serializedLogs).not.toContain('sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+      expect(serializedLogs).not.toContain('secret prompt payload');
     } finally {
       warnSpy.mockRestore();
       await backend.dispose();
@@ -2254,7 +2289,7 @@ describe('PiRpcBackend prompt error handling', () => {
     }
   });
 
-  it('exposes session model state after startSession (for model probing)', async () => {
+  it('publishes the complete session model state asynchronously after startSession', async () => {
     const workDir = makeTempDir('happier-pi-rpc-models-');
     tempDirs.push(workDir);
     const fakeScript = makeFakePiRpcProcessScript(workDir);
@@ -2266,9 +2301,23 @@ describe('PiRpcBackend prompt error handling', () => {
       env: {},
     });
 
+    const completeModelState = new Promise<Record<string, unknown>>((resolve) => {
+      backend.onMessage((message) => {
+        if (
+          message.type === 'event'
+          && message.name === 'session_models_state'
+          && Array.isArray((message.payload as { availableModels?: unknown })?.availableModels)
+          && (message.payload as { availableModels: unknown[] }).availableModels.length > 0
+        ) {
+          resolve(message.payload as Record<string, unknown>);
+        }
+      });
+    });
+
     try {
       await backend.startSession();
-      const state = (backend as any).getSessionModelState?.() ?? null;
+      await completeModelState;
+      const state = backend.getSessionModelState();
       expect(state).toEqual({
         currentModelId: 'openai/gpt-4o-mini',
         availableModels: [

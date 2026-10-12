@@ -100,6 +100,9 @@ export type SessionMessages = {
 
 export type MessagesDomain = {
     sessionMessages: Record<string, SessionMessages>;
+    /** Transient coverage published by sync, including final pages with no renderable messages. */
+    sessionMessagesHistoryStartLoaded: Record<string, true>;
+    markSessionMessagesHistoryStartLoaded: (sessionId: string) => void;
     isMutableToolCall: (sessionId: string, callId: string) => boolean;
     applyMessages: (sessionId: string, messages: NormalizedMessage[]) => {
         changed: string[];
@@ -549,6 +552,12 @@ export function createMessagesDomain<S extends MessagesDomain & MessagesDomainDe
 }): MessagesDomain {
     return {
         sessionMessages: {},
+        sessionMessagesHistoryStartLoaded: {},
+        markSessionMessagesHistoryStartLoaded: (sessionId) => set((state) => {
+            const previous = state.sessionMessagesHistoryStartLoaded ?? {};
+            if (previous[sessionId] === true) return state;
+            return { ...state, sessionMessagesHistoryStartLoaded: { ...previous, [sessionId]: true as const } };
+        }),
         isMutableToolCall: (sessionId: string, callId: string) => {
             const rawSessionMessages = get().sessionMessages[sessionId];
             if (!rawSessionMessages) {
@@ -1164,7 +1173,8 @@ export function createMessagesDomain<S extends MessagesDomain & MessagesDomainDe
         }),
         evictSessionMessages: (sessionId: string) => set((state) => {
             const existingSession = state.sessionMessages[sessionId];
-            if (!existingSession) {
+            const { [sessionId]: _coverage, ...remainingHistoryStartLoaded } = state.sessionMessagesHistoryStartLoaded ?? {};
+            if (!existingSession && !_coverage) {
                 return state;
             }
 
@@ -1180,12 +1190,14 @@ export function createMessagesDomain<S extends MessagesDomain & MessagesDomainDe
             return {
                 ...state,
                 sessionMessages: remainingSessionMessages,
+                sessionMessagesHistoryStartLoaded: remainingHistoryStartLoaded,
             };
         }),
         resetSessionMessages: (sessionId: string) => set((state) => {
             const existingSession = state.sessionMessages[sessionId];
+            const { [sessionId]: _coverage, ...remainingHistoryStartLoaded } = state.sessionMessagesHistoryStartLoaded ?? {};
             if (!existingSession) {
-                return state;
+                return _coverage ? { ...state, sessionMessagesHistoryStartLoaded: remainingHistoryStartLoaded } : state;
             }
 
             const messagesById: Record<string, Message> = {};
@@ -1200,6 +1212,7 @@ export function createMessagesDomain<S extends MessagesDomain & MessagesDomainDe
             // by the no-mounted-surface paths only: evictSessionMessages and deleteSession.
             return {
                 ...state,
+                sessionMessagesHistoryStartLoaded: remainingHistoryStartLoaded,
                 sessionMessages: {
                     ...state.sessionMessages,
                     [sessionId]: {

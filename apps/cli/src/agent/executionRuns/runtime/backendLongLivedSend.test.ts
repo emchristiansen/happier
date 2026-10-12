@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { AgentBackend, SessionId, StartSessionResult } from '@/agent/core/AgentBackend';
+import type { ExecutionRunBackendController } from '@/agent/executionRuns/controllers/types';
 import type { ExecutionRunState } from '@/agent/executionRuns/runtime/executionRunTypes';
 import {
   prepareBackendLongLivedRunResume,
@@ -61,6 +62,30 @@ function createLongLivedResumableRun(overrides?: Partial<ExecutionRunState>): Ex
       vendorSessionId: 'vendor_session_1',
     },
     ...(overrides ?? {}),
+  };
+}
+
+function createActiveLongLivedController(backend: AgentBackend): ExecutionRunBackendController {
+  return {
+    kind: 'backend',
+    backend,
+    backendSupportsResume: true,
+    childSessionId: 'child_session_active' as SessionId,
+    buffer: '',
+    sidechainStreamBuffer: '',
+    sidechainStreamKey: '',
+    streamWriter: null,
+    cancelled: false,
+    turnCount: 1,
+    turnEpoch: 1,
+    turnInFlight: true,
+    turnCancelReason: null,
+    turnCancelEpoch: null,
+    pendingExternalMessages: [],
+    pendingExternalMessagesSignal: null,
+    lastMarkerWriteAtMs: 0,
+    terminalPromise: new Promise<void>(() => {}),
+    resolveTerminal: () => undefined,
   };
 }
 
@@ -170,5 +195,116 @@ describe('sendBackendLongLivedRun (resume)', () => {
     });
     expect(firstSend).not.toHaveBeenCalled();
     expect(successorSend).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['AbortError', Object.assign(new Error('prompt outcome is ambiguous'), { name: 'AbortError' })],
+    ['generic provider error', new Error('provider disconnected after prompt admission')],
+  ])('sends an interrupt replacement only once and keeps custody after %s until completion', async (_label, sendError) => {
+    let resolveCompletion!: () => void;
+    const completion = new Promise<void>((resolve) => {
+      resolveCompletion = resolve;
+    });
+    const { backend } = createResumableBackendHarness();
+    const sendPrompt = vi.fn(async () => {
+      throw sendError;
+    });
+    backend.sendPrompt = sendPrompt;
+    backend.sendSteerPrompt = vi.fn(async () => undefined);
+    backend.waitForResponseComplete = async () => await completion;
+    const run = createLongLivedResumableRun({ status: 'running' });
+    const runs = new Map([[run.runId, run]]);
+    const controller = createActiveLongLivedController(backend);
+    const controllers = new Map([[run.runId, controller]]);
+    const sendArgs = {
+      runId: run.runId,
+      runs,
+      controllers,
+      budgetRegistry: null,
+      createBackend: async () => backend,
+      maxTurns: null,
+      getNowMs: () => 123,
+      finishRun: async () => undefined,
+      sendAcp: (() => undefined) as any,
+      parentProvider: 'claude' as const,
+      streamedTranscriptSession: null,
+      writeActivityMarker: async () => undefined,
+      admitRuntimeActivity: async () => undefined,
+      rollbackRuntimeActivityAfterFailedAdmission: async () => undefined,
+      terminalRuntimeActivityAfterFailedAdmission: async () => undefined,
+    } as const;
+
+    await expect(sendBackendLongLivedRun({
+      ...sendArgs,
+      params: { message: 'replacement', delivery: 'interrupt' },
+    })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'execution_run_send_outcome_unknown',
+    });
+    expect(sendPrompt).toHaveBeenCalledOnce();
+    expect(controller.turnInFlight).toBe(true);
+    expect(controller.turnCancelReason).toBe('outcome_unknown');
+
+    await expect(sendBackendLongLivedRun({
+      ...sendArgs,
+      params: { message: 'must not overlap', delivery: 'steer_if_supported' },
+    })).resolves.toMatchObject({ ok: false, errorCode: 'execution_run_busy' });
+    expect(sendPrompt).toHaveBeenCalledOnce();
+    expect(backend.sendSteerPrompt).not.toHaveBeenCalled();
+
+    resolveCompletion();
+    await vi.waitFor(() => {
+      expect(controller.turnInFlight).toBe(false);
+      expect(controller.turnCancelReason).toBeNull();
+    });
+  });
+
+  it('keeps the active turn busy when a steer throw cannot prove whether the input was accepted', async () => {
+    const { backend } = createResumableBackendHarness();
+    const sendPrompt = vi.fn(async () => undefined);
+    const sendSteerPrompt = vi.fn(async () => {
+      throw new Error('provider disconnected after steer admission');
+    });
+    backend.sendPrompt = sendPrompt;
+    backend.sendSteerPrompt = sendSteerPrompt;
+    const run = createLongLivedResumableRun({ status: 'running' });
+    const runs = new Map([[run.runId, run]]);
+    const controller = createActiveLongLivedController(backend);
+    const controllers = new Map([[run.runId, controller]]);
+    const sendArgs = {
+      runId: run.runId,
+      runs,
+      controllers,
+      budgetRegistry: null,
+      createBackend: async () => backend,
+      maxTurns: null,
+      getNowMs: () => 123,
+      finishRun: async () => undefined,
+      sendAcp: (() => undefined) as any,
+      parentProvider: 'claude' as const,
+      streamedTranscriptSession: null,
+      writeActivityMarker: async () => undefined,
+      admitRuntimeActivity: async () => undefined,
+      rollbackRuntimeActivityAfterFailedAdmission: async () => undefined,
+      terminalRuntimeActivityAfterFailedAdmission: async () => undefined,
+    } as const;
+
+    await expect(sendBackendLongLivedRun({
+      ...sendArgs,
+      params: { message: 'steer once', delivery: 'steer_if_supported' },
+    })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'execution_run_send_outcome_unknown',
+    });
+    expect(sendSteerPrompt).toHaveBeenCalledOnce();
+    expect(controller.turnInFlight).toBe(true);
+    expect(controller.turnCancelReason).toBe('outcome_unknown');
+
+    await expect(sendBackendLongLivedRun({
+      ...sendArgs,
+      params: { message: 'must not overlap', delivery: 'steer_if_supported' },
+    })).resolves.toMatchObject({ ok: false, errorCode: 'execution_run_busy' });
+    expect(sendSteerPrompt).toHaveBeenCalledOnce();
+    expect(sendPrompt).not.toHaveBeenCalled();
   });
 });

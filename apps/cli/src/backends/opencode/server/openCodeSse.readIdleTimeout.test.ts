@@ -112,14 +112,14 @@ describe('subscribeSseJson read idle timeout', () => {
 });
 
 describe('resolveOpenCodeSseReadIdleTimeoutMs', () => {
-  it('uses the default timeout when the environment variable is absent or invalid', async () => {
+  it('leaves healthy quiet streams open by default when the environment variable is absent or invalid', async () => {
     const clientModule = await import('./client') as ClientModuleWithReadIdleResolver;
 
     expect(clientModule.resolveOpenCodeSseReadIdleTimeoutMs).toBeTypeOf('function');
-    expect(clientModule.resolveOpenCodeSseReadIdleTimeoutMs?.({})).toBe(30_000);
+    expect(clientModule.resolveOpenCodeSseReadIdleTimeoutMs?.({})).toBeNull();
     expect(clientModule.resolveOpenCodeSseReadIdleTimeoutMs?.({
       HAPPIER_OPENCODE_SSE_READ_IDLE_TIMEOUT_MS: 'not-a-number',
-    })).toBe(30_000);
+    })).toBeNull();
   });
 
   it('clamps configured timeouts while allowing zero to disable read-idle recovery', async () => {
@@ -187,6 +187,7 @@ describe('createOpenCodeServerRuntimeClient read idle configuration', () => {
 
     const controller = new AbortController();
     await client.subscribeGlobalEvents({ signal: controller.signal, onEvent: vi.fn() });
+    await expect.poll(() => subscribeSseJsonMock.mock.calls.length).toBe(1);
 
     expect(subscribeSseJsonMock).toHaveBeenCalledWith(expect.objectContaining({
       readIdleTimeoutMs: 5_000,

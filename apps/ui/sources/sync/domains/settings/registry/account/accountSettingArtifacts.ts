@@ -7,6 +7,7 @@ import { ACCOUNT_CONNECTED_SERVICES_SETTING_DEFINITIONS } from './accountConnect
 import { ACCOUNT_COLLECTION_SETTING_DEFINITIONS } from './accountCollectionSettingDefinitions';
 import { ACCOUNT_CORE_SETTING_DEFINITIONS } from './accountCoreSettingDefinitions';
 import { ACCOUNT_DISPLAY_SETTING_DEFINITIONS } from './accountDisplaySettingDefinitions';
+import { ACCOUNT_ENCRYPTION_SETTING_DEFINITIONS } from './accountEncryptionSettingDefinitions';
 import { ACCOUNT_FEATURE_TOGGLE_SETTING_DEFINITIONS } from './accountFeatureToggleSettingDefinitions';
 import { ACCOUNT_LEGACY_SETTING_DEFINITIONS } from './accountLegacySettingDefinitions';
 import { ACCOUNT_KEYBOARD_SHORTCUT_SETTING_DEFINITIONS } from './accountKeyboardShortcutSettingDefinitions';
@@ -18,6 +19,7 @@ import { ACCOUNT_PROMPT_LIBRARY_SETTING_DEFINITIONS } from './accountPromptLibra
 import { ACCOUNT_RUNTIME_SETTING_DEFINITIONS } from './accountRuntimeSettingDefinitions';
 import { ACCOUNT_SCM_FILES_SETTING_DEFINITIONS } from './accountScmFilesSettingDefinitions';
 import { ACCOUNT_SESSION_CREATION_SETTING_DEFINITIONS } from './accountSessionCreationSettingDefinitions';
+import { ACCOUNT_SESSION_REMINDER_SETTING_DEFINITIONS } from './accountSessionReminderSettingDefinitions';
 import { ACCOUNT_SERVER_SELECTION_SETTING_DEFINITIONS } from './accountServerSelectionSettingDefinitions';
 import { ACCOUNT_TRANSCRIPT_TOOL_SETTING_DEFINITIONS } from './accountTranscriptToolSettingDefinitions';
 import { ACCOUNT_VOICE_SETTING_DEFINITIONS } from './accountVoiceSettingDefinitions';
@@ -31,6 +33,7 @@ export const ACCOUNT_SETTING_DEFINITIONS = defineSettingDefinitions({
     ...ACCOUNT_COLLECTION_SETTING_DEFINITIONS,
     ...ACCOUNT_CORE_SETTING_DEFINITIONS,
     ...ACCOUNT_DISPLAY_SETTING_DEFINITIONS,
+    ...ACCOUNT_ENCRYPTION_SETTING_DEFINITIONS,
     ...ACCOUNT_FEATURE_TOGGLE_SETTING_DEFINITIONS,
     ...ACCOUNT_KEYBOARD_SHORTCUT_SETTING_DEFINITIONS,
     ...ACCOUNT_LEGACY_SETTING_DEFINITIONS,
@@ -42,6 +45,7 @@ export const ACCOUNT_SETTING_DEFINITIONS = defineSettingDefinitions({
     ...ACCOUNT_RUNTIME_SETTING_DEFINITIONS,
     ...ACCOUNT_SCM_FILES_SETTING_DEFINITIONS,
     ...ACCOUNT_SESSION_CREATION_SETTING_DEFINITIONS,
+    ...ACCOUNT_SESSION_REMINDER_SETTING_DEFINITIONS,
     ...ACCOUNT_SERVER_SELECTION_SETTING_DEFINITIONS,
     ...ACCOUNT_TRANSCRIPT_TOOL_SETTING_DEFINITIONS,
     ...ACCOUNT_VOICE_SETTING_DEFINITIONS,

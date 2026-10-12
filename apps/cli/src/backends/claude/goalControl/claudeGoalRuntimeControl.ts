@@ -5,8 +5,8 @@ import { buildClaudeGoalCommand } from './claudeGoalCommand';
  *
  * The generic goal router prefers the live session RPC for active sessions
  * (`SESSION_GOAL_SET` / `SESSION_GOAL_CLEAR`). For Claude those handlers call
- * these runtime controls, which inject a literal `/goal` user turn into the
- * unified terminal arbiter.
+ * these runtime controls, which inject a terminal-local `/goal` control into
+ * the unified terminal arbiter without opening a provider turn.
  *
  * Delivery semantics are explicit (G3): the injector reports the strongest
  * runtime-observable delivery state it can PROVE. The terminal/arbiter can prove
@@ -21,8 +21,7 @@ import { buildClaudeGoalCommand } from './claudeGoalCommand';
 /**
  * The strongest delivery state observed for an injected `/goal` command:
  *  - `queued`: accepted into the arbiter queue but not yet written to the terminal;
- *  - `sent-to-terminal`: drained from the arbiter and written to the terminal input;
- *  - `provider-turn-started`: the provider began a turn for the injected command.
+ *  - `sent-to-terminal`: drained from the arbiter and written to the terminal input.
  *
  * It deliberately stops at runtime-observable states. A later matching `goal_status` is SOURCE
  * observation that resolves UI pending state; it is not modeled as a command-delivery variant here
@@ -30,11 +29,10 @@ import { buildClaudeGoalCommand } from './claudeGoalCommand';
  */
 export type ClaudeGoalCommandDelivery =
   | Readonly<{ kind: 'queued' }>
-  | Readonly<{ kind: 'sent-to-terminal' }>
-  | Readonly<{ kind: 'provider-turn-started' }>;
+  | Readonly<{ kind: 'sent-to-terminal' }>;
 
 /**
- * Injects a `/goal …` command into the unified terminal arbiter as a user turn and resolves with the
+ * Injects a terminal-local `/goal …` command into the unified terminal arbiter and resolves with the
  * strongest delivery state it can prove. Rejects only on a genuine injection failure.
  */
 export type ClaudeGoalCommandInjector = (message: string) => Promise<ClaudeGoalCommandDelivery>;
@@ -42,7 +40,6 @@ export type ClaudeGoalCommandInjector = (message: string) => Promise<ClaudeGoalC
 const DELIVERY_RANK: Record<ClaudeGoalCommandDelivery['kind'], number> = {
   queued: 0,
   'sent-to-terminal': 1,
-  'provider-turn-started': 2,
 };
 
 /**
