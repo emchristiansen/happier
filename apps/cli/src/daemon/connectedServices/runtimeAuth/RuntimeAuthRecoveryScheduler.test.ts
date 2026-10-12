@@ -79,7 +79,10 @@ describe('RuntimeAuthRecoveryScheduler', () => {
         attemptId: begun.attemptId, resumePromptMode: 'custom' });
       expect(store.read(key)).toMatchObject({ resumePromptMode: 'standard' });
       finish.resolve(); await timer;
-      expect(store.read(key)).toMatchObject({ resumePromptMode: 'standard', status: 'resumed_awaiting_proof' });
+      // Fork divergence: a newer authoritative waiting write owns the phase;
+      // the completed handler may install proof only over its unchanged claim.
+      expect(store.read(key)).toMatchObject({ resumePromptMode: 'standard',
+        status: status === 'waiting' ? 'waiting' : 'resumed_awaiting_proof' });
       expect(continueAfterUsageLimitReset).toHaveBeenCalledOnce();
     } finally { finish.resolve(); await timer; scheduler.dispose(); otherOwner.dispose(); await rm(dir, { recursive: true, force: true }); }
   });
@@ -185,7 +188,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       jitterMs: () => 0,
       recover: async () => ({ status: 'credential_refreshed' }),
       continueAfterUsageLimitReset,
-      gate: () => gated ? { status: 'delayed' as const, retryAtMs: 1100, reason: 'local_server_storm' } : null,
+      gate: () => gated ? { status: 'delayed' as const, retryAtMs: 1100, reason: 'local_server_storm' } : { status: 'open' as const },
     };
     const scheduler = new RuntimeAuthRecoveryScheduler({ ...deps, durableStore: createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(storePath) });
     let reloaded: RuntimeAuthRecoveryScheduler | null = null;
@@ -609,7 +612,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     const baseStore = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath);
     const baseTransact = baseStore.transact!;
     let blockNextTransaction = false;
-    const blockedStore: DurableRecoveryStore<RuntimeAuthRecoveryIntent> = {
+    const blockedStore: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent> = {
       ...baseStore,
       transact: async <TResult>(
         recoveryKey: string,
