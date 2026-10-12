@@ -118,17 +118,19 @@ happier --server company daemon start
 
 ### CLI: run multiple daemons on one machine (one per Relay)
 
+Requires Happier 0.2.13 or later. Update earlier versions before following this recipe.
+
 ```bash
-happier --server personal daemon service install
-happier --server company daemon service install
+happier --server personal daemon service install --instance personal
+happier --server company daemon service install --instance company
 ```
 
 Then verify (cross-platform):
 
 ```bash
 happier daemon status --all
-happier --server personal daemon service status
-happier --server company daemon service status
+happier --server personal daemon service status --instance personal
+happier --server company daemon service status --instance company
 ```
 
 For complete profile/switching behavior and CLI reference, see [Features → Multi-server](/accounts/multi-server).

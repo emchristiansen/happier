@@ -28,6 +28,7 @@ export async function promptMultipleChoice<TId extends string>(
     promptInputFn?: typeof promptInput;
     animate?: boolean;
     renderMessage?: (elapsedSeconds: number, selectedId?: TId) => string;
+    intervalMs?: number | ((elapsedSeconds: number) => number);
   }>,
 ): Promise<TId> {
   const readAnswer = config.promptInputFn ?? promptInput;
@@ -44,6 +45,7 @@ export async function promptMultipleChoice<TId extends string>(
       ? await readAnswer(fullPrompt, {
           animation: {
             animate: config.animate,
+            ...(config.intervalMs === undefined ? {} : { intervalMs: config.intervalMs }),
             render: (seconds) => `${config.renderMessage!(seconds, options[selectedIndex]!.id).trimEnd()} ${suffix}`,
             onMove: (delta) => { selectedIndex = (selectedIndex + delta + options.length) % options.length; },
             answerOnEmpty: () => options[selectedIndex]!.keys.find((key) => key.length > 0) ?? options[selectedIndex]!.short,

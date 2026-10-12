@@ -8,7 +8,7 @@ import type { CommandHandler } from '@/cli/commandRegistry';
 import type { CloudConnectTarget } from '@/cloud/connectTypes';
 import type { DaemonSpawnHooks } from '@/daemon/spawnHooks';
 import type { TrackedSession } from '@/daemon/types';
-import type { BoundTerminalAttachmentInfo } from '@/terminal/attachment/terminalAttachmentInfo';
+import type { ExactTerminalAttachmentInfo } from '@/terminal/attachment/terminalAttachmentInfo';
 import type { DirectSessionsProviderId } from '@happier-dev/protocol';
 import type {
   BackendTargetRefV1,
@@ -17,6 +17,8 @@ import type {
   ConnectedServiceMaterializationIdentityV1,
   ConnectedServicesProviderConfigSharingModeV1,
   ConnectedServicesProviderStateSharingModeV1,
+  SessionProviderCliAttachPrepareRequestV1,
+  SessionProviderCliAttachPrepareResultV1,
 } from '@happier-dev/protocol';
 import type { DirectSessionProviderOps } from './directSessions/providerOps';
 import type { AcpForkContinuationHandler } from './forking/acpForkContinuationHandler';
@@ -91,7 +93,7 @@ export type ProviderRuntimeLocalHandoffMetadataBuilder = (params: Readonly<{
 export type ProviderTerminalAttachmentRetirementHook = (params: Readonly<{
   happyHomeDir: string;
   sessionId: string;
-  attachmentInfo: BoundTerminalAttachmentInfo;
+  attachmentInfo: ExactTerminalAttachmentInfo;
 }>) => Promise<void>;
 
 export type ProviderTerminalAttachmentControlProbe = (params: Readonly<{
@@ -136,6 +138,8 @@ export type ProviderAttachOps = Readonly<{
   runAttach: (params: Readonly<{
     sessionId: string;
     metadata: Record<string, unknown>;
+    prepareProviderCliAttach?: (request: Readonly<SessionProviderCliAttachPrepareRequestV1>) => Promise<SessionProviderCliAttachPrepareResultV1>;
+    terminalClient?: NonNullable<SessionProviderCliAttachPrepareRequestV1['terminalClient']>['herdr'];
   }>) => Promise<number | false>;
 }>;
 
@@ -516,8 +520,8 @@ export type AgentCatalogEntry = Readonly<{
     processEnv?: NodeJS.ProcessEnv;
   }>) => Readonly<Record<string, unknown>> | null;
   /**
-   * Optional provider-owned adapter for probing dynamic session controls (models/modes/config options)
-   * without starting a full ACP session.
+   * Optional provider-owned adapter for probing dynamic controls and native command/skill catalogs
+   * before starting a Happier session or submitting a user turn.
    *
    * Keep provider-specific implementations in the backend folder and expose them via this catalog hook.
    */

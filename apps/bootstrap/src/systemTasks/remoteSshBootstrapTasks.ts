@@ -8,6 +8,7 @@ import {
 } from '@happier-dev/cli-common/systemTasks';
 
 import { runLocalHappierJsonCommand } from './happierCli.js';
+import { scopeProcessEnvToTargetRelay } from './localDaemonCli.js';
 import { buildSshCommand, redactSshText } from '../ssh/index.js';
 import { extractSshHost, normalizeBootstrapChannel, parseFirstJsonObject, resolveDefaultKnownHostsPath, runCommandCapture } from './taskRuntime.js';
 import { installOrUpdateRelayRuntimeDefault } from './relayRuntimeTasks.js';
@@ -133,9 +134,18 @@ export async function approveLocalRemoteAuthRequestDefault(params: Readonly<{
     `--webapp-url=${params.parsed.relay.webappUrl ?? params.parsed.relay.relayUrl}`,
     ...(params.parsed.relay.publicRelayUrl ? [`--public-server-url=${params.parsed.relay.publicRelayUrl}`] : []),
   ];
+  // R13 (a): the approval releases this computer's credentials for exactly the relay the task
+  // names, so it runs in that relay's explicit target scope — an inherited launch pin
+  // (`HAPPIER_ACTIVE_SERVER_ID`, …) would otherwise outrank the flags in the CLI's configuration.
+  const { relayUrl, publicRelayUrl } = params.parsed.relay;
   await (deps.runLocalHappierJsonCommand ?? runLocalHappierJsonCommand)({
     args: ['auth', 'approve', '--public-key', params.publicKey, '--json', '--persist', ...relayArgs],
     releaseRing: normalizeBootstrapChannel(params.parsed.channel).releaseChannel,
+    processEnv: scopeProcessEnvToTargetRelay({
+      serverUrl: publicRelayUrl ?? relayUrl,
+      webappUrl: params.parsed.relay.webappUrl ?? relayUrl,
+      localServerUrl: publicRelayUrl ? relayUrl : null,
+    }, process.env),
   });
 }
 

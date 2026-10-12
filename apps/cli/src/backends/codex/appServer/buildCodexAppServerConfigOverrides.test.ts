@@ -3,6 +3,12 @@ import { describe, expect, it } from 'vitest';
 import { buildCodexAppServerConfigOverrides } from './buildCodexAppServerConfigOverrides';
 
 describe('buildCodexAppServerConfigOverrides', () => {
+    it('preserves ordered opaque native config overrides and ignores prompt text after the argument terminator', () => {
+        expect(buildCodexAppServerConfigOverrides({}, {
+            codexArgs: ['-c', 'model_reasoning_effort=low', '--config', 'custom.value="a=b"', '--config=model_reasoning_effort=high', '-cmodel_reasoning_effort=low', '-c=personality="friendly"', '--', '-c', 'model_reasoning_effort=medium'],
+        })).toEqual(['model_reasoning_effort=low', 'custom.value="a=b"', 'model_reasoning_effort=high', 'model_reasoning_effort=low', 'personality="friendly"']);
+        expect(() => buildCodexAppServerConfigOverrides({}, { codexArgs: ['-c'] })).toThrow();
+    });
     it('translates materialized Happier MCP servers into additive app-server config overrides', () => {
         const overrides = buildCodexAppServerConfigOverrides({
             happier: {

@@ -6,6 +6,8 @@ import {
   getProviderCliBinaryNames,
   getProviderCliRuntimeSpec,
   PROVIDER_CLI_RUNTIME_SPECS,
+  resolveProviderCliLatestVersionSource,
+  resolveProviderCliNpmPackageName,
 } from './providerCliRuntime.js';
 
 const cursorAgentId = 'cursor' as AgentId;
@@ -266,5 +268,27 @@ describe('PROVIDER_CLI_RUNTIME_SPECS', () => {
 
   it('covers every built-in provider', () => {
     expect(Object.keys(PROVIDER_CLI_RUNTIME_SPECS).sort()).toEqual([...AGENT_IDS].sort());
+  });
+
+  it('derives the latest-version source from the managed install owner before the npm package fact', () => {
+    expect(resolveProviderCliLatestVersionSource(getProviderCliRuntimeSpec('codex'))).toEqual({
+      kind: 'github_release',
+      githubRepo: 'openai/codex',
+    });
+    expect(resolveProviderCliLatestVersionSource(getProviderCliRuntimeSpec('opencode'))).toEqual({
+      kind: 'npm',
+      packageName: 'opencode-ai',
+    });
+    expect(resolveProviderCliLatestVersionSource(getProviderCliRuntimeSpec('claude'))).toEqual({
+      kind: 'npm',
+      packageName: '@anthropic-ai/claude-code',
+    });
+    expect(resolveProviderCliLatestVersionSource(getProviderCliRuntimeSpec('kiro'))).toBeNull();
+  });
+
+  it('names the npm package used to prove package-manager installs', () => {
+    expect(resolveProviderCliNpmPackageName(getProviderCliRuntimeSpec('codex'))).toBe('@openai/codex');
+    expect(resolveProviderCliNpmPackageName(getProviderCliRuntimeSpec('gemini'))).toBe('@google/gemini-cli');
+    expect(resolveProviderCliNpmPackageName(getProviderCliRuntimeSpec('cursor'))).toBeNull();
   });
 });

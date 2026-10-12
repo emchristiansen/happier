@@ -27,6 +27,11 @@ Open:
 
 The Authentication section is machine-specific. If you switch to a different machine, Happier checks that machine’s provider CLI instead.
 
+In current development builds, a machine-local **Logged out** result does not hide
+**Switch to remote** for an exclusively local session using a supported connected
+service. That check does not inspect the session's selected credentials; switching
+can still fail if those credentials are invalid.
+
 ## What Happier shows
 
 Depending on the provider, Happier can show:

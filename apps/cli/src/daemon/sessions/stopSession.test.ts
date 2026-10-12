@@ -78,6 +78,9 @@ vi.mock('@/integrations/tmux/TmuxUtilities', () => ({
   },
 }));
 
+// Keep cold module loading outside the behavior deadline, after mock state is initialized.
+const { createStopSession } = await import('./stopSession');
+
 function withProcessPlatform<T>(platform: NodeJS.Platform, fn: () => Promise<T>): Promise<T> {
   const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
   if (!originalPlatformDescriptor?.configurable) {
@@ -120,7 +123,6 @@ function createBoundAttachment(sessionId: string, attachmentIdRaw: string): Boun
 
 describe('createStopSession', () => {
   it('fails closed before signaling when attachment topology evidence is unreadable', async () => {
-    const { createStopSession } = await import('./stopSession');
     const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true as any);
     const stop = createStopSession({
       pidToTrackedSession: new Map<number, any>([[
@@ -563,6 +565,126 @@ describe('createStopSession', () => {
       'dispose-host',
       'cleanup-retired-artifacts',
     ]);
+  });
+
+  it('stops a borrowed provider without closing the user-owned terminal host', async () => {
+    const { createStopSession } = await import('./stopSession');
+    const attachmentId = 'attachment-borrowed-1' as NonNullable<import('@/integrations/terminalHost/_types').TerminalHostHandle['attachmentId']>;
+    const attachmentInfo = {
+      version: 3,
+      lifecycle: 'borrowed',
+      attachmentId,
+      sessionId: 'sess-borrowed',
+      handle: {
+        attachmentId,
+        kind: 'herdr',
+        sessionName: 'work',
+        paneId: 'workspace_1:pane_8',
+        terminalId: 'terminal_wrapper',
+        socketPath: '/tmp/herdr-work.sock',
+        attachMetadata: {
+          attachStrategy: 'terminal_host',
+          topology: 'shared',
+          locality: 'same_machine',
+          liveProbe: 'required',
+        },
+      },
+      terminal: {
+        mode: 'herdr',
+        herdr: {
+          sessionName: 'work',
+          paneId: 'workspace_1:pane_8',
+          terminalId: 'terminal_wrapper',
+          socketPath: '/tmp/herdr-work.sock',
+        },
+      },
+      updatedAt: 1,
+    } as const;
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true as never);
+    const removeAttachmentInfo = vi.fn(async () => true);
+    const retireExactTerminalControlServiceability = vi.fn(async () => 'retired' as const);
+    const onExactTerminalAttachmentRetired = vi.fn(async () => undefined);
+    const stop = createStopSession({
+      pidToTrackedSession: new Map([[555, {
+        startedBy: 'terminal',
+        pid: 555,
+        happySessionId: 'sess-borrowed',
+        processCommandHash: 'h-borrowed',
+        spawnOptions: { directory: '/workspace/project', terminal: { mode: 'herdr' } },
+      }]]),
+      readAttachmentInfo: vi.fn(async () => attachmentInfo),
+      removeAttachmentInfo,
+      waitForTrackedRunnersExit: vi.fn(async () => true),
+      retireExactTerminalControlServiceability,
+      onExactTerminalAttachmentRetired,
+    });
+
+    await expect(stop('sess-borrowed')).resolves.toEqual({ status: 'stopped' });
+    expect(killSpy).toHaveBeenCalledWith(555, 'SIGTERM');
+    expect(retireExactTerminalControlServiceability).toHaveBeenCalledWith(expect.objectContaining({
+      attachmentInfo,
+    }));
+    expect(removeAttachmentInfo).toHaveBeenCalledWith(expect.objectContaining({
+      expectedAttachmentId: attachmentId,
+      expectedTerminal: attachmentInfo.terminal,
+    }));
+    expect(onExactTerminalAttachmentRetired).toHaveBeenCalledWith(expect.objectContaining({ attachmentInfo }));
+  });
+
+  it('accepts a borrowed attachment already released by the exact runner after exit', async () => {
+    const { createStopSession } = await import('./stopSession');
+    const attachmentId = 'attachment-borrowed-self-released' as NonNullable<import('@/integrations/terminalHost/_types').TerminalHostHandle['attachmentId']>;
+    const attachmentInfo = {
+      version: 3,
+      lifecycle: 'borrowed',
+      attachmentId,
+      sessionId: 'sess-borrowed-self-released',
+      handle: {
+        attachmentId,
+        kind: 'herdr',
+        sessionName: 'work',
+        paneId: 'w1:p8',
+        terminalId: 'term_wrapper',
+        socketPath: '/tmp/herdr-work.sock',
+        attachMetadata: {
+          attachStrategy: 'terminal_host',
+          topology: 'shared',
+          locality: 'same_machine',
+          liveProbe: 'required',
+        },
+      },
+      terminal: {
+        mode: 'herdr',
+        herdr: {
+          sessionName: 'work',
+          paneId: 'w1:p8',
+          terminalId: 'term_wrapper',
+          socketPath: '/tmp/herdr-work.sock',
+        },
+      },
+      updatedAt: 1,
+    } as const;
+    const readAttachmentInfo = vi.fn()
+      .mockResolvedValueOnce(attachmentInfo)
+      .mockResolvedValue(null);
+    vi.spyOn(process, 'kill').mockImplementation(() => true as never);
+    const onExactTerminalAttachmentRetired = vi.fn(async () => undefined);
+    const stop = createStopSession({
+      pidToTrackedSession: new Map([[556, {
+        startedBy: 'terminal',
+        pid: 556,
+        happySessionId: 'sess-borrowed-self-released',
+        processCommandHash: 'h-borrowed-self-released',
+        spawnOptions: { directory: '/workspace/project', terminal: { mode: 'herdr' } },
+      }]]),
+      readAttachmentInfo,
+      waitForTrackedRunnersExit: vi.fn(async () => true),
+      retireExactTerminalControlServiceability: vi.fn(async () => 'retired' as const),
+      onExactTerminalAttachmentRetired,
+    });
+
+    await expect(stop('sess-borrowed-self-released')).resolves.toEqual({ status: 'stopped' });
+    expect(onExactTerminalAttachmentRetired).toHaveBeenCalledWith(expect.objectContaining({ attachmentInfo }));
   });
 
   it('force-terminates a verified runner that ignores SIGTERM before destroying its terminal attachment', async () => {
@@ -1362,6 +1484,23 @@ describe('createStopSession', () => {
     nowSpy.mockRestore();
   });
 
+  it('does not signal a Herdr-hosted runner without its committed exact-pane attachment', async () => {
+    const { createStopSession } = await import('./stopSession');
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true as any);
+    const stop = createStopSession({
+      pidToTrackedSession: new Map([[559, {
+        startedBy: 'daemon', pid: 559, happySessionId: 'sess-herdr-unbound',
+        spawnOptions: { terminal: { mode: 'herdr' } },
+      } as any]]),
+      readAttachmentInfo: vi.fn(async () => null),
+    });
+
+    await expect(stop('sess-herdr-unbound')).resolves.toEqual({
+      status: 'incomplete', reason: 'missing_attachment_identity',
+    });
+    expect(killSpy).not.toHaveBeenCalled();
+  });
+
   it('parks an isolated tmux host before a window target is recorded', async () => {
     const { createStopSession } = await import('./stopSession');
 
@@ -1494,6 +1633,7 @@ describe('createStopSession', () => {
       });
       expect(spawnSyncMock).toHaveBeenCalledWith('taskkill', ['/F', '/T', '/PID', '778'], expect.objectContaining({
         stdio: 'ignore',
+        windowsHide: true,
       }));
       expect(childKill).not.toHaveBeenCalled();
       expect(killSpy).not.toHaveBeenCalled();

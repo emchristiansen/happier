@@ -1,61 +1,55 @@
 import * as React from 'react';
 import { act } from 'react-test-renderer';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { renderScreen } from '@/dev/testkit';
+import type { CustomModalChromeConfig } from '@/modal/types';
+import { SessionReminderDateTimeModal } from './SessionReminderDateTimeModal';
 
-const chrome = vi.hoisted(() => ({ value: null as null | { footer?: React.ReactNode } }));
-type MockProps = React.Attributes & Record<string, unknown>;
-
-vi.mock('@/modal/components/card/useModalCardChrome', () => ({
-    useModalCardChrome: (_setChrome: unknown, value: { footer?: React.ReactNode }) => { chrome.value = value; },
-}));
-vi.mock('@/components/ui/buttons/RoundButton', () => ({ RoundButton: (props: MockProps) => React.createElement('RoundButton', props) }));
-vi.mock('@/components/ui/forms/Switch', () => ({ Switch: (props: MockProps) => React.createElement('Switch', props) }));
-vi.mock('@/components/ui/icons/Icon', () => ({ Icon: (props: MockProps) => React.createElement('Icon', props) }));
-vi.mock('@/components/ui/lists/Item', () => ({ Item: (props: MockProps) => React.createElement('Item', props) }));
-vi.mock('@/components/ui/text/Text', () => ({
-    Text: (props: MockProps) => React.createElement('Text', props),
-    TextInput: React.forwardRef<unknown, MockProps>((props, ref) => React.createElement('TextInput', { ...props, ref })),
-}));
-vi.mock('@/text', () => ({ t: (key: string) => key }));
-vi.mock('./SessionReminderPicker', () => ({
-    SessionReminderPicker: (props: MockProps) => React.createElement('SessionReminderPicker', props),
-}));
+vi.mock('@/components/ui/text/Text', async () => {
+    const { createUiTextModuleMock } = await import('@/dev/testkit/mocks/uiText');
+    return createUiTextModuleMock();
+});
+vi.mock('@/text', async () => {
+    const { createTextModuleMock } = await import('@/dev/testkit/mocks/text');
+    return createTextModuleMock({ translate: (key) => key });
+});
 
 describe('SessionReminderDateTimeModal', () => {
-    beforeEach(() => { chrome.value = null; });
-
-    it('reveals the semantic preview only after opt-in and labels the primary action precisely', async () => {
-        const { SessionReminderDateTimeModal } = await import('./SessionReminderDateTimeModal');
+    it('saves an optional preset only after opt-in, preserving the chosen local date and time', async () => {
+        const setChrome = vi.fn<(value: CustomModalChromeConfig | null) => void>();
+        const onResolve = vi.fn();
+        const onClose = vi.fn();
         const screen = await renderScreen(<SessionReminderDateTimeModal
-            nowMs={Date.UTC(2026, 8, 9, 12)}
-            onResolve={vi.fn()}
-            onClose={vi.fn()}
-            setChrome={vi.fn()}
+            nowMs={new Date(2026, 8, 30, 12).getTime()}
+            onResolve={onResolve} onClose={onClose} setChrome={setChrome}
         />);
 
-        expect(screen.findByType('Item').props.subtitle).toBeUndefined();
-        const footer = await renderScreen(<>{chrome.value?.footer}</>);
-        expect(footer.findAllByType('RoundButton').some((button) => button.props.title === 'sessionsList.reminders.setReminder')).toBe(true);
-
-        await act(async () => { screen.findByType('Item').props.onPress(); });
-        expect(screen.findByType('Item').props.subtitle).toBeTruthy();
+        await act(async () => screen.find((node) => typeof node.props.onValueChange === 'function').props.onValueChange(true));
+        const footer = await renderScreen(<>{setChrome.mock.lastCall?.[0]?.footer}</>);
+        const buttons = footer.findAll((node) => typeof node.type === 'string' && node.props.accessibilityRole === 'button');
+        await act(async () => buttons[1].props.onPress());
+        expect(onResolve).toHaveBeenCalledWith({
+            remindAt: new Date(2026, 9, 1, 9).getTime(),
+            preset: { rule: { kind: 'relative_day', daysAhead: 1, minuteOfDay: 540 } },
+        });
+        expect(onClose).toHaveBeenCalledOnce();
     });
 
-    it('opens the themed platform calendar and time pickers from the field icons', async () => {
-        const { SessionReminderDateTimeModal } = await import('./SessionReminderDateTimeModal');
+    it('rejects invalid manual dates and preserves cancellation', async () => {
+        const setChrome = vi.fn<(value: CustomModalChromeConfig | null) => void>();
+        const onResolve = vi.fn();
+        const onClose = vi.fn();
         const screen = await renderScreen(<SessionReminderDateTimeModal
-            nowMs={Date.UTC(2026, 8, 9, 12)}
-            onResolve={vi.fn()}
-            onClose={vi.fn()}
-            setChrome={vi.fn()}
+            nowMs={new Date(2026, 8, 30, 12).getTime()}
+            onResolve={onResolve} onClose={onClose} setChrome={setChrome}
         />);
-
-        await act(async () => { screen.findByTestId('session-reminder-date-picker-button')?.props.onPress(); });
-        expect(screen.findByType('SessionReminderPicker').props.mode).toBe('date');
-
-        await act(async () => { screen.findByTestId('session-reminder-time-picker-button')?.props.onPress(); });
-        expect(screen.findByType('SessionReminderPicker').props.mode).toBe('time');
+        await act(async () => screen.changeTextByTestId('session-reminder-date-input', '2026-02-30'));
+        const footer = await renderScreen(<>{setChrome.mock.lastCall?.[0]?.footer}</>);
+        const buttons = footer.findAll((node) => typeof node.type === 'string' && node.props.accessibilityRole === 'button');
+        expect(buttons[1].props.disabled).toBe(true);
+        await act(async () => buttons[0].props.onPress());
+        expect(onResolve).toHaveBeenCalledWith(null);
+        expect(onClose).toHaveBeenCalledOnce();
     });
 });

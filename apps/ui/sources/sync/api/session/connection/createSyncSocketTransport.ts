@@ -1,6 +1,7 @@
 import { io, type Socket } from 'socket.io-client';
 
 import type { ManagedConnectionTransport, TransportDisconnectEvent } from '@happier-dev/connection-supervisor';
+import { readComputerUiFocusState, subscribeToRuntimeActiveChange } from '@/utils/runtime/isRuntimeActive';
 import { applyUiClientUpgradeRequired } from '@/sync/runtime/clientCompatibility/uiClientUpgradeRequired';
 
 type SyncSocket = Socket;
@@ -52,7 +53,14 @@ export function createSyncSocketTransport(params: Readonly<{
     const errorListeners = new Set<(error: unknown) => void>();
     let intentionalDisconnect = false;
 
+    const publishUiFocus = () => {
+        // Do not buffer lifecycle events across disconnect: reconnect sends the current facts.
+        if (socket.connected === true) socket.emit('ui-focus', readComputerUiFocusState());
+    };
+    const stopUiFocus = subscribeToRuntimeActiveChange(publishUiFocus, { includeWindowFocus: true });
+
     socket.on('connect', () => {
+        publishUiFocus();
         connectedListeners.forEach((listener) => listener());
     });
 
@@ -98,6 +106,7 @@ export function createSyncSocketTransport(params: Readonly<{
             }
         },
         async destroy(): Promise<void> {
+            stopUiFocus();
             intentionalDisconnect = false;
             connectedListeners.clear();
             disconnectedListeners.clear();

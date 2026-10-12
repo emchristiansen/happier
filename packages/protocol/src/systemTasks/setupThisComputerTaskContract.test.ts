@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  createSetupCliChoicePromptData,
   createSetupPairingPromptData,
   createSetupServiceConsentPromptData,
+  parseSetupCliChoicePromptData,
   parseSetupPairingPromptData,
+  readSetupCliChoiceAnswer,
   parseSetupServiceConsentPromptData,
   SETUP_PAIRING_PROMPT_KIND,
   SETUP_SERVICE_CONSENT_PROMPT_KIND,
@@ -103,6 +106,7 @@ describe('setup.thisComputer.v1 prompt contract', () => {
       message: null,
       competingServices: ['happier-preview'],
       servicesToRemove: [],
+      runtimeReplacement: null,
     });
 
     expect(data.kind).toBe(SETUP_SERVICE_CONSENT_PROMPT_KIND);
@@ -111,8 +115,70 @@ describe('setup.thisComputer.v1 prompt contract', () => {
       message: null,
       competingServices: ['happier-preview'],
       servicesToRemove: [],
+      runtimeReplacement: null,
     });
     expect(parseSetupServiceConsentPromptData({ ...data, kind: SETUP_PAIRING_PROMPT_KIND })).toBeNull();
     expect(parseSetupServiceConsentPromptData({ ...data, competingServices: 'happier-preview' })?.competingServices).toEqual([]);
+  });
+
+  it('carries which CLI the service runs now and which one installing switches it to (K3)', () => {
+    const data = createSetupServiceConsentPromptData({
+      takeover: null,
+      message: 'The background service runs /usr/local/bin/happier.',
+      competingServices: [],
+      servicesToRemove: [],
+      runtimeReplacement: { current: '/usr/local/bin/happier', replacement: '/Users/me/.happier/bin/happier' },
+    });
+
+    expect(parseSetupServiceConsentPromptData(data)?.runtimeReplacement).toEqual({
+      current: '/usr/local/bin/happier',
+      replacement: '/Users/me/.happier/bin/happier',
+    });
+    // An older executor sends no replacement; a malformed one is not guessed at.
+    expect(parseSetupServiceConsentPromptData({ ...data, runtimeReplacement: undefined })?.runtimeReplacement).toBeNull();
+    expect(parseSetupServiceConsentPromptData({ ...data, runtimeReplacement: { current: '' } })?.runtimeReplacement).toBeNull();
+  });
+
+  it('names the CLI the one-CLI question is about, and reads only a stated answer (R12)', () => {
+    const data = createSetupCliChoicePromptData({
+      command: '/usr/local/bin/happier',
+      version: '0.2.13',
+      origin: 'npm',
+      removalCommand: 'npm uninstall -g @happier-dev/cli',
+      updateCommand: 'npm install -g @happier-dev/cli@latest',
+      belowSetupFloor: false,
+      missing: false,
+      keepBlockedBy: null,
+    });
+
+    expect(parseSetupCliChoicePromptData(data)).toEqual({
+      command: '/usr/local/bin/happier',
+      version: '0.2.13',
+      origin: 'npm',
+      removalCommand: 'npm uninstall -g @happier-dev/cli',
+      updateCommand: 'npm install -g @happier-dev/cli@latest',
+      belowSetupFloor: false,
+      missing: false,
+      keepBlockedBy: null,
+    });
+    // R13 (b): a kept CLI that disappeared is asked about by the path it was at.
+    expect(parseSetupCliChoicePromptData(createSetupCliChoicePromptData({
+      command: '/usr/local/bin/happier',
+      version: null,
+      origin: 'unknown',
+      removalCommand: null,
+      updateCommand: null,
+      belowSetupFloor: true,
+      missing: true,
+      keepBlockedBy: '/home/me/.local/bin/happier',
+    }))).toMatchObject({ command: '/usr/local/bin/happier', version: null, missing: true, keepBlockedBy: '/home/me/.local/bin/happier' });
+    expect(parseSetupCliChoicePromptData({ ...data, origin: 'pip' })?.origin).toBe('unknown');
+    expect(parseSetupCliChoicePromptData({ ...data, command: '' })).toBeNull();
+
+    expect(readSetupCliChoiceAnswer({ choice: 'managed' })).toBe('managed');
+    expect(readSetupCliChoiceAnswer({ choice: 'own' })).toBe('own');
+    // A dismissed question is no answer, never "keep".
+    expect(readSetupCliChoiceAnswer({ approved: false })).toBeNull();
+    expect(readSetupCliChoiceAnswer(null)).toBeNull();
   });
 });

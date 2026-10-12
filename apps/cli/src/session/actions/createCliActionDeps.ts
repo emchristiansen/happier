@@ -5,6 +5,7 @@ import {
   buildBackendTargetKey,
   getActionSpec,
   listNativeReviewEngines,
+  normalizeSessionMetadataForRead,
   SESSION_USAGE_LIMIT_RECOVERY_METADATA_KEY,
   SessionUsageLimitRecoveryV1Schema,
   buildStructuredQuestionAnswerPayload,
@@ -223,7 +224,7 @@ function readSessionMetadata(params: Readonly<{
 }>): Record<string, unknown> | null {
   const raw = params.rawSession?.metadata;
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-    return raw as Record<string, unknown>;
+    return normalizeSessionMetadataForRead(raw as Record<string, unknown>);
   }
   if (typeof raw !== 'string' || raw.trim().length === 0 || !params.mode) {
     return null;
@@ -236,7 +237,7 @@ function readSessionMetadata(params: Readonly<{
       value: raw,
     });
     return decrypted && typeof decrypted === 'object' && !Array.isArray(decrypted)
-      ? decrypted as Record<string, unknown>
+      ? normalizeSessionMetadataForRead(decrypted as Record<string, unknown>)
       : null;
   } catch {
     return null;
@@ -1601,7 +1602,7 @@ export function createCliActionDeps(params: Readonly<{
     },
     ...(approvalsStore ?? {}),
     ...inventoryDeps,
-    sessionSendMessage: async ({ sessionId, message, requestedAction, wait, timeoutSeconds, permissionModeOverride, modelOverride, callerSurface, callerPermissionMode }) => {
+    sessionSendMessage: async ({ sessionId, message, localId, requestedAction, wait, timeoutSeconds, permissionModeOverride, modelOverride, callerSurface, callerPermissionMode }) => {
       if (!params.credentials) {
         return { ok: false, errorCode: 'not_authenticated', error: 'not_authenticated' };
       }
@@ -1623,6 +1624,7 @@ export function createCliActionDeps(params: Readonly<{
         credentials: params.credentials,
         idOrPrefix: sessionId,
         message: String(message ?? ''),
+        ...(localId ? { localId } : {}),
         requestedAction,
         wait: normalizedWait,
         timeoutMs: normalizedTimeoutSeconds * 1000,

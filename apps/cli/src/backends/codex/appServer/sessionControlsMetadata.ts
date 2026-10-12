@@ -4,6 +4,7 @@ import {
     SESSION_MODES_STATE_KEY,
 } from '@happier-dev/agents';
 import type { Metadata } from '@/api/types';
+import { logger } from '@/ui/logger';
 import {
     normalizeContextWindowTokens,
     readContextWindowTokensFromModelRecord,
@@ -47,6 +48,7 @@ export type CodexAppServerSessionControlsSnapshot = Readonly<{
     availableModes: SessionControlOption[];
     currentModeId: string | null;
     availableModels: SessionModelOption[];
+    modelsObserved: boolean;
     currentModelId: string | null;
     configOptions: SessionConfigOption[];
 }>;
@@ -100,7 +102,7 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     return value as Record<string, unknown>;
 }
 
-function readListEntries(value: unknown): unknown[] {
+function readListEntries(value: unknown): unknown[] | null {
     // Codex app-server responses are usually list-like objects with `data`/`items`, but some
     // call sites may accidentally pass the JSON-RPC envelope (result wrapper). Be liberal in
     // what we accept so model-scoped options aren't dropped on cold start.
@@ -108,13 +110,13 @@ function readListEntries(value: unknown): unknown[] {
     for (let depth = 0; depth < 3; depth += 1) {
         if (Array.isArray(current)) return current;
         const record = asRecord(current);
-        if (!record) return [];
+        if (!record) return null;
         if (Array.isArray(record.items)) return record.items;
         if (Array.isArray(record.data)) return record.data;
-        if (record.result === undefined) return [];
+        if (record.result === undefined) return null;
         current = record.result;
     }
-    return [];
+    return null;
 }
 
 function normalizeReasoningEffortLabel(value: string): string {
@@ -229,7 +231,7 @@ function normalizeSessionModelMasks(params: Readonly<{
     currentServiceTier?: string | null;
 }>): ModelMask[] {
     const out: ModelMask[] = [];
-    for (const entry of readListEntries(params.value)) {
+    for (const entry of readListEntries(params.value) ?? []) {
         const record = asRecord(entry);
         if (!record) continue;
         const id = normalizeString(record.id) ?? normalizeString(record.slug);
@@ -271,7 +273,7 @@ function normalizeSessionModelMasks(params: Readonly<{
 
 function normalizeCollaborationModeMasks(value: unknown): CollaborationModeMask[] {
     const out: CollaborationModeMask[] = [];
-    for (const entry of readListEntries(value)) {
+    for (const entry of readListEntries(value) ?? []) {
         const record = asRecord(entry);
         if (!record) continue;
         const id = normalizeString(record.id) ?? normalizeString(record.slug) ?? normalizeString(record.mode);
@@ -297,7 +299,7 @@ function resolveCurrentId(
     options: readonly SessionControlOption[],
     params?: Readonly<{ fallbackToFirst?: boolean }>,
 ): string | null {
-    for (const entry of readListEntries(value)) {
+    for (const entry of readListEntries(value) ?? []) {
         const record = asRecord(entry);
         if (!record) continue;
         const id = normalizeString(record.id) ?? normalizeString(record.slug);
@@ -439,11 +441,14 @@ export async function readCodexAppServerSessionControls(params: Readonly<{
     const currentModelId = availableModels.some((entry) => entry.id === params.currentModelId)
         ? params.currentModelId ?? null
         : resolveCurrentId(modelsResponse, availableModels, { fallbackToFirst: true });
+    const modelEntries = readListEntries(modelsResponse);
+    const modelsObserved = modelEntries !== null && (modelEntries.length === 0 || availableModels.length > 0);
 
     return {
         availableModes,
         currentModeId,
         availableModels,
+        modelsObserved,
         currentModelId,
         configOptions: [],
     };
@@ -470,6 +475,7 @@ export async function publishCodexAppServerSessionControlsMetadata(params: Reado
         availableModes,
         currentModeId,
         availableModels,
+        modelsObserved,
         currentModelId,
         configOptions,
     } = await readCodexAppServerSessionControls({
@@ -482,6 +488,9 @@ export async function publishCodexAppServerSessionControlsMetadata(params: Reado
     });
 
     if (params.shouldPublish?.() === false) return;
+    if (!modelsObserved) {
+        logger.infoFile('[CodexAppServer] Model discovery failed; retaining the previous model catalog');
+    }
 
     await Promise.resolve(params.session.updateMetadata((metadata) => ({
         ...metadata,
@@ -509,15 +518,9 @@ export async function publishCodexAppServerSessionControlsMetadata(params: Reado
         })(),
         [SESSION_MODELS_STATE_KEY]: (() => {
             const existing = (metadata as Record<string, unknown>)[SESSION_MODELS_STATE_KEY];
-            if (!(availableModels.length > 0)) {
+            if (!modelsObserved) {
                 if (hasGenericSessionModelsState(existing, provider)) return existing;
-                return {
-                    v: 1,
-                    provider,
-                    updatedAt,
-                    currentModelId: normalizeString(params.currentModelId) ?? 'default',
-                    availableModels: [],
-                };
+                return undefined;
             }
             return {
                 v: 1,
@@ -529,7 +532,7 @@ export async function publishCodexAppServerSessionControlsMetadata(params: Reado
         })(),
         [SESSION_CONFIG_OPTIONS_STATE_KEY]: (() => {
             const existing = (metadata as Record<string, unknown>)[SESSION_CONFIG_OPTIONS_STATE_KEY];
-            if (!(availableModels.length > 0)) {
+            if (!modelsObserved) {
                 if (hasGenericSessionConfigOptionsState(existing, provider)) return existing;
                 return {
                     v: 1,
@@ -561,10 +564,6 @@ export async function publishCodexAppServerRuntimeModelContextWindowMetadata(par
     if (!currentModelId || contextWindowTokens === undefined) {
         return;
     }
-
-    const updatedAt = typeof params.updatedAt === 'number' && Number.isFinite(params.updatedAt)
-        ? Math.trunc(params.updatedAt)
-        : Date.now();
 
     await Promise.resolve(params.session.updateMetadata((metadata) => {
         const existing = (metadata as Record<string, unknown>)[SESSION_MODELS_STATE_KEY];
@@ -606,7 +605,8 @@ export async function publishCodexAppServerRuntimeModelContextWindowMetadata(par
             [SESSION_MODELS_STATE_KEY]: {
                 v: 1,
                 provider,
-                updatedAt: existingState ? Math.max(existingState.updatedAt, updatedAt) : updatedAt,
+                // Current-model telemetry is not a new model-list observation.
+                updatedAt: existingState?.updatedAt ?? 0,
                 currentModelId: nextCurrentModelId,
                 availableModels: nextAvailableModels,
             },

@@ -65,6 +65,7 @@ export async function exportOpenCodeSessionBundle(params: Readonly<{
     providerId: 'opencode',
     remoteSessionId: params.remoteSessionId,
     exportJsonBase64: Buffer.from(result.stdout, 'utf8').toString('base64'),
-    affinity,
+    // Managed pool identity is machine-local. Handoff selects the destination's server.
+    affinity: { backendMode: affinity.backendMode, serverBaseUrl: affinity.serverBaseUrl, serverBaseUrlExplicit: affinity.serverBaseUrlExplicit },
   };
 }

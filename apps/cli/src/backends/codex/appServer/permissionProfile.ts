@@ -1,4 +1,5 @@
 import type { PermissionMode } from '@/api/types';
+import { normalizePermissionModeToIntent } from '@/agent/runtime/permission/permissionModeCanonical';
 
 import { resolveCodexAppServerPolicyForPermissionMode } from '../utils/permissionModePolicy';
 
@@ -16,15 +17,13 @@ export type CodexAppServerLegacyPermissionTarget = 'thread' | 'turn';
 export function resolveCodexAppServerPermissionProfileId(
     permissionMode: PermissionMode,
 ): CodexAppServerPermissionProfileId | null {
-    switch (permissionMode) {
+    switch (normalizePermissionModeToIntent(permissionMode)) {
         case 'read-only':
             return ':read-only';
         case 'safe-yolo':
-        case 'acceptEdits':
         case 'plan':
             return ':workspace';
         case 'yolo':
-        case 'bypassPermissions':
             return ':danger-no-sandbox';
         case 'default':
         default:
@@ -43,11 +42,13 @@ export function buildCodexAppServerLegacyPermissionParams(params: Readonly<{
     permissionMode: PermissionMode;
     directory: string;
     target: CodexAppServerLegacyPermissionTarget;
+    managedScalarFallback?: boolean;
 }>): Record<string, unknown> {
     if (params.permissionMode === 'default') return {};
 
     const policy = resolveCodexAppServerPolicyForPermissionMode(params.permissionMode, {
         directory: params.directory,
+        managedScalarFallback: params.managedScalarFallback,
     });
 
     return {

@@ -505,6 +505,18 @@ export const NotificationsSettingsView = React.memo(function NotificationsSettin
                     showChevron={false}
                 />
                 <Item
+                    testID="settings-notifications-mute-phone-focused-computer"
+                    title={t('settingsNotifications.mutePhoneWhenComputerFocusedTitle')}
+                    subtitle={t('settingsNotifications.mutePhoneWhenComputerFocusedSubtitle')}
+                    disabled={!pushEnabled}
+                    rightElement={<Switch
+                        value={notifications.mutePhoneWhenComputerFocused === true}
+                        disabled={!pushEnabled}
+                        onValueChange={(value) => setNotifications({ mutePhoneWhenComputerFocused: Boolean(value) })}
+                    />}
+                    showChevron={false}
+                />
+                <Item
                     testID="settings-notifications-push-troubleshoot"
                     title={t('settingsNotifications.push.troubleshootTitle')}
                     subtitle={t('settingsNotifications.push.troubleshootSubtitle')}

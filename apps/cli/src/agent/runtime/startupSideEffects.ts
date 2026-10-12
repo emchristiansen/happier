@@ -3,7 +3,7 @@ import type { Metadata } from '@/api/types';
 import { configuration } from '@/configuration';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
 import { writeTerminalAttachmentInfo } from '@/terminal/attachment/terminalAttachmentInfo';
-import { buildTerminalHostHandleFromAttachmentMetadata } from '@/agent/runtime/terminal/attachmentMetadata';
+import { buildTerminalHostHandleFromAttachmentMetadata, resolveInheritedTerminalHostLifecycle } from '@/agent/runtime/terminal/attachmentMetadata';
 import type { TerminalAttachmentId, TerminalHostHandle } from '@/integrations/terminalHost/_types';
 import { buildTerminalFallbackMessage } from '@/terminal/attachment/terminalFallbackMessage';
 import { logger } from '@/ui/logger';
@@ -95,6 +95,7 @@ export function resolveTerminalAttachmentPersistenceBinding(
 export async function persistTerminalAttachmentInfoIfNeeded(opts: {
     sessionId: string;
     terminal: Metadata['terminal'] | undefined;
+    startedBy?: Metadata['startedBy'];
 }): Promise<void> {
     if (!opts.terminal) return;
     const binding = resolveTerminalAttachmentPersistenceBinding(opts.terminal);
@@ -104,6 +105,9 @@ export async function persistTerminalAttachmentInfoIfNeeded(opts: {
             sessionId: opts.sessionId,
             terminal: opts.terminal,
             ...(binding ?? {}),
+            ...(binding && opts.startedBy
+                ? { lifecycle: resolveInheritedTerminalHostLifecycle(opts) ?? 'owned' }
+                : {}),
         });
     } catch (error) {
         logger.debug('[START] Failed to persist terminal attachment info', error);

@@ -16,7 +16,6 @@ import { SessionListViewItem, storage, useSetting } from '@/sync/domains/state/s
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useVisibleSessionListViewData } from '@/hooks/session/useVisibleSessionListViewData';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
-import { UpdateBanner } from '@/components/ui/feedback/UpdateBanner';
 import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 import { RecoveryKeyReminderBanner } from '@/components/account/RecoveryKeyReminderBanner';
 import { layout } from '@/components/ui/layout/layout';
@@ -566,7 +565,6 @@ const SessionsListHeader = React.memo(function SessionsListHeader(props: Readonl
     return (
         <View>
             <RecoveryKeyReminderBanner />
-            <UpdateBanner />
             {props.children}
         </View>
     );

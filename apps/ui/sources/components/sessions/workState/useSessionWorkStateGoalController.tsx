@@ -1,9 +1,10 @@
 import * as React from 'react';
-import { ActivityIndicator, View } from 'react-native';
+import { View } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import { Modal } from '@/modal';
 import { Text } from '@/components/ui/text/Text';
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 import { t } from '@/text';
 import { resolveSessionGoalFailurePresentation } from '@/sync/ops/sessionGoalOperationFailure';
 
@@ -283,7 +284,7 @@ export function useSessionWorkStateGoalController(params: Readonly<{
         >
             {pending ? (
                 <View testID="session-goal-pending" style={styles.statusRow}>
-                    <ActivityIndicator size="small" color={theme.colors.text.secondary} />
+                    <ActivitySpinner size="small" color={theme.colors.text.secondary} />
                     <Text style={[styles.pendingText, { color: theme.colors.text.secondary }]}>
                         {t('session.workState.goal.pending')}
                     </Text>

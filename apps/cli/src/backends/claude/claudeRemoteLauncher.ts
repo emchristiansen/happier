@@ -115,7 +115,7 @@ import { isClaudeExplicitDiffToolInput } from './utils/isClaudeExplicitDiffToolI
 import {
     buildClaudeSessionModelsMetadataFromSupportedModels,
 } from './remote/buildClaudeSessionModelsMetadataFromSupportedModels';
-import { applyClaudeEffectiveModelUpdate } from './sessionModels/effectiveModelUpdate';
+import { applyClaudeEffectiveModelUpdate, type ClaudeEffectiveModelObservation } from './sessionModels/effectiveModelUpdate';
 import {
     createStreamedTranscriptWriter,
     type StreamedTranscriptWriter,
@@ -862,6 +862,7 @@ export async function claudeRemoteLauncher(
         if (effectiveModelId) {
             applyClaudeEffectiveModelUpdate({
                 client: session.client,
+                reconcileModels: session.reconcileSessionModels,
                 modelId: effectiveModelId,
                 source: 'sdk',
                 logPrefix: '[remote]',
@@ -1270,12 +1271,15 @@ export async function claudeRemoteLauncher(
                 ? null
                 : { unavailableUntilMs };
         };
-        const surfaceRemoteRateLimitRuntimeIssue = async (details: NormalizedProviderUsageLimitDetailsV1): Promise<void> => {
+        const surfaceRemoteRateLimitRuntimeIssue = async (
+            details: NormalizedProviderUsageLimitDetailsV1,
+            observedWindows?: readonly NormalizedProviderUsageLimitDetailsV1[],
+        ): Promise<void> => {
             recordPrimaryProviderUnavailableForPromptDelivery(details);
-            await surfaceClaudeRateLimitRuntimeIssue(session, details, '[remote]');
+            await surfaceClaudeRateLimitRuntimeIssue(session, details, '[remote]', { observedWindows });
         };
-        const recordRemoteQuotaEvidence = async (details: NormalizedProviderUsageLimitDetailsV1): Promise<void> => {
-            await recordClaudeRateLimitQuotaEvidence(session, details, '[remote]');
+        const recordRemoteQuotaEvidence = async (windows: readonly NormalizedProviderUsageLimitDetailsV1[]): Promise<void> => {
+            await recordClaudeRateLimitQuotaEvidence(session, windows, '[remote]');
         };
         // Initial goal (P1-E4): consumed once from the daemon-provided env so the FIRST unified
         // launch injects `/goal <objective>`; a park/respawn relaunch must not re-inject it.
@@ -1447,6 +1451,7 @@ export async function claudeRemoteLauncher(
                         userMessageLocalIds: batch.userMessageLocalIds,
                         providerAcceptancePending: batch.providerAcceptancePending,
                         pendingProviderAction: batch.pendingProviderAction,
+                        pendingRequestedAction: batch.pendingRequestedAction,
                     });
 
                 const resolveQueuedPromptForProvider = async (
@@ -1703,6 +1708,7 @@ export async function claudeRemoteLauncher(
                             (metadata) => {
                                 const modelsMetadata = buildClaudeSessionModelsMetadataFromSupportedModels({
                                     modelsRaw: caps.models,
+                                    reconcileModels: session.reconcileSessionModels,
                                     metadata,
                                 });
                                 return {
@@ -1719,6 +1725,10 @@ export async function claudeRemoteLauncher(
                     onThinkingChange: session.onThinkingChange,
                     claudeArgs: session.claudeArgs,
                     onMessage,
+                    onEffectiveModel: (facts: ClaudeEffectiveModelObservation) => applyClaudeEffectiveModelUpdate({
+                        client: session.client, reconcileModels: session.reconcileSessionModels,
+                        ...facts, source: 'sdk', logPrefix: '[remote]',
+                    }),
                     isWorkflowProviderTaskId: (taskId: string) => (
                         workflowActivitySource?.isWorkflowOwnedProviderTaskId(taskId) === true
                     ),
@@ -1738,11 +1748,11 @@ export async function claudeRemoteLauncher(
                         workflowActivitySource?.observeTranscriptMessage(value, observation);
                     },
                     onWorkStateSnapshot: publishWorkStateSnapshot,
-                    onRateLimitEvent: async (details: NormalizedProviderUsageLimitDetailsV1) => {
-                        await surfaceRemoteRateLimitRuntimeIssue(details);
+                    onRateLimitEvent: async (details: NormalizedProviderUsageLimitDetailsV1, observedWindows: readonly NormalizedProviderUsageLimitDetailsV1[]) => {
+                        await surfaceRemoteRateLimitRuntimeIssue(details, observedWindows);
                     },
-                    onQuotaEvidence: async (details: NormalizedProviderUsageLimitDetailsV1) => {
-                        await recordRemoteQuotaEvidence(details);
+                    onQuotaEvidence: async (windows: readonly NormalizedProviderUsageLimitDetailsV1[]) => {
+                        await recordRemoteQuotaEvidence(windows);
                     },
                     // Unified terminal usage-limit evidence is detected by the hook lifecycle
                     // bridge and surfaced through onUsageLimitDetails (the legacy/agent-SDK
@@ -1984,6 +1994,7 @@ export async function claudeRemoteLauncher(
                         };
                         const sharedTerminalCallbacks = createClaudeUnifiedTerminalSharedCallbacks({
                             sessionClient: session.client,
+                            reconcileModels: session.reconcileSessionModels,
                             observeInFlightSteerAvailabilitySnapshot,
                             sustainedPendingDeliveryBlockHandler,
                             dialogChoiceBroker,

@@ -1,106 +1,43 @@
-import { join } from 'node:path';
+import { readCachedCliUpdateState } from '@happier-dev/cli-common/update';
+import type { PublicReleaseRingId, PublicReleaseRingLabel } from '@happier-dev/release-runtime/releaseRings';
 
-import packageJson from '../../../package.json';
-import {
-  readNpmDistTagVersion,
-  readUpdateCache,
-  resolveNpmPackageNameOverride,
-  writeUpdateCache,
-} from '@happier-dev/cli-common/update';
-import type { PublicReleaseRingLabel } from '@happier-dev/release-runtime/releaseRings';
-
+import { maybeRefreshCliUpdateCacheInBackground } from '@/cli/runtime/update/autoUpdateNotice';
 import { configuration } from '@/configuration';
+import { projectPath } from '@/projectPath';
 
-import { semverLessThan } from './_shared';
-import { withTimeout } from './_updateCheck';
 import type { CliSelfUpdateAvailable, RepairFinding } from './types';
 
 /**
- * Detect whether a newer CLI is published on the user's release channel.
- *
- * Mechanism:
- *  - `@happier-dev/cli` is distributed via npm, so the canonical "latest for
- *    channel" source is the npm dist-tag (`latest` for stable, `next`
- *    otherwise). This matches what `happier self check` / `happier self update`
- *    use.
- *  - Result is cached in the SAME `~/.happier/cache/update{.channel}.json`
- *    file used by the background auto-update notice — no parallel cache.
- *  - During `doctor repair` we prefer a live refresh (`forceRefresh: true`)
- *    so the user sees the current state, not a stale hint. The network call
- *    is bounded by a short timeout and falls back to the cache on failure.
+ * Whether a newer CLI is published on the user's release channel, as the one update-check owner
+ * cached it (plan R13 S-1): `happier self check` writes the ring's cache — from the acquisition
+ * owner's release lookup for binary installs, npm for npm installs — and this reads it through the
+ * same ring-filtered reader as the terminal notice and the daemon's update facts. Doctor never
+ * writes the cache and never makes the network call itself; when the cache is stale (always, for a
+ * `forceRefresh` run) it starts the existing background check, whose answer the next run shows.
  */
-const DEFAULT_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6h
-const DEFAULT_FETCH_TIMEOUT_MS = 2_500;
-
-function cliUpdateCacheFilePath(channel: PublicReleaseRingLabel): string {
-  const fileName = channel === 'stable' ? 'update.json' : `update.${channel}.json`;
-  return join(configuration.happyHomeDir, 'cache', fileName);
-}
-
-function cliNpmDistTag(channel: PublicReleaseRingLabel): 'latest' | 'next' {
-  return channel === 'stable' ? 'latest' : 'next';
-}
-
-function cliUpdatePackageName(): string {
-  return resolveNpmPackageNameOverride({
-    envValue: process.env.HAPPIER_CLI_UPDATE_PACKAGE_NAME,
-    fallback: String((packageJson as { name?: unknown }).name ?? '').trim(),
-  });
-}
-
-async function readLatestCliVersion(
-  channel: PublicReleaseRingLabel,
-  opts: Readonly<{ forceRefresh?: boolean; maxAgeMs?: number; fetchTimeoutMs?: number }>,
-): Promise<string | null> {
-  const maxAge = opts.maxAgeMs ?? DEFAULT_CACHE_TTL_MS;
-  const cachePath = cliUpdateCacheFilePath(channel);
-  const cache = readUpdateCache(cachePath);
-  const checkedAt = cache?.checkedAt ?? 0;
-  const cached = cache?.latest ?? null;
-
-  const cacheFresh = cached !== null && checkedAt > 0 && Date.now() - checkedAt < maxAge;
-  if (cacheFresh && !opts.forceRefresh) return cached;
-
-  const pkgName = cliUpdatePackageName();
-  if (!pkgName) return cached;
-  const distTag = cliNpmDistTag(channel);
-
-  const latest = await withTimeout(
-    Promise.resolve().then(() => readNpmDistTagVersion({
-      packageName: pkgName,
-      distTag,
-      cwd: process.cwd(),
-      env: process.env,
-    })),
-    opts.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS,
-  );
-
-  if (latest) {
-    writeUpdateCache(cachePath, {
-      checkedAt: Date.now(),
-      latest,
-      current: cache?.current ?? null,
-      runtimeVersion: cache?.runtimeVersion ?? null,
-      invokerVersion: cache?.invokerVersion ?? null,
-      updateAvailable: true,
-      notifiedAt: cache?.notifiedAt ?? null,
-    });
-    return latest;
-  }
-  return cached;
-}
-
 export async function classifyCurrentCli(params: Readonly<{
   currentCliReleaseChannel: PublicReleaseRingLabel;
+  currentCliRingId: PublicReleaseRingId;
   currentCliVersion: string;
   forceRefresh?: boolean;
   onMigration?: boolean;
+  homeDir?: string;
 }>): Promise<readonly RepairFinding[]> {
-  const latest = await readLatestCliVersion(params.currentCliReleaseChannel, {
-    forceRefresh: params.forceRefresh,
+  const homeDir = params.homeDir ?? configuration.happyHomeDir;
+  maybeRefreshCliUpdateCacheInBackground({
+    homeDir,
+    cliRootDir: projectPath(),
+    env: process.env,
+    publicReleaseRing: params.currentCliRingId,
+    ...(params.forceRefresh ? { checkIntervalMs: 0 } : {}),
   });
-  if (!latest || !params.currentCliVersion) return [];
-  if (!semverLessThan(params.currentCliVersion, latest)) return [];
+  if (!params.currentCliVersion) return [];
+  const state = readCachedCliUpdateState({
+    homeDir,
+    publicReleaseRing: params.currentCliRingId,
+    currentVersion: params.currentCliVersion,
+  });
+  if (!state?.updateAvailable || !state.latestVersion) return [];
 
   const finding: CliSelfUpdateAvailable = {
     kind: 'cli_self_update_available',
@@ -109,7 +46,7 @@ export async function classifyCurrentCli(params: Readonly<{
     autoApplyWithoutPrompt: false,
     releaseChannel: params.currentCliReleaseChannel,
     currentVersion: params.currentCliVersion,
-    latestVersion: latest,
+    latestVersion: state.latestVersion,
   };
   return [finding];
 }

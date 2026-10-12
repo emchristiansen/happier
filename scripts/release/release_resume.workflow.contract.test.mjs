@@ -27,6 +27,7 @@ test('one trusted reusable workflow resolves prior release candidates by exact r
     'source_sha',
     'desktop_run_number',
     'desktop_artifacts',
+    'desktop_finalized_artifacts',
     'cli_version',
     'stack_version',
     'server_version',
@@ -42,6 +43,10 @@ test('one trusted reusable workflow resolves prior release candidates by exact r
     'docker_requested',
     'npm_requested',
     'deploy_ui_complete',
+    'ui_ota_complete',
+    'ui_native_ios_complete',
+    'ui_native_android_complete',
+    'ui_apk_complete',
     'deploy_server_complete',
     'deploy_website_complete',
     'deploy_docs_complete',
@@ -60,6 +65,43 @@ test('one trusted reusable workflow resolves prior release candidates by exact r
   assert.match(source, /--artifact-id "\$STATUS_ARTIFACT_ID"/);
   assert.match(source, /--artifact-digest "\$EXPECTED_DIGEST"/);
   assert.match(source, /resolve-release-resume\.mjs[\s\S]*--mode resolve/);
+  assert.equal((source.match(/\/jobs\?filter=latest&per_page=100/g) ?? []).length, 1, 'one canonical origin retrieval owns nested completion evidence');
+  assert.match(source, /--jobs-json "\$RUNNER_TEMP\/resume-jobs.json"/);
+
+  const ui = workflow('promote-ui.yml');
+  const mobile = workflow('build-ui-mobile-local.yml');
+  for (const input of ['ui_ota_complete', 'ui_native_ios_complete', 'ui_native_android_complete', 'ui_apk_complete']) {
+    assert.equal(ui.on.workflow_call.inputs[input]?.type, 'boolean');
+    assert.equal(ui.on.workflow_call.inputs[input]?.default, false);
+  }
+  const evaluate = (expression, inputs) => Function('inputs', 'needs', `return ${expression.replace(/^\$\{\{\s*|\s*\}\}$/g, '')};`)(
+    inputs, { promote: { result: 'success' } },
+  );
+  const fresh = { expo_action: 'full', ui_ota_complete: false, ui_native_ios_complete: false, ui_native_android_complete: false, ui_apk_complete: false };
+  const complete = { ...fresh, ui_ota_complete: true, ui_native_ios_complete: true, ui_native_android_complete: true, ui_apk_complete: true };
+  assert.equal(evaluate(ui.jobs.mobile_native.if, fresh), true);
+  assert.equal(evaluate(ui.jobs.mobile_native.if, complete), false);
+  assert.equal(evaluate(ui.jobs.mobile_apk_release.if, fresh), true);
+  assert.equal(evaluate(ui.jobs.mobile_apk_release.if, complete), false);
+  assert.equal(evaluate(ui.jobs.mobile_native.with.platform, fresh), 'all');
+  assert.equal(evaluate(ui.jobs.mobile_native.with.platform, { ...fresh, ui_native_ios_complete: true }), 'android');
+  assert.equal(evaluate(ui.jobs.mobile_native.with.platform, { ...fresh, ui_native_android_complete: true }), 'ios');
+  assert.equal(ui.jobs.mobile_native.name, 'Mobile native (local runner)');
+  assert.equal(ui.jobs.mobile_apk_release.name, 'Mobile APK release (local runner)');
+  assert.equal(mobile.jobs.build_ios.name, 'Build (ios)');
+  assert.equal(mobile.jobs.build_android.name, 'Build (android)');
+  assert.equal(mobile.jobs.publish_android_apk.name, 'Sign and publish Android APK');
+  for (const [job, names] of [
+    [ui.jobs.validate_candidate, ['Prepare Android OTA artifact without credentials', 'Prepare iOS OTA artifact without credentials', 'Upload prepared OTA artifacts']],
+    [ui.jobs.promote, ['Enable Corepack', 'Install trusted OTA publisher dependencies', 'Download prepared OTA artifacts', 'Publish Android OTA from validated bytes', 'Publish iOS OTA from validated bytes']],
+  ]) {
+    for (const name of names) {
+      const steps = job.steps.filter((step) => step.name === name);
+      assert.equal(steps.length, 1);
+      assert.equal(evaluate(steps[0].if, fresh), true);
+      assert.equal(evaluate(steps[0].if, complete), false, 'satisfied OTA does not export or republish');
+    }
+  }
 });
 
 for (const [name, buildJobs] of [
@@ -174,6 +216,21 @@ test('full release resume binds the prior run to the same operation and authoriz
   assert.match(String(parsed.jobs.deploy_plan.outputs.deploy_ui_resume_complete), /needs\.resolve_resume\.outputs\.deploy_ui_expo_action == inputs\.ui_expo_action/);
   assert.match(String(parsed.jobs.deploy_plan.outputs.deploy_ui_resume_complete), /needs\.resolve_resume\.outputs\.deploy_ui_desktop_mode == inputs\.desktop_mode/);
   assert.match(String(parsed.jobs.deploy_ui.with.desktop_mode), /needs\.deploy_plan\.outputs\.deploy_ui_desktop_mode/);
+  const uiPromotion = workflow('promote-ui.yml');
+  for (const [input, output] of [
+    ['resume_desktop_artifacts', 'desktop_artifacts'],
+    ['resume_desktop_finalized_artifacts', 'desktop_finalized_artifacts'],
+    ['resume_desktop_run_number', 'desktop_run_number'],
+    ['resume_source_sha', 'source_sha'],
+  ]) {
+    assert.equal(parsed.jobs.deploy_ui.with[input], `\${{ needs.resolve_resume.outputs.${output} }}`);
+    assert.equal(uiPromotion.on.workflow_call.inputs[input]?.type, 'string');
+    assert.equal(uiPromotion.jobs.desktop.with[input], `\${{ inputs.${input} }}`);
+  }
+  for (const output of ['ui_ota_complete', 'ui_native_ios_complete', 'ui_native_android_complete', 'ui_apk_complete']) {
+    assert.match(String(parsed.jobs.deploy_ui.with[output]), new RegExp(`needs\\.resolve_resume\\.outputs\\.${output} == 'true'`));
+    assert.match(String(parsed.jobs.deploy_ui.with[output]), /needs\.resolve_resume\.outputs\.deploy_ui_expo_action == inputs\.ui_expo_action/);
+  }
   assert.match(String(statusProjection.env.REQUEST_DEPLOY_UI), /needs\.resolve_resume\.outputs\.deploy_ui_requested == 'true'/);
   assert.match(String(statusProjection.env.REQUEST_DEPLOY_UI), /needs\.deploy_plan\.outputs\.deploy_ui_requested == 'true'/);
   for (const [jobName, outputName, requestEnv] of [

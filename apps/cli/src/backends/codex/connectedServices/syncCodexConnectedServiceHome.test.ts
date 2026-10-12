@@ -1,6 +1,8 @@
 import { lstat, mkdir, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
+import { parse } from 'smol-toml';
+
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createCodexHomePair, exists, loadSyncCodexConnectedServiceHome, mockAllSymlinksFail, mockSymlinkFailureForTempLink, settings, waitFor } from './syncCodexConnectedServiceHome.testUtils';
@@ -334,7 +336,7 @@ describe('syncCodexConnectedServiceHome', () => {
     }
   });
 
-  it('copies mutable config and materializes only current Codex home config entries', async () => {
+  it.each(['linked', 'copied'] as const)('copies mutable config and materializes current Codex home config entries in %s mode', async (configMode) => {
     const { root, sourceCodexHome, destinationCodexHome } = await createCodexHomePair();
     try {
       await writeFile(join(sourceCodexHome, 'config.toml'), 'model = "gpt-5.3-codex"\n');
@@ -343,6 +345,8 @@ describe('syncCodexConnectedServiceHome', () => {
       await writeFile(join(sourceCodexHome, 'environments.toml'), '[env.default]\n');
       await writeFile(join(sourceCodexHome, 'hooks.json'), '{"hooks":[]}\n');
       await mkdir(join(sourceCodexHome, 'rules'), { recursive: true });
+      await mkdir(join(sourceCodexHome, 'plugins', 'cache', 'example'), { recursive: true });
+      await writeFile(join(sourceCodexHome, 'plugins', 'cache', 'example', 'plugin.json'), '{"name":"example"}\n');
       await writeFile(join(sourceCodexHome, 'rules', 'default.rules'), 'prefix_rule(pattern=["git"], decision="allow")\n');
       await mkdir(join(sourceCodexHome, 'agents', 'reviewer'), { recursive: true });
       await writeFile(join(sourceCodexHome, 'agents', 'reviewer', 'config.toml'), 'name = "reviewer"\n');
@@ -354,22 +358,77 @@ describe('syncCodexConnectedServiceHome', () => {
 
       await syncCodexConnectedServiceHome({
         destinationCodexHome,
-        accountSettings: settings('linked', 'isolated'),
+        accountSettings: settings(configMode, 'isolated'),
         processEnv: { CODEX_HOME: sourceCodexHome },
       });
       await writeFile(join(sourceCodexHome, 'config.toml'), 'model = "changed-after-sync"\n');
+
+      await expect(readFile(join(destinationCodexHome, 'plugins', 'cache', 'example', 'plugin.json'), 'utf8')).resolves.toBe('{"name":"example"}\n');
+      expect((await lstat(join(destinationCodexHome, 'plugins'))).isSymbolicLink()).toBe(configMode === 'linked');
 
       const copiedConfig = await readFile(join(destinationCodexHome, 'config.toml'), 'utf8');
       expect(copiedConfig).toContain('model = "gpt-5.3-codex"');
       expect(copiedConfig).toContain('cli_auth_credentials_store = "file"');
       await expect(readFile(join(destinationCodexHome, 'environments.toml'), 'utf8')).resolves.toBe('[env.default]\n');
       await expect(readFile(join(destinationCodexHome, 'hooks.json'), 'utf8')).resolves.toBe('{"hooks":[]}\n');
+      expect((await lstat(join(destinationCodexHome, 'hooks.json'))).isSymbolicLink()).toBe(false);
+      await writeFile(join(sourceCodexHome, 'hooks.json'), '{"hooks":[{"changed":true}]}\n');
+      await expect(readFile(join(destinationCodexHome, 'hooks.json'), 'utf8')).resolves.toBe('{"hooks":[]}\n');
+      await syncCodexConnectedServiceHome({
+        destinationCodexHome,
+        accountSettings: settings('linked', 'isolated'),
+        processEnv: { CODEX_HOME: sourceCodexHome },
+      });
+      expect((await lstat(join(destinationCodexHome, 'hooks.json'))).isSymbolicLink()).toBe(false);
+      await expect(readFile(join(destinationCodexHome, 'hooks.json'), 'utf8')).resolves.toBe('{"hooks":[{"changed":true}]}\n');
       await expect(readFile(join(destinationCodexHome, 'instructions.md'), 'utf8')).resolves.toBe('legacy instructions\n');
       await expect(readFile(join(destinationCodexHome, 'rules', 'default.rules'), 'utf8')).resolves.toBe('prefix_rule(pattern=["git"], decision="allow")\n');
       await expect(readFile(join(destinationCodexHome, 'agents', 'reviewer', 'config.toml'), 'utf8')).resolves.toBe('name = "reviewer"\n');
       await expect(readFile(join(destinationCodexHome, 'skills', 'reviewer', 'SKILL.md'), 'utf8')).resolves.toBe('# Reviewer\n');
       await expect(readFile(join(destinationCodexHome, 'skills', '.system', 'builtin.md'), 'utf8')).resolves.toBe('built in\n');
       await expect(exists(join(destinationCodexHome, 'config.json'))).resolves.toBe(false);
+      await syncCodexConnectedServiceHome({ destinationCodexHome, accountSettings: settings('isolated', 'isolated'), processEnv: { CODEX_HOME: sourceCodexHome } });
+      await expect(exists(join(destinationCodexHome, 'plugins'))).resolves.toBe(false);
+      await expect(readFile(join(sourceCodexHome, 'plugins', 'cache', 'example', 'plugin.json'), 'utf8')).resolves.toBe('{"name":"example"}\n');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('replaces a previously linked hooks file with a copy in shared-state mode', async () => {
+    const { root, sourceCodexHome, destinationCodexHome } = await createCodexHomePair();
+    try {
+      const sourceHooks = join(sourceCodexHome, 'hooks.json');
+      const targetHooks = join(destinationCodexHome, 'hooks.json');
+      await writeFile(sourceHooks, '{"hooks":{"Stop":[]}}\n');
+      await mkdir(destinationCodexHome, { recursive: true });
+      await symlink(sourceHooks, targetHooks, 'file');
+      await writeFile(join(destinationCodexHome, '.happier-state-sharing.json'), JSON.stringify({
+        v: 1,
+        requestedStateMode: 'shared',
+        effectiveStateMode: 'shared',
+        configEntries: ['hooks.json'],
+        stateEntries: [],
+      }));
+      const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
+
+      await syncCodexConnectedServiceHome({
+        destinationCodexHome,
+        accountSettings: settings('linked', 'shared'),
+        processEnv: { CODEX_HOME: sourceCodexHome },
+      });
+      expect((await lstat(targetHooks)).isSymbolicLink()).toBe(false);
+      await expect(readFile(targetHooks, 'utf8')).resolves.toBe('{"hooks":{"Stop":[]}}\n');
+
+      await writeFile(sourceHooks, '{"hooks":{"SessionStart":[]}}\n');
+      await expect(readFile(targetHooks, 'utf8')).resolves.toBe('{"hooks":{"Stop":[]}}\n');
+      await syncCodexConnectedServiceHome({
+        destinationCodexHome,
+        accountSettings: settings('linked', 'shared'),
+        processEnv: { CODEX_HOME: sourceCodexHome },
+      });
+      expect((await lstat(targetHooks)).isSymbolicLink()).toBe(false);
+      await expect(readFile(targetHooks, 'utf8')).resolves.toBe('{"hooks":{"SessionStart":[]}}\n');
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -393,6 +452,110 @@ describe('syncCodexConnectedServiceHome', () => {
 
       await expect(readFile(join(destinationCodexHome, 'config.toml'), 'utf8')).resolves.toBe('model = "local"\n');
       await expect(readFile(join(destinationCodexHome, 'skills', 'local', 'SKILL.md'), 'utf8')).resolves.toBe('# Local\n');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, true])('preserves Codex hook trust after a repeated sync when source config exists: %s', async (sourceConfigExists) => {
+    const { root, sourceCodexHome, destinationCodexHome } = await createCodexHomePair();
+    try {
+      if (sourceConfigExists) {
+        await writeFile(join(sourceCodexHome, 'config.toml'), 'model = "source"\n');
+      }
+      const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
+      const sync = () => syncCodexConnectedServiceHome({
+        destinationCodexHome,
+        accountSettings: settings('linked', 'isolated'),
+        processEnv: { CODEX_HOME: sourceCodexHome },
+      });
+      await sync();
+      const trustedHook = `${join(destinationCodexHome, 'hooks.json')}:Stop:0:0`;
+      const trustSection = `[hooks.state.${JSON.stringify(trustedHook)}]\ntrusted_hash = "${'a'.repeat(64)}"\n`;
+      await writeFile(join(destinationCodexHome, 'config.toml'),
+        `model = "profile"\n[features]\nexperimental = true\n${trustSection}`);
+
+      await sync();
+
+      const config = await readFile(join(destinationCodexHome, 'config.toml'), 'utf8');
+      expect(parse(config)).toMatchObject({ hooks: { state: { [trustedHook]: { trusted_hash: 'a'.repeat(64) } } } });
+      expect(config.match(/trusted_hash/g)).toHaveLength(1);
+      expect(parse(config).model).toBe(sourceConfigExists ? 'source' : undefined);
+      expect(parse(config).features).toBeUndefined();
+      expect(parse(config).cli_auth_credentials_store).toBe('file');
+      const manifest = JSON.parse(await readFile(join(destinationCodexHome, '.happier-state-sharing.json'), 'utf8')) as { configEntries: string[] };
+      expect(manifest.configEntries).toContain('config.toml');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['hooks.json', 'config.toml'])('rebases native %s hook decisions to the promoted home without overriding profile decisions', async (entry) => {
+    const { root, sourceCodexHome, destinationCodexHome } = await createCodexHomePair();
+    try {
+      const sync = await loadSyncCodexConnectedServiceHome();
+      const promotedHome = join(root, 'promoted');
+      const sourceKey = `${join(sourceCodexHome, entry)}:stop:0:0`;
+      const promotedKey = `${join(promotedHome, entry)}:stop:0:0`;
+      const unrelatedKey = `${join(sourceCodexHome, `${entry}.other`)}:stop:0:0`;
+      const nativeConfig = [
+        `[hooks.state.${JSON.stringify(sourceKey)}]`, 'trusted_hash = "sha256:reviewed-native"', 'enabled = false',
+        `[hooks.state.${JSON.stringify(unrelatedKey)}]`, 'enabled = false',
+        '[hooks.state."plugin:example:stop:0:0"]', 'trusted_hash = "sha256:plugin"', '',
+      ].join('\n');
+      await writeFile(join(sourceCodexHome, 'config.toml'), nativeConfig);
+      const materialize = () => sync({ destinationCodexHome, previousCodexHome: promotedHome,
+        accountSettings: settings('copied', 'isolated'), processEnv: { CODEX_HOME: sourceCodexHome } });
+      await materialize();
+      const readStates = async () => (parse(await readFile(join(destinationCodexHome, 'config.toml'), 'utf8')).hooks as { state: Record<string, unknown> }).state;
+      expect(await readStates()).toEqual({
+        [promotedKey]: { trusted_hash: 'sha256:reviewed-native', enabled: false },
+        [unrelatedKey]: { enabled: false },
+        'plugin:example:stop:0:0': { trusted_hash: 'sha256:plugin' },
+      });
+      await mkdir(promotedHome, { recursive: true });
+      await writeFile(join(promotedHome, 'config.toml'), `[hooks.state.${JSON.stringify(promotedKey)}]\ntrusted_hash = "sha256:reviewed-profile"\nenabled = false\n`);
+      await materialize();
+      expect((await readStates())[promotedKey]).toEqual({ trusted_hash: 'sha256:reviewed-profile', enabled: false });
+      expect(await readFile(join(sourceCodexHome, 'config.toml'), 'utf8')).toBe(nativeConfig);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['linked', 'copied'] as const)('preserves native hook trust and disabled state in a staged %s config', async (configMode) => {
+    const { root, sourceCodexHome, destinationCodexHome } = await createCodexHomePair();
+    try {
+      const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
+      const previousCodexHome = join(root, 'promoted', 'codex-home');
+      await mkdir(previousCodexHome, { recursive: true });
+      const hookId = `${join(previousCodexHome, 'hooks.json')}:stop:0:0`;
+      const disabledOnlyId = `${join(previousCodexHome, 'hooks.json')}:session_start:0:0`;
+      const unrelatedId = `${join(sourceCodexHome, 'hooks.json')}:stop:0:0`;
+      const hash = `sha256:${'a'.repeat(64)}`;
+      await writeFile(join(sourceCodexHome, 'config.toml'), 'model = "source"\n');
+      await writeFile(join(previousCodexHome, 'config.toml'), [
+        `[hooks.state.'${hookId}'] # native user preferences`,
+        `trusted_hash = '${hash}' # reviewed hook`,
+        'enabled = false',
+        `[hooks.state.'${disabledOnlyId}']`,
+        'enabled = false',
+        `[hooks.state.'${unrelatedId}']`,
+        `trusted_hash = '${hash}'`,
+        '',
+      ].join('\n'));
+      await syncCodexConnectedServiceHome({
+        destinationCodexHome, previousCodexHome,
+        accountSettings: settings(configMode, 'isolated'),
+        processEnv: { CODEX_HOME: sourceCodexHome },
+      });
+      const config = parse(await readFile(join(destinationCodexHome, 'config.toml'), 'utf8'));
+      expect(config).toMatchObject({
+        model: 'source', cli_auth_credentials_store: 'file',
+        hooks: { state: { [hookId]: { trusted_hash: hash, enabled: false }, [disabledOnlyId]: { enabled: false } } },
+      });
+      expect((config.hooks as { state: Record<string, unknown> }).state[unrelatedId]).toBeUndefined();
+      expect((await lstat(join(destinationCodexHome, 'config.toml'))).mode & 0o777).toBe(0o600);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

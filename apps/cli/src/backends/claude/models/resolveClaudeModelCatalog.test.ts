@@ -202,7 +202,7 @@ describe('resolveClaudeModelCatalog', () => {
 
     const resolution = await resolveClaudeModelCatalogResolution({ timeoutMs: 1_000 });
 
-    expect(resolution).toEqual({ models: [], source: 'dynamic' });
+    expect(resolution).toEqual({ models: [], source: 'dynamic', observedAt: expect.any(Number) });
   });
 
   it('serves a cached catalog and never substitutes ambient auth for a selected account', async () => {
@@ -352,8 +352,8 @@ describe('resolveClaudeModelCatalog', () => {
     });
 
     expect(first).toEqual(expect.objectContaining({ source: 'dynamic' }));
-    expect(stale).toEqual(first);
-    expect(staleDuringFailureCooldown).toEqual(first);
+    expect(stale).toEqual({ ...first, refreshError: true });
+    expect(staleDuringFailureCooldown).toEqual(stale);
     expect(stale.models.map((model) => model.id)).toEqual(['claude-opus-9']);
     expect(fetchAnthropicModelsMock).toHaveBeenCalledTimes(2);
   });
@@ -384,7 +384,7 @@ describe('resolveClaudeModelCatalog', () => {
       nowMs: () => currentTimeMs,
     });
 
-    expect(staleAccountA).toEqual(accountA);
+    expect(staleAccountA).toEqual({ ...accountA, refreshError: true });
     expect(staleAccountA.models.map((model) => model.id)).toEqual(['claude-account-a']);
     expect(fetchAnthropicModelsMock).toHaveBeenCalledTimes(3);
   });
@@ -405,7 +405,7 @@ describe('resolveClaudeEffortLevelsFromModelDescriptor', () => {
 
   it('returns no tiers for a model without an effort control', () => {
     expect(resolveClaudeEffortLevelsFromModelDescriptor(null)).toEqual([]);
-    expect(resolveClaudeEffortLevelsFromModelDescriptor({ id: 'x', name: 'X' })).toEqual([]);
+    expect(resolveClaudeEffortLevelsFromModelDescriptor({})).toEqual([]);
   });
 });
 

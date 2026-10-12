@@ -14,7 +14,7 @@
  * realpath-parsers or package.json readers drifting apart.
  */
 
-import { spawnSync } from 'node:child_process';
+import { spawnBackgroundSync } from '@happier-dev/cli-common/process';
 import { existsSync } from 'node:fs';
 
 import { buildServiceCommandEnv } from '@happier-dev/cli-common/service';
@@ -39,14 +39,14 @@ export function resolveCliVersionFromBinary(params: Readonly<{
   const commonEnv = { cmd: binaryPath, args: ['--version'], env: process.env } as const;
 
   try {
-    let res = spawnSync(binaryPath, ['--version'], {
+    let res = spawnBackgroundSync(binaryPath, ['--version'], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout,
       env: buildServiceCommandEnv(commonEnv),
     });
     if (res.status !== 0 && params.platform !== 'win32') {
-      res = spawnSync('bash', [binaryPath, '--version'], {
+      res = spawnBackgroundSync('bash', [binaryPath, '--version'], {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout,

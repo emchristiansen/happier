@@ -79,7 +79,10 @@ function resolveTokenSubtitle(outcome: ExpoPushTokenOutcome | null, fingerprint:
         if (outcome.reason === 'runtime_unavailable') {
             return t('settingsNotifications.pushTroubleshooting.token.runtimeUnavailableSubtitle');
         }
-        return t('settingsNotifications.pushTroubleshooting.token.deviceUnavailableSubtitle');
+        const subtitle = t('settingsNotifications.pushTroubleshooting.token.deviceUnavailableSubtitle');
+        return outcome.reason === 'token_unavailable' && outcome.message
+            ? `${subtitle}\n${outcome.message}`
+            : subtitle;
     }
     return t('settingsNotifications.pushTroubleshooting.token.unavailableSubtitle');
 }

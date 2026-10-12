@@ -46,6 +46,7 @@ const RELAY_URL = 'https://relay.example.test';
 const RELAY_KEY = createServerUrlComparableKey(RELAY_URL);
 const SERVER_ID = 'custom-2';
 const ACCOUNT_ID = 'acct_app';
+const APP_TOKEN = `header.${Buffer.from(JSON.stringify({ sub: ACCOUNT_ID })).toString('base64')}.signature`;
 const TASK_ID = 'task_1';
 const CLI_COMMAND = '/home/dev/happier-stack/apps/cli/bin/happier.mjs';
 
@@ -137,7 +138,7 @@ beforeEach(() => {
     mocks.serverFetch.mockReset();
     mocks.getCredentialsForServerUrl.mockReset();
     mocks.getCredentialsForServerUrl.mockResolvedValue({
-        token: 'app-token',
+        token: APP_TOKEN,
         encryption: {
             publicKey: encodeBase64(new Uint8Array(32).fill(1)),
             machineKey: encodeBase64(contentPrivateKey),
@@ -146,6 +147,29 @@ beforeEach(() => {
 });
 
 describe('approveSetupPairingForTarget refusals (INV2)', () => {
+    it.each([
+        { token: `header.${Buffer.from(JSON.stringify({ sub: 'acct_after_sign_in' })).toString('base64')}.signature`, reason: 'account_mismatch' },
+        { token: 'unusable-token', reason: 'credentials_unusable' },
+    ] as const)('refuses retained pairing when the current target credentials cannot bind the original account: $reason', async ({ token, reason }) => {
+        // The delayed prompt still names the original account; the secure-storage read now
+        // returns credentials replaced by a later sign-in on this same relay profile.
+        mocks.getCredentialsForServerUrl.mockResolvedValue({
+            token,
+            encryption: {
+                publicKey: encodeBase64(new Uint8Array(32).fill(1)),
+                machineKey: encodeBase64(new Uint8Array(32).fill(12)),
+            },
+        });
+        mocks.serverFetch.mockResolvedValueOnce(jsonResponse({ status: 'pending', supportsV2: true }));
+        mocks.serverFetch.mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+        const { outcome, answers } = await run({});
+
+        expect(outcome).toEqual({ approved: false, reason });
+        expect(answers).toEqual([{ approved: false, reason }]);
+        expect(mocks.serverFetch).not.toHaveBeenCalled();
+    });
+
     it('refuses when the prompt relay differs from the relay the app sent', async () => {
         const { outcome, answers } = await run({
             event: buildPromptEvent({ relayUrl: 'https://other.example.test' }),
@@ -270,7 +294,7 @@ describe('approveSetupPairingForTarget approval (R4)', () => {
 
         // The posted payload is a real v2 envelope the terminal can open with its ephemeral key.
         const init = responseCall?.[1] as RequestInit | undefined;
-        expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer app-token');
+        expect(new Headers(init?.headers).get('Authorization')).toBe(`Bearer ${APP_TOKEN}`);
         const body = JSON.parse(String(init?.body)) as { publicKey: string; response: string };
         expect(body.publicKey).toBe(encodeBase64(terminalPublicKey));
         const opened = openTerminalProvisioningV2Payload({
@@ -319,7 +343,7 @@ describe('approveSetupPairingForTarget approval (R4)', () => {
             for (const key of Object.keys(answer)) {
                 expect(key).not.toMatch(SENSITIVE_KEY_PATTERN);
             }
-            expect(JSON.stringify(answer)).not.toContain('app-token');
+            expect(JSON.stringify(answer)).not.toContain(APP_TOKEN);
         }
     });
 });

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -879,10 +879,13 @@ describe('happier relay --json', () => {
         }
     });
 
-    it('uploads a local server-binary override payload when relay host install runs over ssh', async () => {
+    it('uploads a server-binary payload through the installed current symlink when relay host install runs over ssh', async () => {
         const cliPayloadRoot = await createTempDir('happier-first-party-payload-cli-');
         const serverPayloadRoot = await createTempDir('happier-first-party-payload-server-');
-        const serverBinaryPath = join(serverPayloadRoot, 'happier-server');
+        const versionDir = join(serverPayloadRoot, 'versions', 'v1');
+        mkdirSync(versionDir, { recursive: true });
+        symlinkSync(versionDir, join(serverPayloadRoot, 'current'), 'dir');
+        const serverBinaryPath = join(serverPayloadRoot, 'current', 'happier-server');
         writeFileSync(join(cliPayloadRoot, 'happier'), '#!/usr/bin/env bash\necho stub\n', 'utf8');
         chmodSync(join(cliPayloadRoot, 'happier'), 0o755);
         writeFileSync(serverBinaryPath, '#!/usr/bin/env bash\necho stub\n', 'utf8');

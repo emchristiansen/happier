@@ -64,6 +64,8 @@ export const NotificationsSettingsV1Schema = z.preprocess(
     connectedServiceQuotaBlocked: z.boolean().default(true),
     connectedServiceQuotaRecovered: z.boolean().default(true),
     foregroundBehavior: ForegroundBehaviorSchema.default('full'),
+    // Missing on released clients: keep phone push delivery enabled.
+    mutePhoneWhenComputerFocused: z.boolean().optional(),
   })
   .catch({
     v: 1,

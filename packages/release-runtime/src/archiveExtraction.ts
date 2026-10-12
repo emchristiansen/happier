@@ -6,7 +6,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
-import { createInflateRaw } from 'node:zlib';
+import { createGunzip, createInflateRaw } from 'node:zlib';
 
 import * as tar from 'tar';
 import type { TarOptionsWithAliasesAsyncNoFile } from 'tar';
@@ -726,7 +726,7 @@ async function publishStagedExtraction(params: Readonly<{
   await rename(params.stagingDir, params.extractDir);
 }
 
-function createXzDecompressionRatioGuard(params: Readonly<{
+function createDecompressionRatioGuard(params: Readonly<{
   abortContext: ArchiveAbortContext;
   archiveBytes: number;
   limits: ArchiveExtractionLimits;
@@ -792,13 +792,17 @@ async function extractTarArchiveToDirectory(params: Readonly<{
       const decompressedStream = new XzReadableStream(Readable.toWeb(source));
       await pipeline(
         Readable.fromWeb(decompressedStream),
-        createXzDecompressionRatioGuard(params),
+        createDecompressionRatioGuard(params),
         unpack,
         { signal: params.abortContext.signal },
       );
     } else {
+      // Keep gzip teardown inside pipeline: node-tar's internal gunzip can emit
+      // a late stream error after a rejected entry has already settled extraction.
       await pipeline(
         createOpenArchiveRangeStream(params.archiveFile, 0, params.archiveBytes),
+        createGunzip(),
+        createDecompressionRatioGuard(params),
         unpack,
         { signal: params.abortContext.signal },
       );

@@ -66,6 +66,16 @@ This matters because the available list can depend on:
 
 Use the refresh button in the model section after changing provider login state, CLI config, Custom ACP settings, or working directory.
 
+In development builds with session model refresh, the same control is available in an existing
+session's engine details, including inactive sessions. Its machine must be reachable, but refreshing
+the list does not resume the session. Happier shows previously discovered choices while checking
+for updates and keeps them if the check fails. Retry refresh after restoring the machine connection
+or provider login. Update both the app and daemon to use forced refresh; an older daemon may still
+return its cached list.
+
+Refreshing available choices does not change the model already running. Choose a model separately;
+the provider's normal apply timing still applies.
+
 ## Static model lists
 
 Not every provider has a dynamic model API.

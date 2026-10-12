@@ -9,7 +9,7 @@ import { resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process
 import { spawn } from 'node:child_process';
 
 import { asRecord, normalizeString } from '../server/openCodeParsing';
-import { modelSupportsReasoningVariants, modelSupportsToolCalls, parseOpenCodeModelId } from '../server/openCodeModelParsing';
+import { isOpenCodeModelSelectable, modelSupportsReasoningVariants, parseOpenCodeModelId } from '../server/openCodeModelParsing';
 import { buildOpenCodeThinkingModelOptionsFromVariants } from '../modelOptions/openCodeThinkingModelOption';
 import { readContextWindowTokensFromModelRecord } from '@/backends/modelCapabilities/contextWindowTokens';
 
@@ -64,7 +64,7 @@ function extractJsonBlockFromLines(lines: string[], startIndex: number): { jsonT
 
 function parseOpenCodeModelsVerboseOutput(outputRaw: string): OpenCodePreflightModelBlock[] | null {
   const output = typeof outputRaw === 'string' ? outputRaw : '';
-  if (!output.trim()) return null;
+  if (!output.trim()) return [];
 
   const lines = output.split('\n');
   const parsed: OpenCodePreflightModelBlock[] = [];
@@ -108,6 +108,7 @@ function parseOpenCodeModelsVerboseOutput(outputRaw: string): OpenCodePreflightM
 function parseOpenCodeV2ModelsApiOutput(outputRaw: string): OpenCodePreflightModelBlock[] | null {
   const envelope = tryParseJsonObject(outputRaw.trim());
   if (!Array.isArray(envelope?.data)) return null;
+  if (envelope.data.length === 0) return [];
 
   const parsed = envelope.data.flatMap((rawModel): OpenCodePreflightModelBlock[] => {
     const record = asRecord(rawModel);
@@ -121,12 +122,13 @@ function parseOpenCodeV2ModelsApiOutput(outputRaw: string): OpenCodePreflightMod
 
 function buildOpenCodePreflightModels(
   blocks: readonly OpenCodePreflightModelBlock[],
-): unknown[] | null {
+): unknown[] {
   const models = blocks
     .map((block) => {
       const record = block.record;
-      if (!modelSupportsToolCalls(record)) return null;
       const fullId = block.fullId;
+      const model = parseOpenCodeModelId(fullId);
+      if (!model || !isOpenCodeModelSelectable({ ...model, modelRecord: record })) return null;
       const name = normalizeString(record.name) || fullId;
       const description = normalizeString(record.family) || normalizeString(record.providerID) || undefined;
       const supportsReasoning = modelSupportsReasoningVariants(record);
@@ -144,7 +146,7 @@ function buildOpenCodePreflightModels(
     })
     .filter((model): model is NonNullable<typeof model> => model !== null);
 
-  return models.length > 0 ? models : null;
+  return models;
 }
 
 async function runOpenCodeModelsProbeCommand(params: Readonly<{

@@ -80,6 +80,20 @@ describe('RoundButton keyboard focus', () => {
 });
 
 describe('RoundButton', () => {
+    it('allows the complete action label to wrap while ordinary buttons remain single-line', async () => {
+        const { RoundButton } = await import('./RoundButton');
+        const label = 'Connect this computer here';
+        const screen = await renderScreen(<>
+            <RoundButton title="Short" testID="single-line" />
+            <RoundButton title={label} titleNumberOfLines="complete" testID="complete-label" />
+        </>);
+
+        expect(screen.findByTestId('single-line')?.findByType('Text').props.numberOfLines).toBe(1);
+        const completeLabel = screen.findByTestId('complete-label')?.findByType('Text');
+        expect(completeLabel?.props.children).toBe(label);
+        expect(completeLabel?.props.numberOfLines).toBeUndefined();
+    });
+
     it('forwards the press event to modifier-aware actions', async () => {
         const { RoundButton } = await import('./RoundButton');
         const onPress = vi.fn();

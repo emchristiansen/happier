@@ -293,7 +293,7 @@ describe('ensureDirectSessionLink', () => {
     });
   });
 
-  it('stores the canonical OpenCode runtime descriptor for linked direct sessions', async () => {
+  it.each([false, true])('stores the canonical OpenCode runtime descriptor for linked direct sessions, managed=%s', async (managed) => {
     getOrCreateSessionByTagMock.mockResolvedValueOnce({
       session: {
         id: 'sess_direct_oc_1',
@@ -309,16 +309,25 @@ describe('ensureDirectSessionLink', () => {
       runtimeDescriptor: buildOpenCodeAgentRuntimeDescriptorV1({
         backendMode: 'server',
         vendorSessionId: 'oc_runtime',
-        serverBaseUrl: 'http://127.0.0.1:4096/',
-        serverBaseUrlExplicit: true,
+        ...(managed ? { managedServerLaunchFingerprint: 'a'.repeat(64) } : {
+          serverBaseUrl: 'http://127.0.0.1:4096/', serverBaseUrlExplicit: true,
+        }),
       }),
-      source: { kind: 'opencodeServer', baseUrl: 'http://127.0.0.1:4096/', directory: '/repo' },
+      source: { kind: 'opencodeServer', ...(managed ? {} : { baseUrl: 'http://127.0.0.1:4096/' }), directory: '/repo' },
       titleHint: 'OpenCode linked session',
       directoryHint: '/repo',
       nowMs: () => 123,
     });
 
     const createdMetadata = getOrCreateSessionByTagMock.mock.calls[0]?.[0]?.metadata;
+    if (managed) {
+      expect(createdMetadata).toMatchObject({
+        agentRuntimeDescriptorV1: { provider: { providerExtra: { runtimeHandle: { managedServerLaunchFingerprint: 'a'.repeat(64) } } } },
+        directSessionV1: { agentRuntimeDescriptorV1: { provider: { providerExtra: { runtimeHandle: { managedServerLaunchFingerprint: 'a'.repeat(64) } } } } },
+      });
+      expect(createdMetadata?.opencodeServerBaseUrl).toBeUndefined();
+      return;
+    }
     expect(createdMetadata).toMatchObject({
       opencodeSessionId: 'oc_runtime',
       opencodeBackendMode: 'server',

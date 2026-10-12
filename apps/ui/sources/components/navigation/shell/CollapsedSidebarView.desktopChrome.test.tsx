@@ -60,6 +60,10 @@ vi.mock('@/components/inbox/InboxPopoverButton', () => ({
     InboxPopoverButton: (props: Record<string, unknown>) => React.createElement('InboxPopoverButton', props),
 }));
 
+vi.mock('@/components/updates/UpdatesPopoverButton', () => ({
+    UpdatesEntry: (props: Record<string, unknown>) => React.createElement('UpdatesEntry', props),
+}));
+
 vi.mock('@/components/inbox/actionOperations/ActionOperationActivityButton', () => ({
     ActionOperationActivityButton: (props: Record<string, unknown>) => React.createElement('ActionOperationActivityButton', props),
 }));
@@ -99,15 +103,15 @@ describe('CollapsedSidebarView desktop chrome', () => {
         const screen = await renderScreen(
             <CollapsedSidebarView
                 desktopWindowControls={<View testID="injected-collapsed-window-controls" />}
-                desktopUpdateIndicator={<View testID="injected-collapsed-update-indicator" />}
             />,
         );
 
         expect(screen.findByTestId('desktop-collapsed-shell-chrome')).toBeTruthy();
         expect(screen.findByTestId('desktop-window-controls-host')).toBeTruthy();
         expect(screen.findByTestId('injected-collapsed-window-controls')).toBeTruthy();
-        expect(screen.findByTestId('injected-collapsed-update-indicator')).toBeTruthy();
-        expect(screen.findAllByTestId('collapsed-sidebar-home-button')).toHaveLength(0);
+        // The logo stays; Updates is its own rail entry (R13 (e)), never a replacement for the logo.
+        expect(screen.findAllByTestId('collapsed-sidebar-home-button').length).toBeGreaterThan(0);
+        expect(screen.findByTestId('collapsed-sidebar-updates-button')?.props.variant).toBe('icon');
 
         await act(async () => {
             await pressTestInstanceAsync(screen.findByTestId('sidebar-expand-button'));

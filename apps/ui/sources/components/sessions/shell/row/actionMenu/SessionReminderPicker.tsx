@@ -12,3 +12,5 @@ export type SessionReminderPickerProps = Readonly<{
 }>;
 
 export function SessionReminderPicker(_props: SessionReminderPickerProps) { return null; }
+
+export function isSessionReminderPickerAvailable(): boolean { return false; }

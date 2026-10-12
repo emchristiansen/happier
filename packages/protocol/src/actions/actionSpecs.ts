@@ -571,12 +571,13 @@ const SessionHandoffInputSchema = z.object({
 }).passthrough();
 
 const SessionSpawnTerminalInputSchema = z.object({
-  mode: z.enum(['plain', 'tmux', 'windows_terminal', 'windows_console']).optional(),
+  mode: z.enum(['plain', 'tmux', 'zellij', 'herdr', 'windows_terminal', 'windows_console']).optional(),
   tmux: z.object({
     sessionName: z.string().optional(),
     isolated: z.boolean().optional(),
     tmpDir: z.string().nullable().optional(),
   }).strict().optional(),
+  herdr: z.object({ sessionName: z.string().optional() }).strict().optional(),
 }).strict();
 
 function normalizeSpawnTargetAlias(value: string): string {

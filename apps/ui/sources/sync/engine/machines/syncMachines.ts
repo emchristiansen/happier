@@ -92,11 +92,6 @@ function readReplacementFieldsFromMachineRow(machine: {
     };
 }
 
-function normalizeNonNegativeInteger(value: number | undefined, fallback: number): number {
-    if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
-    return Math.max(0, Math.trunc(value));
-}
-
 function normalizePositiveInteger(value: number | undefined, fallback: number): number {
     if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
     return Math.max(1, Math.trunc(value));
@@ -216,8 +211,6 @@ export async function fetchAndApplyMachines(params: {
     applyMachineDisplayEntries?: (machines: MachineDisplayRenderable[], options?: { replace?: boolean }) => void;
     cachedMachineDisplayEntries?: Record<string, MachineDisplayCacheEntryV1>;
     machineDisplayHydrationConcurrencyLimit?: number;
-    machineDisplayEagerHydrationCount?: number;
-    machineDisplayBackgroundHydrationMaxRows?: number;
     machineDisplayBackgroundHydrationApplyBatchSize?: number;
     shouldContinue?: () => boolean;
     /**
@@ -244,14 +237,6 @@ export async function fetchAndApplyMachines(params: {
     const concurrencyLimit = normalizePositiveInteger(
         params.machineDisplayHydrationConcurrencyLimit,
         syncTuning.machineDisplayHydrationConcurrencyLimit,
-    );
-    const eagerHydrationCount = normalizeNonNegativeInteger(
-        params.machineDisplayEagerHydrationCount,
-        syncTuning.machineDisplayEagerHydrationCount,
-    );
-    const backgroundHydrationMaxRows = normalizeNonNegativeInteger(
-        params.machineDisplayBackgroundHydrationMaxRows,
-        syncTuning.machineDisplayBackgroundHydrationMaxRows,
     );
     const hydrationApplyBatchSize = normalizePositiveInteger(
         params.machineDisplayBackgroundHydrationApplyBatchSize,
@@ -406,6 +391,10 @@ export async function fetchAndApplyMachines(params: {
     const cachedMachineDisplayEntries = params.cachedMachineDisplayEntries ?? {};
     const shouldApplyMachineDisplays = typeof params.applyMachineDisplayEntries === 'function';
     const needsMachineWarmHydration = (machine: typeof machines[number]): boolean => {
+        const existingMachine = params.getExistingMachine?.(machine.id);
+        if (!existingMachine?.metadata || existingMachine.metadataVersion !== machine.metadataVersion) {
+            return true;
+        }
         if (cachedMachineDisplayEntries[machine.id]?.metadataVersion !== machine.metadataVersion) {
             return true;
         }
@@ -429,19 +418,15 @@ export async function fetchAndApplyMachines(params: {
             : null,
     });
 
-    const buildMachineFromRowAndCache = (
+    const buildMachineFromRowAndExisting = (
         machine: typeof machines[number],
-        cachedEntry: MachineDisplayCacheEntryV1 | undefined,
         existingMachine: Machine | null | undefined,
     ): Machine => {
         const hasEncryptedDaemonState = typeof machine.daemonState === 'string' && machine.daemonState.length > 0;
-        const metadata = cachedEntry?.metadataVersion === machine.metadataVersion && existingMachine?.metadata
-            ? {
-                ...existingMachine.metadata,
-                displayName: cachedEntry.displayName ?? existingMachine.metadata.displayName,
-                host: cachedEntry.host ?? existingMachine.metadata.host,
-                homeDir: cachedEntry.homeDir ?? existingMachine.metadata.homeDir,
-            }
+        // Refresh placeholders must not erase capabilities that have already been decrypted.
+        // Keep the payload's own version so socket updates can still deliver the newer envelope.
+        const metadata = machine.metadata && machineEncryptionReady && encryption.getMachineEncryption(machine.id)
+            ? existingMachine?.metadata ?? null
             : null;
         return ({
             id: machine.id,
@@ -452,7 +437,7 @@ export async function fetchAndApplyMachines(params: {
             activeAt: machine.activeAt,
             revokedAt: machine.revokedAt ?? null,
             ...readReplacementFieldsFromMachineRow(machine),
-            metadataVersion: machine.metadataVersion,
+            metadataVersion: metadata && existingMachine ? existingMachine.metadataVersion : machine.metadataVersion,
             metadata,
             daemonState: hasEncryptedDaemonState ? existingMachine?.daemonState ?? null : null,
             daemonStateVersion: hasEncryptedDaemonState
@@ -527,20 +512,17 @@ export async function fetchAndApplyMachines(params: {
         params.applyMachineDisplayEntries!(displayEntries, { replace: params.replace ?? false });
         applyMachines(
             machines.map((machine) =>
-                buildMachineFromRowAndCache(
+                buildMachineFromRowAndExisting(
                     machine,
-                    cachedMachineDisplayEntries[machine.id],
                     params.getExistingMachine?.(machine.id),
                 )),
             params.replace ?? false,
         );
 
-        const maxWarmHydrationRows = eagerHydrationCount + backgroundHydrationMaxRows;
-        const machinesNeedingHydration = machineEncryptionReady && maxWarmHydrationRows > 0
+        const machinesNeedingHydration = machineEncryptionReady
             ? machines
                 .filter((machine) => needsMachineWarmHydration(machine))
                 .sort(compareMachineHydrationPriority)
-                .slice(0, maxWarmHydrationRows)
             : [];
         if (machinesNeedingHydration.length > 0) {
             void runTasksWithLimit(

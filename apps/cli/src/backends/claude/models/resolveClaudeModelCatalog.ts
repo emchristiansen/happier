@@ -77,6 +77,8 @@ function buildAuthoritativeDynamicCatalog(entries: readonly AnthropicModelEntry[
 export type ClaudeModelCatalogResolution = Readonly<{
   models: readonly AgentModelDescriptor[];
   source: 'dynamic' | 'static';
+  observedAt?: number;
+  refreshError?: boolean;
 }>;
 
 type CatalogCacheEntry = Readonly<{ resolution: ClaudeModelCatalogResolution; expiresAtMs: number }>;
@@ -127,6 +129,7 @@ function trimCatalogEntries(protectedKey: string): void {
 
 export type ResolveClaudeModelCatalogParams = Readonly<{
   timeoutMs: number;
+  bypassCache?: boolean;
   connectedServices?: ConnectedServiceBindingsV1 | null;
   credentials?: Credentials | null;
   accountSettings?: Readonly<Record<string, unknown>> | null;
@@ -150,7 +153,7 @@ export async function resolveClaudeModelCatalogResolution(
   params: ResolveClaudeModelCatalogParams,
 ): Promise<ClaudeModelCatalogResolution> {
   if (!isClaudeDynamicModelProbeEnabled(params)) {
-    return { models: resolveStaticClaudeModels(), source: 'static' };
+    return { models: resolveStaticClaudeModels(), source: 'static', refreshError: false };
   }
 
   const nowMs = params.nowMs ?? (() => Date.now());
@@ -168,11 +171,11 @@ export async function resolveClaudeModelCatalogResolution(
   // No resolvable credential is an absence of identity, not an identity of its own. Caching under a
   // placeholder key would let one unreadable credential file evict a valid catalog for the whole
   // failure TTL, so degrade to the curated catalog for this call only and leave the cache untouched.
-  if (!target) return { models: resolveStaticClaudeModels(), source: 'static' };
+  if (!target) return { models: resolveStaticClaudeModels(), source: 'static', refreshError: true };
 
   const cacheKey = target.cacheIdentity;
   const cached = catalogCache.get(cacheKey);
-  if (cached && cached.expiresAtMs > nowMs()) return cached.resolution;
+  if (!params.bypassCache && cached && cached.expiresAtMs > nowMs()) return cached.resolution;
 
   const inFlight = inFlightCatalogResolutions.get(cacheKey);
   if (inFlight) return await inFlight;
@@ -185,12 +188,12 @@ export async function resolveClaudeModelCatalogResolution(
       timeoutMs: params.timeoutMs,
     });
 
-    const resolution: ClaudeModelCatalogResolution = entries !== null
-      ? { models: buildAuthoritativeDynamicCatalog(entries), source: 'dynamic' }
-      : cached?.resolution.source === 'dynamic'
-        ? cached.resolution
-        : { models: resolveStaticClaudeModels(), source: 'static' };
     const resolvedAtMs = nowMs();
+    const resolution: ClaudeModelCatalogResolution = entries !== null
+      ? { models: buildAuthoritativeDynamicCatalog(entries), source: 'dynamic', observedAt: resolvedAtMs }
+      : cached?.resolution.source === 'dynamic'
+        ? { ...cached.resolution, refreshError: true }
+        : { models: resolveStaticClaudeModels(), source: 'static', refreshError: true };
     pruneCatalogEntries(resolvedAtMs, cacheKey);
     // Refresh insertion order so the bounded cache removes the least recently resolved identity.
     catalogCache.delete(cacheKey);
@@ -223,7 +226,10 @@ export async function resolveClaudeModelCatalog(
  * not in the static effort table.
  */
 export function resolveClaudeEffortLevelsFromModelDescriptor(
-  model: AgentModelDescriptor | null | undefined,
+  model: Readonly<{ modelOptions?: ReadonlyArray<Readonly<{
+    id: string;
+    options?: ReadonlyArray<Readonly<{ value: unknown }>>;
+  }>> }> | null | undefined,
 ): readonly string[] {
   const control = model?.modelOptions?.find((option) => option.id === 'reasoning_effort');
   if (!control || !Array.isArray(control.options)) return [];

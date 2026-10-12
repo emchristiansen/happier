@@ -82,7 +82,7 @@ describe('resolveSharedStateRequiredSwitchContinuity', () => {
     const materializedRoot = await mkdtemp(join(tmpdir(), 'happier-codex-shared-state-'));
     tempDirs.push(materializedRoot);
     const rolloutDir = join(materializedRoot, 'codex-home', 'sessions', '2026', '05', '28');
-    const rolloutPath = join(rolloutDir, 'rollout-2026-05-28-resume-id.jsonl');
+    const rolloutPath = join(rolloutDir, 'rollout-2026-05-28T00-00-00-resume-id.jsonl');
     await mkdir(rolloutDir, { recursive: true });
     await writeFile(rolloutPath, '{}\n');
 

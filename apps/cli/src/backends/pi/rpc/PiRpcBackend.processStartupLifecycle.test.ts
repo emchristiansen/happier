@@ -17,9 +17,16 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   return { ...actual, stat: fsBoundary.stat };
 });
 
-vi.mock('@/utils/fs/protectedTempTextArtifact', () => ({
-  materializeProtectedTempTextArtifact: artifactBoundary.materialize,
-}));
+vi.mock('@/utils/fs/protectedTempTextArtifact', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/utils/fs/protectedTempTextArtifact')>();
+  return {
+    ...actual,
+    materializeProtectedTempTextArtifact: (params: Parameters<typeof actual.materializeProtectedTempTextArtifact>[0]) =>
+      params.prefix === 'happier-pi-append-system-prompt-'
+        ? artifactBoundary.materialize(params)
+        : actual.materializeProtectedTempTextArtifact(params),
+  };
+});
 
 import { PiRpcBackend } from './PiRpcBackend';
 

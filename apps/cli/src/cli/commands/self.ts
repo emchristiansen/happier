@@ -7,36 +7,41 @@ import { configuration } from '@/configuration';
 import type { CommandContext } from '@/cli/commandRegistry';
 import {
   FIRST_PARTY_COMPONENT_IDS,
+  FirstPartyPayloadMutationLockError,
   installVersionedPayload,
+  prepareFirstPartyComponentPayloadFromGitHubRelease,
+  resolveFirstPartyComponentRelease,
   resolveInstalledFirstPartyComponentPaths,
-  resolveFirstPartyComponentPublicReleaseVariant,
   resolveManagedCliReleaseChannelSync,
   resolveManagedCliToolNameForRing,
+  runManagedCliUpdate,
 } from '@happier-dev/cli-common/firstPartyRuntime';
 import type { FirstPartyComponentId } from '@happier-dev/cli-common/firstPartyRuntime';
-import { createStepPrinter } from '@happier-dev/cli-common/output';
+import { cmd, createStepPrinter, fail } from '@happier-dev/cli-common/output';
 import {
   compareVersions,
+  readCachedCliUpdateState,
   readNpmDistTagVersion,
-  readUpdateCache,
+  recordCliUpdateCheck,
   resolveNpmPackageNameOverride,
-  writeUpdateCache,
 } from '@happier-dev/cli-common/update';
-import { fetchGitHubReleaseByTag } from '@happier-dev/release-runtime/github';
 import {
   getReleaseRingCatalogEntry,
-  getReleaseRingPublicLabel,
   normalizePublicReleaseRingId,
   type PublicReleaseRingId,
 } from '@happier-dev/release-runtime/releaseRings';
-import {
-  resolveCliBinaryAssetBundleFromReleaseAssets,
-  updateInstalledCliPayloadFromReleaseAssets,
-} from '@/cli/runtime/update/binarySelfUpdate';
 import { handleSelfMigrateCommand } from './self/handleSelfMigrateCommand';
 import { maybeRunVersionGatedRuntimeMigration } from './self/maybeRunVersionGatedRuntimeMigration';
 import { maybeRunDoctorRepair } from './self/maybeRunDoctorRepair';
-import { quiesceInstalledCliWindowsPayloadOwners } from '@/cli/runtime/update/quiesceInstalledCliWindowsPayloadOwners';
+import { resolveRunningCliPackageManagerOrigin } from '@/cli/runtime/update/cliUpdateFacts';
+import { reportUpdaterAdmission } from '@/cli/runtime/update/updaterAdmission';
+import {
+  quiesceInstalledCliWindowsPayloadOwners,
+  resolvePayloadOwnerStopTimeoutMs,
+} from '@/cli/runtime/update/quiesceInstalledCliWindowsPayloadOwners';
+import { planServiceDaemonsRestartAfterUpdate } from '@/cli/runtime/update/restartServiceDaemonAfterUpdate';
+import { evaluateCurrentDaemonOwner } from '@/daemon/ownership/evaluateCurrentDaemonOwner';
+import { resolveCliVersionFromBinary } from '@/daemon/service/resolveCliVersionFromBinary';
 
 type SelfChannel = PublicReleaseRingId;
 
@@ -51,9 +56,9 @@ function usage(): string {
     `  happier self-update [--check] [--preview|--dev|--channel=<preview|dev>] [--to <versionOrTag>]`,
     '',
     `${chalk.bold('Channels:')}`,
-    `  stable  → npm dist-tag ${chalk.cyan('latest')}`,
-    `  preview → npm dist-tag ${chalk.cyan('next')}`,
-    `  dev     → npm dist-tag ${chalk.cyan('next')} (${chalk.gray('dev rolling binaries')})`,
+    `  stable  → npm dist-tag ${cmd('latest')}`,
+    `  preview → npm dist-tag ${cmd('next')}`,
+    `  dev     → npm dist-tag ${cmd('next')} (${chalk.gray('dev rolling binaries')})`,
     '',
     `${chalk.bold('Environment:')}`,
     `  HAPPIER_CLI_UPDATE_CHECK=0                 Disable update notice + background check`,
@@ -109,33 +114,6 @@ function resolveSelfNpmDistTag(channel: SelfChannel): 'latest' | 'next' {
   return channel === 'stable' ? 'latest' : 'next';
 }
 
-/**
- * The `next` npm dist-tag is shared by both preview and dev channels. When
- * `npm view @happier-dev/cli@next version` returns a version, it might be from
- * either channel. Verify the fetched version's prerelease identifier matches
- * the channel we're on — otherwise we'd announce "update available" across
- * channels (e.g. dev 0.2.5 being "updated" to preview 0.2.2).
- *
- * Prerelease tag contracts:
- *  - stable:  no prerelease identifier (e.g. "0.2.3")
- *  - preview: "-preview." prerelease (e.g. "0.2.3-preview.17...")
- *  - dev:     "-dev." prerelease     (e.g. "0.2.5-dev.17...")
- */
-export function doesVersionMatchChannel(version: string | null, channel: SelfChannel): boolean {
-  const v = String(version ?? '').trim();
-  if (!v) return false;
-  const prereleaseIndex = v.indexOf('-');
-  const prerelease = prereleaseIndex >= 0 ? v.slice(prereleaseIndex + 1) : '';
-  if (channel === 'stable') {
-    return prerelease === '';
-  }
-  if (channel === 'preview') {
-    return prerelease.startsWith('preview.') || prerelease === 'preview';
-  }
-  // publicdev
-  return prerelease.startsWith('dev.') || prerelease === 'dev';
-}
-
 function resolveSelfReleaseChannel(params: Readonly<{
   args: readonly string[];
   rawArgv?: readonly string[];
@@ -181,26 +159,6 @@ function resolveBinaryUpdateToken(env: NodeJS.ProcessEnv): string {
   return String(env.HAPPIER_GITHUB_TOKEN ?? env.GITHUB_TOKEN ?? '').trim();
 }
 
-function resolveBinaryUpdatePlatform(env: NodeJS.ProcessEnv): Readonly<{ os: string; arch: string }> {
-  const forcedOs = String(env.HAPPIER_SELF_UPDATE_OS ?? '').trim();
-  const forcedArch = String(env.HAPPIER_SELF_UPDATE_ARCH ?? '').trim();
-  if (forcedOs && forcedArch) return { os: forcedOs, arch: forcedArch };
-
-  const os = process.platform === 'linux' ? 'linux' : process.platform === 'darwin' ? 'darwin' : 'unsupported';
-  const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : 'unsupported';
-  if (os === 'unsupported' || arch === 'unsupported') {
-    throw new Error(`Unsupported platform for binary updates: ${process.platform}/${process.arch}`);
-  }
-  return { os, arch };
-}
-
-function resolveBinaryUpdateTag(channel: SelfChannel): string {
-  return resolveFirstPartyComponentPublicReleaseVariant({
-    componentId: 'happier-cli',
-    channel,
-  }).releaseTag;
-}
-
 function npmUpgradeCommand(params: Readonly<{ packageName: string; channel: SelfChannel; to: string }>): string {
   const pkg = String(params.packageName ?? '').trim();
   const to = String(params.to ?? '').trim();
@@ -208,18 +166,8 @@ function npmUpgradeCommand(params: Readonly<{ packageName: string; channel: Self
   return `npm install -g ${pkg}@${resolveSelfNpmDistTag(params.channel)}`;
 }
 
-function resolvePublicReleaseRingSuffix(ring: SelfChannel): 'stable' | 'preview' | 'dev' {
-  return getReleaseRingPublicLabel(ring);
-}
-
-function updateCachePath(channel: SelfChannel): string {
-  const suffix = resolvePublicReleaseRingSuffix(channel);
-  const fileName = suffix === 'stable' ? 'update.json' : `update.${suffix}.json`;
-  return join(configuration.happyHomeDir, 'cache', fileName);
-}
-
 function runtimeDir(channel: SelfChannel): string {
-  const suffix = resolvePublicReleaseRingSuffix(channel);
+  const suffix = getReleaseRingCatalogEntry(channel).publicLabel;
   return suffix === 'stable'
     ? join(configuration.happyHomeDir, 'runtime')
     : join(configuration.happyHomeDir, `runtime.${suffix}`);
@@ -255,40 +203,26 @@ async function cmdCheck(argv: string[], rawArgv: readonly string[] = process.arg
   const installSource = detectInstallSource(process.argv[1] ?? '');
 
   if (installSource === 'binary') {
-    const { os, arch } = resolveBinaryUpdatePlatform(process.env);
-    const githubRepo = resolveBinaryUpdateRepo(process.env);
-    const githubToken = resolveBinaryUpdateToken(process.env);
-    const tag = resolveBinaryUpdateTag(channel);
-
-    const release = await fetchGitHubReleaseByTag({ githubRepo, tag, githubToken, userAgent: 'happier-cli' });
-    const assets = typeof release === 'object' && release != null && 'assets' in release ? (release as any).assets : null;
-    const bundle = resolveCliBinaryAssetBundleFromReleaseAssets({ assets, os, arch, preferVersion: null });
-
-    const latest = bundle.version;
-    const invokerVersion = configuration.currentCliVersion;
-    const current = invokerVersion || null;
-    const updateAvailable = Boolean(current && latest && compareVersions(latest, current) > 0);
-
-    const existing = readUpdateCache(updateCachePath(channel));
-    const checkedAt = Date.now();
-    writeUpdateCache(updateCachePath(channel), {
-      checkedAt,
+    // The acquisition owner's own release lookup: the version `self update` would install, on
+    // every OS the release publishes (Windows included).
+    const { versionId: latest } = await resolveFirstPartyComponentRelease({
+      componentId: 'happier-cli',
+      channel,
+      githubRepo: resolveBinaryUpdateRepo(process.env),
+      githubToken: resolveBinaryUpdateToken(process.env),
+      userAgent: 'happier-cli',
+    });
+    const current = configuration.currentCliVersion || null;
+    recordCliUpdateCheck({
+      homeDir: configuration.happyHomeDir,
+      publicReleaseRing: channel,
       latest,
       current,
       runtimeVersion: null,
-      invokerVersion,
-      updateAvailable,
-      notifiedAt: existing?.notifiedAt ?? null,
+      invokerVersion: configuration.currentCliVersion,
     });
-
     if (quiet) return;
-
-    if (updateAvailable) {
-      console.log(chalk.yellow(`Update available: ${current ?? 'current'} → ${latest}`));
-      console.log(chalk.gray('Run:'), chalk.cyan(`${resolveManagedCliToolNameForRing(channel)} self update`));
-      return;
-    }
-    console.log(chalk.green('Up to date.'));
+    printCheckResult({ channel, current, latest });
     return;
   }
   const distTag = resolveSelfNpmDistTag(channel);
@@ -299,32 +233,30 @@ async function cmdCheck(argv: string[], rawArgv: readonly string[] = process.arg
   const invokerVersion = configuration.currentCliVersion;
   const current = runtimeVersion || invokerVersion || null;
 
-  const rawLatest = readNpmDistTagVersion({ packageName: pkgName, distTag, cwd: process.cwd(), env: process.env });
-  // Reject cross-channel results (preview/dev share the `next` dist-tag).
-  const latest = doesVersionMatchChannel(rawLatest, channel) ? rawLatest : null;
-  const updateAvailable = Boolean(current && latest && compareVersions(latest, current) > 0);
-
-  const existing = readUpdateCache(updateCachePath(channel));
-  const checkedAt = Date.now();
-  writeUpdateCache(updateCachePath(channel), {
-    checkedAt,
-    latest,
+  // Rejects cross-channel results itself (preview/dev share the `next` dist-tag).
+  recordCliUpdateCheck({
+    homeDir: configuration.happyHomeDir,
+    publicReleaseRing: channel,
+    latest: readNpmDistTagVersion({ packageName: pkgName, distTag, cwd: process.cwd(), env: process.env }),
     current,
     runtimeVersion,
     invokerVersion,
-    updateAvailable,
-    notifiedAt: existing?.notifiedAt ?? null,
   });
-
   if (quiet) return;
-
-  if (!latest) {
+  const cached = current
+    ? readCachedCliUpdateState({ homeDir: configuration.happyHomeDir, publicReleaseRing: channel, currentVersion: current })
+    : null;
+  if (!cached?.latestVersion) {
     console.log(chalk.gray('Unable to determine latest version (npm view failed).'));
     return;
   }
-  if (updateAvailable) {
-    console.log(chalk.yellow(`Update available: ${current ?? 'current'} → ${latest}`));
-    console.log(chalk.gray('Run:'), chalk.cyan(`${resolveManagedCliToolNameForRing(channel)} self update`));
+  printCheckResult({ channel, current, latest: cached.latestVersion });
+}
+
+function printCheckResult(params: Readonly<{ channel: SelfChannel; current: string | null; latest: string }>): void {
+  if (params.current && compareVersions(params.latest, params.current) > 0) {
+    console.log(chalk.yellow(`Update available: ${params.current} → ${params.latest}`));
+    console.log(chalk.gray('Run:'), cmd(`${resolveManagedCliToolNameForRing(params.channel)} self update`));
     return;
   }
   console.log(chalk.green('Up to date.'));
@@ -346,58 +278,65 @@ async function cmdUpdate(argv: string[], rawArgv: readonly string[] = process.ar
     const pkgName = resolveUpdatePackageName();
     const upgrade = npmUpgradeCommand({ packageName: pkgName, channel, to: toArg });
     console.log(chalk.yellow('Detected npm-based install; in-place runtime update is disabled.'));
-    console.log(chalk.gray('Run instead:'), chalk.cyan(upgrade));
+    console.log(chalk.gray('Run instead:'), cmd(upgrade));
+    reportUpdaterAdmission({ admitted: false, code: 'cli_not_managed', message: `This Happier CLI was installed with npm. Update it with: ${upgrade}` });
+    return;
+  }
+  const origin = resolveRunningCliPackageManagerOrigin({
+    invokedPath: process.argv[1] ?? '',
+    execPath: process.execPath,
+    npmPackageName: resolveUpdatePackageName(),
+  });
+  if (origin?.kind === 'brew') {
+    console.log(chalk.yellow('Detected a Homebrew install; Homebrew updates it.'));
+    console.log(chalk.gray('Run instead:'), cmd(origin.updateCommand));
+    reportUpdaterAdmission({ admitted: false, code: 'cli_not_managed', message: `This Happier CLI was installed with Homebrew. Update it with: ${origin.updateCommand}` });
     return;
   }
 
   const effective = (() => {
     const raw = String(toArg ?? '').trim();
-    if (raw === 'latest') return { channel: 'stable' as const, preferVersion: null };
-    if (raw === 'next') return { channel: 'preview' as const, preferVersion: null };
+    if (raw === 'latest') return { channel: 'stable' as const, targetVersion: undefined };
+    if (raw === 'next') return { channel: 'preview' as const, targetVersion: undefined };
     const v = raw.startsWith('v') ? raw.slice(1) : raw;
-    return { channel, preferVersion: v || null };
+    return { channel, targetVersion: v || undefined };
   })();
+  const processEnv = { ...process.env, HAPPIER_HOME_DIR: configuration.happyHomeDir };
 
-  const { os, arch } = resolveBinaryUpdatePlatform(process.env);
-  const githubRepo = resolveBinaryUpdateRepo(process.env);
-  const githubToken = resolveBinaryUpdateToken(process.env);
-  const tag = resolveBinaryUpdateTag(effective.channel);
-  const minisignPubkeyFile = String(process.env.HAPPIER_MINISIGN_PUBKEY ?? '').trim() || undefined;
-  const release = await runSelfUpdateStep(steps, 'Resolving release metadata', async () => {
-    return await fetchGitHubReleaseByTag({
-      githubRepo,
-      tag,
-      githubToken,
-      userAgent: 'happier-cli',
-    });
-  });
-  const assets = typeof release === 'object' && release != null && 'assets' in release ? (release as any).assets : null;
-  resolveCliBinaryAssetBundleFromReleaseAssets({
-    assets,
-    os,
-    arch,
-    preferVersion: effective.preferVersion,
-  });
-
-  await quiesceInstalledCliWindowsPayloadOwners({
+  // Observed before anything changes: on Windows the update stops the payload's processes (every
+  // relay's daemon), and only this observation still knows which service daemons must come back.
+  const restartPlan = await planServiceDaemonsRestartAfterUpdate({
     channel: effective.channel,
-    processEnv: {
-      ...process.env,
-      HAPPIER_HOME_DIR: configuration.happyHomeDir,
-    },
+    ownerBeforeUpdate: await evaluateCurrentDaemonOwner(),
+    processEnv,
   });
 
-  const result = await runSelfUpdateStep(steps, 'Downloading and installing payload', async () => {
-    return await updateInstalledCliPayloadFromReleaseAssets({
-      assets,
-      os,
-      arch,
-      happyHomeDir: configuration.happyHomeDir,
-      preferVersion: effective.preferVersion,
-      minisignPubkeyFile,
-      channel: effective.channel,
-    });
-  });
+  const result = await runSelfUpdateStep(steps, 'Downloading, verifying and installing', async () => await runManagedCliUpdate({
+    channel: effective.channel,
+    processEnv,
+    // A daemon that started this run (remote `cli.update.v1`) answers its task only after this.
+    onAdmitted: () => reportUpdaterAdmission({ admitted: true }),
+    targetVersion: effective.targetVersion,
+    preparePayload: async (params) => await prepareFirstPartyComponentPayloadFromGitHubRelease({
+      ...params,
+      githubRepo: resolveBinaryUpdateRepo(process.env),
+      githubToken: resolveBinaryUpdateToken(process.env),
+      userAgent: 'happier-cli',
+      minisignPubkeyFile: String(process.env.HAPPIER_MINISIGN_PUBKEY ?? '').trim() || undefined,
+    }),
+    readVersion: async (command) => resolveCliVersionFromBinary({
+      binaryPath: command,
+      platform: process.platform,
+      timeoutMs: resolvePayloadOwnerStopTimeoutMs(processEnv),
+    }),
+    beforeActivate: process.platform === 'win32'
+      ? async () => await quiesceInstalledCliWindowsPayloadOwners({ channel: effective.channel, processEnv })
+      : undefined,
+    restartServiceDaemon: restartPlan.restart,
+  }));
+  if (result.outcome !== 'succeeded') {
+    throw new Error(result.message);
+  }
 
   // Refresh cache best-effort.
   await runSelfUpdateStep(steps, 'Refreshing update cache', async () => {
@@ -412,11 +351,20 @@ async function cmdUpdate(argv: string[], rawArgv: readonly string[] = process.ar
     ]);
   });
   const updatedToolName = resolveManagedCliToolNameForRing(effective.channel);
-  console.log(chalk.green(`✓ Updated ${updatedToolName} to ${result.updatedTo}`));
+  console.log(chalk.green(result.changed
+    ? `✓ Updated ${updatedToolName} to ${result.targetVersion}`
+    : `✓ ${updatedToolName} is already ${result.targetVersion}`));
+  if (result.restarted) {
+    console.log(chalk.green(restartPlan.labels.length > 1
+      ? `✓ The background services (${restartPlan.labels.join(', ')}) now run ${result.targetVersion}`
+      : `✓ The background service now runs ${result.targetVersion}`));
+  }
+  if (restartPlan.unmanagedMessage) {
+    console.log(chalk.yellow(restartPlan.unmanagedMessage));
+  }
   const migrationRan = await maybeRunVersionGatedRuntimeMigration({
-    fromVersion: result.previousVersionId,
-    toVersion: result.updatedTo,
-    hadLegacyCurrentInstallWithoutVersionMarkers: result.hadLegacyCurrentInstallWithoutVersionMarkers,
+    fromVersion: result.previousVersion,
+    toVersion: result.targetVersion,
     argv: ['repair'],
     commandPath: `${updatedToolName} doctor`,
   });
@@ -493,6 +441,11 @@ async function cmdInternalInstallPayload(argv: string[], rawArgv: readonly strin
     throw new Error('--version is required');
   }
 
+  // On Windows promotion stops every daemon of the payload (every relay's); the service daemons
+  // observed running here come back afterwards through the same rule `self update` uses.
+  const windowsServiceRestart = componentId === 'happier-cli' && process.platform === 'win32'
+    ? await planServiceDaemonsRestartAfterUpdate({ channel, processEnv: process.env })
+    : null;
   if (componentId === 'happier-cli') {
     await quiesceInstalledCliWindowsPayloadOwners({
       channel,
@@ -507,7 +460,19 @@ async function cmdInternalInstallPayload(argv: string[], rawArgv: readonly strin
     payloadRootAlreadyFiltered: true,
     processEnv: process.env,
     versionId,
+    // The official installers run this for the channel the user asked them to install, and that
+    // choice is what makes a channel the default `happier` command (install.sh / install.ps1).
+    selectAsDefaultReleaseChannel: true,
   });
+
+  if (windowsServiceRestart?.restart && promotion.currentVersionId) {
+    // The installer continues either way (it installs the default service next); a daemon that did
+    // not come back is named rather than failing the promotion.
+    await windowsServiceRestart.restart({ expectedVersion: promotion.currentVersionId, phase: 'activated' })
+      .catch((error: unknown) => {
+        console.error(chalk.yellow(`Background services stopped for the update did not all come back: ${error instanceof Error ? error.message : String(error)}`));
+      });
+  }
 
   if (componentId === 'happier-cli' && !shouldSkipInstallPayloadMigration(process.env)) {
     await withInstalledCliMigrationRuntime({
@@ -551,11 +516,17 @@ export async function handleSelfCliCommand(context: CommandContext): Promise<voi
       await cmdInternalInstallPayload(argv.slice(1), context.rawArgv);
       return;
     }
-    console.error(chalk.red('Error:'), `Unknown self subcommand: ${sub}`);
+    console.error(fail(`Unknown self subcommand: ${sub}`));
     console.log(usage());
     process.exit(1);
   } catch (error) {
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    // A detached updater that ends before admission tells the daemon waiting for it (no-op otherwise).
+    reportUpdaterAdmission({
+      admitted: false,
+      code: error instanceof FirstPartyPayloadMutationLockError ? 'cli_update_in_progress' : 'cli_update_failed',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    });
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     if (process.env.DEBUG) {
       console.error(error);
     }

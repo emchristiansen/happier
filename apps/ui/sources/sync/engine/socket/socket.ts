@@ -8,8 +8,6 @@ import type { Machine } from '@/sync/domains/state/storageTypes';
 import { buildPendingChangedSessionPatch } from './pendingChangedSessionPatch';
 import { isSessionVisible } from '@/sync/domains/session/activeViewingSession';
 import { computeNextSessionSeqFromUpdate } from '@/sync/domains/session/sequence/realtimeSessionSeq';
-import { resolveLastViewedSessionSeq } from '@/sync/domains/session/readCursor/resolveLastViewedSessionSeq';
-import { resolveSessionReadableSeq } from '@/sync/domains/session/readCursor/resolveSessionReadableSeq';
 import { resolveSessionLiveConsumption } from '@/sync/runtime/sessionLiveConsumption';
 import type { MachineActivityUpdate } from '@/sync/reducer/machineActivityAccumulator';
 import { storage } from '@/sync/domains/state/storage';
@@ -69,10 +67,10 @@ import {
     applySessionListRenderablePatch,
     areSessionRuntimeIssuesEqual,
     buildSessionListRenderableMetadata,
+    deriveSessionListRenderableHasUnreadMessagesFromPatch,
     didSessionListRenderableEmbeddedListRowFieldsChange,
     type SessionListRenderableSession,
 } from '@/sync/domains/session/listing/sessionListRenderable';
-import { computeHasUnreadActivity } from '@/sync/domains/messages/unread';
 import {
     storedSessionMessageAttentionImpact,
     storedSessionMessageAttentionImpactOrNull,
@@ -275,7 +273,10 @@ async function hydrateCacheOnlySessionMetadataProjection(
         metadata: buildSessionListRenderableMetadata(metadata),
         metadataVersion: metadataPayload.version,
     };
-    patch.hasUnreadMessages = computeCacheOnlySessionRenderableHasUnreadMessages(current, patch);
+    patch.hasUnreadMessages = deriveSessionListRenderableHasUnreadMessagesFromPatch({
+        renderable: current,
+        patch,
+    });
     applyCacheOnlySessionUpdateProjectionPatch({
         sessionId,
         renderable: current,
@@ -463,45 +464,15 @@ function buildCacheOnlySessionProjectionPatch(params: Readonly<{
         patch.meaningfulActivityAt = updateBody.meaningfulActivityAt;
     }
     Object.assign(patch, buildSessionRuntimeActivityProjectionPatch(renderable, updateBody));
-    patch.hasUnreadMessages = computeCacheOnlySessionRenderableHasUnreadMessages(renderable, patch);
-    return patch;
-}
-
-function computeCacheOnlySessionRenderableHasUnreadMessages(
-    renderable: SessionListRenderableSession,
-    patch: Readonly<Partial<Omit<SessionListRenderableSession, 'id'>>>,
-    readableSeqOverride?: Readonly<{ seq: number | null; affectsUnread: boolean }> | null,
-): boolean {
-    const nextMetadata = patch.metadata === undefined ? renderable.metadata : patch.metadata;
-    const nextLastViewedSessionSeq = patch.lastViewedSessionSeq === undefined
-        ? renderable.lastViewedSessionSeq
-        : patch.lastViewedSessionSeq;
-    const shouldUsePatchedSessionSeq = readableSeqOverride?.affectsUnread !== false;
-    const projectedReadableSeq = resolveSessionReadableSeq({
-        messages: null,
-        sessionSeq: shouldUsePatchedSessionSeq ? patch.seq ?? renderable.seq : renderable.seq,
-        latestReadyEventSeq: patch.latestReadyEventSeq === undefined
-            ? renderable.latestReadyEventSeq
-            : patch.latestReadyEventSeq,
-        latestTurnStatus: patch.latestTurnStatus === undefined
-            ? renderable.latestTurnStatus
-            : patch.latestTurnStatus,
-        includeTerminalSessionSeq: true,
-    }) ?? 0;
-    const explicitReadableSeq = readableSeqOverride?.affectsUnread === true ? readableSeqOverride.seq : null;
-    const readableSeq = explicitReadableSeq === null || explicitReadableSeq === undefined
-        ? projectedReadableSeq
-        : Math.max(projectedReadableSeq, Math.max(0, Math.trunc(explicitReadableSeq)));
-
-    return computeHasUnreadActivity({
-        sessionSeq: readableSeq,
-        pendingActivityAt: 0,
-        lastViewedSessionSeq: resolveLastViewedSessionSeq({
-            lastViewedSessionSeq: nextLastViewedSessionSeq,
-            metadata: nextMetadata,
-        }),
-        lastViewedPendingActivityAt: nextMetadata?.readStateV1?.pendingActivityAt,
+    patch.hasUnreadMessages = deriveSessionListRenderableHasUnreadMessagesFromPatch({
+        renderable,
+        patch,
+        recomputeUnread:
+            typeof updateBody.lastViewedSessionSeq === 'number'
+            || typeof updateBody.latestReadyEventSeq === 'number'
+            || isTerminalTurnStatus(updateBody.latestTurnStatus),
     });
+    return patch;
 }
 
 async function resolveCacheOnlySessionRenderableMetadata(params: Readonly<{
@@ -675,11 +646,12 @@ function buildCacheOnlyDurableMessageProjectionPatch(params: Readonly<{
             ? renderable.meaningfulActivityAt
             : Math.max(currentMeaningfulActivityAt ?? meaningfulActivityCandidate, meaningfulActivityCandidate),
     };
-    patch.hasUnreadMessages = computeCacheOnlySessionRenderableHasUnreadMessages(
+    patch.hasUnreadMessages = deriveSessionListRenderableHasUnreadMessagesFromPatch({
         renderable,
         patch,
-        { seq: messageSeq, affectsUnread: attentionImpact.affectsUnread },
-    );
+        explicitReadableSeq: attentionImpact.affectsUnread ? messageSeq : null,
+        recomputeUnread: attentionImpact.affectsUnread && messageSeq !== null,
+    });
     return patch;
 }
 
@@ -910,6 +882,30 @@ function shouldSkipFreshTimestampOnlyRenderableActivityPatch(
         || nextRuntimeTimestamp - previousRuntimeTimestamp < CACHE_ONLY_ACTIVITY_TIMESTAMP_PATCH_MIN_INTERVAL_MS;
 }
 
+function shouldApplyActivityPatch(
+    current: Pick<SessionListRenderableSession, 'active' | 'activeAt' | 'thinking' | 'thinkingAt' | 'presence' | 'updatedAt'>,
+    patch: ActivityRenderablePatch,
+): boolean {
+    // Runtime heartbeats can trail a newer durable projection while still refreshing live work.
+    if (isTimestampOnlyActivityPatch(current, patch)) {
+        return !isStaleTimestampOnlyActivityPatch(current, patch);
+    }
+    // A newer stop is authoritative even when durable transcript activity advanced updatedAt.
+    const isThinkingStop = patch.thinking === false
+        && current.thinking === true
+        && patch.active === current.active
+        && patch.activeAt >= current.activeAt;
+    if (isThinkingStop) return true;
+    if (patch.active === false && patch.thinking === false) {
+        return patch.activeAt >= current.activeAt;
+    }
+    // Equal timestamps cannot let a delayed working heartbeat undo a published stop.
+    const isThinkingResurrection = patch.thinking === true && current.thinking !== true;
+    return isThinkingResurrection
+        ? patch.activeAt > current.updatedAt
+        : patch.activeAt >= current.updatedAt;
+}
+
 function shouldApplyCacheOnlyActivityRenderablePatch(
     sessionId: string,
     patch: ActivityRenderablePatch,
@@ -918,19 +914,8 @@ function shouldApplyCacheOnlyActivityRenderablePatch(
     const renderable = storage.getState().sessionListRenderables[sessionId];
     if (!renderable) return false;
 
-    const isTimestampOnlyPatch = isTimestampOnlyActivityPatch(renderable, patch);
-    const isTurningOff = patch.active === false && patch.thinking === false;
-    if (!isTimestampOnlyPatch) {
-        if (isTurningOff) {
-            if (patch.activeAt < renderable.activeAt) return false;
-        } else if (patch.activeAt < renderable.updatedAt) {
-            return false;
-        }
-    }
-    if (isTimestampOnlyPatch && shouldSkipFreshTimestampOnlyRenderableActivityPatch(renderable, patch)) {
-        return false;
-    }
-    return true;
+    return shouldApplyActivityPatch(renderable, patch)
+        && !shouldSkipFreshTimestampOnlyRenderableActivityPatch(renderable, patch);
 }
 
 // Legacy-server fallback: hidden durable messages whose fan-out payload lacks
@@ -1575,6 +1560,9 @@ export async function handleUpdateContainer(params: {
                 ...session,
                 ...pendingPatch,
             }], shouldContinue);
+            // Publish the receipt's version before yielding: an older pending GET must observe
+            // this frontier even while transcript materialization is still in flight.
+            flushQueuedSocketSessionApplies(applySessions, [sessionId]);
         }
 
         if (pendingPatch.pendingCount === 0) {
@@ -2188,49 +2176,7 @@ export function flushActivityUpdates(params: {
                 presence: update.active ? 'online' as const : update.activeAt,
                 updatedAt: update.activeAt,
             };
-            const isTimestampOnlyPatch = isTimestampOnlyActivityPatch(session, patch);
-            const isTurningOff = update.active === false && nextThinking === false;
-            const isThinkingResurrection = nextThinking === true && session.thinking !== true;
-            const isThinkingStop =
-                nextThinking === false
-                && session.thinking === true
-                && update.active === session.active
-                && update.activeAt >= session.activeAt;
-
-            // Most state-changing activity ephemerals should be ignored when they predate a newer durable/lifecycle update
-            // (for example a recent turn_aborted/task_complete clear). Otherwise old "thinking=true" ephemerals
-            // can resurrect a completed session into a stuck state.
-            //
-            // Timestamp-only runtime heartbeats are different: durable message/session projections can advance
-            // `updatedAt` while the runtime remains actively thinking. Those heartbeats must still refresh
-            // activeAt/thinkingAt so the visible working status does not expire while the daemon is still active.
-            //
-            // Exception: when we receive a "turn off" activity update (active=false, thinking=false), apply it
-            // even if it predates session.updatedAt, as long as it is not older than the session's last-known
-            // activity timestamp. This prevents "session ended" updates from being dropped when a terminal
-            // shutdown message (or similar durable update) bumps updatedAt slightly after activeAt.
-            if (isTimestampOnlyPatch && isStaleTimestampOnlyActivityPatch(session, patch)) {
-                continue;
-            }
-            // A durable terminal projection can advance `updatedAt` before the
-            // daemon's activity-off event arrives. That event is still the
-            // authoritative working -> online transition when its activity
-            // timestamp is newer than the last activity heartbeat.
-            if (!isTimestampOnlyPatch && !isThinkingStop) {
-                if (isTurningOff) {
-                    if (update.activeAt < session.activeAt) continue;
-                } else {
-                    // Be slightly stricter when an activity update would re-enable thinking, because some
-                    // server clocks/reporting paths can produce equal timestamps for the lifecycle clear and
-                    // the older "thinking=true" activity update. Using `<=` here prevents resurrecting sessions
-                    // into a stuck "working" state after the turn has completed.
-                    if (isThinkingResurrection) {
-                        if (update.activeAt <= session.updatedAt) continue;
-                    } else {
-                        if (update.activeAt < session.updatedAt) continue;
-                    }
-                }
-            }
+            if (!shouldApplyActivityPatch(session, patch)) continue;
             sessions.push({
                 ...session,
                 active: update.active,
@@ -2259,14 +2205,7 @@ export function flushActivityUpdates(params: {
                 updatedAt: Math.max(finiteNumber(renderable.updatedAt) ?? update.activeAt, update.activeAt),
             };
             const isTimestampOnlyPatch = isTimestampOnlyActivityPatch(renderable, patch);
-            const isTurningOff = update.active === false && nextThinking === false;
-            if (!isTimestampOnlyPatch) {
-                if (isTurningOff) {
-                    if (update.activeAt < renderable.activeAt) continue;
-                } else if (update.activeAt < renderable.updatedAt) {
-                    continue;
-                }
-            }
+            if (!shouldApplyActivityPatch(renderable, patch)) continue;
             if (isTimestampOnlyPatch && shouldSkipFreshTimestampOnlyRenderableActivityPatch(renderable, patch)) {
                 renderableTimestampOnlySkippedFreshPatchCount += 1;
                 continue;

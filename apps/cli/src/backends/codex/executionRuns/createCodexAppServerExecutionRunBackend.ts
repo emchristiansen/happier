@@ -1,10 +1,9 @@
-import type { ApiSessionClient } from '@/api/session/sessionClient';
 import type { ACPMessageData, ACPProvider } from '@/api/session/sessionMessageTypes';
 import { readNonBlankSessionControlIdentifier } from '@/agent/runtime/sessionControlIdentifiers';
 import type { AgentBackend, AgentMessage, AgentMessageHandler, SessionId, StartSessionResult } from '@/agent/core';
 import type { PermissionMode } from '@/api/types';
 import type { ExecutionRunBackendStartContext } from '@/agent/executionRuns/registry/executionRunBackendTypes';
-import { createCodexAppServerRuntime } from '@/backends/codex/appServer/runtime';
+import { createCodexAppServerRuntime, type CodexAppServerRuntimeSession } from '@/backends/codex/appServer/runtime';
 import { createExecutionRunTimeoutError } from '@/agent/executionRuns/runtime/executionRunErrors';
 import type {
   CodexAppServerReviewStartRequest,
@@ -174,11 +173,10 @@ export function createCodexAppServerExecutionRunBackend(args: Readonly<{
     lastObservedMessageSeq += 1;
   };
 
-  const sessionAdapter: Pick<ApiSessionClient,
-    'sessionId' | 'getLastObservedMessageSeq' | 'updateMetadata' | 'sendAgentMessage' | 'sendAgentMessageCommitted' | 'sendCodexMessage' | 'sendSessionEvent'
-  > = {
+  const sessionAdapter: CodexAppServerRuntimeSession = {
     sessionId: 'codex-app-server-execution-run',
     getLastObservedMessageSeq: () => lastObservedMessageSeq,
+    getMetadataSnapshot: () => null,
     updateMetadata: async () => undefined,
     // Execution runs have no main-session event projection. In particular, their
     // compaction must not be reported as compaction of the parent session.
@@ -228,7 +226,7 @@ export function createCodexAppServerExecutionRunBackend(args: Readonly<{
     directory: args.cwd,
     activeServerDir: args.cwd,
     processEnv: args.env ?? process.env,
-    session: sessionAdapter as ApiSessionClient,
+    session: sessionAdapter,
     onThinkingChange: (thinking) => {
       emit({ type: 'status', status: thinking ? 'running' : 'idle' });
     },

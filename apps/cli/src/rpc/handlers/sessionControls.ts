@@ -34,6 +34,10 @@ import {
   buildUnsupportedSessionPendingInputInterruptAndRunResult,
   type SessionPendingInputInterruptAndRunRequestV1,
   type SessionPendingInputInterruptAndRunResultV1,
+  SessionProviderCliAttachPrepareRequestV1Schema,
+  SessionProviderCliAttachPrepareResultV1Schema,
+  type SessionProviderCliAttachPrepareRequestV1,
+  type SessionProviderCliAttachPrepareResultV1,
 } from '@happier-dev/protocol';
 import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
 import { mergeUsageLimitRecoveryFieldIntoMetadata } from '@/session/usageLimitRecoveryControls/persistUsageLimitRecoveryFieldDurably';
@@ -47,6 +51,9 @@ import type { Metadata } from '@/api/types';
 import type { RpcHandlerRegistrar } from '@/api/rpc/types';
 
 export type SessionRuntimeControls = {
+  prepareProviderCliAttach?: (
+    request: Readonly<SessionProviderCliAttachPrepareRequestV1>,
+  ) => Promise<SessionProviderCliAttachPrepareResultV1>;
   refreshGoal?: () => unknown;
   setGoal?: (
     objective: string | undefined,
@@ -337,6 +344,15 @@ export function registerSessionControlHandlers(
       await opts.sessionRuntimeControls.clearTerminalComposer(parsed.data),
       parsed.data.sessionId,
     );
+  });
+
+  rpc.registerHandler(SESSION_RPC_METHODS.SESSION_PROVIDER_CLI_ATTACH_PREPARE_V1, async (raw: unknown) => {
+    const parsed = SessionProviderCliAttachPrepareRequestV1Schema.safeParse(raw);
+    if (!parsed.success) return invalidInput();
+    const prepare = opts.sessionRuntimeControls?.prepareProviderCliAttach;
+    if (!prepare) return unsupported(SESSION_RPC_METHODS.SESSION_PROVIDER_CLI_ATTACH_PREPARE_V1);
+    const result = SessionProviderCliAttachPrepareResultV1Schema.safeParse(await prepare(parsed.data));
+    return result.success ? result.data : invalidRuntimeControlResult();
   });
 
   rpc.registerHandler(SESSION_RPC_METHODS.SESSION_PENDING_INPUT_INTERRUPT_AND_RUN, async (raw: unknown) => {

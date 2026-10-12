@@ -48,6 +48,10 @@ describe('commandRegistry install/update aliases', () => {
     expect(commandRegistry.status).toBeTypeOf('function');
   });
 
+  it('registers the Herdr terminal client entry point', () => {
+    expect(commandRegistry.herdr).toBeTypeOf('function');
+  });
+
   it('registers bridge command namespace', () => {
     expect(commandRegistry.bridge).toBeTypeOf('function');
   });

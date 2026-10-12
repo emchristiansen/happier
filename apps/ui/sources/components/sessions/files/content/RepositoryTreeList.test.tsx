@@ -33,7 +33,7 @@ const theme = vi.hoisted(() => ({
         surfacePressedOverlay: 'rgba(255, 255, 255, 0.08)',
         surfaceSelected: '#191919',
         divider: '#333',
-        text: '#eee',
+        text: { primary: '#eee', secondary: '#aaa', link: '#08f' },
         textSecondary: '#aaa',
         textLink: '#08f',
         accent: {

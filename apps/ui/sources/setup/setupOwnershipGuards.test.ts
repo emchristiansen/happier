@@ -47,25 +47,42 @@ describe('setup ownership guards', () => {
         expect(imports.length).toBeGreaterThan(0);
         expect(imports.filter((line) => /daemon|reconcil|systemTask|setupCoordinator/i.test(line))).toEqual([]);
         expect(imports.filter((line) => /@\/setup\//.test(line))).toEqual([
-            "import { recordDirectRelaySelectionIntent } from '@/setup/directRelaySelectionIntent';",
+            "import { selectRelayDirectly } from '@/setup/directRelaySelectionIntent';",
         ]);
     });
 
     /**
-     * The intent is what authorises repointing this computer's background service, so exactly two
-     * sites may arm it, and both are an explicit single-relay pick by a person: the connection
-     * status control and the settings-server profile switch. The screen's shared `switchServerById`
-     * helper is deliberately not one of them — deep-link auto-add and group actions reach it too.
+     * The intent is what authorises repointing this computer's background service. It is armed by
+     * one operation, `selectRelayDirectly`, which also performs the switch, so no call site can
+     * repeat the "record, then switch" pattern and forget half of it (the Settings Add path did).
      */
-    it('keeps exactly the two explicit relay picks recording the intent (R8/INV7)', () => {
+    it('arms the intent only inside the one direct-selection operation (R8/INV7)', () => {
         const recorders = listSourceFiles(SOURCES_ROOT)
             .filter((path) => readFileSync(path, 'utf8').includes('recordDirectRelaySelectionIntent('))
+            .map((path) => path.slice(SOURCES_ROOT.length + 1));
+
+        expect(recorders).toEqual(['setup/directRelaySelectionIntent.ts']);
+    });
+
+    /**
+     * Exactly the surfaces where a person chooses one relay for this device call it: the connection
+     * status control, the onboarding `/setup` relay pick and custom-relay add, and Settings › Server
+     * (profile pick, Add — including a notification-prefilled form the person still submits — and a
+     * confirmed Reset), and a background-service relay chosen from the desktop tray.
+     * Deep-link auto-add, group selection,
+     * notification routing, voice and session navigation keep the raw switch and arm nothing.
+     */
+    it('keeps the direct-selection operation to the explicit relay-choice surfaces (R8/INV7)', () => {
+        const callers = listSourceFiles(SOURCES_ROOT)
+            .filter((path) => readFileSync(path, 'utf8').includes('selectRelayDirectly('))
             .map((path) => path.slice(SOURCES_ROOT.length + 1))
             .sort();
 
-        expect(recorders).toEqual([
+        expect(callers).toEqual([
+            'app/(app)/setup/index.tsx',
             'components/navigation/ConnectionStatusControl.tsx',
-            'components/settings/server/hooks/useServerSettingsServerProfileActions.ts',
+            'components/settings/server/hooks/useServerSettingsScreenController.ts',
+            'desktop/tray/DesktopTrayRuntime.tsx',
             'setup/directRelaySelectionIntent.ts',
         ]);
     });

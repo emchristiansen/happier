@@ -1,5 +1,6 @@
 import type { Metadata } from '@/api/types';
 import {
+  buildOpenCodeAgentRuntimeDescriptor,
   readOpenCodeSessionAffinityFromMetadata,
   readOpenCodeSessionRuntimeHandleFromMetadata,
   type OpenCodeSessionAffinity,
@@ -32,12 +33,18 @@ export function applyOpenCodeSessionAffinityMetadata(
     vendorSessionId?: string | null;
     serverBaseUrl?: string | null;
     serverBaseUrlExplicit?: boolean;
+    managedServerLaunchFingerprint?: string | null;
   }>,
 ): Partial<Metadata> {
   const nextVendorSessionId = typeof params.vendorSessionId === 'string' ? params.vendorSessionId.trim() : '';
   const nextServerBaseUrl = params.serverBaseUrlExplicit ? params.serverBaseUrl : null;
 
   return {
+    ...(params.backendMode ? { agentRuntimeDescriptorV1: buildOpenCodeAgentRuntimeDescriptor({
+      backendMode: params.backendMode, vendorSessionId: nextVendorSessionId,
+      serverBaseUrl: nextServerBaseUrl, serverBaseUrlExplicit: params.serverBaseUrlExplicit,
+      managedServerLaunchFingerprint: params.managedServerLaunchFingerprint,
+    }) } : {}),
     ...(nextVendorSessionId ? { opencodeSessionId: nextVendorSessionId } : {}),
     ...(params.backendMode ? { opencodeBackendMode: params.backendMode } : {}),
     ...(nextServerBaseUrl ? { opencodeServerBaseUrl: nextServerBaseUrl } : {}),

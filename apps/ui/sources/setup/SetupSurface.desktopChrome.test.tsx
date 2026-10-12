@@ -27,20 +27,12 @@ import type { SetupLocalFacts } from './setupStageModel';
 const FACTS: SetupLocalFacts = { relayDisplayName: 'relay.example.test', entry: 'setup', startFailure: null };
 
 describe('SetupSurface desktop chrome', () => {
-    it('leaves window controls and titlebar dragging with the app shell on the first-run ground', async () => {
-        const screen = await renderScreen(<SetupSurface run={null} facts={FACTS} material="ground" />);
+    it('leaves window controls and titlebar dragging with the app shell it sits in (R11)', async () => {
+        const screen = await renderScreen(<SetupSurface run={null} facts={FACTS} />);
 
-        expect(screen.findByTestId('setup-surface-desktop-chrome')).toBeNull();
-        expect(screen.findByTestId('desktop-main-content-drag-surface')).toBeNull();
-    });
-
-    it('leaves window controls with the mounted shell under the maintenance veil', async () => {
-        const screen = await renderScreen(<SetupSurface run={null} facts={FACTS} material="veil" />);
-
-        // The shell remains mounted under the veil and keeps its one controls and drag owners.
+        // A veil over the Home content inside the running shell: that shell keeps its one controls and drag owners.
         expect(screen.findByTestId('setup-surface:veil')).not.toBeNull();
         expect(screen.findByTestId('setup-surface-desktop-chrome')).toBeNull();
         expect(screen.findByTestId('desktop-main-content-drag-surface')).toBeNull();
     });
-
 });

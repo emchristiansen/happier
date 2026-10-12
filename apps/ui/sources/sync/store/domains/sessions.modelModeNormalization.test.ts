@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createSessionsDomain } from './sessions';
+import { createSessionFixture } from '@/dev/testkit';
 import {
     clearPersistence,
     loadSessionModelModeUpdatedAts,
@@ -110,6 +111,25 @@ describe('sessions domain: modelMode normalization', () => {
         });
     });
 
+    it('retains a fresh discovered selection through metadata refresh and persisted reload', () => {
+        const { get, domain } = createHarness();
+        const session = createSessionFixture({
+            id: 's1',
+            metadata: {
+                path: '/tmp', host: 'test', flavor: 'codex',
+                sessionModelsV1: { v: 1, provider: 'codex', updatedAt: 1, currentModelId: 'old', availableModels: [{ id: 'old', name: 'Old' }] },
+            },
+        });
+        domain.applySessions([session]);
+        domain.updateSessionModelMode('s1', 'new', { preflight: { availableModels: [{ id: 'new', name: 'New' }], supportsFreeform: false }, preflightUpdatedAt: 2 });
+        expect(get().sessions.s1.modelMode).toBe('new');
+        domain.applySessions([session]);
+        expect(get().sessions.s1.modelMode).toBe('new');
+        const reloaded = createHarness();
+        reloaded.domain.applySessions([session]);
+        expect(reloaded.get().sessions.s1.modelMode).toBe('new');
+    });
+
     it('clamps invalid local model selections for agents without freeform model selection', () => {
         const { get, domain } = createHarness();
 
@@ -128,7 +148,7 @@ describe('sessions domain: modelMode normalization', () => {
         expect(get().sessions.s1.modelMode).toBe('default');
     });
 
-    it('clamps invalid persisted model modes to default for agents without freeform model selection', () => {
+    it('preserves previously requested persisted models when discovery is unavailable', () => {
         saveSessionModelModes({ s1: 'not-a-real-model' });
         saveSessionModelModeUpdatedAts({ s1: 123 });
 
@@ -144,7 +164,7 @@ describe('sessions domain: modelMode normalization', () => {
             } as any,
         ]);
 
-        expect(get().sessions.s1.modelMode).toBe('default');
+        expect(get().sessions.s1.modelMode).toBe('not-a-real-model');
         expect(get().sessions.s1.modelModeUpdatedAt).toBe(123);
     });
 
@@ -168,7 +188,7 @@ describe('sessions domain: modelMode normalization', () => {
         expect(get().sessions.s1.modelModeUpdatedAt).toBe(123);
     });
 
-    it('ignores invalid metadata model overrides for agents without freeform model selection', () => {
+    it('preserves explicit metadata model overrides when discovery is unavailable', () => {
         const { get, domain } = createHarness();
 
         domain.applySessions([
@@ -184,11 +204,11 @@ describe('sessions domain: modelMode normalization', () => {
             } as any,
         ]);
 
-        expect(get().sessions.s1.modelMode).toBe('default');
+        expect(get().sessions.s1.modelMode).toBe('not-a-real-model');
         expect(get().sessions.s1.modelModeUpdatedAt).toBe(1000);
     });
 
-    it('does not churn clamped metadata model overrides across repeated applySessions calls', () => {
+    it('does not churn requested metadata model overrides across repeated applySessions calls', () => {
         const { get, domain } = createHarness();
         const payload = {
             id: 's1',
@@ -206,7 +226,7 @@ describe('sessions domain: modelMode normalization', () => {
         domain.applySessions([payload]);
         const secondUpdatedAt = get().sessions.s1.modelModeUpdatedAt;
 
-        expect(get().sessions.s1.modelMode).toBe('default');
+        expect(get().sessions.s1.modelMode).toBe('not-a-real-model');
         expect(firstUpdatedAt).toBe(1000);
         expect(secondUpdatedAt).toBe(1000);
     });

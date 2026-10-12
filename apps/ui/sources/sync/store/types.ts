@@ -1,3 +1,4 @@
+import type { SessionModelOptionsContext } from '@/sync/domains/models/modelOptions';
 import type { TodoState } from '@/sync/domains/todos/todoOps';
 import type { TranscriptLoadingDomain } from './domains/transcriptLoading';
 
@@ -138,7 +139,7 @@ export interface SessionsDomainSlice {
     clearSessionThinkingGrace: (sessionId: string) => void;
     markSessionViewed: (sessionId: string) => void;
     updateSessionPermissionMode: (sessionId: string, mode: PermissionMode) => void;
-    updateSessionModelMode: (sessionId: string, mode: SessionModelMode) => void;
+    updateSessionModelMode: (sessionId: string, mode: SessionModelMode, context?: SessionModelOptionsContext) => void;
     deleteSession: (sessionId: string) => void;
 }
 

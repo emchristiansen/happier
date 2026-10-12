@@ -12,7 +12,10 @@ import { installAccountSettingsRouteModuleMocks } from './accountSettingsRouteTe
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
-vi.mock('react-native-reanimated', () => ({}));
+vi.mock('react-native-reanimated', async () => {
+    const { createReanimatedModuleMock } = await import('@/dev/testkit/mocks/reanimated');
+    return createReanimatedModuleMock();
+});
 
 vi.mock('expo-camera', () => ({
     useCameraPermissions: () => [{ granted: true }, async () => ({ granted: true })],

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
 type SocketHandler = (...args: any[]) => void;
 
@@ -7,6 +7,7 @@ function createSocketStub() {
     const anyHandlers = new Set<SocketHandler>();
     const socket = {
         connected: false,
+        emit: vi.fn(),
         on: vi.fn((event: string, handler: SocketHandler) => {
             const bucket = handlersByEvent.get(event) ?? new Set<SocketHandler>();
             bucket.add(handler);
@@ -50,6 +51,10 @@ function createSocketStub() {
 }
 
 describe('createSyncSocketTransport', () => {
+    beforeEach(async () => {
+        const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
+        vi.doMock('react-native', () => createReactNativeWebMock({ Platform: { OS: 'web' } }));
+    });
     afterEach(() => {
         vi.resetModules();
         vi.clearAllMocks();
@@ -218,5 +223,80 @@ describe('createSyncSocketTransport', () => {
         expect(disconnectedListener).toHaveBeenCalledWith(
             expect.objectContaining({ intentional: false }),
         );
+    });
+});
+
+
+describe('computer focus publication', () => {
+    beforeEach(async () => {
+        const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
+        vi.doMock('react-native', () => createReactNativeWebMock({ Platform: { OS: 'web' } }));
+    });
+    afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
+
+    it('publishes current focus on connect/reconnect, blur, and destroys its subscription', async () => {
+        const doc = new EventTarget();
+        let focused = true;
+        Object.assign(doc, { visibilityState: 'visible', hasFocus: () => focused });
+        vi.stubGlobal('document', doc);
+        vi.stubGlobal('window', doc);
+        vi.stubGlobal('navigator', { userAgent: 'Mozilla/5.0 (X11; Linux x86_64)' });
+        const socket = createSocketStub();
+        vi.doMock('socket.io-client', () => ({ io: () => socket }));
+        const { createSyncSocketTransport } = await import('./createSyncSocketTransport');
+        const { transport } = createSyncSocketTransport({ endpoint: 'https://api.example.test', token: 't' });
+        await transport.connect();
+        expect(socket.emit).toHaveBeenLastCalledWith('ui-focus', { computer: true, focused: true });
+        focused = false;
+        doc.dispatchEvent(new Event('blur'));
+        expect(socket.emit).toHaveBeenLastCalledWith('ui-focus', { computer: true, focused: false });
+        await transport.disconnect();
+        focused = true;
+        await transport.connect();
+        expect(socket.emit).toHaveBeenLastCalledWith('ui-focus', { computer: true, focused: true });
+        await transport.destroy();
+        socket.emit.mockClear();
+        doc.dispatchEvent(new Event('focus'));
+        expect(socket.emit).not.toHaveBeenCalled();
+    });
+
+    it('does not classify a focused mobile browser as a computer', async () => {
+        const doc = Object.assign(new EventTarget(), { visibilityState: 'visible', hasFocus: () => true });
+        vi.stubGlobal('document', doc);
+        vi.stubGlobal('window', doc);
+        vi.stubGlobal('navigator', { userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)' });
+        const socket = createSocketStub();
+        vi.doMock('socket.io-client', () => ({ io: () => socket }));
+        const { createSyncSocketTransport } = await import('./createSyncSocketTransport');
+        const { transport } = createSyncSocketTransport({ endpoint: 'https://api.example.test', token: 't' });
+        await transport.connect();
+        expect(socket.emit).toHaveBeenLastCalledWith('ui-focus', { computer: false, focused: false });
+        await transport.destroy();
+    });
+
+    it('publishes an unfocused computer when a still-focused window becomes hidden', async () => {
+        const doc = Object.assign(new EventTarget(), { visibilityState: 'visible', hasFocus: () => true });
+        vi.stubGlobal('document', doc);
+        vi.stubGlobal('window', doc);
+        vi.stubGlobal('navigator', { userAgent: 'Mozilla/5.0 (X11; Linux x86_64)' });
+        const socket = createSocketStub();
+        vi.doMock('socket.io-client', () => ({ io: () => socket }));
+        const { createSyncSocketTransport } = await import('./createSyncSocketTransport');
+        const { transport } = createSyncSocketTransport({ endpoint: 'https://api.example.test', token: 't' });
+        try {
+            await transport.connect();
+            expect(socket.emit).toHaveBeenLastCalledWith('ui-focus', { computer: true, focused: true });
+            doc.visibilityState = 'hidden';
+            doc.dispatchEvent(new Event('visibilitychange'));
+            expect(socket.emit).toHaveBeenLastCalledWith('ui-focus', { computer: true, focused: false });
+            await transport.disconnect();
+            await transport.connect();
+            expect(socket.emit).toHaveBeenLastCalledWith('ui-focus', { computer: true, focused: false });
+            doc.visibilityState = 'visible';
+            doc.dispatchEvent(new Event('visibilitychange'));
+            expect(socket.emit).toHaveBeenLastCalledWith('ui-focus', { computer: true, focused: true });
+        } finally {
+            await transport.destroy();
+        }
     });
 });

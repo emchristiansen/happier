@@ -1416,7 +1416,10 @@ describe('executionRuns session RPC handlers', () => {
       ioMode: 'request_response',
     });
 
-    await new Promise((r) => setTimeout(r, 10));
+    await vi.waitFor(async () => {
+      const got = await client.call<any, any>(SESSION_RPC_METHODS.EXECUTION_RUN_GET, { runId: started.runId });
+      expect(got.run?.status).toBe('succeeded');
+    });
 
     const res = await client.call<any, any>(SESSION_RPC_METHODS.EXECUTION_RUN_SEND, {
       runId: started.runId,
@@ -3292,10 +3295,11 @@ describe('executionRuns session RPC handlers', () => {
       ioMode: 'request_response',
     });
 
-    await new Promise((r) => setTimeout(r, 10));
-    const completionToolResult = sent.find((m: any) => (m.body as any)?.type === 'tool-result' && m.meta);
-    expect((completionToolResult?.meta as any)?.happierExecutionRun?.resumeHandle?.kind).toBe('vendor_session.v1');
-    expect((completionToolResult?.meta as any)?.happierExecutionRun?.resumeHandle?.vendorSessionId).toBeTruthy();
+    await vi.waitFor(() => {
+      const completionToolResult = sent.find((m: any) => (m.body as any)?.type === 'tool-result' && m.meta);
+      expect((completionToolResult?.meta as any)?.happierExecutionRun?.resumeHandle?.kind).toBe('vendor_session.v1');
+      expect((completionToolResult?.meta as any)?.happierExecutionRun?.resumeHandle?.vendorSessionId).toBeTruthy();
+    });
 
     const resumed = await client.call<any, any>(SESSION_RPC_METHODS.EXECUTION_RUN_SEND, {
       runId: started.runId,
@@ -3335,7 +3339,9 @@ describe('executionRuns session RPC handlers', () => {
       ioMode: 'request_response',
     });
 
-    await new Promise((r) => setTimeout(r, 10));
+    await vi.waitFor(() => {
+      expect(sent.some((m: any) => (m.body as any)?.type === 'tool-result' && m.meta)).toBe(true);
+    });
 
     const ensured = await client.call<any, any>(SESSION_RPC_METHODS.EXECUTION_RUN_ENSURE, {
       runId: started.runId,

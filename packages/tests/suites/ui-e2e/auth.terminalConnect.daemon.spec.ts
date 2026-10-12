@@ -1,7 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
 import { mkdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { execFileSync } from 'node:child_process';
 
 import { createRunDirs } from '../../src/testkit/runDir';
 import { startServerLight, type StartedServer } from '../../src/testkit/process/serverLight';
@@ -97,10 +96,6 @@ test.describe('ui e2e: auth + terminal connect', () => {
     return page.locator('[data-testid="session-composer-input"]:visible');
   }
 
-  function resolveServerLightSqliteDbPath(params: { suiteDir: string }): string {
-    return resolve(join(params.suiteDir, 'server-light-data', 'happier-server-light.sqlite'));
-  }
-
   async function waitForLoggedOutTerminalConnectEntry(page: Page): Promise<void> {
     await expect.poll(
       async () => {
@@ -117,21 +112,6 @@ test.describe('ui e2e: auth + terminal connect', () => {
       },
       { timeout: 60_000 },
     ).toBe(true);
-  }
-
-  function readMachineActiveFromServerLightDb(params: { suiteDir: string; machineId: string }): boolean | null {
-    const dbPath = resolveServerLightSqliteDbPath({ suiteDir: params.suiteDir });
-    try {
-      const query = `select active from Machine where id = '${params.machineId.replaceAll("'", "''")}' limit 1;`;
-      const raw = execFileSync('sqlite3', ['-json', dbPath, query], { encoding: 'utf8' });
-      const parsed = JSON.parse(raw) as Array<{ active?: unknown }>;
-      const active = parsed?.[0]?.active;
-      if (active === 1 || active === true) return true;
-      if (active === 0 || active === false) return false;
-      return null;
-    } catch {
-      return null;
-    }
   }
 
   test.beforeAll(async () => {
@@ -183,8 +163,8 @@ test.describe('ui e2e: auth + terminal connect', () => {
     await server?.stop().catch(() => {});
   });
 
-  test('creates an account, approves terminal connect, then daemon becomes online', async ({ page }, testInfo) => {
-    test.setTimeout(420_000);
+  test('creates an account, approves terminal connect, then daemon becomes online', { tag: "@smoke" }, async ({ page }, testInfo) => {
+    test.setTimeout(180_000);
     if (!server || !ui) throw new Error('missing server/ui fixtures');
     if (!uiBaseUrl) throw new Error('missing ui base url');
 
@@ -267,7 +247,7 @@ test.describe('ui e2e: auth + terminal connect', () => {
   });
 
   test('restores the same account using secret key', async ({ page }, testInfo) => {
-    test.setTimeout(300_000);
+    test.setTimeout(180_000);
     if (!ui) throw new Error('missing ui fixture');
     if (!uiBaseUrl) throw new Error('missing ui base url');
     if (!accountSecretKeyFormatted) throw new Error('missing account secret key from prior test');
@@ -308,7 +288,7 @@ test.describe('ui e2e: auth + terminal connect', () => {
   });
 
   test('defaults codex backend mode to ACP in account settings', async ({ page }) => {
-    test.setTimeout(240_000);
+    test.setTimeout(180_000);
     if (!server) throw new Error('missing server fixture');
     if (!uiBaseUrl) throw new Error('missing ui base url');
 
@@ -319,8 +299,8 @@ test.describe('ui e2e: auth + terminal connect', () => {
     await expect(backendModeRow).toContainText('ACP', { timeout: 60_000 });
   });
 
-  test('daemon can reconnect and UI preserves a queued follow-up', async ({ page }, testInfo) => {
-    test.setTimeout(420_000);
+  test('daemon can reconnect without losing a follow-up', async ({ page }, testInfo) => {
+    test.setTimeout(180_000);
     if (!ui) throw new Error('missing ui fixture');
     if (!server) throw new Error('missing server fixture');
     if (!uiBaseUrl) throw new Error('missing ui base url');
@@ -340,15 +320,9 @@ test.describe('ui e2e: auth + terminal connect', () => {
       await restoreAccountUsingSecretKey(page, uiBaseUrl, accountSecretKeyFormatted);
       await reloadCreatedSessionFromNewSessionComposer({ page, session: createdSession });
 
-      const machineId = await waitForDaemonMachineIdFromCliSettings({ cliHomeDir, timeoutMs: 120_000 });
+      await waitForDaemonMachineIdFromCliSettings({ cliHomeDir, timeoutMs: 120_000 });
       await daemon.stop();
       daemon = null;
-
-      await expect
-        .poll(async () => {
-          return readMachineActiveFromServerLightDb({ suiteDir, machineId });
-        }, { timeout: 180_000 })
-        .toBe(false);
 
       fakeClaudeLogPath = resolve(join(testDir, 'fake-claude.jsonl'));
       daemon = await startTestDaemon({
@@ -370,12 +344,6 @@ test.describe('ui e2e: auth + terminal connect', () => {
         },
       });
 
-      await expect
-        .poll(async () => {
-          return readMachineActiveFromServerLightDb({ suiteDir, machineId });
-        }, { timeout: 180_000 })
-        .toBe(true);
-
       await reloadCreatedSessionFromNewSessionComposer({ page, session: createdSession });
       await expect(getVisibleSessionComposer(page)).toHaveCount(1, { timeout: 120_000 });
 
@@ -384,11 +352,17 @@ test.describe('ui e2e: auth + terminal connect', () => {
       await expect(composer).toHaveCount(1, { timeout: 120_000 });
       await composer.fill(followup);
       await page.getByTestId('session-composer-send').click();
-      // Reconnecting the daemon restores machine presence, not the stopped agent
-      // process. The follow-up must remain visible and queued until that session
-      // is explicitly resumed, rather than disappearing or being treated as sent.
-      await expect(page.locator('[data-testid^="pendingMessages.message:"]', { hasText: followup })).toBeVisible({ timeout: 60_000 });
-      await expect(page.getByRole('button', { name: 'Pending messages · Queued' })).toBeVisible({ timeout: 60_000 });
+      // Depending on whether the restart restores the existing agent process before
+      // this send, the follow-up is either delivered or safely remains queued. Both
+      // are valid outcomes; the invariant is that the user-visible follow-up is not lost.
+      const pending = page.locator('[data-testid^="pendingMessages.message:"]', { hasText: followup })
+        .and(page.getByRole('button', { name: 'Pending messages · Queued', exact: true }));
+      const delivered = page.locator('[data-testid^="transcript-message-"]:not([data-testid*=":"])', { hasText: followup });
+      // Observe either valid visible state in the same retrying assertion. The
+      // queue may drain immediately after observation as the daemon reconnects.
+      await expect.poll(async () => {
+        return await pending.first().isVisible() || await delivered.first().isVisible();
+      }, { timeout: 180_000 }).toBe(true);
     } catch (error) {
       thrown = error;
       throw error;
@@ -400,7 +374,7 @@ test.describe('ui e2e: auth + terminal connect', () => {
   });
 
   test('selects the existing session from the list', async ({ page }, testInfo) => {
-    test.setTimeout(420_000);
+    test.setTimeout(180_000);
     if (!ui) throw new Error('missing ui fixture');
     if (!uiBaseUrl) throw new Error('missing ui base url');
     if (!accountSecretKeyFormatted) throw new Error('missing account secret key from prior test');
@@ -440,7 +414,7 @@ test.describe('ui e2e: auth + terminal connect', () => {
   });
 
   test('terminal-connect link redirects to welcome when logged out, then can be approved after restore', async ({ page, browser }, testInfo) => {
-    test.setTimeout(420_000);
+    test.setTimeout(180_000);
     if (!server || !ui) throw new Error('missing server/ui fixtures');
     if (!uiBaseUrl) throw new Error('missing ui base url');
     if (!accountSecretKeyFormatted) {

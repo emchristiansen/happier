@@ -1,6 +1,7 @@
 import { systemTasks } from '@happier-dev/cli-common';
 import type { InteractiveSystemTaskEventInput, InteractiveSystemTaskKind, InteractiveSystemTaskKindMap } from '@happier-dev/cli-common/systemTasks';
 import { createInterface } from 'node:readline';
+import { pathToFileURL } from 'node:url';
 import {
   SystemTaskEventSchema,
   SystemTaskResultSchema,
@@ -15,6 +16,7 @@ import { ensureSetupCapableLocalHappierCli } from '../systemTasks/happierCli.js'
 import {
   configureRelay,
   installService,
+  registerRelayProfile,
   requestAuthPairing,
   controlDaemonService,
   waitForAuthPairing,
@@ -22,6 +24,8 @@ import {
 import {
   createSetupThisComputerKind,
   ensureManagedCliPathExposureDefault,
+  recordHappierCliChoiceDefault,
+  removeManagedCliPathExposureDefault,
 } from '../systemTasks/kinds/setupThisComputer.js';
 import { createHsetupSystemTaskRegistry, createSystemTaskId } from '../systemTasks/registry.js';
 import {
@@ -185,8 +189,11 @@ export function createDefaultInteractiveKinds(): InteractiveSystemTaskKindMap {
     // The only place the setup kind is built for real: every dep that changes this computer is
     // named here, so no other construction site can inherit a real mutation by forgetting one.
     'setup.thisComputer.v1': createSetupThisComputerKind({
+      recordCliChoice: recordHappierCliChoiceDefault,
+      removePathExposure: removeManagedCliPathExposureDefault,
       ensureCli: ensureSetupCapableLocalHappierCli,
       configureRelay,
+      registerRelayProfile,
       requestAuthPairing,
       waitForAuthPairing,
       installService,
@@ -402,7 +409,9 @@ function createDefaultIo(): HsetupIo {
   };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Bun's compiled executable has an embedded module URL, not the executable's argv path.
+// Older Node source launches still identify the entrypoint by its normalized file URL.
+if (import.meta.main || (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)) {
   runHsetupCli(process.argv.slice(2)).then((exitCode) => {
     process.exitCode = exitCode;
   });

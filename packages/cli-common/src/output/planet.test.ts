@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createSetupChoicePrompt, renderNumericPlanet, renderSetupChoice, renderSetupWelcome } from './planet';
+import chalk from 'chalk';
+import { createSetupChoicePrompt, renderPlanet, renderSetupChoice, renderSetupWelcome, resolveTerminalTheme, supportsBrailleArt } from './planet';
+
+const PLANET_DOT = /[\u2801-\u28ff]/u;
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -16,7 +19,7 @@ describe('setup welcome handoff', () => {
     expect(output).toContain('preview-machine');
     expect(output).toContain('Choose your connection');
     expect(output.split('\n')).not.toContain('Happier');
-    expect(output).not.toMatch(/[0-9.]{8}/u);
+    expect(output).not.toMatch(PLANET_DOT);
   });
 
   it('places the static planet beside the complete first setup choice on a wide terminal', () => {
@@ -37,11 +40,31 @@ describe('setup welcome handoff', () => {
       isTTY: true,
     });
     const lines = output.split('\n');
-    expect(lines.some((line) => /^[ 0-9.]{24} {3}Happier$/u.test(line))).toBe(true);
-    expect(lines.some((line) => /^[ 0-9.]{24} {3}How would you like to connect your devices\?$/u.test(line))).toBe(true);
+    expect(lines.some((line) => /^[ \u2800-\u28ff]{24} {3}Happier$/u.test(line))).toBe(true);
+    expect(lines.some((line) => /^[ \u2800-\u28ff]{24} {3}How would you like to connect your devices\?$/u.test(line))).toBe(true);
     expect(output).toContain('Existing server');
     expect(output).toContain('Happier app or your administrator');
     expect(output.trimEnd().endsWith('Use ↑/↓ to move, Enter to select, or type a letter')).toBe(true);
+  });
+
+  it('breaks a word too long for the column beside the planet instead of letting the terminal wrap it', () => {
+    vi.stubEnv('TERM', 'xterm-256color');
+    vi.stubEnv('NO_COLOR', '1');
+    vi.stubEnv('HAPPIER_INSTALLER_WELCOME_SHOWN', '');
+    const machineName = `build-agent-${'x'.repeat(70)}-end`;
+    const output = renderSetupChoice({
+      machineName,
+      subtitle: 'Connect your devices.',
+      question: 'Where does your relay live?',
+      choices: [{ key: 'c', label: 'Happier Cloud', isDefault: true }],
+      columns: 92,
+      rows: 24,
+      isTTY: true,
+    });
+    // Redraws count rows; a row the terminal wraps on its own would break them.
+    for (const line of output.split('\n')) expect([...line].length).toBeLessThanOrEqual(92);
+    expect(output).toMatch(/[⠀-⣿ ]{24} {3}Computer: build-agent-x+$/mu);
+    expect(output).toMatch(/x+-end$/mu);
   });
 
   it('uses compact complete text without the planet on narrow terminals', () => {
@@ -59,12 +82,12 @@ describe('setup welcome handoff', () => {
     const narrow = renderSetupChoice(options);
     expect(narrow).toContain('Happier\nChoose your connection\nComputer: preview-machine');
     expect(narrow.replace(/\n\s*/gu, ' ')).toContain('A deliberately long option whose meaning must wrap instead of being cropped');
-    expect(narrow).not.toMatch(/[0-9.]{8}/u);
+    expect(narrow).not.toMatch(PLANET_DOT);
 
     vi.stubEnv('HAPPIER_INSTALLER_WELCOME_SHOWN', '1');
     const handedOff = renderSetupChoice({ ...options, columns: 100 });
     expect(handedOff).not.toContain('Happier');
-    expect(handedOff).toMatch(/[0-9.]{8}/u);
+    expect(handedOff).toMatch(PLANET_DOT);
     expect(handedOff).toContain('Question');
     expect(handedOff).toContain('Computer: preview-machine');
   });
@@ -129,35 +152,116 @@ describe('setup welcome handoff', () => {
     expect(prompt.message).toContain('Try again?\n› r) Retry\n  x) Exit');
     expect(prompt.message).not.toContain('Happier');
     expect(prompt.message).not.toContain('Computer:');
-    expect(prompt.message).not.toMatch(/[0-9.]{8}/u);
+    expect(prompt.message).not.toMatch(PLANET_DOT);
     expect(prompt).toMatchObject({ animate: false, renderMessage: expect.any(Function) });
   });
 });
 
-describe('numeric planet', () => {
-  it('grows and shrinks slowly inside a fixed-height, fixed-width ASCII canvas', () => {
-    const first = renderNumericPlanet({ columns: 24, seconds: 0, color: false });
-    const later = renderNumericPlanet({ columns: 24, seconds: 2, color: false });
-    expect(later).not.toEqual(first);
-    const occupiedCells = (frame: string[]) => frame.join('').replace(/\s/gu, '').length;
-    expect(occupiedCells(later)).toBeGreaterThan(occupiedCells(first));
-    expect(occupiedCells(renderNumericPlanet({ columns: 24, seconds: 6, color: false }))).toBeLessThan(occupiedCells(later));
-    expect(later).toHaveLength(first.length);
-    for (const frame of [first, later]) {
-      expect(frame.join('\n')).toMatch(/^[0-9. \n]+$/u);
-      expect(frame.every((line) => line.length <= 24)).toBe(true);
+describe('setup planet', () => {
+  const choiceOptions = {
+    machineName: 'preview-machine',
+    subtitle: 'Choose your connection',
+    question: 'Question',
+    choices: [
+      { id: 'first', key: 'a', label: 'First answer', isDefault: true },
+      { id: 'second', key: 'b', label: 'Second answer' },
+    ],
+    columns: 92,
+    rows: 24,
+    isTTY: true,
+  } as const;
+  const planetDots = (message: string) => message.split('\n').join('').match(/[⠁-⣿]/gu)?.length ?? 0;
+  const planetLuminance = (message: string) => {
+    const colours = [...message.matchAll(/\x1b\[38;2;(\d+);(\d+);(\d+)m[⠁-⣿]/gu)].map((m) => [Number(m[1]), Number(m[2]), Number(m[3])]);
+    return colours.reduce((sum, [r, g, b]) => sum + 0.2126 * r! + 0.7152 * g! + 0.0722 * b!, 0) / colours.length;
+  };
+
+  it('rises out of an eclipse on a fresh welcome, but continues lit after the installer already welcomed', () => {
+    vi.stubEnv('TERM', 'xterm-256color');
+    vi.stubEnv('NO_COLOR', '1');
+    vi.stubEnv('HAPPIER_INSTALLER_WELCOME_SHOWN', '');
+    const fresh = renderSetupChoice({ ...choiceOptions, seconds: 0.25 });
+    const settled = renderSetupChoice({ ...choiceOptions, seconds: 8 });
+    expect(planetDots(fresh)).toBeLessThan(planetDots(settled) * 0.45);
+    vi.stubEnv('HAPPIER_INSTALLER_WELCOME_SHOWN', '1');
+    expect(planetDots(renderSetupChoice({ ...choiceOptions, seconds: 0.25 }))).toBeGreaterThan(planetDots(settled) * 0.8);
+  });
+
+  it('keeps breathing but steps back once the user starts choosing', () => {
+    vi.stubEnv('TERM', 'xterm-256color');
+    vi.stubEnv('NO_COLOR', '');
+    vi.stubEnv('HAPPIER_NO_ANIMATION', '');
+    const level = chalk.level;
+    chalk.level = 3;
+    try {
+      const prompt = createSetupChoicePrompt(choiceOptions);
+      expect(prompt.animate).toBe(true);
+      const beforeChoosing = prompt.renderMessage!(8, 'first');
+      prompt.renderMessage!(8.05, 'second');
+      const whileChoosing = prompt.renderMessage!(9, 'second');
+      expect(planetLuminance(whileChoosing)).toBeLessThan(planetLuminance(beforeChoosing) * 0.7);
+      // Moving back to the recommendation does not bring the spotlight back.
+      expect(planetLuminance(prompt.renderMessage!(10, 'first'))).toBeLessThan(planetLuminance(beforeChoosing) * 0.7);
+      // Half a breath later it is still alive, only quieter.
+      expect(prompt.renderMessage!(9 + 4.8, 'second')).not.toBe(whileChoosing);
+    } finally {
+      chalk.level = level;
     }
   });
 
-  it('renders a rounded globe with varied numeric texture instead of concentric bands', () => {
-    const frame = renderNumericPlanet({ columns: 28, seconds: 1.6, color: false });
-    const occupiedWidths = frame.map((line) => line.trim().length).filter((width) => width > 0);
-    const visible = frame.join('').replace(/[ .]/gu, '');
+  it('redraws smoothly while it steps back, then returns to a calm breath', () => {
+    vi.stubEnv('TERM', 'xterm-256color');
+    vi.stubEnv('HAPPIER_NO_ANIMATION', '');
+    const level = chalk.level;
+    chalk.level = 3;
+    try {
+      const prompt = createSetupChoicePrompt(choiceOptions);
+      const calm = prompt.intervalMs!(8);
+      prompt.renderMessage!(8, 'first');
+      prompt.renderMessage!(8.05, 'second');
+      // The step back is a short fade: it needs the fast cadence to read as one.
+      expect(prompt.intervalMs!(8.2)).toBeLessThan(calm / 2);
+      expect(prompt.intervalMs!(9)).toBe(calm);
+    } finally {
+      chalk.level = level;
+    }
+  });
 
-    expect(frame).toHaveLength(13);
-    expect(occupiedWidths.at(0)).toBeLessThan(occupiedWidths[Math.floor(occupiedWidths.length / 2)]!);
-    expect(occupiedWidths.at(-1)).toBeLessThan(occupiedWidths[Math.floor(occupiedWidths.length / 2)]!);
-    expect(new Set(visible).size).toBeGreaterThanOrEqual(8);
-    expect(visible).not.toMatch(/^(?:0+1+2+3+4+)+$/u);
+  it('leaves the art out where the console has no Braille glyphs', () => {
+    expect(supportsBrailleArt({}, 'linux')).toBe(true);
+    expect(supportsBrailleArt({}, 'darwin')).toBe(true);
+    expect(supportsBrailleArt({}, 'win32')).toBe(false);
+    expect(supportsBrailleArt({ WT_SESSION: 'abc' }, 'win32')).toBe(true);
+    expect(supportsBrailleArt({ TERM_PROGRAM: 'vscode' }, 'win32')).toBe(true);
+
+    vi.stubEnv('TERM', 'xterm-256color');
+    vi.stubEnv('NO_COLOR', '1');
+    vi.stubEnv('WT_SESSION', '');
+    vi.stubEnv('TERM_PROGRAM', '');
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' });
+    try {
+      const legacyConsole = renderSetupChoice(choiceOptions);
+      expect(legacyConsole).not.toMatch(PLANET_DOT);
+      expect(legacyConsole).toContain('Second answer');
+      expect(createSetupChoicePrompt(choiceOptions)).toMatchObject({ animate: false });
+    } finally {
+      Object.defineProperty(process, 'platform', platform);
+    }
+  });
+
+  it('reads a light terminal from COLORFGBG and defaults to the dark planet', () => {
+    expect(resolveTerminalTheme({})).toBe('dark');
+    expect(resolveTerminalTheme({ COLORFGBG: '15;0' })).toBe('dark');
+    expect(resolveTerminalTheme({ COLORFGBG: '0;15' })).toBe('light');
+    expect(resolveTerminalTheme({ COLORFGBG: '0;default;7' })).toBe('light');
+  });
+
+  it('renders the settled planet as uncoloured Braille when colour is off', () => {
+    const frame = renderPlanet({ columns: 24, color: false });
+    expect(frame.join('\n')).toMatch(/^[⠀-⣿ \n]+$/u);
+    expect(frame.every((line) => [...line].length <= 24)).toBe(true);
+    // Static renderings use the settled, fully lit pose rather than the eclipse's first frame.
+    expect(planetDots(frame.join('\n'))).toBeGreaterThan(planetDots(renderPlanet({ columns: 24, seconds: 0.25, color: false }).join('\n')) * 2);
   });
 });

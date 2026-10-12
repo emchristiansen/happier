@@ -1,6 +1,6 @@
 import { createHmac } from 'node:crypto';
 
-import { stringifySerializedJsonValue } from '@happier-dev/protocol';
+import { normalizeSessionMetadataForRead, stringifySerializedJsonValue } from '@happier-dev/protocol';
 import type { Credentials } from '@/persistence';
 import { decodeBase64, decrypt, encodeBase64, encrypt, encryptWithDerivedNonce } from '@/api/encryption';
 import { openSessionDataEncryptionKey } from '@/api/client/openSessionDataEncryptionKey';
@@ -47,7 +47,11 @@ export function tryDecryptSessionMetadata(params: Readonly<{
 
   const mode = resolveSessionStoredContentEncryptionMode(params.rawSession);
   if (mode === 'plain') {
-    return tryParseJsonRecord(encryptedMetadataBase64);
+    try {
+      return normalizeSessionMetadataForRead(tryParseJsonRecord(encryptedMetadataBase64));
+    } catch {
+      return null;
+    }
   }
 
   const { encryptionKey, encryptionVariant } = resolveSessionEncryptionContextFromCredentials(
@@ -58,7 +62,7 @@ export function tryDecryptSessionMetadata(params: Readonly<{
   try {
     const decrypted = decrypt(encryptionKey, encryptionVariant, decodeBase64(encryptedMetadataBase64, 'base64'));
     if (!decrypted || typeof decrypted !== 'object' || Array.isArray(decrypted)) return null;
-    return decrypted as Record<string, unknown>;
+    return normalizeSessionMetadataForRead(decrypted as Record<string, unknown>);
   } catch {
     return null;
   }

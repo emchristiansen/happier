@@ -54,6 +54,24 @@ function createManualBridge() {
 }
 
 describe('createSystemTaskRunner', () => {
+    it('retires the native subscription when snapshot replay completes during registration', async () => {
+        const { createSystemTaskRunner } = await import('./createSystemTaskRunner');
+        const manual = createManualBridge();
+        const subscriptions = new Set<string>();
+        // The OS bridge replays an already-finished native task before returning its disposer.
+        const runner = createSystemTaskRunner({ bridge: {
+            ...manual.bridge,
+            async subscribe(taskId, listeners) {
+                subscriptions.add(taskId);
+                listeners.onResult({ protocolVersion: 1, taskId, ok: true, data: {} });
+                return () => { subscriptions.delete(taskId); };
+            },
+        } });
+        const taskId = await runner.start(createSpec());
+        expect(runner.getSnapshot(taskId)?.result).toMatchObject({ ok: true });
+        expect(subscriptions.size).toBe(0);
+    });
+
     it('does not replay a prompt when its subscriber synchronously changes task state', async () => {
         const { createSystemTaskRunner } = await import('./createSystemTaskRunner');
         const manual = createManualBridge();

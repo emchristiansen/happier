@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { sanitizeBugReportUrl } from '../bugReports/sanitize.js';
+import { CliUpdateFactsSchema } from '../machines/cliUpdateFacts.js';
 
 const NonEmptyString = z.string().trim().min(1);
 const PublicReleaseChannelLabelSchema = z.enum(['stable', 'preview', 'dev']);
@@ -107,8 +108,26 @@ export const DoctorSnapshotDaemonStatusSchema = z.object({
     accountId: NonEmptyString.nullable(),
     credentialState: DoctorSnapshotDaemonCredentialStateSchema.optional(),
     validatedAccountId: NonEmptyString.nullable().optional(),
+    /**
+     * How the validated account's profile names it for people (username, else display name), so
+     * a surface can say which account this computer is signed in as. `null` when the relay did
+     * not validate the token or the profile has no name; absent from older CLIs.
+     */
+    accountLabel: NonEmptyString.nullable().optional(),
   }),
   runtimeConvergence: DoctorSnapshotDaemonRuntimeConvergenceSchema.optional(),
+  /**
+   * The answering CLI's own update state from its cached daily check (`happier self check`),
+   * filtered to its release channel. Never a network read; `null` when no check has cached a
+   * result yet, absent from older CLIs. The K5 facts (`CliUpdateFactsSchema`: channel, install
+   * source, update command, remote-update support, last outcome) extend it and are absent from
+   * CLIs that predate them.
+   */
+  cliUpdate: z.object({
+    currentVersion: NonEmptyString,
+    latestVersion: NonEmptyString.nullable(),
+    updateAvailable: z.boolean(),
+  }).extend(CliUpdateFactsSchema.omit({ currentVersion: true, latestVersion: true }).partial().shape).nullable().optional(),
 });
 
 export type DoctorSnapshotDaemonStatus = z.infer<typeof DoctorSnapshotDaemonStatusSchema>;

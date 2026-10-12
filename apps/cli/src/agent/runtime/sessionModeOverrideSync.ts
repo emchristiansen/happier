@@ -11,19 +11,20 @@ export function createSessionModeOverrideSynchronizer(params: Readonly<{
 }>): {
   syncFromMetadata: () => void;
   flushPendingAfterStart: () => Promise<void>;
+  flushPendingAfterStartWithOutcome: () => Promise<boolean>;
   rebindSession: (session: { getMetadataSnapshot: () => Metadata | null }) => void;
 } {
   let session = params.session;
   let lastAppliedUpdatedAt = 0;
   let pending: { modeId: string; updatedAt: number } | null = null;
-  let applyingPromise: Promise<void> | null = null;
+  let applyingPromise: Promise<boolean> | null = null;
   let lastAttemptedUpdatedAt = 0;
   let lastAttemptNumber = 0;
 
-  const applyPendingIfPossible = (): Promise<void> => {
+  const applyPendingIfPossible = (): Promise<boolean> => {
     if (applyingPromise) return applyingPromise;
-    if (!pending) return Promise.resolve();
-    if (!params.isStarted()) return Promise.resolve();
+    if (!pending) return Promise.resolve(true);
+    if (!params.isStarted()) return Promise.resolve(true);
 
     const next = pending;
     // Empty modeId is a "clear override" sentinel (normalized from modeId="default" in metadata).
@@ -32,7 +33,7 @@ export function createSessionModeOverrideSynchronizer(params: Readonly<{
     if (next.modeId === '') {
       lastAppliedUpdatedAt = next.updatedAt;
       pending = null;
-      return Promise.resolve();
+      return Promise.resolve(true);
     }
     const attempt =
       next.updatedAt === lastAttemptedUpdatedAt
@@ -40,7 +41,7 @@ export function createSessionModeOverrideSynchronizer(params: Readonly<{
         : 1;
     if (next.updatedAt <= lastAppliedUpdatedAt) {
       pending = null;
-      return Promise.resolve();
+      return Promise.resolve(true);
     }
     lastAttemptedUpdatedAt = next.updatedAt;
     lastAttemptNumber = attempt;
@@ -56,14 +57,15 @@ export function createSessionModeOverrideSynchronizer(params: Readonly<{
         // Only advance lastAppliedUpdatedAt on success so failures can retry.
         lastAppliedUpdatedAt = next.updatedAt;
         if (pending && pending.updatedAt <= lastAppliedUpdatedAt) pending = null;
+        return true;
       })
-      .catch((error: unknown) => {
-        logger.debug('[SessionModeOverrideSync] Failed to apply session mode override; will retry on next sync', {
-          modeId: next.modeId,
+      .catch(() => {
+        // Provider errors and mode identifiers may contain private launch inputs.
+        logger.infoFile('[SessionModeOverrideSync] Failed to apply session mode override; will retry on next sync', {
           updatedAt: next.updatedAt,
           attempt,
-          error: error instanceof Error ? error.message : String(error ?? 'unknown error'),
         });
+        return false;
       })
       .finally(() => {
         applyingPromise = null;
@@ -94,18 +96,24 @@ export function createSessionModeOverrideSynchronizer(params: Readonly<{
     }
   };
 
-  const flushPendingAfterStart = async (): Promise<void> => {
-    if (!pending) return;
-    if (!params.isStarted()) return;
+  const flushPendingAfterStartWithOutcome = async (): Promise<boolean> => {
+    if (applyingPromise) return await applyingPromise;
+    if (!pending) return true;
+    if (!params.isStarted()) return true;
 
     const next = pending;
-    if (next.updatedAt <= lastAppliedUpdatedAt) return;
-    await applyPendingIfPossible();
+    if (next.updatedAt <= lastAppliedUpdatedAt) return true;
+    return await applyPendingIfPossible();
+  };
+
+  const flushPendingAfterStart = async (): Promise<void> => {
+    await flushPendingAfterStartWithOutcome();
   };
 
   return {
     syncFromMetadata,
     flushPendingAfterStart,
+    flushPendingAfterStartWithOutcome,
     rebindSession: (nextSession) => { session = nextSession; },
   };
 }

@@ -6,6 +6,7 @@ import {
     normalizePathForComparison,
     resolvePathForComparison,
 } from '@/utils/path/normalizePathForComparison';
+import { parseCodexRolloutFilename } from '../utils/codexSessionFiles';
 
 export type CodexSessionMetaPayload = {
     id?: string;
@@ -26,12 +27,6 @@ type ScanOptions = {
 };
 
 const CODEX_SESSION_META_CLOCK_SKEW_MS = 2_000;
-
-function parseResumeIdFromRolloutFilename(filePath: string): string | null {
-    const name = basename(filePath);
-    const match = /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i.exec(name);
-    return match ? match[1] : null;
-}
 
 function parseRolloutTimestampFromFilename(filePath: string): number | null {
     const name = basename(filePath);
@@ -245,7 +240,7 @@ export async function discoverCodexRolloutFileOnce(opts: {
             for (const entry of matches) {
                 const sessionMeta = await readCodexSessionMetaFromRollout(entry.filePath);
                 if (sessionMeta) return { filePath: entry.filePath, sessionMeta };
-                const idFromName = parseResumeIdFromRolloutFilename(entry.filePath);
+                const idFromName = parseCodexRolloutFilename(entry.filePath)?.threadId ?? null;
                 if (idFromName) {
                     return {
                         filePath: entry.filePath,
@@ -265,7 +260,7 @@ export async function discoverCodexRolloutFileOnce(opts: {
     for (const entry of files) {
         const sessionMeta = await readCodexSessionMetaFromRollout(entry.filePath);
         if (!sessionMeta) {
-            const idFromName = parseResumeIdFromRolloutFilename(entry.filePath);
+            const idFromName = parseCodexRolloutFilename(entry.filePath)?.threadId ?? null;
             if (!idFromName) continue;
             if (entry.mtimeMs < opts.startedAtMs - CODEX_SESSION_META_CLOCK_SKEW_MS) continue;
             const fallbackMeta: CodexSessionMetaPayload = {

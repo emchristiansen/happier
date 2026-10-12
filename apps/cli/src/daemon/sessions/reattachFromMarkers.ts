@@ -1,4 +1,5 @@
 import { logger } from '@/ui/logger';
+import { daemonProcessMatchesCurrentScope } from '../ownership/daemonProcessScopeIdentity';
 import type { Credentials } from '@/persistence';
 import { parseOptionalBooleanEnv } from '@happier-dev/protocol';
 import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
@@ -192,13 +193,7 @@ function readConnectedServiceRestartIntent(marker: DaemonSessionMarker): Readonl
 }
 
 async function recoverMarkerlessDaemonSpawnedSessions(params: Readonly<{
-  happyProcesses: ReadonlyArray<{
-    pid: number;
-    command: string;
-    type: string;
-    cwd?: string;
-    environmentVariables?: Record<string, string>;
-  }>;
+  happyProcesses: ReadonlyArray<HappyProcessInfo>;
   incompleteMarkerByPid: ReadonlyMap<number, Readonly<{
     happySessionId: string;
     startedBy?: string;
@@ -219,6 +214,7 @@ async function recoverMarkerlessDaemonSpawnedSessions(params: Readonly<{
       continue;
     }
     const incompleteMarker = incompleteMarkerByPid.get(processInfo.pid);
+    if (!daemonProcessMatchesCurrentScope(processInfo, { requireScopeIdentity: !incompleteMarker })) continue;
     const isGenericHappySession = processInfo.type === 'user-session' || processInfo.type === 'dev-session';
     const liveExistingSessionId = extractExistingSessionIdFromCommand(processInfo.command);
     const incompleteMarkerSessionId =
@@ -452,6 +448,12 @@ export async function reattachTrackedSessionsFromMarkers(params: Readonly<{
               })
           : 'not_applicable';
         if (attachment?.version === 2) {
+          const spawnOptions = applyRecoveredRuntimeSnapshot({
+            spawnOptions: restoreSpawnOptionsFromRespawnDescriptor({
+              parsedRespawnDescriptor: parseRecoveredRespawnDescriptor(marker.respawn), credentials: params.credentials,
+            }),
+            metadata: marker.metadata,
+          });
           disconnectedTerminalHostCandidates.push({
             sessionId,
             pid: marker.pid,
@@ -460,6 +462,7 @@ export async function reattachTrackedSessionsFromMarkers(params: Readonly<{
             attachmentId: attachment.attachmentId,
             handle: attachment.handle,
             controlDescriptorStatus,
+            ...(spawnOptions ? { spawnOptions } : {}),
           });
           continue;
         }

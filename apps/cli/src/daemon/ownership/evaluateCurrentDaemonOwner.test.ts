@@ -163,6 +163,39 @@ describe('evaluateCurrentDaemonOwner', () => {
         });
     });
 
+    it('recognizes a released runner lifecycle derived from the active server when the replacement daemon has no explicit scope', async () => {
+        await withTempDir('happier-daemon-owner-derived-scope-', async (homeDir) => {
+            envScope.patch({
+                HAPPIER_HOME_DIR: homeDir,
+                HAPPIER_ACTIVE_SERVER_ID: 'cloud',
+                HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID: undefined,
+                HAPPIER_PUBLIC_RELEASE_CHANNEL: 'dev',
+            });
+            vi.resetModules();
+
+            const { daemonProcessMatchesCurrentScope } = await import('./daemonProcessScopeIdentity');
+            const runner = {
+                pid: process.pid + 1000,
+                command: `${process.execPath} happier claude --started-by daemon`,
+                type: 'daemon-spawned-session',
+                daemonOwnershipEnvironmentVariables: {
+                    HAPPIER_HOME_DIR: homeDir,
+                    HAPPIER_ACTIVE_SERVER_ID: 'cloud',
+                    HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID: 'cloud',
+                },
+            } satisfies HappyProcessInfo;
+
+            expect(daemonProcessMatchesCurrentScope(runner)).toBe(true);
+            expect(daemonProcessMatchesCurrentScope({
+                ...runner,
+                daemonOwnershipEnvironmentVariables: {
+                    ...runner.daemonOwnershipEnvironmentVariables,
+                    HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID: 'foreign',
+                },
+            })).toBe(false);
+        });
+    });
+
     it('blocks a real state-less daemon with the same explicit lifecycle scope despite a different endpoint profile', async () => {
         await withTempDir('happier-daemon-owner-lifecycle-match-', async (homeDir) => {
             envScope.patch({

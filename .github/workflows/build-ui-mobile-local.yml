@@ -284,6 +284,7 @@ jobs:
       candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}
       app_version: ${{ steps.candidate.outputs.app_version }}
       has_apk: ${{ steps.apk.outputs.has_apk }}
+      artifact_id: ${{ steps.mobile_artifact.outputs.artifact-id }}
     env:
       EAS_CLI_VERSION: 18.0.1
       APP_ENV: ${{ inputs.environment }}
@@ -350,6 +351,7 @@ jobs:
           CANDIDATE_SHA: ${{ steps.candidate.outputs.candidate_sha }}
           APP_VERSION: ${{ steps.candidate.outputs.app_version }}
           RELEASE_ENVIRONMENT: ${{ inputs.environment }}
+          RELEASE_PROFILE: ${{ inputs.profile == 'auto' && inputs.environment || inputs.profile }}
         run: |
           set -euo pipefail
           mkdir -p dist/ui-mobile
@@ -361,6 +363,7 @@ jobs:
               appVersion: process.env.APP_VERSION,
               environment: process.env.RELEASE_ENVIRONMENT,
               platform: "android",
+              profile: process.env.RELEASE_PROFILE,
             }, null, 2)}\n`);
           '
 
@@ -377,10 +380,11 @@ jobs:
           printf 'has_apk=%s\n' "$([ "${#apks[@]}" -eq 1 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
       - name: Upload mobile build artifact
+        id: mobile_artifact
         if: ${{ always() && (inputs.native_build_mode == 'local' || steps.apk.outputs.has_apk == 'true') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: ui-mobile-${{ inputs.environment }}-android
+          name: ui-mobile-${{ inputs.environment }}-android-${{ inputs.profile == 'auto' && inputs.environment || inputs.profile }}
           path: dist/ui-mobile/**
           retention-days: 7
 
@@ -407,10 +411,18 @@ jobs:
         with:
           node-version: 22.x
 
+      - name: Enable Corepack (Yarn)
+        uses: ./.github/actions/enable-corepack-yarn
+
+      - name: Install release verifier dependencies
+        env:
+          HAPPIER_INSTALL_SCOPE: release-runtime
+        uses: ./.github/actions/install-yarn-dependencies
+
       - name: Download built APK candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: ui-mobile-${{ inputs.environment }}-android
+          artifact-ids: ${{ needs.build_android.outputs.artifact_id }}
           path: dist/ui-mobile
 
       - name: Create GitHub App token (APK publishing)
@@ -555,7 +567,7 @@ jobs:
         if: ${{ always() && inputs.native_build_mode == 'local' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: ui-mobile-${{ inputs.environment }}-ios
+          name: ui-mobile-${{ inputs.environment }}-ios-${{ inputs.profile == 'auto' && inputs.environment || inputs.profile }}
           path: dist/ui-mobile/**
           retention-days: 7
 
@@ -588,6 +600,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RETRY_STORE_RUN_ID: ${{ inputs.retry_store_run_id }}
           RETRY_STORE_SOURCE_SHA: ${{ inputs.retry_store_source_sha }}
+          RELEASE_ENVIRONMENT: ${{ inputs.environment }}
+          RELEASE_PROFILE: ${{ inputs.profile == 'auto' && inputs.environment || inputs.profile }}
         run: |
           set -euo pipefail
           [[ "$RETRY_STORE_RUN_ID" =~ ^[1-9][0-9]*$ ]] || { echo "retry_store_run_id must be a positive integer." >&2; exit 1; }
@@ -596,14 +610,49 @@ jobs:
           origin_head_sha="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RETRY_STORE_RUN_ID}" --jq .head_sha)"
           [ "$origin_status" = completed ] || { echo "Origin run $RETRY_STORE_RUN_ID is not completed." >&2; exit 1; }
           printf 'ORIGIN_HEAD_SHA=%s\n' "$origin_head_sha" >> "$GITHUB_ENV"
+          export ORIGIN_HEAD_SHA="$origin_head_sha"
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/runs/${RETRY_STORE_RUN_ID}/artifacts" > "$RUNNER_TEMP/mobile-retry-artifacts.json"
+          node --input-type=module -e '
+            import { readFileSync, writeFileSync } from "node:fs";
+            import { inspectReleaseResumeArtifact } from "./scripts/pipeline/release/resolve-release-resume.mjs";
+            const pages = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/mobile-retry-artifacts.json`, "utf8"));
+            const artifacts = pages.flatMap((page) => page.artifacts);
+            const legacyName = `ui-mobile-${process.env.RELEASE_ENVIRONMENT}-android`;
+            const scoped = artifacts.filter((artifact) => artifact.name === `${legacyName}-${process.env.RELEASE_PROFILE}`);
+            if (scoped.length > 1) throw new Error("Duplicate profile-scoped Android artifacts.");
+            // The combined predecessor run saved an AAB and an APK under the same legacy name.
+            // Keep their archives separate; the submission step admits exactly one AAB.
+            const selected = scoped.length ? scoped : artifacts.filter((artifact) => artifact.name === legacyName);
+            if (!selected.length) throw new Error("No preserved Android artifact matches the requested environment and profile.");
+            const admitted = selected.map((artifact) => {
+              if (artifact.expired !== false) throw new Error("Preserved Android artifact is expired.");
+              return inspectReleaseResumeArtifact(artifact, Number(process.env.RETRY_STORE_RUN_ID), process.env.ORIGIN_HEAD_SHA);
+            });
+            writeFileSync(`${process.env.RUNNER_TEMP}/mobile-retry-selected.json`, JSON.stringify(admitted));
+          '
 
       - name: Download preserved Android build artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          github-token: ${{ github.token }}
-          run-id: ${{ inputs.retry_store_run_id }}
-          name: ui-mobile-${{ inputs.environment }}-android
-          path: retry-artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            import { downloadReleaseResumeArtifact } from "./scripts/pipeline/release/resolve-release-resume.mjs";
+            const selected = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/mobile-retry-selected.json`, "utf8"));
+            for (const artifact of selected) {
+              await downloadReleaseResumeArtifact({ repository: process.env.GITHUB_REPOSITORY, artifactId: artifact.id,
+                digest: artifact.digest, archivePath: `${process.env.RUNNER_TEMP}/mobile-retry-${artifact.id}.zip` });
+            }
+          '
+          mapfile -t artifact_ids < <(node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            for (const artifact of JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/mobile-retry-selected.json`, "utf8"))) console.log(artifact.id);
+          ')
+          for artifact_id in "${artifact_ids[@]}"; do
+            mkdir -p "retry-artifact/$artifact_id"
+            unzip -q "$RUNNER_TEMP/mobile-retry-$artifact_id.zip" -d "retry-artifact/$artifact_id"
+          done
 
       - name: Verify candidate identity and resubmit exact AAB
         env:
@@ -619,11 +668,13 @@ jobs:
             echo "Expected exactly one preserved Android AAB; found ${#aabs[@]}." >&2
             exit 1
           fi
-          if [ -f retry-artifact/candidate-identity.json ]; then
+          artifact_dir="$(dirname "${aabs[0]}")"
+          export CANDIDATE_IDENTITY_PATH="$artifact_dir/candidate-identity.json"
+          if [ -f "$CANDIDATE_IDENTITY_PATH" ]; then
             node --input-type=module -e '
               import { readFileSync } from "node:fs";
-              const identity = JSON.parse(readFileSync("retry-artifact/candidate-identity.json", "utf8"));
-              if (identity.schemaVersion !== 1 || identity.candidateSha !== process.env.RETRY_STORE_SOURCE_SHA || identity.environment !== process.env.RELEASE_ENVIRONMENT || identity.platform !== "android") {
+              const identity = JSON.parse(readFileSync(process.env.CANDIDATE_IDENTITY_PATH, "utf8"));
+              if (identity.schemaVersion !== 1 || identity.candidateSha !== process.env.RETRY_STORE_SOURCE_SHA || identity.environment !== process.env.RELEASE_ENVIRONMENT || identity.platform !== "android" || (identity.profile !== undefined && identity.profile !== process.env.RELEASE_PROFILE)) {
                 throw new Error("Preserved Android artifact identity does not match the authorized retry inputs.");
               }
             '
@@ -824,6 +875,14 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22.x
+
+      - name: Enable Corepack (Yarn)
+        uses: ./.github/actions/enable-corepack-yarn
+
+      - name: Install release verifier dependencies
+        env:
+          HAPPIER_INSTALL_SCOPE: release-runtime
+        uses: ./.github/actions/install-yarn-dependencies
 
       - name: Bind exact immutable APK tag SHA
         id: source

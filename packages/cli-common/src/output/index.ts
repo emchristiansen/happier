@@ -1,3 +1,47 @@
-export { createStepPrinter, runCommandLogged } from './progress.js';
-export { createNumericPlanetFrame, type NumericPlanetCell, type NumericPlanetFrame } from '../../numericPlanetFrame.mjs';
+export {
+  ACCENT_HEX,
+  ansiEnabled,
+  banner,
+  blue,
+  bullets,
+  bold,
+  createTerminalStyles,
+  cmd,
+  createTerminalPresentation,
+  cyan,
+  definitionList,
+  dim,
+  emphasis,
+  errorFrame,
+  frame,
+  fail,
+  checklist,
+  gray,
+  green,
+  info,
+  kv,
+  magenta,
+  neutral,
+  ok,
+  red,
+  sectionTitle,
+  table,
+  terminalPresentation,
+  terminalStyles,
+  warn,
+  yellow,
+  type BannerOptions,
+  type ChecklistItem,
+  type ChecklistOptions,
+  type ChecklistState,
+  type DefinitionListOptions,
+  type DefinitionListRow,
+  type FrameOptions,
+  type FrameTone,
+  type TerminalStyles,
+} from './presentation.js';
+export { createStepPrinter, runCommandLogged, type StepPrinter } from './progress.js';
+export { createPlanetFrame, type PlanetCell, type PlanetFrame, type PlanetTheme } from '../../planetFrame.mjs';
 export { createSetupChoicePrompt, renderSetupChoice, renderSetupWelcome, type SetupChoice, type SetupChoicePrompt, type SetupChoiceRenderOptions } from './planet.js';
+export { createHelpFormatter, helpFormatter, type HelpRow, type HelpRenderOptions } from './help.js';
+export { renderHelpPage, type HelpPageOptions, type HelpPageSection, type RenderHelpPageOptions } from './helpPage.js';

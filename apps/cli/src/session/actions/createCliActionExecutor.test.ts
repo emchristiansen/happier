@@ -1878,29 +1878,6 @@ describe('createCliActionExecutor', () => {
     expect(spawnDaemonSession).not.toHaveBeenCalled();
   });
 
-  it('executes session.message.send via the existing sendSessionMessage service', async () => {
-    const executor = createPlainExecutor();
-    sendSessionMessage.mockResolvedValue({ ok: true, sessionId: 'sess-1', localId: 'local-1', waited: false });
-
-    const result = await executor.execute(
-      'session.message.send',
-      { sessionId: 'sess-1', message: 'Hello', wait: false, timeoutSeconds: 10 },
-      { surface: 'cli', defaultSessionId: 'sess-1' },
-    );
-
-    expect(result).toEqual({
-      ok: true,
-      result: { ok: true, sessionId: 'sess-1', localId: 'local-1', waited: false },
-    });
-    expect(sendSessionMessage).toHaveBeenCalledWith(expect.objectContaining({
-      credentials: expect.objectContaining({ token: 'token' }),
-      idOrPrefix: 'sess-1',
-      message: 'Hello',
-      wait: false,
-      timeoutMs: 10_000,
-    }));
-  });
-
   it('prepares without dispatch and preserves one-shot terminal execution through the CLI wrapper', async () => {
     const executor = createPlainExecutor();
     sendSessionMessage.mockResolvedValue({ ok: true, sessionId: 'sess-1', localId: 'local-1', waited: false });

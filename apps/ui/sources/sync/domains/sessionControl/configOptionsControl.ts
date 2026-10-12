@@ -4,6 +4,7 @@ import type { Metadata } from '@/sync/domains/state/storageTypes';
 import {
     readSessionConfigOptionOverridesState,
     readSessionConfigOptionsState,
+    matchesSessionControlProvider,
     readSessionModelsState,
     readSessionModesState,
 } from './readSessionControlMetadata';
@@ -200,8 +201,6 @@ export function resolveBooleanConfigOptionNextValue(option: SessionConfigOption,
 }
 
 function buildSessionConfigOptionControls(params: Readonly<{
-    providerId: string;
-    provider: string | null;
     configOptions: ReadonlyArray<{
         id: string;
         name: string;
@@ -219,7 +218,6 @@ function buildSessionConfigOptionControls(params: Readonly<{
     hideModeOption: boolean;
     hideModelOption: boolean;
 }>): SessionConfigOptionControl[] | null {
-    if (params.provider !== params.providerId) return null;
 
     const controls: SessionConfigOptionControl[] = [];
 
@@ -281,24 +279,22 @@ export function computeSessionConfigOptionControls(params: {
 }): SessionConfigOptionControl[] | null {
     const state = readSessionConfigOptionsState(params.metadata);
     if (!state) return null;
-    if (state.provider !== params.agentId) return null;
+    if (!matchesSessionControlProvider({ ...params, provider: state.provider })) return null;
     if (state.configOptions.length === 0) return null;
 
     const sessionModes = readSessionModesState(params.metadata);
-    const hasDedicatedModeControl = sessionModes?.provider === params.agentId && sessionModes.availableModes.length > 0;
+    const hasDedicatedModeControl = sessionModes && matchesSessionControlProvider({ ...params, provider: sessionModes.provider }) && sessionModes.availableModes.length > 0;
 
     const sessionModels = readSessionModelsState(params.metadata);
     const hasDedicatedModelControl =
-        sessionModels?.provider === params.agentId && sessionModels.availableModels.length > 0;
+        sessionModels && matchesSessionControlProvider({ ...params, provider: sessionModels.provider }) && sessionModels.availableModels.length > 0;
 
     const overrides = readSessionConfigOptionOverridesState(params.metadata);
     return buildSessionConfigOptionControls({
-        providerId: params.agentId,
-        provider: state.provider,
         configOptions: state.configOptions,
         overrides: overrides?.overrides ?? null,
-        hideModeOption: hasDedicatedModeControl,
-        hideModelOption: hasDedicatedModelControl,
+        hideModeOption: Boolean(hasDedicatedModeControl),
+        hideModelOption: Boolean(hasDedicatedModelControl),
     });
 }
 
@@ -311,8 +307,6 @@ export function computeSessionConfigOptionControlsForProvider(params: Readonly<{
 }>): SessionConfigOptionControl[] | null {
     if (!Array.isArray(params.configOptions) || params.configOptions.length === 0) return null;
     return buildSessionConfigOptionControls({
-        providerId: params.providerId,
-        provider: params.providerId,
         configOptions: params.configOptions,
         overrides: params.overrides ?? null,
         hideModeOption: params.hideModeOption ?? false,

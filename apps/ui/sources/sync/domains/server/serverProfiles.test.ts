@@ -327,6 +327,28 @@ describe('serverProfiles', () => {
         },
     );
 
+    it('never treats the desktop webview origin as a relay', async () => {
+        // The desktop app's page is its own bundle (http://tauri.localhost on Windows, the Metro
+        // devUrl in `tauri dev`), not a relay: it must neither seed a profile nor become the local
+        // relay that desktop setup hands the CLI as `--local-server-url`.
+        const scope = randomScope();
+        process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = scope;
+        delete process.env.EXPO_PUBLIC_HAPPY_SERVER_URL;
+        delete process.env.EXPO_PUBLIC_HAPPY_PRECONFIGURED_SERVERS;
+        stubWebRuntime('http://tauri.localhost');
+        vi.stubGlobal('__TAURI_INTERNALS__', { invoke: async () => null });
+
+        const profiles = await importFresh();
+        const created = profiles.upsertServerProfile({ serverUrl: 'https://relay.example.test', name: 'Relay' });
+        profiles.setActiveServerId(created.id, { scope: 'device' });
+
+        expect(profiles.listServerProfiles().some((p) => p.serverUrl === 'http://tauri.localhost')).toBe(false);
+        expect(profiles.getActiveServerSnapshot()).toMatchObject({
+            serverUrl: 'https://relay.example.test',
+            activeLocalRelayUrl: null,
+        });
+    });
+
     it('does not seed a same-origin server profile when EXPO_PUBLIC_HAPPY_SERVER_URL is set', async () => {
         const scope = randomScope();
         process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = scope;

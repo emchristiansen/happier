@@ -96,6 +96,7 @@ const SETTINGS_ROUTE_CHROME_DEFINITIONS: readonly SettingsRouteChromeDefinition[
     { name: 'sub-agent', titleKey: 'subAgentGuidance.settings.groupTitle' },
     { name: 'system-status', titleKey: 'settings.systemStatus' },
     { name: 'usage', titleKey: 'settings.usage' },
+    { name: 'updates', titleKey: 'updates.title' },
     { name: 'voice', titleKey: 'settings.voiceAssistant' },
 ] as const;
 

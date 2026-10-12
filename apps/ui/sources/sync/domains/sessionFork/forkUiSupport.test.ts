@@ -32,9 +32,9 @@ describe('forkUiSupport', () => {
     expect(canForkFromMessage({ session, messageSeq: 5, replayEnabled: true, agentSwitchingEnabled: false })).toBe(true);
   });
 
-  it('fails closed for OpenCode server fork-from-message until the connected dialect is known', () => {
+  it('allows OpenCode server fork-from-message across the supported server dialects', () => {
     const session = makeSession({ machineId: 'm1', flavor: 'opencode', opencodeBackendMode: 'server' });
-    expect(canForkFromMessage({ session, messageSeq: 5, replayEnabled: false, agentSwitchingEnabled: false })).toBe(false);
+    expect(canForkFromMessage({ session, messageSeq: 5, replayEnabled: false, agentSwitchingEnabled: false })).toBe(true);
   });
 
   it('does not allow fork-from-message for OpenCode ACP when replay and switching are both off', () => {

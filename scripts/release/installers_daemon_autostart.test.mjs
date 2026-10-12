@@ -615,15 +615,15 @@ test('install.sh renders truthful linear download, verify, and install phases wh
     assert.ok(scenario.stdout.indexOf('\n[Download]\n') < scenario.stdout.indexOf('\n[Verify]\n'));
     assert.ok(scenario.stdout.indexOf('\n[Verify]\n') < scenario.stdout.indexOf('\n[Install]\n'));
     assert.match(scenario.stdout, /- \[\.\.\] Fetching cli-stable release metadata/);
-    assert.match(scenario.stdout, /- \[ok\] Fetching cli-stable release metadata/);
+    assert.match(scenario.stdout, /- \[✓\] Fetching cli-stable release metadata/);
     assert.match(scenario.stdout, /- \[\.\.\] Downloading release archive/);
-    assert.match(scenario.stdout, /- \[ok\] Downloading release archive/);
+    assert.match(scenario.stdout, /- \[✓\] Downloading release archive/);
     assert.match(scenario.stdout, /- \[\.\.\] Downloading checksums/);
-    assert.match(scenario.stdout, /- \[ok\] Downloading minisign signature/);
-    assert.match(scenario.stdout, /- \[ok\] Verifying archive checksum/);
-    assert.match(scenario.stdout, /- \[ok\] Verifying release signature/);
+    assert.match(scenario.stdout, /- \[✓\] Downloading minisign signature/);
+    assert.match(scenario.stdout, /- \[✓\] Verifying archive checksum/);
+    assert.match(scenario.stdout, /- \[✓\] Verifying release signature/);
     assert.match(scenario.stdout, /- \[\.\.\] Extracting payload/);
-    assert.match(scenario.stdout, /- \[ok\] Extracting payload/);
+    assert.match(scenario.stdout, /- \[✓\] Extracting payload/);
     assert.doesNotMatch(scenario.stdout, /Expected SHA-256|Actual SHA-256|minisign verification passed/);
   } finally {
     await scenario.cleanup();
@@ -634,7 +634,7 @@ test('install.sh keeps release asset regexes portable across awk implementations
   const scenario = await runInstallerScenario({ HAPPIER_TEST_GNU_AWK_WARNINGS: '1' });
   try {
     assert.equal(scenario.stderr.trim(), '');
-    assert.match(scenario.stdout, /- \[ok\] Verifying release signature/);
+    assert.match(scenario.stdout, /- \[✓\] Verifying release signature/);
   } finally {
     await scenario.cleanup();
   }
@@ -648,8 +648,8 @@ test('install.sh retries transient minisign signature downloads before failing t
   });
   try {
     assert.match(scenario.stdout, /- \[\.\.\] Downloading minisign signature/);
-    assert.match(scenario.stdout, /- \[ok\] Downloading minisign signature/);
-    assert.match(scenario.stdout, /- \[ok\] Verifying release signature/);
+    assert.match(scenario.stdout, /- \[✓\] Downloading minisign signature/);
+    assert.match(scenario.stdout, /- \[✓\] Verifying release signature/);
   } finally {
     await scenario.cleanup();
   }
@@ -674,8 +674,8 @@ test('install.sh retries a transient rolling release metadata gap', async () => 
     HAPPIER_INSTALLER_DOWNLOAD_RETRY_DELAY_SECONDS: '0',
   });
   try {
-    assert.match(scenario.stdout, /- \[ok\] Fetching cli-stable release metadata/);
-    assert.match(scenario.stdout, /- \[ok\] Verifying release signature/);
+    assert.match(scenario.stdout, /- \[✓\] Fetching cli-stable release metadata/);
+    assert.match(scenario.stdout, /- \[✓\] Verifying release signature/);
   } finally {
     await scenario.cleanup();
   }

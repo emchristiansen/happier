@@ -9,6 +9,8 @@ export type ServerScopedMachineRpcParams<A> = Readonly<{
     method: string;
     payload: A;
     serverId?: string | null;
+    /** When present, scoped credentials must belong to this initiating account. */
+    accountId?: string | null;
     timeoutMs?: number;
     preferScoped?: boolean;
     authorization?: SocketRpcAuthorizationContext;

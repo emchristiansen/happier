@@ -11,7 +11,7 @@ import {
 
 describe('buildClaudeRemoteOutgoingMessageMetaExtras', () => {
   it('exports the canonical unified terminal host values used by the provider schema', () => {
-    expect(CLAUDE_UNIFIED_TERMINAL_HOSTS).toEqual(['auto', 'tmux', 'zellij']);
+    expect(CLAUDE_UNIFIED_TERMINAL_HOSTS).toEqual(['auto', 'tmux', 'zellij', 'herdr']);
     expect(CLAUDE_REMOTE_PROVIDER_FIELDS.claudeUnifiedTerminalHost.schema.options).toEqual(
       CLAUDE_UNIFIED_TERMINAL_HOSTS,
     );

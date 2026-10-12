@@ -1,15 +1,15 @@
-import chalk from 'chalk';
+import { cmd, errorFrame, warn } from '@happier-dev/cli-common/output';
 
 import { handleAuthCommand } from '@/cli/commands/auth';
 
 import type { CommandContext } from '@/cli/commandRegistry';
 
 export async function handleLogoutCliCommand(_context: CommandContext): Promise<void> {
-  console.log(chalk.yellow('Note: "happier logout" is deprecated. Use "happier auth logout" instead.\n'));
+  console.log(`${warn(`${cmd('happier logout')} is deprecated. Use ${cmd('happier auth logout')} instead.`)}\n`);
   try {
     await handleAuthCommand(['logout']);
   } catch (error) {
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(errorFrame('Sign-out failed', [error instanceof Error ? error.message : 'Unknown error']));
     if (process.env.DEBUG) {
       console.error(error);
     }

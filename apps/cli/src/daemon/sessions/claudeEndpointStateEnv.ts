@@ -16,6 +16,7 @@ import {
   readTerminalAttachmentInfo as readDefaultTerminalAttachmentInfo,
   removeTerminalAttachmentInfo as removeDefaultTerminalAttachmentInfo,
   type BoundTerminalAttachmentInfo,
+  type ExactTerminalAttachmentInfo,
   type TerminalAttachmentInfo,
 } from '@/terminal/attachment/terminalAttachmentInfo';
 import {
@@ -25,10 +26,7 @@ import {
 import { buildLegacyTerminalAttachmentHostHandle } from '@/terminal/attachment/legacyTerminalAttachmentHandle';
 import type { SpawnSessionOptions } from '@/rpc/handlers/registerSessionHandlers';
 import { logger } from '@/ui/logger';
-import {
-  requireExactTerminalControlServiceabilityRetirement,
-  type ExactTerminalControlServiceabilityRetirement,
-} from './retireTerminalControlServiceability';
+import type { ExactTerminalControlServiceabilityRetirement } from './retireTerminalControlServiceability';
 
 import {
   readSessionMarkerForPid as readDefaultSessionMarkerForPid,
@@ -154,6 +152,9 @@ export async function resolveClaudeEndpointRecoverySpawnOptions(params: Readonly
     sessionId: params.sessionId,
   });
   if (!attachmentInfo) return freshSpawnOptions;
+  // A borrowed terminal belongs to the live foreground wrapper. It cannot be adopted by a
+  // replacement daemon runner and must never enter owned-host recovery or disposal.
+  if (attachmentInfo.version === 3) return freshSpawnOptions;
 
   const endpointState = attachmentInfo.version === 2
     ? await (params.readClaudeEndpointDescriptor ?? readDefaultClaudeEndpointDescriptor)({
@@ -173,14 +174,16 @@ export async function resolveClaudeEndpointRecoverySpawnOptions(params: Readonly
   if (!adapter) return freshSpawnOptions;
   const beforeDescriptorRetirement = params.retireExactTerminalControlServiceability
     ? async ({ attachmentInfo: currentAttachmentInfo }: Readonly<{
-        attachmentInfo: BoundTerminalAttachmentInfo;
+        attachmentInfo: ExactTerminalAttachmentInfo;
       }>): Promise<void> => {
-        const retirement = await params.retireExactTerminalControlServiceability!({
+        if (currentAttachmentInfo.version !== 2) {
+          throw new Error('borrowed_terminal_attachment_is_not_recoverable');
+        }
+        await params.retireExactTerminalControlServiceability!({
           happyHomeDir,
           sessionId: params.sessionId,
           attachmentInfo: currentAttachmentInfo,
         });
-        requireExactTerminalControlServiceabilityRetirement(retirement);
       }
     : undefined;
 
@@ -211,7 +214,7 @@ export async function resolveClaudeEndpointRecoverySpawnOptions(params: Readonly
       expectedAttachmentId: attachmentInfo.attachmentId,
       intent: { kind: 'destroy_owned_host', reason: 'unrecoverable_control_recovery' },
       adapter,
-      readAttachmentInfo: params.readTerminalAttachmentInfo ?? readDefaultTerminalAttachmentInfo,
+      ...(params.readTerminalAttachmentInfo ? { readAttachmentInfo: params.readTerminalAttachmentInfo } : {}),
       removeAttachmentInfo: params.removeTerminalAttachmentInfo ?? removeDefaultTerminalAttachmentInfo,
       beforeDescriptorRetirement,
     }).catch(() => ({ status: 'parked' as const, reason: 'destroy_failed' as const }));
@@ -241,7 +244,7 @@ export async function resolveClaudeEndpointRecoverySpawnOptions(params: Readonly
       happyHomeDir,
       sessionId: params.sessionId,
       expectedAttachmentInfo: attachmentInfo,
-      readAttachmentInfo: params.readTerminalAttachmentInfo ?? readDefaultTerminalAttachmentInfo,
+      ...(params.readTerminalAttachmentInfo ? { readAttachmentInfo: params.readTerminalAttachmentInfo } : {}),
       removeAttachmentInfo: params.removeTerminalAttachmentInfo ?? removeDefaultTerminalAttachmentInfo,
       ...(attachmentInfo.version === 2 && beforeDescriptorRetirement
         ? { beforeDescriptorRetirement }

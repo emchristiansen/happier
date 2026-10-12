@@ -145,29 +145,8 @@ vi.mock('@/hooks/ui/useNativeUpdate', () => ({
 }));
 
 describe('OtaUpdateStatusSection', () => {
-    it('shows a manual OTA check action when no downloaded update is pending', async () => {
-        useNativeUpdateMock.mockReturnValue(null);
-        useUpdatesMock.mockReturnValue({
-            otaUpdatesEnabled: true,
-            updateAvailable: false,
-            isChecking: false,
-            isDownloading: false,
-            isRestarting: false,
-            isUpdatePending: false,
-            downloadProgress: undefined,
-            lastCheckForUpdateTimeSinceRestart: undefined,
-            checkForUpdates: vi.fn(),
-            reloadApp: vi.fn(),
-        });
-
-        const { OtaUpdateStatusSection } = await import('./OtaUpdateStatusSection');
-        const screen = await renderScreen(<OtaUpdateStatusSection />);
-
-        expect(screen.findAllByProps({ title: 'systemStatus.updates.checkNow' }).length).toBeGreaterThan(0);
-    });
-
-    it('shows an apply action when an OTA update has already been downloaded', async () => {
-        useNativeUpdateMock.mockReturnValue(null);
+    it('is diagnostics only: it reports the OTA state and sends the person to the one Updates entry (R13 (e))', async () => {
+        useNativeUpdateMock.mockReturnValue('https://apps.apple.com/app/happier');
         useUpdatesMock.mockReturnValue({
             otaUpdatesEnabled: true,
             updateAvailable: true,
@@ -184,6 +163,9 @@ describe('OtaUpdateStatusSection', () => {
         const { OtaUpdateStatusSection } = await import('./OtaUpdateStatusSection');
         const screen = await renderScreen(<OtaUpdateStatusSection />);
 
-        expect(screen.findAllByProps({ title: 'systemStatus.updates.applyNow' }).length).toBeGreaterThan(0);
+        expect(screen.findAllByProps({ detail: 'systemStatus.updates.readyToApply' }).length).toBeGreaterThan(0);
+        expect(screen.findAllByProps({ title: 'systemStatus.updates.applyNow' })).toHaveLength(0);
+        expect(screen.findAllByProps({ title: 'systemStatus.updates.openStore' })).toHaveLength(0);
+        expect(screen.findAllByProps({ title: 'updates.action.openUpdates' }).length).toBeGreaterThan(0);
     });
 });

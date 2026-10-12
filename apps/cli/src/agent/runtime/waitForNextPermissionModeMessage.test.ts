@@ -7,6 +7,7 @@ import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import { createDeferred } from '@/testkit/async/deferred';
 
 import { waitForNextPermissionModeMessage } from './waitForNextPermissionModeMessage';
+import { createSessionProviderInputConsumer } from './sessionInput/SessionProviderInputConsumer';
 
 type QueueMode = { permissionMode: PermissionMode };
 type PermissionModeSessionFixture = Pick<ApiSessionClient, 'popPendingMessage' | 'waitForPendingEligibilityUpdate'> & {
@@ -130,11 +131,12 @@ describe('waitForNextPermissionModeMessage', () => {
     expect(popPendingMessage).not.toHaveBeenCalled();
   });
 
-  it('wakes on metadata update and then processes a pending-queue item', async () => {
+  it.each(['created', 'shared', 'shared-constructor'] as const)('wakes on metadata update and then processes a pending-queue item: %s consumer', async (consumerKind) => {
     const queue = createQueue();
     const metadataUpdate = createDeferred<boolean>();
     let pendingText: string | null = null;
     let popCount = 0;
+    let metadataWakeConsumed = false;
 
     const session: PermissionModeSessionFixture = {
       async materializeNextPendingMessageSafely() {
@@ -148,25 +150,71 @@ describe('waitForNextPermissionModeMessage', () => {
         popCount += 1;
         return false;
       },
-      async waitForPendingEligibilityUpdate() {
-        return await metadataUpdate.promise;
+      async waitForPendingEligibilityUpdate(signal) {
+        if (!metadataWakeConsumed) {
+          metadataWakeConsumed = true;
+          return await metadataUpdate.promise;
+        }
+        return await new Promise<boolean>((resolve) => {
+          if (signal?.aborted) resolve(false);
+          else signal?.addEventListener('abort', () => resolve(false), { once: true });
+        });
       },
     };
 
+    const controller = new AbortController();
+    // The session port supplies external pending rows/wakes; the shared consumer and wrapper stay real.
+    const inputConsumer = consumerKind === 'shared'
+      ? createSessionProviderInputConsumer({ messageQueue: queue, session, reconcileWhenEmpty: 'skip' })
+      : consumerKind === 'shared-constructor'
+        ? createSessionProviderInputConsumer({
+          messageQueue: queue, session, reconcileWhenEmpty: 'skip',
+          onMetadataUpdate: () => { pendingText = 'from-pending'; },
+        })
+        : undefined;
+    let delivered: string | undefined;
     const resultPromise = waitForNextPermissionModeMessage({
       messageQueue: queue,
-      abortSignal: new AbortController().signal,
+      abortSignal: controller.signal,
       session: asSessionClient(session),
-      onMetadataUpdate: () => {
+      inputConsumer,
+      onMetadataUpdate: consumerKind === 'shared-constructor' ? undefined : () => {
         pendingText = 'from-pending';
       },
+    }).then((result) => { delivered = result?.message; return result; });
+
+    try {
+      metadataUpdate.resolve(true);
+      await expect.poll(() => delivered).toBe('from-pending');
+      expect(popCount).toBe(0);
+    } finally {
+      controller.abort();
+      await resultPromise;
+    }
+  });
+
+  it.each([
+    { onMetadataUpdate: undefined, expectedMode: 'plan' },
+    { onMetadataUpdate: null, expectedMode: 'default' },
+  ] as const)('preserves the shared construction callback unless the wait explicitly disables it: $expectedMode', async ({ onMetadataUpdate, expectedMode }) => {
+    const queue = createQueue();
+    let reconciledMode: PermissionMode = 'default';
+    const session: PermissionModeSessionFixture = {
+      popPendingMessage: async () => false,
+      materializeNextPendingMessageSafely: async () => ({ type: 'no_pending' }),
+      waitForPendingEligibilityUpdate: async () => false,
+    };
+    const inputConsumer = createSessionProviderInputConsumer({
+      messageQueue: queue, session,
+      onMetadataUpdate: () => { reconciledMode = 'plan'; },
     });
-
-    metadataUpdate.resolve(true);
-    const result = await resultPromise;
-
-    expect(popCount).toBe(0);
-    expect(result?.message).toBe('from-pending');
+    queue.pushImmediate('queued-before-wait', { permissionMode: 'default' });
+    const result = await waitForNextPermissionModeMessage({
+      messageQueue: queue, session: asSessionClient(session), inputConsumer,
+      abortSignal: new AbortController().signal, onMetadataUpdate,
+    });
+    expect(result?.message).toBe('queued-before-wait');
+    expect(reconciledMode).toBe(expectedMode);
   });
 
   it('returns a queue message when one arrives while waiting', async () => {

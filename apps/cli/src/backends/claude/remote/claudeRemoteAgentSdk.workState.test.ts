@@ -68,6 +68,10 @@ describe('claudeRemoteAgentSdk work-state projection', () => {
             resetsAt: 1_768_100_000_000,
             rateLimitType: 'five_hour',
             utilization: 100,
+            unifiedWindows: {
+              five_hour: { utilization: 1, resetsAt: 1_768_100_000 },
+              seven_day: { utilization: 0.42, resetsAt: 1_768_500_000 },
+            },
           },
         },
         { type: 'result' },
@@ -89,7 +93,11 @@ describe('claudeRemoteAgentSdk work-state projection', () => {
       overage: null,
       action: null,
       connectedService: null,
-    });
+    }, [
+      // Every window the event reported travels with the limit, so its snapshot keeps them all.
+      expect.objectContaining({ providerLimitId: 'five_hour', utilization: 100 }),
+      expect.objectContaining({ providerLimitId: 'seven_day', utilization: 42 }),
+    ]);
     expect(onMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'rate_limit_event' }));
   });
 
@@ -151,7 +159,7 @@ describe('claudeRemoteAgentSdk work-state projection', () => {
     });
 
     expect(onRateLimitEvent).not.toHaveBeenCalled();
-    expect(onQuotaEvidence).toHaveBeenCalledWith({
+    expect(onQuotaEvidence).toHaveBeenCalledWith([{
       v: 1,
       resetAtMs: 1_779_097_200_000,
       retryAfterMs: null,
@@ -163,8 +171,48 @@ describe('claudeRemoteAgentSdk work-state projection', () => {
       overage: null,
       action: null,
       connectedService: null,
-    });
+    }]);
     expect(onMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'rate_limit_event' }));
+  });
+
+  it('harvests every unified Claude quota window from allowed rate-limit telemetry', async () => {
+    const onRateLimitEvent = vi.fn();
+    const onQuotaEvidence = vi.fn();
+
+    await runAgentSdkMessagesForRateLimitTest({
+      messages: [
+        {
+          // Claude Code 2.1.282 shape: the top level carries no utilization; each window's used
+          // fraction (above 1 once usage runs past the cap) lives under `unifiedWindows`.
+          type: 'rate_limit_event',
+          uuid: 'rate-limit-unified',
+          session_id: 'claude-session-unified',
+          rate_limit_info: {
+            status: 'allowed',
+            resetsAt: 1_790_378_400,
+            rateLimitType: 'five_hour',
+            overageStatus: 'rejected',
+            overageDisabledReason: 'org_level_disabled',
+            isUsingOverage: false,
+            unifiedWindows: {
+              five_hour: { utilization: 0.05, resetsAt: 1_790_378_400 },
+              seven_day: { utilization: 1.2, resetsAt: 1_790_928_000 },
+            },
+          },
+        },
+        { type: 'result' },
+      ],
+      onMessage: vi.fn(),
+      onRateLimitEvent,
+      onQuotaEvidence,
+    });
+
+    expect(onRateLimitEvent).not.toHaveBeenCalled();
+    expect(onQuotaEvidence).toHaveBeenCalledTimes(1);
+    expect(onQuotaEvidence).toHaveBeenCalledWith([
+      expect.objectContaining({ providerLimitId: 'five_hour', utilization: 5, resetAtMs: 1_790_378_400_000 }),
+      expect.objectContaining({ providerLimitId: 'seven_day', utilization: 100, resetAtMs: 1_790_928_000_000 }),
+    ]);
   });
 
   it('surfaces synthetic API-error rate-limit assistant records before transcript conversion', async () => {
@@ -197,7 +245,7 @@ describe('claudeRemoteAgentSdk work-state projection', () => {
       quotaScope: 'account',
       recoverability: 'wait',
       providerLimitId: 'rate_limit',
-    }));
+    }), []);
     expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({
       type: 'assistant',
       isApiErrorMessage: true,

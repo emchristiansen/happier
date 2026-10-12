@@ -6,6 +6,15 @@ import {
 } from './opencodeSessionRuntimeHandle.js';
 
 describe('opencodeSessionRuntimeHandle', () => {
+  it.each(['', { invalid: true }])('retains malformed recorded affinity without substituting a legacy hint: %s', (value) => {
+    expect(readOpenCodeSessionRuntimeHandleFromMetadata({
+      opencodeManagedServerLaunchFingerprint: 'b'.repeat(64),
+      agentRuntimeDescriptorV1: { v: 1, providerId: 'opencode', provider: {
+        backendMode: 'server', vendorSessionId: 'native-target',
+        providerExtra: { v: 1, runtimeHandle: { managedServerLaunchFingerprint: value } },
+      } },
+    })).toMatchObject({ vendorSessionId: 'native-target', managedServerLaunchFingerprint: '' });
+  });
   it('prefers providerExtra runtime handle fields over provider and legacy metadata', () => {
     expect(readOpenCodeSessionRuntimeHandleFromMetadata({
       agentRuntimeDescriptorV1: {
@@ -36,6 +45,7 @@ describe('opencodeSessionRuntimeHandle', () => {
       vendorSessionId: 'oc_1',
       serverBaseUrl: 'http://127.0.0.1:4096/',
       serverBaseUrlExplicit: true,
+      managedServerLaunchFingerprint: null,
     });
   });
 
@@ -60,6 +70,7 @@ describe('opencodeSessionRuntimeHandle', () => {
       vendorSessionId: 'oc_1',
       serverBaseUrl: 'http://127.0.0.1:4096/',
       serverBaseUrlExplicit: true,
+      managedServerLaunchFingerprint: null,
     });
   });
 
@@ -72,6 +83,7 @@ describe('opencodeSessionRuntimeHandle', () => {
       backendMode: 'acp',
       serverBaseUrl: 'http://127.0.0.1:4999/',
       serverBaseUrlExplicit: true,
+      managedServerLaunchFingerprint: null,
     });
   });
 });

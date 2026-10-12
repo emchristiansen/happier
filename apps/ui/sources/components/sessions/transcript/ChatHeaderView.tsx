@@ -130,7 +130,7 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
     };
 
     return (
-        <View style={[styles.container, { paddingTop: includeTopInset ? insets.top : 0, backgroundColor: theme.colors.chrome.header.background }]}>
+        <View style={[styles.container, { paddingTop: includeTopInset ? insets.top : 0, backgroundColor: theme.colors.surface.base }]}>
             <View
                 onLayout={handleWrapperLayout}
                 style={[styles.contentWrapper, constrainWidth ? null : { alignItems: 'stretch' }]}

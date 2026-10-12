@@ -10,6 +10,7 @@ import {
 import {
   isLoopbackManagedOpenCodeBaseUrl,
   readSharedManagedOpenCodeServerStateByBaseUrlBestEffort,
+  readSharedManagedOpenCodeServerStateByLaunchFingerprintBestEffort,
   type SharedManagedOpenCodeServerState,
 } from '@/backends/opencode/server/sharedManagedServer';
 
@@ -32,10 +33,18 @@ type TargetAuthParams = Readonly<{
   baseUrl: string;
   env: NodeJS.ProcessEnv;
   readManagedServerStateFn?: ReadManagedStateFn;
+  managedServerLaunchFingerprint?: string | null;
 }>;
 
 async function readMatchingManagedState(params: TargetAuthParams): Promise<SharedManagedOpenCodeServerState | null> {
   if (!isLoopbackManagedOpenCodeBaseUrl(params.baseUrl)) return null;
+  if (params.managedServerLaunchFingerprint != null) {
+    const state = await readSharedManagedOpenCodeServerStateByLaunchFingerprintBestEffort(params.managedServerLaunchFingerprint);
+    if (!isOpenCodeManagedServerStateTarget({ state, baseUrl: params.baseUrl })) {
+      throw new Error('Managed OpenCode target credential affinity is unavailable.');
+    }
+    return state;
+  }
   const state = await (params.readManagedServerStateFn ?? readSharedManagedOpenCodeServerStateByBaseUrlBestEffort)(params.baseUrl)
     .catch(() => null);
   return isOpenCodeManagedServerStateTarget({ state, baseUrl: params.baseUrl }) ? state : null;
@@ -52,10 +61,12 @@ export async function resolveOpenCodeAttachTargetAuthHeaders(params: Readonly<{
   baseUrl: string;
   env?: NodeJS.ProcessEnv;
   readManagedServerStateFn?: ReadManagedStateFn;
+  managedServerLaunchFingerprint?: string | null;
 }>): Promise<Record<string, string>> {
   return resolveOpenCodeServerAuthHeaders(await resolveTargetCredential({
     baseUrl: params.baseUrl,
     env: params.env ?? process.env,
+    managedServerLaunchFingerprint: params.managedServerLaunchFingerprint,
     ...(params.readManagedServerStateFn ? { readManagedServerStateFn: params.readManagedServerStateFn } : {}),
   }));
 }
@@ -64,12 +75,14 @@ export async function resolveOpenCodeAttachChildEnv(params: Readonly<{
   baseUrl: string;
   env?: NodeJS.ProcessEnv;
   readManagedServerStateFn?: ReadManagedStateFn;
+  managedServerLaunchFingerprint?: string | null;
 }>): Promise<NodeJS.ProcessEnv> {
   const env = params.env ?? process.env;
   if (!isLoopbackManagedOpenCodeBaseUrl(params.baseUrl)) return env;
   const targetAuth = {
     baseUrl: params.baseUrl,
     env,
+    managedServerLaunchFingerprint: params.managedServerLaunchFingerprint,
     ...(params.readManagedServerStateFn ? { readManagedServerStateFn: params.readManagedServerStateFn } : {}),
   };
   const state = await readMatchingManagedState(targetAuth);

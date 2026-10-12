@@ -100,6 +100,14 @@ upgrade; it is not a generic compatibility verdict. Release orchestration never
 waits for client adoption, self-hosted relay upgrades, daemon drain, migration
 cohorts, or a global cutover.
 
+For desktop setup and managed-CLI/service state, the `desktop-setup` suite
+(`scripts/release/release-assets-e2e/README.md`; it gates the production desktop
+publish in `build-tauri.yml`, using the candidate CLI release) runs the
+hsetup shipped in a Linux desktop artifact against a fresh systemd machine, and
+upgrades a machine set up by the previous published stable desktop + CLI (pinned
+immutable tags) to the candidate. It proves the Linux systemd user-service path
+only; macOS launchd and Windows schtasks are not covered by it.
+
 ## Proportionate matrix
 
 List all affected reachable directions and mark each `required`, `unreachable`, or `unsupported` with a reason. Direct seam tests cover each required direction. End-to-end rows are selected by risk and real deployment order.
@@ -125,6 +133,135 @@ Every retained compatibility path records:
 - its removal condition.
 
 Remove the path when its support window has ended and evidence shows no supported reader, writer, or stored shape still requires it. Do not remove a released-data reader merely because current writers stopped producing that shape.
+
+### Native reminder picker on older mobile binaries (0.2.15)
+
+The UI 0.2.12 source at `a357c65536ba89669422977d6f7daf9aa0d17e73`
+does not include `@react-native-community/datetimepicker`, but shares the manual
+`0.2.7-native` OTA runtime with later UI sources that include it. An OTA update
+cannot add that compiled native module to an already-installed app.
+
+The native `SessionReminderPicker` adapter therefore checks the installed
+capability before loading the SDK: the iOS native view, or all four Android
+modules eagerly required by SDK 8.4.4. The reminder modal consumes that same
+availability decision and omits unsupported picker buttons. Its existing manual
+date/time fields and submission rules remain available; equipped binaries retain
+their native picker. Web uses its existing JavaScript picker unchanged.
+
+This is an older-native/new-JavaScript compatibility path, not delivery of new
+native code through OTA. Remove the guard only when no supported binary eligible
+for these updates can lack the SDK. Native renderer fixes and app-link entitlement
+changes still require a native app build.
+
+### Android file actions native runtime (development)
+
+The development UI's Android Save As, Open With, and Share actions require the
+compiled `HappierFileActions` Expo module. Released binaries on the
+`0.2.7-native` OTA runtime do not include it. Non-publicdev lanes use the new
+`0.2.8-native` runtime train for this native surface; publicdev continues to use
+the existing Expo fingerprint policy. Publish a new native build before updates
+for this train, and do not force this JavaScript bundle onto older native runtimes
+using the maintenance override.
+
+This changes the local Android handoff only. Encrypted workspace transfers and
+their daemon-owned limits retain their existing wire contracts. Web and iOS
+downloads keep their existing platform actions.
+
+### Herdr terminal metadata (development)
+
+The released stable UI `ui-web-v0.2.12` and preview
+`ui-web-v0.2.12-preview.4` at
+`a357c65536ba89669422977d6f7daf9aa0d17e73` reject `herdr` in both
+`terminal.mode` and `terminal.requested`. That failure rejects the Session's
+entire metadata, not just its terminal attachment.
+
+`packages/protocol/src/sessionMetadata/terminalMetadata.ts` owns the development
+wire projection: Herdr uses the released `plain` enum value with additive
+`hostKind: 'herdr'` and, independently, `requestedHostKind: 'herdr'` for a Herdr
+preference. The existing Herdr terminal identity and control-serviceability
+fields are preserved. New readers normalize these wire selectors immediately
+to the canonical `herdr` domain values and remove the recognized selectors;
+later domain mutations cannot retain competing host choices. All Session
+metadata write boundaries apply the same projection, before either plaintext
+serialization or encryption. Machine metadata and message bodies are unaffected.
+
+Older UIs retain core Session metadata and can preserve the additive fields when
+editing metadata; they do not acquire Herdr-specific authoring or attachment
+controls. Current UIs and CLIs retain those controls. A provenance-pinned
+released-reader fixture covers current writes through old reads/edits back into
+new readers. The projection may be removed only when UIs with these strict enums
+are no longer supported; readers of persisted additive projections remain needed
+while such Session metadata can still be encountered.
+
+### Terminal-host account settings (development)
+
+The same released UI at `a357c65536ba89669422977d6f7daf9aa0d17e73`
+strips unknown fields inside `sessionTmuxByMachineId` and its machine editor
+writes the complete parsed map. Non-tmux machine choices therefore live in the
+additive top-level `sessionTerminalHostByMachineId` setting, which its raw-baseline
+writeback preserves when editing another machine. `terminalSettings.ts` owns the
+effective host for both launch and presentation. Modern edits update that map and
+the legacy tmux projection in one account-settings patch; none/tmux choices use
+the released boolean settings and retain tmux names, isolation and temporary paths.
+
+A released UI selecting tmux on the same machine remains authoritative through
+`useTmux: true`. A false value also accompanies a non-tmux choice and cannot
+distinguish a repeated old-client echo from an intent to disable Herdr. Older UIs
+do not gain Herdr controls. Current readers normalize the development-only nested
+`terminalHost` shape when the top-level map is absent; an explicit new-map clear
+cannot revive it. Remove this development reader once retained nested development
+settings are no longer encountered.
+
+### Direct-session import and takeover operations (development)
+
+The released `cli-v0.2.14` and `cli-v0.2.14-preview.1` daemon at
+`df8241c8b1068aa964ec7723000ff356ba3a00ef` executes
+`daemon.directSessions.takeoverPersist` synchronously. Updated daemons retain that
+method as a completion-waiting adapter to the shared daemon Action Operations
+runner used by handoff, fork, and session creation. `takeoverPersist.start`
+acknowledges admission with the shared operation snapshot. Direct takeover and
+import admission share writer/auth/source checks and exclude competing requests
+for the same linked session; repeat delivery joins the existing completion.
+The runner owns both the early admission receipt and final completion for tracked
+spawn, fork, handoff, and takeover requests. Reusing a request identity with changed
+canonical input is rejected. Spawn admission uses the existing native nonce identity
+(including trimmed padding) while preserving the forwarded nonce bytes. Handoff
+does not keep a second admission receipt registry. These private changes add no
+fields to the released operation snapshot.
+The development-only `import.status` and `import.cancel` endpoints and dedicated
+import operation store are removed. Status and Stop use the shared
+`actionOperation.list.v1`, `actionOperation.get.v1`, and
+`actionOperation.cancel.v1` methods.
+
+Updated UIs start import through the asynchronous method and observe the daemon's
+phase, message counts, cancellation eligibility, and terminal result through the
+existing account-scoped Action Operations revision stream and connection-time
+reconciliation. The footer and Activity read the same store; the footer does not
+poll a separate import lifecycle. Reconciliation decisions use the newest shared
+snapshot after merging transport responses: a delayed start acknowledgment or
+status response cannot revive an older revision, hide a terminal refresh error,
+or settle the pending send of a newer retry. A transport request deadline does not
+set an import deadline. The existing transcript footer
+also renders for empty imports and remains available through metadata conversion.
+Observation retains the original daemon address until terminal refresh succeeds,
+so conversion cannot strand a pending send; failed refresh remains recoverable
+through the same Refresh action. If the start acknowledgement is
+lost, the UI reconciles the shared operation by request identity without starting
+a second import. A missing method on
+an older daemon asks the user to update the daemon before starting work; it does
+not fall back to the synchronous import path. Existing relay RPC routing requires
+no server schema or persistence change.
+
+Cancellation is cooperative during transcript reading and uploading. The current
+page/media/upload effect may finish before cancellation settles; no next message
+or runner startup follows. Accepted messages remain stored with the existing
+stable import IDs, so retry deduplicates them. Cancellation becomes unavailable
+when runner startup begins. Completion still requires the existing metadata
+conversion. Operations follow the shared daemon-local retention and recovery
+rules: reopening the session recovers status, while daemon restart loses the
+operation record. An authoritative missing record marks status unavailable and
+settles pending UI work without claiming completion. Retry uses a new request
+identity and the existing importer IDs to preserve accepted history.
 
 ### ACP session-list browse source
 
@@ -202,9 +339,31 @@ When the field is absent in storage, a negotiated reader receives the explicit
 stored selection.
 
 `windowDurationMs` is an optional additive quota-meter fact. Updated readers use
-it only for presentation; absence preserves the existing meter semantics and older
+it for presentation and expiry-first ranking; absence preserves eligibility semantics and older
 readers safely ignore it. Pool-selected usage projection filters only meters and
 preserves account-, subscription-, freshness-, and recovery-credit fields.
+
+### Account-pool expiry-first strategy (development)
+
+The canonical V1 policy defaults to `expiry_first` for newly created or absent
+policies. Explicitly persisted `least_limited`, `priority`, and `manual` choices
+remain unchanged. The daemon's existing candidate selector first prefers fresh
+headroom above the pool's soft-switch threshold, then the earliest future reset
+of its longest selected usage allowance or independently fresh, non-renewing
+subscription end. Ties and candidates without adequate headroom use the existing
+least-limited ranking and priority tie-break. Missing, stale, renewing, and passed
+subscription dates provide no urgency; eligibility, current-account stickiness,
+switch budgets, and hot-auth application are unchanged.
+
+Updated group readers negotiate `happierPoolExpiryFirst=1`. The existing response
+projection represents this strategy as `least_limited` for older strict readers;
+it does not rewrite storage. Unrelated older-client patches preserve the stored
+strategy, while an explicit strategy patch remains an intentional choice. Updated
+UI clients offer the new choice only when `connectedServices.poolExpiryFirst` is
+advertised; this bit controls authoring, not runtime selection. Older daemons
+continue their supported least-limited behavior. As with the other development
+policy extensions above, rollback to a server whose persisted-policy parser
+rejects this enum is not a preservation guarantee.
 
 ### Session draft rollout
 

@@ -15,7 +15,7 @@ interface AuthContextType {
     /**
      * Authentication completed during this app run (a login, not credentials restored at
      * launch). Ephemeral by design: it is the one entry-context fact desktop setup reads to
-     * decide whether unresolved local facts show the setup ground or the shell (R14).
+     * decide whether unresolved local facts already show the Home's checking panel (R14/R11).
      */
     authenticatedThisRun: boolean;
     credentials: AuthCredentials | null;

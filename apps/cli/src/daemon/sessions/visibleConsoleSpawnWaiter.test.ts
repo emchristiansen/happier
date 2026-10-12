@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SpawnSessionResult } from '@/rpc/handlers/registerSessionHandlers';
 import type { ChildExit } from './onChildExited';
 import type { TrackedSession } from '../types';
+import { logger } from '@/ui/logger';
 
 import { waitForVisibleConsoleSessionWebhook } from './visibleConsoleSpawnWaiter';
 import { createOnChildExited } from './onChildExited';
@@ -39,8 +40,9 @@ describe('waitForVisibleConsoleSessionWebhook', () => {
     vi.restoreAllMocks();
   });
 
-  it('reports incomplete exit cleanup and retains tracking when terminal custody is unavailable', async () => {
+  it('reports startup exit immediately and retains tracking when terminal cleanup fails', async () => {
     vi.useFakeTimers();
+    const warning = vi.spyOn(logger, 'warn');
     installProcessKillMock({ alive: false });
     const pid = 12347;
     const tracked: TrackedSession = {
@@ -67,9 +69,10 @@ describe('waitForVisibleConsoleSessionWebhook', () => {
 
     await expect(completion).resolves.toMatchObject({
       type: 'error',
-      errorCode: 'SPAWN_FAILED',
+      errorCode: 'CHILD_EXITED_BEFORE_WEBHOOK',
     });
     expect(pidToTrackedSession.get(pid)).toBe(tracked);
+    expect(warning).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ pid, error: expect.any(Error) }));
   });
 
   it('fails closed when webhook success is missing happySessionId', async () => {

@@ -105,6 +105,7 @@ async function main() {
         baseVersion: base,
         explicitVersion: explicitVersions.cli,
         publishSurface: 'npm',
+        allowExistingExactVersion: Boolean(explicitVersions.cli),
         env: process.env,
       })
     ).version;
@@ -123,6 +124,7 @@ async function main() {
         baseVersion: base,
         explicitVersion: explicitVersions.stack,
         publishSurface: 'npm',
+        allowExistingExactVersion: Boolean(explicitVersions.stack),
         env: process.env,
       })
     ).version;
@@ -142,6 +144,7 @@ async function main() {
         baseVersion: base,
         explicitVersion: explicitVersions.server,
         publishSurface: 'npm',
+        allowExistingExactVersion: Boolean(explicitVersions.server),
         env: process.env,
       })
     ).version;
