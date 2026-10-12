@@ -2,12 +2,14 @@ import chalk from 'chalk';
 
 import { parsePermissionIntentAlias } from '@happier-dev/agents';
 import type { PermissionIntent } from '@happier-dev/agents';
+import { readPendingLocalId } from '@happier-dev/protocol';
 
 import type { Credentials } from '@/persistence';
 import { wantsJson, printJsonEnvelope, writeJsonStdout } from '@/cli/output/jsonEnvelope';
 import { hasFlag, readCommandPositionals, readIntFlagValue, readFlagValue } from '@/cli/commands/shared/argvFlags';
 import { createCliActionExecutorFromCredentials } from '@/session/actions/createCliActionExecutorFromCredentials';
 import { tryHandleApprovalRequestCreated } from './shared/tryHandleApprovalRequestCreated';
+import { cmd, fail } from '@happier-dev/cli-common/output';
 
 function parsePermissionIntentOrThrow(raw: string): PermissionIntent {
   const parsed = parsePermissionIntentAlias(raw);
@@ -26,12 +28,24 @@ export async function cmdSessionSend(
   const json = wantsJson(argv);
   const [idOrPrefix = '', message = ''] = readCommandPositionals(argv, {
     startIndex: 1,
-    valueFlags: ['--permission-mode', '--model', '--timeout'],
+    valueFlags: ['--permission-mode', '--model', '--timeout', '--local-id'],
   });
   const wait = hasFlag(argv, '--wait');
   const timeoutSecondsRaw = readIntFlagValue(argv, '--timeout', { min: 1 });
   const permissionModeFlag = (readFlagValue(argv, '--permission-mode') ?? '').trim();
   const modelFlagRaw = readFlagValue(argv, '--model');
+  const optionTerminatorIndex = argv.indexOf('--');
+  const localIdFlagIndex = argv.slice(0, optionTerminatorIndex < 0 ? argv.length : optionTerminatorIndex).indexOf('--local-id');
+  const localIdRaw = localIdFlagIndex >= 0 ? argv[localIdFlagIndex + 1] : undefined;
+  const localId = readPendingLocalId(localIdRaw);
+  if (localIdFlagIndex >= 0 && (
+    localId === null
+    || localId.startsWith('-')
+  )) {
+    const err = new Error('Invalid --local-id');
+    (err as Error & { code?: string }).code = 'invalid_arguments';
+    throw err;
+  }
   const hasModelFlag = modelFlagRaw !== null;
   const modelFlag = typeof modelFlagRaw === 'string' ? modelFlagRaw.trim() : '';
   const timeoutSeconds =
@@ -40,7 +54,7 @@ export async function cmdSessionSend(
       : 300;
 
   if (!idOrPrefix || !message) {
-    throw new Error('Usage: happier session send <session-id-or-prefix> <message> [--permission-mode <mode>] [--model <model-id>] [--wait] [--timeout <seconds>] [--json]');
+    throw new Error('Usage: happier session send <session-id-or-prefix> <message> [--local-id <id>] [--permission-mode <mode>] [--model <model-id>] [--wait] [--timeout <seconds>] [--json]');
   }
 
   const credentials = await deps.readCredentialsFn();
@@ -49,7 +63,7 @@ export async function cmdSessionSend(
       await printJsonEnvelope({ ok: false, kind: 'session_send', error: { code: 'not_authenticated' } });
       return;
     }
-    console.error(chalk.red('Error:'), 'Not authenticated. Run "happier auth login" first.');
+    console.error(fail(`Not signed in. Run ${cmd('happier auth login')} first.`));
     process.exit(1);
   }
 
@@ -72,6 +86,7 @@ export async function cmdSessionSend(
     {
       sessionId: idOrPrefix,
       message,
+      ...(localId !== null ? { localId } : {}),
       ...(permissionModeOverride ? { permissionModeOverride } : {}),
       ...(modelOverride !== undefined ? { modelOverride } : {}),
       ...(wait ? { wait: true } : {}),

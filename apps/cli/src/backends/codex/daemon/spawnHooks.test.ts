@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { dirname, join } from 'node:path';
 
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { createExecutableShim } from '@/testkit/fs/executableShim';
 import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
+import { codexDaemonSpawnHooks } from './spawnHooks';
 
 const envKeys = ['HAPPIER_CODEX_ACP_BIN', 'PATH', 'CODEX_HOME'] as const;
 const ORIGINAL_CWD = process.cwd();
@@ -39,7 +40,6 @@ afterEach(async () => {
   process.chdir(ORIGINAL_CWD);
   envScope.restore();
   envScope = createEnvKeyScope(envKeys);
-  vi.resetModules();
   for (const dir of tempDirs) {
     await removeTempDir(dir);
   }
@@ -47,13 +47,20 @@ afterEach(async () => {
 });
 
 describe('codexDaemonSpawnHooks.validateSpawn', () => {
+  it('uses the admitted backend mode after ACP preflight falls back to MCP', async () => {
+    expect(codexDaemonSpawnHooks.resolveTerminalPresentation?.({
+      host: 'tmux',
+      accountSettings: null,
+      runtimeSelection: { codexBackendMode: 'acp' },
+      processEnv: { HAPPIER_CODEX_BACKEND_MODE: 'mcp' },
+    })).toEqual({ kind: 'runner', startingMode: 'remote' });
+  });
   it('validates ACP spawn when codexBackendMode=acp is set without the legacy flag', async () => {
     const cwd = await createTempDir('happier-codex-spawnhooks-cwd-');
     tempDirs.add(cwd);
     process.chdir(cwd);
     envScope.patch({ HAPPIER_CODEX_ACP_BIN: './missing-codex-acp' });
 
-    const { codexDaemonSpawnHooks } = await import('./spawnHooks');
     const res = await codexDaemonSpawnHooks.validateSpawn!({
       codexBackendMode: 'acp',
     } as any);
@@ -68,7 +75,6 @@ describe('codexDaemonSpawnHooks.validateSpawn', () => {
     process.chdir(cwd);
     envScope.patch({ HAPPIER_CODEX_ACP_BIN: './missing-codex-acp' });
 
-    const { codexDaemonSpawnHooks } = await import('./spawnHooks');
     const res = await codexDaemonSpawnHooks.validateSpawn!({
       experimentalCodexAcp: true,
     } as any);
@@ -81,7 +87,6 @@ describe('codexDaemonSpawnHooks.validateSpawn', () => {
     const pathDir = await createFakeBin('other-cli');
     envScope.patch({ HAPPIER_CODEX_ACP_BIN: undefined, PATH: pathDir });
 
-    const { codexDaemonSpawnHooks } = await import('./spawnHooks');
     const res = await codexDaemonSpawnHooks.validateSpawn!({
       experimentalCodexAcp: true,
     } as any);
@@ -93,7 +98,6 @@ describe('codexDaemonSpawnHooks.validateSpawn', () => {
     tempDirs.add(pathDir);
     envScope.patch({ HAPPIER_CODEX_ACP_BIN: undefined, PATH: pathDir });
 
-    const { codexDaemonSpawnHooks } = await import('./spawnHooks');
     const res = await codexDaemonSpawnHooks.validateSpawn!({
       experimentalCodexAcp: true,
     } as any);
@@ -106,7 +110,6 @@ describe('codexDaemonSpawnHooks.validateSpawn', () => {
     const pathDir = await createNonExecutableBin('codex-acp');
     envScope.patch({ HAPPIER_CODEX_ACP_BIN: undefined, PATH: pathDir });
 
-    const { codexDaemonSpawnHooks } = await import('./spawnHooks');
     const res = await codexDaemonSpawnHooks.validateSpawn!({
       experimentalCodexAcp: true,
     } as any);
@@ -115,15 +118,25 @@ describe('codexDaemonSpawnHooks.validateSpawn', () => {
 });
 
 describe('codexDaemonSpawnHooks', () => {
+  it('presents only the shared native client while retaining headless App Server controller custody', async () => {
+    for (const host of ['tmux', 'zellij', 'herdr'] as const) {
+      const selection = { host, accountSettings: null, processEnv: {} };
+      expect(codexDaemonSpawnHooks.resolveTerminalPresentation?.({
+        ...selection, runtimeSelection: { codexBackendMode: 'appServer' },
+      })).toEqual({ kind: 'provider_attach', startingMode: 'local' });
+      expect(codexDaemonSpawnHooks.resolveTerminalPresentation?.({
+        ...selection, runtimeSelection: { codexBackendMode: 'acp' },
+      })).toEqual({ kind: 'none' });
+    }
+  });
+
   it('does not expose legacy generic token auth plumbing', async () => {
-    const { codexDaemonSpawnHooks } = await import('./spawnHooks');
     expect('buildAuthEnv' in codexDaemonSpawnHooks).toBe(false);
   });
 });
 
 describe('codexDaemonSpawnHooks.buildExtraEnvForChild', () => {
   it('publishes the ACP env marker when codexBackendMode=acp is set', async () => {
-    const { codexDaemonSpawnHooks } = await import('./spawnHooks');
     expect(
       codexDaemonSpawnHooks.buildExtraEnvForChild?.({
         codexBackendMode: 'acp',
@@ -132,7 +145,6 @@ describe('codexDaemonSpawnHooks.buildExtraEnvForChild', () => {
   });
 
   it('does not publish the ACP env marker when codexBackendMode=appServer overrides the legacy flag', async () => {
-    const { codexDaemonSpawnHooks } = await import('./spawnHooks');
     expect(
       codexDaemonSpawnHooks.buildExtraEnvForChild?.({
         codexBackendMode: 'appServer',

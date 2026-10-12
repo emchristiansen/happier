@@ -58,6 +58,7 @@ function installManagedServiceUnit(): string {
     '[Service]',
     'ExecStart=/opt/happier/happier daemon start-sync',
     'Environment=HAPPIER_DAEMON_STARTUP_SOURCE=background-service',
+    `Environment=HAPPIER_HOME_DIR=${configuration.happyHomeDir}`,
     '',
   ].join('\n'));
   return snapshot.label;
@@ -87,12 +88,12 @@ describe('readDaemonStatusSnapshot runtimeConvergence', () => {
     }
   });
 
-  async function startRelay(validatedAccountId: string): Promise<string> {
+  async function startRelay(validatedAccountId: string, profile: Record<string, unknown> = {}): Promise<string> {
     const relay = http.createServer((req, res) => {
       res.setHeader('content-type', 'application/json');
       if (req.url === '/v1/account/profile') {
         res.statusCode = 200;
-        res.end(JSON.stringify({ id: validatedAccountId }));
+        res.end(JSON.stringify({ id: validatedAccountId, ...profile }));
         return;
       }
       res.statusCode = 404;
@@ -136,6 +137,40 @@ describe('readDaemonStatusSnapshot runtimeConvergence', () => {
       },
     }));
   }
+
+  it('names the validated account and reports the cached CLI update of this channel without a network check', async () => {
+    const relayUrl = await startRelay('acct_b', { username: 'bea' });
+    await seedHome({ relayUrl, accountId: 'acct_b', machineId: 'machine-b' });
+    const cacheFile = `${configuration.happyHomeDir}/cache/${configuration.publicReleaseRing === 'stable' ? 'update.json' : `update.${configuration.publicReleaseRing === 'publicdev' ? 'dev' : 'preview'}.json`}`;
+    mkdirSync(dirname(cacheFile), { recursive: true });
+    const latest = configuration.publicReleaseRing === 'stable' ? '999.0.0' : configuration.publicReleaseRing === 'preview' ? '999.0.0-preview.1' : '999.0.0-dev.1';
+    writeFileSync(cacheFile, JSON.stringify({
+      checkedAt: Date.now(),
+      latest,
+      current: '0.0.1',
+      runtimeVersion: null,
+      invokerVersion: '0.0.1',
+      updateAvailable: true,
+      notifiedAt: null,
+    }));
+
+    const { readDaemonStatusSnapshot } = await import('./statusSnapshot');
+    const snapshot = await readDaemonStatusSnapshot();
+
+    expect(snapshot.auth.accountLabel).toBe('bea');
+    expect(snapshot.cliUpdate).toEqual({
+      currentVersion: configuration.currentCliVersion,
+      latestVersion: latest,
+      updateAvailable: true,
+      // K5: the same facts every daemon publishes in its machine metadata. A test process runs
+      // from the repo, not a managed install, so it names no update command and no remote update.
+      channel: configuration.publicReleaseRing === 'publicdev' ? 'dev' : configuration.publicReleaseRing,
+      installSource: 'other',
+      updateCommand: null,
+      canUpdateRemotely: false,
+      lastUpdate: null,
+    });
+  });
 
   it('does not report a daemon running as account A as converged once account B credentials are on disk', async () => {
     const relayUrl = await startRelay('acct_b');

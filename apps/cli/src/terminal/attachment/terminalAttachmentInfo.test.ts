@@ -11,6 +11,47 @@ import {
 } from './terminalAttachmentInfo';
 
 describe('terminalAttachmentInfo', () => {
+  it('persists a Herdr attachment by stable terminal ID despite pane moves', async () => {
+    const dir = tmp.dirSync({ unsafeCleanup: true });
+    try {
+      const terminal = {
+        mode: 'herdr',
+        herdr: {
+          sessionName: 'default',
+          socketPath: '/tmp/herdr.sock',
+          terminalId: 'term_123',
+          paneId: 'w1:p2',
+        },
+      } as const;
+      const handle = {
+        kind: 'herdr',
+        sessionName: 'default',
+        socketPath: '/tmp/herdr.sock',
+        terminalId: 'term_123',
+        paneId: 'w1:p2',
+        attachMetadata: {
+          attachStrategy: 'terminal_host',
+          topology: 'shared',
+          locality: 'same_machine',
+          liveProbe: 'required',
+        },
+      } as const;
+      await writeTerminalAttachmentInfo({
+        happyHomeDir: dir.name,
+        sessionId: 'sess_herdr',
+        attachmentId: 'attachment-herdr',
+        terminal,
+        handle,
+      });
+      await expect(readTerminalAttachmentInfo({
+        happyHomeDir: dir.name,
+        sessionId: 'sess_herdr',
+      })).resolves.toMatchObject({ terminal, handle });
+    } finally {
+      dir.removeCallback();
+    }
+  });
+
   it('writes attachment info with private file permissions', async () => {
     if (process.platform === 'win32') return;
     const dir = tmp.dirSync({ unsafeCleanup: true });
@@ -162,6 +203,66 @@ describe('terminalAttachmentInfo', () => {
         attachmentId: 'attachment-seed-1',
         handle,
       });
+    } finally {
+      dir.removeCallback();
+    }
+  });
+
+  it('persists a borrowed host separately so older owners cannot destroy the user terminal', async () => {
+    const dir = tmp.dirSync({ unsafeCleanup: true });
+    try {
+      const handle = {
+        kind: 'herdr',
+        sessionName: 'work',
+        socketPath: '/tmp/herdr-work.sock',
+        terminalId: 'terminal_wrapper',
+        paneId: 'workspace_1:pane_8',
+        attachMetadata: {
+          attachStrategy: 'terminal_host',
+          topology: 'shared',
+          locality: 'same_machine',
+          liveProbe: 'required',
+        },
+      } as const;
+      const terminal = {
+        mode: 'herdr',
+        herdr: {
+          sessionName: handle.sessionName,
+          socketPath: handle.socketPath,
+          terminalId: handle.terminalId,
+          paneId: handle.paneId,
+        },
+      } as const;
+
+      await writeTerminalAttachmentInfo({
+        happyHomeDir: dir.name,
+        sessionId: 'sess_borrowed',
+        attachmentId: 'attachment-borrowed',
+        handle,
+        terminal,
+        lifecycle: 'borrowed',
+      });
+
+      await expect(readTerminalAttachmentInfo({
+        happyHomeDir: dir.name,
+        sessionId: 'sess_borrowed',
+      })).resolves.toMatchObject({
+        version: 3,
+        lifecycle: 'borrowed',
+        attachmentId: 'attachment-borrowed',
+        handle,
+        terminal,
+      });
+
+      await writeTerminalAttachmentInfo({
+        happyHomeDir: dir.name,
+        sessionId: 'sess_borrowed',
+        terminal,
+      });
+      await expect(readTerminalAttachmentInfo({
+        happyHomeDir: dir.name,
+        sessionId: 'sess_borrowed',
+      })).resolves.toMatchObject({ version: 3, lifecycle: 'borrowed' });
     } finally {
       dir.removeCallback();
     }
@@ -324,7 +425,7 @@ describe('terminalAttachmentInfo', () => {
         mode: 'tmux',
         tmux: { target: 'happy:owned-window', tmpDir: '/tmp/happy-tmux' },
       } as const;
-      await writeTerminalAttachmentInfo({
+      const committed = await writeTerminalAttachmentInfo({
         happyHomeDir: dir.name,
         sessionId,
         attachmentId: 'attachment-current',
@@ -332,7 +433,9 @@ describe('terminalAttachmentInfo', () => {
         terminal,
       });
 
-      await writeTerminalAttachmentInfo({ happyHomeDir: dir.name, sessionId, terminal });
+      const protectedRecord = await writeTerminalAttachmentInfo({ happyHomeDir: dir.name, sessionId, terminal });
+      expect(protectedRecord).toEqual(committed);
+      expect(protectedRecord).toMatchObject({ version: 2, attachmentId: 'attachment-current' });
 
       await expect(readTerminalAttachmentInfo({ happyHomeDir: dir.name, sessionId })).resolves.toMatchObject({
         version: 2,

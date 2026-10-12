@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { installVersionedPayload } from '@happier-dev/cli-common/firstPartyRuntime';
+import { installVersionedPayload, writeHappierCliChoice } from '@happier-dev/cli-common/firstPartyRuntime';
 
 import { ensureLocalFirstPartyComponentCommand, resolveExplicitOrInstalledLocalFirstPartyCommand } from './localFirstPartyCommand.js';
 
@@ -193,4 +193,54 @@ describe('ensureLocalFirstPartyComponentCommand', () => {
         }
     });
 
+    it('resolves the one CLI this computer chose, and never acquires past a CLI the user installed (R12)', async () => {
+        const rootDir = mkdtempSync(join(tmpdir(), 'hsetup-cli-choice-'));
+        const happyHomeDir = join(rootDir, 'home');
+        const npmBin = join(rootDir, 'npm-global', 'bin');
+        const npmHappier = join(npmBin, 'happier');
+        const managedPath = join(happyHomeDir, 'cli', 'current', 'happier');
+        const stagedPayloadRoot = join(rootDir, 'staged');
+        const processEnv = { HAPPIER_HOME_DIR: happyHomeDir, HAPPIER_STACK_REPO_DIR: join(rootDir, 'elsewhere'), PATH: npmBin };
+        const resolve = () => resolveExplicitOrInstalledLocalFirstPartyCommand({ componentId: 'happier-cli', releaseRing: 'stable', processEnv });
+
+        try {
+            mkdirSync(npmBin, { recursive: true });
+            writeFileSync(npmHappier, '#!/bin/sh\n', 'utf8');
+            chmodSync(npmHappier, 0o755);
+
+            // Nobody was asked yet: the CLI on PATH answers, so no read acquires a second one.
+            expect(resolve()).toEqual({ command: npmHappier, provenance: 'override' });
+
+            // "Let Happier manage it" with nothing installed yet: acquisition runs.
+            await writeHappierCliChoice({ choice: { mode: 'managed' }, processEnv });
+            expect(resolve()).toBeNull();
+
+            mkdirSync(stagedPayloadRoot, { recursive: true });
+            writeFileSync(join(stagedPayloadRoot, 'happier'), '#!/bin/sh\n', 'utf8');
+            chmodSync(join(stagedPayloadRoot, 'happier'), 0o755);
+            await installVersionedPayload({
+                componentId: 'happier-cli',
+                versionId: '0.2.13',
+                payloadRoot: stagedPayloadRoot,
+                releaseRing: 'stable',
+                processEnv,
+            });
+            expect(resolve()).toEqual({ command: managedPath, provenance: 'managed' });
+
+            // "Keep my own": that CLI wins even over a managed copy still on disk.
+            await writeHappierCliChoice({ choice: { mode: 'own', command: npmHappier }, processEnv });
+            expect(resolve()).toEqual({ command: npmHappier, provenance: 'override' });
+
+            // The kept CLI disappeared (R13 b): still this computer's answer, so neither the managed
+            // copy left on disk nor a fresh acquisition stands in for it — the question comes first.
+            rmSync(npmHappier, { force: true });
+            expect(resolve).toThrow(expect.objectContaining({ code: 'cli_choice_required', message: expect.stringContaining(npmHappier) }));
+            await expect(ensureLocalFirstPartyComponentCommand(
+                { componentId: 'happier-cli', releaseRing: 'stable', processEnv },
+                { preparePayload: async () => { throw new Error('must not acquire'); } },
+            )).rejects.toMatchObject({ code: 'cli_choice_required' });
+        } finally {
+            rmSync(rootDir, { recursive: true, force: true });
+        }
+    });
 });

@@ -5,6 +5,7 @@ import { renderSettingsView } from '@/dev/testkit/harness/settingsViewHarness';
 
 const setNewSessionDraftEntryMode = vi.fn();
 const setSessionInactiveResumePolicy = vi.fn();
+const setSessionUsageGaugeLabels = vi.fn();
 
 vi.mock('@/sync/domains/state/storage', async () => {
     const { createStorageModuleStub } = await import('@/dev/testkit/mocks/storage');
@@ -12,6 +13,9 @@ vi.mock('@/sync/domains/state/storage', async () => {
         useSettingMutable: (name: string) => {
             if (name === 'newSessionDraftEntryMode') {
                 return ['resumePrevious', setNewSessionDraftEntryMode];
+            }
+            if (name === 'sessionUsageGaugeLabels') {
+                return [false, setSessionUsageGaugeLabels];
             }
             if (name === 'sessionInactiveResumePolicy') {
                 return ['online_only', setSessionInactiveResumePolicy];
@@ -61,6 +65,16 @@ vi.mock('@/components/ui/icons/Icon', () => ({
 }));
 
 describe('SessionComposerSettingsView', () => {
+    it('offers optional usage gauge labels and persists the choice', async () => {
+        const { SessionComposerSettingsView } = await import('./SessionComposerSettingsView');
+        const screen = await renderSettingsView(React.createElement(SessionComposerSettingsView));
+        const toggle = screen.findRow('settings-session-usage-gauge-labels')?.props.rightElement;
+
+        expect(toggle?.props.value).toBe(false);
+        toggle?.props.onValueChange(true);
+        expect(setSessionUsageGaugeLabels).toHaveBeenCalledWith(true);
+    });
+
     it('shows explicit resume and fresh ordinary-entry choices and persists the selection', async () => {
         const { SessionComposerSettingsView } = await import('./SessionComposerSettingsView');
         const screen = await renderSettingsView(React.createElement(SessionComposerSettingsView));

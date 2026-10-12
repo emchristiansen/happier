@@ -865,7 +865,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
     await expect(readFile(join(existingTargetDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"source"}\n');
   });
 
-  it('reuses an existing stable profile home as the authoritative Claude source when Happier-owned provenance matches', async () => {
+  it('refreshes an existing stable profile home from the current native Claude config when provenance matches', async () => {
     const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-claude-materializer-server-'));
     const rootDir = await mkdtemp(join(tmpdir(), 'happier-claude-materializer-root-'));
     const homeDir = await mkdtemp(join(tmpdir(), 'happier-claude-materializer-home-'));
@@ -951,7 +951,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
     });
 
     expect(result).not.toBeNull();
-    await expect(readFile(join(existingTargetDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"target"}\n');
+    await expect(readFile(join(existingTargetDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"source"}\n');
     const targetConfig = JSON.parse(await readFile(join(existingTargetDir, '.claude.json'), 'utf8'));
     expect(targetConfig).not.toHaveProperty('oauthAccount');
     const credential = JSON.parse(await readFile(join(existingTargetDir, '.credentials.json'), 'utf8'));

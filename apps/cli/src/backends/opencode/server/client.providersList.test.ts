@@ -94,4 +94,13 @@ describe('createOpenCodeServerRuntimeClient providersList', () => {
       expect.objectContaining({ id: 'openai' }),
     ]);
   });
+
+  it.each([{}, { all: [{}] }])('rejects malformed provider inventory (%j) rather than observing an empty inventory', async (payload) => {
+    globalThis.fetch = vi.fn(async (input) => {
+      const url = typeof input === 'string' ? input : String((input as Request)?.url ?? '');
+      return jsonResponse(url.includes('/global/health') ? { healthy: true, version: '1.2.15' } : payload);
+    }) as typeof fetch;
+    const client = await createOpenCodeServerRuntimeClient({ directory: '', messageBuffer: new MessageBuffer() });
+    await expect(client.providersList()).rejects.toThrow(/provider inventory/i);
+  });
 });

@@ -8,6 +8,7 @@ import {
   readProcessInstanceFingerprintSync,
 } from '@happier-dev/cli-common/processInstance';
 import { isLoopbackHostname } from '@happier-dev/protocol';
+import { readOpenCodeSessionAffinityFromMetadata } from '@happier-dev/agents';
 
 import { configuration } from '@/configuration';
 import { resolveOpenCodeCliLaunchSpec, type ProviderCliLaunchSpec } from '@/backends/opencode/utils/resolveOpenCodeCliCommand';
@@ -34,7 +35,7 @@ import {
 } from './openCodeManagedServerCredential';
 import { resolveOpenCodeServerAuthHeaders, type OpenCodeServerAuthCredential } from './openCodeServerAuth';
 import { waitForOpenCodeServerHealth } from './waitForOpenCodeServerHealth';
-import { resolveOpenCodeManagedServerLaunchFingerprint } from './openCodeManagedServerEnv';
+import { isOpenCodeManagedServerLaunchFingerprint, resolveOpenCodeManagedServerLaunchFingerprint } from './openCodeManagedServerEnv';
 import {
   terminateManagedOpenCodeServerPidBestEffort,
   terminateManagedOpenCodeServerPidBestEffortWithOptions,
@@ -709,7 +710,7 @@ function tryReadLaunchFingerprintFromSessionMarker(marker: unknown): string | nu
   const respawn = tryReadObject(markerRecord.respawn);
   const respawnEnv = tryReadObject(respawn?.environmentVariables);
   return (
-    tryReadNonEmptyString(metadata?.opencodeManagedServerLaunchFingerprint)
+    readOpenCodeSessionAffinityFromMetadata(metadata).managedServerLaunchFingerprint
     ?? tryReadNonEmptyString(metadata?.launchEnvFingerprint)
     ?? tryReadNonEmptyString(respawnEnv?.HAPPIER_OPENCODE_MANAGED_SERVER_LAUNCH_FINGERPRINT)
     ?? tryReadLaunchFingerprintFromStatePath(tryReadNonEmptyString(respawnEnv?.HAPPIER_OPENCODE_SERVER_STATE_PATH))
@@ -719,6 +720,7 @@ function tryReadLaunchFingerprintFromSessionMarker(marker: unknown): string | nu
 function isOpenCodeTrackedSessionMarker(marker: unknown): boolean {
   const markerRecord = tryReadObject(marker);
   if (!markerRecord) return false;
+  if (tryReadNonEmptyString(markerRecord.flavor)?.toLowerCase() === 'opencode') return true;
 
   const metadata = tryReadObject(markerRecord.metadata);
   const respawn = tryReadObject(markerRecord.respawn);
@@ -771,8 +773,8 @@ async function readTrackedOpenCodeLaunchFingerprintClaimsBestEffort(): Promise<T
     }
     const isTurnInFlight = await resolveOpenCodeConnectedServiceInFlightTurnQueryBestEffort();
     const markers = await Promise.resolve(
-      (listSessionMarkers as () => Promise<readonly unknown[]> | readonly unknown[])(),
-    ).catch(() => []);
+      (listSessionMarkers as (options: Readonly<{ requireComplete: true }>) => Promise<readonly unknown[]> | readonly unknown[])({ requireComplete: true }),
+    );
     for (const marker of markers) {
       const markerRecord = tryReadObject(marker);
       if (!markerRecord || !isMarkerPidAliveBestEffort(markerRecord.pid)) continue;
@@ -791,6 +793,7 @@ async function readTrackedOpenCodeLaunchFingerprintClaimsBestEffort(): Promise<T
     }
   } catch {
     hasUnknownOpenCodeTrackedClaims = true;
+    logger.warn('[OpenCodeServer] Session custody could not be fully read; retaining managed servers');
   }
   return { countsByLaunchFingerprint: counts, hasUnknownOpenCodeTrackedClaims, inFlightTurnLaunchFingerprints };
 }
@@ -1179,7 +1182,10 @@ function createManagedOpenCodeBrokerActivationStateDeps(): ManagedOpenCodeBroker
   return {
     listStateKeys: async () => {
       const managedServersDir = resolveManagedServersDirectory();
-      const entries = await readdir(managedServersDir).catch(() => []);
+      const entries = await readdir(managedServersDir).catch((error: unknown) => {
+        if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+        throw error;
+      });
       return entries
         .filter((entry) => entry.endsWith('.json'))
         .map((entry) => join(managedServersDir, entry));
@@ -1260,8 +1266,10 @@ export async function readSharedManagedOpenCodeServerStateByLaunchFingerprintBes
   launchFingerprint: string,
 ): Promise<SharedManagedOpenCodeServerState | null> {
   const normalized = launchFingerprint.trim();
-  if (!normalized) return null;
-  return await readStateFile(resolveManagedServerStatePathByFingerprint(normalized));
+  if (!isOpenCodeManagedServerLaunchFingerprint(normalized)) return null;
+  const state = await readStateFile(resolveManagedServerStatePathByFingerprint(normalized));
+  return state?.launchEnvFingerprint === normalized && isLoopbackManagedOpenCodeBaseUrl(state.baseUrl)
+    && state.status !== 'starting' && state.status !== 'failed' ? state : null;
 }
 
 export async function releaseForAuthSwitchFromState(
@@ -1521,6 +1529,10 @@ type StopDeps = Readonly<{
   getProcessInfo: (pid: number) => Promise<ManagedServerProcessInfo | null>;
   resolveLaunchSpec?: () => ManagedServerLaunchSpec | null;
   killPid: (pid: number) => Promise<boolean> | boolean;
+  currentDaemonInstanceId?: string;
+  currentActiveServerDir?: string;
+  readProcessStartTimeMs?: ResolveDeps['readProcessStartTimeMs'];
+  readProcessInstanceFingerprint?: ResolveDeps['readProcessInstanceFingerprint'];
 }>;
 
 function looksLikeOpenCodeServe(info: ManagedServerProcessInfo | null): boolean {
@@ -1683,6 +1695,21 @@ export async function stopSharedManagedOpenCodeServerFromState(
   return await deps.withLock(async () => {
     const state = await deps.readState();
     if (!state) return { didKill: false };
+    const isDaemonStop = deps.currentDaemonInstanceId !== undefined;
+    let hasVerifiedDaemonOwnership = false;
+    if (isDaemonStop) {
+      if (!isTrustedManagedOpenCodeStateV2(state)
+        || state.daemonInstanceId !== deps.currentDaemonInstanceId
+        || state.activeServerDir !== deps.currentActiveServerDir
+        || !isLoopbackManagedOpenCodeBaseUrl(state.baseUrl)) {
+        return { didKill: false };
+      }
+      if (deps.isPidAlive(state.pid)) {
+        const info = await deps.getProcessInfo(state.pid).catch(() => null);
+        hasVerifiedDaemonOwnership = await hasTrustedManagedOpenCodeStateIdentityForTermination(state, deps, info);
+        if (!hasVerifiedDaemonOwnership) return { didKill: false };
+      }
+    }
     if (!deps.isPidAlive(state.pid)) {
       await deps.removeState().catch(() => {});
       return { didKill: false };
@@ -1695,18 +1722,14 @@ export async function stopSharedManagedOpenCodeServerFromState(
           resolveOpenCodeManagedServerStateCredential({ state, baseUrl: state.baseUrl }),
         ).catch(() => false)
       : false;
-    if (healthy) {
-      const didKill = await invokeKillPidBestEffort(deps.killPid, state.pid);
-      await deps.removeState().catch(() => {});
-      return { didKill };
-    }
-
-    const info = await deps.getProcessInfo(state.pid).catch(() => null);
-    if (looksLikeManagedOpenCodeServe(info, state.baseUrl, deps.resolveLaunchSpec, {
+    const info = healthy || hasVerifiedDaemonOwnership
+      ? null : await deps.getProcessInfo(state.pid).catch(() => null);
+    if (healthy || hasVerifiedDaemonOwnership || looksLikeManagedOpenCodeServe(info, state.baseUrl, deps.resolveLaunchSpec, {
       allowBroadHeuristicFallback: false,
     })) {
       const didKill = await invokeKillPidBestEffort(deps.killPid, state.pid);
-      await deps.removeState().catch(() => {});
+      if (didKill || !isDaemonStop) await deps.removeState().catch(() => {});
+      else logger.warn('[OpenCodeServer] Managed server did not terminate; retaining custody', { pid: state.pid });
       return { didKill };
     }
 
@@ -1745,20 +1768,55 @@ async function killPidBestEffort(pid: number): Promise<boolean> {
   return await terminateManagedOpenCodeServerPidBestEffort(pid);
 }
 
-export async function stopSharedManagedOpenCodeServerFromEnvBestEffort(): Promise<void> {
-  const statePath = resolveStatePathFromEnv();
-  const lockFile = `${statePath}.lock`;
-  await stopSharedManagedOpenCodeServerFromState({
-    withLock: async (fn) => await withOpenCodeServerFileLock(lockFile, fn),
-    readState: async () => await readStateFile(statePath),
-    removeState: async () => {
-      await rm(statePath, { force: true }).catch(() => {});
-    },
-    isPidAlive: isOpenCodeServerPidAlive,
-    probeHealth: async (baseUrl, apiGeneration, auth) =>
-      await probeOpenCodeHealthBestEffort(baseUrl, apiGeneration, auth),
-    getProcessInfo: async (pid) => await getProcessInfoBestEffort(pid),
+type StopFromEnvDeps = Pick<ManagedOpenCodeBrokerActivationStateDeps,
+  'listStateKeys' | 'withStateLock' | 'readState' | 'isPidAlive' | 'getProcessInfo'
+  | 'readProcessStartTimeMs' | 'readProcessInstanceFingerprint' | 'currentActiveServerDir'
+> & Readonly<{
+  statePath: string;
+  removeState: (statePath: string) => Promise<void>;
+  probeHealth: StopDeps['probeHealth'];
+  resolveLaunchSpec: NonNullable<StopDeps['resolveLaunchSpec']>;
+  killPid: StopDeps['killPid'];
+}>;
+
+export async function stopSharedManagedOpenCodeServerFromEnvBestEffort(
+  params?: Readonly<{ daemonInstanceId: string }>,
+  overrides: Partial<StopFromEnvDeps> = {},
+): Promise<void> {
+  const deps: StopFromEnvDeps = {
+    ...createManagedOpenCodeBrokerActivationStateDeps(),
+    statePath: resolveStatePathFromEnv(),
+    removeState: async (statePath) => { await rm(statePath, { force: true }); },
+    probeHealth: probeOpenCodeHealthBestEffort,
     resolveLaunchSpec: resolveManagedOpenCodeLaunchSpecBestEffort,
     killPid: killPidBestEffort,
-  }).then(() => {}).catch(() => {});
+    ...overrides,
+  };
+  const statePaths = params
+    ? [...new Set([deps.statePath, ...await deps.listStateKeys().catch(() => {
+      logger.warn('[OpenCodeServer] Managed server pool could not be listed during shutdown');
+      return [];
+    })])]
+    : [deps.statePath];
+  for (const statePath of statePaths) {
+    await stopSharedManagedOpenCodeServerFromState({
+      ...deps,
+      ...(params ? { currentDaemonInstanceId: params.daemonInstanceId } : {}),
+      withLock: async (fn) => await deps.withStateLock(statePath, fn),
+      readState: async () => {
+        const state = await deps.readState(statePath);
+        if (!state || !params) return state;
+        const claims = await readTrackedOpenCodeLaunchFingerprintClaimsBestEffort();
+        const fingerprint = readNonEmptyString(state.launchEnvFingerprint)
+          ?? tryReadLaunchFingerprintFromStatePath(statePath);
+        if (claims.hasUnknownOpenCodeTrackedClaims || !fingerprint
+          || (claims.countsByLaunchFingerprint.get(fingerprint) ?? 0) > 0
+          || claims.inFlightTurnLaunchFingerprints.has(fingerprint)) return null;
+        return state;
+      },
+      removeState: async () => await deps.removeState(statePath),
+    }).catch(() => {
+      logger.warn('[OpenCodeServer] Managed server shutdown failed', { statePath });
+    });
+  }
 }

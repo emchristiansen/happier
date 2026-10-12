@@ -73,6 +73,9 @@ export function createClaudePendingAwareInputConsumer(
                 }
                 : {}),
             waitForPendingEligibilityUpdate: (signal) => session.client.waitForPendingEligibilityUpdate(signal),
+            ...(typeof session.client.waitForMetadataUpdate === 'function'
+                ? { waitForMetadataUpdate: (signal?: AbortSignal) => session.client.waitForMetadataUpdate(signal) }
+                : {}),
             ...(typeof session.client.readRuntimeActivitySnapshotTail === 'function'
                 ? {
                     readRuntimeActivitySnapshotTail: session.client.readRuntimeActivitySnapshotTail.bind(session.client),

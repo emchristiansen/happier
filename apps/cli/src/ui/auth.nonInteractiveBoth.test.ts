@@ -116,10 +116,13 @@ describe.sequential('doAuth (non-interactive)', () => {
       expect(creds?.token).toBe('tok');
 
       const out = output.logs.join('\n');
-      expect(out).toContain('Relay URL: https://server.example.test');
-      expect(out).toContain('Web app URL: https://webapp.example.test');
-      expect(out).toContain('Mobile (recommended)');
-      expect(out).toContain('Web (fallback)');
+      // One aligned definition list for the relay, sections titled like the rest of the CLI.
+      expect(out).toMatch(/Relay URL: +https:\/\/server\.example\.test/u);
+      expect(out).toMatch(/Web app URL: +https:\/\/webapp\.example\.test/u);
+      expect(out).toContain('Mobile app (recommended)');
+      expect(out).toContain('Web browser');
+      // The wait resolves as a step instead of trailing off.
+      expect(out).toMatch(/^- \[✓\] Approved$/mu);
       expect(out).toContain('webapp.example.test/terminal/connect#key=');
       expect(out).toContain('happier://terminal?');
       expect(displayQRCodeMock).toHaveBeenCalledTimes(1);
@@ -375,7 +378,9 @@ describe.sequential('doAuth (non-interactive)', () => {
       const creds = await doAuth();
 
       expect(creds).toBeNull();
-      expect(output.logs.join('\n')).toContain('Unexpected response from the relay. Please try again.');
+      const logs = output.logs.join('\n');
+      expect(logs).toMatch(/^- \[x\] Unexpected response from the relay$/mu);
+      expect(logs).toContain('Please try again.');
     } finally {
       axiosDefault.post = originalPost;
       output.restore();

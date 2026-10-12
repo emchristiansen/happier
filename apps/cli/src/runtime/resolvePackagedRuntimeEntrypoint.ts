@@ -121,17 +121,19 @@ function resolveManagedInstalledCliProjectRoot(): string | null {
 
 export function resolvePackagedRuntimeProjectRoots(): string[] {
   const roots: string[] = [];
+  const moduleProjectPath = projectPath();
+  const moduleRoot = isEmbeddedBunBundlePath(moduleProjectPath) ? null : moduleProjectPath;
   const candidateRoots = [
     ...resolveRuntimeRootsFromLaunchedProcess(),
+    // The bin wrapper imports its runtime without changing argv. Under Node/Bun the
+    // loaded module therefore identifies this checkout/npm install (or runner snapshot).
+    isJavaScriptRuntimeExecutable(process.execPath) ? moduleRoot : null,
     resolveRuntimeRootFromInstalledShimPath(process.execPath),
     resolveRuntimeRootFromInstalledShimPath(process.argv[0]),
     resolveManagedInstalledCliProjectRoot(),
     resolveRuntimeRootFromBinaryPath(process.execPath),
     resolveRuntimeRootFromBinaryPath(process.argv[0]),
-    (() => {
-      const resolvedProjectPath = projectPath();
-      return isEmbeddedBunBundlePath(resolvedProjectPath) ? null : resolvedProjectPath;
-    })(),
+    moduleRoot,
   ];
 
   for (const candidate of candidateRoots) {

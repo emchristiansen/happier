@@ -503,7 +503,7 @@ jobs:
 
   ui_desktop:
     name: UI desktop (Tauri) (dev)
-    needs: [prepare_release_candidate, release_verify]
+    needs: [prepare_release_candidate, cli, release_verify]
     uses: ./.github/workflows/build-tauri.yml
     secrets: inherit
     with:
@@ -511,6 +511,7 @@ jobs:
       resume_run_id: ${{ inputs.resume_run_id }}
       source_ref: ${{ needs.prepare_release_candidate.outputs.source_sha }}
       publish_release: true
+      candidate_cli_version: ${{ needs.cli.outputs.version }}
       release_message: ${{ needs.prepare_release_candidate.outputs.release_message }}
 
   docker:

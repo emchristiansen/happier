@@ -134,7 +134,9 @@ describe('happier relay host install open-signup notice', () => {
     it('stays quiet for the loopback default', { timeout: 120_000 }, async () => {
         const logs = (await runInstall()).join('\n');
 
-        expect(logs).toContain('Relay host installed');
+        // The download and install are steps, so a long install never looks like a hang.
+        expect(logs).toContain('- [✓] Downloading relay');
+        expect(logs).toContain('- [✓] Relay host installed');
         expect(logs).not.toContain('create an account on it');
     });
 });

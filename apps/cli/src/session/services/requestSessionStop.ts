@@ -21,6 +21,7 @@ import { resolveSessionIdOrPrefix } from '@/session/query/resolveSessionId';
 import { fetchSessionByIdCompat } from '@/session/transport/http/sessionsHttp';
 import { tryDecryptSessionMetadata } from '@/session/transport/encryption/sessionEncryptionContext';
 import { callMachineRpc } from '@/session/transport/rpc/machineRpc';
+import { readRpcRequestDisposition } from '@/session/transport/rpc/rpcRequestDisposition';
 import {
   resolveSessionControlStopPollIntervalMs,
   resolveSessionControlStopTimeoutMs,
@@ -143,6 +144,9 @@ async function stopSessionOnOwningMachine(params: Readonly<{
       machineId: params.machineId,
       method: RPC_METHODS.STOP_SESSION,
       request: { sessionId: params.sessionId },
+      // Stop's graceful/forced exit and retirement phases can exceed the generic RPC
+      // cutoff. The relay retains its finite forwarding deadline and disconnect guard.
+      timeoutMs: null,
       authorization: {
         kind: SOCKET_RPC_AUTHORIZATION_CONTEXT_KINDS.SESSION_WRITE,
         sessionId: params.sessionId,
@@ -163,8 +167,32 @@ async function stopSessionOnOwningMachine(params: Readonly<{
     }
     return result.data;
   } catch (error) {
-    if (readRpcErrorCode(error) === RPC_ERROR_CODES.FORBIDDEN) {
+    const rpcErrorCode = readRpcErrorCode(error);
+    const disposition = readRpcRequestDisposition(error);
+    const transportErrorCode = error && typeof error === 'object' && 'code' in error
+      ? error.code
+      : undefined;
+    logger.infoFile('[SESSION STOP] Owning-machine acknowledgement failed', {
+      sessionId: params.sessionId,
+      machineId: params.machineId,
+      disposition,
+      rpcErrorCode: Object.values(RPC_ERROR_CODES).some((code) => code === rpcErrorCode)
+        ? rpcErrorCode
+        : undefined,
+      transportErrorCode: transportErrorCode === 'MACHINE_RPC_TIMEOUT' ? transportErrorCode : undefined,
+    });
+    if (rpcErrorCode === RPC_ERROR_CODES.FORBIDDEN) {
       return { status: 'incomplete', reason: 'target_daemon_forbidden' };
+    }
+    if (
+      rpcErrorCode === RPC_ERROR_CODES.METHOD_NOT_AVAILABLE
+      || rpcErrorCode === RPC_ERROR_CODES.METHOD_NOT_FOUND
+      || rpcErrorCode === RPC_ERROR_CODES.SESSION_MACHINE_CONTROL_UNAVAILABLE
+    ) {
+      return { status: 'incomplete', reason: 'target_daemon_unavailable' };
+    }
+    if (disposition === 'outcomeUnknown') {
+      return { status: 'incomplete', reason: 'transport_ambiguous' };
     }
     return { status: 'incomplete', reason: 'target_daemon_unavailable' };
   }
@@ -264,7 +292,7 @@ async function readExactTerminalAttachmentId(sessionId: string): Promise<string 
     happyHomeDir: configuration.happyHomeDir,
     sessionId,
   }).catch(() => ({ status: 'unreadable' as const, reason: 'io_error' as const }));
-  return state.status === 'present' && state.info.version === 2
+  return state.status === 'present' && state.info.version !== 1
     ? state.info.attachmentId
     : null;
 }

@@ -67,11 +67,27 @@ export function buildCodexAppServerConfigOverrides(
         happierSessionId?: string;
         happierMcpToolCallTimeoutMs?: number;
         processEnv?: NodeJS.ProcessEnv;
+        codexArgs?: readonly string[];
     }> = {},
 ): string[] {
     const serverNames = Object.keys(mcpServers);
     const injectedKeys = assignInjectedServerKeys(serverNames);
     const overrides: string[] = [];
+    // Keep Codex's native configuration values opaque: Codex owns TOML parsing.
+    const codexArgs = options.codexArgs ?? [];
+    for (let index = 0; index < codexArgs.length; index += 1) {
+        const arg = codexArgs[index];
+        if (arg === '--') break;
+        if (arg === '-c' || arg === '--config') {
+            const value = codexArgs[++index];
+            if (value === undefined) throw new Error(`Codex ${arg} requires a configuration override`);
+            overrides.push(value);
+        } else if (arg.startsWith('--config=')) {
+            overrides.push(arg.slice('--config='.length));
+        } else if (arg.startsWith('-c') && arg.length > 2) {
+            overrides.push(arg.slice(arg.startsWith('-c=') ? 3 : 2));
+        }
+    }
 
     const hasFirstPartyHappierMcpServer = serverNames.some(
         (serverName) => serverName === 'happier' || serverName === 'happy',

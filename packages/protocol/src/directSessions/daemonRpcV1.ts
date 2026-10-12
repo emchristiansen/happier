@@ -1,5 +1,8 @@
 import { z } from 'zod';
 
+import { ActionOperationSnapshotV1Schema } from '../actions/operations/actionOperationV1.js';
+import { SpawnSessionTerminalSchema } from '../spawnSession.js';
+
 import { AgentRuntimeDescriptorV1Schema } from '../sessionMetadata/agentRuntimeDescriptorV1.js';
 import { CODEX_BACKEND_MODES } from '../providers/codex/backendMode.js';
 import { AgentProviderIdV1Schema } from '../providers/agentProviderIdsV1.js';
@@ -438,11 +441,18 @@ export const DirectTranscriptReadAfterResponseSchema = z.union([
 ]);
 export type DirectTranscriptReadAfterResponse = z.infer<typeof DirectTranscriptReadAfterResponseSchema>;
 
+export const DIRECT_SESSION_TAKEOVER_ACTION_IDS = Object.freeze({
+  direct: 'session.direct.takeover',
+  persisted: 'session.direct.takeover_persist',
+} as const);
+
 export const DirectSessionTakeoverRequestSchema = z
   .object({
     machineId: z.string().min(1),
     sessionId: z.string().min(1),
     forceStop: z.boolean().optional(),
+    requestId: z.string().trim().min(1).optional(),
+    terminal: SpawnSessionTerminalSchema.optional(),
   })
   .passthrough();
 export type DirectSessionTakeoverRequest = z.infer<typeof DirectSessionTakeoverRequestSchema>;
@@ -464,6 +474,8 @@ export const DirectSessionTakeoverPersistRequestSchema = z
     machineId: z.string().min(1),
     sessionId: z.string().min(1),
     forceStop: z.boolean().optional(),
+    requestId: z.string().trim().min(1).optional(),
+    terminal: SpawnSessionTerminalSchema.optional(),
   })
   .passthrough();
 export type DirectSessionTakeoverPersistRequest = z.infer<typeof DirectSessionTakeoverPersistRequestSchema>;
@@ -479,3 +491,14 @@ export const DirectSessionTakeoverPersistResponseSchema = z.union([
     .passthrough(),
 ]);
 export type DirectSessionTakeoverPersistResponse = z.infer<typeof DirectSessionTakeoverPersistResponseSchema>;
+
+// Start acknowledges the same daemon-local Action Operation observed via list/get/cancel.
+export const DirectSessionTakeoverPersistStartResponseSchema = z.union([
+  z.object({ ok: z.literal(true), operation: ActionOperationSnapshotV1Schema }),
+  z.object({
+    ok: z.literal(false),
+    errorCode: z.enum(['invalid_request', 'machine_offline', 'provider_unavailable', 'internal_error']),
+    error: z.string().min(1),
+  }),
+]);
+export type DirectSessionTakeoverPersistStartResponse = z.infer<typeof DirectSessionTakeoverPersistStartResponseSchema>;

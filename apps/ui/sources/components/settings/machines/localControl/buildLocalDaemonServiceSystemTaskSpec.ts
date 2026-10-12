@@ -8,6 +8,11 @@ type LocalDaemonServiceTaskKind =
     | 'daemon.service.start.v1'
     | 'daemon.service.stop.v1'
     | 'daemon.service.autostart.set.v1'
+    // H3 — this computer stops answering on one relay: its desktop-managed service is uninstalled.
+    | 'daemon.service.relay.disconnect.v1'
+    // K2/R17 — updates the desktop-managed CLI of the app's channel through the acquisition owner,
+    // then restarts a running service daemon. The executor refuses a CLI the app did not place.
+    | 'cli.update.v1'
     | 'cli.pathExposure.ensure.v1'
     | 'cli.pathExposure.remove.v1';
 
@@ -23,7 +28,7 @@ export function buildLocalDaemonServiceSystemTaskSpec(
      * decides whether this computer answers while the app is closed. It states the mode in the
      * CLI's own vocabulary, so nothing between here and the service definition translates it.
      */
-    options?: Readonly<{ autostart: DesktopBackgroundServiceAutostartMode }>,
+    options?: Readonly<{ autostart: DesktopBackgroundServiceAutostartMode }> | Readonly<{ relayUrl: string }>,
 ): SystemTaskSpec {
     return {
         protocolVersion: SYSTEM_TASK_PROTOCOL_VERSION,
@@ -33,7 +38,8 @@ export function buildLocalDaemonServiceSystemTaskSpec(
             surface: 'desktop.ui',
             mode: 'user',
             channel: resolvePreferredPublicReleaseRingLabelForCurrentApp(),
-            ...(options ? { autostart: options.autostart } : {}),
+            ...(options && 'autostart' in options ? { autostart: options.autostart } : {}),
+            ...(options && 'relayUrl' in options ? { relayUrl: options.relayUrl } : {}),
         },
     };
 }

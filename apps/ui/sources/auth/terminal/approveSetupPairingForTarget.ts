@@ -8,6 +8,7 @@ import { authApprove, AuthApproveUnsupportedResponseError, type AuthApproveResul
 import { TokenStorage } from '@/auth/storage/tokenStorage';
 import { decodeBase64 } from '@/encryption/base64';
 import { createServerUrlComparableKey } from '@/sync/domains/server/url/serverUrlCanonical';
+import { parseToken } from '@/utils/auth/parseToken';
 
 import {
     buildTerminalResponseV2,
@@ -47,7 +48,8 @@ import {
  *     narrower than "only official binaries": the app must not release the key UNATTENDED to a CLI
  *     its own install path did not place.
  *
- * Then, and only then: read the credentials stored for that exact target, seal a V2 response from
+ * Then, and only then: read the credentials stored for that exact target, verify their token still
+ * names the original account, seal a V2 response from
  * the account content private key, post it through `authApprove` addressed at that same relay
  * (`serverFetch` refuses the authenticated write if the relay is not the focused one), and answer
  * the task. The answer carries a boolean and a reason code — never a token, secret or path — and a
@@ -193,6 +195,18 @@ export async function approveSetupPairingForTarget(params: Readonly<{
     );
     if (!credentials || !credentials.token.trim()) {
         return await refuse('credentials_unavailable');
+    }
+
+    // A retained run keeps its original target, but this profile's credentials can change on
+    // a later sign-in. Bind the actual token before sealing any account key or contacting relay.
+    let credentialAccountId: string;
+    try {
+        credentialAccountId = parseToken(credentials.token);
+    } catch {
+        return await refuse('credentials_unusable');
+    }
+    if (credentialAccountId !== target.expectedAccountId.trim()) {
+        return await refuse('account_mismatch');
     }
 
     let responseV2: Uint8Array;

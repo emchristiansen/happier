@@ -3,6 +3,7 @@ import chalk from 'chalk';
 import type { CommandContext } from '@/cli/commandRegistry';
 import { printJsonEnvelope, wantsJson, writeJsonStdout } from '@/cli/output/jsonEnvelope';
 import { createCliCapabilitiesService } from '@/rpc/handlers/capabilities';
+import { fail } from '@happier-dev/cli-common/output';
 
 function usage(): string {
   return [
@@ -38,7 +39,7 @@ export async function handleCapabilitiesCliCommand(context: CommandContext): Pro
           error: { code: 'unknown_subcommand', message: `Unknown capabilities subcommand: ${subcommand}` },
         });
       } else {
-        console.error(chalk.red('Error:'), `Unknown capabilities subcommand: ${subcommand}`);
+        console.error(fail(`Unknown capabilities subcommand: ${subcommand}`));
         console.log(usage());
         process.exitCode = 1;
       }
@@ -70,7 +71,7 @@ export async function handleCapabilitiesCliCommand(context: CommandContext): Pro
       return;
     }
 
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     if (process.env.DEBUG) {
       console.error(error);
     }

@@ -4,6 +4,7 @@ import { ApiClient } from '@/api/api';
 import { readCredentials } from '@/persistence';
 
 import type { CommandContext } from '@/cli/commandRegistry';
+import { fail, info } from '@happier-dev/cli-common/output';
 
 export async function sendPushNotification({
   api,
@@ -26,7 +27,7 @@ export async function handleNotifyCliCommand(context: CommandContext): Promise<v
   try {
     await handleNotifyCommand(context.args.slice(1));
   } catch (error) {
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     if (process.env.DEBUG) {
       console.error(error);
     }
@@ -88,7 +89,7 @@ ${chalk.bold('Examples:')}
     process.exit(1);
   }
 
-  console.log(chalk.blue('📱 Sending push notification...'));
+  console.log(info('Sending push notification'));
 
   try {
     const api = await ApiClient.create(credentials);
@@ -102,7 +103,7 @@ ${chalk.bold('Examples:')}
     console.log(chalk.gray(`  Message: ${message}`));
     console.log(chalk.gray('  Check your mobile device for the notification.'));
   } catch (error) {
-    console.error(chalk.red('✗ Failed to send push notification'));
+    console.error(fail('Failed to send push notification'));
     throw error;
   }
 }

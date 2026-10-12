@@ -78,7 +78,6 @@ installNewSessionComponentsCommonModuleMocks({
     unistyles: () => createUnistylesMock({
         theme: {
             colors: {
-                text: '#000',
                 textSecondary: '#666',
                 textTertiary: '#444',
                 divider: '#ddd',

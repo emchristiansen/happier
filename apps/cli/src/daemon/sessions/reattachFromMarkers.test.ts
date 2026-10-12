@@ -1,5 +1,6 @@
 import { sealAccountScopedBlobCiphertext } from '@happier-dev/protocol';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { configuration } from '@/configuration';
 
 import { reattachTrackedSessionsFromMarkers } from './reattachFromMarkers';
 import { findAllHappyProcesses, findHappyProcessByPid } from '../doctor';
@@ -28,6 +29,15 @@ const emptyAdoptResult = {
   adoptedPids: [],
   respawnRestoreErrors: [],
 } satisfies ReturnType<typeof adoptSessionsFromMarkers>;
+
+function currentOwnershipEnvironment() {
+  return {
+    HAPPIER_HOME_DIR: configuration.happyHomeDir,
+    HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID: process.env.HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID,
+    HAPPIER_ACTIVE_SERVER_ID: configuration.activeServerId,
+    HAPPIER_SERVER_URL: configuration.serverUrl,
+  };
+}
 
 function mockHappyProcessesForDiscovery(processes: ReadonlyArray<HappyProcessInfo>): void {
   vi.mocked(findAllHappyProcesses).mockResolvedValue([...processes]);
@@ -812,6 +822,7 @@ describe('reattachTrackedSessionsFromMarkers', () => {
     mockHappyProcessesForDiscovery([
       {
         pid: 12345,
+        daemonOwnershipEnvironmentVariables: currentOwnershipEnvironment(),
         type: 'daemon-spawned-session',
         cwd: '/tmp/project',
         environmentVariables: {
@@ -832,6 +843,7 @@ describe('reattachTrackedSessionsFromMarkers', () => {
         happyProcesses: [
           {
             pid: 12345,
+            daemonOwnershipEnvironmentVariables: currentOwnershipEnvironment(),
             type: 'daemon-spawned-session',
             cwd: '/tmp/project',
             environmentVariables: {
@@ -1703,6 +1715,7 @@ describe('reattachTrackedSessionsFromMarkers', () => {
     } satisfies HappyProcessInfo;
     const markerlessProcess = {
       pid: 99991,
+      daemonOwnershipEnvironmentVariables: currentOwnershipEnvironment(),
       type: 'daemon-spawned-session',
       cwd: '/tmp/other',
       command: 'happier codex --started-by daemon --existing-session session-markerless',
@@ -1777,6 +1790,7 @@ describe('reattachTrackedSessionsFromMarkers', () => {
     mockHappyProcessesForDiscovery([
       {
         pid: 22222,
+        daemonOwnershipEnvironmentVariables: currentOwnershipEnvironment(),
         type: 'daemon-spawned-session',
         cwd: '/tmp/project',
         command:

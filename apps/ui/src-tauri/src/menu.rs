@@ -17,51 +17,57 @@
 //! `ExitRequested`; `crate::shutdown` documents that as leaving the daemon exactly where it was.
 
 #[cfg(desktop)]
-use tauri::{menu::MenuEvent, AppHandle, Runtime};
+use tauri::{menu::MenuEvent, AppHandle};
 
 #[cfg(target_os = "macos")]
-use tauri::menu::{
-    AboutMetadata, Menu, MenuItemBuilder, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID,
-    WINDOW_SUBMENU_ID,
+use tauri::{
+    menu::{
+        AboutMetadata, Menu, MenuItemBuilder, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID,
+        WINDOW_SUBMENU_ID,
+    },
+    Runtime,
 };
 
-/// Reveals the main window, which closes to the tray rather than exiting.
 #[cfg(desktop)]
-pub const SHOW_MAIN_WINDOW_MENU_ID: &str = "show-main-window";
-/// Quits the app through `app.exit`, the only quit that reaches the shutdown handoff.
+pub mod ids;
+
+#[cfg(target_os = "macos")]
+use ids::QUIT_APP_MENU_ID;
 #[cfg(desktop)]
-pub const QUIT_APP_MENU_ID: &str = "quit-app";
+use ids::{resolve_desktop_menu_action, DesktopMenuAction};
+
+/// Tells the main webview to navigate to Settings › Updates; the webview owns routing.
+#[cfg(desktop)]
+pub const OPEN_UPDATES_REQUESTED_EVENT: &str = "desktop_open_updates_requested";
+/// Tells the main webview to navigate to Settings.
+#[cfg(desktop)]
+pub const OPEN_SETTINGS_REQUESTED_EVENT: &str = "desktop_open_settings_requested";
 
 #[cfg(desktop)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DesktopMenuAction {
-    ShowMainWindow,
-    QuitApp,
-}
-
-/// `None` for every item this app does not own: predefined items act natively, and the router sees
-/// every menu's events because muda's event channel is global.
-#[cfg(desktop)]
-pub fn resolve_desktop_menu_action(menu_item_id: &str) -> Option<DesktopMenuAction> {
-    match menu_item_id {
-        SHOW_MAIN_WINDOW_MENU_ID => Some(DesktopMenuAction::ShowMainWindow),
-        QUIT_APP_MENU_ID => Some(DesktopMenuAction::QuitApp),
-        _ => None,
-    }
-}
-
-#[cfg(desktop)]
-pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
-    match resolve_desktop_menu_action(event.id().0.as_str()) {
-        Some(DesktopMenuAction::ShowMainWindow) => {
-            if let Err(error) = crate::window_chrome::show_main_window(app) {
-                log::warn!("failed to show the main window from a menu command: {error}");
-            }
+pub fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
+    let Some(action) = resolve_desktop_menu_action(event.id().0.as_str()) else {
+        return;
+    };
+    match action {
+        DesktopMenuAction::ShowMainWindow => {
+            crate::window_chrome::request_show_main_window(app);
         }
+        DesktopMenuAction::OpenUpdates => crate::menu_bar::open_main_window_at(
+            app,
+            crate::menu_bar::MainWindowDestination::Updates,
+        ),
+        DesktopMenuAction::OpenSettings => crate::menu_bar::open_main_window_at(
+            app,
+            crate::menu_bar::MainWindowDestination::Settings,
+        ),
         // Held once by `crate::shutdown` so the webview can honour the background-service
         // preference before the app goes.
-        Some(DesktopMenuAction::QuitApp) => app.exit(0),
-        None => {}
+        DesktopMenuAction::QuitApp => crate::menu_bar::quit(app),
+        DesktopMenuAction::StopServicesAndQuit => crate::menu_bar::stop_services_and_quit(app),
+        DesktopMenuAction::ToggleStartAtLogin => crate::menu_bar::toggle_start_at_login(app),
+        DesktopMenuAction::Service { action, relay_url } => {
+            crate::menu_bar::run_service_action(app, action, relay_url)
+        }
     }
 }
 
@@ -162,34 +168,4 @@ pub fn build_app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
             &help_menu,
         ],
     )
-}
-
-#[cfg(all(test, desktop))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_quit_item_both_menus_share_asks_the_app_to_exit() {
-        // `app.exit` is the only quit that reaches the shutdown handoff, so this arm is what makes
-        // the background-service preference reachable at all.
-        assert_eq!(
-            resolve_desktop_menu_action(QUIT_APP_MENU_ID),
-            Some(DesktopMenuAction::QuitApp)
-        );
-    }
-
-    #[test]
-    fn the_show_item_reveals_the_window_that_close_only_hid() {
-        assert_eq!(
-            resolve_desktop_menu_action(SHOW_MAIN_WINDOW_MENU_ID),
-            Some(DesktopMenuAction::ShowMainWindow)
-        );
-    }
-
-    #[test]
-    fn menu_items_this_app_does_not_own_are_left_to_act_natively() {
-        // The router is global: it sees Edit, View and Window items too, and must not touch them.
-        assert_eq!(resolve_desktop_menu_action("Paste"), None);
-        assert_eq!(resolve_desktop_menu_action(""), None);
-    }
 }

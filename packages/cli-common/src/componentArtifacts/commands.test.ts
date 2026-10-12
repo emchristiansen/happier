@@ -146,6 +146,34 @@ describe('execOrThrow', () => {
 });
 
 describe('compileBunBinary', () => {
+    it('can disable standalone executable dotenv autoloading', async () => {
+        const tempRoot = mkdtempSync(join(tmpdir(), 'cli-common-bun-config-'));
+        try {
+            const entrypoint = join(tempRoot, 'index.mjs');
+            const outfile = join(tempRoot, 'happier-runner');
+            writeFileSync(entrypoint, 'console.log("ok");\n', 'utf8');
+
+            const calls: Array<{ cmd: string; args: string[] }> = [];
+            await compileBunBinary({
+                entrypoint,
+                bunTarget: 'bun-linux-x64-baseline',
+                outfile,
+                bunCommand: 'bun',
+                autoloadDotenv: false,
+                defines: { 'process.env.NODE_ENV': '"production"' },
+                runCommand: async (cmd, args) => {
+                    calls.push({ cmd, args });
+                    writeFileSync(outfile, 'compiled', 'utf8');
+                },
+            });
+
+            expect(calls[0]?.args).toContain('--no-compile-autoload-dotenv');
+            expect(calls[0]?.args).toContain('--define=process.env.NODE_ENV="production"');
+        } finally {
+            rmSync(tempRoot, { recursive: true, force: true });
+        }
+    });
+
     it('passes --no-cache for release binary compilation', async () => {
         const tempRoot = mkdtempSync(join(tmpdir(), 'cli-common-bun-compile-'));
         try {

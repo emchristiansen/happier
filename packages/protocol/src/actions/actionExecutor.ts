@@ -40,6 +40,7 @@ import {
   type PermissionEscalationDecision,
 } from './permissionPrivilege.js';
 import type { ActionsSettingsV1 } from './actionSettings.js';
+import { readPendingLocalId } from '../sessionMessages/pendingLocalId.js';
 import type { ReviewStartInput } from '../reviews/reviewStart.js';
 import type { AcpConfigOptionOverridesV1 } from '../sessionMetadata/metadataOverridesV1.js';
 import type { ConnectedServiceBindingsV1 } from '../connect/connectedServiceBindings.js';
@@ -266,6 +267,7 @@ export type ActionExecutorDeps = Readonly<{
   sessionSendMessage: (args: Readonly<{
     sessionId: string;
     message: string;
+    localId?: string;
     requestedAction: PendingRequestedActionV1;
     permissionModeOverride?: string;
     modelOverride?: string | null;
@@ -2223,6 +2225,14 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
         if (actionId === 'session.message.send') {
           const sessionId = resolveSessionIdFromInput(parsed.data, ctx);
           if (!sessionId) return { ok: false, errorCode: 'session_not_selected', error: 'session_not_selected' };
+          const localIdRaw = (parsed.data as Record<string, unknown>).localId;
+          const localId = readPendingLocalId(localIdRaw);
+          if (localIdRaw !== undefined && (
+            ctx.surface !== 'cli'
+            || localId === null
+          )) {
+            return { ok: false, errorCode: 'invalid_parameters', error: 'invalid_parameters' };
+          }
           const serverId = resolveServerIdForSession(deps, ctx, sessionId);
           const modelOverrideRaw = Object.prototype.hasOwnProperty.call(parsed.data, 'modelOverride')
             ? (parsed.data as any).modelOverride
@@ -2237,6 +2247,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
           const res = await deps.sessionSendMessage({
             sessionId,
             message: (parsed.data as any).message,
+            ...(localId !== null ? { localId } : {}),
             requestedAction: PendingRequestedActionV1Schema.parse(
               parsed.data.requestedAction ?? { v: 1, kind: 'steer_if_active' },
             ),

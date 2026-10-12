@@ -94,9 +94,6 @@ vi.mock('@/components/account/RecoveryKeyReminderBanner', () => ({
     },
 }));
 
-vi.mock('@/components/ui/feedback/UpdateBanner', () => ({
-    UpdateBanner: 'UpdateBanner',
-}));
 
 vi.mock('@/components/ui/text/Text', () => ({
     Text: 'Text',

@@ -51,6 +51,14 @@ export interface TrackedSession {
   /** Best-effort observed process command line used for startup runtime refresh checks. */
   processCommand?: string;
   childProcess?: ChildProcess;
+  /** Transient correlated report writes; shared across wrapper promotion, never persisted. */
+  reportMarkerCustody?: { pending: Promise<void>; retiring: boolean };
+  /** Transient startup custody only; never persisted or projected to public metadata. */
+  startupCustody?: Readonly<{
+    finalization: Promise<void>;
+    promotePid?: (pid: number) => void;
+    observeExit: (exit: Readonly<{ reason: string; code: number | null; signal: string | null }>) => void;
+  }>;
   error?: string;
   directoryCreated?: boolean;
   message?: string;
@@ -74,5 +82,7 @@ export interface TrackedSession {
    * Prevents repeated capability probes when the runner reports unrelated metadata later.
    */
   publishedTerminalControlServiceabilityAttachmentId?: string;
+  /** Lifecycle of the exact attachment whose serviceability was published. */
+  publishedTerminalControlServiceabilityAttachmentLifecycle?: 'owned' | 'borrowed';
   terminalHostHealth?: TerminalHostHealthState;
 }

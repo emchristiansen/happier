@@ -1,72 +1,60 @@
 # DMG installer window styling
 
-`tauri.conf.json` → `bundle.macOS.dmg` is the single owner of the macOS DMG
-window look (background, window size, icon positions). All release channels
-(stable / preview / publicdev) inherit it: the overlay configs define no
-`bundle` section and Tauri deep-merges configs.
+Two owners, in this order:
+
+1. `tauri.conf.json` → `bundle.macOS.dmg`: background, window size, icon
+   positions. Tauri applies these while bundling. All release channels inherit
+   it (the preview/publicdev overlays define no `bundle` section).
+2. `scripts/pipeline/tauri/relayout-macos-dmg.mjs`, run by `build-tauri.yml`
+   right before notarization: re-applies that layout plus what Tauri cannot
+   express, then re-signs the DMG (Tauri signed the original).
+
+What Tauri cannot express, and why the second step exists:
+
+- **Icon size.** Tauri never passes `--icon-size` to its DMG script, so icons
+  render at its default 128pt. The step sets **88pt** (text **12pt**).
+- **Hidden volume items.** Tauri parks "every item" off-window, but Finder's
+  "every item" skips invisible files, so `.background` and `.VolumeIcon.icns`
+  stay on top of the background for anyone who shows hidden files. The step
+  parks them by name, with Finder's hidden files shown for the duration
+  (`--show-hidden-files`, CI only: it restarts Finder).
+- **CI.** Tauri also skips its whole Finder pass when `CI=true`;
+  `TAURI_BUNDLER_DMG_IGNORE_CI=true` on the bundling step turns it back on.
 
 ## Source of truth
 
-- Design reference (window WITH icons, what it should look like):
-  marketing uploads `5b92b9bd-dmg.png`.
-- Background master (same art WITHOUT the app/Applications icons — this is what
-  ships): `dmg-bg.png`, **4096x2728** export of 2026-09-21, kept with the
-  marketing design assets. (The earlier 3072x2046 export is superseded.)
+- Background master: marketing `dmg-bg.png`, **2824x2728** (27 Sep 2026
+  export: tighter crop, headline on two lines). Supersedes the 3260x2728,
+  4096x2728 and 3072x2046 exports.
 
 ## Geometry
 
-- Window: **840x560 points** (3:2, matching the art).
-- `dmg-background.png`: **1680x1120 px @144 DPI** — exactly 2x the window, so
-  Finder treats it as 840x560 points and renders it crisp on retina. Regenerate:
+- Window: **623x602 points** (the master's 1.035 aspect ratio).
+- `dmg-background.png`: **1246x1204 px @144 DPI**, exactly 2x the window.
+  Tauri's DMG `background` takes png/jpg/gif only, so 2x PNG + DPI metadata is
+  the retina path. Regenerate:
 
   ```bash
-  sips -z 1120 1680 dmg-bg.png --out dmg-background.png
+  sips -z 1204 1246 dmg-bg.png --out dmg-background.png
   sips -s dpiWidth 144 -s dpiHeight 144 dmg-background.png
   ```
 
-  Note: Tauri's DMG `background` accepts png/jpg/gif only (no retina TIFF), so
-  the 2x-PNG-with-DPI-metadata approach is the correct one.
-
-- Icon centers (Finder `position` = icon center, from the design fractions
-  ~34.5%/49% and ~65%/48.5% of the window):
-  - app: `{290, 274}`
-  - Applications: `{546, 272}`
+- Icon centres (Finder `position` = icon centre), measured on the master:
+  - x on the QR-code columns: 27.18% and 72.36% of the width → `169` and `451`;
+  - y `305`: level with the arrow's top (arrow spans 50.4%–55.2% of the height,
+    its ends at 51.7%), a touch above its centre by design.
+  At 88pt the arrow (38.7%–61.2% of the width, centred) sits between the two
+  icons with an even ~27pt gap on each side.
 
 ## QR codes
 
-The two QR codes baked into the background target **https://happier.dev/appstore**
-and **https://happier.dev/playstore** (see the website `_redirects`). If those
-URLs ever change, the background must be regenerated from a new design export.
-
-## Hidden volume items
-
-`.background`, `.fseventsd`, `.DS_Store` (and sometimes `.Trashes`) exist on
-every styled DMG — `.background` holds this image, `.DS_Store` holds the icon
-layout, `.fseventsd` is written by macOS on any writable volume. They are only
-visible to users who enable "show hidden files"; every major app's DMG shows
-the same. The preview script parks them off-window (`{2400, y}`). Tauri's
-bundler positions only the app and Applications icons, so after the first real
-bundle: check where Finder drops them for hidden-files-on users and, if needed,
-add a post-bundle repositioning step to the release pipeline (it must run
-BEFORE DMG signing/notarization).
+Baked into the background; they target **https://happier.dev/appstore** and
+**https://happier.dev/playstore** (website `_redirects`). If those URLs change,
+regenerate the background from a new design export.
 
 ## Icon labels
 
-Finder renders the bundle and symlink names as icon labels. The current release
-pipeline uses Tauri's stock DMG output, so `Happier.app` and `Applications`
-remain visible at Finder's default text size.
-
-Do not rename the Applications symlink to a visually blank Unicode character:
-the filename is also its accessible label. Tauri's `DmgConfig` does not expose
-label text size or symlink naming. Any future label or hidden-item layout change
-therefore needs an implemented and validated post-bundle re-layout step before
-DMG signing and notarization; this document must not describe that behavior as
-shipped until the release pipeline owns it.
-
-## Previewing without a build
-
-See the session scratchpad `dmg-preview/` approach: create a staging folder with
-a dummy `Happier.app` (real `icons/icon.icns`), an `/Applications` symlink and
-`.background/background.png`, `hdiutil create -format UDRW`, mount, then apply
-the geometry above with Finder AppleScript (icon view, no toolbar/statusbar,
-icon size 100, bounds `{200, 120, 1040, 708}`).
+Finder cannot hide labels. "Happier" must never be renamed: the label is the
+bundle filename and follows the app into /Applications. Renaming the
+Applications symlink to U+2800 (invisible) remains an option for the relayout
+step; not applied.

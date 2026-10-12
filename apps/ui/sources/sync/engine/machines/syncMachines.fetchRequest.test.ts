@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AuthCredentials } from '@/auth/storage/tokenStorage';
 import type { MachineDataKeyCacheEntry } from './syncMachines';
+import type { Machine } from '@/sync/domains/state/storageTypes';
+import { createMachineFixture } from '@/dev/testkit/fixtures/machineFixtures';
 
 vi.mock('@/log', () => ({ log: { log: vi.fn() } }));
 
@@ -41,7 +43,7 @@ function createEncryptionHarness() {
             initialized.add(machineId);
         }
     });
-    const decryptMetadata = vi.fn(async (_version: number, value: string) => ({ decrypted: value }));
+    const decryptMetadata = vi.fn(async (_version: number, value: string): Promise<unknown> => ({ decrypted: value }));
     const decryptDaemonState = vi.fn(async (_version: number, value: string | null) => {
         if (!value) return null;
         return { decrypted: value };
@@ -79,6 +81,41 @@ async function flushAsyncWork(): Promise<void> {
 }
 
 describe('fetchAndApplyMachines request override', () => {
+    it('preserves terminal capabilities and their version until refreshed metadata is hydrated', async () => {
+        const fetchAndApplyMachines = await loadFetchAndApplyMachines();
+        const existing = createMachineFixture({
+            id: 'm_refresh',
+            metadataVersion: 1,
+            metadata: {
+                ...createMachineFixture().metadata!,
+                daemonTerminalSessionAttachSupported: true,
+            },
+        });
+        const nextMetadata = { ...existing.metadata!, daemonTerminalSessionAttachSupported: false };
+        let finishHydration!: (metadata: typeof nextMetadata) => void;
+        const pendingMetadata = new Promise<typeof nextMetadata>((resolve) => { finishHydration = resolve; });
+        const encryption = createEncryptionHarness();
+        encryption.decryptMetadata.mockImplementation(async () => pendingMetadata);
+        let current: Machine = existing;
+
+        await fetchAndApplyMachines({
+            credentials: { token: 't', secret: 's' },
+            encryption,
+            machineDataKeys: new Map(),
+            request: async () => jsonResponse([{ ...existing, metadata: 'next-ciphertext', metadataVersion: 2, dataEncryptionKey: null }]),
+            getExistingMachine: () => current,
+            cachedMachineDisplayEntries: {},
+            applyMachineDisplayEntries: () => {},
+            applyMachines: (machines) => { current = machines[0]!; },
+        });
+
+        expect(current.metadata?.daemonTerminalSessionAttachSupported).toBe(true);
+        expect(current.metadataVersion).toBe(1);
+        finishHydration(nextMetadata);
+        await vi.waitFor(() => expect(current.metadataVersion).toBe(2));
+        expect(current.metadata?.daemonTerminalSessionAttachSupported).toBe(false);
+    });
+
     it('uses injected request transport when provided', async () => {
         const fetchAndApplyMachines = await loadFetchAndApplyMachines();
         const fetchSpy = vi.fn();
@@ -174,7 +211,7 @@ describe('fetchAndApplyMachines request override', () => {
         });
     });
 
-    it('reuses warm cache machine display data when metadata version matches', async () => {
+    it('hydrates full machine capabilities even when cached display metadata is fresh', async () => {
         const fetchAndApplyMachines = await loadFetchAndApplyMachines();
         const requestSpy = vi.fn(async (_path: string, _init?: RequestInit) =>
             jsonResponse([
@@ -223,7 +260,9 @@ describe('fetchAndApplyMachines request override', () => {
             } as any),
         } as any);
 
-        expect(encryption.decryptMetadata).not.toHaveBeenCalled();
+        await vi.waitFor(() => expect(applyMachines).toHaveBeenLastCalledWith([
+            expect.objectContaining({ id: 'm_cached', metadata: { decrypted: 'encrypted-meta' } }),
+        ], false));
         expect(applyMachines).toHaveBeenCalledWith([
             expect.objectContaining({
                 id: 'm_cached',
@@ -520,7 +559,7 @@ describe('fetchAndApplyMachines request override', () => {
         ], false);
     });
 
-    it('caps and batches cold machine display hydration work', async () => {
+    it('hydrates every cold machine beyond the previous row cutoff', async () => {
         const fetchAndApplyMachines = await loadFetchAndApplyMachines();
         const rows = Array.from({ length: 6 }, (_, index) => ({
             id: `m_cold_${index}`,
@@ -551,17 +590,13 @@ describe('fetchAndApplyMachines request override', () => {
             applyMachineDisplayEntries,
             cachedMachineDisplayEntries: {},
             machineDisplayHydrationConcurrencyLimit: 2,
-            machineDisplayEagerHydrationCount: 2,
-            machineDisplayBackgroundHydrationMaxRows: 0,
             machineDisplayBackgroundHydrationApplyBatchSize: 2,
         } as any);
         await flushAsyncWork();
 
-        expect(encryption.decryptMetadata).toHaveBeenCalledTimes(2);
-        expect(encryption.decryptDaemonState).toHaveBeenCalledTimes(2);
-        expect(applyMachines).toHaveBeenCalledTimes(2);
-        expect(applyMachines.mock.calls[1]?.[0]).toHaveLength(2);
-        expect(applyMachines.mock.calls[1]?.[1]).toBe(false);
+        const hydrated = applyMachines.mock.calls.slice(1).flatMap(([machines]) => machines as Machine[]);
+        expect(hydrated.map((machine) => machine.id).sort()).toEqual(rows.map((row) => row.id).sort());
+        expect(hydrated.every((machine) => machine.metadata !== null && machine.daemonState !== null)).toBe(true);
     });
 
     it('does not throw when the request transport fails (e.g. network error)', async () => {

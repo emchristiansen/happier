@@ -58,7 +58,7 @@ import {
 import { projectManager } from '../../runtime/orchestration/projectManager';
 import { syncPerformanceTelemetry } from '../../runtime/syncPerformanceTelemetry';
 import { isModelMode, type PermissionMode } from '@/sync/domains/permissions/permissionTypes';
-import { isModelSelectableForSession } from '@/sync/domains/models/modelOptions';
+import { isModelSelectableForSession, type SessionModelOptionsContext } from '@/sync/domains/models/modelOptions';
 import { resolveAgentIdFromFlavor } from '@/agents/registry/registryCore';
 import { parsePermissionIntentAlias, resolveMetadataStringOverrideStateV1, resolvePermissionIntentFromSessionMetadata } from '@happier-dev/agents';
 import {
@@ -189,7 +189,7 @@ export type SessionsDomain = {
     clearSessionThinkingGrace: (sessionId: string) => void;
     markSessionViewed: (sessionId: string) => void;
     updateSessionPermissionMode: (sessionId: string, mode: PermissionMode) => void;
-    updateSessionModelMode: (sessionId: string, mode: SessionModelMode) => void;
+    updateSessionModelMode: (sessionId: string, mode: SessionModelMode, context?: SessionModelOptionsContext) => void;
     upsertSessionReviewCommentDraft: (sessionId: string, draft: ReviewCommentDraft) => void;
     setSessionReviewCommentDraftIncluded: (sessionId: string, commentId: string, included: boolean) => void;
     deleteSessionReviewCommentDraft: (sessionId: string, commentId: string) => void;
@@ -887,8 +887,8 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                 // State-aware on purpose: an explicit CLEAR is an override with a
                 // timestamp, not an absent key. The Agent transition writes one when the
                 // armed switch chose no model, and it is the only thing that can retire a
-                // client-local selection made for the DEPARTED Agent — the selectability
-                // clamp below cannot, because a freeform-capable target (Claude) accepts
+                // client-local selection made for the DEPARTED Agent — membership validation
+                // alone cannot, because a freeform-capable target (Claude) accepts
                 // any id, so the source Agent's model survived the cutover, named the
                 // composer chip and was handed to the target's resume.
                 const modelOverride = resolveMetadataStringOverrideStateV1(session.metadata, 'modelOverrideV1', 'modelId');
@@ -916,21 +916,10 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                     }
                 }
 
-                const resolvedAgentId = resolveAgentIdFromFlavor(session.metadata?.flavor);
-                if (
-                    resolvedAgentId &&
-                    mergedModelMode !== 'default' &&
-                    !isModelSelectableForSession(resolvedAgentId, session.metadata, mergedModelMode)
-                ) {
-                    mergedModelMode = 'default';
-                    if (typeof mergedModelModeUpdatedAt !== 'number' || !Number.isFinite(mergedModelModeUpdatedAt)) {
-                        if (typeof metadataModelUpdatedAt === 'number' && Number.isFinite(metadataModelUpdatedAt)) {
-                            mergedModelModeUpdatedAt = metadataModelUpdatedAt;
-                        } else {
-                            mergedModelModeUpdatedAt = nowServerMs();
-                        }
-                    }
-                }
+                // A saved or synced choice has already been requested. Session model lists
+                // can lag fresh discovery, so omission is not provider rejection. Admission
+                // is checked by updateSessionModelMode; newer overrides/tombstones above
+                // still replace the choice when the session or Agent changes.
 
                 let mergedThinkingGraceUntil = existingThinkingGraceUntil;
                 if (presence !== 'online') {
@@ -1918,7 +1907,7 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                 sessions: updatedSessions
             };
         }),
-	        updateSessionModelMode: (sessionId: string, mode: SessionModelMode) => set((state) => {
+	        updateSessionModelMode: (sessionId: string, mode: SessionModelMode, context?: SessionModelOptionsContext) => set((state) => {
 	            const session = state.sessions[sessionId];
 	            if (!session) return state;
 	
@@ -1927,7 +1916,7 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                 const candidate: SessionModelMode = (normalized || 'default') as any;
                 const resolvedAgentId = resolveAgentIdFromFlavor(session.metadata?.flavor);
                 const effectiveMode: SessionModelMode =
-                    resolvedAgentId && candidate !== 'default' && !isModelSelectableForSession(resolvedAgentId, session.metadata, candidate)
+                    resolvedAgentId && candidate !== 'default' && !isModelSelectableForSession(resolvedAgentId, session.metadata, candidate, context)
                         ? 'default'
                         : candidate;
 	

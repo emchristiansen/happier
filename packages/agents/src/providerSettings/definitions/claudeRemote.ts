@@ -8,7 +8,7 @@ export const MAX_CLAUDE_REMOTE_ADVANCED_OPTIONS_JSON_CHARS = 16_384;
 const CLAUDE_SETTING_SOURCES_V2 = ['user', 'project', 'local'] as const;
 export type ClaudeSettingSourceV2 = (typeof CLAUDE_SETTING_SOURCES_V2)[number];
 
-export const CLAUDE_UNIFIED_TERMINAL_HOSTS = ['auto', 'tmux', 'zellij'] as const;
+export const CLAUDE_UNIFIED_TERMINAL_HOSTS = ['auto', 'tmux', 'zellij', 'herdr'] as const;
 export type ClaudeUnifiedTerminalHost = (typeof CLAUDE_UNIFIED_TERMINAL_HOSTS)[number];
 
 export const CLAUDE_UNIFIED_TERMINAL_RESUME_CHOICES = [

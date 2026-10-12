@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { createSystemTasksCapability, systemTasksCapability } from './toolSystemTasks';
+import { createSystemTasksCapability, listAdvertisedSystemTaskKinds, systemTasksCapability } from './toolSystemTasks';
 
 describe('systemTasksCapability', () => {
   it('detects the supported methods and kinds', async () => {
@@ -18,6 +18,11 @@ describe('systemTasksCapability', () => {
       ],
       methods: ['start', 'poll', 'respond'],
     });
+  });
+
+  it('advertises cli.update.v1 only where this machine can update its CLI remotely', () => {
+    expect(listAdvertisedSystemTaskKinds({ canUpdateCliRemotely: true })).toContain('cli.update.v1');
+    expect(listAdvertisedSystemTaskKinds({ canUpdateCliRemotely: false })).not.toContain('cli.update.v1');
   });
 
   it('delegates start, poll, and respond through the stateful runner', async () => {

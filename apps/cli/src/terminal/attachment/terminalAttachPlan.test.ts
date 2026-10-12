@@ -6,6 +6,16 @@ import type { Metadata } from '@/api/types';
 import { createTerminalAttachPlan } from './terminalAttachPlan';
 
 describe('createTerminalAttachPlan', () => {
+  it('uses Herdr stable terminal identity for foreground attachment', () => {
+    expect(createTerminalAttachPlan({
+      terminal: {
+        mode: 'herdr',
+        herdr: { sessionName: 'default', socketPath: '/tmp/herdr.sock', terminalId: 'term_123' },
+      },
+      insideTmux: false,
+    })).toEqual({ type: 'herdr', sessionName: 'default', socketPath: '/tmp/herdr.sock', terminalId: 'term_123' });
+  });
+
   it('returns not-attachable when terminal mode is plain', () => {
     const terminal: NonNullable<Metadata['terminal']> = { mode: 'plain' };
     const plan = createTerminalAttachPlan({ terminal, insideTmux: false });

@@ -1,5 +1,6 @@
 import axios, { type AxiosResponse } from 'axios';
 import {
+  projectSessionMetadataForWire,
   type SessionStoredMessageContent,
   type SessionMessageRole,
   type SessionMessageAttentionImpact,
@@ -397,8 +398,8 @@ export async function getOrCreateSessionByTag(params: Readonly<{
 
   const metadataPayload =
     desiredSessionEncryptionMode === 'plain'
-      ? JSON.stringify(params.metadata)
-      : encodeBase64(encrypt(encryptionKey, encryptionVariant, params.metadata));
+      ? JSON.stringify(projectSessionMetadataForWire(params.metadata))
+      : encodeBase64(encrypt(encryptionKey, encryptionVariant, projectSessionMetadataForWire(params.metadata)));
   const agentStatePayload =
     desiredSessionEncryptionMode === 'plain'
       ? (params.agentState ? JSON.stringify(params.agentState) : null)

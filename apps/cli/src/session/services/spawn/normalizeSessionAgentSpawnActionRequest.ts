@@ -30,8 +30,8 @@ import {
 } from '@/session/inheritance/resolveChildSessionInheritedContextFromMetadata';
 import {
   agentSupportsSpawnConnectedServicesDefaults,
-  resolveSpawnConnectedServicesDefaultDisposition,
 } from '@/session/services/spawnConnectedServicesDefaults';
+import { resolveSpawnConnectedServicesDefaultsForAccount } from '@/session/services/resolveSpawnConnectedServicesDefaultsForAccount';
 import type { CreateSpawnedSessionParams } from '@/session/services/createSpawnedSession';
 
 export type SessionAgentSpawnActionSurface = keyof ActionSurfaces;
@@ -414,40 +414,7 @@ export async function resolveSessionAgentSpawnPolicy(params: Readonly<{
 }
 
 export const resolveSessionAgentSpawnConnectedServicesDefaults: SessionAgentSpawnActionConnectedServicesDefaultResolver =
-  async ({ backendTarget, credentials }) => {
-    if (backendTarget.kind !== 'builtInAgent') return null;
-    const agentId = backendTarget.agentId;
-    if (!AGENT_IDS.includes(agentId as AgentId)) return null;
-    if (!agentSupportsSpawnConnectedServicesDefaults(agentId as AgentId)) return null;
-
-    try {
-      const accountSettingsContext = await bootstrapAccountSettingsContext({
-        credentials,
-        mode: 'blocking',
-        deps: { applySideEffects: () => undefined },
-      });
-      // R4-2 (user-ruled): LITERAL resolution. The configured default is honored exactly as stored —
-      // a profile default binds to that profile, a pool default binds to the pool. No silent
-      // profile→pool upgrade here; rotation intent must be migrated by updating the STORED default.
-      const disposition = resolveSpawnConnectedServicesDefaultDisposition({
-        accountSettings: accountSettingsContext.settings,
-        agentId: agentId as AgentId,
-      });
-      if (disposition.kind === 'unavailable') {
-        throw new Error(disposition.reason);
-      }
-      if (disposition.kind === 'native') return null;
-      return {
-        connectedServices: disposition.bindings,
-        connectedServicesUpdatedAt: Date.now(),
-      };
-    } catch (error) {
-      if (error instanceof Error && error.message === 'connected_services_default_settings_invalid') {
-        throw error;
-      }
-      return null;
-    }
-  };
+  resolveSpawnConnectedServicesDefaultsForAccount;
 
 export async function normalizeSessionAgentSpawnActionRequest(params: Readonly<{
   credentials: Credentials;

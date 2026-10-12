@@ -66,12 +66,10 @@ export type ControlRow = {
 };
 
 /**
- * The three agents whose sessions can move between your terminal and the app.
+ * Three concrete examples of moving a session between terminal and app.
  *
- * Deliberately three rows and not thirteen. `localControl` is declared by a few
- * more entries in the manifest, but only these three declare an attach strategy
- * that exists, and a table row for an agent whose attach strategy is
- * `unsupported` would be a row that reads as a yes.
+ * This is illustrative, not an exhaustive capability list. The released
+ * manifest and generated docs own the full agent-by-agent support matrix.
  */
 export const CONTROL_ROWS: ReadonlyArray<ControlRow> = [
     {

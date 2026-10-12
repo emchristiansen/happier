@@ -36,6 +36,19 @@ beforeEach(() => {
 });
 
 describe('opencodeDaemonSpawnHooks.validateSpawn', () => {
+  it('presents only the native client while retaining headless OpenCode server controller custody', async () => {
+    const { opencodeDaemonSpawnHooks } = await import('./spawnHooks');
+    for (const host of ['tmux', 'zellij', 'herdr'] as const) {
+      const selection = { host, accountSettings: null, runtimeSelection: {} };
+      expect(opencodeDaemonSpawnHooks.resolveTerminalPresentation?.({
+        ...selection, processEnv: {},
+      })).toEqual({ kind: 'provider_attach', startingMode: 'local' });
+      expect(opencodeDaemonSpawnHooks.resolveTerminalPresentation?.({
+        ...selection, processEnv: { HAPPIER_OPENCODE_BACKEND_MODE: 'acp' },
+      })).toEqual({ kind: 'none' });
+    }
+  });
+
   it('rejects spawn when HAPPIER_OPENCODE_PATH points to an invalid executable', async () => {
     const homeDir = await createTempDir('happier-opencode-spawnhooks-home-');
     tempDirs.add(homeDir);

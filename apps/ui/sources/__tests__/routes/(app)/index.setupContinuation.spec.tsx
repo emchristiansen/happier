@@ -17,14 +17,17 @@ vi.mock('@/utils/platform/tauri', () => ({
 }));
 
 let isAuthenticated = true;
+/** R11 — the moment right after signing in, which used to be held behind the setup ground. */
+let authenticatedThisRun = false;
 vi.mock('@/auth/context/AuthContext', () => ({
     useAuth: () => ({
         isAuthenticated,
+        authenticatedThisRun,
     }),
 }));
 
 vi.mock('@/components/navigation/shell/MainView', () => ({
-    MainView: () => null,
+    MainView: () => React.createElement('MainView'),
 }));
 
 vi.mock('@/components/navigation/shell/HomeHeader', () => ({
@@ -59,6 +62,7 @@ vi.mock('@/sync/domains/pending/pendingSetupIntent', () => ({
 describe('/ (welcome) setup continuation', () => {
     beforeEach(() => {
         isAuthenticated = true;
+        authenticatedThisRun = false;
         tauriDesktopState.value = true;
         pendingTerminalConnectState.value = null;
         pendingSetupIntentState.value = {
@@ -135,5 +139,18 @@ describe('/ (welcome) setup continuation', () => {
 
         expect(expoRouterMock.spies.replace).not.toHaveBeenCalledWith('/setup');
         expect(clearPendingSetupIntentSpy).not.toHaveBeenCalled();
+    });
+
+    it('opens the app straight after signing in on desktop, while this computer is still unresolved (R11)', async () => {
+        // Nothing about this computer is known yet and the user has only just signed in — the
+        // exact moment the first-run ground used to own the whole route. The Home renders now.
+        authenticatedThisRun = true;
+        pendingSetupIntentState.value = null;
+
+        const Screen = (await import('@/app/(app)/index')).default;
+        const screen = await renderScreen(React.createElement(Screen));
+        await flushHookEffects({ cycles: 1, turns: 2 });
+
+        expect(screen.findAllByType('MainView' as never)).toHaveLength(1);
     });
 });

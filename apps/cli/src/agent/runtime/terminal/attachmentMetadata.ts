@@ -1,6 +1,15 @@
 import type { Metadata } from '@/api/types';
 import type { TerminalHostHandle } from '@/integrations/terminalHost/_types';
 
+/** Only Herdr currently supplies verified current-pane context at shared CLI dispatch. */
+export function resolveInheritedTerminalHostLifecycle(metadata: Readonly<{
+  terminal?: Metadata['terminal'];
+  startedBy?: Metadata['startedBy'];
+}>): 'owned' | 'borrowed' | null {
+  if (metadata.terminal?.mode !== 'herdr' || !buildTerminalHostHandleFromAttachmentMetadata(metadata.terminal)) return null;
+  return metadata.startedBy === 'daemon' ? 'owned' : 'borrowed';
+}
+
 export function buildTerminalAttachmentMetadataFromHostHandle(
   handle: TerminalHostHandle,
 ): NonNullable<Metadata['terminal']> | null {
@@ -16,6 +25,22 @@ export function buildTerminalAttachmentMetadataFromHostHandle(
         sessionName,
         ...(paneId ? { paneId } : {}),
         ...(socketDirV1 ? { socketDirV1 } : {}),
+      },
+    };
+  }
+
+  if (handle.kind === 'herdr') {
+    const socketPath = handle.socketPath?.trim();
+    const terminalId = handle.terminalId?.trim();
+    if (!socketPath || !terminalId) return null;
+    const paneId = handle.paneId?.trim();
+    return {
+      mode: 'herdr',
+      herdr: {
+        sessionName,
+        socketPath,
+        terminalId,
+        ...(paneId ? { paneId } : {}),
       },
     };
   }
@@ -50,6 +75,28 @@ export function buildTerminalAttachmentMetadataFromHostHandle(
 export function buildTerminalHostHandleFromAttachmentMetadata(
   terminal: NonNullable<Metadata['terminal']>,
 ): TerminalHostHandle | null {
+  if (terminal.mode === 'herdr') {
+    const sessionName = terminal.herdr?.sessionName?.trim();
+    const socketPath = terminal.herdr?.socketPath?.trim();
+    const terminalId = terminal.herdr?.terminalId?.trim();
+    if (!sessionName || !socketPath || !terminalId) return null;
+    const paneId = terminal.herdr?.paneId?.trim();
+    return {
+      kind: 'herdr',
+      sessionName,
+      socketPath,
+      terminalId,
+      ...(paneId ? { paneId } : {}),
+      attachMetadata: {
+        attachStrategy: 'terminal_host',
+        topology: 'shared',
+        locality: 'same_machine',
+        maxClients: null,
+        requiresLocalAttachmentInfo: true,
+        liveProbe: 'required',
+      },
+    };
+  }
   if (terminal.mode === 'zellij') {
     const sessionName = typeof terminal.zellij?.sessionName === 'string'
       ? terminal.zellij.sessionName.trim()

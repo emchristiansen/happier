@@ -126,7 +126,8 @@ vi.mock('@/sync/domains/state/storageStore', async () => {
     };
 });
 
-vi.mock('@/agents/catalog/catalog', () => ({
+vi.mock('@/agents/catalog/catalog', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@/agents/catalog/catalog')>(),
     AGENT_IDS: ['codex', 'claude', 'opencode', 'gemini'],
     DEFAULT_AGENT_ID: 'codex',
     resolveAgentIdFromFlavor: () => null,
@@ -160,7 +161,8 @@ vi.mock('@/agents/catalog/catalog', () => ({
     }),
 }));
 
-vi.mock('@/sync/domains/models/modelOptions', () => ({
+vi.mock('@/sync/domains/models/modelOptions', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@/sync/domains/models/modelOptions')>(),
     findModelOptionForEffectiveModelId: (options: readonly any[], id: string) =>
         (options ?? []).find((o: any) => o.value === id) ?? (options ?? []).find((o: any) => o.extendedContextModelId === id) ?? null,
     getModelOptionsForSession: (_agentId: string, metadata: any) => {
@@ -339,6 +341,9 @@ vi.mock('./components/PermissionModePicker', () => ({
     PermissionModePicker: () => null,
 }));
 
+// Compile the component graph during collection, before timed interaction assertions.
+const { AgentInput } = await import('./AgentInput');
+
 describe('AgentInput (modelOptionsOverride)', () => {
     beforeEach(() => {
         supportsFreeformModelSelectionState.value = false;
@@ -351,7 +356,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('prefers modelOptionsOverride over getModelOptionsForSession()', async () => {
-        const { AgentInput } = await import('./AgentInput');
 
         lastModelPickerOverlayProps = null;
 
@@ -380,7 +384,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('adds a description to the CLI settings option when other models include descriptions', async () => {
-        const { AgentInput } = await import('./AgentInput');
 
         lastModelPickerOverlayProps = null;
 
@@ -409,8 +412,7 @@ describe('AgentInput (modelOptionsOverride)', () => {
         expect(String(defaultOption.description).trim().length).toBeGreaterThan(0);
     });
 
-    it('passes probe state through to ModelPickerOverlay when provided', async () => {
-        const { AgentInput } = await import('./AgentInput');
+    it('passes probe lifecycle and visible failure through the shared engine detail', async () => {
 
         lastModelPickerOverlayProps = null;
         const onRefresh = vi.fn();
@@ -430,12 +432,13 @@ describe('AgentInput (modelOptionsOverride)', () => {
                     modelOptionsOverride: [
                         { value: 'default', label: 'Default (override)', description: '' },
                     ],
-                    modelOptionsOverrideProbe: { phase: 'loading', onRefresh },
+                    modelOptionsOverrideProbe: { phase: 'loading', error: true, onRefresh },
                 } as any));
         expect(screen.findByTestId('agent-input-action-menu-button')).toBeNull();
         await screen.pressByTestIdAsync('agent-input-agent-chip');
 
         expect(lastModelPickerOverlayProps?.probe?.phase).toBe('loading');
+        expect(lastModelPickerOverlayProps?.notes).toContain('errors.unknownError');
         expect(typeof lastModelPickerOverlayProps?.probe?.onRefresh).toBe('function');
         lastModelPickerOverlayProps?.probe?.onRefresh?.();
         expect(onRefresh).toHaveBeenCalledTimes(1);
@@ -445,7 +448,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('submits inline custom models through ModelPickerOverlay without opening a modal prompt', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onModelModeChange = vi.fn();
         supportsFreeformModelSelectionState.value = true;
         lastModelPickerOverlayProps = null;
@@ -479,8 +481,7 @@ describe('AgentInput (modelOptionsOverride)', () => {
         expect(modalPromptMock).not.toHaveBeenCalled();
     });
 
-    it('shows a loading probe when session models are expected but not yet available', async () => {
-        const { AgentInput } = await import('./AgentInput');
+    it('does not invent loading while empty session metadata has no discovery operation', async () => {
 
         lastModelPickerOverlayProps = null;
 
@@ -512,12 +513,11 @@ describe('AgentInput (modelOptionsOverride)', () => {
         expect(screen.findByTestId('agent-input-action-menu-button')).toBeNull();
         await screen.pressByTestIdAsync('agent-input-agent-chip');
 
-        expect(lastModelPickerOverlayProps?.probe?.phase).toBe('loading');
+        expect(lastModelPickerOverlayProps?.probe).toBeUndefined();
         expect((lastModelPickerOverlayProps?.options ?? []).map((o: any) => o.value)).toEqual(['default']);
     });
 
-    it('shows a loading probe when generic session-control model metadata is present but empty', async () => {
-        const { AgentInput } = await import('./AgentInput');
+    it('does not invent loading for empty generic model metadata', async () => {
 
         lastModelPickerOverlayProps = null;
 
@@ -549,12 +549,11 @@ describe('AgentInput (modelOptionsOverride)', () => {
         expect(screen.findByTestId('agent-input-action-menu-button')).toBeNull();
         await screen.pressByTestIdAsync('agent-input-agent-chip');
 
-        expect(lastModelPickerOverlayProps?.probe?.phase).toBe('loading');
+        expect(lastModelPickerOverlayProps?.probe).toBeUndefined();
         expect((lastModelPickerOverlayProps?.options ?? []).map((o: any) => o.value)).toEqual(['default']);
     });
 
-    it('clears the loading probe once session models are available', async () => {
-        const { AgentInput } = await import('./AgentInput');
+    it('updates session model rows without inventing a probe lifecycle', async () => {
 
         lastModelPickerOverlayProps = null;
 
@@ -595,7 +594,7 @@ describe('AgentInput (modelOptionsOverride)', () => {
         expect(screen.findByTestId('agent-input-action-menu-button')).toBeNull();
         await screen.pressByTestIdAsync('agent-input-agent-chip');
 
-        expect(lastModelPickerOverlayProps?.probe?.phase).toBe('loading');
+        expect(lastModelPickerOverlayProps?.probe).toBeUndefined();
 
         await act(async () => {
             screen.tree.update(
@@ -620,8 +619,7 @@ describe('AgentInput (modelOptionsOverride)', () => {
         expect((lastModelPickerOverlayProps?.options ?? []).map((o: any) => o.value)).toEqual(['default', 'session-model']);
     });
 
-    it('keeps the previous model list visible while refreshing if the session list temporarily clears', async () => {
-        const { AgentInput } = await import('./AgentInput');
+    it('honors an explicitly empty published catalog without retaining omitted rows', async () => {
 
         lastModelPickerOverlayProps = null;
 
@@ -684,12 +682,11 @@ describe('AgentInput (modelOptionsOverride)', () => {
             );
         });
 
-        expect(lastModelPickerOverlayProps?.probe?.phase).toBe('refreshing');
-        expect((lastModelPickerOverlayProps?.options ?? []).map((o: any) => o.value)).toEqual(['default', 'session-model']);
+        expect(lastModelPickerOverlayProps?.probe).toBeUndefined();
+        expect((lastModelPickerOverlayProps?.options ?? []).map((o: any) => o.value)).toEqual(['default']);
     });
 
     it('renders an ACP session mode picker from preflight override options when provided', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onAcpSessionModeChange = vi.fn();
 
         const screen = await renderScreen(React.createElement(AgentInput, {
@@ -723,7 +720,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('calls onAcpSessionModeChange when selecting a preflight ACP mode', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onAcpSessionModeChange = vi.fn();
 
         const screen = await renderScreen(React.createElement(AgentInput, {
@@ -756,7 +752,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('cycles the ACP mode chip directly when only simple build-plan options are available', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onAcpSessionModeChange = vi.fn();
         modalShowMock.mockReset();
 
@@ -794,7 +789,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('keeps the existing list icon and bare mode label when the selected ACP mode is Plan', async () => {
-        const { AgentInput } = await import('./AgentInput');
 
         const screen = await renderScreen(React.createElement(AgentInput, {
                     value: 'hello',
@@ -824,7 +818,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('opens ACP mode picker popover instead of cycling when selectable options exceed threshold', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onAcpSessionModeChange = vi.fn();
         modalShowMock.mockReset();
 
@@ -863,7 +856,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('opens env chip popover content instead of invoking the legacy env click callback when custom content exists', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onEnvVarsClick = vi.fn();
 
         const screen = await renderScreen(React.createElement(AgentInput, {
@@ -901,7 +893,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('opens profile chip popover content instead of invoking the legacy profile click callback when custom content exists', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onProfileClick = vi.fn();
 
         const screen = await renderScreen(React.createElement(AgentInput, {
@@ -938,7 +929,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('opens the permission chip with the shared popover instead of invoking the legacy permission click callback', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onPermissionClick = vi.fn();
 
         const screen = await renderScreen(React.createElement(AgentInput, {
@@ -963,7 +953,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('closes the collapsed action menu when opening the permission chip popover', async () => {
-        const { AgentInput } = await import('./AgentInput');
         mockAgentInputActionBarLayout = 'collapsed';
 
         try {
@@ -993,7 +982,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('reopens collapsed settings through the shared content popover transport after closing the permission chip popover', async () => {
-        const { AgentInput } = await import('./AgentInput');
         mockAgentInputActionBarLayout = 'collapsed';
 
         try {
@@ -1024,7 +1012,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('opens the agent chip with the shared chip popover when engine picker props are provided', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onAgentPickerSelect = vi.fn();
         modalShowMock.mockReset();
 
@@ -1062,7 +1049,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('renders a single refresh control in the model section that refreshes the engine popover probes', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onRefresh = vi.fn();
 
         const screen = await renderScreen(React.createElement(AgentInput, {
@@ -1093,7 +1079,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('disables the model refresh control while the probe is busy', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onRefresh = vi.fn();
 
         const screen = await renderScreen(React.createElement(AgentInput, {
@@ -1126,7 +1111,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('invokes the model refresh control when idle', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onRefresh = vi.fn();
 
         const screen = await renderScreen(React.createElement(AgentInput, {
@@ -1158,7 +1142,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('closes the permission popover before showing the shared engine picker in wrap layout', async () => {
-        const { AgentInput } = await import('./AgentInput');
 
         const screen = await renderScreen(React.createElement(AgentInput, {
                     value: 'hello',
@@ -1192,7 +1175,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('prefers the shared live engine picker over the legacy agent click callback when live model access exists', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onAgentClick = vi.fn();
         lastModelPickerOverlayProps = null;
 
@@ -1227,7 +1209,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('opens the agent chip with a live engine detail picker when model selection is available', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onModelModeChange = vi.fn();
         lastModelPickerOverlayProps = null;
         lastPopoverProps = null;
@@ -1277,7 +1258,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('marks the last-used applied model without moving selection away from the requested model', async () => {
-        const { AgentInput } = await import('./AgentInput');
 
         lastModelPickerOverlayProps = null;
 
@@ -1325,7 +1305,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('keeps the check/background on the selected model while the running icon stays on the applied model', async () => {
-        const { AgentInput } = await import('./AgentInput');
         lastModelPickerOverlayProps = null;
 
         const screen = await renderScreen(React.createElement(AgentInput, {
@@ -1372,7 +1351,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('renders the selected model label and provider logo in the engine chip', async () => {
-        const { AgentInput } = await import('./AgentInput');
 
         const screen = await renderScreen(React.createElement(AgentInput, {
                     value: 'hello',
@@ -1412,7 +1390,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('applies the shared provider picker icon scale to the engine chip logo', async () => {
-        const { AgentInput } = await import('./AgentInput');
 
         const screen = await renderScreen(React.createElement(AgentInput, {
                     value: 'hello',
@@ -1441,7 +1418,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('reuses non-Pi picker-row scaling for the engine chip logo', async () => {
-        const { AgentInput } = await import('./AgentInput');
 
         const screen = await renderScreen(React.createElement(AgentInput, {
                     value: 'hello',
@@ -1470,7 +1446,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('caps the engine popover at 570px when the rail is hidden in stacked layout', async () => {
-        const { AgentInput } = await import('./AgentInput');
         mockWindowWidth = 520;
         lastModelPickerOverlayProps = null;
         lastPopoverProps = null;
@@ -1510,7 +1485,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('uses the collapsed settings action as a launcher for the shared engine picker when agent picker options exist', async () => {
-        const { AgentInput } = await import('./AgentInput');
         mockAgentInputActionBarLayout = 'collapsed';
         lastModelPickerOverlayProps = null;
         lastPopoverProps = null;
@@ -1558,7 +1532,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('uses the collapsed settings action as a launcher for the shared session mode popover', async () => {
-        const { AgentInput } = await import('./AgentInput');
         mockAgentInputActionBarLayout = 'collapsed';
         lastPopoverProps = null;
         mockSessionModePickerControl = {
@@ -1612,7 +1585,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('renders preflight session mode controls for Claude even when static session modes exist', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onRefresh = vi.fn();
         mockSessionModePickerControl = {
             options: [
@@ -1664,7 +1636,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('calls refresh handler for preflight ACP mode lists when provided', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onRefresh = vi.fn();
 
         const screen = await renderScreen(React.createElement(AgentInput, {
@@ -1702,7 +1673,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('renders preflight ACP config options in the agent picker and applies local overrides', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onSessionConfigOptionChange = vi.fn();
 
         const screen = await renderScreen(React.createElement(AgentInput, {
@@ -1751,7 +1721,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('routes Cursor model_config options through the selected model controls instead of generic config controls', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onSessionConfigOptionChange = vi.fn();
 
         const screen = await renderScreen(React.createElement(AgentInput, {
@@ -1850,7 +1819,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('renders a config-options loading affordance when ACP config preflight is still loading', async () => {
-        const { AgentInput } = await import('./AgentInput');
 
         const screen = await renderScreen(React.createElement(AgentInput, {
                     value: 'hello',
@@ -1880,7 +1848,6 @@ describe('AgentInput (modelOptionsOverride)', () => {
     });
 
     it('calls refresh handler for preflight ACP config options when no options are loaded yet', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onRefresh = vi.fn();
 
         const screen = await renderScreen(React.createElement(AgentInput, {
@@ -1938,7 +1905,6 @@ describe('AgentInput (extended-context model toggle)', () => {
     ];
 
     it('synthesizes the context toggle and routes it through the model-override pipeline', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onModelModeChange = vi.fn();
         const onSessionConfigOptionChange = vi.fn();
         lastModelPickerOverlayProps = null;
@@ -1978,7 +1944,6 @@ describe('AgentInput (extended-context model toggle)', () => {
     });
 
     it('treats the [1m] variant as its base model and toggles back to the bare id', async () => {
-        const { AgentInput } = await import('./AgentInput');
         const onModelModeChange = vi.fn();
         const onSessionConfigOptionChange = vi.fn();
         lastModelPickerOverlayProps = null;

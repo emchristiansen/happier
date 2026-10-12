@@ -122,9 +122,13 @@ installSessionRouteCommonModuleMocks({
   },
 });
 
-vi.mock('@/sync/store/hooks', () => ({
-  useSessionMessages: () => ({ messages: mockCommittedMessages, isLoaded: mockMessagesLoaded }),
-}));
+vi.mock('@/sync/store/hooks', async () => {
+  const { createUseLocalSettingMock } = await import('@/dev/testkit/mocks/storage');
+  return {
+    useSessionMessages: () => ({ messages: mockCommittedMessages, isLoaded: mockMessagesLoaded }),
+    useLocalSetting: createUseLocalSettingMock(),
+  };
+});
 
 vi.mock('@/sync/sync', () => ({
   sync: {

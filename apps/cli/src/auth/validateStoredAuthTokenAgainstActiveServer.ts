@@ -2,7 +2,12 @@ import { isAuthenticationStatus } from '@/api/client/httpStatusError';
 import { resolveServerHttpBaseUrl } from '@/api/client/serverHttpBaseUrl';
 
 export type ActiveServerStoredTokenValidationResult = Readonly<
-  | { state: 'valid'; httpStatus: number; accountId: string }
+  /**
+   * `accountLabel` is how the profile names the account for people (username, else display name),
+   * so `auth status`/`daemon status` and the app can say WHICH account this computer is signed in
+   * as. `null` when the profile carries neither; readers fall back to a short account id.
+   */
+  | { state: 'valid'; httpStatus: number; accountId: string; accountLabel: string | null }
   | { state: 'invalid'; httpStatus: number; reasonCode: string }
   | { state: 'unknown'; httpStatus: number | null; reasonCode: string }
 >;
@@ -11,6 +16,22 @@ function readResponseCode(body: unknown, fallback: string): string {
   return typeof (body as { code?: unknown })?.code === 'string' && (body as { code: string }).code.trim()
     ? (body as { code: string }).code.trim()
     : fallback;
+}
+
+function readTrimmedString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function readAccountLabel(body: unknown): string | null {
+  const profile = body && typeof body === 'object' ? body as Record<string, unknown> : {};
+  const username = readTrimmedString(profile.username);
+  if (username) {
+    return username;
+  }
+  const displayName = [readTrimmedString(profile.firstName), readTrimmedString(profile.lastName)]
+    .filter((part): part is string => part !== null)
+    .join(' ');
+  return displayName || null;
 }
 
 async function readJsonBody(response: Response): Promise<unknown> {
@@ -57,7 +78,7 @@ export async function validateStoredAuthTokenAgainstServer(params: Readonly<{
     if (response.ok) {
       const accountId = (body as { id?: unknown } | null)?.id;
       if (typeof accountId === 'string' && accountId.trim().length > 0) {
-        return { state: 'valid', httpStatus: response.status, accountId: accountId.trim() };
+        return { state: 'valid', httpStatus: response.status, accountId: accountId.trim(), accountLabel: readAccountLabel(body) };
       }
       return { state: 'unknown', httpStatus: response.status, reasonCode: 'invalid-profile-response' };
     }

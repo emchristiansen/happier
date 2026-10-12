@@ -8,6 +8,13 @@ vi.mock('@/text', async () => {
 import { getModelOptionsForAgentTypeOrPreflight } from './modelOptions';
 
 describe('modelOptions preflight', () => {
+    it('keeps a successful empty discovery authoritative while missing discovery uses the static fallback', () => {
+        expect(getModelOptionsForAgentTypeOrPreflight({
+            agentType: 'claude', preflight: { availableModels: [], supportsFreeform: true },
+        }).map((row) => row.value)).toEqual(['default']);
+        expect(getModelOptionsForAgentTypeOrPreflight({ agentType: 'claude', preflight: null }).length).toBeGreaterThan(1);
+    });
+
     it('treats Grok non-freeform preflight models as authoritative', () => {
         const out = getModelOptionsForAgentTypeOrPreflight({
             agentType: 'grok',
@@ -21,7 +28,7 @@ describe('modelOptions preflight', () => {
         expect(out.some((option) => option.value === 'grok-build')).toBe(false);
     });
 
-    it('merges preflight models with canonical agent models instead of dropping catalog options', () => {
+    it('enriches advertised preflight models without adding missing catalog members', () => {
         const out = getModelOptionsForAgentTypeOrPreflight({
             agentType: 'claude',
             preflight: {
@@ -38,7 +45,7 @@ describe('modelOptions preflight', () => {
         });
 
         const modelIds = out.map((option) => option.value);
-        expect(modelIds.slice(0, 7)).toEqual([
+        expect(modelIds).toEqual([
             'default',
             'claude-fable-5',
             'claude-opus-4-8',
@@ -47,54 +54,11 @@ describe('modelOptions preflight', () => {
             'claude-sonnet-4-6',
             'claude-haiku-4-5',
         ]);
-        expect(modelIds).toEqual(expect.arrayContaining([
-            'claude-opus-5',
-            'claude-sonnet-5',
-            'claude-opus-4-5',
-            'claude-sonnet-4-5',
-        ]));
 
-        // Preflight model lists often omit per-model option metadata; we must preserve catalog
-        // options so controls like Claude "Thinking" can still render.
-        expect(out.find((option) => option.value === 'claude-fable-5')).toMatchObject({
-            modelOptions: expect.arrayContaining([
-                expect.objectContaining({
-                    id: 'reasoning_effort',
-                    currentValue: 'high',
-                    options: expect.arrayContaining([
-                        expect.objectContaining({ value: 'xhigh' }),
-                        expect.objectContaining({ value: 'max' }),
-                    ]),
-                }),
-            ]),
-        });
-        expect(out.find((option) => option.value === 'claude-opus-4-8')).toMatchObject({
-            modelOptions: expect.arrayContaining([
-                expect.objectContaining({
-                    id: 'reasoning_effort',
-                    currentValue: 'high',
-                    options: expect.arrayContaining([
-                        expect.objectContaining({ value: 'xhigh' }),
-                    ]),
-                }),
-            ]),
-        });
-        expect(out.find((option) => option.value === 'claude-opus-4-7')).toMatchObject({
-            modelOptions: expect.arrayContaining([
-                expect.objectContaining({
-                    id: 'reasoning_effort',
-                    currentValue: 'xhigh',
-                    options: expect.arrayContaining([
-                        expect.objectContaining({ value: 'xhigh' }),
-                    ]),
-                }),
-            ]),
-        });
-        expect(out.find((option) => option.value === 'claude-opus-4-6')).toMatchObject({
-            modelOptions: expect.arrayContaining([
-                expect.objectContaining({ id: 'reasoning_effort' }),
-            ]),
-        });
+        // Dynamic capability omissions remain authoritative; the catalog only enriches copy.
+        expect(out.find((option) => option.value === 'claude-fable-5')?.modelOptions).toBeUndefined();
+        expect(out.find((option) => option.value === 'claude-sonnet-4-6')?.extendedContextModelId).toBeUndefined();
+        expect(out.find((option) => option.value === 'claude-opus-4-6')?.description).toBeTruthy();
     });
 
     it('prefers preflight model list and always includes Default first', () => {
@@ -152,6 +116,7 @@ describe('modelOptions preflight', () => {
             preflight: {
                 availableModels: [
                     { id: 'claude-opus-4-5-20251101', name: 'Opus 4.5' },
+                    { id: 'claude-opus-4-5', name: 'Opus 4.5' },
                     { id: 'claude-opus-4-6', name: 'Opus 4.6' },
                 ],
                 supportsFreeform: true,

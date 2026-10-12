@@ -1,5 +1,6 @@
 import { MMKV } from 'react-native-mmkv';
 import { normalizeServerIdentityIdCapability } from '@happier-dev/protocol';
+import { isTauriDesktop } from '@/utils/platform/tauri';
 import { readStorageScopeFromEnv, scopedStorageId } from '@/utils/system/storageScope';
 import { isStackContext } from './serverContext';
 import { canonicalizeServerUrl, createServerUrlComparableKey } from './url/serverUrlCanonical';
@@ -669,8 +670,10 @@ function writeTabActiveServerId(id: string | null): void {
     }
 }
 
-function getWebSameOriginServerUrl(): string | null {
-    if (!isWebRuntime()) return null;
+export function getWebSameOriginServerUrl(): string | null {
+    // The desktop app's page is its own bundle (http://tauri.localhost on Windows, the devUrl in
+    // `tauri dev`), never a relay, so its origin is neither a profile nor this computer's local relay.
+    if (!isWebRuntime() || isTauriDesktop()) return null;
     const origin = (globalThis as any).window?.location?.origin;
     if (!origin || origin === 'null') return null;
     try {

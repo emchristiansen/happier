@@ -10,132 +10,90 @@
 //! the webview asks for the handoff, and the service is only ever stopped by the webview acting on
 //! an answer it actually received. A force quit, an OS shutdown or a logout that kills the app
 //! part-way through therefore leaves the daemon exactly where it was.
+//!
+//! R16 (a): with the login-start setting on, the webview answers the handoff with `menuBar`
+//! instead of exiting — the app then drops its windows and web UI and keeps only the tray
+//! (`crate::menu_bar`), with the services still running. Destroying the last window raises an
+//! implicit exit request, which menu-bar mode holds; only an explicit Quit ends that process.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
-use tauri::{AppHandle, Emitter, Manager, Runtime, State};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+mod policy;
+
+pub use policy::QuitIntent;
+use policy::{
+    parse_shutdown_outcome, resolve_desktop_exit_action, AppExitRequestedPayload,
+    DesktopExitAction, DesktopExitRequest, ShutdownOutcome,
+};
 
 /// Emitted to the webview when the app is quitting and the handoff is still available.
 pub const APP_EXIT_REQUESTED_EVENT: &str = "desktop_app_exit_requested";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DesktopExitAction {
-    /// Hold the exit and let the webview decide what to do with the background service.
-    HandOffToWebview,
-    /// Quit now.
-    Exit,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DesktopExitRequest {
-    /// Whether there is still a webview to ask.
-    pub webview_present: bool,
-    /// Whether this quit already handed off once.
-    pub handoff_used: bool,
-    /// An update relaunch. The app is coming straight back, and `prevent_exit` is ignored for it
-    /// anyway, so asking whether to stop the service would be both pointless and wrong.
-    pub is_restart: bool,
-}
-
-/// One handoff, then the app always quits.
-///
-/// `handoff_used` is what keeps a quit from ever becoming unquittable: if the webview is wedged,
-/// gone, or simply slow, pressing Quit again exits. Nothing here waits on a timer.
-pub fn resolve_desktop_exit_action(request: DesktopExitRequest) -> DesktopExitAction {
-    if request.is_restart || request.handoff_used || !request.webview_present {
-        return DesktopExitAction::Exit;
-    }
-    DesktopExitAction::HandOffToWebview
-}
-
 #[derive(Default)]
 pub struct DesktopShutdownState {
     handoff_used: AtomicBool,
+    intent: Mutex<QuitIntent>,
 }
 
-/// Called by the webview once it has done whatever the user's answer asked for. Exiting again
-/// re-enters the handler, which now finds the handoff used and lets the app go.
-#[tauri::command]
-pub fn desktop_finish_shutdown<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+/// Asks the app to quit the way the person chose; the exit handler hands the choice to the
+/// webview with the one handoff.
+pub fn request_quit(app: &AppHandle, intent: QuitIntent) {
+    let state: State<'_, DesktopShutdownState> = app.state();
+    if let Ok(mut current) = state.intent.lock() {
+        *current = intent;
+    }
     app.exit(0);
+}
+
+/// Called by the webview once it has done whatever the user's answer asked for. `menuBar` keeps a
+/// tray-only process with the services running (R16 a); anything else exits, re-entering the
+/// handler, which now finds the handoff used and lets the app go.
+#[tauri::command]
+pub fn desktop_finish_shutdown(app: AppHandle, outcome: Option<String>) -> Result<(), String> {
+    match parse_shutdown_outcome(outcome.as_deref()) {
+        ShutdownOutcome::MenuBar => {
+            let state: State<'_, DesktopShutdownState> = app.state();
+            // The quit is over; the next one (from the tray, or after reopening) starts afresh.
+            state.handoff_used.store(false, Ordering::SeqCst);
+            crate::menu_bar::enter(&app);
+        }
+        ShutdownOutcome::Exit => app.exit(0),
+    }
     Ok(())
 }
 
 /// Handles `RunEvent::ExitRequested`. Returns `true` when the caller must hold the exit.
-pub fn handle_exit_requested<R: Runtime>(app: &AppHandle<R>, code: Option<i32>) -> bool {
+pub fn handle_exit_requested(app: &AppHandle, code: Option<i32>) -> bool {
     let state: State<'_, DesktopShutdownState> = app.state();
     let request = DesktopExitRequest {
         webview_present: !app.webview_windows().is_empty(),
         handoff_used: state.handoff_used.load(Ordering::SeqCst),
         is_restart: code == Some(tauri::RESTART_EXIT_CODE),
+        menu_bar_mode: crate::menu_bar::is_active(app),
+        explicit: code.is_some(),
     };
 
     match resolve_desktop_exit_action(request) {
         DesktopExitAction::Exit => false,
+        DesktopExitAction::StayInMenuBar => true,
         DesktopExitAction::HandOffToWebview => {
             state.handoff_used.store(true, Ordering::SeqCst);
+            let intent = state
+                .intent
+                .lock()
+                .map(|mut intent| std::mem::take(&mut *intent))
+                .unwrap_or_default();
+            let payload = AppExitRequestedPayload::new(intent, crate::tray::start_at_login(app));
             // `emit` reports success with zero listeners, so this only fires when the event could
             // not be published at all — never as "nobody is listening". A quit that beats the
             // webview's listener is still held, and is finished by pressing Quit again.
-            if app.emit(APP_EXIT_REQUESTED_EVENT, ()).is_err() {
+            if app.emit(APP_EXIT_REQUESTED_EVENT, payload).is_err() {
                 return false;
             }
             true
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn request() -> DesktopExitRequest {
-        DesktopExitRequest {
-            webview_present: true,
-            handoff_used: false,
-            is_restart: false,
-        }
-    }
-
-    #[test]
-    fn a_live_webview_gets_one_chance_to_decide() {
-        assert_eq!(
-            resolve_desktop_exit_action(request()),
-            DesktopExitAction::HandOffToWebview
-        );
-    }
-
-    #[test]
-    fn quitting_again_exits_instead_of_asking_twice() {
-        assert_eq!(
-            resolve_desktop_exit_action(DesktopExitRequest {
-                handoff_used: true,
-                ..request()
-            }),
-            DesktopExitAction::Exit
-        );
-    }
-
-    #[test]
-    fn an_exit_with_nobody_to_ask_never_touches_the_background_service() {
-        // No webview means no decision and no stop command: the daemon is left running.
-        assert_eq!(
-            resolve_desktop_exit_action(DesktopExitRequest {
-                webview_present: false,
-                ..request()
-            }),
-            DesktopExitAction::Exit
-        );
-    }
-
-    #[test]
-    fn an_update_relaunch_never_asks_about_the_background_service() {
-        assert_eq!(
-            resolve_desktop_exit_action(DesktopExitRequest {
-                is_restart: true,
-                ..request()
-            }),
-            DesktopExitAction::Exit
-        );
     }
 }

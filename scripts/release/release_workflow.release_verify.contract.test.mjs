@@ -68,6 +68,16 @@ test('release workflow verifies immutable candidates before promoting preview or
   );
 });
 
+test('release resume rechecks risk-selected suites after the target branch has advanced', async () => {
+  const raw = await readFile(join(repoRoot, '.github', 'workflows', 'release.yml'), 'utf8');
+  const workflow = YAML.parse(raw);
+  const verification = workflow.jobs.verify_release_candidates.with;
+  for (const risk of ['cli_upgrade', 'session_continuity', 'relay_upgrade']) {
+    assert.match(String(verification[`risk_${risk}`]), /needs\.plan\.outputs\.risk_/);
+    assert.match(String(verification[`risk_${risk}`]), /inputs\.resume_run_id != ''/);
+  }
+});
+
 test('post-promotion verification receives the selected server runtime probe URL', async () => {
   const workflow = YAML.parse(await readFile(join(repoRoot, '.github', 'workflows', 'release.yml'), 'utf8'));
   assert.ok(workflow.jobs.release_verify.needs.includes('deploy_server'));

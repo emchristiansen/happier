@@ -1,4 +1,5 @@
 import * as React from 'react';
+import { isLatestVersionCheckDue } from '@/updates/latestVersionCheckFreshness';
 import {
     machineCapabilitiesDetect,
     type MachineCapabilitiesDetectResult,
@@ -132,6 +133,19 @@ function subscribe(cacheKey: string, cb: (state: MachineCapabilitiesCacheState) 
     };
 }
 
+/**
+ * Observe one machine's cached capabilities without fetching — for a surface that lists several
+ * machines at once and so cannot call the per-machine hook in a loop.
+ */
+export function subscribeMachineCapabilitiesCacheState(
+    machineId: string,
+    serverId: string | null | undefined,
+    cacheKeySalt: string | number | null | undefined,
+    listener: () => void,
+): () => void {
+    return subscribe(toCacheKey(machineId, serverId, cacheKeySalt), () => listener());
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
     return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -157,10 +171,47 @@ function withDurableDepVersionCheckTimestamp(result: CapabilityDetectResult): Ca
     };
 }
 
+/**
+ * K6 — an agent CLI's latest version is only in a detect that asked for it (`includeLatestVersion`).
+ * Other detects of the same `cli.<agent>` (the new-session picker, a machine page) replace the
+ * result without it; the answer is still true, so it is carried forward with the time it was
+ * learned (`latestVersionCheckedAt`), which the freshness policy reads instead of the newer
+ * result's `checkedAt`.
+ */
+function withDurableAgentLatestVersion(next: CapabilityDetectResult, prev: CapabilityDetectResult | undefined): CapabilityDetectResult {
+    if (!next.ok || !isPlainObject(next.data)) return next;
+    if (Object.prototype.hasOwnProperty.call(next.data, 'latestVersion')) {
+        if (typeof next.data.latestVersionCheckedAt === 'number') return next;
+        return { ...next, data: { ...next.data, latestVersionCheckedAt: next.checkedAt } };
+    }
+    if (!prev || !prev.ok || !isPlainObject(prev.data) || !Object.prototype.hasOwnProperty.call(prev.data, 'latestVersion')) return next;
+    const learnedAt = typeof prev.data.latestVersionCheckedAt === 'number' ? prev.data.latestVersionCheckedAt : prev.checkedAt;
+    return { ...next, data: { ...next.data, latestVersion: prev.data.latestVersion, latestVersionCheckedAt: learnedAt } };
+}
+
+/** A `cli.<agent>` request asking for the latest version is unmet by a cached result without it. */
+function isAgentLatestVersionMissing(results: Partial<Record<CapabilityId, CapabilityDetectResult>>, capabilityId: string): boolean {
+    const result = results[capabilityId as CapabilityId];
+    if (!result) return true;
+    // An errored probe was checked and failed: it is asked again on the failure cadence of the
+    // shared latest-version policy, not on every Updates request.
+    if (!result.ok) {
+        const checkedAt = typeof result.checkedAt === 'number' ? result.checkedAt : 0;
+        return checkedAt <= 0 || isLatestVersionCheckDue({ checkedAt, ok: false, now: Date.now() });
+    }
+    if (!isPlainObject(result.data)) return true;
+    // A daemon that predates K6 never answers it; asking again would not change the answer.
+    if (typeof result.data.updateSupported !== 'boolean') return false;
+    return !Object.prototype.hasOwnProperty.call(result.data, 'latestVersion');
+}
+
 function mergeCapabilityResult(id: CapabilityId, prev: CapabilityDetectResult | undefined, next: CapabilityDetectResult): CapabilityDetectResult {
     const normalizedPrev = prev ? withDurableDepVersionCheckTimestamp(prev) : undefined;
     const normalizedNext = withDurableDepVersionCheckTimestamp(next);
 
+    if (normalizedNext.ok && id.startsWith('cli.')) {
+        return withDurableAgentLatestVersion(normalizedNext, normalizedPrev);
+    }
     if (!normalizedPrev) return normalizedNext;
     if (!normalizedPrev.ok || !normalizedNext.ok) return normalizedNext;
 
@@ -274,6 +325,14 @@ function requestNeedsRefetchFromState(state: MachineCapabilitiesCacheState, requ
     for (const [capabilityId] of overrideEntries) {
         if (!capabilityId) continue;
         if (!results[capabilityId as CapabilityId]) {
+            return true;
+        }
+    }
+
+    for (const entry of requests) {
+        if (!entry?.id?.startsWith('cli.')) continue;
+        if (Boolean((entry.params as { includeLatestVersion?: unknown } | undefined)?.includeLatestVersion)
+            && isAgentLatestVersionMissing(results, entry.id)) {
             return true;
         }
     }

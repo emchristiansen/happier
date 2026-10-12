@@ -33,6 +33,29 @@ describe('migrateTrackedSessionProcessesOutOfDaemonServiceCgroup', () => {
     sandboxDir = null;
   });
 
+  it.each([
+    { startupSource: 'manual' as const, scopeName: 'session-6.scope' },
+    { startupSource: 'background-service' as const, scopeName: 'session-6.scope' },
+    { startupSource: 'manual' as const, scopeName: 'happier-daemon.default.service' },
+  ])('does not take custody of untracked siblings without service ownership ($startupSource/$scopeName)', async ({ startupSource, scopeName }) => {
+    sandboxDir = await mkdtemp(join(tmpdir(), 'happier-cgroup-shared-scope-'));
+    const procfsRootDir = join(sandboxDir, 'proc');
+    const cgroupRootDir = join(sandboxDir, 'sys', 'fs', 'cgroup');
+    const sharedScope = `/user.slice/user-501.slice/${scopeName}`;
+    await writeProcCgroup(procfsRootDir, 111, sharedScope);
+    await writeProcCgroup(procfsRootDir, 222, sharedScope);
+    await writeProcCgroup(procfsRootDir, 333, sharedScope);
+    await mkdir(join(cgroupRootDir, sharedScope), { recursive: true });
+    await writeFile(join(cgroupRootDir, sharedScope, 'cgroup.procs'), '111\n222\n333\n', 'utf8');
+
+    await expect(migrateTrackedSessionProcessesOutOfDaemonServiceCgroup({
+      trackedSessions: [{ pid: 333, startedBy: 'daemon', reattachedFromDiskMarker: true }],
+      daemonPid: 111, startupSource, procfsRootDir, cgroupRootDir,
+    })).resolves.toEqual([{
+      pid: 333, targetRelativePath: '/user.slice/user-501.slice/happier-session-333.scope',
+    }]);
+  });
+
   it('moves reattached daemon-started tracked session process trees out of the daemon service subtree into sibling scopes', async () => {
     sandboxDir = await mkdtemp(join(tmpdir(), 'happier-cgroup-migration-'));
     const procfsRootDir = join(sandboxDir, 'proc');
@@ -79,6 +102,7 @@ describe('migrateTrackedSessionProcessesOutOfDaemonServiceCgroup', () => {
     const migrated = await migrateTrackedSessionProcessesOutOfDaemonServiceCgroup({
       trackedSessions,
       daemonPid: 111,
+      startupSource: 'background-service',
       procfsRootDir,
       cgroupRootDir,
     });
@@ -287,6 +311,7 @@ describe('migrateTrackedSessionProcessesOutOfDaemonServiceCgroup', () => {
     const migrated = await migrateTrackedSessionProcessesOutOfDaemonServiceCgroup({
       trackedSessions: [],
       daemonPid: 111,
+      startupSource: 'background-service',
       procfsRootDir,
       cgroupRootDir,
     });

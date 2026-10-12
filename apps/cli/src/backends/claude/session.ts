@@ -1,3 +1,4 @@
+import { createClaudeSessionModelsReconciler } from './sessionModels/reconcileClaudeSessionModelsState';
 import { MessageQueue2 } from "@/agent/runtime/modeMessageQueue";
 import type { EnhancedMode } from "./loop";
 import { logger } from "@/ui/logger";
@@ -315,6 +316,7 @@ function buildClaudeReportedSessionMetadata(params: Readonly<{
 }
 
 export class Session {
+    readonly reconcileSessionModels = createClaudeSessionModelsReconciler();
     readonly connectedServiceAuthGroupRequestFence = new ClaudeConnectedServiceAuthGroupRequestFence();
     private unregisterConnectedServiceAuthGroupRuntimeControl: () => void = () => {};
     readonly path: string;

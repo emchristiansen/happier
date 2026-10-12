@@ -6,6 +6,7 @@ import { hasFlag, readCommandPositionals } from '@/cli/commands/shared/argvFlags
 import { createCliActionExecutorFromCredentials } from '@/session/actions/createCliActionExecutorFromCredentials';
 import { normalizeActionExecuteResult } from './shared/normalizeActionExecuteResult';
 import { tryHandleApprovalRequestCreated } from './shared/tryHandleApprovalRequestCreated';
+import { cmd, fail } from '@happier-dev/cli-common/output';
 
 export async function cmdSessionStatus(
   argv: string[],
@@ -24,7 +25,7 @@ export async function cmdSessionStatus(
       await printJsonEnvelope({ ok: false, kind: 'session_status', error: { code: 'not_authenticated' } });
       return;
     }
-    console.error(chalk.red('Error:'), 'Not authenticated. Run "happier auth login" first.');
+    console.error(fail(`Not signed in. Run ${cmd('happier auth login')} first.`));
     process.exit(1);
   }
 

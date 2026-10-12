@@ -15,10 +15,9 @@ describe('planServiceAction (schtasks install)', () => {
     });
 
     const create = plan.commands.find((command) =>
-      command.cmd === 'schtasks' && command.args.includes('/Create'));
-    // stop-if-running, /Create, apply service policy (restart + long-running
-    // hardening, which schtasks cannot express), /Run.
-    expect(plan.commands.map((command) => command.cmd)).toEqual(['powershell.exe', 'schtasks', 'powershell.exe', 'schtasks']);
+      command.cmd === 'powershell.exe' && String(command.args.at(-1)).includes('RegisterTask'));
+    // Stop-if-running, register, apply service policy, then explicitly run.
+    expect(plan.commands.map((command) => command.cmd)).toEqual(['powershell.exe', 'powershell.exe', 'powershell.exe', 'schtasks']);
     expect(plan.commands[0]?.args).toEqual(expect.arrayContaining([
       '-NoProfile',
       '-NonInteractive',
@@ -26,19 +25,23 @@ describe('planServiceAction (schtasks install)', () => {
     ]));
     expect(plan.commands[0]?.args.at(-1)).toContain('Stop-ScheduledTask');
     expect(create).toBeDefined();
-    expect(create?.args).toContain('/SC');
-    expect(create?.args).toContain('ONLOGON');
-    expect(create?.args).not.toContain('/IT');
-    expect(create?.args).toContain('/TR');
-    expect(create?.args[create.args.indexOf('/TR') + 1]).toBe('powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\\Users\\test\\.happier\\services\\happier-daemon.default.ps1"');
+    const registration = String(create?.args.at(-1) ?? '');
+    expect(registration).toContain('[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value');
+    expect(registration).toContain('<LogonTrigger><Enabled>true</Enabled><UserId>');
+    expect(registration).toContain('<LogonType>InteractiveToken</LogonType>');
+    expect(registration).toContain('<RunLevel>LeastPrivilege</RunLevel>');
+    expect(registration).toContain('<Command>powershell.exe</Command>');
+    expect(registration).toContain('-WindowStyle Hidden -File &quot;C:\\Users\\test\\.happier\\services\\happier-daemon.default.ps1&quot;');
+    expect(registration).toContain('$xml.Task.Triggers.LogonTrigger.UserId = $userId');
+    expect(registration).toContain('$xml.Task.Principals.Principal.UserId = $userId');
+    expect(registration).toContain('$folder.RegisterTask($taskName, $xml.OuterXml, 6, $userId, $null, 3, $null)');
   });
 
   /**
-   * `persistent: false` means "registered, startable, but nothing starts it for me". schtasks has
-   * no manual-only schedule, so the trigger has to be one that can never come due — and that must
-   * be stated in the definition, not inferred from the clock at install time.
+   * `persistent: false` means "registered, startable, but nothing starts it for me".
+   * A user task can be registered without any trigger; only an explicit Run starts it.
    */
-  it('registers a non-persistent task with a trigger that can never come due', () => {
+  it('registers a non-persistent task without an automatic trigger', () => {
     const plan = planServiceAction({
       backend: 'schtasks-user',
       action: 'install',
@@ -49,25 +52,14 @@ describe('planServiceAction (schtasks install)', () => {
       persistent: false,
     });
     const create = plan.commands.find((command) =>
-      command.cmd === 'schtasks' && command.args.includes('/Create'));
-    const args = create?.args ?? [];
+      command.cmd === 'powershell.exe' && String(command.args.at(-1)).includes('RegisterTask'));
+    const registration = String(create?.args.at(-1) ?? '');
+    expect(registration).toContain('<Triggers/>');
+    expect(registration).not.toContain('LogonTrigger');
+    expect(registration).not.toContain('TimeTrigger');
+    expect(registration).toContain('<LogonType>InteractiveToken</LogonType>');
 
-    expect(args).toContain('ONCE');
-    expect(args).not.toContain('ONLOGON');
-    expect(args).not.toContain('ONSTART');
-    // The start boundary is explicit and in the past. A scheduled-once task carries a start date
-    // that is still to come — or none at all, which defaults to the day of installation and is
-    // only "already past" because installs rarely happen at midnight.
-    expect(args).toContain('/SD');
-    const [first = '', second = '', year = ''] = (args[args.indexOf('/SD') + 1] ?? '').split('/');
-    expect(Number(year)).toBeLessThan(2001);
-    // Same calendar day whether the host reads MM/DD/YYYY or DD/MM/YYYY, so no regional format
-    // can turn this boundary into a future date.
-    expect(first).toBe(second);
-    expect(args[args.indexOf('/ST') + 1]).toBe('00:00');
-
-    // …and a start Task Scheduler may not catch up: `-StartWhenAvailable` runs a *missed*
-    // scheduled start as soon as possible, which is exactly what a past start boundary is.
+    // No scheduler catch-up in on-demand mode.
     const settings = plan.commands.find((entry) =>
       entry.cmd === 'powershell.exe'
       && String(entry.args.at(-1) ?? '').includes('New-ScheduledTaskSettingsSet'));
@@ -75,5 +67,27 @@ describe('planServiceAction (schtasks install)', () => {
     // The task is still started now, and still hardened for a long-running process.
     expect(plan.commands.some((entry) => entry.cmd === 'schtasks' && entry.args.includes('/Run'))).toBe(true);
     expect(String(settings?.args.at(-1) ?? '')).toContain('-ExecutionTimeLimit');
+  });
+
+  it('keeps elevated SYSTEM boot registration separate from current-user logon registration', () => {
+    const plan = planServiceAction({
+      backend: 'schtasks-system', action: 'install', label: 'relay',
+      definitionPath: 'C:\\ProgramData\\Happier\\relay.ps1', persistent: true,
+    });
+    const create = plan.commands.find((command) => command.cmd === 'schtasks' && command.args.includes('/Create'));
+    expect(create?.args).toEqual(expect.arrayContaining(['ONSTART', '/RU', 'SYSTEM', '/RL', 'HIGHEST']));
+  });
+
+  it('keeps XML and PowerShell metacharacters in a wrapper path literal', () => {
+    const path = "C:\\Users\\O'Brien & $qa\\relay.ps1";
+    const plan = planServiceAction({
+      backend: 'schtasks-user', action: 'install', label: 'relay',
+      definitionPath: path, persistent: true,
+    });
+    const registration = String(plan.commands.find((command) =>
+      String(command.args.at(-1)).includes('RegisterTask'))?.args.at(-1) ?? '');
+    expect(registration).toContain("[xml]$xml = '<Task");
+    expect(registration).toContain('O&apos;Brien &amp; $qa');
+    expect(registration).not.toContain('/SC');
   });
 });

@@ -1,12 +1,14 @@
-import { spawn } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('ps-list', () => ({
-  default: vi.fn().mockRejectedValue(new Error('process listing unavailable')),
+  default: vi.fn().mockRejectedValue(new Error('process listing unavailable: private-native-value')),
 }));
 
 import { killProcessTree } from './killProcessTree';
+import { isPidAlive, spawnInlineNodeParentWithChild, waitForProcessExit } from '@/testkit/process/spawn';
+import { logger } from '@/ui/logger';
 
 describe('killProcessTree process-list failure', () => {
   const spawnedPids = new Set<number>();
@@ -22,16 +24,22 @@ describe('killProcessTree process-list failure', () => {
     spawnedPids.clear();
   });
 
-  it('still terminates the known root without rejecting when descendant enumeration is unavailable', async () => {
-    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], { stdio: 'ignore' });
-    expect(child.pid).toBeTypeOf('number');
-    spawnedPids.add(child.pid!);
+  it('terminates the known root but rejects and records unverified descendant cleanup when process enumeration fails', async () => {
+    if (process.platform === 'win32') return; // The survivor falsifier uses POSIX subtree semantics.
+    const { parent, childPid } = await spawnInlineNodeParentWithChild();
+    spawnedPids.add(parent.pid!);
+    spawnedPids.add(childPid);
+    logger.flushSync();
+    const before = existsSync(logger.getLogPath()) ? readFileSync(logger.getLogPath(), 'utf8') : '';
 
-    await expect(killProcessTree(child, { graceMs: 250 })).resolves.toBeUndefined();
-
-    await vi.waitFor(() => {
-      expect(() => process.kill(child.pid!, 0)).toThrow();
-    }, { timeout: 3_000 });
-    spawnedPids.delete(child.pid!);
+    await expect(killProcessTree(parent, { graceMs: 250 })).rejects.toMatchObject({
+      code: 'process_tree_termination_incomplete',
+    });
+    await expect(waitForProcessExit(parent.pid!, { timeoutMs: 3_000 })).resolves.toBe(true);
+    expect(isPidAlive(childPid)).toBe(true);
+    logger.flushSync();
+    const diagnostic = readFileSync(logger.getLogPath(), 'utf8').slice(before.length);
+    expect(diagnostic).toContain('process_tree_termination_incomplete');
+    expect(diagnostic).not.toContain('private-native-value');
   });
 });

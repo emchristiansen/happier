@@ -50,7 +50,9 @@ async function createImmutableBuildSource({ packageRoot, buildVersion = '' }) {
   // TypeScript retain the package-local node_modules resolution ancestry.
   const snapshotRoot = await mkdtemp(join(packageRoot, '.tmp.hstack-cli-build-source.'));
   try {
-    for (const relativePath of ['package.json', 'tsconfig.json', 'tsconfig.build.json', 'src']) {
+    // Runtime imports resolve shipped sidecars from this generation's package
+    // root, so admission must use the same scripts as the compiled source.
+    for (const relativePath of ['package.json', 'tsconfig.json', 'tsconfig.build.json', 'src', 'scripts']) {
       const sourcePath = join(packageRoot, relativePath);
       if (!existsSync(sourcePath)) continue;
       await cp(sourcePath, join(snapshotRoot, relativePath), { recursive: true });
@@ -122,7 +124,7 @@ export function probeDistRuntimeImport(entrypoint, options = {}) {
     const stderr = String(result.stderr ?? '').trim();
     throw new Error(
       `CLI staged runtime import probe failed (code=${result.status}, signal=${result.signal ?? 'none'}).`
-      + (stderr ? `\n${stderr.split('\n').slice(-8).join('\n')}` : ''),
+      + (stderr ? `\n${stderr}` : ''),
     );
   }
 }

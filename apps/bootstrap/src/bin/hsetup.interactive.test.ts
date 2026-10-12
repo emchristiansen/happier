@@ -108,10 +108,17 @@ describe('runHsetupCli (interactive system tasks)', () => {
     ];
     const calls: string[] = [];
     const setupKind = createSetupThisComputerKind({
+      inspectCliChoice: async () => ({ choice: null, question: null }),
+      recordCliChoice: async () => {
+        calls.push('recordCliChoice');
+      },
+      removePathExposure: async () => ({ removed: false, failure: null }),
       ensureCli: async () => ({ command: '/managed/happier', provenance: 'managed', version: '0.2.13' }),
       previewServiceInstall: async () => ({ takeover: null, installConflict: null }),
       readDaemonStatus: async () => ({ serviceInstalled: false, daemonRunning: false, serverComparableKey: null }),
       configureRelay: async (_ring, profile) => ({ serverUrl: profile.serverUrl, comparableKey: 'relay.example.test' }),
+      registerRelayProfile: async () => ({ id: 'relay-profile' }),
+      readPinnedServiceInventory: async () => ({ listed: true, coexistence: true, relayUrls: [] }),
       readAuthStatus: async () => ({ authenticated: false, accountId: null, machineId: null }),
       requestAuthPairing: async () => ({
         publicKey: 'cHVibGljLWtleQ==',

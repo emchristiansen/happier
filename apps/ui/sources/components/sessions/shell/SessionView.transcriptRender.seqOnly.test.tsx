@@ -579,10 +579,9 @@ vi.mock('@/sync/domains/permissions/permissionModeApply', () => ({
 vi.mock('@/sync/domains/sessionControl/sessionModeControl', () => ({
     supportsSessionModeOverrides: () => false,
 }));
-vi.mock('@/sync/domains/session/control/localControlSwitch', () => ({
+vi.mock('@/sync/domains/session/control/localControlSwitch', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/sync/domains/session/control/localControlSwitch')>()),
     shouldRenderChatTimelineForSession: (args: any) => shouldRenderChatTimelineForSessionMock(args),
-    shouldRequestRemoteControl: () => false,
-    shouldRequestRemoteControlAfterPendingEnqueue: () => false,
 }));
 vi.mock('@/sync/runtime/time', () => ({
     nowServerMs: () => 0,

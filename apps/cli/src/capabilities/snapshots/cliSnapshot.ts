@@ -28,6 +28,11 @@ export interface DetectCliRequest {
     includeLoginStatus?: boolean;
     bypassCache?: boolean;
     requestedCliNames?: readonly DetectCliName[];
+    /**
+     * Probe versions with the slow-probe budget instead of the ambient one. Used to
+     * verify an update, where a slow `--version` must not read as "no version".
+     */
+    verifyVersion?: boolean;
 }
 
 export interface DetectCliEntry {
@@ -99,8 +104,8 @@ const DEFAULT_CLI_SNAPSHOT_PROBE_TIMEOUT_MS = process.env.CI ? 3_000 : 1_500;
 const DEFAULT_CLI_SNAPSHOT_LOGIN_STATUS_PROBE_TIMEOUT_MS = process.env.CI ? 7_000 : 6_500;
 const CLI_SNAPSHOT_PROBE_TIMEOUT = Symbol('CLI_SNAPSHOT_PROBE_TIMEOUT');
 
-function resolveCliSnapshotProbeTimeoutMs(includeLoginStatus: boolean): number {
-    if (includeLoginStatus) {
+function resolveCliSnapshotProbeTimeoutMs(slowProbes: boolean): number {
+    if (slowProbes) {
         const rawLoginStatus = process.env.HAPPIER_CLI_SNAPSHOT_LOGIN_STATUS_PROBE_TIMEOUT_MS;
         const parsedLoginStatus = typeof rawLoginStatus === 'string' ? Number(rawLoginStatus) : Number.NaN;
         if (Number.isFinite(parsedLoginStatus) && parsedLoginStatus > 0) {
@@ -113,7 +118,7 @@ function resolveCliSnapshotProbeTimeoutMs(includeLoginStatus: boolean): number {
     if (Number.isFinite(parsed) && parsed > 0) {
         return parsed;
     }
-    return includeLoginStatus
+    return slowProbes
         ? DEFAULT_CLI_SNAPSHOT_LOGIN_STATUS_PROBE_TIMEOUT_MS
         : DEFAULT_CLI_SNAPSHOT_PROBE_TIMEOUT_MS;
 }
@@ -136,6 +141,7 @@ async function withCliSnapshotProbeTimeout<T>(promise: Promise<T>, timeoutMs: nu
 
 function buildCliSnapshotCacheKey(params: DetectCliRequest, pathEnv: string | null): string {
     const includeLoginStatus = params.includeLoginStatus === true ? '1' : '0';
+    const verifyVersion = params.verifyVersion === true ? '1' : '0';
     const requestedCliNames = Array.isArray(params.requestedCliNames)
         ? params.requestedCliNames.map((value) => String(value)).sort().join(',')
         : '';
@@ -154,7 +160,12 @@ function buildCliSnapshotCacheKey(params: DetectCliRequest, pathEnv: string | nu
         : '';
 
     // Include all HAPPIER_*_PATH overrides for known agents
-    const agentIds = Object.keys(AGENTS);
+    const agentIds = Object.keys(AGENTS) as DetectCliName[];
+    const resolutionEnvKeys = new Set(agentIds.flatMap((id) =>
+        (getProviderCliRuntimeSpec(id).knownCommandCandidates ?? [])
+            .flatMap((candidate) => candidate.kind === 'envBinDir' ? [candidate.envVar] : []),
+    ));
+    const resolutionEnv = JSON.stringify([...resolutionEnvKeys].map((key) => [key, process.env[key] ?? '']));
     const pathOverrides = agentIds
         .map((id) => {
             const envKey = `HAPPIER_${id.toUpperCase()}_PATH`;
@@ -162,7 +173,7 @@ function buildCliSnapshotCacheKey(params: DetectCliRequest, pathEnv: string | nu
         })
         .join(':');
 
-    return `${includeLoginStatus}:${requestedCliNames}:${pathExt}:${path}:${home}:${userProfile}:${happierHomeDir}:${sourcePrefs}:${authEnvFingerprint}:${pathOverrides}`;
+    return `${includeLoginStatus}:${verifyVersion}:${requestedCliNames}:${pathExt}:${path}:${home}:${userProfile}:${happierHomeDir}:${sourcePrefs}:${authEnvFingerprint}:${pathOverrides}:${resolutionEnv}`;
 }
 
 async function resolveCommandOnPath(command: string, pathEnv: string | null): Promise<string | null> {
@@ -377,11 +388,13 @@ async function resolveCliBinaryNames(name: DetectCliName): Promise<readonly stri
     return [name];
 }
 
-async function detectCliVersion(params: { name: DetectCliName; resolvedPath: string }): Promise<string | null> {
+async function detectCliVersion(params: { name: DetectCliName; resolvedPath: string; verifyVersion: boolean; probeTimeoutMs: number }): Promise<string | null> {
     // Best-effort, must never throw.
     try {
-        // Keep this short (runs in parallel for multiple CLIs), but give enough headroom for slower systems.
-        const timeoutMs = process.env.CI ? 2500 : 1200;
+        // Ambient listing keeps each attempt short (runs in parallel for many CLIs) so one retry
+        // fits in the probe budget. Verification gives an attempt the whole (slow) budget: a
+        // slow `--version` right after an install must not read as "no version".
+        const timeoutMs = params.verifyVersion ? params.probeTimeoutMs : (process.env.CI ? 2500 : 1200);
         const isWindows = process.platform === 'win32';
         const isCmdScript = isWindows && /\.(cmd|bat)$/i.test(params.resolvedPath);
         const needsJavaScriptRuntime = providerCliPathRequiresJavaScriptRuntime(params.resolvedPath);
@@ -604,6 +617,14 @@ async function resolveCliPathForName(
 }
 
 /**
+ * Drops every cached snapshot. Called after something changed an installed CLI (an update),
+ * so the next ordinary detect reports what is installed now rather than a pre-change snapshot.
+ */
+export function invalidateCliSnapshots(): void {
+    cliSnapshotCache.clear();
+}
+
+/**
  * CLI status snapshot - checks whether CLIs are resolvable on daemon PATH.
  *
  * This is more reliable than the `bash` RPC for "is CLI installed?" checks because it:
@@ -613,11 +634,12 @@ async function resolveCliPathForName(
 export async function detectCliSnapshotOnDaemonPath(data: DetectCliRequest): Promise<DetectCliSnapshot> {
     const pathEnv = typeof process.env.PATH === 'string' ? process.env.PATH : null;
     const includeLoginStatus = Boolean(data?.includeLoginStatus);
+    const verifyVersion = data?.verifyVersion === true;
     const requestedCliNames = Array.isArray(data?.requestedCliNames)
         ? data.requestedCliNames.filter((name): name is DetectCliName => typeof name === 'string' && Object.prototype.hasOwnProperty.call(AGENTS, name))
         : [];
-    const probeTimeoutMs = resolveCliSnapshotProbeTimeoutMs(includeLoginStatus);
-    const cacheKey = buildCliSnapshotCacheKey({ includeLoginStatus, requestedCliNames }, pathEnv);
+    const probeTimeoutMs = resolveCliSnapshotProbeTimeoutMs(includeLoginStatus || verifyVersion);
+    const cacheKey = buildCliSnapshotCacheKey({ includeLoginStatus, requestedCliNames, verifyVersion }, pathEnv);
     const cached = data?.bypassCache ? null : cliSnapshotCache.get(cacheKey);
     if (!data?.bypassCache && cached?.kind === 'success' && cliSnapshotCache.isFresh(cached)) return cached.value;
 
@@ -640,7 +662,7 @@ export async function detectCliSnapshotOnDaemonPath(data: DetectCliRequest): Pro
 
             const [versionResult, authStatusResult, resolvedCommandResult] = await Promise.all([
                 withCliSnapshotProbeTimeout(
-                    detectCliVersion({ name, resolvedPath }),
+                    detectCliVersion({ name, resolvedPath, verifyVersion, probeTimeoutMs }),
                     probeTimeoutMs,
                 ),
                 includeLoginStatus

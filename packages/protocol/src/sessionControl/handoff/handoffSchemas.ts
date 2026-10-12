@@ -25,7 +25,6 @@ const MAX_MACHINE_ID_LENGTH = 256;
 const MAX_PATH_LENGTH = 4096;
 const MAX_TRANSFER_ID_LENGTH = 512;
 const MAX_MANIFEST_HASH_LENGTH = 256;
-const MAX_ENDPOINT_CANDIDATES = 20;
 const MAX_PREFERRED_TRANSPORT_STRATEGIES = 4;
 const MAX_INCLUDE_GLOBS = 128;
 const MAX_SOURCE_CONTROLLER_METADATA_KEYS = 50;
@@ -56,7 +55,8 @@ const SessionHandoffProviderBundleTransferPublicationSchema = z
     transferId: z.string().min(1).max(MAX_TRANSFER_ID_LENGTH),
     sizeBytes: z.number().int().min(0),
     manifestHash: z.string().min(1).max(MAX_MANIFEST_HASH_LENGTH),
-    endpointCandidates: z.array(TransferEndpointCandidateSchema).max(MAX_ENDPOINT_CANDIDATES).readonly().optional(),
+    // Hosts may advertise many network interfaces; validate each endpoint without dropping routes.
+    endpointCandidates: z.array(TransferEndpointCandidateSchema).readonly().optional(),
   })
   .strict();
 export type SessionHandoffProviderBundleTransferPublication = z.infer<
@@ -66,7 +66,7 @@ export type SessionHandoffProviderBundleTransferPublication = z.infer<
 const SessionHandoffWorkspaceReplicationManifestTransferPublicationSchema = z
   .object({
     transferId: z.string().min(1).max(MAX_TRANSFER_ID_LENGTH),
-    endpointCandidates: z.array(TransferEndpointCandidateSchema).max(MAX_ENDPOINT_CANDIDATES).readonly().optional(),
+    endpointCandidates: z.array(TransferEndpointCandidateSchema).readonly().optional(),
   })
   .strict();
 export type SessionHandoffWorkspaceReplicationManifestTransferPublication = z.infer<
@@ -160,7 +160,6 @@ export const SessionHandoffPrepareTargetRequestSchema = z
     targetPath: z.string().min(1).max(MAX_PATH_LENGTH),
     endpointCandidates: z
       .array(TransferEndpointCandidateSchema)
-      .max(MAX_ENDPOINT_CANDIDATES)
       .readonly()
       .default(() => []),
     handoffMetadataV2: SessionHandoffMetadataV2Schema.optional(),
@@ -242,7 +241,6 @@ export const SessionHandoffStartResponseSchema = z
     status: SessionHandoffStatusSchema,
     endpointCandidates: z
       .array(TransferEndpointCandidateSchema)
-      .max(MAX_ENDPOINT_CANDIDATES)
       .readonly()
       .default(() => []),
     targetPath: z.string().min(1).max(MAX_PATH_LENGTH),

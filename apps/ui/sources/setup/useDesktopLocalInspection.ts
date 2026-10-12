@@ -24,19 +24,35 @@ export type DesktopLocalInspectionState = Readonly<{
  * title it read at app open and the settings row beside a just-repaired daemon still said it was
  * not running.
  */
-export function useDesktopLocalInspection(enabled: boolean): DesktopLocalInspectionState {
+export function useDesktopLocalInspection(
+    enabled: boolean,
+    options: Readonly<{
+        /**
+         * Re-read once when this reader opens, after the shared read settles — for a surface the
+         * person opens to look at this computer (Settings › This computer), where facts found since
+         * app open (a CLI update the daily background check discovered) must show. One read per
+         * mount; nothing repeats it.
+         */
+        refreshOnOpen?: boolean;
+    }> = {},
+): DesktopLocalInspectionState {
     const inspection = React.useSyncExternalStore(
         desktopSetupCoordinator.subscribe,
         desktopSetupCoordinator.readInspectionSnapshot,
         desktopSetupCoordinator.readInspectionSnapshot,
     );
+    const refreshOnOpen = options.refreshOnOpen === true;
     React.useEffect(() => {
         if (!enabled) {
             return;
         }
-        // Whoever mounts first starts the one read; everyone after joins it.
-        void desktopSetupCoordinator.inspect();
-    }, [enabled]);
+        // Whoever mounts first starts the one read; everyone after joins it. A reader that re-reads
+        // on open waits for it, so the two never run side by side.
+        const shared = desktopSetupCoordinator.inspect();
+        if (refreshOnOpen) {
+            void shared.then(() => desktopSetupCoordinator.inspect({ fresh: true }));
+        }
+    }, [enabled, refreshOnOpen]);
     const refresh = React.useCallback(() => {
         void desktopSetupCoordinator.inspect({ fresh: true });
     }, []);

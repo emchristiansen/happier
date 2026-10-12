@@ -22,6 +22,7 @@ import type {
 } from './pendingQueueV2Transport';
 import type {
   PendingProviderAction,
+  PendingRequestedActionV1,
   SessionTranscriptObservationProvenanceV1,
   SessionPendingQueueDeliveryTiming,
   SessionSystemRecord,
@@ -76,6 +77,7 @@ export type SessionUserMessageDeliveryInfo = Readonly<{
   seq: number | null;
   providerAcceptancePending?: boolean | undefined;
   pendingProviderAction?: PendingProviderAction | undefined;
+  pendingRequestedAction?: PendingRequestedActionV1 | undefined;
 }>;
 
 export interface SessionClientPort {
@@ -111,6 +113,7 @@ export interface SessionClientPort {
   hasActiveCanonicalTurn?(): boolean;
   fetchCommittedClaudeJsonlMessageBaseline?(opts?: { take?: number }): Promise<import('@/backends/claude/utils/claudeJsonlMessageKey').CommittedClaudeJsonlMessageBaseline>;
   fetchRecentTranscriptTextItemsForAcpImport?(opts?: { take?: number }): Promise<Array<{ role: 'user' | 'agent'; text: string }>>;
+  fetchCommittedTranscriptIdentitySnapshot?(): Promise<import('./transcriptQueries').CommittedTranscriptIdentitySnapshot>;
   sendAgentMessage(provider: ACPProvider, body: ACPMessageData, opts?: { localId?: string; meta?: Record<string, unknown> }): void;
   sendAgentMessageCommitted(provider: ACPProvider, body: ACPMessageData, opts: { localId: string; meta?: Record<string, unknown> }): Promise<void>;
   sendAgentMessageEphemeral?(

@@ -18,6 +18,12 @@ export type TerminalAttachPlan =
       paneId?: string;
     }
   | {
+      type: 'herdr';
+      sessionName: string;
+      socketPath: string;
+      terminalId: string;
+    }
+  | {
       type: 'tmux';
       sessionName: string;
       target: string;
@@ -105,6 +111,16 @@ export function createTerminalAttachPlan(params: {
       sessionName: sessionName.trim(),
       ...(typeof paneId === 'string' && paneId.trim().length > 0 ? { paneId: paneId.trim() } : {}),
     };
+  }
+
+  if (params.terminal.mode === 'herdr') {
+    const sessionName = params.terminal.herdr?.sessionName?.trim();
+    const socketPath = params.terminal.herdr?.socketPath?.trim();
+    const terminalId = params.terminal.herdr?.terminalId?.trim();
+    if (!sessionName || !socketPath || !terminalId) {
+      return { type: 'not-attachable', reason: 'Session does not include a complete Herdr terminal identity.' };
+    }
+    return { type: 'herdr', sessionName, socketPath, terminalId };
   }
 
   const target = params.terminal.tmux?.target;

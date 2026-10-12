@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createNumericPlanetFrame } from '../../packages/cli-common/numericPlanetFrame.mjs';
+import { createPlanetFrame } from '../../packages/cli-common/planetFrame.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const installerPath = join(resolve(here, '..', '..'), 'scripts', 'release', 'installers', 'install.ps1');
@@ -26,10 +26,16 @@ test('install.ps1 presents the compact branded header and truthful install stage
   const bashRowsBlock = bashSource.match(/HAPPIER_INSTALLER_ART_ROWS=\(([\s\S]*?)\n\)/)?.[1];
   assert.ok(powershellRowsBlock, 'expected PowerShell artwork rows');
   assert.ok(bashRowsBlock, 'expected Bash artwork rows');
-  const powershellRows = [...powershellRowsBlock.matchAll(/^\s*'([^']*)',?$/gm)].map((match) => match[1]);
+  // PowerShell 5.1 may decode a downloaded script with a legacy code page, so the
+  // generated planet spells every Braille cell as a code point and stays ASCII.
+  const planetBlock = header.match(/# BEGIN GENERATED PLANET[\s\S]*?# END GENERATED PLANET/)?.[0] ?? '';
+  assert.match(planetBlock, /\[char\]0x28[0-9a-f]{2}/);
+  assert.doesNotMatch(planetBlock, /[^\x00-\x7f]/u);
+  const powershellRows = [...powershellRowsBlock.matchAll(/^\s*"([^"]*)",?$/gm)]
+    .map((match) => match[1].replace(/\$\(\[char\]0x([0-9a-f]{4})\)/gu, (_, code) => String.fromCharCode(parseInt(code, 16))));
   const bashRows = [...bashRowsBlock.matchAll(/^\s*'([^']*)'$/gm)].map((match) => match[1]);
-  const expectedRows = createNumericPlanetFrame({ columns: 28, seconds: 1.6 })
-    .map((row) => row.map((cell) => cell?.digit ?? ' ').join(''));
+  const expectedRows = createPlanetFrame({ columns: 28 })
+    .map((row) => row.map((cell) => cell?.ch ?? ' ').join(''));
   assert.deepEqual(powershellRows, expectedRows);
   assert.deepEqual(powershellRows, bashRows, 'expected PowerShell and Bash installers to share one visual identity');
   assert.match(header, /Happier/);
@@ -37,7 +43,12 @@ test('install.ps1 presents the compact branded header and truthful install stage
   assert.match(header, /Test-InstallerRichHeaderAvailable/);
   assert.match(header, /Write-Host "Happier"/);
   assert.match(header, /\[1m/);
-  assert.ok(powershellRows.every((row) => row.length === 28), 'expected labels to start at one fixed column');
+  assert.ok(powershellRows.every((row) => [...row].length === 28), 'expected labels to start at one fixed column');
+  // The legacy console host has no Braille glyphs; only hosts that can draw them get the art.
+  assert.match(header, /-not \(Test-InstallerBrailleArtAvailable\)/);
+  const braille = extractFunction(source, 'Test-InstallerBrailleArtAvailable');
+  assert.match(braille, /\$env:WT_SESSION/);
+  assert.match(braille, /\$env:TERM_PROGRAM/);
   assert.doesNotMatch(header, /Dark(?:Red|Blue|Magenta|Cyan|Yellow)/, 'expected readable colors on dark terminals');
 
   const richOutput = extractFunction(source, 'Test-InstallerRichHeaderAvailable');

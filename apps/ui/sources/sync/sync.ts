@@ -1,4 +1,5 @@
 import Constants from 'expo-constants';
+import { parsePermissionIntentAlias, resolvePermissionIntentFromSessionMetadata } from '@happier-dev/agents';
 import { apiSocket } from '@/sync/api/session/apiSocket';
 import { ensureSessionRuntimeForPendingInput } from '@/sync/ops';
 import { shouldDelegatePendingActivationToDaemon } from '@/sync/domains/session/input/pendingActivationWakeDecision';
@@ -9,6 +10,7 @@ import {
     ClientVersionCheckResponseV1Schema,
     SESSION_USER_MESSAGE_DELIVERY_INTENT_META_KEY,
     isRecoveredHistoryTranscriptObservationProvenance,
+    projectSessionMetadataForWire,
     readPendingLocalId,
     type DirectTranscriptRawMessageV1,
     type DirectTranscriptTruncationReason,
@@ -2561,35 +2563,8 @@ class Sync {
         });
 
         try {
-            const publishNextPromptPermissionModeIfNeeded = async (): Promise<void> => {
-                const settingsApplyTiming = storage.getState().settings.sessionPermissionModeApplyTiming ?? 'immediate';
-                if (settingsApplyTiming !== 'next_prompt') {
-                    return;
-                }
-
-                const latestSession = storage.getState().sessions[sessionId] ?? null;
-                const localUpdatedAt = latestSession?.permissionModeUpdatedAt ?? null;
-                const metadataUpdatedAtRaw = latestSession?.metadata?.permissionModeUpdatedAt ?? null;
-                const metadataUpdatedAt =
-                    typeof metadataUpdatedAtRaw === 'number' && Number.isFinite(metadataUpdatedAtRaw)
-                        ? metadataUpdatedAtRaw
-                        : 0;
-
-                if (!(typeof localUpdatedAt === 'number' && Number.isFinite(localUpdatedAt) && localUpdatedAt > metadataUpdatedAt)) {
-                    return;
-                }
-
-                const modeToPublish = (latestSession?.permissionMode ?? 'default') as PermissionMode;
-                try {
-                    await this.publishSessionPermissionModeToMetadata({
-                        sessionId,
-                        permissionMode: modeToPublish,
-                        permissionModeUpdatedAt: localUpdatedAt,
-                    });
-                } catch {
-                    // Best-effort only: sending messages must not fail due to metadata publish failures.
-                }
-            };
+            const permissionPublicationScope = getActiveServerAccountScope();
+            const isPermissionPublicationScopeCurrent = this.createServerScopeGuard();
 
             // Read permission mode from session state
             const permissionMode = session.permissionMode || 'default';
@@ -2627,6 +2602,12 @@ class Sync {
                 settings: storage.getState().settings,
                 session,
                 metaOverrides,
+            });
+            const publishNextPromptPermissionModeIfNeeded = () => this.publishNextPromptPermissionModeAfterAdmission({
+                sessionId,
+                admittedPermissionMode: content.meta?.permissionMode,
+                expectedAccountScope: permissionPublicationScope,
+                isCurrent: isPermissionPublicationScopeCurrent,
             });
 
             const messagePayload =
@@ -3311,7 +3292,7 @@ class Sync {
     private async updateSessionMetadataWithRetry(
         sessionId: string,
         updater: (metadata: Metadata) => Metadata,
-        options?: Readonly<{ serverId?: string | null }>,
+        options?: Readonly<{ serverId?: string | null; shouldContinue?: () => boolean }>,
     ): Promise<void> {
         const resolvedServerIdOverride =
             typeof options?.serverId === 'string' && options.serverId.trim().length > 0
@@ -3366,7 +3347,7 @@ class Sync {
             },
             encryptMetadata: async (metadata) => {
                 if (patchContext.sessionEncryptionMode === 'plain') {
-                    return JSON.stringify(metadata);
+                    return JSON.stringify(projectSessionMetadataForWire(metadata));
                 }
                 if (!patchContext.encryption) {
                     throw new Error(`Session ${sessionId} not found`);
@@ -3405,6 +3386,7 @@ class Sync {
             },
             updater,
             maxAttempts: 8,
+            shouldContinue: options?.shouldContinue,
         });
     }
 
@@ -3508,13 +3490,50 @@ class Sync {
         sessionId: string;
         permissionMode: PermissionMode;
         permissionModeUpdatedAt: number;
+        shouldContinue?: () => boolean;
     }): Promise<void> {
         await publishPermissionModeToMetadataEngine({
             sessionId: params.sessionId,
             permissionMode: params.permissionMode,
             permissionModeUpdatedAt: params.permissionModeUpdatedAt,
-            updateSessionMetadataWithRetry: (sessionId, updater) => this.updateSessionMetadataWithRetry(sessionId, updater),
+            updateSessionMetadataWithRetry: (sessionId, updater) => this.updateSessionMetadataWithRetry(sessionId, updater, { shouldContinue: params.shouldContinue }),
         });
+    }
+
+    async publishNextPromptPermissionModeAfterAdmission(params: Readonly<{
+        sessionId: string;
+        admittedPermissionMode: unknown;
+        expectedAccountScope: ServerAccountScope | null;
+        isCurrent?: () => boolean;
+    }>): Promise<boolean> {
+        const admitted = typeof params.admittedPermissionMode === 'string'
+            ? parsePermissionIntentAlias(params.admittedPermissionMode) : null;
+        if (!admitted || storage.getState().settings.sessionPermissionModeApplyTiming !== 'next_prompt') return false;
+        const isServerScopeCurrent = this.createServerScopeGuard();
+        const shouldContinue = () => {
+            const latest = storage.getState().sessions[params.sessionId];
+            return isServerScopeCurrent()
+                && params.isCurrent?.() !== false
+                && areServerAccountScopesEqual(params.expectedAccountScope, getActiveServerAccountScope())
+                && (typeof latest?.permissionMode === 'string' ? parsePermissionIntentAlias(latest.permissionMode) : 'default') === admitted;
+        };
+        if (!shouldContinue()) return false;
+        const latest = storage.getState().sessions[params.sessionId];
+        const updatedAt = latest?.permissionModeUpdatedAt;
+        const committed = resolvePermissionIntentFromSessionMetadata(latest?.metadata);
+        if (!(typeof updatedAt === 'number' && Number.isFinite(updatedAt) && updatedAt > (committed?.updatedAt ?? 0))) return false;
+        try {
+            await this.publishSessionPermissionModeToMetadata({
+                sessionId: params.sessionId,
+                permissionMode: admitted,
+                permissionModeUpdatedAt: updatedAt,
+                shouldContinue,
+            });
+            return shouldContinue();
+        } catch (error) {
+            console.warn('[sync] Could not publish the admitted permission intent', error);
+            return false;
+        }
     }
 
     async publishSessionAcpSessionModeOverrideToMetadata(params: {
@@ -5068,8 +5087,6 @@ class Sync {
                 storage.getState().replaceMachineDisplays(machines, { sourceServerId });
             },
             machineDisplayHydrationConcurrencyLimit: this.syncTuning.machineDisplayHydrationConcurrencyLimit,
-            machineDisplayEagerHydrationCount: this.syncTuning.machineDisplayEagerHydrationCount,
-            machineDisplayBackgroundHydrationMaxRows: this.syncTuning.machineDisplayBackgroundHydrationMaxRows,
             machineDisplayBackgroundHydrationApplyBatchSize: this.syncTuning.machineDisplayBackgroundHydrationApplyBatchSize,
             applyMachines: (machines, replace) => {
                 if (!shouldContinue()) return;

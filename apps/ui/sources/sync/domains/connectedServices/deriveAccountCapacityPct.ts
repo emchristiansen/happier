@@ -1,6 +1,6 @@
 import { clampQuotaPct } from './deriveQuotaUtilizationPct';
 
-export type AccountCapacityMeterRow = Readonly<{ remainingPct: number }>;
+export type AccountCapacityMeterRow = Readonly<{ remainingPct: number | null }>;
 
 /**
  * Derive an account's capacity as the MINIMUM remaining percentage across its

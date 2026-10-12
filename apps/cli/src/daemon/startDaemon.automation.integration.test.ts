@@ -229,7 +229,7 @@ const harness = vi.hoisted(() => {
     }),
     connect: vi.fn((params?: { onConnect?: () => void | Promise<void> }) => {
       // Simulate a reconnect so we can assert automation assignment refresh isn't
-      // blocked after the one-time metadata refresh.
+      // blocked after the per-connection metadata refresh.
       void params?.onConnect?.();
       void params?.onConnect?.();
     }),
@@ -599,7 +599,8 @@ vi.mock('./lifecycle/heartbeat', () => ({
   startDaemonHeartbeatLoop: vi.fn(() => setInterval(() => {}, 60_000)),
 }));
 
-vi.mock('@/projectPath', () => ({
+vi.mock('@/projectPath', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/projectPath')>(),
   projectPath: vi.fn(() => '/tmp/project'),
 }));
 
@@ -1119,9 +1120,11 @@ describe('startDaemon automation wiring (integration)', () => {
 
       vi.mocked(resolveCatalogAgentId).mockReturnValue('claude');
       vi.mocked(shouldResolveConnectedServiceAuthForSpawn).mockReturnValue(true);
-      vi.mocked(waitForSessionWebhook).mockResolvedValueOnce({
-        type: 'success',
-        sessionId: 'sess-claude-reachable',
+      const actualWaiter = await vi.importActual<typeof import('./spawn/waitForSessionWebhook')>('./spawn/waitForSessionWebhook');
+      vi.mocked(waitForSessionWebhook).mockImplementationOnce((params) => {
+        const completion = actualWaiter.waitForSessionWebhook(params);
+        queueMicrotask(() => params.pidToAwaiter.get(params.pid)?.({ pid: params.pid, startedBy: 'daemon', happySessionId: 'sess-claude-reachable' }));
+        return completion;
       });
       vi.mocked(resolveConnectedServiceAuthForSpawn).mockResolvedValueOnce({
         env: { CLAUDE_CONFIG_DIR: '/tmp/materialized/claude/claude-config' },
@@ -1618,7 +1621,7 @@ describe('startDaemon automation wiring (integration)', () => {
       );
       expect(harness.apiMachine.setRPCHandlers).toHaveBeenCalledTimes(1);
       expect(harness.apiMachine.connect).toHaveBeenCalledTimes(1);
-      expect(harness.apiMachine.updateMachineMetadata).toHaveBeenCalledTimes(1);
+      expect(harness.apiMachine.updateMachineMetadata).toHaveBeenCalledTimes(2);
       expect(harness.automationWorkerRefreshAssignments).toHaveBeenCalledTimes(2);
       await waitForCondition(
         () => harness.automationWorkerStop.mock.calls.length >= 1,
@@ -3891,6 +3894,15 @@ describe('startDaemon automation wiring (integration)', () => {
     try {
       const { startDaemon } = await import('./startDaemon');
       const { buildHappySessionControlArgs } = await import('./sessionSpawnArgs');
+      const { waitForSessionWebhook } = await import('./spawn/waitForSessionWebhook');
+      const actualWaiter = await vi.importActual<typeof import('./spawn/waitForSessionWebhook')>('./spawn/waitForSessionWebhook');
+      vi.mocked(waitForSessionWebhook).mockImplementationOnce((params) => {
+        const completion = actualWaiter.waitForSessionWebhook(params);
+        queueMicrotask(() => params.pidToAwaiter.get(params.pid)?.({
+          pid: params.pid, startedBy: 'daemon', happySessionId: 'sess-settings-version-hint',
+        }));
+        return completion;
+      });
 
       const run = startDaemon();
       await waitForCondition(

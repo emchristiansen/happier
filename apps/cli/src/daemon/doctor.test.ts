@@ -67,6 +67,15 @@ describe('classifyHappyProcess', () => {
     expect(res!.type).toBe('dev-daemon');
   });
 
+  it('classifies ordinary foreground source runners as sessions without requiring unsafe provider flags', () => {
+    const res = classifyHappyProcess({
+      pid: 123,
+      name: 'node',
+      cmd: '/usr/bin/node --import /repo/node_modules/tsx/dist/esm/index.mjs /repo/apps/cli/src/index.ts claude --model sonnet --permission-mode read_only',
+    });
+    expect(res?.type).toBe('dev-session');
+  });
+
   it('preserves daemon ownership scope extracted from the process environment', () => {
     const res = classifyHappyProcess({
       pid: 123,

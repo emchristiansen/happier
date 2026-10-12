@@ -8,6 +8,9 @@ import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import { createApiSessionSocketStub, bindApiSessionSocketPairMock } from '@/testkit/backends/apiSessionSocketHarness';
 import { createPlainSessionFixture } from '@/testkit/backends/sessionFixtures';
 import { createSessionProviderInputConsumer } from './SessionProviderInputConsumer';
+import { waitForNextPermissionModeMessage } from '../waitForNextPermissionModeMessage';
+import { createRuntimeOverrideSynchronizers } from '../createRuntimeOverrideSynchronizers';
+import { createTestMetadata } from '@/testkit/backends/sessionMetadata';
 
 const { mockIo } = vi.hoisted(() => ({ mockIo: vi.fn() }));
 // Only network transports are replaced; the client, wake and drain owners stay real.
@@ -23,6 +26,98 @@ describe('active-turn pending wake recovery', () => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     vi.useRealTimers();
+  });
+
+  it('applies idle metadata controls through the shared consumer without granting Pending eligibility', async () => {
+    const testHome = await mkdtemp(join(tmpdir(), 'happier-idle-control-wake-'));
+    vi.stubEnv('HAPPIER_HOME_DIR', testHome);
+    const { reloadConfiguration } = await import('@/configuration');
+    reloadConfiguration();
+    const { ApiSessionClient } = await import('@/api/session/sessionClient');
+    const sessionSocket = createApiSessionSocketStub();
+    const userSocket = createApiSessionSocketStub();
+    sessionSocket.connect.mockImplementation(() => sessionSocket);
+    userSocket.connect.mockImplementation(() => userSocket);
+    bindApiSessionSocketPairMock(mockIo, { sessionSocket, userSocket, fallbackSocket: sessionSocket });
+    const client = new ApiSessionClient('test-token', {
+      ...createPlainSessionFixture({ id: 'idle-control-session' }),
+      pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 0,
+    });
+    // Observe the real materializer without replacing its domain or eligibility policy.
+    const materialize = vi.spyOn(client, 'materializeNextPendingMessageSafely');
+    const queue = new MessageQueue2<{ permissionMode: 'default' }>(() => 'mode');
+    const consumer = createSessionProviderInputConsumer({
+      messageQueue: queue,
+      session: {
+        materializeNextPendingMessageSafely: (options) => client.materializeNextPendingMessageSafely(options),
+        waitForPendingEligibilityUpdate: (signal) => client.waitForPendingEligibilityUpdate(signal),
+        waitForMetadataUpdate: (signal?: AbortSignal) => client.waitForMetadataUpdate(signal),
+      },
+      reconcileWhenEmpty: 'skip',
+    });
+    const providerControls: Array<{ kind: string; value: string }> = [];
+    const synchronizer = createRuntimeOverrideSynchronizers({
+      session: { getMetadataSnapshot: () => client.getMetadataSnapshot() },
+      // Provider operation boundary: the synchronizers and metadata normalization remain real.
+      runtime: {
+        setSessionMode: async (value) => { providerControls.push({ kind: 'mode', value }); },
+        setSessionModel: async (value) => { providerControls.push({ kind: 'model', value }); },
+        setSessionConfigOption: async (_id, value) => { providerControls.push({ kind: 'config', value }); },
+      },
+      isStarted: () => true,
+    });
+    const controller = new AbortController();
+    const observedMetadata: Array<string | undefined> = [];
+    const metadataListenersBefore = client.listenerCount('metadata-updated');
+    const pendingListenersBefore = client.listenerCount('pending-eligibility-updated');
+    const waiting = waitForNextPermissionModeMessage({
+      messageQueue: queue, session: client, inputConsumer: consumer,
+      abortSignal: controller.signal,
+      onMetadataUpdate: async () => {
+        observedMetadata.push(client.getMetadataSnapshot()?.name);
+        synchronizer.syncFromMetadata();
+        await synchronizer.flushPendingAfterStart();
+      },
+    });
+    const metadata = createTestMetadata({
+      name: 'user-controls',
+      sessionModeOverrideV1: { v: 1, updatedAt: 10, modeId: 'plan' },
+      modelOverrideV1: { v: 1, updatedAt: 11, modelId: 'provider/cheap-model' },
+    });
+    const update = (sid: string, version: number, name = 'user-controls') => userSocket.trigger('update', {
+      id: `metadata-${sid}-${version}`, seq: version, createdAt: version,
+      body: { t: 'update-session', sid, metadata: { version, value: JSON.stringify({ ...metadata, name }) } },
+    });
+    try {
+      await vi.waitFor(() => expect(materialize).toHaveBeenCalledTimes(1));
+      update('other-session', 1);
+      update(client.sessionId, 0);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(providerControls).toEqual([]);
+      update(client.sessionId, 1);
+      expect(client.getMetadataSnapshot()).toMatchObject({
+        sessionModeOverrideV1: { modeId: 'plan' }, modelOverrideV1: { modelId: 'provider/cheap-model' },
+      });
+      await expect.poll(() => providerControls).toEqual([
+        { kind: 'mode', value: 'plan' }, { kind: 'model', value: 'provider/cheap-model' },
+      ]);
+      expect(materialize).toHaveBeenCalledTimes(1);
+      // A newer provider-output projection with the same intent must not replay its controls or Pending.
+      update(client.sessionId, 2, 'provider-output');
+      await expect.poll(() => observedMetadata).toContain('provider-output');
+      expect(providerControls).toHaveLength(2);
+      expect(materialize).toHaveBeenCalledTimes(1);
+      expect(queue.size()).toBe(0);
+    } finally {
+      controller.abort();
+      await expect(waiting).resolves.toBeNull();
+      expect(client.listenerCount('metadata-updated')).toBe(metadataListenersBefore);
+      expect(client.listenerCount('pending-eligibility-updated')).toBe(pendingListenersBefore);
+      await client.close();
+      await rm(testHome, { recursive: true, force: true });
+      vi.unstubAllEnvs();
+      reloadConfiguration();
+    }
   });
 
   it('recovers failed settings convergence on a later pending hint without another connection', async () => {

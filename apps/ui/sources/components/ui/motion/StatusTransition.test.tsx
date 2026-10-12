@@ -193,6 +193,33 @@ describe('StatusTransition', () => {
         }
     });
 
+    it('takes a rectangular box from an invisible sizing child, so a button can settle into a spinner in place', async () => {
+        const { StatusTransition } = await import('./StatusTransition');
+        const sizing = <Text testID="sizing-label">Restart to update</Text>;
+        const screen = await renderScreen(
+            <StatusTransition transitionKey="button" sizing={sizing} fromScale={FROM_SCALE} testID="slot">
+                {renderMark('button')}
+            </StatusTransition>,
+        );
+        await act(async () => {
+            screen.tree.update(
+                <StatusTransition transitionKey="spinner" sizing={sizing} fromScale={FROM_SCALE} testID="slot">
+                    {renderMark('spinner')}
+                </StatusTransition>,
+            );
+        });
+
+        const boxStyle = flattenStyle(screen.findHostByTestId('slot')?.props.style);
+        expect(boxStyle.width).toBeUndefined();
+        // The sizing child lays the box out and is never seen or announced.
+        const sizingLayer = screen.findHostByTestId('slot-sizing');
+        expect(flattenStyle(sizingLayer?.props.style).opacity).toBe(0);
+        expect(sizingLayer?.props.accessibilityElementsHidden).toBe(true);
+        expect(screen.findByTestId('sizing-label')).toBeTruthy();
+        expect(flattenStyle(screen.findHostByTestId('slot-incoming')?.props.style).position).toBe('absolute');
+        expect(flattenStyle(screen.findHostByTestId('slot-outgoing')?.props.style).position).toBe('absolute');
+    });
+
     it('swaps immediately under reduced motion, with no timer and no spring', async () => {
         reducedMotionState.enabled = true;
         const { screen, swapTo } = await renderTransition('running');

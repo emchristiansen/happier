@@ -4,6 +4,8 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, 
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
+import cliDistBuildManifest from '../cliDistBuildManifest.cjs';
+
 async function acceptWorkspacePackageFixtures(_repoRoot, packageNames) {
   return { ok: true, built: [], skipped: [...packageNames] };
 }
@@ -320,6 +322,7 @@ test('buildCliBinaryArtifactPayload compiles the local CLI binary into the paylo
     writeFileSync(join(repoRoot, 'package.json'), JSON.stringify({ name: 'repo', private: true }, null, 2));
     writeCliRuntimePackageFixture(repoRoot);
     writeFileSync(join(cliDistDir, 'index.mjs'), 'console.log("cli");\n', 'utf8');
+    cliDistBuildManifest.writeCliDistBuildManifest(join(cliDistDir, 'index.mjs'));
     writeFileSync(join(cliScriptsDir, 'childProcessOptions.cjs'), 'module.exports = { withWindowsHide: (input) => input };\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'claude_launcher_runtime.cjs'), 'module.exports = { getClaudeCliPath: () => "claude", runClaudeCli: () => {} };\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'claude_local_launcher.cjs'), 'require("./claude_launcher_runtime.cjs");\n', 'utf8');
@@ -329,6 +332,7 @@ test('buildCliBinaryArtifactPayload compiles the local CLI binary into the paylo
     writeFileSync(join(cliScriptsDir, 'ripgrep_launcher.cjs'), 'require("./childProcessOptions.cjs");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'statusline_forwarder.cjs'), 'console.log("statusline");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'terminal_launch_spec_runner.cjs'), 'console.log("terminal launch spec");\n', 'utf8');
+    writeFileSync(join(cliScriptsDir, 'process_tree.cjs'), 'console.log("process tree");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'node_pty_relay.cjs'), 'console.log("node pty relay");\n', 'utf8');
     writeFileSync(join(cliRuntimeDir, 'loadTransformersFromRuntime.mjs'), 'export const env = {}; export async function pipeline() { return () => null; }\n', 'utf8');
     writeFileSync(join(cliShimsDir, 'git'), '#!/bin/sh\nexit 0\n', 'utf8');
@@ -383,8 +387,8 @@ test('buildCliBinaryArtifactPayload compiles the local CLI binary into the paylo
         mkdirSync(cliDistDir, { recursive: true });
         writeFileSync(join(cliDistDir, 'index.mjs'), 'console.log("cli");\n', 'utf8');
       },
-      compileBinary: async ({ outfile, externals }) => {
-        compileCalls.push({ outfile, externals });
+      compileBinary: async ({ outfile, externals, autoloadDotenv }) => {
+        compileCalls.push({ outfile, externals, autoloadDotenv });
         writeFileSync(outfile, '#!/bin/sh\necho happier\n', 'utf8');
       },
     });
@@ -393,6 +397,7 @@ test('buildCliBinaryArtifactPayload compiles the local CLI binary into the paylo
     assert.equal(result.entrypoint, 'happier');
     assert.deepEqual(runCalls, []);
     assert.equal(compileCalls.length, 1);
+    assert.equal(compileCalls[0].autoloadDotenv, false);
     assert.deepEqual(compileCalls[0].externals.sort(), [
       '@homebridge/node-pty-prebuilt-multiarch',
       '@huggingface/transformers',
@@ -511,6 +516,7 @@ test('buildCliBinaryArtifactPayload removes compile-generated node_modules befor
     writeFileSync(join(cliScriptsDir, 'ripgrep_launcher.cjs'), 'require("./childProcessOptions.cjs");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'statusline_forwarder.cjs'), 'console.log("statusline");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'terminal_launch_spec_runner.cjs'), 'console.log("terminal launch spec");\n', 'utf8');
+    writeFileSync(join(cliScriptsDir, 'process_tree.cjs'), 'console.log("process tree");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'node_pty_relay.cjs'), 'console.log("node pty relay");\n', 'utf8');
     writeFileSync(join(cliRuntimeDir, 'loadTransformersFromRuntime.mjs'), 'export const env = {}; export async function pipeline() { return () => null; }\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'shims', 'git'), '#!/bin/sh\nexit 0\n', 'utf8');
@@ -629,6 +635,7 @@ test('buildCliBinaryArtifactPayload snapshots CLI dist before compile/copy so la
     writeFileSync(join(cliScriptsDir, 'ripgrep_launcher.cjs'), 'require("./childProcessOptions.cjs");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'statusline_forwarder.cjs'), 'console.log("statusline");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'terminal_launch_spec_runner.cjs'), 'console.log("terminal launch spec");\n', 'utf8');
+    writeFileSync(join(cliScriptsDir, 'process_tree.cjs'), 'console.log("process tree");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'node_pty_relay.cjs'), 'console.log("node pty relay");\n', 'utf8');
     writeFileSync(join(cliRuntimeDir, 'loadTransformersFromRuntime.mjs'), 'export const env = {}; export async function pipeline() { return () => null; }\n', 'utf8');
     writeFileSync(join(cliShimsDir, 'git'), '#!/bin/sh\nexit 0\n', 'utf8');
@@ -723,6 +730,7 @@ test('buildCliBinaryArtifactPayload derives bundled workspace packages from apps
     writeFileSync(join(cliScriptsDir, 'ripgrep_launcher.cjs'), 'require("./childProcessOptions.cjs");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'statusline_forwarder.cjs'), 'console.log("statusline");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'terminal_launch_spec_runner.cjs'), 'console.log("terminal launch spec");\n', 'utf8');
+    writeFileSync(join(cliScriptsDir, 'process_tree.cjs'), 'console.log("process tree");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'node_pty_relay.cjs'), 'console.log("node pty relay");\n', 'utf8');
     writeFileSync(join(cliRuntimeDir, 'loadTransformersFromRuntime.mjs'), 'export const env = {}; export async function pipeline() { return () => null; }\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'shims', 'git'), '#!/bin/sh\nexit 0\n', 'utf8');
@@ -803,6 +811,7 @@ test('buildCliBinaryArtifactPayload restores runtime sidecars after compile rewr
     writeFileSync(join(cliScriptsDir, 'ripgrep_launcher.cjs'), 'require("./childProcessOptions.cjs");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'statusline_forwarder.cjs'), 'console.log("statusline");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'terminal_launch_spec_runner.cjs'), 'console.log("terminal launch spec");\n', 'utf8');
+    writeFileSync(join(cliScriptsDir, 'process_tree.cjs'), 'console.log("process tree");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'node_pty_relay.cjs'), 'console.log("node pty relay");\n', 'utf8');
     writeFileSync(join(cliRuntimeDir, 'loadTransformersFromRuntime.mjs'), 'export const env = {}; export async function pipeline() { return () => null; }\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'shims', 'git'), '#!/bin/sh\nexit 0\n', 'utf8');
@@ -895,6 +904,7 @@ test('buildCliBinaryArtifactPayload stages embeddings runtime packages and exter
     writeFileSync(join(cliScriptsDir, 'ripgrep_launcher.cjs'), 'require("./childProcessOptions.cjs");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'statusline_forwarder.cjs'), 'console.log("statusline");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'terminal_launch_spec_runner.cjs'), 'console.log("terminal launch spec");\n', 'utf8');
+    writeFileSync(join(cliScriptsDir, 'process_tree.cjs'), 'console.log("process tree");\n', 'utf8');
     writeFileSync(join(cliScriptsDir, 'node_pty_relay.cjs'), 'console.log("node pty relay");\n', 'utf8');
     writeFileSync(join(cliRuntimeDir, 'loadTransformersFromRuntime.mjs'), 'export const env = {}; export async function pipeline() { return () => null; }\n', 'utf8');
     writeFileSync(join(cliShimsDir, 'git'), '#!/bin/sh\nexit 0\n', 'utf8');

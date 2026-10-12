@@ -7,6 +7,8 @@ describe('stripNestedSessionDetectionEnv', () => {
       PATH: '/bin',
       CLAUDECODE: '1',
       CLAUDE_CODE_ENTRYPOINT: 'parent',
+      HERDR_ENV: '1',
+      HERDR_SOCKET_PATH: '/tmp/herdr.sock',
     };
 
     const output = stripNestedSessionDetectionEnv(input);
@@ -14,6 +16,8 @@ describe('stripNestedSessionDetectionEnv', () => {
     expect(output.PATH).toBe('/bin');
     expect(output.CLAUDECODE).toBeUndefined();
     expect(output.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();
+    expect(output.HERDR_ENV).toBeUndefined();
+    expect(output.HERDR_SOCKET_PATH).toBe('/tmp/herdr.sock');
   });
 
   it('does not mutate the input object', () => {

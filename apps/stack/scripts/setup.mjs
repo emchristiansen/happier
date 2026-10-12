@@ -24,7 +24,7 @@ import { readServerPortFromEnvFile, resolveServerPortFromEnv } from './utils/ser
 import { runOrchestratedGuidedAuthFlow } from './utils/auth/orchestrated_stack_auth_flow.mjs';
 import { buildSetupChildEnv } from './utils/setup/child_env.mjs';
 import { getVerbosityLevel } from './utils/cli/verbosity.mjs';
-import { runCommandLogged } from './utils/cli/progress.mjs';
+import { runCommandLogged } from '@happier-dev/cli-common/output';
 import { bold, cyan, dim, green, yellow } from './utils/ui/ansi.mjs';
 import { expandHome } from './utils/paths/canonical_home.mjs';
 import { listAllStackNames, stackExistsSync } from './utils/stack/stacks.mjs';
@@ -724,11 +724,11 @@ async function cmdSetup({ rootDir, argv }) {
 	  if (!profile && interactive) {
 	    profile = await withRl(async (rl) => {
 	      return await promptSelect(rl, {
-	        title: bold(`✨ ${cyan('hstack')} setup ✨\n\nWhat is your goal?`),
+	        title: `${banner('hstack setup')}\n\n${bold('What is your goal?')}`,
 	        options: [
-	          { label: `${cyan('Self-host')}: use Happier on this machine`, value: 'selfhost' },
-	          { label: `${cyan('Development')}: worktrees + stacks + contributor workflows`, value: 'dev' },
-            { label: `${cyan('Local repo')}: use an existing Happier checkout`, value: 'local-repo' },
+	          { label: `${bold('Self-host')}: use Happier on this machine`, value: 'selfhost' },
+	          { label: `${bold('Development')}: worktrees + stacks + contributor workflows`, value: 'dev' },
+            { label: `${bold('Local repo')}: use an existing Happier checkout`, value: 'local-repo' },
 	        ],
 	        defaultIndex: 0,
 	      });

@@ -63,28 +63,28 @@ describe('Codex async user-input questions', () => {
         });
     });
 
-    it('builds one ordinary Codex user message per answered question', () => {
+    it('builds one Codex reply containing every answered question', () => {
         const answersByKey = Object.create(null) as Record<string, readonly string[]>;
         answersByKey['["happier-codex-async-question","message-1",0]'] = ['Production'];
         answersByKey['["happier-codex-async-question","message-1",1]'] = ['Ship after tests'];
 
-        expect(buildCodexAsyncUserInputReply({
+        const reply = buildCodexAsyncUserInputReply({
             itemId: 'message-1',
             questions: [
                 { title: 'Choose\nan environment', options: ['Staging', 'Production'] },
                 { title: 'Add release context' },
             ],
             answersByKey,
-        })).toEqual([
-            {
-                questionIndex: 0,
-                text: '> Choose an environment\n\nProduction',
-            },
-            {
-                questionIndex: 1,
-                text: '> Add release context\n\nShip after tests',
-            },
-        ]);
+        });
+        expect(reply?.displayText).toBe('> Choose an environment\n\nProduction\n\n> Add release context\n\nShip after tests');
+        expect(reply?.text).toBe(
+            '<send_user_message_question_reply>\n'
+            + JSON.stringify([
+                { answer: 'Production', question: 'Choose an environment', questionItemId: '["request_user_input_async","message-1",0]' },
+                { answer: 'Ship after tests', question: 'Add release context', questionItemId: '["request_user_input_async","message-1",1]' },
+            ])
+            + '\n</send_user_message_question_reply>',
+        );
     });
 
     it('rejects an oversized Codex form so the caller can preserve its assistant-text fallback', () => {

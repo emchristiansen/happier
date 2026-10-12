@@ -5,7 +5,6 @@ import {
     getDesktopWindowState,
     listenDesktopWindowState,
     minimizeDesktopWindow,
-    startDesktopWindowDragging,
     toggleDesktopWindowMaximize,
     type DesktopWindowChromeStrategy,
 } from '@/utils/platform/desktopWindowBridge';
@@ -74,10 +73,6 @@ export function useResolvedDesktopWindowControls(
         };
     }, [hasDesktopWindowControlsOverride]);
 
-    const handleStartDragging = React.useCallback(() => {
-        fireAndForget(startDesktopWindowDragging(), { tag: 'DesktopWindowControlsSlot.startDragging' });
-    }, []);
-
     const handleMinimize = React.useCallback(() => {
         fireAndForget(minimizeDesktopWindow(), { tag: 'DesktopWindowControlsSlot.minimize' });
     }, []);
@@ -99,7 +94,7 @@ export function useResolvedDesktopWindowControls(
     }
 
     return (
-        <DesktopWindowControlsSlot enableDragging onStartDragging={handleStartDragging}>
+        <DesktopWindowControlsSlot enableDragging>
             {chromeStrategy === 'custom-controls' ? (
                 <DesktopWindowControlsButtons
                     layout={params.variant === 'collapsed' ? 'column' : 'row'}

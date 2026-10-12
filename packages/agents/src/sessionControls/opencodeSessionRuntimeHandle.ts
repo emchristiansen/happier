@@ -9,6 +9,7 @@ export type OpenCodeSessionAffinity = Readonly<{
   backendMode: OpenCodeBackendMode | null;
   serverBaseUrl: string | null;
   serverBaseUrlExplicit: boolean;
+  managedServerLaunchFingerprint: string | null;
 }>;
 
 export type OpenCodeSessionRuntimeHandle = OpenCodeSessionAffinity & Readonly<{
@@ -39,6 +40,7 @@ export function readOpenCodeSessionAffinityFromMetadata(metadata: unknown): Open
       backendMode: null,
       serverBaseUrl: null,
       serverBaseUrlExplicit: false,
+      managedServerLaunchFingerprint: null,
     };
   }
 
@@ -50,6 +52,9 @@ export function readOpenCodeSessionAffinityFromMetadata(metadata: unknown): Open
       metadata.opencodeServerBaseUrlExplicit,
     ),
     serverBaseUrlExplicit: runtimeDescriptor?.serverBaseUrlExplicit ?? normalizeOpenCodeServerBaseUrlExplicit(metadata.opencodeServerBaseUrlExplicit),
+    managedServerLaunchFingerprint: runtimeDescriptor?.managedServerLaunchFingerprint
+      ?? (metadata.opencodeManagedServerLaunchFingerprint == null ? null
+        : typeof metadata.opencodeManagedServerLaunchFingerprint === 'string' ? metadata.opencodeManagedServerLaunchFingerprint.trim() : ''),
   };
 }
 
@@ -59,6 +64,7 @@ export function readOpenCodeSessionRuntimeHandleFromMetadata(metadata: unknown):
       backendMode: null,
       serverBaseUrl: null,
       serverBaseUrlExplicit: false,
+      managedServerLaunchFingerprint: null,
       vendorSessionId: null,
     };
   }

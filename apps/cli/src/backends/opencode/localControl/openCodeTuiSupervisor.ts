@@ -1,4 +1,4 @@
-import { createAttachedTerminalSupervisor, type AttachedTerminalSupervisor } from '@/agent/localControl/createAttachedTerminalSupervisor';
+import { createAttachedTerminalSupervisor, type AttachedTerminalSupervisor, type AttachedTerminalPresentation } from '@/agent/localControl/createAttachedTerminalSupervisor';
 import type { SharedManagedOpenCodeServerState } from '@/backends/opencode/server/sharedManagedServer';
 
 import { createOpenCodeAttachArgs } from './createOpenCodeAttachArgs';
@@ -15,11 +15,14 @@ function resolveDetachTimeoutMs(): number {
   return Math.max(100, Math.min(60_000, value));
 }
 
-export type OpenCodeTuiSupervisor = AttachedTerminalSupervisor<{
+export type OpenCodeTuiAttachTarget = Readonly<{
   baseUrl: string;
   directory: string;
   sessionId: string;
+  managedServerLaunchFingerprint?: string;
 }>;
+
+export type OpenCodeTuiSupervisor = AttachedTerminalSupervisor<OpenCodeTuiAttachTarget>;
 
 export function createOpenCodeTuiSupervisor(params?: Readonly<{
   spawnProcess?: Parameters<typeof createAttachedTerminalSupervisor>[0]['spawnProcess'];
@@ -27,6 +30,7 @@ export function createOpenCodeTuiSupervisor(params?: Readonly<{
   commandArgs?: readonly string[];
   env?: NodeJS.ProcessEnv;
   onExit?: () => void | Promise<void>;
+  terminalPresentation?: AttachedTerminalPresentation;
   /** Overrides the target probe; omit in production so the actual server decides the dialect. */
   resolveDialectFn?: typeof resolveOpenCodeAttachCliDialect;
   readManagedServerStateFn?: () => Promise<SharedManagedOpenCodeServerState | null>;
@@ -50,13 +54,15 @@ export function createOpenCodeTuiSupervisor(params?: Readonly<{
     env,
     detachTimeoutMs: resolveDetachTimeoutMs(),
     onExit: params?.onExit,
-    resolveInvocation: async ({ baseUrl, directory, sessionId }) => {
+    terminalPresentation: params?.terminalPresentation,
+    resolveInvocation: async ({ baseUrl, directory, sessionId, managedServerLaunchFingerprint }) => {
       // The attached CLI talks to the target server itself: it needs that server's credential (loopback
       // managed targets only) and the argv dialect the target actually speaks.
       const readManagedServerStateFn = params?.readManagedServerStateFn;
       const targetAuth = {
         baseUrl,
         env,
+        managedServerLaunchFingerprint,
         ...(readManagedServerStateFn ? { readManagedServerStateFn } : {}),
       };
       const dialect = await (params?.resolveDialectFn ?? resolveOpenCodeAttachCliDialect)({

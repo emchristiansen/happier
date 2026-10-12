@@ -16,6 +16,35 @@ describe('bundleWorkspacePackage', () => {
     }
   });
 
+  it('preserves conditional package imports and their package-root runtime targets', () => {
+    rootDir = mkdtempSync(join(tmpdir(), 'workspace-package-imports-'));
+    const sourceDir = resolve(rootDir, 'packages', 'fixture');
+    const destinationDir = resolve(rootDir, 'apps', 'cli', 'node_modules', '@happier-dev', 'fixture');
+    const imports = {
+      '#http': { node: './runtime/node.js', default: './dist/fetch.js' },
+      '#fs': 'fs',
+      '#disabled': null,
+    };
+    mkdirSync(resolve(sourceDir, 'dist'), { recursive: true });
+    mkdirSync(resolve(sourceDir, 'runtime'), { recursive: true });
+    writeFileSync(resolve(sourceDir, 'package.json'), JSON.stringify({
+      name: '@happier-dev/fixture', version: '0.0.0', type: 'module',
+      exports: { '.': './dist/connect.js' }, imports,
+    }));
+    writeFileSync(resolve(sourceDir, 'dist/connect.js'), 'import { transport } from "#http"; import { existsSync } from "#fs"; export const selected = transport + ":" + typeof existsSync;\n');
+    writeFileSync(resolve(sourceDir, 'dist/fetch.js'), 'export const transport = "fetch";\n');
+    writeFileSync(resolve(sourceDir, 'runtime/node.js'), 'export const transport = "node";\n');
+    bundleWorkspacePackage({ packageName: '@happier-dev/fixture', srcDir: sourceDir, destDir: destinationDir });
+    // Real Node resolution observes the bundled manifest, not Vitest's resolver.
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e',
+      `const module = await import(${JSON.stringify(pathToFileURL(resolve(destinationDir, 'dist/connect.js')).href)}); console.log(module.selected);`,
+    ], { encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout.trim()).toBe('node:function');
+    expect(JSON.parse(readFileSync(resolve(destinationDir, 'package.json'), 'utf8')).imports).toEqual(imports);
+    expect(readFileSync(resolve(destinationDir, 'dist/fetch.js'), 'utf8')).toContain('fetch');
+  });
+
   it('removes legacy dist staging dirs when rebundling into an existing destination', () => {
     rootDir = mkdtempSync(join(tmpdir(), 'happier-cli-common-bundle-workspace-'));
 

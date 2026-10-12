@@ -12,7 +12,9 @@ import { Item } from '@/components/ui/lists/Item';
 import { ItemGroup } from '@/components/ui/lists/ItemGroup';
 import { ItemList } from '@/components/ui/lists/ItemList';
 import { MachineSetupTextField } from '@/components/settings/machines/shared/MachineSetupTextField';
-import { getActiveServerSnapshot, setActiveServer, subscribeActiveServer } from '@/sync/domains/server/serverRuntime';
+import { getActiveServerSnapshot, subscribeActiveServer } from '@/sync/domains/server/serverRuntime';
+import { useSettingMutable } from '@/sync/domains/state/storage';
+import { selectRelayDirectly } from '@/setup/directRelaySelectionIntent';
 import { clearPendingSetupIntent, setPendingSetupIntent } from '@/sync/domains/pending/pendingSetupIntent';
 import { usePendingSetupIntent } from '@/components/onboarding/state/usePendingSetupIntent';
 import {
@@ -25,6 +27,7 @@ import { t } from '@/text';
 import { toServerUrlDisplay } from '@/sync/domains/server/url/serverUrlDisplay';
 import { isTauriDesktop } from '@/utils/platform/tauri';
 import { Icon } from '@/components/ui/icons/Icon';
+import { fireAndForget } from '@/utils/system/fireAndForget';
 
 const ignoreBrandHeroGetStarted = () => undefined;
 
@@ -160,6 +163,22 @@ function PreAuthSetupRoute() {
     const [customRelayName, setCustomRelayName] = React.useState('');
     const [customRelayError, setCustomRelayError] = React.useState<string | null>(null);
     const relayFormOpacity = React.useRef(new Animated.Value(0)).current;
+    const [, setServerSelectionActiveTargetKind] = useSettingMutable('serverSelectionActiveTargetKind');
+    const [, setServerSelectionActiveTargetId] = useSettingMutable('serverSelectionActiveTargetId');
+    /**
+     * R8/INV7 — a relay picked or added here is the person choosing it for this device, so it goes
+     * through the one direct-selection operation: after sign-in the desktop setup gate may then
+     * offer to move this computer's background service there. `refreshAuth` is null because the
+     * auth provider already refreshes on every active-server change, and onboarding reaches sign-in
+     * through its own Continue path.
+     */
+    const selectRelay = React.useCallback(async (serverId: string) => {
+        await selectRelayDirectly({
+            serverId,
+            selectionTarget: { setServerSelectionActiveTargetKind, setServerSelectionActiveTargetId },
+            refreshAuth: null,
+        });
+    }, [setServerSelectionActiveTargetId, setServerSelectionActiveTargetKind]);
     const continueToAuthForRelay = React.useCallback((nextRelayUrl: string | null) => {
         setPendingSetupIntent({
             branch: 'thisComputer',
@@ -180,7 +199,7 @@ function PreAuthSetupRoute() {
         router.replace('/');
     }, []);
 
-    const handleAddRelay = React.useCallback(() => {
+    const handleAddRelay = React.useCallback(async () => {
         const nextRelayUrl = normalizeRelayUrl(customRelayUrl);
         const validation = validateServerUrl(nextRelayUrl ?? customRelayUrl);
         if (!nextRelayUrl || !validation.valid) {
@@ -194,13 +213,13 @@ function PreAuthSetupRoute() {
             source: 'manual',
             replaceEquivalentStoredUrl: true,
         });
-        setActiveServer({ serverId: resolveServerProfileScopeId(profile), scope: 'device' });
+        await selectRelay(resolveServerProfileScopeId(profile));
         setCustomRelayUrl('');
         setCustomRelayName('');
         setCustomRelayError(null);
         setShowInlineRelayForm(false);
         continueToAuthForRelay(nextRelayUrl);
-    }, [continueToAuthForRelay, customRelayName, customRelayUrl]);
+    }, [continueToAuthForRelay, customRelayName, customRelayUrl, selectRelay]);
 
     React.useEffect(() => {
         if (shouldOpenCustomRelayForm) {
@@ -256,7 +275,7 @@ function PreAuthSetupRoute() {
                                     selected={resolveServerProfileScopeId(profile) === snapshot.serverId}
                                     showChevron={false}
                                     onPress={() => {
-                                        setActiveServer({ serverId: resolveServerProfileScopeId(profile), scope: 'device' });
+                                        fireAndForget(selectRelay(resolveServerProfileScopeId(profile)), { tag: 'setup.selectSavedRelay' });
                                     }}
                                 />
                             ))}
@@ -310,7 +329,7 @@ function PreAuthSetupRoute() {
                                     testID="setup.addRelay"
                                     title={t('setupOnboarding.addAndUseRelay')}
                                     disabled={!customRelayUrl.trim()}
-                                    onPress={handleAddRelay}
+                                    onPress={() => fireAndForget(handleAddRelay(), { tag: 'setup.addRelay' })}
                                 />
                             </>
                         ) : null}
@@ -337,9 +356,10 @@ function PostAuthSetupRoute() {
     const remoteMachineContinuation = livePending?.branch === 'remoteMachine' ? livePending : null;
     /**
      * R9/INV1: after authentication exactly one owner performs "make this computer ready" — the
-     * `DesktopLocalSetupGate` the authenticated root renders, driven by `desktopSetupCoordinator`.
-     * This route must never be a second one, so a desktop visit whose only business is local
-     * setup goes to that gate instead of rendering another setup surface. The remote-machine
+     * `DesktopLocalSetupRuntime` the authenticated desktop shell mounts, driven by
+     * `desktopSetupCoordinator` and presented on the Home. This route must never be a second one,
+     * so a desktop visit whose only business is local setup goes to the Home instead of rendering
+     * another setup surface. The remote-machine
      * branch keeps its post-auth job here: resuming provider follow-up after a relay adoption
      * (`MachineSetupFlowScreen`'s switch-to-remote-relay action).
      */
