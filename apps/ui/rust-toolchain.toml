@@ -1,5 +1,5 @@
 [toolchain]
 # Keep in sync with `apps/ui/src-tauri/Cargo.toml` (`rust-version`).
-channel = "1.94.1"
+channel = "1.99.0"
 profile = "minimal"
 components = ["rustfmt", "clippy"]
