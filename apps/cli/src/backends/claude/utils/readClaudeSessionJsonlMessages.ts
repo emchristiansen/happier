@@ -4,6 +4,7 @@ import { tryReadTextFileTail } from '@/agent/runtime/readTextFileTail';
 import type { RawJSONLines } from '../types';
 import { providers } from '@happier-dev/agents';
 import { parseRawJsonLinesObject } from './parseRawJsonLines';
+import { readClaudeTaskLifecycleEnvelope } from '../taskNotifications/claudeTaskLifecycleEnvelope';
 
 /**
  * Read and parse a Claude Code session JSONL file.
@@ -51,11 +52,12 @@ export async function readClaudeSessionJsonlMessages(params: Readonly<{
         logger.debug(`[${params.logLabel}] Error observing raw message: ${observerError}`);
       }
 
-      if (providers.claude.isClaudeInternalEventType(raw?.type)) {
+      const parsed = parseRawJsonLinesObject(raw);
+      if (providers.claude.isClaudeInternalEventType(parsed?.type ?? raw?.type)
+        && readClaudeTaskLifecycleEnvelope(raw)?.subtype !== 'task_notification') {
         continue;
       }
 
-      const parsed = parseRawJsonLinesObject(raw);
       if (!parsed) {
         continue;
       }

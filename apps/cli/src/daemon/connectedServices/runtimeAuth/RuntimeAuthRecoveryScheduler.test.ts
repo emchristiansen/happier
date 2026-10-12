@@ -12,6 +12,8 @@ import { buildRuntimeAuthRecoveryKey } from './recoveryKey/runtimeAuthRecoveryKe
 import type { ConnectedServiceRuntimeFailureClassification } from './types';
 import type { TransactionalRecoveryStore } from '../recoveryScheduler/DurableBackoffRecoveryScheduler';
 import { createRecoveryIntentFileStore } from '../recoveryScheduler/recoveryIntentFileStore';
+import { decideConnectedServiceRecovery } from './ConnectedServiceRecoveryPolicy';
+import { createConnectedServiceContinuationMessageDispatcher } from '../continuation/createConnectedServiceContinuationMessageDispatcher';
 
 function classification(): ConnectedServiceRuntimeFailureClassification {
   return {
@@ -50,6 +52,291 @@ function createDeferred<T>(): {
 }
 
 describe('RuntimeAuthRecoveryScheduler', () => {
+  it.each(['checking', 'waiting'] as const)('coalesces manual mode changes after an existing claim (%s)', async (status) => {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-claimed-mode-'));
+    const store = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(join(dir, 'recovery.json'));
+    const admitted = createDeferred<void>();
+    const finish = createDeferred<void>();
+    const continueAfterUsageLimitReset = vi.fn(async () => {
+      admitted.resolve(); await finish.promise;
+      return { ok: true, status: 'continuation_enqueued' };
+    });
+    const deps = { nowMs: () => 1000, recover: async () => ({}), continueAfterUsageLimitReset, durableStore: store };
+    const scheduler = new RuntimeAuthRecoveryScheduler(deps);
+    const otherOwner = new RuntimeAuthRecoveryScheduler(deps);
+    let timer: Promise<unknown> | null = null;
+    try {
+      const source = classificationFor({ groupId: null, resetsAtMs: 1000 });
+      const begun = await scheduler.beginClassifiedFailure({ sessionId: 'mode-race', switchesThisTurn: 0,
+        resumePromptMode: 'standard', classification: source });
+      if (!begun.attemptId) throw new Error('Expected armed attempt');
+      timer = scheduler.wake({ sessionId: 'mode-race', reason: 'timer' });
+      await admitted.promise;
+      const key = buildRuntimeAuthRecoveryKey({ sessionId: 'mode-race', ...source });
+      // A new report can project waiting while the previous effect still owns its claim.
+      await store.transact!(key, (current) => ({ ...current, intent: { ...current.intent!, status }, result: undefined }));
+      await otherOwner.wake({ sessionId: 'mode-race', reason: 'manual',
+        attemptId: begun.attemptId, resumePromptMode: 'custom' });
+      expect(store.read(key)).toMatchObject({ resumePromptMode: 'standard' });
+      finish.resolve(); await timer;
+      expect(store.read(key)).toMatchObject({ resumePromptMode: 'standard', status: 'resumed_awaiting_proof' });
+      expect(continueAfterUsageLimitReset).toHaveBeenCalledOnce();
+    } finally { finish.resolve(); await timer; scheduler.dispose(); otherOwner.dispose(); await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([0, 27])('continues a profile limit at reset plus %i ms and waits for provider proof', async (offset) => {
+    let nowMs = 1_000;
+    const pending: string[] = [];
+    const dispatcher = createConnectedServiceContinuationMessageDispatcher({
+      credentials: { token: 'test-token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+      // Pending submission is the transport boundary; the real dispatcher owns identity/admission.
+      sendMessage: async (request) => {
+        pending.push(request.message);
+        return { ok: true, sessionId: 'session-reset', localId: request.localId!, waited: false };
+      },
+    });
+    const failure = classificationFor({ serviceId: 'claude-subscription', groupId: null, resetsAtMs: 60_000 });
+    const scheduler = new RuntimeAuthRecoveryScheduler({
+      nowMs: () => nowMs,
+      jitterMs: () => 0,
+      recover: async () => {
+        const action = decideConnectedServiceRecovery({
+          actor: 'automatic', issue: failure,
+          selection: { kind: 'profile', serviceId: failure.serviceId, profileId: 'primary' },
+        });
+        return { status: 'recovery_action_required', action: { kind: action.action, reason: 'usage_limit' } };
+      },
+      continueAfterUsageLimitReset: async (intent) => {
+        await dispatcher.enqueueInterruptedOriginContinuation({
+          sessionId: intent.sessionId, attemptId: intent.attemptId!, interruptedOriginId: 'failed-turn',
+          interruption: 'provider_failed_turn', resumePromptMode: intent.resumePromptMode ?? 'standard',
+          recoveryKind: intent.classification.kind,
+        });
+        return { ok: true, status: 'continuation_enqueued' };
+      },
+    });
+    try {
+      await scheduler.beginClassifiedFailure({ sessionId: 'session-reset', switchesThisTurn: 0, classification: failure });
+      nowMs = 2_000;
+      await scheduler.wake({ sessionId: 'session-reset', reason: 'manual' });
+      expect(pending).toEqual([]);
+      nowMs = 60_000 + offset;
+      await scheduler.wake({ sessionId: 'session-reset', reason: 'timer' });
+      expect(pending).toEqual(['Usage limits are lifted. Continue where you left off.']);
+      expect(scheduler.readForSession('session-reset')[0]).toMatchObject({ status: 'resumed_awaiting_proof' });
+      const recoveryKey = buildRuntimeAuthRecoveryKey({ sessionId: 'session-reset', serviceId: failure.serviceId, profileId: 'primary', groupId: null });
+      await scheduler.markProviderOutcomeProofByKey({ recoveryKey, proofKind: 'provider_activity' });
+      expect(scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'recovered' });
+    } finally { scheduler.dispose(); }
+  });
+
+  it('bounds timer proof waits without letting manual checks exhaust an admitted continuation', async () => {
+    let nowMs = 1000;
+    const pending: string[] = [];
+    const dispatcher = createConnectedServiceContinuationMessageDispatcher({
+      credentials: { token: 'test-token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+      // Pending submission is the transport boundary; admission remains owned by the real dispatcher.
+      sendMessage: async (request) => {
+        pending.push(request.message);
+        return { ok: true, sessionId: 'proof-wait', localId: request.localId!, waited: false };
+      },
+    });
+    const scheduler = new RuntimeAuthRecoveryScheduler({
+      nowMs: () => nowMs, maxAttempts: 3, providerOutcomePendingWaitMs: 100, jitterMs: () => 0,
+      recover: async () => ({ status: 'recovery_action_required', action: { kind: 'profile_action_required', reason: 'usage_limit' } }),
+      continueAfterUsageLimitReset: async (intent) => {
+        await dispatcher.enqueueInterruptedOriginContinuation({
+          sessionId: intent.sessionId, attemptId: intent.attemptId!, interruptedOriginId: 'failed-turn',
+          interruption: 'provider_failed_turn', resumePromptMode: intent.resumePromptMode ?? 'standard',
+          recoveryKind: intent.classification.kind,
+        });
+        return { ok: true, status: 'continuation_enqueued' };
+      },
+    });
+    try {
+      await scheduler.beginClassifiedFailure({ sessionId: 'proof-wait', switchesThisTurn: 0,
+        classification: classificationFor({ groupId: null, resetsAtMs: 1000 }) });
+      await scheduler.wake({ sessionId: 'proof-wait', reason: 'manual' });
+      for (let count = 0; count < 4; count += 1) {
+        nowMs += 20;
+        await scheduler.wake({ sessionId: 'proof-wait', reason: 'manual' });
+        expect(scheduler.read('proof-wait')?.nextRetryAtMs).toBe(1100);
+      }
+      expect(scheduler.read('proof-wait')).toMatchObject({ status: 'resumed_awaiting_proof', attemptCount: 1 });
+      for (let count = 0; count < 4; count += 1) {
+        nowMs += 100;
+        await scheduler.wake({ sessionId: 'proof-wait', reason: 'timer' });
+      }
+      expect(pending).toEqual(['Usage limits are lifted. Continue where you left off.']);
+      expect(scheduler.read('proof-wait')).toMatchObject({ status: 'exhausted', attemptCount: 3 });
+    } finally { scheduler.dispose(); }
+  });
+
+  it('preserves an admitted continuation through a gate delay and durable reload', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-continuation-phase-'));
+    const storePath = join(dir, 'recovery.json');
+    let nowMs = 1000;
+    let gated = false;
+    const continueAfterUsageLimitReset = vi.fn(async () => ({ ok: true, status: 'continuation_enqueued' }));
+    const deps = {
+      nowMs: () => nowMs,
+      maxAttempts: 3,
+      providerOutcomePendingWaitMs: 100,
+      jitterMs: () => 0,
+      recover: async () => ({ status: 'credential_refreshed' }),
+      continueAfterUsageLimitReset,
+      gate: () => gated ? { status: 'delayed' as const, retryAtMs: 1100, reason: 'local_server_storm' } : null,
+    };
+    const scheduler = new RuntimeAuthRecoveryScheduler({ ...deps, durableStore: createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(storePath) });
+    let reloaded: RuntimeAuthRecoveryScheduler | null = null;
+    try {
+      await scheduler.beginClassifiedFailure({ sessionId: 'phase-reload', switchesThisTurn: 0,
+        classification: classificationFor({ groupId: null, resetsAtMs: 1000 }) });
+      await scheduler.wake({ sessionId: 'phase-reload', reason: 'manual' });
+      nowMs = 1010;
+      gated = true;
+      await scheduler.wake({ sessionId: 'phase-reload', reason: 'manual' });
+      expect(scheduler.read('phase-reload')).toMatchObject({ lastError: 'local_server_storm', attemptCount: 1 });
+      scheduler.dispose();
+      gated = false;
+      reloaded = new RuntimeAuthRecoveryScheduler({ ...deps, durableStore: createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(storePath) });
+      nowMs = 1100;
+      await reloaded.wake({ sessionId: 'phase-reload', reason: 'timer' });
+      expect(reloaded.read('phase-reload')).toMatchObject({ status: 'resumed_awaiting_proof', attemptCount: 2,
+        proofWaitPhase: 'usage_limit_continuation', nextRetryAtMs: 1200 });
+      nowMs = 1200;
+      await reloaded.wake({ sessionId: 'phase-reload', reason: 'timer' });
+      expect(reloaded.read('phase-reload')).toMatchObject({ status: 'exhausted', attemptCount: 3 });
+      expect(reloaded.read('phase-reload')).not.toHaveProperty('proofWaitPhase');
+      expect(continueAfterUsageLimitReset).toHaveBeenCalledOnce();
+    } finally { scheduler.dispose(); reloaded?.dispose(); await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(['continuation', 'generic'] as const)('loads a legacy %s proof record with its correct phase', async (kind) => {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-legacy-proof-phase-'));
+    const store = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(join(dir, 'recovery.json'));
+    const scheduler = new RuntimeAuthRecoveryScheduler({ nowMs: () => 1000, durableStore: store,
+      recover: async () => ({ status: 'credential_refreshed' }) });
+    try {
+      const failure = classificationFor({ groupId: null, resetsAtMs: 1000 });
+      await scheduler.beginClassifiedFailure({ sessionId: 'legacy-phase', switchesThisTurn: 0, classification: failure });
+      const key = buildRuntimeAuthRecoveryKey({ sessionId: 'legacy-phase', ...failure });
+      await store.transact!(key, (current) => {
+        const legacy = { ...current.intent!, v: 1 as const, status: 'resumed_awaiting_proof' as const,
+          lastError: kind === 'continuation' ? 'usage_limit_continuation_awaiting_provider_outcome' : 'recovery_unproven_awaiting_provider_outcome' };
+        Reflect.deleteProperty(legacy, 'proofWaitPhase');
+        return { ...current, intent: legacy, result: undefined };
+      });
+      if (kind === 'continuation') {
+        expect(scheduler.readByKey(key)).toMatchObject({ v: 1, proofWaitPhase: 'usage_limit_continuation' });
+      } else {
+        expect(scheduler.readByKey(key)).not.toHaveProperty('proofWaitPhase');
+      }
+    } finally { scheduler.dispose(); await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it('clears admitted continuation phase for fresh failure evidence while retaining duplicate intake', async () => {
+    let nowMs = 1000;
+    const failure = classificationFor({ groupId: null, resetsAtMs: 1000 });
+    const continueAfterUsageLimitReset = vi.fn(async () => ({ ok: true, status: 'continuation_enqueued' }));
+    const scheduler = new RuntimeAuthRecoveryScheduler({ nowMs: () => nowMs, continueAfterUsageLimitReset,
+      recover: async () => ({ status: 'credential_refreshed' }) });
+    try {
+      await scheduler.beginClassifiedFailure({ reportId: 'first-turn', sessionId: 'phase-intake', switchesThisTurn: 0, classification: failure });
+      await scheduler.wake({ sessionId: 'phase-intake', reason: 'manual' });
+      await scheduler.beginClassifiedFailure({ reportId: 'first-turn', sessionId: 'phase-intake', switchesThisTurn: 0, classification: failure });
+      expect(scheduler.read('phase-intake')).toMatchObject({ proofWaitPhase: 'usage_limit_continuation' });
+      nowMs = 1100;
+      await scheduler.beginClassifiedFailure({ reportId: 'next-turn', sessionId: 'phase-intake', switchesThisTurn: 0,
+        classification: { ...failure, resetsAtMs: 3000 } });
+      expect(scheduler.read('phase-intake')).toMatchObject({ status: 'waiting' });
+      expect(scheduler.read('phase-intake')).not.toHaveProperty('proofWaitPhase');
+      await scheduler.wake({ sessionId: 'phase-intake', reason: 'manual' });
+      expect(continueAfterUsageLimitReset).toHaveBeenCalledOnce();
+      nowMs = 3000;
+      await scheduler.wake({ sessionId: 'phase-intake', reason: 'manual' });
+      expect(continueAfterUsageLimitReset).toHaveBeenCalledTimes(2);
+      expect(scheduler.read('phase-intake')).toMatchObject({ proofWaitPhase: 'usage_limit_continuation' });
+    } finally { scheduler.dispose(); }
+  });
+
+  it.each(['durable', 'targeted', 'recovered'] as const)('clears admitted continuation phase for an authoritative %s result', async (resultKind) => {
+    const failure = classificationFor({ groupId: null, resetsAtMs: 1000 });
+    const scheduler = new RuntimeAuthRecoveryScheduler({ nowMs: () => 1000,
+      continueAfterUsageLimitReset: async () => ({ ok: true, status: 'continuation_enqueued' }),
+      recover: async () => ({ status: 'credential_refreshed' }) });
+    try {
+      await scheduler.beginClassifiedFailure({ sessionId: 'phase-result', switchesThisTurn: 0, classification: failure });
+      await scheduler.wake({ sessionId: 'phase-result', reason: 'manual' });
+      const key = buildRuntimeAuthRecoveryKey({ sessionId: 'phase-result', ...failure });
+      expect(scheduler.readByKey(key)).toMatchObject({ proofWaitPhase: 'usage_limit_continuation' });
+      if (resultKind === 'durable') {
+        await scheduler.markDurableWaitForResultByKey({ recoveryKey: key,
+          result: { status: 'no_eligible_member', groupExhausted: true }, classificationResetsAtMs: 3000 });
+        expect(scheduler.readByKey(key)).toMatchObject({ status: 'waiting', lastError: 'no_eligible_member' });
+      } else if (resultKind === 'targeted') {
+        await scheduler.markAwaitingProviderOutcomeProofForResultByKey({ recoveryKey: key,
+          result: { status: 'switched', activeProfileId: 'next-profile', generation: 2 } });
+        expect(scheduler.readByKey(key)).toMatchObject({ pendingTargetProfileId: 'next-profile', pendingTargetGeneration: 2 });
+      } else {
+        await scheduler.markProviderOutcomeProofByKey({ recoveryKey: key, proofKind: 'provider_activity' });
+        expect(scheduler.readByKey(key)).toMatchObject({ status: 'recovered' });
+      }
+      expect(scheduler.readByKey(key)).not.toHaveProperty('proofWaitPhase');
+    } finally { scheduler.dispose(); }
+  });
+
+  it('does not mistake a generic local repair proof wait for admitted continuation', async () => {
+    let nowMs = 1000;
+    const continueAfterUsageLimitReset = vi.fn(async () => ({ ok: true, status: 'continuation_enqueued' }));
+    const scheduler = new RuntimeAuthRecoveryScheduler({ nowMs: () => nowMs, continueAfterUsageLimitReset,
+      recover: async () => ({ status: 'credential_refreshed' }) });
+    try {
+      const failure = classificationFor({ groupId: null, resetsAtMs: 2000 });
+      await scheduler.beginClassifiedFailure({ sessionId: 'local-repair', switchesThisTurn: 0, classification: failure });
+      const recoveryKey = buildRuntimeAuthRecoveryKey({ sessionId: 'local-repair', ...failure });
+      await scheduler.markAwaitingProviderOutcomeProofForResultByKey({ recoveryKey, result: { status: 'credential_refreshed' } });
+      nowMs = 2000;
+      await scheduler.wake({ sessionId: 'local-repair', reason: 'manual' });
+      expect(continueAfterUsageLimitReset).toHaveBeenCalledTimes(1);
+    } finally { scheduler.dispose(); }
+  });
+
+  it('waits for a fresh later reset and permits its new failed turn to continue', async () => {
+    let nowMs = 1000;
+    const continueAfterUsageLimitReset = vi.fn(async () => ({ ok: true, status: 'continuation_enqueued' }));
+    const scheduler = new RuntimeAuthRecoveryScheduler({ nowMs: () => nowMs, continueAfterUsageLimitReset,
+      recover: async () => ({ status: 'recovery_action_required', action: { kind: 'profile_action_required', reason: 'usage_limit' } }) });
+    try {
+      const failure = classificationFor({ groupId: null, resetsAtMs: 1000 });
+      await scheduler.beginClassifiedFailure({ sessionId: 'new-limit', switchesThisTurn: 0, classification: failure });
+      await scheduler.wake({ sessionId: 'new-limit', reason: 'manual' });
+      nowMs = 1100;
+      await scheduler.beginClassifiedFailure({ sessionId: 'new-limit', switchesThisTurn: 0,
+        classification: { ...failure, resetsAtMs: 3000 } });
+      await scheduler.wake({ sessionId: 'new-limit', reason: 'manual' });
+      expect(continueAfterUsageLimitReset).toHaveBeenCalledTimes(1);
+      nowMs = 3000;
+      await scheduler.wake({ sessionId: 'new-limit', reason: 'manual' });
+      expect(continueAfterUsageLimitReset).toHaveBeenCalledTimes(2);
+      expect(scheduler.read('new-limit')?.status).toBe('resumed_awaiting_proof');
+    } finally { scheduler.dispose(); }
+  });
+
+  it.each(['suppressed', 'disabled'])('settles a %s continuation without losing the cancellation projection', async (reason) => {
+    const scheduler = new RuntimeAuthRecoveryScheduler({ nowMs: () => 1000,
+      recover: async () => ({}),
+      continueAfterUsageLimitReset: async () => ({ status: 'continuation_cancelled', reason: `usage_limit_continuation_${reason}` }) });
+    try {
+      await scheduler.beginClassifiedFailure({ sessionId: 'no-prompt', switchesThisTurn: 0,
+        classification: classificationFor({ groupId: null, resetsAtMs: 1000 }) });
+      await scheduler.wake({ sessionId: 'no-prompt', reason: 'manual' });
+      const settled = scheduler.read('no-prompt');
+      expect(settled).toMatchObject({ status: 'cancelled', terminalReason: `usage_limit_continuation_${reason}` });
+      expect(settled?.pendingVisibleEvents?.some((event) => event.transition === 'terminal')).toBe(true);
+    } finally { scheduler.dispose(); }
+  });
+
   it('keeps the initial in-band working attempt unarmed and arms only a typed retry', async () => {
     const scheduler = new RuntimeAuthRecoveryScheduler({
       nowMs: () => 1_000,
@@ -310,6 +597,66 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       await wake?.catch(() => undefined);
       first?.dispose();
       second?.dispose();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not let a targeted wake claim a replacement attempt after waiting for durable custody', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-runtime-auth-targeted-wake-'));
+    const filePath = join(dir, 'runtime-auth.json');
+    const claimStarted = createDeferred<void>();
+    const releaseClaim = createDeferred<void>();
+    const baseStore = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath);
+    const baseTransact = baseStore.transact!;
+    let blockNextTransaction = false;
+    const blockedStore: DurableRecoveryStore<RuntimeAuthRecoveryIntent> = {
+      ...baseStore,
+      transact: async <TResult>(
+        recoveryKey: string,
+        transaction: (current: Readonly<{ intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null }>) => Readonly<{
+          intent: RuntimeAuthRecoveryIntent | null; effectClaimToken: string | null; result: TResult;
+        }>,
+      ) => {
+        if (blockNextTransaction) {
+          blockNextTransaction = false;
+          claimStarted.resolve();
+          await releaseClaim.promise;
+        }
+        return await baseTransact<TResult>(recoveryKey, transaction);
+      },
+    };
+    const recover = vi.fn(async () => ({ status: 'credential_refreshed' }));
+    const first = new RuntimeAuthRecoveryScheduler({ nowMs: () => 1_000, recover, durableStore: blockedStore });
+    const second = new RuntimeAuthRecoveryScheduler({
+      nowMs: () => 2_000, recover,
+      durableStore: createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(filePath),
+    });
+    let wake: Promise<Readonly<{ status: string }>> | undefined;
+    try {
+      const sessionId = 'session-targeted-wake';
+      const original = await first.beginClassifiedFailure({
+        sessionId, reportId: 'targeted-old', switchesThisTurn: 0,
+        classification: classificationFor({ sourceKey: 'old-source' }),
+      });
+      blockNextTransaction = true;
+      wake = first.wake({ sessionId, reason: 'manual', attemptId: original.attemptId! });
+      await claimStarted.promise;
+      const replacement = await second.beginClassifiedFailure({
+        sessionId, reportId: 'targeted-new', switchesThisTurn: 0,
+        classification: classificationFor({ sourceKey: 'new-source' }),
+      });
+      expect(replacement.attemptId).not.toBe(original.attemptId);
+      releaseClaim.resolve();
+      expect(await wake).toEqual({ status: 'inactive' });
+      expect(recover).not.toHaveBeenCalled();
+      expect(first.readForSession(sessionId)[0]).toMatchObject({ attemptId: replacement.attemptId, attemptCount: 0 });
+      await first.wake({ sessionId, reason: 'manual', attemptId: replacement.attemptId! });
+      expect(recover).toHaveBeenCalledOnce();
+    } finally {
+      releaseClaim.resolve();
+      await wake?.catch(() => undefined);
+      first.dispose();
+      second.dispose();
       await rm(dir, { recursive: true, force: true });
     }
   });

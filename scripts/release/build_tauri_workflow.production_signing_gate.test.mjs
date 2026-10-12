@@ -477,11 +477,13 @@ test('candidate code is isolated from Tauri and Apple private signing authority'
   assert.equal(build.strategy.matrix, '${{ fromJSON(needs.resolve_source.outputs.build_matrix) }}');
   assert.equal(finalize.strategy.matrix, '${{ fromJSON(needs.resolve_source.outputs.finalize_matrix) }}');
   // These job conditions use the shared JavaScript/Actions boolean-expression subset.
-  const admits = (job, needs, cancelled = false) => Function('needs', 'cancelled', `return ${job.if.slice(3, -2)}`)(needs, () => cancelled);
+  const admits = (job, needs, cancelled = false, inputs = { preparation_only: false, use_prepared: false }) => Function('needs', 'cancelled', 'inputs', `return ${job.if.slice(3, -2)}`)(needs, () => cancelled, inputs);
   for (const [buildNeeded, buildResult] of [['true', 'success'], ['false', 'skipped']]) {
     const needs = { resolve_source: { result: 'success', outputs: { build_needed: buildNeeded, finalize_needed: 'true', retry_version: '' } }, build: { result: buildResult } };
     assert.equal(admits(build, needs), buildNeeded === 'true');
     assert.equal(admits(finalize, needs), true, 'all reused unsigned candidates still require finalization');
+    assert.equal(admits(finalize, needs, false, { preparation_only: true }), false, 'preparation must not sign');
+    assert.equal(admits(build, needs, false, { use_prepared: true }), false, 'admitted same-run preparation must not compile twice');
     assert.equal(admits(finalize, { ...needs, resolve_source: { result: 'success', outputs: { finalize_needed: 'false', retry_version: '' } } }), false,
       'already-finalized candidates must never enter signing again');
     assert.equal(admits(finalize, needs, true), false);
@@ -491,9 +493,26 @@ test('candidate code is isolated from Tauri and Apple private signing authority'
   }
   const resume = parsed.jobs.resolve_resume;
   assert.equal(resume.uses, './.github/workflows/resolve-release-resume.yml');
-  assert.equal(resume.with.expected_workflow, '.github/workflows/nightly-dev.yml');
-  assert.equal(resume.with.expected_source_sha, '${{ inputs.source_ref }}');
-  assert.equal(resume.with.expected_channel, '${{ inputs.environment }}');
+  const resolveInputs = (inputs) => Object.fromEntries(Object.entries(resume.with).map(([key, value]) => [key,
+    typeof value === 'string' && value.startsWith('${{')
+      ? Function('inputs', 'format', `return ${value.slice(3, -2)}`)(inputs, (pattern, name) => pattern.replace('{0}', name))
+      : value,
+  ]));
+  const source = 'a'.repeat(40);
+  for (const [workflow, environment, operation, artifact] of [
+    ['release-preview-and-production.yml', 'production', 'rel_exact', 'happier-release-status'],
+    ['nightly-dev.yml', 'dev', '', 'happier-release-status'],
+    ['release.yml', 'production', 'rel_exact', 'happier-release-status'],
+    ['release-preview-and-production.yml', 'preview', 'rel_exact', 'happier-release-status-preview'],
+  ]) {
+    assert.deepEqual(resolveInputs({ resume_run_id: '123', resume_workflow: workflow, resume_operation_id: operation, environment, source_ref: source }), {
+      origin_run_id: '123', expected_workflow: `.github/workflows/${workflow}`, expected_channel: environment,
+      expected_source_sha: source, expected_operation_id: operation, status_artifact_name: artifact,
+    });
+  }
+  assert.equal(resolveInputs({ resume_run_id: '123', environment: 'dev', source_ref: source }).expected_workflow, '.github/workflows/nightly-dev.yml');
+  assert.equal(parsed.on.workflow_dispatch.inputs.resume_workflow.default, 'nightly-dev.yml');
+  assert.deepEqual(parsed.on.workflow_dispatch.inputs.resume_workflow.options, ['nightly-dev.yml', 'release.yml', 'release-preview-and-production.yml']);
   const download = finalize.steps.find((step) => step.name === 'Download and verify admitted desktop candidate');
   assert.equal(download.if, "${{ matrix.artifact_id != '' }}");
   assert.equal(download.env.ARTIFACT_ID, '${{ matrix.artifact_id }}');

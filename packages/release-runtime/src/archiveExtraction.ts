@@ -769,9 +769,23 @@ async function extractTarArchiveToDirectory(params: Readonly<{
     params.allowedEntryRoots,
     params.abortContext.abort,
   );
+  const pendingEntries = new Set<tar.ReadEntry>();
+  const acceptedRoots = new Set<string>();
   const unpackOptions: BoundedTarOptions = {
     cwd: params.extractDir,
-    filter: (_path, entry) => 'meta' in entry ? validateEntry.accept(entry) : true,
+    filter: (_path, entry) => {
+      if (params.abortContext.signal.aborted) return false;
+      if (!('meta' in entry)) return true;
+      if (!validateEntry.accept(entry)) return false;
+      if (!entry.meta) {
+        // Unpack reserves relative entry paths, including their parent paths.
+        // A reservation on each accepted root drains the whole staging tree.
+        acceptedRoots.add(entry.path.split('/').find((segment) => segment && segment !== '.') ?? '.');
+        pendingEntries.add(entry);
+        entry.once('end', () => pendingEntries.delete(entry));
+      }
+      return true;
+    },
     maxDecompressionRatio: params.limits.maxCompressionRatio,
     maxMetaEntrySize: MAX_TAR_METADATA_ENTRY_BYTES,
     // Every accepted path and entry type has already passed the canonical
@@ -783,6 +797,10 @@ async function extractTarArchiveToDirectory(params: Readonly<{
     strict: true,
   };
   const unpack = tar.x(unpackOptions);
+  let extractionFailed = false;
+  const unpackFinished = new Promise<void>((resolveFinished) => {
+    unpack.once('finish', resolveFinished);
+  });
   attachTarMetadataBudget({ parser: unpack, budget, abort: params.abortContext.abort });
 
   try {
@@ -810,9 +828,36 @@ async function extractTarArchiveToDirectory(params: Readonly<{
     params.abortContext.throwIfAborted();
     validateEntry.assertValid();
   } catch (error) {
+    extractionFailed = true;
     params.abortContext.throwIfAborted();
     validateEntry.assertValid();
     throw error;
+  } finally {
+    // Pipeline synthesizes close for node-tar's legacy stream on failure;
+    // that does not drain its pending filesystem callbacks. Successful unpack
+    // emits finish after those callbacks, but parser abort and CwdError do not.
+    unpack.end();
+    if (extractionFailed) {
+      // End and consume every accepted entry, including queued entries, before
+      // taking the reservation barrier so no later entry can start a staging
+      // write. Failed extraction discards these bodies; CwdError otherwise
+      // leaves its entry paused forever.
+      await Promise.all([...pendingEntries].map((entry) => new Promise<void>((resolveEntry) => {
+        entry.once('end', resolveEntry);
+        entry.end();
+        entry.resume();
+      })));
+      if (acceptedRoots.size > 0) {
+        await new Promise<void>((resolveDrained) => {
+          unpack.reservations.reserve([...acceptedRoots], (release) => {
+            release();
+            resolveDrained();
+          });
+        });
+      }
+    } else {
+      await unpackFinished;
+    }
   }
 }
 

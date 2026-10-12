@@ -29,6 +29,21 @@ does not establish message acceptance or foreground activity. UI normalization a
 filters already-persisted internal records, while genuinely unknown output retains
 the unsupported-output diagnostic.
 
+In development source, native cross-session messages use the shared
+`attachments/claudePeerMessageProjection.ts` conversation projector. Delivered
+queued-command attachments become sender-labelled text with native peer provenance;
+ordinary queued commands and queue operations remain internal. The JSONL parser,
+scanner, direct-session reader and SDK converter consume that projection. Peer input
+cannot acknowledge a pending human prompt.
+
+The remote Agent SDK registers its live permission-mode control with the launcher's
+existing metadata consumer. Registration re-reads current permission intent, and
+metadata updates reach the streaming query while idle. Prompt-driven updates and
+ExitPlanMode use the same runtime-settings owner. Claude still owns inbound delivery
+policy: its [non-interactive messaging contract](https://code.claude.com/docs/en/cross-session-messaging#non-interactive-sessions)
+does not expose the terminal approval dialog in `-p` sessions. Happier does not
+override that policy or automatically accept held messages.
+
 ## Session lifecycle surfaces
 
 Development-source Unified Terminal delivery keeps observing canonical Pending
@@ -97,3 +112,11 @@ the permission authority before a request reaches these hooks.
 3. Claude subagent/team behavior is split between CLI-side collectors (`TaskOutput`, JSONL followers, team inbox) and UI-side participant derivation. Those lifecycle rules should live in one normalized sidechain model.
 4. Execution runs already use Claude SDK semantics, but through a separate backend (`ClaudeSdkAgentBackend`) instead of the normal remote-session runtime. That is the clearest remaining duplication inside the Claude stack.
 5. Claude provider settings still carry a migration seam of their own (`claudeRemoteSettingSources` legacy v1 plus `claudeRemoteSettingSourcesV2`). The future control plane should publish one settings schema and one live capability surface.
+
+## Claude Code history attribution (development source)
+
+`claudeCodeIncludeInNativeHistory` is an additive, account-scoped boolean, default false, owned by `packages/agents/src/providerSettings/definitions/claudeRemote.ts`. The existing outgoing-message metadata owner carries it to the CLI; absent or malformed input cannot enable it. Existing clients and CLIs ignore the additive key.
+
+`resolveClaudeSessionEnvOverlay` extends the existing Claude launch overlay with explicit `CLAUDE_CODE_ENTRYPOINT=happier` when enabled. Local, legacy remote, Agent SDK, unified terminal, execution runs, cached startup metadata probes, and non-persisted preflight probes consume that owner. Metadata probe cache fingerprints include explicit attribution; off preserves existing cache keys. `prepareClaudeSubprocessEnv` in `spawn/buildClaudeSubprocessEnv.ts` removes inherited nested-session markers and restores only an explicit child entrypoint overlay. Generic daemon-runner sanitation remains unchanged. Queue mode hashes include this launch-time choice; already-running Claude processes and existing JSONL are not rewritten.
+
+Evidence basis: official Agent SDK 0.2.123 defaults a missing entrypoint to `sdk-ts` and honors `options.env`; official VS Code extension 2.1.296 excludes `sdk-cli`, `sdk-ts`, and `sdk-py` by default and independently excludes daemon session kinds. Official native binaries 2.1.283 and 2.1.296 were executed against a local API fixture with isolated homes: `cli` became `sdk-cli` in JSONL, while `happier` was preserved. The custom value avoids the SDK history exclusion but also changes client-platform attribution, question-preview defaults and built-in agent availability; it is not a documented billing or quota control. Same configuration directory/project and other native history filters still apply. Full validation requires a newly launched authenticated daemon session followed by listing from the matching VS Code workspace; launch-boundary tests do not prove that live composed flow.
