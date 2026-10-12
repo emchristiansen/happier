@@ -85,6 +85,7 @@ const CLI_DIST_BUILD_MANIFEST = '.build-manifest.json';
 const PINNED_RUNNER_DIST_DIR = '.runner-snapshots';
 const PINNED_RUNNER_REQUIRED_ASSET_RELATIVE_PATHS = [
   ['scripts', 'terminal_launch_spec_runner.cjs'],
+  ['scripts', 'process_tree.cjs'],
   ['scripts', 'claude_local_launcher.cjs'],
   ['scripts', 'claude_remote_launcher.cjs'],
   ['scripts', 'claude_launcher_runtime.cjs'],
@@ -919,5 +920,5 @@ export function spawnHappyCLI(
   const spawnOptions: SpawnOptions = launchSpec.env
     ? { ...options, env: { ...(options.env ?? process.env), ...launchSpec.env } }
     : options;
-  return spawn(launchSpec.filePath, launchSpec.args, spawnOptions);
+  return spawn(launchSpec.filePath, launchSpec.args, { ...spawnOptions, windowsHide: spawnOptions.windowsHide !== false });
 }

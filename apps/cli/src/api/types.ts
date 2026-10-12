@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { UsageSchema } from '@/api/usage'
 import { SOCKET_RPC_EVENTS, type SocketRpcRequestPayload as ProtocolSocketRpcRequestPayload } from '@happier-dev/protocol/socketRpc'
-import { SentFromSchema } from '@happier-dev/protocol'
+import { CliUpdateFactsSchema, SentFromSchema } from '@happier-dev/protocol'
 import type { ExecutionRunPublicState } from '@happier-dev/protocol'
 import type {
   AcpConfigOptionOverridesV1,
@@ -333,6 +333,8 @@ export const MachineMetadataSchema = z.object({
   happyLibDir: z.string(),
   daemonTerminalSessionAttachSupported: z.boolean().optional(),
   daemonSessionGoalControlsSupported: z.boolean().optional(),
+  /** K5 — this machine's first-party CLI update facts (plan R13); absent from older daemons. */
+  cliUpdate: CliUpdateFactsSchema.optional(),
 })
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>

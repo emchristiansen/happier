@@ -13,11 +13,6 @@ import type { ConnectedServiceResolvedSelection } from '@/daemon/connectedServic
 import { resolveConfiguredClaudeConfigDir } from '@/backends/claude/utils/resolveConfiguredClaudeConfigDir';
 import { materializeClaudeAnthropicApiKeyAuth } from './materializeClaudeAnthropicApiKeyAuth';
 import {
-  buildClaudeConnectedServiceHomeProvenance,
-  matchesClaudeConnectedServiceHomeProvenance,
-  readClaudeConnectedServiceHomeProvenance,
-} from './claudeConnectedServiceHomeProvenance';
-import {
   materializeClaudeSubscriptionNativeAuthHome,
   type ClaudeSubscriptionNativeAuthIdentityDiagnostic,
   type ClaudeSubscriptionNativeAuthSelectionDescriptor,
@@ -37,13 +32,6 @@ export type ClaudeConnectedServiceSelectionMaterialization = Readonly<{
   identityDiagnostic?: ClaudeSubscriptionNativeAuthIdentityDiagnostic;
 }>;
 
-function withClaudeConfigDir(processEnv: NodeJS.ProcessEnv, claudeConfigDir: string): NodeJS.ProcessEnv {
-  return {
-    ...processEnv,
-    CLAUDE_CONFIG_DIR: claudeConfigDir,
-  };
-}
-
 function withoutClaudeConfigDirOverrides(processEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const nextEnv = { ...processEnv };
   delete nextEnv.CLAUDE_CONFIG_DIR;
@@ -62,28 +50,13 @@ function isClaudeManagedConnectedServiceConfigDir(params: Readonly<{
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
 }
 
-async function resolveClaudeAuthoritativeSourceEnv(params: Readonly<{
+function resolveClaudeConfigurationSourceEnv(params: Readonly<{
   activeServerDir: string;
   processEnv: NodeJS.ProcessEnv;
   targetClaudeConfigDir: string;
-  record: ConnectedServiceCredentialRecordV1;
-  selectionDescriptor: ClaudeSubscriptionNativeAuthSelectionDescriptor;
-}>): Promise<NodeJS.ProcessEnv> {
-  const expectedProvenance = buildClaudeConnectedServiceHomeProvenance({
-    record: params.record,
-    selectionDescriptor: params.selectionDescriptor,
-  });
-  if (
-    matchesClaudeConnectedServiceHomeProvenance(
-      expectedProvenance,
-      await readClaudeConnectedServiceHomeProvenance(params.targetClaudeConfigDir),
-    )
-  ) {
-    return withClaudeConfigDir(
-      withoutClaudeConfigDirOverrides(params.processEnv),
-      params.targetClaudeConfigDir,
-    );
-  }
+}>): NodeJS.ProcessEnv {
+  // Credential provenance governs auth preservation, not configuration freshness. Always
+  // reconcile from the configured native home, never an earlier materialized copy of it.
   const configuredClaudeConfigDir = resolveConfiguredClaudeConfigDir({ env: params.processEnv });
   if (
     resolve(configuredClaudeConfigDir) === resolve(params.targetClaudeConfigDir)
@@ -194,12 +167,10 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
         const canonicalProfileMaterialized = await materializeClaudeSubscriptionNativeAuthHome({
           record: params.record,
           targetClaudeConfigDir: profileClaudeConfigDir,
-          sourceEnv: await resolveClaudeAuthoritativeSourceEnv({
+          sourceEnv: resolveClaudeConfigurationSourceEnv({
             activeServerDir: params.activeServerDir,
             processEnv: params.processEnv,
             targetClaudeConfigDir: profileClaudeConfigDir,
-            record: params.record,
-            selectionDescriptor: canonicalProfileSelectionDescriptor,
           }),
           accountSettings: params.accountSettings ?? null,
           sessionDirectory: params.sessionDirectory ?? null,
@@ -226,12 +197,10 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
         };
       }
     }
-    const sourceEnv = groupSourceEnv ?? await resolveClaudeAuthoritativeSourceEnv({
+    const sourceEnv = groupSourceEnv ?? resolveClaudeConfigurationSourceEnv({
       activeServerDir: params.activeServerDir,
       processEnv: params.processEnv,
       targetClaudeConfigDir: claudeConfigDir,
-      record: params.record,
-      selectionDescriptor,
     });
     const materialized = await materializeClaudeSubscriptionNativeAuthHome({
       record: params.record,

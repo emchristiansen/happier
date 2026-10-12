@@ -53,7 +53,11 @@ async function ensureHappyHomeDirExists(): Promise<void> {
   await bestEffortChmod(configuration.happyHomeDir, 0o700);
 }
 
-function resolveDaemonStateCandidatePathsForCurrentLifecycle(): readonly string[] {
+/**
+ * Every state file a daemon of the current lifecycle scope may have published: the canonical file
+ * plus the ring-scoped basenames of pre-canonical CLIs, all inside the one lifecycle directory.
+ */
+export function resolveDaemonStateCandidatePathsForCurrentLifecycle(): readonly string[] {
   return resolveDaemonStateCandidatePaths({
     serverDir: dirname(configuration.daemonStateFile),
     preferredRing: configuration.publicReleaseRing,
@@ -419,7 +423,7 @@ export async function readSettings(): Promise<Settings> {
     // Warn if schema version is newer than supported
     if (schemaVersion > SUPPORTED_SCHEMA_VERSION) {
       logger.warn(
-        `⚠️ Settings schema v${schemaVersion} > supported v${SUPPORTED_SCHEMA_VERSION}. ` +
+        `Settings file uses schema v${schemaVersion}, newer than the supported v${SUPPORTED_SCHEMA_VERSION}. ` +
         'Update Happier CLI for full functionality.'
       );
     }
@@ -662,11 +666,17 @@ export type Credentials = {
   }
 }
 
-export async function readCredentials(): Promise<Credentials | null> {
-  const primaryPath = configuration.privateKeyFile;
+export type CredentialReadScope = Readonly<{ serverId?: string }>;
+
+export async function readCredentials(scope: CredentialReadScope = {}): Promise<Credentials | null> {
+  const serverId = scope.serverId === undefined ? configuration.activeServerId : scope.serverId.trim();
+  if (!isServerIdFilesystemSafe(serverId)) return null;
+  const primaryPath = scope.serverId === undefined
+    ? configuration.privateKeyFile
+    : join(configuration.happyHomeDir, 'servers', serverId, 'access.key');
   const legacyPath = configuration.legacyPrivateKeyFile;
   const canUseLegacy =
-    configuration.activeServerId === 'cloud' &&
+    serverId === 'cloud' &&
     existsSync(legacyPath) &&
     !existsSync(primaryPath);
 
@@ -699,36 +709,27 @@ export async function readCredentials(): Promise<Credentials | null> {
   return null
 }
 
-export async function writeCredentialsLegacy(credentials: { secret: Uint8Array, token: string }): Promise<void> {
+async function writeStoredCredentialFile(credentials: z.infer<typeof credentialsSchema>): Promise<void> {
   await ensureHappyHomeDirExists();
-  await writeFile(configuration.privateKeyFile, JSON.stringify({
-    secret: encodeBase64(credentials.secret),
-    token: credentials.token
-  }, null, 2), { mode: 0o600 });
-  await bestEffortChmod(configuration.privateKeyFile, 0o600)
-
-  // Migrate legacy single-server credential file (cloud server only).
-  if (configuration.activeServerId === 'cloud' && configuration.legacyPrivateKeyFile !== configuration.privateKeyFile) {
-    if (existsSync(configuration.legacyPrivateKeyFile)) {
-      await unlink(configuration.legacyPrivateKeyFile).catch(() => {});
-    }
+  const serverId = configuration.activeServerId;
+  const keyPath = configuration.privateKeyFile;
+  const legacyPath = configuration.legacyPrivateKeyFile;
+  await writeFile(keyPath, JSON.stringify(credentials, null, 2), { mode: 0o600 });
+  await bestEffortChmod(keyPath, 0o600);
+  if (serverId === 'cloud' && legacyPath !== keyPath && existsSync(legacyPath)) {
+    await unlink(legacyPath).catch(() => {});
   }
 }
 
-export async function writeCredentialsDataKey(credentials: { publicKey: Uint8Array, machineKey: Uint8Array, token: string }): Promise<void> {
-  await ensureHappyHomeDirExists();
-  await writeFile(configuration.privateKeyFile, JSON.stringify({
-    encryption: { publicKey: encodeBase64(credentials.publicKey), machineKey: encodeBase64(credentials.machineKey) },
-    token: credentials.token
-  }, null, 2), { mode: 0o600 });
-  await bestEffortChmod(configuration.privateKeyFile, 0o600)
+export async function writeCredentialsLegacy(credentials: { secret: Uint8Array, token: string }): Promise<void> {
+  await writeStoredCredentialFile({ secret: encodeBase64(credentials.secret), token: credentials.token });
+}
 
-  // Migrate legacy single-server credential file (cloud server only).
-  if (configuration.activeServerId === 'cloud' && configuration.legacyPrivateKeyFile !== configuration.privateKeyFile) {
-    if (existsSync(configuration.legacyPrivateKeyFile)) {
-      await unlink(configuration.legacyPrivateKeyFile).catch(() => {});
-    }
-  }
+export async function writeCredentialsDataKey(credentials: { publicKey: Uint8Array, machineKey: Uint8Array, token: string }): Promise<void> {
+  await writeStoredCredentialFile({
+    encryption: { publicKey: encodeBase64(credentials.publicKey), machineKey: encodeBase64(credentials.machineKey) },
+    token: credentials.token,
+  });
 }
 
 export async function clearCredentials(): Promise<void> {

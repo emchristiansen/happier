@@ -123,6 +123,8 @@ export {
   SessionUsageLimitWaitResumeEnableRequestV1Schema,
   SessionUsageLimitWaitResumeEnableResponseV1Schema,
   SessionSkillCatalogItemV1Schema,
+  PreflightSessionCatalogsV1Schema,
+  type PreflightSessionCatalogsV1,
   SessionSkillCatalogListRequestV1Schema,
   SessionSkillCatalogListResponseV1Schema,
   SessionVendorPluginCatalogListRequestV1Schema,
@@ -202,6 +204,8 @@ export {
   type SkillCatalogItemIdentityV1,
   type SkillCatalogOriginV1,
 } from './sessionWorkState/index.js';
+
+export { NonBlankOpaqueIdentifierSchema, readNonBlankOpaqueIdentifier } from './strings/opaqueIdentifier.js';
 
 export {
   SESSION_WORKFLOW_ACTIVITY_RECENT_RUNS_LIMIT,
@@ -535,6 +539,7 @@ export {
 
 export {
   collectExpoPushTokensMarkedUnregistered,
+  getExpoErrorCode,
 } from './push/expoPushDelivery.js';
 
 export {
@@ -585,6 +590,7 @@ export {
   CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE,
   CONNECTED_SERVICE_AUTO_DISABLE_PLAN_INVALID_QUERY_KEY,
   CONNECTED_SERVICE_POOL_QUOTA_LIMIT_SELECTION_QUERY_KEY,
+  CONNECTED_SERVICE_POOL_EXPIRY_FIRST_QUERY_KEY,
   CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE,
   ConnectedServiceAuthGroupReaderCapabilitiesQueryV1Schema,
   appendConnectedServiceAuthGroupReaderCapabilities,
@@ -599,6 +605,7 @@ export {
   ConnectedServiceAuthGroupPatchRequestV1Schema,
   ConnectedServiceAuthGroupPolicyPatchV1Schema,
   ConnectedServiceAuthGroupPolicyV1Schema,
+  ConnectedServiceAuthGroupStrategyV1Schema,
   ConnectedServiceAuthGroupQuotaLimitSelectionV1Schema,
   ConnectedServiceAuthGroupErrorResponseV1Schema,
   ConnectedServiceAuthGroupResponseV1Schema,
@@ -785,6 +792,17 @@ export {
   type MachineReplacementReason,
   type MachineReplacementRecord,
   type MachineReplacementRegistrationIntent,
+} from './machines/index.js';
+
+export {
+  CliInstallSourceSchema,
+  CliUpdateFactsSchema,
+  CliUpdateLastResultSchema,
+  CliUpdateOutcomeSchema,
+  type CliInstallSource,
+  type CliUpdateFacts,
+  type CliUpdateLastResult,
+  type CliUpdateOutcome,
 } from './machines/index.js';
 
 export {
@@ -1341,6 +1359,7 @@ export {
   PendingFirstInputV1Schema,
   SPAWN_SESSION_ERROR_CODES,
   SPAWN_SESSION_ERROR_DETAIL_KINDS,
+  TerminalHostUnavailableSpawnErrorDetailSchema,
   SpawnSessionExecutionAuthorizationSchema,
   isConnectedServiceUxDiagnosticSpawnErrorDetail,
   isConnectedServiceResumeUnreachableSpawnErrorDetail,
@@ -1352,6 +1371,7 @@ export {
   type ConnectedServiceUxDiagnosticSpawnErrorDetail,
   type SpawnSessionErrorCode,
   type SpawnSessionErrorDetail,
+  type TerminalHostUnavailableSpawnErrorDetail,
   type SpawnSessionErrorDetailKind,
   type SpawnSessionExecutionAuthorization,
   type SpawnSessionResult,
@@ -1779,6 +1799,13 @@ export {
 } from './sessionControl/sessionTerminalComposerClearV1.js';
 
 export {
+  SessionProviderCliAttachPrepareRequestV1Schema,
+  SessionProviderCliAttachPrepareResultV1Schema,
+  type SessionProviderCliAttachPrepareRequestV1,
+  type SessionProviderCliAttachPrepareResultV1,
+} from './sessionControl/sessionProviderCliAttachPrepareV1.js';
+
+export {
   SessionPendingInputInterruptAndRunRequestV1Schema,
   SessionPendingInputInterruptAndRunResultV1Schema,
   buildUnsupportedSessionPendingInputInterruptAndRunResult,
@@ -1900,6 +1927,8 @@ export {
   type SessionTerminalMetadata,
   type TerminalControlServiceabilityPolicy,
   createSessionTerminalMetadataSchema,
+  normalizeSessionMetadataForRead,
+  projectSessionMetadataForWire,
   resolveTerminalControlServiceabilityPolicy,
 } from './sessionMetadata/terminalMetadata.js';
 
@@ -2536,10 +2565,12 @@ export {
   DirectTranscriptReadAfterResponseSchema,
   DirectTranscriptTruncationReasonSchema,
   resolveDirectTranscriptContinuation,
+  DIRECT_SESSION_TAKEOVER_ACTION_IDS,
   DirectSessionTakeoverRequestSchema,
   DirectSessionTakeoverResponseSchema,
   DirectSessionTakeoverPersistRequestSchema,
   DirectSessionTakeoverPersistResponseSchema,
+  DirectSessionTakeoverPersistStartResponseSchema,
   type DirectSessionsProviderId,
   type DirectSessionsSource,
   type DirectSessionsAcpSessionListCapabilityRequest,
@@ -2570,6 +2601,7 @@ export {
   type DirectSessionTakeoverResponse,
   type DirectSessionTakeoverPersistRequest,
   type DirectSessionTakeoverPersistResponse,
+  type DirectSessionTakeoverPersistStartResponse,
 } from './directSessions/daemonRpcV1.js';
 
 export {
@@ -2700,17 +2732,30 @@ export {
   SystemTaskResultSchema,
   SystemTaskSpecSchema,
   classifySetupPairingRequirement,
+  createSetupAccountConsentPromptData,
+  createSetupCliChoicePromptData,
   createSetupPairingPromptData,
   createSetupServiceConsentPromptData,
+  parseSetupAccountConsentPromptData,
+  parseSetupCliChoicePromptData,
+  readSetupCliChoiceAnswer,
   parseSetupPairingPromptData,
   parseSetupServiceConsentPromptData,
+  setupReplacesValidatedAccount,
+  SETUP_ACCOUNT_CONSENT_PROMPT_KIND,
+  SETUP_CLI_CHOICE_PROMPT_KIND,
   SETUP_PAIRING_PROMPT_KIND,
   SETUP_SERVICE_CONSENT_PROMPT_KIND,
   SETUP_THIS_COMPUTER_SYSTEM_TASK_KIND,
+  type SetupAccountConsentPromptPayload,
+  type SetupCliChoice,
+  type SetupCliChoicePromptPayload,
+  type SetupCliOrigin,
   type SetupCliProvenance,
   type SetupPairingPromptPayload,
   type SetupPairingRequirement,
   type SetupServiceConsentPromptPayload,
+  type SetupServiceRuntimeReplacement,
   createTailscaleSecureAccessTaskSpec,
   TAILSCALE_SECURE_ACCESS_SYSTEM_TASK_KIND,
   TAILSCALE_SECURE_ACCESS_SYSTEM_TASK_STEP_IDS,
@@ -3484,6 +3529,7 @@ export {
   BUG_REPORT_FALLBACK_MAX_LABELS,
   BUG_REPORT_FALLBACK_MAX_LABEL_LENGTH,
   buildBugReportFallbackIssueUrl,
+  buildBugReportExportBundle,
   formatBugReportFallbackIssueBody,
   appendBugReportReporterToSummary,
   hasAcceptedBugReportArtifactKind,
@@ -3503,6 +3549,7 @@ export {
   sanitizeBugReportStackContextPayload,
   sanitizeBugReportUrl,
   searchBugReportSimilarIssues,
+  serializeBugReportExportBundle,
   submitBugReportToService,
   trimBugReportTextToMaxBytes,
   type BugReportArtifactPayload,

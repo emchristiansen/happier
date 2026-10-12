@@ -85,36 +85,54 @@ describe('installVersionedPayload default release-channel persistence', () => {
             expect(phases).toEqual(['installing', 'finalizing']);
             expect(await readInstalledVersionMarkers(layout)).toEqual({ currentVersionId: '2.0.0-preview.1', previousVersionId: null });
             expect(await readFile(join(layout.currentPath, binaryName), 'utf8')).toBe('preview-version');
-            expect(await readFile(join(layout.shimDir, binaryName), 'utf8')).toBe('preview-version');
             expect(await readFile(join(layout.shimDir, `hprev${executableSuffix}`), 'utf8')).toBe('preview-version');
-            expect(await readJsonReleaseChannel(resolveDefaultManagedReleaseChannelStatePath({ processEnv: env }))).toBe('preview');
+            // The installed stable CLI stays the default command (D2).
+            expect(await readFile(join(layout.shimDir, binaryName), 'utf8')).toBe('stable-version');
+            expect(await readJsonReleaseChannel(resolveDefaultManagedReleaseChannelStatePath({ processEnv: env }))).toBe('stable');
         } finally {
             await rm(homeDir, { recursive: true, force: true });
         }
     });
 
-    it('writes the effective default release channel for stable and preview installs', async () => {
+    it('keeps the installed default channel when another channel is acquired, and sets it on first install or explicit selection', async () => {
         const homeDir = await mkdtemp(join(tmpdir(), 'happier-install-versioned-payload-channel-'));
         const env = { ...process.env, HAPPIER_HOME_DIR: homeDir };
         const statePath = resolveDefaultManagedReleaseChannelStatePath({ processEnv: env });
+        const binaryName = process.platform === 'win32' ? 'happier.exe' : 'happier';
+        const defaultShimPath = join(homeDir, 'bin', binaryName);
 
         try {
-            await installVersionedPayload({
-                componentId: 'happier-cli',
-                versionId: '1.0.0',
-                payloadRoot: await createPayload(homeDir, '1.0.0', 'stable-version'),
-                processEnv: env,
-            });
-            expect(await readJsonReleaseChannel(statePath)).toBe('stable');
-
+            // First install on an empty machine: preview becomes the default.
             await installVersionedPayload({
                 componentId: 'happier-cli',
                 versionId: '2.0.0-preview.1',
-                payloadRoot: await createPayload(homeDir, '2.0.0-preview.1', 'preview-version'),
+                payloadRoot: await createPayload(homeDir, '2.0.0-preview.1', 'preview-version', binaryName),
                 processEnv: env,
                 channel: 'preview',
             });
             expect(await readJsonReleaseChannel(statePath)).toBe('preview');
+            expect(await readFile(defaultShimPath, 'utf8')).toBe('preview-version');
+
+            // Acquiring stable (a stable app, a stable self-update) never repoints `happier`.
+            await installVersionedPayload({
+                componentId: 'happier-cli',
+                versionId: '1.0.0',
+                payloadRoot: await createPayload(homeDir, '1.0.0', 'stable-version', binaryName),
+                processEnv: env,
+            });
+            expect(await readJsonReleaseChannel(statePath)).toBe('preview');
+            expect(await readFile(defaultShimPath, 'utf8')).toBe('preview-version');
+
+            // The installer's explicit channel choice still selects the default.
+            await installVersionedPayload({
+                componentId: 'happier-cli',
+                versionId: '1.0.1',
+                payloadRoot: await createPayload(homeDir, '1.0.1', 'stable-selected', binaryName),
+                processEnv: env,
+                selectAsDefaultReleaseChannel: true,
+            });
+            expect(await readJsonReleaseChannel(statePath)).toBe('stable');
+            expect(await readFile(defaultShimPath, 'utf8')).toBe('stable-selected');
         } finally {
             await rm(homeDir, { recursive: true, force: true });
         }
@@ -143,6 +161,7 @@ describe('installVersionedPayload default release-channel persistence', () => {
                 payloadRoot: await createPayload(homeDir, '2.0.0-preview.1', 'preview-version'),
                 processEnv: env,
                 channel: 'preview',
+                selectAsDefaultReleaseChannel: true,
             })).rejects.toThrow();
 
             expect(await readJsonReleaseChannel(statePath)).toBe('stable');

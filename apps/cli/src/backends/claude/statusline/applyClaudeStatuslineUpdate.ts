@@ -81,9 +81,11 @@ export function createClaudeStatuslineApplier(params: Readonly<{
 
         applyClaudeEffectiveModelUpdate({
             client: session.client,
+            reconcileModels: session.reconcileSessionModels,
             modelId,
             displayName,
             contextWindowTokens,
+            reasoningEffort: readString(payload.effort?.level),
             source: 'statusline',
             logPrefix: params.logPrefix,
         });

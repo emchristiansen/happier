@@ -4,6 +4,10 @@ import { dirname } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { HAPPIER_SPAWN_EXPLICIT_ENV_KEYS_JSON_ENV_VAR } from '@/daemon/spawn/spawnExplicitEnvKeysMarker';
+import { createTestMetadata } from '@/testkit/backends/sessionMetadata';
+import { createClaudeModelEffortLevelsTracker } from '../models/claudeModelEffortLevelsTracker';
+import { prepareClaudeUnifiedTerminalInitialMode } from '../startup/prepareUnifiedTerminalInitialMode';
+import type { EnhancedMode } from '../loop';
 import {
   HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_ENV_KEY,
   HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY,
@@ -81,6 +85,51 @@ describe('buildClaudeUnifiedTerminalSpawn', () => {
     if (originalPlatformDescriptor) {
       Object.defineProperty(process, 'platform', originalPlatformDescriptor);
     }
+  });
+
+  it.each([
+    { model: 'claude-sonnet-5', current: undefined, currentUpdatedAt: 0, supportsEffort: true, cliEffort: undefined, expected: 'low' },
+    { model: 'claude-sonnet-5', current: 'high', currentUpdatedAt: 30, supportsEffort: true, cliEffort: undefined, expected: undefined },
+    { model: 'claude-sonnet-5', current: undefined, currentUpdatedAt: 0, supportsEffort: true, cliEffort: 'medium', expected: 'medium' },
+    { model: 'claude-haiku-4-5', current: undefined, currentUpdatedAt: 0, supportsEffort: true, cliEffort: undefined, expected: undefined },
+    { model: 'claude-sonnet-5', current: undefined, currentUpdatedAt: 0, supportsEffort: false, cliEffort: undefined, expected: undefined },
+  ])('prepares empty resumed native launch with persisted effort and precedence ($model/$current/$cliEffort/$supportsEffort)', async (input) => {
+    // Real readiness producer, model policy and native spawn serialization; only executable
+    // discovery/process invocation are replaced. No queued message can seed this empty Resume.
+    const initialMode: EnhancedMode = { permissionMode: 'read-only', model: input.model, reasoningEffort: input.current };
+    const prepared = await prepareClaudeUnifiedTerminalInitialMode({
+      initialMode,
+      modelId: input.model,
+      modelEffortTracker: createClaudeModelEffortLevelsTracker({ resolveTimeoutMs: () => 1_000 }),
+      getMetadataSnapshot: () => createTestMetadata({
+        sessionConfigOptionOverridesV1: {
+          v: 1,
+          updatedAt: 20,
+          overrides: { reasoning_effort: { value: 'low', updatedAt: 20 } },
+        },
+      }),
+      readReasoningEffortState: () => ({ value: input.current, updatedAt: input.currentUpdatedAt }),
+      installedRuntimeCapabilities: { supportsEffort: input.supportsEffort, supportsUltracode: true },
+    });
+    const spawn = await buildClaudeUnifiedTerminalSpawn({
+      path: '/workspace/project',
+      happySessionId: 'empty-resumed-happier-session',
+      first: { message: '', mode: initialMode },
+      claudeArgs: ['--resume', 'existing-native-session', ...(input.cliEffort ? ['--effort', input.cliEffort] : [])],
+      deps: {
+        resolveClaudeCliPath: () => '/usr/local/bin/claude',
+        ensureClaudeJsRuntimeExecutable: async () => '/managed/node',
+        claudeLocalLauncherPath: '/happier/scripts/claude_local_launcher.cjs',
+        terminalLaunchSpecRunnerPath: '/happier/scripts/terminal_launch_spec_runner.cjs',
+      },
+    });
+    const launch = await readLaunchSpecFromSpawn(spawn);
+    const args = launch.args ?? [];
+    expect(args.flatMap((arg, index) => arg === '--effort' ? [args[index + 1]] : []))
+      .toEqual(input.expected ? [input.expected] : []);
+    expect(args).toContain('existing-native-session');
+    expect(prepared.reasoningEffort).toBe(input.currentUpdatedAt > 20 ? input.current : 'low');
+    expect(prepared.reasoningEffortUpdatedAt).toBe(Math.max(input.currentUpdatedAt, 20));
   });
 
   it('always allows later dangerous permission bypass without starting default sessions in bypass mode', async () => {
@@ -844,6 +893,8 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
       ANTHROPIC_API_KEY: 'sk-ant-test',
       CLAUDE_CONFIG_DIR: '/tmp/claude-config',
       CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'true',
+      HERDR_ENV: '1',
+      HERDR_PANE_ID: 'w1:p2',
       HUGE_UNRELATED_ENV: 'y'.repeat(200_000),
       MY_EXPLICIT_CHILD_ENV: 'kept',
       [HAPPIER_SPAWN_EXPLICIT_ENV_KEYS_JSON_ENV_VAR]: JSON.stringify(['MY_EXPLICIT_CHILD_ENV']),
@@ -885,6 +936,9 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
       expect(spawn.spawnEnv[HAPPIER_SPAWN_EXPLICIT_ENV_KEYS_JSON_ENV_VAR]).toBeUndefined();
       expect(launchSpec.env?.HUGE_UNRELATED_ENV).toBeUndefined();
       expect(launchSpec.env?.[HAPPIER_SPAWN_EXPLICIT_ENV_KEYS_JSON_ENV_VAR]).toBeUndefined();
+      expect(launchSpec.env?.HERDR_ENV).toBeUndefined();
+      expect(launchSpec.envPassthroughKeys ?? []).not.toContain('HERDR_ENV');
+      expect(spawn.spawnEnv.HERDR_ENV).toBeUndefined();
     });
   });
 

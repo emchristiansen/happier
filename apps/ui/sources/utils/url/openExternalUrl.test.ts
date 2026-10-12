@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const openUrlSpy = vi.fn(async (_url: string) => {});
+const tauriInvokeSpy = vi.fn(async (_command: string, _args?: Record<string, unknown>) => {});
+const tauriState = vi.hoisted(() => ({ isDesktop: false }));
+
+vi.mock('@/utils/platform/tauri', () => ({
+  isTauriDesktop: () => tauriState.isDesktop,
+  invokeTauri: (...args: [string, Record<string, unknown>?]) => tauriInvokeSpy(...args),
+}));
 
 vi.mock('react-native', async () => {
     const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
@@ -17,6 +24,31 @@ vi.mock('react-native', async () => {
 });
 
 describe('openExternalUrl', () => {
+  it('opens web links with the system browser on Tauri desktop', async () => {
+    tauriState.isDesktop = true;
+    tauriInvokeSpy.mockClear();
+    const { openExternalUrl } = await import('./openExternalUrl');
+    try {
+      await expect(openExternalUrl('https://example.com', { platformOS: 'web' })).resolves.toBe(true);
+      expect(tauriInvokeSpy).toHaveBeenCalledWith('plugin:opener|open_url', { url: 'https://example.com' });
+    } finally {
+      tauriState.isDesktop = false;
+    }
+  });
+
+  it('reports a desktop opener failure instead of falling back to the webview', async () => {
+    tauriState.isDesktop = true;
+    tauriInvokeSpy.mockImplementationOnce(async () => { throw new Error('opener unavailable'); });
+    const report = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { openExternalUrl } = await import('./openExternalUrl');
+    try {
+      await expect(openExternalUrl('https://example.com', { platformOS: 'web' })).resolves.toBe(false);
+      expect(report).toHaveBeenCalledOnce();
+    } finally {
+      report.mockRestore();
+      tauriState.isDesktop = false;
+    }
+  });
   it('uses Linking.openURL on native', async () => {
     openUrlSpy.mockClear();
     const { openExternalUrl } = await import('./openExternalUrl');

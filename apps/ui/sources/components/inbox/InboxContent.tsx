@@ -7,7 +7,7 @@ import { ApprovalInboxCard } from '@/components/inbox/cards/ApprovalInboxCard';
 import { InboxSessionAttentionGroupCard } from '@/components/inbox/sessionAttention/InboxSessionAttentionGroupCard';
 import { InboxSessionReviewRow } from '@/components/inbox/InboxSessionReviewRow';
 import { InboxMarkAllReadButton } from '@/components/inbox/InboxMarkAllReadButton';
-import { InboxSection } from '@/components/inbox/InboxSection';
+import { ListSection } from '@/components/ui/lists/ListSection';
 import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 import { Icon } from '@/components/ui/icons/Icon';
 import { Item } from '@/components/ui/lists/Item';
@@ -68,7 +68,7 @@ export const InboxContent = React.memo(function InboxContent(props: Readonly<{
             <RecoveryKeyReminderBanner />
 
             {failedSessions.length > 0 || failedOperations.length > 0 ? (
-                <InboxSection id="errors" title={t('inbox.errors')} surface={sectionSurface}>
+                <ListSection namespace="inbox" id="errors" title={t('inbox.errors')} surface={sectionSurface}>
                     {failedSessions.map((entry) => {
                         const context = model.sessionContextByKey.get(entry.key);
                         return (
@@ -89,11 +89,12 @@ export const InboxContent = React.memo(function InboxContent(props: Readonly<{
                     {failedOperations.length > 0 ? (
                         <ActionOperationRows operations={failedOperations} {...operationRowsProps} />
                     ) : null}
-                </InboxSection>
+                </ListSection>
             ) : null}
 
             {readySessions.length > 0 ? (
-                <InboxSection
+                <ListSection
+                    namespace="inbox"
                     id="ready"
                     title={t('status.readyForReview')}
                     headerAction={<InboxMarkAllReadButton model={model} />}
@@ -119,11 +120,12 @@ export const InboxContent = React.memo(function InboxContent(props: Readonly<{
                             />
                         );
                     })}
-                </InboxSection>
+                </ListSection>
             ) : null}
 
             {model.openApprovals.length > 0 || model.sessionsNeedingAttention.length > 0 || attentionOperations.length > 0 ? (
-                <InboxSection
+                <ListSection
+                    namespace="inbox"
                     id="needs-attention"
                     title={t('inbox.actionOperations.sections.needsAttention')}
                     spacing="separated"
@@ -191,11 +193,11 @@ export const InboxContent = React.memo(function InboxContent(props: Readonly<{
                     {attentionOperations.length > 0 ? (
                         <ActionOperationRows operations={attentionOperations} {...operationRowsProps} />
                     ) : null}
-                </InboxSection>
+                </ListSection>
             ) : null}
 
             {model.showFriendsActivity && model.friendRequests.length > 0 ? (
-                <InboxSection id="friend-requests" title={t('friends.pendingRequests')} spacing="separated" surface={sectionSurface}>
+                <ListSection namespace="inbox" id="friend-requests" title={t('friends.pendingRequests')} spacing="separated" surface={sectionSurface}>
                     {model.friendRequests.map((friend) => (
                         <UserCard
                             key={friend.id}
@@ -207,7 +209,7 @@ export const InboxContent = React.memo(function InboxContent(props: Readonly<{
                             }}
                         />
                     ))}
-                </InboxSection>
+                </ListSection>
             ) : null}
 
             {model.isFriendsLoading && !model.hasContent ? (

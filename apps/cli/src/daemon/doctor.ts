@@ -343,10 +343,8 @@ export function classifyHappyProcess(proc: RawProcessInfo): HappyProcessInfo | n
     type = cmd.includes('tsx') ? 'dev-daemon-spawned' : 'daemon-spawned-session';
   } else if (cmd.includes('doctor')) {
     type = cmd.includes('tsx') ? 'dev-doctor' : 'doctor';
-  } else if (cmd.includes('--yolo')) {
-    type = 'dev-session';
   } else {
-    type = cmd.includes('tsx') ? 'dev-related' : 'user-session';
+    type = cmd.includes('tsx') ? 'dev-session' : 'user-session';
   }
 
   return {

@@ -72,6 +72,8 @@ Before treating a local timeout as product evidence, check whether the developme
 
 Measure cleanup by fewer competing owners, fewer repeated fixtures, faster time to the first deciding failure, and fewer expensive full reruns—not by raw test-count reduction.
 
+For a subsystem-sized pruning campaign, use `.agents/skills/happier-testing/references/test-audit.md`. Use codemods only for mechanically provable migrations after previewing their full match set; test value and keeper selection remain owner-level judgments. Prefer report-only smell analyzers with ratcheting baselines over an immediate repository-wide ban.
+
 When a live E2E surface is stale, use boundary evidence in order: confirm the producer state changed, confirm a fresh transport request and response occurred, then inspect the active DOM/rendered bytes. If the producer and transport are fresh but the active DOM is old, correct and test the renderer boundary; do not add more polling, invalidate unrelated stores, or raise the assertion timeout.
 
 For virtualized browser surfaces, `locator.isVisible()` proves CSS visibility, not viewport intersection, and a row locator may resolve to a different recycled node between assertions. Assert viewport intersection explicitly, read related identity/position facts atomically when they must describe one render, and anchor selectors in semantic content. Treat framework- or library-generated DOM-id prefixes as implementation detail; assert the stable owner-defined suffix or data contract instead of the generated prefix.

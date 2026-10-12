@@ -3,6 +3,7 @@ import {
   ensureHappierCliPathExposure,
   removeHappierCliPathExposure,
   resolveFirstPartyInstallLayout,
+  type HappierCliPathExposureResult,
 } from '@happier-dev/cli-common/firstPartyRuntime';
 
 import { parseDaemonServiceParams } from './daemonService.js';
@@ -18,7 +19,8 @@ function resolveManagedCliBinDir(processEnv: NodeJS.ProcessEnv): string {
 /**
  * Settings repair action: "Add happier to PATH". The setup executor calls the same owner after
  * readiness; this kind exists so the user can retry (or undo) it explicitly, and a failure here
- * is the user-facing result rather than a quiet one.
+ * is the user-facing result rather than a quiet one. `existingCommand` names another `happier`
+ * that already resolves on PATH and was deliberately left in front (nothing is added then).
  */
 export function createCliPathExposureEnsureHandler(overrides: Partial<CliPathExposureDeps> = {}) {
   const processEnv = overrides.processEnv ?? process.env;
@@ -26,7 +28,7 @@ export function createCliPathExposureEnsureHandler(overrides: Partial<CliPathExp
   return async function* (
     params: unknown,
     _context: Readonly<{ signal: AbortSignal }>,
-  ): AsyncGenerator<never, Readonly<{ changed: boolean; shellReloadHint: string | null; failure: string | null }>, void> {
+  ): AsyncGenerator<never, HappierCliPathExposureResult, void> {
     parseDaemonServiceParams(params);
     const result = await ensureHappierCliPathExposure({
       binDir: resolveManagedCliBinDir(processEnv),

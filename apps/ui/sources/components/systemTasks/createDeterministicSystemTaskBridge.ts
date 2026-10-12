@@ -108,6 +108,14 @@ function buildDefaultScenario(spec: SystemTaskSpec, taskId: string): readonly De
                             machineIdMatches: true,
                             cliVersionMatches: true,
                         },
+                        // R16 — the executor's one list of this computer's services.
+                        serviceRows: getActiveServerSnapshot().serverUrl
+                            ? [{ relayUrl: getActiveServerSnapshot().serverUrl, state: 'connected', appManaged: true, serving: 'default-following', actions: ['restart', 'stop'] }]
+                            : [],
+                        pinnedServices: { complete: true, coexistence: true, services: [], unreadable: [] },
+                        // The producer's aggregates over the managed services (one running, mode undeclared).
+                        runningManagedServiceCount: 1,
+                        managedServiceAutostart: null,
                     },
                 },
             },

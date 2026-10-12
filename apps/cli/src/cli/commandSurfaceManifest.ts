@@ -103,6 +103,12 @@ const COMMAND_SURFACE_MANIFEST: readonly CliCommandSurfaceEntry[] = [
     allowTmux: false,
   },
   {
+    command: 'herdr',
+    rootHelpLabel: 'happier herdr',
+    rootHelpDescription: 'Open Herdr for local terminal sessions',
+    allowTmux: false,
+  },
+  {
     command: 'uninstall',
     allowTmux: false,
   },

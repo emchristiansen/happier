@@ -27,6 +27,7 @@ export async function authenticateAcpAgent(params: Readonly<{
   let connection: AcpClientConnection | null = null;
   let onAbort: (() => void) | undefined;
   let initializeTimer: ReturnType<typeof setTimeout> | undefined;
+  let loginFailure: { error: unknown } | undefined;
 
   const interrupted = new Promise<never>((_resolve, reject) => {
     child.once('error', reject);
@@ -74,12 +75,25 @@ export async function authenticateAcpAgent(params: Readonly<{
       await peer.authenticate({ methodId: selection.methodId });
     };
     await Promise.race([login(), interrupted]);
+  } catch (error) {
+    loginFailure = { error };
+    throw error;
   } finally {
     clearTimeout(initializeTimer);
     if (onAbort) params.signal?.removeEventListener('abort', onAbort);
-    child.stderr?.removeListener('data', params.onStderr);
     connection?.close();
-    await killProcessTree(child);
-    await connection?.closed.catch(() => {});
+    try {
+      await killProcessTree(child);
+    } catch (cleanupError) {
+      if (loginFailure) {
+        throw new AggregateError([loginFailure.error, cleanupError], 'ACP login and process cleanup failed');
+      }
+      throw cleanupError;
+    } finally {
+      await connection?.closed.catch(() => {});
+      // ACP success on stdout can arrive before the browser link on stderr.
+      // Keep explicit-login output attached until provider cleanup has settled.
+      child.stderr?.removeListener('data', params.onStderr);
+    }
   }
 }

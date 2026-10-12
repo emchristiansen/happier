@@ -299,9 +299,10 @@ export function useSessionChatFooterState(sessionId: string | null): SessionChat
       const session = sessionId ? state.sessions[sessionId] ?? null : null;
       if (!session) return null;
 
+      const localControl = getSessionLocalControlState(session);
       const value: SessionChatFooterState = {
-        controlledByUser: session.agentState?.controlledByUser === true,
-        localControl: getSessionLocalControlState(session),
+        controlledByUser: localControl?.attached === true && localControl.topology === 'exclusive',
+        localControl,
         permissionsInUiWhileLocal: getPermissionsInUiWhileLocal(session.agentState?.capabilities),
       };
       const signature = buildSessionChatFooterStateSignature(value);

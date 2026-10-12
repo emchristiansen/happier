@@ -1,4 +1,6 @@
 import type { TrackedSession } from '../types';
+import type { ProcessRunState } from '../processRunState';
+import { waitForTrackedRunnerProcessesExit } from './waitForTrackedRunnerProcessesExit';
 
 type ExitObservation = Readonly<{
   reason: 'process-missing';
@@ -6,17 +8,12 @@ type ExitObservation = Readonly<{
   signal: null;
 }>;
 
-function sleep(ms: number): Promise<void> {
-  const safeMs = Number.isFinite(ms) && ms > 0 ? ms : 0;
-  return new Promise((resolve) => setTimeout(resolve, safeMs));
-}
-
 function trackedSessionMatchesExistingSessionId(trackedSession: TrackedSession, sessionId: string): boolean {
   if (trackedSession.happySessionId === sessionId) return true;
 
   const existingSessionId =
-    trackedSession.spawnOptions && typeof (trackedSession.spawnOptions as any).existingSessionId === 'string'
-      ? String((trackedSession.spawnOptions as any).existingSessionId).trim()
+    trackedSession.spawnOptions && typeof trackedSession.spawnOptions.existingSessionId === 'string'
+      ? trackedSession.spawnOptions.existingSessionId.trim()
       : '';
   return existingSessionId === sessionId;
 }
@@ -50,7 +47,7 @@ function collectStopRequestedMatchingPids(params: Readonly<{
 export async function waitForExistingSessionExitIfStopRequested(params: Readonly<{
   sessionId: string;
   pidToTrackedSession: ReadonlyMap<number, TrackedSession>;
-  isSessionRunnerActive: (sessionId: string) => Promise<boolean>;
+  readRunState?: (pid: number) => Promise<ProcessRunState>;
   timeoutMs: number;
   pollIntervalMs: number;
   trackedPids?: ReadonlyArray<number>;
@@ -66,21 +63,12 @@ export async function waitForExistingSessionExitIfStopRequested(params: Readonly
   });
   if (initialMatchingPids.length === 0) return;
 
-  const timeoutMs = Math.max(0, Math.floor(params.timeoutMs));
-  const start = Date.now();
-  while (Date.now() - start <= timeoutMs) {
-    const active = await params.isSessionRunnerActive(normalizedSessionId);
-    if (!active) {
-      const matchingPids = collectStopRequestedMatchingPids({
-        sessionId: normalizedSessionId,
-        pidToTrackedSession: params.pidToTrackedSession,
-        trackedPids: params.trackedPids,
-      });
-      for (const pid of matchingPids) {
-        await params.onExitObserved?.(pid, { reason: 'process-missing', code: null, signal: null });
-      }
-      return;
-    }
-    await sleep(params.pollIntervalMs);
-  }
+  // Serviceability is not death proof: paused or identity-unknown runners must retain custody.
+  await waitForTrackedRunnerProcessesExit({
+    runners: initialMatchingPids.map((pid) => ({ pid })),
+    timeoutMs: params.timeoutMs,
+    pollIntervalMs: params.pollIntervalMs,
+    readRunState: params.readRunState,
+    onExitObserved: params.onExitObserved,
+  });
 }

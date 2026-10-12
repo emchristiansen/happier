@@ -1,21 +1,12 @@
+import { expectTerminalNativeInvocation, terminalLauncherBoundary } from '@/testkit/process/terminalLauncher';
 import { chmod, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const { resolveWindowsCommandInvocationMock } = vi.hoisted(() => ({
-  resolveWindowsCommandInvocationMock: vi.fn((
-    { command, args }: { command: string; args: readonly string[] },
-  ): { command: string; args: string[]; windowsVerbatimArguments?: boolean } => ({
-    command,
-    args: [...args],
-  })),
-}));
-
-vi.mock('@happier-dev/cli-common/process', () => ({
-  resolveWindowsCommandInvocation: resolveWindowsCommandInvocationMock,
-}));
+const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+afterEach(() => Object.defineProperty(process, 'platform', platformDescriptor));
 
 import { createOpenCodeTuiSupervisor } from './openCodeTuiSupervisor';
 
@@ -92,10 +83,10 @@ async function createNodeShebangExecutable(name: string): Promise<{ commandPath:
 describe('createOpenCodeTuiSupervisor', () => {
   it('attaches a released OpenCode 2 managed server through the root dialect with its retained credential', async () => {
     const proc = createSpawnedProcessHarness();
-    const spawnProcess = vi.fn(() => proc.child as any);
+    const spawnProcess = vi.fn(() => terminalLauncherBoundary(proc.child));
     const commandPath = await createFakeExecutable('opencode');
     const supervisor = createOpenCodeTuiSupervisor({
-      spawnProcess,
+      spawnProcess: spawnProcess as unknown as typeof import('node:child_process').spawn,
       env: { HAPPIER_OPENCODE_PATH: commandPath } as NodeJS.ProcessEnv,
       resolveDialectFn: async () => 'v2',
       readManagedServerStateFn: async () => ({
@@ -112,7 +103,7 @@ describe('createOpenCodeTuiSupervisor', () => {
       sessionId: 'session-1',
     })).resolves.toBe(true);
 
-    expect(spawnProcess).toHaveBeenCalledWith(
+    await expectTerminalNativeInvocation(spawnProcess.mock.calls,
       commandPath,
       ['--server', 'http://127.0.0.1:4096', '--session', 'session-1', '/tmp/workspace'],
       expect.objectContaining({
@@ -126,10 +117,10 @@ describe('createOpenCodeTuiSupervisor', () => {
 
   it('spawns the resolved opencode attach command with inherited stdio and tracks attachment state', async () => {
     const proc = createSpawnedProcessHarness();
-    const spawnProcess = vi.fn(() => proc.child as any);
+    const spawnProcess = vi.fn(() => terminalLauncherBoundary(proc.child));
     const commandPath = await createFakeExecutable('opencode');
     const supervisor = createOpenCodeTuiSupervisor({
-      spawnProcess,
+      spawnProcess: spawnProcess as unknown as typeof import('node:child_process').spawn,
       env: { HAPPIER_OPENCODE_PATH: commandPath } as NodeJS.ProcessEnv,
       resolveDialectFn: async () => 'v1',
       readManagedServerStateFn: async () => null,
@@ -142,7 +133,7 @@ describe('createOpenCodeTuiSupervisor', () => {
     })).resolves.toBe(true);
 
     expect(spawnProcess).toHaveBeenCalledTimes(1);
-    expect(spawnProcess).toHaveBeenCalledWith(
+    await expectTerminalNativeInvocation(spawnProcess.mock.calls,
       commandPath,
       ['attach', 'http://127.0.0.1:4096', '--dir', '/tmp/workspace', '--session', 'session-1'],
       expect.objectContaining({ stdio: 'inherit' }),
@@ -150,16 +141,16 @@ describe('createOpenCodeTuiSupervisor', () => {
     expect(supervisor.isAttached()).toBe(true);
 
     proc.emitExit();
-    expect(supervisor.isAttached()).toBe(false);
+    await vi.waitFor(() => expect(supervisor.isAttached()).toBe(false));
   });
 
   it('detaches the running process and clears attachment state', async () => {
     const proc = createSpawnedProcessHarness();
     const onExit = vi.fn();
-    const spawnProcess = vi.fn(() => proc.child as any);
+    const spawnProcess = vi.fn(() => terminalLauncherBoundary(proc.child));
     const commandPath = await createFakeExecutable('opencode');
     const supervisor = createOpenCodeTuiSupervisor({
-      spawnProcess,
+      spawnProcess: spawnProcess as unknown as typeof import('node:child_process').spawn,
       onExit,
       env: { HAPPIER_OPENCODE_PATH: commandPath } as NodeJS.ProcessEnv,
       resolveDialectFn: async () => 'v1',
@@ -187,11 +178,11 @@ describe('createOpenCodeTuiSupervisor', () => {
     // "before startup completes" window is entered from the spawn itself.
     const spawnProcess = vi.fn(() => {
       setImmediate(() => proc.emitError(new Error('ENOENT')));
-      return proc.child as any;
+      return terminalLauncherBoundary(proc.child);
     });
     const commandPath = await createFakeExecutable('opencode');
     const supervisor = createOpenCodeTuiSupervisor({
-      spawnProcess,
+      spawnProcess: spawnProcess as unknown as typeof import('node:child_process').spawn,
       env: { HAPPIER_OPENCODE_PATH: commandPath } as NodeJS.ProcessEnv,
       resolveDialectFn: async () => 'v1',
       readManagedServerStateFn: async () => null,
@@ -209,10 +200,10 @@ describe('createOpenCodeTuiSupervisor', () => {
   it('invokes onExit only once when the child emits both error and exit after startup', async () => {
     const proc = createSpawnedProcessHarness();
     const onExit = vi.fn();
-    const spawnProcess = vi.fn(() => proc.child as any);
+    const spawnProcess = vi.fn(() => terminalLauncherBoundary(proc.child));
     const commandPath = await createFakeExecutable('opencode');
     const supervisor = createOpenCodeTuiSupervisor({
-      spawnProcess,
+      spawnProcess: spawnProcess as unknown as typeof import('node:child_process').spawn,
       onExit,
       env: { HAPPIER_OPENCODE_PATH: commandPath } as NodeJS.ProcessEnv,
       resolveDialectFn: async () => 'v1',
@@ -228,16 +219,16 @@ describe('createOpenCodeTuiSupervisor', () => {
     proc.emitError(new Error('late error'));
     proc.emitExit();
 
-    expect(onExit).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(onExit).toHaveBeenCalledTimes(1));
     expect(supervisor.isAttached()).toBe(false);
   });
 
   it('wraps node-shebang opencode CLIs with the configured JS runtime when attaching', async () => {
     const proc = createSpawnedProcessHarness();
-    const spawnProcess = vi.fn(() => proc.child as any);
+    const spawnProcess = vi.fn(() => terminalLauncherBoundary(proc.child));
     const { commandPath, runtimePath } = await createNodeShebangExecutable('opencode');
     const supervisor = createOpenCodeTuiSupervisor({
-      spawnProcess,
+      spawnProcess: spawnProcess as unknown as typeof import('node:child_process').spawn,
       env: {
         HAPPIER_OPENCODE_PATH: commandPath,
         HAPPIER_JS_RUNTIME_PATH: runtimePath,
@@ -252,7 +243,7 @@ describe('createOpenCodeTuiSupervisor', () => {
       sessionId: 'session-1',
     })).resolves.toBe(true);
 
-    expect(spawnProcess).toHaveBeenCalledWith(
+    await expectTerminalNativeInvocation(spawnProcess.mock.calls,
       runtimePath,
       [commandPath, 'attach', 'http://127.0.0.1:4096', '--dir', '/tmp/workspace', '--session', 'session-1'],
       expect.objectContaining({ stdio: 'inherit' }),
@@ -261,15 +252,12 @@ describe('createOpenCodeTuiSupervisor', () => {
 
   it('wraps Windows shell shims before attaching', async () => {
     const proc = createSpawnedProcessHarness();
-    const spawnProcess = vi.fn(() => proc.child as any);
+    const spawnProcess = vi.fn(() => terminalLauncherBoundary(proc.child));
     const isolatedHome = await mkdtemp(join(tmpdir(), 'happier-opencode-supervisor-home-'));
-    resolveWindowsCommandInvocationMock.mockReturnValueOnce({
-      command: 'C:\\Windows\\System32\\cmd.exe',
-      args: ['/d', '/s', '/c', '"C:\\Users\\natan\\AppData\\Roaming\\npm\\opencode.CMD attach http://127.0.0.1:4096 --dir C:\\workspace --session session-2"'],
-      windowsVerbatimArguments: true,
-    });
+    // Platform identity is an OS boundary; command rendering remains real.
+    Object.defineProperty(process, 'platform', { value: 'win32' });
     const supervisor = createOpenCodeTuiSupervisor({
-      spawnProcess,
+      spawnProcess: spawnProcess as unknown as typeof import('node:child_process').spawn,
       env: {
         ComSpec: 'C:\\Windows\\System32\\cmd.exe',
         PATH: '',
@@ -288,13 +276,9 @@ describe('createOpenCodeTuiSupervisor', () => {
       sessionId: 'session-2',
     })).resolves.toBe(true);
 
-    expect(resolveWindowsCommandInvocationMock).toHaveBeenCalledWith(expect.objectContaining({
-      command: 'C:\\Users\\natan\\AppData\\Roaming\\npm\\opencode.CMD',
-      args: ['attach', 'http://127.0.0.1:4096', '--dir', 'C:\\workspace', '--session', 'session-2'],
-    }));
-    expect(spawnProcess).toHaveBeenCalledWith(
+    await expectTerminalNativeInvocation(spawnProcess.mock.calls,
       'C:\\Windows\\System32\\cmd.exe',
-      ['/d', '/s', '/c', '"C:\\Users\\natan\\AppData\\Roaming\\npm\\opencode.CMD attach http://127.0.0.1:4096 --dir C:\\workspace --session session-2"'],
+      ['/d', '/s', '/c', expect.stringContaining('opencode.CMD')],
       expect.objectContaining({ stdio: 'inherit', windowsVerbatimArguments: true }),
     );
   });

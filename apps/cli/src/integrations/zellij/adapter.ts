@@ -561,8 +561,8 @@ export async function disposeZellijSession(params: Readonly<{
     runnerPid: process.pid,
     callSite: 'integrations.zellij.adapter.dispose',
   };
-  const warn = (action: 'kill-session' | 'delete-session', error: unknown): void => {
-    logger.warn(`[zellij teardown] ${action} failed; continuing best-effort teardown`, {
+  const warn = (action: 'kill-session' | 'delete-session', _error: unknown): void => {
+    logger.infoFile(`[zellij teardown] ${action} failed; continuing best-effort teardown`, {
       action,
       actor: audit.actor,
       reason: audit.reason,
@@ -570,7 +570,7 @@ export async function disposeZellijSession(params: Readonly<{
       sessionId: audit.sessionId,
       runnerPid: audit.runnerPid,
       sessionName: params.sessionName,
-      error,
+      cleanupIncomplete: true,
     });
   };
   const recordAudit = (action: 'kill-session' | 'delete-session'): void => {
@@ -664,7 +664,7 @@ async function cleanupZellijSessionAndRethrowStartupError(params: Readonly<{
     sessionName: params.sessionName,
     actionTimeoutMs: params.actionTimeoutMs,
   });
-  await disposeZellijSession({
+  const cleanup = await disposeZellijSession({
     actions: params.actions,
     zellijBinary: params.zellijBinary,
     env: params.env,
@@ -678,6 +678,19 @@ async function cleanupZellijSessionAndRethrowStartupError(params: Readonly<{
       callSite: 'integrations.zellij.adapter.startupCleanup',
     },
   });
+  if (isTerminalHostStartupError(startupError)) {
+    throw new TerminalHostStartupError({
+      hostKind: startupError.hostKind,
+      reason: startupError.reason,
+      message: startupError.message,
+      diagnostics: startupError.diagnostics,
+      cause: startupError,
+      launchFailure: {
+        launchDisposition: cleanup.killCompleted ? 'stopped' : 'unconfirmed',
+        cleanupIncomplete: !cleanup.killCompleted || !cleanup.deleteCompleted,
+      },
+    });
+  }
   throw startupError;
 }
 
@@ -1109,6 +1122,9 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
 
   const createOrAttachHost: TerminalHostAdapter['createOrAttachHost'] = async (opts) => {
     await prepareSocketDir(env.ZELLIJ_SOCKET_DIR);
+    // Zellij panes inherit the server environment, not the later `run` client's environment.
+    // Use the same launch values when creating either kind of server and its command pane.
+    const launchEnv = { ...env, ...opts.spawnEnv };
     const launchStrategy = params.launchStrategy ?? { type: 'background' };
     let activeSessionName = opts.sessionName;
     let collisionMayBelongToAnotherRunner = false;
@@ -1116,7 +1132,7 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
       if (launchStrategy.type === 'background') {
         const attachCreateBackground = () => actions.attachCreateBackground({
           zellijBinary: params.zellijBinary,
-          env,
+          env: launchEnv,
           sessionName: activeSessionName,
           cwd: opts.workingDirectory,
           ...(params.defaultShell ? { defaultShell: params.defaultShell } : {}),
@@ -1195,7 +1211,7 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
       } else {
         await launchStrategy.launchClient({
           zellijBinary: params.zellijBinary,
-          env,
+          env: launchEnv,
           sessionName: activeSessionName,
           cwd: opts.workingDirectory,
           ...(params.defaultShell ? { defaultShell: params.defaultShell } : {}),
@@ -1249,10 +1265,7 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
         try {
           runResult = await actions.runCommand({
             zellijBinary: params.zellijBinary,
-            env: {
-              ...env,
-              ...opts.spawnEnv,
-            },
+            env: launchEnv,
             sessionName: activeSessionName,
             cwd: opts.workingDirectory,
             command: opts.spawnArgv,
@@ -1299,10 +1312,7 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
         }
         detachedCommandHandle = await actions.startCommandDetached({
           zellijBinary: params.zellijBinary,
-          env: {
-            ...env,
-            ...opts.spawnEnv,
-          },
+          env: launchEnv,
           sessionName: activeSessionName,
           cwd: opts.workingDirectory,
           command: opts.spawnArgv,
@@ -1533,6 +1543,8 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
         duplicateRisk = 'likely';
         const submission = await runTerminalPromptSubmission({
           promptText: textToWrite,
+          signal: input.signal,
+          resolveDeliveryState: input.resolveDeliveryState,
           ...(promptSubmitVerification?.shouldVerifyAfterSubmit(textToWrite)
             ? {
               verifyStagedBeforeSubmit: async ({ promptText, remainingTimeoutMs }) => {

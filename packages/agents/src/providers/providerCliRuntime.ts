@@ -50,6 +50,11 @@ export type ProviderCliManagedInstallSpec =
 
 export type ProviderCliKnownCommandCandidate =
   | Readonly<{
+      kind: 'envBinDir';
+      envVar: string;
+      relativeDir: string;
+    }>
+  | Readonly<{
       kind: 'homeBinDir';
       relativeDir: string;
     }>
@@ -72,6 +77,29 @@ export type ProviderCliAlternativeBinaryIdentityProbe = Readonly<{
   stdoutJsonStringField: string;
 }>;
 
+/**
+ * Who owns an installed agent CLI, derived from its resolved path. Only `managed`
+ * and `native` (with a declared vendor updater) can be updated by Happier; the
+ * package-manager sources are surfaced with a copyable command instead.
+ */
+export type ProviderCliInstallSource = 'managed' | 'native' | 'npm' | 'pnpm' | 'bun' | 'brew' | 'other';
+
+/**
+ * The vendor's own updater, verified from vendor documentation or source. It runs
+ * against the resolved executable only when that executable lives under one of
+ * `installPaths` (home-relative, `/`-separated; the resolved path or its real
+ * path must equal or sit under an entry), so Happier never asks a vendor updater
+ * to replace an install that a package manager owns.
+ */
+export type ProviderCliNativeUpdateSpec = Readonly<{
+  args: ReadonlyArray<string>;
+  installPaths: ReadonlyArray<string>;
+}>;
+
+export type ProviderCliLatestVersionSource =
+  | Readonly<{ kind: 'npm'; packageName: string }>
+  | Readonly<{ kind: 'github_release'; githubRepo: string }>;
+
 export type ProviderCliRuntimeSpec = Readonly<{
   id: AgentId;
   title: string;
@@ -87,6 +115,9 @@ export type ProviderCliRuntimeSpec = Readonly<{
   acceptsJavaScriptFileOverride: boolean;
   installGuideUrl?: string | null;
   docsUrl?: string | null;
+  /** The vendor's npm package, when the CLI is also published to npm and it is not already the managed package. */
+  npmPackageName?: string | null;
+  nativeUpdate?: ProviderCliNativeUpdateSpec | null;
 }>;
 
 function bashCurlPipe(url: string): ProviderCliInstallCommand {
@@ -130,6 +161,14 @@ export const PROVIDER_CLI_RUNTIME_SPECS: Readonly<Record<AgentId, ProviderCliRun
     acceptsJavaScriptFileOverride: true,
     installGuideUrl: 'https://code.claude.com/docs/en/setup',
     docsUrl: 'https://claude.ai',
+    npmPackageName: '@anthropic-ai/claude-code',
+    // https://code.claude.com/docs/en/setup ("Update manually": `claude update`). The native
+    // installer links ~/.local/bin/claude into ~/.local/share/claude/versions/ and, on Windows,
+    // installs %USERPROFILE%\.local\bin\claude.exe beside ~/.local/share/claude.
+    nativeUpdate: {
+      args: ['update'],
+      installPaths: ['.local/share/claude', '.local/bin/claude.exe'],
+    },
   },
   codex: {
     id: 'codex',
@@ -194,6 +233,14 @@ export const PROVIDER_CLI_RUNTIME_SPECS: Readonly<Record<AgentId, ProviderCliRun
     acceptsJavaScriptFileOverride: false,
     installGuideUrl: null,
     docsUrl: 'https://github.com/openai/codex',
+    npmPackageName: '@openai/codex',
+    // openai/codex `codex-rs/cli/src/main.rs` declares the `update` subcommand; the standalone
+    // installer (`scripts/install/install.sh`) keeps its payload in $CODEX_HOME/packages/standalone
+    // (default ~/.codex). A custom CODEX_HOME is not attributed and stays a manual update.
+    nativeUpdate: {
+      args: ['update'],
+      installPaths: ['.codex/packages/standalone'],
+    },
   },
   opencode: {
     id: 'opencode',
@@ -216,6 +263,12 @@ export const PROVIDER_CLI_RUNTIME_SPECS: Readonly<Record<AgentId, ProviderCliRun
     acceptsJavaScriptFileOverride: false,
     installGuideUrl: 'https://opencode.ai/docs',
     docsUrl: 'https://opencode.ai',
+    // https://opencode.ai/docs/cli/ (`opencode upgrade`); the official install script uses
+    // INSTALL_DIR=$HOME/.opencode/bin.
+    nativeUpdate: {
+      args: ['upgrade'],
+      installPaths: ['.opencode/bin'],
+    },
   },
   gemini: {
     id: 'gemini',
@@ -340,7 +393,10 @@ export const PROVIDER_CLI_RUNTIME_SPECS: Readonly<Record<AgentId, ProviderCliRun
     id: 'pi',
     title: 'Pi Coding Agent CLI',
     binaryName: 'pi',
-    knownCommandCandidates: null,
+    knownCommandCandidates: [
+      { kind: 'envBinDir', envVar: 'PI_CODING_AGENT_DIR', relativeDir: 'bin' },
+      { kind: 'homeBinDir', relativeDir: '.pi/agent/bin' },
+    ],
     sourcePreferenceDefault: 'system-first',
     managedInstall: {
       kind: 'managed_package',
@@ -396,6 +452,12 @@ export const PROVIDER_CLI_RUNTIME_SPECS: Readonly<Record<AgentId, ProviderCliRun
     acceptsJavaScriptFileOverride: false,
     installGuideUrl: 'https://cursor.com/docs/cli/installation',
     docsUrl: 'https://cursor.com/docs/cli',
+    // https://cursor.com/docs/cli/installation ("agent update"); `agent` and `cursor-agent` are
+    // the same installed executable under ~/.local/share/cursor-agent/versions/.
+    nativeUpdate: {
+      args: ['update'],
+      installPaths: ['.local/share/cursor-agent'],
+    },
   },
   grok: {
     id: 'grok',
@@ -481,6 +543,23 @@ export const PROVIDER_CLI_RUNTIME_SPECS: Readonly<Record<AgentId, ProviderCliRun
 
 export function getProviderCliRuntimeSpec(id: AgentId): ProviderCliRuntimeSpec {
   return PROVIDER_CLI_RUNTIME_SPECS[id];
+}
+
+export function resolveProviderCliNpmPackageName(spec: ProviderCliRuntimeSpec): string | null {
+  if (spec.managedInstall?.kind === 'managed_package') return spec.managedInstall.packageName;
+  return spec.npmPackageName ?? null;
+}
+
+/**
+ * Where "latest" comes from: the source the managed install owner would install
+ * from, else the vendor's npm package. `null` means no verified latest source.
+ */
+export function resolveProviderCliLatestVersionSource(spec: ProviderCliRuntimeSpec): ProviderCliLatestVersionSource | null {
+  if (spec.managedInstall?.kind === 'github_release_binary') {
+    return { kind: 'github_release', githubRepo: spec.managedInstall.githubRepo };
+  }
+  const packageName = resolveProviderCliNpmPackageName(spec);
+  return packageName ? { kind: 'npm', packageName } : null;
 }
 
 export function getProviderCliBinaryNames(

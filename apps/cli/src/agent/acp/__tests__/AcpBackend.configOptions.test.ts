@@ -14,6 +14,7 @@ function writeFakeAcpAgentScript(params: {
   recordedParamsPath?: string;
   modelSetResponse?: 'empty' | 'staleEcho';
   includeExactOpaqueOption?: boolean;
+  omitConfigOptions?: boolean;
 }): string {
   const src = `
     import { writeFileSync } from 'node:fs';
@@ -54,6 +55,10 @@ function writeFakeAcpAgentScript(params: {
         }
 
         if (method === 'session/new') {
+          if (${JSON.stringify(params.omitConfigOptions === true)}) {
+            ok(id, { sessionId: 'test-session' });
+            continue;
+          }
           ok(id, {
             sessionId: 'test-session',
             configOptions: [
@@ -149,6 +154,13 @@ function writeFakeAcpAgentScript(params: {
             ok(id, {});
             continue;
           }
+          if (configId === 'reasoning_effort') {
+            ok(id, { configOptions: [{
+              id: 'reasoning_effort', name: 'Thinking', category: 'thought_level', type: 'select',
+              currentValue: 'medium', options: [{ value: 'medium', name: 'Medium' }, { value: 'high', name: 'High' }],
+            }] });
+            continue;
+          }
           const nextTelemetry = configId === 'telemetry' ? value : 'false';
           ok(id, {
             configOptions: [
@@ -185,6 +197,26 @@ async function readRecordedParams(path: string): Promise<Record<string, unknown>
 }
 
 describe('AcpBackend session configOptions', () => {
+  it('does not fabricate an empty config snapshot when a successful setter has never observed options', async () => {
+    await withTempDir('happier-acp-config-unknown-', async (dir) => {
+      const scriptPath = writeFakeAcpAgentScript({ dir, omitConfigOptions: true });
+      const backend = new AcpBackend({ agentName: 'test', cwd: dir, command: process.execPath, args: [scriptPath] });
+      const updates: AgentMessage[] = [];
+      backend.onMessage((message) => {
+        if (message.type === 'event' && message.name === 'config_options_update') updates.push(message);
+      });
+      try {
+        const { sessionId } = await backend.startSession();
+        expect(backend.getSessionConfigOptionsState()).toBeNull();
+        await backend.setSessionConfigOption(sessionId, 'model', 'high');
+        expect(backend.getSessionConfigOptionsState()).toBeNull();
+        expect(updates).toEqual([]);
+      } finally {
+        await backend.dispose();
+      }
+    });
+  });
+
   it('suppresses mode controls and rejects both mode mutation paths when provider policy disables modes', async () => {
     await withTempDir('happier-acp-disabled-modes-', async (dir) => {
       const backend = new AcpBackend({
@@ -313,7 +345,7 @@ describe('AcpBackend session configOptions', () => {
     });
   });
 
-  it('repairs stale echoed configOptions for the config option that was accepted by the ACP agent', async () => {
+  it.each(['model', 'reasoning_effort'])('preserves the provider current %s value when a successful response differs from the request', async (configId) => {
     await withTempDir('happier-acp-config-options-stale-echo-', async (dir) => {
       const scriptPath = writeFakeAcpAgentScript({ dir, modelSetResponse: 'staleEcho' });
       let backend: AcpBackend | null = null;
@@ -327,17 +359,14 @@ describe('AcpBackend session configOptions', () => {
         });
 
         const started = await backend.startSession();
-        await backend.setSessionConfigOption(started.sessionId, 'model', 'composer-2.5[fast=true]');
+        await backend.setSessionConfigOption(started.sessionId, configId, configId === 'model' ? 'composer-2.5[fast=true]' : 'high');
 
         expect(backend.getSessionConfigOptionsState()).toEqual(expect.arrayContaining([
           expect.objectContaining({
-            id: 'model',
-            currentValue: 'composer-2.5[fast=true]',
+            id: configId,
+            currentValue: configId === 'model' ? 'default[]' : 'medium',
           }),
-          expect.objectContaining({
-            id: 'mode',
-            currentValue: 'ask',
-          }),
+          ...(configId === 'model' ? [expect.objectContaining({ id: 'mode', currentValue: 'ask' })] : []),
         ]));
       } finally {
         try {

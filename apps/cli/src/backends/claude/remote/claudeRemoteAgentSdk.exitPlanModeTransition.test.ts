@@ -139,15 +139,17 @@ describe('claudeRemoteAgentSdk (ExitPlanMode transition)', () => {
           expect(directResult).toMatchObject({
             hookSpecificOutput: {
               hookEventName: 'PermissionRequest',
-              decision: { behavior: 'allow', updatedInput: { plan: 'p1' } },
+              decision: { behavior: 'allow' },
             },
           });
           expect(duplicateResult).toMatchObject({
             hookSpecificOutput: {
               hookEventName: 'PermissionRequest',
-              decision: { behavior: 'allow', updatedInput: { plan: 'p1' } },
+              decision: { behavior: 'allow' },
             },
           });
+          expect(directResult.hookSpecificOutput?.decision).not.toHaveProperty('updatedInput');
+          expect(duplicateResult.hookSpecificOutput?.decision).not.toHaveProperty('updatedInput');
 
           yield { type: 'result' } as any;
         },

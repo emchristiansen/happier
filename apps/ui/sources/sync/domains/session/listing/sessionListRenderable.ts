@@ -170,6 +170,54 @@ export function deriveSessionListRenderableHasUnreadMessagesFromReadableSeq(
     });
 }
 
+export function deriveSessionListRenderableHasUnreadMessagesFromPatch(params: Readonly<{
+    renderable: SessionListRenderableSession;
+    patch: SessionListRenderablePatchFields;
+    explicitReadableSeq?: number | null;
+    recomputeUnread?: boolean;
+}>): boolean {
+    const { renderable, patch } = params;
+    if (
+        params.recomputeUnread !== true
+        && patch.metadata === undefined
+        && patch.lastViewedSessionSeq === undefined
+    ) {
+        return renderable.hasUnreadMessages === true;
+    }
+
+    const nextMetadata = patch.metadata === undefined ? renderable.metadata : patch.metadata;
+    const nextLastViewedSessionSeq = patch.lastViewedSessionSeq === undefined
+        ? renderable.lastViewedSessionSeq
+        : patch.lastViewedSessionSeq;
+    const projectedReadableSeq = resolveSessionReadableSeq({
+        messages: null,
+        sessionSeq: patch.seq ?? renderable.seq,
+        latestReadyEventSeq: patch.latestReadyEventSeq === undefined
+            ? renderable.latestReadyEventSeq
+            : patch.latestReadyEventSeq,
+        latestTurnStatus: patch.latestTurnStatus === undefined
+            ? renderable.latestTurnStatus
+            : patch.latestTurnStatus,
+        includeTerminalSessionSeq: true,
+    }) ?? 0;
+    const explicitReadableSeq = typeof params.explicitReadableSeq === 'number'
+        && Number.isFinite(params.explicitReadableSeq)
+        ? Math.max(0, Math.trunc(params.explicitReadableSeq))
+        : null;
+
+    return computeHasUnreadActivity({
+        sessionSeq: explicitReadableSeq === null
+            ? projectedReadableSeq
+            : Math.max(projectedReadableSeq, explicitReadableSeq),
+        pendingActivityAt: 0,
+        lastViewedSessionSeq: resolveLastViewedSessionSeq({
+            metadata: nextMetadata,
+            lastViewedSessionSeq: nextLastViewedSessionSeq,
+        }),
+        lastViewedPendingActivityAt: nextMetadata?.readStateV1?.pendingActivityAt,
+    });
+}
+
 /**
  * Work still open in this session — the same tally the session header's glyph, the composer chip
  * and the Agents tab badge read. One counter, one grouping rule, one description (R-8).

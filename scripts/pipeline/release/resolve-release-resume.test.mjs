@@ -146,6 +146,52 @@ const expected = {
   channel: 'dev',
 };
 
+test('combined release resume reuses only exact-source, channel-scoped successful mobile and OTA flows', () => {
+  const workflowPath = '.github/workflows/release-preview-and-production.yml';
+  const surfaces = [previewCliCandidate(), ...standardOptionalSurfaces(true)];
+  surfaces.find((surface) => surface.id === 'deploy_ui').identity.expoAction = 'full';
+  const prefix = 'Publish preview channel / deploy_ui / ';
+  const flows = [
+    ['promote', ['Publish Android OTA from validated bytes', 'Publish iOS OTA from validated bytes']],
+    ['Mobile native (local runner) / Build (ios)', ['EAS build (pipeline)']],
+    ['Mobile native (local runner) / Build (android)', ['EAS build (pipeline)']],
+    ['Mobile APK release (local runner) / Sign and publish Android APK', ['Sign and publish APK with trusted control']],
+  ];
+  const jobs = flows.map(([name, steps], index) => ({
+    id: 2000 + index, run_id: RUN_ID, head_sha: SOURCE_SHA,
+    name: `${prefix}${name}`, status: 'completed', conclusion: 'success',
+    steps: steps.map((name) => ({ name, status: 'completed', conclusion: 'success' })),
+  }));
+  const input = {
+    originRun: originRun({ path: workflowPath }), artifacts: [statusArtifact()], downloadedDigest: DIGEST,
+    status: status({ channel: 'preview', operationId: 'current-release', surfaces }),
+    expected: { repository: REPOSITORY, workflowPath, channel: 'preview', sourceSha: SOURCE_SHA, operationId: 'current-release' },
+    jobs: [{ jobs: jobs.slice(0, 2) }, { jobs: jobs.slice(2) }],
+  };
+  const complete = { ota: true, nativeIos: true, nativeAndroid: true, apk: true };
+  const incomplete = { ota: false, nativeIos: false, nativeAndroid: false, apk: false };
+  assert.deepEqual(resolveReleaseResume(input).uiCompleted, complete);
+  assert.equal(resolveReleaseResume(input).resumeInputs.deployUi.expoAction, 'full', 'reuse does not reduce the approved release intent');
+  assert.deepEqual(resolveReleaseResume({ ...input, jobs: undefined }).uiCompleted, incomplete);
+  for (const patch of [
+    { conclusion: 'failure' }, { conclusion: 'skipped' }, { status: 'in_progress' },
+    { run_id: RUN_ID + 1 }, { head_sha: 'c'.repeat(40) },
+    { name: 'Publish production channel / deploy_ui / promote' },
+    { steps: jobs[0].steps.map((step) => ({ ...step, conclusion: 'skipped' })) },
+    { steps: [...jobs[0].steps, jobs[0].steps[0]] },
+  ]) {
+    assert.deepEqual(resolveReleaseResume({ ...input, jobs: [{ ...jobs[0], ...patch }, ...jobs.slice(1)] }).uiCompleted,
+      { ...complete, ota: false }, 'unproven OTA completion must not suppress publishing');
+  }
+  assert.deepEqual(resolveReleaseResume({ ...input, jobs: [...jobs, jobs[0]] }).uiCompleted, { ...complete, ota: false }, 'duplicate job evidence is ambiguous');
+  assert.deepEqual(resolveReleaseResume({ ...input, jobs: jobs.filter((job) => !job.name.endsWith('Build (ios)')) }).uiCompleted,
+    { ...complete, nativeIos: false }, 'a missing native platform remains scheduled');
+  assert.deepEqual(resolveReleaseResume({ ...input, expected: { ...input.expected, sourceSha: '' } }).uiCompleted, incomplete);
+  assert.deepEqual(resolveReleaseResume({ ...input, originRun: originRun({ path: workflowPath, head_sha: 'c'.repeat(40) }),
+    artifacts: [statusArtifact({ workflow_run: { id: RUN_ID, head_sha: 'c'.repeat(40) } })] }).uiCompleted, incomplete,
+  'control head alone cannot prove a different candidate checkout');
+});
+
 test('resume artifact download preserves binary bytes and fails on digest mismatch or failed GitHub download', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'resume-download-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -204,6 +250,7 @@ test('resume resolution reuses only successful verified immutable candidates', (
     expected,
   }), {
     sourceSha: SOURCE_SHA,
+    uiCompleted: { ota: false, nativeIos: false, nativeAndroid: false, apk: false },
     desktop: { runNumber: 337, artifacts: {} },
     versions: {
       cli: '0.2.10-dev.73',
@@ -272,6 +319,56 @@ test('nightly desktop resume admits exact unsigned artifacts independently of mi
     assert.throws(() => resolveReleaseResume({ ...input, artifacts: [input.artifacts[0], ...artifacts] }), /desktop|artifact/);
   }
   assert.throws(() => resolveReleaseResume({ ...input, originRun: { ...input.originRun, run_number: '337\nother=true' } }), /run number/);
+});
+
+test('nightly desktop resume selects channel-scoped artifacts and retains unambiguous legacy single-channel recovery', () => {
+  const input = {
+    originRun: originRun(), downloadedDigest: DIGEST, status: status(), expected,
+    artifacts: [statusArtifact(),
+      statusArtifact({ id: 101, name: 'tauri-candidate-dev-linux-x86_64' }),
+      statusArtifact({ id: 102, name: 'tauri-candidate-preview-linux-x86_64' }),
+      statusArtifact({ id: 103, name: 'tauri-candidate-production-linux-x86_64' })],
+  };
+  assert.deepEqual(resolveReleaseResume(input).desktop.artifacts, { 'linux-x86_64': { id: 101, digest: DIGEST } });
+  assert.deepEqual(resolveReleaseResume({ ...input, artifacts: [input.artifacts[0], ...input.artifacts.slice(2)] }).desktop.artifacts, {});
+  const legacy = statusArtifact({ id: 104, name: 'tauri-candidate-linux-x86_64' });
+  assert.deepEqual(resolveReleaseResume({ ...input, artifacts: [input.artifacts[0], legacy] }).desktop.artifacts,
+    { 'linux-x86_64': { id: 104, digest: DIGEST } });
+  assert.throws(() => resolveReleaseResume({ ...input, artifacts: [...input.artifacts, legacy] }), /duplicate desktop/);
+  assert.throws(() => resolveReleaseResume({ ...input, artifacts: [input.artifacts[0], input.artifacts[1], input.artifacts[1]] }), /duplicate desktop/);
+});
+
+test('standard and combined release recovery admit only exact channel finalized desktop artifacts for the requested desktop intent', () => {
+  for (const workflowPath of ['.github/workflows/release.yml', '.github/workflows/release-preview-and-production.yml']) {
+    const optional = standardOptionalSurfaces(true);
+    optional.find((surface) => surface.id === 'deploy_ui').identity.desktopMode = 'build_and_publish';
+    const input = {
+      originRun: originRun({ path: workflowPath }), downloadedDigest: DIGEST,
+      expected: { repository: REPOSITORY, workflowPath, channel: 'preview', sourceSha: SOURCE_SHA, operationId: 'operation-37' },
+      status: status({ channel: 'preview', operationId: 'operation-37', surfaces: [previewCliCandidate(), ...optional] }),
+      artifacts: [statusArtifact(),
+        statusArtifact({ id: 101, name: 'tauri-updates-preview-linux-x86_64' }),
+        statusArtifact({ id: 102, name: 'tauri-updates-production-linux-x86_64' }),
+        statusArtifact({ id: 103, name: 'tauri-updates-preview-darwin-aarch64', expired: true }),
+        statusArtifact({ id: 104, name: 'tauri-candidate-preview-windows-x86_64' })],
+    };
+    const desktop = resolveReleaseResume(input).desktop;
+    assert.deepEqual(desktop, { runNumber: 337,
+      artifacts: { 'windows-x86_64': { id: 104, digest: DIGEST } },
+      finalizedArtifacts: { 'linux-x86_64': { id: 101, digest: DIGEST } } });
+    for (const extra of [
+      statusArtifact({ id: 105, name: 'tauri-updates-preview-linux-x86_64' }),
+      statusArtifact({ id: 105, name: 'tauri-updates-preview-unknown' }),
+      statusArtifact({ id: 105, name: 'tauri-updates-preview-darwin-x86_64', workflow_run: { id: RUN_ID + 1, head_sha: SOURCE_SHA } }),
+      statusArtifact({ id: 105, name: 'tauri-updates-preview-darwin-x86_64', digest: 'invalid' }),
+      statusArtifact({ id: 105, name: 'tauri-updates-linux-x86_64' }),
+    ]) assert.throws(() => resolveReleaseResume({ ...input, artifacts: [...input.artifacts, extra] }), /desktop|artifact/);
+    assert.throws(() => resolveReleaseResume({ ...input, expected: { ...input.expected, operationId: 'other' } }), /operation/);
+    assert.throws(() => resolveReleaseResume({ ...input, expected: { ...input.expected, sourceSha: 'c'.repeat(40) } }), /source SHA/);
+    const noDesktopStatus = { ...input.status, surfaces: input.status.surfaces.map((surface) => surface.id === 'deploy_ui'
+      ? { ...surface, identity: { ...surface.identity, desktopMode: 'none' } } : surface) };
+    assert.equal(resolveReleaseResume({ ...input, status: noDesktopStatus }).desktop, undefined);
+  }
 });
 
 test('release resume preserves originally requested optional publication surfaces', () => {
@@ -481,7 +578,8 @@ test('release resume preserves an explicitly requested UI no-op publication inte
   });
 });
 
-test('release resume preserves full UI publication intent for exact recovery', () => {
+for (const workflowPath of ['.github/workflows/release.yml', '.github/workflows/release-preview-and-production.yml']) {
+test(`${workflowPath} resume preserves full UI publication intent for exact recovery`, () => {
   const optionalSurfaces = standardOptionalSurfaces(false);
   const deployUiIndex = optionalSurfaces.findIndex((surface) => surface.id === 'deploy_ui');
   optionalSurfaces[deployUiIndex] = {
@@ -501,7 +599,7 @@ test('release resume preserves full UI publication intent for exact recovery', (
   };
 
   const resolved = resolveReleaseResume({
-    originRun: originRun({ path: '.github/workflows/release.yml' }),
+    originRun: originRun({ path: workflowPath }),
     artifacts: [statusArtifact()],
     downloadedDigest: DIGEST,
     status: status({
@@ -513,7 +611,7 @@ test('release resume preserves full UI publication intent for exact recovery', (
     }),
     expected: {
       repository: REPOSITORY,
-      workflowPath: '.github/workflows/release.yml',
+      workflowPath,
       channel: 'production',
     },
   });
@@ -524,6 +622,7 @@ test('release resume preserves full UI publication intent for exact recovery', (
     desktopMode: 'build_and_publish',
   });
 });
+}
 
 test('release resume fails closed when the origin status omits optional request intent', () => {
   assert.throws(() => resolveReleaseResume({

@@ -6,23 +6,11 @@ vi.mock('./openCodeSse', () => ({
   subscribeSseJson: vi.fn(),
 }));
 
-vi.mock('./sharedManagedServer', () => ({
+vi.mock('./sharedManagedServer', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./sharedManagedServer')>(),
   ensureSharedManagedOpenCodeServerBaseUrl: vi.fn(),
-  isLoopbackManagedOpenCodeBaseUrl: (rawBaseUrl: string) => {
-    const value = rawBaseUrl.trim();
-    if (!value) return false;
-    try {
-      const url = new URL(value);
-      if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
-      const port = Number.parseInt(url.port, 10);
-      if (!Number.isFinite(port) || port <= 0) return false;
-      const host = url.hostname.toLowerCase();
-      return host === 'localhost' || host === '::1' || host.startsWith('127.');
-    } catch {
-      return false;
-    }
-  },
-  readSharedManagedOpenCodeServerStateBestEffort: vi.fn(),
+  readSharedManagedOpenCodeServerStateBestEffort: vi.fn(async () => null),
+  readSharedManagedOpenCodeServerStateByBaseUrlBestEffort: vi.fn(async () => null),
 }));
 
 type FakeResponse = {
@@ -771,8 +759,8 @@ describe('createOpenCodeServerRuntimeClient managed-server identity change signa
     });
     vi.stubGlobal('fetch', fetchSpy as any);
 
-    const { readSharedManagedOpenCodeServerStateBestEffort } = await import('./sharedManagedServer');
-    const readMock = readSharedManagedOpenCodeServerStateBestEffort as unknown as ReturnType<typeof vi.fn>;
+    const { readSharedManagedOpenCodeServerStateByBaseUrlBestEffort } = await import('./sharedManagedServer');
+    const readMock = readSharedManagedOpenCodeServerStateByBaseUrlBestEffort as unknown as ReturnType<typeof vi.fn>;
 
     const changes: unknown[] = [];
     const { createOpenCodeServerRuntimeClient } = await import('./client');
@@ -785,7 +773,7 @@ describe('createOpenCodeServerRuntimeClient managed-server identity change signa
     // Explicit URL mode does not adopt managed lifecycle identity. A loopback URL does perform one
     // state read so an exact managed endpoint can consume its retained credential safely.
     expect(client.getManagedServerIdentity()).toBeNull();
-    expect(readMock).toHaveBeenCalledTimes(1);
+    expect(readMock).toHaveBeenCalledWith('http://127.0.0.1:9999');
     expect(changes).toHaveLength(0);
 
     await client.dispose();

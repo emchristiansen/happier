@@ -11,9 +11,10 @@ import {
     useItemGroupRowPosition,
 } from '@/components/ui/lists/ItemGroupRowPosition';
 import { Text } from '@/components/ui/text/Text';
-import { InboxSection } from '@/components/inbox/InboxSection';
+import { ListSection } from '@/components/ui/lists/ListSection';
 import { useNowMs } from '@/hooks/time/useNowMs';
 import { t } from '@/text';
+import { isActionOperationCancellationRequested } from '@/sync/domains/actionOperations/actionOperationSelectors';
 import { actionOperationReentry } from '@/sync/domains/actionOperations/actionOperationReentry';
 
 import {
@@ -122,7 +123,8 @@ const ActionOperationRow = React.memo(function ActionOperationRow(props: Readonl
     )
         && props.canDismissOperation?.(props.operation) === true;
     const canStop = !canDismiss && !presentation.terminal && props.operation.cancellation === 'supported';
-    const [stopPending, setStopPending] = React.useState(false);
+    const [stopRequestPending, setStopPending] = React.useState(false);
+    const stopPending = stopRequestPending || isActionOperationCancellationRequested(props.operation);
     const [stopFailed, setStopFailed] = React.useState(false);
 
     const stop = React.useCallback((event?: GestureResponderEvent) => {
@@ -294,17 +296,18 @@ export const ActionOperationLedger = React.memo(function ActionOperationLedger(p
     return (
         <View testID="action-operation-ledger">
             {sections.inProgress.length > 0 ? (
-                <InboxSection id="operations-in-progress" title={t('inbox.actionOperations.sections.inProgress')}>
+                <ListSection namespace="inbox" id="operations-in-progress" title={t('inbox.actionOperations.sections.inProgress')}>
                     {renderRows(sections.inProgress)}
-                </InboxSection>
+                </ListSection>
             ) : null}
             {sections.needsAttention.length > 0 ? (
-                <InboxSection id="operations-needs-attention" title={t('inbox.actionOperations.sections.needsAttention')}>
+                <ListSection namespace="inbox" id="operations-needs-attention" title={t('inbox.actionOperations.sections.needsAttention')}>
                     {renderRows(sections.needsAttention)}
-                </InboxSection>
+                </ListSection>
             ) : null}
             {sections.recent.length > 0 ? (
-                <InboxSection
+                <ListSection
+                    namespace="inbox"
                     id="operations-recent"
                     title={t('inbox.actionOperations.sections.recent')}
                     headerAction={props.onClearRecent ? (
@@ -323,7 +326,7 @@ export const ActionOperationLedger = React.memo(function ActionOperationLedger(p
                     ) : null}
                 >
                     {renderRows(sections.recent)}
-                </InboxSection>
+                </ListSection>
             ) : null}
         </View>
     );

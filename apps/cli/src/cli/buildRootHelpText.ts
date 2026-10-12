@@ -1,43 +1,45 @@
-import chalk from 'chalk';
+import { banner, dim, helpFormatter, sectionTitle } from '@happier-dev/cli-common/output';
 
 import { listRootHelpCommands } from './commandSurfaceManifest';
 
 const HELP_LABEL_WIDTH = 27;
 
-function formatHelpEntry(label: string, description: string): string {
-  return `  ${label.padEnd(HELP_LABEL_WIDTH)} ${description}`;
-}
+const EXAMPLES = [
+  { label: 'happier', description: 'Start session' },
+  { label: 'happier --refresh-settings', description: 'Force-refresh account settings before starting' },
+  { label: 'happier --launch-profile <id-or-name>', description: 'Start with a launch profile from your settings' },
+  { label: 'happier --auth cs:<id>', description: 'Start with an exact Connected Services profile or pool' },
+  { label: 'happier --auth native', description: 'Start with native provider authentication' },
+  { label: 'happier --yolo', description: 'Start with bypassing permissions', detail: 'happier sugar for --dangerously-skip-permissions' },
+  { label: 'happier --chrome', description: 'Enable Chrome browser access for this session' },
+  { label: 'happier --no-chrome', description: 'Disable Chrome even if default is on' },
+  { label: 'happier --js-runtime bun', description: 'Use bun instead of node to spawn JavaScript-backed CLIs' },
+  { label: 'happier auth login --force', description: 'Authenticate' },
+  { label: 'happier profiles list', description: 'List available backend profiles' },
+  { label: 'happier doctor', description: 'Run diagnostics' },
+] as const;
 
 export function buildRootHelpText(): string {
   const helpEntries = listRootHelpCommands();
+  const usage = helpFormatter.renderRows(
+    helpEntries.map((entry) => ({
+      label: entry.rootHelpLabel ?? '',
+      description: entry.rootHelpDescription ?? '',
+      ...(entry.rootHelpDetail ? { detail: entry.rootHelpDetail } : {}),
+    })),
+    { labelWidth: HELP_LABEL_WIDTH },
+  );
+  const examples = helpFormatter.renderRows(EXAMPLES, { labelWidth: HELP_LABEL_WIDTH });
   return `
-${chalk.bold('happier')} - AI CLI On the Go
+${banner('Happier', { subtitle: 'Run, watch and steer your coding agents from any device.' })}
 
-${chalk.bold('Usage:')}
-${helpEntries.map((entry) => {
-    const label = entry.rootHelpLabel ?? '';
-    const description = entry.rootHelpDescription ?? '';
-    const firstLine = formatHelpEntry(label, description);
-    if (!entry.rootHelpDetail) return firstLine;
-    return `${firstLine}\n${formatHelpEntry('', entry.rootHelpDetail)}`;
-  }).join('\n')}
+${sectionTitle('Usage')}
+${usage}
 
-${chalk.bold('Examples:')}
-  happier                    Start session
-  happier --refresh-settings  Force-refresh account settings before starting
-  happier --launch-profile <id-or-name> Start with a launch profile from your settings
-  happier --auth cs:<id>    Start with an exact Connected Services profile or pool
-  happier --auth native     Start with native provider authentication
-  happier --yolo             Start with bypassing permissions
-                              happier sugar for --dangerously-skip-permissions
-  happier --chrome           Enable Chrome browser access for this session
-  happier --no-chrome        Disable Chrome even if default is on
-  happier --js-runtime bun   Use bun instead of node to spawn JavaScript-backed CLIs
-  happier auth login --force Authenticate
-  happier profiles list      List available backend profiles
-  happier doctor             Run diagnostics
+${sectionTitle('Examples')}
+${examples}
 
-${chalk.bold('Server selection (global flags; prefix-only; no persistence):')}
+${sectionTitle('Server selection')} ${dim('(global flags; prefix-only; no persistence)')}
   happier --server <name-or-id> ...
   happier --server-url <url> [--webapp-url <url>] [--public-server-url <url>] ...
 `;

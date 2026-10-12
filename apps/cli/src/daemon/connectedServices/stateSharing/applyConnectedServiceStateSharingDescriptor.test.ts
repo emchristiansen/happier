@@ -161,6 +161,7 @@ describe('applyConnectedServiceStateSharingDescriptor', () => {
         join(sourceRoot, 'config.toml'),
         [
           'model = "gpt-5.3-codex"',
+          'model_context_window = 9223372036854775807',
           'cli_auth_credentials_store = "keyring"',
           '',
           '[features]',
@@ -205,6 +206,7 @@ describe('applyConnectedServiceStateSharingDescriptor', () => {
       expect(stat.isSymbolicLink()).toBe(false);
       const transformed = await readFile(join(targetRoot, 'config.toml'), 'utf8');
       expect(transformed).toContain('cli_auth_credentials_store = "file"');
+      expect(transformed).toContain('model_context_window = 9223372036854775807');
       expect(transformed).not.toContain('cli_auth_credentials_store = "keyring"');
     } finally {
       await rm(root, { recursive: true, force: true });

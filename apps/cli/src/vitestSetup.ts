@@ -26,6 +26,12 @@ if (!opencodePath) {
   process.env.HAPPIER_OPENCODE_PATH = stubPath;
 }
 
+// Status reads refresh the CLI update cache in the background (a detached `self check`, which
+// reaches the network). Tests exercise that path through explicit params, never by spawning it.
+if (!String(process.env.HAPPIER_CLI_UPDATE_CHECK ?? '').trim()) {
+  process.env.HAPPIER_CLI_UPDATE_CHECK = '0';
+}
+
 // CLI tests should not inherit embedded build-policy gating (set in CI).
 // Clear it by default so feature tests can opt-in explicitly per case.
 process.env.HAPPIER_FEATURE_POLICY_ENV = '';

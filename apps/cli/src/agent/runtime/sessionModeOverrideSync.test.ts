@@ -1,15 +1,10 @@
-import { describe, expect, it, vi } from 'vitest';
-
-vi.mock('@/ui/logger', () => ({
-  logger: {
-    debug: vi.fn(),
-  },
-}));
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createSessionModeOverrideSynchronizer } from './sessionModeOverrideSync';
 import { logger } from '@/ui/logger';
 
 describe('createSessionModeOverrideSynchronizer', () => {
+  afterEach(() => vi.restoreAllMocks());
   it('queues pending overrides before runtime start and applies after start', async () => {
     let started = false;
     const setSessionMode = vi.fn(async (_modeId: string) => {});
@@ -132,6 +127,9 @@ describe('createSessionModeOverrideSynchronizer', () => {
   });
 
   it('logs failed applies and later retry attempts', async () => {
+    // Observe the real logger without replacing its file boundary.
+    vi.spyOn(logger, 'debug');
+    vi.spyOn(logger, 'infoFile');
     let attempt = 0;
     const setSessionMode = vi.fn(async (_modeId: string) => {
       attempt += 1;
@@ -156,9 +154,9 @@ describe('createSessionModeOverrideSynchronizer', () => {
       '[SessionModeOverrideSync] Applying session mode override',
       expect.objectContaining({ modeId: 'plan', updatedAt: 51, attempt: 1 }),
     );
-    expect(logger.debug).toHaveBeenCalledWith(
+    expect(logger.infoFile).toHaveBeenCalledWith(
       '[SessionModeOverrideSync] Failed to apply session mode override; will retry on next sync',
-      expect.objectContaining({ modeId: 'plan', updatedAt: 51, attempt: 1, error: 'transient failure' }),
+      { updatedAt: 51, attempt: 1 },
     );
     expect(logger.debug).toHaveBeenCalledWith(
       '[SessionModeOverrideSync] Applying session mode override',

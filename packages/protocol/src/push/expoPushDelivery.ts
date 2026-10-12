@@ -6,7 +6,7 @@ type ExpoPushMessageLike = Readonly<{
 
 type ExpoPushReceiptsLike = Readonly<Record<string, unknown>> | ReadonlyMap<string, unknown>;
 
-function getExpoErrorCode(value: unknown): string | null {
+export function getExpoErrorCode(value: unknown): string | null {
   if (!value || typeof value !== 'object') return null;
 
   const details = (value as { details?: unknown }).details;

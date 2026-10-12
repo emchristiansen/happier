@@ -375,6 +375,20 @@ describe('classifyCodexConnectedServiceAuthFailure', () => {
     });
   });
 
+  it('classifies revoked application network permission as a transient provider failure', () => {
+    expect(classifyCodexConnectedServiceAuthFailure({
+      providerErrorPath: true,
+      error: new Error('Fatal error: application network permission was revoked'),
+      serviceId: 'openai-codex',
+      profileId: 'work',
+      groupId: 'pool',
+    })).toMatchObject({
+      kind: 'capacity',
+      limitCategory: 'capacity',
+      quotaScope: 'provider',
+    });
+  });
+
   it('recognizes account-changed auth failures', () => {
     const result = classifyCodexConnectedServiceAuthFailure({
       providerErrorPath: true,

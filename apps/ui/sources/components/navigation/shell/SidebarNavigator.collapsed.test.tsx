@@ -20,7 +20,26 @@ const hoistedState = vi.hoisted(() => ({
     tauriDesktop: false,
     inboxSummary: { hasContent: true },
     inboxContentModelMounts: 0,
+    // The window and route are external stores: a change re-renders their readers, exactly like
+    // the real `useWindowDimensions` subscription (SidebarNavigator is memoized and takes no props).
+    viewportVersion: 0,
+    viewportListeners: new Set<() => void>(),
 }));
+
+function useViewportVersion(): number {
+    return React.useSyncExternalStore(
+        (listener) => {
+            hoistedState.viewportListeners.add(listener);
+            return () => hoistedState.viewportListeners.delete(listener);
+        },
+        () => hoistedState.viewportVersion,
+    );
+}
+
+function notifyViewportChanged(): void {
+    hoistedState.viewportVersion += 1;
+    for (const listener of hoistedState.viewportListeners) listener();
+}
 
 installNavigationShellCommonModuleMocks({
     reactNative: installReactNativeWebMock({
@@ -37,10 +56,13 @@ installNavigationShellCommonModuleMocks({
                 fontScale: 1,
             }),
         },
-        useWindowDimensions: () => ({
-            width: hoistedState.mockWindowDimensions.width,
-            height: hoistedState.mockWindowDimensions.height,
-        }),
+        useWindowDimensions: () => {
+            useViewportVersion();
+            return {
+                width: hoistedState.mockWindowDimensions.width,
+                height: hoistedState.mockWindowDimensions.height,
+            };
+        },
         Platform: {
             get OS() {
                 return hoistedState.mockPlatformOS;
@@ -190,6 +212,7 @@ vi.mock('@/utils/platform/tauri', () => ({
 
 vi.mock('@/utils/platform/responsive', () => ({
   useIsTablet: () => {
+    useViewportVersion();
     if (hoistedState.forceIsTablet != null) return hoistedState.forceIsTablet;
     return Math.min(hoistedState.mockWindowDimensions.width, hoistedState.mockWindowDimensions.height) >= 600;
   },
@@ -204,7 +227,7 @@ vi.mock('@/components/navigation/desktopWindowChrome/DesktopMainContentDragSurfa
 }));
 
 vi.mock('./SidebarView', () => ({
-  SidebarView: (props: any) => React.createElement('SidebarView', props, props.desktopUpdateIndicator),
+  SidebarView: (props: any) => React.createElement('SidebarView', props),
 }));
 
 vi.mock('./CollapsedSidebarView', () => ({
@@ -212,7 +235,6 @@ vi.mock('./CollapsedSidebarView', () => ({
     React.createElement(
       'CollapsedSidebarView',
       props,
-      props.desktopUpdateIndicator,
       React.createElement('Pressable', {
         testID: 'collapsed-sidebar-home-button',
         onPress: () => props.onExitFocusMode?.(),
@@ -347,13 +369,13 @@ describe('SidebarNavigator (collapsed sidebar)', () => {
 
     for (const dimensions of [{ width: 1440, height: 1007 }, { width: 1280, height: 577 }]) {
       hoistedState.mockWindowDimensions = dimensions;
-      await screen.update(<SidebarNavigator desktopUpdateIndicator={React.createElement('UpdateIndicator')} />);
+      await act(async () => notifyViewportChanged());
       expect(screen.tree.findByType(Stack) === navigator).toBe(true);
     }
     hoistedState.mockWindowDimensions = { width: 1440, height: 1007 };
     for (const pathname of ['/session/s1', '/terminal/connect', '/session/s1']) {
       hoistedState.mockPathname = pathname;
-      await screen.update(<SidebarNavigator desktopUpdateIndicator={React.createElement('UpdateIndicator')} />);
+      await act(async () => notifyViewportChanged());
       expect(screen.tree.findByType(Stack) === navigator).toBe(true);
       expect(screen.findAllHostsByTestId('navigation-sidebar')).toHaveLength(
         platform === 'web' && pathname === '/terminal/connect' ? 0 : 1,
@@ -442,31 +464,6 @@ describe('SidebarNavigator (collapsed sidebar)', () => {
     expect(dragSurface).not.toBeNull();
     expect(dragSurface?.props.enabled).toBe(true);
     expect(dragSurface?.props.leftOffsetPx).toBe(getSidebar(screen.tree).props.style.width);
-  });
-
-  it('forwards shell update indicator to the expanded sidebar host', async () => {
-    const { SidebarNavigator } = await import('./SidebarNavigator');
-    const tree = (await renderScreen(
-      <SidebarNavigator desktopUpdateIndicator={React.createElement('UpdateIndicator', { testID: 'shell-update-indicator' })} />,
-    )).tree;
-
-    const sidebarView = tree.findByType('SidebarView' as any);
-    expect(sidebarView.props.desktopUpdateIndicator).toBeTruthy();
-    expect(tree.findByProps({ testID: 'shell-update-indicator' })).toBeDefined();
-  });
-
-  it('forwards shell update indicator to the collapsed sidebar host', async () => {
-    act(() => {
-      mockLocalSettingsStore.setSidebarCollapsed(true);
-    });
-    const { SidebarNavigator } = await import('./SidebarNavigator');
-    const tree = (await renderScreen(
-      <SidebarNavigator desktopUpdateIndicator={React.createElement('UpdateIndicator', { testID: 'shell-update-indicator' })} />,
-    )).tree;
-
-    const collapsedSidebarView = tree.findByType('CollapsedSidebarView' as any);
-    expect(collapsedSidebarView.props.desktopUpdateIndicator).toBeTruthy();
-    expect(tree.findByProps({ testID: 'shell-update-indicator' })).toBeDefined();
   });
 
   it('hides the docked sidebar when min edge is below 600px (e.g. landscape phone)', async () => {

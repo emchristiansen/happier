@@ -79,6 +79,11 @@ export function classifyRelayDrift(params: Readonly<{
      */
     appAccountId?: string | null | undefined;
     daemonNeedsAuth?: boolean | null | undefined;
+    /**
+     * U9 — the daemon's credentials could not be checked at all (the relay did not answer). That
+     * says nothing about them, so a daemon with no validated account is not "needs to sign in".
+     */
+    daemonAuthUnverified?: boolean | null | undefined;
     daemonServiceInstalled?: boolean | null | undefined;
     daemonRunning?: boolean | null | undefined;
 }>): RelayDriftClassification {
@@ -142,6 +147,9 @@ export function classifyRelayDrift(params: Readonly<{
     }
 
     const daemonAccountId = String(params.daemonAccountId ?? '').trim();
+    if (!daemonAccountId && params.daemonAuthUnverified === true) {
+        return { status: 'aligned', repairAction: null };
+    }
     if (!daemonAccountId) {
         return {
             status: 'daemon_needs_auth',

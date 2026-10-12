@@ -276,9 +276,6 @@ vi.mock('@/components/ui/lists/Item', () => ({
     Item: ({ title, subtitle, testID, onPress }: any) => React.createElement('Item', { title, subtitle, testID, onPress }),
 }));
 
-vi.mock('@/components/ui/feedback/UpdateBanner', () => ({
-    UpdateBanner: 'UpdateBanner',
-}));
 
 vi.mock('@/components/account/RecoveryKeyReminderBanner', () => ({
     RecoveryKeyReminderBanner: 'RecoveryKeyReminderBanner',

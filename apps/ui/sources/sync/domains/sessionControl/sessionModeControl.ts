@@ -5,7 +5,7 @@ import { parsePermissionIntentAlias } from '@happier-dev/agents';
 import { resolveRequestedSessionModeId } from '@happier-dev/protocol';
 import { tLoose } from '@/text';
 
-import { readSessionModeOverrideState, readSessionModesState } from './readSessionControlMetadata';
+import { matchesSessionControlProvider, readSessionModeOverrideState, readSessionModesState } from './readSessionControlMetadata';
 
 export function supportsSessionModeOverrides(agentId: AgentId): boolean {
     const kind = getAgentCore(agentId).sessionModes.kind;
@@ -99,7 +99,7 @@ function computeDynamicSessionModePickerControlInternal(params: {
 
     const state = readSessionModesState(params.metadata);
     if (!state) return null;
-    if (state.provider !== params.agentId) return null;
+    if (!matchesSessionControlProvider({ ...params, provider: state.provider })) return null;
     if (state.availableModes.length === 0) return null;
 
     const options = state.availableModes;

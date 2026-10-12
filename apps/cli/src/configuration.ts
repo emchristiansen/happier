@@ -5,12 +5,14 @@
  * Environment files should be loaded using Node's --env-file flag
  */
 
+import { resolveServerProfileApiUrl } from '@/server/serverProfileApiUrl';
 import { spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { join, isAbsolute, resolve as resolvePath } from 'node:path'
 import { deriveServerIdFromUrl, isServerIdFilesystemSafe, sanitizeServerIdForFilesystem } from '@/server/serverId'
 import { isLocalishServerUrl } from '@/server/serverUrlClassification'
-import { normalizeCliArgv } from '@/cli/parseArgs'
+import { readCliProcessArgs } from '@/cli/parseArgs'
+import { applyRuntimeContextPrefixEnv, parseRuntimeContextPrefixArgs } from '@/utils/env/runtimeContextArgv'
 import { expandHomeDirPath } from '@/utils/path/expandHomeDirPath'
 import {
   resolveManagedCliReleaseChannelSync,
@@ -93,7 +95,7 @@ export function isDaemonProcessArgv(args: readonly string[]): boolean {
   return args[1] === 'start' || args[1] === 'start-sync'
 }
 
-function resolveCliHappyHomeDir(env: NodeJS.ProcessEnv): string {
+export function resolveCliHappyHomeDir(env: NodeJS.ProcessEnv): string {
   const override = typeof env.HAPPIER_HOME_DIR === 'string' ? env.HAPPIER_HOME_DIR.trim() : ''
   if (!override) {
     const sudoInvokerHomeDir = resolveSudoInvokerHomeDir(env)
@@ -362,7 +364,7 @@ class Configuration {
 
   constructor() {
     // Check if we're running as daemon based on process args
-    const args = normalizeCliArgv(process.argv.slice(2))
+    const { args } = parseRuntimeContextPrefixArgs(readCliProcessArgs())
     this.isDaemonProcess = isDaemonProcessArgv(args)
     normalizeDaemonProcessInheritedEnv({
       env: process.env,
@@ -1173,7 +1175,7 @@ function resolveServerSelection(params: Readonly<{
       : null;
     if (envActivePersisted && !matchesUrl(envActivePersisted, envCanonicalServerUrl)) {
       const canonical = normalizeServerUrl(envActivePersisted.serverUrl);
-      const apiServerUrl = normalizeServerUrl(envActivePersisted.localServerUrl ?? '') || canonical;
+      const apiServerUrl = normalizeServerUrl(resolveServerProfileApiUrl(envActivePersisted));
       return {
         activeServerId: resolveActiveServerId(envActivePersisted.id),
         serverUrl: canonical,
@@ -1256,7 +1258,7 @@ function resolveServerSelection(params: Readonly<{
     const active = params.persisted.servers[params.persisted.activeServerId];
     if (active) {
       const canonical = normalizeServerUrl(active.serverUrl);
-      const apiServerUrl = normalizeServerUrl(active.localServerUrl ?? '') || canonical;
+      const apiServerUrl = normalizeServerUrl(resolveServerProfileApiUrl(active));
       return {
         activeServerId: resolveActiveServerId(active.id),
         serverUrl: canonical,
@@ -1274,6 +1276,9 @@ function resolveServerSelection(params: Readonly<{
   };
 }
 
+// Apply once, before home/server selection and any configuration filesystem access.
+// Reloads honor later explicit selections rather than replaying the startup context.
+applyRuntimeContextPrefixEnv(readCliProcessArgs(), process.env)
 export let configuration: Configuration = new Configuration()
 
 export function reloadConfiguration(): void {

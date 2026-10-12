@@ -27,6 +27,46 @@ vi.mock('node:child_process', async (importOriginal) => {
 });
 
 describe('createCodexAppServerClient', () => {
+    it('uses the Codex daemon proxy transport without starting another app-server', async () => {
+        await withTempDir('happier-codex-app-server-client-daemon-proxy-', async (root) => {
+            const fakeAppServer = await writeFakeCodexAppServerScript({
+                dir: root,
+                bodyLines: [
+                    'for await (const line of rl) {',
+                    '  if (!line.trim()) continue;',
+                    '  const msg = JSON.parse(line);',
+                    '  if (msg.method === "initialize") {',
+                    '    process.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + "\\n");',
+                    '    continue;',
+                    '  }',
+                    '  if (msg.method === "thread/loaded/list") {',
+                    '    process.stdout.write(JSON.stringify({ id: msg.id, result: { data: ["thread-1"] } }) + "\\n");',
+                    '  }',
+                    '}',
+                ],
+            });
+            const spawn = vi.mocked(childProcess.spawn);
+            spawn.mockClear();
+            const client = await createCodexAppServerClient({
+                processEnv: createCodexAppServerProcessEnv(fakeAppServer),
+                transport: { kind: 'daemonProxy' },
+            });
+            try {
+                await expect(client.request('thread/loaded/list')).resolves.toEqual({ data: ['thread-1'] });
+                expect(spawn.mock.calls[0]?.[1]).toEqual([
+                    fakeAppServer,
+                    'app-server',
+                    'proxy',
+                ]);
+                expect(spawn.mock.calls[0]?.[2]).toEqual(expect.objectContaining({
+                    stdio: ['pipe', 'pipe', 'pipe'],
+                }));
+            } finally {
+                await client.dispose();
+            }
+        });
+    });
+
     it('speaks JSON-RPC over the shared app-server Unix WebSocket', async () => {
         await withTempDir('happier-codex-app-server-client-websocket-', async (root) => {
             const socketPath = process.platform === 'win32'

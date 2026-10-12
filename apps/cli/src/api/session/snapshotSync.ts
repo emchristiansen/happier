@@ -1,4 +1,5 @@
 import type { AgentState, Metadata } from '../types';
+import { normalizeSessionMetadataForRead } from '@happier-dev/protocol';
 import { decodeBase64, decrypt } from '../encryption';
 import { fetchSessionByIdCompat } from '@/session/transport/http/sessionsHttp';
 import { isDeepStrictEqual } from 'node:util';
@@ -104,10 +105,10 @@ export async function fetchSessionSnapshotUpdateFromServer(opts: {
     if (rawMetadata && nextMetadataVersion !== null && nextMetadataVersion >= opts.currentMetadataVersion) {
         const nextMetadata: Metadata | null = (() => {
             if (sessionEncryptionMode === 'plain') {
-                return tryParseJsonRecord(rawMetadata) as unknown as Metadata | null;
+                return normalizeSessionMetadataForRead(tryParseJsonRecord(rawMetadata) as unknown as Metadata | null);
             }
             try {
-                return decrypt(opts.encryptionKey, opts.encryptionVariant, decodeBase64(rawMetadata)) as Metadata;
+                return normalizeSessionMetadataForRead<Metadata>(decrypt(opts.encryptionKey, opts.encryptionVariant, decodeBase64(rawMetadata)));
             } catch {
                 return null;
             }

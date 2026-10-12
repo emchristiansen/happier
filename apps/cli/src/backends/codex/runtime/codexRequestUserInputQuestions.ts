@@ -25,6 +25,7 @@ type AskUserQuestionEntry = Readonly<{
 }>;
 
 type CodexAsyncUserInputQuestion = Readonly<{
+    index: number;
     title: string;
     responseKey: string;
     options: readonly string[];
@@ -77,6 +78,7 @@ function normalizeCodexAsyncQuestions(params: Readonly<{
         const occurrence = (titleOccurrences.get(title) ?? 0) + 1;
         titleOccurrences.set(title, occurrence);
         output.push({
+            index,
             title,
             responseKey: occurrence === 1 ? title : `${title} (${occurrence})`,
             options,
@@ -107,6 +109,26 @@ export function normalizeCodexAsyncUserInputQuestionsToAskUserQuestionInput(para
         : { questions: [] };
 }
 
+export type CodexAsyncQuestionRequest = Readonly<{
+    itemId: string;
+    questions: unknown;
+    input: Readonly<Record<string, unknown>>;
+}>;
+
+export function readPendingCodexAsyncQuestionRequest(value: unknown): CodexAsyncQuestionRequest | null {
+    const request = asRecord(value);
+    if (!request || request.tool !== 'AskUserQuestion') return null;
+    const input = asRecord(request.arguments);
+    const marker = asRecord(input?.[CODEX_ASYNC_QUESTION_MARKER_KEY]);
+    if (marker?.v !== 1 || typeof marker.itemId !== 'string' || marker.itemId.trim().length === 0) return null;
+    if (!Array.isArray(marker.questions) || !input) return null;
+    return {
+        itemId: marker.itemId,
+        questions: marker.questions,
+        input,
+    };
+}
+
 export type CodexAsyncQuestionDelivery = Readonly<{
     itemId: string;
     questions: unknown;
@@ -135,7 +157,9 @@ export function isCodexAsyncQuestionDeliveryCompleted(value: unknown, itemId: st
     const input = asRecord(completed?.arguments);
     const marker = asRecord(input?.[CODEX_ASYNC_QUESTION_MARKER_KEY]);
     const delivery = asRecord(completed?.[CODEX_ASYNC_QUESTION_DELIVERY_KEY]);
-    return marker?.v === 1 && marker.itemId === itemId && delivery?.status === 'delivered';
+    if (marker?.v !== 1 || marker.itemId !== itemId) return false;
+    if (delivery?.status === 'delivered') return true;
+    return completed?.status === 'canceled' && completed.decision === 'abort';
 }
 
 export function markCodexAsyncQuestionDeliveryCompleted(value: unknown, itemId: string): unknown {
@@ -183,17 +207,32 @@ export function buildCodexAsyncUserInputReply(params: Readonly<{
     itemId: string;
     questions: unknown;
     answersByKey: Readonly<Record<string, readonly string[]>>;
-}>): ReadonlyArray<Readonly<{ questionIndex: number; text: string }>> {
-    const replies: Array<Readonly<{ questionIndex: number; text: string }>> = [];
-    for (const [questionIndex, question] of normalizeCodexAsyncQuestions(params).entries()) {
+}>): Readonly<{ text: string; displayText: string }> | null {
+    const replies: Array<{ answer: string; question: string; questionItemId: string }> = [];
+    const fallbackReplies: string[] = [];
+    const displayBlocks: string[] = [];
+    for (const question of normalizeCodexAsyncQuestions(params)) {
         const answer = readCodexAsyncAnswer(question, params.answersByKey);
         if (!answer) continue;
-        // Match Codex's own async-question client framing: a bounded quoted question followed by
-        // the ordinary user answer. No provider RPC or reply envelope exists for this feature.
         const boundedQuestion = truncateUtf8AtCharacterBoundary(question.title, 512).replace(/[\n\r]/g, ' ');
-        replies.push({ questionIndex, text: `> ${boundedQuestion}\n\n${answer}` });
+        const questionItemId = JSON.stringify(['request_user_input_async', params.itemId, question.index]);
+        if (Buffer.byteLength(questionItemId, 'utf8') > 512) {
+            fallbackReplies.push(`> ${boundedQuestion}\n\n${answer}`);
+        } else {
+            replies.push({ answer, question: boundedQuestion, questionItemId });
+        }
+        displayBlocks.push(`> ${boundedQuestion}\n\n${answer}`);
     }
-    return replies;
+    if (replies.length === 0 && fallbackReplies.length === 0) return null;
+    return {
+        text: [
+            ...(replies.length > 0
+                ? [`<send_user_message_question_reply>\n${JSON.stringify(replies)}\n</send_user_message_question_reply>`]
+                : []),
+            ...fallbackReplies,
+        ].join('\n\n'),
+        displayText: displayBlocks.join('\n\n'),
+    };
 }
 
 function readQuestionOptions(question: RecordLike): ReadonlyArray<RecordLike> {

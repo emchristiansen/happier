@@ -474,6 +474,7 @@ function resolveOpenCodeDirectSessionLinkIdentity(params: Readonly<{
     runtimeDescriptor: buildOpenCodeAgentRuntimeDescriptor({
       backendMode,
       vendorSessionId: remoteSessionId,
+      managedServerLaunchFingerprint: canonicalRuntimeDescriptor?.managedServerLaunchFingerprint,
       ...(serverBaseUrl ? { serverBaseUrl } : {}),
       ...((canonicalRuntimeDescriptor?.serverBaseUrlExplicit ?? Boolean(serverBaseUrl)) ? { serverBaseUrlExplicit: true } : {}),
     }),

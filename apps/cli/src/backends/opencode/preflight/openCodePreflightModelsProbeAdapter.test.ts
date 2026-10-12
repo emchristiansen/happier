@@ -79,6 +79,20 @@ describe('openCodePreflightModelsProbeAdapter', () => {
     }
   });
 
+  it.each([
+    { models: [] },
+    { models: [{ id: 'image-only', providerID: 'example', capabilities: { input: ['image'] } }] },
+  ])('preserves an authoritative catalog with no selectable models ($models)', async ({ models }) => {
+    tempDir = makeTempDir('happier-opencode-preflight-empty-');
+    const fakeOpenCode = writeFakeOpenCodeV2ModelsJavaScriptEntrypoint(tempDir, { data: models });
+    const raw = await openCodePreflightModelsProbeAdapter.probeModelsRaw?.({
+      cwd: tempDir,
+      timeoutMs: 2_000,
+      processEnv: { ...process.env, HAPPIER_OPENCODE_PATH: fakeOpenCode },
+    });
+    expect(raw).toEqual([]);
+  });
+
   it('reads rich model metadata from the released OpenCode V2 model API command', async () => {
     tempDir = makeTempDir('happier-opencode-preflight-models-v2-');
     const fakeOpenCode = writeFakeOpenCodeV2ModelsJavaScriptEntrypoint(tempDir, {
@@ -137,6 +151,11 @@ describe('openCodePreflightModelsProbeAdapter', () => {
           { value: 'high', name: 'High' },
         ],
       }],
+    }, {
+      id: 'openai/no-tools',
+      name: 'No Tools',
+      description: 'openai',
+      contextWindowTokens: 100000,
     }]);
   });
 

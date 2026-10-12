@@ -1,5 +1,6 @@
 import { validateCodexAcpSpawnAvailability } from '@/backends/codex/acp/spawnAvailability';
 import { resolveCodexAcpSpawn } from '@/backends/codex/acp/resolveCommand';
+import { resolveCodexBackendModeForRun } from '@/backends/codex/utils/resolveCodexBackendModeForRun';
 import {
   resolveDaemonSpawnRuntimeCodexBackendMode,
   type DaemonSpawnHooks,
@@ -11,12 +12,25 @@ function resolveCodexDaemonBackendMode(params: DaemonSpawnRuntimeSelection): 'mc
 }
 
 export const codexDaemonSpawnHooks: DaemonSpawnHooks = {
+  resolveTerminalPresentation: ({ host, runtimeSelection, processEnv }) => {
+    const admitted = processEnv.HAPPIER_CODEX_BACKEND_MODE;
+    const mode = resolveCodexBackendModeForRun({
+      codexBackendMode: admitted === 'acp' || admitted === 'mcp' || admitted === 'appServer'
+        ? admitted
+        : resolveDaemonSpawnRuntimeCodexBackendMode(runtimeSelection),
+      experimentalCodexAcp: runtimeSelection.experimentalCodexAcp,
+      experimentalCodexAcpEnabledByDefault: false,
+    });
+    if (mode === 'acp') return { kind: 'none' };
+    if (mode === 'appServer') return { kind: 'provider_attach', startingMode: 'local' };
+    return host === 'tmux' ? { kind: 'runner', startingMode: 'remote' } : { kind: 'none' };
+  },
   validateSpawn: async (runtimeSelection) => {
     if (resolveCodexDaemonBackendMode(runtimeSelection) !== 'acp') return { ok: true };
 
     let resolved: { command: string; args: string[] };
     try {
-      resolved = resolveCodexAcpSpawn();
+      resolved = resolveCodexAcpSpawn({ env: runtimeSelection.environmentVariables });
     } catch (error) {
       return {
         ok: false,
@@ -27,7 +41,7 @@ export const codexDaemonSpawnHooks: DaemonSpawnHooks = {
       };
     }
 
-    const availability = validateCodexAcpSpawnAvailability(resolved);
+    const availability = validateCodexAcpSpawnAvailability(resolved, { env: runtimeSelection.environmentVariables });
     if (availability.ok) return { ok: true };
 
     if (resolved.command === 'codex-acp') {

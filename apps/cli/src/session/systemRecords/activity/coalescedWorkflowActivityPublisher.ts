@@ -40,15 +40,11 @@ export function createCoalescedWorkflowActivityPublisher(params: Readonly<{
 }>): CoalescedWorkflowActivityPublisher {
   const debounceMs = params.debounceMs ?? 300;
   const pendingChangedRunIds = new Set<string>();
+  // Failed attempts are delayed work, not fresh observations for flush() to drain immediately.
+  const pendingRetryRunIds = new Set<string>();
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
-  // The currently-running publish drain (scheduler- OR flush-driven). `flush()` awaits this so a
-  // caller that needs the terminal write to have LANDED (startup reconciliation, stream close,
-  // shutdown) never returns while a `notify`-triggered immediate drain is still mid-publish — the
-  // scheduler fires drains fire-and-forget, so without this a `flush()` racing an in-flight drain
-  // would see an already-cleared pending set and return before the headline write completed.
-  let inFlightDrain: Promise<void> | null = null;
-
+  let activeFlushes = 0;
   const runPublishDrain = async (): Promise<void> => {
     if (disposed) return;
     if (pendingChangedRunIds.size === 0) return;
@@ -70,17 +66,8 @@ export function createCoalescedWorkflowActivityPublisher(params: Readonly<{
     }
   };
 
-  const trackedPublishDrain = (): Promise<void> => {
-    const drain = runPublishDrain();
-    const tracked = drain.finally(() => {
-      if (inFlightDrain === tracked) inFlightDrain = null;
-    });
-    inFlightDrain = tracked;
-    return tracked;
-  };
-
   const scheduler = createCoalescedScheduler({
-    drain: trackedPublishDrain,
+    drain: runPublishDrain,
     onError: params.onError,
   });
 
@@ -93,17 +80,28 @@ export function createCoalescedWorkflowActivityPublisher(params: Readonly<{
 
   function triggerNow(): void {
     clearDebounce();
+    takePendingRetries();
     scheduler.trigger();
+  }
+
+  function takePendingRetries(): void {
+    for (const runId of pendingRetryRunIds) pendingChangedRunIds.add(runId);
+    pendingRetryRunIds.clear();
+  }
+
+  function scheduleDebounce(): void {
+    if (debounceTimer !== null) return;
+    debounceTimer = setTimeout(() => {
+      debounceTimer = null;
+      takePendingRetries();
+      scheduler.trigger();
+    }, debounceMs);
   }
 
   function scheduleRetry(runIds: readonly string[]): void {
     if (disposed || runIds.length === 0) return;
-    for (const runId of runIds) pendingChangedRunIds.add(runId);
-    if (pendingChangedRunIds.size === 0 || debounceTimer !== null) return;
-    debounceTimer = setTimeout(() => {
-      debounceTimer = null;
-      scheduler.trigger();
-    }, debounceMs);
+    for (const runId of runIds) pendingRetryRunIds.add(runId);
+    scheduleDebounce();
   }
 
   function notify(observation: WorkflowActivityObservationLike): void {
@@ -116,37 +114,26 @@ export function createCoalescedWorkflowActivityPublisher(params: Readonly<{
       || observation.statusChangedRunIds.length > 0
       || observation.terminalRunIds.length > 0;
 
-    if (immediate) {
+    if (immediate || activeFlushes > 0) {
       triggerNow();
       return;
     }
     // Progress-only: latest-wins debounce.
-    if (debounceTimer !== null) return;
-    debounceTimer = setTimeout(() => {
-      debounceTimer = null;
-      scheduler.trigger();
-    }, debounceMs);
+    scheduleDebounce();
   }
 
   async function flush(): Promise<void> {
     if (disposed) return;
-    // Drain to quiescence. `notify` fires scheduler drains fire-and-forget, and each drain may
-    // schedule a follow-up (a `do/while` re-drain for triggers that arrived mid-publish, or a
-    // `scheduleRetry` debounce). A single await/drain would return while later terminal writes are
-    // still pending, leaving the headline stuck at an early snapshot. So: cancel any debounce timer,
-    // await the in-flight drain so its writes LAND, then drain any work that surfaced — repeat until
-    // no drain is running and nothing is pending. A hard iteration cap guards against a pathological
-    // publisher that never settles (it would only ever drop trailing retries, never lose committed
-    // state, since the headline is rebuilt from committed runs on every publish).
-    for (let iteration = 0; iteration < 1_000; iteration += 1) {
-      if (disposed) return;
-      clearDebounce();
-      if (inFlightDrain) {
-        await inFlightDrain;
-        continue;
-      }
-      if (pendingChangedRunIds.size === 0) return;
-      await trackedPublishDrain();
+    clearDebounce();
+    takePendingRetries();
+    // The scheduler owns every drain, including this barrier. It awaits in-flight writes and
+    // terminal observations queued behind them without a competing direct publish loop. Failures
+    // stay on the delayed retry path instead of becoming immediate flush retries.
+    activeFlushes += 1;
+    try {
+      await scheduler.flush();
+    } finally {
+      activeFlushes -= 1;
     }
   }
 
@@ -154,6 +141,7 @@ export function createCoalescedWorkflowActivityPublisher(params: Readonly<{
     disposed = true;
     clearDebounce();
     pendingChangedRunIds.clear();
+    pendingRetryRunIds.clear();
     scheduler.dispose();
   }
 

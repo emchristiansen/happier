@@ -394,10 +394,9 @@ installSessionShellCommonModuleMocks({
   },
 });
 
-vi.mock('@/sync/domains/session/control/localControlSwitch', () => ({
+vi.mock('@/sync/domains/session/control/localControlSwitch', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/sync/domains/session/control/localControlSwitch')>()),
   shouldRenderChatTimelineForSession: () => true,
-  shouldRequestRemoteControl: () => false,
-  shouldRequestRemoteControlAfterPendingEnqueue: () => false,
 }));
 
 vi.mock('@/sync/domains/input/slashCommands/resolveSessionComposerSend', () => ({

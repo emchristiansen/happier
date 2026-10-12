@@ -1,6 +1,6 @@
 import * as React from 'react';
 
-import type { DesktopBackgroundServiceAutostartMode } from '@/setup/deriveDesktopLocalSetupSnapshot';
+import { readManagedLoginStartMode, type DesktopBackgroundServiceAutostartMode } from '@/setup/deriveDesktopLocalSetupSnapshot';
 import { setBackgroundServiceAutostart } from '@/setup/desktopBackgroundServiceControl';
 import { useDesktopLocalInspection } from '@/setup/useDesktopLocalInspection';
 import { isTauriDesktop } from '@/utils/platform/tauri';
@@ -8,9 +8,9 @@ import { isTauriDesktop } from '@/utils/platform/tauri';
 /**
  * Whether the Happier background service on this computer starts at login.
  *
- * Shaped like `useDesktopAutostart`, and deliberately separate from it: that one launches the
- * *app* through Tauri, this one changes the *installed service* through the CLI that owns it. The
- * two answer different questions and neither may stand in for the other.
+ * It is the one login-start setting (R16 b): the managed services' common mode is the fact, and the
+ * desktop app's own login item follows it natively (`src-tauri/src/autostart.rs`), starting the
+ * app in the menu bar — there is no separate app setting to disagree with it.
  *
  * `mode` is `null` when the local inspection could not say — an older managed CLI, or a read that
  * failed. Unknown stays unknown: the row says so and offers nothing to flip, rather than showing a
@@ -19,6 +19,11 @@ import { isTauriDesktop } from '@/utils/platform/tauri';
 export type DesktopBackgroundServiceAutostartState = Readonly<{
     supported: boolean;
     mode: DesktopBackgroundServiceAutostartMode | null;
+    /**
+     * Whether a managed background service is installed here; `null` when presence is unproved.
+     * `false` is not "unknown mode" — there is nothing to report on until this computer is set up.
+     */
+    installed: boolean | null;
     loading: boolean;
     error: string | null;
     setMode: (mode: DesktopBackgroundServiceAutostartMode) => Promise<void>;
@@ -62,7 +67,13 @@ export function useDesktopBackgroundServiceAutostart(): DesktopBackgroundService
 
     return {
         supported,
-        mode: facts?.service.autostart ?? null,
+        // A14-02 — every managed service's common mode (the producer's), not the default's own.
+        mode: readManagedLoginStartMode(inspection),
+        installed: inspection.status === 'resolved' && facts
+            ? (facts.service.installed === true || inspection.serviceRows?.some((row) => row.appManaged)
+                ? true
+                : facts.service.installed === false && inspection.pinnedServicesComplete === true ? false : null)
+            : null,
         loading: supported && (writing || inspection.status === 'pending'),
         error: error ?? readError,
         setMode,

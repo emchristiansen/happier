@@ -10,7 +10,6 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolveReleaseAssetBundle } from '@happier-dev/release-runtime/assets';
 import { lookupSha256 } from '@happier-dev/release-runtime/checksums';
 import { verifyMinisign } from '@happier-dev/release-runtime/minisign';
-import { extractReleasePayloadRootFromArchive, getFirstPartyComponentCatalogEntry } from '@happier-dev/cli-common/firstPartyRuntime';
 
 import { fileSha256 } from './lib/release-files.mjs';
 import { isBinaryReleaseArtifactFilename, parseArtifactFilename } from './lib/manifests.mjs';
@@ -428,6 +427,10 @@ async function runBaseCliRuntimeSmoke({ root, scratch, artifact, archivePath, en
 }
 
 export async function smokeTestArchive({ archivePath, execute = true }) {
+  // Opaque publishers install release-runtime only. Binary extraction and smoke
+  // still use the canonical runtime owner, but only when a binary is verified.
+  const { extractReleasePayloadRootFromArchive, getFirstPartyComponentCatalogEntry } =
+    await import('@happier-dev/cli-common/firstPartyRuntime');
   const artifact = parseArtifactFilename(basename(archivePath));
   const scratch = await mkdtemp(join(tmpdir(), 'happier-release-smoke-'));
   try {

@@ -117,8 +117,18 @@ export async function createCodexSharedAppServer(params: Readonly<{
       readCodexAppServerStartupRpcTimeoutMs(processEnv),
     );
   } catch (error) {
-    if (child) await dependencies.terminateProcess(child);
-    await dependencies.removeRuntimeDirectory(runtimeDirectory);
+    const failures: unknown[] = [error];
+    try {
+      if (child) await dependencies.terminateProcess(child);
+    } catch (cleanupError) {
+      failures.push(cleanupError);
+    }
+    try {
+      await dependencies.removeRuntimeDirectory(runtimeDirectory);
+    } catch (cleanupError) {
+      failures.push(cleanupError);
+    }
+    if (failures.length > 1) throw new AggregateError(failures, 'Codex shared app-server startup and cleanup failed');
     throw error;
   }
 

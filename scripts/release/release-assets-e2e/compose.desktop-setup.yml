@@ -1,0 +1,65 @@
+# desktop-setup suite (release validation layers 2 and 3). Driven by desktop-setup.mjs; see README.md.
+#
+# relay         — a published relay-server image (sqlite), the relay the "desktop app" selected.
+# release-feed  — answers as api.github.com inside this network only (alias + test CA), serving the
+#                 staged CLI release assets so the shipped hsetup acquires the build under test.
+# approver      — plays the signed-in app: owns the account and approves the pairing prompt.
+# desktop1/2    — systemd machines with NO Happier CLI, daemon or service installed. desktop1 is
+#                 the fresh-download scenario (layer 2), desktop2 the upgrade scenario (layer 3).
+services:
+  relay:
+    image: ${HAPPIER_RELAY_IMAGE:?Missing HAPPIER_RELAY_IMAGE}
+    environment:
+      PORT: "3005"
+      HAPPIER_DB_PROVIDER: sqlite
+      HAPPY_DB_PROVIDER: sqlite
+      RUN_MIGRATIONS: "1"
+    volumes:
+      - relay-data:/data
+
+  release-feed:
+    image: node:22-bookworm
+    command: ["node", "/opt/happier-npm-e2e/bin/release-feed-server.mjs"]
+    environment:
+      FEED_ROOT: /feed
+    volumes:
+      - ${DESKTOP_SETUP_FEED_DIR:?Missing DESKTOP_SETUP_FEED_DIR}:/feed
+      - ./bin:/opt/happier-npm-e2e/bin:ro
+    networks:
+      default:
+        aliases:
+          - api.github.com
+
+  approver:
+    image: node:22-bookworm
+    command: ["sleep", "infinity"]
+    volumes:
+      - ${DESKTOP_SETUP_APPROVER_CLI_DIR:?Missing DESKTOP_SETUP_APPROVER_CLI_DIR}:/opt/approver-cli:ro
+      - ./bin:/opt/happier-npm-e2e/bin:ro
+      - approver-home:/approver-home
+
+  desktop1: &desktop-machine
+    build:
+      context: .
+      dockerfile: Dockerfile.remote-host-systemd
+    privileged: true
+    environment:
+      REMOTE_USER: happy
+      REMOTE_AUTHORIZED_KEYS_PATH: /ssh/authorized_keys
+      REMOTE_SHIM_HAPPIER_INSTALLER: "0"
+    volumes:
+      - ${DESKTOP_SETUP_AUTHORIZED_KEYS:?Missing DESKTOP_SETUP_AUTHORIZED_KEYS}:/ssh/authorized_keys:ro
+      - ${DESKTOP_SETUP_DESKTOP_DIR:?Missing DESKTOP_SETUP_DESKTOP_DIR}:/opt/happier-desktop:ro
+      - ${DESKTOP_SETUP_FEED_DIR:?Missing DESKTOP_SETUP_FEED_DIR}/tls/ca.crt:/opt/happier-feed/ca.crt:ro
+    tmpfs:
+      - /run
+      - /run/lock
+    command: ["bash", "/opt/happier-npm-e2e/bin/remote-host-systemd-entrypoint.sh"]
+
+  desktop2: *desktop-machine
+
+volumes:
+  relay-data:
+    driver: local
+  approver-home:
+    driver: local

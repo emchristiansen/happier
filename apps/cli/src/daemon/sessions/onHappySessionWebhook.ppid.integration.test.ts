@@ -6,6 +6,9 @@ import type { TrackedSession } from '@/daemon/types';
 import { spawnInlineNodeParentWithChild, waitForProcessExit } from '@/testkit/process/spawn';
 
 import { createOnHappySessionWebhook } from './onHappySessionWebhook';
+import { createOnChildExited } from './onChildExited';
+import { waitForVisibleConsoleSessionWebhook } from './visibleConsoleSpawnWaiter';
+import type { SpawnSessionResult } from '@/rpc/handlers/registerSessionHandlers';
 
 function createMetadata(pid: number, startedBy: 'daemon' | 'terminal'): Metadata {
   return {
@@ -22,6 +25,53 @@ function createMetadata(pid: number, startedBy: 'daemon' | 'terminal'): Metadata
 }
 
 describe('createOnHappySessionWebhook (PPID correlation)', () => {
+  it('keeps a placeholder-correlated live runner waiting through wrapper exit and accepts its later canonical report', async () => {
+    if (process.platform === 'win32') return;
+    const { parent: wrapper, childPid } = await spawnInlineNodeParentWithChild();
+    const wrapperPid = wrapper.pid!;
+    const tracked: TrackedSession = { pid: wrapperPid, startedBy: 'daemon' };
+    const sessions = new Map([[wrapperPid, tracked]]);
+    const awaiters = new Map<number, (session: TrackedSession) => void>();
+    const resolvers = new Map<number, (result: SpawnSessionResult) => void>();
+    const timeouts = new Map<number, ReturnType<typeof setTimeout>>();
+    const exit = createOnChildExited({
+      pidToTrackedSession: sessions, spawnResourceCleanupByPid: new Map(), sessionAttachCleanupByPid: new Map(),
+      getApiMachineForSessions: () => null, removeSessionMarkerFn: async () => {},
+    });
+    const completion = waitForVisibleConsoleSessionWebhook({
+      pid: wrapperPid, pollMs: 10, pidToAwaiter: awaiters, pidToSpawnResultResolver: resolvers,
+      pidToSpawnWebhookTimeout: timeouts, onChildExited: exit,
+    });
+    tracked.startupCustody = {
+      finalization: completion.then(() => undefined),
+      observeExit: () => {},
+      promotePid: (pid) => completion.promotePid(pid),
+    };
+    const report = createOnHappySessionWebhook({
+      pidToTrackedSession: sessions, pidToAwaiter: awaiters,
+      findHappyProcessByPidFn: async () => null, writeSessionMarkerFn: async () => {},
+    });
+    try {
+      await report(`PID-${childPid}`, createMetadata(childPid, 'daemon'));
+      expect(sessions.get(wrapperPid)?.sessionRunnerPid).toBe(childPid);
+      wrapper.kill('SIGKILL');
+      await waitForProcessExit(wrapperPid, { timeoutMs: 2_000 });
+      await vi.waitFor(() => expect(sessions.has(childPid)).toBe(true));
+      expect(awaiters.has(childPid)).toBe(true);
+      await report('session-promoted-runner', createMetadata(childPid, 'daemon'));
+      await expect(completion).resolves.toEqual({ type: 'success', sessionId: 'session-promoted-runner' });
+      expect(awaiters.size).toBe(0);
+      expect(resolvers.size).toBe(0);
+      expect(timeouts.size).toBe(0);
+    } finally {
+      for (const timeout of timeouts.values()) clearTimeout(timeout);
+      for (const resolve of resolvers.values()) resolve({ type: 'error', errorCode: 'CHILD_EXITED_BEFORE_WEBHOOK', errorMessage: 'Fixture cleanup' });
+      try { process.kill(childPid, 'SIGKILL'); } catch {}
+      try { wrapper.kill('SIGKILL'); } catch {}
+      await waitForProcessExit(childPid, { timeoutMs: 2_000 });
+      await waitForProcessExit(wrapperPid, { timeoutMs: 2_000 });
+    }
+  });
   it('correlates an unknown webhook PID to a daemon-tracked wrapper PID via PPID', { timeout: 15_000 }, async () => {
     if (process.platform === 'win32') {
       // Windows path intentionally skips PPID matching.

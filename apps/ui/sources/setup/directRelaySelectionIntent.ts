@@ -1,4 +1,10 @@
+import { setActiveServerAndSwitch } from '@/sync/domains/server/activeServerSwitch';
 import { areServerProfileIdentifiersEquivalent } from '@/sync/domains/server/serverProfiles';
+import { getActiveServerSnapshot, subscribeActiveServer } from '@/sync/domains/server/serverRuntime';
+import {
+    writeServerSelectionActiveTargetToServer,
+    type ServerSelectionActiveTargetWriter,
+} from '@/sync/domains/server/selection/serverSelectionActiveTarget';
 
 /**
  * R8/INV7 — the one record of "the user just chose this Relay/Home themselves".
@@ -17,6 +23,34 @@ import { areServerProfileIdentifiersEquivalent } from '@/sync/domains/server/ser
  * maintain. A run that ends with an unconsumed intent simply forgets it.
  */
 let pendingDirectRelaySelection: string | null = null;
+
+/**
+ * F6 — a choice stays the reason for the next relay change only while the app is still on the
+ * relay that was chosen. The gate spends it only when the app's relay CHANGED since the last
+ * inspection, so a pick that never became such a change (a first-run onboarding pick, a pick of the
+ * relay the app was already on, a pick the daemon was already converged for) would otherwise stay
+ * armed for the whole run, and an ambient return to that relay later — notification, deep link,
+ * voice — would be spent as if the person had just chosen it. Once the app moves to any OTHER relay
+ * the choice has been superseded, so it is forgotten there. This watches the active server only
+ * while an intent is armed; the pick's own switch lands on the chosen relay and keeps it.
+ */
+let stopWatchingActiveRelay: (() => void) | null = null;
+
+function clearPendingDirectRelaySelection(): void {
+    pendingDirectRelaySelection = null;
+    stopWatchingActiveRelay?.();
+    stopWatchingActiveRelay = null;
+}
+
+function watchActiveRelayWhileArmed(): void {
+    if (stopWatchingActiveRelay || pendingDirectRelaySelection === null) return;
+    stopWatchingActiveRelay = subscribeActiveServer(() => {
+        const pending = pendingDirectRelaySelection;
+        if (pending !== null && !areServerProfileIdentifiersEquivalent(pending, getActiveServerSnapshot().serverId)) {
+            clearPendingDirectRelaySelection();
+        }
+    });
+}
 
 /**
  * Counts the choices a person has made in this app run, so the gate can notice one it has not
@@ -48,12 +82,19 @@ function normalize(serverIdRaw: string | null | undefined): string | null {
 }
 
 /**
- * Called by the direct Relay/Home action **before** it switches the connection, so the intent is
- * already armed when the gate re-renders against the new identity. Only the latest choice is kept:
- * a user who picks again has replaced the question, not queued a second one.
+ * Arms the intent. Only `selectRelayDirectly` below calls it in production (pinned by
+ * `setupOwnershipGuards.test.ts`); it stays exported for this module's own contract tests. Only
+ * the latest choice is kept: a user who picks again has replaced the question, not queued a
+ * second one.
  */
 export function recordDirectRelaySelectionIntent(serverId: string): void {
-    pendingDirectRelaySelection = normalize(serverId);
+    const next = normalize(serverId);
+    if (next === null) {
+        clearPendingDirectRelaySelection();
+    } else {
+        pendingDirectRelaySelection = next;
+        watchActiveRelayWhileArmed();
+    }
     directRelaySelectionGeneration += 1;
     for (const listener of Array.from(directRelaySelectionListeners)) {
         listener();
@@ -73,6 +114,34 @@ export function consumeDirectRelaySelectionIntent(serverId: string): boolean {
     if (!areServerProfileIdentifiersEquivalent(pendingDirectRelaySelection, requested)) {
         return false;
     }
-    pendingDirectRelaySelection = null;
+    clearPendingDirectRelaySelection();
     return true;
+}
+
+/**
+ * The ONE "a person chose this relay for this device" operation (R8/INV7): the connection status
+ * control's relay pick, Settings › Server's profile pick, Add and Reset all go through it, so none
+ * of them can switch without arming the intent or arm it without switching.
+ *
+ * The intent is recorded **before** the switch, so it is already armed when the authenticated
+ * setup gate re-renders against the new identity — or, for a signed-out relay, when the gate mounts
+ * after the sign-in detour. It then writes the durable single-relay selection target and switches
+ * this device's active server through the one switch owner.
+ *
+ * Ambient changes — notification routing, deep-link auto-add, voice, session navigation, restore,
+ * group selection — keep calling the raw switch (`activeServerSwitch.ts`) and arm nothing, so the
+ * gate never moves the daemon for them.
+ */
+export async function selectRelayDirectly(params: Readonly<{
+    serverId: string;
+    selectionTarget: ServerSelectionActiveTargetWriter;
+    refreshAuth: (() => Promise<void>) | null;
+}>): Promise<boolean> {
+    recordDirectRelaySelectionIntent(params.serverId);
+    writeServerSelectionActiveTargetToServer(params.selectionTarget, params.serverId);
+    return await setActiveServerAndSwitch({
+        serverId: params.serverId,
+        scope: 'device',
+        refreshAuth: params.refreshAuth,
+    });
 }

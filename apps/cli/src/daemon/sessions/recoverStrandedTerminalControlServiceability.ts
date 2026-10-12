@@ -1,4 +1,5 @@
 import { isPidAliveBySignal } from '@/daemon/processRunState';
+import type { Metadata } from '@/api/types';
 import { buildTerminalHostHandleFromAttachmentMetadata } from '@/agent/runtime/terminal/attachmentMetadata';
 import { evaluateTerminalHostLivenessForRecovery } from '@/integrations/terminalHost/livenessPolicy';
 import type { Credentials } from '@/persistence';
@@ -26,7 +27,7 @@ export async function recoverStrandedTerminalControlServiceability(params: Reado
   retireExactTerminalControlServiceability: (input: Readonly<{
     sessionId: string;
     attachmentId: string;
-    terminalMode: 'plain' | 'tmux' | 'zellij' | 'windows_terminal' | 'windows_console';
+    terminalMode: NonNullable<Metadata['terminal']>['mode'];
   }>) => Promise<'retired' | 'superseded'>;
 }>): Promise<StopSessionResult | null> {
   const currentMachineId = params.currentMachineId.trim();

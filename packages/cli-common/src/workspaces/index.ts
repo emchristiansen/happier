@@ -78,6 +78,7 @@ export function sanitizeBundledPackageJson(raw: any): any {
     module,
     types,
     exports,
+    imports,
     dependencies,
     peerDependencies,
     optionalDependencies,
@@ -93,6 +94,7 @@ export function sanitizeBundledPackageJson(raw: any): any {
     module,
     types,
     exports,
+    ...(imports === undefined ? {} : { imports }),
     dependencies: stripInternalBundledWorkspaceDependencies(dependencies),
     peerDependencies,
     optionalDependencies: stripInternalBundledWorkspaceDependencies(optionalDependencies),
@@ -363,6 +365,7 @@ function copyBundledWorkspacePackageContents(params: Readonly<{
   collectNonDistPackageEntryTargets(params.rawPackageJson?.module, files);
   collectNonDistPackageEntryTargets(params.rawPackageJson?.types, files);
   collectNonDistPackageEntryTargets(params.rawPackageJson?.exports, files);
+  collectNonDistPackageEntryTargets(params.rawPackageJson?.imports, files);
   for (const f of files) {
     copyIfExists(resolve(params.srcDir, f), resolve(params.tempDir, f));
   }

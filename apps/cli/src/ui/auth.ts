@@ -1,3 +1,4 @@
+import { selectMachineIdentityInSettings } from '@/auth/machineIdentitySettings';
 import { decodeBase64, encodeBase64, encodeBase64Url } from "@/api/encryption";
 import { configuration, reloadConfiguration } from "@/configuration";
 import { createHash, randomBytes } from "node:crypto";
@@ -16,7 +17,8 @@ import { randomUUID } from 'node:crypto';
 import { logger } from './logger';
 import { ensureDaemonRunningForSessionCommand, shouldAutoStartDaemonAfterAuth } from '@/daemon/ensureDaemon';
 import { buildConfigureServerLinks, buildTerminalConnectLinks } from '@happier-dev/cli-common/links';
-import { createStepPrinter } from '@happier-dev/cli-common/output';
+import { bullets, cmd, createStepPrinter, definitionList, errorFrame, info, ok, sectionTitle, warn } from '@happier-dev/cli-common/output';
+import chalk from 'chalk';
 import { tailscaleServeHttpsUrlForInternalServerUrl } from '@/integrations/tailscale/tailscaleServe';
 import { isLoopbackHttpServerUrl, isLoopbackServerHost } from '@/server/serverUrlClassification';
 import { buildServerUrlReachabilityHintLines } from '@/server/reachability/serverUrlReachabilityHint';
@@ -81,22 +83,54 @@ function printServerUrlReachabilityHint(serverUrl: string): void {
 }
 
 function printMobileLinkMissingServerUrlHint(params: Readonly<{ serverUrl: string; kind: 'terminalConnect' | 'configureServer' }>): void {
+    const details = isLoopbackServerHost(params.serverUrl)
+        ? [
+            'Your relay URL is set to localhost, which is only reachable on this machine.',
+            'On your phone, open Happier → Settings → Relays and add a URL your phone can reach (LAN IP/VPN/Tailscale).',
+            'Tip (recommended): set HAPPIER_PUBLIC_SERVER_URL to a shareable https:// URL so future QR codes include it automatically.',
+        ]
+        : ['Your phone will use its currently configured relay (Happier → Settings → Relays).'];
     // eslint-disable-next-line no-console
-    console.log('Note: this mobile link does not include a relay URL.');
-    if (isLoopbackServerHost(params.serverUrl)) {
-        // eslint-disable-next-line no-console
-        console.log('Your relay URL is set to localhost, which is only reachable on this machine.');
-        // eslint-disable-next-line no-console
-        console.log('On your phone, open Happier → Settings → Relays and add a URL your phone can reach (LAN IP/VPN/Tailscale).');
-        // eslint-disable-next-line no-console
-        console.log('Tip (recommended): set HAPPIER_PUBLIC_SERVER_URL to a shareable https:// URL so future QR codes include it automatically.');
-    } else {
-        // eslint-disable-next-line no-console
-        console.log('Your phone will use its currently configured relay (Happier → Settings → Relays).');
-    }
+    console.log(warn('This mobile link does not include a relay URL.'));
+    // eslint-disable-next-line no-console
+    for (const line of details) console.log(chalk.gray(`  ${line}`));
     // eslint-disable-next-line no-console
     console.log('');
 }
+
+/** The heading every sign-in method starts with: where this computer connects, then what to do. */
+function printConnectIntro(notes: readonly string[]): void {
+    const rows = [{ label: 'Relay URL', value: configuration.serverUrl }];
+    if (configuration.apiServerUrl !== configuration.serverUrl) {
+        rows.push({ label: 'API URL', value: configuration.apiServerUrl });
+    }
+    rows.push({ label: 'Web app URL', value: configuration.webappUrl });
+    console.log('');
+    console.log(sectionTitle('Connect this computer'));
+    console.log(definitionList(rows));
+    console.log('');
+    printServerUrlReachabilityHint(configuration.serverUrl);
+    for (const note of notes) console.log(note);
+    if (notes.length > 0) console.log('');
+}
+
+function printConfigureServerLinks(): void {
+    const configureLinks = buildConfigureServerLinks({
+        webappUrl: configuration.webappUrl,
+        serverUrl: configuration.serverUrl,
+    });
+    console.log(sectionTitle('Configure the relay in the app (optional)'));
+    console.log(definitionList([
+        { label: 'Web', value: configureLinks.webUrl },
+        { label: 'Mobile', value: configureLinks.mobileUrl },
+    ]));
+    console.log('');
+    if (!configureLinks.mobileUrl.includes('url=')) {
+        printMobileLinkMissingServerUrlHint({ serverUrl: configuration.serverUrl, kind: 'configureServer' });
+    }
+}
+
+const SAME_ACCOUNT_NOTE = chalk.gray('If you already have a Happier account on another device, sign in with that same account.');
 
 async function applyAutoPublicServerUrlFromTailscaleServeBestEffort(): Promise<void> {
     if (!shouldAutoInferPublicServerUrl()) return;
@@ -186,7 +220,7 @@ export async function doAuth(): Promise<Credentials | null> {
     const envMethod = envMethodRaw === 'web' || envMethodRaw === 'browser' ? 'web' : envMethodRaw === 'mobile' ? 'mobile' : null;
     const authMethod: AuthMethod | 'both' | null = envMethod ?? (isInteractive ? await selectAuthenticationMethod() : 'both');
     if (!authMethod) {
-        console.log('\nAuthentication cancelled.\n');
+        console.log(`\n${warn('Sign-in cancelled')}\n`);
         process.exit(0);
     }
 
@@ -223,7 +257,11 @@ export async function doAuth(): Promise<Credentials | null> {
         if (debugEnabled) {
             console.log(`[AUTH DEBUG] Failed to send auth request:`, error);
         }
-        console.log('Failed to create authentication request, please try again later.');
+        console.log(errorFrame("Couldn't reach the relay to start signing in", [
+            configuration.apiServerUrl,
+            error instanceof Error ? error.message : String(error),
+            'Check the relay is running and reachable, then try again.',
+        ]));
         return null;
     }
 
@@ -264,29 +302,26 @@ async function doBothAuth(params: Readonly<{
     });
     const terminalMobileEmbedsServerUrl = terminalLinks.mobileUrl.includes('server=');
 
-    console.log('\nAuthenticate this machine\n');
-    console.log(`Relay URL: ${configuration.serverUrl}`);
-    if (configuration.apiServerUrl !== configuration.serverUrl) {
-        console.log(`API URL: ${configuration.apiServerUrl}`);
-    }
-    console.log(`Web app URL: ${configuration.webappUrl}`);
-    console.log('');
-    printServerUrlReachabilityHint(configuration.serverUrl);
-    console.log('Recommended: use the mobile app first. It makes linking additional devices easier.');
-    if (params.pairingRequirement === 'v3') {
-        console.log('Authenticated pairing v3 is required. For protection from an untrusted relay, approve with the native mobile app; web pairing trusts the web app origin.');
-    }
-    console.log('');
-    console.log('Before you continue:');
-    if (terminalMobileEmbedsServerUrl) {
-        console.log('- Make sure your phone/browser can reach the relay URL embedded in the QR/deep link');
-        console.log('- The app/web UI may prompt you to switch relays automatically (because the link includes server=...)');
-    } else {
-        console.log('- Make sure your phone is already configured to the right relay (Happier → Settings → Relays)');
-        console.log('- Tip: set HAPPIER_PUBLIC_SERVER_URL to embed a shareable relay URL in future QR codes');
-    }
-    console.log('- Sign in (or create an account)');
-    console.log('- If you already have a Happier account on another device, sign in with that same account');
+    printConnectIntro([
+        info('Recommended: use the mobile app first. It makes linking additional devices easier.'),
+        ...(params.pairingRequirement === 'v3'
+            ? [warn('Authenticated pairing v3 is required. For protection from an untrusted relay, approve with the native mobile app; web pairing trusts the web app origin.')]
+            : []),
+    ]);
+    console.log(sectionTitle('Before you continue'));
+    console.log(chalk.gray(bullets([
+        ...(terminalMobileEmbedsServerUrl
+            ? [
+                'Make sure your phone/browser can reach the relay URL embedded in the QR/deep link',
+                'The app/web UI may prompt you to switch relays automatically (because the link includes server=...)',
+            ]
+            : [
+                'Make sure your phone is already configured to the right relay (Happier → Settings → Relays)',
+                'Tip: set HAPPIER_PUBLIC_SERVER_URL to embed a shareable relay URL in future QR codes',
+            ]),
+        'Sign in (or create an account)',
+        'If you already have a Happier account on another device, sign in with that same account',
+    ])));
     console.log('');
 
     if (!terminalMobileEmbedsServerUrl) {
@@ -294,32 +329,17 @@ async function doBothAuth(params: Readonly<{
     }
 
     const printConfigureLinksRaw = String(process.env.HAPPIER_AUTH_PRINT_CONFIGURE_LINKS ?? '').trim().toLowerCase();
-    const printConfigureLinks = ['1', 'true', 'yes', 'on'].includes(printConfigureLinksRaw);
-    if (printConfigureLinks) {
-        const configureLinks = buildConfigureServerLinks({
-            webappUrl: configuration.webappUrl,
-            serverUrl: configuration.serverUrl,
-        });
-        console.log('Optional — Configure relay in app/web (advanced)');
-        console.log('Web (prefill + confirm):');
-        console.log(configureLinks.webUrl);
-        console.log('Mobile deep link:');
-        console.log(configureLinks.mobileUrl);
-        console.log('');
-        if (!configureLinks.mobileUrl.includes('url=')) {
-            printMobileLinkMissingServerUrlHint({ serverUrl: configuration.serverUrl, kind: 'configureServer' });
-        }
-    }
+    if (['1', 'true', 'yes', 'on'].includes(printConfigureLinksRaw)) printConfigureServerLinks();
 
-    console.log('Mobile (recommended)');
+    console.log(sectionTitle('Mobile app (recommended)'));
     console.log('Scan this QR code with your Happier mobile app:\n');
     displayQRCode(terminalLinks.mobileUrl);
-    console.log('\nOr manually open this URL:');
+    console.log(chalk.gray('\nOr open this link on your phone:'));
     console.log(terminalLinks.mobileUrl);
     console.log('');
 
-    console.log('Web (fallback)');
-    console.log('Open this URL in a browser where you are signed in to Happier:');
+    console.log(sectionTitle('Web browser'));
+    console.log(chalk.gray('Open this link in a browser where you are signed in to Happier:'));
     console.log(terminalLinks.webUrl);
     console.log('');
 
@@ -402,18 +422,13 @@ async function doMobileAuth(params: Readonly<{
     pairing: TerminalPairingAuthentication;
     pairingRequirement: TerminalPairingRequirement | null;
 }>): Promise<Credentials | null> {
-    console.log('\nConnect this computer\n');
-    console.log(`Relay URL: ${configuration.serverUrl}`);
-    if (configuration.apiServerUrl !== configuration.serverUrl) {
-        console.log(`API URL: ${configuration.apiServerUrl}`);
-    }
-    console.log(`Web app URL: ${configuration.webappUrl}\n`);
-    printServerUrlReachabilityHint(configuration.serverUrl);
-    console.log('Approve this computer with Happier on your phone.');
-    if (params.pairingRequirement === 'v3') {
-        console.log('Authenticated pairing v3 is required. For protection from an untrusted relay, approve with the native mobile app; web pairing trusts the web app origin.');
-    }
-    console.log('If you already have a Happier account on another device, sign in with that same account.\n');
+    printConnectIntro([
+        info('Approve this computer with Happier on your phone.'),
+        ...(params.pairingRequirement === 'v3'
+            ? [warn('Authenticated pairing v3 is required. For protection from an untrusted relay, approve with the native mobile app; web pairing trusts the web app origin.')]
+            : []),
+        SAME_ACCOUNT_NOTE,
+    ]);
 
     const publicKeyB64Url = encodeBase64Url(params.keypair.publicKey);
     const terminalLinks = buildTerminalConnectLinks({
@@ -425,22 +440,7 @@ async function doMobileAuth(params: Readonly<{
     const terminalMobileEmbedsServerUrl = terminalLinks.mobileUrl.includes('server=');
 
     const printConfigureLinksRaw = String(process.env.HAPPIER_AUTH_PRINT_CONFIGURE_LINKS ?? '').trim().toLowerCase();
-    const printConfigureLinks = ['1', 'true', 'yes', 'on'].includes(printConfigureLinksRaw);
-    if (printConfigureLinks) {
-        const configureLinks = buildConfigureServerLinks({
-            webappUrl: configuration.webappUrl,
-            serverUrl: configuration.serverUrl,
-        });
-        console.log('Optional — Configure relay in app/web (advanced)');
-        console.log('Web (prefill + confirm):');
-        console.log(configureLinks.webUrl);
-        console.log('Mobile deep link:');
-        console.log(configureLinks.mobileUrl);
-        console.log('');
-        if (!configureLinks.mobileUrl.includes('url=')) {
-            printMobileLinkMissingServerUrlHint({ serverUrl: configuration.serverUrl, kind: 'configureServer' });
-        }
-    }
+    if (['1', 'true', 'yes', 'on'].includes(printConfigureLinksRaw)) printConfigureServerLinks();
 
     if (!terminalMobileEmbedsServerUrl) {
         printMobileLinkMissingServerUrlHint({ serverUrl: configuration.serverUrl, kind: 'terminalConnect' });
@@ -449,10 +449,10 @@ async function doMobileAuth(params: Readonly<{
     console.log('Scan this QR code with your Happier mobile app:\n');
     displayQRCode(terminalLinks.mobileUrl);
 
-    console.log('\nCopy this link if you cannot scan the code:');
+    console.log(chalk.gray('\nCopy this link if you cannot scan the code:'));
     console.log(terminalLinks.mobileUrl);
     console.log('');
-    console.log('Prefer a browser? Cancel and run this command again, then choose Web browser.');
+    console.log(chalk.gray('Prefer a browser? Cancel and run this command again, then choose Web browser.'));
 
     return await waitForAuthentication(params);
 }
@@ -466,17 +466,12 @@ async function doWebAuth(params: Readonly<{
     pairing: TerminalPairingAuthentication;
     pairingRequirement: TerminalPairingRequirement | null;
 }>): Promise<Credentials | null> {
-    console.log('\nConnect this computer\n');
-    console.log(`This terminal is connected to: ${configuration.serverUrl}`);
-    if (configuration.apiServerUrl !== configuration.serverUrl) {
-        console.log(`API URL: ${configuration.apiServerUrl}`);
-    }
-    console.log(`Web app URL: ${configuration.webappUrl}\n`);
-    printServerUrlReachabilityHint(configuration.serverUrl);
-    if (params.pairingRequirement === 'v3') {
-        console.log('Authenticated pairing v3 is required, but web pairing still trusts the web app origin. Use the native mobile app for protection from an untrusted relay.\n');
-    }
-    console.log('If you already have a Happier account on another device, sign in with that same account.\n');
+    printConnectIntro([
+        ...(params.pairingRequirement === 'v3'
+            ? [warn('Authenticated pairing v3 is required, but web pairing still trusts the web app origin. Use the native mobile app for protection from an untrusted relay.')]
+            : []),
+        SAME_ACCOUNT_NOTE,
+    ]);
 
     const publicKeyB64Url = encodeBase64Url(params.keypair.publicKey);
     const terminalLinks = buildTerminalConnectLinks({
@@ -489,28 +484,26 @@ async function doWebAuth(params: Readonly<{
     const noOpenRaw = (process.env.HAPPIER_NO_BROWSER_OPEN ?? '').toString().trim();
     const noOpen = Boolean(noOpenRaw) && noOpenRaw !== '0' && noOpenRaw.toLowerCase() !== 'false';
     if (!noOpen) {
-        console.log('Opening your browser...');
-
         const browserOpened = await openBrowser(webUrl);
 
         if (browserOpened) {
-            console.log('✓ Browser opened');
+            console.log(ok('Opened your browser'));
         } else {
-            console.log('No browser opened. This is normal on a headless or remote computer.');
+            console.log(info('No browser opened. This is normal on a headless or remote computer.'));
         }
     } else {
-        console.log('Browser opening is disabled; use the link below from any browser.');
+        console.log(info('Browser opening is disabled; use the link below from any browser.'));
     }
 
     // I changed this to always show the URL because we got a report from
     // someone running happy inside the dev-box container image that they saw the
     // "Complete authentication in your browser window." but nothing opened.
     // https://github.com/slopus/happy/issues/19
-    console.log('\nCopy this link into any browser:');
+    console.log(chalk.gray('\nCopy this link into any browser:'));
     console.log(webUrl);
     console.log('');
     console.log('Sign in to the same Happier account you use on your other devices, then approve this computer.');
-    console.log('Prefer the mobile app? Cancel and run this command again, then choose Mobile app.\n');
+    console.log(chalk.gray('Prefer the mobile app? Cancel and run this command again, then choose Mobile app.\n'));
 
     return await waitForAuthentication(params, 'planet');
 }
@@ -528,17 +521,19 @@ async function waitForAuthentication(
     appearance: 'compact' | 'planet' = 'compact',
 ): Promise<Credentials | null> {
     const steps = createStepPrinter({ appearance });
-    const print = (...args: unknown[]): void => {
-        steps.pause();
-        console.log(...args);
+    // The wait is one step: it ends as ✓ Approved, or as x/! with what happened and what to do next.
+    const end = (result: 'x' | '!', title: string, details: readonly string[] = []): void => {
+        steps.stop(result, title);
+        for (const detail of details) console.log(chalk.gray(`  ${detail}`));
     };
+    const signInAgain = `Run ${cmd('happier auth login')} again to create a new sign-in request.`;
     steps.start('Waiting for authentication');
     let cancelled = false;
 
     // Handle Ctrl-C during waiting
     const handleInterrupt = () => {
         cancelled = true;
-        print('\n\nAuthentication cancelled.');
+        end('!', 'Sign-in cancelled');
         process.exit(0);
     };
 
@@ -557,8 +552,7 @@ async function waitForAuthentication(
         };
         const waitExpired = (): boolean => waitDeadlineMs !== null && Date.now() >= waitDeadlineMs;
         const printWaitExpired = (): void => {
-            print('\n\nStopped waiting for the sign-in to be approved.');
-            print('Run `happier auth login` again to create a new sign-in request.');
+            end('!', 'Stopped waiting for the sign-in to be approved', [signInAgain]);
         };
 
         let mode: 'status-claim' | 'legacy-post' = 'status-claim';
@@ -580,21 +574,23 @@ async function waitForAuthentication(
                         nowMs: Date.now(),
                     });
                     if (!opened) {
-                        print(
-                            params.pairingRequirement === 'v3'
-                                ? '\n\nAuthenticated terminal pairing v3 is required. Update the Happier mobile app and scan a new QR code.'
-                                : '\n\nFailed to decrypt response. Please try again.',
-                        );
+                        if (params.pairingRequirement === 'v3') {
+                            end('x', 'Authenticated terminal pairing v3 is required', ['Update the Happier mobile app and scan a new QR code.']);
+                        } else {
+                            end('x', "Couldn't decrypt the relay's response", ['Please try again.']);
+                        }
                         return null;
                     }
 
                     if (opened.type === 'legacy') {
                         await writeCredentialsLegacy({ secret: opened.key, token });
+                        steps.stop('✓', 'Approved');
                         return { encryption: { type: 'legacy', secret: opened.key }, token };
                     }
 
                     const publicKeyBytes = tweetnacl.box.keyPair.fromSecretKey(opened.key).publicKey;
                     await writeCredentialsDataKey({ publicKey: publicKeyBytes, machineKey: opened.key, token });
+                    steps.stop('✓', 'Approved');
                     return { encryption: { type: 'dataKey', publicKey: publicKeyBytes, machineKey: opened.key }, token };
                 };
 
@@ -641,7 +637,7 @@ async function waitForAuthentication(
 
                     const status = statusRes.data?.status;
                     if (status === 'not_found') {
-                        print('\n\nAuthentication request expired. Please run `happier auth login` again.');
+                        end('x', 'The sign-in request expired', [signInAgain]);
                         return null;
                     }
 
@@ -659,7 +655,7 @@ async function waitForAuthentication(
                             }
 
                             if (typeof claimData.token !== 'string' || typeof claimData.response !== 'string') {
-                                print('\n\nUnexpected response from the relay. Please try again.');
+                                end('x', 'Unexpected response from the relay', ['Please try again.']);
                                 return null;
                             }
 
@@ -672,11 +668,7 @@ async function waitForAuthentication(
                             const code = e?.response?.status;
                             const err = e?.response?.data?.error;
                             if (code === 410 && (err === 'expired' || err === 'consumed')) {
-                                const message =
-                                    err === 'consumed'
-                                        ? 'Authentication request was already claimed. Please run `happier auth login` again.'
-                                        : 'Authentication request expired. Please run `happier auth login` again.';
-                                print(`\n\n${message}`);
+                                end('x', err === 'consumed' ? 'The sign-in request was already claimed' : 'The sign-in request expired', [signInAgain]);
                                 return null;
                             }
                             if (code === 404 || (code === 400 && err === 'claim_not_supported') || (code === 409 && err === 'claim_not_supported')) {
@@ -699,7 +691,10 @@ async function waitForAuthentication(
                     printWaitExpired();
                     return null;
                 }
-                print('\n\nFailed to check authentication status. Please try again.');
+                end('x', "Couldn't check whether the sign-in was approved", [
+                    error instanceof Error ? error.message : String(error),
+                    'Please try again.',
+                ]);
                 return null;
             }
 
@@ -745,98 +740,12 @@ export async function ensureMachineIdInSettings(opts?: {
             'cloud',
         );
 
-        const nextMachineIdByServerId = { ...(s.machineIdByServerId ?? {}) };
-        const prevMachineIdForServer = nextMachineIdByServerId[activeServerId];
-        const nextLastSubByServerId = { ...(s.lastTokenSubByServerId ?? {}) };
-        const nextConfirmed = { ...(s.machineIdConfirmedByServerByServerId ?? {}) };
-        const hadLastSub = activeServerId in nextLastSubByServerId;
-        const hadConfirmed = activeServerId in nextConfirmed;
-
-        if (!accountId) {
-            const current = prevMachineIdForServer;
-            if (hadLastSub) delete nextLastSubByServerId[activeServerId];
-            if (hadConfirmed) delete nextConfirmed[activeServerId];
-
-            if (forceNew || !current) {
-                const machineId = randomUUID();
-                nextMachineIdByServerId[activeServerId] = machineId;
-                return {
-                    ...s,
-                    machineIdByServerId: nextMachineIdByServerId,
-                    lastTokenSubByServerId: nextLastSubByServerId,
-                    machineIdConfirmedByServerByServerId: nextConfirmed,
-                    // derived (not persisted in v5+)
-                    machineId,
-                };
-            }
-
-            if (!hadLastSub && !hadConfirmed) {
-                return {
-                    ...s,
-                    machineId: current,
-                };
-            }
-
-            return {
-                ...s,
-                lastTokenSubByServerId: nextLastSubByServerId,
-                machineIdConfirmedByServerByServerId: nextConfirmed,
-                // derived (not persisted in v5+)
-                machineId: current,
-            };
-        }
-
-        const previousAccountId = typeof nextLastSubByServerId[activeServerId] === 'string'
-            ? String(nextLastSubByServerId[activeServerId]).trim()
-            : '';
-
-        const nextMachineIdByServerIdByAccountId = { ...(s.machineIdByServerIdByAccountId ?? {}) };
-        const currentPerAccount = { ...(nextMachineIdByServerIdByAccountId[activeServerId] ?? {}) };
-        const perAccountMachineId = typeof currentPerAccount[accountId] === 'string' ? String(currentPerAccount[accountId]).trim() : '';
-
-        const didAccountSwap = Boolean(previousAccountId && previousAccountId !== accountId);
-
-        let machineId: string | null = null;
-        if (!forceNew && perAccountMachineId) {
-            machineId = perAccountMachineId;
-        } else if (!forceNew && !didAccountSwap && prevMachineIdForServer && typeof prevMachineIdForServer === 'string' && prevMachineIdForServer.trim()) {
-            // Backfill mapping for older CLIs that only stored machineIdByServerId.
-            machineId = prevMachineIdForServer.trim();
-        }
-
-        if (!machineId) {
-            machineId = randomUUID();
-        }
-
-        const normalizedPrevMachineId = typeof prevMachineIdForServer === 'string' && prevMachineIdForServer.trim()
-            ? prevMachineIdForServer.trim()
-            : null;
-        const needsServerMachineIdUpdate = normalizedPrevMachineId !== machineId;
-        const needsLastSubUpdate = previousAccountId !== accountId;
-        const needsPerAccountUpdate = perAccountMachineId !== machineId;
-
-        const needsConfirmedUpdate = (needsServerMachineIdUpdate || needsLastSubUpdate) && activeServerId in nextConfirmed;
-
-        if (!needsServerMachineIdUpdate && !needsLastSubUpdate && !needsPerAccountUpdate && !needsConfirmedUpdate) {
-            return s;
-        }
-
-        nextMachineIdByServerId[activeServerId] = machineId;
-        nextLastSubByServerId[activeServerId] = accountId;
-        currentPerAccount[accountId] = machineId;
-        nextMachineIdByServerIdByAccountId[activeServerId] = currentPerAccount;
-
-        if (needsConfirmedUpdate) delete nextConfirmed[activeServerId];
-
-        return {
-            ...s,
-            machineIdByServerId: nextMachineIdByServerId,
-            lastTokenSubByServerId: nextLastSubByServerId,
-            machineIdByServerIdByAccountId: nextMachineIdByServerIdByAccountId,
-            machineIdConfirmedByServerByServerId: nextConfirmed,
-            // derived (not persisted in v5+)
-            machineId,
-        };
+        return selectMachineIdentityInSettings(s, {
+            serverId: activeServerId,
+            accountId,
+            forceNew,
+            createMachineId: randomUUID,
+        });
     });
 
     if (!settings.machineId) throw new Error('Failed to ensure machine id in settings');

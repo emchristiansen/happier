@@ -1,6 +1,7 @@
 import chalk from 'chalk';
 import { existsSync, rmSync } from 'node:fs';
-import { createInterface } from 'node:readline';
+
+import { cmd, neutral, ok, warn } from '@happier-dev/cli-common/output';
 
 import {
   clearCredentials,
@@ -8,8 +9,9 @@ import {
   updateSettings,
 } from '@/persistence';
 import { configuration } from '@/configuration';
-import { stopDaemon } from '@/daemon/controlClient';
+import { isDaemonStopIncompleteError, stopDaemon } from '@/daemon/controlClient';
 import { stopAllDaemonsBestEffort } from '@/daemon/multiDaemon';
+import { promptConfirmYesNo } from '@/terminal/prompts/promptConfirmYesNo';
 import { clearServerScopedAuthStateInSettings } from './clearServerScopedAuthState';
 
 export async function handleAuthLogout(args: string[]): Promise<void> {
@@ -20,51 +22,36 @@ export async function handleAuthLogout(args: string[]): Promise<void> {
   if (!logoutAll) {
     const credentials = await readCredentials();
     if (!credentials) {
-      console.log(chalk.yellow('Not currently authenticated'));
+      console.log(neutral('Not signed in'));
       return;
     }
   }
 
-  if (logoutAll) {
-    console.log(chalk.blue('This will log you out of Happier on all relays and remove local data'));
-  } else {
-    console.log(chalk.blue(`This will log you out of Happier for relay: ${targetServerId}`));
-  }
-  console.log(chalk.yellow('⚠️  You will need to re-authenticate to use Happier again'));
+  console.log(warn(logoutAll
+    ? 'This signs you out of Happier on all relays and removes local data'
+    : `This signs you out of Happier for relay ${targetServerId}`));
+  console.log(chalk.gray('  You will need to sign in again to use Happier.'));
 
-  const rl = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
+  const confirmed = await promptConfirmYesNo(
+    logoutAll ? 'Sign out everywhere and delete local data?' : 'Sign out?',
+    { default: 'no' },
+  );
 
-  const answer = await new Promise<string>((resolve) => {
-    rl.question(
-      chalk.yellow(logoutAll
-        ? 'Are you sure you want to log out everywhere and delete local data? (y/N): '
-        : 'Are you sure you want to log out? (y/N): '),
-      resolve,
-    );
-  });
-
-  rl.close();
-
-  if (answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes') {
+  if (confirmed) {
     try {
       if (logoutAll) {
-        try {
-          await stopAllDaemonsBestEffort();
-        } catch {
-          // best-effort
-        }
+        await stopAllDaemonsBestEffort();
         if (existsSync(happyDir)) {
           rmSync(happyDir, { recursive: true, force: true });
         }
       } else {
+        let daemonStopIncomplete: Error | null = null;
         try {
-          await stopDaemon();
-          console.log(chalk.gray('Stopped daemon'));
-        } catch {
-          // ignore
+          const stopped = await stopDaemon();
+          console.log(ok(stopped.status === 'stopped' ? 'Stopped the daemon' : 'No daemon was running'));
+        } catch (error) {
+          if (isDaemonStopIncompleteError(error)) daemonStopIncomplete = error;
+          else throw error;
         }
 
         await clearCredentials();
@@ -72,15 +59,16 @@ export async function handleAuthLogout(args: string[]): Promise<void> {
         await updateSettings((settings) => {
           return clearServerScopedAuthStateInSettings(settings, targetServerId);
         });
+        if (daemonStopIncomplete) throw daemonStopIncomplete;
       }
 
-      console.log(chalk.green('✓ Successfully logged out'));
-      console.log(chalk.gray('  Run "happier auth login" to authenticate again'));
+      console.log(ok('Signed out'));
+      console.log(chalk.gray(`  Run ${cmd('happier auth login')} to sign in again.`));
     } catch (error) {
       throw new Error(`Failed to logout: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
     return;
   }
 
-  console.log(chalk.blue('Logout cancelled'));
+  console.log(neutral('Sign-out cancelled'));
 }

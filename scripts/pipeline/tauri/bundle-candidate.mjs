@@ -17,8 +17,9 @@ const PLATFORM_LAYOUTS = Object.freeze({
 
 export const BUNDLE_CANDIDATE_PLATFORMS = Object.freeze(Object.keys(PLATFORM_LAYOUTS));
 
-/** @param {Partial<Record<string, { id: number; digest: string }>>} artifacts */
-export function planBundleCandidates(artifacts) {
+/** @param {Partial<Record<string, { id: number; digest: string }>>} artifacts
+ * @param {Partial<Record<string, { id: number; digest: string }>>} [finalizedArtifacts] */
+export function planBundleCandidates(artifacts, finalizedArtifacts = {}) {
   const include = Object.entries(PLATFORM_LAYOUTS).map(([platform, layout]) => ({
     os: layout.os,
     platform_key: platform,
@@ -26,8 +27,16 @@ export function planBundleCandidates(artifacts) {
     artifact_id: artifacts[platform]?.id ?? '',
     artifact_digest: artifacts[platform]?.digest ?? '',
   }));
-  const build = include.filter((entry) => entry.artifact_id === '');
-  return { buildNeeded: build.length > 0, buildMatrix: { include: build }, finalizeMatrix: { include } };
+  const finalize = include.filter((entry) => !finalizedArtifacts[entry.platform_key]);
+  const build = finalize.filter((entry) => entry.artifact_id === '');
+  const reused = include.filter((entry) => finalizedArtifacts[entry.platform_key]).map((entry) => ({
+    platform_key: entry.platform_key,
+    artifact_id: finalizedArtifacts[entry.platform_key].id,
+    artifact_digest: finalizedArtifacts[entry.platform_key].digest,
+  }));
+  return { buildNeeded: build.length > 0, buildMatrix: { include: build },
+    finalizeNeeded: finalize.length > 0, finalizeMatrix: { include: finalize },
+    reuseNeeded: reused.length > 0, reuseMatrix: { include: reused } };
 }
 
 function sha256(filePath) {
@@ -162,6 +171,7 @@ function main() {
     options: {
       mode: { type: 'string' },
       'resume-artifacts-json': { type: 'string', default: '{}' },
+      'resume-finalized-artifacts-json': { type: 'string', default: '{}' },
       'github-output': { type: 'string' },
       'platform-key': { type: 'string' },
       'source-sha': { type: 'string', default: '' },
@@ -180,10 +190,11 @@ function main() {
     allowPositionals: false,
   });
   if (values.mode === 'plan') {
-    const planned = planBundleCandidates(JSON.parse(String(values['resume-artifacts-json'])));
+    const planned = planBundleCandidates(JSON.parse(String(values['resume-artifacts-json'])),
+      JSON.parse(String(values['resume-finalized-artifacts-json'])));
     if (values['github-output']) {
       fs.appendFileSync(String(values['github-output']),
-        `build_needed=${planned.buildNeeded}\nbuild_matrix=${JSON.stringify(planned.buildMatrix)}\nfinalize_matrix=${JSON.stringify(planned.finalizeMatrix)}\n`);
+        `build_needed=${planned.buildNeeded}\nbuild_matrix=${JSON.stringify(planned.buildMatrix)}\nfinalize_needed=${planned.finalizeNeeded}\nfinalize_matrix=${JSON.stringify(planned.finalizeMatrix)}\nreuse_needed=${planned.reuseNeeded}\nreuse_matrix=${JSON.stringify(planned.reuseMatrix)}\n`);
     }
     console.log(JSON.stringify(planned));
     return;

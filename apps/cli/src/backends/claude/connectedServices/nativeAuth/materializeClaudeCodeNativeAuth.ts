@@ -17,7 +17,6 @@ import { replaceDirectoryAtomically } from '@/utils/fs/replaceDirectoryAtomicall
 
 import {
   backfillPreviousClaudeHomeSessionFiles,
-  resolveClaudeHomeSharingSettings,
   syncClaudeConnectedServiceHome,
 } from '../syncClaudeConnectedServiceHome';
 import {
@@ -555,14 +554,13 @@ export async function materializeClaudeSubscriptionNativeAuthHome(params: Readon
     };
   }
 
-  const sharingPolicy = resolveClaudeHomeSharingSettings(params.accountSettings ?? null);
   const sourceClaudeConfigDir = resolveConfiguredClaudeConfigDir({ env: params.sourceEnv });
-  if (resolve(sourceClaudeConfigDir) === resolve(params.targetClaudeConfigDir)) {
+  if (resolve(sourceClaudeConfigDir) === resolve(params.targetClaudeConfigDir) || preserveNewerExistingCredential) {
     return await withConnectedServiceStateSharingDestinationLock(params.targetClaudeConfigDir, async () => {
       if (!await validateGroupMutationCurrentness()) return supersededResult();
       await stripLegacyRefreshTokensFromManagedClaudeHome(params.targetClaudeConfigDir);
-      // The source and destination may be the same shared group home for an already-running
-      // session. Re-read provenance only after acquiring the canonical destination lock so a
+      // Reconcile existing credentials in place, including self-source homes. Re-read
+      // provenance only after acquiring the canonical destination lock so a
       // delayed older generation cannot overwrite a newer fan-out/materialization.
       const existingProvenance = await readClaudeConnectedServiceHomeProvenance(
         params.targetClaudeConfigDir,
@@ -581,98 +579,13 @@ export async function materializeClaudeSubscriptionNativeAuthHome(params: Readon
         targetDir: params.targetClaudeConfigDir,
         accountSettings: params.accountSettings ?? null,
         sessionDirectory: params.sessionDirectory ?? null,
-        preserveNativeCredentialFile: true,
-        sharingPolicyOverride: {
-          configMode: 'copied',
-          stateMode: sharingPolicy.stateMode,
-        },
+        preserveNativeAuthFiles: true,
         vendorResumeId: params.vendorResumeId ?? null,
         candidatePersistedSessionFile: params.candidatePersistedSessionFile ?? null,
         ambientStateSourceDir: params.ambientStateSourceDir ?? null,
         destinationLockAlreadyHeld: true,
       });
       await mkdir(params.targetClaudeConfigDir, { recursive: true });
-      await materializeClaudeWorkspaceTrust({
-        sourceEnv: params.sourceEnv,
-        targetDir: params.targetClaudeConfigDir,
-        sessionDirectory: params.sessionDirectory ?? null,
-        preserveExistingOauthAccountProjection: true,
-      });
-      const credentialFileAlreadyCurrent = await isClaudeSubscriptionNativeCredentialFileCurrent({
-        record: params.record,
-        selectionDescriptor: params.selectionDescriptor,
-        targetClaudeConfigDir: params.targetClaudeConfigDir,
-      });
-      const materialized = credentialFileAlreadyCurrent
-        ? alreadyMaterializedClaudeCodeNativeAuthResult(params.targetClaudeConfigDir)
-        : await materializeClaudeCodeNativeAuth({
-            record: params.record,
-            claudeConfigDir: params.targetClaudeConfigDir,
-            preserveNewerExistingCredential: false,
-            homeDir: params.sourceEnv.HOME,
-            username: params.sourceEnv.USER,
-            diagnosticContext: credentialDiagnosticContextForSelection(params.selectionDescriptor),
-          });
-      if (materialized.status !== 'materialized') {
-        return {
-          ...materialized,
-          diagnostics: [...syncResult.diagnostics, ...materialized.diagnostics],
-          identityDiagnostic,
-        };
-      }
-      await reconcileClaudeAccountScopedRootConfigFile({
-        path: join(params.targetClaudeConfigDir, '.claude.json'),
-        preserveExistingAccountState,
-        ...oauthIdentity,
-      });
-      if (!credentialFileAlreadyCurrent) {
-        await writeClaudeConnectedServiceHomeProvenance({
-          claudeConfigDir: params.targetClaudeConfigDir,
-          provenance: buildClaudeConnectedServiceHomeProvenance({
-            record: params.record,
-            selectionDescriptor: params.selectionDescriptor,
-          }),
-        });
-      }
-      return {
-        ...materialized,
-        env: { CLAUDE_CONFIG_DIR: params.targetClaudeConfigDir },
-        credentialPath: join(params.targetClaudeConfigDir, '.credentials.json'),
-        diagnostics: [...syncResult.diagnostics, ...materialized.diagnostics],
-        identityDiagnostic,
-      };
-    }, { providerId: 'claude' });
-  }
-
-  if (preserveNewerExistingCredential) {
-    return await withConnectedServiceStateSharingDestinationLock(params.targetClaudeConfigDir, async () => {
-      if (!await validateGroupMutationCurrentness()) return supersededResult();
-      await stripLegacyRefreshTokensFromManagedClaudeHome(params.targetClaudeConfigDir);
-      const existingProvenance = await readClaudeConnectedServiceHomeProvenance(params.targetClaudeConfigDir);
-      if (isClaudeConnectedServiceHomeGenerationSuperseded({
-        incomingSelection: params.selectionDescriptor,
-        existingProvenance,
-      })) {
-        return {
-          ...alreadyMaterializedClaudeCodeNativeAuthResult(params.targetClaudeConfigDir),
-          identityDiagnostic,
-        };
-      }
-      const syncResult = await syncClaudeConnectedServiceHome({
-        sourceEnv: params.sourceEnv,
-        targetDir: params.targetClaudeConfigDir,
-        accountSettings: params.accountSettings ?? null,
-        sessionDirectory: params.sessionDirectory ?? null,
-        preserveNativeCredentialFile: true,
-        sharingPolicyOverride: {
-          configMode: 'copied',
-          stateMode: sharingPolicy.stateMode,
-        },
-        vendorResumeId: params.vendorResumeId ?? null,
-        candidatePersistedSessionFile: params.candidatePersistedSessionFile ?? null,
-        ambientStateSourceDir: params.ambientStateSourceDir ?? null,
-        destinationLockAlreadyHeld: true,
-      });
       await materializeClaudeWorkspaceTrust({
         sourceEnv: params.sourceEnv,
         targetDir: params.targetClaudeConfigDir,
@@ -749,11 +662,7 @@ export async function materializeClaudeSubscriptionNativeAuthHome(params: Readon
         targetDir: stagedClaudeConfigDir,
         accountSettings: params.accountSettings ?? null,
         sessionDirectory: params.sessionDirectory ?? null,
-        preserveNativeCredentialFile: true,
-        sharingPolicyOverride: {
-          configMode: 'copied',
-          stateMode: sharingPolicy.stateMode,
-        },
+        preserveNativeAuthFiles: true,
         vendorResumeId: params.vendorResumeId ?? null,
         candidatePersistedSessionFile: params.candidatePersistedSessionFile ?? null,
       });

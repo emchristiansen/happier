@@ -1,26 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { RpcError } from '@/sync/runtime/rpcErrors';
 import { RPC_ERROR_CODES } from '@happier-dev/protocol/rpc';
+import { storage } from '@/sync/domains/state/storage';
+import { settingsDefaults } from '@/sync/domains/settings/settings';
+import { createActionOperationFixture } from '@/dev/testkit/fixtures/actionOperationFixtures';
+import { createMachineFixture } from '@/dev/testkit/fixtures/machineFixtures';
 
 const machineRpcWithServerScopeMock = vi.hoisted(() => vi.fn());
-const storageState = vi.hoisted(() => ({
-    value: {
-        machines: {},
-    },
-}));
-
 vi.mock('@/sync/runtime/orchestration/serverScopedRpc/serverScopedMachineRpc', () => ({
     machineRpcWithServerScope: machineRpcWithServerScopeMock,
 }));
-
-vi.mock('@/sync/domains/state/storage', async () => {
-    const { createStorageModuleStub } = await import('@/dev/testkit/mocks/storage');
-    return createStorageModuleStub({
-        storage: {
-            getState: () => storageState.value,
-        },
-    });
-});
 
 const directSource = {
     kind: 'codexHome' as const,
@@ -30,7 +19,7 @@ const directSource = {
 describe('machine direct sessions ops server-scoped routing', () => {
     beforeEach(() => {
         machineRpcWithServerScopeMock.mockReset();
-        storageState.value = { machines: {} };
+        storage.setState({ machines: {}, settings: { ...settingsDefaults } });
     });
 
     it('routes direct session candidate listing through server-scoped machine rpc', async () => {
@@ -235,24 +224,71 @@ describe('machine direct sessions ops server-scoped routing', () => {
         }));
     });
 
+    it.each(['direct', 'persist'] as const)('uses replacement-machine terminal settings for %s takeover', async (mode) => {
+        storage.setState({
+            machines: {
+                old: createMachineFixture({ id: 'old', active: false, replacedByMachineId: 'current', replacedAt: 123 }),
+                current: createMachineFixture({ id: 'current', active: true }),
+            },
+            settings: {
+                ...settingsDefaults,
+                sessionUseTmux: false,
+                sessionTmuxByMachineId: {
+                    current: { useTmux: true, sessionName: ' machine-work ', isolated: true, tmpDir: ' /tmp/machine-tmux ' },
+                },
+            },
+        });
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ ok: true, operation: createActionOperationFixture({ scope: { accountId: 'account-1', machineId: 'machine-1', sessionId: 'session-1' } }) });
+        const { machineDirectSessionTakeover, machineDirectSessionTakeoverPersistStart } = await import('./machineDirectSessions');
+        await (mode === 'direct' ? machineDirectSessionTakeover : machineDirectSessionTakeoverPersistStart)({
+            machineId: 'old', sessionId: 'session-1',
+        });
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            machineId: 'current',
+            payload: {
+                machineId: 'old', sessionId: 'session-1',
+                terminal: { mode: 'tmux', tmux: { sessionName: 'machine-work', isolated: true, tmpDir: '/tmp/machine-tmux' } },
+            },
+        }));
+    });
+
+    it.each([
+        { useTmux: true, override: undefined, expected: { mode: 'tmux', tmux: { sessionName: 'global-work', isolated: false, tmpDir: null } } },
+        { useTmux: false, override: undefined, expected: undefined },
+        { useTmux: true, override: { useTmux: false, sessionName: '', isolated: false, tmpDir: '' }, expected: undefined },
+    ])('uses global tmux=$useTmux and machine override=$override for takeover', async ({ useTmux, override, expected }) => {
+        storage.setState({ settings: {
+            ...settingsDefaults,
+            sessionUseTmux: useTmux,
+            sessionTmuxSessionName: 'global-work',
+            sessionTmuxIsolated: false,
+            sessionTmuxTmpDir: '',
+            sessionTmuxByMachineId: override ? { machine: override } : {},
+        } });
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ ok: true });
+        const { machineDirectSessionTakeover } = await import('./machineDirectSessions');
+        await machineDirectSessionTakeover({ machineId: 'machine', sessionId: 'session-1' });
+        expect(machineRpcWithServerScopeMock.mock.calls[0][0].payload.terminal).toEqual(expected);
+    });
+
     it('routes direct session takeover+persist through server-scoped machine rpc', async () => {
         machineRpcWithServerScopeMock.mockResolvedValueOnce({
             ok: true,
-            converted: true,
+            operation: createActionOperationFixture({ scope: { accountId: 'account-1', machineId: 'machine-1', sessionId: 'happy-session-1' } }),
         });
-        const { machineDirectSessionTakeoverPersist } = await import('./machineDirectSessions');
+        const { machineDirectSessionTakeoverPersistStart } = await import('./machineDirectSessions');
 
-        const result = await machineDirectSessionTakeoverPersist({
+        const result = await machineDirectSessionTakeoverPersistStart({
             machineId: 'machine-1',
             sessionId: 'happy-session-1',
             forceStop: true,
         }, { serverId: 'server-a' });
 
-        expect(result).toEqual({ ok: true, converted: true });
+        expect(result).toEqual({ ok: true, operation: createActionOperationFixture({ scope: { accountId: 'account-1', machineId: 'machine-1', sessionId: 'happy-session-1' } }) });
         expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
             machineId: 'machine-1',
             serverId: 'server-a',
-            method: 'daemon.directSessions.takeoverPersist',
+            method: 'daemon.directSessions.takeoverPersist.start',
             payload: {
                 machineId: 'machine-1',
                 sessionId: 'happy-session-1',
@@ -262,37 +298,37 @@ describe('machine direct sessions ops server-scoped routing', () => {
     });
 
     it('routes direct session RPCs to an active replacement machine while preserving linked metadata identity', async () => {
-        storageState.value = {
+        storage.setState({
             machines: {
-                'machine-old': {
+                'machine-old': createMachineFixture({
                     id: 'machine-old',
                     active: false,
                     replacedByMachineId: 'machine-new',
                     replacedAt: 123,
-                },
-                'machine-new': {
+                }),
+                'machine-new': createMachineFixture({
                     id: 'machine-new',
                     active: true,
-                },
+                }),
             },
-        };
+        });
         machineRpcWithServerScopeMock.mockResolvedValueOnce({
             ok: true,
-            converted: true,
+            operation: createActionOperationFixture({ scope: { accountId: 'account-1', machineId: 'machine-1', sessionId: 'happy-session-1' } }),
         });
-        const { machineDirectSessionTakeoverPersist } = await import('./machineDirectSessions');
+        const { machineDirectSessionTakeoverPersistStart } = await import('./machineDirectSessions');
 
-        const result = await machineDirectSessionTakeoverPersist({
+        const result = await machineDirectSessionTakeoverPersistStart({
             machineId: 'machine-old',
             sessionId: 'happy-session-1',
             forceStop: true,
         }, { serverId: 'server-a' });
 
-        expect(result).toEqual({ ok: true, converted: true });
+        expect(result).toEqual({ ok: true, operation: createActionOperationFixture({ scope: { accountId: 'account-1', machineId: 'machine-1', sessionId: 'happy-session-1' } }) });
         expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
             machineId: 'machine-new',
             serverId: 'server-a',
-            method: 'daemon.directSessions.takeoverPersist',
+            method: 'daemon.directSessions.takeoverPersist.start',
             payload: {
                 machineId: 'machine-old',
                 sessionId: 'happy-session-1',

@@ -290,7 +290,7 @@ function modelStateFromConfigOptions(
       ...(option.description ? { description: option.description } : {}),
     }] : [];
   });
-  return availableModels.length > 0
+  return availableModels.length > 0 || modelOption.options.length === 0
     ? { currentModelId: modelOption.currentValue, availableModels }
     : null;
 }

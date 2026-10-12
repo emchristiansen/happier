@@ -8,6 +8,14 @@ import type { Credentials } from '@/persistence';
 import type { SpawnSessionOptions } from '@/rpc/handlers/registerSessionHandlers';
 import os from 'node:os';
 import path from 'node:path';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { ApiMachineClient } from '@/api/apiMachine';
+import { createOnChildExited } from './onChildExited';
+import { readSessionMarkerForPid, writeSessionMarker } from '../sessionRegistry';
+import { spawnInlineNodeTestProcess } from '@/testkit/process/spawn';
+import { once } from 'node:events';
+import { waitForSessionWebhook } from '../spawn/waitForSessionWebhook';
+import type { SpawnSessionResult } from '@/rpc/handlers/registerSessionHandlers';
 
 import { createOnHappySessionWebhook } from './onHappySessionWebhook';
 
@@ -38,6 +46,157 @@ function expectSessionMarkerWriteArgs(args: SessionMarkerWriteArgs | null): Sess
 }
 
 describe('createOnHappySessionWebhook', () => {
+  it('preserves and wakes accepted custody installed during an untracked daemon OS admission probe', async () => {
+    const sessions = new Map<number, TrackedSession>();
+    const awaiters = new Map<number, (session: TrackedSession) => void>();
+    const resolvers = new Map<number, (result: SpawnSessionResult) => void>();
+    const timeouts = new Map<number, ReturnType<typeof setTimeout>>();
+    const tracked: TrackedSession = { pid: process.pid, startedBy: 'daemon' };
+    let completion: ReturnType<typeof waitForSessionWebhook> | undefined;
+    const originalKill = process.kill.bind(process);
+    // Acceptance arrives at the genuine OS liveness boundary. The process run
+    // state reader, report correlation and pending waiter remain real.
+    const probe = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      if (pid === process.pid && signal === 0 && !completion) {
+        sessions.set(pid, tracked);
+        completion = waitForSessionWebhook({ pid, pidToAwaiter: awaiters, pidToSpawnResultResolver: resolvers,
+          pidToSpawnWebhookTimeout: timeouts, timeoutErrorMessage: 'Fixture report timeout' });
+      }
+      return originalKill(pid, signal);
+    });
+    const report = createOnHappySessionWebhook({
+      pidToTrackedSession: sessions, pidToAwaiter: awaiters,
+      findHappyProcessByPidFn: async () => null, writeSessionMarkerFn: async () => {},
+    });
+    try {
+      await report('session-admission-arrival', createMetadata(process.pid, 'daemon'));
+      expect(sessions.get(process.pid)).toBe(tracked);
+      await expect(completion).resolves.toEqual({ type: 'success', sessionId: 'session-admission-arrival' });
+    } finally {
+      probe.mockRestore();
+      for (const timeout of timeouts.values()) clearTimeout(timeout);
+      for (const resolve of resolvers.values()) resolve({ type: 'error', errorCode: 'CHILD_EXITED_BEFORE_WEBHOOK', errorMessage: 'Fixture cleanup' });
+    }
+  });
+  it('cannot revive an old wrapper marker when a pre-promotion report census finishes late', async () => {
+    const previousHome = configuration.happyHomeDir;
+    const fixtureHome = await mkdtemp(path.join(os.tmpdir(), 'happier-wrapper-report-marker-'));
+    Object.defineProperty(configuration, 'happyHomeDir', { value: fixtureHome });
+    const wrapperPid = 813;
+    const tracked: TrackedSession = {
+      pid: wrapperPid, startedBy: 'daemon', happySessionId: 'session-wrapper-marker',
+      // Only the daemon's OS child handle is represented; correlation stays real.
+      childProcess: { pid: wrapperPid } as ChildProcess,
+    };
+    const sessions = new Map([[wrapperPid, tracked]]);
+    let releaseCensus!: () => void;
+    const census = new Promise<void>((resolve) => { releaseCensus = resolve; });
+    let censusEntered = false;
+    let wrapperWritten = false;
+    const report = createOnHappySessionWebhook({
+      pidToTrackedSession: sessions, pidToAwaiter: new Map([[wrapperPid, () => {}]]),
+      getParentPidFn: () => wrapperPid,
+      findHappyProcessByPidFn: async (pid) => { if (pid === wrapperPid) { censusEntered = true; await census; } return null; },
+      writeSessionMarkerFn: async (marker, options) => {
+        await writeSessionMarker(marker, options);
+        if (marker.pid === wrapperPid) wrapperWritten = true;
+      },
+    });
+    const exit = createOnChildExited({
+      pidToTrackedSession: sessions, spawnResourceCleanupByPid: new Map(), sessionAttachCleanupByPid: new Map(),
+      getApiMachineForSessions: () => null,
+    });
+    try {
+      await writeSessionMarker({ pid: wrapperPid, startedBy: 'daemon', happySessionId: 'session-wrapper-marker' });
+      await report(`PID-${wrapperPid}`, createMetadata(wrapperPid, 'daemon'));
+      await vi.waitFor(() => expect(censusEntered).toBe(true));
+      await report(`PID-${process.pid}`, createMetadata(process.pid, 'daemon'));
+      await exit(wrapperPid, { reason: 'process-exited', code: 0, signal: null });
+      expect(sessions.has(process.pid)).toBe(true);
+      releaseCensus();
+      await vi.waitFor(() => expect(wrapperWritten).toBe(true));
+      await vi.waitFor(async () => expect(await readSessionMarkerForPid(wrapperPid)).toBeNull());
+    } finally {
+      releaseCensus();
+      await vi.waitFor(() => expect(wrapperWritten).toBe(true));
+      await tracked.reportMarkerCustody?.pending;
+      Object.defineProperty(configuration, 'happyHomeDir', { value: previousHome });
+      await rm(fixtureHome, { recursive: true, force: true });
+    }
+  });
+  it('rejects a positively dead untracked daemon report without rejecting a live daemon or terminal-origin report', async () => {
+    const child = spawnInlineNodeTestProcess('');
+    const deadPid = child.pid!;
+    await once(child, 'exit');
+    const tracked = new Map<number, TrackedSession>();
+    const report = createOnHappySessionWebhook({
+      pidToTrackedSession: tracked, pidToAwaiter: new Map(),
+      findHappyProcessByPidFn: async () => null, writeSessionMarkerFn: async () => {},
+    });
+    await report('session-dead-daemon', createMetadata(deadPid, 'daemon'));
+    expect(tracked.has(deadPid)).toBe(false);
+    await report('session-live-daemon', createMetadata(process.pid, 'daemon'));
+    expect(tracked.get(process.pid)?.happySessionId).toBe('session-live-daemon');
+    await report('session-terminal', createMetadata(deadPid, 'terminal'));
+    expect(tracked.get(deadPid)?.happySessionId).toBe('session-terminal');
+  });
+  it.each([[1, false, 'daemon'], [2, false, 'daemon'], [1, true, 'daemon'], [1, true, 'terminal']] as const)('retires report-marker work before exact-turn exit and cannot revive custody (%s reports, externally classified %s, origin %s)', async (reportCount, externallyClassified, reportOrigin) => {
+    const previousHome = configuration.happyHomeDir;
+    const fixtureHome = await mkdtemp(path.join(os.tmpdir(), 'happier-report-marker-retirement-'));
+    Object.defineProperty(configuration, 'happyHomeDir', { value: fixtureHome });
+    const pid = 812;
+    const tracked: TrackedSession = { pid, startedBy: externallyClassified ? 'happy directly - likely by user from terminal' : 'daemon', happySessionId: 'session-report-marker', activeTurnId: 'turn-report-marker' };
+    const trackedSessions = new Map([[pid, tracked]]);
+    let releaseCensus!: () => void;
+    const census = new Promise<void>((resolve) => { releaseCensus = resolve; });
+    let censusCalls = 0;
+    let terminalized = false;
+    let written = 0;
+    let reports: Promise<void>[] = [];
+    // The external durable terminal-custody transport is the only API fixture;
+    // marker persistence, report correlation and exit staging remain real.
+    const terminalCustody = new ApiMachineClient('fixture-token', {
+      id: 'machine-test', encryptionKey: new Uint8Array(32).fill(7), encryptionVariant: 'legacy',
+      metadata: null, metadataVersion: 0, daemonState: null, daemonStateVersion: 0,
+    });
+    const terminalWrite = vi.spyOn(terminalCustody, 'enqueueDaemonTerminalExactTurnEnd')
+      .mockImplementation(async () => { terminalized = true; });
+    const report = createOnHappySessionWebhook({
+      pidToTrackedSession: trackedSessions, pidToAwaiter: new Map(),
+      findHappyProcessByPidFn: async () => { censusCalls += 1; await census; return null; },
+      writeSessionMarkerFn: async (...args) => { await writeSessionMarker(...args); written += 1; },
+    });
+    const exit = createOnChildExited({
+      pidToTrackedSession: trackedSessions, spawnResourceCleanupByPid: new Map(), sessionAttachCleanupByPid: new Map(),
+      getApiMachineForSessions: () => terminalCustody,
+    });
+    let exiting: Promise<void> | undefined;
+    try {
+      await writeSessionMarker({ pid, happySessionId: 'session-report-marker', startedBy: reportOrigin, activeTurnId: 'turn-report-marker' });
+      reports = Array.from({ length: reportCount }, () => report('session-report-marker', createMetadata(pid, reportOrigin)));
+      await vi.waitFor(() => expect(censusCalls).toBe(reportCount));
+      exiting = exit(pid, { reason: 'process-exited', code: 0, signal: null });
+      // This external write would retire custody while the independently delayed
+      // process census can still produce a late filesystem marker.
+      expect(terminalized).toBe(false);
+      releaseCensus();
+      await Promise.all(reports);
+      await exiting;
+      await vi.waitFor(() => expect(written).toBe(reportCount));
+      expect(terminalized).toBe(true);
+      expect(trackedSessions.has(pid)).toBe(false);
+      expect(await readSessionMarkerForPid(pid)).toBeNull();
+    } finally {
+      releaseCensus();
+      await Promise.allSettled(reports);
+      await exiting;
+      await vi.waitFor(() => expect(written).toBe(reportCount));
+      terminalWrite.mockRestore();
+      await terminalCustody.shutdown();
+      Object.defineProperty(configuration, 'happyHomeDir', { value: previousHome });
+      await rm(fixtureHome, { recursive: true, force: true });
+    }
+  });
   it('registers an externally started session when PID is unknown', () => {
     const pidToTrackedSession = new Map<number, TrackedSession>();
     const pidToAwaiter = new Map<number, (session: TrackedSession) => void>();
@@ -106,6 +265,43 @@ describe('createOnHappySessionWebhook', () => {
     expect(pidToTrackedSession.get(789)?.happySessionId).toBe('session-daemon-789');
     expect(awaiter).toHaveBeenCalledTimes(1);
     expect(pidToAwaiter.has(789)).toBe(false);
+  });
+
+  it('waits for async spawn finalization before acknowledging the session report', async () => {
+    const tracked: TrackedSession = {
+      pid: 791,
+      startedBy: 'daemon',
+    };
+    const pidToTrackedSession = new Map<number, TrackedSession>([[791, tracked]]);
+    let finishFinalization!: () => void;
+    const finalization = new Promise<void>((resolve) => {
+      finishFinalization = resolve;
+    });
+    const awaiter = vi.fn(async () => {
+      await finalization;
+    });
+    const pidToAwaiter = new Map<number, (session: TrackedSession) => void>([[791, awaiter]]);
+
+    const onWebhook = createOnHappySessionWebhook({
+      pidToTrackedSession,
+      pidToAwaiter,
+      getParentPidFn: () => null,
+      findHappyProcessByPidFn: async () => null,
+      writeSessionMarkerFn: async () => {},
+    });
+
+    const report = onWebhook('session-daemon-791', createMetadata(791, 'daemon'));
+    let acknowledged = false;
+    void report.then(() => {
+      acknowledged = true;
+    });
+
+    await Promise.resolve();
+    expect(acknowledged).toBe(false);
+
+    finishFinalization();
+    await report;
+    expect(acknowledged).toBe(true);
   });
 
   it('preserves an established Happier session id when a later webhook reports another identity', async () => {

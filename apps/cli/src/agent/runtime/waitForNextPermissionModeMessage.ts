@@ -22,6 +22,9 @@ export async function waitForNextPermissionModeMessage<Mode, Message>(opts: {
       await opts.session.reconcilePendingQueueState?.(reconcileOpts);
     },
     waitForPendingEligibilityUpdate: (signal) => opts.session.waitForPendingEligibilityUpdate(signal),
+    ...(typeof opts.session.waitForMetadataUpdate === 'function'
+      ? { waitForMetadataUpdate: (signal?: AbortSignal) => opts.session.waitForMetadataUpdate(signal) }
+      : {}),
   };
 
   const consumerOptions: SessionProviderInputConsumerOptions<Mode, Message> = {
@@ -35,5 +38,8 @@ export async function waitForNextPermissionModeMessage<Mode, Message>(opts: {
 
   const inputConsumer = opts.inputConsumer ?? createSessionProviderInputConsumer(consumerOptions);
 
-  return await inputConsumer.waitForNextInput({ abortSignal: opts.abortSignal });
+  return await inputConsumer.waitForNextInput({
+    abortSignal: opts.abortSignal,
+    onMetadataUpdate: opts.onMetadataUpdate,
+  });
 }

@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawnBackgroundSync } from '@happier-dev/cli-common/process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import {
   buildReadWindowsScheduledTaskStatusPowerShellCommand,
@@ -113,7 +113,7 @@ function splitWindowsScheduledTaskName(taskName: string): { taskPath: string; le
 
 function readScheduledTaskPowerShellInfo(taskName: string): string | null {
   const { taskPath, leafTaskName } = splitWindowsScheduledTaskName(taskName);
-  const result = spawnSync('powershell.exe', [
+  const result = spawnBackgroundSync('powershell.exe', [
     '-NoProfile',
     '-NonInteractive',
     '-ExecutionPolicy',
@@ -125,7 +125,6 @@ function readScheduledTaskPowerShellInfo(taskName: string): string | null {
     }),
   ], {
     encoding: 'utf8',
-    windowsHide: true,
   });
   if (result.error || result.status !== 0 || !result.stdout) {
     return null;
@@ -153,9 +152,8 @@ function readScheduledTaskPowerShellInfo(taskName: string): string | null {
  * diagnostic source.
  */
 function readScheduledTaskSchtasksListInfo(taskName: string): string | null {
-  const result = spawnSync('schtasks', ['/Query', '/TN', taskName, '/FO', 'LIST', '/V'], {
+  const result = spawnBackgroundSync('schtasks', ['/Query', '/TN', taskName, '/FO', 'LIST', '/V'], {
     encoding: 'utf8',
-    windowsHide: true,
   });
   if (result.error || result.status !== 0 || !result.stdout) {
     return null;

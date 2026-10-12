@@ -10,6 +10,8 @@ import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers';
 import { createSerializedWorkQueueDiagnostics, type SerializedWorkDiagnosticContext } from '@/utils/serializedWorkQueueDiagnostics';
 import {
     isConditionalPendingSteerClaim,
+    normalizeSessionMetadataForRead,
+    projectSessionMetadataForWire,
     readPendingLocalId,
     redactBugReportSensitiveText,
 } from '@happier-dev/protocol';
@@ -186,7 +188,9 @@ import { buildUsageReportFromAcpTokenCount } from './acpTokenCountUsageReport';
 import {
     fetchLatestUserPermissionIntentFromEncryptedTranscript,
     fetchRecentTranscriptTextItemsForAcpImportFromServer,
+    type CommittedTranscriptIdentitySnapshot,
 } from './transcriptQueries';
+import { extractSemanticTranscriptItemFromDecryptedPayload } from '@/session/services/transcript/extractSemanticTranscriptItem';
 import {
     discardPendingQueueV2Messages,
     enqueuePendingQueueV2MessageViaHttp,
@@ -251,6 +255,7 @@ import {
 import { createLoopbackReadinessProbe } from '@/api/connection/createLoopbackReadinessProbe';
 import { createSessionSocketTransport } from './connection/createSessionSocketTransport';
 import { ensureSessionConnectionSupervisionActive } from './connection/ensureSessionConnectionSupervisionActive';
+import { SESSION_CONNECTION_STATE_EVENT } from './connection/sessionConnectionStateEvent';
 import { connectionState } from '@/api/offline/serverConnectionErrors';
 import {
     createAuthenticationHttpStatusError,
@@ -513,7 +518,6 @@ function logSessionConnectionState(state: ManagedConnectionState): void {
     });
 }
 
-const SESSION_CONNECTION_STATE_EVENT = 'session-connection-state';
 const SESSION_PRESENCE_RECONNECT_REASSERT_DELAY_MS = 2_000;
 // How long a `thinking=true` keepalive may persist against an already-terminal turn status
 // before the publisher self-heals it to idle. Comfortably longer than a new turn's
@@ -940,7 +944,7 @@ export class ApiSessionClient extends EventEmitter {
 	        super()
 	        this.token = token;
 	        this.sessionId = session.id;
-	        this.metadata = session.metadata;
+	        this.metadata = normalizeSessionMetadataForRead(session.metadata);
 	        this.metadataVersion = session.metadataVersion;
             this.sessionSocketMachineId = resolveSessionSocketMachineIdForBootstrap(session.metadata);
             this.agentState = session.agentState;
@@ -1567,6 +1571,7 @@ export class ApiSessionClient extends EventEmitter {
         const hadMaterializedLocalId = this.hasMaterializedLocalId(localId);
         if (didClear || hadMaterializedLocalId) {
             this.deleteMaterializedLocalId(localId);
+            this.publishPendingEligibilityWake();
         }
         return didClear || hadMaterializedLocalId;
     }
@@ -1929,12 +1934,10 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private async reconcileCanonicalPendingDeliveriesBeforeMaterialization(): Promise<boolean> {
-        const blockingLocalIds = [...this.canonicalPendingDeliveryByLocalId.keys()]
-            .filter((localId) => (
-                this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted'
-                || !this.serverBlockedCanonicalPendingDeliveryLocalIds.has(localId)
-            ));
-        if (blockingLocalIds.length === 0) return true;
+        // Blocked delivery can still own an ambiguous terminal attempt. Reconcile its exact
+        // server identity too, so manual handling retires that custody without inventing acceptance.
+        const claimedLocalIds = [...this.canonicalPendingDeliveryByLocalId.keys()];
+        if (claimedLocalIds.length === 0) return true;
 
         try {
             const statuses = await listPendingQueueV2DeliveryStatusesFromServer({
@@ -1942,7 +1945,7 @@ export class ApiSessionClient extends EventEmitter {
                 sessionId: this.sessionId,
             });
             const statusByLocalId = new Map(statuses.map((entry) => [entry.localId, entry.status]));
-            for (const localId of blockingLocalIds) {
+            for (const localId of claimedLocalIds) {
                 const status = statusByLocalId.get(localId);
                 // While exact provider acceptance is actively settling, it is stronger evidence
                 // than an absent/archived Pending projection. Once that operation finishes, the
@@ -1964,7 +1967,7 @@ export class ApiSessionClient extends EventEmitter {
         } catch (error) {
             logger.debug('[pendingQueue] exact local provider custody reconciliation failed closed', {
                 sessionId: this.sessionId,
-                localIds: blockingLocalIds,
+                localIds: claimedLocalIds,
                 error: serializeAxiosErrorForLog(error),
             });
         }
@@ -3291,20 +3294,16 @@ export class ApiSessionClient extends EventEmitter {
             this.markAgentQueueEchoSuppressedLocalId(localId);
             this.markAgentQueueDeliveredLocalId(localId);
         }
+        const deliveryInfo: SessionUserMessageDeliveryInfo = {
+            seq: typeof message?.seq === 'number' && Number.isFinite(message.seq) ? message.seq : null,
+            ...(opts.providerAcceptancePending ? { providerAcceptancePending: true } : {}),
+            ...(message?.providerAction ? { pendingProviderAction: message.providerAction } : {}),
+            ...(message?.requestedAction ? { pendingRequestedAction: message.requestedAction } : {}),
+        };
         if (this.pendingMessageCallback) {
-            await this.pendingMessageCallback(userMessage, {
-                seq: typeof message?.seq === 'number' && Number.isFinite(message.seq) ? message.seq : null,
-                ...(opts.providerAcceptancePending ? { providerAcceptancePending: true } : {}),
-                ...(message?.providerAction ? { pendingProviderAction: message.providerAction } : {}),
-            });
+            await this.pendingMessageCallback(userMessage, deliveryInfo);
         } else {
-            if (localId) {
-                this.bufferedPendingMessageDeliveryInfoByLocalId.set(localId, {
-                    seq: typeof message?.seq === 'number' && Number.isFinite(message.seq) ? message.seq : null,
-                    ...(opts.providerAcceptancePending ? { providerAcceptancePending: true } : {}),
-                    ...(message?.providerAction ? { pendingProviderAction: message.providerAction } : {}),
-                });
-            }
+            if (localId) this.bufferedPendingMessageDeliveryInfoByLocalId.set(localId, deliveryInfo);
             this.pendingMessages.push(userMessage);
         }
         return true;
@@ -4893,6 +4892,54 @@ export class ApiSessionClient extends EventEmitter {
         });
     }
 
+    async fetchCommittedTranscriptIdentitySnapshot(opts?: { sidechainId: string }): Promise<CommittedTranscriptIdentitySnapshot> {
+        const request = async (): Promise<CommittedTranscriptIdentitySnapshot> => {
+            const rows: Array<CommittedTranscriptIdentitySnapshot['rows'][number]> = [];
+            let complete = true;
+            let beforeSeq: number | undefined;
+            for (;;) {
+                const page = await fetchEncryptedTranscriptMessagesPage({
+                    token: this.token, sessionId: this.sessionId, limit: 500,
+                    ...(beforeSeq !== undefined ? { beforeSeq } : {}),
+                    scope: opts ? 'all' : 'main', roles: ['user', 'agent'],
+                });
+                for (const row of page.messages) {
+                    const stored = SessionMessageContentSchema.safeParse(row.content);
+                    if (!stored.success) { complete = false; continue; }
+                    let decoded: unknown;
+                    try { decoded = this.decodeStoredSessionMessageContent(stored.data); }
+                    catch { complete = false; continue; }
+                    if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) { complete = false; continue; }
+                    const item = extractSemanticTranscriptItemFromDecryptedPayload({
+                        decrypted: decoded, row, index: rows.length,
+                        options: { mode: 'transcript', transcriptRoles: ['user', 'assistant'] },
+                    }).item;
+                    if (!item || (item.role !== 'user' && item.role !== 'assistant')) continue;
+                    const payload = decoded as Record<string, unknown>;
+                    const meta = payload.meta && typeof payload.meta === 'object' && !Array.isArray(payload.meta)
+                        ? payload.meta as Record<string, unknown> : null;
+                    // Released imported user rows can carry sidechain identity only in metadata.
+                    // Read both forms rather than assuming the relay materialized the column.
+                    if (opts ? (row.sidechainId ?? meta?.sidechainId) !== opts.sidechainId
+                        : row.sidechainId || meta?.sidechainId) continue;
+                    rows.push({ localId: readNonBlankOpaqueIdentifier(row.localId), role: item.role === 'user' ? 'user' : 'agent',
+                        ...(item.provider ? { provider: item.provider } : {}), meta });
+                }
+                if (!page.hasMore) break;
+                if (page.messages.length === 0 || page.nextBeforeSeq === null
+                    || (beforeSeq !== undefined && page.nextBeforeSeq >= beforeSeq)) {
+                    complete = false;
+                    break;
+                }
+                beforeSeq = page.nextBeforeSeq;
+            }
+            return { rows, complete };
+        };
+        return this.sessionConnectionSupervisor
+            ? runSupervisedRequest({ supervisor: this.sessionConnectionSupervisor, requireAuth: true, requireOnline: false, request })
+            : request();
+    }
+
     async fetchCommittedClaudeJsonlMessageBaseline(opts?: { take?: number }): Promise<CommittedClaudeJsonlMessageBaseline> {
         const take = typeof opts?.take === 'number' && Number.isFinite(opts.take) && opts.take > 0
             ? Math.trunc(opts.take)
@@ -5061,6 +5108,7 @@ export class ApiSessionClient extends EventEmitter {
         const effectiveThinking = this.resolveKeepAliveThinkingWithTerminalGuard(thinking, Date.now());
         this.latestSessionPresence = { thinking: effectiveThinking, mode };
         const payload = this.createSessionAlivePayload(this.latestSessionPresence);
+        this.emit('local-presence', { thinking: effectiveThinking, mode });
 
         if (effectiveThinking) {
             void this.sessionTurnLifecycle.touchActiveTurn({ observedAt: payload.time }).catch((error) => {
@@ -5852,6 +5900,7 @@ export class ApiSessionClient extends EventEmitter {
             // ignore
         }
         await this.sessionConnectionSupervisor?.stop();
+        this.emit('local-closed');
     }
 
     beginRuntimeTermination(): void {
@@ -6077,8 +6126,8 @@ export class ApiSessionClient extends EventEmitter {
                 const nextMetadata = addDiscardedCommittedMessageLocalIds(current, uniqueNew);
                 const metadataPayload =
                     this.sessionEncryptionMode === 'plain'
-                        ? JSON.stringify(nextMetadata)
-                        : encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, nextMetadata));
+                        ? JSON.stringify(projectSessionMetadataForWire(nextMetadata))
+                        : encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, projectSessionMetadataForWire(nextMetadata)));
                 const answer = await emitSocketWithAck<any>({
                     socket: this.socket as any,
                     event: 'update-metadata',
@@ -6090,10 +6139,10 @@ export class ApiSessionClient extends EventEmitter {
                 });
 
                 if (answer.result === 'success') {
-                    this.metadata =
+                    this.metadata = normalizeSessionMetadataForRead<Metadata>(
                         this.sessionEncryptionMode === 'plain'
                             ? JSON.parse(String(answer.metadata ?? 'null'))
-                            : decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(answer.metadata));
+                            : decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(answer.metadata)));
                     this.metadataVersion = answer.version;
                     addedCount = uniqueNew.length;
                     return;
@@ -6102,10 +6151,10 @@ export class ApiSessionClient extends EventEmitter {
                 if (answer.result === 'version-mismatch') {
                     if (answer.version > this.metadataVersion) {
                         this.metadataVersion = answer.version;
-                        this.metadata =
+                        this.metadata = normalizeSessionMetadataForRead<Metadata>(
                             this.sessionEncryptionMode === 'plain'
                                 ? JSON.parse(String(answer.metadata ?? 'null'))
-                                : decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(answer.metadata));
+                                : decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(answer.metadata)));
                     }
                     throw new Error('Metadata version mismatch');
                 }
@@ -6297,9 +6346,8 @@ export class ApiSessionClient extends EventEmitter {
             didMaterialize: materializeResult.didMaterialize,
             authoritativeState: materializeResult.pendingQueueState ?? null,
         });
-        this.pendingQueueState = pendingStateUpdate.state;
-        if (pendingStateUpdate.changed) {
-            this.pendingWakeSeq += 1;
+        if (pendingStateUpdate.state.known) {
+            this.applyPendingQueueState(pendingStateUpdate.state);
         }
         if (this.closed || this.runtimeTerminationStarted) {
             return { didMaterialize: false, result: { type: 'retryable_transport' } };

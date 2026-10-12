@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
@@ -14,12 +14,18 @@ import {
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import { createMinisignKeyPair, signMinisignMessage } from '../../packages/release-runtime/tests/minisignFixture.mjs';
 
 const repoRoot = resolve(new URL('../..', import.meta.url).pathname);
 const scriptPath = resolve(repoRoot, 'scripts/pipeline/github/promote-rolling-release.mjs');
 const nodeArchiveScript = resolve(repoRoot, 'scripts/pipeline/release/node-archive.mjs');
 const targetSha = '0123456789abcdef0123456789abcdef01234567';
 const oldSha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const signingKey = createMinisignKeyPair();
+const signingDir = mkdtempSync(join(tmpdir(), 'promote-rolling-signing-'));
+const publicKeyPath = join(signingDir, 'happier-release.pub');
+writeFileSync(publicKeyPath, signingKey.pubkeyFile);
+after(() => rmSync(signingDir, { recursive: true, force: true }));
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -42,14 +48,14 @@ function fixture({ missingRolling = false } = {}) {
   mkdirSync(staging);
   const archivePlatform = process.platform === 'darwin' ? 'darwin' : 'linux';
   const archiveArch = process.arch === 'arm64' ? 'arm64' : 'x64';
-  const archiveName = `happier-v1.2.3-preview.4-${archivePlatform}-${archiveArch}.tar.gz`;
-  const aliasName = `happier-${archivePlatform}-${archiveArch}.tar.gz`;
+  const archiveName = `happier-server-v1.2.3-preview.4-${archivePlatform}-${archiveArch}.tar.gz`;
+  const aliasName = `happier-server-${archivePlatform}-${archiveArch}.tar.gz`;
   const archiveStem = archiveName.slice(0, -'.tar.gz'.length);
   const archiveStage = join(root, 'archive-stage');
   const archiveRoot = join(archiveStage, archiveStem);
   mkdirSync(archiveRoot, { recursive: true });
   writeExecutable(
-    join(archiveRoot, 'happier'),
+    join(archiveRoot, 'happier-server'),
     '#!/bin/sh\nprintf \'%s\\n\' \'1.2.3-preview.4\'\n',
   );
   execFileSync(
@@ -63,9 +69,14 @@ function fixture({ missingRolling = false } = {}) {
     { cwd: repoRoot, stdio: 'pipe' },
   );
   const archive = readFileSync(join(source, archiveName));
-  const checksumsName = 'checksums-happier-v1.2.3-preview.4.txt';
-  writeFileSync(join(source, checksumsName), `${sha256(archive)}  ${archiveName}\n`);
-  writeFileSync(join(source, `${checksumsName}.minisig`), 'signature\n');
+  const checksumsName = 'checksums-happier-server-v1.2.3-preview.4.txt';
+  const checksums = `${sha256(archive)}  ${archiveName}\n`;
+  writeFileSync(join(source, checksumsName), checksums);
+  writeFileSync(join(source, `${checksumsName}.minisig`), signMinisignMessage({
+    message: Buffer.from(checksums, 'utf8'),
+    keyId: signingKey.keyId,
+    privateKey: signingKey.privateKey,
+  }));
   writeFileSync(join(rolling, 'old-asset'), 'old\n');
 
   const log = join(root, 'gh.log');
@@ -94,14 +105,10 @@ function fixture({ missingRolling = false } = {}) {
   } else {
     writeFileSync(channelRef, oldSha);
     writeFileSync(publishedState, '1');
-    writeFileSync(release1Tag, 'cli-preview');
-    writeFileSync(release1Name, 'Previous CLI Preview');
+    writeFileSync(release1Tag, 'server-preview');
+    writeFileSync(release1Name, 'Previous Server Preview');
   }
 
-  writeExecutable(
-    join(bin, 'minisign'),
-    '#!/bin/sh\nexit 0\n',
-  );
   writeExecutable(
     join(bin, 'gh'),
     `#!/bin/sh
@@ -114,7 +121,7 @@ not_found() {
 }
 
 if [ "$1" = "release" ] && [ "$2" = "view" ]; then
-  if [ "$3" = "cli-preview" ] && [ ! -f ${JSON.stringify(publishedState)} ]; then exit 1; fi
+  if [ "$3" = "server-preview" ] && [ ! -f ${JSON.stringify(publishedState)} ]; then exit 1; fi
   printf '%s\\n' "$3"
   exit 0
 fi
@@ -127,7 +134,7 @@ if [ "$1" = "release" ] && [ "$2" = "download" ]; then
     shift
   done
   mkdir -p "$destination"
-  if [ "$tag" = "cli-v1.2.3-preview.4" ]; then
+  if [ "$tag" = "server-v1.2.3-preview.4" ]; then
     cp ${JSON.stringify(source)}/* "$destination"/
   elif [ -f ${JSON.stringify(release77Tag)} ] && [ "$(cat ${JSON.stringify(release77Tag)})" = "$tag" ] && [ ! -f ${JSON.stringify(draftState)} ]; then
     cp ${JSON.stringify(staging)}/* "$destination"/
@@ -159,7 +166,7 @@ fi
 
 if [ "$1" = "api" ]; then
   if [ "\${HAPPIER_TEST_FAIL_ROLLING_RELEASE_READ:-0}" = "1" ] \
-    && echo "$*" | grep -q "releases/tags/cli-preview" \
+    && echo "$*" | grep -q "releases/tags/server-preview" \
     && [ ! -f ${JSON.stringify(rollingReadFailureMarker)} ]; then
     : > ${JSON.stringify(rollingReadFailureMarker)}
     echo "gh: injected authorization failure (HTTP 401)" >&2
@@ -202,7 +209,7 @@ if [ "$1" = "api" ]; then
       ;;
   esac
   case "$*" in
-    *git/ref/tags/cli-v1.2.3-preview.4*) printf '%s\\n' ${JSON.stringify(targetSha)} ;;
+    *git/ref/tags/server-v1.2.3-preview.4*) printf '%s\\n' ${JSON.stringify(targetSha)} ;;
     *git/ref/tags/happier-rolling-staging-*)
       if [ -f ${JSON.stringify(stagingRef)} ]; then
         cat ${JSON.stringify(stagingRef)}
@@ -221,22 +228,22 @@ if [ "$1" = "api" ]; then
       fi
       ;;
     *git/ref/tags/happier-rolling-backup-*) if [ -f ${JSON.stringify(backupRef)} ]; then cat ${JSON.stringify(backupRef)}; else not_found; fi ;;
-    *git/ref/tags/cli-preview*) if [ -f ${JSON.stringify(channelRef)} ]; then cat ${JSON.stringify(channelRef)}; else not_found; fi ;;
-    *releases/tags/happier-rolling-backup-cli-preview*)
-      if [ -f ${JSON.stringify(release1Tag)} ] && [ "$(cat ${JSON.stringify(release1Tag)})" = "happier-rolling-backup-cli-preview" ]; then
-        printf '{"id":1,"tag_name":"happier-rolling-backup-cli-preview","name":"%s","body":"previous notes","prerelease":true,"draft":false}\\n' "$(cat ${JSON.stringify(release1Name)})"
+    *git/ref/tags/server-preview*) if [ -f ${JSON.stringify(channelRef)} ]; then cat ${JSON.stringify(channelRef)}; else not_found; fi ;;
+    *releases/tags/happier-rolling-backup-server-preview*)
+      if [ -f ${JSON.stringify(release1Tag)} ] && [ "$(cat ${JSON.stringify(release1Tag)})" = "happier-rolling-backup-server-preview" ]; then
+        printf '{"id":1,"tag_name":"happier-rolling-backup-server-preview","name":"%s","body":"previous notes","prerelease":true,"draft":false}\\n' "$(cat ${JSON.stringify(release1Name)})"
       else
         not_found
       fi
       ;;
-    *releases/tags/cli-v1.2.3-preview.4*)
-      printf '{"id":55,"tag_name":"cli-v1.2.3-preview.4","name":"Immutable CLI","body":"","prerelease":true,"draft":false}\n'
+    *releases/tags/server-v1.2.3-preview.4*)
+      printf '{"id":55,"tag_name":"server-v1.2.3-preview.4","name":"Immutable Server","body":"","prerelease":true,"draft":false}\n'
       ;;
-    *releases/tags/cli-preview*)
-      if [ -f ${JSON.stringify(release1Tag)} ] && [ "$(cat ${JSON.stringify(release1Tag)})" = "cli-preview" ]; then
-        printf '{"id":1,"tag_name":"cli-preview","name":"%s","body":"previous notes","prerelease":true,"draft":false}\\n' "$(cat ${JSON.stringify(release1Name)})"
-      elif [ -f ${JSON.stringify(release77Tag)} ] && [ "$(cat ${JSON.stringify(release77Tag)})" = "cli-preview" ] && [ ! -f ${JSON.stringify(draftState)} ]; then
-        printf '{"id":77,"tag_name":"cli-preview","name":"Happier CLI Preview","body":"Current version: 1.2.3-preview.4","prerelease":true,"draft":false}\\n'
+    *releases/tags/server-preview*)
+      if [ -f ${JSON.stringify(release1Tag)} ] && [ "$(cat ${JSON.stringify(release1Tag)})" = "server-preview" ]; then
+        printf '{"id":1,"tag_name":"server-preview","name":"%s","body":"previous notes","prerelease":true,"draft":false}\\n' "$(cat ${JSON.stringify(release1Name)})"
+      elif [ -f ${JSON.stringify(release77Tag)} ] && [ "$(cat ${JSON.stringify(release77Tag)})" = "server-preview" ] && [ ! -f ${JSON.stringify(draftState)} ]; then
+        printf '{"id":77,"tag_name":"server-preview","name":"Happier Server Preview","body":"Current version: 1.2.3-preview.4","prerelease":true,"draft":false}\\n'
       else
         not_found
       fi
@@ -244,11 +251,11 @@ if [ "$1" = "api" ]; then
     *"releases?per_page=100"*)
       if echo "$*" | grep -q 'startswith'; then
         if [ -f ${JSON.stringify(staleOtherDraftState)} ]; then
-          printf '88\\thappier-rolling-staging-cli-preview-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\n'
+          printf '88\\thappier-rolling-staging-server-preview-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\n'
         fi
       elif [ "\${HAPPIER_TEST_DELAY_DRAFT_VISIBILITY:-0}" != "1" ] \
         && [ -f ${JSON.stringify(draftState)} ] \
-        && echo "$*" | grep -q "cli-preview"; then
+        && echo "$*" | grep -q "server-preview"; then
         printf '%s\\n' "77"
       fi
       ;;
@@ -334,14 +341,14 @@ if [ "$1" = "api" ]; then
           first=0
         done
       else
-        printf '{"id":55,"tag_name":"cli-v1.2.3-preview.4","name":"Immutable CLI","body":"","prerelease":true,"draft":false}\n'
+        printf '{"id":55,"tag_name":"server-v1.2.3-preview.4","name":"Immutable Server","body":"","prerelease":true,"draft":false}\n'
       fi
       ;;
     *releases/88*)
       if echo "$*" | grep -q -- "-X DELETE"; then
         rm -f ${JSON.stringify(staleOtherDraftState)}
       elif [ -f ${JSON.stringify(staleOtherDraftState)} ]; then
-        printf '{"id":88,"tag_name":"happier-rolling-staging-cli-preview-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","name":"old staging","body":"","prerelease":true,"draft":true}\n'
+        printf '{"id":88,"tag_name":"happier-rolling-staging-server-preview-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","name":"old staging","body":"","prerelease":true,"draft":true}\n'
       else
         not_found
       fi
@@ -378,7 +385,7 @@ if [ "$1" = "api" ]; then
         shift
       done
       case "$ref" in
-        cli-preview) printf '%s' "$sha" > ${JSON.stringify(channelRef)} ;;
+        server-preview) printf '%s' "$sha" > ${JSON.stringify(channelRef)} ;;
         happier-rolling-staging-*) printf '%s' "$sha" > ${JSON.stringify(stagingRef)} ;;
         happier-rolling-backup-*) printf '%s' "$sha" > ${JSON.stringify(backupRef)} ;;
       esac
@@ -387,7 +394,7 @@ if [ "$1" = "api" ]; then
       tag="\${4##*/}"; sha=""
       while [ "$#" -gt 0 ]; do case "$1" in sha=*) sha="\${1#sha=}" ;; esac; shift; done
       case "$tag" in
-        cli-preview) printf '%s' "$sha" > ${JSON.stringify(channelRef)} ;;
+        server-preview) printf '%s' "$sha" > ${JSON.stringify(channelRef)} ;;
         happier-rolling-staging-*) printf '%s' "$sha" > ${JSON.stringify(stagingRef)} ;;
         happier-rolling-backup-*) printf '%s' "$sha" > ${JSON.stringify(backupRef)} ;;
       esac
@@ -395,7 +402,7 @@ if [ "$1" = "api" ]; then
     *"-X DELETE repos/test/test/git/refs/tags/"*)
       tag="\${4##*/}"
       case "$tag" in
-        cli-preview) rm -f ${JSON.stringify(channelRef)} ;;
+        server-preview) rm -f ${JSON.stringify(channelRef)} ;;
         happier-rolling-staging-*)
           if [ "\${HAPPIER_TEST_STALE_DELETE_CONFIRM_READS:-0}" -gt 0 ] && [ -f ${JSON.stringify(stagingRef)} ]; then
             cp ${JSON.stringify(stagingRef)} ${JSON.stringify(staleStagingRef)}
@@ -439,14 +446,14 @@ exit 2
 function args() {
   return [
     scriptPath,
-    '--source-tag', 'cli-v1.2.3-preview.4',
-    '--rolling-tag', 'cli-preview',
-    '--title', 'Happier CLI Preview',
+    '--source-tag', 'server-v1.2.3-preview.4',
+    '--rolling-tag', 'server-preview',
+    '--title', 'Happier Server Preview',
     '--target-sha', targetSha,
     '--notes', 'Current version: 1.2.3-preview.4',
     '--prerelease', 'true',
     '--repo', 'test/test',
-    '--public-key', 'scripts/release/installers/happier-release.pub',
+    '--public-key', publicKeyPath,
   ];
 }
 
@@ -454,8 +461,8 @@ test('rolling promotion dry-run shows private staging and whole-release backup c
   const result = spawnSync(process.execPath, [...args(), '--dry-run'], { cwd: repoRoot, encoding: 'utf8' });
   assert.equal(result.status, 0);
   const output = `${String(result.stdout ?? '')}\n${String(result.stderr ?? '')}`;
-  assert.match(output, /happier-rolling-staging-cli-preview-/);
-  assert.match(output, /happier-rolling-backup-cli-preview/);
+  assert.match(output, /happier-rolling-staging-server-preview-/);
+  assert.match(output, /happier-rolling-backup-server-preview/);
   assert.doesNotMatch(output, /releases\/assets\//);
 });
 
@@ -521,11 +528,16 @@ test('rolling promotion audits release assets without buffering their bytes in t
   try {
     const largeMetadata = Buffer.alloc(2 * 1024 * 1024, 'x');
     writeFileSync(join(testFixture.root, 'source', 'large-release-metadata.json'), largeMetadata);
-    const checksumsPath = join(testFixture.root, 'source', 'checksums-happier-v1.2.3-preview.4.txt');
+    const checksumsPath = join(testFixture.root, 'source', 'checksums-happier-server-v1.2.3-preview.4.txt');
     writeFileSync(
       checksumsPath,
       `${readFileSync(checksumsPath, 'utf8')}${sha256(largeMetadata)}  large-release-metadata.json\n`,
     );
+    writeFileSync(`${checksumsPath}.minisig`, signMinisignMessage({
+      message: readFileSync(checksumsPath),
+      keyId: signingKey.keyId,
+      privateKey: signingKey.privateKey,
+    }));
 
     const result = spawnSync(process.execPath, args(), {
       cwd: repoRoot,
@@ -563,7 +575,7 @@ test('rolling promotion rejects a channel alias whose downloaded bytes differ fr
 
     assert.notEqual(result.status, 0);
     assert.match(String(result.stderr), new RegExp(`differs from immutable source bytes: ${testFixture.aliasName}`));
-    assert.equal(readFileSync(testFixture.release1Tag, 'utf8'), 'cli-preview');
+    assert.equal(readFileSync(testFixture.release1Tag, 'utf8'), 'server-preview');
     assert.equal(readFileSync(testFixture.channelRef, 'utf8'), oldSha);
     assert.deepEqual(readdirSync(testFixture.rolling), ['old-asset']);
   } finally {
@@ -623,10 +635,10 @@ for (const [error, attempts] of [
       assert.equal(result.status, 1);
       assert.ok(result.stderr.includes(error), result.stderr);
       assert.equal(Number(readFileSync(testFixture.downloadFailureCounter, 'utf8')), attempts);
-      assert.equal(readFileSync(testFixture.release1Tag, 'utf8'), 'cli-preview');
+      assert.equal(readFileSync(testFixture.release1Tag, 'utf8'), 'server-preview');
       assert.equal(readFileSync(testFixture.channelRef, 'utf8'), oldSha);
       assert.deepEqual(readdirSync(testFixture.rolling), ['old-asset']);
-      assert.doesNotMatch(readFileSync(testFixture.log, 'utf8'), /-X PATCH repos\/test\/test\/git\/refs\/tags\/cli-preview/);
+      assert.doesNotMatch(readFileSync(testFixture.log, 'utf8'), /-X PATCH repos\/test\/test\/git\/refs\/tags\/server-preview/);
     } finally {
       rmSync(testFixture.root, { recursive: true, force: true });
     }
@@ -648,8 +660,8 @@ test('existing rolling replacement stages privately, restores after publish fail
     });
     assert.notEqual(failed.status, 0);
     const failedLog = readFileSync(testFixture.log, 'utf8');
-    assert.doesNotMatch(failedLog, /git\/refs\/tags\/cli-preview/);
-    assert.doesNotMatch(failedLog, /release edit cli-preview/);
+    assert.doesNotMatch(failedLog, /git\/refs\/tags\/server-preview/);
+    assert.doesNotMatch(failedLog, /release edit server-preview/);
     assert.deepEqual(
       readdirSync(testFixture.rolling),
       ['old-asset'],
@@ -668,12 +680,12 @@ test('existing rolling replacement stages privately, restores after publish fail
       encoding: 'utf8',
     });
     assert.notEqual(failedSwitch.status, 0);
-    assert.equal(readFileSync(testFixture.release1Tag, 'utf8'), 'cli-preview');
+    assert.equal(readFileSync(testFixture.release1Tag, 'utf8'), 'server-preview');
     assert.equal(readFileSync(testFixture.channelRef, 'utf8'), oldSha);
     assert.deepEqual(readdirSync(testFixture.rolling), ['old-asset']);
     const failedSwitchLog = readFileSync(testFixture.log, 'utf8');
-    assert.match(failedSwitchLog, /tag_name=happier-rolling-backup-cli-preview/);
-    assert.match(failedSwitchLog, /releases\/1 .*tag_name=cli-preview/);
+    assert.match(failedSwitchLog, /tag_name=happier-rolling-backup-server-preview/);
+    assert.match(failedSwitchLog, /releases\/1 .*tag_name=server-preview/);
     assert.doesNotMatch(failedSwitchLog, /DELETE repos\/test\/test\/releases\/assets\/1-/);
 
     writeFileSync(testFixture.uploadCounter, '0');
@@ -686,7 +698,7 @@ test('existing rolling replacement stages privately, restores after publish fail
 
     const successLog = readFileSync(testFixture.log, 'utf8');
     const stagedAudit = successLog.indexOf('repos/test/test/releases/assets/77-');
-    const moveTag = successLog.lastIndexOf('gh api -X PATCH repos/test/test/git/refs/tags/cli-preview');
+    const moveTag = successLog.lastIndexOf('gh api -X PATCH repos/test/test/git/refs/tags/server-preview');
     const publishReplacement = successLog.lastIndexOf('PATCH repos/test/test/releases/77');
     const visibleAudit = successLog.lastIndexOf('repos/test/test/releases/assets/77-');
     const deleteBackup = successLog.lastIndexOf('DELETE repos/test/test/releases/1');
@@ -699,14 +711,14 @@ test('existing rolling replacement stages privately, restores after publish fail
     assert.deepEqual(
       readdirSync(testFixture.staging).sort(),
       [
-        'checksums-happier-v1.2.3-preview.4.txt',
-        'checksums-happier-v1.2.3-preview.4.txt.minisig',
-        `happier-${process.platform === 'darwin' ? 'darwin' : 'linux'}-${process.arch === 'arm64' ? 'arm64' : 'x64'}.tar.gz`,
+        'checksums-happier-server-v1.2.3-preview.4.txt',
+        'checksums-happier-server-v1.2.3-preview.4.txt.minisig',
+        `happier-server-${process.platform === 'darwin' ? 'darwin' : 'linux'}-${process.arch === 'arm64' ? 'arm64' : 'x64'}.tar.gz`,
         testFixture.archiveName,
       ],
     );
     for (const name of readdirSync(testFixture.staging)) {
-      const sourceName = name === `happier-${process.platform === 'darwin' ? 'darwin' : 'linux'}-${process.arch === 'arm64' ? 'arm64' : 'x64'}.tar.gz`
+      const sourceName = name === `happier-server-${process.platform === 'darwin' ? 'darwin' : 'linux'}-${process.arch === 'arm64' ? 'arm64' : 'x64'}.tar.gz`
         ? testFixture.archiveName
         : name;
       assert.deepEqual(
@@ -870,7 +882,7 @@ test('a non-404 predecessor read failure aborts before any release or tag mutati
     assert.notEqual(result.status, 0);
     assert.match(String(result.stderr), /HTTP 401/);
     assert.doesNotMatch(readFileSync(testFixture.log, 'utf8'), /gh api -X (?:POST|PATCH|DELETE)/);
-    assert.equal(readFileSync(testFixture.release1Tag, 'utf8'), 'cli-preview');
+    assert.equal(readFileSync(testFixture.release1Tag, 'utf8'), 'server-preview');
     assert.equal(readFileSync(testFixture.channelRef, 'utf8'), oldSha);
     assert.deepEqual(readdirSync(testFixture.rolling), ['old-asset']);
   } finally {
@@ -932,10 +944,10 @@ test('rolling promotion tolerates delayed visibility after a successful temporar
 test('retry restores a predecessor stranded under the deterministic backup tag before staging again', () => {
   const testFixture = fixture();
   try {
-    writeFileSync(testFixture.release1Tag, 'happier-rolling-backup-cli-preview');
+    writeFileSync(testFixture.release1Tag, 'happier-rolling-backup-server-preview');
     writeFileSync(
       join(testFixture.root, 'release-1-name'),
-      '[backup:happier-rolling-backup-cli-preview] Previous CLI Preview',
+      '[backup:happier-rolling-backup-server-preview] Previous Server Preview',
     );
     writeFileSync(testFixture.backupRef, oldSha);
     writeFileSync(testFixture.channelRef, targetSha);
@@ -949,7 +961,7 @@ test('retry restores a predecessor stranded under the deterministic backup tag b
       encoding: 'utf8',
     });
     assert.notEqual(result.status, 0);
-    assert.equal(readFileSync(testFixture.release1Tag, 'utf8'), 'cli-preview');
+    assert.equal(readFileSync(testFixture.release1Tag, 'utf8'), 'server-preview');
     assert.equal(readFileSync(testFixture.channelRef, 'utf8'), oldSha);
     assert.equal(existsSync(testFixture.backupRef), false);
     assert.deepEqual(readdirSync(testFixture.rolling), ['old-asset']);
@@ -972,7 +984,7 @@ test('an initially missing rolling release retries one private draft before publ
     });
     assert.notEqual(failed.status, 0);
     const failedLog = readFileSync(testFixture.log, 'utf8');
-    assert.match(failedLog, /POST repos\/test\/test\/releases .*tag_name=happier-rolling-staging-cli-preview-/);
+    assert.match(failedLog, /POST repos\/test\/test\/releases .*tag_name=happier-rolling-staging-server-preview-/);
     assert.doesNotMatch(failedLog, /PATCH repos\/test\/test\/releases\/77/);
     assert.match(failedLog, /happier-rolling-staging/);
     assert.equal(existsSync(testFixture.channelRef), false);

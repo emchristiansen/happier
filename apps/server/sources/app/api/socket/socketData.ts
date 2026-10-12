@@ -6,6 +6,7 @@ export interface HappierSocketData {
     userId?: string;
     clientType?: "session-scoped" | "user-scoped" | "machine-scoped";
     clientPurpose?: string;
+    uiFocus?: Readonly<{ computer: boolean; focused: boolean }>;
     sessionId?: string;
     machineId?: string;
     sessionScopedBinding?: SessionScopedSocketBinding;

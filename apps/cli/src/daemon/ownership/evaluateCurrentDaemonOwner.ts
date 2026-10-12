@@ -16,6 +16,7 @@ import {
 import { projectPath } from '@/projectPath';
 
 import type { DaemonLocallyPersistedState } from '@/persistence';
+import { daemonProcessMatchesCurrentScope } from './daemonProcessScopeIdentity';
 
 export type CurrentDaemonOwner = Readonly<{
   status: Extract<DaemonRunningInspection['status'], 'starting' | 'running'>;
@@ -44,65 +45,6 @@ function resolveCurrentCliVersion(): string {
 
 function normalizePathFragment(value: string): string {
   return value.replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase();
-}
-
-function normalizeScopeValue(value: string | null | undefined): string {
-  return String(value ?? '').trim();
-}
-
-function normalizeServerUrl(value: string | null | undefined): string {
-  return normalizeScopeValue(value).replace(/\/+$/, '').toLowerCase();
-}
-
-function processEnvValueMatchesCurrent(
-  processValue: string | null | undefined,
-  currentValue: string | null | undefined,
-  normalize: (value: string) => string = normalizeScopeValue,
-): boolean {
-  const processScopeValue = normalizeScopeValue(processValue);
-  if (!processScopeValue) return true;
-  const currentScopeValue = normalizeScopeValue(currentValue);
-  if (!currentScopeValue) return true;
-  return normalize(processScopeValue) === normalize(currentScopeValue);
-}
-
-function daemonProcessMatchesCurrentScope(processInfo: HappyProcessInfo): boolean {
-  const env = processInfo.daemonOwnershipEnvironmentVariables;
-  if (!env) return true;
-
-  if (!processEnvValueMatchesCurrent(env.HAPPIER_HOME_DIR, configuration.happyHomeDir, normalizePathFragment)) {
-    return false;
-  }
-  const processLifecycleScopeId = normalizeScopeValue(env.HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID);
-  const currentLifecycleScopeId = normalizeScopeValue(process.env.HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID);
-  if (processLifecycleScopeId) {
-    if (!currentLifecycleScopeId || processLifecycleScopeId !== currentLifecycleScopeId) return false;
-    // Explicit lifecycle scope is the canonical owner identity. Endpoint profile and URL are
-    // independently mutable connection facts and cannot disqualify that exact owner.
-    return true;
-  }
-
-  // Released stack daemons predate the explicit lifecycle-scope variable and used their
-  // already-resolved active server id as the stable lifecycle id. Only that old-daemon shape
-  // may fall back to ACTIVE_SERVER_ID and endpoint URL comparison.
-  const currentFallbackScope = currentLifecycleScopeId || configuration.activeServerId;
-  if (!processEnvValueMatchesCurrent(env.HAPPIER_ACTIVE_SERVER_ID, currentFallbackScope)) {
-    return false;
-  }
-
-  const processServerUrl = normalizeServerUrl(env.HAPPIER_SERVER_URL);
-  if (processServerUrl) {
-    const currentServerUrls = new Set([
-      normalizeServerUrl(configuration.serverUrl),
-      normalizeServerUrl(configuration.apiServerUrl),
-      normalizeServerUrl(configuration.publicServerUrl),
-    ].filter(Boolean));
-    if (currentServerUrls.size > 0 && !currentServerUrls.has(processServerUrl)) {
-      return false;
-    }
-  }
-
-  return true;
 }
 
 export function isDaemonProcessForCurrentRuntimeRoot(processInfo: HappyProcessInfo, currentRuntimeRoot: string): boolean {

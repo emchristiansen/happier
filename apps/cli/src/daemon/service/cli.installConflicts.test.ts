@@ -6,10 +6,27 @@ import { captureStdoutJsonOutput } from '@/testkit/logger/captureOutput';
 
 const {
   installDaemonServiceMock,
+  previewDaemonServiceInstallMock,
   resolveDaemonServiceInstallRuntimeTargetMock,
   inspectDaemonRunningStateMock,
 } = vi.hoisted(() => ({
   installDaemonServiceMock: vi.fn(async () => undefined),
+  previewDaemonServiceInstallMock: vi.fn(async () => ({
+    exactTargetExists: true,
+    exactTargetIsConverged: true,
+    exactTargetMatchesExpectedDefinition: true,
+    strategy: 'add' as const,
+    conflictPlan: {
+      exactTargetExists: true,
+      exactTargetIsConverged: true,
+      competingServices: [],
+      foreignHomeConflicts: [],
+      servicesToRemove: [],
+    },
+    autostart: 'at-login' as const,
+    plan: { files: [], commands: [] },
+    exactTargetRuntimeReplacement: null,
+  })),
   resolveDaemonServiceInstallRuntimeTargetMock: vi.fn(async () => ({
     nodePath: '/managed/node',
     entryPath: '/opt/happier/package-dist/index.mjs',
@@ -17,13 +34,20 @@ const {
   inspectDaemonRunningStateMock: vi.fn<() => Promise<DaemonRunningInspection>>(async () => ({ status: 'not-running' as const })),
 }));
 
-vi.mock('./installer', () => ({
-  installDaemonService: installDaemonServiceMock,
-  uninstallDaemonService: vi.fn(async () => undefined),
-}));
+vi.mock('./installer', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./installer')>();
+  return {
+    ...actual,
+    installDaemonService: installDaemonServiceMock,
+    previewDaemonServiceInstall: previewDaemonServiceInstallMock,
+    uninstallDaemonService: vi.fn(async () => undefined),
+  };
+});
 
 vi.mock('./resolveDaemonServiceInstallRuntimeTarget', () => ({
   resolveDaemonServiceInstallRuntimeTarget: resolveDaemonServiceInstallRuntimeTargetMock,
+  // No managed shim installed in these fixtures: no runtime replacement is ever proposed.
+  resolveManagedDaemonServiceShimPath: async () => null,
 }));
 
 vi.mock('node:child_process', async (importOriginal) => {
@@ -60,6 +84,7 @@ describe('runDaemonServiceCliCommand install conflict preflight', () => {
     envScope.restore();
     envScope = createEnvKeyScope(envKeys);
     vi.clearAllMocks();
+    previewDaemonServiceInstallMock.mockClear();
     inspectDaemonRunningStateMock.mockReset();
     inspectDaemonRunningStateMock.mockImplementation(async () => ({ status: 'not-running' }));
     vi.resetModules();
@@ -170,5 +195,45 @@ describe('runDaemonServiceCliCommand install conflict preflight', () => {
     expect(installDaemonServiceMock).toHaveBeenCalledWith(expect.objectContaining({
       strategy: 'replace-all',
     }));
+  });
+
+  it('uses the same stale-daemon restart decision for install dry-run planning', async () => {
+    envScope.patch({
+      HAPPIER_DAEMON_SERVICE_PLATFORM: 'darwin',
+      HAPPIER_DAEMON_SERVICE_USER_HOME_DIR: '/home/tester',
+      HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR: '/home/tester/.happier',
+      HAPPIER_DAEMON_SERVICE_INSTANCE_ID: 'default',
+      HAPPIER_DAEMON_SERVICE_CHANNEL: 'publicdev',
+      HAPPIER_DAEMON_SERVICE_OWNERSHIP_WAIT_TIMEOUT_MS: '10',
+      HAPPIER_DAEMON_SERVICE_OWNERSHIP_WAIT_POLL_MS: '1',
+      HAPPIER_DAEMON_SERVICE_OWNERSHIP_STABLE_MS: '0',
+    });
+
+    const { resolveDaemonServiceCliRuntimeFromEnv, resolveDaemonServicePaths, runDaemonServiceCliCommand } = await import('./cli.js');
+    const runtime = resolveDaemonServiceCliRuntimeFromEnv({ processEnv: process.env });
+    const paths = resolveDaemonServicePaths(runtime);
+    inspectDaemonRunningStateMock.mockResolvedValue({
+      status: 'running',
+      state: {
+        pid: process.pid,
+        httpPort: 43122,
+        startedAt: Date.now(),
+        startedWithCliVersion: '0.0.0-other',
+        startedWithPublicReleaseChannel: 'dev',
+        startupSource: 'background-service',
+        serviceLabel: paths.label,
+      },
+    });
+
+    const output = captureStdoutJsonOutput<{ ok: boolean }>();
+    try {
+      await runDaemonServiceCliCommand({ argv: ['install', '--dry-run', '--json'] });
+      expect(output.json().ok).toBe(true);
+      expect(previewDaemonServiceInstallMock).toHaveBeenCalledWith(expect.objectContaining({
+        restartRunningDaemon: true,
+      }));
+    } finally {
+      output.restore();
+    }
   });
 });

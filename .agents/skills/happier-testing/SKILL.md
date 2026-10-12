@@ -1,12 +1,12 @@
 ---
 name: happier-testing
-description: Repo-specific TDD and test-validation workflow for Happier changes, with lane selection, fixture policy, and anti-flake guardrails.
+description: Author, change, review, delete, or audit Happier tests through observable contracts, canonical testkits, risk-selected validation, and safe subsystem cleanup. Use for behavior-changing TDD and for test-infrastructure or test-pruning work.
 metadata: {"openclaw":{"homepage":"https://github.com/happier-dev/happier"}}
 ---
 
 # Happier Testing And TDD
 
-Use this skill for behavior-changing work in this repository, especially when changes touch shared runtime contracts, CLI/server/UI flows, or any lane that historically accumulates stale fixtures.
+Use this skill whenever work adds, changes, reviews, deletes, or audits tests, fixtures, testkits, lane wiring, or validation behavior. It is the single test-quality owner; CI failure collection remains in `.agents/skills/happier-ci-stabilize`.
 
 ## Goal
 
@@ -23,10 +23,13 @@ Apply strict RED-GREEN-REFACTOR while following Happier-specific lane, fixture, 
 - Consolidate overlapping tests instead of stacking new ones on top.
 
 2. **Classify failures correctly**
-- `production bug`: runtime behavior is wrong
-- `test drift`: assertions/fixtures assume an obsolete contract
-- `harness drift`: helpers/mocks/testkit no longer match real runtime wiring
-- `infra/resource issue`: disk, Docker, stale child processes, or similar environment failures
+- `production defect`: runtime behavior is wrong
+- `stale test or expectation`: assertions/fixtures assume an obsolete contract
+- `harness or mock defect`: helpers/mocks/testkit do not represent real runtime wiring
+- `release-control or setup defect`: workflow admission, permissions, generated prerequisites, or configuration are wrong
+- `external service or configuration defect`: an external dependency, credential, account, or published state is unavailable or invalid
+- `resource or timeout defect`: the owning resource budget, cleanup, runner, or lifecycle bound is wrong
+- `inconclusive`: available evidence cannot yet identify the owning class
 
 3. **RED**
 - Write or update the smallest relevant test first.
@@ -56,6 +59,19 @@ Apply strict RED-GREEN-REFACTOR while following Happier-specific lane, fixture, 
 - Do not add runtime tests that merely restate TypeScript types, mirror implementation structure, assert pass-through wiring or incidental call counts, or police wording, formatting, raw styles, or example values.
 - Exercise real internal behavior through the canonical/public owner boundary whenever practical.
 - Remove or consolidate redundant tests introduced or exposed by the change.
+
+Before retaining or adding a test, answer all four questions:
+
+1. Which observable behavior, invariant, released contract, or reachable material risk does it protect?
+2. Which plausible implementation mistake would make it fail?
+3. Why does a stronger existing owner-level test not already catch that mistake?
+4. Does the test require a production export, reset, dependency injection seam, or mode that no production caller needs?
+
+A missing answer is a review signal, not an automatic deletion verdict. Static inspection remains valid when it is the cheapest independent proof of a public API, generated artifact, package boundary, workflow permission/trust contract, migration, security property, or platform configuration and survives behavior-preserving refactoring.
+
+## Test Audit And Mechanical Cleanup
+
+For an explicit test-pruning, test-infrastructure, or whole-subsystem audit, read [test-audit.md](references/test-audit.md). Audit one canonical owner or subsystem at a time. Use deterministic analyzers and codemods for mechanical repetition, but keep contract value, keeper selection, compatibility obligations, and deletion decisions evidence-led.
 
 ## Compatibility Contract Gate
 

@@ -1,4 +1,5 @@
 import { Server } from "socket.io";
+import { type HappierSocketData } from "../api/socket/socketData";
 import {
     socketEmissionPayloadBytesHistogram,
     socketEmissionsCounter,
@@ -67,6 +68,29 @@ class EventRouter {
 
     getConnections(userId: string): Set<ClientConnection> | undefined {
         return this.userConnections.get(userId);
+    }
+
+    /** Query the account's live socket owner, including other Redis-adapter workers. */
+    async hasFocusedComputerUi(userId: string): Promise<boolean> {
+        const isFocused = (data: HappierSocketData) => data.clientType === 'user-scoped'
+            && data.clientPurpose === 'sync'
+            && data.uiFocus?.computer === true
+            && data.uiFocus.focused === true;
+        if (this.io) {
+            try {
+                const sockets = await this.io.in(`user-scoped:${userId}`).fetchSockets();
+                return sockets.some((socket) => isFocused(socket.data as HappierSocketData));
+            } catch (error) {
+                // Unknown focus must preserve phone delivery rather than silently mute it.
+                log({ module: 'ui-focus', error }, 'Unable to query focused computer UI; preserving push delivery');
+                return false;
+            }
+        }
+        return [...(this.userConnections.get(userId) ?? [])].some((connection) => (
+            connection.connectionType === 'user-scoped'
+            && connection.socket.connected === true
+            && isFocused(connection.socket.data as HappierSocketData)
+        ));
     }
 
     // === SOCKET.IO ADAPTER (ROOM-BASED FANOUT) ===

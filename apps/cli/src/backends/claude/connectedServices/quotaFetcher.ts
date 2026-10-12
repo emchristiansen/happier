@@ -306,7 +306,8 @@ function formatWindowLabelSuffix(raw: string): string {
     .join(' ');
 }
 
-function resolveUsageWindowLabel(meterId: string): string {
+/** Label for a Claude subscription usage window (`five_hour`, `seven_day_*`, …); null for other ids. */
+export function resolveClaudeUsageWindowLabel(meterId: string): string | null {
   const known = WINDOW_LABELS[meterId];
   if (known) return known;
   for (const { prefix, label } of WINDOW_LABEL_PREFIXES) {
@@ -315,7 +316,11 @@ function resolveUsageWindowLabel(meterId: string): string {
       return suffix ? `${label} (${suffix})` : label;
     }
   }
-  return formatWindowLabelSuffix(meterId) || meterId;
+  return null;
+}
+
+function resolveUsageWindowLabel(meterId: string): string {
+  return resolveClaudeUsageWindowLabel(meterId) ?? (formatWindowLabelSuffix(meterId) || meterId);
 }
 
 function readNonEmptyStringProperty(
@@ -538,6 +543,8 @@ function buildUsageWindowMeter(
   return {
     meterId,
     label: resolveUsageWindowLabel(meterId),
+    ...(meterId === 'seven_day' || meterId.startsWith('seven_day_') ? { windowDurationMs: 604_800_000 }
+      : meterId === 'five_hour' || meterId.startsWith('five_hour_') ? { windowDurationMs: 18_000_000 } : {}),
     used,
     limit,
     unit: resolveUsageWindowUnit(window),

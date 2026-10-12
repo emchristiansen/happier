@@ -1,5 +1,5 @@
 import type { Metadata } from '@/api/types';
-import { resolveClaudeModelCatalog } from '@/backends/claude/models/resolveClaudeModelCatalog';
+import { resolveClaudeModelCatalogResolution } from '@/backends/claude/models/resolveClaudeModelCatalog';
 import {
   isClaudeModelOptionSupportedByInstalledRuntime,
   probeClaudeInstalledRuntimeCapabilities,
@@ -22,22 +22,22 @@ export async function resolveClaudeSessionModelsState(params: Readonly<{
     params.probeInstalledRuntimeCapabilities ?? probeClaudeInstalledRuntimeCapabilities
   )({ cwd: params.cwd, timeoutMs: params.timeoutMs });
 
-  const updatedAt = params.nowMs();
   // Same owner as the new-session preflight probe, so the in-session picker cannot disagree about
   // which models exist or which effort tiers they support. The catalog owns credential-aware
   // caching and falls back to the curated list when the Models API is unavailable. No binding is
   // needed here: the in-session process already runs with the selected account environment.
-  const models = await resolveClaudeModelCatalog({
+  const resolution = await resolveClaudeModelCatalogResolution({
     timeoutMs: params.timeoutMs,
+    nowMs: params.nowMs,
     accountSettings: params.accountSettings,
   });
 
   return {
     v: 1,
     provider: 'claude',
-    updatedAt,
+    updatedAt: resolution.observedAt ?? 0,
     currentModelId: params.currentModelId,
-    availableModels: models.map((model) => {
+    availableModels: resolution.models.map((model) => {
       const description = typeof model.description === 'string' ? model.description : '';
       return {
         id: model.id,

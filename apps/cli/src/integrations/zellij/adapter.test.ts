@@ -8,7 +8,7 @@ import { createClaudePromptSubmitVerificationPolicy } from '@/backends/claude/un
 import { resolveTerminalPromptWriteTimeoutMs } from '@/agent/runtime/terminal/injection/promptWriteTimeout';
 
 const recordTerminalHostKillAudit = vi.hoisted(() => vi.fn());
-const loggerWarn = vi.hoisted(() => vi.fn());
+const loggerInfoFile = vi.hoisted(() => vi.fn());
 
 vi.mock('@/daemon/sessionKillAudit', () => ({
   recordTerminalHostKillAudit,
@@ -17,7 +17,7 @@ vi.mock('@/daemon/sessionKillAudit', () => ({
 vi.mock('@/ui/logger', () => ({
   logger: {
     debug: vi.fn(),
-    warn: loggerWarn,
+    infoFile: loggerInfoFile,
   },
 }));
 
@@ -65,7 +65,7 @@ describe('createZellijTerminalHostAdapter', () => {
   afterEach(() => {
     vi.useRealTimers();
     recordTerminalHostKillAudit.mockReset();
-    loggerWarn.mockReset();
+    loggerInfoFile.mockReset();
   });
 
   it('starts the requested spawn command inside the background session', async () => {
@@ -79,6 +79,7 @@ describe('createZellijTerminalHostAdapter', () => {
           params.env.ZELLIJ_SOCKET_DIR ?? '',
           params.env.ZELLIJ_SESSION_NAME ?? '',
           params.env.HAPPIER_CLAUDE_PATH ?? '',
+          params.env.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION ?? '',
         ].join(':'));
         return { exitCode: 0, stdout: '', stderr: '' };
       },
@@ -90,6 +91,7 @@ describe('createZellijTerminalHostAdapter', () => {
           params.env.ZELLIJ_SESSION_NAME ?? '',
           params.command.join('|'),
           params.env.HAPPIER_CLAUDE_PATH ?? '',
+          params.env.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION ?? '',
         ].join(':'));
         return { exitCode: 0, stdout: 'terminal_42\n', stderr: '' };
       },
@@ -134,14 +136,15 @@ describe('createZellijTerminalHostAdapter', () => {
       spawnArgv: ['/managed/node', 'claude_local_launcher.cjs', '--model', 'sonnet'],
       spawnEnv: {
         HAPPIER_CLAUDE_PATH: '/opt/claude/cli.js',
+        CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
       },
       isolatedEnv: true,
     });
 
     const socketDir = join('/home/happier', 'zellij-sock');
     expect(calls).toEqual([
-      `attach:session-a:${socketDir}::`,
-      `run:session-a:${socketDir}::/managed/node|claude_local_launcher.cjs|--model|sonnet:/opt/claude/cli.js`,
+      `attach:session-a:${socketDir}::/opt/claude/cli.js:false`,
+      `run:session-a:${socketDir}::/managed/node|claude_local_launcher.cjs|--model|sonnet:/opt/claude/cli.js:false`,
     ]);
     expect(handle.paneId).toBe('terminal_42');
     expect(handle.attachmentId).toEqual(expect.any(String));
@@ -553,6 +556,7 @@ describe('createZellijTerminalHostAdapter', () => {
           cwd?: string;
           defaultShell?: string;
         }) => {
+          expect(params.env.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION).toBe('false');
           calls.push(`foreground:${params.sessionName}:${params.env.ZELLIJ_SOCKET_DIR ?? ''}:${params.cwd ?? ''}:${params.defaultShell ?? ''}`);
         },
       },
@@ -573,7 +577,7 @@ describe('createZellijTerminalHostAdapter', () => {
       sessionName: 'session-a',
       workingDirectory: '/workspace/project',
       spawnArgv: ['/managed/node', 'claude_local_launcher.cjs'],
-      spawnEnv: {},
+      spawnEnv: { CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false' },
       isolatedEnv: true,
     });
 
@@ -674,7 +678,7 @@ describe('createZellijTerminalHostAdapter', () => {
     expect(launcherDisposed).toBe(true);
   });
 
-  it('preserves the typed startup failure and attributes best-effort cleanup failures', async () => {
+  it.each([true, false])('preserves the typed startup failure and creation disposition when kill completes=$killCompleted', async (killCompleted) => {
     let listCount = 0;
     let launcherDisposed = false;
     let bootstrapClosed = false;
@@ -716,7 +720,7 @@ describe('createZellijTerminalHostAdapter', () => {
       closePane: async () => {
         bootstrapClosed = true;
       },
-      killSession: async () => ({ exitCode: 1, stdout: '', stderr: 'cleanup denied' }),
+      killSession: async () => ({ exitCode: killCompleted ? 0 : 1, stdout: '', stderr: killCompleted ? '' : 'cleanup denied' }),
       deleteSession: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
     } as ZellijActions & {
       startCommandDetached(): Promise<{ dispose(): void }>;
@@ -749,6 +753,10 @@ describe('createZellijTerminalHostAdapter', () => {
       code: 'terminal_host_startup_failed',
       hostKind: 'zellij',
       reason: 'pane_disappeared_after_bootstrap_cleanup',
+      launchFailure: {
+        launchDisposition: killCompleted ? 'stopped' : 'unconfirmed',
+        cleanupIncomplete: !killCompleted,
+      },
     });
     const diagnostics = (error as { diagnostics?: Record<string, unknown> }).diagnostics;
     expect(diagnostics).toMatchObject({
@@ -759,14 +767,16 @@ describe('createZellijTerminalHostAdapter', () => {
       closedPaneIds: ['terminal_1'],
     });
     expect(String((error as { message?: unknown }).message)).not.toContain('cleanup failed');
-    expect(loggerWarn).toHaveBeenCalledWith(
-      expect.stringContaining('kill-session'),
-      expect.objectContaining({
-        action: 'kill-session',
-        callSite: 'integrations.zellij.adapter.startupCleanup',
-        sessionName: 'session-a',
-      }),
-    );
+    if (!killCompleted) {
+      expect(loggerInfoFile).toHaveBeenCalledWith(
+        expect.stringContaining('kill-session'),
+        expect.objectContaining({
+          action: 'kill-session',
+          callSite: 'integrations.zellij.adapter.startupCleanup',
+          sessionName: 'session-a',
+        }),
+      );
+    }
     expect(launcherDisposed).toBe(true);
   });
 
@@ -1192,7 +1202,7 @@ describe('createZellijTerminalHostAdapter', () => {
     ]);
   });
 
-  it('submits a large zellij paste and retries Enter when it remains pending', async () => {
+  it('submits a large zellij paste and waits for its composer to clear', async () => {
     const prompt = Array.from({ length: 6_000 }, (_, index) => `line ${index} ${'x'.repeat(36)}`).join('\n');
     expect(Buffer.byteLength(prompt, 'utf8')).toBeGreaterThan(250_000);
     const calls: string[] = [];
@@ -1245,18 +1255,13 @@ describe('createZellijTerminalHostAdapter', () => {
       },
     )).resolves.toMatchObject({ status: 'injected' });
 
-    expect(calls).toEqual([
+    expect(calls.filter((call) => !call.startsWith('dump:'))).toEqual([
       'paste:terminal_1',
-      'dump:terminal_1',
       'enter:terminal_1',
-      'dump:terminal_1',
-      'enter:terminal_1',
-      'dump:terminal_1',
-      'dump:terminal_1',
     ]);
   });
 
-  it('re-sends Enter once when a collapsed multiline paste remains in the composer after submit', async () => {
+  it('waits for a collapsed multiline paste to clear without resubmitting', async () => {
     const calls: string[] = [];
     let dumpCount = 0;
     const actions: ZellijActions = {
@@ -1307,18 +1312,13 @@ describe('createZellijTerminalHostAdapter', () => {
       },
     )).resolves.toMatchObject({ status: 'injected' });
 
-    expect(calls).toEqual([
+    expect(calls.filter((call) => !call.startsWith('dump:'))).toEqual([
       'paste:terminal_1',
-      'dump:terminal_1',
       'enter:terminal_1',
-      'dump:terminal_1',
-      'enter:terminal_1',
-      'dump:terminal_1',
-      'dump:terminal_1',
     ]);
   });
 
-  it('reports ambiguous failure when a collapsed zellij paste remains after the bounded Enter retry', async () => {
+  it('reports ambiguous failure when a collapsed zellij paste remains until the observation deadline', async () => {
     const calls: string[] = [];
     const actions: ZellijActions = {
       attachCreateBackground: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
@@ -1363,7 +1363,7 @@ describe('createZellijTerminalHostAdapter', () => {
         text: Array.from({ length: 41 }, (_, index) => `line ${index}`).join('\n'),
         multiline: true,
         origin: { kind: 'ui_pending', nonce: 'nonce-zellij-submit-stuck' },
-        scheduling: {},
+        scheduling: { timeoutMs: 250 },
       },
     )).resolves.toEqual({
       status: 'failed',
@@ -1373,13 +1373,9 @@ describe('createZellijTerminalHostAdapter', () => {
       recoverable: true,
     });
 
-    expect(calls).toEqual([
+    expect(calls.filter((call) => !call.startsWith('dump:'))).toEqual([
       'paste:terminal_1',
-      'dump:terminal_1',
       'enter:terminal_1',
-      'dump:terminal_1',
-      'enter:terminal_1',
-      'dump:terminal_1',
     ]);
   });
 
@@ -2333,12 +2329,12 @@ describe('createZellijTerminalHostAdapter', () => {
       attachMetadata: { attachStrategy: 'terminal_host', topology: 'exclusive' },
     })).rejects.toThrow(/owned zellij session/i);
     expect(calls).toEqual(['kill', 'delete']);
-    expect(loggerWarn).toHaveBeenCalledTimes(2);
-    expect(loggerWarn).toHaveBeenNthCalledWith(1, expect.stringContaining('kill-session'), expect.objectContaining({
+    expect(loggerInfoFile).toHaveBeenCalledTimes(2);
+    expect(loggerInfoFile).toHaveBeenNthCalledWith(1, expect.stringContaining('kill-session'), expect.objectContaining({
       callSite: 'integrations.zellij.adapter.dispose',
       sessionName: 'session-a',
     }));
-    expect(loggerWarn).toHaveBeenNthCalledWith(2, expect.stringContaining('delete-session'), expect.objectContaining({
+    expect(loggerInfoFile).toHaveBeenNthCalledWith(2, expect.stringContaining('delete-session'), expect.objectContaining({
       callSite: 'integrations.zellij.adapter.dispose',
       sessionName: 'session-a',
     }));
@@ -2404,7 +2400,7 @@ describe('createZellijTerminalHostAdapter', () => {
     });
     expect(String((thrown as Error).message)).not.toContain('cleanup failed');
     expect(calls).toEqual(['attach', 'kill', 'delete']);
-    expect(loggerWarn).toHaveBeenCalledTimes(2);
+    expect(loggerInfoFile).toHaveBeenCalledTimes(2);
   });
 
   it('cleans up the background zellij session when background attach throws after partial creation', async () => {

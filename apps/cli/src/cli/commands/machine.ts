@@ -17,6 +17,7 @@ import type {
 } from '@happier-dev/protocol';
 
 import { showMachineHelp } from './machine/help';
+import { fail } from '@happier-dev/cli-common/output';
 
 type SystemTasksRunnerAdapter = Readonly<{
   start: (params: Readonly<{ spec: SystemTaskSpec }>) => Promise<Readonly<{ taskId: string }>>;
@@ -458,7 +459,7 @@ export async function handleMachineCommand(args: string[], deps: Partial<Machine
       return;
     }
 
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     showMachineHelp();
     if (process.env.DEBUG) {
       console.error(error);

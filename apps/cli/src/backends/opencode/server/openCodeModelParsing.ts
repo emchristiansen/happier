@@ -80,23 +80,20 @@ export function isKnownUnavailableOpenCodeModel(params: Readonly<{
 }
 
 /**
- * Canonical readers for an OpenCode model record's capabilities. V1 publishes
- * `{ toolcall: boolean, input: { text: boolean, ... }, reasoning?: boolean }`; released V2
- * publishes `Model.Capabilities = { tools: boolean, input: string[], output: string[] }` and moved
- * reasoning effort onto `variants`. Both shapes are read here so no caller re-implements the test.
+ * Shared eligibility for discovery, selection, and compaction. OpenCode supports text models
+ * without tool calling, so tool support must not change membership between those consumers.
+ * Missing inventory preserves custom-model selection; known retired models remain excluded.
  */
-export function modelSupportsToolCalls(raw: unknown, providerIdHint?: string): boolean {
-  const rec = asRecord(raw);
-  if (!rec) return false;
-  const providerID = normalizeString(providerIdHint) || normalizeString(rec.providerID);
-  const modelID = normalizeString(rec.id);
-  if (providerID && modelID && isKnownUnavailableOpenCodeModel({ providerID, modelID })) return false;
-  if (!modelIsActive(rec)) return false;
-  const capabilities = asRecord(rec.capabilities);
-  if (!capabilities) return false;
-  const supportsTools = capabilities.tools === true || capabilities.toolcall === true;
-  if (!supportsTools) return false;
-  return modelSupportsTextInput(rec);
+export function isOpenCodeModelSelectable(model: Readonly<{
+  providerID: string;
+  modelID: string;
+  modelRecord?: unknown;
+}>): boolean {
+  const providerID = normalizeString(model.providerID);
+  const modelID = normalizeString(model.modelID);
+  if (!providerID || !modelID) return false;
+  if (isKnownUnavailableOpenCodeModel({ providerID, modelID })) return false;
+  return modelIsActive(model.modelRecord) && modelSupportsTextInput(model.modelRecord);
 }
 
 export function modelIsActive(raw: unknown): boolean {

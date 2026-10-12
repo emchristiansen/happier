@@ -71,12 +71,18 @@ const stylesheet = StyleSheet.create((theme) => ({
         fontWeight: '600',
         includeFontPadding: false,
     },
+    completeTitle: {
+        maxWidth: '100%',
+        textAlign: 'center',
+    },
 }));
 
 export type RoundButtonProps = {
     size?: RoundButtonSize,
     display?: RoundButtonDisplay,
     title?: any,
+    /** Preserve the full action wording when a constrained surface needs wrapping. */
+    titleNumberOfLines?: 1 | 'complete',
     /**
      * A mark drawn before the title, inside the same fill.
      *
@@ -227,9 +233,10 @@ export const RoundButton = React.memo(React.forwardRef<
                             color: display.textColor,
                             fontSize: size.fontSize,
                         },
+                        props.titleNumberOfLines === 'complete' ? styles.completeTitle : null,
                         props.textStyle
                     ]}
-                    numberOfLines={1}
+                    numberOfLines={props.titleNumberOfLines === 'complete' ? undefined : 1}
                 >
                     {props.title}
                 </Text>

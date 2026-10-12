@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,10 +10,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { configuration, reloadConfiguration } from '@/configuration';
 import { writeCredentialsLegacy } from '@/persistence';
 import { addServerProfile, useServerProfile } from '@/server/serverProfiles';
-import { captureConsoleLogAndMuteStdout } from '@/testkit/logger/captureOutput';
+import { captureConsoleLogAndMuteStdout, captureStdoutJsonOutput } from '@/testkit/logger/captureOutput';
 import { buildLaunchAgentPlistXml } from '@/daemon/service/darwin';
 import { resolveDaemonServiceCliRuntimeFromEnv, resolveDaemonServicePaths, type DaemonServiceListEntry } from '@/daemon/service/cli';
 import { renderSystemdServiceUnit, renderWindowsScheduledTaskWrapperPs1 } from '@happier-dev/cli-common/service';
+import { resolveServerSelectionBackgroundServiceOutcome } from './backgroundServiceFollowUp';
 
 const promptAnswers: string[] = [];
 const promptQuestions: string[] = [];
@@ -29,7 +31,7 @@ const alternateReleaseChannel = (): DaemonServiceListEntry['releaseChannel'] =>
     (configuration.publicReleaseRing === 'stable' ? 'preview' : 'stable');
 
 vi.mock('node:readline', () => ({
-    createInterface: () => ({
+    createInterface: () => Object.assign(new EventEmitter(), {
         question: (prompt: string, cb: (answer: string) => void) => {
             promptQuestions.push(prompt);
             cb(promptAnswers.shift() ?? '');
@@ -395,6 +397,112 @@ describe('happier server background service follow-up', () => {
             reloadConfiguration();
             await rm(home, { recursive: true, force: true });
         }
+    });
+
+    describe('when the selected relay already has its own pinned background service', () => {
+        const platform = (): DaemonServiceListEntry['platform'] =>
+            (process.platform === 'darwin' || process.platform === 'linux' || process.platform === 'win32' ? process.platform : 'linux');
+        const inventory = (home: string, serverBId: string): DaemonServiceListEntry[] => [
+            {
+                serverId: 'default',
+                name: 'Default background service',
+                installed: true,
+                path: '/tmp/happier-daemon.default.service',
+                happierHomeDir: join(home, '.happier'),
+                platform: platform(),
+                releaseChannel: currentReleaseChannel(),
+                label: 'happier-daemon.default',
+                targetMode: 'default-following',
+            },
+            {
+                serverId: serverBId,
+                activeServerId: serverBId,
+                name: 'B',
+                relayUrl: 'https://b.example.test',
+                installed: true,
+                path: `/tmp/happier-daemon.${serverBId}.service`,
+                happierHomeDir: join(home, '.happier'),
+                platform: platform(),
+                releaseChannel: currentReleaseChannel(),
+                label: `happier-daemon.${serverBId}`,
+                targetMode: 'pinned',
+            },
+        ];
+
+        async function withTwoRelays(run: (params: Readonly<{ home: string; serverBId: string }>) => Promise<void>): Promise<void> {
+            const home = await mkdtemp(join(tmpdir(), 'happier-server-use-pinned-target-'));
+            const previousHome = process.env.HAPPIER_HOME_DIR;
+            try {
+                process.env.HAPPIER_HOME_DIR = home;
+                reloadConfiguration();
+                await addServerProfile({ name: 'A', serverUrl: 'https://a.example.test', webappUrl: 'https://a.example.test', use: true });
+                const serverB = await addServerProfile({ name: 'B', serverUrl: 'https://b.example.test', webappUrl: 'https://b.example.test', use: false });
+                await run({ home, serverBId: serverB.id });
+            } finally {
+                if (previousHome === undefined) delete process.env.HAPPIER_HOME_DIR;
+                else process.env.HAPPIER_HOME_DIR = previousHome;
+                reloadConfiguration();
+                await rm(home, { recursive: true, force: true });
+            }
+        }
+
+        it('names the relay\'s own service and says the default service will not follow, instead of offering a restart', async () => {
+            const restoreTty = setTtyMode(true, true);
+            const output = captureConsoleLogAndMuteStdout();
+            try {
+                await withTwoRelays(async ({ home, serverBId }) => {
+                    resolveInstalledDaemonServiceInventoryForCurrentRelayMock.mockResolvedValue(inventory(home, serverBId));
+
+                    const { handleServerCommand } = await import('./server');
+                    await handleServerCommand(['use', serverBId]);
+
+                    expect(promptQuestions).toEqual([]);
+                    expect(spawnHappyCLIMock).not.toHaveBeenCalled();
+                    const out = output.logs.join('\n');
+                    expect(out).toContain(`happier-daemon.${serverBId}`);
+                    expect(out).toContain('https://b.example.test');
+                    expect(out).not.toContain('happier service restart');
+                });
+            } finally {
+                output.restore();
+                restoreTty();
+            }
+        });
+
+        it('reports the same outcome as a structured field in --json output', async () => {
+            const output = captureStdoutJsonOutput<{ data?: { backgroundService?: unknown } }>();
+            try {
+                await withTwoRelays(async ({ home, serverBId }) => {
+                    resolveInstalledDaemonServiceInventoryForCurrentRelayMock.mockResolvedValue(inventory(home, serverBId));
+
+                    const { handleServerCommand } = await import('./server');
+                    await handleServerCommand(['use', serverBId, '--json']);
+
+                    expect(output.json().data?.backgroundService).toEqual({
+                        defaultFollowingService: 'idle-selected-relay-has-own-service',
+                        selectedRelayServices: [{
+                            label: `happier-daemon.${serverBId}`,
+                            path: `/tmp/happier-daemon.${serverBId}.service`,
+                            managedBy: null,
+                        }],
+                    });
+                });
+            } finally {
+                output.restore();
+            }
+        });
+
+        it('lets the installed default service follow when a pinned candidate is not installed', () => {
+            const services = inventory('/tmp/happier-serving-selection', 'b');
+            const outcome = resolveServerSelectionBackgroundServiceOutcome([
+                services[0]!,
+                { ...services[1]!, installed: false },
+            ]);
+            expect(outcome).toEqual({
+                defaultFollowingService: 'follows-selected-relay',
+                selectedRelayServices: [],
+            });
+        });
     });
 
     it('prints authentication guidance in non-interactive mode when the selected server credentials are stale', async () => {

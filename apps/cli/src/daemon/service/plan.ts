@@ -14,7 +14,7 @@ export type DaemonServiceTargetMode = 'pinned' | 'default-following';
  * Whether the installed background service starts itself at login.
  *
  * - `at-login` (default, unchanged behaviour): launchd `RunAtLoad`, a systemd
- *   `enable`d unit, a Windows `ONLOGON` trigger.
+ *   `enable`d unit, a Windows current-user logon trigger.
  * - `on-demand`: the service stays installed and startable, but nothing starts
  *   it at login — the daemon runs only while something asks for it (the desktop
  *   app, or `happier service start`).
@@ -23,6 +23,42 @@ export type DaemonServiceAutostartMode = 'at-login' | 'on-demand';
 
 /** Definition-embedded record of the mode, so an installed service reports it back. */
 export const DAEMON_SERVICE_AUTOSTART_ENV_KEY = 'HAPPIER_DAEMON_SERVICE_AUTOSTART';
+
+/**
+ * Who manages an installed service. `desktop`: the desktop app created it (for example "connect to
+ * this relay too") and may change or remove it. `null`: no marker — the user installed it, and the
+ * app leaves it alone. Requested on `service install` through the same-named env key and recorded
+ * in the definition itself, so every later rewrite keeps it.
+ */
+export type DaemonServiceManagedBy = 'desktop';
+export const DAEMON_SERVICE_MANAGED_BY_ENV_KEY = 'HAPPIER_DAEMON_SERVICE_MANAGED_BY';
+
+/** `null` for an absent value; throws for anything but `desktop`, so a typo never installs a user-owned service silently. */
+export function parseDaemonServiceManagedBy(raw: string | null | undefined): DaemonServiceManagedBy | null {
+  const value = String(raw ?? '').trim();
+  if (!value) return null;
+  if (value === 'desktop') return 'desktop';
+  throw new Error(`invalid ${DAEMON_SERVICE_MANAGED_BY_ENV_KEY}: ${value} (expected "desktop")`);
+}
+
+/**
+ * R16 — the desktop app that installed a service (its macOS bundle identifier), so System Settings ›
+ * Login Items attributes the LaunchAgent to that app (`AssociatedBundleIdentifiers`). The desktop
+ * passes it on every `service install` it performs (default-following or pinned); only `install`
+ * reads it, a terminal install without it names no app, and it is recorded in the definition so
+ * every later rewrite keeps it. It never changes who manages the service (`managedBy`).
+ */
+export const DAEMON_SERVICE_BUNDLE_ID_ENV_KEY = 'HAPPIER_DAEMON_SERVICE_BUNDLE_ID';
+
+const BUNDLE_ID_PATTERN = /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
+
+/** `null` for an absent value; throws for anything that is not a reverse-DNS bundle identifier. */
+export function parseDaemonServiceBundleId(raw: string | null | undefined): string | null {
+  const value = String(raw ?? '').trim();
+  if (!value) return null;
+  if (BUNDLE_ID_PATTERN.test(value)) return value;
+  throw new Error(`invalid ${DAEMON_SERVICE_BUNDLE_ID_ENV_KEY}: ${value} (expected a bundle identifier such as dev.happier.app)`);
+}
 
 export type DaemonServicePlannedFile = Readonly<{
   path: string;
@@ -258,6 +294,10 @@ export function planDaemonServiceInstall(params: Readonly<{
   channel?: PublicReleaseRingId;
   targetMode?: DaemonServiceTargetMode;
   autostart?: DaemonServiceAutostartMode;
+  /** Recorded in the definition when set; see `DaemonServiceManagedBy`. */
+  managedBy?: DaemonServiceManagedBy | null;
+  /** See `DAEMON_SERVICE_BUNDLE_ID_ENV_KEY`. */
+  bundleId?: string | null;
   /**
    * Set by the install choke point when the only difference from the installed definition is the
    * autostart mode. Linux then applies the login trigger (`enable`/`disable`) and leaves the
@@ -302,6 +342,9 @@ export function planDaemonServiceInstall(params: Readonly<{
   const unitLabel = resolveDaemonServiceSystemdUnitLabel(instanceId, channel, targetMode);
   const unitName = resolveDaemonServiceSystemdUnitName(instanceId, channel, targetMode);
   const programArgs = buildDaemonServiceProgramArgs({ nodePath: params.nodePath, entryPath: params.entryPath });
+  // Present only when the desktop performed (or first performed) this install; a terminal install
+  // never names an app. Independent of `managedBy`, which scopes the desktop's lifecycle control.
+  const bundleId = params.bundleId ?? null;
   const baseEnv: Record<string, string> = {
     HAPPIER_HOME_DIR: params.happierHomeDir,
     HAPPIER_PUBLIC_RELEASE_CHANNEL: publicReleaseChannel,
@@ -315,6 +358,8 @@ export function planDaemonServiceInstall(params: Readonly<{
     // outside the definition file (systemd enable symlink, scheduled-task
     // trigger) — the switch would silently no-op.
     [DAEMON_SERVICE_AUTOSTART_ENV_KEY]: autostart,
+    ...(params.managedBy ? { [DAEMON_SERVICE_MANAGED_BY_ENV_KEY]: params.managedBy } : {}),
+    ...(bundleId ? { [DAEMON_SERVICE_BUNDLE_ID_ENV_KEY]: bundleId } : {}),
     HAPPIER_NO_BROWSER_OPEN: '1',
     HAPPIER_DAEMON_WAIT_FOR_AUTH: '1',
     HAPPIER_DAEMON_WAIT_FOR_AUTH_TIMEOUT_MS: '0',
@@ -352,6 +397,7 @@ export function planDaemonServiceInstall(params: Readonly<{
       // after an uninstall (which runs `launchctl disable`) and so an
       // on-demand service remains startable.
       runAtLoad: autostart === 'at-login',
+      ...(bundleId ? { associatedBundleIdentifiers: [bundleId] } : {}),
       // `KeepAlive{SuccessfulExit:false}` cannot ride along in on-demand mode:
       // launchd.plist(5) states that SuccessfulExit "implies that RunAtLoad is set
       // to true, since the job needs to run at least once before we can get an exit
@@ -419,9 +465,8 @@ export function planDaemonServiceInstall(params: Readonly<{
       definitionPath: wrapperPath,
       definitionContents: wrapper,
       taskName,
-      // `persistent: false` is cli-common's existing expression of "registered
-      // without a logon trigger": it creates the task with `/SC ONCE` instead
-      // of `/SC ONLOGON`, and the install still runs it once now.
+      // cli-common registers the current user's interactive task, with a scoped logon
+      // trigger only at login. On-demand has no trigger; install still runs it now.
       persistent: autostart === 'at-login',
     });
 

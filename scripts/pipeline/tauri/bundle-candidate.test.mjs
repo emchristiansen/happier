@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { spawnSync } from 'node:child_process';
 
-import { materializeBundleCandidate, packBundleCandidate } from './bundle-candidate.mjs';
+import { materializeBundleCandidate, packBundleCandidate, planBundleCandidates } from './bundle-candidate.mjs';
 
 test('bundle candidate is source/version bound and materializes only fixed inputs', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tauri-candidate-'));
@@ -52,4 +52,24 @@ test('candidate plan builds only missing platforms and retains all finalizers wh
   assert.deepEqual(reused.buildMatrix.include, []);
   assert.deepEqual(reused.finalizeMatrix.include.map((entry) => [entry.platform_key, entry.artifact_id, entry.artifact_digest]),
     allPlatforms.map((key) => [key, artifacts[key].id, artifacts[key].digest]));
+});
+
+test('finalized desktop artifacts bypass builds and finalizers while missing siblings use unsigned candidates', () => {
+  const artifact = { id: 37, digest: `sha256:${'b'.repeat(64)}` };
+  const plan = planBundleCandidates({ 'linux-x86_64': artifact, 'windows-x86_64': artifact }, {
+    'linux-x86_64': { ...artifact, id: 38 }, 'darwin-aarch64': artifact,
+  });
+  assert.deepEqual(plan.buildMatrix.include.map((entry) => entry.platform_key), ['darwin-x86_64']);
+  assert.deepEqual(plan.finalizeMatrix.include.map((entry) => [entry.platform_key, entry.artifact_id]),
+    [['windows-x86_64', 37], ['darwin-x86_64', '']]);
+  assert.deepEqual(plan.reuseMatrix.include.map((entry) => [entry.platform_key, entry.artifact_id, entry.artifact_digest]),
+    [['linux-x86_64', 38, artifact.digest], ['darwin-aarch64', 37, artifact.digest]]);
+  assert.equal(plan.finalizeNeeded, true);
+  assert.equal(plan.reuseNeeded, true);
+  const complete = planBundleCandidates({}, Object.fromEntries(
+    ['linux-x86_64', 'windows-x86_64', 'darwin-aarch64', 'darwin-x86_64'].map((key) => [key, artifact])));
+  assert.equal(complete.buildNeeded, false);
+  assert.equal(complete.finalizeNeeded, false);
+  assert.equal(complete.reuseNeeded, true);
+  assert.deepEqual(complete.finalizeMatrix.include, []);
 });

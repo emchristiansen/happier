@@ -34,8 +34,10 @@ import {
 } from '@/cli/connectedServices/resolveDirectConnectedServiceEnvironment';
 import { resolveDirectCliConnectedServiceBindings } from '@/cli/connectedServices/resolveDirectCliConnectedServiceBindings';
 import { HAPPIER_SESSION_CONNECTED_SERVICES_BINDINGS_ENV_KEY } from '@/agent/runtime/sessionConnectedServicesBindingsEnv';
+import { claimSessionRunnerOwnership, withSessionRunnerOwnership } from '@/daemon/sessionRunnerLock';
 
 import type { CommandContext } from '@/cli/commandRegistry';
+import { fail, warn as presentationWarn } from '@happier-dev/cli-common/output';
 
 function readResumeFlagValue(args: readonly string[] | null | undefined): { flagIndex: number; valueIndex: number; value: string } | null {
   const list = Array.isArray(args) ? args : [];
@@ -70,7 +72,7 @@ export function stripHappyInternalSettingsFlag(
     i++; // Consume the value (if any), like upstream's behavior.
 
     const displayedValue = typeof settingsValue === 'string' ? settingsValue : '<missing>';
-    warn(chalk.yellow(`⚠️  Warning: --settings is used internally by Happier for session tracking.`));
+    warn(presentationWarn('--settings is used internally by Happier for session tracking.'));
     warn(chalk.yellow(`   Your settings file "${displayedValue}" will be ignored.`));
     warn(chalk.yellow(`   To configure Claude, edit ~/.claude/settings.json instead.`));
   }
@@ -388,11 +390,14 @@ ${chalk.bold.cyan(`Claude Code Options (from \`${providerHelpCommand}\`):`)}
       }
     }
     options.terminalRuntime = context.terminalRuntime;
-    await runClaude(credentials, options);
+    await withSessionRunnerOwnership(async () => {
+      if (options.existingSessionId) await claimSessionRunnerOwnership(options.existingSessionId);
+      await runClaude(credentials, options);
+    });
     runCompleted = true;
   } catch (error) {
     logger.fatal(error);
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     if (process.env.DEBUG) {
       console.error(error);
     }
