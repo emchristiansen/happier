@@ -947,7 +947,8 @@ const SessionUserActionAnswerInputSchema = z.object({
 
 const SessionModeSetInputSchema = z.object({
   sessionId: z.string().min(1).optional(),
-  modeId: z.string().min(1),
+  // An empty id clears the override; native `default` remains a provider mode.
+  modeId: z.string(),
 }).passthrough();
 
 const SessionPrimaryTargetInputSchema = z.object({
@@ -2521,6 +2522,8 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
     description: 'Get the editable session goal when the provider supports native goals.',
     safety: 'safe',
     approval: APPROVAL_RESULT_REQUIRED,
+    contextualDefaults: { sessionId: 'current_session' },
+    toolExposure: { session_agent: 'direct' },
     placements: [],
     bindings: { mcpToolName: 'session_goal_get' },
     examples: {
@@ -2547,6 +2550,8 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
     description: 'Set or update the native session goal.',
     safety: 'safe',
     approval: APPROVAL_RESULT_NONE,
+    contextualDefaults: { sessionId: 'current_session' },
+    toolExposure: { session_agent: 'direct' },
     placements: [],
     bindings: { mcpToolName: 'session_goal_set' },
     examples: {
@@ -2577,7 +2582,9 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
     title: 'Clear session goal',
     description: 'Clear the native session goal.',
     safety: 'safe',
-    approval: APPROVAL_RESULT_NONE,
+    approval: APPROVAL_RESULT_REQUIRED,
+    contextualDefaults: { sessionId: 'current_session' },
+    toolExposure: { session_agent: 'direct' },
     placements: [],
     bindings: { mcpToolName: 'session_goal_clear' },
     examples: {

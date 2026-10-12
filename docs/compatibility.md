@@ -212,6 +212,12 @@ do not gain Herdr controls. Current readers normalize the development-only neste
 cannot revive it. Remove this development reader once retained nested development
 settings are no longer encountered.
 
+### Same-machine session handoff (development)
+
+Same-machine session handoff extends the existing tracked handoff operation and target-path field; it adds no session identity, storage format or transport strategy. The v2 daemon capability response adds `sameMachineHandoff`. Admission requires that field to be exactly `true` for a local move and continues to accept older capability responses for cross-machine handoff. Local preparation reuses the source export through the existing direct-peer strategy without requiring a network transfer carrier.
+
+Source start validates a distinct local destination before stopping the session. Once the target is committed, source cleanup preserves its v2 job and does not stop the resumed session on the same daemon. Cancellation addresses that shared job once through the existing abort owner. The v1 cleanup adapter remains available for source cleanup; it cannot mutate an uncommitted v2 target job.
+
 ### Direct-session import and takeover operations (development)
 
 The released `cli-v0.2.14` and `cli-v0.2.14-preview.1` daemon at
@@ -278,6 +284,28 @@ transcript import, following, takeover, terminal identity, linking, or writer sa
 The probe can be removed only when daemons predating this method are no longer supported.
 Directory validation remains daemon-owned after successful negotiation, and a relative `cwd`
 continues to return `invalid_request` rather than being reclassified as compatibility fallback.
+
+### Priority-pool primary recovery (development)
+
+The group active-member mutation records its cause in the existing
+`state.lastSwitchReason` and `state.lastSwitchAt` fields. Runtime-state refreshes
+preserve recorded provenance. Manual selections, including older clients that
+omit a cause, replace an automatic cause with `manual`; removing or disabling
+the active member does the same when it selects a replacement.
+
+With priority strategy and `autoRestorePrimaryWhenReset` enabled, the canonical
+candidate selector can restore an eligible primary from fresh healthy quota
+observed after an automatic limit fallback, even without a provider reset time
+or surviving member failure marker. Explicit manual provenance prevents this
+override. Older persisted groups without provenance retain the landed-reset
+proof; missing evidence is not treated as an automatic fallback.
+
+The CLI sends the optional `x-happier-connected-service-switch-reason` header,
+leaving the strict V3 mutation body unchanged. The stable and preview server
+readers at `server-v0.2.16` and `server-v0.2.16-preview.1`
+(`22ac8263cfdbcdb845441b9044ff18199cf7652e`) ignore that header and still perform
+the switch, but cannot record its new provenance. The missing-marker recovery
+therefore requires an updated relay. Browser clients do not send this header.
 
 ### Account-pool quota-reset opt-in (development)
 

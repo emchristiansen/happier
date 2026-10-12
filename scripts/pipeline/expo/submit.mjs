@@ -2,12 +2,18 @@
 
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
 
 import { ensureAscApiKeyFile } from './ensure-asc-api-key-file.mjs';
 import { readIosIpaMetadata } from './read-ios-ipa-metadata.mjs';
 import { normalizeInteractiveOverride, resolveExpoInteractivity } from './resolve-expo-interactivity.mjs';
+import { publishGooglePlayProduction, requireGooglePlayCredential, requireGooglePlayVersionCode } from './google-play-publish.mjs';
+import { readBoundStoreNotes } from '../release/release-notes/project-release-notes.mjs';
+import { readAndroidAabMetadata } from './read-android-aab-metadata.mjs';
+import { verifyAndroidPageSize } from './verify-android-page-size.mjs';
+import { parseEasJsonCommandOutput } from './parse-eas-json-command-output.mjs';
 import {
   allowsBestEffortSubmit,
   MOBILE_STORE_SUBMIT_ENVIRONMENT_CHOICES,
@@ -221,7 +227,7 @@ function applyAndroidReleaseStatusOverride(opts) {
   };
 }
 
-function main() {
+async function main() {
   const repoRoot = path.resolve(process.cwd());
   const { values } = parseArgs({
     options: {
@@ -234,6 +240,11 @@ function main() {
       interactive: { type: 'string', default: 'auto' },
       'eas-cli-version': { type: 'string', default: '' },
       'android-release-status': { type: 'string', default: 'draft' },
+      'release-notes-json': { type: 'string', default: '' },
+      'source-sha': { type: 'string', default: '' },
+      'release-id': { type: 'string', default: '' },
+      'app-version': { type: 'string', default: '' },
+      'android-version-code': { type: 'string', default: '' },
       wait: { type: 'string', default: 'true' },
       'dry-run': { type: 'boolean', default: false },
     },
@@ -284,11 +295,34 @@ function main() {
   const androidReleaseStatus = normalizeAndroidReleaseStatus(values['android-release-status']);
 
   const platforms = platformRaw === 'all' ? ['ios', 'android'] : [platformRaw];
+  const productionAndroid = environment === 'production' && platforms.includes('android');
+  let playPublication;
+  if (productionAndroid) {
+    // Preflight before either platform uploads: publication must not silently stop at draft.
+    requireGooglePlayCredential(process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON);
+    if (!waitForSubmit) fail('Production Android publication requires --wait true so the exact uploaded version can be completed with its notes.');
+    if (!submitIdRaw && !submitPathRaw) fail('Production Android publication requires an exact --id build or --path artifact; --latest is not bound to approved notes.');
+    const whatsNew = readBoundStoreNotes({
+      bundlePath: path.resolve(repoRoot, String(values['release-notes-json'] || '')),
+      sourceSha: String(values['source-sha']), releaseId: String(values['release-id']),
+      appVersion: String(values['app-version']), platform: 'android',
+    });
+    playPublication = {
+      packageName: resolveMobileAppEnvironmentConfig(environment).androidPackage,
+      versionCode: '', whatsNew, credentialJson: process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON,
+    };
+  }
   console.log(`[pipeline] expo submit: environment=${formatMobileReleaseEnvironment(environment)} platform=${platformRaw}`);
 
   const projectDirRaw = String(values['project-dir'] ?? '').trim();
   const uiDir = projectDirRaw ? path.resolve(repoRoot, projectDirRaw) : path.join(repoRoot, 'apps', 'ui');
   if (!fs.existsSync(uiDir)) fail(`Expo submit project directory does not exist: ${uiDir}`);
+  if (productionAndroid) {
+    const easConfig = JSON.parse(fs.readFileSync(path.join(uiDir, 'eas.json'), 'utf8'));
+    if (easConfig?.submit?.[submitProfile]?.android?.track !== 'production') {
+      fail('Production Android publication requires a submit profile targeting the production track.');
+    }
+  }
   const submitPathAbs = submitPathRaw ? path.resolve(repoRoot, submitPathRaw) : '';
   if (submitPathAbs) {
     if (!fs.existsSync(submitPathAbs)) {
@@ -340,6 +374,81 @@ function main() {
     fail('EXPO_TOKEN is required for Expo submit.');
   }
 
+  let androidMetadata;
+  let androidSubmitId = submitIdRaw;
+  const verifyAndroidSubmission = async () => {
+    const appEnvOverride = String(process.env.HAPPIER_EXPO_SUBMIT_APP_ENV ?? '').trim();
+    if (productionAndroid && appEnvOverride && appEnvOverride !== 'production') throw new Error('Production Android publication cannot use another APP_ENV.');
+    const appEnv = appEnvOverride || formatMobileReleaseEnvironment(environment);
+    if (dryRun && (!submitPathAbs || !fs.existsSync(submitPathAbs))) {
+      console.log('[dry-run] verify Android 16KB page size, package, app version, versionCode, and exact EAS source/profile against the submitted AAB before upload');
+      androidMetadata = {
+        packageName: playPublication?.packageName, appVersion: values['app-version'],
+        versionCode: values['android-version-code'] || '<from-exact-artifact>',
+      };
+    } else if (submitPathAbs) {
+      if (!submitPathAbs.endsWith('.aab')) throw new Error('Android store submission requires an AAB artifact.');
+      verifyAndroidPageSize({ aabPath: submitPathAbs });
+      androidMetadata = readAndroidAabMetadata({ aabPath: submitPathAbs });
+    } else {
+      // Resolve a legacy nonproduction --latest once, then verify and submit the
+      // same immutable ID. Production already requires an explicit artifact/ID.
+      if (!androidSubmitId) {
+        // Match eas-cli 18.0.1 submit/utils/builds.ts eligibility, including a
+        // newer pending build rather than silently uploading an older one.
+        const builds = ['new', 'in-queue', 'in-progress', 'finished'].flatMap((status) => {
+          const output = execFileSync('npx', ['--yes', `eas-cli@${easCliVersion}`, 'build:list', '--platform', 'android', '--distribution', 'store', '--status', status, '--limit', '1', '--json', '--non-interactive'], {
+            cwd: uiDir, env: { ...process.env, APP_ENV: appEnv }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          });
+          const parsed = parseEasJsonCommandOutput(output, 'eas build:list');
+          if (!Array.isArray(parsed)) throw new Error('Invalid Android EAS build list.');
+          return parsed;
+        }).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+        androidSubmitId = typeof builds[0]?.id === 'string' ? builds[0].id : '';
+        if (!androidSubmitId) throw new Error('No Android store EAS build is available to verify before submission.');
+      }
+      const output = execFileSync('npx', ['--yes', `eas-cli@${easCliVersion}`, 'build:view', androidSubmitId, '--json'], {
+        cwd: uiDir, env: { ...process.env, APP_ENV: appEnv }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const build = parseEasJsonCommandOutput(output, 'eas build:view');
+      if (build?.id !== androidSubmitId || String(build?.platform).toLowerCase() !== 'android' || build?.status !== 'FINISHED') {
+        throw new Error('The selected EAS Android build must finish before page-size verification and upload; retry with its exact --id after completion.');
+      }
+      if (productionAndroid && (build?.gitCommitHash !== values['source-sha'] || build?.buildProfile !== submitProfile)) {
+        throw new Error('The exact EAS Android build must match the approved source SHA, profile, and finished build identity.');
+      }
+      const archiveUrl = build?.artifacts?.applicationArchiveUrl ?? build?.artifacts?.buildUrl;
+      if (typeof archiveUrl !== 'string' || !archiveUrl.startsWith('https://')) throw new Error('Exact EAS build has no downloadable HTTPS Android archive.');
+      const response = await fetch(archiveUrl);
+      if (!response.ok) throw new Error(`Unable to read the exact EAS Android archive (HTTP ${response.status}).`);
+      const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'happier-android-submit-'));
+      const archivePath = path.join(temporaryDir, 'build.aab');
+      try {
+        fs.writeFileSync(archivePath, Buffer.from(await response.arrayBuffer()));
+        verifyAndroidPageSize({ aabPath: archivePath });
+        androidMetadata = readAndroidAabMetadata({ aabPath: archivePath });
+      } finally {
+        fs.rmSync(temporaryDir, { recursive: true, force: true });
+      }
+      if (androidMetadata.appVersion !== build.appVersion || androidMetadata.versionCode !== String(build.appBuildVersion ?? '')) {
+        throw new Error('Exact EAS build version does not match its Android archive.');
+      }
+    }
+  };
+  if (productionAndroid) await verifyAndroidSubmission();
+
+  if (playPublication) {
+    const metadata = androidMetadata;
+    if (metadata.packageName !== playPublication.packageName || metadata.appVersion !== values['app-version']) {
+      fail('Android artifact package/app version does not match the production target and bound release notes.');
+    }
+    playPublication.versionCode = dryRun && metadata.versionCode === '<from-exact-artifact>'
+      ? metadata.versionCode : requireGooglePlayVersionCode(metadata.versionCode);
+    if (values['android-version-code'] && values['android-version-code'] !== playPublication.versionCode) {
+      fail('Requested Android versionCode does not match the exact submitted artifact.');
+    }
+  }
+
   if (platforms.includes('ios') && nonInteractive) {
     ensureIosSubmitAscApiKeyFile({ repoRoot, uiDir, submitProfile, dryRun });
   }
@@ -350,7 +459,8 @@ function main() {
           repoRoot,
           uiDir,
           submitProfile,
-          androidReleaseStatus,
+          // Play commits approved notes and completed together, after EAS has uploaded a draft.
+          androidReleaseStatus: productionAndroid ? 'draft' : androidReleaseStatus,
           dryRun,
         })
       : () => {};
@@ -358,9 +468,20 @@ function main() {
   let hadFailure = false;
   try {
     for (const platform of platforms) {
+      if (platform === 'android' && !productionAndroid) {
+        try { await verifyAndroidSubmission(); }
+        catch (error) {
+          if (!allowsBestEffortSubmit(environment)) throw error;
+          hadFailure = true;
+          console.error(error instanceof Error ? error.message : String(error));
+          console.log(`::warning::Expo submit failed for android in ${formatMobileReleaseEnvironment(environment)}; artifact verification refused upload.`);
+          continue;
+        }
+      }
       const baseArgs = ['--yes', `eas-cli@${easCliVersion}`, 'submit', '--platform', platform, '--profile', submitProfile];
-      const submitArgs = submitIdRaw
-        ? [...baseArgs, '--id', submitIdRaw]
+      const platformSubmitId = platform === 'android' ? androidSubmitId : submitIdRaw;
+      const submitArgs = platformSubmitId
+        ? [...baseArgs, '--id', platformSubmitId]
         : submitPathAbs
           ? [...baseArgs, '--path', submitPathAbs]
           : [...baseArgs, '--latest'];
@@ -384,6 +505,13 @@ function main() {
         hadFailure = true;
         console.log(`::warning::Expo submit failed for ${platform} in ${formatMobileReleaseEnvironment(environment)}; continuing so successful platform submissions are preserved.`);
       }
+      if (platform === 'android' && playPublication && result.ok) {
+        if (dryRun) {
+          console.log(`[dry-run] Google Play production publication: package=${playPublication.packageName} versionCode=${playPublication.versionCode} releaseStatus=completed (approved notes bound; public availability unverified)`);
+        } else {
+          console.log(JSON.stringify(await publishGooglePlayProduction(playPublication)));
+        }
+      }
     }
   } finally {
     restoreAndroidReleaseStatus();
@@ -397,4 +525,7 @@ function main() {
   }
 }
 
-main();
+main().catch((error) => {
+  console.error(JSON.stringify({ status: 'publication_failed', code: error.code ?? 'submit_failed', message: error.message, httpStatus: error.httpStatus, operation: error.operation, apiStatus: error.apiStatus, apiMessage: error.apiMessage, apiReasons: error.apiReasons }));
+  process.exitCode = 1;
+});

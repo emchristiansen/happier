@@ -22,6 +22,11 @@ import {
   requestSessionPendingQueueWakeV1,
 } from './sessions/pendingQueueWake';
 import { publishSessionPendingQueueWake } from './sessions/publishSessionPendingQueueWake';
+import { checkRuntimeAuthUsageLimitRecovery } from './connectedServices/runtimeAuth/checkRuntimeAuthUsageLimitRecovery';
+import { isCurrentUsageLimitRecoverySource } from './connectedServices/runtimeAuth/isCurrentUsageLimitRecoveryCredential';
+import { continueSessionAfterUsageLimitReset } from './connectedServices/continuation/continueSessionAfterUsageLimitReset';
+import { buildRuntimeAuthUsageLimitRecoveryMetadataUpdater } from './connectedServices/runtimeAuth/projection/connectedServiceRuntimeAuthRecoveryUsageLimitMetadata';
+import { SessionUsageLimitRecoveryV1Schema } from '@happier-dev/protocol';
 import { createRuntimeAuthRecoverySchedulerForDaemon } from './connectedServices/runtimeAuth/createRuntimeAuthRecoverySchedulerForDaemon';
 import { projectTemporaryThrottleRecoveryMetadata } from './connectedServices/runtimeAuth/projection/temporaryThrottleRecoveryMetadata';
 import { deriveConnectedServiceBrokerRefreshToken } from './connectedServices/broker/brokerRefreshCapabilityToken';
@@ -67,7 +72,7 @@ import {
   notifyTerminalAttachmentRetiredThroughCatalog,
 } from '@/backends/catalog';
 import { CATALOG_AGENT_IDS } from '@/backends/types';
-import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
+import { processInstanceFingerprintMatches, readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
 import {
   writeDaemonStateIfLockOwned,
   writeConnectedServiceBrokerState,
@@ -126,7 +131,7 @@ import {
 } from './sessions/claudeEndpointStateEnv';
 import { HAPPIER_CLAUDE_ENDPOINT_STATE_ENV_KEY } from '@/backends/claude/endpointRecovery/claudeEndpointArtifacts';
 import { buildTerminalAttachmentMetadataFromHostHandle } from '@/agent/runtime/terminal/attachmentMetadata';
-import { createOnHappySessionWebhook } from './sessions/onHappySessionWebhook';
+import { adoptReportedHappySessionId, adoptReportedSessionRunnerIdentity, correlateTrackedSessionReport, createOnHappySessionWebhook } from './sessions/onHappySessionWebhook';
 import { applyTrackedSessionTurnLifecycle } from './sessions/applyTrackedSessionTurnLifecycle';
 import { connectedServiceTurnLifecycleContinue } from './connectedServices/connectedServiceTurnLifecycleContract';
 import { resolveSessionRuntimeSnapshot } from './sessions/runtimeSnapshot/resolveSessionRuntimeSnapshot';
@@ -163,7 +168,9 @@ import { waitForTrackedRunnerProcessesExit } from './sessions/waitForTrackedRunn
 import { readProcessRunState } from './processRunState';
 import { resolveSpawnWebhookResult } from './sessions/resolveSpawnWebhookResult';
 import {
+  classifyTrackedSessionRunnerPresence,
   isSessionRunnerActive as isSessionRunnerActiveInDaemon,
+  probeSessionRunnerPresence,
   probeSessionRunnerServiceability as probeSessionRunnerServiceabilityInDaemon,
   resolveSessionRunnerResumeDecision,
   type SessionRunnerServiceabilityProbe,
@@ -422,6 +429,7 @@ import {
   type ConnectedServiceMaterializationIdentityV1,
   type RestartSessionRunnerRequestV1,
   type SessionRunnerRestartDisabledReason,
+  SessionTerminalMetadataSchema,
   writeProviderAccountUsageRecordIdToMetadata,
   type SessionContinuationRecoveryIdentityV1,
   type SessionContinuationResumePromptModeV1,
@@ -797,10 +805,14 @@ async function listRetainedConnectedServiceMaterializationIdentityIds(params: Re
 async function resumeInactiveSessionWhenUsageLimitReady(params: Readonly<{
   spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
   fallbackMachineId: string;
+  credentials: Credentials;
+  customResumePrompt?: string | null;
   sessionId: string;
   rawSession: RawSessionRecord;
   metadata: Record<string, unknown>;
 }>): Promise<boolean> {
+  const recovery = SessionUsageLimitRecoveryV1Schema.safeParse(params.metadata.sessionUsageLimitRecoveryV1);
+  if (!recovery.success) return false;
   const spawnOptions = buildInactiveUsageLimitResumeSpawnOptions({
     sessionId: params.sessionId,
     fallbackMachineId: params.fallbackMachineId,
@@ -808,8 +820,20 @@ async function resumeInactiveSessionWhenUsageLimitReady(params: Readonly<{
     metadata: params.metadata,
   });
   if (!spawnOptions) return false;
-  const result = await params.spawnSession(spawnOptions);
-  return result.type === 'success';
+  const result = await continueSessionAfterUsageLimitReset({
+    ...params, recovery: recovery.data, nowMs: Date.now(),
+    isCurrent: async () => {
+      const fresh = await fetchSessionByIdCompat({ token: params.credentials.token, sessionId: params.sessionId });
+      if (!fresh || fresh.archivedAt != null) return false;
+      const metadata = tryDecryptSessionMetadata({ credentials: params.credentials, rawSession: fresh });
+      const current = SessionUsageLimitRecoveryV1Schema.safeParse(metadata?.sessionUsageLimitRecoveryV1);
+      return current.success && current.data.status !== 'cancelled' && current.data.status !== 'exhausted'
+        && current.data.issueFingerprint === recovery.data.issueFingerprint
+        && current.data.armedAtMs === recovery.data.armedAtMs;
+    },
+    ensureRuntime: async () => (await params.spawnSession(spawnOptions)).type === 'success',
+  });
+  return result.status === 'continued';
 }
 
 async function persistExplicitSessionStopRecoveryCancellation(params: Readonly<{
@@ -2089,31 +2113,90 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         const resolveAcceptedExistingSessionStartup = async (
           sessionId: string,
           requestedSpawnNonce: string | undefined,
+          backendTarget: BackendTargetRefV1,
         ): Promise<SpawnSessionResult | null> => {
-          for (const [pid, tracked] of pidToTrackedSession) {
-            const trackedExistingSessionId = typeof tracked.spawnOptions?.existingSessionId === 'string'
-              ? tracked.spawnOptions.existingSessionId.trim()
-              : '';
-            if (
-              tracked.startedBy !== 'daemon'
-              || tracked.pid !== pid
-              || trackedExistingSessionId !== sessionId
-              || !pidToAwaiter.has(pid)
-            ) {
-              continue;
+          const isPendingDaemonChild = (tracked: TrackedSession): boolean =>
+            tracked.startedBy === 'daemon'
+            && pidToTrackedSession.get(tracked.pid) === tracked
+            && pidToAwaiter.has(tracked.pid)
+            && tracked.reportMarkerCustody?.retiring !== true;
+          const matchesSession = (tracked: TrackedSession): boolean =>
+            tracked.happySessionId?.trim() === sessionId
+            || tracked.spawnOptions?.existingSessionId?.trim() === sessionId;
+          const resolveTrackedStartup = async (): Promise<SpawnSessionResult | null> => {
+            for (const tracked of pidToTrackedSession.values()) {
+              if (!isPendingDaemonChild(tracked) || !matchesSession(tracked) || tracked.stopRequestedAtMs !== undefined) continue;
+              const presence = await classifyTrackedSessionRunnerPresence({ tracked });
+              // OS reads can overlap webhook completion, retirement or wrapper promotion.
+              if (presence !== 'present' || !isPendingDaemonChild(tracked) || !matchesSession(tracked)
+                || tracked.stopRequestedAtMs !== undefined) continue;
+              return {
+                type: 'success',
+                sessionId,
+                runnerAcceptance: resolveExistingRunnerAcceptance({
+                  requestedSpawnNonce,
+                  trackedSpawnNonces: [tracked.spawnOptions?.spawnNonce],
+                }),
+              };
             }
-            const runState = await readProcessRunState(pid).catch(() => null);
-            if (runState !== 'servable') continue;
+            return null;
+          };
+          const knownStartup = await resolveTrackedStartup();
+          if (knownStartup) return knownStartup;
+          const isUnboundFreshChild = (tracked: TrackedSession): boolean =>
+            isPendingDaemonChild(tracked)
+            && !tracked.spawnOptions?.existingSessionId?.trim()
+            && (!tracked.happySessionId?.trim() || /^PID-\d+$/.test(tracked.happySessionId.trim()));
+          if (!Array.from(pidToTrackedSession.values()).some(isUnboundFreshChild)) return null;
+          const knownPresence = await probeSessionRunnerPresence({ sessionId, trackedSessions: pidToTrackedSession.values() });
+          if (knownPresence.state !== 'runner_absent') return null;
+
+          // A session row can be published before its creating child receives the ID,
+          // claims its runner lock and reports the webhook. Resolve only that fresh-child
+          // gap through the existing metadata/encryption owner; never wait on unrelated children.
+          const attachContext = await resolveExistingSessionAttachContext({
+            token: credentials.token,
+            credentials,
+            sessionId,
+            backendTarget,
+          });
+          if (!attachContext.ok) {
+            logger.warn('[DAEMON RUN] Unable to verify a pending fresh session owner', { sessionId, reason: attachContext.reason });
+            return mapExistingSessionAttachFailureToSpawnError(attachContext.reason);
+          }
+          const metadata = attachContext.metadata;
+          const pid = metadata?.hostPid;
+          if (!metadata || metadata.machineId !== machineId || metadata.startedBy !== 'daemon'
+            || (metadata.happyHomeDir && metadata.happyHomeDir !== configuration.happyHomeDir)
+            || typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) return null;
+          const terminal = SessionTerminalMetadataSchema.safeParse(metadata.terminal);
+          const tracked = correlateTrackedSessionReport({
+            pidToTrackedSession,
+            pidToAwaiter,
+            pid,
+            metadata: { startedBy: 'daemon', ...(terminal.success ? { terminal: terminal.data } : {}) },
+          });
+          if (!tracked || !isUnboundFreshChild(tracked)) return null;
+          // The row's PID can outlive its process. Verify the creating runner's generation,
+          // not a wrapper's generation, before binding an otherwise unknown Session id.
+          const expectedFingerprint = readNonEmptyMetadataString(metadata.hostProcessInstanceFingerprint);
+          const currentFingerprint = readProcessInstanceFingerprintSync(pid);
+          if (!expectedFingerprint || !currentFingerprint) {
+            logger.warn('[DAEMON RUN] Refusing unproven fresh session ownership', { sessionId, pid });
             return {
-              type: 'success',
-              sessionId,
-              runnerAcceptance: resolveExistingRunnerAcceptance({
-                requestedSpawnNonce,
-                trackedSpawnNonces: [tracked.spawnOptions?.spawnNonce],
-              }),
+              type: 'error',
+              errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
+              errorMessage: 'The existing session runtime could not be verified. Retry resume after its startup completes.',
             };
           }
-          return null;
+          if (!processInstanceFingerprintMatches(expectedFingerprint, currentFingerprint)) return null;
+          adoptReportedSessionRunnerIdentity(tracked, pid, currentFingerprint);
+          const presence = await classifyTrackedSessionRunnerPresence({ tracked });
+          if (presence === 'absent' || !isUnboundFreshChild(tracked)) return null;
+          // Identity is learned here; readiness, marker promotion and acceptance completion
+          // still belong to the webhook. Unknown/stopped owners go through normal fencing.
+          adoptReportedHappySessionId(tracked, sessionId);
+          return await resolveTrackedStartup();
         };
 
         const spawnRecentSuccessTtlMs = resolvePositiveIntEnv(
@@ -3088,6 +3171,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               const acceptedExistingSessionStartup = await resolveAcceptedExistingSessionStartup(
                 normalizedExistingSessionId,
                 normalizedOptions.spawnNonce,
+                normalizedOptions.backendTarget ?? { kind: 'builtInAgent', agentId: resolveCatalogAgentId(null) },
               );
               if (acceptedExistingSessionStartup) {
                 logger.debug('[DAEMON RUN] Rejoining accepted existing-session launch while its exact child awaits the session webhook', {
@@ -6010,6 +6094,37 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           });
         };
 
+        const authorizeRuntimeAuthFailureForSession = async (input: Readonly<{
+          sessionId: string;
+          classification: ConnectedServiceRuntimeFailureClassification | null;
+          recoveryInvocationSource?: 'scheduler_retry';
+        }>) => {
+          const { sessionId, classification } = input;
+
+          const runtimeAuthApply = classification
+            ? await resolveRuntimeAuthApplyForFailureSource({
+                sessionId,
+                serviceId: ConnectedServiceIdSchema.parse(classification.serviceId),
+              })
+            : null;
+          return await authorizeConnectedServiceRuntimeAuthFailureSource({
+            recoveryInvocationSource: input.recoveryInvocationSource,
+            getChildren: getCurrentChildren,
+            sessionId,
+            classification,
+            resolveDurableSessionForRuntimeAuthRecovery: async ({ sessionId: durableSessionId, classification: durableClassification }) =>
+              await resolveDurableConnectedServiceRuntimeAuthRecoverySession({
+                credentials,
+                sessionId: durableSessionId,
+                serviceId: durableClassification.serviceId,
+              }),
+            resolveRegisteredRuntimeAuthFailureSource: resolveRegisteredRuntimeAuthFailureSourceForSession,
+            resolveCurrentRuntimeAuthFailureSource: resolveCurrentRuntimeAuthFailureSourceForSession,
+            resolveProviderQualifiedRuntimeAuthFailureSource,
+            runtimeAuthApply,
+          });
+        };
+
         const handleConnectedServiceRuntimeAuthRecovery = async (input: Readonly<{
           sessionId: string;
           switchesThisTurn: number;
@@ -6571,6 +6686,65 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             5,
             { min: 1, max: 25 },
           ),
+          continueAfterUsageLimitReset: async (intent) => {
+            const rawSession = await fetchSessionByIdCompat({ token: credentials.token, sessionId: intent.sessionId });
+            if (!rawSession) throw new Error('usage_limit_recovery_session_unavailable');
+            const storedMetadata = tryDecryptSessionMetadata({ credentials, rawSession });
+            const project = buildRuntimeAuthUsageLimitRecoveryMetadataUpdater({ intent });
+            if (!storedMetadata || !project) return { status: 'recovery_superseded', reason: 'usage_limit_recovery_source_unavailable' };
+            const metadata = project(storedMetadata);
+            const recovery = SessionUsageLimitRecoveryV1Schema.safeParse(metadata.sessionUsageLimitRecoveryV1);
+            if (!recovery.success) return { status: 'recovery_superseded', reason: 'usage_limit_recovery_source_unavailable' };
+            const recoveryKey = buildRuntimeAuthRecoveryKey(intent);
+            const isCurrentRecovery = () => {
+              const current = runtimeAuthRecoveryScheduler?.readByKey(recoveryKey);
+              if (!current || current.attemptId !== intent.attemptId
+                || current.status === 'cancelled' || current.status === 'exhausted' || current.status === 'recovered'
+                || current.classification.resetsAtMs !== intent.classification.resetsAtMs
+                || (current.resumePromptMode ?? 'standard') !== (intent.resumePromptMode ?? 'standard')) return false;
+              return true;
+            };
+            const isCurrent = async () => {
+              const binding = connectedServiceRuntimeRegistry.getBySessionId(intent.sessionId)
+                ?.activeBindings.find((candidate) => candidate.serviceId === intent.serviceId);
+              if (binding && (binding.profileId !== intent.profileId || binding.groupId !== intent.groupId)) return false;
+              const hasLiveRunner = Boolean(connectedServiceRuntimeRegistry.getBySessionId(intent.sessionId)
+                || getCurrentChildren().some((child) => child.happySessionId === intent.sessionId));
+              return await isCurrentUsageLimitRecoverySource({
+                classification: intent.classification, isCurrentRecovery,
+                resolveCredential: async () => {
+                  if (!intent.profileId) return null;
+                  const serviceId = ConnectedServiceIdSchema.parse(intent.serviceId);
+                  const credential = (await resolveConnectedServiceCredentialsWithRevisions({
+                    credentials, api, bindings: [{ serviceId, profileId: intent.profileId }],
+                  })).get(serviceId);
+                  return credential ? { record: credential.record,
+                    credentialRevision: credential.revisionSemantics === 'revisioned' ? credential.credentialRevision : null } : null;
+                },
+                ...(hasLiveRunner ? { authorizeLiveSource: async () => {
+                  const authorization = await authorizeRuntimeAuthFailureForSession({
+                    sessionId: intent.sessionId, classification: intent.classification, recoveryInvocationSource: 'scheduler_retry',
+                  });
+                  return authorization.status === 'authorized' || authorization.status === 'current_credential_revision';
+                } } : {}),
+              });
+            };
+            const spawnOptions = buildInactiveUsageLimitResumeSpawnOptions({
+              sessionId: intent.sessionId, fallbackMachineId: machineId, rawSession, metadata,
+            });
+            const result = await continueSessionAfterUsageLimitReset({
+              credentials, sessionId: intent.sessionId, rawSession, metadata, recovery: recovery.data,
+              customResumePrompt: readContinuationCustomResumePrompt(getActiveAccountSettingsSnapshot()?.settings ?? null),
+              nowMs: Date.now(), isCurrent,
+              ensureRuntime: async () => Boolean(spawnOptions && (await spawnSession(spawnOptions)).type === 'success'),
+            });
+            if (result.status === 'continued') return { ok: true, status: 'continuation_enqueued' };
+            if (result.status === 'runtime_unavailable') return { status: 'daemon_lifecycle_unavailable' };
+            if (result.status === 'suppressed' || result.status === 'disabled') {
+              return { status: 'continuation_cancelled', reason: `usage_limit_continuation_${result.status}` };
+            }
+            return { status: 'recovery_superseded', reason: `usage_limit_continuation_${result.status}` };
+          },
           recover: handleConnectedServiceRuntimeAuthRecovery,
           gate: ({ intent }) => {
             const nowMs = Date.now();
@@ -7075,29 +7249,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         return resultWithDiagnostics;
       },
       handleConnectedServiceRuntimeAuthFailure: handleConnectedServiceRuntimeAuthRecovery,
-      authorizeConnectedServiceRuntimeAuthFailure: async ({ sessionId, classification }) => {
-        const runtimeAuthApply = classification
-          ? await resolveRuntimeAuthApplyForFailureSource({
-              sessionId,
-              serviceId: ConnectedServiceIdSchema.parse(classification.serviceId),
-            })
-          : null;
-        return await authorizeConnectedServiceRuntimeAuthFailureSource({
-          getChildren: getCurrentChildren,
-          sessionId,
-          classification,
-          resolveDurableSessionForRuntimeAuthRecovery: async ({ sessionId: durableSessionId, classification: durableClassification }) =>
-            await resolveDurableConnectedServiceRuntimeAuthRecoverySession({
-              credentials,
-              sessionId: durableSessionId,
-              serviceId: durableClassification.serviceId,
-          }),
-          resolveRegisteredRuntimeAuthFailureSource: resolveRegisteredRuntimeAuthFailureSourceForSession,
-          resolveCurrentRuntimeAuthFailureSource: resolveCurrentRuntimeAuthFailureSourceForSession,
-          resolveProviderQualifiedRuntimeAuthFailureSource,
-          runtimeAuthApply,
-        });
-      },
+      authorizeConnectedServiceRuntimeAuthFailure: authorizeRuntimeAuthFailureForSession,
       resolveConnectedServiceRuntimeAuthResumePromptMode: async ({ classification, explicit }) =>
         await resolveContinuationResumePromptMode({
           credentials,
@@ -8590,10 +8742,15 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     }
                   : {}),
               }, {
+                checkRuntimeAuthUsageLimitRecovery: async (input) => await checkRuntimeAuthUsageLimitRecovery({
+                  scheduler: runtimeAuthRecoveryScheduler, ...input,
+                }),
                 resumeInactiveSessionWhenUsageLimitReady: async ({ sessionId, rawSession, metadata }) =>
                   await resumeInactiveSessionWhenUsageLimitReady({
                     spawnSession,
                     fallbackMachineId: machineId,
+                    credentials,
+                    customResumePrompt: readContinuationCustomResumePrompt(getActiveAccountSettingsSnapshot()?.settings ?? null),
                     sessionId,
                     rawSession,
                     metadata,
