@@ -80,6 +80,15 @@ test('promote-ui prepares OTA bytes without secrets and publishes only the bound
   assert.match(promoteText, /actions\/download-artifact@/);
   assert.match(promoteText, /EXPO_TOKEN/);
   assert.doesNotMatch(promoteText, /ui-mobile-release/);
+  for (const [uploadName, downloadName, prefix] of [
+    ['Upload prepared OTA artifacts', 'Download prepared OTA artifacts', 'ui-ota'],
+    ['Upload release notes assets', 'Download release notes assets', 'ui-release-notes'],
+  ]) {
+    const upload = parsed.jobs.validate_candidate.steps.find((step) => step.name === uploadName);
+    const download = parsed.jobs.promote.steps.find((step) => step.name === downloadName);
+    assert.equal(upload.with.name, `${prefix}-\${{ inputs.environment }}-\${{ needs.apply_bump.outputs.release_sha }}`);
+    assert.equal(download.with.name, upload.with.name);
+  }
 });
 
 test('promote-ui installs the app-config runtime before publishing prepared OTA bytes', async () => {

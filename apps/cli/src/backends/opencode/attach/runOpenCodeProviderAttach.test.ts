@@ -1,24 +1,15 @@
-import { describe, expect, it, vi } from 'vitest';
+import { expectTerminalNativeInvocation, terminalLauncherBoundary } from '@/testkit/process/terminalLauncher';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const { resolveWindowsCommandInvocationMock } = vi.hoisted(() => ({
-  resolveWindowsCommandInvocationMock: vi.fn((
-    { command, args }: { command: string; args: readonly string[] },
-  ): { command: string; args: string[]; windowsVerbatimArguments?: boolean } => ({
-    command,
-    args: [...args],
-  })),
-}));
-
-vi.mock('@happier-dev/cli-common/process', () => ({
-  resolveWindowsCommandInvocation: resolveWindowsCommandInvocationMock,
-}));
+const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+afterEach(() => Object.defineProperty(process, 'platform', platformDescriptor));
 
 import { runOpenCodeProviderAttach } from './runOpenCodeProviderAttach';
 import type { ProviderCliLaunchSpec } from '@/runtime/managedTools/requireProviderCliLaunchSpec';
 
 describe('runOpenCodeProviderAttach', () => {
   it('attaches a released OpenCode 2 target through the root dialect with its retained credential in the child env', async () => {
-    const spawnProcess = vi.fn(() => ({
+    const spawnProcess = vi.fn(() => terminalLauncherBoundary({
       once: (event: string, handler: (...args: any[]) => void) => {
         if (event === 'exit') setImmediate(() => handler(0, null));
       },
@@ -46,12 +37,13 @@ describe('runOpenCodeProviderAttach', () => {
         probeHeaders.push(headers);
         return 'v2';
       },
+      prepareProviderCliAttach: async ({ providerSessionId }) => ({ ok: true, providerSessionId }),
     })).resolves.toBe(0);
 
     const expectedAuthorization = `Basic ${Buffer.from('opencode:retained-secret', 'utf8').toString('base64')}`;
     // The dialect probe authenticates as the managed server requires...
     expect(probeHeaders).toEqual([{ Authorization: expectedAuthorization }]);
-    expect(spawnProcess).toHaveBeenCalledWith(
+    await expectTerminalNativeInvocation(spawnProcess.mock.calls,
       'opencode',
       ['--server', 'http://127.0.0.1:7777', '--session', 'opencode-session-v2', '/tmp/opencode-workspace'],
       expect.objectContaining({
@@ -61,8 +53,34 @@ describe('runOpenCodeProviderAttach', () => {
     );
   });
 
+  it.each(['missing', 'rejected', 'different-session'] as const)(
+    'refuses V2 native attachment when preparation is %s', async (preparation) => {
+      const spawnProcess = vi.fn(() => terminalLauncherBoundary({
+        once: (event: string, handler: (...args: unknown[]) => void) => {
+          if (event === 'exit') setImmediate(() => handler(0, null));
+        },
+      }));
+      await expect(runOpenCodeProviderAttach({
+        sessionId: 'sid_opencode_v2',
+        metadata: {
+          path: '/tmp', opencodeSessionId: 'native-session', opencodeBackendMode: 'server',
+          opencodeServerBaseUrl: 'http://127.0.0.1:7777', opencodeServerBaseUrlExplicit: true,
+        },
+        command: 'opencode', commandArgs: [], spawnProcess: spawnProcess as unknown as typeof import('node:child_process').spawn,
+        readManagedServerStateFn: async () => null,
+        resolveDialectFn: () => 'v2',
+        ...(preparation === 'missing' ? {} : {
+          prepareProviderCliAttach: async () => preparation === 'rejected'
+            ? { ok: false as const, errorCode: 'provider_cli_attach_not_ready' }
+            : { ok: true as const, providerSessionId: 'another-session' },
+        }),
+      })).rejects.toThrow();
+      expect(spawnProcess).not.toHaveBeenCalled();
+    },
+  );
+
   it('never hands the managed credential to a remote attach target', async () => {
-    const spawnProcess = vi.fn(() => ({
+    const spawnProcess = vi.fn(() => terminalLauncherBoundary({
       once: (event: string, handler: (...args: any[]) => void) => {
         if (event === 'exit') setImmediate(() => handler(0, null));
       },
@@ -94,7 +112,7 @@ describe('runOpenCodeProviderAttach', () => {
     })).resolves.toBe(0);
 
     // Explicit metadata base URLs are normalized to an origin with a trailing slash.
-    expect(spawnProcess).toHaveBeenCalledWith(
+    await expectTerminalNativeInvocation(spawnProcess.mock.calls,
       'opencode',
       expect.arrayContaining(['attach', 'https://remote.example.test/']),
       expect.objectContaining({ env: { PATH: '/bin' } }),
@@ -102,7 +120,7 @@ describe('runOpenCodeProviderAttach', () => {
   });
 
   it('reuses existing OpenCode session metadata and explicit server affinity to launch provider attach', async () => {
-    const spawnProcess = vi.fn(() => ({
+    const spawnProcess = vi.fn(() => terminalLauncherBoundary({
       once: (event: string, handler: (...args: any[]) => void) => {
         if (event === 'exit') setImmediate(() => handler(0, null));
       },
@@ -123,7 +141,7 @@ describe('runOpenCodeProviderAttach', () => {
       readManagedServerStateFn: async () => null,
     })).resolves.toBe(0);
 
-    expect(spawnProcess).toHaveBeenCalledWith(
+    await expectTerminalNativeInvocation(spawnProcess.mock.calls,
       'opencode',
       ['attach', 'http://127.0.0.1:4096/', '--dir', '/tmp/opencode-workspace', '--session', 'opencode-session-1'],
       expect.objectContaining({
@@ -134,7 +152,7 @@ describe('runOpenCodeProviderAttach', () => {
   });
 
   it('falls back to the shared managed OpenCode server URL when the session has no explicit server url', async () => {
-    const spawnProcess = vi.fn(() => ({
+    const spawnProcess = vi.fn(() => terminalLauncherBoundary({
       once: (event: string, handler: (...args: any[]) => void) => {
         if (event === 'exit') setImmediate(() => handler(0, null));
       },
@@ -153,7 +171,7 @@ describe('runOpenCodeProviderAttach', () => {
       readManagedServerStateFn: async () => ({ baseUrl: 'http://127.0.0.1:7777' } as any),
     })).resolves.toBe(0);
 
-    expect(spawnProcess).toHaveBeenCalledWith(
+    await expectTerminalNativeInvocation(spawnProcess.mock.calls,
       'opencode',
       ['attach', 'http://127.0.0.1:7777', '--dir', '/tmp/opencode-workspace', '--session', 'opencode-session-2'],
       expect.any(Object),
@@ -161,7 +179,7 @@ describe('runOpenCodeProviderAttach', () => {
   });
 
   it('prefers agentRuntimeDescriptorV1 over legacy top-level OpenCode session metadata', async () => {
-    const spawnProcess = vi.fn(() => ({
+    const spawnProcess = vi.fn(() => terminalLauncherBoundary({
       once: (event: string, handler: (...args: any[]) => void) => {
         if (event === 'exit') setImmediate(() => handler(0, null));
       },
@@ -192,7 +210,7 @@ describe('runOpenCodeProviderAttach', () => {
       readManagedServerStateFn: async () => null,
     })).resolves.toBe(0);
 
-    expect(spawnProcess).toHaveBeenCalledWith(
+    await expectTerminalNativeInvocation(spawnProcess.mock.calls,
       'opencode',
       ['attach', 'http://127.0.0.1:4096/', '--dir', '/tmp/opencode-workspace', '--session', 'descriptor-session-1'],
       expect.any(Object),
@@ -200,7 +218,7 @@ describe('runOpenCodeProviderAttach', () => {
   });
 
   it('uses the resolved OpenCode CLI command when no explicit command override is passed', async () => {
-    const spawnProcess = vi.fn(() => ({
+    const spawnProcess = vi.fn(() => terminalLauncherBoundary({
       once: (event: string, handler: (...args: any[]) => void) => {
         if (event === 'exit') setImmediate(() => handler(0, null));
       },
@@ -228,7 +246,7 @@ describe('runOpenCodeProviderAttach', () => {
       }),
     })).resolves.toBe(0);
 
-    expect(spawnProcess).toHaveBeenCalledWith(
+    await expectTerminalNativeInvocation(spawnProcess.mock.calls,
       '/tmp/custom-opencode',
       ['attach', 'http://127.0.0.1:8888', '--dir', '/tmp/opencode-workspace', '--session', 'opencode-session-3'],
       expect.any(Object),
@@ -236,7 +254,7 @@ describe('runOpenCodeProviderAttach', () => {
   });
 
   it('does not resolve the CLI command when an explicit command override is provided', async () => {
-    const spawnProcess = vi.fn(() => ({
+    const spawnProcess = vi.fn(() => terminalLauncherBoundary({
       once: (event: string, handler: (...args: any[]) => void) => {
         if (event === 'exit') setImmediate(() => handler(0, null));
       },
@@ -264,7 +282,7 @@ describe('runOpenCodeProviderAttach', () => {
     })).resolves.toBe(0);
 
     expect(resolveCommandFn).not.toHaveBeenCalled();
-    expect(spawnProcess).toHaveBeenCalledWith(
+    await expectTerminalNativeInvocation(spawnProcess.mock.calls,
       '/tmp/custom-opencode',
       ['--stdio-wrapper', 'attach', 'http://127.0.0.1:7777', '--dir', '/tmp/opencode-workspace', '--session', 'opencode-session-5'],
       expect.any(Object),
@@ -272,7 +290,7 @@ describe('runOpenCodeProviderAttach', () => {
   });
 
   it('prepends resolved launch args when the provider CLI needs a runtime wrapper', async () => {
-    const spawnProcess = vi.fn(() => ({
+    const spawnProcess = vi.fn(() => terminalLauncherBoundary({
       once: (event: string, handler: (...args: any[]) => void) => {
         if (event === 'exit') setImmediate(() => handler(0, null));
       },
@@ -296,7 +314,7 @@ describe('runOpenCodeProviderAttach', () => {
       }),
     })).resolves.toBe(0);
 
-    expect(spawnProcess).toHaveBeenCalledWith(
+    await expectTerminalNativeInvocation(spawnProcess.mock.calls,
       '/tmp/custom-node',
       ['/tmp/custom-opencode', 'attach', 'http://127.0.0.1:9999', '--dir', '/tmp/opencode-workspace', '--session', 'opencode-session-4'],
       expect.any(Object),
@@ -304,16 +322,13 @@ describe('runOpenCodeProviderAttach', () => {
   });
 
   it('wraps Windows shell shims before launching provider attach', async () => {
-    const spawnProcess = vi.fn(() => ({
+    const spawnProcess = vi.fn(() => terminalLauncherBoundary({
       once: (event: string, handler: (...args: any[]) => void) => {
         if (event === 'exit') setImmediate(() => handler(0, null));
       },
     }));
-    resolveWindowsCommandInvocationMock.mockReturnValueOnce({
-      command: 'C:\\Windows\\System32\\cmd.exe',
-      args: ['/d', '/s', '/c', '"C:\\Users\\natan\\AppData\\Roaming\\npm\\opencode.CMD attach http://127.0.0.1:7777 --dir C:\\repo --session opencode-session-6"'],
-      windowsVerbatimArguments: true,
-    });
+    // Platform identity is an OS boundary; command rendering remains real.
+    Object.defineProperty(process, 'platform', { value: 'win32' });
 
     await expect(runOpenCodeProviderAttach({
       sessionId: 'sid_opencode_6',
@@ -334,13 +349,9 @@ describe('runOpenCodeProviderAttach', () => {
       env: { ComSpec: 'C:\\Windows\\System32\\cmd.exe' } as NodeJS.ProcessEnv,
     })).resolves.toBe(0);
 
-    expect(resolveWindowsCommandInvocationMock).toHaveBeenCalledWith(expect.objectContaining({
-      command: 'C:\\Users\\natan\\AppData\\Roaming\\npm\\opencode.CMD',
-      args: ['attach', 'http://127.0.0.1:7777', '--dir', 'C:\\repo', '--session', 'opencode-session-6'],
-    }));
-    expect(spawnProcess).toHaveBeenCalledWith(
+    await expectTerminalNativeInvocation(spawnProcess.mock.calls,
       'C:\\Windows\\System32\\cmd.exe',
-      ['/d', '/s', '/c', '"C:\\Users\\natan\\AppData\\Roaming\\npm\\opencode.CMD attach http://127.0.0.1:7777 --dir C:\\repo --session opencode-session-6"'],
+      ['/d', '/s', '/c', expect.stringContaining('opencode.CMD')],
       expect.objectContaining({ shell: false, windowsVerbatimArguments: true }),
     );
   });

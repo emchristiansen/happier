@@ -9,6 +9,7 @@ import {
     getSelectableModelIdsForSession,
     hasDynamicModelListForSession,
     isModelSelectableForSession,
+    supportsFreeformModelSelectionForSession,
 } from './modelOptions';
 import type { Metadata } from '@/sync/domains/state/storageTypes';
 
@@ -21,6 +22,80 @@ function withMetadata(overrides: Partial<Metadata>): Metadata {
 }
 
 describe('modelOptions', () => {
+    it('uses refreshed models for both session choices and non-freeform validation', () => {
+        const metadata = withMetadata({
+            sessionModelsV1: { v: 1, provider: 'grok', updatedAt: 1, currentModelId: 'old', availableModels: [{ id: 'old', name: 'Old' }] },
+        });
+        const preflight = { availableModels: [{ id: 'new', name: 'New' }], supportsFreeform: false };
+        expect(getModelOptionsForSession('grok', metadata, { preflight, preflightUpdatedAt: 2 }).map((row) => row.value)).toEqual(['default', 'new']);
+        expect(getSelectableModelIdsForSession('grok', metadata, { preflight, preflightUpdatedAt: 2 })).toEqual(['default', 'new']);
+        expect(isModelSelectableForSession('grok', metadata, 'new', { preflight, preflightUpdatedAt: 2 })).toBe(true);
+        expect(isModelSelectableForSession('grok', metadata, 'old', { preflight, preflightUpdatedAt: 2 })).toBe(false);
+    });
+
+    it('retains an explicit freeform selection without restoring unadvertised static rows', () => {
+        const metadata = withMetadata({ modelOverrideV1: { v: 1, modelId: 'my-model', updatedAt: 1 } });
+        const preflight = { availableModels: [{ id: 'discovered', name: 'Discovered' }], supportsFreeform: true };
+        expect(getModelOptionsForSession('claude', metadata, { preflight }).map((row) => row.value)).toEqual(['default', 'discovered', 'my-model']);
+    });
+
+    it('matches configured ACP model metadata to its exact backend', () => {
+        const metadata = withMetadata({
+            flavor: 'acp:custom-one',
+            acpConfiguredBackendV1: { v: 1, backendId: 'custom-one', title: 'Custom', updatedAt: 1 },
+            sessionModelsV1: { v: 1, provider: 'acp:custom-one', updatedAt: 1, currentModelId: 'custom-model', availableModels: [{ id: 'custom-model', name: 'Custom Model' }] },
+        });
+        expect(getModelOptionsForSession('customAcp', metadata).map((row) => row.value)).toEqual(['default', 'custom-model']);
+        expect(hasDynamicModelListForSession('customAcp', metadata)).toBe(true);
+        const otherBackend = withMetadata({ ...metadata, acpConfiguredBackendV1: { v: 1, backendId: 'custom-two', title: 'Other', updatedAt: 2 } });
+        expect(getModelOptionsForSession('customAcp', otherBackend).map((row) => row.value)).toEqual(['default']);
+        expect(hasDynamicModelListForSession('customAcp', otherBackend)).toBe(false);
+    });
+
+    it('resolves discovery and session freshness once for choices and validation', () => {
+        const metadata = withMetadata({
+            sessionModelsV1: { v: 1, provider: 'grok', updatedAt: 20, currentModelId: 'runtime', availableModels: [{ id: 'runtime', name: 'Runtime' }] },
+        });
+        const preflight = { availableModels: [{ id: 'discovered', name: 'Discovered' }], supportsFreeform: false };
+        const stale = { preflight, preflightUpdatedAt: 10 };
+        const fresh = { preflight, preflightUpdatedAt: 30 };
+        expect(getModelOptionsForSession('grok', metadata, { preflight, preflightUpdatedAt: null }).map((row) => row.value)).toEqual(['default', 'runtime']);
+        expect(getModelOptionsForSession('grok', null, { preflight, preflightUpdatedAt: null }).map((row) => row.value)).toEqual(['default', 'discovered']);
+        expect(getModelOptionsForSession('grok', metadata, stale).map((row) => row.value)).toEqual(['default', 'runtime']);
+        expect(isModelSelectableForSession('grok', metadata, 'discovered', stale)).toBe(false);
+        expect(getModelOptionsForSession('grok', metadata, fresh).map((row) => row.value)).toEqual(['default', 'discovered']);
+        expect(isModelSelectableForSession('grok', metadata, 'discovered', fresh)).toBe(true);
+    });
+
+    it('keeps the requested model visible without marking the applied model as requested', () => {
+        const metadata = withMetadata({
+            sessionAppliedModelV1: { v: 1, provider: 'grok', updatedAt: 1, modelId: 'applied' },
+            modelOverrideV1: { v: 1, updatedAt: 2, modelId: 'requested' },
+        });
+        const preflight = { availableModels: [], supportsFreeform: false };
+        expect(getModelOptionsForSession('grok', metadata, { preflight }).map((row) => row.value)).toEqual(['default', 'requested']);
+        expect(getModelOptionsForSession('grok', metadata, { preflight, selectedModelId: 'local-choice' }).map((row) => row.value)).toEqual(['default', 'local-choice']);
+        expect(isModelSelectableForSession('grok', metadata, 'unrequested', { preflight })).toBe(false);
+    });
+
+    it('keeps a newer empty session catalog authoritative over stale discovery', () => {
+        const metadata = withMetadata({ sessionModelsV1: {
+            v: 1, provider: 'claude', updatedAt: 20, currentModelId: 'old', availableModels: [],
+        } });
+        const context = { preflight: { availableModels: [{ id: 'old', name: 'Old' }], supportsFreeform: true }, preflightUpdatedAt: 10 };
+        expect(getModelOptionsForSession('claude', metadata, context).map((row) => row.value)).toEqual(['default']);
+        expect(hasDynamicModelListForSession('claude', metadata)).toBe(true);
+        metadata.sessionModelsV1 = { ...metadata.sessionModelsV1!, updatedAt: 0 };
+        expect(getModelOptionsForSession('claude', metadata).length).toBeGreaterThan(1);
+    });
+
+    it('uses the selected discovery freeform policy for both entry and validation', () => {
+        const context = { preflight: { availableModels: [{ id: 'discovered', name: 'Discovered' }], supportsFreeform: false } };
+        expect(supportsFreeformModelSelectionForSession('pi', null, context)).toBe(false);
+        expect(isModelSelectableForSession('pi', null, 'custom', context)).toBe(false);
+        expect(isModelSelectableForSession('pi', null, 'discovered', context)).toBe(true);
+    });
+
     it('builds generic options for unknown modes', () => {
         const out = getModelOptionsForModes(['gpt-5-low', 'default']);
         expect(out.map((o) => o.value)).toEqual(['gpt-5-low', 'default']);
@@ -144,6 +219,7 @@ describe('modelOptions', () => {
                     currentModelId: 'claude-opus-4-5-20251101',
                     availableModels: [
                         { id: 'claude-opus-4-5-20251101', name: 'Opus 4.5' },
+                        { id: 'claude-opus-4-5', name: 'Opus 4.5' },
                         { id: 'claude-opus-4-6', name: 'Opus 4.6' },
                     ],
                 },
@@ -208,10 +284,7 @@ describe('modelOptions', () => {
         expect(out.some((option) => option.value === 'kiro-from-session')).toBe(false);
     });
 
-    it('keeps the extended-context variant for a curated model that arrives via the dynamic path', () => {
-        // AgentInput gates the 1M-context toggle on extendedContextModelId. The dynamic row builder
-        // has no reason to know about it, so the catalog merge must restore it — otherwise turning
-        // a provider dynamic silently removes the toggle.
+    it('does not restore an unadvertised extended-context capability from the static catalog', () => {
         const out = getModelOptionsForSession(
             'claude',
             withMetadata({
@@ -229,7 +302,7 @@ describe('modelOptions', () => {
             .find((option) => option.value === 'claude-sonnet-4-6') ?? null;
         expect(staticSonnet?.extendedContextModelId).toBeTruthy();
         expect(out.find((option) => option.value === 'claude-sonnet-4-6')?.extendedContextModelId)
-            .toBe(staticSonnet?.extendedContextModelId);
+            .toBeUndefined();
     });
 
     it('carries an extended-context variant declared by the dynamic source itself', () => {
@@ -261,13 +334,9 @@ describe('modelOptions', () => {
             }),
         );
 
-        // Claude publishes sessionModelsV1 from the CLI, so a discovered model reaches the picker,
-        // published rows lead, and the curated catalog is still appended behind them.
+        // Published membership is authoritative; the static catalog enriches matching rows.
         const values = withSession.map((option) => option.value);
-        expect(values.slice(0, 3)).toEqual(['default', 'claude-opus-4-6', 'claude-opus-9']);
-        for (const staticValue of getModelOptionsForAgentType('claude').map((option) => option.value)) {
-            expect(values).toContain(staticValue);
-        }
+        expect(values).toEqual(['default', 'claude-opus-4-6', 'claude-opus-9']);
         expect(withSession.find((option) => option.value === 'claude-opus-9')?.label)
             .toBe('Opus 9 (Discovered)');
 

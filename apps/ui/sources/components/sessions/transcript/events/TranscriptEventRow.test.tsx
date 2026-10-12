@@ -1,6 +1,7 @@
-import { ActivityIndicator, StyleSheet } from 'react-native';
+import { StyleSheet } from 'react-native';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 import { renderScreen } from '@/dev/testkit';
 import { rawRecordSchema, type AgentEvent } from '@/sync/typesRaw/schemas';
 import { t } from '@/text';
@@ -109,7 +110,7 @@ describe('TranscriptEventRow', () => {
             />,
         );
 
-        expect(screen.findByType(ActivityIndicator)).toBeTruthy();
+        expect(screen.findByType(ActivitySpinner)).toBeTruthy();
         expect(screen.findByProps({ testID: 'transcript-event-context-compaction-started' })).toBeTruthy();
     });
 
@@ -125,7 +126,7 @@ describe('TranscriptEventRow', () => {
             />,
         );
 
-        expect(() => screen.findByType(ActivityIndicator)).toThrow();
+        expect(() => screen.findByType(ActivitySpinner)).toThrow();
         expect(screen.findByProps({ testID: 'transcript-event-context-compaction-completed' })).toBeTruthy();
     });
 
@@ -143,7 +144,7 @@ describe('TranscriptEventRow', () => {
             />,
         );
 
-        expect(() => screen.findByType(ActivityIndicator)).toThrow();
+        expect(() => screen.findByType(ActivitySpinner)).toThrow();
         expect(screen.findByProps({ testID: 'transcript-event-context-compaction-paused' })).toBeTruthy();
     });
 
@@ -160,7 +161,7 @@ describe('TranscriptEventRow', () => {
             />,
         );
 
-        expect(() => screen.findByType(ActivityIndicator)).toThrow();
+        expect(() => screen.findByType(ActivitySpinner)).toThrow();
         expect(screen.findByProps({ testID: 'transcript-event-context-compaction-cancelled' })).toBeTruthy();
     });
 

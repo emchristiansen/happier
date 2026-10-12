@@ -96,6 +96,18 @@ describe('createActionExecutor (session control)', () => {
     }));
   });
 
+  it('rejects a caller-chosen local id outside the CLI surface', async () => {
+    const sessionSendMessage = vi.fn(async () => ({ ok: true }));
+    const executor = createExecutor({ sessionSendMessage });
+
+    await expect(executor.execute(
+      'session.message.send' as any,
+      { sessionId: 's1', message: 'Hello', localId: 'claim-1' },
+      { surface: 'mcp', defaultSessionId: null },
+    )).resolves.toEqual({ ok: false, errorCode: 'invalid_parameters', error: 'invalid_parameters' });
+    expect(sessionSendMessage).not.toHaveBeenCalled();
+  });
+
   it('preserves exact nonblank opaque model override bytes when sending a message', async () => {
     const sessionSendMessage = vi.fn(async () => ({ ok: true }));
     const executor = createExecutor({ sessionSendMessage });

@@ -202,7 +202,7 @@ export function createSystemTaskRunner(options: Readonly<{
                 unlistenBridge: null,
             };
             tasks.set(taskId, record);
-            record.unlistenBridge = await options.bridge.subscribe(taskId, {
+            const unlistenBridge = await options.bridge.subscribe(taskId, {
                 onEvent: (payload) => {
                     applyEvent(taskId, payload);
                 },
@@ -210,6 +210,8 @@ export function createSystemTaskRunner(options: Readonly<{
                     applyResult(taskId, payload);
                 },
             } satisfies SystemTaskBridgeListenerSet);
+            if (record.state.result) unlistenBridge();
+            else record.unlistenBridge = unlistenBridge;
             notifyTask(taskId);
             return taskId;
         },

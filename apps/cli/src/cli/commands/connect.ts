@@ -13,6 +13,7 @@ import { parseConnectArgs, type ConnectParsedOptions } from './connect/parseConn
 import { resolveConnectAuthIntent } from './connect/resolveConnectAuthIntent';
 import { resolveConnectTargetServiceIds } from './connect/resolveConnectTargetServiceIds';
 import { storeConnectedServiceCredentialForAccount } from '@/cloud/connectedServices/storeConnectedServiceCredentialForAccount';
+import { fail, info, neutral, ok, sectionTitle, warn } from '@happier-dev/cli-common/output';
 
 /**
  * Handle connect subcommand.
@@ -114,12 +115,12 @@ function formatTargetLine(target: CloudConnectTarget): string {
 }
 
 async function handleConnectVendor(target: CloudConnectTarget, options: ConnectParsedOptions): Promise<void> {
-    console.log(chalk.bold(`\n🔌 Connecting ${target.vendorDisplayName} to Happier cloud\n`));
+    console.log(`\n${sectionTitle(`Connecting ${target.vendorDisplayName} to Happier cloud`)}\n`);
 
     // Check if authenticated
     const credentials = await readCredentials();
     if (!credentials) {
-        console.log(chalk.yellow('⚠️  Not authenticated with Happier'));
+        console.log(warn('Not authenticated with Happier'));
         console.log(chalk.gray('  Please run "happier auth login" first'));
         process.exit(1);
     }
@@ -177,14 +178,14 @@ async function handleConnectVendor(target: CloudConnectTarget, options: ConnectP
       });
     })();
 
-    console.log(`🚀 Registering ${target.displayName} credential with relay (${record.serviceId}/${options.profileId})`);
+    console.log(info(`Registering ${target.displayName} credential with relay (${record.serviceId}/${options.profileId})`));
     await storeConnectedServiceCredentialForAccount({
       api,
       credentials,
       record,
     });
 
-    console.log(`✅ ${target.displayName} credential registered with relay`);
+    console.log(ok(`${target.displayName} credential registered with relay`));
     if (postConnectPayload !== null) {
       target.postConnect?.(postConnectPayload);
     }
@@ -195,12 +196,12 @@ async function handleConnectVendor(target: CloudConnectTarget, options: ConnectP
  * Show connection status for all vendors
  */
 async function handleConnectStatus(targets: ReadonlyArray<CloudConnectTarget>): Promise<void> {
-    console.log(chalk.bold('\n🔌 Connection Status\n'));
+    console.log(`\n${sectionTitle('Connection status')}\n`);
 
     // Check if authenticated
     const credentials = await readCredentials();
     if (!credentials) {
-        console.log(chalk.yellow('⚠️  Not authenticated with Happier'));
+        console.log(warn('Not authenticated with Happier'));
         console.log(chalk.gray('  Please run "happier auth login" first'));
         process.exit(1);
     }
@@ -226,7 +227,7 @@ async function handleConnectStatus(targets: ReadonlyArray<CloudConnectTarget>): 
         if (connected.length === 0) {
           const needsReauth = allProfiles.length > 0;
           const label = needsReauth ? 'needs re-auth' : 'not connected';
-          const icon = needsReauth ? chalk.yellow('⚠️') : chalk.gray('○');
+          const icon = needsReauth ? warn() : neutral();
           const color = needsReauth ? chalk.yellow(label) : chalk.gray(label);
           console.log(`  ${icon}  ${target.vendorDisplayName}: ${color}`);
           continue;
@@ -253,7 +254,7 @@ export async function handleConnectCliCommand(context: CommandContext): Promise<
   try {
     await handleConnectCommand(context.args.slice(1));
   } catch (error) {
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     if (process.env.DEBUG) {
       console.error(error);
     }

@@ -73,6 +73,37 @@ describe('readClaudeSessionJsonlMessages', () => {
     expect((logger.debug as any).mock.calls.some((call: unknown[]) => String(call[0]).includes('Error processing message'))).toBe(false);
   });
 
+  it.each([undefined, 1_024])('reports byte boundaries for raw rows after multibyte content (tail %s)', async (maxBytes) => {
+    tmpRoot = await mkdtemp(join(tmpdir(), 'happier-claude-jsonl-offset-'));
+    const sessionFilePath = join(tmpRoot, 'sess.jsonl');
+    const prefix = JSON.stringify({ type: 'assistant', uuid: 'history', message: {}, pad: '🙂'.repeat(1_000) }) + '\n';
+    const queue = JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content: 'éclair', sessionId: 's1' }) + '\n';
+    const assistant = JSON.stringify({ type: 'assistant', uuid: 'live', message: {} }) + '\n';
+    await writeFile(sessionFilePath, prefix + queue + assistant);
+    const observed: Array<{ value: unknown; source: unknown }> = [];
+    await readClaudeSessionJsonlMessages({
+      sessionFilePath, logLabel: 'TEST', maxBytes,
+      onJsonValue: (value, source) => { observed.push({ value, source }); },
+    });
+    expect(observed.slice(-2)).toEqual([
+      { value: JSON.parse(queue), source: { lineStartOffsetBytes: Buffer.byteLength(prefix) } },
+      { value: JSON.parse(assistant), source: { lineStartOffsetBytes: Buffer.byteLength(prefix + queue) } },
+    ]);
+  });
+
+  it('includes delivered native peer attachments while observing their original envelope', async () => {
+    tmpRoot = await mkdtemp(join(tmpdir(), 'happier-claude-peer-'));
+    const sessionFilePath = join(tmpRoot, 'sess.jsonl');
+    const delivered = { type: 'attachment', uuid: 'file-peer', attachment: { type: 'queued_command',
+      prompt: '<cross-session-message from="uds:/tmp/sender.sock" from-name="Sender" from-mode="prompting">Delivered</cross-session-message>' } };
+    await writeFile(sessionFilePath, JSON.stringify(delivered) + '\n');
+    const observed: unknown[] = [];
+    const messages = await readClaudeSessionJsonlMessages({ sessionFilePath, logLabel: 'TEST', onJsonValue: value => observed.push(value) });
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ type: 'user', uuid: 'file-peer', origin: { kind: 'peer', name: 'Sender' } });
+    expect(observed).toEqual([delivered]);
+  });
+
   it('drops Claude-internal state records that are not conversation content', async () => {
     tmpRoot = await mkdtemp(join(tmpdir(), 'happier-claude-jsonl-'));
     const sessionFilePath = join(tmpRoot, 'sess.jsonl');

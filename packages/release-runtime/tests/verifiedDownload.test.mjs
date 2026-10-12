@@ -1,50 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { generateKeyPairSync, sign, createHash } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { downloadVerifiedReleaseAssetBundle } from '../dist/verifiedDownload.js';
-
-function b64(buf) {
-  return Buffer.from(buf).toString('base64');
-}
-
-function base64UrlToBuffer(value) {
-  const s = String(value ?? '')
-    .replace(/-/g, '+')
-    .replace(/_/g, '/')
-    .padEnd(Math.ceil(String(value ?? '').length / 4) * 4, '=');
-  return Buffer.from(s, 'base64');
-}
-
-function createMinisignKeyPair() {
-  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
-  const jwk = publicKey.export({ format: 'jwk' });
-  const rawPublicKey = base64UrlToBuffer(jwk.x);
-  assert.equal(rawPublicKey.length, 32);
-
-  const keyId = Buffer.from('0123456789abcdef', 'hex');
-  const publicKeyBytes = Buffer.concat([Buffer.from('Ed'), keyId, rawPublicKey]);
-  const pubkeyFile = `untrusted comment: minisign public key\n${b64(publicKeyBytes)}\n`;
-  return { pubkeyFile, keyId, privateKey };
-}
-
-function signMinisignMessage({ message, keyId, privateKey }) {
-  const signature = sign(null, message, privateKey);
-  const sigLineBytes = Buffer.concat([Buffer.from('Ed'), keyId, signature]);
-  const trustedComment = 'trusted comment: test';
-  const trustedSuffix = Buffer.from(trustedComment.slice('trusted comment: '.length), 'utf-8');
-  const globalSignature = sign(null, Buffer.concat([signature, trustedSuffix]), privateKey);
-  return [
-    'untrusted comment: signature from happier test',
-    b64(sigLineBytes),
-    trustedComment,
-    b64(globalSignature),
-    '',
-  ].join('\n');
-}
+import { createMinisignKeyPair, signMinisignMessage } from './minisignFixture.mjs';
 
 function sha256Hex(bytes) {
   return createHash('sha256').update(bytes).digest('hex');

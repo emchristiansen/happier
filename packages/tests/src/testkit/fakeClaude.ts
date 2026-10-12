@@ -14,6 +14,7 @@ export type FakeClaudeInvocation = {
   invocationId?: string;
   mode: 'sdk' | 'local';
   argv: string[];
+  claudeConfigDir?: string;
   mcpConfigs?: unknown[];
   mergedMcpServers?: Record<string, unknown>;
   [key: string]: unknown;
@@ -82,7 +83,7 @@ function asFakeClaudeLogEvent(value: unknown): FakeClaudeLogEvent | null {
   return typeof value === 'object' && value !== null ? value as FakeClaudeLogEvent : null;
 }
 
-async function readRequiredFakeClaudeJsonlFile(path: string): Promise<FakeClaudeLogEvent[]> {
+export async function readFakeClaudeLogEvents(path: string): Promise<FakeClaudeLogEvent[]> {
   let raw: string;
   try {
     raw = await readFile(path, 'utf8');
@@ -102,7 +103,7 @@ export async function countFakeClaudeEventsAfterCurrentRunSentinel(params: Reado
   predicate: (event: FakeClaudeLogEvent) => boolean;
   sentinelPredicate?: (event: FakeClaudeLogEvent) => boolean;
 }>): Promise<number> {
-  const events = await readRequiredFakeClaudeJsonlFile(params.logPath);
+  const events = await readFakeClaudeLogEvents(params.logPath);
   const hasCurrentRunSentinel = events.some((event) => {
     if (params.sentinelPredicate) return params.sentinelPredicate(event);
     return event.type === 'invocation'

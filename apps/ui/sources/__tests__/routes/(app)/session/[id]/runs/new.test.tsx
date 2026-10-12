@@ -161,7 +161,6 @@ installSessionRouteCommonModuleMocks({
             theme: {
                 colors: {
                     surface: '#111',
-                    text: '#eee',
                     textSecondary: '#aaa',
                     divider: '#333',
                 },

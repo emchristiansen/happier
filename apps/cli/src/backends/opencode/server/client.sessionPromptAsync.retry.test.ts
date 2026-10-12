@@ -1,22 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('./sharedManagedServer', () => ({
+vi.mock('./sharedManagedServer', async (importOriginal) => ({
+    ...await importOriginal<typeof import('./sharedManagedServer')>(),
     ensureSharedManagedOpenCodeServerBaseUrl: vi.fn(),
-    isLoopbackManagedOpenCodeBaseUrl: (rawBaseUrl: string) => {
-        const value = rawBaseUrl.trim();
-        if (!value) return false;
-        try {
-            const url = new URL(value);
-            if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
-            const port = Number.parseInt(url.port, 10);
-            if (!Number.isFinite(port) || port <= 0) return false;
-            const host = url.hostname.toLowerCase();
-            return host === 'localhost' || host === '::1' || host.startsWith('127.');
-        } catch {
-            return false;
-        }
-    },
-    readSharedManagedOpenCodeServerStateBestEffort: vi.fn(),
+    readSharedManagedOpenCodeServerStateBestEffort: vi.fn(async () => null),
+    readSharedManagedOpenCodeServerStateByBaseUrlBestEffort: vi.fn(async () => null),
 }));
 
 import { MessageBuffer } from '@/ui/ink/messageBuffer';

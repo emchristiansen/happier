@@ -11,7 +11,7 @@ import { parseClaudeSdkFlagOverridesFromArgs } from "./remote/sdkFlagOverrides";
 import { resolveClaudeRemoteSessionStartPlan } from "./remote/sessionStartPlan";
 import { resolveClaudeConfigDirOverride } from "./utils/resolveClaudeConfigDirOverride";
 import { resolveClaudeConfigDirEnvOverlay } from "./utils/resolveClaudeConfigDirEnvOverlay";
-import { resolveClaudeCodeExperimentalEnvOverlay } from "./spawn/resolveClaudeCodeExperimentalEnvOverlay";
+import { resolveClaudeSessionEnvOverlay } from "./spawn/resolveClaudeSessionEnvOverlay";
 import { logClaudeRuntimeAuthEnvDiagnostic } from "./spawn/logClaudeRuntimeAuthEnvDiagnostic";
 import { ensureClaudeJsRuntimeExecutable } from "./utils/ensureClaudeJsRuntimeExecutable";
 import { resolveClaudeCliPath } from "./utils/resolveClaudeCliPath";
@@ -34,6 +34,7 @@ import { isClaudeLegacyRequiredHookObservationFailure } from './remote/runtimeAc
 import { materializeClaudeMcpConfigArgsForSpawn } from './utils/materializeClaudeMcpConfigArgsForSpawn';
 import { normalizeCurrentHappierSessionId } from '@/agent/runtime/session/currentSessionIdEnv';
 import { hasClaudeQueuedUserTurns } from './remote/resultTurnBoundary';
+import type { ClaudeEffectiveModelObservation } from './sessionModels/effectiveModelUpdate';
 
 function buildClaudeEffortArgs(params: Readonly<{
     modelId: unknown;
@@ -149,6 +150,7 @@ export async function claudeRemote(opts: {
     onSessionFound: (id: string) => void,
     onThinkingChange?: (thinking: boolean) => void,
     onMessage: (message: SDKMessage) => void,
+    onEffectiveModel?: (facts: ClaudeEffectiveModelObservation) => void,
     onCompletionEvent?: (event: ClaudeCompletionEvent) => void,
     onSessionReset?: () => void,
     setUserMessageSender?: (sender: ((message: SDKUserMessage) => void) | null) => void,
@@ -258,8 +260,9 @@ export async function claudeRemote(opts: {
     const resolvedClaudeCliPath = resolveClaudeCliPath();
     const happierSessionId = normalizeCurrentHappierSessionId(opts.happySessionId);
     const launcherEnv: NodeJS.ProcessEnv = {
-        ...resolveClaudeCodeExperimentalEnvOverlay({
+        ...resolveClaudeSessionEnvOverlay({
             claudeCodeExperimentalAgentTeamsEnabled: mode.claudeCodeExperimentalAgentTeamsEnabled,
+            claudeCodeIncludeInNativeHistory: mode.claudeCodeIncludeInNativeHistory,
         }),
         ...resolveClaudeConfigDirEnvOverlay(process.env),
         ...(happierSessionId ? { HAPPIER_SESSION_ID: happierSessionId } : {}),
@@ -367,6 +370,9 @@ export async function claudeRemote(opts: {
                 updateThinking(true);
 
                 const systemInit = message as SDKSystemMessage;
+                if (typeof systemInit.model === 'string' && systemInit.model.trim() && effortArgs[1]) {
+                    opts.onEffectiveModel?.({ modelId: systemInit.model.trim(), reasoningEffort: effortArgs[1] });
+                }
                 if (systemInit.session_id) {
                     currentProviderSessionId = systemInit.session_id;
                     // Do not block on filesystem writes here.
@@ -436,7 +442,9 @@ export async function claudeRemote(opts: {
         updateThinking(false);
     }
     } finally {
-        await materializedMcpConfig.cleanup();
+        // File retirement is nonfatal to the completed provider outcome. Its owner
+        // records incomplete cleanup by default; do not mask an existing turn error.
+        await materializedMcpConfig.cleanup().catch(() => undefined);
     }
     } finally {
         promptSettlements.settleUnresolved();

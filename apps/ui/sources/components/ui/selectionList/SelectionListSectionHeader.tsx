@@ -29,6 +29,8 @@ import type { SelectionListAccessory } from './_types';
 export type SelectionListSectionHeaderProps = Readonly<{
     /** Section title (rendered as uppercase eyebrow text). May be undefined. */
     title?: string;
+    /** Keep the title's case — for titles that are names, such as hostnames, whose case is meaningful. */
+    preserveCase?: boolean;
     /**
      * Optional count rendered to the right of the title with tabular-nums so
      * width stays stable as numbers tick.
@@ -93,7 +95,7 @@ export function SelectionListSectionHeader(
 ): React.ReactElement | null {
     const styles = stylesheet;
     if (props.title === undefined || props.title.length === 0) return null;
-    const title = props.title.toLocaleUpperCase();
+    const title = props.preserveCase ? props.title : props.title.toLocaleUpperCase();
     const rightAccessory = renderSelectionListAccessory(props.rightAccessory);
     return (
         <View testID={props.testID} style={[styles.container, props.containerStyle]}>

@@ -1,6 +1,8 @@
 import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from 'node:path';
 
+import { parse, stringify, TomlError, type TomlTable } from 'smol-toml';
+
 import type { ConnectedServiceStateSharingDescriptor, ConnectedServiceStateSharingDescriptorEntry } from '@/backends/types';
 import type { ConnectedServicesMaterializationDiagnostic } from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
 import type {
@@ -208,7 +210,7 @@ async function copyEntryWithOptionalTransform(params: Readonly<{
   }
   const content = await readFile(params.sourcePath, 'utf8');
   await mkdir(dirname(params.destinationPath), { recursive: true });
-  await writeFile(params.destinationPath, params.transform(content), 'utf8');
+  await writeFile(params.destinationPath, params.transform(content), { encoding: 'utf8', mode: 0o600 });
 }
 
 async function preflightStateLink(params: Readonly<{
@@ -329,51 +331,39 @@ function isConnectedServiceSharedStateLinkUnavailableError(error: unknown): erro
   return code === 'state_symlink_unavailable';
 }
 
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+export function parseConnectedServiceTomlConfig(content: string, configPath: string): TomlTable {
+  try {
+    return parse(content, { integersAsBigInt: 'asNeeded' });
+  } catch (error) {
+    if (!(error instanceof TomlError)) throw error;
+    // Parser messages and codeblocks contain nearby config values. Retain only
+    // safe classification and location metadata when reporting the file error.
+    throw new Error(`Invalid TOML in ${configPath} (line ${error.line}, column ${error.column})`, {
+      cause: { name: 'TomlError', line: error.line, column: error.column },
+    });
+  }
 }
 
 function applyRewriteTomlSetStringValues(
   content: string,
   setStringValues: Readonly<Record<string, string>>,
+  configPath: string,
 ): string {
-  let resultLines = content.split(/\r?\n/);
+  const config = parseConnectedServiceTomlConfig(content, configPath);
   for (const [key, value] of Object.entries(setStringValues)) {
-    if (!key.trim()) continue;
-    const assignment = `${key} = ${JSON.stringify(value)}`;
-    const keyPattern = new RegExp(`^\\s*${escapeRegex(key)}\\s*=`);
-    let replaced = false;
-    const nextLines: string[] = [];
-    for (const line of resultLines) {
-      if (keyPattern.test(line)) {
-        if (!replaced) {
-          nextLines.push(assignment);
-          replaced = true;
-        }
-        continue;
-      }
-      nextLines.push(line);
-    }
-    if (!replaced) {
-      const firstTableIndex = nextLines.findIndex((line) => /^\s*\[/.test(line));
-      if (firstTableIndex === -1) {
-        nextLines.push(assignment);
-      } else {
-        nextLines.splice(firstTableIndex, 0, assignment);
-      }
-    }
-    resultLines = nextLines;
+    if (key.trim()) config[key] = value;
   }
-  return resultLines.join('\n');
+  return stringify(config);
 }
 
 function buildDescriptorCopyTransformByEntry(
   descriptor: ConnectedServiceStateSharingDescriptor,
+  sourceRoot: string,
 ): Readonly<Record<string, (content: string) => string>> {
   const transforms: Record<string, (content: string) => string> = {};
   for (const transform of descriptor.transforms ?? []) {
     if (transform.kind === 'rewrite_toml') {
-      transforms[transform.entry] = (content) => applyRewriteTomlSetStringValues(content, transform.spec.setStringValues);
+      transforms[transform.entry] = (content) => applyRewriteTomlSetStringValues(content, transform.spec.setStringValues, join(sourceRoot, transform.entry));
       continue;
     }
     throw new Error(`Unsupported connected-service descriptor transform kind: ${transform.kind}`);
@@ -427,7 +417,7 @@ export async function applyConnectedServiceStateSharingDescriptor(
   const sourceRoot = resolve(input.nativeSourceContext.sourceRoot);
   const envOverrides: Record<string, string> = {};
   const diagnostics: ConnectedServicesMaterializationDiagnostic[] = [];
-  const descriptorCopyTransformByEntry = buildDescriptorCopyTransformByEntry(input.descriptor);
+  const descriptorCopyTransformByEntry = buildDescriptorCopyTransformByEntry(input.descriptor, sourceRoot);
   const previousManifest = input.existingManifest;
   const configEntryNames = input.configEntryNames ?? input.descriptor.config.entries.map((entry) => entry.path);
   const stateEntryNames = input.stateEntryNames ?? input.descriptor.state.entries.map((entry) => entry.path);
@@ -468,13 +458,24 @@ export async function applyConnectedServiceStateSharingDescriptor(
         continue;
       }
       const sourceStat = await tryStatConnectedServiceHomeEntry(sourcePath);
-      if (!sourceStat) continue;
+      const descriptorTransform = descriptorCopyTransformByEntry[entryName];
+      const profileTransform = input.copyTransformByEntry?.[entryName];
+      const transform = profileTransform
+        ? (content: string) => profileTransform(descriptorTransform ? descriptorTransform(content) : content)
+        : descriptorTransform;
+      if (!sourceStat) {
+        if (!transform) continue;
+        await prepareManagedConnectedServiceHomeDestination(destinationPath);
+        await writeFile(destinationPath, transform(''), { encoding: 'utf8', mode: 0o600 });
+        configEntries.push(entryName);
+        continue;
+      }
       await prepareManagedConnectedServiceHomeDestination(destinationPath);
       if (entryMode === 'copied') {
         await copyEntryWithOptionalTransform({
           sourcePath,
           destinationPath,
-          transform: input.copyTransformByEntry?.[entryName] ?? descriptorCopyTransformByEntry[entryName],
+          transform,
         });
       } else {
         try {
@@ -483,7 +484,7 @@ export async function applyConnectedServiceStateSharingDescriptor(
           await copyEntryWithOptionalTransform({
             sourcePath,
             destinationPath,
-            transform: input.copyTransformByEntry?.[entryName] ?? descriptorCopyTransformByEntry[entryName],
+            transform,
           });
         }
       }

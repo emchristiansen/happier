@@ -41,7 +41,12 @@ function readPositiveIntFromEnv(params: Readonly<{
   return parsed;
 }
 
-function resolvePayloadOwnerStopTimeoutMs(processEnv: NodeJS.ProcessEnv): number {
+/**
+ * The budget for one command the update runs against an installed or staged payload (the
+ * installer's pre-install command timeout): stopping the payload's owners here, and the update
+ * transaction's `--version` smoke of the staged executable.
+ */
+export function resolvePayloadOwnerStopTimeoutMs(processEnv: NodeJS.ProcessEnv): number {
   return readPositiveIntFromEnv({
     processEnv,
     name: 'HAPPIER_CLI_PAYLOAD_OWNER_STOP_TIMEOUT_MS',

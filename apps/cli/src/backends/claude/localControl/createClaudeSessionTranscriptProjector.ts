@@ -245,6 +245,7 @@ export function createClaudeSessionTranscriptProjector(params: Readonly<{
     if (!modelId) return;
     applyClaudeEffectiveModelUpdate({
       client: params.session.client,
+      reconcileModels: params.session.reconcileSessionModels,
       modelId,
       source: 'transcript',
       logPrefix: params.logPrefix,

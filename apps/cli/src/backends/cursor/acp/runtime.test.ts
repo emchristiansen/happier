@@ -4,15 +4,18 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { writeAcpTestAgentScript } from '@/agent/acp/testkit/subprocessHarness';
+import type { Metadata } from '@/api/types';
 import { MessageBuffer } from '@/ui/ink/messageBuffer';
 import { createApprovedPermissionHandler } from '@/testkit/backends/permissionHandler';
-import { createApiSessionClientFixture } from '@/testkit/backends/sessionFixtures';
+import { createApiSessionClientFixture, createMutableApiSessionClientFixture } from '@/testkit/backends/sessionFixtures';
 import { createSessionProviderInputConsumerFixture } from '@/testkit/backends/catalogAcpRuntime';
 import { withTempDir } from '@/testkit/fs/tempDir';
 
+import { createTestMetadata } from '@/testkit/backends/sessionMetadata';
+
 import { createCursorAcpRuntime } from './runtime';
 
-function writeCursorConfigStubAgent(params: { dir: string; callsPath: string }): string {
+function writeCursorConfigStubAgent(params: { dir: string; callsPath: string; emptyOnUpdate?: boolean; proprietary?: boolean }): string {
   const source = `#!/usr/bin/env node
     import { writeFileSync } from 'node:fs';
 
@@ -88,11 +91,18 @@ function writeCursorConfigStubAgent(params: { dir: string; callsPath: string }):
           ok(id, { sessionId: 'cursor-config-stub-session', configOptions });
           continue;
         }
+        if (method === 'cursor/list_available_models') {
+          ok(id, { models: ${params.proprietary ? "[{ value: 'proprietary', name: 'Proprietary' }]" : '[]'} });
+          continue;
+        }
         if (method === 'session/set_config_option') {
           record(params);
           configOptions = configOptions.map((option) =>
             option.id === params.configId ? { ...option, currentValue: params.value } : option
           );
+          if (${params.emptyOnUpdate === true} && params.value === 'true') {
+            configOptions = configOptions.map((option) => option.id === 'model' ? { ...option, options: [] } : option);
+          }
           ok(id, { configOptions });
           continue;
         }
@@ -112,6 +122,42 @@ function writeCursorConfigStubAgent(params: { dir: string; callsPath: string }):
 }
 
 describe('createCursorAcpRuntime', () => {
+  it.each([false, true])('publishes only the merged catalog when standard choices become empty (proprietary %s)', async (proprietary) => {
+    await withTempDir('happier-cursor-runtime-empty-', async (dir) => {
+      const cursorPath = writeCursorConfigStubAgent({ dir, callsPath: join(dir, 'calls.json'), emptyOnUpdate: true, proprietary });
+      const session = createMutableApiSessionClientFixture({ metadata: createTestMetadata() });
+      const runtime = createCursorAcpRuntime({
+        directory: dir, machineId: 'machine-1', session, messageBuffer: new MessageBuffer(),
+        mcpServers: {}, permissionHandler: createApprovedPermissionHandler(), onThinkingChange: () => {},
+        env: { HAPPIER_CURSOR_PATH: cursorPath },
+        providerInputConsumer: createSessionProviderInputConsumerFixture(),
+      });
+      try {
+        await runtime.startOrLoad({ resumeId: null });
+        const publishedModels: string[][] = [];
+        const updateMetadata = session.updateMetadata.bind(session);
+        session.updateMetadata = async (updater) => updateMetadata((metadata: Metadata | null) => {
+          if (!metadata) return metadata;
+          const next = updater(metadata);
+          if (next?.sessionModelsV1 !== metadata?.sessionModelsV1) {
+            publishedModels.push(next?.sessionModelsV1?.availableModels.map((model) => model.id) ?? []);
+          }
+          return next;
+        });
+        if (proprietary) {
+          await runtime.setSessionConfigOption('fast', 'false');
+          expect(publishedModels.every((models) => models.includes('proprietary'))).toBe(true);
+          publishedModels.length = 0;
+        }
+        await runtime.setSessionConfigOption('fast', 'true');
+        const expected = proprietary ? ['proprietary'] : [];
+        expect(publishedModels.length).toBeGreaterThan(0);
+        expect(publishedModels.every((models) => JSON.stringify(models) === JSON.stringify(expected))).toBe(true);
+        expect(session.getMetadataSnapshot()?.sessionModelsV1?.availableModels.map((model) => model.id)).toEqual(expected);
+      } finally { await runtime.reset(); }
+    });
+  });
+
   it('applies startup model aliases through Cursor ACP config options', async () => {
     await withTempDir('happier-cursor-runtime-config-', async (dir) => {
       const callsPath = join(dir, 'config-calls.json');

@@ -92,6 +92,19 @@ test('apps/ui Tauri channel configs leave HTML5 file drag-and-drop available to 
   }
 });
 
+test('apps/ui Tauri channel configs let the app create its main window, so a menu-bar login start loads no web UI', async () => {
+  const scriptsDir = dirname(fileURLToPath(import.meta.url));
+  const packageRoot = dirname(scriptsDir);
+
+  for (const configName of ['tauri.conf.json', 'tauri.preview.conf.json', 'tauri.publicdev.conf.json']) {
+    const config = JSON.parse(await readFile(join(packageRoot, 'src-tauri', configName), 'utf-8'));
+    const main = (config?.app?.windows ?? []).find((windowConfig) => windowConfig?.label === 'main');
+    assert.ok(main, `${configName} should declare the main window by label`);
+    // window_chrome::register creates it unless launched with --menu-bar (R16 b).
+    assert.equal(main.create, false, `${configName} must not auto-create the main window`);
+  }
+});
+
 test('apps/ui Tauri config runs beforeBuildCommand/beforeDevCommand via node wrapper (works on Windows CI)', async () => {
   const scriptsDir = dirname(fileURLToPath(import.meta.url));
   const packageRoot = dirname(scriptsDir);

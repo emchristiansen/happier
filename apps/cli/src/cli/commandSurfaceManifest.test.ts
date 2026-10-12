@@ -22,6 +22,8 @@ describe('CLI command-surface manifest', () => {
       'service',
       'daemon',
       'doctor',
+      'herdr',
+      'attach',
       'session',
       'resume',
     ]);
@@ -42,6 +44,7 @@ describe('CLI command-surface manifest', () => {
     expect(isTmuxAllowedCommand('sessions')).toBe(false);
     expect(isTmuxAllowedCommand('automation')).toBe(false);
     expect(isTmuxAllowedCommand('install')).toBe(false);
+    expect(isTmuxAllowedCommand('herdr')).toBe(false);
   });
 
   // The installers gate every post-install `happier <command>` invocation on the

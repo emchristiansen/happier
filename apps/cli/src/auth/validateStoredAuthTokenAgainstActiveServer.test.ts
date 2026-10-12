@@ -36,7 +36,28 @@ describe('validateStoredAuthTokenAgainstServer', () => {
       state: 'valid',
       httpStatus: 200,
       accountId: 'acct_validated',
+      accountLabel: null,
     });
+  });
+
+  it('labels the validated account with the profile username, else its display name', async () => {
+    const respond = (profile: Record<string, unknown>) => vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ id: 'acct_validated', ...profile }),
+    } as Response)) as typeof fetch;
+    const validate = async (profile: Record<string, unknown>) => await validateStoredAuthTokenAgainstServer({
+      token: 'token-123',
+      serverUrl: 'https://active.example.test',
+      fetchImpl: respond(profile),
+    });
+
+    expect(await validate({ username: 'alice', firstName: 'Alice', lastName: 'Liddell' }))
+      .toMatchObject({ state: 'valid', accountLabel: 'alice' });
+    expect(await validate({ username: null, firstName: 'Alice', lastName: 'Liddell' }))
+      .toMatchObject({ state: 'valid', accountLabel: 'Alice Liddell' });
+    expect(await validate({ username: '  ', firstName: null, lastName: null }))
+      .toMatchObject({ state: 'valid', accountLabel: null });
   });
 
   it('returns unknown for transport failures instead of forcing invalid auth', async () => {

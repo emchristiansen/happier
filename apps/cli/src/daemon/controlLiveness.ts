@@ -1,6 +1,8 @@
+import { isPidAliveBySignal } from './processRunState';
+
 export type DaemonControlLivenessProbeResult =
   | 'running'
-  | 'pid_not_running'
+  | 'control_not_running'
   | 'unauthorized'
   | 'unreachable';
 
@@ -8,7 +10,7 @@ async function pingAuthenticatedControl(input: Readonly<{
   httpPort: number;
   controlToken: string;
   timeoutMs: number;
-}>): Promise<Exclude<DaemonControlLivenessProbeResult, 'pid_not_running'>> {
+}>): Promise<DaemonControlLivenessProbeResult> {
   try {
     const response = await fetch(`http://127.0.0.1:${input.httpPort}/ping`, {
       method: 'POST',
@@ -26,8 +28,12 @@ async function pingAuthenticatedControl(input: Readonly<{
       && (payload as Readonly<{ status?: unknown }>).status === 'ok'
       ? 'running'
       : 'unreachable';
-  } catch {
-    return 'unreachable';
+  } catch (error) {
+    const cause = error && typeof error === 'object' && 'cause' in error ? error.cause : error;
+    return cause && typeof cause === 'object' && 'code' in cause
+      && (cause.code === 'ECONNREFUSED' || cause.code === 'ConnectionRefused')
+      ? 'control_not_running'
+      : 'unreachable';
   }
 }
 
@@ -38,7 +44,8 @@ async function pingAuthenticatedControl(input: Readonly<{
  *
  * A PID the caller cannot see (ESRCH) is not proof of absence either: containers
  * and host boundaries hide the daemon's pid namespace while its control endpoint
- * stays reachable. Only an authenticated `ok` answer resurrects such a PID.
+ * stays reachable. The probe preserves unknown transport failures separately from a refused endpoint;
+ * neither a refused endpoint nor an unobservable PID proves lifecycle cleanup completed.
  */
 export async function probeDaemonAuthenticatedControl(input: Readonly<{
   pid: number;
@@ -52,9 +59,27 @@ export async function probeDaemonAuthenticatedControl(input: Readonly<{
     if ((error as NodeJS.ErrnoException)?.code !== 'ESRCH') {
       return 'unreachable';
     }
-    const hiddenPidProbe = await pingAuthenticatedControl(input);
-    return hiddenPidProbe === 'running' ? 'running' : 'pid_not_running';
+    return await pingAuthenticatedControl(input);
   }
 
   return await pingAuthenticatedControl(input);
+}
+
+export type DaemonPublicationPresenceInspection = Readonly<
+  | { status: 'running'; hiddenPid: boolean }
+  | { status: 'not_running' | 'unverified' }
+>;
+
+/** Coarse publication presence, shared by status projections and confirmed stop. */
+export async function inspectDaemonPublicationPresence(input: Readonly<{
+  pid: number;
+  httpPort: number;
+  controlToken?: string;
+  timeoutMs: number;
+}>): Promise<DaemonPublicationPresenceInspection> {
+  if (isPidAliveBySignal(input.pid)) return { status: 'running', hiddenPid: false };
+  if (!input.controlToken) return { status: 'not_running' };
+  const liveness = await probeDaemonAuthenticatedControl({ ...input, controlToken: input.controlToken });
+  if (liveness === 'running') return { status: 'running', hiddenPid: true };
+  return { status: liveness === 'unreachable' ? 'unverified' : 'not_running' };
 }

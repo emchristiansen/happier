@@ -10,6 +10,18 @@ import {
 } from './agentRuntimeDescriptorV1';
 
 describe('agentRuntimeDescriptorV1', () => {
+  it('retains recognized managed affinity and clears it for explicit server and ACP descriptors', () => {
+    const fingerprint = 'a'.repeat(64);
+    const read = (backendMode: 'server' | 'acp', serverBaseUrlExplicit = false) => readCanonicalAgentRuntimeDescriptorV1ForProvider(
+      AgentRuntimeDescriptorV1Schema.parse(buildOpenCodeAgentRuntimeDescriptorV1({
+        backendMode, vendorSessionId: 'native-target', managedServerLaunchFingerprint: fingerprint,
+        ...(serverBaseUrlExplicit ? { serverBaseUrl: 'https://remote.example.test', serverBaseUrlExplicit: true } : {}),
+      })), 'opencode',
+    );
+    expect(read('server')?.managedServerLaunchFingerprint).toBe(fingerprint);
+    expect(read('server', true)?.managedServerLaunchFingerprint).toBeNull();
+    expect(read('acp')?.managedServerLaunchFingerprint).toBeNull();
+  });
   it('parses generic provider envelopes with provider-owned extras', () => {
     expect(AgentRuntimeDescriptorV1Schema.parse({
       v: 1,
@@ -242,6 +254,7 @@ describe('agentRuntimeDescriptorV1', () => {
       vendorSessionId: 'sess_runtime',
       serverBaseUrl: 'http://canonical.example',
       serverBaseUrlExplicit: true,
+      managedServerLaunchFingerprint: null,
     });
   });
 

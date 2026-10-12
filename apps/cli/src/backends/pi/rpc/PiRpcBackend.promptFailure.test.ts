@@ -38,6 +38,7 @@ function makeFakePiRpcProcessScript(dir: string): string {
 const readline = require('node:readline');
 const rl = readline.createInterface({ input: process.stdin });
 const out = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
+let catalogPublished = false;
 
 rl.on('line', (line) => {
   let command;
@@ -52,6 +53,13 @@ rl.on('line', (line) => {
       out({ id: command.id, type: 'response', command: 'new_session', success: true, data: { cancelled: false } });
       break;
     case 'get_state':
+      if (!catalogPublished) {
+        catalogPublished = true;
+        process.stderr.write(JSON.stringify({ type: 'happier-pi-model-catalog', models: [
+          { id: 'gpt-4o-mini', provider: 'openai', name: 'GPT-4o mini' },
+          { id: 'unnamed-model', provider: 'local' }
+        ] }) + '\\n');
+      }
       out({
         id: command.id,
         type: 'response',

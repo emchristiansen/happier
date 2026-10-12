@@ -18,6 +18,11 @@ export interface MeterBarProps {
     /** Track height in px (default 6). */
     height?: number;
     trackColor?: string;
+    /**
+     * When the bar reports progress (not a capacity), its accessible name. The bar then exposes
+     * `progressbar` semantics with the fill as a 0–100 value.
+     */
+    progressAccessibilityLabel?: string;
     testID?: string;
     style?: StyleProp<ViewStyle>;
 }
@@ -61,7 +66,16 @@ export const MeterBar = React.memo<MeterBarProps>((props) => {
     const trackColor = props.trackColor ?? theme.colors.surface.pressedOverlay;
 
     return (
-        <View testID={props.testID} style={props.style}>
+        <View
+            testID={props.testID}
+            style={props.style}
+            {...(props.progressAccessibilityLabel ? {
+                accessible: true,
+                accessibilityRole: 'progressbar' as const,
+                accessibilityLabel: props.progressAccessibilityLabel,
+                accessibilityValue: { min: 0, max: 100, now: Math.round(fill * 100) },
+            } : null)}
+        >
             <View
                 testID={props.testID ? `${props.testID}:track` : undefined}
                 style={[styles.track, { height, backgroundColor: trackColor }]}

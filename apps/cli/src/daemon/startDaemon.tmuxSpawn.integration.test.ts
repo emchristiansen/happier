@@ -98,4 +98,5 @@ describe('daemon tmux spawn config', () => {
     ]));
     expect(cfg.tmuxEnv.HAPPIER_TEST_ADMITTED_CLOSURE).toBe('0123456789abcdef');
   });
+
 });

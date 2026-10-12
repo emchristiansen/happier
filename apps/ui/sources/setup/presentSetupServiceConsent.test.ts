@@ -44,4 +44,20 @@ describe('presentSetupServiceConsent', () => {
         const [, body] = confirmSpy.mock.calls[0] as unknown as [string, string];
         expect(body).toBe('setupSurface.consentBodyFallback');
     });
+
+    it('asks about taking over a daemon started by hand in the CLI\'s own words, not as a service to replace (U8)', async () => {
+        // No service exists: a daemon started from a terminal is running. Saying "a background
+        // service already exists" was false, and the CLI's own notice was dropped.
+        await presentSetupServiceConsent({
+            taskId: 'task_1',
+            message: null,
+            competingServices: [],
+            servicesToRemove: [],
+            takeover: 'Stopping the daemon started from a terminal (pid 4242).',
+        });
+        const [title, body, options] = confirmSpy.mock.calls[0] as unknown as [string, string, { confirmText: string }];
+        expect(title).toBe('setupSurface.consentTakeoverTitle');
+        expect(body).toBe('Stopping the daemon started from a terminal (pid 4242).');
+        expect(options.confirmText).toBe('setupSurface.consentTakeoverConfirm');
+    });
 });

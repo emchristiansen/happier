@@ -6,6 +6,7 @@ import {
   sendResultToFailure,
 } from './controlRuntime';
 import type { ClaudeScreenState } from './screenState';
+import { isClaudeUsageLimitWaitBlockingComposerClear } from './screenState';
 
 const DEFAULT_USER_AUTHORIZED_COMPOSER_CLEAR_SETTLE_MS = 250;
 // Same bounded keyboard behavior as the automatic own-leftover clear path: one Escape may close an
@@ -23,6 +24,7 @@ export type ClaudeComposerClearRefusalReason =
   | 'unrecognized_confirmation_dialog'
   | 'slash_picker'
   | 'selection_list'
+  | 'usage_limit_wait'
   | 'no_interactive_composer';
 
 export type ClaudeUserAuthorizedComposerClearResult =
@@ -75,6 +77,9 @@ function classifyComposerClearScreen(state: ClaudeScreenState): ComposerClearScr
   }
   if (state.selectionListVisible) {
     return { kind: 'refused', reason: 'selection_list', screen: state };
+  }
+  if (isClaudeUsageLimitWaitBlockingComposerClear(state)) {
+    return { kind: 'refused', reason: 'usage_limit_wait', screen: state };
   }
   if (!state.inputBoxInteractive || state.composerContent === null) {
     return { kind: 'refused', reason: 'no_interactive_composer', screen: state };

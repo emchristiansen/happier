@@ -4,6 +4,15 @@ Happier ships binary installers. First-party runtime paths must work on machines
 
 ## Runtime contract
 
+In current development source, `scripts/pipeline/release/bun-standalone.entitlements.plist`
+owns the macOS hardened-runtime permissions for shipped Bun executables. Standalone
+signing consumes it directly. Tauri's base configuration references this file
+directly, so stable, preview and dev desktop bundles give the same JIT permission
+to the bundled Bun-compiled `hsetup`.
+Signature validity and notarization alone do not prove startup: release validation
+must inspect the bundled helper's JIT entitlement and execute `hsetup --help` on
+the native target without disabling JIT.
+
 Do not introduce direct product-runtime calls to:
 
 - `spawn('node', ...)`
@@ -23,6 +32,16 @@ Before adding or changing a provider/runtime/install/update flow, classify it as
 
 Provider detection, install status, daemon validation, runtime spawning, and UI/installables must reuse the same source of truth. Backend CLIs should prefer user/system installs by default over Happier-managed installs unless an explicit setting says otherwise.
 
+In current development source, Pi's vendor-managed launcher is a system-install candidate
+in the shared provider resolver: `PI_CODING_AGENT_DIR/bin/pi`, then `~/.pi/agent/bin/pi`,
+when `PATH` has no matching executable. Explicit `HAPPIER_PI_PATH` remains exclusive and
+the existing Happier-managed source preference remains authoritative. Detection, version
+probing and launch all consume that resolution; the launcher owns its pinned Pi release.
+An unresolved required CLI throws `ProviderCliNotFoundError` at the shared command/launch
+boundary. The primary-session classifier preserves it as `dependency_failure` with code
+`provider_cli_not_found` and the canonical remediation, without exposing raw paths or
+mistaking runner turn allocation for provider prompt acceptance.
+
 ## Desktop-initiated CLI acquisition
 
 The desktop app acquires the Happier CLI itself; the user never runs an installer to connect the
@@ -30,8 +49,14 @@ computer the app is on. Acquisition is not a separate step: `runLocalHappierJson
 (`apps/bootstrap/src/systemTasks/happierCli.ts`) calls
 `ensureLocalFirstPartyComponentCommand(...)` before every CLI invocation that does not already
 carry a resolved CLI, so reading daemon status already downloads, verifies and installs the managed
-CLI when it is missing. There is no second acquisition trigger, no cross-process lock, and no
-persisted prefetch state — one in-memory promise per app open.
+CLI when it is missing. There is no second acquisition trigger and no persisted prefetch state —
+one in-memory promise per app open. The install itself runs under the install root's mutation
+lock and — because launchers and the default-channel record are shared across channels — the
+home-wide activation lock (`withFirstPartyPayloadMutationLock.ts`); a concurrent installer, update
+or acquisition fails on either at once. An acquisition downloads before taking them; the update
+transaction takes them first, so one update per home downloads at a time. Updating an installed CLI is not acquisition: it is the one
+update transaction (`runManagedCliUpdate`, see `docs/cli-architecture.md` → "One CLI update
+transaction").
 
 A task that runs several commands (or re-reads status while waiting for the daemon) resolves the
 CLI once through `resolveVersionedLocalHappierCli(...)` and passes it to each command. That
@@ -52,6 +77,16 @@ The setup ring still advances only at its existing milestones, and readiness sti
 runtime-convergence and machine-RPC proof.
 
 Acquisition failures carry their phase and cause; diagnostics strip URL credentials and queries.
+In current development source, QA can set `HAPPIER_FIRST_PARTY_RELEASE_API_BASE_URL` to an
+HTTP(S) origin on `127.0.0.1` or `[::1]` when `NODE_ENV=development`. The existing first-party
+release resolver uses that origin for GitHub-shaped tag metadata; metadata supplies the asset URLs.
+Paths, URL credentials, queries, fragments, malformed values and non-loopback hosts are rejected
+visibly. GitHub tokens are never sent to the mirror. Build the QA hsetup with
+`NODE_ENV=development node apps/bootstrap/scripts/buildBinary.mjs` after building its dependencies;
+normal builds freeze `NODE_ENV` to `production` and reject the override even if the launched
+process sets `NODE_ENV=development`. This is a development/QA seam, not a released setting.
+The mirror must serve the publisher's unmodified archives, checksums and minisign signatures:
+the existing checksum and official-public-key verification is unchanged, with no environment key override.
 Retry uses the existing installed-command resolution and acquisition path. The executor's existing
 abort signal reaches release requests and extraction cleanup. Installation checks cancellation
 before promotion, then finishes pointer, shim, and marker finalization once started; this does not
@@ -62,17 +97,173 @@ Resolution order and provenance (`systemTasks/localFirstPartyCommand.ts`):
 | Source | Provenance | Notes |
 | --- | --- | --- |
 | `HAPPIER_BOOTSTRAP_CLI_PATH` / `HAPPIER_BOOTSTRAP_HAPPIER_PATH` | `override` | Development only. |
+| This computer chose **Keep my own** (`<happier home>/cli-choice.json` `{ mode: 'own', command }`) and that CLI exists | `override` | Wins over a managed copy still on disk (plan R12). |
+| **Keep my own** is recorded but that CLI is gone | — | Fails `cli_choice_required`: no leftover managed copy and no acquisition stands in for it; setup asks first (R13 b). |
 | Installed managed payload for the caller's release ring | `managed` | The desktop-managed install layout recorded it. |
 | Repo-local `apps/cli/bin/happier.mjs` | `override` | Accepted on path existence alone. |
+| No recorded **Let Happier manage it**, and a `happier` this layout did not place resolves on PATH | `override` | Until the one question is answered, no read acquires a second CLI beside the user's (R12). |
 | Nothing resolvable | — | Acquire through the managed path, then `managed`. |
 
-The release ring comes from the caller (the app's variant), never a hardcoded default, so a
-preview app acquires a preview CLI. `SETUP_CLI_VERSION_FLOOR` in `happierCli.ts` is the one
-version floor desktop setup enforces; below it a managed CLI is reacquired once and then fails by
-name, and an `override` CLI fails immediately. Only `managed` is approved for pairing silently; an
+### One CLI per computer (plan R12)
+
+When the `happier` a new terminal runs first (`resolveTerminalHappierCli`, the same search path PATH
+exposure uses, including the macOS `buildServicePath` list and Windows `PATHEXT` spellings) is one
+the managed layout did not place (npm, Homebrew, a manual copy), and this computer has not answered
+yet, the setup executor asks once, before it writes anything: **Let Happier manage it**
+or **Keep my own** (prompt `setup.cliChoice`, naming the version from that CLI's `--version`, its
+path, and where it came from). The answer is recorded in `<happier home>/cli-choice.json`
+(`happierCliChoice.ts`, beside `current.version` and `default-cli-release-channel.json`), so every
+Happier app sharing that home and every bootstrap task resolves the same CLI. A computer with no
+other `happier` is never asked and keeps the managed default; a developer override is never asked
+about.
+
+Every other copy is found by `resolveForeignHappierCli`, which walks that path **past** the managed
+shim and the installer's link to it; it feeds Settings only (the old copy's row, removal command and
+change action, which therefore survive **Manage** putting the managed CLI first) and never raises the
+question: a terminal that already runs the managed CLI has nothing to decide (RV3-1). When Settings'
+change asks about such a copy and the managed CLI answers first through something Desktop did not
+create — the official installer's `~/.local/bin` link, or on Windows a `Path` entry Desktop's records
+(`HAPPIER_DESKTOP_PATH_ENTRIES`/`_MOVES`) do not name — keeping it could not make the terminal run it,
+so the prompt carries `keepBlockedBy` (that path), **Keep my own** is not offered, and the dialog says
+that path would have to be removed first.
+
+A working foreign CLI is not interrupted (plan R13 b): while nobody has answered, the app-open read
+uses it as it is, and the question appears only when setup needs to act — a setup run, or a read that
+CLI cannot serve (below). Settings › This computer › Command line offers the change whenever another
+`happier` exists, including the old copy after **Manage**.
+
+- **Manage**: the managed CLI is acquired through the existing owner, its PATH line is written even
+  though another `happier` resolves (INV5 as amended by R12), and a service that runs the old CLI is
+  switched through the install dry-run's `runtimeReplacement`: the recorded answer is that consent,
+  so a pure runtime switch is not asked about twice. Any other ownership change (competing
+  services, a manual daemon) still asks. The switch is symmetric (R13 b): after **Keep my own** a
+  service that runs the managed CLI is the same `runtimeReplacement` toward the kept CLI
+  (`describeDaemonServiceRuntimeReplacement` classifies a change between a user-installed and the
+  managed launcher in either direction), so either answer converges the service through the strict
+  `service install --replace-existing` — its failure fails setup — and `service start`/`restart`
+  never rewrite a definition onto another CLI as best-effort drift. The command that removes the old copy
+  (`npm uninstall -g <package>` from that package's own `package.json`, `brew uninstall <formula>`
+  from its `Cellar/<formula>/` path, else just the path) is shown in Settings › This computer and
+  never run (`happierCliOrigin.ts`).
+- **Keep my own**: nothing is acquired, Desktop-created PATH lines are removed and none is written,
+  and every command (including `service install`) runs that CLI; the CLI's service runtime owner
+  (`resolveManagedDaemonServiceShimPath`) then proposes no managed shim, so the service runs it and
+  `runtimeConvergence.cliVersionMatches` compares against it. Its pairing is an `override`, so the
+  existing attended approval applies. Below the setup floor it fails
+  `cli_own_below_setup_floor`, naming that CLI's own update command, and is never replaced.
+- The question is asked again only from Settings › This computer › Command line (`reconsiderCli`),
+  when the kept CLI disappeared, or when it is below the floor (a CLI that cannot report its version
+  counts as below it).
+  In current development source, the Settings action remains available when the active relay has
+  a user-owned pinned service: the existing setup executor accepts `cliOnly` together with
+  `reconsiderCli`, changes the home-wide CLI choice and PATH through these same owners, and performs
+  no relay, credential or service convergence. PATH keeps its ancillary timing; managed CLI
+  acquisition and required upgrades retain the existing update contract.
+- A kept CLI that disappeared is still the recorded answer (R13 b). The resolver fails
+  `cli_choice_required` instead of using a managed copy left on disk or acquiring one, so the app-open
+  read routes into setup, whose first step asks again: about a `happier` installed since elsewhere,
+  or else about the missing one by the path it was at (`setup.cliChoice` with `missing: true`).
+  **Manage** proceeds as above; **Keep my own** ends `cli_own_missing` with nothing written — the
+  person reinstalls it, or chooses **Manage**.
+- A CLI the question is about that fails the app-open `daemon.service.status.v1` read (a pre-0.2
+  build, one that errors) fails that read as `cli_choice_required`
+  (`describeUnservedCliChoiceFailure`), and the app's entry policy (`deriveDesktopLocalSetupSnapshot`)
+  routes it into setup rather than a Retry that only re-reads: setup's first step asks the question,
+  naming the version when known and otherwise just the path. **Manage** proceeds as above; **Keep my
+  own** with a CLI that cannot serve setup ends in `cli_own_below_setup_floor` and its update command.
+- On Windows, **manage** also moves the managed bin dir to the front of the user `Path` when it is
+  already present behind another `happier` (an npm global dir) — moved, never duplicated, and its
+  added-entry provenance unchanged. The move is recorded in the user environment variable
+  `HAPPIER_DESKTOP_PATH_MOVES` (`<entry>|<entries it was moved ahead of>`), so **Keep my own**
+  (`removeHappierCliPathExposure`) puts it back behind exactly those entries — only while the move
+  still holds (the entry is still ahead of every one of them that remains); an entry the person added
+  since stays where it is, and a move they already undid is left alone. Either way the record is
+  cleared. Windows builds a process PATH as the machine `Path` followed by the user `Path`, so no user
+  `Path` change can put the managed CLI ahead of a `happier` on the machine `Path` (for example a
+  machine-wide Node.js install's global bin); that copy keeps answering first in new terminals until
+  it is removed with the command Settings shows.
+- A CLI found this way must also start from the desktop: on macOS every hsetup CLI command runs
+  with the same search PATH that found it (`resolveHappierCliSearchPath`), so an npm `happier`'s
+  `#!/usr/bin/env node` finds the `node` beside it from a Dock-launched app; on Windows
+  `runCommandCapture` runs an npm `happier.cmd` shim through the process owner's cmd.exe invocation
+  (`resolveWindowsCommandInvocation`). A version manager's shim (nvm, fnm, volta) is not found, as
+  for PATH exposure below.
+- `daemon.service.status.v1` reports the answer and the non-managed CLI as `cli.choice`
+  (`{ mode, otherCli: { command, origin, removalCommand, updateCommand } | null }`).
+
+The release ring is never a hardcoded default: it is the **default channel's** while that
+channel's managed CLI is installed — an app of another channel adopts it (plan R10 D2,
+[One default channel per Happier home](cli-architecture.md#one-default-channel-per-happier-home)) —
+or while this computer has any R12 answer recorded (plan R13 b: its CLI is or was a `happier` the
+user installed, which follows the default channel, so the service it runs is the default channel's
+and **Let Happier manage it** adopts that channel's managed CLI — the pure runtime switch the answer
+consents to — rather than making the app's channel the default and leaving the user's service as
+another ring's to remove, which the service consent would still ask about) — and otherwise the
+caller's own (the app's variant), so a preview app on an empty home acquires a preview CLI. When the adopted default channel's newest CLI is below the floor, setup fails
+`cli_default_channel_below_setup_floor`, naming that channel, its newest version, the floor and the
+app's channel (wait for that channel's release, or make the app's channel the default with the
+installer's `--channel`); `daemon.service.status.v1` reports the answering CLI's channel as
+`acquisition.channel` (`null` for an override). `SETUP_CLI_VERSION_FLOOR` in `happierCli.ts` is the one
+version floor desktop setup enforces. In current development source, replacing an installed managed
+CLI below it uses `runManagedCliUpdate`, with the target floor checked before activation and the
+existing staged smoke, restoration and service-restart proof. First acquisition keeps the acquisition
+owner and checks the resolved release against the floor before installation; an `override` CLI fails
+immediately. Only `managed` is approved for pairing silently; an
 `override` CLI is put to the user once, naming the resolved path. `managed` records install
 ownership, not verified publisher provenance — see
 [Managed-CLI install ownership](cli-architecture.md#managed-cli-install-ownership-silent-vs-attended-approval).
+
+## Homebrew-owned CLIs
+
+Status: prepared, not published. `scripts/pipeline/release/render-homebrew-packages.mjs` renders
+the formula (tap `happier-dev/homebrew-tap`) and the cask (intended for `homebrew/cask`) from a
+stable release's real assets and its signed `checksums-*.txt`.
+
+- The formula is a release product, never checked in. `release.yml` job `publish_homebrew_tap`
+  renders it from the verified stable `cli-v<version>` release (the one this run promoted, or the
+  one a resumed run's origin already promoted) and commits it to the tap. The job does nothing
+  until the repository variable `HOMEBREW_TAP_REPO_NAME` is set.
+- The generator refuses CLI releases before `HOMEBREW_FORMULA_MIN_CLI_VERSION` (0.2.13), the first
+  whose `self update` and service launcher are correct under Homebrew. The 0.2.12 rendering is kept
+  only as a test fixture.
+- Happier requires macOS 13 (Ventura), from one owner: `HAPPIER_MIN_MACOS` in the generator
+  renders `depends_on macos: :ventura` for the formula (inside `on_macos`) and the cask alike.
+  The darwin CLI binaries (Bun) declare LC_BUILD_VERSION minos 13.0, and the desktop app installs
+  that CLI, so `apps/ui/src-tauri/tauri.conf.json` declares
+  `bundle.macOS.minimumSystemVersion: "13.0"` too (decided 2026-09-26). A generator test binds the
+  Tauri value to `HAPPIER_MIN_MACOS`. The preview and publicdev configs merge over it without
+  overriding `bundle.macOS`.
+- The cask submission candidate is `packaging/homebrew/Casks/happier.rb`. Submit it for the first
+  desktop release built with that minimum. Earlier DMGs declare `LSMinimumSystemVersion` 10.13,
+  which `brew audit --online` would flag against `:ventura`.
+
+- **Layout.** The formula installs the unmodified `cli-v<version>` payload for darwin/linux ×
+  arm64/x64 into `Cellar/happier/<version>/libexec` (the compiled `happier` with its
+  `package-dist`, `node_modules`, `tools` and `scripts`; `skip_clean` keeps Homebrew's cleaner out
+  of it) and links `bin/happier` to it. The runtime root comes from `process.execPath`, which Bun
+  resolves through the links to the real file in the keg, so the payload is found without the
+  managed `~/.happier/cli` layout. Optional runtimes (difftastic, local embeddings) are still
+  acquired on first use into `<happier home>`, as for any install.
+- **Origin.** `describeHappierCliOrigin` recognises Homebrew from the `Cellar/<formula>/` segment of
+  the resolved path. A compiled `happier` reports `argv[1]` as its embedded bundle
+  (`/$bunfs/root/happier`), so the running CLI's package-manager origin
+  (`resolveRunningCliPackageManagerOrigin`, `apps/cli/src/cli/runtime/update/cliUpdateFacts.ts`)
+  reads both the invoked path and `execPath`. `self update` and the K5 update facts consume that
+  one owner: `self update` prints `brew upgrade <formula>` instead of installing a managed copy,
+  and remote `cli.update.v1` refuses with `cli_not_managed`.
+- **Desktop.** A Homebrew `happier` is a CLI the managed layout did not place, so desktop setup asks
+  **Let Happier manage it** / **Keep my own** once ([One CLI per computer](#one-cli-per-computer-plan-r12)).
+- **No `brew services`.** The CLI owns its background service (`happier service install`).
+  The running executable resolves into the versioned keg (`Cellar/<formula>/<version>/…`), which
+  `brew upgrade` cleans up by default, so the service runtime owner
+  (`resolveDaemonServiceInstallRuntimeTarget`) records the same file through Homebrew's opt prefix
+  instead (`<prefix>/opt/<formula>/libexec/happier`, the `optPath` of the brew origin; the opt
+  prefix is a link to the active keg). Like the managed shim, the service launches that binary
+  directly with no entry path. An installed managed shim still takes precedence unless this
+  computer chose **Keep my own**. The expected definition the drift check builds resolves
+  to the same path before and after an upgrade, so an upgrade is not drift; a definition an older
+  CLI wrote with the keg path is ordinary drift between two user-installed launchers (not a
+  managed ↔ user runtime replacement) and is refreshed by `service start`/`restart`.
 
 ## Optional CLI runtimes
 
@@ -129,10 +320,22 @@ CLI-specific and must never block setup.
 
 What it guarantees:
 
+- **Never shadows another `happier` unasked, never duplicates the managed one.** Before writing
+  anything the owner resolves `happier` on the process PATH. If it already is the managed shim (for
+  example the POSIX installer's `~/.local/bin/happier` link to `<happier home>/bin/happier`), nothing
+  is added. If it is another CLI (npm, Homebrew, a checkout), what happens follows this computer's
+  R12 answer: with no answer nothing is added — prepending the managed directory would silently
+  change which CLI the user's terminal runs; after **Let Happier manage it** the line is written so
+  the managed CLI comes first; after **Keep my own** nothing is ever written. The result names the
+  other CLI as `existingCommand`, which the `cli.pathExposure.ensure.v1` result carries to machine
+  settings › Terminal. The PATH checked is the desktop process's own; a GUI launch whose PATH lacks a shell
+  directory can still write a line for a `happier` that shells already resolve.
 - **Byte-identical lines.** The POSIX export line and shell/rc-file selection are a transcription
   of `apps/website/public/install.sh`, so if the shell installer already wrote that exact line the
   desktop writes nothing. Deduplication is exact-line equality, and on Windows a case-insensitive
-  entry comparison against the user `Path`.
+  entry comparison against the user `Path`. On POSIX the installer writes its line for its own
+  `BIN_DIR` (`~/.local/bin`), not `<happier home>/bin`, so the two lines are not byte-identical;
+  the PATH check above, not line equality, is what keeps the desktop from adding a second one.
 - **Provenance, in both directions.** A Desktop-written POSIX line is preceded by
   `# Added by Happier Desktop`; on Windows the entries Desktop added are listed in the user
   environment variable `HAPPIER_DESKTOP_PATH_ENTRIES`. Removal
@@ -142,7 +345,9 @@ What it guarantees:
   removal scans every profile file in that same table (`.zshrc`, `.zprofile`, `.bashrc`,
   `.bash_profile`, `.profile`), so switching shells after setup cannot strand a marked line.
   Windows needs no equivalent: the user `Path` and `HAPPIER_DESKTOP_PATH_ENTRIES` live in
-  `HKCU\Environment` and are shell-independent.
+  `HKCU\Environment` and are shell-independent. A reorder Desktop made there after **Let Happier
+  manage it** is recorded in `HAPPIER_DESKTOP_PATH_MOVES` and undone by the same removal, only while
+  it still holds (see [One CLI per computer](#one-cli-per-computer-plan-r12)).
 - **Never gating.** The setup executor starts PATH exposure alongside the remaining service work
   and never waits for it: the app begins its readiness proof from the task result, so a
   shell-profile write must not sit between setup and the reveal. A read-only profile therefore
@@ -166,8 +371,14 @@ Limits, stated so they are not assumed away:
   and dragging the app to the Trash cannot run app code, so PATH cleanup happens only when the
   user asks for it in machine settings.
 - The installer's default POSIX `BIN_DIR` (`~/.local/bin`) differs from the Desktop-managed shim
-  directory (`<happier home>/bin`). When both installers have run, two valid lines coexist:
-  deduplication applies per directory, not per tool.
+  directory (`<happier home>/bin`). When a `happier` already resolves the desktop adds nothing
+  (INV5). On macOS, where an app opened from the Dock gets launchd's PATH, that check also searches
+  the service PATH owner's locations (`buildServicePath`: `~/.local/bin`, `~/bin`, Homebrew's
+  `/opt/homebrew/bin` and `/usr/local/bin`), so the installer link and an npm or Homebrew `happier`
+  in the standard locations are detected. A version manager's shim (nvm, fnm, volta) lives only on
+  the login shell's PATH and is **not** detected: the desktop then writes its line and the managed
+  CLI comes first in new terminals. On Linux the check reads the desktop's own PATH; when that
+  lacks `~/.local/bin`, two valid lines can coexist — both resolve the same managed binary.
 - **fish is not exposed.** `install.sh` routes every shell that is not bash or zsh to
   `~/.profile`, and the desktop transcribes that table verbatim (INV5), so a fish user gets a
   `~/.profile` line fish never reads and a reload hint that is not fish syntax. Changing this means
@@ -189,6 +400,8 @@ Published hosts currently include:
 - `packages/relay-server`
 
 Their `prepack` scripts run `scripts/bundleWorkspaceDeps.mjs` to copy bundled workspaces into the host package and vendor each bundled workspace's external runtime dependency tree under that workspace's bundled `node_modules`.
+
+Current source bundling preserves package-local `imports` declarations and their conditional order, alongside `exports`. The existing workspace copier and bootstrap sync include exact relative import targets outside `dist`; external package targets still use the package's declared dependency closure. Stack bundle freshness also observes those package-root targets, so changing only an imported runtime helper requires a refresh.
 
 ## Dependency ownership
 

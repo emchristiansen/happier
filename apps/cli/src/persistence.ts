@@ -24,6 +24,7 @@ import { logger } from '@/ui/logger';
 import { resolveMachineIdForServerFromSettings } from '@/daemon/resolveMachineIdForServerFromSettings';
 import { cleanupAtomicWriteTempFiles, cleanupAtomicWriteTempFilesSync, writeJsonAtomicSync } from '@/utils/fs/writeJsonAtomicSync';
 import { reclaimJsonOwnerFileLockSnapshot } from '@/utils/fs/jsonOwnerFileLock';
+import { isPidAliveBySignal } from '@/daemon/processRunState';
 import type { PublicReleaseRingLabel } from '@happier-dev/release-runtime/releaseRings';
 import { createServerUrlComparableKey } from '@happier-dev/protocol';
 import type { MachineReplacementReason } from '@happier-dev/protocol';
@@ -53,7 +54,11 @@ async function ensureHappyHomeDirExists(): Promise<void> {
   await bestEffortChmod(configuration.happyHomeDir, 0o700);
 }
 
-function resolveDaemonStateCandidatePathsForCurrentLifecycle(): readonly string[] {
+/**
+ * Every state file a daemon of the current lifecycle scope may have published: the canonical file
+ * plus the ring-scoped basenames of pre-canonical CLIs, all inside the one lifecycle directory.
+ */
+export function resolveDaemonStateCandidatePathsForCurrentLifecycle(): readonly string[] {
   return resolveDaemonStateCandidatePaths({
     serverDir: dirname(configuration.daemonStateFile),
     preferredRing: configuration.publicReleaseRing,
@@ -419,7 +424,7 @@ export async function readSettings(): Promise<Settings> {
     // Warn if schema version is newer than supported
     if (schemaVersion > SUPPORTED_SCHEMA_VERSION) {
       logger.warn(
-        `⚠️ Settings schema v${schemaVersion} > supported v${SUPPORTED_SCHEMA_VERSION}. ` +
+        `Settings file uses schema v${schemaVersion}, newer than the supported v${SUPPORTED_SCHEMA_VERSION}. ` +
         'Update Happier CLI for full functionality.'
       );
     }
@@ -662,11 +667,17 @@ export type Credentials = {
   }
 }
 
-export async function readCredentials(): Promise<Credentials | null> {
-  const primaryPath = configuration.privateKeyFile;
+export type CredentialReadScope = Readonly<{ serverId?: string }>;
+
+export async function readCredentials(scope: CredentialReadScope = {}): Promise<Credentials | null> {
+  const serverId = scope.serverId === undefined ? configuration.activeServerId : scope.serverId.trim();
+  if (!isServerIdFilesystemSafe(serverId)) return null;
+  const primaryPath = scope.serverId === undefined
+    ? configuration.privateKeyFile
+    : join(configuration.happyHomeDir, 'servers', serverId, 'access.key');
   const legacyPath = configuration.legacyPrivateKeyFile;
   const canUseLegacy =
-    configuration.activeServerId === 'cloud' &&
+    serverId === 'cloud' &&
     existsSync(legacyPath) &&
     !existsSync(primaryPath);
 
@@ -699,36 +710,27 @@ export async function readCredentials(): Promise<Credentials | null> {
   return null
 }
 
-export async function writeCredentialsLegacy(credentials: { secret: Uint8Array, token: string }): Promise<void> {
+async function writeStoredCredentialFile(credentials: z.infer<typeof credentialsSchema>): Promise<void> {
   await ensureHappyHomeDirExists();
-  await writeFile(configuration.privateKeyFile, JSON.stringify({
-    secret: encodeBase64(credentials.secret),
-    token: credentials.token
-  }, null, 2), { mode: 0o600 });
-  await bestEffortChmod(configuration.privateKeyFile, 0o600)
-
-  // Migrate legacy single-server credential file (cloud server only).
-  if (configuration.activeServerId === 'cloud' && configuration.legacyPrivateKeyFile !== configuration.privateKeyFile) {
-    if (existsSync(configuration.legacyPrivateKeyFile)) {
-      await unlink(configuration.legacyPrivateKeyFile).catch(() => {});
-    }
+  const serverId = configuration.activeServerId;
+  const keyPath = configuration.privateKeyFile;
+  const legacyPath = configuration.legacyPrivateKeyFile;
+  await writeFile(keyPath, JSON.stringify(credentials, null, 2), { mode: 0o600 });
+  await bestEffortChmod(keyPath, 0o600);
+  if (serverId === 'cloud' && legacyPath !== keyPath && existsSync(legacyPath)) {
+    await unlink(legacyPath).catch(() => {});
   }
 }
 
-export async function writeCredentialsDataKey(credentials: { publicKey: Uint8Array, machineKey: Uint8Array, token: string }): Promise<void> {
-  await ensureHappyHomeDirExists();
-  await writeFile(configuration.privateKeyFile, JSON.stringify({
-    encryption: { publicKey: encodeBase64(credentials.publicKey), machineKey: encodeBase64(credentials.machineKey) },
-    token: credentials.token
-  }, null, 2), { mode: 0o600 });
-  await bestEffortChmod(configuration.privateKeyFile, 0o600)
+export async function writeCredentialsLegacy(credentials: { secret: Uint8Array, token: string }): Promise<void> {
+  await writeStoredCredentialFile({ secret: encodeBase64(credentials.secret), token: credentials.token });
+}
 
-  // Migrate legacy single-server credential file (cloud server only).
-  if (configuration.activeServerId === 'cloud' && configuration.legacyPrivateKeyFile !== configuration.privateKeyFile) {
-    if (existsSync(configuration.legacyPrivateKeyFile)) {
-      await unlink(configuration.legacyPrivateKeyFile).catch(() => {});
-    }
-  }
+export async function writeCredentialsDataKey(credentials: { publicKey: Uint8Array, machineKey: Uint8Array, token: string }): Promise<void> {
+  await writeStoredCredentialFile({
+    encryption: { publicKey: encodeBase64(credentials.publicKey), machineKey: encodeBase64(credentials.machineKey) },
+    token: credentials.token,
+  });
 }
 
 export async function clearCredentials(): Promise<void> {
@@ -1083,10 +1085,64 @@ export async function clearDaemonStateForTests(options: Readonly<{
 }
 
 /**
- * Acquire an exclusive lock file for the daemon.
- * The lock file proves the daemon is running and prevents multiple instances.
- * Returns the file handle to hold for the daemon's lifetime, or null if locked.
+ * Reclaim a departed publication through the exact-owner file primitive. Stop observers
+ * capture the lock before probing control; a replaced lock or state cancels cleanup.
+ * Live, access-denied and uninspectable PIDs stay protected by the shared signal probe.
  */
+export async function reclaimDeadDaemonPublication(options: Readonly<{
+  stateFile?: string;
+  expectedState?: Readonly<{ pid: number; httpPort: number; startedAt?: number; controlToken?: string }> | null;
+  expectedPid?: number;
+  expectedLockRaw?: string | null;
+}> = {}): Promise<boolean> {
+  const stateFile = options.stateFile ?? configuration.daemonStateFile;
+  const lockFile = `${stateFile}.lock`;
+  const readOptional = (path: string): string | null => {
+    try { return readFileSync(path, 'utf8'); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  };
+  try {
+    const lockRaw = options.expectedLockRaw === undefined ? readOptional(lockFile) : options.expectedLockRaw;
+    const expected = options.expectedState ?? null;
+    const lockPid = lockRaw === null ? null : Number(lockRaw.trim());
+    const pid = expected?.pid ?? lockPid;
+    if (options.expectedPid !== undefined && pid !== options.expectedPid) return false;
+    if (!pid || !Number.isSafeInteger(pid) || pid <= 0 || isPidAliveBySignal(pid)) return false;
+    if (lockRaw !== null && lockPid !== pid) return false;
+    if (readOptional(lockFile) !== lockRaw) return false;
+    const stateRaw = readOptional(stateFile);
+    if (stateRaw !== null) {
+      const parsed = DaemonLocallyPersistedStateSchema.safeParse(JSON.parse(stateRaw));
+      if (!parsed.success || !expected) return false;
+      const current = normalizeDaemonState(parsed.data);
+      if (current.pid !== expected.pid || current.httpPort !== expected.httpPort
+        || current.controlToken !== expected.controlToken
+        || (expected.startedAt !== undefined && current.startedAt !== expected.startedAt)) return false;
+      const reclaimed = await reclaimJsonOwnerFileLockSnapshot(stateFile, stateRaw, async (quarantinePath) => {
+        const raw = await readFile(quarantinePath, 'utf8');
+        if (isPidAliveBySignal(pid) || readOptional(lockFile) !== lockRaw) throw new Error('Daemon owner changed during cleanup');
+        return raw;
+      });
+      if (reclaimed !== 'reclaimed') return false;
+    } else if (expected) {
+      // A daemon may have completed its own publication cleanup already.
+      if (readOptional(lockFile) !== lockRaw) return false;
+    }
+    if (lockRaw === null) return true;
+    return await reclaimJsonOwnerFileLockSnapshot(lockFile, lockRaw, async (quarantinePath) => {
+      const raw = await readFile(quarantinePath, 'utf8');
+      if (isPidAliveBySignal(pid) || readOptional(stateFile) !== null) throw new Error('Daemon publication changed during cleanup');
+      return raw;
+    }) === 'reclaimed';
+  } catch {
+    return false;
+  }
+}
+
+/** Acquire the exclusive lifecycle lock, retaining live or unverified owners. */
 export async function acquireDaemonLock(
   maxAttempts: number = 5,
   delayIncrementMs: number = 200
@@ -1139,13 +1195,7 @@ export async function acquireDaemonLock(
               return null;
             }
 
-            let processExists = false;
-            try {
-              process.kill(pid, 0); // Check if process exists
-              processExists = true;
-            } catch (probeError) {
-              processExists = (probeError as NodeJS.ErrnoException | null)?.code === 'EPERM';
-            }
+            const processExists = isPidAliveBySignal(pid);
             if (processExists) {
               // PID reuse safety: only treat the lock as valid if the PID looks like a happier daemon.
               // Otherwise a recycled PID can wedge daemon startup forever.

@@ -90,11 +90,7 @@ const stylesheet = StyleSheet.create((theme) => ({
     },
 }));
 
-export type SidebarNavigatorProps = Readonly<{
-    desktopUpdateIndicator?: React.ReactNode;
-}>;
-
-export const SidebarNavigator = React.memo((props: SidebarNavigatorProps) => {
+export const SidebarNavigator = React.memo(() => {
     const styles = stylesheet;
     const auth = useAuth();
     const isTablet = useIsTablet();
@@ -225,7 +221,6 @@ export const SidebarNavigator = React.memo((props: SidebarNavigatorProps) => {
 
     const sidebar = !showSidebar ? null : effectiveSidebarCollapsed ? (
         <CollapsedSidebarView
-            desktopUpdateIndicator={props.desktopUpdateIndicator}
             focusModeActive={paneFocusModeChromeActive}
             onExitFocusMode={handleCollapsedSidebarExitFocusMode}
             onRequestExpand={handleCollapsedSidebarExpand}
@@ -249,7 +244,6 @@ export const SidebarNavigator = React.memo((props: SidebarNavigatorProps) => {
             >
                 <SidebarView
                     sidebarWidthPx={sidebarWidth}
-                    desktopUpdateIndicator={props.desktopUpdateIndicator}
                     inboxSummary={inboxSummary}
                     inboxEnabled={inboxEnabled}
                 />

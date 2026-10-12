@@ -107,9 +107,18 @@ hdev self update
 
 There is no separate public daemon installer endpoint today; the daemon rides with the matching CLI lane on that machine.
 
+After a successful `self update`, a daemon that lane's background service is running is restarted so it runs the new
+version. A daemon you started yourself (`happier daemon start`) and another lane's service are left running; restart
+those yourself when you are ready.
+
 ### Side-by-side installs (stable vs preview vs dev)
 
 You can install all three public lanes side-by-side (`happier`, `hprev`, `hdev`) without them overwriting each other.
+
+The unsuffixed `happier` command belongs to the lane you installed first, or the one you last picked with the
+installer's `--channel`. Installing or updating another lane — including a desktop app of another lane — adds only
+that lane's own command (`hprev`, `hdev`) and never changes what `happier` runs. The desktop app of another lane
+uses your default lane's CLI and its background service instead of installing a second one.
 
 Daemon runtime state is lane-scoped, and daemon services (LaunchAgent/systemd/Scheduled Task) use lane-scoped service identifiers.
 To inspect the exact service name/label/unit on your platform, run:
@@ -141,7 +150,7 @@ happier daemon service restart
 Platform notes:
 
 - **macOS**: LaunchAgent
-- **Linux**: `systemd --user`
+- **Linux**: `systemd --user`, with `systemctl` available and a working systemd user session. Linux systems without systemd cannot use this automatic startup path.
 - **Windows**: Scheduled Task (user-level)
 
 ### Installed, but not started at login
@@ -207,3 +216,23 @@ This is especially useful for provisioning headless servers because you can appr
 - **Check status**: `happier daemon status`
 - **Find logs**: `happier daemon logs`
 - **Service paths**: `happier daemon service paths`
+
+### Linux without systemctl
+
+If `systemctl` is unavailable, automatic startup cannot be installed. After signing in, check
+`happier daemon status`. If no daemon is running for the selected relay, start one manually:
+
+```bash
+happier daemon start
+```
+
+This starts the daemon for the current machine session; it does not arrange startup after login
+or reboot. Missing `systemctl` in your shell does not prove systemd is stopped. Manual recovery
+does not disable an existing service: if its automatic startup resumes later, that service can
+take over a conflicting manually started daemon under the existing ownership rules.
+
+The development CLI checks for missing service commands before installation or doctor repair
+changes service definitions. It also lets manual startup proceed past readable leftover systemd
+units when `systemctl` is absent. Running daemon ownership and unreadable service state still
+protect against conflicting starts. This correction is not yet established as available in a
+published stable or preview release.

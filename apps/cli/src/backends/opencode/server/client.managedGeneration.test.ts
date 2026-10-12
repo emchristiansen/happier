@@ -62,9 +62,10 @@ describe('createOpenCodeServerRuntimeClient managed generation authority', () =>
   });
 
   it.each([
-    ['auto', 'v1', '/api/health', '/session'],
-    ['auto', 'v2', '/api/health', '/api/session'],
+    ['auto', 'v1', '/global/health', '/session'],
+    ['auto', 'v2', '/global/health', '/api/session'],
     ['v2', 'v2', '/api/health', '/api/session'],
+    ['v2', 'v1', '/api/health', '/session'],
   ] as const)('uses the canonical health probe for managed %s identity backed by a %s server', async (
     apiGeneration,
     serverGeneration,
@@ -76,16 +77,19 @@ describe('createOpenCodeServerRuntimeClient managed generation authority', () =>
       const path = new URL(req.url ?? '/', 'http://localhost').pathname;
       paths.push(path);
       const body = path === '/global/health' && serverGeneration === 'v1'
-        ? { healthy: true, version: '1.18.25' }
-        : path === '/api/health' && serverGeneration === 'v2'
+        ? { healthy: true, version: '1.18.35' }
+        : path === '/api/health'
           ? { healthy: true }
           : path === '/api/session'
             ? { data: [] }
             : path === '/session'
               ? []
+              : path === '/mcp'
+                ? { happier: { status: 'connected' } }
               : { error: 'not found' };
       const available = (path === '/global/health' && serverGeneration === 'v1')
-        || (path === '/api/health' && serverGeneration === 'v2')
+        || path === '/api/health'
+        || path === '/mcp'
         || path === '/session'
         || path === '/api/session';
       res.writeHead(available ? 200 : 404, {
@@ -100,7 +104,7 @@ describe('createOpenCodeServerRuntimeClient managed generation authority', () =>
     const statePath = join(dir, 'managed-server.json');
     envScope.patch({
       HAPPIER_OPENCODE_SERVER_STATE_PATH: statePath,
-      HAPPIER_OPENCODE_CLI_GENERATION: apiGeneration === 'auto' ? 'stable' : 'v2',
+      HAPPIER_OPENCODE_CLI_GENERATION: serverGeneration === 'v1' ? 'stable' : apiGeneration,
       HAPPIER_OPENCODE_SERVER_URL: undefined,
     });
     writeFileSync(statePath, JSON.stringify({
@@ -121,6 +125,12 @@ describe('createOpenCodeServerRuntimeClient managed generation authority', () =>
       messageBuffer: new MessageBuffer(),
     });
     await expect(client.sessionList()).resolves.toEqual([]);
+    if (serverGeneration === 'v1') {
+      await expect(client.mcpAdd({ name: 'happier', config: { type: 'local', enabled: true } }))
+        .resolves.toEqual({ status: 'connected' });
+      expect(paths).toContain('/mcp');
+      expect(paths).not.toContain('/api/experimental/mcp/happier');
+    }
     await client.dispose();
 
     expect(paths[0]).toBe(firstHealthPath);
@@ -187,4 +197,99 @@ describe('createOpenCodeServerRuntimeClient managed generation authority', () =>
 
     expect(authorizations.at(-1)).toBe(expectedAuthorization);
   });
+
+  it('keeps an activated catalog read on its endpoint and credential during managed replacement', async () => {
+    const authorization = (password: string) => `Basic ${Buffer.from(`opencode:${password}`, 'utf8').toString('base64')}`;
+    const originalSkills = [{ id: 'original-skill', name: 'original' }];
+    const replacementSkills = [{ id: 'replacement-skill', name: 'replacement' }];
+    let releaseActivation = () => {};
+    const activationHeld = new Promise<void>((resolve) => { releaseActivation = resolve; });
+    let activationEntered = () => {};
+    const activationStarted = new Promise<void>((resolve) => { activationEntered = resolve; });
+    let replacementActivated = false;
+    let replacementMessageReads = 0;
+    const originalCatalogAuthorizations: Array<string | undefined> = [];
+    const replacementCatalogAuthorizations: Array<string | undefined> = [];
+    const json = (res: ServerResponse, body: unknown, status = 200) => {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(body));
+    };
+    const original = await startServer((req, res) => {
+      const path = new URL(req.url ?? '/', 'http://localhost').pathname;
+      if (path === '/api/health') return json(res, { healthy: true });
+      if (path === '/api/info') return json(res, { version: '2.0.20', pid: process.pid });
+      if (path === '/api/session/fixture/message') {
+        // A genuine transport failure makes the existing safe-read retry owner refresh state.
+        req.socket.destroy();
+        return;
+      }
+      if (path === '/api/integration') {
+        activationEntered();
+        void activationHeld.then(() => json(res, { data: [] }));
+        return;
+      }
+      if (path === '/api/skill') {
+        originalCatalogAuthorizations.push(req.headers.authorization);
+        return json(res, { data: originalSkills }, req.headers.authorization === authorization('original-secret') ? 200 : 401);
+      }
+      return json(res, { error: 'not found' }, 404);
+    });
+    servers.add(original);
+    const replacement = await startServer((req, res) => {
+      const path = new URL(req.url ?? '/', 'http://localhost').pathname;
+      if (path === '/api/health') return json(res, { healthy: true });
+      if (path === '/api/info') return json(res, { version: '2.0.20', pid: process.pid });
+      if (path === '/api/session/fixture/message') {
+        replacementMessageReads += 1;
+        return json(res, { data: [] });
+      }
+      if (path === '/api/integration') {
+        replacementActivated = true;
+        return json(res, { data: [] });
+      }
+      if (path === '/api/skill') {
+        replacementCatalogAuthorizations.push(req.headers.authorization);
+        return json(res, { data: replacementActivated ? replacementSkills : [] },
+          req.headers.authorization === authorization('replacement-secret') ? 200 : 401);
+      }
+      return json(res, { error: 'not found' }, 404);
+    });
+    servers.add(replacement);
+    const dir = createTempDirSync('happier-opencode-catalog-replacement-');
+    tempDirs.add(dir);
+    const statePath = join(dir, 'managed-server.json');
+    envScope.patch({
+      HAPPIER_OPENCODE_SERVER_STATE_PATH: statePath,
+      HAPPIER_OPENCODE_CLI_GENERATION: 'v2',
+      HAPPIER_OPENCODE_SERVER_URL: undefined,
+      OPENCODE_PASSWORD: undefined,
+      OPENCODE_SERVER_PASSWORD: undefined,
+      OPENCODE_SERVER_USERNAME: undefined,
+    });
+    const writeState = (server: StartedServer, password: string) => writeFileSync(statePath, JSON.stringify({
+      baseUrl: server.baseUrl, pid: process.pid, startedAtMs: Date.now(), status: 'ready',
+      launchEnvFingerprint: resolveOpenCodeManagedServerLaunchFingerprint({
+        baseEnv: process.env, xdgRootDir: null, isolateConfig: false,
+      }),
+      apiGeneration: 'v2', authPassword: password,
+    }));
+    writeState(original, 'original-secret');
+    const client = await createOpenCodeServerRuntimeClient({ directory: '/repo', messageBuffer: new MessageBuffer() });
+    const catalog = client.appSkills();
+    try {
+      await activationStarted;
+      writeState(replacement, 'replacement-secret');
+      await expect(client.sessionMessagesList({ sessionId: 'fixture' })).resolves.toEqual([]);
+      expect(replacementMessageReads).toBe(1);
+      releaseActivation();
+      expect(await catalog).toEqual(originalSkills);
+      expect(originalCatalogAuthorizations).toEqual([authorization('original-secret')]);
+      expect(replacementCatalogAuthorizations).toEqual([]);
+      expect(await client.appSkills()).toEqual(replacementSkills);
+      expect(replacementCatalogAuthorizations).toEqual([authorization('replacement-secret')]);
+    } finally {
+      releaseActivation();
+      await Promise.allSettled([catalog, client.dispose()]);
+    }
+  }, 30_000);
 });

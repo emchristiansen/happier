@@ -8,10 +8,37 @@ import { WINDOWS_REMOTE_SESSION_LAUNCH_MODES } from './windowsRemoteSessionLaunc
  * Use factory forms for nohoist/multi-Zod repos.
  */
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function normalizeTerminalWireSelectors(value: unknown): unknown {
+  if (!isRecord(value)) return value;
+  const { hostKind, requestedHostKind, ...terminal } = value;
+  return {
+    ...terminal,
+    ...(hostKind === 'herdr'
+      ? (terminal.mode === 'plain' ? { mode: 'herdr' } : {})
+      : (hostKind === undefined ? {} : { hostKind })),
+    ...(requestedHostKind === 'herdr'
+      ? (terminal.requested === 'plain' ? { requested: 'herdr' } : {})
+      : (requestedHostKind === undefined ? {} : { requestedHostKind })),
+  };
+}
+
+export function createHerdrTerminalMetadataSchema(zod: typeof z) {
+  return zod.object({
+    sessionName: zod.string(),
+    socketPath: zod.string(),
+    terminalId: zod.string(),
+    paneId: zod.string().optional(),
+  });
+}
+
 export function createSessionTerminalMetadataSchema(zod: typeof z) {
-  const terminalModeSchema = zod.enum(['plain', 'tmux', 'zellij', 'windows_terminal', 'windows_console']);
-  const requestedModeSchema = zod.enum(['plain', 'tmux', 'zellij', ...WINDOWS_REMOTE_SESSION_LAUNCH_MODES]);
-  return zod
+  const terminalModeSchema = zod.enum(['plain', 'tmux', 'zellij', 'herdr', 'windows_terminal', 'windows_console']);
+  const requestedModeSchema = zod.enum(['plain', 'tmux', 'zellij', 'herdr', ...WINDOWS_REMOTE_SESSION_LAUNCH_MODES]);
+  const schema = zod
     .object({
       // Optional only for compatibility with retirement tombstones written by the
       // first attachment-bound serviceability writer before it preserved host mode.
@@ -40,6 +67,7 @@ export function createSessionTerminalMetadataSchema(zod: typeof z) {
           socketDirV1: zod.string().optional(),
         })
         .optional(),
+      herdr: createHerdrTerminalMetadataSchema(zod).optional(),
       windows: zod
         .object({
           host: zod.enum(['windows_terminal', 'console']),
@@ -59,10 +87,45 @@ export function createSessionTerminalMetadataSchema(zod: typeof z) {
         message: 'Terminal mode is required outside legacy retirement tombstones',
       });
     });
+  return zod.preprocess(normalizeTerminalWireSelectors, schema);
 }
 
 export const SessionTerminalMetadataSchema = createSessionTerminalMetadataSchema(z);
 export type SessionTerminalMetadata = z.infer<typeof SessionTerminalMetadataSchema>;
+
+/**
+ * Released UIs through ui-web-v0.2.12 reject unknown values in both terminal
+ * enums, rejecting the entire Session metadata. Keep those enum fields readable
+ * and carry Herdr's actual host/request as additive passthrough properties.
+ * Domain readers immediately normalize them; they are never a second selector.
+ */
+export function projectSessionMetadataForWire(metadata: unknown): unknown {
+  if (!isRecord(metadata) || !isRecord(metadata.terminal)) return metadata;
+  const terminal = normalizeTerminalWireSelectors(metadata.terminal);
+  if (!isRecord(terminal)) return metadata;
+  return {
+    ...metadata,
+    terminal: {
+      ...terminal,
+      ...(terminal.mode === 'herdr' ? { mode: 'plain', hostKind: 'herdr' } : {}),
+      ...(terminal.requested === 'herdr' ? { requested: 'plain', requestedHostKind: 'herdr' } : {}),
+    },
+  };
+}
+
+export function normalizeSessionMetadataForRead<T extends { terminal?: unknown }>(
+  metadata: T,
+): Omit<T, 'terminal'> & { terminal?: SessionTerminalMetadata };
+export function normalizeSessionMetadataForRead<T extends { terminal?: unknown }>(
+  metadata: T | null,
+): (Omit<T, 'terminal'> & { terminal?: SessionTerminalMetadata }) | null;
+export function normalizeSessionMetadataForRead<T extends { terminal?: unknown }>(metadata: T | null) {
+  if (metadata === null) return null;
+  const { terminal, ...rest } = metadata;
+  return terminal === undefined
+    ? rest
+    : { ...rest, terminal: SessionTerminalMetadataSchema.parse(terminal) };
+}
 
 export type TerminalControlServiceabilityPolicy = Readonly<{
   hostPresence: 'absent' | 'preserved' | 'retired';

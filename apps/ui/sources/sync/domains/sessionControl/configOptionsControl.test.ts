@@ -15,6 +15,20 @@ function createMetadata(overrides: Partial<Metadata> = {}): Metadata {
 }
 
 describe('computeSessionConfigOptionControls', () => {
+    it('reads configured ACP controls and hides dedicated models only for the same backend', () => {
+        const metadata = createMetadata({
+            acpConfiguredBackendV1: { v: 1, backendId: 'custom-one', title: 'Custom', updatedAt: 1 },
+            sessionConfigOptionsV1: { v: 1, provider: 'acp:custom-one', updatedAt: 1, configOptions: [
+                { id: 'model', name: 'Model', type: 'select', currentValue: 'm', options: [{ value: 'm', name: 'M' }] },
+                { id: 'telemetry', name: 'Telemetry', type: 'boolean', currentValue: 'false' },
+            ] },
+            sessionModelsV1: { v: 1, provider: 'acp:custom-one', updatedAt: 1, currentModelId: 'm', availableModels: [{ id: 'm', name: 'M' }] },
+        });
+        expect(computeSessionConfigOptionControls({ agentId: 'customAcp', metadata })?.map((row) => row.option.id)).toEqual(['telemetry']);
+        metadata.acpConfiguredBackendV1 = { v: 1, backendId: 'custom-two', title: 'Other', updatedAt: 2 };
+        expect(computeSessionConfigOptionControls({ agentId: 'customAcp', metadata })).toBeNull();
+    });
+
     it('returns null when ACP config options are missing', () => {
         expect(computeSessionConfigOptionControls({ agentId: 'opencode', metadata: null })).toBeNull();
         expect(computeSessionConfigOptionControls({ agentId: 'opencode', metadata: createMetadata() })).toBeNull();

@@ -3,10 +3,7 @@ import type { AcpPermissionHandler } from '@/agent/acp/AcpBackend';
 import type { PermissionMode } from '@/api/types';
 import type { PiBridgeSessionConfig } from '@/backends/pi/bridgeExtension';
 import {
-  PI_BROKER_PROVIDERS,
-  PI_BROKER_SELECTIONS_ENV,
-  parsePiBrokerSelections,
-  resolvePiBrokerExtensionPath,
+  resolvePiBrokerExtensionArgs,
 } from '@/backends/pi/brokerExtension';
 import { PiRpcBackend } from '@/backends/pi/rpc/PiRpcBackend';
 import { readConnectedServiceChildSelectionsFromEnv } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
@@ -105,16 +102,6 @@ function resolvePiLaunchSelectionFromConnectedServiceSelection(
   return null;
 }
 
-function resolvePiBrokerExtensionArgs(env: Readonly<Record<string, string>>): string[] {
-  const agentDir = env.PI_CODING_AGENT_DIR?.trim();
-  if (!agentDir) return [];
-
-  const selections = parsePiBrokerSelections(env[PI_BROKER_SELECTIONS_ENV]);
-  const hasBrokeredProvider = PI_BROKER_PROVIDERS.some((provider) => selections[provider]);
-  if (!hasBrokeredProvider) return [];
-
-  return ['--extension', resolvePiBrokerExtensionPath(agentDir)];
-}
 
 /**
  * Tools-bridge extension arguments. Both-or-neither with the Happier session binding:

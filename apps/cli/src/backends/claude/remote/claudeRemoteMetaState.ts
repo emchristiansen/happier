@@ -1,3 +1,4 @@
+import { normalizeClaudeSettingSourcesV2 } from '@/backends/claude/utils/resolveClaudeSettingSources';
 import {
     CLAUDE_UNIFIED_TERMINAL_HOSTS,
     CLAUDE_UNIFIED_TERMINAL_RESUME_CHOICES,
@@ -23,6 +24,7 @@ export type ClaudeRemoteMetaState = Readonly<{
      * Kept for back-compat with older clients. New code should prefer `claudeRemoteSettingSourcesV2`.
      */
     claudeRemoteSettingSources: 'project' | 'user_project' | 'none';
+    claudeCodeIncludeInNativeHistory: boolean;
     claudeCodeExperimentalAgentTeamsEnabled: boolean;
     claudeLocalPermissionBridgeEnabled: boolean;
     claudeLocalPermissionBridgeWaitIndefinitely: boolean;
@@ -37,7 +39,6 @@ export type ClaudeRemoteMetaState = Readonly<{
     claudeRemoteAdvancedOptionsJson: string;
 }>;
 
-const SETTING_SOURCES_V2_ORDER = ['user', 'project', 'local'] as const;
 const DEBUG_CATEGORIES_ORDER = ['api', 'mcp', 'hooks', 'file', '1p'] as const;
 
 function isClaudeUnifiedTerminalHost(value: string): value is ClaudeUnifiedTerminalHost {
@@ -46,20 +47,6 @@ function isClaudeUnifiedTerminalHost(value: string): value is ClaudeUnifiedTermi
 
 function isClaudeUnifiedTerminalResumeChoice(value: string): value is ClaudeUnifiedTerminalResumeChoice {
     return (CLAUDE_UNIFIED_TERMINAL_RESUME_CHOICES as readonly string[]).includes(value);
-}
-
-function normalizeSettingSourcesV2(raw: unknown): ('user' | 'project' | 'local')[] | null {
-    if (!Array.isArray(raw)) return null;
-    const set = new Set<string>();
-    for (const value of raw) {
-        if (typeof value !== 'string') continue;
-        set.add(value);
-    }
-    const out: ('user' | 'project' | 'local')[] = [];
-    for (const key of SETTING_SOURCES_V2_ORDER) {
-        if (set.has(key)) out.push(key);
-    }
-    return out;
 }
 
 function normalizeDebugCategories(raw: unknown): Array<'api' | 'mcp' | 'hooks' | 'file' | '1p'> | null {
@@ -85,6 +72,7 @@ export const DEFAULT_CLAUDE_REMOTE_META_STATE: ClaudeRemoteMetaState = Object.fr
     // Default to loading BOTH user + project settings so Claude Code can see the user's
     // globally configured MCP servers (and other preferences) when launched by Happier.
     claudeRemoteSettingSources: 'user_project',
+    claudeCodeIncludeInNativeHistory: false,
     claudeCodeExperimentalAgentTeamsEnabled: false,
     claudeLocalPermissionBridgeEnabled: true,
     claudeLocalPermissionBridgeWaitIndefinitely: true,
@@ -134,7 +122,7 @@ export function applyClaudeRemoteMetaState(prev: ClaudeRemoteMetaState, meta: un
         }
     }
 
-    const normalizedV2 = normalizeSettingSourcesV2(record.claudeRemoteSettingSourcesV2);
+    const normalizedV2 = normalizeClaudeSettingSourcesV2(record.claudeRemoteSettingSourcesV2);
     if (normalizedV2 !== null) {
         next.claudeRemoteSettingSourcesV2 = normalizedV2;
     }
@@ -144,6 +132,10 @@ export function applyClaudeRemoteMetaState(prev: ClaudeRemoteMetaState, meta: un
         if (value === 'project' || value === 'user_project' || value === 'none') {
             next.claudeRemoteSettingSources = value;
         }
+    }
+
+    if (typeof record.claudeCodeIncludeInNativeHistory === 'boolean') {
+        next.claudeCodeIncludeInNativeHistory = record.claudeCodeIncludeInNativeHistory;
     }
 
     if (typeof record.claudeCodeExperimentalAgentTeamsEnabled === 'boolean') {

@@ -1,11 +1,61 @@
 # Pending delivery architecture
 
+## Explicit non-interrupting delivery (development)
+
+**Steer now** requests immediate delivery of the exact Pending row without
+interrupting the agent. The server claims it as `send` when the foreground is
+ready and `steer` while a turn is active. An idle live runner accepts it through
+its ordinary prompt path. If active steering is unavailable before provider
+effect, the runner retains the same prompt and identity in its existing queue
+for the next safe input slot. **Send now** retains its separate interrupt-and-send
+behavior.
+
+The server's existing requested action accompanies the claimed provider action
+through the runner queue. This preserves the distinction from automatic
+`steer_if_active`: when that conditional steer becomes unavailable before effect,
+the canonical Pending owner returns it to ordinary delivery admission, including
+`after_runtime_idle`. Explicit steering does not require the foreground or
+background activity summary to become idle first.
+
+Claude terminal readiness uses positive native generation evidence even when a
+turn-start lifecycle signal is missing or delayed. Input safety and provider
+acceptance remain owned by the existing terminal readiness and custody paths.
+Once a provider effect may have occurred, steering failures do not automatically
+replay the prompt through ordinary delivery.
+
 ## UI settlement convergence (development)
 
 Provider acceptance carries the exact Pending `localId` to `SessionClient`, which
 requests server settlement. The server transaction commits or updates the
 transcript message and removes that Pending row before publishing the message
 event and the separate Pending count/version event.
+
+In development source, Claude unified terminal reports exact transcript-proven acceptance before stopping
+for missing required session hooks. The hook failure still stops the wrapper and
+surfaces a runtime issue; it does not make an already accepted prompt undelivered
+or eligible for replay. The arbiter owns this ordering even when the transcript
+evidence arrives while the terminal injection is still completing.
+
+An in-flight Claude unified-terminal steer stays pending while Claude holds it in
+its native queue. `UserPromptSubmit` can fire at enqueue and does not prove that
+Claude has consumed the steer. The arbiter accepts a steer from its exact
+transcript consumption evidence; the existing queued-command matcher correlates
+the native enqueue/remove episode with its main-chain `queued_command` attachment.
+The session scanner observes that evidence after awaiting earlier visible-message
+commits, including known resumes and rows appended while the replay baseline loads.
+There is no separate acceptance-only follower of the resume transcript.
+Hookless discovery identifies the main transcript without settling Pending; its
+newly created transcript enters that same ordered live importer from the first row.
+The queued indicator and exact-row interrupt action remain owned by terminal
+custody until that acceptance. Prompts injected to start a new turn may still use
+their exact submission hook as acceptance evidence.
+
+In development source, identical unresolved Claude terminal attempts remain
+ambiguous: transcript text and a new provider UUID cannot identify a Pending
+row. Already ambiguous evidence and delayed echoes of hook-confirmed prompts
+cannot settle a later attempt. Exact canonical retirement removes the retired
+attempt's correlation without reporting provider acceptance; new unique evidence
+can then settle a remaining attempt.
 
 The UI's canonical pending snapshot owns exact server-row reconciliation.
 Receiving a committed user message whose `localId` matches a displayed
@@ -14,6 +64,17 @@ already contains the identical message. Transcript equality does not establish
 Pending freshness. The committed twin alone cannot authorize row removal: a
 snapshot may legitimately retain it. Local-outbox reconciliation and repeated
 message side effects keep their existing owners; this recovery adds no polling.
+
+The pending snapshot owner coalesces the complete read and reconciliation while
+the session's Pending version, transcript, decryption context, and captured
+transport lifetime remain unchanged. A newer receipt, transcript update, or local
+Pending edit starts a fresh server read, bypassing
+generic HTTP in-flight sharing. Publication rejects reads captured before the
+current Pending version, including first-open sessions with no loaded transcript
+sequence. Socket receipts publish their version before awaiting transcript
+materialization; row retirement still waits for that materialization. Existing
+acceptance and committed-sequence fences continue to protect in-flight sends and
+legitimate durable Pending/transcript coexistence.
 
 To distinguish settlement from display failures, inspect the canonical Pending
 read for the exact session and `localId`. A retained server row points to

@@ -1,15 +1,42 @@
 import { describe, expect, it, vi } from 'vitest';
+import * as tmp from 'tmp';
+import { configuration } from '@/configuration';
+import { readTerminalAttachmentInfo } from '@/terminal/attachment/terminalAttachmentInfo';
 
 import {
   primeAgentStateForUi,
   reportSessionToDaemonIfRunning,
   resolveTerminalAttachmentPersistenceBinding,
+  persistTerminalAttachmentInfoIfNeeded,
 } from '@/agent/runtime/startupSideEffects';
 import type { Metadata } from '@/api/types';
 
 const metadataStub = {} as Metadata;
 
 describe('startup side effects: daemon session reporting retry', () => {
+  it.each(['terminal', 'daemon'] as const)('persists the current Herdr terminal as %s ownership', async (startedBy) => {
+    const dir = tmp.dirSync({ unsafeCleanup: true });
+    const home = Object.getOwnPropertyDescriptor(configuration, 'happyHomeDir')!;
+    Object.defineProperty(configuration, 'happyHomeDir', { ...home, value: dir.name });
+    const terminal: NonNullable<Metadata['terminal']> = {
+      mode: 'herdr',
+      herdr: { sessionName: 'work', socketPath: '/tmp/work.sock', terminalId: 'term_42', paneId: 'w1:p2' },
+      controlServiceabilityV1: { v: 1, attachmentId: 'attachment-current', state: 'servable', observedAt: 1 },
+    };
+    try {
+      await persistTerminalAttachmentInfoIfNeeded({ sessionId: 'current-terminal', terminal, startedBy });
+      expect(await readTerminalAttachmentInfo({ happyHomeDir: dir.name, sessionId: 'current-terminal' })).toMatchObject({
+        version: startedBy === 'terminal' ? 3 : 2,
+        ...(startedBy === 'terminal' ? { lifecycle: 'borrowed' } : {}),
+        attachmentId: 'attachment-current',
+        handle: { kind: 'herdr', terminalId: 'term_42' },
+      });
+    } finally {
+      Object.defineProperty(configuration, 'happyHomeDir', home);
+      dir.removeCallback();
+    }
+  });
+
   it('resolves the existing bound tmux identity for local attachment persistence', () => {
     expect(resolveTerminalAttachmentPersistenceBinding({
       mode: 'tmux',

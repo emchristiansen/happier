@@ -40,7 +40,7 @@ import {
     type RemoteServerAvailability,
     type RemoteSignupOptions,
 } from "@/components/account/auth/useRemoteAuthEntryOptions";
-import { DesktopLocalSetupGate } from "@/setup/DesktopLocalSetupGate";
+import { DesktopLocalSetupPanel } from "@/setup/DesktopLocalSetupPanel";
 
 const DEFAULT_WELCOME_SERVER_CHECK_TIMEOUT_MS = 6_000;
 const DEFAULT_WELCOME_SERVER_CHECK_RETRY_DELAY_MS = 1_000;
@@ -120,14 +120,25 @@ function Authenticated() {
             router.replace('/setup');
             return;
         }
-        // R9/INV1: a `thisComputer` continuation is `DesktopLocalSetupGate`'s job, and this route
-        // already renders that gate. Consume the continuation here rather than handing it to a
-        // second setup surface that would start the executor in parallel.
+        // R9/INV1: a `thisComputer` continuation is the shell's one setup lifecycle's job
+        // (`DesktopLocalSetupRuntime`), and this route presents it. Consume the continuation here
+        // rather than handing it to a second setup surface that would start the executor in
+        // parallel.
         clearPendingSetupIntent();
     }, [router, sessionId]);
 
     if (isTauriDesktop()) {
-        return <DesktopLocalSetupGate />;
+        // R11 — setup runs at the shell and never blocks the rest of the app. The Home presents it
+        // as the blurred setup veil over the Home content area only: the sidebar, header chrome,
+        // navigation and every other route stay usable.
+        return (
+            <View style={styles.desktopHome}>
+                <View style={styles.desktopHomeContent}>
+                    <MainView variant="phone" />
+                </View>
+                <DesktopLocalSetupPanel />
+            </View>
+        );
     }
     return <MainView variant="phone" />;
 }
@@ -452,6 +463,14 @@ function NotAuthenticated() {
 }
 
 const styles = StyleSheet.create((theme) => ({
+    // Desktop Home: its own content, with this computer's setup veil over that area only (R11).
+    desktopHome: {
+        flex: 1,
+        position: 'relative',
+    },
+    desktopHomeContent: {
+        flex: 1,
+    },
     // NotAuthenticated styles
     welcomeBody: {
         flex: 1,

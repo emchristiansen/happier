@@ -6,6 +6,8 @@ import {
   getProviderCliBinaryNames,
   getProviderCliRuntimeSpec,
   PROVIDER_CLI_RUNTIME_SPECS,
+  resolveProviderCliLatestVersionSource,
+  resolveProviderCliNpmPackageName,
 } from './providerCliRuntime.js';
 
 const cursorAgentId = 'cursor' as AgentId;
@@ -137,6 +139,16 @@ describe('PROVIDER_CLI_RUNTIME_SPECS', () => {
     expect(JSON.stringify(getProviderCliRuntimeSpec('droid').manualInstallRecipes)).toContain('app.factory.ai/cli');
   });
 
+  it('declares CodeBuddy Code as a system-first CLI Happier can install from its npm package', () => {
+    expect(getProviderCliRuntimeSpec('codebuddy')).toMatchObject({
+      id: 'codebuddy',
+      binaryName: 'codebuddy',
+      sourcePreferenceDefault: 'system-first',
+      managedInstall: { kind: 'managed_package', packageName: '@tencent-ai/codebuddy-code', binaryName: 'codebuddy' },
+      manualInstallKind: 'command',
+    });
+  });
+
   /**
    * Factory's published Windows installer (`https://app.factory.ai/cli/windows`, observed
    * 2026-09-12 at CLI 0.218.1) resolves x64 / x64-baseline / arm64 from one script and copies
@@ -179,6 +191,7 @@ describe('PROVIDER_CLI_RUNTIME_SPECS', () => {
     ]);
     expect(getProviderCliRuntimeSpec('opencode').knownCommandCandidates).toEqual([
       { kind: 'homeBinDir', relativeDir: '.opencode/bin' },
+      { kind: 'homeBinDir', relativeDir: '.local/bin' },
       { kind: 'homePath', relativePath: 'AppData/Roaming/npm/opencode.cmd' },
     ]);
     expect(getProviderCliRuntimeSpec('codex').knownCommandCandidates).toBeNull();
@@ -266,5 +279,27 @@ describe('PROVIDER_CLI_RUNTIME_SPECS', () => {
 
   it('covers every built-in provider', () => {
     expect(Object.keys(PROVIDER_CLI_RUNTIME_SPECS).sort()).toEqual([...AGENT_IDS].sort());
+  });
+
+  it('derives the latest-version source from the managed install owner before the npm package fact', () => {
+    expect(resolveProviderCliLatestVersionSource(getProviderCliRuntimeSpec('codex'))).toEqual({
+      kind: 'github_release',
+      githubRepo: 'openai/codex',
+    });
+    expect(resolveProviderCliLatestVersionSource(getProviderCliRuntimeSpec('opencode'))).toEqual({
+      kind: 'npm',
+      packageName: 'opencode-ai',
+    });
+    expect(resolveProviderCliLatestVersionSource(getProviderCliRuntimeSpec('claude'))).toEqual({
+      kind: 'npm',
+      packageName: '@anthropic-ai/claude-code',
+    });
+    expect(resolveProviderCliLatestVersionSource(getProviderCliRuntimeSpec('kiro'))).toBeNull();
+  });
+
+  it('names the npm package used to prove package-manager installs', () => {
+    expect(resolveProviderCliNpmPackageName(getProviderCliRuntimeSpec('codex'))).toBe('@openai/codex');
+    expect(resolveProviderCliNpmPackageName(getProviderCliRuntimeSpec('gemini'))).toBe('@google/gemini-cli');
+    expect(resolveProviderCliNpmPackageName(getProviderCliRuntimeSpec('cursor'))).toBeNull();
   });
 });

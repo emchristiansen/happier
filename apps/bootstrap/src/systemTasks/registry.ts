@@ -5,10 +5,12 @@ import type { SystemTaskJsonObject, SystemTaskJsonValue } from '@happier-dev/pro
 
 import { createSecureAccessTailscaleHandler } from './kinds/secureAccessTailscale.js';
 import { createCliPathExposureEnsureHandler, createCliPathExposureRemoveHandler } from './kinds/cliPathExposure.js';
+import { createCliUpdateHandler } from './kinds/cliUpdate.js';
 import {
   createDaemonServiceAutostartSetHandler,
   createDaemonServiceStartHandler,
   createDaemonServiceStatusHandler,
+  createDaemonServiceRelayDisconnectHandler,
   createDaemonServiceStopHandler,
 } from './kinds/daemonService.js';
 import { checkRelayRuntimeHealthDefault, controlRelayRuntimeDefault, installOrUpdateRelayRuntimeDefault, readRelayRuntimeStatusDefault } from './relayRuntimeTasks.js';
@@ -79,6 +81,10 @@ export function createHsetupSystemTaskRegistry(deps: HsetupRegistryDeps = {}): S
       handler: createDaemonServiceStopHandler(),
     },
     {
+      kind: 'daemon.service.relay.disconnect.v1',
+      handler: createDaemonServiceRelayDisconnectHandler(),
+    },
+    {
       kind: 'daemon.service.autostart.set.v1',
       handler: createDaemonServiceAutostartSetHandler(),
     },
@@ -89,6 +95,10 @@ export function createHsetupSystemTaskRegistry(deps: HsetupRegistryDeps = {}): S
     {
       kind: 'cli.pathExposure.remove.v1',
       handler: createCliPathExposureRemoveHandler(),
+    },
+    {
+      kind: 'cli.update.v1',
+      handler: createCliUpdateHandler(),
     },
     {
       kind: 'system.noop.v1',

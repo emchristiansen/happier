@@ -20,21 +20,24 @@ import { markRpcRequestDisposition } from './rpcRequestDisposition';
  * Calls exactly one account-scoped machine RPC against exactly the machine id it
  * is given. The caller owns retry policy; this boundary has no timeout redrive.
  */
-async function callExactMachineRpc(params: Readonly<{
+export async function callExactMachineRpc(params: Readonly<{
   credentials: Credentials;
   machineId: string;
   method: string;
   request: unknown;
   authorization?: SocketRpcAuthorizationContext;
-  timeoutMs?: number;
+  /** null delegates acknowledgement expiry to the relay's finite forwarding deadline. */
+  timeoutMs?: number | null;
 }>): Promise<unknown> {
   const machineId = params.machineId.trim();
   if (!machineId) throw new Error('Machine id is required');
 
   const socket = createUserScopedSocket({ token: params.credentials.token });
-  const timeoutMs = typeof params.timeoutMs === 'number' && params.timeoutMs > 0 ? params.timeoutMs : 20_000;
+  const timeoutMs = params.timeoutMs === null
+    ? null
+    : typeof params.timeoutMs === 'number' && params.timeoutMs > 0 ? params.timeoutMs : 20_000;
   const connectTimeoutMs = typeof params.timeoutMs === 'number' && params.timeoutMs > 0
-    ? timeoutMs
+    ? params.timeoutMs
     : resolveSessionControlSocketConnectTimeoutMs();
   const machineEncryption = resolveMachineEncryptionContext(params.credentials);
   const requestId = randomUUID();
@@ -75,12 +78,14 @@ async function callExactMachineRpc(params: Readonly<{
       params.request,
     ));
     const responsePromise = new Promise<{ ok: boolean; result?: unknown; error?: string; errorCode?: string }>((resolve, reject) => {
-      responseTimer = setTimeout(() => {
-        cancelRequest();
-        reject(Object.assign(new Error('Machine RPC call timeout'), {
-          code: 'MACHINE_RPC_TIMEOUT',
-        }));
-      }, timeoutMs);
+      if (timeoutMs !== null) {
+        responseTimer = setTimeout(() => {
+          cancelRequest();
+          reject(Object.assign(new Error('Machine RPC call timeout'), {
+            code: 'MACHINE_RPC_TIMEOUT',
+          }));
+        }, timeoutMs);
+      }
       try {
         requestEmitted = true;
         socket.emit(
@@ -89,7 +94,7 @@ async function callExactMachineRpc(params: Readonly<{
             method: `${machineId}:${params.method}`,
             params: encryptedRequest,
             requestId,
-            timeoutMs,
+            ...(timeoutMs !== null ? { timeoutMs } : {}),
             ...(params.authorization ? { authorization: params.authorization } : {}),
           },
           (payload: { ok: boolean; result?: unknown; error?: string; errorCode?: string }) => resolve(payload),
@@ -171,7 +176,8 @@ export async function callMachineRpc(params: Readonly<{
   method: string;
   request: unknown;
   authorization?: SocketRpcAuthorizationContext;
-  timeoutMs?: number;
+  /** null delegates acknowledgement expiry to the relay's finite forwarding deadline. */
+  timeoutMs?: number | null;
 }>): Promise<unknown> {
   try {
     return await callExactMachineRpc(params);

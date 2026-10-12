@@ -45,7 +45,10 @@ export function installRestoreRouteCommonModuleMocks(
         unistyles: options.unistyles,
     };
 
-    vi.mock('react-native-reanimated', () => ({}));
+    vi.mock('react-native-reanimated', async () => {
+        const { createReanimatedModuleMock } = await import('@/dev/testkit/mocks/reanimated');
+        return createReanimatedModuleMock();
+    });
 
     vi.mock('react-native', async () => {
         if (restoreRouteTestState.options.reactNative) {

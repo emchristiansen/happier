@@ -2,6 +2,7 @@ import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { join, posix } from 'node:path';
 
 import type { TrackedSession } from '@/daemon/types';
+import { isDaemonStartupSourceServiceManaged, type DaemonStartupSource } from '@/daemon/ownership/daemonOwnershipMetadata';
 import {
   resolveDaemonLegacySessionScopeSubtreeRelativePath,
   resolveDaemonSessionScopeBaseRelativePath,
@@ -213,6 +214,7 @@ export async function moveProcessOutOfDaemonServiceCgroup(params: Readonly<{
 export async function migrateTrackedSessionProcessesOutOfDaemonServiceCgroup(params: Readonly<{
   trackedSessions: Iterable<TrackedSession>;
   daemonPid?: number;
+  startupSource?: DaemonStartupSource;
   procfsRootDir?: string;
   cgroupRootDir?: string;
 }>): Promise<readonly ProcessCgroupMigration[]> {
@@ -221,6 +223,10 @@ export async function migrateTrackedSessionProcessesOutOfDaemonServiceCgroup(par
   const cgroupRootDir = params.cgroupRootDir ?? '/sys/fs/cgroup';
   const migrated = new Map<number, ProcessCgroupMigration>();
   const daemonServiceRelativePath = await readUnifiedProcessCgroupRelativePath(daemonPid, procfsRootDir);
+  // A manually started daemon can share an SSH/editor scope with unrelated processes.
+  // Only a service-managed launch in a real service cgroup may transfer untracked children.
+  const ownsServiceCgroup = isDaemonStartupSourceServiceManaged(params.startupSource)
+    && Boolean(daemonServiceRelativePath && posix.basename(daemonServiceRelativePath).endsWith('.service'));
   const daemonLegacySessionScopeSubtreeRelativePath =
     daemonServiceRelativePath ? resolveDaemonLegacySessionScopeSubtreeRelativePath(daemonServiceRelativePath) : null;
 
@@ -262,7 +268,7 @@ export async function migrateTrackedSessionProcessesOutOfDaemonServiceCgroup(par
     }
   }
 
-  if (daemonServiceRelativePath) {
+  if (ownsServiceCgroup && daemonServiceRelativePath) {
     const residualPids = await readCgroupProcessIds({
       relativePath: daemonServiceRelativePath,
       cgroupRootDir,
@@ -282,7 +288,7 @@ export async function migrateTrackedSessionProcessesOutOfDaemonServiceCgroup(par
     }
   }
 
-  if (daemonLegacySessionScopeSubtreeRelativePath) {
+  if (ownsServiceCgroup && daemonLegacySessionScopeSubtreeRelativePath) {
     const residualLegacyScopePids = await readLegacySessionScopeProcessIds({
       legacySessionScopeSubtreeRelativePath: daemonLegacySessionScopeSubtreeRelativePath,
       cgroupRootDir,

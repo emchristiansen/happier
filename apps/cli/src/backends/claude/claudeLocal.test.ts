@@ -37,7 +37,8 @@ vi.mock('node:child_process', async () => {
 
 vi.mock('@/ui/logger', () => ({
     logger: {
-        debug: vi.fn()
+        debug: vi.fn(),
+        infoFile: vi.fn(),
     }
 }));
 
@@ -321,6 +322,30 @@ describe('claudeLocal --continue handling', () => {
         expect(configPath).not.toBe(mcpJson);
         expect(JSON.stringify(spawnArgs)).not.toContain('http://127.0.0.1:1234');
         await expect(stat(configPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    });
+
+    it('keeps the provider outcome when private MCP retirement fails observably', async () => {
+        const underlyingSpawn = mockSpawn.getMockImplementation();
+        if (!underlyingSpawn) throw new Error('Missing native process fixture');
+        let configPath: string | undefined;
+        // Only the native process boundary introduces an actual filesystem obstacle.
+        mockSpawn.mockImplementation((command: string, args: readonly string[]) => {
+            configPath = args[args.indexOf('--mcp-config') + 1];
+            if (!configPath) throw new Error('Missing private native MCP argument');
+            writeFileSync(join(dirname(configPath), 'unexpected-entry'), 'retained');
+            return underlyingSpawn(command, args);
+        });
+        const sessionId = '123e4567-e89b-12d3-a456-426614174000';
+        try {
+            await expect(claudeLocal({
+                abort: new AbortController().signal, sessionId, path: '/tmp', onSessionFound,
+                happierMcpConfigJson: '{"mcpServers":{}}',
+            })).resolves.toBe(sessionId);
+            expect(logger.infoFile).toHaveBeenCalledWith('[claude] Private MCP configuration cleanup incomplete (claude_mcp_config_cleanup_incomplete)');
+            await expect(stat(configPath!)).rejects.toMatchObject({ code: 'ENOENT' });
+        } finally {
+            if (configPath) rmSync(dirname(configPath), { recursive: true, force: true });
+        }
     });
 
     it('redacts MCP config payloads from Claude argument debug logs', async () => {
@@ -1181,7 +1206,7 @@ describe('claudeLocal launcher selection', () => {
         expect(spawnOpts?.env?.DISABLE_AUTOUPDATER).toBe('1');
     });
 
-    it('strips nested Claude Code env vars from the spawned process environment', async () => {
+    it.each([undefined, 'happier'] as const)('strips parent session markers and honors child entrypoint %s', async (entrypoint) => {
         const prevClaudeCode = process.env.CLAUDECODE;
         const prevEntrypoint = process.env.CLAUDE_CODE_ENTRYPOINT;
         process.env.CLAUDECODE = '1';
@@ -1194,12 +1219,13 @@ describe('claudeLocal launcher selection', () => {
                 path: '/tmp',
                 onSessionFound,
                 claudeArgs: [],
+                envOverlay: entrypoint ? { CLAUDE_CODE_ENTRYPOINT: entrypoint } : undefined,
             });
 
             expect(mockSpawn).toHaveBeenCalled();
             const spawnOpts = mockSpawn.mock.calls[0][2];
             expect(spawnOpts?.env?.CLAUDECODE).toBeUndefined();
-            expect(spawnOpts?.env?.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();
+            expect(spawnOpts?.env?.CLAUDE_CODE_ENTRYPOINT).toBe(entrypoint);
         } finally {
             if (typeof prevClaudeCode === 'string') process.env.CLAUDECODE = prevClaudeCode;
             else delete process.env.CLAUDECODE;

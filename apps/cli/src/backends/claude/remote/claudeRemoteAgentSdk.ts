@@ -18,14 +18,16 @@ import { recordToolTraceEvent } from '@/agent/tools/trace/toolTrace';
 
 import type { EnhancedMode } from '@/backends/claude/loop';
 import { mapToClaudeMode, resolveClaudeSdkPermissionModeFromEnhancedMode } from '@/backends/claude/utils/permissionMode';
+import { resolveClaudeSettingSources } from '@/backends/claude/utils/resolveClaudeSettingSources';
 import { getDefaultClaudeCodePathForAgentSdk } from '@/backends/claude/sdk/utils';
+import { normalizeAvailableCommands } from '@/agent/acp/commands/publishSlashCommands';
 import type { SessionHookData } from '@/backends/claude/utils/startHookServer';
 import { getProjectPath } from '@/backends/claude/utils/path';
 import { getClaudeRemoteSystemPrompt } from '@/backends/claude/utils/remoteSystemPrompt';
 import { parseClaudeSdkFlagOverridesFromArgs } from '@/backends/claude/remote/sdkFlagOverrides';
 import { resolveClaudeRemoteSessionStartPlan } from '@/backends/claude/remote/sessionStartPlan';
 import { resolveClaudeConfigDirOverride } from '@/backends/claude/utils/resolveClaudeConfigDirOverride';
-import { resolveClaudeCodeExperimentalEnvOverlay } from '@/backends/claude/spawn/resolveClaudeCodeExperimentalEnvOverlay';
+import { resolveClaudeSessionEnvOverlay } from '@/backends/claude/spawn/resolveClaudeSessionEnvOverlay';
 import { buildClaudeSubprocessEnv } from '@/backends/claude/spawn/buildClaudeSubprocessEnv';
 import { logClaudeRuntimeAuthEnvDiagnostic } from '@/backends/claude/spawn/logClaudeRuntimeAuthEnvDiagnostic';
 import { isCompactHookLocalCommandStdout } from '@/backends/claude/utils/isCompactHookLocalCommandStdout';
@@ -69,6 +71,7 @@ import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers';
 import { parseCheckpointsCommand, parseRewindCommand } from './agentSdk/claudeAgentSdkSlashCommands';
 import {
     mapClaudeRateLimitEventToQuotaEvidence,
+    readClaudeRateLimitEventWindows,
     mapClaudeRateLimitEventToUsageDetails,
     type NormalizedProviderUsageLimitDetailsV1,
 } from '../connectedServices/mapClaudeRateLimitEventToUsageDetails';
@@ -113,6 +116,7 @@ import {
     createClaudeSubscriptionAccessTokenRefreshCallback,
 } from '../connectedServices/claudeSubscriptionAccessTokenRefresh';
 import { resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process';
+import type { ClaudeEffectiveModelObservation } from '../sessionModels/effectiveModelUpdate';
 
 type AgentSdkQueryFactory = (params: {
     prompt: string | AsyncIterable<SDKUserMessage>;
@@ -174,6 +178,8 @@ export async function claudeRemoteAgentSdk(opts: {
     onThinkingChange?: (thinking: boolean) => void;
     onProviderPromptStarted?: () => void | Promise<void>;
     onMessage: (message: SDKMessage) => void;
+    /** Explicit query launch controls acknowledged by the provider's successful init. */
+    onEffectiveModel?: (facts: ClaudeEffectiveModelObservation) => void;
     /** Correlation supplied by the workflow owner after onMessage has observed the same SDK fact. */
     isWorkflowProviderTaskId?: (taskId: string) => boolean;
     streamedTranscriptWriter?: StreamedTranscriptWriter | null;
@@ -191,11 +197,18 @@ export async function claudeRemoteAgentSdk(opts: {
      * Used by the remote launcher to implement UI "Abort" without losing context.
      */
     setTurnInterrupt?: ((handler: (() => Promise<void>) | null) => void) | null;
+    /** Shares the launcher's canonical metadata updates with the current streaming query. */
+    setPermissionModeApplier?: ((apply: ((permissionMode: EnhancedMode['permissionMode']) => Promise<void>) | null) => void | Promise<void>) | null;
     onCheckpointCaptured?: (checkpointId: string) => void;
     onCapabilities?: (caps: { slashCommands?: string[]; slashCommandDetails?: Array<{ command: string; description?: string }>; models?: unknown[] }) => void;
     onWorkStateSnapshot?: (snapshot: SessionWorkStateV1) => void | Promise<void>;
-    onRateLimitEvent?: (details: NormalizedProviderUsageLimitDetailsV1) => void | Promise<void>;
-    onQuotaEvidence?: (details: NormalizedProviderUsageLimitDetailsV1) => void | Promise<void>;
+    /** `observedWindows`: every window the same event reported, the limited one included. */
+    onRateLimitEvent?: (
+        details: NormalizedProviderUsageLimitDetailsV1,
+        observedWindows: readonly NormalizedProviderUsageLimitDetailsV1[],
+    ) => void | Promise<void>;
+    /** Every quota window reported by one rate-limit event; they form one quota snapshot. */
+    onQuotaEvidence?: (windows: readonly NormalizedProviderUsageLimitDetailsV1[]) => void | Promise<void>;
     onRuntimeAuthFailureEvent?: (error: unknown) => void | Promise<void>;
     runtimeActivityAdapter?: ReturnType<typeof createClaudeProviderRuntimeActivityAdapter> | null;
     providerRuntimeActivityEvidence?: ClaudeRuntimeActivityEvidence | null;
@@ -428,40 +441,7 @@ export async function claudeRemoteAgentSdk(opts: {
         }
         return out;
     })();
-    const settingSources = (() => {
-        type SettingSource = 'user' | 'project' | 'local';
-
-        const rawV2 = (mode as any).claudeRemoteSettingSourcesV2 as unknown;
-        if (Array.isArray(rawV2)) {
-            const set = new Set<string>();
-            for (const value of rawV2) {
-                if (typeof value === 'string') set.add(value);
-            }
-            const normalized: SettingSource[] = [];
-            for (const key of ['user', 'project', 'local'] as const) {
-                if (set.has(key)) normalized.push(key);
-            }
-
-            // Preserve fail-closed behavior: an explicit empty array means "no sources".
-            // Do not widen to defaults; respect the user's explicit choice.
-            if (normalized.length === 0) return [];
-
-            // NOTE: Claude Agent SDK currently defaults `settingSources` to `[]` and will still pass
-            // `--setting-sources ""` (empty string) when we omit the option.
-            // To avoid that footgun we always pass the full default list explicitly.
-            if (normalized.length === 3) return ['user', 'project', 'local'] as const;
-            return normalized;
-        }
-
-        // Legacy v1 mapping (back-compat).
-        const value = mode.claudeRemoteSettingSources;
-        if (value === 'user_project') return ['user', 'project'] as const;
-        if (value === 'project') return ['project'] as const;
-        if (value === 'none') return [];
-
-        // Default to all sources when not explicitly configured.
-        return ['user', 'project', 'local'] as const;
-    })();
+    const settingSources = resolveClaudeSettingSources(mode);
     const advancedOptionsJsonRaw = typeof mode.claudeRemoteAdvancedOptionsJson === 'string'
         ? mode.claudeRemoteAdvancedOptionsJson.trim()
         : '';
@@ -552,21 +532,28 @@ export async function claudeRemoteAgentSdk(opts: {
 
     let lastAppliedRuntimeSettings: RuntimeSettingsSnapshot = resolveDesiredRuntimeSettingsSnapshot(mode);
 
-    const applyRuntimeSettingsUpdatesIfNeeded = async (next: RuntimeSettingsSnapshot): Promise<void> => {
-        if (next.permissionMode !== lastAppliedRuntimeSettings.permissionMode) {
-            await response?.setPermissionMode?.(next.permissionMode);
-            lastAppliedRuntimeSettings = { ...lastAppliedRuntimeSettings, permissionMode: next.permissionMode };
-        }
+    let runtimeSettingsUpdate = Promise.resolve();
+    const applyRuntimeSettingsUpdatesIfNeeded = (next: RuntimeSettingsSnapshot): Promise<void> => {
+        const update = runtimeSettingsUpdate.then(async () => {
+            if (next.permissionMode !== lastAppliedRuntimeSettings.permissionMode) {
+                await response?.setPermissionMode?.(next.permissionMode);
+                lastAppliedRuntimeSettings = { ...lastAppliedRuntimeSettings, permissionMode: next.permissionMode };
+            }
 
-        if (next.model !== lastAppliedRuntimeSettings.model) {
-            await response?.setModel?.(next.model ?? undefined);
-            lastAppliedRuntimeSettings = { ...lastAppliedRuntimeSettings, model: next.model };
-        }
+            if (next.model !== lastAppliedRuntimeSettings.model) {
+                await response?.setModel?.(next.model ?? undefined);
+                lastAppliedRuntimeSettings = { ...lastAppliedRuntimeSettings, model: next.model };
+            }
 
-        if (next.maxThinkingTokens !== lastAppliedRuntimeSettings.maxThinkingTokens && next.maxThinkingTokens !== undefined) {
-            await response?.setMaxThinkingTokens?.(next.maxThinkingTokens ?? null);
-            lastAppliedRuntimeSettings = { ...lastAppliedRuntimeSettings, maxThinkingTokens: next.maxThinkingTokens };
-        }
+            if (next.maxThinkingTokens !== lastAppliedRuntimeSettings.maxThinkingTokens && next.maxThinkingTokens !== undefined) {
+                await response?.setMaxThinkingTokens?.(next.maxThinkingTokens ?? null);
+                lastAppliedRuntimeSettings = { ...lastAppliedRuntimeSettings, maxThinkingTokens: next.maxThinkingTokens };
+            }
+        });
+        // A rejected control must not prevent the next metadata update or queued prompt
+        // from retrying. Each caller owns reporting its control failure.
+        runtimeSettingsUpdate = update.catch(() => {});
+        return update;
     };
 
     const canCallToolWithModeTransitions = async (
@@ -600,8 +587,9 @@ export async function claudeRemoteAgentSdk(opts: {
             })();
 
             try {
-                await response?.setPermissionMode?.(nextPermissionMode);
-                lastAppliedRuntimeSettings = { ...lastAppliedRuntimeSettings, permissionMode: nextPermissionMode };
+                await applyRuntimeSettingsUpdatesIfNeeded({
+                    ...resolveDesiredRuntimeSettingsSnapshot(mode), permissionMode: nextPermissionMode,
+                });
             } catch (error) {
                 logger.debug('[claudeRemoteAgentSdk] Failed to transition permission mode after ExitPlanMode (non-fatal)', error);
                 opts.onCompletionEvent?.('Failed to transition permission mode after exiting plan mode (non-fatal); continuing.');
@@ -698,8 +686,9 @@ export async function claudeRemoteAgentSdk(opts: {
     };
 
         const mappedPermissionMode = resolveClaudeSdkPermissionModeFromEnhancedMode(mode);
-        const experimentalEnvOverlay = resolveClaudeCodeExperimentalEnvOverlay({
+        const sessionEnvOverlay = resolveClaudeSessionEnvOverlay({
             claudeCodeExperimentalAgentTeamsEnabled: mode.claudeCodeExperimentalAgentTeamsEnabled,
+            claudeCodeIncludeInNativeHistory: mode.claudeCodeIncludeInNativeHistory,
         });
         const xdgIsolationEnv = resolveClaudeCodeXdgIsolation({
             backendId: 'claude',
@@ -738,8 +727,7 @@ export async function claudeRemoteAgentSdk(opts: {
         })();
         const claudeSubprocessEnv = withCurrentHappierSessionId({
             ...xdgIsolationEnv,
-            ...buildClaudeSubprocessEnv(),
-            ...experimentalEnvOverlay,
+            ...buildClaudeSubprocessEnv({ envOverlay: sessionEnvOverlay }),
         }, opts.happySessionId ?? '');
         logClaudeRuntimeAuthEnvDiagnostic({
             logPrefix: 'claudeRemoteAgentSdk',
@@ -998,6 +986,16 @@ export async function claudeRemoteAgentSdk(opts: {
 	        response = createQuery({
 	            prompt: messages,
 	            options: queryOptions,
+        });
+        await opts.setPermissionModeApplier?.(async (permissionMode) => {
+            if (abortSignal.aborted) return;
+            mode = { ...mode, permissionMode };
+            try {
+                await applyRuntimeSettingsUpdatesIfNeeded(resolveDesiredRuntimeSettingsSnapshot(mode));
+            } catch (error) {
+                logger.debug('[claudeRemoteAgentSdk] Failed to update runtime settings (non-fatal)', error);
+                opts.onCompletionEvent?.('Failed to update runtime settings (non-fatal); continuing.');
+            }
         });
         opts.onWorkflowActivityObserverReady?.();
         await opts.runtimeActivityAdapter?.activateObservation('claude-agent-sdk-provider-observer-installed');
@@ -1721,19 +1719,12 @@ export async function claudeRemoteAgentSdk(opts: {
                     const commandsRaw = commandsResult.status === 'fulfilled' ? commandsResult.value : null;
                     const modelsRaw = modelsResult.status === 'fulfilled' ? modelsResult.value : null;
 
-                    const commandDetails = Array.isArray(commandsRaw)
-                        ? commandsRaw
-                            .map((cmd: any) => ({
-                                command: typeof cmd?.command === 'string' ? cmd.command : null,
-                                description: typeof cmd?.description === 'string' ? cmd.description : undefined,
-                            }))
-                            .filter((cmd: any) => typeof cmd.command === 'string' && cmd.command.length > 0)
-                        : [];
+                    const commandDetails = normalizeAvailableCommands(commandsRaw);
 
                     onCapabilities({
-                        ...(commandDetails.length > 0
+                        ...(Array.isArray(commandsRaw)
                             ? {
-                                slashCommands: commandDetails.map((c: any) => c.command),
+                                slashCommands: commandDetails.map((command) => command.command),
                                 slashCommandDetails: commandDetails,
                             }
                             : {}),
@@ -1778,12 +1769,12 @@ export async function claudeRemoteAgentSdk(opts: {
                 return;
             } else {
                 const quotaEvidence = mapClaudeRateLimitEventToQuotaEvidence(message);
-                if (quotaEvidence) {
+                if (quotaEvidence.length > 0) {
                     await opts.onQuotaEvidence?.(quotaEvidence);
                 }
                 const rateLimitDetails = mapClaudeRateLimitEventToUsageDetails(message);
                 if (rateLimitDetails) {
-                    await opts.onRateLimitEvent?.(rateLimitDetails);
+                    await opts.onRateLimitEvent?.(rateLimitDetails, readClaudeRateLimitEventWindows(message));
                 }
             }
             if (inboundType === 'rate_limit_event') {
@@ -2168,11 +2159,16 @@ export async function claudeRemoteAgentSdk(opts: {
                     }
 
                     if (subtype === 'init' || subtype === 'compact_boundary') {
+                        if (subtype === 'init' && typeof system.model === 'string' && system.model.trim()) {
+                            const launchEffort = resolvedUltracode ? 'xhigh' : queryOptions.effort;
+                            if (typeof launchEffort === 'string') {
+                                opts.onEffectiveModel?.({ modelId: system.model.trim(), reasoningEffort: launchEffort });
+                            }
+                        }
                         if (system.session_id) {
-                            const transcriptPath = join(
-                                getProjectPath(opts.path, claudeConfigDir),
-                                `${system.session_id}.jsonl`,
-                            );
+                            const transcriptPath = latestClaudeSessionId === system.session_id && latestTranscriptPath
+                                ? latestTranscriptPath
+                                : join(getProjectPath(opts.path, claudeConfigDir), `${system.session_id}.jsonl`);
                             logger.debug(
                                 subtype === 'compact_boundary'
                                     ? '[claudeRemoteAgentSdk] Compact boundary'
@@ -2240,6 +2236,13 @@ export async function claudeRemoteAgentSdk(opts: {
             }
 
             if (message && message.type === 'result') {
+                // Init allocates the native identity before its JSONL exists.
+                // A completed turn can now prove it at the existing Session owner.
+                if (latestClaudeSessionId) {
+                    recordSessionFound(latestClaudeSessionId, latestTranscriptPath
+                        ? { transcript_path: latestTranscriptPath, transcriptPath: latestTranscriptPath }
+                        : undefined);
+                }
                 const didRequestThisResult = awaitingRequestedTurnInterruptResult;
                 awaitingRequestedTurnInterruptResult = false;
                 const failure = readAgentSdkResultFailure(message);
@@ -2342,6 +2345,7 @@ export async function claudeRemoteAgentSdk(opts: {
         }
         throw e;
     } finally {
+        await opts.setPermissionModeApplier?.(null);
         opts.onInFlightSteerAvailabilityChange?.(false);
         opts.setUserMessageSender?.(null);
         opts.setTurnInterrupt?.(null);

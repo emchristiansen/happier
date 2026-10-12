@@ -109,6 +109,25 @@ vi.mock('@/sync/domains/server/serverProfiles', () => ({
     listServerProfiles: () => listServerProfilesMock(),
     resolveServerProfileScopeId: (profile: { id: string; serverIdentityId?: string | null }) => profile.serverIdentityId ?? profile.id,
     setActiveServerId: (id: string, opts: { scope: 'tab' | 'device' }) => setActiveServerIdMock(id, opts),
+    // Read by the canonical switch and the direct-selection intent (both real in this suite).
+    areServerProfileIdentifiersEquivalent: (left: string, right: string) => String(left).trim() === String(right).trim(),
+    getDeviceDefaultServerId: () => activeServerSnapshot.serverId,
+    getTabActiveServerId: () => null,
+}));
+
+const settingsWrites = vi.hoisted(() => ({ values: {} as Record<string, unknown> }));
+vi.mock('@/sync/domains/state/storage', async () => {
+    const { createStorageModuleStub } = await import('@/dev/testkit/mocks/storage');
+    return createStorageModuleStub({
+        useSettingMutable: (key: string) => [settingsWrites.values[key] ?? null, (value: unknown) => {
+            settingsWrites.values[key] = value;
+        }],
+    });
+});
+
+const switchConnectionToActiveServerMock = vi.hoisted(() => vi.fn(async () => null));
+vi.mock('@/sync/runtime/orchestration/connectionManager', () => ({
+    switchConnectionToActiveServer: () => switchConnectionToActiveServerMock(),
 }));
 
 vi.mock('@/sync/domains/server/serverRuntime', () => ({
@@ -421,6 +440,61 @@ describe('/setup route', () => {
             relayUrl: 'https://relay.custom.test',
         });
         expect(expoRouterMock.spies.replace).toHaveBeenCalledWith('/');
+    });
+
+    /**
+     * R8/INV7 — a relay picked or added here is a person choosing where this computer belongs, so
+     * it arms the one direct-selection intent the desktop setup gate spends after sign-in to offer
+     * moving this computer's background service. Continuing on the relay already shown chooses
+     * nothing new and arms nothing. The intent module is real: this is what the gate consumes.
+     */
+    it('arms the direct relay selection for a saved relay picked before sign-in', async () => {
+        vi.resetModules();
+        const Screen = (await import('@/app/(app)/setup/index')).default;
+        const intent = await import('@/setup/directRelaySelectionIntent');
+        const screen = await renderScreen(React.createElement(Screen));
+
+        const targetRow = screen.findAllByType('Item' as never).find((entry) => entry.props.testID === 'setup.savedRelay.relay-2');
+        if (!targetRow) throw new Error('Expected saved relay row for relay-2');
+        await act(async () => {
+            await targetRow.props.onPress?.();
+        });
+
+        expect(setActiveServerIdMock).toHaveBeenCalledWith('relay-2', { scope: 'device' });
+        expect(settingsWrites.values.serverSelectionActiveTargetId).toBe('relay-2');
+        expect(intent.consumeDirectRelaySelectionIntent('relay-2')).toBe(true);
+    });
+
+    it('arms the direct relay selection for a custom relay added before sign-in', async () => {
+        vi.resetModules();
+        upsertServerProfileMock.mockImplementationOnce((params) => ({ id: 'server-added', serverUrl: params.serverUrl }));
+        const Screen = (await import('@/app/(app)/setup/index')).default;
+        const intent = await import('@/setup/directRelaySelectionIntent');
+        const screen = await renderScreen(React.createElement(Screen));
+
+        await screen.pressByTestIdAsync('setup.changeRelay');
+        await act(async () => {
+            screen.changeTextByTestId('setup.customRelayUrl', 'https://relay.custom.test/');
+        });
+        await screen.pressByTestIdAsync('setup.addRelay');
+
+        expect(intent.consumeDirectRelaySelectionIntent('server-added')).toBe(true);
+        expect(expoRouterMock.spies.replace).toHaveBeenCalledWith('/');
+    });
+
+    it('arms nothing when the person continues on the relay already selected', async () => {
+        vi.resetModules();
+        const Screen = (await import('@/app/(app)/setup/index')).default;
+        const intent = await import('@/setup/directRelaySelectionIntent');
+        const screen = await renderScreen(React.createElement(Screen));
+
+        const continueButton = requireButton(screen, 'setup.continueToAuth');
+        await act(async () => {
+            const handler = continueButton.props.action ?? continueButton.props.onPress;
+            await handler?.();
+        });
+
+        expect(intent.consumeDirectRelaySelectionIntent('relay-1')).toBe(false);
     });
 
     it('lets the user switch to another saved relay without leaving setup', async () => {

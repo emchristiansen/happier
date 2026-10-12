@@ -34,6 +34,10 @@ import {
   buildUnsupportedSessionPendingInputInterruptAndRunResult,
   type SessionPendingInputInterruptAndRunRequestV1,
   type SessionPendingInputInterruptAndRunResultV1,
+  SessionProviderCliAttachPrepareRequestV1Schema,
+  SessionProviderCliAttachPrepareResultV1Schema,
+  type SessionProviderCliAttachPrepareRequestV1,
+  type SessionProviderCliAttachPrepareResultV1,
 } from '@happier-dev/protocol';
 import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
 import { mergeUsageLimitRecoveryFieldIntoMetadata } from '@/session/usageLimitRecoveryControls/persistUsageLimitRecoveryFieldDurably';
@@ -47,6 +51,9 @@ import type { Metadata } from '@/api/types';
 import type { RpcHandlerRegistrar } from '@/api/rpc/types';
 
 export type SessionRuntimeControls = {
+  prepareProviderCliAttach?: (
+    request: Readonly<SessionProviderCliAttachPrepareRequestV1>,
+  ) => Promise<SessionProviderCliAttachPrepareResultV1>;
   refreshGoal?: () => unknown;
   setGoal?: (
     objective: string | undefined,
@@ -259,6 +266,7 @@ export function registerSessionControlHandlers(
       result: TResult;
     }>) => Promise<TResult> | TResult) | null;
     sessionRuntimeControls?: SessionRuntimeControls | null;
+    getUsageLimitRecoveryCheckNow?: () => SessionRuntimeControls['checkUsageLimitRecoveryNow'];
     /**
      * QAE-1: propagates a SUCCESSFUL user wait-resume cancel to the daemon-side
      * durable recovery owners (runtime-auth recovery + inactive usage-limit
@@ -337,6 +345,15 @@ export function registerSessionControlHandlers(
       await opts.sessionRuntimeControls.clearTerminalComposer(parsed.data),
       parsed.data.sessionId,
     );
+  });
+
+  rpc.registerHandler(SESSION_RPC_METHODS.SESSION_PROVIDER_CLI_ATTACH_PREPARE_V1, async (raw: unknown) => {
+    const parsed = SessionProviderCliAttachPrepareRequestV1Schema.safeParse(raw);
+    if (!parsed.success) return invalidInput();
+    const prepare = opts.sessionRuntimeControls?.prepareProviderCliAttach;
+    if (!prepare) return unsupported(SESSION_RPC_METHODS.SESSION_PROVIDER_CLI_ATTACH_PREPARE_V1);
+    const result = SessionProviderCliAttachPrepareResultV1Schema.safeParse(await prepare(parsed.data));
+    return result.success ? result.data : invalidRuntimeControlResult();
   });
 
   rpc.registerHandler(SESSION_RPC_METHODS.SESSION_PENDING_INPUT_INTERRUPT_AND_RUN, async (raw: unknown) => {
@@ -556,13 +573,16 @@ export function registerSessionControlHandlers(
     if (!await usageLimitRecoveryFeatureEnabled()) {
       return usageLimitRecoveryFeatureDisabledResult({ sessionId: parsed.data.sessionId });
     }
-    if (typeof opts.sessionRuntimeControls?.checkUsageLimitRecoveryNow !== 'function') {
+    const checkNow = opts.getUsageLimitRecoveryCheckNow
+      ? opts.getUsageLimitRecoveryCheckNow()
+      : opts.sessionRuntimeControls?.checkUsageLimitRecoveryNow;
+    if (typeof checkNow !== 'function') {
       return normalizeUsageLimitRecoveryOperationResult(
         unsupported(SESSION_RPC_METHODS.SESSION_USAGE_LIMIT_CHECK_NOW),
         parsed.data.sessionId,
       );
     }
-    return normalizeUsageLimitRecoveryOperationResult(await opts.sessionRuntimeControls.checkUsageLimitRecoveryNow({
+    return normalizeUsageLimitRecoveryOperationResult(await checkNow({
       sessionId: parsed.data.sessionId,
       ...(typeof parsed.data.provider === 'string' ? { provider: parsed.data.provider } : {}),
       ...(parsed.data.operation ? { operation: parsed.data.operation } : {}),

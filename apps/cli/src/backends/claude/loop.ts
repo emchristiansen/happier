@@ -78,6 +78,7 @@ export interface EnhancedMode {
     claudeUnifiedTerminalResumeChoice?: ClaudeUnifiedTerminalResumeChoice;
     claudeRemoteSettingSourcesV2?: ReadonlyArray<'user' | 'project' | 'local'>;
     claudeRemoteSettingSources?: 'project' | 'user_project' | 'none';
+    claudeCodeIncludeInNativeHistory?: boolean;
     claudeCodeExperimentalAgentTeamsEnabled?: boolean;
     claudeRemoteEnableFileCheckpointing?: boolean;
     claudeRemoteMaxThinkingTokens?: number | null;
@@ -97,6 +98,7 @@ interface LoopOptions {
     claudeUnifiedTerminalEnabled?: boolean
         /** Force-enable Claude Code experimental Agent Teams across local + remote starts (off = inherit). */
         claudeCodeExperimentalAgentTeamsEnabled?: boolean
+    claudeCodeIncludeInNativeHistory?: boolean
     onModeChange: (mode: 'local' | 'remote') => void
     session: SessionClientPort
     pushSender?: PushNotificationClient | null
@@ -140,8 +142,9 @@ interface LoopOptions {
     expectedExistingTerminalHostAttachmentId?: string
     onTerminalHostReady?: ((params: Readonly<{
         handle: import('@/integrations/terminalHost/_types').TerminalHostHandle;
+        lifecycle: 'owned' | 'borrowed';
         terminal: NonNullable<import('@/api/types').Metadata['terminal']>;
-        destroyOwnedHostForExplicitStop: () => Promise<void>;
+        stopTerminalHostForExplicitStop: () => Promise<void>;
     }>) => void | Promise<void>)
     signal?: AbortSignal
 }
@@ -180,6 +183,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
         runtimeActivityContributions,
     });
     session.claudeCodeExperimentalAgentTeamsEnabled = opts.claudeCodeExperimentalAgentTeamsEnabled === true;
+    session.claudeCodeIncludeInNativeHistory = opts.claudeCodeIncludeInNativeHistory === true;
 
     // Seed permission mode without blocking on transcript fetches.
     // The session's metadata snapshot is already available locally, and for fresh sessions
@@ -212,6 +216,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
                 model: opts.model,
                 claudeUnifiedTerminalEnabled: true,
                 claudeCodeExperimentalAgentTeamsEnabled: opts.claudeCodeExperimentalAgentTeamsEnabled,
+                claudeCodeIncludeInNativeHistory: opts.claudeCodeIncludeInNativeHistory,
             },
             expectedExistingTerminalHostAttachmentId: opts.expectedExistingTerminalHostAttachmentId,
             onTerminalHostReady: opts.onTerminalHostReady,

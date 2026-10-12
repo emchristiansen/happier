@@ -44,6 +44,8 @@ export function isClaudeUnifiedComposerTextMatch(params: Readonly<{
   promptText: string;
   composerText: string;
   minPrefixChars?: number | undefined;
+  /** Only for verification of the current authorized paste, never historical draft ownership. */
+  allowShortVisibleWindow?: boolean | undefined;
 }>): boolean {
   const promptText = normalizeClaudeUnifiedComposerRenderingText(params.promptText);
   const composerLines = normalizeClaudeUnifiedPromptIdentityText(params.composerText)
@@ -76,6 +78,7 @@ export function isClaudeUnifiedComposerTextMatch(params: Readonly<{
     }
     if (!matches) continue;
     if (start === 0 && end === promptText.length) return true;
+    if (params.allowShortVisibleWindow) return true;
     if (composerLength >= CLAUDE_UNIFIED_LONG_COMPOSER_RESIDUE_MIN_CHARS) return true;
     // Short possible-write residues are prefix-only so a genuine user draft that merely shares
     // a phrase with an earlier injection is never treated as controller-owned.

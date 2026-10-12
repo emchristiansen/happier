@@ -994,6 +994,75 @@ describe('sessionScanner', () => {
     expect((sidechainMsg as any).sidechainId).toBe(sidechainId)
   })
 
+  it('publishes delivered native peer attachments from history and the live tail without queued prompts', async () => {
+    const sessionId = '58585858-5858-4585-8585-585858585858'
+    const delivered = createDeferred<void>()
+    const sessionFile = join(projectDir, `${sessionId}.jsonl`)
+    const peer = (uuid: string) => ({ type: 'attachment', uuid, sessionId, attachment: { type: 'queued_command',
+      prompt: '<cross-session-message from="uds:/tmp/sender.sock" from-name="Sender" from-mode="prompting">Delivered</cross-session-message>' } })
+    await writeFile(sessionFile, JSON.stringify(peer('historical-peer')) + '\n')
+    scanner = await createSessionScanner({ sessionId, replayInitialMessages: true, workingDirectory: testDir, onMessage: message => {
+      collectedMessages.push(message)
+      if (message.uuid === 'peer-sentinel') delivered.resolve()
+    } })
+    await appendFile(sessionFile, [
+      { type: 'queue-operation', operation: 'enqueue', content: peer('not-delivered').attachment.prompt },
+      { type: 'attachment', uuid: 'human-queued', attachment: { type: 'queued_command', prompt: 'ordinary queued prompt', origin: { kind: 'human' } } },
+      peer('live-peer'), { type: 'user', uuid: 'peer-sentinel', message: { content: 'sentinel' } },
+    ].map(row => JSON.stringify(row)).join('\n') + '\n')
+    await delivered.promise
+    expect(collectedMessages.map(message => message.uuid)).toEqual(['historical-peer', 'live-peer', 'peer-sentinel'])
+    for (const message of collectedMessages.slice(0, 2)) {
+      expect(message).toMatchObject({ type: 'user', origin: { kind: 'peer', name: 'Sender' },
+        message: { content: 'From Sender:\n\nDelivered' } })
+    }
+  })
+
+  it.each(['completed', 'failed', 'stopped'] as const)('projects native queued task %s notifications from replay and live input', async status => {
+    const sessionId = '56565656-5656-4565-8565-565656565656'
+    const sessionFile = join(projectDir, `${sessionId}.jsonl`)
+    const notification = (uuid: string, taskId: string, toolUseId?: string) => ({
+      type: 'attachment', uuid, sessionId, isMeta: true,
+      attachment: { type: 'queued_command', commandMode: 'task-notification', prompt:
+        `<task-notification><task-id>${taskId}</task-id>${toolUseId ? `<tool-use-id>${toolUseId}</tool-use-id>` : ''}<status>${status}</status><result>native ${status}</result></task-notification>` },
+    })
+    const ack = (uuid: string, taskId: string, toolUseId: string) => ({
+      type: 'user', uuid, sessionId, toolUseResult: { status: 'async_launched', agentId: taskId },
+      message: { content: [{ type: 'tool_result', tool_use_id: toolUseId, content: 'Async agent launched successfully.' }] },
+    })
+    const launch = { type: 'assistant', uuid: 'native-launch', sessionId, message: { content: [
+      { type: 'tool_use', id: 'native-tool', name: 'Agent', input: { run_in_background: true } },
+      { type: 'tool_use', id: 'early-tool', name: 'Task', input: { run_in_background: true } },
+    ] } }
+    await writeFile(sessionFile, [launch, ack('native-ack', 'native-task', 'native-tool'),
+      notification('native-completion', 'native-task', 'native-tool'), notification('early-completion', 'early-task'),
+      ack('early-ack', 'early-task', 'early-tool')].map(row => JSON.stringify(row)).join('\n') + '\n')
+    scanner = await createSessionScanner({ sessionId, replayInitialMessages: true, workingDirectory: testDir,
+      onMessage: message => { collectedMessages.push(message) } })
+    const projected = collectedMessages.filter(message => message.uuid === 'native-completion' || message.uuid === 'early-completion')
+    expect(projected).toHaveLength(2)
+    for (const message of projected) {
+      expect(message).toMatchObject({ type: 'user', origin: { kind: 'task-notification' },
+        message: { content: [{ type: 'tool_result', is_error: status !== 'completed', content: [{ type: 'text', text: `native ${status}` }] }] } })
+      expect(message.isMeta).toBeUndefined()
+      expect(message.attachment).toBeUndefined()
+    }
+    await appendFile(sessionFile, [notification('native-completion', 'native-task', 'native-tool'),
+      { ...notification('ordinary-queued', 'native-task', 'native-tool'), attachment: { type: 'queued_command', prompt: 'ordinary queued prompt' } },
+      { type: 'user', uuid: 'copied-xml', message: { content: notification('copy', 'native-task', 'native-tool').attachment.prompt } },
+      { ...notification('foreign-sidechain', 'native-task', 'native-tool'), isSidechain: true },
+      { type: 'user', uuid: 'native-sentinel', message: { content: 'sentinel' } },
+    ].map(row => JSON.stringify(row)).join('\n') + '\n')
+    await waitFor(() => collectedMessages.some(message => message.uuid === 'native-sentinel'))
+    expect(collectedMessages.filter(message => message.uuid === 'native-completion')).toHaveLength(1)
+    expect(collectedMessages.some(message => message.uuid === 'ordinary-queued' || message.uuid === 'foreign-sidechain')).toBe(false)
+    expect(collectedMessages.find(message => message.uuid === 'copied-xml')).toMatchObject({ message: { content: expect.any(String) } })
+    // Optional artifact connects the real scanner output to the UI's real reducer in the composed check.
+    if (process.env.HAPPIER_TASK_PROJECTION_TEST_OUTPUT) {
+      await writeFile(`${process.env.HAPPIER_TASK_PROJECTION_TEST_OUTPUT}.${status}.json`, JSON.stringify(collectedMessages))
+    }
+  })
+
   it('rewrites <task-notification> user text into a Task tool_result update (and does not emit the raw XML)', async () => {
     scanner = await createSessionScanner({
       sessionId: null,
@@ -1057,6 +1126,7 @@ describe('sessionScanner', () => {
     const taskNotification = {
       type: 'user',
       uuid: 'u3',
+      origin: { kind: 'task-notification' },
       message: {
         role: 'user',
         content:

@@ -19,6 +19,7 @@ import { createOpenCodeServerRuntimeClient, type OpenCodeServerRuntimeClient } f
 import { extractOpenCodeTextHistoryItems } from './openCodeSessionMessageImport';
 import { resolveOpenCodeUserMessageIdFromMetadata } from './openCodeUserMessageIds';
 import { asRecord, normalizeString } from './openCodeParsing';
+import { ProviderNativeForkFailedBeforeDispatchError } from '@/backends/forking/providerNativeForkHandler';
 
 type RawTranscriptRow = Readonly<{
   id?: unknown;
@@ -185,6 +186,8 @@ export async function forkOpenCodeSessionNative(params: {
   parentRawSession: Readonly<{ encryptionMode?: unknown; dataEncryptionKey?: unknown; metadata?: unknown }>;
   directory: string;
   parentOpenCodeSessionId: string;
+  baseUrlOverride?: string | null;
+  managedServerLaunchFingerprint?: string | null;
   forkPoint: { type: 'latest' } | { type: 'seq'; upToSeqInclusive: number };
 }, deps: OpenCodeNativeForkDeps = {}): Promise<{ vendorSessionId: string; vendorMessageId?: string } | null> {
   const createClient = deps.createClient ?? createOpenCodeServerRuntimeClient;
@@ -219,7 +222,15 @@ export async function forkOpenCodeSessionNative(params: {
 
   let client: OpenCodeServerRuntimeClient | null = null;
   try {
-    client = await createClient({ directory: params.directory, messageBuffer: new MessageBuffer() });
+    client = await createClient({ directory: params.directory, messageBuffer: new MessageBuffer(),
+      ...(params.baseUrlOverride ? { baseUrlOverride: params.baseUrlOverride } : {}),
+      managedServerLaunchFingerprint: params.managedServerLaunchFingerprint,
+    }).catch((error) => {
+      if (params.managedServerLaunchFingerprint != null) {
+        throw new ProviderNativeForkFailedBeforeDispatchError(new Error('Managed OpenCode native fork target is unavailable.'));
+      }
+      throw error;
+    });
 
     // OpenCode server fork semantics are exclusive: it clones messages strictly before `messageID`.
     //

@@ -10,6 +10,8 @@ import {
 } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 import { claudeRemoteAgentSdk } from './claudeRemoteAgentSdk';
 import { makeMode } from './claudeRemoteAgentSdk.testkit';
+import type { EnhancedMode } from '../loop';
+import type { Query } from '@anthropic-ai/claude-agent-sdk';
 import { resolveClaudeProjectId } from '../utils/path';
 
 const ORIGINAL_CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR;
@@ -268,13 +270,19 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
         });
     });
 
-    it('passes effort when the mode specifies a reasoningEffort', async () => {
+    it.each([
+        { requestedModel: 'sonnet', runtimeModel: 'claude-sonnet-4-6', effort: 'low' },
+        { requestedModel: 'claude-opus-4-6', runtimeModel: 'claude-opus-4-6', effort: 'max' },
+    ])('passes effort when the mode specifies a reasoningEffort ($requestedModel/$effort)', async ({ requestedModel, runtimeModel, effort }) => {
         let capturedOptions: any = null;
+        const onEffectiveModel = vi.fn();
 
         const createQuery = vi.fn((_params: any) => {
             capturedOptions = _params.options;
             return {
                 async *[Symbol.asyncIterator]() {
+                    expect(onEffectiveModel).not.toHaveBeenCalled();
+                    yield { type: 'system', subtype: 'init', model: runtimeModel, session_id: 'effort-init' } as any;
                     yield { type: 'result' } as any;
                 },
                 close: vi.fn(),
@@ -292,7 +300,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
             didSendFirst = true;
             return {
                 message: 'hello',
-                mode: makeMode({ permissionMode: 'default', model: 'claude-opus-4-6', reasoningEffort: 'max' } as any),
+                mode: makeMode({ permissionMode: 'default', model: requestedModel, reasoningEffort: effort }),
             };
         });
 
@@ -308,12 +316,14 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
             onReady: () => {},
             onSessionFound: () => {},
             onMessage: () => {},
+            onEffectiveModel,
             createQuery,
         } as any);
 
         expect(capturedOptions).toBeTruthy();
-        expect(capturedOptions.model).toBe('claude-opus-4-6');
-        expect(capturedOptions.effort).toBe('max');
+        expect(capturedOptions.model).toBe(requestedModel);
+        expect(capturedOptions.effort).toBe(effort);
+        expect(onEffectiveModel).toHaveBeenCalledWith({ modelId: runtimeModel, reasoningEffort: effort });
     });
 
     it('passes ultracode through the --settings extraArg for xhigh-capable models', async () => {
@@ -2175,6 +2185,60 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
         }
     });
 
+    it('applies permission control while waiting for a prompt and unregisters it on teardown', async () => {
+        let finishQuery: () => void = () => {};
+        const queryFinished = new Promise<void>(resolve => { finishQuery = resolve; });
+        let releaseNextPrompt: () => void = () => {};
+        const nextPrompt = new Promise<null>(resolve => { releaseNextPrompt = () => resolve(null); });
+        type PermissionModeApplier = (permissionMode: EnhancedMode['permissionMode']) => Promise<void>;
+        let applyPermissionMode: PermissionModeApplier | null = null;
+        const getApplier = (): PermissionModeApplier | null => applyPermissionMode;
+        let finishFirstControl: () => void = () => {};
+        const firstControl = new Promise<void>(resolve => { finishFirstControl = resolve; });
+        const setPermissionMode = vi.fn(async () => {}).mockImplementationOnce(() => firstControl);
+        const createQuery: NonNullable<Parameters<typeof claudeRemoteAgentSdk>[0]['createQuery']> = () => ({
+            async *[Symbol.asyncIterator]() {
+                yield { type: 'result' };
+                await queryFinished;
+            },
+            close: finishQuery,
+            setPermissionMode,
+            setModel: async () => {}, setMaxThinkingTokens: async () => {},
+            supportedCommands: async () => [], supportedModels: async () => [],
+        } as unknown as Query); // Only the consumed external SDK query boundary is replaced.
+        let sentInitial = false;
+        const opts = {
+            sessionId: null, transcriptPath: null, path: '/tmp', claudeExecutablePath: '/tmp/claude',
+            canCallTool: async () => ({ behavior: 'allow' as const, updatedInput: {} }), isAborted: () => false,
+            nextMessage: async () => {
+                if (sentInitial) return nextPrompt;
+                sentInitial = true;
+                return { message: 'hello', mode: makeMode() };
+            },
+            onReady: () => {}, onSessionFound: () => {}, onMessage: () => {}, createQuery,
+            setPermissionModeApplier: (apply: typeof applyPermissionMode) => { applyPermissionMode = apply; },
+        };
+        const runner = claudeRemoteAgentSdk(opts);
+        try {
+            await vi.waitFor(() => expect(applyPermissionMode).toBeTypeOf('function'));
+            const apply = getApplier();
+            if (!apply) throw new Error('Expected registered permission mode control');
+            const bypass = apply('yolo');
+            const restore = apply('default');
+            await vi.waitFor(() => expect(setPermissionMode).toHaveBeenCalledWith('bypassPermissions'));
+            finishFirstControl();
+            await Promise.all([bypass, restore]);
+            expect(setPermissionMode).toHaveBeenCalledWith('bypassPermissions');
+            expect(setPermissionMode).toHaveBeenLastCalledWith('default');
+        } finally {
+            finishFirstControl();
+            releaseNextPrompt();
+            finishQuery();
+            await runner;
+        }
+        expect(applyPermissionMode).toBeNull();
+    });
+
     it('applies live setModel, setPermissionMode, and setMaxThinkingTokens before the next queued message', async () => {
         const transcriptPath = await createMaterializedClaudeTranscript('session-runtime-settings');
         let response: any = null;
@@ -3133,7 +3197,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
                 setPermissionMode: vi.fn(),
                 setModel: vi.fn(),
                 setMaxThinkingTokens: vi.fn(),
-                supportedCommands: vi.fn(async () => [{ command: '/compact', description: 'Compact context' }]),
+                supportedCommands: vi.fn(async () => [{ name: 'compact', description: 'Compact context', argumentHint: '' }]),
                 supportedModels: vi.fn(async () => [{ id: 'm1', displayName: 'Model 1' }]),
             } as any;
         });
@@ -3158,8 +3222,8 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
 
         expect(onCapabilities).toHaveBeenCalledWith(
             expect.objectContaining({
-                slashCommands: ['/compact'],
-                slashCommandDetails: [{ command: '/compact', description: 'Compact context' }],
+                slashCommands: ['compact'],
+                slashCommandDetails: [{ command: 'compact', description: 'Compact context' }],
             }),
         );
     });

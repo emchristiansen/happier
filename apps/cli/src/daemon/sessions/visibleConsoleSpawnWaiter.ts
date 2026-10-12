@@ -1,8 +1,7 @@
 import type { SpawnSessionResult } from '@/rpc/handlers/registerSessionHandlers';
-import { SPAWN_SESSION_ERROR_CODES } from '@/rpc/handlers/registerSessionHandlers';
 import type { ChildExit } from './onChildExited';
 import type { TrackedSession } from '../types';
-import { waitForSessionWebhook } from '../spawn/waitForSessionWebhook';
+import { waitForSessionWebhook, type SessionWebhookCompletion } from '../spawn/waitForSessionWebhook';
 import { logger } from '@/ui/logger';
 
 export function waitForVisibleConsoleSessionWebhook(params: Readonly<{
@@ -12,53 +11,47 @@ export function waitForVisibleConsoleSessionWebhook(params: Readonly<{
   pidToSpawnResultResolver: Map<number, (result: SpawnSessionResult) => void>;
   pidToSpawnWebhookTimeout: Map<number, ReturnType<typeof setTimeout>>;
   onChildExited: (pid: number, exit: ChildExit) => void | Promise<void>;
-}>): Promise<SpawnSessionResult> {
-  const { pid, pollMs, pidToAwaiter, pidToSpawnResultResolver, pidToSpawnWebhookTimeout, onChildExited } = params;
+  onSuccess?: (session: TrackedSession) => void | Promise<void>;
+}>): SessionWebhookCompletion {
+  const { pollMs, pidToAwaiter, pidToSpawnResultResolver, pidToSpawnWebhookTimeout, onChildExited } = params;
+  let completion: SessionWebhookCompletion;
   const interval = setInterval(() => {
+    const pid = completion.getCurrentPid();
     try {
       process.kill(pid, 0);
     } catch {
-      clearInterval(interval);
-      const resolveSpawn = pidToSpawnResultResolver.get(pid);
-      if (resolveSpawn) {
-        pidToSpawnResultResolver.delete(pid);
-        const timeout = pidToSpawnWebhookTimeout.get(pid);
-        if (timeout) clearTimeout(timeout);
-        pidToSpawnWebhookTimeout.delete(pid);
-        pidToAwaiter.delete(pid);
+      // The canonical exit owner arbitrates runner presence and wrapper promotion.
+      // Do not fail the same waiter or stop its existing poll for a wrapper-only exit.
+      let retirement: void | Promise<void>;
+      try {
+        retirement = onChildExited(pid, { reason: 'process-missing', code: null, signal: null });
+      } catch (error) {
+        retirement = Promise.reject(error);
       }
-      void (async () => {
-        try {
-          await onChildExited(pid, { reason: 'process-exited', code: null, signal: null });
-        } catch (error) {
-          logger.warn('[DAEMON RUN] Failed to complete visible-console exit cleanup; retaining tracked custody', { pid, error });
-          resolveSpawn?.({
-            type: 'error',
-            errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_FAILED,
-            errorMessage: 'startup_retirement_incomplete:exit_cleanup_incomplete',
-          });
-          return;
-        }
-        resolveSpawn?.({
-          type: 'error',
-          errorCode: SPAWN_SESSION_ERROR_CODES.CHILD_EXITED_BEFORE_WEBHOOK,
-          errorMessage: `Child process exited before session webhook (pid=${pid})`,
-        });
-      })();
+      // The exit owner settles startup through its custody finalizer. A poll
+      // observes PID absence only; it must not retire a retained dispatcher or
+      // independently fail the same waiter. Keep polling after promotion.
+      void Promise.resolve(retirement).then(() => {
+        if (completion.getCurrentPid() === pid && !pidToSpawnResultResolver.has(pid)) clearInterval(interval);
+      }, (error) => {
+        logger.warn('[DAEMON RUN] Failed to complete visible-console exit cleanup; retaining tracked custody', { pid, error });
+      });
     }
   }, pollMs);
   if (typeof interval.unref === 'function') {
     interval.unref();
   }
 
-  return waitForSessionWebhook({
-    pid,
+  completion = waitForSessionWebhook({
+    pid: params.pid,
     pidToAwaiter,
     pidToSpawnResultResolver,
     pidToSpawnWebhookTimeout,
-    timeoutErrorMessage: `Session webhook timeout for PID ${pid}`,
+    timeoutErrorMessage: `Session webhook timeout for PID ${params.pid}`,
     onTimeout: () => {
       clearInterval(interval);
     },
+    onSuccess: params.onSuccess,
   });
+  return completion;
 }

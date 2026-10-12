@@ -1,4 +1,4 @@
-import { parseClaudeScreenState, type ClaudeScreenState } from './tuiControls/screenState';
+import { isClaudeUsageLimitWaitBlockingComposerClear, parseClaudeScreenState, type ClaudeScreenState } from './tuiControls/screenState';
 import { classifyClaudeOwnComposerDraft } from './ownComposerDraftClassification';
 import { resolveClaudeUnifiedDialogBlockedReason } from './tuiControls/dialogRegistry';
 
@@ -100,6 +100,9 @@ export async function clearOwnLeftoverComposerDraft(opts: Readonly<{
     case 'foreign':
       return { status: 'foreign_draft', screen };
     case 'own':
+      if (isClaudeUsageLimitWaitBlockingComposerClear(screen)) {
+        return { status: 'blocked_non_input_state', screen, blockedReason: 'usage_limit_wait' };
+      }
       break;
   }
 
@@ -130,6 +133,9 @@ export async function clearOwnLeftoverComposerDraft(opts: Readonly<{
         // The draft changed under us (user started typing): stop immediately, never touch it.
         return { status: 'foreign_draft', screen };
       case 'own':
+        if (isClaudeUsageLimitWaitBlockingComposerClear(screen)) {
+          return { status: 'blocked_non_input_state', screen, blockedReason: 'usage_limit_wait' };
+        }
         break;
     }
   }

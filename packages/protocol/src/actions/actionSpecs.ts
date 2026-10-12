@@ -571,12 +571,13 @@ const SessionHandoffInputSchema = z.object({
 }).passthrough();
 
 const SessionSpawnTerminalInputSchema = z.object({
-  mode: z.enum(['plain', 'tmux', 'windows_terminal', 'windows_console']).optional(),
+  mode: z.enum(['plain', 'tmux', 'zellij', 'herdr', 'windows_terminal', 'windows_console']).optional(),
   tmux: z.object({
     sessionName: z.string().optional(),
     isolated: z.boolean().optional(),
     tmpDir: z.string().nullable().optional(),
   }).strict().optional(),
+  herdr: z.object({ sessionName: z.string().optional() }).strict().optional(),
 }).strict();
 
 function normalizeSpawnTargetAlias(value: string): string {
@@ -946,7 +947,8 @@ const SessionUserActionAnswerInputSchema = z.object({
 
 const SessionModeSetInputSchema = z.object({
   sessionId: z.string().min(1).optional(),
-  modeId: z.string().min(1),
+  // An empty id clears the override; native `default` remains a provider mode.
+  modeId: z.string(),
 }).passthrough();
 
 const SessionPrimaryTargetInputSchema = z.object({
@@ -2520,6 +2522,8 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
     description: 'Get the editable session goal when the provider supports native goals.',
     safety: 'safe',
     approval: APPROVAL_RESULT_REQUIRED,
+    contextualDefaults: { sessionId: 'current_session' },
+    toolExposure: { session_agent: 'direct' },
     placements: [],
     bindings: { mcpToolName: 'session_goal_get' },
     examples: {
@@ -2546,6 +2550,8 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
     description: 'Set or update the native session goal.',
     safety: 'safe',
     approval: APPROVAL_RESULT_NONE,
+    contextualDefaults: { sessionId: 'current_session' },
+    toolExposure: { session_agent: 'direct' },
     placements: [],
     bindings: { mcpToolName: 'session_goal_set' },
     examples: {
@@ -2576,7 +2582,9 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
     title: 'Clear session goal',
     description: 'Clear the native session goal.',
     safety: 'safe',
-    approval: APPROVAL_RESULT_NONE,
+    approval: APPROVAL_RESULT_REQUIRED,
+    contextualDefaults: { sessionId: 'current_session' },
+    toolExposure: { session_agent: 'direct' },
     placements: [],
     bindings: { mcpToolName: 'session_goal_clear' },
     examples: {

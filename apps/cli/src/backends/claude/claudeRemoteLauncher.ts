@@ -115,7 +115,7 @@ import { isClaudeExplicitDiffToolInput } from './utils/isClaudeExplicitDiffToolI
 import {
     buildClaudeSessionModelsMetadataFromSupportedModels,
 } from './remote/buildClaudeSessionModelsMetadataFromSupportedModels';
-import { applyClaudeEffectiveModelUpdate } from './sessionModels/effectiveModelUpdate';
+import { applyClaudeEffectiveModelUpdate, type ClaudeEffectiveModelObservation } from './sessionModels/effectiveModelUpdate';
 import {
     createStreamedTranscriptWriter,
     type StreamedTranscriptWriter,
@@ -862,6 +862,7 @@ export async function claudeRemoteLauncher(
         if (effectiveModelId) {
             applyClaudeEffectiveModelUpdate({
                 client: session.client,
+                reconcileModels: session.reconcileSessionModels,
                 modelId: effectiveModelId,
                 source: 'sdk',
                 logPrefix: '[remote]',
@@ -1204,6 +1205,7 @@ export async function claudeRemoteLauncher(
     ) => publisher?.dispose();
     let refreshInFlightSteerAvailability: (() => Promise<ClaudeInFlightSteerAvailabilitySnapshot>) | null = null;
     let applyActiveLaunchPermissionMetadata: ReturnType<typeof createClaudeUnifiedTerminalMetadataModeApplier> | null = null;
+    let applyAgentSdkPermissionMode: ((permissionMode: PermissionMode) => Promise<void>) | null = null;
     const inputConsumer = createClaudePendingAwareInputConsumer(session, {
         resolveActiveTurnSteerability: () => (
             inFlightSteerAvailabilitySnapshot.available ? 'steerable' : 'unsteerable'
@@ -1225,6 +1227,7 @@ export async function claudeRemoteLauncher(
             });
             if (!updated) return;
             logger.debug(`[remote]: Permission mode updated from metadata to: ${updated}`);
+            await applyAgentSdkPermissionMode?.(updated);
             await applyActiveLaunchPermissionMetadata?.(updated);
         },
     });
@@ -1270,12 +1273,15 @@ export async function claudeRemoteLauncher(
                 ? null
                 : { unavailableUntilMs };
         };
-        const surfaceRemoteRateLimitRuntimeIssue = async (details: NormalizedProviderUsageLimitDetailsV1): Promise<void> => {
+        const surfaceRemoteRateLimitRuntimeIssue = async (
+            details: NormalizedProviderUsageLimitDetailsV1,
+            observedWindows?: readonly NormalizedProviderUsageLimitDetailsV1[],
+        ): Promise<void> => {
             recordPrimaryProviderUnavailableForPromptDelivery(details);
-            await surfaceClaudeRateLimitRuntimeIssue(session, details, '[remote]');
+            await surfaceClaudeRateLimitRuntimeIssue(session, details, '[remote]', { observedWindows });
         };
-        const recordRemoteQuotaEvidence = async (details: NormalizedProviderUsageLimitDetailsV1): Promise<void> => {
-            await recordClaudeRateLimitQuotaEvidence(session, details, '[remote]');
+        const recordRemoteQuotaEvidence = async (windows: readonly NormalizedProviderUsageLimitDetailsV1[]): Promise<void> => {
+            await recordClaudeRateLimitQuotaEvidence(session, windows, '[remote]');
         };
         // Initial goal (P1-E4): consumed once from the daemon-provided env so the FIRST unified
         // launch injects `/goal <objective>`; a park/respawn relaunch must not re-inject it.
@@ -1447,6 +1453,7 @@ export async function claudeRemoteLauncher(
                         userMessageLocalIds: batch.userMessageLocalIds,
                         providerAcceptancePending: batch.providerAcceptancePending,
                         pendingProviderAction: batch.pendingProviderAction,
+                        pendingRequestedAction: batch.pendingRequestedAction,
                     });
 
                 const resolveQueuedPromptForProvider = async (
@@ -1588,6 +1595,14 @@ export async function claudeRemoteLauncher(
                     claudeSubscriptionAccessTokenRefreshSelection,
                     streamedTranscriptWriter,
                     setTurnInterrupt: unifiedBinding.sessionOptions.setTurnInterrupt,
+                    setPermissionModeApplier: async (apply: typeof applyAgentSdkPermissionMode) => {
+                        applyAgentSdkPermissionMode = apply;
+                        if (!apply) return;
+                        // Updates may arrive after the first prompt was dequeued but before
+                        // the SDK query registered its live controls. Re-read the same owner.
+                        const updated = syncClaudePermissionModeFromMetadata({ session, permissionHandler });
+                        if (updated) await apply(updated);
+                    },
                     canCallTool: permissionHandler.handleToolCall,
                     isAborted: (toolCallId: string) => {
                         return permissionHandler.isAborted(toolCallId);
@@ -1703,6 +1718,7 @@ export async function claudeRemoteLauncher(
                             (metadata) => {
                                 const modelsMetadata = buildClaudeSessionModelsMetadataFromSupportedModels({
                                     modelsRaw: caps.models,
+                                    reconcileModels: session.reconcileSessionModels,
                                     metadata,
                                 });
                                 return {
@@ -1719,6 +1735,10 @@ export async function claudeRemoteLauncher(
                     onThinkingChange: session.onThinkingChange,
                     claudeArgs: session.claudeArgs,
                     onMessage,
+                    onEffectiveModel: (facts: ClaudeEffectiveModelObservation) => applyClaudeEffectiveModelUpdate({
+                        client: session.client, reconcileModels: session.reconcileSessionModels,
+                        ...facts, source: 'sdk', logPrefix: '[remote]',
+                    }),
                     isWorkflowProviderTaskId: (taskId: string) => (
                         workflowActivitySource?.isWorkflowOwnedProviderTaskId(taskId) === true
                     ),
@@ -1738,11 +1758,11 @@ export async function claudeRemoteLauncher(
                         workflowActivitySource?.observeTranscriptMessage(value, observation);
                     },
                     onWorkStateSnapshot: publishWorkStateSnapshot,
-                    onRateLimitEvent: async (details: NormalizedProviderUsageLimitDetailsV1) => {
-                        await surfaceRemoteRateLimitRuntimeIssue(details);
+                    onRateLimitEvent: async (details: NormalizedProviderUsageLimitDetailsV1, observedWindows: readonly NormalizedProviderUsageLimitDetailsV1[]) => {
+                        await surfaceRemoteRateLimitRuntimeIssue(details, observedWindows);
                     },
-                    onQuotaEvidence: async (details: NormalizedProviderUsageLimitDetailsV1) => {
-                        await recordRemoteQuotaEvidence(details);
+                    onQuotaEvidence: async (windows: readonly NormalizedProviderUsageLimitDetailsV1[]) => {
+                        await recordRemoteQuotaEvidence(windows);
                     },
                     // Unified terminal usage-limit evidence is detected by the hook lifecycle
                     // bridge and surfaced through onUsageLimitDetails (the legacy/agent-SDK
@@ -1984,6 +2004,7 @@ export async function claudeRemoteLauncher(
                         };
                         const sharedTerminalCallbacks = createClaudeUnifiedTerminalSharedCallbacks({
                             sessionClient: session.client,
+                            reconcileModels: session.reconcileSessionModels,
                             observeInFlightSteerAvailabilitySnapshot,
                             sustainedPendingDeliveryBlockHandler,
                             dialogChoiceBroker,
@@ -2229,6 +2250,7 @@ export async function claudeRemoteLauncher(
                 disposeAgentSdkInFlightSteerCapabilityPublisher(agentSdkInFlightSteerCapabilityPublisher);
                 agentSdkInFlightSteerCapabilityPublisher = null;
                 refreshInFlightSteerAvailability = null;
+                applyAgentSdkPermissionMode = null;
                 inFlightSteerAvailabilitySnapshot = { available: false, reason: 'unsafe_window' };
                 if (applyActiveLaunchPermissionMetadata === applyUnifiedTerminalPermissionMetadata) {
                     applyActiveLaunchPermissionMetadata = null;

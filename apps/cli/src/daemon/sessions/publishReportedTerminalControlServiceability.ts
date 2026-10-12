@@ -2,7 +2,10 @@ import type { TerminalAttachmentInfo } from '@/terminal/attachment/terminalAttac
 
 import type { TrackedSession } from '../types';
 import type { SessionRunnerServiceabilityProbe } from './isSessionRunnerActive';
-import { shouldPublishReportedTerminalControlServiceability } from './terminalControlServiceabilityProjection';
+import {
+  hasActiveReportedTerminalControlServiceability,
+  shouldPublishReportedTerminalControlServiceability,
+} from './terminalControlServiceabilityProjection';
 
 export async function publishReportedTerminalControlServiceability(params: Readonly<{
   tracked: TrackedSession;
@@ -20,9 +23,17 @@ export async function publishReportedTerminalControlServiceability(params: Reado
   if (!sessionId || !terminal || terminal.mode === 'plain') return;
 
   const attachment = await params.readTerminalAttachmentInfo(sessionId);
+  if (!attachment || attachment.version === 1) return;
+
+  if (hasActiveReportedTerminalControlServiceability({ terminal, attachmentId: attachment.attachmentId })) {
+    params.tracked.publishedTerminalControlServiceabilityAttachmentId = attachment.attachmentId;
+    params.tracked.publishedTerminalControlServiceabilityAttachmentLifecycle =
+      attachment.version === 3 ? 'borrowed' : 'owned';
+    return;
+  }
+
   if (
-    attachment?.version !== 2
-    || !shouldPublishReportedTerminalControlServiceability({
+    !shouldPublishReportedTerminalControlServiceability({
       terminal,
       attachmentId: attachment.attachmentId,
       publishedAttachmentId: params.tracked.publishedTerminalControlServiceabilityAttachmentId,
@@ -35,5 +46,7 @@ export async function publishReportedTerminalControlServiceability(params: Reado
   const published = await params.publishSessionRunnerControlServiceability(sessionId, probe);
   if (published && probe.state === 'runner_present' && probe.control.state === 'servable') {
     params.tracked.publishedTerminalControlServiceabilityAttachmentId = attachment.attachmentId;
+    params.tracked.publishedTerminalControlServiceabilityAttachmentLifecycle =
+      attachment.version === 3 ? 'borrowed' : 'owned';
   }
 }

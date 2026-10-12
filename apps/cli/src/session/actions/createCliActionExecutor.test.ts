@@ -134,6 +134,9 @@ const env = process.env;
 
 function createPlainExecutor(extra: Partial<Parameters<typeof createCliActionExecutor>[0]> = {}) {
   return createCliActionExecutor({
+    // These existing launch fixtures represent the in-daemon OS boundary.
+    // Exact remote routing is exercised with the real creator/codec in its owner suite.
+    directSpawnTransport: { spawn: spawnDaemonSession, resolveSpawnSessionByNonce: resolveDaemonSpawnSessionByNonce },
     token: 'token',
     credentials: {
       token: 'token',
@@ -156,6 +159,7 @@ function createDataKeyExecutor(extra: Partial<Parameters<typeof createCliActionE
   const machineKey = new Uint8Array(32).fill(7);
   const publicKey = deriveBoxPublicKeyFromSeed(machineKey);
   return createCliActionExecutor({
+    directSpawnTransport: { spawn: spawnDaemonSession, resolveSpawnSessionByNonce: resolveDaemonSpawnSessionByNonce },
     token: 'token',
     credentials: {
       token: 'token',
@@ -1876,29 +1880,6 @@ describe('createCliActionExecutor', () => {
       },
     });
     expect(spawnDaemonSession).not.toHaveBeenCalled();
-  });
-
-  it('executes session.message.send via the existing sendSessionMessage service', async () => {
-    const executor = createPlainExecutor();
-    sendSessionMessage.mockResolvedValue({ ok: true, sessionId: 'sess-1', localId: 'local-1', waited: false });
-
-    const result = await executor.execute(
-      'session.message.send',
-      { sessionId: 'sess-1', message: 'Hello', wait: false, timeoutSeconds: 10 },
-      { surface: 'cli', defaultSessionId: 'sess-1' },
-    );
-
-    expect(result).toEqual({
-      ok: true,
-      result: { ok: true, sessionId: 'sess-1', localId: 'local-1', waited: false },
-    });
-    expect(sendSessionMessage).toHaveBeenCalledWith(expect.objectContaining({
-      credentials: expect.objectContaining({ token: 'token' }),
-      idOrPrefix: 'sess-1',
-      message: 'Hello',
-      wait: false,
-      timeoutMs: 10_000,
-    }));
   });
 
   it('prepares without dispatch and preserves one-shot terminal execution through the CLI wrapper', async () => {

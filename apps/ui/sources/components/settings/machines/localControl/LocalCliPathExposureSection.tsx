@@ -25,7 +25,12 @@ function readTaskOutcome(kind: CliPathExposureTaskKind, result: SystemTaskResult
         return data.removed === true ? t('machine.cliPath.removed') : t('machine.cliPath.nothingToRemove');
     }
     if (data.changed !== true) {
-        return t('machine.cliPath.alreadyPresent');
+        // Another `happier` already answers in the terminal and was deliberately left in front, so
+        // nothing was added; say which one, rather than claiming ours is already there (R17).
+        const existingCommand = typeof data.existingCommand === 'string' ? data.existingCommand.trim() : '';
+        return existingCommand
+            ? t('machine.cliPath.existingCommand', { path: existingCommand })
+            : t('machine.cliPath.alreadyPresent');
     }
     return typeof data.shellReloadHint === 'string' && data.shellReloadHint.trim()
         ? data.shellReloadHint.trim()

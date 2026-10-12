@@ -24,7 +24,6 @@ import type { InboxSummary } from '@/hooks/inbox/useInboxSummary';
 export type SidebarViewProps = Readonly<{
     sidebarWidthPx?: number | null;
     desktopWindowControls?: React.ReactNode;
-    desktopUpdateIndicator?: React.ReactNode;
     inboxSummary?: InboxSummary | null;
     inboxEnabled?: boolean;
 }>;
@@ -111,7 +110,6 @@ export const SidebarView = React.memo((props: SidebarViewProps) => {
                     renderHeaderOverflowVisual={renderHeaderOverflowVisual}
                     popoverBoundaryRef={popoverBoundaryRef}
                     desktopWindowControls={resolvedDesktopWindowControls}
-                    desktopUpdateIndicator={props.desktopUpdateIndicator}
                     inboxSummary={props.inboxSummary}
                     inboxEnabled={props.inboxEnabled}
                 />

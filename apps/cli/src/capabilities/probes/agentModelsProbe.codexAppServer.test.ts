@@ -1,278 +1,106 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-
-const {
-  withCodexAppServerClientMock,
-  readCodexAppServerSessionControlsMock,
-} = vi.hoisted(() => ({
-  withCodexAppServerClientMock: vi.fn(),
-  readCodexAppServerSessionControlsMock: vi.fn(),
-}));
-
-vi.mock('@/backends/codex/appServer/client/withCodexAppServerClient', () => ({
-  withCodexAppServerClient: withCodexAppServerClientMock,
-}));
-
-vi.mock('@/backends/codex/appServer/sessionControlsMetadata', () => ({
-  readCodexAppServerSessionControls: readCodexAppServerSessionControlsMock,
-}));
-
-import { probeAgentModelsBestEffort } from './agentModelsProbe';
-import { resetAgentModelsProbeCacheForTests } from './agentModelsProbe';
+import {
+  createCodexAppServerProcessEnv,
+  writeFakeCodexAppServerScript,
+} from '@/backends/codex/appServer/testkit/fakeCodexAppServer';
+import { createProbeTempDir } from './agentModelsProbe.testkit';
+import { probeAgentModelsBestEffort, resetAgentModelsProbeCacheForTests } from './agentModelsProbe';
 
 describe('probeAgentModelsBestEffort (codex app-server)', () => {
-  let previousCodexHome: string | undefined;
-  let tempCodexHome: string | null = null;
-
-  beforeEach(() => {
-    withCodexAppServerClientMock.mockReset();
-    readCodexAppServerSessionControlsMock.mockReset();
+  let fixture: Awaited<ReturnType<typeof createProbeTempDir>>;
+  beforeEach(async () => {
     resetAgentModelsProbeCacheForTests();
-    previousCodexHome = process.env.CODEX_HOME;
-    tempCodexHome = null;
+    fixture = await createProbeTempDir('happier-codex-model-probe');
+  });
+  afterEach(async () => {
+    resetAgentModelsProbeCacheForTests();
+    await fixture.cleanup();
   });
 
-  afterEach(() => {
-    if (previousCodexHome === undefined) {
-      delete process.env.CODEX_HOME;
-    } else {
-      process.env.CODEX_HOME = previousCodexHome;
-    }
-    if (tempCodexHome) {
-      rmSync(tempCodexHome, { recursive: true, force: true });
-    }
-  });
-
-  it('retries a transient Codex app-server failure within the same probe so the first result is rich', async () => {
-    withCodexAppServerClientMock
-      .mockRejectedValueOnce(new Error('temporary codex app-server failure'))
-      .mockImplementationOnce(async ({ cwd, run }: any) => {
-        expect(cwd).toBe('/repo');
-        return await run({ request: vi.fn() });
-      });
-    readCodexAppServerSessionControlsMock.mockResolvedValue({
-      availableModes: [],
-      currentModeId: 'default',
-      availableModels: [
-        { id: 'gpt-5.4', name: 'GPT-5.4' },
-        { id: 'gpt-5.4-mini', name: 'GPT-5.4 mini' },
+  async function probe(models: unknown[], options: { failFirst?: boolean; accountSettings?: Record<string, unknown> } = {}) {
+    // The installed app-server process is the only substituted boundary. Launch,
+    // RPC orchestration, session-control parsing, normalization and caching stay real.
+    const command = await writeFakeCodexAppServerScript({
+      dir: fixture.dir,
+      importLines: ['import { existsSync, writeFileSync } from "node:fs";'],
+      setupLines: [
+        `const models = ${JSON.stringify(models)};`,
+        `const failureMarker = ${JSON.stringify(join(fixture.dir, 'failed-once'))};`,
+        `const fail = ${options.failFirst === true} && !existsSync(failureMarker);`,
+        'if (fail) writeFileSync(failureMarker, "failed");',
       ],
-      currentModelId: 'gpt-5.4',
-      configOptions: [],
+      bodyLines: [
+        'for await (const line of rl) {',
+        '  const msg = JSON.parse(line);',
+        '  if (msg.id === undefined) continue;',
+        '  const response = msg.method === "initialize" && fail',
+        '    ? { error: { code: -32000, message: "temporary startup failure" } }',
+        '    : { result: msg.method === "model/list" ? { data: models, nextCursor: null }',
+        '      : msg.method === "collaborationMode/list" ? { data: [] }',
+        '      : { userAgent: "fake/0.0.0", platformFamily: "unix", platformOs: "linux" } };',
+        '  process.stdout.write(JSON.stringify({ id: msg.id, ...response }) + "\\n");',
+        '}',
+      ],
     });
-
-    const first = await probeAgentModelsBestEffort({
-      agentId: 'codex',
-      cwd: '/repo',
-      accountSettings: { codexBackendMode: 'appServer' },
+    return await probeAgentModelsBestEffort({
+      agentId: 'codex', cwd: fixture.dir, timeoutMs: 5_000,
+      accountSettings: options.accountSettings,
+      processEnv: createCodexAppServerProcessEnv(command, {
+        CODEX_HOME: fixture.dir, OPENAI_API_KEY: 'test', CODEX_API_KEY: undefined,
+      }),
     });
+  }
 
-    expect(first).toEqual({
-      provider: 'codex',
+  it('retries a transient app-server failure within the same probe', async () => {
+    const result = await probe([
+      { id: 'gpt-5.4', displayName: 'GPT-5.4' },
+      { id: 'gpt-5.4-mini', displayName: 'GPT-5.4 mini' },
+    ], { failFirst: true, accountSettings: { codexBackendMode: 'appServer' } });
+    expect(result).toMatchObject({
+      source: 'dynamic', observedAt: expect.any(Number),
       availableModels: [
         { id: 'default', name: 'Default' },
-        { id: 'gpt-5.4', name: 'GPT-5.4' },
-        { id: 'gpt-5.4-mini', name: 'GPT-5.4 mini' },
+        { id: 'gpt-5.4', name: 'GPT 5.4' },
+        { id: 'gpt-5.4-mini', name: 'GPT 5.4 Mini' },
       ],
-      supportsFreeform: false,
-      source: 'dynamic',
-    });
-    expect(withCodexAppServerClientMock).toHaveBeenCalledTimes(2);
-    expect(readCodexAppServerSessionControlsMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('uses Codex app-server session controls when account settings select appServer', async () => {
-    tempCodexHome = mkdtempSync(join(tmpdir(), 'codex-probe-auth-'));
-    mkdirSync(tempCodexHome, { recursive: true });
-    writeFileSync(join(tempCodexHome, 'auth.json'), JSON.stringify({
-      tokens: {
-        access_token: [
-          'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0',
-          'eyJleHAiIjo0MTAyNDQ0ODAwLCJlbWFpbCI6InFhQGV4YW1wbGUuY29tIn0',
-          '',
-        ].join('.'),
-      },
-    }));
-    process.env.CODEX_HOME = tempCodexHome;
-
-        withCodexAppServerClientMock.mockImplementation(async ({ cwd, run }: any) => {
-          expect(cwd).toBe('/repo');
-          return await run({ request: vi.fn() });
-        });
-        readCodexAppServerSessionControlsMock.mockResolvedValue({
-          availableModes: [],
-          currentModeId: 'default',
-          availableModels: [
-        {
-          id: 'gpt-5.4',
-          name: 'GPT-5.4',
-          description: 'Latest default',
-          modelOptions: [
-            {
-              id: 'reasoning_effort',
-              name: 'Thinking',
-              type: 'select',
-              currentValue: 'medium',
-              options: [
-                { value: 'low', name: 'Low' },
-                { value: 'medium', name: 'Medium' },
-                { value: 'high', name: 'High' },
-              ],
-            },
-          ],
-        },
-        { id: 'gpt-4.1', name: 'GPT-4.1' },
-          ],
-          currentModelId: 'gpt-5.4',
-          configOptions: [],
-        });
-
-    const result = await probeAgentModelsBestEffort({
-      agentId: 'codex',
-      cwd: '/repo',
-      accountSettings: { codexBackendMode: 'appServer' },
-    });
-
-      expect(result).toEqual({
-        provider: 'codex',
-        availableModels: [
-          { id: 'default', name: 'Default' },
-        {
-          id: 'gpt-5.4',
-          name: 'GPT-5.4',
-          description: 'Latest default',
-          modelOptions: [
-            {
-              id: 'reasoning_effort',
-              name: 'Thinking',
-              type: 'select',
-              currentValue: 'medium',
-              options: [
-                { value: 'low', name: 'Low' },
-                { value: 'medium', name: 'Medium' },
-                { value: 'high', name: 'High' },
-              ],
-            },
-          ],
-        },
-        { id: 'gpt-4.1', name: 'GPT-4.1' },
-        ],
-        supportsFreeform: false,
-        source: 'dynamic',
-      });
-    expect(withCodexAppServerClientMock).toHaveBeenCalledTimes(1);
-    expect(readCodexAppServerSessionControlsMock).toHaveBeenCalledTimes(1);
-    expect(readCodexAppServerSessionControlsMock).toHaveBeenCalledWith({
-      client: expect.objectContaining({ request: expect.any(Function) }),
-      authMethod: 'credentials_file',
     });
   });
 
-  it('uses Codex app-server session controls when the shared runtime defaults to appServer', async () => {
-    withCodexAppServerClientMock.mockImplementation(async ({ cwd, run }: any) => {
-      expect(cwd).toBe('/repo-default');
-      return await run({ request: vi.fn() });
-    });
-    readCodexAppServerSessionControlsMock.mockResolvedValue({
-      availableModes: [],
-      currentModeId: 'default',
-      availableModels: [
-        { id: 'gpt-5.4', name: 'GPT-5.4' },
-      ],
-      currentModelId: 'gpt-5.4',
-      configOptions: [],
-    });
-
-    const result = await probeAgentModelsBestEffort({
-      agentId: 'codex',
-      cwd: '/repo-default',
-    });
-
-    expect(result).toEqual({
-      provider: 'codex',
-      availableModels: [
-        { id: 'default', name: 'Default' },
-        { id: 'gpt-5.4', name: 'GPT-5.4' },
-      ],
-      supportsFreeform: false,
+  it('uses app-server model capabilities when account settings select appServer', async () => {
+    const result = await probe([{
+      id: 'gpt-5.4', displayName: 'GPT-5.4', description: 'Latest default',
+      supportedReasoningEfforts: ['low', 'medium', 'high'], defaultReasoningEffort: 'medium',
+    }], { accountSettings: { codexBackendMode: 'appServer' } });
+    expect(result).toMatchObject({
       source: 'dynamic',
+      availableModels: [{ id: 'default', name: 'Default' }, {
+        id: 'gpt-5.4', name: 'GPT 5.4', description: 'Latest default',
+        modelOptions: [{ id: 'reasoning_effort', currentValue: 'medium', options: [
+          { value: 'low', name: 'Low' }, { value: 'medium', name: 'Medium' }, { value: 'high', name: 'High' },
+        ] }],
+      }],
     });
-    expect(withCodexAppServerClientMock).toHaveBeenCalledTimes(1);
-    expect(readCodexAppServerSessionControlsMock).toHaveBeenCalledTimes(1);
   });
 
-  it('filters malformed dynamic model payload entries and normalizes invalid option values to null', async () => {
-    withCodexAppServerClientMock.mockImplementation(async ({ cwd, run }: any) => {
-      expect(cwd).toBe('/repo-parse');
-      return await run({ request: vi.fn() });
+  it('uses app-server controls when the shared runtime defaults to appServer', async () => {
+    expect(await probe([{ id: 'gpt-5.4', displayName: 'GPT-5.4' }])).toMatchObject({
+      source: 'dynamic', observedAt: expect.any(Number),
+      availableModels: [{ id: 'default', name: 'Default' }, { id: 'gpt-5.4', name: 'GPT 5.4' }],
     });
-    readCodexAppServerSessionControlsMock.mockResolvedValue({
-      availableModes: [],
-      currentModeId: 'default',
-      availableModels: [
-        {
-          id: 'gpt-5.4',
-          name: 'GPT-5.4',
-          modelOptions: [
-            {
-              id: 'reasoning_effort',
-              name: 'Thinking',
-              type: 'select',
-              currentValue: { invalid: true },
-              options: [
-                { value: { invalid: true }, name: 'Auto' },
-                { value: 'medium', name: 'Medium' },
-                { value: 'skip-me' },
-              ],
-            },
-            {
-              id: 'missing-type',
-              name: 'Broken option',
-              currentValue: 'ignored',
-            },
-          ],
-        },
-        {
-          id: 'missing-name',
-          modelOptions: [],
-        },
-      ],
-      currentModelId: 'gpt-5.4',
-      configOptions: [],
-    });
+  });
 
-    const result = await probeAgentModelsBestEffort({
-      agentId: 'codex',
-      cwd: '/repo-parse',
-      accountSettings: { codexBackendMode: 'appServer' },
-    });
-
-    expect(result).toEqual({
-      provider: 'codex',
-      availableModels: [
-        { id: 'default', name: 'Default' },
-        {
-          id: 'gpt-5.4',
-          name: 'GPT-5.4',
-          modelOptions: [
-            {
-              id: 'reasoning_effort',
-              name: 'Thinking',
-              type: 'select',
-              currentValue: null,
-              options: [
-                { value: null, name: 'Auto' },
-                { value: 'medium', name: 'Medium' },
-              ],
-            },
-          ],
-        },
-      ],
-      supportsFreeform: false,
-      source: 'dynamic',
+  it('filters malformed model entries and unsupported reasoning choice shapes at the provider boundary', async () => {
+    const result = await probe([
+      { id: 'gpt-5.4', displayName: 'GPT-5.4', supportedReasoningEfforts: [{ invalid: true }, { reasoningEffort: 'medium' }] },
+      { name: 'Missing identifier' }, null,
+    ], { accountSettings: { codexBackendMode: 'appServer' } });
+    expect(result).toMatchObject({
+      source: 'dynamic', availableModels: [{ id: 'default', name: 'Default' }, {
+        id: 'gpt-5.4', name: 'GPT 5.4',
+        modelOptions: [{ id: 'reasoning_effort', currentValue: 'medium', options: [{ value: 'medium', name: 'Medium' }] }],
+      }],
     });
   });
 });

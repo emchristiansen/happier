@@ -5,21 +5,94 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildLaunchdPlistXml, renderSystemdServiceUnit, renderWindowsScheduledTaskWrapperPs1 } from '@happier-dev/cli-common/service';
 
 import { withTempDir } from '@/testkit/fs/tempDir';
+import { withConfiguredDaemonTestHome, writeDaemonSettingsFixture } from '@/daemon/testkit/fakeDaemonLifecycle.testkit';
+import { evaluateDaemonStartupServiceConflict } from '@/daemon/ownership/daemonServiceInventory';
+import { resolveDaemonServiceCliRuntimeFromEnv } from './cli';
+import { previewDaemonServiceInstall } from './installer';
+import { planServiceDaemonsRestartAfterUpdate } from '@/cli/runtime/update/restartServiceDaemonAfterUpdate';
 
-import { discoverInstalledDaemonServiceEntries, readInstalledDaemonServiceAutostartMode } from './discoverInstalledDaemonServiceEntries';
+import { discoverInstalledDaemonServiceEntries, isValidInstalledDaemonServiceFile, readInstalledDaemonServiceAutostartMode, readInstalledDaemonServiceTargetMode } from './discoverInstalledDaemonServiceEntries';
+
+const { readdirSyncMock, readFileSyncMock } = vi.hoisted(() => ({ readdirSyncMock: vi.fn(), readFileSyncMock: vi.fn() }));
+// Filesystem enumeration and reads are the OS boundary; all discovery/parsing stays real.
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, readdirSync: readdirSyncMock, readFileSync: readFileSyncMock };
+});
 
 const { spawnSyncMock } = vi.hoisted(() => ({
   spawnSyncMock: vi.fn<typeof import('node:child_process').spawnSync>(),
 }));
 
-vi.mock('node:child_process', () => ({
+vi.mock('node:child_process', async (importOriginal) => ({
+  ...await importOriginal<typeof import('node:child_process')>(),
   spawnSync: spawnSyncMock,
 }));
 
 describe('discoverInstalledDaemonServiceEntries', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    readdirSyncMock.mockReset();
+    const fs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    readdirSyncMock.mockImplementation(fs.readdirSync);
+    readFileSyncMock.mockReset();
+    readFileSyncMock.mockImplementation(fs.readFileSync);
     spawnSyncMock.mockReset();
-    spawnSyncMock.mockReturnValue({ status: 1, stdout: '', stderr: '' } as never);
+    spawnSyncMock.mockReturnValue({ status: 0, stdout: '', stderr: '' } as never);
+  });
+
+  it.each(['EACCES', 'EIO'])('propagates %s rather than reporting an empty service inventory', async (code) => {
+    const error = Object.assign(new Error('cannot enumerate services'), { code });
+    readdirSyncMock.mockImplementationOnce(() => { throw error; });
+    await expect(discoverInstalledDaemonServiceEntries({
+      platform: 'linux', userHomeDir: '/unused', happierHomeDir: '/unused/.happier', mode: 'user', serversById: {},
+    })).rejects.toMatchObject({ code: 'service_inventory_unavailable', cause: error });
+  });
+
+  it.each(['linux', 'darwin', 'win32'] as const)('requires readable %s definitions to prove installation while optional metadata remains unknown', (platform) => {
+    const cause = Object.assign(new Error('cannot read service definition'), { code: 'EACCES' });
+    readFileSyncMock.mockImplementation(() => { throw cause; });
+    expect(() => isValidInstalledDaemonServiceFile({ platform, path: '/unused', expectedLabel: 'happier-daemon.default' }))
+      .toThrow(expect.objectContaining({ code: 'service_inventory_unavailable', cause }));
+    expect(readInstalledDaemonServiceAutostartMode({ platform, path: '/unused' })).toBeNull();
+    const installedPath = platform === 'linux' ? '/unused/happier-daemon.default.service'
+      : platform === 'darwin' ? '/unused/com.happier.cli.daemon.default.plist'
+      : '/unused/happier-daemon.default.ps1';
+    expect(readInstalledDaemonServiceTargetMode({ platform, path: installedPath })).toBeNull();
+
+    readFileSyncMock.mockImplementation(() => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); });
+    expect(isValidInstalledDaemonServiceFile({ platform, path: '/unused', expectedLabel: 'happier-daemon.default' })).toBe(false);
+  });
+
+  it.each(['daemon-start', 'service-install', 'self-update'] as const)('names unknown inventory before %s can change services', async (operation) => {
+    await withConfiguredDaemonTestHome({ prefix: 'w12-cli-inventory-', env: { HAPPIER_DAEMON_SERVICE_PLATFORM: 'linux', HAPPIER_PUBLIC_RELEASE_CHANNEL: 'stable' } }, async ({ homeDir }) => {
+      await writeDaemonSettingsFixture(homeDir);
+      const cause = Object.assign(new Error('cannot enumerate service directory'), { code: 'EACCES' });
+      readdirSyncMock.mockImplementation(() => { throw cause; });
+      const command = operation === 'daemon-start'
+        ? evaluateDaemonStartupServiceConflict({ startupSource: 'manual', runtime: resolveDaemonServiceCliRuntimeFromEnv({ processEnv: process.env }) })
+        : operation === 'service-install'
+          ? previewDaemonServiceInstall({ platform: 'linux', userHomeDir: homeDir, happierHomeDir: homeDir, channel: 'stable', nodePath: process.execPath, entryPath: process.argv[1] })
+          : planServiceDaemonsRestartAfterUpdate({ channel: 'stable' });
+      await expect(command).rejects.toMatchObject({ code: 'service_inventory_unavailable', message: expect.stringMatching(/background services.*could not be listed/i), cause });
+    });
+  });
+
+  it('reports a missing service directory as an empty inventory', async () => {
+    readdirSyncMock.mockImplementationOnce(() => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); });
+    await expect(discoverInstalledDaemonServiceEntries({
+      platform: 'linux', userHomeDir: '/unused', happierHomeDir: '/unused/.happier', mode: 'user', serversById: {},
+    })).resolves.toEqual([]);
+  });
+
+  it('propagates a Windows task enumeration error rather than losing services with missing wrappers', async () => {
+    await withTempDir('happier-discover-task-error-', async (homeDir) => {
+      mkdirSync(join(homeDir, '.happier', 'services'), { recursive: true });
+      const error = Object.assign(new Error('cannot enumerate scheduled tasks'), { code: 'EACCES' });
+      spawnSyncMock.mockReturnValueOnce({ status: null, error, stdout: '', stderr: '' } as never);
+      await expect(discoverInstalledDaemonServiceEntries({
+        platform: 'win32', userHomeDir: homeDir, happierHomeDir: join(homeDir, '.happier'), mode: 'user', serversById: {},
+      })).rejects.toMatchObject({ code: 'service_inventory_unavailable', cause: error });
+    });
   });
 
   it('prefers the embedded active server id over an env-hash filename for pinned linux units', async () => {
@@ -738,7 +811,7 @@ describe('discoverInstalledDaemonServiceEntries', () => {
     });
   });
 
-  it('does not fabricate a local wrapper path when Windows task wrapper path cannot be resolved', async () => {
+  it('names an unreadable Windows task instead of claiming an empty inventory', async () => {
     await withTempDir('happier-discover-service-entry-windows-unresolved-task-', async (homeDir) => {
       const happierHomeDir = join(homeDir, '.happier');
       mkdirSync(join(happierHomeDir, 'services'), { recursive: true });
@@ -772,15 +845,41 @@ describe('discoverInstalledDaemonServiceEntries', () => {
         return { status: 1, stdout: '', stderr: 'unexpected schtasks call' } as never;
       });
 
-      const entries = await discoverInstalledDaemonServiceEntries({
+      await expect(discoverInstalledDaemonServiceEntries({
         platform: 'win32',
         userHomeDir: homeDir,
         happierHomeDir,
         mode: 'user',
         serversById: {},
-      });
+      })).rejects.toMatchObject({ code: 'service_inventory_unavailable', message: expect.stringContaining('happier-daemon.default') });
+    });
+  });
 
-      expect(entries).toEqual([]);
+  it('enumerates Scheduler without a local wrapper directory and retains foreign tasks', async () => {
+    await withTempDir('happier-discover-task-no-directory-', async (homeDir) => {
+      const wrapper = String.raw`C:\Other\.happier\services\happier-daemon.company.ps1`;
+      spawnSyncMock.mockImplementation((_command, args) => ({ status: 0, stdout: args?.includes('/XML') ? `<Task><Actions><Exec><Arguments>-File "${wrapper}"</Arguments></Exec></Actions></Task>` : '"\\Happier\\happier-daemon.company","N/A"\r\n', stderr: '' } as never));
+      const entries = await discoverInstalledDaemonServiceEntries({ platform: 'win32', userHomeDir: homeDir, happierHomeDir: join(homeDir, '.happier'), mode: 'user', serversById: {} });
+      expect(entries).toEqual([expect.objectContaining({ serverId: 'company', path: wrapper })]);
+    });
+  });
+
+  it('names the task when the OS process boundary throws during inspection', async () => {
+    readdirSyncMock.mockReturnValue([]);
+    spawnSyncMock.mockReturnValueOnce({ status: 0, stdout: '"\\Happier\\happier-daemon.company","N/A"\r\n', stderr: '' } as never)
+      .mockImplementationOnce(() => { throw new Error('OS process unavailable'); });
+    await expect(discoverInstalledDaemonServiceEntries({ platform: 'win32', userHomeDir: '/unused', happierHomeDir: '/unused/.happier', mode: 'user', serversById: {} }))
+      .rejects.toMatchObject({ code: 'service_inventory_unavailable', message: expect.stringContaining('happier-daemon.company') });
+  });
+
+  it('omits a task only after a successful Scheduler enumeration proves it disappeared', async () => {
+    await withTempDir('happier-discover-task-disappeared-', async (homeDir) => {
+      mkdirSync(join(homeDir, '.happier', 'services'), { recursive: true });
+      spawnSyncMock.mockReturnValueOnce({ status: 0, stdout: '"\\Happier\\happier-daemon.company","N/A"\r\n', stderr: '' } as never)
+        .mockReturnValueOnce({ status: 1, stdout: '', stderr: 'not found' } as never)
+        .mockReturnValueOnce({ status: 1, stdout: '', stderr: 'not found' } as never)
+        .mockReturnValueOnce({ status: 0, stdout: '', stderr: '' } as never);
+      await expect(discoverInstalledDaemonServiceEntries({ platform: 'win32', userHomeDir: homeDir, happierHomeDir: join(homeDir, '.happier'), mode: 'user', serversById: {} })).resolves.toEqual([]);
     });
   });
 

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { writeFakeCodexAppServerThreadListScript } from '@/backends/codex/appServer/testkit/fakeCodexAppServer';
 import type { RawSessionRecord } from '@/session/transport/http/sessionsHttp';
+import type { Credentials } from '@/persistence';
 import type {
   ConnectedServiceBindingsV1,
   ConnectedServiceMaterializationIdentityV1,
@@ -13,7 +14,8 @@ import type {
 import type { LoadedLinkedDirectSession } from './loadLinkedDirectSession';
 import { resolveDirectTakeoverSpawnOptions } from './resolveDirectTakeoverSpawnOptions';
 
-const { listSessionMarkersMock } = vi.hoisted(() => ({
+const { bootstrapAccountSettingsContextMock, listSessionMarkersMock } = vi.hoisted(() => ({
+  bootstrapAccountSettingsContextMock: vi.fn(async () => ({ settings: {} })),
   listSessionMarkersMock: vi.fn<() => Promise<unknown[]>>(async () => []),
 }));
 
@@ -32,6 +34,12 @@ vi.mock('@/configuration', () => ({
 vi.mock('@/daemon/sessionRegistry', () => ({
   listSessionMarkers: listSessionMarkersMock,
 }));
+
+vi.mock('@/settings/accountSettings/bootstrapAccountSettingsContext', () => ({
+  bootstrapAccountSettingsContext: bootstrapAccountSettingsContextMock,
+}));
+
+const TEST_CREDENTIALS = { token: 'test-token' } as Credentials;
 
 function jsonlLine(value: unknown): string {
   return `${JSON.stringify(value)}\n`;
@@ -74,15 +82,93 @@ function createLinkedOpenCodeSessionFixture(params: Readonly<{
   };
 }
 
+function createLinkedClaudeSessionFixture(params: Readonly<{
+  remoteSessionId: string;
+  source: LoadedLinkedDirectSession['source'];
+  sessionPath?: string | null;
+  metadata?: LoadedLinkedDirectSession['metadata'];
+}>): LoadedLinkedDirectSession {
+  return {
+    rawSession: {} as RawSessionRecord,
+    metadata: params.metadata ?? {},
+    sessionPath: params.sessionPath ?? null,
+    providerId: 'claude',
+    machineId: 'machine-1',
+    remoteSessionId: params.remoteSessionId,
+    source: params.source,
+    codexBackendMode: null,
+  };
+}
+
 describe('resolveDirectTakeoverSpawnOptions', () => {
   beforeEach(() => {
     listSessionMarkersMock.mockReset();
     listSessionMarkersMock.mockResolvedValue([]);
+    bootstrapAccountSettingsContextMock.mockReset();
+    bootstrapAccountSettingsContextMock.mockResolvedValue({ settings: {} });
     vi.stubEnv('CODEX_SQLITE_HOME', TEST_CODEX_SQLITE_HOME);
   });
 
   afterEach(() => {
     vi.unstubAllEnvs();
+  });
+
+  it.each([
+    {
+      provider: 'codex' as const,
+      linked: () => createLinkedCodexSessionFixture({
+        remoteSessionId: 'default-auth-codex-thread',
+        sessionPath: '/tmp/direct-codex-default-auth-project',
+        source: { kind: 'codexHome', home: 'user' },
+        codexBackendMode: 'appServer',
+      }),
+      serviceId: 'openai-codex',
+    },
+    {
+      provider: 'claude' as const,
+      linked: () => createLinkedClaudeSessionFixture({
+        remoteSessionId: 'default-auth-claude-thread',
+        sessionPath: '/tmp/direct-claude-default-auth-project',
+        source: { kind: 'claudeConfig', configDir: '/tmp/direct-claude-default-auth-config', projectId: null },
+      }),
+      serviceId: 'claude-subscription',
+    },
+  ])('applies the configured connected-service default when takeover starts a new $provider runtime', async ({ linked, serviceId }) => {
+    const connectedServices = {
+      v: 1,
+      bindingsByServiceId: {
+        [serviceId]: { source: 'connected', selection: 'group', groupId: 'default-pool' },
+      },
+    } satisfies ConnectedServiceBindingsV1;
+    bootstrapAccountSettingsContextMock.mockResolvedValueOnce({
+      settings: {
+        connectedServicesDefaultAuthByAgentIdV1: {
+          v: 1,
+          bindingsByAgentId: {
+            [linked().providerId]: {
+              v: 1,
+              bindingsByServiceId: connectedServices.bindingsByServiceId,
+            },
+          },
+        },
+      },
+    });
+
+    const spawnOptions = await resolveDirectTakeoverSpawnOptions({
+      linked: linked(),
+      sessionId: `sess_happy_direct_${serviceId}`,
+      credentials: TEST_CREDENTIALS,
+    });
+
+    expect(bootstrapAccountSettingsContextMock).toHaveBeenCalledWith({
+      credentials: TEST_CREDENTIALS,
+      mode: 'blocking',
+      deps: { applySideEffects: expect.any(Function) },
+    });
+    expect(spawnOptions).toMatchObject({
+      connectedServices,
+      connectedServicesUpdatedAt: expect.any(Number),
+    });
   });
 
   it('lets direct Codex takeovers inherit the default backend mode instead of forcing ACP', async () => {
@@ -112,6 +198,7 @@ describe('resolveDirectTakeoverSpawnOptions', () => {
     vi.stubEnv('CODEX_HOME', codexHome);
 
     const spawnOptions = await resolveDirectTakeoverSpawnOptions({
+      credentials: TEST_CREDENTIALS,
       linked: createLinkedCodexSessionFixture({
         remoteSessionId: '11111111-1111-1111-1111-111111111111',
         source: { kind: 'codexHome', home: 'user' },
@@ -140,6 +227,7 @@ describe('resolveDirectTakeoverSpawnOptions', () => {
     vi.stubEnv('CODEX_HOME', codexHome);
 
     const spawnOptions = await resolveDirectTakeoverSpawnOptions({
+      credentials: TEST_CREDENTIALS,
       linked: createLinkedCodexSessionFixture({
         remoteSessionId: '11111111-1111-1111-1111-111111111111',
         sessionPath: '/tmp/direct-codex-app-server-project',
@@ -164,6 +252,160 @@ describe('resolveDirectTakeoverSpawnOptions', () => {
     });
   });
 
+  it('adopts the existing Codex app-server daemon when it already owns the requested direct thread', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-direct-takeover-codex-daemon-'));
+    const codexHome = join(root, '.codex');
+    const projectDir = join(root, 'project');
+    await mkdir(codexHome, { recursive: true });
+    await mkdir(projectDir, { recursive: true });
+    const fakeAppServer = await writeFakeCodexAppServerThreadListScript({
+      dir: root,
+      loadedThreadIds: ['daemon-thread-1'],
+    });
+    vi.stubEnv('CODEX_HOME', codexHome);
+    vi.stubEnv('HAPPIER_CODEX_APP_SERVER_BIN', fakeAppServer);
+    bootstrapAccountSettingsContextMock.mockResolvedValueOnce({
+      settings: {
+        connectedServicesDefaultAuthByAgentIdV1: {
+          v: 1,
+          bindingsByAgentId: {
+            codex: {
+              v: 1,
+              bindingsByServiceId: {
+                'openai-codex': { source: 'connected', selection: 'group', groupId: 'default-pool' },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const spawnOptions = await resolveDirectTakeoverSpawnOptions({
+      linked: createLinkedCodexSessionFixture({
+        remoteSessionId: 'daemon-thread-1',
+        sessionPath: projectDir,
+        source: { kind: 'codexHome', home: 'user' },
+        codexBackendMode: 'appServer',
+      }),
+      sessionId: 'sess_happy_direct_codex_daemon',
+      credentials: TEST_CREDENTIALS,
+      transcriptStorage: 'direct',
+    });
+
+    expect(spawnOptions).toMatchObject({
+      codexBackendMode: 'appServer',
+      transcriptStorage: 'direct',
+      environmentVariables: {
+        CODEX_HOME: codexHome,
+        CODEX_SQLITE_HOME: TEST_CODEX_SQLITE_HOME,
+        HAPPIER_CODEX_APP_SERVER_TRANSPORT: 'daemonProxy',
+      },
+      connectedServices: {
+        v: 1,
+        bindingsByServiceId: {
+          'openai-codex': { source: 'native' },
+          openai: { source: 'native' },
+        },
+      },
+    });
+    expect(bootstrapAccountSettingsContextMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps an exact connected-service Codex source pinned instead of replacing it with the account default', async () => {
+    const codexHome = '/tmp/happier-test-active-server/daemon/connected-services/homes/openai-codex/source-profile/codex/codex-home';
+    await mkdir(codexHome, { recursive: true });
+    bootstrapAccountSettingsContextMock.mockResolvedValueOnce({
+      settings: {
+        connectedServicesDefaultAuthByAgentIdV1: {
+          v: 1,
+          bindingsByAgentId: {
+            codex: {
+              v: 1,
+              bindingsByServiceId: {
+                'openai-codex': { source: 'connected', selection: 'group', groupId: 'different-default-pool' },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const spawnOptions = await resolveDirectTakeoverSpawnOptions({
+      linked: createLinkedCodexSessionFixture({
+        remoteSessionId: 'connected-source-thread',
+        sessionPath: '/tmp/direct-codex-connected-source-project',
+        source: {
+          kind: 'codexHome',
+          home: 'connectedService',
+          connectedServiceId: 'openai-codex',
+          connectedServiceProfileId: 'source-profile',
+          homePath: codexHome,
+        },
+        codexBackendMode: 'appServer',
+      }),
+      sessionId: 'sess_happy_direct_codex_connected_source',
+      credentials: TEST_CREDENTIALS,
+    });
+
+    expect(spawnOptions).toMatchObject({
+      connectedServices: {
+        v: 1,
+        bindingsByServiceId: {
+          'openai-codex': {
+            source: 'connected',
+            selection: 'profile',
+            profileId: 'source-profile',
+          },
+        },
+      },
+    });
+    expect(bootstrapAccountSettingsContextMock).not.toHaveBeenCalled();
+  });
+
+  it('adopts a live Codex daemon independently of persisted transcript storage', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-persisted-takeover-codex-daemon-'));
+    const codexHome = join(root, '.codex');
+    const projectDir = join(root, 'project');
+    await mkdir(codexHome, { recursive: true });
+    await mkdir(projectDir, { recursive: true });
+    const fakeAppServer = await writeFakeCodexAppServerThreadListScript({
+      dir: root,
+      loadedThreadIds: ['daemon-thread-2'],
+    });
+    vi.stubEnv('CODEX_HOME', codexHome);
+    vi.stubEnv('HAPPIER_CODEX_APP_SERVER_BIN', fakeAppServer);
+
+    const spawnOptions = await resolveDirectTakeoverSpawnOptions({
+      credentials: TEST_CREDENTIALS,
+      linked: createLinkedCodexSessionFixture({
+        remoteSessionId: 'daemon-thread-2',
+        sessionPath: projectDir,
+        source: { kind: 'codexHome', home: 'user' },
+        codexBackendMode: 'appServer',
+      }),
+      sessionId: 'sess_happy_persisted_codex_daemon',
+      transcriptStorage: 'persisted',
+    });
+
+    expect(spawnOptions).toMatchObject({
+      codexBackendMode: 'appServer',
+      transcriptStorage: 'persisted',
+      environmentVariables: {
+        CODEX_HOME: codexHome,
+        CODEX_SQLITE_HOME: TEST_CODEX_SQLITE_HOME,
+        HAPPIER_CODEX_APP_SERVER_TRANSPORT: 'daemonProxy',
+      },
+      connectedServices: {
+        v: 1,
+        bindingsByServiceId: {
+          'openai-codex': { source: 'native' },
+          openai: { source: 'native' },
+        },
+      },
+    });
+    expect(bootstrapAccountSettingsContextMock).not.toHaveBeenCalled();
+  });
+
   it('refuses ambiguous connected-service Codex takeovers when the source does not identify an exact profile/home', async () => {
     const firstHome = '/tmp/happier-test-active-server/daemon/connected-services/homes/openai-codex/profile-a/codex/codex-home';
     const secondHome = '/tmp/happier-test-active-server/daemon/connected-services/homes/openai-codex/profile-b/codex/codex-home';
@@ -171,6 +413,7 @@ describe('resolveDirectTakeoverSpawnOptions', () => {
     await mkdir(secondHome, { recursive: true });
 
     const spawnOptions = await resolveDirectTakeoverSpawnOptions({
+      credentials: TEST_CREDENTIALS,
       linked: createLinkedCodexSessionFixture({
         remoteSessionId: 'ambiguous-thread-1',
         sessionPath: '/tmp/direct-codex-ambiguous-project',
@@ -188,6 +431,7 @@ describe('resolveDirectTakeoverSpawnOptions', () => {
     await mkdir(foreignHome, { recursive: true });
 
     const spawnOptions = await resolveDirectTakeoverSpawnOptions({
+      credentials: TEST_CREDENTIALS,
       linked: createLinkedCodexSessionFixture({
         remoteSessionId: 'wrong-home-thread-1',
         sessionPath: '/tmp/direct-codex-wrong-home-project',
@@ -210,6 +454,7 @@ describe('resolveDirectTakeoverSpawnOptions', () => {
     await mkdir(nestedHome, { recursive: true });
 
     const spawnOptions = await resolveDirectTakeoverSpawnOptions({
+      credentials: TEST_CREDENTIALS,
       linked: createLinkedCodexSessionFixture({
         remoteSessionId: 'wrong-depth-thread-1',
         sessionPath: '/tmp/direct-codex-wrong-depth-project',
@@ -237,6 +482,7 @@ describe('resolveDirectTakeoverSpawnOptions', () => {
     await symlink(realHome, linkedHome);
 
     const spawnOptions = await resolveDirectTakeoverSpawnOptions({
+      credentials: TEST_CREDENTIALS,
       linked: createLinkedCodexSessionFixture({
         remoteSessionId: 'wrong-link-thread-1',
         sessionPath: '/tmp/direct-codex-wrong-link-project',
@@ -262,6 +508,7 @@ describe('resolveDirectTakeoverSpawnOptions', () => {
     vi.stubEnv('CODEX_HOME', codexHome);
 
     const spawnOptions = await resolveDirectTakeoverSpawnOptions({
+      credentials: TEST_CREDENTIALS,
       linked: createLinkedCodexSessionFixture({
         remoteSessionId: 'acp-thread-1',
         sessionPath: '/tmp/direct-codex-acp-project',
@@ -302,6 +549,7 @@ describe('resolveDirectTakeoverSpawnOptions', () => {
     vi.stubEnv('HAPPIER_CODEX_APP_SERVER_BIN', fakeAppServer);
 
     const spawnOptions = await resolveDirectTakeoverSpawnOptions({
+      credentials: TEST_CREDENTIALS,
       linked: createLinkedCodexSessionFixture({
         remoteSessionId: '22222222-2222-2222-2222-222222222222',
         source: { kind: 'codexHome', home: 'user' },
@@ -327,6 +575,7 @@ describe('resolveDirectTakeoverSpawnOptions', () => {
 
   it('marks direct OpenCode server takeovers as explicit server affinity', async () => {
     const spawnOptions = await resolveDirectTakeoverSpawnOptions({
+      credentials: TEST_CREDENTIALS,
       linked: createLinkedOpenCodeSessionFixture({
         remoteSessionId: 'opencode-session-1',
         sessionPath: '/tmp/direct-opencode-takeover-project',
@@ -368,6 +617,7 @@ describe('resolveDirectTakeoverSpawnOptions', () => {
     } satisfies ConnectedServiceMaterializationIdentityV1;
 
     const spawnOptions = await resolveDirectTakeoverSpawnOptions({
+      credentials: TEST_CREDENTIALS,
       linked: createLinkedOpenCodeSessionFixture({
         remoteSessionId: 'opencode-session-connected-1',
         sessionPath: '/tmp/direct-opencode-connected-takeover-project',
@@ -429,6 +679,7 @@ describe('resolveDirectTakeoverSpawnOptions', () => {
     ]);
 
     const spawnOptions = await resolveDirectTakeoverSpawnOptions({
+      credentials: TEST_CREDENTIALS,
       linked: createLinkedOpenCodeSessionFixture({
         remoteSessionId: 'opencode-session-marker-1',
         sessionPath: '/tmp/direct-opencode-marker-takeover-project',

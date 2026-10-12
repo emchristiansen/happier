@@ -1,7 +1,7 @@
 /**
  * OpenCode CLI Entry Point
  *
- * Runs the OpenCode agent through Happier CLI using ACP.
+ * Runs the OpenCode agent through Happier CLI using the selected server-native or ACP backend.
  */
 
 import type { PermissionMode } from '@/api/types';
@@ -14,7 +14,7 @@ import { updateAgentStateBestEffort } from '@/api/session/sessionWritesBestEffor
 
 import { OpenCodeTerminalDisplay } from '@/backends/opencode/ui/OpenCodeTerminalDisplay';
 
-import { maybeUpdateOpenCodeSessionIdMetadata } from './utils/opencodeSessionIdMetadata';
+import { maybeUpdateOpenCodeSessionIdMetadata, type OpenCodeSessionMetadataPublicationState } from './utils/opencodeSessionIdMetadata';
 import { createOpenCodeAcpRuntime } from './acp/runtime';
 import {
   isLoopbackManagedOpenCodeBaseUrl,
@@ -23,51 +23,61 @@ import {
 import { createOpenCodeServerRuntime } from './server/runtime';
 import { createOpenCodeSharedLocalControl } from './localControl/createOpenCodeSharedLocalControl';
 import { resolveOpenCodeLocalControlSupport } from './localControl/resolveOpenCodeLocalControlSupport';
-
-function resolveOpenCodeBackendModeFromEnv(): 'server' | 'acp' {
-  const raw = typeof process.env.HAPPIER_OPENCODE_BACKEND_MODE === 'string'
-    ? process.env.HAPPIER_OPENCODE_BACKEND_MODE.trim().toLowerCase()
-    : '';
-  if (raw === 'acp') return 'acp';
-  return 'server';
-}
+import { resolveOpenCodeBackendModeFromEnv } from './backendMode';
+import { hasHostedAttachedTerminalPresentation } from '@/agent/localControl/createAttachedTerminalSupervisor';
 
 export async function runOpenCode(opts: StandardAcpProviderRunOptions & {
   credentials: Credentials;
   permissionMode?: PermissionMode;
   startingMode?: 'local' | 'remote';
 }): Promise<void> {
-  const lastPublishedOpenCodeSessionMetadata = {
+  const lastPublishedOpenCodeSessionMetadata: OpenCodeSessionMetadataPublicationState = {
     sessionId: null as string | null,
     backendMode: null as 'server' | 'acp' | null,
     serverBaseUrl: null as string | null,
     serverBaseUrlExplicit: false,
   };
-  const backendMode = resolveOpenCodeBackendModeFromEnv();
+  const backendMode = resolveOpenCodeBackendModeFromEnv(process.env);
+  let serverRuntime: ReturnType<typeof createOpenCodeServerRuntime> | null = null;
   let currentSession: Parameters<NonNullable<StandardAcpProviderConfig['onAfterStart']>>[0]['session'] | null = null;
   let currentRuntime: Parameters<NonNullable<StandardAcpProviderConfig['onAfterStart']>>[0]['runtime'] | null = null;
+  let prepareLocalAttachment: (() => Promise<boolean>) | null = null;
+  let unregisterAttachPreparation: (() => void) | null = null;
   let mountRemoteUi = (): void => undefined;
   let unmountRemoteUi = async (): Promise<void> => undefined;
   const localControl = createOpenCodeSharedLocalControl({
     support: resolveOpenCodeLocalControlSupport({
       backendMode,
       hasTTY: process.stdout.isTTY && process.stdin.isTTY,
+      hasHostedTerminal: hasHostedAttachedTerminalPresentation(opts.terminalRuntime),
     }),
     startingMode: opts.startingMode ?? (opts.startedBy === 'terminal' && backendMode === 'server' ? 'local' : 'remote'),
+    terminalRuntime: opts.terminalRuntime,
     getSession: () => currentSession,
     getSessionId: () => currentRuntime?.getSessionId() ?? null,
+    prepareAttachment: async () => prepareLocalAttachment ? await prepareLocalAttachment() : false,
     getDirectory: () => currentSession?.getMetadataSnapshot()?.path ?? process.cwd(),
-    getServerBaseUrl: async () => {
+    getServerTarget: async () => {
+      const selected = currentRuntime === serverRuntime ? serverRuntime?.getManagedServerIdentity() : null;
+      if (selected) return { baseUrl: selected.baseUrl,
+        ...(selected.launchEnvFingerprint ? { managedServerLaunchFingerprint: selected.launchEnvFingerprint } : {}) };
       const raw = typeof process.env.HAPPIER_OPENCODE_SERVER_URL === 'string'
         ? process.env.HAPPIER_OPENCODE_SERVER_URL.trim()
         : '';
-      if (raw) return raw;
+      if (raw) return { baseUrl: raw };
       const managed = await readSharedManagedOpenCodeServerStateBestEffort().catch(() => null);
-      return managed?.baseUrl && isLoopbackManagedOpenCodeBaseUrl(managed.baseUrl) ? managed.baseUrl : null;
+      return managed?.baseUrl && isLoopbackManagedOpenCodeBaseUrl(managed.baseUrl) ? { baseUrl: managed.baseUrl } : null;
     },
     mountRemoteUi: () => mountRemoteUi(),
     unmountRemoteUi: () => unmountRemoteUi(),
   });
+
+  const registerAttachPreparation = (session: NonNullable<typeof currentSession>): void => {
+    unregisterAttachPreparation?.();
+    unregisterAttachPreparation = backendMode === 'server'
+      ? session.registerSessionRuntimeControls?.({ prepareProviderCliAttach: localControl.prepareProviderCliAttach }) ?? null
+      : null;
+  };
 
   await runStandardAcpProvider(opts, {
     flavor: 'opencode',
@@ -104,7 +114,7 @@ export async function runOpenCode(opts: StandardAcpProviderRunOptions & {
         });
       }
 
-      return createOpenCodeServerRuntime({
+      serverRuntime = createOpenCodeServerRuntime({
         directory,
         session,
         messageBuffer,
@@ -120,9 +130,11 @@ export async function runOpenCode(opts: StandardAcpProviderRunOptions & {
           maxPopPerWake: pendingQueueDrainMaxPopPerWake,
         },
       });
+      return serverRuntime;
     },
     onSessionSwap: async ({ session }) => {
       currentSession = session;
+      registerAttachPreparation(session);
       await localControl.onSessionSwap(session);
     },
     onAttachMetadataSnapshotError: (error) => {
@@ -131,11 +143,14 @@ export async function runOpenCode(opts: StandardAcpProviderRunOptions & {
     onAttachMetadataSnapshotMissing: () => {
       logger.debug('[opencode] Failed to fetch session metadata snapshot before attach startup update; continuing without metadata write (non-fatal)');
     },
-    onAfterStart: ({ session, runtime }) => {
+    onAfterStart: ({ session, runtime, initialControlsApplied, prepareLocalAttachment: prepare }) => {
       currentSession = session;
       currentRuntime = runtime;
-      void localControl.onAfterStart().catch((error) => {
-        logger.debug('[opencode] Failed to start local control attachment (non-fatal)', error);
+      prepareLocalAttachment = prepare;
+      registerAttachPreparation(session);
+      if (!initialControlsApplied) logger.infoFile('[opencode] native_attachment_controls_not_applied');
+      void localControl.onAfterStart({ canAttach: initialControlsApplied }).catch(() => {
+        logger.infoFile('[opencode] native_attachment_start_failed');
       });
       const openCodeSessionId = runtime.getSessionId();
       if (!openCodeSessionId) return;
@@ -166,7 +181,7 @@ export async function runOpenCode(opts: StandardAcpProviderRunOptions & {
         }
 
         // If runtime was reset/restarted while we were waiting for metadata, do not publish stale ids.
-        if (runtime.getSessionId() !== openCodeSessionId) {
+        if (runtime.getSessionId() !== openCodeSessionId || currentRuntime !== runtime || currentSession !== session) {
           logger.debug('[opencode] Runtime session changed before opencodeSessionId publish; skipping stale publish (non-fatal)');
           return;
         }
@@ -176,6 +191,9 @@ export async function runOpenCode(opts: StandardAcpProviderRunOptions & {
           backendMode,
           serverBaseUrl: process.env.HAPPIER_OPENCODE_SERVER_URL ?? null,
           serverBaseUrlExplicit: process.env.HAPPIER_OPENCODE_SERVER_URL_EXPLICIT ?? null,
+          // Only the actual provider factory's selected client owns managed affinity.
+          managedServerLaunchFingerprint: runtime === serverRuntime
+            ? serverRuntime?.getManagedServerIdentity()?.launchEnvFingerprint ?? null : null,
           transcriptStorage: process.env.HAPPIER_TRANSCRIPT_STORAGE === 'direct' ? 'direct' : 'persisted',
           updateHappySessionMetadata: (updater) => session.updateMetadata(updater),
           lastPublished: lastPublishedOpenCodeSessionMetadata,
@@ -186,12 +204,17 @@ export async function runOpenCode(opts: StandardAcpProviderRunOptions & {
     },
     onAfterReset: () => {
       currentRuntime = null;
+      serverRuntime = null;
+      prepareLocalAttachment = null;
       lastPublishedOpenCodeSessionMetadata.sessionId = null;
       lastPublishedOpenCodeSessionMetadata.backendMode = null;
       lastPublishedOpenCodeSessionMetadata.serverBaseUrl = null;
       lastPublishedOpenCodeSessionMetadata.serverBaseUrlExplicit = false;
+      lastPublishedOpenCodeSessionMetadata.managedServerLaunchFingerprint = null;
     },
     onDispose: async () => {
+      unregisterAttachPreparation?.();
+      unregisterAttachPreparation = null;
       await localControl.dispose();
     },
     formatPromptErrorMessage: formatProviderPromptErrorMessage,

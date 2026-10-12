@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 
 import { configuration } from '@/configuration';
@@ -5,23 +6,30 @@ import { configuration } from '@/configuration';
 import {
   applyDaemonServiceInstallPlan,
   applyDaemonServiceUninstallPlan,
+  assertDaemonServiceCommandsAvailable,
   type DaemonServiceCommandFailureMode,
 } from './apply';
 import {
+  daemonServiceMatchesInstallTarget,
   resolveDaemonServiceInstallConflictPlan,
   type DaemonServiceInstallConflictPlan,
   type DaemonServiceInstallStrategy,
   type DaemonServiceInstallTarget,
+  type DaemonServiceRelay,
 } from './daemonInstallConflict';
 import { assertDaemonServiceModeSupported } from './assertDaemonServiceModeSupported';
 import {
   discoverInstalledDaemonServiceEntries,
   readInstalledDaemonServiceAutostartMode,
-  type InstalledDaemonServiceEntry,
+  readInstalledDaemonServiceBundleId,
+  readInstalledDaemonServiceManagedBy,
 } from './discoverInstalledDaemonServiceEntries';
 import { planDaemonServiceInstall, planDaemonServiceUninstall } from './plan';
-import type { DaemonServiceAutostartMode, DaemonServiceMode, DaemonServiceTargetMode } from './plan';
-import { resolveDaemonServiceInstallRuntimeTarget } from './resolveDaemonServiceInstallRuntimeTarget';
+import type { DaemonServiceAutostartMode, DaemonServiceManagedBy, DaemonServiceMode, DaemonServiceTargetMode } from './plan';
+import {
+  isManagedCliDaemonServiceLauncher,
+  resolveDaemonServiceInstallRuntimeTarget,
+} from './resolveDaemonServiceInstallRuntimeTarget';
 import { resolveDaemonServiceDiscoveryTargets } from './resolveDaemonServiceDiscoveryTargets';
 import type { PublicReleaseRingId } from '@happier-dev/release-runtime/releaseRings';
 import {
@@ -29,7 +37,9 @@ import {
   resolveManagedCliReleaseChannel,
 } from '@happier-dev/cli-common/firstPartyRuntime';
 import { doesInstalledDaemonServiceDefinitionMatchExpected } from './doesInstalledDaemonServiceDefinitionMatchExpected';
-import { resolveHappierHomeDirComparableKey } from '@/daemon/ownership/happierHomeDirComparableKey';
+import { describeDaemonServiceRuntimeReplacement } from './readDaemonServiceDefinitionLauncher';
+import { happierHomeDirsMatch } from '@/daemon/ownership/happierHomeDirComparableKey';
+import { getActiveServerProfile } from '@/server/serverProfiles';
 
 type SupportedPlatform = 'darwin' | 'linux' | 'win32';
 
@@ -114,7 +124,29 @@ export type DaemonServiceInstallPreview = Readonly<{
   /** The mode the plan was built with, after inheriting from any installed service. */
   autostart: DaemonServiceAutostartMode;
   plan: ReturnType<typeof planDaemonServiceInstall>;
+  /**
+   * The exact target is installed but launches another CLI than this install would write (for
+   * example a user's npm `happier` where the managed shim now exists). Installing switches it, so
+   * a caller acting for the user must ask first; `null` when the launcher would not change.
+   */
+  exactTargetRuntimeReplacement: Readonly<{ current: string; replacement: string }> | null;
 }>;
+
+/** Definition-owned settings to retain across a rewrite or a repair's remove/reinstall. */
+export function readDaemonServicePreservedInstallOptions(params: Readonly<{
+  platform: SupportedPlatform;
+  path: string;
+}>): Readonly<{
+  autostart?: DaemonServiceAutostartMode;
+  managedBy?: DaemonServiceManagedBy;
+  bundleId?: string;
+}> {
+  return {
+    autostart: readInstalledDaemonServiceAutostartMode(params) ?? undefined,
+    managedBy: readInstalledDaemonServiceManagedBy(params) ?? undefined,
+    bundleId: readInstalledDaemonServiceBundleId(params) ?? undefined,
+  };
+}
 
 export async function previewDaemonServiceInstall(options: Readonly<{
   platform?: SupportedPlatform;
@@ -131,7 +163,15 @@ export async function previewDaemonServiceInstall(options: Readonly<{
    * trigger the user turned off.
    */
   autostart?: DaemonServiceAutostartMode;
+  /**
+   * Omit to keep whatever marker the installed service carries: only an explicit request marks a
+   * service as the desktop's, and no rewrite ever drops the mark.
+   */
+  managedBy?: DaemonServiceManagedBy;
+  /** Omitted keeps the bundle id the installed definition records (`DAEMON_SERVICE_BUNDLE_ID_ENV_KEY`). */
+  bundleId?: string;
   darwinInstallMode?: 'rebootstrap' | 'kickstart';
+  restartRunningDaemon?: boolean;
   instanceId?: string;
   activeServerId?: string;
   strategy?: DaemonServiceInstallStrategy;
@@ -195,26 +235,42 @@ export async function previewDaemonServiceInstall(options: Readonly<{
     ring: channel,
     instanceId: targetMode === 'default-following' ? null : instanceId,
     happierHomeDir,
+    ...(targetMode === 'pinned'
+      ? {
+          activeServerId,
+          serverUrl: publicServerUrl,
+          defaultFollowingServer: await resolveDefaultFollowingServerForHome(happierHomeDir),
+        }
+      : {}),
   };
   const conflictPlan = resolveDaemonServiceInstallConflictPlan({
     target,
     strategy,
     services: discoveredServices,
   });
-  const installedTargetService = discoveredServices.find((service) => matchesInstallTarget(service, target)) ?? null;
-  const installedAutostart = installedTargetService
-    ? readInstalledDaemonServiceAutostartMode({ platform, path: installedTargetService.path })
-    : null;
+  const installedTargetService = discoveredServices.find((service) => daemonServiceMatchesInstallTarget(service, target)) ?? null;
+  const preservedOptions = installedTargetService
+    ? readDaemonServicePreservedInstallOptions({ platform, path: installedTargetService.path })
+    : {};
+  const installedAutostart = preservedOptions.autostart ?? null;
   const autostart: DaemonServiceAutostartMode = options.autostart ?? installedAutostart ?? 'at-login';
-  const buildPlan = (planAutostart: DaemonServiceAutostartMode, autostartTriggerChangeOnly = false) => planDaemonServiceInstall({
+  const managedBy = options.managedBy ?? preservedOptions.managedBy ?? null;
+  const bundleId = options.bundleId ?? preservedOptions.bundleId ?? null;
+  const buildPlan = (
+    planAutostart: DaemonServiceAutostartMode,
+    autostartTriggerChangeOnly = false,
+    darwinInstallMode = options.darwinInstallMode,
+  ) => planDaemonServiceInstall({
     platform,
     mode: options.mode,
     systemUser: options.systemUser,
     channel,
     targetMode,
     autostart: planAutostart,
+    managedBy,
+    bundleId,
     autostartTriggerChangeOnly,
-    darwinInstallMode: options.darwinInstallMode,
+    darwinInstallMode,
     instanceId,
     activeServerId,
     uid,
@@ -232,7 +288,7 @@ export async function previewDaemonServiceInstall(options: Readonly<{
   const installedModeExpectedFile = installedTargetService && installedAutostart && installedAutostart !== autostart
     ? buildPlan(installedAutostart).files[0] ?? null
     : null;
-  const autostartTriggerChangeOnly = Boolean(
+  const autostartTriggerChangeOnly = options.restartRunningDaemon !== true && Boolean(
     installedTargetService
     && installedModeExpectedFile
     && installedModeExpectedFile.path === installedTargetService.path
@@ -241,19 +297,38 @@ export async function previewDaemonServiceInstall(options: Readonly<{
       expectedContents: installedModeExpectedFile.content,
     }),
   );
-  const plan = buildPlan(autostart, autostartTriggerChangeOnly);
+  let plan = buildPlan(autostart, autostartTriggerChangeOnly);
   const expectedInstalledFile = previewPlanFileForTarget({
     plan,
   });
   const exactTargetMatchesExpectedDefinition = conflictPlan.exactTargetExists && (
     !expectedInstalledFile
     || discoveredServices
-      .filter((service) => matchesInstallTarget(service, target))
+      .filter((service) => daemonServiceMatchesInstallTarget(service, target))
       .some((service) => service.path === expectedInstalledFile.path && doesInstalledDaemonServiceDefinitionMatchExpected({
         installedPath: service.path,
         expectedContents: expectedInstalledFile.content,
       }))
   );
+
+  // Only a switch between a CLI the user installed and the managed CLI — either way (R12/R13 b) —
+  // changes which CLI the user's service runs. A node or override launcher legitimately drifts per
+  // shell (fnm, repo checkouts); that stays drift.
+  const exactTargetRuntimeReplacement = conflictPlan.exactTargetExists && expectedInstalledFile
+    ? describeDaemonServiceRuntimeReplacement({
+        platform,
+        installedContents: readInstalledDaemonServiceDefinition(expectedInstalledFile.path),
+        expectedContents: expectedInstalledFile.content,
+        isManagedCliLauncher: (launcher) => isManagedCliDaemonServiceLauncher(launcher, process.env),
+      })
+    : null;
+
+  // kickstart uses launchd's already loaded definition. A rewritten command or environment
+  // must be loaded again before restarting, including a consented managed/own CLI switch.
+  if (platform === 'darwin' && options.darwinInstallMode === 'kickstart'
+    && (!exactTargetMatchesExpectedDefinition || exactTargetRuntimeReplacement || options.restartRunningDaemon === true)) {
+    plan = buildPlan(autostart, autostartTriggerChangeOnly, 'rebootstrap');
+  }
 
   return {
     exactTargetExists: conflictPlan.exactTargetExists,
@@ -263,7 +338,16 @@ export async function previewDaemonServiceInstall(options: Readonly<{
     conflictPlan,
     autostart,
     plan,
+    exactTargetRuntimeReplacement,
   };
+}
+
+export function readInstalledDaemonServiceDefinition(path: string): string | null {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch {
+    return null;
+  }
 }
 
 function previewPlanFileForTarget(params: Readonly<{
@@ -277,26 +361,20 @@ function previewPlanFileForTarget(params: Readonly<{
     : null;
 }
 
-function matchesInstallTarget(
-  service: InstalledDaemonServiceEntry,
-  target: DaemonServiceInstallTarget,
-): boolean {
-  if (service.platform !== target.platform) {
-    return false;
+/**
+ * The relay this home's default-following service serves: the persisted active profile (the
+ * service's definition names none). Only this CLI's own home can be read; any other is unknown.
+ */
+async function resolveDefaultFollowingServerForHome(happierHomeDir: string): Promise<DaemonServiceRelay | null> {
+  if (!happierHomeDirsMatch(happierHomeDir, configuration.happyHomeDir)) {
+    return null;
   }
-  if ((service.mode ?? 'user') !== target.mode) {
-    return false;
+  try {
+    const profile = await getActiveServerProfile();
+    return { serverId: profile.id, serverUrl: profile.serverUrl };
+  } catch {
+    return null;
   }
-  if (service.targetMode !== target.targetMode) {
-    return false;
-  }
-  if (resolveHappierHomeDirComparableKey(service.happierHomeDir) !== resolveHappierHomeDirComparableKey(target.happierHomeDir)) {
-    return false;
-  }
-  if (target.targetMode === 'default-following') {
-    return service.releaseChannel === target.ring;
-  }
-  return service.releaseChannel === target.ring && service.serverId === target.instanceId;
 }
 
 export async function installDaemonService(options: Readonly<{
@@ -314,7 +392,12 @@ export async function installDaemonService(options: Readonly<{
    * trigger the user turned off.
    */
   autostart?: DaemonServiceAutostartMode;
+  /** See `previewDaemonServiceInstall`: omitted keeps the installed marker. */
+  managedBy?: DaemonServiceManagedBy;
+  /** Omitted keeps the bundle id the installed definition records (`DAEMON_SERVICE_BUNDLE_ID_ENV_KEY`). */
+  bundleId?: string;
   darwinInstallMode?: 'rebootstrap' | 'kickstart';
+  restartRunningDaemon?: boolean;
   instanceId?: string;
   activeServerId?: string;
   strategy?: DaemonServiceInstallStrategy;
@@ -324,6 +407,8 @@ export async function installDaemonService(options: Readonly<{
   nodePath?: string;
   entryPath?: string;
   runCommands?: boolean;
+  /** Prepare the current owner only when installation will actually change its definition. */
+  beforeApply?: () => Promise<void>;
   commandFailureMode?: DaemonServiceCommandFailureMode;
 }> = {}): Promise<void> {
   const platformInput = options.platform ?? process.platform;
@@ -348,6 +433,10 @@ export async function installDaemonService(options: Readonly<{
     );
   }
 
+  if (options.runCommands !== false) {
+    assertDaemonServiceCommandsAvailable(preview.plan.commands);
+  }
+
   for (const service of preview.conflictPlan.servicesToRemove) {
     await uninstallDaemonService({
       platform,
@@ -364,9 +453,13 @@ export async function installDaemonService(options: Readonly<{
     });
   }
 
-  if (preview.exactTargetIsConverged && preview.exactTargetMatchesExpectedDefinition) {
+  // A runtime replacement is a real change even where the definition comparator treats launchers
+  // as equivalent (darwin), so the consented switch is written rather than skipped.
+  if (preview.exactTargetIsConverged && preview.exactTargetMatchesExpectedDefinition
+    && !preview.exactTargetRuntimeReplacement && options.restartRunningDaemon !== true) {
     return;
   }
+  await options.beforeApply?.();
   await applyDaemonServiceInstallPlan(preview.plan, {
     runCommands: options.runCommands,
     commandFailureMode: options.commandFailureMode,

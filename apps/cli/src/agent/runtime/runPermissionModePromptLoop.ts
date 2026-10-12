@@ -11,6 +11,7 @@ import { waitForNextPermissionModeMessage } from '@/agent/runtime/waitForNextPer
 import type { SessionProviderInputConsumer } from '@/agent/runtime/sessionInput/types';
 import type { MessageBuffer } from '@/ui/ink/messageBuffer';
 import type { PermissionModeQueuedPrompt } from '@/agent/runtime/permission/permissionModeQueuedPrompt';
+import type { InFlightSteerController } from '@/agent/runtime/permission/bindPermissionModeQueue';
 import { resolveProviderPromptForDispatch } from '@/agent/runtime/prompt/resolveProviderPromptForDispatch';
 import { normalizePendingDeliveryLocalIds } from '@/agent/runtime/session/pendingDelivery/undeliverableProviderPrompt';
 import { isAbortLikeError } from '@/agent/executionRuns/runtime/turnDelivery';
@@ -33,7 +34,7 @@ type PromptRuntime = {
   // Read at dispatch to reconstruct provider context for composer references (INV-9).
   listVendorPlugins?: () => Promise<unknown>;
   listSkills?: () => Promise<unknown>;
-  isProviderNativeCommand?: (prompt: string) => Promise<boolean>;
+  isProviderNativeCommand?: InFlightSteerController['isProviderNativeCommand'];
   compactContext?: (command: string) => Promise<void>;
   failTurn?: (error: unknown) => void | boolean | Promise<void | boolean>;
   flushTurn: () => void | Promise<void>;
@@ -44,8 +45,13 @@ type PromptRuntime = {
 
 type OverrideSynchronizer = {
   syncFromMetadata: () => void;
-  flushPendingAfterStart: () => Promise<void>;
+  flushPendingAfterStart: () => Promise<void | boolean>;
 };
+
+export type ProviderStartupControls = Readonly<{
+  initialControlsApplied: boolean;
+  prepareLocalAttachment: () => Promise<boolean>;
+}>;
 
 type QueuedPermissionModeMessage = {
   message: PermissionModeQueuedPrompt;
@@ -132,7 +138,7 @@ export async function runPermissionModePromptLoop(opts: {
   }>) => void | Promise<void>) | null;
   failClosedOnResumeFailure?: boolean;
   startRuntimeBeforeFirstPrompt?: boolean;
-  onAfterStart?: (() => void | Promise<void>) | null;
+  onAfterStart?: ((controls: ProviderStartupControls) => void | Promise<void>) | null;
   onAfterReset?: (() => void | Promise<void>) | null;
   resolveFreshSessionSystemPrompt?: (args: {
     baseOverride?: string | null;
@@ -245,6 +251,12 @@ export async function runPermissionModePromptLoop(opts: {
 
   overrideSync.syncFromMetadata();
 
+  const prepareLocalAttachment = async (): Promise<boolean> => {
+    if (!wasStarted || opts.shouldExit()) return false;
+    overrideSync.syncFromMetadata();
+    return await overrideSync.flushPendingAfterStart() === true && !opts.shouldExit();
+  };
+
   const ensureRuntimeStarted = async (): Promise<{ startedFreshSessionForTurn: boolean }> => {
     if (wasStarted) return { startedFreshSessionForTurn: false };
 
@@ -305,17 +317,21 @@ export async function runPermissionModePromptLoop(opts: {
     if (opts.shouldExit()) return { startedFreshSessionForTurn };
     if (strictAbort) throw strictAbort;
 
-    await opts.onAfterStart?.();
-    if (opts.shouldExit()) return { startedFreshSessionForTurn };
     wasStarted = true;
-    await overrideSync.flushPendingAfterStart();
+    const initialControlsApplied = await overrideSync.flushPendingAfterStart() === true;
     if (opts.shouldExit()) return { startedFreshSessionForTurn };
     // Provider startup can publish metadata after the prompt-boundary refresh, so keep one post-start catch-up.
     await refreshSessionSnapshotBeforeTurnBestEffort();
     if (opts.shouldExit()) return { startedFreshSessionForTurn };
     syncPermissionModeFromMetadata();
     overrideSync.syncFromMetadata();
-    await overrideSync.flushPendingAfterStart();
+    const catchUpControlsApplied = await overrideSync.flushPendingAfterStart() === true;
+    if (opts.shouldExit()) return { startedFreshSessionForTurn };
+    await opts.onAfterStart?.({
+      // A settled/rejected command may disappear during catch-up; absence cannot erase its failure.
+      initialControlsApplied: initialControlsApplied && catchUpControlsApplied,
+      prepareLocalAttachment,
+    });
     if (opts.shouldExit()) return { startedFreshSessionForTurn };
     await opts.runtime.drainPendingAfterStartOrLoad?.();
     return { startedFreshSessionForTurn };
@@ -505,30 +521,23 @@ export async function runPermissionModePromptLoop(opts: {
         : false;
 
       const nowMs = Date.now();
-      const seedResolution = providerNativeCommand
-        ? {
-            providerPrompt: message.message.text,
-            meta: message.message.meta,
-            seedApplied: false,
-            settleReplaySeedOnProviderAcceptance: async () => undefined,
-          }
-        : await resolveProviderPromptForDispatch({
-            session: opts.session,
-            userText: message.message.text,
-            allowSeed: special.type === null,
-            localId,
-            nowMs,
-            refreshMetadataBeforeRead: false,
-            meta: message.message.meta,
-            catalogs: {
-              ...(typeof opts.runtime.listSkills === 'function'
-                ? { listSkills: () => opts.runtime.listSkills!() }
-                : {}),
-              ...(typeof opts.runtime.listVendorPlugins === 'function'
-                ? { listVendorPlugins: () => opts.runtime.listVendorPlugins!() }
-                : {}),
-            },
-          });
+      const seedResolution = await resolveProviderPromptForDispatch({
+        session: opts.session,
+        userText: message.message.text,
+        allowSeed: special.type === null && !providerNativeCommand,
+        localId,
+        nowMs,
+        refreshMetadataBeforeRead: false,
+        meta: message.message.meta,
+        catalogs: {
+          ...(typeof opts.runtime.listSkills === 'function'
+            ? { listSkills: () => opts.runtime.listSkills!() }
+            : {}),
+          ...(typeof opts.runtime.listVendorPlugins === 'function'
+            ? { listVendorPlugins: () => opts.runtime.listVendorPlugins!() }
+            : {}),
+        },
+      });
       const dispatchMeta = seedResolution.meta;
       if (seedResolution.seedApplied) {
         pendingReplaySeedSettlement = seedResolution.settleReplaySeedOnProviderAcceptance;
@@ -640,7 +649,9 @@ export async function runPermissionModePromptLoop(opts: {
       }
       // Metadata updates can arrive while we're mid-turn.
       overrideSync.syncFromMetadata();
-      opts.setThinking(false);
+      // Once a turn began, the runtime flush owns provider activity, including native work
+      // that outlives command callback completion. Setup/exit paths have no runtime flush.
+      if (!didBeginRuntimeTurn || opts.shouldExit()) opts.setThinking(false);
       opts.keepAlive();
       if (shouldSendReady && !opts.shouldExit()) {
         opts.sendReady(readyTurnContext);

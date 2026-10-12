@@ -74,18 +74,24 @@ async function classifyLockPresence(params: {
   });
 }
 
-async function classifyTrackedSessionPresence(params: {
-  sessionId: string;
+export async function classifyTrackedSessionRunnerPresence(params: {
   tracked: TrackedSession;
-  readProcessRunState: ReadProcessRunState;
+  readProcessRunState?: ReadProcessRunState;
   getProcessCommandHash?: SessionRunnerProcessCommandHashReader;
   getProcessInstanceFingerprint?: SessionRunnerProcessInstanceFingerprintReader;
 }): Promise<SessionRunnerProcessPresence> {
-  if (!trackedSessionMatchesSessionId(params.tracked, params.sessionId)) return 'absent';
-
+  // A Windows Terminal dispatcher can exit before the runner reports. Its
+  // lifetime is not evidence of runner absence; the existing startup finalizer
+  // owns failure/timeout until a correlated runner identity is available.
+  if (params.tracked.hostedTerminal?.mode === 'windows_terminal'
+    && params.tracked.startupCustody
+    && !params.tracked.sessionRunnerPid
+    && !params.tracked.happySessionMetadataFromLocalWebhook
+    && params.tracked.stopRequestedAtMs === undefined) return 'unknown';
   const childPid = typeof params.tracked.childProcess?.pid === 'number' ? params.tracked.childProcess.pid : null;
-  const pidToCheck = childPid ?? params.tracked.pid;
-  const runState = await params.readProcessRunState(pidToCheck).catch(() => null);
+  const pidToCheck = params.tracked.sessionRunnerPid ?? childPid ?? params.tracked.pid;
+  const readProcessRunState = params.readProcessRunState ?? readProcessRunStateDefault;
+  const runState = await readProcessRunState(pidToCheck).catch(() => null);
   return await classifyStoredProcessPresence({
     storedProcessCommandHash: params.tracked.processCommandHash,
     storedProcessInstanceFingerprint: params.tracked.processInstanceFingerprint,
@@ -111,8 +117,8 @@ export async function isSessionRunnerActive(params: Readonly<{
   const readLockStatus = params.readSessionRunnerLockStatus ?? readSessionRunnerLockStatus;
 
   for (const tracked of params.trackedSessions) {
-    if (await classifyTrackedSessionPresence({
-      sessionId,
+    if (!trackedSessionMatchesSessionId(tracked, sessionId)) continue;
+    if (await classifyTrackedSessionRunnerPresence({
       tracked,
       readProcessRunState,
       getProcessCommandHash: params.getProcessCommandHash,
@@ -159,15 +165,23 @@ export function resolveSessionRunnerResumeDecision(probe: SessionRunnerServiceab
   return { action: 'fence', reason: probe.control.reason };
 }
 
-export async function probeSessionRunnerServiceability(params: Readonly<{
+type SessionRunnerPresenceProbeParams = Readonly<{
   sessionId: string;
   trackedSessions: Iterable<TrackedSession>;
-  probeCapability: () => Promise<SessionRunnerServiceability>;
   readProcessRunState?: ReadProcessRunState;
   getProcessCommandHash?: SessionRunnerProcessCommandHashReader;
   getProcessInstanceFingerprint?: SessionRunnerProcessInstanceFingerprintReader;
   readSessionRunnerLockStatus?: (args: { sessionId: string }) => Promise<SessionRunnerLockStatus>;
-}>): Promise<SessionRunnerServiceabilityProbe> {
+}>;
+
+export type SessionRunnerPresenceProbe =
+  | Readonly<{ state: 'runner_present' }>
+  | Exclude<SessionRunnerServiceabilityProbe, Readonly<{ state: 'runner_present' }>>;
+
+/** Presence admission without performing or inventing a capability RPC result. */
+export async function probeSessionRunnerPresence(
+  params: SessionRunnerPresenceProbeParams,
+): Promise<SessionRunnerPresenceProbe> {
   const sessionId = normalizeSessionId(params.sessionId);
   const trackedSessions = Array.from(params.trackedSessions);
   const readProcessRunState = params.readProcessRunState ?? readProcessRunStateDefault;
@@ -175,15 +189,14 @@ export async function probeSessionRunnerServiceability(params: Readonly<{
 
   for (const tracked of trackedSessions) {
     if (!trackedSessionMatchesSessionId(tracked, sessionId)) continue;
-    const presence = await classifyTrackedSessionPresence({
-      sessionId,
+    const presence = await classifyTrackedSessionRunnerPresence({
       tracked,
       readProcessRunState,
       getProcessCommandHash: params.getProcessCommandHash,
       getProcessInstanceFingerprint: params.getProcessInstanceFingerprint,
     });
     if (presence === 'present') {
-      return { state: 'runner_present', control: await params.probeCapability() };
+      return { state: 'runner_present' };
     }
     if (presence !== 'absent') {
       return { state: 'runner_unknown', reason: 'runner_presence_unproven' };
@@ -198,10 +211,19 @@ export async function probeSessionRunnerServiceability(params: Readonly<{
     readSessionRunnerLockStatus: readLockStatus,
   });
   if (lockPresence === 'present') {
-    return { state: 'runner_present', control: await params.probeCapability() };
+    return { state: 'runner_present' };
   }
   if (lockPresence === 'absent' || lockPresence === 'recoverable_stopped') {
     return { state: 'runner_absent' };
   }
   return { state: 'runner_unknown', reason: 'runner_presence_unproven' };
+}
+
+export async function probeSessionRunnerServiceability(params: SessionRunnerPresenceProbeParams & Readonly<{
+  probeCapability: () => Promise<SessionRunnerServiceability>;
+}>): Promise<SessionRunnerServiceabilityProbe> {
+  const presence = await probeSessionRunnerPresence(params);
+  return presence.state === 'runner_present'
+    ? { ...presence, control: await params.probeCapability() }
+    : presence;
 }

@@ -9,6 +9,50 @@ import { describe, expect, it, vi } from 'vitest';
 const require = createRequire(import.meta.url);
 
 describe('terminal_launch_spec_runner.cjs', () => {
+  it('reports controller-loss cleanup failure with a fixed diagnostic, without native launch values', async () => {
+    const mod = require('./terminal_launch_spec_runner.cjs') as {
+      runLaunchSpec: (spec: { command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv }, signal: AbortSignal) => Promise<number>;
+    };
+    const controller = new AbortController();
+    const previousPath = process.env.PATH;
+    let ownedPid: number | undefined;
+    let stderr = '';
+    const consoleError = vi.spyOn(console, 'error').mockImplementation((...values: unknown[]) => {
+      stderr += values.map(String).join(' ') + '\n';
+    });
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      const text = String(chunk);
+      stderr += text;
+      const ready = text.match(/guardian-ready:(\d+)/);
+      if (ready) {
+        ownedPid = Number(ready[1]);
+        // Genuine OS discovery failure in the surviving launcher, after native startup.
+        process.env.PATH = '';
+        controller.abort();
+      }
+      return true;
+    });
+    try {
+      await mod.runLaunchSpec({
+        command: process.execPath,
+        args: ['-e', 'process.stderr.write("guardian-ready:" + process.pid + "\\n"); setInterval(() => {}, 1000)', 'private-native-value'],
+        cwd: tmpdir(),
+        env: { ...process.env, PRIVATE_NATIVE_VALUE: 'private-native-value' },
+      }, controller.signal);
+      expect(ownedPid).toBeGreaterThan(0);
+      expect(stderr).toContain('terminal_controller_cleanup_incomplete');
+      expect(stderr).not.toContain('private-native-value');
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      stderrWrite.mockRestore();
+      consoleError.mockRestore();
+      if (ownedPid) {
+        try { process.kill(ownedPid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
+  });
+
   it('reads Windows verbatim argument handling and rejects malformed values', async () => {
     const mod = require('./terminal_launch_spec_runner.cjs') as {
       readLaunchSpecFile: (specPath: string) => Promise<{ windowsVerbatimArguments?: boolean }>;

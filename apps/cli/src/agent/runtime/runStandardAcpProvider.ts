@@ -30,14 +30,14 @@ import { createStartupMetadataOverrides } from '@/agent/runtime/createStartupMet
 import { initializeBackendApiContext } from '@/agent/runtime/initializeBackendApiContext';
 import { initializeBackendRunSession } from '@/agent/runtime/initializeBackendRunSession';
 import { registerRunnerTerminationHandlers } from '@/agent/runtime/runnerTerminationHandlers';
-import { runPermissionModePromptLoop, type ReadyNotificationTurnContext } from '@/agent/runtime/runPermissionModePromptLoop';
+import { runPermissionModePromptLoop, type ProviderStartupControls, type ReadyNotificationTurnContext } from '@/agent/runtime/runPermissionModePromptLoop';
 import { getSessionNotificationTitle } from '@/agent/runtime/readyNotificationContext';
 import { resolveReadyNotificationAssistantText } from '@/agent/runtime/readyNotificationAssistantText';
 import { sendReadyWithPushNotification } from '@/agent/runtime/sendReadyWithPushNotification';
 import { createTurnAssistantPreviewTracker, type TurnAssistantPreviewTracker } from '@/agent/runtime/turnAssistantPreviewTracker';
 import { resolveEffectiveCodingPromptText } from '@/agent/prompting/coding/resolveEffectiveCodingPrompt';
 import { shouldSendReadyPushNotification } from '@/settings/notifications/notificationsPolicy';
-import type { InFlightSteerController, InFlightSteerDeliveryIdentity } from '@/agent/runtime/permission/bindPermissionModeQueue';
+import type { InFlightSteerController, InFlightSteerPromptOptions } from '@/agent/runtime/permission/bindPermissionModeQueue';
 import type { Credentials } from '@/persistence';
 import { registerKillSessionHandler } from '@/rpc/handlers/killSession';
 import { MessageBuffer } from '@/ui/ink/messageBuffer';
@@ -68,11 +68,12 @@ type RuntimeForLoop = {
   clearGoal?: () => Promise<unknown>;
   listVendorPlugins?: () => Promise<unknown>;
   listSkills?: () => Promise<unknown>;
+  isProviderNativeCommand?: InFlightSteerController['isProviderNativeCommand'];
   supportsInFlightSteer?: () => boolean;
   isTurnInFlight?: () => boolean;
   steerPrompt?: (
     message: string,
-    identity?: InFlightSteerDeliveryIdentity & Readonly<{
+    identity?: InFlightSteerPromptOptions & Readonly<{
       onProviderPromptAccepted?: () => void;
     }>,
   ) => Promise<void>;
@@ -81,6 +82,7 @@ type RuntimeForLoop = {
   getSessionId: () => string | null;
   cancel: () => Promise<void>;
   setSessionMode: (modeId: string) => Promise<void>;
+  clearSessionModeOverride?: () => Promise<void>;
   setSessionConfigOption: (configId: string, value: string | number | boolean | null) => Promise<void>;
   setSessionModel: (modelId: string) => Promise<void>;
 };
@@ -162,7 +164,7 @@ export type StandardAcpProviderConfig = {
   onAttachMetadataSnapshotMissing?: (error: unknown | null) => void;
   onAttachMetadataSnapshotError?: (error: unknown) => void;
   onSessionSwap?: (params: { session: ApiSessionClient }) => void | Promise<void>;
-  onAfterStart?: (params: { session: ApiSessionClient; runtime: RuntimeForLoop }) => void | Promise<void>;
+  onAfterStart?: (params: { session: ApiSessionClient; runtime: RuntimeForLoop } & ProviderStartupControls) => void | Promise<void>;
   onAfterReset?: (params: { session: ApiSessionClient; runtime: RuntimeForLoop }) => void | Promise<void>;
   onDispose?: (params: { session: ApiSessionClient; runtime: RuntimeForLoop }) => void | Promise<void>;
   startRuntimeBeforeFirstPrompt?: boolean;
@@ -294,6 +296,7 @@ export async function runStandardAcpProvider(
     state,
     existingSessionId: opts.existingSessionId,
     uiLogPrefix: config.uiLogPrefix,
+    terminalAgentLabel: policyAgentId,
     startupMetadataOverrides: createStartupMetadataOverrides(opts),
     onSessionSwap: async (newSession) => {
       session = newSession;
@@ -351,9 +354,12 @@ export async function runStandardAcpProvider(
   const inFlightSteerController: InFlightSteerController = {
     supportsInFlightSteer: () => runtimeForInFlightSteer?.supportsInFlightSteer?.() === true,
     isTurnInFlight: () => runtimeForInFlightSteer?.isTurnInFlight?.() === true,
+    isProviderNativeCommand: (text) => runtimeForInFlightSteer?.isProviderNativeCommand?.(text) ?? false,
+    listSkills: () => runtimeForInFlightSteer?.listSkills?.() ?? Promise.resolve({ supported: false, skills: [] }),
+    listVendorPlugins: () => runtimeForInFlightSteer?.listVendorPlugins?.() ?? Promise.resolve({ supported: false, vendorPlugins: [] }),
     steerText: async (
       text: string,
-      identity?: InFlightSteerDeliveryIdentity,
+      identity?: InFlightSteerPromptOptions,
       callbacks?: Readonly<{ onProviderPromptAccepted?: () => void }>,
     ) => {
       const runtime = runtimeForInFlightSteer;
@@ -751,7 +757,7 @@ export async function runStandardAcpProvider(
           ? baseOverride.trim()
           : '';
       },
-      onAfterStart: config.onAfterStart ? () => config.onAfterStart?.({ session, runtime }) : undefined,
+      onAfterStart: config.onAfterStart ? (controls) => config.onAfterStart?.({ session, runtime, ...controls }) : undefined,
       onAfterReset: config.onAfterReset ? () => config.onAfterReset?.({ session, runtime }) : undefined,
       formatPromptErrorMessage: config.formatPromptErrorMessage,
     });

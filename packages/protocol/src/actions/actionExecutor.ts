@@ -40,6 +40,7 @@ import {
   type PermissionEscalationDecision,
 } from './permissionPrivilege.js';
 import type { ActionsSettingsV1 } from './actionSettings.js';
+import { readPendingLocalId } from '../sessionMessages/pendingLocalId.js';
 import type { ReviewStartInput } from '../reviews/reviewStart.js';
 import type { AcpConfigOptionOverridesV1 } from '../sessionMetadata/metadataOverridesV1.js';
 import type { ConnectedServiceBindingsV1 } from '../connect/connectedServiceBindings.js';
@@ -266,6 +267,7 @@ export type ActionExecutorDeps = Readonly<{
   sessionSendMessage: (args: Readonly<{
     sessionId: string;
     message: string;
+    localId?: string;
     requestedAction: PendingRequestedActionV1;
     permissionModeOverride?: string;
     modelOverride?: string | null;
@@ -760,15 +762,15 @@ function resolveServerIdForSession(deps: ActionExecutorDeps, ctx: ActionExecutor
   return deps.resolveServerIdForSessionId ? deps.resolveServerIdForSessionId(sessionId) : null;
 }
 
-function normalizeResolvedOptions(value: unknown): readonly Readonly<{ value: string; label: string; description?: string; disabled?: boolean }>[] {
-  const items = Array.isArray((value as any)?.items)
-    ? ((value as any).items as readonly Record<string, unknown>[])
-    : Array.isArray(value)
-      ? (value as readonly Record<string, unknown>[])
-      : [];
+function normalizeResolvedOptions(value: unknown, options: Readonly<{ allowEmptyValue?: boolean }> = {}): readonly Readonly<{ value: string; label: string; description?: string; disabled?: boolean }>[] {
+  const inventory = typeof value === 'object' && value !== null && 'items' in value ? value.items : value;
+  const items: readonly unknown[] = Array.isArray(inventory) ? inventory : [];
 
   return items
-    .map((item) => {
+    .map((rawItem) => {
+      if (typeof rawItem !== 'object' || rawItem === null) return null;
+      // Action-service inventories are untyped transport input.
+      const item = rawItem as Record<string, unknown>;
       const valueCandidate =
         typeof item?.targetKey === 'string'
           ? item.targetKey
@@ -781,7 +783,7 @@ function normalizeResolvedOptions(value: unknown): readonly Readonly<{ value: st
                 : typeof item?.engineId === 'string'
                   ? item.engineId
                   : null;
-      if (!valueCandidate) return null;
+      if (valueCandidate === null || (valueCandidate === '' && options.allowEmptyValue !== true)) return null;
       const labelCandidate =
         typeof item?.label === 'string'
           ? item.label
@@ -798,7 +800,7 @@ function normalizeResolvedOptions(value: unknown): readonly Readonly<{ value: st
         ...(disabledCandidate ? { disabled: true as const } : {}),
       };
     })
-    .filter(Boolean) as readonly Readonly<{ value: string; label: string; description?: string; disabled?: boolean }>[];
+    .filter((option) => option !== null);
 }
 
 function normalizeExecutionBackendOptionValue(value: string): string {
@@ -983,7 +985,7 @@ async function resolveDynamicActionOptions(params: Readonly<{
     const sessionId = resolveSessionIdFromInput(input, ctx);
     if (!sessionId) return { ok: false, errorCode: 'session_not_selected', error: 'session_not_selected' };
     const result = await deps.sessionModesList({ sessionId });
-    return { ok: true, result: normalizeResolvedOptions(result) };
+    return { ok: true, result: normalizeResolvedOptions(result, { allowEmptyValue: true }) };
   }
 
   if (route.kind === 'agentInventory') {
@@ -2223,6 +2225,14 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
         if (actionId === 'session.message.send') {
           const sessionId = resolveSessionIdFromInput(parsed.data, ctx);
           if (!sessionId) return { ok: false, errorCode: 'session_not_selected', error: 'session_not_selected' };
+          const localIdRaw = (parsed.data as Record<string, unknown>).localId;
+          const localId = readPendingLocalId(localIdRaw);
+          if (localIdRaw !== undefined && (
+            ctx.surface !== 'cli'
+            || localId === null
+          )) {
+            return { ok: false, errorCode: 'invalid_parameters', error: 'invalid_parameters' };
+          }
           const serverId = resolveServerIdForSession(deps, ctx, sessionId);
           const modelOverrideRaw = Object.prototype.hasOwnProperty.call(parsed.data, 'modelOverride')
             ? (parsed.data as any).modelOverride
@@ -2237,6 +2247,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
           const res = await deps.sessionSendMessage({
             sessionId,
             message: (parsed.data as any).message,
+            ...(localId !== null ? { localId } : {}),
             requestedAction: PendingRequestedActionV1Schema.parse(
               parsed.data.requestedAction ?? { v: 1, kind: 'steer_if_active' },
             ),

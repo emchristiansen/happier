@@ -9,11 +9,11 @@ This is different from how Happier runs Claude by default. It is off until you t
 
 ## The three ways Happier runs Claude
 
-| Runtime | How Happier drives Claude | Is there a terminal to join? |
+| Runtime | How Happier drives Claude | Native Claude TUI in remote mode? |
 | --- | --- | --- |
-| **Agent SDK** (default) | Happier runs Claude through `@anthropic-ai/claude-agent-sdk` in a background process and streams messages into it. | No. There is no Claude Code TUI in this mode. |
-| **Unified terminal** | Happier hosts Claude Code’s own TUI in tmux, zellij, or a Windows console host, and writes prompts into its composer. | Yes on the tmux and zellij hosts — `happier attach <session-id>` puts you in the same window or pane. |
-| **Legacy remote** (fallback) | Happier spawns `claude` with a streaming output format and forwards hooks for session info. | No. |
+| **Agent SDK** (default) | Happier runs Claude through `@anthropic-ai/claude-agent-sdk` in a background process and streams messages into it. | No. An attachable Happier runner can switch to local mode. |
+| **Unified terminal** | Happier hosts Claude Code’s own TUI in tmux, zellij, Herdr, or a Windows console host, and writes prompts into its composer. | Yes on tmux, zellij, and Herdr — `happier attach <session-id>` puts you in the same window or pane. |
+| **Legacy remote** (fallback) | Happier spawns `claude` with a streaming output format and forwards hooks for session info. | No. An attachable Happier runner can switch to local mode. |
 
 Selection happens when the provider session starts, and it is pinned for the life of that session. Turning the setting on or off later changes the next Claude session you start, not the one already running.
 
@@ -31,7 +31,9 @@ Under the **Agent SDK**, a steered message is pushed onto the SDK’s streaming 
 
 Choosing **Interrupt** instead calls the SDK’s interrupt before the message is pushed, so the current turn stops and yours starts.
 
-Under the **unified terminal**, a steered message is typed into the live Claude Code composer while the turn is still generating. Claude Code handles it the way it handles anything you type mid-generation: it queues the text and submits it when the turn ends. Once Happier sees Claude’s own queued-messages banner on screen, the pending row switches to **Queued in Claude** — that is terminal evidence that Claude has your text, not a guess.
+Under the **unified terminal**, a steered message is typed into the live Claude Code composer while the turn is still generating. Claude Code queues the text and can consume it during the running turn or after that turn ends. Once Happier sees Claude’s own queued-messages banner on screen, the pending row switches to **Queued in Claude** — that is terminal evidence that Claude has your text, not a guess.
+
+In development source, a queued steer stays pending until Claude’s transcript confirms that it consumed the message. Its submission hook alone does not move it into Happier’s transcript. While Claude still holds it in the queue, the row retains its **Interrupt and run now** action.
 
 Happier will not write into the terminal blindly. Before every write it reads the screen, and it refuses to steer when the running turn was started under a different permission mode — the TUI would silently swallow the mode change, so that message keeps the deferred path and runs as a normal new turn instead.
 
@@ -68,12 +70,21 @@ The unified runtime needs a terminal host that can hold the Claude Code TUI and 
 - **Auto** (default) — use `tmux` when it is available, otherwise Happier’s bundled zellij.
 - **tmux** — use your system `tmux` installation.
 - **zellij** — use Happier’s bundled zellij.
+- **Herdr** — use a supported local Herdr installation.
 
 ### macOS and Linux
 
-Either host works. **Auto** takes `tmux` when it is installed and falls back to the bundled zellij, so the runtime still works on a machine with no `tmux`. If you pick **zellij** explicitly and the bundled binary is unavailable, Happier falls back to `tmux` rather than failing the session.
+All three hosts work. **Auto** takes `tmux` when it is installed and falls back to the bundled zellij, so the runtime still works on a machine with no `tmux`. If you pick **zellij** explicitly and the bundled binary is unavailable, Happier falls back to `tmux` rather than failing the session. Herdr is explicit: selecting it requires a stable Herdr release, version `0.9.2` or newer.
 
-Both hosts are attachable: `happier attach <session-id>` drops you into the same tmux window or zellij pane the app is driving.
+All three hosts are attachable: `happier attach <session-id>` drops you into the same tmux window, zellij pane, or Herdr pane the app is driving.
+
+<Callout type="info">
+  Herdr support and same-pane Claude unified execution are available in Happier CLI 0.2.16 and later, including stable releases.
+</Callout>
+
+With Herdr selected, an app-created unified session puts the Happier runner and its Claude child in one Herdr pane. If `happier claude` starts inside an existing Herdr pane, Happier reuses that pane too instead of creating another provider pane. The Happier wrapper owns the Claude child process; a user-owned Herdr pane remains intact when the session stops.
+
+For these same-pane sessions, a private lifetime channel triggers Claude's process-tree cleanup in the surviving launcher if the Happier controller exits abruptly. This does not close your shell pane. Operating-system failures when finding or signalling processes can leave descendants running; Happier reports incomplete cleanup rather than silently treating it as successful. The launcher cannot perform cleanup if it is also killed or cannot run. Independently recoverable terminal hosts retain their existing lifecycle.
 
 ### Windows
 
@@ -81,6 +92,7 @@ On native Windows, Happier hosts the unified runtime in a **Windows console host
 
 - **tmux** is refused outright — it is not supported on native Windows.
 - **zellij** is refused on native Windows because the bundled build is not validated there, and on Windows ARM64 because there is no upstream zellij binary for that architecture.
+- **Herdr** terminal attachment is not supported on native Windows.
 
 Both refusals name WSL2 as the way to get a `tmux`- or zellij-hosted unified session on a Windows machine. Leaving **Terminal host** on **Auto** is the path that works on Windows as it stands.
 

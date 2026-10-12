@@ -68,6 +68,16 @@ test('release workflow verifies immutable candidates before promoting preview or
   );
 });
 
+test('release resume rechecks risk-selected suites after the target branch has advanced', async () => {
+  const raw = await readFile(join(repoRoot, '.github', 'workflows', 'release.yml'), 'utf8');
+  const workflow = YAML.parse(raw);
+  const verification = workflow.jobs.verify_release_candidates.with;
+  for (const risk of ['cli_upgrade', 'session_continuity', 'relay_upgrade']) {
+    assert.match(String(verification[`risk_${risk}`]), /needs\.plan\.outputs\.risk_/);
+    assert.match(String(verification[`risk_${risk}`]), /inputs\.resume_run_id != ''/);
+  }
+});
+
 test('post-promotion verification receives the selected server runtime probe URL', async () => {
   const workflow = YAML.parse(await readFile(join(repoRoot, '.github', 'workflows', 'release.yml'), 'utf8'));
   assert.ok(workflow.jobs.release_verify.needs.includes('deploy_server'));
@@ -113,10 +123,18 @@ test('preview and stable releases advance a pre-promotion issue snapshot only af
   assert.equal(snapshot['continue-on-error'], true);
   assert.ok(!workflow.jobs.plan.needs.includes('snapshot_release_issues'));
 
-  assert.deepEqual(advance.needs, ['snapshot_release_issues', 'release_verify']);
+  assert.deepEqual(advance.needs, ['snapshot_release_issues', 'release_verify', 'release_status']);
   assert.equal(advance['continue-on-error'], true);
   assert.equal(advance.permissions.issues, 'write');
   assert.match(String(advance.if), /needs\.release_verify\.result == 'success'/);
+  assert.match(String(advance.if), /always\(\)/, 'resumed releases with skipped transitive jobs still evaluate verified advancement');
+  assert.match(String(advance.if), /needs\.release_status\.result == 'success'/, 'partial channel releases cannot advance availability');
+  assert.ok(!workflow.jobs.release_status.needs.includes('advance_release_issues'), 'terminal status must precede optional issue reconciliation');
+  assert.equal(workflow.on.workflow_call.outputs.release_complete.value, '${{ jobs.release_status.outputs.release_complete }}');
+  assert.equal(workflow.jobs.release_status.outputs.release_complete, '${{ steps.admit.outputs.release_complete }}');
+  const terminalAdmission = workflow.jobs.release_status.steps.find((step) => step.id === 'admit');
+  assert.match(String(terminalAdmission?.run), /status\.terminal !== "complete" && status\.terminal !== "published"/);
+  assert.match(String(terminalAdmission?.run), /release_complete=true/);
   assert.match(JSON.stringify(advance.steps), /reconcile-issue-stage\.mjs advance/);
   assert.match(JSON.stringify(advance.steps), /stage:source/);
   assert.match(JSON.stringify(advance.steps), /stage:dev/);
@@ -289,10 +307,19 @@ test('remote release uses one publication decision for publishers and their admi
   const workflow = YAML.parse(await readFile(join(repoRoot, '.github', 'workflows', 'release.yml'), 'utf8'));
   const outputs = workflow.jobs.plan.outputs;
 
-  assert.match(outputs.publish_server_runtime_needed, /inputs\.force_deploy == true/);
-  assert.match(outputs.publish_server_runtime_needed, /steps\.plan\.outputs\.changed_server == 'true'/);
-  assert.match(outputs.publish_cli_binaries_needed, /inputs\.force_deploy == true/);
-  assert.match(outputs.publish_cli_binaries_needed, /steps\.plan\.outputs\.changed_cli == 'true'/);
+  for (const [output, planOutput] of [
+    ['publish_server_runtime_needed', 'publish_server_runtime'],
+    ['publish_cli_binaries_needed', 'publish_cli_binaries'],
+    ['publish_ui_web_needed', 'publish_ui_web'],
+    ['publish_docker_relay_needed', 'publish_docker_relay'],
+    ['publish_docker_dev_box_needed', 'publish_docker_dev_box'],
+  ]) {
+    assert.match(outputs[output], new RegExp(`steps\\.bump_plan\\.outputs\\.${planOutput} == 'true'`));
+    assert.doesNotMatch(outputs[output], /steps\.plan\.outputs\.changed_|inputs\.force_deploy/);
+  }
+  const planner = workflow.jobs.plan.steps.find((step) => step.id === 'bump_plan');
+  assert.equal(planner.env.FORCE_DEPLOY, '${{ inputs.force_deploy }}');
+  assert.match(planner.run, /--force-deploy "\$\{FORCE_DEPLOY\}"/);
   assert.match(workflow.jobs.publish_server_runtime.if, /needs\.plan\.outputs\.publish_server_runtime_needed == 'true'/);
   assert.match(workflow.jobs.publish_cli_binaries.if, /needs\.plan\.outputs\.publish_cli_binaries_needed == 'true'/);
   assert.doesNotMatch(JSON.stringify(workflow.jobs.mysql_db_contract), /deploy_targets/);

@@ -212,7 +212,7 @@ const stylesheet = StyleSheet.create((theme, runtime) => ({
         paddingVertical: Platform.select({ ios: 8, default: 2 }),
     },
     iconContainer: {
-        marginRight: 12,
+        marginRight: ITEM_ICON_MARGIN_RIGHT.comfortable,
         width: ITEM_ICON_BOX_SIZE.comfortable,
         height: ITEM_ICON_BOX_SIZE.comfortable,
         alignItems: 'center',
@@ -221,17 +221,17 @@ const stylesheet = StyleSheet.create((theme, runtime) => ({
         ...ICON_LABEL_OPTICAL_NUDGE_STYLE,
     },
     iconContainerCompact: {
-        marginRight: 10,
+        marginRight: ITEM_ICON_MARGIN_RIGHT.compact,
         width: ITEM_ICON_BOX_SIZE.compact,
         height: ITEM_ICON_BOX_SIZE.compact,
     },
     iconContainerCozy: {
-        marginRight: 14,
+        marginRight: ITEM_ICON_MARGIN_RIGHT.cozy,
         width: ITEM_ICON_BOX_SIZE.cozy,
         height: ITEM_ICON_BOX_SIZE.cozy,
     },
     iconContainerTight: {
-        marginRight: 8,
+        marginRight: ITEM_ICON_MARGIN_RIGHT.tight,
         width: ITEM_ICON_BOX_SIZE.tight,
         height: ITEM_ICON_BOX_SIZE.tight,
     },

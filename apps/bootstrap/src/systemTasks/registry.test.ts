@@ -452,7 +452,7 @@ describe('createHsetupSystemTaskRegistry', () => {
           needsAuth: false,
           machineId: 'machine-local-1',
           // Acquisition is stated, not implied: this run resolved an override CLI.
-          acquisition: { command: fakeCli.cliPath, provenance: 'override', version: '0.2.13' },
+          acquisition: { command: fakeCli.cliPath, provenance: 'override', version: '0.2.13', channel: null },
           server: { serverUrl: 'https://relay.example.test', publicServerUrl: 'https://relay.example.test' },
           service: { installed: true, running: true },
           // A CLI that emits no runtimeConvergence leaves the running daemon unknown.
@@ -569,6 +569,8 @@ describe('createHsetupSystemTaskRegistry', () => {
       expect(fakeCli.readInvocations()).toEqual([
         ['--version'],
         ['daemon', 'status', '--json'],
+        // The pinned services the app also manages (one login-start setting), each started on its own.
+        ['daemon', 'service', 'list', '--json'],
         ['daemon', 'service', 'start', '--json'],
         ['daemon', 'status', '--json'],
       ]);
@@ -939,12 +941,14 @@ posixDescribe('createHsetupSystemTaskRegistry cli.pathExposure kinds', () => {
     const previousShell = process.env.SHELL;
     const previousHappierHome = process.env.HAPPIER_HOME_DIR;
     const previousNoPathUpdate = process.env.HAPPIER_NO_PATH_UPDATE;
+    const previousPath = process.env.PATH;
     const zshrcPath = join(homeDir, '.zshrc');
     writeFileSync(zshrcPath, '# mine\n', 'utf8');
     try {
       process.env.HOME = homeDir;
       process.env.SHELL = '/bin/zsh';
       process.env.HAPPIER_HOME_DIR = join(homeDir, '.happier');
+      process.env.PATH = '';
       delete process.env.HAPPIER_NO_PATH_UPDATE;
       const registry = createHsetupSystemTaskRegistry();
       const params = { surface: 'desktop.ui', target: { kind: 'local' }, mode: 'user' };
@@ -964,6 +968,7 @@ posixDescribe('createHsetupSystemTaskRegistry cli.pathExposure kinds', () => {
           changed: true,
           shellReloadHint: expect.stringContaining(zshrcPath),
           failure: null,
+          existingCommand: null,
         },
       });
       expect(readFileSync(zshrcPath, 'utf8')).toContain(`export PATH="${join(homeDir, '.happier', 'bin')}:$PATH"`);
@@ -982,6 +987,7 @@ posixDescribe('createHsetupSystemTaskRegistry cli.pathExposure kinds', () => {
       restoreEnvVar('SHELL', previousShell);
       restoreEnvVar('HAPPIER_HOME_DIR', previousHappierHome);
       restoreEnvVar('HAPPIER_NO_PATH_UPDATE', previousNoPathUpdate);
+      restoreEnvVar('PATH', previousPath);
       rmSync(homeDir, { recursive: true, force: true });
     }
   });

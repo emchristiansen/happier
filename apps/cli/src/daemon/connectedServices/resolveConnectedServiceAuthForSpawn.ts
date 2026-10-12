@@ -606,6 +606,8 @@ async function maybeSelectGroupActiveProfileForSpawn(params: Readonly<{
   }
 
   const selected = selectConnectedServiceAuthGroupCandidate({
+    lastSwitchReason: state.lastSwitchReason,
+    lastSwitchAt: state.lastSwitchAt,
     nowMs: params.nowMs,
     quotaFreshnessMs: params.quotaFreshnessMs,
     activeProfileId: state.activeProfileId,
@@ -785,6 +787,8 @@ function isAuthoritativeGroupActiveProfileEligible(params: Readonly<{
   const activeMembers = state.members.filter((member) => member.profileId === params.activeProfileId);
   if (activeMembers.length === 0) return false;
   const selected = selectConnectedServiceAuthGroupCandidate({
+    lastSwitchReason: state.lastSwitchReason,
+    lastSwitchAt: state.lastSwitchAt,
     nowMs: params.nowMs,
     quotaFreshnessMs: params.quotaFreshnessMs,
     activeProfileId: params.activeProfileId,
@@ -1087,6 +1091,8 @@ async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly
   resumeReachabilityRequired: boolean;
   candidatePersistedSessionFile: string | null;
   validateGroupMutationCurrentness: ReturnType<typeof createConnectedServiceGroupMutationCurrentnessValidator>;
+  signal?: AbortSignal;
+  onCleanup?: (cleanup: () => Promise<void>) => void;
 }>): Promise<(ConnectedServicesMaterializeResult & Readonly<{
   materializationRoot: string;
   cleanupMaterializationRoot: () => void;
@@ -1122,6 +1128,8 @@ async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly
     vendorResumeId: params.vendorResumeId,
     candidatePersistedSessionFile: params.candidatePersistedSessionFile,
     validateGroupMutationCurrentness: params.validateGroupMutationCurrentness,
+    signal: params.signal,
+    onCleanup: params.onCleanup,
     validatePromotedMaterialization: async ({ env, diagnostics }) => {
       assertNoBlockingMaterializationDiagnostics({
         agentId: params.agentId,
@@ -1179,6 +1187,8 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
    * hard-fail.
    */
   candidatePersistedSessionFile?: string | null;
+  signal?: AbortSignal;
+  onCleanup?: (cleanup: () => Promise<void>) => void;
 }>): Promise<Readonly<{
   env: Record<string, string>;
   materializationRoot?: string | null;
@@ -1189,6 +1199,7 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
   runtimeAccountIdentitySelections: ReadonlyArray<RuntimeAccountIdentitySelectionInput>;
   diagnostics?: readonly ConnectedServicesMaterializationDiagnostic[];
 }> | null> {
+  params.signal?.throwIfAborted();
   const selections = parseConnectedServiceBindingSelections(params.connectedServicesBindingsRaw);
   if (selections.length === 0) return null;
   const nowMs = (params.nowMs ?? (() => Date.now()))();
@@ -1208,12 +1219,14 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
     predictiveSoftSwitchMode: credentialLifecycleDescriptor.predictiveSoftSwitch.mode,
     quotaProbeDeadlineAtMs: params.quotaProbeDeadlineAtMs,
   });
+  params.signal?.throwIfAborted();
 
   const resolvedCredentials = await resolveConnectedServiceCredentialsWithRevisions({
       credentials: params.credentials,
       api: params.api,
       bindings: resolvedBindings.credentialBindings,
     });
+  params.signal?.throwIfAborted();
   const recordsByServiceId = new Map(Array.from(
     resolvedCredentials,
     ([serviceId, resolved]) => [serviceId, resolved.record],
@@ -1231,6 +1244,7 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
         api: params.api,
         credentialBindings,
       });
+      params.signal?.throwIfAborted();
       await applySpawnPreflightRefresh({
         recordsByServiceId,
         credentialRevisionsByServiceId,
@@ -1288,6 +1302,8 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
         vendorResumeId: params.vendorResumeId ?? null,
         resumeReachabilityRequired: params.resumeReachabilityRequired ?? false,
         candidatePersistedSessionFile: params.candidatePersistedSessionFile ?? null,
+        signal: params.signal,
+        onCleanup: params.onCleanup,
         validateGroupMutationCurrentness: createConnectedServiceGroupMutationCurrentnessValidator({
           api: params.api,
           credentials: params.credentials,

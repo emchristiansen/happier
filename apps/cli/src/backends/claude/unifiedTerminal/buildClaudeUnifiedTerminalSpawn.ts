@@ -1,7 +1,6 @@
 import { chmodSync, existsSync, writeFileSync } from 'node:fs';
-import { chmod, mkdtemp, rmdir, unlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { join } from 'node:path';
+import { createUnreadTerminalArtifactsCleanup, writeTerminalLaunchSpec, type TerminalSpawn } from '@/terminal/runtime/terminalLaunchSpec';
 
 import type { CommandInvocation } from '@happier-dev/cli-common/process';
 import { resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process';
@@ -17,7 +16,7 @@ import {
   resolveClaudeStatuslineOriginalCommand,
   type ClaudeStatuslineOverlaySettings,
 } from '../statusline/buildClaudeStatuslineOverlay';
-import { stripNestedSessionDetectionEnv } from '@/utils/processEnv/stripNestedSessionDetectionEnv';
+import { resolveClaudeSessionEnvOverlay } from '../spawn/resolveClaudeSessionEnvOverlay';
 import { buildMissingJavaScriptRuntimeMessage } from '@/runtime/js/buildMissingJavaScriptRuntimeMessage';
 import { resolveJavaScriptRuntimeExecutable } from '@/runtime/js/resolveJavaScriptRuntimeExecutable';
 import { isBun } from '@/utils/runtime';
@@ -44,12 +43,7 @@ import {
   withCurrentHappierSessionId,
 } from '@/agent/runtime/session/currentSessionIdEnv';
 
-export type ClaudeUnifiedTerminalSpawn = Readonly<{
-  spawnArgv: readonly string[];
-  spawnEnv: Readonly<Record<string, string>>;
-  launchSpecPath?: string | undefined;
-  cleanupUnreadArtifacts?: (() => Promise<void>) | undefined;
-}>;
+export type ClaudeUnifiedTerminalSpawn = TerminalSpawn;
 
 export class ClaudeUnifiedTerminalUnsupportedOptionError extends Error {
   readonly code = 'claude_unified_terminal_unsupported_option';
@@ -307,7 +301,7 @@ function readMaterializedEnvKeySet(env: Pick<NodeJS.ProcessEnv, string>): Set<st
 }
 
 function buildClaudeEnv(envOverlay: Readonly<Record<string, string>> | undefined): Record<string, string> {
-  const env = stripNestedSessionDetectionEnv(buildClaudeSubprocessEnv({
+  const env = buildClaudeSubprocessEnv({
     envOverlay: {
       DISABLE_AUTOUPDATER: '1',
       // Do not force IS_DEMO: Claude then hides workspace trust while still suppressing plugin hooks.
@@ -317,7 +311,7 @@ function buildClaudeEnv(envOverlay: Readonly<Record<string, string>> | undefined
       // placeholder at the process boundary instead of weakening draft detection.
       CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
     },
-  }));
+  });
   return Object.fromEntries(
     Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
   );
@@ -359,21 +353,6 @@ function buildTerminalLauncherProcessEnv(baseEnv: NodeJS.ProcessEnv = process.en
   return out;
 }
 
-type TerminalLaunchSpec = Readonly<{
-  command: string;
-  args: readonly string[];
-  windowsVerbatimArguments?: boolean | undefined;
-  cwd: string;
-  env: Readonly<Record<string, string>>;
-  envPassthroughKeys?: readonly string[] | undefined;
-  cleanupPaths?: readonly string[] | undefined;
-  diagnostics?: Readonly<{
-    sessionId: string;
-    logsDir: string;
-    sessionExitDir: string;
-  }> | undefined;
-}>;
-
 type SplitTerminalLaunchEnv = Readonly<{
   persistedEnv: Record<string, string>;
   passthroughEnv: Record<string, string>;
@@ -398,40 +377,6 @@ function splitTerminalLaunchSpecEnv(env: Readonly<Record<string, string>>): Spli
   }
 
   return { persistedEnv, passthroughEnv, passthroughKeys };
-}
-
-async function writeTerminalLaunchSpec(spec: TerminalLaunchSpec): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), 'happier-terminal-launch-'));
-  const path = join(dir, 'launch.json');
-  try {
-    await writeFile(path, JSON.stringify(spec), { mode: 0o600 });
-    if (process.platform !== 'win32') {
-      await chmod(path, 0o600);
-    }
-    return path;
-  } catch (error) {
-    await unlink(path).catch(() => undefined);
-    await rmdir(dir).catch(() => undefined);
-    throw error;
-  }
-}
-
-function createUnreadSpawnArtifactsCleanup(params: Readonly<{
-  launchSpecPath: string;
-  cleanupMcpConfig: () => Promise<void>;
-}>): () => Promise<void> {
-  let cleanupPromise: Promise<void> | null = null;
-  return () => {
-    cleanupPromise ??= (async () => {
-      await unlink(params.launchSpecPath).catch(() => undefined);
-      const specDir = dirname(params.launchSpecPath);
-      if (basename(specDir).startsWith('happier-terminal-launch-')) {
-        await rmdir(specDir).catch(() => undefined);
-      }
-      await params.cleanupMcpConfig();
-    })();
-    return cleanupPromise;
-  };
 }
 
 function defaultDeps(inputDeps: Partial<ClaudeUnifiedTerminalSpawnDeps> | undefined): ClaudeUnifiedTerminalSpawnDeps {
@@ -469,7 +414,10 @@ export async function buildClaudeUnifiedTerminalSpawn<Mode extends EnhancedMode 
   // Env first: the statusline overlay resolves the user's original statusline command from the
   // EFFECTIVE config root of the spawned process (CLAUDE_CONFIG_DIR / HOME in the child env).
   const happierSessionId = normalizeCurrentHappierSessionId(input.happySessionId);
-  const env = withCurrentHappierSessionId(buildClaudeEnv(input.envOverlay), happierSessionId ?? '');
+  const env = withCurrentHappierSessionId(buildClaudeEnv({
+    ...input.envOverlay,
+    ...resolveClaudeSessionEnvOverlay({ claudeCodeIncludeInNativeHistory: input.first.mode.claudeCodeIncludeInNativeHistory }),
+  }), happierSessionId ?? '');
   const statuslineSettings = resolveStatuslineOverlaySettings({ input, deps, env });
   const materializedMcpConfig = await materializeClaudeMcpConfigArgsForSpawn(
     buildClaudeArgs(input, statuslineSettings),
@@ -543,13 +491,15 @@ export async function buildClaudeUnifiedTerminalSpawn<Mode extends EnhancedMode 
         ...splitEnv.passthroughEnv,
       },
       launchSpecPath: specPath,
-      cleanupUnreadArtifacts: createUnreadSpawnArtifactsCleanup({
+      cleanupUnreadArtifacts: createUnreadTerminalArtifactsCleanup({
         launchSpecPath: specPath,
-        cleanupMcpConfig: materializedMcpConfig.cleanup,
+        cleanup: materializedMcpConfig.cleanup,
       }),
     };
   } catch (error) {
-    await materializedMcpConfig.cleanup();
+    try { await materializedMcpConfig.cleanup(); } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], 'Claude terminal launch preparation failed with incomplete cleanup', { cause: error });
+    }
     throw error;
   }
 }

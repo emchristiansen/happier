@@ -1,10 +1,43 @@
 import { describe, expect, it } from 'vitest';
 
-import type { SDKUserMessage } from '@/backends/claude/sdk';
+import type { SDKMessage, SDKUserMessage } from '@/backends/claude/sdk';
 import { convertSDKToLog } from './sdkToLogConverter';
 import { asRecord, conversionContext, createConverter } from './sdkToLogConverter.testkit';
 
 describe('SDKToLogConverter tool result mode metadata', () => {
+  it.each(['completed', 'failed', 'stopped'] as const)('projects native queued task %s before internal filtering and preserves cancellation', status => {
+    const converter = createConverter();
+    const native = { type: 'attachment', uuid: 'notification', attachment: { type: 'queued_command', commandMode: 'task-notification',
+      prompt: `<task-notification><task-id>task</task-id><status>${status}</status><result>final result</result></task-notification>` } };
+    // Native JSONL attachment delivery is ahead of the installed SDK's declared union.
+    expect(converter.convert(native as unknown as SDKMessage)).toBeNull();
+    const result = converter.convert({ type: 'user', uuid: 'ack', tool_use_result: { status: 'async_launched', agentId: 'task' },
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool', content: 'Async agent launched successfully.' }] } });
+    expect(result).toMatchObject({ uuid: 'notification', type: 'user', origin: { toolUseId: 'tool', status },
+      message: { content: [{ type: 'tool_result', tool_use_id: 'tool', is_error: status !== 'completed' }] } });
+    expect(result?.isMeta).toBeUndefined();
+    expect(result?.attachment).toBeUndefined();
+  });
+
+  it.each(['Delivered', '<cross-session-message from="uds:/tmp/sender.sock" from-name="Sender" from-mode="prompting">Delivered</cross-session-message>'])('preserves native SDK peer origin and displays its sender for %s', content => {
+    const converter = createConverter();
+    const result = converter.convert({ type: 'user', uuid: 'sdk-peer', origin: { kind: 'peer', from: 'uds:/tmp/sender.sock', name: 'Sender' },
+      message: { role: 'user', content } });
+    expect(result?.origin).toEqual({ kind: 'peer', from: 'uds:/tmp/sender.sock', name: 'Sender' });
+    if (!result || result.type !== 'user') throw new Error('Missing SDK peer output');
+    expect(result.message.content).toBe('From Sender:\n\nDelivered');
+  });
+
+  it('projects native SDK peer text blocks as visible user content', () => {
+    const result = createConverter().convert({ type: 'user', uuid: 'sdk-peer-blocks', origin: { kind: 'peer', from: 'uds:/tmp/sender.sock', name: 'Sender' },
+      message: { role: 'user', content: [{ type: 'text', text: 'Delivered' }] } });
+    expect(result).toMatchObject({ origin: { kind: 'peer', name: 'Sender' }, message: { content: 'From Sender:\n\nDelivered' } });
+    const toolContent = [{ type: 'tool_result', tool_use_id: 'peer-tool', content: 'Tool outcome' }];
+    const toolResult = createConverter().convert({ type: 'user', uuid: 'sdk-peer-tool', origin: { kind: 'peer', from: 'uds:/tmp/sender.sock', name: 'Sender' },
+      message: { role: 'user', content: toolContent } });
+    expect(toolResult).toMatchObject({ origin: { kind: 'peer' }, message: { content: toolContent } });
+  });
+
   type ClaudeResponseMap = Parameters<typeof createConverter>[0];
   type ClaudeResponseValue = ClaudeResponseMap extends Map<string, infer TValue> | undefined ? TValue : never;
   type ClaudePermissionMode = ClaudeResponseValue extends { mode?: infer TMode } ? TMode : never;

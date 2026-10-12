@@ -10,6 +10,15 @@ import {
 } from './modelControls';
 
 describe('devinSessionModelAdapter', () => {
+  it('distinguishes an empty model choice catalog from an absent or malformed one', () => {
+    const modelOption = { id: 'model', name: 'Model', type: 'select', currentValue: 'swe-2' };
+    expect(buildDevinSessionModelsFromConfigOptions([modelOption])).toBeNull();
+    expect(buildDevinSessionModelsFromConfigOptions([{ ...modelOption, options: [{ value: '', name: '' }] }])).toBeNull();
+    expect(buildDevinSessionModelsFromConfigOptions([{ ...modelOption, options: [] }])).toEqual({
+      currentModelId: 'swe-2', availableModels: [],
+    });
+  });
+
   const rawState: SessionModelState = {
     currentModelId: 'swe-2-max',
     availableModels: [

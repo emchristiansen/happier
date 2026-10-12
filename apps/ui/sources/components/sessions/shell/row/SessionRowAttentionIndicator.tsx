@@ -10,7 +10,8 @@ import type {
 } from './resolveSessionRowPresentation';
 import { resolveSessionRowAttentionIndicatorColor } from './sessionRowAttentionColors';
 
-const DEFAULT_WORKING_SPINNER_SIZE = 12;
+/** Fills the indicator's 16 px slot, so the working mark reads at the scale of the row's agent icons. */
+const DEFAULT_WORKING_SPINNER_SIZE = 16;
 
 const stylesheet = StyleSheet.create(() => ({
     container: {

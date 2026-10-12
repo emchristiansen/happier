@@ -7,6 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
+import { planetRowsForColumns } from '../../packages/cli-common/planetFrame.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '..', '..');
@@ -277,9 +278,14 @@ test('install.sh keeps static art but emits no animation controls when motion is
   });
   const output = String(res.stdout ?? '').replaceAll('\r\n', '\n');
   assert.equal(res.status, 0, `installer failed:\n${output}\n${String(res.stderr ?? '')}`);
-  const artLines = output.split('\n').filter((line) => /^\s*\d{4,}/.test(line));
+  // Every art row is the full 28-cell Braille canvas (blank cells are spaces), then its label.
+  const artRow = /^[ \u2800-\u28ff]{28}(?: {3}.*)?$/u;
+  const lines = output.split('\n');
+  const first = lines.findIndex((line) => artRow.test(line));
+  const artLines = lines.slice(first, first + planetRowsForColumns(28));
   const titleRow = artLines.findIndex((line) => /Happier/.test(line));
-  assert.ok(artLines.length >= 9, 'expected a complete numeric globe');
+  assert.ok(first >= 0 && artLines.every((line) => artRow.test(line)), 'expected a complete Braille globe');
+  assert.ok((artLines.join('').match(/[\u2801-\u28ff]/gu) ?? []).length >= 150, 'expected a lit globe, not an empty canvas');
   assert.equal(titleRow, Math.floor((artLines.length - 1) / 2) - 1, 'title is centered beside the globe');
   assert.ok(artLines.every((line) => line.length <= 80), 'header must fit without terminal wrapping');
   assert.doesNotMatch(output, /\r(?!\n)|\x1b/);

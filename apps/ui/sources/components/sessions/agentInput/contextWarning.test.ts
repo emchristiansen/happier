@@ -14,6 +14,20 @@ import {
 } from './resolveContextWarningWindowTokens';
 
 describe('context warning window resolution', () => {
+    it('uses configured ACP context windows only for the matching backend', () => {
+        const metadata = {
+            path: '/tmp', host: 'test',
+            acpConfiguredBackendV1: { v: 1 as const, backendId: 'custom-one', title: 'Custom', updatedAt: 1 },
+            sessionModelsV1: {
+                v: 1 as const, provider: 'acp:custom-one', updatedAt: 1, currentModelId: 'm',
+                availableModels: [{ id: 'm', name: 'M', contextWindowTokens: 64_000 }],
+            },
+        };
+        expect(resolveContextWindowTokens({ agentId: 'customAcp', metadata })).toBe(64_000);
+        metadata.acpConfiguredBackendV1.backendId = 'custom-two';
+        expect(resolveContextWindowTokens({ agentId: 'customAcp', metadata })).toBeNull();
+    });
+
     it('returns null for non-Claude providers when no supported context window is known', () => {
         expect(resolveContextWindowTokens({
             agentId: 'codex',

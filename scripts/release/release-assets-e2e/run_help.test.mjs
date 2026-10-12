@@ -6,9 +6,58 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import YAML from 'yaml';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const runScript = join(here, 'run.sh');
+
+for (const scriptName of ['remote-daemon-smoke.sh', 'remote-daemon-authenticated-cli-smoke.sh']) {
+  function runSetupCapture(result) {
+    const source = fs.readFileSync(join(here, 'bin', scriptName), 'utf8');
+    const start = source.indexOf('remote_setup_output="$(mktemp');
+    // Exercise the real setup capture at the hstack process boundary, before
+    // unrelated relay/SSH connectivity checks.
+    const captureEnd = source.indexOf('checking remote daemon connectivity after setup...', start);
+    const block = source.slice(start, source.lastIndexOf('\necho ', captureEnd));
+    assert.ok(start >= 0 && captureEnd > start);
+    return spawnSync('bash', ['-c', `set -euo pipefail
+      hstack() { printf '%s\\n' "$HAPPIER_TEST_SETUP_RESULT"; }
+      remote_channel_args=(--preview)
+      ${block}`, join(here, 'bin', scriptName)], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        HAPPIER_TEST_SETUP_RESULT: result,
+        REMOTE_SSH_TARGET: 'happy@remote1',
+        HAPPIER_SERVER_URL: 'http://stack:3005',
+        HAPPIER_WEBAPP_URL: 'http://stack:3005',
+        HAPPIER_PUBLIC_SERVER_URL: 'http://stack:3005',
+      },
+    });
+  }
+
+  test(`${scriptName} rejects a failed JSON task result even when hstack exits successfully`, () => {
+    const output = runSetupCapture([
+      JSON.stringify({ protocolVersion: 1, taskId: 'private-task', type: 'progress', data: { token: 'private-token' } }),
+      JSON.stringify({ protocolVersion: 1, taskId: 'private-task', ok: false, error: { code: 'DOWNLOAD_FAILED', message: 'Release download failed' } }),
+    ].join('\n'));
+    assert.equal(output.status, 1, output.stderr);
+    assert.match(output.stderr, /DOWNLOAD_FAILED/);
+    assert.doesNotMatch(output.stdout + output.stderr, /private-task|private-token/);
+  });
+
+  test(`${scriptName} accepts a successful JSON task result without disclosing its data`, () => {
+    const output = runSetupCapture(JSON.stringify({ protocolVersion: 1, taskId: 'private-task', ok: true, data: { token: 'private-token' } }));
+    assert.equal(output.status, 0, output.stderr);
+    assert.equal(output.stdout + output.stderr, '');
+  });
+
+  test(`${scriptName} rejects setup output without a terminal result`, () => {
+    const output = runSetupCapture(JSON.stringify({ protocolVersion: 1, taskId: 'private-task', type: 'progress' }));
+    assert.equal(output.status, 1, output.stderr);
+    assert.match(output.stderr, /REMOTE_SETUP_RESULT_MISSING/);
+  });
+}
 
 test('npm-e2e-smoke run.sh documents remote daemon flags', () => {
   const res = spawnSync('bash', [runScript, '--help'], { encoding: 'utf8' });
@@ -191,6 +240,16 @@ test('release-assets-e2e remote host install shims make repeated CLI installs id
   }
 });
 
+test('systemd test hosts use Docker-private cgroup mounts, not the read-only host root', () => {
+  const dockerfile = fs.readFileSync(join(here, 'Dockerfile.remote-host-systemd'), 'utf8');
+  assert.doesNotMatch(dockerfile, /^VOLUME\s+\["\/sys\/fs\/cgroup"\]/m);
+  for (const filename of ['compose.remote.yml', 'compose.desktop-setup.yml']) {
+    const compose = fs.readFileSync(join(here, filename), 'utf8');
+    assert.doesNotMatch(compose, /- \/sys\/fs\/cgroup:\/sys\/fs\/cgroup/);
+    assert.match(compose, /privileged: true/);
+  }
+});
+
 test('npm-e2e-smoke dockerhub postgres smoke waits for postgres readiness', () => {
   const content = fs.readFileSync(runScript, 'utf8');
   assert.match(content, /waiting for dockerhub postgres/i);
@@ -211,11 +270,17 @@ test('release-assets-e2e run.sh documents relay-server upgrade smoke flags', () 
   assert.match(res.stdout ?? '', /--relay-upgrade-db=/);
 });
 
-test('release-assets-e2e compose.dockerhub mounts terminal-auth-approve for relay upgrade bootstrap', () => {
+test('release-assets-e2e bootstraps relay auth in a Node-capable smoke container', () => {
   const composePath = join(here, 'compose.dockerhub.yml');
-  const raw = fs.readFileSync(composePath, 'utf8');
-  assert.match(raw, /\n  relay:\n/);
-  assert.match(raw, /\/scripts\/release\/release-assets-e2e\/bin:\/opt\/happier-npm-e2e\/bin:ro/);
+  const compose = YAML.parse(fs.readFileSync(composePath, 'utf8'));
+  assert.match(compose.services['auth-bootstrap']?.image ?? '', /^node:22-/);
+  assert.ok(compose.services['auth-bootstrap']?.volumes?.some((volume) => String(volume).includes(':/opt/happier-npm-e2e/bin:ro')));
+  assert.equal(compose.services.relay?.volumes?.some((volume) => String(volume).includes(':/opt/happier-npm-e2e/bin:ro')), false);
+
+  const script = fs.readFileSync(runScript, 'utf8');
+  const upgradeBlock = script.slice(script.indexOf('run_relay_upgrade_smoke()'), script.indexOf('if [[ "$monorepo_mode" == "local" ]]'));
+  assert.match(upgradeBlock, /run --rm -T --no-deps[^\n]*auth-bootstrap sh -lc/);
+  assert.doesNotMatch(upgradeBlock, /exec -T relay node/);
 });
 
 test('release-assets-e2e run.sh cleanup does not crash when docker is unavailable', () => {

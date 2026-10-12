@@ -7,13 +7,33 @@ import { describe, expect, it } from 'vitest';
 import {
   findCodexRolloutFileById,
   isMatchingCodexRolloutFileName,
+  parseCodexRolloutFilename,
   resolveCodexNativeSessionsRoot,
 } from './codexSessionFiles';
+
+describe('parseCodexRolloutFilename', () => {
+  it('returns the thread and continuation ids from a supported composite filename', () => {
+    expect(parseCodexRolloutFilename(
+      'rollout-2026-09-25T11-50-33-019d94f3-0a6f-7c41-bb18-d26425384658_019d94f4-0a6f-7c41-bb18-d26425384659.jsonl',
+    )).toEqual({
+      sessionId: '019d94f3-0a6f-7c41-bb18-d26425384658_019d94f4-0a6f-7c41-bb18-d26425384659',
+      threadId: '019d94f3-0a6f-7c41-bb18-d26425384658',
+      turnId: '019d94f4-0a6f-7c41-bb18-d26425384659',
+    });
+  });
+});
 
 describe('isMatchingCodexRolloutFileName', () => {
   it('matches a rollout file whose name ends with the vendor resume id', () => {
     expect(isMatchingCodexRolloutFileName(
       'rollout-2026-04-16T08-20-49-019d94f3-0a6f-7c41-bb18-d26425384658.jsonl',
+      '019d94f3-0a6f-7c41-bb18-d26425384658',
+    )).toBe(true);
+  });
+
+  it('matches a continuation rollout with a thread id and appended turn id', () => {
+    expect(isMatchingCodexRolloutFileName(
+      'rollout-2026-09-25T11-50-33-019d94f3-0a6f-7c41-bb18-d26425384658_019d94f4-0a6f-7c41-bb18-d26425384659.jsonl',
       '019d94f3-0a6f-7c41-bb18-d26425384658',
     )).toBe(true);
   });
@@ -28,6 +48,13 @@ describe('isMatchingCodexRolloutFileName', () => {
   it('does not match a non-rollout jsonl file', () => {
     expect(isMatchingCodexRolloutFileName(
       'session-019d94f3-0a6f-7c41-bb18-d26425384658.jsonl',
+      '019d94f3-0a6f-7c41-bb18-d26425384658',
+    )).toBe(false);
+  });
+
+  it('does not match a continuation with a different thread id', () => {
+    expect(isMatchingCodexRolloutFileName(
+      'rollout-2026-09-25T11-50-33-aaaaaaaa-0a6f-7c41-bb18-d26425384658_019d94f4-0a6f-7c41-bb18-d26425384659.jsonl',
       '019d94f3-0a6f-7c41-bb18-d26425384658',
     )).toBe(false);
   });

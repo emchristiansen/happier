@@ -52,7 +52,12 @@ if supports_color; then
   COLOR_DIM=$'\033[2m'
   COLOR_GREEN=$'\033[32m'
   COLOR_YELLOW=$'\033[33m'
-  COLOR_CYAN=$'\033[36m'
+  COLOR_RED=$'\033[31m'
+  if [[ "${COLORTERM:-}" == "truecolor" || "${COLORTERM:-}" == "24bit" ]]; then
+    COLOR_GOLD=$'\033[38;2;214;162;74m'
+  else
+    COLOR_GOLD=$'\033[38;5;179m'
+  fi
   COLOR_ART_YELLOW=$'\033[93m'
   COLOR_ART_RED=$'\033[91m'
   COLOR_ART_MAGENTA=$'\033[95m'
@@ -64,7 +69,8 @@ else
   COLOR_DIM=""
   COLOR_GREEN=""
   COLOR_YELLOW=""
-  COLOR_CYAN=""
+  COLOR_RED=""
+  COLOR_GOLD=""
   COLOR_ART_YELLOW=""
   COLOR_ART_RED=""
   COLOR_ART_MAGENTA=""
@@ -77,7 +83,7 @@ say() {
 }
 
 info() {
-  say "${COLOR_CYAN}$*${COLOR_RESET}"
+  say "${COLOR_GOLD}•${COLOR_RESET} $*"
 }
 
 success() {
@@ -129,38 +135,38 @@ installer_terminal_is_wide() {
 }
 
 INSTALLER_WELCOME_SHOWN="0"
-# BEGIN GENERATED NUMERIC PLANET
+# BEGIN GENERATED PLANET
 HAPPIER_INSTALLER_ART_ROWS=(
-  '         8557531822         '
-  '     751448095236608919     '
-  '   9008479751008911184043   '
-  '  134069691908745137496009  '
-  ' 15908889374662814990040775 '
-  '8460391940911977361087356084'
-  '3686579386469759261860770407'
-  '8426999911207303208277772263'
-  ' 91900644319441053135416199 '
-  '  572641993727001697448951  '
-  '   5488295512800135204007   '
-  '     793254239790824733     '
-  '         4203319290         '
+  '            ⠁⠄⠁⠄⠁⠄⠁         '
+  '        ⠁⠄⠅⢅⢕⢅⣕⢅⢕⢅⢅⢅⠅⠄⠁     '
+  '      ⠁⠄⢕⢵⣿⣿⣿⣟⣿⣿⣿⣽⣿⣵⣵⢅⠅⠄⠁   '
+  '      ⠁⠕⢜⣵⣿⣿⣽⣿⣿⣿⣿⣟⢿⣿⣿⣿⢷⢅⠅⠄⠁ '
+  '      ⠁⢕⢝⢵⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢷⢕⠅⠁⠄'
+  '      ⠁⠅⢝⢽⢿⣿⣟⣽⣿⣽⣿⣿⣿⣽⣷⣿⣟⣿⣟⢅⠅⠄'
+  '      ⠁⠅⠕⢭⢿⣿⣿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢕⠅⠅'
+  '        ⠁⢑⢉⢽⢷⣷⣿⢿⣿⣿⣿⣿⣿⣽⣿⣿⢟⠅⠅⠄'
+  '        ⠁⠅⠕⢙⢽⢽⢿⣿⣿⣿⣿⣿⣿⣟⣿⢟⠕⠅⠁ '
+  '          ⠁⠅⠜⢝⢝⢽⢿⣿⣿⣿⣿⢟⠝⠅⠁⠅⠁ '
+  '            ⠁⠁⠑⠕⠕⠝⠝⠝⠕⠅⠁⠅⠁ ⠁ '
+  '                ⠁⠁⠁⠁⠁ ⠁     '
+  '                            '
 )
 HAPPIER_INSTALLER_ART_RGB_ROWS=(
-  $'         \033[38;2;245;184;102m8\033[38;2;250;187;104m5\033[38;2;251;188;105m5\033[38;2;251;188;105m7\033[38;2;251;188;105m5\033[38;2;251;188;105m3\033[38;2;249;187;104m1\033[38;2;246;184;103m8\033[38;2;242;181;101m2\033[38;2;236;177;98m2         \033[0m'
-  $'     \033[38;2;225;162;116m7\033[38;2;235;169;121m5\033[38;2;241;173;124m1\033[38;2;242;174;124m4\033[38;2;242;174;124m4\033[38;2;242;174;124m8\033[38;2;242;174;124m0\033[38;2;242;174;124m9\033[38;2;242;174;124m5\033[38;2;242;174;124m2\033[38;2;242;174;124m3\033[38;2;242;174;124m6\033[38;2;242;174;124m6\033[38;2;239;172;123m0\033[38;2;235;169;121m8\033[38;2;231;166;118m9\033[38;2;225;162;115m1\033[38;2;215;155;111m9     \033[0m'
-  $'   \033[38;2;211;145;130m9\033[38;2;220;151;136m0\033[38;2;226;155;139m0\033[38;2;231;159;142m8\033[38;2;232;160;143m4\033[38;2;232;160;143m7\033[38;2;232;160;143m9\033[38;2;232;160;143m7\033[38;2;232;160;143m5\033[38;2;232;160;143m1\033[38;2;232;160;143m0\033[38;2;232;160;143m0\033[38;2;232;160;143m8\033[38;2;232;160;143m9\033[38;2;232;160;143m1\033[38;2;232;160;143m1\033[38;2;229;158;142m1\033[38;2;226;155;139m8\033[38;2;221;152;137m4\033[38;2;216;149;134m0\033[38;2;210;145;130m4\033[38;2;201;138;124m3   \033[0m'
-  $'  \033[38;2;199;130;146m1\033[38;2;207;135;151m3\033[38;2;212;139;155m4\033[38;2;217;142;158m0\033[38;2;221;144;161m6\033[38;2;223;146;163m9\033[38;2;223;146;163m6\033[38;2;223;146;163m9\033[38;2;223;146;163m1\033[38;2;223;146;163m9\033[38;2;223;146;163m0\033[38;2;223;146;163m8\033[38;2;223;146;163m7\033[38;2;223;146;163m4\033[38;2;223;146;163m5\033[38;2;223;146;163m1\033[38;2;222;145;162m3\033[38;2;219;143;160m7\033[38;2;216;141;158m4\033[38;2;213;139;155m9\033[38;2;208;136;152m6\033[38;2;204;133;149m0\033[38;2;198;130;145m0\033[38;2;191;125;139m9  \033[0m'
-  $' \033[38;2;184;113;157m1\033[38;2;191;118;163m5\033[38;2;197;121;168m9\033[38;2;201;124;171m0\033[38;2;205;126;175m8\033[38;2;208;128;177m8\033[38;2;210;130;180m8\033[38;2;213;131;181m9\033[38;2;214;132;182m3\033[38;2;214;132;182m7\033[38;2;214;132;182m4\033[38;2;214;132;182m6\033[38;2;214;132;182m6\033[38;2;214;132;182m2\033[38;2;214;132;182m8\033[38;2;213;132;182m1\033[38;2;211;131;180m4\033[38;2;209;129;179m9\033[38;2;207;128;177m9\033[38;2;204;126;174m0\033[38;2;201;124;172m0\033[38;2;198;122;169m4\033[38;2;194;120;165m0\033[38;2;189;117;161m7\033[38;2;183;113;156m7\033[38;2;176;108;150m5 \033[0m'
-  $'\033[38;2;164;95;162m8\033[38;2;173;100;171m4\033[38;2;179;104;177m6\033[38;2;184;106;182m0\033[38;2;188;108;185m3\033[38;2;191;110;189m9\033[38;2;194;112;191m1\033[38;2;196;113;193m9\033[38;2;198;114;195m4\033[38;2;199;115;197m0\033[38;2;200;116;198m9\033[38;2;201;116;198m1\033[38;2;201;116;199m1\033[38;2;201;116;198m9\033[38;2;201;116;198m7\033[38;2;200;115;197m7\033[38;2;199;115;196m3\033[38;2;197;114;195m6\033[38;2;195;113;193m1\033[38;2;193;112;191m0\033[38;2;191;110;188m8\033[38;2;188;109;186m7\033[38;2;185;107;183m3\033[38;2;182;105;179m5\033[38;2;178;102;175m6\033[38;2;173;100;170m0\033[38;2;166;96;164m8\033[38;2;157;90;154m4\033[0m'
-  $'\033[38;2;151;86;177m3\033[38;2;159;91;187m6\033[38;2;165;94;193m8\033[38;2;169;96;198m6\033[38;2;172;98;202m5\033[38;2;175;100;205m7\033[38;2;177;101;208m9\033[38;2;179;102;210m3\033[38;2;181;103;212m8\033[38;2;182;104;214m6\033[38;2;183;104;215m4\033[38;2;184;105;216m6\033[38;2;184;105;216m9\033[38;2;184;105;216m7\033[38;2;184;105;215m5\033[38;2;183;104;215m9\033[38;2;182;104;213m2\033[38;2;181;103;212m6\033[38;2;179;102;210m1\033[38;2;177;101;208m8\033[38;2;175;100;206m6\033[38;2;173;98;203m0\033[38;2;170;97;199m7\033[38;2;167;95;196m7\033[38;2;163;93;191m0\033[38;2;159;90;186m4\033[38;2;153;87;180m0\033[38;2;146;83;172m7\033[0m'
-  $'\033[38;2;132;87;170m8\033[38;2;141;93;181m4\033[38;2;146;96;187m2\033[38;2;149;99;192m6\033[38;2;153;101;196m9\033[38;2;155;102;199m9\033[38;2;157;104;202m9\033[38;2;159;105;205m9\033[38;2;161;106;206m1\033[38;2;162;107;208m1\033[38;2;163;107;209m2\033[38;2;163;108;210m0\033[38;2;163;108;210m7\033[38;2;163;108;210m3\033[38;2;163;108;210m0\033[38;2;162;107;209m3\033[38;2;162;107;208m2\033[38;2;161;106;206m0\033[38;2;159;105;205m8\033[38;2;158;104;203m2\033[38;2;156;103;200m7\033[38;2;154;101;197m7\033[38;2;151;100;194m7\033[38;2;148;98;190m7\033[38;2;145;96;186m2\033[38;2;142;94;182m2\033[38;2;137;91;177m6\033[38;2;130;86;167m3\033[0m'
-  $' \033[38;2;121;93;171m9\033[38;2;126;97;179m1\033[38;2;130;100;184m9\033[38;2;133;102;189m0\033[38;2;135;104;192m0\033[38;2;137;105;195m6\033[38;2;139;107;197m4\033[38;2;140;108;199m4\033[38;2;141;108;201m3\033[38;2;142;109;202m1\033[38;2;143;109;202m9\033[38;2;143;110;203m4\033[38;2;143;110;203m4\033[38;2;143;110;203m1\033[38;2;142;109;202m0\033[38;2;142;109;201m5\033[38;2;141;108;200m3\033[38;2;140;107;198m1\033[38;2;138;106;196m3\033[38;2;136;105;193m5\033[38;2;134;103;191m4\033[38;2;133;102;188m1\033[38;2;131;100;185m6\033[38;2;128;98;182m1\033[38;2;125;96;177m9\033[38;2;120;92;170m9 \033[0m'
-  $'  \033[38;2;107;95;168m5\033[38;2;111;99;174m7\033[38;2;113;101;179m2\033[38;2;116;104;183m6\033[38;2;118;105;186m4\033[38;2;119;107;188m1\033[38;2;121;108;190m9\033[38;2;122;109;192m9\033[38;2;122;110;193m3\033[38;2;123;110;194m7\033[38;2;123;110;194m2\033[38;2;123;110;194m7\033[38;2;123;110;194m0\033[38;2;123;110;193m0\033[38;2;122;109;192m1\033[38;2;121;108;191m6\033[38;2;120;108;190m9\033[38;2;120;107;188m7\033[38;2;118;106;187m4\033[38;2;117;105;185m4\033[38;2;115;103;182m8\033[38;2;113;101;179m9\033[38;2;111;99;174m5\033[38;2;107;95;168m1  \033[0m'
-  $'   \033[38;2;91;96;161m5\033[38;2;95;100;169m4\033[38;2;98;103;173m8\033[38;2;100;105;177m8\033[38;2;101;106;179m2\033[38;2;102;108;181m9\033[38;2;103;109;183m5\033[38;2;104;109;184m5\033[38;2;105;110;185m1\033[38;2;105;110;186m2\033[38;2;105;110;186m8\033[38;2;105;110;186m0\033[38;2;105;110;186m0\033[38;2;105;110;185m1\033[38;2;104;109;184m3\033[38;2;103;109;183m5\033[38;2;102;108;181m2\033[38;2;101;106;179m0\033[38;2;100;105;177m4\033[38;2;98;103;173m0\033[38;2;95;100;169m0\033[38;2;91;96;161m7   \033[0m'
-  $'     \033[38;2;78;97;156m7\033[38;2;81;101;164m9\033[38;2;84;104;168m3\033[38;2;85;106;171m2\033[38;2;86;107;173m5\033[38;2;87;108;175m4\033[38;2;87;109;176m2\033[38;2;88;109;177m3\033[38;2;88;110;177m9\033[38;2;88;110;177m7\033[38;2;88;109;177m9\033[38;2;87;109;176m0\033[38;2;87;108;175m8\033[38;2;86;107;173m2\033[38;2;85;106;171m4\033[38;2;84;104;168m7\033[38;2;81;101;164m3\033[38;2;78;97;156m3     \033[0m'
-  $'         \033[38;2;66;99;154m4\033[38;2;68;102;158m2\033[38;2;69;104;161m0\033[38;2;70;104;162m3\033[38;2;70;105;163m3\033[38;2;70;105;163m1\033[38;2;70;104;162m9\033[38;2;69;104;161m2\033[38;2;68;102;158m9\033[38;2;66;99;154m0         \033[0m'
+  $'            \033[38;2;143;109;59m⠁\033[38;2;158;120;63m⠄\033[38;2;144;110;59m⠁\033[38;2;157;120;63m⠄\033[38;2;143;109;59m⠁\033[38;2;152;116;61m⠄\033[38;2;139;106;58m⠁         \033[0m'
+  $'        \033[38;2;153;114;63m⠁\033[38;2;182;130;73m⠄\033[38;2;181;134;71m⠅\033[38;2;206;151;78m⢅\033[38;2;211;157;78m⢕\033[38;2;216;173;92m⢅\033[38;2;222;172;89m⣕\033[38;2;216;162;79m⢅\033[38;2;203;153;76m⢕\033[38;2;198;149;74m⢅\033[38;2;186;140;71m⢅\033[38;2;175;132;68m⢅\033[38;2;160;121;64m⠅\033[38;2;158;120;63m⠄\033[38;2;141;108;58m⠁     \033[0m'
+  $'      \033[38;2;160;103;71m⠁\033[38;2;203;123;87m⠄\033[38;2;199;137;87m⢕\033[38;2;184;158;101m⢵\033[38;2;220;194;121m⣿\033[38;2;239;220;139m⣿\033[38;2;252;232;145m⣿⣟\033[38;2;254;234;145m⣿\033[38;2;253;232;144m⣿\033[38;2;255;232;142m⣿\033[38;2;253;222;132m⣽\033[38;2;247;209;118m⣿\033[38;2;241;198;108m⣵\033[38;2;223;171;87m⣵\033[38;2;196;147;74m⢅\033[38;2;172;130;67m⠅\033[38;2;165;125;65m⠄\033[38;2;144;110;59m⠁   \033[0m'
+  $'      \033[38;2;203;113;91m⠁\033[38;2;76;63;41m⠕\033[38;2;149;118;64m⢜\033[38;2;188;148;74m⣵\033[38;2;230;187;95m⣿\033[38;2;247;205;105m⣿\033[38;2;253;214;111m⣽\033[38;2;255;221;119m⣿\033[38;2;255;225;124m⣿\033[38;2;255;227;129m⣿\033[38;2;255;229;134m⣿\033[38;2;255;231;137m⣟\033[38;2;255;233;142m⢿\033[38;2;255;232;140m⣿\033[38;2;254;228;137m⣿\033[38;2;248;207;116m⣿\033[38;2;222;164;82m⢷\033[38;2;194;145;73m⢅\033[38;2;170;129;66m⠅\033[38;2;159;121;63m⠄\033[38;2;142;108;58m⠁ \033[0m'
+  $'      \033[38;2;39;31;28m⠁\033[38;2;92;58;38m⢕\033[38;2;143;90;48m⢝\033[38;2;188;116;54m⢵\033[38;2;211;134;59m⣿\033[38;2;237;155;64m⣿\033[38;2;250;169;68m⣿\033[38;2;251;175;69m⣿\033[38;2;254;182;71m⣿\033[38;2;253;186;75m⣿\033[38;2;255;192;79m⣿\033[38;2;255;196;82m⣿\033[38;2;255;200;87m⣿\033[38;2;255;204;92m⣿\033[38;2;255;208;97m⣿\033[38;2;255;211;103m⣿\033[38;2;254;207;106m⣿\033[38;2;231;165;92m⢷\033[38;2;192;135;76m⢕\033[38;2;171;124;69m⠅\033[38;2;152;116;62m⠁\033[38;2;144;107;60m⠄\033[0m'
+  $'      \033[38;2;38;27;28m⠁\033[38;2;69;38;35m⠅\033[38;2;125;59;46m⢝\033[38;2;168;77;52m⢽\033[38;2;201;94;55m⢿\033[38;2;220;104;56m⣿\033[38;2;241;118;56m⣟\033[38;2;245;124;54m⣽\033[38;2;245;129;53m⣿\033[38;2;248;134;54m⣽\033[38;2;248;139;54m⣿\033[38;2;249;145;55m⣿\033[38;2;249;149;56m⣿\033[38;2;253;155;58m⣽\033[38;2;253;159;60m⣷\033[38;2;254;168;66m⣿\033[38;2;254;178;74m⣟\033[38;2;253;186;91m⣿\033[38;2;212;133;88m⣟\033[38;2;179;115;77m⢅\033[38;2;159;107;69m⠅\033[38;2;145;97;64m⠄\033[0m'
+  $'      \033[38;2;26;21;27m⠁\033[38;2;44;25;36m⠅\033[38;2;79;34;49m⠕\033[38;2;113;43;63m⢭\033[38;2;150;53;72m⢿\033[38;2;175;61;78m⣿\033[38;2;196;69;78m⣿\033[38;2;214;77;74m⢿\033[38;2;219;80;73m⣿\033[38;2;224;84;69m⣿\033[38;2;224;87;66m⣿\033[38;2;228;92;63m⣿\033[38;2;233;97;61m⣿\033[38;2;237;103;60m⣿\033[38;2;240;109;59m⣿\033[38;2;242;117;60m⣿\033[38;2;245;130;64m⣿\033[38;2;249;155;78m⣿\033[38;2;214;117;95m⣿\033[38;2;176;101;81m⢕\033[38;2;158;95;73m⠅\033[38;2;143;88;67m⠅\033[0m'
+  $'        \033[38;2;38;25;44m⠁\033[38;2;47;31;65m⢑\033[38;2;74;37;82m⢉\033[38;2;83;40;99m⢽\033[38;2;93;42;108m⢷\033[38;2;104;45;115m⣷\033[38;2;126;48;114m⣿\033[38;2;145;50;106m⢿\033[38;2;150;51;106m⣿\033[38;2;160;53;101m⣿\033[38;2;168;56;97m⣿\033[38;2;179;60;94m⣿\033[38;2;188;66;91m⣿\033[38;2;195;75;89m⣽\033[38;2;210;92;89m⣿\033[38;2;227;127;97m⣿\033[38;2;198;93;96m⢟\033[38;2;172;86;85m⠅\033[38;2;150;78;75m⠅\033[38;2;134;70;69m⠄\033[0m'
+  $'        \033[38;2;20;23;34m⠁\033[38;2;22;28;46m⠅\033[38;2;26;39;75m⠕\033[38;2;32;50;106m⢙\033[38;2;33;57;126m⢽\033[38;2;36;65;149m⢽\033[38;2;38;65;157m⢿\033[38;2;42;70;171m⣿\033[38;2;47;67;169m⣿\033[38;2;54;65;166m⣿\033[38;2;61;61;159m⣿\033[38;2;72;60;151m⣿\033[38;2;85;61;143m⣿\033[38;2;106;68;135m⣟\033[38;2;147;89;125m⣿\033[38;2;190;95;108m⢟\033[38;2;170;69;92m⠕\033[38;2;151;64;82m⠅\033[38;2;140;65;74m⠁ \033[0m'
+  $'          \033[38;2;21;28;44m⠁\033[38;2;22;32;54m⠅\033[38;2;25;47;87m⠜\033[38;2;26;56;108m⢝\033[38;2;28;68;136m⢝\033[38;2;30;76;152m⢽\033[38;2;33;88;178m⢿\033[38;2;35;91;185m⣿\033[38;2;38;95;191m⣿\033[38;2;45;99;191m⣿\033[38;2;61;106;185m⣿\033[38;2;91;106;165m⢟\033[38;2;143;86;125m⠝\033[38;2;137;65;103m⠅\033[38;2;136;61;91m⠁\033[38;2;116;54;81m⠅\033[38;2;119;52;75m⠁ \033[0m'
+  $'            \033[38;2;18;23;38m⠁\033[38;2;17;28;55m⠁\033[38;2;17;32;68m⠑\033[38;2;17;34;75m⠕\033[38;2;18;41;92m⠕\033[38;2;22;52;115m⠝\033[38;2;31;64;126m⠝\033[38;2;74;80;147m⠝\033[38;2;89;78;129m⠕\033[38;2;98;63;118m⠅\033[38;2;104;61;108m⠁\033[38;2;89;54;95m⠅\033[38;2;94;53;88m⠁ \033[38;2;91;49;77m⠁ \033[0m'
+  $'                \033[38;2;53;68;156m⠁\033[38;2;57;65;146m⠁\033[38;2;60;62;134m⠁\033[38;2;61;59;123m⠁\033[38;2;62;55;113m⠁ \033[38;2;64;51;98m⠁     \033[0m'
+  $'                            \033[0m'
 )
-# END GENERATED NUMERIC PLANET
+# END GENERATED PLANET
 
 print_installer_welcome() {
   INSTALLER_WELCOME_SHOWN="1"
@@ -203,7 +209,7 @@ installer_phase() {
 }
 
 installer_step_pending_symbol() {
-  printf '%s' "${COLOR_CYAN}..${COLOR_RESET}"
+  printf '%s' '..'
 }
 
 installer_step_success_symbol() {
@@ -211,39 +217,78 @@ installer_step_success_symbol() {
 }
 
 installer_step_failure_symbol() {
-  printf '%s' "${COLOR_YELLOW}x${COLOR_RESET}"
+  printf '%s' "${COLOR_RED}x${COLOR_RESET}"
+}
+
+# Step rows match the CLI step printer (packages/cli-common/src/output/progress.ts):
+# a gold Braille spinner while the step runs, then "✓ label  1.2s" or a red "x label".
+# Without an animating terminal they stay plain "- [..]" / "- [✓]" lines.
+INSTALLER_SPINNER_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+
+# Tenths of a second. bash < 5 (macOS /bin/bash) has no EPOCHREALTIME, so it counts whole seconds.
+installer_now_tenths() {
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    local whole="${EPOCHREALTIME%[.,]*}"
+    local fraction="${EPOCHREALTIME#*[.,]}"
+    printf '%s' "$((whole * 10 + 10#${fraction:0:1}))"
+    return 0
+  fi
+  printf '%s' "$((SECONDS * 10))"
+}
+
+installer_step_elapsed() {
+  local tenths=$(($(installer_now_tenths) - $1))
+  printf '  %s%s.%ss%s' "${COLOR_DIM}" "$((tenths / 10))" "$((tenths % 10))" "${COLOR_RESET}"
+}
+
+# Launch in the caller shell so printf -v assigns its PID variable on Bash 3.2 too.
+# Monitor mode gives the background step its own group without changing later CLI handoff.
+installer_start_step_group() {
+  local result_var="$1"
+  shift
+  set -m
+  "$@" &
+  local process_group_pid=$!
+  set +m
+  printf -v "${result_var}" '%s' "${process_group_pid}"
+}
+
+# Each step has its own process group. Background descendants can preserve ignored SIGINT
+# (macOS curl does), so Ctrl-C cancels the whole step group with SIGTERM. Callers clear
+# the trap (trap - INT) once the step has finished.
+installer_stop_step_on_interrupt() {
+  trap "kill -TERM -- -$1 2>/dev/null || true; printf '\\n' >&2; exit 130" INT
+}
+
+# Animates a background step until it exits, then prints its outcome row and returns its status.
+installer_animate_step() {
+  local label="$1"
+  local step_pid="$2"
+  local started="$3"
+  local frame_index=0
+  installer_stop_step_on_interrupt "${step_pid}"
+  while kill -0 "${step_pid}" 2>/dev/null; do
+    local frame="${INSTALLER_SPINNER_FRAMES[$((frame_index % ${#INSTALLER_SPINNER_FRAMES[@]}))]}"
+    printf '\r\033[2K%s %s' "${COLOR_GOLD}${frame}${COLOR_RESET}" "${label}" >&2
+    frame_index=$((frame_index + 1))
+    sleep 0.08
+  done
+
+  local status=0
+  wait "${step_pid}" || status=$?
+  trap - INT
+  if [[ "${status}" -eq 0 ]]; then
+    printf '\r\033[2K%s %s%s\n' "$(installer_step_success_symbol)" "${label}" "$(installer_step_elapsed "${started}")" >&2
+  else
+    printf '\r\033[2K%s %s\n' "$(installer_step_failure_symbol)" "${label}" >&2
+  fi
+  return "${status}"
 }
 
 run_installer_step() {
   local label="$1"
   shift
 
-  if ! installer_should_animate; then
-    local tmp_output=""
-    if [[ -n "${TMP_DIR:-}" ]]; then
-      tmp_output="${TMP_DIR}/installer-step.$$.log"
-    else
-      tmp_output="$(mktemp)"
-    fi
-    say "- [..] ${label}"
-    if "$@" >"${tmp_output}" 2>&1; then
-      say "- [ok] ${label}"
-      if [[ "${VERBOSE_MODE}" == "1" ]] && [[ -s "${tmp_output}" ]]; then
-        cat "${tmp_output}"
-      fi
-      rm -f "${tmp_output}" >/dev/null 2>&1 || true
-      return 0
-    fi
-    say "- [x] ${label}"
-    if [[ -s "${tmp_output}" ]]; then
-      cat "${tmp_output}" >&2
-    fi
-    rm -f "${tmp_output}" >/dev/null 2>&1 || true
-    return 1
-  fi
-
-  local spinner_frames=('|' '/' '-' '\')
-  local frame_index=0
   local tmp_output=""
   if [[ -n "${TMP_DIR:-}" ]]; then
     tmp_output="${TMP_DIR}/installer-step.$$.log"
@@ -251,32 +296,36 @@ run_installer_step() {
     tmp_output="$(mktemp)"
   fi
 
-  "$@" >"${tmp_output}" 2>&1 &
-  local step_pid=$!
-
-  while kill -0 "${step_pid}" 2>/dev/null; do
-    local frame="${spinner_frames[$((frame_index % ${#spinner_frames[@]}))]}"
-    printf '\r- [%s] %s' "${COLOR_CYAN}${frame}${COLOR_RESET}" "${label}" >&2
-    frame_index=$((frame_index + 1))
-    sleep 0.12
-  done
-
   local status=0
-  if wait "${step_pid}"; then
-    status=0
+  if installer_should_animate; then
+    local started
+    started="$(installer_now_tenths)"
+    local step_pid
+    installer_start_step_group step_pid "$@" >"${tmp_output}" 2>&1
+    installer_animate_step "${label}" "${step_pid}" "${started}" || status=$?
   else
-    status=$?
+    say "- [$(installer_step_pending_symbol)] ${label}"
+    # A job, not "$@" || …: errexit is ignored inside a command tested by ||/if, so a failing
+    # command in the step (a rejected signature) would not fail it. The animated path does the same.
+    local step_pid
+    installer_start_step_group step_pid "$@" >"${tmp_output}" 2>&1
+    installer_stop_step_on_interrupt "${step_pid}"
+    wait "${step_pid}" || status=$?
+    trap - INT
+    if [[ "${status}" -eq 0 ]]; then
+      say "- [$(installer_step_success_symbol)] ${label}"
+    else
+      say "- [$(installer_step_failure_symbol)] ${label}"
+    fi
   fi
+
   if [[ "${status}" -eq 0 ]]; then
-    printf '\r- [%s] %s\n' "$(installer_step_success_symbol)" "${label}" >&2
     if [[ "${VERBOSE_MODE}" == "1" ]] && [[ -s "${tmp_output}" ]]; then
       cat "${tmp_output}"
     fi
     rm -f "${tmp_output}" >/dev/null 2>&1 || true
     return 0
   fi
-
-  printf '\r- [%s] %s\n' "$(installer_step_failure_symbol)" "${label}" >&2
   if [[ -s "${tmp_output}" ]]; then
     cat "${tmp_output}" >&2
   fi
@@ -299,38 +348,28 @@ capture_installer_step_output() {
     tmp_error="$(mktemp)"
   fi
 
-  if ! installer_should_animate; then
-    say "- [..] ${label}"
-    if "$@" >"${tmp_output}" 2>"${tmp_error}"; then
-      say "- [ok] ${label}"
-      printf -v "${__resultvar}" '%s' "$(cat "${tmp_output}")"
-      if [[ "${VERBOSE_MODE}" == "1" ]] && [[ -s "${tmp_error}" ]]; then
-        cat "${tmp_error}" >&2
-      fi
-      rm -f "${tmp_output}" "${tmp_error}" >/dev/null 2>&1 || true
-      return 0
+  local status=0
+  if installer_should_animate; then
+    local started
+    started="$(installer_now_tenths)"
+    local step_pid
+    installer_start_step_group step_pid "$@" >"${tmp_output}" 2>"${tmp_error}"
+    installer_animate_step "${label}" "${step_pid}" "${started}" || status=$?
+  else
+    say "- [$(installer_step_pending_symbol)] ${label}"
+    local step_pid
+    installer_start_step_group step_pid "$@" >"${tmp_output}" 2>"${tmp_error}"
+    installer_stop_step_on_interrupt "${step_pid}"
+    wait "${step_pid}" || status=$?
+    trap - INT
+    if [[ "${status}" -eq 0 ]]; then
+      say "- [$(installer_step_success_symbol)] ${label}"
+    else
+      say "- [$(installer_step_failure_symbol)] ${label}" >&2
     fi
-    say "- [x] ${label}" >&2
-    cat "${tmp_error}" >&2
-    rm -f "${tmp_output}" "${tmp_error}" >/dev/null 2>&1 || true
-    return 1
   fi
 
-  local spinner_frames=('|' '/' '-' '\')
-  local frame_index=0
-
-  "$@" >"${tmp_output}" 2>"${tmp_error}" &
-  local step_pid=$!
-
-  while kill -0 "${step_pid}" 2>/dev/null; do
-    local frame="${spinner_frames[$((frame_index % ${#spinner_frames[@]}))]}"
-    printf '\r- [%s] %s' "${COLOR_CYAN}${frame}${COLOR_RESET}" "${label}" >&2
-    frame_index=$((frame_index + 1))
-    sleep 0.12
-  done
-
-  if wait "${step_pid}"; then
-    printf '\r- [%s] %s\n' "$(installer_step_success_symbol)" "${label}" >&2
+  if [[ "${status}" -eq 0 ]]; then
     printf -v "${__resultvar}" '%s' "$(cat "${tmp_output}")"
     if [[ "${VERBOSE_MODE}" == "1" ]] && [[ -s "${tmp_error}" ]]; then
       cat "${tmp_error}" >&2
@@ -338,8 +377,6 @@ capture_installer_step_output() {
     rm -f "${tmp_output}" "${tmp_error}" >/dev/null 2>&1 || true
     return 0
   fi
-
-  printf '\r- [%s] %s\n' "$(installer_step_failure_symbol)" "${label}" >&2
   if [[ -s "${tmp_error}" ]]; then
     cat "${tmp_error}" >&2
   fi
@@ -2271,18 +2308,20 @@ ensure_minisign() {
   local os="$(detect_os)"
   local asset=""
   local expected_sha=""
-  local url_base="https://github.com/jedisct1/minisign/releases/download/${minisign_version}"
 
   if [[ "${os}" == "linux" ]]; then
     asset="minisign-${minisign_version}-linux.tar.gz"
     expected_sha="9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73"
   elif [[ "${os}" == "darwin" ]]; then
+    # 0.12's macOS binary is arm64-only; 0.11 is universal (x86_64 + arm64).
+    minisign_version="0.11"
     asset="minisign-${minisign_version}-macos.zip"
-    expected_sha="89000b19535765f9cffc65a65d64a820f433ef6db8020667f7570e06bf6aac63"
+    expected_sha="e7c410ae8b8960d7087392472b040bda9b2f307c76df0384ac37f9ad103fc893"
   else
     return 1
   fi
 
+  local url_base="https://github.com/jedisct1/minisign/releases/download/${minisign_version}"
   local archive_path="${TMP_DIR}/${asset}"
   curl -fsSL "${url_base}/${asset}" -o "${archive_path}"
   local actual_sha
@@ -2380,7 +2419,10 @@ verify_release_signature() {
     return 1
   fi
   write_minisign_public_key "${PUBKEY_PATH}"
-  "${MINISIGN_BIN}" -Vm "${CHECKSUMS_PATH}" -x "${SIG_PATH}" -p "${PUBKEY_PATH}" >/dev/null
+  if ! "${MINISIGN_BIN}" -Vm "${CHECKSUMS_PATH}" -x "${SIG_PATH}" -p "${PUBKEY_PATH}" >/dev/null; then
+    echo "minisign could not verify the release signature." >&2
+    return 1
+  fi
   say "minisign verification passed."
 }
 

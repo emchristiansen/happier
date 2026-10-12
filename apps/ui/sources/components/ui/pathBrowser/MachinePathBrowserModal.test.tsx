@@ -116,7 +116,6 @@ vi.mock('react-native-unistyles', async () => {
         theme: {
             colors: {
                 surface: '#fff',
-                text: '#111',
                 textSecondary: '#666',
                 textLink: '#06f',
                 divider: '#ddd',

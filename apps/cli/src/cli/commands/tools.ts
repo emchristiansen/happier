@@ -16,6 +16,7 @@ import {
   type ResolvedCustomHappierToolWarning,
 } from '@/agent/tools/happierTools/customMcp/listResolvedCustomHappierTools';
 import { callResolvedCustomHappierTool } from '@/agent/tools/happierTools/customMcp/callResolvedCustomHappierTool';
+import { fail } from '@happier-dev/cli-common/output';
 
 type BuiltInToolEntry = Awaited<ReturnType<typeof listBuiltInHappierTools>>[number];
 type CustomToolEntry = Awaited<ReturnType<typeof listResolvedCustomHappierTools>>['tools'][number];
@@ -343,7 +344,7 @@ export async function handleToolsCliCommand(context: CommandContext): Promise<vo
       return;
     }
 
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     if (process.env.DEBUG) console.error(error);
     process.exitCode = typeof process.exitCode === 'number' && process.exitCode > 1 ? process.exitCode : 1;
   }

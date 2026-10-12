@@ -24,7 +24,7 @@ describe('resolveDesktopCloseDaemonDecision', () => {
             autostart: 'at-login',
             activeLocalSessionCount: 0,
             canSeeDaemonSessions: true,
-        })).toBe('leaveRunning');
+        })).toBe('keepInMenuBar');
     });
 
     it('leaves the service running when the autostart mode could not be read', () => {
@@ -46,6 +46,52 @@ describe('resolveDesktopCloseDaemonDecision', () => {
             autostart: 'on-demand',
             activeLocalSessionCount: 0,
             canSeeDaemonSessions: false,
+        })).toBe('askUnknown');
+    });
+
+    it('says it cannot tell, rather than claiming sessions are running, when it cannot see them (U11)', () => {
+        // Same ask, different truth: the "sessions are still running" question is only true when
+        // the app actually saw them.
+        expect(resolveDesktopCloseDaemonDecision({
+            autostart: 'on-demand',
+            activeLocalSessionCount: 2,
+            canSeeDaemonSessions: true,
         })).toBe('ask');
+    });
+
+    describe('R16 — menu-bar mode and the split Quit', () => {
+        it('keeps the tray and the services when the service starts at login', () => {
+            expect(resolveDesktopCloseDaemonDecision({
+                autostart: 'at-login',
+                activeLocalSessionCount: 2,
+                canSeeDaemonSessions: true,
+            })).toBe('keepInMenuBar');
+        });
+
+        it('"Stop background services and quit" stops them whatever the login-start setting says', () => {
+            for (const autostart of ['at-login', 'on-demand', null] as const) {
+                expect(resolveDesktopCloseDaemonDecision({
+                    intent: 'stopServices',
+                    autostart,
+                    activeLocalSessionCount: 0,
+                    canSeeDaemonSessions: true,
+                })).toBe('stop');
+            }
+        });
+
+        it('still asks before ending sessions it sees, or cannot see, when told to stop everything', () => {
+            expect(resolveDesktopCloseDaemonDecision({
+                intent: 'stopServices',
+                autostart: 'at-login',
+                activeLocalSessionCount: 1,
+                canSeeDaemonSessions: true,
+            })).toBe('ask');
+            expect(resolveDesktopCloseDaemonDecision({
+                intent: 'stopServices',
+                autostart: 'at-login',
+                activeLocalSessionCount: 0,
+                canSeeDaemonSessions: false,
+            })).toBe('askUnknown');
+        });
     });
 });

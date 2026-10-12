@@ -1,7 +1,7 @@
 import { statSync, utimesSync } from 'node:fs';
 import { chmod, mkdir, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawnBackgroundSync } from '@happier-dev/cli-common/process';
 
 import {
   buildServiceCommandEnv,
@@ -18,10 +18,25 @@ function formatDaemonServiceCommand(command: DaemonServicePlannedCommand): strin
   return `${command.cmd} ${command.args.join(' ')}`.trim();
 }
 
+function unavailableServiceCommand(command: DaemonServicePlannedCommand): Error & Readonly<{ code: 'service_manager_unavailable' }> {
+  return Object.assign(new Error(`Background service command is not available: ${formatDaemonServiceCommand(command)}`), {
+    code: 'service_manager_unavailable' as const,
+  });
+}
+
+export function assertDaemonServiceCommandsAvailable(commands: readonly DaemonServicePlannedCommand[]): void {
+  for (const command of commands) {
+    if (command.ignoreFailure) continue;
+    if (!commandExistsInPath({ cmd: command.cmd, envPath: process.env.PATH, platform: process.platform, pathext: process.env.PATHEXT })) {
+      throw unavailableServiceCommand(command);
+    }
+  }
+}
+
 function runCommand(command: DaemonServicePlannedCommand): { ok: boolean; out: string | null } {
   try {
     const timeoutMs = readPositiveIntEnv('HAPPIER_DAEMON_SERVICE_COMMAND_TIMEOUT_MS', 30_000);
-    const res = spawnSync(command.cmd, [...command.args], {
+    const res = spawnBackgroundSync(command.cmd, command.args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: buildServiceCommandEnv({ cmd: command.cmd, args: command.args, env: process.env }),
       timeout: timeoutMs,
@@ -113,7 +128,7 @@ function runLaunchctlWithRetry(command: DaemonServicePlannedCommand): { ok: bool
   let result = runCommand(command);
   if (result.ok) return result;
   for (const ms of delaysMs) {
-    const { status } = spawnSync('sleep', [(ms / 1000).toFixed(3)]);
+    const { status } = spawnBackgroundSync('sleep', [(ms / 1000).toFixed(3)]);
     if (status !== 0) {
       // Fallback to a busy wait in the rare environment without `sleep`.
       const deadline = Date.now() + ms;
@@ -141,8 +156,8 @@ export function runDaemonServiceCommands(
   for (const command of commands) {
     const exists = commandExistsInPath({ cmd: command.cmd, envPath: process.env.PATH, platform: process.platform, pathext: process.env.PATHEXT });
     if (!exists) {
-      if (failureMode === 'strict') {
-        throw new Error(`Background service command is not available: ${formatDaemonServiceCommand(command)}`);
+      if (failureMode === 'strict' && !command.ignoreFailure) {
+        throw unavailableServiceCommand(command);
       }
       continue;
     }
@@ -163,6 +178,9 @@ export async function applyDaemonServiceInstallPlan(
   plan: DaemonServiceInstallPlan,
   options: Readonly<{ runCommands?: boolean; commandFailureMode?: DaemonServiceCommandFailureMode }> = {},
 ): Promise<void> {
+  if (options.runCommands !== false) {
+    assertDaemonServiceCommandsAvailable(plan.commands);
+  }
   for (const file of plan.files) {
     await mkdir(dirname(file.path), { recursive: true });
     await writeFile(file.path, file.content, 'utf-8');

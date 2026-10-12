@@ -130,40 +130,25 @@ describe('daemon service install plan — autostart dimension', () => {
   });
 
   describe('win32 (scheduled task)', () => {
-    /**
-     * schtasks has no manual-only schedule, so on-demand is `ONCE` with a start boundary that has
-     * already passed. That boundary must be stated: without `/SD` the trigger defaults to the
-     * installation day and is "never due" only because installs rarely happen at 00:00.
-     */
-    it('registers a trigger that can never come due in on-demand mode', () => {
+    it('registers an interactive user task without triggers in on-demand mode', () => {
       const install = planDaemonServiceInstall({ ...WIN32_BASE, autostart: 'on-demand' })
-        .commands.find((command) => command.cmd === 'schtasks' && command.args.includes('/Create'));
-      const args = install?.args ?? [];
-
-      expect(args).toContain('ONCE');
-      expect(args).not.toContain('ONLOGON');
-      expect(args).not.toContain('ONSTART');
-      expect(args).toContain('/SD');
-      const [first = '', second = '', year = ''] = (args[args.indexOf('/SD') + 1] ?? '').split('/');
-      // Already past, and the same calendar day under MM/DD/YYYY or DD/MM/YYYY — a scheduled-once
-      // task would carry a date still to come, or none at all.
-      expect(Number(year)).toBeLessThan(2001);
-      expect(first).toBe(second);
-      expect(args[args.indexOf('/ST') + 1]).toBe('00:00');
+        .commands.find((command) => command.cmd === 'powershell.exe' && String(command.args.at(-1)).includes('RegisterTask'));
+      const registration = String(install?.args.at(-1) ?? '');
+      expect(registration).toContain('<Triggers/>');
+      expect(registration).toContain('<LogonType>InteractiveToken</LogonType>');
+      expect(registration).not.toContain('LogonTrigger');
       // Installed and started right now, just never by the scheduler.
       expect(commandLines(planDaemonServiceInstall({ ...WIN32_BASE, autostart: 'on-demand' })))
         .toContain('schtasks /Run /TN Happier\\happier-daemon.cloud');
     });
 
-    it('registers the logon trigger by default', () => {
+    it('registers a current-user logon trigger by default', () => {
       const install = planDaemonServiceInstall({ ...WIN32_BASE })
-        .commands.find((command) => command.cmd === 'schtasks' && command.args.includes('/Create'));
-      const args = install?.args ?? [];
-
-      expect(args).toContain('ONLOGON');
-      expect(args).not.toContain('ONCE');
-      // A real trigger needs no start boundary, and a missed logon must still be caught up.
-      expect(args).not.toContain('/SD');
+        .commands.find((command) => command.cmd === 'powershell.exe' && String(command.args.at(-1)).includes('RegisterTask'));
+      const registration = String(install?.args.at(-1) ?? '');
+      expect(registration).toContain('<LogonTrigger>');
+      expect(registration).toContain('$xml.Task.Triggers.LogonTrigger.UserId = $userId');
+      expect(registration).toContain('<RunLevel>LeastPrivilege</RunLevel>');
     });
   });
 

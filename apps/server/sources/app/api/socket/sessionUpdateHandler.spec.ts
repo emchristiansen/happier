@@ -27,7 +27,7 @@ const currentPublisher: Extract<CurrentPublisherResult, { status: "current" }> =
 // The database transaction is the system boundary mocked by this socket-owner test; the
 // materialization service itself is mocked below and never reads from this fixture.
 const transactionClientFixture = {} as Tx;
-const resolveCurrentPublisher = vi.fn(async () => currentPublisher);
+const resolveCurrentPublisher = vi.fn<(...args: unknown[]) => Promise<CurrentPublisherResult>>(async () => currentPublisher);
 const runAsCurrentPublisher = async <T>(params: {
     action: (publisher: typeof currentPublisher) => Promise<T>;
 }) => ({
@@ -494,6 +494,64 @@ describe("sessionUpdateHandler", () => {
             content: { t: "plain", v: { type: "user", text: "hi" } },
             localId: null,
             sidechainId: null,
+        });
+        expect(callback).toHaveBeenCalledWith(expect.objectContaining({ ok: false, error: "invalid-params" }));
+    });
+
+    it("rejects legacy transcript messages from a superseded machine-bound publisher", async () => {
+        const socket = createFakeSocket();
+        resolveCurrentPublisher.mockResolvedValueOnce({ status: "superseded" } as CurrentPublisherResult);
+
+        registerSessionUpdateHandler(
+            "user-1",
+            socket as any,
+            { connectionType: "session-scoped", socket: socket as any, userId: "user-1", sessionId: "s-1" } as any,
+            {
+                presence: { resolveCurrentPublisher },
+                binding: { accountId: "user-1", machineId: "machine-1", sessionId: "s-1" },
+            },
+        );
+
+        const callback = vi.fn();
+        await getSocketHandler(socket, "message")({
+            sid: "s-1",
+            message: { t: "plain", v: { type: "agent", text: "stale" } },
+        }, callback);
+
+        expect(callback).toHaveBeenCalledWith({ ok: false, error: "forbidden" });
+        expect(createSessionMessage).not.toHaveBeenCalled();
+    });
+
+    it("keeps the released transcript adapter working for the current machine-bound publisher", async () => {
+        const socket = createFakeSocket();
+        registerSessionUpdateHandler(
+            "user-1",
+            socket as any,
+            { connectionType: "session-scoped", socket: socket as any, userId: "user-1", sessionId: "s-1" } as any,
+            {
+                presence: { resolveCurrentPublisher },
+                binding: { accountId: "user-1", machineId: "machine-1", sessionId: "s-1" },
+            },
+        );
+
+        const callback = vi.fn();
+        await getSocketHandler(socket, "message")({
+            sid: "s-1",
+            message: { t: "plain", v: { type: "agent", text: "current" } },
+        }, callback);
+
+        expect(createSessionMessage).toHaveBeenCalledWith({
+            actorUserId: "user-1",
+            sessionId: "s-1",
+            content: { t: "plain", v: { type: "agent", text: "current" } },
+            localId: null,
+            sidechainId: null,
+            trustedPublisherFence: {
+                accountId: "user-1",
+                machineId: "machine-1",
+                sessionId: "s-1",
+                committedFence: currentPublisher.committedFence,
+            },
         });
         expect(callback).toHaveBeenCalledWith(expect.objectContaining({ ok: false, error: "invalid-params" }));
     });

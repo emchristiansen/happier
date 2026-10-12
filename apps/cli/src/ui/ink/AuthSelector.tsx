@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Text, useInput, Box } from 'ink';
+import { ACCENT_HEX } from '@happier-dev/cli-common/output';
 import { resolveAuthSelectorInput, type AuthMethod } from './authSelectorInput';
 
 export type { AuthMethod } from './authSelectorInput';
@@ -51,17 +52,17 @@ export const AuthSelector: React.FC<AuthSelectorProps> = ({ onSelect, onCancel }
                     
                     return (
                         <Box key={option.method} marginBottom={index === AUTH_OPTIONS.length - 1 ? 0 : 1} flexDirection="column">
-                            <Text color={isSelected ? "#d6a24a" : undefined} bold={isSelected}>
+                            <Text color={isSelected ? ACCENT_HEX : undefined} bold={isSelected}>
                                 {isSelected ? '› ' : '  '}{index + 1}. {option.label}
                             </Text>
-                            <Text>     {option.description}</Text>
+                            <Text dimColor>     {option.description}</Text>
                         </Box>
                     );
                 })}
             </Box>
 
             <Box marginTop={1}>
-                <Text>Use ↑/↓ or 1–2, then Enter. Esc cancels.</Text>
+                <Text dimColor>Use ↑/↓ or 1–2, then Enter. Esc cancels.</Text>
             </Box>
         </Box>
     );

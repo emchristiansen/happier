@@ -5,6 +5,27 @@ import { runTerminalPromptSubmission } from '@/integrations/terminalHost/promptS
 import { createClaudePromptSubmitVerificationPolicy } from './claudePromptSubmitVerification';
 
 describe('createClaudePromptSubmitVerificationPolicy', () => {
+  it('hands a positively foreign composer back without submitting it, while ambiguous capture still waits', async () => {
+    const policy = createClaudePromptSubmitVerificationPolicy();
+    const promptText = 'authorized prompt';
+    const foreignScreen = '❯ A changed user draft\n  with a separate paragraph';
+    const submitEnter = vi.fn(async () => 'success' as const);
+    const result = await runTerminalPromptSubmission({
+      promptText,
+      verifyStagedBeforeSubmit: async () => policy.isPromptStagedBeforeSubmit({ promptText, screenText: foreignScreen }),
+      submitEnter,
+      remainingTimeoutMs: () => 0,
+    });
+    expect(result).toMatchObject({
+      success: false, reason: 'verification_failed', phase: 'after_write_before_enter', submitMayHaveReachedPane: false,
+    });
+    expect(submitEnter).not.toHaveBeenCalled();
+    expect(policy.isPromptStillPendingAfterSubmit({ promptText, screenText: foreignScreen })).toBe(false);
+    // No cursor/style evidence: these may be a suggestion or an in-progress paste marker.
+    expect(policy.isPromptStagedBeforeSubmit({ promptText, screenText: '❯ Try editing a file' })).toBe(false);
+    expect(policy.isPromptStagedBeforeSubmit({ promptText, screenText: '❯ [Pasted text #1' })).toBe(false);
+  });
+
   it('verifies every non-empty prompt after submit', () => {
     const policy = createClaudePromptSubmitVerificationPolicy();
 
@@ -97,9 +118,41 @@ describe('createClaudePromptSubmitVerificationPolicy', () => {
       verifyAfterSubmit: async () => false,
       remainingTimeoutMs: () => 0,
       wait: async () => {},
-      submitRetryDelayMs: 0,
+      postSubmitSettleMs: 0,
     })).toEqual({ success: true });
     expect(submitEnter).toHaveBeenCalledOnce();
+  });
+
+  it('submits a prompt whose small terminal viewport exposes only a short matching tail', async () => {
+    // Claude Code 2.1.280, real tmux probe at 40x15: the composer scrolls to its
+    // last three rows after paste, even though the complete prompt was written.
+    const promptText = `${'Review the message delivery implementation. '.repeat(10)}\n\nExplain whether the message arrived, and report any remaining issue.`;
+    const screenText = [
+      '─'.repeat(40),
+      '❯ Explain whether the message',
+      '  arrived, and report any remaining',
+      '  issue.',
+      '─'.repeat(40),
+      '  ⏸ plan mode on',
+    ].join('\n');
+    const policy = createClaudePromptSubmitVerificationPolicy();
+    const submitEnter = vi.fn(async () => 'success' as const);
+
+    expect(await runTerminalPromptSubmission({
+      promptText,
+      verifyStagedBeforeSubmit: async () => policy.isPromptStagedBeforeSubmit({ promptText, screenText }),
+      submitEnter,
+      verifyAfterSubmit: async () => false,
+      remainingTimeoutMs: () => 0,
+      wait: async () => {},
+      postSubmitSettleMs: 0,
+    })).toEqual({ success: true });
+    expect(submitEnter).toHaveBeenCalledOnce();
+    expect(policy.isPromptStillPendingAfterSubmit({ promptText, screenText })).toBe(true);
+    expect(() => policy.isPromptStagedBeforeSubmit({
+      promptText,
+      screenText: screenText.replace('remaining', 'unrelated'),
+    })).toThrow();
   });
 
   it('accepts a sufficiently long canonical visible composer window before and after submit', () => {
@@ -148,7 +201,7 @@ describe('createClaudePromptSubmitVerificationPolicy', () => {
     expect(policy.isPromptStillPendingAfterSubmit({
       promptText: prompt,
       screenText: `❯ ${visibleSuffixWords.slice(-8).join(' ')}`,
-    })).toBe(false);
+    })).toBe(true);
     expect(policy.isPromptStillPendingAfterSubmit({
       promptText: prompt,
       screenText: `❯ ${'unrelated visible composer text '.repeat(12)}`,
@@ -190,6 +243,21 @@ describe('createClaudePromptSubmitVerificationPolicy', () => {
         '',
         '│ > │',
       ].join('\n'),
+    })).toBe(false);
+  });
+
+  it('verifies chunked native paste markers without accepting a mixed user draft or historical paste', () => {
+    const policy = createClaudePromptSubmitVerificationPolicy();
+    const promptText = 'large escaped prompt '.repeat(100_000);
+    // Claude Code 2.1.287 renders separate Herdr IPC pastes as adjacent blocks.
+    const markers = '[Pasted text #1][Pasted text #2][Pasted text #3 +7 lines]';
+    expect(policy.isPromptStagedBeforeSubmit({ promptText, screenText: `❯ ${markers}` })).toBe(true);
+    expect(policy.isPromptStillPendingAfterSubmit({ promptText, screenText: `❯ ${markers}` })).toBe(true);
+    for (const composer of [`user draft ${markers}`, `${markers} user draft`, '[Pasted text #1][not a paste marker]']) {
+      expect(policy.isPromptStagedBeforeSubmit({ promptText, screenText: `❯ ${composer}` })).toBe(false);
+    }
+    expect(policy.isPromptStillPendingAfterSubmit({
+      promptText, screenText: `❯ ${markers}\n\n│ > │`,
     })).toBe(false);
   });
 

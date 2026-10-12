@@ -1,10 +1,15 @@
 import type { DaemonSpawnHooks } from '@/daemon/spawnHooks';
 import { resolveOpenCodeCliLaunchSpec } from '@/backends/opencode/utils/resolveOpenCodeCliCommand';
+import { resolveOpenCodeBackendModeFromEnv } from '@/backends/opencode/backendMode';
 
 export const opencodeDaemonSpawnHooks: DaemonSpawnHooks = {
-  validateSpawn: async () => {
+  resolveTerminalPresentation: ({ processEnv }) => {
+    if (resolveOpenCodeBackendModeFromEnv(processEnv) === 'acp') return { kind: 'none' };
+    return { kind: 'provider_attach', startingMode: 'local' };
+  },
+  validateSpawn: async ({ environmentVariables }) => {
     try {
-      resolveOpenCodeCliLaunchSpec();
+      resolveOpenCodeCliLaunchSpec(environmentVariables);
       return { ok: true };
     } catch (error) {
       return {
