@@ -1,5 +1,21 @@
 # Changelog
 
+## Release 2026-10-09.1 - 2026-10-09
+
+<!-- happier-release-note-projections:v1
+{
+  "expo": { "message": "Remote machine setup over SSH now works on a fresh machine that is not yet signed in. Fix connections to stable OpenCode servers. Claude permission changes apply during running sessions, and delivered cross-session messages are visible." },
+  "appStore": { "whatsNew": "Remote machine setup over SSH now works on a fresh machine that is not yet signed in. Fix connections to stable OpenCode servers. Claude permission changes apply during running sessions, and delivered cross-session messages are visible." },
+  "playStore": { "whatsNew": "Remote machine setup over SSH now works on a fresh machine that is not yet signed in. Fix connections to stable OpenCode servers. Claude permission changes apply during running sessions, and delivered cross-session messages are visible." }
+}
+-->
+
+### Reliability
+
+- Remote machine setup over SSH now works on a fresh machine that is not yet signed in.
+- Fix connections to stable OpenCode servers.
+- Claude permission changes apply during running sessions, and delivered cross-session messages are visible.
+
 ## Release 2026-10-07.1 - 2026-10-07
 
 <!-- happier-release-note-projections:v1
@@ -88,8 +104,11 @@ Opening and sharing use a cached copy, not a permanent saved download. Use **Sav
 ### Control sessions without losing your place
 
 - Follow a direct-session import's progress and use **Stop** if you no longer want it to continue. History already imported remains available; the UI shows when cancellation or an import failure occurs.
+- Use session handoff to continue in a different working directory on the same computer, keeping the session and conversation. Choose the current computer and a different destination directory; this requires an updated daemon. File transfer defaults off.
+- Agents with native goal support can recover a blocked goal through Happier tools by reading, clearing and replacing it. If clearing requires your approval, they wait for your decision.
 - Use **Steer now** to deliver a queued message without interrupting the Agent, including while it is idle. If steering becomes unavailable before submission, the message waits for the next safe input; **Send now** keeps its interrupting behavior.
 - Model, permission-mode and reasoning controls reflect what the Agent is actually using rather than treating a requested change as already applied.
+- Happier now recognizes Claude Sonnet 5.5 in the model picker, with model-specific context and reasoning-effort controls. Availability still depends on your connected account.
 - OpenCode V2 can apply idle model, reasoning and agent-mode changes without another prompt, including before opening its terminal. V1 keeps those changes for the next prompt sent through Happier.
 - CLI scripts can choose a message reference with `happier session send <session-id> "ping" --local-id board-wake-42 --json`, making it easier to find that send in history and correlate retries. Use a nonblank value that does not start with `-` or the reserved `agent-transition:` prefix.
 - Codex connected accounts retain native hooks and their enabled or disabled choices. Previously trusted unchanged hooks remain usable, while edited hooks still require Codex's trust checks.
@@ -126,16 +145,25 @@ Opening and sharing use a cached copy, not a permanent saved download. Use **Sav
 - Modal lists keep their content height instead of collapsing inside a card.
 - Pet tiles stay inside narrow panes.
 - The desktop **Updates** button now sits next to back and forward navigation.
-- When you choose another Agent to continue a session, the composer shows that Agent's requested account defaults, and its model picker uses the configured connected account. The running Agent's mode and MCP controls are hidden while the switch is selected.
+- When you choose another Agent to continue a session, the composer shows that Agent's requested account defaults and permission choices, and its model picker uses the configured connected account. The running Agent's model, mode, configuration and MCP controls are hidden while the switch is selected.
+- With permission changes set to apply on the next prompt, continuing with another Agent carries the permission choice selected for that message. If an older daemon lacks support, or support cannot be confirmed, your draft and selected Agent stay available. A newer permission choice remains pending for a later prompt.
 - Messages sent with attachments to a replacement Agent retain that Agent's selected reasoning settings.
-- Claude terminal sessions now wait for a slow prompt paste to finish before submitting it, and stop waiting once the prompt is accepted, its queued message is canceled, or the session stops.
+- Claude terminal sessions now wait for a slow prompt paste to finish before submitting it, and stop waiting once the prompt is accepted, its queued message is canceled, or the session stops. An accepted prompt stays successful even if Happier cannot read the terminal to check the paste.
+- Linux Agent launches respect an inherited lower scheduling priority, avoiding launch failures when Happier cannot raise it.
+- If desktop setup fails, the headline names the failed step when it is known.
+- If Happier already knows it cannot fetch the session for a direct handoff, it refuses the handoff immediately instead of accepting it and failing later.
+- After switching Agents, you can choose another Agent again, including after reopening the session. A newer draft or Agent choice is preserved when the earlier switch finishes.
+- **Move to folder** now works for individual sessions and bulk selections even when folder view is off. Errors are shown instead of the action silently doing nothing.
 
 ### Thank you
 
 - [@Rui-li023](https://github.com/Rui-li023) for Claude usage windows and labeled usage rings in [#440](https://github.com/happier-dev/happier/pull/440).
 - [@clemenssautter-ai](https://github.com/clemenssautter-ai) for `session send --local-id` and Codex hook continuity in [#436](https://github.com/happier-dev/happier/pull/436) and [#442](https://github.com/happier-dev/happier/pull/442).
 - [@Nul-led](https://github.com/Nul-led) for Android video preview and file actions in [#487](https://github.com/happier-dev/happier/pull/487).
-- [@sergedc](https://github.com/sergedc) for selectable AI option text in [#500](https://github.com/happier-dev/happier/pull/500).
+- [@sergedc](https://github.com/sergedc) for selectable AI option text and Claude Sonnet 5.5 support in [#500](https://github.com/happier-dev/happier/pull/500) and [#502](https://github.com/happier-dev/happier/pull/502).
+- [@AmT42](https://github.com/AmT42) for restoring Agent choices after a session switch in [#499](https://github.com/happier-dev/happier/pull/499).
+- [@schjonhaug](https://github.com/schjonhaug) for same-computer directory handoff and folder moves with folder view off in [#504](https://github.com/happier-dev/happier/issues/504) and [#501](https://github.com/happier-dev/happier/issues/501).
+- [@artman-shane](https://github.com/artman-shane) for native-goal recovery through Happier tools in [#505](https://github.com/happier-dev/happier/issues/505).
 
 Thank you also to [@fredericrous](https://github.com/fredericrous) and [@emcp-dev](https://github.com/emcp-dev) for the adopted Mac and Windows installation diagnoses; [@TomySpagnoletti](https://github.com/TomySpagnoletti) for desktop pairing and shared account configuration; [@karolzlot](https://github.com/karolzlot) for terminal recovery; [@Kunde21](https://github.com/Kunde21) for Pi installation detection; [@alfdupont](https://github.com/alfdupont), [@wcollani](https://github.com/wcollani) and [@hazem3500](https://github.com/hazem3500) for Agent controls and authentication fixes; and Ash Berlin-Taylor for Codex direct-session attachment. Their incorporated contributions are credited in the relevant commits.
 
