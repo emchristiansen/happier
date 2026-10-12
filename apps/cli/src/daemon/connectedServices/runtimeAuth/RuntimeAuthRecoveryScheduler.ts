@@ -950,6 +950,10 @@ function mergeRuntimeAuthRecoveryIntent(
     // policy change under an outstanding claim or consume a manual-check refund.
     return {
       ...previous,
+      // Legacy pending records may predate attempt identities. Initialize that
+      // missing identity in this same intake transaction so its in-band result
+      // can settle by identity, without replacing an existing ID or policy.
+      attemptId: previous.attemptId ?? next.attemptId,
       lastSettledTransition: mergeRuntimeAuthRecoveryTransition(
         previous.lastSettledTransition,
         next.lastSettledTransition,

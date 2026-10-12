@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { join } from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
 import { SPAWN_SESSION_ERROR_CODES } from '@happier-dev/protocol';
@@ -28,7 +29,9 @@ import { buildRuntimeAuthRecoveryKey } from './connectedServices/runtimeAuth/rec
 import {
   RuntimeAuthRecoveryScheduler,
   type RuntimeAuthRecoveryDiagnostic,
+  type RuntimeAuthRecoveryIntent,
 } from './connectedServices/runtimeAuth/RuntimeAuthRecoveryScheduler';
+import { createRecoveryIntentFileStore } from './connectedServices/recoveryScheduler/recoveryIntentFileStore';
 import {
   reportConnectedServiceRuntimeAuthFailureToDaemon,
   resetConnectedServiceRuntimeAuthFailureReportDedupeForTests,
@@ -770,6 +773,124 @@ describe('createDaemonControlApp connected-service runtime auth handling', () =>
       releaseHandler.resolve();
       runtimeAuthRecoveryScheduler.dispose();
       await app.close();
+    }
+  });
+
+  it.each([
+    { legacy: false, status: 'waiting' as const },
+    { legacy: false, status: 'resumed_awaiting_proof' as const },
+    { legacy: true, status: 'waiting' as const },
+    { legacy: true, status: 'resumed_awaiting_proof' as const },
+  ])('settles an in-band result after coalescing a pending record (%o)', async ({ legacy, status }) => {
+    const dir = await createTempDir('happier-legacy-intake-result-');
+    const store = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(join(dir, 'recovery.json'));
+    let nowMs = 1000;
+    const runtimeAuthRecoveryScheduler = new RuntimeAuthRecoveryScheduler({
+      nowMs: () => nowMs, durableStore: store,
+      recover: async () => { throw new Error('Unexpected scheduled recovery'); },
+    });
+    const classification = {
+      kind: 'auth_expired', serviceId: 'openai-codex', profileId: 'primary', groupId: 'main',
+      resetsAtMs: null, planType: null, rateLimits: null,
+      source: 'structured_provider_error', sourceKey: 'same-source',
+    } as ConnectedServiceRuntimeFailureClassification;
+    const sessionId = 'sess_legacy_coalesced_result';
+    const recoveryKey = buildRuntimeAuthRecoveryKey({ sessionId, ...classification });
+    const app = createDaemonControlApp({
+      getChildren: () => [], machineId: 'machine',
+      stopSession: async () => ({ status: 'not_found' as const }),
+      spawnSession: async () => ({ type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED, errorMessage: 'unused' }),
+      requestShutdown: () => {}, onHappySessionWebhook: () => {}, controlToken: 'token',
+      handleConnectedServiceRuntimeAuthFailure: async () => ({
+        status: 'recovery_action_required', action: { kind: 'reconnect_profile', reason: 'auth_expired' },
+      }),
+      runtimeAuthRecoveryScheduler,
+    });
+    try {
+      await runtimeAuthRecoveryScheduler.beginClassifiedFailure({
+        sessionId, reportId: 'runtime-auth-report:initial', switchesThisTurn: 0, classification,
+      });
+      await store.transact(recoveryKey, (current) => {
+        const intent = { ...current.intent!, v: legacy ? 1 as const : 2 as const, status, nextRetryAtMs: 20_000 };
+        if (legacy) {
+          Reflect.deleteProperty(intent, 'attemptId');
+          Reflect.deleteProperty(intent, 'lastSettledTransition');
+        }
+        return { ...current, intent, result: undefined };
+      });
+      const previousId = runtimeAuthRecoveryScheduler.readByKeyPassive(recoveryKey)?.attemptId;
+      nowMs = 2000;
+      const response = await app.inject({
+        method: 'POST', url: '/connected-service-runtime-auth/failure',
+        headers: { 'x-happier-daemon-token': 'token' },
+        payload: { reportId: 'runtime-auth-report:current', sessionId, switchesThisTurn: 0, classification },
+      });
+      expect(response.statusCode).toBe(200);
+      const settled = runtimeAuthRecoveryScheduler.readByKeyPassive(recoveryKey);
+      expect(settled).toMatchObject({ status: 'cancelled', nextRetryAtMs: null, attemptId: expect.any(String) });
+      expect(response.json()).toMatchObject({ recoveryReceipt: { attemptId: settled?.attemptId, transition: 'terminal' } });
+      if (!legacy) expect(settled?.attemptId).toBe(previousId);
+    } finally {
+      runtimeAuthRecoveryScheduler.dispose();
+      await app.close();
+      await removeTempDir(dir);
+    }
+  });
+
+  it.each([false, true])('honors an in-band durable wait after coalescing untargeted proof (legacy %s)', async (legacy) => {
+    const dir = await createTempDir('happier-legacy-intake-wait-');
+    const store = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(join(dir, 'recovery.json'));
+    let nowMs = 1000;
+    const recover = vi.fn(async () => ({ status: 'credential_refreshed' }));
+    const runtimeAuthRecoveryScheduler = new RuntimeAuthRecoveryScheduler({
+      nowMs: () => nowMs, durableStore: store, providerOutcomePendingWaitMs: 1000, jitterMs: () => 0, recover,
+    });
+    const classification = {
+      kind: 'usage_limit', serviceId: 'openai-codex', profileId: 'primary', groupId: 'main',
+      resetsAtMs: 9000, planType: null, rateLimits: null,
+      source: 'structured_provider_error', sourceKey: 'same-source',
+    } as ConnectedServiceRuntimeFailureClassification;
+    const sessionId = 'sess_legacy_coalesced_wait';
+    const recoveryKey = buildRuntimeAuthRecoveryKey({ sessionId, ...classification });
+    const app = createDaemonControlApp({
+      getChildren: () => [], machineId: 'machine',
+      stopSession: async () => ({ status: 'not_found' as const }),
+      spawnSession: async () => ({ type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED, errorMessage: 'unused' }),
+      requestShutdown: () => {}, onHappySessionWebhook: () => {}, controlToken: 'token',
+      handleConnectedServiceRuntimeAuthFailure: async () => ({ status: 'no_eligible_member', groupExhausted: true }),
+      runtimeAuthRecoveryScheduler,
+    });
+    try {
+      await runtimeAuthRecoveryScheduler.beginClassifiedFailure({
+        sessionId, reportId: 'runtime-auth-report:initial-wait', switchesThisTurn: 0, classification,
+      });
+      await store.transact(recoveryKey, (current) => {
+        const intent = { ...current.intent!, v: legacy ? 1 as const : 2 as const,
+          status: 'resumed_awaiting_proof' as const, attemptCount: 1, nextRetryAtMs: 20_000,
+          lastError: 'recovery_unproven_awaiting_provider_outcome' };
+        if (legacy) {
+          Reflect.deleteProperty(intent, 'attemptId');
+          Reflect.deleteProperty(intent, 'lastSettledTransition');
+        }
+        return { ...current, intent, result: undefined };
+      });
+      nowMs = 2000;
+      const response = await app.inject({
+        method: 'POST', url: '/connected-service-runtime-auth/failure',
+        headers: { 'x-happier-daemon-token': 'token' },
+        payload: { reportId: 'runtime-auth-report:current-wait', sessionId, switchesThisTurn: 0, classification },
+      });
+      expect(response.statusCode).toBe(200);
+      const accepted = runtimeAuthRecoveryScheduler.readByKeyPassive(recoveryKey);
+      nowMs = 9000;
+      await runtimeAuthRecoveryScheduler.wake({ sessionId, reason: 'timer' });
+      expect(accepted).toMatchObject({ status: 'waiting', attemptCount: 2,
+        nextRetryAtMs: 9000, lastError: 'no_eligible_member', attemptId: expect.any(String) });
+      expect(recover).toHaveBeenCalledOnce();
+    } finally {
+      runtimeAuthRecoveryScheduler.dispose();
+      await app.close();
+      await removeTempDir(dir);
     }
   });
 

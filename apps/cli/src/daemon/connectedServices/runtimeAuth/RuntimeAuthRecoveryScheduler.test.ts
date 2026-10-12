@@ -302,6 +302,44 @@ describe('RuntimeAuthRecoveryScheduler', () => {
     }
   });
 
+  it('adopts a missing legacy intake identity without changing policy or opaque claim custody', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-legacy-intake-identity-'));
+    const store = createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(join(dir, 'recovery.json'));
+    let nowMs = 1000;
+    const recover = vi.fn(async () => ({ status: 'credential_refreshed' }));
+    const scheduler = new RuntimeAuthRecoveryScheduler({ nowMs: () => nowMs, durableStore: store, recover });
+    try {
+      const input = { sessionId: 'legacy-claim-intake', reportId: 'initial-report', switchesThisTurn: 0,
+        classification: classificationFor({ sourceKey: 'same-source' }) };
+      await scheduler.beginClassifiedFailure(input);
+      const key = buildRuntimeAuthRecoveryKey({ sessionId: input.sessionId, ...input.classification });
+      await store.transact(key, (current) => {
+        const intent = { ...current.intent!, v: 1 as const, status: 'checking' as const,
+          attemptCount: 2, nextRetryAtMs: 20_000 };
+        Reflect.deleteProperty(intent, 'attemptId');
+        Reflect.deleteProperty(intent, 'lastSettledTransition');
+        return { intent, effectClaimToken: 'opaque-legacy-effect', result: undefined };
+      });
+      const before = scheduler.readByKeyPassive(key)!;
+      nowMs = 2000;
+      const intake = await scheduler.beginClassifiedFailure({ ...input, reportId: 'current-report' });
+      const after = scheduler.readByKeyPassive(key)!;
+      expect(intake.attemptId).toEqual(expect.any(String));
+      expect(after.attemptId).toBe(intake.attemptId);
+      const { attemptId: _beforeId, lastSettledTransition: _beforeTransition, pendingVisibleEvents: _beforeOutbox, ...beforePolicy } = before;
+      const { attemptId: _afterId, lastSettledTransition: _afterTransition, pendingVisibleEvents: _afterOutbox, ...afterPolicy } = after;
+      expect(afterPolicy).toEqual(beforePolicy);
+      expect(await store.transact(key, (current) => ({ ...current, result: current.effectClaimToken })))
+        .toBe('opaque-legacy-effect');
+      const duplicate = await scheduler.beginClassifiedFailure({ ...input, reportId: 'another-report' });
+      expect(duplicate.attemptId).toBe(intake.attemptId);
+      await expect(scheduler.wake({ sessionId: input.sessionId, reason: 'manual' })).resolves.toEqual({ status: 'checking' });
+      expect(recover).not.toHaveBeenCalled();
+      expect(await store.transact(key, (current) => ({ ...current, result: current.effectClaimToken })))
+        .toBe('opaque-legacy-effect');
+    } finally { scheduler.dispose(); await rm(dir, { recursive: true, force: true }); }
+  });
+
   it('preserves an admitted continuation through a gate delay and durable reload', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'happier-continuation-phase-'));
     const storePath = join(dir, 'recovery.json');
