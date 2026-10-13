@@ -2404,7 +2404,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect((client as any).canonicalPendingDeliveryByLocalId.has('ack-timeout-settlement')).toBe(false);
   });
 
-  it('caps same-operation response-loss rejoin while reserving exact redrive for reconnect', async () => {
+  it('continues exact accepted settlement after repeated response loss without reconnecting', async () => {
     const client = await createClient({
       latestTurnStatus: 'completed',
       pendingCount: 1,
@@ -2420,9 +2420,16 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     resolveAcceptedPendingDeliveryMock
       .mockRejectedValueOnce(timeoutError)
       .mockRejectedValueOnce(timeoutError)
+      .mockRejectedValueOnce(timeoutError)
       .mockResolvedValueOnce({
         didResolve: true,
         pendingQueueState: { known: true, pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 3 },
+        message: {
+          ...createProviderDeliveryMaterializeResult('bounded-rejoin-local').message,
+          id: 'committed-bounded-rejoin-local',
+          seq: 43,
+          deliveryState: null,
+        },
       });
 
     await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
@@ -2443,16 +2450,24 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
         pendingVersion: 3,
       },
     });
-    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(999);
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(2);
     expect((client as any).canonicalPendingDeliveryByLocalId.has('bounded-rejoin-local')).toBe(true);
 
-    if (!supervisorOnConnected) throw new Error('missing supervised reconnect callback');
-    await supervisorOnConnected();
-    await vi.advanceTimersByTimeAsync(0);
-
+    await vi.advanceTimersByTimeAsync(1);
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(3);
+    expect((client as any).canonicalPendingDeliveryByLocalId.has('bounded-rejoin-local')).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(999);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(3);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(4);
+    for (const [request] of resolveAcceptedPendingDeliveryMock.mock.calls) {
+      expect(request).toEqual({ socket: sessionSocketStub, sessionId: 's1', localId: 'bounded-rejoin-local' });
+    }
     expect((client as any).canonicalPendingDeliveryByLocalId.has('bounded-rejoin-local')).toBe(false);
+    expect(hasProviderInputAcceptance(client, 'bounded-rejoin-local')).toBe(true);
     expect(materializeNextMock).toHaveBeenCalledTimes(1);
   });
 
