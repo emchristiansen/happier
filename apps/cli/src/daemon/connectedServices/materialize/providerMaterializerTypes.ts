@@ -3,6 +3,7 @@ import type {
   ConnectedServiceCredentialRecordV1,
   ConnectedServiceId,
 } from '@happier-dev/protocol';
+import type { PreservedDirectoryEntries } from '@/utils/fs/replaceDirectoryAtomically';
 import type { CatalogAgentId } from '@/backends/types';
 import type { ConnectedServiceResolvedSelection } from './materializeConnectedServicesForSpawn';
 import type { ConnectedServiceRefreshFailureCategory } from '../credentials/lifecycleTypes';
@@ -53,6 +54,7 @@ export function collectBlockingConnectedServicesMaterializationDiagnostics(
 export type ConnectedServicesMaterializeResult = Readonly<{
   env: Record<string, string>;
   targetMaterializedRoot?: string | null;
+  preserveUnprovidedEntriesAcrossPromotion?: readonly PreservedDirectoryEntries[];
   afterPromote?: (input: Readonly<{
     env: Record<string, string>;
     targetMaterializedRoot: string | null;

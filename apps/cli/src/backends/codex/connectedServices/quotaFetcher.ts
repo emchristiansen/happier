@@ -13,6 +13,7 @@ import {
 import { isRecord, normalizeNonEmptyString, normalizePct, resolveConnectedServiceQuotaAccountLabel } from '@/daemon/connectedServices/quotas/quotaNormalization';
 import { parseRetryAfterHeader } from '@/daemon/connectedServices/quotas/normalization';
 import { createOpenAiCodexSubscriptionFetcher } from './subscriptionFetcher';
+import { normalizeCodexQuotaWindows } from './codexQuotaWindows';
 
 const RESET_AT_PLAUSIBILITY_FLOOR_TOLERANCE_MS = 24 * 60 * 60_000;
 
@@ -278,11 +279,6 @@ export function createOpenAiCodexQuotaFetcher(params?: Readonly<{
 
       const planLabel = normalizeNonEmptyString(data.plan_type);
       const rateLimit = isRecord(data.rate_limit) ? data.rate_limit : null;
-      const primary = rateLimit && isRecord(rateLimit.primary_window) ? rateLimit.primary_window : null;
-      const secondary = rateLimit && isRecord(rateLimit.secondary_window) ? rateLimit.secondary_window : null;
-
-      const sessionPct = normalizePct(primary?.used_percent);
-      const weeklyPct = normalizePct(secondary?.used_percent);
       const recoveryCredits = mapCodexRateLimitResetCreditsToQuotaRecoveryCredits(rawResetCredits);
 
       return {
@@ -294,30 +290,7 @@ export function createOpenAiCodexQuotaFetcher(params?: Readonly<{
         planLabel,
         accountLabel: resolveAccountLabel(record),
         ...(recoveryCredits ? { recoveryCredits } : {}),
-        meters: [
-          {
-            meterId: 'session',
-            label: 'Session',
-            used: null,
-            limit: null,
-            unit: 'unknown',
-            utilizationPct: sessionPct,
-            resetsAt: normalizeWindowResetAtMs(primary, now),
-            status: sessionPct === null ? 'unavailable' : 'ok',
-            details: {},
-          },
-          {
-            meterId: 'weekly',
-            label: 'Weekly',
-            used: null,
-            limit: null,
-            unit: 'unknown',
-            utilizationPct: weeklyPct,
-            resetsAt: normalizeWindowResetAtMs(secondary, now),
-            status: weeklyPct === null ? 'unavailable' : 'ok',
-            details: {},
-          },
-        ],
+        meters: normalizeCodexQuotaWindows(rateLimit, now, normalizePct, normalizeWindowResetAtMs),
       };
     },
   };

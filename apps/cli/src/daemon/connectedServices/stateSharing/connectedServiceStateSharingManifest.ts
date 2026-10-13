@@ -36,8 +36,8 @@ const EMPTY_MANIFEST: ConnectedServiceStateSharingManifestV1 = Object.freeze({
   diagnostics: [],
 });
 
-const DEFAULT_MANIFEST_NAME = '.happier-state-sharing.json';
-const LEGACY_CODEX_MANIFEST_NAME = '.happier-codex-home-sharing.json';
+export const DEFAULT_MANIFEST_NAME = '.happier-state-sharing.json';
+export const LEGACY_CODEX_MANIFEST_NAME = '.happier-codex-home-sharing.json';
 
 export function isSafeConnectedServiceStateSharingEntry(entry: unknown): entry is string {
   if (typeof entry !== 'string' || entry.length === 0 || isAbsolute(entry)) return false;
