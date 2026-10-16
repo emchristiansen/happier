@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   buildConnectedServiceCredentialRecord,
   ConnectedServiceAuthGroupPolicyV1Schema,
@@ -8,6 +8,8 @@ import {
 } from '@happier-dev/protocol';
 
 import type { TrackedSession } from '@/daemon/types';
+import { logger } from '@/ui/logger';
+import { createDeferred } from '@/testkit/async/deferred';
 import { createCodexConnectedServiceRuntimeAuthAdapter } from '@/backends/codex/connectedServices/createCodexConnectedServiceRuntimeAuthAdapter';
 import { resolveCodexConnectedServiceSwitchContinuity } from '@/backends/codex/connectedServices/resolveCodexConnectedServiceSwitchContinuity';
 import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
@@ -16,6 +18,7 @@ import { createSessionConnectedServiceAuthHotApply } from './sessionConnectedSer
 import { switchSessionConnectedServiceAuth, type SwitchSessionConnectedServiceAuthInput } from './switchSessionConnectedServiceAuth';
 
 const credentialRevision = 'csr_abcdefghijklmnopqrstuv';
+afterEach(() => vi.restoreAllMocks());
 
 function trackedSession(overrides: Partial<TrackedSession> = {}): TrackedSession {
   return {
@@ -378,7 +381,9 @@ describe('switchSessionConnectedServiceAuth', () => {
     }));
   });
 
-  it('awaits runtime-auth credential write commitment before restart rematerialization spawns', async () => {
+  it.each([false, true])('logs await stages while preserving credential-write ordering (unchanged binding: %s)', async (unchanged) => {
+    const log = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
+    const profileId = unchanged ? 'old-profile' : 'new-profile';
     const tracked = trackedSession({
       spawnOptions: {
         directory: '/tmp/project',
@@ -410,7 +415,7 @@ describe('switchSessionConnectedServiceAuth', () => {
       api: {
         listConnectedServiceProfiles: async () => ({
           serviceId: 'anthropic' as const,
-          profiles: [{ profileId: 'new-profile', status: 'connected' as const }],
+          profiles: [{ profileId, status: 'connected' as const }],
         }),
         getConnectedServiceAuthGroup: async () => null,
       },
@@ -424,7 +429,8 @@ describe('switchSessionConnectedServiceAuth', () => {
       request: {
         sessionId: 'sess_1',
         agentId: 'claude',
-        bindings: bindings('new-profile'),
+        bindings: bindings(profileId),
+        ...(unchanged ? { rematerializeServiceId: 'anthropic' as const } : {}),
       },
     });
 
@@ -433,13 +439,75 @@ describe('switchSessionConnectedServiceAuth', () => {
     await Promise.resolve();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(restartSession).not.toHaveBeenCalled();
-
-    releaseCredentialWrite();
+    const stageRecords = () => log.mock.calls
+      .filter(([message]) => message === '[DAEMON RUN] Connected-service auth stage')
+      .map(([, record]) => record);
+    const context = { sessionId: 'sess_1', bindings: [{ serviceId: 'anthropic', profileId }] };
+    try {
+      expect(stageRecords()).toContainEqual({ ...context, stage: 'credential_write_commit', phase: 'begin' });
+      expect(stageRecords()).not.toContainEqual({ ...context, stage: 'credential_write_commit', phase: 'end' });
+    } finally {
+      releaseCredentialWrite();
+      await switchPromise;
+    }
     await expect(switchPromise).resolves.toMatchObject({
       ok: true,
       action: 'restart_requested',
     });
     expect(restartSession).toHaveBeenCalledOnce();
+    expect(stageRecords()).toEqual([
+      { ...context, stage: 'session_lock_wait', phase: 'begin' },
+      { ...context, stage: 'session_lock_wait', phase: 'end' },
+      { ...context, stage: 'profile_normalization', phase: 'begin' },
+      { ...context, stage: 'profile_normalization', phase: 'end' },
+      { ...context, stage: 'materializer', phase: 'begin' },
+      { ...context, stage: 'materializer', phase: 'end' },
+      { ...context, stage: 'credential_write_commit', phase: 'begin' },
+      { ...context, stage: 'credential_write_commit', phase: 'end' },
+      { ...context, stage: 'continuity', phase: 'begin' },
+      { ...context, stage: 'continuity', phase: 'end' },
+    ]);
+  });
+
+  it('ends the lock-wait stage when the session lock is acquired, before normalization settles', async () => {
+    const log = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
+    const locks = new ConnectedServiceSessionAuthSwitchLockRegistry();
+    const releaseLock = createDeferred<void>();
+    const normalize = createDeferred<{ serviceId: 'anthropic'; profiles: [] }>();
+    const normalizing = createDeferred<void>();
+    const held = locks.runExclusive('sess_1', () => releaseLock.promise);
+    const switched = switchSessionConnectedServiceAuth({
+      core: createConnectedServiceSessionAuthSwitchCore({ locks }),
+      getChildren: () => [trackedSession()],
+      api: {
+        listConnectedServiceProfiles: () => { normalizing.resolve(); return normalize.promise; },
+        getConnectedServiceAuthGroup: async () => null,
+      },
+      resolveContinuity: async () => ({ mode: 'unsupported', errorCode: 'continuity_unsupported' }),
+      restartSession: async () => {},
+      hotApply: async () => ({ ok: true }),
+      registerHotApplyTargets: () => {},
+      emitSessionEvent: () => {},
+      request: { sessionId: 'sess_1', agentId: 'claude', bindings: bindings('new-profile') },
+    });
+    const records = () => log.mock.calls.filter(([message]) => message === '[DAEMON RUN] Connected-service auth stage').map(([, record]) => record);
+    const context = { sessionId: 'sess_1', bindings: [{ serviceId: 'anthropic', profileId: 'new-profile' }] };
+    try {
+      expect(records()).toEqual([{ ...context, stage: 'session_lock_wait', phase: 'begin' }]);
+      releaseLock.resolve();
+      await held;
+      await normalizing.promise;
+      expect(records()).toEqual([
+        { ...context, stage: 'session_lock_wait', phase: 'begin' },
+        { ...context, stage: 'session_lock_wait', phase: 'end' },
+        { ...context, stage: 'profile_normalization', phase: 'begin' },
+      ]);
+    } finally {
+      releaseLock.resolve();
+      normalize.resolve({ serviceId: 'anthropic', profiles: [] });
+      await held;
+      await switched;
+    }
   });
 
   it('fails before side effects when startup reconciliation would require restart-resume', async () => {

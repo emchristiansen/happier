@@ -53,6 +53,10 @@ import type {
 } from '../accountTransitions/acceptedConnectedServiceAccountVerification';
 import type { ConnectedServiceTransitionLockMode } from './locking/connectedServiceTransitionLockMode';
 import { runSerializedConnectedServiceTransition } from './locking/runSerializedConnectedServiceTransition';
+import {
+  beginConnectedServiceAuthStage,
+  observeConnectedServiceAuthStage,
+} from '../runtimeAuth/observeConnectedServiceAuthStage';
 import { buildConnectedServiceUxDiagnostic } from '../diagnostics/connectedServiceUxDiagnostics';
 import { sanitizeConnectedServiceDiagnosticString } from '../diagnostics/sanitizeConnectedServiceDiagnosticString';
 import { buildConnectedServiceSwitchContinuationAttemptId } from './buildConnectedServiceSwitchContinuationAttemptId';
@@ -1640,7 +1644,15 @@ async function rematerializeUnchangedConnectedServiceBinding(input: Readonly<{
   const previousBindings = readConnectedServiceBindingsOrEmpty(
     resolveTrackedConnectedServiceBindingsRaw(input.tracked),
   );
-  const runtimeAuthSelection = await maybeMaterializeRuntimeAuthSelection({
+  const stageContext = {
+    sessionId: input.request.sessionId,
+    bindings: [{
+      serviceId,
+      ...(next.profileId === null ? {} : { profileId: next.profileId }),
+      ...(next.groupId === null ? {} : { groupId: next.groupId }),
+    }],
+  };
+  const runtimeAuthSelection = await observeConnectedServiceAuthStage(stageContext, 'materializer', () => maybeMaterializeRuntimeAuthSelection({
     materializeRuntimeAuthSelection: input.materializeRuntimeAuthSelection,
     tracked: input.tracked,
     sessionId: input.request.sessionId,
@@ -1657,8 +1669,8 @@ async function rematerializeUnchangedConnectedServiceBinding(input: Readonly<{
     ...(input.expectedCredentialRevisionByServiceId?.[serviceId] === undefined
       ? {}
       : { expectedCredentialRevision: input.expectedCredentialRevisionByServiceId[serviceId] }),
-  });
-  await awaitRuntimeAuthCredentialWriteCommitted(runtimeAuthSelection);
+  }));
+  await observeConnectedServiceAuthStage(stageContext, 'credential_write_commit', () => awaitRuntimeAuthCredentialWriteCommitted(runtimeAuthSelection));
   const blockingMaterializationDiagnostics = readRuntimeAuthSelectionBlockingMaterializationDiagnostics(
     runtimeAuthSelection,
   );
@@ -1680,7 +1692,7 @@ async function rematerializeUnchangedConnectedServiceBinding(input: Readonly<{
     agentId: input.trackedAgentId,
     tracked: input.tracked,
   });
-  const continuity = await input.resolveContinuity({
+  const continuity = await observeConnectedServiceAuthStage(stageContext, 'continuity', () => input.resolveContinuity({
     tracked: input.tracked,
     sessionId: input.request.sessionId,
     agentId: input.trackedAgentId,
@@ -1692,7 +1704,7 @@ async function rematerializeUnchangedConnectedServiceBinding(input: Readonly<{
     ...(runtimeAuthSelection === null || runtimeAuthSelection === undefined ? {} : { runtimeAuthSelection }),
     ...(connectedServiceMaterializationIdentityV1 ? { connectedServiceMaterializationIdentityV1 } : {}),
     ...(trackedVendorResumeId ? { vendorResumeId: trackedVendorResumeId } : {}),
-  });
+  }));
   if (continuity.mode === 'unsupported') {
     return failureResult(continuity.errorCode, {
       serviceId,
@@ -1903,6 +1915,17 @@ async function rematerializeUnchangedConnectedServiceBinding(input: Readonly<{
 export async function switchSessionConnectedServiceAuth(
   input: SwitchSessionConnectedServiceAuthInput,
 ): Promise<SessionConnectedServiceAuthSwitchResult> {
+  const stageContext = {
+    sessionId: input.request.sessionId,
+    bindings: Object.entries(readConnectedServiceBindingsOrEmpty(input.request.bindings).bindingsByServiceId)
+      .map(([serviceId, binding]) => ({
+        serviceId,
+        ...(binding.source === 'connected' ? {
+          ...(binding.profileId === undefined ? {} : { profileId: binding.profileId }),
+          ...(typeof binding.groupId === 'string' ? { groupId: binding.groupId } : {}),
+        } : {}),
+      })),
+  };
   const diagnosticSource = resolveSwitchUxDiagnosticSource(input.switchReason);
   const continueAfterRuntimeAuthSwitch = input.executionPolicy?.allowContinuation === false
     ? undefined
@@ -1918,13 +1941,13 @@ export async function switchSessionConnectedServiceAuth(
           return { ok: false, errorCode: 'agent_mismatch' };
         }
 
-	        const normalized = await normalizeRequestedBindings({
+	        const normalized = await observeConnectedServiceAuthStage(stageContext, 'profile_normalization', () => normalizeRequestedBindings({
 	          api: input.api,
 	          agentId: inactive.agentId,
 	          request: input.request,
 	          diagnosticSource,
 	          dryRun: input.dryRun === true,
-	        });
+	        }));
         if (!normalized.ok) return normalized;
 
         const previousByServiceId = previousEffectiveBindings(inactive.connectedServices);
@@ -1957,7 +1980,14 @@ export async function switchSessionConnectedServiceAuth(
         for (const serviceId of changedServiceIds) {
           const next = nextByServiceId.get(serviceId);
           if (!next) continue;
-          const continuity = await input.resolveContinuity({
+          const continuity = await observeConnectedServiceAuthStage({
+            sessionId: input.request.sessionId,
+            bindings: [{
+              serviceId,
+              ...(next.profileId === null ? {} : { profileId: next.profileId }),
+              ...(next.groupId === null ? {} : { groupId: next.groupId }),
+            }],
+          }, 'continuity', () => input.resolveContinuity({
             tracked: null,
             sessionId: input.request.sessionId,
             agentId: inactive.agentId,
@@ -1980,7 +2010,7 @@ export async function switchSessionConnectedServiceAuth(
             ...(typeof inactive.candidatePersistedSessionFile === 'string' && inactive.candidatePersistedSessionFile.trim()
               ? { candidatePersistedSessionFile: inactive.candidatePersistedSessionFile.trim() }
               : {}),
-          });
+          }));
           continuityByServiceId[serviceId] = continuity.mode;
           warnings.push(...(continuity.warnings ?? []));
           if (continuity.mode === 'unsupported') {
@@ -2032,13 +2062,13 @@ export async function switchSessionConnectedServiceAuth(
         return { ok: false, errorCode: 'agent_mismatch' };
       }
 
-	      const normalized = await normalizeRequestedBindings({
+	      const normalized = await observeConnectedServiceAuthStage(stageContext, 'profile_normalization', () => normalizeRequestedBindings({
 	        api: input.api,
 	        agentId: trackedAgentId,
 	        request: input.request,
 	        diagnosticSource,
 	        dryRun: input.dryRun === true,
-	      });
+	      }));
       if (!normalized.ok) return normalized;
 
       const previousBindings = readConnectedServiceBindingsOrEmpty(
@@ -2129,7 +2159,15 @@ export async function switchSessionConnectedServiceAuth(
           serviceId,
         });
         runtimeAuthApplyByServiceId.set(serviceId, runtimeAuthApply);
-        const runtimeAuthSelection = await maybeMaterializeRuntimeAuthSelection({
+        const bindingStageContext = {
+          sessionId: input.request.sessionId,
+          bindings: [{
+            serviceId,
+            ...(next.profileId === null ? {} : { profileId: next.profileId }),
+            ...(next.groupId === null ? {} : { groupId: next.groupId }),
+          }],
+        };
+        const runtimeAuthSelection = await observeConnectedServiceAuthStage(bindingStageContext, 'materializer', () => maybeMaterializeRuntimeAuthSelection({
           materializeRuntimeAuthSelection: input.materializeRuntimeAuthSelection,
           tracked,
           sessionId: input.request.sessionId,
@@ -2148,8 +2186,8 @@ export async function switchSessionConnectedServiceAuth(
               : {
                   expectedCredentialRevision: input.expectedCredentialRevisionByServiceId[serviceId],
                 }),
-          });
-        await awaitRuntimeAuthCredentialWriteCommitted(runtimeAuthSelection);
+          }));
+        await observeConnectedServiceAuthStage(bindingStageContext, 'credential_write_commit', () => awaitRuntimeAuthCredentialWriteCommitted(runtimeAuthSelection));
         const blockingMaterializationDiagnostics = readRuntimeAuthSelectionBlockingMaterializationDiagnostics(
           runtimeAuthSelection,
         );
@@ -2181,7 +2219,7 @@ export async function switchSessionConnectedServiceAuth(
         if (runtimeAuthSelection !== null && runtimeAuthSelection !== undefined) {
           runtimeAuthSelectionsByServiceId.set(serviceId, runtimeAuthSelection);
         }
-        const continuity = await input.resolveContinuity({
+        const continuity = await observeConnectedServiceAuthStage(bindingStageContext, 'continuity', () => input.resolveContinuity({
           tracked,
           sessionId: input.request.sessionId,
           agentId: trackedAgentId,
@@ -2193,7 +2231,7 @@ export async function switchSessionConnectedServiceAuth(
           ...(runtimeAuthSelection === null || runtimeAuthSelection === undefined ? {} : { runtimeAuthSelection }),
           ...(connectedServiceMaterializationIdentityV1 ? { connectedServiceMaterializationIdentityV1 } : {}),
           ...(trackedVendorResumeId ? { vendorResumeId: trackedVendorResumeId } : {}),
-        });
+        }));
         continuityByServiceId[serviceId] = continuity.mode;
         warnings.push(...(continuity.warnings ?? []));
         if (continuity.mode === 'unsupported') {
@@ -2465,13 +2503,17 @@ export async function switchSessionConnectedServiceAuth(
         ...spreadContinuityProofDiagnostics(continuityProofDiagnostics),
       };
   };
+  const endLockWait = beginConnectedServiceAuthStage(stageContext, 'session_lock_wait');
 	  const result = await runSerializedConnectedServiceTransition({
 	    core: input.core,
 	    transitionLockMode: input.transitionLockMode,
     sessionId: input.request.sessionId,
     reason: input.switchReason ?? 'manual',
-    execute,
-  });
+    execute: async () => {
+      endLockWait();
+      return await execute();
+    },
+  }).finally(endLockWait);
   if (!input.dryRun) {
     emitConnectedServiceSwitchAttemptEvent({
       emitSessionEvent: input.emitSessionEvent,
