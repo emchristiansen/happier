@@ -120,7 +120,7 @@ describe('happier session list (integration)', () => {
                 agentState: null,
                 agentStateVersion: 0,
                 pendingCount: 0,
-                pendingVersion: 0,
+                pendingVersion: 7,
                 dataEncryptionKey: dataEncryptionKeyBase64,
                 share: null,
               },
@@ -151,7 +151,6 @@ describe('happier session list (integration)', () => {
                 agentState: null,
                 agentStateVersion: 0,
                 pendingCount: 0,
-                pendingVersion: 0,
                 dataEncryptionKey: dataEncryptionKeyBase64,
                 share: null,
               },
@@ -224,6 +223,7 @@ describe('happier session list (integration)', () => {
       expect(parsed.ok).toBe(true);
       expect(parsed.kind).toBe('session_list');
       expect(parsed.data?.sessions?.[0]?.id).toBe('sess_integration_list_123');
+      expect(parsed.data?.sessions?.[0]).toMatchObject({ seq: 1, pendingVersion: 0 });
       expect(parsed.data?.sessions?.[0]?.tag).toBe('MyTag');
       expect(parsed.data?.sessions?.[0]?.title).toBe('My Title');
       expect(parsed.data?.sessions?.[0]?.host).toBe('host1');
@@ -255,6 +255,8 @@ describe('happier session list (integration)', () => {
       expect(parsed.ok).toBe(true);
       expect(parsed.kind).toBe('session_list');
       expect(parsed.data?.sessions?.[0]?.id).toBe(archivedSessionId);
+      expect(parsed.data?.sessions?.[0]?.seq).toBe(3);
+      expect(parsed.data?.sessions?.[0]).not.toHaveProperty('pendingVersion');
       expect(parsed.data?.sessions?.[0]?.tag).toBe('ArchivedTag');
       expect(parsed.data?.sessions?.[0]?.title).toBe('Archived Title');
     } finally {
@@ -361,6 +363,8 @@ describe('happier session list (integration)', () => {
       const systemSession = parsed.data?.sessions?.find((session: any) => session.id === systemSessionId);
       expect(systemSession).toMatchObject({
         id: systemSessionId,
+        seq: 2,
+        pendingVersion: 7,
         isSystem: true,
         systemPurpose: 'voice_carrier',
       });
