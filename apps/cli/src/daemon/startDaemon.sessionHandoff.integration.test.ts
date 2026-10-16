@@ -354,7 +354,9 @@ vi.mock('./connectedServices/shouldResolveConnectedServiceAuthForSpawn', () => (
 }));
 
 vi.mock('./connectedServices/refresh/ConnectedServiceRefreshCoordinator', () => ({
-    ConnectedServiceRefreshCoordinator: vi.fn(),
+    ConnectedServiceRefreshCoordinator: vi.fn(() => ({
+        observeTargetRegistrations: vi.fn(() => vi.fn()),
+    })),
 }));
 
 vi.mock('./connectedServices/refresh/createConnectedServicesAuthUpdatedRestartHandler', () => ({
