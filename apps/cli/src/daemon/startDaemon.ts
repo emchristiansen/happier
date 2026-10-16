@@ -557,11 +557,9 @@ function readConnectedServiceAccessTokenRefreshCapabilityFromMetadata(
       ? { mode: 'daemon_callback', serviceIds }
       : null;
   }
-  const capability = record?.claudeSubscriptionAccessTokenRefreshV1;
-  if (!capability || typeof capability !== 'object' || Array.isArray(capability)) return null;
-  return (capability as Readonly<{ mode?: unknown }>).mode === 'daemon_callback'
-    ? { mode: 'daemon_callback', serviceIds: ['claude-subscription'] }
-    : null;
+  // Older Claude launchers inferred callback support from runner selection. The
+  // ordinary Agent SDK runtime does not establish that capability; clear it.
+  return null;
 }
 
 export function registerConnectedServiceTrackedSessionTargetsForDaemon(input: Readonly<{

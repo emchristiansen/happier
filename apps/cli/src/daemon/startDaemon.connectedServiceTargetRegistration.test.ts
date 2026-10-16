@@ -53,7 +53,7 @@ describe('registerConnectedServiceTrackedSessionTargetsForDaemon', () => {
     };
   }
 
-  it('keeps Claude connected-service sessions restart-capable until the Agent SDK callback is reported active', () => {
+  it('does not infer a Claude refresh callback from connected-service registration', () => {
     const runtimeRegistry = new ConnectedServiceRuntimeRegistry();
 
     registerConnectedServiceTrackedSessionTargetsForDaemon({
@@ -64,23 +64,27 @@ describe('registerConnectedServiceTrackedSessionTargetsForDaemon', () => {
     expect(runtimeRegistry.getByPid(6610)?.accessTokenRefresh).toBeNull();
   });
 
-  it('marks Claude connected-service sessions callback-capable after the Agent SDK runtime reports the OAuth callback', () => {
+  it('rejects an older Claude launcher callback claim and clears prior registry capability', () => {
     const runtimeRegistry = new ConnectedServiceRuntimeRegistry();
 
+    const tracked = createClaudeTrackedSession({
+      claudeSubscriptionAccessTokenRefreshV1: { v: 1, mode: 'daemon_callback' },
+    });
     registerConnectedServiceTrackedSessionTargetsForDaemon({
-      tracked: createClaudeTrackedSession({
-        claudeSubscriptionAccessTokenRefreshV1: {
-          v: 1,
-          mode: 'daemon_callback',
-        },
-      }),
+      tracked,
       runtimeRegistry,
     });
+    expect(runtimeRegistry.getByPid(6610)?.accessTokenRefresh).toBeNull();
 
-    expect(runtimeRegistry.getByPid(6610)?.accessTokenRefresh).toEqual({
+    // A daemon upgraded with existing registry knowledge must replace it, too.
+    const target = runtimeRegistry.getByPid(6610);
+    if (!target) throw new Error('Expected registered Claude target');
+    runtimeRegistry.registerTarget({ ...target, accessTokenRefresh: {
       mode: 'daemon_callback',
       serviceIds: ['claude-subscription'],
-    });
+    } });
+    registerConnectedServiceTrackedSessionTargetsForDaemon({ tracked, runtimeRegistry });
+    expect(runtimeRegistry.getByPid(6610)?.accessTokenRefresh).toBeNull();
   });
 
   it('clears Claude callback capability when the runtime reports the legacy fallback', () => {
