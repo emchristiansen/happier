@@ -2,6 +2,7 @@ import type { CatalogAgentId } from '@/backends/types';
 import type { TrackedSession } from '@/daemon/types';
 import type { ConnectedServiceCredentialLifecycleDescriptor } from '@/daemon/connectedServices/credentials/lifecycleTypes';
 import { readConnectedServiceChildSelectionsFromEnv } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
+import { observeConnectedServiceAuthStage } from '../runtimeAuth/observeConnectedServiceAuthStage';
 import type { ConnectedServiceId, StopSessionResult } from '@happier-dev/protocol';
 import type {
   ConnectedServiceDaemonRestartDiagnosticInput,
@@ -193,7 +194,10 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
         );
       }
       if (params.restartEnabled === false) continue;
-      const descriptor = await params.resolveLifecycleDescriptor(target.agentId);
+      const descriptor = await observeConnectedServiceAuthStage({
+        sessionId: tracked?.happySessionId ?? null,
+        bindings: [event.binding],
+      }, 'descriptor_lookup', () => params.resolveLifecycleDescriptor(target.agentId));
       if (!(descriptor.serviceIds as readonly string[]).includes(event.binding.serviceId)) continue;
       const refreshedCredentialApplication = descriptor.refreshedCredentialApplication;
       if (refreshedCredentialApplication.mode !== 'restart_required') continue;

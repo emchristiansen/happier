@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { ConnectedServiceId } from '@happier-dev/protocol';
 import type { CatalogAgentId } from '@/backends/types';
@@ -6,6 +6,8 @@ import { agent as openCodeAgent } from '@/backends/opencode';
 import { agent as piAgent } from '@/backends/pi';
 import type { ConnectedServiceCredentialLifecycleDescriptor } from '@/daemon/connectedServices/credentials/lifecycleTypes';
 import type { TrackedSession } from '@/daemon/types';
+import { logger } from '@/ui/logger';
+import { createDeferred } from '@/testkit/async/deferred';
 import { createConnectedServicesAuthUpdatedRestartHandler } from './createConnectedServicesAuthUpdatedRestartHandler';
 
 const directLiveExternalTokenInjectionCapability = {
@@ -17,10 +19,46 @@ const directLiveExternalTokenInjectionCapability = {
     surface: 'codex_chatgpt_auth_tokens',
   },
 } as const;
+afterEach(() => vi.restoreAllMocks());
 
 describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
   type RestartHandlerParams = Parameters<typeof createConnectedServicesAuthUpdatedRestartHandler>[0];
   type RestartSignalParams = Parameters<RestartHandlerParams['requestRestartSignal']>[0];
+
+  it.each([false, true])('logs descriptor lookup completion without changing rejection (reject: %s)', async (reject) => {
+    const log = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
+    const descriptor = createDeferred<ConnectedServiceCredentialLifecycleDescriptor>();
+    const entered = createDeferred<void>();
+    const failure = new Error('descriptor boundary failure');
+    const handler = createConnectedServicesAuthUpdatedRestartHandler({
+      restartRequestedPids: new Set(),
+      pidToTrackedSession: new Map([[1, createTrackedSession({ pid: 1, sessionId: 's1' })]]),
+      resolveLifecycleDescriptor: () => { entered.resolve(); return descriptor.promise; },
+      resolveProcessGroupPid: (tracked) => tracked.pid,
+      requestRestartSignal: async () => ({ signaled: true }),
+      restartSignalDelayMs: 0,
+    } satisfies RestartHandlerParams);
+    const result = handler({
+      binding: { serviceId: 'claude-subscription', profileId: 'work', groupId: 'team' },
+      affectedTargets: [{ pid: 1, agentId: 'claude' }],
+    });
+    const outcome = result.then(() => null, (error: unknown) => error);
+    await entered.promise;
+    const context = { sessionId: 's1', bindings: [{ serviceId: 'claude-subscription', profileId: 'work', groupId: 'team' }] };
+    const records = () => log.mock.calls.filter(([message]) => message === '[DAEMON RUN] Connected-service auth stage').map(([, record]) => record);
+    try {
+      expect(records()).toEqual([{ ...context, stage: 'descriptor_lookup', phase: 'begin' }]);
+    } finally {
+      if (reject) descriptor.reject(failure);
+      else descriptor.resolve(createLifecycleDescriptor('claude', 'no_restart_required'));
+      await outcome;
+    }
+    expect(await outcome).toBe(reject ? failure : null);
+    expect(records()).toEqual([
+      { ...context, stage: 'descriptor_lookup', phase: 'begin' },
+      { ...context, stage: 'descriptor_lookup', phase: 'end' },
+    ]);
+  });
 
   function createTrackedSession(input: Readonly<{
     pid: number;
