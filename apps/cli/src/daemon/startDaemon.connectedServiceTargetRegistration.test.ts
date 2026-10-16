@@ -112,6 +112,59 @@ describe('registerConnectedServiceTrackedSessionTargetsForDaemon', () => {
     expect(runtimeRegistry.getByPid(6610)?.accessTokenRefresh).toBeNull();
   });
 
+  it('retains a null-capability target without requesting duplicate reconciliation, but advances a real Codex capability change', () => {
+    const runtimeRegistry = new ConnectedServiceRuntimeRegistry();
+    const reconcileClaudeTarget = vi.fn();
+    const initial = registerConnectedServiceTrackedSessionTargetsForDaemon({
+      tracked: createClaudeTrackedSession(),
+      runtimeRegistry,
+      onRegisteredTarget: reconcileClaudeTarget,
+    });
+    if (!initial) throw new Error('Expected registered Claude target');
+    expect(initial.accessTokenRefresh).toBeNull();
+    expect(reconcileClaudeTarget).toHaveBeenCalledExactlyOnceWith(initial);
+
+    const unavailable = registerConnectedServiceTrackedSessionTargetsForDaemon({
+      tracked: createClaudeTrackedSession({
+        claudeSubscriptionAccessTokenRefreshV1: { v: 1, mode: 'unavailable' },
+      }),
+      runtimeRegistry,
+      onRegisteredTarget: reconcileClaudeTarget,
+    });
+    expect(unavailable).toBe(initial);
+    expect(unavailable?.revision).toBe(initial.revision);
+    expect(runtimeRegistry.isCurrentTargetRegistration({ key: { kind: 'session', pid: 6610 }, target: initial })).toBe(true);
+    expect(reconcileClaudeTarget).toHaveBeenCalledTimes(1);
+
+    const codex = createClaudeTrackedSession({ flavor: 'codex' });
+    codex.pid = 6611;
+    codex.happySessionId = 'sess-codex-refresh-capability';
+    codex.spawnOptions = {
+      ...codex.spawnOptions,
+      directory: '/workspace/codex',
+      backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+      connectedServices: { v: 1, bindingsByServiceId: {
+        'openai-codex': { source: 'connected', selection: 'profile', profileId: 'codex-primary' },
+      } },
+      environmentVariables: { [HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY]: JSON.stringify([
+        { kind: 'profile', serviceId: 'openai-codex', profileId: 'codex-primary' },
+      ]) },
+    };
+    const reconcileCodexTarget = vi.fn();
+    const before = registerConnectedServiceTrackedSessionTargetsForDaemon({ tracked: codex, runtimeRegistry, onRegisteredTarget: reconcileCodexTarget });
+    if (!before) throw new Error('Expected registered Codex target');
+    codex.happySessionMetadataFromLocalWebhook = {
+      ...codex.happySessionMetadataFromLocalWebhook!,
+      connectedServiceAccessTokenRefreshV1: { v: 1, mode: 'daemon_callback', serviceIds: ['openai-codex'] },
+    };
+    const after = registerConnectedServiceTrackedSessionTargetsForDaemon({ tracked: codex, runtimeRegistry, onRegisteredTarget: reconcileCodexTarget });
+    expect(after).not.toBe(before);
+    expect(after?.revision).toBe(before.revision + 1);
+    expect(after?.accessTokenRefresh).toEqual({ mode: 'daemon_callback', serviceIds: ['openai-codex'] });
+    expect(reconcileCodexTarget).toHaveBeenCalledTimes(2);
+    expect(runtimeRegistry.isCurrentTargetRegistration({ key: { kind: 'session', pid: 6611 }, target: before })).toBe(false);
+  });
+
   it('registers and replaces a provider-reported Codex app-server refresh callback capability', () => {
     const runtimeRegistry = new ConnectedServiceRuntimeRegistry();
     const tracked = createClaudeTrackedSession({
