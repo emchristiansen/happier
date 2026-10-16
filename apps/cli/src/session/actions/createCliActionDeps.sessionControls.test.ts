@@ -8,6 +8,7 @@ import {
 import { RPC_METHODS, SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
 
 const mocks = vi.hoisted(() => ({
+  axiosPost: vi.fn(async (_url: string, _body: unknown): Promise<unknown> => ({ data: { didWrite: true } })),
   axiosGet: vi.fn(async (): Promise<unknown> => ({ status: 200, data: { id: 'acct_1', connectedServicesV2: [] } })),
   bootstrapAccountSettingsContext: vi.fn(async (): Promise<unknown> => ({ settings: {}, settingsVersion: 1, loadedAtMs: 1 })),
   callSessionRpc: vi.fn(async () => ({ ok: true })),
@@ -50,11 +51,11 @@ const mocks = vi.hoisted(() => ({
     },
     mode: 'plain' as const,
   })),
-  sendSessionMessage: vi.fn(async () => ({ ok: true as const })),
+  sendSessionMessage: vi.fn(async (_params: Parameters<typeof import('@/session/services/sendSessionMessage').sendSessionMessage>[0]): Promise<unknown> => ({ ok: true })),
 }));
 
 vi.mock('axios', () => ({
-  default: { get: mocks.axiosGet },
+  default: { get: mocks.axiosGet, post: mocks.axiosPost },
   get: mocks.axiosGet,
 }));
 vi.mock('@/backends/catalog', async (importOriginal) => ({
@@ -114,6 +115,8 @@ function parseUsageLimitResult(value: unknown) {
 
 describe('createCliActionDeps session controls', () => {
   beforeEach(() => {
+    mocks.axiosPost.mockReset();
+    mocks.axiosPost.mockResolvedValue({ data: { didWrite: true } });
     mocks.axiosGet.mockReset();
     mocks.axiosGet.mockResolvedValue({ status: 200, data: { id: 'acct_1', connectedServicesV2: [] } });
     mocks.bootstrapAccountSettingsContext.mockReset();
@@ -854,6 +857,32 @@ describe('createCliActionDeps session controls', () => {
       error: 'invalid_parameters',
     });
     expect(mocks.sendSessionMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(['resume_failed', 'pre_admission_timeout'] as const)('keeps custody in action errors only after admission: %s', async (outcome) => {
+    const { sendSessionMessage } = await vi.importActual<typeof import('@/session/services/sendSessionMessage')>('@/session/services/sendSessionMessage');
+    mocks.sendSessionMessage.mockImplementationOnce(sendSessionMessage);
+    mocks.resolveSessionTransportContext.mockResolvedValue({
+      ok: true, sessionId: 'sess_1', mode: 'plain',
+      ctx: { encryptionKey: new Uint8Array(32).fill(1), encryptionVariant: 'legacy' },
+      rawSession: {
+        id: 'sess_1', active: false, encryptionMode: 'plain', path: '/repo', machineId: 'machine-session',
+        metadata: JSON.stringify({ flavor: 'claude', claudeSessionId: 'native-thread', path: '/repo', machineId: 'machine-session' }),
+      },
+    });
+    mocks.callMachineRpc.mockResolvedValue({ type: 'error', errorMessage: 'Resume rejected' });
+    if (outcome === 'pre_admission_timeout') mocks.axiosPost.mockRejectedValueOnce(new Error('Pending acknowledgement timed out'));
+    const deps = createCliActionDeps({ token: 'token', credentials: createCredentials(), sessionId: 'sess_1',
+      ctx: { encryptionKey: new Uint8Array(32).fill(1), encryptionVariant: 'legacy' }, mode: 'plain', rawSession: { metadata: {} } });
+    const result = await deps.sessionSendMessage({ sessionId: 'sess_1', message: 'hello', requestedAction: { v: 1, kind: 'steer_if_active' } });
+    if (outcome === 'pre_admission_timeout') {
+      expect(result).toEqual({ ok: false, errorCode: 'timeout', error: 'timeout', message: 'Pending acknowledgement timed out' });
+      expect(mocks.callMachineRpc).not.toHaveBeenCalled();
+    } else {
+      const body = mocks.axiosPost.mock.calls[0]?.[1] as { localId: string };
+      expect(result).toEqual({ ok: false, errorCode: 'resume_failed', error: 'resume_failed', message: 'Resume rejected',
+        details: { pendingCustody: 'confirmed', sessionId: 'sess_1', localId: body.localId } });
+    }
   });
 
   it('preserves exact nonblank opaque model override bytes through the CLI service adapter', async () => {

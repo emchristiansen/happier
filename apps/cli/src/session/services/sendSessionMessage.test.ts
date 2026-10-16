@@ -10,6 +10,8 @@ describe('sendSessionMessage', () => {
 
     afterEach(() => {
         vi.doUnmock('@/api/session/pendingQueueV2Transport');
+        vi.doUnmock('axios');
+        vi.doUnmock('@/session/transport/rpc/machineRpc');
         vi.resetModules();
         vi.clearAllMocks();
     });
@@ -1243,54 +1245,53 @@ describe('sendSessionMessage', () => {
         expect(requestInactiveSessionResume).not.toHaveBeenCalled();
     });
 
-    it('retains inactive custody and reports resume failure without an alternate wake or transcript commit', async () => {
-        const enqueuePendingQueueV2MessageViaHttp = vi.fn(async () => undefined);
-        const callSessionRpc = vi.fn(async (params: { request: { selector: { localId: string } } }) => ({ ok: true, result: 'dispatch_issued', localId: params.request.selector.localId }));
-        const requestInactiveSessionResume = vi.fn(async () => ({
-            ok: false as const,
-            code: 'timeout' as const,
-            message: 'Machine resume acknowledgement timed out',
-        }));
-
-        vi.doMock('@/api/session/pendingQueueV2Transport', () => ({ enqueuePendingQueueV2MessageViaHttp }));
-        vi.doMock('@/session/transport/rpc/sessionRpc', () => ({ callSessionRpc }));
-        vi.doMock('./requestInactiveSessionResume', () => ({ requestInactiveSessionResume }));
-        vi.doMock('./resolveSessionTransportContext', () => ({
-            resolveSessionTransportContext: vi.fn(async () => ({
-                ok: true,
-                sessionId: 'sess-1',
-                mode: 'plain',
-                ctx: { encryptionKey: new Uint8Array(32).fill(1), encryptionVariant: 'dataKey' },
-                rawSession: {
-                    id: 'sess-1',
-                    active: false,
-                    encryptionMode: 'plain',
-                    path: '/repo',
-                    machineId: 'machine-session',
-                    metadata: JSON.stringify({ agentId: 'claude', path: '/repo', machineId: 'machine-session' }),
-                },
-            })),
-        }));
-
-        const { sendSessionMessage } = await import('./sendSessionMessage');
-        const machineKey = new Uint8Array(32).fill(1);
-        await expect(sendSessionMessage({
-            credentials: { token: 'token', encryption: { type: 'dataKey', publicKey: machineKey, machineKey } },
-            idOrPrefix: 'sess-1',
-            message: 'continue',
-            localId: 'local-timeout',
-            wait: false,
-            timeoutMs: 1,
-        })).resolves.toEqual({
-            ok: false,
-            code: 'timeout',
-            message: 'Machine resume acknowledgement timed out',
-        });
-
-        expect(enqueuePendingQueueV2MessageViaHttp).toHaveBeenCalledTimes(1);
-        expect(requestInactiveSessionResume).toHaveBeenCalledTimes(1);
-        expect(callSessionRpc).not.toHaveBeenCalled();
-    });
+    it.each(['resume_failed', 'timeout', 'unsupported', 'pre_admission_timeout'] as const)(
+        'reports exact pending custody only after admission: %s', async (outcome) => {
+            vi.doUnmock('@/api/session/pendingQueueV2Transport');
+            vi.doUnmock('./requestInactiveSessionResume');
+            const post = vi.fn(async () => {
+                if (outcome === 'pre_admission_timeout') throw new Error('Pending acknowledgement timed out');
+                return { data: { didWrite: true } };
+            });
+            const callMachineRpc = vi.fn(async () => {
+                if (outcome === 'timeout') throw Object.assign(new Error('Machine acknowledgement timed out'), { code: 'MACHINE_RPC_TIMEOUT' });
+                return outcome === 'unsupported'
+                    ? { type: 'success', sessionId: 'different-session' }
+                    : { type: 'error', errorMessage: 'Resume rejected' };
+            });
+            vi.doMock('axios', () => ({ default: { post } }));
+            vi.doMock('@/session/transport/rpc/machineRpc', () => ({ callMachineRpc }));
+            vi.doMock('./resolveSessionTransportContext', () => ({
+                resolveSessionTransportContext: vi.fn(async () => ({
+                    ok: true,
+                    sessionId: 'sess-1',
+                    mode: 'plain',
+                    ctx: { encryptionKey: new Uint8Array(32).fill(1), encryptionVariant: 'dataKey' },
+                    rawSession: {
+                        id: 'sess-1', active: false, encryptionMode: 'plain', path: '/repo', machineId: 'machine-session',
+                        metadata: JSON.stringify({ flavor: 'claude', claudeSessionId: 'native-thread', path: '/repo', machineId: 'machine-session' }),
+                    },
+                })),
+            }));
+            const { sendSessionMessage } = await import('./sendSessionMessage');
+            const machineKey = new Uint8Array(32).fill(1);
+            const result = await sendSessionMessage({
+                credentials: { token: 'token', encryption: { type: 'dataKey', publicKey: machineKey, machineKey } },
+                idOrPrefix: 'sess-1', message: 'continue', localId: 'exact-local-id', wait: false, timeoutMs: 1,
+            });
+            if (outcome === 'pre_admission_timeout') {
+                expect(result).toEqual({ ok: false, code: 'timeout', message: 'Pending acknowledgement timed out' });
+                expect(callMachineRpc).not.toHaveBeenCalled();
+            } else {
+                expect(result).toEqual(expect.objectContaining({
+                    ok: false, code: outcome, pendingCustody: 'confirmed', sessionId: 'sess-1', localId: 'exact-local-id',
+                }));
+                expect(callMachineRpc).toHaveBeenCalledOnce();
+            }
+            expect(post).toHaveBeenCalledWith(expect.stringContaining('/sessions/sess-1/pending'),
+                expect.objectContaining({ localId: 'exact-local-id' }), expect.anything());
+        },
+    );
 
     it('retains pending custody without transcript fallback when the canonical wake is unavailable', async () => {
         const sendSessionMessageViaSocketCommitted = vi.fn(async () => undefined);

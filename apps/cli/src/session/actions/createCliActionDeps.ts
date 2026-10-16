@@ -1659,6 +1659,9 @@ export function createCliActionDeps(params: Readonly<{
           error: res.code,
           ...(res.candidates ? { candidates: res.candidates } : {}),
           ...(res.message ? { message: res.message } : {}),
+          ...(res.pendingCustody === 'confirmed' ? {
+            details: { pendingCustody: res.pendingCustody, sessionId: res.sessionId, localId: res.localId },
+          } : {}),
         };
       }
       return res;
