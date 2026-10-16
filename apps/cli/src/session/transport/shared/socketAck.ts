@@ -18,7 +18,7 @@ type EmitCallbackAckSocket = {
     emit: (event: string, payload: unknown, callback: (answer: unknown) => void) => unknown;
 };
 
-function createSocketAckError(params: Readonly<{
+export function createSocketAckError(params: Readonly<{
     code: SocketAckError['code'];
     event: string;
     message: string;

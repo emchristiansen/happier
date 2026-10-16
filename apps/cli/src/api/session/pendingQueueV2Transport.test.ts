@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import axios from 'axios';
+import { Manager } from 'socket.io-client';
 import { serializeOutboundError } from './outboundErrorSerialization';
 
 import {
@@ -1444,6 +1445,63 @@ describe('pendingQueueV2Transport', () => {
             sessionId: 'session-1',
             localId: 'accepted-local',
         })).rejects.toThrow('Invalid pending delivery accepted settlement acknowledgement');
+        expect(mockPost).not.toHaveBeenCalled();
+    });
+
+    it('normalizes the real Socket.IO accepted-settlement ACK timeout without a second transport', async () => {
+        vi.useFakeTimers();
+        vi.stubEnv('HAPPIER_SESSION_SOCKET_ACK_TIMEOUT_MS', '100');
+        // Keep Socket.IO's real ACK/timer machinery; replace only its outbound network boundary.
+        const manager = new Manager('http://127.0.0.1', { autoConnect: false, reconnection: false });
+        const socket = manager.socket('/');
+        const packetWrite = vi.spyOn(manager, '_packet').mockImplementation(() => {});
+        socket.connected = true;
+        try {
+            const outcome = resolveAcceptedPendingQueueV2Delivery({
+                socket,
+                sessionId: 'session-1',
+                localId: 'accepted-local',
+            }).then(
+                (value) => ({ status: 'resolved' as const, value }),
+                (error: unknown) => ({ status: 'rejected' as const, error }),
+            );
+            expect(packetWrite).toHaveBeenCalledWith(expect.objectContaining({
+                data: ['pending-delivery-accepted-v1', { v: 1, sessionId: 'session-1', localId: 'accepted-local' }],
+            }));
+            await vi.advanceTimersByTimeAsync(100);
+            expect(await outcome).toMatchObject({
+                status: 'rejected',
+                error: {
+                    code: 'socket_ack_timeout',
+                    event: 'pending-delivery-accepted-v1',
+                    retryable: true,
+                    timeoutMs: 100,
+                },
+            });
+            expect(mockPost).not.toHaveBeenCalled();
+        } finally {
+            socket.disconnect();
+            packetWrite.mockRestore();
+            vi.unstubAllEnvs();
+            vi.useRealTimers();
+        }
+    });
+
+    it('preserves unrelated accepted-settlement transport failures without making them retryable', async () => {
+        const failure = new Error('publisher rejected the request');
+        // Only the external socket boundary rejects; the accepted-settlement adapter remains real.
+        const socket = {
+            connected: true,
+            emitWithAck: vi.fn().mockRejectedValue(failure),
+            timeout: vi.fn().mockReturnThis(),
+        } as unknown as Parameters<typeof resolveAcceptedPendingQueueV2Delivery>[0]['socket'];
+
+        await expect(resolveAcceptedPendingQueueV2Delivery({
+            socket,
+            sessionId: 'session-1',
+            localId: 'accepted-local',
+        })).rejects.toBe(failure);
+        expect(failure).not.toHaveProperty('retryable');
         expect(mockPost).not.toHaveBeenCalled();
     });
 
