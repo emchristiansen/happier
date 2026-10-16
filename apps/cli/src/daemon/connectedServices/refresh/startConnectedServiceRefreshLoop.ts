@@ -1,4 +1,5 @@
 import { startSingleFlightIntervalLoop, type SingleFlightIntervalLoopHandle } from '@/daemon/lifecycle/singleFlightIntervalLoop';
+import { logger } from '@/ui/logger';
 
 type ConnectedServiceRefreshLoopHandle = Readonly<{
     stop: () => void;
@@ -24,6 +25,10 @@ export function startConnectedServiceRefreshLoop(params: Readonly<{
             await params.coordinator.tickOnce();
         },
         onError: params.onTickError,
+        onObservation: (observation) => {
+            // The loop isolates sink failures from scheduling and authentication.
+            logger.infoFile('[ConnectedServiceRefresh] Loop', observation);
+        },
         unref: true,
     });
 

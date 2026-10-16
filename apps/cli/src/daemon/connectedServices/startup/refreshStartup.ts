@@ -1,6 +1,9 @@
 import type { ApiClient } from '@/api/api';
 import type { Credentials } from '@/persistence';
 import type { AccountSettings } from '@happier-dev/protocol';
+import packageJson from '../../../../package.json';
+import { logger } from '@/ui/logger';
+import { buildDoctorRuntimeDiagnostics } from '@/ui/doctorRuntimeDiagnostics';
 import {
   ConnectedServiceRefreshCoordinator,
 } from '../refresh/ConnectedServiceRefreshCoordinator';
@@ -38,7 +41,25 @@ export function startConnectedServiceRefreshStartup(input: Readonly<{
     input.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED,
     true,
   );
+  const logStartup = (settings: Readonly<Record<string, number>>) => {
+    try {
+      const runtime = buildDoctorRuntimeDiagnostics();
+      logger.infoFile('[ConnectedServiceRefresh] Startup', {
+        event: 'startup', enabled: connectedServicesRefreshEnabled,
+        cliVersion: packageJson.version, executablePath: process.execPath,
+        entrypoint: process.argv[1] ?? null,
+        runtimeName: runtime.runtime, runtimeVersion: runtime.runtimeVersion,
+        nodeCompatibilityVersion: runtime.nodeCompatibilityVersion, isEmbeddedBundle: runtime.isEmbeddedBundle,
+        platform: process.platform, arch: process.arch,
+        pid: process.pid, runtimeId: input.runtimeId,
+        ...settings,
+      });
+    } catch {
+      // Provenance is observational; an unavailable log sink cannot disable refresh.
+    }
+  };
   if (!connectedServicesRefreshEnabled) {
+    logStartup({});
     return { coordinator: null, loopHandle: null };
   }
 
@@ -62,6 +83,10 @@ export function startConnectedServiceRefreshStartup(input: Readonly<{
     5_000,
     { min: 0, max: 30_000 },
   );
+  logStartup({
+    tickMs: refreshTickMs, refreshWindowMs, refreshLeaseMs,
+    leaseContentionWaitMaxMs: refreshLeaseContentionWaitMaxMs,
+  });
 
   const coordinator = new ConnectedServiceRefreshCoordinator({
     api: input.api,
@@ -80,7 +105,13 @@ export function startConnectedServiceRefreshStartup(input: Readonly<{
     ...(input.onAuthUpdated ? { onAuthUpdated: input.onAuthUpdated } : {}),
     onCredentialHealthNotification: input.onCredentialHealthNotification,
   });
-  input.registerCurrentTargets();
+  const stopObservingRegistrations = coordinator.observeTargetRegistrations();
+  try {
+    input.registerCurrentTargets();
+  } catch (error) {
+    stopObservingRegistrations();
+    throw error;
+  }
 
   const loopHandle = startConnectedServiceRefreshLoop({
     enabled: true,
@@ -89,5 +120,14 @@ export function startConnectedServiceRefreshStartup(input: Readonly<{
     onTickError: input.onTickError,
   });
 
-  return { coordinator, loopHandle };
+  return {
+    coordinator,
+    loopHandle: loopHandle ? {
+      ...loopHandle,
+      stop: () => {
+        stopObservingRegistrations();
+        loopHandle.stop();
+      },
+    } : null,
+  };
 }

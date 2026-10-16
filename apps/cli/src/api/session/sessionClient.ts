@@ -1596,8 +1596,10 @@ export class ApiSessionClient extends EventEmitter {
     ): Promise<void> {
         if (this.acceptedCanonicalPendingDeliveryResolutionLocalIdsInFlight.has(localId)) return;
         this.acceptedCanonicalPendingDeliveryResolutionLocalIdsInFlight.add(localId);
+        let attempt = 0;
+        let previousRetryDelayMs = 0;
         try {
-            for (let attempt = 0; attempt < 2; attempt += 1) {
+            while (true) {
                 if (
                     !this.isAcceptedCanonicalPendingDeliveryOperationCurrent(authority)
                     || !this.canonicalPendingDeliveryByLocalId.has(localId)
@@ -1605,65 +1607,83 @@ export class ApiSessionClient extends EventEmitter {
                 ) {
                     return;
                 }
-            try {
-                const result = await resolveAcceptedPendingQueueV2Delivery({
-                    socket: authority.socket,
-                    sessionId: this.sessionId,
-                    localId,
-                });
-                if (!this.isAcceptedCanonicalPendingDeliveryOperationCurrent(authority)) return;
-                if (!this.canonicalPendingDeliveryByLocalId.has(localId)) continue;
-                if (result.pendingQueueState) {
-                    this.applyPendingQueueState(result.pendingQueueState, { emit: true });
-                } else if (!this.closed) {
-                    this.pendingWakeSeq += 1;
-                    this.emit('metadata-updated');
-                    this.emitPendingEligibilityUpdated();
-                }
-                const hasExactCommittedReplay = result.didResolve === false
-                    && result.message?.localId === localId
-                    && typeof result.message.seq === 'number';
-                if (result.didResolve !== true && !hasExactCommittedReplay) {
-                    // A live no-op cannot prove that this exact accepted row committed. Keep its
-                    // claim visible for reconciliation; unrelated wakes must not become retry authority.
+                try {
+                    attempt += 1;
+                    const result = await resolveAcceptedPendingQueueV2Delivery({
+                        socket: authority.socket,
+                        sessionId: this.sessionId,
+                        localId,
+                    });
+                    if (!this.isAcceptedCanonicalPendingDeliveryOperationCurrent(authority)) return;
+                    if (!this.canonicalPendingDeliveryByLocalId.has(localId)) continue;
+                    if (result.pendingQueueState) {
+                        this.applyPendingQueueState(result.pendingQueueState, { emit: true });
+                    } else if (!this.closed) {
+                        this.pendingWakeSeq += 1;
+                        this.emit('metadata-updated');
+                        this.emitPendingEligibilityUpdated();
+                    }
+                    const hasExactCommittedReplay = result.didResolve === false
+                        && result.message?.localId === localId
+                        && typeof result.message.seq === 'number';
+                    if (result.didResolve !== true && !hasExactCommittedReplay) {
+                        // A live no-op cannot prove that this exact accepted row committed. Keep its
+                        // claim visible for reconciliation; unrelated wakes must not become retry authority.
+                        return;
+                    }
+                    // This mutation targets one exact localId. A successful server settlement is the
+                    // authoritative sequence result; the provider callback sequence was only a hint
+                    // available before the durable mutation completed.
+                    const resolvedSeq = typeof result.message?.seq === 'number' ? result.message.seq : null;
+                    this.acceptedProviderInputLocalIds.add(localId);
+                    this.clearCanonicalPendingDeliveryLocalState(localId);
+                    this.recordCommittedUserMessageSeq(localId, resolvedSeq);
                     return;
-                }
-                // This mutation targets one exact localId. A successful server settlement is the
-                // authoritative sequence result; the provider callback sequence was only a hint
-                // available before the durable mutation completed.
-                const resolvedSeq = typeof result.message?.seq === 'number' ? result.message.seq : null;
-                this.acceptedProviderInputLocalIds.add(localId);
-                this.clearCanonicalPendingDeliveryLocalState(localId);
-                this.recordCommittedUserMessageSeq(localId, resolvedSeq);
-                return;
-            } catch (error) {
-                logger.debug('[pendingQueue] accepted provider delivery resolution failed', {
-                    sessionId: this.sessionId,
-                    localId,
-                    error: serializeAcceptedPendingSettlementErrorForLog(error),
-                });
-                if (!this.isAcceptedCanonicalPendingDeliveryOperationCurrent(authority)) return;
-                if (await this.retireStaleCanonicalPendingDeliveryAfterTerminalMiss(localId, 'accepted', error)) return;
-                if (this.canonicalPendingDeliveryByLocalId.has(localId)) {
-                    const retryDirective = readAcceptedPendingQueueV2DeliveryRetryDirective(error);
-                    const isResponseLoss = Boolean(
-                        error
-                        && typeof error === 'object'
-                        && 'code' in error
-                        && (error as { code?: unknown }).code === 'socket_ack_timeout'
-                        && 'retryable' in error
-                        && (error as { retryable?: unknown }).retryable === true,
-                    );
-                    if ((!retryDirective && !isResponseLoss) || attempt > 0) return;
-                    const retryAfterMs = retryDirective
-                        ? Math.min(60_000, Math.max(250, retryDirective.retryAfterMs))
-                        : 1_000;
-                    await delayUnrefAbortable(retryAfterMs, authority.abortSignal);
-                } else {
-                    return;
+                } catch (error) {
+                    logger.debug('[pendingQueue] accepted provider delivery resolution failed', {
+                        sessionId: this.sessionId,
+                        localId,
+                        error: serializeAcceptedPendingSettlementErrorForLog(error),
+                    });
+                    if (!this.isAcceptedCanonicalPendingDeliveryOperationCurrent(authority)) return;
+                    if (await this.retireStaleCanonicalPendingDeliveryAfterTerminalMiss(localId, 'accepted', error)) return;
+                    if (!this.isAcceptedCanonicalPendingDeliveryOperationCurrent(authority)) return;
+                    if (this.canonicalPendingDeliveryByLocalId.has(localId)) {
+                        const retryDirective = readAcceptedPendingQueueV2DeliveryRetryDirective(error);
+                        const isResponseLoss = Boolean(
+                            error
+                            && typeof error === 'object'
+                            && 'code' in error
+                            && (error as { code?: unknown }).code === 'socket_ack_timeout'
+                            && 'retryable' in error
+                            && (error as { retryable?: unknown }).retryable === true,
+                        );
+                        const retryAfterMs = retryDirective || isResponseLoss
+                            ? Math.min(60_000, Math.max(
+                                retryDirective ? Math.max(250, retryDirective.retryAfterMs) : 1_000,
+                                previousRetryDelayMs * 2,
+                            ))
+                            : null;
+                        try {
+                            logger.warn('[pendingQueue] accepted provider settlement remains unresolved', {
+                                sessionId: this.sessionId,
+                                localId,
+                                attempt,
+                                retryAfterMs,
+                                willRetry: retryAfterMs !== null,
+                                errorValuesOmitted: true,
+                            });
+                        } catch {
+                            // Diagnostic sink failure must not change accepted settlement custody or retries.
+                        }
+                        if (retryAfterMs === null) return;
+                        previousRetryDelayMs = retryAfterMs;
+                        await delayUnrefAbortable(retryAfterMs, authority.abortSignal);
+                    } else {
+                        return;
+                    }
                 }
             }
-        }
         } finally {
             this.acceptedCanonicalPendingDeliveryResolutionLocalIdsInFlight.delete(localId);
         }

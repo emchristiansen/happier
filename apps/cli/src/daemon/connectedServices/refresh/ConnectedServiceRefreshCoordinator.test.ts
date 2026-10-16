@@ -175,11 +175,11 @@ afterEach(() => {
     });
   });
 
-  it('keeps checking other bindings across ticks while one credential read never settles', async () => {
+  it.each([false, true])('observes pending registration without duplicate work and clears settled reads (reject=%s)', async (rejectRead) => {
     const baseDir = await mkdtemp(join(tmpdir(), 'happier-refresh-pending-'));
     let finishPendingRead!: () => void;
-    const pendingRead = new Promise<null>((resolve) => {
-      finishPendingRead = () => resolve(null);
+    const pendingRead = new Promise<null>((resolve, reject) => {
+      finishPendingRead = () => rejectRead ? reject(new Error('credential read failed')) : resolve(null);
     });
     const reads: string[] = [];
     const api = {
@@ -189,6 +189,7 @@ afterEach(() => {
       }),
     } as unknown as ApiClient;
     completeCredentialAuthorityBoundaryFixture(api);
+    const runtimeRegistry = new ConnectedServiceRuntimeRegistry();
     const coordinator = new ConnectedServiceRefreshCoordinator({
       api,
       credentials: { token: 'fixture-token', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) } },
@@ -198,6 +199,7 @@ afterEach(() => {
       refreshWindowMs: 60_000,
       refreshLeaseMs: 30_000,
       now: () => Date.now(),
+      runtimeRegistry,
     });
     const target: Parameters<typeof coordinator.registerSpawnTarget>[0] = {
       pid: 1,
@@ -209,6 +211,8 @@ afterEach(() => {
         'claude-subscription': { source: 'connected', selection: 'profile', profileId: 'healthy' },
       } },
     };
+    const file = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
+    const stopObservingRegistrations = coordinator.observeTargetRegistrations();
     coordinator.registerSpawnTarget(target);
     const warning = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     vi.useFakeTimers();
@@ -218,7 +222,18 @@ afterEach(() => {
         () => { tickSettled = true; },
         () => { tickSettled = true; },
       );
-      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.advanceTimersByTimeAsync(8_000);
+      // Real daemon registrations write the shared registry directly, including during retained work.
+      runtimeRegistry.registerTarget({ ...target, pid: 2, sessionId: 'late-session',
+        connectedServiceSelectionsEnv: { PRIVATE_TOKEN: 'registration-secret-must-not-be-logged' } });
+      expect(file).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        event: 'target_registered', pid: 2, targetCount: 2,
+        pendingBindings: expect.arrayContaining([expect.objectContaining({
+          serviceId: 'openai-codex', profileId: 'pending', stage: 'credential_read', elapsedMs: 8_000,
+        })]),
+      }));
+      expect(reads.filter((profileId) => profileId === 'pending')).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(22_000);
       expect(reads).toContain('healthy');
       expect(tickSettled).toBe(true);
       await tick;
@@ -230,26 +245,44 @@ afterEach(() => {
       expect(warning).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
         serviceId: 'openai-codex', profileId: 'pending', ageMs: 30_000,
       }));
+      expect(file).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        event: 'binding_skipped', serviceId: 'openai-codex', profileId: 'pending', stage: 'credential_read', elapsedMs: 30_000,
+      }));
       const warningCount = warning.mock.calls.length;
       await vi.advanceTimersByTimeAsync(30_000);
       await coordinator.tickOnce();
       expect(warning.mock.calls.length).toBeGreaterThan(warningCount);
 
       coordinator.unregisterPid(1);
+      coordinator.unregisterPid(2);
       const warningCountBeforeUnregister = warning.mock.calls.length;
       await coordinator.tickOnce();
       expect(warning.mock.calls.length).toBeGreaterThan(warningCountBeforeUnregister);
+      expect(file).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ event: 'tick_started', targetCount: 0, bindingCount: 0 }));
+      const emitted = JSON.stringify(file.mock.calls);
+      expect(emitted).not.toContain('registration-secret-must-not-be-logged');
+      expect(emitted).not.toContain('fixture-token');
 
       finishPendingRead();
       await vi.advanceTimersByTimeAsync(0);
       coordinator.registerSpawnTarget(target);
       reads.length = 0;
-      await coordinator.tickOnce();
+      if (rejectRead) await expect(coordinator.tickOnce()).rejects.toThrow(AggregateError);
+      else await coordinator.tickOnce();
       expect(reads).toContain('pending');
+      expect(file).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        event: 'binding_completed', serviceId: 'openai-codex', profileId: 'pending', outcome: rejectRead ? 'failure' : 'success',
+      }));
+      file.mockImplementation(() => { throw new Error('diagnostic sink unavailable'); });
+      expect(() => runtimeRegistry.registerTarget({ ...target, pid: 3 })).not.toThrow();
+      if (rejectRead) await expect(coordinator.tickOnce()).rejects.toThrow(AggregateError);
+      else await expect(coordinator.tickOnce()).resolves.toBeUndefined();
     } finally {
       finishPendingRead();
       vi.useRealTimers();
       warning.mockRestore();
+      stopObservingRegistrations();
+      file.mockRestore();
     }
   });
 

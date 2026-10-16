@@ -5,7 +5,7 @@ import { classifyServerEndpointError } from '@/api/client/classifyServerEndpoint
 import { isAuthenticationError } from '@/api/client/httpStatusError';
 import type { ClientToServerEvents, ServerToClientEvents } from '../types';
 import { resolveServerHttpBaseUrl } from '@/session/transport/http/serverHttpBaseUrl';
-import { emitSocketWithAck } from '@/session/transport/shared/socketAck';
+import { createSocketAckError, emitSocketWithAck } from '@/session/transport/shared/socketAck';
 import {
     ACCEPTED_PENDING_SETTLEMENT_EVENT_V1,
     AcceptedPendingSettlementRequestV1Schema,
@@ -564,18 +564,32 @@ function createPendingMaterializeAckSocket(socket: Socket<ServerToClientEvents, 
 function createAcceptedPendingSettlementAckSocket(
     socket: Socket<ServerToClientEvents, ClientToServerEvents>,
 ): PendingMaterializeAckSocket {
-    const build = (target: Socket<ServerToClientEvents, ClientToServerEvents>): PendingMaterializeAckSocket => ({
+    const build = (
+        target: Socket<ServerToClientEvents, ClientToServerEvents>,
+        timeoutMs?: number,
+    ): PendingMaterializeAckSocket => ({
         connected: target.connected,
         emitWithAck: async (event, payload) => {
             if (event !== ACCEPTED_PENDING_SETTLEMENT_EVENT_V1) {
                 throw new Error(`Unexpected accepted pending settlement socket ACK event: ${event}`);
             }
-            return await target.emitWithAck(
-                ACCEPTED_PENDING_SETTLEMENT_EVENT_V1,
-                AcceptedPendingSettlementRequestV1Schema.parse(payload),
-            );
+            const request = AcceptedPendingSettlementRequestV1Schema.parse(payload);
+            try {
+                return await target.emitWithAck(ACCEPTED_PENDING_SETTLEMENT_EVENT_V1, request);
+            } catch (error) {
+                // Socket.IO's native timer can reject before the shared typed deadline.
+                if (timeoutMs !== undefined && error instanceof Error && error.message === 'operation has timed out') {
+                    throw createSocketAckError({
+                        code: 'socket_ack_timeout',
+                        event: ACCEPTED_PENDING_SETTLEMENT_EVENT_V1,
+                        message: `${ACCEPTED_PENDING_SETTLEMENT_EVENT_V1} ack timed out after ${timeoutMs}ms`,
+                        timeoutMs,
+                    });
+                }
+                throw error;
+            }
         },
-        timeout: (ms) => build(target.timeout(ms)),
+        timeout: (ms) => build(target.timeout(ms), ms),
     });
     return build(socket);
 }
