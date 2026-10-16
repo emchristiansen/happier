@@ -699,7 +699,7 @@ export async function claudeRemoteLauncher(
         if (activeRemoteRunnerKind !== 'agentSdk') return;
         void goalStatusTranscriptTail.start(transcriptPath ?? session.transcriptPath ?? null);
     };
-    const reportClaudeSubscriptionAccessTokenRefreshCapability = (runner: ClaudeRemoteRunnerKind): void => {
+    const reportClaudeSubscriptionAccessTokenRefreshCapability = (): void => {
         const metadata = session.client.getMetadataSnapshot?.();
         const sessionId = session.sessionId?.trim();
         if (!metadata || !sessionId) return;
@@ -709,7 +709,7 @@ export async function claudeRemoteLauncher(
                 ...metadata,
                 claudeSubscriptionAccessTokenRefreshV1: {
                     v: 1,
-                    mode: runner === 'agentSdk' ? 'daemon_callback' : 'unavailable',
+                    mode: 'unavailable',
                 },
             },
         }).catch((error) => {
@@ -1883,7 +1883,7 @@ export async function claudeRemoteLauncher(
                         }
                         if (runner === null) return;
                         remoteProviderInputOutcomes = createClaudeRemoteProviderInputOutcomeBridge(session.client);
-                        reportClaudeSubscriptionAccessTokenRefreshCapability(runner);
+                        reportClaudeSubscriptionAccessTokenRefreshCapability();
                         // Resume sessions know the transcript path up front; new sessions learn it via
                         // onSessionFound (which also starts the tail). Idempotent for the same path.
                         maybeStartAgentSdkGoalStatusTail(session.transcriptPath ?? null);

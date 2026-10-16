@@ -29,11 +29,9 @@ const claudeConnectedServiceCredentialLifecycleDescriptor: ConnectedServiceCrede
   spawnPreflightOauthRefresh: { mode: 'expiry_window' },
   refreshedCredentialApplication: {
     mode: 'restart_required',
-    // Every Claude runner shape reads the stable CLAUDE_CONFIG_DIR home LIVE: the terminal
-    // `claude` binary re-reads .credentials.json between requests (live-proven 2026-07-08), and
-    // the agent-SDK runner additionally refreshes through the daemon getOAuthToken callback.
-    // Refreshed claude-subscription credentials therefore apply WITHOUT restarting sessions —
-    // restarts remain only for account SWITCHES (generation applies via the switch coordinator).
+    // Retain the existing no-restart policy for credential refresh. Ordinary Agent SDK
+    // runner selection does not prove getOAuthToken callback support or live credential
+    // adoption; capability reporting must not infer either from this policy.
     noRestartRequiredServiceIds: ['claude-subscription'],
   },
   predictiveSoftSwitch: {
