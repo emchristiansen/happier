@@ -87,6 +87,7 @@ export async function cmdSessionSend(
         error: {
           code: actionRes.errorCode,
           ...(actionRes.error ? { message: actionRes.error } : {}),
+          ...(actionRes.details === undefined ? {} : { details: actionRes.details }),
         },
       });
       return;

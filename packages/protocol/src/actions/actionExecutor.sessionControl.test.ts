@@ -79,6 +79,19 @@ describe('createActionExecutor (session control)', () => {
     }));
   });
 
+  it.each(['resume_failed', 'timeout', 'unsupported'] as const)('preserves confirmed pending custody on MCP send errors: %s', async (errorCode) => {
+    const details = { pendingCustody: 'confirmed', sessionId: 's1', localId: 'exact-local-id' };
+    const executor = createExecutor({ sessionSendMessage: async () => ({ ok: false, errorCode, error: errorCode, details }) });
+    await expect(executor.execute('session.message.send', { sessionId: 's1', message: 'hello' }, { surface: 'mcp' }))
+      .resolves.toEqual({ ok: false, errorCode, error: errorCode, details });
+  });
+
+  it('keeps pre-admission send timeout distinct from confirmed pending custody', async () => {
+    const executor = createExecutor({ sessionSendMessage: async () => ({ ok: false, errorCode: 'timeout', error: 'timeout' }) });
+    await expect(executor.execute('session.message.send', { sessionId: 's1', message: 'hello' }, { surface: 'mcp' }))
+      .resolves.toEqual({ ok: false, errorCode: 'timeout', error: 'timeout' });
+  });
+
   it('defaults generic session.message.send callers to conditional steering instead of interruption', async () => {
     const sessionSendMessage = vi.fn(async () => ({ ok: true }));
     const executor = createExecutor({ sessionSendMessage });

@@ -54,7 +54,10 @@ export type SendSessionMessageResult =
       code: 'session_not_found' | 'session_id_ambiguous' | 'session_lookup_timeout' | 'session_archived' | 'unsupported' | 'resume_failed' | 'timeout' | 'wait_failed';
       candidates?: string[];
       message?: string;
-    }>;
+    }> & (
+      | Readonly<{ pendingCustody: 'confirmed'; sessionId: string; localId: string }>
+      | Readonly<{ pendingCustody?: never; sessionId?: never; localId?: never }>
+    );
 
 function parsePermissionIntentOrThrow(raw: string): PermissionIntent {
   const parsed = parsePermissionIntentAlias(raw);
@@ -533,6 +536,9 @@ export async function sendSessionMessage(params: Readonly<{
         ok: false,
         code: resumeResult.code,
         message: resumeResult.message,
+        pendingCustody: 'confirmed',
+        sessionId,
+        localId,
       };
     }
   }

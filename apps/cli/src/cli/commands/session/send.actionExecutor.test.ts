@@ -52,6 +52,18 @@ describe('happier session send (action executor)', () => {
     }
   });
 
+  it.each([true, false])('prints send custody details only when confirmed: %s', async (confirmed) => {
+    const details = { pendingCustody: 'confirmed', sessionId: 'sess-1', localId: 'exact-local-id' };
+    execute.mockResolvedValueOnce({ ok: false, errorCode: 'timeout', error: 'timeout', ...(confirmed ? { details } : {}) });
+    const { cmdSessionSend } = await import('./send');
+    const output = captureConsoleJsonOutput();
+    try {
+      await cmdSessionSend(['send', 'sess-1', 'hello', '--json'], { readCredentialsFn: async () => ({ token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(1) } }) });
+      const parsed = output.json() as { error: unknown };
+      expect(parsed.error).toEqual({ code: 'timeout', message: 'timeout', ...(confirmed ? { details } : {}) });
+    } finally { output.restore(); }
+  });
+
   it('rejects a malformed timeout before reading credentials', async () => {
     const readCredentialsFn = vi.fn(async () => null);
     const { cmdSessionSend } = await import('./send');

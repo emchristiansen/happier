@@ -2261,7 +2261,10 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
               : {}),
           });
           const failure = readActionExecuteFailure(res);
-          if (failure) return { ok: false, ...failure };
+          if (failure) {
+            const details = (res as Readonly<{ details?: unknown }>).details;
+            return { ok: false, ...failure, ...(details === undefined ? {} : { details }) };
+          }
           return { ok: true, result: res };
         }
 
