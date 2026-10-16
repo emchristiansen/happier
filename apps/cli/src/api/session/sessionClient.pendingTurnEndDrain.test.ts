@@ -2477,6 +2477,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       attempt: 3,
       retryAfterMs: 4_000,
       willRetry: true,
+      errorValuesOmitted: true,
     }));
   });
 

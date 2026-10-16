@@ -1671,6 +1671,7 @@ export class ApiSessionClient extends EventEmitter {
                                 attempt,
                                 retryAfterMs,
                                 willRetry: retryAfterMs !== null,
+                                errorValuesOmitted: true,
                             });
                         } catch {
                             // Diagnostic sink failure must not change accepted settlement custody or retries.
