@@ -121,6 +121,14 @@ function bindingKey(binding: BoundProfile): string {
   return `${binding.serviceId}/${binding.profileId}`;
 }
 
+type ScheduledRefreshStage =
+  | 'credential_check' | 'credential_read' | 'credential_health_read'
+  | 'lease_acquisition' | 'lease_contention_wait' | 'leased_credential_read'
+  | 'provider_refresh' | 'lease_renewal_settlement' | 'credential_persistence'
+  | 'persisted_credential_read' | 'credential_distribution'
+  | 'credential_health_persistence' | 'credential_health_notification'
+  | 'credential_ready_wait' | 'credential_refresh_completion';
+
 export type ConnectedServiceAuthUpdatedApplicationResult = Readonly<{
   /** Runtime identities whose exact refreshed credential was accepted by the live application owner. */
   appliedRuntimeIdentityKeys: ReadonlySet<string>;
@@ -201,11 +209,12 @@ export class ConnectedServiceCredentialRefreshError extends Error {
 }
 
 export class ConnectedServiceRefreshCoordinator {
-  private readonly scheduledBindingTasks = new Map<string, Readonly<{
+  private readonly scheduledBindingTasks = new Map<string, {
     binding: BoundProfile;
     startedAtMs: number;
     completion: Promise<void>;
-  }>>();
+    stage: ScheduledRefreshStage;
+  }>();
   private readonly homeOwnershipTails = new Map<string, Promise<void>>();
   private readonly bindingHomeWork = new Map<string, Readonly<{
     homeIdentities: ReadonlyArray<string>;
@@ -272,6 +281,53 @@ export class ConnectedServiceRefreshCoordinator {
     this.runtimeRegistry = params.runtimeRegistry ?? new ConnectedServiceRuntimeRegistry();
   }
 
+  observeTargetRegistrations(): () => void {
+    return this.runtimeRegistry.onTargetRegistration(({ key, target }) => {
+      this.logScheduling('target_registered', () => ({
+        targetKind: key.kind, pid: target.pid, agentId: target.agentId,
+        sessionId: target.sessionId,
+        bindings: target.boundProfiles.map(({ serviceId, profileId }) => ({ serviceId, profileId })),
+        targetCount: this.runtimeRegistry.listRefreshTargets().length,
+        pendingBindings: this.pendingBindingObservations(),
+      }));
+    });
+  }
+
+  private logScheduling(event: string, metadata: () => Readonly<Record<string, unknown>>): void {
+    try {
+      logger.infoFile('[ConnectedServiceRefresh] Scheduling', { event, ...metadata() });
+    } catch {
+      // Metadata and sink failures cannot alter registry, scheduling, or auth work.
+    }
+  }
+
+  private scheduledBindingObservation(binding: BoundProfile, startedAtMs: number) {
+    const key = bindingKey(binding);
+    const homeWork = this.bindingHomeWork.get(key);
+    const stage = homeWork?.stage
+      ?? (this.inFlightRefreshAuthUpdatedNotifications.has(key)
+        ? 'auth_updated_notification'
+        : this.inFlightRefreshRematerializations.has(key)
+          ? 'rematerialization'
+          : this.scheduledBindingTasks.get(key)?.stage ?? 'credential_check');
+    return {
+      serviceId: binding.serviceId, profileId: binding.profileId,
+      elapsedMs: Math.max(0, this.params.now() - startedAtMs), stage,
+    };
+  }
+
+  private pendingBindingObservations() {
+    return Array.from(this.scheduledBindingTasks.values(), (task) =>
+      this.scheduledBindingObservation(task.binding, task.startedAtMs));
+  }
+
+  private observeScheduledStage(binding: BoundProfile, stage: ScheduledRefreshStage): void {
+    const task = this.scheduledBindingTasks.get(bindingKey(binding));
+    if (!task) return;
+    task.stage = stage;
+    this.logScheduling('binding_stage', () => this.scheduledBindingObservation(binding, task.startedAtMs));
+  }
+
   registerSpawnTarget(params: Readonly<{
     pid: number;
     agentId: CatalogAgentId;
@@ -319,11 +375,16 @@ export class ConnectedServiceRefreshCoordinator {
     const unique = new Map<string, BoundProfile>();
     const errors: unknown[] = [];
 
-    for (const target of this.runtimeRegistry.listRefreshTargets()) {
+    const targets = this.runtimeRegistry.listRefreshTargets();
+    for (const target of targets) {
       for (const binding of target.bindings) {
         unique.set(bindingKey(binding), binding);
       }
     }
+    this.logScheduling('tick_started', () => ({
+      targetCount: targets.length, bindingCount: unique.size,
+      pendingBindings: this.pendingBindingObservations(),
+    }));
 
     // Retained rotations also stay observable if their last session unregisters.
     for (const task of this.scheduledBindingTasks.values()) {
@@ -343,6 +404,12 @@ export class ConnectedServiceRefreshCoordinator {
       }
     }));
 
+    this.logScheduling('tick_completed', () => ({
+      targetCount: targets.length, bindingCount: unique.size,
+      elapsedMs: Math.max(0, this.params.now() - now),
+      outcome: errors.length > 0 ? 'failure' : 'success', errorCount: errors.length,
+      pendingBindings: this.pendingBindingObservations(),
+    }));
     if (errors.length > 0) {
       throw new AggregateError(errors, 'Connected services refresh tick failed');
     }
@@ -352,6 +419,9 @@ export class ConnectedServiceRefreshCoordinator {
     const key = bindingKey(binding);
     const existing = this.scheduledBindingTasks.get(key);
     if (existing) {
+      this.logScheduling('binding_skipped', () => ({
+        ...this.scheduledBindingObservation(binding, existing.startedAtMs), reason: 'pending_task',
+      }));
       return;
     }
 
@@ -359,11 +429,18 @@ export class ConnectedServiceRefreshCoordinator {
     const task = {
       binding,
       startedAtMs: now,
+      stage: 'credential_check' as ScheduledRefreshStage,
       completion: Promise.resolve()
         .then(async () => {
           await this.maybeRefreshBinding(binding, this.params.now());
+          this.logScheduling('binding_completed', () => ({
+            ...this.scheduledBindingObservation(binding, now), outcome: 'success',
+          }));
         })
         .catch((error: unknown) => {
+          this.logScheduling('binding_completed', () => ({
+            ...this.scheduledBindingObservation(binding, now), outcome: 'failure', errorValuesOmitted: true,
+          }));
           if (schedulingBudgetExpired) {
             logger.warn('[ConnectedServiceRefresh] Pending scheduled binding failed', {
               serviceId: binding.serviceId, profileId: binding.profileId, error,
@@ -378,6 +455,7 @@ export class ConnectedServiceRefreshCoordinator {
         }),
     };
     this.scheduledBindingTasks.set(key, task);
+    this.logScheduling('binding_started', () => this.scheduledBindingObservation(binding, now));
 
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -398,6 +476,7 @@ export class ConnectedServiceRefreshCoordinator {
   }
 
   private warnPendingScheduledBinding(binding: BoundProfile, startedAtMs: number): void {
+    this.logScheduling('binding_pending', () => this.scheduledBindingObservation(binding, startedAtMs));
     const key = bindingKey(binding);
     const homeWork = this.bindingHomeWork.get(key);
     const awaitStage = homeWork?.stage
@@ -825,6 +904,7 @@ export class ConnectedServiceRefreshCoordinator {
     binding: BoundProfile,
     credentialRevision: ConnectedServiceCredentialRevisionV1 | null = null,
   ): Promise<RefreshedBindingDistributionResult> {
+    this.observeScheduledStage(binding, 'credential_distribution');
     const rematerialization = await this.rematerializeTargetsForBindingAfterRefresh(binding);
     const application = rematerialization.rematerializedTargets.length > 0
       ? await this.notifyAuthUpdatedForRefreshedBinding(
@@ -1005,14 +1085,17 @@ export class ConnectedServiceRefreshCoordinator {
       if (existing) {
         // A rejecting credential rotation represents an attempt that re-running concurrently would
         // not improve; every joiner adopts the same rejection rather than firing a duplicate refresh.
+        this.observeScheduledStage(binding, 'credential_ready_wait');
         const observed = await existing.credentialReady;
         if (inFlightResultSatisfiesCaller(observed, options)) {
+          this.observeScheduledStage(binding, 'credential_refresh_completion');
           return options.adoptCredentialReadyFromInFlightRefresh === true && observed.status === 'refreshed'
             ? observed
             : await existing.completion;
         }
         // Preserve the existing serialized forced-after-non-forced contract: health persistence and
         // any non-rotation completion work settle before the forced retry re-reads canonical state.
+        this.observeScheduledStage(binding, 'credential_refresh_completion');
         await existing.completion;
         continue;
       }
@@ -1089,12 +1172,14 @@ export class ConnectedServiceRefreshCoordinator {
       }, this.params.now());
     }
     this.logRefreshDiagnostic(finalizedResult.diagnostic);
+    this.observeScheduledStage(binding, 'credential_health_persistence');
     const healthSettled = await persistCredentialHealthForRefreshResult({
       api: this.params.api,
       result: finalizedResult,
       now: this.params.now(),
     });
     if (healthSettled) {
+      this.observeScheduledStage(binding, 'credential_health_notification');
       await this.notifyCredentialHealthForRefreshResult(finalizedResult);
     }
     return finalizedResult;
@@ -1180,6 +1265,7 @@ export class ConnectedServiceRefreshCoordinator {
     now: number,
     options: Readonly<{ force: boolean; reason: ConnectedServiceRefreshReason }>,
   ): Promise<ConnectedServiceCredentialRefreshResult> {
+    this.observeScheduledStage(binding, 'credential_read');
     const source = await readCredentialForRefresh({
       api: this.params.api,
       credentials: this.params.credentials,
@@ -1217,6 +1303,7 @@ export class ConnectedServiceRefreshCoordinator {
 
     const expiresAt = source.mode === 'plain' ? record.expiresAt : source.metadata.expiresAt ?? record.expiresAt;
     let isCredentialHealthReprobe = false;
+    this.observeScheduledStage(binding, 'credential_health_read');
     if (
       shouldBlockRefreshForCredentialHealth(options.reason)
       && isReconnectRequiredProfileStatus(await readCredentialHealthStatusForRefresh({
@@ -1303,6 +1390,7 @@ export class ConnectedServiceRefreshCoordinator {
     }
 
     const ownerId = this.params.ownerIdProvider?.()?.trim();
+    this.observeScheduledStage(binding, 'lease_acquisition');
     const lease = await this.params.api.acquireConnectedServiceRefreshLease({
       serviceId: binding.serviceId,
       profileId: binding.profileId,
@@ -1312,6 +1400,7 @@ export class ConnectedServiceRefreshCoordinator {
       ...(source.credentialRevision ? { expectedCredentialRevision: source.credentialRevision } : {}),
     });
     if (!lease.acquired) {
+      this.observeScheduledStage(binding, 'lease_contention_wait');
       const observed = await this.waitForContendedRefresh(binding, source, lease.leaseUntil, now, options);
       if (observed) return observed;
       return {
@@ -1332,6 +1421,7 @@ export class ConnectedServiceRefreshCoordinator {
     // before acquisition. Another daemon may therefore have rotated and persisted this binding while
     // we waited. Re-read under the acquired lease so provider I/O, persistence, and health evidence
     // are all based on the same canonical credential revision.
+    this.observeScheduledStage(binding, 'leased_credential_read');
     const leasedSource = await readCredentialForRefresh({
       api: this.params.api,
       credentials: this.params.credentials,
@@ -1449,6 +1539,7 @@ export class ConnectedServiceRefreshCoordinator {
       });
     }, renewalEveryMs);
     (renewalTimer as unknown as { unref?: () => void }).unref?.();
+    this.observeScheduledStage(binding, 'provider_refresh');
     try {
       refreshed = await refreshConnectedAccountOauthTokens({
         serviceId: binding.serviceId,
@@ -1475,6 +1566,7 @@ export class ConnectedServiceRefreshCoordinator {
       };
     } finally {
       clearInterval(renewalTimer);
+      this.observeScheduledStage(binding, 'lease_renewal_settlement');
       await renewalInFlight;
     }
     if (!leaseAuthority) {
@@ -1510,6 +1602,7 @@ export class ConnectedServiceRefreshCoordinator {
       next,
     });
 
+    this.observeScheduledStage(binding, 'credential_persistence');
     const persisted = await persistRefreshedCredential({
       api: this.params.api,
       credentials: this.params.credentials,
@@ -1519,6 +1612,7 @@ export class ConnectedServiceRefreshCoordinator {
       refreshLeaseOwnerId: lease.ownerId ?? ownerId ?? machineId,
     });
     if (persisted && 'error' in persisted) {
+      this.observeScheduledStage(binding, 'persisted_credential_read');
       const current = await readCredentialForRefresh({
         api: this.params.api,
         credentials: this.params.credentials,
@@ -1540,6 +1634,7 @@ export class ConnectedServiceRefreshCoordinator {
         }),
       };
     }
+    this.observeScheduledStage(binding, 'persisted_credential_read');
     const settledSource = await readCredentialForRefresh({
       api: this.params.api,
       credentials: this.params.credentials,

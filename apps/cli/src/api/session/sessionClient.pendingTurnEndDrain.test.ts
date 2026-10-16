@@ -2405,6 +2405,8 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
   });
 
   it('continues exact accepted settlement after repeated response loss without reconnecting', async () => {
+    const warningSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    warningSpy.mockImplementationOnce(() => { throw new Error('diagnostic sink unavailable'); });
     const client = await createClient({
       latestTurnStatus: 'completed',
       pendingCount: 1,
@@ -2450,7 +2452,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
         pendingVersion: 3,
       },
     });
-    await vi.advanceTimersByTimeAsync(999);
+    await vi.advanceTimersByTimeAsync(1_999);
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(2);
     expect((client as any).canonicalPendingDeliveryByLocalId.has('bounded-rejoin-local')).toBe(true);
 
@@ -2458,7 +2460,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(3);
     expect((client as any).canonicalPendingDeliveryByLocalId.has('bounded-rejoin-local')).toBe(true);
 
-    await vi.advanceTimersByTimeAsync(999);
+    await vi.advanceTimersByTimeAsync(3_999);
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(3);
 
     await vi.advanceTimersByTimeAsync(1);
@@ -2469,6 +2471,37 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect((client as any).canonicalPendingDeliveryByLocalId.has('bounded-rejoin-local')).toBe(false);
     expect(hasProviderInputAcceptance(client, 'bounded-rejoin-local')).toBe(true);
     expect(materializeNextMock).toHaveBeenCalledTimes(1);
+    expect(warningSpy).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      sessionId: 's1',
+      localId: 'bounded-rejoin-local',
+      attempt: 3,
+      retryAfterMs: 4_000,
+      willRetry: true,
+    }));
+  });
+
+  it('caps accepted settlement backoff and cancels it on close without another provider input', async () => {
+    const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 });
+    await waitForCurrentPendingInputContract(client);
+    materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult('capped-close-settlement'));
+    resolveAcceptedPendingDeliveryMock.mockRejectedValue(
+      new PendingQueueAcceptedSettlementError('transaction-unavailable', 120_000),
+    );
+    await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+    vi.useFakeTimers();
+    confirmProviderInputAccepted(client, 'capped-close-settlement');
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(2);
+    (client as any).rpcLifecycleRegistrations.splice(0);
+    const close = client.close();
+    await vi.advanceTimersByTimeAsync(0);
+    await close;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(2);
+    expect(materializeNextMock).toHaveBeenCalledTimes(1);
+    expect(blockPendingDeliveryMock).not.toHaveBeenCalled();
   });
 
   it('parks a generic accepted-settlement 500 with correlated diagnostics and no socket teardown', async () => {
@@ -3973,14 +4006,18 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     materializeNextMock
       .mockResolvedValueOnce(createProviderDeliveryMaterializeResult(localId))
       .mockResolvedValueOnce(createProviderDeliveryMaterializeResult('next-after-transcript-proof'));
-    resolveAcceptedPendingDeliveryMock.mockRejectedValueOnce(new Error('operation has timed out'));
+    resolveAcceptedPendingDeliveryMock.mockRejectedValue(
+      new PendingQueueAcceptedSettlementError('transaction-unavailable', 1_250),
+    );
 
     await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toMatchObject({
       type: 'materialized',
       localId,
     });
+    vi.useFakeTimers();
     confirmProviderInputAccepted(client, localId);
-    await waitUntil(() => resolveAcceptedPendingDeliveryMock.mock.calls.length === 1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
 
     triggerCommittedUserMessage({ seq: 73, localId: 'neighbor-transcript-row' });
     expect((client as any).canonicalPendingDeliveryByLocalId.has(localId)).toBe(true);
@@ -3989,6 +4026,8 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
 
     expect((client as any).canonicalPendingDeliveryByLocalId.has(localId)).toBe(false);
     expect(client.getCommittedUserMessageSeq(localId)).toBe(74);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
     await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toMatchObject({
       type: 'materialized',
       localId: 'next-after-transcript-proof',
