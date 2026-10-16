@@ -75,14 +75,9 @@ function shouldRetryForPublishedSessionDataEncryptionKey(params: Readonly<{
 async function fetchSessionTransportRecord(params: Readonly<{
     credentials: Credentials;
     sessionId: string;
-}>): Promise<RawSessionRecord | null> {
-    let rawSession = await fetchSessionById({
-        token: params.credentials.token,
-        sessionId: params.sessionId,
-    });
-    if (!rawSession) {
-        return null;
-    }
+    rawSession: RawSessionRecord;
+}>): Promise<RawSessionRecord> {
+    let rawSession = params.rawSession;
 
     const retryAttempts = resolvePositiveIntFromEnv(
         'HAPPIER_SESSION_E2EE_DEK_FETCH_RETRY_ATTEMPTS',
@@ -131,14 +126,8 @@ export async function resolveSessionTransportContext(params: Readonly<{
     const rawSession = await fetchSessionTransportRecord({
         credentials: params.credentials,
         sessionId: resolved.sessionId,
+        rawSession: resolved.rawSession,
     });
-    if (!rawSession) {
-        return {
-            ok: false,
-            code: 'session_not_found',
-            sessionId: resolved.sessionId,
-        };
-    }
 
     return {
         ok: true,
