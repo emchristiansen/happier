@@ -332,7 +332,7 @@ describe('createCliActionExecutor', () => {
     });
   });
 
-  it('resolves session mode options from fetched session metadata when targeting a different session id', async () => {
+  it('resolves session mode options from the list record when targeting a different session id', async () => {
     const executor = createPlainExecutor();
     const rawSession = {
       id: 'sess-2',
@@ -354,7 +354,6 @@ describe('createCliActionExecutor', () => {
     fetchSessionsPage
       .mockResolvedValueOnce({ sessions: [rawSession], hasNext: false, nextCursor: null })
       .mockResolvedValueOnce({ sessions: [], hasNext: false, nextCursor: null });
-    fetchSessionById.mockResolvedValue(rawSession);
 
     const result = await executor.execute(
       'action.options.resolve',
@@ -377,7 +376,7 @@ describe('createCliActionExecutor', () => {
         ],
       },
     });
-    expect(fetchSessionById).toHaveBeenCalledWith({ token: 'token', sessionId: 'sess-2' });
+    expect(fetchSessionById).not.toHaveBeenCalled();
   });
 
   it('rejects actions disabled on the CLI surface by action settings', async () => {
@@ -452,12 +451,7 @@ describe('createCliActionExecutor', () => {
 
   it('responds to the only pending permission request when requestId is omitted', async () => {
     const executor = createPlainExecutor();
-    fetchSessionsPage.mockResolvedValue({
-      sessions: [{ id: 'sess-1', metadata: {} }],
-      hasNext: false,
-      nextCursor: null,
-    });
-    fetchSessionById.mockResolvedValue({
+    const rawSession = {
       id: 'sess-1',
       createdAt: 1,
       updatedAt: 2,
@@ -472,7 +466,13 @@ describe('createCliActionExecutor', () => {
           'perm-1': { kind: 'permission', tool: 'Write', createdAt: 1 },
         },
       }),
+    };
+    fetchSessionsPage.mockResolvedValue({
+      sessions: [rawSession],
+      hasNext: false,
+      nextCursor: null,
     });
+    fetchSessionById.mockResolvedValue(rawSession);
     callSessionRpc.mockResolvedValue({ ok: true });
 
     const result = await executor.execute(
@@ -580,12 +580,7 @@ describe('createCliActionExecutor', () => {
 
   it('answers the only pending user-action request when requestId is omitted', async () => {
     const executor = createPlainExecutor();
-    fetchSessionsPage.mockResolvedValue({
-      sessions: [{ id: 'sess-1', metadata: {} }],
-      hasNext: false,
-      nextCursor: null,
-    });
-    fetchSessionById.mockResolvedValue({
+    const rawSession = {
       id: 'sess-1',
       createdAt: 1,
       updatedAt: 2,
@@ -600,7 +595,13 @@ describe('createCliActionExecutor', () => {
           'ua-1': { kind: 'user_action', tool: 'AskUserQuestion', createdAt: 1 },
         },
       }),
+    };
+    fetchSessionsPage.mockResolvedValue({
+      sessions: [rawSession],
+      hasNext: false,
+      nextCursor: null,
     });
+    fetchSessionById.mockResolvedValue(rawSession);
     callSessionRpc.mockResolvedValue({ ok: true });
 
     const result = await executor.execute(

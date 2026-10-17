@@ -2,14 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { deriveBoxPublicKeyFromSeed, sealEncryptedDataKeyEnvelopeV1 } from '@happier-dev/protocol';
 import { encodeBase64, encrypt } from '@/api/encryption';
+import { createSessionRecordFixture } from '@/testkit/backends/sessionFixtures';
 
-const { resolveSessionIdOrPrefix, fetchSessionById } = vi.hoisted(() => ({
-    resolveSessionIdOrPrefix: vi.fn(),
+const { fetchSessionById } = vi.hoisted(() => ({
     fetchSessionById: vi.fn(),
-}));
-
-vi.mock('@/session/query/resolveSessionId', () => ({
-    resolveSessionIdOrPrefix,
 }));
 
 vi.mock('@/session/transport/http/sessionsHttp', () => ({
@@ -21,7 +17,6 @@ describe('resolveSessionTransportContext', () => {
     const prevRetryDelayMs = process.env.HAPPIER_SESSION_E2EE_DEK_FETCH_RETRY_DELAY_MS;
 
     beforeEach(() => {
-        resolveSessionIdOrPrefix.mockReset();
         fetchSessionById.mockReset();
         process.env.HAPPIER_SESSION_E2EE_DEK_FETCH_RETRY_ATTEMPTS = '2';
         process.env.HAPPIER_SESSION_E2EE_DEK_FETCH_RETRY_DELAY_MS = '1';
@@ -41,6 +36,78 @@ describe('resolveSessionTransportContext', () => {
         }
     });
 
+    it.each(['plain', 'legacy'] as const)('reuses the resolved %s session without another HTTP read', async (kind) => {
+        const secret = new Uint8Array(32).fill(4);
+        const session = createSessionRecordFixture({
+            id: 'c123456789012345678901234',
+            encryptionMode: kind === 'plain' ? 'plain' : 'e2ee',
+            metadata: kind === 'plain' ? JSON.stringify({ path: '/project' }) : 'legacy metadata',
+        });
+        fetchSessionById.mockResolvedValue(session);
+        const { resolveSessionTransportContext } = await import('./resolveSessionTransportContext');
+
+        const result = await resolveSessionTransportContext({
+            credentials: {
+                token: 'token',
+                encryption: kind === 'legacy'
+                    ? { type: 'legacy', secret }
+                    : { type: 'dataKey', publicKey: deriveBoxPublicKeyFromSeed(secret), machineKey: secret },
+            },
+            idOrPrefix: session.id,
+        });
+
+        expect(result).toMatchObject({ ok: true, sessionId: session.id, rawSession: session });
+        expect(fetchSessionById).toHaveBeenCalledTimes(1);
+    });
+
+    it('uses the published key from the resolved session without another HTTP read', async () => {
+        const machineKey = new Uint8Array(32).fill(7);
+        const publicKey = deriveBoxPublicKeyFromSeed(machineKey);
+        const sessionDataKey = new Uint8Array(32).fill(9);
+        const session = createSessionRecordFixture({
+            id: 'c123456789012345678901234',
+            encryptionMode: 'e2ee',
+            dataEncryptionKey: encodeBase64(sealEncryptedDataKeyEnvelopeV1({
+                dataKey: sessionDataKey,
+                recipientPublicKey: publicKey,
+                randomBytes: (length) => new Uint8Array(length).fill(3),
+            }), 'base64'),
+        });
+        fetchSessionById.mockResolvedValue(session);
+        const { resolveSessionTransportContext } = await import('./resolveSessionTransportContext');
+
+        const result = await resolveSessionTransportContext({
+            credentials: { token: 'token', encryption: { type: 'dataKey', publicKey, machineKey } },
+            idOrPrefix: session.id,
+        });
+
+        expect(result).toMatchObject({ ok: true, sessionId: session.id, rawSession: session });
+        if (!result.ok) throw new Error('Expected resolved session transport context');
+        expect(Array.from(result.ctx.encryptionKey)).toEqual(Array.from(sessionDataKey));
+        expect(fetchSessionById).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not refetch a missing published key when metadata decrypts with the machine key', async () => {
+        const machineKey = new Uint8Array(32).fill(7);
+        const session = createSessionRecordFixture({
+            id: 'c123456789012345678901234',
+            encryptionMode: 'e2ee',
+            metadata: encodeBase64(encrypt(machineKey, 'dataKey', { path: '/project' }), 'base64'),
+        });
+        fetchSessionById.mockResolvedValue(session);
+        const { resolveSessionTransportContext } = await import('./resolveSessionTransportContext');
+
+        const result = await resolveSessionTransportContext({
+            credentials: { token: 'token', encryption: {
+                type: 'dataKey', publicKey: deriveBoxPublicKeyFromSeed(machineKey), machineKey,
+            } },
+            idOrPrefix: session.id,
+        });
+
+        expect(result).toMatchObject({ ok: true, rawSession: session });
+        expect(fetchSessionById).toHaveBeenCalledTimes(1);
+    });
+
     it('refetches active e2ee sessions when the published dataEncryptionKey is briefly missing', async () => {
         const machineKey = new Uint8Array(32).fill(7);
         const publicKey = deriveBoxPublicKeyFromSeed(machineKey);
@@ -58,27 +125,24 @@ describe('resolveSessionTransportContext', () => {
             'base64',
         );
 
-        resolveSessionIdOrPrefix.mockResolvedValue({
-            ok: true,
-            sessionId: 'sess-1',
-        });
+        const sessionId = 'c123456789012345678901234';
         fetchSessionById
-            .mockResolvedValueOnce({
-                id: 'sess-1',
+            .mockResolvedValueOnce(createSessionRecordFixture({
+                id: sessionId,
                 active: true,
                 activeAt: 1,
                 encryptionMode: 'e2ee',
                 dataEncryptionKey: null,
                 metadata: encryptedMetadata,
-            })
-            .mockResolvedValueOnce({
-                id: 'sess-1',
+            }))
+            .mockResolvedValueOnce(createSessionRecordFixture({
+                id: sessionId,
                 active: true,
                 activeAt: 1,
                 encryptionMode: 'e2ee',
                 dataEncryptionKey: publishedDataEncryptionKey,
                 metadata: encryptedMetadata,
-            });
+            }));
 
         const { resolveSessionTransportContext } = await import('./resolveSessionTransportContext');
 
@@ -91,13 +155,13 @@ describe('resolveSessionTransportContext', () => {
                     machineKey,
                 },
             },
-            idOrPrefix: 'sess-1',
+            idOrPrefix: sessionId,
         });
 
         expect(fetchSessionById).toHaveBeenCalledTimes(2);
         expect(result).toMatchObject({
             ok: true,
-            sessionId: 'sess-1',
+            sessionId,
             mode: 'e2ee',
         });
         if (!result.ok) {
