@@ -108,6 +108,35 @@ describe('resolveSessionTransportContext', () => {
         expect(fetchSessionById).toHaveBeenCalledTimes(1);
     });
 
+    it.each(['wrong recipient', 'malformed envelope'])('refuses a present DEK with %s', async (kind) => {
+        const machineKey = new Uint8Array(32).fill(7);
+        const dataEncryptionKey = kind === 'malformed envelope'
+            ? encodeBase64(new Uint8Array([1, 2, 3]), 'base64')
+            : encodeBase64(sealEncryptedDataKeyEnvelopeV1({
+                dataKey: new Uint8Array(32).fill(9),
+                recipientPublicKey: deriveBoxPublicKeyFromSeed(new Uint8Array(32).fill(8)),
+                randomBytes: (length) => new Uint8Array(length).fill(3),
+            }), 'base64');
+        const session = createSessionRecordFixture({
+            id: 'c123456789012345678901234', encryptionMode: 'e2ee', dataEncryptionKey,
+        });
+        fetchSessionById.mockResolvedValue(session);
+
+        const { resolveSessionTransportContext } = await import('./resolveSessionTransportContext');
+        const credentials = {
+            token: 'token',
+            encryption: { type: 'dataKey' as const, machineKey, publicKey: deriveBoxPublicKeyFromSeed(machineKey) },
+        };
+        // Non-send consumers retain their original fallback and result contract.
+        expect(await resolveSessionTransportContext({ credentials, idOrPrefix: session.id }))
+            .toMatchObject({ ok: true, ctx: { encryptionKey: machineKey, encryptionVariant: 'dataKey' } });
+        expect(await resolveSessionTransportContext({
+            credentials,
+            idOrPrefix: session.id,
+            requireOpenSessionDataKey: true,
+        })).toEqual({ ok: false, code: 'session_data_key_unopenable', sessionId: session.id });
+    });
+
     it('refetches active e2ee sessions when the published dataEncryptionKey is briefly missing', async () => {
         const machineKey = new Uint8Array(32).fill(7);
         const publicKey = deriveBoxPublicKeyFromSeed(machineKey);
