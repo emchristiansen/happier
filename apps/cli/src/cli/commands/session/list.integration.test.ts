@@ -118,7 +118,7 @@ describe('happier session list (integration)', () => {
                 metadata: systemMetadata,
                 metadataVersion: 0,
                 agentState: null,
-                agentStateVersion: 0,
+                agentStateVersion: 9,
                 pendingCount: 0,
                 pendingVersion: 7,
                 dataEncryptionKey: dataEncryptionKeyBase64,
@@ -223,7 +223,7 @@ describe('happier session list (integration)', () => {
       expect(parsed.ok).toBe(true);
       expect(parsed.kind).toBe('session_list');
       expect(parsed.data?.sessions?.[0]?.id).toBe('sess_integration_list_123');
-      expect(parsed.data?.sessions?.[0]).toMatchObject({ seq: 1, pendingVersion: 0 });
+      expect(parsed.data?.sessions?.[0]).toMatchObject({ seq: 1, pendingVersion: 0, agentStateVersion: 0 });
       expect(parsed.data?.sessions?.[0]?.tag).toBe('MyTag');
       expect(parsed.data?.sessions?.[0]?.title).toBe('My Title');
       expect(parsed.data?.sessions?.[0]?.host).toBe('host1');
@@ -365,6 +365,7 @@ describe('happier session list (integration)', () => {
         id: systemSessionId,
         seq: 2,
         pendingVersion: 7,
+        agentStateVersion: 9,
         isSystem: true,
         systemPurpose: 'voice_carrier',
       });

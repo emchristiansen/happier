@@ -21,6 +21,7 @@ export type ListSessionsLastMessagePreview = Readonly<{
 export type ListSessionsJsonSession = SessionSummary & Readonly<{
   seq: number;
   pendingVersion?: number;
+  agentStateVersion?: number;
   agentId: CliSessionRowModel['agentId'];
   vendorResumeEligible: boolean;
   vendorResumeReasonCode?: VendorResumeEligibilityReasonCode;
@@ -134,6 +135,7 @@ export async function listSessions(params: Readonly<{
         ...session,
         seq: rawRow.seq,
         ...(typeof rawRow.pendingVersion === 'number' ? { pendingVersion: rawRow.pendingVersion } : {}),
+        ...(typeof rawRow.agentStateVersion === 'number' ? { agentStateVersion: rawRow.agentStateVersion } : {}),
         agentId: row.agentId,
         vendorResumeEligible: row.vendorResume.eligible,
         ...(row.vendorResume.eligible ? {} : { vendorResumeReasonCode: row.vendorResume.reasonCode }),
