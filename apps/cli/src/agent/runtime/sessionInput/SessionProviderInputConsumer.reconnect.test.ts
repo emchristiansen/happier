@@ -1,5 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import axios from 'axios';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,20 +7,31 @@ import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import { createApiSessionSocketStub, bindApiSessionSocketPairMock } from '@/testkit/backends/apiSessionSocketHarness';
 import { createPlainSessionFixture } from '@/testkit/backends/sessionFixtures';
 import { createSessionProviderInputConsumer } from './SessionProviderInputConsumer';
+import { logger } from '@/ui/logger';
 
-const { mockIo } = vi.hoisted(() => ({ mockIo: vi.fn() }));
+const { mockIo, httpGet } = vi.hoisted(() => ({ mockIo: vi.fn(), httpGet: vi.fn() }));
 // Only network transports are replaced; the client, wake and drain owners stay real.
 vi.mock('socket.io-client', () => ({ io: mockIo }));
-vi.mock('axios', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('axios')>();
-  const unavailable = async () => { throw new Error('test transport disconnected'); };
-  return { ...actual, default: { ...actual.default, get: vi.fn(unavailable), post: unavailable, request: unavailable } };
+vi.mock('axios', async () => {
+  const { createOfflineAxios } = await import('@/testkit/http/offlineAxios');
+  const boundary = createOfflineAxios((url) => httpGet(url));
+  return { default: boundary, ...boundary };
 });
 
 describe('active-turn pending wake recovery', () => {
+  beforeEach(() => {
+    vi.stubEnv('HAPPIER_SERVER_URL', 'https://relay.example.invalid');
+    vi.stubEnv('HAPPIER_LOCAL_SERVER_URL', 'https://relay.example.invalid');
+    vi.stubEnv('HAPPIER_PUBLIC_SERVER_URL', 'https://relay.example.invalid');
+    vi.stubEnv('HAPPIER_WEBAPP_URL', 'https://relay.example.invalid');
+    vi.stubGlobal('fetch', async () => { throw new Error('Unconfigured offline fetch'); });
+    httpGet.mockReset().mockImplementation(async () => { throw new Error('test transport disconnected'); });
+    mockIo.mockReset().mockImplementation(() => { throw new Error('Unconfigured offline socket'); });
+  });
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
     vi.useRealTimers();
   });
 
@@ -52,7 +62,7 @@ describe('active-turn pending wake recovery', () => {
       await expect(failedWait).resolves.toBe(true);
       expect(getActiveAccountSettingsSnapshot()).toBeNull();
       await writeCredentialsLegacy({ token: 'test-token', secret: new Uint8Array(32).fill(1) });
-      vi.mocked(axios.get).mockImplementation(async (url) => {
+      httpGet.mockImplementation(async (url) => {
         if (String(url).endsWith('/v1/account/profile')) return { status: 200, data: { id: 'test-account' } };
         if (String(url).endsWith('/v2/account/settings')) return {
           status: 200, data: { version: 7, content: { t: 'plain', v: { schemaVersion: 6 } } },
@@ -72,6 +82,66 @@ describe('active-turn pending wake recovery', () => {
       reloadConfiguration();
     }
   }, 90_000);
+
+  it.each([
+    { phase: 'idle', eventAt: 'backoff' },
+    { phase: 'active', eventAt: 'backoff' },
+    { phase: 'idle', eventAt: 'exhaustion' },
+    { phase: 'active', eventAt: 'exhaustion' },
+  ] as const)('exhausts twelve real client failures in the $phase consumer with a fresh event at $eventAt', async ({ phase, eventAt }) => {
+    const testHome = await mkdtemp(join(tmpdir(), 'happier-pending-retry-'));
+    vi.stubEnv('HAPPIER_HOME_DIR', testHome);
+    const { reloadConfiguration } = await import('@/configuration');
+    reloadConfiguration();
+    const { ApiSessionClient } = await import('@/api/session/sessionClient');
+    const sessionSocket = createApiSessionSocketStub();
+    const userSocket = createApiSessionSocketStub();
+    sessionSocket.connect.mockImplementation(() => sessionSocket);
+    userSocket.connect.mockImplementation(() => userSocket);
+    bindApiSessionSocketPairMock(mockIo, { sessionSocket, userSocket, fallbackSocket: sessionSocket });
+    const client = new ApiSessionClient('test-token', {
+      ...createPlainSessionFixture({ id: 'pending-retry-session' }),
+      pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 1,
+    });
+    const materialize = vi.spyOn(client, 'materializeNextPendingMessageSafely');
+    const infoFile = vi.spyOn(logger, 'infoFile');
+    const consumer = createSessionProviderInputConsumer({
+      messageQueue: new MessageQueue2<{ id: string }>(() => 'mode'),
+      session: client,
+    });
+    const controller = new AbortController();
+    vi.useFakeTimers();
+    const waiting = phase === 'idle'
+      ? consumer.waitForNextInput({ abortSignal: controller.signal })
+      : consumer.pumpPendingWhileActive({ abortSignal: controller.signal, reason: 'retry-episode' });
+    const overlappingWait = phase === 'idle' ? consumer.waitForNextInput({ abortSignal: controller.signal }) : undefined;
+    try {
+      await vi.advanceTimersByTimeAsync(eventAt === 'backoff' ? 0 : 30 * 60_000);
+      const previousAttempts = eventAt === 'backoff' ? 1 : 12;
+      expect(materialize).toHaveBeenCalledTimes(previousAttempts);
+      userSocket.trigger('update', {
+        id: 'fresh-pending-episode', seq: 2, createdAt: 2,
+        body: { t: 'pending-changed', sid: client.sessionId, pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 2 },
+      });
+      await vi.advanceTimersByTimeAsync(30 * 60_000);
+      expect(materialize).toHaveBeenCalledTimes(previousAttempts + 12);
+      expect(infoFile).toHaveBeenCalledWith(
+        '[pendingInput] retry episode exhausted',
+        expect.objectContaining({ operation: 'materialization', status: 'exhausted', failedAttempts: 12 }),
+      );
+      await vi.advanceTimersByTimeAsync(30 * 60_000);
+      expect(materialize).toHaveBeenCalledTimes(previousAttempts + 12);
+      expect(sessionSocket.emit.mock.calls.filter(([event]) => event === 'pending-materialize-next')).toHaveLength(0);
+    } finally {
+      controller.abort();
+      await Promise.all([waiting, overlappingWait]);
+      vi.useRealTimers();
+      await client.close();
+      await rm(testHome, { recursive: true, force: true });
+      vi.unstubAllEnvs();
+      reloadConfiguration();
+    }
+  });
 
   it.each([
     { phase: 'active', updateTiming: 'after_rearm' },

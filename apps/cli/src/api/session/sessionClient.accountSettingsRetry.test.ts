@@ -1,0 +1,450 @@
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { createDeferred } from '@/testkit/async/deferred';
+import { createApiSessionSocketStub, type ApiSessionSocketStub } from '@/testkit/backends/apiSessionSocketHarness';
+
+const origin = 'https://relay.example.invalid';
+const scratch = join(tmpdir(), 'account-settings-retry-fixture');
+let sessionSocket: ApiSessionSocketStub;
+let userSocket: ApiSessionSocketStub;
+let readSettings: () => Promise<unknown>;
+const settingsRequests = vi.fn();
+
+// These are the actual HTTP/socket system boundaries. All internal session/settings owners run.
+vi.mock('axios', async () => {
+  const { createOfflineAxios } = await import('@/testkit/http/offlineAxios');
+  return { default: createOfflineAxios(async (url) => {
+    const path = new URL(url).pathname;
+    if (path === '/v2/account/settings') {
+      settingsRequests();
+      return readSettings();
+    }
+    if (path === '/v1/account/profile') return { status: 200, data: { id: 'retry-account' } };
+    if (path === '/health') return { status: 200, data: {} };
+    if (path === '/v1/features') return { status: 200, data: features };
+    if (path === '/v2/changes') return { status: 200, data: { changes: [], nextCursor: 0 } };
+    if (path.endsWith('/messages')) return { status: 200, data: { messages: [], hasMore: false } };
+    throw new Error(`Unconfigured offline settings GET: ${url}`);
+  }) };
+});
+
+vi.mock('socket.io-client', () => ({
+  io: (url: string, options: { auth: { clientType: string } }) => {
+    if (url !== origin) throw new Error(`Offline socket refused origin: ${url}`);
+    if (options.auth.clientType === 'user-scoped') return userSocket;
+    if (options.auth.clientType === 'session-scoped') return sessionSocket;
+    throw new Error('Unconfigured offline socket client type');
+  },
+}));
+
+const features = {
+  features: { sharing: { pendingQueueV2: { enabled: true }, pendingDeliveryState: { enabled: false } } },
+  capabilities: {},
+};
+let clientModule: typeof import('./sessionClient');
+let createPlainSessionFixture: typeof import('@/testkit/backends/sessionFixtures')['createPlainSessionFixture'];
+let snapshots: typeof import('@/settings/accountSettings/activeAccountSettingsSnapshot');
+let logger: typeof import('@/ui/logger')['logger'];
+const clients: import('./sessionClient').ApiSessionClient[] = [];
+
+function settings(version = 1) {
+  return {
+    status: 200,
+    data: { version, content: { t: 'plain', v: { sessionPendingQueueDeliveryTiming: 'after_runtime_idle' } } },
+  };
+}
+
+async function createClient() {
+  sessionSocket = createApiSessionSocketStub({ id: 'settings-session', connected: true });
+  userSocket = createApiSessionSocketStub({ id: 'settings-user', connected: false });
+  const fixture = createPlainSessionFixture({ id: 'settings-retry-session' });
+  fixture.metadata = {
+    ...fixture.metadata,
+    path: scratch,
+    homeDir: scratch,
+    happyHomeDir: scratch,
+    happyLibDir: scratch,
+    happyToolsDir: scratch,
+  };
+  const client = new clientModule.ApiSessionClient('synthetic-settings-token', fixture);
+  clients.push(client);
+  const connected = createDeferred<void>();
+  client.once('pending-eligibility-updated', () => connected.resolve());
+  client.onUserMessage(() => {});
+  await connected.promise;
+  return client;
+}
+
+describe('ApiSessionClient account settings retry', () => {
+  beforeAll(async () => {
+    vi.stubEnv('HAPPIER_SERVER_URL', origin);
+    vi.stubEnv('HAPPIER_LOCAL_SERVER_URL', origin);
+    vi.stubEnv('HAPPIER_PUBLIC_SERVER_URL', origin);
+    vi.stubEnv('HAPPIER_WEBAPP_URL', origin);
+    vi.stubEnv('HAPPY_ENABLE_V2_CHANGES', '0');
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.origin !== origin || url.pathname !== '/v1/features') {
+        throw new Error(`Unconfigured offline fetch: ${url.href}`);
+      }
+      return new Response(JSON.stringify(features), { status: 200 });
+    }));
+    const { reloadConfiguration } = await import('@/configuration');
+    reloadConfiguration();
+    clientModule = await import('./sessionClient');
+    ({ createPlainSessionFixture } = await import('@/testkit/backends/sessionFixtures'));
+    snapshots = await import('@/settings/accountSettings/activeAccountSettingsSnapshot');
+    ({ logger } = await import('@/ui/logger'));
+    const { writeCredentialsLegacy } = await import('@/persistence');
+    await writeCredentialsLegacy({ token: 'synthetic-settings-token', secret: new Uint8Array(32).fill(9) });
+  }, 120_000);
+
+  beforeEach(() => {
+    settingsRequests.mockClear();
+    snapshots.resetActiveAccountSettingsSnapshotForTests();
+    readSettings = async () => settings();
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  });
+
+  afterEach(async () => {
+    for (const client of clients.splice(0)) await client.close();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  afterAll(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it('recovers a failed settings read on the same connection without another event', async () => {
+    const failed = createDeferred<void>();
+    readSettings = async () => {
+      if (settingsRequests.mock.calls.length === 1) {
+        failed.resolve();
+        throw new Error('synthetic offline transport failure');
+      }
+      return settings(4);
+    };
+    const client = await createClient();
+    const abort = new AbortController();
+    let observed: boolean | null = null;
+    const wait = client.waitForPendingEligibilityUpdate(abort.signal).then((value) => { observed = value; return value; });
+    try {
+      await failed.promise;
+      await vi.advanceTimersByTimeAsync(300_000);
+      await vi.waitFor(() => expect(settingsRequests).toHaveBeenCalledTimes(2));
+      await expect(wait).resolves.toBe(true);
+      expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(4);
+      expect(observed).toBe(true);
+    } finally {
+      abort.abort();
+      await wait;
+    }
+  });
+
+  it('shares recovery across waiters and keeps it alive when one waiter aborts', async () => {
+    const firstRead = createDeferred<unknown>();
+    const requested = createDeferred<void>();
+    readSettings = () => {
+      requested.resolve();
+      return settingsRequests.mock.calls.length === 1 ? firstRead.promise : Promise.resolve(settings(5));
+    };
+    const client = await createClient();
+    const aborted = new AbortController();
+    const retained = new AbortController();
+    const firstWait = client.waitForPendingEligibilityUpdate(aborted.signal);
+    const secondWait = client.waitForPendingEligibilityUpdate(retained.signal);
+    try {
+      await requested.promise;
+      aborted.abort();
+      await expect(firstWait).resolves.toBe(false);
+      firstRead.reject(new Error('synthetic shared settings read failure'));
+      await vi.advanceTimersByTimeAsync(300_000);
+      await vi.waitFor(() => expect(settingsRequests).toHaveBeenCalledTimes(2));
+      await expect(secondWait).resolves.toBe(true);
+      expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(5);
+    } finally {
+      aborted.abort();
+      retained.abort();
+      await Promise.all([firstWait, secondWait]);
+    }
+  });
+
+  it('retains server retry guidance across a genuine pending wake', async () => {
+    const failed = createDeferred<void>();
+    readSettings = async () => {
+      if (settingsRequests.mock.calls.length === 1) {
+        failed.resolve();
+        return { status: 503, headers: { 'retry-after': '120' }, data: {} };
+      }
+      return settings(6);
+    };
+    const client = await createClient();
+    const abort = new AbortController();
+    const firstWait = client.waitForPendingEligibilityUpdate(abort.signal);
+    let secondWait: Promise<boolean> | undefined;
+    try {
+      await failed.promise;
+      await vi.advanceTimersByTimeAsync(1_000);
+      sessionSocket.trigger('update', {
+        id: 'genuine-pending-event', seq: 1, createdAt: Date.now(),
+        body: { t: 'pending-changed', sid: 'settings-retry-session', pendingVersion: 1, pendingCount: 1 },
+      });
+      await expect(firstWait).resolves.toBe(true);
+      secondWait = client.waitForPendingEligibilityUpdate(abort.signal);
+      await vi.advanceTimersByTimeAsync(118_999);
+      expect(settingsRequests).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(secondWait).resolves.toBe(true);
+      expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(6);
+    } finally {
+      abort.abort();
+      await Promise.all([firstWait, secondWait]);
+    }
+  });
+
+  it('waits for a replaced in-flight read and honors its server guidance after reconnect', async () => {
+    const firstRead = createDeferred<unknown>();
+    const requested = createDeferred<void>();
+    readSettings = () => {
+      requested.resolve();
+      return settingsRequests.mock.calls.length === 1 ? firstRead.promise : Promise.resolve(settings(7));
+    };
+    const client = await createClient();
+    const abort = new AbortController();
+    const wait = client.waitForPendingEligibilityUpdate(abort.signal);
+    try {
+      await requested.promise;
+      userSocket.trigger('connect');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settingsRequests).toHaveBeenCalledTimes(1);
+      firstRead.resolve({ status: 503, headers: { 'retry-after': '120' }, data: {} });
+      await vi.advanceTimersByTimeAsync(119_999);
+      expect(settingsRequests).toHaveBeenCalledTimes(1);
+      expect(snapshots.getActiveAccountSettingsSnapshot()).toBeNull();
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(wait).resolves.toBe(true);
+      expect(settingsRequests).toHaveBeenCalledTimes(2);
+      expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(7);
+    } finally {
+      abort.abort();
+      firstRead.resolve(settings(0));
+      await wait;
+    }
+  });
+
+  it('routes a settings hint through the shared flight and retains its minimum version', async () => {
+    const firstRead = createDeferred<unknown>();
+    const requested = createDeferred<void>();
+    readSettings = () => {
+      requested.resolve();
+      return settingsRequests.mock.calls.length === 1 ? firstRead.promise
+        : Promise.resolve(settings(settingsRequests.mock.calls.length === 2 ? 8 : 9));
+    };
+    const client = await createClient();
+    const abort = new AbortController();
+    const wait = client.waitForPendingEligibilityUpdate(abort.signal);
+    try {
+      await requested.promise;
+      userSocket.trigger('update', {
+        id: 'settings-hint-during-read', seq: 1, createdAt: Date.now(),
+        body: { t: 'account-settings-changed', settingsVersion: 9 },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settingsRequests).toHaveBeenCalledTimes(1);
+      firstRead.resolve({ status: 503, headers: { 'retry-after': '120' }, data: {} });
+      await vi.advanceTimersByTimeAsync(119_999);
+      expect(settingsRequests).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(() => expect(settingsRequests).toHaveBeenCalledTimes(3));
+      await expect(wait).resolves.toBe(true);
+      expect(settingsRequests).toHaveBeenCalledTimes(3);
+      expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(9);
+    } finally {
+      abort.abort();
+      firstRead.resolve(settings(0));
+      await wait;
+    }
+  });
+
+  it.each([401, 403])('stops retries after terminal authentication HTTP %s', async (status) => {
+    const failed = createDeferred<void>();
+    readSettings = async () => {
+      failed.resolve();
+      return { status, headers: {}, data: {} };
+    };
+    const client = await createClient();
+    const abort = new AbortController();
+    let observed: boolean | null = null;
+    const wait = client.waitForPendingEligibilityUpdate(abort.signal).then((value) => { observed = value; return value; });
+    try {
+      await failed.promise;
+      await vi.advanceTimersByTimeAsync(30 * 60_000);
+      expect(settingsRequests).toHaveBeenCalledTimes(1);
+      expect(snapshots.getActiveAccountSettingsSnapshot()).toBeNull();
+      expect(observed).toBeNull();
+    } finally {
+      abort.abort();
+      await wait;
+    }
+  });
+
+  it('keeps direct changes refresh reachable while the user socket is disconnected and honors its lower bound', async () => {
+    readSettings = async () => settingsRequests.mock.calls.length === 1
+      ? { status: 503, headers: { 'retry-after': '120' }, data: {} }
+      : settings(9);
+    const client = await createClient();
+    userSocket.connected = false;
+    const owner = client as unknown as {
+      refreshAccountSettingsFromChangesHint(version: number): Promise<void>;
+    };
+    await expect(owner.refreshAccountSettingsFromChangesHint(5)).rejects.toMatchObject({ status: 503 });
+    const refreshed = owner.refreshAccountSettingsFromChangesHint(9);
+    await vi.advanceTimersByTimeAsync(119_999);
+    expect(settingsRequests).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await refreshed;
+    expect(settingsRequests).toHaveBeenCalledTimes(2);
+    expect(userSocket.connected).toBe(false);
+    expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(9);
+  });
+
+  it('keeps joined higher-version changes refresh pending until its minimum actually applies', async () => {
+    const firstRead = createDeferred<unknown>();
+    const secondRead = createDeferred<unknown>();
+    const requested = createDeferred<void>();
+    readSettings = () => {
+      requested.resolve();
+      return settingsRequests.mock.calls.length === 1 ? firstRead.promise : secondRead.promise;
+    };
+    const client = await createClient();
+    const abort = new AbortController();
+    let observed: boolean | null = null;
+    const wait = client.waitForPendingEligibilityUpdate(abort.signal).then((value) => { observed = value; return value; });
+    const owner = client as unknown as { refreshAccountSettingsFromChangesHint(version: number): Promise<void> };
+    let refreshed: Promise<void> | undefined;
+    try {
+      await requested.promise;
+      refreshed = owner.refreshAccountSettingsFromChangesHint(9);
+      firstRead.resolve(settings(8));
+      await vi.waitFor(() => expect(settingsRequests).toHaveBeenCalledTimes(2));
+      expect(observed).toBeNull();
+      secondRead.resolve(settings(9));
+      await refreshed;
+      await expect(wait).resolves.toBe(true);
+      expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(9);
+    } finally {
+      abort.abort();
+      firstRead.resolve(settings(8));
+      secondRead.resolve(settings(9));
+      await Promise.all([wait, refreshed]);
+    }
+  });
+
+  it.each(['envelope', 'hint'] as const)('does not wake an already converged waiter when a live %s narrows eligibility', async (source) => {
+    readSettings = async () => ({
+      status: 200,
+      data: { version: 1, content: { t: 'plain', v: { sessionPendingQueueDeliveryTiming: 'after_foreground_ready' } } },
+    });
+    const client = await createClient();
+    await expect(client.waitForPendingEligibilityUpdate()).resolves.toBe(true);
+    readSettings = async () => settings(2);
+    const abort = new AbortController();
+    const wait = client.waitForPendingEligibilityUpdate(abort.signal);
+    try {
+      userSocket.trigger('update', {
+        id: 'narrow-settings-event', seq: 1, createdAt: Date.now(),
+        body: source === 'hint'
+          ? { t: 'account-settings-changed', settingsVersion: 2 }
+          : { t: 'update-account', id: 'retry-account', settingsV2: settings(2).data },
+      });
+      await vi.waitFor(() => expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(2));
+      abort.abort();
+      await expect(wait).resolves.toBe(false);
+    } finally {
+      abort.abort();
+      await wait;
+    }
+  });
+
+  it('exposes typed exhaustion when server guidance cannot fit the absolute window', async () => {
+    const failed = createDeferred<void>();
+    readSettings = async () => {
+      failed.resolve();
+      return { status: 503, headers: { 'retry-after': '1800' }, data: {} };
+    };
+    const diagnostic = vi.spyOn(logger, 'infoFile');
+    const client = await createClient();
+    const abort = new AbortController();
+    const wait = client.waitForPendingEligibilityUpdate(abort.signal);
+    try {
+      await failed.promise;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(diagnostic).toHaveBeenCalledWith('[pendingInput] retry episode exhausted', expect.objectContaining({
+        operation: 'account_settings', status: 'exhausted', reason: 'deadline', failedAttempts: 1,
+      }));
+      await vi.advanceTimersByTimeAsync(30 * 60_000);
+      expect(settingsRequests).toHaveBeenCalledTimes(1);
+      expect(snapshots.getActiveAccountSettingsSnapshot()).toBeNull();
+    } finally {
+      abort.abort();
+      await wait;
+    }
+  });
+
+  it.each(['user', 'session'] as const)('exhausts twelve actual failures without timer renewal and re-arms on a genuine %s reconnect', async (source) => {
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    const diagnostic = vi.spyOn(logger, 'infoFile');
+    readSettings = async () => { throw new Error('synthetic repeated settings failure'); };
+    const client = await createClient();
+    const abort = new AbortController();
+    const wait = client.waitForPendingEligibilityUpdate(abort.signal);
+    try {
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        await vi.waitFor(() => expect(settingsRequests).toHaveBeenCalledTimes(attempt + 1));
+        await vi.advanceTimersByTimeAsync(Math.ceil(250 * 2 ** attempt * 1.1));
+      }
+      expect(diagnostic).toHaveBeenCalledWith('[pendingInput] retry episode exhausted', expect.objectContaining({
+        operation: 'account_settings', status: 'exhausted', reason: 'attempt_limit', failedAttempts: 12,
+      }));
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(settingsRequests).toHaveBeenCalledTimes(12);
+      readSettings = async () => settings(8);
+      if (source === 'user') userSocket.trigger('connect');
+      else {
+        sessionSocket.connected = false;
+        sessionSocket.trigger('disconnect', 'transport close');
+        sessionSocket.connected = true;
+        sessionSocket.trigger('connect');
+      }
+      await expect(wait).resolves.toBe(true);
+      if (snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion !== 8) {
+        // Session reconnect publishes a verdict-free eligibility wake before its settings
+        // request settles. Re-arm the actual input wait against that fresh connection.
+        await expect(client.waitForPendingEligibilityUpdate(abort.signal)).resolves.toBe(true);
+      }
+      expect(settingsRequests).toHaveBeenCalledTimes(13);
+      expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(8);
+    } finally {
+      abort.abort();
+      await wait;
+    }
+  });
+
+  it('stops a scheduled retry when the final waiter aborts', async () => {
+    const failed = createDeferred<void>();
+    readSettings = async () => { failed.resolve(); throw new Error('synthetic cancelled settings read'); };
+    const client = await createClient();
+    const abort = new AbortController();
+    const wait = client.waitForPendingEligibilityUpdate(abort.signal);
+    await failed.promise;
+    await vi.advanceTimersByTimeAsync(0);
+    abort.abort();
+    await expect(wait).resolves.toBe(false);
+    await vi.advanceTimersByTimeAsync(30 * 60_000);
+    expect(settingsRequests).toHaveBeenCalledTimes(1);
+  });
+});

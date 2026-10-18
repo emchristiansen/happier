@@ -1,5 +1,7 @@
 import type { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
-import { readAuthenticationStatus } from '@/api/client/httpStatusError';
+import { readAuthenticationStatus, isPermanentRequestError } from '@/api/client/httpStatusError';
+import { classifyServerEndpointError } from '@/api/client/classifyServerEndpointError';
+import { PendingInputRetryEpisode } from '@/api/session/pendingInputRetryEpisode';
 import { logger } from '@/ui/logger';
 import {
   DEFAULT_SESSION_METADATA_WAIT_RETRY_BACKOFF_MS,
@@ -441,12 +443,12 @@ async function pumpPendingWhileActive(
     drainPending: (drainOpts?: DrainPendingOptions) => Promise<DrainPendingResult>;
   }>,
 ): Promise<void> {
+  const retryEpisode = new PendingInputRetryEpisode('materialization');
   while (!opts.abortSignal.aborted && (opts.shouldContinue?.() ?? true)) {
     const wakeController = new AbortController();
     const onAbort = () => wakeController.abort(opts.abortSignal.reason);
     opts.abortSignal.addEventListener('abort', onAbort, { once: true });
     if (opts.abortSignal.aborted) wakeController.abort(opts.abortSignal.reason);
-
     let passDirty = false;
     const armedWake = waitForWakeSignal({
       waitForPendingEligibilityUpdate: opts.waitForPendingEligibilityUpdate,
@@ -457,20 +459,38 @@ async function pumpPendingWhileActive(
       if (updated) passDirty = true;
       return updated;
     });
-
     try {
-      const result = await opts.drainPending({
-        ...opts,
-        abortSignal: opts.abortSignal,
-      });
-      if (
-        opts.abortSignal.aborted
-        || !(opts.shouldContinue?.() ?? true)
-        || result.stoppedReason === 'aborted'
-        || result.stoppedReason === 'auth_failure'
-      ) return;
-      if (passDirty) continue;
+      const before = retryEpisode.beginAttempt();
+      if (before.status === 'retrying' && before.retryAtMs <= Date.now()) {
+        const result = await opts.drainPending({ ...opts, abortSignal: opts.abortSignal });
+        if (
+          opts.abortSignal.aborted || !(opts.shouldContinue?.() ?? true)
+          || result.stoppedReason === 'aborted' || result.stoppedReason === 'auth_failure'
+        ) return;
+        if (result.stoppedReason === 'retryable_transport') retryEpisode.failed(result.retryAfterMs);
+        else retryEpisode.settled();
+      }
+      if (passDirty) {
+        retryEpisode.freshEvent();
+        continue;
+      }
+      const state = retryEpisode.state;
+      if (state.status === 'retrying') {
+        const winner = await Promise.race([
+          armedWake.then((updated) => ({ kind: 'wake' as const, updated })),
+          waitForSessionMetadataRetryBackoff({
+            abortSignal: wakeController.signal,
+            backoffMs: Math.max(1, state.retryAtMs - Date.now()), minMs: 1,
+          }).then(() => ({ kind: 'retry' as const })),
+        ]);
+        if (winner.kind === 'wake') {
+          if (!winner.updated) return;
+          retryEpisode.freshEvent();
+        }
+        continue;
+      }
       if (!await armedWake) return;
+      retryEpisode.freshEvent();
     } finally {
       opts.abortSignal.removeEventListener('abort', onAbort);
       wakeController.abort('active-turn-pending-pass-complete');
@@ -510,14 +530,10 @@ async function waitForNextInput<Mode, Message>(
   },
 ): Promise<MessageBatch<Mode, Message> | null> {
   const metadataWaitRetryBackoffMs = opts.metadataWaitRetryBackoffMs ?? DEFAULT_SESSION_METADATA_WAIT_RETRY_BACKOFF_MS;
-  let timedMaterializationRejoinConsumed = false;
+  const retryEpisode = new PendingInputRetryEpisode('materialization');
 
-  while (true) {
-    if (opts.abortSignal.aborted || !opts.isProviderInputAdmissionOpen()) {
-      return null;
-    }
-    // Arm ordinary wakes before the complete reconcile/materialize pass. A wake at any awaited
-    // phase marks this pass dirty and forces a full re-run; it never materializes directly.
+  while (!opts.abortSignal.aborted && opts.isProviderInputAdmissionOpen()) {
+    // Arm before the complete pass: an event during any await dirties the pass.
     const controller = new AbortController();
     const onAbort = () => controller.abort();
     opts.abortSignal.addEventListener('abort', onAbort, { once: true });
@@ -529,94 +545,58 @@ async function waitForNextInput<Mode, Message>(
       controller,
       metadataWaitRetryBackoffMs,
     }).then((winner) => {
-      passDirty = true;
+      if (winner.kind === 'queue' ? winner.hasMessages : winner.ok) passDirty = true;
       return winner;
     });
-
-    const existingBatch = await collectQueuedBatch(opts.messageQueue, opts.abortSignal);
-    if (existingBatch) {
-      controller.abort('sessionProviderInputConsumer-batch');
-      opts.abortSignal.removeEventListener('abort', onAbort);
-      if (!opts.isProviderInputAdmissionOpen()) return null;
-      await callMetadataUpdate(opts.onMetadataUpdate, opts.abortSignal);
-      if (opts.abortSignal.aborted) {
-        return null;
-      }
-      return existingBatch;
-    }
-
-    const materializationRetryAfterMs = await materializePendingMessage(opts);
-    if (!opts.isProviderInputAdmissionOpen()) return null;
-
-    const materializedBatch = await collectQueuedBatch(opts.messageQueue, opts.abortSignal);
-    if (materializedBatch) {
-      controller.abort('sessionProviderInputConsumer-materialized');
-      opts.abortSignal.removeEventListener('abort', onAbort);
-      await callMetadataUpdate(opts.onMetadataUpdate, opts.abortSignal);
-      if (opts.abortSignal.aborted) {
-        return null;
-      }
-      return materializedBatch;
-    }
-
-    if (materializationRetryAfterMs !== null && !timedMaterializationRejoinConsumed) {
-      timedMaterializationRejoinConsumed = true;
-      const retryOrWake = await Promise.race([
-        wakePromise.then((winner) => ({ kind: 'wake' as const, winner })),
-        waitForSessionMetadataRetryBackoff({
-          abortSignal: controller.signal,
-          backoffMs: materializationRetryAfterMs,
-        }).then(() => ({ kind: 'retry' as const })),
-      ]);
-      controller.abort('sessionProviderInputConsumer-materialization-retry');
-      opts.abortSignal.removeEventListener('abort', onAbort);
-      if (opts.abortSignal.aborted || !opts.isProviderInputAdmissionOpen()) return null;
-      if (retryOrWake.kind === 'wake') {
-        if (retryOrWake.winner.kind === 'queue' && !retryOrWake.winner.hasMessages) return null;
-        if (retryOrWake.winner.kind === 'meta' && retryOrWake.winner.ok) {
-          await callMetadataUpdate(opts.onMetadataUpdate, opts.abortSignal);
-        }
-      }
-      continue;
-    }
+    const applyWake = async (winner: WakeWinner): Promise<boolean> => {
+      if (winner.kind === 'queue' && !winner.hasMessages) return false;
+      if (winner.kind === 'meta' && !winner.ok) return !opts.abortSignal.aborted;
+      retryEpisode.freshEvent();
+      if (winner.kind === 'meta') await callMetadataUpdate(opts.onMetadataUpdate, opts.abortSignal);
+      return true;
+    };
 
     try {
-      if (opts.messageQueue.size() > 0 || passDirty || !opts.isProviderInputAdmissionOpen()) {
-        controller.abort('sessionProviderInputConsumer-dirty-pass');
-        if (!opts.isProviderInputAdmissionOpen()) return null;
-        if (passDirty) {
-          const dirtyWinner = await wakePromise;
-          if (dirtyWinner.kind === 'meta' && dirtyWinner.ok) {
-            await callMetadataUpdate(opts.onMetadataUpdate, opts.abortSignal);
-          }
+      let batch = await collectQueuedBatch(opts.messageQueue, opts.abortSignal);
+      if (!batch) {
+        const state = retryEpisode.beginAttempt();
+        if (state.status === 'retrying' && state.retryAtMs <= Date.now()) {
+          const retry = await materializePendingMessage(opts);
+          if (retry) retryEpisode.failed(retry.retryAfterMs, metadataWaitRetryBackoffMs);
+          else retryEpisode.settled();
+          batch = await collectQueuedBatch(opts.messageQueue, opts.abortSignal);
         }
-        continue;
       }
-
-      const winner = await wakePromise;
-
-      if (winner.kind === 'meta' && !winner.ok) {
-        controller.abort('sessionProviderInputConsumer-meta-false');
-
-        if (opts.abortSignal.aborted) {
-          return null;
-        }
-
-        continue;
-      }
-
-      controller.abort('sessionProviderInputConsumer');
-
-      if (winner.kind === 'queue' && !winner.hasMessages) return null;
-      if (winner.kind === 'meta' && winner.ok) {
+      if (opts.abortSignal.aborted || !opts.isProviderInputAdmissionOpen()) return null;
+      if (batch) {
         await callMetadataUpdate(opts.onMetadataUpdate, opts.abortSignal);
+        return opts.abortSignal.aborted ? null : batch;
       }
-      controller.abort('sessionProviderInputConsumer-rerun');
-      continue;
+      if (passDirty) {
+        if (!await applyWake(await wakePromise)) return null;
+        continue;
+      }
+      const state = retryEpisode.state;
+      if (state.status === 'retrying') {
+        const retryOrWake = await Promise.race([
+          wakePromise.then((winner) => ({ kind: 'wake' as const, winner })),
+          waitForSessionMetadataRetryBackoff({
+            abortSignal: controller.signal,
+            backoffMs: Math.max(1, state.retryAtMs - Date.now()),
+            minMs: 1,
+          }).then(() => ({ kind: 'retry' as const })),
+        ]);
+        if (retryOrWake.kind === 'wake' && !await applyWake(retryOrWake.winner)) return null;
+        // A timer rejoins the same episode. Only applyWake renews its budget.
+        continue;
+      }
+      if (!await applyWake(await wakePromise)) return null;
     } finally {
+      controller.abort('sessionProviderInputConsumer-pass-complete');
       opts.abortSignal.removeEventListener('abort', onAbort);
     }
   }
+  return null;
 }
 
 async function collectQueuedBatch<Mode, Message>(
@@ -634,7 +614,7 @@ async function materializePendingMessage<Mode, Message>(
     abortSignal: AbortSignal;
     isProviderInputAdmissionOpen: () => boolean;
   },
-): Promise<number | null> {
+): Promise<Readonly<{ retryAfterMs?: number }> | null> {
   const reconcileWhenEmpty = opts.reconcileWhenEmpty ?? 'skip';
   let activeTurnSteerability = readActiveTurnSteerability(opts);
   let result: PendingMaterializationResult;
@@ -668,6 +648,10 @@ async function materializePendingMessage<Mode, Message>(
         reason: 'unknown',
       });
     }
+    if (localIds.length === 0 && !isPermanentRequestError(error)) {
+      const classified = classifyServerEndpointError(error);
+      return classified.retryAfterMs === undefined ? {} : { retryAfterMs: classified.retryAfterMs };
+    }
     return null;
   }
   logInputConsumerMaterializationDecision({
@@ -688,18 +672,16 @@ async function materializePendingMessage<Mode, Message>(
   }
   if (result.type !== 'retryable_transport') return null;
 
-  // A transport retry without a server-provided delay can otherwise consume the only
-  // eligibility wake and then wait forever for another event. Reuse the session client's
-  // authoritative reconciliation hook before one bounded local retry; connection recovery
-  // remains responsible for publishing subsequent wakes, so this is not a polling loop.
+  // Reconcile through the same authoritative owner; no alternate claim or delivery path.
   if (opts.session.reconcilePendingQueueState) {
-    await Promise.resolve(opts.session.reconcilePendingQueueState({ force: true })).catch((error: unknown) => {
+    try {
+      await opts.session.reconcilePendingQueueState({ force: true });
+    } catch (error) {
+      if (readAuthenticationStatus(error) !== null) throw new PendingQueueMaterializationAuthError();
       logger.debug('[pendingQueue] retryable transport reconciliation failed (non-fatal)', error);
-    });
+    }
   }
-  return result.retryAfterMs
-    ?? opts.metadataWaitRetryBackoffMs
-    ?? DEFAULT_SESSION_METADATA_WAIT_RETRY_BACKOFF_MS;
+  return result.retryAfterMs === undefined ? {} : { retryAfterMs: result.retryAfterMs };
 }
 
 function withDefaultDrainOptions(
@@ -767,9 +749,11 @@ async function drainPendingMessages(
         materialized += 1;
         continue;
       }
-      return { materialized, stoppedReason: result };
+      return typeof result === 'string'
+        ? { materialized, stoppedReason: result }
+        : { materialized, ...result };
     } catch (error) {
-      return { materialized, stoppedReason: readDrainErrorStoppedReason(error, opts) };
+      return { materialized, ...readDrainErrorResult(error, opts) };
     }
   }
 
@@ -779,7 +763,7 @@ async function drainPendingMessages(
 async function materializeNextPendingForDrain(
   session: SessionProviderInputConsumerSession,
   opts: DrainPendingOptions,
-): Promise<Exclude<DrainPendingResult['stoppedReason'], 'aborted' | 'drain_disallowed' | 'materialization_blocked' | 'max_pop_per_wake'> | 'materialized'> {
+): Promise<Exclude<DrainPendingResult['stoppedReason'], 'aborted' | 'drain_disallowed' | 'materialization_blocked' | 'max_pop_per_wake' | 'retryable_transport'> | 'materialized' | Readonly<{ stoppedReason: 'retryable_transport'; retryAfterMs?: number }>> {
   try {
     const reconcileWhenEmpty = 'force';
     let activeTurnSteerability = readActiveTurnSteerability(opts);
@@ -815,20 +799,31 @@ async function materializeNextPendingForDrain(
       logTerminalAuthDrainStop(opts, result.statusCode);
       return 'auth_failure';
     }
-    if (result.type === 'retryable_transport') return 'error';
+    if (result.type === 'retryable_transport') return {
+      stoppedReason: 'retryable_transport',
+      ...(result.retryAfterMs === undefined ? {} : { retryAfterMs: result.retryAfterMs }),
+    };
     return 'no_pending';
   } catch (error) {
-    return readDrainErrorStoppedReason(error, opts);
+    const result = readDrainErrorResult(error, opts);
+    return result.stoppedReason === 'retryable_transport' ? result : result.stoppedReason;
   }
 }
 
-function readDrainErrorStoppedReason(error: unknown, opts: DrainPendingOptions): 'auth_failure' | 'error' {
+function readDrainErrorResult(error: unknown, opts: DrainPendingOptions):
+  | Readonly<{ stoppedReason: 'auth_failure' | 'error' }>
+  | Readonly<{ stoppedReason: 'retryable_transport'; retryAfterMs?: number }> {
   const terminalAuthStatus = readAuthenticationStatus(error);
   if (terminalAuthStatus !== null) {
     logTerminalAuthDrainStop(opts, terminalAuthStatus);
-    return 'auth_failure';
+    return { stoppedReason: 'auth_failure' };
   }
-  return 'error';
+  if (isPermanentRequestError(error)) return { stoppedReason: 'error' };
+  const classified = classifyServerEndpointError(error);
+  return {
+    stoppedReason: 'retryable_transport',
+    ...(classified.retryAfterMs === undefined ? {} : { retryAfterMs: classified.retryAfterMs }),
+  };
 }
 
 function logTerminalAuthDrainStop(opts: DrainPendingOptions, status: 401 | 403 | null): void {

@@ -11,6 +11,7 @@ import {
 } from '@happier-dev/protocol';
 
 import { serializeAxiosErrorForLog } from '@/api/client/serializeAxiosErrorForLog';
+import { classifyServerEndpointError } from '@/api/client/classifyServerEndpointError';
 import type { Credentials } from '@/persistence';
 import { configuration } from '@/configuration';
 import { logger } from '@/ui/logger';
@@ -88,10 +89,12 @@ function contextFromActiveSnapshot(active: NonNullable<ReturnType<typeof getActi
 
 class AccountSettingsV2RequestError extends Error {
   readonly status: number;
+  readonly retryAfterMs?: number;
 
-  constructor(status: number) {
+  constructor(status: number, retryAfterMs?: number) {
     super(`Failed to fetch /v2/account/settings (${status})`);
     this.status = status;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -105,7 +108,8 @@ async function requestAccountSettingsV2(credentials: Credentials): Promise<Accou
     validateStatus: () => true,
   });
   if (response.status < 200 || response.status >= 300) {
-    throw new AccountSettingsV2RequestError(response.status);
+    const classification = classifyServerEndpointError({ response: { status: response.status, headers: response.headers } });
+    throw new AccountSettingsV2RequestError(response.status, classification.retryable ? classification.retryAfterMs : undefined);
   }
   return AccountSettingsV2GetResponseSchema.parse(response.data);
 }
