@@ -218,7 +218,32 @@ export function createSessionProviderInputConsumer<Mode, Message>(
   opts: SessionProviderInputConsumerOptions<Mode, Message>,
 ): SessionProviderInputConsumer<Mode, Message> {
   let waitForNextInputTurn: Promise<void> = Promise.resolve();
-  let drainPendingTurn: Promise<void> = Promise.resolve();
+  const materializationRetryEpisode = new PendingInputRetryEpisode('materialization');
+  let materializationTurn: Promise<void> = Promise.resolve();
+  // Idle and active consumers share the complete pass, including failure accounting.
+  // Serializing only the RPC would let a queued pass bypass the preceding backoff.
+  const runMaterializationPass = async <Result>(
+    signal: AbortSignal,
+    pass: () => Promise<Result>,
+    readRetry: (result: Result) => Readonly<{ retryAfterMs?: number }> | null,
+  ): Promise<Result | undefined> => {
+    const previous = materializationTurn;
+    let release: () => void = () => {};
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    materializationTurn = previous.catch(() => undefined).then(() => current);
+    try {
+      if (!await waitForSerializedWaitTurn(previous, signal)) return undefined;
+      const state = materializationRetryEpisode.beginAttempt();
+      if (state.status !== 'retrying' || state.retryAtMs > Date.now()) return undefined;
+      const result = await pass();
+      const retry = readRetry(result);
+      if (retry) materializationRetryEpisode.failed(retry.retryAfterMs, opts.metadataWaitRetryBackoffMs);
+      else if (!signal.aborted) materializationRetryEpisode.settled();
+      return result;
+    } finally {
+      release();
+    }
+  };
   let providerInputAdmissionOpen = true;
   let activeProviderInputDispatches = 0;
   let activePendingMaterializationRequests = 0;
@@ -339,29 +364,15 @@ export function createSessionProviderInputConsumer<Mode, Message>(
   };
 
   const drainPending = async (drainOpts?: DrainPendingOptions): Promise<DrainPendingResult> => {
-    const previousTurn = drainPendingTurn;
-    let releaseTurn: () => void = () => {};
-    const currentTurn = new Promise<void>((resolve) => {
-      releaseTurn = resolve;
-    });
-    drainPendingTurn = previousTurn.catch(() => undefined).then(() => currentTurn);
-
-    try {
-      const abortSignal = drainOpts?.abortSignal ?? new AbortController().signal;
-      const canStart = await waitForSerializedWaitTurn(previousTurn, abortSignal);
-      if (!canStart) {
-        return { materialized: 0, stoppedReason: 'aborted' };
-      }
+    const abortSignal = drainOpts?.abortSignal ?? new AbortController().signal;
+    const result = await runMaterializationPass(abortSignal, async () => {
       if (opts.messageQueue.size() > 0) {
-        return { materialized: 0, stoppedReason: 'drain_disallowed' };
+        return { materialized: 0, stoppedReason: 'drain_disallowed' } as const;
       }
-      // A provider loop normally releases this reservation by dispatching the returned batch or
-      // requesting its next input. If the exact durable row is instead resolved/discarded outside
-      // that loop, reuse the session client's authoritative localId reconciliation before letting
-      // the anonymous local reservation hide later Pending work.
+      // Keep the exact localId reservation authoritative before any later claim.
       await reconcileReservedProviderInputBatch();
       if (providerInputBatchReserved) {
-        return { materialized: 0, stoppedReason: 'drain_disallowed' };
+        return { materialized: 0, stoppedReason: 'drain_disallowed' } as const;
       }
       const callerShouldContinue = drainOpts?.shouldContinue;
       return await drainPendingMessages(withDefaultDrainOptions(
@@ -379,9 +390,16 @@ export function createSessionProviderInputConsumer<Mode, Message>(
           ),
         },
       ));
-    } finally {
-      releaseTurn();
-    }
+    }, (passResult) => passResult.stoppedReason === 'retryable_transport'
+      ? { retryAfterMs: passResult.retryAfterMs } : null);
+    if (result) return result;
+    if (abortSignal.aborted) return { materialized: 0, stoppedReason: 'aborted' };
+    const state = materializationRetryEpisode.state;
+    if (state.status === 'exhausted') return { materialized: 0, stoppedReason: 'retry_exhausted' };
+    return {
+      materialized: 0, stoppedReason: 'retryable_transport',
+      ...(state.status === 'retrying' ? { retryAfterMs: Math.max(1, state.retryAtMs - Date.now()) } : {}),
+    };
   };
 
   return {
@@ -412,6 +430,8 @@ export function createSessionProviderInputConsumer<Mode, Message>(
           session: admissionTrackedSession,
           abortSignal: waitOpts.abortSignal,
           isProviderInputAdmissionOpen: () => providerInputAdmissionOpen,
+          retryEpisode: materializationRetryEpisode,
+          materialize: (pass) => runMaterializationPass(waitOpts.abortSignal, pass, (result) => result),
         });
         if (
           batch?.pendingProviderAction !== undefined
@@ -432,6 +452,7 @@ export function createSessionProviderInputConsumer<Mode, Message>(
         ...pumpOpts,
         waitForPendingEligibilityUpdate: admissionTrackedSession.waitForPendingEligibilityUpdate,
         drainPending,
+        retryEpisode: materializationRetryEpisode,
       });
     },
   };
@@ -441,9 +462,10 @@ async function pumpPendingWhileActive(
   opts: ActiveTurnPendingPumpOptions & Readonly<{
     waitForPendingEligibilityUpdate: SessionProviderInputConsumerSession['waitForPendingEligibilityUpdate'];
     drainPending: (drainOpts?: DrainPendingOptions) => Promise<DrainPendingResult>;
+    retryEpisode: PendingInputRetryEpisode;
   }>,
 ): Promise<void> {
-  const retryEpisode = new PendingInputRetryEpisode('materialization');
+  const retryEpisode = opts.retryEpisode;
   while (!opts.abortSignal.aborted && (opts.shouldContinue?.() ?? true)) {
     const wakeController = new AbortController();
     const onAbort = () => wakeController.abort(opts.abortSignal.reason);
@@ -460,16 +482,11 @@ async function pumpPendingWhileActive(
       return updated;
     });
     try {
-      const before = retryEpisode.beginAttempt();
-      if (before.status === 'retrying' && before.retryAtMs <= Date.now()) {
-        const result = await opts.drainPending({ ...opts, abortSignal: opts.abortSignal });
-        if (
-          opts.abortSignal.aborted || !(opts.shouldContinue?.() ?? true)
-          || result.stoppedReason === 'aborted' || result.stoppedReason === 'auth_failure'
-        ) return;
-        if (result.stoppedReason === 'retryable_transport') retryEpisode.failed(result.retryAfterMs);
-        else retryEpisode.settled();
-      }
+      const result = await opts.drainPending({ ...opts, abortSignal: opts.abortSignal });
+      if (
+        opts.abortSignal.aborted || !(opts.shouldContinue?.() ?? true)
+        || result.stoppedReason === 'aborted' || result.stoppedReason === 'auth_failure'
+      ) return;
       if (passDirty) {
         retryEpisode.freshEvent();
         continue;
@@ -527,10 +544,12 @@ async function waitForNextInput<Mode, Message>(
   opts: SessionProviderInputConsumerOptions<Mode, Message> & {
     abortSignal: AbortSignal;
     isProviderInputAdmissionOpen: () => boolean;
+    retryEpisode: PendingInputRetryEpisode;
+    materialize: (pass: () => Promise<Readonly<{ retryAfterMs?: number }> | null>) => Promise<Readonly<{ retryAfterMs?: number }> | null | undefined>;
   },
 ): Promise<MessageBatch<Mode, Message> | null> {
   const metadataWaitRetryBackoffMs = opts.metadataWaitRetryBackoffMs ?? DEFAULT_SESSION_METADATA_WAIT_RETRY_BACKOFF_MS;
-  const retryEpisode = new PendingInputRetryEpisode('materialization');
+  const retryEpisode = opts.retryEpisode;
 
   while (!opts.abortSignal.aborted && opts.isProviderInputAdmissionOpen()) {
     // Arm before the complete pass: an event during any await dirties the pass.
@@ -559,13 +578,8 @@ async function waitForNextInput<Mode, Message>(
     try {
       let batch = await collectQueuedBatch(opts.messageQueue, opts.abortSignal);
       if (!batch) {
-        const state = retryEpisode.beginAttempt();
-        if (state.status === 'retrying' && state.retryAtMs <= Date.now()) {
-          const retry = await materializePendingMessage(opts);
-          if (retry) retryEpisode.failed(retry.retryAfterMs, metadataWaitRetryBackoffMs);
-          else retryEpisode.settled();
-          batch = await collectQueuedBatch(opts.messageQueue, opts.abortSignal);
-        }
+        await opts.materialize(() => materializePendingMessage(opts));
+        batch = await collectQueuedBatch(opts.messageQueue, opts.abortSignal);
       }
       if (opts.abortSignal.aborted || !opts.isProviderInputAdmissionOpen()) return null;
       if (batch) {

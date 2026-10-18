@@ -3066,7 +3066,7 @@ export class ApiSessionClient extends EventEmitter {
         if (settingsVersion !== null && Number.isSafeInteger(settingsVersion) && settingsVersion >= 0) {
             this.accountSettingsHighestObservedVersion = Math.max(this.accountSettingsHighestObservedVersion, settingsVersion);
         }
-        const retryState = this.accountSettingsRetryEpisode.state;
+        const retryState = this.accountSettingsRetryEpisode.beginAttempt();
         if (!opts.signal && (retryState.status === 'exhausted'
             || (retryState.status === 'retrying' && retryState.retryAtMs > Date.now()))) {
             const current = this.convergeAccountSettingsForUserSocketConnection(false);
@@ -3079,7 +3079,7 @@ export class ApiSessionClient extends EventEmitter {
             ? this.accountSettingsSyncBarrier
             : null;
         if (existingConvergence) {
-            return existingConvergence.then((didApply) => {
+            return existingConvergence.then(async (didApply) => {
                 if (!didApply) {
                     throw this.accountSettingsSyncFailure instanceof Error
                         ? this.accountSettingsSyncFailure
@@ -3087,7 +3087,7 @@ export class ApiSessionClient extends EventEmitter {
                 }
                 const minimum = Math.max(settingsVersion ?? -1, this.accountSettingsHighestObservedVersion);
                 if ((getActiveAccountSettingsSnapshot()?.settingsVersion ?? -1) < minimum) {
-                    return this.refreshAccountSettingsFromChangesHint(minimum, opts);
+                    await this.refreshAccountSettingsFromChangesHint(minimum, opts);
                 }
             });
         }

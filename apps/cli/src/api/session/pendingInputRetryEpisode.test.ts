@@ -28,7 +28,7 @@ describe('pending input retry budget', () => {
     episode.freshEvent();
     expect(episode.beginAttempt()).toMatchObject({ status: 'retrying', failedAttempts: 0, retryAtMs: 400_000 });
     episode.settled();
-    expect(episode.beginAttempt()).toMatchObject({ status: 'retrying', retryAtMs: 100 });
+    expect(episode.beginAttempt()).toMatchObject({ status: 'retrying', retryAtMs: 400_000 });
   });
 
   it('exhausts immediately when server guidance cannot fit rather than issuing an early attempt', () => {

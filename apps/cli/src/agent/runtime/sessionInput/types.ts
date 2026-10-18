@@ -31,7 +31,8 @@ export type DrainPendingStoppedReason =
   | 'error'
   | 'materialization_blocked'
   | 'max_pop_per_wake'
-  | 'no_pending';
+  | 'no_pending'
+  | 'retry_exhausted';
 
 export type DrainPendingOptions = {
   maxPopPerWake?: number | undefined;

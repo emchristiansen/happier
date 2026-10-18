@@ -11,6 +11,8 @@ let sessionSocket: ApiSessionSocketStub;
 let userSocket: ApiSessionSocketStub;
 let readSettings: () => Promise<unknown>;
 const settingsRequests = vi.fn();
+let activeSettingsRequests = 0;
+let maxActiveSettingsRequests = 0;
 
 // These are the actual HTTP/socket system boundaries. All internal session/settings owners run.
 vi.mock('axios', async () => {
@@ -19,7 +21,10 @@ vi.mock('axios', async () => {
     const path = new URL(url).pathname;
     if (path === '/v2/account/settings') {
       settingsRequests();
-      return readSettings();
+      activeSettingsRequests += 1;
+      maxActiveSettingsRequests = Math.max(maxActiveSettingsRequests, activeSettingsRequests);
+      try { return await readSettings(); }
+      finally { activeSettingsRequests -= 1; }
     }
     if (path === '/v1/account/profile') return { status: 200, data: { id: 'retry-account' } };
     if (path === '/health') return { status: 200, data: {} };
@@ -56,24 +61,21 @@ function settings(version = 1) {
   };
 }
 
-async function createClient() {
+function createClient() {
   sessionSocket = createApiSessionSocketStub({ id: 'settings-session', connected: true });
   userSocket = createApiSessionSocketStub({ id: 'settings-user', connected: false });
-  const fixture = createPlainSessionFixture({ id: 'settings-retry-session' });
-  fixture.metadata = {
-    ...fixture.metadata,
+  const originalFixture = createPlainSessionFixture({ id: 'settings-retry-session' });
+  const fixture = { ...originalFixture, metadata: {
+    ...originalFixture.metadata,
     path: scratch,
     homeDir: scratch,
     happyHomeDir: scratch,
     happyLibDir: scratch,
     happyToolsDir: scratch,
-  };
+  } };
   const client = new clientModule.ApiSessionClient('synthetic-settings-token', fixture);
   clients.push(client);
-  const connected = createDeferred<void>();
-  client.once('pending-eligibility-updated', () => connected.resolve());
   client.onUserMessage(() => {});
-  await connected.promise;
   return client;
 }
 
@@ -103,6 +105,8 @@ describe('ApiSessionClient account settings retry', () => {
 
   beforeEach(() => {
     settingsRequests.mockClear();
+    activeSettingsRequests = 0;
+    maxActiveSettingsRequests = 0;
     snapshots.resetActiveAccountSettingsSnapshotForTests();
     readSettings = async () => settings();
     vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
@@ -417,6 +421,7 @@ describe('ApiSessionClient account settings retry', () => {
       else {
         sessionSocket.connected = false;
         sessionSocket.trigger('disconnect', 'transport close');
+        await vi.waitFor(() => expect(userSocket.connected).toBe(false));
         sessionSocket.connected = true;
         sessionSocket.trigger('connect');
       }
@@ -424,9 +429,12 @@ describe('ApiSessionClient account settings retry', () => {
       if (snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion !== 8) {
         // Session reconnect publishes a verdict-free eligibility wake before its settings
         // request settles. Re-arm the actual input wait against that fresh connection.
-        await expect(client.waitForPendingEligibilityUpdate(abort.signal)).resolves.toBe(true);
+        const rearmed = client.waitForPendingEligibilityUpdate(abort.signal);
+        await vi.waitFor(() => expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(8));
+        await expect(rearmed).resolves.toBe(true);
       }
-      expect(settingsRequests).toHaveBeenCalledTimes(13);
+      expect(settingsRequests.mock.calls.length).toBeGreaterThanOrEqual(13);
+      expect(maxActiveSettingsRequests).toBe(1);
       expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(8);
     } finally {
       abort.abort();

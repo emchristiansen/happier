@@ -88,6 +88,9 @@ describe('active-turn pending wake recovery', () => {
     { phase: 'active', eventAt: 'backoff' },
     { phase: 'idle', eventAt: 'exhaustion' },
     { phase: 'active', eventAt: 'exhaustion' },
+    { phase: 'idle', eventAt: 'caller_restart' },
+    { phase: 'idle', eventAt: 'direct_drain' },
+    { phase: 'both', eventAt: 'exhaustion' },
   ] as const)('exhausts twelve real client failures in the $phase consumer with a fresh event at $eventAt', async ({ phase, eventAt }) => {
     const testHome = await mkdtemp(join(tmpdir(), 'happier-pending-retry-'));
     vi.stubEnv('HAPPIER_HOME_DIR', testHome);
@@ -109,16 +112,43 @@ describe('active-turn pending wake recovery', () => {
       messageQueue: new MessageQueue2<{ id: string }>(() => 'mode'),
       session: client,
     });
-    const controller = new AbortController();
+    let controller = new AbortController();
     vi.useFakeTimers();
-    const waiting = phase === 'idle'
-      ? consumer.waitForNextInput({ abortSignal: controller.signal })
-      : consumer.pumpPendingWhileActive({ abortSignal: controller.signal, reason: 'retry-episode' });
-    const overlappingWait = phase === 'idle' ? consumer.waitForNextInput({ abortSignal: controller.signal }) : undefined;
+    let waiting: Promise<unknown> = phase === 'active'
+      ? consumer.pumpPendingWhileActive({ abortSignal: controller.signal, reason: 'retry-episode' })
+      : consumer.waitForNextInput({ abortSignal: controller.signal });
+    if (phase === 'both') waiting = Promise.all([
+      waiting,
+      consumer.pumpPendingWhileActive({ abortSignal: controller.signal, reason: 'retry-episode' }),
+    ]);
+    const overlappingWait = phase === 'idle' && eventAt !== 'caller_restart'
+      ? consumer.waitForNextInput({ abortSignal: controller.signal }) : undefined;
     try {
+      if (eventAt === 'direct_drain') {
+        await vi.advanceTimersByTimeAsync(0);
+        expect(materialize).toHaveBeenCalledTimes(1);
+        await expect(consumer.drainPending({ abortSignal: controller.signal })).resolves.toMatchObject({
+          materialized: 0, stoppedReason: 'retryable_transport',
+        });
+        expect(materialize).toHaveBeenCalledTimes(1);
+      }
+      if (eventAt === 'caller_restart') {
+        await vi.advanceTimersByTimeAsync(0);
+        expect(materialize).toHaveBeenCalledTimes(1);
+        controller.abort();
+        await waiting;
+        controller = new AbortController();
+        waiting = consumer.waitForNextInput({ abortSignal: controller.signal });
+      }
       await vi.advanceTimersByTimeAsync(eventAt === 'backoff' ? 0 : 30 * 60_000);
       const previousAttempts = eventAt === 'backoff' ? 1 : 12;
       expect(materialize).toHaveBeenCalledTimes(previousAttempts);
+      if (previousAttempts === 12) {
+        await expect(consumer.drainPending({ abortSignal: controller.signal })).resolves.toEqual({
+          materialized: 0, stoppedReason: 'retry_exhausted',
+        });
+        expect(materialize).toHaveBeenCalledTimes(12);
+      }
       userSocket.trigger('update', {
         id: 'fresh-pending-episode', seq: 2, createdAt: 2,
         body: { t: 'pending-changed', sid: client.sessionId, pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 2 },

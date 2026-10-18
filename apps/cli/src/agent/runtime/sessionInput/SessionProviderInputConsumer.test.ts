@@ -907,15 +907,15 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
         materializeNextPendingMessageSafely,
         shouldAttemptPendingMaterialization: () => false,
         reconcilePendingQueueState,
-        waitForPendingEligibilityUpdate: async () => {
-          abortController.abort();
-          return false;
-        },
+        waitForPendingEligibilityUpdate: async () => false,
       },
       reconcileWhenEmpty: 'skip',
     });
 
-    await expect(consumer.waitForNextInput({ abortSignal: abortController.signal })).resolves.toBeNull();
+    const wait = consumer.waitForNextInput({ abortSignal: abortController.signal });
+    await vi.waitFor(() => expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(1));
+    abortController.abort();
+    await expect(wait).resolves.toBeNull();
     expect(materializeNextPendingMessageSafely).toHaveBeenCalledWith({
       reconcileWhenEmpty: 'skip',
       onDiagnosticPhase: expect.any(Function),
@@ -935,15 +935,15 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
       messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
       session: {
         materializeNextPendingMessageSafely,
-        waitForPendingEligibilityUpdate: async () => {
-          abortController.abort();
-          return false;
-        },
+        waitForPendingEligibilityUpdate: async () => false,
       },
       reconcileWhenEmpty: 'skip',
     });
 
-    await expect(consumer.waitForNextInput({ abortSignal: abortController.signal })).resolves.toBeNull();
+    const wait = consumer.waitForNextInput({ abortSignal: abortController.signal });
+    await vi.waitFor(() => expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(1));
+    abortController.abort();
+    await expect(wait).resolves.toBeNull();
     expect(debugSpy).toHaveBeenCalledWith(
       '[pendingQueue] input consumer materialization failed (non-fatal)',
       materializeError,
@@ -1031,16 +1031,16 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
       messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
       session: {
         materializeNextPendingMessageSafely,
-        waitForPendingEligibilityUpdate: async () => {
-          abortController.abort();
-          return false;
-        },
+        waitForPendingEligibilityUpdate: async () => false,
       },
       activeTurnSteerability: 'steerable',
       reconcileWhenEmpty: 'skip',
     });
 
-    await expect(consumer.waitForNextInput({ abortSignal: abortController.signal })).resolves.toBeNull();
+    const wait = consumer.waitForNextInput({ abortSignal: abortController.signal });
+    await vi.waitFor(() => expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(1));
+    abortController.abort();
+    await expect(wait).resolves.toBeNull();
 
     expect(debugSpy).toHaveBeenCalledWith('[pendingQueue] input consumer materialization decision', {
       activeTurnSteerability: 'steerable',

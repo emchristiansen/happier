@@ -35,7 +35,7 @@ export class PendingInputRetryEpisode {
 
   settled(): void {
     this.current = { status: 'idle' };
-    this.serverNotBeforeMs = 0;
+    // A local success (for example a settings envelope) cannot waive server guidance.
   }
 
   beginAttempt(): PendingInputRetryState {
