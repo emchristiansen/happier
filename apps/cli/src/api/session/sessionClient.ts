@@ -3635,7 +3635,12 @@ export class ApiSessionClient extends EventEmitter {
             }
             if (ack && ack.ok === false) {
                 if (ack.error === 'transaction-unavailable') {
-                    if (!this.sessionMessageCommitRetry.readCurrent(retryToken)) return null;
+                    if (!this.sessionMessageCommitRetry.readCurrent(retryToken)) {
+                        if (params.requireCommit) {
+                            throw new Error('transaction-unavailable: message commit unconfirmed; retry intent no longer current');
+                        }
+                        return null;
+                    }
                     this.pendingMaterializedLocalIds.add(localId);
                     const willRetry = this.scheduleCommitRetry(retryToken);
                     logger.infoFile('[SOCKET] Transcript transaction admission unavailable', {
@@ -3735,7 +3740,12 @@ export class ApiSessionClient extends EventEmitter {
 
         if (ack && ack.ok === false) {
             if (ack.error === 'transaction-unavailable') {
-                if (!this.sessionMessageCommitRetry.readCurrent(retryToken)) return null;
+                if (!this.sessionMessageCommitRetry.readCurrent(retryToken)) {
+                    if (params.requireCommit) {
+                        throw new Error('transaction-unavailable: message commit unconfirmed; retry intent no longer current');
+                    }
+                    return null;
+                }
                 this.pendingMaterializedLocalIds.add(localId);
                 const willRetry = this.scheduleCommitRetry(retryToken);
                 logger.infoFile('[SOCKET] Transcript transaction admission unavailable', {
