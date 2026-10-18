@@ -49,7 +49,10 @@ Account-settings convergence uses the same budget at its existing request-only
 owner. A transient failure can retry on the same connection without another hint.
 The failed or applying settings barrier remains conservative, and only a current
 source may commit settings. Concurrent waiters share convergence; cancelling one
-waiter does not cancel the others.
+waiter does not cancel the others. A still-owned request whose source becomes
+stale before completion leaves a failed barrier and observes backoff, while an
+older completion cannot alter a newer barrier. Request-only callers recheck the
+highest observed minimum before resolving and rejoin the same owner if needed.
 
 Exhaustion retains a typed disposition and writes one
 `[pendingInput] retry episode exhausted` entry to the default-enabled session file

@@ -3062,7 +3062,14 @@ export class ApiSessionClient extends EventEmitter {
         const publishOnCompletion = this.accountSettingsHintConvergenceInFlight !== current;
         this.accountSettingsHintConvergenceInFlight = current;
         return current.then(() => {
-            if (publishOnCompletion && !this.closed) {
+            if (this.closed) throw new Error('Account settings convergence was closed');
+            // A changes continuation can strengthen the requirement after the owner's
+            // final check but before this reaction. Re-enter that same serialized owner.
+            if (this.accountSettingsSyncBarrier !== null
+                || (getActiveAccountSettingsSnapshot()?.settingsVersion ?? -1) < this.accountSettingsHighestObservedVersion) {
+                return this.refreshAccountSettingsFromChangesHint(null);
+            }
+            if (publishOnCompletion) {
                 this.accountSettingsPendingEligibilityWakeWithheld = false;
                 this.publishPendingEligibilityWake();
             }
@@ -3111,6 +3118,16 @@ export class ApiSessionClient extends EventEmitter {
                 )
             )
         );
+        const recordFailure = (error: unknown): false => {
+            failure = error;
+            if (this.accountSettingsSyncBarrier === current) this.accountSettingsSyncFailure = error;
+            this.recordAccountSettingsConvergenceFailure(error);
+            logger.debug('[accountSettings] Failed request-only reconnect convergence; withholding pending eligibility wakes', {
+                settingsVersion,
+                error: serializeAxiosErrorForLog(error),
+            });
+            return false;
+        };
         // Construct and publish the barrier before the first credential/account await. A Pending
         // hint delivered in the same socket turn must observe fail-closed convergence immediately.
         const previousRequest = this.accountSettingsRequestInFlight;
@@ -3134,16 +3151,7 @@ export class ApiSessionClient extends EventEmitter {
                 throw new Error('Account settings reconnect source closed before convergence completed');
             }
             return true;
-        })().catch((error) => {
-            failure = error;
-            if (this.accountSettingsSyncBarrier === current) this.accountSettingsSyncFailure = error;
-            this.recordAccountSettingsConvergenceFailure(error);
-            logger.debug('[accountSettings] Failed request-only reconnect convergence; withholding pending eligibility wakes', {
-                settingsVersion,
-                error: serializeAxiosErrorForLog(error),
-            });
-            return false;
-        });
+        })().catch(recordFailure);
         this.accountSettingsSyncBarrier = current;
         this.accountSettingsSyncBarrierState = 'applying';
         this.accountSettingsSyncFailure = null;
@@ -3152,6 +3160,11 @@ export class ApiSessionClient extends EventEmitter {
             if (this.accountSettingsRequestInFlight === current) this.accountSettingsRequestInFlight = null;
         });
         return current.then((didApply) => {
+            if (didApply && this.accountSettingsSyncBarrier === current && !sourceIsCurrent()) {
+                // Success and this completion are separate reactions. A newer minimum or
+                // source invalidation must terminalize our own barrier, never a newer one.
+                didApply = recordFailure(new Error('Account settings reconnect source changed before convergence settled'));
+            }
             if (!didApply) {
                 if (this.accountSettingsSyncBarrier === current) {
                     this.accountSettingsSyncBarrierState = 'failed';
@@ -3163,7 +3176,7 @@ export class ApiSessionClient extends EventEmitter {
                 }
                 throw failure instanceof Error ? failure : new Error('Account settings reconnect convergence failed');
             }
-            if (!sourceIsCurrent() || this.accountSettingsSyncBarrier !== current) return;
+            if (this.accountSettingsSyncBarrier !== current) return;
             this.accountSettingsSyncBarrier = null;
             this.accountSettingsSyncBarrierState = null;
             this.accountSettingsRetryEpisode.settled();

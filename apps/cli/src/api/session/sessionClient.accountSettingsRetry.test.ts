@@ -407,6 +407,213 @@ describe('ApiSessionClient account settings retry', () => {
     expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(9);
   });
 
+  it.each(['changes', 'live-hint', 'cancelled-changes'] as const)('recovers a %s minimum raised at attempt completion through the same owner', async (source) => {
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    const firstRead = createDeferred<unknown>();
+    const secondRead = createDeferred<unknown>();
+    const requested = createDeferred<void>();
+    const secondRequested = createDeferred<void>();
+    const inspected = createDeferred<void>();
+    readSettings = () => {
+      if (settingsRequests.mock.calls.length === 1) { requested.resolve(); return firstRead.promise; }
+      secondRequested.resolve();
+      return secondRead.promise;
+    };
+    const client = createClient();
+    const abort = new AbortController();
+    const wait = client.waitForPendingEligibilityUpdate(abort.signal);
+    const owner = client as unknown as {
+      refreshAccountSettingsFromChangesHint(version: number): Promise<void>;
+      accountSettingsSyncBarrier: Promise<boolean> | null;
+      accountSettingsSyncBarrierState: string | null;
+      accountSettingsRetryEpisode: { state: import('./pendingInputRetryEpisode').PendingInputRetryState };
+    };
+    let refreshed: Promise<string> | undefined;
+    let higherCompleted = false;
+    let stranded = false;
+    const unsubscribe = snapshots.subscribeActiveAccountSettingsSnapshot((_previous, next) => {
+      if (next.settingsVersion !== 5) return;
+      const barrier = owner.accountSettingsSyncBarrier;
+      let barrierResult: boolean | null = null;
+      void barrier?.then((value) => { barrierResult = value; });
+      void (async () => {
+        // Controlled snapshot reactions exercise the callback/owner contract. The exact
+        // production changes-fetch scheduling interval is not established by this fixture.
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        if (source !== 'live-hint') refreshed = owner.refreshAccountSettingsFromChangesHint(9).then(
+          () => { higherCompleted = true; return 'fulfilled'; }, () => 'rejected',
+        );
+        else userSocket.trigger('update', {
+          id: 'completion-boundary-live-hint', seq: 1, createdAt: Date.now(),
+          body: { t: 'account-settings-changed', settingsVersion: 9 },
+        });
+        // Bound the counterexample independently of timers or the episode deadline.
+        for (let reaction = 0; reaction < 16; reaction += 1) await Promise.resolve();
+        stranded = owner.accountSettingsSyncBarrier === barrier
+          && owner.accountSettingsSyncBarrierState === 'applying' && barrierResult === true;
+        if (stranded) {
+          const closing = client.close();
+          abort.abort();
+          await closing;
+        }
+        inspected.resolve();
+      })();
+    });
+    try {
+      await requested.promise;
+      firstRead.resolve(settings(5));
+      await inspected.promise;
+      expect(stranded).toBe(false);
+      expect(owner.accountSettingsSyncBarrierState).toBe('failed');
+      expect(owner.accountSettingsRetryEpisode.state).toMatchObject({
+        status: 'retrying', failedAttempts: 1, retryAtMs: Date.now() + 275,
+      });
+      expect(higherCompleted).toBe(false);
+      expect(settingsRequests).toHaveBeenCalledTimes(1);
+      expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(5);
+      if (source === 'cancelled-changes') {
+        await client.close();
+        await expect(refreshed).resolves.toBe('rejected');
+        await vi.advanceTimersByTimeAsync(300_000);
+        expect(settingsRequests).toHaveBeenCalledTimes(1);
+        expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(5);
+        return;
+      }
+      await vi.advanceTimersByTimeAsync(274);
+      expect(settingsRequests).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await secondRequested.promise;
+      expect(higherCompleted).toBe(false);
+      expect(owner.accountSettingsSyncBarrierState).toBe('applying');
+      secondRead.resolve(settings(9));
+      if (refreshed) await expect(refreshed).resolves.toBe('fulfilled');
+      await expect(wait).resolves.toBe(true);
+      await vi.waitFor(() => expect(owner.accountSettingsSyncBarrierState).toBeNull());
+      expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(9);
+      expect(settingsRequests).toHaveBeenCalledTimes(2);
+      expect(maxActiveSettingsRequests).toBe(1);
+    } finally {
+      unsubscribe();
+      abort.abort();
+      secondRead.resolve(settings(9));
+      await client.close();
+      await Promise.all([wait, refreshed]);
+    }
+  });
+
+  it('keeps a changes minimum joining after loop return pending until version nine applies', async () => {
+    const firstRead = createDeferred<unknown>();
+    const secondRead = createDeferred<unknown>();
+    const requested = createDeferred<void>();
+    const secondRequested = createDeferred<void>();
+    const inspected = createDeferred<void>();
+    readSettings = () => {
+      if (settingsRequests.mock.calls.length === 1) { requested.resolve(); return firstRead.promise; }
+      secondRequested.resolve();
+      return secondRead.promise;
+    };
+    const client = createClient();
+    const abort = new AbortController();
+    const wait = client.waitForPendingEligibilityUpdate(abort.signal);
+    const owner = client as unknown as {
+      refreshAccountSettingsFromChangesHint(version: number): Promise<void>;
+      accountSettingsSyncBarrier: Promise<boolean> | null;
+      userSocketSettingsConvergenceInFlight: Promise<void> | null;
+    };
+    let refreshed: Promise<unknown> | undefined;
+    let higherCompleted = false;
+    let joinedCurrentOwner = false;
+    try {
+      await requested.promise;
+      const current = owner.userSocketSettingsConvergenceInFlight;
+      void owner.accountSettingsSyncBarrier?.then(() => {
+        // Controlled barrier reactions queue the join after the loop continuation and
+        // before tracked.finally. This is not a full changes-fetch scheduling trace.
+        queueMicrotask(() => {
+          joinedCurrentOwner = owner.userSocketSettingsConvergenceInFlight === current;
+          refreshed = owner.refreshAccountSettingsFromChangesHint(9).then(() => { higherCompleted = true; }, () => {});
+          void (async () => {
+            for (let reaction = 0; reaction < 16; reaction += 1) await Promise.resolve();
+            inspected.resolve();
+          })();
+        });
+      });
+      firstRead.resolve(settings(5));
+      await inspected.promise;
+      expect(joinedCurrentOwner).toBe(true);
+      expect(higherCompleted).toBe(false);
+      await secondRequested.promise;
+      expect(higherCompleted).toBe(false);
+      expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(5);
+      secondRead.resolve(settings(9));
+      await refreshed;
+      expect(higherCompleted).toBe(true);
+      expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(9);
+      expect(settingsRequests).toHaveBeenCalledTimes(2);
+      expect(maxActiveSettingsRequests).toBe(1);
+    } finally {
+      abort.abort();
+      secondRead.resolve(settings(9));
+      await client.close();
+      await Promise.all([wait, refreshed]);
+    }
+  });
+
+  it('does not let an old successful completion fail or clear a newer envelope barrier', async () => {
+    const firstRead = createDeferred<unknown>();
+    const requested = createDeferred<void>();
+    const inspected = createDeferred<void>();
+    readSettings = () => { requested.resolve(); return firstRead.promise; };
+    const client = createClient();
+    const abort = new AbortController();
+    const wait = client.waitForPendingEligibilityUpdate(abort.signal);
+    const owner = client as unknown as {
+      accountSettingsSyncBarrier: Promise<boolean> | null;
+      accountSettingsSyncBarrierState: string | null;
+      accountSettingsRetryEpisode: { state: import('./pendingInputRetryEpisode').PendingInputRetryState };
+    };
+    let newerBarrier: Promise<boolean> | null = null;
+    const unsubscribe = snapshots.subscribeActiveAccountSettingsSnapshot((_previous, next) => {
+      if (next.settingsVersion !== 5) return;
+      void (async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        userSocket.trigger('update', {
+          id: 'newer-completion-barrier', seq: 1, createdAt: Date.now(),
+          body: { t: 'update-account', id: 'retry-account', settingsV2: settings(9).data },
+        });
+        newerBarrier = owner.accountSettingsSyncBarrier;
+        for (let reaction = 0; reaction < 16; reaction += 1) await Promise.resolve();
+        inspected.resolve();
+      })();
+    });
+    try {
+      await requested.promise;
+      firstRead.resolve(settings(5));
+      await inspected.promise;
+      expect(newerBarrier).not.toBeNull();
+      expect(owner.accountSettingsSyncBarrier).toBe(newerBarrier);
+      expect(owner.accountSettingsSyncBarrierState).toBe('applying');
+      expect(owner.accountSettingsRetryEpisode.state).toMatchObject({ status: 'retrying', failedAttempts: 0 });
+      await newerBarrier;
+      await expect(wait).resolves.toBe(true);
+      expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(9);
+      expect(owner.accountSettingsSyncBarrierState).toBeNull();
+      expect(settingsRequests).toHaveBeenCalledTimes(1);
+      expect(maxActiveSettingsRequests).toBe(1);
+    } finally {
+      unsubscribe();
+      abort.abort();
+      await client.close();
+      await wait;
+    }
+  });
+
   it('keeps joined higher-version changes refresh pending until its minimum actually applies', async () => {
     const firstRead = createDeferred<unknown>();
     const secondRead = createDeferred<unknown>();
