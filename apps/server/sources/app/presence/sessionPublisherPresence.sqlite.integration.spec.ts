@@ -532,6 +532,73 @@ describe("session publisher presence on SQLite", () => {
         });
     });
 
+    it("lets only explicit stop terminalize an archived publisher without restoring publication rights", async () => {
+        const seeded = await seed();
+        const presence = createSessionPublisherPresence({ now: () => new Date(seeded.fence.getTime() + 10) });
+        const socket = {};
+        const registered = await presence.registerPublisher({
+            socket,
+            binding: seeded.binding,
+            completeActivitySnapshot: { state: "active", activeCount: 1 },
+        });
+        if (registered.status !== "registered") throw new Error("expected registration");
+        const archivedAt = new Date("2026-10-18T01:00:00.000Z");
+        await db.session.update({
+            where: { id: seeded.binding.sessionId },
+            data: { active: false, archivedAt },
+        });
+
+        await expect(presence.closePublisher({ socket })).resolves.toEqual({ status: "rejected", reason: "archived" });
+        const captured = await presence.captureExplicitMachineStop({ binding: seeded.binding });
+        expect(captured.status).toBe("captured");
+        if (captured.status !== "captured") throw new Error("expected archived-stop capture");
+        await expect(presence.finalizeExplicitMachineStop({ target: captured.target }))
+            .resolves.toEqual({ status: "already_inactive" });
+        await expect(db.session.findUniqueOrThrow({
+            where: { id: seeded.binding.sessionId },
+            select: { archivedAt: true, active: true, publisherGenerationLastActiveAt: true },
+        })).resolves.toEqual({ archivedAt, active: false, publisherGenerationLastActiveAt: null });
+
+        await db.session.update({ where: { id: seeded.binding.sessionId }, data: { archivedAt: null } });
+        await expect(presence.touchPublisher({ socket })).resolves.toEqual({ status: "superseded" });
+    });
+
+    it("does not let an archived stop close a successor publisher after unarchive", async () => {
+        const seeded = await seed();
+        const presence = createSessionPublisherPresence({ now: () => new Date(seeded.fence.getTime() + 10) });
+        const first = await presence.registerPublisher({
+            socket: {},
+            binding: seeded.binding,
+            completeActivitySnapshot: { state: "active", activeCount: 1 },
+        });
+        if (first.status !== "registered") throw new Error("expected registration");
+        await db.session.update({
+            where: { id: seeded.binding.sessionId },
+            data: { active: false, archivedAt: new Date("2026-10-18T01:00:00.000Z") },
+        });
+        const captured = await presence.captureExplicitMachineStop({ binding: seeded.binding });
+        if (captured.status !== "captured") throw new Error("expected archived-stop capture");
+        await db.session.update({ where: { id: seeded.binding.sessionId }, data: { archivedAt: null } });
+        const successor = await presence.registerPublisher({
+            socket: {},
+            binding: seeded.binding,
+            completeActivitySnapshot: { state: "idle", activeCount: 0 },
+        });
+        if (successor.status !== "registered") throw new Error("expected successor registration");
+
+        await expect(presence.finalizeExplicitMachineStop({ target: captured.target }))
+            .resolves.toEqual({ status: "superseded" });
+        await expect(db.session.findUniqueOrThrow({
+            where: { id: seeded.binding.sessionId },
+            select: { active: true, archivedAt: true, lastActiveAt: true, publisherGeneration: true },
+        })).resolves.toEqual({
+            active: true,
+            archivedAt: null,
+            lastActiveAt: successor.committedFence,
+            publisherGeneration: successor.publisherGeneration,
+        });
+    });
+
     it("keeps explicit-stop authority when the same publisher heartbeats before stop proof arrives", async () => {
         const seeded = await seed();
         let now = new Date(seeded.fence.getTime() + 10);
@@ -626,12 +693,13 @@ describe("session publisher presence on SQLite", () => {
         });
     });
 
-    it("keeps an exact-fence fallback for publishers registered by an older server", async () => {
+    it.each([false, true])("keeps an exact-fence fallback for older-server publishers with archived=%s", async (archived) => {
         const unchanged = await seed();
         const presence = createSessionPublisherPresence();
+        const archivedAt = archived ? new Date("2026-10-18T01:00:00.000Z") : null;
         await db.session.update({
             where: { id: unchanged.binding.sessionId },
-            data: { active: true },
+            data: { active: true, archivedAt },
         });
         const captured = await presence.captureExplicitMachineStop({ binding: unchanged.binding });
         expect(captured).toMatchObject({
@@ -648,7 +716,7 @@ describe("session publisher presence on SQLite", () => {
         const advanced = await seed();
         await db.session.update({
             where: { id: advanced.binding.sessionId },
-            data: { active: true },
+            data: { active: true, archivedAt },
         });
         const staleCapture = await presence.captureExplicitMachineStop({ binding: advanced.binding });
         if (staleCapture.status !== "captured") throw new Error("expected legacy capture");
