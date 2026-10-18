@@ -467,6 +467,12 @@ export const MessageAckResponseSchema = z.union([
   }).passthrough(),
   z.object({
     ok: z.literal(false),
+    /**
+     * `transaction-unavailable` means this attempt never entered the transaction
+     * callback. Retry the original localId/content; another attempt may already
+     * have committed it. Other errors, including `internal`, make no such promise.
+     * Keep this open string for released and future server error codes.
+     */
     error: z.string(),
   }).passthrough(),
 ]);

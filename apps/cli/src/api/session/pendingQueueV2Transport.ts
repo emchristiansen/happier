@@ -202,6 +202,30 @@ export class PendingQueueAcceptedSettlementError extends Error {
     }
 }
 
+/** A failed observation of settlement, never evidence that settlement had no effect. */
+export class PendingQueueAcceptedSettlementAmbiguousError extends Error {
+    readonly code = 'pending_queue_accepted_settlement_ambiguous' as const;
+
+    constructor(
+        readonly classification: 'transport_failure' | 'malformed_ack',
+        cause: unknown,
+    ) {
+        super('Pending delivery accepted settlement outcome is unconfirmed', { cause });
+        this.name = 'PendingQueueAcceptedSettlementAmbiguousError';
+    }
+}
+
+export function isAcceptedPendingQueueV2DeliveryRetryableError(error: unknown): boolean {
+    if (error instanceof PendingQueueAcceptedSettlementAmbiguousError) return true;
+    if (error instanceof PendingQueueAcceptedSettlementError) {
+        return error.settlementError === 'internal' || error.settlementError === 'transaction-unavailable';
+    }
+    // The local deadline already supplies positive response-loss evidence. Native
+    // Socket.IO rejections are classified at the accepted transport boundary below.
+    return readErrorCode(error) === 'socket_ack_timeout'
+        && (error as { retryable?: unknown }).retryable === true;
+}
+
 export function isAcceptedPendingQueueV2DeliveryNotFound(error: unknown): boolean {
     return error instanceof PendingQueueAcceptedSettlementError && error.settlementError === 'not-found';
 }
@@ -889,18 +913,25 @@ export async function resolveAcceptedPendingQueueV2Delivery(params: {
     localId: string;
 }): Promise<{ didResolve: boolean; pendingQueueState?: KnownPendingQueueState; message?: PendingQueueMaterializedMessage | null }> {
     const localId = requirePendingLocalId(params.localId);
-    const raw = await emitSocketWithAck<Record<string, unknown>>({
-        socket: createAcceptedPendingSettlementAckSocket(params.socket),
-        event: ACCEPTED_PENDING_SETTLEMENT_EVENT_V1,
-        payload: {
-            v: 1,
-            sessionId: params.sessionId,
-            localId,
-        },
+    const payload = AcceptedPendingSettlementRequestV1Schema.parse({
+        v: 1, sessionId: params.sessionId, localId,
     });
+    let raw: unknown;
+    try {
+        raw = await emitSocketWithAck({
+            socket: createAcceptedPendingSettlementAckSocket(params.socket),
+            event: ACCEPTED_PENDING_SETTLEMENT_EVENT_V1,
+            payload,
+        });
+    } catch (error) {
+        if (readErrorCode(error) === 'socket_not_connected' || readErrorCode(error) === 'socket_ack_timeout') {
+            throw error;
+        }
+        throw new PendingQueueAcceptedSettlementAmbiguousError('transport_failure', error);
+    }
     const parsedAck = AcceptedPendingSettlementResponseV1Schema.safeParse(raw);
     if (!parsedAck.success) {
-        throw new Error('Invalid pending delivery accepted settlement acknowledgement');
+        throw new PendingQueueAcceptedSettlementAmbiguousError('malformed_ack', parsedAck.error);
     }
     const ack = parsedAck.data;
     if (!ack.ok) {
@@ -914,7 +945,9 @@ export async function resolveAcceptedPendingQueueV2Delivery(params: {
     const didResolve = ack.didResolve;
     const message = 'message' in ack ? readMaterializedMessageFromAck(ack) : null;
     if ((didResolve || 'message' in ack) && message?.localId !== localId) {
-        throw new Error('Invalid pending delivery accepted settlement acknowledgement');
+        throw new PendingQueueAcceptedSettlementAmbiguousError(
+            'malformed_ack', new Error('Accepted settlement acknowledgement does not prove the requested localId'),
+        );
     }
     return {
         didResolve,

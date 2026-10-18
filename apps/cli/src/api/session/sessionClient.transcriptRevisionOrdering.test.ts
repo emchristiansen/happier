@@ -54,6 +54,8 @@ type CommitSessionMessage = (params: {
   localId: string;
   sidechainId: string | null;
   requireCommit: boolean;
+  requireWriteDisposition?: boolean;
+  markAsUserMessage?: boolean;
 }) => Promise<number | null>;
 
 function createDeferred<T>() {
@@ -74,6 +76,213 @@ describe('ApiSessionClient transcript revision retry ordering', () => {
   afterEach(() => {
     vi.useRealTimers();
     delete process.env.HAPPIER_TRANSCRIPT_STORAGE;
+  });
+
+  it.each([
+    { storage: 'persisted', required: false },
+    { storage: 'persisted', required: true },
+    { storage: 'direct', required: false },
+    { storage: 'direct', required: true },
+  ])('retains the exact $storage intent after temporary admission failure (required=$required)', async ({ storage, required }) => {
+    vi.resetModules();
+    vi.useFakeTimers();
+    process.env.HAPPIER_TRANSCRIPT_STORAGE = storage;
+    const sent: unknown[] = [];
+    sessionSocketStub = createApiSessionSocketStub({
+      connected: true,
+      emitWithAck: async (event, payload) => {
+        if (event !== 'message') return { ok: true };
+        sent.push(payload);
+        return sent.length === 1
+          ? { ok: false, error: 'transaction-unavailable' }
+          : { ok: true, id: 'existing-row', seq: 7, localId: 'original-id', didWrite: false };
+      },
+    });
+    userSocketStub = createApiSessionSocketStub({ connected: true, emitWithAckResult: { ok: true } });
+    const { ApiSessionClient } = await import('./sessionClient');
+    const client = new ApiSessionClient('tok', createPlainSessionFixture({ id: 's1' }));
+    const internals = client as unknown as {
+      commitSessionMessage: CommitSessionMessage;
+      sessionMessageCommitRetry: { size: number };
+      pendingMaterializedLocalIds: Set<string>;
+      lastObservedMessageSeq: number;
+    };
+    const first = internals.commitSessionMessage.call(client, {
+      message: { t: 'plain', v: { role: 'assistant', content: 'original-body' } },
+      localId: 'original-id', sidechainId: 'original-sidechain',
+      requireCommit: required, requireWriteDisposition: required,
+    });
+    if (required) await expect(first).rejects.toThrow('transaction-unavailable');
+    else await expect(first).resolves.toBeNull();
+    expect(internals.sessionMessageCommitRetry.size).toBe(1);
+    expect(internals.pendingMaterializedLocalIds.has('original-id')).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toEqual(sent[0]);
+    expect(internals.lastObservedMessageSeq).toBe(7);
+    expect(internals.sessionMessageCommitRetry.size).toBe(0);
+  });
+
+  it.each([
+    { storage: 'direct', caller: 'claude', invalidate: 'close' },
+    { storage: 'persisted', caller: 'claude', invalidate: 'close' },
+    { storage: 'direct', caller: 'agent', invalidate: 'close' },
+    { storage: 'persisted', caller: 'agent', invalidate: 'close' },
+    { storage: 'direct', caller: 'claude', invalidate: 'supersede' },
+    { storage: 'persisted', caller: 'claude', invalidate: 'supersede' },
+    { storage: 'direct', caller: 'agent', invalidate: 'supersede' },
+    { storage: 'persisted', caller: 'agent', invalidate: 'supersede' },
+  ])('rejects a late temporary $storage NACK for required $caller after $invalidate', async ({ storage, caller, invalidate }) => {
+    // Storage is selected per client; reuse the module graph while each case creates and closes its own client.
+    vi.useFakeTimers();
+    process.env.HAPPIER_TRANSCRIPT_STORAGE = storage;
+    const firstAck = createDeferred<unknown>();
+    const started = createDeferred<string>();
+    const sent: { message: CommitPayload; localId: string }[] = [];
+    sessionSocketStub = createApiSessionSocketStub({
+      connected: true,
+      emitWithAck: async (event, payload) => {
+        if (event !== 'message') return { ok: true };
+        const message = payload as { message: CommitPayload; localId: string };
+        sent.push(message);
+        if (sent.length === 1) {
+          started.resolve(message.localId);
+          return firstAck.promise;
+        }
+        if (sent.length === 2) return { ok: false, error: 'transaction-unavailable' };
+        return { ok: true, id: 'newer-row', seq: 7, localId: message.localId, didWrite: true };
+      },
+    });
+    userSocketStub = createApiSessionSocketStub({ connected: true, emitWithAckResult: { ok: true } });
+    const { ApiSessionClient } = await import('./sessionClient');
+    const client = new ApiSessionClient('tok', createPlainSessionFixture({ id: 's1' }));
+    const turnToken = client.beginTurnAssistantTextSnapshot({ turnToken: 'turn-1', startSeqExclusive: 0 });
+    const state = client as unknown as {
+      commitSessionMessage: CommitSessionMessage;
+      sessionMessageCommitRetry: { size: number };
+      pendingMaterializedLocalIds: Set<string>;
+      committedLocalIdsAwaitingEcho: Set<string>;
+    };
+    const required = caller === 'claude'
+      ? client.sendClaudeSessionMessageCommittedExact({
+        type: 'assistant', uuid: 'required-original',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'unconfirmed answer' }] },
+      })
+      : client.sendAgentMessageCommitted('codex', { type: 'message', message: 'unconfirmed answer' }, { localId: 'required-original' });
+    // Observe rejection immediately, even while close drains the real required dispatch lane.
+    const outcome = required.then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    );
+    const localId = await started.promise;
+    let close: Promise<void> | undefined;
+    if (invalidate === 'close') {
+      close = client.close();
+      expect(state.sessionMessageCommitRetry.size).toBe(0);
+    } else {
+      await state.commitSessionMessage.call(client, {
+        message: 'newer-body', localId, sidechainId: null, requireCommit: false,
+      });
+      expect(state.sessionMessageCommitRetry.size).toBe(1);
+    }
+    firstAck.resolve({ ok: false, error: 'transaction-unavailable' });
+    const result = await outcome;
+    if (close) await close;
+    expect(result).toMatchObject({
+      status: 'rejected',
+      error: expect.objectContaining({ message: expect.stringContaining('transaction-unavailable') }),
+    });
+    expect(client.getTurnAssistantTextSnapshot({ turnToken, startSeqExclusive: 0 })).toBeNull();
+    expect(client.getLastObservedMessageSeq()).toBe(0);
+    expect(state.committedLocalIdsAwaitingEcho.has(localId)).toBe(false);
+    await vi.advanceTimersByTimeAsync(7_000);
+    if (invalidate === 'close') {
+      expect(sent).toHaveLength(1);
+      expect(state.pendingMaterializedLocalIds.has(localId)).toBe(false);
+    } else {
+      expect(sent.map((message) => message.message)).toEqual([sent[0].message, 'newer-body', 'newer-body']);
+      expect(client.getLastObservedMessageSeq()).toBe(7);
+      await client.close();
+    }
+    expect(state.sessionMessageCommitRetry.size).toBe(0);
+  });
+
+  it.each(['direct', 'persisted'])('bounds temporary $storage admission retries without inventing a commit', async (storage) => {
+    vi.resetModules();
+    vi.useFakeTimers();
+    process.env.HAPPIER_TRANSCRIPT_STORAGE = storage;
+    sessionSocketStub = createApiSessionSocketStub({
+      connected: true,
+      emitWithAck: async (event) => event === 'message'
+        ? { ok: false, error: 'transaction-unavailable' }
+        : { ok: true },
+    });
+    userSocketStub = createApiSessionSocketStub({ connected: true, emitWithAckResult: { ok: true } });
+    const { ApiSessionClient } = await import('./sessionClient');
+    const client = new ApiSessionClient('tok', createPlainSessionFixture({ id: 's1' }));
+    const internals = client as unknown as {
+      commitSessionMessage: CommitSessionMessage;
+      sessionMessageCommitRetry: { size: number };
+      committedLocalIdsAwaitingEcho: Set<string>;
+    };
+    await internals.commitSessionMessage.call(client, {
+      message: 'original-ciphertext', localId: 'original-id', sidechainId: null, requireCommit: false,
+    });
+    await vi.advanceTimersByTimeAsync(7_000);
+    expect(readMessagePayloads(sessionSocketStub)).toEqual(Array(4).fill('original-ciphertext'));
+    expect(internals.sessionMessageCommitRetry.size).toBe(0);
+    expect(internals.committedLocalIdsAwaitingEcho.has('original-id')).toBe(false);
+  });
+
+  it.each(['direct', 'persisted'])('preserves $storage intent options through admission retry and reconnect', async (storage) => {
+    vi.resetModules();
+    vi.useFakeTimers();
+    process.env.HAPPIER_TRANSCRIPT_STORAGE = storage;
+    const sent: unknown[] = [];
+    sessionSocketStub = createApiSessionSocketStub({
+      connected: true,
+      emitWithAck: async (event, payload) => {
+        if (event !== 'message') return { ok: true };
+        sent.push(payload);
+        return sent.length === 1 ? { ok: false, error: 'transaction-unavailable' }
+          : { ok: true, id: 'committed-row', seq: 7, localId: 'reconnect-original', didWrite: false };
+      },
+    });
+    userSocketStub = createApiSessionSocketStub({ connected: true, emitWithAckResult: { ok: true } });
+    const { ApiSessionClient } = await import('./sessionClient');
+    const client = new ApiSessionClient('tok', createPlainSessionFixture({ id: 's1' }));
+    const state = client as unknown as {
+      commitSessionMessage: CommitSessionMessage;
+      flushQueuedSessionMessagesOnReconnect(): Promise<void>;
+    };
+    await expect(state.commitSessionMessage.call(client, {
+      message: 'original-ciphertext', localId: 'reconnect-original', sidechainId: 'sidechain',
+      requireCommit: true, requireWriteDisposition: true, markAsUserMessage: true,
+    })).rejects.toThrow('transaction-unavailable');
+    sessionSocketStub.connected = false;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sent).toHaveLength(1);
+    sessionSocketStub.connected = true;
+    await state.flushQueuedSessionMessagesOnReconnect();
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toEqual(sent[0]);
+    expect(client.getCommittedUserMessageSeq('reconnect-original')).toBe(7);
+  });
+
+  it.each(['internal', 'forbidden', 'invalid-params'])('does not retry the permanent %s NACK', async (error) => {
+    vi.resetModules();
+    vi.useFakeTimers();
+    sessionSocketStub = createApiSessionSocketStub({
+      connected: true,
+      emitWithAck: async (event) => event === 'message' ? { ok: false, error } : { ok: true },
+    });
+    userSocketStub = createApiSessionSocketStub({ connected: true, emitWithAckResult: { ok: true } });
+    const { ApiSessionClient } = await import('./sessionClient');
+    const client = new ApiSessionClient('tok', createPlainSessionFixture({ id: 's1' }));
+    const commit = (client as unknown as { commitSessionMessage: CommitSessionMessage }).commitSessionMessage.bind(client);
+    await expect(commit({ message: 'body', localId: 'permanent-id', sidechainId: null, requireCommit: true })).rejects.toThrow(error);
+    await vi.advanceTimersByTimeAsync(7_000);
+    expect(readMessagePayloads(sessionSocketStub)).toEqual(['body']);
   });
 
   it.each([

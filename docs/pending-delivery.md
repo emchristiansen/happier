@@ -1,5 +1,21 @@
 # Pending delivery architecture
 
+## Accepted settlement retry (development)
+
+Once a provider accepts a Pending input, the session client retains that exact
+accepted `localId` until settlement or exact committed replay proves delivery.
+Lost responses, unavailable or malformed acknowledgements, and an `internal`
+settlement failure leave the outcome uncertain. The existing settlement loop
+retries that same identity with capped exponential backoff while its socket,
+connection epoch, producer and session lifetime remain current. It never submits
+the provider input again. An explicit definitive refusal ends that operation's
+retries while preserving its unresolved custody.
+
+Successful settlement releases the local gate that holds later materialization.
+Continued transport failure cannot promise queue progress. Disconnect, producer
+replacement and shutdown stop the originating operation; reconnect retains the
+existing exact-intent reconciliation path.
+
 ## Live runner wake-up recovery (development)
 
 The session client owns pending-input wake subscriptions. A transient socket
