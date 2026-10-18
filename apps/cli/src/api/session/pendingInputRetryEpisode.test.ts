@@ -77,4 +77,22 @@ describe('pending input retry budget', () => {
     vi.setSystemTime(30 * 60_000);
     expect(episode.beginAttempt()).toMatchObject({ status: 'exhausted', reason: 'deadline', failedAttempts: 0 });
   });
+  it('retains late server guidance after an observation already exhausted the episode', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const episode = new PendingInputRetryEpisode('account_settings');
+    episode.beginAttempt();
+    episode.failed(1_790_000);
+    vi.setSystemTime(1_790_000);
+    expect(episode.beginAttempt()).toMatchObject({ status: 'retrying', retryAtMs: 1_790_000 });
+    vi.setSystemTime(1_801_000);
+    const exhausted = episode.beginAttempt();
+    expect(exhausted).toMatchObject({ status: 'exhausted', reason: 'deadline' });
+    vi.setSystemTime(1_803_000);
+    expect(episode.failed(120_000)).toEqual(exhausted);
+    vi.setSystemTime(1_810_000);
+    episode.freshEvent();
+    expect(episode.beginAttempt()).toMatchObject({ status: 'retrying', retryAtMs: 1_923_000, failedAttempts: 0 });
+  });
+
 });

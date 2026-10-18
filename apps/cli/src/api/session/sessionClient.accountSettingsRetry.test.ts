@@ -296,23 +296,114 @@ describe('ApiSessionClient account settings retry', () => {
     }
   });
 
-  it('keeps direct changes refresh reachable while the user socket is disconnected and honors its lower bound', async () => {
-    readSettings = async () => settingsRequests.mock.calls.length === 1
-      ? { status: 503, headers: { 'retry-after': '120' }, data: {} }
-      : settings(9);
-    const client = await createClient();
-    userSocket.connected = false;
-    const owner = client as unknown as {
-      refreshAccountSettingsFromChangesHint(version: number): Promise<void>;
+  it('retries one disconnected changes refresh through recovery without another caller', async () => {
+    const firstRead = createDeferred<unknown>();
+    const requested = createDeferred<void>();
+    readSettings = () => {
+      requested.resolve();
+      return settingsRequests.mock.calls.length === 1 ? firstRead.promise : Promise.resolve(settings(9));
     };
-    await expect(owner.refreshAccountSettingsFromChangesHint(5)).rejects.toMatchObject({ status: 503 });
-    const refreshed = owner.refreshAccountSettingsFromChangesHint(9);
+    const client = createClient();
+    userSocket.connected = false;
+    const owner = client as unknown as { refreshAccountSettingsFromChangesHint(version: number | null): Promise<void> };
+    const refreshed = owner.refreshAccountSettingsFromChangesHint(5).then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    );
+    await requested.promise;
+    firstRead.resolve({ status: 503, headers: { 'retry-after': '120' }, data: {} });
+    await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(119_999);
     expect(settingsRequests).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
-    await refreshed;
-    expect(settingsRequests).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(settingsRequests).toHaveBeenCalledTimes(2));
+    await expect(refreshed).resolves.toEqual({ status: 'fulfilled' });
     expect(userSocket.connected).toBe(false);
+    expect(maxActiveSettingsRequests).toBe(1);
+    expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(9);
+  });
+
+  it.each([null, 5])('retains observed minimum nine across a later changes minimum %s', async (minimum) => {
+    const firstRead = createDeferred<unknown>();
+    const requested = createDeferred<void>();
+    readSettings = () => {
+      requested.resolve();
+      return settingsRequests.mock.calls.length === 1 ? firstRead.promise : Promise.resolve(settings(8));
+    };
+    const client = createClient();
+    userSocket.connected = false;
+    const owner = client as unknown as { refreshAccountSettingsFromChangesHint(version: number | null): Promise<void> };
+    const high = owner.refreshAccountSettingsFromChangesHint(9).then(() => 'fulfilled', () => 'rejected');
+    await requested.promise;
+    firstRead.resolve({ status: 503, headers: { 'retry-after': '1' }, data: {} });
+    await vi.advanceTimersByTimeAsync(0);
+    // Advance wall time without running the retained timer: the later caller must join it.
+    vi.setSystemTime(Date.now() + 1_000);
+    let lowCompleted = false;
+    const low = owner.refreshAccountSettingsFromChangesHint(minimum).then(
+      () => { lowCompleted = true; return 'fulfilled'; },
+      () => 'rejected',
+    );
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(settingsRequests.mock.calls.length).toBeGreaterThanOrEqual(2));
+    expect(snapshots.getActiveAccountSettingsSnapshot()).toBeNull();
+    expect(lowCompleted).toBe(false);
+    readSettings = async () => settings(9);
+    await vi.advanceTimersByTimeAsync(300_000);
+    await expect(Promise.all([high, low])).resolves.toEqual(['fulfilled', 'fulfilled']);
+    expect(maxActiveSettingsRequests).toBe(1);
+    expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(9);
+  });
+
+  it('retains late guidance across deadline observation at 1801s and a genuine event at 1810s', async () => {
+    vi.setSystemTime(0);
+    const firstRead = createDeferred<unknown>();
+    const lateRead = createDeferred<unknown>();
+    const firstRequested = createDeferred<void>();
+    const lateRequested = createDeferred<void>();
+    readSettings = () => {
+      if (settingsRequests.mock.calls.length === 1) { firstRequested.resolve(); return firstRead.promise; }
+      if (settingsRequests.mock.calls.length === 2) { lateRequested.resolve(); return lateRead.promise; }
+      return Promise.resolve(settings(9));
+    };
+    const client = createClient();
+    userSocket.connected = false;
+    const owner = client as unknown as { refreshAccountSettingsFromChangesHint(version: number | null): Promise<void> };
+    const root = owner.refreshAccountSettingsFromChangesHint(null).then(() => 'fulfilled', () => 'rejected');
+    await firstRequested.promise;
+    firstRead.resolve({ status: 503, headers: { 'retry-after': '1790' }, data: {} });
+    await vi.advanceTimersByTimeAsync(0);
+    // This joins the retained owner; on the old source it creates that owner after the first rejection.
+    const retained = owner.refreshAccountSettingsFromChangesHint(null).then(() => 'fulfilled', () => 'rejected');
+    await vi.advanceTimersByTimeAsync(1_790_000);
+    await lateRequested.promise;
+    expect(Date.now()).toBe(1_790_000);
+    await vi.advanceTimersByTimeAsync(11_000);
+    const observer = owner.refreshAccountSettingsFromChangesHint(null).then(() => 'fulfilled', () => 'rejected');
+    await vi.advanceTimersByTimeAsync(2_000);
+    lateRead.resolve({ status: 503, headers: { 'retry-after': '120' }, data: {} });
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.all([root, retained, observer]);
+    expect(Date.now()).toBe(1_803_000);
+    expect(maxActiveSettingsRequests).toBe(1);
+    await vi.advanceTimersByTimeAsync(7_000);
+    sessionSocket.trigger('update', {
+      id: 'late-guidance-fresh-event', seq: 1, createdAt: Date.now(),
+      body: { t: 'pending-changed', sid: 'settings-retry-session', pendingVersion: 1, pendingCount: 1 },
+    });
+    const resumed = owner.refreshAccountSettingsFromChangesHint(null).then(() => 'fulfilled', () => 'rejected');
+    await vi.advanceTimersByTimeAsync(0);
+    // The failed barrier must remain until guidance permits a new request. This also
+    // detects premature admission before the real credential-file await has settled.
+    expect((client as unknown as { accountSettingsSyncBarrierState: string | null }).accountSettingsSyncBarrierState).toBe('failed');
+    await vi.advanceTimersByTimeAsync(112_999);
+    expect(Date.now()).toBe(1_922_999);
+    expect(settingsRequests).toHaveBeenCalledTimes(2);
+    expect(snapshots.getActiveAccountSettingsSnapshot()).toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(resumed).resolves.toBe('fulfilled');
+    expect(settingsRequests).toHaveBeenCalledTimes(3);
+    expect(maxActiveSettingsRequests).toBe(1);
     expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(9);
   });
 

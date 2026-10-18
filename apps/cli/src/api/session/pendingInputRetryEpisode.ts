@@ -54,12 +54,14 @@ export class PendingInputRetryEpisode {
 
   failed(retryAfterMs?: number, initialDelayMs = 250): PendingInputRetryState {
     const state = this.current.status === 'idle' ? this.beginAttempt() : this.current;
-    if (state.status !== 'retrying') return state;
     const now = Date.now();
-    const progress = { ...state, failedAttempts: state.failedAttempts + 1 };
+    // Response guidance belongs to the completed physical request even when another
+    // observation already exhausted its episode. Only the attempt budget stays terminal.
     if (typeof retryAfterMs === 'number' && Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
       this.serverNotBeforeMs = Math.max(this.serverNotBeforeMs, now + Math.ceil(retryAfterMs));
     }
+    if (state.status !== 'retrying') return state;
+    const progress = { ...state, failedAttempts: state.failedAttempts + 1 };
     const base = Number.isFinite(initialDelayMs) && initialDelayMs > 0 ? initialDelayMs : 250;
     // Positive jitter; cap the complete local delay, then apply the independent server bound.
     const localDelayMs = Math.min(MAX_LOCAL_DELAY_MS, Math.ceil(base * 2 ** (progress.failedAttempts - 1) * (1.1 + Math.random() * 0.2)));

@@ -3055,39 +3055,42 @@ export class ApiSessionClient extends EventEmitter {
         }
     }
 
-    private refreshAccountSettingsFromChangesHint(
-        settingsVersion: number | null,
-        opts: Readonly<{
-            sourceSocket?: Socket<ServerToClientEvents, ClientToServerEvents>;
-            publishPendingEligibilityWake?: boolean;
-            signal?: AbortSignal;
-        }> = {},
-    ): Promise<void> {
+    private refreshAccountSettingsFromChangesHint(settingsVersion: number | null): Promise<void> {
         if (settingsVersion !== null && Number.isSafeInteger(settingsVersion) && settingsVersion >= 0) {
             this.accountSettingsHighestObservedVersion = Math.max(this.accountSettingsHighestObservedVersion, settingsVersion);
         }
-        const retryState = this.accountSettingsRetryEpisode.beginAttempt();
-        if (!opts.signal && (retryState.status === 'exhausted'
-            || (retryState.status === 'retrying' && retryState.retryAtMs > Date.now()))) {
-            const current = this.convergeAccountSettingsForUserSocketConnection(false);
-            this.accountSettingsHintConvergenceInFlight = current;
-            return current.finally(() => {
-                if (this.accountSettingsHintConvergenceInFlight === current) this.accountSettingsHintConvergenceInFlight = null;
-            });
-        }
+        // External changes requests retain the same owner from the first attempt, including
+        // when no user socket or eligibility waiter exists to drive convergence for them.
+        const current = this.convergeAccountSettingsForUserSocketConnection(false);
+        const publishOnCompletion = this.accountSettingsHintConvergenceInFlight !== current;
+        this.accountSettingsHintConvergenceInFlight = current;
+        return current.then(() => {
+            if (publishOnCompletion && !this.closed) {
+                this.accountSettingsPendingEligibilityWakeWithheld = false;
+                this.publishPendingEligibilityWake();
+            }
+        }).finally(() => {
+            if (this.accountSettingsHintConvergenceInFlight === current) this.accountSettingsHintConvergenceInFlight = null;
+        });
+    }
+
+    private attemptAccountSettingsRefresh(
+        settingsVersion: number | null,
+        opts: Readonly<{
+            sourceSocket?: Socket<ServerToClientEvents, ClientToServerEvents>;
+            signal: AbortSignal;
+        }>,
+    ): Promise<void> {
+        const minimumVersion = Math.max(settingsVersion ?? -1, this.accountSettingsHighestObservedVersion);
         const existingConvergence = this.accountSettingsSyncBarrierState === 'applying'
             ? this.accountSettingsSyncBarrier
             : null;
         if (existingConvergence) {
-            return existingConvergence.then(async (didApply) => {
+            return existingConvergence.then((didApply) => {
                 if (!didApply) {
                     throw this.accountSettingsSyncFailure instanceof Error
                         ? this.accountSettingsSyncFailure
                         : new Error('Account settings reconnect convergence failed');
-                }
-                const minimum = Math.max(settingsVersion ?? -1, this.accountSettingsHighestObservedVersion);
-                if ((getActiveAccountSettingsSnapshot()?.settingsVersion ?? -1) < minimum) {
-                    await this.refreshAccountSettingsFromChangesHint(minimum, opts);
                 }
             });
         }
@@ -3101,6 +3104,7 @@ export class ApiSessionClient extends EventEmitter {
             !this.closed
             && !opts.signal?.aborted
             && revision === this.accountSettingsEventRevision
+            && minimumVersion >= this.accountSettingsHighestObservedVersion
             && (
                 !opts.sourceSocket
                 || (
@@ -3126,7 +3130,7 @@ export class ApiSessionClient extends EventEmitter {
             }
             await refreshActiveAccountSettingsFromServer({
                 credentials,
-                minSettingsVersion: settingsVersion,
+                minSettingsVersion: minimumVersion >= 0 ? minimumVersion : null,
                 shouldCommit: sourceIsCurrent,
             });
             if (!sourceIsCurrent()) {
@@ -3171,9 +3175,6 @@ export class ApiSessionClient extends EventEmitter {
                 getActiveAccountSettingsSnapshot()?.settingsVersion ?? -1,
             );
             if (!this.accountSettingsHintConvergenceInFlight) this.accountSettingsPendingEligibilityWakeWithheld = false;
-            if (opts.publishPendingEligibilityWake !== false) {
-                this.publishPendingEligibilityWake();
-            }
         });
     }
 
@@ -3241,14 +3242,14 @@ export class ApiSessionClient extends EventEmitter {
                     continue;
                 }
                 try {
-                    await this.refreshAccountSettingsFromChangesHint(
+                    await this.attemptAccountSettingsRefresh(
                         this.accountSettingsHighestObservedVersion >= 0 ? this.accountSettingsHighestObservedVersion : null, {
                         sourceSocket: requireUserSocket ? this.userSocket : undefined,
-                        publishPendingEligibilityWake: false,
                         signal: controller.signal,
                     });
                     if (!isCurrent()) break;
-                    if (this.accountSettingsSyncBarrier !== null) continue;
+                    if (this.accountSettingsSyncBarrier !== null
+                        || (getActiveAccountSettingsSnapshot()?.settingsVersion ?? -1) < this.accountSettingsHighestObservedVersion) continue;
                     if (requireUserSocket) this.userSocketSettingsConvergedEpoch = epoch;
                     this.accountSettingsRetryEpisode.settled();
                     if (!this.accountSettingsHintConvergenceInFlight) this.accountSettingsPendingEligibilityWakeWithheld = false;
