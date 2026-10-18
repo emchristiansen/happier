@@ -19,6 +19,48 @@ import {
   PendingQueueAcceptedSettlementError,
   PendingQueueMaterializationTransportAmbiguousError,
 } from './pendingQueueV2Transport';
+
+const offlineBoundary = vi.hoisted(() => {
+  const origin = 'https://relay.example.invalid';
+  for (const key of ['HAPPIER_SERVER_URL', 'HAPPIER_LOCAL_SERVER_URL', 'HAPPIER_PUBLIC_SERVER_URL', 'HAPPIER_WEBAPP_URL']) {
+    vi.stubEnv(key, origin);
+  }
+  const fetch = vi.fn(async (input: string | URL | Request) => {
+    const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+    if (url.origin !== origin || url.pathname !== '/v1/features') {
+      throw new Error(`Unconfigured offline fetch: ${url.href}`);
+    }
+    return new Response(JSON.stringify({
+      features: {
+        sharing: {
+          pendingQueueV2: { enabled: true },
+          pendingDeliveryState: { enabled: true },
+        },
+      },
+      capabilities: {
+        session: {
+          runtimeActivity: { protocolVersion: 2 },
+          pendingInput: { protocolVersion: 1 },
+        },
+      },
+    }), { status: 200 });
+  });
+  vi.stubGlobal('fetch', fetch);
+  return { origin, fetch };
+});
+
+vi.mock('axios', async () => {
+  const { createOfflineAxios } = await import('@/testkit/http/offlineAxios');
+  return { default: createOfflineAxios(async (url) => {
+    throw new Error(`Unconfigured offline GET: ${url}`);
+  }) };
+});
+
+vi.mock('socket.io-client', () => ({
+  io: () => { throw new Error('Unconfigured offline socket'); },
+}));
+
+const clients: import('./sessionClient').ApiSessionClient[] = [];
 const providerInputOutcomeObservers = new WeakMap<object, (outcome: Readonly<{ kind: 'accepted'; localId: string }>) => void>();
 
 function providerInputOutcomeObserver(client: any) {
@@ -207,6 +249,7 @@ async function createClient(
         : {}),
     },
   } as any);
+  clients.push(client);
   (client as unknown as { accountIdPromise: Promise<string> }).accountIdPromise = Promise.resolve('account-1');
   await supervisorConnectedPromise;
   return client;
@@ -346,20 +389,10 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
   }, 120_000);
 
   beforeEach(() => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
-      features: {
-        sharing: {
-          pendingQueueV2: { enabled: true },
-          pendingDeliveryState: { enabled: true },
-        },
-      },
-      capabilities: {
-        session: {
-          runtimeActivity: { protocolVersion: 2 },
-          pendingInput: { protocolVersion: 1 },
-        },
-      },
-    }), { status: 200 })));
+    for (const key of ['HAPPIER_SERVER_URL', 'HAPPIER_LOCAL_SERVER_URL', 'HAPPIER_PUBLIC_SERVER_URL', 'HAPPIER_WEBAPP_URL']) {
+      vi.stubEnv(key, offlineBoundary.origin);
+    }
+    vi.stubGlobal('fetch', offlineBoundary.fetch);
     supervisorOnConnected = null;
     supervisorConnectedPromise = null;
     supervisorReportProbeResultMock.mockReset();
@@ -401,7 +434,21 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    for (const client of clients.splice(0)) {
+      const pending = client as unknown as {
+        changesSyncInFlight: Promise<void> | null;
+        userSocketSettingsConvergenceInFlight: Promise<void> | null;
+        accountSettingsHintConvergenceInFlight: Promise<void> | null;
+        accountSettingsRequestInFlight: Promise<boolean> | null;
+      };
+      const drains = [pending.changesSyncInFlight, pending.userSocketSettingsConvergenceInFlight,
+        pending.accountSettingsHintConvergenceInFlight, pending.accountSettingsRequestInFlight];
+      await client.close();
+      await Promise.allSettled([...drains, pending.changesSyncInFlight,
+        pending.userSocketSettingsConvergenceInFlight, pending.accountSettingsHintConvergenceInFlight,
+        pending.accountSettingsRequestInFlight]);
+    }
     vi.useRealTimers();
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
@@ -992,6 +1039,9 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       }>();
       const get = vi.spyOn(axios, 'get').mockImplementation((url) => {
         const path = String(url);
+        if (new URL(path).origin !== offlineBoundary.origin) {
+          throw new Error(`Offline HTTP boundary refused origin: ${new URL(path).origin}`);
+        }
         if (path.endsWith('/v2/changes')) {
           return Promise.resolve({
             status: 200,

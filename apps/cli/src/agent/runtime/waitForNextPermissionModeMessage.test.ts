@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import type { ApiSessionClient } from '@/api/session/sessionClient';
 import type { MaterializeNextPendingResult } from '@/api/session/sessionClientPort';
@@ -7,6 +7,28 @@ import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import { createDeferred } from '@/testkit/async/deferred';
 
 import { waitForNextPermissionModeMessage } from './waitForNextPermissionModeMessage';
+
+// Guard transitive diagnostic HTTP before the real queue and consumer modules load.
+vi.hoisted(() => {
+  vi.stubGlobal('fetch', vi.fn(async () => {
+    throw new Error('Unconfigured offline fetch');
+  }));
+});
+
+vi.mock('axios', async () => {
+  const { createOfflineAxios } = await import('@/testkit/http/offlineAxios');
+  return { default: createOfflineAxios(async (url) => {
+    throw new Error(`Unconfigured offline GET: ${url}`);
+  }) };
+});
+
+vi.mock('socket.io-client', () => ({
+  io: () => { throw new Error('Unconfigured offline socket'); },
+}));
+
+afterAll(() => {
+  vi.unstubAllGlobals();
+});
 
 type QueueMode = { permissionMode: PermissionMode };
 type PermissionModeSessionFixture = Pick<ApiSessionClient, 'popPendingMessage' | 'waitForPendingEligibilityUpdate'> & {
