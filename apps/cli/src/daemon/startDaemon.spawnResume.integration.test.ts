@@ -3693,7 +3693,8 @@ describe('startDaemon spawn resume wiring (integration)', () => {
         method: 'sess_already_running:session.pendingQueue.wakeCapability.v1.get',
         request: {},
       });
-      expect(callSessionRpc).toHaveBeenCalledTimes(4);
+      // Wake now awaits its own fresh archive read after adoption.
+      await vi.waitFor(() => expect(callSessionRpc).toHaveBeenCalledTimes(4));
       expect(callSessionRpc).toHaveBeenNthCalledWith(4, expect.objectContaining({
         method: 'sess_already_running:session.pendingQueue.wake.v1',
         request: { protocolVersion: 1 },
@@ -5209,7 +5210,8 @@ describe('startDaemon spawn resume wiring (integration)', () => {
       expect(result).toMatchObject({ type: 'success', sessionId: 'sess_plain' });
       expect(spawnHappyCLI).toHaveBeenCalledTimes(1);
 
-      expect(guardedRpcMock).toHaveBeenCalledTimes(2);
+      // The advisory wake is asynchronous; prove the guarded RPC actually completed.
+      await vi.waitFor(() => expect(guardedRpcMock).toHaveBeenCalledTimes(2));
       expect(guardedRpcMock.mock.calls[0]?.[0]).toEqual({
         token: 'token-daemon',
         sessionId: 'sess_plain',
