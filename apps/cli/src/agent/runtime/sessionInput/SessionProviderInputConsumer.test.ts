@@ -721,7 +721,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
     });
   });
 
-  it('returns an error result when reconciliation fails during drain', async () => {
+  it('returns a retryable disposition when reconciliation fails during drain', async () => {
     const reconcilePendingQueueState = vi.fn(async () => {
       throw new Error('reconcile failed');
     });
@@ -735,7 +735,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
 
     await expect(consumer.drainPending({ reason: 'test-reconcile-error' })).resolves.toEqual({
       materialized: 0,
-      stoppedReason: 'error',
+      stoppedReason: 'retryable_transport',
     });
     expect(reconcilePendingQueueState).toHaveBeenCalledWith({ force: true });
   });
@@ -758,7 +758,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
     expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(1);
   });
 
-  it('does not create a local retry episode for a typed unavailable materializer', async () => {
+  it('returns a retryable disposition without looping inside a single drain', async () => {
     const materializeNextPendingMessageSafely = vi.fn(async () => ({ type: 'retryable_transport' as const }));
     const consumer = createDrainConsumer(
       {
@@ -769,7 +769,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
 
     await expect(consumer.drainPending?.({ reason: 'test-legacy-pop-name' })).resolves.toEqual({
       materialized: 0,
-      stoppedReason: 'error',
+      stoppedReason: 'retryable_transport',
     });
     expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(1);
   });
@@ -907,15 +907,15 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
         materializeNextPendingMessageSafely,
         shouldAttemptPendingMaterialization: () => false,
         reconcilePendingQueueState,
-        waitForPendingEligibilityUpdate: async () => {
-          abortController.abort();
-          return false;
-        },
+        waitForPendingEligibilityUpdate: async () => false,
       },
       reconcileWhenEmpty: 'skip',
     });
 
-    await expect(consumer.waitForNextInput({ abortSignal: abortController.signal })).resolves.toBeNull();
+    const wait = consumer.waitForNextInput({ abortSignal: abortController.signal });
+    await vi.waitFor(() => expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(1));
+    abortController.abort();
+    await expect(wait).resolves.toBeNull();
     expect(materializeNextPendingMessageSafely).toHaveBeenCalledWith({
       reconcileWhenEmpty: 'skip',
       onDiagnosticPhase: expect.any(Function),
@@ -935,15 +935,15 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
       messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
       session: {
         materializeNextPendingMessageSafely,
-        waitForPendingEligibilityUpdate: async () => {
-          abortController.abort();
-          return false;
-        },
+        waitForPendingEligibilityUpdate: async () => false,
       },
       reconcileWhenEmpty: 'skip',
     });
 
-    await expect(consumer.waitForNextInput({ abortSignal: abortController.signal })).resolves.toBeNull();
+    const wait = consumer.waitForNextInput({ abortSignal: abortController.signal });
+    await vi.waitFor(() => expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(1));
+    abortController.abort();
+    await expect(wait).resolves.toBeNull();
     expect(debugSpy).toHaveBeenCalledWith(
       '[pendingQueue] input consumer materialization failed (non-fatal)',
       materializeError,
@@ -1031,16 +1031,16 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
       messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
       session: {
         materializeNextPendingMessageSafely,
-        waitForPendingEligibilityUpdate: async () => {
-          abortController.abort();
-          return false;
-        },
+        waitForPendingEligibilityUpdate: async () => false,
       },
       activeTurnSteerability: 'steerable',
       reconcileWhenEmpty: 'skip',
     });
 
-    await expect(consumer.waitForNextInput({ abortSignal: abortController.signal })).resolves.toBeNull();
+    const wait = consumer.waitForNextInput({ abortSignal: abortController.signal });
+    await vi.waitFor(() => expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(1));
+    abortController.abort();
+    await expect(wait).resolves.toBeNull();
 
     expect(debugSpy).toHaveBeenCalledWith('[pendingQueue] input consumer materialization decision', {
       activeTurnSteerability: 'steerable',
@@ -1247,6 +1247,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
 
   it('reconciles once and schedules a bounded retry when transport fails without a server delay', async () => {
     vi.useFakeTimers();
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
     try {
       const abortController = new AbortController();
       const messageQueue = new MessageQueue2<TestMode>(() => 'hash');
@@ -1273,12 +1274,13 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
       expect(reconcilePendingQueueState).toHaveBeenCalledWith({ force: true });
       expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(1);
 
-      await vi.advanceTimersByTimeAsync(249);
+      await vi.advanceTimersByTimeAsync(274);
       expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(1);
       await vi.advanceTimersByTimeAsync(1);
       await expect(waiting).resolves.toMatchObject({ message: 'recovered after reconciliation' });
       expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(2);
     } finally {
+      random.mockRestore();
       vi.useRealTimers();
     }
   });
@@ -1318,7 +1320,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
     }
   });
 
-  it('caps timer-driven ambiguous materialization rejoin at one attempt until another wake', async () => {
+  it('retries transient materialization up to twelve failures without another wake', async () => {
     vi.useFakeTimers();
     try {
       const abortController = new AbortController();
@@ -1340,8 +1342,8 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
       await vi.advanceTimersByTimeAsync(1_000);
       expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(2);
 
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(30 * 60_000);
+      expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(12);
 
       abortController.abort();
       await expect(waiting).resolves.toBeNull();

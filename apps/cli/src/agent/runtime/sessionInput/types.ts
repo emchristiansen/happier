@@ -31,7 +31,8 @@ export type DrainPendingStoppedReason =
   | 'error'
   | 'materialization_blocked'
   | 'max_pop_per_wake'
-  | 'no_pending';
+  | 'no_pending'
+  | 'retry_exhausted';
 
 export type DrainPendingOptions = {
   maxPopPerWake?: number | undefined;
@@ -45,10 +46,10 @@ export type DrainPendingOptions = {
   resolvePendingQueueDeliveryTiming?: (() => PendingQueueDeliveryTiming | undefined) | undefined;
 };
 
-export type DrainPendingResult = {
-  materialized: number;
-  stoppedReason: DrainPendingStoppedReason;
-};
+export type DrainPendingResult = { materialized: number } & (
+  | { stoppedReason: DrainPendingStoppedReason }
+  | { stoppedReason: 'retryable_transport'; retryAfterMs?: number }
+);
 
 export type ActiveTurnPendingPumpOptions = Omit<DrainPendingOptions, 'abortSignal'> & {
   abortSignal: AbortSignal;

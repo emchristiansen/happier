@@ -5,6 +5,8 @@ import { Socket } from 'socket.io-client'
 import { AgentState, ClientToServerEvents, MessageAckResponseSchema, MessageContent, Metadata, ServerToClientEvents, Session, SessionMessageContent, SessionMessageContentSchema, Update, UserMessage, UserMessageSchema, Usage } from '../types'
 import { decodeBase64, decrypt, encodeBase64, encrypt } from '../encryption';
 import { backoff, delayUnrefAbortable } from '@/utils/time';
+import { classifyServerEndpointError } from '@/api/client/classifyServerEndpointError';
+import { PendingInputRetryEpisode } from './pendingInputRetryEpisode';
 import { LruSet } from '@/utils/collections/lru';
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers';
 import { createSerializedWorkQueueDiagnostics, type SerializedWorkDiagnosticContext } from '@/utils/serializedWorkQueueDiagnostics';
@@ -696,12 +698,19 @@ export class ApiSessionClient extends EventEmitter {
     private accountIdPromise: Promise<string> | null = null;
     private accountSettingsSyncBarrier: Promise<boolean> | null = null;
     private accountSettingsSyncBarrierState: 'applying' | 'failed' | null = null;
+    private accountSettingsSyncFailure: unknown = null;
+    private accountSettingsRequestInFlight: Promise<boolean> | null = null;
     private accountSettingsPendingEligibilityWakeWithheld = false;
     private accountSettingsEventRevision = 0;
     private accountSettingsHighestObservedVersion = -1;
     private userSocketSettingsConnectionEpoch = 0;
     private userSocketSettingsConvergedEpoch = -1;
     private userSocketSettingsConvergenceInFlight: Promise<void> | null = null;
+    private readonly accountSettingsRetryEpisode = new PendingInputRetryEpisode('account_settings');
+    private accountSettingsRetryAbortController: AbortController | null = null;
+    private accountSettingsRetryRequiresUserSocket = true;
+    private readonly accountSettingsEligibilityWaiters = new Set<() => void>();
+    private accountSettingsHintConvergenceInFlight: Promise<void> | null = null;
     private startupMessageCatchUpStarted = false;
     private startupMessageCatchUpRetryIndex = 0;
     private startupMessageCatchUpRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1182,7 +1191,7 @@ export class ApiSessionClient extends EventEmitter {
         }));
         this.userSocket.on('connect', () => {
             this.userSocketSettingsConnectionEpoch += 1;
-            this.userSocketSettingsConvergenceInFlight = null;
+            this.resetAccountSettingsRetryForEvent({ preserveRequestOnlyFlight: true });
         });
         // Broadcast-safe session events are optional hints; ignore unless explicitly used.
         this.userSocket.on('session', () => {});
@@ -1337,6 +1346,7 @@ export class ApiSessionClient extends EventEmitter {
                 const isReconnect = this.hasConnectedOnce;
                 this.hasConnectedOnce = true;
                 this.sessionConnectionEpoch += 1;
+                this.resetAccountSettingsRetryForEvent();
                 if (!await this.convergePendingInputReadiness?.(() => {
                     if (this.shouldKeepUserSocketConnected()) {
                         this.kickUserSocketConnect();
@@ -2543,7 +2553,33 @@ export class ApiSessionClient extends EventEmitter {
 
         // Settings envelopes carry no session projection themselves. Other envelopes continue
         // through handleUpdate immediately; only their Pending-eligibility effect is withheld.
+        const neededConvergenceBeforeEvent = this.userSocketSettingsConvergedEpoch !== this.userSocketSettingsConnectionEpoch;
+        this.resetAccountSettingsRetryForEvent({ rearmWaiters: false });
         const revision = ++this.accountSettingsEventRevision;
+        if (isAccountSettingsHint) {
+            this.userSocketSettingsConvergedEpoch = -1;
+            const epoch = this.userSocketSettingsConnectionEpoch;
+            const deliveryTimingBeforeUpdate = resolveSessionPendingQueueDeliveryTiming(
+                getActiveAccountSettingsSnapshot()?.settings ?? null,
+            );
+            const current = this.convergeAccountSettingsForUserSocketConnection();
+            this.accountSettingsHintConvergenceInFlight = current;
+            if (neededConvergenceBeforeEvent) this.rearmAccountSettingsEligibilityWaiters();
+            void current.then(() => {
+                if (this.closed || opts.socket !== this.userSocket || !opts.socket.connected
+                    || epoch !== this.userSocketSettingsConnectionEpoch
+                    || this.accountSettingsHintConvergenceInFlight !== current) return;
+                const didBroadenEligibility = deliveryTimingBeforeUpdate === 'after_runtime_idle'
+                    && resolveSessionPendingQueueDeliveryTiming(getActiveAccountSettingsSnapshot()?.settings ?? null)
+                        === 'after_foreground_ready';
+                const hadWithheldWake = this.accountSettingsPendingEligibilityWakeWithheld;
+                this.accountSettingsPendingEligibilityWakeWithheld = false;
+                if (didBroadenEligibility || hadWithheldWake) this.publishPendingEligibilityWake();
+            }, () => {}).finally(() => {
+                if (this.accountSettingsHintConvergenceInFlight === current) this.accountSettingsHintConvergenceInFlight = null;
+            });
+            return;
+        }
         const sourceUserSocketConnectionEpoch = this.userSocketSettingsConnectionEpoch;
         const deliveryTimingBeforeUpdate = resolveSessionPendingQueueDeliveryTiming(
             getActiveAccountSettingsSnapshot()?.settings ?? null,
@@ -2554,6 +2590,7 @@ export class ApiSessionClient extends EventEmitter {
             this.accountSettingsSyncBarrier = Promise.resolve(false);
             this.accountSettingsSyncBarrierState = 'failed';
             this.userSocketSettingsConvergedEpoch = -1;
+            this.rearmAccountSettingsEligibilityWaiters();
             return;
         }
 
@@ -2569,6 +2606,7 @@ export class ApiSessionClient extends EventEmitter {
                 && sourceUserSocketConnectionEpoch === this.userSocketSettingsConnectionEpoch
                 && revision === this.accountSettingsEventRevision
             );
+            if (!sourceIsCurrent()) throw new Error('Account settings source closed before convergence started');
             if (accountSettingsUpdate && data.body.t === 'update-account') {
                 const accountId = await this.getAccountId();
                 if (!accountId || accountId !== data.body.id) {
@@ -2579,18 +2617,14 @@ export class ApiSessionClient extends EventEmitter {
                     update: accountSettingsUpdate,
                     shouldCommit: sourceIsCurrent,
                 });
-            } else if (data.body.t === 'account-settings-changed') {
-                await refreshActiveAccountSettingsFromServer({
-                    credentials,
-                    minSettingsVersion: data.body.settingsVersion,
-                    shouldCommit: sourceIsCurrent,
-                });
             }
             if (!sourceIsCurrent()) {
                 throw new Error('Account settings source closed before convergence completed');
             }
             return true;
         })().catch((error) => {
+            if (this.accountSettingsSyncBarrier === current) this.accountSettingsSyncFailure = error;
+            this.recordAccountSettingsConvergenceFailure(error);
             logger.debug('[accountSettings] Failed to apply live account settings update; withholding pending eligibility wakes', {
                 settingsVersion: accountSettingsUpdate?.version
                     ?? (data.body.t === 'account-settings-changed' ? data.body.settingsVersion : null),
@@ -2600,6 +2634,8 @@ export class ApiSessionClient extends EventEmitter {
         });
         this.accountSettingsSyncBarrier = current;
         this.accountSettingsSyncBarrierState = 'applying';
+        this.accountSettingsSyncFailure = null;
+        if (neededConvergenceBeforeEvent) this.rearmAccountSettingsEligibilityWaiters();
         void current.then((didApply) => {
             if (
                 this.closed
@@ -2611,6 +2647,7 @@ export class ApiSessionClient extends EventEmitter {
             if (!didApply) {
                 this.accountSettingsSyncBarrierState = 'failed';
                 this.userSocketSettingsConvergedEpoch = -1;
+                this.rearmAccountSettingsEligibilityWaiters();
                 if (this.accountSettingsPendingEligibilityWakeWithheld) {
                     this.accountSettingsPendingEligibilityWakeWithheld = false;
                     this.publishPendingEligibilityWake();
@@ -2619,6 +2656,7 @@ export class ApiSessionClient extends EventEmitter {
             }
             this.accountSettingsSyncBarrier = null;
             this.accountSettingsSyncBarrierState = null;
+            this.accountSettingsRetryEpisode.settled();
             this.userSocketSettingsConvergedEpoch = this.userSocketSettingsConnectionEpoch;
             const deliveryTimingAfterUpdate = resolveSessionPendingQueueDeliveryTiming(
                 getActiveAccountSettingsSnapshot()?.settings ?? null,
@@ -2752,6 +2790,9 @@ export class ApiSessionClient extends EventEmitter {
                 const runtimeActivityBecameIdle = !runtimeActivityWasIdle
                     && this.runtimeActivityProjection.runtimeActivityState === 'idle'
                     && this.runtimeActivityProjection.runtimeActivityActiveCount === 0;
+                if (stateUpdateResult.pendingWakeSeq !== pendingWakeSeqBefore || runtimeActivityBecameIdle) {
+                    this.resetAccountSettingsRetryForEvent();
+                }
                 if (
                     shouldWithholdPendingEligibility
                     && (
@@ -3011,20 +3052,50 @@ export class ApiSessionClient extends EventEmitter {
         }
     }
 
-    private refreshAccountSettingsFromChangesHint(
+    private refreshAccountSettingsFromChangesHint(settingsVersion: number | null): Promise<void> {
+        if (settingsVersion !== null && Number.isSafeInteger(settingsVersion) && settingsVersion >= 0) {
+            this.accountSettingsHighestObservedVersion = Math.max(this.accountSettingsHighestObservedVersion, settingsVersion);
+        }
+        // External changes requests retain the same owner from the first attempt, including
+        // when no user socket or eligibility waiter exists to drive convergence for them.
+        const current = this.convergeAccountSettingsForUserSocketConnection(false);
+        const publishOnCompletion = this.accountSettingsHintConvergenceInFlight !== current;
+        this.accountSettingsHintConvergenceInFlight = current;
+        return current.then(() => {
+            if (this.closed) throw new Error('Account settings convergence was closed');
+            // A changes continuation can strengthen the requirement after the owner's
+            // final check but before this reaction. Re-enter that same serialized owner.
+            if (this.accountSettingsSyncBarrier !== null
+                || (getActiveAccountSettingsSnapshot()?.settingsVersion ?? -1) < this.accountSettingsHighestObservedVersion) {
+                return this.refreshAccountSettingsFromChangesHint(null);
+            }
+            if (publishOnCompletion) {
+                this.accountSettingsPendingEligibilityWakeWithheld = false;
+                this.publishPendingEligibilityWake();
+            }
+            return;
+        }).finally(() => {
+            if (this.accountSettingsHintConvergenceInFlight === current) this.accountSettingsHintConvergenceInFlight = null;
+        });
+    }
+
+    private attemptAccountSettingsRefresh(
         settingsVersion: number | null,
         opts: Readonly<{
             sourceSocket?: Socket<ServerToClientEvents, ClientToServerEvents>;
-            publishPendingEligibilityWake?: boolean;
-        }> = {},
+            signal: AbortSignal;
+        }>,
     ): Promise<void> {
+        const minimumVersion = Math.max(settingsVersion ?? -1, this.accountSettingsHighestObservedVersion);
         const existingConvergence = this.accountSettingsSyncBarrierState === 'applying'
             ? this.accountSettingsSyncBarrier
             : null;
         if (existingConvergence) {
             return existingConvergence.then((didApply) => {
                 if (!didApply) {
-                    throw new Error('Account settings reconnect convergence failed');
+                    throw this.accountSettingsSyncFailure instanceof Error
+                        ? this.accountSettingsSyncFailure
+                        : new Error('Account settings reconnect convergence failed');
                 }
             });
         }
@@ -3036,7 +3107,9 @@ export class ApiSessionClient extends EventEmitter {
         let failure: unknown = null;
         const sourceIsCurrent = () => (
             !this.closed
+            && !opts.signal?.aborted
             && revision === this.accountSettingsEventRevision
+            && minimumVersion >= this.accountSettingsHighestObservedVersion
             && (
                 !opts.sourceSocket
                 || (
@@ -3046,9 +3119,22 @@ export class ApiSessionClient extends EventEmitter {
                 )
             )
         );
+        const recordFailure = (error: unknown): false => {
+            failure = error;
+            if (this.accountSettingsSyncBarrier === current) this.accountSettingsSyncFailure = error;
+            this.recordAccountSettingsConvergenceFailure(error);
+            logger.debug('[accountSettings] Failed request-only reconnect convergence; withholding pending eligibility wakes', {
+                settingsVersion,
+                error: serializeAxiosErrorForLog(error),
+            });
+            return false;
+        };
         // Construct and publish the barrier before the first credential/account await. A Pending
         // hint delivered in the same socket turn must observe fail-closed convergence immediately.
+        const previousRequest = this.accountSettingsRequestInFlight;
         const current = (async () => {
+            if (previousRequest) await previousRequest;
+            if (!sourceIsCurrent()) throw new Error('Account settings reconnect source closed before convergence started');
             const credentials = await readCredentials();
             if (!credentials || credentials.token !== this.token) {
                 throw new Error('Account settings reconnect refresh requires the active session credentials');
@@ -3059,24 +3145,27 @@ export class ApiSessionClient extends EventEmitter {
             }
             await refreshActiveAccountSettingsFromServer({
                 credentials,
-                minSettingsVersion: settingsVersion,
+                minSettingsVersion: minimumVersion >= 0 ? minimumVersion : null,
                 shouldCommit: sourceIsCurrent,
             });
             if (!sourceIsCurrent()) {
                 throw new Error('Account settings reconnect source closed before convergence completed');
             }
             return true;
-        })().catch((error) => {
-            failure = error;
-            logger.debug('[accountSettings] Failed request-only reconnect convergence; withholding pending eligibility wakes', {
-                settingsVersion,
-                error: serializeAxiosErrorForLog(error),
-            });
-            return false;
-        });
+        })().catch(recordFailure);
         this.accountSettingsSyncBarrier = current;
         this.accountSettingsSyncBarrierState = 'applying';
+        this.accountSettingsSyncFailure = null;
+        this.accountSettingsRequestInFlight = current;
+        void current.then(() => {
+            if (this.accountSettingsRequestInFlight === current) this.accountSettingsRequestInFlight = null;
+        });
         return current.then((didApply) => {
+            if (didApply && this.accountSettingsSyncBarrier === current && !sourceIsCurrent()) {
+                // Success and this completion are separate reactions. A newer minimum or
+                // source invalidation must terminalize our own barrier, never a newer one.
+                didApply = recordFailure(new Error('Account settings reconnect source changed before convergence settled'));
+            }
             if (!didApply) {
                 if (this.accountSettingsSyncBarrier === current) {
                     this.accountSettingsSyncBarrierState = 'failed';
@@ -3088,42 +3177,132 @@ export class ApiSessionClient extends EventEmitter {
                 }
                 throw failure instanceof Error ? failure : new Error('Account settings reconnect convergence failed');
             }
-            if (!sourceIsCurrent() || this.accountSettingsSyncBarrier !== current) return;
+            if (this.accountSettingsSyncBarrier !== current) return;
             this.accountSettingsSyncBarrier = null;
             this.accountSettingsSyncBarrierState = null;
+            this.accountSettingsRetryEpisode.settled();
             this.accountSettingsHighestObservedVersion = Math.max(
                 this.accountSettingsHighestObservedVersion,
                 getActiveAccountSettingsSnapshot()?.settingsVersion ?? -1,
             );
-            this.accountSettingsPendingEligibilityWakeWithheld = false;
-            if (opts.publishPendingEligibilityWake !== false) {
-                this.publishPendingEligibilityWake();
-            }
+            if (!this.accountSettingsHintConvergenceInFlight) this.accountSettingsPendingEligibilityWakeWithheld = false;
         });
     }
 
-    private convergeAccountSettingsForUserSocketConnection(): Promise<void> {
+    private recordAccountSettingsConvergenceFailure(error: unknown): void {
+        const status = readAuthenticationStatus(error);
+        if (status) {
+            this.sessionConnectionSupervisor?.reportProbeResult?.({
+                status: 'auth_failed', statusCode: status, errorMessage: 'Authentication failed while converging account settings',
+            });
+            return;
+        }
+        const classification = classifyServerEndpointError(error);
+        this.accountSettingsRetryEpisode.failed(classification.retryable ? classification.retryAfterMs : undefined);
+    }
+
+    private resetAccountSettingsRetryForEvent(opts: Readonly<{
+        rearmWaiters?: boolean;
+        preserveRequestOnlyFlight?: boolean;
+    }> = {}): void {
+        this.accountSettingsRetryEpisode.freshEvent();
+        // A user connection does not invalidate an HTTP-only settings source. Keep its
+        // physical request and retry owner; socket-bound or cancelled sources still retire.
+        const preserveRequestOnlyFlight = opts.preserveRequestOnlyFlight === true
+            && !this.closed
+            && this.currentConnectionState.phase !== 'auth_failed'
+            && this.userSocketSettingsConvergenceInFlight !== null
+            && !this.accountSettingsRetryRequiresUserSocket
+            && this.accountSettingsRetryAbortController?.signal.aborted === false;
+        if (!preserveRequestOnlyFlight) {
+            this.accountSettingsRetryAbortController?.abort();
+            this.accountSettingsHintConvergenceInFlight = null;
+        }
+        // Run after this envelope has published its applying/failed barrier. Reuse the active
+        // eligibility waiters instead of creating an independent convergence producer.
+        if (opts.rearmWaiters !== false) this.rearmAccountSettingsEligibilityWaiters();
+    }
+
+    private rearmAccountSettingsEligibilityWaiters(): void {
+        for (const onEvent of this.accountSettingsEligibilityWaiters) queueMicrotask(onEvent);
+    }
+
+    private convergeAccountSettingsForUserSocketConnection(requireUserSocket = true): Promise<void> {
         const epoch = this.userSocketSettingsConnectionEpoch;
-        if (this.userSocketSettingsConvergedEpoch === epoch) return Promise.resolve();
+        if (requireUserSocket && this.userSocketSettingsConvergedEpoch === epoch) return Promise.resolve();
         if (this.userSocketSettingsConvergenceInFlight) {
+            if (!requireUserSocket && this.accountSettingsRetryRequiresUserSocket && !this.userSocket.connected) {
+                this.accountSettingsRetryAbortController?.abort();
+            }
+            if (this.accountSettingsRetryAbortController?.signal.aborted) {
+                // Cancellation fences commits, but the request still owns the shared flight
+                // until it settles. Its response may also carry a server retry lower bound.
+                return this.userSocketSettingsConvergenceInFlight.catch(() => {}).then(() => {
+                    if (this.closed || (requireUserSocket && this.accountSettingsEligibilityWaiters.size === 0 && !this.accountSettingsHintConvergenceInFlight)) {
+                        throw new Error('Account settings convergence has no active eligibility waiter');
+                    }
+                    return this.convergeAccountSettingsForUserSocketConnection(requireUserSocket);
+                });
+            }
+            if (requireUserSocket && !this.accountSettingsRetryRequiresUserSocket) {
+                return this.userSocketSettingsConvergenceInFlight.then(() => {
+                    if (this.closed || this.currentConnectionState.phase === 'auth_failed'
+                        || !this.userSocket.connected || this.userSocketSettingsConnectionEpoch !== epoch) {
+                        throw new Error('Account settings user connection changed before shared convergence completed');
+                    }
+                    if (this.accountSettingsSyncBarrier !== null
+                        || (getActiveAccountSettingsSnapshot()?.settingsVersion ?? -1) < this.accountSettingsHighestObservedVersion) {
+                        return this.convergeAccountSettingsForUserSocketConnection();
+                    }
+                    this.userSocketSettingsConvergedEpoch = epoch;
+                    return;
+                });
+            }
             return this.userSocketSettingsConvergenceInFlight;
         }
-        const current = this.refreshAccountSettingsFromChangesHint(null, {
-            sourceSocket: this.userSocket,
-            publishPendingEligibilityWake: false,
-        }).then(() => {
-            if (
-                !this.closed
-                && this.userSocket.connected
-                && this.userSocketSettingsConnectionEpoch === epoch
-            ) {
-                this.userSocketSettingsConvergedEpoch = epoch;
+        const controller = new AbortController();
+        this.accountSettingsRetryAbortController = controller;
+        this.accountSettingsRetryRequiresUserSocket = requireUserSocket;
+        const isCurrent = () => (
+            !this.closed
+            && !controller.signal.aborted
+            && this.currentConnectionState.phase !== 'auth_failed'
+            && (!requireUserSocket || (this.userSocket.connected && this.userSocketSettingsConnectionEpoch === epoch))
+        );
+        const current = (async () => {
+            while (isCurrent()) {
+                const state = this.accountSettingsRetryEpisode.beginAttempt();
+                if (state.status === 'exhausted') {
+                    throw Object.assign(new Error('Account settings convergence retry episode exhausted'), { retryState: state });
+                }
+                if (state.status === 'retrying' && state.retryAtMs > Date.now()) {
+                    await delayUnrefAbortable(state.retryAtMs - Date.now(), controller.signal);
+                    continue;
+                }
+                try {
+                    await this.attemptAccountSettingsRefresh(
+                        this.accountSettingsHighestObservedVersion >= 0 ? this.accountSettingsHighestObservedVersion : null, {
+                        sourceSocket: requireUserSocket ? this.userSocket : undefined,
+                        signal: controller.signal,
+                    });
+                    if (!isCurrent()) break;
+                    if (this.accountSettingsSyncBarrier !== null
+                        || (getActiveAccountSettingsSnapshot()?.settingsVersion ?? -1) < this.accountSettingsHighestObservedVersion) continue;
+                    if (requireUserSocket) this.userSocketSettingsConvergedEpoch = epoch;
+                    this.accountSettingsRetryEpisode.settled();
+                    if (!this.accountSettingsHintConvergenceInFlight) this.accountSettingsPendingEligibilityWakeWithheld = false;
+                    return;
+                } catch (error) {
+                    if (!isCurrent() || isAuthenticationError(error) || this.currentConnectionState.phase === 'auth_failed') throw error;
+                }
             }
-        });
+            throw new Error('Account settings convergence was cancelled or replaced');
+        })();
         const tracked = current.finally(() => {
             if (this.userSocketSettingsConvergenceInFlight === tracked) {
                 this.userSocketSettingsConvergenceInFlight = null;
             }
+            if (this.accountSettingsRetryAbortController === controller) this.accountSettingsRetryAbortController = null;
         });
         this.userSocketSettingsConvergenceInFlight = tracked;
         return tracked;
@@ -3345,6 +3524,11 @@ export class ApiSessionClient extends EventEmitter {
             const onUpdate = () => finish(true);
             const onAbort = () => finish(false);
             let connectConvergenceStarted = false;
+            const onSettingsRetryEvent = () => {
+                connectConvergenceStarted = false;
+                if (!cleanedUp && this.userSocket.connected
+                    && this.userSocketSettingsConvergedEpoch !== this.userSocketSettingsConnectionEpoch) onConnect();
+            };
             const onConnect = () => {
                 if (cleanedUp || connectConvergenceStarted) return;
                 connectConvergenceStarted = true;
@@ -3371,12 +3555,17 @@ export class ApiSessionClient extends EventEmitter {
                 abortSignal?.removeEventListener('abort', onAbort);
                 this.metadataWaitAbortController.signal.removeEventListener('abort', onAbort);
                 this.userSocket.off('connect', onConnect);
+                this.accountSettingsEligibilityWaiters.delete(onSettingsRetryEvent);
+                if (this.accountSettingsEligibilityWaiters.size === 0 && !this.accountSettingsHintConvergenceInFlight) {
+                    this.accountSettingsRetryAbortController?.abort();
+                }
                 this.maybeScheduleUserSocketDisconnect();
             };
             this.on('pending-eligibility-updated', onUpdate);
             abortSignal?.addEventListener('abort', onAbort, { once: true });
             this.metadataWaitAbortController.signal.addEventListener('abort', onAbort, { once: true });
             this.userSocket.on('connect', onConnect);
+            this.accountSettingsEligibilityWaiters.add(onSettingsRetryEvent);
             this.kickUserSocketConnect();
             if (this.closed || abortSignal?.aborted) {
                 onAbort();
@@ -5742,6 +5931,7 @@ export class ApiSessionClient extends EventEmitter {
 
     async close() {
         logger.debug('[API] socket.close() called');
+        this.accountSettingsRetryAbortController?.abort();
         this.executionRunPermissionHandler?.reset();
         this.executionRunPermissionHandler = null;
         this.pendingInputReadinessAbortController?.abort();

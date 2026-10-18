@@ -37,6 +37,32 @@ settlement before claiming input.
 Authentication failures and unsupported contracts still fail closed; this
 recovery adds no polling or reconnect side effects.
 
+Development source also retries transient materialization failures through the
+existing idle consumer or active-turn pump. Each episode permits at most 12 failed
+attempts within an absolute 30-minute window. Exponential backoff adds positive
+jitter and caps the resulting local delay at 300 seconds. Eligible server retry
+guidance remains a lower bound, even across a new event; guidance that cannot fit
+within the remaining window exhausts the episode instead of causing an early
+request. The episode's own timer never renews its budget.
+
+Account-settings convergence uses the same budget at its existing request-only
+owner. A transient failure can retry on the same connection without another hint.
+The failed or applying settings barrier remains conservative, and only a current
+source may commit settings. Concurrent waiters share convergence; cancelling one
+waiter does not cancel the others. A still-owned request whose source becomes
+stale before completion leaves a failed barrier and observes backoff, while an
+older completion cannot alter a newer barrier. Request-only callers recheck the
+highest observed minimum before resolving and rejoin the same owner if needed.
+
+Exhaustion retains a typed disposition and writes one
+`[pendingInput] retry episode exhausted` entry to the default-enabled session file
+log, identifying the operation, reason, failed attempts, and episode timing. The
+consumer then waits for an existing eligibility event or reconnect to start a
+fresh episode. Cancellation stops future retries; it does not retire accepted
+provider custody or authorize a new message identity. These retries do not add
+periodic refreshes for an otherwise idle, known-empty queue whose hint never
+arrives.
+
 In current development source, an admitted prompt does not wait for the daemon's
 `prompt_or_steer` lifecycle response. That notification informs recovery and
 switching; it is not input authorization. A delayed or failed notification does
