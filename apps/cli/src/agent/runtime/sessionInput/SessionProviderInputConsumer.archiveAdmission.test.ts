@@ -148,12 +148,14 @@ describe('archived session input admission', () => {
 
   it('does not dispatch a reserved input after admission closes during the read', async () => {
     const read = createDeferred<unknown>();
-    readArchive = async () => await read.promise;
+    const readStarted = createDeferred<void>();
+    readArchive = async () => { readStarted.resolve(); return await read.promise; };
     const { consumer } = await createConsumer();
     const dispatch = vi.fn(async () => 'provider-accepted');
     const result = consumer.runProviderInputDispatch({
       abortSignal: new AbortController().signal, dispatch,
     });
+    await readStarted.promise;
     await consumer.closeProviderInputAdmissionAndWaitForDispatches();
     read.resolve({ status: 200, data: { session: record() } });
     await expect(result).resolves.toEqual({ status: 'cancelled' });
