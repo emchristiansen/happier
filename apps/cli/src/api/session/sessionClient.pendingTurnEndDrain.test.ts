@@ -2505,7 +2505,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(blockPendingDeliveryMock).not.toHaveBeenCalled();
   });
 
-  it('parks a generic accepted-settlement 500 with correlated diagnostics and no socket teardown', async () => {
+  it('retries an uncertain accepted-settlement internal failure with correlated diagnostics and no socket teardown', async () => {
     const { logger } = await import('@/ui/logger');
     const debugSpy = vi.spyOn(logger, 'debug').mockImplementation(() => {});
     const client = await createClient({
@@ -2515,10 +2515,16 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       metadata: { deliveredUserMessageSeqV1: 0 },
     });
     await waitForCurrentPendingInputContract(client);
-    materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult('generic-500-local'));
+    materializeNextMock
+      .mockResolvedValueOnce(createProviderDeliveryMaterializeResult('generic-500-local'))
+      .mockResolvedValueOnce(createProviderDeliveryMaterializeResult('later-queued-local', 4));
     resolveAcceptedPendingDeliveryMock.mockRejectedValueOnce(
       new PendingQueueAcceptedSettlementError('internal', undefined, 'req-post-callback-500'),
-    );
+    ).mockResolvedValueOnce({
+      didResolve: true,
+      pendingQueueState: { known: true, pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 3 },
+      message: { ...createProviderDeliveryMaterializeResult('generic-500-local').message, id: 'committed', seq: 7 },
+    });
 
     await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toMatchObject({
       type: 'materialized',
@@ -2540,7 +2546,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(10_000);
 
-    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(2);
     expect(debugSpy).toHaveBeenCalledWith(
       '[pendingQueue] accepted provider delivery resolution failed',
       expect.objectContaining({
@@ -2553,6 +2559,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
         }),
       }),
     );
+    expect(client.hasCanonicalPendingProviderInputDelivery('generic-500-local')).toBe(false);
     expect(materializeNextMock).toHaveBeenCalledTimes(1);
     expect(catchUpMock).not.toHaveBeenCalled();
     expect(fetchSnapshotMock).not.toHaveBeenCalled();
@@ -2563,6 +2570,10 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(sessionSocketStub?.connect).not.toHaveBeenCalled();
     expect(sessionSocketStub?.disconnect).not.toHaveBeenCalled();
     expect(sessionSocketStub?.close).not.toHaveBeenCalled();
+    await expect(client.materializeNextPendingMessageSafely()).resolves.toMatchObject({
+      type: 'materialized', localId: 'later-queued-local',
+    });
+    expect(materializeNextMock).toHaveBeenCalledTimes(2);
   });
 
   it('delivers provider-claimed pending rows directly without a committed transcript seq', async () => {

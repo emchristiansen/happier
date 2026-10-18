@@ -5,7 +5,8 @@ import { createDbMocks, installDbModuleMock } from "../api/testkit/dbMocks";
 let currentTx: any;
 let transactionQueue: any[] = [];
 
-vi.mock("@/storage/inTx", () => ({
+vi.mock("@/storage/inTx", async (importOriginal) => ({
+    ...await importOriginal<typeof import("@/storage/inTx")>(),
     inTx: async (fn: any) => await fn(transactionQueue.shift() ?? currentTx),
 }));
 

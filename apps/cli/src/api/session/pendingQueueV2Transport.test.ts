@@ -1444,7 +1444,10 @@ describe('pendingQueueV2Transport', () => {
             socket: socket as any,
             sessionId: 'session-1',
             localId: 'accepted-local',
-        })).rejects.toThrow('Invalid pending delivery accepted settlement acknowledgement');
+        })).rejects.toMatchObject({
+            code: 'pending_queue_accepted_settlement_ambiguous',
+            classification: 'malformed_ack',
+        });
         expect(mockPost).not.toHaveBeenCalled();
     });
 
@@ -1487,7 +1490,7 @@ describe('pendingQueueV2Transport', () => {
         }
     });
 
-    it('preserves unrelated accepted-settlement transport failures without making them retryable', async () => {
+    it('retains an untagged transport failure as ambiguous settlement evidence', async () => {
         const failure = new Error('publisher rejected the request');
         // Only the external socket boundary rejects; the accepted-settlement adapter remains real.
         const socket = {
@@ -1500,7 +1503,11 @@ describe('pendingQueueV2Transport', () => {
             socket,
             sessionId: 'session-1',
             localId: 'accepted-local',
-        })).rejects.toBe(failure);
+        })).rejects.toMatchObject({
+            code: 'pending_queue_accepted_settlement_ambiguous',
+            classification: 'transport_failure',
+            cause: failure,
+        });
         expect(failure).not.toHaveProperty('retryable');
         expect(mockPost).not.toHaveBeenCalled();
     });

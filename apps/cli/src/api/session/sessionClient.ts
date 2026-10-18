@@ -85,6 +85,20 @@ export type SessionRuntimeActivityClientConfig = Readonly<{
     executionRunContributionHandle: SessionRuntimeActivityContributionHandle;
 }>;
 
+type SessionMessageCommitPayload = Readonly<{
+    message: string | { t: 'plain'; v: unknown };
+    sidechainId: string | null;
+    messageRole?: SessionMessageRole;
+    sessionEventType?: 'ready';
+    markAsUserMessage?: boolean;
+    requireWriteDisposition?: boolean;
+}>;
+
+type QueuedSessionMessage = SessionMessageCommitPayload & Readonly<{
+    localId: string;
+    retryToken?: SessionMessageCommitRetryToken;
+}>;
+
 type SessionMessageCommitObservation = Readonly<{
     localId: string;
     messageId: string;
@@ -186,6 +200,8 @@ import {
     materializeNextPendingQueueV2Message,
     blockPendingQueueV2Delivery,
     PendingQueueAcceptedSettlementError,
+    PendingQueueAcceptedSettlementAmbiguousError,
+    isAcceptedPendingQueueV2DeliveryRetryableError,
     PendingQueueMaterializationTransportAmbiguousError,
     isAcceptedPendingQueueV2DeliveryNotFound,
     readAcceptedPendingQueueV2DeliveryRetryDirective,
@@ -462,6 +478,9 @@ function isTerminalPendingDeliveryNotFound(
 
 function serializeAcceptedPendingSettlementErrorForLog(error: unknown): Record<string, unknown> {
     const serialized = serializeAxiosErrorForLog(error);
+    if (error instanceof PendingQueueAcceptedSettlementAmbiguousError) {
+        return { ...serialized, classification: error.classification, cause: serializeAxiosErrorForLog(error.cause) };
+    }
     if (!(error instanceof PendingQueueAcceptedSettlementError)) return serialized;
     return {
         ...serialized,
@@ -579,7 +598,7 @@ export class ApiSessionClient extends EventEmitter {
         lastDisconnectedAt: null,
         lastErrorMessage: null,
     };
-    private queuedDisconnectedSessionMessages = new Map<string, { message: string | { t: 'plain'; v: unknown }; localId: string; sidechainId: string | null; messageRole?: SessionMessageRole; sessionEventType?: 'ready'; retryToken?: SessionMessageCommitRetryToken }>();
+    private queuedDisconnectedSessionMessages = new Map<string, QueuedSessionMessage>();
     private readonly sessionEncryptionMode: 'e2ee' | 'plain';
     private disconnectedSendLogged = false;
     private latestSessionPresence: SessionPresenceSnapshot = { thinking: false, mode: 'remote' };
@@ -639,12 +658,7 @@ export class ApiSessionClient extends EventEmitter {
     private runtimeActivityProjection: RuntimeActivityProjectionForPendingDrain = {};
     private lastTurnStatusRefreshPendingVersion: number | null = null;
     private lastBlockedTurnStatusRefreshAt = 0;
-    private readonly sessionMessageCommitRetry = createSessionMessageCommitRetry<{
-        message: string | { t: 'plain'; v: unknown };
-        sidechainId: string | null;
-        messageRole?: SessionMessageRole;
-        sessionEventType?: 'ready';
-    }, ReturnType<typeof setTimeout>>({
+    private readonly sessionMessageCommitRetry = createSessionMessageCommitRetry<SessionMessageCommitPayload, ReturnType<typeof setTimeout>>({
         maxAttempts: 3,
         resolveDelayMs: (attempt) => 1_000 * attempt,
         scheduleTimer: (callback, delayMs) => {
@@ -1650,15 +1664,7 @@ export class ApiSessionClient extends EventEmitter {
                     if (!this.isAcceptedCanonicalPendingDeliveryOperationCurrent(authority)) return;
                     if (this.canonicalPendingDeliveryByLocalId.has(localId)) {
                         const retryDirective = readAcceptedPendingQueueV2DeliveryRetryDirective(error);
-                        const isResponseLoss = Boolean(
-                            error
-                            && typeof error === 'object'
-                            && 'code' in error
-                            && (error as { code?: unknown }).code === 'socket_ack_timeout'
-                            && 'retryable' in error
-                            && (error as { retryable?: unknown }).retryable === true,
-                        );
-                        const retryAfterMs = retryDirective || isResponseLoss
+                        const retryAfterMs = retryDirective || isAcceptedPendingQueueV2DeliveryRetryableError(error)
                             ? Math.min(60_000, Math.max(
                                 retryDirective ? Math.max(250, retryDirective.retryAfterMs) : 1_000,
                                 previousRetryDelayMs * 2,
@@ -2257,7 +2263,7 @@ export class ApiSessionClient extends EventEmitter {
             || this.queuedDisconnectedSessionMessages.size > 0;
     }
 
-    private queueSessionMessageUntilReconnect(params: { message: string | { t: 'plain'; v: unknown }; localId: string; sidechainId: string | null; messageRole?: SessionMessageRole; sessionEventType?: 'ready'; retryToken?: SessionMessageCommitRetryToken }): void {
+    private queueSessionMessageUntilReconnect(params: QueuedSessionMessage): void {
         if (this.closed) return;
         this.queuedDisconnectedSessionMessages.set(params.localId, params);
         this.kickSessionSocketReconnectForQueuedMessage(params.localId);
@@ -2303,16 +2309,7 @@ export class ApiSessionClient extends EventEmitter {
                     requireCommit: false,
                     connectionEpoch: this.userSocketSettingsConnectionEpoch,
                 },
-            }, () =>
-                this.commitSessionMessage({
-                    message: params.message,
-                    localId: params.localId,
-                    sidechainId: params.sidechainId,
-                    messageRole: params.messageRole,
-                    sessionEventType: params.sessionEventType,
-                    requireCommit: false,
-                    ...(params.retryToken ? { retryToken: params.retryToken } : {}),
-                }),
+            }, () => this.commitSessionMessage({ ...params, requireCommit: false }),
             );
         }
     }
@@ -3550,19 +3547,10 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private async commitSessionMessage(
-        params: {
-            message: string | { t: 'plain'; v: unknown };
-            localId: string;
-            sidechainId: string | null;
-            messageRole?: SessionMessageRole;
-            sessionEventType?: 'ready';
-            requireCommit: boolean;
-            requireWriteDisposition?: boolean;
-            markAsUserMessage?: boolean;
-            retryToken?: SessionMessageCommitRetryToken;
-        },
+        params: QueuedSessionMessage & Readonly<{ requireCommit: boolean }>,
     ): Promise<SessionMessageCommitObservation | null> {
-        const localId = params.localId;
+        const { localId, requireCommit: _requireCommit, retryToken: previousRetryToken, ...payload } = params;
+        if (previousRetryToken && !this.sessionMessageCommitRetry.readCurrent(previousRetryToken)) return null;
         if (localId.length === 0) {
             if (params.requireCommit) {
                 throw new Error('localId is required');
@@ -3574,21 +3562,12 @@ export class ApiSessionClient extends EventEmitter {
                 throw new Error('Socket not connected');
             }
             this.queueSessionMessageUntilReconnect({
-                message: params.message,
-                localId,
-                sidechainId: params.sidechainId,
-                messageRole: params.messageRole,
-                sessionEventType: params.sessionEventType,
-                ...(params.retryToken ? { retryToken: params.retryToken } : {}),
+                ...payload, localId,
+                ...(previousRetryToken ? { retryToken: previousRetryToken } : {}),
             });
             return null;
         }
-        const retryToken = params.retryToken ?? this.sessionMessageCommitRetry.beginIntent(localId, {
-            message: params.message,
-            sidechainId: params.sidechainId,
-            ...(params.messageRole ? { messageRole: params.messageRole } : {}),
-            ...(params.sessionEventType ? { sessionEventType: params.sessionEventType } : {}),
-        });
+        const retryToken = previousRetryToken ?? this.sessionMessageCommitRetry.beginIntent(localId, payload);
         if (this.transcriptStorage === 'direct') {
 
             if (!params.requireCommit) {
@@ -3655,6 +3634,23 @@ export class ApiSessionClient extends EventEmitter {
                 };
             }
             if (ack && ack.ok === false) {
+                if (ack.error === 'transaction-unavailable') {
+                    if (!this.sessionMessageCommitRetry.readCurrent(retryToken)) {
+                        if (params.requireCommit) {
+                            throw new Error('transaction-unavailable: message commit unconfirmed; retry intent no longer current');
+                        }
+                        return null;
+                    }
+                    this.pendingMaterializedLocalIds.add(localId);
+                    const willRetry = this.scheduleCommitRetry(retryToken);
+                    logger.infoFile('[SOCKET] Transcript transaction admission unavailable', {
+                        localId, requireCommit: params.requireCommit, willRetry,
+                    });
+                    if (params.requireCommit) {
+                        throw new Error(`transaction-unavailable: message commit unconfirmed; ${willRetry ? 'same intent queued for retry' : 'retry budget exhausted'}`);
+                    }
+                    return null;
+                }
                 if (this.sessionMessageCommitRetry.complete(retryToken) && !params.requireCommit) {
                     this.deleteMaterializedLocalId(localId);
                 }
@@ -3743,6 +3739,23 @@ export class ApiSessionClient extends EventEmitter {
         }
 
         if (ack && ack.ok === false) {
+            if (ack.error === 'transaction-unavailable') {
+                if (!this.sessionMessageCommitRetry.readCurrent(retryToken)) {
+                    if (params.requireCommit) {
+                        throw new Error('transaction-unavailable: message commit unconfirmed; retry intent no longer current');
+                    }
+                    return null;
+                }
+                this.pendingMaterializedLocalIds.add(localId);
+                const willRetry = this.scheduleCommitRetry(retryToken);
+                logger.infoFile('[SOCKET] Transcript transaction admission unavailable', {
+                    localId, requireCommit: params.requireCommit, willRetry,
+                });
+                if (params.requireCommit) {
+                    throw new Error(`transaction-unavailable: message commit unconfirmed; ${willRetry ? 'same intent queued for retry' : 'retry budget exhausted'}`);
+                }
+                return null;
+            }
             if (this.sessionMessageCommitRetry.complete(retryToken)) {
                 this.deleteMaterializedLocalId(localId);
             }
@@ -3825,8 +3838,9 @@ export class ApiSessionClient extends EventEmitter {
         return dispatched;
     }
 
-    private scheduleCommitRetry(retryToken: SessionMessageCommitRetryToken): void {
-        if (!this.pendingMaterializedLocalIds.has(retryToken.localId)) return;
+    private scheduleCommitRetry(retryToken: SessionMessageCommitRetryToken): boolean {
+        if (!this.pendingMaterializedLocalIds.has(retryToken.localId)) return false;
+        if (!this.sessionMessageCommitRetry.readCurrent(retryToken)) return false;
         const scheduled = this.sessionMessageCommitRetry.schedule(retryToken, (readyToken) => {
             void this.enqueueMessageCommit('best-effort', {
                 operation: 'best-effort-retry',
@@ -3850,7 +3864,11 @@ export class ApiSessionClient extends EventEmitter {
         });
         if (!scheduled) {
             this.sessionMessageCommitRetry.complete(retryToken);
+            logger.infoFile('[SOCKET] Transcript commit retry budget exhausted; commit remains unconfirmed', {
+                localId: retryToken.localId,
+            });
         }
+        return scheduled;
     }
 
     private encryptSessionContent(content: unknown): string {
