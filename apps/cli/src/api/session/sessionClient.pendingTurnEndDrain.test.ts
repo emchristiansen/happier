@@ -51,9 +51,13 @@ const offlineBoundary = vi.hoisted(() => {
 
 vi.mock('axios', async () => {
   const { createOfflineAxios } = await import('@/testkit/http/offlineAxios');
-  return { default: createOfflineAxios(async (url) => {
-    throw new Error(`Unconfigured offline GET: ${url}`);
-  }) };
+  return { default: {
+    ...createOfflineAxios(async (url) => {
+      throw new Error(`Unconfigured offline GET: ${url}`);
+    }),
+    isAxiosError: (payload: unknown) => payload !== null && typeof payload === 'object'
+      && 'isAxiosError' in payload && payload.isAxiosError === true,
+  } };
 });
 
 vi.mock('socket.io-client', () => ({
