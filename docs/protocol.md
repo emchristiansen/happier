@@ -135,6 +135,8 @@ Field names below match on-wire payloads.
 - `message`
   - `{ sid, message, localId? }`
   - Creates a new session message (encrypted payload) and emits `new-message` update to other connections.
+  - In development, `{ ok: false, error: "transaction-unavailable" }` identifies a transaction acquisition failure before the write callback started. The runner retains the original `localId`, content and intent for its existing bounded retry. A required caller still receives a failure until a commit is confirmed. `internal` and other negative acknowledgements do not establish this no-effect classification.
+  - A retry can find an already committed row with the same `localId`; its successful acknowledgement retains `didWrite: false`. Retry exhaustion leaves the commit unconfirmed and produces a file diagnostic.
 
 - `session-alive`
   - `{ sid, time, thinking? }`

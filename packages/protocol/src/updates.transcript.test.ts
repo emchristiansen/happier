@@ -352,6 +352,13 @@ describe('updates transcript vNext payloads', () => {
     expect(parsed.data.ok).toBe(true);
   });
 
+  it.each(['transaction-unavailable', 'internal', 'forbidden', 'future-server-error'])(
+    'preserves the message failure code %s on the released open ACK boundary', (error) => {
+      const wire = JSON.parse(JSON.stringify({ ok: false, error }));
+      expect(MessageAckResponseSchema.parse(wire)).toEqual({ ok: false, error });
+    },
+  );
+
   it('parses message ack responses with forward-compatible extra fields', () => {
     const parsed = MessageAckResponseSchema.safeParse({
       ok: true,

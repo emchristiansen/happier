@@ -97,6 +97,24 @@ Do not run a full Cartesian UI × CLI × daemon × server matrix for an internal
 - Do not multiply shallow permutations. A new test must distinguish a plausible incompatibility, reader/writer mismatch, semantic change, or rollout failure.
 - Record the exact tag/commit/artifact, component roles, direction, command, and result.
 
+## Transcript admission failures (development)
+
+The `message` acknowledgement retains the released `{ ok: false, error: string }`
+shape from `cli-v0.2.12` and `server-v0.2.12` at
+`a357c65536ba89669422977d6f7daf9aa0d17e73`. The new
+`transaction-unavailable` code means the particular attempt did not enter its
+transaction callback. Updated runners retry the original intent and local ID;
+older runners can still parse the response but retain their permanent-NACK
+behavior. Updated runners talking to older servers keep generic `internal`
+failures distinct and cannot recover the missing classification by inference.
+No request, persisted message format or connection capability changes.
+
+Accepted-provider settlement uses its existing exact-ID operation and wire
+schema. Its client retries uncertain observations rather than interpreting
+missing or malformed responses as definitive refusal. This is independent of
+the ordinary transcript admission classification and does not replay provider
+input.
+
 ## Compatibility path lifecycle
 
 Every retained compatibility path records:

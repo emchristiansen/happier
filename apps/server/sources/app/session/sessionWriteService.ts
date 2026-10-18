@@ -1,6 +1,6 @@
 import { markSessionParticipantsChanged, type SessionParticipantCursor } from "@/app/session/changeTracking/markSessionParticipantsChanged";
 import { db } from "@/storage/db";
-import { inTx, type Tx } from "@/storage/inTx";
+import { inTx, isTransactionAcquisitionUnavailableError, type Tx } from "@/storage/inTx";
 import { isPrismaErrorCode } from "@/storage/prisma";
 import { log } from "@/utils/logging/log";
 import { readEncryptionFeatureEnv } from "@/app/features/catalog/readFeatureEnv";
@@ -925,6 +925,8 @@ export type CreateSessionMessageResult =
         participantCursors: [];
       }
     | { ok: false; error: "invalid-params" | "forbidden" | "session-not-found" | "internal"; code?: EncryptionPolicyRejectionCode }
+    // Only inTx's before-callback classification establishes no effect for this attempt.
+    | { ok: false; error: "transaction-unavailable" }
     | { ok: false; error: "local-id-conflict" };
 
 type CreateSessionMessageParamsBase = Readonly<{
@@ -1310,6 +1312,13 @@ export async function createSessionMessage(
             };
         });
     } catch (e) {
+        if (isTransactionAcquisitionUnavailableError(e)) {
+            log(
+                { module: "session-write", level: "warn", sessionId, error: e },
+                "Session message transaction acquisition unavailable",
+            );
+            return { ok: false, error: "transaction-unavailable" };
+        }
         if (localId && isPrismaErrorCode(e, "P2002")) {
             const target = (e as any)?.meta?.target;
             const isLocalIdConstraint =
@@ -1374,8 +1383,11 @@ export async function createSessionMessage(
                         attentionImpact,
                     });
                 });
-            } catch {
-                return { ok: false, error: "internal" };
+            } catch (error) {
+                return {
+                    ok: false,
+                    error: isTransactionAcquisitionUnavailableError(error) ? "transaction-unavailable" : "internal",
+                };
             }
         }
         log(

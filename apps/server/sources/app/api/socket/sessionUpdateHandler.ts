@@ -238,7 +238,14 @@ export function sessionUpdateHandler(
                     : {}),
             });
         if (!result.ok) {
-            callback?.({ ok: false, error: result.error === "forbidden" ? "forbidden" : result.error === "internal" ? "internal" : "invalid_observation" });
+            // Observation clients already retry internal failures. Preserve their
+            // released ACK shape without turning admission failure into invalid input.
+            callback?.({
+                ok: false,
+                error: result.error === "forbidden" ? "forbidden"
+                    : result.error === "internal" || result.error === "transaction-unavailable" ? "internal"
+                    : "invalid_observation",
+            });
             return;
         }
 
