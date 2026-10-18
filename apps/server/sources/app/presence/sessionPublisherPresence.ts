@@ -68,7 +68,7 @@ export interface ExplicitMachineStopTarget {
 export type CaptureExplicitMachineStopResult =
     | { status: "captured"; target: ExplicitMachineStopTarget }
     | { status: "already_inactive" }
-    | { status: "rejected"; reason: "not_found" | "machine_control_unavailable" | "archived" };
+    | { status: "rejected"; reason: "not_found" | "machine_control_unavailable" };
 export type CurrentPublisherResult =
     | {
         status: "current";
@@ -248,7 +248,11 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
         if (!await hasCurrentSessionScopedMachineAccessInTx({ tx, ...params.binding })) {
             return { status: "rejected", reason: "unauthorized" };
         }
-        if (session.archivedAt !== null) return { status: "rejected", reason: "archived" };
+        // Explicit machine-stop authority can retire an archived runner; a publisher's
+        // own close still has no authority over an archived session.
+        if (session.archivedAt !== null && params.authority.kind === "heartbeat") {
+            return { status: "rejected", reason: "archived" };
+        }
         if (
             params.authority.kind !== "legacy-heartbeat"
             && session.publisherGeneration !== params.authority.publisherGeneration
@@ -277,7 +281,7 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
                     where: {
                         id: params.binding.sessionId,
                         active: false,
-                        archivedAt: null,
+                        archivedAt: session.archivedAt,
                         lastActiveAt: session.lastActiveAt,
                         publisherGeneration: params.authority.publisherGeneration,
                         publisherGenerationLastActiveAt: session.lastActiveAt,
@@ -292,7 +296,7 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
             where: {
                 id: params.binding.sessionId,
                 active: true,
-                archivedAt: null,
+                archivedAt: session.archivedAt,
                 lastActiveAt: params.authority.kind === "generation"
                     ? session.lastActiveAt
                     : params.authority.committedFence,
@@ -312,11 +316,15 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
             mutationId: params.mutationId,
             observedAt: now().getTime(),
         });
-        const activity = await writeSessionRuntimeActivityObserverLossInTx({
-            tx,
-            sessionId: params.binding.sessionId,
-        });
-        if (activity.status === "rejected") {
+        // Archive already owns the terminal Activity projection. Physical-stop proof
+        // retires reachability and the publisher fence without granting Activity writes.
+        const activity = session.archivedAt === null
+            ? await writeSessionRuntimeActivityObserverLossInTx({
+                tx,
+                sessionId: params.binding.sessionId,
+            })
+            : null;
+        if (activity?.status === "rejected") {
             throw new Error(`Failed to record Runtime Activity observer loss: ${activity.reason}`);
         }
         const participantCursors = await markSessionParticipantsChanged({
@@ -327,7 +335,7 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
             status: "closed",
             activeAt: session.lastActiveAt,
             participantCursors,
-            ...(activity.status === "applied" ? { projection: activity.projection } : {}),
+            ...(activity?.status === "applied" ? { projection: activity.projection } : {}),
             ...(turnResult?.didApply
                 ? {
                     turnProjection: {
@@ -359,8 +367,9 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
         if (!await hasCurrentSessionScopedMachineAccessInTx({ tx, ...params.binding })) {
             return { status: "rejected", reason: "machine_control_unavailable" };
         }
-        if (session.archivedAt !== null) return { status: "rejected", reason: "archived" };
-        if (!session.active) return { status: "already_inactive" };
+        // Archive can follow a presence timeout while the old publisher fence survives.
+        // Capture it so confirmed physical stop terminalizes that fence without unarchiving.
+        if (!session.active && session.archivedAt === null) return { status: "already_inactive" };
         const authority = session.publisherGeneration > 0n
             && session.publisherGenerationLastActiveAt?.getTime() === session.lastActiveAt.getTime()
             ? {

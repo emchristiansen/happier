@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Server, Socket } from "socket.io";
 
-import { RPC_METHODS } from "@happier-dev/protocol/rpc";
+import { RPC_ERROR_CODES, RPC_METHODS } from "@happier-dev/protocol/rpc";
 import { SOCKET_RPC_EVENTS } from "@happier-dev/protocol/socketRpc";
 
 import { createSessionPublisherPresence } from "@/app/presence/sessionPublisherPresence";
@@ -63,12 +63,14 @@ describe("explicit machine stop RPC on SQLite", () => {
 
     async function callStop(params: Readonly<{
         targetResponse: unknown;
-        beforeResponse?: () => Promise<void>;
+        beforeCall?: (seeded: Awaited<ReturnType<typeof seed>>) => Promise<void>;
+        beforeResponse?: (seeded: Awaited<ReturnType<typeof seed>>) => Promise<void>;
     }>) {
         const seeded = await seed();
+        await params.beforeCall?.(seeded);
         const method = `${seeded.machineId}:${RPC_METHODS.STOP_SESSION}`;
         const targetEmitWithAck = vi.fn(async () => {
-            await params.beforeResponse?.();
+            await params.beforeResponse?.(seeded);
             const isStopped = (
                 params.targetResponse
                 && typeof params.targetResponse === "object"
@@ -153,6 +155,118 @@ describe("explicit machine stop RPC on SQLite", () => {
             where: { id: result.session.id },
             select: { active: true },
         })).resolves.toEqual({ active: true });
+    });
+
+    it.each([false, true])("forwards an authorized archived stop with active=%s and terminalizes its fence without unarchiving", async (active) => {
+        const archivedAt = new Date("2026-10-18T01:00:00.000Z");
+        const runtimeActivityObservedAt = BigInt(archivedAt.getTime());
+        const result = await callStop({
+            targetResponse: { status: "stopped" },
+            beforeCall: async ({ session }) => {
+                await db.session.update({
+                    where: { id: session.id },
+                    data: {
+                        active, archivedAt,
+                        runtimeActivityState: "unknown", runtimeActivityActiveCount: 0,
+                        runtimeActivityObservedAt, runtimeActivityRevision: 7n,
+                    },
+                });
+            },
+        });
+
+        expect(result.targetEmitWithAck).toHaveBeenCalledOnce();
+        expect(result.callback).toHaveBeenCalledWith({ ok: true, result: { status: "stopped" } });
+        await expect(db.session.findUniqueOrThrow({
+            where: { id: result.session.id },
+            select: {
+                active: true, archivedAt: true, publisherGenerationLastActiveAt: true,
+                runtimeActivityState: true, runtimeActivityActiveCount: true,
+                runtimeActivityObservedAt: true, runtimeActivityRevision: true,
+            },
+        })).resolves.toEqual({
+            active: false, archivedAt, publisherGenerationLastActiveAt: null,
+            runtimeActivityState: "unknown", runtimeActivityActiveCount: 0,
+            runtimeActivityObservedAt, runtimeActivityRevision: 7n,
+        });
+    });
+
+    it("retains the archived publisher fence when termination is only requested", async () => {
+        const archivedAt = new Date("2026-10-18T01:00:00.000Z");
+        const result = await callStop({
+            targetResponse: { status: "requested" },
+            beforeCall: async ({ session }) => {
+                await db.session.update({ where: { id: session.id }, data: { active: false, archivedAt } });
+            },
+        });
+
+        expect(result.targetEmitWithAck).toHaveBeenCalledOnce();
+        expect(result.callback).toHaveBeenCalledWith({ ok: true, result: { status: "requested" } });
+        const session = await db.session.findUniqueOrThrow({
+            where: { id: result.session.id },
+            select: { active: true, archivedAt: true, lastActiveAt: true, publisherGenerationLastActiveAt: true },
+        });
+        expect(session).toEqual({ active: false, archivedAt, lastActiveAt: session.lastActiveAt, publisherGenerationLastActiveAt: session.lastActiveAt });
+    });
+
+    it("preserves archive when it occurs between stop capture and physical-stop acknowledgement", async () => {
+        const archivedAt = new Date("2026-10-18T01:00:00.000Z");
+        const result = await callStop({
+            targetResponse: { status: "stopped" },
+            beforeResponse: async ({ session }) => {
+                await db.session.update({
+                    where: { id: session.id },
+                    data: { active: false, archivedAt },
+                });
+            },
+        });
+
+        expect(result.callback).toHaveBeenCalledWith({ ok: true, result: { status: "stopped" } });
+        await expect(db.session.findUniqueOrThrow({
+            where: { id: result.session.id },
+            select: { active: true, archivedAt: true, publisherGenerationLastActiveAt: true },
+        })).resolves.toEqual({ active: false, archivedAt, publisherGenerationLastActiveAt: null });
+    });
+
+    it("does not forward an archived stop after session-scoped machine access is revoked", async () => {
+        const result = await callStop({
+            targetResponse: { status: "stopped" },
+            beforeCall: async ({ owner, machineId, session }) => {
+                await db.session.update({
+                    where: { id: session.id },
+                    data: { active: false, archivedAt: new Date("2026-10-18T01:00:00.000Z") },
+                });
+                await db.accessKey.deleteMany({
+                    where: { accountId: owner.id, machineId, sessionId: session.id },
+                });
+            },
+        });
+
+        expect(result.targetEmitWithAck).not.toHaveBeenCalled();
+        expect(result.callback).toHaveBeenCalledWith(expect.objectContaining({
+            ok: false,
+            errorCode: RPC_ERROR_CODES.SESSION_MACHINE_CONTROL_UNAVAILABLE,
+        }));
+    });
+
+    it("does not finalize an archived stop when machine access is revoked before acknowledgement", async () => {
+        const archivedAt = new Date("2026-10-18T01:00:00.000Z");
+        const result = await callStop({
+            targetResponse: { status: "stopped" },
+            beforeCall: async ({ session }) => {
+                await db.session.update({ where: { id: session.id }, data: { active: false, archivedAt } });
+            },
+            beforeResponse: async ({ owner, machineId, session }) => {
+                await db.accessKey.deleteMany({ where: { accountId: owner.id, machineId, sessionId: session.id } });
+            },
+        });
+
+        expect(result.targetEmitWithAck).toHaveBeenCalledOnce();
+        expect(result.callback).toHaveBeenCalledWith({ ok: false, error: "Session stop could not be finalized safely" });
+        const session = await db.session.findUniqueOrThrow({
+            where: { id: result.session.id },
+            select: { active: true, archivedAt: true, lastActiveAt: true, publisherGenerationLastActiveAt: true },
+        });
+        expect(session).toEqual({ active: false, archivedAt, lastActiveAt: session.lastActiveAt, publisherGenerationLastActiveAt: session.lastActiveAt });
     });
 
     it("does not close a successor publisher that registers while stop is in flight", async () => {
