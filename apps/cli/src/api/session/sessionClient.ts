@@ -3073,6 +3073,7 @@ export class ApiSessionClient extends EventEmitter {
                 this.accountSettingsPendingEligibilityWakeWithheld = false;
                 this.publishPendingEligibilityWake();
             }
+            return;
         }).finally(() => {
             if (this.accountSettingsHintConvergenceInFlight === current) this.accountSettingsHintConvergenceInFlight = null;
         });
