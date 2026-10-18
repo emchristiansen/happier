@@ -19,6 +19,9 @@ import {
 import type { SessionEncryptionContext, SessionStoredContentEncryptionMode } from '@/session/transport/encryption/sessionEncryptionContext';
 import { resolveSessionControlWaitIdleConfirmMs } from '@/session/transport/shared/sessionTimeouts';
 
+// Socket observations remain immediate. Bound the fallback's silent-socket detection delay.
+const MAX_PROJECTION_RECHECK_DELAY_MS = 5_000;
+
 export type AgentStateSummary = Readonly<{
   controlledByUser?: boolean;
   pendingRequestsCount: number;
@@ -160,6 +163,7 @@ export async function waitForIdleViaSocket(params: Readonly<{
     let hasFreshAgentStateObservation = false;
     let idleConfirmTimer: ReturnType<typeof setTimeout> | null = null;
     let busyRecheckTimer: ReturnType<typeof setTimeout> | null = null;
+    let projectionRecheckDelayMs = resolveSessionControlWaitIdleConfirmMs();
 
     const cleanup = () => {
       if (settled) return;
@@ -239,7 +243,12 @@ export async function waitForIdleViaSocket(params: Readonly<{
       if (!waitingForIdleAfterFreshBusy) return;
 
       const remainingMs = Math.max(1, deadlineMs - Date.now());
-      const delayMs = Math.min(resolveSessionControlWaitIdleConfirmMs(), remainingMs);
+      // The callback's source is fixed at entry by waitForSessionIdle. A later socket
+      // projection must not change the cadence of a transcript-only callback.
+      const fallbackDelayMs = params.preferProjectionUpdates === true
+        ? projectionRecheckDelayMs
+        : resolveSessionControlWaitIdleConfirmMs();
+      const delayMs = Math.min(fallbackDelayMs, remainingMs);
 
       if (busyRecheckTimer) {
         clearTimeout(busyRecheckTimer);
@@ -248,10 +257,14 @@ export async function waitForIdleViaSocket(params: Readonly<{
 
       busyRecheckTimer = setTimeout(() => {
         busyRecheckTimer = null;
+        if (params.preferProjectionUpdates === true) {
+          projectionRecheckDelayMs = Math.min(MAX_PROJECTION_RECHECK_DELAY_MS, projectionRecheckDelayMs * 2);
+        }
         void (async () => {
           if (settled) return;
           try {
             const latestTurnActivity = await params.recheckTurnActivity?.();
+            if (settled) return;
             if (!latestTurnActivity) {
               scheduleBusyTurnActivityRecheck();
               return;

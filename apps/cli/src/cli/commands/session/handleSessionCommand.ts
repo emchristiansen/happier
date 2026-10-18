@@ -186,7 +186,7 @@ export async function handleSessionCommand(
         await bootstrapAccountSettingsContext({
           credentials,
           mode: 'blocking',
-          refresh: 'force',
+          refresh: 'auto',
         });
       } catch {
         // Best-effort: session control commands should still work when
