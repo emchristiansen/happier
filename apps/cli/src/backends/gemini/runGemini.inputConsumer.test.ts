@@ -30,6 +30,7 @@ type FakeSession = {
   getMetadataSnapshot: ReturnType<typeof vi.fn>;
   fetchLatestUserPermissionIntentFromTranscript: ReturnType<typeof vi.fn>;
   keepAlive: ReturnType<typeof vi.fn>;
+  waitForProviderInputAdmission: ReturnType<typeof vi.fn>;
   waitForMetadataUpdate: ReturnType<typeof vi.fn>;
   waitForPendingEligibilityUpdate: ReturnType<typeof vi.fn>;
   materializeNextPendingMessageSafely: ReturnType<typeof vi.fn>;
@@ -411,6 +412,7 @@ function createFakeSession(): FakeSession {
     getMetadataSnapshot: vi.fn(() => ({ path: '/tmp/gemini-test' })),
     fetchLatestUserPermissionIntentFromTranscript: vi.fn(async () => null),
     keepAlive: vi.fn(),
+    waitForProviderInputAdmission: vi.fn(async (signal: AbortSignal) => !signal.aborted),
     waitForMetadataUpdate: vi.fn(async () => false),
     waitForPendingEligibilityUpdate: vi.fn(async () => false),
     materializeNextPendingMessageSafely: vi.fn(

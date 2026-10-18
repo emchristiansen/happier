@@ -63,14 +63,14 @@ vi.mock('socket.io-client', () => ({
   },
 }));
 
-async function createConsumer() {
+async function createConsumer(attachSessionId = sessionId) {
   sessionSocket = createApiSessionSocketStub({ id: 'f1-session' });
   userSocket = createApiSessionSocketStub({ id: 'f1-user' });
   const api = await apiModule.ApiClient.create({
     token: 'synthetic-f1-token', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(8) },
   });
   const session = api.sessionSyncClient(createPlainSessionFixture({ id: sessionId }), undefined,
-    { existingSessionId: sessionId });
+    { existingSessionId: attachSessionId });
   clients.push(session);
   const queue = new MessageQueue2<{ id: string }>(() => 'original-hash');
   return { session, queue, consumer: createSessionProviderInputConsumer({ messageQueue: queue, session }) };
@@ -101,6 +101,15 @@ describe('archived session input admission', () => {
   afterAll(() => {
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
+  });
+
+  it('binds the canonical existing identity after the resume parser trims whitespace', async () => {
+    const { session } = await createConsumer(` ${sessionId} `);
+    expect(session.sessionId).toBe(sessionId);
+  });
+
+  it('refuses an existing-identity admission binding for a different session', async () => {
+    await expect(createConsumer('different-existing-session')).rejects.toThrow('exact attached session identity');
   });
 
   it('retains the exact queued input while archive admission is unreadable', async () => {
@@ -274,7 +283,7 @@ describe('archived session input admission', () => {
   });
 
 
-  it.each(['initial goal', 'queued prompt'] as const)('holds the actual terminal writer for %s until a fresh archive read succeeds', async (kind) => {
+  it.each([['initial goal', 'allowed'], ['queued prompt', 'allowed'], ['queued prompt', 'archived'], ['queued prompt', 'unavailable']] as const)('holds the actual terminal writer for %s with %s archive admission', async (kind, outcome) => {
     const fixtureRoot = await mkdtemp(join(tmpdir(), 'f1-terminal-admission-'));
     const transcriptPath = join(fixtureRoot, 'f1-provider-resume.jsonl');
     await writeFile(transcriptPath, '');
@@ -305,11 +314,15 @@ describe('archived session input admission', () => {
       interruptTurn: async () => {}, evaluateLiveness: async () => ({ paneAlive: true, observedAt: Date.now() }), dispose: async () => {},
     };
     let pulled = false;
+    const returned: unknown[] = [];
+    const onPromptAcceptedByProvider = vi.fn();
     const run = runClaudeUnifiedTerminalSession({
       path: process.cwd(), happySessionId: sessionId, sessionId: 'f1-provider-resume',
       transcriptPath, hookPluginDir: join(fixtureRoot, 'hook-plugin'),
       initialMode: { permissionMode: 'default', claudeUnifiedTerminalHost: 'tmux' },
       initialGoalObjective: kind === 'initial goal' ? 'exact original goal' : undefined,
+      returnUnconsumedMessage: (batch) => { returned.push(batch); },
+      onPromptAcceptedByProvider,
       waitForProviderInputAdmission: (signal) => session.waitForProviderInputAdmission(signal),
       nextMessage: async () => {
         if (kind === 'queued prompt' && !pulled) {
@@ -331,13 +344,26 @@ describe('archived session input admission', () => {
     try {
       await readStarted.promise;
       expect(injectUserPrompt).not.toHaveBeenCalled();
-      response.resolve({ status: 200, data: { session: record() } });
-      await written.promise;
-      await run;
-      expect(injectUserPrompt).toHaveBeenCalledTimes(1);
-      expect(injectUserPrompt.mock.calls[0]?.[1]).toEqual(expect.objectContaining({
-        text: kind === 'initial goal' ? '/goal exact original goal' : 'exact original prompt',
-      }));
+      response.resolve(outcome === 'unavailable' ? { status: 503, data: {} } : {
+        status: 200, data: { session: { ...record(), archivedAt: outcome === 'archived' ? 42 : null } },
+      });
+      if (outcome === 'allowed') {
+        await written.promise;
+        await run;
+        expect(injectUserPrompt).toHaveBeenCalledTimes(1);
+        expect(injectUserPrompt.mock.calls[0]?.[1]).toEqual(expect.objectContaining({
+          text: kind === 'initial goal' ? '/goal exact original goal' : 'exact original prompt',
+        }));
+      } else {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        abort.abort();
+        await run;
+        expect(injectUserPrompt).not.toHaveBeenCalled();
+        expect(onPromptAcceptedByProvider).not.toHaveBeenCalled();
+        expect(returned).toContainEqual(expect.objectContaining({
+          message: 'exact original prompt', userMessageLocalIds: ['exact-terminal-id'],
+        }));
+      }
     } finally {
       abort.abort();
       response.resolve({ status: 503, data: {} });

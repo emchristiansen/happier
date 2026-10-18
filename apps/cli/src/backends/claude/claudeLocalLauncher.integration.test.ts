@@ -162,6 +162,7 @@ function createLocalHarness(options?: {
     },
     getMetadataSnapshot: options?.metadataSnapshot ? vi.fn(() => options.metadataSnapshot) : undefined,
     waitForMetadataUpdate: vi.fn(async () => false),
+    waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted,
     waitForPendingEligibilityUpdate: vi.fn(async () => false),
     popPendingMessage: vi.fn(async () => false),
     rpcHandlerManager: {

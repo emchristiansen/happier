@@ -750,7 +750,7 @@ export class ApiClient {
     runtimeActivity?: import('./session/sessionClient').SessionRuntimeActivityClientConfig,
     attach?: Readonly<{ existingSessionId: string }>,
   ): ApiSessionClient {
-    if (attach && attach.existingSessionId !== session.id) {
+    if (attach && attach.existingSessionId.trim() !== session.id) {
       throw new Error('Existing-session input admission requires the exact attached session identity');
     }
     return new ApiSessionClient(this.credential.token, session, runtimeActivity, attach ? async () => {
