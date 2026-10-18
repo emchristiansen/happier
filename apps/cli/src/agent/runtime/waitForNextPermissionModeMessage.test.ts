@@ -85,18 +85,21 @@ describe('waitForNextPermissionModeMessage', () => {
 
   it('waits after deferred safe materialization without falling back to legacy pop', async () => {
     const queue = createQueue();
-    const waitingForMetadata = createDeferred<void>();
+    const deferredMaterialized = createDeferred<void>();
     const popPendingMessage = vi.fn(async () => true);
-    const materializeNextPendingMessageSafely = vi.fn(async () => ({
-      type: 'deferred',
-      reason: 'supervisor_offline',
-    }) satisfies MaterializeNextPendingResult);
+    const materializeNextPendingMessageSafely = vi.fn(async () => {
+      const result = {
+        type: 'deferred',
+        reason: 'supervisor_offline',
+      } satisfies MaterializeNextPendingResult;
+      deferredMaterialized.resolve();
+      return result;
+    });
 
     const session: PermissionModeSessionFixture = {
       popPendingMessage,
       materializeNextPendingMessageSafely,
       async waitForPendingEligibilityUpdate(abortSignal?: AbortSignal) {
-        waitingForMetadata.resolve();
         return await new Promise<boolean>((resolve) => {
           abortSignal?.addEventListener('abort', () => resolve(false), { once: true });
         });
@@ -110,7 +113,7 @@ describe('waitForNextPermissionModeMessage', () => {
       session: asSessionClient(session),
     });
 
-    await waitingForMetadata.promise;
+    await deferredMaterialized.promise;
     abortController.abort();
 
     await expect(resultPromise).resolves.toBeNull();

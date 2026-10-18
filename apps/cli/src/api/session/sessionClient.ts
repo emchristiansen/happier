@@ -1191,7 +1191,7 @@ export class ApiSessionClient extends EventEmitter {
         }));
         this.userSocket.on('connect', () => {
             this.userSocketSettingsConnectionEpoch += 1;
-            this.resetAccountSettingsRetryForEvent();
+            this.resetAccountSettingsRetryForEvent({ preserveRequestOnlyFlight: true });
         });
         // Broadcast-safe session events are optional hints; ignore unless explicitly used.
         this.userSocket.on('session', () => {});
@@ -2554,7 +2554,7 @@ export class ApiSessionClient extends EventEmitter {
         // Settings envelopes carry no session projection themselves. Other envelopes continue
         // through handleUpdate immediately; only their Pending-eligibility effect is withheld.
         const neededConvergenceBeforeEvent = this.userSocketSettingsConvergedEpoch !== this.userSocketSettingsConnectionEpoch;
-        this.resetAccountSettingsRetryForEvent(false);
+        this.resetAccountSettingsRetryForEvent({ rearmWaiters: false });
         const revision = ++this.accountSettingsEventRevision;
         if (isAccountSettingsHint) {
             this.userSocketSettingsConvergedEpoch = -1;
@@ -3201,13 +3201,26 @@ export class ApiSessionClient extends EventEmitter {
         this.accountSettingsRetryEpisode.failed(classification.retryable ? classification.retryAfterMs : undefined);
     }
 
-    private resetAccountSettingsRetryForEvent(rearmWaiters = true): void {
+    private resetAccountSettingsRetryForEvent(opts: Readonly<{
+        rearmWaiters?: boolean;
+        preserveRequestOnlyFlight?: boolean;
+    }> = {}): void {
         this.accountSettingsRetryEpisode.freshEvent();
-        this.accountSettingsRetryAbortController?.abort();
-        this.accountSettingsHintConvergenceInFlight = null;
+        // A user connection does not invalidate an HTTP-only settings source. Keep its
+        // physical request and retry owner; socket-bound or cancelled sources still retire.
+        const preserveRequestOnlyFlight = opts.preserveRequestOnlyFlight === true
+            && !this.closed
+            && this.currentConnectionState.phase !== 'auth_failed'
+            && this.userSocketSettingsConvergenceInFlight !== null
+            && !this.accountSettingsRetryRequiresUserSocket
+            && this.accountSettingsRetryAbortController?.signal.aborted === false;
+        if (!preserveRequestOnlyFlight) {
+            this.accountSettingsRetryAbortController?.abort();
+            this.accountSettingsHintConvergenceInFlight = null;
+        }
         // Run after this envelope has published its applying/failed barrier. Reuse the active
         // eligibility waiters instead of creating an independent convergence producer.
-        if (rearmWaiters) this.rearmAccountSettingsEligibilityWaiters();
+        if (opts.rearmWaiters !== false) this.rearmAccountSettingsEligibilityWaiters();
     }
 
     private rearmAccountSettingsEligibilityWaiters(): void {
@@ -3229,6 +3242,20 @@ export class ApiSessionClient extends EventEmitter {
                         throw new Error('Account settings convergence has no active eligibility waiter');
                     }
                     return this.convergeAccountSettingsForUserSocketConnection(requireUserSocket);
+                });
+            }
+            if (requireUserSocket && !this.accountSettingsRetryRequiresUserSocket) {
+                return this.userSocketSettingsConvergenceInFlight.then(() => {
+                    if (this.closed || this.currentConnectionState.phase === 'auth_failed'
+                        || !this.userSocket.connected || this.userSocketSettingsConnectionEpoch !== epoch) {
+                        throw new Error('Account settings user connection changed before shared convergence completed');
+                    }
+                    if (this.accountSettingsSyncBarrier !== null
+                        || (getActiveAccountSettingsSnapshot()?.settingsVersion ?? -1) < this.accountSettingsHighestObservedVersion) {
+                        return this.convergeAccountSettingsForUserSocketConnection();
+                    }
+                    this.userSocketSettingsConvergedEpoch = epoch;
+                    return;
                 });
             }
             return this.userSocketSettingsConvergenceInFlight;

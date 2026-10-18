@@ -296,7 +296,8 @@ describe('ApiSessionClient account settings retry', () => {
     }
   });
 
-  it('retries one disconnected changes refresh through recovery without another caller', async () => {
+  it.each(['disconnected', 'concurrent_success', 'concurrent_retry'] as const)(
+    'retains one changes refresh through recovery and user reconnect: %s', async (scenario) => {
     const firstRead = createDeferred<unknown>();
     const requested = createDeferred<void>();
     readSettings = () => {
@@ -310,17 +311,52 @@ describe('ApiSessionClient account settings retry', () => {
       () => ({ status: 'fulfilled' as const }),
       (error: unknown) => ({ status: 'rejected' as const, error }),
     );
-    await requested.promise;
-    firstRead.resolve({ status: 503, headers: { 'retry-after': '120' }, data: {} });
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(119_999);
-    expect(settingsRequests).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1);
-    await vi.waitFor(() => expect(settingsRequests).toHaveBeenCalledTimes(2));
-    await expect(refreshed).resolves.toEqual({ status: 'fulfilled' });
-    expect(userSocket.connected).toBe(false);
-    expect(maxActiveSettingsRequests).toBe(1);
-    expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(9);
+    const abort = new AbortController();
+    let wait: Promise<boolean> | undefined;
+    let waitCompleted = false;
+    try {
+      await requested.promise;
+      if (scenario !== 'disconnected') {
+        wait = client.waitForPendingEligibilityUpdate(abort.signal).then((value) => {
+          waitCompleted = true;
+          return value;
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(userSocket.connected).toBe(true);
+        expect(waitCompleted).toBe(false);
+        expect(settingsRequests).toHaveBeenCalledTimes(1);
+      }
+      firstRead.resolve(scenario === 'concurrent_success'
+        ? settings(9)
+        : { status: 503, headers: { 'retry-after': '120' }, data: {} });
+      await vi.advanceTimersByTimeAsync(0);
+      if (scenario !== 'concurrent_success') {
+        await vi.advanceTimersByTimeAsync(119_999);
+        expect(settingsRequests).toHaveBeenCalledTimes(1);
+        expect(snapshots.getActiveAccountSettingsSnapshot()).toBeNull();
+        expect(waitCompleted).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+        await vi.waitFor(() => expect(settingsRequests).toHaveBeenCalledTimes(2));
+      }
+      await expect(refreshed).resolves.toEqual({ status: 'fulfilled' });
+      if (wait) {
+        await expect(wait).resolves.toBe(true);
+        const epochs = client as unknown as {
+          userSocketSettingsConvergedEpoch: number;
+          userSocketSettingsConnectionEpoch: number;
+        };
+        expect(epochs.userSocketSettingsConvergedEpoch).toBe(epochs.userSocketSettingsConnectionEpoch);
+      } else {
+        expect(userSocket.connected).toBe(false);
+      }
+      expect(settingsRequests).toHaveBeenCalledTimes(scenario === 'concurrent_success' ? 1 : 2);
+      expect(maxActiveSettingsRequests).toBe(1);
+      expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(9);
+    } finally {
+      abort.abort();
+      firstRead.resolve(settings(9));
+      await Promise.all([refreshed, wait]);
+    }
   });
 
   it.each([null, 5])('retains observed minimum nine across a later changes minimum %s', async (minimum) => {
