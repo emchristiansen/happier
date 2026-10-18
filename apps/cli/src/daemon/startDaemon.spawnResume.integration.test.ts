@@ -16,6 +16,7 @@ import { SPAWN_SESSION_ERROR_CODES } from '@/rpc/handlers/registerSessionHandler
 import { fetchSessionByIdCompat, fetchSessionsPage } from '@/session/transport/http/sessionsHttp';
 import { callSessionRpc } from '@/session/transport/rpc/sessionRpc';
 import { resolveSessionTransportContext } from '@/session/services/resolveSessionTransportContext';
+import { createDeferred } from '@/testkit/async/deferred';
 import { createSessionRecordFixture } from '@/testkit/backends/sessionFixtures';
 import {
   HAPPIER_SESSION_CONNECTED_SERVICES_BINDINGS_ENV_KEY,
@@ -120,6 +121,25 @@ async function createValidClaudeEndpointFixture(
 }
 
 const ORIGINAL_PLATFORM_DESCRIPTOR = Object.getOwnPropertyDescriptor(process, 'platform');
+const archiveHttp = vi.hoisted(() => ({
+  archivedAt: null as number | null,
+  read: null as null | ((id: string) => Promise<unknown>),
+}));
+
+vi.mock('axios', () => ({
+  default: {
+    get: vi.fn(async (url: string) => {
+      const parsed = new URL(url);
+      if (parsed.origin !== 'https://relay.example.invalid' || !parsed.pathname.startsWith('/v2/sessions/')) {
+        throw new Error(`Unconfigured offline daemon HTTP request: ${url}`);
+      }
+      const id = decodeURIComponent(parsed.pathname.slice('/v2/sessions/'.length));
+      if (archiveHttp.read) return await archiveHttp.read(id);
+      return { status: 200, data: { session: createSessionRecordFixture({ id, archivedAt: archiveHttp.archivedAt }) } };
+    }),
+    isAxiosError: () => false,
+  },
+}));
 const { spawnChildProcess } = vi.hoisted(() => ({
   spawnChildProcess: vi.fn(() => ({
     pid: 12345,
@@ -385,16 +405,16 @@ vi.mock('@/ui/auth', () => ({
 
 vi.mock('@/configuration', () => ({
   configuration: {
-    privateKeyFile: '/tmp/key',
-    happyHomeDir: '/tmp/happy-home',
-    activeServerDir: '/tmp/happy-home/servers/active',
+    privateKeyFile: join(tmpdir(), 'f1-daemon-key'),
+    happyHomeDir: join(tmpdir(), 'f1-daemon-home'),
+    activeServerDir: join(tmpdir(), 'f1-daemon-home/servers/active'),
     activeServerId: 'test-server',
-    apiServerUrl: 'http://localhost:9999',
+    apiServerUrl: 'https://relay.example.invalid',
     currentCliVersion: '0.0.0-test',
-    installationIdentityFile: '/tmp/happy-home/installation-identity.json',
+    installationIdentityFile: join(tmpdir(), 'f1-daemon-home/installation-identity.json'),
     publicReleaseRing: 'stable',
-    serverUrl: 'http://localhost:9999',
-    webappUrl: 'http://localhost:9999',
+    serverUrl: 'https://relay.example.invalid',
+    webappUrl: 'https://relay.example.invalid',
     daemonSpawnExistingSessionWaitForExitMs: 5_000,
     daemonSpawnExistingSessionWaitForExitPollIntervalMs: 50,
     daemonReattachCatchUpConcurrency: 4,
@@ -860,7 +880,8 @@ vi.mock('./shutdownPolicy', () => ({
   getDaemonShutdownWatchdogTimeoutMs: vi.fn(() => 10_000),
 }));
 
-vi.mock('@/session/transport/http/sessionsHttp', () => ({
+vi.mock('@/session/transport/http/sessionsHttp', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/session/transport/http/sessionsHttp')>(),
   fetchSessionByIdCompat: vi.fn(async () =>
     createSessionRecordFixture({
       id: 'sess_plain',
@@ -890,6 +911,8 @@ vi.mock('./connectedServices/quotas/resolveConnectedServicesQuotasDaemonEnabled'
 
 describe('startDaemon spawn resume wiring (integration)', () => {
   beforeEach(() => {
+    archiveHttp.archivedAt = null;
+    archiveHttp.read = null;
     if (ORIGINAL_PLATFORM_DESCRIPTOR) {
       // Most cases exercise platform-independent daemon lifecycle behavior. Keep their
       // launch adapter deterministic; dedicated cases below opt into Linux/macOS behavior.
@@ -3295,7 +3318,157 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     }
   });
 
-  it('spawns an existing session without re-fetching it when a pre-resolved attach payload is supplied', async () => {
+  it('retains an unreadable resume without occupying another session’s physical-spawn slot', async () => {
+    vi.stubEnv('HAPPIER_DAEMON_MAX_CONCURRENT_SPAWNS', '1');
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const firstRead = createDeferred<void>();
+    let unreadable = true;
+    archiveHttp.read = async (id) => {
+      if (id === 'f1-unknown-slot' && unreadable) {
+        firstRead.resolve();
+        return { status: 503, data: {} };
+      }
+      return { status: 200, data: { session: createSessionRecordFixture({ id, archivedAt: 42 }) } };
+    };
+    let run: Promise<void> | null = null;
+    let first: Promise<unknown> | null = null;
+    let second: Promise<unknown> | null = null;
+    try {
+      const { startDaemon } = await import('./startDaemon');
+      run = startDaemon();
+      const spawnSession = await waitForSpawnSessionRegistration();
+      const options = {
+        directory: join(tmpdir(), 'f1-unknown-workspace'),
+        backendTarget: { kind: 'builtInAgent' as const, agentId: 'codex' as const },
+        existingSessionAttachPayload: { v: 2 as const, encryptionMode: 'plain' as const },
+      };
+      let firstFinished = false;
+      first = spawnSession({ ...options, existingSessionId: 'f1-unknown-slot' }).then((value) => { firstFinished = true; return value; });
+      await firstRead.promise;
+      let secondFinished = false;
+      second = spawnSession({ ...options, existingSessionId: 'f1-archived-neighbor' }).then((value) => { secondFinished = true; return value; });
+      await vi.waitFor(() => expect(secondFinished).toBe(true));
+      expect(firstFinished).toBe(false);
+      await expect(second).resolves.toMatchObject({ type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED });
+      expect(spawnHappyCLI).not.toHaveBeenCalled();
+    } finally {
+      unreadable = false;
+      await first;
+      await second;
+      if (run) { harness.requestShutdown('happier-cli'); await run; }
+      vi.unstubAllEnvs();
+      exitSpy.mockRestore();
+    }
+  });
+
+  it('rereads archive state after a queued start obtains its physical-spawn slot', async () => {
+    vi.stubEnv('HAPPIER_DAEMON_MAX_CONCURRENT_SPAWNS', '1');
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const firstAccepted = createDeferred<void>();
+    const releaseFirst = createDeferred<void>();
+    let run: Promise<void> | null = null;
+    let first: Promise<unknown> | null = null;
+    let second: Promise<unknown> | null = null;
+    try {
+      const { startDaemon } = await import('./startDaemon');
+      run = startDaemon();
+      const spawnSession = await waitForSpawnSessionRegistration();
+      const options = {
+        directory: join(tmpdir(), 'f1-queued-workspace'),
+        backendTarget: { kind: 'builtInAgent' as const, agentId: 'codex' as const },
+        existingSessionAttachPayload: { v: 2 as const, encryptionMode: 'plain' as const },
+      };
+      first = spawnSession({ ...options, existingSessionId: 'f1-before-archive' }, {
+        onBeforeRunnerLaunchAccepted: async () => { firstAccepted.resolve(); await releaseFirst.promise; },
+      });
+      await firstAccepted.promise;
+      second = spawnSession({ ...options, existingSessionId: 'f1-queued-then-archived' });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      archiveHttp.archivedAt = 42;
+      releaseFirst.resolve();
+      await first;
+      await expect(second).resolves.toMatchObject({ type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED });
+      // The already-admitted first start may exist briefly; archive is not a global lock.
+      // The later queued start must never launch after its fresh check sees archive.
+      expect(spawnHappyCLI).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseFirst.resolve();
+      await first;
+      await second;
+      if (run) { harness.requestShutdown('happier-cli'); await run; }
+      vi.unstubAllEnvs();
+      exitSpy.mockRestore();
+    }
+  });
+
+  it.each(['before adoption', 'before wake'] as const)('refuses archive %s without waking the existing runner', async (boundary) => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    sessionRunnerActivityBoundaryMocks.readProcessRunState.mockResolvedValue('servable');
+    const id = 'f1-adopt-archive';
+    pendingMaterializationRpcMocks.resolveSessionTransportContext.mockResolvedValue({
+      ok: true, sessionId: id, rawSession: { id, active: true, encryptionMode: 'plain' },
+      mode: 'plain', ctx: pendingMaterializationRpcMocks.ctx,
+    });
+    pendingMaterializationRpcMocks.callSessionRpc.mockImplementation(async (params) =>
+      params.method.endsWith('wakeCapability.v1.get')
+        ? { ok: true, capability: 'pending_queue_wake_v1', protocolVersion: 1, method: 'session.pendingQueue.wake.v1' }
+        : { ok: true, result: 'wake_published' });
+    if (boundary === 'before adoption') archiveHttp.archivedAt = 42;
+    vi.mocked(fetchSessionByIdCompat).mockImplementation(async () => {
+      if (boundary === 'before wake') archiveHttp.archivedAt = 42;
+      return createSessionRecordFixture({ id, encryptionMode: 'plain', metadata: JSON.stringify({ flavor: 'codex', path: tmpdir(), codexSessionId: 'f1-vendor-id' }) });
+    });
+    let run: Promise<void> | null = null;
+    const tracked: { current: Parameters<typeof import('./sessions/onHappySessionWebhook').createOnHappySessionWebhook>[0]['pidToTrackedSession'] | null } = { current: null };
+    try {
+      const webhook = await import('./sessions/onHappySessionWebhook');
+      vi.mocked(webhook.createOnHappySessionWebhook).mockImplementation(({ pidToTrackedSession }) => {
+        tracked.current = pidToTrackedSession;
+        return vi.fn();
+      });
+      const { startDaemon } = await import('./startDaemon');
+      run = startDaemon();
+      const spawnSession = await waitForSpawnSessionRegistration();
+      expect(tracked.current).not.toBeNull();
+      tracked.current!.set(12345, { pid: 12345, startedBy: 'terminal', happySessionId: id, spawnOptions: { directory: tmpdir(), existingSessionId: id, backendTarget: { kind: 'builtInAgent', agentId: 'codex' } } });
+      const result = await spawnSession({ directory: tmpdir(), existingSessionId: id, backendTarget: { kind: 'builtInAgent', agentId: 'codex' } });
+      expect(result).toMatchObject(boundary === 'before adoption'
+        ? { type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED }
+        : { type: 'success', runnerAcceptance: 'preexisting_or_adopted' });
+      expect(spawnHappyCLI).not.toHaveBeenCalled();
+      expect(pendingMaterializationRpcMocks.callSessionRpc.mock.calls.some(([request]) => request.method.endsWith(':session.pendingQueue.wake.v1'))).toBe(false);
+    } finally {
+      if (run) { harness.requestShutdown('happier-cli'); await run; }
+      exitSpy.mockRestore();
+    }
+  });
+
+  it('refuses an archived existing session even when its attach payload was pre-resolved', async () => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    archiveHttp.archivedAt = 42;
+    let run: Promise<void> | null = null;
+    try {
+      const { startDaemon } = await import('./startDaemon');
+      run = startDaemon();
+      const spawnSession = await waitForSpawnSessionRegistration();
+      const result = await spawnSession({
+        directory: join(tmpdir(), 'f1-archived-workspace'),
+        backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+        existingSessionId: 'f1-archived-target',
+        existingSessionAttachPayload: { v: 2, encryptionMode: 'plain' },
+      });
+      expect(result).toMatchObject({ type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED });
+      expect(spawnHappyCLI).not.toHaveBeenCalled();
+    } finally {
+      if (run) {
+        harness.requestShutdown('happier-cli');
+        await run;
+      }
+      exitSpy.mockRestore();
+    }
+  });
+
+  it('spawns an existing session without re-fetching its attach payload when it was pre-resolved', async () => {
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
     const refreshEnvOriginal = process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;
     process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = 'false';

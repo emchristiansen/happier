@@ -2311,7 +2311,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata: vi.fn() } as any,
+            session: { updateMetadata: vi.fn(), waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted } as any,
             permissionMode: 'read-only',
             pendingQueue: {
                 drainAfterStartOrLoad: true,
@@ -3921,6 +3921,7 @@ describe('createCodexAppServerRuntime', () => {
         const inputConsumer = createSessionProviderInputConsumer({
             messageQueue: new MessageQueue2<{ id: string }>(() => 'hash'),
             session: {
+                waitForProviderInputAdmission: async (signal) => !signal.aborted,
                 materializeNextPendingMessageSafely,
                 waitForPendingEligibilityUpdate: async (signal) => await new Promise<boolean>((resolve) => {
                     const finish = (updated: boolean) => {

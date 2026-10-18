@@ -223,6 +223,30 @@ opt-out restores previews; users can disable them again from an updated client. 
 the flag and retain their existing reduced hints. There is no new server operation,
 migration, duplicate settings owner, or client-update requirement.
 
+### Existing-session archive admission (maintained 0.2 source)
+
+Existing-ID resume, adoption, and Pending wake use a fresh authenticated session
+read before admission. A newly loaded runner reads again before programmatic
+provider input, including preloaded input and initial goals. An archived result
+refuses input and requests the existing exact-owner physical-stop path. An
+unreadable, missing, or malformed result grants no permission: the original input
+and local ID remain pending through the existing retry policy. Exhausted input
+waits require a fresh eligibility or connection event to renew their retry budget.
+
+This changes CLI/daemon semantics without changing relay schemas or wire formats.
+A relay response must include an explicit null `archivedAt` to permit input;
+responses that omit archive state keep existing-ID input waiting. Already loaded
+older runners retain their old behavior until replaced, so updating a package or
+daemon does not retrofit this check into a resident runner. The maintained 0.2
+source change makes no claim about the development 0.3 line.
+
+Archive does not wait for a runner. An archive occurring after the final check
+can meet one turn already in flight, and a runner may exist briefly before its
+stop is confirmed. Stop uncertainty remains uncertainty. Explicit create/load is
+outside this admission contract: automatic same-tag create retry can unarchive a
+just-archived new session. Human terminal keystrokes are also outside the
+programmatic-input boundary.
+
 ## Migration history
 
 Migration source has a stricter authoring boundary than ordinary internal code:

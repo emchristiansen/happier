@@ -505,7 +505,8 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     if (!activateProviderTaskRuntimeActivity) {
         throw new Error('Claude runtime Activity producer binding was not configured');
     }
-    const session = api.sessionSyncClient(baseSession, runtimeActivity.lifecycle.clientConfig());
+    const session = api.sessionSyncClient(baseSession, runtimeActivity.lifecycle.clientConfig(),
+        existingSessionId ? { existingSessionId } : undefined);
     logger.infoFile('[CLAUDE_STARTUP] stage=session_transport_attach_started');
     await runtimeActivity.lifecycle.attachSession(session);
     logger.infoFile('[CLAUDE_STARTUP] stage=session_transport_attach_completed');
@@ -1626,6 +1627,7 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
     };
 
     const startupSpec = createClaudeStartupSpec({
+        existingSessionId,
         deps: {
             registerRpcHandlers: ({ artifacts }) => {
                 registerSessionHandlers(artifacts.deferredSession.startupRpcHandlerManager, workingDirectory, {

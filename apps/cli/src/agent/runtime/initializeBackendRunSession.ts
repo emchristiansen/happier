@@ -294,6 +294,7 @@ export async function initializeBackendRunSession(
     const session = opts.api.sessionSyncClient(
       baseSession,
       preparedRuntimeActivity.clientConfig(),
+      { existingSessionId },
     )
     await preparedRuntimeActivity.attachSession(session)
     opts.configureSessionClient?.(session)

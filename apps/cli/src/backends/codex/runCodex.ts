@@ -910,6 +910,7 @@ export async function runCodex(opts: {
             };
 
         return {
+            waitForProviderInputAdmission: (signal) => session.waitForProviderInputAdmission(signal),
             materializeNextPendingMessageSafely,
             shouldAttemptPendingMaterialization: () => session.shouldAttemptPendingMaterialization?.() ?? true,
             reconcilePendingQueueState: (opts) => session.reconcilePendingQueueState?.(opts),

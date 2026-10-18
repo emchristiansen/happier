@@ -454,6 +454,9 @@ export async function claudeLocalLauncher(
 
                 const { mcpConfigJson: baseMcpConfigJson } = await session.getOrCreateHappierMcpBridge();
                 try {
+                    if (!await session.client.waitForProviderInputAdmission(processAbortController.signal)) {
+                        return { type: 'exit', code: 1 };
+                    }
                     await claudeLocal({
                         path: session.path,
                         sessionId: resumeFromSessionId,

@@ -49,6 +49,7 @@ function createLoopClient(overrides?: Partial<SessionClientPort>): SessionClient
     sendAgentMessageCommitted: vi.fn(async () => {}),
     keepAlive: vi.fn(),
     getMetadataSnapshot: () => null,
+    waitForProviderInputAdmission: async (signal) => !signal.aborted,
     waitForPendingEligibilityUpdate: vi.fn(async () => false),
     waitForMetadataUpdate: vi.fn(async () => false),
     popPendingMessage: vi.fn(async () => false),

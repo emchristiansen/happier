@@ -219,6 +219,8 @@ export type ClaudeUnifiedTerminalSessionOptions<Mode extends EnhancedMode = Enha
   signal?: AbortSignal | undefined;
   initialMode?: Mode | undefined;
   nextMessage: () => Promise<ClaudeUnifiedTerminalQueuedInput<Mode> | null>;
+  /** Fresh existing-session archive admission, including delayed programmatic goal injection. */
+  waitForProviderInputAdmission: (signal: AbortSignal) => Promise<boolean>;
   /**
    * Hands back a queued message that was already consumed by the input pump but
    * can no longer be delivered (host-death/dispose unwind), so the owner can
@@ -1706,6 +1708,20 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
     const hostInputInjection: TerminalInputInjectionV1 = {
       hostKind: hostResolution.adapter.kind,
       injectUserPrompt: async (input, writeBoundary) => {
+        const signal = AbortSignal.any([
+          runtimeAbortController.signal, processSignalAbortController.signal,
+          ...(opts.signal ? [opts.signal] : []),
+        ]);
+        if (!await opts.waitForProviderInputAdmission(signal)) {
+          const error = new Error('Provider input admission closed before terminal prompt injection');
+          error.name = 'AbortError';
+          throw error;
+        }
+        if (signal.aborted) {
+          const error = new Error('Terminal prompt injection cancelled before host write');
+          error.name = 'AbortError';
+          throw error;
+        }
         // Lane X: every text we attempt to write is recorded so a later leftover composer draft
         // can be exact-match classified as OUR OWN residue (vs an untouchable genuine user draft).
         ownComposerTextLog.record(input.text);

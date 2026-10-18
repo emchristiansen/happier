@@ -59,6 +59,7 @@ export type DeferredApiSessionTarget = Readonly<{
   getMetadataSnapshot: () => Metadata | null;
   refreshSessionSnapshotFromServerBestEffort?: (opts?: { reason?: 'connect' | 'waitForMetadataUpdate' }) => Promise<void>;
   waitForMetadataUpdate: (abortSignal?: AbortSignal) => Promise<boolean>;
+  waitForProviderInputAdmission?: (abortSignal: AbortSignal) => Promise<boolean>;
   waitForPendingEligibilityUpdate?: (abortSignal?: AbortSignal) => Promise<boolean>;
   shouldAttemptPendingMaterialization?: () => boolean;
   reconcilePendingQueueState?: (opts?: { force?: boolean }) => Promise<boolean>;
@@ -103,12 +104,16 @@ export class DeferredApiSessionClient {
   private cancelled = false;
   private runtimeTerminationStarted = false;
   private pendingWakeDebt = false;
+  private readonly existingSessionId: string | null;
+  private readonly archiveAdmissionTarget = createDeferredPromise<DeferredApiSessionTarget | null>();
+  private readonly archiveAdmissionAbort = new AbortController();
   private providerOwnedUserMessageEchoClassifier: ProviderOwnedUserMessageEchoClassifier | null = null;
   private providerOwnedUserMessageEchoClassifierSet = false;
 
-  constructor(opts: { placeholderSessionId: string; limits: DeferredSessionBufferLimits }) {
+  constructor(opts: { placeholderSessionId: string; limits: DeferredSessionBufferLimits; existingSessionId?: string }) {
     this.sessionId = opts.placeholderSessionId;
     this.limits = opts.limits;
+    this.existingSessionId = opts.existingSessionId?.trim() || null;
     this.rpcHandlerManager = {
       registerHandler: <TRequest = any, TResponse = any>(
         method: string,
@@ -489,6 +494,39 @@ export class DeferredApiSessionClient {
     return await this.withAttachedTarget((t) => t.waitForMetadataUpdate(abortSignal), false);
   }
 
+  async waitForProviderInputAdmission(abortSignal: AbortSignal): Promise<boolean> {
+    const signal = AbortSignal.any([abortSignal, this.archiveAdmissionAbort.signal]);
+    if (signal.aborted || this.cancelled || this.runtimeTerminationStarted) return false;
+    // Fresh create/load startup keeps its existing fast-start behavior. Existing-ID attach
+    // cannot turn this placeholder or a failed attach into permission to deliver input.
+    if (!this.existingSessionId) {
+      return this.target?.waitForProviderInputAdmission?.(signal) ?? true;
+    }
+    const target = await new Promise<DeferredApiSessionTarget | null>((resolve) => {
+      const finish = (value: DeferredApiSessionTarget | null) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      };
+      const onAbort = () => finish(null);
+      signal.addEventListener('abort', onAbort, { once: true });
+      this.archiveAdmissionTarget.promise.then(finish);
+      if (signal.aborted) finish(null);
+    });
+    if (!target || signal.aborted || target.sessionId !== this.existingSessionId) return false;
+    const admission = target.waitForProviderInputAdmission;
+    if (!admission) {
+      // An attached target without the new admission owner is still unknown. Hold the input
+      // until cancellation; do not claim that the missing method authorized or rejected it.
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) resolve();
+        else signal.addEventListener('abort', () => resolve(), { once: true });
+      });
+      return false;
+    }
+    const allowed = await admission.call(target, signal);
+    return allowed && !signal.aborted && !this.cancelled && !this.runtimeTerminationStarted;
+  }
+
   async waitForPendingEligibilityUpdate(abortSignal?: AbortSignal): Promise<boolean> {
     if (abortSignal?.aborted) return false;
     return await this.withAttachedTarget(
@@ -549,6 +587,7 @@ export class DeferredApiSessionClient {
   }
 
   async close(): Promise<void> {
+    this.archiveAdmissionAbort.abort();
     await this.withAttachedTarget((t) => t.close(), undefined);
   }
 
@@ -613,12 +652,17 @@ export class DeferredApiSessionClient {
         this.flushInFlight = null;
       }
     })();
+    void this.attachPromise.then(
+      () => this.archiveAdmissionTarget.resolve(_real),
+      () => { /* The attach caller reports failure; a failed attach grants no input permission. */ },
+    );
     return this.attachPromise;
   }
 
   cancel(): void {
     if (this.cancelled) return;
     this.cancelled = true;
+    this.archiveAdmissionAbort.abort();
     this.pendingWakeDebt = false;
 
     const entries = this.buffer;
@@ -637,6 +681,7 @@ export class DeferredApiSessionClient {
   beginRuntimeTermination(): void {
     if (this.runtimeTerminationStarted) return;
     this.runtimeTerminationStarted = true;
+    this.archiveAdmissionAbort.abort();
     this.target?.beginRuntimeTermination?.();
     if (!this.target) this.cancel();
   }

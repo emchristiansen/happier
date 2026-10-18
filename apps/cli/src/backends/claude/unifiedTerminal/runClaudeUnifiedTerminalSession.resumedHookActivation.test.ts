@@ -152,6 +152,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
         expectedProviderResumeSessionId: requestedSessionId,
         hookPluginDir: join(dir, 'owned-happier-hook-plugin'),
         signal: abortController.signal,
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         nextMessage: async () => {
           if (pendingPulled) return await new Promise(() => undefined);
           pendingPulled = true;
@@ -300,6 +301,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
       transcriptPath,
       hookPluginDir: join(dir, 'owned-happier-hook-plugin'),
       signal: abortController.signal,
+      waitForProviderInputAdmission: async (signal) => !signal.aborted,
       nextMessage: async () => {
         if (pendingPulled) return await new Promise(() => undefined);
         pendingPulled = true;
@@ -472,6 +474,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
       transcriptPath,
       hookPluginDir: join(dir, 'owned-happier-hook-plugin'),
       signal: abortController.signal,
+      waitForProviderInputAdmission: async (signal) => !signal.aborted,
       nextMessage: async () => {
         pendingPullCount += 1;
         if (pendingPullCount > 2) return await new Promise(() => undefined);
@@ -617,6 +620,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     const sessionPromise = runClaudeUnifiedTerminalSession({
       path: '/workspace/project',
       signal: abortController.signal,
+      waitForProviderInputAdmission: async (signal) => !signal.aborted,
       nextMessage: async () => {
         if (consumed) return await new Promise(() => undefined);
         consumed = true;
@@ -727,6 +731,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     const sessionPromise = runClaudeUnifiedTerminalSession({
       path: '/workspace/project',
       signal: abortController.signal,
+      waitForProviderInputAdmission: async (signal) => !signal.aborted,
       nextMessage: async () => {
         if (consumed) return await new Promise(() => undefined);
         consumed = true;
@@ -915,6 +920,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
       sessionId: claudeSessionId,
       hookPluginDir: join(dir, 'owned-happier-hook-plugin'),
       signal: abortController.signal,
+      waitForProviderInputAdmission: async (signal) => !signal.aborted,
       nextMessage: async () => {
         if (consumed) return await new Promise(() => undefined);
         consumed = true;

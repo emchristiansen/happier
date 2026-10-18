@@ -11,6 +11,8 @@ import {
 } from '@happier-dev/agents';
 
 import { ApiClient, isMachineContentPublicKeyMismatchError } from '@/api/api';
+import { readSessionArchiveState } from '@/session/services/readSessionArchiveState';
+import { createBackoff } from '@/utils/time';
 import { serializeAxiosErrorForLog } from '@/api/client/serializeAxiosErrorForLog';
 import { ensureMachineRegistered } from '@/api/machine/ensureMachineRegistered';
 import { ensureSessionMachineAccessKeyBinding } from '@/api/session/ensureSessionMachineAccessKeyBinding';
@@ -1409,11 +1411,45 @@ async function applyAlreadyRunningExistingSessionRuntimeSnapshot(params: Readonl
   }
 }
 
+class SessionArchiveAdmissionUnavailableError extends Error {
+  constructor() { super('Session archive admission is temporarily unreadable'); }
+}
+
+async function readDaemonSessionArchiveAdmission(params: Readonly<{
+  sessionId: string;
+  credentials: Credentials;
+  isShutdownRequested?: () => boolean;
+}>): Promise<boolean> {
+  if (params.isShutdownRequested?.()) throw new Error('Session archive admission cancelled by daemon shutdown');
+  const state = await readSessionArchiveState({
+    token: params.credentials.token, sessionId: params.sessionId, signal: new AbortController().signal,
+  });
+  if (state === 'unavailable') throw new SessionArchiveAdmissionUnavailableError();
+  return state === 'unarchived';
+}
+
+async function waitForDaemonSessionArchiveAdmission(params: Readonly<{
+  sessionId: string;
+  credentials: Credentials;
+  isShutdownRequested?: () => boolean;
+}>): Promise<boolean> {
+  // Unknown is a retained request, not a permanent spawn rejection. Reuse the daemon's
+  // existing backoff utility; only an authoritative row or actual shutdown ends this wait.
+  const read = createBackoff({
+    maxFailureCount: Number.POSITIVE_INFINITY,
+    shouldRetry: () => !params.isShutdownRequested?.(),
+  });
+  return await read(async () => await readDaemonSessionArchiveAdmission(params));
+}
+
 async function requestPendingQueueWake(params: Readonly<{
   sessionId: string;
   credentials: Credentials;
   isShutdownRequested?: () => boolean;
 }>) {
+  if (!await waitForDaemonSessionArchiveAdmission(params)) {
+    throw new Error('Pending queue wake refused because the existing session is archived');
+  }
   return await requestSessionPendingQueueWakeV1({
     sessionId: params.sessionId,
     token: params.credentials.token,
@@ -3096,6 +3132,15 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   };
                 }
                 if (resumeDecisionAfterWait.action === 'adopt') {
+                  if (!await waitForDaemonSessionArchiveAdmission({
+                    sessionId: normalizedExistingSessionId, credentials,
+                    isShutdownRequested: () => shutdownInitiated,
+                  })) {
+                    return {
+                      type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED,
+                      errorMessage: 'Cannot resume an archived session. Unarchive it explicitly before resuming.',
+                    };
+                  }
                   const runnerAcceptance = resolveExistingRunnerAcceptance({
                     requestedSpawnNonce: normalizedOptions.spawnNonce,
                     trackedSpawnNonces: Array.from(pidToTrackedSession.values())
@@ -3164,7 +3209,13 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               }
             }
 
-            return await spawnConcurrencyGate.run(async () => {
+            // Only a failed no-effect archive read is retried. Release the physical-spawn
+            // slot between reads so one unavailable session cannot block unrelated starts.
+            const retryArchiveAdmission = createBackoff({
+              maxFailureCount: Number.POSITIVE_INFINITY,
+              shouldRetry: (error) => error instanceof SessionArchiveAdmissionUnavailableError && !shutdownInitiated,
+            });
+            return await retryArchiveAdmission(async () => await spawnConcurrencyGate.run(async () => {
               const resolvedDirectory = normalizedOptions.directory;
               let {
                 directory,
@@ -3190,6 +3241,17 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               } = normalizedOptions;
               const normalizedResume = typeof resume === 'string' ? resume.trim() : '';
               const normalizedExistingSessionId = typeof existingSessionId === 'string' ? existingSessionId.trim() : '';
+              // This read belongs after the queue: a pre-queue snapshot cannot authorize
+              // a later physical start, and a supplied attach payload is not archive authority.
+              if (normalizedExistingSessionId && !await readDaemonSessionArchiveAdmission({
+                sessionId: normalizedExistingSessionId, credentials,
+                isShutdownRequested: () => shutdownInitiated,
+              })) {
+                return {
+                  type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED,
+                  errorMessage: 'Cannot resume an archived session. Unarchive it explicitly before resuming.',
+                };
+              }
               const canonicalCodexBackendMode = resolveCanonicalCodexBackendMode({
                 codexBackendMode,
                 experimentalCodexAcp,
@@ -4520,7 +4582,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                       errorMessage: `Failed to spawn session: ${errorMessage}`
                     };
                   }
-              });
+              }));
           });
                 };
 

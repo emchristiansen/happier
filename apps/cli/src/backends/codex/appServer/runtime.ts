@@ -4245,6 +4245,11 @@ export function createCodexAppServerRuntime(params: Readonly<{
         );
         const initialGoal = options.initialGoal;
         if (initialGoal?.objective) {
+            if (!await params.session.waitForProviderInputAdmission(new AbortController().signal)) {
+                const error = new Error('Provider input admission closed before initial Codex goal');
+                error.name = 'AbortError';
+                throw error;
+            }
             const response = await client.request('thread/goal/set', {
                 threadId: startOrLoadResult.nextThreadId,
                 objective: trimStringValue(initialGoal.objective),

@@ -1043,8 +1043,10 @@ export async function claudeUnifiedTerminalLauncher(
         transcriptProjector.observeRaw(value, observation);
       },
       initialGoalObjective: consumeInitialGoalObjective(),
+      waitForProviderInputAdmission: (signal) => session.client.waitForProviderInputAdmission(signal),
       nextMessage: async () => {
         await session.connectedServiceAuthGroupRequestFence?.waitUntilAvailable(abortController.signal);
+        if (!await session.client.waitForProviderInputAdmission(abortController.signal)) return null;
         if (parkedMessage) {
           const parked = parkedMessage;
           const mode = observeOutgoingBatchMode(parked.mode);

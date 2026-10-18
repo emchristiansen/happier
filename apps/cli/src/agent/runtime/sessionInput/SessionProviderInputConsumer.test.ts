@@ -24,12 +24,13 @@ function createDeferred<T>() {
 }
 
 function createDrainConsumer(
-  session: Parameters<typeof createSessionProviderInputConsumer<TestMode, string>>[0]['session'],
+  session: Omit<Parameters<typeof createSessionProviderInputConsumer<TestMode, string>>[0]['session'], 'waitForProviderInputAdmission'>,
   options: Partial<Omit<Parameters<typeof createSessionProviderInputConsumer<TestMode, string>>[0], 'messageQueue' | 'session'>> = {},
 ): ConsumerWithDrain {
   return createSessionProviderInputConsumer({
     messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
-    session,
+    // These materialization fixtures model create/load scope, not existing-ID archive admission.
+    session: { waitForProviderInputAdmission: async (signal) => !signal.aborted, ...session },
     ...options,
   }) as ConsumerWithDrain;
 }
@@ -170,6 +171,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue,
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         blockPendingMessageDelivery,
         waitForPendingEligibilityUpdate: async () => false,
@@ -273,6 +275,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue,
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         waitForPendingEligibilityUpdate: () => metadataWake.promise,
       },
@@ -344,6 +347,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue,
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         waitForPendingEligibilityUpdate: async () => false,
       },
@@ -421,6 +425,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue,
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         waitForPendingEligibilityUpdate: async () => false,
       },
@@ -473,6 +478,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue,
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         waitForPendingEligibilityUpdate: async () => false,
       },
@@ -506,6 +512,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue,
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         waitForPendingEligibilityUpdate: async () => false,
       },
@@ -551,6 +558,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue,
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         shouldAttemptPendingMaterialization: () => !hasBlockingCanonicalDelivery,
         reconcilePendingQueueState,
@@ -586,6 +594,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue,
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         shouldAttemptPendingMaterialization: () => true,
         reconcilePendingQueueState: async () => {
@@ -791,6 +800,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         waitForMetadataUpdate,
         waitForPendingEligibilityUpdate,
@@ -828,6 +838,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue,
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         shouldAttemptPendingMaterialization: () => false,
         waitForPendingEligibilityUpdate: () => new Promise<boolean>(() => {}),
@@ -870,6 +881,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue,
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely: vi.fn(async () => ({ type: 'no_pending' as const })),
         shouldAttemptPendingMaterialization: () => false,
         waitForPendingEligibilityUpdate: () => new Promise<boolean>(() => {}),
@@ -904,6 +916,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         shouldAttemptPendingMaterialization: () => false,
         reconcilePendingQueueState,
@@ -934,6 +947,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         waitForPendingEligibilityUpdate: async () => false,
       },
@@ -970,6 +984,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         blockPendingMessageDelivery,
         waitForPendingEligibilityUpdate: async () => await metadataWake.promise,
@@ -997,6 +1012,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely: vi.fn(async () => {
           throw materializeError;
         }),
@@ -1030,6 +1046,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         waitForPendingEligibilityUpdate: async () => false,
       },
@@ -1068,6 +1085,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
       const consumer = createSessionProviderInputConsumer({
         messageQueue,
         session: {
+          waitForProviderInputAdmission: async (signal) => !signal.aborted,
           materializeNextPendingMessageSafely: vi.fn(async () => ({ type: 'no_pending' as const })),
           waitForPendingEligibilityUpdate: vi.fn(async () => false),
         },
@@ -1099,6 +1117,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
       const consumer = createSessionProviderInputConsumer({
         messageQueue,
         session: {
+          waitForProviderInputAdmission: async (signal) => !signal.aborted,
           materializeNextPendingMessageSafely: vi.fn(async () => ({ type: 'no_pending' as const })),
           waitForPendingEligibilityUpdate: vi
             .fn<() => Promise<boolean>>()
@@ -1132,6 +1151,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely: vi.fn(async () => ({ type: 'no_pending' as const })),
         waitForPendingEligibilityUpdate: vi.fn(async () => false),
       },
@@ -1154,6 +1174,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue,
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely: vi.fn(async () => ({ type: 'no_pending' as const })),
         waitForPendingEligibilityUpdate: vi.fn(async () => false),
       },
@@ -1231,6 +1252,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue,
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         waitForPendingEligibilityUpdate: () => eligibilityWake.promise,
       },
@@ -1262,6 +1284,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
       const consumer = createSessionProviderInputConsumer({
         messageQueue,
         session: {
+          waitForProviderInputAdmission: async (signal) => !signal.aborted,
           materializeNextPendingMessageSafely,
           reconcilePendingQueueState,
           waitForPendingEligibilityUpdate: () => new Promise<boolean>(() => {}),
@@ -1300,6 +1323,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
       const consumer = createSessionProviderInputConsumer({
         messageQueue,
         session: {
+          waitForProviderInputAdmission: async (signal) => !signal.aborted,
           materializeNextPendingMessageSafely,
           waitForPendingEligibilityUpdate: () => new Promise<boolean>(() => {}),
         },
@@ -1330,6 +1354,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
       const consumer = createSessionProviderInputConsumer({
         messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
         session: {
+          waitForProviderInputAdmission: async (signal) => !signal.aborted,
           materializeNextPendingMessageSafely,
           waitForPendingEligibilityUpdate: () => new Promise<boolean>(() => {}),
         },
@@ -1369,6 +1394,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         waitForPendingEligibilityUpdate: () => eligibilityWake.promise,
       },
@@ -1425,6 +1451,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue,
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         readRuntimeActivitySnapshotTail,
         waitForRuntimeActivitySnapshotTailChange,
@@ -1480,6 +1507,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
       const consumer = createSessionProviderInputConsumer({
         messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
         session: {
+          waitForProviderInputAdmission: async (signal) => !signal.aborted,
           materializeNextPendingMessageSafely,
           waitForPendingEligibilityUpdate: () => new Promise<boolean>(() => {}),
         },
@@ -1504,6 +1532,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         waitForPendingEligibilityUpdate: () => new Promise<boolean>(() => {}),
       },
@@ -1521,6 +1550,7 @@ describe('SessionProviderInputConsumer waitForNextInput', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
       session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         materializeNextPendingMessageSafely,
         waitForPendingEligibilityUpdate: () => new Promise<boolean>(() => {}),
       },

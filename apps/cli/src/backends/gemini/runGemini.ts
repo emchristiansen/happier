@@ -792,6 +792,7 @@ export async function runGemini(opts: {
 	    const inputConsumer = createSessionProviderInputConsumer<GeminiMode, string>({
 	      messageQueue,
 	      session: {
+	        waitForProviderInputAdmission: (signal) => session.waitForProviderInputAdmission(signal),
 	        materializeNextPendingMessageSafely: (materializeOpts) =>
 	          session.materializeNextPendingMessageSafely(materializeOpts),
 	        shouldAttemptPendingMaterialization: () => session.shouldAttemptPendingMaterialization?.() ?? true,

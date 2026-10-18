@@ -201,6 +201,7 @@ describe('active-turn pending wake recovery', () => {
     const consumer = createSessionProviderInputConsumer({
       messageQueue: new MessageQueue2<{ id: string }>(() => 'mode'),
       session: {
+        waitForProviderInputAdmission: (signal) => client.waitForProviderInputAdmission(signal),
         waitForPendingEligibilityUpdate: (signal) => client.waitForPendingEligibilityUpdate(signal),
         materializeNextPendingMessageSafely: (options) => client.materializeNextPendingMessageSafely(options),
       },
