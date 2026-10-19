@@ -25,18 +25,34 @@ const boundary = vi.hoisted(() => {
     vi.stubEnv(key, "https://relay.example.invalid");
   }
   vi.stubEnv("HAPPIER_HOME_DIR", `${process.env.TMPDIR}/pending-discovery-fixture`);
-  return { get: vi.fn() };
+  return { get: vi.fn(), beforeJournalRead: null as (() => Promise<void>) | null };
 });
 const origin = "https://relay.example.invalid";
 const home = join(tmpdir(), "pending-discovery-fixture");
 let sessionSocket: ApiSessionSocketStub;
 let userSocket: ApiSessionSocketStub;
 
-// Only HTTP, sockets, credential filesystem access, clock and randomness are replaced.
+// Only HTTP, sockets, filesystem access, clock and randomness are replaced.
 // Snapshot parsing, session custody, reconciliation, queue and input consumer stay real.
 vi.mock("axios", async () => {
   const { createOfflineAxios } = await import("@/testkit/http/offlineAxios");
   return { default: createOfflineAxios((url) => boundary.get(url)) };
+});
+// The journal read is a filesystem boundary; all outbox/readiness logic stays real.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    readFile: async (...args: Parameters<typeof actual.readFile>) => {
+      if (
+        boundary.beforeJournalRead
+        && String(args[0]).endsWith("session-discovery-session.dead-letter.json")
+      ) {
+        await boundary.beforeJournalRead();
+      }
+      return actual.readFile(...args);
+    },
+  };
 });
 vi.mock("socket.io-client", () => ({
   io: (url: string, options: { auth: { clientType: string } }) => {
@@ -472,15 +488,46 @@ describe("authoritative pending discovery through the session client and consume
   });
 
   it("defers reads while actual connection readiness is unsettled and resumes one timer after convergence", async () => {
-    await createClient();
+    const { client } = await createClient();
+    const state = client as unknown as {
+      sessionConnectionEpoch: number;
+      sessionSyncPendingInputServerContract: { sessionConnectionEpoch: number } | null;
+      pendingInputReadinessAbortController: AbortController | null;
+      pendingDiscoveryTimer: unknown;
+    };
     const response = createDeferred<Response>();
     readFeatures = () => response.promise;
     sessionSocket.trigger("connect");
     await vi.advanceTimersByTimeAsync(2 * 60 * 60_000);
     expect(detailReads).not.toHaveBeenCalled();
     expect(claims).not.toHaveBeenCalled();
-    response.resolve(new Response(JSON.stringify(features), { status: 200 }));
-    await vi.advanceTimersByTimeAsync(0);
+    const journalReadStarted = createDeferred<void>();
+    const releaseJournalRead = createDeferred<void>();
+    boundary.beforeJournalRead = async () => {
+      journalReadStarted.resolve();
+      await releaseJournalRead.promise;
+    };
+    try {
+      response.resolve(new Response(JSON.stringify(features), { status: 200 }));
+      await journalReadStarted.promise;
+      // Features are resolved, but outbox convergence still owns this filesystem read.
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(detailReads).not.toHaveBeenCalled();
+      expect(claims).not.toHaveBeenCalled();
+    } finally {
+      boundary.beforeJournalRead = null;
+      releaseJournalRead.resolve();
+    }
+    // Observe real filesystem convergence without moving the discovery clock.
+    await vi.waitFor(
+      () => {
+        expect(state.sessionSyncPendingInputServerContract?.sessionConnectionEpoch)
+          .toBe(state.sessionConnectionEpoch);
+        expect(state.pendingInputReadinessAbortController).toBeNull();
+        expect(state.pendingDiscoveryTimer).not.toBeNull();
+      },
+      { timeout: 5_000, interval: 0 },
+    );
     await vi.advanceTimersByTimeAsync(299_999);
     expect(detailReads).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
