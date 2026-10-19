@@ -89,6 +89,7 @@ async function runTwoPromptsWithFirstTurnAborted(params: Readonly<{
 
   let shouldExit = false;
   const session = {
+    waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted,
     getMetadataSnapshot: () => metadata,
     updateMetadata: (updater: (current: typeof metadata) => typeof metadata) => {
       metadata = updater(metadata);

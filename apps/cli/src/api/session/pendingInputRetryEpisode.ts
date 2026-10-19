@@ -20,7 +20,7 @@ export class PendingInputRetryEpisode {
   private current: PendingInputRetryState = { status: 'idle' };
   private serverNotBeforeMs = 0;
 
-  constructor(private readonly operation: 'materialization' | 'account_settings') {}
+  constructor(private readonly operation: 'materialization' | 'account_settings' | 'archive_admission') {}
 
   get state(): PendingInputRetryState { return this.current; }
 

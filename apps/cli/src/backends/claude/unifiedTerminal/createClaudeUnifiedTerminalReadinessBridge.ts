@@ -77,7 +77,8 @@ function isInputStateReady(
 export type ClaudeUnifiedStartupDialogResolution =
   | Readonly<{ status: 'unhandled' }>
   | Readonly<{ status: 'handled' }>
-  | Readonly<{ status: 'waiting_for_user' }>;
+  | Readonly<{ status: 'waiting_for_user' }>
+  | Readonly<{ status: 'waiting_for_input_admission' }>;
 
 export type ClaudeUnifiedStartupDialogResolver = (input: Readonly<{
   screenState: ClaudeScreenState;
@@ -116,8 +117,8 @@ export function createClaudeUnifiedTerminalReadinessBridge(opts: Readonly<{
   canReportStartupReady?: (() => boolean) | undefined;
   /**
    * Known startup dialogs are blocking, but some can be resolved before the normal composer appears.
-   * The resolver may auto-handle the dialog or publish a user action. While the exact dialog and
-   * runtime stay live, the user wait pauses the readiness deadline; normal timeout accounting resumes
+   * The resolver may auto-handle the dialog, wait for input admission or publish a user action.
+   * While the exact dialog and runtime stay live, either wait pauses the readiness deadline; normal timeout accounting resumes
    * as soon as that dialog disappears, changes, or the host stops being live.
    */
   resolveStartupDialog?: ClaudeUnifiedStartupDialogResolver | undefined;
@@ -170,10 +171,10 @@ export function createClaudeUnifiedTerminalReadinessBridge(opts: Readonly<{
       const activePauseDuration = readinessPausedAtMs === null ? 0 : Math.max(0, current - readinessPausedAtMs);
       return current - readinessPausedDurationMs - activePauseDuration;
     };
-    const beginHumanDialogWait = (): void => {
+    const beginDialogWait = (): void => {
       readinessPausedAtMs ??= nowMs();
     };
-    const endHumanDialogWait = (): void => {
+    const endDialogWait = (): void => {
       if (readinessPausedAtMs === null) return;
       readinessPausedDurationMs += Math.max(0, nowMs() - readinessPausedAtMs);
       readinessPausedAtMs = null;
@@ -277,7 +278,7 @@ export function createClaudeUnifiedTerminalReadinessBridge(opts: Readonly<{
       try {
         liveness = await awaitReadinessOperation(opts.hostAdapter.evaluateLiveness(opts.handle));
       } catch (error: unknown) {
-        endHumanDialogWait();
+        endDialogWait();
         if (isClaudeUnifiedTerminalReadinessTimeoutError(error)) throw error;
         if (!(await continueAfterDelay())) return;
         continue;
@@ -286,7 +287,7 @@ export function createClaudeUnifiedTerminalReadinessBridge(opts: Readonly<{
       if (disposed || abortSignal.aborted) return;
       lastLivenessPaneAlive = liveness.paneAlive;
       if (!liveness.paneAlive) {
-        endHumanDialogWait();
+        endDialogWait();
         if (!(await continueAfterDelay())) return;
         continue;
       }
@@ -296,7 +297,7 @@ export function createClaudeUnifiedTerminalReadinessBridge(opts: Readonly<{
         try {
           inputState = await awaitReadinessOperation(opts.hostAdapter.captureInputState(opts.handle));
         } catch (error: unknown) {
-          endHumanDialogWait();
+          endDialogWait();
           if (isClaudeUnifiedTerminalReadinessTimeoutError(error)) throw error;
           if (!(await continueAfterDelay())) return;
           continue;
@@ -318,18 +319,18 @@ export function createClaudeUnifiedTerminalReadinessBridge(opts: Readonly<{
           }));
           if (resolution === stopped) return;
           if (disposed || abortSignal.aborted) return;
-          if (resolution.status === 'waiting_for_user') {
-            beginHumanDialogWait();
+          if (resolution.status === 'waiting_for_user' || resolution.status === 'waiting_for_input_admission') {
+            beginDialogWait();
             if (!(await continueAfterDelay())) return;
             continue;
           }
-          endHumanDialogWait();
+          endDialogWait();
           if (resolution.status === 'handled') {
             if (!(await continueAfterDelay())) return;
             continue;
           }
         } else {
-          endHumanDialogWait();
+          endDialogWait();
         }
         if (isInputStateReady(inputState, screenState)) {
           if (canReportStartupReady()) {

@@ -7,6 +7,7 @@ import { decodeBase64, decrypt, encodeBase64, encrypt } from '../encryption';
 import { backoff, delayUnrefAbortable } from '@/utils/time';
 import { classifyServerEndpointError } from '@/api/client/classifyServerEndpointError';
 import { PendingInputRetryEpisode } from './pendingInputRetryEpisode';
+import { SessionArchiveInputAdmission, type RequestArchivedSessionCleanup } from './sessionArchiveInputAdmission';
 import { LruSet } from '@/utils/collections/lru';
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers';
 import { createSerializedWorkQueueDiagnostics, type SerializedWorkDiagnosticContext } from '@/utils/serializedWorkQueueDiagnostics';
@@ -739,6 +740,8 @@ export class ApiSessionClient extends EventEmitter {
     private userSocketDisconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private closed = false;
     private readonly metadataWaitAbortController = new AbortController();
+    private readonly archiveInputAdmission: SessionArchiveInputAdmission | null;
+    private readonly archiveAdmissionTermination = new AbortController();
     private runtimeTerminationStarted = false;
     private snapshotSyncInFlight: Promise<SessionSnapshotReadResult> | null = null;
     private readonly toolCallCanonicalNameByProviderAndId = new Map<string, { rawToolName: string; canonicalToolName: string }>();
@@ -1004,10 +1007,21 @@ export class ApiSessionClient extends EventEmitter {
             token: string,
             session: Session,
             runtimeActivity?: SessionRuntimeActivityClientConfig,
+            requestArchivedStop?: RequestArchivedSessionCleanup,
         ) {
 	        super()
 	        this.token = token;
 	        this.sessionId = session.id;
+            this.archiveInputAdmission = requestArchivedStop ? new SessionArchiveInputAdmission({
+                token,
+                sessionId: session.id,
+                lifetime: AbortSignal.any([
+                    this.metadataWaitAbortController.signal, this.archiveAdmissionTermination.signal,
+                ]),
+                connectionEpoch: () => this.sessionConnectionEpoch,
+                waitForFreshEvent: (signal) => this.waitForPendingEligibilityUpdate(signal),
+                requestArchivedStop,
+            }) : null;
 	        this.metadata = session.metadata;
 	        this.metadataVersion = session.metadataVersion;
             this.sessionSocketMachineId = resolveSessionSocketMachineIdForBootstrap(session.metadata);
@@ -3838,6 +3852,15 @@ export class ApiSessionClient extends EventEmitter {
         this.emit('pending-eligibility-updated');
     }
 
+    waitForProviderInputAdmission(abortSignal: AbortSignal): Promise<boolean> {
+        if (!this.archiveInputAdmission) {
+            // Create/load (including its offline placeholder) retains its existing semantics.
+            // Existing-ID startup installs the fresh-read owner at the exact attach factory call.
+            return Promise.resolve(!this.closed && !this.runtimeTerminationStarted && !abortSignal.aborted);
+        }
+        return this.archiveInputAdmission.wait(abortSignal);
+    }
+
     waitForPendingEligibilityUpdate(abortSignal?: AbortSignal): Promise<boolean> {
         if (this.closed || abortSignal?.aborted) return Promise.resolve(false);
         const startPendingWakeSeq = this.pendingWakeSeq;
@@ -6304,6 +6327,9 @@ export class ApiSessionClient extends EventEmitter {
 
     async close() {
         logger.debug('[API] socket.close() called');
+        // Pending control RPCs can be waiting here; release archive admission before
+        // draining RPC executions so closing cannot wait on its own lifetime abort.
+        this.archiveAdmissionTermination.abort();
         this.clearPendingDiscoveryTimer();
         this.accountSettingsRetryAbortController?.abort();
         this.executionRunPermissionHandler?.reset();
@@ -6383,6 +6409,7 @@ export class ApiSessionClient extends EventEmitter {
     beginRuntimeTermination(): void {
         if (this.runtimeTerminationStarted) return;
         this.runtimeTerminationStarted = true;
+        this.archiveAdmissionTermination.abort();
         this.clearPendingDiscoveryTimer();
         this.providerInputOutcomeProducerGeneration += 1;
         this.acceptedCanonicalPendingDeliveryOperationAbortController.abort();

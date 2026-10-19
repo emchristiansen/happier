@@ -18,6 +18,7 @@ function createSession(): Session {
   return {
     path: '/workspace/project',
     client: {
+      waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted,
       sessionId: 'happy-session-id',
       sendSessionEvent: vi.fn(),
       getMetadataSnapshot: vi.fn(() => ({})),

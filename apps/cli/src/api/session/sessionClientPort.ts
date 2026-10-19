@@ -189,6 +189,7 @@ export interface SessionClientPort {
     startSeqExclusive?: number | null;
   }): TurnAssistantTextSnapshot | null;
   waitForMetadataUpdate(abortSignal?: AbortSignal): Promise<boolean>;
+  waitForProviderInputAdmission(abortSignal: AbortSignal): Promise<boolean>;
   waitForPendingEligibilityUpdate(abortSignal?: AbortSignal): Promise<boolean>;
   shouldAttemptPendingMaterialization?(opts?: {
     activeTurnSteerability?: PendingForegroundSteerability;

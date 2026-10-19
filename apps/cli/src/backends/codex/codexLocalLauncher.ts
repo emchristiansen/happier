@@ -391,6 +391,9 @@ export async function codexLocalLauncher<TMode>(opts: {
     const interactive = Boolean(process.stdout.isTTY && process.stdin.isTTY);
     let bufferedStderr = '';
     const maxBufferedStderrChars = 16_000;
+    if (!await opts.session.waitForProviderInputAdmission(new AbortController().signal)) {
+      return { type: 'exit', code: 1 };
+    }
     child = spawn(invocation.command, invocation.args, {
       cwd: opts.path,
       env: buildCodexTuiChildEnv(),

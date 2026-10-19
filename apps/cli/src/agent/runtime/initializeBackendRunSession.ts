@@ -1,3 +1,4 @@
+import type { RequestArchivedSessionCleanup } from '@/api/session/sessionArchiveInputAdmission'
 import type { ApiClient } from '@/api/api'
 import type {
   ApiSessionClient,
@@ -41,6 +42,7 @@ export interface InitializeBackendRunSessionOptions {
   metadata: Metadata
   state: AgentState
   existingSessionId?: string
+  requestArchivedSessionCleanup?: RequestArchivedSessionCleanup
   uiLogPrefix: string
   startupMetadataOverrides: {
     permissionModeOverride: PermissionModeOverride
@@ -294,6 +296,8 @@ export async function initializeBackendRunSession(
     const session = opts.api.sessionSyncClient(
       baseSession,
       preparedRuntimeActivity.clientConfig(),
+      { existingSessionId, ...(opts.requestArchivedSessionCleanup
+        ? { requestArchivedSessionCleanup: opts.requestArchivedSessionCleanup } : {}) },
     )
     await preparedRuntimeActivity.attachSession(session)
     opts.configureSessionClient?.(session)

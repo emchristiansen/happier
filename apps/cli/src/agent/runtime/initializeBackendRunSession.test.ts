@@ -187,7 +187,8 @@ describe('initializeBackendRunSession', () => {
     })
     const api = {
       getOrCreateSession: async () => null,
-      sessionSyncClient: (_baseSession: Session, receivedRuntimeActivity?: unknown) => {
+      sessionSyncClient: (_baseSession: Session, receivedRuntimeActivity?: unknown, receivedArchiveAdmission?: unknown) => {
+        expect(receivedArchiveAdmission).toEqual({ existingSessionId: ' session-123 ' })
         expect(receivedRuntimeActivity).toMatchObject({ executionRunContributionHandle: expect.any(Object) })
         return session
       },

@@ -33,6 +33,7 @@ type ApiSessionClientStubContract = Pick<
     | 'ensureMetadataSnapshot'
     | 'refreshSessionSnapshotFromServerBestEffort'
     | 'waitForMetadataUpdate'
+    | 'waitForProviderInputAdmission'
     | 'waitForPendingEligibilityUpdate'
     | 'shouldAttemptPendingMaterialization'
     | 'reconcilePendingQueueState'
@@ -94,6 +95,8 @@ class OfflineSessionStub extends EventEmitter implements ApiSessionClientStubCon
     async ensureMetadataSnapshot(): Promise<Metadata | null> { return null; }
     async refreshSessionSnapshotFromServerBestEffort(): Promise<void> {}
     async waitForMetadataUpdate(): Promise<boolean> { return false; }
+    // Only create/load startup uses this stub; existing-ID resume never grants permission here.
+    async waitForProviderInputAdmission(signal: AbortSignal): Promise<boolean> { return !signal.aborted; }
     async waitForPendingEligibilityUpdate(): Promise<boolean> { return false; }
     shouldAttemptPendingMaterialization(): boolean { return false; }
     async reconcilePendingQueueState(): Promise<boolean> { return false; }

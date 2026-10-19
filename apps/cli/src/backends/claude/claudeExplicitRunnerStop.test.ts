@@ -51,6 +51,20 @@ describe('requestClaudeExplicitRunnerStop', () => {
     expect(requestTermination).not.toHaveBeenCalled();
   });
 
+  it('uses the supplied local exit event after exact host disposal for an archived runner', async () => {
+    const requestTermination = vi.fn();
+    const destroyOwnedHostForExplicitStop = vi.fn(async () => {});
+    await requestClaudeExplicitRunnerStop({
+      unifiedTerminalEnabled: true,
+      destroyOwnedHostForExplicitStop,
+      requestTermination,
+      whenTerminated: Promise.resolve(),
+      terminationEvent: { kind: 'exit', code: 0 },
+    });
+    expect(destroyOwnedHostForExplicitStop).toHaveBeenCalledOnce();
+    expect(requestTermination).toHaveBeenCalledWith({ kind: 'exit', code: 0 });
+  });
+
   it('preserves the existing direct termination path for non-Unified Claude sessions', async () => {
     const requestTermination = vi.fn();
 

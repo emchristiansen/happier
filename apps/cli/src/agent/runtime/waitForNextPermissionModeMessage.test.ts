@@ -42,7 +42,7 @@ function createQueue(): MessageQueue2<QueueMode> {
 }
 
 function asSessionClient(session: PermissionModeSessionFixture): ApiSessionClient {
-  return session as unknown as ApiSessionClient;
+  return { waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted, ...session } as unknown as ApiSessionClient;
 }
 
 describe('waitForNextPermissionModeMessage', () => {

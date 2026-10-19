@@ -35,6 +35,7 @@ export function createClaudePendingAwareInputConsumer(
     const consumer = createSessionProviderInputConsumer<EnhancedMode, string>({
         messageQueue: session.queue,
         session: {
+            waitForProviderInputAdmission: (signal) => session.client.waitForProviderInputAdmission(signal),
             materializeNextPendingMessageSafely: async (materializeOpts) => {
                 // Committed transcript messages queued locally must be processed before
                 // materializing additional server pending rows. This is ordering backpressure,

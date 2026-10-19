@@ -42,6 +42,7 @@ const defaultDeps: CreateClaudeStartupSpecDeps = {
 };
 
 export function createClaudeStartupSpec(params: {
+  existingSessionId?: string;
   configureSessionClient?: (session: DeferredApiSessionClient) => void;
   deps?: Partial<CreateClaudeStartupSpecDeps>;
 }): BackendStartupSpec<ClaudeStartupArtifacts> {
@@ -63,6 +64,7 @@ export function createClaudeStartupSpec(params: {
       const placeholderSessionId = `PID-${process.pid}`;
       const deferredSession = new DeferredApiSessionClient({
         placeholderSessionId,
+        existingSessionId: params.existingSessionId,
         limits: {
           maxEntries: configuration.startupDeferredSessionBufferMaxEntries,
           maxBytes: configuration.startupDeferredSessionBufferMaxBytes,

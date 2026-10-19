@@ -40,6 +40,7 @@ function createSessionClientStub(overrides?: Partial<SessionClientPort>): Sessio
     keepAlive: vi.fn(),
     getMetadataSnapshot: () => null,
     waitForMetadataUpdate: vi.fn(async () => false),
+    waitForProviderInputAdmission: async (signal) => !signal.aborted,
     waitForPendingEligibilityUpdate: vi.fn(async () => false),
     popPendingMessage: vi.fn(async () => false),
     peekPendingMessageQueueV2Count: vi.fn(async () => 0),
