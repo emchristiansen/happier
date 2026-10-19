@@ -71,6 +71,7 @@ function claimed() {
       id: 'claimed-row', seq: null, localId: originalPrompt.localId, messageRole: 'user',
       content: { t: 'plain', v: originalPrompt },
       deliveryState: { mode: 'provider', unresolved: true },
+      requestedAction: { v: 1, kind: 'enqueue' },
       providerAction: 'send',
       createdAt: 1_000, updatedAt: 1_000,
     },
@@ -78,9 +79,10 @@ function claimed() {
 }
 
 function committed(didResolve = true) {
+  const { deliveryState: _claimState, ...message } = claimed().message;
   return {
     ok: true, didResolve, pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 3,
-    message: { ...claimed().message, id: 'committed-row', seq: 7 },
+    message: { ...message, id: 'committed-row', seq: 7 },
   };
 }
 
@@ -92,7 +94,7 @@ function bind(client: import('./sessionClient').ApiSessionClient) {
 
 async function createClient(pendingCount = 0) {
   sessionSocket = createApiSessionSocketStub({
-    id: 'discovery-session-socket', connected: true,
+    id: 'discovery-session-socket', connected: false,
     emitWithAck: async (event, payload) => {
       if (event === 'pending-materialize-next') { claims(payload); return materialize(); }
       if (event === 'pending-delivery-accepted-v1') { settlements(payload); return settle(payload); }
@@ -104,9 +106,29 @@ async function createClient(pendingCount = 0) {
   const fixture = createPlainSessionFixture({ id: snapshot.id, pendingCount, pendingBlockedCount: 0, pendingVersion: 0 });
   const client = new ApiSessionClient('synthetic-token', {
     ...fixture,
-    metadata: { ...fixture.metadata, flavor: 'codex', path: home, homeDir: home, happyHomeDir: home },
+    metadata: { ...fixture.metadata, flavor: 'codex', machineId: 'discovery-machine', path: home, homeDir: home, happyHomeDir: home },
   });
   clients.push(client);
+  await client.getRuntimeActivitySnapshotPublisher().publish({ state: 'idle', activeCount: 0 });
+  await vi.waitFor(() => {
+    const tail = client.readRuntimeActivitySnapshotTail();
+    expect(tail.custody).toBeNull();
+    expect(tail.settlement).not.toBeNull();
+  }, { timeout: 5_000 });
+  const settingsWait = new AbortController();
+  const settingsReady = client.waitForPendingEligibilityUpdate(settingsWait.signal);
+  await vi.waitFor(() => {
+    const state = client as unknown as {
+      accountSettingsRequestInFlight: Promise<unknown> | null;
+      userSocketSettingsConvergedEpoch: number;
+      userSocketSettingsConnectionEpoch: number;
+    };
+    expect(userSocket.connected).toBe(true);
+    expect(state.accountSettingsRequestInFlight).toBeNull();
+    expect(state.userSocketSettingsConvergedEpoch).toBe(state.userSocketSettingsConnectionEpoch);
+  }, { timeout: 5_000 });
+  settingsWait.abort();
+  await settingsReady;
   const observe = bind(client);
   await vi.advanceTimersByTimeAsync(0);
   detailReads.mockClear();
@@ -154,6 +176,7 @@ describe('authoritative pending discovery through the session client and consume
       const path = new URL(url).pathname;
       if (path === `/v2/sessions/${snapshot.id}`) { detailReads(Date.now()); return readSnapshot(); }
       if (path === '/v1/account/profile') return { status: 200, data: { id: 'discovery-account' } };
+      if (path === '/v1/access-keys/discovery-session/discovery-machine') return { status: 200, data: { accessKey: 'synthetic-machine-binding' } };
       if (path === '/v2/account/settings') return { status: 200, data: { version: 1, content: { t: 'plain', v: { schemaVersion: 6 } } } };
       if (path === '/health') return { status: 200, data: {} };
       if (path === '/v1/features') return { status: 200, data: features };
@@ -180,7 +203,9 @@ describe('authoritative pending discovery through the session client and consume
     await vi.advanceTimersByTimeAsync(299_999);
     expect(claims).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
-    expect(batch?.message).toEqual(originalPrompt);
+    expect(detailReads.mock.calls).toEqual([[Date.now()]]);
+    expect(claims).toHaveBeenCalledTimes(1);
+    expect(batch?.message).toEqual({ ...originalPrompt, createdAt: 1_000 });
     expect(batch?.userMessageLocalIds).toEqual([originalPrompt.localId]);
     expect(claims).toHaveBeenCalledTimes(1);
     let providerEntries = 0;
@@ -241,7 +266,7 @@ describe('authoritative pending discovery through the session client and consume
     await vi.advanceTimersByTimeAsync(300_000);
     expect(claims).toHaveBeenCalledTimes(1);
     const batch = await waiting;
-    expect(batch?.message).toEqual(originalPrompt);
+    expect(batch?.message).toEqual({ ...originalPrompt, createdAt: 1_000 });
     const readsAtReservation = detailReads.mock.calls.length;
     await vi.advanceTimersByTimeAsync(1_800_000);
     await expect(consumer.drainPending({ abortSignal: controller.signal })).resolves.toMatchObject({ materialized: 0 });
@@ -253,7 +278,9 @@ describe('authoritative pending discovery through the session client and consume
       providerEntries += 1;
       observe({ kind: 'accepted', localId: originalPrompt.localId });
     } });
-    await vi.advanceTimersByTimeAsync(1_800_000);
+    // Stay inside the existing socket ACK deadline: the unsettled acceptance still owns
+    // its operation. Its own timeout/retry policy is distinct from this discovery timer.
+    await vi.advanceTimersByTimeAsync(1_000);
     expect(client.hasPendingProviderInputAcceptance(originalPrompt.localId)).toBe(true);
     expect(client.hasCanonicalPendingProviderInputDelivery(originalPrompt.localId)).toBe(true);
     expect(detailReads).toHaveBeenCalledTimes(readsAtReservation);
