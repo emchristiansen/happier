@@ -6,7 +6,7 @@ import { existsSync } from 'node:fs';
 import { logger } from '@/ui/logger';
 import { resolveHasTTY } from '@/ui/tty/resolveHasTTY';
 import { Credentials } from '@/persistence';
-import type { Metadata } from '@/api/types';
+import type { Metadata, UserMessage } from '@/api/types';
 import { initialMachineMetadata } from '@/daemon/machine/metadata';
 import {
     refreshDaemonOpenAiCodexChatGptAuthTokensForBridge,
@@ -55,7 +55,7 @@ import {
 } from '@/agent/runtime/sessionInput/pendingQueueDrainPolicy';
 import { connectionState } from '@/api/offline/serverConnectionErrors';
 import type { ApiSessionClient, SessionProviderInputRejectedBeforeEffectReason } from '@/api/session/sessionClient';
-import type { PendingInputSteerNowAdmission } from '@/api/session/sessionClientPort';
+import type { BoundCodexSteerDelivery, PendingInputSteerNowAdmission, SessionUserMessageDeliveryInfo } from '@/api/session/sessionClientPort';
 import type { SessionRuntimeControls } from '@/rpc/handlers/sessionControls';
 import { createCurrentSessionTranscriptPort } from '@/api/session/createCurrentSessionTranscriptPort';
 import {
@@ -82,7 +82,7 @@ import { pushMessageToQueueWithSpecialCommands } from '@/agent/runtime/queueSpec
 import { normalizePermissionModeToIntent, resolvePermissionModeUpdatedAtFromMessage } from '@/agent/runtime/permission/permissionModeCanonical';
 import { publishCodexSessionIdMetadata } from './utils/codexSessionIdMetadata';
 import { createCodexAcpRuntime } from './acp/runtime';
-import { createCodexAppServerRuntime } from './appServer/runtime';
+import { createCodexAppServerRuntime, CodexBoundSteerUnavailableError, type CodexBoundSteerContext } from './appServer/runtime';
 import { isCodexAppServerTerminalOwnedGroupRecoveryClassification } from './appServer/recovery/terminalGroupRecovery';
 import {
     createCodexAcpProviderInputOutcomeBridge,
@@ -248,25 +248,30 @@ function attachRuntimeAuthClassificationToError(
     return Object.assign(nextError, { runtimeAuthClassification: classification });
 }
 
-type CodexPendingExactSteerTurnBinding = Readonly<{ turnId: string }>;
+type CodexPendingExactSteerTurnBinding = Readonly<{
+    bindingId: string;
+    turnId: string;
+    runtime: Pick<ReturnType<typeof createCodexAppServerRuntime>, 'getActiveSteerableTurnId'>;
+}>;
 
 export function createCodexPendingInputSteerControl(opts: Readonly<{
     session: Pick<ApiSessionClient, 'sessionId' | 'requestPendingInputSteerNow' | 'waitForProviderInputTerminalOutcome'>;
     runtime: Pick<ReturnType<typeof createCodexAppServerRuntime>, 'getActiveSteerableTurnId'>;
     inputConsumer: Pick<SessionProviderInputConsumer<unknown, unknown>, 'drainPending'>;
     turnBindings: Map<string, CodexPendingExactSteerTurnBinding>;
+    isAdmissionOpen: () => boolean;
 }>): NonNullable<SessionRuntimeControls['interruptPendingInputAndRun']> {
     return async (request) => {
         const session = opts.session;
         const identity = { sessionId: request.sessionId, localId: request.localId };
-        if (request.sessionId !== session.sessionId) {
+        if (request.sessionId !== session.sessionId || !opts.isAdmissionOpen()) {
             return { ok: false, status: 'stale_state', ...identity };
         }
         const expectedTurnId = await opts.runtime.getActiveSteerableTurnId();
-        if (!expectedTurnId || opts.turnBindings.has(request.localId)) {
+        if (!expectedTurnId || !opts.isAdmissionOpen() || opts.turnBindings.has(request.localId)) {
             return { ok: false, status: 'not_safe', ...identity };
         }
-        const binding: CodexPendingExactSteerTurnBinding = { turnId: expectedTurnId };
+        const binding: CodexPendingExactSteerTurnBinding = Object.freeze({ bindingId: randomUUID(), turnId: expectedTurnId, runtime: opts.runtime });
         opts.turnBindings.set(request.localId, binding);
         // The PATCH can publish a Pending wake before its HTTP acknowledgement returns.
         // Observe that delivery before claim settlement is allowed to clear its local outcome.
@@ -283,7 +288,7 @@ export function createCodexPendingInputSteerControl(opts: Readonly<{
                 error: 'The exact pending input action may have been admitted; provider delivery has not been observed',
             };
         try {
-            admission = await session.requestPendingInputSteerNow(request.localId);
+            admission = await session.requestPendingInputSteerNow(request.localId, binding.bindingId);
             if (admission.kind === 'not_admitted') {
                 if (opts.turnBindings.get(request.localId) === binding) opts.turnBindings.delete(request.localId);
                 return {
@@ -329,6 +334,39 @@ export function createCodexPendingInputSteerControl(opts: Readonly<{
         } finally {
             outcomeController.abort();
         }
+    };
+}
+
+type CodexPendingBoundSteerAttempt = Readonly<{
+    binding: CodexPendingExactSteerTurnBinding;
+    context: CodexBoundSteerContext;
+}>;
+
+export function createCodexPendingInputBoundSteerHandler(opts: Readonly<{
+    turnBindings: Map<string, CodexPendingExactSteerTurnBinding>;
+    getRuntime: () => CodexPendingExactSteerTurnBinding['runtime'] | null;
+    isAdmissionOpen: () => boolean;
+    steer: (message: UserMessage, info: SessionUserMessageDeliveryInfo, attempt: CodexPendingBoundSteerAttempt) => Promise<void>;
+    refuse: (localId: string, seq: number | null) => Promise<void>;
+}>): (message: UserMessage, delivery: BoundCodexSteerDelivery) => Promise<void> {
+    return async (message, delivery) => {
+        const binding = opts.turnBindings.get(delivery.localId);
+        const isCurrentBinding = (): boolean => binding !== undefined
+            && binding.bindingId === delivery.requestedAction.bindingId
+            && message.localId === delivery.localId
+            && opts.turnBindings.get(delivery.localId) === binding
+            && opts.getRuntime() === binding.runtime
+            && opts.isAdmissionOpen() && delivery.isCurrentRegistration();
+        if (!binding || !isCurrentBinding()
+            || await binding.runtime.getActiveSteerableTurnId() !== binding.turnId
+            || !isCurrentBinding()) {
+            await opts.refuse(delivery.localId, delivery.seq);
+            return;
+        }
+        await opts.steer(message, { seq: delivery.seq, providerAcceptancePending: true, pendingProviderAction: 'steer' }, {
+            binding,
+            context: { expectedTurnId: binding.turnId, isCurrentBinding },
+        });
     };
 }
 
@@ -394,6 +432,7 @@ export async function runCodex(opts: {
         setSessionModel: (model: string) => Promise<void>;
         setSessionConfigOption: (key: string, value: string | number | boolean | null) => Promise<void>;
         steerPrompt: (prompt: string, options?: { metadata?: unknown; localId?: string | null; localIds?: readonly string[]; userMessageSeq?: number | null; expectedTurnId?: string; onProviderPromptAccepted?: () => void }) => Promise<void>;
+        steerPromptBound?: ReturnType<typeof createCodexAppServerRuntime>['steerPromptBound'];
         sendPrompt: (prompt: string, options?: { metadata?: unknown; localId?: string | null; localIds?: readonly string[]; userMessageSeq?: number | null; appliedModelId?: string | null }) => Promise<void>;
         sendPromptWithMeta?: (params: {
             text: string;
@@ -1130,7 +1169,7 @@ export async function runCodex(opts: {
         }
     };
 
-    session.onUserMessage(async (message, info) => {
+    const handleUserMessage = async (message: UserMessage, info?: SessionUserMessageDeliveryInfo, boundSteer?: CodexPendingBoundSteerAttempt): Promise<void> => {
         const userMessageSeq = info?.seq ?? null;
         // Resolve permission mode (accept all modes, will be mapped in switch statement)
         const activeTurnPermissionModeBeforeMessage = currentPermissionMode ?? initialPermissionMode;
@@ -1234,16 +1273,16 @@ export async function runCodex(opts: {
                     suppressUserEcho: true,
                     providerPromptAlreadyResolved: true,
                 };
-                const exactSteerLocalId = normalizeProviderPromptLocalIds([message.localId ?? null])[0];
-                const exactSteerBinding = exactSteerLocalId ? pendingExactSteerTurnIdByLocalId.get(exactSteerLocalId) : undefined;
+                const exactSteerLocalId = boundSteer ? message.localId ?? undefined : undefined;
+                const exactSteerBinding = boundSteer?.binding;
                 try {
                     const inputConsumer = providerInputConsumer;
                     if (!inputConsumer) {
                         return;
                     }
                     await liveSteerReplaySeedRetirement.drain();
+                    if (boundSteer && (!boundSteer.context.isCurrentBinding() || await boundSteer.binding.runtime.getActiveSteerableTurnId() !== boundSteer.binding.turnId || !boundSteer.context.isCurrentBinding())) throw new CodexBoundSteerUnavailableError('none');
                     const localIds = normalizeProviderPromptLocalIds([message.localId ?? null]);
-                    const expectedTurnId = exactSteerBinding?.turnId;
                     const dispatchResolution = await resolveCodexQueuedPromptForDispatch({
                         sessionClient: session,
                         text,
@@ -1254,6 +1293,7 @@ export async function runCodex(opts: {
                         catalogs: codexDispatchCatalogReaders(),
                     });
                     didReplaySeedBootstrap = dispatchResolution.didBootstrap;
+                    if (boundSteer && (!boundSteer.context.isCurrentBinding() || await boundSteer.binding.runtime.getActiveSteerableTurnId() !== boundSteer.binding.turnId || !boundSteer.context.isCurrentBinding())) throw new CodexBoundSteerUnavailableError('none');
                     providerPromptText = dispatchResolution.text;
                     providerPromptMetadata = dispatchResolution.metadata;
                     permissionHandlerApplyGenerationForSteer = didChangePermissionMode
@@ -1272,13 +1312,18 @@ export async function runCodex(opts: {
                         ? () => liveSteerReplaySeedRetirement.confirmProviderAccepted(localIds)
                         : null;
                     await dispatchProviderInputOrThrow(async () => {
-                        await runtime.steerPrompt(providerPromptText, {
+                        const steerOptions = {
                             ...providerPromptIdentityOption(localIds),
-                            ...(expectedTurnId ? { expectedTurnId } : {}),
                             metadata: providerPromptMetadata,
                             userMessageSeq,
                             ...(onProviderPromptAccepted ? { onProviderPromptAccepted } : {}),
-                        });
+                        };
+                        if (boundSteer) {
+                            if (!runtime.steerPromptBound || !boundSteer.context.isCurrentBinding()) throw new CodexBoundSteerUnavailableError('none');
+                            await runtime.steerPromptBound(providerPromptText, steerOptions, boundSteer.context);
+                        } else {
+                            await runtime.steerPrompt(providerPromptText, steerOptions);
+                        }
                     });
                     if (onProviderPromptAccepted) {
                         await liveSteerReplaySeedRetirement.drain();
@@ -1288,19 +1333,27 @@ export async function runCodex(opts: {
                     }
                 } catch (error) {
                     const localIds = normalizeProviderPromptLocalIds([message.localId ?? null]);
-                    if (exactSteerLocalId && pendingExactSteerTurnIdByLocalId.get(exactSteerLocalId) === exactSteerBinding) {
-                        pendingExactSteerTurnIdByLocalId.delete(exactSteerLocalId);
-                    }
                     if (didChangePermissionMode && permissionHandlerApplyGenerationForSteer !== null) {
                         restorePermissionModeForActiveCodexTurnIfUnchanged(permissionHandlerApplyGenerationForSteer, {
                             permissionMode: activeTurnPermissionModeBeforeMessage,
                             permissionModeUpdatedAt: activeTurnPermissionModeUpdatedAtBeforeMessage,
                         });
                     }
-                    const exactPendingTurnUnavailable = exactSteerBinding !== undefined
-                        && error instanceof Error
-                        && /(?:active turn is not steerable|active turn changed before exact pending steer|no active turn to steer|steerPrompt requires an active turn)/i.test(error.message);
-                    if (!isCodexAppServerNoActiveTurnToSteerError(error) && !exactPendingTurnUnavailable) {
+                    if (boundSteer) {
+                        const beforeEffect = error instanceof CodexBoundSteerUnavailableError && error.providerEffect === 'none';
+                        await blockProviderPromptDeliveryBeforeAcceptance({
+                            localIds,
+                            userMessageSeq,
+                            ...(beforeEffect
+                                ? { reason: 'steering_unavailable' as const, providerEffect: 'none' as const }
+                                : { reason: resolveProviderPromptFailureDeliveryReason(error, true) }),
+                        });
+                        if (beforeEffect && exactSteerLocalId && pendingExactSteerTurnIdByLocalId.get(exactSteerLocalId) === exactSteerBinding) {
+                            pendingExactSteerTurnIdByLocalId.delete(exactSteerLocalId);
+                        }
+                        return;
+                    }
+                    if (!isCodexAppServerNoActiveTurnToSteerError(error)) {
                         await blockProviderPromptDeliveryBeforeAcceptance({
                             localIds,
                             reason: resolveProviderPromptFailureDeliveryReason(error, true),
@@ -1335,13 +1388,13 @@ export async function runCodex(opts: {
             pendingProviderAction === 'steer'
         ) {
             const localIds = normalizeProviderPromptLocalIds([message.localId ?? null]);
-            if (localIds.length === 1) pendingExactSteerTurnIdByLocalId.delete(localIds[0]);
             await blockProviderPromptDeliveryBeforeAcceptance({
                 localIds,
                 reason: 'steering_unavailable',
                 userMessageSeq,
                 providerEffect: 'none',
             });
+            if (boundSteer && localIds.length === 1 && pendingExactSteerTurnIdByLocalId.get(localIds[0]) === boundSteer.binding) pendingExactSteerTurnIdByLocalId.delete(localIds[0]);
             return;
         }
 
@@ -1356,6 +1409,17 @@ export async function runCodex(opts: {
             pendingProviderAction,
             prioritize: pendingProviderAction !== undefined,
         });
+    };
+    session.onUserMessage(handleUserMessage, {
+        onBoundCodexSteer: createCodexPendingInputBoundSteerHandler({
+            turnBindings: pendingExactSteerTurnIdByLocalId,
+            getRuntime: () => codexAppServerRuntime && getCodexRemoteRuntime() === codexAppServerRuntime ? codexAppServerRuntime : null,
+            isAdmissionOpen: () => !providerInputAdmissionClosed && providerInputConsumer !== null && !abortController.signal.aborted,
+            steer: handleUserMessage,
+            refuse: async (localId, seq) => {
+                await blockProviderPromptDeliveryBeforeAcceptance({ localIds: [localId], userMessageSeq: seq, reason: 'steering_unavailable', providerEffect: 'none' });
+            },
+        }),
     });
 
     let thinking = false;
@@ -2116,6 +2180,7 @@ export async function runCodex(opts: {
                 runtime: codexAppServerRuntime,
                 inputConsumer,
                 turnBindings: pendingExactSteerTurnIdByLocalId,
+                isAdmissionOpen: () => !providerInputAdmissionClosed && !abortController.signal.aborted,
             }),
         }) ?? null;
         if (!storedSessionIdForResume?.trim() && !readAttachedCodexAppServerThreadId()) {

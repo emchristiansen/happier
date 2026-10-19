@@ -474,9 +474,10 @@ async function materializeNextPendingMessageInTx(
                 if (row.deliveryState !== null) return false;
                 const action = PendingRequestedActionV1Schema.safeParse(row.requestedAction);
                 if (!action.success) return false;
-                if (requestedLocalId && action.data.kind !== "steer_now") return false;
+                if (requestedLocalId && action.data.kind !== "steer_now" && action.data.kind !== "steer_now_bound") return false;
                 return action.data.kind === "send_now"
                     || action.data.kind === "steer_now"
+                    || action.data.kind === "steer_now_bound"
                     || (
                         action.data.kind === "steer_if_active"
                         && foregroundState === "active_steerable"
@@ -588,6 +589,7 @@ async function materializeNextPendingMessageInTx(
             const nextPending = selected.row;
             const requestedAction = selected.action;
             const providerAction: PendingProviderAction = requestedAction.kind === "steer_now"
+                || requestedAction.kind === "steer_now_bound"
                 || (requestedAction.kind === "steer_if_active" && foregroundState === "active_steerable")
                 ? "steer"
                 : requestedAction.kind === "send_now" && foregroundState !== "ready"

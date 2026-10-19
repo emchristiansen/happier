@@ -1366,9 +1366,10 @@ export async function requestPendingQueueV2SteerNow(params: {
     token: string;
     sessionId: string;
     localId: string;
+    bindingId: string;
 }): Promise<Readonly<{ didUpdate: boolean }>> {
     const localId = requirePendingLocalId(params.localId);
-    const requestedAction = { v: 1, kind: 'steer_now' } as const;
+    const requestedAction = PendingRequestedActionV1Schema.parse({ v: 1, kind: 'steer_now_bound', bindingId: params.bindingId });
     const serverUrl = resolveServerHttpBaseUrl();
     const response = await axios.patch(
         `${serverUrl}/v2/sessions/${encodeURIComponent(params.sessionId)}/pending/${encodeURIComponent(localId)}/action`,
@@ -1386,7 +1387,7 @@ export async function requestPendingQueueV2SteerNow(params: {
     if (
         record.requestedAction === undefined
         || PendingRequestedActionV1Schema.safeParse(record.requestedAction).success !== true
-        || (record.requestedAction as { kind?: unknown }).kind !== 'steer_now'
+        || JSON.stringify(PendingRequestedActionV1Schema.parse(record.requestedAction)) !== JSON.stringify(requestedAction)
         || typeof record.didUpdate !== 'boolean'
     ) {
         throw new Error('Invalid pending queue steer-now acknowledgement');

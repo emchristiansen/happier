@@ -50,7 +50,7 @@ describe('pendingQueueV2Transport', () => {
             data: {
                 ok: true,
                 didUpdate: true,
-                requestedAction: { v: 1, kind: 'steer_now' },
+                requestedAction: { v: 1, kind: 'steer_now_bound', bindingId: ' B1 ' },
             },
         });
 
@@ -58,12 +58,13 @@ describe('pendingQueueV2Transport', () => {
             token: 'token',
             sessionId: 'session/with spaces',
             localId: 'target-local',
+            bindingId: ' B1 ',
         })).resolves.toEqual({ didUpdate: true });
 
         expect(mockPatch).toHaveBeenCalledWith(
             expect.stringContaining('/v2/sessions/session%2Fwith%20spaces/pending/target-local/action'),
             {
-                requestedAction: { v: 1, kind: 'steer_now' },
+                requestedAction: { v: 1, kind: 'steer_now_bound', bindingId: ' B1 ' },
             },
             expect.objectContaining({
                 headers: expect.objectContaining({ Authorization: 'Bearer token' }),
@@ -71,6 +72,29 @@ describe('pendingQueueV2Transport', () => {
             }),
         );
 
+    });
+
+    it.each([
+        { v: 1, kind: 'steer_now_bound', bindingId: 'B2' },
+        { v: 1, kind: 'steer_now' },
+        { v: 1, kind: 'steer_now_bound' },
+    ])('does not acknowledge a changed or missing bound invocation: %j', async (requestedAction) => {
+        mockPatch.mockResolvedValueOnce({ data: { ok: true, didUpdate: true, requestedAction } });
+        await expect(requestPendingQueueV2SteerNow({ token: 'token', sessionId: 's1', localId: ' L ', bindingId: 'B1' })).rejects.toThrow();
+        expect(mockPatch).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['http', 'socket'] as const)('[bound-lifetime] retains the whole bound claim from %s', async (transport) => {
+        const requestedAction = { v: 1, kind: 'steer_now_bound', bindingId: ' B1 ' } as const;
+        const ack = { ok: true, didMaterialize: true, didWrite: false, localId: ' L ', pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 4, deliveryState: { mode: 'provider', unresolved: true }, message: {
+            id: null, seq: null, localId: ' L ', messageRole: 'user', content: { t: 'plain', v: { role: 'user', content: { type: 'text', text: 'bound input' } } }, requestedAction, providerAction: 'steer', createdAt: 1_000, updatedAt: 1_000,
+        } };
+        mockPost.mockResolvedValueOnce({ data: ack });
+        const socket = { connected: true, timeout: vi.fn(() => socket), emitWithAck: vi.fn(async () => ack) };
+        const result = transport === 'http'
+            ? await materializeNextPendingQueueV2MessageViaHttp({ token: 'token', sessionId: 's1', deliveryStateOptIn: true })
+            : await materializeNextPendingQueueV2Message({ token: 'token', sessionId: 's1', socket: socket as unknown as import('socket.io-client').Socket, requestedLocalId: ' L ', deliveryStateOptIn: true });
+        expect(result).toMatchObject({ didMaterialize: true, message: { localId: ' L ', requestedAction, providerAction: 'steer' } });
     });
 
     it('accepts a terminal enqueue rejoin only with the exact committed-message localId', async () => {

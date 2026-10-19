@@ -22,6 +22,7 @@ import type {
 } from './pendingQueueV2Transport';
 import type {
   PendingProviderAction,
+  PendingRequestedActionV1,
   SessionTranscriptObservationProvenanceV1,
   SessionPendingQueueDeliveryTiming,
   SessionSystemRecord,
@@ -81,6 +82,15 @@ export type SessionUserMessageDeliveryInfo = Readonly<{
   seq: number | null;
   providerAcceptancePending?: boolean | undefined;
   pendingProviderAction?: PendingProviderAction | undefined;
+}>;
+
+export type BoundCodexSteerDelivery = Readonly<{
+  localId: string;
+  requestedAction: Extract<PendingRequestedActionV1, { kind: 'steer_now_bound' }>;
+  providerAction: 'steer';
+  providerAcceptancePending: true;
+  seq: number | null;
+  isCurrentRegistration: () => boolean;
 }>;
 
 export interface SessionClientPort {

@@ -585,7 +585,10 @@ export class ApiSessionClient extends EventEmitter {
     private userSocket: Socket<ServerToClientEvents, ClientToServerEvents>;
     private pendingMessages: UserMessage[] = [];
     private readonly bufferedPendingMessageDeliveryInfoByLocalId = new Map<string, SessionUserMessageDeliveryInfo>();
-    private pendingMessageCallback: ((message: UserMessage, info?: SessionUserMessageDeliveryInfo) => unknown | Promise<unknown>) | null = null;
+    private pendingMessageRegistration: Readonly<{
+        ordinary: (message: UserMessage, info?: SessionUserMessageDeliveryInfo) => unknown | Promise<unknown>;
+        boundCodexSteer?: (message: UserMessage, delivery: import('./sessionClientPort').BoundCodexSteerDelivery) => unknown | Promise<unknown>;
+    }> | null = null;
     readonly rpcHandlerManager: RpcHandlerManager;
     private sessionPermissionRpcRouter: SessionPermissionRpcRouter | null = null;
     private executionRunPermissionHandler: CodexLikePermissionHandler | null = null;
@@ -1516,7 +1519,7 @@ export class ApiSessionClient extends EventEmitter {
         };
     }
 
-    async requestPendingInputSteerNow(localId: string): Promise<PendingInputSteerNowAdmission> {
+    async requestPendingInputSteerNow(localId: string, bindingId: string): Promise<PendingInputSteerNowAdmission> {
         const exactLocalId = readPendingLocalId(localId);
         if (!exactLocalId) return { kind: 'not_admitted', reason: 'invalid_local_id' };
         const contract = this.sessionSyncPendingInputServerContract;
@@ -1538,6 +1541,7 @@ export class ApiSessionClient extends EventEmitter {
                 token: this.token,
                 sessionId: this.sessionId,
                 localId: exactLocalId,
+                bindingId,
             });
         } catch (error) {
             return isPermanentRequestStatus(readHttpStatus(error))
@@ -2381,7 +2385,7 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private shouldKeepUserSocketConnected(): boolean {
-        return this.pendingMessageCallback !== null
+        return this.pendingMessageRegistration !== null
             || this.pendingMaterializedLocalIds.size > 0
             || this.committedLocalIdsAwaitingEcho.size > 0
             || this.pendingQueueMaterializedLocalIds.size > 0
@@ -3528,6 +3532,26 @@ export class ApiSessionClient extends EventEmitter {
         const userMessage = this.readPendingQueueUserMessage(message);
         if (!userMessage) return false;
         const localId = readPendingLocalId(userMessage.localId);
+        if (message?.requestedAction?.kind === 'steer_now_bound') {
+            const registration = this.pendingMessageRegistration;
+            const boundHandler = registration?.boundCodexSteer;
+            if (!localId || message.providerAction !== 'steer' || !opts.providerAcceptancePending || !boundHandler) {
+                if (localId) await this.blockPendingQueueDeliveryLocalId(localId, 'unsupported_action', { canonicalOnly: true });
+                // Handled as refusal; never enter the ordinary callback or its buffer.
+                return true;
+            }
+            await boundHandler(userMessage, {
+                localId,
+                requestedAction: message.requestedAction,
+                providerAction: 'steer',
+                providerAcceptancePending: true,
+                seq: message.seq,
+                isCurrentRegistration: () => this.pendingMessageRegistration === registration
+                    && !this.closed && !this.runtimeTerminationStarted
+                    && this.canonicalPendingDeliveryByLocalId.get(localId)?.requestedAction === message.requestedAction,
+            });
+            return true;
+        }
         if (localId) {
             if (this.hasAgentQueueDeliveredLocalId(localId)) {
                 return true;
@@ -3535,8 +3559,8 @@ export class ApiSessionClient extends EventEmitter {
             this.markAgentQueueEchoSuppressedLocalId(localId);
             this.markAgentQueueDeliveredLocalId(localId);
         }
-        if (this.pendingMessageCallback) {
-            await this.pendingMessageCallback(userMessage, {
+        if (this.pendingMessageRegistration) {
+            await this.pendingMessageRegistration.ordinary(userMessage, {
                 seq: typeof message?.seq === 'number' && Number.isFinite(message.seq) ? message.seq : null,
                 ...(opts.providerAcceptancePending ? { providerAcceptancePending: true } : {}),
                 ...(message?.providerAction ? { pendingProviderAction: message.providerAction } : {}),
@@ -3554,14 +3578,17 @@ export class ApiSessionClient extends EventEmitter {
         return true;
     }
 
-    onUserMessage(callback: (data: UserMessage, info?: SessionUserMessageDeliveryInfo) => unknown | Promise<unknown>) {
+    onUserMessage(
+        callback: (data: UserMessage, info?: SessionUserMessageDeliveryInfo) => unknown | Promise<unknown>,
+        opts?: Readonly<{ onBoundCodexSteer: (message: UserMessage, delivery: import('./sessionClientPort').BoundCodexSteerDelivery) => unknown | Promise<unknown> }>,
+    ) {
         logger.debug('[API] onUserMessage callback attached', {
             sessionId: this.sessionId,
             startedByDaemonProcess: this.startedByDaemonProcess,
             metadataStartedBy: this.metadata?.startedBy ?? null,
             metadataStartedFromDaemon: this.metadata?.startedFromDaemon ?? null,
         });
-        this.pendingMessageCallback = callback;
+        this.pendingMessageRegistration = { ordinary: callback, ...(opts ? { boundCodexSteer: opts.onBoundCodexSteer } : {}) };
         if (this.userSocketDisconnectTimer) {
             clearTimeout(this.userSocketDisconnectTimer);
             this.userSocketDisconnectTimer = null;
