@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
@@ -129,6 +129,20 @@ describe('listCodexDirectSessionCandidatesViaAppServer', () => {
                     }),
                 }),
             ]));
+        });
+    });
+});
+
+
+describe('dedicated private native domain app-server preview boundary', () => {
+    it('refuses before constructing an ordinary preview process', async () => {
+        await withTempDir('happier-private-app-preview-', async (root) => {
+            const home = join(root, 'private');
+            await mkdir(home);
+            await writeFile(join(home, '.muninn-private-native-domain'), 'restriction');
+            await expect(listCodexDirectSessionCandidatesViaAppServer({ codexHome: home, env: {
+                HAPPIER_CODEX_APP_SERVER_BIN: join(root, 'must-not-be-started'),
+            } })).rejects.toThrow('private native domain');
         });
     });
 });

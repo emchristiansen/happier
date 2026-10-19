@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -211,5 +211,27 @@ describe('prepareFilesystemPathAuthorizer', () => {
       resolvedPath: 'C:\\Users\\alice\\work\\repo\\file.txt',
     });
     await expect(authorizePath('C:\\Users\\alice2\\work\\repo\\file.txt')).resolves.toMatchObject({ valid: false });
+  });
+});
+
+
+describe('dedicated private native domain restriction', () => {
+  it('refuses current os-user and restricted filesystem reads before access, including aliased missing descendants', async () => {
+    const root = createTempRoot('happier-private-fs-policy');
+    const privateDomain = join(root, 'private');
+    const ordinary = join(root, 'ordinary');
+    mkdirSync(privateDomain);
+    mkdirSync(ordinary);
+    writeFileSync(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+    symlinkSync(privateDomain, join(root, 'alias'));
+    for (const accessPolicy of [{ kind: 'osUser' } as const, { kind: 'restrictedRoots', roots: [root] } as const]) {
+      const authorize = await prepareFilesystemPathAuthorizer({ defaultDirectory: root, accessPolicy });
+      for (const targetPath of [join(privateDomain, 'raw.bin'), join(root, 'alias', 'missing', 'later.bin')]) {
+        expect(authorizeFilesystemPath({ targetPath, defaultDirectory: root, accessPolicy }).valid).toBe(false);
+        expect((await authorize(targetPath)).valid).toBe(false);
+      }
+      expect((await authorize(join(ordinary, 'future', 'record'))).valid).toBe(true);
+      expect(authorizeFilesystemPath({ targetPath: ordinary, defaultDirectory: root, accessPolicy }).valid).toBe(true);
+    }
   });
 });

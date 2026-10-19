@@ -443,6 +443,8 @@ async function createOwnedCodexAppServerClient(
             privateCustodyFailure ??= audienceFailure('capture', error);
             throw privateCustodyFailure;
         }
+        // A synchronous owner callback can reenter this client and fail nested custody.
+        if (privateCustodyFailure) throw privateCustodyFailure;
     };
     const sourceProcessEnv = params.processEnv ?? process.env;
     const rpcLogger = privateOwner ? null : createRpcLogger(sourceProcessEnv);
@@ -946,7 +948,9 @@ async function createOwnedCodexAppServerClient(
             registerRequestHandler, registerNotificationHandler, onExit, dispose,
         };
     } catch (error) {
+        // Record the constructor failure before disposal performs the owner's final flush.
+        const failure = privateOwner ? audienceFailure('construction', error) : error;
         await dispose().catch(() => undefined);
-        throw error;
+        throw failure;
     }
 }

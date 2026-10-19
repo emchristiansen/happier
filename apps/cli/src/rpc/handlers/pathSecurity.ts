@@ -1,10 +1,70 @@
-import { realpathSync } from 'fs';
-import { basename, dirname, isAbsolute, relative, resolve, sep } from 'path';
+import { lstatSync, realpathSync } from 'fs';
+import { basename, dirname, isAbsolute, relative, resolve, sep, join } from 'path';
 
 export interface PathValidationResult {
     valid: boolean;
     error?: string;
     resolvedPath?: string;
+}
+
+
+// This is a durable restriction on newly created dedicated private domains.
+// Its absence grants no authority, and this utility never creates a marker.
+export const PRIVATE_NATIVE_DOMAIN_MARKER = '.muninn-private-native-domain';
+
+function isMissingPath(error: unknown): boolean {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+function hasPrivateNativeDomainAncestor(targetPath: string): boolean {
+    for (let candidate = targetPath;; candidate = dirname(candidate)) {
+        try {
+            lstatSync(join(candidate, PRIVATE_NATIVE_DOMAIN_MARKER));
+            return true;
+        } catch (error) {
+            if (!isMissingPath(error)) throw error;
+        }
+        if (dirname(candidate) === candidate) return false;
+    }
+}
+
+function resolveReaderPathThroughExistingAncestor(targetPath: string): string {
+    let candidate = targetPath;
+    const missing: string[] = [];
+    for (;;) {
+        try {
+            return resolve(realpathSync(candidate), ...missing);
+        } catch (error) {
+            if (!isMissingPath(error)) throw error;
+            const parent = dirname(candidate);
+            if (parent === candidate) throw error;
+            missing.unshift(basename(candidate));
+            candidate = parent;
+        }
+    }
+}
+
+/** Ordinary readers may not open a dedicated private native domain.
+ * This negative restriction is independent of workspace or os-user authority.
+ * Check both lexical ancestors and real ancestors, including missing targets.
+ */
+export function validateOrdinaryReaderPath(targetPath: string): PathValidationResult {
+    try {
+        const lexical = resolve(targetPath);
+        if (hasPrivateNativeDomainAncestor(lexical)
+            || hasPrivateNativeDomainAncestor(resolveReaderPathThroughExistingAncestor(lexical))) {
+            return { valid: false, error: 'Access denied: private native domain' };
+        }
+        return { valid: true, resolvedPath: lexical };
+    } catch {
+        return { valid: false, error: 'Access denied: unable to inspect private native domain restriction; values not shown' };
+    }
+}
+
+export function assertOrdinaryReaderPath(targetPath: string): void {
+    const result = validateOrdinaryReaderPath(targetPath);
+    if (!result.valid) throw new Error(result.error);
 }
 
 function resolveRealPathThroughExistingAncestor(targetPath: string): string {
@@ -44,10 +104,7 @@ export function validateWorkspaceInspectionPath(targetPath: string): PathValidat
         };
     }
 
-    return {
-        valid: true,
-        resolvedPath: resolve(trimmedPath),
-    };
+    return validateOrdinaryReaderPath(trimmedPath);
 }
 
 /**
@@ -80,6 +137,8 @@ export function validatePath(
 
     // Resolve symlinks for the target when possible to prevent traversal via symlinks.
     // If the file doesn't exist yet, validate based on the realpath of its parent directory.
+    const restriction = validateOrdinaryReaderPath(resolvedTarget);
+    if (!restriction.valid) return restriction;
     const realTarget = resolveRealPathThroughExistingAncestor(resolvedTarget);
 
     const allowedDirs = [realWorkingDir, ...resolvedExtraDirs].map((dir) => {

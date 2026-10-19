@@ -1,4 +1,5 @@
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { listMachineBrowseDirectory } from './listMachineBrowseDirectory';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -84,5 +85,30 @@ describe('validateMachineBrowsePath', () => {
       rmSync(workspace, { recursive: true, force: true });
       rmSync(outside, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe('dedicated private native domain machine browser boundary', () => {
+  it('refuses the actual machine browser through aliases and missing descendants, preserving ordinary neighbors', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'happier-private-machine-browser-'));
+    try {
+      const privateDomain = join(root, 'private');
+      const ordinary = join(root, 'ordinary');
+      mkdirSync(privateDomain);
+      mkdirSync(ordinary);
+      writeFileSync(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+      writeFileSync(join(privateDomain, 'private-outcome.bin'), Buffer.from([0, 255, 10]));
+      writeFileSync(join(ordinary, 'ordinary.txt'), 'ordinary original bytes');
+      symlinkSync(privateDomain, join(root, 'alias'), process.platform === 'win32' ? 'junction' : 'dir');
+      const roots = [{ id: root, label: root, path: root }];
+      const result = await listMachineBrowseDirectory({ raw: { path: privateDomain }, roots, maxEntries: 100, statConcurrency: 1 });
+      expect(result.ok).toBe(false);
+      for (const targetPath of [privateDomain, join(root, 'alias', 'missing', 'future')]) {
+        expect(validateMachineBrowsePath({ targetPath, roots }).valid).toBe(false);
+      }
+      const allowed = await listMachineBrowseDirectory({ raw: { path: ordinary }, roots, maxEntries: 100, statConcurrency: 1 });
+      expect(allowed).toMatchObject({ ok: true, entries: [{ name: 'ordinary.txt' }] });
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

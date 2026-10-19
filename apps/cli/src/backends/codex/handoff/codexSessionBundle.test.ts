@@ -1,3 +1,4 @@
+import { copySessionHandoffFileSlice, readSessionHandoffProviderBundleFile, writeSessionHandoffProviderBundleArtifact } from '@/session/handoff/sessionHandoffProviderBundleFile';
 import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -757,5 +758,33 @@ describe('codex session handoff bundle', () => {
         CODEX_HOME: codexHome,
       },
     })).rejects.toThrow(/CODEX_HOME|outside/i);
+  });
+});
+
+
+describe('dedicated private native domain handoff boundary', () => {
+  it('refuses private export, forged file slices, artifact reads and import targets while preserving original bytes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-private-handoff-'));
+    const privateDomain = join(root, 'private');
+    const ordinary = join(root, 'ordinary');
+    await mkdir(privateDomain);
+    await mkdir(ordinary);
+    await writeFile(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+    await mkdir(join(privateDomain, 'sessions'));
+    const raw = join(privateDomain, 'sessions', 'rollout-2026-01-02T00-00-00-private_thread.jsonl');
+    const original = Buffer.from([0, 255, 128, 10]);
+    await writeFile(raw, original);
+    await expect(exportCodexSessionBundle({ metadata: { path: '/repo', codexSessionId: 'private_thread', codexBackendMode: 'appServer' },
+      remoteSessionId: 'private_thread', env: { CODEX_HOME: privateDomain }, activeServerDir: root }))
+      .rejects.toThrow('private native domain');
+    const source = { t: 'happier.handoff.file.v1' as const, filePath: raw, offsetBytes: 0, sizeBytes: original.length };
+    await expect(copySessionHandoffFileSlice({ source, targetFilePath: join(ordinary, 'copied') })).rejects.toThrow('private native domain');
+    await expect(readSessionHandoffProviderBundleFile(raw)).rejects.toThrow('private native domain');
+    const bundle = { providerId: 'codex' as const, remoteSessionId: 'private_thread', files: [{ relativePath: 'sessions/copied.jsonl', contentFile: source }] };
+    await expect(writeSessionHandoffProviderBundleArtifact({ providerBundle: bundle, filePath: join(ordinary, 'artifact') }))
+      .rejects.toThrow('private native domain');
+    await expect(importCodexSessionBundle({ bundle: { ...bundle, files: [] }, targetPath: '/repo', env: { CODEX_HOME: privateDomain } }))
+      .rejects.toThrow('private native domain');
+    expect(await readFile(raw)).toEqual(original);
   });
 });

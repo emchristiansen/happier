@@ -1,3 +1,4 @@
+import { validateOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
 import { realpathSync } from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import { basename, dirname, posix, win32 } from 'node:path';
@@ -134,6 +135,10 @@ export function resolveFilesystemTargetPath(input: Readonly<{
     ? normalizeFilesystemPathForPolicy(targetPath, platform)
     : normalizeFilesystemPathForPolicy(api.resolve(defaultDirectory, targetPath), platform);
 
+  if (platform === process.platform) {
+    const restriction = validateOrdinaryReaderPath(resolvedPath);
+    if (!restriction.valid) return { valid: false, error: restriction.error ?? 'Access denied: private native domain' };
+  }
   return { valid: true, resolvedPath };
 }
 

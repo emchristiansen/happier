@@ -1,3 +1,4 @@
+import { assertOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
 import type { Dirent } from 'node:fs';
 import { lstat, readdir, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -176,7 +177,7 @@ export function inferCodexDirectSessionsSourceFromHome(params: Readonly<{
   };
 }
 
-export async function resolveCodexHomeEntriesForDirectSessionsSource(params: Readonly<{
+async function resolveCodexHomeEntriesUnchecked(params: Readonly<{
   source: DirectSessionsSource;
   activeServerDir: string;
   env: NodeJS.ProcessEnv;
@@ -357,5 +358,14 @@ export async function resolveCodexHomeEntriesForDirectSessionsSource(params: Rea
     }
   }
 
+  return entries;
+}
+
+
+export async function resolveCodexHomeEntriesForDirectSessionsSource(
+  params: Parameters<typeof resolveCodexHomeEntriesUnchecked>[0],
+): Promise<CodexDirectSessionHomeEntry[]> {
+  const entries = await resolveCodexHomeEntriesUnchecked(params);
+  for (const entry of entries) assertOrdinaryReaderPath(entry.codexHome);
   return entries;
 }

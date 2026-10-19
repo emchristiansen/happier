@@ -1,7 +1,7 @@
 import { resolve } from 'path';
 import { afterAll, describe, it, expect } from 'vitest';
 import { validatePath, validateWorkspaceInspectionPath } from './pathSecurity';
-import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, rmSync, existsSync } from 'fs';
+import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, rmSync, existsSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -163,5 +163,28 @@ describe('validateWorkspaceInspectionPath', () => {
             valid: false,
             error: 'Attached workspace candidate path contains invalid characters',
         });
+    });
+});
+
+
+describe('dedicated private native domain restriction', () => {
+    it('refuses legacy workspace reads through aliases and missing descendants while preserving ordinary neighbors', () => {
+        const root = mkdtempSync(join(tmpdir(), 'happier-private-path-'));
+        try {
+            const privateDomain = join(root, 'private');
+            const ordinary = join(root, 'ordinary');
+            mkdirSync(privateDomain);
+            mkdirSync(ordinary);
+            writeFileSync(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+            writeFileSync(join(privateDomain, 'raw.bin'), Buffer.from([0, 255, 10]));
+            symlinkSync(privateDomain, join(root, 'alias'));
+            for (const target of [join(privateDomain, 'raw.bin'), join(root, 'alias', 'missing', 'later.bin')]) {
+                expect(validatePath(target, root).valid).toBe(false);
+            }
+            expect(validatePath(join(ordinary, 'future', 'record'), root).valid).toBe(true);
+            expect(validatePath(join(root, 'ordinary'), root).valid).toBe(true);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
     });
 });
