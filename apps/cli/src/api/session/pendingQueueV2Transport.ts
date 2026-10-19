@@ -793,11 +793,10 @@ export type PendingQueueV2DeliveryStatusEntry = Readonly<{
 }>;
 
 /**
- * Canonical per-row delivery status projection for every row currently in the server pending
- * queue. Terminal outcomes (a row resolved/delivered — e.g. user "mark delivered" — or removed)
- * are represented by the row's ABSENCE from the returned list; a lingering row explicitly reports
- * its `discarded` status. This is the single delivery-truth source used to retire local canonical
- * provider-delivery claims whose server row has gone terminal.
+ * Per-row delivery status projection for rows currently in the server pending queue. An absent
+ * row is only an observation, not proof of settlement or exact committed delivery. The existing
+ * canonical custody owner decides release from its exact terminal/committed proof; a retained
+ * row's explicit status remains available to that owner.
  */
 export async function listPendingQueueV2DeliveryStatusesFromServer(params: {
     token: string;

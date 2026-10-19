@@ -57,6 +57,7 @@ export async function fetchSessionSnapshotUpdateFromServer(opts: {
     currentAgentState?: AgentState | null;
     reason?: SessionSnapshotRefreshReasonInput;
 }): Promise<{
+    archivedAt?: number;
     metadata?: { metadata: Metadata; metadataVersion: number };
     agentState?: { agentState: AgentState | null; agentStateVersion: number };
     pendingQueueState?: KnownPendingQueueState;
@@ -71,6 +72,7 @@ export async function fetchSessionSnapshotUpdateFromServer(opts: {
         (raw as any)?.encryptionMode === 'plain' ? 'plain' : 'e2ee';
 
     const out: {
+        archivedAt?: number;
         metadata?: { metadata: Metadata; metadataVersion: number };
         agentState?: { agentState: AgentState | null; agentStateVersion: number };
         pendingQueueState?: KnownPendingQueueState;
@@ -78,6 +80,10 @@ export async function fetchSessionSnapshotUpdateFromServer(opts: {
         latestTurnStatusObservedAt?: number;
         runtimeActivityProjection?: SessionRuntimeActivityProjectionBoundary;
     } = {};
+
+    if (typeof raw.archivedAt === 'number') {
+        out.archivedAt = raw.archivedAt;
+    }
 
     const runtimeActivityProjection = readSessionRuntimeActivityProjectionBoundary(raw);
     if (hasSessionRuntimeActivityProjectionBoundaryEvidence(runtimeActivityProjection)) {
