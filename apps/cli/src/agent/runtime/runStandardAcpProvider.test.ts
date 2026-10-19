@@ -44,6 +44,7 @@ function createHarness() {
 
   const session: any = {
     sessionId: 'session-1',
+    waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted,
     rpcHandlerManager: {
       registerHandler: (name: string, handler: (request: unknown) => unknown | Promise<unknown>) => {
         handlers.set(name, (request) => handler(request));
@@ -1095,6 +1096,31 @@ describe('runStandardAcpProvider', () => {
     expect(harness.metrics.cleanupCalls).toBe(1);
     expect(onDispose).toHaveBeenCalledTimes(1);
     expect(harness.metrics.callOrder).toEqual(['permission:Session ended', 'backend-cleanup']);
+  });
+
+  it('uses its own archive cleanup callback to close the current runner without archiving', async () => {
+    const harness = createHarness();
+    harness.opts.existingSessionId = 'session-1';
+    const initialize = harness.deps.initializeBackendRunSessionFn;
+    let cleanup: (() => Promise<unknown>) | undefined;
+    harness.deps.initializeBackendRunSessionFn = async (params: any) => {
+      cleanup = params.requestArchivedSessionCleanup;
+      return await initialize(params);
+    };
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    harness.deps.runPermissionModePromptLoopFn = async () => {
+      expect(cleanup).toBeTypeOf('function');
+      await expect(cleanup!()).resolves.toEqual({ kind: 'requested' });
+      await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(0));
+    };
+    try {
+      await runStandardAcpProvider(harness.opts, harness.config, harness.deps);
+    } finally {
+      exitSpy.mockRestore();
+    }
+    expect(harness.session.close).toHaveBeenCalled();
+    expect(harness.metrics.cleanupCalls).toBe(1);
+    expect(sessionWasArchived(harness.session)).toBe(false);
   });
 
   it('invokes kill handler lifecycle without archiving the session', async () => {
