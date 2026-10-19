@@ -4,6 +4,7 @@ export type SessionSnapshotRefreshReason =
     | 'socket-reconnect-catchup'
     | 'metadata-version-unknown'
     | 'pending-version-unknown'
+    | 'pending-reconciliation'
     | 'explicit-drain'
     | 'startup-drain'
     | 'manual-recovery'

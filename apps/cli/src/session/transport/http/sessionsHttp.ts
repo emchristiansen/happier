@@ -13,6 +13,7 @@ import {
 import type { Credentials } from '@/persistence';
 import { resolveSessionEncryptionContext } from '@/api/client/encryptionKey';
 import { createHttpStatusError, isAuthenticationStatus } from '@/api/client/httpStatusError';
+import { classifyServerEndpointError } from '@/api/client/classifyServerEndpointError';
 import { encodeBase64, encrypt } from '@/api/encryption';
 import { resolveSessionCreateEncryptionMode } from '@/api/session/resolveSessionCreateEncryptionMode';
 import { configuration } from '@/configuration';
@@ -42,8 +43,10 @@ function throwAuthenticationStatusError(status: number, message = `Unauthorized 
   throw createHttpStatusError(status, message, 'not_authenticated');
 }
 
-function throwUnexpectedHttpStatusError(status: number, message: string): never {
-  throw createHttpStatusError(status, message);
+function throwUnexpectedHttpStatusError(status: number, message: string, headers?: unknown): never {
+  const { retryAfterMs } = classifyServerEndpointError({ response: { status, headers } });
+  throw Object.assign(createHttpStatusError(status, message),
+    retryAfterMs === undefined ? {} : { retryAfterMs });
 }
 
 function enforceSessionCompatibilityResponse(response: Readonly<{ status: number; data?: unknown }>): void {
@@ -114,7 +117,7 @@ export async function fetchSessionById(params: Readonly<{ token: string; session
     throwAuthenticationStatusError(response.status);
   }
   if (response.status !== 200) {
-    throwUnexpectedHttpStatusError(response.status, `Unexpected status from /v2/sessions/${params.sessionId}: ${response.status}`);
+    throwUnexpectedHttpStatusError(response.status, `Unexpected status from /v2/sessions/${params.sessionId}: ${response.status}`, response.headers);
   }
 
   return parseOrThrow<V2SessionByIdResponse>(V2SessionByIdResponseSchema, response.data, 'Unexpected /v2/sessions response shape').session;
@@ -141,6 +144,9 @@ export async function fetchSessionByIdCompat(params: Readonly<{ token: string; s
 
   if (response.status === 404) {
     if (!looksLikeMissingV2SessionRoute404(response.data, params.sessionId)) return null;
+    // A low-frequency recovery read must remain one physical request. Interactive and
+    // compatibility callers retain their legacy list fallback; periodic discovery does not.
+    if (params.reason === 'pending-reconciliation') return null;
 
     let cursor: string | undefined = undefined;
     const seenCursors = new Set<string>();
@@ -158,7 +164,7 @@ export async function fetchSessionByIdCompat(params: Readonly<{ token: string; s
     throwAuthenticationStatusError(response.status);
   }
   if (response.status !== 200) {
-    throwUnexpectedHttpStatusError(response.status, `Unexpected status from /v2/sessions/${params.sessionId}: ${response.status}`);
+    throwUnexpectedHttpStatusError(response.status, `Unexpected status from /v2/sessions/${params.sessionId}: ${response.status}`, response.headers);
   }
 
   return parseOrThrow<V2SessionByIdResponse>(V2SessionByIdResponseSchema, response.data, 'Unexpected /v2/sessions response shape').session;

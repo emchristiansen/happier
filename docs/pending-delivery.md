@@ -74,9 +74,61 @@ Exhaustion retains a typed disposition and writes one
 log, identifying the operation, reason, failed attempts, and episode timing. The
 consumer then waits for an existing eligibility event or reconnect to start a
 fresh episode. Cancellation stops future retries; it does not retire accepted
-provider custody or authorize a new message identity. These retries do not add
-periodic refreshes for an otherwise idle, known-empty queue whose hint never
-arrives.
+provider custody or authorize a new message identity. An exhausted episode is not
+renewed by elapsed time alone.
+
+### Authoritative discovery after a missed hint
+
+A live session client's canonical provider binding owns one low-frequency timer.
+The timer reads the existing authoritative session snapshot even if the cached
+pending projection says empty or positive. It uses the same reconciliation and
+snapshot single flights as hints and turn-end work; a joining request dirties the
+current pass without starting another read. New authoritative queue state wakes
+the existing consumer, which still owns materialization and provider admission.
+Turn-end reconciliation also requests an authoritative snapshot. Websocket hints
+and turn ends remain the fast path.
+
+An idle healthy binding waits an independently sampled 240–360 seconds after
+each completed pass. A successful read taking at least two seconds stretches the
+base delay to the greater of twice the previous base and five minutes per rounded-up
+second of elapsed read time, capped at thirty minutes. Failures double the base
+with the same cap. Reads under one second restore the five-minute base; intermediate
+read times retain it. Sampling remains 80–120% of that base, capped at thirty
+minutes, and a server Retry-After remains an independent lower bound even when it
+exceeds that cap. There is no immediate periodic retry burst. The maximum added
+periodic read rate is one read per 240 seconds per eligible binding: 1.667 reads
+per second for 400 continuously eligible bindings. At the stretched cap it is
+at most one per 1,440 seconds, or 0.278 reads per second for 400 bindings. These
+are source bounds, not measurements of the participating population or relay cost.
+Periodic discovery never initiates the compatibility reader's paginated session-list
+fallback. An older relay without the detail route therefore has no periodic recovery
+guarantee; existing non-periodic compatibility callers retain their fallback.
+
+Ticks defer during a locally active provider turn: turn-end reconciliation already
+handles that boundary. They also defer while readiness or settings application is
+unsettled, or the client holds reserved/accepted provider custody. Close,
+termination, changed producer generation, socket/connection epoch, machine identity,
+lost publisher binding and an authoritative archive observation fence late results
+and disable originating timers. This adds no archive cleanup or replacement owner.
+
+A failed authoritative discovery read followed by a readable pending snapshot at
+the same authority permits one existing consumer recovery wake. New queue state
+can supply its ordinary eligibility wake. Repeated unchanged readable snapshots
+cannot keep renewing exhausted consumer budgets. Existing retry/server lower bounds,
+settings convergence, archive admission, runtime readiness and exact provider
+acceptance/settlement remain in force. A missing server row does not retire local
+reserved or accepted custody; an accepted input is never delivered to the provider
+again merely because its settlement acknowledgement was lost.
+External deletion or manual handling without an exact completion receipt leaves
+that reservation or accepted operation unresolved and blocks a later claim. The
+existing exact settlement/committed-proof path must release it.
+
+A missed hint can add up to six minutes while healthy, or thirty minutes under
+stretched cadence, plus read completion and any larger server lower bound. Active
+turns and unsettled prerequisites can defer discovery longer. A permanently hung
+read, readiness/settings operation, reservation or provider acceptance remains
+owned and unresolved; discovery does not time it out into permission or launch a
+parallel operation. This development source does not update already loaded runners.
 
 In current development source, an admitted prompt does not wait for the daemon's
 `prompt_or_steer` lifecycle response. That notification informs recovery and
