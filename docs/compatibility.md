@@ -228,7 +228,8 @@ migration, duplicate settings owner, or client-update requirement.
 Existing-ID resume, adoption, and Pending wake use a fresh authenticated session
 read before admission. A newly loaded runner reads again before programmatic
 provider input, including preloaded input and initial goals. An archived result
-refuses input and requests the existing exact-owner physical-stop path. An
+refuses input and requests only that runner’s local cleanup owner. It never
+rediscovers a current owner by session ID or cancels session-wide recovery. An
 unreadable, missing, or malformed result grants no permission: the original input
 and local ID remain pending through the existing retry policy. Exhausted input
 waits require a fresh eligibility or connection event to renew their retry budget.
@@ -242,7 +243,11 @@ source change makes no claim about the development 0.3 line.
 
 Archive does not wait for a runner. An archive occurring after the final check
 can meet one turn already in flight, and a runner may exist briefly before its
-stop is confirmed. Stop uncertainty remains uncertainty. Explicit create/load is
+stop is confirmed. Before the local cleanup owner is installed, or when a
+Unified terminal host has not been adopted with exact attachment authority,
+input remains refused and physical cleanup stays unconfirmed. Missing ownership,
+failed disposal, and cleanup timeout never authorize stopping a successor.
+Explicit create/load is
 outside this admission contract: automatic same-tag create retry can unarchive a
 just-archived new session. Human terminal keystrokes are also outside the
 programmatic-input boundary.

@@ -63,14 +63,14 @@ vi.mock('socket.io-client', () => ({
   },
 }));
 
-async function createConsumer(attachSessionId = sessionId) {
+async function createConsumer(attachSessionId = sessionId, requestArchivedSessionCleanup?: () => Promise<{ kind: 'requested' | 'unavailable' }>) {
   sessionSocket = createApiSessionSocketStub({ id: 'f1-session' });
   userSocket = createApiSessionSocketStub({ id: 'f1-user' });
   const api = await apiModule.ApiClient.create({
     token: 'synthetic-f1-token', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(8) },
   });
   const session = api.sessionSyncClient(createPlainSessionFixture({ id: sessionId }), undefined,
-    { existingSessionId: attachSessionId });
+    { existingSessionId: attachSessionId, requestArchivedSessionCleanup });
   clients.push(session);
   const queue = new MessageQueue2<{ id: string }>(() => 'original-hash');
   return { session, queue, consumer: createSessionProviderInputConsumer({ messageQueue: queue, session }) };
@@ -144,6 +144,39 @@ describe('archived session input admission', () => {
       abortSignal: new AbortController().signal, dispatch,
     })).resolves.toEqual({ status: 'cancelled' });
     expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it('cleans only the observing runner after a delayed archive read and successor attachment', async () => {
+    const read = createDeferred<unknown>();
+    const started = createDeferred<void>();
+    readArchive = async () => { started.resolve(); return await read.promise; };
+    const cleanupA = vi.fn(async () => ({ kind: 'requested' as const }));
+    const cleanupB = vi.fn(async () => ({ kind: 'requested' as const }));
+    const { consumer } = await createConsumer(sessionId, cleanupA);
+    const dispatch = vi.fn(async () => 'accepted');
+    const result = consumer.runProviderInputDispatch({ abortSignal: new AbortController().signal, dispatch });
+    await started.promise;
+    // A later attachment must never become the target of A's delayed observation.
+    await createConsumer(sessionId, cleanupB);
+    read.resolve({ status: 200, data: { session: { ...record(), archivedAt: 42 } } });
+    await expect(result).resolves.toEqual({ status: 'cancelled' });
+    await vi.waitFor(() => expect(cleanupA).toHaveBeenCalledTimes(1));
+    expect(cleanupB).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each(['unavailable', 'failed'] as const)('keeps input refused when exact local cleanup is %s', async (cleanupState) => {
+    readArchive = async () => ({ status: 200, data: { session: { ...record(), archivedAt: 42 } } });
+    const cleanup = vi.fn(async () => {
+      if (cleanupState === 'failed') throw new Error('injected owned cleanup failure');
+      return { kind: 'unavailable' as const };
+    });
+    const { consumer, queue } = await createConsumer(sessionId, cleanup);
+    queue.push('retained body', { id: 'retained-mode' }, { userMessageLocalId: 'retained-id' });
+    await expect(consumer.waitForNextInput({ abortSignal: new AbortController().signal })).resolves.toBeNull();
+    await expect(consumer.waitForNextInput({ abortSignal: new AbortController().signal })).resolves.toBeNull();
+    await vi.waitFor(() => expect(cleanup).toHaveBeenCalledTimes(1));
+    expect(queue.size()).toBe(1);
   });
 
   it('does not dispatch a reserved input after admission closes during the read', async () => {

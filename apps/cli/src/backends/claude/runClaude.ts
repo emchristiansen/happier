@@ -1,3 +1,4 @@
+import type { RequestArchivedSessionCleanup } from '@/api/session/sessionArchiveInputAdmission';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 
@@ -505,8 +506,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     if (!activateProviderTaskRuntimeActivity) {
         throw new Error('Claude runtime Activity producer binding was not configured');
     }
+    let archivedSessionCleanup: RequestArchivedSessionCleanup = async () => ({ kind: 'unavailable' });
     const session = api.sessionSyncClient(baseSession, runtimeActivity.lifecycle.clientConfig(),
-        existingSessionId ? { existingSessionId } : undefined);
+        existingSessionId ? { existingSessionId, requestArchivedSessionCleanup: () => archivedSessionCleanup() } : undefined);
     logger.infoFile('[CLAUDE_STARTUP] stage=session_transport_attach_started');
     await runtimeActivity.lifecycle.attachSession(session);
     logger.infoFile('[CLAUDE_STARTUP] stage=session_transport_attach_completed');
@@ -1202,6 +1204,19 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             }),
         });
 
+    archivedSessionCleanup = async () => {
+        // A surviving host is never rediscovered or destroyed without its exact local owner.
+        if (unifiedTerminalRuntimeActive && !destroyOwnedHostForExplicitStop) return { kind: 'unavailable' };
+        await requestClaudeExplicitRunnerStop({
+            unifiedTerminalEnabled: unifiedTerminalRuntimeActive,
+            destroyOwnedHostForExplicitStop,
+            requestTermination: terminationHandlers.requestTermination,
+            whenTerminated: terminationHandlers.whenTerminated,
+            terminationEvent: { kind: 'exit', code: 0 },
+        });
+        return { kind: 'requested' };
+    };
+
     registerKillSessionHandler(session.rpcHandlerManager, async () => {
         await requestClaudeExplicitRunnerStop({
             unifiedTerminalEnabled: unifiedTerminalRuntimeActive,
@@ -1626,6 +1641,7 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
         permissionRequestTimeoutMs: localPermissionBridgeWaitIndefinitely ? null : localPermissionBridgeTimeoutMs,
     };
 
+    let archivedSessionCleanup: RequestArchivedSessionCleanup = async () => ({ kind: 'unavailable' });
     const startupSpec = createClaudeStartupSpec({
         existingSessionId,
         deps: {
@@ -2015,6 +2031,7 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
                         metadata,
                         state,
                         existingSessionId,
+                        requestArchivedSessionCleanup: () => archivedSessionCleanup(),
                         attachMetadataIdentityPolicy,
                             uiLogPrefix: '[claude]',
                             offlineNotify: (message: string) => {
@@ -2295,6 +2312,19 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
                 ignoreWindowMs: configuration.claudeAbortUnhandledRejectionIgnoreWindowMs,
             }),
         });
+
+    archivedSessionCleanup = async () => {
+        // A surviving host is never rediscovered or destroyed without its exact local owner.
+        if (unifiedTerminalRuntimeActive && !destroyOwnedHostForExplicitStop) return { kind: 'unavailable' };
+        await requestClaudeExplicitRunnerStop({
+            unifiedTerminalEnabled: unifiedTerminalRuntimeActive,
+            destroyOwnedHostForExplicitStop,
+            requestTermination: terminationHandlers.requestTermination,
+            whenTerminated: terminationHandlers.whenTerminated,
+            terminationEvent: { kind: 'exit', code: 0 },
+        });
+        return { kind: 'requested' };
+    };
 
     registerKillSessionHandler(coordinator.artifacts.deferredSession.rpcHandlerManager, async () => {
         await requestClaudeExplicitRunnerStop({

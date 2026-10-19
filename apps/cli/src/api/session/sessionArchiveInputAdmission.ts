@@ -4,6 +4,9 @@ import { AsyncLock } from '@/utils/lock';
 import { delayUnrefAbortable } from '@/utils/time';
 import { logger } from '@/ui/logger';
 
+export type ArchivedSessionCleanupOutcome = Readonly<{ kind: 'requested' | 'unavailable' }>;
+export type RequestArchivedSessionCleanup = () => Promise<ArchivedSessionCleanupOutcome>;
+
 /** Owns only archive admission; materialization and settings retain their retry episodes. */
 export class SessionArchiveInputAdmission {
   private readonly readLock = new AsyncLock();
@@ -16,7 +19,7 @@ export class SessionArchiveInputAdmission {
     lifetime: AbortSignal;
     connectionEpoch: () => number;
     waitForFreshEvent: (signal: AbortSignal) => Promise<boolean>;
-    requestArchivedStop: () => Promise<unknown>;
+    requestArchivedStop: RequestArchivedSessionCleanup;
   }>) {}
 
   async wait(signal: AbortSignal): Promise<boolean> {
@@ -46,8 +49,12 @@ export class SessionArchiveInputAdmission {
           if (archive === 'archived') {
             this.archived = true;
             // Waiting for our own physical exit would deadlock this delivery boundary.
-            // The existing stop owner keeps all identity/fence checks and reports uncertainty.
-            void Promise.resolve().then(this.opts.requestArchivedStop).catch(() => {
+            // Cleanup is bound to the observing runner, never rediscovered by session ID.
+            void Promise.resolve().then(this.opts.requestArchivedStop).then((outcome) => {
+              if (outcome.kind === 'unavailable') {
+                logger.debug('[archiveAdmission] exact local cleanup owner unavailable; input refused, physical cleanup unconfirmed');
+              }
+            }).catch(() => {
               logger.debug('[archiveAdmission] archived physical stop request failed; error details not shown');
             });
             return { kind: 'refused' } as const;

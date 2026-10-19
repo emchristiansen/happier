@@ -1,3 +1,4 @@
+import type { RequestArchivedSessionCleanup } from '@/api/session/sessionArchiveInputAdmission';
 import { applyPermissionModeToCodexPermissionHandler } from './utils/applyPermissionModeToHandler';
 import { createCodexPermissionHandler, type CodexRuntimePermissionHandler } from './utils/createCodexPermissionHandler';
 import { DiffProcessor } from './utils/diffProcessor';
@@ -815,12 +816,14 @@ export async function runCodex(opts: {
     // Offline reconnection handle (only relevant when creating a new session and server is unreachable)
     let reconnectionHandle: { cancel: () => void } | null = null;
     const stopRunSessionSpan = timing.startSpan('initialize_backend_run_session');
+    let archivedSessionCleanup: RequestArchivedSessionCleanup = async () => ({ kind: 'unavailable' });
     const initializedSession = await initializeBackendRunSession({
         api,
         sessionTag,
         metadata: startupMetadata,
         state,
         existingSessionId: opts.existingSessionId,
+        requestArchivedSessionCleanup: () => archivedSessionCleanup(),
         uiLogPrefix: '[codex]',
         startupMetadataOverrides: createStartupMetadataOverrides(opts),
         metadataKeysToUnsetOnAttach: codexBackendMode === 'acp'
@@ -1521,6 +1524,11 @@ export async function runCodex(opts: {
             }
         },
     });
+
+    archivedSessionCleanup = async () => {
+        terminationHandlers.requestTermination({ kind: 'exit', code: 0 });
+        return { kind: 'requested' };
+    };
 
     const handleKillSession = async () => {
         logger.debug('[Codex] Kill session requested - terminating process');

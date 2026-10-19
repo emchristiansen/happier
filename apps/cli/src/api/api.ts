@@ -1,3 +1,4 @@
+import type { RequestArchivedSessionCleanup } from './session/sessionArchiveInputAdmission';
 import axios from 'axios'
 import { z } from 'zod';
 import { logger } from '@/ui/logger'
@@ -748,18 +749,14 @@ export class ApiClient {
   sessionSyncClient(
     session: Session,
     runtimeActivity?: import('./session/sessionClient').SessionRuntimeActivityClientConfig,
-    attach?: Readonly<{ existingSessionId: string }>,
+    attach?: Readonly<{ existingSessionId: string; requestArchivedSessionCleanup?: RequestArchivedSessionCleanup }>,
   ): ApiSessionClient {
     if (attach && attach.existingSessionId.trim() !== session.id) {
       throw new Error('Existing-session input admission requires the exact attached session identity');
     }
-    return new ApiSessionClient(this.credential.token, session, runtimeActivity, attach ? async () => {
-      const { requestSessionStop } = await import('@/session/services/requestSessionStop');
-      const result = await requestSessionStop({ credentials: this.credential, idOrPrefix: session.id });
-      if (!result.ok || !result.stopped) {
-        logger.debug('[archiveAdmission] archived physical stop remains unconfirmed', result);
-      }
-    } : undefined);
+    return new ApiSessionClient(this.credential.token, session, runtimeActivity, attach
+      ? attach.requestArchivedSessionCleanup ?? (async () => ({ kind: 'unavailable' as const }))
+      : undefined);
   }
 
   machineSyncClient(

@@ -7,7 +7,7 @@ import { decodeBase64, decrypt, encodeBase64, encrypt } from '../encryption';
 import { backoff, delayUnrefAbortable } from '@/utils/time';
 import { classifyServerEndpointError } from '@/api/client/classifyServerEndpointError';
 import { PendingInputRetryEpisode } from './pendingInputRetryEpisode';
-import { SessionArchiveInputAdmission } from './sessionArchiveInputAdmission';
+import { SessionArchiveInputAdmission, type RequestArchivedSessionCleanup } from './sessionArchiveInputAdmission';
 import { LruSet } from '@/utils/collections/lru';
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers';
 import { createSerializedWorkQueueDiagnostics, type SerializedWorkDiagnosticContext } from '@/utils/serializedWorkQueueDiagnostics';
@@ -941,7 +941,7 @@ export class ApiSessionClient extends EventEmitter {
             token: string,
             session: Session,
             runtimeActivity?: SessionRuntimeActivityClientConfig,
-            requestArchivedStop?: () => Promise<unknown>,
+            requestArchivedStop?: RequestArchivedSessionCleanup,
         ) {
 	        super()
 	        this.token = token;

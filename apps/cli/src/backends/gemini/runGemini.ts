@@ -6,6 +6,7 @@
  * communication with the Happier server and app.
  */
 
+import type { RequestArchivedSessionCleanup } from '@/api/session/sessionArchiveInputAdmission';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import { resolve } from 'node:path';
@@ -245,12 +246,14 @@ export async function runGemini(opts: {
     }
   };
 
+  let archivedSessionCleanup: RequestArchivedSessionCleanup = async () => ({ kind: 'unavailable' });
   const initializedSession = await initializeBackendRunSession({
     api,
     sessionTag,
     metadata,
     state,
     existingSessionId: opts.existingSessionId,
+    requestArchivedSessionCleanup: () => archivedSessionCleanup(),
     uiLogPrefix: '[gemini]',
     startupMetadataOverrides: createStartupMetadataOverrides(opts),
     startupSideEffectsOrder: 'persist-first',
@@ -676,6 +679,12 @@ export async function runGemini(opts: {
       }
     },
   });
+
+  archivedSessionCleanup = async () => {
+    if (!terminationHandlers) return { kind: 'unavailable' };
+    terminationHandlers.requestTermination({ kind: 'exit', code: 0 });
+    return { kind: 'requested' };
+  };
 
   const handleKillSession = async () => {
     logger.debug('[Gemini] Kill session requested - terminating process');

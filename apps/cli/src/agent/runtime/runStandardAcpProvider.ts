@@ -1,3 +1,4 @@
+import type { RequestArchivedSessionCleanup } from '@/api/session/sessionArchiveInputAdmission';
 import { randomUUID } from 'node:crypto';
 
 import { render } from 'ink';
@@ -279,12 +280,14 @@ export async function runStandardAcpProvider(
   // Used by the message-queue binding to optionally steer additional user input into an in-flight turn.
   // This is late-bound because the queue binding is initialized before the runtime is created.
   let runtimeForInFlightSteer: RuntimeForLoop | null = null;
+  let archivedSessionCleanup: RequestArchivedSessionCleanup = async () => ({ kind: 'unavailable' });
   const initializedSession = await initializeBackendRunSessionFn({
     api,
     sessionTag,
     metadata,
     state,
     existingSessionId: opts.existingSessionId,
+    requestArchivedSessionCleanup: () => archivedSessionCleanup(),
     uiLogPrefix: config.uiLogPrefix,
     startupMetadataOverrides: createStartupMetadataOverrides(opts),
     onSessionSwap: async (newSession) => {
@@ -618,6 +621,11 @@ export async function runStandardAcpProvider(
       await cleanupOnce();
     },
   });
+
+  archivedSessionCleanup = async () => {
+    terminationHandlers.requestTermination({ kind: 'exit', code: 0 });
+    return { kind: 'requested' };
+  };
 
   const handleKillSession = async () => {
     logger.debug(`${config.uiLogPrefix} Kill session requested`);

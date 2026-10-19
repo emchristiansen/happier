@@ -5,6 +5,7 @@ export async function requestClaudeExplicitRunnerStop(input: Readonly<{
   destroyOwnedHostForExplicitStop: (() => Promise<void>) | null;
   requestTermination: (event: RunnerTerminationEvent) => void;
   whenTerminated: Promise<unknown>;
+  terminationEvent?: RunnerTerminationEvent;
 }>): Promise<void> {
   if (input.unifiedTerminalEnabled) {
     if (!input.destroyOwnedHostForExplicitStop) {
@@ -13,6 +14,6 @@ export async function requestClaudeExplicitRunnerStop(input: Readonly<{
     await input.destroyOwnedHostForExplicitStop();
   }
 
-  input.requestTermination({ kind: 'killSession' });
+  input.requestTermination(input.terminationEvent ?? { kind: 'killSession' });
   await input.whenTerminated;
 }
