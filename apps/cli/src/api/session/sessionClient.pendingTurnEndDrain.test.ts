@@ -1976,6 +1976,108 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(blockPendingDeliveryMock).toHaveBeenCalledWith(expect.objectContaining({ localId, reason: 'steering_unavailable' }));
   });
 
+  it.each([true, false])('[bound-retry-outcome] joins the original durable refusal before retry (settled=%s)', async (settled) => {
+    const client = await createClient({ latestTurnStatus: 'in_progress', pendingCount: 1, pendingVersion: 1, metadata: { flavor: 'codex' } });
+    await waitForCurrentPendingInputContract(client);
+    const localId = 'retry-after-held-refusal';
+    const block = createDeferred<{ pendingQueueState: { known: true; pendingCount: number; pendingBlockedCount: number; pendingVersion: number } }>();
+    blockPendingDeliveryMock.mockReturnValueOnce(block.promise);
+    const bridge = createCodexAppServerProviderInputOutcomeBridge(client, { isCurrentRuntimeMode: () => true });
+    const { createCodexPendingInputSteerControl, createCodexPendingInputBoundSteerHandler } = await import('@/backends/codex/runCodex');
+    const runtime = { getActiveSteerableTurnId: vi.fn().mockResolvedValueOnce('T1').mockResolvedValue('T2') };
+    const turnBindings: Parameters<typeof createCodexPendingInputSteerControl>[0]['turnBindings'] = new Map();
+    const steer = vi.fn(async () => { bridge.observeAccepted({ localIds: [localId], providerTurnId: 'T2' }); });
+    client.onUserMessage(() => { throw new Error('Bound action reached ordinary callback'); }, {
+      onBoundCodexSteer: createCodexPendingInputBoundSteerHandler({
+        turnBindings, getRuntime: () => runtime, isAdmissionOpen: () => true, steer,
+        refuse: async () => { bridge.observeRejectedBeforeEffect({ localIds: [localId], reason: 'steering_unavailable' }); },
+      }),
+    });
+    const materialized = createProviderDeliveryMaterializeResult(localId);
+    let attempt = 0;
+    vi.spyOn(axios, 'patch').mockImplementation(async (_url, body) => {
+      attempt += 1;
+      if (attempt === 2) {
+        await block.promise;
+        await vi.waitFor(() => expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(false));
+        sessionSocketStub!.trigger('update', {
+          id: 'retry-action-unblocked', createdAt: Date.now(),
+          body: { t: 'pending-changed', sid: client.sessionId, pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 3 },
+        });
+      }
+      const requestedAction = (body as { requestedAction: unknown }).requestedAction;
+      materializeNextMock.mockReset();
+      materializeNextMock.mockResolvedValueOnce({ ...materialized, message: { ...materialized.message, requestedAction, providerAction: 'steer' } }).mockResolvedValue({ didMaterialize: false });
+      return { data: { ok: true, didUpdate: true, requestedAction } };
+    });
+    const inputConsumer = createSessionProviderInputConsumer({ session: client, messageQueue: new MessageQueue2<{ id: string }>(() => 'mode'), activeTurnSteerability: 'steerable' });
+    const control = createCodexPendingInputSteerControl({ session: client, runtime, inputConsumer, turnBindings, isAdmissionOpen: () => true, getDispatchSignal: () => new AbortController().signal });
+    await expect(control({ sessionId: client.sessionId, localId })).resolves.toMatchObject({ ok: false, errorCode: 'steering_unavailable' });
+    expect(turnBindings.has(localId)).toBe(false);
+    expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
+    const retry = control({ sessionId: client.sessionId, localId });
+    await vi.waitFor(() => expect(turnBindings.get(localId)?.turnId).toBe('T2'));
+    if (settled) {
+      block.resolve({ pendingQueueState: { known: true, pendingCount: 1, pendingBlockedCount: 1, pendingVersion: 2 } });
+    } else {
+      block.reject(new Error('original durable block response lost'));
+    }
+    const result = await retry;
+    if (settled) {
+      expect(steer).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({ ok: true, status: 'admitted_and_steered', sessionId: client.sessionId, localId });
+      expect(axios.patch).toHaveBeenCalledTimes(2);
+    } else {
+      expect(steer).not.toHaveBeenCalled();
+      expect(axios.patch).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({ ok: false, errorCode: 'pending_input_steer_unavailable' });
+      expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
+      await expect(client.waitForProviderInputTerminalOutcome(localId)).resolves.toMatchObject({ kind: 'rejected_before_effect', reason: 'steering_unavailable' });
+    }
+  });
+
+  it('[bound-retry-outcome] retains uncertain custody and allows its later qualified acceptance', async () => {
+    const client = await createClient({ latestTurnStatus: 'in_progress', pendingCount: 1, pendingVersion: 1, metadata: { flavor: 'codex' } });
+    await waitForCurrentPendingInputContract(client);
+    const localId = 'uncertain-bound-retry';
+    const materialized = createProviderDeliveryMaterializeResult(localId);
+    materializeNextMock.mockResolvedValueOnce({ ...materialized, message: { ...materialized.message, requestedAction: { v: 1, kind: 'steer_now_bound', bindingId: 'B1' }, providerAction: 'steer' } });
+    const observe = providerInputOutcomeObserver(client);
+    client.onUserMessage(() => { throw new Error('Bound action reached ordinary callback'); }, { onBoundCodexSteer: () => {} });
+    await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+    observe({ kind: 'effect_may_have_occurred', localId });
+    await vi.waitFor(() => expect(blockPendingDeliveryMock).toHaveBeenCalled());
+    const patch = vi.spyOn(axios, 'patch');
+    await expect(client.requestPendingInputSteerNow(localId, 'B2')).resolves.toMatchObject({ kind: 'not_admitted' });
+    expect(patch).not.toHaveBeenCalled();
+    expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
+    await expect(client.waitForProviderInputTerminalOutcome(localId)).resolves.toEqual({ kind: 'pending' });
+    observe({ kind: 'accepted', localId, providerTurnId: 'T1' });
+    await vi.waitFor(() => expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(false));
+  });
+
+  it('[bound-retry-outcome] preserves accepted custody and its terminal observation without another PATCH', async () => {
+    const client = await createClient({ latestTurnStatus: 'in_progress', pendingCount: 1, pendingVersion: 1, metadata: { flavor: 'codex' } });
+    await waitForCurrentPendingInputContract(client);
+    const localId = 'accepted-bound-retry';
+    const settlement = createDeferred<{ didResolve: boolean }>();
+    resolveAcceptedPendingDeliveryMock.mockReturnValueOnce(settlement.promise);
+    const materialized = createProviderDeliveryMaterializeResult(localId);
+    materializeNextMock.mockResolvedValueOnce({ ...materialized, message: { ...materialized.message, requestedAction: { v: 1, kind: 'steer_now_bound', bindingId: 'B1' }, providerAction: 'steer' } });
+    const bridge = createCodexAppServerProviderInputOutcomeBridge(client, { isCurrentRuntimeMode: () => true });
+    client.onUserMessage(() => { throw new Error('Bound action reached ordinary callback'); }, { onBoundCodexSteer: () => {} });
+    await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+    bridge.observeAccepted({ localIds: [localId], providerTurnId: 'T1' });
+    await vi.waitFor(() => expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalled());
+    const patch = vi.spyOn(axios, 'patch');
+    await expect(client.requestPendingInputSteerNow(localId, 'B2')).resolves.toMatchObject({ kind: 'not_admitted' });
+    expect(patch).not.toHaveBeenCalled();
+    expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
+    await expect(client.waitForProviderInputTerminalOutcome(localId)).resolves.toEqual({ kind: 'accepted', providerTurnId: 'T1' });
+    settlement.resolve({ didResolve: true });
+    await vi.waitFor(() => expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(false));
+  });
+
   it('retains acknowledged exact-steer admission when the connection changes after the PATCH', async () => {
     const client = await createClient({ latestTurnStatus: 'in_progress', pendingCount: 1, pendingVersion: 1 });
     await waitForCurrentPendingInputContract(client);

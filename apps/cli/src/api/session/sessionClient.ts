@@ -1588,9 +1588,33 @@ export class ApiSessionClient extends EventEmitter {
         };
     }
 
+    private async waitForCanonicalPendingDeliveryBlockWrites(localId: string): Promise<void> {
+        let write = this.canonicalPendingDeliveryBlockWritesByLocalId.get(localId);
+        while (write) {
+            await write;
+            write = this.canonicalPendingDeliveryBlockWritesByLocalId.get(localId);
+        }
+    }
+
     async requestPendingInputSteerNow(localId: string, bindingId: string): Promise<PendingInputSteerNowAdmission> {
         const exactLocalId = readPendingLocalId(localId);
         if (!exactLocalId) return { kind: 'not_admitted', reason: 'invalid_local_id' };
+        // A proven refusal is retryable only after its existing durable settlement has
+        // retired the old claim and terminal outcome. Never PATCH over retained custody.
+        if (this.canonicalPendingDeliveryBlockWritesByLocalId.has(exactLocalId)) {
+            try {
+                await this.waitForCanonicalPendingDeliveryBlockWrites(exactLocalId);
+            } catch {
+                return { kind: 'admission_uncertain' };
+            }
+        }
+        if (
+            this.canonicalPendingDeliveryByLocalId.has(exactLocalId)
+            || this.providerInputTerminalOutcomeByLocalId.has(exactLocalId)
+            || this.providerInputUncertainLocalIds.has(exactLocalId)
+        ) {
+            return { kind: 'not_admitted', reason: 'unsupported' };
+        }
         const contract = this.sessionSyncPendingInputServerContract;
         if (
             !contract
@@ -1634,6 +1658,20 @@ export class ApiSessionClient extends EventEmitter {
         const exactLocalId = readPendingLocalId(localId);
         if (abortSignal?.aborted) return { kind: 'pending' };
         if (!exactLocalId) return { kind: 'rejected_before_effect' };
+        // The caller installs this observer before its PATCH. Join an older refusal's
+        // settlement first so that observer cannot capture the previous attempt's result.
+        // With no preceding write, registration remains synchronous before the first await.
+        if (
+            this.providerInputTerminalOutcomeByLocalId.get(exactLocalId) === 'rejected_before_effect'
+            && this.canonicalPendingDeliveryBlockWritesByLocalId.has(exactLocalId)
+        ) {
+            try {
+                await this.waitForCanonicalPendingDeliveryBlockWrites(exactLocalId);
+            } catch {
+                return { kind: 'pending' };
+            }
+            if (abortSignal?.aborted) return { kind: 'pending' };
+        }
         const current = this.providerInputTerminalOutcomeByLocalId.get(exactLocalId);
         if (current === 'accepted') {
             const providerTurnId = this.providerInputAcceptedTurnIdByLocalId.get(exactLocalId);
