@@ -524,6 +524,7 @@ const SESSION_CLIENT_TOOL_CALL_CACHE_MAX_ENTRIES = 1_000;
 // stretch the cadence so a saturated relay does not need to fail before we shed reads.
 const PENDING_DISCOVERY_BASE_DELAY_MS = 300_000;
 const PENDING_DISCOVERY_MAX_DELAY_MS = 1_800_000;
+const PENDING_DISCOVERY_MAX_TIMER_DELAY_MS = 2_147_483_647;
 const PENDING_DISCOVERY_FAST_READ_MS = 1_000;
 const PENDING_DISCOVERY_SLOW_READ_MS = 2_000;
 type SessionSnapshotReadResult =
@@ -2050,15 +2051,17 @@ export class ApiSessionClient extends EventEmitter {
         const isCurrent = () => this.isPendingDiscoveryProducerCurrent()
             && this.isAcceptedCanonicalPendingDeliveryOperationCurrent(authority)
             && machineId === this.sessionSocketMachineId;
-        const delayMs = Math.max(
+        const delayMs = Math.min(PENDING_DISCOVERY_MAX_TIMER_DELAY_MS, Math.max(
             Math.min(PENDING_DISCOVERY_MAX_DELAY_MS,
                 Math.round(this.pendingDiscoveryDelayMs * (0.8 + Math.random() * 0.4))),
             this.pendingDiscoveryNotBeforeMs - Date.now(),
-        );
+        ));
         this.pendingDiscoveryTimer = setTimeout(() => {
             this.pendingDiscoveryTimer = null;
             if (!isCurrent()) return;
-            if (this.shouldDeferPendingDiscovery()) {
+            // A server floor may arrive after this timer was armed, or outlive one
+            // supported timer chunk. Neither case permits an early authoritative read.
+            if (Date.now() < this.pendingDiscoveryNotBeforeMs || this.shouldDeferPendingDiscovery()) {
                 this.schedulePendingDiscovery();
                 return;
             }
@@ -2076,9 +2079,6 @@ export class ApiSessionClient extends EventEmitter {
         if (result.status === 'failed') {
             this.pendingDiscoveryReadFailed = true;
             this.pendingDiscoveryDelayMs = Math.min(PENDING_DISCOVERY_MAX_DELAY_MS, this.pendingDiscoveryDelayMs * 2);
-            if (result.retryAfterMs !== undefined) {
-                this.pendingDiscoveryNotBeforeMs = Math.max(this.pendingDiscoveryNotBeforeMs, Date.now() + result.retryAfterMs);
-            }
             logger.infoFile('[pendingQueue] authoritative discovery read failed', {
                 sessionId: this.sessionId,
                 retryable: result.retryable,
@@ -2342,12 +2342,18 @@ export class ApiSessionClient extends EventEmitter {
                     pendingQueueState: update.pendingQueueState ?? null, archived: false,
                 };
             } catch (error) {
+                const classification = classifyServerEndpointError(error);
+                // Pacing belongs to this same session request even after provider rebind.
+                // It grants no authority to apply stale state or renew consumer eligibility.
+                if (!this.closed && !this.runtimeTerminationStarted && !lifetimeSignal.aborted
+                    && classification.retryAfterMs !== undefined) {
+                    this.pendingDiscoveryNotBeforeMs = Math.max(this.pendingDiscoveryNotBeforeMs, Date.now() + classification.retryAfterMs);
+                }
                 if (!isCurrent()) return { status: 'obsolete' };
                 logger.debug('[API] Failed to sync session snapshot from server', {
                     reason: opts.reason,
                     error: serializeAxiosErrorForLog(error),
                 });
-                const classification = classifyServerEndpointError(error);
                 return { status: 'failed', retryable: !isPermanentRequestError(error), retryAfterMs: classification.retryAfterMs };
             }
         })();
