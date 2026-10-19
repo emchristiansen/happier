@@ -1697,30 +1697,43 @@ describe('ApiSessionClient session.userMessage.send delivery', () => {
     });
     userSocketStub = createApiSessionSocketStub({ connected: true, emitWithAckResult: { ok: true } });
 
-    const client = new ApiSessionClient('tok', createPlainSessionFixture({ id: 's1' }));
+    const client = new ApiSessionClient('tok', createPlainClaudeSessionFixture('s1'));
     await waitForCurrentPendingInputContract(client);
+    const observe = client.bindProviderInputOutcomeProducer(createProviderInputOutcomeProducer());
 
     const received: any[] = [];
     client.onUserMessage((msg) => received.push(msg));
 
-    await (client as any).enqueueSessionUserMessage({
-      text: 'first',
-      meta: { source: 'ui', sentFrom: 'ios' },
-    });
-    await (client as any).enqueueSessionUserMessage({
-      text: 'second',
-      meta: { source: 'ui', sentFrom: 'ios' },
-    });
-    await (client as any).enqueueSessionUserMessage({
-      text: 'third',
-      localId: 'l3',
-      meta: { source: 'ui', sentFrom: 'ios' },
-    });
-    await (client as any).enqueueSessionUserMessage({
-      text: 'fourth',
-      localId: 'l4',
-      meta: { source: 'ui', sentFrom: 'ios' },
-    });
+    for (const [index, prompt] of [
+      { text: 'first' },
+      { text: 'second' },
+      { text: 'third', localId: 'l3' },
+      { text: 'fourth', localId: 'l4' },
+    ].entries()) {
+      expect(await client.enqueueSessionUserMessage({
+        ...prompt,
+        meta: { source: 'ui', sentFrom: 'ios' },
+      })).toEqual({ providerAcceptancePending: true });
+      expect(received).toHaveLength(index + 1);
+      const localId = received[index].localId;
+      expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
+      expect(resolveAcceptedPendingQueueV2DeliveryMock).toHaveBeenCalledTimes(index);
+      const materializationCount = materializeNextPendingQueueV2MessageMock.mock.calls.length;
+      await expect(client.materializeNextPendingMessageSafely()).resolves.toEqual({ type: 'no_pending' });
+      expect(materializeNextPendingQueueV2MessageMock).toHaveBeenCalledTimes(materializationCount);
+      expect(received).toHaveLength(index + 1);
+      expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
+
+      // Enqueue admission leaves exact provider custody pending. Settle it through the
+      // existing outcome owner before expecting a later distinct prompt to materialize.
+      observe({ kind: 'accepted', localId });
+      await vi.waitFor(() => expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(false));
+      expect(resolveAcceptedPendingQueueV2DeliveryMock).toHaveBeenNthCalledWith(index + 1, {
+        socket: sessionSocketStub,
+        sessionId: 's1',
+        localId,
+      });
+    }
 
     expect(received.map((message) => message?.content?.text)).toEqual([
       'first',
@@ -1729,6 +1742,9 @@ describe('ApiSessionClient session.userMessage.send delivery', () => {
       'fourth',
     ]);
     expect(new Set(received.map((message) => message?.localId)).size).toBe(4);
+    expect(received[2]?.localId).toBe('l3');
+    expect(received[3]?.localId).toBe('l4');
+    await client.close();
   });
 
   it('defaults session.userMessage.send meta source/sentFrom to ui when missing', async () => {
