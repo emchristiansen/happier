@@ -1,9 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
+import axios from 'axios';
+import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
 
 import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import { HttpStatusError } from '@/api/client/httpStatusError';
+import type { RpcHandler } from '@/api/rpc/types';
+import { requestPendingQueueV2SteerNow } from '@/api/session/pendingQueueV2Transport';
 import type { MaterializeNextPendingResult } from '@/api/session/sessionClientPort';
 import type { RuntimeActivitySnapshotTail } from '@/api/session/mutations/createSessionMutationOutbox';
+import { createCodexPendingInputSteerControl } from '@/backends/codex/runCodex';
+import { registerSessionControlHandlers } from '@/rpc/handlers/sessionControls';
 import { logger } from '@/ui/logger';
 
 import {
@@ -35,6 +41,86 @@ function createDrainConsumer(
 }
 
 describe('SessionProviderInputConsumer drainPending', () => {
+  it('keeps the selected opaque row identity through the RPC, Codex factory, PATCH and drain', async () => {
+    const rows = new Map<string, { requestedAction?: 'steer_now'; claimed: boolean }>([
+      ['x', { claimed: false }],
+      [' x ', { claimed: false }],
+    ]);
+    const patch = vi.spyOn(axios, 'patch').mockImplementation(async (url) => {
+      const localId = decodeURIComponent(new URL(String(url)).pathname.split('/')[5]);
+      const row = rows.get(localId);
+      if (!row) throw new Error('Selected pending row does not exist');
+      row.requestedAction = 'steer_now';
+      return { data: { ok: true, didUpdate: true, requestedAction: { v: 1, kind: 'steer_now' } } };
+    });
+    const materializeNextPendingMessageSafely = vi.fn(async (opts?: { requestedLocalId?: string }) => {
+      const localId = opts?.requestedLocalId;
+      if (localId === undefined) throw new Error('Exact pending row identity is required');
+      const row = rows.get(localId);
+      if (!row || row.requestedAction !== 'steer_now') throw new Error('Exact pending row was not admitted');
+      row.claimed = true;
+      return { type: 'materialized' as const, localId, seq: 12, content: null };
+    });
+    const consumer = createDrainConsumer({
+      materializeNextPendingMessageSafely,
+      waitForPendingEligibilityUpdate: async () => false,
+    });
+    const waitForProviderInputTerminalOutcome = vi.fn(async () => ({
+      kind: 'accepted' as const,
+      providerTurnId: 'turn-1',
+    }));
+    const turnBindings = new Map<string, { turnId: string }>();
+    const handlers = new Map<string, RpcHandler>();
+    registerSessionControlHandlers({
+      registerHandler: (method, handler) => { handlers.set(method, handler); },
+    }, {
+      sessionRuntimeControls: {
+        interruptPendingInputAndRun: createCodexPendingInputSteerControl({
+          session: {
+            sessionId: 'session-1',
+            requestPendingInputSteerNow: async (localId) => {
+              await requestPendingQueueV2SteerNow({ token: 'token', sessionId: 'session-1', localId });
+              return { kind: 'admitted' };
+            },
+            waitForProviderInputTerminalOutcome,
+          },
+          runtime: { getActiveSteerableTurnId: async () => 'turn-1' },
+          inputConsumer: consumer,
+          turnBindings,
+        }),
+      },
+    });
+
+    try {
+      const handler = handlers.get(SESSION_RPC_METHODS.SESSION_PENDING_INPUT_INTERRUPT_AND_RUN);
+      if (!handler) throw new Error('Pending interrupt-and-run RPC was not registered');
+      const result = await handler({ sessionId: 'session-1', localId: ' x ' });
+      expect(rows.get('x')).toEqual({ claimed: false });
+      expect(rows.get(' x ')).toEqual({ requestedAction: 'steer_now', claimed: true });
+      expect(result).toEqual({
+        ok: true,
+        status: 'admitted_and_steered',
+        sessionId: 'session-1',
+        localId: ' x ',
+      });
+      expect(patch).toHaveBeenCalledTimes(1);
+      expect(patch).toHaveBeenCalledWith(
+        expect.stringMatching(/\/v2\/sessions\/session-1\/pending\/%20x%20\/action$/),
+        { requestedAction: { v: 1, kind: 'steer_now' } },
+        expect.any(Object),
+      );
+      expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(1);
+      expect(materializeNextPendingMessageSafely).toHaveBeenCalledWith(expect.objectContaining({
+        requestedLocalId: ' x ',
+      }));
+      expect(waitForProviderInputTerminalOutcome).toHaveBeenCalledWith(' x ', 10_000, expect.any(AbortSignal));
+      expect(turnBindings.has(' x ')).toBe(true);
+      expect(turnBindings.has('x')).toBe(false);
+    } finally {
+      patch.mockRestore();
+    }
+  });
+
   it('passes an exact requested localId through one canonical drain pass', async () => {
     const materializeNextPendingMessageSafely = vi.fn(async () => ({ type: 'no_pending' as const }));
     const consumer = createDrainConsumer({

@@ -1,9 +1,11 @@
 import { z } from 'zod';
 
+import { PendingLocalIdSchema } from '../sessionMessages/pendingLocalId.js';
+
 export const SessionPendingInputInterruptAndRunRequestV1Schema = z
   .object({
     sessionId: z.string().trim().min(1),
-    localId: z.string().trim().min(1),
+    localId: PendingLocalIdSchema,
     expectedStateAtMs: z.number().int().nonnegative().optional(),
   })
   .passthrough();
