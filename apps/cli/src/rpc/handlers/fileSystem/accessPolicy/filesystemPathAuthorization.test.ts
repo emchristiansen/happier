@@ -224,9 +224,10 @@ describe('dedicated private native domain restriction', () => {
     mkdirSync(ordinary);
     writeFileSync(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
     symlinkSync(privateDomain, join(root, 'alias'));
+    symlinkSync(join(ordinary, 'not-created'), join(ordinary, 'dangling'));
     for (const accessPolicy of [{ kind: 'osUser' } as const, { kind: 'restrictedRoots', roots: [root] } as const]) {
       const authorize = await prepareFilesystemPathAuthorizer({ defaultDirectory: root, accessPolicy });
-      for (const targetPath of [join(privateDomain, 'raw.bin'), join(root, 'alias', 'missing', 'later.bin')]) {
+      for (const targetPath of [join(privateDomain, 'raw.bin'), join(root, 'alias', 'missing', 'later.bin'), join(ordinary, 'dangling'), join(ordinary, 'dangling', 'future.bin')]) {
         expect(authorizeFilesystemPath({ targetPath, defaultDirectory: root, accessPolicy }).valid).toBe(false);
         expect((await authorize(targetPath)).valid).toBe(false);
       }

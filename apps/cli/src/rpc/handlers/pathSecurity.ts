@@ -1,4 +1,5 @@
 import { lstatSync, realpathSync } from 'fs';
+import { lstat, realpath } from 'fs/promises';
 import { basename, dirname, isAbsolute, relative, resolve, sep, join } from 'path';
 
 export interface PathValidationResult {
@@ -57,6 +58,46 @@ function resolveReaderPathThroughExistingAncestor(targetPath: string): string {
     }
 }
 
+async function hasPrivateNativeDomainAncestorAsync(targetPath: string): Promise<boolean> {
+    for (let candidate = targetPath;; candidate = dirname(candidate)) {
+        try {
+            await lstat(join(candidate, PRIVATE_NATIVE_DOMAIN_MARKER));
+            return true;
+        } catch (error) {
+            if (!isMissingPath(error)) throw error;
+        }
+        if (dirname(candidate) === candidate) return false;
+    }
+}
+
+async function resolveReaderPathThroughExistingAncestorAsync(targetPath: string): Promise<string> {
+    let candidate = targetPath;
+    const missing: string[] = [];
+    for (;;) {
+        try {
+            // The synchronous JS realpath resolver normalizes '..' before following symlinks.
+            // Native resolution preserves the identity used by read/open, including
+            // when only an existing ancestor of a future write target is present.
+            return resolve(await realpath(candidate), ...missing);
+        } catch (error) {
+            if (!isMissingPath(error)) throw error;
+            // Do not discard a symlink whose target cannot be resolved. Its
+            // missing destination may belong to a different restricted domain.
+            let unresolvedSymlink = false;
+            try {
+                unresolvedSymlink = (await lstat(candidate)).isSymbolicLink();
+            } catch (inspectionError) {
+                if (!isMissingPath(inspectionError)) throw inspectionError;
+            }
+            if (unresolvedSymlink) throw error;
+            const parent = dirname(candidate);
+            if (parent === candidate) throw error;
+            missing.unshift(basename(candidate));
+            candidate = parent;
+        }
+    }
+}
+
 /** Ordinary readers may not open a dedicated private native domain.
  * This negative restriction is independent of workspace or os-user authority.
  * Check lexical ancestors and both native path identities: consumers may open
@@ -69,6 +110,21 @@ export function validateOrdinaryReaderPath(targetPath: string): PathValidationRe
         if (hasPrivateNativeDomainAncestor(lexical)
             || hasPrivateNativeDomainAncestor(resolveReaderPathThroughExistingAncestor(targetPath))
             || hasPrivateNativeDomainAncestor(resolveReaderPathThroughExistingAncestor(lexical))) {
+            return { valid: false, error: 'Access denied: private native domain' };
+        }
+        return { valid: true, resolvedPath: lexical };
+    } catch {
+        return { valid: false, error: 'Access denied: unable to inspect private native domain restriction; values not shown' };
+    }
+}
+
+/** Same restriction with native-equivalent asynchronous filesystem inspection. */
+export async function validateOrdinaryReaderPathAsync(targetPath: string): Promise<PathValidationResult> {
+    try {
+        const lexical = resolve(targetPath);
+        if (await hasPrivateNativeDomainAncestorAsync(lexical)
+            || await hasPrivateNativeDomainAncestorAsync(await resolveReaderPathThroughExistingAncestorAsync(targetPath))
+            || await hasPrivateNativeDomainAncestorAsync(await resolveReaderPathThroughExistingAncestorAsync(lexical))) {
             return { valid: false, error: 'Access denied: private native domain' };
         }
         return { valid: true, resolvedPath: lexical };

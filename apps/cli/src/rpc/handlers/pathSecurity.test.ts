@@ -1,6 +1,6 @@
 import { resolve } from 'path';
 import { afterAll, describe, it, expect } from 'vitest';
-import { validateOrdinaryReaderPath, validatePath, validateWorkspaceInspectionPath } from './pathSecurity';
+import { validateOrdinaryReaderPath, validateOrdinaryReaderPathAsync, validatePath, validateWorkspaceInspectionPath } from './pathSecurity';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, rmSync, existsSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -167,8 +167,11 @@ describe('validateWorkspaceInspectionPath', () => {
 });
 
 
-describe('dedicated private native domain restriction', () => {
-    it.skipIf(process.platform === 'win32')('[SH-IO28-004] refuses a normalized canonical private path when the original native path is ordinary', () => {
+describe.each([
+    ['synchronous', validateOrdinaryReaderPath],
+    ['asynchronous', validateOrdinaryReaderPathAsync],
+] as const)('dedicated private native domain restriction (%s)', (_mode, validateReaderPath) => {
+    it.skipIf(process.platform === 'win32')('[SH-IO28-004] refuses a normalized canonical private path when the original native path is ordinary', async () => {
         const root = mkdtempSync(join(tmpdir(), 'happier-inverse-path-identity-'));
         try {
             const ordinary = join(root, 'ordinary');
@@ -184,7 +187,7 @@ describe('dedicated private native domain restriction', () => {
             const requested = `${ordinary}/alias/../raw`;
             expect(realpathSync.native(requested)).toBe(join(other, 'raw'));
             expect(realpathSync.native(resolve(requested))).toBe(join(privateDomain, 'subdir'));
-            expect(validateOrdinaryReaderPath(requested).valid).toBe(false);
+            expect((await validateReaderPath(requested)).valid).toBe(false);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -192,7 +195,7 @@ describe('dedicated private native domain restriction', () => {
 
     it.skipIf(process.platform === 'win32').each([
         ['private', 'file'], ['ordinary', 'file'], ['private', 'directory'], ['ordinary', 'directory'],
-    ] as const)('[SH-IO28-005] refuses an unresolved %s dangling %s target', (home, kind) => {
+    ] as const)('[SH-IO28-005] refuses an unresolved %s dangling %s target', async (home, kind) => {
         const root = mkdtempSync(join(tmpdir(), 'happier-dangling-path-identity-'));
         try {
             const ordinary = join(root, 'ordinary');
@@ -204,15 +207,15 @@ describe('dedicated private native domain restriction', () => {
             const link = join(ordinary, 'link');
             symlinkSync(target, link);
             expect(existsSync(target)).toBe(false);
-            expect(validateOrdinaryReaderPath(kind === 'file' ? link : `${link}/future.bin`).valid).toBe(false);
-            expect(validateOrdinaryReaderPath(join(ordinary, 'plain', 'future.bin')).valid).toBe(true);
+            expect((await validateReaderPath(kind === 'file' ? link : `${link}/future.bin`)).valid).toBe(false);
+            expect((await validateReaderPath(join(ordinary, 'plain', 'future.bin'))).valid).toBe(true);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
     });
 
     it.skipIf(process.platform === 'win32').each(['raw.bin', 'missing/future.bin'])(
-        '[path-identity] refuses a private effective path through a symlink before ..: %s', (suffix) => {
+        '[path-identity] refuses a private effective path through a symlink before ..: %s', async (suffix) => {
             const root = mkdtempSync(join(tmpdir(), 'happier-private-path-identity-'));
             try {
                 const privateDomain = join(root, 'private');
@@ -231,14 +234,14 @@ describe('dedicated private native domain restriction', () => {
                     expect(readFileSync(requested)).toEqual(original);
                     expect(readFileSync(resolve(requested))).not.toEqual(original);
                 }
-                expect(validateOrdinaryReaderPath(requested).valid).toBe(false);
+                expect((await validateReaderPath(requested)).valid).toBe(false);
             } finally {
                 rmSync(root, { recursive: true, force: true });
             }
         },
     );
 
-    it.skipIf(process.platform === 'win32')('[path-identity] preserves the lexical restriction when a symlink leaves a marked domain', () => {
+    it.skipIf(process.platform === 'win32')('[path-identity] preserves the lexical restriction when a symlink leaves a marked domain', async () => {
         const root = mkdtempSync(join(tmpdir(), 'happier-private-lexical-identity-'));
         try {
             const privateDomain = join(root, 'private');
@@ -250,13 +253,13 @@ describe('dedicated private native domain restriction', () => {
             symlinkSync(join(ordinary, 'child'), join(privateDomain, 'alias'));
             const requested = `${privateDomain}/alias/../raw.bin`;
             expect(realpathSync.native(requested)).toBe(join(ordinary, 'raw.bin'));
-            expect(validateOrdinaryReaderPath(requested).valid).toBe(false);
+            expect((await validateReaderPath(requested)).valid).toBe(false);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
     });
 
-    it.skipIf(process.platform === 'win32')('[path-identity] allows ordinary effective paths and missing descendants', () => {
+    it.skipIf(process.platform === 'win32')('[path-identity] allows ordinary effective paths and missing descendants', async () => {
         const root = mkdtempSync(join(tmpdir(), 'happier-ordinary-path-identity-'));
         try {
             mkdirSync(join(root, 'actual', 'child'), { recursive: true });
@@ -265,15 +268,18 @@ describe('dedicated private native domain restriction', () => {
             writeFileSync(join(root, 'actual', 'raw.bin'), original);
             writeFileSync(join(root, 'raw.bin'), Buffer.from([1, 2, 3]));
             const requested = `${root}/alias/../raw.bin`;
-            expect(validateOrdinaryReaderPath(requested).valid).toBe(true);
+            expect((await validateReaderPath(requested)).valid).toBe(true);
             expect(readFileSync(requested)).toEqual(original);
             expect(readFileSync(resolve(requested))).not.toEqual(original);
-            expect(validateOrdinaryReaderPath(`${root}/alias/../missing/future.bin`).valid).toBe(true);
+            expect((await validateReaderPath(`${root}/alias/../missing/future.bin`)).valid).toBe(true);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
     });
 
+});
+
+describe('dedicated private native domain legacy workspace restriction', () => {
     it('refuses legacy workspace reads through aliases and missing descendants while preserving ordinary neighbors', () => {
         const root = mkdtempSync(join(tmpdir(), 'happier-private-path-'));
         try {

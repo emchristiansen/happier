@@ -9,6 +9,8 @@ import type { RpcHandlerRegistrar } from '@/api/rpc/types';
 
 const filesystemProbe = vi.hoisted(() => ({
   realpathSyncCalls: 0,
+  realpathNativeSyncCalls: 0,
+  lstatSyncCalls: 0,
   realpathCallsByPath: new Map<string, number>(),
   readFileCallsByPath: new Map<string, number>(),
 }));
@@ -17,9 +19,18 @@ vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
   return {
     ...actual,
-    realpathSync: (...args: Parameters<typeof actual.realpathSync>) => {
+    realpathSync: Object.assign((...args: Parameters<typeof actual.realpathSync>) => {
       filesystemProbe.realpathSyncCalls += 1;
       return actual.realpathSync(...args);
+    }, {
+      native: (...args: Parameters<typeof actual.realpathSync.native>) => {
+        filesystemProbe.realpathNativeSyncCalls += 1;
+        return actual.realpathSync.native(...args);
+      },
+    }),
+    lstatSync: (...args: Parameters<typeof actual.lstatSync>) => {
+      filesystemProbe.lstatSyncCalls += 1;
+      return actual.lstatSync(...args);
     },
   };
 });
@@ -62,6 +73,8 @@ describe('workspace favicon event-loop responsiveness', () => {
 
   afterEach(() => {
     filesystemProbe.realpathSyncCalls = 0;
+    filesystemProbe.realpathNativeSyncCalls = 0;
+    filesystemProbe.lstatSyncCalls = 0;
     filesystemProbe.realpathCallsByPath.clear();
     filesystemProbe.readFileCallsByPath.clear();
     for (const dir of tempDirs.splice(0)) {
@@ -90,15 +103,19 @@ describe('workspace favicon event-loop responsiveness', () => {
     if (!handler) throw new Error('expected workspace favicon handler');
 
     filesystemProbe.realpathSyncCalls = 0;
+    filesystemProbe.realpathNativeSyncCalls = 0;
+    filesystemProbe.lstatSyncCalls = 0;
     await expect(handler({ workspacePath: workspace })).resolves.toEqual({ success: true, found: false });
 
     expect(filesystemProbe.realpathSyncCalls).toBe(0);
+    expect(filesystemProbe.realpathNativeSyncCalls).toBe(0);
+    expect(filesystemProbe.lstatSyncCalls).toBe(0);
     for (const root of unrelatedRoots) {
       expect(filesystemProbe.realpathCallsByPath.get(root)).toBe(1);
     }
   });
 
-  it('returns a direct favicon without reading lower-priority source files', async () => {
+  it.each(['restrictedRoots', 'osUser'] as const)('returns a direct favicon without reading lower-priority source files (%s)', async (kind) => {
     const workspace = mkdtempSync(join(tmpdir(), 'happier-workspace-favicon-direct-'));
     tempDirs.push(workspace);
     const sourcePath = join(workspace, 'index.html');
@@ -108,7 +125,7 @@ describe('workspace favicon event-loop responsiveness', () => {
     const { handlers, registrar } = createRegistrar();
     registerWorkspaceFaviconHandlers(registrar, {
       defaultDirectory: workspace,
-      accessPolicy: { kind: 'restrictedRoots', roots: [workspace] },
+      accessPolicy: kind === 'osUser' ? { kind } : { kind, roots: [workspace] },
     });
 
     const handler = handlers.get(RPC_METHODS.WORKSPACE_FAVICON_RESOLVE);
@@ -120,6 +137,9 @@ describe('workspace favicon event-loop responsiveness', () => {
       relativePath: 'favicon.svg',
     });
     expect(filesystemProbe.readFileCallsByPath.get(sourcePath) ?? 0).toBe(0);
+    expect(filesystemProbe.realpathSyncCalls).toBe(0);
+    expect(filesystemProbe.realpathNativeSyncCalls).toBe(0);
+    expect(filesystemProbe.lstatSyncCalls).toBe(0);
   });
 
   it('keeps brace-sparse source parsing bounded', async () => {
