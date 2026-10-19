@@ -52,10 +52,10 @@ export class SessionArchiveInputAdmission {
             // Cleanup is bound to the observing runner, never rediscovered by session ID.
             void Promise.resolve().then(this.opts.requestArchivedStop).then((outcome) => {
               if (outcome.kind === 'unavailable') {
-                logger.debug('[archiveAdmission] exact local cleanup owner unavailable; input refused, physical cleanup unconfirmed');
+                logger.infoFile('[archiveAdmission] exact local cleanup owner unavailable; input refused, physical cleanup unconfirmed');
               }
             }).catch(() => {
-              logger.debug('[archiveAdmission] archived physical stop request failed; error details not shown');
+              logger.infoFile('[archiveAdmission] exact local cleanup request failed; input refused, physical cleanup unconfirmed; error details not shown');
             });
             return { kind: 'refused' } as const;
           }

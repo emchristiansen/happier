@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -15,6 +15,10 @@ import { createSessionProviderInputConsumer } from './SessionProviderInputConsum
 import { DeferredApiSessionClient, type DeferredApiSessionTarget } from '@/agent/runtime/startup/DeferredApiSessionClient';
 import { runClaudeUnifiedTerminalSession } from '@/backends/claude/unifiedTerminal/runClaudeUnifiedTerminalSession';
 import type { TerminalAttachmentId, TerminalHostAdapter, TerminalHostHandle } from '@/integrations/terminalHost/_types';
+import { logger } from '@/ui/logger';
+
+// Exercise the real session logger at its normal level, including when CI enables DEBUG.
+vi.hoisted(() => { vi.stubEnv('HAPPIER_LOG_LEVEL', 'info'); });
 
 const origin = 'https://relay.example.invalid';
 const sessionId = 'cf1archiveadmission00000000';
@@ -166,16 +170,41 @@ describe('archived session input admission', () => {
   });
 
   it.each(['unavailable', 'failed'] as const)('keeps input refused when exact local cleanup is %s', async (cleanupState) => {
-    readArchive = async () => ({ status: 200, data: { session: { ...record(), archivedAt: 42 } } });
+    const read = createDeferred<unknown>();
+    const readStarted = createDeferred<void>();
+    readArchive = async () => { readStarted.resolve(); return await read.promise; };
     const cleanup = vi.fn(async () => {
       if (cleanupState === 'failed') throw new Error('injected owned cleanup failure');
       return { kind: 'unavailable' as const };
     });
     const { consumer, queue } = await createConsumer(sessionId, cleanup);
+    logger.infoFile('[archiveAdmission test] normal-info baseline');
+    logger.flushSync();
+    const before = await readFile(logger.getLogPath(), 'utf8');
+    const debugMarker = `[archiveAdmission test] debug-only ${cleanupState}`;
+    logger.debug(debugMarker);
     queue.push('retained body', { id: 'retained-mode' }, { userMessageLocalId: 'retained-id' });
-    await expect(consumer.waitForNextInput({ abortSignal: new AbortController().signal })).resolves.toBeNull();
+    const input = consumer.waitForNextInput({ abortSignal: new AbortController().signal });
+    await readStarted.promise;
+    const successorCleanup = vi.fn(async () => ({ kind: 'requested' as const }));
+    await createConsumer(sessionId, successorCleanup);
+    read.resolve({ status: 200, data: { session: { ...record(), archivedAt: 42 } } });
+    await expect(input).resolves.toBeNull();
     await expect(consumer.waitForNextInput({ abortSignal: new AbortController().signal })).resolves.toBeNull();
     await vi.waitFor(() => expect(cleanup).toHaveBeenCalledTimes(1));
+    await vi.waitFor(async () => {
+      logger.flushSync();
+      const entries = (await readFile(logger.getLogPath(), 'utf8')).slice(before.length);
+      expect(entries).toContain(cleanupState === 'unavailable' ? 'cleanup owner unavailable' : 'cleanup request failed');
+      expect(entries).toContain('input refused, physical cleanup unconfirmed');
+      expect(entries).not.toContain(debugMarker);
+    });
+    const dispatch = vi.fn(async () => 'must not accept retained input');
+    await expect(consumer.runProviderInputDispatch({
+      abortSignal: new AbortController().signal, dispatch,
+    })).resolves.toEqual({ status: 'cancelled' });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(successorCleanup).not.toHaveBeenCalled();
     expect(queue.size()).toBe(1);
   });
 
