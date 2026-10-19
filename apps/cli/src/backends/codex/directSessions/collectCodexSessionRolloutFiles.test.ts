@@ -77,6 +77,12 @@ describe('collectCodexSessionRolloutFiles', () => {
 
 
 describe('dedicated private native domain rollout collection', () => {
+  beforeEach(async () => {
+    readdirMock.mockReset();
+    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    readdirMock.mockImplementation(actual.readdir);
+  });
+
   it('refuses a symlinked private sessions root before readdir', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-private-rollout-alias-'));
     const home = join(root, 'ordinary');
