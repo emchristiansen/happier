@@ -34,7 +34,10 @@ function resolveReaderPathThroughExistingAncestor(targetPath: string): string {
     const missing: string[] = [];
     for (;;) {
         try {
-            return resolve(realpathSync(candidate), ...missing);
+            // The JS realpath resolver normalizes '..' before following symlinks.
+            // Native resolution preserves the identity used by read/open, including
+            // when only an existing ancestor of a future write target is present.
+            return resolve(realpathSync.native(candidate), ...missing);
         } catch (error) {
             if (!isMissingPath(error)) throw error;
             const parent = dirname(candidate);
@@ -53,7 +56,7 @@ export function validateOrdinaryReaderPath(targetPath: string): PathValidationRe
     try {
         const lexical = resolve(targetPath);
         if (hasPrivateNativeDomainAncestor(lexical)
-            || hasPrivateNativeDomainAncestor(resolveReaderPathThroughExistingAncestor(lexical))) {
+            || hasPrivateNativeDomainAncestor(resolveReaderPathThroughExistingAncestor(targetPath))) {
             return { valid: false, error: 'Access denied: private native domain' };
         }
         return { valid: true, resolvedPath: lexical };

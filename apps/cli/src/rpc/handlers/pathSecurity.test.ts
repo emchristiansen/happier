@@ -1,7 +1,7 @@
 import { resolve } from 'path';
 import { afterAll, describe, it, expect } from 'vitest';
-import { validatePath, validateWorkspaceInspectionPath } from './pathSecurity';
-import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, rmSync, existsSync, writeFileSync } from 'fs';
+import { validateOrdinaryReaderPath, validatePath, validateWorkspaceInspectionPath } from './pathSecurity';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, rmSync, existsSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -168,6 +168,69 @@ describe('validateWorkspaceInspectionPath', () => {
 
 
 describe('dedicated private native domain restriction', () => {
+    it.skipIf(process.platform === 'win32').each(['raw.bin', 'missing/future.bin'])(
+        '[path-identity] refuses a private effective path through a symlink before ..: %s', (suffix) => {
+            const root = mkdtempSync(join(tmpdir(), 'happier-private-path-identity-'));
+            try {
+                const privateDomain = join(root, 'private');
+                const ordinary = join(root, 'ordinary');
+                mkdirSync(join(privateDomain, 'child'), { recursive: true });
+                mkdirSync(ordinary);
+                writeFileSync(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+                const original = Buffer.from([0, 255, 128, 10]);
+                writeFileSync(join(privateDomain, 'raw.bin'), original);
+                writeFileSync(join(ordinary, 'raw.bin'), Buffer.from([1, 2, 3]));
+                symlinkSync(join(privateDomain, 'child'), join(ordinary, 'alias'));
+                // Preserve the actual open path; join/resolve would collapse away the symlink.
+                const requested = `${ordinary}/alias/../${suffix}`;
+                if (suffix === 'raw.bin') {
+                    expect(realpathSync.native(requested)).toBe(join(privateDomain, 'raw.bin'));
+                    expect(readFileSync(requested)).toEqual(original);
+                    expect(readFileSync(resolve(requested))).not.toEqual(original);
+                }
+                expect(validateOrdinaryReaderPath(requested).valid).toBe(false);
+            } finally {
+                rmSync(root, { recursive: true, force: true });
+            }
+        },
+    );
+
+    it.skipIf(process.platform === 'win32')('[path-identity] preserves the lexical restriction when a symlink leaves a marked domain', () => {
+        const root = mkdtempSync(join(tmpdir(), 'happier-private-lexical-identity-'));
+        try {
+            const privateDomain = join(root, 'private');
+            const ordinary = join(root, 'ordinary');
+            mkdirSync(privateDomain);
+            mkdirSync(join(ordinary, 'child'), { recursive: true });
+            writeFileSync(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+            writeFileSync(join(ordinary, 'raw.bin'), Buffer.from([0, 255, 128, 10]));
+            symlinkSync(join(ordinary, 'child'), join(privateDomain, 'alias'));
+            const requested = `${privateDomain}/alias/../raw.bin`;
+            expect(realpathSync.native(requested)).toBe(join(ordinary, 'raw.bin'));
+            expect(validateOrdinaryReaderPath(requested).valid).toBe(false);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it.skipIf(process.platform === 'win32')('[path-identity] allows ordinary effective paths and missing descendants', () => {
+        const root = mkdtempSync(join(tmpdir(), 'happier-ordinary-path-identity-'));
+        try {
+            mkdirSync(join(root, 'actual', 'child'), { recursive: true });
+            symlinkSync(join(root, 'actual', 'child'), join(root, 'alias'));
+            const original = Buffer.from([255, 0, 128, 10]);
+            writeFileSync(join(root, 'actual', 'raw.bin'), original);
+            writeFileSync(join(root, 'raw.bin'), Buffer.from([1, 2, 3]));
+            const requested = `${root}/alias/../raw.bin`;
+            expect(validateOrdinaryReaderPath(requested).valid).toBe(true);
+            expect(readFileSync(requested)).toEqual(original);
+            expect(readFileSync(resolve(requested))).not.toEqual(original);
+            expect(validateOrdinaryReaderPath(`${root}/alias/../missing/future.bin`).valid).toBe(true);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it('refuses legacy workspace reads through aliases and missing descendants while preserving ordinary neighbors', () => {
         const root = mkdtempSync(join(tmpdir(), 'happier-private-path-'));
         try {
