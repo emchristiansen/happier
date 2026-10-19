@@ -1793,7 +1793,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     });
     const { createCodexPendingInputSteerControl, createCodexPendingInputBoundSteerHandler } = await import('@/backends/codex/runCodex');
     const turnBindings: Parameters<typeof createCodexPendingInputSteerControl>[0]['turnBindings'] = new Map();
-    const control = createCodexPendingInputSteerControl({ session: original, isAdmissionOpen: () => true,
+    const control = createCodexPendingInputSteerControl({ getDispatchSignal: () => new AbortController().signal, session: original, isAdmissionOpen: () => true,
       runtime: { getActiveSteerableTurnId: async () => 'T1' }, inputConsumer, turnBindings });
     vi.useFakeTimers();
     const result = control({ sessionId: original.sessionId, localId });
@@ -1963,7 +1963,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       activeTurnSteerability: 'steerable',
     });
     const { createCodexPendingInputSteerControl } = await import('@/backends/codex/runCodex');
-    const control = createCodexPendingInputSteerControl({
+    const control = createCodexPendingInputSteerControl({ getDispatchSignal: () => new AbortController().signal,
       session: client,
       isAdmissionOpen: () => true,
       runtime: { getActiveSteerableTurnId: async () => 'captured-native-turn' },
@@ -2024,7 +2024,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     });
     const turnBindings: Parameters<typeof import('@/backends/codex/runCodex').createCodexPendingInputSteerControl>[0]['turnBindings'] = new Map();
     const { createCodexPendingInputSteerControl } = await import('@/backends/codex/runCodex');
-    const control = createCodexPendingInputSteerControl({
+    const control = createCodexPendingInputSteerControl({ getDispatchSignal: () => new AbortController().signal,
       session: client,
       isAdmissionOpen: () => true,
       runtime: { getActiveSteerableTurnId: async () => 'captured-native-turn' },
@@ -2074,7 +2074,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       activeTurnSteerability: 'steerable',
     });
     const { createCodexPendingInputSteerControl } = await import('@/backends/codex/runCodex');
-    const control = createCodexPendingInputSteerControl({
+    const control = createCodexPendingInputSteerControl({ getDispatchSignal: () => new AbortController().signal,
       session: client,
       isAdmissionOpen: () => true,
       runtime: { getActiveSteerableTurnId: async () => 'captured-native-turn' },

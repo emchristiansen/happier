@@ -252,6 +252,7 @@ function attachRuntimeAuthClassificationToError(
 type CodexPendingExactSteerTurnBinding = Readonly<{
     bindingId: string;
     turnId: string;
+    dispatchSignal: AbortSignal;
     runtime: Pick<ReturnType<typeof createCodexAppServerRuntime>, 'getActiveSteerableTurnId'>;
 }>;
 
@@ -261,18 +262,20 @@ export function createCodexPendingInputSteerControl(opts: Readonly<{
     inputConsumer: Pick<SessionProviderInputConsumer<unknown, unknown>, 'drainPending'>;
     turnBindings: Map<string, CodexPendingExactSteerTurnBinding>;
     isAdmissionOpen: () => boolean;
+    getDispatchSignal: () => AbortSignal;
 }>): NonNullable<SessionRuntimeControls['interruptPendingInputAndRun']> {
     return async (request) => {
         const session = opts.session;
+        const dispatchSignal = opts.getDispatchSignal();
         const identity = { sessionId: request.sessionId, localId: request.localId };
-        if (request.sessionId !== session.sessionId || !opts.isAdmissionOpen()) {
+        if (request.sessionId !== session.sessionId || !opts.isAdmissionOpen() || dispatchSignal.aborted) {
             return { ok: false, status: 'stale_state', ...identity };
         }
         const expectedTurnId = await opts.runtime.getActiveSteerableTurnId();
-        if (!expectedTurnId || !opts.isAdmissionOpen() || opts.turnBindings.has(request.localId)) {
+        if (!expectedTurnId || !opts.isAdmissionOpen() || dispatchSignal.aborted || opts.turnBindings.has(request.localId)) {
             return { ok: false, status: 'not_safe', ...identity };
         }
-        const binding: CodexPendingExactSteerTurnBinding = Object.freeze({ bindingId: randomUUID(), turnId: expectedTurnId, runtime: opts.runtime });
+        const binding: CodexPendingExactSteerTurnBinding = Object.freeze({ bindingId: randomUUID(), turnId: expectedTurnId, runtime: opts.runtime, dispatchSignal });
         opts.turnBindings.set(request.localId, binding);
         // The PATCH can publish a Pending wake before its HTTP acknowledgement returns.
         // Observe that delivery before claim settlement is allowed to clear its local outcome.
@@ -353,6 +356,7 @@ export function createCodexPendingInputBoundSteerHandler(opts: Readonly<{
     return async (message, delivery) => {
         const binding = opts.turnBindings.get(delivery.localId);
         const isCurrentBinding = (): boolean => binding !== undefined
+            && !binding.dispatchSignal.aborted
             && binding.bindingId === delivery.requestedAction.bindingId
             && message.localId === delivery.localId
             && opts.turnBindings.get(delivery.localId) === binding
@@ -362,6 +366,10 @@ export function createCodexPendingInputBoundSteerHandler(opts: Readonly<{
             || await binding.runtime.getActiveSteerableTurnId() !== binding.turnId
             || !isCurrentBinding()) {
             await opts.refuse(delivery.localId, delivery.seq);
+            if (binding && binding.bindingId === delivery.requestedAction.bindingId
+                && opts.turnBindings.get(delivery.localId) === binding) {
+                opts.turnBindings.delete(delivery.localId);
+            }
             return;
         }
         await opts.steer(message, { seq: delivery.seq, providerAcceptancePending: true, pendingProviderAction: 'steer' }, {
@@ -1084,6 +1092,7 @@ export async function runCodex(opts: {
     let codexAppServerRuntime: ReturnType<typeof createCodexAppServerRuntime> | null = null;
     let providerInputConsumer: SessionProviderInputConsumer<EnhancedMode, string> | null = null;
     const pendingExactSteerTurnIdByLocalId = new Map<string, CodexPendingExactSteerTurnBinding>();
+    let boundSteerDispatchAbortController = new AbortController();
     let unregisterPendingInputSteerControl: (() => void) | null = null;
     let syncOverridesFromMetadata: () => void = () => {};
     let providerInputAdmissionClosed = false;
@@ -1617,6 +1626,7 @@ export async function runCodex(opts: {
         // Abandon the original bootstrap request before asynchronous abort cleanup.
         initialGoalForStartOrLoad = null;
         startOrLoadAbortController.abort();
+        boundSteerDispatchAbortController.abort();
         try {
             await permissionHandler.abortPendingRequestsAndFlush('Aborted by user');
             // Store the current session ID before aborting for potential resume
@@ -1650,6 +1660,7 @@ export async function runCodex(opts: {
         } finally {
             abortController = new AbortController();
             startOrLoadAbortController = new AbortController();
+            boundSteerDispatchAbortController = new AbortController();
         }
     }
 
@@ -2192,6 +2203,7 @@ export async function runCodex(opts: {
                 runtime: codexAppServerRuntime,
                 inputConsumer,
                 turnBindings: pendingExactSteerTurnIdByLocalId,
+                getDispatchSignal: () => boundSteerDispatchAbortController.signal,
                 isAdmissionOpen: () => !providerInputAdmissionClosed && !abortController.signal.aborted,
             }),
         }) ?? null;

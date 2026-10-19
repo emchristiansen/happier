@@ -42,6 +42,84 @@ function createDrainConsumer(
 }
 
 describe('SessionProviderInputConsumer drainPending', () => {
+  it('[bound-retry] retires a proven early refusal and admits a fresh explicit invocation on T2', async () => {
+    let turn: string | null = 'T1';
+    const runtime = { getActiveSteerableTurnId: async () => turn };
+    const bindings: Parameters<typeof createCodexPendingInputSteerControl>[0]['turnBindings'] = new Map();
+    let outcome = createDeferred<Awaited<ReturnType<import('@/api/session/sessionClient').ApiSessionClient['waitForProviderInputTerminalOutcome']>>>();
+    let actionBinding = '';
+    const admitted: string[] = [];
+    const steer = vi.fn(async () => { outcome.resolve({ kind: 'accepted', providerTurnId: 'T2' }); });
+    const handler = createCodexPendingInputBoundSteerHandler({
+      turnBindings: bindings, getRuntime: () => runtime, isAdmissionOpen: () => true, steer,
+      refuse: async () => { outcome.resolve({ kind: 'rejected_before_effect', reason: 'steering_unavailable' }); },
+    });
+    const control = createCodexPendingInputSteerControl({ getDispatchSignal: () => new AbortController().signal,
+      session: {
+        sessionId: 's1', requestPendingInputSteerNow: async (_localId, bindingId) => {
+          admitted.push(bindingId); actionBinding = bindingId;
+          if (admitted.length === 1) turn = null;
+          return { kind: 'admitted' };
+        },
+        waitForProviderInputTerminalOutcome: async () => outcome.promise,
+      },
+      runtime, turnBindings: bindings, isAdmissionOpen: () => true,
+      inputConsumer: { drainPending: async () => {
+        await handler({ role: 'user', content: { type: 'text', text: 'exact input' }, localId: ' L ' }, {
+          localId: ' L ', requestedAction: { v: 1, kind: 'steer_now_bound', bindingId: actionBinding },
+          providerAction: 'steer', providerAcceptancePending: true, seq: null, isCurrentRegistration: () => true,
+        });
+        return { materialized: 1, stoppedReason: 'max_pop_per_wake' };
+      } },
+    });
+    await expect(control({ sessionId: 's1', localId: ' L ' })).resolves.toMatchObject({ ok: false, errorCode: 'steering_unavailable' });
+    expect(bindings.has(' L ')).toBe(false);
+    turn = 'T2'; outcome = createDeferred();
+    await expect(control({ sessionId: 's1', localId: ' L ' })).resolves.toMatchObject({ ok: true, status: 'admitted_and_steered' });
+    expect(admitted).toHaveLength(2);
+    expect(admitted[1]).not.toBe(admitted[0]);
+    expect(steer).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['replacement', 'failed_refusal', 'uncertain'] as const)('[bound-retry] preserves %s custody', async (kind) => {
+    const runtime = { getActiveSteerableTurnId: async () => null };
+    const binding = Object.freeze({ bindingId: 'B1', turnId: 'T1', runtime, dispatchSignal: new AbortController().signal });
+    const newer = Object.freeze({ bindingId: 'B2', turnId: 'T2', runtime, dispatchSignal: new AbortController().signal });
+    const bindings: Parameters<typeof createCodexPendingInputBoundSteerHandler>[0]['turnBindings'] = new Map([['L', binding]]);
+    const refusal = createDeferred<void>();
+    const handler = createCodexPendingInputBoundSteerHandler({
+      turnBindings: bindings, getRuntime: () => runtime, isAdmissionOpen: () => true,
+      steer: async () => { throw new Error('Unexpected steer'); },
+      refuse: async () => {
+        if (kind === 'failed_refusal') throw new Error('No qualified refusal');
+        await refusal.promise;
+      },
+    });
+    if (kind === 'uncertain') {
+      const patch = vi.fn(async () => ({ kind: 'admission_uncertain' as const }));
+      const control = createCodexPendingInputSteerControl({ getDispatchSignal: () => new AbortController().signal,
+        session: { sessionId: 's1', requestPendingInputSteerNow: patch, waitForProviderInputTerminalOutcome: async () => ({ kind: 'pending' }) },
+        runtime: { getActiveSteerableTurnId: async () => 'T1' }, turnBindings: bindings, isAdmissionOpen: () => true,
+        inputConsumer: { drainPending: async () => ({ materialized: 0, stoppedReason: 'no_pending' }) },
+      });
+      bindings.clear();
+      await control({ sessionId: 's1', localId: 'L' });
+      const retained = bindings.get('L');
+      await expect(control({ sessionId: 's1', localId: 'L' })).resolves.toMatchObject({ status: 'not_safe' });
+      expect(bindings.get('L')).toBe(retained);
+      expect(patch).toHaveBeenCalledTimes(1);
+      return;
+    }
+    const delivery = handler({ role: 'user', content: { type: 'text', text: 'input' }, localId: 'L' }, {
+      localId: 'L', requestedAction: { v: 1, kind: 'steer_now_bound', bindingId: 'B1' }, providerAction: 'steer', providerAcceptancePending: true, seq: null, isCurrentRegistration: () => true,
+    });
+    if (kind === 'replacement') bindings.set('L', newer);
+    refusal.resolve();
+    if (kind === 'failed_refusal') await expect(delivery).rejects.toThrow('No qualified refusal');
+    else await delivery;
+    expect(bindings.get('L')).toBe(kind === 'replacement' ? newer : binding);
+  });
+
   it('keeps the selected opaque row identity through the RPC, Codex factory, PATCH and drain', async () => {
     const rows = new Map<string, { requestedAction?: 'steer_now_bound'; claimed: boolean }>([
       ['x', { claimed: false }],
@@ -76,7 +154,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
       registerHandler: (method, handler) => { handlers.set(method, handler); },
     }, {
       sessionRuntimeControls: {
-        interruptPendingInputAndRun: createCodexPendingInputSteerControl({
+        interruptPendingInputAndRun: createCodexPendingInputSteerControl({ getDispatchSignal: () => new AbortController().signal,
           session: {
             sessionId: 'session-1',
             requestPendingInputSteerNow: async (localId, bindingId) => {
@@ -127,7 +205,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
     '[bound-lifetime] refuses an unavailable original invocation: %s', async (change) => {
       const resolvingTurn = createDeferred<string | null>();
       const runtime = { getActiveSteerableTurnId: () => resolvingTurn.promise };
-      const binding = Object.freeze({ bindingId: 'B1', turnId: 'T1', runtime });
+      const binding = Object.freeze({ bindingId: 'B1', turnId: 'T1', runtime, dispatchSignal: new AbortController().signal });
       const bindings: Parameters<typeof createCodexPendingInputBoundSteerHandler>[0]['turnBindings'] = new Map([[' L ', binding]]);
       let admission = true;
       let registered = true;
@@ -143,7 +221,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
       if (change === 'closed') admission = false;
       if (change === 'replaced_runtime') activeRuntime = null;
       if (change === 'registration') registered = false;
-      const newer = Object.freeze({ bindingId: 'B2', turnId: 'T2', runtime });
+      const newer = Object.freeze({ bindingId: 'B2', turnId: 'T2', runtime, dispatchSignal: new AbortController().signal });
       if (change === 'B2') bindings.set(' L ', newer);
       resolvingTurn.resolve(change === 'T2' ? 'T2' : 'T1');
       await delivery;
@@ -155,7 +233,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
 
   it('[bound-lifetime] gives only the original invocation a mandatory T1 context and revokes it when B2 replaces it', async () => {
     const runtime = { getActiveSteerableTurnId: async () => 'T1' };
-    const binding = Object.freeze({ bindingId: 'B1', turnId: 'T1', runtime });
+    const binding = Object.freeze({ bindingId: 'B1', turnId: 'T1', runtime, dispatchSignal: new AbortController().signal });
     const bindings: Parameters<typeof createCodexPendingInputBoundSteerHandler>[0]['turnBindings'] = new Map([['L', binding]]);
     let context: import('@/backends/codex/appServer/runtime').CodexBoundSteerContext | null = null;
     const handler = createCodexPendingInputBoundSteerHandler({
@@ -170,7 +248,7 @@ describe('SessionProviderInputConsumer drainPending', () => {
     const captured = context as import('@/backends/codex/appServer/runtime').CodexBoundSteerContext;
     expect(captured.expectedTurnId).toBe('T1');
     expect(captured.isCurrentBinding()).toBe(true);
-    const newer = Object.freeze({ bindingId: 'B2', turnId: 'T2', runtime });
+    const newer = Object.freeze({ bindingId: 'B2', turnId: 'T2', runtime, dispatchSignal: new AbortController().signal });
     bindings.set('L', newer);
     expect(captured.isCurrentBinding()).toBe(false);
     expect(bindings.get('L')).toBe(newer);
