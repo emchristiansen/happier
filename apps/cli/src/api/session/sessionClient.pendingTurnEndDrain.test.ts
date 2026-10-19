@@ -1,5 +1,6 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import axios from 'axios';
+import { readFileSync } from 'node:fs';
 
 import { createDeferred } from '@/testkit/async/deferred';
 import { createPlainSessionFixture } from '@/testkit/backends/sessionFixtures';
@@ -15,12 +16,15 @@ import {
 } from '@/settings/accountSettings/activeAccountSettingsSnapshot';
 import type { SessionMutationOutbox } from './mutations/createSessionMutationOutbox';
 import { logger } from '@/ui/logger';
+import { createSocketAckError } from '@/session/transport/shared/socketAck';
 import {
   PendingQueueAcceptedSettlementError,
   PendingQueueMaterializationTransportAmbiguousError,
 } from './pendingQueueV2Transport';
 
 const offlineBoundary = vi.hoisted(() => {
+  vi.stubEnv('HAPPIER_LOG_LEVEL', 'info');
+  vi.stubEnv('DEBUG', '');
   const origin = 'https://relay.example.invalid';
   for (const key of ['HAPPIER_SERVER_URL', 'HAPPIER_LOCAL_SERVER_URL', 'HAPPIER_PUBLIC_SERVER_URL', 'HAPPIER_WEBAPP_URL']) {
     vi.stubEnv(key, origin);
@@ -2208,6 +2212,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     }));
   });
   it('ignores provider acceptance that is not tied to a canonical materialized claim', async () => {
+    const infoSpy = vi.spyOn(logger, 'infoFile');
     const client = await createClient({
       pendingCount: 0,
       pendingVersion: 0,
@@ -2217,6 +2222,15 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
 
     expect(hasProviderInputAcceptance(client, 'prompt-late-seq')).toBe(false);
     expect(resolveAcceptedPendingDeliveryMock).not.toHaveBeenCalled();
+    expect(infoSpy).toHaveBeenCalledWith('[pendingQueue] provider acceptance handoff', expect.objectContaining({
+      sessionId: 's1', localId: 'prompt-late-seq', stage: 'accepted_observed', canonicalCustody: false,
+      producerGeneration: expect.any(Number), sessionConnectionEpoch: expect.any(Number),
+    }));
+    expect(infoSpy).toHaveBeenCalledWith('[pendingQueue] provider acceptance handoff', expect.objectContaining({
+      localId: 'prompt-late-seq', stage: 'canonical_custody_absent', canonicalCustody: false,
+    }));
+    logger.flushSync();
+    expect(readFileSync(logger.getLogPath(), 'utf8')).toContain('"localId":"prompt-late-seq","stage":"canonical_custody_absent"');
 
     triggerCommittedUserMessage({ seq: 740, localId: 'prompt-late-seq' });
 
@@ -2224,7 +2238,144 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(resolveAcceptedPendingDeliveryMock).not.toHaveBeenCalled();
   });
 
+  it.each([
+    {
+      name: 'disconnected socket without retry qualification',
+      localId: 'diagnostic-no-retry-socket',
+      error: Object.assign(new Error('private socket detail'), { code: 'socket_not_connected', retryable: false }),
+      failure: { kind: 'socket', code: 'socket_not_connected' },
+    },
+    {
+      name: 'recognized server refusal',
+      localId: 'diagnostic-no-retry-server',
+      error: new PendingQueueAcceptedSettlementError('forbidden'),
+      failure: { kind: 'server_ack', error: 'forbidden' },
+    },
+    {
+      name: 'unrecognized typed server value',
+      localId: 'diagnostic-no-retry-server-unknown',
+      error: new PendingQueueAcceptedSettlementError('private-unrecognized-server-value'),
+      failure: { kind: 'unknown' },
+    },
+    {
+      name: 'untyped failure',
+      localId: 'diagnostic-no-retry-unknown',
+      error: Object.assign(new Error('private-untyped-failure'), { code: 'private-unrecognized-code' }),
+      failure: { kind: 'unknown' },
+    },
+  ])('reports the accepted no-retry shape for $name without changing exact custody or dispatch', async ({ localId, error, failure }) => {
+    const infoSpy = vi.spyOn(logger, 'infoFile');
+    const warningSpy = vi.spyOn(logger, 'warn');
+    const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 });
+    await waitForCurrentPendingInputContract(client);
+    const original = createProviderDeliveryMaterializeResult(localId);
+    materializeNextMock.mockResolvedValueOnce(original);
+    listDeliveryStatusesMock.mockResolvedValue([{ localId, status: 'delivering' }]);
+    resolveAcceptedPendingDeliveryMock.mockRejectedValueOnce(error);
+    const providerEntry = vi.fn((message: unknown) => {
+      expect(message).toEqual({ ...original.message.content.v, createdAt: 1000 });
+      confirmProviderInputAccepted(client, localId);
+    });
+    client.onUserMessage(providerEntry);
+
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toMatchObject({
+      type: 'materialized', localId,
+    });
+    await waitUntil(() => warningSpy.mock.calls.some(([message, details]) => (
+      message === '[pendingQueue] accepted provider settlement remains unresolved'
+      && typeof details === 'object' && details !== null && 'localId' in details && details.localId === localId
+    )));
+    expect(infoSpy).toHaveBeenCalledWith('[pendingQueue] provider acceptance handoff', expect.objectContaining({
+      sessionId: 's1', localId, stage: 'settlement_admitted', canonicalCustody: true,
+      producerGeneration: expect.any(Number), sessionConnectionEpoch: expect.any(Number),
+    }));
+    expect(warningSpy).toHaveBeenCalledWith('[pendingQueue] accepted provider settlement remains unresolved', expect.objectContaining({
+      sessionId: 's1', localId, attempt: 1, retryAfterMs: null, willRetry: false,
+      retryDisposition: 'retained_without_retry', failure,
+      producerGeneration: expect.any(Number), sessionConnectionEpoch: expect.any(Number),
+    }));
+    logger.flushSync();
+    const fileLog = readFileSync(logger.getLogPath(), 'utf8');
+    expect(fileLog).toContain(`"failure":${JSON.stringify(failure)}`);
+    expect(fileLog).not.toContain('private socket detail');
+    expect(fileLog).not.toContain('private-unrecognized-server-value');
+    expect(fileLog).not.toContain('private-unrecognized-code');
+    expect(fileLog).not.toContain('private-untyped-failure');
+    expect(client.hasPendingProviderInputAcceptance(localId)).toBe(true);
+    expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toEqual({ type: 'no_pending' });
+    expect(providerEntry).toHaveBeenCalledTimes(1);
+    expect(materializeNextMock).toHaveBeenCalledTimes(1);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledExactlyOnceWith({ socket: sessionSocketStub, sessionId: 's1', localId });
+    expect(blockPendingDeliveryMock).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('retries the original accepted settlement after a pre-emit socket drop recovers without another provider entry (didResolve=%s)', async (didResolve) => {
+    const actualTransport = await vi.importActual<typeof import('./pendingQueueV2Transport')>('./pendingQueueV2Transport');
+    const localId = 'pre-emit-drop-exact-local';
+    const original = createProviderDeliveryMaterializeResult(localId);
+    const committed = {
+      id: 'committed-pre-emit-drop',
+      seq: 83,
+      localId,
+      messageRole: original.message.messageRole,
+      content: original.message.content,
+      createdAt: original.message.createdAt,
+      updatedAt: original.message.updatedAt,
+    };
+    const transcriptCommit = vi.fn();
+    const settlementAck = vi.fn(() => {
+      if (didResolve) transcriptCommit();
+      return { ok: true, didResolve, pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 3, message: committed };
+    });
+    const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 }, {
+      sessionSocketEmitWithAck: (event) => event === 'pending-delivery-accepted-v1' ? settlementAck() : { ok: true },
+    });
+    await waitForCurrentPendingInputContract(client);
+    materializeNextMock.mockResolvedValueOnce(original);
+    let dropBeforeEmit = true;
+    resolveAcceptedPendingDeliveryMock.mockImplementation((params: Parameters<typeof actualTransport.resolveAcceptedPendingQueueV2Delivery>[0]) => {
+      if (!dropBeforeEmit) return actualTransport.resolveAcceptedPendingQueueV2Delivery(params);
+      dropBeforeEmit = false;
+      // Preserve the real accepted adapter and local ACK check. Only the socket boundary
+      // drops, then recovers before the existing owner classifies the rejection.
+      params.socket.connected = false;
+      const operation = actualTransport.resolveAcceptedPendingQueueV2Delivery(params);
+      params.socket.connected = true;
+      return operation;
+    });
+    const providerEntry = vi.fn((message: unknown) => {
+      expect(message).toEqual({ ...original.message.content.v, createdAt: 1000 });
+      confirmProviderInputAccepted(client, localId);
+    });
+    client.onUserMessage(providerEntry);
+    const warningSpy = vi.spyOn(logger, 'warn');
+    vi.useFakeTimers();
+    await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(warningSpy).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      localId, attempt: 1, retryAfterMs: 1000, willRetry: true,
+    }));
+    expect(settlementAck).not.toHaveBeenCalled();
+    expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(2);
+    for (const [request] of resolveAcceptedPendingDeliveryMock.mock.calls) {
+      expect(request).toEqual({ socket: sessionSocketStub, sessionId: 's1', localId });
+    }
+    expect(settlementAck).toHaveBeenCalledTimes(1);
+    expect(transcriptCommit).toHaveBeenCalledTimes(didResolve ? 1 : 0);
+    expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(false);
+    expect(client.hasPendingProviderInputAcceptance(localId)).toBe(true);
+    expect(client.getCommittedUserMessageSeq(localId)).toBe(83);
+    expect(providerEntry).toHaveBeenCalledTimes(1);
+    expect(materializeNextMock).toHaveBeenCalledTimes(1);
+  });
+
   it('resolves server-owned provider delivery after provider acceptance', async () => {
+    vi.spyOn(logger, 'infoFile').mockImplementation(() => { throw new Error('diagnostic sink unavailable'); });
     const deliveryState = { mode: 'provider' as const, unresolved: true };
     const client = await createClient({
       latestTurnStatus: 'completed',
@@ -2377,7 +2528,11 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
 
   });
 
-  it('abandons the operation-local accepted settlement retry when its originating runtime is replaced', async () => {
+  it.each([
+    { error: new PendingQueueAcceptedSettlementError('transaction-unavailable', 1250), delayMs: 1250 },
+    { error: createSocketAckError({ code: 'socket_not_connected', event: 'pending-delivery-accepted-v1', message: 'disconnected before emit' }), delayMs: 1000 },
+  ])('abandons the operation-local accepted settlement retry when its originating runtime is replaced %#', async ({ error, delayMs }) => {
+    const warningSpy = vi.spyOn(logger, 'warn');
     const client = await createClient({
       latestTurnStatus: 'completed',
       pendingCount: 1,
@@ -2387,7 +2542,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     await waitForCurrentPendingInputContract(client);
     materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult('runtime-fenced-settlement'));
     resolveAcceptedPendingDeliveryMock
-      .mockRejectedValueOnce(new PendingQueueAcceptedSettlementError('transaction-unavailable', 1_250))
+      .mockRejectedValueOnce(error)
       .mockResolvedValueOnce({
         didResolve: true,
         pendingQueueState: { known: true, pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 3 },
@@ -2398,9 +2553,10 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     confirmProviderInputAccepted(client, 'runtime-fenced-settlement');
     await vi.advanceTimersByTimeAsync(0);
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
+    expect(warningSpy).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ willRetry: true, retryAfterMs: delayMs }));
 
     client.beginRuntimeTermination();
-    await vi.advanceTimersByTimeAsync(1_250);
+    await vi.advanceTimersByTimeAsync(delayMs);
 
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
     expect((client as any).canonicalPendingDeliveryByLocalId.has('runtime-fenced-settlement')).toBe(true);
@@ -2531,6 +2687,8 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       attempt: 3,
       retryAfterMs: 4_000,
       willRetry: true,
+      retryDisposition: 'same_operation_after_backoff',
+      failure: { kind: 'socket', code: 'socket_ack_timeout' },
       errorValuesOmitted: true,
     }));
   });
@@ -3869,6 +4027,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
   });
 
   it('re-drives exact provider acceptance after reconnect when acceptance arrived while disconnected', async () => {
+    const infoSpy = vi.spyOn(logger, 'infoFile');
     const client = await createClient({
       latestTurnStatus: 'completed',
       pendingCount: 1,
@@ -3889,6 +4048,9 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(resolveAcceptedPendingDeliveryMock).not.toHaveBeenCalled();
     expect((client as any).canonicalPendingDeliveryByLocalId.has('retry-on-reconnect')).toBe(true);
+    expect(infoSpy).toHaveBeenCalledWith('[pendingQueue] provider acceptance handoff', expect.objectContaining({
+      sessionId: 's1', localId: 'retry-on-reconnect', stage: 'authority_unavailable', canonicalCustody: true,
+    }));
 
     if (!supervisorOnConnected) throw new Error('missing supervised reconnect callback');
     sessionSocketStub.connected = true;
