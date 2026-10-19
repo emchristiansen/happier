@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { StringDecoder } from 'node:string_decoder';
 import { readFileSync } from 'node:fs';
 import { appendFile, rename, rm, stat } from 'node:fs/promises';
@@ -493,10 +494,43 @@ async function createOwnedCodexAppServerClient(
     let nextId = 0;
     let disposing = false;
     let disposePromise: Promise<void> | null = null;
+    const privateCallbackContext = privateOwner ? new AsyncLocalStorage<{ active: boolean }>() : null;
+    const privateCallbackTasks = new Set<Promise<void>>();
     let resolveClosed: (() => void) | null = null;
     const closedPromise = new Promise<void>((resolve) => {
         resolveClosed = resolve;
     });
+
+    const invokePrivateCallback = <T>(callback: () => T | Promise<T>): T | Promise<T> => {
+        if (!privateCallbackContext) return callback();
+        const context = { active: true };
+        try {
+            const result = privateCallbackContext.run(context, callback);
+            if (result && typeof (result as PromiseLike<T>).then === 'function') {
+                return Promise.resolve(result).finally(() => { context.active = false; });
+            }
+            context.active = false;
+            return result;
+        } catch (error) {
+            context.active = false;
+            throw error;
+        }
+    };
+
+    const runPrivateCallbackTask = (operation: () => Promise<void>, onFailure: (error: unknown) => void): void => {
+        if (disposing) return;
+        const task = (async () => {
+            try { await operation(); }
+            catch (error) { onFailure(error); }
+        })();
+        privateCallbackTasks.add(task);
+        void task.then(() => { privateCallbackTasks.delete(task); });
+    };
+
+    const assertPrivateWorkAdmission = (): void => {
+        // Reuse the recorded disposal failure; registering after the final flush adds no new event.
+        if (privateOwner && disposing) throw state.fatalError ?? new CodexAppServerPrivateIoError('work admission');
+    };
 
     const failPendingRequests = (error: Error): void => {
         for (const [requestKey, pending] of pendingRequests.entries()) {
@@ -530,6 +564,7 @@ async function createOwnedCodexAppServerClient(
         const nextWrite = writeChain.then(async () => {
             // A queued write must not outlive a failure while capturing another message.
             if (privateCustodyFailure) throw privateCustodyFailure;
+            if (privateOwner && disposing) throw state.fatalError ?? new CodexAppServerPrivateIoError('write after disposal');
             const stdin = child.stdin;
             if (!stdin || stdin.writableEnded || stdin.destroyed) {
                 throw state.fatalError ?? createDisposedError();
@@ -537,6 +572,7 @@ async function createOwnedCodexAppServerClient(
             await new Promise<void>((resolve, reject) => {
                 try {
                     capturePrivate({ kind: 'raw', stream: 'stdin', bytes: Buffer.from(payload, 'utf8') });
+                    if (privateOwner && disposing) throw state.fatalError ?? new CodexAppServerPrivateIoError('write after disposal');
                     stdin.write(payload, 'utf8', (error) => {
                         if (error) {
                             reject(error);
@@ -570,7 +606,9 @@ async function createOwnedCodexAppServerClient(
             return;
         }
         try {
-            const result = await handler(message.params, message);
+            const result = await (privateOwner
+                ? invokePrivateCallback(() => handler(message.params, message))
+                : handler(message.params, message));
             await sendMessage({ id: message.id, result: result ?? null });
         } catch (error) {
             if (privateOwner) audienceFailure('request handler', error);
@@ -587,11 +625,10 @@ async function createOwnedCodexAppServerClient(
         reportedExitFailure = failure;
         for (const handler of [...exitHandlers]) {
             if (privateOwner) {
-                try {
-                    void Promise.resolve(handler(failure)).catch((error) => { audienceFailure('exit handler', error); });
-                } catch (error) {
-                    audienceFailure('exit handler', error);
-                }
+                runPrivateCallbackTask(
+                    async () => { await invokePrivateCallback(() => handler(failure)); },
+                    (error) => { audienceFailure('exit handler', error); },
+                );
             } else {
                 void Promise.resolve(handler(failure)).catch(() => undefined);
             }
@@ -634,14 +671,20 @@ async function createOwnedCodexAppServerClient(
         const requestKey = toMessageKey(message.id);
         if (typeof message.method === 'string') {
             if (requestKey) {
-                void handleServerRequest(message).catch((error) => {
-                    failWith(error);
-                });
+                if (privateOwner) runPrivateCallbackTask(() => handleServerRequest(message), (error) => { failWith(error); });
+                else void handleServerRequest(message).catch((error) => { failWith(error); });
                 return;
             }
             const handlers = notificationHandlers.get(message.method);
             if (handlers && handlers.size > 0) {
                 for (const handler of [...handlers]) {
+                    if (privateOwner) {
+                        runPrivateCallbackTask(
+                            async () => { await invokePrivateCallback(() => handler(message.params)); },
+                            (error) => { failWith(error); },
+                        );
+                        continue;
+                    }
                     try {
                         const result = handler(message.params);
                         if (result && typeof (result as PromiseLike<void>).then === 'function') {
@@ -849,6 +892,7 @@ async function createOwnedCodexAppServerClient(
     };
 
     const registerRequestHandler = (method: string, handler: JsonRpcRequestHandler): (() => void) => {
+        assertPrivateWorkAdmission();
         requestHandlers.set(method, handler);
         return () => {
             if (requestHandlers.get(method) === handler) {
@@ -858,6 +902,7 @@ async function createOwnedCodexAppServerClient(
     };
 
     const registerNotificationHandler = (method: string, handler: JsonRpcNotificationHandler): (() => void) => {
+        assertPrivateWorkAdmission();
         const existing = notificationHandlers.get(method);
         if (existing) {
             existing.add(handler);
@@ -875,43 +920,67 @@ async function createOwnedCodexAppServerClient(
     };
 
     const dispose = async (options?: CodexAppServerClientDisposeOptions): Promise<void> => {
+        // This check precedes memoized disposal: waiting from an owned callback would wait on itself.
+        if (privateCallbackContext?.getStore()?.active) {
+            throw audienceFailure('reentrant disposal', new Error('Cannot dispose the private Codex app-server from its active callback'));
+        }
         if (disposePromise) {
             return await disposePromise;
         }
         disposing = true;
-        const disposedError = privateOwner
-            ? audienceFailure('disposal', options?.pendingRequestError ?? createDisposedError())
-            : options?.pendingRequestError ?? createDisposedError();
-        failWaiters(state, disposedError);
-        failPendingRequests(disposedError);
-        disposePromise = (async () => {
-            try {
-                await terminateChild();
-                await closedPromise;
-                if (privateCustodyFailure) throw privateCustodyFailure;
-            } finally {
-                if (privateOwner) {
-                    try {
-                        await privateOwner.flush();
-                    } catch (error) {
-                        throw audienceFailure('disposal flush', error);
+        const beginDisposal = (): Promise<void> => {
+            const disposedError = privateOwner
+                ? audienceFailure('disposal', options?.pendingRequestError ?? createDisposedError())
+                : options?.pendingRequestError ?? createDisposedError();
+            failWaiters(state, disposedError);
+            failPendingRequests(disposedError);
+            return (async () => {
+                try {
+                    await terminateChild();
+                    await closedPromise;
+                    if (privateOwner) {
+                        await Promise.all(privateCallbackTasks);
+                        await writeChain;
                     }
-                } else {
-                    await rpcLogger?.flush().catch(() => undefined);
+                    if (privateCustodyFailure) throw privateCustodyFailure;
+                } finally {
+                    if (privateOwner) {
+                        try {
+                            await privateOwner.flush();
+                        } catch (error) {
+                            throw audienceFailure('disposal flush', error);
+                        }
+                    } else {
+                        await rpcLogger?.flush().catch(() => undefined);
+                    }
                 }
-            }
-        })();
+            })();
+        };
+        if (privateOwner) {
+            // Install completion before owner.capture can synchronously reenter disposal.
+            let startDisposal!: () => void;
+            disposePromise = new Promise<void>((resolve, reject) => {
+                startDisposal = () => {
+                    try { resolve(beginDisposal()); }
+                    catch (error) { reject(error); }
+                };
+            });
+            startDisposal();
+        } else {
+            disposePromise = beginDisposal();
+        }
         return await disposePromise;
     };
 
     const onExit = (handler: CodexAppServerExitHandler): (() => void) => {
+        assertPrivateWorkAdmission();
         if (reportedExitFailure) {
             if (privateOwner) {
-                try {
-                    void Promise.resolve(handler(reportedExitFailure)).catch((error) => { audienceFailure('exit handler', error); });
-                } catch (error) {
-                    audienceFailure('exit handler', error);
-                }
+                const failure = reportedExitFailure;
+                runPrivateCallbackTask(
+                    async () => { await invokePrivateCallback(() => handler(failure)); },
+                    (error) => { audienceFailure('exit handler', error); },
+                );
             } else {
                 void Promise.resolve(handler(reportedExitFailure)).catch(() => undefined);
             }
@@ -938,6 +1007,7 @@ async function createOwnedCodexAppServerClient(
 
         return {
             request: privateOwner ? async (...args: Parameters<typeof request>) => {
+                assertPrivateWorkAdmission();
                 try { return await request(...args); }
                 catch (error) { throw audienceFailure('request', error); }
             } : request,

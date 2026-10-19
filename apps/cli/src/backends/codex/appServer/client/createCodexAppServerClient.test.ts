@@ -7,6 +7,7 @@ import { PassThrough, Writable } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 
 import { waitForCondition } from '@/testkit/async/waitFor';
+import { createDeferred } from '@/testkit/async/deferred';
 import { withTempDir } from '@/testkit/fs/tempDir';
 import {
     HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_ENV_KEY,
@@ -273,6 +274,239 @@ describe('createCodexAppServerClient', () => {
         } finally {
             await boundary.dispose().catch(() => undefined);
         }
+    });
+
+    it.each(['notification', 'request', 'exit'] as const)('[private-io-async] drains a deferred %s failure before disposal flush', async (kind) => {
+        const pending: CodexAppServerPrivateIoEvent[] = [];
+        const drained: CodexAppServerPrivateIoEvent[] = [];
+        const failure = new Error('private deferred callback failure');
+        const gate = createDeferred();
+        const started = createDeferred();
+        const capturedFailure = createDeferred();
+        const flush = vi.fn(async () => { drained.push(...pending.splice(0)); });
+        const boundary = await createPrivateProcessBoundary({
+            capture: (event) => {
+                pending.push(event);
+                if (event.kind === 'failure' && event.error === failure) capturedFailure.resolve();
+            },
+            flush,
+        });
+        const handler = () => { started.resolve(); return gate.promise; };
+        if (kind === 'notification') boundary.client.registerNotificationHandler('native/deferred', handler);
+        else if (kind === 'request') boundary.client.registerRequestHandler('native/deferred', handler);
+        else boundary.client.onExit(handler);
+        if (kind === 'exit') boundary.child.emit('error', new Error('private process failure'));
+        else boundary.stdout.write(JSON.stringify({ ...(kind === 'request' ? { id: 'deferred-request' } : {}), method: 'native/deferred' }) + '\n');
+        await started.promise;
+        let disposed = false;
+        const disposal = boundary.dispose().then(() => { disposed = true; });
+        try {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            expect(disposed).toBe(false);
+            expect(flush).not.toHaveBeenCalled();
+            gate.reject(failure);
+            await capturedFailure.promise;
+            await disposal;
+            expect(flush).toHaveBeenCalledTimes(1);
+            expect(pending).toEqual([]);
+            expect(drained).toContainEqual(expect.objectContaining({ kind: 'failure', error: failure }));
+            expect(drained).toContainEqual({ kind: 'close', code: 0, signal: null });
+        } finally {
+            gate.reject(failure);
+            await capturedFailure.promise;
+            await disposal;
+        }
+    });
+
+    it.each(['before-await', 'after-await'] as const)('[private-io-async] refuses %s reentrant disposal before returning an existing disposal promise', async (phase) => {
+        const events: CodexAppServerPrivateIoEvent[] = [];
+        const gate = createDeferred();
+        const started = createDeferred();
+        const reentrant = createDeferred<unknown>();
+        const flush = vi.fn(async () => {});
+        const boundary = await createPrivateProcessBoundary({ capture: (event) => { events.push(event); }, flush });
+        boundary.client.registerNotificationHandler('native/reentrant-disposal', async () => {
+            started.resolve();
+            if (phase === 'after-await') await gate.promise;
+            const result = await boundary.client.dispose().then(() => null, (error: unknown) => error);
+            reentrant.resolve(result);
+        });
+        boundary.stdout.write(JSON.stringify({ method: 'native/reentrant-disposal' }) + '\n');
+        await started.promise;
+        const disposal = boundary.dispose();
+        gate.resolve();
+        const result = await reentrant.promise;
+        await disposal;
+        expect(result).toBeInstanceOf(Error);
+        expect(events).toContainEqual(expect.objectContaining({ kind: 'failure', operation: 'reentrant disposal' }));
+        expect(flush).toHaveBeenCalledTimes(1);
+    });
+
+    it('[private-io-async] allows another client and settled callback descendants to dispose', async () => {
+        const events: CodexAppServerPrivateIoEvent[] = [];
+        const firstFlush = vi.fn(async () => {});
+        const secondFlush = vi.fn(async () => {});
+        const first = await createPrivateProcessBoundary({ capture: (event) => { events.push(event); }, flush: firstFlush });
+        const second = await createPrivateProcessBoundary({ capture: () => {}, flush: secondFlush });
+        const gate = createDeferred();
+        const callbackFinished = createDeferred();
+        let descendant: Promise<void> | null = null;
+        first.client.registerNotificationHandler('native/other-client', async () => {
+            await Promise.resolve();
+            await second.dispose();
+            descendant = gate.promise.then(() => first.dispose());
+            callbackFinished.resolve();
+        });
+        first.stdout.write(JSON.stringify({ method: 'native/other-client' }) + '\n');
+        await callbackFinished.promise;
+        // The callback has settled before its independently gated descendant runs.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        gate.resolve();
+        expect(descendant).not.toBeNull();
+        await expect(descendant).resolves.toBeUndefined();
+        expect(firstFlush).toHaveBeenCalledTimes(1);
+        expect(secondFlush).toHaveBeenCalledTimes(1);
+        expect(events.some((event) => event.kind === 'failure' && event.operation === 'reentrant disposal')).toBe(false);
+    });
+
+    it('[private-io-async] closes callback registration and native dispatch before final disposal flush', async () => {
+        const events: CodexAppServerPrivateIoEvent[] = [];
+        const pending: CodexAppServerPrivateIoEvent[] = [];
+        const boundary = await createPrivateProcessBoundary({
+            capture: (event) => { events.push(event); pending.push(event); },
+            flush: async () => { pending.splice(0); },
+        });
+        const invoked = vi.fn();
+        boundary.client.registerRequestHandler('native/after-shutdown', invoked);
+        boundary.client.registerNotificationHandler('native/after-shutdown', invoked);
+        boundary.child.emit('error', new Error('private original process failure'));
+        const disposal = boundary.client.dispose();
+        boundary.stdout.write(JSON.stringify({ method: 'native/after-shutdown' }) + '\n');
+        boundary.stdout.write(JSON.stringify({ id: 'after-shutdown', method: 'native/after-shutdown' }) + '\n');
+        boundary.child.emit('close', 0, null);
+        await disposal;
+        const finalCount = events.length;
+        // reportedExitFailure is already set; late registration must not invoke its replay branch.
+        const refusals = [
+            () => boundary.client.registerRequestHandler('late/request', invoked),
+            () => boundary.client.registerNotificationHandler('late/notification', invoked),
+            () => boundary.client.onExit(invoked),
+        ].map((register) => {
+            try { register(); return null; }
+            catch (error) { return error; }
+        });
+        expect(refusals.every((error) => error instanceof Error)).toBe(true);
+        expect(invoked).not.toHaveBeenCalled();
+        await expect(boundary.client.request('late/already-aborted', undefined, { signal: AbortSignal.abort() })).rejects.toThrow('diagnostic values are not shown');
+        expect(events).toHaveLength(finalCount);
+        expect(pending).toEqual([]);
+    });
+
+    it('[private-io-async] settles an existing pipe write and refuses queued writes before final flush', async () => {
+        const pending: CodexAppServerPrivateIoEvent[] = [];
+        const flush = vi.fn(async () => { pending.splice(0); });
+        const boundary = await createPrivateProcessBoundary({ capture: (event) => { pending.push(event); }, flush });
+        const firstWrite = createDeferred();
+        const nativeMethods: string[] = [];
+        let finishWrite: (() => void) | null = null;
+        const write = vi.spyOn(boundary.stdin, 'write').mockImplementation((chunk, _encoding, callback) => {
+            const method = (JSON.parse(String(chunk)) as { method: string }).method;
+            nativeMethods.push(method);
+            if (method === 'first/pending') {
+                finishWrite = () => { if (typeof callback === 'function') callback(undefined); };
+                firstWrite.resolve();
+            } else if (typeof callback === 'function') callback(undefined);
+            return true;
+        });
+        const first = boundary.client.notify('first/pending');
+        const queued = boundary.client.notify('second/queued').then(() => null, (error: unknown) => error);
+        await firstWrite.promise;
+        const disposal = boundary.dispose();
+        try {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            const flushesBeforeWriteSettled = flush.mock.calls.length;
+            if (!finishWrite) throw new Error('Expected pending native pipe callback');
+            (finishWrite as () => void)();
+            await first;
+            const queuedResult = await queued;
+            await disposal;
+            expect({ flushesBeforeWriteSettled, queuedRefused: queuedResult instanceof Error, nativeMethods, pending, finalFlushes: flush.mock.calls.length }).toEqual({
+                flushesBeforeWriteSettled: 0, queuedRefused: true, nativeMethods: ['first/pending'], pending: [], finalFlushes: 1,
+            });
+        } finally {
+            if (finishWrite) (finishWrite as () => void)();
+            await first;
+            await queued;
+            await disposal;
+            write.mockRestore();
+        }
+    });
+
+    it('[private-io-shutdown-reentry] refuses a native write when raw capture initiates disposal', async () => {
+        const pending: CodexAppServerPrivateIoEvent[] = [];
+        const writes: Record<string, unknown>[] = [];
+        const flush = vi.fn(async () => { pending.splice(0); });
+        let disposal: Promise<void> | null = null;
+        const boundary = await createPrivateProcessBoundary({
+            capture: (event) => {
+                pending.push(event);
+                if (event.kind === 'raw' && event.stream === 'stdin' && JSON.parse(Buffer.from(event.bytes).toString('utf8')).method === 'dispose/during-capture') {
+                    disposal = boundary.client.dispose();
+                    boundary.child.emit('close', 0, null);
+                }
+            },
+            flush,
+        }, (message) => { writes.push(message); });
+        const result = await boundary.client.notify('dispose/during-capture').then(() => null, (error: unknown) => error);
+        expect(disposal).not.toBeNull();
+        await disposal;
+        expect({ refused: result instanceof Error, writes: writes.filter((message) => message.method !== 'initialized'), pending, flushes: flush.mock.calls.length }).toEqual({
+            refused: true, writes: [], pending: [], flushes: 1,
+        });
+    });
+
+    it('[private-io-disposal-latch] memoizes disposal before a synchronous owner reenters its failure capture', async () => {
+        const pending: CodexAppServerPrivateIoEvent[] = [];
+        const captured: CodexAppServerPrivateIoEvent[] = [];
+        const flush = vi.fn(async () => { pending.splice(0); });
+        let reentered = false;
+        let nested: Promise<void> | null = null;
+        const boundary = await createPrivateProcessBoundary({
+            capture: (event) => {
+                captured.push(event);
+                pending.push(event);
+                if (event.kind === 'failure' && event.operation === 'disposal' && !reentered) {
+                    // Bound the counterexample to one nested call; never recurse toward a host limit.
+                    reentered = true;
+                    nested = boundary.client.dispose();
+                }
+            },
+            flush,
+        });
+        const disposal = boundary.dispose();
+        await disposal;
+        expect(nested).not.toBeNull();
+        await nested;
+        expect(captured.filter((event) => event.kind === 'failure' && event.operation === 'disposal')).toHaveLength(1);
+        expect(flush).toHaveBeenCalledTimes(1);
+        expect(pending).toEqual([]);
+    });
+
+    it('preserves ordinary callback disposal control semantics', async () => {
+        const boundary = createPipedProcessBoundary((message) => {
+            if (message.method === 'initialize') boundary.stdout.write(JSON.stringify({ id: message.id, result: {} }) + '\n');
+        });
+        const client = await createCodexAppServerClient({ processEnv: { HAPPIER_CODEX_APP_SERVER_BIN: process.execPath } });
+        const finished = createDeferred();
+        client.registerNotificationHandler('ordinary/disposal', async () => {
+            await Promise.resolve();
+            await client.dispose();
+            finished.resolve();
+        });
+        boundary.stdout.write(JSON.stringify({ method: 'ordinary/disposal' }) + '\n');
+        boundary.child.emit('close', 0, null);
+        await finished.promise;
+        await expect(client.dispose()).resolves.toBeUndefined();
     });
 
     it('[private-io] captures construction failure before an ordinary logger can be created', async () => {
