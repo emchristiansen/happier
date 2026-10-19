@@ -262,6 +262,7 @@ import { connectionState } from '@/api/offline/serverConnectionErrors';
 import {
     createAuthenticationHttpStatusError,
     isAuthenticationError,
+    isPermanentRequestError,
     readAuthenticationStatus,
 } from '@/api/client/httpStatusError';
 import { serializeAxiosErrorForLog } from '@/api/client/serializeAxiosErrorForLog';
@@ -519,6 +520,17 @@ const SESSION_PRESENCE_RECONNECT_REASSERT_DELAY_MS = 2_000;
 const STUCK_THINKING_TERMINAL_KEEPALIVE_GUARD_MS = 15_000;
 const SESSION_CLIENT_RECEIVED_MESSAGE_ID_CACHE_MAX_ENTRIES = 1_000;
 const SESSION_CLIENT_TOOL_CALL_CACHE_MAX_ENTRIES = 1_000;
+// Recovery only: hints and turn-end remain the fast path. Slow *successful* reads also
+// stretch the cadence so a saturated relay does not need to fail before we shed reads.
+const PENDING_DISCOVERY_BASE_DELAY_MS = 300_000;
+const PENDING_DISCOVERY_MAX_DELAY_MS = 1_800_000;
+const PENDING_DISCOVERY_MAX_TIMER_DELAY_MS = 2_147_483_647;
+const PENDING_DISCOVERY_FAST_READ_MS = 1_000;
+const PENDING_DISCOVERY_SLOW_READ_MS = 2_000;
+type SessionSnapshotReadResult =
+    | Readonly<{ status: 'readable'; elapsedMs: number; pendingQueueState: KnownPendingQueueState | null; archived: boolean }>
+    | Readonly<{ status: 'failed'; retryable: boolean; retryAfterMs?: number }>
+    | Readonly<{ status: 'obsolete' }>;
 type SessionSocketAckWriteEvent = 'update-metadata' | 'update-state';
 type SessionAliveMode = 'local' | 'remote';
 type SessionAlivePayload = Readonly<{
@@ -644,7 +656,16 @@ export class ApiSessionClient extends EventEmitter {
     private readonly explicitUserRecoveryCheckedLocalIdCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private pendingWakeSeq = 0;
     private pendingQueueState: PendingQueueState = UNKNOWN_PENDING_QUEUE_STATE;
-    private pendingQueueStateReconcileInFlight: Promise<boolean> | null = null;
+    private pendingQueueStateReconcileInFlight: {
+        request: { force: boolean; discovery: boolean };
+        promise: Promise<boolean>;
+    } | null = null;
+    private pendingDiscoveryTimer: ReturnType<typeof setTimeout> | null = null;
+    private pendingDiscoveryProducer: Readonly<{ generation: number; producer: SessionProviderInputOutcomeProducer }> | null = null;
+    private pendingDiscoveryDelayMs = PENDING_DISCOVERY_BASE_DELAY_MS;
+    private pendingDiscoveryNotBeforeMs = 0;
+    private pendingDiscoveryReadFailed = false;
+    private pendingDiscoveryArchived = false;
     private lastPendingQueueStateReconcileAt = 0;
     private latestTurnStatus: LatestTurnStatusSnapshot | undefined = undefined;
     private latestTurnStatusObservedAtMs: number | null = null;
@@ -674,7 +695,7 @@ export class ApiSessionClient extends EventEmitter {
     private closed = false;
     private readonly metadataWaitAbortController = new AbortController();
     private runtimeTerminationStarted = false;
-    private snapshotSyncInFlight: Promise<boolean> | null = null;
+    private snapshotSyncInFlight: Promise<SessionSnapshotReadResult> | null = null;
     private readonly toolCallCanonicalNameByProviderAndId = new Map<string, { rawToolName: string; canonicalToolName: string }>();
     private readonly permissionToolCallRawInputByProviderAndId = new Map<string, unknown>();
     private readonly toolCallInputByProviderAndId = new Map<string, unknown>();
@@ -1356,6 +1377,8 @@ export class ApiSessionClient extends EventEmitter {
                     }
                 })) return;
                 this.reofferAcceptedCanonicalPendingDeliveriesAfterConnection();
+                this.clearPendingDiscoveryTimer();
+                this.schedulePendingDiscovery();
 
                 await this.syncChangesOnConnect({ reason: isReconnect ? 'reconnect' : 'connect' }).catch((error) => {
                     logger.debug('[API] Session changes sync on connect failed (non-fatal)', {
@@ -1380,6 +1403,7 @@ export class ApiSessionClient extends EventEmitter {
             },
             onDisconnected: async ({ event }) => {
                 logger.debug('[API] Socket disconnected:', event.reason ?? 'unknown');
+                this.clearPendingDiscoveryTimer();
                 this.clearReconnectPresenceReassertTimer();
                 this.pendingInputReadinessAbortController?.abort();
                 this.pendingInputReadinessAbortController = null;
@@ -1394,6 +1418,7 @@ export class ApiSessionClient extends EventEmitter {
                 }
             },
             onAuthFailed: async () => {
+                this.clearPendingDiscoveryTimer();
                 this.clearReconnectPresenceReassertTimer();
                 this.pendingInputReadinessAbortController?.abort();
                 this.pendingInputReadinessAbortController = null;
@@ -1917,16 +1942,18 @@ export class ApiSessionClient extends EventEmitter {
             const statusByLocalId = new Map(statuses.map((entry) => [entry.localId, entry.status]));
             for (const localId of blockingLocalIds) {
                 const status = statusByLocalId.get(localId);
-                if (status !== undefined && status !== 'discarded') continue;
+                // Absence cannot settle an accepted result or a batch reserved between dequeue
+                // and provider entry. Only the exact existing settlement/terminal proof may do so.
+                if (status !== 'discarded') continue;
+                if (this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted') continue;
                 if (!this.canonicalPendingDeliveryByLocalId.has(localId)) continue;
-                logger.debug('[pendingQueue] exact terminal server truth retired local provider custody', {
+                logger.debug('[pendingQueue] exact discarded row retired unaccepted local provider custody', {
                     sessionId: this.sessionId,
                     localId,
                     serverStatus: status ?? 'absent',
                 });
-                // Unlike successful settlement or an exact committed replay, authoritative
-                // absence/discard proves there is no remaining Pending row whose acceptance
-                // this session client should expose.
+                // An explicit discard retires unaccepted custody. Accepted results still need
+                // their own exact settlement proof; absence alone proves neither outcome.
                 this.acceptedProviderInputLocalIds.delete(localId);
                 this.clearCanonicalPendingDeliveryLocalState(localId);
             }
@@ -1953,52 +1980,138 @@ export class ApiSessionClient extends EventEmitter {
         return false;
     }
 
-    async reconcilePendingQueueState(opts?: { force?: boolean }): Promise<boolean> {
-        if (this.closed) return false;
-        // Keep the public queue reconciliation hook authoritative for both server projection and
-        // exact local provider custody. Generic input consumers call this hook when their cheap
-        // eligibility preflight is blocked; without this step, a server-resolved delivery can
-        // permanently hide a later queued row before the safe materialization owner gets a chance
-        // to run its own identical reconciliation.
-        await this.reconcileCanonicalPendingDeliveriesBeforeMaterialization();
-        if (!opts?.force && this.pendingQueueState.known && this.pendingQueueState.pendingCount > 0) {
-            return false;
+    async reconcilePendingQueueState(opts?: { force?: boolean; discovery?: boolean }): Promise<boolean> {
+        if (this.closed || this.runtimeTerminationStarted) return false;
+        const existing = this.pendingQueueStateReconcileInFlight;
+        if (existing) {
+            existing.request.force ||= opts?.force === true;
+            existing.request.discovery ||= opts?.discovery === true;
+            return await existing.promise;
         }
-
-        const now = Date.now();
-        if (
-            !opts?.force
-            && this.lastPendingQueueStateReconcileAt > 0
-            && now - this.lastPendingQueueStateReconcileAt < configuration.pendingQueueStateReconcileThrottleMs
-        ) {
-            return false;
-        }
-
-        if (this.pendingQueueStateReconcileInFlight) {
-            return await this.pendingQueueStateReconcileInFlight;
-        }
-
+        const request = { force: opts?.force === true, discovery: opts?.discovery === true };
         const run = async (): Promise<boolean> => {
+            // Keep server projection and exact local custody at this same reconciliation owner.
+            // Discovery defers while custody is held; other callers retain exact reconciliation.
+            if (!request.discovery) await this.reconcileCanonicalPendingDeliveriesBeforeMaterialization();
+            if (this.closed || this.runtimeTerminationStarted) return false;
+            if (!request.force && this.pendingQueueState.known && this.pendingQueueState.pendingCount > 0) return false;
+            if (!request.force && this.lastPendingQueueStateReconcileAt > 0
+                && Date.now() - this.lastPendingQueueStateReconcileAt < configuration.pendingQueueStateReconcileThrottleMs) return false;
             this.lastPendingQueueStateReconcileAt = Date.now();
             const before = this.pendingQueueState;
-            await this.syncSessionSnapshotFromServer({ reason: 'waitForMetadataUpdate' });
-            return !arePendingQueueStatesEqual(before, this.pendingQueueState);
+            const result = await this.readSessionSnapshotFromServer({
+                reason: request.discovery ? 'pending-reconciliation' : 'waitForMetadataUpdate',
+            });
+            const changed = !arePendingQueueStatesEqual(before, this.pendingQueueState);
+            // A tick/hint/turn-end that joined this read dirties the same request. The already
+            // authoritative response satisfies it; monotonic pendingVersion keeps a newer hint.
+            if (request.discovery) this.observePendingDiscoveryRead(result, changed);
+            return changed;
         };
 
-        const reconcile = run().finally(() => {
-            if (this.pendingQueueStateReconcileInFlight === reconcile) {
+        // Publish the complete flight before any custody/snapshot work can emit a reentrant wake.
+        const reconcile = Promise.resolve().then(run).finally(() => {
+            if (this.pendingQueueStateReconcileInFlight?.promise === reconcile) {
                 this.pendingQueueStateReconcileInFlight = null;
             }
         });
-        this.pendingQueueStateReconcileInFlight = reconcile;
+        this.pendingQueueStateReconcileInFlight = { request, promise: reconcile };
         return await reconcile;
+    }
+
+    private clearPendingDiscoveryTimer(): void {
+        if (this.pendingDiscoveryTimer) clearTimeout(this.pendingDiscoveryTimer);
+        this.pendingDiscoveryTimer = null;
+    }
+
+    private isPendingDiscoveryProducerCurrent(): boolean {
+        const owner = this.pendingDiscoveryProducer;
+        if (!owner || owner.generation !== this.providerInputOutcomeProducerGeneration
+            || this.closed || this.runtimeTerminationStarted || this.pendingDiscoveryArchived) return false;
+        try {
+            return owner.producer.matchesCurrentSession({ metadata: this.metadata });
+        } catch {
+            return false;
+        }
+    }
+
+    private shouldDeferPendingDiscovery(): boolean {
+        return this.sessionTurnLifecycle.hasActiveTurn()
+            || this.hasMaterializationBlockingCanonicalPendingDelivery()
+            || this.pendingInputReadinessAbortController !== null
+            || this.accountSettingsSyncBarrierState === 'applying'
+            || this.accountSettingsRequestInFlight !== null;
+    }
+
+    private schedulePendingDiscovery(): void {
+        if (this.pendingDiscoveryTimer || !this.isPendingDiscoveryProducerCurrent()) return;
+        const authority = this.captureAcceptedCanonicalPendingDeliveryOperationAuthority();
+        if (!authority) return;
+        const machineId = this.sessionSocketMachineId;
+        const isCurrent = () => this.isPendingDiscoveryProducerCurrent()
+            && this.isAcceptedCanonicalPendingDeliveryOperationCurrent(authority)
+            && machineId === this.sessionSocketMachineId;
+        const delayMs = Math.min(PENDING_DISCOVERY_MAX_TIMER_DELAY_MS, Math.max(
+            Math.min(PENDING_DISCOVERY_MAX_DELAY_MS,
+                Math.round(this.pendingDiscoveryDelayMs * (0.8 + Math.random() * 0.4))),
+            this.pendingDiscoveryNotBeforeMs - Date.now(),
+        ));
+        this.pendingDiscoveryTimer = setTimeout(() => {
+            this.pendingDiscoveryTimer = null;
+            if (!isCurrent()) return;
+            // A server floor may arrive after this timer was armed, or outlive one
+            // supported timer chunk. Neither case permits an early authoritative read.
+            if (Date.now() < this.pendingDiscoveryNotBeforeMs || this.shouldDeferPendingDiscovery()) {
+                this.schedulePendingDiscovery();
+                return;
+            }
+            void this.reconcilePendingQueueState({ force: true, discovery: true })
+                .catch((error) => {
+                    logger.debug('[pendingQueue] periodic discovery reconciliation failed', { error: serializeAxiosErrorForLog(error) });
+                })
+                .finally(() => { if (isCurrent()) this.schedulePendingDiscovery(); });
+        }, delayMs);
+        this.pendingDiscoveryTimer.unref?.();
+    }
+
+    private observePendingDiscoveryRead(result: SessionSnapshotReadResult, changed: boolean): void {
+        if (result.status === 'obsolete' || !this.isPendingDiscoveryProducerCurrent()) return;
+        if (result.status === 'failed') {
+            this.pendingDiscoveryReadFailed = true;
+            this.pendingDiscoveryDelayMs = Math.min(PENDING_DISCOVERY_MAX_DELAY_MS, this.pendingDiscoveryDelayMs * 2);
+            logger.infoFile('[pendingQueue] authoritative discovery read failed', {
+                sessionId: this.sessionId,
+                retryable: result.retryable,
+                nextDelayBaseMs: this.pendingDiscoveryDelayMs,
+                ...(result.retryAfterMs === undefined ? {} : { retryAfterMs: result.retryAfterMs }),
+            });
+            if (!result.retryable) this.pendingDiscoveryProducer = null;
+            return;
+        }
+        if (result.archived) {
+            this.pendingDiscoveryArchived = true;
+            this.clearPendingDiscoveryTimer();
+            return;
+        }
+        if (result.elapsedMs >= PENDING_DISCOVERY_SLOW_READ_MS) {
+            this.pendingDiscoveryDelayMs = Math.min(PENDING_DISCOVERY_MAX_DELAY_MS,
+                Math.max(this.pendingDiscoveryDelayMs * 2, Math.ceil(result.elapsedMs / 1_000) * PENDING_DISCOVERY_BASE_DELAY_MS));
+        } else if (result.elapsedMs < PENDING_DISCOVERY_FAST_READ_MS) {
+            this.pendingDiscoveryDelayMs = PENDING_DISCOVERY_BASE_DELAY_MS;
+        }
+        if (!result.pendingQueueState) return;
+        const recovered = this.pendingDiscoveryReadFailed;
+        this.pendingDiscoveryReadFailed = false;
+        // Only an observed failed-read → readable transition, or new authoritative queue state
+        // (emitted by applyPendingQueueState), may renew the existing consumer's bounded episode.
+        if (recovered && !changed) this.publishPendingEligibilityWake();
     }
 
     shouldAttemptPendingMaterialization(opts: {
         activeTurnSteerability?: PendingForegroundSteerability;
         pendingQueueDeliveryTiming?: SessionPendingQueueDeliveryTiming;
     } = {}): boolean {
-        if (this.hasMaterializationBlockingCanonicalPendingDelivery()) return false;
+        if (this.pendingDiscoveryArchived || this.hasMaterializationBlockingCanonicalPendingDelivery()) return false;
         return countMaterializablePendingRows(this.pendingQueueState) > 0;
     }
 
@@ -2078,7 +2191,7 @@ export class ApiSessionClient extends EventEmitter {
             pendingCount: this.pendingQueueState.known ? this.pendingQueueState.pendingCount : null,
         });
         this.publishPendingEligibilityWake();
-        void this.reconcilePendingQueueState({ force: false }).catch(() => undefined);
+        void this.reconcilePendingQueueState({ force: true }).catch(() => undefined);
     }
 
     /**
@@ -2143,11 +2256,26 @@ export class ApiSessionClient extends EventEmitter {
         return true;
     }
 
-    private syncSessionSnapshotFromServer(opts: { reason: SessionSnapshotRefreshReasonInput }): Promise<boolean> {
-        if (this.closed) return Promise.resolve(false);
-        if (this.snapshotSyncInFlight) return this.snapshotSyncInFlight;
+    private async syncSessionSnapshotFromServer(opts: { reason: SessionSnapshotRefreshReasonInput }): Promise<boolean> {
+        return (await this.readSessionSnapshotFromServer(opts)).status === 'readable';
+    }
 
-        const p = (async (): Promise<boolean> => {
+    private readSessionSnapshotFromServer(opts: { reason: SessionSnapshotRefreshReasonInput }): Promise<SessionSnapshotReadResult> {
+        const lifetimeSignal = this.acceptedCanonicalPendingDeliveryOperationAbortController.signal;
+        if (this.closed || this.runtimeTerminationStarted || lifetimeSignal.aborted) return Promise.resolve({ status: 'obsolete' });
+        if (this.snapshotSyncInFlight) return this.snapshotSyncInFlight;
+        const generation = this.providerInputOutcomeProducerGeneration;
+        const epoch = this.sessionConnectionEpoch;
+        const socket = this.socket;
+        const wasConnected = socket.connected === true;
+        const machineId = this.sessionSocketMachineId;
+        const startedAtMs = Date.now();
+        const isCurrent = () => !this.closed && !this.runtimeTerminationStarted && !lifetimeSignal.aborted
+            && generation === this.providerInputOutcomeProducerGeneration
+            && epoch === this.sessionConnectionEpoch && socket === this.socket
+            && (!wasConnected || socket.connected === true)
+            && machineId === this.sessionSocketMachineId;
+        const p = (async (): Promise<SessionSnapshotReadResult> => {
             try {
                 const request = () => fetchSessionSnapshotUpdateFromServer({
                     token: this.token,
@@ -2170,7 +2298,12 @@ export class ApiSessionClient extends EventEmitter {
                     })
                     : await request();
 
-                if (this.closed) return false;
+                if (!isCurrent()) return { status: 'obsolete' };
+                if (update.archivedAt !== null && update.archivedAt !== undefined) {
+                    this.pendingDiscoveryArchived = true;
+                    this.clearPendingDiscoveryTimer();
+                    return { status: 'readable', elapsedMs: Date.now() - startedAtMs, pendingQueueState: null, archived: true };
+                }
 
                 if (update.metadata) {
                     this.metadata = update.metadata.metadata;
@@ -2197,14 +2330,31 @@ export class ApiSessionClient extends EventEmitter {
 
                 if (update.pendingQueueState) {
                     this.applyPendingQueueState(update.pendingQueueState, { emit: true });
+                    if (latestTurnStatus !== undefined && this.pendingQueueState.known
+                        && update.pendingQueueState.pendingVersion === this.pendingQueueState.pendingVersion) {
+                        // This same authoritative read already checked turn status for the exact
+                        // queue version. A consumer wake must not immediately repeat that read.
+                        this.lastTurnStatusRefreshPendingVersion = this.pendingQueueState.pendingVersion;
+                    }
                 }
-                return true;
+                return {
+                    status: 'readable', elapsedMs: Math.max(0, Date.now() - startedAtMs),
+                    pendingQueueState: update.pendingQueueState ?? null, archived: false,
+                };
             } catch (error) {
+                const classification = classifyServerEndpointError(error);
+                // Pacing belongs to this same session request even after provider rebind.
+                // It grants no authority to apply stale state or renew consumer eligibility.
+                if (!this.closed && !this.runtimeTerminationStarted && !lifetimeSignal.aborted
+                    && classification.retryAfterMs !== undefined) {
+                    this.pendingDiscoveryNotBeforeMs = Math.max(this.pendingDiscoveryNotBeforeMs, Date.now() + classification.retryAfterMs);
+                }
+                if (!isCurrent()) return { status: 'obsolete' };
                 logger.debug('[API] Failed to sync session snapshot from server', {
                     reason: opts.reason,
                     error: serializeAxiosErrorForLog(error),
                 });
-                return false;
+                return { status: 'failed', retryable: !isPermanentRequestError(error), retryAfterMs: classification.retryAfterMs };
             }
         })();
 
@@ -5479,6 +5629,11 @@ export class ApiSessionClient extends EventEmitter {
         // Only a valid canonical producer may advance the generation. Invalid bind attempts must
         // not fence the currently active runtime observer.
         const generation = ++this.providerInputOutcomeProducerGeneration;
+        this.clearPendingDiscoveryTimer();
+        this.pendingDiscoveryProducer = { generation, producer };
+        this.pendingDiscoveryReadFailed = false;
+        this.pendingDiscoveryDelayMs = PENDING_DISCOVERY_BASE_DELAY_MS;
+        this.schedulePendingDiscovery();
 
         return (outcome) => {
             if (
@@ -5931,6 +6086,7 @@ export class ApiSessionClient extends EventEmitter {
 
     async close() {
         logger.debug('[API] socket.close() called');
+        this.clearPendingDiscoveryTimer();
         this.accountSettingsRetryAbortController?.abort();
         this.executionRunPermissionHandler?.reset();
         this.executionRunPermissionHandler = null;
@@ -6007,6 +6163,7 @@ export class ApiSessionClient extends EventEmitter {
     beginRuntimeTermination(): void {
         if (this.runtimeTerminationStarted) return;
         this.runtimeTerminationStarted = true;
+        this.clearPendingDiscoveryTimer();
         this.providerInputOutcomeProducerGeneration += 1;
         this.acceptedCanonicalPendingDeliveryOperationAbortController.abort();
     }
@@ -6705,6 +6862,7 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     async materializeNextPendingMessageSafely(opts: MaterializeNextPendingOptions = {}): Promise<MaterializeNextPendingResult> {
+        if (this.pendingDiscoveryArchived) return { type: 'no_pending' };
         const supervisorState = this.sessionConnectionSupervisor?.getState();
         if (supervisorState?.phase === 'auth_failed') {
             return { type: 'auth_failure', statusCode: 401 };
@@ -6789,6 +6947,7 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     async popPendingMessage(): Promise<boolean> {
+        if (this.pendingDiscoveryArchived) return false;
         if (!await this.reconcileCanonicalPendingDeliveriesBeforeMaterialization()) {
             return false;
         }

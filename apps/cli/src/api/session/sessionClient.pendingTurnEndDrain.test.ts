@@ -3415,7 +3415,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(materializeNextMock).toHaveBeenCalledTimes(2);
   });
 
-  it('retires exact local custody after manual handling deletes the server row and materializes the later row once', async () => {
+  it('retains reserved custody after server-row absence until accepted exact committed proof releases the later row', async () => {
     const client = await createClient({
       latestTurnStatus: 'completed',
       pendingCount: 1,
@@ -3439,25 +3439,39 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     });
     expect(providerInvocations).toEqual(['manual-handled-local']);
 
-    // The exact first row was resolved with manual_handled and deleted. The later row remains.
+    // Absence could result from manual handling, but the snapshot carries no exact receipt.
     listDeliveryStatusesMock.mockResolvedValueOnce([
       { localId: 'later-local', status: 'queued' },
     ]);
     await client.reconcilePendingQueueState({ force: true });
-    expect(client.shouldAttemptPendingMaterialization()).toBe(true);
+    expect(client.shouldAttemptPendingMaterialization()).toBe(false);
+    expect((client as any).canonicalPendingDeliveryByLocalId.has('manual-handled-local')).toBe(true);
+    expect(hasProviderInputAcceptance(client, 'manual-handled-local')).toBe(false);
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+      .resolves.toEqual({ type: 'no_pending' });
+    expect(materializeNextMock).toHaveBeenCalledTimes(1);
+    expect(providerInvocations).toEqual(['manual-handled-local']);
+
+    resolveAcceptedPendingDeliveryMock.mockResolvedValueOnce({ didResolve: false });
+    confirmProviderInputAccepted(client, 'manual-handled-local');
+    await waitUntil(() => resolveAcceptedPendingDeliveryMock.mock.calls.length === 1);
+    expect((client as any).canonicalPendingDeliveryByLocalId.has('manual-handled-local')).toBe(true);
+    triggerCommittedUserMessage({ seq: 75, localId: 'manual-handled-local' });
+    expect((client as any).canonicalPendingDeliveryByLocalId.has('manual-handled-local')).toBe(false);
+    expect(client.getCommittedUserMessageSeq('manual-handled-local')).toBe(75);
     await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toMatchObject({
       type: 'materialized',
       localId: 'later-local',
     });
 
-    expect(listDeliveryStatusesMock).toHaveBeenCalledTimes(1);
+    expect(listDeliveryStatusesMock).toHaveBeenCalledTimes(2);
     expect(listDeliveryStatusesMock).toHaveBeenCalledWith({
       token: 'tok',
       sessionId: 's1',
     });
     expect(materializeNextMock).toHaveBeenCalledTimes(2);
     expect(providerInvocations).toEqual(['manual-handled-local', 'later-local']);
-    expect(hasProviderInputAcceptance(client, 'manual-handled-local')).toBe(false);
+    expect(hasProviderInputAcceptance(client, 'manual-handled-local')).toBe(true);
   });
 
   it('retires an exact discarded server row without manufacturing provider input or acceptance', async () => {
@@ -3938,7 +3952,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(materializeNextMock).toHaveBeenCalledTimes(2);
   });
 
-  it('retires an accepted-delivery claim after not-found plus exact authoritative absence without manufacturing acceptance', async () => {
+  it('retains accepted custody after not-found and absence until exact committed proof releases the later row', async () => {
     const deliveryState = { mode: 'provider' as const, unresolved: true };
     const client = await createClient({
       latestTurnStatus: 'completed',
@@ -4016,6 +4030,13 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     await waitUntil(() => resolveAcceptedPendingDeliveryMock.mock.calls.length === 1);
 
     listDeliveryStatusesMock.mockResolvedValueOnce([]);
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+      .resolves.toEqual({ type: 'no_pending' });
+    expect(materializeNextMock).toHaveBeenCalledTimes(1);
+    expect((client as any).canonicalPendingDeliveryByLocalId.has('stale-accepted-provider-m1')).toBe(true);
+    expect(hasProviderInputAcceptance(client, 'stale-accepted-provider-m1')).toBe(true);
+    triggerCommittedUserMessage({ seq: 71, localId: 'stale-accepted-provider-m1' });
+    expect(client.getCommittedUserMessageSeq('stale-accepted-provider-m1')).toBe(71);
     await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toMatchObject({
       type: 'materialized',
       localId: 'stale-accepted-provider-m2',
@@ -4023,7 +4044,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
     expect(materializeNextMock).toHaveBeenCalledTimes(2);
     expect((client as any).canonicalPendingDeliveryByLocalId.has('stale-accepted-provider-m1')).toBe(false);
-    expect(hasProviderInputAcceptance(client, 'stale-accepted-provider-m1')).toBe(false);
+    expect(hasProviderInputAcceptance(client, 'stale-accepted-provider-m1')).toBe(true);
   });
 
   it('retires an accepted-delivery claim only from the exact committed replay identity and seq', async () => {
@@ -4451,7 +4472,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(materializeNextMock).toHaveBeenCalledTimes(1);
   });
 
-  it('retires a stale blocked-delivery claim after exact authoritative absence without manufacturing acceptance', async () => {
+  it('retains custody after failed block and absence until accepted exact committed proof releases the later row', async () => {
     const deliveryState = { mode: 'provider' as const, unresolved: true };
     const client = await createClient({
       latestTurnStatus: 'completed',
@@ -4522,6 +4543,17 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(client.shouldAttemptPendingMaterialization()).toBe(false);
 
     listDeliveryStatusesMock.mockResolvedValueOnce([]);
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+      .resolves.toEqual({ type: 'no_pending' });
+    expect(materializeNextMock).toHaveBeenCalledTimes(1);
+    expect((client as any).canonicalPendingDeliveryByLocalId.has('stale-block-provider-m1')).toBe(true);
+    expect(hasProviderInputAcceptance(client, 'stale-block-provider-m1')).toBe(false);
+    resolveAcceptedPendingDeliveryMock.mockResolvedValueOnce({ didResolve: false });
+    confirmProviderInputAccepted(client, 'stale-block-provider-m1');
+    await waitUntil(() => resolveAcceptedPendingDeliveryMock.mock.calls.length === 1);
+    expect((client as any).canonicalPendingDeliveryByLocalId.has('stale-block-provider-m1')).toBe(true);
+    triggerCommittedUserMessage({ seq: 81, localId: 'stale-block-provider-m1' });
+    expect(client.getCommittedUserMessageSeq('stale-block-provider-m1')).toBe(81);
     const secondResult = await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
     expect(materializeNextMock).toHaveBeenCalledTimes(2);
     expect(secondResult).toMatchObject({
@@ -4529,7 +4561,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       localId: 'stale-block-provider-m2',
     });
     expect(blockPendingDeliveryMock).toHaveBeenCalledTimes(1);
-    expect(hasProviderInputAcceptance(client, 'stale-block-provider-m1')).toBe(false);
+    expect(hasProviderInputAcceptance(client, 'stale-block-provider-m1')).toBe(true);
   });
 
   it('does not use turn-end catch-up as a hidden transcript queue for canonical pending deliveries', async () => {
