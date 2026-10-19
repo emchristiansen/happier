@@ -16,6 +16,7 @@ import {
 } from '@/settings/accountSettings/activeAccountSettingsSnapshot';
 import type { SessionMutationOutbox } from './mutations/createSessionMutationOutbox';
 import { logger } from '@/ui/logger';
+import { createSocketAckError } from '@/session/transport/shared/socketAck';
 import {
   PendingQueueAcceptedSettlementError,
   PendingQueueMaterializationTransportAmbiguousError,
@@ -2309,21 +2310,26 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(blockPendingDeliveryMock).not.toHaveBeenCalled();
   });
 
-  it('retries the original accepted settlement after a pre-emit socket drop recovers without another provider entry', async () => {
+  it.each([true, false])('retries the original accepted settlement after a pre-emit socket drop recovers without another provider entry (didResolve=%s)', async (didResolve) => {
     const actualTransport = await vi.importActual<typeof import('./pendingQueueV2Transport')>('./pendingQueueV2Transport');
     const localId = 'pre-emit-drop-exact-local';
     const original = createProviderDeliveryMaterializeResult(localId);
     const committed = {
-      ...original.message,
       id: 'committed-pre-emit-drop',
       seq: 83,
-      deliveryState: null,
+      localId,
+      messageRole: original.message.messageRole,
+      content: original.message.content,
+      createdAt: original.message.createdAt,
+      updatedAt: original.message.updatedAt,
     };
-    const relayCommit = vi.fn(() => ({
-      ok: true, didResolve: true, pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 3, message: committed,
-    }));
+    const transcriptCommit = vi.fn();
+    const settlementAck = vi.fn(() => {
+      if (didResolve) transcriptCommit();
+      return { ok: true, didResolve, pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 3, message: committed };
+    });
     const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 }, {
-      sessionSocketEmitWithAck: (event) => event === 'pending-delivery-accepted-v1' ? relayCommit() : { ok: true },
+      sessionSocketEmitWithAck: (event) => event === 'pending-delivery-accepted-v1' ? settlementAck() : { ok: true },
     });
     await waitForCurrentPendingInputContract(client);
     materializeNextMock.mockResolvedValueOnce(original);
@@ -2350,7 +2356,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(warningSpy).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
       localId, attempt: 1, retryAfterMs: 1000, willRetry: true,
     }));
-    expect(relayCommit).not.toHaveBeenCalled();
+    expect(settlementAck).not.toHaveBeenCalled();
     expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
     await vi.advanceTimersByTimeAsync(999);
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
@@ -2359,7 +2365,8 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     for (const [request] of resolveAcceptedPendingDeliveryMock.mock.calls) {
       expect(request).toEqual({ socket: sessionSocketStub, sessionId: 's1', localId });
     }
-    expect(relayCommit).toHaveBeenCalledTimes(1);
+    expect(settlementAck).toHaveBeenCalledTimes(1);
+    expect(transcriptCommit).toHaveBeenCalledTimes(didResolve ? 1 : 0);
     expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(false);
     expect(client.hasPendingProviderInputAcceptance(localId)).toBe(true);
     expect(client.getCommittedUserMessageSeq(localId)).toBe(83);
@@ -2368,6 +2375,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
   });
 
   it('resolves server-owned provider delivery after provider acceptance', async () => {
+    vi.spyOn(logger, 'infoFile').mockImplementation(() => { throw new Error('diagnostic sink unavailable'); });
     const deliveryState = { mode: 'provider' as const, unresolved: true };
     const client = await createClient({
       latestTurnStatus: 'completed',
@@ -2520,7 +2528,11 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
 
   });
 
-  it('abandons the operation-local accepted settlement retry when its originating runtime is replaced', async () => {
+  it.each([
+    { error: new PendingQueueAcceptedSettlementError('transaction-unavailable', 1250), delayMs: 1250 },
+    { error: createSocketAckError({ code: 'socket_not_connected', event: 'pending-delivery-accepted-v1', message: 'disconnected before emit' }), delayMs: 1000 },
+  ])('abandons the operation-local accepted settlement retry when its originating runtime is replaced %#', async ({ error, delayMs }) => {
+    const warningSpy = vi.spyOn(logger, 'warn');
     const client = await createClient({
       latestTurnStatus: 'completed',
       pendingCount: 1,
@@ -2530,7 +2542,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     await waitForCurrentPendingInputContract(client);
     materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult('runtime-fenced-settlement'));
     resolveAcceptedPendingDeliveryMock
-      .mockRejectedValueOnce(new PendingQueueAcceptedSettlementError('transaction-unavailable', 1_250))
+      .mockRejectedValueOnce(error)
       .mockResolvedValueOnce({
         didResolve: true,
         pendingQueueState: { known: true, pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 3 },
@@ -2541,9 +2553,10 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     confirmProviderInputAccepted(client, 'runtime-fenced-settlement');
     await vi.advanceTimersByTimeAsync(0);
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
+    expect(warningSpy).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ willRetry: true, retryAfterMs: delayMs }));
 
     client.beginRuntimeTermination();
-    await vi.advanceTimersByTimeAsync(1_250);
+    await vi.advanceTimersByTimeAsync(delayMs);
 
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
     expect((client as any).canonicalPendingDeliveryByLocalId.has('runtime-fenced-settlement')).toBe(true);
@@ -2674,6 +2687,8 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       attempt: 3,
       retryAfterMs: 4_000,
       willRetry: true,
+      retryDisposition: 'same_operation_after_backoff',
+      failure: { kind: 'socket', code: 'socket_ack_timeout' },
       errorValuesOmitted: true,
     }));
   });

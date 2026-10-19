@@ -11,10 +11,25 @@ connection epoch, producer and session lifetime remain current. It never submits
 the provider input again. An explicit definitive refusal ends that operation's
 retries while preserving its unresolved custody.
 
+The local pre-emit `socket_not_connected` failure also permits that same settlement
+retry only when the error explicitly carries `retryable: true`. An unqualified
+failure does not gain retry permission. The existing authority checks still stop
+the originating operation if its connection or runtime is no longer current.
+
 Successful settlement releases the local gate that holds later materialization.
 Continued transport failure cannot promise queue progress. Disconnect, producer
 replacement and shutdown stop the originating operation; reconnect retains the
 existing exact-intent reconciliation path.
+
+Ordinary info-level file entries identify exact acceptance observation, absent
+canonical custody, unavailable settlement authority and admission to the existing
+settlement owner, with the original session/input identity and generation/epoch.
+Admission records an owner handoff, not proof that a request reached the server.
+The existing unresolved-settlement warning includes the recognized socket,
+ambiguous-transport or server-acknowledgement failure and the chosen retry
+disposition; an unrecognized failure remains explicitly unknown. These entries
+do not include arbitrary error messages, stacks or payload values. A missing
+entry does not prove that acceptance or settlement never happened.
 
 ## Live runner wake-up recovery (development)
 
