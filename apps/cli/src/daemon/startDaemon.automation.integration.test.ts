@@ -12,6 +12,7 @@ import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from './connectedService
 import { DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1 } from './connectedServices/accountGroups/selection/selectConnectedServiceAuthGroupCandidate';
 import type { TrackedSession } from './types';
 import { PI_BROKER_SELECTION_IDENTITY_ENV } from '@/backends/pi/brokerExtension';
+import { createSessionRecordFixture } from '@/testkit/backends/sessionFixtures';
 
 type ShutdownSource = 'happier-app' | 'happier-cli' | 'os-signal' | 'exception';
 type BuildHappyCliSubprocessLaunchSpec = typeof import('@/utils/spawnHappyCLI').buildHappyCliSubprocessLaunchSpec;
@@ -1028,11 +1029,22 @@ describe('startDaemon automation wiring (integration)', () => {
     spawnSession: (options: unknown) => Promise<unknown>;
   }> {
     const { startDaemon } = await import('./startDaemon');
+    const rpcReady = createDeferred<void>();
+    const registerHandlers = harness.apiMachine.setRPCHandlers;
+    const originalRegistration = registerHandlers.getMockImplementation();
+    registerHandlers.mockImplementation((...args) => {
+      originalRegistration?.(...args);
+      rpcReady.resolve();
+    });
     const run = startDaemon();
-    await waitForCondition(
-      () => harness.apiMachine.setRPCHandlers.mock.calls.length >= 1,
-      'Expected daemon RPC handlers to be registered',
-    );
+    try {
+      await Promise.race([
+        rpcReady.promise,
+        run.then(() => { throw new Error('Daemon exited before registering RPC handlers'); }),
+      ]);
+    } finally {
+      registerHandlers.mockImplementation(originalRegistration ?? (() => undefined));
+    }
 
     const handlers = harness.apiMachine.setRPCHandlers.mock.calls[0]?.[0] as {
       spawnSession?: (options: unknown) => Promise<unknown>;
@@ -1207,9 +1219,14 @@ describe('startDaemon automation wiring (integration)', () => {
       const { resolveExistingSessionAttachContext } = await import('./sessionEncryption/resolveExistingSessionAttachContext');
       const { resolveSpawnChildEnvironment } = await import('./spawn/resolveSpawnChildEnvironment');
       const { resolveCatalogAgentId } = await import('@/backends/catalog');
+      const { fetchSessionById } = await import('@/session/transport/http/sessionsHttp');
 
       vi.mocked(resolveCatalogAgentId).mockReturnValue('claude');
       vi.mocked(shouldResolveConnectedServiceAuthForSpawn).mockReturnValue(true);
+      vi.mocked(fetchSessionById).mockResolvedValueOnce(createSessionRecordFixture({
+        id: 'sess-existing',
+        archivedAt: null,
+      }));
       vi.mocked(resolveExistingSessionAttachContext).mockResolvedValueOnce({
         ok: true,
         attachPayload: { v: 2, encryptionMode: 'plain', lastObservedMessageSeq: 0 },
