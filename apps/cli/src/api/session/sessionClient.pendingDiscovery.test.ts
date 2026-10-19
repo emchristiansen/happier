@@ -365,6 +365,71 @@ describe("authoritative pending discovery through the session client and consume
     expect(detailReads).toHaveBeenCalledTimes(2);
   });
 
+  it("preserves a held old-generation Retry-After after rebind without renewing eligibility", async () => {
+    const { client } = await createClient();
+    const eligibilityUpdates = vi.fn();
+    client.on("pending-eligibility-updated", eligibilityUpdates);
+    const response = createDeferred<unknown>();
+    readSnapshot = () => response.promise;
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(detailReads).toHaveBeenCalledTimes(1);
+    bind(client);
+    await vi.advanceTimersByTimeAsync(1_000);
+    response.resolve({ status: 429, headers: { "retry-after": "3600" }, data: {} });
+    await vi.advanceTimersByTimeAsync(0);
+    readSnapshot = async () => ({ status: 200, data: { session: snapshot } });
+    await vi.advanceTimersByTimeAsync(3_599_999);
+    expect(detailReads).toHaveBeenCalledTimes(1);
+    expect(eligibilityUpdates).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(detailReads).toHaveBeenCalledTimes(2);
+    expect(eligibilityUpdates).not.toHaveBeenCalled();
+    expect(client.shouldAttemptPendingMaterialization()).toBe(false);
+    expect(claims).not.toHaveBeenCalled();
+    expect(settlements).not.toHaveBeenCalled();
+  });
+
+  it("chunks a finite Retry-After beyond the timer range and rechecks its full deadline before reading", async () => {
+    await createClient();
+    const response = createDeferred<unknown>();
+    readSnapshot = () => response.promise;
+    await vi.advanceTimersByTimeAsync(300_000);
+    const timers: Array<{ delayMs: number; fire: () => void }> = [];
+    // Capture only the external timer boundary, avoiding millions of unrelated ticks
+    // while exercising a finite server floor just beyond Node's supported timer range.
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((fire: () => void, delay?: number) => {
+      timers.push({ delayMs: Number(delay ?? 0), fire });
+      return { unref: vi.fn() } as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout);
+    vi.spyOn(globalThis, "clearTimeout").mockImplementation(() => undefined);
+    response.resolve({ status: 429, headers: { "retry-after": "2147484" }, data: {} });
+    await vi.advanceTimersByTimeAsync(0);
+    const serverDeadline = Date.now() + 2_147_484_000;
+    const first = timers.at(-1)!;
+    expect(first.delayMs).toBe(2_147_483_647);
+    readSnapshot = async () => ({ status: 200, data: { session: snapshot } });
+    vi.setSystemTime(Date.now() + first.delayMs);
+    first.fire();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(detailReads).toHaveBeenCalledTimes(1);
+    const rearmed = timers.at(-1)!;
+    expect(rearmed).not.toBe(first);
+    expect(rearmed.delayMs).toBeGreaterThanOrEqual(serverDeadline - Date.now());
+    vi.setSystemTime(serverDeadline - 1);
+    rearmed.fire();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(detailReads).toHaveBeenCalledTimes(1);
+    const deadlineTimer = timers.at(-1)!;
+    expect(deadlineTimer).not.toBe(rearmed);
+    vi.setSystemTime(serverDeadline);
+    deadlineTimer.fire();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(detailReads).toHaveBeenCalledTimes(2);
+    expect(timers.every(({ delayMs }) => delayMs <= 2_147_483_647)).toBe(true);
+    expect(claims).not.toHaveBeenCalled();
+    expect(settlements).not.toHaveBeenCalled();
+  });
+
   it("never starts a paginated compatibility scan from periodic discovery when the detail route is absent", async () => {
     await createClient();
     readSnapshot = async () => ({
