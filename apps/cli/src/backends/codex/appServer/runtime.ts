@@ -4164,6 +4164,8 @@ export function createCodexAppServerRuntime(params: Readonly<{
     };
 
     const startOrLoad = async (options: CodexAppServerStartOrLoadOptions = {}): Promise<void> => {
+        // Native setup may finish after task cancellation; its deferred goal must not.
+        const initialGoalSignal = directControlInputAbort.signal;
         // A runtime may attach more than once without replacing its app-server client (for
         // example resume fallback or an explicit second load). Every attach must re-arm the
         // history fence before the provider can emit notifications for the selected thread.
@@ -4261,11 +4263,8 @@ export function createCodexAppServerRuntime(params: Readonly<{
         );
         const initialGoal = options.initialGoal;
         if (initialGoal?.objective) {
-            if (!await params.session.waitForProviderInputAdmission(new AbortController().signal)) {
-                const error = new Error('Provider input admission closed before initial Codex goal');
-                error.name = 'AbortError';
-                throw error;
-            }
+            await waitForDirectControlInputAdmission(initialGoalSignal);
+            initialGoalSignal.throwIfAborted();
             const response = await client.request('thread/goal/set', {
                 threadId: startOrLoadResult.nextThreadId,
                 objective: trimStringValue(initialGoal.objective),

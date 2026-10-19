@@ -1412,7 +1412,7 @@ async function applyAlreadyRunningExistingSessionRuntimeSnapshot(params: Readonl
 }
 
 class SessionArchiveAdmissionUnavailableError extends Error {
-  constructor() { super('Session archive admission is temporarily unreadable'); }
+  constructor(readonly retryAfterMs?: number) { super('Session archive admission is temporarily unreadable'); }
 }
 
 async function readDaemonSessionArchiveAdmission(params: Readonly<{
@@ -1424,8 +1424,8 @@ async function readDaemonSessionArchiveAdmission(params: Readonly<{
   const state = await readSessionArchiveState({
     token: params.credentials.token, sessionId: params.sessionId, signal: new AbortController().signal,
   });
-  if (state === 'unavailable') throw new SessionArchiveAdmissionUnavailableError();
-  return state === 'unarchived';
+  if (state.kind === 'unavailable') throw new SessionArchiveAdmissionUnavailableError(state.retryAfterMs);
+  return state.kind === 'unarchived';
 }
 
 async function waitForDaemonSessionArchiveAdmission(params: Readonly<{
@@ -1438,6 +1438,7 @@ async function waitForDaemonSessionArchiveAdmission(params: Readonly<{
   const read = createBackoff({
     maxFailureCount: Number.POSITIVE_INFINITY,
     shouldRetry: () => !params.isShutdownRequested?.(),
+    retryAfterMs: (error) => error instanceof SessionArchiveAdmissionUnavailableError ? error.retryAfterMs : undefined,
   });
   return await read(async () => await readDaemonSessionArchiveAdmission(params));
 }
@@ -3214,6 +3215,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             const retryArchiveAdmission = createBackoff({
               maxFailureCount: Number.POSITIVE_INFINITY,
               shouldRetry: (error) => error instanceof SessionArchiveAdmissionUnavailableError && !shutdownInitiated,
+              retryAfterMs: (error) => error instanceof SessionArchiveAdmissionUnavailableError ? error.retryAfterMs : undefined,
             });
             return await retryArchiveAdmission(async () => await spawnConcurrencyGate.run(async () => {
               const resolvedDirectory = normalizedOptions.directory;

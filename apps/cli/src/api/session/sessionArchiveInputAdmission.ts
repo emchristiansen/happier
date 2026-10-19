@@ -42,11 +42,11 @@ export class SessionArchiveInputAdmission {
             token: this.opts.token, sessionId: this.opts.sessionId, signal: passSignal,
           });
           if (lifetime.aborted) return { kind: 'refused' } as const;
-          if (epoch !== this.opts.connectionEpoch() || archive === 'unavailable') {
-            this.retry.failed();
+          if (epoch !== this.opts.connectionEpoch() || archive.kind === 'unavailable') {
+            this.retry.failed(archive.kind === 'unavailable' ? archive.retryAfterMs : undefined);
             return { kind: 'waiting' } as const;
           }
-          if (archive === 'archived') {
+          if (archive.kind === 'archived') {
             this.archived = true;
             // Waiting for our own physical exit would deadlock this delivery boundary.
             // Cleanup is bound to the observing runner, never rediscovered by session ID.

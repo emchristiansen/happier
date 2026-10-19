@@ -3361,6 +3361,80 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     }
   });
 
+  it.each(['spawn', 'adoption', 'wake'] as const)('honors the archive HTTP retry floor before %s', async (boundary) => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const id = 'f1-http-floor';
+    const floorRead = createDeferred<void>();
+    const resumedRead = createDeferred<void>();
+    let reads = 0;
+    archiveHttp.read = async (requestedId) => {
+      expect(requestedId).toBe(id);
+      reads += 1;
+      if (boundary === 'wake' && reads === 1) {
+        return { status: 200, data: { session: createSessionRecordFixture({ id, archivedAt: null }) } };
+      }
+      if (reads === (boundary === 'wake' ? 2 : 1)) {
+        floorRead.resolve();
+        return { status: 429, headers: { 'retry-after': '60' }, data: {} };
+      }
+      resumedRead.resolve();
+      return { status: 200, data: { session: createSessionRecordFixture({ id, archivedAt: 42 }) } };
+    };
+    sessionRunnerActivityBoundaryMocks.readProcessRunState.mockResolvedValue(boundary === 'spawn' ? 'dead' : 'servable');
+    pendingMaterializationRpcMocks.resolveSessionTransportContext.mockResolvedValue({
+      ok: true, sessionId: id, rawSession: { id, active: true, encryptionMode: 'plain' },
+      mode: 'plain', ctx: pendingMaterializationRpcMocks.ctx,
+    });
+    pendingMaterializationRpcMocks.callSessionRpc.mockImplementation(async (params) =>
+      params.method.endsWith('wakeCapability.v1.get')
+        ? { ok: true, capability: 'pending_queue_wake_v1', protocolVersion: 1, method: 'session.pendingQueue.wake.v1' }
+        : { ok: true, result: 'wake_published' });
+    vi.mocked(fetchSessionByIdCompat).mockResolvedValue(createSessionRecordFixture({
+      id, encryptionMode: 'plain', metadata: JSON.stringify({ flavor: 'codex', path: tmpdir(), codexSessionId: 'f1-vendor-id' }),
+    }));
+    let run: Promise<void> | null = null;
+    let result: Promise<unknown> | null = null;
+    const tracked: { current: Parameters<typeof import('./sessions/onHappySessionWebhook').createOnHappySessionWebhook>[0]['pidToTrackedSession'] | null } = { current: null };
+    try {
+      const webhook = await import('./sessions/onHappySessionWebhook');
+      vi.mocked(webhook.createOnHappySessionWebhook).mockImplementation(({ pidToTrackedSession }) => {
+        tracked.current = pidToTrackedSession;
+        return vi.fn();
+      });
+      const { startDaemon } = await import('./startDaemon');
+      run = startDaemon();
+      const spawnSession = await waitForSpawnSessionRegistration();
+      if (boundary !== 'spawn') tracked.current!.set(12345, {
+        pid: 12345, startedBy: 'terminal', happySessionId: id,
+        spawnOptions: { directory: tmpdir(), existingSessionId: id, backendTarget: { kind: 'builtInAgent', agentId: 'codex' } },
+      });
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+      result = spawnSession({ directory: tmpdir(), existingSessionId: id,
+        backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+        existingSessionAttachPayload: { v: 2, encryptionMode: 'plain' } as any });
+      await floorRead.promise;
+      await vi.advanceTimersByTimeAsync(0);
+      const readsBeforeFloor = boundary === 'wake' ? 2 : 1;
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(reads).toBe(readsBeforeFloor);
+      expect(spawnHappyCLI).not.toHaveBeenCalled();
+      expect(pendingMaterializationRpcMocks.callSessionRpc.mock.calls.some(([request]) => request.method.endsWith(':session.pendingQueue.wake.v1'))).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await resumedRead.promise;
+      await expect(result).resolves.toMatchObject(boundary === 'wake'
+        ? { type: 'success', runnerAcceptance: 'preexisting_or_adopted' }
+        : { type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED });
+      expect(reads).toBe(readsBeforeFloor + 1);
+      expect(spawnHappyCLI).not.toHaveBeenCalled();
+    } finally {
+      await vi.advanceTimersByTimeAsync(60_000);
+      await result;
+      vi.useRealTimers();
+      if (run) { harness.requestShutdown('happier-cli'); await run; }
+      exitSpy.mockRestore();
+    }
+  });
+
   it('rereads archive state after a queued start obtains its physical-spawn slot', async () => {
     vi.stubEnv('HAPPIER_DAEMON_MAX_CONCURRENT_SPAWNS', '1');
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);

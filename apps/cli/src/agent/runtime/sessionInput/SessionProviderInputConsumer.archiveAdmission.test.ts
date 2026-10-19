@@ -331,6 +331,119 @@ describe('archived session input admission', () => {
     }
   });
 
+  it.each([
+    ['setup', 'cancel'], ['setup', 'reset'], ['admission', 'cancel'], ['admission', 'reset'],
+  ] as const)('keeps an initial goal cancelled during delayed %s after %s', async (boundary, cancellation) => {
+    const started = createDeferred<void>();
+    const released = createDeferred<void>();
+    readArchive = async () => {
+      if (boundary === 'admission') { started.resolve(); await released.promise; }
+      return { status: 200, data: { session: record() } };
+    };
+    const { session } = await createConsumer();
+    const { runtime, request } = await attachDirectControls(session, {
+      loadThread: false,
+      waitForThreadStart: boundary === 'setup'
+        ? async () => { started.resolve(); await released.promise; }
+        : undefined,
+    });
+    const result = runtime.startOrLoad({
+      resumeId: 'f1-direct-thread', importHistory: false,
+      initialGoal: { objective: 'Do not run this abandoned initial goal' },
+    });
+    const outcome = result.then(
+      () => ({ kind: 'success' as const }),
+      (error: unknown) => ({ kind: 'failure' as const, error }),
+    );
+    try {
+      await started.promise;
+      await runtime[cancellation]();
+      // A transport may complete after cancellation. A positive late reply is not permission.
+      released.resolve();
+      await expect(outcome).resolves.toMatchObject({ kind: 'failure', error: { name: 'AbortError' } });
+      expect(request.mock.calls.filter(([method]) => method === 'thread/goal/set')).toEqual([]);
+    } finally {
+      released.resolve();
+      session.beginRuntimeTermination();
+      await outcome;
+    }
+  });
+
+  it('retains the exact initial goal through unreadable admission until it becomes available', async () => {
+    const retryStarted = createDeferred<void>();
+    const readable = createDeferred<unknown>();
+    let reads = 0;
+    readArchive = async () => {
+      if (++reads === 1) return { status: 503, data: {} };
+      retryStarted.resolve();
+      return await readable.promise;
+    };
+    const { session } = await createConsumer();
+    const { runtime, request } = await attachDirectControls(session, { loadThread: false });
+    const result = runtime.startOrLoad({
+      resumeId: 'f1-direct-thread', importHistory: false,
+      initialGoal: { objective: 'Retain this exact initial goal', status: 'paused', tokenBudget: 1200 },
+    });
+    try {
+      await retryStarted.promise;
+      expect(request.mock.calls.filter(([method]) => method === 'thread/goal/set')).toEqual([]);
+      readable.resolve({ status: 200, data: { session: record() } });
+      await result;
+      expect(request.mock.calls.filter(([method]) => method === 'thread/goal/set')).toEqual([
+        ['thread/goal/set', { threadId: 'f1-direct-thread', objective: 'Retain this exact initial goal', status: 'paused', tokenBudget: 1200 }],
+      ]);
+    } finally {
+      readable.resolve({ status: 503, data: {} });
+      session.beginRuntimeTermination();
+      await result.catch(() => {});
+    }
+  });
+
+  it.each(['during response', 'after response'] as const)('honors the physical archive HTTP retry floor across fresh connection events %s', async (eventTiming) => {
+    const response = createDeferred<unknown>();
+    let reads = 0;
+    readArchive = async () => ++reads === 1 ? response.promise : { status: 200, data: { session: record() } };
+    const events = new EventEmitter();
+    const abort = new AbortController();
+    let epoch = 1;
+    const admission = new SessionArchiveInputAdmission({
+      token: 'synthetic-f1-token', sessionId, lifetime: abort.signal, connectionEpoch: () => epoch,
+      waitForFreshEvent: (signal) => new Promise<boolean>((resolve) => {
+        const finish = (updated: boolean) => { events.off('eligibility', onEvent); signal.removeEventListener('abort', onAbort); resolve(updated); };
+        const onEvent = () => finish(true);
+        const onAbort = () => finish(false);
+        events.on('eligibility', onEvent);
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      }),
+      requestArchivedStop: async () => { throw new Error('unarchived result must not request a stop'); },
+    });
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    let finished = false;
+    const result = admission.wait(abort.signal).then((value) => { finished = true; return value; });
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reads).toBe(1);
+      if (eventTiming === 'during response') { epoch += 1; events.emit('eligibility'); }
+      response.resolve({ status: 429, headers: { 'retry-after': '60' }, data: {} });
+      await vi.advanceTimersByTimeAsync(0);
+      if (eventTiming === 'after response') { epoch += 1; events.emit('eligibility'); }
+      await vi.advanceTimersByTimeAsync(59_999);
+      events.emit('eligibility');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reads).toBe(1);
+      expect(finished).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(result).resolves.toBe(true);
+      expect(reads).toBe(2);
+    } finally {
+      abort.abort();
+      response.resolve({ status: 503, data: {} });
+      await vi.advanceTimersByTimeAsync(0);
+      await result;
+    }
+  });
+
   it('cleans only the observing runner after a delayed archive read and successor attachment', async () => {
     const read = createDeferred<unknown>();
     const started = createDeferred<void>();

@@ -51,7 +51,9 @@ export function createBackoff(
         shouldRetry?: (e: any, failuresCount: number) => boolean,
         minDelay?: number,
         maxDelay?: number,
-        maxFailureCount?: number
+        maxFailureCount?: number,
+        /** Optional server floor for this failed attempt; never capped by local jitter. */
+        retryAfterMs?: (error: unknown) => number | undefined
     }): BackoffFunc {
     return async <T>(callback: () => Promise<T>): Promise<T> => {
         let currentFailureCount = 0;
@@ -85,8 +87,12 @@ export function createBackoff(
                 if (opts && opts.onError) {
                     opts.onError(e, currentFailureCount);
                 }
-                let waitForRequest = exponentialBackoffDelay(currentFailureCount, minDelay, maxDelay, maxFailureCount);
-                await delay(waitForRequest);
+                const localDelay = exponentialBackoffDelay(currentFailureCount, minDelay, maxDelay, maxFailureCount);
+                const retryAfterMs = opts?.retryAfterMs?.(e);
+                const serverDelay = typeof retryAfterMs === 'number' && Number.isFinite(retryAfterMs)
+                    ? Math.max(0, Math.ceil(retryAfterMs))
+                    : 0;
+                await delay(Math.max(localDelay, serverDelay));
             }
         }
     };
