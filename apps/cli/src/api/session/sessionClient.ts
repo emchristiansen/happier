@@ -5954,6 +5954,9 @@ export class ApiSessionClient extends EventEmitter {
 
     async close() {
         logger.debug('[API] socket.close() called');
+        // Pending control RPCs can be waiting here; release archive admission before
+        // draining RPC executions so closing cannot wait on its own lifetime abort.
+        this.archiveAdmissionTermination.abort();
         this.accountSettingsRetryAbortController?.abort();
         this.executionRunPermissionHandler?.reset();
         this.executionRunPermissionHandler = null;

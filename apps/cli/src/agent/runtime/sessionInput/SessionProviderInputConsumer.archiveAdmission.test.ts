@@ -16,6 +16,9 @@ import { DeferredApiSessionClient, type DeferredApiSessionTarget } from '@/agent
 import { runClaudeUnifiedTerminalSession } from '@/backends/claude/unifiedTerminal/runClaudeUnifiedTerminalSession';
 import type { TerminalAttachmentId, TerminalHostAdapter, TerminalHostHandle } from '@/integrations/terminalHost/_types';
 import { logger } from '@/ui/logger';
+import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
+import { createCodexAppServerRuntime } from '@/backends/codex/appServer/runtime';
+import type { DisposableCodexAppServerClient } from '@/backends/codex/appServer/client/createCodexAppServerClient';
 
 // Exercise the real session logger at its normal level, including when CI enables DEBUG.
 vi.hoisted(() => { vi.stubEnv('HAPPIER_LOG_LEVEL', 'info'); });
@@ -29,9 +32,18 @@ let userSocket: ApiSessionSocketStub;
 let readArchive: (signal: AbortSignal) => Promise<unknown>;
 let apiModule: typeof import('@/api/api');
 const clients: ApiSessionClient[] = [];
+const runtimes: ReturnType<typeof createCodexAppServerRuntime>[] = [];
+let providerClient: DisposableCodexAppServerClient;
 
-// Only network boundaries are replaced. The factory, session client, archive reader,
-// retry owner and consumer all execute their real production implementations.
+// The provider process/JSON-RPC transport is the external boundary. Runtime controls,
+// RPC registration/invocation and the existing-ID archive admission remain real.
+vi.mock('@/backends/codex/appServer/client/createCodexAppServerClient', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/backends/codex/appServer/client/createCodexAppServerClient')>(),
+  createCodexAppServerClient: async () => providerClient,
+}));
+
+// HTTP and socket transports are external boundaries. The API factory, session
+// client, archive reader, retry owner and consumer execute their real implementations.
 vi.mock('axios', async () => {
   const { createOfflineAxios } = await import('@/testkit/http/offlineAxios');
   const offline = createOfflineAxios(async (url) => {
@@ -80,6 +92,59 @@ async function createConsumer(attachSessionId = sessionId, requestArchivedSessio
   return { session, queue, consumer: createSessionProviderInputConsumer({ messageQueue: queue, session }) };
 }
 
+async function attachDirectControls(session: ApiSessionClient, options: {
+  loadThread?: boolean;
+  waitForThreadStart?: () => Promise<void>;
+} = {}) {
+  const notifications = new Map<string, (params: unknown) => void | Promise<void>>();
+  const request = vi.fn<DisposableCodexAppServerClient['request']>(async (method, params) => {
+    if (method === 'thread/resume' || method === 'thread/start') {
+      await options.waitForThreadStart?.();
+      return { thread: { id: 'f1-direct-thread', turns: [] } };
+    }
+    if (method === 'thread/goal/get') return { goal: null };
+    if (method === 'collaborationMode/list' || method === 'model/list') return { data: [] };
+    if (method === 'thread/goal/set') return { goal: { ...(params as Record<string, unknown>), id: 'f1-direct-goal' } };
+    if (method === 'review/start') {
+      setImmediate(() => {
+        void notifications.get('turn/completed')?.({
+          threadId: 'f1-direct-thread', turn: { id: 'f1-direct-review', status: 'completed' },
+        });
+      });
+      return { turn: { id: 'f1-direct-review' } };
+    }
+    throw new Error(`Unconfigured offline Codex request: ${method}`);
+  });
+  providerClient = {
+    request, notify: async () => {}, dispose: async () => {},
+    onExit: () => () => {}, registerRequestHandler: () => () => {},
+    registerNotificationHandler: (method, handler) => {
+      notifications.set(method, handler);
+      return () => { notifications.delete(method); };
+    },
+  };
+  const runtime = createCodexAppServerRuntime({
+    directory: process.cwd(), session, onThinkingChange: () => {},
+    // The synthetic external transport never needs provider credentials or runtime auth.
+    processEnv: {},
+  });
+  runtimes.push(runtime);
+  if (options.loadThread !== false) await runtime.startOrLoad({ resumeId: 'f1-direct-thread', importHistory: false });
+  session.setSessionRuntimeControls(runtime);
+  return { runtime, request };
+}
+
+function invokeDirectControl(session: ApiSessionClient, kind: 'goal' | 'review') {
+  return kind === 'goal'
+    ? session.rpcHandlerManager.invokeLocal(SESSION_RPC_METHODS.SESSION_GOAL_SET, {
+      objective: 'Retain this exact goal', status: 'paused', tokenBudget: 1200,
+    })
+    : session.rpcHandlerManager.invokeLocal(SESSION_RPC_METHODS.SESSION_REVIEW_START_INLINE, {
+      engineIds: ['codex'], instructions: 'Retain this exact review', runLocation: 'current_session',
+      changeType: 'uncommitted', base: { kind: 'none' },
+    });
+}
+
 describe('archived session input admission', () => {
   beforeAll(async () => {
     for (const name of ['HAPPIER_SERVER_URL', 'HAPPIER_LOCAL_SERVER_URL', 'HAPPIER_PUBLIC_SERVER_URL', 'HAPPIER_WEBAPP_URL']) {
@@ -100,6 +165,7 @@ describe('archived session input admission', () => {
 
   afterEach(async () => {
     vi.useRealTimers();
+    for (const runtime of runtimes.splice(0)) await runtime.reset();
     for (const client of clients.splice(0)) await client.close();
   });
   afterAll(() => {
@@ -148,6 +214,121 @@ describe('archived session input admission', () => {
       abortSignal: new AbortController().signal, dispatch,
     })).resolves.toEqual({ status: 'cancelled' });
     expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each(['goal', 'review'] as const)('refuses the first direct %s RPC after an existing-ID attach is archived', async (kind) => {
+    let archivedAt: number | null = null;
+    readArchive = async () => ({ status: 200, data: { session: { ...record(), archivedAt } } });
+    const cleanup = vi.fn(async () => ({ kind: 'requested' as const }));
+    const { session } = await createConsumer(sessionId, cleanup);
+    await expect(session.waitForProviderInputAdmission(new AbortController().signal)).resolves.toBe(true);
+    const { request } = await attachDirectControls(session);
+    archivedAt = 42;
+    await expect(invokeDirectControl(session, kind)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(request.mock.calls.filter(([method]) => method === 'thread/goal/set' || method === 'review/start')).toEqual([]);
+    await vi.waitFor(() => expect(cleanup).toHaveBeenCalledTimes(1));
+  });
+
+  it.each(['goal', 'review'] as const)('retains the original direct %s RPC while archive state is unreadable', async (kind) => {
+    readArchive = async () => ({ status: 200, data: { session: record() } });
+    const { session } = await createConsumer();
+    await expect(session.waitForProviderInputAdmission(new AbortController().signal)).resolves.toBe(true);
+    const { request } = await attachDirectControls(session);
+    const retryStarted = createDeferred<void>();
+    const readable = createDeferred<unknown>();
+    let reads = 0;
+    readArchive = async () => {
+      if (++reads === 1) return { status: 503, data: {} };
+      retryStarted.resolve();
+      return await readable.promise;
+    };
+    const result = invokeDirectControl(session, kind);
+    try {
+      await Promise.race([retryStarted.promise, result.then(() => { throw new Error('Direct RPC completed before archive admission'); })]);
+      expect(request.mock.calls.filter(([method]) => method === 'thread/goal/set' || method === 'review/start')).toEqual([]);
+      readable.resolve({ status: 200, data: { session: record() } });
+      await result;
+      expect(request.mock.calls.filter(([method]) => method === 'thread/goal/set' || method === 'review/start')).toEqual([
+        kind === 'goal' ? ['thread/goal/set', {
+          threadId: 'f1-direct-thread', objective: 'Retain this exact goal', status: 'paused', tokenBudget: 1200,
+        }] : ['review/start', {
+          threadId: 'f1-direct-thread', target: {
+            type: 'custom', instructions: expect.stringContaining('Retain this exact review'),
+          }, delivery: 'inline',
+        }],
+      ]);
+    } finally {
+      readable.resolve({ status: 503, data: {} });
+      session.beginRuntimeTermination();
+      await result.catch(() => {});
+    }
+  });
+
+  it.each([
+    ['goal', 'cancel'], ['review', 'cancel'], ['goal', 'reset'], ['review', 'reset'],
+    ['goal', 'close'], ['review', 'close'],
+  ] as const)('cancels a pending direct %s RPC when its own runtime/session receives %s', async (kind, cancellation) => {
+    readArchive = async () => ({ status: 200, data: { session: record() } });
+    const { session } = await createConsumer();
+    const { runtime, request } = await attachDirectControls(session);
+    const started = createDeferred<void>();
+    readArchive = async (signal) => {
+      started.resolve();
+      return await new Promise((resolve) => {
+        const abort = () => resolve({ status: 503, data: {} });
+        signal.addEventListener('abort', abort, { once: true });
+        if (signal.aborted) abort();
+      });
+    };
+    const result = invokeDirectControl(session, kind);
+    let settled = false;
+    const outcome = result.then(
+      (value) => { settled = true; return { kind: 'success' as const, value }; },
+      (error: unknown) => { settled = true; return { kind: 'failure' as const, error }; },
+    );
+    let close: Promise<void> | undefined;
+    try {
+      await Promise.race([started.promise, outcome.then(() => { throw new Error('Direct RPC completed before archive admission'); })]);
+      if (cancellation === 'close') close = session.close();
+      else await runtime[cancellation]();
+      await vi.waitFor(() => expect(settled).toBe(true));
+      await expect(outcome).resolves.toMatchObject({ kind: 'failure', error: { name: 'AbortError' } });
+      expect(request.mock.calls.filter(([method]) => method === 'thread/goal/set' || method === 'review/start')).toEqual([]);
+    } finally {
+      session.beginRuntimeTermination();
+      await outcome;
+      if (close) {
+        await close;
+        clients.splice(clients.indexOf(session), 1);
+      }
+    }
+  });
+
+  it.each(['cancel', 'reset'] as const)('keeps a direct review cancelled during initial thread setup after %s', async (cancellation) => {
+    readArchive = async () => ({ status: 200, data: { session: record() } });
+    const { session } = await createConsumer();
+    const started = createDeferred<void>();
+    const attached = createDeferred<void>();
+    const { runtime, request } = await attachDirectControls(session, {
+      loadThread: false,
+      waitForThreadStart: async () => { started.resolve(); await attached.promise; },
+    });
+    const result = invokeDirectControl(session, 'review');
+    const outcome = result.then(
+      (value) => ({ kind: 'success' as const, value }),
+      (error: unknown) => ({ kind: 'failure' as const, error }),
+    );
+    try {
+      await started.promise;
+      await runtime[cancellation]();
+      attached.resolve();
+      await expect(outcome).resolves.toMatchObject({ kind: 'failure', error: { name: 'AbortError' } });
+      expect(request.mock.calls.filter(([method]) => method === 'review/start')).toEqual([]);
+    } finally {
+      attached.resolve();
+      session.beginRuntimeTermination();
+      await outcome;
+    }
   });
 
   it('cleans only the observing runner after a delayed archive read and successor attachment', async () => {

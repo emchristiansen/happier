@@ -25,7 +25,7 @@ import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecyc
 import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import { createSessionProviderInputConsumer } from '@/agent/runtime/sessionInput/SessionProviderInputConsumer';
 import { waitForCondition } from '@/testkit/async/waitFor';
-import { createApiSessionClientFixture } from '@/testkit/backends/sessionFixtures';
+import { createApiSessionClientFixture, createMutableApiSessionClientFixture } from '@/testkit/backends/sessionFixtures';
 import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
 import { runScmCommand } from '@/scm/runtime';
 import {
@@ -38,6 +38,9 @@ import { logger } from '@/ui/logger';
 
 import { createCodexAppServerRuntime, writeUsageLimitRecoveryIntentToMetadata } from './runtime';
 import { createCodexAppServerProcessEnv, createCodexAppServerTestEnvScope } from './testkit/fakeCodexAppServer';
+
+// These partial session fixtures model create/load; existing-ID admission uses real API/RPC tests.
+const creationScopeInputAdmission = createMutableApiSessionClientFixture().waitForProviderInputAdmission;
 
 type CommittedSnapshotBody = Readonly<{
     type?: string;
@@ -2720,7 +2723,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange,
-            session: { updateMetadata: vi.fn() } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata: vi.fn() } as any,
             permissionMode: 'read-only',
         });
 
@@ -2760,7 +2763,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata: vi.fn() } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata: vi.fn() } as any,
         });
 
         await runtime.startOrLoad({});
@@ -2790,7 +2793,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata: vi.fn() } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata: vi.fn() } as any,
         });
 
         await runtime.startOrLoad({});
@@ -2817,7 +2820,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata: vi.fn() } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata: vi.fn() } as any,
         });
 
         await runtime.startOrLoad({});
@@ -2857,7 +2860,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata } as any,
             permissionMode: 'default',
         });
 
@@ -2902,7 +2905,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata: vi.fn(), sessionTurnLifecycle } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata: vi.fn(), sessionTurnLifecycle } as any,
             permissionMode: 'default',
         });
 
@@ -2956,7 +2959,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata: vi.fn(), sessionTurnLifecycle } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata: vi.fn(), sessionTurnLifecycle } as any,
             permissionMode: 'default',
         });
 
@@ -2987,6 +2990,7 @@ describe('createCodexAppServerRuntime', () => {
         const sessionTurnLifecycle = createSessionTurnLifecycleTestDouble();
 
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             updateMetadata: vi.fn(),
             sendAgentMessageCommitted: vi.fn(async () => {}),
             sendCodexMessage: vi.fn(),
@@ -3048,6 +3052,7 @@ describe('createCodexAppServerRuntime', () => {
         const { root } = await createRuntimeFixture('happier-codex-app-server-runtime-goal-successor-handoff-');
         const sessionTurnLifecycle = createSessionTurnLifecycleTestDouble();
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             updateMetadata: vi.fn(),
             sendAgentMessageCommitted: vi.fn(async () => {}),
             sendCodexMessage: vi.fn(),
@@ -3135,6 +3140,7 @@ describe('createCodexAppServerRuntime', () => {
             },
             onThinkingChange: vi.fn(),
             session: {
+                waitForProviderInputAdmission: creationScopeInputAdmission,
                 updateMetadata: vi.fn(),
                 sendAgentMessageCommitted: vi.fn(async () => {}),
                 sendCodexMessage: vi.fn(),
@@ -3234,6 +3240,7 @@ describe('createCodexAppServerRuntime', () => {
             directory: root,
             onThinkingChange,
             session: {
+                waitForProviderInputAdmission: creationScopeInputAdmission,
                 updateMetadata: vi.fn(),
                 sendAgentMessageCommitted: vi.fn(async () => {}),
                 sendCodexMessage: vi.fn(),
@@ -3272,6 +3279,7 @@ describe('createCodexAppServerRuntime', () => {
         const sessionTurnLifecycle = createSessionTurnLifecycleTestDouble();
 
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             updateMetadata: vi.fn(),
             sendAgentMessageCommitted: vi.fn(async () => {}),
             sendCodexMessage: vi.fn(),
@@ -3539,7 +3547,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata: vi.fn() } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata: vi.fn() } as any,
             permissionMode: 'default',
         });
 
@@ -3575,7 +3583,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata: vi.fn() } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata: vi.fn() } as any,
             permissionMode: 'default',
         });
 
@@ -4188,6 +4196,7 @@ describe('createCodexAppServerRuntime', () => {
             directory: root,
             onThinkingChange: vi.fn(),
             session: {
+                waitForProviderInputAdmission: creationScopeInputAdmission,
                 updateMetadata: vi.fn(),
                 sendAgentMessageCommitted: vi.fn(async () => {}),
                 sendCodexMessage: vi.fn(),
@@ -4707,6 +4716,7 @@ describe('createCodexAppServerRuntime', () => {
         const { root } = await createRuntimeFixture('happier-codex-app-server-runtime-review-dedupe-');
 
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             updateMetadata: vi.fn(),
             sendAgentMessageCommitted: vi.fn(async () => {}),
             sendCodexMessage: vi.fn(),
@@ -4746,6 +4756,7 @@ describe('createCodexAppServerRuntime', () => {
         const { root } = await createRuntimeFixture('happier-codex-app-server-runtime-review-different-final-');
 
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             updateMetadata: vi.fn(),
             sendAgentMessageCommitted: vi.fn(async () => {}),
             sendCodexMessage: vi.fn(),
@@ -4783,6 +4794,7 @@ describe('createCodexAppServerRuntime', () => {
         const { root } = await createRuntimeFixture('happier-codex-app-server-runtime-inline-review-');
 
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             sessionId: 'sess-inline-review',
             updateMetadata: vi.fn(),
             sendAgentMessageCommitted: vi.fn(async () => {}),
@@ -4833,6 +4845,7 @@ describe('createCodexAppServerRuntime', () => {
         const { root, requestLogPath } = await createRuntimeFixture('happier-codex-app-server-runtime-inline-review-start-');
 
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             sessionId: 'sess-inline-review-start',
             updateMetadata: vi.fn(),
             sendAgentMessageCommitted: vi.fn(async () => {}),
@@ -4895,6 +4908,7 @@ describe('createCodexAppServerRuntime', () => {
         const { root, requestLogPath } = await createRuntimeFixture('happier-codex-app-server-runtime-inline-review-command-');
 
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             sessionId: 'sess-inline-review-command',
             updateMetadata: vi.fn(),
             sendAgentMessageCommitted: vi.fn(async () => {}),
@@ -7846,6 +7860,7 @@ describe('createCodexAppServerRuntime', () => {
             onThinkingChange: vi.fn(),
             onConnectedServiceAuthGenerationApplied: vi.fn(async () => {}),
             session: {
+                waitForProviderInputAdmission: creationScopeInputAdmission,
                 sessionId: 'session-provider-started-identity-race',
                 updateMetadata: vi.fn(),
                 sessionTurnLifecycle,

@@ -1333,6 +1333,22 @@ export function createCodexAppServerRuntime(params: Readonly<{
         }
     };
     let clientPromise: Promise<DisposableCodexAppServerClient> | null = null;
+    let directControlInputAbort = new AbortController();
+
+    const cancelPendingDirectControlInput = (): void => {
+        directControlInputAbort.abort();
+        directControlInputAbort = new AbortController();
+    };
+
+    const waitForDirectControlInputAdmission = async (signal: AbortSignal): Promise<void> => {
+        signal.throwIfAborted();
+        if (!await params.session.waitForProviderInputAdmission(signal)) {
+            const error = new Error('Provider input admission closed before direct Codex control');
+            error.name = 'AbortError';
+            throw error;
+        }
+        signal.throwIfAborted();
+    };
     let currentModeId: string | null = null;
     let currentModelId: string | null = null;
     let currentReasoningEffort: string | null = null;
@@ -4406,6 +4422,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
 
     const startReviewTurn = async (
         request: CodexAppServerReviewStartRequest,
+        inputSignal: AbortSignal = directControlInputAbort.signal,
     ): Promise<string | UnsupportedSessionRuntimeMethodResult | void> => {
         let recoveredContextWindowExhaustion = false;
         let originalContextWindowExhaustionFailure: Error | null = null;
@@ -4418,8 +4435,10 @@ export function createCodexAppServerRuntime(params: Readonly<{
                 throw new Error('Codex app-server already has a turn in flight');
             }
             const client = await ensureClient();
+            await waitForDirectControlInputAdmission(inputSignal);
             const activeTurn = await beginPendingTurnForThread(activeThreadId);
             try {
+                inputSignal.throwIfAborted();
                 const response = await client.request('review/start', {
                     threadId: activeThreadId,
                     target: request.target,
@@ -4495,6 +4514,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
     const startInlineReview = async (
         input: unknown,
     ): Promise<Readonly<{ ok: true; reviewTurnId: string | null }> | UnsupportedSessionRuntimeMethodResult | Readonly<{ ok: false; errorCode: 'invalid_parameters' | 'inline_review_not_supported'; error: string }>> => {
+        const inputSignal = directControlInputAbort.signal;
         const parsedInlineInput = ReviewStartInputSchema.safeParse(input);
         if (!parsedInlineInput.success || parsedInlineInput.data.engineIds.length !== 1 || parsedInlineInput.data.engineIds[0] !== 'codex') {
             return { ok: false, errorCode: 'inline_review_not_supported', error: 'inline_review_not_supported' };
@@ -4517,7 +4537,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
         activeInlineReview = true;
         let reviewTurnResult: string | void | UnsupportedSessionRuntimeMethodResult;
         try {
-            reviewTurnResult = await startReviewTurn(resolved.request);
+            reviewTurnResult = await startReviewTurn(resolved.request, inputSignal);
         } finally {
             activeInlineReview = false;
         }
@@ -4540,6 +4560,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
             void beginTurnChangeTracking();
         },
         cancel: async () => {
+            cancelPendingDirectControlInput();
             await waitForNativeTurnHandoff();
             const activeTurn = pendingTurn;
             if (!activeTurn) {
@@ -4574,6 +4595,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
             await activeTurn.promise.catch(() => undefined);
         },
         reset: async () => {
+            cancelPendingDirectControlInput();
             threadId = null;
             currentModeId = null;
             currentModelId = null;
@@ -5334,6 +5356,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
             objective: string | undefined,
             options?: Readonly<{ status?: string; tokenBudget?: number | null }>,
         ) => {
+            const inputSignal = directControlInputAbort.signal;
             const activeThreadId = threadId;
             if (!activeThreadId) {
                 throw new Error('Codex app-server setGoal requires an active thread');
@@ -5347,6 +5370,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
                 throw new Error('Codex app-server setGoal requires a non-empty objective');
             }
             const client = await ensureClient();
+            await waitForDirectControlInputAdmission(inputSignal);
             const buildRequest = (fallbackObjective?: string | null): Record<string, unknown> => ({
                 threadId: activeThreadId,
                 ...(trimmedObjective ? { objective: trimmedObjective } : {}),
@@ -5367,6 +5391,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
                     if (!fallbackObjective) {
                         return { ok: false, errorCode: 'goal_not_found', error: 'goal_not_found' };
                     }
+                    await waitForDirectControlInputAdmission(inputSignal);
                     const response = await client.request('thread/goal/set', buildRequest(fallbackObjective));
                     await publishGoalWorkState(response);
                     return undefined;
