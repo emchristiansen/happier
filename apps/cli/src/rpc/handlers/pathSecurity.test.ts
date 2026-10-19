@@ -168,6 +168,49 @@ describe('validateWorkspaceInspectionPath', () => {
 
 
 describe('dedicated private native domain restriction', () => {
+    it.skipIf(process.platform === 'win32')('[SH-IO28-004] refuses a normalized canonical private path when the original native path is ordinary', () => {
+        const root = mkdtempSync(join(tmpdir(), 'happier-inverse-path-identity-'));
+        try {
+            const ordinary = join(root, 'ordinary');
+            const other = join(root, 'other');
+            const privateDomain = join(root, 'private');
+            mkdirSync(ordinary);
+            mkdirSync(join(other, 'child'), { recursive: true });
+            mkdirSync(join(other, 'raw'));
+            mkdirSync(join(privateDomain, 'subdir'), { recursive: true });
+            writeFileSync(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+            symlinkSync(join(other, 'child'), join(ordinary, 'alias'));
+            symlinkSync(join(privateDomain, 'subdir'), join(ordinary, 'raw'));
+            const requested = `${ordinary}/alias/../raw`;
+            expect(realpathSync.native(requested)).toBe(join(other, 'raw'));
+            expect(realpathSync.native(resolve(requested))).toBe(join(privateDomain, 'subdir'));
+            expect(validateOrdinaryReaderPath(requested).valid).toBe(false);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it.skipIf(process.platform === 'win32').each([
+        ['private', 'file'], ['ordinary', 'file'], ['private', 'directory'], ['ordinary', 'directory'],
+    ] as const)('[SH-IO28-005] refuses an unresolved %s dangling %s target', (home, kind) => {
+        const root = mkdtempSync(join(tmpdir(), 'happier-dangling-path-identity-'));
+        try {
+            const ordinary = join(root, 'ordinary');
+            const privateDomain = join(root, 'private');
+            mkdirSync(ordinary);
+            mkdirSync(privateDomain);
+            writeFileSync(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+            const target = join(home === 'private' ? privateDomain : ordinary, 'missing');
+            const link = join(ordinary, 'link');
+            symlinkSync(target, link);
+            expect(existsSync(target)).toBe(false);
+            expect(validateOrdinaryReaderPath(kind === 'file' ? link : `${link}/future.bin`).valid).toBe(false);
+            expect(validateOrdinaryReaderPath(join(ordinary, 'plain', 'future.bin')).valid).toBe(true);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it.skipIf(process.platform === 'win32').each(['raw.bin', 'missing/future.bin'])(
         '[path-identity] refuses a private effective path through a symlink before ..: %s', (suffix) => {
             const root = mkdtempSync(join(tmpdir(), 'happier-private-path-identity-'));

@@ -40,6 +40,15 @@ function resolveReaderPathThroughExistingAncestor(targetPath: string): string {
             return resolve(realpathSync.native(candidate), ...missing);
         } catch (error) {
             if (!isMissingPath(error)) throw error;
+            // Do not discard a symlink whose target cannot be resolved. Its
+            // missing destination may belong to a different restricted domain.
+            let unresolvedSymlink = false;
+            try {
+                unresolvedSymlink = lstatSync(candidate).isSymbolicLink();
+            } catch (inspectionError) {
+                if (!isMissingPath(inspectionError)) throw inspectionError;
+            }
+            if (unresolvedSymlink) throw error;
             const parent = dirname(candidate);
             if (parent === candidate) throw error;
             missing.unshift(basename(candidate));
@@ -50,13 +59,16 @@ function resolveReaderPathThroughExistingAncestor(targetPath: string): string {
 
 /** Ordinary readers may not open a dedicated private native domain.
  * This negative restriction is independent of workspace or os-user authority.
- * Check both lexical ancestors and real ancestors, including missing targets.
+ * Check lexical ancestors and both native path identities: consumers may open
+ * the original string or its lexical normalization. Unresolved symlinks refuse;
+ * plain missing descendants are inspected through their existing ancestor.
  */
 export function validateOrdinaryReaderPath(targetPath: string): PathValidationResult {
     try {
         const lexical = resolve(targetPath);
         if (hasPrivateNativeDomainAncestor(lexical)
-            || hasPrivateNativeDomainAncestor(resolveReaderPathThroughExistingAncestor(targetPath))) {
+            || hasPrivateNativeDomainAncestor(resolveReaderPathThroughExistingAncestor(targetPath))
+            || hasPrivateNativeDomainAncestor(resolveReaderPathThroughExistingAncestor(lexical))) {
             return { valid: false, error: 'Access denied: private native domain' };
         }
         return { valid: true, resolvedPath: lexical };
