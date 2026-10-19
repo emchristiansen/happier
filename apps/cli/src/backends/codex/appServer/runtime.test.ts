@@ -174,6 +174,7 @@ async function writeFakeCodexAppServerScript(params: Readonly<{
     oversizedResumePayloadChars?: number;
     omitTurnStartedForPrompt?: string;
     omitTurnCompletedForPrompt?: string;
+    steerWaitControlPaths?: Readonly<{ startRelease: string; completionRelease: string }>;
     failStateRuntimeInitializationOnce?: boolean;
     failLocalDbLogDbLockInitializationOnce?: boolean;
 }>): Promise<string> {
@@ -539,6 +540,21 @@ async function writeFakeCodexAppServerScript(params: Readonly<{
         '        const text = Array.isArray(msg.params?.input) ? String(msg.params.input[0]?.text ?? "unknown") : "unknown";',
         '        const matchingTurnStartCount = (await readFile(requestLogPath, "utf8").catch(() => "")).split("\\n").filter((line) => { try { const entry = JSON.parse(line); return entry.method === "turn/start" && Array.isArray(entry.params?.input) && String(entry.params.input[0]?.text ?? "") === text; } catch { return false; } }).length;',
         '        const turnId = matchingTurnStartCount > 1 ? `turn-${text}-${matchingTurnStartCount}` : `turn-${text}`;',
+        `        const steerWaitControlPaths = ${JSON.stringify(params.steerWaitControlPaths ?? null)};`,
+        '        if (text === "steer-delay" && steerWaitControlPaths) {',
+        '            void (async () => {',
+        '                while (!(await readFile(steerWaitControlPaths.startRelease, "utf8").catch((error) => { if (error.code === "ENOENT") return ""; throw error; }))) {',
+        '                    await new Promise((resolve) => setTimeout(resolve, 5));',
+        '                }',
+        '                process.stdout.write(JSON.stringify({ id: msg.id, result: { turn: { id: turnId }, threadId: msg.params?.threadId ?? null } }) + "\\n");',
+        '                process.stdout.write(JSON.stringify({ method: "turn/started", params: { threadId: msg.params?.threadId ?? null, turn: { id: turnId } } }) + "\\n");',
+        '                while (!(await readFile(steerWaitControlPaths.completionRelease, "utf8").catch((error) => { if (error.code === "ENOENT") return ""; throw error; }))) {',
+        '                    await new Promise((resolve) => setTimeout(resolve, 5));',
+        '                }',
+        '                process.stdout.write(JSON.stringify({ method: "turn/completed", params: { threadId: msg.params?.threadId ?? null, turn: { id: turnId } } }) + "\\n");',
+        '            })().catch((error) => { process.stderr.write(String(error.stack ?? error) + "\\n"); process.exit(1); });',
+        '            continue;',
+        '        }',
         '        const completionDelayMs = text === "connected-service-invalidation-active-turn" && matchingTurnStartCount === 1 ? 120000 : text === "overlap-start" ? 180 : text === "cancel-me" ? 50 : 15;',
         '        if (text === "usage-limit-before-turn-response") {',
         '            process.stdout.write(JSON.stringify({ method: "error", params: { threadId: msg.params?.threadId ?? null, turnId, willRetry: false, error: { message: "Usage limit reached", codexErrorInfo: "UsageLimitExceeded", additionalDetails: null } } }) + "\\n");',
@@ -1645,6 +1661,7 @@ describe('createCodexAppServerRuntime', () => {
             oversizedResumePayloadChars?: number;
             omitTurnStartedForPrompt?: string;
             omitTurnCompletedForPrompt?: string;
+            steerWaitControlPaths?: Readonly<{ startRelease: string; completionRelease: string }>;
             maxJsonLineChars?: number;
             rpcTimeoutMs?: number;
             startupRpcTimeoutMs?: number;
@@ -1703,6 +1720,7 @@ describe('createCodexAppServerRuntime', () => {
             oversizedResumePayloadChars: options.oversizedResumePayloadChars,
             omitTurnStartedForPrompt: options.omitTurnStartedForPrompt,
             omitTurnCompletedForPrompt: options.omitTurnCompletedForPrompt,
+            steerWaitControlPaths: options.steerWaitControlPaths,
             failStateRuntimeInitializationOnce: options.failStateRuntimeInitializationOnce,
             failLocalDbLogDbLockInitializationOnce: options.failLocalDbLogDbLockInitializationOnce,
         });
@@ -4533,7 +4551,13 @@ describe('createCodexAppServerRuntime', () => {
     });
 
     it('waits for the active turn id before calling turn/steer', async () => {
-        const { root, requestLogPath } = await createRuntimeFixture('happier-codex-app-server-runtime-steer-wait-');
+        const controlRoot = await createTempDir('happier-codex-app-server-steer-wait-controls-');
+        tempRoots.add(controlRoot);
+        const startRelease = join(controlRoot, 'start-release');
+        const completionRelease = join(controlRoot, 'completion-release');
+        const { root, requestLogPath } = await createRuntimeFixture('happier-codex-app-server-runtime-steer-wait-', {
+            steerWaitControlPaths: { startRelease, completionRelease },
+        });
 
         const runtime = createCodexAppServerRuntime({
             directory: root,
@@ -4541,39 +4565,56 @@ describe('createCodexAppServerRuntime', () => {
             session: { updateMetadata: vi.fn() } as any,
         });
 
-        await runtime.startOrLoad({});
+        let sendPromptPromise: Promise<void> | undefined;
+        let steerPromise: Promise<void> | undefined;
+        try {
+            await runtime.startOrLoad({});
 
-        const sendPromptPromise = runtime.sendPrompt('steer-delay');
-        await new Promise((resolve) => setTimeout(resolve, 5));
+            sendPromptPromise = runtime.sendPrompt('steer-delay');
+            await waitForCondition(async () => (await readRequestLog(requestLogPath))
+                .some((entry) => entry.method === 'turn/start'), {
+                timeoutMs: 1_000,
+                intervalMs: 5,
+                label: 'turn/start request while provider acknowledgement is held',
+            });
 
-        expect(runtime.isTurnInFlight()).toBe(true);
-        expect(runtime.canSteerPrompt()).toBe(false);
+            expect(runtime.isTurnInFlight()).toBe(true);
+            expect(runtime.canSteerPrompt()).toBe(false);
 
-        let steerSettled = false;
-        const steerPromise = runtime.steerPrompt('nudge-early');
-        void steerPromise.then(
-            () => { steerSettled = true; },
-            () => { steerSettled = true; },
-        );
-        await new Promise((resolve) => setTimeout(resolve, 5));
+            let steerSettled = false;
+            steerPromise = runtime.steerPrompt('nudge-early');
+            void steerPromise.then(
+                () => { steerSettled = true; },
+                () => { steerSettled = true; },
+            );
+            await new Promise((resolve) => setTimeout(resolve, 5));
 
-        expect(steerSettled).toBe(false);
-        const earlyRequestLog = await readRequestLog(requestLogPath);
-        expect(earlyRequestLog.filter((entry) => entry.method === 'turn/steer')).toHaveLength(0);
+            expect(steerSettled).toBe(false);
+            const earlyRequestLog = await readRequestLog(requestLogPath);
+            expect(earlyRequestLog.filter((entry) => entry.method === 'turn/steer')).toHaveLength(0);
 
-        await steerPromise;
-        await sendPromptPromise;
+            await writeFile(startRelease, 'release');
+            await steerPromise;
 
-        const requestLog = (await readFile(requestLogPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
-        expect(requestLog.filter((entry: { method: string }) => entry.method === 'turn/steer')).toEqual([
-            expect.objectContaining({
-                params: expect.objectContaining({
-                    threadId: 'thread-started',
-                    expectedTurnId: 'turn-steer-delay',
-                    input: [{ type: 'text', text: 'nudge-early' }],
+            const requestLog = await readRequestLog(requestLogPath);
+            expect(requestLog.filter((entry) => entry.method === 'turn/steer')).toEqual([
+                expect.objectContaining({
+                    params: expect.objectContaining({
+                        threadId: 'thread-started',
+                        expectedTurnId: 'turn-steer-delay',
+                        input: [{ type: 'text', text: 'nudge-early' }],
+                    }),
                 }),
-            }),
-        ]);
+            ]);
+            await writeFile(completionRelease, 'release');
+            await sendPromptPromise;
+        } finally {
+            await Promise.all([
+                writeFile(startRelease, 'release'),
+                writeFile(completionRelease, 'release'),
+            ]);
+            await Promise.allSettled([sendPromptPromise, steerPromise]);
+        }
     });
 
     it('does not steer a turn whose ownership changes while structured input is resolving', async () => {
