@@ -51,7 +51,7 @@ import {
     bootstrapAccountSettingsContext,
     refreshActiveAccountSettingsFromServer,
 } from '@/settings/accountSettings/bootstrapAccountSettingsContext';
-import { AccountSettingsV2GetResponseSchema } from '@happier-dev/protocol';
+import { AcceptedPendingSettlementResponseV1Schema, AccountSettingsV2GetResponseSchema } from '@happier-dev/protocol';
 import {
     getActiveAccountSettingsSnapshot,
     subscribeActiveAccountSettingsSnapshot,
@@ -492,6 +492,36 @@ function serializeAcceptedPendingSettlementErrorForLog(error: unknown): Record<s
         ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}),
         ...(error.correlationId ? { correlationId: error.correlationId } : {}),
     };
+}
+
+function readAcceptedPendingSettlementFailureDiagnostic(error: unknown) {
+    if (error instanceof PendingQueueAcceptedSettlementError) {
+        const ack = AcceptedPendingSettlementResponseV1Schema.safeParse({
+            ok: false,
+            error: error.settlementError,
+            ...(error.settlementError === 'transaction-unavailable' ? {
+                retryAfterMs: error.retryAfterMs,
+                ...(error.correlationId ? { correlationId: error.correlationId } : {}),
+            } : {}),
+        });
+        if (ack.success && !ack.data.ok) {
+            return {
+                kind: 'server_ack' as const,
+                error: ack.data.error,
+                ...(ack.data.error === 'transaction-unavailable' && ack.data.correlationId
+                    ? { correlationId: ack.data.correlationId } : {}),
+            };
+        }
+    } else if (error instanceof PendingQueueAcceptedSettlementAmbiguousError) {
+        if (error.classification === 'transport_failure' || error.classification === 'malformed_ack') {
+            return { kind: 'ambiguous' as const, classification: error.classification };
+        }
+    } else if (error && typeof error === 'object' && 'code' in error) {
+        if (error.code === 'socket_not_connected' || error.code === 'socket_ack_timeout') {
+            return { kind: 'socket' as const, code: error.code };
+        }
+    }
+    return { kind: 'unknown' as const };
 }
 
 export function classifySessionTransportErrorToProbeResult(
@@ -1726,6 +1756,10 @@ export class ApiSessionClient extends EventEmitter {
                                 attempt,
                                 retryAfterMs,
                                 willRetry: retryAfterMs !== null,
+                                retryDisposition: retryAfterMs !== null ? 'same_operation_after_backoff' : 'retained_without_retry',
+                                failure: readAcceptedPendingSettlementFailureDiagnostic(error),
+                                producerGeneration: authority.producerGeneration,
+                                sessionConnectionEpoch: authority.sessionConnectionEpoch,
                                 errorValuesOmitted: true,
                             });
                         } catch {
@@ -5682,6 +5716,24 @@ export class ApiSessionClient extends EventEmitter {
     ): void {
         const localId = readPendingLocalId(outcome.localId);
         if (!localId) return;
+        const reportAcceptedHandoff = (stage: 'accepted_observed' | 'canonical_custody_absent' | 'authority_unavailable' | 'settlement_admitted'): void => {
+            if (outcome.kind !== 'accepted') return;
+            try {
+                logger.infoFile('[pendingQueue] provider acceptance handoff', {
+                    sessionId: this.sessionId,
+                    localId,
+                    stage,
+                    canonicalCustody: this.canonicalPendingDeliveryByLocalId.has(localId),
+                    producerGeneration,
+                    sessionConnectionEpoch: this.sessionConnectionEpoch,
+                    providerId: producer.providerId,
+                    providerMode: producer.mode,
+                });
+            } catch {
+                // Diagnostics never own acceptance, custody or settlement admission.
+            }
+        };
+        reportAcceptedHandoff('accepted_observed');
 
         for (const trackedLocalId of this.providerInputTerminalOutcomeByLocalId.keys()) {
             if (!this.canonicalPendingDeliveryByLocalId.has(trackedLocalId)) {
@@ -5772,7 +5824,10 @@ export class ApiSessionClient extends EventEmitter {
             }
         }
 
-        if (!this.canonicalPendingDeliveryByLocalId.has(localId)) return;
+        if (!this.canonicalPendingDeliveryByLocalId.has(localId)) {
+            reportAcceptedHandoff('canonical_custody_absent');
+            return;
+        }
         this.providerInputUncertainLocalIds.delete(localId);
         this.providerInputTerminalOutcomeByLocalId.set(localId, terminalOutcome);
 
@@ -5781,7 +5836,11 @@ export class ApiSessionClient extends EventEmitter {
             // that failed and was parked for retry. A late failure must not resurrect that block.
             this.acceptedProviderInputLocalIds.add(localId);
             const authority = this.captureAcceptedCanonicalPendingDeliveryOperationAuthority(producerGeneration);
-            if (!authority) return;
+            if (!authority) {
+                reportAcceptedHandoff('authority_unavailable');
+                return;
+            }
+            reportAcceptedHandoff('settlement_admitted');
             this.trackAcceptedCanonicalPendingDeliveryResolution(
                 this.resolveAcceptedCanonicalPendingDelivery(localId, authority),
             );

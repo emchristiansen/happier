@@ -220,9 +220,9 @@ export function isAcceptedPendingQueueV2DeliveryRetryableError(error: unknown): 
     if (error instanceof PendingQueueAcceptedSettlementError) {
         return error.settlementError === 'internal' || error.settlementError === 'transaction-unavailable';
     }
-    // The local deadline already supplies positive response-loss evidence. Native
-    // Socket.IO rejections are classified at the accepted transport boundary below.
-    return readErrorCode(error) === 'socket_ack_timeout'
+    // The shared deadline and pre-emit connection check supply typed transport failures.
+    // Native Socket.IO rejections are classified at the accepted transport boundary below.
+    return (readErrorCode(error) === 'socket_ack_timeout' || readErrorCode(error) === 'socket_not_connected')
         && (error as { retryable?: unknown }).retryable === true;
 }
 
