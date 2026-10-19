@@ -13,7 +13,12 @@ export type SessionPendingInputInterruptAndRunRequestV1 =
 export const SessionPendingInputInterruptAndRunResultV1Schema = z.discriminatedUnion('ok', [
   z.object({
     ok: z.literal(true),
-    status: z.literal('interrupted'),
+    status: z.enum([
+      'interrupted',
+      'admitted_and_steered',
+      'admitted_and_queued_until_boundary',
+      'admitted_delivery_unobserved',
+    ]),
     sessionId: z.string().min(1).optional(),
     localId: z.string().min(1).optional(),
   }).passthrough(),

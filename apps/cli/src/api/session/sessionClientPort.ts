@@ -63,6 +63,7 @@ export type PendingMaterializationDiagnosticPhase =
   | 'materialize.delivery_settlement';
 
 export type MaterializeNextPendingOptions = {
+  requestedLocalId?: string;
   expectedPendingVersion?: number;
   expectedRuntimeActivityRevision?: number;
   reconcileWhenEmpty?: PendingQueueReconcileWhenEmpty;
@@ -70,6 +71,11 @@ export type MaterializeNextPendingOptions = {
   pendingQueueDeliveryTiming?: SessionPendingQueueDeliveryTiming;
   onDiagnosticPhase?: (phase: PendingMaterializationDiagnosticPhase) => void;
 };
+
+export type PendingInputSteerNowAdmission =
+  | Readonly<{ kind: 'admitted' }>
+  | Readonly<{ kind: 'admission_uncertain' }>
+  | Readonly<{ kind: 'not_admitted'; reason: 'unsupported' | 'invalid_local_id' | 'server_rejected' }>;
 
 export type SessionUserMessageDeliveryInfo = Readonly<{
   seq: number | null;

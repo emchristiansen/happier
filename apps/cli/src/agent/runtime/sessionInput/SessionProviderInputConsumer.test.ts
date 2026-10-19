@@ -35,6 +35,24 @@ function createDrainConsumer(
 }
 
 describe('SessionProviderInputConsumer drainPending', () => {
+  it('passes an exact requested localId through one canonical drain pass', async () => {
+    const materializeNextPendingMessageSafely = vi.fn(async () => ({ type: 'no_pending' as const }));
+    const consumer = createDrainConsumer({
+      materializeNextPendingMessageSafely,
+      waitForPendingEligibilityUpdate: async () => false,
+    });
+
+    await expect(consumer.drainPending({ requestedLocalId: 'urgent-local', reason: 'exact-steer' })).resolves.toEqual({
+      materialized: 0,
+      stoppedReason: 'no_pending',
+    });
+    expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(1);
+    expect(materializeNextPendingMessageSafely).toHaveBeenCalledWith(expect.objectContaining({
+      requestedLocalId: 'urgent-local',
+      reconcileWhenEmpty: 'force',
+    }));
+  });
+
   it('arms the Pending wake before an active-turn pass and drains once for the wake without polling', async () => {
     const metadataWakes: Array<(updated: boolean) => void> = [];
     const materializeNextPendingMessageSafely = vi

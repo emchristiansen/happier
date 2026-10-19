@@ -12,6 +12,7 @@ import {
     listPendingQueueV2DeliveryStatusesFromServer,
     listPendingQueueV2ProviderDeliveryLocalIdsFromServer,
     markPendingQueueV2DeliveryHandled,
+    requestPendingQueueV2SteerNow,
     materializeNextPendingQueueV2Message,
     materializeNextPendingQueueV2MessageOnReleasedServer,
     materializeNextPendingQueueV2MessageViaHttp,
@@ -20,15 +21,17 @@ import {
     resolveAcceptedPendingQueueV2Delivery,
 } from './pendingQueueV2Transport';
 
-const { mockGet, mockPost } = vi.hoisted(() => ({
+const { mockGet, mockPost, mockPatch } = vi.hoisted(() => ({
     mockGet: vi.fn(),
     mockPost: vi.fn(),
+    mockPatch: vi.fn(),
 }));
 
 vi.mock('axios', () => ({
     default: {
         get: mockGet,
         post: mockPost,
+        patch: mockPatch,
         isAxiosError: (error: unknown) => Boolean(
             error && typeof error === 'object' && (error as { isAxiosError?: unknown }).isAxiosError === true,
         ),
@@ -39,6 +42,35 @@ describe('pendingQueueV2Transport', () => {
     beforeEach(() => {
         mockGet.mockReset();
         mockPost.mockReset();
+        mockPatch.mockReset();
+    });
+
+    it('acknowledges the steer-now action against the exact row path', async () => {
+        mockPatch.mockResolvedValueOnce({
+            data: {
+                ok: true,
+                didUpdate: true,
+                requestedAction: { v: 1, kind: 'steer_now' },
+            },
+        });
+
+        await expect(requestPendingQueueV2SteerNow({
+            token: 'token',
+            sessionId: 'session/with spaces',
+            localId: 'target-local',
+        })).resolves.toEqual({ didUpdate: true });
+
+        expect(mockPatch).toHaveBeenCalledWith(
+            expect.stringContaining('/v2/sessions/session%2Fwith%20spaces/pending/target-local/action'),
+            {
+                requestedAction: { v: 1, kind: 'steer_now' },
+            },
+            expect.objectContaining({
+                headers: expect.objectContaining({ Authorization: 'Bearer token' }),
+                timeout: 10_000,
+            }),
+        );
+
     });
 
     it('accepts a terminal enqueue rejoin only with the exact committed-message localId', async () => {
@@ -564,6 +596,35 @@ describe('pendingQueueV2Transport', () => {
         expect(socket.emitWithAck).toHaveBeenCalledWith('pending-materialize-next', {
             sid: 'session-1',
             deliveryTiming: 'after_runtime_idle',
+        });
+        expect(mockPost).not.toHaveBeenCalled();
+    });
+
+    it('uses a non-fallback exact operation for a requested pending localId', async () => {
+        const socket = {
+            connected: true,
+            timeout: vi.fn(() => socket),
+            emitWithAck: vi.fn(async () => ({
+                ok: true,
+                didMaterialize: false,
+                pendingCount: 2,
+                pendingVersion: 7,
+                deferredReason: 'requested_local_id_unavailable',
+            })),
+        };
+
+        await expect(materializeNextPendingQueueV2Message({
+            token: 'token',
+            sessionId: 'session-1',
+            socket: socket as any,
+            requestedLocalId: 'urgent-local',
+        })).resolves.toMatchObject({
+            didMaterialize: false,
+            deferredReason: 'requested_local_id_unavailable',
+        });
+        expect(socket.emitWithAck).toHaveBeenCalledWith('pending-materialize-exact-v1', {
+            sid: 'session-1',
+            requestedLocalId: 'urgent-local',
         });
         expect(mockPost).not.toHaveBeenCalled();
     });

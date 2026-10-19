@@ -371,6 +371,7 @@ type CodexAppServerPromptOptions = Readonly<{
     localIds?: readonly string[] | null;
     trustedLocalImagePaths?: ReadonlySet<string>;
     userMessageSeq?: number | null;
+    expectedTurnId?: string;
     appliedModelId?: string | null;
     onProviderPromptAccepted?: () => void;
 }>;
@@ -1236,6 +1237,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
     canSteerPrompt: () => boolean;
     isTurnInFlight: () => boolean;
     hasActiveProviderTurn: () => boolean;
+    getActiveSteerableTurnId: () => Promise<string | null>;
     beginTurn: () => void;
     cancel: () => Promise<void>;
     reset: () => Promise<void>;
@@ -4531,6 +4533,11 @@ export function createCodexAppServerRuntime(params: Readonly<{
         canSteerPrompt,
         isTurnInFlight: () => turnInFlight || nativeTurnHandoffBarrier !== null,
         hasActiveProviderTurn: () => pendingTurn !== null || nativeTurnHandoffBarrier !== null,
+        getActiveSteerableTurnId: async () => {
+            const activeTurn = pendingTurn;
+            if (!activeTurn) return null;
+            return await waitForSteerableActiveTurnId(activeTurn);
+        },
         beginTurn: () => {
             void beginTurnChangeTracking();
         },
@@ -4652,6 +4659,9 @@ export function createCodexAppServerRuntime(params: Readonly<{
             }
             if (!expectedTurnId) {
                 throw new Error('Codex app-server steerPrompt requires an active turn id');
+            }
+            if (options?.expectedTurnId && options.expectedTurnId !== expectedTurnId) {
+                throw new Error('Codex app-server active turn changed before exact pending steer');
             }
 
             const structuredInput = await buildCodexTurnInputForPrompt(prompt, params.directory, options);

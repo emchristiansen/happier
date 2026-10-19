@@ -63,7 +63,7 @@ export type MaterializeNextPendingMessageResult =
         participantCursorsPending?: ParticipantCursor[];
         badgeAttentionChanged?: boolean;
         deliveryState?: PendingMaterializationDeliveryState;
-        deferredReason?: RuntimeActivityPendingDeferredReason | "waiting_for_foreground_turn" | "pending_version_mismatch" | "waiting_for_predecessor";
+        deferredReason?: RuntimeActivityPendingDeferredReason | "waiting_for_foreground_turn" | "pending_version_mismatch" | "waiting_for_predecessor" | "requested_local_id_unavailable";
         retryAfterMs?: number;
       }
     | {
@@ -90,6 +90,7 @@ async function tryRejoinProviderClaimInTx(params: Readonly<{
     actorUserId: string;
     sessionId: string;
     trustedPublisherFence: TrustedPendingPublisherFence;
+    requestedLocalId?: string;
 }>): Promise<MaterializeNextPendingMessageResult | null> {
         const tx = params.tx;
             const claimed = await tx.sessionPendingMessage.findFirst({
@@ -110,6 +111,19 @@ async function tryRejoinProviderClaimInTx(params: Readonly<{
                 },
             });
             if (!claimed) return null;
+            if (params.requestedLocalId && claimed.localId !== params.requestedLocalId) {
+                const session = await tx.session.findUniqueOrThrow({
+                    where: { id: params.sessionId },
+                    select: { pendingCount: true, pendingBlockedCount: true, pendingVersion: true },
+                });
+                return {
+                    ok: true,
+                    didMaterialize: false,
+                    ...session,
+                    deferredReason: "waiting_for_predecessor",
+                    deliveryState: { mode: "provider", unresolved: false },
+                };
+            }
             if (readPendingLocalId(claimed.localId) === null) {
                 return { ok: false, error: "invalid-params" };
             }
@@ -217,6 +231,7 @@ async function tryRejoinProviderClaimInTx(params: Readonly<{
 export async function materializeNextPendingMessageForCurrentPublisher(params: Readonly<{
     actorUserId: string;
     sessionId: string;
+    requestedLocalId?: string;
     trustedPublisherFence: TrustedPendingPublisherFence;
     expectedPendingVersion?: number;
     deliveryTiming: SessionPendingQueueDeliveryTiming;
@@ -238,6 +253,7 @@ export async function materializeNextPendingMessageForCurrentPublisherInTx(param
     tx: Tx;
     actorUserId: string;
     sessionId: string;
+    requestedLocalId?: string;
     trustedPublisherFence: TrustedPendingPublisherFence;
     expectedPendingVersion?: number;
     deliveryTiming: SessionPendingQueueDeliveryTiming;
@@ -250,6 +266,7 @@ export async function materializeNextPendingMessageForCurrentPublisherInTx(param
 type MaterializeNextPendingMessageCommonParams = Readonly<{
     actorUserId: string;
     sessionId: string;
+    requestedLocalId?: string;
     expectedPendingVersion?: number;
     deliveryTiming?: SessionPendingQueueDeliveryTiming;
     foregroundState?: PendingForegroundState;
@@ -284,6 +301,9 @@ async function materializeNextPendingMessageInTx(
     const tx = params.tx;
     const actorUserId = typeof params.actorUserId === "string" ? params.actorUserId : "";
     const sessionId = typeof params.sessionId === "string" ? params.sessionId : "";
+    const requestedLocalId = params.requestedLocalId === undefined
+        ? undefined
+        : readPendingLocalId(params.requestedLocalId) ?? "";
     const materializedDeliveryState = {
         mode: "provider",
         unresolved: true,
@@ -309,6 +329,7 @@ async function materializeNextPendingMessageInTx(
         actorUserId,
         sessionId,
         trustedPublisherFence: params.trustedPublisherFence,
+        ...(requestedLocalId ? { requestedLocalId } : {}),
     });
     if (rejoined !== null) return rejoined;
     if (
@@ -326,6 +347,7 @@ async function materializeNextPendingMessageInTx(
             params.expectedPendingVersion !== undefined
             && (!Number.isSafeInteger(params.expectedPendingVersion) || params.expectedPendingVersion < 0)
         )
+        || (params.requestedLocalId !== undefined && !requestedLocalId)
     ) return { ok: false, error: "invalid-params" };
 
     // Released claim writers omitted this field and historically meant foreground-ready.
@@ -448,9 +470,11 @@ async function materializeNextPendingMessageInTx(
 
             const queueHead = queuedPending[0];
             const exactActionCandidate = queuedPending.find((row) => {
+                if (requestedLocalId && row.localId !== requestedLocalId) return false;
                 if (row.deliveryState !== null) return false;
                 const action = PendingRequestedActionV1Schema.safeParse(row.requestedAction);
                 if (!action.success) return false;
+                if (requestedLocalId && action.data.kind !== "steer_now") return false;
                 return action.data.kind === "send_now"
                     || action.data.kind === "steer_now"
                     || (
@@ -496,11 +520,24 @@ async function materializeNextPendingMessageInTx(
                     pendingCount: sessionBefore.pendingCount ?? 0,
                     pendingBlockedCount: sessionBefore.pendingBlockedCount ?? 0,
                     pendingVersion: sessionBefore.pendingVersion ?? 0,
+                    ...(requestedLocalId ? { deferredReason: "requested_local_id_unavailable" as const } : {}),
                     ...(noopDeliveryState ? { deliveryState: noopDeliveryState } : {}),
                 } as const;
             }
             if (readPendingLocalId(queueHead.localId) === null) {
                 return { ok: false, error: "invalid-params" } as const;
+            }
+
+            if (requestedLocalId && !exactActionCandidate) {
+                return {
+                    ok: true,
+                    didMaterialize: false,
+                    pendingCount: sessionBefore.pendingCount ?? 0,
+                    pendingBlockedCount: sessionBefore.pendingBlockedCount ?? 0,
+                    pendingVersion: sessionBefore.pendingVersion ?? 0,
+                    deferredReason: "requested_local_id_unavailable",
+                    ...(noopDeliveryState ? { deliveryState: noopDeliveryState } : {}),
+                } as const;
             }
 
             if (!exactActionCandidate && queueHead.deliveryState !== null) {

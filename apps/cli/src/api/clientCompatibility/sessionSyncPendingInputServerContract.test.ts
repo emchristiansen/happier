@@ -8,6 +8,7 @@ import {
 function features(params: Readonly<{
     runtimeActivity?: number;
     pendingInput?: number;
+    exactLocalId?: number;
 }> = { runtimeActivity: 2, pendingInput: 1 }) {
     return {
         features: {
@@ -22,7 +23,12 @@ function features(params: Readonly<{
                     runtimeActivity: { protocolVersion: params.runtimeActivity },
                 }),
                 ...(params.pendingInput === undefined ? {} : {
-                    pendingInput: { protocolVersion: params.pendingInput },
+                    pendingInput: {
+                        protocolVersion: params.pendingInput,
+                    },
+                }),
+                ...(params.exactLocalId === undefined ? {} : {
+                    pendingInputExactLocalId: { protocolVersion: params.exactLocalId },
                 }),
             },
         },
@@ -53,10 +59,29 @@ describe('session server capability selection', () => {
         expect(resolveSessionServerCapabilities(features({ runtimeActivity: 2 }))).toEqual({
             runtimeActivity: 'v2',
             pendingInput: 'unsupported',
+            pendingExactLocalId: 'unsupported',
         });
         expect(resolveSessionServerCapabilities(features({ pendingInput: 1 }))).toEqual({
             runtimeActivity: 'unsupported',
             pendingInput: 'v1',
+            pendingExactLocalId: 'unsupported',
+        });
+    });
+
+    it('requires the exact-local-id capability in addition to the older pending protocol version', () => {
+        expect(resolveSessionServerCapabilities(features({ pendingInput: 2 }))).toMatchObject({
+            pendingInput: 'v1',
+            pendingExactLocalId: 'unsupported',
+        });
+        expect(resolveSessionServerCapabilities(features({ runtimeActivity: 2, pendingInput: 2, exactLocalId: 1 }))).toEqual({
+            runtimeActivity: 'v2',
+            pendingInput: 'v1',
+            pendingExactLocalId: 'v1',
+        });
+        expect(resolveSessionServerCapabilities(features({ exactLocalId: 1 }))).toEqual({
+            runtimeActivity: 'unsupported',
+            pendingInput: 'unsupported',
+            pendingExactLocalId: 'unsupported',
         });
     });
 
@@ -64,6 +89,7 @@ describe('session server capability selection', () => {
         expect(resolveSessionServerCapabilities(releasedServerV021Features)).toEqual({
             runtimeActivity: 'legacy',
             pendingInput: 'released_server_v0_2_1',
+            pendingExactLocalId: 'unsupported',
         });
     });
 
@@ -87,6 +113,7 @@ describe('session server capability selection', () => {
             mode: 'session_sync_v2_pending_input_v1',
             runtimeActivity: 'v2',
             pendingInput: 'v1',
+            pendingExactLocalId: 'unsupported',
         });
         expect(fetchImpl).toHaveBeenCalledWith(
             'https://server.example/v1/features',
@@ -111,6 +138,7 @@ describe('session server capability selection', () => {
             mode: 'auth_failed',
             runtimeActivity: 'indeterminate',
             pendingInput: 'indeterminate',
+            pendingExactLocalId: 'indeterminate',
         });
     });
 
@@ -131,6 +159,7 @@ describe('session server capability selection', () => {
             mode: 'session_sync_v2_pending_input_v1',
             runtimeActivity: 'v2',
             pendingInput: 'v1',
+            pendingExactLocalId: 'unsupported',
         });
         expect(fetchImpl).toHaveBeenCalledTimes(2);
     });
@@ -152,11 +181,13 @@ describe('session server capability selection', () => {
         expect(controller.invalidate({ sessionConnectionEpoch: 4, socket })).toMatchObject({
             runtimeActivity: 'indeterminate',
             pendingInput: 'indeterminate',
+            pendingExactLocalId: 'indeterminate',
         });
         release?.(response(features()));
         await expect(pending).resolves.toMatchObject({
             runtimeActivity: 'indeterminate',
             pendingInput: 'indeterminate',
+            pendingExactLocalId: 'indeterminate',
         });
     });
 });

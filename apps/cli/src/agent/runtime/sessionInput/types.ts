@@ -35,6 +35,7 @@ export type DrainPendingStoppedReason =
   | 'retry_exhausted';
 
 export type DrainPendingOptions = {
+  requestedLocalId?: string | undefined;
   maxPopPerWake?: number | undefined;
   reason?: string | undefined;
   abortSignal?: AbortSignal | undefined;

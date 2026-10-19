@@ -1584,6 +1584,90 @@ describe("pendingMessageService (shared sessions)", () => {
         ]);
     });
 
+    it("materializes only the requested steer-now row when another urgent row is earlier", async () => {
+        const owner = await createAccount("exact-steer-target-owner");
+        const session = await createSession(owner.id);
+        const earlierLocalId = `exact-steer-earlier-${randomUUID()}`;
+        const targetLocalId = `exact-steer-target-${randomUUID()}`;
+
+        await enqueuePendingMessage({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            localId: earlierLocalId,
+            ciphertext: "cipher-exact-steer-earlier",
+            requestedAction: { v: 1, kind: "steer_now" },
+        });
+        await enqueuePendingMessage({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            localId: targetLocalId,
+            ciphertext: "cipher-exact-steer-target",
+            requestedAction: { v: 1, kind: "enqueue" },
+        });
+        await expect(updatePendingRequestedAction({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            localId: targetLocalId,
+            requestedAction: { v: 1, kind: "steer_now" },
+        })).resolves.toMatchObject({ ok: true, didUpdate: true });
+
+        const result = await materializeNextPendingMessage({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            requestedLocalId: targetLocalId,
+            deliveryState: "provider",
+            foregroundState: "active_steerable",
+        });
+
+        expect(result).toMatchObject({
+            ok: true,
+            didMaterialize: true,
+            message: {
+                localId: targetLocalId,
+                requestedAction: { v: 1, kind: "steer_now" },
+                providerAction: "steer",
+            },
+        });
+        await expect(db.sessionPendingMessage.findMany({
+            where: { sessionId: session.id },
+            orderBy: [{ position: "asc" }, { localId: "asc" }],
+            select: { localId: true, deliveryState: true },
+        })).resolves.toEqual([
+            { localId: earlierLocalId, deliveryState: null },
+            { localId: targetLocalId, deliveryState: "delivering" },
+        ]);
+    });
+
+    it("does not fall back to another urgent row when an exact steer target is unavailable", async () => {
+        const owner = await createAccount("missing-exact-steer-target-owner");
+        const session = await createSession(owner.id);
+        const queuedLocalId = `exact-steer-unrelated-${randomUUID()}`;
+
+        await enqueuePendingMessage({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            localId: queuedLocalId,
+            ciphertext: "cipher-exact-steer-unrelated",
+            requestedAction: { v: 1, kind: "steer_now" },
+        });
+
+        await expect(materializeNextPendingMessage({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            requestedLocalId: `missing-${randomUUID()}`,
+            deliveryState: "provider",
+            foregroundState: "active_steerable",
+        })).resolves.toMatchObject({
+            ok: true,
+            didMaterialize: false,
+            deferredReason: "requested_local_id_unavailable",
+        });
+        await expect(db.sessionPendingMessage.findUniqueOrThrow({
+            where: { sessionId_localId: { sessionId: session.id, localId: queuedLocalId } },
+            select: { deliveryState: true, providerAction: true },
+        })).resolves.toEqual({ deliveryState: null, providerAction: null });
+    });
+
     it("persists the canonical requested action and rejects same-localId content or action drift", async () => {
         const owner = await createAccount("owner");
         const session = await createSession(owner.id);

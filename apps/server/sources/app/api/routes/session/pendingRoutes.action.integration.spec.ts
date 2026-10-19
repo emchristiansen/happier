@@ -58,6 +58,7 @@ describe("sessionPendingRoutes (requested action)", () => {
 
         expect(bodySchema.safeParse({
             requestedAction: { v: 1, kind: "send_now" },
+            exactLocalId: "l1",
             deliveryCommand: "resume_process_now",
         }).success).toBe(false);
     });
