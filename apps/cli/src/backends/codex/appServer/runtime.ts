@@ -182,6 +182,8 @@ type CodexAppServerStartOrLoadOptions = Readonly<{
     strictNativeResumeIdentity?: boolean;
     importHistory?: boolean;
     initialGoal?: SessionInitialGoalRequestV1 | null;
+    /** Lifetime of the caller request that supplied the initial goal, including bootstrap awaits. */
+    initialGoalSignal?: AbortSignal;
 }>;
 
 const CODEX_APP_SERVER_STATE_RUNTIME_RETRY_INITIAL_DELAY_MS = 250;
@@ -4165,7 +4167,9 @@ export function createCodexAppServerRuntime(params: Readonly<{
 
     const startOrLoad = async (options: CodexAppServerStartOrLoadOptions = {}): Promise<void> => {
         // Native setup may finish after task cancellation; its deferred goal must not.
-        const initialGoalSignal = directControlInputAbort.signal;
+        const initialGoalSignal = options.initialGoalSignal
+            ? AbortSignal.any([options.initialGoalSignal, directControlInputAbort.signal])
+            : directControlInputAbort.signal;
         // A runtime may attach more than once without replacing its app-server client (for
         // example resume fallback or an explicit second load). Every attach must re-arm the
         // history fence before the provider can emit notifications for the selected thread.

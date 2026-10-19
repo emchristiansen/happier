@@ -369,6 +369,53 @@ describe('archived session input admission', () => {
     }
   });
 
+  it.each(['before runtime entry', 'during setup'] as const)(
+    'keeps the original caller initial goal cancelled %s without cancelling a future goal', async (boundary) => {
+      readArchive = async () => ({ status: 200, data: { session: record() } });
+      const started = createDeferred<void>();
+      const released = createDeferred<void>();
+      const originalRequest = new AbortController();
+      const { session } = await createConsumer();
+      const { runtime, request } = await attachDirectControls(session, {
+        loadThread: false,
+        waitForThreadStart: boundary === 'during setup'
+          ? async () => { started.resolve(); await released.promise; }
+          : undefined,
+      });
+      if (boundary === 'before runtime entry') {
+        originalRequest.abort();
+        // The runtime has already installed the next direct-control generation.
+        await runtime.cancel();
+      }
+      const outcome = runtime.startOrLoad({
+        resumeId: 'f1-direct-thread', importHistory: false,
+        initialGoal: { objective: 'Do not revive the original caller goal' },
+        initialGoalSignal: originalRequest.signal,
+      }).then(
+        () => ({ kind: 'success' as const }),
+        (error: unknown) => ({ kind: 'failure' as const, error }),
+      );
+      try {
+        if (boundary === 'during setup') {
+          await started.promise;
+          originalRequest.abort();
+          released.resolve();
+        }
+        await expect(outcome).resolves.toMatchObject({ kind: 'failure', error: { name: 'AbortError' } });
+        expect(request.mock.calls.filter(([method]) => method === 'thread/goal/set')).toEqual([]);
+        // Abandoning the bootstrap request must leave later RPC requests usable.
+        await invokeDirectControl(session, 'goal');
+        expect(request.mock.calls.filter(([method]) => method === 'thread/goal/set')).toEqual([
+          ['thread/goal/set', { threadId: 'f1-direct-thread', objective: 'Retain this exact goal', status: 'paused', tokenBudget: 1200 }],
+        ]);
+      } finally {
+        released.resolve();
+        session.beginRuntimeTermination();
+        await outcome;
+      }
+    },
+  );
+
   it('retains the exact initial goal through unreadable admission until it becomes available', async () => {
     const retryStarted = createDeferred<void>();
     const readable = createDeferred<unknown>();
