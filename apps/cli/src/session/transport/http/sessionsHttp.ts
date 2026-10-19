@@ -144,6 +144,9 @@ export async function fetchSessionByIdCompat(params: Readonly<{ token: string; s
 
   if (response.status === 404) {
     if (!looksLikeMissingV2SessionRoute404(response.data, params.sessionId)) return null;
+    // A low-frequency recovery read must remain one physical request. Interactive and
+    // compatibility callers retain their legacy list fallback; periodic discovery does not.
+    if (params.reason === 'pending-reconciliation') return null;
 
     let cursor: string | undefined = undefined;
     const seenCursors = new Set<string>();

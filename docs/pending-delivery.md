@@ -85,6 +85,9 @@ periodic read rate is one read per 240 seconds per eligible binding: 1.667 reads
 per second for 400 continuously eligible bindings. At the stretched cap it is
 at most one per 1,440 seconds, or 0.278 reads per second for 400 bindings. These
 are source bounds, not measurements of the participating population or relay cost.
+Periodic discovery never initiates the compatibility reader's paginated session-list
+fallback. An older relay without the detail route therefore has no periodic recovery
+guarantee; existing non-periodic compatibility callers retain their fallback.
 
 Ticks defer during a locally active provider turn: turn-end reconciliation already
 handles that boundary. They also defer while readiness or settings application is
@@ -101,6 +104,9 @@ settings convergence, archive admission, runtime readiness and exact provider
 acceptance/settlement remain in force. A missing server row does not retire local
 reserved or accepted custody; an accepted input is never delivered to the provider
 again merely because its settlement acknowledgement was lost.
+External deletion or manual handling without an exact completion receipt leaves
+that reservation or accepted operation unresolved and blocks a later claim. The
+existing exact settlement/committed-proof path must release it.
 
 A missed hint can add up to six minutes while healthy, or thirty minutes under
 stretched cadence, plus read completion and any larger server lower bound. Active

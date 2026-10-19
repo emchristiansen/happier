@@ -1951,9 +1951,8 @@ export class ApiSessionClient extends EventEmitter {
                     localId,
                     serverStatus: status ?? 'absent',
                 });
-                // Unlike successful settlement or an exact committed replay, authoritative
-                // absence/discard proves there is no remaining Pending row whose acceptance
-                // this session client should expose.
+                // An explicit discard retires unaccepted custody. Accepted results still need
+                // their own exact settlement proof; absence alone proves neither outcome.
                 this.acceptedProviderInputLocalIds.delete(localId);
                 this.clearCanonicalPendingDeliveryLocalState(localId);
             }
@@ -2080,6 +2079,12 @@ export class ApiSessionClient extends EventEmitter {
             if (result.retryAfterMs !== undefined) {
                 this.pendingDiscoveryNotBeforeMs = Math.max(this.pendingDiscoveryNotBeforeMs, Date.now() + result.retryAfterMs);
             }
+            logger.infoFile('[pendingQueue] authoritative discovery read failed', {
+                sessionId: this.sessionId,
+                retryable: result.retryable,
+                nextDelayBaseMs: this.pendingDiscoveryDelayMs,
+                ...(result.retryAfterMs === undefined ? {} : { retryAfterMs: result.retryAfterMs }),
+            });
             if (!result.retryable) this.pendingDiscoveryProducer = null;
             return;
         }
@@ -2256,16 +2261,19 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private readSessionSnapshotFromServer(opts: { reason: SessionSnapshotRefreshReasonInput }): Promise<SessionSnapshotReadResult> {
-        if (this.closed || this.runtimeTerminationStarted) return Promise.resolve({ status: 'obsolete' });
+        const lifetimeSignal = this.acceptedCanonicalPendingDeliveryOperationAbortController.signal;
+        if (this.closed || this.runtimeTerminationStarted || lifetimeSignal.aborted) return Promise.resolve({ status: 'obsolete' });
         if (this.snapshotSyncInFlight) return this.snapshotSyncInFlight;
         const generation = this.providerInputOutcomeProducerGeneration;
         const epoch = this.sessionConnectionEpoch;
         const socket = this.socket;
+        const wasConnected = socket.connected === true;
         const machineId = this.sessionSocketMachineId;
         const startedAtMs = Date.now();
-        const isCurrent = () => !this.closed && !this.runtimeTerminationStarted
+        const isCurrent = () => !this.closed && !this.runtimeTerminationStarted && !lifetimeSignal.aborted
             && generation === this.providerInputOutcomeProducerGeneration
             && epoch === this.sessionConnectionEpoch && socket === this.socket
+            && (!wasConnected || socket.connected === true)
             && machineId === this.sessionSocketMachineId;
         const p = (async (): Promise<SessionSnapshotReadResult> => {
             try {
