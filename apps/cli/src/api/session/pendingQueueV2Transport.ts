@@ -222,9 +222,9 @@ export function isAcceptedPendingQueueV2DeliveryRetryableError(error: unknown): 
     if (error instanceof PendingQueueAcceptedSettlementError) {
         return error.settlementError === 'internal' || error.settlementError === 'transaction-unavailable';
     }
-    // The local deadline already supplies positive response-loss evidence. Native
-    // Socket.IO rejections are classified at the accepted transport boundary below.
-    return readErrorCode(error) === 'socket_ack_timeout'
+    // The shared deadline and pre-emit connection check supply typed transport failures.
+    // Native Socket.IO rejections are classified at the accepted transport boundary below.
+    return (readErrorCode(error) === 'socket_ack_timeout' || readErrorCode(error) === 'socket_not_connected')
         && (error as { retryable?: unknown }).retryable === true;
 }
 
@@ -808,11 +808,10 @@ export type PendingQueueV2DeliveryStatusEntry = Readonly<{
 }>;
 
 /**
- * Canonical per-row delivery status projection for every row currently in the server pending
- * queue. Terminal outcomes (a row resolved/delivered — e.g. user "mark delivered" — or removed)
- * are represented by the row's ABSENCE from the returned list; a lingering row explicitly reports
- * its `discarded` status. This is the single delivery-truth source used to retire local canonical
- * provider-delivery claims whose server row has gone terminal.
+ * Per-row delivery status projection for rows currently in the server pending queue. An absent
+ * row is only an observation, not proof of settlement or exact committed delivery. The existing
+ * canonical custody owner decides release from its exact terminal/committed proof; a retained
+ * row's explicit status remains available to that owner.
  */
 export async function listPendingQueueV2DeliveryStatusesFromServer(params: {
     token: string;

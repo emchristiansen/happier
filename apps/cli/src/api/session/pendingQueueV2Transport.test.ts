@@ -18,6 +18,7 @@ import {
     materializeNextPendingQueueV2MessageViaHttp,
     PendingQueueMaterializationTransportAmbiguousError,
     readAcceptedPendingQueueV2DeliveryRetryDirective,
+    isAcceptedPendingQueueV2DeliveryRetryableError,
     resolveAcceptedPendingQueueV2Delivery,
 } from './pendingQueueV2Transport';
 
@@ -1598,15 +1599,29 @@ describe('pendingQueueV2Transport', () => {
     });
 
     it('fails closed without HTTP fallback when the publisher socket is disconnected', async () => {
-        await expect(resolveAcceptedPendingQueueV2Delivery({
-            socket: { connected: false } as any,
+        const socket = { connected: false, emitWithAck: vi.fn() };
+        const error = await resolveAcceptedPendingQueueV2Delivery({
+            socket: socket as unknown as Parameters<typeof resolveAcceptedPendingQueueV2Delivery>[0]['socket'],
             sessionId: 'session-1',
             localId: 'accepted-local',
-        })).rejects.toMatchObject({
+        }).catch((error: unknown) => error);
+        expect(error).toMatchObject({
             code: 'socket_not_connected',
             event: 'pending-delivery-accepted-v1',
+            retryable: true,
         });
+        expect(isAcceptedPendingQueueV2DeliveryRetryableError(error)).toBe(true);
+        expect(socket.emitWithAck).not.toHaveBeenCalled();
         expect(mockPost).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        new Error('untyped disconnected transport'),
+        Object.assign(new Error('unqualified disconnected socket'), { code: 'socket_not_connected' }),
+        Object.assign(new Error('explicitly nonretryable disconnected socket'), { code: 'socket_not_connected', retryable: false }),
+        Object.assign(new Error('unrecognized transport code'), { code: 'other_socket_failure', retryable: true }),
+    ])('does not widen accepted-settlement retry to an unqualified failure %#', (error) => {
+        expect(isAcceptedPendingQueueV2DeliveryRetryableError(error)).toBe(false);
     });
 
 
