@@ -80,6 +80,9 @@ export type RuntimeAuthRecoveryIntent = Readonly<{
   // local outage can be waited out without prematurely dead-lettering a recoverable
   // session. It is still bounded (cannot wait forever).
   degradedAttemptCount?: number;
+  // Provider trials after a known limit reset have their own bounded budget.
+  // Policy-only waits (including records retained from older daemons) spend none.
+  limitResetRetryCount?: number;
   // RD-REC-15 / F4: bounded coalesced-replay budget. When a wake reproduces the
   // SAME pending proof target for a stale-profile intent (no new information),
   // the attempt rollback must not make `resumed_awaiting_proof` unbounded — each
@@ -130,6 +133,21 @@ export type RuntimeAuthRecoveryDiagnostic = Readonly<{
   transition?: RuntimeAuthRecoveryTransition;
 }>;
 
+export type RuntimeAuthLimitResetRetryInput = Readonly<{
+  sessionId: string;
+  attemptId: string;
+  retryCount: number;
+  classification: ConnectedServiceRuntimeFailureClassification;
+  resumePromptMode: 'standard' | 'off' | 'custom';
+  isCurrent: () => boolean;
+}>;
+
+export type RuntimeAuthLimitResetRetryResult =
+  | Readonly<{ status: 'continued' }>
+  | Readonly<{ status: 'deferred' }>
+  | Readonly<{ status: 'superseded'; reason: string }>
+  | Readonly<{ status: 'terminal'; lastError: string }>;
+
 export type RuntimeAuthRecoverySchedulerDeps = Readonly<{
   nowMs: () => number;
   baseBackoffMs?: number;
@@ -149,6 +167,7 @@ export type RuntimeAuthRecoverySchedulerDeps = Readonly<{
     resumePromptMode: 'standard' | 'off' | 'custom';
     source: 'scheduler_retry';
   }>) => Promise<unknown>;
+  retryAfterLimitReset?: (input: RuntimeAuthLimitResetRetryInput) => Promise<RuntimeAuthLimitResetRetryResult>;
   gate?: (input: Readonly<{ sessionId: string; intent: RuntimeAuthRecoveryIntent }>) => DurableRecoveryGateResult;
   recordDiagnostic?: (event: RuntimeAuthRecoveryDiagnostic) => void;
   durableStore?: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent>;
@@ -305,6 +324,9 @@ function normalizeIntent(value: unknown): RuntimeAuthRecoveryIntent | null {
     ...(readNonNegativeNumber(value.coalescedReplayCount) === null
       ? {}
       : { coalescedReplayCount: readNonNegativeNumber(value.coalescedReplayCount) as number }),
+    ...(readNonNegativeNumber(value.limitResetRetryCount) === null
+      ? {}
+      : { limitResetRetryCount: readNonNegativeNumber(value.limitResetRetryCount) as number }),
     switchesThisTurn,
     classification,
     failurePhase,
@@ -940,6 +962,9 @@ function mergeRuntimeAuthRecoveryIntent(
     // prompt mode is an attempt fact too, so duplicate evidence cannot rewrite
     // the policy that the in-band handler and future wakes must share.
     resumePromptMode: previous.resumePromptMode,
+    ...(previous.limitResetRetryCount === undefined && next.limitResetRetryCount === undefined ? {} : {
+      limitResetRetryCount: Math.max(previous.limitResetRetryCount ?? 0, next.limitResetRetryCount ?? 0),
+    }),
     lastSettledTransition: mergeRuntimeAuthRecoveryTransition(
       previous.lastSettledTransition,
       next.lastSettledTransition,
@@ -1111,11 +1136,23 @@ function mergeRuntimeAuthRecoveryWakeWrite(input: Readonly<{
     lastError: keepLatestFailureMessage ? input.current.lastError : input.next.lastError,
     lastErrorClassification: input.current.lastErrorClassification,
     attemptCount: Math.max(input.current.attemptCount, input.next.attemptCount),
+    ...(input.current.limitResetRetryCount === undefined && input.next.limitResetRetryCount === undefined ? {} : {
+      limitResetRetryCount: Math.max(input.current.limitResetRetryCount ?? 0, input.next.limitResetRetryCount ?? 0),
+    }),
     maxAttempts: Math.min(input.current.maxAttempts, input.next.maxAttempts),
     nextRetryAtMs: mergeRuntimeAuthWakeNextRetryAtMs(input.current, input.next),
     pendingTargetProfileId: input.next.pendingTargetProfileId ?? input.current.pendingTargetProfileId ?? null,
     pendingTargetGeneration: input.next.pendingTargetGeneration ?? input.current.pendingTargetGeneration ?? null,
   };
+}
+
+function isRuntimeAuthLimitResetRetryDue(intent: RuntimeAuthRecoveryIntent, nowMs: number): boolean {
+  return intent.groupId === null
+    && (intent.classification.kind === 'usage_limit' || intent.classification.kind === 'rate_limit')
+    && typeof intent.classification.resetsAtMs === 'number'
+    && Number.isFinite(intent.classification.resetsAtMs)
+    && intent.classification.resetsAtMs <= nowMs
+    && intent.lastError !== RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR;
 }
 
 function isRuntimeAuthDurableWaitIntent(intent: RuntimeAuthRecoveryIntent): boolean {
@@ -1192,7 +1229,7 @@ export class RuntimeAuthRecoveryScheduler {
   private pendingVisibleEventDeliver: ((delivery: RuntimeAuthRecoveryVisibleEventDelivery) => Promise<void>) | null = null;
   private pendingVisibleEventRetryDelayMs = 10_000;
   private pendingVisibleEventDrainError: ((error: unknown) => void) | null = null;
-  private pendingVisibleEventDrainDisposed = false;
+  private disposed = false;
 
   constructor(private readonly deps: RuntimeAuthRecoverySchedulerDeps) {
     this.baseBackoffMs = normalizePositiveInteger(deps.baseBackoffMs, DEFAULT_RUNTIME_AUTH_RECOVERY_BASE_BACKOFF_MS);
@@ -1234,10 +1271,14 @@ export class RuntimeAuthRecoveryScheduler {
           ? 'cancelled'
           : intent.status,
       getNextRetryAtMs: (intent) => intent.nextRetryAtMs,
-      getAttemptCount: (intent) => intent.attemptCount,
+      getAttemptCount: (intent) => deps.retryAfterLimitReset && isRuntimeAuthLimitResetRetryDue(intent, deps.nowMs())
+        ? intent.limitResetRetryCount ?? 0
+        : intent.attemptCount,
       // Proof observations do not run recovery attempts. The durable scheduler
       // treats zero as no attempt ceiling; targeted recovery keeps its budget.
-      getMaxAttempts: (intent) => isUntargetedProviderOutcomeProofWait(intent)
+      getMaxAttempts: (intent) => deps.retryAfterLimitReset && isRuntimeAuthLimitResetRetryDue(intent, deps.nowMs())
+        ? intent.maxAttempts
+        : isUntargetedProviderOutcomeProofWait(intent)
         ? 0
         : isRuntimeAuthDurableWaitIntent(intent)
           ? Number.MAX_SAFE_INTEGER
@@ -1264,7 +1305,12 @@ export class RuntimeAuthRecoveryScheduler {
         attemptId: intent.attemptId ?? buildRuntimeAuthRecoveryAttemptId(undefined),
         status: 'checking',
         lastSettledTransition: mergeRuntimeAuthRecoveryTransition(intent.lastSettledTransition, 'working'),
-        attemptCount,
+        attemptCount: deps.retryAfterLimitReset && isRuntimeAuthLimitResetRetryDue(intent, deps.nowMs())
+          ? intent.attemptCount + 1
+          : attemptCount,
+        ...(deps.retryAfterLimitReset && isRuntimeAuthLimitResetRetryDue(intent, deps.nowMs()) ? {
+          limitResetRetryCount: Math.min(attemptCount, intent.maxAttempts),
+        } : {}),
         // A gate can replace lastError while retaining the proof-wait state.
         // Carry that phase through the generic scheduler's checking transition.
         lastError: isUntargetedProviderOutcomeProofWait(intent)
@@ -1339,6 +1385,45 @@ export class RuntimeAuthRecoveryScheduler {
       }),
       recover: async (intent) => {
         try {
+          // A handed-off trial waits for its real outcome, never another prompt.
+          // Transactional stores observe this before the claim; retain the same
+          // no-effect behavior for the supported in-memory store too.
+          if (intent.limitResetRetryCount !== undefined
+            && intent.lastError === RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR) {
+            return {
+              status: 'wait', exhaustOnMaxAttempt: false,
+              lastError: RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR,
+              nextRetryAtMs: deps.nowMs() + (this.providerOutcomePendingWaitMs ?? this.baseBackoffMs),
+              intent: { ...intent, status: 'resumed_awaiting_proof', attemptCount: Math.max(0, intent.attemptCount - 1) },
+            };
+          }
+          if (deps.retryAfterLimitReset && isRuntimeAuthLimitResetRetryDue(intent, deps.nowMs())) {
+            const result = await deps.retryAfterLimitReset({
+              sessionId: intent.sessionId,
+              attemptId: intent.attemptId!,
+              retryCount: intent.limitResetRetryCount!,
+              classification: intent.classification,
+              resumePromptMode: readResumePromptMode(intent.resumePromptMode),
+              isCurrent: () => {
+                const current = this.readByKey(buildRecoveryKeyForIntent(intent));
+                return !this.disposed && current?.status === 'checking'
+                  && current.attemptId === intent.attemptId
+                  && current.limitResetRetryCount === intent.limitResetRetryCount;
+              },
+            });
+            if (result.status === 'superseded') return { status: 'superseded', reason: result.reason };
+            if (result.status === 'terminal') return {
+              status: 'terminal', lastError: result.lastError,
+              intent: buildTerminalRuntimeAuthIntent({ intent, nowMs: deps.nowMs(), terminalReason: result.lastError }),
+            };
+            if (result.status === 'deferred') return { status: 'wait', exhaustOnMaxAttempt: false, lastError: 'limit_reset_retry_deferred' };
+            return {
+              status: 'wait', exhaustOnMaxAttempt: false,
+              lastError: RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR,
+              nextRetryAtMs: deps.nowMs() + (this.providerOutcomePendingWaitMs ?? this.baseBackoffMs),
+              intent: { ...intent, status: 'resumed_awaiting_proof', pendingTargetProfileId: null, pendingTargetGeneration: null },
+            };
+          }
           const result = await deps.recover({
             sessionId: intent.sessionId,
             switchesThisTurn: intent.switchesThisTurn,
@@ -1687,7 +1772,7 @@ export class RuntimeAuthRecoveryScheduler {
     retryDelayMs?: number;
     onError?: (error: unknown) => void;
   }>): void {
-    if (this.pendingVisibleEventDrainDisposed) return;
+    if (this.disposed) return;
     this.pendingVisibleEventDeliver = input.deliver;
     if (typeof input.retryDelayMs === 'number' && Number.isFinite(input.retryDelayMs)) {
       this.pendingVisibleEventRetryDelayMs = Math.max(0, Math.trunc(input.retryDelayMs));
@@ -1713,12 +1798,12 @@ export class RuntimeAuthRecoveryScheduler {
     try {
       await this.drainPendingVisibleEvents(deliver);
     } catch (error) {
-      if (!this.pendingVisibleEventDrainDisposed) this.pendingVisibleEventDrainRequested = true;
+      if (!this.disposed) this.pendingVisibleEventDrainRequested = true;
       this.pendingVisibleEventDrainError?.(error);
     } finally {
       this.pendingVisibleEventDrainInFlight = false;
     }
-    if (!this.pendingVisibleEventDrainDisposed && this.pendingVisibleEventDrainRequested) {
+    if (!this.disposed && this.pendingVisibleEventDrainRequested) {
       this.schedulePendingVisibleEventDrain({ deliver, delayMs: this.pendingVisibleEventRetryDelayMs });
     }
   }
@@ -1770,7 +1855,7 @@ export class RuntimeAuthRecoveryScheduler {
    * work cannot switch/restart sessions while this daemon instance is tearing down.
    */
   dispose(): void {
-    this.pendingVisibleEventDrainDisposed = true;
+    this.disposed = true;
     if (this.pendingVisibleEventDrainTimer) clearTimeout(this.pendingVisibleEventDrainTimer);
     this.pendingVisibleEventDrainTimer = null;
     this.pendingVisibleEventDeliver = null;

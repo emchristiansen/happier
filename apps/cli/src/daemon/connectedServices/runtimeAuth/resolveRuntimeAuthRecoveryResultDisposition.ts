@@ -65,6 +65,7 @@ function resolveActionRequiredWaitCandidateMs(input: Readonly<{
   switchResult: Readonly<Record<string, unknown>>;
   classificationResetsAtMs: number | null;
   nowMs: number;
+  retryBackoffMs: number;
 }>): number | null {
   if (input.switchResult.status !== 'recovery_action_required') return null;
   const action = isRecord(input.switchResult.action) ? input.switchResult.action : null;
@@ -72,7 +73,14 @@ function resolveActionRequiredWaitCandidateMs(input: Readonly<{
   const actionReason = readString(action?.reason);
   if (!actionKind || !WAITABLE_ACTION_REQUIRED_KINDS.has(actionKind)) return null;
   if (!actionReason || !WAITABLE_FAILURE_REASONS.has(actionReason)) return null;
-  return resolveEarliestFutureWaitCandidateMs([input.classificationResetsAtMs], input.nowMs);
+  const futureReset = resolveEarliestFutureWaitCandidateMs([input.classificationResetsAtMs], input.nowMs);
+  if (futureReset !== null) return futureReset;
+  // An expired reset is permission to try the provider again, not evidence that
+  // the account is still limited. Fresh failures retain a backoff-separated wait.
+  return (actionReason === 'usage_limit' || actionReason === 'rate_limit')
+    && readNonNegativeNumber(input.classificationResetsAtMs) !== null
+    ? input.nowMs + input.retryBackoffMs
+    : null;
 }
 
 /**
@@ -136,6 +144,7 @@ export function resolveRuntimeAuthRecoveryResultDisposition(input: Readonly<{
     switchResult,
     classificationResetsAtMs: input.classificationResetsAtMs,
     nowMs: input.nowMs,
+    retryBackoffMs: Math.max(GROUP_EXHAUSTED_WAIT_FLOOR_MS, readNonNegativeNumber(input.unknownNoEligibleMemberBackoffMs) ?? 0),
   });
   if (actionRequiredCandidate !== null) {
     return {
@@ -152,11 +161,15 @@ export function resolveRuntimeAuthRecoveryResultDisposition(input: Readonly<{
     const resetAtMs = resolveEarliestFutureWaitCandidateMs([
       input.classificationResetsAtMs,
     ], input.nowMs);
-    if (resetAtMs !== null) {
+    const expiredKnownReset = (input.classificationFailureKind === 'usage_limit' || input.classificationFailureKind === 'rate_limit')
+      && readNonNegativeNumber(input.classificationResetsAtMs) !== null;
+    if (resetAtMs !== null || expiredKnownReset) {
       return {
         kind: 'durable_wait',
         reason: 'awaiting_limit_reset',
-        nextRetryAtMs: resetAtMs,
+        nextRetryAtMs: resetAtMs ?? input.nowMs + Math.max(
+          GROUP_EXHAUSTED_WAIT_FLOOR_MS, readNonNegativeNumber(input.unknownNoEligibleMemberBackoffMs) ?? 0,
+        ),
       };
     }
   }

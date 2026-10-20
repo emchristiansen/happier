@@ -24,6 +24,7 @@ import {
   requestSessionPendingQueueWakeV1,
 } from './sessions/pendingQueueWake';
 import { publishSessionPendingQueueWake } from './sessions/publishSessionPendingQueueWake';
+import { retryRuntimeAuthLimitAfterReset } from './connectedServices/runtimeAuth/retryRuntimeAuthLimitAfterReset';
 import { createRuntimeAuthRecoverySchedulerForDaemon } from './connectedServices/runtimeAuth/createRuntimeAuthRecoverySchedulerForDaemon';
 import { projectTemporaryThrottleRecoveryMetadata } from './connectedServices/runtimeAuth/projection/temporaryThrottleRecoveryMetadata';
 import { deriveConnectedServiceBrokerRefreshToken } from './connectedServices/broker/brokerRefreshCapabilityToken';
@@ -6456,6 +6457,15 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             { min: 1, max: 25 },
           ),
           recover: handleConnectedServiceRuntimeAuthRecovery,
+          retryAfterLimitReset: async (retry) => await retryRuntimeAuthLimitAfterReset({
+            ...retry,
+            isCurrent: () => !shutdownInitiated && retry.isCurrent(),
+            resolveResumeSource: resolveTemporaryThrottleResumeSource,
+            credentials,
+            readCredentials,
+            spawnSession,
+            customResumePrompt: readContinuationCustomResumePrompt(getActiveAccountSettingsSnapshot()?.settings ?? null),
+          }),
           gate: ({ intent }) => {
             const nowMs = Date.now();
             // Daemon-lifecycle gate: while shutting down, defer the recovery WITHOUT counting an
