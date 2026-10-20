@@ -25,6 +25,8 @@ import {
 import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '../connectedServiceChildEnvironment';
 import { normalizeMaterializationKeyForPath } from '../materialize/normalizeMaterializationKeyForPath';
 import { buildDefaultConnectedServiceCredentialLifecycleDescriptor } from '../credentials/lifecycleTypes';
+import { createConnectedServiceSessionAuthSwitchCore } from '../runtimeAuth/connectedServiceSessionAuthSwitchCore';
+import { createRefreshedConnectedServiceAuthUpdatedHandler } from './createRefreshedConnectedServiceAuthUpdatedHandler';
 import { ConnectedServiceRuntimeRegistry } from '../runtimeRegistry/registry';
 import { resolveConnectedServiceCredentialLifecycleDescriptor } from '@/backends/catalog';
 import { computeConnectedServiceAccessTokenFingerprint } from './credentialFreshness/tokenFingerprint';
@@ -2121,6 +2123,85 @@ afterEach(() => {
     }
 
     expect(harness.onAuthUpdated).toHaveBeenCalledTimes(1);
+  });
+
+  it('unwinds stopped notification and scheduled binding custody, then permits a later refresh', async () => {
+    const harness = await buildGroupHomeOwnershipHarness();
+    const core = createConnectedServiceSessionAuthSwitchCore();
+    let releaseOwner!: () => void;
+    const owner = core.run({
+      sessionId: 'session-group-owner-a',
+      reason: 'manual',
+      execute: () => new Promise<void>((resolve) => { releaseOwner = resolve; }),
+    });
+    await Promise.resolve();
+    const applied: string[] = [];
+    let notificationStarted!: () => void;
+    const started = new Promise<void>((resolve) => { notificationStarted = resolve; });
+    const handler = createRefreshedConnectedServiceAuthUpdatedHandler({
+      applyRefreshedAuth: async ({ sessionId }) => await core.run({
+        sessionId, reason: 'automatic_runtime_failure', execute: async () => {
+          applied.push(sessionId);
+          return { ok: true, action: 'hot_applied' };
+        },
+      }),
+      restartAfterAuthUpdated: async () => {},
+      onRestartRequired: () => {},
+    });
+    harness.onAuthUpdated.mockImplementation(async (event) => {
+      notificationStarted();
+      return await handler(event);
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ access_token: 'rotated-access', refresh_token: 'rotated-refresh', expires_in: 3600 }),
+    })) as unknown as typeof fetch);
+    const scheduling = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
+    let outcome: unknown;
+    const refresh = harness.coordinator.refreshConnectedServiceCredentialForSpawnPreflight({
+      serviceId: 'claude-subscription', profileId: 'workA', force: true,
+    }).catch((error: unknown) => { outcome = error; });
+    let tick: Promise<void> | undefined;
+    let tickOutcome: unknown;
+    try {
+      await started;
+      // The scheduled owner joins the same pending notification rather than rotating twice.
+      tick = harness.coordinator.tickOnce().catch((error: unknown) => { tickOutcome = error; });
+      await expect.poll(() => scheduling.mock.calls).toContainEqual([
+        expect.any(String), expect.objectContaining({ event: 'binding_started', profileId: 'workA' }),
+      ]);
+      core.clearSession('session-group-owner-a');
+      await expect.poll(() => outcome).toMatchObject({ reason: 'session_stopped' });
+      await refresh;
+      await tick;
+      expect(tickOutcome).toBeInstanceOf(AggregateError);
+      expect((tickOutcome as AggregateError).errors).toContain(outcome);
+      expect(outcome).toMatchObject({ reason: 'session_stopped' });
+      expect(harness.api.registerConnectedServiceCredentialSealed).toHaveBeenCalledTimes(1);
+      expect(applied).not.toContain('session-group-owner-a');
+      expect(scheduling).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        event: 'binding_completed', profileId: 'workA', outcome: 'failure',
+      }));
+      releaseOwner();
+      await owner;
+      scheduling.mockClear();
+      await harness.coordinator.tickOnce();
+      expect(scheduling).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        event: 'binding_started', profileId: 'workA',
+      }));
+      expect(scheduling).not.toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        event: 'binding_skipped', profileId: 'workA', reason: 'pending_task',
+      }));
+      await expect(harness.coordinator.refreshConnectedServiceCredentialForSpawnPreflight({
+        serviceId: 'claude-subscription', profileId: 'workA', force: true,
+      })).resolves.toMatchObject({ status: 'refreshed' });
+      expect(applied).toContain('session-group-owner-a');
+      expect(harness.onAuthUpdated.mock.calls.length).toBeGreaterThan(1);
+    } finally {
+      releaseOwner();
+      await Promise.allSettled([owner, refresh, ...(tick ? [tick] : [])]);
+      scheduling.mockRestore();
+    }
   });
 
   it('retains a pending rotation across scheduled ticks without rotating it again', async () => {

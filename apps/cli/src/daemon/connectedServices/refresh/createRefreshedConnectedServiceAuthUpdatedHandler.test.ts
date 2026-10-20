@@ -9,6 +9,7 @@ import {
   createRefreshedConnectedServiceAuthUpdatedHandler,
   type RefreshedConnectedServiceAuthApplication,
 } from './createRefreshedConnectedServiceAuthUpdatedHandler';
+import { ConnectedServiceSessionAuthSwitchLockRegistry } from '../runtimeAuth/connectedServiceSessionAuthSwitchCore';
 import type { SpawnTarget } from './refreshTypes';
 
 type Handler = ReturnType<typeof createRefreshedConnectedServiceAuthUpdatedHandler>;
@@ -178,4 +179,42 @@ describe('createRefreshedConnectedServiceAuthUpdatedHandler', () => {
       expect(await restartsFor({ agentId: 'codex', serviceId: 'openai-codex' })).toEqual([]);
     });
   });
+});
+
+it('applies eligible sessions while other targets wait, then rejects all expired acquisitions without late effects', async () => {
+  vi.useFakeTimers();
+  const locks = new ConnectedServiceSessionAuthSwitchLockRegistry();
+  const releases: Array<() => void> = [];
+  const held = ['busy-1', 'busy-2'].map((sessionId) =>
+    locks.runExclusive(sessionId, () => new Promise<void>((resolve) => { releases.push(resolve); })),
+  );
+  await Promise.resolve();
+  const applied: string[] = [];
+  const restartAfterAuthUpdated = vi.fn(async (_event: AuthUpdatedEvent) => {});
+  const handler = createRefreshedConnectedServiceAuthUpdatedHandler({
+    applyRefreshedAuth: async ({ sessionId }) => await locks.runExclusive(sessionId, async () => {
+      applied.push(sessionId);
+      return { ok: true, action: 'hot_applied' };
+    }),
+    restartAfterAuthUpdated,
+    onRestartRequired: () => {},
+  });
+  let outcome: unknown;
+  const notification = Promise.resolve(handler(refreshEvent('claude-subscription', 'work', ['busy-1', 'busy-2', 'ready', 'ready'].map((sessionId, index) =>
+    spawnTarget({ pid: index + 1, sessionId, agentId: 'claude', serviceId: 'claude-subscription', profileId: 'work' }),
+  )))).catch((error: unknown) => { outcome = error; });
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    expect(applied).toEqual(['ready']);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(outcome).toMatchObject({ reason: 'timed_out' });
+    expect(restartAfterAuthUpdated).not.toHaveBeenCalled();
+    releases.forEach((release) => release());
+    await Promise.all([...held, notification]);
+    expect(applied).toEqual(['ready']);
+  } finally {
+    releases.forEach((release) => release());
+    await Promise.all([...held, notification]);
+    vi.useRealTimers();
+  }
 });

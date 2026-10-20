@@ -5633,6 +5633,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           const existingStop = stopSessionInFlightBySessionId.get(normalizedSessionId);
           if (existingStop) return await existingStop;
 
+          // Cancel queued auth applications before any asynchronous Stop cleanup can wait on them.
+          // The executing owner retains exclusion until its own operation unwinds.
+          connectedServiceSessionAuthSwitchCore.clearSession(normalizedSessionId);
           const operation = Promise.resolve().then(async (): Promise<StopSessionResult> => {
             sessionRunnerRespawnManager.markStopRequested(normalizedSessionId, { reason: 'daemon_stop_session', requestedAtMs: Date.now() });
             const automaticRecoveryCancellations = await Promise.allSettled([

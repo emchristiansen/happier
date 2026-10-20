@@ -58,11 +58,12 @@ export function createRefreshedConnectedServiceAuthUpdatedHandler(params: Readon
       return { appliedRuntimeIdentityKeys: new Set<string>() };
     }
 
-    const appliedSessionIds = new Set<string>();
+    const attemptedSessionIds = new Set<string>();
+    const applications: Promise<void>[] = [];
     const appliedRuntimeIdentityKeys = new Set<string>();
     for (const target of event.affectedTargets) {
       const sessionId = String(target.sessionId ?? '').trim();
-      if (!sessionId || appliedSessionIds.has(sessionId)) continue;
+      if (!sessionId || attemptedSessionIds.has(sessionId)) continue;
       const selection = target.selectionsByServiceId.get(event.binding.serviceId);
       if (!selection) continue;
       const activeProfileId = selection.kind === 'profile'
@@ -70,43 +71,51 @@ export function createRefreshedConnectedServiceAuthUpdatedHandler(params: Readon
         : selection.activeProfileId;
       if (activeProfileId !== event.binding.profileId) continue;
 
-      const result = await params.applyRefreshedAuth({
-        sessionId,
-        serviceId: event.binding.serviceId,
-        groupId: selection.kind === 'group' ? selection.groupId : null,
-        activeProfileId,
-        generation: selection.kind === 'group' ? selection.generation : null,
-        credentialRevision: event.credentialRevision,
-        reason: event.trigger,
-        switchReason: 'automatic_runtime_failure',
-        fromProfileId: activeProfileId,
-      });
-      if (!result.ok) {
-        if (result.errorCode === 'restart_disallowed_by_execution_policy') continue;
-        if (result.errorCode === 'hot_apply_restart_required') {
-          params.onRestartRequired({
-            sessionId,
-            pid: target.pid,
-            agentId: target.agentId,
-            serviceId: event.binding.serviceId,
-            profileId: event.binding.profileId,
-            errorCode: 'hot_apply_restart_required',
-          });
-          continue;
+      attemptedSessionIds.add(sessionId);
+      applications.push((async () => {
+        const result = await params.applyRefreshedAuth({
+          sessionId,
+          serviceId: event.binding.serviceId,
+          groupId: selection.kind === 'group' ? selection.groupId : null,
+          activeProfileId,
+          generation: selection.kind === 'group' ? selection.generation : null,
+          credentialRevision: event.credentialRevision,
+          reason: event.trigger,
+          switchReason: 'automatic_runtime_failure',
+          fromProfileId: activeProfileId,
+        });
+        if (!result.ok) {
+          if (result.errorCode === 'restart_disallowed_by_execution_policy') return;
+          if (result.errorCode === 'hot_apply_restart_required') {
+            params.onRestartRequired({
+              sessionId,
+              pid: target.pid,
+              agentId: target.agentId,
+              serviceId: event.binding.serviceId,
+              profileId: event.binding.profileId,
+              errorCode: 'hot_apply_restart_required',
+            });
+            return;
+          }
+          throw new Error(`connected_service_refreshed_auth_application_failed:${result.errorCode ?? 'unknown'}`);
         }
-        throw new Error(`connected_service_refreshed_auth_application_failed:${result.errorCode ?? 'unknown'}`);
-      }
-      if (result.action !== 'hot_applied') continue;
-      appliedSessionIds.add(sessionId);
-      for (const affectedTarget of event.affectedTargets) {
-        if (
-          affectedTarget.sessionId === sessionId
-          && affectedTarget.pid === target.pid
-        ) {
-          appliedRuntimeIdentityKeys.add(affectedTarget.runtimeIdentityKey);
+        if (result.action !== 'hot_applied') return;
+        for (const affectedTarget of event.affectedTargets) {
+          if (
+            affectedTarget.sessionId === sessionId
+            && affectedTarget.pid === target.pid
+          ) {
+            appliedRuntimeIdentityKeys.add(affectedTarget.runtimeIdentityKey);
+          }
         }
-      }
+      })());
     }
+
+    // Settle every attempted session before failing the notification. Promise.race would
+    // abandon queued work, and serial acquisition would multiply the contention budget.
+    const outcomes = await Promise.allSettled(applications);
+    const failure = outcomes.find((outcome) => outcome.status === 'rejected');
+    if (failure?.status === 'rejected') throw failure.reason;
 
     await params.restartAfterAuthUpdated(event);
     return { appliedRuntimeIdentityKeys };

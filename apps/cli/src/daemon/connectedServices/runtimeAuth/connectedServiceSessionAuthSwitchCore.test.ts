@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   ConnectedServiceSessionAuthSwitchLockRegistry,
@@ -80,5 +80,72 @@ describe('connectedServiceSessionAuthSwitchCore', () => {
     await expect(first).resolves.toEqual({ status: 'first' });
     await expect(second).resolves.toEqual({ status: 'second' });
     expect(events).toEqual(['first:start', 'first:end', 'second:start']);
+  });
+});
+
+describe('queued auth switch cancellation', () => {
+  it('bounds queued acquisition without releasing a running owner or executing an expired node later', async () => {
+    vi.useFakeTimers();
+    const locks = new ConnectedServiceSessionAuthSwitchLockRegistry();
+    let release!: () => void;
+    const held = locks.runExclusive('s1', () => new Promise<void>((resolve) => { release = resolve; }));
+    await Promise.resolve();
+    const executed: string[] = [];
+    let queuedOutcome: unknown;
+    const queued = locks.runExclusive('s1', async () => { executed.push('expired'); })
+      .catch((error: unknown) => { queuedOutcome = error; });
+    try {
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(queuedOutcome).toMatchObject({ reason: 'timed_out', sessionId: 's1' });
+      let successorStarted = false;
+      const successor = locks.runExclusive('s1', async () => { successorStarted = true; });
+      await Promise.resolve();
+      expect(successorStarted).toBe(false);
+      release();
+      await Promise.all([held, queued, successor]);
+      expect(successorStarted).toBe(true);
+      expect(executed).toEqual([]);
+    } finally {
+      release();
+      await Promise.all([held, queued]);
+      vi.useRealTimers();
+    }
+  });
+
+  it('settles stopped waiters immediately and keeps new work excluded until the running owner finishes', async () => {
+    const core = createConnectedServiceSessionAuthSwitchCore();
+    let release!: () => void;
+    const held = core.run({
+      sessionId: 's1',
+      reason: 'manual',
+      execute: () => new Promise<void>((resolve) => { release = resolve; }),
+    });
+    await Promise.resolve();
+    const executed: string[] = [];
+    let queuedOutcome: unknown;
+    const queued = core.run({
+      sessionId: 's1', reason: 'automatic_runtime_failure',
+      execute: async () => { executed.push('stopped'); },
+    }).catch((error: unknown) => { queuedOutcome = error; });
+    core.clearSession('s1');
+    try {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await expect.poll(() => queuedOutcome).toMatchObject({ reason: 'session_stopped', sessionId: 's1' });
+      const successor = core.run({
+        sessionId: 's1', reason: 'manual',
+        execute: async () => { executed.push('successor'); },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(executed).toEqual([]);
+      release();
+      await Promise.all([held, queued, successor]);
+      expect(executed).toEqual(['successor']);
+    } finally {
+      release();
+      await Promise.all([held, queued]);
+    }
   });
 });
