@@ -55,6 +55,7 @@ function createSessionStub(sessionId: string = 'api-session-1'): Session {
     keepAlive: vi.fn(),
     getMetadataSnapshot: vi.fn(() => null),
     waitForMetadataUpdate: vi.fn(async () => true),
+    waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted,
     waitForPendingEligibilityUpdate: vi.fn(async () => true),
     popPendingMessage: vi.fn(async () => false),
     peekPendingMessageQueueV2Count: vi.fn(async () => 0),
@@ -63,11 +64,11 @@ function createSessionStub(sessionId: string = 'api-session-1'): Session {
     sendSessionDeath: vi.fn(),
     flush: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
-  });
+  }) satisfies SessionClientPort;
 
   const queue = new MessageQueue2<any>(() => 'mode');
   return new Session({
-    client: client as unknown as SessionClientPort,
+    client,
     path: '/tmp',
     logPath: '/tmp/log',
     sessionId: null,

@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { StringDecoder } from 'node:string_decoder';
 import { readFileSync } from 'node:fs';
 import { appendFile, rename, rm, stat } from 'node:fs/promises';
 
@@ -56,6 +58,45 @@ export type CodexAppServerExitHandler = (error: Error) => void | Promise<void>;
 export type DisposableCodexAppServerClient = CodexAppServerClient & Readonly<{
     onExit: (handler: CodexAppServerExitHandler) => () => void;
     dispose: (options?: CodexAppServerClientDisposeOptions) => Promise<void>;
+}>;
+
+export type CodexAppServerPrivateIoEvent =
+    | Readonly<{ kind: 'raw'; stream: 'stdin' | 'stdout' | 'stderr'; bytes: Uint8Array }>
+    | Readonly<{ kind: 'frame'; text: string }>
+    | Readonly<{ kind: 'message'; direction: 'incoming' | 'outgoing'; message: unknown }>
+    | Readonly<{ kind: 'failure'; operation: string; error: unknown }>
+    | Readonly<{ kind: 'close'; code: number | null; signal: NodeJS.Signals | null }>;
+
+/** Captures custody synchronously; flush settles the owner's pending private writes. */
+export type CodexAppServerPrivateIoOwner = Readonly<{
+    capture: (event: CodexAppServerPrivateIoEvent) => void;
+    flush: () => Promise<void>;
+}>;
+
+class CodexAppServerPrivateIoError extends Error {
+    constructor(operation: string, readonly custodyFailed = false) {
+        super(`Private Codex app-server ${operation} failed; diagnostic values are not shown`);
+        this.name = 'CodexAppServerPrivateIoError';
+    }
+}
+
+function privateIoFailure(owner: CodexAppServerPrivateIoOwner, operation: string, error: unknown): Error {
+    if (error instanceof CodexAppServerPrivateIoError) return error;
+    try {
+        owner.capture({ kind: 'failure', operation, error });
+    } catch {
+        return new CodexAppServerPrivateIoError('failure custody', true);
+    }
+    return new CodexAppServerPrivateIoError(operation);
+}
+
+type CodexAppServerClientParameters = Readonly<{
+    processEnv?: NodeJS.ProcessEnv;
+    cwd?: string;
+    configOverrides?: ReadonlyArray<string>;
+    disableUserMcpServers?: boolean;
+    initializeRequestOptions?: CodexAppServerRequestOptions;
+    io?: Readonly<{ kind: 'ordinary' }> | Readonly<{ kind: 'private'; owner: CodexAppServerPrivateIoOwner }>;
 }>;
 
 type MessageQueueState = {
@@ -354,15 +395,60 @@ function readCodexMcpServerKeysFromConfigToml(env: NodeJS.ProcessEnv): string[] 
     return Array.from(keys).sort((a, b) => a.localeCompare(b));
 }
 
-export async function createCodexAppServerClient(params: Readonly<{
-    processEnv?: NodeJS.ProcessEnv;
-    cwd?: string;
-    configOverrides?: ReadonlyArray<string>;
-    disableUserMcpServers?: boolean;
-    initializeRequestOptions?: CodexAppServerRequestOptions;
-}>): Promise<DisposableCodexAppServerClient> {
+export async function createCodexAppServerClient(params: CodexAppServerClientParameters): Promise<DisposableCodexAppServerClient> {
+    // This installs an I/O edge only. It does not qualify readers, launch origin or an audience.
+    const selectedOwner = params.io?.kind === 'private' ? params.io.owner : null;
+    if (params.io?.kind === 'private' && (
+        !selectedOwner || typeof selectedOwner.capture !== 'function' || typeof selectedOwner.flush !== 'function'
+    )) {
+        throw new CodexAppServerPrivateIoError('owner construction');
+    }
+    let flushPromise: Promise<void> | null = null;
+    const privateOwner = selectedOwner ? {
+        capture: selectedOwner.capture.bind(selectedOwner),
+        flush: () => flushPromise ??= Promise.resolve().then(() => selectedOwner.flush()),
+    } : null;
+    try {
+        return await createOwnedCodexAppServerClient(params, privateOwner);
+    } catch (error) {
+        if (!privateOwner) throw error;
+        const failure = privateIoFailure(privateOwner, 'construction', error);
+        try {
+            await privateOwner.flush();
+        } catch (flushError) {
+            throw privateIoFailure(privateOwner, 'construction flush', flushError);
+        }
+        throw failure;
+    }
+}
+
+async function createOwnedCodexAppServerClient(
+    params: CodexAppServerClientParameters,
+    privateOwner: CodexAppServerPrivateIoOwner | null,
+): Promise<DisposableCodexAppServerClient> {
+    let privateCustodyFailure: Error | null = null;
+    const audienceFailure = (operation: string, error: unknown): Error => {
+        const failure = privateOwner
+            ? privateIoFailure(privateOwner, operation, error)
+            : error instanceof Error ? error : new Error(String(error));
+        if (failure instanceof CodexAppServerPrivateIoError && failure.custodyFailed) {
+            privateCustodyFailure ??= failure;
+        }
+        return failure;
+    };
+    const capturePrivate = (event: CodexAppServerPrivateIoEvent): void => {
+        if (!privateOwner) return;
+        try {
+            privateOwner.capture(event);
+        } catch (error) {
+            privateCustodyFailure ??= audienceFailure('capture', error);
+            throw privateCustodyFailure;
+        }
+        // A synchronous owner callback can reenter this client and fail nested custody.
+        if (privateCustodyFailure) throw privateCustodyFailure;
+    };
     const sourceProcessEnv = params.processEnv ?? process.env;
-    const rpcLogger = createRpcLogger(sourceProcessEnv);
+    const rpcLogger = privateOwner ? null : createRpcLogger(sourceProcessEnv);
     const processEnv = sanitizeCodexAppServerEnv(sourceProcessEnv);
     const baseInvocation = await resolveCodexCliInvocation({
         args: ['app-server', '--listen', 'stdio://'],
@@ -408,10 +494,43 @@ export async function createCodexAppServerClient(params: Readonly<{
     let nextId = 0;
     let disposing = false;
     let disposePromise: Promise<void> | null = null;
+    const privateCallbackContext = privateOwner ? new AsyncLocalStorage<{ active: boolean }>() : null;
+    const privateCallbackTasks = new Set<Promise<void>>();
     let resolveClosed: (() => void) | null = null;
     const closedPromise = new Promise<void>((resolve) => {
         resolveClosed = resolve;
     });
+
+    const invokePrivateCallback = <T>(callback: () => T | Promise<T>): T | Promise<T> => {
+        if (!privateCallbackContext) return callback();
+        const context = { active: true };
+        try {
+            const result = privateCallbackContext.run(context, callback);
+            if (result && typeof (result as PromiseLike<T>).then === 'function') {
+                return Promise.resolve(result).finally(() => { context.active = false; });
+            }
+            context.active = false;
+            return result;
+        } catch (error) {
+            context.active = false;
+            throw error;
+        }
+    };
+
+    const runPrivateCallbackTask = (operation: () => Promise<void>, onFailure: (error: unknown) => void): void => {
+        if (disposing) return;
+        const task = (async () => {
+            try { await operation(); }
+            catch (error) { onFailure(error); }
+        })();
+        privateCallbackTasks.add(task);
+        void task.then(() => { privateCallbackTasks.delete(task); });
+    };
+
+    const assertPrivateWorkAdmission = (): void => {
+        // Reuse the recorded disposal failure; registering after the final flush adds no new event.
+        if (privateOwner && disposing) throw state.fatalError ?? new CodexAppServerPrivateIoError('work admission');
+    };
 
     const failPendingRequests = (error: Error): void => {
         for (const [requestKey, pending] of pendingRequests.entries()) {
@@ -421,10 +540,12 @@ export async function createCodexAppServerClient(params: Readonly<{
     };
 
     const sendMessage = async (message: Record<string, unknown>): Promise<void> => {
+        if (privateCustodyFailure) throw privateCustodyFailure;
         if (state.fatalError) {
             throw state.fatalError;
         }
-        rpcLogger.append({
+        capturePrivate({ kind: 'message', direction: 'outgoing', message });
+        rpcLogger?.append({
             direction: 'outgoing',
             id: (message as JsonRpcMessage).id ?? null,
             method: (message as JsonRpcMessage).method,
@@ -438,15 +559,20 @@ export async function createCodexAppServerClient(params: Readonly<{
         } catch (error) {
             const reason = error instanceof Error ? error.message : String(error);
             const method = typeof message.method === 'string' ? message.method : 'notification';
-            throw new Error(`Failed to serialize Codex app-server ${method} message: ${reason}`);
+            throw privateOwner ? audienceFailure('serialization', error) : new Error(`Failed to serialize Codex app-server ${method} message: ${reason}`);
         }
         const nextWrite = writeChain.then(async () => {
+            // A queued write must not outlive a failure while capturing another message.
+            if (privateCustodyFailure) throw privateCustodyFailure;
+            if (privateOwner && disposing) throw state.fatalError ?? new CodexAppServerPrivateIoError('write after disposal');
             const stdin = child.stdin;
             if (!stdin || stdin.writableEnded || stdin.destroyed) {
                 throw state.fatalError ?? createDisposedError();
             }
             await new Promise<void>((resolve, reject) => {
                 try {
+                    capturePrivate({ kind: 'raw', stream: 'stdin', bytes: Buffer.from(payload, 'utf8') });
+                    if (privateOwner && disposing) throw state.fatalError ?? new CodexAppServerPrivateIoError('write after disposal');
                     stdin.write(payload, 'utf8', (error) => {
                         if (error) {
                             reject(error);
@@ -460,7 +586,11 @@ export async function createCodexAppServerClient(params: Readonly<{
             });
         });
         writeChain = nextWrite.catch(() => undefined);
-        await nextWrite;
+        try {
+            await nextWrite;
+        } catch (error) {
+            throw audienceFailure('write', error);
+        }
     };
 
     const handleServerRequest = async (message: JsonRpcMessage): Promise<void> => {
@@ -476,9 +606,12 @@ export async function createCodexAppServerClient(params: Readonly<{
             return;
         }
         try {
-            const result = await handler(message.params, message);
+            const result = await (privateOwner
+                ? invokePrivateCallback(() => handler(message.params, message))
+                : handler(message.params, message));
             await sendMessage({ id: message.id, result: result ?? null });
         } catch (error) {
+            if (privateOwner) audienceFailure('request handler', error);
             const failure = error instanceof Error ? error : new Error(String(error));
             await sendMessage({
                 id: message.id,
@@ -491,7 +624,14 @@ export async function createCodexAppServerClient(params: Readonly<{
         if (reportedExitFailure || disposing) return;
         reportedExitFailure = failure;
         for (const handler of [...exitHandlers]) {
-            void Promise.resolve(handler(failure)).catch(() => undefined);
+            if (privateOwner) {
+                runPrivateCallbackTask(
+                    async () => { await invokePrivateCallback(() => handler(failure)); },
+                    (error) => { audienceFailure('exit handler', error); },
+                );
+            } else {
+                void Promise.resolve(handler(failure)).catch(() => undefined);
+            }
         }
     };
 
@@ -500,22 +640,27 @@ export async function createCodexAppServerClient(params: Readonly<{
         if (terminateChildPromise) return terminateChildPromise;
         // Snapshot and terminate descendants before closing stdio. Ending stdin first can let a
         // JavaScript launcher exit and re-parent its native Codex child before the tree walk.
-        terminateChildPromise = killProcessTree(child, { graceMs: 250 }).catch(() => undefined);
+        terminateChildPromise = killProcessTree(child, { graceMs: 250 }).catch((error) => {
+            if (privateOwner) throw audienceFailure('process disposal', error);
+        });
         return terminateChildPromise;
     };
 
-    const failWith = (error: unknown, options?: Readonly<{ terminateChild?: boolean }>): void => {
-        const failure = error instanceof Error ? error : new Error(String(error));
+    const failWith = (error: unknown, options?: Readonly<{ terminateChild?: boolean; operation?: string }>): void => {
+        const failure = audienceFailure(options?.operation ?? 'process', error);
         failWaiters(state, failure);
         const fatalFailure = state.fatalError ?? failure;
         failPendingRequests(fatalFailure);
         reportExit(fatalFailure);
         if (options?.terminateChild === false || disposing) return;
-        void terminateChild();
+        void terminateChild().catch((error) => {
+            failWith(error, { terminateChild: false, operation: 'process disposal' });
+        });
     };
 
     const handleIncomingMessage = (message: JsonRpcMessage): void => {
-        rpcLogger.append({
+        capturePrivate({ kind: 'message', direction: 'incoming', message });
+        rpcLogger?.append({
             direction: 'incoming',
             id: message.id ?? null,
             method: message.method,
@@ -526,14 +671,20 @@ export async function createCodexAppServerClient(params: Readonly<{
         const requestKey = toMessageKey(message.id);
         if (typeof message.method === 'string') {
             if (requestKey) {
-                void handleServerRequest(message).catch((error) => {
-                    failWith(error);
-                });
+                if (privateOwner) runPrivateCallbackTask(() => handleServerRequest(message), (error) => { failWith(error); });
+                else void handleServerRequest(message).catch((error) => { failWith(error); });
                 return;
             }
             const handlers = notificationHandlers.get(message.method);
             if (handlers && handlers.size > 0) {
                 for (const handler of [...handlers]) {
+                    if (privateOwner) {
+                        runPrivateCallbackTask(
+                            async () => { await invokePrivateCallback(() => handler(message.params)); },
+                            (error) => { failWith(error); },
+                        );
+                        continue;
+                    }
                     try {
                         const result = handler(message.params);
                         if (result && typeof (result as PromiseLike<void>).then === 'function') {
@@ -582,7 +733,7 @@ export async function createCodexAppServerClient(params: Readonly<{
     };
 
     const handleOversizedJsonLine = (sample: string, maxBufferedChars: number): void => {
-        const error = new CodexAppServerJsonLineTooLargeError(maxBufferedChars);
+        const error = audienceFailure('oversized frame', new CodexAppServerJsonLineTooLargeError(maxBufferedChars));
         if (rejectCorrelatedJsonLine(sample, error)) return;
         failWith(error);
     };
@@ -591,9 +742,11 @@ export async function createCodexAppServerClient(params: Readonly<{
         (rawLine) => {
             if (state.fatalError) return;
             try {
+                capturePrivate({ kind: 'frame', text: rawLine });
                 handleIncomingMessage(JSON.parse(rawLine) as JsonRpcMessage);
             } catch (error) {
-                const failure = new Error(`Invalid Codex app-server JSON output: ${error instanceof Error ? error.message : String(error)}`);
+                const failure = privateOwner ? audienceFailure('frame parsing', error)
+                    : new Error(`Invalid Codex app-server JSON output: ${error instanceof Error ? error.message : String(error)}`);
                 if (rejectCorrelatedJsonLine(rawLine, failure)) return;
                 failWith(failure);
             }
@@ -605,35 +758,55 @@ export async function createCodexAppServerClient(params: Readonly<{
     );
 
     child.stdin.on('error', (error) => {
-        failWith(error);
+        failWith(error, { operation: 'stdin' });
     });
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => {
-        if (state.fatalError) return;
+    // Private capture sees original bytes before UTF-8 decoding or JSON framing.
+    const stdoutDecoder = privateOwner ? new StringDecoder('utf8') : null;
+    if (!privateOwner) child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk: Buffer | string) => {
         try {
-            jsonLineReader.push(chunk);
+            if (privateOwner) capturePrivate({ kind: 'raw', stream: 'stdout', bytes: Buffer.from(chunk) });
+            if (state.fatalError) return;
+            jsonLineReader.push(stdoutDecoder ? stdoutDecoder.write(Buffer.from(chunk)) : chunk as string);
         } catch (error) {
-            failWith(new Error(`Invalid Codex app-server JSON output: ${error instanceof Error ? error.message : String(error)}`));
+            failWith(privateOwner ? error : new Error(`Invalid Codex app-server JSON output: ${error instanceof Error ? error.message : String(error)}`), { operation: 'stdout' });
         }
     });
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk: string) => {
+    if (!privateOwner) child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: Buffer | string) => {
+        if (privateOwner) {
+            try {
+                capturePrivate({ kind: 'raw', stream: 'stderr', bytes: Buffer.from(chunk) });
+            } catch (error) {
+                failWith(error, { operation: 'stderr' });
+            }
+            return;
+        }
         if (stderrBuffer.length >= maxStderrChars) return;
         stderrBuffer = (stderrBuffer + chunk).slice(0, maxStderrChars);
     });
+    if (privateOwner) {
+        child.stdout.on('error', (error) => failWith(error, { operation: 'stdout' }));
+        child.stderr.on('error', (error) => failWith(error, { operation: 'stderr' }));
+    }
     child.once('error', (error) => {
-        failWith(new Error(`Failed to launch Codex app-server: ${error.message}`));
+        failWith(privateOwner ? error : new Error(`Failed to launch Codex app-server: ${error.message}`), { operation: 'launch' });
     });
     child.once('close', (code, signal) => {
         resolveClosed?.();
+        try {
+            capturePrivate({ kind: 'close', code, signal });
+        } catch (error) {
+            failWith(error, { terminateChild: false, operation: 'close custody' });
+        }
         if (disposing) {
             return;
         }
-        const suffix = stderrBuffer.trim()
+        const suffix = !privateOwner && stderrBuffer.trim()
             ? `\n${sanitizeCodexAppServerRpcDiagnosticString(stderrBuffer.trim())}`
             : '';
         const failure = new Error(`Codex app-server exited before completing the request (code=${code ?? 'null'} signal=${signal ?? 'null'})${suffix}`);
-        failWith(failure, { terminateChild: false });
+        failWith(failure, { terminateChild: false, operation: 'exit' });
     });
 
     const request = async (
@@ -719,6 +892,7 @@ export async function createCodexAppServerClient(params: Readonly<{
     };
 
     const registerRequestHandler = (method: string, handler: JsonRpcRequestHandler): (() => void) => {
+        assertPrivateWorkAdmission();
         requestHandlers.set(method, handler);
         return () => {
             if (requestHandlers.get(method) === handler) {
@@ -728,6 +902,7 @@ export async function createCodexAppServerClient(params: Readonly<{
     };
 
     const registerNotificationHandler = (method: string, handler: JsonRpcNotificationHandler): (() => void) => {
+        assertPrivateWorkAdmission();
         const existing = notificationHandlers.get(method);
         if (existing) {
             existing.add(handler);
@@ -745,24 +920,70 @@ export async function createCodexAppServerClient(params: Readonly<{
     };
 
     const dispose = async (options?: CodexAppServerClientDisposeOptions): Promise<void> => {
+        // This check precedes memoized disposal: waiting from an owned callback would wait on itself.
+        if (privateCallbackContext?.getStore()?.active) {
+            throw audienceFailure('reentrant disposal', new Error('Cannot dispose the private Codex app-server from its active callback'));
+        }
         if (disposePromise) {
             return await disposePromise;
         }
         disposing = true;
-        const disposedError = options?.pendingRequestError ?? createDisposedError();
-        failWaiters(state, disposedError);
-        failPendingRequests(disposedError);
-        disposePromise = (async () => {
-            await terminateChild();
-            await closedPromise;
-            await rpcLogger.flush().catch(() => undefined);
-        })();
+        const beginDisposal = (): Promise<void> => {
+            const disposedError = privateOwner
+                ? audienceFailure('disposal', options?.pendingRequestError ?? createDisposedError())
+                : options?.pendingRequestError ?? createDisposedError();
+            failWaiters(state, disposedError);
+            failPendingRequests(disposedError);
+            return (async () => {
+                try {
+                    await terminateChild();
+                    await closedPromise;
+                    if (privateOwner) {
+                        await Promise.all(privateCallbackTasks);
+                        await writeChain;
+                    }
+                    if (privateCustodyFailure) throw privateCustodyFailure;
+                } finally {
+                    if (privateOwner) {
+                        try {
+                            await privateOwner.flush();
+                        } catch (error) {
+                            throw audienceFailure('disposal flush', error);
+                        }
+                    } else {
+                        await rpcLogger?.flush().catch(() => undefined);
+                    }
+                }
+            })();
+        };
+        if (privateOwner) {
+            // Install completion before owner.capture can synchronously reenter disposal.
+            let startDisposal!: () => void;
+            disposePromise = new Promise<void>((resolve, reject) => {
+                startDisposal = () => {
+                    try { resolve(beginDisposal()); }
+                    catch (error) { reject(error); }
+                };
+            });
+            startDisposal();
+        } else {
+            disposePromise = beginDisposal();
+        }
         return await disposePromise;
     };
 
     const onExit = (handler: CodexAppServerExitHandler): (() => void) => {
+        assertPrivateWorkAdmission();
         if (reportedExitFailure) {
-            void Promise.resolve(handler(reportedExitFailure)).catch(() => undefined);
+            if (privateOwner) {
+                const failure = reportedExitFailure;
+                runPrivateCallbackTask(
+                    async () => { await invokePrivateCallback(() => handler(failure)); },
+                    (error) => { audienceFailure('exit handler', error); },
+                );
+            } else {
+                void Promise.resolve(handler(reportedExitFailure)).catch(() => undefined);
+            }
             return () => undefined;
         }
         exitHandlers.add(handler);
@@ -784,9 +1005,22 @@ export async function createCodexAppServerClient(params: Readonly<{
         }, params.initializeRequestOptions);
         await notify('initialized');
 
-        return { request, notify, registerRequestHandler, registerNotificationHandler, onExit, dispose };
+        return {
+            request: privateOwner ? async (...args: Parameters<typeof request>) => {
+                assertPrivateWorkAdmission();
+                try { return await request(...args); }
+                catch (error) { throw audienceFailure('request', error); }
+            } : request,
+            notify: privateOwner ? async (...args: Parameters<typeof notify>) => {
+                try { await notify(...args); }
+                catch (error) { throw audienceFailure('notification', error); }
+            } : notify,
+            registerRequestHandler, registerNotificationHandler, onExit, dispose,
+        };
     } catch (error) {
+        // Record the constructor failure before disposal performs the owner's final flush.
+        const failure = privateOwner ? audienceFailure('construction', error) : error;
         await dispose().catch(() => undefined);
-        throw error;
+        throw failure;
     }
 }

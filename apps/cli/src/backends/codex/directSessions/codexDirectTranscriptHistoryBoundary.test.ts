@@ -1,3 +1,4 @@
+import { pageCodexRolloutStreams, readAfterCodexRolloutStreams } from './codexDirectTranscriptStreamPaging';
 import { appendFile, mkdir, mkdtemp, rename, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -277,5 +278,23 @@ describe('Codex direct transcript durable history boundary', () => {
     expect(live.truncated).toBe(false);
     const idle = await readAfter({ ...fixture, sessionId, cursor: live.nextCursor! });
     expect(idle.items).toEqual([]);
+  });
+});
+
+
+describe('dedicated private native domain injected stream boundary', () => {
+  it('refuses injected private rollout files before child discovery or cursor fingerprinting', async () => {
+    const fixture = await createFixture('private-injected');
+    const privateDomain = join(fixture.root, 'private-domain');
+    await mkdir(privateDomain);
+    await writeFile(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+    const filePath = join(privateDomain, 'rollout.jsonl');
+    await writeFile(filePath, sessionMetaLine('private-injected') + assistantLine('private bytes'));
+    const params = {
+      codexHome: fixture.codexHome, remoteSessionId: 'private-injected', maxBytes: 1024, maxItems: 10,
+      initialRolloutFiles: [{ filePath, fileRelPath: 'injected.jsonl', sortMs: 1, mtimeMs: 1 }],
+    };
+    await expect(pageCodexRolloutStreams({ ...params, direction: 'older' })).rejects.toThrow('private native domain');
+    await expect(readAfterCodexRolloutStreams({ ...params, cursor: 'tail' })).rejects.toThrow('private native domain');
   });
 });

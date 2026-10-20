@@ -1,3 +1,4 @@
+import { assertOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
@@ -54,6 +55,8 @@ export async function importCodexSessionBundle(params: Readonly<{
 }>): Promise<ImportedSessionHandoffBundle> {
   const codexHome = resolveConfiguredCodexHome(params.env);
   const sqliteHome = resolveConfiguredCodexSqliteHome(params.env);
+  assertOrdinaryReaderPath(codexHome);
+  assertOrdinaryReaderPath(sqliteHome);
   const runtimeIdentity = resolvePersistedCodexRuntimeIdentity(params.bundle) ?? { backendMode: 'appServer' as const };
   const importedRuntimeDescriptor = readCanonicalAgentRuntimeDescriptorV1ForProvider(params.bundle.affinity?.runtimeDescriptor, 'codex');
   const sourceAffinity = resolveCodexRuntimeSourceAffinity(params.bundle.affinity?.source);
@@ -93,6 +96,8 @@ export async function importCodexSessionBundle(params: Readonly<{
     };
   for (const file of params.bundle.files) {
     const destPath = resolveContainedCodexPath(codexHome, file.relativePath);
+    assertOrdinaryReaderPath(destPath);
+    if (file.contentFile) assertOrdinaryReaderPath(file.contentFile.filePath);
     await mkdir(dirname(destPath), { recursive: true });
     if (file.contentFile) {
       await copySessionHandoffFileSlice({ source: file.contentFile, targetFilePath: destPath });

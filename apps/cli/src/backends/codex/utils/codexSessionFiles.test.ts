@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   findCodexRolloutFileById,
+  findCodexRolloutFileByIdSync,
   isMatchingCodexRolloutFileName,
   resolveCodexNativeSessionsRoot,
 } from './codexSessionFiles';
@@ -109,5 +110,20 @@ describe('findCodexRolloutFileById', () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe('dedicated private native domain recovery boundary', () => {
+  it('refuses async and sync recovery locators after the domain owner is absent', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-private-native-recovery-'));
+    await writeFile(join(root, '.muninn-private-native-domain'), 'restriction');
+    const sessionsRoot = join(root, 'sessions');
+    await mkdir(sessionsRoot);
+    await writeFile(join(sessionsRoot, 'rollout-2026-01-02T00-00-00-private_thread.jsonl'), 'private bytes');
+    const params = { sessionsRoot, vendorResumeId: 'private_thread' };
+    // No invocation state or in-memory owner exists; the durable restriction remains.
+    await expect(findCodexRolloutFileById(params)).rejects.toThrow('private native domain');
+    expect(() => findCodexRolloutFileByIdSync(params)).toThrow('private native domain');
   });
 });

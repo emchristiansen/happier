@@ -1,4 +1,5 @@
 import type { RequestArchivedSessionCleanup } from '@/api/session/sessionArchiveInputAdmission';
+import { assertOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
 import { applyPermissionModeToCodexPermissionHandler } from './utils/applyPermissionModeToHandler';
 import { createCodexPermissionHandler, type CodexRuntimePermissionHandler } from './utils/createCodexPermissionHandler';
 import { DiffProcessor } from './utils/diffProcessor';
@@ -399,6 +400,8 @@ export async function runCodex(opts: {
     codexBackendMode?: CodexBackendMode;
     accountSettingsContext?: import('@/settings/accountSettings/bootstrapAccountSettingsContext').AccountSettingsContext | null;
 }): Promise<void> {
+    // Private callers use the separate early bootstrap, before ordinary SessionClient creation.
+    assertOrdinaryReaderPath(resolveConfiguredCodexHome(process.env));
 	    // Use shared PermissionMode type for cross-agent compatibility
 	    type PermissionMode = import('@/api/types').PermissionMode;
 	    const requestedDirectory = resolveCodexRequestedDirectory({ directory: opts.directory ?? null });

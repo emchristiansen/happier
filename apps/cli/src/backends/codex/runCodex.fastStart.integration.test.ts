@@ -1,3 +1,4 @@
+import { mkdtemp, writeFile } from 'node:fs/promises';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -119,6 +120,21 @@ vi.mock('@/rpc/handlers/killSession', () => ({
 }));
 
 describe('runCodex fast-start', () => {
+  it('refuses a private domain before ordinary session initialization', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'happier-private-early-run-'));
+    await writeFile(join(home, '.muninn-private-native-domain'), 'restriction');
+    const previous = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = home;
+    try {
+      const { runCodex } = await import('./runCodex');
+      await expect(runCodex({ credentials: { token: 'test' } as Credentials })).rejects.toThrow('private native domain');
+      expect(initializeBackendRunSessionSpy).not.toHaveBeenCalled();
+      expect(codexLocalLauncherSpy).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previous;
+    }
+  });
   const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
     void code;
     return undefined as never;

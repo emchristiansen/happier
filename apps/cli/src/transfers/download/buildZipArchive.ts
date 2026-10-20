@@ -1,3 +1,4 @@
+import { assertOrdinaryReaderPath, validateOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
 import archiver from 'archiver';
 import { createWriteStream } from 'node:fs';
 import { mkdir, readdir, stat, lstat } from 'fs/promises';
@@ -15,6 +16,8 @@ export async function buildZipArchive(input: Readonly<{
   maxTotalBytes: number;
   maxOutputBytes: number;
 }>): Promise<void> {
+  assertOrdinaryReaderPath(input.sourcePath);
+  assertOrdinaryReaderPath(input.zipPath);
   await mkdir(dirname(input.zipPath), { recursive: true });
 
   const archive = archiver('zip', { zlib: { level: 9 } });
@@ -39,6 +42,7 @@ export async function buildZipArchive(input: Readonly<{
   const rootName = basename(input.sourcePath);
 
   const addFile = async (filePath: string, entryPath: string): Promise<void> => {
+    assertOrdinaryReaderPath(filePath);
     const fileStats = await stat(filePath);
     totalBytes += fileStats.size;
     if (totalBytes > input.maxTotalBytes) {
@@ -52,6 +56,7 @@ export async function buildZipArchive(input: Readonly<{
   };
 
   const walkDir = async (dirPath: string, relPrefix: string): Promise<void> => {
+    assertOrdinaryReaderPath(dirPath);
     const entries = await readdir(dirPath, { withFileTypes: true });
     for (const entry of entries) {
       const name = entry.name;
@@ -62,6 +67,8 @@ export async function buildZipArchive(input: Readonly<{
       }
 
       const fullPath = join(dirPath, name);
+      // Restrict only this private child; ordinary siblings remain exportable.
+      if (!validateOrdinaryReaderPath(fullPath).valid) continue;
       const relPath = relPrefix ? join(relPrefix, name) : name;
       const entryPath = toZipEntryPath([rootName, relPath]);
 

@@ -1,3 +1,4 @@
+import { validateOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
 import { realpathSync } from 'node:fs'
 import { posix, win32 } from 'node:path'
 
@@ -49,6 +50,10 @@ export function validateMachineBrowsePath(input: ValidateMachineBrowsePathInput)
     return { valid: false, error: 'Path must be absolute' }
   }
 
+  if (platform === process.platform) {
+    const restriction = validateOrdinaryReaderPath(rawPath)
+    if (!restriction.valid) return { valid: false, error: restriction.error ?? 'Access denied: private native domain' }
+  }
   const resolvedPath = resolvePathForComparison(rawPath, platform)
   const allowed = input.roots.some((root) => isWithinRoot(root.path, resolvedPath, platform))
   if (!allowed) {

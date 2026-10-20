@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
+import type { RpcHandler } from '@/api/rpc/types';
 import type { SessionClientPort } from '@/api/session/sessionClientPort';
+import type { ACPMessageData } from '@/api/session/sessionMessageTypes';
 import type { AgentState, Metadata } from '@/api/types';
 
 import type { EnhancedMode } from './loop';
@@ -34,8 +36,6 @@ vi.mock('@/runtime/js/ensureJavaScriptRuntimeExecutable', () => ({
 vi.mock('./utils/resolveClaudeCliPath', () => ({
   resolveClaudeCliPath: vi.fn(() => '/resolved/claude-cli.js'),
 }));
-
-type RpcHandler = (params?: unknown) => unknown | Promise<unknown>;
 
 const createdSessions: Session[] = [];
 
@@ -84,7 +84,7 @@ function createHarness(): Readonly<{
       markRolledBack: vi.fn(async () => {}),
       touchActiveTurn: vi.fn(async () => {}),
       hasActiveTurn: vi.fn(() => false),
-      observeAcpLifecycleMarker: vi.fn((input: { body: unknown }) => ({ body: input.body, pendingWrite: null })),
+      observeAcpLifecycleMarker: vi.fn((input: { body: ACPMessageData }) => ({ body: input.body, pendingWrite: null })),
     },
     updateMetadata: vi.fn((updater: (current: Metadata) => Metadata) => {
       metadata = updater(metadata);
@@ -107,6 +107,7 @@ function createHarness(): Readonly<{
     sendSessionEvent: vi.fn(),
     getMetadataSnapshot: vi.fn(() => hasMetadata ? metadata : null),
     waitForMetadataUpdate: vi.fn(async () => false),
+    waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted,
     waitForPendingEligibilityUpdate: vi.fn(async () => false),
     popPendingMessage: vi.fn(async () => false),
     peekPendingMessageQueueV2Count: vi.fn(async () => 0),
@@ -117,7 +118,7 @@ function createHarness(): Readonly<{
     close: vi.fn(async () => {}),
     on: vi.fn(),
     off: vi.fn(),
-  } as unknown as SessionClientPort;
+  } satisfies SessionClientPort;
 
   const session = new Session({
     client,

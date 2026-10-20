@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { mkdtemp, writeFile, utimes, mkdir, rm, truncate } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { discoverCodexRolloutFileOnce, scoreCodexRolloutCandidate } from '../rolloutDiscovery';
+import { discoverCodexRolloutFileOnce, scoreCodexRolloutCandidate, readCodexSessionMetaFromRollout } from '../rolloutDiscovery';
 
 const rolloutDiscoveryStatPaths = vi.hoisted(() => [] as string[]);
 
@@ -405,5 +405,18 @@ describe('codex local-control rollout discovery', () => {
         } finally {
             await rm(root, { recursive: true, force: true });
         }
+    });
+});
+
+
+describe('dedicated private native domain local recovery boundary', () => {
+    it('refuses direct metadata and discovery before private native reads', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happier-private-discovery-'));
+        await writeFile(join(root, '.muninn-private-native-domain'), 'restriction');
+        const raw = join(root, 'rollout-2026-01-02T00-00-00-private_thread.jsonl');
+        await writeFile(raw, sessionMetaLine({ id: 'private_thread', cwd: '/private/repo' }));
+        await expect(readCodexSessionMetaFromRollout(raw)).rejects.toThrow('private native domain');
+        await expect(discoverCodexRolloutFileOnce({ sessionsRootDir: root, startedAtMs: 1, cwd: '/repo', scanLimit: 100 }))
+            .rejects.toThrow('private native domain');
     });
 });
