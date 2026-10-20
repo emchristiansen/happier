@@ -11,6 +11,8 @@ import {
 import { encodeBase64, encrypt } from '../encryption';
 import { accountSettingsParse } from '@happier-dev/protocol';
 import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
+import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
+import { configuration } from '@/configuration';
 import {
   getActiveAccountSettingsSnapshot,
   setActiveAccountSettingsSnapshot,
@@ -1927,10 +1929,21 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       protocolVersion: 1,
       method: SESSION_RPC_METHODS.SESSION_PENDING_QUEUE_WAKE_V1,
     };
+    // The terminal report names this exact process, computed the way the daemon reads a pid's instance.
     const publisherLostCapability = {
       ok: false,
       error: 'pending_materialization_wake_unavailable',
       errorCode: 'publisher_lost',
+      respondent: {
+        machineId: 'machine-1',
+        pid: process.pid,
+        processInstanceFingerprint: readProcessInstanceFingerprintSync(process.pid),
+      },
+    };
+    const publisherRecoveringCapability = {
+      ok: false,
+      error: 'pending_materialization_wake_unavailable',
+      errorCode: 'publisher_recovering',
     };
     const reconnect = async () => {
       if (!supervisorOnConnected) throw new Error('missing supervised reconnect callback');
@@ -1956,7 +1969,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
         .resolves.toEqual({ type: 'publisher_lost' });
       expect(supervisorReportProbeResultMock).toHaveBeenCalledTimes(1);
-      await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
+      await expect(readWakeCapability(client)).resolves.toEqual(publisherRecoveringCapability);
 
       await reconnect();
       await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
@@ -1974,6 +1987,96 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       // An independent connection that claims publisher status clears the terminal state.
       await reconnect();
       await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
+    });
+
+    it('completes an unreclaimed recovery as publisher_lost at its deadline, without another reconnect', async () => {
+      const client = await createClient({
+        latestTurnStatus: 'completed',
+        pendingCount: 1,
+        pendingBlockedCount: 0,
+        pendingVersion: 1,
+      });
+      await waitForCurrentPendingInputContract(client);
+      vi.useFakeTimers();
+      materializeNextMock.mockRejectedValue(publisherLost());
+
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toEqual({ type: 'publisher_lost' });
+      expect(supervisorReportProbeResultMock).toHaveBeenCalledTimes(1);
+      // The replacement connection never completes publisher readiness.
+      await vi.advanceTimersByTimeAsync(configuration.pendingPublisherRecoveryDeadlineMs - 1);
+      await expect(readWakeCapability(client)).resolves.toEqual(publisherRecoveringCapability);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(readWakeCapability(client)).resolves.toEqual(publisherLostCapability);
+
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toEqual({ type: 'publisher_lost' });
+      expect(materializeNextMock).toHaveBeenCalledTimes(1);
+      expect(supervisorReportProbeResultMock).toHaveBeenCalledTimes(1);
+
+      // A later independently converged connection still clears the terminal state.
+      await reconnect();
+      await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
+    });
+
+    it('cancels the deadline when the reconnect reclaims publisher status in time', async () => {
+      const client = await createClient({
+        latestTurnStatus: 'completed',
+        pendingCount: 1,
+        pendingBlockedCount: 0,
+        pendingVersion: 1,
+      });
+      await waitForCurrentPendingInputContract(client);
+      vi.useFakeTimers();
+      materializeNextMock.mockRejectedValueOnce(publisherLost());
+
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toEqual({ type: 'publisher_lost' });
+      await vi.advanceTimersByTimeAsync(configuration.pendingPublisherRecoveryDeadlineMs - 1);
+      await reconnect();
+      await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
+
+      await vi.advanceTimersByTimeAsync(configuration.pendingPublisherRecoveryDeadlineMs);
+      await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
+    });
+
+    it('does not let an earlier episode deadline end a newer episode', async () => {
+      const client = await createClient({
+        latestTurnStatus: 'completed',
+        pendingCount: 1,
+        pendingBlockedCount: 0,
+        pendingVersion: 1,
+      });
+      await waitForCurrentPendingInputContract(client);
+      vi.useFakeTimers();
+      const deadlineMs = configuration.pendingPublisherRecoveryDeadlineMs;
+      const halfDeadlineMs = Math.floor(deadlineMs / 2);
+      materializeNextMock
+        .mockRejectedValueOnce(publisherLost())
+        .mockResolvedValueOnce({
+          didMaterialize: false,
+          localId: null,
+          didWrite: false,
+          pendingQueueState: { known: true, pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 2 },
+        })
+        .mockRejectedValueOnce(publisherLost());
+
+      // Episode 1 reclaims, and an accepted claim ends it.
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toEqual({ type: 'publisher_lost' });
+      await reconnect();
+      await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+      await vi.advanceTimersByTimeAsync(halfDeadlineMs);
+
+      // Episode 2 starts later; episode 1's deadline instant passes without ending it.
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toEqual({ type: 'publisher_lost' });
+      expect(supervisorReportProbeResultMock).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(deadlineMs - halfDeadlineMs);
+      await expect(readWakeCapability(client)).resolves.toEqual(publisherRecoveringCapability);
+
+      await vi.advanceTimersByTimeAsync(halfDeadlineMs);
+      await expect(readWakeCapability(client)).resolves.toEqual(publisherLostCapability);
     });
 
     it('recovers normally when the one reconnect reclaims publisher status', async () => {

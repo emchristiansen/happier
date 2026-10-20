@@ -93,6 +93,7 @@ async function forceKillTrackedRunner(params: Readonly<{
   pidToTrackedSession: ReadonlyMap<number, TrackedSession>;
   normalizedSessionId: string;
   logPidReuseRefusal: (message: string) => void;
+  exactRunner?: ExactStopRunner;
 }>): Promise<boolean> {
   const currentSession = params.pidToTrackedSession.get(params.pid);
   if (currentSession !== params.expectedSession) {
@@ -102,11 +103,13 @@ async function forceKillTrackedRunner(params: Readonly<{
     return false;
   }
 
-  const safe = await isPidSafeHappySessionProcess({
-    pid: params.pid,
-    expectedProcessCommandHash: params.expectedSession.processCommandHash,
-    expectedProcessInstanceFingerprint: params.expectedSession.processInstanceFingerprint,
-  });
+  const safe = await isPidSafeHappySessionProcess(params.exactRunner
+    ? { pid: params.pid, expectedProcessInstanceFingerprint: params.exactRunner.processInstanceFingerprint }
+    : {
+        pid: params.pid,
+        expectedProcessCommandHash: params.expectedSession.processCommandHash,
+        expectedProcessInstanceFingerprint: params.expectedSession.processInstanceFingerprint,
+      });
   if (!safe || params.pidToTrackedSession.get(params.pid) !== params.expectedSession) {
     params.logPidReuseRefusal(
       `[DAEMON RUN] Refusing to SIGKILL PID ${params.pid} for session ${params.normalizedSessionId} (PID reuse safety)`,
@@ -160,6 +163,51 @@ async function forceKillTrackedRunner(params: Readonly<{
   }
 }
 
+/**
+ * The one runner incarnation a replacement Stop may signal. Stop refuses, signalling nothing, unless
+ * this pid is the session's only tracked runner, and re-verifies the process instance before every signal.
+ */
+export type ExactStopRunner = Readonly<{ pid: number; processInstanceFingerprint: string }>;
+export type StopSessionOptions = Readonly<{ exactRunner?: ExactStopRunner }>;
+
+function selectTrackedRunnersForStop(
+  pidToTrackedSession: ReadonlyMap<number, TrackedSession>,
+  normalizedSessionId: string,
+): Readonly<{ pidsToStop: number[]; expectedTrackedSessionsByPid: Map<number, TrackedSession> }> {
+  const isPidFallback = normalizedSessionId.startsWith('PID-');
+  const fallbackPid = isPidFallback ? Number.parseInt(normalizedSessionId.replace('PID-', ''), 10) : NaN;
+  const pidsToStop: number[] = [];
+  const expectedTrackedSessionsByPid = new Map<number, TrackedSession>();
+  for (const [pid, session] of pidToTrackedSession.entries()) {
+    const happySessionId = typeof session.happySessionId === 'string' ? session.happySessionId : '';
+    const existingSessionId =
+      session.spawnOptions && typeof (session.spawnOptions as any).existingSessionId === 'string'
+        ? String((session.spawnOptions as any).existingSessionId).trim()
+        : '';
+    const matches =
+      happySessionId === normalizedSessionId ||
+      existingSessionId === normalizedSessionId ||
+      (isPidFallback && Number.isFinite(fallbackPid) && pid === fallbackPid);
+    if (matches) {
+      pidsToStop.push(pid);
+      expectedTrackedSessionsByPid.set(pid, session);
+    }
+  }
+  return { pidsToStop, expectedTrackedSessionsByPid };
+}
+
+/** Whether a Stop of this session would signal exactly the named runner and no other process. */
+export function isExactStopRunnerSoleTrackedRunner(params: Readonly<{
+  pidToTrackedSession: ReadonlyMap<number, TrackedSession>;
+  sessionId: string;
+  exactRunner: ExactStopRunner;
+}>): boolean {
+  const normalizedSessionId = String(params.sessionId ?? '').trim();
+  if (!normalizedSessionId || normalizedSessionId.startsWith('PID-')) return false;
+  const { pidsToStop } = selectTrackedRunnersForStop(params.pidToTrackedSession, normalizedSessionId);
+  return pidsToStop.length === 1 && pidsToStop[0] === params.exactRunner.pid;
+}
+
 export function createStopSession(params: Readonly<{
   pidToTrackedSession: Map<number, TrackedSession>;
   logPidReuseRefusal?: (message: string) => void;
@@ -197,37 +245,25 @@ export function createStopSession(params: Readonly<{
   requireTerminalTopologyProof?: boolean;
   /** Exact persisted topology for reconstructed dead-runner candidates not represented by spawn options. */
   provenTerminalHostKindsByPid?: ReadonlyMap<number, TerminalHostAdapter['kind']>;
-}>): (sessionId: string) => Promise<StopSessionResult> {
+}>): (sessionId: string, options?: StopSessionOptions) => Promise<StopSessionResult> {
   const { pidToTrackedSession } = params;
   const logPidReuseRefusal = params.logPidReuseRefusal ?? ((message: string): void => logger.warn(message));
   const logWarning = params.logWarning ?? ((message: string, ...args: unknown[]): void => logger.warn(message, ...args));
 
   // Stop a session by sessionId or PID fallback
-  return async (sessionId: string): Promise<StopSessionResult> => {
+  return async (sessionId: string, options?: StopSessionOptions): Promise<StopSessionResult> => {
     logger.debug(`[DAEMON RUN] Attempting to stop session ${sessionId}`);
 
     const normalizedSessionId = String(sessionId ?? '').trim();
     if (!normalizedSessionId) return incompleteStopSession('invalid_session_id');
     const isPidFallback = normalizedSessionId.startsWith('PID-');
-    const fallbackPid = isPidFallback ? Number.parseInt(normalizedSessionId.replace('PID-', ''), 10) : NaN;
-
-    const pidsToStop: number[] = [];
-    const expectedTrackedSessionsByPid = new Map<number, TrackedSession>();
-    for (const [pid, session] of pidToTrackedSession.entries()) {
-      const happySessionId = typeof session.happySessionId === 'string' ? session.happySessionId : '';
-      const existingSessionId =
-        session.spawnOptions && typeof (session.spawnOptions as any).existingSessionId === 'string'
-          ? String((session.spawnOptions as any).existingSessionId).trim()
-          : '';
-      const matches =
-        happySessionId === normalizedSessionId ||
-        existingSessionId === normalizedSessionId ||
-        (isPidFallback && Number.isFinite(fallbackPid) && pid === fallbackPid);
-      if (matches) {
-        pidsToStop.push(pid);
-        expectedTrackedSessionsByPid.set(pid, session);
-      }
+    const exactRunner = options?.exactRunner;
+    if (exactRunner && !isExactStopRunnerSoleTrackedRunner({ pidToTrackedSession, sessionId: normalizedSessionId, exactRunner })) {
+      logWarning(`[DAEMON RUN] Refusing exact-runner Stop for session ${normalizedSessionId}: PID ${exactRunner.pid} is not the session's only tracked runner`);
+      return incompleteStopSession('runner_signal_incomplete');
     }
+
+    const { pidsToStop, expectedTrackedSessionsByPid } = selectTrackedRunnersForStop(pidToTrackedSession, normalizedSessionId);
 
     const readAttachmentInfo = params.readAttachmentInfo ?? readTerminalAttachmentInfo;
     const readAttachmentState = params.readAttachmentState
@@ -416,6 +452,14 @@ export function createStopSession(params: Readonly<{
       const session = pidToTrackedSession.get(pid);
       if (!session) continue;
 
+      if (exactRunner && !await isPidSafeHappySessionProcess({
+        pid,
+        expectedProcessInstanceFingerprint: exactRunner.processInstanceFingerprint,
+      })) {
+        logPidReuseRefusal(`[DAEMON RUN] Refusing to signal PID ${pid} for session ${normalizedSessionId} (exact runner instance changed)`);
+        continue;
+      }
+
       if (session.startedBy === 'daemon' && session.childProcess) {
         if (process.platform === 'win32') {
           if (await taskkillWindowsDaemonChild({ pid, session, normalizedSessionId, logPidReuseRefusal })) {
@@ -469,8 +513,9 @@ export function createStopSession(params: Readonly<{
         continue;
       }
 
-      // PID reuse safety: verify the PID is still a Happy runner and matches the strongest persisted identity.
-      const safe = await isPidSafeHappySessionProcess({
+      // PID reuse safety: verify the PID is still a Happy runner and matches the strongest persisted
+      // identity. An exact runner's instance was already verified above.
+      const safe = exactRunner !== undefined || await isPidSafeHappySessionProcess({
         pid,
         expectedProcessCommandHash: session.processCommandHash,
         expectedProcessInstanceFingerprint: session.processInstanceFingerprint,
@@ -554,6 +599,7 @@ export function createStopSession(params: Readonly<{
           pidToTrackedSession,
           normalizedSessionId,
           logPidReuseRefusal,
+          ...(exactRunner ? { exactRunner } : {}),
         }) || forceSignaledAny;
       }
 

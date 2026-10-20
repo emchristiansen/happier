@@ -42,6 +42,7 @@ type ShutdownSource = 'happier-app' | 'happier-cli' | 'os-signal' | 'exception';
 type BuildHappyCliSubprocessLaunchSpec = typeof import('@/utils/spawnHappyCLI').buildHappyCliSubprocessLaunchSpec;
 type HappyCliSubprocessRuntimeDecision = import('@/utils/spawnHappyCLI').HappyCliSubprocessRuntimeDecision;
 type CreateStopSessionInput = Parameters<typeof import('./sessions/stopSession').createStopSession>[0];
+type StopSessionOptions = import('./sessions/stopSession').StopSessionOptions;
 type CallSessionRpc = typeof callSessionRpc;
 type ReadProcessRunState = typeof import('./processRunState').readProcessRunState;
 type ReadSessionRunnerLockStatus = typeof import('./sessionRunnerLock').readSessionRunnerLockStatus;
@@ -203,7 +204,7 @@ const pendingMaterializationRpcMocks = vi.hoisted(() => {
   };
 });
 const stopSessionMocks = vi.hoisted(() => {
-  const stopSession = vi.fn<(_: string) => Promise<StopSessionResult>>(async () => ({ status: 'stopped' }));
+  const stopSession = vi.fn<(_: string, __?: StopSessionOptions) => Promise<StopSessionResult>>(async () => ({ status: 'stopped' }));
   return {
     stopSession,
     createStopSession: vi.fn<(_: CreateStopSessionInput) => typeof stopSession>(() => stopSession),
@@ -225,6 +226,9 @@ const sessionRunnerActivityBoundaryMocks = vi.hoisted(() => ({
   readSessionRunnerLockStatus: vi.fn<ReadSessionRunnerLockStatus>(async () => ({ ok: false, reason: 'not_found' })),
 }));
 const ensureSessionMachineAccessKeyBindingMock = vi.hoisted(() => vi.fn(async () => {}));
+const processInstanceBoundaryMocks = vi.hoisted(() => ({
+  readProcessInstanceFingerprintSync: vi.fn<(pid: number) => string | null>(),
+}));
 const harness = vi.hoisted(() => {
   let resolveShutdown: ((value: { source: ShutdownSource; errorMessage?: string }) => void) | null = null;
   let requestShutdownRef: ((source: ShutdownSource, errorMessage?: string) => void) | null = null;
@@ -768,6 +772,15 @@ vi.mock('./sessions/onHappySessionWebhook', () => ({
   createOnHappySessionWebhook: vi.fn(() => vi.fn()),
 }));
 
+vi.mock('@happier-dev/cli-common/processInstance', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@happier-dev/cli-common/processInstance')>();
+  processInstanceBoundaryMocks.readProcessInstanceFingerprintSync.mockImplementation((pid) => actual.readProcessInstanceFingerprintSync(pid));
+  return {
+    ...actual,
+    readProcessInstanceFingerprintSync: (pid: number) => processInstanceBoundaryMocks.readProcessInstanceFingerprintSync(pid),
+  };
+});
+
 vi.mock('./processRunState', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./processRunState')>();
   return {
@@ -809,7 +822,8 @@ vi.mock('./sessions/visibleConsoleSpawnWaiter', () => ({
   waitForVisibleConsoleSessionWebhook: vi.fn(async () => ({ type: 'success', sessionId: 'sess_visible_console' })),
 }));
 
-vi.mock('./sessions/stopSession', () => ({
+vi.mock('./sessions/stopSession', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./sessions/stopSession')>(),
   createStopSession: stopSessionMocks.createStopSession,
 }));
 
@@ -3795,76 +3809,161 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     }
   });
 
-  it.each([
-    {
-      control: 'publisher_lost',
-      capability: async () => ({ ok: false, error: 'pending_materialization_wake_unavailable', errorCode: 'publisher_lost' }),
-      replaced: true,
-    },
-    {
-      control: 'rpc_failed',
-      capability: async () => { throw new Error('transient session RPC failure'); },
-      replaced: false,
-    },
-  ] as const)('replaces a live resume target only for a reported lost publisher ($control)', async ({ capability, replaced }) => {
-    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+  describe('lost publisher replacement', () => {
     const id = 'sess_publisher_lost';
-    sessionRunnerActivityBoundaryMocks.readProcessRunState.mockResolvedValue('servable');
-    pendingMaterializationRpcMocks.resolveSessionTransportContext.mockResolvedValue({
-      ok: true, sessionId: id, rawSession: { id, active: true, encryptionMode: 'plain' },
-      mode: 'plain', ctx: pendingMaterializationRpcMocks.ctx,
+    const runnerPid = 12345;
+    const runnerFingerprint = 'linux-proc:runner-12345';
+    const localRunner = { machineId: 'machine-1', pid: runnerPid, processInstanceFingerprint: runnerFingerprint };
+    const publisherLost = (respondent?: unknown) => ({
+      ok: false,
+      error: 'pending_materialization_wake_unavailable',
+      errorCode: 'publisher_lost',
+      ...(respondent === undefined ? {} : { respondent }),
     });
-    pendingMaterializationRpcMocks.callSessionRpc.mockImplementation(async (params) => {
-      if (params.method.endsWith('wakeCapability.v1.get')) return await capability();
-      throw new Error(`unexpected session RPC ${params.method}`);
-    });
-    // The existing Stop path is the one owner of runner termination; model its effect on presence.
-    stopSessionMocks.stopSession.mockImplementation(async () => {
-      sessionRunnerActivityBoundaryMocks.readProcessRunState.mockResolvedValue('dead');
-      return { status: 'stopped' };
-    });
-    vi.mocked(fetchSessionByIdCompat).mockResolvedValue(createSessionRecordFixture({
-      id, encryptionMode: 'plain', metadata: JSON.stringify({ flavor: 'codex', path: tmpdir(), codexSessionId: 'vendor-publisher-lost' }),
-    }));
-    let run: Promise<void> | null = null;
-    const tracked: { current: Parameters<typeof import('./sessions/onHappySessionWebhook').createOnHappySessionWebhook>[0]['pidToTrackedSession'] | null } = { current: null };
-    try {
-      const webhook = await import('./sessions/onHappySessionWebhook');
-      vi.mocked(webhook.createOnHappySessionWebhook).mockImplementation(({ pidToTrackedSession }) => {
-        tracked.current = pidToTrackedSession;
-        return vi.fn();
-      });
-      const { startDaemon } = await import('./startDaemon');
-      run = startDaemon();
-      const spawnSession = await waitForSpawnSessionRegistration();
-      tracked.current!.set(12345, {
-        pid: 12345, startedBy: 'daemon', happySessionId: id,
-        spawnOptions: { directory: tmpdir(), existingSessionId: id, backendTarget: { kind: 'builtInAgent', agentId: 'codex' } },
-      });
+    const servable = { ok: true, capability: 'pending_queue_wake_v1', protocolVersion: 1, method: 'session.pendingQueue.wake.v1' };
 
-      const result = await spawnSession({
-        directory: tmpdir(),
-        existingSessionId: id,
-        backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
-        token: 't',
-        codexBackendMode: 'acp',
+    async function resumeAgainstLiveRunner(params: Readonly<{
+      capability: () => Promise<unknown>;
+      stopEffect?: 'runner_exits' | 'runner_stays';
+      stopResult?: StopSessionResult;
+    }>) {
+      const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+      sessionRunnerActivityBoundaryMocks.readProcessRunState.mockResolvedValue('servable');
+      processInstanceBoundaryMocks.readProcessInstanceFingerprintSync.mockImplementation((pid) => (
+        pid === runnerPid ? runnerFingerprint : null
+      ));
+      pendingMaterializationRpcMocks.resolveSessionTransportContext.mockResolvedValue({
+        ok: true, sessionId: id, rawSession: { id, active: true, encryptionMode: 'plain' },
+        mode: 'plain', ctx: pendingMaterializationRpcMocks.ctx,
       });
+      pendingMaterializationRpcMocks.callSessionRpc.mockImplementation(async (rpc) => {
+        if (rpc.method.endsWith('wakeCapability.v1.get')) return await params.capability();
+        if (rpc.method.endsWith('pendingQueue.wake.v1')) return { ok: true, result: 'wake_published' };
+        throw new Error(`unexpected session RPC ${rpc.method}`);
+      });
+      // The existing Stop path is the one owner of runner termination; model its effect on presence.
+      stopSessionMocks.stopSession.mockImplementation(async () => {
+        if ((params.stopEffect ?? 'runner_exits') === 'runner_exits') {
+          sessionRunnerActivityBoundaryMocks.readProcessRunState.mockResolvedValue('dead');
+        }
+        return params.stopResult ?? { status: 'stopped' };
+      });
+      vi.mocked(fetchSessionByIdCompat).mockResolvedValue(createSessionRecordFixture({
+        id, encryptionMode: 'plain', metadata: JSON.stringify({ flavor: 'codex', path: tmpdir(), codexSessionId: 'vendor-publisher-lost' }),
+      }));
+      let run: Promise<void> | null = null;
+      const tracked: { current: Parameters<typeof import('./sessions/onHappySessionWebhook').createOnHappySessionWebhook>[0]['pidToTrackedSession'] | null } = { current: null };
+      try {
+        const webhook = await import('./sessions/onHappySessionWebhook');
+        vi.mocked(webhook.createOnHappySessionWebhook).mockImplementation(({ pidToTrackedSession }) => {
+          tracked.current = pidToTrackedSession;
+          return vi.fn();
+        });
+        const { startDaemon } = await import('./startDaemon');
+        run = startDaemon();
+        const spawnSession = await waitForSpawnSessionRegistration();
+        tracked.current!.set(runnerPid, {
+          pid: runnerPid, startedBy: 'daemon', happySessionId: id,
+          spawnOptions: { directory: tmpdir(), existingSessionId: id, backendTarget: { kind: 'builtInAgent', agentId: 'codex' } },
+        });
 
-      if (replaced) {
-        expect(stopSessionMocks.stopSession).toHaveBeenCalledExactlyOnceWith(id);
-        expect(spawnHappyCLI).toHaveBeenCalledTimes(1);
-        expect(spawnHappyCLI.mock.calls[0]?.[0]).toEqual(expect.arrayContaining(['--existing-session', id]));
-      } else {
-        expect(result).toMatchObject({ type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED });
-        expect(stopSessionMocks.stopSession).not.toHaveBeenCalled();
-        expect(spawnHappyCLI).not.toHaveBeenCalled();
+        return await spawnSession({
+          directory: tmpdir(),
+          existingSessionId: id,
+          backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+          token: 't',
+          codexBackendMode: 'acp',
+        });
+      } finally {
+        if (run) { harness.requestShutdown('happier-cli'); await run; }
+        const webhook = await import('./sessions/onHappySessionWebhook');
+        vi.mocked(webhook.createOnHappySessionWebhook).mockImplementation(() => vi.fn());
+        const actualProcessInstance = await vi.importActual<typeof import('@happier-dev/cli-common/processInstance')>(
+          '@happier-dev/cli-common/processInstance',
+        );
+        processInstanceBoundaryMocks.readProcessInstanceFingerprintSync.mockImplementation(
+          (pid) => actualProcessInstance.readProcessInstanceFingerprintSync(pid),
+        );
+        exitSpy.mockRestore();
       }
-    } finally {
-      if (run) { harness.requestShutdown('happier-cli'); await run; }
-      const webhook = await import('./sessions/onHappySessionWebhook');
-      vi.mocked(webhook.createOnHappySessionWebhook).mockImplementation(() => vi.fn());
-      exitSpy.mockRestore();
     }
+
+    function expectFencedWithoutStop(result: unknown): void {
+      expect(result).toMatchObject({ type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED });
+      expect(stopSessionMocks.stopSession).not.toHaveBeenCalled();
+      expect(spawnHappyCLI).not.toHaveBeenCalled();
+    }
+
+    it('replaces exactly the local runner that reported the loss, then spawns', async () => {
+      await resumeAgainstLiveRunner({ capability: async () => publisherLost(localRunner) });
+
+      expect(stopSessionMocks.stopSession).toHaveBeenCalledExactlyOnceWith(id, {
+        exactRunner: expect.objectContaining({ pid: runnerPid, processInstanceFingerprint: runnerFingerprint }),
+      });
+      expect(spawnHappyCLI).toHaveBeenCalledTimes(1);
+      expect(spawnHappyCLI.mock.calls[0]?.[0]).toEqual(expect.arrayContaining(['--existing-session', id]));
+    });
+
+    it.each([
+      ['another pid', { ...localRunner, pid: runnerPid + 1 }],
+      ['another process instance', { ...localRunner, processInstanceFingerprint: 'linux-proc:someone-else' }],
+      ['another machine', { ...localRunner, machineId: 'machine-other-home' }],
+      ['no identity', undefined],
+      ['a partial identity', { machineId: 'machine-1', pid: runnerPid }],
+    ])('fences a loss reported with %s and never stops the local runner', async (_label, respondent) => {
+      expectFencedWithoutStop(await resumeAgainstLiveRunner({ capability: async () => publisherLost(respondent) }));
+    });
+
+    it('fences a transient session RPC failure without stopping the runner', async () => {
+      expectFencedWithoutStop(await resumeAgainstLiveRunner({
+        capability: async () => { throw new Error('transient session RPC failure'); },
+      }));
+    });
+
+    it('fences a runner still recovering its publisher before its deadline', async () => {
+      expectFencedWithoutStop(await resumeAgainstLiveRunner({
+        capability: async () => ({ ok: false, error: 'pending_materialization_wake_unavailable', errorCode: 'publisher_recovering' }),
+      }));
+    });
+
+    it('refuses Resume without spawning when the exact Stop is incomplete', async () => {
+      const result = await resumeAgainstLiveRunner({
+        capability: async () => publisherLost(localRunner),
+        stopEffect: 'runner_stays',
+        stopResult: { status: 'incomplete', reason: 'runner_signal_incomplete' },
+      });
+
+      expect(result).toMatchObject({ type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED });
+      expect(stopSessionMocks.stopSession).toHaveBeenCalledTimes(1);
+      expect(spawnHappyCLI).not.toHaveBeenCalled();
+    });
+
+    it('refuses Resume without spawning when the runner is still present after a reported Stop', async () => {
+      const result = await resumeAgainstLiveRunner({
+        capability: async () => publisherLost(localRunner),
+        stopEffect: 'runner_stays',
+      });
+
+      expect(result).toMatchObject({ type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED });
+      expect(stopSessionMocks.stopSession).toHaveBeenCalledTimes(1);
+      expect(spawnHappyCLI).not.toHaveBeenCalled();
+    });
+
+    it('replaces the exact runner when the loss is first reported at the after-wait decision', async () => {
+      let capabilityProbes = 0;
+      await resumeAgainstLiveRunner({
+        capability: async () => {
+          capabilityProbes += 1;
+          return capabilityProbes === 1 ? servable : publisherLost(localRunner);
+        },
+      });
+
+      expect(capabilityProbes).toBeGreaterThanOrEqual(2);
+      expect(stopSessionMocks.stopSession).toHaveBeenCalledExactlyOnceWith(id, {
+        exactRunner: expect.objectContaining({ pid: runnerPid, processInstanceFingerprint: runnerFingerprint }),
+      });
+      expect(spawnHappyCLI).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('launches markerless explicit Claude Resume with the exact live attachment descriptor in the child environment', async () => {

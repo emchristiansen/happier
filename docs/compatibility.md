@@ -256,20 +256,33 @@ programmatic-input boundary.
 
 A runner whose session socket receives `forbidden` from `pending-materialize-next`
 has lost publisher status for the session. It asks its connection supervisor for
-one reconnect, whose connect path reclaims publisher status. If the reclaimed
-connection is still refused, the runner stops materializing and its wake
-capability RPC answers `pending_materialization_wake_unavailable` with the new
-`errorCode: 'publisher_lost'`. A later connection that claims publisher status
-clears that state. On Resume, the daemon replaces such a runner through its
-existing Stop path and then spawns, but only once the runner is proven absent.
-Every other probe result, including a failed or missing one, keeps its previous
-adopt or fence decision.
+one reconnect, whose connect path reclaims publisher status. Until that reconnect
+reclaims publisher status, the wake capability RPC answers
+`pending_materialization_wake_unavailable` with `errorCode: 'publisher_recovering'`.
+If the reclaimed connection is still refused, or no reconnect reclaims publisher
+status within `HAPPIER_PENDING_PUBLISHER_RECOVERY_DEADLINE_MS` (default 120000),
+the runner stops materializing and answers `errorCode: 'publisher_lost'` with a
+`respondent` naming its own incarnation: machine id, pid, and the process-instance
+fingerprint that `readProcessInstanceFingerprintSync` reads for that pid. A later
+connection that claims publisher status clears that state.
 
-The relay is unchanged. The widened `errorCode` enum is a runner-to-daemon seam.
-A daemon without this change parses `publisher_lost` as a malformed response and
-fences Resume instead of adopting; it never replaces. A runner without this
-change never reports `publisher_lost`, so resident older runners that are already
-wedged still need a manual Stop before Resume.
+On Resume, the daemon replaces such a runner only when the respondent equals the
+one local process a Stop of the session would signal: the session's only tracked
+runner, on this daemon's machine, with the same pid and process instance. It then
+stops exactly that process, re-verifying its instance before each signal, and
+spawns only once the runner is proven absent. A report from any other incarnation,
+or one without a complete respondent, fences Resume
+(`publisher_lost_respondent_unbound`), as does a session with several local
+runners, a wrapper process, or a runner known only from its lock
+(`publisher_lost_target_ambiguous`). Every other probe result, including a
+recovering, failed or missing one, keeps its previous adopt or fence decision.
+
+The relay is unchanged. The widened wake response is a runner-to-daemon seam. A
+daemon without this change parses `publisher_recovering` and `publisher_lost`
+(its strict schema rejects both the new codes and the `respondent` field) as a
+malformed response and fences Resume instead of adopting; it never replaces. A
+runner without this change never reports either code, so resident older runners
+that are already wedged still need a manual Stop before Resume.
 
 ## Migration history
 

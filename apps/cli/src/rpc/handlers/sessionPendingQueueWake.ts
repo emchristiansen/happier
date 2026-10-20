@@ -19,9 +19,13 @@ function unavailableForRuntimeState(
   controls: Pick<SessionRuntimeControls, 'readPendingMaterializationServiceability'> | null | undefined,
 ) {
   const serviceability = controls?.readPendingMaterializationServiceability?.();
-  return serviceability?.state === 'unservable'
-    ? unavailable(serviceability.reason)
-    : null;
+  if (serviceability?.state !== 'unservable') return null;
+  if (serviceability.reason !== 'publisher_lost') return unavailable(serviceability.reason);
+  // The daemon may replace a runner only on a loss reported by that exact incarnation.
+  return {
+    ...unavailable('publisher_lost'),
+    ...(serviceability.respondent ? { respondent: serviceability.respondent } : {}),
+  };
 }
 
 export function registerSessionPendingQueueWakeHandlers(

@@ -1,6 +1,8 @@
 import {
   SessionPendingQueueWakeCapabilityResponseV1Schema,
   SessionPendingQueueWakeResponseV1Schema,
+  type PendingQueueWakeRunnerIncarnationV1,
+  type SessionPendingQueueWakeCapabilityResponseV1,
 } from '@happier-dev/protocol';
 import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
 
@@ -8,17 +10,58 @@ export type SessionPendingQueueWakeDiagnostic =
   | Readonly<{ type: 'wake_published' }>
   | Readonly<{
       type: 'unavailable';
-      reason: 'no_token' | 'shutdown' | 'transport_unavailable' | 'session_mismatch' | 'rpc_method_unavailable' | 'runtime_upgrade_required' | 'runtime_terminating' | 'publisher_lost' | 'malformed_response' | 'rpc_failed';
+      reason: 'no_token' | 'shutdown' | 'transport_unavailable' | 'session_mismatch' | 'rpc_method_unavailable' | 'runtime_upgrade_required' | 'runtime_terminating' | 'publisher_recovering' | 'publisher_lost' | 'publisher_lost_respondent_unbound' | 'malformed_response' | 'rpc_failed';
     }>;
 
 type TransportResult =
   | Readonly<{ ok: true; sessionId: string; mode: unknown; ctx: unknown }>
   | Readonly<{ ok: false }>;
 
+/** The runtime incarnation a runner reports about itself. */
+export type SessionRunnerIncarnation = PendingQueueWakeRunnerIncarnationV1;
+
 export type SessionRunnerServiceability =
   | Readonly<{ state: 'servable' }>
-  | Readonly<{ state: 'recoverable_unservable'; reason: 'session_mismatch' | 'rpc_method_unavailable' | 'runtime_upgrade_required' | 'runtime_terminating' | 'publisher_lost' | 'malformed_response' }>
+  /** Terminal loss reported by the incarnation named here; whether that is the local runner is decided later. */
+  | Readonly<{ state: 'recoverable_unservable'; reason: 'publisher_lost'; respondent: SessionRunnerIncarnation }>
+  | Readonly<{
+      state: 'recoverable_unservable';
+      reason:
+        | 'session_mismatch'
+        | 'rpc_method_unavailable'
+        | 'runtime_upgrade_required'
+        | 'runtime_terminating'
+        | 'publisher_recovering'
+        /** A lost-publisher report whose respondent is missing, partial or malformed. */
+        | 'publisher_lost_respondent_unbound'
+        | 'malformed_response';
+    }>
   | Readonly<{ state: 'unknown'; reason: 'no_token' | 'shutdown' | 'transport_unavailable' | 'rpc_failed' }>;
+
+const UNBOUND_PUBLISHER_LOST: Readonly<{ state: 'recoverable_unservable'; reason: 'publisher_lost_respondent_unbound' }> = {
+  state: 'recoverable_unservable',
+  reason: 'publisher_lost_respondent_unbound',
+};
+
+/** A lost-publisher report whose respondent failed the strict schema still never reads as healthy or replaceable. */
+function isUnparseablePublisherLostReport(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const record = raw as Record<string, unknown>;
+  return record.ok === false
+    && record.error === 'pending_materialization_wake_unavailable'
+    && record.errorCode === 'publisher_lost';
+}
+
+function classifyUnavailableCapability(
+  unavailable: Extract<SessionPendingQueueWakeCapabilityResponseV1, { ok: false }>,
+): Exclude<SessionRunnerServiceability, { state: 'servable' } | { state: 'unknown' }> {
+  if (unavailable.errorCode !== 'publisher_lost') {
+    return { state: 'recoverable_unservable', reason: unavailable.errorCode };
+  }
+  return unavailable.respondent
+    ? { state: 'recoverable_unservable', reason: 'publisher_lost', respondent: unavailable.respondent }
+    : UNBOUND_PUBLISHER_LOST;
+}
 
 type CapabilityProbeParams = Readonly<{
   sessionId: string;
@@ -50,11 +93,18 @@ async function discoverSessionPendingQueueWakeCapabilityV1(params: CapabilityPro
     );
     if (params.isShutdownRequested?.()) return { result: { state: 'unknown', reason: 'shutdown' } };
     const capability = SessionPendingQueueWakeCapabilityResponseV1Schema.safeParse(raw);
-    if (!capability.success || (capability.data.ok && capability.data.method !== SESSION_RPC_METHODS.SESSION_PENDING_QUEUE_WAKE_V1)) {
+    if (!capability.success) {
+      return {
+        result: isUnparseablePublisherLostReport(raw)
+          ? UNBOUND_PUBLISHER_LOST
+          : { state: 'recoverable_unservable', reason: 'malformed_response' },
+      };
+    }
+    if (capability.data.ok && capability.data.method !== SESSION_RPC_METHODS.SESSION_PENDING_QUEUE_WAKE_V1) {
       return { result: { state: 'recoverable_unservable', reason: 'malformed_response' } };
     }
     if (!capability.data.ok) {
-      return { result: { state: 'recoverable_unservable', reason: capability.data.errorCode } };
+      return { result: classifyUnavailableCapability(capability.data) };
     }
     return { result: { state: 'servable' }, transport };
   } catch (error) {

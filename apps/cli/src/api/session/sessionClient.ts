@@ -11,7 +11,12 @@ import { SessionArchiveInputAdmission, type RequestArchivedSessionCleanup } from
 import { LruSet } from '@/utils/collections/lru';
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers';
 import { createSerializedWorkQueueDiagnostics, type SerializedWorkDiagnosticContext } from '@/utils/serializedWorkQueueDiagnostics';
-import { isConditionalPendingSteerClaim, readPendingLocalId } from '@happier-dev/protocol';
+import {
+    isConditionalPendingSteerClaim,
+    readPendingLocalId,
+    type PendingQueueWakeRunnerIncarnationV1,
+} from '@happier-dev/protocol';
+import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
 import { inferAgentIdFromSessionMetadata } from '@happier-dev/agents';
 import { configuration } from '@/configuration';
 import type { RawJSONLines } from '@/backends/claude/types';
@@ -27,7 +32,7 @@ import { randomUUID } from 'node:crypto';
 import { AsyncLock } from '@/utils/lock';
 import { RpcHandlerManager } from '../rpc/RpcHandlerManager';
 import { registerSessionHandlers } from '@/rpc/handlers/registerSessionHandlers';
-import type { SessionRuntimeControls } from '@/rpc/handlers/sessionControls';
+import type { PendingMaterializationServiceability, SessionRuntimeControls } from '@/rpc/handlers/sessionControls';
 import {
     clearSessionRuntimeControls,
     copyCallableSessionRuntimeControls,
@@ -585,11 +590,13 @@ type AcceptedCanonicalPendingDeliveryOperationAuthority = Readonly<{
 /**
  * One lost-publisher episode. The first refusal requests one supervisor reconnect, whose connect
  * path reclaims publisher status; a refusal on that reclaimed connection is terminal until a
- * later connection claims publisher status again. Any accepted claim ends the episode.
+ * later connection claims publisher status again. Any accepted claim ends the episode. A reconnect
+ * that does not reclaim publisher status within `configuration.pendingPublisherRecoveryDeadlineMs`
+ * completes the episode as terminal too, so recovery always ends.
  */
 type PendingPublisherRecovery =
     | Readonly<{ state: 'current' }>
-    | Readonly<{ state: 'reconnect_requested' }>
+    | Readonly<{ state: 'reconnect_requested'; episode: number }>
     | Readonly<{ state: 'reclaimed'; sessionConnectionEpoch: number }>
     | Readonly<{ state: 'publisher_lost' }>;
 
@@ -756,6 +763,8 @@ export class ApiSessionClient extends EventEmitter {
     private sessionConnectionEpoch = 0;
     private sessionSyncPendingInputServerContract: SessionSyncPendingInputServerContractResult | null = null;
     private pendingPublisherRecovery: PendingPublisherRecovery = { state: 'current' };
+    private pendingPublisherRecoveryEpisode = 0;
+    private pendingPublisherRecoveryDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
     private pendingInputReadinessAbortController: AbortController | null = null;
     private convergePendingInputReadiness: ((onContractPrepared?: () => void) => Promise<boolean>) | null = null;
     private changesSyncInFlight: Promise<void> | null = null;
@@ -1503,30 +1512,79 @@ export class ApiSessionClient extends EventEmitter {
             copyCallableSessionRuntimeControls(this.sessionRuntimeControls, registration);
         }
         this.sessionRuntimeControls.wakePendingMaterialization = () => this.wakePendingMaterialization();
-        this.sessionRuntimeControls.readPendingMaterializationServiceability = () => (
-            this.closed || this.runtimeTerminationStarted
-                ? { state: 'unservable', reason: 'runtime_terminating' }
-                : this.pendingPublisherRecovery.state === 'publisher_lost'
-                    ? { state: 'unservable', reason: 'publisher_lost' }
-                    : { state: 'servable' }
-        );
+        this.sessionRuntimeControls.readPendingMaterializationServiceability = (): PendingMaterializationServiceability => {
+            if (this.closed || this.runtimeTerminationStarted) return { state: 'unservable', reason: 'runtime_terminating' };
+            switch (this.pendingPublisherRecovery.state) {
+                case 'publisher_lost':
+                    return { state: 'unservable', reason: 'publisher_lost', respondent: this.readPendingPublisherRespondent() };
+                case 'reconnect_requested':
+                    // Unservable but not terminal until the episode completes. Servable would make the
+                    // daemon adopt a runner whose Pending claims the server is refusing, and terminal
+                    // would let it replace a runner whose one reconnect may still succeed; this keeps
+                    // Resume fenced for at most the recovery deadline.
+                    return { state: 'unservable', reason: 'publisher_recovering' };
+                default:
+                    return { state: 'servable' };
+            }
+        };
+    }
+
+    /**
+     * This runner's own incarnation, for the daemon to bind a `publisher_lost` report to the exact
+     * local process it may stop. The fingerprint is read the way the daemon reads any pid's instance.
+     */
+    private readPendingPublisherRespondent(): PendingQueueWakeRunnerIncarnationV1 | null {
+        const machineId = (this.sessionSocketMachineId ?? resolveSessionSocketMachineIdForBootstrap(this.metadata))?.trim();
+        const processInstanceFingerprint = readProcessInstanceFingerprintSync(process.pid)?.trim();
+        return machineId && processInstanceFingerprint
+            ? { machineId, pid: process.pid, processInstanceFingerprint }
+            : null;
+    }
+
+    /** Every recovery transition goes through here, so leaving an episode always disarms its deadline. */
+    private setPendingPublisherRecovery(next: PendingPublisherRecovery): void {
+        this.clearPendingPublisherRecoveryDeadline();
+        this.pendingPublisherRecovery = next;
+    }
+
+    private clearPendingPublisherRecoveryDeadline(): void {
+        if (this.pendingPublisherRecoveryDeadlineTimer) clearTimeout(this.pendingPublisherRecoveryDeadlineTimer);
+        this.pendingPublisherRecoveryDeadlineTimer = null;
+    }
+
+    private expirePendingPublisherRecovery(episode: number): void {
+        const recovery = this.pendingPublisherRecovery;
+        // Bound to its episode: a deadline can never end a later episode or overwrite a reclaim.
+        if (recovery.state !== 'reconnect_requested' || recovery.episode !== episode) return;
+        this.setPendingPublisherRecovery({ state: 'publisher_lost' });
+        logger.infoFile('[pendingQueue] reconnect did not reclaim publisher status before its deadline; materialization stopped', {
+            sessionId: this.sessionId,
+            deadlineMs: configuration.pendingPublisherRecoveryDeadlineMs,
+        });
     }
 
     private observePendingPublisherClaim(sessionConnectionEpoch: number): void {
         if (this.pendingPublisherRecovery.state === 'reconnect_requested') {
-            this.pendingPublisherRecovery = { state: 'reclaimed', sessionConnectionEpoch };
+            this.setPendingPublisherRecovery({ state: 'reclaimed', sessionConnectionEpoch });
         } else if (this.pendingPublisherRecovery.state === 'publisher_lost') {
             logger.infoFile('[pendingQueue] new connection reclaimed publisher status; materialization resumes', {
                 sessionId: this.sessionId,
             });
-            this.pendingPublisherRecovery = { state: 'current' };
+            this.setPendingPublisherRecovery({ state: 'current' });
         }
     }
 
     private observePendingPublisherLost(sessionConnectionEpoch: number): void {
         const recovery = this.pendingPublisherRecovery;
         if (recovery.state === 'current') {
-            this.pendingPublisherRecovery = { state: 'reconnect_requested' };
+            const episode = ++this.pendingPublisherRecoveryEpisode;
+            this.setPendingPublisherRecovery({ state: 'reconnect_requested', episode });
+            const deadline = setTimeout(
+                () => this.expirePendingPublisherRecovery(episode),
+                configuration.pendingPublisherRecoveryDeadlineMs,
+            );
+            deadline.unref?.();
+            this.pendingPublisherRecoveryDeadlineTimer = deadline;
             logger.infoFile('[pendingQueue] session socket lost publisher status; reconnecting once', {
                 sessionId: this.sessionId,
             });
@@ -1540,7 +1598,7 @@ export class ApiSessionClient extends EventEmitter {
             return;
         }
         if (recovery.state === 'reclaimed' && sessionConnectionEpoch >= recovery.sessionConnectionEpoch) {
-            this.pendingPublisherRecovery = { state: 'publisher_lost' };
+            this.setPendingPublisherRecovery({ state: 'publisher_lost' });
             logger.infoFile('[pendingQueue] reconnect did not restore publisher status; materialization stopped', {
                 sessionId: this.sessionId,
             });
@@ -6225,6 +6283,7 @@ export class ApiSessionClient extends EventEmitter {
         // draining RPC executions so closing cannot wait on its own lifetime abort.
         this.archiveAdmissionTermination.abort();
         this.clearPendingDiscoveryTimer();
+        this.clearPendingPublisherRecoveryDeadline();
         this.accountSettingsRetryAbortController?.abort();
         this.executionRunPermissionHandler?.reset();
         this.executionRunPermissionHandler = null;
@@ -6303,6 +6362,7 @@ export class ApiSessionClient extends EventEmitter {
         this.runtimeTerminationStarted = true;
         this.archiveAdmissionTermination.abort();
         this.clearPendingDiscoveryTimer();
+        this.clearPendingPublisherRecoveryDeadline();
         this.providerInputOutcomeProducerGeneration += 1;
         this.acceptedCanonicalPendingDeliveryOperationAbortController.abort();
     }
@@ -6739,7 +6799,7 @@ export class ApiSessionClient extends EventEmitter {
                 };
             }
             // The server accepted this connection as the current publisher.
-            this.pendingPublisherRecovery = { state: 'current' };
+            this.setPendingPublisherRecovery({ state: 'current' });
         }
         if (!isServerContractCurrent()) {
             return {

@@ -34,6 +34,7 @@ import {
   buildUnsupportedSessionPendingInputInterruptAndRunResult,
   type SessionPendingInputInterruptAndRunRequestV1,
   type SessionPendingInputInterruptAndRunResultV1,
+  type PendingQueueWakeRunnerIncarnationV1,
 } from '@happier-dev/protocol';
 import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
 import { mergeUsageLimitRecoveryFieldIntoMetadata } from '@/session/usageLimitRecoveryControls/persistUsageLimitRecoveryFieldDurably';
@@ -49,7 +50,9 @@ import type { RpcHandlerRegistrar } from '@/api/rpc/types';
 /** Whether this runner can claim Pending input; reported to the daemon by the wake capability RPC. */
 export type PendingMaterializationServiceability =
   | Readonly<{ state: 'servable' }>
-  | Readonly<{ state: 'unservable'; reason: 'runtime_terminating' | 'publisher_lost' }>;
+  | Readonly<{ state: 'unservable'; reason: 'runtime_terminating' | 'publisher_recovering' }>
+  /** Terminal loss, naming this runner's own incarnation when it can identify itself. */
+  | Readonly<{ state: 'unservable'; reason: 'publisher_lost'; respondent: PendingQueueWakeRunnerIncarnationV1 | null }>;
 
 export type SessionRuntimeControls = {
   refreshGoal?: () => unknown;
