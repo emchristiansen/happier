@@ -686,3 +686,16 @@ describe('readAfterCodexTranscript', () => {
     );
   });
 });
+
+
+describe('dedicated private native domain follow boundary', () => {
+  it('refuses tail and existing-cursor reads without loading private records', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-private-follow-'));
+    await writeFile(join(root, '.muninn-private-native-domain'), 'restriction');
+    for (const cursor of ['tail', 'existing-ordinary-cursor']) {
+      await expect(readAfterCodexTranscript({ source: { kind: 'codexHome', home: 'user' }, env: { CODEX_HOME: root },
+        activeServerDir: join(root, 'server'), remoteSessionId: 'private_thread', cursor, maxBytes: 1024, maxItems: 10 }))
+        .rejects.toThrow('private native domain');
+    }
+  });
+});

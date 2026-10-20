@@ -1,5 +1,7 @@
+import { deflateRawSync } from 'node:zlib';
+import { buildZipArchive } from '../download/buildZipArchive';
 import { afterEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -141,5 +143,43 @@ describe('resolveWorkspaceFileDownloadSource', () => {
             success: false,
             error: SESSION_RPC_FILE_TRANSFER_SIZE_LIMIT_ERROR,
         });
+    });
+});
+
+
+describe('dedicated private native domain archive boundary', () => {
+    it('omits a private subtree from newly generated parent archives while preserving original ordinary bytes', async () => {
+        const workspace = createWorkspace();
+        const privateDomain = join(workspace, 'private');
+        mkdirSync(privateDomain);
+        writeFileSync(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+        const privateBytes = Buffer.concat([Buffer.from('private original raw bytes '), Buffer.from([0, 255, 128, 10])]);
+        const ordinaryBytes = Buffer.from([0, 255, 128, 10, 65, 66, 67, 0]);
+        writeFileSync(join(privateDomain, 'private-raw-record.bin'), privateBytes);
+        writeFileSync(join(workspace, 'ordinary-raw-record.bin'), ordinaryBytes);
+        const result = await resolveWorkspaceFileDownloadSource({ workingDirectory: workspace, path: workspace, asZip: true });
+        expect(result.success).toBe(true);
+        if (!result.success) throw new Error('ordinary parent export failed');
+        createdPaths.add(result.source.filePath);
+        const archiveBytes = readFileSync(result.source.filePath);
+        expect(archiveBytes.includes(Buffer.from('private-raw-record.bin'))).toBe(false);
+        expect(archiveBytes.includes(deflateRawSync(privateBytes, { level: 9 }))).toBe(false);
+        expect(archiveBytes.includes(Buffer.from('ordinary-raw-record.bin'))).toBe(true);
+        // ZIP uses raw deflate: compare the full original binary member encoding.
+        expect(archiveBytes.includes(deflateRawSync(ordinaryBytes, { level: 9 }))).toBe(true);
+        expect(readFileSync(join(workspace, 'ordinary-raw-record.bin'))).toEqual(ordinaryBytes);
+        expect(readFileSync(join(privateDomain, 'private-raw-record.bin'))).toEqual(privateBytes);
+    });
+
+    it('refuses direct builder use on a private root before creating an archive', async () => {
+        const workspace = createWorkspace();
+        const privateDomain = join(workspace, 'private');
+        mkdirSync(privateDomain);
+        writeFileSync(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+        writeFileSync(join(privateDomain, 'raw.bin'), Buffer.from([0, 255, 128]));
+        const zipPath = join(workspace, 'must-not-exist.zip');
+        await expect(buildZipArchive({ sourcePath: privateDomain, zipPath, excludedTopLevelDirs: [], maxEntryCount: 100,
+            maxTotalBytes: 1024 * 1024, maxOutputBytes: 1024 * 1024 })).rejects.toThrow('private native domain');
+        expect(existsSync(zipPath)).toBe(false);
     });
 });

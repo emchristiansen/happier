@@ -1,3 +1,4 @@
+import { assertOrdinaryReaderPath, validateOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
 import { readdir, stat } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 
@@ -77,6 +78,7 @@ function buildLikelyRolloutDayDirs(params: Readonly<{ codexHome: string; remoteS
 }
 
 async function collectRolloutMatchesFromFlatDir(params: Readonly<{ codexHome: string; dir: string; remoteSessionId: string }>): Promise<CodexRolloutFile[]> {
+  if (!validateOrdinaryReaderPath(params.dir).valid) return [];
   let entries: any[];
   try {
     entries = await readdir(params.dir, { withFileTypes: true });
@@ -108,6 +110,9 @@ async function collectRolloutMatchesFromFlatDir(params: Readonly<{ codexHome: st
 }
 
 export async function collectCodexSessionRolloutFiles(params: Readonly<{ codexHome: string; remoteSessionId: string }>): Promise<CodexRolloutFile[]> {
+  assertOrdinaryReaderPath(params.codexHome);
+  assertOrdinaryReaderPath(join(params.codexHome, 'sessions'));
+  assertOrdinaryReaderPath(join(params.codexHome, 'archived_sessions'));
   const targetedMatches = (
     await Promise.all(
       buildLikelyRolloutDayDirs({
@@ -130,6 +135,8 @@ export async function collectCodexSessionRolloutFiles(params: Readonly<{ codexHo
   const matches: CodexRolloutFile[] = [];
   const walk = async (dir: string, depth: number): Promise<void> => {
     if (depth > 10) return;
+    // An ordinary mixed container remains visible; never enter a private child.
+    if (!validateOrdinaryReaderPath(dir).valid) return;
     let entries: any[];
     try {
       entries = await readdir(dir, { withFileTypes: true });

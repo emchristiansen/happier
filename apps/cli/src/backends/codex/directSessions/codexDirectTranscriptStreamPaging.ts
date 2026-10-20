@@ -1,3 +1,4 @@
+import { assertOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
 import { stat } from 'node:fs/promises';
 
 import type { DirectTranscriptRawMessageV1 } from '@happier-dev/protocol';
@@ -297,6 +298,8 @@ export async function readAfterCodexRolloutStreams(params: Readonly<{
   maxItems: number;
   initialRolloutFiles?: readonly CodexRolloutFile[];
 }>): Promise<Readonly<{ items: DirectTranscriptRawMessageV1[]; nextCursor: string | null; truncated: boolean }>> {
+  assertOrdinaryReaderPath(params.codexHome);
+  for (const file of params.initialRolloutFiles ?? []) assertOrdinaryReaderPath(file.filePath);
   const streams = await collectCodexDirectTranscriptRolloutStreams({
     codexHome: params.codexHome,
     remoteSessionId: params.remoteSessionId,
@@ -418,6 +421,8 @@ export async function pageCodexRolloutStreams(params: Readonly<{
   hasMore: boolean;
   truncated?: boolean;
 }>> {
+  assertOrdinaryReaderPath(params.codexHome);
+  for (const file of params.initialRolloutFiles ?? []) assertOrdinaryReaderPath(file.filePath);
   const streams = [...await collectCodexDirectTranscriptRolloutStreams({
     codexHome: params.codexHome,
     remoteSessionId: params.remoteSessionId,

@@ -1,3 +1,5 @@
+import { getCodexDirectSessionActivity } from './getCodexDirectSessionActivity';
+import { codexDirectSessionProviderOps } from './providerOps';
 import { mkdir, mkdtemp, readFile, symlink, writeFile, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -902,5 +904,57 @@ describe('listCodexSessionCandidates', () => {
       intervalMs: 25,
       label: 'timed-out Codex app-server subprocess to exit',
     });
+  });
+});
+
+
+describe('dedicated private native domain listing and takeover boundary', () => {
+  it('refuses listing, activity and takeover through their actual existing owners', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-private-list-'));
+    await writeFile(join(root, '.muninn-private-native-domain'), 'restriction');
+    const source = { kind: 'codexHome' as const, home: 'user' as const, homePath: root };
+    await expect(listCodexSessionCandidates({ source, activeServerDir: join(root, 'server'), env: createDirectSessionsEnv(root), limit: 10 }))
+      .rejects.toThrow('private native domain');
+    await expect(getCodexDirectSessionActivity({ source, activeServerDir: join(root, 'server'), remoteSessionId: 'private_thread' }))
+      .rejects.toThrow('private native domain');
+    await expect(codexDirectSessionProviderOps.resolveTakeoverSpawnOptions!({
+      sessionId: 'ordinary-session', linked: {
+        source, remoteSessionId: 'private_thread', sessionPath: '/repo', providerId: 'codex', machineId: 'fixture-machine',
+        codexBackendMode: 'appServer', metadata: {},
+        rawSession: { id: 'ordinary-session', seq: 0, createdAt: 0, updatedAt: 0, active: false, activeAt: 0,
+          metadata: '{}', metadataVersion: 0, agentState: null, agentStateVersion: 0, dataEncryptionKey: null },
+      },
+    })).rejects.toThrow('private native domain');
+  });
+});
+
+
+describe('dedicated private native domain independent rollout listing', () => {
+  it('refuses an aliased private sessions root before independent rollout discovery', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-private-independent-list-'));
+    const home = join(root, 'ordinary');
+    const privateDomain = join(root, 'private');
+    await mkdir(home);
+    await mkdir(privateDomain);
+    await writeFile(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+    const sessions = join(privateDomain, 'sessions');
+    await mkdir(sessions);
+    await writeFile(join(sessions, 'rollout-2026-01-02T00-00-00-private_thread.jsonl'), sessionMetaLine({ id: 'private_thread', cwd: '/private/repo' }));
+    await symlink(sessions, join(home, 'sessions'));
+    const visited: string[] = [];
+    vi.resetModules();
+    vi.doMock('node:fs/promises', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs/promises')>();
+      return { ...actual, readdir: async (...args: Parameters<typeof actual.readdir>) => {
+        visited.push(String(args[0]));
+        return actual.readdir(...args);
+      } };
+    });
+    try {
+      const { listCodexDirectSessionCandidatesViaRollouts } = await import('./listCodexDirectSessionCandidatesViaRollouts');
+      await expect(listCodexDirectSessionCandidatesViaRollouts({ source: { kind: 'codexHome', home: 'user' },
+        activeServerDir: join(root, 'server'), env: { CODEX_HOME: home }, limit: 10 })).rejects.toThrow('private native domain');
+      expect(visited).not.toContain(join(home, 'sessions'));
+    } finally { vi.unmock('node:fs/promises'); vi.resetModules(); }
   });
 });

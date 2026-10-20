@@ -1,3 +1,4 @@
+import { validateOrdinaryReaderPath, validateOrdinaryReaderPathAsync } from '@/rpc/handlers/pathSecurity';
 import { realpathSync } from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import { basename, dirname, posix, win32 } from 'node:path';
@@ -107,11 +108,9 @@ function normalizeAdditionalAllowedDirs(
     .map((value) => normalizeFilesystemPathForPolicy(value, platform));
 }
 
-export function resolveFilesystemTargetPath(input: Readonly<{
-  targetPath: unknown;
-  defaultDirectory: string;
-  platform?: NodeJS.Platform;
-}>): FilesystemPathAuthorizationResult {
+type FilesystemTargetPathInput = Pick<AuthorizeFilesystemPathInput, 'targetPath' | 'defaultDirectory' | 'platform'>;
+
+function resolveFilesystemTargetPathInput(input: FilesystemTargetPathInput): FilesystemPathAuthorizationResult {
   const platform = input.platform ?? process.platform;
   const api = pathApi(platform);
   const targetPath = typeof input.targetPath === 'string' ? input.targetPath : '';
@@ -135,6 +134,26 @@ export function resolveFilesystemTargetPath(input: Readonly<{
     : normalizeFilesystemPathForPolicy(api.resolve(defaultDirectory, targetPath), platform);
 
   return { valid: true, resolvedPath };
+}
+
+export function resolveFilesystemTargetPath(input: FilesystemTargetPathInput): FilesystemPathAuthorizationResult {
+  const resolved = resolveFilesystemTargetPathInput(input);
+  if (!resolved.valid) return resolved;
+  if ((input.platform ?? process.platform) === process.platform) {
+    const restriction = validateOrdinaryReaderPath(resolved.resolvedPath);
+    if (!restriction.valid) return { valid: false, error: restriction.error ?? 'Access denied: private native domain' };
+  }
+  return resolved;
+}
+
+async function resolveFilesystemTargetPathAsync(input: FilesystemTargetPathInput): Promise<FilesystemPathAuthorizationResult> {
+  const resolved = resolveFilesystemTargetPathInput(input);
+  if (!resolved.valid) return resolved;
+  if ((input.platform ?? process.platform) === process.platform) {
+    const restriction = await validateOrdinaryReaderPathAsync(resolved.resolvedPath);
+    if (!restriction.valid) return { valid: false, error: restriction.error ?? 'Access denied: private native domain' };
+  }
+  return resolved;
 }
 
 export function authorizeFilesystemPath(input: AuthorizeFilesystemPathInput): FilesystemPathAuthorizationResult {
@@ -173,7 +192,7 @@ export async function prepareFilesystemPathAuthorizer(
 ): Promise<FilesystemPathAuthorizer> {
   const platform = input.platform ?? process.platform;
   if (input.accessPolicy.kind === 'osUser') {
-    return async (targetPath) => resolveFilesystemTargetPath({
+    return async (targetPath) => resolveFilesystemTargetPathAsync({
       targetPath,
       defaultDirectory: input.defaultDirectory,
       platform,
@@ -189,7 +208,7 @@ export async function prepareFilesystemPathAuthorizer(
   )));
 
   return async (targetPath) => {
-    const resolved = resolveFilesystemTargetPath({
+    const resolved = await resolveFilesystemTargetPathAsync({
       targetPath,
       defaultDirectory: input.defaultDirectory,
       platform,

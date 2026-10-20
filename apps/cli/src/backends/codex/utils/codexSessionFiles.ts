@@ -1,3 +1,4 @@
+import { assertOrdinaryReaderPath, validateOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
 import { readdirSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -60,8 +61,10 @@ export async function findCodexRolloutFileById(params: Readonly<{
   sessionsRoot: string;
   vendorResumeId: string;
 }>): Promise<string | null> {
+  assertOrdinaryReaderPath(params.sessionsRoot);
   async function walk(currentDir: string, depth: number): Promise<string | null> {
     if (depth > CODEX_NATIVE_SEARCH_MAX_DEPTH) return null;
+    if (!validateOrdinaryReaderPath(currentDir).valid) return null;
 
     const subDirectoryNames: string[] = [];
     try {
@@ -101,8 +104,10 @@ export function findCodexRolloutFileByIdSync(params: Readonly<{
   sessionsRoot: string;
   vendorResumeId: string;
 }>): string | null {
+  assertOrdinaryReaderPath(params.sessionsRoot);
   function walk(currentDir: string, depth: number): string | null {
     if (depth > CODEX_NATIVE_SEARCH_MAX_DEPTH) return null;
+    if (!validateOrdinaryReaderPath(currentDir).valid) return null;
 
     const subDirectoryNames: string[] = [];
     try {

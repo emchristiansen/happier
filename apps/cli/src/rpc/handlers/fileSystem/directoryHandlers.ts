@@ -1,3 +1,4 @@
+import { validateOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
 import { mkdir, readdir, stat } from 'fs/promises';
 import { basename, join } from 'path';
 
@@ -141,6 +142,7 @@ export function registerDirectoryHandlers(
       }
 
       async function buildTree(nodePath: string, name: string, currentDepth: number): Promise<TreeNode | null> {
+        if (!validateOrdinaryReaderPath(nodePath).valid) return null;
         try {
           const stats = await stat(nodePath);
           const node: TreeNode = {

@@ -1,3 +1,5 @@
+import { assertOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
+import { resolveConfiguredCodexHome } from '../../utils/resolveConfiguredCodexHome';
 import { buildCodexAgentRuntimeDescriptor } from '@happier-dev/agents';
 import {
     type DirectSessionCandidateV1,
@@ -63,6 +65,7 @@ export async function listCodexDirectSessionCandidatesViaExistingAppServerClient
     client: CodexAppServerClient;
     processEnv: NodeJS.ProcessEnv;
 }>): Promise<DirectSessionCandidateV1[]> {
+    assertOrdinaryReaderPath(resolveConfiguredCodexHome(params.processEnv));
     const [nonArchivedThreads, archivedThreads] = await Promise.all([
         listThreadsForArchiveStateWithClient({ client: params.client, processEnv: params.processEnv, archived: false }),
         listThreadsForArchiveStateWithClient({ client: params.client, processEnv: params.processEnv, archived: true }),
@@ -110,6 +113,7 @@ export async function listCodexDirectSessionCandidatesViaAppServer(params: Reado
     codexHome: string;
     env?: NodeJS.ProcessEnv;
 }>): Promise<DirectSessionCandidateV1[]> {
+    assertOrdinaryReaderPath(params.codexHome);
     const processEnv = await resolveCodexAppServerProcessEnv({
         processEnv: { ...process.env, ...(params.env ?? {}) },
         affinity: { home: 'user', homePath: params.codexHome },
