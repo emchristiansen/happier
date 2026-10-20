@@ -84,6 +84,77 @@ describe('connectedServiceSessionAuthSwitchCore', () => {
 });
 
 describe('queued auth switch cancellation', () => {
+  it('preserves the queued caller ancestry when another owner hands off the lock', async () => {
+    vi.useFakeTimers();
+    const locks = new ConnectedServiceSessionAuthSwitchLockRegistry();
+    let releaseB!: () => void;
+    const heldB = locks.runExclusive('b', () => new Promise<void>((resolve) => { releaseB = resolve; }));
+    let reenteredA = false;
+    const nested = locks.runExclusive('a', async () => locks.runExclusive('b', async () => (
+      locks.runExclusive('a', async () => {
+        reenteredA = true;
+        return 'completed';
+      })
+    )));
+    const outcome = nested.then(
+      (value) => ({ status: 'completed' as const, value }),
+      (error: unknown) => ({ status: 'failed' as const, error }),
+    );
+
+    try {
+      releaseB();
+      await heldB;
+      await vi.advanceTimersByTimeAsync(30_000);
+      await expect(outcome).resolves.toEqual({ status: 'completed', value: 'completed' });
+      expect(reenteredA).toBe(true);
+    } finally {
+      releaseB();
+      locks.clearSession('a');
+      locks.clearSession('b');
+      await Promise.allSettled([heldB, nested]);
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not transfer a live ancestor capability to an unrelated queued caller', async () => {
+    const locks = new ConnectedServiceSessionAuthSwitchLockRegistry();
+    let releaseB!: () => void;
+    let releaseA!: () => void;
+    const aCanFinish = new Promise<void>((resolve) => { releaseA = resolve; });
+    const events: string[] = [];
+    const outer = locks.runExclusive('a', async () => {
+      await locks.runExclusive('b', () => new Promise<void>((resolve) => { releaseB = resolve; }));
+      await aCanFinish;
+      events.push('outer:a:end');
+    });
+    let attemptedA!: () => void;
+    const aWasRequested = new Promise<void>((resolve) => { attemptedA = resolve; });
+    let unrelatedAStarted = false;
+    const unrelated = locks.runExclusive('b', async () => {
+      const requestedA = locks.runExclusive('a', async () => {
+        unrelatedAStarted = true;
+        events.push('unrelated:a');
+      });
+      attemptedA();
+      await requestedA;
+    });
+
+    try {
+      releaseB();
+      await aWasRequested;
+      expect(unrelatedAStarted).toBe(false);
+      releaseA();
+      await Promise.all([outer, unrelated]);
+      expect(events).toEqual(['outer:a:end', 'unrelated:a']);
+    } finally {
+      releaseB();
+      releaseA();
+      locks.clearSession('a');
+      locks.clearSession('b');
+      await Promise.allSettled([outer, unrelated]);
+    }
+  });
+
   it('bounds queued acquisition without releasing a running owner or executing an expired node later', async () => {
     vi.useFakeTimers();
     const locks = new ConnectedServiceSessionAuthSwitchLockRegistry();

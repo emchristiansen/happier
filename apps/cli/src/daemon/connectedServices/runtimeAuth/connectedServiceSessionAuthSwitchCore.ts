@@ -49,6 +49,7 @@ export class ConnectedServiceSessionAuthSwitchLockRegistry {
       return await operation();
     }
 
+    const parentOwners = activeSessionLockOwners.getStore() ?? [];
     const lock = this.locksBySessionId.get(sessionId) ?? { ownerId: null, queue: new Set<QueuedAcquisition>() };
     this.locksBySessionId.set(sessionId, lock);
     return await new Promise<T>((resolve, reject) => {
@@ -65,7 +66,7 @@ export class ConnectedServiceSessionAuthSwitchLockRegistry {
           removeQueued();
           const ownerId = Symbol('connected-service-session-auth-switch-lock-owner');
           lock.ownerId = ownerId;
-          void this.runAsOwner(sessionId, lock, ownerId, operation).then(resolve, reject);
+          void this.runAsOwner(sessionId, lock, ownerId, parentOwners, operation).then(resolve, reject);
         },
         cancel: (reason) => {
           if (phase !== 'queued') return;
@@ -95,10 +96,10 @@ export class ConnectedServiceSessionAuthSwitchLockRegistry {
     sessionId: string,
     lock: SessionLock,
     ownerId: symbol,
+    parentOwners: ReadonlyArray<ActiveSessionLockOwner>,
     operation: () => Promise<T>,
   ): Promise<T> {
     try {
-      const parentOwners = activeSessionLockOwners.getStore() ?? [];
       return await activeSessionLockOwners.run([
         ...parentOwners,
         { registry: this, sessionId, ownerId },
