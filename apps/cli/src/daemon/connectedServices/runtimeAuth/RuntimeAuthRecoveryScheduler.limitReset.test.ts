@@ -126,6 +126,11 @@ describe('runtime-auth limit reset continuation', () => {
       await h.scheduler.wakeByKey({ recoveryKey, reason: 'timer' });
       expect(h.sendMessage).toHaveBeenCalledTimes(2);
       expect(h.scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'exhausted', limitResetRetryCount: 2, nextRetryAtMs: null });
+      await h.reportLimit('fresh-provider-limit-2');
+      h.setNow(h.scheduler.readByKey(recoveryKey)?.nextRetryAtMs ?? 300_000);
+      await h.scheduler.wakeByKey({ recoveryKey, reason: 'timer' });
+      expect(h.sendMessage).toHaveBeenCalledTimes(2);
+      expect(h.scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'exhausted', limitResetRetryCount: 2 });
     } finally { h.scheduler.dispose(); }
   });
 

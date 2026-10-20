@@ -1,4 +1,4 @@
-import type { PendingRequestedActionV1 } from '@happier-dev/protocol';
+import { PendingRequestedActionV1Schema, type PendingRequestedActionV1 } from '@happier-dev/protocol';
 import type { PermissionIntent } from '@happier-dev/agents';
 
 import { enqueuePendingQueueV2MessageViaHttp } from '@/api/session/pendingQueueV2Transport';
@@ -34,6 +34,21 @@ import {
  * second is the predecessor's ordering invariant, and each caller owns the
  * lifecycle step that follows.
  */
+
+export type SessionUserMessageAdmissionBody = Parameters<typeof enqueuePendingQueueV2MessageViaHttp>[0]['body'];
+
+/** Persisted retry bodies use the same canonical Pending action parser. */
+export function readSessionUserMessageAdmissionBody(value: unknown): SessionUserMessageAdmissionBody | null {
+  if (!value || typeof value !== 'object') return null;
+  const body = value as Record<string, unknown>;
+  if (typeof body.localId !== 'string' || !body.localId.trim()
+    || body.messageRole !== 'user' || !PendingRequestedActionV1Schema.safeParse(body.requestedAction).success
+    || (body.deliveryMode !== undefined && body.deliveryMode !== 'continuation_if_no_queued_user_input')) return null;
+  const content = body.content as { t?: unknown; v?: unknown } | undefined;
+  if (!(typeof body.ciphertext === 'string' && body.content === undefined)
+    && !(body.ciphertext === undefined && content?.t === 'plain' && 'v' in content)) return null;
+  return value as SessionUserMessageAdmissionBody;
+}
 
 export type SessionUserMessageAdmissionResult =
   /** The row is in durable Pending custody. */
@@ -92,6 +107,7 @@ export async function admitSessionUserMessageToPendingQueue(params: Readonly<{
   pendingAdmissionMode?: 'continuation_if_no_queued_user_input';
   /** Synchronous final effect fence, after all asynchronous caller preparation. */
   assertCanAdmit?: () => void;
+  preserveAdmission?: (body: SessionUserMessageAdmissionBody) => Promise<SessionUserMessageAdmissionBody>;
 }>): Promise<SessionUserMessageAdmissionResult> {
   const record = buildSessionUserMessageRecord({
     text: params.text,
@@ -114,28 +130,21 @@ export async function admitSessionUserMessageToPendingQueue(params: Readonly<{
 
   const requestedAction = params.requestedAction ?? { v: 1, kind: 'steer_if_active' as const };
 
+  const candidate: SessionUserMessageAdmissionBody = content.t === 'encrypted'
+    ? { localId: params.localId, ciphertext: content.c, messageRole: 'user', requestedAction,
+        ...(params.pendingAdmissionMode ? { deliveryMode: params.pendingAdmissionMode } : {}) }
+    : { localId: params.localId, content, messageRole: 'user', requestedAction,
+        ...(params.pendingAdmissionMode ? { deliveryMode: params.pendingAdmissionMode } : {}) };
+  // Persist the exact first envelope before its first possible issuance. A
+  // lost ACK must reconcile those bytes, independent of newer session settings.
+  const body = params.preserveAdmission ? await params.preserveAdmission(candidate) : candidate;
+  if (body.localId !== params.localId) throw new Error('session_admission_identity_changed');
   params.assertCanAdmit?.();
 
   let enqueueResult: Awaited<ReturnType<typeof enqueuePendingQueueV2MessageViaHttp>>;
   try {
     enqueueResult = await enqueuePendingQueueV2MessageViaHttp({
-      token: params.credentials.token,
-      sessionId: params.sessionId,
-      body: content.t === 'encrypted'
-        ? {
-            localId: params.localId,
-            ciphertext: content.c,
-            messageRole: 'user',
-            requestedAction,
-            ...(params.pendingAdmissionMode ? { deliveryMode: params.pendingAdmissionMode } : {}),
-          }
-        : {
-            localId: params.localId,
-            content,
-            messageRole: 'user',
-            requestedAction,
-            ...(params.pendingAdmissionMode ? { deliveryMode: params.pendingAdmissionMode } : {}),
-          },
+      token: params.credentials.token, sessionId: params.sessionId, body,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error ?? '');

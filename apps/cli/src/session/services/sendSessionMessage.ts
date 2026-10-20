@@ -1,3 +1,4 @@
+import type { SessionUserMessageAdmissionBody } from '@/session/services/admitSessionUserMessage';
 import { randomUUID } from 'node:crypto';
 
 import {
@@ -442,6 +443,7 @@ export async function sendSessionMessage(params: Readonly<{
   requestedAction?: PendingRequestedActionV1;
   pendingAdmissionMode?: 'continuation_if_no_queued_user_input';
   assertCanAdmit?: () => void;
+  preserveAdmission?: (body: SessionUserMessageAdmissionBody) => Promise<SessionUserMessageAdmissionBody>;
 }>): Promise<SendSessionMessageResult> {
   const sessionTarget = await resolveSessionTransportContext({
     credentials: params.credentials,
@@ -494,6 +496,7 @@ export async function sendSessionMessage(params: Readonly<{
     text: params.message,
     permissionIntent,
     modelId,
+    ...(params.preserveAdmission ? { preserveAdmission: params.preserveAdmission } : {}),
     ...(params.assertCanAdmit ? { assertCanAdmit: params.assertCanAdmit } : {}),
     ...(params.requestedAction ? { requestedAction: params.requestedAction } : {}),
     ...(params.pendingAdmissionMode ? { pendingAdmissionMode: params.pendingAdmissionMode } : {}),

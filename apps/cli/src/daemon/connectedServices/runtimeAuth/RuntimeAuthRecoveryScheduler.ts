@@ -1,3 +1,4 @@
+import { readSessionUserMessageAdmissionBody, type SessionUserMessageAdmissionBody } from '@/session/services/admitSessionUserMessage';
 import type { DaemonServerWorkErrorClassification, DaemonServerWorkErrorKind } from '@/daemon/serverWork/types';
 import { isDeepStrictEqual } from 'node:util';
 import { classifyDaemonServerWorkError } from '@/daemon/serverWork/classifyDaemonServerWorkError';
@@ -64,6 +65,7 @@ type RuntimeAuthLimitResetTrial = Readonly<{
   admissionAttemptCount: number;
   resumePromptMode: 'standard' | 'off' | 'custom';
   customResumePrompt: string | null;
+  admissionBody?: SessionUserMessageAdmissionBody;
 }>;
 
 export type RuntimeAuthRecoveryIntent = Readonly<{
@@ -155,6 +157,7 @@ export type RuntimeAuthLimitResetRetryInput = Readonly<{
   resumePromptMode: 'standard' | 'off' | 'custom';
   customResumePrompt: string | null;
   isCurrent: () => boolean;
+  preserveAdmission?: (body: SessionUserMessageAdmissionBody) => Promise<SessionUserMessageAdmissionBody>;
 }>;
 
 export type RuntimeAuthLimitResetRetryResult =
@@ -268,6 +271,7 @@ function readLimitResetTrial(value: unknown): RuntimeAuthLimitResetTrial | null 
     || !Number.isSafeInteger(trial.admissionAttemptCount) || (trial.admissionAttemptCount as number) < 1
     || !['standard', 'off', 'custom'].includes(trial.resumePromptMode as string)
     || (trial.customResumePrompt !== null && typeof trial.customResumePrompt !== 'string')) return null;
+  if (trial.admissionBody !== undefined && !readSessionUserMessageAdmissionBody(trial.admissionBody)) return null;
   return trial as RuntimeAuthLimitResetTrial;
 }
 
@@ -979,6 +983,11 @@ function mergeRuntimeAuthRecoveryIntent(
     // handler intake whose producer does not have a durable provider report id.
     return incoming;
   }
+  // A report ID is an intake identity, not proof that an ambiguously admitted
+  // trial completed. Keep its custody and finite reconciliation budget even
+  // after exhaustion or daemon restart; replay/older intake cannot replace it.
+  // Confirmed handoff clears the trial, allowing genuine subsequent outcomes.
+  if (previous.limitResetTrial) return previous;
   if (previous.status === 'cancelled' || previous.status === 'exhausted') {
     if (previous.attemptId === incoming.attemptId) return previous;
     // Only a fresh in-band provider report owns a new recovery epoch. A later handler/apply
@@ -990,12 +999,10 @@ function mergeRuntimeAuthRecoveryIntent(
   const previousProviderReportAttemptId = previous.limitResetLastProviderReportAttemptId ?? previous.attemptId;
   const freshProviderOutcome = limitResetIntake && incoming.lastSettledTransition === 'working'
     && incoming.attemptId !== previousProviderReportAttemptId;
-  const unresolvedTrial = previous.limitResetTrial && !freshProviderOutcome ? previous.limitResetTrial : undefined;
   const incomingWithTrial = {
     ...incoming,
     ...(limitResetIntake ? { limitResetLastProviderReportAttemptId: freshProviderOutcome
       ? incoming.attemptId : previousProviderReportAttemptId } : {}),
-    ...(unresolvedTrial ? { limitResetTrial: unresolvedTrial } : {}),
   };
   const next = previous.limitResetRetryCount !== undefined
     && previous.groupId === null && incoming.groupId === null
@@ -1156,8 +1163,15 @@ function mergeRuntimeAuthRecoveryWakeWrite(input: Readonly<{
   const claimedPolicy = normalizeIntent(input.base);
   // Delivery acknowledgments mutate this outbox during provider work. They
   // change no recovery policy and must neither cause a retry nor be resurrected.
-  const { pendingVisibleEvents: _currentOutbox, ...currentFields } = currentPolicy ?? {};
-  const { pendingVisibleEvents: _claimedOutbox, ...claimedFields } = claimedPolicy ?? {};
+  const withoutAdmissionBody = (policy: RuntimeAuthRecoveryIntent | null) => {
+    if (!policy) return {};
+    const { pendingVisibleEvents: _outbox, ...fields } = policy;
+    if (!fields.limitResetTrial) return fields;
+    const { admissionBody: _body, ...trial } = fields.limitResetTrial;
+    return { ...fields, limitResetTrial: trial };
+  };
+  const currentFields = withoutAdmissionBody(currentPolicy);
+  const claimedFields = withoutAdmissionBody(claimedPolicy);
   if (input.reason === 'waiting'
     && !isDeepStrictEqual(currentFields, claimedFields)) {
     // Observations no longer claim or settle. A real attempt may install its
@@ -1470,6 +1484,22 @@ export class RuntimeAuthRecoveryScheduler {
               classification: intent.classification,
               resumePromptMode: intent.limitResetTrial.resumePromptMode,
               customResumePrompt: intent.limitResetTrial.customResumePrompt,
+              preserveAdmission: async (candidate) => {
+                const key = buildRecoveryKeyForIntent(intent);
+                const settlement = await this.scheduler.upsertConditionallyByKey({
+                  sessionId: intent.sessionId, recoveryKey: key, intent,
+                  expectedCurrent: (current) => !this.disposed && current.status === 'checking'
+                    && current.attemptId === intent.attemptId
+                    && current.limitResetTrial?.retryCount === intent.limitResetTrial!.retryCount,
+                  merge: (current) => ({ ...current, limitResetTrial: { ...current.limitResetTrial!,
+                    admissionBody: current.limitResetTrial!.admissionBody ?? candidate } }),
+                });
+                if (settlement.status !== 'settled' || !settlement.intent.limitResetTrial?.admissionBody) {
+                  throw new Error('limit_reset_recovery_no_longer_current');
+                }
+                intent = settlement.intent;
+                return intent.limitResetTrial!.admissionBody!;
+              },
               isCurrent: () => {
                 const current = this.readByKey(buildRecoveryKeyForIntent(intent));
                 return !this.disposed && current?.status === 'checking'

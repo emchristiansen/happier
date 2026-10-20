@@ -53,7 +53,9 @@ export class ConnectedServiceSessionAuthSwitchLockRegistry {
   }
 
   clearSession(sessionId: string): void {
-    this.tailsBySessionId.delete(sessionId);
+    // Runner exit is not cancellation of an in-flight auth transition. Its
+    // finally block owns release, including switches already queued behind it.
+    if (this.tailsBySessionId.has(sessionId)) return;
     this.activeOwnerIdsBySessionId.delete(sessionId);
   }
 

@@ -40,6 +40,7 @@ export async function retryRuntimeAuthLimitAfterReset(input: RuntimeAuthLimitRes
         tracked, sessionId: input.sessionId, credentials: input.credentials, readCredentials: input.readCredentials,
         ...(input.resolveRespawnOptions ? { resolveRespawnOptions: input.resolveRespawnOptions } : {}),
         spawnSession: async (options) => { assertCurrent(); return await input.spawnSession(options); },
+        ...(input.preserveAdmission ? { preserveAdmission: input.preserveAdmission } : {}),
         assertCanAdmit: () => { assertCurrent(); admissionStarted = true; },
         sendMessage: async (request) => { assertCurrent(); return await (input.sendMessage ?? sendSessionMessage)(request); },
         // Pending identifies this claimed provider trial; later trials use a new identity.

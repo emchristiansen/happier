@@ -34,7 +34,7 @@ function deferred() {
 }
 
 function harness(input: { lookupGate?: () => Promise<void>; loseAcknowledgement?: boolean; acceptFirst?: boolean;
-  alwaysLoseAcknowledgement?: boolean; loseAcknowledgementAttempts?: ReadonlyArray<number>; postGate?: () => Promise<void>;
+  alwaysLoseAcknowledgement?: boolean; alwaysLoseAcknowledgementAfterFirst?: boolean; loseAcknowledgementAttempts?: ReadonlyArray<number>; postGate?: () => Promise<void>;
   durableStore?: ConstructorParameters<typeof RuntimeAuthRecoveryScheduler>[0]['durableStore'];
   terminal?: Map<string, unknown>; mode?: 'standard' | 'custom'; } = {}) {
   vi.useFakeTimers();
@@ -59,7 +59,7 @@ function harness(input: { lookupGate?: () => Promise<void>; loseAcknowledgement?
   const post = vi.spyOn(axios, 'post').mockImplementation(async (url, body: any) => {
     if (!String(url).endsWith(`/v2/sessions/${sessionId}/pending`)) throw new Error(`Unexpected HTTP POST: ${url}`);
     await input.postGate?.();
-    if (input.alwaysLoseAcknowledgement) {
+    if (input.alwaysLoseAcknowledgement || (input.alwaysLoseAcknowledgementAfterFirst && post.mock.calls.length > 1)) {
       terminal.set(body.localId, body);
       throw new Error('timeout after Pending POST');
     }
@@ -104,6 +104,7 @@ function harness(input: { lookupGate?: () => Promise<void>; loseAcknowledgement?
       expectedAttemptId: intake.attemptId });
   };
   return { scheduler, post, terminal, spawnSession, switchCore, reportLimit,
+    setMetadata: (metadata: unknown) => { session.metadata = JSON.stringify(metadata); },
     setCustomPrompt: (value: string) => { customResumePrompt = value; },
     setBinding: (nextProfile: string, nextGroup: string | null = null, revision = credentialRevision) => {
       profileId = nextProfile; groupId = nextGroup; credentialRevision = revision;
@@ -166,6 +167,7 @@ describe('expired limit trial admission and source ownership', () => {
     const first = harness({ loseAcknowledgement: true, terminal, mode: 'custom',
       durableStore: createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(path) });
     try {
+      first.setMetadata({ permissionMode: 'default', modelOverrideV1: { v: 1, modelId: 'original-model', updatedAt: 1 } });
       await first.arm(); await first.wake();
       const originalBody = first.post.mock.calls[0]?.[1];
       expect(first.scheduler.readByKey(recoveryKey)?.limitResetTrial).toMatchObject({ retryCount: 1, admissionAttemptCount: 1 });
@@ -173,6 +175,7 @@ describe('expired limit trial admission and source ownership', () => {
       const second = harness({ terminal, mode: 'custom', durableStore: createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(path) });
       try {
         second.setCustomPrompt('An updated preference must not change an unresolved input.');
+        second.setMetadata({ permissionMode: 'bypassPermissions', modelOverrideV1: { v: 1, modelId: 'newer-model', updatedAt: 2 } });
         second.scheduler.hydratePassive(); await second.wake();
         expect(second.post.mock.calls[0]?.[1]).toEqual(originalBody);
         expect(terminal.size).toBe(1);
@@ -230,6 +233,41 @@ describe('expired limit trial admission and source ownership', () => {
   });
 
 
+  it('retains lane ownership across normal runner exit while transport lookup is suspended', async () => {
+    const entered = deferred(); const release = deferred();
+    const h = harness({ lookupGate: async () => { entered.resolve(); await release.promise; } });
+    let manualEntered = false;
+    try {
+      await h.arm(); const wake = h.wake(); await entered.promise;
+      h.switchCore.clearSession(sessionId);
+      const manual = h.switchCore.run({ sessionId, reason: 'manual', execute: async () => {
+        manualEntered = true; h.setBinding('secondary');
+      } });
+      // Drain the microtask handoff used by runExclusive, without releasing lookup.
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+      expect(manualEntered).toBe(false);
+      release.resolve(); await wake; await manual;
+      expect(h.post).toHaveBeenCalledTimes(1);
+      expect(manualEntered).toBe(true);
+    } finally { release.resolve(); h.scheduler.dispose(); }
+  });
+
+  it('reconciles the original admission meaning after model and permission settings change', async () => {
+    const h = harness({ loseAcknowledgement: true });
+    try {
+      h.setMetadata({ permissionMode: 'default', modelOverrideV1: { v: 1, modelId: 'first-model', updatedAt: 1 } });
+      await h.arm(); await h.wake();
+      const original = h.post.mock.calls[0]?.[1];
+      h.setMetadata({ permissionMode: 'bypassPermissions', modelOverrideV1: { v: 1, modelId: 'second-model', updatedAt: 2 } });
+      await h.wake();
+      expect(h.post.mock.calls[1]?.[1]).toEqual(original);
+      expect(h.scheduler.readByKey(recoveryKey)?.status).toBe('resumed_awaiting_proof');
+      await h.reportLimit('confirmed-next-outcome'); await h.wake();
+      expect(h.post.mock.calls[2]?.[1]).toMatchObject({ content: { v: { meta: { model: 'second-model', permissionMode: 'yolo' } } } });
+      expect(h.terminal.size).toBe(2);
+    } finally { h.scheduler.dispose(); }
+  });
+
   it('keeps Off terminal without resolving the old source or runner', async () => {
     const authorizeSource = vi.fn(async () => { throw new Error('source unavailable'); });
     const resolveResumeSource = vi.fn(async () => null);
@@ -244,8 +282,59 @@ describe('expired limit trial admission and source ownership', () => {
   });
 
 
+  it('does not replace unconfirmed custody with an arbitrary different provider report', async () => {
+    const h = harness({ loseAcknowledgement: true });
+    try {
+      await h.arm(); await h.wake();
+      const original = h.post.mock.calls[0]?.[1];
+      await h.reportLimit('different-or-delayed-report'); await h.wake();
+      expect(h.terminal.size).toBe(1);
+      expect(h.post.mock.calls[1]?.[1]).toEqual(original);
+      expect(h.scheduler.readByKey(recoveryKey)?.limitResetRetryCount).toBe(1);
+    } finally { h.scheduler.dispose(); }
+  });
+
+  it('retains terminal unresolved custody through durable hydration and report replay', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'limit-terminal-replay-'));
+    const path = join(directory, 'recovery.json');
+    const terminal = new Map<string, unknown>();
+    const first = harness({ alwaysLoseAcknowledgementAfterFirst: true, terminal,
+      durableStore: createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(path) });
+    try {
+      await first.arm(); await first.wake();
+      await first.reportLimit('report-B');
+      for (let i = 0; i < 4; i++) await first.wake();
+      const exhausted = first.scheduler.readByKey(recoveryKey);
+      expect(exhausted).toMatchObject({ status: 'exhausted', limitResetRetryCount: 2,
+        limitResetTrial: { retryCount: 2, admissionAttemptCount: 3 } });
+      first.scheduler.dispose(); vi.restoreAllMocks();
+      const second = harness({ terminal, durableStore: createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(path) });
+      try {
+        second.scheduler.hydratePassive();
+        await second.reportLimit('report-B'); await second.wake();
+        await second.reportLimit('older-unseen-report'); await second.wake();
+        expect(second.post).not.toHaveBeenCalled();
+        expect(terminal.size).toBe(2);
+        expect(second.scheduler.readByKey(recoveryKey)).toEqual(exhausted);
+      } finally { second.scheduler.dispose(); }
+    } finally { first.scheduler.dispose(); await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it('allows a new failure epoch after actual positive-proof settlement of unresolved custody', async () => {
+    const h = harness({ alwaysLoseAcknowledgement: true });
+    try {
+      await h.arm(); for (let i = 0; i < 4; i++) await h.wake();
+      expect(h.scheduler.readByKey(recoveryKey)?.status).toBe('exhausted');
+      await h.scheduler.markProviderOutcomeProofByKey({ recoveryKey, proofKind: 'provider_activity' });
+      expect(h.scheduler.readByKey(recoveryKey)?.status).toBe('recovered');
+      await h.reportLimit('new-failure-after-positive-proof'); await h.wake();
+      expect(h.terminal.size).toBe(2);
+      expect(h.scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'waiting', limitResetRetryCount: 1 });
+    } finally { h.scheduler.dispose(); }
+  });
+
   it('does not mistake a duplicate provider report for another outcome while admission is unconfirmed', async () => {
-    const h = harness({ loseAcknowledgementAttempts: [1, 2] });
+    const h = harness({ loseAcknowledgementAttempts: [2] });
     try {
       await h.arm(); await h.wake();
       await h.reportLimit('fresh-provider-report'); await h.wake();
