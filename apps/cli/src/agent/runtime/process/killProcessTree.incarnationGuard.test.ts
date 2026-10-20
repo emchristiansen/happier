@@ -3,70 +3,168 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 const psListMock = vi.hoisted(() => vi.fn<() => Promise<Array<{ pid: number; ppid: number; name: string }>>>());
 vi.mock('ps-list', () => ({ default: psListMock }));
 
-import { killProcessTree } from './killProcessTree';
+import { killProcessTree, killProcessTreeGuarded, type ProcessTreeRootIdentity } from './killProcessTree';
 
 const ROOT_PID = 910_001;
 const CHILD_PID = 910_002;
+const NO_RETRY_WAIT = [1, 1, 1] as const;
 
 type SignalCall = readonly [pid: number, signal: NodeJS.Signals | number | undefined];
 
-/** Records every non-probe signal; signal 0 (liveness) always reports alive, so escalation is reached. */
-function spyOnSignals(): { calls: SignalCall[]; restore: () => void } {
+/**
+ * Simulated OS boundary: records every non-probe signal, answers liveness (signal 0) from `alive`,
+ * and lets each test react to a signal (a root exiting on SIGTERM, a pid being reused, ...).
+ */
+function simulateProcesses(params: Readonly<{
+  alive: Set<number>;
+  onSignal?: (pid: number, signal: NodeJS.Signals | number | undefined) => void;
+}>): { calls: SignalCall[] } {
   const calls: SignalCall[] = [];
-  const spy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
-    if (signal !== 0) calls.push([pid, signal]);
+  vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+    if (signal === 0) {
+      if (!params.alive.has(pid)) throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+      return true;
+    }
+    calls.push([pid, signal]);
+    params.onSignal?.(pid, signal);
     return true;
   }) as typeof process.kill);
-  return { calls, restore: () => spy.mockRestore() };
+  return { calls };
 }
 
-describe('killProcessTree root incarnation guard', () => {
+const rootSignals = (calls: readonly SignalCall[]) => calls.filter(([pid]) => pid === ROOT_PID).map(([, signal]) => signal);
+const childSignals = (calls: readonly SignalCall[]) => calls.filter(([pid]) => pid === CHILD_PID).map(([, signal]) => signal);
+
+describe('killProcessTree root identity guard', () => {
   afterEach(() => {
     psListMock.mockReset();
     vi.restoreAllMocks();
   });
 
-  it('still escalates to SIGKILL without a guard (ordinary cleanup unchanged)', async () => {
+  it('keeps unguarded cleanup exactly as before', async () => {
     if (process.platform === 'win32') return;
     psListMock.mockResolvedValue([{ pid: CHILD_PID, ppid: ROOT_PID, name: 'child' }]);
-    const signals = spyOnSignals();
+    const { calls } = simulateProcesses({ alive: new Set([ROOT_PID, CHILD_PID]) });
 
-    await killProcessTree({ pid: ROOT_PID }, { graceMs: 1 });
-    signals.restore();
+    await expect(killProcessTree({ pid: ROOT_PID }, { graceMs: 1 })).resolves.toBeUndefined();
 
-    expect(signals.calls).toEqual(expect.arrayContaining([
+    expect(calls).toEqual([
       [ROOT_PID, 'SIGSTOP'],
       [CHILD_PID, 'SIGTERM'],
       [ROOT_PID, 'SIGCONT'],
       [ROOT_PID, 'SIGTERM'],
       [CHILD_PID, 'SIGKILL'],
       [ROOT_PID, 'SIGKILL'],
-    ]));
+    ]);
   });
 
-  it('sends no SIGKILL when the root incarnation changes between SIGTERM and the escalation decision', async () => {
+  it('still kills a surviving child when the root exits normally during the grace wait', async () => {
     if (process.platform === 'win32') return;
     psListMock.mockResolvedValue([{ pid: CHILD_PID, ppid: ROOT_PID, name: 'child' }]);
-    const signals = spyOnSignals();
+    const alive = new Set([ROOT_PID, CHILD_PID]);
+    // The root exits on SIGTERM; the child ignores SIGTERM.
+    const { calls } = simulateProcesses({
+      alive,
+      onSignal: (pid, signal) => { if (pid === ROOT_PID && signal === 'SIGTERM') alive.delete(ROOT_PID); },
+    });
+    const readRootIdentity = (): ProcessTreeRootIdentity => (alive.has(ROOT_PID) ? 'same' : 'not_same');
+
+    await expect(killProcessTreeGuarded({ pid: ROOT_PID }, {
+      graceMs: 1, readRootIdentity, unreadableRetryDelaysMs: NO_RETRY_WAIT,
+    })).resolves.toBe('completed');
+
+    expect(childSignals(calls)).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(rootSignals(calls)).toEqual(['SIGSTOP', 'SIGCONT', 'SIGTERM']);
+  });
+
+  it('completes normally when an unreadable identity after SIGSTOP recovers on retry', async () => {
+    if (process.platform === 'win32') return;
+    psListMock.mockResolvedValue([{ pid: CHILD_PID, ppid: ROOT_PID, name: 'child' }]);
+    const { calls } = simulateProcesses({ alive: new Set([ROOT_PID, CHILD_PID]) });
+    let unreadableReadsLeft = 2;
+    const readRootIdentity = vi.fn((): ProcessTreeRootIdentity => {
+      if (rootSignals(calls).includes('SIGSTOP') && unreadableReadsLeft > 0) {
+        unreadableReadsLeft -= 1;
+        return 'unreadable';
+      }
+      return 'same';
+    });
+
+    await expect(killProcessTreeGuarded({ pid: ROOT_PID }, {
+      graceMs: 1, readRootIdentity, unreadableRetryDelaysMs: NO_RETRY_WAIT,
+    })).resolves.toBe('completed');
+
+    expect(rootSignals(calls)).toEqual(['SIGSTOP', 'SIGCONT', 'SIGTERM', 'SIGKILL']);
+    expect(childSignals(calls)).toEqual(['SIGTERM', 'SIGKILL']);
+  });
+
+  it('leaves a root it cannot re-identify suspended, sends it nothing more, and reports that', async () => {
+    if (process.platform === 'win32') return;
+    psListMock.mockResolvedValue([{ pid: CHILD_PID, ppid: ROOT_PID, name: 'child' }]);
+    const { calls } = simulateProcesses({ alive: new Set([ROOT_PID, CHILD_PID]) });
+    const readRootIdentity = vi.fn((): ProcessTreeRootIdentity => (rootSignals(calls).includes('SIGSTOP') ? 'unreadable' : 'same'));
+
+    await expect(killProcessTreeGuarded({ pid: ROOT_PID }, {
+      graceMs: 1, readRootIdentity, unreadableRetryDelaysMs: NO_RETRY_WAIT,
+    })).resolves.toBe('root_unreadable_suspended');
+
+    expect(rootSignals(calls)).toEqual(['SIGSTOP']);
+    // Descendants captured under the verified, stopped root keep their cleanup.
+    expect(childSignals(calls)).toEqual(['SIGTERM', 'SIGKILL']);
+    // The bounded retry ran before settling: the pre-SIGSTOP read, then the first post-SIGSTOP read and its retries.
+    expect(readRootIdentity.mock.calls.length).toBe(1 + 1 + NO_RETRY_WAIT.length);
+  });
+
+  it('sends no root SIGKILL after pid reuse, still handles descendants, and reports root_not_same', async () => {
+    if (process.platform === 'win32') return;
+    psListMock.mockResolvedValue([{ pid: CHILD_PID, ppid: ROOT_PID, name: 'child' }]);
+    let rootReused = false;
+    // The root exits on SIGTERM and its pid is immediately reused by a live, unrelated process.
+    const { calls } = simulateProcesses({
+      alive: new Set([ROOT_PID, CHILD_PID]),
+      onSignal: (pid, signal) => { if (pid === ROOT_PID && signal === 'SIGTERM') rootReused = true; },
+    });
+
+    await expect(killProcessTreeGuarded({ pid: ROOT_PID }, {
+      graceMs: 1,
+      readRootIdentity: () => (rootReused ? 'not_same' : 'same'),
+      unreadableRetryDelaysMs: NO_RETRY_WAIT,
+    })).resolves.toBe('root_not_same');
+
+    expect(rootSignals(calls)).toEqual(['SIGSTOP', 'SIGCONT', 'SIGTERM']);
+    expect(childSignals(calls)).toEqual(['SIGTERM', 'SIGKILL']);
+  });
+
+  it('keeps descendant cleanup when the root is replaced during enumeration', async () => {
+    if (process.platform === 'win32') return;
     let rootReplaced = false;
-    const isRootIncarnation = vi.fn(() => !rootReplaced);
-    // The root exits on SIGTERM and its pid is reused by another process before escalation.
-    vi.mocked(process.kill).mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
-      if (signal !== 0) signals.calls.push([pid, signal]);
-      if (pid === ROOT_PID && signal === 'SIGTERM') rootReplaced = true;
-      return true;
-    }) as typeof process.kill);
+    psListMock.mockImplementation(async () => {
+      rootReplaced = true;
+      return [{ pid: CHILD_PID, ppid: ROOT_PID, name: 'child' }];
+    });
+    const { calls } = simulateProcesses({ alive: new Set([ROOT_PID, CHILD_PID]) });
 
-    await killProcessTree({ pid: ROOT_PID }, { graceMs: 1, isRootIncarnation });
-    signals.restore();
+    await expect(killProcessTreeGuarded({ pid: ROOT_PID }, {
+      graceMs: 1,
+      readRootIdentity: () => (rootReplaced ? 'not_same' : 'same'),
+      unreadableRetryDelaysMs: NO_RETRY_WAIT,
+    })).resolves.toBe('root_not_same');
 
-    expect(signals.calls).toEqual([
-      [ROOT_PID, 'SIGSTOP'],
-      [CHILD_PID, 'SIGTERM'],
-      [ROOT_PID, 'SIGCONT'],
-      [ROOT_PID, 'SIGTERM'],
-    ]);
-    expect(isRootIncarnation).toHaveBeenCalled();
+    expect(rootSignals(calls)).toEqual(['SIGSTOP']);
+    expect(childSignals(calls)).toEqual(['SIGTERM', 'SIGKILL']);
+  });
+
+  it('signals nothing when the root is already another process', async () => {
+    if (process.platform === 'win32') return;
+    psListMock.mockResolvedValue([{ pid: CHILD_PID, ppid: ROOT_PID, name: 'child' }]);
+    const { calls } = simulateProcesses({ alive: new Set([ROOT_PID, CHILD_PID]) });
+
+    await expect(killProcessTreeGuarded({ pid: ROOT_PID }, {
+      graceMs: 1, readRootIdentity: () => 'not_same', unreadableRetryDelaysMs: NO_RETRY_WAIT,
+    })).resolves.toBe('root_not_same');
+
+    expect(calls).toEqual([]);
+    expect(psListMock).not.toHaveBeenCalled();
   });
 
   it('evaluates the guard immediately before every root signal', async () => {
@@ -77,43 +175,17 @@ describe('killProcessTree root incarnation guard', () => {
       if (signal !== 0) order.push(`${pid}:${String(signal)}`);
       return true;
     }) as typeof process.kill);
-    const isRootIncarnation = vi.fn(() => {
-      order.push('guard');
-      return true;
-    });
 
-    await killProcessTree({ pid: ROOT_PID }, { graceMs: 1, isRootIncarnation });
+    await expect(killProcessTreeGuarded({ pid: ROOT_PID }, {
+      graceMs: 1,
+      readRootIdentity: () => { order.push('guard'); return 'same'; },
+      unreadableRetryDelaysMs: NO_RETRY_WAIT,
+    })).resolves.toBe('completed');
 
     for (const signal of ['SIGSTOP', 'SIGCONT', 'SIGTERM', 'SIGKILL']) {
       const index = order.indexOf(`${ROOT_PID}:${signal}`);
       expect(index, signal).toBeGreaterThan(0);
       expect(order[index - 1], signal).toBe('guard');
     }
-  });
-
-  it('signals nothing at all when the root is already another incarnation', async () => {
-    if (process.platform === 'win32') return;
-    psListMock.mockResolvedValue([{ pid: CHILD_PID, ppid: ROOT_PID, name: 'child' }]);
-    const signals = spyOnSignals();
-
-    await killProcessTree({ pid: ROOT_PID }, { graceMs: 1, isRootIncarnation: () => false });
-    signals.restore();
-
-    expect(signals.calls).toEqual([]);
-  });
-
-  it('sends descendants nothing once the root guard fails during enumeration', async () => {
-    if (process.platform === 'win32') return;
-    let rootReplaced = false;
-    psListMock.mockImplementation(async () => {
-      rootReplaced = true;
-      return [{ pid: CHILD_PID, ppid: ROOT_PID, name: 'child' }];
-    });
-    const signals = spyOnSignals();
-
-    await killProcessTree({ pid: ROOT_PID }, { graceMs: 1, isRootIncarnation: () => !rootReplaced });
-    signals.restore();
-
-    expect(signals.calls).toEqual([[ROOT_PID, 'SIGSTOP']]);
   });
 });

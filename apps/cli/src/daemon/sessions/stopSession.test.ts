@@ -1617,10 +1617,43 @@ describe('createStopSession', () => {
         waitForTrackedRunnersExit,
         readProcessInstanceFingerprint: () => (rootSigterms >= 2 ? 'linux-proc:reused' : 'linux-proc:111'),
       });
-      await expect(stop('sess-1', { exactRunner })).resolves.toEqual({ status: 'incomplete', reason: 'runner_exit_timeout' });
+      // Stopping signalling a reused pid is not completed cleanup: replacement must not spawn.
+      await expect(stop('sess-1', { exactRunner })).resolves.toEqual({ status: 'incomplete', reason: 'runner_signal_incomplete' });
 
       expect(rootSigterms).toBe(2);
       expect(killSpy.mock.calls.filter(([, signal]) => signal === 'SIGKILL')).toEqual([]);
+      killSpy.mockRestore();
+    });
+
+    it('reports an incomplete Stop, loudly, when a suspended exact runner cannot be re-identified', async () => {
+      if (process.platform === 'win32') return;
+      const { createStopSession } = await import('./stopSession');
+      isPidSafeHappySessionProcess.mockReset();
+      isPidSafeHappySessionProcess.mockResolvedValue(true);
+      const signals: Array<[number, unknown]> = [];
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+        if (signal !== 0) signals.push([pid, signal]);
+        return true;
+      }) as typeof process.kill);
+      const logWarning = vi.fn();
+      const pidToTrackedSession = new Map<number, any>([
+        [111, { startedBy: 'terminal', pid: 111, happySessionId: 'sess-1', processCommandHash: 'h1' }],
+      ]);
+      const waitForTrackedRunnersExit = vi.fn(async () => false);
+
+      const stop = createStopSession({
+        pidToTrackedSession,
+        waitForTrackedRunnersExit,
+        logWarning,
+        // The runner is alive, but after SIGSTOP its instance can no longer be read.
+        readProcessInstanceFingerprint: () => (signals.some(([, signal]) => signal === 'SIGSTOP') ? null : 'linux-proc:111'),
+      });
+      await expect(stop('sess-1', { exactRunner })).resolves.toEqual({ status: 'incomplete', reason: 'runner_signal_incomplete' });
+
+      const rootSignalsAfterGraceful = signals.filter(([pid]) => pid === 111).map(([, signal]) => signal);
+      expect(rootSignalsAfterGraceful).toEqual(['SIGTERM', 'SIGSTOP']);
+      expect(waitForTrackedRunnersExit).toHaveBeenCalledTimes(1);
+      expect(logWarning).toHaveBeenCalledWith(expect.stringMatching(/PID 111.*sess-1.*SIGSTOP|sess-1.*PID 111.*SIGSTOP/));
       killSpy.mockRestore();
     });
 

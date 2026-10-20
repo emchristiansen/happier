@@ -17,7 +17,11 @@ import {
 import { buildLegacyTerminalAttachmentHostHandle } from '@/terminal/attachment/legacyTerminalAttachmentHandle';
 import { evaluateTerminalHostLivenessForRecovery } from '@/integrations/terminalHost/livenessPolicy';
 import { configuration } from '@/configuration';
-import { killProcessTree } from '@/agent/runtime/process/killProcessTree';
+import {
+  killProcessTree,
+  killProcessTreeGuarded,
+  type ProcessTreeRootIdentity,
+} from '@/agent/runtime/process/killProcessTree';
 
 import {
   processInstanceFingerprintMatches,
@@ -50,15 +54,51 @@ function isTrackedChildStillLiveForPid(session: TrackedSession, pid: number): bo
   return true;
 }
 
-/** Synchronous check that a pid is still the exact runner incarnation; evaluated right before a signal. */
-type ExactRunnerInstanceGuard = (pid: number) => boolean;
+/**
+ * Synchronous identity of a pid against the exact runner incarnation, read right before a signal:
+ * `unreadable` means the process is alive but its instance cannot be established right now.
+ */
+type ExactRunnerIdentityReader = (pid: number) => ProcessTreeRootIdentity;
+
+function fingerprintScheme(fingerprint: string): string {
+  const separator = fingerprint.indexOf(':');
+  return separator > 0 ? fingerprint.slice(0, separator) : '';
+}
+
+function isProcessAliveDefault(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException | null)?.code === 'EPERM';
+  }
+}
+
+/** Never infers `not_same` from a failed read while the pid is alive. */
+function createExactRunnerIdentityReader(params: Readonly<{
+  exactRunner: ExactStopRunner;
+  readProcessInstanceFingerprint: (pid: number) => string | null;
+  isProcessAlive: (pid: number) => boolean;
+}>): ExactRunnerIdentityReader {
+  const expected = params.exactRunner.processInstanceFingerprint;
+  return (pid) => {
+    if (pid !== params.exactRunner.pid) return 'not_same';
+    const observed = String(params.readProcessInstanceFingerprint(pid) ?? '').trim();
+    if (processInstanceFingerprintMatches(expected, observed)) return 'same';
+    if (!params.isProcessAlive(pid)) return 'not_same';
+    // A different value under the same scheme is a positively different instance. A missing value,
+    // or one from another scheme (such as the `ps` fallback), says nothing about which process it is.
+    if (observed && fingerprintScheme(observed) === fingerprintScheme(expected)) return 'not_same';
+    return 'unreadable';
+  };
+}
 
 async function taskkillWindowsDaemonChild(params: Readonly<{
   pid: number;
   session: TrackedSession;
   normalizedSessionId: string;
   logPidReuseRefusal: (message: string) => void;
-  isExactRunnerInstance?: ExactRunnerInstanceGuard;
+  readExactRunnerIdentity?: ExactRunnerIdentityReader;
 }>): Promise<boolean> {
   if (!isTrackedChildStillLiveForPid(params.session, params.pid)) {
     params.logPidReuseRefusal(`[DAEMON RUN] Refusing to taskkill PID ${params.pid} for session ${params.normalizedSessionId} (tracked child is no longer live)`);
@@ -75,7 +115,7 @@ async function taskkillWindowsDaemonChild(params: Readonly<{
     return false;
   }
   // The safety check above awaited; an exact runner must still hold immediately before taskkill.
-  if (params.isExactRunnerInstance && !params.isExactRunnerInstance(params.pid)) {
+  if (params.readExactRunnerIdentity && params.readExactRunnerIdentity(params.pid) !== 'same') {
     params.logPidReuseRefusal(`[DAEMON RUN] Refusing to taskkill PID ${params.pid} for session ${params.normalizedSessionId} (exact runner instance changed)`);
     return false;
   }
@@ -106,15 +146,16 @@ async function forceKillTrackedRunner(params: Readonly<{
   pidToTrackedSession: ReadonlyMap<number, TrackedSession>;
   normalizedSessionId: string;
   logPidReuseRefusal: (message: string) => void;
+  logWarning: (message: string, ...args: unknown[]) => void;
   exactRunner?: ExactStopRunner;
-  isExactRunnerInstance?: ExactRunnerInstanceGuard;
-}>): Promise<boolean> {
+  readExactRunnerIdentity?: ExactRunnerIdentityReader;
+}>): Promise<ForcedRunnerKillResult> {
   const currentSession = params.pidToTrackedSession.get(params.pid);
   if (currentSession !== params.expectedSession) {
     params.logPidReuseRefusal(
       `[DAEMON RUN] Refusing to SIGKILL PID ${params.pid} for session ${params.normalizedSessionId} (tracked runner identity changed)`,
     );
-    return false;
+    return 'not_signaled';
   }
 
   const safe = await isPidSafeHappySessionProcess(params.exactRunner
@@ -128,7 +169,7 @@ async function forceKillTrackedRunner(params: Readonly<{
     params.logPidReuseRefusal(
       `[DAEMON RUN] Refusing to SIGKILL PID ${params.pid} for session ${params.normalizedSessionId} (PID reuse safety)`,
     );
-    return false;
+    return 'not_signaled';
   }
 
   recordTerminalHostKillAudit({
@@ -141,48 +182,69 @@ async function forceKillTrackedRunner(params: Readonly<{
     callSite: 'daemon.sessions.stopSession.pid',
   });
 
-  const isExactRunnerInstance = params.isExactRunnerInstance;
+  const readExactRunnerIdentity = params.readExactRunnerIdentity;
   if (process.platform === 'win32') {
-    if (isExactRunnerInstance && !isExactRunnerInstance(params.pid)) return false;
+    if (readExactRunnerIdentity && readExactRunnerIdentity(params.pid) !== 'same') return 'exact_runner_incomplete';
     const result = spawnSync('taskkill', ['/F', '/T', '/PID', String(params.pid)], { stdio: 'ignore' });
     if ((result.status ?? 1) !== 0) {
       logger.debug(
         `[DAEMON RUN] Forced taskkill failed for session ${params.normalizedSessionId} (pid=${params.pid})`,
       );
-      return false;
+      return 'not_signaled';
     }
     logger.debug(
       `[DAEMON RUN] Forced taskkill requested for session process tree ${params.normalizedSessionId} (pid=${params.pid})`,
     );
-    return true;
+    return 'signaled';
   }
 
-  // An exact runner's tree is signalled only while its root is still that incarnation: the helper
-  // awaits between signals, and a reused pid must never receive the escalation.
-  const treeOptions = isExactRunnerInstance
-    ? { graceMs: 1, isRootIncarnation: () => isExactRunnerInstance(params.pid) }
-    : { graceMs: 1 };
+  const root = params.expectedSession.startedBy === 'daemon' && params.expectedSession.childProcess
+    ? params.expectedSession.childProcess
+    : null;
+  if (root && !isTrackedChildStillLiveForPid(params.expectedSession, params.pid)) {
+    return 'not_signaled';
+  }
   try {
-    if (params.expectedSession.startedBy === 'daemon' && params.expectedSession.childProcess) {
-      if (!isTrackedChildStillLiveForPid(params.expectedSession, params.pid)) {
-        return false;
-      }
-      await killProcessTree(params.expectedSession.childProcess, treeOptions);
+    if (!readExactRunnerIdentity) {
+      await killProcessTree(root ?? { pid: params.pid }, { graceMs: 1 });
     } else {
-      await killProcessTree({ pid: params.pid }, treeOptions);
+      // An exact runner's root is signalled only while it is still that incarnation: the helper awaits
+      // between signals, and a reused pid must never receive the escalation.
+      const outcome = await killProcessTreeGuarded(root ?? { pid: params.pid }, {
+        graceMs: 1,
+        readRootIdentity: () => readExactRunnerIdentity(params.pid),
+      });
+      if (outcome !== 'completed') {
+        if (outcome === 'root_unreadable_suspended') {
+          params.logWarning(
+            `[DAEMON RUN] Exact-runner Stop left PID ${params.pid} for session ${params.normalizedSessionId} SIGSTOPped: its process instance could not be re-identified after suspension, so it was neither resumed nor killed. Stop is incomplete; inspect and resume or kill PID ${params.pid} manually.`,
+          );
+        } else {
+          params.logWarning(
+            `[DAEMON RUN] Exact-runner forced Stop for session ${params.normalizedSessionId} stopped signalling PID ${params.pid} (${outcome}); Stop is incomplete`,
+          );
+        }
+        return 'exact_runner_incomplete';
+      }
     }
     logger.debug(
       `[DAEMON RUN] Requested forced process-tree termination for session ${params.normalizedSessionId} (pid=${params.pid})`,
     );
-    return true;
+    return 'signaled';
   } catch (error) {
     logger.debug(
       `[DAEMON RUN] Failed to force-kill session ${params.normalizedSessionId} (pid=${params.pid}):`,
       error,
     );
-    return false;
+    return 'not_signaled';
   }
 }
+
+/**
+ * `exact_runner_incomplete`: the exact runner's root stopped being identifiable or became another
+ * process during forced escalation. That is never completed cleanup.
+ */
+type ForcedRunnerKillResult = 'signaled' | 'not_signaled' | 'exact_runner_incomplete';
 
 /**
  * The one runner incarnation a replacement Stop may signal. Stop refuses, signalling nothing, unless
@@ -268,9 +330,12 @@ export function createStopSession(params: Readonly<{
   provenTerminalHostKindsByPid?: ReadonlyMap<number, TerminalHostAdapter['kind']>;
   /** Process-instance reader for exact-runner Stop; the daemon's own reader by default. */
   readProcessInstanceFingerprint?: (pid: number) => string | null;
+  /** Liveness check for exact-runner Stop; `process.kill(pid, 0)` by default. */
+  isProcessAlive?: (pid: number) => boolean;
 }>): (sessionId: string, options?: StopSessionOptions) => Promise<StopSessionResult> {
   const { pidToTrackedSession } = params;
   const readProcessInstanceFingerprint = params.readProcessInstanceFingerprint ?? readProcessInstanceFingerprintSync;
+  const isProcessAlive = params.isProcessAlive ?? isProcessAliveDefault;
   const logPidReuseRefusal = params.logPidReuseRefusal ?? ((message: string): void => logger.warn(message));
   const logWarning = params.logWarning ?? ((message: string, ...args: unknown[]): void => logger.warn(message, ...args));
 
@@ -282,9 +347,8 @@ export function createStopSession(params: Readonly<{
     if (!normalizedSessionId) return incompleteStopSession('invalid_session_id');
     const isPidFallback = normalizedSessionId.startsWith('PID-');
     const exactRunner = options?.exactRunner;
-    const isExactRunnerInstance: ExactRunnerInstanceGuard | undefined = exactRunner
-      ? (pid) => pid === exactRunner.pid
-        && processInstanceFingerprintMatches(exactRunner.processInstanceFingerprint, readProcessInstanceFingerprint(pid))
+    const readExactRunnerIdentity = exactRunner
+      ? createExactRunnerIdentityReader({ exactRunner, readProcessInstanceFingerprint, isProcessAlive })
       : undefined;
     if (exactRunner && !isExactStopRunnerSoleTrackedRunner({ pidToTrackedSession, sessionId: normalizedSessionId, exactRunner })) {
       logWarning(`[DAEMON RUN] Refusing exact-runner Stop for session ${normalizedSessionId}: PID ${exactRunner.pid} is not the session's only tracked runner`);
@@ -495,7 +559,7 @@ export function createStopSession(params: Readonly<{
             session,
             normalizedSessionId,
             logPidReuseRefusal,
-            ...(isExactRunnerInstance ? { isExactRunnerInstance } : {}),
+            ...(readExactRunnerIdentity ? { readExactRunnerIdentity } : {}),
           })) {
             stoppedAny = true;
             signaledPids.push(pid);
@@ -627,14 +691,19 @@ export function createStopSession(params: Readonly<{
         }
         const expectedSession = expectedTrackedSessionsByPid.get(pid);
         if (!expectedSession) continue;
-        forceSignaledAny = await forceKillTrackedRunner({
+        const forced = await forceKillTrackedRunner({
           pid,
           expectedSession,
           pidToTrackedSession,
           normalizedSessionId,
           logPidReuseRefusal,
-          ...(exactRunner && isExactRunnerInstance ? { exactRunner, isExactRunnerInstance } : {}),
-        }) || forceSignaledAny;
+          logWarning,
+          ...(exactRunner && readExactRunnerIdentity ? { exactRunner, readExactRunnerIdentity } : {}),
+        });
+        // An exact runner that could not be signalled to completion is never counted as stopped,
+        // whatever a later exit wait or presence probe would conclude.
+        if (forced === 'exact_runner_incomplete') return incompleteStopSession('runner_signal_incomplete');
+        forceSignaledAny = forced === 'signaled' || forceSignaledAny;
       }
 
       if (exitedBeforeForcePids.size === pidsToStop.length) {

@@ -273,9 +273,15 @@ stops exactly that process and spawns only once the runner is proven absent. Sto
 checks the process instance again before signalling: the graceful signal (or
 Windows `taskkill`) follows that check with no intervening wait, and forced
 escalation re-reads the instance synchronously immediately before every signal to
-the runner, sending nothing further to the runner or its descendants once the
-instance no longer matches. The check and the signal are still separate system
-calls, so a pid reused in between that instant is not excluded. A report from any other incarnation,
+the runner. Once the pid is gone or is positively another instance, the runner
+receives nothing further. If the runner was suspended for descendant enumeration
+and its instance then cannot be read, the read is retried briefly, and the runner
+is otherwise left suspended (never resumed or killed blind) and logged by pid.
+Descendants enumerated under the verified, suspended runner are still terminated,
+with SIGKILL for survivors, even after the runner exits or stops matching. Any of
+these outcomes makes the Stop incomplete, so replacement does not spawn. The check
+and the signal are still separate system calls, so a pid reused at that instant is
+not excluded. A report from any other incarnation,
 or one without a complete respondent, fences Resume
 (`publisher_lost_respondent_unbound`), as does a session with several local
 runners, a wrapper process, or a runner known only from its lock
