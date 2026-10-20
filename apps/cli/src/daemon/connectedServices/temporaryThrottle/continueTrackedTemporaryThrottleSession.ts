@@ -41,6 +41,7 @@ export async function continueTrackedTemporaryThrottleSession(input: Readonly<{
   spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
   resolveRespawnOptions?: ResolveRespawnOptions;
   sendMessage?: typeof sendSessionMessage;
+  assertCanAdmit?: () => void;
   attemptId: string;
   continuation: TemporaryThrottleContinuationIntent;
 }>): Promise<TemporaryThrottleContinuationResult> {
@@ -58,6 +59,7 @@ export async function continueTrackedTemporaryThrottleSession(input: Readonly<{
 
   const dispatcher = createConnectedServiceContinuationMessageDispatcher({
     credentials: input.credentials,
+    ...(input.assertCanAdmit ? { assertCanAdmit: input.assertCanAdmit } : {}),
     ...(input.sendMessage ? { sendMessage: input.sendMessage } : {}),
   });
   const continuationResult = await dispatcher.enqueueInterruptedOriginContinuation({

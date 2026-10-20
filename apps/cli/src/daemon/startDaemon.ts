@@ -5858,6 +5858,33 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           });
         };
 
+        const authorizeRuntimeAuthFailureSourceForSession = async ({ sessionId, classification, recoveryInvocationSource }:
+          Pick<Parameters<typeof authorizeConnectedServiceRuntimeAuthFailureSource>[0],
+            'sessionId' | 'classification' | 'recoveryInvocationSource'>) => {
+          const runtimeAuthApply = classification
+            ? await resolveRuntimeAuthApplyForFailureSource({
+                sessionId,
+                serviceId: ConnectedServiceIdSchema.parse(classification.serviceId),
+              })
+            : null;
+          return await authorizeConnectedServiceRuntimeAuthFailureSource({
+            getChildren: getCurrentChildren,
+            sessionId,
+            classification,
+            recoveryInvocationSource,
+            resolveDurableSessionForRuntimeAuthRecovery: async ({ sessionId: durableSessionId, classification: durableClassification }) =>
+              await resolveDurableConnectedServiceRuntimeAuthRecoverySession({
+                credentials,
+                sessionId: durableSessionId,
+                serviceId: durableClassification.serviceId,
+              }),
+            resolveRegisteredRuntimeAuthFailureSource: resolveRegisteredRuntimeAuthFailureSourceForSession,
+            resolveCurrentRuntimeAuthFailureSource: resolveCurrentRuntimeAuthFailureSourceForSession,
+            resolveProviderQualifiedRuntimeAuthFailureSource,
+            runtimeAuthApply,
+          });
+        };
+
         const handleConnectedServiceRuntimeAuthRecovery = async (input: Readonly<{
           sessionId: string;
           switchesThisTurn: number;
@@ -6457,6 +6484,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             { min: 1, max: 25 },
           ),
           recover: handleConnectedServiceRuntimeAuthRecovery,
+          readLimitResetCustomResumePrompt: () => readContinuationCustomResumePrompt(getActiveAccountSettingsSnapshot()?.settings ?? null),
           retryAfterLimitReset: async (retry) => await retryRuntimeAuthLimitAfterReset({
             ...retry,
             isCurrent: () => !shutdownInitiated && retry.isCurrent(),
@@ -6464,7 +6492,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             credentials,
             readCredentials,
             spawnSession,
-            customResumePrompt: readContinuationCustomResumePrompt(getActiveAccountSettingsSnapshot()?.settings ?? null),
+            switchCore: connectedServiceSessionAuthSwitchCore,
+            authorizeSource: () => authorizeRuntimeAuthFailureSourceForSession({ sessionId: retry.sessionId,
+              classification: retry.classification, recoveryInvocationSource: 'scheduler_retry' }),
           }),
           gate: ({ intent }) => {
             const nowMs = Date.now();
@@ -6936,29 +6966,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         return resultWithDiagnostics;
       },
       handleConnectedServiceRuntimeAuthFailure: handleConnectedServiceRuntimeAuthRecovery,
-      authorizeConnectedServiceRuntimeAuthFailure: async ({ sessionId, classification }) => {
-        const runtimeAuthApply = classification
-          ? await resolveRuntimeAuthApplyForFailureSource({
-              sessionId,
-              serviceId: ConnectedServiceIdSchema.parse(classification.serviceId),
-            })
-          : null;
-        return await authorizeConnectedServiceRuntimeAuthFailureSource({
-          getChildren: getCurrentChildren,
-          sessionId,
-          classification,
-          resolveDurableSessionForRuntimeAuthRecovery: async ({ sessionId: durableSessionId, classification: durableClassification }) =>
-            await resolveDurableConnectedServiceRuntimeAuthRecoverySession({
-              credentials,
-              sessionId: durableSessionId,
-              serviceId: durableClassification.serviceId,
-          }),
-          resolveRegisteredRuntimeAuthFailureSource: resolveRegisteredRuntimeAuthFailureSourceForSession,
-          resolveCurrentRuntimeAuthFailureSource: resolveCurrentRuntimeAuthFailureSourceForSession,
-          resolveProviderQualifiedRuntimeAuthFailureSource,
-          runtimeAuthApply,
-        });
-      },
+      authorizeConnectedServiceRuntimeAuthFailure: authorizeRuntimeAuthFailureSourceForSession,
       resolveConnectedServiceRuntimeAuthResumePromptMode: async ({ classification, explicit }) =>
         await resolveContinuationResumePromptMode({
           credentials,

@@ -90,6 +90,8 @@ export async function admitSessionUserMessageToPendingQueue(params: Readonly<{
   meta?: Readonly<Record<string, unknown>>;
   requestedAction?: PendingRequestedActionV1;
   pendingAdmissionMode?: 'continuation_if_no_queued_user_input';
+  /** Synchronous final effect fence, after all asynchronous caller preparation. */
+  assertCanAdmit?: () => void;
 }>): Promise<SessionUserMessageAdmissionResult> {
   const record = buildSessionUserMessageRecord({
     text: params.text,
@@ -111,6 +113,8 @@ export async function admitSessionUserMessageToPendingQueue(params: Readonly<{
         } as const);
 
   const requestedAction = params.requestedAction ?? { v: 1, kind: 'steer_if_active' as const };
+
+  params.assertCanAdmit?.();
 
   let enqueueResult: Awaited<ReturnType<typeof enqueuePendingQueueV2MessageViaHttp>>;
   try {

@@ -441,6 +441,7 @@ export async function sendSessionMessage(params: Readonly<{
   modelOverride?: string | null;
   requestedAction?: PendingRequestedActionV1;
   pendingAdmissionMode?: 'continuation_if_no_queued_user_input';
+  assertCanAdmit?: () => void;
 }>): Promise<SendSessionMessageResult> {
   const sessionTarget = await resolveSessionTransportContext({
     credentials: params.credentials,
@@ -493,6 +494,7 @@ export async function sendSessionMessage(params: Readonly<{
     text: params.message,
     permissionIntent,
     modelId,
+    ...(params.assertCanAdmit ? { assertCanAdmit: params.assertCanAdmit } : {}),
     ...(params.requestedAction ? { requestedAction: params.requestedAction } : {}),
     ...(params.pendingAdmissionMode ? { pendingAdmissionMode: params.pendingAdmissionMode } : {}),
   });

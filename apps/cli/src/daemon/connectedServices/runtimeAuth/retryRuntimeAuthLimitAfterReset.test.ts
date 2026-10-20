@@ -1,0 +1,261 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import axios from 'axios';
+import type { Credentials } from '@/persistence';
+import { createSessionRecordFixture } from '@/testkit/backends/sessionFixtures';
+import { authorizeConnectedServiceRuntimeAuthFailureSource } from './handleConnectedServiceRuntimeAuthFailureForSession';
+import { createConnectedServiceSessionAuthSwitchCore } from './connectedServiceSessionAuthSwitchCore';
+import { handleConnectedServiceRuntimeAuthFailure } from './handleConnectedServiceRuntimeAuthFailure';
+import { createRecoveryIntentFileStore } from '../recoveryScheduler/recoveryIntentFileStore';
+import { RuntimeAuthRecoveryScheduler, type RuntimeAuthRecoveryIntent } from './RuntimeAuthRecoveryScheduler';
+import { retryRuntimeAuthLimitAfterReset } from './retryRuntimeAuthLimitAfterReset';
+import { buildRuntimeAuthRecoveryKey } from './recoveryKey/runtimeAuthRecoveryKey';
+import type { ConnectedServiceRuntimeFailureClassification } from './types';
+
+const sessionId = 'c111111111111111111111111';
+const classification: ConnectedServiceRuntimeFailureClassification = {
+  kind: 'usage_limit', serviceId: 'claude-subscription', profileId: 'primary', groupId: null,
+  credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa', sourceKey: 'provider-report',
+  resetsAtMs: 10_000, retryAfterMs: 90_000, planType: null, rateLimits: null,
+  source: 'structured_provider_error',
+};
+const recoveryKey = buildRuntimeAuthRecoveryKey({ sessionId, ...classification });
+const credentials: Credentials = { token: 'fixture', encryption: { type: 'legacy', secret: new Uint8Array(32) } };
+
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function harness(input: { lookupGate?: () => Promise<void>; loseAcknowledgement?: boolean; acceptFirst?: boolean;
+  alwaysLoseAcknowledgement?: boolean; loseAcknowledgementAttempts?: ReadonlyArray<number>; postGate?: () => Promise<void>;
+  durableStore?: ConstructorParameters<typeof RuntimeAuthRecoveryScheduler>[0]['durableStore'];
+  terminal?: Map<string, unknown>; mode?: 'standard' | 'custom'; } = {}) {
+  vi.useFakeTimers();
+  let now = 1_000;
+  let profileId = 'primary';
+  let credentialRevision = classification.credentialRevision!;
+  let groupId: string | null = null;
+  let customResumePrompt = 'Continue the original work.';
+  const tracked = { startedBy: 'daemon' as const, happySessionId: sessionId, pid: 123,
+    vendorResumeId: 'vendor-1', spawnOptions: { directory: '/project', backendTarget: { kind: 'builtInAgent' as const, agentId: 'claude' as const } } };
+  const session = createSessionRecordFixture({ id: sessionId, encryptionMode: 'plain', metadata: '{}', active: false });
+  vi.spyOn(axios, 'get').mockImplementation(async (url) => {
+    if (String(url).endsWith(`/v2/sessions/${sessionId}`)) {
+      await input.lookupGate?.();
+      return { status: 200, data: { session } };
+    }
+    throw new Error(`Unexpected HTTP GET: ${url}`);
+  });
+  // Model the server's exact-localId Pending + terminal deduplication boundary.
+  // Consumption removes a queued row but retains its terminal localId/content.
+  const terminal = input.terminal ?? new Map<string, unknown>();
+  const post = vi.spyOn(axios, 'post').mockImplementation(async (url, body: any) => {
+    if (!String(url).endsWith(`/v2/sessions/${sessionId}/pending`)) throw new Error(`Unexpected HTTP POST: ${url}`);
+    await input.postGate?.();
+    if (input.alwaysLoseAcknowledgement) {
+      terminal.set(body.localId, body);
+      throw new Error('timeout after Pending POST');
+    }
+    const previous = terminal.get(body.localId);
+    if (previous) {
+      expect(body).toEqual(previous);
+      return { status: 200, data: { didWrite: false, terminal: true, message: { id: 'message-1', seq: 1, localId: body.localId, requestedAction: body.requestedAction } } };
+    }
+    if (post.mock.calls.length !== 1 || input.acceptFirst !== false) terminal.set(body.localId, body);
+    if ((input.loseAcknowledgement && post.mock.calls.length === 1)
+      || input.loseAcknowledgementAttempts?.includes(post.mock.calls.length)) throw new Error('timeout after Pending POST');
+    return { status: 200, data: { didWrite: true } };
+  });
+  const spawnSession = vi.fn(async () => ({ type: 'success' as const, sessionId, runnerAcceptance: 'preexisting_or_adopted' as const }));
+  const switchCore = createConnectedServiceSessionAuthSwitchCore();
+  const authorizeSource = () => authorizeConnectedServiceRuntimeAuthFailureSource({
+    getChildren: () => [tracked], sessionId, classification, recoveryInvocationSource: 'scheduler_retry',
+    runtimeAuthApply: { directLiveHotAuth: 'unsupported' },
+    resolveRegisteredRuntimeAuthFailureSource: () => ({ serviceId: 'claude-subscription', profileId,
+      groupId, generation: groupId === null ? null : 1, credentialRevision }),
+  });
+  const recover = () => handleConnectedServiceRuntimeAuthFailure({ sessionId,
+    selection: { kind: 'profile', serviceId: 'claude-subscription', profileId: 'primary' },
+    classification, switchesThisTurn: 0,
+    switchCoordinator: { switchAfterClassifiedFailure: async () => { throw new Error('not a group'); } },
+  });
+  const scheduler = new RuntimeAuthRecoveryScheduler({
+    nowMs: () => now, baseBackoffMs: 100, maxBackoffMs: 1_000, jitterMs: () => 0, maxAttempts: 3,
+    durableStore: input.durableStore, readLimitResetCustomResumePrompt: () => customResumePrompt,
+    providerOutcomePendingWaitMs: 1_000, recover: async () => await recover(),
+    retryAfterLimitReset: (retry) => retryRuntimeAuthLimitAfterReset({ ...retry,
+      resolveResumeSource: async () => tracked, credentials, readCredentials: async () => null, spawnSession,
+      resolveRespawnOptions: ({ defaultOptions }) => defaultOptions,
+      authorizeSource, switchCore,
+    }),
+  });
+  const reportLimit = async (reportId: string) => {
+    const intake = await scheduler.beginClassifiedFailure({ reportId, sessionId,
+      classification, switchesThisTurn: 0, resumePromptMode: input.mode ?? 'standard' });
+    await scheduler.markDurableWaitForResultByKey({ recoveryKey, result: await recover(),
+      classificationFailureKind: classification.kind, classificationResetsAtMs: classification.resetsAtMs,
+      expectedAttemptId: intake.attemptId });
+  };
+  return { scheduler, post, terminal, spawnSession, switchCore, reportLimit,
+    setCustomPrompt: (value: string) => { customResumePrompt = value; },
+    setBinding: (nextProfile: string, nextGroup: string | null = null, revision = credentialRevision) => {
+      profileId = nextProfile; groupId = nextGroup; credentialRevision = revision;
+    },
+    arm: async () => { await reportLimit('initial'); now = 10_000; },
+    wake: async () => { now = Math.max(now, scheduler.readByKey(recoveryKey)?.nextRetryAtMs ?? now); await scheduler.wakeByKey({ recoveryKey, reason: 'timer' }); },
+  };
+}
+
+describe('expired limit trial admission and source ownership', () => {
+  it('reconciles an accepted and consumed Pending write under the same identity after a lost acknowledgement', async () => {
+    const h = harness({ loseAcknowledgement: true });
+    try {
+      await h.arm(); await h.wake();
+      expect(h.terminal.size).toBe(1);
+      await h.wake();
+      expect(h.post).toHaveBeenCalledTimes(2);
+      expect(h.terminal.size).toBe(1);
+      expect(h.post.mock.calls[1]?.[1]).toEqual(h.post.mock.calls[0]?.[1]);
+      expect(h.scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'resumed_awaiting_proof', limitResetRetryCount: 1 });
+    } finally { h.scheduler.dispose(); }
+  });
+
+  it('does not admit after Stop while the real session transport lookup is in flight', async () => {
+    const entered = deferred(); const release = deferred();
+    const h = harness({ lookupGate: async () => { entered.resolve(); await release.promise; } });
+    try {
+      await h.arm(); const wake = h.wake(); await entered.promise;
+      await h.scheduler.cancel({ sessionId }); release.resolve(); await wake;
+      expect(h.post).not.toHaveBeenCalled();
+      expect(h.scheduler.readByKey(recoveryKey)?.status).toBe('cancelled');
+    } finally { release.resolve(); h.scheduler.dispose(); }
+  });
+
+  it.each([['secondary', null], ['primary', 'new-group']] as const)('supersedes the old limit source after switching to %s/%s', async (profile, group) => {
+    const h = harness();
+    try {
+      await h.arm(); h.setBinding(profile, group); await h.wake();
+      expect(h.spawnSession).not.toHaveBeenCalled();
+      expect(h.post).not.toHaveBeenCalled();
+      expect(h.scheduler.readByKey(recoveryKey)).toBeNull();
+    } finally { h.scheduler.dispose(); }
+  });
+
+  it('admits an unaccepted first request on reconciliation without spending a second provider trial', async () => {
+    const h = harness({ loseAcknowledgement: true, acceptFirst: false });
+    try {
+      await h.arm(); await h.wake(); expect(h.terminal.size).toBe(0);
+      await h.wake();
+      expect(h.terminal.size).toBe(1);
+      expect(h.post.mock.calls[1]?.[1]).toEqual(h.post.mock.calls[0]?.[1]);
+      expect(h.scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'resumed_awaiting_proof', limitResetRetryCount: 1 });
+    } finally { h.scheduler.dispose(); }
+  });
+
+  it('retains the exact trial and custom prompt through durable hydration and a settings change', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'limit-trial-custody-'));
+    const path = join(directory, 'recovery.json');
+    const terminal = new Map<string, unknown>();
+    const first = harness({ loseAcknowledgement: true, terminal, mode: 'custom',
+      durableStore: createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(path) });
+    try {
+      await first.arm(); await first.wake();
+      const originalBody = first.post.mock.calls[0]?.[1];
+      expect(first.scheduler.readByKey(recoveryKey)?.limitResetTrial).toMatchObject({ retryCount: 1, admissionAttemptCount: 1 });
+      first.scheduler.dispose(); vi.restoreAllMocks();
+      const second = harness({ terminal, mode: 'custom', durableStore: createRecoveryIntentFileStore<RuntimeAuthRecoveryIntent>(path) });
+      try {
+        second.setCustomPrompt('An updated preference must not change an unresolved input.');
+        second.scheduler.hydratePassive(); await second.wake();
+        expect(second.post.mock.calls[0]?.[1]).toEqual(originalBody);
+        expect(terminal.size).toBe(1);
+        expect(second.scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'resumed_awaiting_proof', limitResetRetryCount: 1 });
+      } finally { second.scheduler.dispose(); }
+    } finally { first.scheduler.dispose(); await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it('bounds ambiguous admission reconciliation while preserving its unresolved identity', async () => {
+    const h = harness({ alwaysLoseAcknowledgement: true });
+    try {
+      await h.arm();
+      for (let i = 0; i < 6; i++) await h.wake();
+      expect(h.post).toHaveBeenCalledTimes(3);
+      expect(h.terminal.size).toBe(1);
+      expect(h.scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'exhausted', limitResetRetryCount: 1,
+        limitResetTrial: { retryCount: 1, admissionAttemptCount: 3 } });
+    } finally { h.scheduler.dispose(); }
+  });
+
+  it('keeps an already sent but unacknowledged trial when disposal occurs in the HTTP request', async () => {
+    const entered = deferred(); const release = deferred();
+    const h = harness({ loseAcknowledgement: true, postGate: async () => { entered.resolve(); await release.promise; } });
+    try {
+      await h.arm(); const wake = h.wake(); await entered.promise;
+      h.scheduler.dispose(); release.resolve(); await wake;
+      expect(h.post).toHaveBeenCalledTimes(1);
+      expect(h.scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'waiting', limitResetRetryCount: 1,
+        limitResetTrial: { retryCount: 1, admissionAttemptCount: 1 } });
+    } finally { release.resolve(); h.scheduler.dispose(); }
+  });
+
+  it('retains the canonical same-profile newer-credential allowance', async () => {
+    const h = harness();
+    try {
+      await h.arm(); h.setBinding('primary', null, 'csr_bbbbbbbbbbbbbbbbbbbbbb'); await h.wake();
+      expect(h.post).toHaveBeenCalledTimes(1);
+      expect(h.scheduler.readByKey(recoveryKey)?.status).toBe('resumed_awaiting_proof');
+    } finally { h.scheduler.dispose(); }
+  });
+
+  it('authorizes after an earlier manual switch releases the existing session lane', async () => {
+    const entered = deferred(); const release = deferred();
+    const h = harness();
+    try {
+      await h.arm();
+      const manual = h.switchCore.run({ sessionId, reason: 'manual', execute: async () => {
+        entered.resolve(); await release.promise; h.setBinding('secondary');
+      } });
+      await entered.promise; const wake = h.wake();
+      release.resolve(); await manual; await wake;
+      expect(h.spawnSession).not.toHaveBeenCalled(); expect(h.post).not.toHaveBeenCalled();
+      expect(h.scheduler.readByKey(recoveryKey)).toBeNull();
+    } finally { release.resolve(); h.scheduler.dispose(); }
+  });
+
+
+  it('keeps Off terminal without resolving the old source or runner', async () => {
+    const authorizeSource = vi.fn(async () => { throw new Error('source unavailable'); });
+    const resolveResumeSource = vi.fn(async () => null);
+    const spawnSession = vi.fn(async () => ({ type: 'success' as const, sessionId }));
+    expect(await retryRuntimeAuthLimitAfterReset({ sessionId, classification, attemptId: 'attempt-1', retryCount: 1,
+      resumePromptMode: 'off', customResumePrompt: null, isCurrent: () => true,
+      authorizeSource, resolveResumeSource, spawnSession, readCredentials: async () => null, credentials,
+      switchCore: createConnectedServiceSessionAuthSwitchCore(),
+    })).toEqual({ status: 'terminal', lastError: 'limit_reset_continuation_disabled' });
+    expect(authorizeSource).not.toHaveBeenCalled(); expect(resolveResumeSource).not.toHaveBeenCalled();
+    expect(spawnSession).not.toHaveBeenCalled();
+  });
+
+
+  it('does not mistake a duplicate provider report for another outcome while admission is unconfirmed', async () => {
+    const h = harness({ loseAcknowledgementAttempts: [1, 2] });
+    try {
+      await h.arm(); await h.wake();
+      await h.reportLimit('fresh-provider-report'); await h.wake();
+      expect(h.terminal.size).toBe(2);
+      await h.reportLimit('fresh-provider-report'); await h.wake();
+      expect(h.post).toHaveBeenCalledTimes(3);
+      expect(h.terminal.size).toBe(2);
+      expect(h.post.mock.calls[2]?.[1]).toEqual(h.post.mock.calls[1]?.[1]);
+      expect(h.scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'resumed_awaiting_proof', limitResetRetryCount: 2 });
+    } finally { h.scheduler.dispose(); }
+  });
+
+});

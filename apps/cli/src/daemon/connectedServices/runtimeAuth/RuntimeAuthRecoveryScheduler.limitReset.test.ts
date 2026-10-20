@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { sendSessionMessage } from '@/session/services/sendSessionMessage';
 import type { SpawnSessionOptions, SpawnSessionResult } from '@/rpc/handlers/registerSessionHandlers';
 import { resolveRuntimeAuthRecoveryResultDisposition } from './resolveRuntimeAuthRecoveryResultDisposition';
+import { createConnectedServiceSessionAuthSwitchCore } from './connectedServiceSessionAuthSwitchCore';
 import { retryRuntimeAuthLimitAfterReset } from './retryRuntimeAuthLimitAfterReset';
 import { createRecoveryIntentFileStore } from '../recoveryScheduler/recoveryIntentFileStore';
 import type { TransactionalRecoveryStore } from '../recoveryScheduler/DurableBackoffRecoveryScheduler';
@@ -63,6 +64,8 @@ function harness(input: {
       readCredentials: async () => null, spawnSession, sendMessage,
       resolveRespawnOptions: ({ defaultOptions }) => defaultOptions,
       customResumePrompt: null,
+      switchCore: createConnectedServiceSessionAuthSwitchCore(),
+      authorizeSource: async () => ({ status: 'authorized', tracked: null }),
     }),
   });
   const reportLimit = async (reportId: string, patch: Partial<ConnectedServiceRuntimeFailureClassification> = {}) => {
