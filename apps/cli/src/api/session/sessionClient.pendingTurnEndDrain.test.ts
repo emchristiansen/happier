@@ -2040,6 +2040,49 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
     });
 
+    it('arms no recovery deadline for a refusal that lands while close is in progress', async () => {
+      const client = await createClient({
+        latestTurnStatus: 'completed',
+        pendingCount: 1,
+        pendingBlockedCount: 0,
+        pendingVersion: 1,
+      });
+      await waitForCurrentPendingInputContract(client);
+      vi.useFakeTimers();
+      const infoFileSpy = vi.spyOn(logger, 'infoFile');
+      const refusal = createDeferred<never>();
+      materializeNextMock.mockReturnValueOnce(refusal.promise);
+      // Hold close inside its drain window, after its early timer cleanup and before `closed`.
+      const closeDrainGate = createDeferred<void>();
+      const waitForIdle = vi.spyOn(client.rpcHandlerManager, 'waitForIdle').mockImplementation(async () => {
+        await closeDrainGate.promise;
+      });
+
+      const materialization = client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+      await vi.waitFor(() => expect(materializeNextMock).toHaveBeenCalledTimes(1));
+      const closing = client.close();
+      try {
+        await vi.waitFor(() => expect(waitForIdle).toHaveBeenCalled());
+        refusal.reject(publisherLost());
+        await materialization;
+
+        expect(supervisorReportProbeResultMock).not.toHaveBeenCalled();
+        expect((client as unknown as { pendingPublisherRecoveryDeadlineTimer: unknown }).pendingPublisherRecoveryDeadlineTimer)
+          .toBeNull();
+      } finally {
+        closeDrainGate.resolve();
+        await closing;
+      }
+
+      await vi.advanceTimersByTimeAsync(configuration.pendingPublisherRecoveryDeadlineMs);
+      expect((client as unknown as { pendingPublisherRecovery: { state: string } }).pendingPublisherRecovery.state)
+        .toBe('current');
+      expect(infoFileSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('before its deadline'),
+        expect.anything(),
+      );
+    });
+
     it('does not let an earlier episode deadline end a newer episode', async () => {
       const client = await createClient({
         latestTurnStatus: 'completed',

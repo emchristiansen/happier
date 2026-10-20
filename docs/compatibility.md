@@ -269,8 +269,13 @@ connection that claims publisher status clears that state.
 On Resume, the daemon replaces such a runner only when the respondent equals the
 one local process a Stop of the session would signal: the session's only tracked
 runner, on this daemon's machine, with the same pid and process instance. It then
-stops exactly that process, re-verifying its instance before each signal, and
-spawns only once the runner is proven absent. A report from any other incarnation,
+stops exactly that process and spawns only once the runner is proven absent. Stop
+checks the process instance again before signalling: the graceful signal (or
+Windows `taskkill`) follows that check with no intervening wait, and forced
+escalation re-reads the instance synchronously immediately before every signal to
+the runner, sending nothing further to the runner or its descendants once the
+instance no longer matches. The check and the signal are still separate system
+calls, so a pid reused in between that instant is not excluded. A report from any other incarnation,
 or one without a complete respondent, fences Resume
 (`publisher_lost_respondent_unbound`), as does a session with several local
 runners, a wrapper process, or a runner known only from its lock

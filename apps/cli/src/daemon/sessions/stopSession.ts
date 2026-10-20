@@ -19,6 +19,10 @@ import { evaluateTerminalHostLivenessForRecovery } from '@/integrations/terminal
 import { configuration } from '@/configuration';
 import { killProcessTree } from '@/agent/runtime/process/killProcessTree';
 
+import {
+  processInstanceFingerprintMatches,
+  readProcessInstanceFingerprintSync,
+} from '@happier-dev/cli-common/processInstance';
 import { isPidSafeHappySessionProcess } from '../pidSafety';
 import type { TrackedSession } from '../types';
 import { recordTerminalHostKillAudit } from '@/daemon/sessionKillAudit';
@@ -46,11 +50,15 @@ function isTrackedChildStillLiveForPid(session: TrackedSession, pid: number): bo
   return true;
 }
 
+/** Synchronous check that a pid is still the exact runner incarnation; evaluated right before a signal. */
+type ExactRunnerInstanceGuard = (pid: number) => boolean;
+
 async function taskkillWindowsDaemonChild(params: Readonly<{
   pid: number;
   session: TrackedSession;
   normalizedSessionId: string;
   logPidReuseRefusal: (message: string) => void;
+  isExactRunnerInstance?: ExactRunnerInstanceGuard;
 }>): Promise<boolean> {
   if (!isTrackedChildStillLiveForPid(params.session, params.pid)) {
     params.logPidReuseRefusal(`[DAEMON RUN] Refusing to taskkill PID ${params.pid} for session ${params.normalizedSessionId} (tracked child is no longer live)`);
@@ -64,6 +72,11 @@ async function taskkillWindowsDaemonChild(params: Readonly<{
   });
   if (!safe) {
     params.logPidReuseRefusal(`[DAEMON RUN] Refusing to taskkill PID ${params.pid} for session ${params.normalizedSessionId} (PID reuse safety)`);
+    return false;
+  }
+  // The safety check above awaited; an exact runner must still hold immediately before taskkill.
+  if (params.isExactRunnerInstance && !params.isExactRunnerInstance(params.pid)) {
+    params.logPidReuseRefusal(`[DAEMON RUN] Refusing to taskkill PID ${params.pid} for session ${params.normalizedSessionId} (exact runner instance changed)`);
     return false;
   }
 
@@ -94,6 +107,7 @@ async function forceKillTrackedRunner(params: Readonly<{
   normalizedSessionId: string;
   logPidReuseRefusal: (message: string) => void;
   exactRunner?: ExactStopRunner;
+  isExactRunnerInstance?: ExactRunnerInstanceGuard;
 }>): Promise<boolean> {
   const currentSession = params.pidToTrackedSession.get(params.pid);
   if (currentSession !== params.expectedSession) {
@@ -127,7 +141,9 @@ async function forceKillTrackedRunner(params: Readonly<{
     callSite: 'daemon.sessions.stopSession.pid',
   });
 
+  const isExactRunnerInstance = params.isExactRunnerInstance;
   if (process.platform === 'win32') {
+    if (isExactRunnerInstance && !isExactRunnerInstance(params.pid)) return false;
     const result = spawnSync('taskkill', ['/F', '/T', '/PID', String(params.pid)], { stdio: 'ignore' });
     if ((result.status ?? 1) !== 0) {
       logger.debug(
@@ -141,14 +157,19 @@ async function forceKillTrackedRunner(params: Readonly<{
     return true;
   }
 
+  // An exact runner's tree is signalled only while its root is still that incarnation: the helper
+  // awaits between signals, and a reused pid must never receive the escalation.
+  const treeOptions = isExactRunnerInstance
+    ? { graceMs: 1, isRootIncarnation: () => isExactRunnerInstance(params.pid) }
+    : { graceMs: 1 };
   try {
     if (params.expectedSession.startedBy === 'daemon' && params.expectedSession.childProcess) {
       if (!isTrackedChildStillLiveForPid(params.expectedSession, params.pid)) {
         return false;
       }
-      await killProcessTree(params.expectedSession.childProcess, { graceMs: 1 });
+      await killProcessTree(params.expectedSession.childProcess, treeOptions);
     } else {
-      await killProcessTree({ pid: params.pid }, { graceMs: 1 });
+      await killProcessTree({ pid: params.pid }, treeOptions);
     }
     logger.debug(
       `[DAEMON RUN] Requested forced process-tree termination for session ${params.normalizedSessionId} (pid=${params.pid})`,
@@ -245,8 +266,11 @@ export function createStopSession(params: Readonly<{
   requireTerminalTopologyProof?: boolean;
   /** Exact persisted topology for reconstructed dead-runner candidates not represented by spawn options. */
   provenTerminalHostKindsByPid?: ReadonlyMap<number, TerminalHostAdapter['kind']>;
+  /** Process-instance reader for exact-runner Stop; the daemon's own reader by default. */
+  readProcessInstanceFingerprint?: (pid: number) => string | null;
 }>): (sessionId: string, options?: StopSessionOptions) => Promise<StopSessionResult> {
   const { pidToTrackedSession } = params;
+  const readProcessInstanceFingerprint = params.readProcessInstanceFingerprint ?? readProcessInstanceFingerprintSync;
   const logPidReuseRefusal = params.logPidReuseRefusal ?? ((message: string): void => logger.warn(message));
   const logWarning = params.logWarning ?? ((message: string, ...args: unknown[]): void => logger.warn(message, ...args));
 
@@ -258,6 +282,10 @@ export function createStopSession(params: Readonly<{
     if (!normalizedSessionId) return incompleteStopSession('invalid_session_id');
     const isPidFallback = normalizedSessionId.startsWith('PID-');
     const exactRunner = options?.exactRunner;
+    const isExactRunnerInstance: ExactRunnerInstanceGuard | undefined = exactRunner
+      ? (pid) => pid === exactRunner.pid
+        && processInstanceFingerprintMatches(exactRunner.processInstanceFingerprint, readProcessInstanceFingerprint(pid))
+      : undefined;
     if (exactRunner && !isExactStopRunnerSoleTrackedRunner({ pidToTrackedSession, sessionId: normalizedSessionId, exactRunner })) {
       logWarning(`[DAEMON RUN] Refusing exact-runner Stop for session ${normalizedSessionId}: PID ${exactRunner.pid} is not the session's only tracked runner`);
       return incompleteStopSession('runner_signal_incomplete');
@@ -462,7 +490,13 @@ export function createStopSession(params: Readonly<{
 
       if (session.startedBy === 'daemon' && session.childProcess) {
         if (process.platform === 'win32') {
-          if (await taskkillWindowsDaemonChild({ pid, session, normalizedSessionId, logPidReuseRefusal })) {
+          if (await taskkillWindowsDaemonChild({
+            pid,
+            session,
+            normalizedSessionId,
+            logPidReuseRefusal,
+            ...(isExactRunnerInstance ? { isExactRunnerInstance } : {}),
+          })) {
             stoppedAny = true;
             signaledPids.push(pid);
           }
@@ -599,7 +633,7 @@ export function createStopSession(params: Readonly<{
           pidToTrackedSession,
           normalizedSessionId,
           logPidReuseRefusal,
-          ...(exactRunner ? { exactRunner } : {}),
+          ...(exactRunner && isExactRunnerInstance ? { exactRunner, isExactRunnerInstance } : {}),
         }) || forceSignaledAny;
       }
 

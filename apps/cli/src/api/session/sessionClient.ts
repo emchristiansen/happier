@@ -765,6 +765,8 @@ export class ApiSessionClient extends EventEmitter {
     private pendingPublisherRecovery: PendingPublisherRecovery = { state: 'current' };
     private pendingPublisherRecoveryEpisode = 0;
     private pendingPublisherRecoveryDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
+    /** Set at `close()` entry, before its awaits, so no in-flight continuation can start a recovery episode. */
+    private closeStarted = false;
     private pendingInputReadinessAbortController: AbortController | null = null;
     private convergePendingInputReadiness: ((onContractPrepared?: () => void) => Promise<boolean>) | null = null;
     private changesSyncInFlight: Promise<void> | null = null;
@@ -1575,6 +1577,9 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private observePendingPublisherLost(sessionConnectionEpoch: number): void {
+        // A refusal that lands while the client is closing or terminating changes nothing: arming a
+        // deadline now would outlive close, and no reconnect or replacement is wanted.
+        if (this.closeStarted || this.closed || this.runtimeTerminationStarted) return;
         const recovery = this.pendingPublisherRecovery;
         if (recovery.state === 'current') {
             const episode = ++this.pendingPublisherRecoveryEpisode;
@@ -6279,6 +6284,7 @@ export class ApiSessionClient extends EventEmitter {
 
     async close() {
         logger.debug('[API] socket.close() called');
+        this.closeStarted = true;
         // Pending control RPCs can be waiting here; release archive admission before
         // draining RPC executions so closing cannot wait on its own lifetime abort.
         this.archiveAdmissionTermination.abort();

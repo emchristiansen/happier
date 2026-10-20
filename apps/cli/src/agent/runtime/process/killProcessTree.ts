@@ -70,12 +70,21 @@ export async function killProcessTree(
   proc: ProcessTreeRoot,
   opts?: {
     graceMs?: number;
+    /**
+     * Synchronous proof that `proc.pid` is still the intended process instance. When supplied, it is
+     * evaluated immediately before every signal to the root; once it fails, nothing further is sent
+     * to the root or its descendants, because the pid may now name an unrelated process.
+     */
+    isRootIncarnation?: () => boolean;
   }
 ): Promise<void> {
   const pid = proc.pid;
   if (!pid) return;
 
   const graceMs = Math.max(1, opts?.graceMs ?? 1000);
+  const guard = opts?.isRootIncarnation;
+  const rootHolds = (): boolean => guard === undefined || guard();
+  if (!rootHolds()) return;
 
   // Keep child runtimes attached to their owning CLI process tree and explicitly terminate
   // descendants on disposal so provider processes cannot outlive their supervisor.
@@ -84,7 +93,10 @@ export async function killProcessTree(
   // process listing; killing the parent then reparents that descendant and loses the only
   // relationship that lets this owner find it.
   const rootStopped = process.platform !== 'win32' && isAlive(pid);
-  if (rootStopped) bestEffortKillPid(pid, 'SIGSTOP');
+  if (rootStopped) {
+    if (!rootHolds()) return;
+    bestEffortKillPid(pid, 'SIGSTOP');
+  }
 
   let descendants: number[];
   try {
@@ -98,14 +110,26 @@ export async function killProcessTree(
   const all = [...descendants, pid];
 
   // Try graceful first (children-first).
+  if (!rootHolds()) return;
   for (const targetPid of descendants) bestEffortKillPid(targetPid, 'SIGTERM');
-  if (rootStopped) bestEffortKillPid(pid, 'SIGCONT');
+  if (rootStopped) {
+    if (!rootHolds()) return;
+    bestEffortKillPid(pid, 'SIGCONT');
+  }
+  if (!rootHolds()) return;
   bestEffortKillPid(pid, 'SIGTERM');
   await waitForAllGone(all, graceMs);
 
   const remaining = all.filter((p) => isAlive(p));
   if (remaining.length === 0) return;
 
-  for (const targetPid of remaining) bestEffortKillPid(targetPid, 'SIGKILL');
+  if (!rootHolds()) return;
+  for (const targetPid of remaining) {
+    if (targetPid !== pid) bestEffortKillPid(targetPid, 'SIGKILL');
+  }
+  if (remaining.includes(pid)) {
+    if (!rootHolds()) return;
+    bestEffortKillPid(pid, 'SIGKILL');
+  }
   await waitForAllGone(remaining, Math.min(250, graceMs));
 }
