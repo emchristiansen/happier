@@ -1,3 +1,9 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { readdir } from 'fs/promises';
+import { registerDirectoryHandlers } from './fileSystem/directoryHandlers';
+import type { RpcHandler, RpcHandlerRegistrar } from '@/api/rpc/types';
 import { describe, expect, it, vi } from 'vitest';
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
 
@@ -207,5 +213,35 @@ describe('registerFileSystemHandlers', () => {
     const result = await createDirectory({ path: 'tmp/new-folder' });
     expect(result).toMatchObject({ success: true });
     expect(mkdir).toHaveBeenCalledWith(resolve('/work/dir', 'tmp', 'new-folder'), { recursive: true });
+  });
+});
+
+
+describe('dedicated private native domain recursive filesystem boundary', () => {
+  it('omits private subtrees before stat while preserving ordinary sibling reads', async () => {
+    const actual = await vi.importActual<typeof import('fs/promises')>('fs/promises');
+    const root = await mkdtemp(join(tmpdir(), 'happier-private-tree-'));
+    try {
+      const privateDomain = join(root, 'private');
+      await actual.mkdir(privateDomain);
+      await actual.writeFile(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+      await actual.writeFile(join(privateDomain, 'private-raw-record.bin'), Buffer.from([0, 255, 10]));
+      await actual.writeFile(join(root, 'ordinary.txt'), 'ordinary original bytes');
+      const handlers = new Map<string, RpcHandler>();
+      const registrar: RpcHandlerRegistrar = { registerHandler(method, handler) { handlers.set(method, handler); } };
+      registerDirectoryHandlers(registrar, { defaultDirectory: root, accessPolicy: { kind: 'osUser' },
+        getAdditionalAllowedReadDirs: () => [], getAdditionalAllowedWriteDirs: () => [] });
+      const tree = handlers.get(RPC_METHODS.GET_DIRECTORY_TREE);
+      if (!tree) throw new Error('directory tree handler missing');
+      await vi.mocked(stat).withImplementation(actual.stat, async () => {
+        await vi.mocked(readdir).withImplementation(actual.readdir, async () => {
+          const result = await tree({ path: root, maxDepth: 3 });
+          expect(result).toMatchObject({ success: true, tree: { children: [{ name: 'ordinary.txt' }] } });
+          expect(JSON.stringify(result)).not.toContain('private-raw-record.bin');
+          expect(JSON.stringify(result)).not.toContain('"name":"private"');
+          expect(vi.mocked(stat).mock.calls.some(([path]) => String(path) === privateDomain)).toBe(false);
+        });
+      });
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 });

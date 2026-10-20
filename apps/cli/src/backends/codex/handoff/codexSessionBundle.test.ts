@@ -1,4 +1,5 @@
-import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { copySessionHandoffFileSlice, readSessionHandoffProviderBundleFile, writeSessionHandoffProviderBundleArtifact } from '@/session/handoff/sessionHandoffProviderBundleFile';
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -757,5 +758,126 @@ describe('codex session handoff bundle', () => {
         CODEX_HOME: codexHome,
       },
     })).rejects.toThrow(/CODEX_HOME|outside/i);
+  });
+});
+
+
+describe('dedicated private native domain handoff boundary', () => {
+  it.skipIf(process.platform === 'win32').each(['private', 'ordinary'] as const)(
+    '[SH-IO28-005] refuses a dangling handoff write target whose missing destination is %s', async (home) => {
+      const root = await mkdtemp(join(tmpdir(), 'happier-dangling-handoff-'));
+      try {
+        const privateDomain = join(root, 'private');
+        const ordinary = join(root, 'ordinary');
+        await mkdir(privateDomain);
+        await mkdir(ordinary);
+        await writeFile(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+        const original = Buffer.from([0, 255, 128, 10]);
+        const sourcePath = join(ordinary, 'source.bin');
+        await writeFile(sourcePath, original);
+        const targetPath = join(home === 'private' ? privateDomain : ordinary, 'new.bin');
+        const link = join(ordinary, 'link');
+        await symlink(targetPath, link);
+        await expect(copySessionHandoffFileSlice({
+          source: { t: 'happier.handoff.file.v1', filePath: sourcePath, offsetBytes: 0, sizeBytes: original.length },
+          targetFilePath: link,
+        })).rejects.toThrow('unable to inspect private native domain restriction');
+        await expect(readFile(targetPath)).rejects.toMatchObject({ code: 'ENOENT' });
+        expect(await readFile(sourcePath)).toEqual(original);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === 'win32')('[SH-IO28-005] preserves a plain missing ordinary handoff target and complete original bytes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-plain-missing-handoff-'));
+    try {
+      const original = Buffer.from([255, 0, 128, 10, 13]);
+      const sourcePath = join(root, 'source.bin');
+      const targetPath = join(root, 'new.bin');
+      await writeFile(sourcePath, original);
+      await copySessionHandoffFileSlice({
+        source: { t: 'happier.handoff.file.v1', filePath: sourcePath, offsetBytes: 0, sizeBytes: original.length },
+        targetFilePath: targetPath,
+      });
+      expect(await readFile(targetPath)).toEqual(original);
+      expect(await readFile(sourcePath)).toEqual(original);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === 'win32').each(['source', 'target'] as const)(
+    '[path-identity] refuses a private handoff %s reached through a symlink before ..', async (side) => {
+      const root = await mkdtemp(join(tmpdir(), 'happier-private-handoff-identity-'));
+      try {
+        const privateDomain = join(root, 'private');
+        const ordinary = join(root, 'ordinary');
+        await mkdir(join(privateDomain, 'child'), { recursive: true });
+        await mkdir(ordinary);
+        await writeFile(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+        const original = Buffer.from([0, 255, 128, 10]);
+        await writeFile(join(privateDomain, 'raw.bin'), original);
+        await writeFile(join(ordinary, 'raw.bin'), Buffer.from([1, 2, 3, 4]));
+        await symlink(join(privateDomain, 'child'), join(ordinary, 'alias'));
+        const sourcePath = side === 'source' ? `${ordinary}/alias/../raw.bin` : join(ordinary, 'raw.bin');
+        const targetPath = side === 'target' ? `${ordinary}/alias/../new.bin` : join(ordinary, 'copied.bin');
+        await expect(copySessionHandoffFileSlice({
+          source: { t: 'happier.handoff.file.v1', filePath: sourcePath, offsetBytes: 0, sizeBytes: original.length },
+          targetFilePath: targetPath,
+        })).rejects.toThrow('private native domain');
+        await expect(readFile(side === 'target' ? join(privateDomain, 'new.bin') : targetPath))
+          .rejects.toMatchObject({ code: 'ENOENT' });
+        expect(await readFile(join(privateDomain, 'raw.bin'))).toEqual(original);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === 'win32')('[path-identity] copies complete ordinary bytes using the effective source and target paths', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-ordinary-handoff-identity-'));
+    try {
+      await mkdir(join(root, 'actual', 'child'), { recursive: true });
+      await symlink(join(root, 'actual', 'child'), join(root, 'alias'));
+      const original = Buffer.from([255, 0, 128, 10, 13]);
+      await writeFile(join(root, 'actual', 'raw.bin'), original);
+      await writeFile(join(root, 'raw.bin'), Buffer.from([1, 2, 3, 4, 5]));
+      await copySessionHandoffFileSlice({
+        source: { t: 'happier.handoff.file.v1', filePath: `${root}/alias/../raw.bin`, offsetBytes: 0, sizeBytes: original.length },
+        targetFilePath: `${root}/alias/../copied.bin`,
+      });
+      expect(await readFile(join(root, 'actual', 'copied.bin'))).toEqual(original);
+      expect(await readFile(join(root, 'actual', 'raw.bin'))).toEqual(original);
+      await expect(readFile(join(root, 'copied.bin'))).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses private export, forged file slices, artifact reads and import targets while preserving original bytes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-private-handoff-'));
+    const privateDomain = join(root, 'private');
+    const ordinary = join(root, 'ordinary');
+    await mkdir(privateDomain);
+    await mkdir(ordinary);
+    await writeFile(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+    await mkdir(join(privateDomain, 'sessions'));
+    const raw = join(privateDomain, 'sessions', 'rollout-2026-01-02T00-00-00-private_thread.jsonl');
+    const original = Buffer.from([0, 255, 128, 10]);
+    await writeFile(raw, original);
+    await expect(exportCodexSessionBundle({ metadata: { path: '/repo', codexSessionId: 'private_thread', codexBackendMode: 'appServer' },
+      remoteSessionId: 'private_thread', env: { CODEX_HOME: privateDomain }, activeServerDir: root }))
+      .rejects.toThrow('private native domain');
+    const source = { t: 'happier.handoff.file.v1' as const, filePath: raw, offsetBytes: 0, sizeBytes: original.length };
+    await expect(copySessionHandoffFileSlice({ source, targetFilePath: join(ordinary, 'copied') })).rejects.toThrow('private native domain');
+    await expect(readSessionHandoffProviderBundleFile(raw)).rejects.toThrow('private native domain');
+    const bundle = { providerId: 'codex' as const, remoteSessionId: 'private_thread', files: [{ relativePath: 'sessions/copied.jsonl', contentFile: source }] };
+    await expect(writeSessionHandoffProviderBundleArtifact({ providerBundle: bundle, filePath: join(ordinary, 'artifact') }))
+      .rejects.toThrow('private native domain');
+    await expect(importCodexSessionBundle({ bundle: { ...bundle, files: [] }, targetPath: '/repo', env: { CODEX_HOME: privateDomain } }))
+      .rejects.toThrow('private native domain');
+    expect(await readFile(raw)).toEqual(original);
   });
 });

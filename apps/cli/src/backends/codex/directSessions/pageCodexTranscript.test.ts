@@ -25,6 +25,25 @@ function eventMsgLine(params: { timestamp: string; payload: Record<string, unkno
 }
 
 describe('pageCodexTranscript', () => {
+  it('refuses a dedicated private domain before ordinary transcript paging or preview fallback', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-private-codex-page-'));
+    const codexHome = join(root, 'private-domain');
+    await mkdir(codexHome);
+    await writeFile(join(codexHome, '.muninn-private-native-domain'), 'restriction');
+    const sessions = join(codexHome, 'sessions');
+    await mkdir(sessions);
+    const sessionId = '11111111-1111-1111-1111-111111111111';
+    await writeFile(join(sessions, `rollout-2026-01-02T00-00-00-${sessionId}.jsonl`),
+      sessionMetaLine({ id: sessionId, cwd: '/private/repo' }) + responseItemLine({
+        timestamp: '2026-01-02T00:00:01.000Z',
+        payload: { type: 'message', role: 'user', content: [{ type: 'text', text: 'private original bytes' }] },
+      }));
+    await expect(pageCodexTranscript({
+      source: { kind: 'codexHome', home: 'user' }, env: { CODEX_HOME: codexHome },
+      activeServerDir: join(root, 'server'), remoteSessionId: sessionId,
+      direction: 'older', maxBytes: 1024 * 1024, maxItems: 10,
+    })).rejects.toThrow('private native domain');
+  });
   it('pages newest-first (direction=older) from a rollout jsonl transcript', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-page-'));
     const codexHome = join(root, 'codex-home');

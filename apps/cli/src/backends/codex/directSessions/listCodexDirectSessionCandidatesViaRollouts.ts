@@ -1,3 +1,4 @@
+import { assertOrdinaryReaderPath, validateOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
 import { readdir, stat } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
@@ -27,6 +28,7 @@ async function collectRolloutFiles(params: Readonly<{
   archived: boolean;
   filenameIncludes?: string;
 }>): Promise<Array<{ filePath: string; mtimeMs: number; archived: boolean }>> {
+  assertOrdinaryReaderPath(params.rootDir);
   const out: Array<{ filePath: string; mtimeMs: number; archived: boolean }> = [];
   const maxDepth = Math.max(0, Math.trunc(params.maxDepth));
   const filenameIncludes = typeof params.filenameIncludes === 'string'
@@ -35,6 +37,7 @@ async function collectRolloutFiles(params: Readonly<{
 
   async function walk(dir: string, depth: number): Promise<void> {
     if (depth > maxDepth) return;
+    if (!validateOrdinaryReaderPath(dir).valid) return;
     let entries: any[];
     try {
       entries = await readdir(dir, { withFileTypes: true });

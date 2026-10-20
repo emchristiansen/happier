@@ -1,10 +1,13 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import * as childProcess from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { PassThrough, Writable } from 'node:stream';
 
 import { describe, expect, it, vi } from 'vitest';
 
 import { waitForCondition } from '@/testkit/async/waitFor';
+import { createDeferred } from '@/testkit/async/deferred';
 import { withTempDir } from '@/testkit/fs/tempDir';
 import {
     HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_ENV_KEY,
@@ -12,7 +15,7 @@ import {
 } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 import { HAPPIER_SPAWN_EXPLICIT_ENV_KEYS_JSON_ENV_VAR } from '@/daemon/spawn/spawnExplicitEnvKeysMarker';
 
-import { createCodexAppServerClient } from './createCodexAppServerClient';
+import { createCodexAppServerClient, type CodexAppServerPrivateIoEvent, type CodexAppServerPrivateIoOwner } from './createCodexAppServerClient';
 import {
     createCodexAppServerProcessEnv,
     createCodexAppServerTestEnvScope,
@@ -24,7 +27,544 @@ vi.mock('node:child_process', async (importOriginal) => {
     return { ...actual, spawn: vi.fn(actual.spawn) };
 });
 
+function createPipedProcessBoundary(onWrite: (message: Record<string, unknown>) => void) {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const stdin = new Writable({
+        write(chunk: Buffer, _encoding, callback) {
+            try {
+                onWrite(JSON.parse(chunk.toString('utf8')) as Record<string, unknown>);
+                callback();
+            } catch (error) {
+                callback(error instanceof Error ? error : new Error(String(error)));
+            }
+        },
+    });
+    // A fake child/pipe is the OS boundary; client framing, RPC and lifecycle stay real.
+    const child = Object.assign(new EventEmitter(), { stdin, stdout, stderr, pid: undefined }) as unknown as childProcess.ChildProcess;
+    vi.mocked(childProcess.spawn).mockReturnValueOnce(child);
+    return { child, stdin, stdout, stderr };
+}
+
+async function createPrivateProcessBoundary(owner: CodexAppServerPrivateIoOwner, onWrite?: (message: Record<string, unknown>) => void) {
+    const boundary = createPipedProcessBoundary((message) => {
+        if (message.method === 'initialize') {
+            boundary.stdout.write(JSON.stringify({ id: message.id, result: {} }) + '\n');
+        } else {
+            onWrite?.(message);
+        }
+    });
+    const client = await createCodexAppServerClient({
+        processEnv: { HAPPIER_CODEX_APP_SERVER_BIN: process.execPath },
+        io: { kind: 'private', owner },
+    });
+    const dispose = async () => {
+        const disposal = client.dispose();
+        boundary.child.emit('close', 0, null);
+        await disposal;
+    };
+    return { ...boundary, client, dispose };
+}
+
 describe('createCodexAppServerClient', () => {
+    it('[private-io] owns the first raw and parsed frame before initialization completes without ordinary RPC logging', async () => {
+        await withTempDir('happier-private-native-io-first-frame-', async (root) => {
+            const events: unknown[] = [];
+            const flush = vi.fn(async () => {});
+            let initializeId: unknown;
+            let initialized = false;
+            let observeInitialize: () => void = () => {};
+            const initializeObserved = new Promise<void>((resolve) => { observeInitialize = resolve; });
+            const processBoundary = createPipedProcessBoundary((message) => {
+                if (message.method === 'initialize') { initializeId = message.id; observeInitialize(); }
+            });
+            const ordinaryLog = join(root, 'ordinary-rpc.jsonl');
+            const construction = {
+                processEnv: { HAPPIER_CODEX_APP_SERVER_BIN: process.execPath, HAPPIER_CODEX_APP_SERVER_RPC_LOG_PATH: ordinaryLog },
+                io: { kind: 'private' as const, owner: { capture: (event: unknown) => { events.push(event); }, flush } },
+            };
+            const creation = createCodexAppServerClient(construction).then((client) => { initialized = true; return client; });
+            await initializeObserved;
+            const firstMessage = { method: 'item/started', params: { privateText: 'first-native-record' } };
+            const firstBytes = Buffer.from(JSON.stringify(firstMessage) + '\n');
+            const firstData = new Promise<void>((resolve) => processBoundary.stdout.once('data', () => resolve()));
+            processBoundary.stdout.write(firstBytes);
+            await firstData;
+            try {
+                expect(initialized).toBe(false);
+                expect(events).toContainEqual({ kind: 'raw', stream: 'stdout', bytes: firstBytes });
+                expect(events).toContainEqual({ kind: 'message', direction: 'incoming', message: firstMessage });
+            } finally {
+                processBoundary.stdout.write(JSON.stringify({ id: initializeId, result: {} }) + '\n');
+                const client = await creation;
+                const disposal = client.dispose();
+                processBoundary.child.emit('close', 0, null);
+                await disposal;
+            }
+            expect(flush).toHaveBeenCalledTimes(1);
+            await expect(readFile(ordinaryLog, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+        });
+    });
+
+    it('[private-io] retains exact split UTF-8 bytes, complete stderr, and both directions of RPC traffic', async () => {
+        const events: CodexAppServerPrivateIoEvent[] = [];
+        let observeResponse: (message: Record<string, unknown>) => void = () => {};
+        const response = new Promise<Record<string, unknown>>((resolve) => { observeResponse = resolve; });
+        const boundary = await createPrivateProcessBoundary({ capture: (event) => { events.push(event); }, flush: async () => {} }, (message) => {
+            if (message.method === 'private/request') {
+                boundary.stdout.write(JSON.stringify({ id: message.id, result: { exact: 'private-result' } }) + '\n');
+            }
+            if (message.id === 'native-request') observeResponse(message);
+        });
+        try {
+            boundary.client.registerRequestHandler('native/request', (params) => ({ retained: params }));
+            const notification = { method: 'native/notification', params: { text: 'α🐈' } };
+            const bytes = Buffer.from(JSON.stringify(notification) + '\n');
+            const split = bytes.indexOf(Buffer.from('🐈')) + 2;
+            boundary.stdout.write(bytes.subarray(0, split));
+            boundary.stdout.write(bytes.subarray(split));
+            const stderr = Buffer.concat([Buffer.alloc(9_000, 120), Buffer.from([0xff, 0, 0xfe])]);
+            boundary.stderr.write(stderr);
+            const nativeRequest = { id: 'native-request', method: 'native/request', params: { opaque: 'unmodified' } };
+            boundary.stdout.write(JSON.stringify(nativeRequest) + '\n');
+            expect(await response).toEqual({ id: 'native-request', result: { retained: nativeRequest.params } });
+            await boundary.client.notify('private/notification', { exact: 'outgoing' });
+            expect(await boundary.client.request('private/request', { exact: 'request' })).toEqual({ exact: 'private-result' });
+            expect(events).toContainEqual({ kind: 'raw', stream: 'stdout', bytes: bytes.subarray(0, split) });
+            expect(events).toContainEqual({ kind: 'raw', stream: 'stdout', bytes: bytes.subarray(split) });
+            expect(events).toContainEqual({ kind: 'raw', stream: 'stderr', bytes: stderr });
+            for (const message of [notification, nativeRequest]) {
+                expect(events).toContainEqual({ kind: 'frame', text: JSON.stringify(message) });
+                expect(events).toContainEqual({ kind: 'message', direction: 'incoming', message });
+            }
+            const written = Buffer.concat(events.filter((event) => event.kind === 'raw' && event.stream === 'stdin').map((event) => event.kind === 'raw' ? Buffer.from(event.bytes) : Buffer.alloc(0))).toString('utf8').trim().split('\n').map((line) => JSON.parse(line));
+            expect(written).toContainEqual({ method: 'private/notification', params: { exact: 'outgoing' } });
+            for (const message of written) expect(events).toContainEqual({ kind: 'message', direction: 'outgoing', message });
+            expect(events.some((event) => event.kind === 'message' && event.direction === 'incoming' && (event.message as { result?: unknown }).result !== undefined)).toBe(true);
+        } finally { await boundary.dispose(); }
+    });
+
+    it('[private-io] keeps native RPC error details in custody and returns a value-free failure', async () => {
+        const events: CodexAppServerPrivateIoEvent[] = [];
+        const nativeError = { code: -32000, message: 'private RPC failure text', data: { retained: 'native-error-data' } };
+        const boundary = await createPrivateProcessBoundary({ capture: (event) => { events.push(event); }, flush: async () => {} }, (message) => {
+            if (message.method === 'private/failure') boundary.stdout.write(JSON.stringify({ id: message.id, error: nativeError }) + '\n');
+        });
+        try {
+            await expect(boundary.client.request('private/failure')).rejects.toThrow('Private Codex app-server request failed; diagnostic values are not shown');
+            expect(events.some((event) => event.kind === 'message' && event.direction === 'incoming' && JSON.stringify(event.message).includes(JSON.stringify(nativeError)))).toBe(true);
+            expect(events.some((event) => event.kind === 'failure' && event.operation === 'request' && event.error instanceof Error && event.error.message.includes(nativeError.message))).toBe(true);
+        } finally { await boundary.dispose(); }
+    });
+
+    it.each(['malformed', 'stdout', 'stderr', 'stdin', 'launch', 'close'] as const)('[private-io] retains %s failure and keeps observers and pending requests free of its values', async (failureKind) => {
+        const events: CodexAppServerPrivateIoEvent[] = [];
+        const boundary = await createPrivateProcessBoundary({ capture: (event) => { events.push(event); }, flush: async () => {} });
+        const observed: Error[] = [];
+        boundary.client.onExit((error) => { observed.push(error); });
+        const pending = boundary.client.request('private/pending', {}, { timeoutMs: null }).catch((error: unknown) => error);
+        const original = new Error('private stream failure value');
+        const malformed = Buffer.from('private malformed frame\n');
+        try {
+            if (failureKind === 'malformed') boundary.stdout.write(malformed);
+            else if (failureKind === 'close') { boundary.stderr.write('private exit stderr'); boundary.child.emit('close', 37, 'SIGTERM'); }
+            else if (failureKind === 'launch') boundary.child.emit('error', original);
+            else boundary[failureKind].emit('error', original);
+            const failure = await pending;
+            expect(failure).toBeInstanceOf(Error);
+            expect((failure as Error).message).toContain('diagnostic values are not shown');
+            expect((failure as Error).message).not.toContain('private stream failure value');
+            expect((failure as Error).message).not.toContain('private exit stderr');
+            expect(observed).toEqual([failure]);
+            if (failureKind === 'malformed') {
+                expect(events).toContainEqual({ kind: 'raw', stream: 'stdout', bytes: malformed });
+                expect(events).toContainEqual({ kind: 'frame', text: 'private malformed frame' });
+                expect(events.some((event) => event.kind === 'failure' && event.operation === 'frame parsing' && event.error instanceof SyntaxError)).toBe(true);
+            } else if (failureKind === 'close') {
+                expect(events).toContainEqual({ kind: 'close', code: 37, signal: 'SIGTERM' });
+            } else expect(events).toContainEqual({ kind: 'failure', operation: failureKind, error: original });
+        } finally { await boundary.dispose(); }
+    });
+
+    it('[private-io] refuses after capture failure, and preserves owner flush failures in custody', async () => {
+        const events: CodexAppServerPrivateIoEvent[] = [];
+        const captureError = new Error('private capture failure');
+        const flushError = new Error('private flush failure');
+        const boundary = await createPrivateProcessBoundary({
+            capture: (event) => {
+                if (event.kind === 'raw' && event.stream === 'stderr') throw captureError;
+                events.push(event);
+            },
+            flush: async () => { throw flushError; },
+        });
+        boundary.stderr.write('private stderr');
+        await expect(boundary.client.notify('must/not/write')).rejects.toThrow('diagnostic values are not shown');
+        await expect(boundary.dispose()).rejects.toThrow('Private Codex app-server disposal flush failed; diagnostic values are not shown');
+        expect(events).toContainEqual({ kind: 'failure', operation: 'capture', error: captureError });
+        expect(events).toContainEqual({ kind: 'failure', operation: 'disposal flush', error: flushError });
+        expect(events.some((event) => event.kind === 'message' && event.direction === 'outgoing' && (event.message as { method?: string }).method === 'must/not/write')).toBe(false);
+    });
+
+    it.each(['outgoing', 'failure-record', 'queued-write'] as const)('[private-io-terminal] forbids later native writes after one %s custody failure even when the owner recovers', async (failurePoint) => {
+        const events: CodexAppServerPrivateIoEvent[] = [];
+        const writes: Record<string, unknown>[] = [];
+        const captureFailure = new Error('private one-shot custody failure');
+        let failed = false;
+        const boundary = await createPrivateProcessBoundary({
+            capture: (event) => {
+                events.push(event);
+                if (failed) return;
+                const failOutgoing = event.kind === 'message' && event.direction === 'outgoing' && (event.message as { method?: string }).method === 'fail/custody';
+                const failFailureRecord = event.kind === 'failure' && event.operation === 'request';
+                if ((failurePoint === 'failure-record' && failFailureRecord) || (failurePoint !== 'failure-record' && failOutgoing)) {
+                    failed = true;
+                    throw captureFailure;
+                }
+            },
+            flush: async () => {},
+        }, (message) => {
+            writes.push(message);
+            if (message.method === 'private/rpc-error') boundary.stdout.write(JSON.stringify({ id: message.id, error: { code: -32000, message: 'private native refusal' } }) + '\n');
+        });
+        try {
+            const queued = failurePoint === 'queued-write'
+                ? boundary.client.notify('queued/before-custody').then(() => null, (error: unknown) => error)
+                : null;
+            if (failurePoint === 'failure-record') await expect(boundary.client.request('private/rpc-error')).rejects.toThrow('failure custody');
+            else await expect(boundary.client.notify('fail/custody')).rejects.toThrow('diagnostic values are not shown');
+            expect(failed).toBe(true);
+            await expect(boundary.client.notify('later/notification')).rejects.toThrow('diagnostic values are not shown');
+            await expect(boundary.client.request('later/request')).rejects.toThrow('diagnostic values are not shown');
+            if (queued) expect(await queued).toBeInstanceOf(Error);
+            expect(writes.filter((message) => message.method !== 'initialized' && message.method !== 'private/rpc-error')).toEqual([]);
+            await expect(boundary.dispose()).rejects.toThrow('diagnostic values are not shown');
+        } finally {
+            await boundary.dispose().catch(() => undefined);
+        }
+    });
+
+    it('[private-io-reentry] refuses the outer write when raw capture reenters a failing notification', async () => {
+        const writes: Record<string, unknown>[] = [];
+        const events: CodexAppServerPrivateIoEvent[] = [];
+        const captureError = new Error('private nested capture failure');
+        let nested: Promise<unknown> | null = null;
+        const boundary = await createPrivateProcessBoundary({
+            capture: (event) => {
+                events.push(event);
+                if (event.kind === 'message' && event.direction === 'outgoing' && (event.message as { method?: string }).method === 'nested/custody') {
+                    throw captureError;
+                }
+                if (event.kind === 'raw' && event.stream === 'stdin' && JSON.parse(Buffer.from(event.bytes).toString('utf8')).method === 'outer/notification') {
+                    // The outer capture returns normally after this synchronous nested capture fails.
+                    nested = boundary.client.notify('nested/custody').then(() => null, (error: unknown) => error);
+                }
+            },
+            flush: async () => {},
+        }, (message) => { writes.push(message); });
+        try {
+            const outer = await boundary.client.notify('outer/notification').then(() => null, (error: unknown) => error);
+            expect(nested).not.toBeNull();
+            expect(await nested).toBeInstanceOf(Error);
+            expect(outer).toBeInstanceOf(Error);
+            await expect(boundary.client.notify('future/notification')).rejects.toThrow('diagnostic values are not shown');
+            await expect(boundary.client.request('future/request')).rejects.toThrow('diagnostic values are not shown');
+            expect(writes.filter((message) => message.method !== 'initialized')).toEqual([]);
+            expect(events).toContainEqual({ kind: 'failure', operation: 'capture', error: captureError });
+            await expect(boundary.dispose()).rejects.toThrow('diagnostic values are not shown');
+        } finally {
+            await boundary.dispose().catch(() => undefined);
+        }
+    });
+
+    it.each(['notification', 'request', 'exit'] as const)('[private-io-async] drains a deferred %s failure before disposal flush', async (kind) => {
+        const pending: CodexAppServerPrivateIoEvent[] = [];
+        const drained: CodexAppServerPrivateIoEvent[] = [];
+        const failure = new Error('private deferred callback failure');
+        const gate = createDeferred();
+        const started = createDeferred();
+        const capturedFailure = createDeferred();
+        const flush = vi.fn(async () => { drained.push(...pending.splice(0)); });
+        const boundary = await createPrivateProcessBoundary({
+            capture: (event) => {
+                pending.push(event);
+                if (event.kind === 'failure' && event.error === failure) capturedFailure.resolve();
+            },
+            flush,
+        });
+        const handler = () => { started.resolve(); return gate.promise; };
+        if (kind === 'notification') boundary.client.registerNotificationHandler('native/deferred', handler);
+        else if (kind === 'request') boundary.client.registerRequestHandler('native/deferred', handler);
+        else boundary.client.onExit(handler);
+        if (kind === 'exit') boundary.child.emit('error', new Error('private process failure'));
+        else boundary.stdout.write(JSON.stringify({ ...(kind === 'request' ? { id: 'deferred-request' } : {}), method: 'native/deferred' }) + '\n');
+        await started.promise;
+        let disposed = false;
+        const disposal = boundary.dispose().then(() => { disposed = true; });
+        try {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            expect(disposed).toBe(false);
+            expect(flush).not.toHaveBeenCalled();
+            gate.reject(failure);
+            await capturedFailure.promise;
+            await disposal;
+            expect(flush).toHaveBeenCalledTimes(1);
+            expect(pending).toEqual([]);
+            expect(drained).toContainEqual(expect.objectContaining({ kind: 'failure', error: failure }));
+            expect(drained).toContainEqual({ kind: 'close', code: 0, signal: null });
+        } finally {
+            gate.reject(failure);
+            await capturedFailure.promise;
+            await disposal;
+        }
+    });
+
+    it.each(['before-await', 'after-await'] as const)('[private-io-async] refuses %s reentrant disposal before returning an existing disposal promise', async (phase) => {
+        const events: CodexAppServerPrivateIoEvent[] = [];
+        const gate = createDeferred();
+        const started = createDeferred();
+        const reentrant = createDeferred<unknown>();
+        const flush = vi.fn(async () => {});
+        const boundary = await createPrivateProcessBoundary({ capture: (event) => { events.push(event); }, flush });
+        boundary.client.registerNotificationHandler('native/reentrant-disposal', async () => {
+            started.resolve();
+            if (phase === 'after-await') await gate.promise;
+            const result = await boundary.client.dispose().then(() => null, (error: unknown) => error);
+            reentrant.resolve(result);
+        });
+        boundary.stdout.write(JSON.stringify({ method: 'native/reentrant-disposal' }) + '\n');
+        await started.promise;
+        const disposal = boundary.dispose();
+        gate.resolve();
+        const result = await reentrant.promise;
+        await disposal;
+        expect(result).toBeInstanceOf(Error);
+        expect(events).toContainEqual(expect.objectContaining({ kind: 'failure', operation: 'reentrant disposal' }));
+        expect(flush).toHaveBeenCalledTimes(1);
+    });
+
+    it('[private-io-async] allows another client and settled callback descendants to dispose', async () => {
+        const events: CodexAppServerPrivateIoEvent[] = [];
+        const firstFlush = vi.fn(async () => {});
+        const secondFlush = vi.fn(async () => {});
+        const first = await createPrivateProcessBoundary({ capture: (event) => { events.push(event); }, flush: firstFlush });
+        const second = await createPrivateProcessBoundary({ capture: () => {}, flush: secondFlush });
+        const gate = createDeferred();
+        const callbackFinished = createDeferred();
+        let descendant: Promise<void> | null = null;
+        first.client.registerNotificationHandler('native/other-client', async () => {
+            await Promise.resolve();
+            await second.dispose();
+            descendant = gate.promise.then(() => first.dispose());
+            callbackFinished.resolve();
+        });
+        first.stdout.write(JSON.stringify({ method: 'native/other-client' }) + '\n');
+        await callbackFinished.promise;
+        // The callback has settled before its independently gated descendant runs.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        gate.resolve();
+        expect(descendant).not.toBeNull();
+        await expect(descendant).resolves.toBeUndefined();
+        expect(firstFlush).toHaveBeenCalledTimes(1);
+        expect(secondFlush).toHaveBeenCalledTimes(1);
+        expect(events.some((event) => event.kind === 'failure' && event.operation === 'reentrant disposal')).toBe(false);
+    });
+
+    it('[private-io-async] closes callback registration and native dispatch before final disposal flush', async () => {
+        const events: CodexAppServerPrivateIoEvent[] = [];
+        const pending: CodexAppServerPrivateIoEvent[] = [];
+        const boundary = await createPrivateProcessBoundary({
+            capture: (event) => { events.push(event); pending.push(event); },
+            flush: async () => { pending.splice(0); },
+        });
+        const invoked = vi.fn();
+        boundary.client.registerRequestHandler('native/after-shutdown', invoked);
+        boundary.client.registerNotificationHandler('native/after-shutdown', invoked);
+        boundary.child.emit('error', new Error('private original process failure'));
+        const disposal = boundary.client.dispose();
+        boundary.stdout.write(JSON.stringify({ method: 'native/after-shutdown' }) + '\n');
+        boundary.stdout.write(JSON.stringify({ id: 'after-shutdown', method: 'native/after-shutdown' }) + '\n');
+        boundary.child.emit('close', 0, null);
+        await disposal;
+        const finalCount = events.length;
+        // reportedExitFailure is already set; late registration must not invoke its replay branch.
+        const refusals = [
+            () => boundary.client.registerRequestHandler('late/request', invoked),
+            () => boundary.client.registerNotificationHandler('late/notification', invoked),
+            () => boundary.client.onExit(invoked),
+        ].map((register) => {
+            try { register(); return null; }
+            catch (error) { return error; }
+        });
+        expect(refusals.every((error) => error instanceof Error)).toBe(true);
+        expect(invoked).not.toHaveBeenCalled();
+        await expect(boundary.client.request('late/already-aborted', undefined, { signal: AbortSignal.abort() })).rejects.toThrow('diagnostic values are not shown');
+        expect(events).toHaveLength(finalCount);
+        expect(pending).toEqual([]);
+    });
+
+    it('[private-io-async] settles an existing pipe write and refuses queued writes before final flush', async () => {
+        const pending: CodexAppServerPrivateIoEvent[] = [];
+        const flush = vi.fn(async () => { pending.splice(0); });
+        const boundary = await createPrivateProcessBoundary({ capture: (event) => { pending.push(event); }, flush });
+        const firstWrite = createDeferred();
+        const nativeMethods: string[] = [];
+        let finishWrite: (() => void) | null = null;
+        const write = vi.spyOn(boundary.stdin, 'write').mockImplementation((chunk, _encoding, callback) => {
+            const method = (JSON.parse(String(chunk)) as { method: string }).method;
+            nativeMethods.push(method);
+            if (method === 'first/pending') {
+                finishWrite = () => { if (typeof callback === 'function') callback(undefined); };
+                firstWrite.resolve();
+            } else if (typeof callback === 'function') callback(undefined);
+            return true;
+        });
+        const first = boundary.client.notify('first/pending');
+        const queued = boundary.client.notify('second/queued').then(() => null, (error: unknown) => error);
+        await firstWrite.promise;
+        const disposal = boundary.dispose();
+        try {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            const flushesBeforeWriteSettled = flush.mock.calls.length;
+            if (!finishWrite) throw new Error('Expected pending native pipe callback');
+            (finishWrite as () => void)();
+            await first;
+            const queuedResult = await queued;
+            await disposal;
+            expect({ flushesBeforeWriteSettled, queuedRefused: queuedResult instanceof Error, nativeMethods, pending, finalFlushes: flush.mock.calls.length }).toEqual({
+                flushesBeforeWriteSettled: 0, queuedRefused: true, nativeMethods: ['first/pending'], pending: [], finalFlushes: 1,
+            });
+        } finally {
+            if (finishWrite) (finishWrite as () => void)();
+            await first;
+            await queued;
+            await disposal;
+            write.mockRestore();
+        }
+    });
+
+    it('[private-io-shutdown-reentry] refuses a native write when raw capture initiates disposal', async () => {
+        const pending: CodexAppServerPrivateIoEvent[] = [];
+        const writes: Record<string, unknown>[] = [];
+        const flush = vi.fn(async () => { pending.splice(0); });
+        let disposal: Promise<void> | null = null;
+        const boundary = await createPrivateProcessBoundary({
+            capture: (event) => {
+                pending.push(event);
+                if (event.kind === 'raw' && event.stream === 'stdin' && JSON.parse(Buffer.from(event.bytes).toString('utf8')).method === 'dispose/during-capture') {
+                    disposal = boundary.client.dispose();
+                    boundary.child.emit('close', 0, null);
+                }
+            },
+            flush,
+        }, (message) => { writes.push(message); });
+        const result = await boundary.client.notify('dispose/during-capture').then(() => null, (error: unknown) => error);
+        expect(disposal).not.toBeNull();
+        await disposal;
+        expect({ refused: result instanceof Error, writes: writes.filter((message) => message.method !== 'initialized'), pending, flushes: flush.mock.calls.length }).toEqual({
+            refused: true, writes: [], pending: [], flushes: 1,
+        });
+    });
+
+    it('[private-io-disposal-latch] memoizes disposal before a synchronous owner reenters its failure capture', async () => {
+        const pending: CodexAppServerPrivateIoEvent[] = [];
+        const captured: CodexAppServerPrivateIoEvent[] = [];
+        const flush = vi.fn(async () => { pending.splice(0); });
+        let reentered = false;
+        let nested: Promise<void> | null = null;
+        const boundary = await createPrivateProcessBoundary({
+            capture: (event) => {
+                captured.push(event);
+                pending.push(event);
+                if (event.kind === 'failure' && event.operation === 'disposal' && !reentered) {
+                    // Bound the counterexample to one nested call; never recurse toward a host limit.
+                    reentered = true;
+                    nested = boundary.client.dispose();
+                }
+            },
+            flush,
+        });
+        const disposal = boundary.dispose();
+        await disposal;
+        expect(nested).not.toBeNull();
+        await nested;
+        expect(captured.filter((event) => event.kind === 'failure' && event.operation === 'disposal')).toHaveLength(1);
+        expect(flush).toHaveBeenCalledTimes(1);
+        expect(pending).toEqual([]);
+    });
+
+    it('preserves ordinary callback disposal control semantics', async () => {
+        const boundary = createPipedProcessBoundary((message) => {
+            if (message.method === 'initialize') boundary.stdout.write(JSON.stringify({ id: message.id, result: {} }) + '\n');
+        });
+        const client = await createCodexAppServerClient({ processEnv: { HAPPIER_CODEX_APP_SERVER_BIN: process.execPath } });
+        const finished = createDeferred();
+        client.registerNotificationHandler('ordinary/disposal', async () => {
+            await Promise.resolve();
+            await client.dispose();
+            finished.resolve();
+        });
+        boundary.stdout.write(JSON.stringify({ method: 'ordinary/disposal' }) + '\n');
+        boundary.child.emit('close', 0, null);
+        await finished.promise;
+        await expect(client.dispose()).resolves.toBeUndefined();
+    });
+
+    it('[private-io] captures construction failure before an ordinary logger can be created', async () => {
+        await withTempDir('happier-private-construction-failure-', async (root) => {
+            const events: CodexAppServerPrivateIoEvent[] = [];
+            const original = new Error('private spawn failure');
+            const flush = vi.fn(async () => {});
+            vi.mocked(childProcess.spawn).mockImplementationOnce(() => { throw original; });
+            const ordinaryLog = join(root, 'ordinary-rpc.jsonl');
+            await expect(createCodexAppServerClient({
+                processEnv: { HAPPIER_CODEX_APP_SERVER_BIN: process.execPath, HAPPIER_CODEX_APP_SERVER_RPC_LOG_PATH: ordinaryLog },
+                io: { kind: 'private', owner: { capture: (event) => { events.push(event); }, flush } },
+            })).rejects.toThrow('Private Codex app-server construction failed; diagnostic values are not shown');
+            expect(events).toContainEqual({ kind: 'failure', operation: 'construction', error: original });
+            expect(flush).toHaveBeenCalledTimes(1);
+            await expect(readFile(ordinaryLog, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+        });
+    });
+
+    it('[private-io-drain] retains initialization and cleanup failures before the final constructor flush', async () => {
+        const events: CodexAppServerPrivateIoEvent[] = [];
+        const pending: CodexAppServerPrivateIoEvent[] = [];
+        const drained: CodexAppServerPrivateIoEvent[] = [];
+        const afterFlush: CodexAppServerPrivateIoEvent[] = [];
+        let flushed = false;
+        const flush = vi.fn(async () => {
+            drained.push(...pending.splice(0));
+            flushed = true;
+        });
+        const nativeError = { code: -32001, message: 'private initialize failure', data: { retained: 'complete' } };
+        const boundary = createPipedProcessBoundary((message) => {
+            if (message.method !== 'initialize') return;
+            boundary.stdout.write(JSON.stringify({ id: message.id, error: nativeError }) + '\n');
+        });
+        await expect(createCodexAppServerClient({
+            processEnv: { HAPPIER_CODEX_APP_SERVER_BIN: process.execPath },
+            io: { kind: 'private', owner: {
+                capture: (event) => {
+                    events.push(event);
+                    pending.push(event);
+                    if (flushed) afterFlush.push(event);
+                    if (event.kind === 'failure' && event.operation === 'disposal') {
+                        queueMicrotask(() => { boundary.child.emit('close', 1, null); });
+                    }
+                },
+                flush,
+            } },
+        })).rejects.toThrow('Private Codex app-server construction failed; diagnostic values are not shown');
+        expect(events.some((event) => event.kind === 'message' && event.direction === 'incoming' && JSON.stringify(event.message).includes(JSON.stringify(nativeError)))).toBe(true);
+        expect(events.some((event) => event.kind === 'failure' && event.operation === 'construction' && event.error instanceof Error && event.error.message.includes(nativeError.message))).toBe(true);
+        expect(flush).toHaveBeenCalledTimes(1);
+        expect(afterFlush).toEqual([]);
+        expect(pending).toEqual([]);
+        expect(drained).toEqual(events);
+        expect(drained.filter((event) => event.kind === 'failure').map((event) => event.kind === 'failure' ? event.operation : null)).toEqual(['construction', 'disposal']);
+        expect(drained.at(-1)).toEqual({ kind: 'close', code: 1, signal: null });
+    });
+
     it('settles pending requests and reports stdin failure without an uncaught stream error', async () => {
         await withTempDir('happier-codex-app-server-client-stdin-error-', async (root) => {
             const fakeAppServer = await writeFakeCodexAppServerScript({

@@ -1,3 +1,4 @@
+import { assertOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
 import { randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -61,6 +62,7 @@ async function projectBundleFiles(value: unknown): Promise<Readonly<{
   const visit = async (current: unknown, inArray: boolean): Promise<unknown> => {
     const source = readSourceFile(current);
     if (source) {
+      assertOrdinaryReaderPath(source.filePath);
       const sourceStats = await stat(source.filePath);
       if (source.offsetBytes + source.sizeBytes > sourceStats.size) {
         throw new Error('Invalid session handoff file reference');
@@ -98,6 +100,7 @@ async function appendFile(
   source: SessionHandoffFileSlice,
   onBytesWritten?: (bytesWritten: number) => void,
 ): Promise<void> {
+  assertOrdinaryReaderPath(source.filePath);
   const input = await open(source.filePath, 'r');
   try {
     let remaining = source.sizeBytes;
@@ -132,6 +135,7 @@ export async function writeSessionHandoffProviderBundleArtifact(params: Readonly
   filePath: string;
   onProgress?: (progress: Readonly<{ currentBytes: number; totalBytes: number }>) => void;
 }>): Promise<Readonly<{ sizeBytes: number; manifestHash: string }>> {
+  assertOrdinaryReaderPath(params.filePath);
   const normalized = SessionHandoffProviderBundleSchema.parse(params.providerBundle);
   assertCanonicalSessionHandoffProviderBundle(normalized);
   const projected = await projectBundleFiles(normalized);
@@ -245,6 +249,7 @@ function materializeBundleFiles(params: Readonly<{
 export async function readSessionHandoffProviderBundleFile(
   providerBundleFilePath: string,
 ): Promise<SessionHandoffProviderBundle> {
+  assertOrdinaryReaderPath(providerBundleFilePath);
   const file = await open(providerBundleFilePath, 'r');
   try {
     const prefix = await readExactly(file, ARTIFACT_MAGIC.length, 0).catch(() => null);
@@ -308,6 +313,8 @@ export async function copySessionHandoffFileSlice(params: Readonly<{
   source: SessionHandoffFileSlice;
   targetFilePath: string;
 }>): Promise<void> {
+  assertOrdinaryReaderPath(params.source.filePath);
+  assertOrdinaryReaderPath(params.targetFilePath);
   const source = await open(params.source.filePath, 'r');
   const target = await open(params.targetFilePath, 'w', 0o600);
   try {

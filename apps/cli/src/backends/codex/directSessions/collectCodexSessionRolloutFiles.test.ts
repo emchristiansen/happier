@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -72,5 +72,43 @@ describe('collectCodexSessionRolloutFiles', () => {
     expect(files.map((file) => file.fileRelPath)).toEqual([
       `sessions/custom/tree/rollout-2026-02-14T08-28-05-${remoteSessionId}.jsonl`,
     ]);
+  });
+});
+
+
+describe('dedicated private native domain rollout collection', () => {
+  beforeEach(async () => {
+    readdirMock.mockReset();
+    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    readdirMock.mockImplementation(actual.readdir);
+  });
+
+  it('refuses a symlinked private sessions root before readdir', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-private-rollout-alias-'));
+    const home = join(root, 'ordinary');
+    const privateDomain = join(root, 'private');
+    await mkdir(home);
+    await mkdir(privateDomain);
+    await writeFile(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+    await mkdir(join(privateDomain, 'sessions'));
+    await symlink(join(privateDomain, 'sessions'), join(home, 'sessions'));
+    readdirMock.mockClear();
+    await expect(collectCodexSessionRolloutFiles({ codexHome: home, remoteSessionId: 'private-thread' }))
+      .rejects.toThrow('private native domain');
+    expect(readdirMock).not.toHaveBeenCalled();
+  });
+
+  it('preserves ordinary rollout discovery in a mixed container without entering a private child', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'happier-private-mixed-rollouts-'));
+    const sessions = join(home, 'sessions');
+    const privateDomain = join(sessions, 'dedicated-private');
+    await mkdir(privateDomain, { recursive: true });
+    await writeFile(join(privateDomain, '.muninn-private-native-domain'), 'restriction');
+    await writeFile(join(privateDomain, 'rollout-2026-01-02T00-00-00-thread.jsonl'), 'private bytes');
+    const ordinary = join(sessions, 'rollout-2026-01-01T00-00-00-thread.jsonl');
+    await writeFile(ordinary, 'ordinary bytes');
+    const files = await collectCodexSessionRolloutFiles({ codexHome: home, remoteSessionId: 'thread' });
+    expect(files.map(file => file.filePath)).toEqual([ordinary]);
+    expect(readdirMock.mock.calls.some(([path]) => path === privateDomain)).toBe(false);
   });
 });

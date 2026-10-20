@@ -1,3 +1,4 @@
+import { assertOrdinaryReaderPath, validateOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
 import { open, readdir, stat } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
@@ -81,12 +82,14 @@ async function isOwnedFreshRootRollout(opts: {
 type RolloutFileEntry = Readonly<{ filePath: string; mtimeMs: number }>;
 
 async function collectRolloutFiles(opts: ScanOptions): Promise<RolloutFileEntry[]> {
+    assertOrdinaryReaderPath(opts.sessionsRootDir);
     const results: string[] = [];
     const maxDepth = Math.max(0, typeof opts.maxDepth === 'number' ? opts.maxDepth : 10);
     const scanLimit = Math.max(0, opts.scanLimit);
 
     async function walk(dir: string, depth: number): Promise<void> {
         if (depth >= maxDepth || results.length >= scanLimit) return;
+        if (!validateOrdinaryReaderPath(dir).valid) return;
 
         let entries: any[];
         try {
@@ -132,6 +135,7 @@ async function collectRolloutFiles(opts: ScanOptions): Promise<RolloutFileEntry[
 }
 
 async function readFirstLine(filePath: string): Promise<string | null> {
+    assertOrdinaryReaderPath(filePath);
     const maxProbeBytes = 64 * 1024;
     const chunkBytes = 4 * 1024;
     try {
