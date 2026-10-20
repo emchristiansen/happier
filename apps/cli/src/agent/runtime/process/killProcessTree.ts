@@ -79,7 +79,9 @@ export type ProcessTreeRootIdentity = 'same' | 'not_same' | 'unreadable';
  *   sent nothing further.
  * - `root_unreadable_suspended`: this call SIGSTOPped the root and could not re-identify it, so it was
  *   deliberately left stopped rather than resumed or signalled blind.
- * Descendants enumerated under the verified root are terminated in every case.
+ * Descendants are signalled only from a process snapshot validated by verifying the root both before
+ * and after it was taken; validated descendants are then terminated whatever the root does later.
+ * If the root fails the check after the snapshot, the snapshot is discarded and no descendant is signalled.
  */
 export type GuardedProcessTreeKillOutcome = 'completed' | 'root_not_same' | 'root_unreadable' | 'root_unreadable_suspended';
 
@@ -140,8 +142,15 @@ async function killProcessTreeCore(pid: number, graceMs: number, guard: RootGuar
     descendants = [];
   }
 
-  // Try graceful first (children-first). Descendants enumerated under the stopped, verified root
-  // belong to its tree and are cleaned up whether or not the root later exits or stops matching.
+  // The snapshot selects descendants by parent pid alone, so it describes the intended root's tree
+  // only if the root was still that instance once the snapshot existed. If the root was killed and its
+  // pid reused while the snapshot was taken, the listed children belong to another process. A root that
+  // fails this check, or cannot be identified, leaves the snapshot unverified: signal none of it.
+  if (guard && !await rootHolds()) return rootOutcome;
+
+  // Try graceful first (children-first). These descendants were enumerated under a root verified both
+  // before and after the snapshot, so they belong to its tree and are cleaned up whether or not the
+  // root later exits or stops matching.
   for (const targetPid of descendants) bestEffortKillPid(targetPid, 'SIGTERM');
   if (rootStopped && await rootHolds()) {
     bestEffortKillPid(pid, 'SIGCONT');
@@ -175,9 +184,10 @@ export async function killProcessTree(
 
 /**
  * `killProcessTree` for a root whose pid must still name one exact process instance. The guard is
- * read immediately before every signal to the root; it never gates descendants already enumerated
- * under the verified root. An unreadable identity after this call suspended the root is retried
- * with a short bounded backoff, then the root is left stopped rather than resumed blind.
+ * read immediately before every signal to the root, and once more after the descendant snapshot:
+ * descendants are signalled only if the root is verified both before and after that snapshot, and
+ * from then on the guard no longer gates them. An unreadable identity after this call suspended the
+ * root is retried with a short bounded backoff, then the root is left stopped rather than resumed blind.
  */
 export async function killProcessTreeGuarded(
   proc: ProcessTreeRoot,

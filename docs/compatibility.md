@@ -277,8 +277,13 @@ the runner. Once the pid is gone or is positively another instance, the runner
 receives nothing further. If the runner was suspended for descendant enumeration
 and its instance then cannot be read, the read is retried briefly, and the runner
 is otherwise left suspended (never resumed or killed blind) and logged by pid.
-Descendants enumerated under the verified, suspended runner are still terminated,
-with SIGKILL for survivors, even after the runner exits or stops matching. Any of
+Descendants are signalled only from a process snapshot taken while the runner was
+verified both before and after it; those are still terminated, with SIGKILL for
+survivors, even after the runner later exits or stops matching. If the runner fails
+the check after the snapshot, no enumerated descendant is signalled. A fingerprint
+read under a different method (Linux falls back from `/proc` to `ps`) never counts
+as proof that the pid was reused, so a later Resume cannot treat a suspended runner
+read that way as gone. Any of
 these outcomes makes the Stop incomplete, so replacement does not spawn. The check
 and the signal are still separate system calls, so a pid reused at that instant is
 not excluded. A report from any other incarnation,

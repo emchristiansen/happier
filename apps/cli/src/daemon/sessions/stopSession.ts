@@ -27,6 +27,7 @@ import {
   processInstanceFingerprintMatches,
   readProcessInstanceFingerprintSync,
 } from '@happier-dev/cli-common/processInstance';
+import { processInstanceFingerprintsProveDifferentInstances } from '../processInstanceFingerprintEvidence';
 import { isPidSafeHappySessionProcess } from '../pidSafety';
 import type { TrackedSession } from '../types';
 import { recordTerminalHostKillAudit } from '@/daemon/sessionKillAudit';
@@ -60,11 +61,6 @@ function isTrackedChildStillLiveForPid(session: TrackedSession, pid: number): bo
  */
 type ExactRunnerIdentityReader = (pid: number) => ProcessTreeRootIdentity;
 
-function fingerprintScheme(fingerprint: string): string {
-  const separator = fingerprint.indexOf(':');
-  return separator > 0 ? fingerprint.slice(0, separator) : '';
-}
-
 function isProcessAliveDefault(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -88,7 +84,7 @@ function createExactRunnerIdentityReader(params: Readonly<{
     if (!params.isProcessAlive(pid)) return 'not_same';
     // A different value under the same scheme is a positively different instance. A missing value,
     // or one from another scheme (such as the `ps` fallback), says nothing about which process it is.
-    if (observed && fingerprintScheme(observed) === fingerprintScheme(expected)) return 'not_same';
+    if (processInstanceFingerprintsProveDifferentInstances(expected, observed)) return 'not_same';
     return 'unreadable';
   };
 }

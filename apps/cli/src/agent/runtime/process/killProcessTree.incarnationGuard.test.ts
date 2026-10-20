@@ -109,9 +109,9 @@ describe('killProcessTree root identity guard', () => {
     })).resolves.toBe('root_unreadable_suspended');
 
     expect(rootSignals(calls)).toEqual(['SIGSTOP']);
-    // Descendants captured under the verified, stopped root keep their cleanup.
-    expect(childSignals(calls)).toEqual(['SIGTERM', 'SIGKILL']);
-    // The bounded retry ran before settling: the pre-SIGSTOP read, then the first post-SIGSTOP read and its retries.
+    // The root could not be verified after the snapshot, so the snapshot's children are not signalled.
+    expect(childSignals(calls)).toEqual([]);
+    // The bounded retry ran before settling: the pre-SIGSTOP read, then the post-snapshot read and its retries.
     expect(readRootIdentity.mock.calls.length).toBe(1 + 1 + NO_RETRY_WAIT.length);
   });
 
@@ -135,9 +135,11 @@ describe('killProcessTree root identity guard', () => {
     expect(childSignals(calls)).toEqual(['SIGTERM', 'SIGKILL']);
   });
 
-  it('keeps descendant cleanup when the root is replaced during enumeration', async () => {
+  it('signals no enumerated child when the root is replaced during enumeration', async () => {
     if (process.platform === 'win32') return;
     let rootReplaced = false;
+    // The root is killed externally and its pid reused while the snapshot is taken; the listed child
+    // belongs to the unrelated process now holding ROOT_PID.
     psListMock.mockImplementation(async () => {
       rootReplaced = true;
       return [{ pid: CHILD_PID, ppid: ROOT_PID, name: 'child' }];
@@ -151,7 +153,26 @@ describe('killProcessTree root identity guard', () => {
     })).resolves.toBe('root_not_same');
 
     expect(rootSignals(calls)).toEqual(['SIGSTOP']);
-    expect(childSignals(calls)).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(childSignals(calls)).toEqual([]);
+  });
+
+  it('signals no enumerated child when the root turns unreadable between the snapshot and its check', async () => {
+    if (process.platform === 'win32') return;
+    let rootUnreadable = false;
+    psListMock.mockImplementation(async () => {
+      rootUnreadable = true;
+      return [{ pid: CHILD_PID, ppid: ROOT_PID, name: 'child' }];
+    });
+    const { calls } = simulateProcesses({ alive: new Set([ROOT_PID, CHILD_PID]) });
+
+    await expect(killProcessTreeGuarded({ pid: ROOT_PID }, {
+      graceMs: 1,
+      readRootIdentity: () => (rootUnreadable ? 'unreadable' : 'same'),
+      unreadableRetryDelaysMs: NO_RETRY_WAIT,
+    })).resolves.toBe('root_unreadable_suspended');
+
+    expect(rootSignals(calls)).toEqual(['SIGSTOP']);
+    expect(childSignals(calls)).toEqual([]);
   });
 
   it('signals nothing when the root is already another process', async () => {
