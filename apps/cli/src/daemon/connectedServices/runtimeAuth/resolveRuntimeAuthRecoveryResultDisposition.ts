@@ -77,7 +77,8 @@ function resolveActionRequiredWaitCandidateMs(input: Readonly<{
   if (futureReset !== null) return futureReset;
   // An expired reset is permission to try the provider again, not evidence that
   // the account is still limited. Fresh failures retain a backoff-separated wait.
-  return (actionReason === 'usage_limit' || actionReason === 'rate_limit')
+  return action?.groupId === null
+    && (actionReason === 'usage_limit' || actionReason === 'rate_limit')
     && readNonNegativeNumber(input.classificationResetsAtMs) !== null
     ? input.nowMs + input.retryBackoffMs
     : null;
@@ -161,15 +162,11 @@ export function resolveRuntimeAuthRecoveryResultDisposition(input: Readonly<{
     const resetAtMs = resolveEarliestFutureWaitCandidateMs([
       input.classificationResetsAtMs,
     ], input.nowMs);
-    const expiredKnownReset = (input.classificationFailureKind === 'usage_limit' || input.classificationFailureKind === 'rate_limit')
-      && readNonNegativeNumber(input.classificationResetsAtMs) !== null;
-    if (resetAtMs !== null || expiredKnownReset) {
+    if (resetAtMs !== null) {
       return {
         kind: 'durable_wait',
         reason: 'awaiting_limit_reset',
-        nextRetryAtMs: resetAtMs ?? input.nowMs + Math.max(
-          GROUP_EXHAUSTED_WAIT_FLOOR_MS, readNonNegativeNumber(input.unknownNoEligibleMemberBackoffMs) ?? 0,
-        ),
+        nextRetryAtMs: resetAtMs,
       };
     }
   }

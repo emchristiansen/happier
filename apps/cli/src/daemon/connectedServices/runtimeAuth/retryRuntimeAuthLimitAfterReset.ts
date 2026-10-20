@@ -33,8 +33,7 @@ export async function retryRuntimeAuthLimitAfterReset(input: RuntimeAuthLimitRes
       ...(input.resolveRespawnOptions ? { resolveRespawnOptions: input.resolveRespawnOptions } : {}),
       spawnSession: async (options) => { assertCurrent(); return await input.spawnSession(options); },
       sendMessage: async (request) => { assertCurrent(); return await (input.sendMessage ?? sendSessionMessage)(request); },
-      // One stable input per claimed provider trial; an uncertain transport retry
-      // retains its Pending identity, while a later trial gets a distinct one.
+      // Pending identifies this claimed provider trial; later trials use a new identity.
       attemptId: `${input.attemptId}:limit-reset:${input.retryCount}`,
       continuation: {
         interruptedOriginId: input.attemptId,
