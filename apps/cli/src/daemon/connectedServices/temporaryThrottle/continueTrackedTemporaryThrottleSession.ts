@@ -1,3 +1,4 @@
+import type { SessionUserMessageAdmissionBody } from '@/session/services/admitSessionUserMessage';
 import type { Credentials } from '@/persistence';
 import type { sendSessionMessage } from '@/session/services/sendSessionMessage';
 import type {
@@ -41,6 +42,8 @@ export async function continueTrackedTemporaryThrottleSession(input: Readonly<{
   spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
   resolveRespawnOptions?: ResolveRespawnOptions;
   sendMessage?: typeof sendSessionMessage;
+  assertCanAdmit?: () => void;
+  preserveAdmission?: (body: SessionUserMessageAdmissionBody) => Promise<SessionUserMessageAdmissionBody>;
   attemptId: string;
   continuation: TemporaryThrottleContinuationIntent;
 }>): Promise<TemporaryThrottleContinuationResult> {
@@ -58,6 +61,8 @@ export async function continueTrackedTemporaryThrottleSession(input: Readonly<{
 
   const dispatcher = createConnectedServiceContinuationMessageDispatcher({
     credentials: input.credentials,
+    ...(input.preserveAdmission ? { preserveAdmission: input.preserveAdmission } : {}),
+    ...(input.assertCanAdmit ? { assertCanAdmit: input.assertCanAdmit } : {}),
     ...(input.sendMessage ? { sendMessage: input.sendMessage } : {}),
   });
   const continuationResult = await dispatcher.enqueueInterruptedOriginContinuation({

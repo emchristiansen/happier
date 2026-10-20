@@ -1,3 +1,4 @@
+import { readSessionUserMessageAdmissionBody, type SessionUserMessageAdmissionBody } from '@/session/services/admitSessionUserMessage';
 import type { DaemonServerWorkErrorClassification, DaemonServerWorkErrorKind } from '@/daemon/serverWork/types';
 import { isDeepStrictEqual } from 'node:util';
 import { classifyDaemonServerWorkError } from '@/daemon/serverWork/classifyDaemonServerWorkError';
@@ -58,6 +59,15 @@ export type RuntimeAuthRecoveryIntakeResult = Readonly<{
   resumePromptMode?: 'standard' | 'off' | 'custom';
 }>;
 
+type RuntimeAuthLimitResetTrial = Readonly<{
+  attemptId: string;
+  retryCount: number;
+  admissionAttemptCount: number;
+  resumePromptMode: 'standard' | 'off' | 'custom';
+  customResumePrompt: string | null;
+  admissionBody?: SessionUserMessageAdmissionBody;
+}>;
+
 export type RuntimeAuthRecoveryIntent = Readonly<{
   v: 1 | 2;
   attemptId?: string;
@@ -80,6 +90,15 @@ export type RuntimeAuthRecoveryIntent = Readonly<{
   // local outage can be waited out without prematurely dead-lettering a recoverable
   // session. It is still bounded (cannot wait forever).
   degradedAttemptCount?: number;
+  // Provider trials after a known limit reset have their own bounded budget.
+  // Policy-only waits (including records retained from older daemons) spend none.
+  limitResetRetryCount?: number;
+  // Persisted before any effect. An unknown Pending acknowledgement owns this
+  // exact trial until reconciliation or a fresh provider outcome settles it.
+  limitResetTrial?: RuntimeAuthLimitResetTrial;
+  // Active intent identity can outlive several reports. Keep the latest in-band
+  // outcome identity separately so replaying that report cannot settle a trial twice.
+  limitResetLastProviderReportAttemptId?: string;
   // RD-REC-15 / F4: bounded coalesced-replay budget. When a wake reproduces the
   // SAME pending proof target for a stale-profile intent (no new information),
   // the attempt rollback must not make `resumed_awaiting_proof` unbounded — each
@@ -130,6 +149,24 @@ export type RuntimeAuthRecoveryDiagnostic = Readonly<{
   transition?: RuntimeAuthRecoveryTransition;
 }>;
 
+export type RuntimeAuthLimitResetRetryInput = Readonly<{
+  sessionId: string;
+  attemptId: string;
+  retryCount: number;
+  classification: ConnectedServiceRuntimeFailureClassification;
+  resumePromptMode: 'standard' | 'off' | 'custom';
+  customResumePrompt: string | null;
+  isCurrent: () => boolean;
+  preserveAdmission?: (body: SessionUserMessageAdmissionBody) => Promise<SessionUserMessageAdmissionBody>;
+}>;
+
+export type RuntimeAuthLimitResetRetryResult =
+  | Readonly<{ status: 'continued' }>
+  | Readonly<{ status: 'deferred' }>
+  | Readonly<{ status: 'admission_unconfirmed' }>
+  | Readonly<{ status: 'superseded'; reason: string }>
+  | Readonly<{ status: 'terminal'; lastError: string }>;
+
 export type RuntimeAuthRecoverySchedulerDeps = Readonly<{
   nowMs: () => number;
   baseBackoffMs?: number;
@@ -149,6 +186,8 @@ export type RuntimeAuthRecoverySchedulerDeps = Readonly<{
     resumePromptMode: 'standard' | 'off' | 'custom';
     source: 'scheduler_retry';
   }>) => Promise<unknown>;
+  readLimitResetCustomResumePrompt?: () => string | null;
+  retryAfterLimitReset?: (input: RuntimeAuthLimitResetRetryInput) => Promise<RuntimeAuthLimitResetRetryResult>;
   gate?: (input: Readonly<{ sessionId: string; intent: RuntimeAuthRecoveryIntent }>) => DurableRecoveryGateResult;
   recordDiagnostic?: (event: RuntimeAuthRecoveryDiagnostic) => void;
   durableStore?: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent>;
@@ -183,6 +222,7 @@ const DEFAULT_RUNTIME_AUTH_RECOVERY_DEGRADED_BACKOFF_MS = 60_000;
 // over and settles the recovery terminal.
 const DEFAULT_RUNTIME_AUTH_RECOVERY_MAX_COALESCED_REPLAYS = 12;
 const RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR = 'recovery_unproven_awaiting_provider_outcome';
+const RUNTIME_AUTH_LIMIT_RESET_RETRY_CLAIMED = 'limit_reset_retry_claimed';
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === 'object' && value !== null;
@@ -221,6 +261,18 @@ function normalizeClassification(value: unknown): DaemonServerWorkErrorClassific
 
 function normalizeRuntimeClassification(value: unknown): ConnectedServiceRuntimeFailureClassification | null {
   return sanitizeConnectedServiceRuntimeFailureClassification(value);
+}
+
+function readLimitResetTrial(value: unknown): RuntimeAuthLimitResetTrial | null {
+  if (!value || typeof value !== 'object') return null;
+  const trial = value as Record<string, unknown>;
+  if (typeof trial.attemptId !== 'string' || !trial.attemptId.trim()
+    || !Number.isSafeInteger(trial.retryCount) || (trial.retryCount as number) < 1
+    || !Number.isSafeInteger(trial.admissionAttemptCount) || (trial.admissionAttemptCount as number) < 1
+    || !['standard', 'off', 'custom'].includes(trial.resumePromptMode as string)
+    || (trial.customResumePrompt !== null && typeof trial.customResumePrompt !== 'string')) return null;
+  if (trial.admissionBody !== undefined && !readSessionUserMessageAdmissionBody(trial.admissionBody)) return null;
+  return trial as RuntimeAuthLimitResetTrial;
 }
 
 function normalizeIntent(value: unknown): RuntimeAuthRecoveryIntent | null {
@@ -276,6 +328,9 @@ function normalizeIntent(value: unknown): RuntimeAuthRecoveryIntent | null {
         return [{ attemptId, transition, transcriptEvent: parsedEvent.data }];
       })
     : [];
+  const limitResetTrial = readLimitResetTrial(value.limitResetTrial);
+  if (value.limitResetTrial !== undefined && (!limitResetTrial
+    || limitResetTrial.retryCount !== readNonNegativeNumber(value.limitResetRetryCount))) return null;
   return {
     v: value.v,
     ...(readString(value.attemptId) ? { attemptId: readString(value.attemptId) as string } : {}),
@@ -305,6 +360,12 @@ function normalizeIntent(value: unknown): RuntimeAuthRecoveryIntent | null {
     ...(readNonNegativeNumber(value.coalescedReplayCount) === null
       ? {}
       : { coalescedReplayCount: readNonNegativeNumber(value.coalescedReplayCount) as number }),
+    ...(readNonNegativeNumber(value.limitResetRetryCount) === null
+      ? {}
+      : { limitResetRetryCount: readNonNegativeNumber(value.limitResetRetryCount) as number }),
+    ...(limitResetTrial ? { limitResetTrial } : {}),
+    ...(readString(value.limitResetLastProviderReportAttemptId)
+      ? { limitResetLastProviderReportAttemptId: readString(value.limitResetLastProviderReportAttemptId)! } : {}),
     switchesThisTurn,
     classification,
     failurePhase,
@@ -913,22 +974,42 @@ function hasExplicitRuntimeAuthRecoveryEpochChange(
 
 function mergeRuntimeAuthRecoveryIntent(
   previous: RuntimeAuthRecoveryIntent | null,
-  next: RuntimeAuthRecoveryIntent,
+  incoming: RuntimeAuthRecoveryIntent,
 ): RuntimeAuthRecoveryIntent {
-  if (!previous) return next;
+  if (!previous) return incoming;
   if (previous.status === 'recovered') {
-    if (previous.attemptId === next.attemptId) return previous;
+    if (previous.attemptId === incoming.attemptId) return previous;
     // Recovery closes only the settled attempt. Any later failure owns a new epoch, including
     // handler intake whose producer does not have a durable provider report id.
-    return next;
+    return incoming;
   }
+  // A report ID is an intake identity, not proof that an ambiguously admitted
+  // trial completed. Keep its custody and finite reconciliation budget even
+  // after exhaustion or daemon restart; replay/older intake cannot replace it.
+  // Confirmed handoff clears the trial, allowing genuine subsequent outcomes.
+  if (previous.limitResetTrial) return previous;
   if (previous.status === 'cancelled' || previous.status === 'exhausted') {
-    if (previous.attemptId === next.attemptId) return previous;
+    if (previous.attemptId === incoming.attemptId) return previous;
     // Only a fresh in-band provider report owns a new recovery epoch. A later handler/apply
     // failure without the original attempt id is still fallout from the settled attempt and must
     // not revive it merely because its caller omitted the report id.
-    return next.lastSettledTransition === 'working' ? next : previous;
+    return incoming.lastSettledTransition === 'working' ? incoming : previous;
   }
+  const limitResetIntake = isRuntimeAuthLimitResetIntent(previous) && isRuntimeAuthLimitResetIntent(incoming);
+  const previousProviderReportAttemptId = previous.limitResetLastProviderReportAttemptId ?? previous.attemptId;
+  const freshProviderOutcome = limitResetIntake && incoming.lastSettledTransition === 'working'
+    && incoming.attemptId !== previousProviderReportAttemptId;
+  const incomingWithTrial = {
+    ...incoming,
+    ...(limitResetIntake ? { limitResetLastProviderReportAttemptId: freshProviderOutcome
+      ? incoming.attemptId : previousProviderReportAttemptId } : {}),
+  };
+  const next = previous.limitResetRetryCount !== undefined
+    && previous.groupId === null && incoming.groupId === null
+    && (previous.classification.kind === 'usage_limit' || previous.classification.kind === 'rate_limit')
+    && (incoming.classification.kind === 'usage_limit' || incoming.classification.kind === 'rate_limit')
+    ? { ...incomingWithTrial, limitResetRetryCount: Math.max(previous.limitResetRetryCount, incoming.limitResetRetryCount ?? 0) }
+    : incomingWithTrial;
   const sameEvidence = hasSameRuntimeAuthRecoveryEvidence(previous, next);
   if (!sameEvidence && hasExplicitRuntimeAuthRecoveryEpochChange(previous, next)) return next;
   if (!sameEvidence && previous.status !== 'checking' && previous.status !== 'resumed_awaiting_proof') return next;
@@ -940,6 +1021,9 @@ function mergeRuntimeAuthRecoveryIntent(
     // prompt mode is an attempt fact too, so duplicate evidence cannot rewrite
     // the policy that the in-band handler and future wakes must share.
     resumePromptMode: previous.resumePromptMode,
+    ...(previous.limitResetRetryCount === undefined && next.limitResetRetryCount === undefined ? {} : {
+      limitResetRetryCount: Math.max(previous.limitResetRetryCount ?? 0, next.limitResetRetryCount ?? 0),
+    }),
     lastSettledTransition: mergeRuntimeAuthRecoveryTransition(
       previous.lastSettledTransition,
       next.lastSettledTransition,
@@ -1079,8 +1163,15 @@ function mergeRuntimeAuthRecoveryWakeWrite(input: Readonly<{
   const claimedPolicy = normalizeIntent(input.base);
   // Delivery acknowledgments mutate this outbox during provider work. They
   // change no recovery policy and must neither cause a retry nor be resurrected.
-  const { pendingVisibleEvents: _currentOutbox, ...currentFields } = currentPolicy ?? {};
-  const { pendingVisibleEvents: _claimedOutbox, ...claimedFields } = claimedPolicy ?? {};
+  const withoutAdmissionBody = (policy: RuntimeAuthRecoveryIntent | null) => {
+    if (!policy) return {};
+    const { pendingVisibleEvents: _outbox, ...fields } = policy;
+    if (!fields.limitResetTrial) return fields;
+    const { admissionBody: _body, ...trial } = fields.limitResetTrial;
+    return { ...fields, limitResetTrial: trial };
+  };
+  const currentFields = withoutAdmissionBody(currentPolicy);
+  const claimedFields = withoutAdmissionBody(claimedPolicy);
   if (input.reason === 'waiting'
     && !isDeepStrictEqual(currentFields, claimedFields)) {
     // Observations no longer claim or settle. A real attempt may install its
@@ -1111,11 +1202,22 @@ function mergeRuntimeAuthRecoveryWakeWrite(input: Readonly<{
     lastError: keepLatestFailureMessage ? input.current.lastError : input.next.lastError,
     lastErrorClassification: input.current.lastErrorClassification,
     attemptCount: Math.max(input.current.attemptCount, input.next.attemptCount),
+    ...(input.current.limitResetRetryCount === undefined && input.next.limitResetRetryCount === undefined ? {} : {
+      limitResetRetryCount: Math.max(input.current.limitResetRetryCount ?? 0, input.next.limitResetRetryCount ?? 0),
+    }),
     maxAttempts: Math.min(input.current.maxAttempts, input.next.maxAttempts),
     nextRetryAtMs: mergeRuntimeAuthWakeNextRetryAtMs(input.current, input.next),
     pendingTargetProfileId: input.next.pendingTargetProfileId ?? input.current.pendingTargetProfileId ?? null,
     pendingTargetGeneration: input.next.pendingTargetGeneration ?? input.current.pendingTargetGeneration ?? null,
   };
+}
+
+function isRuntimeAuthLimitResetIntent(intent: RuntimeAuthRecoveryIntent): boolean {
+  return intent.groupId === null
+    && (intent.classification.kind === 'usage_limit' || intent.classification.kind === 'rate_limit')
+    && typeof intent.classification.resetsAtMs === 'number'
+    && Number.isFinite(intent.classification.resetsAtMs)
+    && intent.classification.resetsAtMs >= 0;
 }
 
 function isRuntimeAuthDurableWaitIntent(intent: RuntimeAuthRecoveryIntent): boolean {
@@ -1192,7 +1294,7 @@ export class RuntimeAuthRecoveryScheduler {
   private pendingVisibleEventDeliver: ((delivery: RuntimeAuthRecoveryVisibleEventDelivery) => Promise<void>) | null = null;
   private pendingVisibleEventRetryDelayMs = 10_000;
   private pendingVisibleEventDrainError: ((error: unknown) => void) | null = null;
-  private pendingVisibleEventDrainDisposed = false;
+  private disposed = false;
 
   constructor(private readonly deps: RuntimeAuthRecoverySchedulerDeps) {
     this.baseBackoffMs = normalizePositiveInteger(deps.baseBackoffMs, DEFAULT_RUNTIME_AUTH_RECOVERY_BASE_BACKOFF_MS);
@@ -1234,14 +1336,18 @@ export class RuntimeAuthRecoveryScheduler {
           ? 'cancelled'
           : intent.status,
       getNextRetryAtMs: (intent) => intent.nextRetryAtMs,
-      getAttemptCount: (intent) => intent.attemptCount,
+      getAttemptCount: (intent) => deps.retryAfterLimitReset && isRuntimeAuthLimitResetIntent(intent)
+        ? intent.limitResetTrial?.admissionAttemptCount ?? intent.limitResetRetryCount ?? 0
+        : intent.attemptCount,
       // Proof observations do not run recovery attempts. The durable scheduler
       // treats zero as no attempt ceiling; targeted recovery keeps its budget.
       getMaxAttempts: (intent) => isUntargetedProviderOutcomeProofWait(intent)
         ? 0
-        : isRuntimeAuthDurableWaitIntent(intent)
-          ? Number.MAX_SAFE_INTEGER
-          : intent.maxAttempts,
+        : deps.retryAfterLimitReset && isRuntimeAuthLimitResetIntent(intent)
+          ? intent.maxAttempts
+          : isRuntimeAuthDurableWaitIntent(intent)
+            ? Number.MAX_SAFE_INTEGER
+            : intent.maxAttempts,
       observeBeforeEffectClaim: (intent) => {
         if (!isUntargetedProviderOutcomeProofWait(intent)) return null;
         const retryAtMs = this.providerOutcomePendingWaitMs === null
@@ -1256,21 +1362,36 @@ export class RuntimeAuthRecoveryScheduler {
       },
       terminalRecordRetentionMs: DEFAULT_RUNTIME_AUTH_RECOVERY_TERMINAL_RECORD_RETENTION_MS,
       getTerminalPruneReferenceMs: (intent) => intent.terminalAtMs ?? intent.armedAtMs,
-      markChecking: (intent, attemptCount) => ({
-        ...intent,
-        v: 2,
-        // DurableBackoffRecoveryScheduler commits this state and the effect
-        // claim in one transaction; legacy identity cannot lag its claim.
-        attemptId: intent.attemptId ?? buildRuntimeAuthRecoveryAttemptId(undefined),
-        status: 'checking',
-        lastSettledTransition: mergeRuntimeAuthRecoveryTransition(intent.lastSettledTransition, 'working'),
-        attemptCount,
-        // A gate can replace lastError while retaining the proof-wait state.
-        // Carry that phase through the generic scheduler's checking transition.
-        lastError: isUntargetedProviderOutcomeProofWait(intent)
-          ? RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR
-          : intent.lastError,
-      }),
+      markChecking: (intent, attemptCount) => {
+        const limitResetIntent = deps.retryAfterLimitReset && isRuntimeAuthLimitResetIntent(intent);
+        // Budget reads are clock-independent. Decide whether this claim owns a
+        // provider trial once, so crossing the reset cannot charge policy checks.
+        const limitResetRetryDue = limitResetIntent
+          && intent.lastError !== RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR
+          && (intent.classification.resetsAtMs ?? Infinity) <= deps.nowMs();
+        const attemptId = intent.attemptId ?? buildRuntimeAuthRecoveryAttemptId(undefined);
+        const trial = limitResetRetryDue ? intent.limitResetTrial
+          ? { ...intent.limitResetTrial, admissionAttemptCount: attemptCount }
+          : { attemptId, retryCount: Math.min(attemptCount, intent.maxAttempts), admissionAttemptCount: 1,
+              resumePromptMode: readResumePromptMode(intent.resumePromptMode),
+              customResumePrompt: deps.readLimitResetCustomResumePrompt?.() ?? null }
+          : undefined;
+        return {
+          ...intent,
+          v: 2,
+          // The durable scheduler commits identity, phase and effect claim together.
+          attemptId,
+          status: 'checking',
+          lastSettledTransition: mergeRuntimeAuthRecoveryTransition(intent.lastSettledTransition, 'working'),
+          attemptCount: limitResetIntent ? intent.attemptCount + 1 : attemptCount,
+          ...(trial ? { limitResetRetryCount: trial.retryCount, limitResetTrial: trial } : {}),
+          lastError: limitResetRetryDue
+            ? RUNTIME_AUTH_LIMIT_RESET_RETRY_CLAIMED
+            : isUntargetedProviderOutcomeProofWait(intent)
+              ? RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR
+              : intent.lastError,
+        };
+      },
       markWaiting: (intent, input) => withRuntimeAuthWaitPresentation({
         ...intent,
         v: 2,
@@ -1339,6 +1460,76 @@ export class RuntimeAuthRecoveryScheduler {
       }),
       recover: async (intent) => {
         try {
+          // A handed-off trial waits for its real outcome, never another prompt.
+          // Transactional stores observe this before the claim; retain the same
+          // no-effect behavior for the supported in-memory store too.
+          if (intent.limitResetRetryCount !== undefined
+            && intent.lastError === RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR) {
+            return {
+              status: 'wait', exhaustOnMaxAttempt: false,
+              lastError: RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR,
+              nextRetryAtMs: deps.nowMs() + (this.providerOutcomePendingWaitMs ?? this.baseBackoffMs),
+              intent: { ...intent, status: 'resumed_awaiting_proof', attemptCount: Math.max(0, intent.attemptCount - 1) },
+            };
+          }
+          if (deps.retryAfterLimitReset && isRuntimeAuthLimitResetIntent(intent)
+            && intent.lastError === RUNTIME_AUTH_LIMIT_RESET_RETRY_CLAIMED) {
+            if (!intent.attemptId || !intent.limitResetTrial) {
+              throw new Error('limit_reset_retry_identity_missing');
+            }
+            const result = await deps.retryAfterLimitReset({
+              sessionId: intent.sessionId,
+              attemptId: intent.limitResetTrial.attemptId,
+              retryCount: intent.limitResetTrial.retryCount,
+              classification: intent.classification,
+              resumePromptMode: intent.limitResetTrial.resumePromptMode,
+              customResumePrompt: intent.limitResetTrial.customResumePrompt,
+              preserveAdmission: async (candidate) => {
+                const key = buildRecoveryKeyForIntent(intent);
+                const settlement = await this.scheduler.upsertConditionallyByKey({
+                  sessionId: intent.sessionId, recoveryKey: key, intent,
+                  expectedCurrent: (current) => !this.disposed && current.status === 'checking'
+                    && current.attemptId === intent.attemptId
+                    && current.limitResetTrial?.retryCount === intent.limitResetTrial!.retryCount,
+                  merge: (current) => ({ ...current, limitResetTrial: { ...current.limitResetTrial!,
+                    admissionBody: current.limitResetTrial!.admissionBody ?? candidate } }),
+                });
+                if (settlement.status !== 'settled' || !settlement.intent.limitResetTrial?.admissionBody) {
+                  throw new Error('limit_reset_recovery_no_longer_current');
+                }
+                intent = settlement.intent;
+                return intent.limitResetTrial!.admissionBody!;
+              },
+              isCurrent: () => {
+                const current = this.readByKey(buildRecoveryKeyForIntent(intent));
+                return !this.disposed && current?.status === 'checking'
+                  && current.attemptId === intent.attemptId
+                  && current.limitResetRetryCount === intent.limitResetRetryCount;
+              },
+            });
+            if (result.status === 'admission_unconfirmed') return {
+              status: 'wait', lastError: 'limit_reset_admission_unconfirmed', intent,
+            };
+            if (result.status === 'superseded') return { status: 'superseded', reason: result.reason };
+            if (result.status === 'terminal') return {
+              status: 'terminal', lastError: result.lastError,
+              intent: buildTerminalRuntimeAuthIntent({ intent, nowMs: deps.nowMs(), terminalReason: result.lastError }),
+            };
+            if (result.status === 'deferred') return {
+              status: 'wait', exhaustOnMaxAttempt: false, lastError: 'limit_reset_retry_deferred',
+              intent: { ...intent, attemptCount: Math.max(0, intent.attemptCount - 1),
+                limitResetRetryCount: intent.limitResetTrial.admissionAttemptCount === 1
+                  ? Math.max(0, (intent.limitResetRetryCount ?? 1) - 1) : intent.limitResetRetryCount,
+                limitResetTrial: intent.limitResetTrial.admissionAttemptCount === 1 ? undefined
+                  : { ...intent.limitResetTrial, admissionAttemptCount: intent.limitResetTrial.admissionAttemptCount - 1 } },
+            };
+            return {
+              status: 'wait', exhaustOnMaxAttempt: false,
+              lastError: RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR,
+              nextRetryAtMs: deps.nowMs() + (this.providerOutcomePendingWaitMs ?? this.baseBackoffMs),
+              intent: { ...intent, limitResetTrial: undefined, status: 'resumed_awaiting_proof', pendingTargetProfileId: null, pendingTargetGeneration: null },
+            };
+          }
           const result = await deps.recover({
             sessionId: intent.sessionId,
             switchesThisTurn: intent.switchesThisTurn,
@@ -1687,7 +1878,7 @@ export class RuntimeAuthRecoveryScheduler {
     retryDelayMs?: number;
     onError?: (error: unknown) => void;
   }>): void {
-    if (this.pendingVisibleEventDrainDisposed) return;
+    if (this.disposed) return;
     this.pendingVisibleEventDeliver = input.deliver;
     if (typeof input.retryDelayMs === 'number' && Number.isFinite(input.retryDelayMs)) {
       this.pendingVisibleEventRetryDelayMs = Math.max(0, Math.trunc(input.retryDelayMs));
@@ -1713,12 +1904,12 @@ export class RuntimeAuthRecoveryScheduler {
     try {
       await this.drainPendingVisibleEvents(deliver);
     } catch (error) {
-      if (!this.pendingVisibleEventDrainDisposed) this.pendingVisibleEventDrainRequested = true;
+      if (!this.disposed) this.pendingVisibleEventDrainRequested = true;
       this.pendingVisibleEventDrainError?.(error);
     } finally {
       this.pendingVisibleEventDrainInFlight = false;
     }
-    if (!this.pendingVisibleEventDrainDisposed && this.pendingVisibleEventDrainRequested) {
+    if (!this.disposed && this.pendingVisibleEventDrainRequested) {
       this.schedulePendingVisibleEventDrain({ deliver, delayMs: this.pendingVisibleEventRetryDelayMs });
     }
   }
@@ -1770,7 +1961,7 @@ export class RuntimeAuthRecoveryScheduler {
    * work cannot switch/restart sessions while this daemon instance is tearing down.
    */
   dispose(): void {
-    this.pendingVisibleEventDrainDisposed = true;
+    this.disposed = true;
     if (this.pendingVisibleEventDrainTimer) clearTimeout(this.pendingVisibleEventDrainTimer);
     this.pendingVisibleEventDrainTimer = null;
     this.pendingVisibleEventDeliver = null;
