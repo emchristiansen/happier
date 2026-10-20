@@ -253,6 +253,7 @@ export function createLocalSessionHarness(): LocalSessionHarness {
     peekPendingMessageQueueV2Count: async () => 0,
     discardPendingMessageQueueV2All: async () => 0,
     discardCommittedMessageLocalIds: async (_ids: string[]) => {},
+    waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted,
     waitForMetadataUpdate: async () => false,
     waitForPendingEligibilityUpdate: async () => false,
   } as unknown as ApiSessionClient;

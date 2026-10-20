@@ -65,6 +65,7 @@ function baseOptions(
       permissionMode: 'default',
       claudeUnifiedTerminalHost: 'tmux',
     },
+    waitForProviderInputAdmission: async (signal) => !signal.aborted,
     nextMessage: async () => null,
     signal: abortController.signal,
     resolveHostAdapter: async () => ({ status: 'resolved', adapter, reason: 'test' }),

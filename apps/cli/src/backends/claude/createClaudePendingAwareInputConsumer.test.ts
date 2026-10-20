@@ -32,6 +32,7 @@ function createSessionHarness(accountSettings: Record<string, unknown> | null) {
     accountSettings,
     registerProviderInputConsumer: vi.fn(),
     client: {
+      waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted,
       materializeNextPendingMessageSafely,
       readRuntimeActivitySnapshotTail,
       waitForRuntimeActivitySnapshotTailChange: vi.fn(async () => false),

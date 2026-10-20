@@ -25,7 +25,7 @@ import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecyc
 import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import { createSessionProviderInputConsumer } from '@/agent/runtime/sessionInput/SessionProviderInputConsumer';
 import { waitForCondition } from '@/testkit/async/waitFor';
-import { createApiSessionClientFixture } from '@/testkit/backends/sessionFixtures';
+import { createApiSessionClientFixture, createMutableApiSessionClientFixture } from '@/testkit/backends/sessionFixtures';
 import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
 import { runScmCommand } from '@/scm/runtime';
 import {
@@ -38,6 +38,9 @@ import { logger } from '@/ui/logger';
 
 import { createCodexAppServerRuntime, writeUsageLimitRecoveryIntentToMetadata } from './runtime';
 import { createCodexAppServerProcessEnv, createCodexAppServerTestEnvScope } from './testkit/fakeCodexAppServer';
+
+// These partial session fixtures model create/load; existing-ID admission uses real API/RPC tests.
+const creationScopeInputAdmission = createMutableApiSessionClientFixture().waitForProviderInputAdmission;
 
 type CommittedSnapshotBody = Readonly<{
     type?: string;
@@ -171,6 +174,7 @@ async function writeFakeCodexAppServerScript(params: Readonly<{
     oversizedResumePayloadChars?: number;
     omitTurnStartedForPrompt?: string;
     omitTurnCompletedForPrompt?: string;
+    steerWaitControlPaths?: Readonly<{ startRelease: string; completionRelease: string }>;
     failStateRuntimeInitializationOnce?: boolean;
     failLocalDbLogDbLockInitializationOnce?: boolean;
 }>): Promise<string> {
@@ -536,6 +540,21 @@ async function writeFakeCodexAppServerScript(params: Readonly<{
         '        const text = Array.isArray(msg.params?.input) ? String(msg.params.input[0]?.text ?? "unknown") : "unknown";',
         '        const matchingTurnStartCount = (await readFile(requestLogPath, "utf8").catch(() => "")).split("\\n").filter((line) => { try { const entry = JSON.parse(line); return entry.method === "turn/start" && Array.isArray(entry.params?.input) && String(entry.params.input[0]?.text ?? "") === text; } catch { return false; } }).length;',
         '        const turnId = matchingTurnStartCount > 1 ? `turn-${text}-${matchingTurnStartCount}` : `turn-${text}`;',
+        `        const steerWaitControlPaths = ${JSON.stringify(params.steerWaitControlPaths ?? null)};`,
+        '        if (text === "steer-delay" && steerWaitControlPaths) {',
+        '            void (async () => {',
+        '                while (!(await readFile(steerWaitControlPaths.startRelease, "utf8").catch((error) => { if (error.code === "ENOENT") return ""; throw error; }))) {',
+        '                    await new Promise((resolve) => setTimeout(resolve, 5));',
+        '                }',
+        '                process.stdout.write(JSON.stringify({ id: msg.id, result: { turn: { id: turnId }, threadId: msg.params?.threadId ?? null } }) + "\\n");',
+        '                process.stdout.write(JSON.stringify({ method: "turn/started", params: { threadId: msg.params?.threadId ?? null, turn: { id: turnId } } }) + "\\n");',
+        '                while (!(await readFile(steerWaitControlPaths.completionRelease, "utf8").catch((error) => { if (error.code === "ENOENT") return ""; throw error; }))) {',
+        '                    await new Promise((resolve) => setTimeout(resolve, 5));',
+        '                }',
+        '                process.stdout.write(JSON.stringify({ method: "turn/completed", params: { threadId: msg.params?.threadId ?? null, turn: { id: turnId } } }) + "\\n");',
+        '            })().catch((error) => { process.stderr.write(String(error.stack ?? error) + "\\n"); process.exit(1); });',
+        '            continue;',
+        '        }',
         '        const completionDelayMs = text === "connected-service-invalidation-active-turn" && matchingTurnStartCount === 1 ? 120000 : text === "overlap-start" ? 180 : text === "cancel-me" ? 50 : 15;',
         '        if (text === "usage-limit-before-turn-response") {',
         '            process.stdout.write(JSON.stringify({ method: "error", params: { threadId: msg.params?.threadId ?? null, turnId, willRetry: false, error: { message: "Usage limit reached", codexErrorInfo: "UsageLimitExceeded", additionalDetails: null } } }) + "\\n");',
@@ -1642,6 +1661,7 @@ describe('createCodexAppServerRuntime', () => {
             oversizedResumePayloadChars?: number;
             omitTurnStartedForPrompt?: string;
             omitTurnCompletedForPrompt?: string;
+            steerWaitControlPaths?: Readonly<{ startRelease: string; completionRelease: string }>;
             maxJsonLineChars?: number;
             rpcTimeoutMs?: number;
             startupRpcTimeoutMs?: number;
@@ -1700,6 +1720,7 @@ describe('createCodexAppServerRuntime', () => {
             oversizedResumePayloadChars: options.oversizedResumePayloadChars,
             omitTurnStartedForPrompt: options.omitTurnStartedForPrompt,
             omitTurnCompletedForPrompt: options.omitTurnCompletedForPrompt,
+            steerWaitControlPaths: options.steerWaitControlPaths,
             failStateRuntimeInitializationOnce: options.failStateRuntimeInitializationOnce,
             failLocalDbLogDbLockInitializationOnce: options.failLocalDbLogDbLockInitializationOnce,
         });
@@ -2311,7 +2332,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata: vi.fn() } as any,
+            session: { updateMetadata: vi.fn(), waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted } as any,
             permissionMode: 'read-only',
             pendingQueue: {
                 drainAfterStartOrLoad: true,
@@ -2720,7 +2741,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange,
-            session: { updateMetadata: vi.fn() } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata: vi.fn() } as any,
             permissionMode: 'read-only',
         });
 
@@ -2760,7 +2781,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata: vi.fn() } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata: vi.fn() } as any,
         });
 
         await runtime.startOrLoad({});
@@ -2790,7 +2811,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata: vi.fn() } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata: vi.fn() } as any,
         });
 
         await runtime.startOrLoad({});
@@ -2817,7 +2838,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata: vi.fn() } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata: vi.fn() } as any,
         });
 
         await runtime.startOrLoad({});
@@ -2857,7 +2878,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata } as any,
             permissionMode: 'default',
         });
 
@@ -2902,7 +2923,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata: vi.fn(), sessionTurnLifecycle } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata: vi.fn(), sessionTurnLifecycle } as any,
             permissionMode: 'default',
         });
 
@@ -2956,7 +2977,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata: vi.fn(), sessionTurnLifecycle } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata: vi.fn(), sessionTurnLifecycle } as any,
             permissionMode: 'default',
         });
 
@@ -2987,6 +3008,7 @@ describe('createCodexAppServerRuntime', () => {
         const sessionTurnLifecycle = createSessionTurnLifecycleTestDouble();
 
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             updateMetadata: vi.fn(),
             sendAgentMessageCommitted: vi.fn(async () => {}),
             sendCodexMessage: vi.fn(),
@@ -3048,6 +3070,7 @@ describe('createCodexAppServerRuntime', () => {
         const { root } = await createRuntimeFixture('happier-codex-app-server-runtime-goal-successor-handoff-');
         const sessionTurnLifecycle = createSessionTurnLifecycleTestDouble();
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             updateMetadata: vi.fn(),
             sendAgentMessageCommitted: vi.fn(async () => {}),
             sendCodexMessage: vi.fn(),
@@ -3135,6 +3158,7 @@ describe('createCodexAppServerRuntime', () => {
             },
             onThinkingChange: vi.fn(),
             session: {
+                waitForProviderInputAdmission: creationScopeInputAdmission,
                 updateMetadata: vi.fn(),
                 sendAgentMessageCommitted: vi.fn(async () => {}),
                 sendCodexMessage: vi.fn(),
@@ -3234,6 +3258,7 @@ describe('createCodexAppServerRuntime', () => {
             directory: root,
             onThinkingChange,
             session: {
+                waitForProviderInputAdmission: creationScopeInputAdmission,
                 updateMetadata: vi.fn(),
                 sendAgentMessageCommitted: vi.fn(async () => {}),
                 sendCodexMessage: vi.fn(),
@@ -3272,6 +3297,7 @@ describe('createCodexAppServerRuntime', () => {
         const sessionTurnLifecycle = createSessionTurnLifecycleTestDouble();
 
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             updateMetadata: vi.fn(),
             sendAgentMessageCommitted: vi.fn(async () => {}),
             sendCodexMessage: vi.fn(),
@@ -3539,7 +3565,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata: vi.fn() } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata: vi.fn() } as any,
             permissionMode: 'default',
         });
 
@@ -3575,7 +3601,7 @@ describe('createCodexAppServerRuntime', () => {
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
-            session: { updateMetadata: vi.fn() } as any,
+            session: { waitForProviderInputAdmission: creationScopeInputAdmission, updateMetadata: vi.fn() } as any,
             permissionMode: 'default',
         });
 
@@ -3921,6 +3947,7 @@ describe('createCodexAppServerRuntime', () => {
         const inputConsumer = createSessionProviderInputConsumer({
             messageQueue: new MessageQueue2<{ id: string }>(() => 'hash'),
             session: {
+                waitForProviderInputAdmission: async (signal) => !signal.aborted,
                 materializeNextPendingMessageSafely,
                 waitForPendingEligibilityUpdate: async (signal) => await new Promise<boolean>((resolve) => {
                     const finish = (updated: boolean) => {
@@ -4187,6 +4214,7 @@ describe('createCodexAppServerRuntime', () => {
             directory: root,
             onThinkingChange: vi.fn(),
             session: {
+                waitForProviderInputAdmission: creationScopeInputAdmission,
                 updateMetadata: vi.fn(),
                 sendAgentMessageCommitted: vi.fn(async () => {}),
                 sendCodexMessage: vi.fn(),
@@ -4523,7 +4551,13 @@ describe('createCodexAppServerRuntime', () => {
     });
 
     it('waits for the active turn id before calling turn/steer', async () => {
-        const { root, requestLogPath } = await createRuntimeFixture('happier-codex-app-server-runtime-steer-wait-');
+        const controlRoot = await createTempDir('happier-codex-app-server-steer-wait-controls-');
+        tempRoots.add(controlRoot);
+        const startRelease = join(controlRoot, 'start-release');
+        const completionRelease = join(controlRoot, 'completion-release');
+        const { root, requestLogPath } = await createRuntimeFixture('happier-codex-app-server-runtime-steer-wait-', {
+            steerWaitControlPaths: { startRelease, completionRelease },
+        });
 
         const runtime = createCodexAppServerRuntime({
             directory: root,
@@ -4531,39 +4565,56 @@ describe('createCodexAppServerRuntime', () => {
             session: { updateMetadata: vi.fn() } as any,
         });
 
-        await runtime.startOrLoad({});
+        let sendPromptPromise: Promise<void> | undefined;
+        let steerPromise: Promise<void> | undefined;
+        try {
+            await runtime.startOrLoad({});
 
-        const sendPromptPromise = runtime.sendPrompt('steer-delay');
-        await new Promise((resolve) => setTimeout(resolve, 5));
+            sendPromptPromise = runtime.sendPrompt('steer-delay');
+            await waitForCondition(async () => (await readRequestLog(requestLogPath))
+                .some((entry) => entry.method === 'turn/start'), {
+                timeoutMs: 1_000,
+                intervalMs: 5,
+                label: 'turn/start request while provider acknowledgement is held',
+            });
 
-        expect(runtime.isTurnInFlight()).toBe(true);
-        expect(runtime.canSteerPrompt()).toBe(false);
+            expect(runtime.isTurnInFlight()).toBe(true);
+            expect(runtime.canSteerPrompt()).toBe(false);
 
-        let steerSettled = false;
-        const steerPromise = runtime.steerPrompt('nudge-early');
-        void steerPromise.then(
-            () => { steerSettled = true; },
-            () => { steerSettled = true; },
-        );
-        await new Promise((resolve) => setTimeout(resolve, 5));
+            let steerSettled = false;
+            steerPromise = runtime.steerPrompt('nudge-early');
+            void steerPromise.then(
+                () => { steerSettled = true; },
+                () => { steerSettled = true; },
+            );
+            await new Promise((resolve) => setTimeout(resolve, 5));
 
-        expect(steerSettled).toBe(false);
-        const earlyRequestLog = await readRequestLog(requestLogPath);
-        expect(earlyRequestLog.filter((entry) => entry.method === 'turn/steer')).toHaveLength(0);
+            expect(steerSettled).toBe(false);
+            const earlyRequestLog = await readRequestLog(requestLogPath);
+            expect(earlyRequestLog.filter((entry) => entry.method === 'turn/steer')).toHaveLength(0);
 
-        await steerPromise;
-        await sendPromptPromise;
+            await writeFile(startRelease, 'release');
+            await steerPromise;
 
-        const requestLog = (await readFile(requestLogPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
-        expect(requestLog.filter((entry: { method: string }) => entry.method === 'turn/steer')).toEqual([
-            expect.objectContaining({
-                params: expect.objectContaining({
-                    threadId: 'thread-started',
-                    expectedTurnId: 'turn-steer-delay',
-                    input: [{ type: 'text', text: 'nudge-early' }],
+            const requestLog = await readRequestLog(requestLogPath);
+            expect(requestLog.filter((entry) => entry.method === 'turn/steer')).toEqual([
+                expect.objectContaining({
+                    params: expect.objectContaining({
+                        threadId: 'thread-started',
+                        expectedTurnId: 'turn-steer-delay',
+                        input: [{ type: 'text', text: 'nudge-early' }],
+                    }),
                 }),
-            }),
-        ]);
+            ]);
+            await writeFile(completionRelease, 'release');
+            await sendPromptPromise;
+        } finally {
+            await Promise.all([
+                writeFile(startRelease, 'release'),
+                writeFile(completionRelease, 'release'),
+            ]);
+            await Promise.allSettled([sendPromptPromise, steerPromise]);
+        }
     });
 
     it('does not steer a turn whose ownership changes while structured input is resolving', async () => {
@@ -4706,6 +4757,7 @@ describe('createCodexAppServerRuntime', () => {
         const { root } = await createRuntimeFixture('happier-codex-app-server-runtime-review-dedupe-');
 
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             updateMetadata: vi.fn(),
             sendAgentMessageCommitted: vi.fn(async () => {}),
             sendCodexMessage: vi.fn(),
@@ -4745,6 +4797,7 @@ describe('createCodexAppServerRuntime', () => {
         const { root } = await createRuntimeFixture('happier-codex-app-server-runtime-review-different-final-');
 
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             updateMetadata: vi.fn(),
             sendAgentMessageCommitted: vi.fn(async () => {}),
             sendCodexMessage: vi.fn(),
@@ -4782,6 +4835,7 @@ describe('createCodexAppServerRuntime', () => {
         const { root } = await createRuntimeFixture('happier-codex-app-server-runtime-inline-review-');
 
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             sessionId: 'sess-inline-review',
             updateMetadata: vi.fn(),
             sendAgentMessageCommitted: vi.fn(async () => {}),
@@ -4832,6 +4886,7 @@ describe('createCodexAppServerRuntime', () => {
         const { root, requestLogPath } = await createRuntimeFixture('happier-codex-app-server-runtime-inline-review-start-');
 
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             sessionId: 'sess-inline-review-start',
             updateMetadata: vi.fn(),
             sendAgentMessageCommitted: vi.fn(async () => {}),
@@ -4894,6 +4949,7 @@ describe('createCodexAppServerRuntime', () => {
         const { root, requestLogPath } = await createRuntimeFixture('happier-codex-app-server-runtime-inline-review-command-');
 
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             sessionId: 'sess-inline-review-command',
             updateMetadata: vi.fn(),
             sendAgentMessageCommitted: vi.fn(async () => {}),
@@ -7845,6 +7901,7 @@ describe('createCodexAppServerRuntime', () => {
             onThinkingChange: vi.fn(),
             onConnectedServiceAuthGenerationApplied: vi.fn(async () => {}),
             session: {
+                waitForProviderInputAdmission: creationScopeInputAdmission,
                 sessionId: 'session-provider-started-identity-race',
                 updateMetadata: vi.fn(),
                 sessionTurnLifecycle,

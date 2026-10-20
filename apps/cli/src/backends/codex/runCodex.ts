@@ -1,3 +1,4 @@
+import type { RequestArchivedSessionCleanup } from '@/api/session/sessionArchiveInputAdmission';
 import { assertOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
 import { applyPermissionModeToCodexPermissionHandler } from './utils/applyPermissionModeToHandler';
 import { createCodexPermissionHandler, type CodexRuntimePermissionHandler } from './utils/createCodexPermissionHandler';
@@ -307,6 +308,7 @@ export async function runCodex(opts: {
             strictNativeResumeIdentity?: boolean;
             importHistory?: boolean;
             initialGoal?: import('@happier-dev/protocol').SessionInitialGoalRequestV1;
+            initialGoalSignal?: AbortSignal;
         }) => Promise<unknown>;
         setSessionMode: (mode: string) => Promise<void>;
         setSessionModel: (model: string) => Promise<void>;
@@ -344,10 +346,10 @@ export async function runCodex(opts: {
 
     const sessionTag = randomUUID();
     let initialGoalForStartOrLoad = readDaemonInitialGoalFromEnv();
-    const consumeInitialGoalForStartOrLoad = () => {
+    const consumeInitialGoalForStartOrLoad = (signal: AbortSignal) => {
         const goal = initialGoalForStartOrLoad;
         initialGoalForStartOrLoad = null;
-        return goal ? { initialGoal: goal } : {};
+        return goal ? { initialGoal: goal, initialGoalSignal: signal } : {};
     };
 
     // Set backend for offline warnings (before any API calls)
@@ -818,12 +820,14 @@ export async function runCodex(opts: {
     // Offline reconnection handle (only relevant when creating a new session and server is unreachable)
     let reconnectionHandle: { cancel: () => void } | null = null;
     const stopRunSessionSpan = timing.startSpan('initialize_backend_run_session');
+    let archivedSessionCleanup: RequestArchivedSessionCleanup = async () => ({ kind: 'unavailable' });
     const initializedSession = await initializeBackendRunSession({
         api,
         sessionTag,
         metadata: startupMetadata,
         state,
         existingSessionId: opts.existingSessionId,
+        requestArchivedSessionCleanup: () => archivedSessionCleanup(),
         uiLogPrefix: '[codex]',
         startupMetadataOverrides: createStartupMetadataOverrides(opts),
         metadataKeysToUnsetOnAttach: codexBackendMode === 'acp'
@@ -913,6 +917,7 @@ export async function runCodex(opts: {
             };
 
         return {
+            waitForProviderInputAdmission: (signal) => session.waitForProviderInputAdmission(signal),
             materializeNextPendingMessageSafely,
             shouldAttemptPendingMaterialization: () => session.shouldAttemptPendingMaterialization?.() ?? true,
             reconcilePendingQueueState: (opts) => session.reconcilePendingQueueState?.(opts),
@@ -1439,9 +1444,11 @@ export async function runCodex(opts: {
      */
     async function handleAbort() {
         logger.debug('[Codex] Abort requested - stopping current task');
+        // Abandon the original bootstrap request before asynchronous abort cleanup.
+        initialGoalForStartOrLoad = null;
+        startOrLoadAbortController.abort();
         try {
             await permissionHandler.abortPendingRequestsAndFlush('Aborted by user');
-            startOrLoadAbortController.abort();
             // Store the current session ID before aborting for potential resume
             if (useCodexAcp || useCodexAppServer) {
                 const currentRemoteSessionId = getCodexRemoteResumeId();
@@ -1523,6 +1530,11 @@ export async function runCodex(opts: {
             }
         },
     });
+
+    archivedSessionCleanup = async () => {
+        terminationHandlers.requestTermination({ kind: 'exit', code: 0 });
+        return { kind: 'requested' };
+    };
 
     const handleKillSession = async () => {
         logger.debug('[Codex] Kill session requested - terminating process');
@@ -2121,6 +2133,23 @@ export async function runCodex(opts: {
                 });
             };
 
+            const startOrLoadRemoteRuntime = async (
+                runtime: CodexRemoteRuntime,
+                options: Parameters<CodexRemoteRuntime['startOrLoad']>[0],
+                signal: AbortSignal,
+            ): Promise<unknown> => {
+                signal.throwIfAborted();
+                // The goal and its lifetime belong to this request, before any bootstrap await.
+                const initialGoal = consumeInitialGoalForStartOrLoad(signal);
+                if (options.resumeId) {
+                    await clearTrackedNativeReturnBeforeProviderOpen(options.resumeId);
+                    signal.throwIfAborted();
+                }
+                await seedCodexAppServerOverridesBeforeStartOrLoad();
+                signal.throwIfAborted();
+                return await runtime.startOrLoad({ ...options, ...initialGoal });
+            };
+
 	        runtimeOverridesSync = await initializeRuntimeOverridesSynchronizer({
 	            explicitPermissionMode: typeof explicitPermissionMode === 'string'
 	                ? normalizePermissionModeToIntent(explicitPermissionMode) ?? undefined
@@ -2247,15 +2276,12 @@ export async function runCodex(opts: {
                 if (resumeId && (useCodexAppServer || isStrictExplicit || isStrictLocalControl)) {
                     messageBuffer.addMessage('Resuming previous context…', 'status');
                     const resumeSignal = startOrLoadAbortController.signal;
-                    await clearTrackedNativeReturnBeforeProviderOpen(resumeId);
-                    await seedCodexAppServerOverridesBeforeStartOrLoad();
-                    const startOrLoadPromise = Promise.resolve(codexRuntime.startOrLoad({
+                    const startOrLoadPromise = startOrLoadRemoteRuntime(codexRuntime, {
                         resumeId,
                         strictNativeResumeIdentity: isTrackedNativeReturnResume(resumeId),
                         // Avoid importing ACP replay history into Happier on resume; Happier transcript is the source of truth.
                         importHistory: false,
-                        ...consumeInitialGoalForStartOrLoad(),
-                    })).then(() => undefined);
+                    }, resumeSignal).then(() => undefined);
                     let resumeAborted = false;
                     try {
                         await awaitWithAbortSignal(
@@ -2323,12 +2349,10 @@ export async function runCodex(opts: {
                     const existingAppServerSessionId = readAttachedCodexAppServerThreadId();
                     if (existingAppServerSessionId) {
                         const startSignal = startOrLoadAbortController.signal;
-                        await seedCodexAppServerOverridesBeforeStartOrLoad();
-                        const startOrLoadPromise = Promise.resolve(codexRuntime.startOrLoad({
+                        const startOrLoadPromise = startOrLoadRemoteRuntime(codexRuntime, {
                             existingSessionId: existingAppServerSessionId,
                             importHistory: false,
-                            ...consumeInitialGoalForStartOrLoad(),
-                        })).then(() => undefined);
+                        }, startSignal).then(() => undefined);
                         try {
                             await awaitWithAbortSignal(
                                 startOrLoadPromise,
@@ -2554,16 +2578,12 @@ export async function runCodex(opts: {
                         if (resumeId) {
                             messageBuffer.addMessage('Resuming previous context…', 'status');
                             const resumeSignal = startOrLoadAbortController.signal;
-                            await clearTrackedNativeReturnBeforeProviderOpen(resumeId);
-                            await seedCodexAppServerOverridesBeforeStartOrLoad();
-                            const initialGoal = consumeInitialGoalForStartOrLoad();
-                            const startOrLoadPromise = Promise.resolve(codexRuntime.startOrLoad({
+                            const startOrLoadPromise = startOrLoadRemoteRuntime(codexRuntime, {
                                 resumeId,
                                 strictNativeResumeIdentity: isTrackedNativeReturnResume(resumeId),
                                 // Avoid importing ACP replay history into Happier on resume; Happier transcript is the source of truth.
                                 importHistory: false,
-                                ...initialGoal,
-                            })).then(() => undefined);
+                            }, resumeSignal).then(() => undefined);
                             try {
                                 await awaitWithAbortSignal(
                                     startOrLoadPromise,
@@ -2610,11 +2630,8 @@ export async function runCodex(opts: {
                                 messageBuffer.addMessage('Resume failed; starting a new session.', 'status');
                                 session.sendSessionEvent({ type: 'message', message: 'Resume failed; starting a new session.' });
                                 const startSignal = startOrLoadAbortController.signal;
-                                await seedCodexAppServerOverridesBeforeStartOrLoad();
-                                const initialGoal = consumeInitialGoalForStartOrLoad();
-                                const fallbackPromise = Promise.resolve(codexRuntime.startOrLoad({
-                                    ...initialGoal,
-                                })).then(() => undefined);
+                                const fallbackPromise = startOrLoadRemoteRuntime(codexRuntime, {}, startSignal)
+                                    .then(() => undefined);
                                 try {
                                     await awaitWithAbortSignal(
                                         fallbackPromise,
@@ -2640,11 +2657,8 @@ export async function runCodex(opts: {
                             }
                         } else {
                             const startSignal = startOrLoadAbortController.signal;
-                            await seedCodexAppServerOverridesBeforeStartOrLoad();
-                            const initialGoal = consumeInitialGoalForStartOrLoad();
-                            const startOrLoadPromise = Promise.resolve(codexRuntime.startOrLoad({
-                                ...initialGoal,
-                            })).then(() => undefined);
+                            const startOrLoadPromise = startOrLoadRemoteRuntime(codexRuntime, {}, startSignal)
+                                .then(() => undefined);
                             try {
                                 await awaitWithAbortSignal(
                                     startOrLoadPromise,

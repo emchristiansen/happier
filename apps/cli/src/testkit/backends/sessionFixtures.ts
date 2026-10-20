@@ -179,6 +179,11 @@ export function createMutableApiSessionClientFixture<TMetadata extends Record<st
         async waitForMetadataUpdate() {
             return false;
         },
+        async waitForProviderInputAdmission(signal: AbortSignal) {
+            // The generic fixture models create/load. Existing-ID archive tests use the real
+            // ApiClient/session/HTTP admission chain instead of this fixture's permission.
+            return !signal.aborted;
+        },
         async waitForPendingEligibilityUpdate() {
             return false;
         },

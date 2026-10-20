@@ -2,11 +2,13 @@ import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import type { TerminalHostAdapter, TerminalHostHandle } from '@/integrations/terminalHost/_types';
 import type { TerminalControlPort } from '@/integrations/terminalHost/controlTypes';
 import type { RawJSONLines } from '../types';
+import { SessionArchiveInputAdmission } from '@/api/session/sessionArchiveInputAdmission';
+import { createSessionRecordFixture } from '@/testkit/backends/sessionFixtures';
 import { createPermissionHandlerSessionStub } from '../utils/permissionHandler.testkit';
 import { getProjectPath } from '../utils/path';
 import type { SessionHookData } from '../utils/startHookServer';
@@ -15,6 +17,13 @@ import { createClaudeProviderRuntimeActivityAdapter } from '../providerActivity/
 import { ClaudeUnifiedDialogChoiceBroker } from './dialogChoice/claudeUnifiedDialogChoiceBroker';
 import { createClaudeUnifiedResumeChoiceStartupResolver } from './resumeChoice/claudeUnifiedResumeChoiceStartupResolver';
 import { runClaudeUnifiedTerminalSession } from './runClaudeUnifiedTerminalSession';
+
+// Only the archive HTTP transport is replaced; the reader, retry owner and runtime stay real.
+let readArchive: () => Promise<unknown>;
+vi.mock('axios', async () => {
+  const { createOfflineAxios } = await import('@/testkit/http/offlineAxios');
+  return { default: createOfflineAxios(async () => await readArchive()) };
+});
 
 const interactiveClaudeScreen = [
   'Some previous Claude output',
@@ -78,6 +87,14 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<v
 
 describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
   const tempDirs: string[] = [];
+
+  beforeAll(async () => {
+    for (const name of ['HAPPIER_SERVER_URL', 'HAPPIER_LOCAL_SERVER_URL', 'HAPPIER_PUBLIC_SERVER_URL', 'HAPPIER_WEBAPP_URL']) {
+      vi.stubEnv(name, 'https://relay.example.invalid');
+    }
+    const { reloadConfiguration } = await import('@/configuration');
+    reloadConfiguration();
+  });
 
   afterEach(async () => {
     for (const dir of tempDirs.splice(0)) {
@@ -152,6 +169,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
         expectedProviderResumeSessionId: requestedSessionId,
         hookPluginDir: join(dir, 'owned-happier-hook-plugin'),
         signal: abortController.signal,
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
         nextMessage: async () => {
           if (pendingPulled) return await new Promise(() => undefined);
           pendingPulled = true;
@@ -192,7 +210,8 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     }
   });
 
-  it('does not interrupt provider-owned resume-summary compaction before delivering the queued Pending row once', async () => {
+  it.each(['readable', 'archived', 'unknown_then_readable', 'unknown_then_cancelled', 'cancelled_before_answer'] as const)(
+    'admits automatic startup summary only after host launch: %s', async (admissionState) => {
     const dir = await mkdtemp(join(tmpdir(), 'happier-claude-resume-summary-compaction-'));
     tempDirs.push(dir);
     const workspaceDir = join(dir, 'workspace');
@@ -212,8 +231,33 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     let screenText = resumeChoiceDialog;
     let subscribedHook: ((data: SessionHookData) => void) | undefined;
     let pendingPulled = false;
+    let hostLaunched = false;
+    let admissionChecks = 0;
+    let archiveReadable = !admissionState.startsWith('unknown');
+    const requestArchivedStop = vi.fn(async () => ({ kind: 'unavailable' as const }));
+    readArchive = async () => {
+      expect(hostLaunched).toBe(true);
+      admissionChecks += 1;
+      if (!archiveReadable) throw new Error('Synthetic archive HTTP unavailable');
+      return { status: 200, data: { session: createSessionRecordFixture({
+        id: 'resume-summary-compaction-session',
+        archivedAt: admissionState === 'archived' ? 1 : null,
+      }) } };
+    };
+    const admission = new SessionArchiveInputAdmission({
+      token: 'synthetic-startup-archive-token', sessionId: 'resume-summary-compaction-session',
+      lifetime: abortController.signal, connectionEpoch: () => 1,
+      waitForFreshEvent: async (signal) => await new Promise<boolean>((resolve) => {
+        if (signal.aborted) return resolve(false);
+        signal.addEventListener('abort', () => resolve(false), { once: true });
+      }),
+      requestArchivedStop,
+    });
     let resumeAnswerSubmitted = false;
     let compactPromptSubmitted = false;
+    let startupCapturePending = false;
+    let releaseStartupCapture: (() => void) | undefined;
+    const startupCapture = new Promise<void>((resolve) => { releaseStartupCapture = resolve; });
     const onPromptAcceptedByProvider = vi.fn();
     const onTerminalPromptInjected = vi.fn();
     const handle: TerminalHostHandle = {
@@ -230,6 +274,10 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     const controlPort: TerminalControlPort = {
       hostKind: 'tmux',
       async captureScreen() {
+        if (admissionState === 'cancelled_before_answer' && admissionChecks > 0) {
+          startupCapturePending = true;
+          await startupCapture;
+        }
         return {
           status: 'captured',
           capture: { text: screenText, capturedAtMs: Date.now(), hostKind: 'tmux' },
@@ -278,7 +326,10 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     });
     const adapter: TerminalHostAdapter = {
       kind: 'tmux',
-      createOrAttachHost: vi.fn(async () => handle),
+      createOrAttachHost: vi.fn(async () => {
+        hostLaunched = true;
+        return handle;
+      }),
       injectUserPrompt,
       evaluateLiveness: vi.fn(async () => ({ paneAlive: true, observedAt: Date.now() })),
       captureInputState: vi.fn(async () => ({
@@ -300,12 +351,13 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
       transcriptPath,
       hookPluginDir: join(dir, 'owned-happier-hook-plugin'),
       signal: abortController.signal,
+      waitForProviderInputAdmission: (signal) => admission.wait(signal),
       nextMessage: async () => {
         if (pendingPulled) return await new Promise(() => undefined);
         pendingPulled = true;
         return {
           message: pendingPrompt,
-          mode: { permissionMode: 'default', claudeUnifiedTerminalHost: 'tmux' },
+          mode: { permissionMode: 'default', claudeUnifiedTerminalHost: 'tmux', claudeUnifiedTerminalResumeChoice: 'resume_from_summary' },
           userMessageLocalIds: ['resume-summary-pending-local-id'],
           pendingProviderAction: 'interrupt_and_send',
         };
@@ -344,7 +396,47 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
       dialogTurnEndScreenProbeDelaysMs: [],
     });
 
+    // Observe rejection immediately so a truthful refusal cannot become an unhandled promise.
+    const outcome = sessionPromise.then(() => null, (error: unknown) => error);
     try {
+      if (admissionState === 'cancelled_before_answer') {
+        await waitUntil(() => startupCapturePending || resumeAnswerSubmitted);
+        expect(startupCapturePending).toBe(true);
+        abortController.abort();
+        releaseStartupCapture?.();
+        await outcome;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        expect(resumeAnswerSubmitted).toBe(false);
+        expect(injectUserPrompt).not.toHaveBeenCalled();
+        return;
+      }
+      if (admissionState === 'archived') {
+        await waitUntil(() => admissionChecks > 0 || resumeAnswerSubmitted);
+        expect(admissionChecks).toBeGreaterThan(0);
+        await expect(outcome).resolves.toMatchObject({ name: 'AbortError' });
+        expect(admissionChecks).toBeGreaterThan(0);
+        expect(resumeAnswerSubmitted).toBe(false);
+        expect(requestArchivedStop).toHaveBeenCalledTimes(1);
+        expect(injectUserPrompt).not.toHaveBeenCalled();
+        expect(onPromptAcceptedByProvider).not.toHaveBeenCalled();
+        return;
+      }
+      if (admissionState.startsWith('unknown')) {
+        await waitUntil(() => admissionChecks > 0 || resumeAnswerSubmitted);
+        expect(admissionChecks).toBeGreaterThan(0);
+        expect(resumeAnswerSubmitted).toBe(false);
+        expect(injectUserPrompt).not.toHaveBeenCalled();
+        if (admissionState === 'unknown_then_cancelled') {
+          abortController.abort();
+          await outcome;
+          archiveReadable = true;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          expect(resumeAnswerSubmitted).toBe(false);
+          expect(injectUserPrompt).not.toHaveBeenCalled();
+          return;
+        }
+        archiveReadable = true;
+      }
       await waitUntil(() => resumeAnswerSubmitted);
       await waitUntil(() => compactPromptSubmitted);
       await new Promise((resolve) => setTimeout(resolve, 1_500));
@@ -386,7 +478,8 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
       });
     } finally {
       abortController.abort();
-      await sessionPromise;
+      releaseStartupCapture?.();
+      await outcome;
       await broker.dispose();
       if (previousClaudeConfigDir === undefined) {
         delete process.env.CLAUDE_CONFIG_DIR;
@@ -472,6 +565,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
       transcriptPath,
       hookPluginDir: join(dir, 'owned-happier-hook-plugin'),
       signal: abortController.signal,
+      waitForProviderInputAdmission: async (signal) => !signal.aborted,
       nextMessage: async () => {
         pendingPullCount += 1;
         if (pendingPullCount > 2) return await new Promise(() => undefined);
@@ -617,6 +711,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     const sessionPromise = runClaudeUnifiedTerminalSession({
       path: '/workspace/project',
       signal: abortController.signal,
+      waitForProviderInputAdmission: async (signal) => !signal.aborted,
       nextMessage: async () => {
         if (consumed) return await new Promise(() => undefined);
         consumed = true;
@@ -727,6 +822,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     const sessionPromise = runClaudeUnifiedTerminalSession({
       path: '/workspace/project',
       signal: abortController.signal,
+      waitForProviderInputAdmission: async (signal) => !signal.aborted,
       nextMessage: async () => {
         if (consumed) return await new Promise(() => undefined);
         consumed = true;
@@ -915,6 +1011,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
       sessionId: claudeSessionId,
       hookPluginDir: join(dir, 'owned-happier-hook-plugin'),
       signal: abortController.signal,
+      waitForProviderInputAdmission: async (signal) => !signal.aborted,
       nextMessage: async () => {
         if (consumed) return await new Promise(() => undefined);
         consumed = true;

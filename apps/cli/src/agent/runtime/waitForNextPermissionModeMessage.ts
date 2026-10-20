@@ -15,6 +15,7 @@ export async function waitForNextPermissionModeMessage<Mode, Message>(opts: {
   onMetadataUpdate?: (() => void | Promise<void>) | null;
 }): Promise<MessageBatch<Mode, Message> | null> {
   const session: SessionProviderInputConsumerSession = {
+    waitForProviderInputAdmission: (signal) => opts.session.waitForProviderInputAdmission(signal),
     materializeNextPendingMessageSafely: (materializeOpts) =>
       opts.session.materializeNextPendingMessageSafely(materializeOpts),
     shouldAttemptPendingMaterialization: () => opts.session.shouldAttemptPendingMaterialization?.() ?? true,

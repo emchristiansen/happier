@@ -16,6 +16,8 @@ import { CONNECTED_SERVICE_RUNTIME_AUTH_FAILURE_REPORT_TIMEOUT_MS } from '@/daem
 import { createCodexPermissionHandler } from './utils/createCodexPermissionHandler';
 import { applyPermissionModeToCodexPermissionHandler } from './utils/applyPermissionModeToHandler';
 import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
+import { createDeferred } from '@/testkit/async/deferred';
+import { createMutableApiSessionClientFixture } from '@/testkit/backends/sessionFixtures';
 
 const modelSyncFlushPendingAfterStartSpy = vi.fn(async () => {});
 const sessionModeSyncFlushPendingAfterStartSpy = vi.fn(async () => {});
@@ -2963,6 +2965,10 @@ describe('runCodex CodexACP resume behavior', () => {
 
     const consumerOptions = createSessionProviderInputConsumerSpy.mock.calls.at(-1)?.[0];
     expect(consumerOptions).not.toHaveProperty('initialProviderInputAdmissions');
+    // This case creates a fresh session; existing-ID admission uses the real API tests.
+    Object.assign(lastSessionClient!, {
+      waitForProviderInputAdmission: createMutableApiSessionClientFixture().waitForProviderInputAdmission,
+    });
     const actualConsumerModule = await vi.importActual<
       typeof import('@/agent/runtime/sessionInput/SessionProviderInputConsumer')
     >('@/agent/runtime/sessionInput/SessionProviderInputConsumer');
@@ -4427,6 +4433,59 @@ describe('runCodex CodexACP resume behavior', () => {
     );
     expect(flushTurn).not.toHaveBeenCalled();
   });
+
+  it.each(['resume', 'existing attach'] as const)(
+    'abandons an initial goal aborted during override seeding for %s and permits the next prompt', async (entry) => {
+      resolveRunnerMcpServersSpy.mockResolvedValueOnce({
+        happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() }, mcpServers: {},
+      });
+      process.env[HAPPIER_DAEMON_INITIAL_GOAL_ENV_KEY] = serializeDaemonInitialGoalForEnv({
+        objective: 'abandoned bootstrap goal',
+      });
+      mockAttachedSessionMetadata({
+        codexSessionId: 'thread-original', codexBackendMode: 'appServer',
+        modelOverrideV1: { v: 1, modelId: 'gpt-test', updatedAt: 1 },
+      });
+      const seedStarted = createDeferred<void>();
+      const releaseSeed = createDeferred<void>();
+      const runtime = createDefaultCodexAppServerRuntimeMock();
+      runtime.setSessionModel.mockImplementationOnce(async () => {
+        seedStarted.resolve();
+        await releaseSeed.promise;
+      });
+      runtime.startOrLoad.mockResolvedValue(undefined);
+      createCodexAppServerRuntimeSpy.mockReturnValueOnce(runtime);
+      let inputs = 0;
+      sessionInputConsumerWaitForNextInputImpl = async () => {
+        if (++inputs === 1) return {
+          message: 'legitimate next prompt', mode: { permissionMode: 'default', permissionModeUpdatedAt: 1 },
+          isolate: false, hash: 'next-prompt',
+        };
+        throw new Error('next-prompt-completed');
+      };
+      const { runCodex } = await import('./runCodex');
+      const outcome = runCodex({
+        credentials: { token: 'test' } as Credentials, startedBy: 'daemon', startingMode: 'remote',
+        codexBackendMode: 'appServer', permissionMode: 'default', permissionModeUpdatedAt: 1,
+        ...(entry === 'resume' ? { resume: 'thread-original' } : { existingSessionId: 'existing-123' }),
+      }).then(() => ({ ok: true as const }), (error: unknown) => ({ ok: false as const, error }));
+      try {
+        await seedStarted.promise;
+        const abort = registerSessionRpcHandlerMock.mock.calls.find((call) => call[0] === 'abort')?.[1];
+        expect(abort).toBeTypeOf('function');
+        await abort!();
+        releaseSeed.resolve();
+        await expect(outcome).resolves.toMatchObject({ ok: false, error: { message: 'next-prompt-completed' } });
+        expect(runtime.startOrLoad.mock.calls.map((call: [{ initialGoal?: unknown }]) => call[0].initialGoal).filter(Boolean)).toEqual([]);
+        expect(runtime.startOrLoad).toHaveBeenCalledTimes(1);
+        expect(runtime.startOrLoad.mock.calls[0][0]).not.toHaveProperty('initialGoal');
+        expect(runtime.sendPrompt).toHaveBeenCalledWith('legitimate next prompt', expect.anything());
+      } finally {
+        releaseSeed.resolve();
+        await outcome;
+      }
+    },
+  );
 
   it('admits a connected-service initial-goal resume without a generation transition and starts it once', async () => {
     resolveRunnerMcpServersSpy.mockImplementationOnce(async () => ({

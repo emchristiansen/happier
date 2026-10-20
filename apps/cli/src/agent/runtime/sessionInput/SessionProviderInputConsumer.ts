@@ -37,6 +37,7 @@ export class PendingQueueMaterializationAuthError extends Error {
 }
 
 export interface SessionProviderInputConsumerSession {
+  waitForProviderInputAdmission: (abortSignal: AbortSignal) => Promise<boolean>;
   materializeNextPendingMessageSafely: (opts?: MaterializeNextPendingOptions) => Promise<PendingMaterializationResult>;
   shouldAttemptPendingMaterialization?: ((opts?: {
     activeTurnSteerability?: PendingForegroundSteerability;
@@ -245,6 +246,7 @@ export function createSessionProviderInputConsumer<Mode, Message>(
     }
   };
   let providerInputAdmissionOpen = true;
+  const archiveAdmissionAbort = new AbortController();
   let activeProviderInputDispatches = 0;
   let activePendingMaterializationRequests = 0;
   let providerInputBatchReserved = false;
@@ -271,6 +273,11 @@ export function createSessionProviderInputConsumer<Mode, Message>(
     if (!providerInputAdmissionOpen || dispatchOpts.abortSignal.aborted) {
       return { status: 'cancelled' };
     }
+    if (!await opts.session.waitForProviderInputAdmission(AbortSignal.any([
+      dispatchOpts.abortSignal, archiveAdmissionAbort.signal,
+    ])) || !providerInputAdmissionOpen || dispatchOpts.abortSignal.aborted) {
+      return { status: 'cancelled' };
+    }
     // This increment and closeProviderInputAdmissionAndWaitForDispatches's flag write are
     // synchronous, establishing the one event-loop order for replacement versus dispatch.
     providerInputBatchReserved = false;
@@ -284,6 +291,9 @@ export function createSessionProviderInputConsumer<Mode, Message>(
   };
 
   const admissionTrackedSession: SessionProviderInputConsumerSession = {
+    waitForProviderInputAdmission: (signal) => opts.session.waitForProviderInputAdmission(AbortSignal.any([
+      signal, archiveAdmissionAbort.signal,
+    ])),
     materializeNextPendingMessageSafely: async (materializeOpts) => {
       if (!providerInputAdmissionOpen) return { type: 'no_pending' };
       activePendingMaterializationRequests += 1;
@@ -406,6 +416,7 @@ export function createSessionProviderInputConsumer<Mode, Message>(
     runProviderInputDispatch,
     async closeProviderInputAdmissionAndWaitForDispatches() {
       providerInputAdmissionOpen = false;
+      archiveAdmissionAbort.abort();
       await waitForActiveProviderInputAdmissionWork();
     },
     async waitForNextInput(waitOpts) {
@@ -576,6 +587,8 @@ async function waitForNextInput<Mode, Message>(
     };
 
     try {
+      if (!await opts.session.waitForProviderInputAdmission(opts.abortSignal)
+        || opts.abortSignal.aborted || !opts.isProviderInputAdmissionOpen()) return null;
       let batch = await collectQueuedBatch(opts.messageQueue, opts.abortSignal);
       if (!batch) {
         await opts.materialize(() => materializePendingMessage(opts));

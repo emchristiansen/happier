@@ -56,6 +56,7 @@ describe('runPermissionModePromptLoop provider submission phase ownership', () =
       agentMessageType: 'pi',
       explicitPermissionMode: 'default',
       session: {
+        waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted,
         getMetadataSnapshot: () => metadata,
         updateMetadata: vi.fn(),
         ensureMetadataSnapshot: async () => metadata,
@@ -151,6 +152,7 @@ describe('runPermissionModePromptLoop provider submission phase ownership', () =
       agentMessageType: 'qwen',
       explicitPermissionMode: 'default',
       session: {
+        waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted,
         getMetadataSnapshot: () => metadata,
         updateMetadata: (updater: (current: typeof metadata) => typeof metadata) => {
           metadata = updater(metadata);
@@ -259,6 +261,7 @@ describe('runPermissionModePromptLoop provider submission phase ownership', () =
     const blockPendingMessageDelivery = vi.fn(async () => true);
     const providerInputOutcomeObserver = vi.fn();
     const session = {
+      waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted,
       getMetadataSnapshot: () => metadata,
       updateMetadata: (updater: (current: typeof metadata) => typeof metadata) => {
         metadata = updater(metadata);

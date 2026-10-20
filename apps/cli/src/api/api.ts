@@ -1,3 +1,4 @@
+import type { RequestArchivedSessionCleanup } from './session/sessionArchiveInputAdmission';
 import axios from 'axios'
 import { z } from 'zod';
 import { logger } from '@/ui/logger'
@@ -748,8 +749,14 @@ export class ApiClient {
   sessionSyncClient(
     session: Session,
     runtimeActivity?: import('./session/sessionClient').SessionRuntimeActivityClientConfig,
+    attach?: Readonly<{ existingSessionId: string; requestArchivedSessionCleanup?: RequestArchivedSessionCleanup }>,
   ): ApiSessionClient {
-    return new ApiSessionClient(this.credential.token, session, runtimeActivity);
+    if (attach && attach.existingSessionId.trim() !== session.id) {
+      throw new Error('Existing-session input admission requires the exact attached session identity');
+    }
+    return new ApiSessionClient(this.credential.token, session, runtimeActivity, attach
+      ? attach.requestArchivedSessionCleanup ?? (async () => ({ kind: 'unavailable' as const }))
+      : undefined);
   }
 
   machineSyncClient(

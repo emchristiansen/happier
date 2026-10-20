@@ -43,6 +43,8 @@ export function exponentialBackoffDelay(currentFailureCount: number, minDelay: n
     return Math.max(minDelay, Math.round(jittered));
 }
 
+const MAX_BACKOFF_TIMER_DELAY_MS = 2_147_483_647;
+
 export type BackoffFunc = <T>(callback: () => Promise<T>) => Promise<T>;
 
 export function createBackoff(
@@ -51,10 +53,13 @@ export function createBackoff(
         shouldRetry?: (e: any, failuresCount: number) => boolean,
         minDelay?: number,
         maxDelay?: number,
-        maxFailureCount?: number
+        maxFailureCount?: number,
+        /** Optional server floor for this failed attempt; never capped by local jitter. */
+        retryAfterMs?: (error: unknown) => number | undefined
     }): BackoffFunc {
     return async <T>(callback: () => Promise<T>): Promise<T> => {
         let currentFailureCount = 0;
+        let serverNotBeforeMs = 0;
         const minDelay = opts && opts.minDelay !== undefined ? opts.minDelay : 250;
         const maxDelay = opts && opts.maxDelay !== undefined ? opts.maxDelay : 1000;
         const maxFailureCount = opts && opts.maxFailureCount !== undefined ? opts.maxFailureCount : 8;
@@ -72,6 +77,12 @@ export function createBackoff(
                 return true;
             };
         while (true) {
+            // A bounded timer wake cannot waive a longer server floor.
+            const serverRemainingMs = serverNotBeforeMs - Date.now();
+            if (serverRemainingMs > 0) {
+                await delay(Math.min(MAX_BACKOFF_TIMER_DELAY_MS, serverRemainingMs));
+                continue;
+            }
             try {
                 return await callback();
             } catch (e) {
@@ -85,8 +96,14 @@ export function createBackoff(
                 if (opts && opts.onError) {
                     opts.onError(e, currentFailureCount);
                 }
-                let waitForRequest = exponentialBackoffDelay(currentFailureCount, minDelay, maxDelay, maxFailureCount);
-                await delay(waitForRequest);
+                const localDelay = exponentialBackoffDelay(currentFailureCount, minDelay, maxDelay, maxFailureCount);
+                const retryAfterMs = opts?.retryAfterMs?.(e);
+                const serverDelay = typeof retryAfterMs === 'number' && Number.isFinite(retryAfterMs)
+                    ? Math.max(0, Math.ceil(retryAfterMs))
+                    : 0;
+                if (serverDelay > 0) serverNotBeforeMs = Math.max(serverNotBeforeMs, Date.now() + serverDelay);
+                const waitForRequest = Math.max(localDelay, serverDelay);
+                await delay(serverDelay > MAX_BACKOFF_TIMER_DELAY_MS ? MAX_BACKOFF_TIMER_DELAY_MS : waitForRequest);
             }
         }
     };

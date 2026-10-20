@@ -219,6 +219,8 @@ export type ClaudeUnifiedTerminalSessionOptions<Mode extends EnhancedMode = Enha
   signal?: AbortSignal | undefined;
   initialMode?: Mode | undefined;
   nextMessage: () => Promise<ClaudeUnifiedTerminalQueuedInput<Mode> | null>;
+  /** Fresh existing-session archive admission, including delayed programmatic goal injection. */
+  waitForProviderInputAdmission: (signal: AbortSignal) => Promise<boolean>;
   /**
    * Hands back a queued message that was already consumed by the input pump but
    * can no longer be delivered (host-death/dispose unwind), so the owner can
@@ -1706,6 +1708,20 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
     const hostInputInjection: TerminalInputInjectionV1 = {
       hostKind: hostResolution.adapter.kind,
       injectUserPrompt: async (input, writeBoundary) => {
+        const signal = AbortSignal.any([
+          runtimeAbortController.signal, processSignalAbortController.signal,
+          ...(opts.signal ? [opts.signal] : []),
+        ]);
+        if (!await opts.waitForProviderInputAdmission(signal)) {
+          const error = new Error('Provider input admission closed before terminal prompt injection');
+          error.name = 'AbortError';
+          throw error;
+        }
+        if (signal.aborted) {
+          const error = new Error('Terminal prompt injection cancelled before host write');
+          error.name = 'AbortError';
+          throw error;
+        }
         // Lane X: every text we attempt to write is recorded so a later leftover composer draft
         // can be exact-match classified as OUR OWN residue (vs an untouchable genuine user draft).
         ownComposerTextLog.record(input.text);
@@ -1799,10 +1815,40 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
       // NON-generating screen only). Separate from the runtime-control controller's port — the
       // evaluator never routes through controller state. Shared with the pre-injection guard below.
       const steerDraftClearPort = hostResolution.adapter.createControlPort?.(activeHandle) ?? null;
-      const startupDialogControlPort = opts.createStartupDialogResolver
+      const rawStartupDialogControlPort = opts.createStartupDialogResolver
         ? (hostResolution.adapter.createControlPort?.(activeHandle) ?? null)
         : null;
-      const resolveStartupDialog = startupDialogControlPort
+      const automaticSummary = startupInput.mode.claudeUnifiedTerminalResumeChoice === 'resume_from_summary';
+      const startupDialogLifetime = AbortSignal.any([
+        runtimeAbortController.signal, processSignalAbortController.signal,
+        ...(opts.signal ? [opts.signal] : []),
+      ]);
+      let startupWriteSignal = startupDialogLifetime;
+      const assertStartupWriteLive = (): void => {
+        if (!startupWriteSignal.aborted) return;
+        const error = new Error('Automatic startup summary answer cancelled before terminal write');
+        error.name = 'AbortError';
+        throw error;
+      };
+      const startupDialogControlPort: TerminalControlPort | null = rawStartupDialogControlPort && automaticSummary
+        ? {
+          hostKind: rawStartupDialogControlPort.hostKind,
+          captureScreen: () => rawStartupDialogControlPort.captureScreen(),
+          sendLiteralText: async (text) => {
+            assertStartupWriteLive();
+            return rawStartupDialogControlPort.sendLiteralText(text);
+          },
+          sendRawSequence: async (sequence) => {
+            assertStartupWriteLive();
+            return rawStartupDialogControlPort.sendRawSequence(sequence);
+          },
+          sendSpecialKey: async (key) => {
+            assertStartupWriteLive();
+            return rawStartupDialogControlPort.sendSpecialKey(key);
+          },
+        }
+        : rawStartupDialogControlPort;
+      const startupDialogResolver = startupDialogControlPort
         ? (opts.createStartupDialogResolver?.({
           controlPort: startupDialogControlPort,
           startupMode: startupInput.mode,
@@ -1818,6 +1864,56 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
             });
           },
         }) ?? undefined)
+        : undefined;
+      // Readiness must retain this configured choice while archive state is unreadable. Its
+      // existing pause outcome keeps the startup deadline from turning that wait into refusal.
+      type StartupAdmission = {
+        abort: AbortController;
+        signal: AbortSignal;
+        outcome: { kind: 'pending' } | { kind: 'admitted' } | { kind: 'failed'; error: unknown };
+      };
+      let startupAdmission: StartupAdmission | null = null;
+      const resolveStartupDialog: ClaudeUnifiedStartupDialogResolver | undefined = startupDialogResolver
+        ? async (input) => {
+          if (!automaticSummary || !input.screenState.resumeChoiceDialogVisible) {
+            startupAdmission?.abort.abort();
+            startupAdmission = null;
+            return startupDialogResolver(input);
+          }
+          if (!startupAdmission) {
+            const abort = new AbortController();
+            const attempt: StartupAdmission = {
+              abort,
+              signal: AbortSignal.any([startupDialogLifetime, input.abortSignal, abort.signal]),
+              outcome: { kind: 'pending' },
+            };
+            startupAdmission = attempt;
+            void opts.waitForProviderInputAdmission(attempt.signal).then((allowed) => {
+              if (allowed && !attempt.signal.aborted) {
+                attempt.outcome = { kind: 'admitted' };
+              } else {
+                const error = new Error('Provider input admission closed before automatic startup summary answer');
+                error.name = 'AbortError';
+                attempt.outcome = { kind: 'failed', error };
+              }
+            }, (error: unknown) => { attempt.outcome = { kind: 'failed', error }; });
+          }
+          const attempt = startupAdmission;
+          if (attempt.outcome.kind === 'pending') return { status: 'waiting_for_input_admission' };
+          startupAdmission = null;
+          if (attempt.outcome.kind === 'failed') {
+            attempt.abort.abort();
+            throw attempt.outcome.error;
+          }
+          startupWriteSignal = attempt.signal;
+          try {
+            assertStartupWriteLive();
+            return await startupDialogResolver(input);
+          } finally {
+            attempt.abort.abort();
+            startupWriteSignal = startupDialogLifetime;
+          }
+        }
         : undefined;
       const captureInputStateForGuard = hostResolution.adapter.captureInputState;
       const promptInjector = createClaudeUnifiedPromptInjector<Mode>({

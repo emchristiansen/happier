@@ -547,14 +547,15 @@ describe('createClaudeUnifiedTerminalReadinessBridge', () => {
     bridge.dispose();
   });
 
-  it('pauses the readiness deadline while the exact live dialog waits for a user answer', async () => {
+  it.each(['waiting_for_user', 'waiting_for_input_admission'] as const)(
+    'pauses the readiness deadline while the exact live dialog waits: %s', async (waitingStatus) => {
     vi.useFakeTimers();
     let nowMs = 0;
     const arbiter = createArbiter();
     const abortController = new AbortController();
     let waitingForUser = true;
     const resolveStartupDialog = vi.fn().mockImplementation(() => (
-      waitingForUser ? { status: 'waiting_for_user' as const } : { status: 'unhandled' as const }
+      waitingForUser ? { status: waitingStatus } : { status: 'unhandled' as const }
     ));
     const captureInputState = vi.fn().mockImplementation(async () => ({
       stable: true,

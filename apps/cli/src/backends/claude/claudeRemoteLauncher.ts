@@ -1598,6 +1598,7 @@ export async function claudeRemoteLauncher(
                     },
                     nextMessage: async () => {
                         await session.connectedServiceAuthGroupRequestFence?.waitUntilAvailable(controller.signal);
+                        if (!await session.client.waitForProviderInputAdmission(controller.signal)) return null;
                         if (pending) {
                             const p = pending;
                             pending = null;
@@ -2072,6 +2073,7 @@ export async function claudeRemoteLauncher(
                             // re-setting the same objective after a clear is accepted (G2).
                             recordGoalSetIntent: () => goalWorkStateSource.recordGoalSetIntent(),
                             initialGoalObjective: consumeInitialGoalObjectiveForUnified(),
+                            waitForProviderInputAdmission: (signal) => session.client.waitForProviderInputAdmission(signal),
                             // C11 (incident cmq8y3nlx): binding-owned registry, seeded from the
                             // persisted prompt store above, so a respawned runner recognizes its
                             // predecessor's leftover composer injection as our own text.
