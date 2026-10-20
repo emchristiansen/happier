@@ -14,6 +14,21 @@ describe('probeSessionRunnerServiceability', () => {
     })).toEqual({ action: 'wait_for_exit', reason: 'runtime_terminating' });
     expect(resolveSessionRunnerResumeDecision({ state: 'runner_absent' })).toEqual({ action: 'spawn' });
   });
+  it('replaces a present runner only on its positively reported lost publisher', () => {
+    expect(resolveSessionRunnerResumeDecision({
+      state: 'runner_present', control: { state: 'recoverable_unservable', reason: 'publisher_lost' },
+    })).toEqual({ action: 'replace', reason: 'publisher_lost' });
+    // A healthy runner is adopted, and an unprobeable one stays fenced; neither is replaced.
+    expect(resolveSessionRunnerResumeDecision({ state: 'runner_present', control: { state: 'servable' } })).toEqual({ action: 'adopt' });
+    expect(resolveSessionRunnerResumeDecision({
+      state: 'runner_present', control: { state: 'unknown', reason: 'rpc_failed' },
+    })).toEqual({ action: 'fence', reason: 'rpc_failed' });
+    expect(resolveSessionRunnerResumeDecision({
+      state: 'runner_present', control: { state: 'recoverable_unservable', reason: 'malformed_response' },
+    })).toEqual({ action: 'fence', reason: 'malformed_response' });
+    expect(resolveSessionRunnerResumeDecision({ state: 'runner_unknown', reason: 'runner_presence_unproven' }))
+      .toEqual({ action: 'fence', reason: 'runner_presence_unproven' });
+  });
   it('does not claim serviceability from a live matching PID alone', async () => {
     const tracked: TrackedSession = { startedBy: 'daemon', pid: 456, happySessionId: 'sess_1' };
     await expect(probeSessionRunnerServiceability({

@@ -56,6 +56,20 @@ describe('probeSessionPendingQueueWakeCapabilityV1', () => {
       isMethodUnavailable: () => false,
     })).resolves.toEqual({ state: 'recoverable_unservable', reason: 'runtime_terminating' });
   });
+
+  it('carries a runner-reported lost publisher as its own unservable reason', async () => {
+    await expect(probeSessionPendingQueueWakeCapabilityV1({
+      sessionId: 'sess-wedged',
+      token: 'token',
+      resolveTransport: async () => ({ ok: true, sessionId: 'sess-wedged', mode: 'socket', ctx: {} }),
+      callRpc: async () => ({
+        ok: false,
+        error: 'pending_materialization_wake_unavailable',
+        errorCode: 'publisher_lost',
+      }),
+      isMethodUnavailable: () => false,
+    })).resolves.toEqual({ state: 'recoverable_unservable', reason: 'publisher_lost' });
+  });
 });
 
 describe('requestSessionPendingQueueWakeV1', () => {

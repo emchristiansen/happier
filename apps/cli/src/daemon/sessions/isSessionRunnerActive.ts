@@ -140,6 +140,7 @@ export type SessionRunnerResumeDecision =
   | Readonly<{ action: 'spawn' }>
   | Readonly<{ action: 'adopt' }>
   | Readonly<{ action: 'wait_for_exit'; reason: 'runtime_terminating' }>
+  | Readonly<{ action: 'replace'; reason: 'publisher_lost' }>
   | Readonly<{ action: 'fence'; reason: string }>;
 
 export function resolveSessionRunnerResumeDecision(probe: SessionRunnerServiceabilityProbe): SessionRunnerResumeDecision {
@@ -148,6 +149,11 @@ export function resolveSessionRunnerResumeDecision(probe: SessionRunnerServiceab
   if (probe.control.state === 'servable') return { action: 'adopt' };
   if (probe.control.state === 'recoverable_unservable' && probe.control.reason === 'runtime_terminating') {
     return { action: 'wait_for_exit', reason: 'runtime_terminating' };
+  }
+  // Only the runner's own positive report proves it can never claim Pending input again. A
+  // missing, failed or malformed probe stays a fence and never implies replacement.
+  if (probe.control.state === 'recoverable_unservable' && probe.control.reason === 'publisher_lost') {
+    return { action: 'replace', reason: 'publisher_lost' };
   }
   return { action: 'fence', reason: probe.control.reason };
 }

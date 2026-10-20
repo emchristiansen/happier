@@ -54,4 +54,14 @@ describe('session pending queue wake wire contracts', () => {
     expect(SessionPendingQueueWakeCapabilityResponseV1Schema.parse(response)).toEqual(response);
     expect(SessionPendingQueueWakeResponseV1Schema.parse(response)).toEqual(response);
   });
+
+  it('represents a runner that lost its pending publisher status', () => {
+    const response = {
+      ok: false as const,
+      error: 'pending_materialization_wake_unavailable' as const,
+      errorCode: 'publisher_lost' as const,
+    };
+    expect(SessionPendingQueueWakeCapabilityResponseV1Schema.parse(response)).toEqual(response);
+    expect(SessionPendingQueueWakeResponseV1Schema.parse(response)).toEqual(response);
+  });
 });

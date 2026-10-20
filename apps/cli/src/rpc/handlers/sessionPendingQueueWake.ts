@@ -5,19 +5,22 @@ import {
 import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
 
 import type { RpcHandlerRegistrar } from '@/api/rpc/types';
-import type { SessionRuntimeControls } from './sessionControls';
+import type { PendingMaterializationServiceability, SessionRuntimeControls } from './sessionControls';
 
-const unavailable = (errorCode: 'runtime_upgrade_required' | 'runtime_terminating' = 'runtime_upgrade_required') => ({
+type UnservableReason = Extract<PendingMaterializationServiceability, { state: 'unservable' }>['reason'];
+
+const unavailable = (errorCode: 'runtime_upgrade_required' | UnservableReason = 'runtime_upgrade_required') => ({
   ok: false as const,
   error: 'pending_materialization_wake_unavailable' as const,
   errorCode,
 });
 
 function unavailableForRuntimeState(
-  controls: Pick<SessionRuntimeControls, 'isPendingMaterializationAvailable'> | null | undefined,
+  controls: Pick<SessionRuntimeControls, 'readPendingMaterializationServiceability'> | null | undefined,
 ) {
-  return controls?.isPendingMaterializationAvailable?.() === false
-    ? unavailable('runtime_terminating')
+  const serviceability = controls?.readPendingMaterializationServiceability?.();
+  return serviceability?.state === 'unservable'
+    ? unavailable(serviceability.reason)
     : null;
 }
 
@@ -26,7 +29,7 @@ export function registerSessionPendingQueueWakeHandlers(
   opts: Readonly<{
     sessionRuntimeControls?: Pick<
       SessionRuntimeControls,
-      'wakePendingMaterialization' | 'isPendingMaterializationAvailable'
+      'wakePendingMaterialization' | 'readPendingMaterializationServiceability'
     > | null;
   }>,
 ): void {

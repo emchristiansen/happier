@@ -10,6 +10,7 @@ import {
 } from '@/testkit/backends/apiSessionSocketHarness';
 import { encodeBase64, encrypt } from '../encryption';
 import { accountSettingsParse } from '@happier-dev/protocol';
+import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
 import {
   getActiveAccountSettingsSnapshot,
   setActiveAccountSettingsSnapshot,
@@ -1910,6 +1911,136 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     });
     expect(client.sessionTurnLifecycle.hasActiveTurn()).toBe(true);
     expect(materializeNextMock).toHaveBeenCalledTimes(2);
+  });
+
+  describe('lost pending publisher', () => {
+    const publisherLost = () => new PendingQueueMaterializationTransportAmbiguousError(
+      new Error('Pending queue materialize server acknowledgement: forbidden'),
+      'publisher_lost',
+      'forbidden',
+    );
+    const readWakeCapability = (client: Awaited<ReturnType<typeof createClient>>) =>
+      client.rpcHandlerManager.invokeLocal(SESSION_RPC_METHODS.SESSION_PENDING_QUEUE_WAKE_CAPABILITY_GET_V1, {});
+    const servableCapability = {
+      ok: true,
+      capability: 'pending_queue_wake_v1',
+      protocolVersion: 1,
+      method: SESSION_RPC_METHODS.SESSION_PENDING_QUEUE_WAKE_V1,
+    };
+    const publisherLostCapability = {
+      ok: false,
+      error: 'pending_materialization_wake_unavailable',
+      errorCode: 'publisher_lost',
+    };
+    const reconnect = async () => {
+      if (!supervisorOnConnected) throw new Error('missing supervised reconnect callback');
+      await supervisorOnConnected();
+    };
+
+    it('reconnects once, then stops materializing and reports publisher_lost until a new publisher claim', async () => {
+      const client = await createClient({
+        latestTurnStatus: 'completed',
+        pendingCount: 1,
+        pendingBlockedCount: 0,
+        pendingVersion: 1,
+      });
+      await waitForCurrentPendingInputContract(client);
+      materializeNextMock.mockRejectedValue(publisherLost());
+
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toEqual({ type: 'publisher_lost' });
+      expect(supervisorReportProbeResultMock).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ status: 'retry_later' }),
+      );
+      // A refusal on the same connection while the reconnect is pending is not a second episode.
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toEqual({ type: 'publisher_lost' });
+      expect(supervisorReportProbeResultMock).toHaveBeenCalledTimes(1);
+      await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
+
+      await reconnect();
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toEqual({ type: 'publisher_lost' });
+      expect(materializeNextMock).toHaveBeenCalledTimes(3);
+      expect(supervisorReportProbeResultMock).toHaveBeenCalledTimes(1);
+      await expect(readWakeCapability(client)).resolves.toEqual(publisherLostCapability);
+
+      // Terminal: later wakes neither re-materialize nor reconnect.
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toEqual({ type: 'publisher_lost' });
+      expect(materializeNextMock).toHaveBeenCalledTimes(3);
+      expect(supervisorReportProbeResultMock).toHaveBeenCalledTimes(1);
+
+      // An independent connection that claims publisher status clears the terminal state.
+      await reconnect();
+      await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
+    });
+
+    it('recovers normally when the one reconnect reclaims publisher status', async () => {
+      const client = await createClient({
+        latestTurnStatus: 'completed',
+        pendingCount: 1,
+        pendingBlockedCount: 0,
+        pendingVersion: 1,
+      });
+      await waitForCurrentPendingInputContract(client);
+      materializeNextMock
+        .mockRejectedValueOnce(publisherLost())
+        .mockResolvedValueOnce({
+          didMaterialize: true,
+          localId: 'local-after-reconnect',
+          didWrite: true,
+          message: {
+            id: 'm-after-reconnect',
+            seq: 10,
+            localId: 'local-after-reconnect',
+            messageRole: 'user',
+            content: { t: 'plain', v: { role: 'user', content: { type: 'text', text: 'after reconnect' } } },
+            createdAt: 1000,
+            updatedAt: 1000,
+          },
+          pendingQueueState: { known: true, pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 3 },
+        })
+        .mockRejectedValueOnce(publisherLost());
+
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toEqual({ type: 'publisher_lost' });
+      expect(supervisorReportProbeResultMock).toHaveBeenCalledTimes(1);
+
+      await reconnect();
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toMatchObject({ type: 'materialized', localId: 'local-after-reconnect', seq: 10 });
+      await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
+
+      // Success closed the episode, so a later loss gets its own single reconnect.
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toEqual({ type: 'publisher_lost' });
+      expect(supervisorReportProbeResultMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps transaction-unavailable on the transport retry path without reconnecting', async () => {
+      const client = await createClient({
+        latestTurnStatus: 'completed',
+        pendingCount: 1,
+        pendingBlockedCount: 0,
+        pendingVersion: 1,
+      });
+      await waitForCurrentPendingInputContract(client);
+      materializeNextMock.mockRejectedValue(new PendingQueueMaterializationTransportAmbiguousError(
+        new Error('Pending queue materialize server acknowledgement: transaction-unavailable'),
+        'server_retryable',
+        'transaction-unavailable',
+        1_000,
+      ));
+
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+          .resolves.toEqual({ type: 'retryable_transport', retryAfterMs: 1_000 });
+      }
+      expect(materializeNextMock).toHaveBeenCalledTimes(3);
+      expect(supervisorReportProbeResultMock).not.toHaveBeenCalled();
+      await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
+    });
   });
 
   it('identifies the server-claim subphase before awaiting an unsettled materialization transport', async () => {

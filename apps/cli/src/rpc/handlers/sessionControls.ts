@@ -46,6 +46,11 @@ import {
 import type { Metadata } from '@/api/types';
 import type { RpcHandlerRegistrar } from '@/api/rpc/types';
 
+/** Whether this runner can claim Pending input; reported to the daemon by the wake capability RPC. */
+export type PendingMaterializationServiceability =
+  | Readonly<{ state: 'servable' }>
+  | Readonly<{ state: 'unservable'; reason: 'runtime_terminating' | 'publisher_lost' }>;
+
 export type SessionRuntimeControls = {
   refreshGoal?: () => unknown;
   setGoal?: (
@@ -67,7 +72,7 @@ export type SessionRuntimeControls = {
     request: Readonly<SessionConnectedServiceAuthReadRuntimeIdentityRequestV1>,
   ) => Promise<unknown> | unknown;
   wakePendingMaterialization?: () => void;
-  isPendingMaterializationAvailable?: () => boolean;
+  readPendingMaterializationServiceability?: () => PendingMaterializationServiceability;
   enableUsageLimitWaitResume?: (request: Readonly<{
     sessionId: string;
     issueFingerprint?: string;

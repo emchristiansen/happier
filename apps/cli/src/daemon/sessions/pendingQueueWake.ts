@@ -8,7 +8,7 @@ export type SessionPendingQueueWakeDiagnostic =
   | Readonly<{ type: 'wake_published' }>
   | Readonly<{
       type: 'unavailable';
-      reason: 'no_token' | 'shutdown' | 'transport_unavailable' | 'session_mismatch' | 'rpc_method_unavailable' | 'runtime_upgrade_required' | 'runtime_terminating' | 'malformed_response' | 'rpc_failed';
+      reason: 'no_token' | 'shutdown' | 'transport_unavailable' | 'session_mismatch' | 'rpc_method_unavailable' | 'runtime_upgrade_required' | 'runtime_terminating' | 'publisher_lost' | 'malformed_response' | 'rpc_failed';
     }>;
 
 type TransportResult =
@@ -17,7 +17,7 @@ type TransportResult =
 
 export type SessionRunnerServiceability =
   | Readonly<{ state: 'servable' }>
-  | Readonly<{ state: 'recoverable_unservable'; reason: 'session_mismatch' | 'rpc_method_unavailable' | 'runtime_upgrade_required' | 'runtime_terminating' | 'malformed_response' }>
+  | Readonly<{ state: 'recoverable_unservable'; reason: 'session_mismatch' | 'rpc_method_unavailable' | 'runtime_upgrade_required' | 'runtime_terminating' | 'publisher_lost' | 'malformed_response' }>
   | Readonly<{ state: 'unknown'; reason: 'no_token' | 'shutdown' | 'transport_unavailable' | 'rpc_failed' }>;
 
 type CapabilityProbeParams = Readonly<{

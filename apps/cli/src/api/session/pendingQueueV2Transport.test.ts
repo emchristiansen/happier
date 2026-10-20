@@ -698,6 +698,27 @@ describe('pendingQueueV2Transport', () => {
         expect(mockPost).not.toHaveBeenCalled();
     });
 
+    it('classifies a forbidden opted-in session-socket ACK as a lost publisher, not a transport retry', async () => {
+        const socket = {
+            connected: true,
+            timeout: vi.fn(() => socket),
+            emitWithAck: vi.fn(async () => ({ ok: false, error: 'forbidden' })),
+        };
+
+        await expect(materializeNextPendingQueueV2Message({
+            token: 'token',
+            sessionId: 'session-1',
+            socket: socket as any,
+            deliveryStateOptIn: true,
+        })).rejects.toMatchObject({
+            code: 'pending_queue_materialization_transport_ambiguous',
+            diagnosticCode: 'pending_queue_materialization_publisher_lost',
+            classification: 'publisher_lost',
+            serverError: 'forbidden',
+        });
+        expect(mockPost).not.toHaveBeenCalled();
+    });
+
     it('preserves a typed transaction-unavailable materialization ACK and its server retry delay', async () => {
         const socket = {
             connected: true,

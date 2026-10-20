@@ -252,6 +252,25 @@ outside this admission contract: automatic same-tag create retry can unarchive a
 just-archived new session. Human terminal keystrokes are also outside the
 programmatic-input boundary.
 
+### Lost Pending publisher (maintained 0.2 source)
+
+A runner whose session socket receives `forbidden` from `pending-materialize-next`
+has lost publisher status for the session. It asks its connection supervisor for
+one reconnect, whose connect path reclaims publisher status. If the reclaimed
+connection is still refused, the runner stops materializing and its wake
+capability RPC answers `pending_materialization_wake_unavailable` with the new
+`errorCode: 'publisher_lost'`. A later connection that claims publisher status
+clears that state. On Resume, the daemon replaces such a runner through its
+existing Stop path and then spawns, but only once the runner is proven absent.
+Every other probe result, including a failed or missing one, keeps its previous
+adopt or fence decision.
+
+The relay is unchanged. The widened `errorCode` enum is a runner-to-daemon seam.
+A daemon without this change parses `publisher_lost` as a malformed response and
+fences Resume instead of adopting; it never replaces. A runner without this
+change never reports `publisher_lost`, so resident older runners that are already
+wedged still need a manual Stop before Resume.
+
 ## Migration history
 
 Migration source has a stricter authoring boundary than ordinary internal code:

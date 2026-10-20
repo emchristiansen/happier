@@ -3088,6 +3088,35 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 pollIntervalMs: configuration.daemonSpawnExistingSessionWaitForExitPollIntervalMs,
               });
               const initialResumeDecision = resolveSessionRunnerResumeDecision(initialServiceability);
+              // A runner that positively reports `publisher_lost` is alive but can never claim the
+              // queued input again. Replace it as a person would: the existing Stop path, then the
+              // ordinary spawn below, once the runner is proven absent.
+              const replacePublisherLostRunner = async (): Promise<Extract<SpawnSessionResult, { type: 'error' }> | null> => {
+                logger.warn('[DAEMON RUN] Resume target reported a lost pending publisher; replacing its runner', {
+                  sessionId: normalizedExistingSessionId,
+                });
+                const stopResult = await stopSession(normalizedExistingSessionId);
+                if (
+                  (stopResult.status === 'stopped' || stopResult.status === 'not_found')
+                  && (await probeSessionRunnerServiceability(normalizedExistingSessionId)).state === 'runner_absent'
+                ) {
+                  return null;
+                }
+                logger.warn('[DAEMON RUN] Refusing Resume because the lost-publisher runner was not proven stopped', {
+                  sessionId: normalizedExistingSessionId,
+                  stopStatus: stopResult.status,
+                  ...(stopResult.status === 'incomplete' ? { stopReason: stopResult.reason } : {}),
+                });
+                return {
+                  type: 'error',
+                  errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
+                  errorMessage: 'The existing session runtime lost its server connection and could not be stopped. Stop the session, then Resume again.',
+                };
+              };
+              if (initialResumeDecision.action === 'replace') {
+                const replacementRefusal = await replacePublisherLostRunner();
+                if (replacementRefusal) return replacementRefusal;
+              }
               if (initialResumeDecision.action === 'fence') {
                 await publishSessionRunnerControlServiceability(normalizedExistingSessionId, initialServiceability);
                 logger.debug('[DAEMON RUN] Resume target serviceability is unknown; refusing an unsafe duplicate spawn', {
@@ -3125,6 +3154,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
 
                 const serviceabilityAfterWait = await probeSessionRunnerServiceability(normalizedExistingSessionId);
                 const resumeDecisionAfterWait = resolveSessionRunnerResumeDecision(serviceabilityAfterWait);
+                if (resumeDecisionAfterWait.action === 'replace') {
+                  const replacementRefusal = await replacePublisherLostRunner();
+                  if (replacementRefusal) return replacementRefusal;
+                }
                 if (resumeDecisionAfterWait.action === 'fence') {
                   await publishSessionRunnerControlServiceability(normalizedExistingSessionId, serviceabilityAfterWait);
                   return {
@@ -3169,6 +3202,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   // destructive escape hatch that killed live Claude runners en masse after a daemon
                   // restart marked them (falsely) inactive. Never kill a live, servable runner over
                   // a momentary probe result; it will drain its queue once its handler is ready.
+                  // The one exception is decided before adoption: a runner that itself reports
+                  // `publisher_lost` has already spent its one reconnect, and the server refuses
+                  // its every claim, so it can never drain. Only that positive report replaces a
+                  // runner; a missing or failed probe never implies it.
                   const hasExplicitCatchUpCursor = typeof normalizedOptions.initialTranscriptAfterSeq === 'number';
                   const hasFreshUserRequestAuthorization =
                     normalizedOptions.executionAuthorization?.provenance === 'user_request'

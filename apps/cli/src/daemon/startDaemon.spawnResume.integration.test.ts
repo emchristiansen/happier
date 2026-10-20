@@ -3795,6 +3795,78 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     }
   });
 
+  it.each([
+    {
+      control: 'publisher_lost',
+      capability: async () => ({ ok: false, error: 'pending_materialization_wake_unavailable', errorCode: 'publisher_lost' }),
+      replaced: true,
+    },
+    {
+      control: 'rpc_failed',
+      capability: async () => { throw new Error('transient session RPC failure'); },
+      replaced: false,
+    },
+  ] as const)('replaces a live resume target only for a reported lost publisher ($control)', async ({ capability, replaced }) => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const id = 'sess_publisher_lost';
+    sessionRunnerActivityBoundaryMocks.readProcessRunState.mockResolvedValue('servable');
+    pendingMaterializationRpcMocks.resolveSessionTransportContext.mockResolvedValue({
+      ok: true, sessionId: id, rawSession: { id, active: true, encryptionMode: 'plain' },
+      mode: 'plain', ctx: pendingMaterializationRpcMocks.ctx,
+    });
+    pendingMaterializationRpcMocks.callSessionRpc.mockImplementation(async (params) => {
+      if (params.method.endsWith('wakeCapability.v1.get')) return await capability();
+      throw new Error(`unexpected session RPC ${params.method}`);
+    });
+    // The existing Stop path is the one owner of runner termination; model its effect on presence.
+    stopSessionMocks.stopSession.mockImplementation(async () => {
+      sessionRunnerActivityBoundaryMocks.readProcessRunState.mockResolvedValue('dead');
+      return { status: 'stopped' };
+    });
+    vi.mocked(fetchSessionByIdCompat).mockResolvedValue(createSessionRecordFixture({
+      id, encryptionMode: 'plain', metadata: JSON.stringify({ flavor: 'codex', path: tmpdir(), codexSessionId: 'vendor-publisher-lost' }),
+    }));
+    let run: Promise<void> | null = null;
+    const tracked: { current: Parameters<typeof import('./sessions/onHappySessionWebhook').createOnHappySessionWebhook>[0]['pidToTrackedSession'] | null } = { current: null };
+    try {
+      const webhook = await import('./sessions/onHappySessionWebhook');
+      vi.mocked(webhook.createOnHappySessionWebhook).mockImplementation(({ pidToTrackedSession }) => {
+        tracked.current = pidToTrackedSession;
+        return vi.fn();
+      });
+      const { startDaemon } = await import('./startDaemon');
+      run = startDaemon();
+      const spawnSession = await waitForSpawnSessionRegistration();
+      tracked.current!.set(12345, {
+        pid: 12345, startedBy: 'daemon', happySessionId: id,
+        spawnOptions: { directory: tmpdir(), existingSessionId: id, backendTarget: { kind: 'builtInAgent', agentId: 'codex' } },
+      });
+
+      const result = await spawnSession({
+        directory: tmpdir(),
+        existingSessionId: id,
+        backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+        token: 't',
+        codexBackendMode: 'acp',
+      });
+
+      if (replaced) {
+        expect(stopSessionMocks.stopSession).toHaveBeenCalledExactlyOnceWith(id);
+        expect(spawnHappyCLI).toHaveBeenCalledTimes(1);
+        expect(spawnHappyCLI.mock.calls[0]?.[0]).toEqual(expect.arrayContaining(['--existing-session', id]));
+      } else {
+        expect(result).toMatchObject({ type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED });
+        expect(stopSessionMocks.stopSession).not.toHaveBeenCalled();
+        expect(spawnHappyCLI).not.toHaveBeenCalled();
+      }
+    } finally {
+      if (run) { harness.requestShutdown('happier-cli'); await run; }
+      const webhook = await import('./sessions/onHappySessionWebhook');
+      vi.mocked(webhook.createOnHappySessionWebhook).mockImplementation(() => vi.fn());
+      exitSpy.mockRestore();
+    }
+  });
+
   it('launches markerless explicit Claude Resume with the exact live attachment descriptor in the child environment', async () => {
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
     const refreshEnvOriginal = process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;

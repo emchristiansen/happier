@@ -72,13 +72,13 @@ describe('registerSessionHandlers pending queue materialization', () => {
     expect(wakePendingMaterialization).toHaveBeenCalledTimes(1);
   });
 
-  it('reports a terminating runtime before accepting wake work', async () => {
+  it.each(['runtime_terminating', 'publisher_lost'] as const)('reports a %s runtime before accepting wake work', async (reason) => {
     const { handlers, registrar } = createRegistrar();
     const wakePendingMaterialization = vi.fn();
 
     registerSessionHandlers(registrar, process.cwd(), {
       sessionRuntimeControls: {
-        isPendingMaterializationAvailable: () => false,
+        readPendingMaterializationServiceability: () => ({ state: 'unservable', reason }),
         wakePendingMaterialization,
       },
     });
@@ -86,7 +86,7 @@ describe('registerSessionHandlers pending queue materialization', () => {
     const unavailable = {
       ok: false,
       error: 'pending_materialization_wake_unavailable',
-      errorCode: 'runtime_terminating',
+      errorCode: reason,
     };
     await expect(handlers.get(SESSION_RPC_METHODS.SESSION_PENDING_QUEUE_WAKE_CAPABILITY_GET_V1)?.({}))
       .resolves.toEqual(unavailable);

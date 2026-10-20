@@ -582,6 +582,16 @@ type AcceptedCanonicalPendingDeliveryOperationAuthority = Readonly<{
     socket: Socket<ServerToClientEvents, ClientToServerEvents>;
     abortSignal: AbortSignal;
 }>;
+/**
+ * One lost-publisher episode. The first refusal requests one supervisor reconnect, whose connect
+ * path reclaims publisher status; a refusal on that reclaimed connection is terminal until a
+ * later connection claims publisher status again. Any accepted claim ends the episode.
+ */
+type PendingPublisherRecovery =
+    | Readonly<{ state: 'current' }>
+    | Readonly<{ state: 'reconnect_requested' }>
+    | Readonly<{ state: 'reclaimed'; sessionConnectionEpoch: number }>
+    | Readonly<{ state: 'publisher_lost' }>;
 
 function readFiniteTimestampMs(value: unknown): number | null {
     if (typeof value !== 'number' && typeof value !== 'bigint') return null;
@@ -745,6 +755,7 @@ export class ApiSessionClient extends EventEmitter {
      */
     private sessionConnectionEpoch = 0;
     private sessionSyncPendingInputServerContract: SessionSyncPendingInputServerContractResult | null = null;
+    private pendingPublisherRecovery: PendingPublisherRecovery = { state: 'current' };
     private pendingInputReadinessAbortController: AbortController | null = null;
     private convergePendingInputReadiness: ((onContractPrepared?: () => void) => Promise<boolean>) | null = null;
     private changesSyncInFlight: Promise<void> | null = null;
@@ -1411,6 +1422,7 @@ export class ApiSessionClient extends EventEmitter {
                 const isReconnect = this.hasConnectedOnce;
                 this.hasConnectedOnce = true;
                 this.sessionConnectionEpoch += 1;
+                const connectionEpoch = this.sessionConnectionEpoch;
                 this.resetAccountSettingsRetryForEvent();
                 if (!await this.convergePendingInputReadiness?.(() => {
                     if (this.shouldKeepUserSocketConnected()) {
@@ -1420,6 +1432,8 @@ export class ApiSessionClient extends EventEmitter {
                         this.reassertSessionPresenceAfterReconnect();
                     }
                 })) return;
+                // On publisher-fenced servers, converged readiness includes this connection's settled publisher claim.
+                this.observePendingPublisherClaim(connectionEpoch);
                 this.reofferAcceptedCanonicalPendingDeliveriesAfterConnection();
                 this.clearPendingDiscoveryTimer();
                 this.schedulePendingDiscovery();
@@ -1489,9 +1503,48 @@ export class ApiSessionClient extends EventEmitter {
             copyCallableSessionRuntimeControls(this.sessionRuntimeControls, registration);
         }
         this.sessionRuntimeControls.wakePendingMaterialization = () => this.wakePendingMaterialization();
-        this.sessionRuntimeControls.isPendingMaterializationAvailable = () => (
-            !this.closed && !this.runtimeTerminationStarted
+        this.sessionRuntimeControls.readPendingMaterializationServiceability = () => (
+            this.closed || this.runtimeTerminationStarted
+                ? { state: 'unservable', reason: 'runtime_terminating' }
+                : this.pendingPublisherRecovery.state === 'publisher_lost'
+                    ? { state: 'unservable', reason: 'publisher_lost' }
+                    : { state: 'servable' }
         );
+    }
+
+    private observePendingPublisherClaim(sessionConnectionEpoch: number): void {
+        if (this.pendingPublisherRecovery.state === 'reconnect_requested') {
+            this.pendingPublisherRecovery = { state: 'reclaimed', sessionConnectionEpoch };
+        } else if (this.pendingPublisherRecovery.state === 'publisher_lost') {
+            logger.infoFile('[pendingQueue] new connection reclaimed publisher status; materialization resumes', {
+                sessionId: this.sessionId,
+            });
+            this.pendingPublisherRecovery = { state: 'current' };
+        }
+    }
+
+    private observePendingPublisherLost(sessionConnectionEpoch: number): void {
+        const recovery = this.pendingPublisherRecovery;
+        if (recovery.state === 'current') {
+            this.pendingPublisherRecovery = { state: 'reconnect_requested' };
+            logger.infoFile('[pendingQueue] session socket lost publisher status; reconnecting once', {
+                sessionId: this.sessionId,
+            });
+            // The supervisor owns the session transport: it drops this socket, and its normal
+            // connect path reclaims publisher status and publishes the pending eligibility wake.
+            this.sessionConnectionSupervisor?.reportProbeResult?.({
+                status: 'retry_later',
+                reason: 'probe_failed',
+                errorMessage: 'Pending materialization lost session publisher status',
+            });
+            return;
+        }
+        if (recovery.state === 'reclaimed' && sessionConnectionEpoch >= recovery.sessionConnectionEpoch) {
+            this.pendingPublisherRecovery = { state: 'publisher_lost' };
+            logger.infoFile('[pendingQueue] reconnect did not restore publisher status; materialization stopped', {
+                sessionId: this.sessionId,
+            });
+        }
     }
 
     private publishSessionGoalControlCapabilities(): void {
@@ -6570,6 +6623,11 @@ export class ApiSessionClient extends EventEmitter {
         ) {
             return { didMaterialize: false, result: { type: 'retryable_transport' } };
         }
+        if (this.pendingPublisherRecovery.state === 'publisher_lost') {
+            // Terminal until a new connection claims publisher status: the server refuses every
+            // claim on this one, so neither a wake nor a timer may retry it.
+            return { didMaterialize: false, result: { type: 'publisher_lost' } };
+        }
         let materializeResult: PendingQueueMaterializeNextResult;
         reportPendingMaterializationDiagnosticPhase(opts.onDiagnosticPhase, 'materialize.server_claim');
         if (serverContract.pendingInput === 'released_server_v0_2_1') {
@@ -6660,6 +6718,13 @@ export class ApiSessionClient extends EventEmitter {
                             : {}),
                     },
                 });
+                if (
+                    error instanceof PendingQueueMaterializationTransportAmbiguousError
+                    && error.classification === 'publisher_lost'
+                ) {
+                    this.observePendingPublisherLost(serverContract.sessionConnectionEpoch);
+                    return { didMaterialize: false, result: { type: 'publisher_lost' } };
+                }
                 return {
                     didMaterialize: false,
                     result: {
@@ -6673,6 +6738,8 @@ export class ApiSessionClient extends EventEmitter {
                     },
                 };
             }
+            // The server accepted this connection as the current publisher.
+            this.pendingPublisherRecovery = { state: 'current' };
         }
         if (!isServerContractCurrent()) {
             return {

@@ -3,7 +3,7 @@ import { z } from 'zod';
 export const PendingQueueWakeUnavailableV1Schema = z.object({
   ok: z.literal(false),
   error: z.literal('pending_materialization_wake_unavailable'),
-  errorCode: z.enum(['runtime_upgrade_required', 'runtime_terminating']),
+  errorCode: z.enum(['runtime_upgrade_required', 'runtime_terminating', 'publisher_lost']),
 }).strict();
 
 export const SessionPendingQueueLegacyMaterializeDeferredResponseV0Schema = z.object({
