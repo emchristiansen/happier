@@ -45,6 +45,7 @@ const runAsCurrentPublisherInTx = async <T>(params: {
 });
 const sessionMessageFindUnique = vi.hoisted(() => vi.fn(async (): Promise<unknown> => null));
 const coordinateAcceptedPendingSettlement = vi.fn(async (): Promise<unknown> => ({ ok: false, error: "internal" }));
+const mapPendingMaterializationError = vi.fn((error: unknown): unknown => ({ ok: false, error: "internal", cause: error }));
 const emitEphemeral = vi.fn();
 const emitUpdate = vi.fn();
 const buildNewMessageUpdate = vi.fn((_message: unknown, _sessionId: string, seq: number, updateId: string) => ({
@@ -93,7 +94,7 @@ vi.mock("@/app/session/pending/pendingMessageService", async (importOriginal) =>
         materializeNextPendingMessage,
         materializeNextPendingMessageForCurrentPublisher,
         materializeNextPendingMessageForCurrentPublisherInTx: materializeNextPendingMessageForCurrentPublisher,
-        mapPendingMaterializationError: (error: unknown) => ({ ok: false, error: "internal", cause: error }),
+        mapPendingMaterializationError: (error: unknown) => mapPendingMaterializationError(error),
         readSessionPendingState,
     };
 });
@@ -324,8 +325,71 @@ describe("sessionUpdateHandler", () => {
             relayPublishAuthorized: true,
             refusal: { kind: "delivery_state_opt_in_absent" },
         },
-    ])("logs why it answered forbidden for $name", async ({ event, request, connection, notCurrent, relayPublishAuthorized, refusal }) => {
+        {
+            name: "a settlement the service refused after the publisher check",
+            event: "pending-delivery-accepted-v1",
+            request: { v: 1, sessionId: "s-1", localId: "pending-1" },
+            connection: { connectionType: "session-scoped", userId: "user-1", sessionId: "s-1" },
+            notCurrent: null,
+            current: true,
+            serviceResult: { ok: false, error: "forbidden" },
+            relayPublishAuthorized: true,
+            refusal: { kind: "service_forbidden" },
+        },
+        {
+            name: "a materialization the service refused after the publisher check",
+            event: "pending-materialize-next",
+            request: { sid: "s-1", deliveryState: "provider", deliveryTiming: "after_foreground_ready", foregroundState: "ready" },
+            connection: { connectionType: "session-scoped", userId: "user-1", sessionId: "s-1" },
+            notCurrent: null,
+            current: true,
+            serviceResult: { ok: false, error: "forbidden" },
+            relayPublishAuthorized: true,
+            refusal: { kind: "service_forbidden" },
+        },
+        {
+            name: "a materialization whose publisher fence moved in its transaction",
+            event: "pending-materialize-next",
+            request: { sid: "s-1", deliveryState: "provider", deliveryTiming: "after_foreground_ready", foregroundState: "ready" },
+            connection: { connectionType: "session-scoped", userId: "user-1", sessionId: "s-1" },
+            notCurrent: null,
+            current: true,
+            serviceThrows: true,
+            relayPublishAuthorized: true,
+            refusal: { kind: "publisher_fence_lost" },
+        },
+        {
+            name: "a user-scoped materialization naming an unverified session",
+            event: "pending-materialize-next",
+            request: { sid: "x".repeat(4096), deliveryTiming: "after_foreground_ready", foregroundState: "ready" },
+            connection: { connectionType: "user-scoped", userId: "user-1" },
+            notCurrent: null,
+            relayPublishAuthorized: true,
+            refusal: { kind: "delivery_state_opt_in_absent" },
+        },
+    ] as Array<{
+        name: string;
+        event: string;
+        request: Record<string, unknown>;
+        connection: Record<string, unknown>;
+        notCurrent: { status: "superseded" | "unregistered" } | { status: "rejected"; reason: "unauthorized" } | null;
+        current?: boolean;
+        serviceResult?: unknown;
+        serviceThrows?: boolean;
+        relayPublishAuthorized: boolean;
+        refusal: Record<string, unknown>;
+    }>)("logs why it answered forbidden for $name", async ({ event, request, connection, notCurrent, current, serviceResult, serviceThrows, relayPublishAuthorized, refusal }) => {
         if (!relayPublishAuthorized) authorizeSessionRelayPublish.mockResolvedValueOnce(null);
+        if (serviceResult && event === "pending-delivery-accepted-v1") {
+            coordinateAcceptedPendingSettlement.mockResolvedValueOnce(serviceResult);
+        }
+        if (serviceResult && event === "pending-materialize-next") {
+            materializeNextPendingMessageForCurrentPublisher.mockResolvedValueOnce(serviceResult);
+        }
+        if (serviceThrows) {
+            materializeNextPendingMessageForCurrentPublisher.mockRejectedValueOnce(new Error("publisher fence moved"));
+            mapPendingMaterializationError.mockReturnValueOnce({ ok: false, error: "forbidden" });
+        }
         const socket = createFakeSocket();
         registerSessionUpdateHandler(
             "user-1",
@@ -340,6 +404,11 @@ describe("sessionUpdateHandler", () => {
                     },
                     binding: { accountId: "user-1", machineId: "machine-1", sessionId: "s-1" },
                 }
+                : current
+                ? {
+                    presence: { resolveCurrentPublisher, runAsCurrentPublisher, runAsCurrentPublisherInTx },
+                    binding: { accountId: "user-1", machineId: "machine-1", sessionId: "s-1" },
+                }
                 : undefined,
         );
         const callback = vi.fn();
@@ -351,9 +420,10 @@ describe("sessionUpdateHandler", () => {
             {
                 module: "websocket",
                 event,
-                sessionId: "s-1",
+                connectionType: connection.connectionType,
+                sessionId: connection.connectionType === "session-scoped" ? "s-1" : null,
                 socketId: "fake-socket",
-                machineId: notCurrent ? "machine-1" : null,
+                machineId: notCurrent || current ? "machine-1" : null,
                 refusal,
             },
             "Pending publisher authority refused; answered forbidden",

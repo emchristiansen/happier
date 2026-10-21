@@ -120,11 +120,17 @@ type PendingPublisherAuthorityRefusal =
     | Readonly<{ kind: "publisher_binding_absent" }>
     | Readonly<{ kind: "publisher_binding_mismatch"; field: "accountId" | "sessionId" }>
     | Readonly<{ kind: "relay_publish_unauthorized" }>
+    | Readonly<{ kind: "publisher_not_current"; status: "unregistered" | "superseded" }>
     | Readonly<{
         kind: "publisher_not_current";
-        status: Exclude<CurrentPublisherResult, { status: "current" }>["status"];
-        reason?: Extract<CurrentPublisherResult, { status: "rejected" }>["reason"];
-    }>;
+        status: "rejected";
+        reason: Extract<CurrentPublisherResult, { status: "rejected" }>["reason"];
+    }>
+    // The socket was the current publisher, but the service then refused in its own transaction:
+    // owner access, or a publisher fence that moved before that transaction took it.
+    | Readonly<{ kind: "service_forbidden" }>
+    // Materialization's publisher fence moved inside its transaction (PublisherAuthorityLostError).
+    | Readonly<{ kind: "publisher_fence_lost" }>;
 
 /**
  * The first binding check a refused settlement or materialization failed, read after its guard
@@ -160,7 +166,7 @@ function readPendingPublisherNotCurrentRefusal(
 function warnPendingPublisherAuthorityRefused(params: Readonly<{
     event: string;
     socket: Socket;
-    sessionId: string;
+    connection: ClientConnection;
     trusted: TrustedTranscriptObservationPublisher | undefined;
     refusal: PendingPublisherAuthorityRefusal;
 }>): void {
@@ -168,7 +174,10 @@ function warnPendingPublisherAuthorityRefused(params: Readonly<{
         {
             module: "websocket",
             event: params.event,
-            sessionId: params.sessionId,
+            connectionType: params.connection.connectionType,
+            // Only an established identity: a session-scoped socket's own session. Any other
+            // connection's request names a session the server has not verified.
+            sessionId: params.connection.connectionType === "session-scoped" ? params.connection.sessionId : null,
             socketId: params.socket.id,
             machineId: params.trusted?.binding.machineId ?? null,
             refusal: params.refusal,
@@ -950,7 +959,7 @@ export function sessionUpdateHandler(
                     warnPendingPublisherAuthorityRefused({
                         event: ACCEPTED_PENDING_SETTLEMENT_EVENT_V1,
                         socket,
-                        sessionId,
+                        connection,
                         trusted,
                         refusal: readPendingPublisherBindingRefusal({
                             connection,
@@ -980,7 +989,7 @@ export function sessionUpdateHandler(
                     warnPendingPublisherAuthorityRefused({
                         event: ACCEPTED_PENDING_SETTLEMENT_EVENT_V1,
                         socket,
-                        sessionId,
+                        connection,
                         trusted,
                         refusal: readPendingPublisherNotCurrentRefusal(current),
                     });
@@ -989,6 +998,15 @@ export function sessionUpdateHandler(
                 }
                 const result = current.value;
                 if (!result.ok) {
+                    if (result.error === "forbidden") {
+                        warnPendingPublisherAuthorityRefused({
+                            event: ACCEPTED_PENDING_SETTLEMENT_EVENT_V1,
+                            socket,
+                            connection,
+                            trusted,
+                            refusal: { kind: "service_forbidden" },
+                        });
+                    }
                     respond({
                         ok: false,
                         error: result.error,
@@ -1060,7 +1078,7 @@ export function sessionUpdateHandler(
                     warnPendingPublisherAuthorityRefused({
                         event: "pending-materialize-next",
                         socket,
-                        sessionId: sid,
+                        connection,
                         trusted: trustedTranscriptObservationPublisher,
                         refusal: { kind: "delivery_state_opt_in_absent" },
                     });
@@ -1106,7 +1124,7 @@ export function sessionUpdateHandler(
                     warnPendingPublisherAuthorityRefused({
                         event: "pending-materialize-next",
                         socket,
-                        sessionId: sid,
+                        connection,
                         trusted,
                         refusal: readPendingPublisherBindingRefusal({
                             connection,
@@ -1136,7 +1154,7 @@ export function sessionUpdateHandler(
                     warnPendingPublisherAuthorityRefused({
                         event: "pending-materialize-next",
                         socket,
-                        sessionId: sid,
+                        connection,
                         trusted,
                         refusal: readPendingPublisherNotCurrentRefusal(current),
                     });
@@ -1146,6 +1164,15 @@ export function sessionUpdateHandler(
                 const result = current.value;
 
                 if (!result.ok) {
+                    if (result.error === "forbidden") {
+                        warnPendingPublisherAuthorityRefused({
+                            event: "pending-materialize-next",
+                            socket,
+                            connection,
+                            trusted,
+                            refusal: { kind: "service_forbidden" },
+                        });
+                    }
                     respond({
                         ok: false,
                         error: result.error,
@@ -1241,6 +1268,15 @@ export function sessionUpdateHandler(
                 }
                 log({ module: 'websocket', level: 'error' }, `Error in pending-materialize-next: ${error}`);
                 const failure = mapPendingMaterializationError(error);
+                if (!failure.ok && failure.error === "forbidden") {
+                    warnPendingPublisherAuthorityRefused({
+                        event: "pending-materialize-next",
+                        socket,
+                        connection,
+                        trusted: trustedTranscriptObservationPublisher,
+                        refusal: { kind: "publisher_fence_lost" },
+                    });
+                }
                 respond({
                     ok: false,
                     error: failure.ok ? "internal" : failure.error,
