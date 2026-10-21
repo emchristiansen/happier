@@ -55,7 +55,7 @@ import { publishSessionReadCursorUpdate } from "@/app/session/readCursor/publish
 import { publishSessionTurnUpdate } from "@/app/session/turns/publishSessionTurnUpdate";
 import { publishSessionReadyProjectionUpdate } from "@/app/session/ready/publishSessionReadyProjectionUpdate";
 import { db } from "@/storage/db";
-import type { createSessionPublisherPresence } from "@/app/presence/sessionPublisherPresence";
+import type { createSessionPublisherPresence, CurrentPublisherResult } from "@/app/presence/sessionPublisherPresence";
 import { coordinateAcceptedPendingSettlement } from "@/app/session/pending/acceptedPendingSettlementCoordinator";
 import {
     isTransactionAcquisitionUnavailableError,
@@ -112,6 +112,70 @@ type TrustedTranscriptObservationPublisher = Readonly<{
         & Partial<Pick<ReturnType<typeof createSessionPublisherPresence>, "runAsCurrentPublisher" | "runAsCurrentPublisherInTx">>;
     binding: Readonly<{ accountId: string; machineId: string; sessionId: string }>;
 }>;
+
+/** Why a pending settlement or materialization was answered `forbidden`. */
+type PendingPublisherAuthorityRefusal =
+    | Readonly<{ kind: "delivery_state_opt_in_absent" }>
+    | Readonly<{ kind: "connection_not_session_scoped" }>
+    | Readonly<{ kind: "publisher_binding_absent" }>
+    | Readonly<{ kind: "publisher_binding_mismatch"; field: "accountId" | "sessionId" }>
+    | Readonly<{ kind: "relay_publish_unauthorized" }>
+    | Readonly<{
+        kind: "publisher_not_current";
+        status: Exclude<CurrentPublisherResult, { status: "current" }>["status"];
+        reason?: Extract<CurrentPublisherResult, { status: "rejected" }>["reason"];
+    }>;
+
+/**
+ * The first binding check a refused settlement or materialization failed, read after its guard
+ * already answered `forbidden`. When every binding check passes, the guard failed on relay publish
+ * authorization, the only check it makes beyond these (materialization makes none).
+ */
+function readPendingPublisherBindingRefusal(params: Readonly<{
+    connection: ClientConnection;
+    trusted: TrustedTranscriptObservationPublisher | undefined;
+    hasPublisherOperation: boolean;
+    userId: string;
+    sessionId: string;
+}>): PendingPublisherAuthorityRefusal {
+    if (params.connection.connectionType !== "session-scoped") return { kind: "connection_not_session_scoped" };
+    if (!params.trusted || !params.hasPublisherOperation) return { kind: "publisher_binding_absent" };
+    if (params.trusted.binding.accountId !== params.userId) return { kind: "publisher_binding_mismatch", field: "accountId" };
+    if (params.trusted.binding.sessionId !== params.sessionId) return { kind: "publisher_binding_mismatch", field: "sessionId" };
+    return { kind: "relay_publish_unauthorized" };
+}
+
+function readPendingPublisherNotCurrentRefusal(
+    result: Exclude<CurrentPublisherResult, { status: "current" }>,
+): PendingPublisherAuthorityRefusal {
+    return result.status === "rejected"
+        ? { kind: "publisher_not_current", status: result.status, reason: result.reason }
+        : { kind: "publisher_not_current", status: result.status };
+}
+
+/**
+ * One line per `forbidden` answer to a pending settlement or materialization, so a runner refused
+ * publisher authority shows which check refused it. A runner treats `forbidden` as a lost publisher.
+ */
+function warnPendingPublisherAuthorityRefused(params: Readonly<{
+    event: string;
+    socket: Socket;
+    sessionId: string;
+    trusted: TrustedTranscriptObservationPublisher | undefined;
+    refusal: PendingPublisherAuthorityRefusal;
+}>): void {
+    warn(
+        {
+            module: "websocket",
+            event: params.event,
+            sessionId: params.sessionId,
+            socketId: params.socket.id,
+            machineId: params.trusted?.binding.machineId ?? null,
+            refusal: params.refusal,
+        },
+        "Pending publisher authority refused; answered forbidden",
+    );
+}
 
 export function sessionUpdateHandler(
     userId: string,
@@ -883,6 +947,19 @@ export function sessionUpdateHandler(
                     || trusted.binding.sessionId !== sessionId
                     || !await authorizeSessionRelayPublish({ socket, connection, userId, sessionId })
                 ) {
+                    warnPendingPublisherAuthorityRefused({
+                        event: ACCEPTED_PENDING_SETTLEMENT_EVENT_V1,
+                        socket,
+                        sessionId,
+                        trusted,
+                        refusal: readPendingPublisherBindingRefusal({
+                            connection,
+                            trusted,
+                            hasPublisherOperation: Boolean(trusted?.presence.runAsCurrentPublisher),
+                            userId,
+                            sessionId,
+                        }),
+                    });
                     respond({ ok: false, error: "forbidden" });
                     return;
                 }
@@ -900,6 +977,13 @@ export function sessionUpdateHandler(
                     }),
                 });
                 if (current.status !== "current") {
+                    warnPendingPublisherAuthorityRefused({
+                        event: ACCEPTED_PENDING_SETTLEMENT_EVENT_V1,
+                        socket,
+                        sessionId,
+                        trusted,
+                        refusal: readPendingPublisherNotCurrentRefusal(current),
+                    });
                     respond({ ok: false, error: "forbidden" });
                     return;
                 }
@@ -973,6 +1057,13 @@ export function sessionUpdateHandler(
                     : undefined;
                 const deliveryState = resolvePendingMaterializeDeliveryStateOptIn(data);
                 if (deliveryState !== "provider") {
+                    warnPendingPublisherAuthorityRefused({
+                        event: "pending-materialize-next",
+                        socket,
+                        sessionId: sid,
+                        trusted: trustedTranscriptObservationPublisher,
+                        refusal: { kind: "delivery_state_opt_in_absent" },
+                    });
                     respond({ ok: false, error: "forbidden" });
                     return;
                 }
@@ -1012,6 +1103,19 @@ export function sessionUpdateHandler(
                     || trusted.binding.accountId !== userId
                     || trusted.binding.sessionId !== sid
                 ) {
+                    warnPendingPublisherAuthorityRefused({
+                        event: "pending-materialize-next",
+                        socket,
+                        sessionId: sid,
+                        trusted,
+                        refusal: readPendingPublisherBindingRefusal({
+                            connection,
+                            trusted,
+                            hasPublisherOperation: Boolean(trusted?.presence.runAsCurrentPublisherInTx),
+                            userId,
+                            sessionId: sid,
+                        }),
+                    });
                     respond({ ok: false, error: "forbidden" });
                     return;
                 }
@@ -1029,6 +1133,13 @@ export function sessionUpdateHandler(
                     }),
                 });
                 if (current.status !== "current") {
+                    warnPendingPublisherAuthorityRefused({
+                        event: "pending-materialize-next",
+                        socket,
+                        sessionId: sid,
+                        trusted,
+                        refusal: readPendingPublisherNotCurrentRefusal(current),
+                    });
                     respond({ ok: false, error: "forbidden" });
                     return;
                 }

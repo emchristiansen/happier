@@ -269,6 +269,97 @@ describe("sessionUpdateHandler", () => {
         expect(coordinateAcceptedPendingSettlement).not.toHaveBeenCalled();
     });
 
+    it.each([
+        {
+            name: "a settlement on a superseded publisher",
+            event: "pending-delivery-accepted-v1",
+            request: { v: 1, sessionId: "s-1", localId: "pending-1" },
+            connection: { connectionType: "session-scoped", userId: "user-1", sessionId: "s-1" },
+            notCurrent: { status: "superseded" as const },
+            relayPublishAuthorized: true,
+            refusal: { kind: "publisher_not_current", status: "superseded" },
+        },
+        {
+            name: "a settlement whose binding is no longer authorized",
+            event: "pending-delivery-accepted-v1",
+            request: { v: 1, sessionId: "s-1", localId: "pending-1" },
+            connection: { connectionType: "session-scoped", userId: "user-1", sessionId: "s-1" },
+            notCurrent: { status: "rejected" as const, reason: "unauthorized" as const },
+            relayPublishAuthorized: true,
+            refusal: { kind: "publisher_not_current", status: "rejected", reason: "unauthorized" },
+        },
+        {
+            name: "a settlement refused relay publish authorization",
+            event: "pending-delivery-accepted-v1",
+            request: { v: 1, sessionId: "s-1", localId: "pending-1" },
+            connection: { connectionType: "session-scoped", userId: "user-1", sessionId: "s-1" },
+            notCurrent: { status: "superseded" as const },
+            relayPublishAuthorized: false,
+            refusal: { kind: "relay_publish_unauthorized" },
+        },
+        {
+            name: "a materialization on an unregistered publisher",
+            event: "pending-materialize-next",
+            request: { sid: "s-1", deliveryState: "provider", deliveryTiming: "after_foreground_ready", foregroundState: "ready" },
+            connection: { connectionType: "session-scoped", userId: "user-1", sessionId: "s-1" },
+            notCurrent: { status: "unregistered" as const },
+            relayPublishAuthorized: true,
+            refusal: { kind: "publisher_not_current", status: "unregistered" },
+        },
+        {
+            name: "a materialization from a socket with no publisher binding",
+            event: "pending-materialize-next",
+            request: { sid: "s-1", deliveryState: "provider", deliveryTiming: "after_foreground_ready", foregroundState: "ready" },
+            connection: { connectionType: "session-scoped", userId: "user-1", sessionId: "s-1" },
+            notCurrent: null,
+            relayPublishAuthorized: true,
+            refusal: { kind: "publisher_binding_absent" },
+        },
+        {
+            name: "a materialization without the delivery-state opt-in",
+            event: "pending-materialize-next",
+            request: { sid: "s-1", deliveryTiming: "after_foreground_ready", foregroundState: "ready" },
+            connection: { connectionType: "session-scoped", userId: "user-1", sessionId: "s-1" },
+            notCurrent: { status: "superseded" as const },
+            relayPublishAuthorized: true,
+            refusal: { kind: "delivery_state_opt_in_absent" },
+        },
+    ])("logs why it answered forbidden for $name", async ({ event, request, connection, notCurrent, relayPublishAuthorized, refusal }) => {
+        if (!relayPublishAuthorized) authorizeSessionRelayPublish.mockResolvedValueOnce(null);
+        const socket = createFakeSocket();
+        registerSessionUpdateHandler(
+            "user-1",
+            socket as any,
+            { ...connection, socket } as any,
+            notCurrent
+                ? {
+                    presence: {
+                        resolveCurrentPublisher,
+                        runAsCurrentPublisher: vi.fn(async () => notCurrent),
+                        runAsCurrentPublisherInTx: vi.fn(async () => notCurrent),
+                    },
+                    binding: { accountId: "user-1", machineId: "machine-1", sessionId: "s-1" },
+                }
+                : undefined,
+        );
+        const callback = vi.fn();
+
+        await getSocketHandler(socket, event)(request, callback);
+
+        expect(callback).toHaveBeenCalledWith({ ok: false, error: "forbidden" });
+        expect(warn).toHaveBeenCalledExactlyOnceWith(
+            {
+                module: "websocket",
+                event,
+                sessionId: "s-1",
+                socketId: "fake-socket",
+                machineId: notCurrent ? "machine-1" : null,
+                refusal,
+            },
+            "Pending publisher authority refused; answered forbidden",
+        );
+    });
+
     it("returns one retry ACK and observably warns when accepted settlement cannot acquire publisher authority", async () => {
         const transactionBodyError = Object.assign(
             new Error("Transaction API error: Unable to start a transaction in the given time."),
