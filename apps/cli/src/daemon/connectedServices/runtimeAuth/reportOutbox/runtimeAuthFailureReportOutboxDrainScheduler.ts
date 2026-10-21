@@ -4,8 +4,12 @@ import { drainRuntimeAuthFailureReportOutboxToDaemon } from './runtimeAuthFailur
 
 type RuntimeAuthFailureReportOutboxDrainLogger = Readonly<{
   debug: (message: string, error?: unknown) => void;
-  /** Report-path callers may pass a debug-only logger; the chain-end warning then uses the default logger. */
-  warn?: (message: string, fields: unknown) => void;
+  /**
+   * File-only sink for the chain-end warning. Report-path callers may pass a debug-only logger;
+   * the warning then goes to the default logger's file. It never reaches stdout, which belongs to
+   * the provider terminal in agent sessions.
+   */
+  warnFile?: (message: string, fields: unknown) => void;
 }>;
 
 type Timer = ReturnType<typeof setTimeout>;
@@ -170,9 +174,13 @@ async function warnIfAutomaticDrainChainStoppedWithQueuedItems(params: Readonly<
       attemptCount: oldest.attemptCount,
     },
   };
-  if (params.logger.warn) {
-    params.logger.warn(message, fields);
-    return;
+  try {
+    if (params.logger.warnFile) {
+      params.logger.warnFile(message, fields);
+      return;
+    }
+    defaultLogger.warnFile(message, fields);
+  } catch {
+    // A failing diagnostic sink must not change the outbox or its drain chain.
   }
-  defaultLogger.warn(message, fields);
 }

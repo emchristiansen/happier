@@ -5,6 +5,7 @@ import {
   scheduleRuntimeAuthFailureReportOutboxDrainToDaemon,
 } from './runtimeAuthFailureReportOutboxDrainScheduler';
 import type { RuntimeAuthFailureReportOutboxItem } from './runtimeAuthFailureReportOutboxTypes';
+import { logger as defaultLogger } from '@/ui/logger';
 
 function buildQueuedItem(input: Readonly<{
   reportId: string;
@@ -47,6 +48,7 @@ describe('runtimeAuthFailureReportOutboxDrainScheduler', () => {
   afterEach(() => {
     resetRuntimeAuthFailureReportOutboxDrainSchedulerForTests();
     vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   it('coalesces duplicate schedules into one outbox drain', async () => {
@@ -162,7 +164,7 @@ describe('runtimeAuthFailureReportOutboxDrainScheduler', () => {
         attemptCount: 1,
       }),
     ]);
-    const logger = { debug: vi.fn(), warn: vi.fn() };
+    const logger = { debug: vi.fn(), warnFile: vi.fn() };
 
     scheduleRuntimeAuthFailureReportOutboxDrainToDaemon({
       outboxDir: '/outbox-under-test',
@@ -178,7 +180,7 @@ describe('runtimeAuthFailureReportOutboxDrainScheduler', () => {
 
     await vi.advanceTimersByTimeAsync(10);
     await vi.advanceTimersByTimeAsync(20);
-    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.warnFile).not.toHaveBeenCalled();
     expect(peekQueuedItems).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(40);
     await vi.advanceTimersByTimeAsync(10_000);
@@ -186,8 +188,8 @@ describe('runtimeAuthFailureReportOutboxDrainScheduler', () => {
     expect(drain).toHaveBeenCalledTimes(3);
     expect(peekQueuedItems).toHaveBeenCalledOnce();
     expect(peekQueuedItems).toHaveBeenCalledWith({ outboxDir: '/outbox-under-test' });
-    expect(logger.warn).toHaveBeenCalledOnce();
-    expect(logger.warn).toHaveBeenCalledWith(
+    expect(logger.warnFile).toHaveBeenCalledOnce();
+    expect(logger.warnFile).toHaveBeenCalledWith(
       '[test] Connected-service runtime auth failure report outbox automatic drain chain stopped with reports still queued',
       {
         automaticPasses: 3,
@@ -217,7 +219,7 @@ describe('runtimeAuthFailureReportOutboxDrainScheduler', () => {
         attemptCount: 1,
       }),
     ]);
-    const logger = { debug: vi.fn(), warn: vi.fn() };
+    const logger = { debug: vi.fn(), warnFile: vi.fn() };
 
     scheduleRuntimeAuthFailureReportOutboxDrainToDaemon({
       delayMs: 10,
@@ -232,8 +234,8 @@ describe('runtimeAuthFailureReportOutboxDrainScheduler', () => {
 
     expect(drain).toHaveBeenCalledOnce();
     expect(peekQueuedItems).toHaveBeenCalledWith({});
-    expect(logger.warn).toHaveBeenCalledOnce();
-    expect(logger.warn).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+    expect(logger.warnFile).toHaveBeenCalledOnce();
+    expect(logger.warnFile).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
       automaticPasses: 1,
       maxAutomaticPasses: 8,
       stopReason: 'last_pass_left_nothing_retryable',
@@ -245,13 +247,48 @@ describe('runtimeAuthFailureReportOutboxDrainScheduler', () => {
     }));
   });
 
+  it('writes the chain-end warning only to the default log file when the caller passes a debug-only logger', async () => {
+    const drain = vi.fn(async () => ({ delivered: 0, dropped: 0, retried: 0 }));
+    const peekQueuedItems = vi.fn(async () => [
+      buildQueuedItem({
+        reportId: 'runtime-auth-report:default-sink',
+        sessionId: 'session-default-sink',
+        createdAtMs: 1_700_000_000_000,
+        updatedAtMs: 1_700_000_000_000,
+        attemptCount: 1,
+      }),
+    ]);
+    const warnFile = vi.spyOn(defaultLogger, 'warnFile').mockImplementation(() => {});
+    const consoleWarn = vi.spyOn(defaultLogger, 'warn');
+    const stdout = vi.spyOn(console, 'log');
+
+    scheduleRuntimeAuthFailureReportOutboxDrainToDaemon({
+      delayMs: 10,
+      nowMs: () => 1_700_000_001_000,
+      logger: { debug: vi.fn() },
+      logPrefix: '[test]',
+      drain,
+      peekQueuedItems,
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(warnFile).toHaveBeenCalledOnce();
+    expect(warnFile).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      queuedItemCount: 1,
+      oldestQueuedItem: expect.objectContaining({ reportId: 'runtime-auth-report:default-sink' }),
+    }));
+    expect(consoleWarn).not.toHaveBeenCalled();
+    expect(stdout).not.toHaveBeenCalled();
+  });
+
   it('does not warn when the automatic chain drains the outbox clean', async () => {
     const drain = vi
       .fn()
       .mockResolvedValueOnce({ delivered: 0, dropped: 0, retried: 1 })
       .mockResolvedValueOnce({ delivered: 1, dropped: 0, retried: 0 });
     const peekQueuedItems = vi.fn(peekNothingQueued);
-    const logger = { debug: vi.fn(), warn: vi.fn() };
+    const logger = { debug: vi.fn(), warnFile: vi.fn() };
 
     scheduleRuntimeAuthFailureReportOutboxDrainToDaemon({
       delayMs: 10,
@@ -266,7 +303,7 @@ describe('runtimeAuthFailureReportOutboxDrainScheduler', () => {
 
     expect(drain).toHaveBeenCalledTimes(2);
     expect(peekQueuedItems).toHaveBeenCalledOnce();
-    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.warnFile).not.toHaveBeenCalled();
     expect(logger.debug).not.toHaveBeenCalled();
   });
 });

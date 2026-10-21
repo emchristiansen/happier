@@ -470,6 +470,12 @@ class Logger {
     this.logToFile(`[${this.localTimezoneTimestamp()}]`, `[WARN] ${message}`, ...args)
   }
 
+  /** A warning written only to the log file, for paths whose stdout belongs to a provider terminal. */
+  warnFile(message: string, ...args: unknown[]): void {
+    if (!this.warnFileEnabled) return
+    this.logToFile(`[${this.localTimezoneTimestamp()}]`, `[WARN] ${message}`, ...args)
+  }
+
   /**
    * Persist an unhandled CLI failure before a detached runner exits. This deliberately
    * records only sanitized Error text: enumerable fields can contain argv or environment
