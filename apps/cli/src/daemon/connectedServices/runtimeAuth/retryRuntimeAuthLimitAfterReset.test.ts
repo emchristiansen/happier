@@ -78,8 +78,8 @@ function harness(input: { lookupGate?: () => Promise<void>; loseAcknowledgement?
   const authorizeSource = () => authorizeConnectedServiceRuntimeAuthFailureSource({
     getChildren: () => [tracked], sessionId, classification, recoveryInvocationSource: 'scheduler_retry',
     runtimeAuthApply: { directLiveHotAuth: 'unsupported' },
-    resolveRegisteredRuntimeAuthFailureSource: () => ({ serviceId: 'claude-subscription', profileId,
-      groupId, generation: groupId === null ? null : 1, credentialRevision }),
+    resolveRegisteredRuntimeAuthFailureSource: () => ({ status: 'bound', binding: { serviceId: 'claude-subscription', profileId,
+      groupId, generation: groupId === null ? null : 1, credentialRevision } }),
   });
   const recover = () => handleConnectedServiceRuntimeAuthFailure({ sessionId,
     selection: { kind: 'profile', serviceId: 'claude-subscription', profileId: 'primary' },
