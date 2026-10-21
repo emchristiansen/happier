@@ -1989,6 +1989,65 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
     });
 
+    // An accepted provider input whose settlement the server refuses as `forbidden` is held until a
+    // connection that publishes the session settles it; meanwhile it blocks every materialization.
+    const holdAcceptedInputRefusedForbidden = async (localId: string) => {
+      const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 });
+      await waitForCurrentPendingInputContract(client);
+      materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult(localId));
+      listDeliveryStatusesMock.mockResolvedValue([{ localId, status: 'delivering' }]);
+      resolveAcceptedPendingDeliveryMock.mockRejectedValueOnce(new PendingQueueAcceptedSettlementError('forbidden'));
+      client.onUserMessage(() => confirmProviderInputAccepted(client, localId));
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toMatchObject({ type: 'materialized', localId });
+      await waitUntil(() => resolveAcceptedPendingDeliveryMock.mock.calls.length === 1);
+      return client;
+    };
+
+    it('reconnects once when a settlement is refused forbidden, and the new connection settles the held input', async () => {
+      const warningSpy = vi.spyOn(logger, 'warn');
+      const client = await holdAcceptedInputRefusedForbidden('settle-forbidden-reclaimed');
+
+      await waitUntil(() => supervisorReportProbeResultMock.mock.calls.length === 1);
+      expect(supervisorReportProbeResultMock).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ status: 'retry_later' }),
+      );
+      expect(warningSpy).toHaveBeenCalledWith('[pendingQueue] accepted provider settlement remains unresolved', expect.objectContaining({
+        sessionId: 's1', localId: 'settle-forbidden-reclaimed', attempt: 1, retryAfterMs: null, willRetry: false,
+        retryDisposition: 'retained_for_publisher_recovery', failure: { kind: 'server_ack', error: 'forbidden' },
+      }));
+      await expect(readWakeCapability(client)).resolves.toEqual(publisherRecoveringCapability);
+      expect(client.hasCanonicalPendingProviderInputDelivery('settle-forbidden-reclaimed')).toBe(true);
+
+      // The reconnect claims publisher status and re-offers the held settlement on the new connection.
+      resolveAcceptedPendingDeliveryMock.mockResolvedValueOnce({
+        didResolve: true,
+        pendingQueueState: { known: true, pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 3 },
+      });
+      await reconnect();
+      await waitUntil(() => !client.hasCanonicalPendingProviderInputDelivery('settle-forbidden-reclaimed'));
+      expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(2);
+      expect(supervisorReportProbeResultMock).toHaveBeenCalledTimes(1);
+      await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
+    });
+
+    it('reports publisher_lost, not no_pending, while a held settlement is refused on the reclaimed connection too', async () => {
+      const client = await holdAcceptedInputRefusedForbidden('settle-forbidden-terminal');
+      await waitUntil(() => supervisorReportProbeResultMock.mock.calls.length === 1);
+
+      resolveAcceptedPendingDeliveryMock.mockRejectedValueOnce(new PendingQueueAcceptedSettlementError('forbidden'));
+      await reconnect();
+      await waitUntil(() => resolveAcceptedPendingDeliveryMock.mock.calls.length === 2);
+      await expect(readWakeCapability(client)).resolves.toEqual(publisherLostCapability);
+
+      // The held input still blocks materialization, but a wake now reports why.
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toEqual({ type: 'publisher_lost' });
+      expect(materializeNextMock).toHaveBeenCalledTimes(1);
+      expect(supervisorReportProbeResultMock).toHaveBeenCalledTimes(1);
+      expect(client.hasCanonicalPendingProviderInputDelivery('settle-forbidden-terminal')).toBe(true);
+    });
+
     it('completes an unreclaimed recovery as publisher_lost at its deadline, without another reconnect', async () => {
       const client = await createClient({
         latestTurnStatus: 'completed',
@@ -2523,10 +2582,11 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       failure: { kind: 'socket', code: 'socket_not_connected' },
     },
     {
+      // A `forbidden` settlement is a lost publisher, covered under 'lost pending publisher'.
       name: 'recognized server refusal',
       localId: 'diagnostic-no-retry-server',
-      error: new PendingQueueAcceptedSettlementError('forbidden'),
-      failure: { kind: 'server_ack', error: 'forbidden' },
+      error: new PendingQueueAcceptedSettlementError('transcript-conflict'),
+      failure: { kind: 'server_ack', error: 'transcript-conflict' },
     },
     {
       name: 'unrecognized typed server value',
@@ -2585,6 +2645,31 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(materializeNextMock).toHaveBeenCalledTimes(1);
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledExactlyOnceWith({ socket: sessionSocketStub, sessionId: 's1', localId });
     expect(blockPendingDeliveryMock).not.toHaveBeenCalled();
+  });
+
+  it('logs once per held input when held provider custody stops materialization', async () => {
+    const localId = 'held-custody-logged-once';
+    const infoSpy = vi.spyOn(logger, 'infoFile');
+    const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 });
+    await waitForCurrentPendingInputContract(client);
+    materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult(localId));
+    listDeliveryStatusesMock.mockResolvedValue([{ localId, status: 'delivering' }]);
+    resolveAcceptedPendingDeliveryMock.mockRejectedValueOnce(new PendingQueueAcceptedSettlementError('transcript-conflict'));
+    client.onUserMessage(() => confirmProviderInputAccepted(client, localId));
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+      .resolves.toMatchObject({ type: 'materialized', localId });
+    await waitUntil(() => resolveAcceptedPendingDeliveryMock.mock.calls.length === 1);
+    const heldLines = () => infoSpy.mock.calls.filter(([message]) => message === '[pendingQueue] materialization held by provider custody');
+
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toEqual({ type: 'no_pending' });
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toEqual({ type: 'no_pending' });
+
+    expect(heldLines()).toEqual([['[pendingQueue] materialization held by provider custody', {
+      sessionId: 's1', localId, providerInputOutcome: 'accepted', publisherRecovery: 'current',
+      sessionConnectionEpoch: expect.any(Number),
+    }]]);
+    logger.flushSync();
+    expect(readFileSync(logger.getLogPath(), 'utf8')).toContain(`"localId":"${localId}","providerInputOutcome":"accepted"`);
   });
 
   it.each([true, false])('retries the original accepted settlement after a pre-emit socket drop recovers without another provider entry (didResolve=%s)', async (didResolve) => {

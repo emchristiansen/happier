@@ -697,6 +697,8 @@ export class ApiSessionClient extends EventEmitter {
     private readonly providerInputUncertainLocalIds = new Set<string>();
     private readonly acceptedCanonicalPendingDeliveryResolutionWrites = new Set<Promise<void>>();
     private readonly acceptedCanonicalPendingDeliveryResolutionLocalIdsInFlight = new Set<string>();
+    // Held inputs already named in the runner log; pruned to the currently held set at each hold.
+    private readonly materializationHeldLoggedLocalIds = new Set<string>();
     private readonly acceptedCanonicalPendingDeliveryOperationAbortController = new AbortController();
     private readonly committedLocalIdCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private readonly agentQueueEchoSuppressedLocalIdCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -1865,6 +1867,11 @@ export class ApiSessionClient extends EventEmitter {
                                 previousRetryDelayMs * 2,
                             ))
                             : null;
+                        // The server refuses settlement as `forbidden` only when this connection no
+                        // longer publishes the session (its session binding or publisher fence), so no
+                        // retry on it can succeed. A connection that reclaims publisher status re-offers it.
+                        const isPublisherLost = error instanceof PendingQueueAcceptedSettlementError
+                            && error.settlementError === 'forbidden';
                         try {
                             logger.warn('[pendingQueue] accepted provider settlement remains unresolved', {
                                 sessionId: this.sessionId,
@@ -1872,7 +1879,9 @@ export class ApiSessionClient extends EventEmitter {
                                 attempt,
                                 retryAfterMs,
                                 willRetry: retryAfterMs !== null,
-                                retryDisposition: retryAfterMs !== null ? 'same_operation_after_backoff' : 'retained_without_retry',
+                                retryDisposition: retryAfterMs !== null
+                                    ? 'same_operation_after_backoff'
+                                    : isPublisherLost ? 'retained_for_publisher_recovery' : 'retained_without_retry',
                                 failure: readAcceptedPendingSettlementFailureDiagnostic(error),
                                 producerGeneration: authority.producerGeneration,
                                 sessionConnectionEpoch: authority.sessionConnectionEpoch,
@@ -1881,7 +1890,10 @@ export class ApiSessionClient extends EventEmitter {
                         } catch {
                             // Diagnostic sink failure must not change accepted settlement custody or retries.
                         }
-                        if (retryAfterMs === null) return;
+                        if (retryAfterMs === null) {
+                            if (isPublisherLost) this.observePendingPublisherLost(authority.sessionConnectionEpoch);
+                            return;
+                        }
                         previousRetryDelayMs = retryAfterMs;
                         await delayUnrefAbortable(retryAfterMs, authority.abortSignal);
                     } else {
@@ -2091,11 +2103,7 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private async reconcileCanonicalPendingDeliveriesBeforeMaterialization(): Promise<boolean> {
-        const blockingLocalIds = [...this.canonicalPendingDeliveryByLocalId.keys()]
-            .filter((localId) => (
-                this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted'
-                || !this.serverBlockedCanonicalPendingDeliveryLocalIds.has(localId)
-            ));
+        const blockingLocalIds = this.listMaterializationBlockingCanonicalPendingDeliveryLocalIds();
         if (blockingLocalIds.length === 0) return true;
 
         try {
@@ -2133,15 +2141,36 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private hasMaterializationBlockingCanonicalPendingDelivery(): boolean {
-        for (const localId of this.canonicalPendingDeliveryByLocalId.keys()) {
-            if (
-                this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted'
-                || !this.serverBlockedCanonicalPendingDeliveryLocalIds.has(localId)
-            ) {
-                return true;
-            }
+        return this.listMaterializationBlockingCanonicalPendingDeliveryLocalIds().length > 0;
+    }
+
+    private listMaterializationBlockingCanonicalPendingDeliveryLocalIds(): string[] {
+        return [...this.canonicalPendingDeliveryByLocalId.keys()].filter((localId) => (
+            this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted'
+            || !this.serverBlockedCanonicalPendingDeliveryLocalIds.has(localId)
+        ));
+    }
+
+    /**
+     * Held custody makes materialization answer `no_pending` while the server still queues input,
+     * so name each held input once in the runner log; otherwise that stall leaves no trace there.
+     */
+    private logMaterializationHeldByProviderCustody(): void {
+        const held = this.listMaterializationBlockingCanonicalPendingDeliveryLocalIds();
+        for (const localId of this.materializationHeldLoggedLocalIds) {
+            if (!held.includes(localId)) this.materializationHeldLoggedLocalIds.delete(localId);
         }
-        return false;
+        for (const localId of held) {
+            if (this.materializationHeldLoggedLocalIds.has(localId)) continue;
+            this.materializationHeldLoggedLocalIds.add(localId);
+            logger.infoFile('[pendingQueue] materialization held by provider custody', {
+                sessionId: this.sessionId,
+                localId,
+                providerInputOutcome: this.providerInputTerminalOutcomeByLocalId.get(localId) ?? null,
+                publisherRecovery: this.pendingPublisherRecovery.state,
+                sessionConnectionEpoch: this.sessionConnectionEpoch,
+            });
+        }
     }
 
     async reconcilePendingQueueState(opts?: { force?: boolean; discovery?: boolean }): Promise<boolean> {
@@ -7098,8 +7127,14 @@ export class ApiSessionClient extends EventEmitter {
                 phase: supervisorState.phase,
             });
         }
+        if (this.pendingPublisherRecovery.state === 'publisher_lost') {
+            // Ahead of held custody: an input whose settlement this connection was refused stays
+            // held, and the wake must report the lost publisher rather than an empty queue.
+            return { type: 'publisher_lost' };
+        }
         reportPendingMaterializationDiagnosticPhase(opts.onDiagnosticPhase, 'materialize.delivery_reconcile');
         if (!await this.reconcileCanonicalPendingDeliveriesBeforeMaterialization()) {
+            this.logMaterializationHeldByProviderCustody();
             return { type: 'no_pending' };
         }
 
