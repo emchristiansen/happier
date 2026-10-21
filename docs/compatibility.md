@@ -270,11 +270,11 @@ On Resume, the daemon replaces such a runner only when the respondent equals the
 one local process a Stop of the session would signal: the session's only tracked
 runner, on this daemon's machine, with the same pid and process instance. It then
 stops exactly that process and spawns only once the runner is proven absent. Stop
-checks the process instance again before signalling: the graceful signal (or
-Windows `taskkill`) follows that check with no intervening wait, and forced
-escalation re-reads the instance synchronously immediately before every signal to
-the runner. Once the pid is gone or is positively another instance, the runner
-receives nothing further. If the runner was suspended for descendant enumeration
+checks the process instance again before every signal to the runner, including the
+graceful signal, the Windows `taskkill` and each signal of forced escalation across
+its waits. A check is not atomic with the signal that follows it: other work can
+run between them. Once the pid is gone or is positively another instance, the
+runner receives nothing further. If the runner was suspended for descendant enumeration
 and its instance then cannot be read, the read is retried briefly, and the runner
 is otherwise left suspended (never resumed or killed blind) and logged by pid.
 Descendants are signalled only from a process snapshot taken while the runner was

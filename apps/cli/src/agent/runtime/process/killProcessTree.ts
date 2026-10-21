@@ -75,8 +75,8 @@ export type ProcessTreeRootIdentity = 'same' | 'not_same' | 'unreadable';
 /**
  * Result of a guarded process-tree kill. Only `completed` means the root was signalled to the end.
  * - `root_not_same`: the root pid stopped being the intended process, so it received nothing further.
- * - `root_unreadable`: the root was alive but unidentifiable before this call suspended it; it was
- *   sent nothing further.
+ * - `root_unreadable`: the root was alive but unidentifiable at a check made while this call did not
+ *   hold it suspended (before suspending it, or after resuming it); it was sent nothing further.
  * - `root_unreadable_suspended`: this call SIGSTOPped the root and could not re-identify it, so it was
  *   deliberately left stopped rather than resumed or signalled blind.
  * Descendants are signalled only from a process snapshot validated by verifying the root both before
@@ -107,7 +107,7 @@ async function killProcessTreeCore(pid: number, graceMs: number, guard: RootGuar
   // Once the guard stops holding, the root is excluded from every later signal and wait.
   let rootOutcome: GuardedProcessTreeKillOutcome = 'completed';
   let rootStopped = false;
-  /** Checks the guard immediately before a root signal; true only while the root is still the intended instance. */
+  /** Checks the guard before a root signal; true only while the root is still the intended instance. The check is not atomic with the signal. */
   const rootHolds = async (): Promise<boolean> => {
     if (rootOutcome !== 'completed') return false;
     if (!guard) return true;
