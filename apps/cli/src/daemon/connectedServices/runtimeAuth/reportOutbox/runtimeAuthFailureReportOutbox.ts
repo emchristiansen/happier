@@ -421,10 +421,10 @@ export async function enqueueRuntimeAuthFailureReportOutboxItem(input: Readonly<
   });
 }
 
-export async function readRuntimeAuthFailureReportOutboxItems(input: Readonly<{
-  outboxDir?: string;
-}> = {}): Promise<RuntimeAuthFailureReportOutboxItem[]> {
-  const outboxDir = resolveOutboxDir(input);
+async function readOutboxItems(
+  outboxDir: string,
+  invalidEntries: 'quarantine' | 'skip',
+): Promise<RuntimeAuthFailureReportOutboxItem[]> {
   const entries = await readOutboxEntries(outboxDir);
   const items: RuntimeAuthFailureReportOutboxItem[] = [];
   for (const entry of entries) {
@@ -440,9 +440,25 @@ export async function readRuntimeAuthFailureReportOutboxItems(input: Readonly<{
     } catch {
       // handled below
     }
-    await quarantineInvalidJson(outboxDir, entry);
+    if (invalidEntries === 'quarantine') await quarantineInvalidJson(outboxDir, entry);
   }
   return items.sort((left, right) => left.createdAtMs - right.createdAtMs || left.reportKey.localeCompare(right.reportKey));
+}
+
+export async function readRuntimeAuthFailureReportOutboxItems(input: Readonly<{
+  outboxDir?: string;
+}> = {}): Promise<RuntimeAuthFailureReportOutboxItem[]> {
+  return await readOutboxItems(resolveOutboxDir(input), 'quarantine');
+}
+
+/**
+ * Diagnostic read of the queued items, oldest first. Unlike `readRuntimeAuthFailureReportOutboxItems`
+ * it never quarantines an unreadable entry, so observing the outbox cannot change it.
+ */
+export async function peekRuntimeAuthFailureReportOutboxItems(input: Readonly<{
+  outboxDir?: string;
+}> = {}): Promise<RuntimeAuthFailureReportOutboxItem[]> {
+  return await readOutboxItems(resolveOutboxDir(input), 'skip');
 }
 
 export async function removeRuntimeAuthFailureReportOutboxItem(input: Readonly<{

@@ -242,11 +242,14 @@ describe('createDaemonControlApp connected-service runtime auth handling', () =>
           sessionId,
           classification,
           resolveRegisteredRuntimeAuthFailureSource: () => ({
-            serviceId: 'openai-codex',
-            groupId: 'main',
-            profileId: 'batiplus',
-            generation: 1225,
-            credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb',
+            status: 'bound',
+            binding: {
+              serviceId: 'openai-codex',
+              groupId: 'main',
+              profileId: 'batiplus',
+              generation: 1225,
+              credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb',
+            },
           }),
           resolveCurrentRuntimeAuthFailureSource: async ({ classification: currentClassification }) =>
             await resolveCurrentCodexRuntimeAuthFailureSource({
@@ -357,7 +360,11 @@ describe('createDaemonControlApp connected-service runtime auth handling', () =>
           getChildren: () => [tracked],
           sessionId,
           classification,
-          resolveRegisteredRuntimeAuthFailureSource: () => null,
+          resolveRegisteredRuntimeAuthFailureSource: () => ({
+            status: 'absent',
+            reason: 'session_unregistered',
+            registeredServiceIds: [],
+          }),
         }),
       handleConnectedServiceRuntimeAuthFailure,
       runtimeAuthRecoveryScheduler: { beginClassifiedFailure },
@@ -398,6 +405,93 @@ describe('createDaemonControlApp connected-service runtime auth handling', () =>
     }
   });
 
+  it('logs the exact registered-binding rejection detail on the source verification warning', async () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const handleConnectedServiceRuntimeAuthFailure = vi.fn(async () => ({ status: 'switch_attempted' }));
+    const tracked = {
+      startedBy: 'daemon' as const,
+      happySessionId: 'sess_service_unbound',
+      pid: 123,
+      spawnOptions: { directory: '/tmp/project' },
+    };
+    const app = createDaemonControlApp({
+      getChildren: () => [tracked],
+      machineId: 'machine',
+      stopSession: async () => ({ status: 'not_found' as const }),
+      spawnSession: async () => ({
+        type: 'error',
+        errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
+        errorMessage: 'unused',
+      }),
+      requestShutdown: () => {},
+      onHappySessionWebhook: () => {},
+      controlToken: 'token',
+      authorizeConnectedServiceRuntimeAuthFailure: async ({ sessionId, classification }) =>
+        await authorizeConnectedServiceRuntimeAuthFailureSource({
+          getChildren: () => [tracked],
+          sessionId,
+          classification,
+          resolveRegisteredRuntimeAuthFailureSource: () => ({
+            status: 'absent',
+            reason: 'service_unbound',
+            registeredServiceIds: ['claude-subscription'],
+          }),
+        }),
+      handleConnectedServiceRuntimeAuthFailure,
+    });
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/connected-service-runtime-auth/failure',
+        headers: { 'x-happier-daemon-token': 'token' },
+        payload: {
+          reportId: 'runtime-auth-report:service-unbound',
+          sessionId: tracked.happySessionId,
+          switchesThisTurn: 0,
+          classification: {
+            kind: 'usage_limit',
+            serviceId: 'openai-codex',
+            profileId: 'primary',
+            groupId: 'main',
+            groupGeneration: 1,
+            credentialRevision: 'csr_abcdefghijklmnopqrstuv',
+            resetsAtMs: null,
+            planType: null,
+            rateLimits: null,
+            source: 'structured_provider_error',
+            recoveryAction: { kind: 'quota_recovery_required' },
+          },
+        },
+      });
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual({
+        ok: false,
+        errorCode: 'connected_service_runtime_auth_recovery_intake_failed',
+      });
+      expect(handleConnectedServiceRuntimeAuthFailure).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalledWith(
+        '[CONTROL SERVER] Connected-service runtime auth source verification unavailable',
+        {
+          sessionId: tracked.happySessionId,
+          serviceId: 'openai-codex',
+          error: {
+            name: 'Error',
+            message: 'connected-service exact runtime source binding temporarily unavailable',
+          },
+          exactSourceBindingRejection: {
+            kind: 'registered_binding_absent',
+            reason: 'service_unbound',
+            serviceId: 'openai-codex',
+            registeredServiceIds: ['claude-subscription'],
+          },
+        },
+      );
+    } finally {
+      warnSpy.mockRestore();
+      await app.close();
+    }
+  });
+
   it('retains an exact report in the bounded outbox while the current binding is unavailable', async () => {
     resetConnectedServiceRuntimeAuthFailureReportDedupeForTests();
     const outboxDir = await createTempDir('happier-runtime-auth-source-binding-unavailable-');
@@ -425,7 +519,11 @@ describe('createDaemonControlApp connected-service runtime auth handling', () =>
           getChildren: () => [tracked],
           sessionId,
           classification,
-          resolveRegisteredRuntimeAuthFailureSource: () => null,
+          resolveRegisteredRuntimeAuthFailureSource: () => ({
+            status: 'absent',
+            reason: 'session_unregistered',
+            registeredServiceIds: [],
+          }),
         }),
       handleConnectedServiceRuntimeAuthFailure,
     });

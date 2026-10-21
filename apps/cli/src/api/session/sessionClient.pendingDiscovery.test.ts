@@ -14,6 +14,7 @@ import {
 import { MessageQueue2 } from "@/agent/runtime/modeMessageQueue";
 import { createSessionProviderInputConsumer } from "@/agent/runtime/sessionInput/SessionProviderInputConsumer";
 import type { UserMessage } from "@/api/types";
+import { logger } from "@/ui/logger";
 
 const boundary = vi.hoisted(() => {
   for (const key of [
@@ -581,6 +582,45 @@ describe("authoritative pending discovery through the session client and consume
       { v: 1, sessionId: snapshot.id, localId: originalPrompt.localId },
       { v: 1, sessionId: snapshot.id, localId: originalPrompt.localId },
     ]);
+  });
+
+  it("names a held accepted input once when the consumer's custody gate stops materialization", async () => {
+    const infoSpy = vi.spyOn(logger, "infoFile");
+    const heldLines = () =>
+      infoSpy.mock.calls.filter(([message]) => message === "[pendingQueue] materialization held by provider custody");
+    const { client, observe } = await createClient();
+    const { consumer, controller } = consume(client);
+    const waiting = consumer.waitForNextInput({ abortSignal: controller.signal });
+    snapshot = { ...snapshot, pendingCount: 1, pendingVersion: 1 };
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(await waiting).toBeTruthy();
+    // The server refuses the accepted input's settlement without a retry, so its custody stays held.
+    settle = async () => ({ ok: false, error: "transcript-conflict" });
+    await consumer.runProviderInputDispatch({
+      abortSignal: controller.signal,
+      dispatch: async () => {
+        observe({ kind: "accepted", localId: originalPrompt.localId });
+      },
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(settlements).toHaveBeenCalledTimes(1);
+    expect(client.hasCanonicalPendingProviderInputDelivery(originalPrompt.localId)).toBe(true);
+
+    // A later input queues behind it; each drain stops at the consumer's custody gate.
+    snapshot = { ...snapshot, pendingCount: 1, pendingVersion: 4 };
+    await client.reconcilePendingQueueState({ force: true });
+    for (let drain = 0; drain < 2; drain += 1) {
+      await expect(consumer.drainPending({ abortSignal: controller.signal })).resolves.toMatchObject({
+        materialized: 0,
+        stoppedReason: "materialization_blocked",
+      });
+    }
+
+    expect(heldLines()).toEqual([[
+      "[pendingQueue] materialization held by provider custody",
+      expect.objectContaining({ localId: originalPrompt.localId, providerInputOutcome: "accepted" }),
+    ]]);
+    expect(claims).toHaveBeenCalledTimes(1);
   });
 
   it("renews one exhausted consumer episode after observed read recovery, never from elapsed or unchanged healthy ticks", async () => {
