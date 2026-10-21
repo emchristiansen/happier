@@ -2304,7 +2304,12 @@ export class ApiSessionClient extends EventEmitter {
         activeTurnSteerability?: PendingForegroundSteerability;
         pendingQueueDeliveryTiming?: SessionPendingQueueDeliveryTiming;
     } = {}): boolean {
-        if (this.pendingDiscoveryArchived || this.hasMaterializationBlockingCanonicalPendingDelivery()) return false;
+        if (this.pendingDiscoveryArchived) return false;
+        if (this.hasMaterializationBlockingCanonicalPendingDelivery()) {
+            // Input consumers stop here without reaching materializeNextPendingMessageSafely.
+            this.logMaterializationHeldByProviderCustody();
+            return false;
+        }
         return countMaterializablePendingRows(this.pendingQueueState) > 0;
     }
 
