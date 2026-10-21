@@ -184,10 +184,12 @@ export async function killProcessTree(
 
 /**
  * `killProcessTree` for a root whose pid must still name one exact process instance. The guard is
- * read immediately before every signal to the root, and once more after the descendant snapshot:
- * descendants are signalled only if the root is verified both before and after that snapshot, and
- * from then on the guard no longer gates them. An unreadable identity after this call suspended the
- * root is retried with a short bounded backoff, then the root is left stopped rather than resumed blind.
+ * read before every signal to the root, though not atomically with it, and once more after the
+ * descendant snapshot: descendants are signalled only if the root is verified both before and after
+ * that snapshot, and from then on the guard no longer gates them. While this call holds the root
+ * suspended, an unreadable identity is retried with a short bounded backoff, then the root is left
+ * stopped rather than resumed blind (`root_unreadable_suspended`). An unreadable identity at any
+ * other check, before suspending the root or after resuming it, ends with `root_unreadable`.
  */
 export async function killProcessTreeGuarded(
   proc: ProcessTreeRoot,
