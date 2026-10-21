@@ -150,7 +150,11 @@ import { publishReportedTerminalControlServiceability } from './sessions/publish
 import { retireExactTerminalControlServiceability } from './sessions/retireTerminalControlServiceability';
 import { recoverStrandedTerminalControlServiceability } from './sessions/recoverStrandedTerminalControlServiceability';
 import { waitForVisibleConsoleSessionWebhook } from './sessions/visibleConsoleSpawnWaiter';
-import { createStopSession } from './sessions/stopSession';
+import {
+  createStopSession,
+  isExactStopRunnerSoleTrackedRunner,
+  type StopSessionOptions,
+} from './sessions/stopSession';
 import {
   isTerminalHostPhysicallyRetiredStopResult,
   type StopSessionResult,
@@ -164,6 +168,7 @@ import {
   isSessionRunnerActive as isSessionRunnerActiveInDaemon,
   probeSessionRunnerServiceability as probeSessionRunnerServiceabilityInDaemon,
   resolveSessionRunnerResumeDecision,
+  type MatchedLostPublisherRunner,
   type SessionRunnerServiceabilityProbe,
 } from './sessions/isSessionRunnerActive';
 import { startDaemonHeartbeatLoop } from './lifecycle/heartbeat';
@@ -2320,6 +2325,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           return await probeSessionRunnerServiceabilityInDaemon({
             sessionId: sessionIdRaw,
             trackedSessions: pidToTrackedSession.values(),
+            localMachineId: machineId,
             probeCapability: async () => await probePendingQueueServiceability({
               sessionId: sessionIdRaw,
               credentials,
@@ -3088,6 +3094,53 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 pollIntervalMs: configuration.daemonSpawnExistingSessionWaitForExitPollIntervalMs,
               });
               const initialResumeDecision = resolveSessionRunnerResumeDecision(initialServiceability);
+              // A local runner that itself reports `publisher_lost` is alive but can never claim the
+              // queued input again. Replace it as a person would: Stop exactly that runner incarnation,
+              // then the ordinary spawn below, once the session's runner is proven absent.
+              const replacePublisherLostRunner = async (
+                target: MatchedLostPublisherRunner,
+              ): Promise<Extract<SpawnSessionResult, { type: 'error' }> | null> => {
+                const refusal = {
+                  type: 'error' as const,
+                  errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
+                  errorMessage: 'The existing session runtime can no longer receive queued messages and could not be safely replaced. Stop the session, then Resume again.',
+                };
+                // Re-check before Stop's side effects: the reporting runner must still be the only
+                // tracked process Stop would signal.
+                if (!isExactStopRunnerSoleTrackedRunner({
+                  pidToTrackedSession,
+                  sessionId: normalizedExistingSessionId,
+                  exactRunner: target,
+                })) {
+                  logger.warn('[DAEMON RUN] Refusing to replace a lost-publisher runner that is no longer the session\'s only tracked runner', {
+                    sessionId: normalizedExistingSessionId,
+                    pid: target.pid,
+                  });
+                  return refusal;
+                }
+                logger.warn('[DAEMON RUN] Resume target reported a lost pending publisher; replacing its runner', {
+                  sessionId: normalizedExistingSessionId,
+                  pid: target.pid,
+                });
+                const stopResult = await stopSession(normalizedExistingSessionId, { exactRunner: target });
+                if (
+                  (stopResult.status === 'stopped' || stopResult.status === 'not_found')
+                  && (await probeSessionRunnerServiceability(normalizedExistingSessionId)).state === 'runner_absent'
+                ) {
+                  return null;
+                }
+                logger.warn('[DAEMON RUN] Refusing Resume because the lost-publisher runner was not proven stopped', {
+                  sessionId: normalizedExistingSessionId,
+                  pid: target.pid,
+                  stopStatus: stopResult.status,
+                  ...(stopResult.status === 'incomplete' ? { stopReason: stopResult.reason } : {}),
+                });
+                return refusal;
+              };
+              if (initialResumeDecision.action === 'replace') {
+                const replacementRefusal = await replacePublisherLostRunner(initialResumeDecision.target);
+                if (replacementRefusal) return replacementRefusal;
+              }
               if (initialResumeDecision.action === 'fence') {
                 await publishSessionRunnerControlServiceability(normalizedExistingSessionId, initialServiceability);
                 logger.debug('[DAEMON RUN] Resume target serviceability is unknown; refusing an unsafe duplicate spawn', {
@@ -3125,6 +3178,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
 
                 const serviceabilityAfterWait = await probeSessionRunnerServiceability(normalizedExistingSessionId);
                 const resumeDecisionAfterWait = resolveSessionRunnerResumeDecision(serviceabilityAfterWait);
+                if (resumeDecisionAfterWait.action === 'replace') {
+                  const replacementRefusal = await replacePublisherLostRunner(resumeDecisionAfterWait.target);
+                  if (replacementRefusal) return replacementRefusal;
+                }
                 if (resumeDecisionAfterWait.action === 'fence') {
                   await publishSessionRunnerControlServiceability(normalizedExistingSessionId, serviceabilityAfterWait);
                   return {
@@ -3169,6 +3226,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   // destructive escape hatch that killed live Claude runners en masse after a daemon
                   // restart marked them (falsely) inactive. Never kill a live, servable runner over
                   // a momentary probe result; it will drain its queue once its handler is ready.
+                  // The one exception is decided before adoption: the exact local runner that itself
+                  // reports `publisher_lost` has spent its one reconnect, and the server refuses its
+                  // every claim, so it can never drain. Only that positive, incarnation-bound report
+                  // replaces a runner; a missing, failed, foreign or unbindable probe never implies it.
                   const hasExplicitCatchUpCursor = typeof normalizedOptions.initialTranscriptAfterSeq === 'number';
                   const hasFreshUserRequestAuthorization =
                     normalizedOptions.executionAuthorization?.provenance === 'user_request'
@@ -5629,7 +5690,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           }
         };
 
-        const stopSession = async (sessionId: string): Promise<StopSessionResult> => {
+        const stopSession = async (sessionId: string, options?: StopSessionOptions): Promise<StopSessionResult> => {
           const normalizedSessionId = String(sessionId ?? '').trim();
           const existingStop = stopSessionInFlightBySessionId.get(normalizedSessionId);
           if (existingStop) return await existingStop;
@@ -5671,7 +5732,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               });
             });
             physicallyRetiredTerminalAttachmentIdBySessionId.delete(normalizedSessionId);
-            const trackedStopResult = await stopSessionCore(normalizedSessionId);
+            const trackedStopResult = options === undefined
+              ? await stopSessionCore(normalizedSessionId)
+              : await stopSessionCore(normalizedSessionId, options);
             const physicallyRetiredAttachmentId = physicallyRetiredTerminalAttachmentIdBySessionId.get(normalizedSessionId);
             physicallyRetiredTerminalAttachmentIdBySessionId.delete(normalizedSessionId);
             if (isTerminalHostPhysicallyRetiredStopResult(trackedStopResult) && physicallyRetiredAttachmentId) {

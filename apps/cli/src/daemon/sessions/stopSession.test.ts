@@ -17,6 +17,9 @@ vi.mock('node:child_process', async (importOriginal) => {
   };
 });
 
+// Process enumeration is an external boundary; a fixed empty tree keeps forced escalation deterministic.
+vi.mock('ps-list', () => ({ default: vi.fn(async () => []) }));
+
 const isPidSafeHappySessionProcess = vi.fn(async () => true);
 vi.mock('../pidSafety', () => ({
   isPidSafeHappySessionProcess,
@@ -1497,6 +1500,246 @@ describe('createStopSession', () => {
       }));
       expect(childKill).not.toHaveBeenCalled();
       expect(killSpy).not.toHaveBeenCalled();
+      killSpy.mockRestore();
+    });
+  });
+
+  describe('exact runner target', () => {
+    const exactRunner = { pid: 111, processInstanceFingerprint: 'linux-proc:111' };
+
+    it('signals only the exact runner after re-verifying its process instance', async () => {
+      const { createStopSession } = await import('./stopSession');
+      isPidSafeHappySessionProcess.mockReset();
+      isPidSafeHappySessionProcess.mockResolvedValue(true);
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true as any);
+      const pidToTrackedSession = new Map<number, any>([
+        [111, { startedBy: 'daemon', pid: 111, happySessionId: 'sess-1', childProcess: { pid: 111, kill: vi.fn() } }],
+      ]);
+
+      const stop = createStopSession({ pidToTrackedSession, waitForTrackedRunnersExit: vi.fn(async () => true) });
+      await expect(stop('sess-1', { exactRunner })).resolves.toEqual({ status: 'stopped' });
+
+      expect(isPidSafeHappySessionProcess).toHaveBeenCalledWith({
+        pid: 111,
+        expectedProcessInstanceFingerprint: 'linux-proc:111',
+      });
+      expect(isPidSafeHappySessionProcess.mock.invocationCallOrder[0]).toBeLessThan(killSpy.mock.invocationCallOrder[0]!);
+      expect(killSpy).toHaveBeenCalledTimes(1);
+      expect(killSpy).toHaveBeenCalledWith(-111, 'SIGTERM');
+      killSpy.mockRestore();
+    });
+
+    it('refuses to signal when the pid now belongs to another process instance', async () => {
+      const { createStopSession } = await import('./stopSession');
+      isPidSafeHappySessionProcess.mockReset();
+      isPidSafeHappySessionProcess.mockResolvedValue(false);
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true as any);
+      const childKill = vi.fn();
+      const pidToTrackedSession = new Map<number, any>([
+        [111, { startedBy: 'daemon', pid: 111, happySessionId: 'sess-1', childProcess: { pid: 111, kill: childKill } }],
+      ]);
+
+      const stop = createStopSession({ pidToTrackedSession, waitForTrackedRunnersExit: vi.fn(async () => true) });
+      await expect(stop('sess-1', { exactRunner })).resolves.toEqual({ status: 'incomplete', reason: 'runner_signal_incomplete' });
+
+      expect(killSpy).not.toHaveBeenCalled();
+      expect(childKill).not.toHaveBeenCalled();
+      killSpy.mockRestore();
+    });
+
+    it('carries the exact process instance into forced escalation', async () => {
+      const { createStopSession } = await import('./stopSession');
+      isPidSafeHappySessionProcess.mockReset();
+      isPidSafeHappySessionProcess.mockResolvedValue(true);
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true as any);
+      const pidToTrackedSession = new Map<number, any>([
+        [111, { startedBy: 'terminal', pid: 111, happySessionId: 'sess-1', processCommandHash: 'h1' }],
+      ]);
+      const waitForTrackedRunnersExit = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+
+      const stop = createStopSession({
+        pidToTrackedSession,
+        waitForTrackedRunnersExit,
+        readProcessInstanceFingerprint: () => 'linux-proc:111',
+      });
+      await expect(stop('sess-1', { exactRunner })).resolves.toEqual({ status: 'stopped' });
+
+      expect(isPidSafeHappySessionProcess).toHaveBeenCalledTimes(2);
+      for (const [call] of isPidSafeHappySessionProcess.mock.calls as unknown as Array<[Record<string, unknown>]>) {
+        expect(call).toMatchObject({ pid: 111, expectedProcessInstanceFingerprint: 'linux-proc:111' });
+      }
+      expect(killSpy).toHaveBeenCalledWith(111, 'SIGTERM');
+      expect(killSpy).toHaveBeenCalledWith(111, 'SIGKILL');
+      killSpy.mockRestore();
+    });
+
+    it('refuses forced escalation when the pid is another instance by then', async () => {
+      const { createStopSession } = await import('./stopSession');
+      isPidSafeHappySessionProcess.mockReset();
+      // Graceful check: still the exact runner. Forced check: the pid now belongs to another process.
+      isPidSafeHappySessionProcess.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true as any);
+      const pidToTrackedSession = new Map<number, any>([
+        [111, { startedBy: 'terminal', pid: 111, happySessionId: 'sess-1', processCommandHash: 'h1' }],
+      ]);
+      const waitForTrackedRunnersExit = vi.fn(async () => false);
+
+      const stop = createStopSession({
+        pidToTrackedSession,
+        waitForTrackedRunnersExit,
+        readProcessInstanceFingerprint: () => 'linux-proc:someone-else',
+      });
+      await expect(stop('sess-1', { exactRunner })).resolves.toEqual({ status: 'incomplete', reason: 'runner_exit_timeout' });
+
+      expect(isPidSafeHappySessionProcess).toHaveBeenCalledTimes(2);
+      expect(killSpy.mock.calls).toEqual([[111, 'SIGTERM']]);
+      killSpy.mockRestore();
+    });
+
+    it('sends no SIGKILL when the instance changes between the forced SIGTERM and escalation', async () => {
+      if (process.platform === 'win32') return;
+      const { createStopSession } = await import('./stopSession');
+      isPidSafeHappySessionProcess.mockReset();
+      isPidSafeHappySessionProcess.mockResolvedValue(true);
+      let rootSigterms = 0;
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+        // The second SIGTERM is forced escalation's; the runner exits and its pid is reused.
+        if (pid === 111 && signal === 'SIGTERM') rootSigterms += 1;
+        return true;
+      }) as typeof process.kill);
+      const pidToTrackedSession = new Map<number, any>([
+        [111, { startedBy: 'terminal', pid: 111, happySessionId: 'sess-1', processCommandHash: 'h1' }],
+      ]);
+      const waitForTrackedRunnersExit = vi.fn(async () => false);
+
+      const stop = createStopSession({
+        pidToTrackedSession,
+        waitForTrackedRunnersExit,
+        readProcessInstanceFingerprint: () => (rootSigterms >= 2 ? 'linux-proc:reused' : 'linux-proc:111'),
+      });
+      // Stopping signalling a reused pid is not completed cleanup: replacement must not spawn.
+      await expect(stop('sess-1', { exactRunner })).resolves.toEqual({ status: 'incomplete', reason: 'runner_signal_incomplete' });
+
+      expect(rootSigterms).toBe(2);
+      expect(killSpy.mock.calls.filter(([, signal]) => signal === 'SIGKILL')).toEqual([]);
+      killSpy.mockRestore();
+    });
+
+    it('reports an incomplete Stop, loudly, when a suspended exact runner cannot be re-identified', async () => {
+      if (process.platform === 'win32') return;
+      const { createStopSession } = await import('./stopSession');
+      isPidSafeHappySessionProcess.mockReset();
+      isPidSafeHappySessionProcess.mockResolvedValue(true);
+      const signals: Array<[number, unknown]> = [];
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+        if (signal !== 0) signals.push([pid, signal]);
+        return true;
+      }) as typeof process.kill);
+      const logWarning = vi.fn();
+      const pidToTrackedSession = new Map<number, any>([
+        [111, { startedBy: 'terminal', pid: 111, happySessionId: 'sess-1', processCommandHash: 'h1' }],
+      ]);
+      const waitForTrackedRunnersExit = vi.fn(async () => false);
+
+      const stop = createStopSession({
+        pidToTrackedSession,
+        waitForTrackedRunnersExit,
+        logWarning,
+        // The runner is alive, but after SIGSTOP its instance can no longer be read.
+        readProcessInstanceFingerprint: () => (signals.some(([, signal]) => signal === 'SIGSTOP') ? null : 'linux-proc:111'),
+      });
+      await expect(stop('sess-1', { exactRunner })).resolves.toEqual({ status: 'incomplete', reason: 'runner_signal_incomplete' });
+
+      const rootSignalsAfterGraceful = signals.filter(([pid]) => pid === 111).map(([, signal]) => signal);
+      expect(rootSignalsAfterGraceful).toEqual(['SIGTERM', 'SIGSTOP']);
+      expect(waitForTrackedRunnersExit).toHaveBeenCalledTimes(1);
+      expect(logWarning).toHaveBeenCalledWith(expect.stringMatching(/PID 111.*sess-1.*SIGSTOP|sess-1.*PID 111.*SIGSTOP/));
+      killSpy.mockRestore();
+    });
+
+    it('re-checks the exact instance immediately before a Windows taskkill', async () => {
+      await withProcessPlatform('win32', async () => {
+        vi.resetModules();
+        spawnSyncMock.mockReset();
+        spawnSyncMock.mockReturnValue({ status: 0, stdout: '', stderr: '' });
+        isPidSafeHappySessionProcess.mockReset();
+        isPidSafeHappySessionProcess.mockResolvedValue(true);
+        const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => {
+          throw new Error('process.kill should not run for Windows daemon children');
+        });
+        const { createStopSession } = await import('./stopSession');
+        const pidToTrackedSession = new Map<number, any>([
+          [111, {
+            startedBy: 'daemon',
+            pid: 111,
+            happySessionId: 'sess-1',
+            childProcess: { pid: 111, exitCode: null, signalCode: null, kill: vi.fn() },
+          }],
+        ]);
+
+        const stop = createStopSession({
+          pidToTrackedSession,
+          waitForTrackedRunnersExit: vi.fn(async () => true),
+          // The pid became another process during the helper's own safety await.
+          readProcessInstanceFingerprint: () => 'win32-cim:someone-else',
+        });
+        await expect(stop('sess-1', { exactRunner })).resolves.toEqual({ status: 'incomplete', reason: 'runner_signal_incomplete' });
+
+        expect(spawnSyncMock).not.toHaveBeenCalled();
+        killSpy.mockRestore();
+      });
+    });
+
+    it('runs a Windows taskkill when the exact instance still holds', async () => {
+      await withProcessPlatform('win32', async () => {
+        vi.resetModules();
+        spawnSyncMock.mockReset();
+        spawnSyncMock.mockReturnValue({ status: 0, stdout: '', stderr: '' });
+        isPidSafeHappySessionProcess.mockReset();
+        isPidSafeHappySessionProcess.mockResolvedValue(true);
+        const { createStopSession } = await import('./stopSession');
+        const pidToTrackedSession = new Map<number, any>([
+          [111, {
+            startedBy: 'daemon',
+            pid: 111,
+            happySessionId: 'sess-1',
+            childProcess: { pid: 111, exitCode: null, signalCode: null, kill: vi.fn() },
+          }],
+        ]);
+
+        const stop = createStopSession({
+          pidToTrackedSession,
+          waitForTrackedRunnersExit: vi.fn(async () => true),
+          readProcessInstanceFingerprint: () => 'linux-proc:111',
+        });
+        await expect(stop('sess-1', { exactRunner })).resolves.toEqual({ status: 'stopped' });
+
+        expect(spawnSyncMock).toHaveBeenCalledWith('taskkill', ['/F', '/T', '/PID', '111'], expect.objectContaining({ stdio: 'ignore' }));
+      });
+    });
+
+    it.each([
+      ['another tracked process also belongs to the session', [
+        [111, { startedBy: 'daemon', pid: 111, happySessionId: 'sess-1', childProcess: { pid: 111, kill: vi.fn() } }],
+        [222, { startedBy: 'terminal', pid: 222, happySessionId: 'sess-1' }],
+      ]],
+      ['the session is tracked under another pid', [
+        [333, { startedBy: 'daemon', pid: 333, happySessionId: 'sess-1', childProcess: { pid: 333, kill: vi.fn() } }],
+      ]],
+    ] as const)('signals nothing when %s', async (_label, entries) => {
+      const { createStopSession } = await import('./stopSession');
+      isPidSafeHappySessionProcess.mockReset();
+      isPidSafeHappySessionProcess.mockResolvedValue(true);
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true as any);
+      const pidToTrackedSession = new Map<number, any>(entries.map(([pid, tracked]) => [pid, { ...tracked }]));
+
+      const stop = createStopSession({ pidToTrackedSession, waitForTrackedRunnersExit: vi.fn(async () => true) });
+      await expect(stop('sess-1', { exactRunner })).resolves.toEqual({ status: 'incomplete', reason: 'runner_signal_incomplete' });
+
+      expect(killSpy).not.toHaveBeenCalled();
+      for (const tracked of pidToTrackedSession.values()) {
+        expect(tracked.stopRequestedAtMs).toBeUndefined();
+      }
       killSpy.mockRestore();
     });
   });

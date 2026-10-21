@@ -252,6 +252,54 @@ outside this admission contract: automatic same-tag create retry can unarchive a
 just-archived new session. Human terminal keystrokes are also outside the
 programmatic-input boundary.
 
+### Lost Pending publisher (maintained 0.2 source)
+
+A runner whose session socket receives `forbidden` from `pending-materialize-next`
+has lost publisher status for the session. It asks its connection supervisor for
+one reconnect, whose connect path reclaims publisher status. Until that reconnect
+reclaims publisher status, the wake capability RPC answers
+`pending_materialization_wake_unavailable` with `errorCode: 'publisher_recovering'`.
+If the reclaimed connection is still refused, or no reconnect reclaims publisher
+status within `HAPPIER_PENDING_PUBLISHER_RECOVERY_DEADLINE_MS` (default 120000),
+the runner stops materializing and answers `errorCode: 'publisher_lost'` with a
+`respondent` naming its own incarnation: machine id, pid, and the process-instance
+fingerprint that `readProcessInstanceFingerprintSync` reads for that pid. A later
+connection that claims publisher status clears that state.
+
+On Resume, the daemon replaces such a runner only when the respondent equals the
+one local process a Stop of the session would signal: the session's only tracked
+runner, on this daemon's machine, with the same pid and process instance. It then
+stops exactly that process and spawns only once the runner is proven absent. Stop
+checks the process instance again before every signal to the runner, including the
+graceful signal, the Windows `taskkill` and each signal of forced escalation across
+its waits. A check is not atomic with the signal that follows it: other work can
+run between them. Once the pid is gone or is positively another instance, the
+runner receives nothing further. If the runner was suspended for descendant enumeration
+and its instance then cannot be read, the read is retried briefly, and the runner
+is otherwise left suspended (never resumed or killed blind) and logged by pid.
+Descendants are signalled only from a process snapshot taken while the runner was
+verified both before and after it; those are still terminated, with SIGKILL for
+survivors, even after the runner later exits or stops matching. If the runner fails
+the check after the snapshot, no enumerated descendant is signalled. A fingerprint
+read under a different method (Linux falls back from `/proc` to `ps`) never counts
+as proof that the pid was reused, so a later Resume cannot treat a suspended runner
+read that way as gone. Any of
+these outcomes makes the Stop incomplete, so replacement does not spawn. The check
+and the signal are still separate system calls, so a pid reused at that instant is
+not excluded. A report from any other incarnation,
+or one without a complete respondent, fences Resume
+(`publisher_lost_respondent_unbound`), as does a session with several local
+runners, a wrapper process, or a runner known only from its lock
+(`publisher_lost_target_ambiguous`). Every other probe result, including a
+recovering, failed or missing one, keeps its previous adopt or fence decision.
+
+The relay is unchanged. The widened wake response is a runner-to-daemon seam. A
+daemon without this change parses `publisher_recovering` and `publisher_lost`
+(its strict schema rejects both the new codes and the `respondent` field) as a
+malformed response and fences Resume instead of adopting; it never replaces. A
+runner without this change never reports either code, so resident older runners
+that are already wedged still need a manual Stop before Resume.
+
 ## Migration history
 
 Migration source has a stricter authoring boundary than ordinary internal code:

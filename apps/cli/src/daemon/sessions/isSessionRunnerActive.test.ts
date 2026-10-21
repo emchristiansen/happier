@@ -14,6 +14,87 @@ describe('probeSessionRunnerServiceability', () => {
     })).toEqual({ action: 'wait_for_exit', reason: 'runtime_terminating' });
     expect(resolveSessionRunnerResumeDecision({ state: 'runner_absent' })).toEqual({ action: 'spawn' });
   });
+  describe('lost publisher replacement binding', () => {
+    const localRunner = { machineId: 'machine-1', pid: 456, processInstanceFingerprint: 'linux-proc:456' };
+    const probeLostPublisher = async (params: Readonly<{
+      respondent?: unknown;
+      tracked?: readonly TrackedSession[];
+      localMachineId?: string;
+      localFingerprint?: string | null;
+      lockPid?: number;
+    }> = {}) => await probeSessionRunnerServiceability({
+      sessionId: 'sess_1',
+      trackedSessions: params.tracked ?? [{ startedBy: 'daemon', pid: 456, happySessionId: 'sess_1' }],
+      localMachineId: 'localMachineId' in params ? params.localMachineId : 'machine-1',
+      readProcessRunState: async () => 'servable',
+      readSessionRunnerLockStatus: async () => (params.lockPid === undefined
+        ? { ok: false, reason: 'not_found' }
+        : { ok: true, lock: { pid: params.lockPid, sessionId: 'sess_1', acquiredAtMs: 1 } }),
+      getProcessCommandHash: async () => null,
+      getProcessInstanceFingerprint: (pid) => ('localFingerprint' in params ? params.localFingerprint ?? null : `linux-proc:${pid}`),
+      probeCapability: async () => (params.respondent === undefined
+        ? { state: 'recoverable_unservable', reason: 'publisher_lost_respondent_unbound' }
+        : { state: 'recoverable_unservable', reason: 'publisher_lost', respondent: params.respondent as typeof localRunner }),
+    });
+
+    it('replaces only the exact local runner that reported the loss, and names it as the Stop target', async () => {
+      const probe = await probeLostPublisher({ respondent: localRunner });
+      expect(resolveSessionRunnerResumeDecision(probe)).toEqual({
+        action: 'replace',
+        reason: 'publisher_lost',
+        target: localRunner,
+      });
+    });
+
+    it.each([
+      ['another pid', { ...localRunner, pid: 457 }],
+      ['another process instance', { ...localRunner, processInstanceFingerprint: 'linux-proc:999' }],
+      ['another machine', { ...localRunner, machineId: 'machine-2' }],
+    ])('fences a loss reported by %s', async (_label, respondent) => {
+      expect(resolveSessionRunnerResumeDecision(await probeLostPublisher({ respondent })))
+        .toEqual({ action: 'fence', reason: 'publisher_lost_respondent_unbound' });
+    });
+
+    it('fences a loss whose respondent did not identify itself', async () => {
+      expect(resolveSessionRunnerResumeDecision(await probeLostPublisher()))
+        .toEqual({ action: 'fence', reason: 'publisher_lost_respondent_unbound' });
+    });
+
+    it.each([
+      ['two tracked processes for the session', {
+        tracked: [
+          { startedBy: 'daemon', pid: 456, happySessionId: 'sess_1' },
+          { startedBy: 'terminal', pid: 789, happySessionId: 'sess_1' },
+        ],
+      }],
+      ['a tracked wrapper whose runner is another pid', {
+        tracked: [{ startedBy: 'daemon', pid: 456, sessionRunnerPid: 457, happySessionId: 'sess_1' }],
+      }],
+      ['a runner known only from its lock', { tracked: [], lockPid: 456 }],
+      ['an unreadable local process instance', { localFingerprint: null }],
+      ['an unknown local machine', { localMachineId: undefined }],
+    ] as const)('fences when Stop cannot name exactly the reporting process: %s', async (_label, extra) => {
+      expect(resolveSessionRunnerResumeDecision(await probeLostPublisher({ respondent: localRunner, ...extra })))
+        .toEqual({ action: 'fence', reason: 'publisher_lost_target_ambiguous' });
+    });
+  });
+
+  it('never replaces a runner that is healthy, unprobeable or still recovering', () => {
+    // A healthy runner is adopted, and an unprobeable one stays fenced; neither is replaced.
+    expect(resolveSessionRunnerResumeDecision({ state: 'runner_present', control: { state: 'servable' } })).toEqual({ action: 'adopt' });
+    expect(resolveSessionRunnerResumeDecision({
+      state: 'runner_present', control: { state: 'unknown', reason: 'rpc_failed' },
+    })).toEqual({ action: 'fence', reason: 'rpc_failed' });
+    expect(resolveSessionRunnerResumeDecision({
+      state: 'runner_present', control: { state: 'recoverable_unservable', reason: 'malformed_response' },
+    })).toEqual({ action: 'fence', reason: 'malformed_response' });
+    expect(resolveSessionRunnerResumeDecision({ state: 'runner_unknown', reason: 'runner_presence_unproven' }))
+      .toEqual({ action: 'fence', reason: 'runner_presence_unproven' });
+    // Before its recovery deadline the runner is neither adopted nor replaced.
+    expect(resolveSessionRunnerResumeDecision({
+      state: 'runner_present', control: { state: 'recoverable_unservable', reason: 'publisher_recovering' },
+    })).toEqual({ action: 'fence', reason: 'publisher_recovering' });
+  });
   it('does not claim serviceability from a live matching PID alone', async () => {
     const tracked: TrackedSession = { startedBy: 'daemon', pid: 456, happySessionId: 'sess_1' };
     await expect(probeSessionRunnerServiceability({

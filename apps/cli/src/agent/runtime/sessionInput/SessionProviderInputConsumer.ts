@@ -830,6 +830,8 @@ async function materializeNextPendingForDrain(
       stoppedReason: 'retryable_transport',
       ...(result.retryAfterMs === undefined ? {} : { retryAfterMs: result.retryAfterMs }),
     };
+    // Not a transport retry: the session client owns the one reconnect and its wake.
+    if (result.type === 'publisher_lost') return 'publisher_lost';
     return 'no_pending';
   } catch (error) {
     const result = readDrainErrorResult(error, opts);

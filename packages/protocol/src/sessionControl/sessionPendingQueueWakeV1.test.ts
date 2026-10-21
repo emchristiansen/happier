@@ -54,4 +54,51 @@ describe('session pending queue wake wire contracts', () => {
     expect(SessionPendingQueueWakeCapabilityResponseV1Schema.parse(response)).toEqual(response);
     expect(SessionPendingQueueWakeResponseV1Schema.parse(response)).toEqual(response);
   });
+
+  it('represents a runner that lost its pending publisher status, with the reporting incarnation', () => {
+    const response = {
+      ok: false as const,
+      error: 'pending_materialization_wake_unavailable' as const,
+      errorCode: 'publisher_lost' as const,
+      respondent: { machineId: 'machine-1', pid: 4242, processInstanceFingerprint: 'linux-proc:991' },
+    };
+    expect(SessionPendingQueueWakeCapabilityResponseV1Schema.parse(response)).toEqual(response);
+    expect(SessionPendingQueueWakeResponseV1Schema.parse(response)).toEqual(response);
+    // A runner that cannot identify itself still reports the loss; the daemon then cannot bind it.
+    const { respondent: _respondent, ...unbound } = response;
+    expect(SessionPendingQueueWakeCapabilityResponseV1Schema.parse(unbound)).toEqual(unbound);
+  });
+
+  it('rejects a partial or foreign-shaped reporting incarnation', () => {
+    const base = {
+      ok: false as const,
+      error: 'pending_materialization_wake_unavailable' as const,
+      errorCode: 'publisher_lost' as const,
+    };
+    for (const respondent of [
+      { machineId: 'machine-1', pid: 4242 },
+      { machineId: 'machine-1', processInstanceFingerprint: 'linux-proc:991' },
+      { machineId: '', pid: 4242, processInstanceFingerprint: 'linux-proc:991' },
+      { machineId: 'machine-1', pid: 0, processInstanceFingerprint: 'linux-proc:991' },
+      { machineId: 'machine-1', pid: 4242, processInstanceFingerprint: 'linux-proc:991', home: '/x' },
+    ]) {
+      expect(SessionPendingQueueWakeCapabilityResponseV1Schema.safeParse({ ...base, respondent }).success).toBe(false);
+    }
+    // Only a terminal loss names its respondent.
+    expect(SessionPendingQueueWakeCapabilityResponseV1Schema.safeParse({
+      ...base,
+      errorCode: 'runtime_terminating',
+      respondent: { machineId: 'machine-1', pid: 4242, processInstanceFingerprint: 'linux-proc:991' },
+    }).success).toBe(false);
+  });
+
+  it('represents a runner still recovering its publisher status distinctly from a lost one', () => {
+    const response = {
+      ok: false as const,
+      error: 'pending_materialization_wake_unavailable' as const,
+      errorCode: 'publisher_recovering' as const,
+    };
+    expect(SessionPendingQueueWakeCapabilityResponseV1Schema.parse(response)).toEqual(response);
+    expect(SessionPendingQueueWakeResponseV1Schema.parse(response)).toEqual(response);
+  });
 });
