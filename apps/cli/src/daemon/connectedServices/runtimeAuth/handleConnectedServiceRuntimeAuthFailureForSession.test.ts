@@ -10,7 +10,9 @@ import type { TrackedSession } from '@/daemon/types';
 import {
   authorizeConnectedServiceRuntimeAuthFailureSource,
   handleConnectedServiceRuntimeAuthFailureForSession,
+  type RegisteredRuntimeAuthFailureSourceResolution,
 } from './handleConnectedServiceRuntimeAuthFailureForSession';
+import { ConnectedServiceExactRuntimeSourceBindingUnavailableError } from './connectedServiceExactRuntimeSourceBindingUnavailableError';
 import { ConnectedServiceRuntimeAuthSwitchAttemptTracker } from './ConnectedServiceRuntimeAuthSwitchAttemptTracker';
 import type {
   ConnectedServiceSessionAuthSwitchCore,
@@ -165,11 +167,14 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
         recoveryAction: { kind: 'quota_recovery_required' },
       },
       resolveRegisteredRuntimeAuthFailureSource: () => ({
-        serviceId: 'openai-codex',
-        groupId: 'main',
-        profileId: 'work',
-        generation: 7,
-        credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+        status: 'bound',
+        binding: {
+          serviceId: 'openai-codex',
+          groupId: 'main',
+          profileId: 'work',
+          generation: 7,
+          credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+        },
       }),
       resolveCurrentRuntimeAuthFailureSource,
       runtimeAuthApply: exactLiveRuntimeIdentityCapability,
@@ -233,11 +238,14 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
         recoveryAction: { kind: 'quota_recovery_required' },
       },
       resolveRegisteredRuntimeAuthFailureSource: () => ({
-        serviceId: 'openai-codex',
-        groupId: 'main',
-        profileId: 'live-profile',
-        generation: 8,
-        credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb',
+        status: 'bound',
+        binding: {
+          serviceId: 'openai-codex',
+          groupId: 'main',
+          profileId: 'live-profile',
+          generation: 8,
+          credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb',
+        },
       }),
       resolveCurrentRuntimeAuthFailureSource,
       runtimeAuthApply: exactLiveRuntimeIdentityCapability,
@@ -282,11 +290,14 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
         source: 'structured_provider_error',
       },
       resolveRegisteredRuntimeAuthFailureSource: () => ({
-        serviceId: 'openai-codex',
-        groupId: 'main',
-        profileId: 'work',
-        generation: 8,
-        credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+        status: 'bound',
+        binding: {
+          serviceId: 'openai-codex',
+          groupId: 'main',
+          profileId: 'work',
+          generation: 8,
+          credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+        },
       }),
       resolveCurrentRuntimeAuthFailureSource,
       runtimeAuthApply: exactLiveRuntimeIdentityCapability,
@@ -338,11 +349,14 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
         source: 'structured_provider_error',
       },
       resolveRegisteredRuntimeAuthFailureSource: () => ({
-        serviceId: 'openai-codex',
-        groupId: 'main',
-        profileId: currentProfileId,
-        generation: 8,
-        credentialRevision: currentCredentialRevision,
+        status: 'bound',
+        binding: {
+          serviceId: 'openai-codex',
+          groupId: 'main',
+          profileId: currentProfileId,
+          generation: 8,
+          credentialRevision: currentCredentialRevision,
+        },
       }),
       resolveCurrentRuntimeAuthFailureSource,
       runtimeAuthApply: exactLiveRuntimeIdentityCapability,
@@ -385,11 +399,14 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
         recoveryAction: { kind: 'quota_recovery_required' },
       },
       resolveRegisteredRuntimeAuthFailureSource: () => ({
-        serviceId: 'openai-codex',
-        groupId: 'main',
-        profileId: 'work',
-        generation: 8,
-        credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb',
+        status: 'bound',
+        binding: {
+          serviceId: 'openai-codex',
+          groupId: 'main',
+          profileId: 'work',
+          generation: 8,
+          credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb',
+        },
       }),
       runtimeAuthApply: exactLiveRuntimeIdentityCapability,
       switchCoordinator: { switchAfterClassifiedFailure },
@@ -467,11 +484,14 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
         source: 'structured_provider_error',
       },
       resolveRegisteredRuntimeAuthFailureSource: () => ({
-        serviceId: 'openai-codex',
-        groupId: 'main',
-        profileId: 'live-profile',
-        generation: 8,
-        credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb',
+        status: 'bound',
+        binding: {
+          serviceId: 'openai-codex',
+          groupId: 'main',
+          profileId: 'live-profile',
+          generation: 8,
+          credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb',
+        },
       }),
       resolveCurrentRuntimeAuthFailureSource,
       runtimeAuthApply: exactLiveRuntimeIdentityCapability,
@@ -521,7 +541,7 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
       },
       resolveRegisteredRuntimeAuthFailureSource: () => {
         callOrder.push('registry');
-        return staleRegisteredBinding;
+        return { status: 'bound', binding: staleRegisteredBinding };
       },
       resolveCurrentRuntimeAuthFailureSource: async () => {
         callOrder.push('probe');
@@ -559,13 +579,167 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
         source: 'structured_provider_error',
       },
       resolveRegisteredRuntimeAuthFailureSource: () => ({
-        serviceId: 'openai-codex',
-        groupId: 'main',
-        profileId: 'live-profile',
-        generation: 8,
-        credentialRevision: null,
+        status: 'bound',
+        binding: {
+          serviceId: 'openai-codex',
+          groupId: 'main',
+          profileId: 'live-profile',
+          generation: 8,
+          credentialRevision: null,
+        },
       }),
     })).rejects.toThrow('temporarily unavailable');
+  });
+
+  describe('exact registered-binding rejection detail', () => {
+    const tracked = {
+      startedBy: 'daemon' as const,
+      happySessionId: 'sess_registered_binding_detail',
+      pid: 123,
+      spawnOptions: { directory: '/tmp/project' },
+    } satisfies TrackedSession;
+    const exactReport = {
+      kind: 'usage_limit',
+      serviceId: 'openai-codex',
+      profileId: 'work',
+      groupId: 'main',
+      groupGeneration: 7,
+      credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+      resetsAtMs: null,
+      planType: null,
+      rateLimits: null,
+      source: 'structured_provider_error',
+      recoveryAction: { kind: 'quota_recovery_required' },
+    } satisfies ConnectedServiceRuntimeFailureClassification;
+    const exactBinding = {
+      serviceId: 'openai-codex' as const,
+      groupId: 'main',
+      profileId: 'work',
+      generation: 7,
+      credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+    };
+
+    async function readRejection(
+      resolveRegisteredRuntimeAuthFailureSource:
+        | (() => RegisteredRuntimeAuthFailureSourceResolution)
+        | null,
+    ): Promise<ConnectedServiceExactRuntimeSourceBindingUnavailableError> {
+      const rejection = await authorizeConnectedServiceRuntimeAuthFailureSource({
+        getChildren: () => [tracked],
+        sessionId: tracked.happySessionId,
+        classification: exactReport,
+        resolveRegisteredRuntimeAuthFailureSource,
+        runtimeAuthApply: registryOnlyRuntimeAuthCapability,
+      }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(rejection).toBeInstanceOf(ConnectedServiceExactRuntimeSourceBindingUnavailableError);
+      const typedRejection = rejection as ConnectedServiceExactRuntimeSourceBindingUnavailableError;
+      // External watchers count this exact message, and existing diagnostics log the name.
+      expect(typedRejection.message).toBe('connected-service exact runtime source binding temporarily unavailable');
+      expect(typedRejection.name).toBe('Error');
+      return typedRejection;
+    }
+
+    it('reports an unregistered session', async () => {
+      const rejection = await readRejection(() => ({
+        status: 'absent',
+        reason: 'session_unregistered',
+        registeredServiceIds: [],
+      }));
+      expect(rejection.detail).toEqual({
+        kind: 'registered_binding_absent',
+        reason: 'session_unregistered',
+        serviceId: 'openai-codex',
+        registeredServiceIds: [],
+      });
+    });
+
+    it('reports a registered session without a binding for the reported service', async () => {
+      const rejection = await readRejection(() => ({
+        status: 'absent',
+        reason: 'service_unbound',
+        registeredServiceIds: ['claude-subscription'],
+      }));
+      expect(rejection.detail).toEqual({
+        kind: 'registered_binding_absent',
+        reason: 'service_unbound',
+        serviceId: 'openai-codex',
+        registeredServiceIds: ['claude-subscription'],
+      });
+    });
+
+    it('reports a missing registered-binding resolver', async () => {
+      const rejection = await readRejection(null);
+      expect(rejection.detail).toEqual({
+        kind: 'registered_binding_resolver_unavailable',
+        serviceId: 'openai-codex',
+      });
+    });
+
+    it.each([
+      {
+        name: 'a blank profile',
+        binding: { ...exactBinding, profileId: '  ' },
+        deficiencies: ['profile_id_blank'],
+        credentialRevisionPresent: true,
+      },
+      {
+        name: 'an absent credential revision',
+        binding: { ...exactBinding, credentialRevision: null },
+        deficiencies: ['credential_revision_absent'],
+        credentialRevisionPresent: false,
+      },
+      {
+        name: 'a group without a generation',
+        binding: { ...exactBinding, generation: null },
+        deficiencies: ['group_generation_absent'],
+        credentialRevisionPresent: true,
+      },
+      {
+        name: 'a generation without a group',
+        binding: { ...exactBinding, groupId: null },
+        deficiencies: ['group_id_absent'],
+        credentialRevisionPresent: true,
+      },
+      {
+        name: 'a blank profile and an absent credential revision together',
+        binding: { ...exactBinding, profileId: '', credentialRevision: null },
+        deficiencies: ['profile_id_blank', 'credential_revision_absent'],
+        credentialRevisionPresent: false,
+      },
+    ])('reports exactly which members are missing for $name', async ({
+      binding,
+      deficiencies,
+      credentialRevisionPresent,
+    }) => {
+      const rejection = await readRejection(() => ({ status: 'bound', binding }));
+      expect(rejection.detail).toEqual({
+        kind: 'registered_binding_not_exact',
+        serviceId: 'openai-codex',
+        deficiencies,
+        profileId: binding.profileId,
+        groupId: binding.groupId,
+        generation: binding.generation,
+        credentialRevisionPresent,
+        credentialRevision: binding.credentialRevision,
+      });
+    });
+
+    it('authorizes an exact registered binding that matches the report without throwing', async () => {
+      await expect(authorizeConnectedServiceRuntimeAuthFailureSource({
+        getChildren: () => [tracked],
+        sessionId: tracked.happySessionId,
+        classification: exactReport,
+        resolveRegisteredRuntimeAuthFailureSource: () => ({ status: 'bound', binding: exactBinding }),
+        runtimeAuthApply: registryOnlyRuntimeAuthCapability,
+      })).resolves.toEqual({
+        status: 'authorized',
+        tracked,
+        sourceBinding: exactBinding,
+      });
+    });
   });
 
   it('authorizes a modern non-group report from the registered live binding instead of stale spawn revision', async () => {
@@ -611,7 +785,7 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
         rateLimits: null,
         source: 'structured_provider_error',
       },
-      resolveRegisteredRuntimeAuthFailureSource: () => sourceBinding,
+      resolveRegisteredRuntimeAuthFailureSource: () => ({ status: 'bound', binding: sourceBinding }),
       resolveCurrentRuntimeAuthFailureSource,
       runtimeAuthApply: registryOnlyRuntimeAuthCapability,
     })).resolves.toEqual({
@@ -699,7 +873,7 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
         rateLimits: null,
         source: 'structured_provider_error',
       },
-      resolveRegisteredRuntimeAuthFailureSource: () => sourceBinding,
+      resolveRegisteredRuntimeAuthFailureSource: () => ({ status: 'bound', binding: sourceBinding }),
     })).resolves.toMatchObject({
       status: 'credential_refreshed',
     });
@@ -791,11 +965,14 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
         recoveryAction: { kind: 'quota_recovery_required' },
       },
       resolveRegisteredRuntimeAuthFailureSource: () => ({
-        serviceId: 'openai-codex',
-        groupId: 'main',
-        profileId: 'work',
-        generation: 7,
-        credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+        status: 'bound',
+        binding: {
+          serviceId: 'openai-codex',
+          groupId: 'main',
+          profileId: 'work',
+          generation: 7,
+          credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+        },
       }),
       resolveCurrentRuntimeAuthFailureSource,
       runtimeAuthApply: exactLiveRuntimeIdentityCapability,
@@ -888,11 +1065,14 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
         recoveryAction: { kind: 'quota_recovery_required' },
       },
       resolveRegisteredRuntimeAuthFailureSource: () => ({
-        serviceId: 'openai-codex',
-        groupId: 'main',
-        profileId: 'previous',
-        generation: 7,
-        credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+        status: 'bound',
+        binding: {
+          serviceId: 'openai-codex',
+          groupId: 'main',
+          profileId: 'previous',
+          generation: 7,
+          credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+        },
       }),
       resolveCurrentRuntimeAuthFailureSource,
       runtimeAuthApply: exactLiveRuntimeIdentityCapability,
@@ -948,11 +1128,14 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
         recoveryAction: { kind: 'quota_recovery_required' },
       },
       resolveRegisteredRuntimeAuthFailureSource: () => ({
-        serviceId: 'openai-codex',
-        groupId: 'main',
-        profileId: 'work',
-        generation: 7,
-        credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+        status: 'bound',
+        binding: {
+          serviceId: 'openai-codex',
+          groupId: 'main',
+          profileId: 'work',
+          generation: 7,
+          credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+        },
       }),
       resolveCurrentRuntimeAuthFailureSource,
       runtimeAuthApply: exactLiveRuntimeIdentityCapability,
@@ -993,11 +1176,14 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
         recoveryAction: { kind: 'quota_recovery_required' },
       },
       resolveRegisteredRuntimeAuthFailureSource: () => ({
-        serviceId: 'openai-codex',
-        groupId: 'main',
-        profileId: 'stale-registry',
-        generation: 7,
-        credentialRevision: 'csr_cccccccccccccccccccccc',
+        status: 'bound',
+        binding: {
+          serviceId: 'openai-codex',
+          groupId: 'main',
+          profileId: 'stale-registry',
+          generation: 7,
+          credentialRevision: 'csr_cccccccccccccccccccccc',
+        },
       }),
       resolveCurrentRuntimeAuthFailureSource: async () => ({
         serviceId: 'openai-codex',
@@ -1085,11 +1271,14 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
         recoveryAction: { kind: 'quota_recovery_required' },
       },
       resolveRegisteredRuntimeAuthFailureSource: () => ({
-        serviceId: 'openai-codex',
-        groupId: 'main',
-        profileId: 'current-group-profile',
-        generation: 8,
-        credentialRevision: 'csr_cccccccccccccccccccccc',
+        status: 'bound',
+        binding: {
+          serviceId: 'openai-codex',
+          groupId: 'main',
+          profileId: 'current-group-profile',
+          generation: 8,
+          credentialRevision: 'csr_cccccccccccccccccccccc',
+        },
       }),
       resolveCurrentRuntimeAuthFailureSource,
       runtimeAuthApply: providerOwnedBrokerRuntimeAuthCapability,
@@ -1274,11 +1463,14 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
       switchCoordinator: { switchAfterClassifiedFailure },
       credentialRefreshService: { refreshConnectedServiceCredentialForRuntimeAuthFailure },
       resolveRegisteredRuntimeAuthFailureSource: () => ({
-        serviceId: 'openai-codex',
-        groupId: 'main',
-        profileId: 'work',
-        generation: 7,
-        credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+        status: 'bound',
+        binding: {
+          serviceId: 'openai-codex',
+          groupId: 'main',
+          profileId: 'work',
+          generation: 7,
+          credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+        },
       }),
       resolveCurrentRuntimeAuthFailureSource: async () => null,
       runtimeAuthApply: exactLiveRuntimeIdentityCapability,
@@ -1359,11 +1551,14 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
     await handleConnectedServiceRuntimeAuthFailureForSession({
       getChildren: () => [tracked],
       resolveRegisteredRuntimeAuthFailureSource: () => ({
-        serviceId: 'openai-codex',
-        groupId: 'main',
-        profileId: 'work',
-        generation: 7,
-        credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+        status: 'bound',
+        binding: {
+          serviceId: 'openai-codex',
+          groupId: 'main',
+          profileId: 'work',
+          generation: 7,
+          credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+        },
       }),
       resolveCurrentRuntimeAuthFailureSource,
       runtimeAuthApply: exactLiveRuntimeIdentityCapability,
@@ -1407,11 +1602,14 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
       getChildren: () => [trackedSession],
       switchCoordinator: { switchAfterClassifiedFailure },
       resolveRegisteredRuntimeAuthFailureSource: () => ({
-        serviceId: 'gemini',
-        groupId: null,
-        profileId: 'work',
-        generation: null,
-        credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb',
+        status: 'bound',
+        binding: {
+          serviceId: 'gemini',
+          groupId: null,
+          profileId: 'work',
+          generation: null,
+          credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb',
+        },
       }),
       sessionId: 'sess_revision',
       switchesThisTurn: 0,
@@ -3213,11 +3411,14 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
       switchAttemptTracker,
       credentialRefreshService: { refreshConnectedServiceCredentialForRuntimeAuthFailure },
       resolveRegisteredRuntimeAuthFailureSource: () => ({
-        serviceId: 'claude-subscription',
-        groupId: null,
-        profileId: 'primary',
-        generation: null,
-        credentialRevision: currentRevision,
+        status: 'bound',
+        binding: {
+          serviceId: 'claude-subscription',
+          groupId: null,
+          profileId: 'primary',
+          generation: null,
+          credentialRevision: currentRevision,
+        },
       }),
       sessionId: trackedSession.happySessionId,
       switchesThisTurn: 0,

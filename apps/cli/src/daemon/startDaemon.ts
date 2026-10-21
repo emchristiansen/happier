@@ -5828,20 +5828,31 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         const resolveRegisteredRuntimeAuthFailureSourceForSession: NonNullable<
           Parameters<typeof authorizeConnectedServiceRuntimeAuthFailureSource>[0]['resolveRegisteredRuntimeAuthFailureSource']
         > = ({ sessionId: liveSessionId, classification: liveClassification }) => {
+          const runtimeTarget = connectedServiceRuntimeRegistry.getBySessionId(liveSessionId);
+          if (!runtimeTarget) {
+            return { status: 'absent', reason: 'session_unregistered', registeredServiceIds: [] };
+          }
           const serviceId = ConnectedServiceIdSchema.safeParse(liveClassification.serviceId);
-          if (!serviceId.success) return null;
-          const binding = connectedServiceRuntimeRegistry
-            .getBySessionId(liveSessionId)
-            ?.activeBindings.find((candidate) => candidate.serviceId === serviceId.data) ?? null;
-          return binding
-            ? {
-                serviceId: binding.serviceId,
-                groupId: binding.groupId,
-                profileId: binding.profileId,
-                generation: binding.generation,
-                credentialRevision: binding.credentialRevision,
-              }
+          const binding = serviceId.success
+            ? runtimeTarget.activeBindings.find((candidate) => candidate.serviceId === serviceId.data) ?? null
             : null;
+          if (!binding) {
+            return {
+              status: 'absent',
+              reason: 'service_unbound',
+              registeredServiceIds: runtimeTarget.activeBindings.map((candidate) => candidate.serviceId),
+            };
+          }
+          return {
+            status: 'bound',
+            binding: {
+              serviceId: binding.serviceId,
+              groupId: binding.groupId,
+              profileId: binding.profileId,
+              generation: binding.generation,
+              credentialRevision: binding.credentialRevision,
+            },
+          };
         };
         const resolveRuntimeAuthApplyForFailureSource = async (input: Readonly<{
           sessionId: string;

@@ -9,6 +9,7 @@ import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
 import {
   drainRuntimeAuthFailureReportOutboxItems,
   enqueueRuntimeAuthFailureReportOutboxItem,
+  peekRuntimeAuthFailureReportOutboxItems,
   readRuntimeAuthFailureReportOutboxItems,
   removeRuntimeAuthFailureReportOutboxItem,
   removeRuntimeAuthFailureReportOutboxItemsForSession,
@@ -403,6 +404,42 @@ describe('runtimeAuthFailureReportOutbox', () => {
       await expect(readRuntimeAuthFailureReportOutboxItems({ outboxDir })).resolves.toEqual([]);
       const quarantineFiles = await readdir(join(outboxDir, 'quarantine'));
       expect(quarantineFiles.some((entry) => entry.includes('report-invalid'))).toBe(true);
+    } finally {
+      await removeTempDir(outboxDir);
+    }
+  });
+
+  it('peeks queued reports oldest first without quarantining invalid JSON', async () => {
+    const outboxDir = await createTempDir('happier-runtime-auth-report-outbox-peek-');
+    try {
+      await enqueueRuntimeAuthFailureReportOutboxItem({
+        outboxDir,
+        report: {
+          reportId: 'runtime-auth-report:peek-newer',
+          sessionId: 'session-newer',
+          classification: classifiedFailure,
+        },
+        nowMs: () => 1_700_000_002_000,
+      });
+      await enqueueRuntimeAuthFailureReportOutboxItem({
+        outboxDir,
+        report: {
+          reportId: 'runtime-auth-report:peek-older',
+          sessionId: 'session-older',
+          classification: classifiedFailure,
+        },
+        nowMs: () => 1_700_000_001_000,
+      });
+      await writeFile(join(outboxDir, 'report-invalid.json'), '{ invalid json', 'utf8');
+
+      const items = await peekRuntimeAuthFailureReportOutboxItems({ outboxDir });
+      expect(items.map((item) => [item.reportId, item.createdAtMs])).toEqual([
+        ['runtime-auth-report:peek-older', 1_700_000_001_000],
+        ['runtime-auth-report:peek-newer', 1_700_000_002_000],
+      ]);
+      const entries = await readdir(outboxDir);
+      expect(entries).toContain('report-invalid.json');
+      expect(entries).not.toContain('quarantine');
     } finally {
       await removeTempDir(outboxDir);
     }

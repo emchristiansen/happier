@@ -118,6 +118,7 @@ import {
   applyAuthorizedRuntimeAuthFailureSourceBinding,
   type RuntimeAuthFailureSourceAuthorization,
 } from './connectedServices/runtimeAuth/handleConnectedServiceRuntimeAuthFailureForSession';
+import { readConnectedServiceExactRuntimeSourceBindingUnavailableDetail } from './connectedServices/runtimeAuth/connectedServiceExactRuntimeSourceBindingUnavailableError';
 import { sanitizeConnectedServiceDiagnosticString } from './connectedServices/diagnostics/sanitizeConnectedServiceDiagnosticString';
 import {
   buildRuntimeAuthRecoveryScheduledResult,
@@ -908,10 +909,12 @@ export function createDaemonControlApp({
         classification,
       });
     } catch (error) {
+      const exactSourceBindingRejection = readConnectedServiceExactRuntimeSourceBindingUnavailableDetail(error);
       logger.warn('[CONTROL SERVER] Connected-service runtime auth source verification unavailable', {
         sessionId,
         serviceId: classification.serviceId,
         error: readSafeDaemonControlErrorDiagnostic(error),
+        ...(exactSourceBindingRejection ? { exactSourceBindingRejection } : {}),
       });
       reply.code(503);
       return {
