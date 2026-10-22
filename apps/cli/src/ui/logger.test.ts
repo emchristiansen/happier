@@ -1,10 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createContext, runInContext } from 'node:vm';
 
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { createTempDirSync, removeTempDirSync } from '@/testkit/fs/tempDir';
+
+/**
+ * The removed constructor-time prune was fire-and-forget async fs work with no completion
+ * handle. Give any such work generous wall time to land before asserting nothing was removed.
+ */
+async function settleBackgroundFsWork(): Promise<void> {
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+}
 
 describe('logger', () => {
     const envKeys = ['DEBUG', 'HAPPIER_HOME_DIR', 'HAPPIER_LOG_LEVEL', 'HAPPIER_SESSION_LOG_KEEP_COUNT', 'HAPPIER_CRASHED_SESSION_LOG_KEEP_COUNT'] as const;
@@ -333,94 +341,36 @@ describe('logger', () => {
         });
     });
 
-    it('prunes session logs best-effort when constructing a session logger, leaving daemon logs alone', async () => {
-        process.env.HAPPIER_SESSION_LOG_KEEP_COUNT = '3';
-        const logsDir = join(tempDir, 'logs');
-        mkdirSync(logsDir, { recursive: true });
-        for (let index = 0; index < 6; index += 1) {
-            writeFileSync(
-                join(logsDir, `2026-06-30-10-${String(index).padStart(2, '0')}-00-pid-${910_000 + index}.log`),
-                `old session ${index}\n`,
-                'utf8',
-            );
-        }
-        writeFileSync(join(logsDir, '2026-06-30-09-00-00-pid-99-daemon.log'), 'daemon\n', 'utf8');
-
-        await import('@/ui/logger');
-
-        await vi.waitFor(() => {
-            const entries = readdirSync(logsDir);
-            const sessionLogs = entries.filter(file => file.endsWith('.log') && !file.endsWith('-daemon.log'));
-            expect(sessionLogs).toHaveLength(3);
-            expect(entries).toContain('2026-06-30-09-00-00-pid-99-daemon.log');
-        });
-    });
-
-    it('retains bounded non-zero crashed runner session logs outside the normal session log budget', async () => {
-        process.env.HAPPIER_SESSION_LOG_KEEP_COUNT = '3';
-        process.env.HAPPIER_CRASHED_SESSION_LOG_KEEP_COUNT = '1';
+    it('never prunes the logs dir when constructing a non-daemon logger, even for old dead-runner logs past every budget', async () => {
         const logsDir = join(tempDir, 'logs');
         const sessionExitDir = join(logsDir, 'session-exit');
         mkdirSync(sessionExitDir, { recursive: true });
-        for (let index = 1; index <= 7; index += 1) {
-            writeFileSync(
-                join(logsDir, `2026-06-30-10-${String(index).padStart(2, '0')}-00-pid-${920_000 + index}.log`),
-                `old session ${index}\n`,
-                'utf8',
-            );
+        const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+        const fixtures: string[] = [];
+        // 250 > DEFAULT_SESSION_LOG_KEEP_COUNT (200). Pids above Linux pid_max (2^22) and macOS
+        // PID_MAX can never be alive, so every fixture is an old, dead-runner session log.
+        for (let index = 0; index < 250; index += 1) {
+            const name = `2026-01-01-10-${String(Math.floor(index / 60)).padStart(2, '0')}-${String(index % 60).padStart(2, '0')}-pid-${4_200_000 + index}.log`;
+            writeFileSync(join(logsDir, name), `old session ${index}\n`, 'utf8');
+            utimesSync(join(logsDir, name), thirtyDaysAgo, thirtyDaysAgo);
+            fixtures.push(name);
         }
-        writeFileSync(
-            join(sessionExitDir, 'z-session-crashed-old-pid-3.json'),
-            JSON.stringify({ sessionId: 'crashed-old', pid: 920_003, observedAt: 10, reason: 'process-exited', code: 1 }),
-            'utf8',
-        );
-        writeFileSync(
-            join(sessionExitDir, 'a-session-crashed-new-pid-2.json'),
-            JSON.stringify({ sessionId: 'crashed-new', pid: 920_002, observedAt: 20, reason: 'process-exited', code: 1 }),
-            'utf8',
-        );
-        writeFileSync(
-            join(sessionExitDir, 'session-clean-pid-1.json'),
-            JSON.stringify({ sessionId: 'clean', pid: 920_001, reason: 'process-exited', code: 0 }),
-            'utf8',
-        );
-
-        await import('@/ui/logger');
-
-        await vi.waitFor(() => {
-            const sessionLogs = readdirSync(logsDir)
-                .filter(file => file.endsWith('.log') && !file.endsWith('-daemon.log'))
-                .sort();
-            expect(sessionLogs).toHaveLength(4);
-            expect(sessionLogs).toContain('2026-06-30-10-02-00-pid-920002.log');
-            expect(sessionLogs).not.toContain('2026-06-30-10-03-00-pid-920003.log');
-            expect(sessionLogs).not.toContain('2026-06-30-10-01-00-pid-920001.log');
-        });
-    });
-
-    it('retains a live runner log outside the normal session log budget', async () => {
-        process.env.HAPPIER_SESSION_LOG_KEEP_COUNT = '3';
-        const logsDir = join(tempDir, 'logs');
-        mkdirSync(logsDir, { recursive: true });
-        const liveRunnerLog = `2020-01-01-00-00-00-pid-${process.pid}.log`;
-        writeFileSync(join(logsDir, liveRunnerLog), 'live runner history\n', 'utf8');
-        for (let index = 1; index <= 7; index += 1) {
-            writeFileSync(
-                join(logsDir, `2026-06-30-10-${String(index).padStart(2, '0')}-00-pid-${900_000 + index}.log`),
-                `inactive session ${index}\n`,
-                'utf8',
-            );
+        for (let index = 0; index < 60; index += 1) {
+            const name = `2026-01-01-09-${String(index).padStart(2, '0')}-00-pid-${4_300_000 + index}-daemon.log`;
+            writeFileSync(join(logsDir, name), `old daemon ${index}\n`, 'utf8');
+            utimesSync(join(logsDir, name), thirtyDaysAgo, thirtyDaysAgo);
+            fixtures.push(name);
         }
 
-        await import('@/ui/logger');
+        const { logger } = (await import('@/ui/logger')) as typeof import('@/ui/logger');
+        logger.info('[TEST] session logger constructed');
+        logger.flushSync();
+        await settleBackgroundFsWork();
 
-        await vi.waitFor(() => {
-            const sessionLogs = readdirSync(logsDir)
-                .filter(file => file.endsWith('.log') && !file.endsWith('-daemon.log'))
-                .sort();
-            expect(sessionLogs).toHaveLength(4);
-            expect(sessionLogs).toContain(liveRunnerLog);
-        });
+        const entries = readdirSync(logsDir);
+        for (const fixture of fixtures) {
+            expect(entries).toContain(fixture);
+        }
     });
 
     it('registers process flush hooks only once across repeated logger module reloads', async () => {
