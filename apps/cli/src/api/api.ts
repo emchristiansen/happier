@@ -209,6 +209,7 @@ type ConnectedServiceProfileListResult = Readonly<{
     providerAccountId?: string | null;
     expiresAt?: number | null;
     lastUsedAt?: number | null;
+    health?: ConnectedServiceCredentialHealthV1 | null;
   }>;
 }>;
 
@@ -970,6 +971,10 @@ export class ApiClient {
         providerAccountId: z.string().nullable().optional(),
         expiresAt: z.number().nullable().optional(),
         lastUsedAt: z.number().nullable().optional(),
+        // Lenient on purpose: health is diagnostic, while this list also feeds spawn auth and
+        // quotas. A health shape this client does not know (the schema is strict, and a newer
+        // server may add a failure kind) drops that profile's health, never the whole list.
+        health: ConnectedServiceCredentialHealthV1Schema.nullable().optional().catch(undefined),
       }),
     ).safeParse((raw as any).profiles);
 

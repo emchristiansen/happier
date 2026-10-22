@@ -525,6 +525,65 @@ describe('ApiClient connected services v2', () => {
     });
   });
 
+  it('keeps each profile\'s credential health from the server and accepts profiles without health', async () => {
+    const health = {
+      v: 1,
+      status: 'refresh_failed_retryable',
+      reconnectRequired: false,
+      lastRefreshSuccessAt: 1_700_000_000_000,
+      lastRefreshFailureAt: 1_700_000_100_000,
+      lastRefreshFailureKind: 'network_error',
+      providerHttpStatus: 503,
+      providerErrorCode: 'overloaded',
+      lastRuntimeAuthFailureAt: 1_700_000_200_000,
+    };
+    mockGet.mockResolvedValue({
+      status: 200,
+      data: {
+        serviceId: 'openai-codex',
+        profiles: [
+          { profileId: 'unhealthy', status: 'refresh_failed_retryable', kind: 'oauth', health },
+          { profileId: 'null-health', status: 'connected', kind: 'oauth', health: null },
+          { profileId: 'no-health', status: 'connected', kind: 'oauth' },
+        ],
+      },
+    });
+
+    const api = await ApiClient.create(createTestCredentials());
+    const result = await api.listConnectedServiceProfiles({ serviceId: 'openai-codex' });
+
+    expect(result.profiles[0]?.health).toEqual(health);
+    expect(result.profiles[1]?.health).toBeNull();
+    expect(result.profiles[2]?.health).toBeUndefined();
+    expect(result.profiles.map((profile) => profile.profileId)).toEqual(['unhealthy', 'null-health', 'no-health']);
+  });
+
+  it('keeps the profile list when one profile\'s health has a shape this client does not know', async () => {
+    mockGet.mockResolvedValue({
+      status: 200,
+      data: {
+        serviceId: 'openai-codex',
+        profiles: [
+          {
+            profileId: 'newer-server',
+            status: 'needs_reauth',
+            kind: 'oauth',
+            health: { v: 1, status: 'needs_reauth', reconnectRequired: true, lastRefreshFailureKind: 'some_future_kind', futureField: 1 },
+          },
+          { profileId: 'plain', status: 'connected', kind: 'oauth', health: { v: 1, status: 'connected', reconnectRequired: false } },
+        ],
+      },
+    });
+
+    const api = await ApiClient.create(createTestCredentials());
+    const result = await api.listConnectedServiceProfiles({ serviceId: 'openai-codex' });
+
+    expect(result.profiles).toHaveLength(2);
+    expect(result.profiles[0]).toMatchObject({ profileId: 'newer-server', status: 'needs_reauth' });
+    expect(result.profiles[0]?.health).toBeUndefined();
+    expect(result.profiles[1]?.health).toEqual({ v: 1, status: 'connected', reconnectRequired: false });
+  });
+
   it('shares concurrent and fresh connected-service profile list requests', async () => {
     let resolveProfiles: ((value: unknown) => void) | undefined;
     mockGet.mockReturnValueOnce(new Promise((resolve) => {

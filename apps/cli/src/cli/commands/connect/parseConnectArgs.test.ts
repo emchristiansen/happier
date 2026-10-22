@@ -29,4 +29,29 @@ describe('parseConnectArgs', () => {
     const res = parseConnectArgs(['github', '--token']);
     expect(res.options.token).toBe(true);
   });
+
+  describe('profileFlag', () => {
+    it('is absent without --profile', () => {
+      expect(parseConnectArgs(['status']).profileFlag).toEqual({ kind: 'absent' });
+    });
+
+    it('carries the exact value given to --profile', () => {
+      const res = parseConnectArgs(['status', '--profile', 'work']);
+      expect(res.subcommand).toBe('status');
+      expect(res.profileFlag).toEqual({ kind: 'value', profileId: 'work' });
+    });
+
+    it.each([
+      ['no value follows', ['status', '--profile']],
+      ['the value is empty', ['status', '--profile', '']],
+      ['the value is blank', ['status', '--profile', '   ']],
+      ['another flag follows', ['status', '--profile', '--all']],
+    ])('reports a missing value when %s', (_case, args) => {
+      expect(parseConnectArgs(args).profileFlag).toEqual({ kind: 'missing_value' });
+    });
+
+    it('leaves the connect <target> default profile unchanged', () => {
+      expect(parseConnectArgs(['codex', '--profile']).options.profileId).toBe('default');
+    });
+  });
 });
