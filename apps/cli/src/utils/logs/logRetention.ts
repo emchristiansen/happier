@@ -8,8 +8,9 @@
  * `daemonLogRetention.ts`):
  *
  * - Daemon logs (`*-daemon.log`): keep the newest {@link DEFAULT_DAEMON_LOG_KEEP_COUNT} by name,
- *   plus the running daemon's own log. A daemon log is created once per daemon start, so
- *   repeating this hourly removes nothing the startup pass would not.
+ *   plus the running daemon's own log. This runs at startup and hourly. New daemon logs can
+ *   appear between passes: another daemon sharing the home, or a process the argv classifier
+ *   names daemon-like for log naming (such as `daemon start --help`), creates its own.
  * - Session logs (all other `*.log`), by age plus count (see `sweepSessionLogs.ts`). A session
  *   log is deleted only when ALL of these hold:
  *   a. its writer pid (from `-pid-<n>.log`) is known and dead; a name without a pid is kept;
