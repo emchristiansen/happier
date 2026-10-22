@@ -10,6 +10,7 @@ import type { CommandContext } from '@/cli/commandRegistry';
 import { buildConnectedAccountOauthCredentialRecord } from '@/daemon/connectedServices/descriptors/buildConnectedAccountCredentialRecord';
 import { githubConnectedAccountTarget } from '@/daemon/connectedServices/github/githubConnectedAccountTarget';
 import { parseConnectArgs, type ConnectParsedOptions } from './connect/parseConnectArgs';
+import { formatConnectStatusLines, type ConnectStatusServiceListing, type ConnectStatusVendor } from './connect/formatConnectStatus';
 import { resolveConnectAuthIntent } from './connect/resolveConnectAuthIntent';
 import { resolveConnectTargetServiceIds } from './connect/resolveConnectTargetServiceIds';
 import { storeConnectedServiceCredentialForAccount } from '@/cloud/connectedServices/storeConnectedServiceCredentialForAccount';
@@ -23,7 +24,7 @@ import { storeConnectedServiceCredentialForAccount } from '@/cloud/connectedServ
  * - connect gemini: Store Gemini OAuth (gemini)
  */
 export async function handleConnectCommand(args: string[]): Promise<void> {
-    const { includeExperimental, subcommand, options } = parseConnectArgs(args);
+    const { includeExperimental, subcommand, profileFlag, options } = parseConnectArgs(args);
 
     const allTargets = await loadConnectTargets({ includeExperimental: true });
     const visibleTargets = includeExperimental ? allTargets : allTargets.filter((t) => t.status === 'wired');
@@ -38,7 +39,14 @@ export async function handleConnectCommand(args: string[]): Promise<void> {
 
     const normalized = subcommand.toLowerCase();
     if (normalized === 'status') {
-      await handleConnectStatus(visibleTargets);
+      if (profileFlag.kind === 'missing_value') {
+        console.error(chalk.red('Missing value for --profile.'));
+        console.error('Usage: happier connect status --profile <id>');
+        process.exit(1);
+      }
+      await handleConnectStatus(visibleTargets, {
+        profileFilter: profileFlag.kind === 'value' ? profileFlag.profileId : null,
+      });
       return;
     }
 
@@ -77,7 +85,8 @@ ${chalk.bold('happier connect')} - Connect AI vendor subscriptions and API keys 
 
 ${chalk.bold('Usage:')}
 ${targetLines}
-  happier connect status       Show connection status for all vendors
+  happier connect status       Show every stored profile and its health, per vendor
+  happier connect status --profile <id>        Show only profiles with this id
   happier connect help         Show this help message
   happier connect --all ...    Include experimental providers
   happier connect <target> --profile <id>      Store under a specific profile (default: default)
@@ -99,6 +108,7 @@ ${chalk.bold('Description:')}
 ${chalk.bold('Examples:')}
   happier connect ${targets[0]?.id ?? 'gemini'}
   happier connect status
+  happier connect status --profile work
 
 ${chalk.bold('Notes:')} 
   • You must be authenticated with Happier first (run 'happier auth login')
@@ -192,9 +202,12 @@ async function handleConnectVendor(target: CloudConnectTarget, options: ConnectP
 }
 
 /**
- * Show connection status for all vendors
+ * Show every profile of every vendor's connected services, or only those with `profileFilter`.
  */
-async function handleConnectStatus(targets: ReadonlyArray<CloudConnectTarget>): Promise<void> {
+async function handleConnectStatus(
+    targets: ReadonlyArray<CloudConnectTarget>,
+    params: Readonly<{ profileFilter: string | null }>,
+): Promise<void> {
     console.log(chalk.bold('\n🔌 Connection Status\n'));
 
     // Check if authenticated
@@ -208,39 +221,38 @@ async function handleConnectStatus(targets: ReadonlyArray<CloudConnectTarget>): 
     // Create API client
     const api = await ApiClient.create(credentials);
 
+    const vendors: ConnectStatusVendor[] = [];
     for (const target of targets) {
+      let serviceIds: ConnectedServiceId[];
       try {
-        const serviceIds: ConnectedServiceId[] = resolveConnectTargetServiceIds(target.id);
-
-        if (serviceIds.length === 0) {
-          console.log(`  ${chalk.gray('○')}  ${target.vendorDisplayName}: ${chalk.gray('not supported')}`);
-          continue;
-        }
-
-        const allProfiles = (await Promise.all(serviceIds.map(async (serviceId) => {
-          const { profiles } = await api.listConnectedServiceProfiles({ serviceId });
-          return profiles;
-        }))).flat();
-
-        const connected = allProfiles.filter((p) => p.status === 'connected');
-        if (connected.length === 0) {
-          const needsReauth = allProfiles.length > 0;
-          const label = needsReauth ? 'needs re-auth' : 'not connected';
-          const icon = needsReauth ? chalk.yellow('⚠️') : chalk.gray('○');
-          const color = needsReauth ? chalk.yellow(label) : chalk.gray(label);
-          console.log(`  ${icon}  ${target.vendorDisplayName}: ${color}`);
-          continue;
-        }
-
-        const primary = connected[0]!;
-        const userInfo = primary.providerEmail ? chalk.gray(` (${primary.providerEmail})`) : '';
-        console.log(`  ${chalk.green('✓')}  ${target.vendorDisplayName}: ${chalk.green('connected')}${userInfo}`);
+        serviceIds = resolveConnectTargetServiceIds(target.id);
       } catch (error) {
         if (process.env.DEBUG) {
-          console.error(chalk.gray(`[debug] failed to check ${target.vendorDisplayName} connection:`), error);
+          console.error(chalk.gray(`[debug] failed to resolve ${target.vendorDisplayName} services:`), error);
         }
-        console.log(`  ${chalk.yellow('?')}  ${target.vendorDisplayName}: ${chalk.yellow('unknown (check failed)')}`);
+        vendors.push({ vendorDisplayName: target.vendorDisplayName, kind: 'unresolved' });
+        continue;
       }
+      if (serviceIds.length === 0) {
+        vendors.push({ vendorDisplayName: target.vendorDisplayName, kind: 'unsupported' });
+        continue;
+      }
+      const services = await Promise.all(serviceIds.map(async (serviceId): Promise<ConnectStatusServiceListing> => {
+        try {
+          const { profiles } = await api.listConnectedServiceProfiles({ serviceId });
+          return { serviceId, outcome: 'listed', profiles };
+        } catch (error) {
+          if (process.env.DEBUG) {
+            console.error(chalk.gray(`[debug] failed to check ${target.vendorDisplayName} (${serviceId}) connection:`), error);
+          }
+          return { serviceId, outcome: 'failed' };
+        }
+      }));
+      vendors.push({ vendorDisplayName: target.vendorDisplayName, kind: 'services', services });
+    }
+
+    for (const line of formatConnectStatusLines({ vendors, profileFilter: params.profileFilter })) {
+      console.log(line);
     }
 
     console.log('');
