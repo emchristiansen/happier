@@ -46,6 +46,9 @@ describe('parseConnectArgs', () => {
       ['the value is empty', ['status', '--profile', '']],
       ['the value is blank', ['status', '--profile', '   ']],
       ['another flag follows', ['status', '--profile', '--all']],
+      ['a long flag follows', ['status', '--profile', '--json']],
+      ['a short help flag follows', ['status', '--profile', '-h']],
+      ['another short flag follows', ['status', '--profile', '-x']],
     ])('reports a missing value when %s', (_case, args) => {
       expect(parseConnectArgs(args).profileFlag).toEqual({ kind: 'missing_value' });
     });

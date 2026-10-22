@@ -11,9 +11,11 @@ export type ConnectParsedOptions = Readonly<{
 }>;
 
 /**
- * What `--profile` said, as given: absent, present without a usable value (nothing, blank, or
- * another flag in its place), or an exact profile id. `options.profileId` keeps its connect
- * <target> meaning, where anything but a value falls back to `default`.
+ * What `--profile` said, as given: absent, present without a usable value (nothing, blank, or a
+ * token starting with `-`, such as `-h` or `--json`, in its place), or an exact profile id.
+ * Profile ids start with a letter or digit, so no valid id is refused. `options.profileId` keeps
+ * its connect <target> meaning unchanged: the trimmed next token, or `default` when that is
+ * absent or blank.
  */
 export type ConnectProfileFlag =
   | Readonly<{ kind: 'absent' }>
@@ -39,7 +41,7 @@ export function parseConnectArgs(args: ReadonlyArray<string>): Readonly<{
   const profileId = profileFlagIdx !== -1 ? String(args[profileFlagIdx + 1] ?? '').trim() : '';
   const profileFlag: ConnectProfileFlag = profileFlagIdx === -1
     ? { kind: 'absent' }
-    : profileId && !profileId.startsWith('--')
+    : profileId && !profileId.startsWith('-')
       ? { kind: 'value', profileId }
       : { kind: 'missing_value' };
 

@@ -21,6 +21,10 @@ function captureConsole(): Readonly<{ out: () => string[]; err: () => string[]; 
   return { out: () => out, err: () => err, restore: () => { log.mockRestore(); error.mockRestore(); } };
 }
 
+// Each test imports the connect command afresh (after vi.resetModules), which loads a large module
+// graph; on a loaded host that cold import alone has taken close to the 30 s default.
+const CONNECT_IMPORT_TIMEOUT_MS = 120_000;
+
 describe('happier connect status', () => {
   const envKeys = ['HAPPIER_HOME_DIR', 'HAPPIER_SERVER_URL', 'HAPPIER_LOCAL_SERVER_URL', 'HAPPIER_VARIANT', 'DEBUG'] as const;
   let envScope = createEnvKeyScope(envKeys);
@@ -49,6 +53,8 @@ describe('happier connect status', () => {
   it.each([
     ['--profile has no value', ['status', '--profile']],
     ['--profile is empty', ['status', '--profile', '']],
+    ['--profile is followed by a short flag', ['status', '--profile', '-h']],
+    ['--profile is followed by a long flag', ['status', '--profile', '--json']],
   ])('exits 1 with a usage error when %s, before any status work', async (_case, args) => {
     const consoleCapture = captureConsole();
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((code): never => {
@@ -63,7 +69,7 @@ describe('happier connect status', () => {
       exitSpy.mockRestore();
       consoleCapture.restore();
     }
-  });
+  }, CONNECT_IMPORT_TIMEOUT_MS);
 
   it('lists every profile the server returns, with health, and filters by --profile', async () => {
     const app = fastify({ logger: false });
@@ -138,5 +144,5 @@ describe('happier connect status', () => {
       restoreAxios();
       await app.close();
     }
-  });
+  }, CONNECT_IMPORT_TIMEOUT_MS);
 });
