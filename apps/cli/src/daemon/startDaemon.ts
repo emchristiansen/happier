@@ -410,8 +410,8 @@ import { commitConnectedServiceQuotaLifecycleSessionEvents } from './connectedSe
 import { ConnectedServiceGroupHomeCleanupScheduler } from './connectedServices/homes/ConnectedServiceGroupHomeCleanupScheduler';
 import { ConnectedServiceMaterializedHomeCleanupScheduler } from './connectedServices/materialize/cleanup/ConnectedServiceMaterializedHomeCleanupScheduler';
 import { startConnectedServiceMaterializedHomeCleanupLoop } from './connectedServices/materialize/cleanup/startConnectedServiceMaterializedHomeCleanupLoop';
-import { startSessionLogRetentionLoop, type SessionLogRetentionLoopHandle } from './logs/startSessionLogRetentionLoop';
-import { sweepSessionLogs } from '@/utils/logs/sweepSessionLogs';
+import { startLogRetentionLoop, type LogRetentionLoopHandle } from './logs/startLogRetentionLoop';
+import { runDaemonLogRetention } from '@/utils/logs/daemonLogRetention';
 import { isConnectedServiceAuthGroupUnavailableError } from '@/api/connectedServices/connectedServiceCredentialApi';
 import {
   ConnectedServiceCredentialRecordV1Schema,
@@ -2111,7 +2111,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         stop: () => void;
         trigger: () => void;
       }> | null = null;
-      let sessionLogRetentionLoopHandle: SessionLogRetentionLoopHandle | null = null;
+      let logRetentionLoopHandle: LogRetentionLoopHandle | null = null;
       let daemonServerWorkOnline = true;
       const daemonServerWorkScheduler: DaemonServerWorkScheduler = createDaemonServerWorkScheduler({
         budget: createDaemonServerWorkBudget({
@@ -2822,14 +2822,19 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           logger.debug('[DAEMON RUN] Connected-service group home startup reconciliation failed (non-fatal)', error);
         });
         connectedServiceMaterializedHomeCleanupLoopHandle?.trigger();
-        // Only the daemon prunes session logs (utils/logs/logRetention.ts): once now, then hourly.
-        sessionLogRetentionLoopHandle = startSessionLogRetentionLoop({
-          sweep: async () => await sweepSessionLogs({
-            logsDir: configuration.logsDir,
-            protectedPaths: [logger.getLogPath()],
-          }),
+        // Only the running daemon prunes the logs dir (utils/logs/logRetention.ts): once now, then hourly.
+        logRetentionLoopHandle = startLogRetentionLoop({
+          runRetention: async () => {
+            const result = await runDaemonLogRetention({
+              logsDir: configuration.logsDir,
+              currentLogPath: logger.getLogPath(),
+            });
+            if (result.sessionLogs.outcome === 'skipped') {
+              logger.debug('[DAEMON RUN] Session log sweep deleted nothing this pass', result);
+            }
+          },
           onTickError: (error) => {
-            logger.debug('[DAEMON RUN] Session log retention sweep failed (non-fatal)', error);
+            logger.debug('[DAEMON RUN] Log retention pass failed (non-fatal)', error);
           },
         });
         if (shouldUseSystemdUserSessionResourceGovernor({ platform: process.platform, startupSource })) {
@@ -8873,9 +8878,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         connectedServiceMaterializedHomeCleanupLoopHandle.stop();
         connectedServiceMaterializedHomeCleanupLoopHandle = null;
       }
-      if (sessionLogRetentionLoopHandle) {
-        sessionLogRetentionLoopHandle.stop();
-        sessionLogRetentionLoopHandle = null;
+      if (logRetentionLoopHandle) {
+        logRetentionLoopHandle.stop();
+        logRetentionLoopHandle = null;
       }
       connectedServiceQuotasCoordinator?.dispose();
       connectedServiceQuotasCoordinator = null;

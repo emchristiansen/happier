@@ -7,7 +7,7 @@ import {
   DEFAULT_SESSION_LOG_KEEP_COUNT,
   DEFAULT_SESSION_LOG_MIN_AGE_DAYS,
   LOG_FILE_SUFFIX,
-  SESSION_LOG_SWEEP_INTERVAL_MS,
+  LOG_RETENTION_INTERVAL_MS,
   resolveCrashedSessionLogKeepCount,
   resolveDaemonLogKeepCount,
   resolveSessionLogKeepCount,
@@ -52,7 +52,7 @@ describe('logRetention', () => {
     expect(resolveSessionLogMinAgeMs({ HAPPIER_SESSION_LOG_MIN_AGE_DAYS: '0' })).toBe(0);
   });
 
-  it('sweeps session logs hourly', () => {
-    expect(SESSION_LOG_SWEEP_INTERVAL_MS).toBe(60 * 60 * 1000);
+  it('runs the retention pass hourly', () => {
+    expect(LOG_RETENTION_INTERVAL_MS).toBe(60 * 60 * 1000);
   });
 });

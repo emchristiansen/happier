@@ -53,7 +53,7 @@ describe('sweepSessionLogs', () => {
       // Ordinary dead, old, out-of-budget logs: deleted.
       const deletedA = sessionLogName(1, deadPid(1));
       const deletedB = sessionLogName(2, deadPid(2));
-      // No parseable pid: judged on age, budget and crash only, so deleted when old.
+      // No parseable pid: the writer is unknown, so (a) cannot hold and it is kept even when old.
       const noPidOld = '2026-01-01-09-00-00-legacy.log';
       // No parseable pid but recent: kept.
       const noPidRecent = '2026-01-01-09-01-00-legacy.log';
@@ -73,6 +73,7 @@ describe('sweepSessionLogs', () => {
       const result = await sweepSessionLogs({ logsDir, env });
 
       expect(await listLogs(logsDir)).toEqual([
+        noPidOld,
         noPidRecent,
         recent,
         live,
@@ -81,16 +82,24 @@ describe('sweepSessionLogs', () => {
         newestA,
         daemonLog,
       ].sort());
-      expect(result).toEqual({ deleted: 5 });
+      expect(result).toEqual({ outcome: 'swept', deleted: 4 });
     });
   });
 
   // The four delete conditions are joined by AND. Each case below fails exactly one of them for the
   // variant log while a control log fails none, so an OR anywhere in the rule deletes the variant.
+  // Condition (a) fails two ways: a live writer, and a writer that cannot be identified.
   describe.each([
     {
       condition: '(a) its writer is alive',
       variant: sessionLogName(2, process.pid),
+      ageMs: 30 * DAY_MS,
+      env: { HAPPIER_SESSION_LOG_KEEP_COUNT: '0' },
+      crashReportPid: null,
+    },
+    {
+      condition: "(a') its writer is unknown",
+      variant: '2026-01-01-10-02-00-legacy.log',
       ageMs: 30 * DAY_MS,
       env: { HAPPIER_SESSION_LOG_KEEP_COUNT: '0' },
       crashReportPid: null,
@@ -129,7 +138,7 @@ describe('sweepSessionLogs', () => {
         const result = await sweepSessionLogs({ logsDir, env });
 
         expect(await listLogs(logsDir)).toEqual([variant]);
-        expect(result).toEqual({ deleted: 1 });
+        expect(result).toEqual({ outcome: 'swept', deleted: 1 });
       });
     });
   });
@@ -204,7 +213,7 @@ describe('sweepSessionLogs', () => {
 
   it('never throws when the logs dir is missing', async () => {
     await withTempDir('happier-cli-sweep-session-logs-missing-', async (root) => {
-      await expect(sweepSessionLogs({ logsDir: join(root, 'absent'), env: {} })).resolves.toEqual({ deleted: 0 });
+      await expect(sweepSessionLogs({ logsDir: join(root, 'absent'), env: {} })).resolves.toEqual({ outcome: 'swept', deleted: 0 });
     });
   });
 });

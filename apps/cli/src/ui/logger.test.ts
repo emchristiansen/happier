@@ -318,27 +318,26 @@ describe('logger', () => {
         }
     });
 
-    it('prunes daemon logs best-effort when constructing a daemon logger', async () => {
-        process.argv = ['node', 'happier', 'daemon', 'start'];
+    it('never prunes the logs dir when constructing a logger with daemon argv: the running daemon trims from its retention loop', async () => {
+        process.argv = ['node', 'happier', 'daemon', 'start-sync'];
         const logsDir = join(tempDir, 'logs');
         mkdirSync(logsDir, { recursive: true });
-        for (let index = 0; index < 52; index += 1) {
-            writeFileSync(
-                join(logsDir, `2026-06-30-10-${String(index).padStart(2, '0')}-00-pid-${index}-daemon.log`),
-                `old ${index}\n`,
-                'utf8',
-            );
+        const fixtures: string[] = [];
+        // 60 > DEFAULT_DAEMON_LOG_KEEP_COUNT (50).
+        for (let index = 0; index < 60; index += 1) {
+            const name = `2026-06-30-10-${String(index).padStart(2, '0')}-00-pid-${4_300_000 + index}-daemon.log`;
+            writeFileSync(join(logsDir, name), `old ${index}\n`, 'utf8');
+            fixtures.push(name);
         }
 
         const { logger } = (await import('@/ui/logger')) as typeof import('@/ui/logger');
         logger.debug('[TEST] current daemon log');
         logger.flushSync();
+        await settleBackgroundFsWork();
 
-        await vi.waitFor(() => {
-            const daemonLogs = readdirSync(logsDir).filter(file => file.endsWith('-daemon.log'));
-            expect(daemonLogs).toHaveLength(50);
-            expect(daemonLogs).toContain(logger.getLogPath().split('/').pop());
-        });
+        const entries = readdirSync(logsDir);
+        expect(fixtures.filter(fixture => !entries.includes(fixture))).toEqual([]);
+        expect(entries).toContain(logger.getLogPath().split('/').pop());
     });
 
     it('never prunes the logs dir when constructing a non-daemon logger, even for old dead-runner logs past every budget', async () => {

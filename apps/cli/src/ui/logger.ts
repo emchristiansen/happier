@@ -11,17 +11,12 @@
 
 import chalk from 'chalk'
 import { configuration } from '@/configuration'
-import { appendFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { existsSync, readdirSync, statSync } from 'node:fs'
+import { basename, join } from 'node:path'
 import { inspect } from 'node:util'
 import { redactBugReportSensitiveText } from '@happier-dev/protocol'
 import { writeConsoleErrorBestEffort, writeConsoleLogBestEffort } from '@/utils/writeConsoleBestEffort'
-import { pruneLogsByCount } from '@/utils/logs/pruneLogsByCount'
-import {
-  DAEMON_LOG_SUFFIX,
-  LOG_FILE_SUFFIX,
-  resolveDaemonLogKeepCount,
-} from '@/utils/logs/logRetention'
+import { DAEMON_LOG_SUFFIX, LOG_FILE_SUFFIX } from '@/utils/logs/logRetention'
 import { BufferedFileAppender } from './logFileAppender'
 import { isFileLogLevelEnabled, resolveFileLogLevel, type FileLogLevel } from './logFileLevel'
 // Note: readDaemonState is imported lazily inside listDaemonLogFiles() to avoid
@@ -155,31 +150,6 @@ function getSessionLogPath(): string {
   return join(configuration.logsDir, filename)
 }
 
-async function pruneDaemonLogsForCurrentLogger(logFilePath: string): Promise<void> {
-  try {
-    mkdirSync(dirname(logFilePath), { recursive: true })
-    appendFileSync(logFilePath, '')
-  } catch {
-    // Best-effort pruning only.
-  }
-  await pruneLogsByCount({
-    dir: configuration.logsDir,
-    suffix: DAEMON_LOG_SUFFIX,
-    keepCount: resolveDaemonLogKeepCount(),
-    keepPath: logFilePath,
-  }).catch(() => ({ pruned: 0 }))
-}
-
-/**
- * Only the daemon prunes the logs dir (see utils/logs/logRetention.ts). A daemon logger trims old
- * daemon logs here; session logs are swept by the daemon's retention loop, never by the process
- * that happens to start, so no runner, `session send`, `--help` or status call deletes anything.
- */
-function pruneLogsForCurrentLogger(logFilePath: string): void {
-  if (!configuration.isDaemonProcess) return
-  void pruneDaemonLogsForCurrentLogger(logFilePath)
-}
-
 type LoggerFlushHookState = {
   registered: boolean
   flushers: Set<() => void>
@@ -232,7 +202,8 @@ class Logger {
   constructor(
     public readonly logFilePath = getSessionLogPath()
   ) {
-    pruneLogsForCurrentLogger(this.logFilePath)
+    // Constructing a logger never deletes anything: only the running daemon prunes the logs dir,
+    // from its retention loop (see utils/logs/logRetention.ts).
 
     this.fileLogLevel = resolveFileLogLevel({ env: process.env, isDaemonProcess: configuration.isDaemonProcess })
     this.debugFileEnabled = isFileLogLevelEnabled(this.fileLogLevel, 'debug')
