@@ -202,6 +202,24 @@ describe('formatConnectStatusLines', () => {
     ]);
   });
 
+  it('says that health is not shown when the server sent a shape this client does not recognise', () => {
+    const lines = format([{
+      vendorDisplayName: 'Claude',
+      kind: 'services',
+      services: [{
+        serviceId: 'claude-subscription',
+        outcome: 'listed',
+        profiles: [{ profileId: 'p', status: 'needs_reauth', healthUnrecognised: true }],
+      }],
+    }]);
+
+    expect(lines).toEqual([
+      '  ⚠️  Claude',
+      '      claude-subscription/p: needs_reauth',
+      '        health: not shown (the server sent a shape this client does not recognise)',
+    ]);
+  });
+
   describe('with a profile filter', () => {
     const vendors: ConnectStatusVendor[] = [
       {

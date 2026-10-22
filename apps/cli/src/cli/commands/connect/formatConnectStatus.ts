@@ -14,6 +14,7 @@ export type ConnectStatusProfile = Readonly<{
   providerEmail?: string | null;
   expiresAt?: number | null;
   health?: ConnectedServiceCredentialHealthV1 | null;
+  healthUnrecognised?: true;
 }>;
 
 /** One service id's profile list, or the fact that it could not be fetched. */
@@ -51,6 +52,9 @@ function formatProfileDetails(profile: ConnectStatusProfile): string[] {
   if (profile.providerEmail) details.push(`email: ${profile.providerEmail}`);
   if (typeof profile.expiresAt === 'number') details.push(`expires at: ${formatUtc(profile.expiresAt)}`);
   const health = profile.health;
+  if (profile.healthUnrecognised) {
+    details.push('health: not shown (the server sent a shape this client does not recognise)');
+  }
   if (health) {
     details.push(`health: ${health.status}`);
     details.push(`reconnect required: ${health.reconnectRequired ? 'yes' : 'no'}`);

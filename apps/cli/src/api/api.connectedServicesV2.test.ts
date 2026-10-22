@@ -581,7 +581,9 @@ describe('ApiClient connected services v2', () => {
     expect(result.profiles).toHaveLength(2);
     expect(result.profiles[0]).toMatchObject({ profileId: 'newer-server', status: 'needs_reauth' });
     expect(result.profiles[0]?.health).toBeUndefined();
+    expect(result.profiles[0]?.healthUnrecognised).toBe(true);
     expect(result.profiles[1]?.health).toEqual({ v: 1, status: 'connected', reconnectRequired: false });
+    expect(result.profiles[1]?.healthUnrecognised).toBeUndefined();
   });
 
   it('shares concurrent and fresh connected-service profile list requests', async () => {
