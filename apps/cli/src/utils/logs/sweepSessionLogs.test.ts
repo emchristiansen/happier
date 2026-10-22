@@ -85,6 +85,55 @@ describe('sweepSessionLogs', () => {
     });
   });
 
+  // The four delete conditions are joined by AND. Each case below fails exactly one of them for the
+  // variant log while a control log fails none, so an OR anywhere in the rule deletes the variant.
+  describe.each([
+    {
+      condition: '(a) its writer is alive',
+      variant: sessionLogName(2, process.pid),
+      ageMs: 30 * DAY_MS,
+      env: { HAPPIER_SESSION_LOG_KEEP_COUNT: '0' },
+      crashReportPid: null,
+    },
+    {
+      condition: '(b) it is younger than the minimum age',
+      variant: sessionLogName(2, deadPid(2)),
+      ageMs: 1 * DAY_MS,
+      env: { HAPPIER_SESSION_LOG_KEEP_COUNT: '0' },
+      crashReportPid: null,
+    },
+    {
+      condition: '(c) it is among the newest session logs by name',
+      variant: sessionLogName(59, deadPid(59)),
+      ageMs: 30 * DAY_MS,
+      env: { HAPPIER_SESSION_LOG_KEEP_COUNT: '1' },
+      crashReportPid: null,
+    },
+    {
+      condition: '(d) it is a kept crashed-runner log',
+      variant: sessionLogName(2, deadPid(2)),
+      ageMs: 30 * DAY_MS,
+      env: { HAPPIER_SESSION_LOG_KEEP_COUNT: '0', HAPPIER_CRASHED_SESSION_LOG_KEEP_COUNT: '1' },
+      crashReportPid: deadPid(2),
+    },
+  ])('when only $condition', ({ variant, ageMs, env, crashReportPid }) => {
+    it('keeps that log and deletes a control log that meets every delete condition', async () => {
+      await withTempDir('happier-cli-sweep-session-logs-single-', async (logsDir) => {
+        const control = sessionLogName(1, deadPid(1));
+        await writeLog(logsDir, control, 30 * DAY_MS);
+        await writeLog(logsDir, variant, ageMs);
+        if (crashReportPid !== null) {
+          await writeExitReport(logsDir, 'crash.json', { pid: crashReportPid, observedAt: 1, code: 1 });
+        }
+
+        const result = await sweepSessionLogs({ logsDir, env });
+
+        expect(await listLogs(logsDir)).toEqual([variant]);
+        expect(result).toEqual({ deleted: 1 });
+      });
+    });
+  });
+
   it('never deletes a protected path, such as the daemon current log', async () => {
     await withTempDir('happier-cli-sweep-session-logs-protected-', async (logsDir) => {
       const protectedLog = sessionLogName(1, deadPid(1));
