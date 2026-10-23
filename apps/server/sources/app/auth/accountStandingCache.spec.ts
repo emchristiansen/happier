@@ -162,7 +162,8 @@ describe("createAccountStandingCache", () => {
         const h = harness();
         const beforeWrite = deferred();
         h.setNextResult(() => beforeWrite.promise);
-        const stale = h.resolve("a");
+        // The caller that started the read keeps its own result, exactly as an uncached read racing the write would.
+        const starter = h.resolve("a");
 
         h.cache.invalidate("a");
         const afterWrite = deferred();
@@ -171,13 +172,107 @@ describe("createAccountStandingCache", () => {
         expect(h.reads).toEqual(["a", "a"]);
 
         beforeWrite.resolve({ kind: "active" });
-        await expect(stale).resolves.toEqual({ kind: "active" });
+        await expect(starter).resolves.toEqual({ kind: "active" });
         afterWrite.resolve({ kind: "disabled" });
         await expect(fresh).resolves.toEqual({ kind: "disabled" });
 
         h.setNextResult(async () => ({ kind: "disabled" }));
         await expect(h.resolve("a")).resolves.toEqual({ kind: "disabled" });
         expect(h.reads).toEqual(["a", "a", "a"]);
+    });
+
+    it("makes a caller that joined a read before invalidation read again instead of taking the old result", async () => {
+        const h = harness();
+        const beforeWrite = deferred();
+        h.setNextResult(() => beforeWrite.promise);
+        const starter = h.resolve("a");
+        h.setNow(1_000);
+        const joiner = h.resolve("a");
+
+        h.cache.invalidate("a");
+        h.setNextResult(async () => ({ kind: "disabled" }));
+        beforeWrite.resolve({ kind: "active" });
+
+        await expect(starter).resolves.toEqual({ kind: "active" });
+        await expect(joiner).resolves.toEqual({ kind: "disabled" });
+        expect(h.reads).toEqual(["a", "a"]);
+    });
+
+    it("makes a caller that joined a read read again when the read settles at or after the bound", async () => {
+        const h = harness();
+        const slow = deferred();
+        h.setNextResult(() => slow.promise);
+        const starter = h.resolve("a");
+        h.setNow(TTL_MS - 1_000);
+        const joiner = h.resolve("a");
+
+        h.setNow(TTL_MS);
+        h.setNextResult(async () => ({ kind: "disabled" }));
+        slow.resolve({ kind: "active" });
+
+        await expect(starter).resolves.toEqual({ kind: "active" });
+        await expect(joiner).resolves.toEqual({ kind: "disabled" });
+        expect(h.reads).toEqual(["a", "a"]);
+    });
+
+    it("lets a joined caller take a result that settles just inside the bound", async () => {
+        const h = harness();
+        const slow = deferred();
+        h.setNextResult(() => slow.promise);
+        const starter = h.resolve("a");
+        h.setNow(TTL_MS - 1_000);
+        const joiner = h.resolve("a");
+
+        h.setNow(TTL_MS - 1);
+        slow.resolve({ kind: "disabled" });
+
+        await expect(starter).resolves.toEqual({ kind: "disabled" });
+        await expect(joiner).resolves.toEqual({ kind: "disabled" });
+        expect(h.reads).toEqual(["a"]);
+    });
+
+    it("passes a current shared rejection to joined callers, but rereads for them after invalidation", async () => {
+        const current = harness();
+        const failing = deferred();
+        current.setNextResult(() => failing.promise);
+        const starter = current.resolve("a");
+        const joiner = current.resolve("a");
+        failing.reject(new Error("boom"));
+        await expect(starter).rejects.toThrow("boom");
+        await expect(joiner).rejects.toThrow("boom");
+        expect(current.reads).toEqual(["a"]);
+
+        const detached = harness();
+        const failingBeforeWrite = deferred();
+        detached.setNextResult(() => failingBeforeWrite.promise);
+        const detachedStarter = detached.resolve("a");
+        const detachedJoiner = detached.resolve("a");
+        detached.cache.invalidate("a");
+        detached.setNextResult(async () => ({ kind: "active" }));
+        failingBeforeWrite.reject(new Error("boom"));
+        await expect(detachedStarter).rejects.toThrow("boom");
+        await expect(detachedJoiner).resolves.toEqual({ kind: "active" });
+        expect(detached.reads).toEqual(["a", "a"]);
+    });
+
+    it("rereads for a joined caller at most once", async () => {
+        const h = harness();
+        const first = deferred();
+        h.setNextResult(() => first.promise);
+        const starter = h.resolve("a");
+        const joiner = h.resolve("a");
+
+        const second = deferred();
+        h.setNextResult(() => second.promise);
+        h.cache.invalidate("a");
+        first.resolve({ kind: "active" });
+        await expect(starter).resolves.toEqual({ kind: "active" });
+
+        // The joiner now owns the second read; invalidating again does not send it round a third time.
+        h.cache.invalidate("a");
+        second.resolve({ kind: "disabled" });
+        await expect(joiner).resolves.toEqual({ kind: "disabled" });
+        expect(h.reads).toEqual(["a", "a"]);
     });
 
     it("invalidating one account leaves the others cached", async () => {

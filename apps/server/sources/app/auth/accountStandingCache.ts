@@ -1,15 +1,24 @@
 import type { AccountStanding } from "@/app/auth/accountStanding";
 
 /**
- * Staleness bound for a cached "active" standing.
+ * Staleness bound for a shared account standing.
  *
- * Every login-eligibility decision that uses this cache rests on an account read that started at most
- * this long before the decision, and after the most recent in-process `invalidate` of that account.
- * Writes made by another server process (multi-replica deployments) take effect within this bound.
+ * A standing this cache hands to a caller that did not read it itself comes from a read that started less than
+ * this long before the hand-over, and that no in-process `invalidate` of the account detached in the meantime:
+ * - a remembered "active" standing is returned only before its read's start + bound;
+ * - a caller that joined another caller's read accepts that read's result only if, when it settles, it is still
+ *   before start + bound and not detached; otherwise the joiner performs one read of its own instead.
+ * A caller that started a read always receives that read's own result, as an uncached lookup would; a write that
+ * commits while that read is in flight may or may not be seen, exactly as in the uncached code.
+ * Writes made by another server process (multi-replica deployments) are not invalidated here; a caller is handed
+ * a standing that predates such a write only if that standing's read started less than this long before.
  */
 export const ACCOUNT_STANDING_CACHE_TTL_MS = 10_000;
 
-/** Upper bound on remembered accounts; beyond it the least recently used account is forgotten. */
+/**
+ * Upper bound on remembered "active" standings; beyond it the least recently used is forgotten. Reads in flight
+ * are tracked separately, one per account with an outstanding read, and only until they settle or are detached.
+ */
 export const ACCOUNT_STANDING_CACHE_MAX_ENTRIES = 4_096;
 
 export interface AccountStandingCacheOptions {
@@ -21,15 +30,15 @@ export interface AccountStandingCacheOptions {
 
 export interface AccountStandingCache {
     /**
-     * Returns the account's standing, reading it with `read` unless an "active" standing read within the bound
-     * is remembered. Concurrent callers share one read that started within the bound. Only "active" is ever
-     * remembered: not-found, disabled, unavailable and rejected reads are returned to the callers that shared
-     * that read and then forgotten.
+     * Returns the account's standing, under the contract stated on `ACCOUNT_STANDING_CACHE_TTL_MS`. Only "active"
+     * is ever remembered: not-found, disabled, unavailable and rejected reads go only to the callers of that read
+     * (subject to the same joiner check) and are then forgotten.
      */
     resolve(accountId: string, read: (accountId: string) => Promise<AccountStanding>): Promise<AccountStanding>;
     /**
-     * Forgets the account and detaches any read in flight for it, so that read is never remembered and later
-     * callers start a new one. Call after every in-process write that can end an account's active standing.
+     * Forgets the account and detaches any read in flight for it: that read is never remembered, callers that had
+     * joined it read again, and later callers start a new read. Call after every in-process write that can end an
+     * account's active standing (including writes that fail ambiguously).
      */
     invalidate(accountId: string): void;
     /** Number of remembered active accounts. */
@@ -39,7 +48,13 @@ export interface AccountStandingCache {
 interface InFlightRead {
     readonly startedAtMs: number;
     readonly standing: Promise<AccountStanding>;
+    /** Set by `invalidate` while the read is in flight. */
+    detached: boolean;
 }
+
+type SettledRead =
+    | { readonly ok: true; readonly standing: AccountStanding }
+    | { readonly ok: false; readonly error: unknown };
 
 const ACTIVE: AccountStanding = Object.freeze({ kind: "active" });
 
@@ -75,12 +90,12 @@ export function createAccountStandingCache(options: AccountStandingCacheOptions)
         read: (accountId: string) => Promise<AccountStanding>,
         startedAtMs: number,
     ): Promise<AccountStanding> {
-        const entry: InFlightRead = { startedAtMs, standing: read(accountId) };
+        const entry: InFlightRead = { startedAtMs, standing: read(accountId), detached: false };
         inFlight.set(accountId, entry);
         try {
             const standing = await entry.standing;
             const expiresAtMs = entry.startedAtMs + ttlMs;
-            // An entry no longer registered was invalidated (or superseded by a newer read) while in flight.
+            // An entry no longer registered was detached by `invalidate` or superseded by a newer read.
             if (standing.kind === "active" && inFlight.get(accountId) === entry && now() < expiresAtMs) {
                 remember(accountId, expiresAtMs);
             }
@@ -107,14 +122,27 @@ export function createAccountStandingCache(options: AccountStandingCacheOptions)
 
             const pending = inFlight.get(accountId);
             if (pending && nowMs - pending.startedAtMs < ttlMs) {
-                return await pending.standing;
+                const settled: SettledRead = await pending.standing.then(
+                    (standing) => ({ ok: true, standing }),
+                    (error: unknown) => ({ ok: false, error }),
+                );
+                if (!pending.detached && now() < pending.startedAtMs + ttlMs) {
+                    if (settled.ok) return settled.standing;
+                    throw settled.error;
+                }
+                // The joined read went stale while this caller waited: read once more, as its own reader.
+                return await startRead(accountId, read, now());
             }
 
             return await startRead(accountId, read, nowMs);
         },
         invalidate(accountId) {
             activeUntilMs.delete(accountId);
-            inFlight.delete(accountId);
+            const pending = inFlight.get(accountId);
+            if (pending) {
+                pending.detached = true;
+                inFlight.delete(accountId);
+            }
         },
         get size() {
             return activeUntilMs.size;
