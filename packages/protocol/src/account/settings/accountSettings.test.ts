@@ -651,6 +651,8 @@ describe('accountSettings', () => {
     expect(isActionEnabledByActionsSettings('session.permission.respond' as any, settings, { surface: 'session_agent' } as any)).toBe(false);
     expect(isActionEnabledByActionsSettings('session.user_action.answer' as any, settings, { surface: 'session_agent' } as any)).toBe(false);
     expect(isActionEnabledByActionsSettings('session.usageLimit.consumeResetCredit' as any, settings, { surface: 'session_agent' } as any)).toBe(false);
+    expect(isActionEnabledByActionsSettings('session.pendingInput.markHandled' as any, settings, { surface: 'session_agent' } as any)).toBe(false);
+    expect(isActionEnabledByActionsSettings('session.pendingInput.markHandled' as any, settings, { surface: 'cli' } as any)).toBe(true);
 
     // Spawn, coordination, reads, and useful runtime mutations are allowed by default.
     expect(isActionEnabledByActionsSettings('session.spawn_new' as any, settings, { surface: 'session_agent' } as any)).toBe(true);

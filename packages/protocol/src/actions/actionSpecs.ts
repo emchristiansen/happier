@@ -25,6 +25,7 @@ import {
 } from '../sessionWorkState/sessionWorkStateRpc.js';
 import { SessionTerminalComposerClearRequestV1Schema } from '../sessionControl/sessionTerminalComposerClearV1.js';
 import { SessionPendingInputInterruptAndRunRequestV1Schema } from '../sessionControl/sessionPendingInputInterruptAndRunV1.js';
+import { SessionPendingInputMarkHandledRequestV1Schema } from '../sessionControl/sessionPendingInputMarkHandledV1.js';
 import { PendingRequestedActionV1Schema } from '../sessionMessages/pendingRequestedActionV1.js';
 import { SessionWorkStateStatusV1Schema } from '../sessionWorkState/sessionWorkStateV1.js';
 import { STRUCTURED_QUESTION_LIMITS } from '../tools/structuredQuestionAnswersV1.js';
@@ -2634,6 +2635,48 @@ export const ACTION_SPECS: readonly ActionSpec[] = Object.freeze([
       ],
     },
     inputSchema: SessionPendingInputInterruptAndRunRequestV1Schema,
+  },
+  {
+    id: 'session.pendingInput.markHandled',
+    title: 'Mark pending input handled',
+    description: 'Resolve one pending input as handled after its delivery was proven elsewhere. Refuses unless the row is in the expected delivery state, posts once, and returns a readback receipt that never claims delivery.',
+    safety: 'danger',
+    approval: APPROVAL_RESULT_REQUIRED,
+    placements: [],
+    surfaces: {
+      ui_button: false,
+      ui_slash_command: false,
+      voice_tool: false,
+      voice_action_block: false,
+      session_agent: false,
+      mcp: false,
+      cli: true,
+    },
+    inputHints: {
+      title: 'Mark pending input handled',
+      fields: [
+        { path: 'sessionId', title: 'Session id', widget: 'text', required: true },
+        { path: 'localId', title: 'Pending message local id', widget: 'text', required: true },
+        {
+          path: 'expectedDeliveryState',
+          title: 'Expected delivery state',
+          widget: 'select',
+          required: true,
+          options: [
+            { value: 'delivering', label: 'Delivering' },
+            { value: 'external_handoff', label: 'External handoff' },
+            { value: 'blocked', label: 'Blocked' },
+          ],
+        },
+        {
+          path: 'expectedBlockedReason',
+          title: 'Expected blocked reason',
+          widget: 'text',
+          visibleWhen: { op: 'eq', path: 'expectedDeliveryState', value: 'blocked' },
+        },
+      ],
+    },
+    inputSchema: SessionPendingInputMarkHandledRequestV1Schema,
   },
   {
     id: 'session.usageLimit.waitResume.enable',
