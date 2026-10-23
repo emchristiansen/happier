@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
 import { captureConsoleJsonOutput, captureConsoleText } from '@/testkit/logger/captureOutput';
+import { SessionControlEnvelopeErrorSchema } from '@happier-dev/protocol';
 
 type RecordedRequest = Readonly<{ method: string; pathname: string; search: URLSearchParams; body: unknown }>;
 
@@ -258,6 +259,7 @@ describe('happier session set-folder (integration)', () => {
 
     expect(parsed.ok).toBe(false);
     expect(parsed.error).toEqual({ code: 'session_not_found', details: { serverError: 'Session not found' } });
+    expect(SessionControlEnvelopeErrorSchema.safeParse(parsed).success).toBe(true);
     expect(folderAssignmentRequests().map((request) => request.method)).toEqual(['PUT']);
   });
 
@@ -276,6 +278,7 @@ describe('happier session set-folder (integration)', () => {
         details: { sessionId, folderId: 'folder_missing', serverError: 'invalid-session-folder-assignment' },
       },
     });
+    expect(SessionControlEnvelopeErrorSchema.safeParse(parsed).success).toBe(true);
     expect(process.exitCode).toBe(1);
     expect(folderAssignmentRequests().map((request) => request.method)).toEqual(['PUT']);
   });
@@ -288,6 +291,7 @@ describe('happier session set-folder (integration)', () => {
     expect(parsed.ok).toBe(false);
     expect(parsed.error.code).toBe('unsupported');
     expect(parsed.error.details).toEqual({ serverError: 'not_found' });
+    expect(SessionControlEnvelopeErrorSchema.safeParse(parsed).success).toBe(true);
   });
 
   it('fails with readback_mismatch when the server reports a different folder after the write', async () => {
@@ -306,6 +310,7 @@ describe('happier session set-folder (integration)', () => {
         readbackFolderId: 'folder_other',
       },
     });
+    expect(SessionControlEnvelopeErrorSchema.safeParse(parsed).success).toBe(true);
     expect(process.exitCode).toBe(1);
   });
 

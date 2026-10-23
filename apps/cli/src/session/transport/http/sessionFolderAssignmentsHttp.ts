@@ -2,6 +2,8 @@ import axios from 'axios';
 import {
   SessionOrganizationSnapshotResponseSchema,
   SetSessionFolderAssignmentResponseSchema,
+  type SessionOrganizationFolder,
+  type SessionOrganizationSnapshot,
   type SetSessionFolderAssignmentResponse,
 } from '@happier-dev/protocol';
 
@@ -80,23 +82,20 @@ export async function putSessionFolderAssignment(params: Readonly<{
   return { ok: true, assignment: parsed.data };
 }
 
+type SessionOrganizationSnapshotReadResult =
+  | Readonly<{ ok: true; snapshot: SessionOrganizationSnapshot }>
+  | Readonly<{ ok: false; code: 'unsupported'; serverError: string | null }>;
+
 /**
- * Reads one session's folder assignment through the scoped organization snapshot, the same query
- * the app uses (`assignmentSessionIds=<id>` with folders, tags and labels excluded). A session with
- * no assignment row is in no folder, reported as `null`.
+ * `GET /v2/session-organization` with the given query. A 404 means the server does not serve the
+ * organization snapshot at all (it predates session organization).
  */
-export async function fetchSessionFolderAssignment(params: Readonly<{
+async function getSessionOrganizationSnapshot(params: Readonly<{
   token: string;
-  sessionId: string;
-}>): Promise<Readonly<{ sessionId: string; folderId: string | null }>> {
+  query: URLSearchParams;
+}>): Promise<SessionOrganizationSnapshotReadResult> {
   const serverUrl = resolveServerHttpBaseUrl();
-  const query = new URLSearchParams({
-    includeFolders: 'false',
-    includeTags: 'false',
-    includeLabels: 'false',
-    assignmentSessionIds: params.sessionId,
-  });
-  const path = `${SESSION_ORGANIZATION_ROUTE}?${query.toString()}`;
+  const path = `${SESSION_ORGANIZATION_ROUTE}?${params.query.toString()}`;
   const response = await axios.get(`${serverUrl}${path}`, {
     headers: authHeaders(params.token),
     timeout: configuration.sessionControlHttpTimeoutMs,
@@ -106,6 +105,9 @@ export async function fetchSessionFolderAssignment(params: Readonly<{
   if (isAuthenticationStatus(response.status)) {
     throw createHttpStatusError(response.status, `Unauthorized (${response.status})`, 'not_authenticated');
   }
+  if (response.status === 404) {
+    return { ok: false, code: 'unsupported', serverError: readServerError(response.data) };
+  }
   if (response.status !== 200) {
     throw createHttpStatusError(response.status, `Unexpected status from GET ${SESSION_ORGANIZATION_ROUTE}: ${response.status}`);
   }
@@ -114,9 +116,72 @@ export async function fetchSessionFolderAssignment(params: Readonly<{
   if (!parsed.success) {
     throw new Error(`Unexpected GET ${SESSION_ORGANIZATION_ROUTE} response shape`);
   }
-  const matches = parsed.data.snapshot.folderAssignments.filter((assignment) => assignment.sessionId === params.sessionId);
+  return { ok: true, snapshot: parsed.data.snapshot };
+}
+
+function readSingleFolderAssignment(
+  snapshot: SessionOrganizationSnapshot,
+  sessionId: string,
+): string | null {
+  const matches = snapshot.folderAssignments.filter((assignment) => assignment.sessionId === sessionId);
   if (matches.length > 1) {
     throw new Error(`GET ${SESSION_ORGANIZATION_ROUTE} returned ${matches.length} folder assignments for one session`);
   }
-  return { sessionId: params.sessionId, folderId: matches[0]?.folderId ?? null };
+  return matches[0]?.folderId ?? null;
+}
+
+/**
+ * Reads one session's folder assignment through the scoped organization snapshot, the same query
+ * the app uses (`assignmentSessionIds=<id>` with folders, tags and labels excluded). A session with
+ * no assignment row is in no folder, reported as `null`.
+ */
+export async function fetchSessionFolderAssignment(params: Readonly<{
+  token: string;
+  sessionId: string;
+}>): Promise<Readonly<{ sessionId: string; folderId: string | null }>> {
+  const query = new URLSearchParams({
+    includeFolders: 'false',
+    includeTags: 'false',
+    includeLabels: 'false',
+    assignmentSessionIds: params.sessionId,
+  });
+  const result = await getSessionOrganizationSnapshot({ token: params.token, query });
+  if (!result.ok) {
+    throw createHttpStatusError(404, `Unexpected status from GET ${SESSION_ORGANIZATION_ROUTE}: 404`);
+  }
+  return { sessionId: params.sessionId, folderId: readSingleFolderAssignment(result.snapshot, params.sessionId) };
+}
+
+export type FetchSessionOrganizationFoldersResult =
+  | Readonly<{
+    ok: true;
+    folders: readonly SessionOrganizationFolder[];
+    session: Readonly<{ sessionId: string; folderId: string | null }> | null;
+  }>
+  | Readonly<{ ok: false; code: 'unsupported'; serverError: string | null }>;
+
+/**
+ * Reads the account's active folders (the snapshot excludes archived ones) and, when `sessionId` is
+ * given, that session's folder assignment, in one snapshot request with tags and labels excluded.
+ * Folder display envelopes are returned as the server stores them; opening them is the caller's job.
+ */
+export async function fetchSessionOrganizationFolders(params: Readonly<{
+  token: string;
+  sessionId: string | null;
+}>): Promise<FetchSessionOrganizationFoldersResult> {
+  const query = new URLSearchParams({
+    includeFolders: 'true',
+    includeTags: 'false',
+    includeLabels: 'false',
+    ...(params.sessionId !== null ? { assignmentSessionIds: params.sessionId } : {}),
+  });
+  const result = await getSessionOrganizationSnapshot({ token: params.token, query });
+  if (!result.ok) return result;
+  return {
+    ok: true,
+    folders: result.snapshot.folders,
+    session: params.sessionId === null
+      ? null
+      : { sessionId: params.sessionId, folderId: readSingleFolderAssignment(result.snapshot, params.sessionId) },
+  };
 }
