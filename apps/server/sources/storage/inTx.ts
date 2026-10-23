@@ -3,6 +3,7 @@ import { delay } from "@/utils/runtime/delay";
 import { db } from "@/storage/db";
 import { getDbProviderFromEnv, isPrismaErrorCode, type TransactionClient } from "@/storage/prisma";
 import { isRetryableSqliteWriteError } from "@/storage/sqliteRetryClassifier";
+import { warn } from "@/utils/logging/log";
 
 export type Tx = TransactionClient;
 
@@ -137,13 +138,48 @@ export function isTransactionAcquisitionUnavailableError(
 
 /**
  * A callback scheduled by `afterTx`. It may be async: `inTx` starts it after commit but does not await it,
- * and a returned promise that rejects is handled like a synchronous throw (see `ignoreAfterCommitCallbackFailure`).
+ * and a returned promise that rejects is handled like a synchronous throw (see `reportAfterCommitCallbackFailure`).
  */
 export type AfterTxCallback = () => void | Promise<void>;
 
+type ScheduledAfterTxCallback = Readonly<{
+    callback: AfterTxCallback;
+    // Captured where `afterTx` was called, so a failure log names the call site without a label at each caller.
+    // V8 formats `stack` only when it is first read, which is only when the callback fails.
+    registration: Error;
+}>;
+
+type AfterCommitCallbackFailure = "threw" | "rejected";
+
+// The first stack frame below `afterTx`: the function and file position that scheduled the callback.
+function readAfterTxCallSite(registration: Error): string | undefined {
+    const frame = registration.stack?.split("\n").find((line) => line.trimStart().startsWith("at "));
+    return frame?.trim().slice("at ".length);
+}
+
 // The transactional result is already committed when after-commit callbacks run, so a callback failure is
-// ignored and never rethrown. Synchronous throws and rejected promises both end here.
-function ignoreAfterCommitCallbackFailure(_error: unknown): void {}
+// logged and never rethrown. Synchronous throws and rejected promises both end here.
+function reportAfterCommitCallbackFailure(
+    scheduled: ScheduledAfterTxCallback,
+    failure: AfterCommitCallbackFailure,
+    err: unknown,
+): void {
+    try {
+        warn(
+            {
+                module: "storage",
+                event: "after-tx-callback-failed",
+                failure,
+                callSite: readAfterTxCallSite(scheduled.registration),
+                callbackName: scheduled.callback.name || undefined,
+                err,
+            },
+            "afterTx callback failed after commit; the committed transaction is unaffected",
+        );
+    } catch {
+        // Logging must not turn a committed transaction into a failure or an unhandled rejection.
+    }
+}
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {
     return (typeof value === "object" || typeof value === "function")
@@ -157,11 +193,13 @@ export function afterTx(tx: Tx, callback: AfterTxCallback) {
     // - Instead, schedule them with afterTx so they only fire after commit.
     //
     // `afterTx` is only valid for transactions created via `inTx()`.
-    const callbacks = (tx as any)[symbol] as AfterTxCallback[] | undefined;
+    const callbacks = (tx as any)[symbol] as ScheduledAfterTxCallback[] | undefined;
     if (!callbacks) {
         throw new Error('afterTx(tx, ...) called outside inTx() transaction');
     }
-    callbacks.push(callback);
+    const registration = new Error("afterTx callback registered");
+    Error.captureStackTrace(registration, afterTx);
+    callbacks.push({ callback, registration });
 }
 
 function resolveBoundedTransactionOptions(params: Readonly<{
@@ -193,7 +231,7 @@ export async function inTx<T>(fn: (tx: Tx) => Promise<T>, options: InTxOptions =
         transactionCallbackEntered = true;
         (tx as any)[symbol] = [];
         let result = await fn(tx);
-        let callbacks = (tx as any)[symbol] as AfterTxCallback[];
+        let callbacks = (tx as any)[symbol] as ScheduledAfterTxCallback[];
         return { result, callbacks };
     }
     while (true) {
@@ -217,15 +255,17 @@ export async function inTx<T>(fn: (tx: Tx) => Promise<T>, options: InTxOptions =
                     ...(bounded ? { maxWait: bounded.maxWait } : {}),
                 };
             let result = await db.$transaction(wrapped, txOpts);
-            for (let callback of result.callbacks) {
+            for (let scheduled of result.callbacks) {
                 try {
-                    const returned = callback();
+                    const returned = scheduled.callback();
                     if (isThenable(returned)) {
                         // Not awaited, so after-commit callbacks keep their timing and order relative to the caller.
-                        void returned.then(undefined, ignoreAfterCommitCallbackFailure);
+                        void returned.then(undefined, (error: unknown) => {
+                            reportAfterCommitCallbackFailure(scheduled, "rejected", error);
+                        });
                     }
                 } catch (error) {
-                    ignoreAfterCommitCallbackFailure(error);
+                    reportAfterCommitCallbackFailure(scheduled, "threw", error);
                 }
             }
             return result.result;

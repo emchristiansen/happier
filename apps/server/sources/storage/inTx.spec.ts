@@ -5,6 +5,7 @@ import { installDbModuleMock } from "../app/api/testkit/dbMocks";
 
 const transaction = vi.fn(async (fn: any, _opts?: any) => fn({} as any));
 const delayMock = vi.fn(async () => {});
+const { warnMock } = vi.hoisted(() => ({ warnMock: vi.fn() }));
 
 installDbModuleMock({
     db: {
@@ -13,6 +14,10 @@ installDbModuleMock({
 });
 
 vi.mock("@/utils/runtime/delay", () => ({ delay: delayMock }));
+vi.mock("@/utils/logging/log", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("@/utils/logging/log")>()),
+    warn: warnMock,
+}));
 
 describe("inTx", () => {
     const envSnapshot = snapshotEnv();
@@ -22,6 +27,7 @@ describe("inTx", () => {
         vi.restoreAllMocks();
         transaction.mockClear();
         delayMock.mockClear();
+        warnMock.mockReset();
     });
 
     it("uses serializable transactions by default", async () => {
@@ -236,14 +242,32 @@ describe("inTx", () => {
             return unhandled;
         }
 
-        it("ignores a synchronously throwing callback and still runs the later callbacks", async () => {
+        const failureMessage = "afterTx callback failed after commit; the committed transaction is unaffected";
+
+        function expectedFailureLog(failure: "threw" | "rejected", err: unknown, callbackName?: string) {
+            return [
+                {
+                    module: "storage",
+                    event: "after-tx-callback-failed",
+                    failure,
+                    // The frame that called afterTx: the transaction body in this spec file.
+                    callSite: expect.stringMatching(/inTx\.spec\.ts:\d+:\d+/),
+                    callbackName,
+                    err,
+                },
+                failureMessage,
+            ];
+        }
+
+        it("logs a synchronously throwing callback at warn and still runs the later callbacks", async () => {
             const { inTx, afterTx } = await import("./inTx");
+            const failure = new Error("sync after-commit failure");
             const later = vi.fn();
 
             const unhandled = await captureUnhandledRejections(async () => {
                 const result = await inTx(async (tx) => {
                     afterTx(tx, () => {
-                        throw new Error("sync after-commit failure");
+                        throw failure;
                     });
                     afterTx(tx, later);
                     return 321;
@@ -252,19 +276,22 @@ describe("inTx", () => {
             });
 
             expect(later).toHaveBeenCalledTimes(1);
+            expect(warnMock).toHaveBeenCalledTimes(1);
+            expect(warnMock.mock.calls[0]).toEqual(expectedFailureLog("threw", failure));
             expect(unhandled).toEqual([]);
         });
 
-        it("handles a rejected async callback like a synchronous throw, without an unhandled rejection", async () => {
+        it("logs a rejected async callback with the same log line as a synchronous throw, without an unhandled rejection", async () => {
             const { inTx, afterTx } = await import("./inTx");
             const failure = new Error("async after-commit failure");
             const later = vi.fn();
+            const emitAfterCommit = async () => {
+                throw failure;
+            };
 
             const unhandled = await captureUnhandledRejections(async () => {
                 const result = await inTx(async (tx) => {
-                    afterTx(tx, async () => {
-                        throw failure;
-                    });
+                    afterTx(tx, emitAfterCommit);
                     afterTx(tx, later);
                     return 654;
                 });
@@ -272,6 +299,8 @@ describe("inTx", () => {
             });
 
             expect(later).toHaveBeenCalledTimes(1);
+            expect(warnMock).toHaveBeenCalledTimes(1);
+            expect(warnMock.mock.calls[0]).toEqual(expectedFailureLog("rejected", failure, "emitAfterCommit"));
             expect(unhandled).toEqual([]);
         });
 
@@ -281,6 +310,7 @@ describe("inTx", () => {
             const pending = new Promise<void>((_resolve, reject) => {
                 rejectCallback = reject;
             });
+            const lateFailure = new Error("late async after-commit failure");
             const order: string[] = [];
 
             const unhandled = await captureUnhandledRejections(async () => {
@@ -296,10 +326,36 @@ describe("inTx", () => {
                 });
                 order.push("inTx returned");
                 expect(result).toBe(987);
-                rejectCallback(new Error("late async after-commit failure"));
+                expect(warnMock).not.toHaveBeenCalled();
+                rejectCallback(lateFailure);
             });
 
             expect(order).toEqual(["async callback started", "next callback ran", "inTx returned"]);
+            expect(warnMock).toHaveBeenCalledTimes(1);
+            expect(warnMock.mock.calls[0]).toEqual(expectedFailureLog("rejected", lateFailure));
+            expect(unhandled).toEqual([]);
+        });
+
+        it("keeps the committed result when the failure log itself throws", async () => {
+            const { inTx, afterTx } = await import("./inTx");
+            warnMock.mockImplementation(() => {
+                throw new Error("logger failure");
+            });
+
+            const unhandled = await captureUnhandledRejections(async () => {
+                const result = await inTx(async (tx) => {
+                    afterTx(tx, () => {
+                        throw new Error("sync after-commit failure");
+                    });
+                    afterTx(tx, async () => {
+                        throw new Error("async after-commit failure");
+                    });
+                    return 135;
+                });
+                expect(result).toBe(135);
+            });
+
+            expect(warnMock).toHaveBeenCalledTimes(2);
             expect(unhandled).toEqual([]);
         });
     });
