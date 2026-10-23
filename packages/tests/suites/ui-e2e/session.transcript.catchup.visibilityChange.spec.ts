@@ -1,3 +1,4 @@
+// Base probe (throwaway): CI run of base 81e2accf for the shard-9 failure at line 367 seen on #26, #29 and #39. Not for merge.
 import { test, expect, type Page } from '@playwright/test';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
