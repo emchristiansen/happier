@@ -720,10 +720,11 @@ export class ApiMachineClient {
      * retires that runner's publisher fence (only while it is still the current publisher) and the
      * session stops reading `active`.
      *
-     * Delivery is deliberately once and live-only: a report is never buffered while the machine
-     * socket is disconnected, because a late report could retire a successor runner's fence. A
-     * relay that predates the event ignores it, so the report settles as unacknowledged and the
-     * server's presence timeout remains the fallback.
+     * Delivery is deliberately once and live-only: the report only shortens the wait for the
+     * server's presence timeout, which remains the fallback, so it is not buffered while the machine
+     * socket is disconnected. The server's incarnation check, not delivery timing, keeps a report
+     * from retiring a successor runner. A relay that predates the event ignores it, so the report
+     * settles as unacknowledged.
      */
     async reportSessionRunnerExited(report: MachineSessionRunnerExitedRequest): Promise<SessionRunnerExitReportOutcome> {
         const socket = this.socket;

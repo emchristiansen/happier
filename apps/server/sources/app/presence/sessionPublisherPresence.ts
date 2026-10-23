@@ -27,6 +27,7 @@ import { blockInheritedProviderDeliveryClaims } from "@/app/session/pending/prov
 import { applyLatestSessionTurnEndInTx } from "@/app/session/sessionWriteService";
 import { AsyncLock } from "@/utils/runtime/lock";
 import type { Tx } from "@/storage/inTx";
+import { readPendingActivationWakeInTx, type PendingActivationWake } from "./pendingActivationWake";
 
 export interface PublisherBinding {
     readonly accountId: string;
@@ -55,6 +56,8 @@ export type ClosePublisherResult =
             lastRuntimeIssue: SessionRuntimeIssueV1 | null;
             badgeAttentionChanged: boolean;
         }>;
+        /** The session's waiting activation request, for a close that asked to wake it. */
+        activationWake?: PendingActivationWake;
       }
     | { status: "already_inactive" }
     | { status: "superseded" }
@@ -117,8 +120,10 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
     // A runner names its process in its socket handshake. Each successful registration records which
     // incarnation holds which publisher generation, so a daemon's later exit report can retire
     // exactly that runner's fence. One entry per session registered on this server process, replaced
-    // by the session's next registration. A report that reaches another server process, or arrives
-    // after a server restart, finds no entry and is rejected; the presence timeout then applies.
+    // by the session's next registration here. The record is in memory: when this process holds no
+    // entry for the incarnation (it registered elsewhere, or before a restart) the report is rejected
+    // as unmatched, and when its entry is stale (a successor registered elsewhere) the close
+    // transaction rejects it as superseded. Either way the presence timeout then applies.
     const incarnationsBySocket = new WeakMap<object, string>();
     const latestIncarnationRegistrationBySession = new Map<string, Readonly<{
         publisherIncarnationId: string;
@@ -258,6 +263,11 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
         authority: PublisherCloseAuthority;
         /** Ends the session's latest turn with this mutation id; `null` ends no turn. */
         latestTurnEnd: Readonly<{ mutationId: string }> | null;
+        /**
+         * Reads the session's waiting activation request when this close makes it inactive, as the
+         * presence timeout does, so the caller can wake the owner's machines for it.
+         */
+        wakeWaitingActivation: boolean;
     }>): Promise<ClosePublisherResult> => await inTx(async (tx): Promise<ClosePublisherResult> => {
         const session = await tx.session.findUnique({
             where: { id: params.binding.sessionId },
@@ -358,10 +368,14 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
             tx,
             sessionId: params.binding.sessionId,
         });
+        const activationWake = params.wakeWaitingActivation
+            ? await readPendingActivationWakeInTx({ tx, sessionId: params.binding.sessionId })
+            : undefined;
         return {
             status: "closed",
             activeAt: session.lastActiveAt,
             participantCursors,
+            ...(activationWake ? { activationWake } : {}),
             ...(activity?.status === "applied" ? { projection: activity.projection } : {}),
             ...(turnResult?.didApply
                 ? {
@@ -426,6 +440,7 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
                 ? `explicit-machine-stop:generation:${params.target.authority.publisherGeneration}`
                 : `explicit-machine-stop:legacy-heartbeat:${params.target.authority.committedFence.getTime()}`,
         },
+        wakeWaitingActivation: false,
     });
 
     /**
@@ -434,6 +449,8 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
      * session's current publisher generation (checked inside the close transaction), so a successor
      * runner is never retired. No turn is ended: exact turn custody for an observed exit belongs to
      * the daemon's staged exact-turn end, and the latest turn may already belong to a successor.
+     * A retirement that makes the session inactive returns its waiting activation request, as the
+     * presence timeout would have, because the timeout no longer selects an inactive session.
      */
     const retireExitedPublisher = async (params: Readonly<{
         binding: PublisherBinding;
@@ -453,6 +470,7 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
             binding: registration.binding,
             authority: { kind: "generation", publisherGeneration: registration.publisherGeneration },
             latestTurnEnd: null,
+            wakeWaitingActivation: true,
         });
     };
 
@@ -470,6 +488,7 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
                     publisherGeneration: registration.publisherGeneration,
                 },
                 latestTurnEnd: { mutationId: `publisher-close:${registration.committedFence.getTime()}` },
+                wakeWaitingActivation: false,
             });
         });
         closeResults.set(params.socket, result);

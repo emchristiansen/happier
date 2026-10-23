@@ -43,9 +43,10 @@ export const DAEMON_STARTED_REPORT_ATTEMPT_TIMEOUT_MS = SESSION_STARTED_READINES
 /**
  * Hard ceiling on how long a runner that requires the daemon's readiness acknowledgement keeps
  * reporting, counted from its first attempt. It matters while the daemon keeps answering that
- * readiness has not settled (a slow server, 2026-10-23). Every attempt's timeout and every pause is
- * clipped to the time left, so no attempt or answer outlasts it. A daemon that stops answering still
- * fails the runner once the ordinary retry window passes without an answer.
+ * readiness has not settled (a slow server, 2026-10-23). It is a deadline: each attempt is aborted
+ * when it passes, from reading the daemon state through the HTTP answer; each pause is clipped to
+ * the time left; and an acknowledgement that settles after it is not accepted. A daemon that stops
+ * answering still fails the runner once the ordinary retry window passes without an answer.
  */
 export const DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS = 10 * 60_000;
 
@@ -188,14 +189,12 @@ async function runDaemonSessionReport(
         const remainingCeilingMs = (): number => state.requireDaemonAck
             ? startedAt + DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS - nowFn()
             : Number.POSITIVE_INFINITY;
-        if (remainingCeilingMs() <= 0) {
-            logger.debug(`[START] Daemon readiness for session ${sessionId} not acknowledged within the ceiling`);
-            throw new Error('Claude runtime readiness was not acknowledged by the daemon');
-        }
+        const remainingAtAttemptMs = remainingCeilingMs();
+        if (remainingAtAttemptMs <= 0) break;
         const boundedAttemptTimeoutMs = Math.min(
             reportAttemptTimeoutMs,
             Math.max(100, retryTimeoutMs),
-            remainingCeilingMs(),
+            remainingAtAttemptMs,
         );
         // While a live daemon keeps answering that readiness is not settled, a runner that needs its
         // acknowledgement keeps waiting until the ceiling; otherwise the retry window counts from the start.
@@ -211,14 +210,25 @@ async function runDaemonSessionReport(
             await sleepFn(Math.min(retryIntervalMs, Math.max(0, remainingCeilingMs())));
         };
 
+        // The control client floors an explicit timeout at 100 ms and reads the daemon state before
+        // the request, so the ceiling reaches it as an abort signal covering the whole attempt.
+        const ceilingAbort = Number.isFinite(remainingAtAttemptMs) ? new AbortController() : null;
+        const ceilingTimer = ceilingAbort
+            ? setTimeout(() => ceilingAbort.abort(new Error('daemon readiness acknowledgement ceiling timeout')), remainingAtAttemptMs)
+            : null;
         try {
             logger.debug(`[START] Reporting session ${sessionId} to daemon (attempt ${attempt})`);
             const result = await notifyFn(
                 sessionId,
                 metadata,
-                { timeoutMs: boundedAttemptTimeoutMs },
+                {
+                    timeoutMs: boundedAttemptTimeoutMs,
+                    ...(ceilingAbort ? { signal: ceilingAbort.signal } : {}),
+                },
             );
             if (!result?.error) {
+                // An acknowledgement that settles after the ceiling is not accepted.
+                if (remainingCeilingMs() <= 0) break;
                 if (state.revision !== revision) continue;
                 logger.debug(`[START] Reported session ${sessionId} to daemon`);
                 for (const onReported of state.onReportedCallbacks) {
@@ -254,8 +264,12 @@ async function runDaemonSessionReport(
                 return;
             }
             await pauseBeforeNextAttempt();
+        } finally {
+            if (ceilingTimer) clearTimeout(ceilingTimer);
         }
     }
+    logger.debug(`[START] Daemon readiness for session ${sessionId} not acknowledged within the ceiling`);
+    throw new Error('Claude runtime readiness was not acknowledged by the daemon');
 }
 
 export function reportSessionToDaemonIfRunning(opts: {

@@ -1,8 +1,11 @@
+import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { io as ioClient } from "socket.io-client";
 
 import { auth } from "@/app/auth/auth";
+import { enqueuePendingMessage } from "@/app/session/pending/pendingMessageService";
+import { emitPendingChanged } from "@/app/session/pending/publishPendingMutation";
 import { applySessionTurnMutation } from "@/app/session/sessionWriteService";
 import { db } from "@/storage/db";
 import { createLightSqliteHarness, type LightSqliteHarness } from "@/testkit/lightSqliteHarness";
@@ -234,6 +237,81 @@ describe("startSocket machine-reported runner exit", () => {
                 publisherIncarnationId: "runner-a",
             });
             expect(repeated).toEqual({ status: "already_inactive", sessionId: seeded.sessionId });
+        } finally {
+            daemon.close();
+            await app.close();
+        }
+    }, 30_000);
+
+    it("wakes the waiting activation request when the exited runner's retirement makes the session inactive", async () => {
+        const machineId = "m-runner-exit-wake";
+        const seeded = await seedMachineSession(machineId);
+        const { app, url } = await startServer();
+        const daemon = machineSocket(url, seeded.token, machineId);
+        const activationHints: string[] = [];
+        daemon.on("update", (update: { body?: { t?: unknown; sessionId?: unknown; pendingActivationRequestId?: unknown } }) => {
+            const body = update?.body;
+            if (
+                body?.t === "pending-changed"
+                && body.sessionId === seeded.sessionId
+                && typeof body.pendingActivationRequestId === "string"
+            ) {
+                activationHints.push(body.pendingActivationRequestId);
+            }
+        });
+
+        try {
+            // Runner A dies without a graceful close; the session still reads active at A's last fence.
+            const runnerA = await registerRunner({
+                url, token: seeded.token, machineId, sessionId: seeded.sessionId, publisherIncarnationId: "runner-a",
+            });
+            await killRunner(runnerA, seeded.sessionId);
+            await connect(daemon);
+
+            // Before A's exit report arrives, the user sends now. The route arms the session's activation
+            // authorization and wakes the daemon once.
+            const requestId = `pending-${randomUUID()}`;
+            const enqueued = await enqueuePendingMessage({
+                actorUserId: seeded.accountId,
+                sessionId: seeded.sessionId,
+                localId: requestId,
+                ciphertext: "cipher-send-now",
+                messageRole: "user",
+                requestedAction: { v: 1, kind: "send_now" },
+            });
+            if (!enqueued.ok || enqueued.terminal === true || enqueued.suppressed === true) {
+                throw new Error(`Expected the send-now request to be queued: ${JSON.stringify(enqueued)}`);
+            }
+            expect(enqueued.activationTarget).toEqual({ accountId: seeded.accountId, requestId });
+            await emitPendingChanged({
+                sessionId: seeded.sessionId,
+                changedByAccountId: seeded.accountId,
+                pendingCount: enqueued.pendingCount,
+                pendingBlockedCount: enqueued.pendingBlockedCount,
+                pendingVersion: enqueued.pendingVersion,
+                meaningfulActivityAt: enqueued.didWrite ? enqueued.meaningfulActivityAt : undefined,
+                participantCursors: enqueued.participantCursors,
+                activationTarget: enqueued.activationTarget!,
+            });
+            await waitFor(async () => activationHints.length === 1, "Expected the daemon to receive the initial activation hint");
+
+            // The daemon's first activation attempt fails transiently (its first session fetch throws), so
+            // it keeps the durable authorization and waits for the next wake. Then A's exit report lands.
+            const ack = await daemon.timeout(5_000).emitWithAck(MACHINE_SESSION_RUNNER_EXITED_EVENT, {
+                sessionId: seeded.sessionId,
+                publisherIncarnationId: "runner-a",
+            });
+            expect(ack).toEqual({ status: "closed", sessionId: seeded.sessionId });
+            await expect(db.session.findUniqueOrThrow({
+                where: { id: seeded.sessionId },
+                select: { active: true, pendingActivationRequestId: true, pendingActivationStatus: true },
+            })).resolves.toEqual({ active: false, pendingActivationRequestId: requestId, pendingActivationStatus: "waiting" });
+
+            // The presence timeout no longer selects this inactive row, so the retirement itself must
+            // re-deliver the exact waiting request's wake on the daemon's existing connection.
+            await waitFor(async () => activationHints.length === 2,
+                "Expected the waiting activation request to be woken again after the exited runner was retired");
+            expect(activationHints).toEqual([requestId, requestId]);
         } finally {
             daemon.close();
             await app.close();

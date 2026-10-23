@@ -19,6 +19,7 @@ import {
 
 import type { SessionParticipantCursor } from '@/app/session/changeTracking/markSessionParticipantsChanged';
 import { publishSessionPublisherLifecycleUpdate } from '@/app/session/runtimeActivity/publishPublisherLifecycleUpdate';
+import { emitPendingActivationWake } from '@/app/presence/pendingActivationWake';
 import type { createSessionPublisherPresence } from '@/app/presence/sessionPublisherPresence';
 import { describeLoggableError } from '@/utils/logging/describeLoggableError';
 import { warn } from '@/utils/logging/log';
@@ -329,7 +330,8 @@ export function registerSessionRuntimeActivitySnapshotSocketEvent(params: Readon
  * The report names the exited runner's publisher incarnation. The presence owner retires the fence
  * only while that incarnation's latest registration is still the current publisher generation and
  * the reporting machine still hosts the session. A late report for a predecessor is rejected as
- * `unmatched` and never retires a successor; no turn is ended.
+ * `unmatched` and never retires a successor; no turn is ended. When the retirement makes the
+ * session inactive, a waiting activation request is woken again, as the presence timeout does.
  */
 export function registerMachineSessionRunnerExitedSocketEvent(params: Readonly<{
     socket: RuntimeActivitySnapshotEventSocket;
@@ -357,6 +359,13 @@ export function registerMachineSessionRunnerExitedSocketEvent(params: Readonly<{
                     activeAt: retired.activeAt.getTime(),
                     ...(retired.projection ? { projection: retired.projection } : {}),
                 });
+                if (retired.activationWake) {
+                    await emitPendingActivationWake({
+                        sessionId,
+                        participantCursors: retired.participantCursors,
+                        wake: retired.activationWake,
+                    });
+                }
             }
             acknowledge?.(MachineSessionRunnerExitedAckSchema.parse(
                 retired.status === 'closed' || retired.status === 'already_inactive'
