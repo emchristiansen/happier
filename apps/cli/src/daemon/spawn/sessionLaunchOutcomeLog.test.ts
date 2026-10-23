@@ -106,10 +106,11 @@ describe('startSessionLaunchOutcomeLog', () => {
     resumed.sessionBound('sess_existing');
     await settled();
 
-    expect(capture.lines).toEqual([
-      `INFO launch-session-bound launch=${LAUNCH_ID} session=sess_existing`,
+    // The lines correlate by launch id; their relative order is not guaranteed.
+    expect([...capture.lines].sort()).toEqual([
       `INFO launch-placement launch=${LAUNCH_ID} session=sess_existing mode=tmux pid=5151 outcome=unscoped reason=no-user-bus`,
-    ]);
+      `INFO launch-session-bound launch=${LAUNCH_ID} session=sess_existing`,
+    ].sort());
   });
 
   it('never writes scoped before the placement observation concludes', async () => {
@@ -181,10 +182,11 @@ describe('launch-failed is written only for a launch still pending its webhook',
     childExited(maps, log, 0, null);
     await settled();
 
-    expect(capture.lines).toEqual([
+    // The lines correlate by launch id; their relative order is not guaranteed.
+    expect([...capture.lines].sort()).toEqual([
       `INFO launch-placement launch=${LAUNCH_ID} session=pending mode=child pid=4242 outcome=scoped unit=${UNIT}`,
       `INFO launch-session-bound launch=${LAUNCH_ID} session=sess_new`,
-    ]);
+    ].sort());
     expect(capture.lines.some((line) => line.includes('launch-failed'))).toBe(false);
   });
 
@@ -244,9 +246,10 @@ describe('launch-failed is written only for a launch still pending its webhook',
     tmux.webhookTimedOut();
     await settled();
 
-    expect(capture.lines.filter((line) => line.includes('launch-failed'))).toEqual([
+    // Two independent attempts: no order between them is promised.
+    expect(capture.lines.filter((line) => line.includes('launch-failed')).sort()).toEqual([
       `WARN launch-failed launch=${LAUNCH_ID} session=pending mode=child pid=4242 code=unavailable signal=unavailable message="spawn systemd-run ENOENT" webhook=not-received placement=scoped stage=unknown`,
       `WARN launch-failed launch=${LAUNCH_ID} session=pending mode=tmux pid=5151 reason=webhook-timeout code=unavailable signal=unavailable webhook=not-received placement=unknown stage=unknown`,
-    ]);
+    ].sort());
   });
 });

@@ -68,6 +68,13 @@ export type SessionLaunchOutcomeLog = Readonly<{
  * The stage is always `unknown`: a systemd-run exit before exec and a runner exit
  * before its webhook share one PID and can share one exit code.
  *
+ * Lines correlate by `launchId`; no order between them is promised. In particular
+ * `launch-session-bound` is written when the webhook resolves, which can precede the
+ * placement line (written when the up-to-2 s observation concludes) and, after a
+ * timeout that a tracked canonical Session ID later recovers, the timeout line too.
+ * The one dependency is that `launch-failed` reports the attempt's concluded
+ * placement, so it is written after that attempt's `launch-placement` line.
+ *
  * Coverage is best-effort. Nothing here refuses, retries or delays a spawn.
  */
 export function startSessionLaunchOutcomeLog(params: Readonly<{
