@@ -65,4 +65,29 @@ describe('registerHappierMcpBridgeTools', () => {
       },
     });
   });
+
+  it('forwards only the provider tool-call id from the upstream request _meta', async () => {
+    const { registerHappierMcpBridgeTools } = await import('./registerHappierMcpBridgeTools');
+    const handlers = new Map<string, (args: any, extra?: unknown) => Promise<any>>();
+    const forwarded: unknown[][] = [];
+    registerHappierMcpBridgeTools({
+      registerTool: (name: string, _def: any, handler: (args: any, extra?: unknown) => Promise<any>) => {
+        handlers.set(name, handler);
+      },
+    }, {
+      callHttpTool: async (...args: unknown[]) => {
+        forwarded.push(args);
+        return { content: [{ type: 'text', text: 'ok' }], isError: false };
+      },
+    });
+
+    const send = handlers.get('action_execute');
+    if (!send) throw new Error('Expected action_execute to be registered');
+    const args = { actionId: 'session.message.send', input: { message: 'hi' } };
+    await send(args, { requestId: 3, _meta: { 'claudecode/toolUseId': 'toolu_9', progressToken: 'up-1' } });
+    await send(args, { requestId: 4 });
+
+    expect(forwarded[0]).toEqual(['action_execute', args, { 'claudecode/toolUseId': 'toolu_9' }]);
+    expect(forwarded[1]).toEqual(['action_execute', args]);
+  });
 });

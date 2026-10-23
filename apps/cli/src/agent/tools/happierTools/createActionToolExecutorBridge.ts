@@ -25,12 +25,15 @@ type ActionExecutorLike = Readonly<{
       callerPermissionMode?: string | null;
       actionsSettings?: ActionsSettingsV1 | null;
       actionRequestId?: string | null;
+      providerToolCallId?: string | null;
     }>,
   ) => Promise<ActionExecutorResult>;
 }>;
 
 export type ActionToolExecutionOptions = Readonly<{
   approvalOrigin?: ApprovalRequestOriginV1 | null;
+  /** Provider-assigned tool-call id, stable across that provider's retries of the call. */
+  providerToolCallId?: string | null;
 }>;
 
 type ActionToolBridgeResult =
@@ -125,6 +128,9 @@ export function createActionToolExecutorBridge(params: Readonly<{
     executeActionByToolName: async (toolName, toolArgs, defaultSessionId, options) => {
       const callerPermissionMode = readCallerPermissionMode();
       const actionRequestId = readActionRequestId(options?.approvalOrigin);
+      const providerToolCallId = typeof options?.providerToolCallId === 'string' && options.providerToolCallId.trim()
+        ? options.providerToolCallId.trim()
+        : null;
       const context = {
         defaultSessionId,
         ...(params.defaultSessionMachineId ? { defaultSessionMachineId: params.defaultSessionMachineId } : {}),
@@ -132,6 +138,7 @@ export function createActionToolExecutorBridge(params: Readonly<{
         ...(options?.approvalOrigin ? { approvalOrigin: options.approvalOrigin } : {}),
         ...(callerPermissionMode ? { callerPermissionMode } : {}),
         ...(actionRequestId ? { actionRequestId } : {}),
+        ...(providerToolCallId ? { providerToolCallId } : {}),
         actionsSettings: readActionsSettings(),
       } as const;
       if (toolName === 'action_execute') {

@@ -172,6 +172,20 @@ export type ActionExecutorContext = Readonly<{
   /** Stable identity for one externally retryable action invocation. */
   actionRequestId?: string | null;
 
+  /**
+   * Provider-assigned id of the transcript tool call that invoked this action
+   * (Claude's `_meta["claudecode/toolUseId"]`, Pi's tool call id), which that
+   * provider repeats when it retries the same call. Never an MCP JSON-RPC
+   * request id: those restart per connection and change on every retry.
+   */
+  providerToolCallId?: string | null;
+
+  /**
+   * Caller-chosen Pending localId for `session.message.send` (the CLI's
+   * `--local-id`). Set only by trusted local callers, never from tool input.
+   */
+  messageLocalId?: string | null;
+
   /** Resolve the existing action attempt without repeating its outward write. */
   resumeActionRequest?: boolean;
 
@@ -274,6 +288,10 @@ export type ActionExecutorDeps = Readonly<{
     serverId?: string | null;
     callerSurface?: keyof ActionSurfaces | null;
     callerPermissionMode?: string | null;
+    /** Caller-chosen Pending localId, used verbatim. */
+    localId?: string;
+    /** See `ActionExecutorContext.providerToolCallId`. */
+    providerToolCallId?: string;
   }>) => Promise<unknown>;
   sessionTitleSet?: (args: Readonly<{ sessionId: string; title: string; serverId?: string | null }>) => Promise<unknown>;
   sessionStop?: (args: Readonly<{ sessionId: string; serverId?: string | null }>) => Promise<SessionStopActionDependencyResult>;
@@ -1322,6 +1340,9 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
             surface: requestSurface,
             placement: null,
             bypassApprovals: true,
+            // The decider's invocation identities do not belong to the approved action.
+            providerToolCallId: null,
+            messageLocalId: null,
           })
       : { ok: false as const, errorCode: 'approval_execution_surface_invalid', error: 'approval_execution_surface_invalid' };
     const executedAtMs = Date.now();
@@ -1537,6 +1558,8 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
                   ...(requestSurface ? { surface: requestSurface } : {}),
                   placement: null,
                   bypassApprovals: true,
+                  providerToolCallId: null,
+                  messageLocalId: null,
                 },
               };
               return ready(approvedAdmission, async (runOptions) => {
@@ -2259,6 +2282,11 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
             ...(isSessionAgentCaller(ctx)
               ? { callerSurface: 'session_agent' as const, callerPermissionMode: ctx.callerPermissionMode ?? null }
               : {}),
+            // Pending identity is opaque: forward the caller's localId verbatim.
+            ...(typeof ctx.messageLocalId === 'string' && ctx.messageLocalId.trim().length > 0
+              ? { localId: ctx.messageLocalId }
+              : {}),
+            ...(normalizeId(ctx.providerToolCallId) ? { providerToolCallId: normalizeId(ctx.providerToolCallId) } : {}),
           });
           const failure = readActionExecuteFailure(res);
           if (failure) {

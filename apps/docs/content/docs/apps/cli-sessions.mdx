@@ -126,6 +126,15 @@ Notes:
 - `--model` lets you target a specific model for that message when the backend supports it.
 - `--json` + explicit timeouts are recommended for scripts.
 
+### Resending safely (`--local-id`)
+
+Every message carries a `localId`, and the server keeps at most one message per `localId` in a session. A resend that reuses the `localId` of an earlier attempt can therefore never create a second copy.
+
+- `--local-id <id>` sets it yourself. Use a new value for every message you mean to send, and the same value only to retry it.
+- Without `--local-id`, the CLI picks one. If an identical send (same target, text and overrides) to the same session did not succeed within the last 10 minutes, it reuses that attempt's `localId`; otherwise it picks a new one. A deliberate repeat after a successful send is therefore always a new message.
+- A send that times out reports `timeout` with `pendingCustody: "unconfirmed"` and the `localId` (in `--json` output under `error.details`). The message may still have been committed; resend with that `localId` to finish it without duplicating it.
+- `conflict` means the session already has that `localId` with different content, or the message was discarded.
+
 ## History
 
 Get recent transcript rows:

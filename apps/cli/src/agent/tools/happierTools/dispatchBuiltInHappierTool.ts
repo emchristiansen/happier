@@ -38,7 +38,7 @@ type DispatchDeps = Readonly<{
     toolName: string,
     args: unknown,
     defaultSessionId: string,
-    options?: Readonly<{ approvalOrigin?: ApprovalRequestOriginV1 | null }>,
+    options?: Readonly<{ approvalOrigin?: ApprovalRequestOriginV1 | null; providerToolCallId?: string | null }>,
   ) => Promise<HappierBuiltInToolDispatchResult>;
   resolveActionOptions?: (args: Readonly<{
     actionId: ActionId | null;
@@ -131,12 +131,22 @@ export async function dispatchBuiltInHappierTool(params: Readonly<{
   actionsSettings?: ActionsSettingsV1 | null;
   getActionsSettings?: (() => ActionsSettingsV1 | null) | null;
   approvalOrigin?: ApprovalRequestOriginV1 | null;
+  /** Provider-assigned tool-call id, stable across that provider's retries of the call. */
+  providerToolCallId?: string | null;
   deps: DispatchDeps;
 }>): Promise<HappierBuiltInToolDispatchResult> {
   const isActionEnabled = params.deps.isActionEnabled ?? (() => true);
   const surface = params.surface ?? 'session_agent';
   const actionsSettings = params.getActionsSettings?.() ?? params.actionsSettings ?? null;
-  const actionExecutionOptions = params.approvalOrigin ? { approvalOrigin: params.approvalOrigin } : undefined;
+  const providerToolCallId = typeof params.providerToolCallId === 'string' && params.providerToolCallId.trim()
+    ? params.providerToolCallId.trim()
+    : null;
+  const actionExecutionOptions = params.approvalOrigin || providerToolCallId
+    ? {
+        ...(params.approvalOrigin ? { approvalOrigin: params.approvalOrigin } : {}),
+        ...(providerToolCallId ? { providerToolCallId } : {}),
+      }
+    : undefined;
   const actionExecutionOptionsArgs = actionExecutionOptions ? [actionExecutionOptions] as const : [] as const;
 
   const executionRunStartEquivalentActionId = params.toolName === 'execution_run_start'

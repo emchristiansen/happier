@@ -83,7 +83,7 @@ const SESSION_HELP_BY_COMMAND = {
   list: 'happier session list [--active] [--archived] [--limit N] [--cursor C] [--include-system] [--resumable] [--plain] [--json]',
   status: 'happier session status <session-id-or-prefix-or-tag> [--live] [--json]',
   create: SESSION_CREATE_USAGE,
-  send: 'happier session send <session-id-or-prefix-or-tag> <message> [--permission-mode <mode>] [--model <model-id>] [--wait] [--timeout <seconds>] [--json]',
+  send: 'happier session send <session-id-or-prefix-or-tag> <message> [--local-id <id>] [--permission-mode <mode>] [--model <model-id>] [--wait] [--timeout <seconds>] [--json]',
   wait: 'happier session wait <session-id-or-prefix-or-tag> [--timeout <seconds>] [--json]',
   stop: 'happier session stop <session-id-or-prefix-or-tag> [--json]',
   history: 'happier session history <session-id-or-prefix-or-tag> [--limit N] [--format compact|raw] [--include-meta] [--include-structured-payload] [--json]',

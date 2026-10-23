@@ -41,9 +41,42 @@ import {
 
 import { resolveSessionTransportContext } from './resolveSessionTransportContext';
 import { requestInactiveSessionResume } from './requestInactiveSessionResume';
+import {
+  claimSessionSendLocalId,
+  type SessionSendAttemptOutcome,
+  type SessionSendRetryIdentity,
+} from './sessionSendLocalId';
 
 export type SendSessionMessageResult =
   | Readonly<{ ok: true; sessionId: string; localId: string; waited: boolean; suppressed?: true }>
+  /**
+   * The enqueue was issued and its acknowledgement never arrived. The relay
+   * usually commits such a request anyway, so the message may exist under
+   * `localId`; resending with the same localId cannot create a second copy.
+   */
+  | Readonly<{
+      ok: false;
+      code: 'timeout';
+      message: string;
+      pendingCustody: 'unconfirmed';
+      sessionId: string;
+      localId: string;
+      candidates?: never;
+    }>
+  /**
+   * The relay answered with a permanent 4xx and created nothing for this
+   * attempt. `conflict` (409) means it already holds `localId` with different
+   * content or action, or as a discarded row.
+   */
+  | Readonly<{
+      ok: false;
+      code: 'conflict' | 'enqueue_rejected';
+      message: string;
+      pendingCustody: 'refused';
+      sessionId: string;
+      localId: string;
+      candidates?: never;
+    }>
   | Readonly<{
       ok: false;
       /**
@@ -59,6 +92,16 @@ export type SendSessionMessageResult =
       | Readonly<{ pendingCustody: 'confirmed'; sessionId: string; localId: string }>
       | Readonly<{ pendingCustody?: never; sessionId?: never; localId?: never }>
     );
+
+/**
+ * How the attempt's Pending localId is chosen. Exactly one of:
+ * - `localId`: the caller's own key, used verbatim (daemon continuations, `--local-id`);
+ * - `retryIdentity`: derived per `claimSessionSendLocalId`, so retries reuse it;
+ * - neither: a fresh random localId (the historical behaviour, kept for daemon callers).
+ */
+type SendSessionMessageLocalIdChoice =
+  | Readonly<{ localId?: string; retryIdentity?: never }>
+  | Readonly<{ localId?: never; retryIdentity: SessionSendRetryIdentity }>;
 
 function parsePermissionIntentOrThrow(raw: string): PermissionIntent {
   const parsed = parsePermissionIntentAlias(raw);
@@ -430,13 +473,12 @@ async function waitForAssistantOutcomeAfterCurrentUserTurn(params: Readonly<{
   return { kind: 'missing' };
 }
 
-export async function sendSessionMessage(params: Readonly<{
+type SendSessionMessageParams = Readonly<{
   credentials: Credentials;
   idOrPrefix: string;
   message: string;
   wait: boolean;
   timeoutMs: number;
-  localId?: string;
   resumeInactiveSession?: boolean;
   permissionModeOverride?: string;
   modelOverride?: string | null;
@@ -444,7 +486,45 @@ export async function sendSessionMessage(params: Readonly<{
   pendingAdmissionMode?: 'continuation_if_no_queued_user_input';
   assertCanAdmit?: () => void;
   preserveAdmission?: (body: SessionUserMessageAdmissionBody) => Promise<SessionUserMessageAdmissionBody>;
-}>): Promise<SendSessionMessageResult> {
+}> & SendSessionMessageLocalIdChoice;
+
+function classifySendAttemptOutcome(result: SendSessionMessageResult): SessionSendAttemptOutcome {
+  if (result.ok) return 'succeeded';
+  return result.pendingCustody === 'refused' ? 'refused' : 'unsuccessful';
+}
+
+export async function sendSessionMessage(params: SendSessionMessageParams): Promise<SendSessionMessageResult> {
+  if (!params.retryIdentity) {
+    return await sendSessionMessageOnce(params, params.localId);
+  }
+  const claim = await claimSessionSendLocalId({
+    identity: params.retryIdentity,
+    inputs: {
+      target: params.idOrPrefix,
+      message: params.message,
+      requestedAction: params.requestedAction ?? null,
+      permissionModeOverride: params.permissionModeOverride ?? null,
+      modelOverride: params.modelOverride === undefined
+        ? { set: false }
+        : { set: true, value: params.modelOverride },
+      pendingAdmissionMode: params.pendingAdmissionMode ?? null,
+    },
+  });
+  let result: SendSessionMessageResult;
+  try {
+    result = await sendSessionMessageOnce(params, claim.localId);
+  } catch (error) {
+    await claim.settle('unsuccessful');
+    throw error;
+  }
+  await claim.settle(classifySendAttemptOutcome(result));
+  return result;
+}
+
+async function sendSessionMessageOnce(
+  params: SendSessionMessageParams,
+  requestedLocalId: string | undefined,
+): Promise<SendSessionMessageResult> {
   const sessionTarget = await resolveSessionTransportContext({
     credentials: params.credentials,
     idOrPrefix: params.idOrPrefix,
@@ -469,10 +549,10 @@ export async function sendSessionMessage(params: Readonly<{
     return { ok: false, code: 'session_archived' };
   }
 
-  if (params.localId !== undefined && readPendingLocalId(params.localId) === null) {
+  if (requestedLocalId !== undefined && readPendingLocalId(requestedLocalId) === null) {
     throw new Error('Pending localId must not be blank');
   }
-  const localId = readPendingLocalId(params.localId) ?? randomUUID();
+  const localId = readPendingLocalId(requestedLocalId) ?? randomUUID();
   const decryptedMetadata = tryDecryptSessionMetadata({
     credentials: params.credentials,
     rawSession: sessionTarget.rawSession,
@@ -506,7 +586,24 @@ export async function sendSessionMessage(params: Readonly<{
     return {
       ok: false,
       code: 'timeout',
-      message: admission.message,
+      message: `${admission.message}. The message may still have been committed under localId ${localId}; `
+        + 'resending it with the same localId cannot create a second copy.',
+      pendingCustody: 'unconfirmed',
+      sessionId,
+      localId,
+    };
+  }
+
+  if (admission.status === 'refused') {
+    return {
+      ok: false,
+      code: admission.httpStatus === 409 ? 'conflict' : 'enqueue_rejected',
+      message: admission.httpStatus === 409
+        ? `${admission.message}: this localId (${localId}) already names a different or discarded message`
+        : admission.message,
+      pendingCustody: 'refused',
+      sessionId,
+      localId,
     };
   }
 
@@ -590,6 +687,9 @@ export async function sendSessionMessage(params: Readonly<{
       return {
         ok: false,
         code: 'wait_failed',
+        pendingCustody: 'confirmed',
+        sessionId,
+        localId,
         message: formatBlockedPromptDeliveryFailure(promptDelivery.reason),
       };
     }
@@ -597,12 +697,18 @@ export async function sendSessionMessage(params: Readonly<{
       return {
         ok: false,
         code: 'wait_failed',
+        pendingCustody: 'confirmed',
+        sessionId,
+        localId,
       };
     }
     if (promptDelivery.kind !== 'materialized') {
       return {
         ok: false,
         code: 'timeout',
+        pendingCustody: 'confirmed',
+        sessionId,
+        localId,
       };
     }
     const materialized = promptDelivery.message;
@@ -686,6 +792,9 @@ export async function sendSessionMessage(params: Readonly<{
       return {
         ok: false,
         code: 'wait_failed',
+        pendingCustody: 'confirmed',
+        sessionId,
+        localId,
         message: projectedFailure,
       };
     }
@@ -702,6 +811,9 @@ export async function sendSessionMessage(params: Readonly<{
       return {
         ok: false,
         code: 'wait_failed',
+        pendingCustody: 'confirmed',
+        sessionId,
+        localId,
         message: initialAssistantTurnOutcome.message,
       };
     }
@@ -721,6 +833,9 @@ export async function sendSessionMessage(params: Readonly<{
       return {
         ok: false,
         code: 'wait_failed',
+        pendingCustody: 'confirmed',
+        sessionId,
+        localId,
         message: assistantTurnOutcome.message,
       };
     }
@@ -728,6 +843,9 @@ export async function sendSessionMessage(params: Readonly<{
       return {
         ok: false,
         code: 'timeout',
+        pendingCustody: 'confirmed',
+        sessionId,
+        localId,
       };
     }
     return {
@@ -742,11 +860,17 @@ export async function sendSessionMessage(params: Readonly<{
       return {
         ok: false,
         code: 'timeout',
+        pendingCustody: 'confirmed',
+        sessionId,
+        localId,
       };
     }
     return {
       ok: false,
       code: 'wait_failed',
+      pendingCustody: 'confirmed',
+      sessionId,
+      localId,
       message: errorMessage || 'Wait for idle failed',
     };
   }

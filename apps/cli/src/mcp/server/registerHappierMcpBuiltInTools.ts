@@ -3,6 +3,7 @@ import { dispatchBuiltInHappierTool } from '@/agent/tools/happierTools/dispatchB
 import type { ActionsSettingsV1, ApprovalRequestOriginV1 } from '@happier-dev/protocol';
 import { getEquivalentActionIdForBuiltInTool } from '@/agent/tools/happierTools/actionToolCatalog';
 import { projectContextualActionToolInputSchema } from '@/agent/tools/happierTools/contextualActionToolInput';
+import { readProviderToolCallIdFromMcpExtra } from './providerToolCallIdMeta';
 
 type ToolRegistrar = Readonly<{
     registerTool: (name: string, meta: unknown, handler: (args: unknown, extra?: unknown) => Promise<unknown>) => void;
@@ -83,6 +84,7 @@ export function registerHappierMcpBuiltInTools(
                         toolName: tool.name,
                         extra,
                     });
+                    const providerToolCallId = readProviderToolCallIdFromMcpExtra(extra);
                     const result = await dispatchBuiltInHappierTool({
                         toolName: tool.name,
                         args,
@@ -91,6 +93,7 @@ export function registerHappierMcpBuiltInTools(
                         actionsSettings: readActionsSettings(),
                         getActionsSettings: readActionsSettings,
                         ...(approvalOrigin ? { approvalOrigin } : {}),
+                        ...(providerToolCallId ? { providerToolCallId } : {}),
                         deps: params.deps,
                     });
 

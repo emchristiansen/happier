@@ -298,7 +298,7 @@ async function admitInputAndActivateTarget(params: Readonly<{
     permissionIntent,
     ...(request.selection.modelId ? { modelId: request.selection.modelId } : {}),
   });
-  if (admission.status === 'unconfirmed') {
+  if (admission.status === 'unconfirmed' || admission.status === 'refused') {
     return committed.committed('input_admission_failed');
   }
   if (admission.status === 'suppressed') {

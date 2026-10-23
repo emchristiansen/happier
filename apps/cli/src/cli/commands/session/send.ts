@@ -6,6 +6,7 @@ import type { PermissionIntent } from '@happier-dev/agents';
 import type { Credentials } from '@/persistence';
 import { wantsJson, printJsonEnvelope, writeJsonStdout } from '@/cli/output/jsonEnvelope';
 import { hasFlag, readCommandPositionals, readIntFlagValue, readFlagValue } from '@/cli/commands/shared/argvFlags';
+import { isSessionAgentTransitionDividerLocalId, readPendingLocalId } from '@happier-dev/protocol';
 import { createCliActionExecutorFromCredentials } from '@/session/actions/createCliActionExecutorFromCredentials';
 import { tryHandleApprovalRequestCreated } from './shared/tryHandleApprovalRequestCreated';
 
@@ -19,6 +20,28 @@ function parsePermissionIntentOrThrow(raw: string): PermissionIntent {
   return parsed;
 }
 
+function parseLocalIdOrThrow(raw: string): string {
+  const localId = readPendingLocalId(raw);
+  if (localId === null || isSessionAgentTransitionDividerLocalId(localId)) {
+    const err = new Error(`Invalid --local-id: ${raw}`);
+    (err as any).code = 'invalid_arguments';
+    throw err;
+  }
+  return localId;
+}
+
+function readPendingCustodyDetails(value: unknown): Readonly<{ pendingCustody: string; localId: string; message: string | null }> | null {
+  if (!value || typeof value !== 'object') return null;
+  const record = value as Record<string, unknown>;
+  return typeof record.pendingCustody === 'string' && typeof record.localId === 'string'
+    ? {
+        pendingCustody: record.pendingCustody,
+        localId: record.localId,
+        message: typeof record.message === 'string' && record.message.trim() ? record.message : null,
+      }
+    : null;
+}
+
 export async function cmdSessionSend(
   argv: string[],
   deps: Readonly<{ readCredentialsFn: () => Promise<Credentials | null> }>,
@@ -26,8 +49,9 @@ export async function cmdSessionSend(
   const json = wantsJson(argv);
   const [idOrPrefix = '', message = ''] = readCommandPositionals(argv, {
     startIndex: 1,
-    valueFlags: ['--permission-mode', '--model', '--timeout'],
+    valueFlags: ['--permission-mode', '--model', '--timeout', '--local-id'],
   });
+  const localIdFlag = readFlagValue(argv, '--local-id');
   const wait = hasFlag(argv, '--wait');
   const timeoutSecondsRaw = readIntFlagValue(argv, '--timeout', { min: 1 });
   const permissionModeFlag = (readFlagValue(argv, '--permission-mode') ?? '').trim();
@@ -40,8 +64,9 @@ export async function cmdSessionSend(
       : 300;
 
   if (!idOrPrefix || !message) {
-    throw new Error('Usage: happier session send <session-id-or-prefix> <message> [--permission-mode <mode>] [--model <model-id>] [--wait] [--timeout <seconds>] [--json]');
+    throw new Error('Usage: happier session send <session-id-or-prefix-or-tag> <message> [--local-id <id>] [--permission-mode <mode>] [--model <model-id>] [--wait] [--timeout <seconds>] [--json]');
   }
+  const localId = localIdFlag === null ? null : parseLocalIdOrThrow(localIdFlag);
 
   const credentials = await deps.readCredentialsFn();
   if (!credentials) {
@@ -77,7 +102,7 @@ export async function cmdSessionSend(
       ...(wait ? { wait: true } : {}),
       ...(timeoutSeconds ? { timeoutSeconds } : {}),
     },
-    { surface: 'cli', defaultSessionId: null },
+    { surface: 'cli', defaultSessionId: null, ...(localId ? { messageLocalId: localId } : {}) },
   );
   if (!actionRes.ok) {
     if (json) {
@@ -91,6 +116,11 @@ export async function cmdSessionSend(
         },
       });
       return;
+    }
+    const custody = readPendingCustodyDetails(actionRes.details);
+    if (custody) {
+      console.error(chalk.yellow('localId:'), custody.localId, `(pending custody: ${custody.pendingCustody})`);
+      if (custody.message) console.error(custody.message);
     }
     throw new Error(actionRes.errorCode);
   }

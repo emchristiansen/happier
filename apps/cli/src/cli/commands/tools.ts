@@ -285,6 +285,7 @@ export async function handleToolsCommand(args: string[], overrides?: Partial<Too
               code: result.errorCode,
               message: result.error,
               ...(candidates ? { candidates } : {}),
+              ...('details' in result && result.details !== undefined ? { details: result.details } : {}),
             },
           }, { exitCode: 1 });
         }

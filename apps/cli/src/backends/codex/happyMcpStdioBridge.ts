@@ -78,9 +78,14 @@ async function main() {
   });
 
   registerHappierMcpBridgeTools(server as any, {
-    callHttpTool: async (name, args) => {
+    callHttpTool: async (name, args, requestMetadata) => {
       const client = await ensureHttpClient();
-      return await callMcpToolWithResolvedTimeout({ client, toolName: name, args });
+      return await callMcpToolWithResolvedTimeout({
+        client,
+        toolName: name,
+        args,
+        ...(requestMetadata ? { requestMetadata } : {}),
+      });
     },
   });
   registerHappierMcpResources(server as any, {

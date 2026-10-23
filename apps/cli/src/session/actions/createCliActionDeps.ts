@@ -1618,7 +1618,7 @@ export function createCliActionDeps(params: Readonly<{
     },
     ...(approvalsStore ?? {}),
     ...inventoryDeps,
-    sessionSendMessage: async ({ sessionId, message, requestedAction, wait, timeoutSeconds, permissionModeOverride, modelOverride }) => {
+    sessionSendMessage: async ({ sessionId, message, requestedAction, wait, timeoutSeconds, permissionModeOverride, modelOverride, localId, providerToolCallId }) => {
       if (!params.credentials) {
         return { ok: false, errorCode: 'not_authenticated', error: 'not_authenticated' };
       }
@@ -1651,6 +1651,16 @@ export function createCliActionDeps(params: Readonly<{
           : typeof modelOverride === 'string' && modelOverride.trim().length > 0
             ? { modelOverride }
             : {}),
+        // A caller-chosen localId is used verbatim; otherwise retries of this
+        // send reuse one localId (see claimSessionSendLocalId).
+        ...(typeof localId === 'string' && localId.trim().length > 0
+          ? { localId }
+          : {
+              retryIdentity: {
+                senderSessionId: params.sessionId,
+                providerToolCallId: normalizeString(providerToolCallId),
+              },
+            }),
       });
       if (!res.ok) {
         return {
@@ -1659,8 +1669,15 @@ export function createCliActionDeps(params: Readonly<{
           error: res.code,
           ...(res.candidates ? { candidates: res.candidates } : {}),
           ...(res.message ? { message: res.message } : {}),
-          ...(res.pendingCustody === 'confirmed' ? {
-            details: { pendingCustody: res.pendingCustody, sessionId: res.sessionId, localId: res.localId },
+          // The action envelope keeps only errorCode/error/details, so the
+          // custody facts and their explanation travel in details.
+          ...(res.pendingCustody !== undefined ? {
+            details: {
+              pendingCustody: res.pendingCustody,
+              sessionId: res.sessionId,
+              localId: res.localId,
+              ...(res.pendingCustody !== 'confirmed' && res.message ? { message: res.message } : {}),
+            },
           } : {}),
         };
       }

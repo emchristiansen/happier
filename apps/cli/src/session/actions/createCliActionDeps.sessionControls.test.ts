@@ -876,7 +876,13 @@ describe('createCliActionDeps session controls', () => {
       ctx: { encryptionKey: new Uint8Array(32).fill(1), encryptionVariant: 'legacy' }, mode: 'plain', rawSession: { metadata: {} } });
     const result = await deps.sessionSendMessage({ sessionId: 'sess_1', message: 'hello', requestedAction: { v: 1, kind: 'steer_if_active' } });
     if (outcome === 'pre_admission_timeout') {
-      expect(result).toEqual({ ok: false, errorCode: 'timeout', error: 'timeout', message: 'Pending acknowledgement timed out' });
+      // An unconfirmed enqueue may still have been committed, so the caller
+      // gets its localId to resend without duplicating it.
+      const body = mocks.axiosPost.mock.calls[0]?.[1] as { localId: string };
+      const message = 'Pending acknowledgement timed out. The message may still have been committed under localId '
+        + `${body.localId}; resending it with the same localId cannot create a second copy.`;
+      expect(result).toEqual({ ok: false, errorCode: 'timeout', error: 'timeout', message,
+        details: { pendingCustody: 'unconfirmed', sessionId: 'sess_1', localId: body.localId, message } });
       expect(mocks.callMachineRpc).not.toHaveBeenCalled();
     } else {
       const body = mocks.axiosPost.mock.calls[0]?.[1] as { localId: string };

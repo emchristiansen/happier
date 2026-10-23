@@ -42,6 +42,22 @@ describe('pendingQueueV2Transport', () => {
         mockPost.mockReset();
     });
 
+    it('waits 30 s for a Pending enqueue acknowledgement', async () => {
+        mockPost.mockResolvedValueOnce({ data: { didWrite: true } });
+
+        await enqueuePendingQueueV2MessageViaHttp({
+            token: 'token',
+            sessionId: 'session-1',
+            body: { localId: 'local-1', ciphertext: 'cipher', requestedAction: { v: 1, kind: 'enqueue' } },
+        });
+
+        expect(mockPost).toHaveBeenCalledWith(
+            expect.stringContaining('/v2/sessions/session-1/pending'),
+            expect.anything(),
+            expect.objectContaining({ timeout: 30_000 }),
+        );
+    });
+
     it('accepts a terminal enqueue rejoin only with the exact committed-message localId', async () => {
         const localId = ' exact-cli-local ';
         const requestedAction = { v: 1, kind: 'enqueue' } as const;

@@ -1,6 +1,7 @@
 import { PendingRequestedActionV1Schema, type PendingRequestedActionV1 } from '@happier-dev/protocol';
 import type { PermissionIntent } from '@happier-dev/agents';
 
+import { isPermanentRequestStatus, readHttpStatus } from '@/api/client/httpStatusError';
 import { enqueuePendingQueueV2MessageViaHttp } from '@/api/session/pendingQueueV2Transport';
 import type { Credentials } from '@/persistence';
 import {
@@ -62,7 +63,20 @@ export type SessionUserMessageAdmissionResult =
    */
   | Readonly<{ status: 'already_terminal' }>
   /** The acknowledgement was not confirmed. Custody is genuinely unknown. */
-  | Readonly<{ status: 'unconfirmed'; message: string }>;
+  | Readonly<{ status: 'unconfirmed'; message: string }>
+  /**
+   * The server answered with a permanent 4xx: it understood this request and
+   * created nothing for it. 409 means it already holds this localId with
+   * different content or action, or as a discarded row.
+   */
+  | Readonly<{ status: 'refused'; httpStatus: number; message: string }>;
+
+function readServerErrorString(error: unknown): string | null {
+  const response = error && typeof error === 'object' ? (error as { response?: { data?: unknown } }).response : undefined;
+  const data = response?.data;
+  const value = data && typeof data === 'object' ? (data as { error?: unknown }).error : undefined;
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+}
 
 export function buildSessionUserMessageRecord(params: Readonly<{
   text: string;
@@ -148,6 +162,15 @@ export async function admitSessionUserMessageToPendingQueue(params: Readonly<{
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error ?? '');
+    const httpStatus = readHttpStatus(error);
+    if (httpStatus !== null && isPermanentRequestStatus(httpStatus)) {
+      const serverError = readServerErrorString(error);
+      return {
+        status: 'refused',
+        httpStatus,
+        message: `Pending enqueue was refused with HTTP ${httpStatus}${serverError ? ` (${serverError})` : ''}`,
+      };
+    }
     return { status: 'unconfirmed', message: message || 'Pending enqueue acknowledgement was not confirmed' };
   }
 

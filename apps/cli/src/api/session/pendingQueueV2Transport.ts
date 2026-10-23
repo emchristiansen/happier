@@ -862,6 +862,21 @@ export async function discardPendingQueueV2Messages(params: {
     return discarded;
 }
 
+/**
+ * Client wait for one `POST /v2/sessions/:id/pending`.
+ *
+ * Grounded in relay measurements (2026-10-23, episode 31): completed requests
+ * averaged 5-6.5 s and reached about 15 s, and most POST /pending requests were
+ * abandoned at the old 10 s client timeout while the relay kept working on them.
+ * Server side, the enqueue runs reads that queue behind the single SQLite
+ * connection (the source of the 5-6.5 s means), then an interactive transaction
+ * whose attempts must all fit in a 25 s budget
+ * (`DEFAULT_SQLITE_TRANSACTION_TOTAL_RETRY_BUDGET_MS`, apps/server/sources/storage/inTx.ts).
+ * 30 s covers that budget plus a mean-length queue ahead of it, so the client
+ * normally stops waiting only after the relay has committed or failed on its own.
+ */
+export const PENDING_ENQUEUE_HTTP_TIMEOUT_MS = 30_000;
+
 export async function enqueuePendingQueueV2MessageViaHttp(params: {
     token: string;
     sessionId: string;
@@ -874,7 +889,7 @@ export async function enqueuePendingQueueV2MessageViaHttp(params: {
         params.body,
         {
             headers: buildSessionRunnerHttpHeaders(params.token, 'application/json'),
-            timeout: 10_000,
+            timeout: PENDING_ENQUEUE_HTTP_TIMEOUT_MS,
         },
     );
     const data = response?.data;

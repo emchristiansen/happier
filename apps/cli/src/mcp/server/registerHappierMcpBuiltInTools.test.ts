@@ -84,4 +84,43 @@ describe('registerHappierMcpBuiltInTools', () => {
       },
     );
   });
+
+  it('passes the provider tool-call id from MCP request _meta, never the JSON-RPC id', async () => {
+    const handlers = new Map<string, (args: unknown, extra?: unknown) => Promise<unknown>>();
+    const executeActionByToolName = vi.fn(async () => ({ ok: true as const, result: { ok: true } }));
+
+    registerHappierMcpBuiltInTools({
+      registerTool: (name, _meta, handler) => {
+        handlers.set(name, handler as (args: unknown, extra?: unknown) => Promise<unknown>);
+      },
+    }, {
+      sessionId: 'sess-1',
+      surface: 'session_agent',
+      deps: {
+        changeTitle: async () => ({ success: true }),
+        startExecutionRun: async () => ({ ok: false as const, errorCode: 'unsupported', error: 'unsupported' }),
+        executeActionByToolName,
+      },
+    });
+
+    const handler = handlers.get('action_execute');
+    if (!handler) throw new Error('Expected action_execute to be registered');
+    const args = { actionId: 'session.message.send', input: { sessionId: 'sess-2', message: 'hi' } };
+
+    await handler(args, {
+      requestId: 7,
+      _meta: { 'claudecode/toolUseId': 'toolu_01abc', progressToken: 'p-1' },
+    });
+    await handler(args, { requestId: 8 });
+
+    expect(executeActionByToolName).toHaveBeenNthCalledWith(
+      1,
+      'action_execute',
+      args,
+      'sess-1',
+      expect.objectContaining({ providerToolCallId: 'toolu_01abc' }),
+    );
+    const secondOptions = (executeActionByToolName.mock.calls as unknown[][])[1]?.[3] as Record<string, unknown>;
+    expect(secondOptions).not.toHaveProperty('providerToolCallId');
+  });
 });

@@ -372,6 +372,9 @@ describe('sendSessionMessage', () => {
         })).resolves.toEqual({
             ok: false,
             code: 'timeout',
+            pendingCustody: 'confirmed',
+            sessionId: 'sess-1',
+            localId: 'local-user',
         });
 
         expect(waitForIdleViaSocket).toHaveBeenCalled();
@@ -460,6 +463,9 @@ describe('sendSessionMessage', () => {
         })).resolves.toEqual({
             ok: false,
             code: 'wait_failed',
+            pendingCustody: 'confirmed',
+            sessionId: 'sess-1',
+            localId: 'local-user',
             message: expect.stringContaining('runtime_disposed_before_delivery'),
         });
 
@@ -631,6 +637,9 @@ describe('sendSessionMessage', () => {
         })).resolves.toEqual({
             ok: false,
             code: 'timeout',
+            pendingCustody: 'confirmed',
+            sessionId: 'sess-1',
+            localId: 'local-user',
         });
 
         expect(waitForIdleViaSocket).toHaveBeenCalled();
@@ -656,6 +665,9 @@ describe('sendSessionMessage', () => {
         expect(result).toEqual({
             ok: false,
             code: 'timeout',
+            pendingCustody: 'confirmed',
+            sessionId: 'sess-1',
+            localId: 'local-user',
         });
         expect(waitForIdleViaSocket).toHaveBeenCalled();
         expect(fetchEncryptedTranscriptPageAfterSeq).toHaveBeenCalledWith(expect.objectContaining({ limit: 100 }));
@@ -672,6 +684,9 @@ describe('sendSessionMessage', () => {
         expect(result).toEqual({
             ok: false,
             code: 'wait_failed',
+            pendingCustody: 'confirmed',
+            sessionId: 'sess-1',
+            localId: 'local-user',
             message,
         });
         expect(waitForIdleViaSocket).toHaveBeenCalled();
@@ -696,6 +711,9 @@ describe('sendSessionMessage', () => {
         expect(result).toEqual({
             ok: false,
             code: 'wait_failed',
+            pendingCustody: 'confirmed',
+            sessionId: 'sess-1',
+            localId: 'local-user',
             message: 'Current turn failed: Pi provider reported assistant_message_end failed without details after prompt acceptance',
         });
         expect(waitForIdleViaSocket).toHaveBeenCalled();
@@ -753,6 +771,9 @@ describe('sendSessionMessage', () => {
         expect(result).toEqual({
             ok: false,
             code: 'wait_failed',
+            pendingCustody: 'confirmed',
+            sessionId: 'sess-1',
+            localId: 'local-user',
             message: 'Current turn failed: Provider session failed',
         });
         expect(waitForIdleViaSocket).toHaveBeenCalled();
@@ -783,6 +804,9 @@ describe('sendSessionMessage', () => {
         expect(result).toEqual({
             ok: false,
             code: 'wait_failed',
+            pendingCustody: 'confirmed',
+            sessionId: 'sess-1',
+            localId: 'local-user',
             message: 'Current turn failed',
         });
         expect(waitForIdleViaSocket).toHaveBeenCalled();
@@ -804,6 +828,9 @@ describe('sendSessionMessage', () => {
         expect(result).toEqual({
             ok: false,
             code: 'wait_failed',
+            pendingCustody: 'confirmed',
+            sessionId: 'sess-1',
+            localId: 'local-user',
             message: 'Current turn failed',
         });
         expect(waitForIdleViaSocket).toHaveBeenCalled();
@@ -1280,7 +1307,15 @@ describe('sendSessionMessage', () => {
                 idOrPrefix: 'sess-1', message: 'continue', localId: 'exact-local-id', wait: false, timeoutMs: 1,
             });
             if (outcome === 'pre_admission_timeout') {
-                expect(result).toEqual({ ok: false, code: 'timeout', message: 'Pending acknowledgement timed out' });
+                expect(result).toEqual({
+                    ok: false,
+                    code: 'timeout',
+                    message: 'Pending acknowledgement timed out. The message may still have been committed under localId '
+                        + 'exact-local-id; resending it with the same localId cannot create a second copy.',
+                    pendingCustody: 'unconfirmed',
+                    sessionId: 'sess-1',
+                    localId: 'exact-local-id',
+                });
                 expect(callMachineRpc).not.toHaveBeenCalled();
             } else {
                 expect(result).toEqual(expect.objectContaining({

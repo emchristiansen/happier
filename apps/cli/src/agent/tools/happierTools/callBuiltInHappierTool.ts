@@ -113,6 +113,7 @@ export async function callBuiltInHappierTool(params: Readonly<{
     surface,
     actionsSettings,
     ...(approvalOrigin ? { approvalOrigin } : {}),
+    ...(toolCallId ? { providerToolCallId: toolCallId } : {}),
     deps: {
       changeTitle: createChangeTitleToolHandler({
         executor,
