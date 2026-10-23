@@ -160,6 +160,24 @@ happier session archive <session-id-or-prefix>
 happier session unarchive <session-id-or-prefix>
 ```
 
+List folders, and see which folder a session is in:
+
+```bash
+happier session folders
+happier session folders --session <session-id-or-prefix>
+```
+
+Each folder is listed on one line with its id, its name (or why the name is not shown), its parent folder id and its workspace. With `--json`, each folder also carries its sort key and timestamps: `folderId`, `parentFolderId`, `sortKey`, `createdAt`, `updatedAt`, `workspace`, `nameShown`, `name` and `nameNotShownReason`. The app may store a folder's display (its name and workspace) encrypted with the account key; the CLI opens it with the same key it uses for account settings. When a name is not shown, `--json` output says so with `nameShown: false`, `name: null` and a `nameNotShownReason` of `display_not_decryptable`, `no_display` or `display_has_no_name`. With `--session`, the output also gives that session's folder id (`data.session.folderId`, `null` for no folder), read from the same request. The command only reads; it does not create, rename or delete folders.
+
+Move a session into a folder, or out of every folder:
+
+```bash
+happier session set-folder <session-id-or-prefix> <folder-id>
+happier session set-folder <session-id-or-prefix> --none
+```
+
+The folder is named by its id (from `happier session folders`). After the change the command reads the session's folder back from the server and reports it (`data.readback.folderId` with `--json`); it fails with `folder_not_found` when the id is not an active folder of the account, and with `readback_mismatch` when the server reports a different folder afterwards.
+
 Update metadata:
 
 ```bash
@@ -194,7 +212,7 @@ Notes:
 - The exact allowed operations still depend on the backend/provider and your account policy.
 - Use `--json` to see the normalized intent stored/used.
 
-These session control commands map to canonical actions such as:
+Most session control commands map to canonical actions such as:
 
 - `session.title.set`
 - `session.model.set`
@@ -210,9 +228,11 @@ These session control commands map to canonical actions such as:
 
 That is what makes them available not just from the CLI, but also from external MCP hosts and session agents when the relevant surface is enabled.
 
+The folder commands are the exception: `session folders` and `session set-folder` call the server's session-organization API directly with the CLI's credentials. They have no action id, so they are available only from the CLI, and the per-surface enablement and approval controls below do not apply to them.
+
 ## Approvals and action gating
 
-Session control commands are implemented as **actions**.
+Session control commands other than the folder commands are implemented as **actions**.
 
 That means:
 

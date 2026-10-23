@@ -133,6 +133,8 @@ export const SessionControlErrorCodeSchema = z.enum([
   'session_not_found',
   'session_id_ambiguous',
   'session_active',
+  'folder_not_found',
+  'readback_mismatch',
   'execution_run_not_found',
   'execution_run_action_not_supported',
   'execution_run_invalid_action_input',
