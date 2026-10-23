@@ -10,6 +10,12 @@ import { resolveLightDataDir, resolveLightDatabaseDir } from "@/flavors/light/en
 import { resolveLightSqliteBusyTimeoutMsFromEnv } from "@/flavors/light/sqliteConnectionConfig";
 import { log } from "@/utils/logging/log";
 import { acquirePgliteDirLock } from "./locks/pgliteLock";
+import {
+    renderSqliteReadPoolDatabaseUrl,
+    requireSingleSqliteWriteConnection,
+    resolveSqliteReadPoolConfigFromEnv,
+    routeSqliteDbProperty,
+} from "./sqliteReadPool";
 export type TransactionClient = PrismaNamespace.TransactionClient;
 export type PrismaClientType = PrismaClientInstance;
 
@@ -110,6 +116,9 @@ export function resolvePreferredGeneratedClientEntrypoint(
 }
 
 let _db: PrismaClientType | null = null;
+// SQLite only, and only when HAPPIER_SQLITE_READ_POOL_SIZE is set: serves allow-listed model reads
+// issued outside a transaction. `_db` stays the single write connection. See sqliteReadPool.ts.
+let _readDb: PrismaClientType | null = null;
 let _pglite: PGlite | null = null;
 let _pgliteServer: PGLiteSocketServer | null = null;
 let _provider: DbProvider | null = null;
@@ -126,8 +135,7 @@ export const db: PrismaClientType = new Proxy({} as PrismaClientType, {
                 "Database client is not initialized. Call initDbPostgres(), initDbMysql(), initDbSqlite(), or initDbPglite() before using db.",
             );
         }
-        const value = (_db as any)[prop];
-        return typeof value === "function" ? value.bind(_db) : value;
+        return routeSqliteDbProperty({ write: _db, read: _readDb, prop });
     },
     set(_target, prop, value) {
         if (!_db) {
@@ -191,7 +199,10 @@ async function initDbFromGeneratedClient(provider: "mysql" | "sqlite"): Promise<
     _db = await createGeneratedPrismaClient(provider);
 }
 
-async function createGeneratedPrismaClient(provider: "mysql" | "sqlite"): Promise<PrismaClientType> {
+async function createGeneratedPrismaClient(
+    provider: "mysql" | "sqlite",
+    databaseUrl?: string,
+): Promise<PrismaClientType> {
     const entrypoint =
         provider === "mysql"
             ? resolveGeneratedClientEntrypoint("../../generated/mysql-client")
@@ -213,7 +224,9 @@ async function createGeneratedPrismaClient(provider: "mysql" | "sqlite"): Promis
     if (!mod?.PrismaClient) {
         throw new Error(`Invalid generated Prisma client module: ${entrypoint}`);
     }
-    return new mod.PrismaClient() as PrismaClientType;
+    return (databaseUrl === undefined
+        ? new mod.PrismaClient()
+        : new mod.PrismaClient({ datasources: { db: { url: databaseUrl } } })) as PrismaClientType;
 }
 
 export async function createDbSqliteMaintenanceClient(): Promise<PrismaClientType> {
@@ -225,11 +238,23 @@ export async function initDbMysql(): Promise<void> {
 }
 
 export async function initDbSqlite(): Promise<void> {
+    // Validate before creating any client, so a bad setting fails startup with nothing to clean up.
+    const readPool = resolveSqliteReadPoolConfigFromEnv(process.env);
+    const databaseUrl = String(process.env.DATABASE_URL ?? "");
+    if (readPool.kind === "enabled") requireSingleSqliteWriteConnection(databaseUrl);
     await initDbFromGeneratedClient("sqlite");
     if (!_db) {
         throw new Error("Database client is not initialized after initDbFromGeneratedClient(sqlite).");
     }
     await applySqliteRuntimePragmas(_db, process.env);
+    if (readPool.kind === "enabled") {
+        // Read connections take busy_timeout from the URL's socket_timeout; they never commit, so the
+        // commit-time PRAGMAs above (synchronous, journal_size_limit) matter only on the write connection.
+        _readDb = await createGeneratedPrismaClient(
+            "sqlite",
+            renderSqliteReadPoolDatabaseUrl(databaseUrl, readPool.connectionLimit),
+        );
+    }
     log(
         { module: "storage", event: "sqlite-startup-diagnostics", sqlite: resolveSqliteStartupDiagnosticsFromEnv(process.env) },
         "SQLite startup diagnostics",
@@ -339,6 +364,8 @@ export type SqliteStartupDiagnostics = Readonly<{
     databaseUrlSocketTimeoutSeconds: number | null;
     databaseUrlConnectionLimit: number | null;
     databaseUrlConnectionLimitStatus: SqliteDatabaseUrlConnectionLimitStatus;
+    /** Connections in the optional read pool, or null when there is none (the default). */
+    readPoolConnectionLimit: number | null;
 }>;
 
 // Cap the WAL file retained after a checkpoint. SQLite's default (-1) means "no limit",
@@ -419,6 +446,7 @@ function readSqliteDatabaseUrlSearchParam(env: NodeJS.ProcessEnv, key: string): 
 
 export function resolveSqliteStartupDiagnosticsFromEnv(env: NodeJS.ProcessEnv): SqliteStartupDiagnostics {
     const pragmas = resolveSqliteRuntimePragmasFromEnv(env);
+    const readPool = resolveSqliteReadPoolConfigFromEnv(env);
     const rawConnectionLimit = readSqliteDatabaseUrlSearchParam(env, "connection_limit");
     const databaseUrlConnectionLimit = parsePositiveInteger(rawConnectionLimit);
     const databaseUrlConnectionLimitStatus: SqliteDatabaseUrlConnectionLimitStatus =
@@ -433,6 +461,7 @@ export function resolveSqliteStartupDiagnosticsFromEnv(env: NodeJS.ProcessEnv): 
         databaseUrlSocketTimeoutSeconds: parsePositiveInteger(readSqliteDatabaseUrlSearchParam(env, "socket_timeout")),
         databaseUrlConnectionLimit,
         databaseUrlConnectionLimitStatus,
+        readPoolConnectionLimit: readPool.kind === "enabled" ? readPool.connectionLimit : null,
     };
 }
 
@@ -451,10 +480,18 @@ export async function shutdownDbClient(): Promise<void> {
         throw new Error("shutdownDbClient() cannot shut down PGlite; call shutdownDbPglite() instead");
     }
     const client = _db;
+    const readClient = _readDb;
     _db = null;
+    _readDb = null;
     _provider = null;
-    if (client) {
-        await client.$disconnect();
+    try {
+        if (readClient) {
+            await readClient.$disconnect();
+        }
+    } finally {
+        if (client) {
+            await client.$disconnect();
+        }
     }
 }
 

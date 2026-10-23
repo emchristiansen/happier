@@ -114,6 +114,7 @@ describe("storage/prisma sqlite pragmas", () => {
             databaseUrlSocketTimeoutSeconds: 45,
             databaseUrlConnectionLimit: 1,
             databaseUrlConnectionLimitStatus: "configured",
+            readPoolConnectionLimit: null,
         });
         expect(JSON.stringify(diagnostics)).not.toContain("happier-secret-path");
     });
