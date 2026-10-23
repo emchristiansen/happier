@@ -6591,7 +6591,10 @@ export class ApiSessionClient extends EventEmitter {
         return localIds.length + this.pendingQueueMaterializedLocalIds.size;
     }
 
-    /** Discards exactly the rows the switch count includes; handed-off and server-overridden rows stay. */
+    /**
+     * Discards the same server-row selection the switch count reads (its own fresh read; the count may
+     * also include local in-flight inputs). Handed-off and server-overridden rows stay.
+     */
     async discardPendingMessageQueueV2All(opts: { reason: 'switch_to_local' | 'manual' }): Promise<number> {
         const localIds = await this.listActionablePendingMessageQueueV2LocalIds();
         if (localIds.length === 0) return 0;
