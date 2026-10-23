@@ -77,6 +77,11 @@ function errorMessage(error: unknown): string {
  * start time recorded at the first read must match, and `isKnownGone` (when the caller
  * owns the ChildProcess) must still be false.
  *
+ * The bound is terminal and independent of the reads: a timer started with the
+ * observation resolves `unknown` / `bound-elapsed` at the deadline even if a /proc read
+ * never settles, and anything a read produces after that is ignored, so there is never
+ * a late `scoped` or a second outcome. Both timers are unref'd and cleared on finish.
+ *
  * systemd-run attaches its own PID to the scope and waits for the scope to start before
  * exec'ing the runner in that PID, so an observed path inside the scope proves the
  * attachment. It does not prove that exec succeeded.
@@ -90,17 +95,11 @@ export async function observeSessionLaunchPlacement(params: Readonly<{
   isKnownGone?: () => boolean;
   pollIntervalMs?: number;
   boundMs?: number;
-  now?: () => number;
-  sleep?: (ms: number) => Promise<void>;
 }>): Promise<SessionLaunchPlacementOutcome> {
   const procfsRootDir = params.procfsRootDir ?? '/proc';
   const readProcFile = params.readProcFile ?? defaultReadProcFile;
   const pollIntervalMs = params.pollIntervalMs ?? SESSION_LAUNCH_PLACEMENT_POLL_INTERVAL_MS;
   const boundMs = params.boundMs ?? SESSION_LAUNCH_PLACEMENT_BOUND_MS;
-  const now = params.now ?? Date.now;
-  const sleep = params.sleep ?? (async (ms: number) => await new Promise<void>((resolve) => {
-    setTimeout(resolve, ms).unref?.();
-  }));
   const isKnownGone = params.isKnownGone ?? (() => false);
 
   let lastCgroup: string | null = null;
@@ -113,40 +112,76 @@ export async function observeSessionLaunchPlacement(params: Readonly<{
   const expectedSuffix = expectedSessionLaunchCgroupSuffix({ uid: params.uid, unitName: params.unitName });
   const statPath = join(procfsRootDir, String(params.pid), 'stat');
   const cgroupPath = join(procfsRootDir, String(params.pid), 'cgroup');
-
   const readStartTime = async (): Promise<string | null> => parseProcessStartTime(await readProcFile(statPath));
 
-  const deadline = now() + boundMs;
-  let identity: string | null;
-  try {
-    if (isKnownGone()) return unknown({ kind: 'pid-gone' });
-    identity = await readStartTime();
-  } catch (error) {
-    return isProcessGoneError(error) ? unknown({ kind: 'pid-gone' }) : unknown({ kind: 'read-error', message: errorMessage(error) });
-  }
-  if (identity === null) {
-    return unknown({ kind: 'read-error', message: `unparseable ${statPath}` });
-  }
+  return await new Promise<SessionLaunchPlacementOutcome>((resolve) => {
+    let finished = false;
+    let pollTimer: NodeJS.Timeout | null = null;
+    const finish = (outcome: SessionLaunchPlacementOutcome) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(deadlineTimer);
+      if (pollTimer !== null) clearTimeout(pollTimer);
+      pollTimer = null;
+      resolve(outcome);
+    };
+    const deadlineTimer = setTimeout(() => finish(unknown({ kind: 'bound-elapsed' })), boundMs);
+    deadlineTimer.unref?.();
+    // Resolves after the interval, or never once the observation has finished (its timer is cleared).
+    const pause = async () => await new Promise<void>((wake) => {
+      pollTimer = setTimeout(() => {
+        pollTimer = null;
+        wake();
+      }, pollIntervalMs);
+      pollTimer.unref?.();
+    });
 
-  for (;;) {
-    try {
-      const cgroup = parseUnifiedCgroupPath(await readProcFile(cgroupPath));
-      // Discard the cgroup read unless the same process is still behind the PID afterwards.
-      const startTimeAfter = await readStartTime();
-      if (isKnownGone() || startTimeAfter !== identity) {
-        return unknown({ kind: 'pid-gone' });
+    // Returns null when the observation finished (deadline) while a read was in flight.
+    const poll = async (): Promise<SessionLaunchPlacementOutcome | null> => {
+      let identity: string | null;
+      try {
+        if (isKnownGone()) return unknown({ kind: 'pid-gone' });
+        identity = await readStartTime();
+      } catch (error) {
+        if (finished) return null;
+        return isProcessGoneError(error) ? unknown({ kind: 'pid-gone' }) : unknown({ kind: 'read-error', message: errorMessage(error) });
       }
-      lastCgroup = cgroup;
-      if (cgroup !== null && cgroup.endsWith(expectedSuffix)) {
-        return { outcome: 'scoped', unitName: params.unitName };
+      if (finished) return null;
+      if (identity === null) {
+        return unknown({ kind: 'read-error', message: `unparseable ${statPath}` });
       }
-    } catch (error) {
-      if (isProcessGoneError(error)) return unknown({ kind: 'pid-gone' });
-      return unknown({ kind: 'read-error', message: errorMessage(error) });
-    }
-    if (now() >= deadline) return unknown({ kind: 'bound-elapsed' });
-    await sleep(pollIntervalMs);
-  }
+
+      for (;;) {
+        try {
+          const cgroup = parseUnifiedCgroupPath(await readProcFile(cgroupPath));
+          if (finished) return null;
+          // Discard the cgroup read unless the same process is still behind the PID afterwards.
+          const startTimeAfter = await readStartTime();
+          if (finished) return null;
+          if (isKnownGone() || startTimeAfter !== identity) {
+            return unknown({ kind: 'pid-gone' });
+          }
+          lastCgroup = cgroup;
+          if (cgroup !== null && cgroup.endsWith(expectedSuffix)) {
+            return { outcome: 'scoped', unitName: params.unitName };
+          }
+        } catch (error) {
+          if (finished) return null;
+          if (isProcessGoneError(error)) return unknown({ kind: 'pid-gone' });
+          return unknown({ kind: 'read-error', message: errorMessage(error) });
+        }
+        await pause();
+        if (finished) return null;
+      }
+    };
+
+    poll().then(
+      (outcome) => {
+        if (outcome !== null) finish(outcome);
+      },
+      (error: unknown) => finish(unknown({ kind: 'read-error', message: errorMessage(error) })),
+    );
+  });
 }
 
 /** Resolves the placement outcome for an intent: observed for a scope, immediate otherwise. */

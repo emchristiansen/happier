@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   observeSessionLaunchPlacement,
@@ -45,15 +45,28 @@ function fakeProc(pid: number, states: readonly ProcState[]): { readProcFile: Re
   return { readProcFile, cgroupReads: () => cgroupReads };
 }
 
-function clock() {
-  let now = 0;
-  return {
-    now: () => now,
-    sleep: vi.fn(async (ms: number) => { now += ms; }),
-  };
+type Observation = { outcome: Awaited<ReturnType<typeof observeSessionLaunchPlacement>> | null };
+
+/** Starts an observation and records its outcome without awaiting it, so a hang cannot hang the test. */
+function start(params: Parameters<typeof observeSessionLaunchPlacement>[0]): Observation {
+  const observation: Observation = { outcome: null };
+  void observeSessionLaunchPlacement(params).then((outcome) => { observation.outcome = outcome; });
+  return observation;
+}
+
+function never<T>(): Promise<T> {
+  return new Promise<T>(() => {});
 }
 
 describe('observeSessionLaunchPlacement', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('reports scoped once the same process is seen inside this attempt\'s scope', async () => {
     const proc = fakeProc(4242, [
       { cgroup: DAEMON_CGROUP, startTime: '777' },
@@ -61,32 +74,39 @@ describe('observeSessionLaunchPlacement', () => {
       { cgroup: DAEMON_CGROUP, startTime: '777' },
       { cgroup: SCOPED_CGROUP, startTime: '777' },
     ]);
-    const time = clock();
+    const observation = start({ pid: 4242, uid: 1000, unitName: UNIT, readProcFile: proc.readProcFile });
 
-    await expect(observeSessionLaunchPlacement({
-      pid: 4242, uid: 1000, unitName: UNIT, readProcFile: proc.readProcFile, ...time,
-    })).resolves.toEqual({ outcome: 'scoped', unitName: UNIT });
+    await vi.advanceTimersByTimeAsync(99);
+    expect(observation.outcome).toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(observation.outcome).toEqual({ outcome: 'scoped', unitName: UNIT });
     expect(proc.cgroupReads()).toBe(3);
-    expect(time.sleep).toHaveBeenCalledWith(50);
+    // Neither the poll timer nor the deadline timer outlives the observation.
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('never reports scoped for another attempt\'s scope; it reports unknown when the bound elapses', async () => {
     const otherScope = SCOPED_CGROUP.replace(LAUNCH_ID, '00000000-0000-4000-8000-000000000000');
     const proc = fakeProc(4242, [{ cgroup: otherScope, startTime: '777' }]);
 
-    await expect(observeSessionLaunchPlacement({
-      pid: 4242, uid: 1000, unitName: UNIT, readProcFile: proc.readProcFile, ...clock(),
-    })).resolves.toEqual({ outcome: 'unknown', lastCgroup: otherScope, reason: { kind: 'bound-elapsed' } });
-    // 50 ms polls over a 2 s bound: the first read plus one per elapsed interval.
-    expect(proc.cgroupReads()).toBe(41);
+    const observation = start({ pid: 4242, uid: 1000, unitName: UNIT, readProcFile: proc.readProcFile });
+
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(observation.outcome).toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(observation.outcome).toEqual({ outcome: 'unknown', lastCgroup: otherScope, reason: { kind: 'bound-elapsed' } });
+    // 50 ms polls inside a 2 s bound: reads at 0, 50, ..., 1950 ms.
+    expect(proc.cgroupReads()).toBe(40);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('never reports scoped for the user manager\'s scope under another uid', async () => {
     const proc = fakeProc(4242, [{ cgroup: SCOPED_CGROUP, startTime: '777' }]);
 
-    await expect(observeSessionLaunchPlacement({
-      pid: 4242, uid: 1001, unitName: UNIT, readProcFile: proc.readProcFile, ...clock(),
-    })).resolves.toMatchObject({ outcome: 'unknown', reason: { kind: 'bound-elapsed' } });
+    const observation = start({ pid: 4242, uid: 1001, unitName: UNIT, readProcFile: proc.readProcFile });
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(observation.outcome).toMatchObject({ outcome: 'unknown', reason: { kind: 'bound-elapsed' } });
   });
 
   it('discards a scoped read when the PID now names a different process', async () => {
@@ -97,9 +117,11 @@ describe('observeSessionLaunchPlacement', () => {
       { cgroup: SCOPED_CGROUP, startTime: '999' },
     ]);
 
-    await expect(observeSessionLaunchPlacement({
-      pid: 4242, uid: 1000, unitName: UNIT, readProcFile: proc.readProcFile, ...clock(),
-    })).resolves.toEqual({ outcome: 'unknown', lastCgroup: DAEMON_CGROUP, reason: { kind: 'pid-gone' } });
+    const observation = start({ pid: 4242, uid: 1000, unitName: UNIT, readProcFile: proc.readProcFile });
+
+    await vi.advanceTimersByTimeAsync(50);
+    expect(observation.outcome).toEqual({ outcome: 'unknown', lastCgroup: DAEMON_CGROUP, reason: { kind: 'pid-gone' } });
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('reports pid-gone when the process disappears, and read-error for other failures', async () => {
@@ -108,18 +130,19 @@ describe('observeSessionLaunchPlacement', () => {
       { cgroup: DAEMON_CGROUP, startTime: '777' },
       'gone',
     ]);
-    await expect(observeSessionLaunchPlacement({
-      pid: 4242, uid: 1000, unitName: UNIT, readProcFile: gone.readProcFile, ...clock(),
-    })).resolves.toEqual({ outcome: 'unknown', lastCgroup: DAEMON_CGROUP, reason: { kind: 'pid-gone' } });
+    const goneObservation = start({ pid: 4242, uid: 1000, unitName: UNIT, readProcFile: gone.readProcFile });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(goneObservation.outcome).toEqual({ outcome: 'unknown', lastCgroup: DAEMON_CGROUP, reason: { kind: 'pid-gone' } });
 
     const denied = fakeProc(4242, [Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })]);
-    await expect(observeSessionLaunchPlacement({
-      pid: 4242, uid: 1000, unitName: UNIT, readProcFile: denied.readProcFile, ...clock(),
-    })).resolves.toEqual({
+    const deniedObservation = start({ pid: 4242, uid: 1000, unitName: UNIT, readProcFile: denied.readProcFile });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(deniedObservation.outcome).toEqual({
       outcome: 'unknown',
       lastCgroup: null,
       reason: { kind: 'read-error', message: 'EACCES: permission denied' },
     });
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('stops trusting the PID once the owning ChildProcess has exited', async () => {
@@ -131,9 +154,82 @@ describe('observeSessionLaunchPlacement', () => {
       return content;
     };
 
-    await expect(observeSessionLaunchPlacement({
-      pid: 4242, uid: 1000, unitName: UNIT, readProcFile, isKnownGone: () => exited, ...clock(),
-    })).resolves.toEqual({ outcome: 'unknown', lastCgroup: null, reason: { kind: 'pid-gone' } });
+    const observation = start({ pid: 4242, uid: 1000, unitName: UNIT, readProcFile, isKnownGone: () => exited });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(observation.outcome).toEqual({ outcome: 'unknown', lastCgroup: null, reason: { kind: 'pid-gone' } });
+  });
+
+  it('ends at the bound when the first stat read never settles', async () => {
+    const observation = start({ pid: 4242, uid: 1000, unitName: UNIT, readProcFile: () => never<string>() });
+
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(observation.outcome).toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(observation.outcome).toEqual({ outcome: 'unknown', lastCgroup: null, reason: { kind: 'bound-elapsed' } });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('ends at the bound when a cgroup read never settles, keeping the last completed read', async () => {
+    const proc = fakeProc(4242, [{ cgroup: DAEMON_CGROUP, startTime: '777' }]);
+    let cgroupReads = 0;
+    const readProcFile: ReadProcFile = async (path) => {
+      if (path.endsWith('/cgroup') && ++cgroupReads > 1) return await never<string>();
+      return await proc.readProcFile(path);
+    };
+    const observation = start({ pid: 4242, uid: 1000, unitName: UNIT, readProcFile });
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(observation.outcome).toEqual({ outcome: 'unknown', lastCgroup: DAEMON_CGROUP, reason: { kind: 'bound-elapsed' } });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('ignores a scoped read that completes after the bound, and stops polling', async () => {
+    const proc = fakeProc(4242, [{ cgroup: SCOPED_CGROUP, startTime: '777' }]);
+    const reads: string[] = [];
+    const readProcFile: ReadProcFile = async (path) => {
+      reads.push(path);
+      if (path.endsWith('/cgroup')) {
+        // Settles 500 ms after the bound with a matching scope path.
+        await new Promise<void>((resolve) => { setTimeout(resolve, 2_500); });
+      }
+      return await proc.readProcFile(path);
+    };
+    const observation = start({ pid: 4242, uid: 1000, unitName: UNIT, readProcFile });
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(observation.outcome).toEqual({ outcome: 'unknown', lastCgroup: null, reason: { kind: 'bound-elapsed' } });
+    const readsAtBound = reads.length;
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(observation.outcome).toEqual({ outcome: 'unknown', lastCgroup: null, reason: { kind: 'bound-elapsed' } });
+    // At most the identity re-check that belonged to the late read; no further polls.
+    expect(reads.length).toBeLessThanOrEqual(readsAtBound + 1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('swallows a read that rejects after the bound', async () => {
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      const observation = start({
+        pid: 4242,
+        uid: 1000,
+        unitName: UNIT,
+        readProcFile: () => new Promise<string>((_resolve, reject) => {
+          setTimeout(() => reject(Object.assign(new Error('EIO: late'), { code: 'EIO' })), 3_000);
+        }),
+      });
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(observation.outcome).toEqual({ outcome: 'unknown', lastCgroup: null, reason: { kind: 'bound-elapsed' } });
+      await vi.advanceTimersByTimeAsync(2_000);
+      vi.useRealTimers();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(observation.outcome).toEqual({ outcome: 'unknown', lastCgroup: null, reason: { kind: 'bound-elapsed' } });
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', unhandled);
+    }
   });
 });
 
