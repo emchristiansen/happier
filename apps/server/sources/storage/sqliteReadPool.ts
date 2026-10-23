@@ -55,12 +55,19 @@ export function renderSqliteReadPoolDatabaseUrl(databaseUrl: string, connectionL
     return `${base}?${searchParams.toString()}${hash}`;
 }
 
-/** A read pool is only sound beside exactly one write connection; refuse anything else at startup. */
+/**
+ * A read pool is only sound beside exactly one write connection; refuse anything else at startup.
+ * Prisma honours the last of repeated URL parameters while URLSearchParams.get returns the first, so
+ * the URL must carry exactly one connection_limit, and it must be 1.
+ */
 export function requireSingleSqliteWriteConnection(databaseUrl: string): void {
-    const found = splitDatabaseUrl(databaseUrl).searchParams.get("connection_limit");
-    if (found?.trim() !== "1") {
+    const found = splitDatabaseUrl(databaseUrl).searchParams.getAll("connection_limit");
+    if (found.length !== 1 || found[0]!.trim() !== "1") {
+        const described = found.length === 0
+            ? "no connection_limit"
+            : found.map((value) => `connection_limit=${value}`).join(" and ");
         throw new Error(
-            `${SQLITE_READ_POOL_SIZE_ENV} requires DATABASE_URL to set connection_limit=1 for the write connection (found: ${found === null ? "no connection_limit" : `connection_limit=${found}`})`,
+            `${SQLITE_READ_POOL_SIZE_ENV} requires DATABASE_URL to set exactly one connection_limit=1 for the write connection (found: ${described})`,
         );
     }
 }

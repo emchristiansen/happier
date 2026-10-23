@@ -48,6 +48,11 @@ describe("requireSingleSqliteWriteConnection", () => {
         "file:/d/x.sqlite?socket_timeout=30&connection_limit=4",
         "file:/d/x.sqlite?socket_timeout=30",
         "file:/d/x.sqlite",
+        // Prisma honours the last of repeated parameters (measured: 1&4 opens 4 connections), so a
+        // repeated connection_limit is refused whatever its values.
+        "file:/d/x.sqlite?socket_timeout=30&connection_limit=1&connection_limit=4",
+        "file:/d/x.sqlite?socket_timeout=30&connection_limit=4&connection_limit=1",
+        "file:/d/x.sqlite?connection_limit=1&connection_limit=1",
     ])("refuses a read pool beside %s", (url) => {
         expect(() => requireSingleSqliteWriteConnection(url)).toThrow(/connection_limit=1/);
     });
