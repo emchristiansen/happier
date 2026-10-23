@@ -23,6 +23,7 @@ function createFakeRelay(params: Readonly<{ secret: Uint8Array; senderSessionId:
   const rows = new Map<string, PendingRow>();
   const postedLocalIds: string[] = [];
   let dropAcknowledgements = 0;
+  let permissionMode = 'default';
 
   const sessionRecord = async (id: string) => {
     const { encodeBase64, encryptLegacy } = await import('@/api/encryption');
@@ -33,7 +34,7 @@ function createFakeRelay(params: Readonly<{ secret: Uint8Array; senderSessionId:
       updatedAt: 2,
       active: true,
       activeAt: 1,
-      metadata: encodeBase64(encryptLegacy({ path: '/repo', host: 'host1', permissionMode: 'default' }, params.secret), 'base64'),
+      metadata: encodeBase64(encryptLegacy({ path: '/repo', host: 'host1', permissionMode }, params.secret), 'base64'),
       metadataVersion: 0,
       agentState: null,
       agentStateVersion: 0,
@@ -106,6 +107,10 @@ function createFakeRelay(params: Readonly<{ secret: Uint8Array; senderSessionId:
     postedLocalIds,
     dropNextAcknowledgements(count: number) {
       dropAcknowledgements = count;
+    },
+    /** Another actor changes the session's permission mode metadata. */
+    setPermissionMode(mode: string) {
+      permissionMode = mode;
     },
   };
 }
@@ -209,6 +214,20 @@ describe('session message send idempotency at the relay HTTP boundary (integrati
     expect(results.map((result) => result.ok)).toEqual([false, false, false, true]);
     expect(relay!.postedLocalIds).toHaveLength(4);
     expect(new Set(relay!.postedLocalIds).size).toBe(1);
+    expect(relay!.rows.size).toBe(1);
+  });
+
+  it('re-sends the first attempt bytes after a lost acknowledgement even when the session metadata changed', async () => {
+    relay!.dropNextAcknowledgements(1);
+    const first = await sessionSend([targetSessionId, 'CORRECTION CASE 3']);
+    relay!.setPermissionMode('read-only');
+    const second = await sessionSend([targetSessionId, 'CORRECTION CASE 3']);
+
+    expect(first.error?.code).toBe('timeout');
+    expect(second).toEqual(expect.objectContaining({ ok: true }));
+    expect(new Set(relay!.postedLocalIds).size).toBe(1);
+    // The retry re-sent the identical body, so the relay answered with the existing row
+    // instead of refusing a re-sealed one (which would let a third send mint a new id).
     expect(relay!.rows.size).toBe(1);
   });
 

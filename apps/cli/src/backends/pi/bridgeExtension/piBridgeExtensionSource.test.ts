@@ -105,7 +105,10 @@ const { writeFileSync } = require('node:fs');
 writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd() }));
 const argsIndex = process.argv.indexOf('--args-json');
 const args = JSON.parse(process.argv[argsIndex + 1]);
-if (args.input.value === 'fail') {
+if (args.input.value === 'send-timeout') {
+  const message = 'Pending enqueue acknowledgement was not confirmed. The message may still have been committed under localId local-7; resending it with the same localId cannot create a second copy.';
+  process.stdout.write(JSON.stringify({ ok: false, error: { code: 'timeout', message: 'timeout', details: { pendingCustody: 'unconfirmed', sessionId: 'sess-target', localId: 'local-7', message } } }) + '\\n');
+} else if (args.input.value === 'fail') {
   process.stdout.write(JSON.stringify({ ok: false, error: { code: 'action_failed', message: 'expected failure' } }) + '\\n');
 } else if (args.input.value === 'large') {
   process.stdout.write(JSON.stringify({ ok: true, data: { output: 'x'.repeat(100000) } }) + '\\n');
@@ -181,6 +184,16 @@ if (args.input.value === 'fail') {
         undefined,
         { cwd: dir },
       )).rejects.toThrow('action_failed');
+
+      const sendTimeout = harness.tools[0]!.execute(
+        'call-send-timeout',
+        { value: 'send-timeout' },
+        new AbortController().signal,
+        undefined,
+        { cwd: dir },
+      );
+      await expect(sendTimeout).rejects.toThrow('code=timeout — timeout — pendingCustody=unconfirmed localId=local-7 sessionId=sess-target');
+      await expect(sendTimeout).rejects.toThrow('may still have been committed under localId local-7');
 
       const largeResult = await harness.tools[0]!.execute(
         'call-3',

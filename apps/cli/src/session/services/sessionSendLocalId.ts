@@ -5,6 +5,10 @@ import { join } from 'node:path';
 import { readPendingLocalId, type PendingRequestedActionV1 } from '@happier-dev/protocol';
 
 import { configuration } from '@/configuration';
+import {
+  readSessionUserMessageAdmissionBody,
+  type SessionUserMessageAdmissionBody,
+} from '@/session/services/admitSessionUserMessage';
 import { writeJsonAtomic } from '@/utils/fs/writeJsonAtomic';
 
 /**
@@ -26,6 +30,12 @@ import { writeJsonAtomic } from '@/utils/fs/writeJsonAtomic';
  *    exact send inputs, the localId of the last attempt that did not end in
  *    success, for `SESSION_SEND_RETRY_WINDOW_MS` after that attempt. An identical
  *    send inside the window reuses it; a success removes it.
+ *
+ * The entry also keeps the exact admission body first issued under its localId
+ * (`preserveAdmission`). A retry re-issues those bytes, not a re-sealing under
+ * the target's current model or permission metadata: the relay answers an
+ * identical re-enqueue with the existing row, but refuses a changed one, and
+ * a refused retry would let the next identical send mint a fresh localId.
  *
  * Why not a pure (target, text) digest: agents send identical texts on purpose
  * ("READY TO MOVE", repeated status lines). With a fixed digest the relay would
@@ -73,10 +83,17 @@ export type SessionSendAttemptOutcome =
 
 export type ClaimedSessionSendLocalId = Readonly<{
   localId: string;
+  /**
+   * Returns the admission body to issue for `sessionId`: the one already kept
+   * for this localId and session, else `candidate`, which it keeps first.
+   */
+  preserveAdmission: (sessionId: string, candidate: SessionUserMessageAdmissionBody) => Promise<SessionUserMessageAdmissionBody>;
   settle: (outcome: SessionSendAttemptOutcome) => Promise<void>;
 }>;
 
-type LedgerEntry = Readonly<{ v: 1; localId: string; lastAttemptAtMs: number }>;
+type LedgerAdmission = Readonly<{ sessionId: string; body: SessionUserMessageAdmissionBody }>;
+
+type LedgerEntry = Readonly<{ v: 1; localId: string; lastAttemptAtMs: number; admission?: LedgerAdmission }>;
 
 function sha256Hex(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -126,7 +143,16 @@ function readLedgerEntry(raw: string): LedgerEntry | null {
   if (record.v !== 1 || localId === null || typeof lastAttemptAtMs !== 'number' || !Number.isFinite(lastAttemptAtMs)) {
     return null;
   }
-  return { v: 1, localId, lastAttemptAtMs };
+  const admission = readLedgerAdmission(record.admission, localId);
+  return { v: 1, localId, lastAttemptAtMs, ...(admission ? { admission } : {}) };
+}
+
+function readLedgerAdmission(value: unknown, localId: string): LedgerAdmission | null {
+  if (!value || typeof value !== 'object') return null;
+  const record = value as Record<string, unknown>;
+  const sessionId = typeof record.sessionId === 'string' && record.sessionId.length > 0 ? record.sessionId : null;
+  const body = readSessionUserMessageAdmissionBody(record.body);
+  return sessionId && body && body.localId === localId ? { sessionId, body } : null;
 }
 
 async function readEntryFile(path: string): Promise<LedgerEntry | null> {
@@ -185,9 +211,11 @@ export async function claimSessionSendLocalId(params: Readonly<{
     : randomUUID();
 
   let localId: string;
+  let admission: LedgerAdmission | null = null;
   const existing = await readEntryFile(path);
   if (isLive(existing, now())) {
     localId = existing.localId;
+    admission = existing.admission ?? null;
   } else if (existing === null) {
     const candidate: LedgerEntry = { v: 1, localId: freshLocalId(), lastAttemptAtMs: now() };
     if (await publishEntryIfAbsent(directory, path, candidate)) {
@@ -195,21 +223,39 @@ export async function claimSessionSendLocalId(params: Readonly<{
     } else {
       const winner = await readEntryFile(path);
       localId = isLive(winner, now()) ? winner.localId : candidate.localId;
+      admission = isLive(winner, now()) ? winner.admission ?? null : null;
     }
   } else {
     localId = freshLocalId();
   }
+  const writeEntry = async () => await writeJsonAtomic(path, {
+    v: 1,
+    localId,
+    lastAttemptAtMs: now(),
+    ...(admission ? { admission } : {}),
+  } satisfies LedgerEntry);
   // Persist before the first possible issuance: a process killed mid-attempt
   // must leave the localId for its retry to find.
-  await writeJsonAtomic(path, { v: 1, localId, lastAttemptAtMs: now() } satisfies LedgerEntry);
+  await writeEntry();
 
   return {
     localId,
+    preserveAdmission: async (sessionId, candidate) => {
+      if (candidate.localId !== localId) throw new Error('session_send_admission_identity_changed');
+      if (admission && admission.sessionId === sessionId) return admission.body;
+      // A different session behind the same typed target has no committed
+      // bytes under this localId to reconcile with; keep the first session's.
+      if (admission) return candidate;
+      admission = { sessionId, body: candidate };
+      // Persist before the first issuance, so a retry re-sends these bytes.
+      await writeEntry();
+      return candidate;
+    },
     settle: async (outcome) => {
       const current = await readEntryFile(path);
       if (current !== null && current.localId !== localId) return;
       if (outcome === 'unsuccessful') {
-        await writeJsonAtomic(path, { v: 1, localId, lastAttemptAtMs: now() } satisfies LedgerEntry);
+        await writeEntry();
         return;
       }
       await unlink(path).catch((error: NodeJS.ErrnoException) => {

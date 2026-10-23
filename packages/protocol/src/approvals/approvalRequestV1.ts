@@ -50,6 +50,17 @@ export const ApprovalExecutionV1Schema = z.object({
 }).passthrough();
 export type ApprovalExecutionV1 = z.infer<typeof ApprovalExecutionV1Schema>;
 
+/**
+ * Trusted invocation identities of the requester, captured when the approval
+ * request is created, so the approved execution keeps them (for example the
+ * caller's `--local-id`) and never takes the decider's.
+ */
+export const ApprovalRequestInvocationIdentityV1Schema = z.object({
+  messageLocalId: z.string().min(1).optional(),
+  providerToolCallId: z.string().min(1).optional(),
+}).strict();
+export type ApprovalRequestInvocationIdentityV1 = z.infer<typeof ApprovalRequestInvocationIdentityV1Schema>;
+
 export const ApprovalRequestV1Schema = z.object({
   v: z.literal(1),
   status: ApprovalRequestStatusSchema,
@@ -62,6 +73,7 @@ export const ApprovalRequestV1Schema = z.object({
   summary: z.string().min(1),
   approval: ActionApprovalSchema.optional(),
   origin: ApprovalRequestOriginV1Schema.optional(),
+  invocationIdentity: ApprovalRequestInvocationIdentityV1Schema.optional(),
   preview: z.unknown().optional(),
   decision: ApprovalDecisionV1Schema.optional(),
   execution: ApprovalExecutionV1Schema.optional(),

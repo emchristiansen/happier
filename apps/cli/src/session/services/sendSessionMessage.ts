@@ -96,13 +96,19 @@ export type SendSessionMessageResult =
 
 /**
  * How the attempt's Pending localId is chosen. Exactly one of:
- * - `localId`: the caller's own key, used verbatim (daemon continuations, `--local-id`);
- * - `retryIdentity`: derived per `claimSessionSendLocalId`, so retries reuse it;
+ * - `localId`: the caller's own key, used verbatim (daemon continuations, `--local-id`),
+ *   with the caller's own optional `preserveAdmission`;
+ * - `retryIdentity`: derived per `claimSessionSendLocalId`, so retries reuse it; the
+ *   claim then owns admission preservation for the logical attempt;
  * - neither: a fresh random localId (the historical behaviour, kept for daemon callers).
  */
 type SendSessionMessageLocalIdChoice =
-  | Readonly<{ localId?: string; retryIdentity?: never }>
-  | Readonly<{ localId?: never; retryIdentity: SessionSendRetryIdentity }>;
+  | Readonly<{
+      localId?: string;
+      retryIdentity?: never;
+      preserveAdmission?: (body: SessionUserMessageAdmissionBody) => Promise<SessionUserMessageAdmissionBody>;
+    }>
+  | Readonly<{ localId?: never; retryIdentity: SessionSendRetryIdentity; preserveAdmission?: never }>;
 
 function parsePermissionIntentOrThrow(raw: string): PermissionIntent {
   const parsed = parsePermissionIntentAlias(raw);
@@ -486,8 +492,12 @@ type SendSessionMessageParams = Readonly<{
   requestedAction?: PendingRequestedActionV1;
   pendingAdmissionMode?: 'continuation_if_no_queued_user_input';
   assertCanAdmit?: () => void;
-  preserveAdmission?: (body: SessionUserMessageAdmissionBody) => Promise<SessionUserMessageAdmissionBody>;
 }> & SendSessionMessageLocalIdChoice;
+
+type SendAttemptIdentity = Readonly<{
+  localId: string | undefined;
+  preserveAdmission?: (sessionId: string, body: SessionUserMessageAdmissionBody) => Promise<SessionUserMessageAdmissionBody>;
+}>;
 
 function classifySendAttemptOutcome(result: SendSessionMessageResult): SessionSendAttemptOutcome {
   if (result.ok) return 'succeeded';
@@ -496,7 +506,11 @@ function classifySendAttemptOutcome(result: SendSessionMessageResult): SessionSe
 
 export async function sendSessionMessage(params: SendSessionMessageParams): Promise<SendSessionMessageResult> {
   if (!params.retryIdentity) {
-    return await sendSessionMessageOnce(params, params.localId);
+    const callerPreserveAdmission = params.preserveAdmission;
+    return await sendSessionMessageOnce(params, {
+      localId: params.localId,
+      ...(callerPreserveAdmission ? { preserveAdmission: async (_sessionId, body) => await callerPreserveAdmission(body) } : {}),
+    });
   }
   const claim = await claimSessionSendLocalId({
     identity: params.retryIdentity,
@@ -513,7 +527,10 @@ export async function sendSessionMessage(params: SendSessionMessageParams): Prom
   });
   let result: SendSessionMessageResult;
   try {
-    result = await sendSessionMessageOnce(params, claim.localId);
+    result = await sendSessionMessageOnce(params, {
+      localId: claim.localId,
+      preserveAdmission: claim.preserveAdmission,
+    });
   } catch (error) {
     await settleRetryLedgerEntry(claim, 'unsuccessful');
     throw error;
@@ -541,8 +558,9 @@ async function settleRetryLedgerEntry(
 
 async function sendSessionMessageOnce(
   params: SendSessionMessageParams,
-  requestedLocalId: string | undefined,
+  attempt: SendAttemptIdentity,
 ): Promise<SendSessionMessageResult> {
+  const requestedLocalId = attempt.localId;
   const sessionTarget = await resolveSessionTransportContext({
     credentials: params.credentials,
     idOrPrefix: params.idOrPrefix,
@@ -594,7 +612,9 @@ async function sendSessionMessageOnce(
     text: params.message,
     permissionIntent,
     modelId,
-    ...(params.preserveAdmission ? { preserveAdmission: params.preserveAdmission } : {}),
+    ...(attempt.preserveAdmission
+      ? { preserveAdmission: async (body: SessionUserMessageAdmissionBody) => await attempt.preserveAdmission!(sessionId, body) }
+      : {}),
     ...(params.assertCanAdmit ? { assertCanAdmit: params.assertCanAdmit } : {}),
     ...(params.requestedAction ? { requestedAction: params.requestedAction } : {}),
     ...(params.pendingAdmissionMode ? { pendingAdmissionMode: params.pendingAdmissionMode } : {}),

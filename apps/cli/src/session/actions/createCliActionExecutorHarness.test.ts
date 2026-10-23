@@ -388,4 +388,127 @@ describe('createCliActionExecutorHarness', () => {
 
     expect(await expectSettled(pending)).toMatchObject({ decision: 'canceled' });
   });
+
+  describe('session.message.send identity across approval', () => {
+    function createSendApprovalHarnesses(sessionSendMessage: NonNullable<ActionExecutorDeps['sessionSendMessage']>) {
+      const requests = new Map<string, ApprovalRequestV1>();
+      let nextArtifact = 0;
+      const sharedDeps: Partial<ActionExecutorDeps> = {
+        approvalsCreate: vi.fn(async ({ request }) => {
+          nextArtifact += 1;
+          const artifactId = `approval_send_${nextArtifact}`;
+          requests.set(artifactId, request);
+          return { artifactId };
+        }),
+        approvalsGet: vi.fn(async ({ artifactId }) => requests.get(artifactId) ?? null),
+        approvalsUpdate: vi.fn(async ({ artifactId, request }) => {
+          requests.set(artifactId, request);
+          return { ok: true as const };
+        }),
+        isActionEnabled: () => true,
+        isActionApprovalRequired: (id, ctx) => id === 'session.message.send' && ctx.surface === 'cli',
+        sessionSendMessage,
+      };
+      const params = {
+        token: 'token',
+        sessionId: 'sess_1',
+        ctx: { encryptionKey: new Uint8Array(32).fill(1), encryptionVariant: 'legacy' as const },
+      };
+      return {
+        requests,
+        requester: createCliActionExecutorHarness(params, sharedDeps),
+        decider: createCliActionExecutorHarness(params, sharedDeps),
+      };
+    }
+
+    const deciderContext = {
+      surface: 'cli' as const,
+      defaultSessionId: 'sess_1',
+      messageLocalId: 'decider-key',
+      providerToolCallId: 'decider-call',
+    };
+
+    it("runs an approved deferred send under the requester's --local-id, not the decider's", async () => {
+      const sessionSendMessage = vi.fn(async () => ({ ok: true, sessionId: 'sess_2', localId: 'caller-key-1', waited: false }));
+      const { requests, requester, decider } = createSendApprovalHarnesses(sessionSendMessage);
+
+      const created = await requester.executor.execute(
+        'session.message.send',
+        { sessionId: 'sess_2', message: 'hello' },
+        { surface: 'cli', defaultSessionId: null, messageLocalId: 'caller-key-1' },
+      );
+      expect(created).toMatchObject({ ok: true, result: { kind: 'approval_request_created', artifactId: 'approval_send_1' } });
+      expect(sessionSendMessage).not.toHaveBeenCalled();
+      expect(requests.get('approval_send_1')?.invocationIdentity).toEqual({ messageLocalId: 'caller-key-1' });
+
+      await decider.executor.execute(
+        'approval.request.decide' as any,
+        { artifactId: 'approval_send_1', decision: 'approve' },
+        deciderContext,
+      );
+
+      expect(sessionSendMessage).toHaveBeenCalledTimes(1);
+      const sendArgs = (sessionSendMessage.mock.calls as unknown[][])[0]?.[0] as Record<string, unknown>;
+      expect(sendArgs.localId).toBe('caller-key-1');
+      expect(sendArgs).not.toHaveProperty('providerToolCallId');
+    });
+
+    it('records the custody details of a failed approved send', async () => {
+      const details = {
+        pendingCustody: 'unconfirmed',
+        sessionId: 'sess_2',
+        localId: 'caller-key-2',
+        message: 'Pending enqueue acknowledgement was not confirmed. The message may still have been committed under localId caller-key-2',
+      };
+      const sessionSendMessage = vi.fn(async () => ({ ok: false, errorCode: 'timeout', error: 'timeout', details }));
+      const { requests, requester, decider } = createSendApprovalHarnesses(sessionSendMessage);
+
+      await requester.executor.execute(
+        'session.message.send',
+        { sessionId: 'sess_2', message: 'hello' },
+        { surface: 'cli', defaultSessionId: null, messageLocalId: 'caller-key-2' },
+      );
+      const decided = await decider.executor.execute(
+        'approval.request.decide' as any,
+        { artifactId: 'approval_send_1', decision: 'approve' },
+        deciderContext,
+      );
+
+      expect(requests.get('approval_send_1')).toMatchObject({
+        status: 'failed',
+        execution: { ok: false, errorCode: 'timeout', error: 'timeout', details },
+      });
+      expect(decided).toMatchObject({
+        ok: true,
+        result: { status: 'failed', execution: { ok: false, errorCode: 'timeout', details } },
+      });
+    });
+
+    it("keeps the requester's identities in the prepared blocking continuation", async () => {
+      const sessionSendMessage = vi.fn(async () => ({ ok: true, sessionId: 'sess_2', localId: 'caller-key-3', waited: false }));
+      const { requester, decider } = createSendApprovalHarnesses(sessionSendMessage);
+
+      const preparing = requester.executor.prepare(
+        'session.message.send',
+        { sessionId: 'sess_2', message: 'hello' },
+        { surface: 'cli', defaultSessionId: null, messageLocalId: 'caller-key-3', providerToolCallId: 'requester-call' },
+      );
+      await vi.waitFor(async () => {
+        const decided = await decider.executor.execute(
+          'approval.request.decide' as any,
+          { artifactId: 'approval_send_1', decision: 'approve' },
+          deciderContext,
+        );
+        expect(decided).toMatchObject({ ok: true, result: { status: 'approved' } });
+      });
+      const prepared = await preparing;
+      if (prepared.kind !== 'ready') throw new Error('expected a ready invocation');
+      await expect(prepared.invocation.run()).resolves.toMatchObject({ ok: true });
+
+      expect(sessionSendMessage).toHaveBeenCalledTimes(1);
+      const sendArgs = (sessionSendMessage.mock.calls as unknown[][])[0]?.[0] as Record<string, unknown>;
+      expect(sendArgs.localId).toBe('caller-key-3');
+      expect(sendArgs.providerToolCallId).toBe('requester-call');
+    });
+  });
 });

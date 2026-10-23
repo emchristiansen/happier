@@ -111,6 +111,15 @@ function envelopeToToolResult(envelope) {
   const parts = ["code=" + (typeof error.code === "string" && error.code ? error.code : "unknown")];
   if (typeof error.message === "string" && error.message) parts.push(error.message);
   if (Array.isArray(error.candidates) && error.candidates.length > 0) parts.push("candidates: " + error.candidates.join(", "));
+  // Message custody: which localId the send used, whether the relay holds it,
+  // and the explanation (for a timeout: it may still have been committed).
+  const details = error.details && typeof error.details === "object" ? error.details : {};
+  if (typeof details.pendingCustody === "string" && details.pendingCustody) {
+    parts.push("pendingCustody=" + details.pendingCustody
+      + (typeof details.localId === "string" && details.localId ? " localId=" + details.localId : "")
+      + (typeof details.sessionId === "string" && details.sessionId ? " sessionId=" + details.sessionId : ""));
+  }
+  if (typeof details.message === "string" && details.message && details.message !== error.message) parts.push(details.message);
   const projected = truncateToolOutput(parts.join(" — "));
   throw new Error(projected.content);
 }

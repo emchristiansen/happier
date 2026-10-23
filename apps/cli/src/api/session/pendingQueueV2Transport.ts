@@ -863,17 +863,22 @@ export async function discardPendingQueueV2Messages(params: {
 }
 
 /**
- * Client wait for one `POST /v2/sessions/:id/pending`.
+ * Client wait for one `POST /v2/sessions/:id/pending` attempt (not an
+ * end-to-end deadline for the send).
  *
- * Grounded in relay measurements (2026-10-23, episode 31): completed requests
- * averaged 5-6.5 s and reached about 15 s, and most POST /pending requests were
- * abandoned at the old 10 s client timeout while the relay kept working on them.
- * Server side, the enqueue runs reads that queue behind the single SQLite
- * connection (the source of the 5-6.5 s means), then an interactive transaction
- * whose attempts must all fit in a 25 s budget
- * (`DEFAULT_SQLITE_TRANSACTION_TOTAL_RETRY_BUDGET_MS`, apps/server/sources/storage/inTx.ts).
- * 30 s covers that budget plus a mean-length queue ahead of it, so the client
- * normally stops waiting only after the relay has committed or failed on its own.
+ * A chosen value with a measured motivation. During the 2026-10-23 relay
+ * saturation (episode 31), requests that completed averaged 5-6.5 s and reached
+ * about 15 s, and those figures count completed requests only. Most POST
+ * /pending arrivals logged no completion while the client gave up at 10 s, and
+ * the relay does not cancel a handler whose client left. Server side, the
+ * enqueue queues behind the relay's single SQLite connection and then runs an
+ * interactive transaction whose retry scheduling is budgeted at 25 s
+ * (`DEFAULT_SQLITE_TRANSACTION_TOTAL_RETRY_BUDGET_MS`,
+ * apps/server/sources/storage/inTx.ts); that budget is not a wall-clock bound
+ * on the whole request. 30 s is three times the old wait and twice the longest
+ * completion observed, so far fewer enqueues are abandoned while the relay is
+ * still working on them. It does not guarantee the relay has finished, which is
+ * why a timeout is reported as unconfirmed custody with its localId.
  */
 export const PENDING_ENQUEUE_HTTP_TIMEOUT_MS = 30_000;
 

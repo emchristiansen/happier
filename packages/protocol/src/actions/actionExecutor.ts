@@ -1215,7 +1215,31 @@ function buildActionExecuteResultFromRecordedApprovalExecution(request: Approval
   const error = typeof execution.error === 'string' && execution.error.trim().length > 0
     ? execution.error
     : errorCode;
-  return { ok: false, errorCode, error };
+  const details = (execution as { details?: unknown }).details;
+  return { ok: false, errorCode, error, ...(details === undefined ? {} : { details }) };
+}
+
+function readApprovalRequestInvocationIdentity(request: ApprovalRequestV1): Readonly<{
+  providerToolCallId: string | null;
+  messageLocalId: string | null;
+}> {
+  const identity = request.invocationIdentity;
+  return {
+    providerToolCallId: identity?.providerToolCallId ?? null,
+    messageLocalId: identity?.messageLocalId ?? null,
+  };
+}
+
+function buildApprovalRequestInvocationIdentity(ctx: ActionExecutorContext): ApprovalRequestV1['invocationIdentity'] | null {
+  const providerToolCallId = normalizeId(ctx.providerToolCallId);
+  const messageLocalId = typeof ctx.messageLocalId === 'string' && ctx.messageLocalId.trim().length > 0
+    ? ctx.messageLocalId
+    : '';
+  if (!providerToolCallId && !messageLocalId) return null;
+  return {
+    ...(messageLocalId ? { messageLocalId } : {}),
+    ...(providerToolCallId ? { providerToolCallId } : {}),
+  };
 }
 
 function resolveApprovalRequestExecutionSurface(createdBySurface: ApprovalRequestV1['createdBy']['surface']): keyof ActionSurfaces | null {
@@ -1340,9 +1364,9 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
             surface: requestSurface,
             placement: null,
             bypassApprovals: true,
-            // The decider's invocation identities do not belong to the approved action.
-            providerToolCallId: null,
-            messageLocalId: null,
+            // The approved action runs under the requester's trusted
+            // identities recorded on the request, never the decider's.
+            ...readApprovalRequestInvocationIdentity(args.request),
           })
       : { ok: false as const, errorCode: 'approval_execution_surface_invalid', error: 'approval_execution_surface_invalid' };
     const executedAtMs = Date.now();
@@ -1352,7 +1376,13 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
       updatedAtMs: executedAtMs,
       execution: exec.ok
         ? { executedAtMs, ok: true, result: (exec as any).result }
-        : { executedAtMs, ok: false, errorCode: (exec as any).errorCode, error: (exec as any).error },
+        : {
+            executedAtMs,
+            ok: false,
+            errorCode: (exec as any).errorCode,
+            error: (exec as any).error,
+            ...((exec as any).details === undefined ? {} : { details: (exec as any).details }),
+          },
     };
 
     const updated = await deps.approvalsUpdate({ artifactId: args.artifactId, request: nextExecuted, serverId: args.effectiveServerId });
@@ -1486,6 +1516,9 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
             result: approvalRouting.result,
           },
           ...(approvalOrigin ? { origin: approvalOrigin } : {}),
+          ...(buildApprovalRequestInvocationIdentity(ctx)
+            ? { invocationIdentity: buildApprovalRequestInvocationIdentity(ctx)! }
+            : {}),
           summary: buildApprovalSummary(spec, targetSessionId),
           preview: { actionId, actionArgs: parsed.data },
           ...(normalizeId(ctx.serverId) ? { serverId: normalizeId(ctx.serverId) } : {}),
@@ -1558,8 +1591,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
                   ...(requestSurface ? { surface: requestSurface } : {}),
                   placement: null,
                   bypassApprovals: true,
-                  providerToolCallId: null,
-                  messageLocalId: null,
+                  ...readApprovalRequestInvocationIdentity(approvedRequest),
                 },
               };
               return ready(approvedAdmission, async (runOptions) => {
