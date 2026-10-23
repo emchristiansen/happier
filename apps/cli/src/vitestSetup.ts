@@ -2,6 +2,14 @@ import { mkdirSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { applyUnitTestServerEnv } from './testkit/env/unitTestServerEnv';
+
+// `.env.integration-test` points the server URL at `http://localhost:3005`, where a live local
+// server or relay may listen. Unit test defaults are redirected away from it and the cloud
+// endpoints to loopback port 9, which is expected to be closed in the intended environment; a test
+// that needs a server sets `HAPPIER_SERVER_URL` itself. See `vitestSetup.serverUrl.test.ts`.
+applyUnitTestServerEnv(process.env);
+
 // Many CLI tests touch persistence under `HAPPIER_HOME_DIR`. Our `.env.integration-test`
 // sets a shared value, which can cause cross-process races when Vitest runs with multiple
 // workers. Provide a per-process default home directory instead; individual tests may
