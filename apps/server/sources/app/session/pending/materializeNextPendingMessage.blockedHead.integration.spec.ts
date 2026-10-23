@@ -361,4 +361,118 @@ describe("materializeNextPendingMessage queue heads", () => {
             { localId: explicit, deliveryState: "delivering" },
         ]);
     });
+    const readRawPayload = async (sessionId: string, localId: string) => await db.$queryRawUnsafe<Array<{
+        contentHex: string;
+        requestedActionHex: string;
+    }>>(
+        'SELECT hex(CAST("content" AS BLOB)) AS "contentHex", hex(CAST("requestedAction" AS BLOB)) AS "requestedActionHex" '
+            + 'FROM "SessionPendingMessage" WHERE "sessionId" = ? AND "localId" = ?',
+        sessionId,
+        localId,
+    );
+
+    it("keeps a stored-block row's content and requested action byte for byte, advancing only its update time", async () => {
+        const { ownerId, sessionId } = await createOwnerSession("unsupported-raw-bytes");
+        const head = `raw-bytes-${randomUUID()}`;
+        await enqueue(ownerId, sessionId, head);
+        // Unusual key order, spacing and a non-ASCII character: any parse-and-reserialize of either
+        // column would change these bytes.
+        await db.$executeRawUnsafe(
+            'UPDATE "SessionPendingMessage" SET "requestedAction" = ?, "content" = ? WHERE "sessionId" = ? AND "localId" = ?',
+            '{"kind":  "future_action","v":1 , "note":"caf\u00e9 ü"}',
+            '{"c":"cipher-raw-bytes",   "t":"encrypted"}',
+            sessionId,
+            head,
+        );
+        const rawBefore = await readRawPayload(sessionId, head);
+        const rowBefore = await db.sessionPendingMessage.findUniqueOrThrow({
+            where: { sessionId_localId: { sessionId, localId: head } },
+            select: { updatedAt: true },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 5));
+
+        await expect(materialize(ownerId, sessionId)).resolves.toMatchObject({ ok: true, didMaterialize: false });
+
+        await expect(readRawPayload(sessionId, head)).resolves.toEqual(rawBefore);
+        const rowAfter = await db.sessionPendingMessage.findUniqueOrThrow({
+            where: { sessionId_localId: { sessionId, localId: head } },
+            select: { deliveryState: true, deliveryBlockedReason: true, updatedAt: true },
+        });
+        expect(rowAfter).toMatchObject({ deliveryState: "blocked", deliveryBlockedReason: "unsupported_action" });
+        expect(rowAfter.updatedAt.getTime()).toBeGreaterThan(rowBefore.updatedAt.getTime());
+    });
+
+    it("never stores an unsupported_action block on a held head whose action is unparseable", async () => {
+        const { ownerId, sessionId } = await createOwnerSession("malformed-held-blocked");
+        const head = `held-${randomUUID()}`;
+        const next = `next-${randomUUID()}`;
+        await enqueue(ownerId, sessionId, head);
+        await enqueue(ownerId, sessionId, next);
+        await claimHeadThenBlock(ownerId, sessionId, head, "provider_rejected_before_acceptance");
+        await db.sessionPendingMessage.update({
+            where: { sessionId_localId: { sessionId, localId: head } },
+            data: { requestedAction: { v: 1, kind: "future_action" } },
+        });
+        const countersBefore = await readCounters(sessionId);
+
+        await expect(materialize(ownerId, sessionId)).resolves.toMatchObject({
+            ok: true,
+            didMaterialize: false,
+            deferredReason: "waiting_for_predecessor",
+            blockingHead: { localId: head, deliveryState: "blocked", blockedReason: "provider_rejected_before_acceptance" },
+        });
+        await expect(readRows(sessionId)).resolves.toEqual([
+            { localId: head, status: "queued", deliveryState: "blocked", deliveryBlockedReason: "provider_rejected_before_acceptance" },
+            { localId: next, status: "queued", deliveryState: null, deliveryBlockedReason: null },
+        ]);
+        await expect(readCounters(sessionId)).resolves.toEqual(countersBefore);
+    });
+
+    it("never stores an unsupported_action block on an external_handoff head whose action is unparseable", async () => {
+        const { ownerId, sessionId } = await createOwnerSession("malformed-held-handoff");
+        const head = `handoff-${randomUUID()}`;
+        const next = `next-${randomUUID()}`;
+        await enqueue(ownerId, sessionId, head, { deliveryMode: "external_handoff" });
+        await enqueue(ownerId, sessionId, next);
+        await db.sessionPendingMessage.update({
+            where: { sessionId_localId: { sessionId, localId: head } },
+            data: { requestedAction: { v: 1, kind: "future_action" } },
+        });
+        const countersBefore = await readCounters(sessionId);
+
+        await expect(materialize(ownerId, sessionId)).resolves.toMatchObject({
+            ok: true,
+            didMaterialize: false,
+            deferredReason: "waiting_for_predecessor",
+            blockingHead: { localId: head, deliveryState: "external_handoff" },
+        });
+        await expect(readRows(sessionId)).resolves.toEqual([
+            { localId: head, status: "queued", deliveryState: "external_handoff", deliveryBlockedReason: null },
+            { localId: next, status: "queued", deliveryState: null, deliveryBlockedReason: null },
+        ]);
+        await expect(readCounters(sessionId)).resolves.toEqual(countersBefore);
+    });
+
+    it("never stores an unsupported_action block on a delivering head whose action is unparseable", async () => {
+        const { ownerId, sessionId } = await createOwnerSession("malformed-held-delivering");
+        const head = `delivering-${randomUUID()}`;
+        const next = `next-${randomUUID()}`;
+        await enqueue(ownerId, sessionId, head);
+        await enqueue(ownerId, sessionId, next);
+        await expect(materialize(ownerId, sessionId)).resolves.toMatchObject({ ok: true, didMaterialize: true, message: { localId: head } });
+        await db.sessionPendingMessage.update({
+            where: { sessionId_localId: { sessionId, localId: head } },
+            data: { requestedAction: { v: 1, kind: "future_action" } },
+        });
+        const countersBefore = await readCounters(sessionId);
+
+        // The current publisher's rejoin of its own claim answers first, as before this change; it
+        // cannot rebuild the frozen claim from an unparseable action.
+        await expect(materialize(ownerId, sessionId)).resolves.toEqual({ ok: false, error: "invalid-params" });
+        await expect(readRows(sessionId)).resolves.toEqual([
+            { localId: head, status: "queued", deliveryState: "delivering", deliveryBlockedReason: null },
+            { localId: next, status: "queued", deliveryState: null, deliveryBlockedReason: null },
+        ]);
+        await expect(readCounters(sessionId)).resolves.toEqual(countersBefore);
+    });
 });

@@ -5430,6 +5430,29 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       }
     });
 
+    it('keeps its counts through an error answer with no push, and takes the stored counters from the next explicit wake', async () => {
+      // The server stored the head's block and then answered transcript-conflict for the next row:
+      // the counters changed durably but no pending-changed update was pushed.
+      const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 2, pendingBlockedCount: 0, pendingVersion: 4 });
+      await waitForCurrentPendingInputContract(client);
+      materializeNextMock.mockRejectedValueOnce(new PendingQueueMaterializationTransportAmbiguousError(
+        new Error('Pending queue materialize server acknowledgement: transcript-conflict'),
+        'server_rejected',
+        'transcript-conflict',
+      ));
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toMatchObject({ type: 'retryable_transport' });
+      expect((client as any).pendingQueueState).toEqual({ known: true, pendingCount: 2, pendingBlockedCount: 0, pendingVersion: 4 });
+
+      fetchSnapshotMock.mockResolvedValueOnce({
+        pendingQueueState: { known: true, pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 5 },
+      });
+      client.wakePendingMaterialization();
+      await waitUntil(() => (client as any).pendingQueueState.pendingVersion === 5);
+      expect((client as any).pendingQueueState).toEqual({ known: true, pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 5 });
+      expect(fetchSnapshotMock).toHaveBeenCalled();
+    });
+
     it('counts a row behind an unsupported_action head as deliverable and the head itself as not', async () => {
       const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 4 });
       expect(client.shouldAttemptPendingMaterialization()).toBe(true);
