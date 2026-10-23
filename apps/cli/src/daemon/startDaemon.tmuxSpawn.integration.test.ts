@@ -31,6 +31,7 @@ vi.mock('@/utils/spawnHappyCLI', () => {
   };
 });
 
+import { createSessionLaunchId } from './platform/linux/sessionLaunchId';
 import { buildTmuxSpawnConfig } from './platform/tmux/spawnConfig';
 
 describe('daemon tmux spawn config', () => {
@@ -56,6 +57,7 @@ describe('daemon tmux spawn config', () => {
     process.env.PATH = '/bin';
 
     const cfg = await buildTmuxSpawnConfig({
+      launchId: createSessionLaunchId(),
       agent: 'claude',
       directory: '/tmp',
       extraEnv: {
@@ -77,6 +79,7 @@ describe('daemon tmux spawn config', () => {
   it('uses the admitted immutable runner decision for the tmux child command', async () => {
     const immutableEntrypoint = '/runtime/.runner-snapshots/0123456789abcdef/index.mjs';
     const cfg = await buildTmuxSpawnConfig({
+      launchId: createSessionLaunchId(),
       agent: 'claude',
       directory: '/tmp',
       extraEnv: {},

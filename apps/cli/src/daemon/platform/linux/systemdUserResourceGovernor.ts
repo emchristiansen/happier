@@ -1,5 +1,9 @@
 import { execFile } from 'node:child_process';
 
+import { sessionLaunchScopeUnitName, type SessionLaunchId } from './sessionLaunchId';
+
+// systemd places a dashed slice under its prefix slice: happier-jobs.slice lives in happier.slice.
+export const HAPPIER_SLICE_NAME = 'happier.slice';
 export const HAPPIER_JOBS_SLICE_NAME = 'happier-jobs.slice';
 export const HAPPIER_CRITICAL_SLICE_NAME = 'happier-critical.slice';
 export const HAPPIER_CRITICAL_SLICE_MEMORY_LOW_BYTES = 4 * 1024 * 1024 * 1024;
@@ -80,20 +84,68 @@ function isFinitePositiveSystemdLimit(value: string | undefined): boolean {
   return Number.isFinite(parsed) && parsed > 0;
 }
 
-async function isSystemdUserSliceReady(
+/**
+ * Why a slice can or cannot take a session scope. Every "not ready" answer
+ * names its reason, so a launch that stays in the daemon's cgroup can say why.
+ */
+export type SystemdUserSliceProbeResult =
+  | Readonly<{ kind: 'ready' }>
+  | SystemdUserSliceProbeFailure;
+
+export type SystemdUserSliceProbeFailure =
+  | Readonly<{ kind: 'unsupported-platform'; platform: NodeJS.Platform }>
+  | Readonly<{ kind: 'no-user-bus' }>
+  | Readonly<{ kind: 'slice-mismatch'; property: string; expected: string; actual: string }>
+  | Readonly<{ kind: 'probe-error'; message: string }>
+  | Readonly<{ kind: 'probe-timeout' }>;
+
+const POSITIVE_FINITE_EXPECTATION = 'positive-finite';
+
+function findSlicePolicyMismatch(
+  properties: ReadonlyMap<string, string>,
+  policy: SystemdUserSlicePolicy,
+): SystemdUserSliceProbeFailure | null {
+  const requiredFiniteProperties = policy.requiredFiniteProperties ?? [];
+  const expectations: readonly (readonly [string, string])[] = [
+    ['LoadState', 'loaded'],
+    ...policy.expectedProperties,
+  ];
+  for (const [property, expected] of expectations) {
+    const actual = properties.get(property) ?? '';
+    if (actual !== expected) return { kind: 'slice-mismatch', property, expected, actual };
+  }
+  for (const property of requiredFiniteProperties) {
+    const actual = properties.get(property) ?? '';
+    if (!isFinitePositiveSystemdLimit(actual)) {
+      return { kind: 'slice-mismatch', property, expected: POSITIVE_FINITE_EXPECTATION, actual };
+    }
+  }
+  return null;
+}
+
+function isExecFileTimeout(error: unknown): boolean {
+  // child_process.execFile kills the child when `timeout` elapses and reports `killed: true`.
+  return typeof error === 'object' && error !== null && (error as { killed?: unknown }).killed === true;
+}
+
+async function probeSystemdUserSlice(
   params: Readonly<{
     platform?: NodeJS.Platform;
     environment?: NodeJS.ProcessEnv;
     execFile?: SystemdUserResourceGovernorExecFile;
   }>,
   policy: SystemdUserSlicePolicy,
-): Promise<boolean> {
+): Promise<SystemdUserSliceProbeResult> {
   const platform = params.platform ?? process.platform;
   const environment = params.environment ?? process.env;
-  if (platform !== 'linux' || !hasSystemdUserBus(environment)) {
-    return false;
+  if (platform !== 'linux') {
+    return { kind: 'unsupported-platform', platform };
+  }
+  if (!hasSystemdUserBus(environment)) {
+    return { kind: 'no-user-bus' };
   }
 
+  let stdout: string;
   try {
     const runExecFile = params.execFile ?? defaultExecFile;
     const requiredFiniteProperties = policy.requiredFiniteProperties ?? [];
@@ -109,15 +161,13 @@ async function isSystemdUserSliceReady(
       env: environment,
       maxBuffer: 16 * 1024,
     });
-    const properties = parseSystemdProperties(String(result.stdout));
-    return properties.get('LoadState') === 'loaded'
-      && policy.expectedProperties.every(([property, expectedValue]) => (
-        properties.get(property) === expectedValue
-      ))
-      && requiredFiniteProperties.every((property) => isFinitePositiveSystemdLimit(properties.get(property)));
-  } catch {
-    return false;
+    stdout = String(result.stdout);
+  } catch (error) {
+    if (isExecFileTimeout(error)) return { kind: 'probe-timeout' };
+    return { kind: 'probe-error', message: error instanceof Error ? error.message : String(error) };
   }
+
+  return findSlicePolicyMismatch(parseSystemdProperties(stdout), policy) ?? { kind: 'ready' };
 }
 
 function buildSystemdUserScopedLaunchSpecForSlice(
@@ -133,6 +183,9 @@ function buildSystemdUserScopedLaunchSpecForSlice(
       '--quiet',
       `--slice=${sliceName}`,
       ...scopeArgs,
+      // systemd-run expands ${VAR} in the command line by default, and with --scope it
+      // does so itself before exec. Runner argv (resume paths, model ids) must arrive literally.
+      '--expand-environment=no',
       '--',
       params.launchSpec.filePath,
       ...params.launchSpec.args,
@@ -144,24 +197,35 @@ function buildSystemdUserScopedLaunchSpecForSlice(
 /**
  * Checking the expected jobs policy keeps an arbitrary Linux host on its
  * existing launch path instead of turning a missing user manager into a
- * session-start failure.
+ * session-start failure. The result names why a host is not ready, so the
+ * unscoped launch that follows can be logged with its reason.
  */
-export async function isSystemdUserResourceGovernorReady(params: Readonly<{
+export async function probeSystemdUserResourceGovernor(params: Readonly<{
   platform?: NodeJS.Platform;
   environment?: NodeJS.ProcessEnv;
   execFile?: SystemdUserResourceGovernorExecFile;
-}> = {}): Promise<boolean> {
-  return await isSystemdUserSliceReady(params, {
+}> = {}): Promise<SystemdUserSliceProbeResult> {
+  return await probeSystemdUserSlice(params, {
     sliceName: HAPPIER_JOBS_SLICE_NAME,
     expectedProperties: HAPPIER_JOBS_SLICE_EXPECTED_PROPERTIES,
     requiredFiniteProperties: ['MemoryHigh'],
   });
 }
 
+/**
+ * Wraps one session launch attempt in its own transient user scope,
+ * `happier-launch-<launchId>.scope`, inside `happier-jobs.slice`. The unit name
+ * comes from the attempt, not the session, so a respawned runner never collides
+ * with an older scope that still holds processes.
+ */
 export function buildSystemdUserScopedLaunchSpec(params: Readonly<{
   launchSpec: SystemdUserScopedLaunchSpec;
+  launchId: SessionLaunchId;
 }>): SystemdUserScopedLaunchSpec {
-  return buildSystemdUserScopedLaunchSpecForSlice(params, HAPPIER_JOBS_SLICE_NAME, ['--nice=10']);
+  return buildSystemdUserScopedLaunchSpecForSlice(params, HAPPIER_JOBS_SLICE_NAME, [
+    `--unit=${sessionLaunchScopeUnitName(params.launchId)}`,
+    '--nice=10',
+  ]);
 }
 
 /**
@@ -174,10 +238,11 @@ export async function isSystemdUserCriticalResourceGovernorReady(params: Readonl
   environment?: NodeJS.ProcessEnv;
   execFile?: SystemdUserResourceGovernorExecFile;
 }> = {}): Promise<boolean> {
-  return await isSystemdUserSliceReady(params, {
+  const probe = await probeSystemdUserSlice(params, {
     sliceName: HAPPIER_CRITICAL_SLICE_NAME,
     expectedProperties: HAPPIER_CRITICAL_SLICE_EXPECTED_PROPERTIES,
   });
+  return probe.kind === 'ready';
 }
 
 export function buildSystemdUserCriticalScopedLaunchSpec(params: Readonly<{
