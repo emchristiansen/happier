@@ -3,8 +3,10 @@ import type { Socket } from "socket.io";
 import type { ClientConnection } from "@/app/events/eventPayloadTypes";
 import { checkSessionAccess, requireAccessLevel } from "@/app/share/accessControl";
 import { getSessionParticipantUserIds } from "@/app/share/sessionParticipants";
+import { db } from "@/storage/db";
+import { inTx, type Tx } from "@/storage/inTx";
 import {
-    hasCurrentSessionScopedMachineAccess,
+    hasCurrentSessionScopedMachineAccessInTx,
     resolveSessionScopedMachinePublishBinding,
 } from "./sessionScopedBinding";
 
@@ -28,8 +30,11 @@ import {
  * started before that commit may have read the pre-revocation state, so a cache-wide invalidation
  * count is captured when a resolution starts reading. A resolution crossed by any invalidation is
  * neither returned nor stored: it is resolved once more (its reads then start after the commit and
- * see it), and if that retry is crossed as well the call is denied without caching. So a revocation
- * cannot be undone by a read that straddled it, for this call or for the TTL.
+ * see it). If that retry is crossed as well, the call is answered from a third resolution read inside
+ * a transaction on the write connection, which is serialized after every commit that preceded it,
+ * and that answer is not cached. So a revocation cannot be undone by a read that straddled it, for
+ * this call or for the TTL, and a call is refused only when an uncrossed or write-connection
+ * resolution says the binding is not authorized.
  *
  * A cached grant is reused until `SESSION_RELAY_AUTH_CACHE_TTL_MS` after the resolution that stored
  * it started reading (wall clock).
@@ -55,37 +60,49 @@ const relayAuthCache = new Map<string, SessionRelayAuthCacheEntry>();
 // resolution only costs one more verification.
 let relayAuthInvalidations = 0;
 
-// One resolution plus one retry. A call crossed by invalidations on every attempt is denied.
-const RELAY_AUTH_RESOLUTION_ATTEMPTS = 2;
+// Read-pool resolutions before falling back to an uncached write-connection resolution.
+const RELAY_AUTH_POOL_RESOLUTION_ATTEMPTS = 2;
 
 type RelayAuthResolution = Readonly<{ participantUserIds: readonly string[] | null; crossedByInvalidation: boolean }>;
 
-async function resolveSessionScopedMachineBinding(params: Readonly<{
+type RelayAuthBinding = Readonly<{
     accountId: string;
     machineId: string;
     sessionId: string;
-}>): Promise<RelayAuthResolution> {
-    const invalidationsAtStart = relayAuthInvalidations;
-    const crossed = () => relayAuthInvalidations !== invalidationsAtStart;
+}>;
 
-    if (!await hasCurrentSessionScopedMachineAccess({
-        accountId: params.accountId,
-        machineId: params.machineId,
-        sessionId: params.sessionId,
-    })) {
-        return { participantUserIds: null, crossedByInvalidation: crossed() };
+/** The DB-backed facts of a binding, all read through `reader`; null when not authorized. */
+async function readSessionScopedMachineBindingGrant(
+    reader: Tx,
+    params: RelayAuthBinding,
+): Promise<readonly string[] | null> {
+    if (!await hasCurrentSessionScopedMachineAccessInTx({ tx: reader, ...params })) {
+        return null;
     }
 
-    const access = await checkSessionAccess(params.accountId, params.sessionId);
+    const access = await checkSessionAccess(params.accountId, params.sessionId, reader);
     if (!access || !requireAccessLevel(access, "edit") || !access.isOwner) {
-        return { participantUserIds: null, crossedByInvalidation: crossed() };
+        return null;
     }
 
-    const participantUserIds = await getSessionParticipantUserIds({ sessionId: params.sessionId });
-    if (participantUserIds.length === 0) {
-        return { participantUserIds: null, crossedByInvalidation: crossed() };
-    }
-    return { participantUserIds, crossedByInvalidation: crossed() };
+    const participantUserIds = await getSessionParticipantUserIds({ sessionId: params.sessionId, tx: reader });
+    return participantUserIds.length === 0 ? null : participantUserIds;
+}
+
+/** A resolution through the global db (allow-listed reads go to the read pool when one is set). */
+async function resolveOnPool(params: RelayAuthBinding): Promise<RelayAuthResolution> {
+    const invalidationsAtStart = relayAuthInvalidations;
+    const participantUserIds = await readSessionScopedMachineBindingGrant(db, params);
+    return { participantUserIds, crossedByInvalidation: relayAuthInvalidations !== invalidationsAtStart };
+}
+
+/**
+ * A resolution read through a transaction client. Every operation on a transaction client runs on
+ * the write connection (the read-pool router only routes the global db), and on SQLite the
+ * transaction begins with BEGIN IMMEDIATE, so it reads after every commit that preceded it.
+ */
+async function resolveOnWriteConnection(params: RelayAuthBinding): Promise<readonly string[] | null> {
+    return await inTx(async (tx) => await readSessionScopedMachineBindingGrant(tx, params));
 }
 
 function createRelayAuthCacheKey(userId: string, sessionId: string, machineId: string): string {
@@ -149,9 +166,9 @@ export async function authorizeSessionScopedMachineBinding(params: Readonly<{
     }
     pruneExpiredRelayAuthEntries(nowMs);
 
-    for (let attempt = 1; attempt <= RELAY_AUTH_RESOLUTION_ATTEMPTS; attempt += 1) {
+    for (let attempt = 1; attempt <= RELAY_AUTH_POOL_RESOLUTION_ATTEMPTS; attempt += 1) {
         const startedAtMs = Date.now();
-        const resolution = await resolveSessionScopedMachineBinding(params);
+        const resolution = await resolveOnPool(params);
         // A crossed resolution may hold pre-invalidation facts, positive or negative: resolve again.
         if (resolution.crossedByInvalidation) continue;
         if (resolution.participantUserIds === null) return null;
@@ -163,7 +180,8 @@ export async function authorizeSessionScopedMachineBinding(params: Readonly<{
         });
         return resolution.participantUserIds;
     }
-    return null;
+    // Crossed on every pool attempt: answer from the write connection's current state, uncached.
+    return await resolveOnWriteConnection(params);
 }
 
 /** Drop cached relay authorizations for a session (share change, session delete). */

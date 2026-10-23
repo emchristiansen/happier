@@ -1,4 +1,5 @@
 import { db } from "@/storage/db";
+import type { Tx } from "@/storage/inTx";
 import { ShareAccessLevel } from "@/storage/prisma";
 
 /**
@@ -29,14 +30,16 @@ export interface SessionAccess {
  *
  * @param userId - User ID requesting access
  * @param sessionId - Session ID to check
+ * @param reader - Client to read through: the global db by default, or a transaction client
  * @returns Session access info, or null if no access
  */
 export async function checkSessionAccess(
     userId: string,
-    sessionId: string
+    sessionId: string,
+    reader: Pick<Tx, "session" | "sessionShare"> = db,
 ): Promise<SessionAccess | null> {
     // First check if user owns the session
-    const session = await db.session.findUnique({
+    const session = await reader.session.findUnique({
         where: { id: sessionId },
         select: {
             accountId: true,
@@ -61,7 +64,7 @@ export async function checkSessionAccess(
     }
 
     // Check if session is shared with user
-    const share = await db.sessionShare.findUnique({
+    const share = await reader.sessionShare.findUnique({
         where: {
             sessionId_sharedWithUserId: {
                 sessionId,

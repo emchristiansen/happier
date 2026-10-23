@@ -34,6 +34,12 @@ vi.mock("@/storage/db", () => ({
     },
 }));
 
+// The write connection: inTx hands its callback a transaction client with its own accessKey reads.
+const writeAccessKeyFindUnique = vi.hoisted(() => vi.fn(async (): Promise<AccessKeyAccessProof | null> => null));
+const writeTx = vi.hoisted(() => ({ accessKey: { findUnique: writeAccessKeyFindUnique } }));
+const inTx = vi.hoisted(() => vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => await fn(writeTx)));
+vi.mock("@/storage/inTx", () => ({ inTx }));
+
 function createBoundSocket(overrides: Partial<{ sessionId: string; machineId: string | null; proof: string }> = {}) {
     return {
         data: {
@@ -68,6 +74,9 @@ describe("sessionRelayAuthCache", () => {
         getSessionParticipantUserIds.mockReset();
         accessKeyFindUnique.mockReset();
         accessKeyFindUnique.mockResolvedValue(currentAccessProof);
+        writeAccessKeyFindUnique.mockReset();
+        writeAccessKeyFindUnique.mockResolvedValue(currentAccessProof);
+        inTx.mockClear();
         checkSessionAccess.mockImplementation(async (userId, sessionId) => ({
             userId,
             sessionId,
@@ -164,7 +173,7 @@ describe("sessionRelayAuthCache", () => {
             },
         });
         expect(checkSessionAccess).toHaveBeenCalledTimes(1);
-        expect(checkSessionAccess).toHaveBeenCalledWith("u1", "s1");
+        expect(checkSessionAccess).toHaveBeenCalledWith("u1", "s1", expect.anything()); // third argument: the pool reader (global db)
         expect(getSessionParticipantUserIds).toHaveBeenCalledTimes(1);
     });
 
@@ -381,7 +390,7 @@ describe("sessionRelayAuthCache", () => {
             expect(accessKeyFindUnique).toHaveBeenCalledTimes(2);
         });
 
-        it("denies, without storing, when invalidations cross both the resolution and its retry", async () => {
+        async function crossBothPoolResolutions() {
             const { invalidateSessionRelayAuthorizationForMachine } = await loadModule();
             const fill = await startFillHeldAtParticipantLookup();
             invalidateSessionRelayAuthorizationForMachine("m-other");
@@ -390,9 +399,37 @@ describe("sessionRelayAuthCache", () => {
                 return ["u1", "u2"];
             });
             fill.participants.resolve(["u1", "u2"]);
+            return fill;
+        }
+
+        function expectThirdResolutionOnWriteConnection() {
+            expect(accessKeyFindUnique).toHaveBeenCalledTimes(2); // the two pool attempts only
+            expect(inTx).toHaveBeenCalledTimes(1);
+            expect(writeAccessKeyFindUnique).toHaveBeenCalledTimes(1);
+        }
+
+        it("answers from the write connection when invalidations cross both pool resolutions, and admits a still-authorized binding without caching it", async () => {
+            const fill = await crossBothPoolResolutions();
+            getSessionParticipantUserIds.mockImplementationOnce(async () => ["u1", "u3"]);
+
+            await expect(fill.inFlight).resolves.toEqual(["u1", "u3"]);
+            expectThirdResolutionOnWriteConnection();
+            expect(checkSessionAccess).toHaveBeenLastCalledWith("u1", "s1", writeTx);
+            expect(getSessionParticipantUserIds).toHaveBeenLastCalledWith({ sessionId: "s1", tx: writeTx });
+
+            // Not cached: the next call resolves again on the pool.
+            await expect(fill.authorizeSessionRelayPublish(fill.params)).resolves.toEqual(["u1", "u2"]);
+            expect(accessKeyFindUnique).toHaveBeenCalledTimes(3);
+            expect(inTx).toHaveBeenCalledTimes(1);
+        });
+
+        it("answers from the write connection when invalidations cross both pool resolutions, and refuses a revoked binding because the current state says so", async () => {
+            const fill = await crossBothPoolResolutions();
+            writeAccessKeyFindUnique.mockResolvedValue(null); // the access key is gone on the write connection
 
             await expect(fill.inFlight).resolves.toBeNull();
-            expect(accessKeyFindUnique).toHaveBeenCalledTimes(2);
+            expectThirdResolutionOnWriteConnection();
+
             await expect(fill.authorizeSessionRelayPublish(fill.params)).resolves.toEqual(["u1", "u2"]);
             expect(accessKeyFindUnique).toHaveBeenCalledTimes(3);
         });
