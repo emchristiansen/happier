@@ -17,6 +17,7 @@ vi.mock("@/app/monitoring/metrics2", () => ({
 }));
 
 const dbSessionFindFirst = vi.fn();
+const dbUsageReportFindUnique = vi.fn();
 const dbUsageReportUpsert = vi.fn();
 const txSessionFindFirst = vi.fn();
 const txUsageReportFindUnique = vi.fn();
@@ -32,7 +33,8 @@ const inTx = vi.fn(async (run: (tx: unknown) => Promise<unknown>) => run({
 vi.mock("@/storage/db", () => ({
     db: {
         session: { findFirst: dbSessionFindFirst },
-        usageReport: { upsert: dbUsageReportUpsert },
+        // Read by the unchanged-report fast path before any transaction; writes must not use db.
+        usageReport: { findUnique: dbUsageReportFindUnique, upsert: dbUsageReportUpsert },
     },
 }));
 
@@ -42,6 +44,7 @@ describe("usageHandler usage writes", () => {
     beforeEach(() => {
         vi.clearAllMocks();
         dbSessionFindFirst.mockResolvedValue({ id: "s1" });
+        dbUsageReportFindUnique.mockResolvedValue(null);
         dbUsageReportUpsert.mockRejectedValue(Object.assign(new Error("Socket timeout"), { code: "P1008" }));
         txSessionFindFirst.mockResolvedValue({ id: "s1" });
         txUsageReportFindUnique.mockResolvedValue(null);
@@ -108,10 +111,46 @@ describe("usageHandler usage writes", () => {
         expect(emitEphemeral).toHaveBeenCalledTimes(1);
     });
 
-    it("acknowledges unchanged socket usage reports without emitting duplicate ephemeral updates", async () => {
+    it("acknowledges unchanged socket usage reports from committed rows without a transaction or duplicate ephemeral update", async () => {
         const { usageHandler } = await import("./usageHandler");
         const socket = createFakeSocket();
         usageHandler("u1", socket as any);
+        dbUsageReportFindUnique.mockResolvedValue({
+            id: "report-1",
+            createdAt: new Date("2026-01-01T00:00:00.000Z"),
+            updatedAt: new Date("2026-01-01T00:00:01.000Z"),
+            data: { tokens: { total: 10, prompt: 4 }, cost: { total: 0.25 } },
+        });
+
+        const callback = vi.fn();
+        await getSocketHandler(socket, "usage-report")({
+            key: "k1",
+            sessionId: "s1",
+            tokens: { total: 10, prompt: 4 },
+            cost: { total: 0.25 },
+        }, callback);
+
+        expect(callback).toHaveBeenCalledWith(expect.objectContaining({
+            success: true,
+            reportId: "report-1",
+        }));
+        expect(dbSessionFindFirst).toHaveBeenCalledWith({
+            where: { id: "s1", accountId: "u1" },
+            select: { id: true },
+        });
+        expect(inTx).not.toHaveBeenCalled();
+        expect(txUsageReportUpsert).not.toHaveBeenCalled();
+        expect(dbUsageReportUpsert).not.toHaveBeenCalled();
+        expect(usageReportWritesCounterInc).toHaveBeenCalledTimes(1);
+        expect(usageReportWritesCounterInc).toHaveBeenCalledWith({ scope: "session", result: "unchanged" });
+        expect(emitEphemeral).not.toHaveBeenCalled();
+    });
+
+    it("acknowledges a report the transaction finds unchanged without emitting duplicate ephemeral updates", async () => {
+        const { usageHandler } = await import("./usageHandler");
+        const socket = createFakeSocket();
+        usageHandler("u1", socket as any);
+        // The fast path saw no row; by the time the transaction reads, an equal row exists.
         txUsageReportFindUnique.mockResolvedValue({
             id: "report-1",
             createdAt: new Date("2026-01-01T00:00:00.000Z"),
@@ -131,7 +170,9 @@ describe("usageHandler usage writes", () => {
             success: true,
             reportId: "report-1",
         }));
+        expect(inTx).toHaveBeenCalledTimes(1);
         expect(txUsageReportUpsert).not.toHaveBeenCalled();
+        expect(usageReportWritesCounterInc).toHaveBeenCalledTimes(1);
         expect(usageReportWritesCounterInc).toHaveBeenCalledWith({ scope: "session", result: "unchanged" });
         expect(emitEphemeral).not.toHaveBeenCalled();
     });
