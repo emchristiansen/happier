@@ -2,7 +2,7 @@ import axios from 'axios';
 import type { Socket } from 'socket.io-client';
 
 import { classifyServerEndpointError } from '@/api/client/classifyServerEndpointError';
-import { isAuthenticationError } from '@/api/client/httpStatusError';
+import { createInvalidResponseShapeError, isAuthenticationError } from '@/api/client/httpStatusError';
 import type { ClientToServerEvents, ServerToClientEvents } from '../types';
 import { resolveServerHttpBaseUrl } from '@/session/transport/http/serverHttpBaseUrl';
 import { createSocketAckError, emitSocketWithAck } from '@/session/transport/shared/socketAck';
@@ -12,6 +12,7 @@ import {
     AcceptedPendingSettlementResponseV1Schema,
     normalizePendingDeliveryStatusV1,
     parsePendingDeliveryStatusV1,
+    pendingDeliveryStatusV1ToPersistedFields,
     PendingProviderActionSchema,
     SessionMessageRoleSchema,
     type PendingDeliveryBlockedReason,
@@ -429,68 +430,61 @@ function parseReleasedServerV021MaterializeAck(value: unknown): ReleasedServerV0
     };
 }
 
-function arePendingDeliveryStatusesEqual(
-    left: PendingDeliveryStatusV1,
-    right: PendingDeliveryStatusV1,
-): boolean {
+/**
+ * Reads the persisted delivery fields a server without the typed `deliveryStatus` sends. A row is
+ * accepted exactly when it is the persisted form of the status the protocol normalizes it to, so
+ * the protocol alone decides which `deliveryState` values exist. Blocked reasons are not compared:
+ * an unknown reason normalizes to `unknown` rather than rejecting the row.
+ */
+function parseLegacyPendingRowDeliveryStatus(record: Record<string, unknown>): PendingDeliveryStatusV1 | null {
+    const fields = {
+        status: record.status,
+        deliveryState: record.deliveryState ?? null,
+        deliveryBlockedReason: record.deliveryBlockedReason ?? null,
+        discardedReason: record.discardedReason ?? null,
+    };
+    const status = normalizePendingDeliveryStatusV1(fields);
+    const persisted = pendingDeliveryStatusV1ToPersistedFields(status);
+    if (persisted.status !== fields.status || persisted.deliveryState !== fields.deliveryState) return null;
+    if (persisted.deliveryState !== 'blocked' && fields.deliveryBlockedReason !== null) return null;
+    if (persisted.status !== 'discarded' && fields.discardedReason !== null) return null;
+    if (fields.discardedReason !== null && typeof fields.discardedReason !== 'string') return null;
+    return status;
+}
+
+/**
+ * The typed `deliveryStatus` is the server's canonical projection and wins when present: it also
+ * carries what the persisted fields cannot express, such as a queued row with an unparseable
+ * requested action reading as blocked `unsupported_action`. The persisted fields are the fallback
+ * for servers that predate the typed field.
+ */
+function readPendingRowDeliveryStatus(record: Record<string, unknown>): PendingDeliveryStatusV1 | null {
+    return hasOwn(record, 'deliveryStatus')
+        ? parsePendingDeliveryStatusV1(record.deliveryStatus)
+        : parseLegacyPendingRowDeliveryStatus(record);
+}
+
+function arePendingDeliveryStatusesEqual(left: PendingDeliveryStatusV1, right: PendingDeliveryStatusV1): boolean {
     if (left.status !== right.status) return false;
     if (left.status === 'blocked' && right.status === 'blocked') return left.reason === right.reason;
     if (left.status === 'discarded' && right.status === 'discarded') return left.reason === right.reason;
     return true;
 }
 
-function parseLegacyPendingRowDeliveryStatus(record: Record<string, unknown>): PendingDeliveryStatusV1 | null {
-    if (record.status !== 'queued' && record.status !== 'discarded') return null;
-    if (record.status === 'discarded') {
-        if (record.deliveryState !== undefined && record.deliveryState !== null) return null;
-        if (record.deliveryBlockedReason !== undefined && record.deliveryBlockedReason !== null) return null;
-        if (
-            record.discardedReason !== undefined
-            && record.discardedReason !== null
-            && typeof record.discardedReason !== 'string'
-        ) return null;
-        return normalizePendingDeliveryStatusV1({
-            status: record.status,
-            deliveryState: record.deliveryState,
-            deliveryBlockedReason: record.deliveryBlockedReason,
-            discardedReason: record.discardedReason,
-        });
-    }
-
-    if (
-        record.deliveryState !== undefined
-        && record.deliveryState !== null
-        && record.deliveryState !== 'delivering'
-        && record.deliveryState !== 'blocked'
-    ) return null;
-    if (
-        record.deliveryState !== 'blocked'
-        && record.deliveryBlockedReason !== undefined
-        && record.deliveryBlockedReason !== null
-    ) return null;
-    if (record.discardedReason !== undefined && record.discardedReason !== null) return null;
-    return normalizePendingDeliveryStatusV1({
-        status: record.status,
-        deliveryState: record.deliveryState,
-        deliveryBlockedReason: record.deliveryBlockedReason,
-        discardedReason: record.discardedReason,
-    });
-}
-
-function readPendingRowDeliveryStatus(record: Record<string, unknown>): PendingDeliveryStatusV1 | null {
-    const hasTypedStatus = hasOwn(record, 'deliveryStatus');
-    const hasLegacyStatus = hasOwn(record, 'status')
+/**
+ * Whether a row's persisted fields read as the same status as its typed `deliveryStatus`. They differ
+ * where the server overrides the typed status, as for a queued row whose requested action it cannot
+ * parse (persisted queued, typed blocked `unsupported_action`). A row with only one representation
+ * has nothing to contradict.
+ */
+function doPersistedFieldsMatchTypedStatus(record: Record<string, unknown>, typedStatus: PendingDeliveryStatusV1): boolean {
+    const hasPersistedFields = hasOwn(record, 'status')
         || hasOwn(record, 'deliveryState')
         || hasOwn(record, 'deliveryBlockedReason')
         || hasOwn(record, 'discardedReason');
-    if (!hasTypedStatus && !hasLegacyStatus) return null;
-
-    const typedStatus = hasTypedStatus ? parsePendingDeliveryStatusV1(record.deliveryStatus) : null;
-    if (hasTypedStatus && typedStatus === null) return null;
-    const legacyStatus = hasLegacyStatus ? parseLegacyPendingRowDeliveryStatus(record) : null;
-    if (hasLegacyStatus && legacyStatus === null) return null;
-    if (typedStatus && legacyStatus && !arePendingDeliveryStatusesEqual(typedStatus, legacyStatus)) return null;
-    return typedStatus ?? legacyStatus;
+    if (!hasOwn(record, 'deliveryStatus') || !hasPersistedFields) return true;
+    const persistedStatus = parseLegacyPendingRowDeliveryStatus(record);
+    return persistedStatus !== null && arePendingDeliveryStatusesEqual(persistedStatus, typedStatus);
 }
 
 type PendingQueueV2ProjectionEntry = Readonly<{
@@ -498,6 +492,7 @@ type PendingQueueV2ProjectionEntry = Readonly<{
     deliveryStatus: PendingDeliveryStatusV1;
     messageRole: SessionMessageRole | null;
     requestedAction: PendingRequestedActionV1 | null;
+    persistedFieldsMatchTypedStatus: boolean;
 }>;
 
 function parsePendingQueueV2Projection(value: unknown): PendingQueueV2ProjectionEntry[] {
@@ -532,15 +527,16 @@ function parsePendingQueueV2Projection(value: unknown): PendingQueueV2Projection
             deliveryStatus,
             messageRole: messageRole.success ? messageRole.data : null,
             requestedAction: requestedAction.success ? requestedAction.data : null,
+            persistedFieldsMatchTypedStatus: doPersistedFieldsMatchTypedStatus(pendingRecord, deliveryStatus),
         });
     }
     return entries;
 }
 
-async function fetchPendingQueueV2Projection(params: {
+async function fetchPendingQueueV2List(params: {
     token: string;
     sessionId: string;
-}): Promise<PendingQueueV2ProjectionEntry[]> {
+}): Promise<unknown> {
     const serverUrl = resolveServerHttpBaseUrl();
     const response = await axios.get(
         `${serverUrl}/v2/sessions/${encodeURIComponent(params.sessionId)}/pending`,
@@ -549,7 +545,91 @@ async function fetchPendingQueueV2Projection(params: {
             timeout: 10_000,
         },
     );
-    return parsePendingQueueV2Projection(response?.data);
+    return response?.data;
+}
+
+async function fetchPendingQueueV2Projection(params: {
+    token: string;
+    sessionId: string;
+}): Promise<PendingQueueV2ProjectionEntry[]> {
+    return parsePendingQueueV2Projection(await fetchPendingQueueV2List(params));
+}
+
+/** One pending row exactly as the server's pending list reported it. */
+export type PendingQueueV2RowSnapshot = Readonly<{
+    localId: string;
+    status: 'queued' | 'discarded';
+    deliveryState: 'delivering' | 'external_handoff' | 'blocked' | null;
+    /** The server's stored reason, unnormalized, so an unrecognized reason is never read as a known one. */
+    deliveryBlockedReason: string | null;
+    position: number;
+}>;
+
+const PENDING_ROW_SNAPSHOT_DELIVERY_STATES = new Set<unknown>(['delivering', 'external_handoff', 'blocked']);
+
+function invalidPendingRowSnapshot(): Error {
+    return createInvalidResponseShapeError('Invalid pending queue row snapshot');
+}
+
+function readOptionalNonEmptyString(value: unknown): string | null | undefined {
+    if (value === undefined || value === null) return null;
+    return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function parsePendingQueueV2RowSnapshot(row: unknown): PendingQueueV2RowSnapshot {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) throw invalidPendingRowSnapshot();
+    const record = row as Record<string, unknown>;
+    const localId = readPendingLocalId(record.localId);
+    const status = record.status === 'queued' || record.status === 'discarded' ? record.status : null;
+    const rawDeliveryState = record.deliveryState ?? null;
+    const deliveryBlockedReason = readOptionalNonEmptyString(record.deliveryBlockedReason);
+    const discardedReason = readOptionalNonEmptyString(record.discardedReason);
+    const position = record.position;
+    if (
+        localId === null
+        || status === null
+        || (rawDeliveryState !== null && !PENDING_ROW_SNAPSHOT_DELIVERY_STATES.has(rawDeliveryState))
+        || deliveryBlockedReason === undefined
+        || discardedReason === undefined
+        || typeof position !== 'number'
+        || !Number.isSafeInteger(position)
+    ) {
+        throw invalidPendingRowSnapshot();
+    }
+    const deliveryState = rawDeliveryState as PendingQueueV2RowSnapshot['deliveryState'];
+    if (status === 'discarded' && deliveryState !== null) throw invalidPendingRowSnapshot();
+    if (deliveryBlockedReason !== null && deliveryState !== 'blocked') throw invalidPendingRowSnapshot();
+    // The row's delivery status must be readable by the parser every pending-list reader shares.
+    // When the typed status is present it can legitimately differ from the persisted fields (a row
+    // whose requested action the server cannot read is typed blocked `unsupported_action`), so it is
+    // neither compared with them nor substituted for them: the snapshot keeps the persisted fields,
+    // which are what the server's handled route checks.
+    if (readPendingRowDeliveryStatus(record) === null) throw invalidPendingRowSnapshot();
+    return { localId, status, deliveryState, deliveryBlockedReason, position };
+}
+
+/**
+ * Reads every row of the server's pending list with its persisted delivery fields and position.
+ * Unlike the delivery-status projection above, which keeps only the canonical typed status, this
+ * reader keeps the persisted fields exactly as stored. It fails closed on any row it cannot read
+ * exactly and on duplicate local ids.
+ */
+export async function readPendingQueueV2RowSnapshotsFromServer(params: {
+    token: string;
+    sessionId: string;
+}): Promise<PendingQueueV2RowSnapshot[]> {
+    const data = await fetchPendingQueueV2List(params);
+    const record = data && typeof data === 'object' && !Array.isArray(data)
+        ? data as Record<string, unknown>
+        : null;
+    if (!record || !Array.isArray(record.pending)) throw invalidPendingRowSnapshot();
+    const seenLocalIds = new Set<string>();
+    return record.pending.map((row) => {
+        const snapshot = parsePendingQueueV2RowSnapshot(row);
+        if (seenLocalIds.has(snapshot.localId)) throw invalidPendingRowSnapshot();
+        seenLocalIds.add(snapshot.localId);
+        return snapshot;
+    });
 }
 
 function buildPendingMaterializeBody(params: {
@@ -773,6 +853,24 @@ export async function listPendingQueueV2LocalIdsFromServer(params: {
     return pending.map((entry) => entry.localId);
 }
 
+/**
+ * Local ids of the rows a mode switch or a switch-to-local discard acts on: every pending row except
+ * one the app handed to an external terminal (`external_handoff`, whose custody is outside this
+ * runner) and one whose typed status the server overrode so that it no longer matches the persisted
+ * fields (a queued row whose requested action the server cannot parse). Queued, delivering and
+ * blocked rows count, including a malformed action already persisted as blocked.
+ * `listPendingQueueV2LocalIdsFromServer` remains the complete inventory.
+ */
+export async function listPendingQueueV2ActionableLocalIdsFromServer(params: {
+    token: string;
+    sessionId: string;
+}): Promise<string[]> {
+    const pending = await fetchPendingQueueV2Projection(params);
+    return pending
+        .filter((entry) => entry.deliveryStatus.status !== 'external_handoff' && entry.persistedFieldsMatchTypedStatus)
+        .map((entry) => entry.localId);
+}
+
 export type PendingQueueV2ActivationEligibility = 'eligible' | 'missing' | 'ineligible';
 
 export async function readPendingQueueV2ActivationEligibilityFromServer(params: {
@@ -988,11 +1086,12 @@ export async function blockPendingQueueV2Delivery(params: {
     usedLegacySteeringUnavailableFallback?: true;
 }> {
     try {
-        return await postPendingQueueV2DeliveryAction({
+        const { pendingQueueState } = await postPendingQueueV2DeliveryAction({
             ...params,
             action: 'block',
             body: { reason: params.reason },
         });
+        return pendingQueueState ? { pendingQueueState } : {};
     } catch (error) {
         if (
             params.reason !== 'conditional_steer_unavailable'
@@ -1001,25 +1100,89 @@ export async function blockPendingQueueV2Delivery(params: {
         ) {
             throw error;
         }
-        const fallback = await postPendingQueueV2DeliveryAction({
+        const { pendingQueueState } = await postPendingQueueV2DeliveryAction({
             ...params,
             action: 'block',
             body: { reason: 'steering_unavailable' },
         });
-        return { ...fallback, usedLegacySteeringUnavailableFallback: true };
+        return { ...(pendingQueueState ? { pendingQueueState } : {}), usedLegacySteeringUnavailableFallback: true };
     }
 }
 
+/** The transcript message the server committed when it resolved a pending row as manually handled. */
+export type PendingQueueV2HandledTranscriptMessage = Readonly<{
+    id: string;
+    seq: number;
+    localId: string;
+    deliveryResolution: Readonly<{ v: 1; kind: 'manual_handled' }>;
+}>;
+
+function readHandledTranscriptMessage(
+    data: Record<string, unknown>,
+    localId: string,
+): PendingQueueV2HandledTranscriptMessage | null {
+    // The route sends a message only when this request resolved the row; otherwise it answers
+    // with the current counts alone.
+    if (!hasOwn(data, 'message')) return null;
+    const message = data.message;
+    const record = message && typeof message === 'object' && !Array.isArray(message)
+        ? message as Record<string, unknown>
+        : null;
+    const resolution = record?.deliveryResolution;
+    const resolutionRecord = resolution && typeof resolution === 'object' && !Array.isArray(resolution)
+        ? resolution as Record<string, unknown>
+        : null;
+    const id = record ? readNonBlankOpaqueIdentifier(record.id) : null;
+    if (
+        !record
+        || id === null
+        || typeof record.seq !== 'number'
+        || !Number.isSafeInteger(record.seq)
+        || record.seq < 0
+        || readPendingLocalId(record.localId) !== localId
+        || resolutionRecord?.v !== 1
+        || resolutionRecord.kind !== 'manual_handled'
+    ) {
+        throw createInvalidResponseShapeError('Invalid pending delivery handled resolution message');
+    }
+    return { id, seq: record.seq, localId, deliveryResolution: { v: 1, kind: 'manual_handled' } };
+}
+
+/**
+ * What one handled POST established: the committed transcript message when the request resolved
+ * the row, or else the queue counts and version with which the server answers a request that
+ * resolved nothing.
+ */
+export type PendingQueueV2HandledResponse =
+    | Readonly<{ transcriptMessage: PendingQueueV2HandledTranscriptMessage; pendingQueueState?: KnownPendingQueueState }>
+    | Readonly<{ transcriptMessage: null; pendingQueueState: KnownPendingQueueState }>;
+
+/**
+ * Posts one manual-handled resolution. The server has no compare-and-set on the row's state, so a
+ * caller that needs one must check the row before calling and read it back afterwards.
+ */
 export async function markPendingQueueV2DeliveryHandled(params: {
     token: string;
     sessionId: string;
     localId: string;
-}): Promise<{ pendingQueueState?: KnownPendingQueueState }> {
-    return postPendingQueueV2DeliveryAction({
+}): Promise<PendingQueueV2HandledResponse> {
+    const localId = requirePendingLocalId(params.localId);
+    const { pendingQueueState, data } = await postPendingQueueV2DeliveryAction({
         ...params,
+        localId,
         action: 'handled',
         body: {},
     });
+    const transcriptMessage = readHandledTranscriptMessage(data, localId);
+    if (transcriptMessage !== null) {
+        return { transcriptMessage, ...(pendingQueueState ? { pendingQueueState } : {}) };
+    }
+    // The route's answer to a request that resolved nothing always carries all three counts. A
+    // success body with neither that nor a message does not show that the row was left unresolved.
+    if (!pendingQueueState || !hasOwn(data, 'pendingBlockedCount')) {
+        throw createInvalidResponseShapeError('Invalid pending delivery handled response: neither a resolution message nor valid queue counts');
+    }
+    return { transcriptMessage: null, pendingQueueState };
 }
 
 async function postPendingQueueV2DeliveryAction(params: {
@@ -1028,7 +1191,7 @@ async function postPendingQueueV2DeliveryAction(params: {
     localId: string;
     action: 'block' | 'handled';
     body: Record<string, unknown>;
-}): Promise<{ pendingQueueState?: KnownPendingQueueState; message?: PendingQueueMaterializedMessage | null; didResolve?: boolean }> {
+}): Promise<{ pendingQueueState?: KnownPendingQueueState; data: Record<string, unknown> }> {
     const localId = requirePendingLocalId(params.localId);
     const serverUrl = resolveServerHttpBaseUrl();
     const response = await axios.post(
@@ -1039,17 +1202,25 @@ async function postPendingQueueV2DeliveryAction(params: {
             timeout: 10_000,
         },
     );
+    // Handled receipts must tell an unreadable success body apart from a lost connection, so that
+    // action marks it with the invalid-response code. Block keeps its plain errors, whose retry
+    // classification its runner callers already depend on.
+    const unreadableResponse = (message: string): Error => params.action === 'handled'
+        ? createInvalidResponseShapeError(message)
+        : new Error(message);
     const data = response?.data;
     if (!data || typeof data !== 'object') {
-        throw new Error(`Invalid pending delivery ${params.action} response`);
+        throw unreadableResponse(`Invalid pending delivery ${params.action} response`);
     }
-    if ((data as Record<string, unknown>).ok !== true) {
-        const error = (data as Record<string, unknown>).error;
-        throw new Error(`Pending delivery ${params.action} failed: ${typeof error === 'string' ? error : 'unknown'}`);
+    const record = data as Record<string, unknown>;
+    if (record.ok !== true) {
+        const error = record.error;
+        throw unreadableResponse(`Pending delivery ${params.action} failed: ${typeof error === 'string' ? error : 'unknown'}`);
     }
     const pendingQueueState = readKnownPendingQueueState(data);
     return {
         ...(pendingQueueState ? { pendingQueueState } : {}),
+        data: record,
     };
 }
 

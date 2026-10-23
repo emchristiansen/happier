@@ -23,6 +23,7 @@ const RESULT_REQUIRED_BLOCKING_ACTION_IDS = [
   'session.goal.get',
   'session.terminalComposer.clear',
   'session.pendingInput.interruptAndRun',
+  'session.pendingInput.markHandled',
   'session.usageLimit.checkNow',
   'session.usageLimit.consumeResetCredit',
   'session.vendor_plugin_catalog.list',
@@ -100,6 +101,7 @@ const EXTERNALLY_CONTROLLABLE_SESSION_AGENT_UNSUPPORTED_ACTIONS = {
   'session.spawn_picker': 'the interactive spawn picker remains UI/external-client only; in-session agents use session.spawn_new.',
   'session.terminalComposer.clear': 'clearing a human terminal composer is an explicit human/UI decision.',
   'session.pendingInput.interruptAndRun': 'interrupting a human-visible live provider turn is an explicit human/UI decision.',
+  'session.pendingInput.markHandled': 'settling a pending input as handled relies on delivery proof the caller holds outside the session.',
   'session.target.primary.set': 'target-state mutation changes the human-visible workspace target and stays external by default.',
   'session.target.tracked.set': 'target-state mutation changes tracked workspace state and stays external by default.',
   'approval.request.decide': 'agents must not approve or reject approval requests on their own behalf.',
@@ -411,6 +413,43 @@ describe('Action Spec Registry', () => {
     });
     expect(spec.inputSchema.safeParse({
       sessionId: '  ',
+    }).success).toBe(false);
+  });
+
+  it('declares pending-input mark-handled as a CLI-only danger action with an expected-state guard', () => {
+    const spec = getActionSpec('session.pendingInput.markHandled');
+
+    expect(spec.safety).toBe('danger');
+    expect(spec.approval).toEqual({ result: 'required' });
+    expect(spec.surfaces).toEqual({
+      ui_button: false,
+      ui_slash_command: false,
+      voice_tool: false,
+      voice_action_block: false,
+      session_agent: false,
+      mcp: false,
+      cli: true,
+    });
+    expect(isActionSpecSurfacedOn(spec, 'cli')).toBe(true);
+    expect(isActionSpecSurfacedOn(spec, 'mcp')).toBe(false);
+    expect(isActionSpecSurfacedOn(spec, 'session_agent')).toBe(false);
+    expect(spec.inputSchema.parse({
+      sessionId: 'sess_1',
+      localId: 'local-1',
+      expectedDeliveryState: 'blocked',
+      expectedBlockedReason: 'delivery_outcome_uncertain',
+    })).toEqual({
+      sessionId: 'sess_1',
+      localId: 'local-1',
+      expectedDeliveryState: 'blocked',
+      expectedBlockedReason: 'delivery_outcome_uncertain',
+    });
+    expect(spec.inputSchema.safeParse({ sessionId: 'sess_1', localId: 'local-1' }).success).toBe(false);
+    expect(spec.inputSchema.safeParse({
+      sessionId: 'sess_1',
+      localId: 'local-1',
+      expectedDeliveryState: 'external_handoff',
+      expectedBlockedReason: 'unknown',
     }).success).toBe(false);
   });
 

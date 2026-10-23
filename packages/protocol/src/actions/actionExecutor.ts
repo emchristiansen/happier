@@ -26,6 +26,11 @@ import { ApprovalRequestOriginV1Schema, ApprovalRequestV1Schema, type ApprovalRe
 import type { PromptRegistryConfiguredSourceV1 } from '../promptLibrary/promptRegistriesV1.js';
 import { BackendTargetKeySchema, BackendTargetRefSchema, buildBackendTargetKey, parseBackendTargetKey, type BackendTargetRefV1 } from '../backendTargets/backendTargetRef.js';
 import type { SessionRollbackTarget } from '../sessionRollback.js';
+import type { PendingDeliveryBlockedReason } from '../sessionMessages/pendingDeliveryBlockedReason.js';
+import type {
+  SessionPendingInputMarkHandledExpectedDeliveryStateV1,
+  SessionPendingInputMarkHandledRequestV1,
+} from '../sessionControl/sessionPendingInputMarkHandledV1.js';
 import {
   SessionHandoffWorkspaceTransferSchema,
   type SessionHandoffWorkspaceTransfer,
@@ -324,6 +329,13 @@ export type ActionExecutorDeps = Readonly<{
     sessionId: string;
     localId: string;
     expectedStateAtMs?: number;
+    serverId?: string | null;
+  }>) => Promise<unknown>;
+  sessionPendingInputMarkHandled?: (args: Readonly<{
+    sessionId: string;
+    localId: string;
+    expectedDeliveryState: SessionPendingInputMarkHandledExpectedDeliveryStateV1;
+    expectedBlockedReason?: PendingDeliveryBlockedReason;
     serverId?: string | null;
   }>) => Promise<unknown>;
   sessionVendorPluginCatalogList?: (args: Readonly<{ sessionId: string; cwd?: string; serverId?: string | null }>) => Promise<unknown>;
@@ -2514,6 +2526,22 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
             sessionId,
             localId,
             ...(typeof expectedStateAtMs === 'number' ? { expectedStateAtMs } : {}),
+            ...(serverId ? { serverId } : {}),
+          });
+          return { ok: true, result: res };
+        }
+
+        if (actionId === 'session.pendingInput.markHandled') {
+          if (!deps.sessionPendingInputMarkHandled) {
+            return { ok: false, errorCode: 'unsupported_action', error: 'unsupported_action:session.pendingInput.markHandled' };
+          }
+          const request = parsed.data as SessionPendingInputMarkHandledRequestV1;
+          const serverId = resolveServerIdForSession(deps, ctx, request.sessionId);
+          const res = await deps.sessionPendingInputMarkHandled({
+            sessionId: request.sessionId,
+            localId: request.localId,
+            expectedDeliveryState: request.expectedDeliveryState,
+            ...(request.expectedBlockedReason ? { expectedBlockedReason: request.expectedBlockedReason } : {}),
             ...(serverId ? { serverId } : {}),
           });
           return { ok: true, result: res };
