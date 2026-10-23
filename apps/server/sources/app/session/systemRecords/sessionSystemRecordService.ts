@@ -288,8 +288,12 @@ async function upsertSessionSystemRecordWithRetry(
         // opening a write transaction. Only the transaction's own "unchanged" outcome is taken here;
         // every other outcome runs the transaction below, which re-reads everything. See
         // readSessionSystemRecordUpsertState for why this is linearizable.
-        const fast = await readSessionSystemRecordUpsertState(db, params);
-        if (fast.kind === "unchanged") return fast.result;
+        // The fast path is strictly optional: if its read fails for any reason, the transaction below
+        // runs as before. It re-runs this same decision through the transaction client, so an error
+        // the transactional path would surface surfaces there again, and a transient one gets
+        // inTx's bounded retry, exactly as before the fast path existed.
+        const fast = await readSessionSystemRecordUpsertState(db, params).catch(() => null);
+        if (fast?.kind === "unchanged") return fast.result;
 
         return await inTx(async (tx) => {
             const state = await readSessionSystemRecordUpsertState(tx, params);

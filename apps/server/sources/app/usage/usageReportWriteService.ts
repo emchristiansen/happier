@@ -65,8 +65,13 @@ export async function recordUsageReportForAccount(params: Readonly<{
         // opening a write transaction. Only the transaction's own "unchanged" outcome is taken here;
         // every other outcome (not found, new, changed, duplicate rows) runs the transaction below,
         // which re-reads everything. See readUsageReportState for why this is linearizable.
-        const fast = await readUsageReportState(db, { userId: params.userId, sessionId, key: params.key, usageData });
-        if (fast.kind === "unchanged") {
+        // The fast path is strictly optional: if its read fails for any reason, the transaction below
+        // runs as before. It re-runs this same decision through the transaction client, so an error
+        // the transactional path would surface surfaces there again, and a transient one gets
+        // inTx's bounded retry, exactly as before the fast path existed.
+        const fast = await readUsageReportState(db, { userId: params.userId, sessionId, key: params.key, usageData })
+            .catch(() => null);
+        if (fast?.kind === "unchanged") {
             usageReportWritesCounter.inc({ scope: fast.scope, result: "unchanged" });
             return { ok: true, report: fast.report, usageData, changed: false };
         }

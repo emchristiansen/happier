@@ -54,6 +54,42 @@ async function withTransactionBoundary<T>(
     }
 }
 
+/**
+ * Test-only: the first `findUnique` on `model` through the global db fails with a retryable socket
+ * timeout (P1008), as a transient SQLite stall would; later calls reach the real client.
+ */
+async function withFirstRecordReadFailing<T>(
+    model: "usageReport" | "sessionSystemRecord",
+    run: (reads: Readonly<{ calls: () => number }>) => Promise<T>,
+): Promise<T> {
+    const mutableDb = db as unknown as Record<string, object>;
+    const original = mutableDb[model]!;
+    let calls = 0;
+    mutableDb[model] = new Proxy(original, {
+        get: (target, prop) => {
+            const value = Reflect.get(target, prop);
+            if (prop !== "findUnique" || typeof value !== "function") {
+                return typeof value === "function" ? value.bind(target) : value;
+            }
+            return async (...args: unknown[]) => {
+                calls += 1;
+                if (calls === 1) {
+                    throw new Prisma.PrismaClientKnownRequestError(
+                        "Socket timeout (the database failed to respond to a query within the configured timeout).",
+                        { code: "P1008", clientVersion: Prisma.prismaVersion.client, meta: {} },
+                    );
+                }
+                return await (value as (...a: unknown[]) => Promise<unknown>).apply(target, args);
+            };
+        },
+    });
+    try {
+        return await run({ calls: () => calls });
+    } finally {
+        mutableDb[model] = original;
+    }
+}
+
 const usage = (total: number) => ({
     tokens: { total, input: total - 1, output: 1 },
     cost: { total: total / 1000, input: 0, output: total / 1000 },
@@ -165,6 +201,38 @@ describe("recordUsageReportForAccount: unchanged reports skip the transaction", 
             return value;
         });
         expect(result).toEqual({ ok: false, error: "session-not-found" });
+    });
+
+    it("still writes a changed session report through the transaction when the optional read fails once", async () => {
+        const { userId, sessionId } = await createOwnedSession();
+        await recordUsageReportForAccount({ userId, sessionId, key: "claude", ...usage(40) });
+
+        const changed = await withFirstRecordReadFailing("usageReport", async (reads) =>
+            await withTransactionBoundary("count", async (boundary) => {
+                const result = await recordUsageReportForAccount({ userId, sessionId, key: "claude", ...usage(41) });
+                expect(reads.calls()).toBeGreaterThanOrEqual(1);
+                expect(boundary.attempts()).toBe(1);
+                return result;
+            }));
+        expect(changed).toMatchObject({ ok: true, changed: true, usageData: usage(41) });
+        await expect(db.usageReport.findUnique({
+            where: { accountId_sessionId_key: { accountId: userId, sessionId, key: "claude" } },
+            select: { data: true },
+        })).resolves.toEqual({ data: usage(41) });
+    });
+
+    it("still answers an unchanged session report through the transaction when the optional read fails once", async () => {
+        const { userId, sessionId } = await createOwnedSession();
+        const first = await recordUsageReportForAccount({ userId, sessionId, key: "claude", ...usage(42) });
+        if (!first.ok) throw new Error("setup failed");
+
+        const unchanged = await withFirstRecordReadFailing("usageReport", async () =>
+            await withTransactionBoundary("count", async (boundary) => {
+                const result = await recordUsageReportForAccount({ userId, sessionId, key: "claude", ...usage(42) });
+                expect(boundary.attempts()).toBe(1);
+                return result;
+            }));
+        expect(unchanged).toEqual({ ok: true, changed: false, report: first.report, usageData: usage(42) });
     });
 
     it("answers an unchanged account-level report without opening a transaction", async () => {
