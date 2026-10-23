@@ -24,8 +24,10 @@ const liveDefaultOrigins = [
 
 const unreachableOrigin = new URL(UNIT_TEST_UNREACHABLE_SERVER_URL).origin;
 
+// Checks the defaults the unit setup installs (environment values and resolved origins); it makes no
+// network connection.
 describe('unit test default server URL', () => {
-  it('points the server env at an address nothing listens on', () => {
+  it('points the default server env at loopback port 9 and clears the overrides', () => {
     expect(process.env.HAPPIER_SERVER_URL).toBe(UNIT_TEST_UNREACHABLE_SERVER_URL);
     expect(process.env.HAPPIER_WEBAPP_URL).toBe(UNIT_TEST_UNREACHABLE_SERVER_URL);
     expect(process.env.HAPPIER_PUBLIC_SERVER_URL).toBeUndefined();

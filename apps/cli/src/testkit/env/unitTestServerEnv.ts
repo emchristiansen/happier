@@ -3,10 +3,11 @@
  *
  * `.env.integration-test` points `HAPPIER_SERVER_URL` at `http://localhost:3005`, the port a real
  * Happier server or relay listens on during local development. A unit test that falls back to the
- * configured server would otherwise send real HTTP requests to whatever runs there. Unit tests get
- * a loopback URL on the discard port (9) instead, where nothing listens, so a stray request fails
- * with a connection error and never reaches a live server. A test that needs a specific server sets
- * the variables itself.
+ * configured server would otherwise send real HTTP requests to whatever runs there. Unit test
+ * defaults are redirected away from that relay and the cloud endpoints to a loopback URL on the
+ * discard port (9), which is expected to be closed in the intended test environment. This changes
+ * only the default destination; nothing here controls what listens on port 9 or how a request is
+ * routed. A test that needs a specific server sets the variables itself.
  */
 export const UNIT_TEST_UNREACHABLE_SERVER_URL = 'http://127.0.0.1:9'
 
