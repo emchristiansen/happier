@@ -220,3 +220,107 @@ describe('queued auth switch cancellation', () => {
     }
   });
 });
+
+describe('deferred background acquisition', () => {
+  it('outlives the ordinary bound on the shared FIFO queue while an ordinary waiter beside it expires', async () => {
+    vi.useFakeTimers();
+    const locks = new ConnectedServiceSessionAuthSwitchLockRegistry();
+    let release!: () => void;
+    const held = locks.runExclusive('s1', () => new Promise<void>((resolve) => { release = resolve; }));
+    await Promise.resolve();
+    const events: string[] = [];
+    let ordinaryOutcome: unknown;
+    const ordinary = locks.runExclusive('s1', async () => { events.push('ordinary'); })
+      .catch((error: unknown) => { ordinaryOutcome = error; });
+    const background = locks.runExclusiveDeferredBackground('s1', async () => {
+      events.push('background');
+      return 'applied';
+    }).then(
+      (value) => ({ status: 'completed' as const, value }),
+      (error: unknown) => ({ status: 'failed' as const, error }),
+    );
+    let later: Promise<void> | undefined;
+    try {
+      await vi.advanceTimersByTimeAsync(10_000);
+      // Queued behind the background acquisition; its own 30 s bound runs until t = 40 s.
+      later = locks.runExclusive('s1', async () => { events.push('later'); });
+      await vi.advanceTimersByTimeAsync(25_000);
+      expect(ordinaryOutcome).toMatchObject({ reason: 'timed_out', sessionId: 's1' });
+      expect(events).toEqual([]);
+      release();
+      await held;
+      await expect(background).resolves.toEqual({ status: 'completed', value: 'applied' });
+      await later;
+      await ordinary;
+      expect(events).toEqual(['background', 'later']);
+    } finally {
+      release();
+      locks.clearSession('s1');
+      await Promise.allSettled([held, ordinary, background, ...(later ? [later] : [])]);
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the queued caller ancestry and re-enters at once, with no acquisition timeout', async () => {
+    vi.useFakeTimers();
+    const locks = new ConnectedServiceSessionAuthSwitchLockRegistry();
+    let releaseB!: () => void;
+    const heldB = locks.runExclusive('b', () => new Promise<void>((resolve) => { releaseB = resolve; }));
+    await Promise.resolve();
+    const events: string[] = [];
+    const nested = locks.runExclusive('a', async () => await locks.runExclusiveDeferredBackground('b', async () => {
+      events.push('b');
+      // Both the queued caller's own lock and the background owner's lock re-enter at once.
+      await locks.runExclusiveDeferredBackground('b', async () => { events.push('b:reentered'); });
+      return await locks.runExclusive('a', async () => {
+        events.push('a:reentered');
+        return 'completed';
+      });
+    })).then(
+      (value) => ({ status: 'completed' as const, value }),
+      (error: unknown) => ({ status: 'failed' as const, error }),
+    );
+    try {
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(events).toEqual([]);
+      releaseB();
+      await heldB;
+      await expect(nested).resolves.toEqual({ status: 'completed', value: 'completed' });
+      expect(events).toEqual(['b', 'b:reentered', 'a:reentered']);
+    } finally {
+      releaseB();
+      locks.clearSession('a');
+      locks.clearSession('b');
+      await Promise.allSettled([heldB, nested]);
+      vi.useRealTimers();
+    }
+  });
+
+  it('is cancelled by clearSession while queued, and never runs later or requeues', async () => {
+    vi.useFakeTimers();
+    const locks = new ConnectedServiceSessionAuthSwitchLockRegistry();
+    let release!: () => void;
+    const held = locks.runExclusive('s1', () => new Promise<void>((resolve) => { release = resolve; }));
+    await Promise.resolve();
+    const executed: string[] = [];
+    let backgroundOutcome: unknown;
+    const background = locks.runExclusiveDeferredBackground('s1', async () => { executed.push('stopped'); })
+      .catch((error: unknown) => { backgroundOutcome = error; });
+    try {
+      locks.clearSession('s1');
+      await background;
+      expect(backgroundOutcome).toMatchObject({ reason: 'session_stopped', sessionId: 's1' });
+      // The running owner keeps its exclusion through Stop.
+      expect(locks.isHeldByAnotherOwner('s1')).toBe(true);
+      release();
+      await held;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(executed).toEqual([]);
+      expect(locks.isHeldByAnotherOwner('s1')).toBe(false);
+    } finally {
+      release();
+      await Promise.allSettled([held, background]);
+      vi.useRealTimers();
+    }
+  });
+});

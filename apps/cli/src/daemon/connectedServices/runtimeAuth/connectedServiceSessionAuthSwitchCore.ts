@@ -5,11 +5,17 @@ export type ConnectedServiceSessionAuthSwitchReason =
   | 'manual'
   | 'pre_turn_group_policy';
 
-// Acquisition alone is bounded: the executing owner keeps exclusion until it finishes.
-// This is below the default 60s turn deferral and the 120s refresh scheduling lease.
+// Ordinary queued acquisition, not execution, is bounded: the executing owner keeps exclusion
+// until it finishes. This is below the default 60s turn deferral and the 120s refresh scheduling
+// lease. The one unbounded exception is `runExclusiveDeferredBackground`, for work nobody awaits.
 const SESSION_AUTH_SWITCH_ACQUISITION_TIMEOUT_MS = 30_000;
 
 type AcquisitionCancellationReason = 'timed_out' | 'session_stopped';
+
+// How long a queued acquisition may wait. Both kinds stay cancellable by `clearSession`.
+type AcquisitionBound =
+  | Readonly<{ kind: 'bounded'; timeoutMs: number }>
+  | Readonly<{ kind: 'until_acquired_or_stopped' }>;
 
 export class ConnectedServiceSessionAuthSwitchAcquisitionError extends Error {
   constructor(
@@ -41,9 +47,43 @@ const activeSessionLockOwners = new AsyncLocalStorage<ReadonlyArray<ActiveSessio
 export class ConnectedServiceSessionAuthSwitchLockRegistry {
   private readonly locksBySessionId = new Map<string, SessionLock>();
 
-  async runExclusive<T>(
+  /**
+   * Runs `operation` while holding the session's lock. A queued acquisition fails with
+   * `timed_out` after 30 seconds, or with `session_stopped` when `clearSession` cancels it.
+   */
+  runExclusive<T>(
     sessionId: string,
     operation: () => Promise<T>,
+  ): Promise<T> {
+    return this.acquire(sessionId, operation, {
+      kind: 'bounded',
+      timeoutMs: SESSION_AUTH_SWITCH_ACQUISITION_TIMEOUT_MS,
+    });
+  }
+
+  /**
+   * Like `runExclusive`, on the same lock and FIFO queue, with the same re-entry and caller
+   * ancestry, except that a queued acquisition has no timeout: it runs after every transition
+   * already holding or awaiting the lock, however long they take. Only `clearSession` (explicit
+   * Stop or final child cleanup) cancels it while queued, with `session_stopped`; a cancelled
+   * acquisition never runs later and is not requeued.
+   *
+   * Only work that nobody awaits may use this: the refreshed-credential distribution's deferred
+   * application for a session whose lock another transition holds. An awaited caller uses
+   * `runExclusive`, whose bound keeps it from waiting indefinitely. An owner that never finishes
+   * keeps such an acquisition queued until the session is stopped.
+   */
+  runExclusiveDeferredBackground<T>(
+    sessionId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    return this.acquire(sessionId, operation, { kind: 'until_acquired_or_stopped' });
+  }
+
+  private async acquire<T>(
+    sessionId: string,
+    operation: () => Promise<T>,
+    bound: AcquisitionBound,
   ): Promise<T> {
     if (this.hasActiveOwner(sessionId)) {
       return await operation();
@@ -79,7 +119,9 @@ export class ConnectedServiceSessionAuthSwitchLockRegistry {
         acquisition.start();
       } else {
         lock.queue.add(acquisition);
-        timer = setTimeout(() => acquisition.cancel('timed_out'), SESSION_AUTH_SWITCH_ACQUISITION_TIMEOUT_MS);
+        if (bound.kind === 'bounded') {
+          timer = setTimeout(() => acquisition.cancel('timed_out'), bound.timeoutMs);
+        }
       }
     });
   }
@@ -111,6 +153,14 @@ export class ConnectedServiceSessionAuthSwitchLockRegistry {
       if (next) next.start();
       else this.locksBySessionId.delete(sessionId);
     }
+  }
+
+  /**
+   * Whether another transition holds or awaits this session's lock. The calling async context's
+   * own hold does not count, because its re-entry runs at once.
+   */
+  isHeldByAnotherOwner(sessionId: string): boolean {
+    return this.locksBySessionId.has(sessionId) && !this.hasActiveOwner(sessionId);
   }
 
   private hasActiveOwner(sessionId: string): boolean {
