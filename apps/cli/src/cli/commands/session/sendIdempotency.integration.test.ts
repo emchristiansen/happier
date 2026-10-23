@@ -287,10 +287,10 @@ describe('session message send idempotency at the relay HTTP boundary (integrati
     const first = await sessionSend([targetSessionId, 'READY TO MOVE']);
     const second = await sessionSend([targetSessionId, 'READY TO MOVE']);
 
+    expect(relay!.rows.size).toBe(1);
     expect(first).toEqual(expect.objectContaining({ ok: true }));
     expect(first.data).not.toHaveProperty('deduplicated');
     expect(second.data).toEqual(expect.objectContaining({ localId: first.data.localId, deduplicated: true }));
-    expect(relay!.rows.size).toBe(1);
   });
 
   it('sends the same text again once the next UTC bucket starts', async () => {
@@ -309,6 +309,10 @@ describe('session message send idempotency at the relay HTTP boundary (integrati
     const first = await mcpActionExecuteSend('CORRECTION CASE tv-g1-paths-present-1', { requestId: 1 });
     const second = await mcpActionExecuteSend('CORRECTION CASE tv-g1-paths-present-1', { requestId: 2 });
 
+    // Row counts first, so a RED run reports the duplicate itself.
+    expect(relay!.postedLocalIds).toHaveLength(2);
+    expect(relay!.rows.size).toBe(1);
+    expect(new Set(relay!.postedLocalIds).size).toBe(1);
     expect(first.isError).toBe(true);
     expect(first.payload).toEqual(expect.objectContaining({
       errorCode: 'timeout',
@@ -316,9 +320,6 @@ describe('session message send idempotency at the relay HTTP boundary (integrati
     }));
     expect(second.isError).toBe(false);
     expect(second.payload).toEqual(expect.objectContaining({ ok: true, deduplicated: true }));
-    expect(relay!.postedLocalIds).toHaveLength(2);
-    expect(new Set(relay!.postedLocalIds).size).toBe(1);
-    expect(relay!.rows.size).toBe(1);
   });
 
   it('prefers the MCP request _meta provider call id over the bucket on the action_execute path', async () => {
