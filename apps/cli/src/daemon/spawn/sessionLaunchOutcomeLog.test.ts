@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { SessionLaunchPlacementOutcome } from '@/daemon/platform/linux/observeSessionLaunchPlacement';
+import {
+  resolveSessionLaunchPlacement,
+  type SessionLaunchPlacementOutcome,
+} from '@/daemon/platform/linux/observeSessionLaunchPlacement';
 import type { SessionLaunchId } from '@/daemon/platform/linux/sessionLaunchId';
 import { SPAWN_SESSION_ERROR_CODES, type SpawnSessionResult } from '@/rpc/handlers/registerSessionHandlers';
 
@@ -251,5 +254,51 @@ describe('launch-failed is written only for a launch still pending its webhook',
       `WARN launch-failed launch=${LAUNCH_ID} session=pending mode=child pid=4242 code=unavailable signal=unavailable message="spawn systemd-run ENOENT" webhook=not-received placement=scoped stage=unknown`,
       `WARN launch-failed launch=${LAUNCH_ID} session=pending mode=tmux pid=5151 reason=webhook-timeout code=unavailable signal=unavailable webhook=not-received placement=unknown stage=unknown`,
     ].sort());
+  });
+});
+
+describe('a hung placement read does not withhold the pending failure line', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('writes one unknown placement and one launch-failed line at the bound, and nothing when the read settles late', async () => {
+    vi.useFakeTimers();
+    const capture = captureWriter();
+    let settleLate!: (content: string) => void;
+    const placement = resolveSessionLaunchPlacement({
+      intent: { kind: 'systemd-scope', launchId: LAUNCH_ID, unitName: UNIT },
+      pid: 4242,
+      uid: 1000,
+      readProcFile: async (path) => {
+        if (path.endsWith('/stat')) {
+          return await new Promise<string>((resolve) => { settleLate = resolve; });
+        }
+        return `0::/user.slice/user-1000.slice/user@1000.service/happier.slice/happier-jobs.slice/${UNIT}\n`;
+      },
+    });
+    const log = startSessionLaunchOutcomeLog({
+      launchId: LAUNCH_ID,
+      mode: 'child',
+      existingSessionId: '',
+      pid: 4242,
+      placement,
+      write: capture.write,
+    });
+
+    await vi.advanceTimersByTimeAsync(100);
+    log.childExitedBeforeWebhook({ code: 1, signal: null });
+    await vi.advanceTimersByTimeAsync(1_800);
+    expect(capture.lines).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect(capture.lines).toEqual([
+      `INFO launch-placement launch=${LAUNCH_ID} session=pending mode=child pid=4242 outcome=unknown last_cgroup=none reason=bound-elapsed`,
+      `WARN launch-failed launch=${LAUNCH_ID} session=pending mode=child pid=4242 code=1 signal=null webhook=not-received placement=unknown stage=unknown`,
+    ]);
+
+    settleLate('4242 (node) S 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 777 0\n');
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(capture.lines).toHaveLength(2);
   });
 });

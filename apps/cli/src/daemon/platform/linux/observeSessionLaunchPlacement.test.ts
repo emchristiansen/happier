@@ -207,6 +207,71 @@ describe('observeSessionLaunchPlacement', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it('does not resume polling when a first stat read that was pending at the bound resolves late', async () => {
+    const reads: string[] = [];
+    const readProcFile: ReadProcFile = async (path) => {
+      reads.push(path);
+      if (reads.length === 1) {
+        await new Promise<void>((resolve) => { setTimeout(resolve, 2_500); });
+      }
+      return path.endsWith('/stat') ? stat(4242, '777') : `0::${SCOPED_CGROUP}\n`;
+    };
+    const observation = start({ pid: 4242, uid: 1000, unitName: UNIT, readProcFile });
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(observation.outcome).toEqual({ outcome: 'unknown', lastCgroup: null, reason: { kind: 'bound-elapsed' } });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(observation.outcome).toEqual({ outcome: 'unknown', lastCgroup: null, reason: { kind: 'bound-elapsed' } });
+    expect(reads).toEqual(['/proc/4242/stat']);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(['resolves', 'rejects'] as const)(
+    'never accepts a matching cgroup whose identity re-check was pending at the bound and %s late',
+    async (lateSettlement) => {
+      const unhandled = vi.fn();
+      process.on('unhandledRejection', unhandled);
+      try {
+        let statReads = 0;
+        const readProcFile: ReadProcFile = async (path) => {
+          if (path.endsWith('/cgroup')) return `0::${SCOPED_CGROUP}\n`;
+          statReads += 1;
+          if (statReads === 1) return stat(4242, '777');
+          // The re-check after a matching cgroup read hangs past the bound.
+          await new Promise<void>((resolve) => { setTimeout(resolve, 2_500); });
+          if (lateSettlement === 'rejects') throw Object.assign(new Error('EIO: late identity'), { code: 'EIO' });
+          return stat(4242, '777');
+        };
+        const observation = start({ pid: 4242, uid: 1000, unitName: UNIT, readProcFile });
+
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect(observation.outcome).toEqual({ outcome: 'unknown', lastCgroup: null, reason: { kind: 'bound-elapsed' } });
+        await vi.advanceTimersByTimeAsync(5_000);
+        vi.useRealTimers();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(observation.outcome).toEqual({ outcome: 'unknown', lastCgroup: null, reason: { kind: 'bound-elapsed' } });
+        expect(statReads).toBe(2);
+        expect(unhandled).not.toHaveBeenCalled();
+      } finally {
+        process.off('unhandledRejection', unhandled);
+      }
+    },
+  );
+
+  it('ends at the bound even when a matching scope would be seen on the next poll after it', async () => {
+    // Prompt reads: non-matching through 1950 ms, matching from 2000 ms on.
+    const readProcFile: ReadProcFile = async (path) => {
+      if (path.endsWith('/stat')) return stat(4242, '777');
+      return `0::${Date.now() >= 2_000 ? SCOPED_CGROUP : DAEMON_CGROUP}\n`;
+    };
+    vi.setSystemTime(0);
+    const observation = start({ pid: 4242, uid: 1000, unitName: UNIT, readProcFile });
+
+    await vi.advanceTimersByTimeAsync(2_100);
+    expect(observation.outcome).toEqual({ outcome: 'unknown', lastCgroup: DAEMON_CGROUP, reason: { kind: 'bound-elapsed' } });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('swallows a read that rejects after the bound', async () => {
     const unhandled = vi.fn();
     process.on('unhandledRejection', unhandled);
