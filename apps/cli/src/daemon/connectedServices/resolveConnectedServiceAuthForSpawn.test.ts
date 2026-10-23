@@ -252,12 +252,12 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
 
   describe('when spawn preflight joins a rotation still in flight', () => {
     // Incident 2026-10-22/23: a deadlocked rotation stayed registered as in flight. Every spawn
-    // preflight adopted its credential, minted at the rotation's start, even after it expired and
-    // after a newer credential had reached the server, and handed it to new runners.
+    // preflight adopted its credential, minted at the rotation's start, even after it expired, and
+    // handed it to new runners.
     const now = 1_792_740_000_000;
     const hourMs = 60 * 60_000;
     const currentRevision = 'csr_currentcurrentcurrent01';
-    const stuckRevision = 'csr_stuckstuckstuckstuck0001';
+    const inFlightRevision = 'csr_inflightinflightinflt01';
 
     function claudeRecord(input: Readonly<{ accessToken: string; updatedAt: number; expiresAt: number }>) {
       return {
@@ -284,7 +284,12 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     async function spawnWithInFlightRotation(input: Readonly<{
       current: ReturnType<typeof claudeRecord>;
       inFlight: ReturnType<typeof claudeRecord>;
+      /** The spawn's clock; a test moves it while the refresh is awaited. */
+      clock?: { nowMs: number };
+      /** Runs inside each awaited refresh call (1-based), before it answers. */
+      duringRefresh?: (call: number) => void;
     }>) {
+      const clock = input.clock ?? { nowMs: now };
       const baseDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-test-'));
       const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-server-test-'));
       const processEnv = await createIsolatedClaudeSourceEnv();
@@ -309,20 +314,25 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       } as unknown as ApiClient;
       // The coordinator's adoption of an in-flight rotation's credentialReady result
       // (`adoptCredentialReadyFromInFlightRefresh`) returns that rotation's credential as `refreshed`.
-      const refreshConnectedServiceCredentialForSpawnPreflight = vi.fn(async () => ({
-        status: 'refreshed' as const,
-        credential: input.inFlight,
-        credentialRevision: stuckRevision,
-        diagnostic: {
-          serviceId: 'claude-subscription' as const,
-          profileId: 'work',
-          reason: 'spawn_preflight' as const,
+      let refreshCalls = 0;
+      const refreshConnectedServiceCredentialForSpawnPreflight = vi.fn(async () => {
+        refreshCalls += 1;
+        input.duringRefresh?.(refreshCalls);
+        return {
           status: 'refreshed' as const,
-          expiresAt: input.inFlight.expiresAt,
-          expiryAgeMs: now - (input.inFlight.expiresAt ?? now),
-          refreshWindowMs: 600_000,
-        },
-      }));
+          credential: input.inFlight,
+          credentialRevision: inFlightRevision,
+          diagnostic: {
+            serviceId: 'claude-subscription' as const,
+            profileId: 'work',
+            reason: 'spawn_preflight' as const,
+            status: 'refreshed' as const,
+            expiresAt: input.inFlight.expiresAt,
+            expiryAgeMs: now - (input.inFlight.expiresAt ?? now),
+            refreshWindowMs: 600_000,
+          },
+        };
+      });
       const spawn = resolveConnectedServiceAuthForSpawn({
         agentId: 'claude',
         connectedServicesBindingsRaw: {
@@ -336,7 +346,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
         baseDir,
         credentials,
         api,
-        nowMs: () => now,
+        nowMs: () => clock.nowMs,
         processEnv,
         credentialRefreshService: { refreshConnectedServiceCredentialForSpawnPreflight },
       });
@@ -356,18 +366,6 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       expect(credential).toMatchObject({ claudeAiOauth: { accessToken: 'current-access' } });
     });
 
-    it('refuses an unexpired in-flight credential older than the current server record', async () => {
-      const { spawn } = await spawnWithInFlightRotation({
-        current: claudeRecord({ accessToken: 'current-access', updatedAt: now - hourMs, expiresAt: now + 7 * hourMs }),
-        inFlight: claudeRecord({ accessToken: 'older-access', updatedAt: now - 7 * hourMs, expiresAt: now + hourMs }),
-      });
-
-      const connectedServiceAuth = await spawn;
-
-      const credential = await readClaudeCodeNativeCredential(connectedServiceAuth!.env.CLAUDE_CONFIG_DIR!);
-      expect(credential).toMatchObject({ claudeAiOauth: { accessToken: 'current-access' } });
-    });
-
     it('fails the spawn with a clear error when both the in-flight credential and the server record have expired', async () => {
       const { spawn } = await spawnWithInFlightRotation({
         current: claudeRecord({ accessToken: 'current-access', updatedAt: now - 9 * hourMs, expiresAt: now - 30 * 60_000 }),
@@ -380,6 +378,55 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
         serviceId: 'claude-subscription',
         profileId: 'work',
       });
+    });
+
+    it('refuses an in-flight credential that expires while the preflight refresh is awaited', async () => {
+      const clock = { nowMs: now };
+      const { spawn } = await spawnWithInFlightRotation({
+        clock,
+        // Valid when the spawn starts; expired by the time the joined rotation answers.
+        duringRefresh: () => { clock.nowMs = now + 1_000; },
+        current: claudeRecord({ accessToken: 'current-access', updatedAt: now - 2 * hourMs, expiresAt: now + 7 * hourMs }),
+        inFlight: claudeRecord({ accessToken: 'expiring-access', updatedAt: now - hourMs, expiresAt: now + 500 }),
+      });
+
+      const connectedServiceAuth = await spawn;
+
+      const credential = await readClaudeCodeNativeCredential(connectedServiceAuth!.env.CLAUDE_CONFIG_DIR!);
+      expect(credential).toMatchObject({ claudeAiOauth: { accessToken: 'current-access' } });
+    });
+
+    it('does not fall back to a server record that expired while the preflight refresh was awaited', async () => {
+      const clock = { nowMs: now };
+      const { spawn } = await spawnWithInFlightRotation({
+        clock,
+        duringRefresh: () => { clock.nowMs = now + 1_000; },
+        current: claudeRecord({ accessToken: 'current-access', updatedAt: now - 2 * hourMs, expiresAt: now + 500 }),
+        inFlight: claudeRecord({ accessToken: 'stuck-access', updatedAt: now - 9 * hourMs, expiresAt: now - hourMs }),
+      });
+
+      await expect(spawn).rejects.toMatchObject({
+        name: 'ConnectedServiceSpawnCredentialRefreshError',
+        kind: 'transient_refresh_failed',
+      });
+    });
+
+    it('refuses, in the materialization-time refresh, a credential that expired after preflight adopted it', async () => {
+      const clock = { nowMs: now };
+      const { spawn, refreshConnectedServiceCredentialForSpawnPreflight } = await spawnWithInFlightRotation({
+        clock,
+        // Preflight adopts the in-flight credential while it is valid; it expires before the
+        // materializer's own refresh call answers.
+        duringRefresh: (call) => { if (call === 2) clock.nowMs = now + 1_000; },
+        current: claudeRecord({ accessToken: 'current-access', updatedAt: now - 2 * hourMs, expiresAt: now + 7 * hourMs }),
+        inFlight: claudeRecord({ accessToken: 'expiring-access', updatedAt: now - hourMs, expiresAt: now + 500 }),
+      });
+
+      await expect(spawn).rejects.toMatchObject({
+        name: 'ConnectedServiceSpawnCredentialRefreshError',
+        kind: 'transient_refresh_failed',
+      });
+      expect(refreshConnectedServiceCredentialForSpawnPreflight).toHaveBeenCalledTimes(2);
     });
   });
 

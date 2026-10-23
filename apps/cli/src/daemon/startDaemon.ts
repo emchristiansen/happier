@@ -306,7 +306,6 @@ import {
   markBrokerBridgeEffectiveSelectionUnavailable,
 } from './connectedServices/broker/brokerBridgeEffectiveSelectionRegistry';
 import {
-  CONNECTED_SERVICE_READINESS_LIVE_CREDENTIAL_APPLICATION_WAIT_MS,
   reconcileConnectedServiceAuthGroupGenerationForRuntimeTarget,
   reconcileConnectedServiceDirectCredentialRevisionForRuntimeTarget,
   reconcileConnectedServiceDirectCredentialRevisions,
@@ -2540,31 +2539,6 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               await connectedServiceRefreshCoordinator.handleExternalCredentialUpdate(input);
             },
             executionAuthority: 'passive_projection',
-            liveApplicationWaitMs: CONNECTED_SERVICE_READINESS_LIVE_CREDENTIAL_APPLICATION_WAIT_MS,
-            onDeferredLiveApplication: (event) => {
-              const context = {
-                sessionId: target.sessionId,
-                pid: target.pid,
-                serviceId: event.serviceId,
-                profileId: event.profileId,
-              };
-              if (event.phase === 'answered_before_completion') {
-                logger.infoFile(
-                  '[DAEMON RUN] Connected-service registration reconciliation stopped waiting for a live credential application; it continues',
-                  { ...context, waitBudgetMs: event.waitBudgetMs },
-                );
-              } else if (event.phase === 'completed_after_answer') {
-                logger.infoFile(
-                  '[DAEMON RUN] Connected-service live credential application completed after registration reconciliation stopped waiting',
-                  context,
-                );
-              } else {
-                logger.warn(
-                  '[DAEMON RUN] Connected-service live credential application failed after registration reconciliation stopped waiting',
-                  { ...context, error: serializeAxiosErrorForLog(event.error) },
-                );
-              }
-            },
             isCurrent,
             ...(signal ? { signal } : {}),
           });

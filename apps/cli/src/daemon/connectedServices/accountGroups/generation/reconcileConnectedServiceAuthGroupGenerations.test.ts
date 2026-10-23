@@ -223,69 +223,12 @@ describe('reconcileConnectedServiceAuthGroupGenerations', () => {
       }),
       applyLiveCredentialBoundary,
       executionAuthority: 'passive_projection',
-      liveApplicationWaitMs: 5_000,
-      onDeferredLiveApplication: () => {},
     });
 
     expect(result).toEqual({ appliedBindingCount: 1 });
     expect(applyLiveCredentialBoundary).toHaveBeenCalledWith(expect.objectContaining({
       credentialBoundary: expect.objectContaining({ credentialRevision }),
     }));
-  });
-
-  it('stops waiting for a live direct-credential application after its bound, reports it, and still observes its outcome', async () => {
-    // Incident 2026-10-23: `/session-started` readiness awaited this reconciliation, whose live
-    // application (`handleExternalCredentialUpdate` -> `onAuthUpdated`) waited forever on a
-    // deadlocked session lock; every new runner then failed its readiness acknowledgement.
-    vi.useFakeTimers();
-    try {
-      let failLiveApplication!: (error: Error) => void;
-      const liveApplication = new Promise<void>((_resolve, reject) => { failLiveApplication = reject; });
-      const onDeferredLiveApplication = vi.fn();
-      let outcome: unknown = 'still waiting';
-      void reconcileConnectedServiceDirectCredentialRevisionForRuntimeTarget({
-        target: {
-          sessionId: 'new-runner',
-          activeBindings: [{
-            serviceId: 'claude-subscription',
-            profileId: 'direct',
-            groupId: null,
-            generation: null,
-            credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb',
-          }],
-          connectedServicesBindingsRaw: {},
-        },
-        resolveCredentialBoundary: revisionedCredentialBoundary,
-        applyLiveCredentialBoundary: async () => await liveApplication,
-        executionAuthority: 'passive_projection',
-        liveApplicationWaitMs: 5_000,
-        onDeferredLiveApplication,
-      }).then((value) => { outcome = value; }, (error: unknown) => { outcome = error; });
-
-      await vi.advanceTimersByTimeAsync(4_999);
-      expect(outcome).toBe('still waiting');
-      await vi.advanceTimersByTimeAsync(1);
-
-      expect(outcome).toEqual({ appliedBindingCount: 0 });
-      expect(onDeferredLiveApplication).toHaveBeenCalledWith({
-        phase: 'answered_before_completion',
-        serviceId: 'claude-subscription',
-        profileId: 'direct',
-        waitBudgetMs: 5_000,
-      });
-
-      const failure = new Error('session lock still held');
-      failLiveApplication(failure);
-      await vi.advanceTimersByTimeAsync(0);
-      expect(onDeferredLiveApplication).toHaveBeenLastCalledWith({
-        phase: 'failed_after_answer',
-        serviceId: 'claude-subscription',
-        profileId: 'direct',
-        error: failure,
-      });
-    } finally {
-      vi.useRealTimers();
-    }
   });
 
   it('applies authoritative absence when one late runtime target still holds the deleted direct credential', async () => {
@@ -305,8 +248,6 @@ describe('reconcileConnectedServiceAuthGroupGenerations', () => {
       resolveCredentialBoundary: () => ({ status: 'absent' }),
       applyLiveCredentialBoundary,
       executionAuthority: 'passive_projection',
-      liveApplicationWaitMs: 5_000,
-      onDeferredLiveApplication: () => {},
     });
 
     expect(result).toEqual({ appliedBindingCount: 1 });
@@ -338,8 +279,6 @@ describe('reconcileConnectedServiceAuthGroupGenerations', () => {
       }),
       applyLiveCredentialBoundary,
       executionAuthority: 'passive_projection',
-      liveApplicationWaitMs: 5_000,
-      onDeferredLiveApplication: () => {},
     });
 
     expect(result).toEqual({ appliedBindingCount: 0 });
