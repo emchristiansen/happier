@@ -94,7 +94,12 @@ export type SendSessionMessageResult =
       candidates?: string[];
       message?: string;
     }> & (
-      | Readonly<{ pendingCustody: 'confirmed'; sessionId: string; localId: string }>
+      /**
+       * `deduplicated: true` (as on success) means this attempt wrote no row:
+       * the relay already held this localId's row, and the failure concerns
+       * that one row.
+       */
+      | Readonly<{ pendingCustody: 'confirmed'; sessionId: string; localId: string; deduplicated?: true }>
       | Readonly<{ pendingCustody?: never; sessionId?: never; localId?: never }>
     );
 
@@ -670,6 +675,7 @@ export async function sendSessionMessage(params: SendSessionMessageParams): Prom
         code: resumeResult.code,
         message: resumeResult.message,
         pendingCustody: 'confirmed',
+        ...(deduplicated ? { deduplicated: true as const } : {}),
         sessionId,
         localId,
       };
@@ -716,6 +722,7 @@ export async function sendSessionMessage(params: SendSessionMessageParams): Prom
         ok: false,
         code: 'wait_failed',
         pendingCustody: 'confirmed',
+        ...(deduplicated ? { deduplicated: true as const } : {}),
         sessionId,
         localId,
         message: formatBlockedPromptDeliveryFailure(promptDelivery.reason),
@@ -726,6 +733,7 @@ export async function sendSessionMessage(params: SendSessionMessageParams): Prom
         ok: false,
         code: 'wait_failed',
         pendingCustody: 'confirmed',
+        ...(deduplicated ? { deduplicated: true as const } : {}),
         sessionId,
         localId,
       };
@@ -735,6 +743,7 @@ export async function sendSessionMessage(params: SendSessionMessageParams): Prom
         ok: false,
         code: 'timeout',
         pendingCustody: 'confirmed',
+        ...(deduplicated ? { deduplicated: true as const } : {}),
         sessionId,
         localId,
       };
@@ -821,6 +830,7 @@ export async function sendSessionMessage(params: SendSessionMessageParams): Prom
         ok: false,
         code: 'wait_failed',
         pendingCustody: 'confirmed',
+        ...(deduplicated ? { deduplicated: true as const } : {}),
         sessionId,
         localId,
         message: projectedFailure,
@@ -840,6 +850,7 @@ export async function sendSessionMessage(params: SendSessionMessageParams): Prom
         ok: false,
         code: 'wait_failed',
         pendingCustody: 'confirmed',
+        ...(deduplicated ? { deduplicated: true as const } : {}),
         sessionId,
         localId,
         message: initialAssistantTurnOutcome.message,
@@ -863,6 +874,7 @@ export async function sendSessionMessage(params: SendSessionMessageParams): Prom
         ok: false,
         code: 'wait_failed',
         pendingCustody: 'confirmed',
+        ...(deduplicated ? { deduplicated: true as const } : {}),
         sessionId,
         localId,
         message: assistantTurnOutcome.message,
@@ -873,6 +885,7 @@ export async function sendSessionMessage(params: SendSessionMessageParams): Prom
         ok: false,
         code: 'timeout',
         pendingCustody: 'confirmed',
+        ...(deduplicated ? { deduplicated: true as const } : {}),
         sessionId,
         localId,
       };
@@ -891,6 +904,7 @@ export async function sendSessionMessage(params: SendSessionMessageParams): Prom
         ok: false,
         code: 'timeout',
         pendingCustody: 'confirmed',
+        ...(deduplicated ? { deduplicated: true as const } : {}),
         sessionId,
         localId,
       };
@@ -899,6 +913,7 @@ export async function sendSessionMessage(params: SendSessionMessageParams): Prom
       ok: false,
       code: 'wait_failed',
       pendingCustody: 'confirmed',
+      ...(deduplicated ? { deduplicated: true as const } : {}),
       sessionId,
       localId,
       message: errorMessage || 'Wait for idle failed',

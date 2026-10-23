@@ -30,13 +30,14 @@ function parseLocalIdOrThrow(raw: string): string {
   return localId;
 }
 
-function readPendingCustodyDetails(value: unknown): Readonly<{ pendingCustody: string; localId: string; message: string | null }> | null {
+function readPendingCustodyDetails(value: unknown): Readonly<{ pendingCustody: string; localId: string; deduplicated: boolean; message: string | null }> | null {
   if (!value || typeof value !== 'object') return null;
   const record = value as Record<string, unknown>;
   return typeof record.pendingCustody === 'string' && typeof record.localId === 'string'
     ? {
         pendingCustody: record.pendingCustody,
         localId: record.localId,
+        deduplicated: record.deduplicated === true,
         message: typeof record.message === 'string' && record.message.trim() ? record.message : null,
       }
     : null;
@@ -119,7 +120,11 @@ export async function cmdSessionSend(
     }
     const custody = readPendingCustodyDetails(actionRes.details);
     if (custody) {
-      console.error(chalk.yellow('localId:'), custody.localId, `(pending custody: ${custody.pendingCustody})`);
+      console.error(
+        chalk.yellow('localId:'),
+        custody.localId,
+        `(pending custody: ${custody.pendingCustody}${custody.deduplicated ? '; already present, deduplicated by localId' : ''})`,
+      );
       if (custody.message) console.error(custody.message);
     }
     throw new Error(actionRes.errorCode);

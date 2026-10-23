@@ -1619,7 +1619,8 @@ export function createCliActionDeps(params: Readonly<{
     },
     ...(approvalsStore ?? {}),
     ...inventoryDeps,
-    sessionSendMessage: async ({ sessionId, message, requestedAction, wait, timeoutSeconds, permissionModeOverride, modelOverride, localId, providerToolCallId }) => {
+    resolveInvocationSenderSessionId: () => params.sessionId,
+    sessionSendMessage: async ({ sessionId, message, requestedAction, wait, timeoutSeconds, permissionModeOverride, modelOverride, localId, providerToolCallId, senderSessionId }) => {
       if (!params.credentials) {
         return { ok: false, errorCode: 'not_authenticated', error: 'not_authenticated' };
       }
@@ -1659,7 +1660,9 @@ export function createCliActionDeps(params: Readonly<{
           : {
               kind: 'derived',
               identity: {
-                senderSessionId: params.sessionId,
+                // The original requester's session for an approved execution
+                // (recorded on its approval request), else this binding's.
+                senderSessionId: normalizeString(senderSessionId) ?? params.sessionId,
                 providerToolCallId: normalizeString(providerToolCallId),
               },
             },
@@ -1678,6 +1681,7 @@ export function createCliActionDeps(params: Readonly<{
               pendingCustody: res.pendingCustody,
               sessionId: res.sessionId,
               localId: res.localId,
+              ...(res.pendingCustody === 'confirmed' && res.deduplicated === true ? { deduplicated: true } : {}),
               ...(res.pendingCustody !== 'confirmed' && res.message ? { message: res.message } : {}),
             },
           } : {}),

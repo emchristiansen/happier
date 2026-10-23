@@ -108,6 +108,8 @@ const args = JSON.parse(process.argv[argsIndex + 1]);
 if (args.input.value === 'send-timeout') {
   const message = 'Pending enqueue acknowledgement was not confirmed. The message may still have been committed under localId local-7; resending it with the same localId cannot create a second copy.';
   process.stdout.write(JSON.stringify({ ok: false, error: { code: 'timeout', message: 'timeout', details: { pendingCustody: 'unconfirmed', sessionId: 'sess-target', localId: 'local-7', message } } }) + '\\n');
+} else if (args.input.value === 'send-resume-failed-deduplicated') {
+  process.stdout.write(JSON.stringify({ ok: false, error: { code: 'resume_failed', message: 'resume_failed', details: { pendingCustody: 'confirmed', sessionId: 'sess-target', localId: 'local-8', deduplicated: true } } }) + '\\n');
 } else if (args.input.value === 'fail') {
   process.stdout.write(JSON.stringify({ ok: false, error: { code: 'action_failed', message: 'expected failure' } }) + '\\n');
 } else if (args.input.value === 'large') {
@@ -194,6 +196,15 @@ if (args.input.value === 'send-timeout') {
       );
       await expect(sendTimeout).rejects.toThrow('code=timeout — timeout — pendingCustody=unconfirmed localId=local-7 sessionId=sess-target');
       await expect(sendTimeout).rejects.toThrow('may still have been committed under localId local-7');
+      await expect(sendTimeout).rejects.not.toThrow('deduplicated');
+
+      await expect(harness.tools[0]!.execute(
+        'call-send-resume-failed',
+        { value: 'send-resume-failed-deduplicated' },
+        new AbortController().signal,
+        undefined,
+        { cwd: dir },
+      )).rejects.toThrow('code=resume_failed — resume_failed — pendingCustody=confirmed localId=local-8 sessionId=sess-target deduplicated=true');
 
       const largeResult = await harness.tools[0]!.execute(
         'call-3',

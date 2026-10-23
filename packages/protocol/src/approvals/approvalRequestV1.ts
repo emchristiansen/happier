@@ -58,6 +58,8 @@ export type ApprovalExecutionV1 = z.infer<typeof ApprovalExecutionV1Schema>;
 export const ApprovalRequestInvocationIdentityV1Schema = z.object({
   messageLocalId: z.string().min(1).optional(),
   providerToolCallId: z.string().min(1).optional(),
+  /** The session (or `cli-global`) on whose behalf the requester's executor ran. */
+  senderSessionId: z.string().min(1).optional(),
 }).strict();
 export type ApprovalRequestInvocationIdentityV1 = z.infer<typeof ApprovalRequestInvocationIdentityV1Schema>;
 

@@ -891,6 +891,35 @@ describe('createCliActionDeps session controls', () => {
     }
   });
 
+  it('carries a confirmed failure\'s deduplicated flag in the action error details', async () => {
+    mocks.sendSessionMessage.mockResolvedValueOnce({
+      ok: false, code: 'resume_failed', message: 'Resume rejected',
+      pendingCustody: 'confirmed', sessionId: 'sess_2', localId: 'held-local-id', deduplicated: true,
+    });
+    const deps = createCliActionDeps({ token: 'token', credentials: createCredentials(), sessionId: 'sess_1',
+      ctx: { encryptionKey: new Uint8Array(32).fill(1), encryptionVariant: 'legacy' }, mode: 'plain', rawSession: { metadata: {} } });
+    await expect(deps.sessionSendMessage({ sessionId: 'sess_2', message: 'hello', requestedAction: { v: 1, kind: 'steer_if_active' } })).resolves.toEqual({
+      ok: false, errorCode: 'resume_failed', error: 'resume_failed', message: 'Resume rejected',
+      details: { pendingCustody: 'confirmed', sessionId: 'sess_2', localId: 'held-local-id', deduplicated: true },
+    });
+  });
+
+  it('derives the localId with the given requester session as sender, else its own binding', async () => {
+    mocks.sendSessionMessage.mockResolvedValue({ ok: true, sessionId: 'sess_2', localId: 'derived', waited: false });
+    const deps = createCliActionDeps({ token: 'token', credentials: createCredentials(), sessionId: 'sess_1',
+      ctx: { encryptionKey: new Uint8Array(32).fill(1), encryptionVariant: 'legacy' }, mode: 'plain', rawSession: { metadata: {} } });
+    expect(deps.resolveInvocationSenderSessionId?.()).toBe('sess_1');
+    const requestedAction = { v: 1 as const, kind: 'steer_if_active' as const };
+    await deps.sessionSendMessage({ sessionId: 'sess_2', message: 'hello', requestedAction, senderSessionId: 'sess_requester', providerToolCallId: 'call-1' });
+    await deps.sessionSendMessage({ sessionId: 'sess_2', message: 'hello', requestedAction });
+    const identities = (mocks.sendSessionMessage.mock.calls as unknown[][]).slice(-2)
+      .map(([args]) => (args as { idempotency: unknown }).idempotency);
+    expect(identities).toEqual([
+      { kind: 'derived', identity: { senderSessionId: 'sess_requester', providerToolCallId: 'call-1' } },
+      { kind: 'derived', identity: { senderSessionId: 'sess_1', providerToolCallId: null } },
+    ]);
+  });
+
   it('preserves exact nonblank opaque model override bytes through the CLI service adapter', async () => {
     const deps = createCliActionDeps({
       token: 'token',

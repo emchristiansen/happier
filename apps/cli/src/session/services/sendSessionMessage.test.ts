@@ -381,7 +381,11 @@ describe('sendSessionMessage', () => {
         expect(fetchEncryptedTranscriptPageAfterSeq).toHaveBeenCalled();
     });
 
-    it('returns wait_failed when the current prompt delivery is blocked before transcript materialization', async () => {
+    it.each([
+        ['an enqueue without a didWrite flag', undefined, {}],
+        ['a written enqueue', { didWrite: true }, {}],
+        ['a deduplicated enqueue', { didWrite: false }, { deduplicated: true }],
+    ] as const)('returns wait_failed when the current prompt delivery is blocked before transcript materialization, after %s', async (_label, enqueueResult, dedupe) => {
         const fetchEncryptedTranscriptPageAfterSeq = vi.fn(async () => []);
         const fetchEncryptedTranscriptPageLatest = vi.fn(async () => []);
         const waitForTranscriptEncryptedMessageByLocalId = vi.fn(async (_params: Readonly<{ maxWaitMs: number }>) => null);
@@ -410,7 +414,7 @@ describe('sendSessionMessage', () => {
             waitForTranscriptEncryptedMessageByLocalId,
         }));
         vi.doMock('@/api/session/pendingQueueV2Transport', () => ({
-            enqueuePendingQueueV2MessageViaHttp: vi.fn(async () => undefined),
+            enqueuePendingQueueV2MessageViaHttp: vi.fn(async () => enqueueResult),
             materializeNextPendingQueueV2MessageViaHttp: vi.fn(async () => ({
                 didMaterialize: false,
                 localId: null,
@@ -466,6 +470,7 @@ describe('sendSessionMessage', () => {
             pendingCustody: 'confirmed',
             sessionId: 'sess-1',
             localId: 'local-user',
+            ...dedupe,
             message: expect.stringContaining('runtime_disposed_before_delivery'),
         });
 
@@ -1328,6 +1333,46 @@ describe('sendSessionMessage', () => {
                 expect.objectContaining({ localId: 'exact-local-id' }), expect.anything());
         },
     );
+
+    it.each([
+        ['written', { didWrite: true }, {}],
+        ['without a didWrite flag', {}, {}],
+        ['deduplicated', { didWrite: false }, { deduplicated: true }],
+    ] as const)('marks a resume failure deduplicated only when the enqueue was: %s', async (_label, enqueueData, dedupe) => {
+        vi.doUnmock('@/api/session/pendingQueueV2Transport');
+        vi.doUnmock('./requestInactiveSessionResume');
+        const post = vi.fn(async () => ({ data: enqueueData }));
+        const callMachineRpc = vi.fn(async () => ({ type: 'error', errorMessage: 'Resume rejected' }));
+        vi.doMock('axios', () => ({ default: { post } }));
+        vi.doMock('@/session/transport/rpc/machineRpc', () => ({ callMachineRpc }));
+        vi.doMock('./resolveSessionTransportContext', () => ({
+            resolveSessionTransportContext: vi.fn(async () => ({
+                ok: true,
+                sessionId: 'sess-1',
+                mode: 'plain',
+                ctx: { encryptionKey: new Uint8Array(32).fill(1), encryptionVariant: 'dataKey' },
+                rawSession: {
+                    id: 'sess-1', active: false, encryptionMode: 'plain', path: '/repo', machineId: 'machine-session',
+                    metadata: JSON.stringify({ flavor: 'claude', claudeSessionId: 'native-thread', path: '/repo', machineId: 'machine-session' }),
+                },
+            })),
+        }));
+        const { sendSessionMessage } = await import('./sendSessionMessage');
+        const machineKey = new Uint8Array(32).fill(1);
+        const result = await sendSessionMessage({
+            credentials: { token: 'token', encryption: { type: 'dataKey', publicKey: machineKey, machineKey } },
+            idOrPrefix: 'sess-1', message: 'continue', localId: 'exact-local-id', wait: false, timeoutMs: 1,
+        });
+        expect(result).toEqual({
+            ok: false,
+            code: 'resume_failed',
+            message: expect.any(String),
+            pendingCustody: 'confirmed',
+            sessionId: 'sess-1',
+            localId: 'exact-local-id',
+            ...dedupe,
+        });
+    });
 
     it('retains pending custody without transcript fallback when the canonical wake is unavailable', async () => {
         const sendSessionMessageViaSocketCommitted = vi.fn(async () => undefined);

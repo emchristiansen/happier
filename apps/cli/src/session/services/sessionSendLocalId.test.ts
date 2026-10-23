@@ -1,4 +1,6 @@
 import { createHmac } from 'node:crypto';
+import { readdir, unlink, utimes, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createEnvKeyScope } from '@/testkit/env/envScope';
@@ -11,6 +13,7 @@ import {
   type SessionSendRequestInputs,
 } from './sessionSendLocalId';
 import {
+  SESSION_SEND_ADMISSION_MAX_ENTRIES,
   SESSION_SEND_ADMISSION_RETENTION_MS,
   fingerprintSessionSendRequest,
   preserveSessionSendAdmission as preserveWithFingerprint,
@@ -151,5 +154,91 @@ describe('preserveSessionSendAdmission', () => {
     await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('new', 'local-2'), nowMs: () => nowMs });
     expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('resealed'), nowMs: () => nowMs }))
       .toEqual(body('resealed'));
+  });
+
+  async function storeDirectory(): Promise<string> {
+    const { configuration } = await import('@/configuration');
+    return join(configuration.activeServerDir, 'session-send-admissions');
+  }
+
+  async function listEntries(): Promise<string[]> {
+    return (await readdir(await storeDirectory())).filter((name) => !name.startsWith('.')).sort();
+  }
+
+  it('removes a body just over the retention on write and keeps one exactly at it', async () => {
+    const t0 = 1_000_000;
+    await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('over', 'local-over'), nowMs: () => t0 });
+    await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('inside', 'local-inside'), nowMs: () => t0 + 1 });
+    const writeAtMs = t0 + 1 + SESSION_SEND_ADMISSION_RETENTION_MS;
+    await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('trigger', 'local-trigger'), nowMs: () => writeAtMs });
+
+    expect(await listEntries()).toHaveLength(2);
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('resealed', 'local-inside'), nowMs: () => writeAtMs }))
+      .toEqual(body('inside', 'local-inside'));
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('resealed', 'local-over'), nowMs: () => writeAtMs }))
+      .toEqual(body('resealed', 'local-over'));
+  });
+
+  it('evicts the oldest bodies by storedAtMs to stay within the cap', async () => {
+    let nowMs = 1_000_000;
+    for (let index = 0; index < SESSION_SEND_ADMISSION_MAX_ENTRIES; index += 1) {
+      nowMs += 1;
+      await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body(`body-${index}`, `local-${index}`), nowMs: () => nowMs });
+    }
+    expect(await listEntries()).toHaveLength(SESSION_SEND_ADMISSION_MAX_ENTRIES);
+
+    nowMs += 1;
+    await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('newest', 'local-newest'), nowMs: () => nowMs });
+    expect(await listEntries()).toHaveLength(SESSION_SEND_ADMISSION_MAX_ENTRIES);
+    // The second oldest survives; the oldest was evicted, so its resend is issued as itself.
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('resealed', 'local-1'), nowMs: () => nowMs }))
+      .toEqual(body('body-1', 'local-1'));
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('resealed', 'local-0'), nowMs: () => nowMs }))
+      .toEqual(body('resealed', 'local-0'));
+  }, 120_000);
+
+  it('removes temporary and quarantine files older than the retention and keeps fresh ones', async () => {
+    await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('first') });
+    const directory = await storeDirectory();
+    const staleSeconds = (Date.now() - SESSION_SEND_ADMISSION_RETENTION_MS - 60_000) / 1000;
+    for (const name of ['.tmp-dead-1.json', '.quarantine-dead-1']) {
+      await writeFile(join(directory, name), '{}');
+      await utimes(join(directory, name), staleSeconds, staleSeconds);
+    }
+    await writeFile(join(directory, '.tmp-live-1.json'), '{}');
+
+    await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('second', 'local-2') });
+    const names = await readdir(directory);
+    expect(names).not.toContain('.tmp-dead-1.json');
+    expect(names).not.toContain('.quarantine-dead-1');
+    expect(names).toContain('.tmp-live-1.json');
+  });
+
+  it('never removes a body republished after a remover judged the old one stale', async () => {
+    const t0 = 1_000_000;
+    const t1 = t0 + SESSION_SEND_ADMISSION_RETENTION_MS + 1;
+    await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('stale'), nowMs: () => t0 });
+    const [staleEntry] = await listEntries();
+    let interleaved = false;
+
+    await preserveSessionSendAdmission({
+      sessionId: 'sess-a',
+      candidate: body('unrelated', 'local-2'),
+      nowMs: () => t1,
+      beforeRemove: async (entryName) => {
+        if (interleaved || entryName !== staleEntry) return;
+        interleaved = true;
+        // Between this remover's judgment and its move, another writer removes
+        // the stale body and publishes a fresh one at the same pathname.
+        await unlink(join(await storeDirectory(), entryName));
+        expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('fresh'), nowMs: () => t1 }))
+          .toEqual(body('fresh'));
+      },
+    });
+
+    expect(interleaved).toBe(true);
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('resealed'), nowMs: () => t1 }))
+      .toEqual(body('fresh'));
+    expect((await readdir(await storeDirectory())).filter((name) => name.startsWith('.'))).toEqual([]);
   });
 });

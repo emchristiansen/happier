@@ -5,6 +5,9 @@ import { createEnvKeyScope } from '@/testkit/env/envScope';
 
 import { createCliActionExecutorHarness } from './createCliActionExecutorHarness';
 
+const sendSessionMessageService = vi.hoisted(() => vi.fn());
+vi.mock('@/session/services/sendSessionMessage', () => ({ sendSessionMessage: sendSessionMessageService }));
+
 function createApprovalRequest(overrides: Partial<ApprovalRequestV1> = {}): ApprovalRequestV1 {
   return {
     v: 1,
@@ -439,7 +442,7 @@ describe('createCliActionExecutorHarness', () => {
       );
       expect(created).toMatchObject({ ok: true, result: { kind: 'approval_request_created', artifactId: 'approval_send_1' } });
       expect(sessionSendMessage).not.toHaveBeenCalled();
-      expect(requests.get('approval_send_1')?.invocationIdentity).toEqual({ messageLocalId: 'caller-key-1' });
+      expect(requests.get('approval_send_1')?.invocationIdentity).toEqual({ messageLocalId: 'caller-key-1', senderSessionId: 'sess_1' });
 
       await decider.executor.execute(
         'approval.request.decide' as any,
@@ -509,6 +512,71 @@ describe('createCliActionExecutorHarness', () => {
       const sendArgs = (sessionSendMessage.mock.calls as unknown[][])[0]?.[0] as Record<string, unknown>;
       expect(sendArgs.localId).toBe('caller-key-3');
       expect(sendArgs.providerToolCallId).toBe('requester-call');
+    });
+
+    it("derives every attempt's localId with the requester's session as sender, not the approver's or a recovering CLI's", async () => {
+      sendSessionMessageService.mockReset();
+      sendSessionMessageService.mockResolvedValue({ ok: true, sessionId: 'sess_target', localId: 'derived', waited: false });
+      const requests = new Map<string, ApprovalRequestV1>();
+      let failExecutionRecordWrites = false;
+      const sharedDeps: Partial<ActionExecutorDeps> = {
+        approvalsCreate: vi.fn(async ({ request }) => {
+          requests.set('approval_sender_1', request);
+          return { artifactId: 'approval_sender_1' };
+        }),
+        approvalsGet: vi.fn(async ({ artifactId }) => requests.get(artifactId) ?? null),
+        approvalsUpdate: vi.fn(async ({ artifactId, request }) => {
+          // The approver's execution record write fails, leaving the request 'approved'.
+          if (failExecutionRecordWrites && request.execution) {
+            return { ok: false as const, errorCode: 'approval_update_failed', error: 'approval_update_failed' };
+          }
+          requests.set(artifactId, request);
+          return { ok: true as const };
+        }),
+        isActionEnabled: () => true,
+        isActionApprovalRequired: (id, ctx) => id === 'session.message.send' && ctx.surface === 'cli',
+      };
+      const boundTo = (sessionId: string) => createCliActionExecutorHarness({
+        token: 'token',
+        credentials: { token: 'token' } as any,
+        sessionId,
+        ctx: { encryptionKey: new Uint8Array(32).fill(1), encryptionVariant: 'legacy' as const },
+      }, sharedDeps);
+      const requester = boundTo('sess_A');
+      const approver = boundTo('sess_B');
+      const recoverer = boundTo('sess_C');
+
+      await requester.executor.execute(
+        'session.message.send',
+        { sessionId: 'sess_target', message: 'hello' },
+        { surface: 'cli', defaultSessionId: null, providerToolCallId: 'call-p' },
+      );
+      expect(requests.get('approval_sender_1')?.invocationIdentity).toEqual({ providerToolCallId: 'call-p', senderSessionId: 'sess_A' });
+
+      failExecutionRecordWrites = true;
+      await approver.executor.execute(
+        'approval.request.decide' as any,
+        { artifactId: 'approval_sender_1', decision: 'approve' },
+        { surface: 'cli', defaultSessionId: null },
+      );
+      expect(requests.get('approval_sender_1')).toMatchObject({ status: 'approved' });
+      expect(requests.get('approval_sender_1')?.execution).toBeUndefined();
+
+      failExecutionRecordWrites = false;
+      await recoverer.executor.execute(
+        'approval.request.decide' as any,
+        { artifactId: 'approval_sender_1', decision: 'approve' },
+        { surface: 'cli', defaultSessionId: null },
+      );
+      expect(requests.get('approval_sender_1')).toMatchObject({ status: 'executed' });
+
+      expect(sendSessionMessageService).toHaveBeenCalledTimes(2);
+      for (const [args] of sendSessionMessageService.mock.calls as unknown[][]) {
+        expect((args as Record<string, unknown>).idempotency).toEqual({
+          kind: 'derived',
+          identity: { senderSessionId: 'sess_A', providerToolCallId: 'call-p' },
+        });
+      }
     });
   });
 });

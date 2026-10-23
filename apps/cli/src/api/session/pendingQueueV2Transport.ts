@@ -974,9 +974,12 @@ export async function discardPendingQueueV2Messages(params: {
  * (`DEFAULT_SQLITE_TRANSACTION_TOTAL_RETRY_BUDGET_MS`,
  * apps/server/sources/storage/inTx.ts); that budget is not a wall-clock bound
  * on the whole request. 30 s is three times the old wait and twice the longest
- * completion observed, so far fewer enqueues are abandoned while the relay is
- * still working on them. It does not guarantee the relay has finished, which is
- * why a timeout is reported as unconfirmed custody with its localId.
+ * completion observed. It is meant to let an enqueue the relay is still working
+ * on complete before the client gives up, at the cost of up to 20 s more wait
+ * before a caller hears of a timeout. The figures sample completed requests
+ * only, so how many of the uncompleted arrivals 30 s would have let finish is
+ * unknown. It does not guarantee the relay has finished, which is why a timeout
+ * is reported as unconfirmed custody with its localId.
  */
 export const PENDING_ENQUEUE_HTTP_TIMEOUT_MS = 30_000;
 

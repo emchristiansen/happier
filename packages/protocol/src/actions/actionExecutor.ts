@@ -191,6 +191,13 @@ export type ActionExecutorContext = Readonly<{
    */
   messageLocalId?: string | null;
 
+  /**
+   * The session on whose behalf this invocation runs, when that differs from
+   * the executing dependencies' own binding: set only from a recorded approval
+   * request (the original requester's), never from tool input.
+   */
+  senderSessionId?: string | null;
+
   /** Resolve the existing action attempt without repeating its outward write. */
   resumeActionRequest?: boolean;
 
@@ -213,6 +220,13 @@ type SessionStopActionDependencyResult = Readonly<{
 }>;
 
 export type ActionExecutorDeps = Readonly<{
+  /**
+   * The session these dependencies act for (`cli-global` outside a session),
+   * recorded on an approval request as its requester so that an approved
+   * execution elsewhere sends on the requester's behalf.
+   */
+  resolveInvocationSenderSessionId?: () => string | null;
+
   // Execution runs (session-scoped RPC)
   executionRunStart: (sessionId: string, request: any, opts?: Readonly<{ serverId?: string | null }>) => Promise<unknown>;
   executionRunList: (sessionId: string, request: any, opts?: Readonly<{ serverId?: string | null }>) => Promise<unknown>;
@@ -297,6 +311,8 @@ export type ActionExecutorDeps = Readonly<{
     localId?: string;
     /** See `ActionExecutorContext.providerToolCallId`. */
     providerToolCallId?: string;
+    /** See `ActionExecutorContext.senderSessionId`; absent means the dependencies' own binding. */
+    senderSessionId?: string;
   }>) => Promise<unknown>;
   sessionTitleSet?: (args: Readonly<{ sessionId: string; title: string; serverId?: string | null }>) => Promise<unknown>;
   sessionStop?: (args: Readonly<{ sessionId: string; serverId?: string | null }>) => Promise<SessionStopActionDependencyResult>;
@@ -1234,23 +1250,30 @@ function buildActionExecuteResultFromRecordedApprovalExecution(request: Approval
 function readApprovalRequestInvocationIdentity(request: ApprovalRequestV1): Readonly<{
   providerToolCallId: string | null;
   messageLocalId: string | null;
+  senderSessionId: string | null;
 }> {
   const identity = request.invocationIdentity;
   return {
     providerToolCallId: identity?.providerToolCallId ?? null,
     messageLocalId: identity?.messageLocalId ?? null,
+    senderSessionId: identity?.senderSessionId ?? null,
   };
 }
 
-function buildApprovalRequestInvocationIdentity(ctx: ActionExecutorContext): ApprovalRequestV1['invocationIdentity'] | null {
+function buildApprovalRequestInvocationIdentity(
+  ctx: ActionExecutorContext,
+  dependencySenderSessionId: string,
+): ApprovalRequestV1['invocationIdentity'] | null {
   const providerToolCallId = normalizeId(ctx.providerToolCallId);
   const messageLocalId = typeof ctx.messageLocalId === 'string' && ctx.messageLocalId.trim().length > 0
     ? ctx.messageLocalId
     : '';
-  if (!providerToolCallId && !messageLocalId) return null;
+  const senderSessionId = normalizeId(ctx.senderSessionId) || dependencySenderSessionId;
+  if (!providerToolCallId && !messageLocalId && !senderSessionId) return null;
   return {
     ...(messageLocalId ? { messageLocalId } : {}),
     ...(providerToolCallId ? { providerToolCallId } : {}),
+    ...(senderSessionId ? { senderSessionId } : {}),
   };
 }
 
@@ -1514,6 +1537,10 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
         // execute outside that custodian. Direct execute() retains the Action's
         // declared deferred behavior.
         const approvalFlow = options?.prepareOnly ? 'blocking' : approvalRouting.flow;
+        const invocationIdentity = buildApprovalRequestInvocationIdentity(
+          ctx,
+          normalizeId(deps.resolveInvocationSenderSessionId?.()),
+        );
         const request: ApprovalRequestV1 = {
           v: 1,
           status: 'open',
@@ -1528,9 +1555,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
             result: approvalRouting.result,
           },
           ...(approvalOrigin ? { origin: approvalOrigin } : {}),
-          ...(buildApprovalRequestInvocationIdentity(ctx)
-            ? { invocationIdentity: buildApprovalRequestInvocationIdentity(ctx)! }
-            : {}),
+          ...(invocationIdentity ? { invocationIdentity } : {}),
           summary: buildApprovalSummary(spec, targetSessionId),
           preview: { actionId, actionArgs: parsed.data },
           ...(normalizeId(ctx.serverId) ? { serverId: normalizeId(ctx.serverId) } : {}),
@@ -2331,6 +2356,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
               ? { localId: ctx.messageLocalId }
               : {}),
             ...(normalizeId(ctx.providerToolCallId) ? { providerToolCallId: normalizeId(ctx.providerToolCallId) } : {}),
+            ...(normalizeId(ctx.senderSessionId) ? { senderSessionId: normalizeId(ctx.senderSessionId) } : {}),
           });
           const failure = readActionExecuteFailure(res);
           if (failure) {

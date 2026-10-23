@@ -117,7 +117,8 @@ function envelopeToToolResult(envelope) {
   if (typeof details.pendingCustody === "string" && details.pendingCustody) {
     parts.push("pendingCustody=" + details.pendingCustody
       + (typeof details.localId === "string" && details.localId ? " localId=" + details.localId : "")
-      + (typeof details.sessionId === "string" && details.sessionId ? " sessionId=" + details.sessionId : ""));
+      + (typeof details.sessionId === "string" && details.sessionId ? " sessionId=" + details.sessionId : "")
+      + (details.deduplicated === true ? " deduplicated=true" : ""));
   }
   if (typeof details.message === "string" && details.message && details.message !== error.message) parts.push(details.message);
   const projected = truncateToolOutput(parts.join(" — "));
