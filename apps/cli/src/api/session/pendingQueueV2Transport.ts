@@ -469,6 +469,7 @@ type PendingQueueV2ProjectionEntry = Readonly<{
     deliveryStatus: PendingDeliveryStatusV1;
     messageRole: SessionMessageRole | null;
     requestedAction: PendingRequestedActionV1 | null;
+    requestedActionMalformed: boolean;
 }>;
 
 function parsePendingQueueV2Projection(value: unknown): PendingQueueV2ProjectionEntry[] {
@@ -503,6 +504,7 @@ function parsePendingQueueV2Projection(value: unknown): PendingQueueV2Projection
             deliveryStatus,
             messageRole: messageRole.success ? messageRole.data : null,
             requestedAction: requestedAction.success ? requestedAction.data : null,
+            requestedActionMalformed: pendingRecord.requestedActionMalformed === true,
         });
     }
     return entries;
@@ -829,18 +831,19 @@ export async function listPendingQueueV2LocalIdsFromServer(params: {
 }
 
 /**
- * Local ids of rows a runner can still materialize: canonical `queued` status only. Delivering,
- * external-handoff and blocked rows (including a malformed requested action) are held elsewhere or
- * need explicit settlement, so they are not work a mode switch or discard gate should act on.
+ * Local ids of the rows a mode switch or a switch-to-local discard acts on: every pending row except
+ * one the app handed to an external terminal (`external_handoff`, whose custody is outside this
+ * runner) and one whose requested action the server could not parse (`requestedActionMalformed`,
+ * reported as blocked `unsupported_action`). Queued, delivering and blocked rows all count.
  * `listPendingQueueV2LocalIdsFromServer` remains the complete inventory.
  */
-export async function listPendingQueueV2MaterializableLocalIdsFromServer(params: {
+export async function listPendingQueueV2ActionableLocalIdsFromServer(params: {
     token: string;
     sessionId: string;
 }): Promise<string[]> {
     const pending = await fetchPendingQueueV2Projection(params);
     return pending
-        .filter((entry) => entry.deliveryStatus.status === 'queued')
+        .filter((entry) => entry.deliveryStatus.status !== 'external_handoff' && !entry.requestedActionMalformed)
         .map((entry) => entry.localId);
 }
 

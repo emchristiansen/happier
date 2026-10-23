@@ -204,7 +204,7 @@ import {
     enqueuePendingQueueV2MessageViaHttp,
     listPendingQueueV2DeliveryStatusesFromServer,
     listPendingQueueV2LocalIdsFromServer,
-    listPendingQueueV2MaterializableLocalIdsFromServer,
+    listPendingQueueV2ActionableLocalIdsFromServer,
     listPendingQueueV2ProviderDeliveryLocalIdsFromServer,
     materializeNextPendingQueueV2Message,
     blockPendingQueueV2Delivery,
@@ -6535,12 +6535,11 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     /**
-     * Server pending rows this runner can still materialize (canonical `queued` status). Counts that
-     * decide a mode switch or a discard gate use this, not the complete inventory: external-handoff,
-     * delivering and blocked rows are not work the runner can take.
+     * Server pending rows a mode switch or a switch-to-local discard acts on: every row except one
+     * handed to an external terminal or one whose requested action the server could not parse.
      */
-    async listMaterializablePendingMessageQueueV2LocalIds(): Promise<string[]> {
-        return this.runPendingQueueRead(() => listPendingQueueV2MaterializableLocalIdsFromServer({
+    async listActionablePendingMessageQueueV2LocalIds(): Promise<string[]> {
+        return this.runPendingQueueRead(() => listPendingQueueV2ActionableLocalIdsFromServer({
             token: this.token,
             sessionId: this.sessionId,
         }));
@@ -6560,10 +6559,10 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     /**
-     * Pending work a mode switch or discard gate should act on: server rows this runner can
-     * materialize plus inputs already materialized locally but not yet observed in the transcript.
+     * Pending work a mode switch or discard gate should act on: actionable server rows plus inputs
+     * already materialized locally but not yet observed in the transcript.
      */
-    async peekMaterializablePendingMessageQueueV2Count(opts?: PendingQueueReadOptions): Promise<number> {
+    async peekActionablePendingMessageQueueV2Count(opts?: PendingQueueReadOptions): Promise<number> {
         const policy = resolvePendingQueueReconcileWhenEmpty(opts, 'force');
         if (!this.pendingQueueState.known) {
             await this.reconcilePendingQueueState({ force: true });
@@ -6583,7 +6582,7 @@ export class ApiSessionClient extends EventEmitter {
             return this.pendingQueueMaterializedLocalIds.size;
         }
 
-        const localIds = await this.listMaterializablePendingMessageQueueV2LocalIds();
+        const localIds = await this.listActionablePendingMessageQueueV2LocalIds();
         // Include materialized-but-not-yet-observed messages as "pending-ish" work.
         // These are messages we already removed from the server pending queue but haven't
         // seen broadcast into the transcript yet; switching modes during this window can
@@ -6591,8 +6590,9 @@ export class ApiSessionClient extends EventEmitter {
         return localIds.length + this.pendingQueueMaterializedLocalIds.size;
     }
 
+    /** Discards exactly the rows the switch count includes; handed-off and malformed-action rows stay. */
     async discardPendingMessageQueueV2All(opts: { reason: 'switch_to_local' | 'manual' }): Promise<number> {
-        const localIds = await this.listPendingMessageQueueV2LocalIds();
+        const localIds = await this.listActionablePendingMessageQueueV2LocalIds();
         if (localIds.length === 0) return 0;
         const request = () => discardPendingQueueV2Messages({
             token: this.token,

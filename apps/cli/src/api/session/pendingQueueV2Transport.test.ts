@@ -9,7 +9,7 @@ import {
     readBlockedPendingQueueV2DeliveryByLocalIdFromServer,
     readPendingQueueV2ActivationEligibilityFromServer,
     listPendingQueueV2LocalIdsFromServer,
-    listPendingQueueV2MaterializableLocalIdsFromServer,
+    listPendingQueueV2ActionableLocalIdsFromServer,
     listPendingQueueV2DeliveryStatusesFromServer,
     listPendingQueueV2ProviderDeliveryLocalIdsFromServer,
     markPendingQueueV2DeliveryHandled,
@@ -1864,7 +1864,7 @@ describe('pendingQueueV2Transport', () => {
             })).resolves.toEqual(['queued-local', 'handoff-local']);
         });
 
-        it('lists only rows a runner can materialize for action counts', async () => {
+        it('leaves handed-off and malformed-action rows out of the actionable rows', async () => {
             mockGet.mockResolvedValueOnce({
                 data: {
                     pending: [
@@ -1882,14 +1882,22 @@ describe('pendingQueueV2Transport', () => {
                             deliveryStatus: { status: 'blocked', reason: 'runtime_disposed_before_delivery' },
                         }),
                         { localId: 'legacy-queued-local', status: 'queued', deliveryState: null },
+                        {
+                            ...serverPendingRow({
+                                localId: 'malformed-action-local',
+                                deliveryStatus: { status: 'blocked', reason: 'unsupported_action' },
+                            }),
+                            requestedAction: undefined,
+                            requestedActionMalformed: true,
+                        },
                     ],
                 },
             });
 
-            await expect(listPendingQueueV2MaterializableLocalIdsFromServer({
+            await expect(listPendingQueueV2ActionableLocalIdsFromServer({
                 token: 'token',
                 sessionId: 'session-1',
-            })).resolves.toEqual(['queued-local', 'legacy-queued-local']);
+            })).resolves.toEqual(['queued-local', 'delivering-local', 'blocked-local', 'legacy-queued-local']);
         });
 
         it('projects the external handoff status, including from persisted fields alone', async () => {
