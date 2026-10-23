@@ -45,7 +45,7 @@ export function createConnectedServiceSessionReadinessReconciliation(deps: Reado
    */
   reconcile: (registration: ConnectedServiceRuntimeTargetRegistration) => Promise<void>;
   isCurrent: (registration: ConnectedServiceRuntimeTargetRegistration) => boolean;
-  /** True once daemon shutdown has begun: no new reconciliation is started after that. */
+  /** True once daemon shutdown has begun: no new retry is admitted after that. */
   isShuttingDown: () => boolean;
   waitMs?: number;
   retryDelayMs?: Readonly<{ initialMs: number; maxMs: number }>;

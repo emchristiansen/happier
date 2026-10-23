@@ -495,7 +495,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     });
 
     // F46-001: once the server's read shows the spawn's record superseded, an expired server record
-    // fails the spawn; restoring the superseded record would hand the runner a revoked credential.
+    // fails the spawn; restoring the superseded record could hand the runner a revoked credential.
     it('fails the spawn rather than restore a superseded record when the server holds an expired rotation', async () => {
       const { spawn } = await spawnWithInFlightRotation({
         current: claudeRecord({ accessToken: 'superseded-access', updatedAt: now - hourMs, expiresAt: now + 7 * hourMs }),
