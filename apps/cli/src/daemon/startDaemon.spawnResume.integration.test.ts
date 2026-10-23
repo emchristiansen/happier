@@ -4006,8 +4006,14 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     });
 
     // A due limit-reset retry owns the session's auth lane while its runner Resume replaces a
-    // lost publisher. Scheduler, switch core, retry, Resume and the daemon Stop wrapper are real;
-    // only process signalling (Stop's runner core), process spawn and Pending admission are faked.
+    // lost publisher. The daemon's runtime-auth scheduler with its file-backed store, the switch
+    // core, the limit-reset retry, Resume and the daemon Stop wrapper are composed for real. The
+    // surrounding edges are this file's harness mocks: the control server, session metadata
+    // writes, process-state and process-identity readers, session RPC and transport, the
+    // child-exit base, Stop's runner-signalling core and process spawn. The fixture supplies the
+    // tracked runner and the lost-publisher capability response, and the sender below stands in
+    // for Pending: it runs the admission currentness guard and reports success, so it proves
+    // admission was reached, not Pending durability or provider execution.
     async function armDueLimitResetRetry() {
       const scheduler = harness.getRuntimeAuthRecoveryScheduler();
       if (!scheduler) throw new Error('Expected the daemon runtime-auth recovery scheduler');
