@@ -1,3 +1,4 @@
+import type { SessionUserMessageAdmissionBody } from '@/session/services/admitSessionUserMessage';
 import { createHash } from 'node:crypto';
 
 import {
@@ -19,6 +20,8 @@ export type ConnectedServiceContinuationInterruption =
 type ConnectedServiceContinuationMessageDispatcherDeps = Readonly<{
   credentials: Credentials;
   sendMessage?: typeof sendSessionMessage;
+  assertCanAdmit?: () => void;
+  preserveAdmission?: (body: SessionUserMessageAdmissionBody) => Promise<SessionUserMessageAdmissionBody>;
 }>;
 
 function createContinuationLocalId(sessionId: string, attemptId: string, interruptedOriginId: string): string {
@@ -50,6 +53,8 @@ export function createConnectedServiceContinuationMessageDispatcher(
     }>): Promise<Readonly<{ suppressed: boolean }>> {
       const sent = await sendMessage({
         credentials: deps.credentials,
+        ...(deps.preserveAdmission ? { preserveAdmission: deps.preserveAdmission } : {}),
+        ...(deps.assertCanAdmit ? { assertCanAdmit: deps.assertCanAdmit } : {}),
         idOrPrefix: input.sessionId,
         message: input.prompt,
         localId: input.localId,

@@ -193,6 +193,9 @@ class Configuration {
   // so server-side active=false can be published before callers continue with archive/delete flows.
   public readonly daemonStopSessionWaitForExitMs: number
   public readonly daemonStopSessionWaitForExitPollIntervalMs: number
+  // Lost Pending publisher: how long a runner's one supervisor reconnect may take to reclaim
+  // publisher status before the episode completes as terminal `publisher_lost`.
+  public readonly pendingPublisherRecoveryDeadlineMs: number
   // Managed runtime installable auto-update background check interval.
   public readonly installablesRuntimeAutoUpdateCheckIntervalMs: number
   // File system RPC limits (Files tab + transfers).
@@ -445,6 +448,12 @@ class Configuration {
     this.daemonStopSessionWaitForExitPollIntervalMs = resolveIntEnvWithBounds(
       'HAPPIER_DAEMON_STOP_SESSION_WAIT_FOR_EXIT_POLL_INTERVAL_MS',
       { min: 10, max: 2_000, default: 100 },
+    );
+    // Default: 2 minutes. A healthy reconnect reclaims publisher status in seconds; this tolerates a
+    // relay restart while bounding how long a runner that cannot recover reports itself as recovering.
+    this.pendingPublisherRecoveryDeadlineMs = resolveIntEnvWithBounds(
+      'HAPPIER_PENDING_PUBLISHER_RECOVERY_DEADLINE_MS',
+      { min: 1_000, max: 3_600_000, default: 120_000 },
     );
 
     // Default: 6 hours. Defensive minimum: 1 minute.

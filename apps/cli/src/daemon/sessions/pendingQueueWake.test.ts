@@ -56,6 +56,55 @@ describe('probeSessionPendingQueueWakeCapabilityV1', () => {
       isMethodUnavailable: () => false,
     })).resolves.toEqual({ state: 'recoverable_unservable', reason: 'runtime_terminating' });
   });
+
+  it('carries a runner-reported lost publisher with the incarnation that reported it', async () => {
+    const respondent = { machineId: 'machine-1', pid: 4242, processInstanceFingerprint: 'linux-proc:991' };
+    await expect(probeSessionPendingQueueWakeCapabilityV1({
+      sessionId: 'sess-wedged',
+      token: 'token',
+      resolveTransport: async () => ({ ok: true, sessionId: 'sess-wedged', mode: 'socket', ctx: {} }),
+      callRpc: async () => ({
+        ok: false,
+        error: 'pending_materialization_wake_unavailable',
+        errorCode: 'publisher_lost',
+        respondent,
+      }),
+      isMethodUnavailable: () => false,
+    })).resolves.toEqual({ state: 'recoverable_unservable', reason: 'publisher_lost', respondent });
+  });
+
+  it.each([
+    ['missing', {}],
+    ['partial', { respondent: { machineId: 'machine-1', pid: 4242 } }],
+    ['malformed', { respondent: { machineId: 'machine-1', pid: '4242', processInstanceFingerprint: 'linux-proc:991' } }],
+  ])('keeps a lost-publisher report with a %s respondent unbound', async (_label, extra) => {
+    await expect(probeSessionPendingQueueWakeCapabilityV1({
+      sessionId: 'sess-wedged',
+      token: 'token',
+      resolveTransport: async () => ({ ok: true, sessionId: 'sess-wedged', mode: 'socket', ctx: {} }),
+      callRpc: async () => ({
+        ok: false,
+        error: 'pending_materialization_wake_unavailable',
+        errorCode: 'publisher_lost',
+        ...extra,
+      }),
+      isMethodUnavailable: () => false,
+    })).resolves.toEqual({ state: 'recoverable_unservable', reason: 'publisher_lost_respondent_unbound' });
+  });
+
+  it('carries a runner still recovering its publisher as its own unservable reason', async () => {
+    await expect(probeSessionPendingQueueWakeCapabilityV1({
+      sessionId: 'sess-recovering',
+      token: 'token',
+      resolveTransport: async () => ({ ok: true, sessionId: 'sess-recovering', mode: 'socket', ctx: {} }),
+      callRpc: async () => ({
+        ok: false,
+        error: 'pending_materialization_wake_unavailable',
+        errorCode: 'publisher_recovering',
+      }),
+      isMethodUnavailable: () => false,
+    })).resolves.toEqual({ state: 'recoverable_unservable', reason: 'publisher_recovering' });
+  });
 });
 
 describe('requestSessionPendingQueueWakeV1', () => {

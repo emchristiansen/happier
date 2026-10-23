@@ -11,19 +11,12 @@
 
 import chalk from 'chalk'
 import { configuration } from '@/configuration'
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { existsSync, readdirSync, statSync } from 'node:fs'
+import { basename, join } from 'node:path'
 import { inspect } from 'node:util'
 import { redactBugReportSensitiveText } from '@happier-dev/protocol'
 import { writeConsoleErrorBestEffort, writeConsoleLogBestEffort } from '@/utils/writeConsoleBestEffort'
-import { pruneLogsByCount } from '@/utils/logs/pruneLogsByCount'
-import {
-  DAEMON_LOG_SUFFIX,
-  LOG_FILE_SUFFIX,
-  resolveCrashedSessionLogKeepCount,
-  resolveDaemonLogKeepCount,
-  resolveSessionLogKeepCount,
-} from '@/utils/logs/logRetention'
+import { DAEMON_LOG_SUFFIX, LOG_FILE_SUFFIX } from '@/utils/logs/logRetention'
 import { BufferedFileAppender } from './logFileAppender'
 import { isFileLogLevelEnabled, resolveFileLogLevel, type FileLogLevel } from './logFileLevel'
 // Note: readDaemonState is imported lazily inside listDaemonLogFiles() to avoid
@@ -157,135 +150,6 @@ function getSessionLogPath(): string {
   return join(configuration.logsDir, filename)
 }
 
-async function pruneDaemonLogsForCurrentLogger(logFilePath: string): Promise<void> {
-  try {
-    mkdirSync(dirname(logFilePath), { recursive: true })
-    appendFileSync(logFilePath, '')
-  } catch {
-    // Best-effort pruning only.
-  }
-  await pruneLogsByCount({
-    dir: configuration.logsDir,
-    suffix: DAEMON_LOG_SUFFIX,
-    keepCount: resolveDaemonLogKeepCount(),
-    keepPath: logFilePath,
-  }).catch(() => ({ pruned: 0 }))
-}
-
-async function pruneSessionLogsForCurrentLogger(logFilePath: string): Promise<void> {
-  const keepCount = resolveSessionLogKeepCount()
-  await pruneLogsByCount({
-    dir: configuration.logsDir,
-    suffix: LOG_FILE_SUFFIX,
-    excludeSuffix: DAEMON_LOG_SUFFIX,
-    keepCount,
-    keepPath: logFilePath,
-    keepPaths: [
-      ...resolveCrashedSessionLogKeepPaths(configuration.logsDir),
-      ...resolveLiveSessionLogKeepPaths(configuration.logsDir, keepCount),
-    ],
-  }).catch(() => ({ pruned: 0 }))
-}
-
-type CrashedSessionExitReportReference = Readonly<{
-  pid: number
-  observedAt: number
-}>
-
-function readNonZeroExitReportReference(path: string): CrashedSessionExitReportReference | null {
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown;
-    if (!parsed || typeof parsed !== 'object') return null;
-    const record = parsed as { pid?: unknown; code?: unknown; signal?: unknown };
-    const pid = typeof record.pid === 'number' && Number.isInteger(record.pid) && record.pid > 0
-      ? record.pid
-      : null;
-    if (pid === null) return null;
-    const crashed = (typeof record.code === 'number' && record.code !== 0)
-      || (typeof record.signal === 'string' && record.signal.trim().length > 0)
-    if (!crashed) return null
-    const observedAt = typeof (record as { observedAt?: unknown }).observedAt === 'number'
-      && Number.isFinite((record as { observedAt?: number }).observedAt)
-      ? Math.trunc((record as { observedAt: number }).observedAt)
-      : Math.trunc(statSync(path).mtimeMs)
-    return { pid, observedAt }
-  } catch {
-    return null;
-  }
-}
-
-function resolveCrashedSessionLogKeepPaths(logsDir: string): string[] {
-  try {
-    const keepCount = resolveCrashedSessionLogKeepCount();
-    if (keepCount <= 0) return [];
-    const sessionExitDir = join(logsDir, 'session-exit');
-    const crashedPids = readdirSync(sessionExitDir)
-      .filter((file) => file.endsWith('.json'))
-      .map((file) => readNonZeroExitReportReference(join(sessionExitDir, file)))
-      .filter((entry): entry is CrashedSessionExitReportReference => entry !== null)
-      .sort((a, b) => b.observedAt - a.observedAt)
-      .slice(0, keepCount)
-      .map((entry) => entry.pid);
-    if (crashedPids.length === 0) return [];
-    const crashedPidSet = new Set(crashedPids);
-    return readdirSync(logsDir)
-      .filter((file) => file.endsWith(LOG_FILE_SUFFIX) && !file.endsWith(DAEMON_LOG_SUFFIX))
-      .filter((file) => {
-        const match = /-pid-(\d+)\.log$/.exec(file);
-        return match ? crashedPidSet.has(Number(match[1])) : false;
-      })
-      .map((file) => join(logsDir, file));
-  } catch {
-    return [];
-  }
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return Boolean(
-      error
-      && typeof error === 'object'
-      && 'code' in error
-      && error.code === 'EPERM',
-    )
-  }
-}
-
-function resolveLiveSessionLogKeepPaths(logsDir: string, keepCount: number): string[] {
-  try {
-    const livenessByPid = new Map<number, boolean>()
-    return readdirSync(logsDir)
-      .filter((file) => file.endsWith(LOG_FILE_SUFFIX) && !file.endsWith(DAEMON_LOG_SUFFIX))
-      .sort((a, b) => a < b ? 1 : a > b ? -1 : 0)
-      .slice(Math.max(0, keepCount))
-      .filter((file) => {
-        const match = /-pid-(\d+)\.log$/.exec(file)
-        if (!match) return false
-        const pid = Number(match[1])
-        if (!Number.isSafeInteger(pid) || pid <= 0) return false
-        const cached = livenessByPid.get(pid)
-        if (cached !== undefined) return cached
-        const alive = isProcessAlive(pid)
-        livenessByPid.set(pid, alive)
-        return alive
-      })
-      .map((file) => join(logsDir, file))
-  } catch {
-    return []
-  }
-}
-
-function pruneLogsForCurrentLogger(logFilePath: string): void {
-  if (configuration.isDaemonProcess) {
-    void pruneDaemonLogsForCurrentLogger(logFilePath)
-    return
-  }
-  void pruneSessionLogsForCurrentLogger(logFilePath)
-}
-
 type LoggerFlushHookState = {
   registered: boolean
   flushers: Set<() => void>
@@ -338,7 +202,8 @@ class Logger {
   constructor(
     public readonly logFilePath = getSessionLogPath()
   ) {
-    pruneLogsForCurrentLogger(this.logFilePath)
+    // Constructing a logger never deletes anything: only the running daemon prunes the logs dir,
+    // from its retention loop (see utils/logs/logRetention.ts).
 
     this.fileLogLevel = resolveFileLogLevel({ env: process.env, isDaemonProcess: configuration.isDaemonProcess })
     this.debugFileEnabled = isFileLogLevelEnabled(this.fileLogLevel, 'debug')
@@ -466,6 +331,12 @@ class Logger {
 
   warn(message: string, ...args: unknown[]): void {
     this.logToConsole('warn', '', message, ...args)
+    if (!this.warnFileEnabled) return
+    this.logToFile(`[${this.localTimezoneTimestamp()}]`, `[WARN] ${message}`, ...args)
+  }
+
+  /** A warning written only to the log file, for paths whose stdout belongs to a provider terminal. */
+  warnFile(message: string, ...args: unknown[]): void {
     if (!this.warnFileEnabled) return
     this.logToFile(`[${this.localTimezoneTimestamp()}]`, `[WARN] ${message}`, ...args)
   }

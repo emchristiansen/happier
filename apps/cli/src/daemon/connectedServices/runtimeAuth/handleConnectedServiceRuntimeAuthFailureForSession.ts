@@ -30,6 +30,10 @@ import {
 } from './resolveConnectedServiceRuntimeAuthRecoverySelection';
 import type { ConnectedServiceRuntimeAuthApplyCapability } from '../credentials/lifecycleTypes';
 import { resolveSwitchAttemptEventOutcomeForFailure } from '../sessionAuthSwitch/events/resolveSwitchAttemptEventOutcome';
+import {
+  ConnectedServiceExactRuntimeSourceBindingUnavailableError,
+  type RegisteredRuntimeAuthFailureSourceBindingDeficiency,
+} from './connectedServiceExactRuntimeSourceBindingUnavailableError';
 
 type SwitchCoordinatorLike = Parameters<typeof handleConnectedServiceRuntimeAuthFailure>[0]['switchCoordinator'];
 type SwitchAfterClassifiedFailureInput = Parameters<SwitchCoordinatorLike['switchAfterClassifiedFailure']>[0];
@@ -115,11 +119,19 @@ type RuntimeAuthFailureSourceBindingResolver = (input: Readonly<{
   classification: ConnectedServiceRuntimeFailureClassification;
 }>) => Promise<RuntimeAuthFailureSourceBinding | null>;
 
+export type RegisteredRuntimeAuthFailureSourceResolution =
+  | Readonly<{ status: 'bound'; binding: RuntimeAuthFailureSourceBinding }>
+  | Readonly<{
+      status: 'absent';
+      reason: 'session_unregistered' | 'service_unbound';
+      registeredServiceIds: ReadonlyArray<string>;
+    }>;
+
 type RegisteredRuntimeAuthFailureSourceBindingResolver = (input: Readonly<{
   sessionId: string;
   tracked: TrackedSession;
   classification: ConnectedServiceRuntimeFailureClassification;
-}>) => RuntimeAuthFailureSourceBinding | null;
+}>) => RegisteredRuntimeAuthFailureSourceResolution;
 
 type ProviderQualifiedRuntimeAuthFailureSourceResolver = (input: Readonly<{
   sessionId: string;
@@ -345,14 +357,26 @@ export async function authorizeConnectedServiceRuntimeAuthFailureSource(input: R
     if (!tracked) {
       throw new Error('connected-service exact runtime source session temporarily unavailable');
     }
-    const registeredBinding = input.resolveRegisteredRuntimeAuthFailureSource?.({
+    const registeredResolution = input.resolveRegisteredRuntimeAuthFailureSource?.({
       sessionId: input.sessionId,
       tracked,
       classification,
     }) ?? null;
-    if (!registeredBinding) {
-      throw new Error('connected-service exact runtime source binding temporarily unavailable');
+    if (!registeredResolution) {
+      throw new ConnectedServiceExactRuntimeSourceBindingUnavailableError({
+        kind: 'registered_binding_resolver_unavailable',
+        serviceId: classification.serviceId,
+      });
     }
+    if (registeredResolution.status === 'absent') {
+      throw new ConnectedServiceExactRuntimeSourceBindingUnavailableError({
+        kind: 'registered_binding_absent',
+        reason: registeredResolution.reason,
+        serviceId: classification.serviceId,
+        registeredServiceIds: registeredResolution.registeredServiceIds,
+      });
+    }
+    const registeredBinding = registeredResolution.binding;
     const registeredProfileId = registeredBinding.profileId.trim();
     const registeredCredentialRevision = registeredBinding.credentialRevision?.trim() ?? '';
     const registeredGroupIdRaw = registeredBinding.groupId?.trim() ?? '';
@@ -369,7 +393,21 @@ export async function authorizeConnectedServiceRuntimeAuthFailureSource(input: R
         || (registeredGroupId === null && registeredGeneration === null)
       );
     if (!registeredBindingIsExact) {
-      throw new Error('connected-service exact runtime source binding temporarily unavailable');
+      const deficiencies: RegisteredRuntimeAuthFailureSourceBindingDeficiency[] = [];
+      if (registeredProfileId.length === 0) deficiencies.push('profile_id_blank');
+      if (registeredCredentialRevision.length === 0) deficiencies.push('credential_revision_absent');
+      if (registeredGroupId !== null && registeredGeneration === null) deficiencies.push('group_generation_absent');
+      if (registeredGroupId === null && registeredGeneration !== null) deficiencies.push('group_id_absent');
+      throw new ConnectedServiceExactRuntimeSourceBindingUnavailableError({
+        kind: 'registered_binding_not_exact',
+        serviceId: registeredBinding.serviceId,
+        deficiencies,
+        profileId: registeredBinding.profileId,
+        groupId: registeredBinding.groupId,
+        generation: registeredBinding.generation,
+        credentialRevisionPresent: registeredCredentialRevision.length > 0,
+        credentialRevision: registeredBinding.credentialRevision,
+      });
     }
     const exactRegisteredBinding: RuntimeAuthFailureSourceBinding = {
       serviceId: registeredBinding.serviceId,

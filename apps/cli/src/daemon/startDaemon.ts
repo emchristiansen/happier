@@ -24,6 +24,7 @@ import {
   requestSessionPendingQueueWakeV1,
 } from './sessions/pendingQueueWake';
 import { publishSessionPendingQueueWake } from './sessions/publishSessionPendingQueueWake';
+import { retryRuntimeAuthLimitAfterReset } from './connectedServices/runtimeAuth/retryRuntimeAuthLimitAfterReset';
 import { createRuntimeAuthRecoverySchedulerForDaemon } from './connectedServices/runtimeAuth/createRuntimeAuthRecoverySchedulerForDaemon';
 import { projectTemporaryThrottleRecoveryMetadata } from './connectedServices/runtimeAuth/projection/temporaryThrottleRecoveryMetadata';
 import { deriveConnectedServiceBrokerRefreshToken } from './connectedServices/broker/brokerRefreshCapabilityToken';
@@ -149,7 +150,11 @@ import { publishReportedTerminalControlServiceability } from './sessions/publish
 import { retireExactTerminalControlServiceability } from './sessions/retireTerminalControlServiceability';
 import { recoverStrandedTerminalControlServiceability } from './sessions/recoverStrandedTerminalControlServiceability';
 import { waitForVisibleConsoleSessionWebhook } from './sessions/visibleConsoleSpawnWaiter';
-import { createStopSession } from './sessions/stopSession';
+import {
+  createStopSession,
+  isExactStopRunnerSoleTrackedRunner,
+  type StopSessionOptions,
+} from './sessions/stopSession';
 import {
   isTerminalHostPhysicallyRetiredStopResult,
   type StopSessionResult,
@@ -163,6 +168,7 @@ import {
   isSessionRunnerActive as isSessionRunnerActiveInDaemon,
   probeSessionRunnerServiceability as probeSessionRunnerServiceabilityInDaemon,
   resolveSessionRunnerResumeDecision,
+  type MatchedLostPublisherRunner,
   type SessionRunnerServiceabilityProbe,
 } from './sessions/isSessionRunnerActive';
 import { startDaemonHeartbeatLoop } from './lifecycle/heartbeat';
@@ -404,6 +410,8 @@ import { commitConnectedServiceQuotaLifecycleSessionEvents } from './connectedSe
 import { ConnectedServiceGroupHomeCleanupScheduler } from './connectedServices/homes/ConnectedServiceGroupHomeCleanupScheduler';
 import { ConnectedServiceMaterializedHomeCleanupScheduler } from './connectedServices/materialize/cleanup/ConnectedServiceMaterializedHomeCleanupScheduler';
 import { startConnectedServiceMaterializedHomeCleanupLoop } from './connectedServices/materialize/cleanup/startConnectedServiceMaterializedHomeCleanupLoop';
+import { startLogRetentionLoop, type LogRetentionLoopHandle } from './logs/startLogRetentionLoop';
+import { runDaemonLogRetention } from '@/utils/logs/daemonLogRetention';
 import { isConnectedServiceAuthGroupUnavailableError } from '@/api/connectedServices/connectedServiceCredentialApi';
 import {
   ConnectedServiceCredentialRecordV1Schema,
@@ -2103,6 +2111,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         stop: () => void;
         trigger: () => void;
       }> | null = null;
+      let logRetentionLoopHandle: LogRetentionLoopHandle | null = null;
       let daemonServerWorkOnline = true;
       const daemonServerWorkScheduler: DaemonServerWorkScheduler = createDaemonServerWorkScheduler({
         budget: createDaemonServerWorkBudget({
@@ -2319,6 +2328,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           return await probeSessionRunnerServiceabilityInDaemon({
             sessionId: sessionIdRaw,
             trackedSessions: pidToTrackedSession.values(),
+            localMachineId: machineId,
             probeCapability: async () => await probePendingQueueServiceability({
               sessionId: sessionIdRaw,
               credentials,
@@ -2812,6 +2822,21 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           logger.debug('[DAEMON RUN] Connected-service group home startup reconciliation failed (non-fatal)', error);
         });
         connectedServiceMaterializedHomeCleanupLoopHandle?.trigger();
+        // Only the running daemon prunes the logs dir (utils/logs/logRetention.ts): once now, then hourly.
+        logRetentionLoopHandle = startLogRetentionLoop({
+          runRetention: async () => {
+            const result = await runDaemonLogRetention({
+              logsDir: configuration.logsDir,
+              currentLogPath: logger.getLogPath(),
+            });
+            if (result.sessionLogs.outcome === 'skipped') {
+              logger.debug('[DAEMON RUN] Session log sweep deleted nothing this pass', result);
+            }
+          },
+          onTickError: (error) => {
+            logger.debug('[DAEMON RUN] Log retention pass failed (non-fatal)', error);
+          },
+        });
         if (shouldUseSystemdUserSessionResourceGovernor({ platform: process.platform, startupSource })) {
           const migratedTrackedSessionProcesses = await migrateTrackedSessionProcessesOutOfDaemonServiceCgroup({
             trackedSessions: pidToTrackedSession.values(),
@@ -3087,6 +3112,53 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 pollIntervalMs: configuration.daemonSpawnExistingSessionWaitForExitPollIntervalMs,
               });
               const initialResumeDecision = resolveSessionRunnerResumeDecision(initialServiceability);
+              // A local runner that itself reports `publisher_lost` is alive but can never claim the
+              // queued input again. Replace it as a person would: Stop exactly that runner incarnation,
+              // then the ordinary spawn below, once the session's runner is proven absent.
+              const replacePublisherLostRunner = async (
+                target: MatchedLostPublisherRunner,
+              ): Promise<Extract<SpawnSessionResult, { type: 'error' }> | null> => {
+                const refusal = {
+                  type: 'error' as const,
+                  errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
+                  errorMessage: 'The existing session runtime can no longer receive queued messages and could not be safely replaced. Stop the session, then Resume again.',
+                };
+                // Re-check before Stop's side effects: the reporting runner must still be the only
+                // tracked process Stop would signal.
+                if (!isExactStopRunnerSoleTrackedRunner({
+                  pidToTrackedSession,
+                  sessionId: normalizedExistingSessionId,
+                  exactRunner: target,
+                })) {
+                  logger.warn('[DAEMON RUN] Refusing to replace a lost-publisher runner that is no longer the session\'s only tracked runner', {
+                    sessionId: normalizedExistingSessionId,
+                    pid: target.pid,
+                  });
+                  return refusal;
+                }
+                logger.warn('[DAEMON RUN] Resume target reported a lost pending publisher; replacing its runner', {
+                  sessionId: normalizedExistingSessionId,
+                  pid: target.pid,
+                });
+                const stopResult = await stopSession(normalizedExistingSessionId, { exactRunner: target });
+                if (
+                  (stopResult.status === 'stopped' || stopResult.status === 'not_found')
+                  && (await probeSessionRunnerServiceability(normalizedExistingSessionId)).state === 'runner_absent'
+                ) {
+                  return null;
+                }
+                logger.warn('[DAEMON RUN] Refusing Resume because the lost-publisher runner was not proven stopped', {
+                  sessionId: normalizedExistingSessionId,
+                  pid: target.pid,
+                  stopStatus: stopResult.status,
+                  ...(stopResult.status === 'incomplete' ? { stopReason: stopResult.reason } : {}),
+                });
+                return refusal;
+              };
+              if (initialResumeDecision.action === 'replace') {
+                const replacementRefusal = await replacePublisherLostRunner(initialResumeDecision.target);
+                if (replacementRefusal) return replacementRefusal;
+              }
               if (initialResumeDecision.action === 'fence') {
                 await publishSessionRunnerControlServiceability(normalizedExistingSessionId, initialServiceability);
                 logger.debug('[DAEMON RUN] Resume target serviceability is unknown; refusing an unsafe duplicate spawn', {
@@ -3124,6 +3196,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
 
                 const serviceabilityAfterWait = await probeSessionRunnerServiceability(normalizedExistingSessionId);
                 const resumeDecisionAfterWait = resolveSessionRunnerResumeDecision(serviceabilityAfterWait);
+                if (resumeDecisionAfterWait.action === 'replace') {
+                  const replacementRefusal = await replacePublisherLostRunner(resumeDecisionAfterWait.target);
+                  if (replacementRefusal) return replacementRefusal;
+                }
                 if (resumeDecisionAfterWait.action === 'fence') {
                   await publishSessionRunnerControlServiceability(normalizedExistingSessionId, serviceabilityAfterWait);
                   return {
@@ -3168,6 +3244,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   // destructive escape hatch that killed live Claude runners en masse after a daemon
                   // restart marked them (falsely) inactive. Never kill a live, servable runner over
                   // a momentary probe result; it will drain its queue once its handler is ready.
+                  // The one exception is decided before adoption: the exact local runner that itself
+                  // reports `publisher_lost` has spent its one reconnect, and the server refuses its
+                  // every claim, so it can never drain. Only that positive, incarnation-bound report
+                  // replaces a runner; a missing, failed, foreign or unbindable probe never implies it.
                   const hasExplicitCatchUpCursor = typeof normalizedOptions.initialTranscriptAfterSeq === 'number';
                   const hasFreshUserRequestAuthorization =
                     normalizedOptions.executionAuthorization?.provenance === 'user_request'
@@ -5628,7 +5708,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           }
         };
 
-        const stopSession = async (sessionId: string): Promise<StopSessionResult> => {
+        const stopSession = async (sessionId: string, options?: StopSessionOptions): Promise<StopSessionResult> => {
           const normalizedSessionId = String(sessionId ?? '').trim();
           const existingStop = stopSessionInFlightBySessionId.get(normalizedSessionId);
           if (existingStop) return await existingStop;
@@ -5673,7 +5753,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               });
             });
             physicallyRetiredTerminalAttachmentIdBySessionId.delete(normalizedSessionId);
-            const trackedStopResult = await stopSessionCore(normalizedSessionId);
+            const trackedStopResult = options === undefined
+              ? await stopSessionCore(normalizedSessionId)
+              : await stopSessionCore(normalizedSessionId, options);
             const physicallyRetiredAttachmentId = physicallyRetiredTerminalAttachmentIdBySessionId.get(normalizedSessionId);
             physicallyRetiredTerminalAttachmentIdBySessionId.delete(normalizedSessionId);
             if (isTerminalHostPhysicallyRetiredStopResult(trackedStopResult) && physicallyRetiredAttachmentId) {
@@ -5767,20 +5849,31 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         const resolveRegisteredRuntimeAuthFailureSourceForSession: NonNullable<
           Parameters<typeof authorizeConnectedServiceRuntimeAuthFailureSource>[0]['resolveRegisteredRuntimeAuthFailureSource']
         > = ({ sessionId: liveSessionId, classification: liveClassification }) => {
+          const runtimeTarget = connectedServiceRuntimeRegistry.getBySessionId(liveSessionId);
+          if (!runtimeTarget) {
+            return { status: 'absent', reason: 'session_unregistered', registeredServiceIds: [] };
+          }
           const serviceId = ConnectedServiceIdSchema.safeParse(liveClassification.serviceId);
-          if (!serviceId.success) return null;
-          const binding = connectedServiceRuntimeRegistry
-            .getBySessionId(liveSessionId)
-            ?.activeBindings.find((candidate) => candidate.serviceId === serviceId.data) ?? null;
-          return binding
-            ? {
-                serviceId: binding.serviceId,
-                groupId: binding.groupId,
-                profileId: binding.profileId,
-                generation: binding.generation,
-                credentialRevision: binding.credentialRevision,
-              }
+          const binding = serviceId.success
+            ? runtimeTarget.activeBindings.find((candidate) => candidate.serviceId === serviceId.data) ?? null
             : null;
+          if (!binding) {
+            return {
+              status: 'absent',
+              reason: 'service_unbound',
+              registeredServiceIds: runtimeTarget.activeBindings.map((candidate) => candidate.serviceId),
+            };
+          }
+          return {
+            status: 'bound',
+            binding: {
+              serviceId: binding.serviceId,
+              groupId: binding.groupId,
+              profileId: binding.profileId,
+              generation: binding.generation,
+              credentialRevision: binding.credentialRevision,
+            },
+          };
         };
         const resolveRuntimeAuthApplyForFailureSource = async (input: Readonly<{
           sessionId: string;
@@ -5857,6 +5950,33 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     }
                   : null;
               }),
+          });
+        };
+
+        const authorizeRuntimeAuthFailureSourceForSession = async ({ sessionId, classification, recoveryInvocationSource }:
+          Pick<Parameters<typeof authorizeConnectedServiceRuntimeAuthFailureSource>[0],
+            'sessionId' | 'classification' | 'recoveryInvocationSource'>) => {
+          const runtimeAuthApply = classification
+            ? await resolveRuntimeAuthApplyForFailureSource({
+                sessionId,
+                serviceId: ConnectedServiceIdSchema.parse(classification.serviceId),
+              })
+            : null;
+          return await authorizeConnectedServiceRuntimeAuthFailureSource({
+            getChildren: getCurrentChildren,
+            sessionId,
+            classification,
+            recoveryInvocationSource,
+            resolveDurableSessionForRuntimeAuthRecovery: async ({ sessionId: durableSessionId, classification: durableClassification }) =>
+              await resolveDurableConnectedServiceRuntimeAuthRecoverySession({
+                credentials,
+                sessionId: durableSessionId,
+                serviceId: durableClassification.serviceId,
+              }),
+            resolveRegisteredRuntimeAuthFailureSource: resolveRegisteredRuntimeAuthFailureSourceForSession,
+            resolveCurrentRuntimeAuthFailureSource: resolveCurrentRuntimeAuthFailureSourceForSession,
+            resolveProviderQualifiedRuntimeAuthFailureSource,
+            runtimeAuthApply,
           });
         };
 
@@ -6459,6 +6579,18 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             { min: 1, max: 25 },
           ),
           recover: handleConnectedServiceRuntimeAuthRecovery,
+          readLimitResetCustomResumePrompt: () => readContinuationCustomResumePrompt(getActiveAccountSettingsSnapshot()?.settings ?? null),
+          retryAfterLimitReset: async (retry) => await retryRuntimeAuthLimitAfterReset({
+            ...retry,
+            isCurrent: () => !shutdownInitiated && retry.isCurrent(),
+            resolveResumeSource: resolveTemporaryThrottleResumeSource,
+            credentials,
+            readCredentials,
+            spawnSession,
+            switchCore: connectedServiceSessionAuthSwitchCore,
+            authorizeSource: () => authorizeRuntimeAuthFailureSourceForSession({ sessionId: retry.sessionId,
+              classification: retry.classification, recoveryInvocationSource: 'scheduler_retry' }),
+          }),
           gate: ({ intent }) => {
             const nowMs = Date.now();
             // Daemon-lifecycle gate: while shutting down, defer the recovery WITHOUT counting an
@@ -6929,29 +7061,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         return resultWithDiagnostics;
       },
       handleConnectedServiceRuntimeAuthFailure: handleConnectedServiceRuntimeAuthRecovery,
-      authorizeConnectedServiceRuntimeAuthFailure: async ({ sessionId, classification }) => {
-        const runtimeAuthApply = classification
-          ? await resolveRuntimeAuthApplyForFailureSource({
-              sessionId,
-              serviceId: ConnectedServiceIdSchema.parse(classification.serviceId),
-            })
-          : null;
-        return await authorizeConnectedServiceRuntimeAuthFailureSource({
-          getChildren: getCurrentChildren,
-          sessionId,
-          classification,
-          resolveDurableSessionForRuntimeAuthRecovery: async ({ sessionId: durableSessionId, classification: durableClassification }) =>
-            await resolveDurableConnectedServiceRuntimeAuthRecoverySession({
-              credentials,
-              sessionId: durableSessionId,
-              serviceId: durableClassification.serviceId,
-          }),
-          resolveRegisteredRuntimeAuthFailureSource: resolveRegisteredRuntimeAuthFailureSourceForSession,
-          resolveCurrentRuntimeAuthFailureSource: resolveCurrentRuntimeAuthFailureSourceForSession,
-          resolveProviderQualifiedRuntimeAuthFailureSource,
-          runtimeAuthApply,
-        });
-      },
+      authorizeConnectedServiceRuntimeAuthFailure: authorizeRuntimeAuthFailureSourceForSession,
       resolveConnectedServiceRuntimeAuthResumePromptMode: async ({ classification, explicit }) =>
         await resolveContinuationResumePromptMode({
           credentials,
@@ -8770,6 +8880,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       if (connectedServiceMaterializedHomeCleanupLoopHandle) {
         connectedServiceMaterializedHomeCleanupLoopHandle.stop();
         connectedServiceMaterializedHomeCleanupLoopHandle = null;
+      }
+      if (logRetentionLoopHandle) {
+        logRetentionLoopHandle.stop();
+        logRetentionLoopHandle = null;
       }
       connectedServiceQuotasCoordinator?.dispose();
       connectedServiceQuotasCoordinator = null;

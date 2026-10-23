@@ -2,6 +2,7 @@ import { classifyProcessByPid } from './doctor';
 import { hashProcessCommand } from './sessionRegistry';
 import type { ProcessRunState } from './processRunState';
 import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
+import { processInstanceFingerprintsProveDifferentInstances } from './processInstanceFingerprintEvidence';
 
 export type SessionRunnerProcessIdentity =
   | Readonly<{ kind: 'happy'; processCommandHash: string; processInstanceFingerprint?: string }>
@@ -65,13 +66,19 @@ export async function readSessionRunnerProcessIdentity(params: Readonly<{
   return { kind: 'unknown', ...(processInstanceFingerprint ? { processInstanceFingerprint } : {}) };
 }
 
+/**
+ * True only when the stored and current fingerprints share a scheme and differ. One living pid can be
+ * fingerprinted under two schemes (the Linux `/proc` reading and its `ps` fallback), so a difference
+ * across schemes is missing evidence, never proof of reuse.
+ */
 export function storedProcessIdentityProvesPidReuse(params: Readonly<{
   storedProcessInstanceFingerprint: string | null | undefined;
   currentIdentity: SessionRunnerProcessIdentity;
 }>): boolean {
-  const stored = String(params.storedProcessInstanceFingerprint ?? '').trim();
-  const observed = String(params.currentIdentity.processInstanceFingerprint ?? '').trim();
-  return Boolean(stored && observed && stored !== observed);
+  return processInstanceFingerprintsProveDifferentInstances(
+    params.storedProcessInstanceFingerprint,
+    params.currentIdentity.processInstanceFingerprint,
+  );
 }
 
 export function storedProcessIdentityMatchesCurrentIdentity(params: Readonly<{
@@ -96,7 +103,8 @@ export type SessionRunnerProcessPresence =
 
 /**
  * Canonical process-evidence decision shared by lock acquisition and daemon resume fencing.
- * A fingerprint mismatch proves PID reuse; missing identity evidence never does.
+ * A same-scheme fingerprint mismatch proves PID reuse; missing identity evidence, including a
+ * fingerprint read under a different scheme, never does.
  */
 export function classifySessionRunnerProcessPresence(params: Readonly<{
   runState: ProcessRunState | null;

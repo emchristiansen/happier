@@ -88,8 +88,9 @@ export class ConnectedServiceSessionAuthSwitchLockRegistry {
     const lock = this.locksBySessionId.get(sessionId);
     if (!lock) return;
     for (const acquisition of lock.queue) acquisition.cancel('session_stopped');
-    // An active owner may still be unwinding. Keep its lock and reentrant capability;
-    // a later request must not run concurrently merely because Stop was requested.
+    // Runner exit or Stop is not cancellation of an in-flight auth transition. An active
+    // owner may still be unwinding: keep its lock and reentrant capability until its own
+    // finally block releases them, so a later request cannot run concurrently with it.
   }
 
   private async runAsOwner<T>(

@@ -19,7 +19,7 @@ const SESSION_RUNTIME_CONTROL_KEYS = [
     'interruptPendingInputAndRun',
     'handleUserMessage',
     'wakePendingMaterialization',
-    'isPendingMaterializationAvailable',
+    'readPendingMaterializationServiceability',
 ] as const satisfies readonly SessionRuntimeControlKey[];
 
 export function copyCallableSessionRuntimeControls(

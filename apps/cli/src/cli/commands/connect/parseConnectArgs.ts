@@ -10,9 +10,22 @@ export type ConnectParsedOptions = Readonly<{
   token: boolean;
 }>;
 
+/**
+ * What `--profile` said, as given: absent, present without a usable value (nothing, blank, or a
+ * token starting with `-`, such as `-h` or `--json`, in its place), or an exact profile id.
+ * Profile ids start with a letter or digit, so no valid id is refused. `options.profileId` keeps
+ * its connect <target> meaning unchanged: the trimmed next token, or `default` when that is
+ * absent or blank.
+ */
+export type ConnectProfileFlag =
+  | Readonly<{ kind: 'absent' }>
+  | Readonly<{ kind: 'missing_value' }>
+  | Readonly<{ kind: 'value'; profileId: string }>;
+
 export function parseConnectArgs(args: ReadonlyArray<string>): Readonly<{
   includeExperimental: boolean;
   subcommand: string | null;
+  profileFlag: ConnectProfileFlag;
   options: ConnectParsedOptions;
 }> {
   const includeExperimental = args.includes('--all') || args.includes('--experimental');
@@ -26,6 +39,11 @@ export function parseConnectArgs(args: ReadonlyArray<string>): Readonly<{
 
   const profileFlagIdx = args.findIndex((a) => a === '--profile');
   const profileId = profileFlagIdx !== -1 ? String(args[profileFlagIdx + 1] ?? '').trim() : '';
+  const profileFlag: ConnectProfileFlag = profileFlagIdx === -1
+    ? { kind: 'absent' }
+    : profileId && !profileId.startsWith('-')
+      ? { kind: 'value', profileId }
+      : { kind: 'missing_value' };
 
   const timeoutFlagIdx = args.findIndex((a) => a === '--timeout');
   const timeoutRaw = timeoutFlagIdx !== -1 ? String(args[timeoutFlagIdx + 1] ?? '').trim() : '';
@@ -61,6 +79,7 @@ export function parseConnectArgs(args: ReadonlyArray<string>): Readonly<{
   return {
     includeExperimental,
     subcommand,
+    profileFlag,
     options: {
       profileId: profileId || 'default',
       paste,

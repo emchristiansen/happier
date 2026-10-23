@@ -45,6 +45,8 @@ export type MaterializeNextPendingResult =
   }
   | { type: 'no_pending' }
   | { type: 'retryable_transport'; retryAfterMs?: number }
+  /** The session socket no longer publishes the session; retrying on it cannot materialize. */
+  | { type: 'publisher_lost' }
   | { type: 'auth_failure'; statusCode: 401 | 403 }
   | {
     type: 'deferred';

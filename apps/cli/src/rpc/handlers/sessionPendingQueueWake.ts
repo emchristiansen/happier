@@ -5,20 +5,27 @@ import {
 import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
 
 import type { RpcHandlerRegistrar } from '@/api/rpc/types';
-import type { SessionRuntimeControls } from './sessionControls';
+import type { PendingMaterializationServiceability, SessionRuntimeControls } from './sessionControls';
 
-const unavailable = (errorCode: 'runtime_upgrade_required' | 'runtime_terminating' = 'runtime_upgrade_required') => ({
+type UnservableReason = Extract<PendingMaterializationServiceability, { state: 'unservable' }>['reason'];
+
+const unavailable = (errorCode: 'runtime_upgrade_required' | UnservableReason = 'runtime_upgrade_required') => ({
   ok: false as const,
   error: 'pending_materialization_wake_unavailable' as const,
   errorCode,
 });
 
 function unavailableForRuntimeState(
-  controls: Pick<SessionRuntimeControls, 'isPendingMaterializationAvailable'> | null | undefined,
+  controls: Pick<SessionRuntimeControls, 'readPendingMaterializationServiceability'> | null | undefined,
 ) {
-  return controls?.isPendingMaterializationAvailable?.() === false
-    ? unavailable('runtime_terminating')
-    : null;
+  const serviceability = controls?.readPendingMaterializationServiceability?.();
+  if (serviceability?.state !== 'unservable') return null;
+  if (serviceability.reason !== 'publisher_lost') return unavailable(serviceability.reason);
+  // The daemon may replace a runner only on a loss reported by that exact incarnation.
+  return {
+    ...unavailable('publisher_lost'),
+    ...(serviceability.respondent ? { respondent: serviceability.respondent } : {}),
+  };
 }
 
 export function registerSessionPendingQueueWakeHandlers(
@@ -26,7 +33,7 @@ export function registerSessionPendingQueueWakeHandlers(
   opts: Readonly<{
     sessionRuntimeControls?: Pick<
       SessionRuntimeControls,
-      'wakePendingMaterialization' | 'isPendingMaterializationAvailable'
+      'wakePendingMaterialization' | 'readPendingMaterializationServiceability'
     > | null;
   }>,
 ): void {

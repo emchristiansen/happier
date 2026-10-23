@@ -407,6 +407,48 @@ describe('sessionRunnerLock', () => {
     expect(JSON.parse(raw).pid).toBe(999);
   });
 
+  it('does NOT break a lock held by a STOPPED pid whose fingerprint is now read under another scheme', async () => {
+    const happyHomeDir = await mkdtemp(join(tmpdir(), 'happier-session-runner-lock-'));
+    const lockPath = sessionRunnerLockPathForSessionId({ happyHomeDir, sessionId: 'sess_cross_scheme' });
+    expect(lockPath).not.toBeNull();
+    if (!lockPath) return;
+
+    await mkdir(dirname(lockPath), { recursive: true });
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        sessionId: 'sess_cross_scheme',
+        pid: 999,
+        acquiredAtMs: 1,
+        processCommandHash: 'a'.repeat(64),
+        processInstanceFingerprint: 'linux-proc:4200',
+      }, null, 2),
+      'utf8',
+    );
+
+    const killedPids: number[] = [];
+    const res = await acquireSessionRunnerLock({
+      happyHomeDir,
+      sessionId: 'sess_cross_scheme',
+      pid: 123,
+      nowMs: 10_000,
+      getCurrentProcessCommandHash: async (pid) => (pid === 999 ? 'a'.repeat(64) : 'b'.repeat(64)),
+      // The same suspended holder, read through the `ps` fallback after a /proc read failed.
+      getProcessInstanceFingerprint: (pid) => (pid === 999 ? 'linux-ps:Mon Oct 20 10:00:00 2026' : 'linux-proc:current'),
+      readProcessRunState: async (pid) => (pid === 999 ? 'stopped' : 'servable'),
+      killWedgedPid: (pid) => {
+        killedPids.push(pid);
+      },
+    });
+
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.reason).toBe('already_running');
+    expect(killedPids).toEqual([]);
+    const raw = await readFile(lockPath, 'utf8');
+    expect(JSON.parse(raw).pid).toBe(999);
+  });
+
   it('breaks a lock held by a ZOMBIE pid without requiring a kill', async () => {
     const happyHomeDir = await mkdtemp(join(tmpdir(), 'happier-session-runner-lock-'));
     const lockPath = sessionRunnerLockPathForSessionId({ happyHomeDir, sessionId: 'sess_10' });

@@ -9,7 +9,11 @@ import {
   type SessionRunnerProcessInstanceFingerprintReader,
   type SessionRunnerProcessPresence,
 } from '../sessionRunnerProcessIdentity';
-import type { SessionRunnerServiceability } from './pendingQueueWake';
+import {
+  processInstanceFingerprintMatches,
+  readProcessInstanceFingerprintSync,
+} from '@happier-dev/cli-common/processInstance';
+import type { SessionRunnerIncarnation, SessionRunnerServiceability } from './pendingQueueWake';
 
 function normalizeSessionId(raw: unknown): string {
   return String(raw ?? '').trim();
@@ -131,16 +135,80 @@ export async function isSessionRunnerActive(params: Readonly<{
   }) === 'present';
 }
 
+declare const matchedLostPublisherRunnerBrand: unique symbol;
+
+/**
+ * The exact local runner incarnation that itself reported `publisher_lost`. Only
+ * `bindLostPublisherReport` constructs one, after proving the respondent equals the one local process
+ * a Stop of the session would signal, so a `replace` decision always carries its matched target.
+ */
+export type MatchedLostPublisherRunner = SessionRunnerIncarnation & Readonly<{ [matchedLostPublisherRunnerBrand]: true }>;
+
+/** Runner control state as seen by the daemon, after binding any lost-publisher report to a local process. */
+export type SessionRunnerControl =
+  | Exclude<SessionRunnerServiceability, Readonly<{ reason: 'publisher_lost' }>>
+  | Readonly<{ state: 'recoverable_unservable'; reason: 'publisher_lost'; target: MatchedLostPublisherRunner }>
+  /** The report may be genuine, but no single local process is provably the one Stop would signal. */
+  | Readonly<{ state: 'recoverable_unservable'; reason: 'publisher_lost_target_ambiguous' }>;
+
 export type SessionRunnerServiceabilityProbe =
   | Readonly<{ state: 'runner_absent' }>
   | Readonly<{ state: 'runner_unknown'; reason: 'runner_presence_unproven' }>
-  | Readonly<{ state: 'runner_present'; control: SessionRunnerServiceability }>;
+  | Readonly<{ state: 'runner_present'; control: SessionRunnerControl }>;
 
 export type SessionRunnerResumeDecision =
   | Readonly<{ action: 'spawn' }>
   | Readonly<{ action: 'adopt' }>
   | Readonly<{ action: 'wait_for_exit'; reason: 'runtime_terminating' }>
+  | Readonly<{ action: 'replace'; reason: 'publisher_lost'; target: MatchedLostPublisherRunner }>
   | Readonly<{ action: 'fence'; reason: string }>;
+
+/**
+ * The one local incarnation a session Stop would signal, or null when that is not exactly one
+ * process: several tracked entries, a wrapper whose runner is another pid, lock-only presence, or an
+ * unreadable machine or process instance.
+ */
+function resolveSoleTrackedRunnerIncarnation(params: Readonly<{
+  tracked: TrackedSession;
+  matchingTrackedCount: number;
+  localMachineId: string | undefined;
+  getProcessInstanceFingerprint: SessionRunnerProcessInstanceFingerprintReader;
+}>): SessionRunnerIncarnation | null {
+  if (params.matchingTrackedCount !== 1) return null;
+  const pid = params.tracked.pid;
+  const childPid = params.tracked.childProcess?.pid;
+  if (typeof childPid === 'number' && childPid !== pid) return null;
+  if (typeof params.tracked.sessionRunnerPid === 'number' && params.tracked.sessionRunnerPid !== pid) return null;
+  const machineId = String(params.localMachineId ?? '').trim();
+  if (!machineId) return null;
+  const processInstanceFingerprint = String(params.getProcessInstanceFingerprint(pid) ?? '').trim();
+  if (!processInstanceFingerprint) return null;
+  return { machineId, pid, processInstanceFingerprint };
+}
+
+function bindLostPublisherReport(
+  control: SessionRunnerServiceability,
+  readLocalRunner: () => SessionRunnerIncarnation | null,
+): SessionRunnerControl {
+  if (control.state !== 'recoverable_unservable' || control.reason !== 'publisher_lost') return control;
+  const local = readLocalRunner();
+  if (!local) return { state: 'recoverable_unservable', reason: 'publisher_lost_target_ambiguous' };
+  const respondent = control.respondent;
+  // Session RPC routes to the account's last registering socket, which may be another runner for
+  // this session (another home, same account). Only the exact local incarnation's report counts.
+  if (
+    respondent.machineId !== local.machineId
+    || respondent.pid !== local.pid
+    || !processInstanceFingerprintMatches(local.processInstanceFingerprint, respondent.processInstanceFingerprint)
+  ) {
+    return { state: 'recoverable_unservable', reason: 'publisher_lost_respondent_unbound' };
+  }
+  return {
+    state: 'recoverable_unservable',
+    reason: 'publisher_lost',
+    target: { ...local } as MatchedLostPublisherRunner,
+  };
+}
 
 export function resolveSessionRunnerResumeDecision(probe: SessionRunnerServiceabilityProbe): SessionRunnerResumeDecision {
   if (probe.state === 'runner_absent') return { action: 'spawn' };
@@ -149,6 +217,11 @@ export function resolveSessionRunnerResumeDecision(probe: SessionRunnerServiceab
   if (probe.control.state === 'recoverable_unservable' && probe.control.reason === 'runtime_terminating') {
     return { action: 'wait_for_exit', reason: 'runtime_terminating' };
   }
+  // Only the exact local runner's own positive report proves it can never claim Pending input again.
+  // A missing, failed, malformed, foreign or unbindable report stays a fence and never implies replacement.
+  if (probe.control.state === 'recoverable_unservable' && probe.control.reason === 'publisher_lost') {
+    return { action: 'replace', reason: 'publisher_lost', target: probe.control.target };
+  }
   return { action: 'fence', reason: probe.control.reason };
 }
 
@@ -156,18 +229,21 @@ export async function probeSessionRunnerServiceability(params: Readonly<{
   sessionId: string;
   trackedSessions: Iterable<TrackedSession>;
   probeCapability: () => Promise<SessionRunnerServiceability>;
+  /** This daemon's machine identity; without it no lost-publisher report can bind to a local runner. */
+  localMachineId?: string;
   readProcessRunState?: ReadProcessRunState;
   getProcessCommandHash?: SessionRunnerProcessCommandHashReader;
   getProcessInstanceFingerprint?: SessionRunnerProcessInstanceFingerprintReader;
   readSessionRunnerLockStatus?: (args: { sessionId: string }) => Promise<SessionRunnerLockStatus>;
 }>): Promise<SessionRunnerServiceabilityProbe> {
   const sessionId = normalizeSessionId(params.sessionId);
-  const trackedSessions = Array.from(params.trackedSessions);
+  const matchingTracked = Array.from(params.trackedSessions)
+    .filter((tracked) => trackedSessionMatchesSessionId(tracked, sessionId));
   const readProcessRunState = params.readProcessRunState ?? readProcessRunStateDefault;
   const readLockStatus = params.readSessionRunnerLockStatus ?? readSessionRunnerLockStatus;
+  const getProcessInstanceFingerprint = params.getProcessInstanceFingerprint ?? readProcessInstanceFingerprintSync;
 
-  for (const tracked of trackedSessions) {
-    if (!trackedSessionMatchesSessionId(tracked, sessionId)) continue;
+  for (const tracked of matchingTracked) {
     const presence = await classifyTrackedSessionPresence({
       sessionId,
       tracked,
@@ -176,7 +252,15 @@ export async function probeSessionRunnerServiceability(params: Readonly<{
       getProcessInstanceFingerprint: params.getProcessInstanceFingerprint,
     });
     if (presence === 'present') {
-      return { state: 'runner_present', control: await params.probeCapability() };
+      return {
+        state: 'runner_present',
+        control: bindLostPublisherReport(await params.probeCapability(), () => resolveSoleTrackedRunnerIncarnation({
+          tracked,
+          matchingTrackedCount: matchingTracked.length,
+          localMachineId: params.localMachineId,
+          getProcessInstanceFingerprint,
+        })),
+      };
     }
     if (presence !== 'absent') {
       return { state: 'runner_unknown', reason: 'runner_presence_unproven' };
@@ -191,7 +275,8 @@ export async function probeSessionRunnerServiceability(params: Readonly<{
     readSessionRunnerLockStatus: readLockStatus,
   });
   if (lockPresence === 'present') {
-    return { state: 'runner_present', control: await params.probeCapability() };
+    // A lock-only runner is not tracked, so a session Stop cannot signal it: never a replacement target.
+    return { state: 'runner_present', control: bindLostPublisherReport(await params.probeCapability(), () => null) };
   }
   if (lockPresence === 'absent' || lockPresence === 'recoverable_stopped') {
     return { state: 'runner_absent' };

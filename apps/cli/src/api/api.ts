@@ -209,6 +209,9 @@ type ConnectedServiceProfileListResult = Readonly<{
     providerAccountId?: string | null;
     expiresAt?: number | null;
     lastUsedAt?: number | null;
+    health?: ConnectedServiceCredentialHealthV1 | null;
+    /** The server sent health in a shape this client does not know; `health` is then absent. */
+    healthUnrecognised?: true;
   }>;
 }>;
 
@@ -970,6 +973,7 @@ export class ApiClient {
         providerAccountId: z.string().nullable().optional(),
         expiresAt: z.number().nullable().optional(),
         lastUsedAt: z.number().nullable().optional(),
+        health: z.unknown().optional(),
       }),
     ).safeParse((raw as any).profiles);
 
@@ -977,7 +981,19 @@ export class ApiClient {
       throw new Error('Invalid connected service profiles response');
     }
 
-    return { serviceId: serviceIdParsed.data, profiles: profilesParsed.data };
+    // Health is diagnostic, while this list also feeds spawn auth and quotas, so a health shape
+    // this client does not know (the schema is strict; a newer server may add a failure kind)
+    // never rejects the list. That profile reports `healthUnrecognised` instead of a health value,
+    // so callers can say that health is not shown rather than imply there is none.
+    const profiles = profilesParsed.data.map(({ health: rawHealth, ...profile }) => {
+      if (rawHealth === undefined) return profile;
+      const health = ConnectedServiceCredentialHealthV1Schema.nullable().safeParse(rawHealth);
+      return health.success
+        ? { ...profile, health: health.data }
+        : { ...profile, healthUnrecognised: true as const };
+    });
+
+    return { serviceId: serviceIdParsed.data, profiles };
   }
 
   async getConnectedServiceAuthGroup(params: {

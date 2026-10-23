@@ -11,7 +11,12 @@ import { SessionArchiveInputAdmission, type RequestArchivedSessionCleanup } from
 import { LruSet } from '@/utils/collections/lru';
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers';
 import { createSerializedWorkQueueDiagnostics, type SerializedWorkDiagnosticContext } from '@/utils/serializedWorkQueueDiagnostics';
-import { isConditionalPendingSteerClaim, readPendingLocalId } from '@happier-dev/protocol';
+import {
+    isConditionalPendingSteerClaim,
+    readPendingLocalId,
+    type PendingQueueWakeRunnerIncarnationV1,
+} from '@happier-dev/protocol';
+import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
 import { inferAgentIdFromSessionMetadata } from '@happier-dev/agents';
 import { configuration } from '@/configuration';
 import type { RawJSONLines } from '@/backends/claude/types';
@@ -27,7 +32,7 @@ import { randomUUID } from 'node:crypto';
 import { AsyncLock } from '@/utils/lock';
 import { RpcHandlerManager } from '../rpc/RpcHandlerManager';
 import { registerSessionHandlers } from '@/rpc/handlers/registerSessionHandlers';
-import type { SessionRuntimeControls } from '@/rpc/handlers/sessionControls';
+import type { PendingMaterializationServiceability, SessionRuntimeControls } from '@/rpc/handlers/sessionControls';
 import {
     clearSessionRuntimeControls,
     copyCallableSessionRuntimeControls,
@@ -582,6 +587,18 @@ type AcceptedCanonicalPendingDeliveryOperationAuthority = Readonly<{
     socket: Socket<ServerToClientEvents, ClientToServerEvents>;
     abortSignal: AbortSignal;
 }>;
+/**
+ * One lost-publisher episode. The first refusal requests one supervisor reconnect, whose connect
+ * path reclaims publisher status; a refusal on that reclaimed connection is terminal until a
+ * later connection claims publisher status again. Any accepted claim ends the episode. A reconnect
+ * that does not reclaim publisher status within `configuration.pendingPublisherRecoveryDeadlineMs`
+ * completes the episode as terminal too, so recovery always ends.
+ */
+type PendingPublisherRecovery =
+    | Readonly<{ state: 'current' }>
+    | Readonly<{ state: 'reconnect_requested'; episode: number }>
+    | Readonly<{ state: 'reclaimed'; sessionConnectionEpoch: number }>
+    | Readonly<{ state: 'publisher_lost' }>;
 
 function readFiniteTimestampMs(value: unknown): number | null {
     if (typeof value !== 'number' && typeof value !== 'bigint') return null;
@@ -680,6 +697,8 @@ export class ApiSessionClient extends EventEmitter {
     private readonly providerInputUncertainLocalIds = new Set<string>();
     private readonly acceptedCanonicalPendingDeliveryResolutionWrites = new Set<Promise<void>>();
     private readonly acceptedCanonicalPendingDeliveryResolutionLocalIdsInFlight = new Set<string>();
+    // Held inputs already named in the runner log; pruned to the currently held set at each hold.
+    private readonly materializationHeldLoggedLocalIds = new Set<string>();
     private readonly acceptedCanonicalPendingDeliveryOperationAbortController = new AbortController();
     private readonly committedLocalIdCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private readonly agentQueueEchoSuppressedLocalIdCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -745,6 +764,11 @@ export class ApiSessionClient extends EventEmitter {
      */
     private sessionConnectionEpoch = 0;
     private sessionSyncPendingInputServerContract: SessionSyncPendingInputServerContractResult | null = null;
+    private pendingPublisherRecovery: PendingPublisherRecovery = { state: 'current' };
+    private pendingPublisherRecoveryEpisode = 0;
+    private pendingPublisherRecoveryDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
+    /** Set at `close()` entry, before its awaits, so no in-flight continuation can start a recovery episode. */
+    private closeStarted = false;
     private pendingInputReadinessAbortController: AbortController | null = null;
     private convergePendingInputReadiness: ((onContractPrepared?: () => void) => Promise<boolean>) | null = null;
     private changesSyncInFlight: Promise<void> | null = null;
@@ -1411,6 +1435,7 @@ export class ApiSessionClient extends EventEmitter {
                 const isReconnect = this.hasConnectedOnce;
                 this.hasConnectedOnce = true;
                 this.sessionConnectionEpoch += 1;
+                const connectionEpoch = this.sessionConnectionEpoch;
                 this.resetAccountSettingsRetryForEvent();
                 if (!await this.convergePendingInputReadiness?.(() => {
                     if (this.shouldKeepUserSocketConnected()) {
@@ -1420,6 +1445,8 @@ export class ApiSessionClient extends EventEmitter {
                         this.reassertSessionPresenceAfterReconnect();
                     }
                 })) return;
+                // On publisher-fenced servers, converged readiness includes this connection's settled publisher claim.
+                this.observePendingPublisherClaim(connectionEpoch);
                 this.reofferAcceptedCanonicalPendingDeliveriesAfterConnection();
                 this.clearPendingDiscoveryTimer();
                 this.schedulePendingDiscovery();
@@ -1489,9 +1516,100 @@ export class ApiSessionClient extends EventEmitter {
             copyCallableSessionRuntimeControls(this.sessionRuntimeControls, registration);
         }
         this.sessionRuntimeControls.wakePendingMaterialization = () => this.wakePendingMaterialization();
-        this.sessionRuntimeControls.isPendingMaterializationAvailable = () => (
-            !this.closed && !this.runtimeTerminationStarted
-        );
+        this.sessionRuntimeControls.readPendingMaterializationServiceability = (): PendingMaterializationServiceability => {
+            if (this.closed || this.runtimeTerminationStarted) return { state: 'unservable', reason: 'runtime_terminating' };
+            switch (this.pendingPublisherRecovery.state) {
+                case 'publisher_lost':
+                    return { state: 'unservable', reason: 'publisher_lost', respondent: this.readPendingPublisherRespondent() };
+                case 'reconnect_requested':
+                    // Unservable but not terminal until the episode completes. Servable would make the
+                    // daemon adopt a runner whose Pending claims the server is refusing, and terminal
+                    // would let it replace a runner whose one reconnect may still succeed; this keeps
+                    // Resume fenced for at most the recovery deadline.
+                    return { state: 'unservable', reason: 'publisher_recovering' };
+                default:
+                    return { state: 'servable' };
+            }
+        };
+    }
+
+    /**
+     * This runner's own incarnation, for the daemon to bind a `publisher_lost` report to the exact
+     * local process it may stop. The fingerprint is read the way the daemon reads any pid's instance.
+     */
+    private readPendingPublisherRespondent(): PendingQueueWakeRunnerIncarnationV1 | null {
+        const machineId = (this.sessionSocketMachineId ?? resolveSessionSocketMachineIdForBootstrap(this.metadata))?.trim();
+        const processInstanceFingerprint = readProcessInstanceFingerprintSync(process.pid)?.trim();
+        return machineId && processInstanceFingerprint
+            ? { machineId, pid: process.pid, processInstanceFingerprint }
+            : null;
+    }
+
+    /** Every recovery transition goes through here, so leaving an episode always disarms its deadline. */
+    private setPendingPublisherRecovery(next: PendingPublisherRecovery): void {
+        this.clearPendingPublisherRecoveryDeadline();
+        this.pendingPublisherRecovery = next;
+    }
+
+    private clearPendingPublisherRecoveryDeadline(): void {
+        if (this.pendingPublisherRecoveryDeadlineTimer) clearTimeout(this.pendingPublisherRecoveryDeadlineTimer);
+        this.pendingPublisherRecoveryDeadlineTimer = null;
+    }
+
+    private expirePendingPublisherRecovery(episode: number): void {
+        const recovery = this.pendingPublisherRecovery;
+        // Bound to its episode: a deadline can never end a later episode or overwrite a reclaim.
+        if (recovery.state !== 'reconnect_requested' || recovery.episode !== episode) return;
+        this.setPendingPublisherRecovery({ state: 'publisher_lost' });
+        logger.infoFile('[pendingQueue] reconnect did not reclaim publisher status before its deadline; materialization stopped', {
+            sessionId: this.sessionId,
+            deadlineMs: configuration.pendingPublisherRecoveryDeadlineMs,
+        });
+    }
+
+    private observePendingPublisherClaim(sessionConnectionEpoch: number): void {
+        if (this.pendingPublisherRecovery.state === 'reconnect_requested') {
+            this.setPendingPublisherRecovery({ state: 'reclaimed', sessionConnectionEpoch });
+        } else if (this.pendingPublisherRecovery.state === 'publisher_lost') {
+            logger.infoFile('[pendingQueue] new connection reclaimed publisher status; materialization resumes', {
+                sessionId: this.sessionId,
+            });
+            this.setPendingPublisherRecovery({ state: 'current' });
+        }
+    }
+
+    private observePendingPublisherLost(sessionConnectionEpoch: number): void {
+        // A refusal that lands while the client is closing or terminating changes nothing: arming a
+        // deadline now would outlive close, and no reconnect or replacement is wanted.
+        if (this.closeStarted || this.closed || this.runtimeTerminationStarted) return;
+        const recovery = this.pendingPublisherRecovery;
+        if (recovery.state === 'current') {
+            const episode = ++this.pendingPublisherRecoveryEpisode;
+            this.setPendingPublisherRecovery({ state: 'reconnect_requested', episode });
+            const deadline = setTimeout(
+                () => this.expirePendingPublisherRecovery(episode),
+                configuration.pendingPublisherRecoveryDeadlineMs,
+            );
+            deadline.unref?.();
+            this.pendingPublisherRecoveryDeadlineTimer = deadline;
+            logger.infoFile('[pendingQueue] session socket lost publisher status; reconnecting once', {
+                sessionId: this.sessionId,
+            });
+            // The supervisor owns the session transport: it drops this socket, and its normal
+            // connect path reclaims publisher status and publishes the pending eligibility wake.
+            this.sessionConnectionSupervisor?.reportProbeResult?.({
+                status: 'retry_later',
+                reason: 'probe_failed',
+                errorMessage: 'Pending materialization lost session publisher status',
+            });
+            return;
+        }
+        if (recovery.state === 'reclaimed' && sessionConnectionEpoch >= recovery.sessionConnectionEpoch) {
+            this.setPendingPublisherRecovery({ state: 'publisher_lost' });
+            logger.infoFile('[pendingQueue] reconnect did not restore publisher status; materialization stopped', {
+                sessionId: this.sessionId,
+            });
+        }
     }
 
     private publishSessionGoalControlCapabilities(): void {
@@ -1749,6 +1867,11 @@ export class ApiSessionClient extends EventEmitter {
                                 previousRetryDelayMs * 2,
                             ))
                             : null;
+                        // The server refuses settlement as `forbidden` only when this connection no
+                        // longer publishes the session (its session binding or publisher fence), so no
+                        // retry on it can succeed. A connection that reclaims publisher status re-offers it.
+                        const isPublisherLost = error instanceof PendingQueueAcceptedSettlementError
+                            && error.settlementError === 'forbidden';
                         try {
                             logger.warn('[pendingQueue] accepted provider settlement remains unresolved', {
                                 sessionId: this.sessionId,
@@ -1756,7 +1879,9 @@ export class ApiSessionClient extends EventEmitter {
                                 attempt,
                                 retryAfterMs,
                                 willRetry: retryAfterMs !== null,
-                                retryDisposition: retryAfterMs !== null ? 'same_operation_after_backoff' : 'retained_without_retry',
+                                retryDisposition: retryAfterMs !== null
+                                    ? 'same_operation_after_backoff'
+                                    : isPublisherLost ? 'retained_for_publisher_recovery' : 'retained_without_retry',
                                 failure: readAcceptedPendingSettlementFailureDiagnostic(error),
                                 producerGeneration: authority.producerGeneration,
                                 sessionConnectionEpoch: authority.sessionConnectionEpoch,
@@ -1765,7 +1890,10 @@ export class ApiSessionClient extends EventEmitter {
                         } catch {
                             // Diagnostic sink failure must not change accepted settlement custody or retries.
                         }
-                        if (retryAfterMs === null) return;
+                        if (retryAfterMs === null) {
+                            if (isPublisherLost) this.observePendingPublisherLost(authority.sessionConnectionEpoch);
+                            return;
+                        }
                         previousRetryDelayMs = retryAfterMs;
                         await delayUnrefAbortable(retryAfterMs, authority.abortSignal);
                     } else {
@@ -1975,11 +2103,7 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private async reconcileCanonicalPendingDeliveriesBeforeMaterialization(): Promise<boolean> {
-        const blockingLocalIds = [...this.canonicalPendingDeliveryByLocalId.keys()]
-            .filter((localId) => (
-                this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted'
-                || !this.serverBlockedCanonicalPendingDeliveryLocalIds.has(localId)
-            ));
+        const blockingLocalIds = this.listMaterializationBlockingCanonicalPendingDeliveryLocalIds();
         if (blockingLocalIds.length === 0) return true;
 
         try {
@@ -2017,15 +2141,36 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private hasMaterializationBlockingCanonicalPendingDelivery(): boolean {
-        for (const localId of this.canonicalPendingDeliveryByLocalId.keys()) {
-            if (
-                this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted'
-                || !this.serverBlockedCanonicalPendingDeliveryLocalIds.has(localId)
-            ) {
-                return true;
-            }
+        return this.listMaterializationBlockingCanonicalPendingDeliveryLocalIds().length > 0;
+    }
+
+    private listMaterializationBlockingCanonicalPendingDeliveryLocalIds(): string[] {
+        return [...this.canonicalPendingDeliveryByLocalId.keys()].filter((localId) => (
+            this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted'
+            || !this.serverBlockedCanonicalPendingDeliveryLocalIds.has(localId)
+        ));
+    }
+
+    /**
+     * Held custody makes materialization answer `no_pending` while the server still queues input,
+     * so name each held input once in the runner log; otherwise that stall leaves no trace there.
+     */
+    private logMaterializationHeldByProviderCustody(): void {
+        const held = this.listMaterializationBlockingCanonicalPendingDeliveryLocalIds();
+        for (const localId of this.materializationHeldLoggedLocalIds) {
+            if (!held.includes(localId)) this.materializationHeldLoggedLocalIds.delete(localId);
         }
-        return false;
+        for (const localId of held) {
+            if (this.materializationHeldLoggedLocalIds.has(localId)) continue;
+            this.materializationHeldLoggedLocalIds.add(localId);
+            logger.infoFile('[pendingQueue] materialization held by provider custody', {
+                sessionId: this.sessionId,
+                localId,
+                providerInputOutcome: this.providerInputTerminalOutcomeByLocalId.get(localId) ?? null,
+                publisherRecovery: this.pendingPublisherRecovery.state,
+                sessionConnectionEpoch: this.sessionConnectionEpoch,
+            });
+        }
     }
 
     async reconcilePendingQueueState(opts?: { force?: boolean; discovery?: boolean }): Promise<boolean> {
@@ -2159,7 +2304,12 @@ export class ApiSessionClient extends EventEmitter {
         activeTurnSteerability?: PendingForegroundSteerability;
         pendingQueueDeliveryTiming?: SessionPendingQueueDeliveryTiming;
     } = {}): boolean {
-        if (this.pendingDiscoveryArchived || this.hasMaterializationBlockingCanonicalPendingDelivery()) return false;
+        if (this.pendingDiscoveryArchived) return false;
+        if (this.hasMaterializationBlockingCanonicalPendingDelivery()) {
+            // Input consumers stop here without reaching materializeNextPendingMessageSafely.
+            this.logMaterializationHeldByProviderCustody();
+            return false;
+        }
         return countMaterializablePendingRows(this.pendingQueueState) > 0;
     }
 
@@ -6168,10 +6318,12 @@ export class ApiSessionClient extends EventEmitter {
 
     async close() {
         logger.debug('[API] socket.close() called');
+        this.closeStarted = true;
         // Pending control RPCs can be waiting here; release archive admission before
         // draining RPC executions so closing cannot wait on its own lifetime abort.
         this.archiveAdmissionTermination.abort();
         this.clearPendingDiscoveryTimer();
+        this.clearPendingPublisherRecoveryDeadline();
         this.accountSettingsRetryAbortController?.abort();
         this.executionRunPermissionHandler?.reset();
         this.executionRunPermissionHandler = null;
@@ -6250,6 +6402,7 @@ export class ApiSessionClient extends EventEmitter {
         this.runtimeTerminationStarted = true;
         this.archiveAdmissionTermination.abort();
         this.clearPendingDiscoveryTimer();
+        this.clearPendingPublisherRecoveryDeadline();
         this.providerInputOutcomeProducerGeneration += 1;
         this.acceptedCanonicalPendingDeliveryOperationAbortController.abort();
     }
@@ -6570,6 +6723,11 @@ export class ApiSessionClient extends EventEmitter {
         ) {
             return { didMaterialize: false, result: { type: 'retryable_transport' } };
         }
+        if (this.pendingPublisherRecovery.state === 'publisher_lost') {
+            // Terminal until a new connection claims publisher status: the server refuses every
+            // claim on this one, so neither a wake nor a timer may retry it.
+            return { didMaterialize: false, result: { type: 'publisher_lost' } };
+        }
         let materializeResult: PendingQueueMaterializeNextResult;
         reportPendingMaterializationDiagnosticPhase(opts.onDiagnosticPhase, 'materialize.server_claim');
         if (serverContract.pendingInput === 'released_server_v0_2_1') {
@@ -6660,6 +6818,13 @@ export class ApiSessionClient extends EventEmitter {
                             : {}),
                     },
                 });
+                if (
+                    error instanceof PendingQueueMaterializationTransportAmbiguousError
+                    && error.classification === 'publisher_lost'
+                ) {
+                    this.observePendingPublisherLost(serverContract.sessionConnectionEpoch);
+                    return { didMaterialize: false, result: { type: 'publisher_lost' } };
+                }
                 return {
                     didMaterialize: false,
                     result: {
@@ -6673,6 +6838,8 @@ export class ApiSessionClient extends EventEmitter {
                     },
                 };
             }
+            // The server accepted this connection as the current publisher.
+            this.setPendingPublisherRecovery({ state: 'current' });
         }
         if (!isServerContractCurrent()) {
             return {
@@ -6965,8 +7132,14 @@ export class ApiSessionClient extends EventEmitter {
                 phase: supervisorState.phase,
             });
         }
+        if (this.pendingPublisherRecovery.state === 'publisher_lost') {
+            // Ahead of held custody: an input whose settlement this connection was refused stays
+            // held, and the wake must report the lost publisher rather than an empty queue.
+            return { type: 'publisher_lost' };
+        }
         reportPendingMaterializationDiagnosticPhase(opts.onDiagnosticPhase, 'materialize.delivery_reconcile');
         if (!await this.reconcileCanonicalPendingDeliveriesBeforeMaterialization()) {
+            this.logMaterializationHeldByProviderCustody();
             return { type: 'no_pending' };
         }
 

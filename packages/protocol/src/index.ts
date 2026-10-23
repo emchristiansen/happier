@@ -57,6 +57,8 @@ export {
 } from './connect/connectedServiceCredentialBinding.js';
 
 export {
+  PendingQueueWakeRunnerIncarnationV1Schema,
+  type PendingQueueWakeRunnerIncarnationV1,
   SessionPendingQueueLegacyMaterializeDeferredResponseV0Schema,
   SessionPendingQueueWakeCapabilityRequestV1Schema,
   SessionPendingQueueWakeCapabilityResponseV1Schema,
