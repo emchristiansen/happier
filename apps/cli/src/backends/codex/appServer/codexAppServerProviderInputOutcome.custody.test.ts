@@ -266,19 +266,28 @@ function emptyQueueMaterializeResult() {
 /**
  * Scripted Codex app-server. `turn/start` opens a turn that ends only when the test writes the
  * release file. `turn/steer` answers by the steer text: `steer-with-echo` succeeds and echoes the
- * correlated user message, `steer-without-echo` succeeds without the echo, and `steer-refused`
- * is answered with a JSON-RPC error.
+ * correlated user message, `steer-without-echo` and `steer-late-echo` succeed without the echo,
+ * and `steer-refused` is answered with a JSON-RPC error. For `steer-late-echo`, the exact
+ * user-message echo for the ended turn is sent only when the test writes the late-echo file.
  */
-async function startScriptedCodexAppServer(): Promise<Readonly<{ root: string; endActiveTurn: () => Promise<void> }>> {
+async function startScriptedCodexAppServer(): Promise<Readonly<{
+  root: string;
+  endActiveTurn: () => Promise<void>;
+  sendLateEcho: () => Promise<void>;
+}>> {
   const root = await createTempDir('happier-codex-outcome-custody-');
   tempRoots.push(root);
   const turnEndReleasePath = join(root, 'end-active-turn');
+  const lateEchoReleasePath = join(root, 'send-late-echo');
   const fakeAppServer = await writeFakeCodexAppServerScript({
     dir: root,
     importLines: ['import { readFile } from "node:fs/promises";'],
     setupLines: [
       `const turnEndReleasePath = ${JSON.stringify(turnEndReleasePath)};`,
+      `const lateEchoReleasePath = ${JSON.stringify(lateEchoReleasePath)};`,
       'const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");',
+      'const waitForFile = async (path) => { while (!(await readFile(path, "utf8").catch(() => ""))) await new Promise((resolve) => setTimeout(resolve, 5)); };',
+      'let lateEcho = null;',
     ],
     bodyLines: [
       'for await (const line of rl) {',
@@ -292,8 +301,11 @@ async function startScriptedCodexAppServer(): Promise<Readonly<{ root: string; e
       '    send({ id: msg.id, result: { turn: { id: "turn-1" }, threadId } });',
       '    send({ method: "turn/started", params: { threadId, turn: { id: "turn-1" } } });',
       '    void (async () => {',
-      '      while (!(await readFile(turnEndReleasePath, "utf8").catch(() => ""))) await new Promise((resolve) => setTimeout(resolve, 5));',
+      '      await waitForFile(turnEndReleasePath);',
       '      send({ method: "turn/completed", params: { threadId, turn: { id: "turn-1", status: "completed" } } });',
+      '      if (!lateEcho) return;',
+      '      await waitForFile(lateEchoReleasePath);',
+      '      send({ method: "item/started", params: { threadId, turnId: "turn-1", item: { id: "late-user-echo", type: "userMessage", clientId: lateEcho.clientId, content: lateEcho.input } } });',
       '    })();',
       '    continue;',
       '  }',
@@ -301,6 +313,7 @@ async function startScriptedCodexAppServer(): Promise<Readonly<{ root: string; e
       '    const text = String(msg.params?.input?.[0]?.text ?? "");',
       '    if (text === "steer-refused") { send({ id: msg.id, error: { code: -32000, message: "steer refused by Codex" } }); continue; }',
       '    send({ id: msg.id, result: { turnId: msg.params?.expectedTurnId ?? "turn-1" } });',
+      '    if (text === "steer-late-echo") lateEcho = { clientId: msg.params?.clientUserMessageId, input: msg.params?.input ?? [] };',
       '    if (text === "steer-with-echo") {',
       '      send({ method: "item/started", params: { threadId: msg.params?.threadId ?? "thread-1", turnId: "turn-1", item: { id: "user-echo", type: "userMessage", clientId: msg.params?.clientUserMessageId, content: msg.params?.input ?? [] } } });',
       '    }',
@@ -325,6 +338,9 @@ async function startScriptedCodexAppServer(): Promise<Readonly<{ root: string; e
     root,
     endActiveTurn: async () => {
       await writeFile(turnEndReleasePath, 'end');
+    },
+    sendLateEcho: async () => {
+      await writeFile(lateEchoReleasePath, 'echo');
     },
   };
 }
@@ -457,7 +473,7 @@ describe('Codex app-server provider-input outcomes reach Queue custody', () => {
     expect(blockReasonsFor(localId)).toEqual([]);
   });
 
-  it('blocks a steer Codex refused as undeliverable, not as an uncertain delivery', async () => {
+  it('blocks a steer Codex refused with an RPC error as uncertain, once, without a turn-end report', async () => {
     const localId = 'steer-refused-local';
     const client = await createCodexSessionClient();
     const { root, endActiveTurn } = await startScriptedCodexAppServer();
@@ -481,8 +497,71 @@ describe('Codex app-server provider-input outcomes reach Queue custody', () => {
     await endActiveTurn();
     await activeTurn;
 
-    expect(blockReasonsFor(localId)).toEqual(['provider_rejected_before_acceptance']);
-    expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(false);
+    // No source or protocol contract establishes that Codex's error answer to `turn/steer`
+    // means the input had no effect, so the refusal stays uncertain.
+    expect(blockReasonsFor(localId)).toEqual(['ambiguous_terminal_delivery']);
+    materializeNextMock.mockResolvedValueOnce(emptyQueueMaterializeResult());
+    await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+    expect(materializeNextMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries a failed uncertain block on the same live client until the server acknowledges it', async () => {
+    const localId = 'steer-uncertain-block-retried-local';
+    const client = await createCodexSessionClient();
+    const { root, endActiveTurn } = await startScriptedCodexAppServer();
+    const { runtime, activeTurn } = await startCodexRuntimeOnSession(client, root);
+    client.onUserMessage(async (message) => {
+      await runtime.steerPrompt(message.content.text, { localId: message.localId });
+    });
+    materializeNextMock.mockResolvedValueOnce(providerDeliveryMaterializeResult(localId, 'steer-without-echo'));
+    // The first block write fails in transport before the server changes the row.
+    blockPendingDeliveryMock.mockRejectedValueOnce(new Error('socket hang up'));
+
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+      .resolves.toMatchObject({ type: 'materialized', localId });
+    await waitUntil(() => client.hasCanonicalPendingProviderInputDelivery(localId));
+    await endActiveTurn();
+    await activeTurn;
+    await waitUntil(() => blockReasonsFor(localId).length === 1);
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+      .resolves.toEqual({ type: 'no_pending' });
+
+    // Transport has recovered; the same client writes the owed block again and releases the hold.
+    await waitUntil(() => blockReasonsFor(localId).length === 2, 5_000);
+    expect(blockReasonsFor(localId)).toEqual(['delivery_outcome_uncertain', 'delivery_outcome_uncertain']);
+    materializeNextMock.mockResolvedValueOnce(emptyQueueMaterializeResult());
+    await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+    expect(materializeNextMock).toHaveBeenCalledTimes(2);
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    expect(blockReasonsFor(localId)).toHaveLength(2);
+  });
+
+  it('settles an uncertain steer as accepted when Codex echoes it exactly after its turn ended', async () => {
+    const localId = 'steer-late-echo-local';
+    const client = await createCodexSessionClient();
+    const { root, endActiveTurn, sendLateEcho } = await startScriptedCodexAppServer();
+    const { runtime, activeTurn } = await startCodexRuntimeOnSession(client, root);
+    client.onUserMessage(async (message) => {
+      await runtime.steerPrompt(message.content.text, { localId: message.localId });
+    });
+    materializeNextMock.mockResolvedValueOnce(providerDeliveryMaterializeResult(localId, 'steer-late-echo'));
+
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+      .resolves.toMatchObject({ type: 'materialized', localId });
+    await waitUntil(() => client.hasCanonicalPendingProviderInputDelivery(localId));
+    await endActiveTurn();
+    await activeTurn;
+    await waitUntil(() => blockReasonsFor(localId).length > 0);
+    expect(blockReasonsFor(localId)).toEqual(['delivery_outcome_uncertain']);
+    expect(resolveAcceptedPendingDeliveryMock).not.toHaveBeenCalled();
+
+    // The echo names the same thread and the ended turn, which the history boundary has consumed.
+    await sendLateEcho();
+    await waitUntil(() => resolveAcceptedPendingDeliveryMock.mock.calls.length === 1);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledWith(expect.objectContaining({ localId }));
+    await waitUntil(() => !client.hasCanonicalPendingProviderInputDelivery(localId));
+    expect(client.hasPendingProviderInputAcceptance(localId)).toBe(true);
+    expect(blockReasonsFor(localId)).toEqual(['delivery_outcome_uncertain']);
   });
 });
 

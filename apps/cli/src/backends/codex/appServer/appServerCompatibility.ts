@@ -69,16 +69,9 @@ export function isCodexAppServerMethodNotFoundError(error: unknown): boolean {
  * establish that no provider-side effect occurred.
  */
 export function isCodexAppServerDefinitiveMethodNotFoundError(error: unknown, method: string): boolean {
-    return readCode(error) === -32601 && isCodexAppServerErrorResponseTo(error, method);
-}
-
-/**
- * True only for a JSON-RPC error response that Codex correlated with a request to `method`.
- * Transport, timeout and process failures never satisfy it, so it proves Codex answered.
- */
-export function isCodexAppServerErrorResponseTo(error: unknown, method: string): boolean {
     if (!error || typeof error !== 'object') return false;
-    return (error as { method?: unknown }).method === method
+    return readCode(error) === -32601
+        && (error as { method?: unknown }).method === method
         && (error as { [CODEX_APP_SERVER_RPC_ERROR]?: unknown })[CODEX_APP_SERVER_RPC_ERROR] === true;
 }
 
