@@ -26,6 +26,7 @@ import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '../connectedServic
 import { normalizeMaterializationKeyForPath } from '../materialize/normalizeMaterializationKeyForPath';
 import { buildDefaultConnectedServiceCredentialLifecycleDescriptor } from '../credentials/lifecycleTypes';
 import { ConnectedServiceRuntimeRegistry } from '../runtimeRegistry/registry';
+import { ConnectedServiceSessionAuthSwitchLockRegistry } from '../runtimeAuth/connectedServiceSessionAuthSwitchCore';
 import { resolveConnectedServiceCredentialLifecycleDescriptor } from '@/backends/catalog';
 import { computeConnectedServiceAccessTokenFingerprint } from './credentialFreshness/tokenFingerprint';
 
@@ -2121,6 +2122,81 @@ afterEach(() => {
     }
 
     expect(harness.onAuthUpdated).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets a runtime-auth refresh that holds its session lock adopt a rotation whose distribution waits for that lock', async () => {
+    // Incident 2026-10-22: the runtime-auth failure handler holds session S's auth lock while it forces
+    // a refresh. A rotation already in flight distributes through `onAuthUpdated`, which applies the
+    // credential under each session's lock, S included. If the forced refresh awaits that
+    // distribution, neither side can finish: the binding stays in flight for good.
+    const harness = await buildGroupHomeOwnershipHarness();
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        access_token: 'rotated-access',
+        refresh_token: 'rotated-refresh',
+        expires_in: 3600,
+      }),
+    })) as unknown as typeof fetch);
+    const sessionId = 'session-group-owner-a';
+    const locks = new ConnectedServiceSessionAuthSwitchLockRegistry();
+    const applications: string[] = [];
+    let observeDistributionAtSessionLock!: () => void;
+    const distributionAtSessionLock = new Promise<void>((resolve) => {
+      observeDistributionAtSessionLock = resolve;
+    });
+    let authUpdatedCalls = 0;
+    // The live application owner applies under each session's auth lock (`switchSessionConnectedServiceAuth`).
+    harness.onAuthUpdated.mockImplementation(async (event: Readonly<{
+      affectedTargets: ReadonlyArray<Readonly<{ sessionId?: string | null }>>;
+    }>) => {
+      authUpdatedCalls += 1;
+      const caller = authUpdatedCalls === 1 ? 'distribution' : 'runtime-auth';
+      for (const target of event.affectedTargets) {
+        if (!target.sessionId) continue;
+        if (caller === 'distribution') observeDistributionAtSessionLock();
+        await locks.runExclusive(target.sessionId, async () => {
+          applications.push(`${caller}:${target.sessionId}`);
+        });
+      }
+    });
+
+    let runtimeAuthResult: unknown = null;
+    let observeHolderEntered!: () => void;
+    const holderEntered = new Promise<void>((resolve) => {
+      observeHolderEntered = resolve;
+    });
+    const runtimeAuthHandler = locks.runExclusive(sessionId, async () => {
+      observeHolderEntered();
+      await distributionAtSessionLock;
+      runtimeAuthResult = await harness.coordinator.refreshConnectedServiceCredentialForRuntimeAuthFailure({
+        serviceId: 'claude-subscription',
+        profileId: 'workA',
+        sessionId,
+      });
+    });
+    await holderEntered;
+    const rotation = harness.coordinator.refreshConnectedServiceCredentialForSpawnPreflight({
+      serviceId: 'claude-subscription',
+      profileId: 'workA',
+      force: true,
+    });
+
+    // Before the fix this never settles (the test times out): the handler awaits the rotation's
+    // whole distribution, and the distribution waits for the handler's lock.
+    await runtimeAuthHandler;
+    expect(runtimeAuthResult).toMatchObject({
+      status: 'refreshed',
+      credential: expect.objectContaining({
+        oauth: expect.objectContaining({ accessToken: 'rotated-access' }),
+      }),
+    });
+    await expect(rotation).resolves.toMatchObject({ status: 'refreshed' });
+    expect(applications).toEqual([
+      `runtime-auth:${sessionId}`,
+      `distribution:${sessionId}`,
+    ]);
+    expect(harness.api.registerConnectedServiceCredentialSealed).toHaveBeenCalledTimes(1);
   });
 
   it('retains a pending rotation across scheduled ticks without rotating it again', async () => {
