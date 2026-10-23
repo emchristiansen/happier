@@ -569,11 +569,10 @@ const PENDING_DISCOVERY_FAST_READ_MS = 1_000;
 const PENDING_DISCOVERY_SLOW_READ_MS = 2_000;
 // Backstop for a provider that takes an input and never reports its outcome. While the session
 // is idle, a held input with no outcome is treated as uncertain after this long, so the Queue
-// cannot wait forever. It must outlast the slowest legitimate idle path from hand-off to provider
-// acceptance: a Codex runner's cold thread resume runs under a 120 s default recovery budget
-// (`readCodexAppServerResumeRecoveryTimeoutMs`), and in the 2026-10-21 and 2026-10-22 runner logs
-// no session's first input took longer than 25 s from its hold to its acceptance. A late
-// acceptance still settles the input.
+// cannot wait forever. The value is a heuristic, not a bound on legitimate waits: Codex
+// `thread/resume`, `turn/start` and `turn/steer` have no request timeout. In the 2026-10-21 and
+// 2026-10-22 runner logs no session's first input took longer than 25 s from its hold to its
+// acceptance. A later exact acceptance still settles the input.
 export const PROVIDER_INPUT_OUTCOME_IDLE_GRACE_MS = 180_000;
 type SessionSnapshotReadResult =
     | Readonly<{ status: 'readable'; elapsedMs: number; pendingQueueState: KnownPendingQueueState | null; archived: boolean }>

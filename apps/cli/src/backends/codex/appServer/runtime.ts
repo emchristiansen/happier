@@ -1665,8 +1665,12 @@ export function createCodexAppServerRuntime(params: Readonly<{
     ): void => {
         const clientUserMessageId = readProviderUserMessageClientId(notificationParams);
         if (!clientUserMessageId) return;
+        // A steer already reported uncertain is accepted only by `acceptLateEchoOfUncertainSteer`,
+        // whose exact generation, thread and turn match this local-ID-only search cannot provide.
         const pending = Array.from(pendingProviderPrompts).find(
-            (candidate) => candidate.localIds?.length === 1 && candidate.localIds[0] === clientUserMessageId,
+            (candidate) => candidate.phase.kind !== 'outcome_uncertain'
+                && candidate.localIds?.length === 1
+                && candidate.localIds[0] === clientUserMessageId,
         );
         markPendingProviderPromptAccepted(pending, rawProviderTurnId);
     };

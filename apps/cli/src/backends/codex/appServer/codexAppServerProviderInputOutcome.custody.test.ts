@@ -1,4 +1,4 @@
-import { writeFile } from 'node:fs/promises';
+import { mkdir, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -263,31 +263,58 @@ function emptyQueueMaterializeResult() {
   };
 }
 
+type ScriptedUserMessageEcho = Readonly<{
+  localId: string;
+  /** Omitted fields are left out of the notification, as an incomplete provider echo would. */
+  threadId?: string;
+  turnId?: string;
+}>;
+
 /**
- * Scripted Codex app-server. `turn/start` opens a turn that ends only when the test writes the
- * release file. `turn/steer` answers by the steer text: `steer-with-echo` succeeds and echoes the
- * correlated user message, `steer-without-echo` and `steer-late-echo` succeed without the echo,
- * and `steer-refused` is answered with a JSON-RPC error. For `steer-late-echo`, the exact
- * user-message echo for the ended turn is sent only when the test writes the late-echo file.
+ * Scripted Codex app-server. Each `turn/start` opens `turn-<n>` (counted per process) on
+ * `thread-1` and leaves it running; the test ends turns and delivers later notifications by
+ * injecting them. `turn/steer` answers by the steer text: `steer-with-echo` succeeds and echoes
+ * the correlated user message, `steer-refused` is answered with a JSON-RPC error, and any other
+ * text succeeds without an echo.
  */
 async function startScriptedCodexAppServer(): Promise<Readonly<{
   root: string;
+  endTurn: (turnId: string) => Promise<void>;
   endActiveTurn: () => Promise<void>;
-  sendLateEcho: () => Promise<void>;
+  echoUserMessage: (echo: ScriptedUserMessageEcho) => Promise<void>;
 }>> {
   const root = await createTempDir('happier-codex-outcome-custody-');
   tempRoots.push(root);
-  const turnEndReleasePath = join(root, 'end-active-turn');
-  const lateEchoReleasePath = join(root, 'send-late-echo');
+  const injectDir = join(root, 'inject');
+  await mkdir(injectDir);
+  let injected = 0;
+  const inject = async (message: unknown) => {
+    injected += 1;
+    const name = String(injected).padStart(6, '0');
+    await writeFile(join(injectDir, `${name}.tmp`), JSON.stringify(message));
+    await rename(join(injectDir, `${name}.tmp`), join(injectDir, `${name}.json`));
+  };
   const fakeAppServer = await writeFakeCodexAppServerScript({
     dir: root,
-    importLines: ['import { readFile } from "node:fs/promises";'],
+    importLines: ['import { readdir, readFile, unlink } from "node:fs/promises";'],
     setupLines: [
-      `const turnEndReleasePath = ${JSON.stringify(turnEndReleasePath)};`,
-      `const lateEchoReleasePath = ${JSON.stringify(lateEchoReleasePath)};`,
+      `const injectDir = ${JSON.stringify(injectDir)};`,
       'const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");',
-      'const waitForFile = async (path) => { while (!(await readFile(path, "utf8").catch(() => ""))) await new Promise((resolve) => setTimeout(resolve, 5)); };',
-      'let lateEcho = null;',
+      'let turnCount = 0;',
+      'let draining = false;',
+      'setInterval(async () => {',
+      '  if (draining) return;',
+      '  draining = true;',
+      '  try {',
+      '    const names = (await readdir(injectDir)).filter((name) => name.endsWith(".json")).sort();',
+      '    for (const name of names) {',
+      '      const path = injectDir + "/" + name;',
+      '      const text = await readFile(path, "utf8");',
+      '      await unlink(path);',
+      '      process.stdout.write(text + "\\n");',
+      '    }',
+      '  } finally { draining = false; }',
+      '}, 5);',
     ],
     bodyLines: [
       'for await (const line of rl) {',
@@ -297,25 +324,20 @@ async function startScriptedCodexAppServer(): Promise<Readonly<{
       '  if (msg.method === "initialized") continue;',
       '  if (msg.method === "thread/start") { send({ id: msg.id, result: { threadId: "thread-1", model: "gpt-5.4", serviceTier: null } }); continue; }',
       '  if (msg.method === "turn/start") {',
+      '    turnCount += 1;',
+      '    const turnId = "turn-" + turnCount;',
       '    const threadId = msg.params?.threadId ?? "thread-1";',
-      '    send({ id: msg.id, result: { turn: { id: "turn-1" }, threadId } });',
-      '    send({ method: "turn/started", params: { threadId, turn: { id: "turn-1" } } });',
-      '    void (async () => {',
-      '      await waitForFile(turnEndReleasePath);',
-      '      send({ method: "turn/completed", params: { threadId, turn: { id: "turn-1", status: "completed" } } });',
-      '      if (!lateEcho) return;',
-      '      await waitForFile(lateEchoReleasePath);',
-      '      send({ method: "item/started", params: { threadId, turnId: "turn-1", item: { id: "late-user-echo", type: "userMessage", clientId: lateEcho.clientId, content: lateEcho.input } } });',
-      '    })();',
+      '    send({ id: msg.id, result: { turn: { id: turnId }, threadId } });',
+      '    send({ method: "turn/started", params: { threadId, turn: { id: turnId } } });',
       '    continue;',
       '  }',
       '  if (msg.method === "turn/steer") {',
       '    const text = String(msg.params?.input?.[0]?.text ?? "");',
       '    if (text === "steer-refused") { send({ id: msg.id, error: { code: -32000, message: "steer refused by Codex" } }); continue; }',
-      '    send({ id: msg.id, result: { turnId: msg.params?.expectedTurnId ?? "turn-1" } });',
-      '    if (text === "steer-late-echo") lateEcho = { clientId: msg.params?.clientUserMessageId, input: msg.params?.input ?? [] };',
+      '    const turnId = msg.params?.expectedTurnId ?? "turn-" + turnCount;',
+      '    send({ id: msg.id, result: { turnId } });',
       '    if (text === "steer-with-echo") {',
-      '      send({ method: "item/started", params: { threadId: msg.params?.threadId ?? "thread-1", turnId: "turn-1", item: { id: "user-echo", type: "userMessage", clientId: msg.params?.clientUserMessageId, content: msg.params?.input ?? [] } } });',
+      '      send({ method: "item/started", params: { threadId: msg.params?.threadId ?? "thread-1", turnId, item: { id: "user-echo", type: "userMessage", clientId: msg.params?.clientUserMessageId, content: msg.params?.input ?? [] } } });',
       '    }',
       '    continue;',
       '  }',
@@ -334,13 +356,24 @@ async function startScriptedCodexAppServer(): Promise<Readonly<{
     [HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_ENV_KEY]: undefined,
     [HAPPIER_SPAWN_EXPLICIT_ENV_KEYS_JSON_ENV_VAR]: undefined,
   });
+  const endTurn = async (turnId: string) => {
+    await inject({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: turnId, status: 'completed' } } });
+  };
   return {
     root,
+    endTurn,
     endActiveTurn: async () => {
-      await writeFile(turnEndReleasePath, 'end');
+      await endTurn('turn-1');
     },
-    sendLateEcho: async () => {
-      await writeFile(lateEchoReleasePath, 'echo');
+    echoUserMessage: async ({ localId, threadId, turnId }) => {
+      await inject({
+        method: 'item/started',
+        params: {
+          ...(threadId ? { threadId } : {}),
+          ...(turnId ? { turnId } : {}),
+          item: { id: `user-echo-${localId}-${injected + 1}`, type: 'userMessage', clientId: localId, content: [] },
+        },
+      });
     },
   };
 }
@@ -354,7 +387,9 @@ async function startCodexRuntimeOnSession(client: ApiSessionClient, root: string
     session: client,
   });
   runtimes.push(runtime);
+  const providerAcceptances: Array<Readonly<{ localIds?: readonly string[] | null; providerTurnId: string }>> = [];
   runtime.setOnPromptAcceptedByProvider(({ localIds, providerTurnId }) => {
+    providerAcceptances.push({ localIds, providerTurnId });
     bridge.observeAccepted({ localIds, providerTurnId });
   });
   runtime.setOnPromptsEffectMayHaveOccurred?.((prompts) => {
@@ -363,7 +398,7 @@ async function startCodexRuntimeOnSession(client: ApiSessionClient, root: string
   await runtime.startOrLoad({});
   const activeTurn = runtime.sendPrompt('opening prompt');
   await waitUntil(() => runtime.canSteerPrompt());
-  return { runtime, activeTurn };
+  return { runtime, activeTurn, providerAcceptances };
 }
 
 function blockReasonsFor(localId: string): unknown[] {
@@ -539,12 +574,12 @@ describe('Codex app-server provider-input outcomes reach Queue custody', () => {
   it('settles an uncertain steer as accepted when Codex echoes it exactly after its turn ended', async () => {
     const localId = 'steer-late-echo-local';
     const client = await createCodexSessionClient();
-    const { root, endActiveTurn, sendLateEcho } = await startScriptedCodexAppServer();
+    const { root, endActiveTurn, echoUserMessage } = await startScriptedCodexAppServer();
     const { runtime, activeTurn } = await startCodexRuntimeOnSession(client, root);
     client.onUserMessage(async (message) => {
       await runtime.steerPrompt(message.content.text, { localId: message.localId });
     });
-    materializeNextMock.mockResolvedValueOnce(providerDeliveryMaterializeResult(localId, 'steer-late-echo'));
+    materializeNextMock.mockResolvedValueOnce(providerDeliveryMaterializeResult(localId, 'steer-without-echo'));
 
     await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
       .resolves.toMatchObject({ type: 'materialized', localId });
@@ -556,12 +591,87 @@ describe('Codex app-server provider-input outcomes reach Queue custody', () => {
     expect(resolveAcceptedPendingDeliveryMock).not.toHaveBeenCalled();
 
     // The echo names the same thread and the ended turn, which the history boundary has consumed.
-    await sendLateEcho();
+    await echoUserMessage({ localId, threadId: 'thread-1', turnId: 'turn-1' });
     await waitUntil(() => resolveAcceptedPendingDeliveryMock.mock.calls.length === 1);
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledWith(expect.objectContaining({ localId }));
     await waitUntil(() => !client.hasCanonicalPendingProviderInputDelivery(localId));
     expect(client.hasPendingProviderInputAcceptance(localId)).toBe(true);
     expect(blockReasonsFor(localId)).toEqual(['delivery_outcome_uncertain']);
+  });
+
+  /** Steer L into turn-1 without an echo, end turn-1, and wait until L is blocked as uncertain. */
+  async function leaveSteerUncertainAfterItsTurn(localId: string) {
+    const client = await createCodexSessionClient();
+    const fake = await startScriptedCodexAppServer();
+    const composed = await startCodexRuntimeOnSession(client, fake.root);
+    client.onUserMessage(async (message) => {
+      await composed.runtime.steerPrompt(message.content.text, { localId: message.localId });
+    });
+    materializeNextMock.mockResolvedValueOnce(providerDeliveryMaterializeResult(localId, 'steer-without-echo'));
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+      .resolves.toMatchObject({ type: 'materialized', localId });
+    await fake.endTurn('turn-1');
+    await composed.activeTurn;
+    await waitUntil(() => blockReasonsFor(localId).length > 0);
+    expect(blockReasonsFor(localId)).toEqual(['delivery_outcome_uncertain']);
+    return { client, fake, ...composed };
+  }
+
+  function expectStillUncertain(
+    client: ApiSessionClient,
+    localId: string,
+    providerAcceptances: ReadonlyArray<Readonly<{ localIds?: readonly string[] | null }>>,
+  ): void {
+    expect(providerAcceptances.filter((acceptance) => acceptance.localIds?.includes(localId))).toEqual([]);
+    expect(resolveAcceptedPendingDeliveryMock).not.toHaveBeenCalled();
+    expect(client.hasPendingProviderInputAcceptance(localId)).toBe(false);
+    expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
+    expect(blockReasonsFor(localId)).toEqual(['delivery_outcome_uncertain']);
+  }
+
+  it('does not accept an uncertain steer from an echo that names the successor turn', async () => {
+    const localId = 'uncertain-successor-turn-echo-local';
+    const { client, fake, runtime, providerAcceptances } = await leaveSteerUncertainAfterItsTurn(localId);
+    const successorTurn = runtime.sendPrompt('successor prompt');
+    await waitUntil(() => runtime.canSteerPrompt());
+
+    await fake.echoUserMessage({ localId, threadId: 'thread-1', turnId: 'turn-2' });
+    await fake.endTurn('turn-2');
+    await successorTurn;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    expectStillUncertain(client, localId, providerAcceptances);
+  });
+
+  it('does not accept an uncertain steer from an echo without thread or turn while a successor turn runs', async () => {
+    const localId = 'uncertain-identityless-echo-local';
+    const { client, fake, runtime, providerAcceptances } = await leaveSteerUncertainAfterItsTurn(localId);
+    const successorTurn = runtime.sendPrompt('successor prompt');
+    await waitUntil(() => runtime.canSteerPrompt());
+
+    await fake.echoUserMessage({ localId });
+    await fake.endTurn('turn-2');
+    await successorTurn;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    expectStillUncertain(client, localId, providerAcceptances);
+  });
+
+  it('does not accept an uncertain steer from an exact echo delivered on a later client generation', async () => {
+    const localId = 'uncertain-later-generation-echo-local';
+    const { client, fake, runtime, providerAcceptances } = await leaveSteerUncertainAfterItsTurn(localId);
+    // A new app-server client: its first turn reuses the identities thread-1 and turn-1.
+    await runtime.reset();
+    await runtime.startOrLoad({});
+    const laterTurn = runtime.sendPrompt('later-generation prompt');
+    await waitUntil(() => runtime.canSteerPrompt());
+
+    await fake.echoUserMessage({ localId, threadId: 'thread-1', turnId: 'turn-1' });
+    await fake.endTurn('turn-1');
+    await laterTurn;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    expectStillUncertain(client, localId, providerAcceptances);
   });
 });
 
