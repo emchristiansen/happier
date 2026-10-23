@@ -24,6 +24,12 @@ import {
  * - machine revoke deleting its access keys (`machinesRoutes.ts`) → `invalidateSessionRelayAuthorizationForMachine`
  * - session delete (`deleteOwnedSession.ts`) → `invalidateSessionRelayAuthorizationForSession`
  *
+ * Every invalidation runs in `afterTx`, after the revoking write commits. A fill whose reads started
+ * before that commit may have read the pre-revocation state, so a cache-wide invalidation count is
+ * captured when a fill starts reading and the fill is stored only if no invalidation of any key ran
+ * since. The in-flight call still answers from what it read (that state held when it started); only
+ * the cache refill is refused, so a revocation cannot be undone for the TTL by a read that straddled it.
+ *
  * In multi-process deployments the eager invalidation is process-local; the TTL bounds staleness to
  * `SESSION_RELAY_AUTH_CACHE_TTL_MS`, the same guarantee `activityCache` already provides for
  * `session-alive`. Relay authorization is only cached for sockets whose handshake proof succeeded.
@@ -38,6 +44,12 @@ type SessionRelayAuthCacheEntry = Readonly<{
 }>;
 
 const relayAuthCache = new Map<string, SessionRelayAuthCacheEntry>();
+
+// Cache-wide count of invalidations. It fences fills only, not stored entries: a fill that captured an
+// older count is not stored. Cache-wide rather than per key so the fence needs no bookkeeping that
+// could miss a key; invalidations are rare (share changes, session delete, machine revoke), and a
+// refused fill only costs the next call one more verification.
+let relayAuthInvalidations = 0;
 
 function createRelayAuthCacheKey(userId: string, sessionId: string, machineId: string): string {
     return `${userId}\u0000${sessionId}\u0000${machineId}`;
@@ -99,6 +111,7 @@ export async function authorizeSessionScopedMachineBinding(params: Readonly<{
         return cached.participantUserIds;
     }
     pruneExpiredRelayAuthEntries(nowMs);
+    const invalidationsAtFillStart = relayAuthInvalidations;
 
     if (!await hasCurrentSessionScopedMachineAccess({
         accountId: params.accountId,
@@ -118,17 +131,20 @@ export async function authorizeSessionScopedMachineBinding(params: Readonly<{
         return null;
     }
 
-    relayAuthCache.set(cacheKey, {
-        validUntil: nowMs + SESSION_RELAY_AUTH_CACHE_TTL_MS,
-        sessionId: params.sessionId,
-        machineId: params.machineId,
-        participantUserIds,
-    });
+    if (relayAuthInvalidations === invalidationsAtFillStart) {
+        relayAuthCache.set(cacheKey, {
+            validUntil: nowMs + SESSION_RELAY_AUTH_CACHE_TTL_MS,
+            sessionId: params.sessionId,
+            machineId: params.machineId,
+            participantUserIds,
+        });
+    }
     return participantUserIds;
 }
 
 /** Drop cached relay authorizations for a session (share change, session delete). */
 export function invalidateSessionRelayAuthorizationForSession(sessionId: string): void {
+    relayAuthInvalidations += 1;
     for (const [key, entry] of relayAuthCache) {
         if (entry.sessionId === sessionId) {
             relayAuthCache.delete(key);
@@ -138,6 +154,7 @@ export function invalidateSessionRelayAuthorizationForSession(sessionId: string)
 
 /** Drop cached relay authorizations for a machine (machine revoke deletes its access keys). */
 export function invalidateSessionRelayAuthorizationForMachine(machineId: string): void {
+    relayAuthInvalidations += 1;
     for (const [key, entry] of relayAuthCache) {
         if (entry.machineId === machineId) {
             relayAuthCache.delete(key);
@@ -147,5 +164,6 @@ export function invalidateSessionRelayAuthorizationForMachine(machineId: string)
 
 /** Reset all cached relay authorizations (tests, shutdown). */
 export function clearSessionRelayAuthorizationCache(): void {
+    relayAuthInvalidations += 1;
     relayAuthCache.clear();
 }

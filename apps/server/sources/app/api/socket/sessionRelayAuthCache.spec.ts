@@ -312,4 +312,81 @@ describe("sessionRelayAuthCache", () => {
 
         expect(checkSessionAccess).toHaveBeenCalledTimes(1);
     });
+
+    describe("a fill that was reading when an invalidation ran", () => {
+        function deferred<T>() {
+            let resolve!: (value: T) => void;
+            const promise = new Promise<T>((r) => {
+                resolve = r;
+            });
+            return { promise, resolve };
+        }
+
+        async function startFillHeldAtParticipantLookup() {
+            const { authorizeSessionRelayPublish } = await loadModule();
+            const socket = createBoundSocket();
+            const params = {
+                socket: socket as any,
+                connection: createConnection(socket) as any,
+                userId: "u1",
+                sessionId: "s1",
+            };
+            const participants = deferred<string[]>();
+            const participantLookupStarted = deferred<void>();
+            getSessionParticipantUserIds.mockImplementationOnce(async () => {
+                participantLookupStarted.resolve();
+                return await participants.promise;
+            });
+            const inFlight = authorizeSessionRelayPublish(params);
+            // The fill has read the access key and owner access (pre-revocation state) and is waiting
+            // on its last read when the revoking write commits and its afterTx invalidation runs.
+            await participantLookupStarted.promise;
+            return { authorizeSessionRelayPublish, params, participants, inFlight };
+        }
+
+        it("does not refill a grant that a machine revocation invalidated while it was reading", async () => {
+            const { invalidateSessionRelayAuthorizationForMachine } = await loadModule();
+            const fill = await startFillHeldAtParticipantLookup();
+            accessKeyFindUnique.mockResolvedValue(null); // the revocation deleted the access key
+            invalidateSessionRelayAuthorizationForMachine("m1");
+            fill.participants.resolve(["u1", "u2"]);
+            // The in-flight call answers from the state it read, which held when it started.
+            await expect(fill.inFlight).resolves.toEqual(["u1", "u2"]);
+
+            await expect(fill.authorizeSessionRelayPublish(fill.params)).resolves.toBeNull();
+            expect(accessKeyFindUnique).toHaveBeenCalledTimes(2);
+        });
+
+        it("does not refill a grant that a session invalidation (share revoke, delete) invalidated while it was reading", async () => {
+            const { invalidateSessionRelayAuthorizationForSession } = await loadModule();
+            const fill = await startFillHeldAtParticipantLookup();
+            checkSessionAccess.mockResolvedValue(null); // e.g. the session was deleted
+            invalidateSessionRelayAuthorizationForSession("s1");
+            fill.participants.resolve(["u1", "u2"]);
+            await fill.inFlight;
+
+            await expect(fill.authorizeSessionRelayPublish(fill.params)).resolves.toBeNull();
+            expect(checkSessionAccess).toHaveBeenCalledTimes(2);
+        });
+
+        it("drops the fill even when the invalidation named another session, and re-verifies next time", async () => {
+            const { invalidateSessionRelayAuthorizationForSession } = await loadModule();
+            const fill = await startFillHeldAtParticipantLookup();
+            invalidateSessionRelayAuthorizationForSession("s-other");
+            fill.participants.resolve(["u1", "u2"]);
+            await fill.inFlight;
+
+            await expect(fill.authorizeSessionRelayPublish(fill.params)).resolves.toEqual(["u1", "u2"]);
+            expect(accessKeyFindUnique).toHaveBeenCalledTimes(2);
+        });
+
+        it("still caches a fill that no invalidation overlapped", async () => {
+            const fill = await startFillHeldAtParticipantLookup();
+            fill.participants.resolve(["u1", "u2"]);
+            await fill.inFlight;
+
+            await expect(fill.authorizeSessionRelayPublish(fill.params)).resolves.toEqual(["u1", "u2"]);
+            expect(accessKeyFindUnique).toHaveBeenCalledTimes(1);
+        });
+    });
 });
