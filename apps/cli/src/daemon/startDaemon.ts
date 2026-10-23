@@ -344,9 +344,11 @@ import { shouldCommitAutomaticGroupApplySessionEvent } from './connectedServices
 import { commitConnectedServiceRuntimeAuthRecoverySessionEvent } from './connectedServices/runtimeAuth/commitConnectedServiceRuntimeAuthRecoverySessionEvent';
 import { ConnectedServiceRuntimeAuthSwitchAttemptTracker } from './connectedServices/runtimeAuth/ConnectedServiceRuntimeAuthSwitchAttemptTracker';
 import {
+  ConnectedServiceSessionAuthSwitchLockRegistry,
   createConnectedServiceSessionAuthSwitchCore,
   type ConnectedServiceSessionAuthSwitchReason,
 } from './connectedServices/runtimeAuth/connectedServiceSessionAuthSwitchCore';
+import { findConnectedServiceChildSelection } from './connectedServices/connectedServiceChildEnvironment';
 import { buildConnectedServiceRuntimeAuthSwitchAttemptLogContext } from './connectedServices/runtimeAuth/buildConnectedServiceRuntimeAuthSwitchAttemptLogContext';
 import {
   RuntimeAuthRecoveryScheduler,
@@ -2012,7 +2014,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           { min: 1_000, max: 24 * 60 * 60_000 },
         ),
       });
-      const connectedServiceSessionAuthSwitchCore = createConnectedServiceSessionAuthSwitchCore();
+      const connectedServiceSessionAuthSwitchLocks = new ConnectedServiceSessionAuthSwitchLockRegistry();
+      const connectedServiceSessionAuthSwitchCore = createConnectedServiceSessionAuthSwitchCore({
+        locks: connectedServiceSessionAuthSwitchLocks,
+      });
       const inactiveUsageLimitRecoveryCheckOwner = createInactiveUsageLimitRecoveryCheckOwner();
       const inactiveUsageLimitRecoveryRunnerUnavailableRetryDelayMs = resolvePositiveIntEnv(
         process.env.HAPPIER_USAGE_LIMIT_RECOVERY_RUNNER_UNAVAILABLE_RETRY_DELAY_MS,
@@ -7471,6 +7476,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       > = createRefreshedConnectedServiceAuthUpdatedHandler({
         applyRefreshedAuth: applyRefreshedConnectedServiceAuth,
         restartAfterAuthUpdated,
+        sessionLocks: connectedServiceSessionAuthSwitchLocks,
+        // The live switch owner rewrites this environment when it switches the session.
+        readCurrentSelection: (sessionId, serviceId) => {
+          const tracked = getCurrentChildren().find((child) => child.happySessionId === sessionId);
+          return tracked
+            ? findConnectedServiceChildSelection(tracked.spawnOptions?.environmentVariables ?? {}, serviceId)
+            : null;
+        },
         onRestartRequired: (diagnostic) => {
           logger.warn(
             '[DAEMON RUN] Refreshed connected-service credential could not be hot-applied; left to the lifecycle restart policy',
