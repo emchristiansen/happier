@@ -12,13 +12,10 @@ import { findHappyProcessByPid } from '../doctor';
 import type { TrackedSession } from '../types';
 import { hashProcessCommand, writeSessionMarker } from '../sessionRegistry';
 import { buildSessionRunnerRespawnDescriptorV1FromSpawnOptions } from '../processSupervision/sessionRunnerRespawnDescriptor';
+import { isPidPlaceholderSessionId } from './pidPlaceholderSessionId';
 
 const DEFAULT_PARENT_PID_LOOKUP_TIMEOUT_MS = 1000;
 const PARENT_PID_LOOKUP_TIMEOUT_ENV_KEY = 'HAPPIER_DAEMON_PARENT_PID_LOOKUP_TIMEOUT_MS';
-
-function isPidPlaceholderSessionId(value: string): boolean {
-  return /^PID-\d+$/.test(value);
-}
 
 function adoptReportedHappySessionId(tracked: TrackedSession, reportedSessionId: string): string {
   const currentSessionId = normalizeNonEmptyString(tracked.happySessionId);

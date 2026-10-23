@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS,
+  DAEMON_STARTED_REPORT_ATTEMPT_TIMEOUT_MS,
   primeAgentStateForUi,
   reportSessionToDaemonIfRunning,
   resolveTerminalAttachmentPersistenceBinding,
@@ -239,7 +241,7 @@ describe('startup side effects: daemon session reporting retry', () => {
       },
     );
 
-    expect(observedTimeouts).toEqual([2_500, 10_000]);
+    expect(observedTimeouts).toEqual([2_500, DAEMON_STARTED_REPORT_ATTEMPT_TIMEOUT_MS]);
   });
 
   it('uses a longer default retry window for daemon-started sessions', async () => {
@@ -279,6 +281,101 @@ describe('startup side effects: daemon session reporting retry', () => {
         retryTimeoutMs: 0,
       },
     )).rejects.toThrow('Claude runtime readiness was not acknowledged by the daemon');
+  });
+
+  it('keeps a daemon-started runner waiting while a slow daemon still answers readiness', async () => {
+    // 2026-10-23: the daemon answered /session-started only after its 15 s account-profile check,
+    // so every 10 s attempt timed out and a runner whose daemon was alive exited FATAL after 90 s.
+    const daemonAccountCheckMs = 15_000;
+    const serverRecoversAtMs = 4 * 60_000;
+    let now = 0;
+    let answeredAttempts = 0;
+
+    await expect(reportSessionToDaemonIfRunning(
+      {
+        sessionId: 'session-slow-daemon',
+        metadata: { startedBy: 'daemon' } as Metadata,
+        requireDaemonAck: true,
+      },
+      {
+        notifyDaemonSessionStartedFn: async (_sessionId, _metadata, options) => {
+          const attemptTimeoutMs = options?.timeoutMs ?? 0;
+          if (attemptTimeoutMs <= daemonAccountCheckMs) {
+            now += attemptTimeoutMs;
+            return { error: 'Request failed: /session-started, The operation was aborted due to timeout' };
+          }
+          now += daemonAccountCheckMs;
+          answeredAttempts += 1;
+          if (now < serverRecoversAtMs) {
+            return {
+              error: 'Request failed: /session-started, HTTP 503 (session_startup_reconciliation_failed)',
+              errorCode: 'session_startup_reconciliation_failed',
+            };
+          }
+          return { status: 'ok' };
+        },
+        sleepFn: async (ms) => {
+          now += ms;
+        },
+        nowFn: () => now,
+      },
+    )).resolves.toBeUndefined();
+    expect(answeredAttempts).toBeGreaterThan(1);
+    expect(now).toBeGreaterThanOrEqual(serverRecoversAtMs);
+  });
+
+  it('gives up on a daemon that keeps answering readiness failures once the total ceiling passes', async () => {
+    let now = 0;
+
+    await expect(reportSessionToDaemonIfRunning(
+      {
+        sessionId: 'session-never-ready',
+        metadata: { startedBy: 'daemon' } as Metadata,
+        requireDaemonAck: true,
+      },
+      {
+        notifyDaemonSessionStartedFn: async () => {
+          now += 1_000;
+          return {
+            error: 'Request failed: /session-started, HTTP 503 (session_startup_reconciliation_pending)',
+            errorCode: 'session_startup_reconciliation_pending',
+          };
+        },
+        sleepFn: async (ms) => {
+          now += ms;
+        },
+        nowFn: () => now,
+      },
+    )).rejects.toThrow('Claude runtime readiness was not acknowledged by the daemon');
+    expect(now).toBeGreaterThanOrEqual(DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS);
+    expect(now).toBeLessThan(DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS + 5_000);
+  });
+
+  it('still fails a daemon-started runner whose daemon never answers', async () => {
+    let now = 0;
+    let attempts = 0;
+
+    await expect(reportSessionToDaemonIfRunning(
+      {
+        sessionId: 'session-dead-daemon',
+        metadata: { startedBy: 'daemon' } as Metadata,
+        requireDaemonAck: true,
+      },
+      {
+        notifyDaemonSessionStartedFn: async () => {
+          attempts += 1;
+          now += 5;
+          return { error: 'Request failed: /session-started, fetch failed' };
+        },
+        sleepFn: async (ms) => {
+          now += ms;
+        },
+        nowFn: () => now,
+      },
+    )).rejects.toThrow('Claude runtime readiness was not acknowledged by the daemon');
+    expect(attempts).toBeGreaterThan(1);
+    expect(now).toBeGreaterThanOrEqual(90_000);
+    expect(now).toBeLessThan(91_000);
   });
 
   it('uses a longer default retry window when daemon autostart is enabled for terminal sessions', async () => {

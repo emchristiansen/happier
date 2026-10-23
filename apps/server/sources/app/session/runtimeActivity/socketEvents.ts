@@ -1,4 +1,7 @@
 import {
+    MACHINE_SESSION_RUNNER_EXITED_EVENT,
+    MachineSessionRunnerExitedAckSchema,
+    MachineSessionRunnerExitedRequestSchema,
     SESSION_PUBLISHER_LEGACY_ALIVE_EVENT,
     SESSION_PUBLISHER_LEGACY_END_EVENT,
     SESSION_RUNTIME_ACTIVITY_CLOSE_EVENT,
@@ -15,6 +18,7 @@ import {
 } from '@happier-dev/protocol';
 
 import type { SessionParticipantCursor } from '@/app/session/changeTracking/markSessionParticipantsChanged';
+import { publishSessionPublisherLifecycleUpdate } from '@/app/session/runtimeActivity/publishPublisherLifecycleUpdate';
 import type { createSessionPublisherPresence } from '@/app/presence/sessionPublisherPresence';
 import { describeLoggableError } from '@/utils/logging/describeLoggableError';
 import { warn } from '@/utils/logging/log';
@@ -305,6 +309,70 @@ export function registerSessionRuntimeActivitySnapshotSocketEvent(params: Readon
                 'Failed to adapt released session-end event',
             );
             // Released end events have no required acknowledgement; timeout remains authoritative.
+        }
+    });
+}
+
+/**
+ * A daemon that observed its session runner exit retires that runner's publisher fence, so the
+ * session stops reading `active` instead of waiting for the presence timeout. A dead runner cannot
+ * close its own fence, and a dropped connection only forgets the in-memory publisher.
+ *
+ * The observed exit is the same physical-stop proof an acknowledged explicit machine stop carries,
+ * so this reuses that capture-and-finalize path: it closes only the fence that is current when the
+ * report arrives, and only for a machine that still hosts the session.
+ */
+export function registerMachineSessionRunnerExitedSocketEvent(params: Readonly<{
+    socket: RuntimeActivitySnapshotEventSocket;
+    presence: RuntimeActivitySnapshotPresence;
+    accountId: string;
+    machineId: string;
+}>): void {
+    params.socket.on(MACHINE_SESSION_RUNNER_EXITED_EVENT, async (value, acknowledge) => {
+        const request = MachineSessionRunnerExitedRequestSchema.safeParse(value);
+        if (!request.success) {
+            acknowledge?.(MachineSessionRunnerExitedAckSchema.parse({ status: 'rejected', reason: 'invalid_request' }));
+            return;
+        }
+        const { sessionId } = request.data;
+        try {
+            const captured = await params.presence.captureExplicitMachineStop({
+                binding: { accountId: params.accountId, machineId: params.machineId, sessionId },
+            });
+            if (captured.status !== 'captured') {
+                acknowledge?.(MachineSessionRunnerExitedAckSchema.parse(captured.status === 'already_inactive'
+                    ? { status: 'already_inactive', sessionId }
+                    : { status: 'rejected', sessionId, reason: captured.reason }));
+                return;
+            }
+            const closed = await params.presence.finalizeExplicitMachineStop({ target: captured.target });
+            if (closed.status === 'closed') {
+                await publishSessionPublisherLifecycleUpdate({
+                    sessionId,
+                    participantCursors: closed.participantCursors,
+                    active: false,
+                    activeAt: closed.activeAt.getTime(),
+                    ...(closed.projection ? { projection: closed.projection } : {}),
+                    ...(closed.turnProjection ?? {}),
+                });
+            }
+            acknowledge?.(MachineSessionRunnerExitedAckSchema.parse(
+                closed.status === 'closed' || closed.status === 'already_inactive'
+                    ? { status: closed.status, sessionId }
+                    : closed.status === 'superseded'
+                        ? { status: 'rejected', sessionId, reason: 'superseded' }
+                        : {
+                            status: 'rejected',
+                            sessionId,
+                            reason: closed.reason === 'unauthorized' ? 'machine_control_unavailable' : closed.reason,
+                        },
+            ));
+        } catch (error) {
+            warn(
+                { module: 'session-publisher-presence', sessionId, error: describeLoggableError(error) },
+                'Failed to retire an exited session runner',
+            );
+            acknowledge?.(MachineSessionRunnerExitedAckSchema.parse({ status: 'retryable', sessionId, reason: 'internal' }));
         }
     });
 }

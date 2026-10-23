@@ -126,6 +126,10 @@ import {
 } from './connectedServices/runtimeAuth/projection/connectedServiceRuntimeAuthRecoveryProjection';
 import { buildRuntimeAuthRecoveryKey } from './connectedServices/runtimeAuth/recoveryKey/runtimeAuthRecoveryKey';
 import { buildRuntimeAuthRecoveryAttemptTransitionLocalId } from './connectedServices/runtimeAuth/commitConnectedServiceRuntimeAuthRecoverySessionEvent';
+import {
+  SESSION_STARTED_READINESS_ANSWER_TIMEOUT_MS,
+  SESSION_STARTED_READINESS_NOT_READY_ERROR_CODES,
+} from './sessionStartedReadiness';
 
 const DEFAULT_DAEMON_CONTROL_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
 const DAEMON_CONTROL_BODY_LIMIT_BYTES_ENV_KEY = 'HAPPIER_DAEMON_CONTROL_BODY_LIMIT_BYTES';
@@ -761,7 +765,7 @@ export function createDaemonControlApp({
         401: authSchema401,
         503: z.object({
           status: z.literal('error'),
-          errorCode: z.literal('session_startup_reconciliation_failed'),
+          errorCode: z.enum(SESSION_STARTED_READINESS_NOT_READY_ERROR_CODES),
         }),
       }
     },
@@ -784,8 +788,17 @@ export function createDaemonControlApp({
         errorCode: 'session_startup_reconciliation_failed' as const,
       };
     }
+    // Answer within the runner's attempt timeout even while readiness waits on a slow server.
+    // Readiness keeps running; the runner's next attempt joins it.
+    let answerTimer: ReturnType<typeof setTimeout> | undefined;
+    let readinessOutcome: 'ready' | 'pending';
     try {
-      await readiness;
+      readinessOutcome = await Promise.race([
+        readiness.then(() => 'ready' as const),
+        new Promise<'pending'>((resolve) => {
+          answerTimer = setTimeout(() => resolve('pending'), SESSION_STARTED_READINESS_ANSWER_TIMEOUT_MS);
+        }),
+      ]);
     } catch (error) {
       logger.warn('[CONTROL SERVER] Post-registration session startup reconciliation failed', {
         sessionId,
@@ -795,6 +808,19 @@ export function createDaemonControlApp({
       return {
         status: 'error' as const,
         errorCode: 'session_startup_reconciliation_failed' as const,
+      };
+    } finally {
+      clearTimeout(answerTimer);
+    }
+    if (readinessOutcome === 'pending') {
+      logger.warn('[CONTROL SERVER] Post-registration session startup reconciliation still settling; asking the runner to retry', {
+        sessionId,
+        answerTimeoutMs: SESSION_STARTED_READINESS_ANSWER_TIMEOUT_MS,
+      });
+      reply.code(503);
+      return {
+        status: 'error' as const,
+        errorCode: 'session_startup_reconciliation_pending' as const,
       };
     }
 

@@ -288,7 +288,7 @@ sequenceDiagram
 - `/stop-session`
 - `/spawn-session`
 - `/stop` (shutdown daemon)
-- `/session-started` (session self-report)
+- `/session-started` (session self-report). A daemon-started runner's readiness waits on a server account check; the daemon answers within `SESSION_STARTED_READINESS_ANSWER_TIMEOUT_MS` (`src/daemon/sessionStartedReadiness.ts`), with 503 `session_startup_reconciliation_pending` if the check is still running, and the runner's retry joins that check.
 
 The CLI talks to this server via `controlClient.ts`, using a port stored in `daemon.state.json`.
 

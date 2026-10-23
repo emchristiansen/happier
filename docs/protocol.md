@@ -162,6 +162,12 @@ Field names below match on-wire payloads.
   - `{ machineId, daemonState, expectedVersion }`
   - Response: `{ result: "success", version, daemonState }` or `{ result: "version-mismatch", version, daemonState }`
 
+- `machine-session-runner-exited`
+  - Machine-scoped connections only. `{ sessionId }`
+  - Sent by a daemon that observed the session's runner process exit while no other live local runner owns the session. The server retires the publisher fence that is current when the report arrives, the same close an acknowledged explicit machine stop applies, so the session stops reading `active` without waiting for the presence timeout.
+  - Response: `{ status: "closed" | "already_inactive", sessionId }`, `{ status: "rejected", sessionId, reason: "not_found" | "machine_control_unavailable" | "archived" | "superseded" }`, `{ status: "retryable", sessionId, reason: "internal" }` or `{ status: "rejected", reason: "invalid_request" }`.
+  - A server that predates the event ignores it. The daemon sends the report once, only while connected, and never buffers it, because a late report could retire a successor runner's fence.
+
 - `artifact-read`
   - `{ artifactId }`
   - Response: `{ result: "success", artifact }` or `{ result: "error", message }`

@@ -26,8 +26,11 @@ import { RpcHandlerManager, type RpcHandlerRegistrationReadiness } from './rpc/R
 import { SOCKET_RPC_EVENTS } from '@happier-dev/protocol/socketRpc';
 import { RPC_METHODS } from '@happier-dev/protocol/rpc';
 import {
+    MACHINE_SESSION_RUNNER_EXITED_EVENT,
+    MachineSessionRunnerExitedAckSchema,
     sealAccountScopedBlobCiphertext,
     type ActionOperationSnapshotV1,
+    type MachineSessionRunnerExitedAck,
     type DirectSessionTranscriptDeltaEphemeral,
     type MachineTransferReceiveEnvelope,
     type MachineTransferSendEnvelope,
@@ -169,6 +172,13 @@ function isMachineReplacedSocketError(error: unknown, diagnostic: Record<string,
     const errorCode = data?.error ?? record?.message;
     return diagnostic.statusCode === 410 && errorCode === 'machine-replaced';
 }
+
+/** How long the daemon waits for the server to acknowledge a runner-exit report before giving up on it. */
+const SESSION_RUNNER_EXIT_REPORT_ACK_TIMEOUT_MS = 10_000;
+
+export type SessionRunnerExitReportOutcome =
+    | Readonly<{ kind: 'acknowledged'; ack: MachineSessionRunnerExitedAck }>
+    | Readonly<{ kind: 'not_delivered'; reason: 'socket_not_connected' | 'unacknowledged' | 'invalid_ack' }>;
 
 export class ApiMachineClient {
     private socket: Socket<ServerToDaemonEvents, DaemonToServerEvents> | null = null;
@@ -702,6 +712,36 @@ export class ApiMachineClient {
 
     async enqueueDaemonTerminalExactTurnEnd(mutation: ExactSessionTurnEndMutationV1): Promise<void> {
         await this.getDaemonTerminalSessionMutationOutbox(mutation.sessionId).enqueueExactTurnEnd(mutation);
+    }
+
+    /**
+     * Tell the server that this machine observed the session's runner process exit, so the server
+     * retires that runner's publisher fence and the session stops reading `active`.
+     *
+     * Delivery is deliberately once and live-only: a report is never buffered while the machine
+     * socket is disconnected, because a late report could retire a successor runner's fence. A
+     * relay that predates the event ignores it, so the report settles as unacknowledged and the
+     * server's presence timeout remains the fallback.
+     */
+    async reportSessionRunnerExited(sessionId: string): Promise<SessionRunnerExitReportOutcome> {
+        const socket = this.socket;
+        if (!socket?.connected) return { kind: 'not_delivered', reason: 'socket_not_connected' };
+        let answer: unknown;
+        try {
+            answer = await emitSocketWithAck({
+                socket: socket as unknown as EmitWithAckSocket,
+                event: MACHINE_SESSION_RUNNER_EXITED_EVENT,
+                payload: { sessionId },
+                timeoutMs: SESSION_RUNNER_EXIT_REPORT_ACK_TIMEOUT_MS,
+            });
+        } catch (error) {
+            const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+            return { kind: 'not_delivered', reason: code === 'socket_not_connected' ? 'socket_not_connected' : 'unacknowledged' };
+        }
+        const ack = MachineSessionRunnerExitedAckSchema.safeParse(answer);
+        return ack.success
+            ? { kind: 'acknowledged', ack: ack.data }
+            : { kind: 'not_delivered', reason: 'invalid_ack' };
     }
 
     async recoverDaemonTerminalSessionMutationJournals(): Promise<void> {

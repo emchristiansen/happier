@@ -2,6 +2,10 @@ import type { ApiSessionClient } from '@/api/session/sessionClient';
 import type { Metadata } from '@/api/types';
 import { configuration } from '@/configuration';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
+import {
+    isSessionStartedReadinessNotReadyErrorCode,
+    SESSION_STARTED_READINESS_ANSWER_TIMEOUT_MS,
+} from '@/daemon/sessionStartedReadiness';
 import { writeTerminalAttachmentInfo } from '@/terminal/attachment/terminalAttachmentInfo';
 import { buildTerminalHostHandleFromAttachmentMetadata } from '@/agent/runtime/terminal/attachmentMetadata';
 import type { TerminalAttachmentId, TerminalHostHandle } from '@/integrations/terminalHost/_types';
@@ -28,6 +32,20 @@ type InFlightDaemonSessionReport = {
 };
 
 const inFlightDaemonSessionReports = new Map<string, InFlightDaemonSessionReport>();
+
+/**
+ * Per-attempt HTTP timeout for a daemon-started runner's report. It exceeds the daemon's own
+ * readiness answer bound, so every attempt to a live daemon gets an answer even while the
+ * daemon's server account check is slow.
+ */
+export const DAEMON_STARTED_REPORT_ATTEMPT_TIMEOUT_MS = SESSION_STARTED_READINESS_ANSWER_TIMEOUT_MS + 10_000;
+
+/**
+ * Longest a runner that requires the daemon's readiness acknowledgement keeps retrying while the
+ * daemon keeps answering that readiness has not settled (a slow server, 2026-10-23). A daemon that
+ * stops answering still fails the runner once the ordinary retry window passes without an answer.
+ */
+export const DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS = 10 * 60_000;
 
 function isTransientDaemonReportError(error: string): boolean {
     const normalized = error.trim().toLowerCase();
@@ -137,6 +155,7 @@ async function runDaemonSessionReport(
         });
 
     const startedAt = nowFn();
+    let lastDaemonAnswerAt: number | null = null;
     let attempt = 0;
     while (true) {
         attempt += 1;
@@ -156,7 +175,7 @@ async function runDaemonSessionReport(
                 min: 0,
                 max: 120_000,
             });
-        const defaultReportAttemptTimeoutMs = startedBy === 'daemon' ? 10_000 : 2_500;
+        const defaultReportAttemptTimeoutMs = startedBy === 'daemon' ? DAEMON_STARTED_REPORT_ATTEMPT_TIMEOUT_MS : 2_500;
         const reportAttemptTimeoutMs =
             deps.reportAttemptTimeoutMs ??
             resolveDaemonReportRetryValue(process.env.HAPPIER_DAEMON_REPORT_SESSION_HTTP_TIMEOUT_MS, defaultReportAttemptTimeoutMs, {
@@ -164,6 +183,16 @@ async function runDaemonSessionReport(
                 max: 30_000,
             });
         const boundedAttemptTimeoutMs = Math.min(reportAttemptTimeoutMs, Math.max(100, retryTimeoutMs));
+        // While a live daemon keeps answering that readiness is not settled, a runner that needs its
+        // acknowledgement waits up to the ceiling; otherwise the retry window counts from the start.
+        const isRetryWindowExhausted = (): boolean => {
+            const now = nowFn();
+            if (state.requireDaemonAck && lastDaemonAnswerAt !== null) {
+                return now - lastDaemonAnswerAt >= retryTimeoutMs
+                    || now - startedAt >= DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS;
+            }
+            return now - startedAt >= retryTimeoutMs;
+        };
 
         try {
             logger.debug(`[START] Reporting session ${sessionId} to daemon (attempt ${attempt})`);
@@ -186,8 +215,11 @@ async function runDaemonSessionReport(
             }
 
             const message = String(result.error);
-            const timedOut = nowFn() - startedAt >= retryTimeoutMs;
-            if (!isTransientDaemonReportError(message) || timedOut) {
+            if (isSessionStartedReadinessNotReadyErrorCode(result.errorCode)) {
+                lastDaemonAnswerAt = nowFn();
+                logger.debug(`[START] Daemon answered that session ${sessionId} readiness has not settled (${result.errorCode})`);
+            }
+            if (!isTransientDaemonReportError(message) || isRetryWindowExhausted()) {
                 logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
                 if (state.requireDaemonAck) {
                     throw new Error('Claude runtime readiness was not acknowledged by the daemon');
@@ -197,8 +229,7 @@ async function runDaemonSessionReport(
             await sleepFn(retryIntervalMs);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error ?? '');
-            const timedOut = nowFn() - startedAt >= retryTimeoutMs;
-            if (!isTransientDaemonReportError(message) || timedOut) {
+            if (!isTransientDaemonReportError(message) || isRetryWindowExhausted()) {
                 logger.debug('[START] Failed to report to daemon (may not be running):', error);
                 if (state.requireDaemonAck) {
                     throw new Error('Claude runtime readiness was not acknowledged by the daemon');

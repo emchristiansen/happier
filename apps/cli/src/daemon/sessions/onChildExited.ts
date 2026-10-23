@@ -5,6 +5,7 @@ import { writeSessionExitReport } from '@/session/diagnostics/sessionExitReport'
 import type { TrackedSession } from '../types';
 import { removeSessionMarker, updateSessionMarkerActiveTurn } from '../sessionRegistry';
 import { cleanupPidSessionResources } from './cleanupPidSessionResources';
+import { isPidPlaceholderSessionId } from './pidPlaceholderSessionId';
 import { stageObservedExit } from './stageObservedExit';
 
 export type ChildExit = { reason: string; code: number | null; signal: string | null };
@@ -43,6 +44,32 @@ function findLiveReplacementForSameSession(
   }
 
   return null;
+}
+
+/**
+ * Tell the server the session's runner exited, so the session stops reading `active` instead of
+ * waiting out the presence timeout. A dead runner cannot close its own publisher fence, and a
+ * dropped connection does not clear `active`. The exit lifecycle never waits on this report.
+ */
+function reportSessionRunnerExit(apiMachine: ApiMachineClient, sessionId: string, pid: number): void {
+  const reportFailure = (detail: Readonly<Record<string, unknown>>): void => {
+    logger.warn('[DAEMON RUN] Server did not retire the exited runner; the session reads active until the server presence timeout', {
+      sessionId,
+      pid,
+      ...detail,
+    });
+  };
+  try {
+    void apiMachine.reportSessionRunnerExited(sessionId).then((outcome) => {
+      if (outcome.kind === 'acknowledged' && (outcome.ack.status === 'closed' || outcome.ack.status === 'already_inactive')) {
+        logger.debug('[DAEMON RUN] Server retired the exited runner', { sessionId, pid, status: outcome.ack.status });
+        return;
+      }
+      reportFailure({ outcome });
+    }, (error: unknown) => reportFailure({ error }));
+  } catch (error) {
+    reportFailure({ error });
+  }
 }
 
 export function createOnChildExited(params: Readonly<{
@@ -192,6 +219,11 @@ export function createOnChildExited(params: Readonly<{
             error,
           });
         }
+      }
+      const exitedSessionId = normalizeSessionId(tracked.happySessionId);
+      if (shouldReportSessionEnd && exitedSessionId && !isPidPlaceholderSessionId(exitedSessionId) && apiMachineForSessions) {
+        // Before any respawn is scheduled, so the report reaches the server ahead of a successor runner.
+        reportSessionRunnerExit(apiMachineForSessions, exitedSessionId, pid);
       }
       if (shouldReportSessionEnd && isUnexpected && typeof tracked.happySessionId === 'string' && tracked.happySessionId.trim().length > 0) {
         try {

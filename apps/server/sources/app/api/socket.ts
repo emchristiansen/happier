@@ -31,7 +31,10 @@ import { createMachineSocketOwnershipRegistry } from "./socket/machineSocketOwne
 import { createSessionPublisherPresence } from "@/app/presence/sessionPublisherPresence";
 import { publishMachinePresenceSnapshot } from "@/app/presence/publishMachinePresenceSnapshot";
 import { describeLoggableError } from "@/utils/logging/describeLoggableError";
-import { registerSessionRuntimeActivitySnapshotSocketEvent } from "@/app/session/runtimeActivity/socketEvents";
+import {
+    registerMachineSessionRunnerExitedSocketEvent,
+    registerSessionRuntimeActivitySnapshotSocketEvent,
+} from "@/app/session/runtimeActivity/socketEvents";
 import { publishSessionPublisherLifecycleUpdate } from "@/app/session/runtimeActivity/publishPublisherLifecycleUpdate";
 import { readHappierSocketData } from "./socket/socketData";
 import { registerReleasedUiV021SessionEndSocketEvent } from "@/app/session/compatibility/registerReleasedUiV021SessionEndSocketEvent";
@@ -434,6 +437,14 @@ export function startSocket(app: Fastify) {
                 }
                 : undefined,
         );
+        if (connection.connectionType === "machine-scoped") {
+            registerMachineSessionRunnerExitedSocketEvent({
+                socket,
+                presence: sessionPublisherPresence,
+                accountId: userId,
+                machineId: connection.machineId,
+            });
+        }
         if (connection.connectionType === "user-scoped") {
             registerReleasedUiV021SessionEndSocketEvent({
                 socket,
