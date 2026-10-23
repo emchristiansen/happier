@@ -6536,7 +6536,8 @@ export class ApiSessionClient extends EventEmitter {
 
     /**
      * Server pending rows a mode switch or a switch-to-local discard acts on: every row except one
-     * handed to an external terminal or one whose requested action the server could not parse.
+     * handed to an external terminal or one whose typed status the server overrode (a queued row
+     * whose requested action it cannot parse).
      */
     async listActionablePendingMessageQueueV2LocalIds(): Promise<string[]> {
         return this.runPendingQueueRead(() => listPendingQueueV2ActionableLocalIdsFromServer({
@@ -6590,7 +6591,10 @@ export class ApiSessionClient extends EventEmitter {
         return localIds.length + this.pendingQueueMaterializedLocalIds.size;
     }
 
-    /** Discards exactly the rows the switch count includes; handed-off and malformed-action rows stay. */
+    /**
+     * Discards the same server-row selection the switch count reads (its own fresh read; the count may
+     * also include local in-flight inputs). Handed-off and server-overridden rows stay.
+     */
     async discardPendingMessageQueueV2All(opts: { reason: 'switch_to_local' | 'manual' }): Promise<number> {
         const localIds = await this.listActionablePendingMessageQueueV2LocalIds();
         if (localIds.length === 0) return 0;

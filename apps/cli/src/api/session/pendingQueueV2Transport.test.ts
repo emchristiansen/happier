@@ -1864,7 +1864,7 @@ describe('pendingQueueV2Transport', () => {
             })).resolves.toEqual(['queued-local', 'handoff-local']);
         });
 
-        it('leaves handed-off and malformed-action rows out of the actionable rows', async () => {
+        it('leaves handed-off and raw-queued malformed-action rows out of the actionable rows', async () => {
             mockGet.mockResolvedValueOnce({
                 data: {
                     pending: [
@@ -1890,6 +1890,16 @@ describe('pendingQueueV2Transport', () => {
                             requestedAction: undefined,
                             requestedActionMalformed: true,
                         },
+                        {
+                            ...serverPendingRow({
+                                localId: 'persisted-blocked-malformed-action-local',
+                                deliveryState: 'blocked',
+                                deliveryBlockedReason: 'unsupported_action',
+                                deliveryStatus: { status: 'blocked', reason: 'unsupported_action' },
+                            }),
+                            requestedAction: undefined,
+                            requestedActionMalformed: true,
+                        },
                     ],
                 },
             });
@@ -1897,7 +1907,13 @@ describe('pendingQueueV2Transport', () => {
             await expect(listPendingQueueV2ActionableLocalIdsFromServer({
                 token: 'token',
                 sessionId: 'session-1',
-            })).resolves.toEqual(['queued-local', 'delivering-local', 'blocked-local', 'legacy-queued-local']);
+            })).resolves.toEqual([
+                'queued-local',
+                'delivering-local',
+                'blocked-local',
+                'legacy-queued-local',
+                'persisted-blocked-malformed-action-local',
+            ]);
         });
 
         it('projects the external handoff status, including from persisted fields alone', async () => {

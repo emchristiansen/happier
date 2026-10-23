@@ -331,9 +331,19 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
       ['a malformed-action row', [malformedActionRow]],
     ] as const;
     // Row kinds the base parser already read and counted; their decisions must not change.
+    // A malformed action the server already persisted as blocked: raw and typed status agree, so the
+    // base parser read it.
+    const persistedBlockedMalformedActionRow = serverRow('persisted-blocked-malformed-action', {
+      requestedAction: undefined,
+      requestedActionMalformed: true,
+      deliveryState: 'blocked',
+      deliveryBlockedReason: 'unsupported_action',
+      deliveryStatus: { status: 'blocked', reason: 'unsupported_action' },
+    });
     const countedBeforeHandoffParsing = [
       ['a blocked row', [blockedRow]],
       ['a delivering row', [deliveringRow]],
+      ['a malformed-action row already persisted as blocked', [persistedBlockedMalformedActionRow]],
     ] as const;
 
     function markPendingKnownNonEmpty(client: ApiSessionClient): void {
@@ -468,12 +478,12 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
       });
     });
 
-    it('discards blocked and queued rows on switch to local, leaving handed-off and malformed-action rows', async () => {
-      pendingRows = [queuedRow, handoffRow, malformedActionRow, blockedRow];
+    it('discards the rows the base read on switch to local, leaving handed-off and raw-queued malformed-action rows', async () => {
+      pendingRows = [queuedRow, handoffRow, malformedActionRow, blockedRow, persistedBlockedMalformedActionRow];
       const client = await createClient();
 
-      await expect(client.discardPendingMessageQueueV2All({ reason: 'switch_to_local' })).resolves.toBe(2);
-      expect(discardedLocalIds).toEqual(['queued', 'blocked']);
+      await expect(client.discardPendingMessageQueueV2All({ reason: 'switch_to_local' })).resolves.toBe(3);
+      expect(discardedLocalIds).toEqual(['queued', 'blocked', 'persisted-blocked-malformed-action']);
     });
 
     it('discards exactly the rows a confirmed switch-to-local prompt counted', async () => {
