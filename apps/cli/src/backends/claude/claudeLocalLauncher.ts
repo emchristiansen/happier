@@ -367,7 +367,7 @@ export async function claudeLocalLauncher(
             const pendingGateStartMs = configuration.startupTimingEnabled ? Date.now() : null;
             const discardResult = await discardQueuedAndPendingForLocalSwitch({
                 queue: session.queue,
-                getServerPendingCount: () => session.client.peekPendingMessageQueueV2Count({ reconcileWhenEmpty: 'force', reason: 'manual-check' }),
+                getServerPendingCount: () => session.client.peekActionablePendingMessageQueueV2Count({ reconcileWhenEmpty: 'force', reason: 'manual-check' }),
                 discardServerPending: () =>
                     session.client.discardPendingMessageQueueV2All({ reason: 'switch_to_local' }),
                 markQueuedAsDiscarded: (localIds) =>
@@ -401,7 +401,7 @@ export async function claudeLocalLauncher(
                 if (lifecycleSnapshot.active && !lifecycleSnapshot.terminal) {
                     await turnLifecycle.waitForSafeRemoteHandoff();
                 }
-                return session.client.peekPendingMessageQueueV2Count({ reconcileWhenEmpty: 'skip', reason: 'passive-wait' });
+                return session.client.peekActionablePendingMessageQueueV2Count({ reconcileWhenEmpty: 'skip', reason: 'passive-wait' });
             },
             requestRemoteSwitch: () => remoteSwitchController.requestRemoteSwitch('server_pending_queue'),
             waitForPendingQueueUpdate: (signal) => session.client.waitForPendingEligibilityUpdate(signal),

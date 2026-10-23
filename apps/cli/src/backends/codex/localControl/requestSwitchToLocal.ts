@@ -15,7 +15,7 @@ type QueueLike = {
 };
 
 type SessionLike = {
-  peekPendingMessageQueueV2Count: (opts?: PendingQueueReadOptions) => Promise<number>;
+  peekActionablePendingMessageQueueV2Count: (opts?: PendingQueueReadOptions) => Promise<number>;
   discardPendingMessageQueueV2All: (opts: { reason: 'switch_to_local' | 'manual' }) => Promise<number>;
   discardCommittedMessageLocalIds: (opts: {
     localIds: string[];
@@ -41,7 +41,7 @@ export async function requestSwitchToLocal<Reason extends string>(params: {
 
   const discardResult = await discardQueuedAndPendingForLocalSwitch({
     queue: params.queue,
-    getServerPendingCount: () => params.session.peekPendingMessageQueueV2Count({ reconcileWhenEmpty: 'force', reason: 'manual-check' }),
+    getServerPendingCount: () => params.session.peekActionablePendingMessageQueueV2Count({ reconcileWhenEmpty: 'force', reason: 'manual-check' }),
     discardServerPending: () => params.session.discardPendingMessageQueueV2All({ reason: 'switch_to_local' }),
     markQueuedAsDiscarded: (localIds) =>
       params.session.discardCommittedMessageLocalIds({ localIds: [...localIds], reason: 'switch_to_local' }),

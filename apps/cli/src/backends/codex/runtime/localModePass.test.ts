@@ -14,7 +14,7 @@ describe('runCodexLocalModePass', () => {
     queue.push('hello', { permissionMode: 'default', localId: 'l1' });
 
     const session = {
-      listPendingMessageQueueV2LocalIds: vi.fn().mockResolvedValue([]),
+      listActionablePendingMessageQueueV2LocalIds: vi.fn().mockResolvedValue([]),
       discardPendingMessageQueueV2All: vi.fn(),
       discardCommittedMessageLocalIds: vi.fn(),
       sendSessionEvent: vi.fn(),
@@ -41,7 +41,7 @@ describe('runCodexLocalModePass', () => {
   it('returns exit when local launcher exits', async () => {
     const queue = new MessageQueue2<Mode>(() => 'hash');
     const session = {
-      listPendingMessageQueueV2LocalIds: vi.fn().mockResolvedValue([]),
+      listActionablePendingMessageQueueV2LocalIds: vi.fn().mockResolvedValue([]),
       discardPendingMessageQueueV2All: vi.fn(),
       discardCommittedMessageLocalIds: vi.fn(),
       sendSessionEvent: vi.fn(),
@@ -66,7 +66,7 @@ describe('runCodexLocalModePass', () => {
   it('returns remote with resume id after local launcher switch', async () => {
     const queue = new MessageQueue2<Mode>(() => 'hash');
     const session = {
-      listPendingMessageQueueV2LocalIds: vi.fn().mockResolvedValue([]),
+      listActionablePendingMessageQueueV2LocalIds: vi.fn().mockResolvedValue([]),
       discardPendingMessageQueueV2All: vi.fn(),
       discardCommittedMessageLocalIds: vi.fn(),
       sendSessionEvent: vi.fn(),
@@ -91,7 +91,7 @@ describe('runCodexLocalModePass', () => {
   it('passes provider-native Codex args through to the local launcher', async () => {
     const queue = new MessageQueue2<Mode>(() => 'hash');
     const session = {
-      listPendingMessageQueueV2LocalIds: vi.fn().mockResolvedValue([]),
+      listActionablePendingMessageQueueV2LocalIds: vi.fn().mockResolvedValue([]),
       discardPendingMessageQueueV2All: vi.fn(),
       discardCommittedMessageLocalIds: vi.fn(),
       sendSessionEvent: vi.fn(),

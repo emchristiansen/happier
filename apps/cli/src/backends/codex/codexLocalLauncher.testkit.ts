@@ -250,7 +250,7 @@ export function createLocalSessionHarness(): LocalSessionHarness {
         rpcHandlers[name] = handler;
       },
     },
-    peekPendingMessageQueueV2Count: async () => 0,
+    peekActionablePendingMessageQueueV2Count: async () => 0,
     discardPendingMessageQueueV2All: async () => 0,
     discardCommittedMessageLocalIds: async (_ids: string[]) => {},
     waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted,

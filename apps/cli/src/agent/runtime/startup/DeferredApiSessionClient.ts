@@ -66,7 +66,7 @@ export type DeferredApiSessionTarget = Readonly<{
   materializeNextPendingMessageSafely?: (opts?: MaterializeNextPendingOptions) => Promise<MaterializeNextPendingResult>;
   wakePendingMaterialization?: () => void;
   popPendingMessage: () => Promise<boolean>;
-  peekPendingMessageQueueV2Count: (opts?: PendingQueueReadOptions) => Promise<number>;
+  peekActionablePendingMessageQueueV2Count: (opts?: PendingQueueReadOptions) => Promise<number>;
   discardPendingMessageQueueV2All: (opts: { reason: 'switch_to_local' | 'manual' }) => Promise<number>;
   discardCommittedMessageLocalIds: (opts: { localIds: string[]; reason: 'switch_to_local' | 'manual' }) => Promise<number>;
   sendSessionDeath: () => void;
@@ -557,8 +557,8 @@ export class DeferredApiSessionClient {
     return await this.withAttachedTarget((t) => t.popPendingMessage(), false);
   }
 
-  async peekPendingMessageQueueV2Count(opts?: PendingQueueReadOptions): Promise<number> {
-    return await this.withAttachedTarget((t) => t.peekPendingMessageQueueV2Count(opts), 0);
+  async peekActionablePendingMessageQueueV2Count(opts?: PendingQueueReadOptions): Promise<number> {
+    return await this.withAttachedTarget((t) => t.peekActionablePendingMessageQueueV2Count(opts), 0);
   }
 
   async discardPendingMessageQueueV2All(opts: { reason: 'switch_to_local' | 'manual' }): Promise<number> {

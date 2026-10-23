@@ -190,7 +190,7 @@ function createLocalHarness(options?: {
     sendAgentMessage: vi.fn(),
     sendAgentMessageCommitted: vi.fn(async () => {}),
     sendSessionEvent,
-    peekPendingMessageQueueV2Count: vi.fn().mockResolvedValue(0),
+    peekActionablePendingMessageQueueV2Count: vi.fn().mockResolvedValue(0),
     discardPendingMessageQueueV2All: vi.fn().mockResolvedValue(0),
     discardCommittedMessageLocalIds: vi.fn().mockResolvedValue(0),
     sendSessionDeath: vi.fn(),
@@ -430,7 +430,7 @@ describe('claudeLocalLauncher', () => {
   it('does not block initial local startup on pending-queue inspection', async () => {
     const { session, client } = createLocalHarness();
 
-    client.peekPendingMessageQueueV2Count = vi.fn(async () => {
+    client.peekActionablePendingMessageQueueV2Count = vi.fn(async () => {
       throw new Error('pending queue inspection should not run for initial local startup');
     });
 
@@ -522,7 +522,7 @@ describe('claudeLocalLauncher', () => {
     const { session, client } = createLocalHarness();
 
     const peek = vi.fn().mockResolvedValue(0);
-    client.peekPendingMessageQueueV2Count = peek;
+    client.peekActionablePendingMessageQueueV2Count = peek;
 
     mockClaudeLocal.mockImplementationOnce(async () => {});
 
@@ -542,7 +542,7 @@ describe('claudeLocalLauncher', () => {
     const previousE2e = process.env.HAPPIER_E2E_PROVIDERS;
     process.env.HAPPIER_E2E_PROVIDERS = '1';
 
-    client.peekPendingMessageQueueV2Count = vi.fn(async () => pendingCount);
+    client.peekActionablePendingMessageQueueV2Count = vi.fn(async () => pendingCount);
     client.discardPendingMessageQueueV2All = vi.fn(async () => {
       const discarded = await discardDeferred.promise;
       pendingCount = 0;
@@ -559,7 +559,7 @@ describe('claudeLocalLauncher', () => {
       await vi.advanceTimersByTimeAsync(0);
       await Promise.resolve();
 
-      expect(client.peekPendingMessageQueueV2Count).toHaveBeenCalledTimes(1);
+      expect(client.peekActionablePendingMessageQueueV2Count).toHaveBeenCalledTimes(1);
       expect(mockClaudeLocal).not.toHaveBeenCalled();
 
       discardDeferred.resolve(1);
@@ -913,7 +913,7 @@ describe('claudeLocalLauncher', () => {
     } = { current: null };
     const localStarted = createDeferred<void>();
 
-    client.peekPendingMessageQueueV2Count = vi.fn(async () => pendingCount);
+    client.peekActionablePendingMessageQueueV2Count = vi.fn(async () => pendingCount);
     client.shouldAttemptPendingMaterialization = vi.fn(() => pendingCount > 0);
     client.waitForPendingEligibilityUpdate = vi.fn(async (signal?: AbortSignal) => {
       return await new Promise<boolean>((resolve) => {
@@ -954,7 +954,7 @@ describe('claudeLocalLauncher', () => {
     await Promise.resolve();
 
     expect(client.waitForPendingEligibilityUpdate).toHaveBeenCalled();
-    expect(client.peekPendingMessageQueueV2Count).not.toHaveBeenCalled();
+    expect(client.peekActionablePendingMessageQueueV2Count).not.toHaveBeenCalled();
     expect(abortObserved).toBe(false);
 
     await scannerOptions!.onMessage({
