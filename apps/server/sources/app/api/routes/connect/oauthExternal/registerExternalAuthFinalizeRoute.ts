@@ -8,6 +8,7 @@ import { connectExternalIdentity } from "@/app/auth/providers/identity";
 import { auth } from "@/app/auth/auth";
 import { resolveAuthPolicyFromEnv } from "@/app/auth/authPolicy";
 import { accountDisabledKey, disableAccount } from "@/app/auth/accountDisable";
+import { accountStandingCache } from "@/app/auth/accountStandingCache";
 import { Context } from "@/context";
 import { decryptString } from "@/modules/encrypt";
 import { findOAuthProviderById } from "@/app/oauth/providers/registry";
@@ -365,6 +366,7 @@ export function registerExternalAuthFinalizeRoute(app: Fastify) {
                 const key = accountDisabledKey(oldAccountId);
                 if (!key || key === "auth_disabled_") return;
                 await db.repeatKey.delete({ where: { key } }).catch(() => {});
+                accountStandingCache.invalidate(oldAccountId);
             };
 
             try {
