@@ -194,7 +194,7 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
       pendingVersion: 1,
     };
 
-    await expect(client.peekMaterializablePendingMessageQueueV2Count({ reconcileWhenEmpty: 'skip' })).resolves.toBe(1);
+    await expect(client.peekActionablePendingMessageQueueV2Count({ reconcileWhenEmpty: 'skip' })).resolves.toBe(1);
   });
 
   it('reports authentication failures from pending list calls to the session supervisor', async () => {
@@ -284,7 +284,7 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
     expect(supervisedInternals(client).currentConnectionState.phase).not.toBe('auth_failed');
   });
 
-  describe('action counts on a queue holding rows the runner cannot materialize', () => {
+  describe('action counts on a queue holding rows the runner cannot act on', () => {
     // Rows in the exact shape the server's `toPendingJson` sends.
     function serverRow(localId: string, fields: Readonly<Record<string, unknown>>): PendingRow {
       return {
@@ -315,9 +315,25 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
     });
     const queuedRow = serverRow('queued', { deliveryStatus: { status: 'queued' } });
 
-    const notMaterializable = [
+    const blockedRow = serverRow('blocked', {
+      deliveryState: 'blocked',
+      deliveryBlockedReason: 'runtime_disposed_before_delivery',
+      deliveryStatus: { status: 'blocked', reason: 'runtime_disposed_before_delivery' },
+    });
+    const deliveringRow = serverRow('delivering', {
+      deliveryState: 'delivering',
+      deliveryStatus: { status: 'delivering', detail: 'awaiting_acceptance' },
+    });
+
+    // Rows the parser newly lets through; the base parser rejected the whole snapshot on them.
+    const newlyParsedNotActionable = [
       ['an external-handoff row', [handoffRow]],
       ['a malformed-action row', [malformedActionRow]],
+    ] as const;
+    // Row kinds the base parser already read and counted; their decisions must not change.
+    const countedBeforeHandoffParsing = [
+      ['a blocked row', [blockedRow]],
+      ['a delivering row', [deliveringRow]],
     ] as const;
 
     function markPendingKnownNonEmpty(client: ApiSessionClient): void {
@@ -345,7 +361,7 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
       });
       let waits = 0;
       const watcher = startLocalPendingQueueRemoteSwitchWatcher({
-        peekPendingCount: () => client.peekMaterializablePendingMessageQueueV2Count({ reconcileWhenEmpty: 'skip', reason: 'passive-wait' }),
+        peekPendingCount: () => client.peekActionablePendingMessageQueueV2Count({ reconcileWhenEmpty: 'skip', reason: 'passive-wait' }),
         requestRemoteSwitch: async () => {
           const switched = await requestRemoteSwitch();
           markInspected();
@@ -365,7 +381,7 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
       return requestRemoteSwitch.mock.calls.length > 0;
     }
 
-    it.each(notMaterializable)('keeps local mode on a pending wake when the queue holds only %s', async (_case, rows) => {
+    it.each(newlyParsedNotActionable)('keeps local mode on a pending wake when the queue holds only %s', async (_case, rows) => {
       pendingRows = [...rows];
       const client = await createClient();
       markPendingKnownNonEmpty(client);
@@ -374,7 +390,7 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
       expect(pendingListRequestCount).toBe(1);
     });
 
-    it('switches to remote on a pending wake when materializable work sits beside a handed-off row', async () => {
+    it('switches to remote on a pending wake when actionable work sits beside a handed-off row', async () => {
       pendingRows = [handoffRow, malformedActionRow, queuedRow];
       const client = await createClient();
       markPendingKnownNonEmpty(client);
@@ -382,6 +398,100 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
       await expect(didWatcherRequestRemoteSwitchAfterWake(client)).resolves.toBe(true);
       // The complete inventory read still reports every row for its observational callers.
       await expect(client.listPendingMessageQueueV2LocalIds()).resolves.toEqual(['handoff', 'malformed-action', 'queued']);
+    });
+
+    describe('rows counted before this change', () => {
+      it.each(countedBeforeHandoffParsing)('switches to remote on a pending wake for %s', async (_case, rows) => {
+        pendingRows = [...rows];
+        const client = await createClient();
+        markPendingKnownNonEmpty(client);
+
+        await expect(didWatcherRequestRemoteSwitchAfterWake(client)).resolves.toBe(true);
+      });
+
+      it.each(countedBeforeHandoffParsing)('asks to discard %s at the Claude local-entry gate', async (_case, rows) => {
+        pendingRows = [...rows];
+        const client = await createClient();
+        markPendingKnownNonEmpty(client);
+
+        await expect(discardQueuedAndPendingForLocalSwitch({
+          queue: emptyLocalQueue(),
+          getServerPendingCount: () => client.peekActionablePendingMessageQueueV2Count({ reconcileWhenEmpty: 'force', reason: 'manual-check' }),
+          discardServerPending: () => client.discardPendingMessageQueueV2All({ reason: 'switch_to_local' }),
+          markQueuedAsDiscarded: async () => 0,
+          sendStatusMessage: () => {},
+          formatError: String,
+        })).resolves.toBe('cancelled');
+        expect(mockConfirmDiscard).toHaveBeenCalledWith(expect.objectContaining({ serverCount: 1 }));
+      });
+
+      it.each(countedBeforeHandoffParsing)('asks to discard %s before the Codex explicit switch to local', async (_case, rows) => {
+        pendingRows = [...rows];
+        const client = await createClient();
+        markPendingKnownNonEmpty(client);
+        const requestSwitch = vi.fn(async () => {});
+
+        await expect(requestSwitchToLocal({
+          queue: emptyLocalQueue(),
+          session: client,
+          resolveLocalSwitchAvailability: async () => ({ ok: true }),
+          requestSwitch,
+          formatSwitchDeniedMessage: String,
+          formatError: String,
+        })).resolves.toBe(false);
+        expect(requestSwitch).not.toHaveBeenCalled();
+        expect(mockConfirmDiscard).toHaveBeenCalledWith(expect.objectContaining({ serverCount: 1 }));
+      });
+
+      it.each(countedBeforeHandoffParsing)('gates the Codex local-mode pass on %s', async (_case, rows) => {
+        pendingRows = [...rows];
+        const client = await createClient();
+        const launchLocal = vi.fn(async () => ({ type: 'exit' as const, code: 0 }));
+        const discardController = vi.fn(async (args: { getServerPendingCount: () => Promise<number> }) => {
+          await args.getServerPendingCount();
+          return 'cancelled' as const;
+        });
+
+        await expect(runCodexLocalModePass({
+          session: client,
+          messageQueue: emptyLocalQueue() as any,
+          workspaceDir: '/workspace',
+          api: {},
+          permissionMode: 'default',
+          resumeId: null,
+          formatError: String,
+          launchLocal,
+          discardController: discardController as any,
+        })).resolves.toEqual({ type: 'remote', resumeId: null });
+        expect(launchLocal).not.toHaveBeenCalled();
+        await expect(discardController.mock.calls[0]![0].getServerPendingCount()).resolves.toBe(1);
+      });
+    });
+
+    it('discards blocked and queued rows on switch to local, leaving handed-off and malformed-action rows', async () => {
+      pendingRows = [queuedRow, handoffRow, malformedActionRow, blockedRow];
+      const client = await createClient();
+
+      await expect(client.discardPendingMessageQueueV2All({ reason: 'switch_to_local' })).resolves.toBe(2);
+      expect(discardedLocalIds).toEqual(['queued', 'blocked']);
+    });
+
+    it('discards exactly the rows a confirmed switch-to-local prompt counted', async () => {
+      pendingRows = [queuedRow, malformedActionRow];
+      const client = await createClient();
+      markPendingKnownNonEmpty(client);
+      mockConfirmDiscard.mockResolvedValueOnce(true);
+
+      await expect(discardQueuedAndPendingForLocalSwitch({
+        queue: emptyLocalQueue(),
+        getServerPendingCount: () => client.peekActionablePendingMessageQueueV2Count({ reconcileWhenEmpty: 'force', reason: 'manual-check' }),
+        discardServerPending: () => client.discardPendingMessageQueueV2All({ reason: 'switch_to_local' }),
+        markQueuedAsDiscarded: async () => 0,
+        sendStatusMessage: () => {},
+        formatError: String,
+      })).resolves.toBe('proceed');
+      expect(mockConfirmDiscard).toHaveBeenCalledWith(expect.objectContaining({ serverCount: 1 }));
+      expect(discardedLocalIds).toEqual(['queued']);
     });
 
     it('still switches for locally materialized input not yet observed when only a handed-off row remains', async () => {
@@ -397,7 +507,7 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
       async function runGate(client: ApiSessionClient) {
         return await discardQueuedAndPendingForLocalSwitch({
           queue: emptyLocalQueue(),
-          getServerPendingCount: () => client.peekMaterializablePendingMessageQueueV2Count({ reconcileWhenEmpty: 'force', reason: 'manual-check' }),
+          getServerPendingCount: () => client.peekActionablePendingMessageQueueV2Count({ reconcileWhenEmpty: 'force', reason: 'manual-check' }),
           discardServerPending: () => client.discardPendingMessageQueueV2All({ reason: 'switch_to_local' }),
           markQueuedAsDiscarded: async () => 0,
           sendStatusMessage: () => {},
@@ -405,7 +515,7 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
         });
       }
 
-      it.each(notMaterializable)('enters local mode without confirmation when the queue holds only %s', async (_case, rows) => {
+      it.each(newlyParsedNotActionable)('enters local mode without confirmation when the queue holds only %s', async (_case, rows) => {
         pendingRows = [...rows];
         const client = await createClient();
         markPendingKnownNonEmpty(client);
@@ -415,7 +525,7 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
         expect(discardRequestCount).toBe(0);
       });
 
-      it('asks to discard only the materializable rows beside a handed-off row', async () => {
+      it('asks to discard only the actionable rows beside a handed-off row', async () => {
         pendingRows = [handoffRow, queuedRow];
         const client = await createClient();
         markPendingKnownNonEmpty(client);
@@ -440,7 +550,7 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
         return { switched, requestSwitch };
       }
 
-      it.each(notMaterializable)('switches without confirmation when the queue holds only %s', async (_case, rows) => {
+      it.each(newlyParsedNotActionable)('switches without confirmation when the queue holds only %s', async (_case, rows) => {
         pendingRows = [...rows];
         const client = await createClient();
         markPendingKnownNonEmpty(client);
@@ -452,7 +562,7 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
         expect(discardRequestCount).toBe(0);
       });
 
-      it('asks to discard only the materializable rows beside a handed-off row', async () => {
+      it('asks to discard only the actionable rows beside a handed-off row', async () => {
         pendingRows = [handoffRow, queuedRow];
         const client = await createClient();
         markPendingKnownNonEmpty(client);
@@ -485,7 +595,7 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
         return { result, launchLocal, discardController };
       }
 
-      it.each(notMaterializable)('launches local mode without the discard gate when the queue holds only %s', async (_case, rows) => {
+      it.each(newlyParsedNotActionable)('launches local mode without the discard gate when the queue holds only %s', async (_case, rows) => {
         pendingRows = [...rows];
         const client = await createClient();
 
@@ -495,7 +605,7 @@ describe('ApiSessionClient pending queue V2 helpers', () => {
         expect(discardController).not.toHaveBeenCalled();
       });
 
-      it('gates local launch on the materializable rows beside a handed-off row', async () => {
+      it('gates local launch on the actionable rows beside a handed-off row', async () => {
         pendingRows = [handoffRow, queuedRow];
         const client = await createClient();
 
