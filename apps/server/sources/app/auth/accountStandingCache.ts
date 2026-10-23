@@ -4,10 +4,12 @@ import type { AccountStanding } from "@/app/auth/accountStanding";
  * Staleness bound for a shared account standing.
  *
  * A standing this cache hands to a caller that did not read it itself comes from a read that started less than
- * this long before the hand-over, and that no in-process `invalidate` of the account detached in the meantime:
- * - a remembered "active" standing is returned only before its read's start + bound;
- * - a caller that joined another caller's read accepts that read's result only if, when it settles, it is still
- *   before start + bound and not detached; otherwise the joiner performs one read of its own instead.
+ * this long before the hand-over, with no in-process `invalidate` (of any account) between that read's start and
+ * the hand-over:
+ * - a remembered "active" standing is returned only before its read's start + bound; `invalidate` forgets it;
+ * - a caller that joined another caller's read accepts that read's result only if, at the moment it checks (after
+ *   the read settles), it is still before start + bound and the cache-wide invalidation count is the one the read
+ *   captured when it started. Otherwise the joiner performs one read of its own instead and returns that result.
  * A caller that started a read always receives that read's own result, as an uncached lookup would; a write that
  * commits while that read is in flight may or may not be seen, exactly as in the uncached code.
  * Writes made by another server process (multi-replica deployments) are not invalidated here; a caller is handed
@@ -17,7 +19,8 @@ export const ACCOUNT_STANDING_CACHE_TTL_MS = 10_000;
 
 /**
  * Upper bound on remembered "active" standings; beyond it the least recently used is forgotten. Reads in flight
- * are tracked separately, one per account with an outstanding read, and only until they settle or are detached.
+ * are tracked separately, one per account with an outstanding read, and only until they settle, are displaced by
+ * a newer read, or the account is invalidated.
  */
 export const ACCOUNT_STANDING_CACHE_MAX_ENTRIES = 4_096;
 
@@ -36,8 +39,8 @@ export interface AccountStandingCache {
      */
     resolve(accountId: string, read: (accountId: string) => Promise<AccountStanding>): Promise<AccountStanding>;
     /**
-     * Forgets the account and detaches any read in flight for it: that read is never remembered, callers that had
-     * joined it read again, and later callers start a new read. Call after every in-process write that can end an
+     * Forgets the account, stops later callers joining its read in flight (that read is never remembered), and
+     * advances the cache-wide invalidation count, so every caller already waiting on any shared read reads again. Call after every in-process write that can end an
      * account's active standing (including writes that fail ambiguously).
      */
     invalidate(accountId: string): void;
@@ -48,8 +51,8 @@ export interface AccountStandingCache {
 interface InFlightRead {
     readonly startedAtMs: number;
     readonly standing: Promise<AccountStanding>;
-    /** Set by `invalidate` while the read is in flight. */
-    detached: boolean;
+    /** `invalidations` when the read started; any later `invalidate` makes the result unshareable. */
+    readonly invalidationsAtStart: number;
 }
 
 type SettledRead =
@@ -74,6 +77,12 @@ export function createAccountStandingCache(options: AccountStandingCacheOptions)
     // Map iteration order is insertion order; re-inserting on every hit makes the first key the least recently used.
     const activeUntilMs = new Map<string, number>();
     const inFlight = new Map<string, InFlightRead>();
+    // Cache-wide count of `invalidate` calls. A shared result is handed over only if the count has not moved since
+    // its read started. Being independent of map slots, it survives a read being displaced from `inFlight` or
+    // removed by its starter's cleanup before a joiner checks. Invalidations are rare (disable, rollback delete,
+    // marker clear), so the cost of counting every account is at most one extra read for the callers waiting at
+    // that instant.
+    let invalidations = 0;
 
     function remember(accountId: string, expiresAtMs: number): void {
         activeUntilMs.delete(accountId);
@@ -90,12 +99,12 @@ export function createAccountStandingCache(options: AccountStandingCacheOptions)
         read: (accountId: string) => Promise<AccountStanding>,
         startedAtMs: number,
     ): Promise<AccountStanding> {
-        const entry: InFlightRead = { startedAtMs, standing: read(accountId), detached: false };
+        const entry: InFlightRead = { startedAtMs, standing: read(accountId), invalidationsAtStart: invalidations };
         inFlight.set(accountId, entry);
         try {
             const standing = await entry.standing;
             const expiresAtMs = entry.startedAtMs + ttlMs;
-            // An entry no longer registered was detached by `invalidate` or superseded by a newer read.
+            // An entry no longer registered was removed by `invalidate` or displaced by a newer read.
             if (standing.kind === "active" && inFlight.get(accountId) === entry && now() < expiresAtMs) {
                 remember(accountId, expiresAtMs);
             }
@@ -126,7 +135,7 @@ export function createAccountStandingCache(options: AccountStandingCacheOptions)
                     (standing) => ({ ok: true, standing }),
                     (error: unknown) => ({ ok: false, error }),
                 );
-                if (!pending.detached && now() < pending.startedAtMs + ttlMs) {
+                if (invalidations === pending.invalidationsAtStart && now() < pending.startedAtMs + ttlMs) {
                     if (settled.ok) return settled.standing;
                     throw settled.error;
                 }
@@ -137,12 +146,9 @@ export function createAccountStandingCache(options: AccountStandingCacheOptions)
             return await startRead(accountId, read, nowMs);
         },
         invalidate(accountId) {
+            invalidations += 1;
             activeUntilMs.delete(accountId);
-            const pending = inFlight.get(accountId);
-            if (pending) {
-                pending.detached = true;
-                inFlight.delete(accountId);
-            }
+            inFlight.delete(accountId);
         },
         get size() {
             return activeUntilMs.size;

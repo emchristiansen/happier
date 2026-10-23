@@ -21,6 +21,10 @@ function deferred(): Deferred {
     return { promise, resolve, reject };
 }
 
+function flushMacrotask(): Promise<void> {
+    return new Promise((resolve) => setImmediate(resolve));
+}
+
 function harness(options: { maxEntries?: number } = {}) {
     let nowMs = 0;
     const reads: string[] = [];
@@ -253,6 +257,64 @@ describe("createAccountStandingCache", () => {
         await expect(detachedStarter).rejects.toThrow("boom");
         await expect(detachedJoiner).resolves.toEqual({ kind: "active" });
         expect(detached.reads).toEqual(["a", "a"]);
+    });
+
+    it("makes a caller that joined a younger read that was later displaced read again after an invalidation", async () => {
+        const h = harness();
+        const r0 = deferred();
+        const r1 = deferred();
+        const r2 = deferred();
+
+        h.setNextResult(() => r0.promise);
+        const a = h.resolve("a");
+        h.setNow(9_000);
+        const j0 = h.resolve("a");
+
+        h.setNow(TTL_MS);
+        h.setNextResult(() => r1.promise);
+        const b = h.resolve("a");
+        h.setNow(TTL_MS + 10);
+        const j1 = h.resolve("a");
+
+        // R0 settles too late for J0, which starts R2; R2 takes the in-flight slot from R1.
+        h.setNow(TTL_MS + 20);
+        h.setNextResult(() => r2.promise);
+        r0.resolve({ kind: "active" });
+        await expect(a).resolves.toEqual({ kind: "active" });
+        await flushMacrotask();
+        expect(h.reads).toEqual(["a", "a", "a"]);
+
+        // A disable commits while R1 (displaced, young) is still pending.
+        h.setNow(TTL_MS + 30);
+        h.cache.invalidate("a");
+
+        h.setNow(TTL_MS + 40);
+        h.setNextResult(async () => ({ kind: "disabled" }));
+        r1.resolve({ kind: "active" });
+        await expect(b).resolves.toEqual({ kind: "active" });
+        await expect(j1).resolves.toEqual({ kind: "disabled" });
+
+        r2.resolve({ kind: "disabled" });
+        await expect(j0).resolves.toEqual({ kind: "disabled" });
+        expect(h.reads).toEqual(["a", "a", "a", "a"]);
+    });
+
+    it("makes a joined caller read again when an invalidation lands after the read's cleanup but before the joiner resumes", async () => {
+        const h = harness();
+        const read = deferred();
+        h.setNextResult(() => read.promise);
+        const starter = h.resolve("a");
+        const joiner = h.resolve("a");
+
+        // Registered after the starter's and joiner's reactions: runs after the starter has cleaned up its in-flight
+        // entry, but before the joiner's acceptance check resumes.
+        void read.promise.then(() => h.cache.invalidate("a"));
+        h.setNextResult(async () => ({ kind: "disabled" }));
+        read.resolve({ kind: "active" });
+
+        await expect(starter).resolves.toEqual({ kind: "active" });
+        await expect(joiner).resolves.toEqual({ kind: "disabled" });
+        expect(h.reads).toEqual(["a", "a"]);
     });
 
     it("rereads for a joined caller at most once", async () => {
