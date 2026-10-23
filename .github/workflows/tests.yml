@@ -366,7 +366,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(inputs.ui_e2e_specs != '' && '[1]' || '[1,2,3,4,5,6,7,8,9,10,11,12]') }}
+        # Probe (ob-50an2, not for merge): shard 1 only.
+        shard: [1]
     runs-on: ${{ needs.trusted_ref_guard.outputs.ubuntu_2204 }}
     timeout-minutes: 120
     env:
@@ -423,7 +424,8 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$UI_E2E_SPECS" ]; then
-            yarn -s test:e2e:ui -- --shard=${{ matrix.shard }}/12
+            # Probe (ob-50an2, not for merge): only the :328 reconnect spec, repeated 5x.
+            yarn -s test:e2e:ui -- packages/tests/suites/ui-e2e/auth.terminalConnect.daemon.spec.ts --repeat-each=5
             exit 0
           fi
 
@@ -449,7 +451,8 @@ jobs:
           yarn -s test:e2e:ui -- "${specs[@]}"
 
       - name: Upload UI E2E artifacts (Playwright)
-        if: failure()
+        # Probe (ob-50an2, not for merge): keep passing repetitions' logs too.
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ui-e2e-playwright-artifacts-shard-${{ matrix.shard }}-of-12

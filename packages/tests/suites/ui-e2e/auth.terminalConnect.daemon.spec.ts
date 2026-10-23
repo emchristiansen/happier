@@ -376,6 +376,9 @@ test.describe('ui e2e: auth + terminal connect', () => {
           HAPPIER_E2E_FAKE_CLAUDE_LOG: fakeClaudeLogPath,
           HAPPIER_E2E_FAKE_CLAUDE_SESSION_ID: `fake-claude-session-${run.runId}`,
           HAPPIER_E2E_FAKE_CLAUDE_INVOCATION_ID: `fake-claude-invocation-${run.runId}`,
+          // Probe (ob-50an2, not for merge): debug-level file logs for the restarted daemon and the
+          // session runner it spawns (buildSpawnChildProcessEnv passes HAPPIER_LOG_LEVEL through).
+          HAPPIER_LOG_LEVEL: 'debug',
         },
       });
 
