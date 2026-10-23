@@ -434,6 +434,43 @@ describe("sessionRelayAuthCache", () => {
             expect(accessKeyFindUnique).toHaveBeenCalledTimes(3);
         });
 
+        it("never installs a grant once an invalidation has run, wherever it lands after the last pool read settles", async () => {
+            // Sweep the invalidation across the microtask turns between the fill's last read settling
+            // and the call returning, including the gap between the crossing check and the install.
+            const { authorizeSessionRelayPublish, clearSessionRelayAuthorizationCache, invalidateSessionRelayAuthorizationForMachine } = await loadModule();
+            const socket = createBoundSocket();
+            const params = { socket: socket as any, connection: createConnection(socket) as any, userId: "u1", sessionId: "s1" };
+            const installedAfterInvalidation: number[] = [];
+            for (let turns = 0; turns <= 40; turns += 1) {
+                clearSessionRelayAuthorizationCache();
+                accessKeyFindUnique.mockReset();
+                accessKeyFindUnique.mockResolvedValue(currentAccessProof);
+                writeAccessKeyFindUnique.mockReset();
+                writeAccessKeyFindUnique.mockResolvedValue(null);
+                getSessionParticipantUserIds.mockReset();
+                getSessionParticipantUserIds.mockResolvedValue(["u1", "u2"]);
+
+                const participants = deferred<string[]>();
+                getSessionParticipantUserIds.mockImplementationOnce(async () => await participants.promise);
+                const inFlight = authorizeSessionRelayPublish(params);
+                while (getSessionParticipantUserIds.mock.calls.length === 0) await Promise.resolve();
+
+                participants.resolve(["u1", "u2"]);
+                for (let i = 0; i < turns; i += 1) await Promise.resolve();
+                // The revocation commits and its afterTx invalidation runs now.
+                accessKeyFindUnique.mockResolvedValue(null);
+                invalidateSessionRelayAuthorizationForMachine("m1");
+                await inFlight;
+
+                const callsBefore = accessKeyFindUnique.mock.calls.length;
+                const next = await authorizeSessionRelayPublish(params);
+                if (next !== null || accessKeyFindUnique.mock.calls.length === callsBefore) {
+                    installedAfterInvalidation.push(turns);
+                }
+            }
+            expect(installedAfterInvalidation).toEqual([]);
+        });
+
         it("still caches a fill that no invalidation overlapped", async () => {
             const fill = await startFillHeldAtParticipantLookup();
             fill.participants.resolve(["u1", "u2"]);

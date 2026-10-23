@@ -28,7 +28,8 @@ import {
  *
  * Every invalidation runs in `afterTx`, after the revoking write commits. A resolution whose reads
  * started before that commit may have read the pre-revocation state, so a cache-wide invalidation
- * count is captured when a resolution starts reading. A resolution crossed by any invalidation is
+ * count is captured when a resolution starts reading and compared with the current count in the same
+ * synchronous step that would return or store its answer. A resolution crossed by any invalidation is
  * neither returned nor stored: it is resolved once more (its reads then start after the commit and
  * see it). If that retry is crossed as well, the call is answered from a third resolution read inside
  * a transaction on the write connection, which is serialized after every commit that preceded it,
@@ -63,7 +64,12 @@ let relayAuthInvalidations = 0;
 // Read-pool resolutions before falling back to an uncached write-connection resolution.
 const RELAY_AUTH_POOL_RESOLUTION_ATTEMPTS = 2;
 
-type RelayAuthResolution = Readonly<{ participantUserIds: readonly string[] | null; crossedByInvalidation: boolean }>;
+/**
+ * A read-pool resolution and the invalidation count captured before its first read. Whether it was
+ * crossed is decided by the caller against the count current at the moment it acts, in the same
+ * synchronous continuation as the install or return, never from a value computed before an await.
+ */
+type RelayAuthResolution = Readonly<{ participantUserIds: readonly string[] | null; invalidationsAtStart: number }>;
 
 type RelayAuthBinding = Readonly<{
     accountId: string;
@@ -93,7 +99,7 @@ async function readSessionScopedMachineBindingGrant(
 async function resolveOnPool(params: RelayAuthBinding): Promise<RelayAuthResolution> {
     const invalidationsAtStart = relayAuthInvalidations;
     const participantUserIds = await readSessionScopedMachineBindingGrant(db, params);
-    return { participantUserIds, crossedByInvalidation: relayAuthInvalidations !== invalidationsAtStart };
+    return { participantUserIds, invalidationsAtStart };
 }
 
 /**
@@ -169,8 +175,10 @@ export async function authorizeSessionScopedMachineBinding(params: Readonly<{
     for (let attempt = 1; attempt <= RELAY_AUTH_POOL_RESOLUTION_ATTEMPTS; attempt += 1) {
         const startedAtMs = Date.now();
         const resolution = await resolveOnPool(params);
+        // No await from here to the install/return: the crossing check sees every invalidation that
+        // ran before this continuation, and none can run between the check and the install.
         // A crossed resolution may hold pre-invalidation facts, positive or negative: resolve again.
-        if (resolution.crossedByInvalidation) continue;
+        if (relayAuthInvalidations !== resolution.invalidationsAtStart) continue;
         if (resolution.participantUserIds === null) return null;
         relayAuthCache.set(cacheKey, {
             validUntil: startedAtMs + SESSION_RELAY_AUTH_CACHE_TTL_MS,
