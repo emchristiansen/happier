@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { PendingLocalIdSchema } from '../sessionMessages/pendingLocalId.js';
 import { PendingActivationAuthorizationV1Schema } from './pendingActivationAuthorizationV1.js';
+import { PendingQueueBlockingHeadV1Schema } from '../sessionMessages/pendingQueueBlockingHeadV1.js';
 import { decodeBase64, encodeBase64 } from '../crypto/base64.js';
 
 import {
@@ -339,6 +340,9 @@ export const V2SessionRecordSchema = z
     pendingCount: z.number().int().min(0).optional(),
     pendingBlockedCount: z.number().int().min(0).optional(),
     pendingVersion: z.number().int().min(0).optional(),
+    // The queue head holding ordinary pending rows back, or null when none does. Diagnostic only:
+    // a head this reader cannot parse is dropped (`catch`) rather than failing the whole record.
+    pendingQueueBlockingHead: PendingQueueBlockingHeadV1Schema.nullable().optional().catch(undefined),
     dataEncryptionKey: z.string().nullable(),
     share: SessionShareSchema.nullable().optional(),
     latestTurnId: z.string().min(1).nullable().optional(),

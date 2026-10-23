@@ -40,28 +40,59 @@ export type PendingMessageRowRaw = {
     authorAccountId: string | null;
 };
 
-export function mapPendingMessageRow(row: PendingMessageRowRaw): PendingMessageRow {
+/**
+ * The server's delivery status for a pending row: the persisted fields, except that a queued row
+ * whose requested action this server cannot parse reads as blocked `unsupported_action`, because no
+ * runner can ever deliver it. A missing requested action reads as the legacy `enqueue`.
+ */
+export function readPendingMessageRowDeliveryStatus(row: Readonly<{
+    status: string;
+    requestedAction?: unknown;
+    deliveryState?: string | null;
+    deliveryBlockedReason?: string | null;
+    discardedReason?: string | null;
+}>): PendingDeliveryStatusV1 {
+    return readPendingMessageRowProjection(row).deliveryStatus;
+}
+
+function readPendingMessageRowProjection(row: Readonly<{
+    status: string;
+    requestedAction?: unknown;
+    deliveryState?: string | null;
+    deliveryBlockedReason?: string | null;
+    discardedReason?: string | null;
+}>) {
     const parsedRequestedAction = row.requestedAction == null
         ? PendingRequestedActionV1Schema.safeParse({ v: 1, kind: "enqueue" })
         : PendingRequestedActionV1Schema.safeParse(row.requestedAction);
     const requestedActionMalformed = !parsedRequestedAction.success;
+    const deliveryStatus: PendingDeliveryStatusV1 = requestedActionMalformed && row.status !== "discarded"
+        ? { status: "blocked", reason: "unsupported_action" }
+        : normalizePendingDeliveryStatusV1({
+            status: row.status,
+            deliveryState: row.deliveryState,
+            deliveryBlockedReason: row.deliveryBlockedReason,
+            discardedReason: row.discardedReason,
+        });
+    return {
+        requestedAction: parsedRequestedAction.success ? parsedRequestedAction.data : null,
+        deliveryStatus,
+    };
+}
+
+export function mapPendingMessageRow(row: PendingMessageRowRaw): PendingMessageRow {
+    const projection = readPendingMessageRowProjection(row);
+    const requestedActionMalformed = projection.requestedAction === null;
     return {
         localId: row.localId,
         messageRole: parseSessionMessageRole(row.messageRole),
         content: row.content,
-        ...(parsedRequestedAction.success ? { requestedAction: parsedRequestedAction.data } : {}),
+        ...(projection.requestedAction ? { requestedAction: projection.requestedAction } : {}),
         ...(requestedActionMalformed ? { requestedActionMalformed: true as const } : {}),
         status: row.status,
         deliveryState: typeof row.deliveryState === "string" && row.deliveryState.length > 0 ? row.deliveryState : null,
         deliveryBlockedReason: typeof row.deliveryBlockedReason === "string" && row.deliveryBlockedReason.length > 0 ? row.deliveryBlockedReason : null,
-        deliveryStatus: requestedActionMalformed && row.status !== "discarded"
-            ? { status: "blocked", reason: "unsupported_action" }
-            : normalizePendingDeliveryStatusV1({
-                status: row.status,
-                deliveryState: row.deliveryState,
-                deliveryBlockedReason: row.deliveryBlockedReason,
-                discardedReason: row.discardedReason,
-            }),
+        deliveryStatus: projection.deliveryStatus,
         position: row.position,
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,

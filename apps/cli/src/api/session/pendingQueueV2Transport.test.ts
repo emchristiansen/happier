@@ -625,6 +625,65 @@ describe('pendingQueueV2Transport', () => {
         expect(mockPost).not.toHaveBeenCalled();
     });
 
+    it('carries the blocking queue head the server reports with a predecessor deferral', async () => {
+        const blockingHead = {
+            localId: 'head-1',
+            deliveryState: 'blocked',
+            blockedReason: 'delivery_outcome_uncertain',
+            lastUpdatedAt: 1_700_000_000_000,
+            ageSinceLastUpdateMs: 45_000,
+        };
+        const socket = {
+            connected: true,
+            timeout: vi.fn(() => socket),
+            emitWithAck: vi.fn(async () => ({
+                ok: true,
+                didMaterialize: false,
+                pendingCount: 2,
+                pendingBlockedCount: 1,
+                pendingVersion: 9,
+                deferredReason: 'waiting_for_predecessor',
+                blockingHead,
+            })),
+        };
+
+        await expect(materializeNextPendingQueueV2Message({
+            token: 'token',
+            sessionId: 'session-1',
+            socket: socket as any,
+            deliveryStateOptIn: true,
+        })).resolves.toMatchObject({
+            didMaterialize: false,
+            deferredReason: 'waiting_for_predecessor',
+            blockingHead,
+        });
+    });
+
+    it('drops a malformed blocking queue head without failing the deferral', async () => {
+        const socket = {
+            connected: true,
+            timeout: vi.fn(() => socket),
+            emitWithAck: vi.fn(async () => ({
+                ok: true,
+                didMaterialize: false,
+                pendingCount: 2,
+                pendingBlockedCount: 1,
+                pendingVersion: 9,
+                deferredReason: 'waiting_for_predecessor',
+                blockingHead: { localId: 'head-1', deliveryState: 'blocked' },
+            })),
+        };
+
+        const result = await materializeNextPendingQueueV2Message({
+            token: 'token',
+            sessionId: 'session-1',
+            socket: socket as any,
+            deliveryStateOptIn: true,
+        });
+        expect(result).toMatchObject({ didMaterialize: false, deferredReason: 'waiting_for_predecessor' });
+        expect(result).not.toHaveProperty('blockingHead');
+    });
+
     it('does not redrive through HTTP after a connected socket response is lost', async () => {
         const socket = {
             connected: true,

@@ -1701,4 +1701,55 @@ describe("sessionUpdateHandler", () => {
         });
     });
 
+    it("reports the blocking queue head with a predecessor deferral", async () => {
+        const blockingHead = {
+            localId: "head-1",
+            deliveryState: "blocked",
+            blockedReason: "delivery_outcome_uncertain",
+            lastUpdatedAt: 1_700_000_000_000,
+            ageSinceLastUpdateMs: 45_000,
+        };
+        materializeNextPendingMessageForCurrentPublisher.mockResolvedValueOnce({
+            ok: true,
+            didMaterialize: false,
+            pendingCount: 2,
+            pendingBlockedCount: 1,
+            pendingVersion: 9,
+            deliveryState: { mode: "provider", unresolved: true },
+            deferredReason: "waiting_for_predecessor",
+            blockingHead,
+        });
+        const socket = createFakeSocket();
+
+        registerSessionUpdateHandler(
+            "user-1",
+            socket as any,
+            { connectionType: "session-scoped", socket: socket as any, userId: "user-1", sessionId: "s-head-reported" } as any,
+            {
+                presence: { resolveCurrentPublisher, runAsCurrentPublisher, runAsCurrentPublisherInTx },
+                binding: { accountId: "user-1", machineId: "machine-1", sessionId: "s-head-reported" },
+            },
+        );
+
+        const handler = getSocketHandler(socket, "pending-materialize-next");
+        const callback = vi.fn();
+        await handler({
+            sid: "s-head-reported",
+            deliveryState: "provider",
+            deliveryTiming: "after_foreground_ready",
+            foregroundState: "ready",
+        }, callback);
+
+        expect(callback).toHaveBeenCalledWith({
+            ok: true,
+            didMaterialize: false,
+            pendingCount: 2,
+            pendingBlockedCount: 1,
+            pendingVersion: 9,
+            deliveryState: { mode: "provider", unresolved: true },
+            deferredReason: "waiting_for_predecessor",
+            blockingHead,
+        });
+    });
+
 });

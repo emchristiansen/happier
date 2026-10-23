@@ -92,4 +92,60 @@ describe('publishSessionPendingQueueWake', () => {
     expect(loggerMocks.warn).not.toHaveBeenCalled();
     expect(loggerMocks.infoFile).not.toHaveBeenCalled();
   });
+  it('logs the blocking queue head the server reports in session state after a published wake', async () => {
+    const readBlockingHead = vi.fn(async () => ({
+      localId: 'head-1',
+      deliveryState: 'blocked' as const,
+      blockedReason: 'provider_unavailable_before_acceptance' as const,
+      lastUpdatedAt: 1_700_000_000_000,
+      ageSinceLastUpdateMs: 120_000,
+    }));
+    publishSessionPendingQueueWake({
+      sessionId: 'sess-stalled',
+      isShutdownRequested: () => false,
+      logLabel: 'attach',
+      requestWake: async () => ({ type: 'wake_published' }),
+      readBlockingHead,
+    });
+
+    await vi.waitFor(() => expect(loggerMocks.infoFile).toHaveBeenCalledWith(
+      '[DAEMON RUN] Pending queue head is holding back ordinary pending input',
+      {
+        event: 'pending_queue_blocking_head',
+        sessionId: 'sess-stalled',
+        trigger: 'attach',
+        localId: 'head-1',
+        deliveryState: 'blocked',
+        blockedReason: 'provider_unavailable_before_acceptance',
+        lastUpdatedAt: 1_700_000_000_000,
+        ageSinceLastUpdateMs: 120_000,
+      },
+    ));
+    expect(readBlockingHead).toHaveBeenCalledOnce();
+  });
+
+  it('logs nothing more when the server reports no blocking head, and never reads it after an unavailable wake', async () => {
+    const readNoHead = vi.fn(async () => null);
+    publishSessionPendingQueueWake({
+      sessionId: 'sess-flowing',
+      isShutdownRequested: () => false,
+      logLabel: 'attach',
+      requestWake: async () => ({ type: 'wake_published' }),
+      readBlockingHead: readNoHead,
+    });
+    await vi.waitFor(() => expect(readNoHead).toHaveBeenCalledOnce());
+    await Promise.resolve();
+    expect(loggerMocks.infoFile).toHaveBeenCalledTimes(1);
+
+    const readAfterUnavailable = vi.fn(async () => null);
+    publishSessionPendingQueueWake({
+      sessionId: 'sess-unavailable',
+      isShutdownRequested: () => false,
+      logLabel: 'attach',
+      requestWake: async () => ({ type: 'unavailable', reason: 'runtime_terminating' }),
+      readBlockingHead: readAfterUnavailable,
+    });
+    await vi.waitFor(() => expect(loggerMocks.warn).toHaveBeenCalled());
+    expect(readAfterUnavailable).not.toHaveBeenCalled();
+  });
 });

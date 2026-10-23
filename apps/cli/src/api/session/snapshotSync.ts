@@ -4,6 +4,8 @@ import { fetchSessionByIdCompat } from '@/session/transport/http/sessionsHttp';
 import { isDeepStrictEqual } from 'node:util';
 import { tryParseJsonRecord } from '@/utils/tryParseJsonRecord';
 import { readKnownPendingQueueState, type KnownPendingQueueState } from './pendingQueueState';
+import { readSessionPendingQueueBlockingHead } from './pendingQueueBlockingHead';
+import type { PendingQueueBlockingHeadV1 } from '@happier-dev/protocol';
 import type { SessionSnapshotRefreshReasonInput } from './sessionSnapshotRefreshReason';
 import { readLatestTurnStatusSnapshot, type LatestTurnStatusSnapshot } from './sessionTurnStatusSnapshot';
 import {
@@ -61,6 +63,8 @@ export async function fetchSessionSnapshotUpdateFromServer(opts: {
     metadata?: { metadata: Metadata; metadataVersion: number };
     agentState?: { agentState: AgentState | null; agentStateVersion: number };
     pendingQueueState?: KnownPendingQueueState;
+    /** The head the server reports as holding ordinary pending rows back; absent when unreported. */
+    pendingQueueBlockingHead?: PendingQueueBlockingHeadV1 | null;
     latestTurnStatus?: LatestTurnStatusSnapshot;
     latestTurnStatusObservedAt?: number;
     runtimeActivityProjection?: SessionRuntimeActivityProjectionBoundary;
@@ -76,6 +80,7 @@ export async function fetchSessionSnapshotUpdateFromServer(opts: {
         metadata?: { metadata: Metadata; metadataVersion: number };
         agentState?: { agentState: AgentState | null; agentStateVersion: number };
         pendingQueueState?: KnownPendingQueueState;
+        pendingQueueBlockingHead?: PendingQueueBlockingHeadV1 | null;
         latestTurnStatus?: LatestTurnStatusSnapshot;
         latestTurnStatusObservedAt?: number;
         runtimeActivityProjection?: SessionRuntimeActivityProjectionBoundary;
@@ -102,6 +107,11 @@ export async function fetchSessionSnapshotUpdateFromServer(opts: {
     const pendingQueueState = readKnownPendingQueueState(raw);
     if (pendingQueueState) {
         out.pendingQueueState = pendingQueueState;
+    }
+
+    const pendingQueueBlockingHead = readSessionPendingQueueBlockingHead(raw);
+    if (pendingQueueBlockingHead !== undefined) {
+        out.pendingQueueBlockingHead = pendingQueueBlockingHead;
     }
 
     // Sync metadata if it is newer than our local view.

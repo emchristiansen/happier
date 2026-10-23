@@ -18,7 +18,9 @@ import {
     type PendingDeliveryStatusV1,
     PendingRequestedActionV1Schema,
     readPendingLocalId,
+    readPendingQueueBlockingHeadV1,
     type PendingProviderAction,
+    type PendingQueueBlockingHeadV1,
     type PendingRequestedActionV1,
     type SessionPendingQueueDeliveryTiming,
     type SessionMessageRole,
@@ -53,6 +55,8 @@ export type PendingQueueMaterializeNextResult = {
     message?: PendingQueueMaterializedMessage | null;
     pendingQueueState?: KnownPendingQueueState;
     deferredReason?: PendingQueueMaterializeDeferredReason;
+    /** With `waiting_for_predecessor`: the head the server reports ordinary rows wait behind. */
+    blockingHead?: PendingQueueBlockingHeadV1;
     retryAfterMs?: number;
     runtimeActivityNotice?: Readonly<{ id: string; message: string }>;
     deliveryState?: PendingMaterializationDeliveryState | null;
@@ -153,12 +157,12 @@ type PendingQueueWriteBody = Readonly<(
 
 type PendingQueueSocketMaterializeResult =
     | { ok: true; didMaterialize: true; localId: string | null; didWrite: boolean; message: PendingQueueMaterializedMessage | null; providerDeliveryContractInvalid?: boolean; pendingQueueState?: KnownPendingQueueState; runtimeActivityNotice?: Readonly<{ id: string; message: string }> }
-    | { ok: true; didMaterialize: false; pendingQueueState?: KnownPendingQueueState; deferredReason?: PendingQueueMaterializeDeferredReason; retryAfterMs?: number; deliveryState?: PendingMaterializationDeliveryState | null }
+    | { ok: true; didMaterialize: false; pendingQueueState?: KnownPendingQueueState; deferredReason?: PendingQueueMaterializeDeferredReason; blockingHead?: PendingQueueBlockingHeadV1; retryAfterMs?: number; deliveryState?: PendingMaterializationDeliveryState | null }
     | { ok: false; error: unknown };
 
 type PendingQueueHttpMaterializeResult =
     | { ok: true; didMaterialize: true; localId: string | null; didWrite: boolean; message: PendingQueueMaterializedMessage | null; providerDeliveryContractInvalid?: boolean; pendingQueueState?: KnownPendingQueueState; runtimeActivityNotice?: Readonly<{ id: string; message: string }> }
-    | { ok: true; didMaterialize: false; pendingQueueState?: KnownPendingQueueState; deferredReason?: PendingQueueMaterializeDeferredReason; retryAfterMs?: number; deliveryState?: PendingMaterializationDeliveryState | null };
+    | { ok: true; didMaterialize: false; pendingQueueState?: KnownPendingQueueState; deferredReason?: PendingQueueMaterializeDeferredReason; blockingHead?: PendingQueueBlockingHeadV1; retryAfterMs?: number; deliveryState?: PendingMaterializationDeliveryState | null };
 
 type PendingMaterializeAckSocket = Parameters<typeof emitSocketWithAck>[0]['socket'];
 
@@ -351,6 +355,12 @@ function readPendingMaterializeDeferredReason(value: unknown): PendingQueueMater
         || reason === 'waiting_for_foreground_turn'
         ? reason
         : undefined;
+}
+
+/** A malformed or absent report yields nothing: the deferral itself stays valid. */
+function readPendingMaterializeBlockingHead(value: unknown): PendingQueueBlockingHeadV1 | undefined {
+    if (!value || typeof value !== 'object') return undefined;
+    return readPendingQueueBlockingHeadV1((value as { blockingHead?: unknown }).blockingHead) ?? undefined;
 }
 
 function readPendingMaterializeRetryAfterMs(value: unknown): number | undefined {
@@ -1108,6 +1118,7 @@ async function tryMaterializeNextViaSocket(params: {
         const pendingQueueState = readKnownPendingQueueState(rawAck);
         if (rawAck.didMaterialize !== true) {
             const deferredReason = readPendingMaterializeDeferredReason(rawAck);
+            const blockingHead = readPendingMaterializeBlockingHead(rawAck);
             const retryAfterMs = readPendingMaterializeRetryAfterMs(rawAck);
             const deliveryState = parseDeliveryState(rawAck.deliveryState).deliveryState;
             return {
@@ -1115,6 +1126,7 @@ async function tryMaterializeNextViaSocket(params: {
                 didMaterialize: false,
                 ...(pendingQueueState ? { pendingQueueState } : {}),
                 ...(deferredReason ? { deferredReason } : {}),
+                ...(blockingHead ? { blockingHead } : {}),
                 ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
                 ...(deliveryState ? { deliveryState } : {}),
             };
@@ -1173,6 +1185,7 @@ async function tryMaterializeNextViaHttp(params: {
     const pendingQueueState = readKnownPendingQueueState(data);
     if (data.didMaterialize !== true) {
         const deferredReason = readPendingMaterializeDeferredReason(data);
+        const blockingHead = readPendingMaterializeBlockingHead(data);
         const retryAfterMs = readPendingMaterializeRetryAfterMs(data);
         const deliveryState = parseDeliveryState(data.deliveryState).deliveryState;
         return {
@@ -1180,6 +1193,7 @@ async function tryMaterializeNextViaHttp(params: {
             didMaterialize: false,
             ...(pendingQueueState ? { pendingQueueState } : {}),
             ...(deferredReason ? { deferredReason } : {}),
+            ...(blockingHead ? { blockingHead } : {}),
             ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
             ...(deliveryState ? { deliveryState } : {}),
         };
@@ -1228,6 +1242,7 @@ export async function materializeNextPendingQueueV2MessageViaHttp(params: {
             didWrite: false,
             ...(res.pendingQueueState ? { pendingQueueState: res.pendingQueueState } : {}),
             ...(res.deferredReason ? { deferredReason: res.deferredReason } : {}),
+            ...(res.blockingHead ? { blockingHead: res.blockingHead } : {}),
             ...(res.retryAfterMs !== undefined ? { retryAfterMs: res.retryAfterMs } : {}),
             ...(res.deliveryState ? { deliveryState: res.deliveryState } : {}),
         };
@@ -1318,6 +1333,7 @@ export async function materializeNextPendingQueueV2Message(params: {
             didWrite: false,
             ...(res.pendingQueueState ? { pendingQueueState: res.pendingQueueState } : {}),
             ...(res.deferredReason ? { deferredReason: res.deferredReason } : {}),
+            ...(res.blockingHead ? { blockingHead: res.blockingHead } : {}),
             ...(res.retryAfterMs !== undefined ? { retryAfterMs: res.retryAfterMs } : {}),
             ...(res.deliveryState ? { deliveryState: res.deliveryState } : {}),
         };

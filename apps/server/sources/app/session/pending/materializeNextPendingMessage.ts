@@ -14,6 +14,7 @@ import {
     PendingRequestedActionV1Schema,
     readPendingLocalId,
     type PendingProviderAction,
+    type PendingQueueBlockingHeadV1,
     type PendingRequestedActionV1,
     type SessionMessageRole,
     type SessionPendingQueueDeliveryTiming,
@@ -29,6 +30,11 @@ import {
     type TrustedPendingPublisherFence,
 } from "@/app/session/pending/pendingPublisherAuthority";
 import { reconcilePendingActivationAuthorizationForRemovedRequestInTx } from "@/app/session/pending/pendingActivationAuthorization";
+import {
+    describePendingQueueBlockingHead,
+    pendingQueueHeadOrderBy,
+    splitPendingQueueHead,
+} from "@/app/session/pending/pendingQueueBlockingHead";
 
 type ParticipantCursor = SessionParticipantCursor;
 class PublisherAuthorityLostError extends Error {}
@@ -64,6 +70,8 @@ export type MaterializeNextPendingMessageResult =
         badgeAttentionChanged?: boolean;
         deliveryState?: PendingMaterializationDeliveryState;
         deferredReason?: RuntimeActivityPendingDeferredReason | "waiting_for_foreground_turn" | "pending_version_mismatch" | "waiting_for_predecessor";
+        /** With `waiting_for_predecessor`: the head ordinary rows wait behind. Reporting only. */
+        blockingHead?: PendingQueueBlockingHeadV1;
         retryAfterMs?: number;
       }
     | {
@@ -212,6 +220,76 @@ async function tryRejoinProviderClaimInTx(params: Readonly<{
                 deliveryState: { mode: "provider", unresolved: true },
                 badgeAttentionChanged: false,
             };
+}
+
+type SessionBadgeFields = Parameters<typeof didSessionActivityBadgeContributionChange>[0];
+
+/**
+ * Stores, for leading queue rows the materializer passes, the status the server already reports for
+ * them: a plain queued row whose requested action this server cannot parse reads everywhere as
+ * blocked `unsupported_action`, and this makes the stored row and the session counters say so too.
+ * Without it the blocked counter would keep counting such a row as deliverable, so a runner would
+ * keep treating the queue as holding deliverable work. Rows already stored as blocked are left as
+ * they are. Nothing else about the row changes; it stays queued and can be resolved by hand.
+ */
+async function storeProjectedUnsupportedActionBlocksInTx(params: Readonly<{
+    tx: Tx;
+    sessionId: string;
+    rows: readonly Readonly<{ localId: string; deliveryState: string | null }>[];
+    trustedPublisherFence: TrustedPendingPublisherFence;
+    sessionBefore: SessionBadgeFields;
+}>): Promise<{
+    pendingCount: number;
+    pendingBlockedCount: number;
+    pendingVersion: number;
+    participantCursorsPending: readonly ParticipantCursor[];
+    badgeAttentionChanged: boolean;
+} | null> {
+    const tx = params.tx;
+    const localIds = params.rows.filter((row) => row.deliveryState === null).map((row) => row.localId);
+    if (localIds.length === 0) return null;
+    const blocked = pendingDeliveryStatusV1ToPersistedFields({ status: "blocked", reason: "unsupported_action" });
+    const stored = await tx.sessionPendingMessage.updateMany({
+        where: { sessionId: params.sessionId, localId: { in: localIds }, status: "queued", deliveryState: null },
+        data: { deliveryState: blocked.deliveryState, deliveryBlockedReason: blocked.deliveryBlockedReason },
+    });
+    if (stored.count === 0) return null;
+    const pendingCount = await tx.sessionPendingMessage.count({
+        where: { sessionId: params.sessionId, status: "queued" },
+    });
+    const pendingBlockedCount = await tx.sessionPendingMessage.count({
+        where: { sessionId: params.sessionId, status: "queued", deliveryState: "blocked" },
+    });
+    const publisherFence = await tx.session.updateMany({
+        where: {
+            id: params.sessionId,
+            active: true,
+            archivedAt: null,
+            lastActiveAt: params.trustedPublisherFence.committedFence,
+        },
+        data: { pendingCount, pendingBlockedCount, pendingVersion: { increment: 1 } },
+    });
+    if (publisherFence.count !== 1) throw new PublisherAuthorityLostError();
+    const updated = await tx.session.findUniqueOrThrow({
+        where: { id: params.sessionId },
+        select: { pendingCount: true, pendingBlockedCount: true, pendingVersion: true },
+    });
+    const participantCursorsPending = await markPendingStateChangedParticipants({
+        tx,
+        sessionId: params.sessionId,
+        pendingCount: updated.pendingCount,
+        pendingBlockedCount: updated.pendingBlockedCount,
+        pendingVersion: updated.pendingVersion,
+    });
+    return {
+        ...updated,
+        participantCursorsPending,
+        badgeAttentionChanged: didSessionActivityBadgeContributionChange(params.sessionBefore, {
+            ...params.sessionBefore,
+            pendingCount: updated.pendingCount,
+            pendingBlockedCount: updated.pendingBlockedCount,
+        }),
+    };
 }
 
 export async function materializeNextPendingMessageForCurrentPublisher(params: Readonly<{
@@ -432,7 +510,7 @@ async function materializeNextPendingMessageInTx(
 
             const queuedPending = await tx.sessionPendingMessage.findMany({
                 where: { sessionId, status: "queued" },
-                orderBy: [{ position: "asc" }, { createdAt: "asc" }, { localId: "asc" }],
+                orderBy: pendingQueueHeadOrderBy,
                 select: {
                     localId: true,
                     messageRole: true,
@@ -441,12 +519,17 @@ async function materializeNextPendingMessageInTx(
                     providerAction: true,
                     status: true,
                     deliveryState: true,
+                    deliveryBlockedReason: true,
                     createdAt: true,
                     updatedAt: true,
                 },
             });
 
-            const queueHead = queuedPending[0];
+            // Ordinary delivery passes leading rows whose requested action this server cannot
+            // parse (blocked `unsupported_action`, stored or projected): no runner can ever deliver
+            // them, so no delivered message changes order. Every other head still holds ordinary
+            // rows back below.
+            const { passedUnsupported, head: queueHead } = splitPendingQueueHead(queuedPending);
             const exactActionCandidate = queuedPending.find((row) => {
                 if (row.deliveryState !== null) return false;
                 const action = PendingRequestedActionV1Schema.safeParse(row.requestedAction);
@@ -458,6 +541,27 @@ async function materializeNextPendingMessageInTx(
                         && foregroundState === "active_steerable"
                     );
             });
+            // When ordinary (FIFO) delivery reaches such rows, store the block the server already
+            // reports for them, so the counters stop counting them as deliverable. An explicit
+            // action that bypasses them leaves them exactly as they are.
+            const storedUnsupportedBlocks = exactActionCandidate
+                ? null
+                : await storeProjectedUnsupportedActionBlocksInTx({
+                    tx,
+                    sessionId,
+                    rows: passedUnsupported,
+                    trustedPublisherFence: params.trustedPublisherFence,
+                    sessionBefore,
+                });
+            // Counts a no-op answer reports: the stored blocks above already moved them.
+            const sessionCounts = storedUnsupportedBlocks ?? sessionBefore;
+            const storedBlocksChange = storedUnsupportedBlocks
+                ? {
+                    pendingStateChanged: true,
+                    participantCursorsPending: [...storedUnsupportedBlocks.participantCursorsPending],
+                    badgeAttentionChanged: storedUnsupportedBlocks.badgeAttentionChanged,
+                }
+                : {};
 
             if (!queueHead) {
                 const pendingCount = await tx.sessionPendingMessage.count({
@@ -466,13 +570,13 @@ async function materializeNextPendingMessageInTx(
                 const blockedCount = await tx.sessionPendingMessage.count({
                     where: { sessionId, status: "queued", deliveryState: "blocked" },
                 });
-                if ((sessionBefore.pendingCount ?? 0) !== pendingCount || (sessionBefore.pendingBlockedCount ?? 0) !== blockedCount) {
+                if ((sessionCounts.pendingCount ?? 0) !== pendingCount || (sessionCounts.pendingBlockedCount ?? 0) !== blockedCount) {
                     await tx.session.updateMany({
                         where: {
                             id: sessionId,
-                            pendingCount: sessionBefore.pendingCount,
-                            pendingBlockedCount: sessionBefore.pendingBlockedCount,
-                            pendingVersion: sessionBefore.pendingVersion,
+                            pendingCount: sessionCounts.pendingCount,
+                            pendingBlockedCount: sessionCounts.pendingBlockedCount,
+                            pendingVersion: sessionCounts.pendingVersion,
                         },
                         data: { pendingCount, pendingBlockedCount: blockedCount, pendingVersion: { increment: 1 } },
                     });
@@ -486,6 +590,7 @@ async function materializeNextPendingMessageInTx(
                         pendingCount: latestSession.pendingCount,
                         pendingBlockedCount: latestSession.pendingBlockedCount,
                         pendingVersion: latestSession.pendingVersion,
+                        ...storedBlocksChange,
                         ...(noopDeliveryState ? { deliveryState: noopDeliveryState } : {}),
                     } as const;
                 }
@@ -493,9 +598,10 @@ async function materializeNextPendingMessageInTx(
                 return {
                     ok: true,
                     didMaterialize: false,
-                    pendingCount: sessionBefore.pendingCount ?? 0,
-                    pendingBlockedCount: sessionBefore.pendingBlockedCount ?? 0,
-                    pendingVersion: sessionBefore.pendingVersion ?? 0,
+                    pendingCount: sessionCounts.pendingCount ?? 0,
+                    pendingBlockedCount: sessionCounts.pendingBlockedCount ?? 0,
+                    pendingVersion: sessionCounts.pendingVersion ?? 0,
+                    ...storedBlocksChange,
                     ...(noopDeliveryState ? { deliveryState: noopDeliveryState } : {}),
                 } as const;
             }
@@ -504,13 +610,17 @@ async function materializeNextPendingMessageInTx(
             }
 
             if (!exactActionCandidate && queueHead.deliveryState !== null) {
+                // Reported so a runner and daemon can see the stall. Nothing here acts on the head.
+                const blockingHead = describePendingQueueBlockingHead(queueHead, Date.now());
                 return {
                     ok: true,
                     didMaterialize: false,
-                    pendingCount: sessionBefore.pendingCount ?? 0,
-                    pendingBlockedCount: sessionBefore.pendingBlockedCount ?? 0,
-                    pendingVersion: sessionBefore.pendingVersion ?? 0,
+                    pendingCount: sessionCounts.pendingCount ?? 0,
+                    pendingBlockedCount: sessionCounts.pendingBlockedCount ?? 0,
+                    pendingVersion: sessionCounts.pendingVersion ?? 0,
+                    ...storedBlocksChange,
                     deferredReason: "waiting_for_predecessor",
+                    ...(blockingHead ? { blockingHead } : {}),
                     ...(materializedDeliveryState ? { deliveryState: materializedDeliveryState } : {}),
                 } as const;
             }
@@ -540,9 +650,10 @@ async function materializeNextPendingMessageInTx(
                 return {
                     ok: true,
                     didMaterialize: false,
-                    pendingCount: sessionBefore.pendingCount ?? 0,
-                    pendingBlockedCount: sessionBefore.pendingBlockedCount ?? 0,
-                    pendingVersion: sessionBefore.pendingVersion ?? 0,
+                    pendingCount: sessionCounts.pendingCount ?? 0,
+                    pendingBlockedCount: sessionCounts.pendingBlockedCount ?? 0,
+                    pendingVersion: sessionCounts.pendingVersion ?? 0,
+                    ...storedBlocksChange,
                     deferredReason: "waiting_for_foreground_turn",
                     ...(noopDeliveryState ? { deliveryState: noopDeliveryState } : {}),
                 } as const;
@@ -569,9 +680,10 @@ async function materializeNextPendingMessageInTx(
                     return {
                         ok: true,
                         didMaterialize: false,
-                        pendingCount: sessionBefore.pendingCount ?? 0,
-                        pendingBlockedCount: sessionBefore.pendingBlockedCount ?? 0,
-                        pendingVersion: sessionBefore.pendingVersion ?? 0,
+                        pendingCount: sessionCounts.pendingCount ?? 0,
+                        pendingBlockedCount: sessionCounts.pendingBlockedCount ?? 0,
+                        pendingVersion: sessionCounts.pendingVersion ?? 0,
+                        ...storedBlocksChange,
                         deferredReason: activityDecision.reason === "active"
                             ? "waiting_for_runtime_activity"
                             : "runtime_activity_unknown",
@@ -585,9 +697,10 @@ async function materializeNextPendingMessageInTx(
                     return {
                         ok: true,
                         didMaterialize: false,
-                        pendingCount: sessionBefore.pendingCount ?? 0,
-                        pendingBlockedCount: sessionBefore.pendingBlockedCount ?? 0,
-                        pendingVersion: sessionBefore.pendingVersion ?? 0,
+                        pendingCount: sessionCounts.pendingCount ?? 0,
+                        pendingBlockedCount: sessionCounts.pendingBlockedCount ?? 0,
+                        pendingVersion: sessionCounts.pendingVersion ?? 0,
+                        ...storedBlocksChange,
                         deferredReason: "runtime_activity_unknown",
                         ...(noopDeliveryState ? { deliveryState: noopDeliveryState } : {}),
                     } as const;
@@ -651,6 +764,7 @@ async function materializeNextPendingMessageInTx(
                         pendingCount: latestSession.pendingCount,
                         pendingBlockedCount: latestSession.pendingBlockedCount,
                         pendingVersion: latestSession.pendingVersion,
+                        ...storedBlocksChange,
                         ...(noopDeliveryState ? { deliveryState: noopDeliveryState } : {}),
                     } as const;
                 }

@@ -334,6 +334,7 @@ import {
     type KnownPendingQueueState,
     type PendingQueueState,
 } from './pendingQueueState';
+import { PendingQueueBlockingHeadLog } from './pendingQueueBlockingHead';
 import type { PendingForegroundSteerability } from './pendingForegroundSteerability';
 import {
     type PendingQueueRuntimeActivityProjection,
@@ -706,6 +707,7 @@ export class ApiSessionClient extends EventEmitter {
     private readonly explicitUserRecoveryCheckedLocalIdCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private pendingWakeSeq = 0;
     private pendingQueueState: PendingQueueState = UNKNOWN_PENDING_QUEUE_STATE;
+    private pendingQueueBlockingHeadLogInstance: PendingQueueBlockingHeadLog | null = null;
     private pendingQueueStateReconcileInFlight: {
         request: { force: boolean; discovery: boolean };
         promise: Promise<boolean>;
@@ -2300,6 +2302,12 @@ export class ApiSessionClient extends EventEmitter {
         if (recovered && !changed) this.publishPendingEligibilityWake();
     }
 
+    /** Info-level visibility of the head the server reports as holding ordinary input back. */
+    private get pendingQueueBlockingHeadLog(): PendingQueueBlockingHeadLog {
+        this.pendingQueueBlockingHeadLogInstance ??= new PendingQueueBlockingHeadLog(this.sessionId);
+        return this.pendingQueueBlockingHeadLogInstance;
+    }
+
     shouldAttemptPendingMaterialization(opts: {
         activeTurnSteerability?: PendingForegroundSteerability;
         pendingQueueDeliveryTiming?: SessionPendingQueueDeliveryTiming;
@@ -2526,6 +2534,7 @@ export class ApiSessionClient extends EventEmitter {
                     this.applyRuntimeActivityProjectionFromServer(update.runtimeActivityProjection);
                 }
 
+                this.pendingQueueBlockingHeadLog.observe(update.pendingQueueBlockingHead, 'session_snapshot');
                 if (update.pendingQueueState) {
                     this.applyPendingQueueState(update.pendingQueueState, { emit: true });
                     if (latestTurnStatus !== undefined && this.pendingQueueState.known
@@ -6884,6 +6893,7 @@ export class ApiSessionClient extends EventEmitter {
                 return { didMaterialize: false, result: { type: 'deferred', reason: 'pending_version_mismatch' } };
             }
             if (materializeResult.deferredReason === 'waiting_for_predecessor') {
+                this.pendingQueueBlockingHeadLog.observe(materializeResult.blockingHead, 'materialize');
                 return { didMaterialize: false, result: { type: 'deferred', reason: 'waiting_for_predecessor' } };
             }
             if (materializeResult.deferredReason === 'waiting_for_foreground_turn') {

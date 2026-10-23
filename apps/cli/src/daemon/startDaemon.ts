@@ -24,6 +24,7 @@ import {
   requestSessionPendingQueueWakeV1,
 } from './sessions/pendingQueueWake';
 import { publishSessionPendingQueueWake } from './sessions/publishSessionPendingQueueWake';
+import { readSessionPendingQueueBlockingHead } from '@/api/session/pendingQueueBlockingHead';
 import { retryRuntimeAuthLimitAfterReset } from './connectedServices/runtimeAuth/retryRuntimeAuthLimitAfterReset';
 import { createRuntimeAuthRecoverySchedulerForDaemon } from './connectedServices/runtimeAuth/createRuntimeAuthRecoverySchedulerForDaemon';
 import { projectTemporaryThrottleRecoveryMetadata } from './connectedServices/runtimeAuth/projection/temporaryThrottleRecoveryMetadata';
@@ -1557,6 +1558,12 @@ async function nudgeAttachedExistingSessionPendingQueue(params: Readonly<{
       credentials: params.credentials,
       isShutdownRequested: params.isShutdownRequested,
     }),
+    // One read of session state per published attach wake, so the daemon log shows a held head.
+    readBlockingHead: async () => readSessionPendingQueueBlockingHead(await fetchSessionByIdCompat({
+      token: params.credentials.token,
+      sessionId: resolvedSessionId,
+      reason: 'pending-reconciliation',
+    })),
   });
   return params.resolved;
 }

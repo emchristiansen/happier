@@ -5344,4 +5344,105 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     }
   });
 
+  describe('blocking queue head the server reports', () => {
+    const blockedHead = {
+      localId: 'head-blocked',
+      deliveryState: 'blocked' as const,
+      blockedReason: 'delivery_outcome_uncertain' as const,
+      lastUpdatedAt: 1_700_000_000_000,
+      ageSinceLastUpdateMs: 45_000,
+    };
+
+    function predecessorDeferral(blockingHead: unknown) {
+      return {
+        didMaterialize: false,
+        localId: null,
+        didWrite: false,
+        deferredReason: 'waiting_for_predecessor',
+        pendingQueueState: { known: true, pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 4 },
+        blockingHead,
+      };
+    }
+
+    function blockingHeadLogCalls(spy: ReturnType<typeof vi.spyOn>) {
+      return spy.mock.calls.filter(([message]) => typeof message === 'string' && message.includes('queue head'));
+    }
+
+    it('logs the reported head at info level once per head, not once per deferral', async () => {
+      const infoFile = vi.spyOn(logger, 'infoFile');
+      try {
+        const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 4 });
+        materializeNextMock.mockResolvedValueOnce(predecessorDeferral(blockedHead));
+        materializeNextMock.mockResolvedValueOnce(predecessorDeferral({ ...blockedHead, ageSinceLastUpdateMs: 60_000 }));
+        materializeNextMock.mockResolvedValueOnce(predecessorDeferral({
+          localId: 'head-handoff',
+          deliveryState: 'external_handoff',
+          lastUpdatedAt: 1_700_000_100_000,
+          ageSinceLastUpdateMs: 1_000,
+        }));
+
+        for (let i = 0; i < 3; i += 1) {
+          await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+            .resolves.toEqual({ type: 'deferred', reason: 'waiting_for_predecessor' });
+        }
+
+        const calls = blockingHeadLogCalls(infoFile);
+        expect(calls).toHaveLength(2);
+        expect(calls[0]?.[1]).toEqual({
+          sessionId: 's1',
+          source: 'materialize',
+          localId: 'head-blocked',
+          deliveryState: 'blocked',
+          blockedReason: 'delivery_outcome_uncertain',
+          lastUpdatedAt: 1_700_000_000_000,
+          ageSinceLastUpdateMs: 45_000,
+        });
+        expect(calls[1]?.[1]).toEqual({
+          sessionId: 's1',
+          source: 'materialize',
+          localId: 'head-handoff',
+          deliveryState: 'external_handoff',
+          blockedReason: null,
+          lastUpdatedAt: 1_700_000_100_000,
+          ageSinceLastUpdateMs: 1_000,
+        });
+      } finally {
+        infoFile.mockRestore();
+      }
+    });
+
+    it('logs the head reported in the session snapshot a wake re-reads', async () => {
+      const infoFile = vi.spyOn(logger, 'infoFile');
+      try {
+        const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 4 });
+        fetchSnapshotMock.mockResolvedValueOnce({
+          pendingQueueState: { known: true, pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 4 },
+          pendingQueueBlockingHead: blockedHead,
+        });
+
+        await client.reconcilePendingQueueState({ force: true });
+
+        const calls = blockingHeadLogCalls(infoFile);
+        expect(calls).toHaveLength(1);
+        expect(calls[0]?.[1]).toMatchObject({ sessionId: 's1', source: 'session_snapshot', localId: 'head-blocked' });
+      } finally {
+        infoFile.mockRestore();
+      }
+    });
+
+    it('counts a row behind an unsupported_action head as deliverable and the head itself as not', async () => {
+      const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 4 });
+      expect(client.shouldAttemptPendingMaterialization()).toBe(true);
+      expect(client.hasOnlyBlockedPendingWork()).toBe(false);
+
+      // The server materialized the row behind the head; the head stays, blocked.
+      fetchSnapshotMock.mockResolvedValueOnce({
+        pendingQueueState: { known: true, pendingCount: 1, pendingBlockedCount: 1, pendingVersion: 5 },
+      });
+      await client.reconcilePendingQueueState({ force: true });
+      expect(client.shouldAttemptPendingMaterialization()).toBe(false);
+      expect(client.hasOnlyBlockedPendingWork()).toBe(true);
+    });
+  });
+
 });

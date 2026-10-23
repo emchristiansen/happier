@@ -1190,6 +1190,7 @@ export function sessionUpdateHandler(
                         pendingVersion: result.pendingVersion,
                         ...(result.deliveryState ? { deliveryState: result.deliveryState } : {}),
                         ...(result.deferredReason ? { deferredReason: result.deferredReason } : {}),
+                        ...(result.blockingHead ? { blockingHead: result.blockingHead } : {}),
                         ...(result.retryAfterMs !== undefined ? { retryAfterMs: result.retryAfterMs } : {}),
                     };
                     respond(response);

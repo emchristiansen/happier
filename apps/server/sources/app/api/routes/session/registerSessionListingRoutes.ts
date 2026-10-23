@@ -19,6 +19,7 @@ import {
     parseStoredSessionRuntimeIssue,
 } from "./v2SessionListRows";
 import { mapPendingActivationAuthorization } from "@/app/session/pending/pendingActivationAuthorization";
+import { readPendingQueueBlockingHead } from "@/app/session/pending/pendingQueueBlockingHead";
 import {
     createV2ActiveSessionListRowsWhere,
     createV2SessionListCursorWhere,
@@ -422,8 +423,15 @@ export function registerSessionListingRoutes(app: Fastify) {
             return reply.code(404).send({ error: 'Session not found' });
         }
 
+        // Session state reports the queue head that holds ordinary pending rows back, so a runner
+        // or daemon reading it can see a stall. The pending counter gates the read so an empty queue
+        // costs no query; a drifted zero counter omits the report until the counter is reconciled.
+        const pendingQueueBlockingHead = (session.pendingCount ?? 0) > 0
+            ? await readPendingQueueBlockingHead({ sessionId: session.id, nowMs: Date.now() })
+            : null;
+
         return reply.send({
-            session: mapV2SessionListRows({ rows: [session], userId })[0],
+            session: { ...mapV2SessionListRows({ rows: [session], userId })[0]!, pendingQueueBlockingHead },
         });
     });
 }

@@ -912,6 +912,11 @@ export {
   type PendingDeliveryStatusV1,
 } from './sessionMessages/pendingDeliveryStatusV1.js';
 export {
+  PendingQueueBlockingHeadV1Schema,
+  readPendingQueueBlockingHeadV1,
+  type PendingQueueBlockingHeadV1,
+} from './sessionMessages/pendingQueueBlockingHeadV1.js';
+export {
   SessionMessageDeliveryResolutionV1Schema,
   type SessionMessageDeliveryResolutionV1,
 } from './sessionMessages/sessionMessageDeliveryResolutionV1.js';
