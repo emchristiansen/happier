@@ -52,6 +52,14 @@ export class ConnectedServiceSessionAuthSwitchLockRegistry {
     }
   }
 
+  /**
+   * Whether another transition holds or awaits this session's lock. The calling async context's
+   * own hold does not count, because its re-entry runs at once.
+   */
+  isHeldByAnotherOwner(sessionId: string): boolean {
+    return this.tailsBySessionId.has(sessionId) && !this.hasActiveOwner(sessionId);
+  }
+
   clearSession(sessionId: string): void {
     // Runner exit is not cancellation of an in-flight auth transition. Its
     // finally block owns release, including switches already queued behind it.
