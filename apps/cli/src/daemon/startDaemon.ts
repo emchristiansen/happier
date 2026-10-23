@@ -306,6 +306,7 @@ import {
   markBrokerBridgeEffectiveSelectionUnavailable,
 } from './connectedServices/broker/brokerBridgeEffectiveSelectionRegistry';
 import {
+  CONNECTED_SERVICE_READINESS_LIVE_CREDENTIAL_APPLICATION_WAIT_MS,
   reconcileConnectedServiceAuthGroupGenerationForRuntimeTarget,
   reconcileConnectedServiceDirectCredentialRevisionForRuntimeTarget,
   reconcileConnectedServiceDirectCredentialRevisions,
@@ -342,9 +343,11 @@ import { shouldCommitAutomaticGroupApplySessionEvent } from './connectedServices
 import { commitConnectedServiceRuntimeAuthRecoverySessionEvent } from './connectedServices/runtimeAuth/commitConnectedServiceRuntimeAuthRecoverySessionEvent';
 import { ConnectedServiceRuntimeAuthSwitchAttemptTracker } from './connectedServices/runtimeAuth/ConnectedServiceRuntimeAuthSwitchAttemptTracker';
 import {
+  ConnectedServiceSessionAuthSwitchLockRegistry,
   createConnectedServiceSessionAuthSwitchCore,
   type ConnectedServiceSessionAuthSwitchReason,
 } from './connectedServices/runtimeAuth/connectedServiceSessionAuthSwitchCore';
+import { findConnectedServiceChildSelection } from './connectedServices/connectedServiceChildEnvironment';
 import { buildConnectedServiceRuntimeAuthSwitchAttemptLogContext } from './connectedServices/runtimeAuth/buildConnectedServiceRuntimeAuthSwitchAttemptLogContext';
 import {
   RuntimeAuthRecoveryScheduler,
@@ -2004,7 +2007,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           { min: 1_000, max: 24 * 60 * 60_000 },
         ),
       });
-      const connectedServiceSessionAuthSwitchCore = createConnectedServiceSessionAuthSwitchCore();
+      const connectedServiceSessionAuthSwitchLocks = new ConnectedServiceSessionAuthSwitchLockRegistry();
+      const connectedServiceSessionAuthSwitchCore = createConnectedServiceSessionAuthSwitchCore({
+        locks: connectedServiceSessionAuthSwitchLocks,
+      });
       const inactiveUsageLimitRecoveryCheckOwner = createInactiveUsageLimitRecoveryCheckOwner();
       const inactiveUsageLimitRecoveryRunnerUnavailableRetryDelayMs = resolvePositiveIntEnv(
         process.env.HAPPIER_USAGE_LIMIT_RECOVERY_RUNNER_UNAVAILABLE_RETRY_DELAY_MS,
@@ -2534,6 +2540,31 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               await connectedServiceRefreshCoordinator.handleExternalCredentialUpdate(input);
             },
             executionAuthority: 'passive_projection',
+            liveApplicationWaitMs: CONNECTED_SERVICE_READINESS_LIVE_CREDENTIAL_APPLICATION_WAIT_MS,
+            onDeferredLiveApplication: (event) => {
+              const context = {
+                sessionId: target.sessionId,
+                pid: target.pid,
+                serviceId: event.serviceId,
+                profileId: event.profileId,
+              };
+              if (event.phase === 'answered_before_completion') {
+                logger.infoFile(
+                  '[DAEMON RUN] Connected-service registration reconciliation stopped waiting for a live credential application; it continues',
+                  { ...context, waitBudgetMs: event.waitBudgetMs },
+                );
+              } else if (event.phase === 'completed_after_answer') {
+                logger.infoFile(
+                  '[DAEMON RUN] Connected-service live credential application completed after registration reconciliation stopped waiting',
+                  context,
+                );
+              } else {
+                logger.warn(
+                  '[DAEMON RUN] Connected-service live credential application failed after registration reconciliation stopped waiting',
+                  { ...context, error: serializeAxiosErrorForLog(event.error) },
+                );
+              }
+            },
             isCurrent,
             ...(signal ? { signal } : {}),
           });
@@ -7447,6 +7478,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       > = createRefreshedConnectedServiceAuthUpdatedHandler({
         applyRefreshedAuth: applyRefreshedConnectedServiceAuth,
         restartAfterAuthUpdated,
+        sessionLocks: connectedServiceSessionAuthSwitchLocks,
+        // The live switch owner rewrites this environment when it switches the session.
+        readCurrentSelection: (sessionId, serviceId) => {
+          const tracked = getCurrentChildren().find((child) => child.happySessionId === sessionId);
+          return tracked
+            ? findConnectedServiceChildSelection(tracked.spawnOptions?.environmentVariables ?? {}, serviceId)
+            : null;
+        },
         onRestartRequired: (diagnostic) => {
           logger.warn(
             '[DAEMON RUN] Refreshed connected-service credential could not be hot-applied; left to the lifecycle restart policy',

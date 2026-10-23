@@ -13,6 +13,7 @@ import type { CatalogAgentId } from '@/backends/types';
 import { resolveConnectedServiceCredentialLifecycleDescriptor } from '@/backends/catalog';
 import type { ApiClient } from '@/api/api';
 import type { Credentials } from '@/persistence';
+import { logger } from '@/ui/logger';
 
 import {
   parseConnectedServiceBindingSelections,
@@ -321,17 +322,50 @@ async function applySpawnPreflightRefresh(params: Readonly<{
       profileId: binding.profileId,
       ...(params.forceOauthRefresh ? { force: true } : {}),
     });
-    if (result.status === 'refreshed' && result.credential) {
-      params.recordsByServiceId.set(binding.serviceId, result.credential);
-      const revision = ConnectedServiceCredentialRevisionV1Schema.safeParse(result.credentialRevision);
-      params.credentialRevisionsByServiceId.set(binding.serviceId, revision.success ? revision.data : null);
-      continue;
-    }
-    const outcome = resolveSpawnRefreshOutcome({ result, record, nowMs: params.nowMs });
-    if (outcome !== record) {
-      params.recordsByServiceId.set(binding.serviceId, outcome);
-    }
+    const outcome = resolveSpawnRefreshOutcome({
+      result,
+      current: {
+        record,
+        credentialRevision: params.credentialRevisionsByServiceId.get(binding.serviceId) ?? null,
+      },
+      nowMs: params.nowMs,
+    });
+    params.recordsByServiceId.set(binding.serviceId, outcome.record);
+    params.credentialRevisionsByServiceId.set(binding.serviceId, outcome.credentialRevision);
   }
+}
+
+type SpawnCredential = Readonly<{
+  record: ConnectedServiceCredentialRecordV1;
+  credentialRevision: ConnectedServiceCredentialRevisionV1 | null;
+}>;
+
+type StaleRefreshedSpawnCredentialReason = 'refreshed_credential_expired' | 'refreshed_credential_older_than_current';
+
+/**
+ * A `refreshed` result can carry a credential older than the spawn's current server record: the
+ * coordinator hands a spawn preflight the persisted credential of a rotation still in flight
+ * (`adoptCredentialReadyFromInFlightRefresh`). Incident 2026-10-22/23: a deadlocked rotation stayed
+ * in flight for hours, and every spawn adopted its credential after it expired and after a newer
+ * one reached the server. Such a credential is refused. The record's `updatedAt` orders the two,
+ * because credential revisions are opaque.
+ */
+function readStaleRefreshedSpawnCredentialReason(input: Readonly<{
+  refreshed: SpawnCredential;
+  current: SpawnCredential;
+  nowMs: number;
+}>): StaleRefreshedSpawnCredentialReason | null {
+  const expiresAt = input.refreshed.record.expiresAt;
+  if (typeof expiresAt === 'number' && Number.isFinite(expiresAt) && expiresAt <= input.nowMs) {
+    return 'refreshed_credential_expired';
+  }
+  if (
+    input.refreshed.credentialRevision !== input.current.credentialRevision
+    && input.refreshed.record.updatedAt < input.current.record.updatedAt
+  ) {
+    return 'refreshed_credential_older_than_current';
+  }
+  return null;
 }
 
 /**
@@ -342,16 +376,50 @@ async function applySpawnPreflightRefresh(params: Readonly<{
  * another refresher owns the rotation, and live application (scheduled loop / SDK callback / home
  * re-read) picks it up — failing here turned refresh-lease contention right after a daemon restart
  * into a user-visible "Failed to resume session" (live incident 2026-07-08 19:39). Expired records
- * still fail the spawn.
+ * still fail the spawn. A `refreshed` credential that has expired, or is older than the current
+ * record, is refused in favour of the current record; if that has expired too, the spawn fails.
  */
 function resolveSpawnRefreshOutcome(params: Readonly<{
   result: Awaited<ReturnType<ConnectedServiceSpawnCredentialRefreshService['refreshConnectedServiceCredentialForSpawnPreflight']>>;
-  record: ConnectedServiceCredentialRecordV1;
+  current: SpawnCredential;
   nowMs: number;
-}>): ConnectedServiceCredentialRecordV1 {
-  const { result, record, nowMs } = params;
+}>): SpawnCredential {
+  const { result, current, nowMs } = params;
+  const record = current.record;
   if (result.status === 'refreshed' && result.credential) {
-    return result.credential;
+    const revision = ConnectedServiceCredentialRevisionV1Schema.safeParse(result.credentialRevision);
+    const refreshed: SpawnCredential = {
+      record: result.credential,
+      credentialRevision: revision.success ? revision.data : null,
+    };
+    const staleReason = readStaleRefreshedSpawnCredentialReason({ refreshed, current, nowMs });
+    if (!staleReason) return refreshed;
+    const currentUsable = isRecordStillUsableForSpawn(record, nowMs);
+    logger.warn('[DAEMON RUN] Spawn preflight refused a stale refreshed connected-service credential', {
+      serviceId: result.diagnostic.serviceId,
+      profileId: result.diagnostic.profileId,
+      reason: staleReason,
+      refreshedCredentialRevision: refreshed.credentialRevision,
+      refreshedUpdatedAt: refreshed.record.updatedAt,
+      refreshedExpiresAt: refreshed.record.expiresAt,
+      currentCredentialRevision: current.credentialRevision,
+      currentUpdatedAt: record.updatedAt,
+      currentExpiresAt: record.expiresAt,
+      outcome: currentUsable ? 'using_current_record' : 'spawn_failed_current_record_expired',
+    });
+    if (currentUsable) return current;
+    throw new ConnectedServiceSpawnCredentialRefreshError({
+      kind: 'transient_refresh_failed',
+      diagnostic: {
+        serviceId: result.diagnostic.serviceId,
+        profileId: result.diagnostic.profileId,
+        reason: result.diagnostic.reason,
+        status: 'refresh_failed',
+        expiresAt: record.expiresAt,
+        expiryAgeMs: typeof record.expiresAt === 'number' ? nowMs - record.expiresAt : null,
+        refreshWindowMs: result.diagnostic.refreshWindowMs,
+      },
+    });
   }
   if (result.status === 'refresh_failed') {
     if (isReconnectRequiredRefreshCategory(result.diagnostic.category)) {
@@ -360,7 +428,7 @@ function resolveSpawnRefreshOutcome(params: Readonly<{
         diagnostic: result.diagnostic,
       });
     }
-    if (isRecordStillUsableForSpawn(record, nowMs)) return record;
+    if (isRecordStillUsableForSpawn(record, nowMs)) return current;
     throw new ConnectedServiceSpawnCredentialRefreshError({
       kind: 'transient_refresh_failed',
       diagnostic: result.diagnostic,
@@ -373,13 +441,13 @@ function resolveSpawnRefreshOutcome(params: Readonly<{
     });
   }
   if (result.status === 'lease_not_acquired') {
-    if (isRecordStillUsableForSpawn(record, nowMs)) return record;
+    if (isRecordStillUsableForSpawn(record, nowMs)) return current;
     throw new ConnectedServiceSpawnCredentialRefreshError({
       kind: 'transient_refresh_failed',
       diagnostic: result.diagnostic,
     });
   }
-  return record;
+  return current;
 }
 
 function isRecordStillUsableForSpawn(record: ConnectedServiceCredentialRecordV1, nowMs: number): boolean {
@@ -1107,14 +1175,21 @@ async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly
             profileId,
             ...(params.forceOauthRefresh ? { force: true } : {}),
           });
-          const refreshed = resolveSpawnRefreshOutcome({ result, record, nowMs: params.nowMs });
-          if (!refreshed) return null;
-          const revision = ConnectedServiceCredentialRevisionV1Schema.safeParse(result.credentialRevision);
-          params.credentialRevisionsByServiceId.set(serviceId, revision.success ? revision.data : null);
-          return {
-            record: refreshed,
-            credentialRevision: revision.success ? revision.data : null,
-          };
+          const outcome = resolveSpawnRefreshOutcome({
+            result,
+            current: {
+              record,
+              credentialRevision: params.credentialRevisionsByServiceId.get(serviceId) ?? null,
+            },
+            nowMs: params.nowMs,
+          });
+          // Other results keep their previous handling here: they report the result's own revision.
+          const resultRevision = ConnectedServiceCredentialRevisionV1Schema.safeParse(result.credentialRevision);
+          const credentialRevision = result.status === 'refreshed'
+            ? outcome.credentialRevision
+            : resultRevision.success ? resultRevision.data : null;
+          params.credentialRevisionsByServiceId.set(serviceId, credentialRevision);
+          return { record: outcome.record, credentialRevision };
         }
       : null,
     accountSettings: params.accountSettings,

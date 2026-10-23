@@ -229,9 +229,46 @@ export async function reconcileConnectedServiceDirectCredentialRevisions(params:
 }
 
 /**
+ * How long `/session-started` readiness reconciliation waits, in total, for live direct-credential
+ * applications. It protects the runner's readiness acknowledgement: a daemon-started runner gives
+ * each `/session-started` attempt 10 s (`defaultReportAttemptTimeoutMs` in
+ * `agent/runtime/startupSideEffects.ts`) and treats an unanswered attempt as failed. The same
+ * reconciliation first reads the account projection, normally well under a second; half the
+ * attempt is left for that read and the answer.
+ */
+export const CONNECTED_SERVICE_READINESS_LIVE_CREDENTIAL_APPLICATION_WAIT_MS = 5_000;
+
+export type ConnectedServiceDeferredLiveApplicationEvent =
+  | Readonly<{
+      phase: 'answered_before_completion';
+      serviceId: ConnectedServiceId;
+      profileId: string;
+      waitBudgetMs: number;
+    }>
+  | Readonly<{
+      phase: 'completed_after_answer';
+      serviceId: ConnectedServiceId;
+      profileId: string;
+    }>
+  | Readonly<{
+      phase: 'failed_after_answer';
+      serviceId: ConnectedServiceId;
+      profileId: string;
+      error: unknown;
+    }>;
+
+/**
  * Reconcile one newly reachable runtime target against the latest direct-profile projection.
  * Registration replay targets only the newly reachable runtime. The existing live refresh owner
  * remains the only direct-credential effect.
+ *
+ * `/session-started` readiness awaits this reconciliation, so it waits at most
+ * `liveApplicationWaitMs` in total for live applications. A live application reaches every session
+ * bound to the profile, not only this runtime; incident 2026-10-23: one deadlocked session lock held
+ * it, and with it every new runner's readiness, until the runner gave up. Once the budget is spent
+ * the reconciliation goes on without the bindings still applying, which are not counted as
+ * applied; their applications keep running, and `onDeferredLiveApplication` reports each deferral
+ * and its eventual outcome. A failure within the budget still fails the reconciliation.
  */
 export async function reconcileConnectedServiceDirectCredentialRevisionForRuntimeTarget(params: Readonly<{
   target: ConnectedServiceGenerationRuntimeTarget;
@@ -246,6 +283,8 @@ export async function reconcileConnectedServiceDirectCredentialRevisionForRuntim
     executionAuthority: ConnectedServiceGenerationExecutionAuthority;
   }>) => Promise<void>;
   executionAuthority: ConnectedServiceGenerationExecutionAuthority;
+  liveApplicationWaitMs: number;
+  onDeferredLiveApplication: (event: ConnectedServiceDeferredLiveApplicationEvent) => void;
   isCurrent?: () => boolean;
   signal?: AbortSignal;
 }>): Promise<Readonly<{ appliedBindingCount: number }>> {
@@ -275,14 +314,37 @@ export async function reconcileConnectedServiceDirectCredentialRevisionForRuntim
     });
   }
   let appliedBindingCount = 0;
-  for (const binding of bindings.values()) {
-    params.signal?.throwIfAborted();
-    if (params.isCurrent && !params.isCurrent()) break;
-    await params.applyLiveCredentialBoundary({
-      ...binding,
-      executionAuthority: params.executionAuthority,
-    });
-    appliedBindingCount += 1;
+  let waitBudgetTimer: ReturnType<typeof setTimeout> | undefined;
+  let waitBudget: Promise<false> | null = null;
+  const waitBudgetSpent = (): Promise<false> => waitBudget ??= new Promise<false>((resolve) => {
+    waitBudgetTimer = setTimeout(() => resolve(false), params.liveApplicationWaitMs);
+    waitBudgetTimer.unref?.();
+  });
+  try {
+    for (const binding of bindings.values()) {
+      params.signal?.throwIfAborted();
+      if (params.isCurrent && !params.isCurrent()) break;
+      const application = params.applyLiveCredentialBoundary({
+        ...binding,
+        executionAuthority: params.executionAuthority,
+      });
+      if (await Promise.race([application.then(() => true as const), waitBudgetSpent()])) {
+        appliedBindingCount += 1;
+        continue;
+      }
+      const identity = { serviceId: binding.serviceId, profileId: binding.profileId };
+      params.onDeferredLiveApplication({
+        phase: 'answered_before_completion',
+        ...identity,
+        waitBudgetMs: params.liveApplicationWaitMs,
+      });
+      application.then(
+        () => params.onDeferredLiveApplication({ phase: 'completed_after_answer', ...identity }),
+        (error: unknown) => params.onDeferredLiveApplication({ phase: 'failed_after_answer', ...identity, error }),
+      );
+    }
+  } finally {
+    if (waitBudgetTimer) clearTimeout(waitBudgetTimer);
   }
   params.signal?.throwIfAborted();
   return { appliedBindingCount };
