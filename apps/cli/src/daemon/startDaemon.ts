@@ -253,6 +253,7 @@ import { waitForSessionWebhook } from './spawn/waitForSessionWebhook';
 import { resolveSpawnChildEnvironment } from './spawn/resolveSpawnChildEnvironment';
 import { buildSpawnChildProcessEnv } from './spawn/buildSpawnChildProcessEnv';
 import { resolveStackProcessKindOverrideForSessionSpawn } from './spawn/resolveStackProcessKindOverrideForSessionSpawn';
+import { resolveSessionRunnerDebugLogEnv } from './spawn/sessionRunnerDebugLog';
 import { createSpawnConcurrencyGate } from './spawn/createSpawnConcurrencyGate';
 import { computeDaemonSpawnRequestKey, createSpawnRequestCoalescer } from './spawn/spawnRequestCoalescer';
 import { createDaemonSpawnAttemptRegistry } from './spawn/daemonSpawnAttemptRegistry';
@@ -3868,6 +3869,19 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             }
 
             const stackProcessKindOverride = resolveStackProcessKindOverrideForSessionSpawn(process.env);
+            // Read at every spawn: `happier daemon session-debug-log` changes one session's runner
+            // level from its next start without a daemon restart.
+            const sessionRunnerDebugLogEnv = normalizedExistingSessionId
+              ? await resolveSessionRunnerDebugLogEnv({
+                daemonStateDir: dirname(configuration.daemonStateFile),
+                sessionId: normalizedExistingSessionId,
+              })
+              : {};
+            if (sessionRunnerDebugLogEnv.HAPPIER_LOG_LEVEL) {
+              logger.infoFile('[DAEMON RUN] Session runner debug log switch is on; spawning this runner at debug level', {
+                sessionId: normalizedExistingSessionId,
+              });
+            }
             const extraEnvForChildWithMessage = {
               ...extraEnvForChild,
               ...(sessionAttachFilePath
@@ -3880,6 +3894,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 ? { [HAPPIER_DAEMON_INITIAL_GOAL_ENV_KEY]: serializeDaemonInitialGoalForEnv(initialGoal) }
                 : {}),
               ...stackProcessKindOverride,
+              ...sessionRunnerDebugLogEnv,
             };
 
             const tmuxRequested = terminalRequest.requested === 'tmux';
