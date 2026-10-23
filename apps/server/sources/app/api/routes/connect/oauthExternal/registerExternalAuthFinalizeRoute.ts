@@ -8,6 +8,8 @@ import { connectExternalIdentity } from "@/app/auth/providers/identity";
 import { auth } from "@/app/auth/auth";
 import { resolveAuthPolicyFromEnv } from "@/app/auth/authPolicy";
 import { accountDisabledKey, disableAccount } from "@/app/auth/accountDisable";
+import { accountStandingCache } from "@/app/auth/accountStandingCache";
+import { deleteProvisionalAccount } from "@/app/auth/deleteProvisionalAccount";
 import { Context } from "@/context";
 import { decryptString } from "@/modules/encrypt";
 import { findOAuthProviderById } from "@/app/oauth/providers/registry";
@@ -287,7 +289,7 @@ export function registerExternalAuthFinalizeRoute(app: Fastify) {
             try {
                 await db.accountIdentity.delete({ where: { id: identitySnapshot.id } });
             } catch (error) {
-                await db.account.delete({ where: { id: newAccount.id } }).catch(() => {});
+                await deleteProvisionalAccount(newAccount.id);
                 throw error;
             }
 
@@ -320,7 +322,7 @@ export function registerExternalAuthFinalizeRoute(app: Fastify) {
                         },
                     })
                     .catch(() => {});
-                await db.account.delete({ where: { id: newAccount.id } }).catch(() => {});
+                await deleteProvisionalAccount(newAccount.id);
 
                 if (error instanceof Error && error.message === "not-eligible") {
                     await db.repeatKey.deleteMany({ where: { key: pendingKey } });
@@ -359,12 +361,13 @@ export function registerExternalAuthFinalizeRoute(app: Fastify) {
                     .catch(() => {});
             };
             const deleteNewAccountBestEffort = async () => {
-                await db.account.delete({ where: { id: newAccount.id } }).catch(() => {});
+                await deleteProvisionalAccount(newAccount.id);
             };
             const clearDisableMarkerBestEffort = async () => {
                 const key = accountDisabledKey(oldAccountId);
                 if (!key || key === "auth_disabled_") return;
                 await db.repeatKey.delete({ where: { key } }).catch(() => {});
+                accountStandingCache.invalidate(oldAccountId);
             };
 
             try {
@@ -455,20 +458,20 @@ export function registerExternalAuthFinalizeRoute(app: Fastify) {
         } catch (error) {
             if (error instanceof Error && error.message === "not-eligible") {
                 if (!existingAccount) {
-                    await db.account.delete({ where: { id: account.id } }).catch(() => {});
+                    await deleteProvisionalAccount(account.id);
                 }
                 await db.repeatKey.deleteMany({ where: { key: pendingKey } });
                 return reply.code(403).send({ error: "not-eligible" });
             }
             if (error instanceof Error && error.message === PROVIDER_ALREADY_LINKED_ERROR) {
                 if (!existingAccount) {
-                    await db.account.delete({ where: { id: account.id } }).catch(() => {});
+                    await deleteProvisionalAccount(account.id);
                 }
                 await db.repeatKey.deleteMany({ where: { key: pendingKey } });
                 return reply.code(409).send({ error: PROVIDER_ALREADY_LINKED_ERROR, provider: providerId });
             }
             if (!existingAccount) {
-                await db.account.delete({ where: { id: account.id } }).catch(() => {});
+                await deleteProvisionalAccount(account.id);
             }
             throw error;
         }
