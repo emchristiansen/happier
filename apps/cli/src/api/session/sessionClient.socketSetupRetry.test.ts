@@ -107,6 +107,12 @@ vi.mock('./connection/createSessionSocketTransport', () => ({
 let setupTailBlocked = false;
 let setupTailBlockedUntilReleased = false;
 let unsettledSetupTailWaits = 0;
+// While set, the tail stays unsettled and its wait ends only when its signal aborts, as the real
+// outbox wait does: setup then waits until close (or a disconnect) aborts the readiness controller.
+let setupTailHeldUntilAbort = false;
+let heldTailWaits = 0;
+let heldTailAborts = 0;
+let contractWrites = 0;
 const settledTail = {
   sequence: 1,
   custody: null,
@@ -124,11 +130,22 @@ vi.mock('./mutations/createSessionMutationOutbox', () => ({
     enqueueSessionTurn: async () => {},
     enqueueTranscriptMessage: async () => ({ persisted: true, delivered: true }),
     enqueueRuntimeActivitySnapshot: async () => ({ persisted: true, delivered: true }),
-    setSessionSyncPendingInputServerContract: async () => {},
-    readRuntimeActivitySnapshotTail: () => (setupTailBlocked || setupTailBlockedUntilReleased
+    setSessionSyncPendingInputServerContract: async () => { contractWrites += 1; },
+    readRuntimeActivitySnapshotTail: () => (setupTailBlocked || setupTailBlockedUntilReleased || setupTailHeldUntilAbort
       ? { sequence: 1, custody: { mutationKey: 'runtime-activity-snapshot:s1' }, settlement: null }
       : settledTail) as any,
-    waitForRuntimeActivitySnapshotTailChange: async () => {
+    waitForRuntimeActivitySnapshotTailChange: async (_sequence: number, signal?: AbortSignal) => {
+      if (setupTailHeldUntilAbort) {
+        heldTailWaits += 1;
+        return await new Promise<boolean>((resolve) => {
+          const onAbort = () => {
+            heldTailAborts += 1;
+            resolve(false);
+          };
+          if (signal?.aborted) onAbort();
+          else signal?.addEventListener('abort', onAbort, { once: true });
+        });
+      }
       if (setupTailBlocked || setupTailBlockedUntilReleased) unsettledSetupTailWaits += 1;
       setupTailBlocked = false;
       return false;
@@ -183,7 +200,10 @@ vi.mock('./snapshotSync', async (importOriginal) => {
   };
 });
 
-async function createClient(sessionOverrides: Record<string, unknown>) {
+async function createClient(
+  sessionOverrides: Record<string, unknown>,
+  options: Readonly<{ awaitConnected?: boolean }> = {},
+) {
   sessionSocketStub = createApiSessionSocketStub({
     id: 'session-socket',
     connected: true,
@@ -200,7 +220,7 @@ async function createClient(sessionOverrides: Record<string, unknown>) {
   } as any);
   clients.push(client);
   (client as unknown as { accountIdPromise: Promise<string> }).accountIdPromise = Promise.resolve('account-1');
-  await supervisorConnectedPromise;
+  if (options.awaitConnected !== false) await supervisorConnectedPromise;
   return client;
 }
 
@@ -218,6 +238,10 @@ describe('ApiSessionClient session socket setup retry', () => {
     setupTailBlocked = false;
     setupTailBlockedUntilReleased = false;
     unsettledSetupTailWaits = 0;
+    setupTailHeldUntilAbort = false;
+    heldTailWaits = 0;
+    heldTailAborts = 0;
+    contractWrites = 0;
     supervisorConnectedPromise = null;
     fetchSnapshotMock.mockReset();
     fetchSnapshotMock.mockResolvedValue({});
@@ -339,6 +363,43 @@ describe('ApiSessionClient session socket setup retry', () => {
     expect(connectFailures()).toBe(4);
     expect(unsettledSetupTailWaits).toBe(4);
     await clientPromise;
+  }, 20_000);
+
+  it('starts no new setup after close begins, even while a close drain is still pending', async () => {
+    const infoFile = vi.spyOn(logger, 'infoFile');
+    setupTailHeldUntilAbort = true;
+    const client = await createClient(
+      { latestTurnStatus: 'completed', pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 1 },
+      { awaitConnected: false },
+    );
+    await vi.waitFor(() => expect(heldTailWaits).toBe(1), { timeout: 5_000 });
+    const contractWritesBeforeClose = contractWrites;
+    let releaseDrain: () => void = () => {};
+    const drainPending = new Promise<void>((resolve) => { releaseDrain = resolve; });
+    vi.spyOn(client as any, 'drainBestEffortSessionWrites').mockImplementation(async () => await drainPending);
+
+    const closing = client.close();
+    try {
+    // Close aborts   the readiness wait, so this connection's setup attempt returns false.
+      await vi.waitFor(() => expect(heldTailAborts).toBe(1));
+      // Hold close open well past the first retry delay (250 ms).
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect(heldTailWaits).toBe(1);
+      expect(contractWrites).toBe(contractWritesBeforeClose);
+      expect(infoFile).not.toHaveBeenCalledWith(
+        '[API] session socket setup did not complete',
+        expect.objectContaining({ trigger: 'connect' }),
+      );
+      // A pending-input pass during close starts no setup either.
+      await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(heldTailWaits).toBe(1);
+    expect(contractWrites).toBe(contractWritesBeforeClose);
+    } finally {
+      releaseDrain();
+      await closing;
+      clients.splice(clients.indexOf(client), 1);
+    }
   }, 20_000);
 
   it('wakes the input consumer when a materialize answer adopts newer queue state', async () => {
