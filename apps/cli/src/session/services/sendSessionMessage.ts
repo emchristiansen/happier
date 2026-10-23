@@ -40,6 +40,7 @@ import {
 } from '@/session/shared/sessionTurnLifecycle';
 
 import { resolveSessionTransportContext } from './resolveSessionTransportContext';
+import { logger } from '@/ui/logger';
 import { requestInactiveSessionResume } from './requestInactiveSessionResume';
 import {
   claimSessionSendLocalId,
@@ -514,11 +515,28 @@ export async function sendSessionMessage(params: SendSessionMessageParams): Prom
   try {
     result = await sendSessionMessageOnce(params, claim.localId);
   } catch (error) {
-    await claim.settle('unsuccessful');
+    await settleRetryLedgerEntry(claim, 'unsuccessful');
     throw error;
   }
-  await claim.settle(classifySendAttemptOutcome(result));
+  await settleRetryLedgerEntry(claim, classifySendAttemptOutcome(result));
   return result;
+}
+
+/**
+ * The attempt's outcome is already decided; a ledger write failure must not
+ * turn a delivered message into a reported failure. Left unsettled, the entry
+ * only makes an identical send within the window reuse this localId.
+ */
+async function settleRetryLedgerEntry(
+  claim: Awaited<ReturnType<typeof claimSessionSendLocalId>>,
+  outcome: SessionSendAttemptOutcome,
+): Promise<void> {
+  try {
+    await claim.settle(outcome);
+  } catch (error) {
+    logger.warn(`[session send] retry ledger entry for localId ${claim.localId} was not settled as ${outcome}: `
+      + (error instanceof Error ? error.message : String(error)));
+  }
 }
 
 async function sendSessionMessageOnce(
