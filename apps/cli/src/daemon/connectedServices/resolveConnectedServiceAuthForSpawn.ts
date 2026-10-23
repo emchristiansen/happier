@@ -365,12 +365,14 @@ type ReadServerCurrentSpawnCredential = (binding: SpawnCredentialBinding) => Pro
  *
  * The coordinator hands a spawn preflight the persisted credential of a rotation still in flight
  * (`adoptCredentialReadyFromInFlightRefresh`), which may have been persisted before the record this
- * spawn read. When the `refreshed` revision differs from the spawn's, the server's current record
- * decides which is current: it stores one credential per profile, while revisions are random and a
- * record's `updatedAt` is its writer's clock, so neither orders two revisions.
+ * spawn read. Unless the `refreshed` revision and the spawn's are both present and equal, each such
+ * decision reads the server's current credential and adopts it: the server stores one credential per
+ * profile, while revisions are random and a record's `updatedAt` is its writer's clock, so neither
+ * orders two revisions. Preflight and the materialization-time refresh each make this decision.
  *
- * A credential so chosen that has already expired is refused in favour of the current record; if
- * that has expired too, the spawn fails. Incident 2026-10-22/23: a deadlocked rotation stayed in
+ * An adopted credential that has already expired is refused. The spawn falls back to its current
+ * record only while that is unexpired and the server's read has not shown it superseded (a different
+ * revision); otherwise the spawn fails. Incident 2026-10-22/23: a deadlocked rotation stayed in
  * flight for hours, and every spawn adopted its credential after it expired, over a newer server
  * record. Expiry is judged by `clock` at each decision, after the awaited reads, not at spawn entry.
  */
@@ -389,10 +391,13 @@ async function resolveSpawnRefreshOutcome(params: Readonly<{
       record: result.credential,
       credentialRevision: revision.success ? revision.data : null,
     };
-    const adopted = refreshed.credentialRevision !== null
+    const serverRead = refreshed.credentialRevision !== null
       && refreshed.credentialRevision === current.credentialRevision
-      ? refreshed
+      ? null
       : await params.readServerCurrentCredential(binding);
+    const adopted = serverRead ?? refreshed;
+    // The server has replaced the record this spawn read: it is no fallback, however unexpired.
+    const currentSuperseded = serverRead !== null && serverRead.credentialRevision !== current.credentialRevision;
     if (adopted.credentialRevision !== refreshed.credentialRevision) {
       logger.warn('[DAEMON RUN] Spawn preflight refused a refreshed connected-service credential the server has superseded', {
         serviceId: binding.serviceId,
@@ -404,7 +409,7 @@ async function resolveSpawnRefreshOutcome(params: Readonly<{
     }
     const decidedAtMs = clock();
     if (isRecordStillUsableForSpawn(adopted.record, decidedAtMs)) return adopted;
-    const currentUsable = isRecordStillUsableForSpawn(record, clock());
+    const currentUsable = !currentSuperseded && isRecordStillUsableForSpawn(record, clock());
     logger.warn('[DAEMON RUN] Spawn preflight refused an expired refreshed connected-service credential', {
       serviceId: binding.serviceId,
       profileId: binding.profileId,
@@ -413,9 +418,12 @@ async function resolveSpawnRefreshOutcome(params: Readonly<{
       currentCredentialRevision: current.credentialRevision,
       currentExpiresAt: record.expiresAt,
       decidedAtMs: decidedAtMs,
-      outcome: currentUsable ? 'using_current_record' : 'spawn_failed_current_record_expired',
+      outcome: currentUsable
+        ? 'using_current_record'
+        : currentSuperseded ? 'spawn_failed_current_record_superseded' : 'spawn_failed_current_record_expired',
     });
     if (currentUsable) return current;
+    const failedRecord = currentSuperseded ? adopted.record : record;
     throw new ConnectedServiceSpawnCredentialRefreshError({
       kind: 'transient_refresh_failed',
       diagnostic: {
@@ -423,8 +431,8 @@ async function resolveSpawnRefreshOutcome(params: Readonly<{
         profileId: result.diagnostic.profileId,
         reason: result.diagnostic.reason,
         status: 'refresh_failed',
-        expiresAt: record.expiresAt,
-        expiryAgeMs: typeof record.expiresAt === 'number' ? clock() - record.expiresAt : null,
+        expiresAt: failedRecord.expiresAt,
+        expiryAgeMs: typeof failedRecord.expiresAt === 'number' ? clock() - failedRecord.expiresAt : null,
         refreshWindowMs: result.diagnostic.refreshWindowMs,
       },
     });

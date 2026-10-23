@@ -16,8 +16,9 @@ export const CONNECTED_SERVICE_SESSION_READINESS_WAIT_MS = 5_000;
 
 /**
  * Pauses before re-running a reconciliation that failed after readiness answered. The first matches
- * the readiness wait; each failure doubles it, up to the longest, so a server outage costs each
- * registered runner one account-profile read per five minutes.
+ * the readiness wait; each failure doubles it (5 s, 10 s, 20 s, …) up to the longest. Through a
+ * server outage this owner's retries for one runner thus settle at one account-profile read per five
+ * minutes; other producers read the account profile on their own schedules.
  */
 export const CONNECTED_SERVICE_SESSION_READINESS_RETRY_DELAY_MS = Object.freeze({
   initialMs: 5_000,
@@ -29,14 +30,23 @@ export const CONNECTED_SERVICE_SESSION_READINESS_RETRY_DELAY_MS = Object.freeze(
  *
  * Readiness answers once the reconciliation succeeds, or after `waitMs` while it is still running;
  * a failure inside the wait fails readiness, and the runner reports again. A reconciliation readiness
- * stopped waiting for keeps running, and the target stays unreconciled until it succeeds (the
- * reconciliation records its projection epoch only after its live application). If it later fails,
- * this owner runs it again, with backoff, until one run succeeds or the registration is replaced.
+ * stopped waiting for keeps running. It records the target's projection epoch only after the live
+ * applications it awaits succeed, so an ordinary application failure leaves the target unreconciled.
+ * The exception: for a session whose auth lock another owner holds, the refreshed-auth handler
+ * queues the application and returns, so that application can fail after the reconciliation has
+ * succeeded, unseen here. If a reconciliation fails after readiness answered, this owner runs it
+ * again, with backoff, until one run succeeds, the registration is replaced, or daemon shutdown
+ * begins. Shutdown stops new runs only; a run already in progress is not cancelled.
  */
 export function createConnectedServiceSessionReadinessReconciliation(deps: Readonly<{
-  /** Runs the target's forced reconciliation, joining one already running. */
+  /**
+   * Runs the target's forced reconciliation. When one is already running, the forced run follows
+   * it with another.
+   */
   reconcile: (registration: ConnectedServiceRuntimeTargetRegistration) => Promise<void>;
   isCurrent: (registration: ConnectedServiceRuntimeTargetRegistration) => boolean;
+  /** True once daemon shutdown has begun: no new reconciliation is started after that. */
+  isShuttingDown: () => boolean;
   waitMs?: number;
   retryDelayMs?: Readonly<{ initialMs: number; maxMs: number }>;
 }>): (registration: ConnectedServiceRuntimeTargetRegistration) => Promise<void> {
@@ -63,7 +73,7 @@ export function createConnectedServiceSessionReadinessReconciliation(deps: Reado
         retryingTargets.delete(registration.target);
         logger.infoFile('[DAEMON RUN] Connected-service reconciliation settled after session readiness answered', logContext(registration));
       }, (error: unknown) => {
-        if (!deps.isCurrent(registration)) {
+        if (deps.isShuttingDown() || !deps.isCurrent(registration)) {
           retryingTargets.delete(registration.target);
           return;
         }
@@ -75,7 +85,7 @@ export function createConnectedServiceSessionReadinessReconciliation(deps: Reado
           error: serializeAxiosErrorForLog(error),
         });
         const timer = setTimeout(() => {
-          if (!deps.isCurrent(registration)) {
+          if (deps.isShuttingDown() || !deps.isCurrent(registration)) {
             retryingTargets.delete(registration.target);
             return;
           }

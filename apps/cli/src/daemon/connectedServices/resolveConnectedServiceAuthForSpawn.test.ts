@@ -480,8 +480,9 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       });
     });
 
-    it('refuses an expired in-flight credential and materializes the current server record', async () => {
+    it('refuses an expired in-flight credential and materializes the record the server still holds', async () => {
       const { spawn, refreshConnectedServiceCredentialForSpawnPreflight } = await spawnWithInFlightRotation({
+        rotationPersisted: false,
         current: claudeRecord({ accessToken: 'current-access', updatedAt: now - hourMs, expiresAt: now + 7 * hourMs }),
         inFlight: claudeRecord({ accessToken: 'stuck-access', updatedAt: now - 9 * hourMs, expiresAt: now - hourMs }),
       });
@@ -491,6 +492,22 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       expect(refreshConnectedServiceCredentialForSpawnPreflight).toHaveBeenCalled();
       const credential = await readClaudeCodeNativeCredential(connectedServiceAuth!.env.CLAUDE_CONFIG_DIR!);
       expect(credential).toMatchObject({ claudeAiOauth: { accessToken: 'current-access' } });
+    });
+
+    // F46-001: once the server's read shows the spawn's record superseded, an expired server record
+    // fails the spawn; restoring the superseded record would hand the runner a revoked credential.
+    it('fails the spawn rather than restore a superseded record when the server holds an expired rotation', async () => {
+      const { spawn } = await spawnWithInFlightRotation({
+        current: claudeRecord({ accessToken: 'superseded-access', updatedAt: now - hourMs, expiresAt: now + 7 * hourMs }),
+        inFlight: claudeRecord({ accessToken: 'stuck-access', updatedAt: now - 9 * hourMs, expiresAt: now - hourMs }),
+      });
+
+      await expect(spawn).rejects.toMatchObject({
+        name: 'ConnectedServiceSpawnCredentialRefreshError',
+        kind: 'transient_refresh_failed',
+        serviceId: 'claude-subscription',
+        profileId: 'work',
+      });
     });
 
     it('fails the spawn with a clear error when both the in-flight credential and the server record have expired', async () => {
@@ -507,26 +524,55 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       });
     });
 
-    it('refuses an in-flight credential that expires while the preflight refresh is awaited', async () => {
+    it('fails the spawn when the rotation the server holds expires while the preflight refresh is awaited', async () => {
       const clock = { nowMs: now };
       const { spawn } = await spawnWithInFlightRotation({
         clock,
-        // Valid when the spawn starts; expired by the time the joined rotation answers.
+        // Persisted after the spawn's read and valid then; expired by the time the joined rotation
+        // answers. The spawn's own record is superseded, so it is no fallback.
         duringRefresh: () => { clock.nowMs = now + 1_000; },
-        current: claudeRecord({ accessToken: 'current-access', updatedAt: now - 2 * hourMs, expiresAt: now + 7 * hourMs }),
+        current: claudeRecord({ accessToken: 'superseded-access', updatedAt: now - 2 * hourMs, expiresAt: now + 7 * hourMs }),
         inFlight: claudeRecord({ accessToken: 'expiring-access', updatedAt: now - hourMs, expiresAt: now + 500 }),
       });
 
-      const connectedServiceAuth = await spawn;
+      await expect(spawn).rejects.toMatchObject({
+        name: 'ConnectedServiceSpawnCredentialRefreshError',
+        kind: 'transient_refresh_failed',
+      });
+    });
 
-      const credential = await readClaudeCodeNativeCredential(connectedServiceAuth!.env.CLAUDE_CONFIG_DIR!);
-      expect(credential).toMatchObject({ claudeAiOauth: { accessToken: 'current-access' } });
+    it('fails, in the materialization-time refresh, rather than restore a record the server shows superseded', async () => {
+      const clock = { nowMs: now };
+      const { spawn, refreshConnectedServiceCredentialForSpawnPreflight } = await spawnWithInFlightRotation({
+        clock,
+        // Preflight finds nothing to refresh. The rotation reaches the server while the materializer's
+        // own refresh call waits on it, and expires before that call answers.
+        answer: (call) => (call === 1 ? 'not_needed' : 'in_flight'),
+        rotationPersisted: false,
+        duringRefresh: (call, server) => {
+          if (call !== 2) return;
+          server.persist(
+            claudeRecord({ accessToken: 'expiring-access', updatedAt: now - hourMs, expiresAt: now + 500 }),
+            inFlightRevision,
+          );
+          clock.nowMs = now + 1_000;
+        },
+        current: claudeRecord({ accessToken: 'superseded-access', updatedAt: now - 2 * hourMs, expiresAt: now + 7 * hourMs }),
+        inFlight: claudeRecord({ accessToken: 'expiring-access', updatedAt: now - hourMs, expiresAt: now + 500 }),
+      });
+
+      await expect(spawn).rejects.toMatchObject({
+        name: 'ConnectedServiceSpawnCredentialRefreshError',
+        kind: 'transient_refresh_failed',
+      });
+      expect(refreshConnectedServiceCredentialForSpawnPreflight).toHaveBeenCalledTimes(2);
     });
 
     it('does not fall back to a server record that expired while the preflight refresh was awaited', async () => {
       const clock = { nowMs: now };
       const { spawn } = await spawnWithInFlightRotation({
         clock,
+        rotationPersisted: false,
         duringRefresh: () => { clock.nowMs = now + 1_000; },
         current: claudeRecord({ accessToken: 'current-access', updatedAt: now - 2 * hourMs, expiresAt: now + 500 }),
         inFlight: claudeRecord({ accessToken: 'stuck-access', updatedAt: now - 9 * hourMs, expiresAt: now - hourMs }),

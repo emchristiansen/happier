@@ -61,6 +61,7 @@ describe('createConnectedServiceSessionReadinessReconciliation', () => {
     return createConnectedServiceSessionReadinessReconciliation({
       reconcile,
       isCurrent: (registration) => registry.isCurrentTargetRegistration(registration),
+      isShuttingDown: () => false,
     });
   }
 
@@ -139,6 +140,52 @@ describe('createConnectedServiceSessionReadinessReconciliation', () => {
     expect(reconcile).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(1);
     expect(reconcile).toHaveBeenCalledTimes(3);
+  });
+
+  it('admits no new retry once daemon shutdown has begun', async () => {
+    // F46-002: a retry scheduled before shutdown must not start a fresh reconciliation (account
+    // fetch, rematerialization, hot application) while shutdown drains, though the runner's
+    // registration is still current.
+    const hung = deferred();
+    const reconcile = vi.fn(async () => await hung.promise);
+    let shuttingDown = false;
+    const readiness = createConnectedServiceSessionReadinessReconciliation({
+      reconcile,
+      isCurrent: (registration) => registry.isCurrentTargetRegistration(registration),
+      isShuttingDown: () => shuttingDown,
+    });
+    const registration = registerRunner(registry);
+    observe(readiness(registration));
+    await vi.advanceTimersByTimeAsync(waitMs);
+    hung.reject(new Error('hot application failed'));
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    shuttingDown = true;
+    await vi.advanceTimersByTimeAsync(10 * initialMs);
+
+    expect(registry.isCurrentTargetRegistration(registration)).toBe(true);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+  });
+
+  it('schedules no retry for a failure that arrives after daemon shutdown has begun', async () => {
+    const hung = deferred();
+    const reconcile = vi.fn(async () => await hung.promise);
+    let shuttingDown = false;
+    const readiness = createConnectedServiceSessionReadinessReconciliation({
+      reconcile,
+      isCurrent: (registration) => registry.isCurrentTargetRegistration(registration),
+      isShuttingDown: () => shuttingDown,
+    });
+    observe(readiness(registerRunner(registry)));
+    await vi.advanceTimersByTimeAsync(waitMs);
+
+    shuttingDown = true;
+    hung.reject(new Error('hot application failed'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(10 * initialMs);
+    expect(reconcile).toHaveBeenCalledTimes(1);
   });
 
   it('stops retrying once the runner registration is replaced', async () => {

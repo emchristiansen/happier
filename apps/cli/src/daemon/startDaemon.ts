@@ -2593,6 +2593,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             true,
           ),
           isCurrent: (registration) => connectedServiceRuntimeRegistry.isCurrentTargetRegistration(registration),
+          isShuttingDown: () => shutdownInitiated,
         });
         const connectedServiceRuntimeRegistrationCleanup = connectedServiceRuntimeRegistry.onTargetRegistration(
           (registration) => {
