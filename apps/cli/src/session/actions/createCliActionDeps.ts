@@ -1651,16 +1651,17 @@ export function createCliActionDeps(params: Readonly<{
           : typeof modelOverride === 'string' && modelOverride.trim().length > 0
             ? { modelOverride }
             : {}),
-        // A caller-chosen localId is used verbatim; otherwise retries of this
-        // send reuse one localId (see claimSessionSendLocalId).
-        ...(typeof localId === 'string' && localId.trim().length > 0
-          ? { localId }
+        // Precedence: the caller's localId verbatim, then the provider
+        // tool-call id, then the 10-minute bucket (deriveSessionSendLocalId).
+        idempotency: typeof localId === 'string' && localId.trim().length > 0
+          ? { kind: 'explicit', localId }
           : {
-              retryIdentity: {
+              kind: 'derived',
+              identity: {
                 senderSessionId: params.sessionId,
                 providerToolCallId: normalizeString(providerToolCallId),
               },
-            }),
+            },
       });
       if (!res.ok) {
         return {

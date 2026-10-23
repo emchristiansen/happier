@@ -1,35 +1,109 @@
+import { createHmac } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
 
 import {
-  SESSION_SEND_RETRY_WINDOW_MS,
-  claimSessionSendLocalId,
-  deriveSessionSendToolCallLocalId,
-  type SessionSendRetryInputs,
+  SESSION_SEND_BUCKET_MS,
+  deriveSessionSendLocalId,
+  resolveSessionSendBucketStartMs,
+  type SessionSendRequestInputs,
 } from './sessionSendLocalId';
+import {
+  SESSION_SEND_ADMISSION_RETENTION_MS,
+  fingerprintSessionSendRequest,
+  preserveSessionSendAdmission as preserveWithFingerprint,
+} from './sessionSendAdmissionStore';
 
-const inputs: SessionSendRetryInputs = {
-  target: 'sess-target',
+const requestFingerprint = fingerprintSessionSendRequest(['READY TO MOVE']);
+const preserveSessionSendAdmission = (params: Omit<Parameters<typeof preserveWithFingerprint>[0], 'requestFingerprint'>) =>
+  preserveWithFingerprint({ requestFingerprint, ...params });
+
+const key = new Uint8Array(32).fill(5);
+const inputs: SessionSendRequestInputs = {
   message: 'READY TO MOVE',
   requestedAction: { v: 1, kind: 'steer_if_active' },
   permissionModeOverride: null,
   modelOverride: { set: false },
   pendingAdmissionMode: null,
 };
-const cliIdentity = { senderSessionId: 'cli-global', providerToolCallId: null } as const;
+const identity = { senderSessionId: 'sess-sender', providerToolCallId: null } as const;
+// 2026-10-23T19:00:00Z, a bucket boundary.
+const boundaryMs = Date.UTC(2026, 9, 23, 19, 0, 0);
 
-describe('claimSessionSendLocalId', () => {
+function derive(overrides: Partial<Parameters<typeof deriveSessionSendLocalId>[0]> = {}) {
+  return deriveSessionSendLocalId({ key, targetSessionId: 'sess-target', identity, inputs, nowMs: boundaryMs, ...overrides });
+}
+
+describe('resolveSessionSendBucketStartMs', () => {
+  it('floors UTC epoch milliseconds to 10-minute buckets', () => {
+    expect(SESSION_SEND_BUCKET_MS).toBe(600_000);
+    expect(boundaryMs % SESSION_SEND_BUCKET_MS).toBe(0);
+    expect(resolveSessionSendBucketStartMs(boundaryMs)).toBe(boundaryMs);
+    expect(resolveSessionSendBucketStartMs(boundaryMs + SESSION_SEND_BUCKET_MS - 1)).toBe(boundaryMs);
+    expect(resolveSessionSendBucketStartMs(boundaryMs - 1)).toBe(boundaryMs - SESSION_SEND_BUCKET_MS);
+    expect(() => resolveSessionSendBucketStartMs(-1)).toThrow('session_send_clock_invalid');
+    expect(() => resolveSessionSendBucketStartMs(1.5)).toThrow('session_send_clock_invalid');
+  });
+});
+
+describe('deriveSessionSendLocalId', () => {
+  it('gives every identical send in one bucket the same localId and the next bucket a new one', () => {
+    const first = derive();
+    expect(first.startsWith('session-send-text:')).toBe(true);
+    expect(derive({ nowMs: boundaryMs + SESSION_SEND_BUCKET_MS - 1 })).toBe(first);
+    expect(derive({ nowMs: boundaryMs + SESSION_SEND_BUCKET_MS })).not.toBe(first);
+    expect(derive({ nowMs: boundaryMs - 1 })).not.toBe(first);
+  });
+
+  it('is an HMAC over a domain-separated, target-namespaced encoding', () => {
+    const expected = createHmac('sha256', key).update(JSON.stringify([
+      'happier.session-send.local-id.text-bucket.v1',
+      'sess-target',
+      'sess-sender',
+      boundaryMs,
+      'READY TO MOVE',
+      { v: 1, kind: 'steer_if_active' },
+      null,
+      ['unset'],
+      null,
+    ])).digest('hex').slice(0, 32);
+    expect(derive()).toBe(`session-send-text:${expected}`);
+    expect(derive({ key: new Uint8Array(32).fill(6) })).not.toBe(derive());
+  });
+
+  it('separates targets, senders and every enqueued input', () => {
+    const base = derive();
+    const variants = [
+      derive({ targetSessionId: 'sess-other-target' }),
+      derive({ identity: { senderSessionId: 'sess-other-sender', providerToolCallId: null } }),
+      derive({ inputs: { ...inputs, message: 'READY TO MOVE.' } }),
+      derive({ inputs: { ...inputs, requestedAction: { v: 1, kind: 'send_now' } } }),
+      derive({ inputs: { ...inputs, permissionModeOverride: 'read-only' } }),
+      derive({ inputs: { ...inputs, modelOverride: { set: true, value: null } } }),
+      derive({ inputs: { ...inputs, pendingAdmissionMode: 'continuation_if_no_queued_user_input' } }),
+    ];
+    expect(new Set([base, ...variants]).size).toBe(variants.length + 1);
+  });
+
+  it('prefers a provider tool-call id, with no time component', () => {
+    const toolIdentity = { senderSessionId: 'sess-sender', providerToolCallId: 'toolu_1' } as const;
+    const byCall = derive({ identity: toolIdentity });
+    expect(byCall.startsWith('session-send-tool-call:')).toBe(true);
+    expect(derive({ identity: toolIdentity, nowMs: boundaryMs + 5 * SESSION_SEND_BUCKET_MS })).toBe(byCall);
+    expect(derive({ identity: { ...toolIdentity, providerToolCallId: 'toolu_2' } })).not.toBe(byCall);
+    expect(byCall).not.toBe(derive());
+  });
+});
+
+describe('preserveSessionSendAdmission', () => {
   let envScope = createEnvKeyScope(['HAPPIER_HOME_DIR']);
   let homeDir = '';
-  let nowMs = 1_000_000;
-  const now = () => nowMs;
 
   beforeEach(async () => {
-    homeDir = await createTempDir('happier-send-ledger-');
+    homeDir = await createTempDir('happier-send-admissions-');
     process.env.HAPPIER_HOME_DIR = homeDir;
-    nowMs = 1_000_000;
     const { reloadConfiguration } = await import('@/configuration');
     reloadConfiguration();
   });
@@ -42,75 +116,40 @@ describe('claimSessionSendLocalId', () => {
     reloadConfiguration();
   });
 
-  it('reuses the localId of an unsuccessful attempt inside the window and re-arms it on each failure', async () => {
-    const first = await claimSessionSendLocalId({ identity: cliIdentity, inputs, nowMs: now });
-    await first.settle('unsuccessful');
-
-    nowMs += SESSION_SEND_RETRY_WINDOW_MS - 1;
-    const second = await claimSessionSendLocalId({ identity: cliIdentity, inputs, nowMs: now });
-    await second.settle('unsuccessful');
-
-    nowMs += SESSION_SEND_RETRY_WINDOW_MS - 1;
-    const third = await claimSessionSendLocalId({ identity: cliIdentity, inputs, nowMs: now });
-
-    expect(second.localId).toBe(first.localId);
-    expect(third.localId).toBe(first.localId);
+  const body = (ciphertext: string, localId = 'local-1') => ({
+    localId,
+    ciphertext,
+    messageRole: 'user' as const,
+    requestedAction: { v: 1 as const, kind: 'steer_if_active' as const },
   });
 
-  it('gives a fresh localId after success, after a refusal, and after the window lapses', async () => {
-    const succeeded = await claimSessionSendLocalId({ identity: cliIdentity, inputs, nowMs: now });
-    await succeeded.settle('succeeded');
-    const afterSuccess = await claimSessionSendLocalId({ identity: cliIdentity, inputs, nowMs: now });
-    await afterSuccess.settle('refused');
-    const afterRefusal = await claimSessionSendLocalId({ identity: cliIdentity, inputs, nowMs: now });
-    await afterRefusal.settle('unsuccessful');
-    nowMs += SESSION_SEND_RETRY_WINDOW_MS + 1;
-    const afterWindow = await claimSessionSendLocalId({ identity: cliIdentity, inputs, nowMs: now });
-
-    expect(new Set([succeeded.localId, afterSuccess.localId, afterRefusal.localId, afterWindow.localId]).size).toBe(4);
+  it('keeps the first body per (session, localId) and returns it to later attempts', async () => {
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('first') })).toEqual(body('first'));
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('resealed') })).toEqual(body('first'));
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-b', candidate: body('other-session') })).toEqual(body('other-session'));
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('other-id', 'local-2') })).toEqual(body('other-id', 'local-2'));
   });
 
-  it('keys by sender and by every enqueued input', async () => {
-    const base = await claimSessionSendLocalId({ identity: cliIdentity, inputs, nowMs: now });
-    await base.settle('unsuccessful');
-    const variants = await Promise.all([
-      claimSessionSendLocalId({ identity: { senderSessionId: 'sess-other', providerToolCallId: null }, inputs, nowMs: now }),
-      claimSessionSendLocalId({ identity: cliIdentity, inputs: { ...inputs, target: 'sess-other-target' }, nowMs: now }),
-      claimSessionSendLocalId({ identity: cliIdentity, inputs: { ...inputs, message: 'READY TO MOVE.' }, nowMs: now }),
-      claimSessionSendLocalId({ identity: cliIdentity, inputs: { ...inputs, requestedAction: { v: 1, kind: 'send_now' } }, nowMs: now }),
-      claimSessionSendLocalId({ identity: cliIdentity, inputs: { ...inputs, permissionModeOverride: 'read-only' }, nowMs: now }),
-      claimSessionSendLocalId({ identity: cliIdentity, inputs: { ...inputs, modelOverride: { set: true, value: null } }, nowMs: now }),
-    ]);
-
-    for (const variant of variants) {
-      expect(variant.localId).not.toBe(base.localId);
-    }
+  it('converges concurrent first attempts on one body', async () => {
+    const results = await Promise.all(Array.from({ length: 8 }, (_, index) =>
+      preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body(`candidate-${index}`) })));
+    expect(new Set(results.map((result) => (result as { ciphertext?: string }).ciphertext)).size).toBe(1);
   });
 
-  it('converges concurrent identical claims on one localId', async () => {
-    const claims = await Promise.all(
-      Array.from({ length: 8 }, () => claimSessionSendLocalId({ identity: cliIdentity, inputs, nowMs: now })),
-    );
-
-    expect(new Set(claims.map((claim) => claim.localId)).size).toBe(1);
+  it('issues a different request under a kept localId as itself, without replacing the kept body', async () => {
+    await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('first') });
+    const otherRequest = fingerprintSessionSendRequest(['other text']);
+    expect(await preserveWithFingerprint({ sessionId: 'sess-a', requestFingerprint: otherRequest, candidate: body('other') }))
+      .toEqual(body('other'));
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('resealed') })).toEqual(body('first'));
   });
 
-  it('derives a tool-call localId from the call id and sender, and prefers a live unsuccessful attempt', async () => {
-    const toolIdentity = { senderSessionId: 'sess-sender', providerToolCallId: 'toolu_1' } as const;
-    const derived = deriveSessionSendToolCallLocalId(toolIdentity, inputs);
-    expect(derived).toBe(deriveSessionSendToolCallLocalId(toolIdentity, inputs));
-    expect(derived).not.toBe(deriveSessionSendToolCallLocalId({ ...toolIdentity, senderSessionId: 'sess-other' }, inputs));
-    expect(derived.startsWith('session-send-tool-call:')).toBe(true);
-
-    const firstCall = await claimSessionSendLocalId({ identity: toolIdentity, inputs, nowMs: now });
-    expect(firstCall.localId).toBe(derived);
-    await firstCall.settle('unsuccessful');
-
-    const newCallSameText = await claimSessionSendLocalId({
-      identity: { ...toolIdentity, providerToolCallId: 'toolu_2' },
-      inputs,
-      nowMs: now,
-    });
-    expect(newCallSameText.localId).toBe(derived);
+  it('drops other bodies older than the retention when publishing', async () => {
+    let nowMs = 1_000_000;
+    await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('old'), nowMs: () => nowMs });
+    nowMs += SESSION_SEND_ADMISSION_RETENTION_MS + 1;
+    await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('new', 'local-2'), nowMs: () => nowMs });
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('resealed'), nowMs: () => nowMs }))
+      .toEqual(body('resealed'));
   });
 });

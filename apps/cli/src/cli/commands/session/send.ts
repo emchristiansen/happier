@@ -147,10 +147,21 @@ export async function cmdSessionSend(
   }
 
   if (json) {
-    await printJsonEnvelope({ ok: true, kind: 'session_send', data: { sessionId: result.sessionId, localId: result.localId, waited: result.waited } });
+    await printJsonEnvelope({
+      ok: true,
+      kind: 'session_send',
+      data: {
+        sessionId: result.sessionId,
+        localId: result.localId,
+        waited: result.waited,
+        ...(result.deduplicated === true ? { deduplicated: true } : {}),
+      },
+    });
     return;
   }
 
-  console.log(chalk.green('✓'), 'message sent');
+  console.log(chalk.green('✓'), result.deduplicated === true
+    ? 'message already present (deduplicated by localId)'
+    : 'message sent');
   await writeJsonStdout({ sessionId: result.sessionId, localId: result.localId }, { pretty: true });
 }

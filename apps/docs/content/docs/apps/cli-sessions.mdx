@@ -128,13 +128,13 @@ Notes:
 
 ### Resending safely (`--local-id`)
 
-Every message carries a `localId`, and the server keeps at most one message per `localId` in a session. A resend that reuses the `localId` of an earlier attempt with the same message bytes cannot create a second copy.
+Every message carries a `localId`, and the server keeps at most one message per `localId` in a session. A resend that reuses the `localId` of an earlier attempt cannot create a second copy; the CLI re-sends the exact bytes of the first attempt under that `localId`.
 
 - `--local-id <id>` sets it yourself. Use a new value for every message you mean to send, and the same value only to retry it.
-- Without `--local-id`, the CLI picks one. If an identical send (same target as typed, text and overrides) from the same session did not succeed in the last 10 minutes, it reuses that attempt's `localId` and re-sends the exact bytes that attempt sent, even if the session's model or permission settings changed since. Otherwise it picks a new one, so a deliberate repeat after a successful send is normally a new message. This bookkeeping is local to one machine and home directory.
+- Without `--local-id`, the CLI derives it from the target session, the sender, the text and overrides, and the current 10-minute UTC window (`:00`, `:10`, `:20` … past each hour). Every identical send in the same window is the same message: the second one reports `deduplicated: true` and is not delivered again, even if you meant it as a repeat. A resend that falls into the next window is a new message. Use `--local-id` when you need to repeat a message on purpose.
 - If the server does not acknowledge the enqueue in time (`timeout` with `pendingCustody: "unconfirmed"`), it may still have committed the message. The `localId` is reported (in `--json` output under `error.details`); resend with it to finish the send without duplicating it.
-- If `--wait` times out after the message was queued, the error is `timeout` with `pendingCustody: "confirmed"`: the message is in the session, and resending it would send it again.
-- `conflict` means the session already has that `localId` with different content, or the message was discarded. A `--local-id` resend after the session's model or permission settings changed can report `conflict` even though the first attempt was committed.
+- If `--wait` times out after the message was queued, the error is `timeout` with `pendingCustody: "confirmed"`: the message is in the session, and resending it with a new `localId` would send it again.
+- `conflict` means the session already has that `localId` with different content, or the message was discarded.
 
 ## History
 

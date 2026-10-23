@@ -52,8 +52,12 @@ export function readSessionUserMessageAdmissionBody(value: unknown): SessionUser
 }
 
 export type SessionUserMessageAdmissionResult =
-  /** The row is in durable Pending custody. */
-  | Readonly<{ status: 'admitted' }>
+  /**
+   * The row is in durable Pending custody. `deduplicated` is true exactly when
+   * the server reported `didWrite: false`: it already held a queued row with
+   * this localId and identical content, and returned that row.
+   */
+  | Readonly<{ status: 'admitted'; deduplicated: boolean }>
   /** The server declined to queue it (delivery-mode condition), with no error. */
   | Readonly<{ status: 'suppressed' }>
   /**
@@ -176,5 +180,5 @@ export async function admitSessionUserMessageToPendingQueue(params: Readonly<{
 
   if (enqueueResult?.suppressed === true) return { status: 'suppressed' };
   if (enqueueResult?.terminal === true) return { status: 'already_terminal' };
-  return { status: 'admitted' };
+  return { status: 'admitted', deduplicated: enqueueResult?.didWrite === false };
 }

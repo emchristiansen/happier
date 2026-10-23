@@ -69,8 +69,9 @@ describe('admitSessionUserMessageToPendingQueue', () => {
     // The same-Session Agent transition admits the user's own prompt and asks
     // for no delivery condition. A lost acknowledgement makes it retry with the
     // identical localId and text.
-    await expect(admit(transitionAdmission())).resolves.toEqual({ status: 'admitted' });
-    await expect(admit(transitionAdmission())).resolves.toEqual({ status: 'admitted' });
+    // The mocked enqueue reports no didWrite field, so neither is claimed deduplicated.
+    await expect(admit(transitionAdmission())).resolves.toEqual({ status: 'admitted', deduplicated: false });
+    await expect(admit(transitionAdmission())).resolves.toEqual({ status: 'admitted', deduplicated: false });
 
     const [first, retry] = bodies();
     expect(first?.ciphertext).toEqual(expect.any(String));

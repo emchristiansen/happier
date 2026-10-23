@@ -126,7 +126,12 @@ describe('session message send idempotency at the relay HTTP boundary (integrati
   const targetSessionId = 'sess_send_idem_target';
   const credentials = async () => ({ token: 'token_test', encryption: { type: 'legacy' as const, secret } });
 
+  // Mid-bucket (19:03Z), advancing in real time: a whole test stays inside one
+  // 10-minute bucket unless it moves the clock itself.
+  const midBucketMs = Date.UTC(2026, 9, 23, 19, 3, 0);
+
   beforeEach(async () => {
+    vi.useFakeTimers({ toFake: ['Date'], shouldAdvanceTime: true, now: midBucketMs });
     happyHomeDir = await createTempDir('happier-cli-send-idempotency-');
     delete process.env.HAPPIER_ACTIONS_SETTINGS_V1;
     relay = createFakeRelay({ secret, senderSessionId, targetSessionId });
@@ -141,6 +146,7 @@ describe('session message send idempotency at the relay HTTP boundary (integrati
   });
 
   afterEach(async () => {
+    vi.useRealTimers();
     if (relay) {
       await new Promise<void>((resolve, reject) => relay!.server.close((e) => (e ? reject(e) : resolve())));
     }
@@ -164,6 +170,51 @@ describe('session message send idempotency at the relay HTTP boundary (integrati
     } finally {
       output.restore();
     }
+  }
+
+  /**
+   * The incident's path: the runner's MCP server registers `action_execute`,
+   * which runs `session.message.send` through the CLI action executor harness.
+   * `extra` is what the MCP SDK hands the handler; no `_meta` call id here.
+   */
+  async function mcpActionExecuteSend(message: string, extra: Record<string, unknown>): Promise<any> {
+    const { createCliActionExecutorHarness } = await import('@/session/actions/createCliActionExecutorHarness');
+    const { createActionToolExecutorBridge } = await import('@/agent/tools/happierTools/createActionToolExecutorBridge');
+    const { registerHappierMcpBuiltInTools } = await import('@/mcp/server/registerHappierMcpBuiltInTools');
+    const { resolveSessionEncryptionContextFromCredentials } = await import('@/session/transport/encryption/sessionEncryptionContext');
+    const creds = await credentials();
+    const harness = createCliActionExecutorHarness({
+      token: creds.token,
+      credentials: creds,
+      sessionId: senderSessionId,
+      ctx: resolveSessionEncryptionContextFromCredentials(creds),
+    });
+    const bridge = createActionToolExecutorBridge({
+      executor: harness.executor,
+      surface: 'session_agent',
+      resolveCallerPermissionMode: () => 'default',
+    });
+    const handlers = new Map<string, (args: unknown, extra?: unknown) => Promise<unknown>>();
+    registerHappierMcpBuiltInTools({
+      registerTool: (name, _meta, handler) => {
+        handlers.set(name, handler as (args: unknown, extra?: unknown) => Promise<unknown>);
+      },
+    }, {
+      sessionId: senderSessionId,
+      surface: 'session_agent',
+      deps: {
+        changeTitle: async () => ({ success: true }),
+        startExecutionRun: async () => ({ ok: false as const, errorCode: 'unsupported', error: 'unsupported' }),
+        executeActionByToolName: bridge.executeActionByToolName,
+      },
+    });
+    const handler = handlers.get('action_execute');
+    if (!handler) throw new Error('Expected action_execute to be registered');
+    const result = await handler({ actionId: 'session.message.send', input: { sessionId: targetSessionId, message } }, extra) as {
+      isError: boolean;
+      content: Array<{ text: string }>;
+    };
+    return { isError: result.isError, payload: JSON.parse(result.content[0]?.text ?? 'null') };
   }
 
   async function agentToolSend(toolCallId: string, message: string): Promise<any> {
@@ -201,7 +252,7 @@ describe('session message send idempotency at the relay HTTP boundary (integrati
       details: expect.objectContaining({ pendingCustody: 'unconfirmed', sessionId: targetSessionId, localId }),
     }));
     expect(String(first.error.details.message)).toContain('may still have been committed');
-    expect(second).toEqual(expect.objectContaining({ ok: true, data: expect.objectContaining({ localId }) }));
+    expect(second).toEqual(expect.objectContaining({ ok: true, data: expect.objectContaining({ localId, deduplicated: true }) }));
   });
 
   it('keeps one localId across a resend loop that keeps losing acknowledgements', async () => {
@@ -227,18 +278,55 @@ describe('session message send idempotency at the relay HTTP boundary (integrati
     expect(second).toEqual(expect.objectContaining({ ok: true }));
     expect(new Set(relay!.postedLocalIds).size).toBe(1);
     // The retry re-sent the identical body, so the relay answered with the existing row
-    // instead of refusing a re-sealed one (which would let a third send mint a new id).
+    // instead of refusing a body re-sealed under the new metadata as a conflict.
+    expect(second.data.deduplicated).toBe(true);
     expect(relay!.rows.size).toBe(1);
   });
 
-  it('sends a deliberate repeat of the same text after a successful send as a new message', async () => {
+  it('reports an identical send in the same 10-minute bucket as deduplicated, even if meant as a repeat', async () => {
     const first = await sessionSend([targetSessionId, 'READY TO MOVE']);
     const second = await sessionSend([targetSessionId, 'READY TO MOVE']);
 
-    expect(first.ok).toBe(true);
+    expect(first).toEqual(expect.objectContaining({ ok: true }));
+    expect(first.data).not.toHaveProperty('deduplicated');
+    expect(second.data).toEqual(expect.objectContaining({ localId: first.data.localId, deduplicated: true }));
+    expect(relay!.rows.size).toBe(1);
+  });
+
+  it('sends the same text again once the next UTC bucket starts', async () => {
+    const first = await sessionSend([targetSessionId, 'READY TO MOVE']);
+    vi.setSystemTime(Date.UTC(2026, 9, 23, 19, 10, 0));
+    const second = await sessionSend([targetSessionId, 'READY TO MOVE']);
+
     expect(second.ok).toBe(true);
+    expect(second.data.localId).not.toBe(first.data.localId);
     expect(relay!.rows.size).toBe(2);
-    expect(first.data.localId).not.toBe(second.data.localId);
+  });
+
+  it('collapses the incident path: MCP action_execute session.message.send twice with identical input and no call id', async () => {
+    relay!.dropNextAcknowledgements(1);
+
+    const first = await mcpActionExecuteSend('CORRECTION CASE tv-g1-paths-present-1', { requestId: 1 });
+    const second = await mcpActionExecuteSend('CORRECTION CASE tv-g1-paths-present-1', { requestId: 2 });
+
+    expect(first.isError).toBe(true);
+    expect(first.payload).toEqual(expect.objectContaining({
+      errorCode: 'timeout',
+      details: expect.objectContaining({ pendingCustody: 'unconfirmed' }),
+    }));
+    expect(second.isError).toBe(false);
+    expect(second.payload).toEqual(expect.objectContaining({ ok: true, deduplicated: true }));
+    expect(relay!.postedLocalIds).toHaveLength(2);
+    expect(new Set(relay!.postedLocalIds).size).toBe(1);
+    expect(relay!.rows.size).toBe(1);
+  });
+
+  it('prefers the MCP request _meta provider call id over the bucket on the action_execute path', async () => {
+    await mcpActionExecuteSend('ACK', { requestId: 1, _meta: { 'claudecode/toolUseId': 'toolu_mcp_a' } });
+    await mcpActionExecuteSend('ACK', { requestId: 2, _meta: { 'claudecode/toolUseId': 'toolu_mcp_b' } });
+
+    expect(relay!.rows.size).toBe(2);
+    expect([...relay!.rows.keys()].every((localId) => localId.startsWith('session-send-tool-call:'))).toBe(true);
   });
 
   it('uses --local-id verbatim, so a resend with it dedupes', async () => {

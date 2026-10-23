@@ -1266,6 +1266,7 @@ describe('sendSessionMessage', () => {
             sessionId: 'sess-1',
             localId: 'already-accepted-local-id',
             waited: false,
+            deduplicated: true,
         });
 
         expect(enqueuePendingQueueV2MessageViaHttp).toHaveBeenCalledTimes(1);

@@ -40,16 +40,20 @@ import {
 } from '@/session/shared/sessionTurnLifecycle';
 
 import { resolveSessionTransportContext } from './resolveSessionTransportContext';
-import { logger } from '@/ui/logger';
 import { requestInactiveSessionResume } from './requestInactiveSessionResume';
+import { fingerprintSessionSendRequest, preserveSessionSendAdmission } from './sessionSendAdmissionStore';
 import {
-  claimSessionSendLocalId,
-  type SessionSendAttemptOutcome,
-  type SessionSendRetryIdentity,
+  deriveSessionSendLocalId,
+  type SessionSendDerivationIdentity,
+  type SessionSendRequestInputs,
 } from './sessionSendLocalId';
 
 export type SendSessionMessageResult =
-  | Readonly<{ ok: true; sessionId: string; localId: string; waited: boolean; suppressed?: true }>
+  /**
+   * `deduplicated: true` means the relay already held this localId with
+   * identical content and returned that message instead of creating a new one.
+   */
+  | Readonly<{ ok: true; sessionId: string; localId: string; waited: boolean; suppressed?: true; deduplicated?: true }>
   /**
    * The enqueue was issued and its acknowledgement never arrived. The relay
    * usually commits such a request anyway, so the message may exist under
@@ -96,19 +100,25 @@ export type SendSessionMessageResult =
 
 /**
  * How the attempt's Pending localId is chosen. Exactly one of:
- * - `localId`: the caller's own key, used verbatim (daemon continuations, `--local-id`),
- *   with the caller's own optional `preserveAdmission`;
- * - `retryIdentity`: derived per `claimSessionSendLocalId`, so retries reuse it; the
- *   claim then owns admission preservation for the logical attempt;
- * - neither: a fresh random localId (the historical behaviour, kept for daemon callers).
+ * - `localId` (optionally with the caller's own `preserveAdmission`): the
+ *   caller's key, used verbatim; daemon callers own their retry state;
+ * - neither: a fresh random localId (the historical behaviour, kept for daemon callers);
+ * - `idempotency`: the action path (`session.message.send`). An explicit
+ *   localId is used verbatim, otherwise one is derived by
+ *   `deriveSessionSendLocalId`; either way the first admission body per
+ *   (session, localId) is kept and re-issued (`preserveSessionSendAdmission`).
  */
+export type SessionSendIdempotency =
+  | Readonly<{ kind: 'explicit'; localId: string }>
+  | Readonly<{ kind: 'derived'; identity: SessionSendDerivationIdentity }>;
+
 type SendSessionMessageLocalIdChoice =
   | Readonly<{
       localId?: string;
-      retryIdentity?: never;
+      idempotency?: never;
       preserveAdmission?: (body: SessionUserMessageAdmissionBody) => Promise<SessionUserMessageAdmissionBody>;
     }>
-  | Readonly<{ localId?: never; retryIdentity: SessionSendRetryIdentity; preserveAdmission?: never }>;
+  | Readonly<{ localId?: never; idempotency: SessionSendIdempotency; preserveAdmission?: never }>;
 
 function parsePermissionIntentOrThrow(raw: string): PermissionIntent {
   const parsed = parsePermissionIntentAlias(raw);
@@ -494,73 +504,46 @@ type SendSessionMessageParams = Readonly<{
   assertCanAdmit?: () => void;
 }> & SendSessionMessageLocalIdChoice;
 
-type SendAttemptIdentity = Readonly<{
-  localId: string | undefined;
-  preserveAdmission?: (sessionId: string, body: SessionUserMessageAdmissionBody) => Promise<SessionUserMessageAdmissionBody>;
-}>;
+function readSendRequestInputs(params: SendSessionMessageParams): SessionSendRequestInputs {
+  return {
+    message: params.message,
+    requestedAction: params.requestedAction ?? null,
+    permissionModeOverride: params.permissionModeOverride ?? null,
+    modelOverride: params.modelOverride === undefined
+      ? { set: false }
+      : { set: true, value: params.modelOverride },
+    pendingAdmissionMode: params.pendingAdmissionMode ?? null,
+  };
+}
 
-function classifySendAttemptOutcome(result: SendSessionMessageResult): SessionSendAttemptOutcome {
-  if (result.ok) return 'succeeded';
-  return result.pendingCustody === 'refused' ? 'refused' : 'unsuccessful';
+function resolveAttemptLocalId(params: SendSessionMessageParams, target: Readonly<{
+  sessionId: string;
+  encryptionKey: Uint8Array;
+}>): string | undefined {
+  const idempotency = params.idempotency;
+  if (!idempotency) return params.localId;
+  if (idempotency.kind === 'explicit') return idempotency.localId;
+  return deriveSessionSendLocalId({
+    key: target.encryptionKey,
+    targetSessionId: target.sessionId,
+    identity: idempotency.identity,
+    inputs: readSendRequestInputs(params),
+    nowMs: Date.now(),
+  });
+}
+
+function resolveAttemptPreserveAdmission(
+  params: SendSessionMessageParams,
+  sessionId: string,
+): ((body: SessionUserMessageAdmissionBody) => Promise<SessionUserMessageAdmissionBody>) | undefined {
+  if (params.idempotency) {
+    const requestFingerprint = fingerprintSessionSendRequest(readSendRequestInputs(params));
+    return async (candidate) => await preserveSessionSendAdmission({ sessionId, requestFingerprint, candidate });
+  }
+  return params.preserveAdmission;
 }
 
 export async function sendSessionMessage(params: SendSessionMessageParams): Promise<SendSessionMessageResult> {
-  if (!params.retryIdentity) {
-    const callerPreserveAdmission = params.preserveAdmission;
-    return await sendSessionMessageOnce(params, {
-      localId: params.localId,
-      ...(callerPreserveAdmission ? { preserveAdmission: async (_sessionId, body) => await callerPreserveAdmission(body) } : {}),
-    });
-  }
-  const claim = await claimSessionSendLocalId({
-    identity: params.retryIdentity,
-    inputs: {
-      target: params.idOrPrefix,
-      message: params.message,
-      requestedAction: params.requestedAction ?? null,
-      permissionModeOverride: params.permissionModeOverride ?? null,
-      modelOverride: params.modelOverride === undefined
-        ? { set: false }
-        : { set: true, value: params.modelOverride },
-      pendingAdmissionMode: params.pendingAdmissionMode ?? null,
-    },
-  });
-  let result: SendSessionMessageResult;
-  try {
-    result = await sendSessionMessageOnce(params, {
-      localId: claim.localId,
-      preserveAdmission: claim.preserveAdmission,
-    });
-  } catch (error) {
-    await settleRetryLedgerEntry(claim, 'unsuccessful');
-    throw error;
-  }
-  await settleRetryLedgerEntry(claim, classifySendAttemptOutcome(result));
-  return result;
-}
-
-/**
- * The attempt's outcome is already decided; a ledger write failure must not
- * turn a delivered message into a reported failure. Left unsettled, the entry
- * only makes an identical send within the window reuse this localId.
- */
-async function settleRetryLedgerEntry(
-  claim: Awaited<ReturnType<typeof claimSessionSendLocalId>>,
-  outcome: SessionSendAttemptOutcome,
-): Promise<void> {
-  try {
-    await claim.settle(outcome);
-  } catch (error) {
-    logger.warn(`[session send] retry ledger entry for localId ${claim.localId} was not settled as ${outcome}: `
-      + (error instanceof Error ? error.message : String(error)));
-  }
-}
-
-async function sendSessionMessageOnce(
-  params: SendSessionMessageParams,
-  attempt: SendAttemptIdentity,
-): Promise<SendSessionMessageResult> {
-  const requestedLocalId = attempt.localId;
   const sessionTarget = await resolveSessionTransportContext({
     credentials: params.credentials,
     idOrPrefix: params.idOrPrefix,
@@ -585,6 +568,10 @@ async function sendSessionMessageOnce(
     return { ok: false, code: 'session_archived' };
   }
 
+  const requestedLocalId = resolveAttemptLocalId(params, {
+    sessionId,
+    encryptionKey: sessionTarget.ctx.encryptionKey,
+  });
   if (requestedLocalId !== undefined && readPendingLocalId(requestedLocalId) === null) {
     throw new Error('Pending localId must not be blank');
   }
@@ -612,8 +599,8 @@ async function sendSessionMessageOnce(
     text: params.message,
     permissionIntent,
     modelId,
-    ...(attempt.preserveAdmission
-      ? { preserveAdmission: async (body: SessionUserMessageAdmissionBody) => await attempt.preserveAdmission!(sessionId, body) }
+    ...(resolveAttemptPreserveAdmission(params, sessionId)
+      ? { preserveAdmission: resolveAttemptPreserveAdmission(params, sessionId)! }
       : {}),
     ...(params.assertCanAdmit ? { assertCanAdmit: params.assertCanAdmit } : {}),
     ...(params.requestedAction ? { requestedAction: params.requestedAction } : {}),
@@ -652,8 +639,9 @@ async function sendSessionMessageOnce(
   // The server found this exact localId in the terminal transcript. Starting
   // an inactive runtime now would create work without pending custody.
   if (admission.status === 'already_terminal') {
-    return { ok: true, sessionId, localId, waited: false };
+    return { ok: true, sessionId, localId, waited: false, deduplicated: true };
   }
+  const deduplicated = admission.status === 'admitted' && admission.deduplicated;
 
   if (!shouldUseRuntimeRpc && params.resumeInactiveSession !== false) {
     const resumeResult = await requestInactiveSessionResume({
@@ -668,6 +656,7 @@ async function sendSessionMessageOnce(
       if (!params.wait) {
         return {
           ok: true,
+          ...(deduplicated ? { deduplicated: true as const } : {}),
           sessionId,
           localId,
           waited: false,
@@ -704,6 +693,7 @@ async function sendSessionMessageOnce(
   if (!params.wait) {
     return {
       ok: true,
+      ...(deduplicated ? { deduplicated: true as const } : {}),
       sessionId: sessionId,
       localId,
       waited: false,
@@ -858,6 +848,7 @@ async function sendSessionMessageOnce(
     if (initialAssistantTurnOutcome.kind === 'completed') {
       return {
         ok: true,
+        ...(deduplicated ? { deduplicated: true as const } : {}),
         sessionId: sessionId,
         localId,
         waited: true,
@@ -888,6 +879,7 @@ async function sendSessionMessageOnce(
     }
     return {
       ok: true,
+      ...(deduplicated ? { deduplicated: true as const } : {}),
       sessionId: sessionId,
       localId,
       waited: true,
