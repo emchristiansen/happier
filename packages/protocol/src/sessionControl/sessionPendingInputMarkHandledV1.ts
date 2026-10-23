@@ -66,10 +66,21 @@ const SessionPendingInputMarkHandledRefusalV1Schema = z.discriminatedUnion('reas
   z.object({ reason: z.literal('state_mismatch'), row: SessionPendingInputRowSnapshotV1Schema }).strict(),
 ]);
 
+/** Queue counters a response or readback may omit; each is null when it was not reported. */
 const SessionPendingQueueCountsV1Shape = {
   pendingCount: NonNegativeIntegerSchema.nullable(),
   pendingBlockedCount: NonNegativeIntegerSchema.nullable(),
   pendingVersion: NonNegativeIntegerSchema.nullable(),
+} as const;
+
+/**
+ * Queue counters of a not-resolved receipt. A handled response without a transcript message counts
+ * as the server's answer that nothing was resolved only when it reports all three counters.
+ */
+const SessionPendingQueueCompleteCountsV1Shape = {
+  pendingCount: NonNegativeIntegerSchema,
+  pendingBlockedCount: NonNegativeIntegerSchema,
+  pendingVersion: NonNegativeIntegerSchema,
 } as const;
 
 const SessionPendingInputMarkHandledReadbackV1Schema = z
@@ -154,7 +165,7 @@ export const SessionPendingInputMarkHandledResultV1Schema = z.discriminatedUnion
   z.object({
     ...SessionPendingInputMarkHandledPostedReceiptV1Shape,
     outcome: z.literal('not_resolved'),
-    post: z.object(SessionPendingQueueCountsV1Shape).strict(),
+    post: z.object(SessionPendingQueueCompleteCountsV1Shape).strict(),
   }).strict(),
   z.object({
     ...SessionPendingInputMarkHandledPostedReceiptV1Shape,

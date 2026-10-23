@@ -114,6 +114,59 @@ describe('session pending input mark-handled contract', () => {
     }).outcome).toBe('uncertain');
   });
 
+  describe('not-resolved post counts', () => {
+    const notResolved = {
+      sessionId: 'sess_1',
+      localId: 'local-1',
+      expectation,
+      claimsDelivery: false,
+      outcome: 'not_resolved',
+      preRead,
+      post: { pendingCount: 3, pendingBlockedCount: 1, pendingVersion: 7 },
+      readback,
+    } as const;
+
+    it('accepts complete counts, including zeros', () => {
+      expect(SessionPendingInputMarkHandledResultV1Schema.safeParse(notResolved).success).toBe(true);
+      expect(SessionPendingInputMarkHandledResultV1Schema.safeParse({
+        ...notResolved,
+        post: { pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 0 },
+      }).success).toBe(true);
+    });
+
+    it.each([
+      ['a null pending count', { pendingCount: null, pendingBlockedCount: 1, pendingVersion: 7 }],
+      ['a null blocked count', { pendingCount: 3, pendingBlockedCount: null, pendingVersion: 7 }],
+      ['a null pending version', { pendingCount: 3, pendingBlockedCount: 1, pendingVersion: null }],
+      ['all counts null', { pendingCount: null, pendingBlockedCount: null, pendingVersion: null }],
+      ['a missing blocked count', { pendingCount: 3, pendingVersion: 7 }],
+      ['a negative count', { pendingCount: -1, pendingBlockedCount: 1, pendingVersion: 7 }],
+      ['a fractional version', { pendingCount: 3, pendingBlockedCount: 1, pendingVersion: 7.5 }],
+    ])('rejects %s', (_case, post) => {
+      expect(SessionPendingInputMarkHandledResultV1Schema.safeParse({ ...notResolved, post }).success).toBe(false);
+    });
+
+    it('keeps resolved post counts and session readback counts nullable', () => {
+      expect(SessionPendingInputMarkHandledResultV1Schema.safeParse({
+        ...notResolved,
+        outcome: 'resolved',
+        post: {
+          pendingCount: null,
+          pendingBlockedCount: null,
+          pendingVersion: null,
+          transcriptMessage: { id: 'msg-1', seq: 41, localId: 'local-1', deliveryResolution: { v: 1, kind: 'manual_handled' } },
+        },
+      }).success).toBe(true);
+      expect(SessionPendingInputMarkHandledResultV1Schema.safeParse({
+        ...notResolved,
+        readback: {
+          ...readback,
+          sessionCounts: { status: 'read', pendingCount: null, pendingBlockedCount: null, pendingVersion: null },
+        },
+      }).success).toBe(true);
+    });
+  });
+
   it('cannot represent a receipt that claims delivery or a resolution without its transcript proof', () => {
     const resolved = {
       sessionId: 'sess_1',
