@@ -4,12 +4,13 @@ import type { AccountStanding } from "@/app/auth/accountStanding";
  * Staleness bound for a shared account standing.
  *
  * A standing this cache hands to a caller that did not read it itself comes from a read that started less than
- * this long before the hand-over, with no in-process `invalidate` (of any account) between that read's start and
- * the hand-over:
- * - a remembered "active" standing is returned only before its read's start + bound; `invalidate` forgets it;
- * - a caller that joined another caller's read accepts that read's result only if, at the moment it checks (after
- *   the read settles), it is still before start + bound and the cache-wide invalidation count is the one the read
- *   captured when it started. Otherwise the joiner performs one read of its own instead and returns that result.
+ * this long before the hand-over. The two ways of handing one over are fenced against invalidation differently:
+ * - a remembered "active" standing is returned only before its read's start + bound, and `invalidate(accountId)`
+ *   forgets that account's entry only; invalidating one account leaves other accounts' remembered entries in place;
+ * - a caller that joined another caller's pending read accepts that read's result only if, at the moment it checks
+ *   (after the read settles), it is still before start + bound and the cache-wide invalidation count is the one the
+ *   read captured when it started, so no `invalidate` of any account happened in between. Otherwise the joiner
+ *   performs one read of its own instead and returns that result.
  * A caller that started a read always receives that read's own result, as an uncached lookup would; a write that
  * commits while that read is in flight may or may not be seen, exactly as in the uncached code.
  * Writes made by another server process (multi-replica deployments) are not invalidated here; a caller is handed
@@ -77,11 +78,13 @@ export function createAccountStandingCache(options: AccountStandingCacheOptions)
     // Map iteration order is insertion order; re-inserting on every hit makes the first key the least recently used.
     const activeUntilMs = new Map<string, number>();
     const inFlight = new Map<string, InFlightRead>();
-    // Cache-wide count of `invalidate` calls. A shared result is handed over only if the count has not moved since
-    // its read started. Being independent of map slots, it survives a read being displaced from `inFlight` or
-    // removed by its starter's cleanup before a joiner checks. Invalidations are rare (disable, rollback delete,
-    // marker clear), so the cost of counting every account is at most one extra read for the callers waiting at
-    // that instant.
+    // Cache-wide count of `invalidate` calls. It fences joiners only: a joined pending read's result is handed over
+    // only if the count has not moved since that read started (remembered entries are fenced per account by
+    // `invalidate` deleting them). Being independent of map slots, the count survives a read being displaced from
+    // `inFlight` or removed by its starter's cleanup before a joiner checks. Because it counts every account, an
+    // invalidation makes every request joined to any read that started before it, including requests that join such
+    // a still-pending read afterwards, do one read of its own: at most one extra read per affected joined request.
+    // Invalidations are rare (disable, rollback delete, marker clear).
     let invalidations = 0;
 
     function remember(accountId: string, expiresAtMs: number): void {
