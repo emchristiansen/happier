@@ -20,6 +20,7 @@ test('tests workflow keeps slow CI jobs above the observed timeout floor', async
   const cliJob = extractJobBlock(raw, 'cli');
   const stackJob = extractJobBlock(raw, 'stack');
   const installerSmokeWindowsJob = extractJobBlock(raw, 'installers-smoke-windows');
+  const typecheckJob = extractJobBlock(raw, 'typecheck');
 
   assert.match(
     uiE2eJob,
@@ -52,6 +53,12 @@ test('tests workflow keeps slow CI jobs above the observed timeout floor', async
     stackJob,
     /name:\s*Stack Tests \(unit \+ integration\)[\s\S]*?timeout-minutes:\s*45\b/,
     'Stack Tests should reserve enough time for dependency installation plus unit and integration suites',
+  );
+
+  assert.match(
+    typecheckJob,
+    /name:\s*Typecheck[\s\S]*?timeout-minutes:\s*40\b/,
+    'Typecheck should reserve enough time for dependency installation, governance checks and the typecheck on loaded GitHub-hosted runners',
   );
 
   assert.match(
