@@ -167,7 +167,7 @@ happier session folders
 happier session folders --session <session-id-or-prefix>
 ```
 
-Each folder is listed with its id, parent folder id, sort key and, where the CLI can read the folder's display, its name and workspace. The app may store that display encrypted with the account key; the CLI opens it with the same key it uses for account settings. When a name is not shown, `--json` output says so with `nameShown: false`, `name: null` and a `nameNotShownReason` of `display_not_decryptable`, `no_display` or `display_has_no_name`. With `--session`, the output also gives that session's folder id (`data.session.folderId`, `null` for no folder), read from the same request. The command only reads; it does not create, rename or delete folders.
+Each folder is listed on one line with its id, its name (or why the name is not shown), its parent folder id and its workspace. With `--json`, each folder also carries its sort key and timestamps: `folderId`, `parentFolderId`, `sortKey`, `createdAt`, `updatedAt`, `workspace`, `nameShown`, `name` and `nameNotShownReason`. The app may store a folder's display (its name and workspace) encrypted with the account key; the CLI opens it with the same key it uses for account settings. When a name is not shown, `--json` output says so with `nameShown: false`, `name: null` and a `nameNotShownReason` of `display_not_decryptable`, `no_display` or `display_has_no_name`. With `--session`, the output also gives that session's folder id (`data.session.folderId`, `null` for no folder), read from the same request. The command only reads; it does not create, rename or delete folders.
 
 Move a session into a folder, or out of every folder:
 
