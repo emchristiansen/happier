@@ -60,7 +60,7 @@ describe('createDaemonControlApp /session-started body limit', () => {
 
             expect(response.statusCode).toBe(200);
             expect(response.json()).toEqual({ status: 'ok' });
-            expect(onHappySessionWebhook).toHaveBeenCalledWith('test-session-large', metadata);
+            expect(onHappySessionWebhook).toHaveBeenCalledWith('test-session-large', metadata, {});
         } finally {
             await app.close();
         }

@@ -70,6 +70,7 @@ import {
 } from './sessions/stopSessionContract';
 import { readProcessRunState } from './processRunState';
 import { classifyDaemonLifecycleProcessByPid } from './doctor';
+import { RUNNER_PUBLISHER_INCARNATION_ID } from '@/api/session/publisherIncarnation';
 
 export type DaemonControlRequestOptions = {
   /** `null` leaves a local control request owned by caller/daemon lifecycle. */
@@ -474,6 +475,7 @@ export async function notifyDaemonSessionStarted(
   return await daemonPost('/session-started', {
     sessionId,
     metadata,
+    publisherIncarnationId: RUNNER_PUBLISHER_INCARNATION_ID,
   }, options);
 }
 

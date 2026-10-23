@@ -4,6 +4,7 @@ import { buildMachineActivityEphemeral, ClientConnection, eventRouter } from "@/
 import {
     buildMachineOwnerConflictSocketPayload,
     readMachineDaemonOwnershipMetadataFromSocketAuth,
+    SessionPublisherIncarnationIdSchema,
 } from "@happier-dev/protocol";
 import { Server, Socket } from "socket.io";
 import { log } from "@/utils/logging/log";
@@ -455,6 +456,9 @@ export function startSocket(app: Fastify) {
         if (connection.connectionType === "session-scoped") {
             if (sessionBinding) {
                 if (sessionBinding.proof === "machine-access-key" && sessionBinding.machineId) {
+                    const publisherIncarnationId = SessionPublisherIncarnationIdSchema.safeParse(
+                        (socket.handshake.auth as Record<string, unknown> | undefined)?.publisherIncarnationId,
+                    );
                     registerSessionRuntimeActivitySnapshotSocketEvent({
                         socket,
                         presence: sessionPublisherPresence,
@@ -463,6 +467,7 @@ export function startSocket(app: Fastify) {
                             machineId: sessionBinding.machineId,
                             sessionId: sessionBinding.sessionId,
                         },
+                        ...(publisherIncarnationId.success ? { publisherIncarnationId: publisherIncarnationId.data } : {}),
                         publish: async ({
                             sessionId: publishedSessionId,
                             projection,

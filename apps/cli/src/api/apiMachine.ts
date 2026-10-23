@@ -31,6 +31,7 @@ import {
     sealAccountScopedBlobCiphertext,
     type ActionOperationSnapshotV1,
     type MachineSessionRunnerExitedAck,
+    type MachineSessionRunnerExitedRequest,
     type DirectSessionTranscriptDeltaEphemeral,
     type MachineTransferReceiveEnvelope,
     type MachineTransferSendEnvelope,
@@ -715,15 +716,16 @@ export class ApiMachineClient {
     }
 
     /**
-     * Tell the server that this machine observed the session's runner process exit, so the server
-     * retires that runner's publisher fence and the session stops reading `active`.
+     * Tell the server that this machine observed one exact runner incarnation exit, so the server
+     * retires that runner's publisher fence (only while it is still the current publisher) and the
+     * session stops reading `active`.
      *
      * Delivery is deliberately once and live-only: a report is never buffered while the machine
      * socket is disconnected, because a late report could retire a successor runner's fence. A
      * relay that predates the event ignores it, so the report settles as unacknowledged and the
      * server's presence timeout remains the fallback.
      */
-    async reportSessionRunnerExited(sessionId: string): Promise<SessionRunnerExitReportOutcome> {
+    async reportSessionRunnerExited(report: MachineSessionRunnerExitedRequest): Promise<SessionRunnerExitReportOutcome> {
         const socket = this.socket;
         if (!socket?.connected) return { kind: 'not_delivered', reason: 'socket_not_connected' };
         let answer: unknown;
@@ -731,7 +733,7 @@ export class ApiMachineClient {
             answer = await emitSocketWithAck({
                 socket: socket as unknown as EmitWithAckSocket,
                 event: MACHINE_SESSION_RUNNER_EXITED_EVENT,
-                payload: { sessionId },
+                payload: report,
                 timeoutMs: SESSION_RUNNER_EXIT_REPORT_ACK_TIMEOUT_MS,
             });
         } catch (error) {

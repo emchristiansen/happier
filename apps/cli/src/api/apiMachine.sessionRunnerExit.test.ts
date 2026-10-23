@@ -31,11 +31,17 @@ describe('ApiMachineClient session runner exit report', () => {
         const emitWithAck = vi.fn(async () => ({ status: 'closed', sessionId: 'session-exited' }));
         const client = createClient({ connected: true, timeout: () => ({ emitWithAck }), emitWithAck });
 
-        await expect(client.reportSessionRunnerExited('session-exited')).resolves.toEqual({
+        await expect(client.reportSessionRunnerExited({
+            sessionId: 'session-exited',
+            publisherIncarnationId: 'incarnation-a',
+        })).resolves.toEqual({
             kind: 'acknowledged',
             ack: { status: 'closed', sessionId: 'session-exited' },
         });
-        expect(emitWithAck).toHaveBeenCalledWith(MACHINE_SESSION_RUNNER_EXITED_EVENT, { sessionId: 'session-exited' });
+        expect(emitWithAck).toHaveBeenCalledWith(MACHINE_SESSION_RUNNER_EXITED_EVENT, {
+            sessionId: 'session-exited',
+            publisherIncarnationId: 'incarnation-a',
+        });
     });
 
     it('settles as not delivered when the server never acknowledges the report', async () => {
@@ -44,7 +50,10 @@ describe('ApiMachineClient session runner exit report', () => {
         const emitWithAck = vi.fn(() => new Promise<unknown>(() => {}));
         const client = createClient({ connected: true, timeout: () => ({ emitWithAck }), emitWithAck });
 
-        const outcome = client.reportSessionRunnerExited('session-old-server');
+        const outcome = client.reportSessionRunnerExited({
+            sessionId: 'session-old-server',
+            publisherIncarnationId: 'incarnation-a',
+        });
         await vi.advanceTimersByTimeAsync(60_000);
 
         await expect(outcome).resolves.toEqual({ kind: 'not_delivered', reason: 'unacknowledged' });
@@ -54,7 +63,10 @@ describe('ApiMachineClient session runner exit report', () => {
         const emitWithAck = vi.fn(async () => ({ status: 'closed', sessionId: 'session-offline' }));
         const client = createClient({ connected: false, timeout: () => ({ emitWithAck }), emitWithAck });
 
-        await expect(client.reportSessionRunnerExited('session-offline')).resolves.toEqual({
+        await expect(client.reportSessionRunnerExited({
+            sessionId: 'session-offline',
+            publisherIncarnationId: 'incarnation-a',
+        })).resolves.toEqual({
             kind: 'not_delivered',
             reason: 'socket_not_connected',
         });

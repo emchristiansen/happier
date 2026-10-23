@@ -41,9 +41,11 @@ const inFlightDaemonSessionReports = new Map<string, InFlightDaemonSessionReport
 export const DAEMON_STARTED_REPORT_ATTEMPT_TIMEOUT_MS = SESSION_STARTED_READINESS_ANSWER_TIMEOUT_MS + 10_000;
 
 /**
- * Longest a runner that requires the daemon's readiness acknowledgement keeps retrying while the
- * daemon keeps answering that readiness has not settled (a slow server, 2026-10-23). A daemon that
- * stops answering still fails the runner once the ordinary retry window passes without an answer.
+ * Hard ceiling on how long a runner that requires the daemon's readiness acknowledgement keeps
+ * reporting, counted from its first attempt. It matters while the daemon keeps answering that
+ * readiness has not settled (a slow server, 2026-10-23). Every attempt's timeout and every pause is
+ * clipped to the time left, so no attempt or answer outlasts it. A daemon that stops answering still
+ * fails the runner once the ordinary retry window passes without an answer.
  */
 export const DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS = 10 * 60_000;
 
@@ -182,16 +184,31 @@ async function runDaemonSessionReport(
                 min: 100,
                 max: 30_000,
             });
-        const boundedAttemptTimeoutMs = Math.min(reportAttemptTimeoutMs, Math.max(100, retryTimeoutMs));
+        // A runner that needs the acknowledgement never reports past the ceiling, whatever the answers.
+        const remainingCeilingMs = (): number => state.requireDaemonAck
+            ? startedAt + DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS - nowFn()
+            : Number.POSITIVE_INFINITY;
+        if (remainingCeilingMs() <= 0) {
+            logger.debug(`[START] Daemon readiness for session ${sessionId} not acknowledged within the ceiling`);
+            throw new Error('Claude runtime readiness was not acknowledged by the daemon');
+        }
+        const boundedAttemptTimeoutMs = Math.min(
+            reportAttemptTimeoutMs,
+            Math.max(100, retryTimeoutMs),
+            remainingCeilingMs(),
+        );
         // While a live daemon keeps answering that readiness is not settled, a runner that needs its
-        // acknowledgement waits up to the ceiling; otherwise the retry window counts from the start.
+        // acknowledgement keeps waiting until the ceiling; otherwise the retry window counts from the start.
         const isRetryWindowExhausted = (): boolean => {
             const now = nowFn();
+            if (remainingCeilingMs() <= 0) return true;
             if (state.requireDaemonAck && lastDaemonAnswerAt !== null) {
-                return now - lastDaemonAnswerAt >= retryTimeoutMs
-                    || now - startedAt >= DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS;
+                return now - lastDaemonAnswerAt >= retryTimeoutMs;
             }
             return now - startedAt >= retryTimeoutMs;
+        };
+        const pauseBeforeNextAttempt = async (): Promise<void> => {
+            await sleepFn(Math.min(retryIntervalMs, Math.max(0, remainingCeilingMs())));
         };
 
         try {
@@ -226,7 +243,7 @@ async function runDaemonSessionReport(
                 }
                 return;
             }
-            await sleepFn(retryIntervalMs);
+            await pauseBeforeNextAttempt();
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error ?? '');
             if (!isTransientDaemonReportError(message) || isRetryWindowExhausted()) {
@@ -236,7 +253,7 @@ async function runDaemonSessionReport(
                 }
                 return;
             }
-            await sleepFn(retryIntervalMs);
+            await pauseBeforeNextAttempt();
         }
     }
 }

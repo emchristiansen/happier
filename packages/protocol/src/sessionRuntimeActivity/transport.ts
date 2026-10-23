@@ -104,14 +104,23 @@ export type SessionRuntimeActivityCloseRequest = z.infer<typeof SessionRuntimeAc
 export type SessionRuntimeActivityCloseAck = z.infer<typeof SessionRuntimeActivityCloseAckSchema>;
 
 /**
- * Machine-scoped proof that a session's runner process has exited. A dead runner cannot
- * close its own publisher fence, so the daemon that observed the exit retires it instead,
- * exactly as an acknowledged explicit machine stop does.
+ * Identity of one runner process acting as a session publisher. The runner sends it in its
+ * session-scoped socket handshake (`publisherIncarnationId` in the auth payload) and reports it to
+ * its daemon on `POST /session-started`, so a later exit report can name exactly that runner.
+ */
+export const SessionPublisherIncarnationIdSchema = z.string().trim().min(1).max(128);
+
+/**
+ * Machine-scoped proof that one exact runner incarnation exited. A dead runner cannot close its own
+ * publisher fence, so the daemon that observed the exit asks the server to retire it. The server
+ * retires the fence only while that incarnation's latest registration is still the current
+ * publisher; a report that cannot be matched is rejected, never redirected to the current publisher.
  */
 export const MACHINE_SESSION_RUNNER_EXITED_EVENT = 'machine-session-runner-exited';
 
 export const MachineSessionRunnerExitedRequestSchema = z.object({
   sessionId: z.string().trim().min(1),
+  publisherIncarnationId: SessionPublisherIncarnationIdSchema,
 }).strict();
 
 export const MachineSessionRunnerExitedAckSchema = z.union([
@@ -120,7 +129,7 @@ export const MachineSessionRunnerExitedAckSchema = z.union([
   z.object({
     status: z.literal('rejected'),
     sessionId: z.string().trim().min(1),
-    reason: z.enum(['not_found', 'machine_control_unavailable', 'archived', 'superseded']),
+    reason: z.enum(['not_found', 'machine_control_unavailable', 'archived', 'superseded', 'unmatched']),
   }).strict(),
   z.object({
     status: z.literal('retryable'),

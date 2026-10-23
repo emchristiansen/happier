@@ -20,3 +20,9 @@ export type SessionStartedReadinessNotReadyErrorCode = (typeof SESSION_STARTED_R
 export function isSessionStartedReadinessNotReadyErrorCode(value: unknown): value is SessionStartedReadinessNotReadyErrorCode {
     return SESSION_STARTED_READINESS_NOT_READY_ERROR_CODES.some((code) => code === value);
 }
+
+/** What a runner's `/session-started` report says about the runner itself, beyond session metadata. */
+export type SessionStartedRunnerReport = Readonly<{
+    /** The reporting runner's publisher incarnation; absent from runners that predate it. */
+    publisherIncarnationId?: string;
+}>;

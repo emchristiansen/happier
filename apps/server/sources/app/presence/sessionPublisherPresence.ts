@@ -69,6 +69,9 @@ export type CaptureExplicitMachineStopResult =
     | { status: "captured"; target: ExplicitMachineStopTarget }
     | { status: "already_inactive" }
     | { status: "rejected"; reason: "not_found" | "machine_control_unavailable" };
+export type RetireExitedPublisherResult =
+    | ClosePublisherResult
+    | { status: "rejected"; reason: "unmatched" | "machine_control_unavailable" };
 export type CurrentPublisherResult =
     | {
         status: "current";
@@ -111,6 +114,17 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
     const registrationAttempts = new WeakMap<object, RegistrationAttempt>();
     const closeResults = new WeakMap<object, Promise<ClosePublisherResult>>();
     const operationLocks = new WeakMap<object, AsyncLock>();
+    // A runner names its process in its socket handshake. Each successful registration records which
+    // incarnation holds which publisher generation, so a daemon's later exit report can retire
+    // exactly that runner's fence. One entry per session registered on this server process, replaced
+    // by the session's next registration. A report that reaches another server process, or arrives
+    // after a server restart, finds no entry and is rejected; the presence timeout then applies.
+    const incarnationsBySocket = new WeakMap<object, string>();
+    const latestIncarnationRegistrationBySession = new Map<string, Readonly<{
+        publisherIncarnationId: string;
+        binding: PublisherBinding;
+        publisherGeneration: bigint;
+    }>>();
 
     const serialize = async <T>(
         socket: object,
@@ -194,6 +208,16 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
                 committedFence: new Date(result.committedFence.getTime()),
                 publisherGeneration: result.publisherGeneration,
             });
+            const publisherIncarnationId = incarnationsBySocket.get(params.socket);
+            if (publisherIncarnationId) {
+                latestIncarnationRegistrationBySession.set(params.binding.sessionId, {
+                    publisherIncarnationId,
+                    binding: { ...params.binding },
+                    publisherGeneration: result.publisherGeneration,
+                });
+            } else {
+                latestIncarnationRegistrationBySession.delete(params.binding.sessionId);
+            }
         }
         return result;
     };
@@ -232,7 +256,8 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
     const closeBinding = async (params: Readonly<{
         binding: PublisherBinding;
         authority: PublisherCloseAuthority;
-        mutationId: string;
+        /** Ends the session's latest turn with this mutation id; `null` ends no turn. */
+        latestTurnEnd: Readonly<{ mutationId: string }> | null;
     }>): Promise<ClosePublisherResult> => await inTx(async (tx): Promise<ClosePublisherResult> => {
         const session = await tx.session.findUnique({
             where: { id: params.binding.sessionId },
@@ -310,12 +335,14 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
             data: { active: false, publisherGenerationLastActiveAt: null },
         });
         if (updated.count === 0) return { status: "superseded" };
-        const turnResult = await applyLatestSessionTurnEndInTx({
-            tx,
-            sessionId: params.binding.sessionId,
-            mutationId: params.mutationId,
-            observedAt: now().getTime(),
-        });
+        const turnResult = params.latestTurnEnd
+            ? await applyLatestSessionTurnEndInTx({
+                tx,
+                sessionId: params.binding.sessionId,
+                mutationId: params.latestTurnEnd.mutationId,
+                observedAt: now().getTime(),
+            })
+            : null;
         // Archive already owns the terminal Activity projection. Physical-stop proof
         // retires reachability and the publisher fence without granting Activity writes.
         const activity = session.archivedAt === null
@@ -394,10 +421,40 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
     }>): Promise<ClosePublisherResult> => await closeBinding({
         binding: params.target.binding,
         authority: params.target.authority,
-        mutationId: params.target.authority.kind === "generation"
-            ? `explicit-machine-stop:generation:${params.target.authority.publisherGeneration}`
-            : `explicit-machine-stop:legacy-heartbeat:${params.target.authority.committedFence.getTime()}`,
+        latestTurnEnd: {
+            mutationId: params.target.authority.kind === "generation"
+                ? `explicit-machine-stop:generation:${params.target.authority.publisherGeneration}`
+                : `explicit-machine-stop:legacy-heartbeat:${params.target.authority.committedFence.getTime()}`,
+        },
     });
+
+    /**
+     * Retire the publisher fence of a runner incarnation its machine observed exit. Only that
+     * incarnation's latest registration qualifies, and only while its generation is still the
+     * session's current publisher generation (checked inside the close transaction), so a successor
+     * runner is never retired. No turn is ended: exact turn custody for an observed exit belongs to
+     * the daemon's staged exact-turn end, and the latest turn may already belong to a successor.
+     */
+    const retireExitedPublisher = async (params: Readonly<{
+        binding: PublisherBinding;
+        publisherIncarnationId: string;
+    }>): Promise<RetireExitedPublisherResult> => {
+        const registration = latestIncarnationRegistrationBySession.get(params.binding.sessionId);
+        if (!registration || registration.publisherIncarnationId !== params.publisherIncarnationId) {
+            return { status: "rejected", reason: "unmatched" };
+        }
+        if (
+            registration.binding.accountId !== params.binding.accountId
+            || registration.binding.machineId !== params.binding.machineId
+        ) {
+            return { status: "rejected", reason: "machine_control_unavailable" };
+        }
+        return await closeBinding({
+            binding: registration.binding,
+            authority: { kind: "generation", publisherGeneration: registration.publisherGeneration },
+            latestTurnEnd: null,
+        });
+    };
 
     const closePublisher = (params: Readonly<{ socket: object }>): Promise<ClosePublisherResult> => {
         const existing = closeResults.get(params.socket);
@@ -412,7 +469,7 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
                     committedFence: registration.committedFence,
                     publisherGeneration: registration.publisherGeneration,
                 },
-                mutationId: `publisher-close:${registration.committedFence.getTime()}`,
+                latestTurnEnd: { mutationId: `publisher-close:${registration.committedFence.getTime()}` },
             });
         });
         closeResults.set(params.socket, result);
@@ -698,12 +755,19 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
         }
     };
 
+    /** Records the runner incarnation a publisher socket named in its handshake, before it registers. */
+    const bindPublisherIncarnation = (params: Readonly<{ socket: object; publisherIncarnationId: string }>): void => {
+        incarnationsBySocket.set(params.socket, params.publisherIncarnationId);
+    };
+
     return {
         registerPublisher,
         touchPublisher,
         closePublisher,
         captureExplicitMachineStop,
         finalizeExplicitMachineStop,
+        bindPublisherIncarnation,
+        retireExitedPublisher,
         resolveCurrentPublisher,
         runAsCurrentPublisher,
         runAsCurrentPublisherInTx,

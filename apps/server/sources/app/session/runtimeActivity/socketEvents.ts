@@ -76,11 +76,19 @@ export function registerSessionRuntimeActivitySnapshotSocketEvent(params: Readon
     socket: RuntimeActivitySnapshotEventSocket;
     presence: RuntimeActivitySnapshotPresence;
     binding: Readonly<{ accountId: string; machineId: string; sessionId: string }>;
+    /** The runner process this publisher socket named in its handshake, when it named one. */
+    publisherIncarnationId?: string;
     publish: PublishRuntimeActivitySnapshotProjection;
     /** Clock for the released-heartbeat persistence window (mirrors `createSessionPublisherPresence`). */
     nowMs?: () => number;
 }>): void {
     const nowMs = params.nowMs ?? (() => Date.now());
+    if (params.publisherIncarnationId) {
+        params.presence.bindPublisherIncarnation({
+            socket: params.socket,
+            publisherIncarnationId: params.publisherIncarnationId,
+        });
+    }
     const publishParticipants = async (published: Readonly<{
         participantCursors: readonly SessionParticipantCursor[];
         projection?: SessionRuntimeActivityProjection;
@@ -314,13 +322,14 @@ export function registerSessionRuntimeActivitySnapshotSocketEvent(params: Readon
 }
 
 /**
- * A daemon that observed its session runner exit retires that runner's publisher fence, so the
- * session stops reading `active` instead of waiting for the presence timeout. A dead runner cannot
- * close its own fence, and a dropped connection only forgets the in-memory publisher.
+ * A daemon that observed one exact runner incarnation exit retires that runner's publisher fence,
+ * so the session stops reading `active` instead of waiting for the presence timeout. A dead runner
+ * cannot close its own fence, and a dropped connection only forgets the in-memory publisher.
  *
- * The observed exit is the same physical-stop proof an acknowledged explicit machine stop carries,
- * so this reuses that capture-and-finalize path: it closes only the fence that is current when the
- * report arrives, and only for a machine that still hosts the session.
+ * The report names the exited runner's publisher incarnation. The presence owner retires the fence
+ * only while that incarnation's latest registration is still the current publisher generation and
+ * the reporting machine still hosts the session. A late report for a predecessor is rejected as
+ * `unmatched` and never retires a successor; no turn is ended.
  */
 export function registerMachineSessionRunnerExitedSocketEvent(params: Readonly<{
     socket: RuntimeActivitySnapshotEventSocket;
@@ -334,37 +343,30 @@ export function registerMachineSessionRunnerExitedSocketEvent(params: Readonly<{
             acknowledge?.(MachineSessionRunnerExitedAckSchema.parse({ status: 'rejected', reason: 'invalid_request' }));
             return;
         }
-        const { sessionId } = request.data;
+        const { sessionId, publisherIncarnationId } = request.data;
         try {
-            const captured = await params.presence.captureExplicitMachineStop({
+            const retired = await params.presence.retireExitedPublisher({
                 binding: { accountId: params.accountId, machineId: params.machineId, sessionId },
+                publisherIncarnationId,
             });
-            if (captured.status !== 'captured') {
-                acknowledge?.(MachineSessionRunnerExitedAckSchema.parse(captured.status === 'already_inactive'
-                    ? { status: 'already_inactive', sessionId }
-                    : { status: 'rejected', sessionId, reason: captured.reason }));
-                return;
-            }
-            const closed = await params.presence.finalizeExplicitMachineStop({ target: captured.target });
-            if (closed.status === 'closed') {
+            if (retired.status === 'closed') {
                 await publishSessionPublisherLifecycleUpdate({
                     sessionId,
-                    participantCursors: closed.participantCursors,
+                    participantCursors: retired.participantCursors,
                     active: false,
-                    activeAt: closed.activeAt.getTime(),
-                    ...(closed.projection ? { projection: closed.projection } : {}),
-                    ...(closed.turnProjection ?? {}),
+                    activeAt: retired.activeAt.getTime(),
+                    ...(retired.projection ? { projection: retired.projection } : {}),
                 });
             }
             acknowledge?.(MachineSessionRunnerExitedAckSchema.parse(
-                closed.status === 'closed' || closed.status === 'already_inactive'
-                    ? { status: closed.status, sessionId }
-                    : closed.status === 'superseded'
+                retired.status === 'closed' || retired.status === 'already_inactive'
+                    ? { status: retired.status, sessionId }
+                    : retired.status === 'superseded'
                         ? { status: 'rejected', sessionId, reason: 'superseded' }
                         : {
                             status: 'rejected',
                             sessionId,
-                            reason: closed.reason === 'unauthorized' ? 'machine_control_unavailable' : closed.reason,
+                            reason: retired.reason === 'unauthorized' ? 'machine_control_unavailable' : retired.reason,
                         },
             ));
         } catch (error) {
