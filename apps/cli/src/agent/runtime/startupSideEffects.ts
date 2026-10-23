@@ -14,7 +14,12 @@ type DaemonReportDeps = {
     sleepFn?: (ms: number) => Promise<void>;
     nowFn?: () => number;
     retryTimeoutMs?: number;
+    /** First retry delay (backoff base). */
     retryIntervalMs?: number;
+    /** Retry delay cap; never below the base. */
+    retryMaxIntervalMs?: number;
+    /** Jitter source in [0, 1); injectable for tests. */
+    randomFn?: () => number;
     reportAttemptTimeoutMs?: number;
     onReported?: (opts: { sessionId: string }) => Promise<void> | void;
 };
@@ -50,6 +55,44 @@ function resolveDaemonReportRetryValue(raw: string | undefined, fallback: number
     const parsed = Number.parseInt(value, 10);
     if (!Number.isFinite(parsed)) return fallback;
     return Math.min(bounds.max, Math.max(bounds.min, parsed));
+}
+
+/**
+ * Retry spacing for the runner's `/session-started` report.
+ *
+ * The n-th consecutive failed attempt waits `min(cap, base * FACTOR^(n-1))`, reduced by a random
+ * fraction of at most JITTER_FRACTION, and never longer than what remains of the retry budget.
+ * Every transient failure counts, including the daemon's 503 `session_startup_reconciliation_failed`,
+ * so a daemon that is failing its startup reconciliation is never retried immediately.
+ *
+ * - base 250 ms (`HAPPIER_DAEMON_REPORT_SESSION_RETRY_INTERVAL_MS`, formerly the fixed interval): a
+ *   daemon that is simply not listening yet still gets answered within the first few hundred ms.
+ * - factor 2: each failure halves the attempt rate, so a daemon that keeps failing sees the
+ *   attempt rate fall from 4/s to the cap's rate within five failures.
+ * - cap 5 s (`HAPPIER_DAEMON_REPORT_SESSION_RETRY_MAX_INTERVAL_MS`, raised to the base when lower):
+ *   a 503 means the daemon's reconciliation (a relay round trip with a 15 s timeout) failed, so
+ *   retrying more often than every few seconds only repeats that work; 5 s still leaves more than
+ *   fifteen attempts in the 90 s daemon-started budget and adds at most 5 s after recovery.
+ * - jitter up to half of the nominal delay ("equal jitter"): runners started together by one
+ *   daemon spread their retries instead of arriving in waves, and the wait never drops below half
+ *   the nominal delay, so no failure is followed by a near-immediate retry.
+ */
+const DAEMON_REPORT_RETRY_BASE_MS = 250;
+const DAEMON_REPORT_RETRY_FACTOR = 2;
+const DAEMON_REPORT_RETRY_MAX_MS = 5_000;
+const DAEMON_REPORT_RETRY_JITTER_FRACTION = 0.5;
+
+export function resolveDaemonReportRetryDelayMs(input: Readonly<{
+    consecutiveFailures: number;
+    baseMs: number;
+    maxMs: number;
+    random: number;
+}>): number {
+    const cap = Math.max(input.baseMs, input.maxMs);
+    const exponent = Math.min(Math.max(input.consecutiveFailures - 1, 0), 30);
+    const nominal = Math.min(cap, input.baseMs * DAEMON_REPORT_RETRY_FACTOR ** exponent);
+    const random = Math.min(Math.max(input.random, 0), 1);
+    return Math.round(nominal * (1 - DAEMON_REPORT_RETRY_JITTER_FRACTION * random));
 }
 
 function isTruthyEnvFlag(raw: string | undefined): boolean {
@@ -129,15 +172,34 @@ async function runDaemonSessionReport(
     const notifyFn = deps.notifyDaemonSessionStartedFn ?? notifyDaemonSessionStarted;
     const sleepFn = deps.sleepFn ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     const nowFn = deps.nowFn ?? (() => Date.now());
+    const randomFn = deps.randomFn ?? Math.random;
     const retryIntervalMs =
         deps.retryIntervalMs ??
-        resolveDaemonReportRetryValue(process.env.HAPPIER_DAEMON_REPORT_SESSION_RETRY_INTERVAL_MS, 250, {
+        resolveDaemonReportRetryValue(process.env.HAPPIER_DAEMON_REPORT_SESSION_RETRY_INTERVAL_MS, DAEMON_REPORT_RETRY_BASE_MS, {
             min: 50,
             max: 10_000,
+        });
+    const retryMaxIntervalMs =
+        deps.retryMaxIntervalMs ??
+        resolveDaemonReportRetryValue(process.env.HAPPIER_DAEMON_REPORT_SESSION_RETRY_MAX_INTERVAL_MS, DAEMON_REPORT_RETRY_MAX_MS, {
+            min: 50,
+            max: 60_000,
         });
 
     const startedAt = nowFn();
     let attempt = 0;
+    let consecutiveFailures = 0;
+    const waitBeforeRetry = async (retryTimeoutMs: number): Promise<void> => {
+        consecutiveFailures += 1;
+        const delayMs = resolveDaemonReportRetryDelayMs({
+            consecutiveFailures,
+            baseMs: retryIntervalMs,
+            maxMs: retryMaxIntervalMs,
+            random: randomFn(),
+        });
+        const remainingBudgetMs = Math.max(0, retryTimeoutMs - (nowFn() - startedAt));
+        await sleepFn(Math.min(delayMs, remainingBudgetMs));
+    };
     while (true) {
         attempt += 1;
         const revision = state.revision;
@@ -194,7 +256,7 @@ async function runDaemonSessionReport(
                 }
                 return;
             }
-            await sleepFn(retryIntervalMs);
+            await waitBeforeRetry(retryTimeoutMs);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error ?? '');
             const timedOut = nowFn() - startedAt >= retryTimeoutMs;
@@ -205,7 +267,7 @@ async function runDaemonSessionReport(
                 }
                 return;
             }
-            await sleepFn(retryIntervalMs);
+            await waitBeforeRetry(retryTimeoutMs);
         }
     }
 }
