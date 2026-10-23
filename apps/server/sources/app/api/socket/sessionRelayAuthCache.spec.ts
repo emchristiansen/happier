@@ -344,40 +344,57 @@ describe("sessionRelayAuthCache", () => {
             return { authorizeSessionRelayPublish, params, participants, inFlight };
         }
 
-        it("does not refill a grant that a machine revocation invalidated while it was reading", async () => {
+        it("re-resolves a grant that a machine revocation invalidated while it was reading, and neither returns nor stores it", async () => {
             const { invalidateSessionRelayAuthorizationForMachine } = await loadModule();
             const fill = await startFillHeldAtParticipantLookup();
             accessKeyFindUnique.mockResolvedValue(null); // the revocation deleted the access key
             invalidateSessionRelayAuthorizationForMachine("m1");
             fill.participants.resolve(["u1", "u2"]);
-            // The in-flight call answers from the state it read, which held when it started.
-            await expect(fill.inFlight).resolves.toEqual(["u1", "u2"]);
 
-            await expect(fill.authorizeSessionRelayPublish(fill.params)).resolves.toBeNull();
+            await expect(fill.inFlight).resolves.toBeNull();
             expect(accessKeyFindUnique).toHaveBeenCalledTimes(2);
+            await expect(fill.authorizeSessionRelayPublish(fill.params)).resolves.toBeNull();
+            expect(accessKeyFindUnique).toHaveBeenCalledTimes(3);
         });
 
-        it("does not refill a grant that a session invalidation (share revoke, delete) invalidated while it was reading", async () => {
+        it("re-resolves a grant that a session invalidation (share revoke, delete) invalidated while it was reading", async () => {
             const { invalidateSessionRelayAuthorizationForSession } = await loadModule();
             const fill = await startFillHeldAtParticipantLookup();
             checkSessionAccess.mockResolvedValue(null); // e.g. the session was deleted
             invalidateSessionRelayAuthorizationForSession("s1");
             fill.participants.resolve(["u1", "u2"]);
-            await fill.inFlight;
 
-            await expect(fill.authorizeSessionRelayPublish(fill.params)).resolves.toBeNull();
+            await expect(fill.inFlight).resolves.toBeNull();
             expect(checkSessionAccess).toHaveBeenCalledTimes(2);
+            await expect(fill.authorizeSessionRelayPublish(fill.params)).resolves.toBeNull();
         });
 
-        it("drops the fill even when the invalidation named another session, and re-verifies next time", async () => {
+        it("re-resolves after an invalidation that named another session, then caches the fresh grant", async () => {
             const { invalidateSessionRelayAuthorizationForSession } = await loadModule();
             const fill = await startFillHeldAtParticipantLookup();
             invalidateSessionRelayAuthorizationForSession("s-other");
             fill.participants.resolve(["u1", "u2"]);
-            await fill.inFlight;
 
+            await expect(fill.inFlight).resolves.toEqual(["u1", "u2"]);
+            expect(accessKeyFindUnique).toHaveBeenCalledTimes(2);
             await expect(fill.authorizeSessionRelayPublish(fill.params)).resolves.toEqual(["u1", "u2"]);
             expect(accessKeyFindUnique).toHaveBeenCalledTimes(2);
+        });
+
+        it("denies, without storing, when invalidations cross both the resolution and its retry", async () => {
+            const { invalidateSessionRelayAuthorizationForMachine } = await loadModule();
+            const fill = await startFillHeldAtParticipantLookup();
+            invalidateSessionRelayAuthorizationForMachine("m-other");
+            getSessionParticipantUserIds.mockImplementationOnce(async () => {
+                invalidateSessionRelayAuthorizationForMachine("m-other-2");
+                return ["u1", "u2"];
+            });
+            fill.participants.resolve(["u1", "u2"]);
+
+            await expect(fill.inFlight).resolves.toBeNull();
+            expect(accessKeyFindUnique).toHaveBeenCalledTimes(2);
+            await expect(fill.authorizeSessionRelayPublish(fill.params)).resolves.toEqual(["u1", "u2"]);
+            expect(accessKeyFindUnique).toHaveBeenCalledTimes(3);
         });
 
         it("still caches a fill that no invalidation overlapped", async () => {
