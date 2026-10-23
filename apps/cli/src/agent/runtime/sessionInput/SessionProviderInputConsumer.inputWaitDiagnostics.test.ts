@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import type { MaterializeNextPendingResult } from '@/api/session/sessionClientPort';
+import type { RuntimeActivitySnapshotTail } from '@/api/session/mutations/createSessionMutationOutbox';
 import { logger } from '@/ui/logger';
 
 import { createSessionProviderInputConsumer } from './SessionProviderInputConsumer';
@@ -19,6 +20,40 @@ function waitForAbortOnly(signal?: AbortSignal): Promise<boolean> {
     signal?.addEventListener('abort', () => resolve(false), { once: true });
   });
 }
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((promiseResolve) => { resolve = promiseResolve; });
+  return { promise, resolve };
+}
+
+// Runtime Activity custody not yet settled: the consumer waits on the tail before its exact retry.
+const unsettledTail: RuntimeActivitySnapshotTail = {
+  sequence: 7,
+  custody: {
+    identity: { mutationKey: 'activity-pending-8', admissionOrder: 8 },
+    value: { state: 'idle' as const, activeCount: 0 },
+  },
+  settlement: {
+    identity: { mutationKey: 'activity-applied-6', admissionOrder: 6 },
+    desiredValue: { state: 'active' as const, activeCount: 1 },
+    result: 'applied' as const,
+    committedProjection: { state: 'active' as const, activeCount: 1, observedAt: 90, revision: 40 },
+    committedRevision: 40,
+  },
+} as RuntimeActivitySnapshotTail;
+
+const settledIdleTail: RuntimeActivitySnapshotTail = {
+  sequence: 8,
+  custody: null,
+  settlement: {
+    identity: { mutationKey: 'activity-pending-8', admissionOrder: 8 },
+    desiredValue: { state: 'idle', activeCount: 0 },
+    result: 'applied',
+    committedProjection: { state: 'idle', activeCount: 0, observedAt: 100, revision: 41 },
+    committedRevision: 41,
+  },
+} as RuntimeActivitySnapshotTail;
 
 function noInputLogCalls(spy: ReturnType<typeof vi.spyOn>): unknown[][] {
   return spy.mock.calls.filter((call) => call[0] === NO_INPUT_LOG);
@@ -143,6 +178,97 @@ describe('SessionProviderInputConsumer input-wait diagnostics', () => {
       'resultType',
       'source',
     ]);
+  });
+});
+
+describe('SessionProviderInputConsumer input-wait diagnostics around the Runtime Activity tail wait', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('logs the first runtime_activity_unknown answer before waiting on the tail, and not again when the retry materializes', async () => {
+    const infoFile = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
+    const tailChanged = createDeferred<boolean>();
+    let tail = unsettledTail;
+    const messageQueue = new MessageQueue2<TestMode>(() => 'hash');
+    const materializeNextPendingMessageSafely = vi
+      .fn<() => Promise<MaterializeNextPendingResult>>()
+      .mockResolvedValueOnce({ type: 'deferred', reason: 'runtime_activity_unknown' })
+      .mockImplementationOnce(async () => {
+        messageQueue.push('after-exact-idle', { id: 'mode' });
+        return { type: 'materialized', localId: 'after-exact-idle', seq: null, content: null };
+      });
+    const waitForRuntimeActivitySnapshotTailChange = vi.fn(async () => await tailChanged.promise);
+    const consumer = createSessionProviderInputConsumer({
+      messageQueue,
+      session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
+        materializeNextPendingMessageSafely,
+        readRuntimeActivitySnapshotTail: () => tail,
+        waitForRuntimeActivitySnapshotTailChange,
+        waitForPendingEligibilityUpdate: waitForAbortOnly,
+      },
+      pendingQueueDeliveryTiming: 'after_runtime_idle',
+    });
+    const controller = new AbortController();
+    const waiting = consumer.waitForNextInput({ abortSignal: controller.signal });
+
+    await vi.waitFor(() => expect(waitForRuntimeActivitySnapshotTailChange).toHaveBeenCalledTimes(1));
+    // The tail is still unsettled: the answer must already be in the log.
+    expect(noInputLogCalls(infoFile)).toEqual([[
+      NO_INPUT_LOG,
+      expect.objectContaining({
+        source: 'waitForNextInput',
+        resultType: 'deferred',
+        deferredReason: 'runtime_activity_unknown',
+        pendingQueueDeliveryTiming: 'after_runtime_idle',
+      }),
+    ]]);
+
+    tail = settledIdleTail;
+    tailChanged.resolve(true);
+    await expect(waiting).resolves.toMatchObject({ message: 'after-exact-idle' });
+    expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(2);
+    expect(noInputLogCalls(infoFile)).toHaveLength(1);
+    controller.abort();
+  });
+
+  it('accounts for both the first deferral and a non-materialized retry answer exactly once each in a drain', async () => {
+    const infoFile = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
+    const tailChanged = createDeferred<boolean>();
+    let tail = unsettledTail;
+    const materializeNextPendingMessageSafely = vi
+      .fn<() => Promise<MaterializeNextPendingResult>>()
+      .mockResolvedValueOnce({ type: 'deferred', reason: 'runtime_activity_unknown' })
+      .mockResolvedValueOnce({ type: 'no_pending' });
+    const waitForRuntimeActivitySnapshotTailChange = vi.fn(async () => await tailChanged.promise);
+    const consumer = createSessionProviderInputConsumer({
+      messageQueue: new MessageQueue2<TestMode>(() => 'hash'),
+      session: {
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
+        materializeNextPendingMessageSafely,
+        readRuntimeActivitySnapshotTail: () => tail,
+        waitForRuntimeActivitySnapshotTailChange,
+        waitForPendingEligibilityUpdate: waitForAbortOnly,
+      },
+      pendingQueueDeliveryTiming: 'after_runtime_idle',
+    });
+
+    const drain = consumer.drainPending({ reason: 'tail-wait-drain' });
+    await vi.waitFor(() => expect(waitForRuntimeActivitySnapshotTailChange).toHaveBeenCalledTimes(1));
+    expect(noInputLogCalls(infoFile)).toHaveLength(1);
+    expect(noInputLogCalls(infoFile)[0]?.[1]).toMatchObject({
+      source: 'drainPending',
+      resultType: 'deferred',
+      deferredReason: 'runtime_activity_unknown',
+    });
+
+    tail = settledIdleTail;
+    tailChanged.resolve(true);
+    await expect(drain).resolves.toMatchObject({ materialized: 0, stoppedReason: 'no_pending' });
+    expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(2);
+    expect(noInputLogCalls(infoFile).map((call) => (call[1] as { resultType: string }).resultType))
+      .toEqual(['deferred', 'no_pending']);
   });
 });
 

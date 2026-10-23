@@ -4,7 +4,7 @@ import axios from 'axios';
 import { Socket } from 'socket.io-client'
 import { AgentState, ClientToServerEvents, MessageAckResponseSchema, MessageContent, Metadata, ServerToClientEvents, Session, SessionMessageContent, SessionMessageContentSchema, Update, UserMessage, UserMessageSchema, Usage } from '../types'
 import { decodeBase64, decrypt, encodeBase64, encrypt } from '../encryption';
-import { backoff, delayUnref, delayUnrefAbortable } from '@/utils/time';
+import { backoff, delayUnrefAbortable } from '@/utils/time';
 import { classifyServerEndpointError } from '@/api/client/classifyServerEndpointError';
 import { PendingInputRetryEpisode } from './pendingInputRetryEpisode';
 import { SessionArchiveInputAdmission, type RequestArchivedSessionCleanup } from './sessionArchiveInputAdmission';
@@ -561,6 +561,8 @@ type ConnectedSessionSetup = {
     readonly epoch: number;
     readonly socket: Socket<ServerToClientEvents, ClientToServerEvents>;
     readonly isReconnect: boolean;
+    /** Aborted when a newer connection replaces this one or the client starts closing. */
+    readonly lifetime: AbortController;
     contractPrepared: boolean;
     failedAttempts: number;
     attempt: Promise<boolean> | null;
@@ -788,6 +790,7 @@ export class ApiSessionClient extends EventEmitter {
     private pendingInputReadinessAbortController: AbortController | null = null;
     private convergePendingInputReadiness: ((onContractPrepared?: () => void) => Promise<boolean>) | null = null;
     private ensureConnectedSessionSetupForPendingInput: (() => void) | null = null;
+    private retireConnectedSessionSetup: (() => void) | null = null;
     private changesSyncInFlight: Promise<void> | null = null;
     private readonly sessionChangesCursorByAccountId = new Map<string, number>();
     private accountIdPromise: Promise<string> | null = null;
@@ -1325,7 +1328,7 @@ export class ApiSessionClient extends EventEmitter {
         this.convergePendingInputReadiness = (onContractPrepared) => {
             const socket = currentTransportSocket;
             const epoch = this.sessionConnectionEpoch;
-            if (!socket || socket.connected !== true || this.closed || this.runtimeTerminationStarted) {
+            if (!socket || socket.connected !== true || this.closeStarted || this.closed || this.runtimeTerminationStarted) {
                 return Promise.resolve(false);
             }
             if (readinessConvergence?.epoch === epoch && readinessConvergence.socket === socket) {
@@ -1342,6 +1345,8 @@ export class ApiSessionClient extends EventEmitter {
                     && serverContract.socket === this.socket
                     && this.socket === currentTransportSocket
                     && this.socket.connected === true
+                    // close() aborts readiness once, at entry; no later step may re-establish it.
+                    && !this.closeStarted
                     && !this.closed
                     && !this.runtimeTerminationStarted
                 );
@@ -1424,6 +1429,8 @@ export class ApiSessionClient extends EventEmitter {
             && setup.epoch === this.sessionConnectionEpoch
             && setup.socket === this.socket
             && this.socket.connected === true
+            && !setup.lifetime.signal.aborted
+            && !this.closeStarted
             && !this.closed
             && !this.runtimeTerminationStarted
         );
@@ -1534,9 +1541,12 @@ export class ApiSessionClient extends EventEmitter {
                     ...(exhausted ? { retryOn: 'next_pending_input_pass_or_reconnect' } : { retryInMs }),
                 });
                 if (exhausted) return;
-                await delayUnref(retryInMs);
+                await delayUnrefAbortable(retryInMs, setup.lifetime.signal);
                 if (!isConnectedSessionSetupCurrent(setup)) return;
             }
+        };
+        this.retireConnectedSessionSetup = () => {
+            connectedSessionSetup?.lifetime.abort();
         };
         this.ensureConnectedSessionSetupForPendingInput = () => {
             const setup = connectedSessionSetup;
@@ -1592,10 +1602,13 @@ export class ApiSessionClient extends EventEmitter {
                 this.sessionConnectionEpoch += 1;
                 const connectionEpoch = this.sessionConnectionEpoch;
                 this.resetAccountSettingsRetryForEvent();
+                connectedSessionSetup?.lifetime.abort();
+                if (this.closeStarted) return;
                 const setup: ConnectedSessionSetup = {
                     epoch: connectionEpoch,
                     socket: this.socket,
                     isReconnect,
+                    lifetime: new AbortController(),
                     contractPrepared: false,
                     failedAttempts: 0,
                     attempt: null,
@@ -6451,6 +6464,9 @@ export class ApiSessionClient extends EventEmitter {
     async close() {
         logger.debug('[API] socket.close() called');
         this.closeStarted = true;
+        // Retire this connection's setup before aborting its readiness: a setup attempt that the
+        // abort below makes return false must not be retried while the drains below run.
+        this.retireConnectedSessionSetup?.();
         // Pending control RPCs can be waiting here; release archive admission before
         // draining RPC executions so closing cannot wait on its own lifetime abort.
         this.archiveAdmissionTermination.abort();

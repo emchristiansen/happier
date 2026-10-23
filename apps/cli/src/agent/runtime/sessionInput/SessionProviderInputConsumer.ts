@@ -106,10 +106,16 @@ function readCommittedIdleRuntimeActivityRevision(
   return settlement.committedRevision;
 }
 
+/**
+ * Every answer the server gives is reported to `observeAnswer` as soon as it arrives, including a
+ * first runtime_activity_unknown answer before this helper waits on the Runtime Activity tail
+ * (which can last indefinitely) and the exact-revision retry's answer.
+ */
 async function materializeWithRuntimeActivityTail(
   session: SessionProviderInputConsumerSession,
   options: ReturnType<typeof buildMaterializeOptions>,
   abortSignal: AbortSignal,
+  observeAnswer: (result: PendingMaterializationResult) => void,
 ): Promise<PendingMaterializationResult> {
   const first = await observePendingInputPhase(
     'materialize',
@@ -118,6 +124,7 @@ async function materializeWithRuntimeActivityTail(
       onDiagnosticPhase,
     }),
   );
+  observeAnswer(first);
   if (
     options.pendingQueueDeliveryTiming !== 'after_runtime_idle'
     || first.type !== 'deferred'
@@ -129,7 +136,7 @@ async function materializeWithRuntimeActivityTail(
     if (!tail) return first;
     const expectedRuntimeActivityRevision = readCommittedIdleRuntimeActivityRevision(tail);
     if (expectedRuntimeActivityRevision !== undefined) {
-      return await observePendingInputPhase(
+      const retried = await observePendingInputPhase(
         'materialize_runtime_tail_retry',
         async (onDiagnosticPhase) => await session.materializeNextPendingMessageSafely({
           ...options,
@@ -137,6 +144,8 @@ async function materializeWithRuntimeActivityTail(
           onDiagnosticPhase,
         }),
       );
+      observeAnswer(retried);
+      return retried;
     }
     if (tail.custody === null || !session.waitForRuntimeActivitySnapshotTailChange) return first;
     if (!await session.waitForRuntimeActivitySnapshotTailChange(tail.sequence, abortSignal)) return first;
@@ -778,6 +787,12 @@ async function materializePendingMessage<Mode, Message>(
         pendingQueueDeliveryTiming,
       ),
       opts.abortSignal,
+      (answer) => opts.noInputLog.observe({
+        source: 'waitForNextInput',
+        activeTurnSteerability,
+        pendingQueueDeliveryTiming,
+        observation: { kind: 'answer', result: answer },
+      }),
     );
   } catch (error) {
     if (
@@ -815,12 +830,6 @@ async function materializePendingMessage<Mode, Message>(
     reconcileWhenEmpty,
     activeTurnSteerability,
     result,
-  });
-  opts.noInputLog.observe({
-    source: 'waitForNextInput',
-    activeTurnSteerability,
-    pendingQueueDeliveryTiming,
-    observation: { kind: 'answer', result },
   });
   if (result.type === 'materialized') {
     // The transcript update path owns queue delivery; do not synthesize a provider batch from the pending payload.
@@ -945,18 +954,18 @@ async function materializeNextPendingForDrain(
         pendingQueueDeliveryTiming,
       ),
       opts.abortSignal ?? new AbortController().signal,
+      (answer) => opts.noInputLog.observe({
+        source: 'drainPending',
+        activeTurnSteerability,
+        pendingQueueDeliveryTiming,
+        observation: { kind: 'answer', result: answer },
+      }),
     );
     logInputConsumerMaterializationDecision({
       source: 'drainPending',
       reconcileWhenEmpty,
       activeTurnSteerability,
       result,
-    });
-    opts.noInputLog.observe({
-      source: 'drainPending',
-      activeTurnSteerability,
-      pendingQueueDeliveryTiming,
-      observation: { kind: 'answer', result },
     });
     if (result.type === 'materialized') {
       return 'materialized';
