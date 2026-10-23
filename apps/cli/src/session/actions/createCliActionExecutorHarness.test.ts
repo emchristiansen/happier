@@ -514,7 +514,11 @@ describe('createCliActionExecutorHarness', () => {
       expect(sendArgs.providerToolCallId).toBe('requester-call');
     });
 
-    it("derives every attempt's localId with the requester's session as sender, not the approver's or a recovering CLI's", async () => {
+    it.each([
+      ['a policy-created', 'call-p'],
+      ['an explicitly created (approval.request.create)', null],
+    ] as const)("derives every attempt's localId for %s approval with the requester's session as sender, not the approver's or a recovering CLI's", async (label, providerToolCallId) => {
+      const explicit = label.startsWith('an explicitly');
       sendSessionMessageService.mockReset();
       sendSessionMessageService.mockResolvedValue({ ok: true, sessionId: 'sess_target', localId: 'derived', waited: false });
       const requests = new Map<string, ApprovalRequestV1>();
@@ -528,7 +532,8 @@ describe('createCliActionExecutorHarness', () => {
         approvalsUpdate: vi.fn(async ({ artifactId, request }) => {
           // The approver's execution record write fails, leaving the request 'approved'.
           if (failExecutionRecordWrites && request.execution) {
-            return { ok: false as const, errorCode: 'approval_update_failed', error: 'approval_update_failed' };
+            // As cliApprovalsArtifactStore reports a non-success HTTP response.
+            return { ok: false as const, errorCode: 'update_failed', error: 'artifact_update_failed' };
           }
           requests.set(artifactId, request);
           return { ok: true as const };
@@ -546,11 +551,25 @@ describe('createCliActionExecutorHarness', () => {
       const approver = boundTo('sess_B');
       const recoverer = boundTo('sess_C');
 
-      await requester.executor.execute(
-        'session.message.send',
-        { sessionId: 'sess_target', message: 'hello' },
-        { surface: 'cli', defaultSessionId: null, providerToolCallId: 'call-p' },
-      );
+      const requesterContext = { surface: 'cli' as const, defaultSessionId: null, ...(providerToolCallId ? { providerToolCallId } : {}) };
+      const created = explicit
+        ? await requester.executor.execute(
+          'approval.request.create' as any,
+          {
+            actionId: 'session.message.send',
+            actionArgs: { sessionId: 'sess_target', message: 'hello' },
+            summary: 'Send hello',
+            createdBy: { surface: 'cli' },
+          },
+          requesterContext,
+        )
+        : await requester.executor.execute(
+          'session.message.send',
+          { sessionId: 'sess_target', message: 'hello' },
+          requesterContext,
+        );
+      expect(created).toMatchObject({ ok: true });
+      expect(requests.get('approval_sender_1')).toMatchObject({ status: 'open', actionId: 'session.message.send' });
 
       failExecutionRecordWrites = true;
       await approver.executor.execute(
@@ -573,9 +592,12 @@ describe('createCliActionExecutorHarness', () => {
       expect((sendSessionMessageService.mock.calls as unknown[][]).map(([args]) => (args as Record<string, unknown>).idempotency))
         .toEqual(Array.from({ length: 2 }, () => ({
           kind: 'derived',
-          identity: { senderSessionId: 'sess_A', providerToolCallId: 'call-p' },
+          identity: { senderSessionId: 'sess_A', providerToolCallId },
         })));
-      expect(requests.get('approval_sender_1')?.invocationIdentity).toEqual({ providerToolCallId: 'call-p', senderSessionId: 'sess_A' });
+      expect(requests.get('approval_sender_1')?.invocationIdentity).toEqual({
+        ...(providerToolCallId ? { providerToolCallId } : {}),
+        senderSessionId: 'sess_A',
+      });
     });
   });
 });

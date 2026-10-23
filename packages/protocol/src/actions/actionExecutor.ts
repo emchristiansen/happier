@@ -3128,6 +3128,12 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
 
         const summary = String((parsed.data as any).summary ?? '').trim();
         if (!summary) return { ok: false, errorCode: 'invalid_parameters', error: 'invalid_parameters' };
+        // As for a policy-created request: the creating invocation's trusted
+        // identities, never fields of the tool input.
+        const invocationIdentity = buildApprovalRequestInvocationIdentity(
+          ctx,
+          normalizeId(deps.resolveInvocationSenderSessionId?.()),
+        );
 
         const request: ApprovalRequestV1 = {
           v: 1,
@@ -3140,6 +3146,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
           actionArgs: parsedTargetArgs.data,
           approval: buildApprovalMetadata(targetSpec),
           ...(approvalOrigin ? { origin: approvalOrigin } : {}),
+          ...(invocationIdentity ? { invocationIdentity } : {}),
           summary,
           ...(normalizeId(ctx.serverId) ? { serverId: normalizeId(ctx.serverId) } : {}),
           ...(Object.prototype.hasOwnProperty.call(parsed.data, 'preview') ? { preview: (parsed.data as any).preview } : {}),

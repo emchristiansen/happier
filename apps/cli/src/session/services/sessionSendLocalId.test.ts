@@ -161,8 +161,9 @@ describe('preserveSessionSendAdmission', () => {
     return join(configuration.activeServerDir, 'session-send-admissions');
   }
 
+  /** The stored bodies: one `.json` file each (any other file holds no message). */
   async function listEntries(): Promise<string[]> {
-    return (await readdir(await storeDirectory())).filter((name) => !name.startsWith('.')).sort();
+    return (await readdir(await storeDirectory())).filter((name) => !name.startsWith('.') && name.endsWith('.json')).sort();
   }
 
   it('removes a body just over the retention on write and keeps one exactly at it', async () => {
@@ -197,48 +198,101 @@ describe('preserveSessionSendAdmission', () => {
       .toEqual(body('resealed', 'local-0'));
   }, 120_000);
 
-  it('removes temporary and quarantine files older than the retention and keeps fresh ones', async () => {
+  it('removes temporary files older than the retention and keeps fresh ones', async () => {
     await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('first') });
     const directory = await storeDirectory();
     const staleSeconds = (Date.now() - SESSION_SEND_ADMISSION_RETENTION_MS - 60_000) / 1000;
-    for (const name of ['.tmp-dead-1.json', '.quarantine-dead-1']) {
-      await writeFile(join(directory, name), '{}');
-      await utimes(join(directory, name), staleSeconds, staleSeconds);
-    }
-    await writeFile(join(directory, '.tmp-live-1.json'), '{}');
+    await writeFile(join(directory, '.tmp-dead-1'), '{}');
+    await utimes(join(directory, '.tmp-dead-1'), staleSeconds, staleSeconds);
+    await writeFile(join(directory, '.tmp-live-1'), '{}');
 
     await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('second', 'local-2') });
     const names = await readdir(directory);
-    expect(names).not.toContain('.tmp-dead-1.json');
-    expect(names).not.toContain('.quarantine-dead-1');
-    expect(names).toContain('.tmp-live-1.json');
+    expect(names).not.toContain('.tmp-dead-1');
+    expect(names).toContain('.tmp-live-1');
   });
 
-  it('never removes a body republished after a remover judged the old one stale', async () => {
+  it('keeps issuing a committed body while a stale cleaner and a third publisher interleave', async () => {
+    // An old attempt under X left body A, now expired. Cleaner R (publishing
+    // another key) judges A stale and pauses. Another cleaner removes A; a
+    // send publishes B under X and the relay commits it, its acknowledgement
+    // lost. Every retry of that request, before and after R resumes, must
+    // issue B's exact bytes, whatever R does to the store meanwhile.
     const t0 = 1_000_000;
     const t1 = t0 + SESSION_SEND_ADMISSION_RETENTION_MS + 1;
-    await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('stale'), nowMs: () => t0 });
-    const [staleEntry] = await listEntries();
-    let interleaved = false;
+    await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('A'), nowMs: () => t0 });
+    let removals = 0;
 
     await preserveSessionSendAdmission({
       sessionId: 'sess-a',
       candidate: body('unrelated', 'local-2'),
       nowMs: () => t1,
-      beforeRemove: async (entryName) => {
-        if (interleaved || entryName !== staleEntry) return;
+      beforeRemove: async (fileName) => {
+        removals += 1;
+        if (removals === 1) {
+          await unlink(join(await storeDirectory(), fileName));
+          expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('B'), nowMs: () => t1 }))
+            .toEqual(body('B'));
+        }
+        // Third publisher: the retry with resealed bytes C.
+        expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('C'), nowMs: () => t1 }))
+          .toEqual(body('B'));
+      },
+    });
+
+    expect(removals).toBeGreaterThan(0);
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('D'), nowMs: () => t1 }))
+      .toEqual(body('B'));
+    expect((await readdir(await storeDirectory())).filter((name) => name.startsWith('.'))).toEqual([]);
+  });
+
+  it('holds the cap after two distinct-key publications interleave at 255 bodies', async () => {
+    let nowMs = 1_000_000;
+    for (let index = 0; index < SESSION_SEND_ADMISSION_MAX_ENTRIES - 1; index += 1) {
+      nowMs += 1;
+      await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body(`body-${index}`, `local-${index}`), nowMs: () => nowMs });
+    }
+    expect(await listEntries()).toHaveLength(SESSION_SEND_ADMISSION_MAX_ENTRIES - 1);
+    nowMs += 1;
+    let interleaved = false;
+
+    // X has scanned the store and is about to publish when Y publishes in full.
+    await preserveSessionSendAdmission({
+      sessionId: 'sess-a',
+      candidate: body('x', 'local-x'),
+      nowMs: () => nowMs,
+      beforeLink: async () => {
+        if (interleaved) return;
         interleaved = true;
-        // Between this remover's judgment and its move, another writer removes
-        // the stale body and publishes a fresh one at the same pathname.
-        await unlink(join(await storeDirectory(), entryName));
-        expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('fresh'), nowMs: () => t1 }))
-          .toEqual(body('fresh'));
+        await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('y', 'local-y'), nowMs: () => nowMs });
       },
     });
 
     expect(interleaved).toBe(true);
-    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('resealed'), nowMs: () => t1 }))
-      .toEqual(body('fresh'));
-    expect((await readdir(await storeDirectory())).filter((name) => name.startsWith('.'))).toEqual([]);
+    expect((await listEntries()).length).toBeLessThanOrEqual(SESSION_SEND_ADMISSION_MAX_ENTRIES);
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('resealed', 'local-x'), nowMs: () => nowMs }))
+      .toEqual(body('x', 'local-x'));
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('resealed', 'local-y'), nowMs: () => nowMs }))
+      .toEqual(body('y', 'local-y'));
+  }, 120_000);
+
+  it('converges two attempts on one body across a window boundary', async () => {
+    const boundary = 2 * SESSION_SEND_ADMISSION_RETENTION_MS;
+    let lateNowMs = boundary - 1;
+    // The late attempt read its window just before the boundary; the other
+    // attempt runs entirely after it, before the late one links.
+    const late = preserveSessionSendAdmission({
+      sessionId: 'sess-a',
+      candidate: body('late'),
+      nowMs: () => lateNowMs,
+      beforeLink: async () => {
+        lateNowMs = boundary + 5;
+      },
+    });
+    const early = await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('after-boundary'), nowMs: () => boundary + 1 });
+    const lateResult = await late;
+    expect(lateResult).toEqual(early);
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('retry'), nowMs: () => boundary + 10 }))
+      .toEqual(early);
   });
 });

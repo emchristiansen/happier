@@ -5,6 +5,7 @@ import { mapUnknownErrorToControlError } from '@/cli/control/controlErrorMapping
 import type { Credentials } from '@/persistence';
 import { readCredentials } from '@/persistence';
 import { wantsJson, printJsonEnvelope, writeJsonStdout } from '@/cli/output/jsonEnvelope';
+import { printPendingCustodyDetails } from '@/cli/output/pendingCustodyDetails';
 import { bootstrapAccountSettingsContext } from '@/settings/accountSettings/bootstrapAccountSettingsContext';
 import { initialMachineMetadata } from '@/daemon/machine/metadata';
 import { initializeBackendApiContext } from '@/agent/runtime/initializeBackendApiContext';
@@ -292,7 +293,12 @@ export async function handleToolsCommand(args: string[], overrides?: Partial<Too
         return;
       }
 
-      if (!result.ok) throw new Error(result.error);
+      if (!result.ok) {
+        // A failed send's custody facts (localId, session, whether the relay
+        // already held it) are otherwise lost with the thrown message.
+        printPendingCustodyDetails('details' in result ? result.details : undefined);
+        throw new Error(result.error);
+      }
       await writeJsonStdout(result.result, { pretty: true });
       return;
     }
@@ -312,13 +318,13 @@ export async function handleToolsCommand(args: string[], overrides?: Partial<Too
   }
 }
 
-export async function handleToolsCliCommand(context: CommandContext): Promise<void> {
+export async function handleToolsCliCommand(context: CommandContext, overrides?: Partial<ToolsCommandDeps>): Promise<void> {
   const args = context.args.slice(1);
   const json = wantsJson(args);
   const kind = resolveCommandKind(args);
 
   try {
-    await handleToolsCommand(args);
+    await handleToolsCommand(args, overrides);
   } catch (error) {
     if (json) {
       const mapped = mapUnknownErrorToControlError(error);

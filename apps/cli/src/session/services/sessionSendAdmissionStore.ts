@@ -18,62 +18,91 @@ import {
  * target's current model and permission metadata, so a metadata change between
  * attempts turns a retry of a committed message into a refusal.
  *
- * Publication: each (session, localId) has one pathname. The first publisher
- * wins through an exclusive `link` of a complete file; a later attempt of the
- * same request (same fingerprint) reads and issues the winner. An attempt with
- * a different request under the same localId (a reused `--local-id`) issues its
- * own body and leaves the kept one in place.
+ * No pathname that a reader may resolve as the current body is ever deleted,
+ * renamed or overwritten. Two kinds of immutable file exist per key:
  *
- * Removal is fenced by generation. Every published file carries a random
- * `generation`. A remover decides on one (pathname, generation), then
- * atomically renames the pathname to a private quarantine name and reads what
- * it actually moved. Only the decided generation is unlinked. Anything else (a
- * body republished at that pathname after another remover deleted the old one)
- * is linked back; if a third body was published in that instant, the moved
- * one is dropped and the newer one stays. A remover therefore never deletes a
- * generation it did not judge.
+ * - A body, `<key>.<storedAtMs>-<uuid>.json`, holds one attempt's admission
+ *   body. Its name is unique to the attempt that wrote it and is never reused.
+ * - A decision, `<key>.<window>.<n>.decision`, names the body that every
+ *   attempt in that window issues. `window` is `floor(nowMs / retention)`. It
+ *   is published with an exclusive `link`, so of two attempts racing for one
+ *   decision name exactly one wins; the loser adopts the winner's body. `n`
+ *   counts decisions within a window: a new one is made only when the body of
+ *   the highest one is no longer current.
  *
- * Bounds, applied on every publication: bodies older than
- * `SESSION_SEND_ADMISSION_RETENTION_MS` are removed; above
- * `SESSION_SEND_ADMISSION_MAX_ENTRIES` the oldest by `storedAtMs` are evicted;
- * temporary files older than the retention (left by a crash) are removed. A
- * kept body older than the retention is not re-issued.
+ * An attempt reads the decisions of the current and the previous window, and
+ * takes the highest. It returns a body only when that decision is in the
+ * window the attempt both started and ended in; a decision found only in the
+ * previous window is first re-published in the current one. The decisions any
+ * two returns rely on therefore share one exclusive name, or are ordered
+ * through it, and no attempt issues a body while another body is current.
+ *
+ * Removal, applied after a publication: bodies older than the retention, then
+ * the oldest bodies beyond `SESSION_SEND_ADMISSION_MAX_ENTRIES` (by
+ * storedAtMs, then name); decisions two or more windows old, which no attempt
+ * reads or writes again (assuming the host clock does not step back by a
+ * window); temporary files whose mtime is older than the retention, the
+ * cleanup criterion for a write that never completed. Every removal names one
+ * unique file. A decision whose body was removed counts as not current.
  */
 
 export const SESSION_SEND_ADMISSION_RETENTION_MS = 60 * 60_000;
 export const SESSION_SEND_ADMISSION_MAX_ENTRIES = 256;
 
 const DIRECTORY_NAME = 'session-send-admissions';
-const ENTRY_SUFFIX = '.json';
 const TMP_PREFIX = '.tmp-';
-const QUARANTINE_PREFIX = '.quarantine-';
+const MAX_ATTEMPTS = 8;
+
+const BODY_NAME = /^([0-9a-f]{64})\.(\d+)-([0-9a-f-]{36})\.json$/;
+const DECISION_NAME = /^([0-9a-f]{64})\.(\d+)\.(\d+)\.decision$/;
 
 type StoredAdmission = Readonly<{
-  v: 1;
-  generation: string;
+  v: 2;
   sessionId: string;
   requestFingerprint: string;
   storedAtMs: number;
   body: SessionUserMessageAdmissionBody;
 }>;
 
+type Decision = Readonly<{ name: string; window: number; n: number }>;
+
 type StoreOptions = Readonly<{
   nowMs?: () => number;
-  /** Test seam: runs after a remover has decided on a generation and before it moves it. */
-  beforeRemove?: (entryName: string) => Promise<void>;
+  /** Test seam: runs before a removal unlinks the file it judged. */
+  beforeRemove?: (fileName: string) => Promise<void>;
+  /** Test seam: runs before an attempt links a decision. */
+  beforeLink?: () => Promise<void>;
 }>;
 
 function resolveDirectory(): string {
   return join(configuration.activeServerDir, DIRECTORY_NAME);
 }
 
-function resolveEntryName(sessionId: string, localId: string): string {
-  const name = createHash('sha256').update(JSON.stringify(['session-send-admission-v1', sessionId, localId])).digest('hex');
-  return `${name}${ENTRY_SUFFIX}`;
+function resolveKey(sessionId: string, localId: string): string {
+  return createHash('sha256').update(JSON.stringify(['session-send-admission-v2', sessionId, localId])).digest('hex');
 }
 
-function isEntryName(name: string): boolean {
-  return name.endsWith(ENTRY_SUFFIX) && !name.startsWith('.');
+function windowOf(nowMs: number): number {
+  return Math.floor(nowMs / SESSION_SEND_ADMISSION_RETENTION_MS);
+}
+
+function parseBodyName(name: string): Readonly<{ key: string; storedAtMs: number }> | null {
+  const match = BODY_NAME.exec(name);
+  return match ? { key: match[1]!, storedAtMs: Number(match[2]) } : null;
+}
+
+function parseDecisionName(name: string): Readonly<{ key: string; window: number; n: number }> | null {
+  const match = DECISION_NAME.exec(name);
+  return match ? { key: match[1]!, window: Number(match[2]), n: Number(match[3]) } : null;
+}
+
+async function readIfPresent(path: string): Promise<string | null> {
+  try {
+    return await readFile(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
 function parseStoredAdmission(raw: string): StoredAdmission | null {
@@ -86,24 +115,19 @@ function parseStoredAdmission(raw: string): StoredAdmission | null {
   if (!parsed || typeof parsed !== 'object') return null;
   const record = parsed as Record<string, unknown>;
   const body = readSessionUserMessageAdmissionBody(record.body);
-  if (record.v !== 1 || typeof record.generation !== 'string' || typeof record.sessionId !== 'string'
-    || typeof record.requestFingerprint !== 'string' || typeof record.storedAtMs !== 'number' || !body) return null;
-  return {
-    v: 1,
-    generation: record.generation,
-    sessionId: record.sessionId,
-    requestFingerprint: record.requestFingerprint,
-    storedAtMs: record.storedAtMs,
-    body,
-  };
+  if (record.v !== 2 || typeof record.sessionId !== 'string' || typeof record.requestFingerprint !== 'string'
+    || typeof record.storedAtMs !== 'number' || !body) return null;
+  return { v: 2, sessionId: record.sessionId, requestFingerprint: record.requestFingerprint, storedAtMs: record.storedAtMs, body };
 }
 
-async function readStoredAdmission(path: string): Promise<StoredAdmission | null | 'unreadable'> {
+function parseDecisionBodyName(raw: string): string | null {
   try {
-    return parseStoredAdmission(await readFile(path, 'utf8')) ?? 'unreadable';
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
-    throw error;
+    const parsed = JSON.parse(raw) as Record<string, unknown> | null;
+    return parsed && parsed.v === 2 && typeof parsed.bodyName === 'string' && BODY_NAME.test(parsed.bodyName)
+      ? parsed.bodyName
+      : null;
+  } catch {
+    return null;
   }
 }
 
@@ -113,76 +137,61 @@ async function unlinkIfPresent(path: string): Promise<void> {
   });
 }
 
-/**
- * Removes `entryName` only if it still holds `generation` (null: an unreadable
- * file). Returns whether that generation was removed.
- */
-async function removeGeneration(
-  directory: string,
-  entryName: string,
-  generation: string | null,
-  options: StoreOptions,
-): Promise<boolean> {
-  await options.beforeRemove?.(entryName);
-  const path = join(directory, entryName);
-  const quarantinePath = join(directory, `${QUARANTINE_PREFIX}${process.pid}-${randomUUID()}`);
+async function writeTmp(directory: string, contents: string): Promise<string> {
+  const tmpPath = join(directory, `${TMP_PREFIX}${process.pid}-${randomUUID()}`);
+  await writeFile(tmpPath, contents, { mode: 0o600 });
+  return tmpPath;
+}
+
+/** Publishes `contents` at `name` only if nothing is there; returns whether it did. */
+async function linkExclusive(directory: string, name: string, contents: string): Promise<boolean> {
+  const tmpPath = await writeTmp(directory, contents);
   try {
-    await rename(path, quarantinePath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
-    throw error;
-  }
-  const moved = await readStoredAdmission(quarantinePath);
-  const movedGeneration = moved === null ? undefined : moved === 'unreadable' ? null : moved.generation;
-  if (movedGeneration === generation) {
-    await unlinkIfPresent(quarantinePath);
+    await link(tmpPath, join(directory, name));
     return true;
-  }
-  // Not the generation this remover judged: put it back, unless a newer body
-  // was already published at the pathname, which then stays.
-  try {
-    await link(quarantinePath, path);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw error;
+    if ((error as NodeJS.ErrnoException)?.code === 'EEXIST') return false;
+    throw error;
   } finally {
-    await unlinkIfPresent(quarantinePath);
+    await unlinkIfPresent(tmpPath);
   }
-  return false;
+}
+
+async function removeJudged(directory: string, name: string, options: StoreOptions): Promise<void> {
+  await options.beforeRemove?.(name);
+  await unlinkIfPresent(join(directory, name));
 }
 
 async function enforceBounds(directory: string, nowMs: number, options: StoreOptions): Promise<void> {
-  const live: Array<Readonly<{ name: string; generation: string; storedAtMs: number }>> = [];
+  const currentWindow = windowOf(nowMs);
+  const live: Array<Readonly<{ name: string; storedAtMs: number }>> = [];
   for (const name of await readdir(directory)) {
-    const path = join(directory, name);
-    if (name.startsWith(TMP_PREFIX) || name.startsWith(QUARANTINE_PREFIX)) {
-      // Private to one writer for milliseconds; older than the retention means
-      // its writer died. Names are unique per writer, so no generation applies.
-      const info = await stat(path).catch((error: NodeJS.ErrnoException) => {
+    if (name.startsWith(TMP_PREFIX)) {
+      // The cleanup criterion for a write that never completed; not proof
+      // that its writer is gone.
+      const info = await stat(join(directory, name)).catch((error: NodeJS.ErrnoException) => {
         if (error?.code === 'ENOENT') return null;
         throw error;
       });
-      if (info && nowMs - info.mtimeMs > SESSION_SEND_ADMISSION_RETENTION_MS) await unlinkIfPresent(path);
+      if (info && nowMs - info.mtimeMs > SESSION_SEND_ADMISSION_RETENTION_MS) await removeJudged(directory, name, options);
       continue;
     }
-    if (!isEntryName(name)) continue;
-    const stored = await readStoredAdmission(path);
-    if (stored === null) continue;
-    if (stored === 'unreadable') {
-      await removeGeneration(directory, name, null, options);
+    const decision = parseDecisionName(name);
+    if (decision) {
+      if (decision.window <= currentWindow - 2) await removeJudged(directory, name, options);
       continue;
     }
-    if (nowMs - stored.storedAtMs > SESSION_SEND_ADMISSION_RETENTION_MS) {
-      await removeGeneration(directory, name, stored.generation, options);
+    const body = parseBodyName(name);
+    if (!body) continue;
+    if (nowMs - body.storedAtMs > SESSION_SEND_ADMISSION_RETENTION_MS) {
+      await removeJudged(directory, name, options);
       continue;
     }
-    live.push({ name, generation: stored.generation, storedAtMs: stored.storedAtMs });
+    live.push({ name, storedAtMs: body.storedAtMs });
   }
-  // Leave room for the body about to be published.
   live.sort((a, b) => a.storedAtMs - b.storedAtMs || a.name.localeCompare(b.name));
-  let excess = live.length - (SESSION_SEND_ADMISSION_MAX_ENTRIES - 1);
-  for (const entry of live) {
-    if (excess <= 0) break;
-    if (await removeGeneration(directory, entry.name, entry.generation, options)) excess -= 1;
+  for (const entry of live.slice(0, Math.max(0, live.length - SESSION_SEND_ADMISSION_MAX_ENTRIES))) {
+    await removeJudged(directory, entry.name, options);
   }
 }
 
@@ -192,9 +201,9 @@ export function fingerprintSessionSendRequest(inputs: unknown): string {
 }
 
 /**
- * Returns the body to issue: the one kept for (sessionId, localId) and this
- * request within the retention, else `candidate`, which it keeps if no body
- * is kept for that pathname.
+ * Returns the body to issue: the body decided for (sessionId, localId) while
+ * it is current, if it was stored for this request, else `candidate`. When no
+ * body is current, `candidate` becomes the decided body.
  */
 export async function preserveSessionSendAdmission(params: Readonly<{
   sessionId: string;
@@ -205,50 +214,74 @@ export async function preserveSessionSendAdmission(params: Readonly<{
   const localId = params.candidate.localId;
   const directory = resolveDirectory();
   await mkdir(directory, { recursive: true, mode: 0o700 });
-  const entryName = resolveEntryName(params.sessionId, localId);
-  const path = join(directory, entryName);
+  const key = resolveKey(params.sessionId, localId);
 
-  const currentOf = (stored: StoredAdmission | null | 'unreadable'): StoredAdmission | null =>
-    stored !== null && stored !== 'unreadable'
-    && stored.sessionId === params.sessionId && stored.body.localId === localId
-    && now() - stored.storedAtMs <= SESSION_SEND_ADMISSION_RETENTION_MS
+  const readCurrent = async (bodyName: string): Promise<StoredAdmission | null> => {
+    const raw = await readIfPresent(join(directory, bodyName));
+    const stored = raw === null ? null : parseStoredAdmission(raw);
+    return stored && stored.sessionId === params.sessionId && stored.body.localId === localId
+      && now() - stored.storedAtMs <= SESSION_SEND_ADMISSION_RETENTION_MS
       ? stored
       : null;
+  };
   const choose = (stored: StoredAdmission) =>
     stored.requestFingerprint === params.requestFingerprint ? stored.body : params.candidate;
 
-  const existing = currentOf(await readStoredAdmission(path));
-  if (existing) return choose(existing);
-
-  await enforceBounds(directory, now(), params);
-  const record: StoredAdmission = {
-    v: 1,
-    generation: randomUUID(),
-    sessionId: params.sessionId,
-    requestFingerprint: params.requestFingerprint,
-    storedAtMs: now(),
-    body: params.candidate,
-  };
-  const tmpPath = join(directory, `${TMP_PREFIX}${process.pid}-${randomUUID()}${ENTRY_SUFFIX}`);
-  await writeFile(tmpPath, JSON.stringify(record), { mode: 0o600 });
+  // This attempt's own body, written at most once and removed unless decided.
+  let ownBodyName: string | null = null;
+  let ownBodyDecided = false;
   try {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        await link(tmpPath, path);
-        return params.candidate;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw error;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+      const window = windowOf(now());
+      let top: Decision | null = null;
+      for (const name of await readdir(directory)) {
+        const parsed = parseDecisionName(name);
+        if (!parsed || parsed.key !== key || (parsed.window !== window && parsed.window !== window - 1)) continue;
+        if (!top || parsed.window > top.window || (parsed.window === top.window && parsed.n > top.n)) {
+          top = { name, window: parsed.window, n: parsed.n };
+        }
       }
-      const winner = await readStoredAdmission(path);
-      const currentWinner = currentOf(winner);
-      if (currentWinner) return choose(currentWinner);
-      // A stale or unreadable body that bound enforcement did not remove: remove that generation and retry.
-      if (winner !== null) {
-        await removeGeneration(directory, entryName, winner === 'unreadable' ? null : winner.generation, params);
+      const decidedBodyName = top ? parseDecisionBodyName((await readIfPresent(join(directory, top.name))) ?? '') : null;
+      const decided = decidedBodyName ? await readCurrent(decidedBodyName) : null;
+
+      if (decided && top!.window === window) {
+        // Decided in this window. A window change during the read means the
+        // decision must first be carried into the new window.
+        if (windowOf(now()) !== window) continue;
+        if (decidedBodyName === ownBodyName) ownBodyDecided = true;
+        return choose(decided);
       }
+
+      // Record a decision in this window: the previous window's current body,
+      // or else this attempt's own.
+      let bodyName: string | null = decided ? decidedBodyName! : ownBodyName;
+      if (!bodyName) {
+        const storedAtMs = now();
+        const record: StoredAdmission = {
+          v: 2,
+          sessionId: params.sessionId,
+          requestFingerprint: params.requestFingerprint,
+          storedAtMs,
+          body: params.candidate,
+        };
+        ownBodyName = `${key}.${storedAtMs}-${randomUUID()}.json`;
+        const tmpPath = await writeTmp(directory, JSON.stringify(record));
+        await rename(tmpPath, join(directory, ownBodyName));
+        bodyName = ownBodyName;
+      }
+      const n = top && top.window === window ? top.n + 1 : 0;
+      await params.beforeLink?.();
+      const linked = await linkExclusive(directory, `${key}.${window}.${n}.decision`, JSON.stringify({ v: 2, bodyName }));
+      if (linked && bodyName === ownBodyName) {
+        ownBodyDecided = true;
+        // Bound the store after this body is in place, so the bound holds once
+        // every concurrent publication has returned.
+        await enforceBounds(directory, now(), params);
+      }
+      // Re-read: the next pass returns the decision if the window held.
     }
     throw new Error('session_send_admission_store_contended');
   } finally {
-    await unlinkIfPresent(tmpPath);
+    if (ownBodyName && !ownBodyDecided) await unlinkIfPresent(join(directory, ownBodyName));
   }
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { handleToolsCommand } from './tools';
+import { handleToolsCliCommand, handleToolsCommand } from './tools';
 import { captureStdoutJsonOutput } from '@/testkit/logger/captureOutput';
 
 function createBaseDeps() {
@@ -303,6 +303,47 @@ describe('happier tools --json', () => {
       }));
     } finally {
       output.restore();
+      process.exitCode = prevExitCode;
+    }
+  });
+
+  it.each([
+    ['a deduplicated confirmed failure', { pendingCustody: 'confirmed', sessionId: 'sess-target', localId: 'local-9', deduplicated: true }, true],
+    ['a written confirmed failure', { pendingCustody: 'confirmed', sessionId: 'sess-target', localId: 'local-9' }, false],
+  ] as const)('keeps the send facts of %s in human tools call output and still fails', async (_label, details, deduplicated) => {
+    const stderr: string[] = [];
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation((...parts: unknown[]) => {
+      stderr.push(parts.map(String).join(' '));
+    });
+    const prevExitCode = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      await handleToolsCliCommand({
+        args: [
+          'tools', 'call',
+          '--session-id', 'sess-1',
+          '--directory', '/workspace',
+          '--source', 'happier',
+          '--tool', 'action_execute',
+          '--args-json', JSON.stringify({ actionId: 'session.message.send', input: { sessionId: 'sess-target', message: 'hello' } }),
+        ],
+        rawArgv: [],
+        terminalRuntime: null,
+      }, {
+        ...createBaseDeps(),
+        callBuiltInHappierTool: async () => ({ ok: false, errorCode: 'resume_failed', error: 'resume_failed', details }),
+      } as any);
+
+      expect(process.exitCode).toBe(1);
+      const text = stderr.join('\n');
+      expect(text).toContain('resume_failed');
+      expect(text).toContain('local-9');
+      expect(text).toContain('pending custody: confirmed');
+      expect(text).toContain('session: sess-target');
+      if (deduplicated) expect(text).toContain('already present, deduplicated by localId');
+      else expect(text).not.toContain('deduplicated');
+    } finally {
+      errorSpy.mockRestore();
       process.exitCode = prevExitCode;
     }
   });
