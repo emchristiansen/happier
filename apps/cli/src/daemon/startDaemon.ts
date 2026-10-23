@@ -2482,10 +2482,15 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         let connectedServiceProjectionReconciliationBaseline: ConnectedServiceProjectionSnapshot | null = null;
         let connectedServiceProjectionEpoch = 0;
         const lastReconciledProjectionEpochByRuntimeTarget = new WeakMap<ConnectedServiceRuntimeTarget, number>();
-        // One account-profile GET at a time for the whole daemon. A caller that arrives while a GET is
-        // in flight does not take that GET's answer (it was requested before the caller, e.g. before a
-        // credential rotation or group switch the caller must observe); it shares the single queued
-        // follow-up GET, which starts after the in-flight one settles and therefore after the caller.
+        // Profile-fetch owner for forced runtime-target registration reconciliation (startup readiness,
+        // runtime-auth recovery): one active GET and one queued follow-up. A caller that arrives while
+        // a GET is in flight does not take that GET's answer (it was requested before the caller, e.g.
+        // before a credential rotation or group switch the caller must observe); it shares the single
+        // queued follow-up GET, which starts after the in-flight one settles and therefore after the
+        // caller. Forced GETs publish to `latestConnectedServiceProjectionSnapshot` in order relative to
+        // each other. Other profile GETs, such as ApiMachineClient's projection-change notification
+        // fetch, are not owned here: they can overlap these, and the notification path can replace
+        // `latestConnectedServiceProjectionSnapshot` before a forced caller reads it.
         const accountProfileProjectionSnapshotFetches = createKeyedFollowUpRuns<
           'account_profile',
           null,

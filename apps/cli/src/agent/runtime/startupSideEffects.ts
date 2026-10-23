@@ -60,22 +60,31 @@ function resolveDaemonReportRetryValue(raw: string | undefined, fallback: number
 /**
  * Retry spacing for the runner's `/session-started` report.
  *
- * The n-th consecutive failed attempt waits `min(cap, base * FACTOR^(n-1))`, reduced by a random
- * fraction of at most JITTER_FRACTION, and never longer than what remains of the retry budget.
- * Every transient failure counts, including the daemon's 503 `session_startup_reconciliation_failed`,
- * so a daemon that is failing its startup reconciliation is never retried immediately.
+ * After the n-th consecutive failed attempt the runner requests a sleep of nominal
+ * `min(cap, base * FACTOR^(n-1))`: with the defaults 250, 500, 1000, 2000 and 4000 ms after
+ * failures 1-5, and the 5 s cap from the 6th failure on. Jitter then scales the nominal value by
+ * `1 - JITTER_FRACTION * random`, i.e. into [nominal / 2, nominal], and finally the sleep is clamped
+ * to what remains of the retry budget, so the last sleep before the deadline can be shorter than
+ * half its nominal value. Every transient failure counts, including the daemon's 503
+ * `session_startup_reconciliation_failed`.
+ *
+ * These are requested sleeps only. Attempt count and elapsed time also depend on how long each
+ * request takes and on timer scheduling. The loop (unchanged here) has no deadline check before
+ * starting the next request, and each request's timeout is the full per-attempt timeout bounded by
+ * the whole budget, not by the time remaining, so a late timer can start a request after the
+ * deadline and a request started at the deadline can finish after it.
  *
  * - base 250 ms (`HAPPIER_DAEMON_REPORT_SESSION_RETRY_INTERVAL_MS`, formerly the fixed interval): a
  *   daemon that is simply not listening yet still gets answered within the first few hundred ms.
- * - factor 2: each failure halves the attempt rate, so a daemon that keeps failing sees the
- *   attempt rate fall from 4/s to the cap's rate within five failures.
+ * - factor 2: the nominal sleep doubles per failure until the cap.
  * - cap 5 s (`HAPPIER_DAEMON_REPORT_SESSION_RETRY_MAX_INTERVAL_MS`, raised to the base when lower):
- *   a 503 means the daemon's reconciliation (a relay round trip with a 15 s timeout) failed, so
- *   retrying more often than every few seconds only repeats that work; 5 s still leaves more than
- *   fifteen attempts in the 90 s daemon-started budget and adds at most 5 s after recovery.
- * - jitter up to half of the nominal delay ("equal jitter"): runners started together by one
- *   daemon spread their retries instead of arriving in waves, and the wait never drops below half
- *   the nominal delay, so no failure is followed by a near-immediate retry.
+ *   a 503 means the daemon's startup reconciliation failed (a relay round trip with a 15 s
+ *   timeout failing is one cause; a missing generation consumer or another reconciliation error is
+ *   another), so retrying more often than every few seconds mostly repeats that work. The cap
+ *   bounds the requested sleep, not the time from daemon recovery to acknowledgement.
+ * - jitter down to half of the nominal sleep ("equal jitter"): runners started together by one
+ *   daemon spread their retries instead of arriving in waves, and apart from the budget clamp no
+ *   sleep drops below half its nominal value.
  */
 const DAEMON_REPORT_RETRY_BASE_MS = 250;
 const DAEMON_REPORT_RETRY_FACTOR = 2;
