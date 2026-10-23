@@ -1,0 +1,216 @@
+/**
+ * The daemon's session-log retention sweep. The policy and its knobs live in `logRetention.ts`;
+ * this module applies it to one logs directory. It never throws. An fs error on a log skips that
+ * log; crash evidence that cannot be read skips the whole sweep, since a missing crash report
+ * would otherwise turn condition (d)'s protection into permission to delete.
+ */
+
+import { lstat, readdir, readFile, rm } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+
+import {
+  DAEMON_LOG_SUFFIX,
+  LOG_FILE_SUFFIX,
+  resolveCrashedSessionLogKeepCount,
+  resolveSessionLogKeepCount,
+  resolveSessionLogMinAgeMs,
+  type EnvLike,
+} from './logRetention';
+
+export type SweepSessionLogsParams = Readonly<{
+  logsDir: string;
+  /** Never deleted, whatever the policy says (the daemon passes its own current log). */
+  protectedPaths?: readonly string[];
+  env?: EnvLike;
+}>;
+
+export type SweepSessionLogsSkipReason =
+  /** The logs dir exists but could not be listed. */
+  | 'logs_dir_unavailable'
+  /** `session-exit/` or one of its reports could not be read, so condition (d) is unknown. */
+  | 'crash_evidence_unavailable';
+
+export type SweepSessionLogsResult =
+  | Readonly<{ outcome: 'swept'; deleted: number }>
+  | Readonly<{ outcome: 'skipped'; reason: SweepSessionLogsSkipReason; deleted: 0 }>;
+
+type CrashedSessionExitReportReference = Readonly<{
+  pid: number;
+  observedAt: number;
+}>;
+
+/** One report's contribution to condition (d). */
+type CrashReportReading =
+  | Readonly<{ kind: 'crash'; report: CrashedSessionExitReportReference }>
+  /** Readable but not crash evidence (malformed, no usable pid, clean exit), or gone since the scan. */
+  | Readonly<{ kind: 'not_crash_evidence' }>
+  | Readonly<{ kind: 'unavailable' }>;
+
+/** Condition (d)'s keep set, or the fact that it cannot be established this sweep. */
+type CrashRetention =
+  | Readonly<{ kind: 'established'; keptNames: ReadonlySet<string> }>
+  | Readonly<{ kind: 'unavailable' }>;
+
+function readErrorCode(error: unknown): unknown {
+  return error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+}
+
+function isNotFound(error: unknown): boolean {
+  return readErrorCode(error) === 'ENOENT';
+}
+
+export function isSessionLogFileName(name: string): boolean {
+  return name.endsWith(LOG_FILE_SUFFIX) && !name.endsWith(DAEMON_LOG_SUFFIX);
+}
+
+/** The writer's pid from a `...-pid-<n>.log` name, or null when the name carries none. */
+export function parseSessionLogPid(name: string): number | null {
+  const match = /-pid-(\d+)\.log$/.exec(name);
+  if (!match) return null;
+  const pid = Number(match[1]);
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: the process exists but belongs to another user.
+    return readErrorCode(error) === 'EPERM';
+  }
+}
+
+/** (a) Only a log whose writer is known and dead may go; an unidentifiable writer keeps its log. */
+function isWriterKnownDead(name: string): boolean {
+  const pid = parseSessionLogPid(name);
+  return pid !== null && !isProcessAlive(pid);
+}
+
+/** (b) Only logs untouched for longer than the minimum retention age may go. */
+function isOlderThanMinimumAge(mtimeMs: number, nowMs: number, minAgeMs: number): boolean {
+  return nowMs - mtimeMs > minAgeMs;
+}
+
+/** (c) Names are `<local timestamp>-pid-<n>.log`, so name order is creation order. */
+function selectNewestSessionLogNames(names: readonly string[], keepCount: number): ReadonlySet<string> {
+  return new Set([...names].sort((a, b) => (a < b ? 1 : a > b ? -1 : 0)).slice(0, keepCount));
+}
+
+async function readCrashReport(path: string): Promise<CrashReportReading> {
+  let raw: string;
+  try {
+    raw = await readFile(path, 'utf8');
+  } catch (error) {
+    return isNotFound(error) ? { kind: 'not_crash_evidence' } : { kind: 'unavailable' };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { kind: 'not_crash_evidence' };
+  }
+  if (!parsed || typeof parsed !== 'object') return { kind: 'not_crash_evidence' };
+  const record = parsed as { pid?: unknown; code?: unknown; signal?: unknown; observedAt?: unknown };
+  const pid = typeof record.pid === 'number' && Number.isInteger(record.pid) && record.pid > 0 ? record.pid : null;
+  if (pid === null) return { kind: 'not_crash_evidence' };
+  const crashed = (typeof record.code === 'number' && record.code !== 0)
+    || (typeof record.signal === 'string' && record.signal.trim().length > 0);
+  if (!crashed) return { kind: 'not_crash_evidence' };
+  if (typeof record.observedAt === 'number' && Number.isFinite(record.observedAt)) {
+    return { kind: 'crash', report: { pid, observedAt: Math.trunc(record.observedAt) } };
+  }
+  try {
+    return { kind: 'crash', report: { pid, observedAt: Math.trunc((await lstat(path)).mtimeMs) } };
+  } catch (error) {
+    return isNotFound(error) ? { kind: 'not_crash_evidence' } : { kind: 'unavailable' };
+  }
+}
+
+/** (d) Logs of the newest `keepCount` crashed runners (non-zero exit or signal in `session-exit/`). */
+async function resolveCrashRetention(
+  logsDir: string,
+  names: readonly string[],
+  keepCount: number,
+): Promise<CrashRetention> {
+  if (keepCount <= 0) return { kind: 'established', keptNames: new Set() };
+  const sessionExitDir = join(logsDir, 'session-exit');
+  let reportFiles: string[];
+  try {
+    reportFiles = (await readdir(sessionExitDir)).filter((file) => file.endsWith('.json'));
+  } catch (error) {
+    return isNotFound(error) ? { kind: 'established', keptNames: new Set() } : { kind: 'unavailable' };
+  }
+  // One report at a time: the sweep is hourly, and sequential reads cannot exhaust descriptors.
+  const crashes: CrashedSessionExitReportReference[] = [];
+  for (const file of reportFiles) {
+    const reading = await readCrashReport(join(sessionExitDir, file));
+    if (reading.kind === 'unavailable') return { kind: 'unavailable' };
+    if (reading.kind === 'crash') crashes.push(reading.report);
+  }
+  const keptCrashedPids = new Set(
+    crashes
+      .sort((a, b) => b.observedAt - a.observedAt)
+      .slice(0, keepCount)
+      .map((report) => report.pid),
+  );
+  return {
+    kind: 'established',
+    keptNames: new Set(names.filter((name) => {
+      const pid = parseSessionLogPid(name);
+      return pid !== null && keptCrashedPids.has(pid);
+    })),
+  };
+}
+
+async function readMtimeMs(path: string): Promise<number | null> {
+  try {
+    return (await lstat(path)).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Delete each session log in `logsDir` whose (a) writer is known and dead, that is (b) older than
+ * the minimum retention age, (c) not among the newest session logs by name and (d) not a kept
+ * crashed-runner log. Deletes nothing when (d) cannot be established. Never throws.
+ */
+export async function sweepSessionLogs(params: SweepSessionLogsParams): Promise<SweepSessionLogsResult> {
+  const env = params.env ?? process.env;
+  let names: string[];
+  try {
+    names = (await readdir(params.logsDir)).filter(isSessionLogFileName);
+  } catch (error) {
+    return isNotFound(error)
+      ? { outcome: 'swept', deleted: 0 }
+      : { outcome: 'skipped', reason: 'logs_dir_unavailable', deleted: 0 };
+  }
+
+  const crashRetention = await resolveCrashRetention(params.logsDir, names, resolveCrashedSessionLogKeepCount(env));
+  if (crashRetention.kind === 'unavailable') {
+    return { outcome: 'skipped', reason: 'crash_evidence_unavailable', deleted: 0 };
+  }
+
+  const protectedPaths = new Set((params.protectedPaths ?? []).map((path) => resolve(path)));
+  const newest = selectNewestSessionLogNames(names, resolveSessionLogKeepCount(env));
+  const minAgeMs = resolveSessionLogMinAgeMs(env);
+  const nowMs = Date.now();
+
+  let deleted = 0;
+  for (const name of names) {
+    const path = join(params.logsDir, name);
+    if (protectedPaths.has(resolve(path))) continue;
+    if (newest.has(name) || crashRetention.keptNames.has(name)) continue;
+    if (!isWriterKnownDead(name)) continue;
+    const mtimeMs = await readMtimeMs(path);
+    if (mtimeMs === null || !isOlderThanMinimumAge(mtimeMs, nowMs, minAgeMs)) continue;
+    try {
+      await rm(path);
+      deleted += 1;
+    } catch {
+      // Best effort: a file that cannot be removed stays for the next sweep.
+    }
+  }
+  return { outcome: 'swept', deleted };
+}

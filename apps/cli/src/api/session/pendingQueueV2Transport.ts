@@ -70,6 +70,7 @@ export type PendingQueueMaterializeDeferredReason =
 export type PendingQueueMaterializationTransportClassification =
     | 'server_rejected'
     | 'server_retryable'
+    | 'publisher_lost'
     | 'socket_disconnected'
     | 'ack_timeout'
     | 'malformed_ack'
@@ -78,6 +79,7 @@ export type PendingQueueMaterializationTransportClassification =
 export type PendingQueueMaterializationTransportErrorCode =
     | 'pending_queue_materialization_server_rejected'
     | 'pending_queue_materialization_server_retryable'
+    | 'pending_queue_materialization_publisher_lost'
     | 'pending_queue_materialization_socket_disconnected'
     | 'pending_queue_materialization_ack_timeout'
     | 'pending_queue_materialization_ack_malformed'
@@ -86,6 +88,7 @@ export type PendingQueueMaterializationTransportErrorCode =
 const PENDING_QUEUE_MATERIALIZATION_TRANSPORT_ERROR_CODES = {
     server_rejected: 'pending_queue_materialization_server_rejected',
     server_retryable: 'pending_queue_materialization_server_retryable',
+    publisher_lost: 'pending_queue_materialization_publisher_lost',
     socket_disconnected: 'pending_queue_materialization_socket_disconnected',
     ack_timeout: 'pending_queue_materialization_ack_timeout',
     malformed_ack: 'pending_queue_materialization_ack_malformed',
@@ -1093,11 +1096,17 @@ async function tryMaterializeNextViaSocket(params: {
                 const retryAfterMs = serverError === 'transaction-unavailable'
                     ? readPendingMaterializeRetryAfterMs(rawAck)
                     : undefined;
+                // With delivery-state opt-in present, the session socket's `forbidden` comes only from
+                // the server's session binding or publisher fence: this connection no longer
+                // publishes the session, and retrying on it cannot succeed.
+                const isPublisherLost = serverError === 'forbidden' && params.deliveryStateOptIn === true;
                 return {
                     ok: false,
                     error: new PendingQueueMaterializationTransportAmbiguousError(
                         new Error(`Pending queue materialize server acknowledgement: ${serverError}`),
-                        retryAfterMs === undefined ? 'server_rejected' : 'server_retryable',
+                        retryAfterMs !== undefined
+                            ? 'server_retryable'
+                            : isPublisherLost ? 'publisher_lost' : 'server_rejected',
                         serverError,
                         retryAfterMs,
                     ),

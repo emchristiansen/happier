@@ -32,6 +32,7 @@ export type DrainPendingStoppedReason =
   | 'materialization_blocked'
   | 'max_pop_per_wake'
   | 'no_pending'
+  | 'publisher_lost'
   | 'retry_exhausted';
 
 export type DrainPendingOptions = {

@@ -1,10 +1,34 @@
 import { z } from 'zod';
 
-export const PendingQueueWakeUnavailableV1Schema = z.object({
+/**
+ * The runtime incarnation of the runner process that answered: its machine, its pid, and the
+ * process-instance fingerprint `readProcessInstanceFingerprintSync` reads for that pid. A daemon
+ * acts destructively on a report only when this equals the exact local process it would stop.
+ */
+export const PendingQueueWakeRunnerIncarnationV1Schema = z.object({
+  machineId: z.string().min(1).max(512),
+  pid: z.number().int().positive(),
+  processInstanceFingerprint: z.string().min(1).max(512),
+}).strict();
+
+const pendingQueueWakeUnavailableV1Shape = {
   ok: z.literal(false),
   error: z.literal('pending_materialization_wake_unavailable'),
-  errorCode: z.enum(['runtime_upgrade_required', 'runtime_terminating']),
-}).strict();
+} as const;
+
+export const PendingQueueWakeUnavailableV1Schema = z.union([
+  z.object({
+    ...pendingQueueWakeUnavailableV1Shape,
+    errorCode: z.enum(['runtime_upgrade_required', 'runtime_terminating', 'publisher_recovering']),
+  }).strict(),
+  // Terminal publisher loss names its reporting incarnation. It is optional on the wire because a
+  // runner that cannot identify itself still reports the loss; such a report authorizes nothing.
+  z.object({
+    ...pendingQueueWakeUnavailableV1Shape,
+    errorCode: z.literal('publisher_lost'),
+    respondent: PendingQueueWakeRunnerIncarnationV1Schema.optional(),
+  }).strict(),
+]);
 
 export const SessionPendingQueueLegacyMaterializeDeferredResponseV0Schema = z.object({
   ok: z.literal(true),
@@ -39,6 +63,7 @@ export const SessionPendingQueueWakeResponseV1Schema = z.union([
   PendingQueueWakeUnavailableV1Schema,
 ]);
 
+export type PendingQueueWakeRunnerIncarnationV1 = z.infer<typeof PendingQueueWakeRunnerIncarnationV1Schema>;
 export type SessionPendingQueueLegacyMaterializeDeferredResponseV0 = z.infer<
   typeof SessionPendingQueueLegacyMaterializeDeferredResponseV0Schema
 >;
