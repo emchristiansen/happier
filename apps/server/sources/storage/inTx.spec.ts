@@ -216,4 +216,91 @@ describe("inTx", () => {
         expect(transaction).toHaveBeenCalledTimes(1);
         expect(delayMock).not.toHaveBeenCalled();
     });
+
+    describe("after-commit callbacks", () => {
+        // Node reports an unhandled rejection only after the microtask queue drains, so wait a full macrotask turn.
+        const settleUnhandledRejectionDetection = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+        async function captureUnhandledRejections(run: () => Promise<void>): Promise<unknown[]> {
+            const unhandled: unknown[] = [];
+            const onUnhandledRejection = (reason: unknown) => {
+                unhandled.push(reason);
+            };
+            process.on("unhandledRejection", onUnhandledRejection);
+            try {
+                await run();
+                await settleUnhandledRejectionDetection();
+            } finally {
+                process.off("unhandledRejection", onUnhandledRejection);
+            }
+            return unhandled;
+        }
+
+        it("ignores a synchronously throwing callback and still runs the later callbacks", async () => {
+            const { inTx, afterTx } = await import("./inTx");
+            const later = vi.fn();
+
+            const unhandled = await captureUnhandledRejections(async () => {
+                const result = await inTx(async (tx) => {
+                    afterTx(tx, () => {
+                        throw new Error("sync after-commit failure");
+                    });
+                    afterTx(tx, later);
+                    return 321;
+                });
+                expect(result).toBe(321);
+            });
+
+            expect(later).toHaveBeenCalledTimes(1);
+            expect(unhandled).toEqual([]);
+        });
+
+        it("handles a rejected async callback like a synchronous throw, without an unhandled rejection", async () => {
+            const { inTx, afterTx } = await import("./inTx");
+            const failure = new Error("async after-commit failure");
+            const later = vi.fn();
+
+            const unhandled = await captureUnhandledRejections(async () => {
+                const result = await inTx(async (tx) => {
+                    afterTx(tx, async () => {
+                        throw failure;
+                    });
+                    afterTx(tx, later);
+                    return 654;
+                });
+                expect(result).toBe(654);
+            });
+
+            expect(later).toHaveBeenCalledTimes(1);
+            expect(unhandled).toEqual([]);
+        });
+
+        it("returns the transaction result without waiting for an async callback to settle", async () => {
+            const { inTx, afterTx } = await import("./inTx");
+            let rejectCallback!: (error: unknown) => void;
+            const pending = new Promise<void>((_resolve, reject) => {
+                rejectCallback = reject;
+            });
+            const order: string[] = [];
+
+            const unhandled = await captureUnhandledRejections(async () => {
+                const result = await inTx(async (tx) => {
+                    afterTx(tx, () => {
+                        order.push("async callback started");
+                        return pending;
+                    });
+                    afterTx(tx, () => {
+                        order.push("next callback ran");
+                    });
+                    return 987;
+                });
+                order.push("inTx returned");
+                expect(result).toBe(987);
+                rejectCallback(new Error("late async after-commit failure"));
+            });
+
+            expect(order).toEqual(["async callback started", "next callback ran", "inTx returned"]);
+            expect(unhandled).toEqual([]);
+        });
+    });
 });

@@ -135,13 +135,29 @@ export function isTransactionAcquisitionUnavailableError(
     return error instanceof TransactionAcquisitionUnavailableError;
 }
 
-export function afterTx(tx: Tx, callback: () => void) {
+/**
+ * A callback scheduled by `afterTx`. It may be async: `inTx` starts it after commit but does not await it,
+ * and a returned promise that rejects is handled like a synchronous throw (see `ignoreAfterCommitCallbackFailure`).
+ */
+export type AfterTxCallback = () => void | Promise<void>;
+
+// The transactional result is already committed when after-commit callbacks run, so a callback failure is
+// ignored and never rethrown. Synchronous throws and rejected promises both end here.
+function ignoreAfterCommitCallbackFailure(_error: unknown): void {}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+    return (typeof value === "object" || typeof value === "function")
+        && value !== null
+        && typeof (value as { then?: unknown }).then === "function";
+}
+
+export function afterTx(tx: Tx, callback: AfterTxCallback) {
     // Golden rule:
     // - Do NOT emit socket updates inside a DB transaction.
     // - Instead, schedule them with afterTx so they only fire after commit.
     //
     // `afterTx` is only valid for transactions created via `inTx()`.
-    const callbacks = (tx as any)[symbol] as (() => void)[] | undefined;
+    const callbacks = (tx as any)[symbol] as AfterTxCallback[] | undefined;
     if (!callbacks) {
         throw new Error('afterTx(tx, ...) called outside inTx() transaction');
     }
@@ -177,7 +193,7 @@ export async function inTx<T>(fn: (tx: Tx) => Promise<T>, options: InTxOptions =
         transactionCallbackEntered = true;
         (tx as any)[symbol] = [];
         let result = await fn(tx);
-        let callbacks = (tx as any)[symbol] as (() => void)[];
+        let callbacks = (tx as any)[symbol] as AfterTxCallback[];
         return { result, callbacks };
     }
     while (true) {
@@ -203,9 +219,13 @@ export async function inTx<T>(fn: (tx: Tx) => Promise<T>, options: InTxOptions =
             let result = await db.$transaction(wrapped, txOpts);
             for (let callback of result.callbacks) {
                 try {
-                    callback();
-                } catch {
-                    // Ignore callback failures; transactional result is already committed.
+                    const returned = callback();
+                    if (isThenable(returned)) {
+                        // Not awaited, so after-commit callbacks keep their timing and order relative to the caller.
+                        void returned.then(undefined, ignoreAfterCommitCallbackFailure);
+                    }
+                } catch (error) {
+                    ignoreAfterCommitCallbackFailure(error);
                 }
             }
             return result.result;
