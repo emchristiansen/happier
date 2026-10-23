@@ -1,5 +1,31 @@
 # Pending delivery architecture
 
+## Exact Codex steering (development)
+
+An explicit pending-input action can steer the selected `localId` into the
+currently active Codex app-server turn. The runner captures that native turn
+before admitting the action and sends it as `expectedTurnId` at provider dispatch.
+If that turn ends, the input is refused before effect rather than redirected into
+a later turn. The action uses the existing Pending custody and delivery owners.
+
+The server advertises this operation separately as
+`capabilities.session.pendingInputExactLocalId: { protocolVersion: 1 }`.
+The strict `pendingInput` object keeps its existing shape, so older readers can
+ignore the optional sibling. A client requires both Pending-input support and
+the exact-local-ID capability. The exact materialization event selects only the
+requested eligible `steer_now_bound` row; an unavailable target never substitutes another
+urgent input, and another unresolved delivery claim still defers materialization.
+
+The control observes provider outcomes before sending the admission PATCH because
+a Pending wake can deliver the input before that HTTP acknowledgement returns.
+A durable admission acknowledgement alone does not prove provider delivery.
+`admitted_and_steered` requires observed acceptance on the captured turn;
+`admitted_delivery_unobserved` means admission is known but delivery was not
+observed. A lost or uncertain admission response retains the captured binding
+without claiming admission or replaying the provider input. Known rejection before
+effect remains distinct from that uncertainty. Session replacement and cleanup
+retain the existing publisher, generation and lifetime checks.
+
 ## Accepted settlement retry (development)
 
 Once a provider accepts a Pending input, the session client retains that exact

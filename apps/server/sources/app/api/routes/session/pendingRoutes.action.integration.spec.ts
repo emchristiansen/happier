@@ -58,8 +58,21 @@ describe("sessionPendingRoutes (requested action)", () => {
 
         expect(bodySchema.safeParse({
             requestedAction: { v: 1, kind: "send_now" },
+            exactLocalId: "l1",
             deliveryCommand: "resume_process_now",
         }).success).toBe(false);
+    });
+
+    it("[bound-lifetime] validates and echoes the full invocation action without accepting missing binding", async () => {
+        const route = await createActionRoute();
+        const entry = getRouteEntry(route.app, "PATCH", "/v2/sessions/:sessionId/pending/:localId/action");
+        const bodySchema = (entry.opts.schema as { body: { safeParse: (value: unknown) => { success: boolean } } }).body;
+        const requestedAction = { v: 1, kind: "steer_now_bound", bindingId: " B1 " };
+        expect(bodySchema.safeParse({ requestedAction }).success).toBe(true);
+        expect(bodySchema.safeParse({ requestedAction: { v: 1, kind: "steer_now_bound" } }).success).toBe(false);
+        updatePendingRequestedAction.mockResolvedValueOnce({ ok: true, didUpdate: true, pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 4, participantCursors: [], badgeAttentionChanged: false });
+        await expect(route.invoke({ userId: "actor", params: { sessionId: "s1", localId: " L " }, body: { requestedAction } }).then(({ response }) => response)).resolves.toMatchObject({ ok: true, requestedAction });
+        expect(updatePendingRequestedAction).toHaveBeenCalledWith({ actorUserId: "actor", sessionId: "s1", localId: " L ", requestedAction });
     });
 
     it("forwards the separate resume authorization command", async () => {

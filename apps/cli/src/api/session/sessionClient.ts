@@ -46,6 +46,7 @@ import {
     fetchSessionSystemRecordsPage as fetchSessionSystemRecordsPageHttp,
     upsertSessionSystemRecord as upsertSessionSystemRecordHttp,
 } from '@/session/transport/http/sessionSystemRecordsHttp';
+import { requestPendingQueueV2SteerNow } from './pendingQueueV2Transport';
 import { createExecutionRunBackend } from '@/agent/executionRuns/runtime/createExecutionRunBackend';
 import { CodexLikePermissionHandler } from '@/agent/permissions/CodexLikePermissionHandler';
 import { SessionPermissionRpcRouter } from '@/agent/permissions/sessionPermissionRpcRouter';
@@ -82,6 +83,7 @@ import {
 } from './mutations/runtimeActivitySnapshotSessionMutationPublisher';
 import {
     createSessionSyncPendingInputServerContractController,
+    supportsPendingExactLocalIdV1,
     supportsPendingInputV1,
     supportsRuntimeActivityV2,
     type SessionSyncPendingInputServerContractResult,
@@ -270,6 +272,8 @@ import {
     isAuthenticationError,
     isPermanentRequestError,
     readAuthenticationStatus,
+    readHttpStatus,
+    isPermanentRequestStatus,
 } from '@/api/client/httpStatusError';
 import { serializeAxiosErrorForLog } from '@/api/client/serializeAxiosErrorForLog';
 import {
@@ -298,6 +302,7 @@ import type {
     MaterializeNextPendingOptions,
     MaterializeNextPendingResult,
     PendingMaterializationDiagnosticPhase,
+    PendingInputSteerNowAdmission,
     SessionUserMessageDeliveryInfo,
 } from './sessionClientPort';
 import {
@@ -640,7 +645,10 @@ export class ApiSessionClient extends EventEmitter {
     private userSocket: Socket<ServerToClientEvents, ClientToServerEvents>;
     private pendingMessages: UserMessage[] = [];
     private readonly bufferedPendingMessageDeliveryInfoByLocalId = new Map<string, SessionUserMessageDeliveryInfo>();
-    private pendingMessageCallback: ((message: UserMessage, info?: SessionUserMessageDeliveryInfo) => unknown | Promise<unknown>) | null = null;
+    private pendingMessageRegistration: Readonly<{
+        ordinary: (message: UserMessage, info?: SessionUserMessageDeliveryInfo) => unknown | Promise<unknown>;
+        boundCodexSteer?: (message: UserMessage, delivery: import('./sessionClientPort').BoundCodexSteerDelivery) => unknown | Promise<unknown>;
+    }> | null = null;
     readonly rpcHandlerManager: RpcHandlerManager;
     private sessionPermissionRpcRouter: SessionPermissionRpcRouter | null = null;
     private executionRunPermissionHandler: CodexLikePermissionHandler | null = null;
@@ -694,6 +702,13 @@ export class ApiSessionClient extends EventEmitter {
     private readonly acceptedProviderInputLocalIds = new Set<string>();
     private providerInputOutcomeProducerGeneration = 0;
     private readonly providerInputTerminalOutcomeByLocalId = new Map<string, 'accepted' | 'rejected_before_effect'>();
+    private readonly providerInputAcceptedTurnIdByLocalId = new Map<string, string>();
+    private readonly providerInputRejectedReasonByLocalId = new Map<string, SessionProviderInputRejectedBeforeEffectReason>();
+    private readonly providerInputOutcomeWaiters = new Map<string, Set<(outcome: Readonly<{
+        kind: 'accepted' | 'rejected_before_effect';
+        providerTurnId?: string;
+        reason?: SessionProviderInputRejectedBeforeEffectReason;
+    }>) => void>>();
     private readonly providerInputUncertainLocalIds = new Set<string>();
     private readonly acceptedCanonicalPendingDeliveryResolutionWrites = new Set<Promise<void>>();
     private readonly acceptedCanonicalPendingDeliveryResolutionLocalIdsInFlight = new Set<string>();
@@ -1691,6 +1706,146 @@ export class ApiSessionClient extends EventEmitter {
         };
     }
 
+    private async waitForCanonicalPendingDeliveryBlockWrites(localId: string): Promise<void> {
+        let write = this.canonicalPendingDeliveryBlockWritesByLocalId.get(localId);
+        while (write) {
+            await write;
+            write = this.canonicalPendingDeliveryBlockWritesByLocalId.get(localId);
+        }
+    }
+
+    async requestPendingInputSteerNow(localId: string, bindingId: string): Promise<PendingInputSteerNowAdmission> {
+        const exactLocalId = readPendingLocalId(localId);
+        if (!exactLocalId) return { kind: 'not_admitted', reason: 'invalid_local_id' };
+        // A proven refusal is retryable only after its existing durable settlement has
+        // retired the old claim and terminal outcome. Never PATCH over retained custody.
+        if (this.canonicalPendingDeliveryBlockWritesByLocalId.has(exactLocalId)) {
+            try {
+                await this.waitForCanonicalPendingDeliveryBlockWrites(exactLocalId);
+            } catch {
+                return { kind: 'admission_uncertain' };
+            }
+        }
+        if (
+            this.canonicalPendingDeliveryByLocalId.has(exactLocalId)
+            || this.providerInputTerminalOutcomeByLocalId.has(exactLocalId)
+            || this.providerInputUncertainLocalIds.has(exactLocalId)
+        ) {
+            return { kind: 'not_admitted', reason: 'unsupported' };
+        }
+        const contract = this.sessionSyncPendingInputServerContract;
+        if (
+            !contract
+            ||
+            !supportsPendingInputV1(contract)
+            || !supportsPendingExactLocalIdV1(contract)
+            || contract?.sessionConnectionEpoch !== this.sessionConnectionEpoch
+            || contract.socket !== this.socket
+            || contract.socket.connected !== true
+            || this.closed
+            || this.runtimeTerminationStarted
+        ) {
+            return { kind: 'not_admitted', reason: 'unsupported' };
+        }
+        try {
+            await requestPendingQueueV2SteerNow({
+                token: this.token,
+                sessionId: this.sessionId,
+                localId: exactLocalId,
+                bindingId,
+            });
+        } catch (error) {
+            return isPermanentRequestStatus(readHttpStatus(error))
+                ? { kind: 'not_admitted', reason: 'server_rejected' }
+                : { kind: 'admission_uncertain' };
+        }
+        // This acknowledgement proves the durable action even if the publisher connection
+        // changed while HTTP was in flight. Materialization independently checks its authority.
+        return { kind: 'admitted' };
+    }
+
+    async waitForProviderInputTerminalOutcome(
+        localId: string,
+        timeoutMs = 10_000,
+        abortSignal?: AbortSignal,
+    ): Promise<Readonly<{
+        kind: 'accepted' | 'rejected_before_effect' | 'pending';
+        providerTurnId?: string;
+        reason?: SessionProviderInputRejectedBeforeEffectReason;
+    }>> {
+        const exactLocalId = readPendingLocalId(localId);
+        if (abortSignal?.aborted) return { kind: 'pending' };
+        if (!exactLocalId) return { kind: 'rejected_before_effect' };
+        // The caller installs this observer before its PATCH. Join an older refusal's
+        // settlement first so that observer cannot capture the previous attempt's result.
+        // With no preceding write, registration remains synchronous before the first await.
+        if (
+            this.providerInputTerminalOutcomeByLocalId.get(exactLocalId) === 'rejected_before_effect'
+            && this.canonicalPendingDeliveryBlockWritesByLocalId.has(exactLocalId)
+        ) {
+            try {
+                await this.waitForCanonicalPendingDeliveryBlockWrites(exactLocalId);
+            } catch {
+                return { kind: 'pending' };
+            }
+            if (abortSignal?.aborted) return { kind: 'pending' };
+        }
+        const current = this.providerInputTerminalOutcomeByLocalId.get(exactLocalId);
+        if (current === 'accepted') {
+            const providerTurnId = this.providerInputAcceptedTurnIdByLocalId.get(exactLocalId);
+            return { kind: 'accepted', ...(providerTurnId ? { providerTurnId } : {}) };
+        }
+        if (current === 'rejected_before_effect') {
+            const reason = this.providerInputRejectedReasonByLocalId.get(exactLocalId);
+            return { kind: current, ...(reason ? { reason } : {}) };
+        }
+        if (this.providerInputUncertainLocalIds.has(exactLocalId)) return { kind: 'pending' };
+        return await new Promise((resolve) => {
+            let settled = false;
+            const finish = (outcome: Readonly<{
+                kind: 'accepted' | 'rejected_before_effect' | 'pending';
+                providerTurnId?: string;
+                reason?: SessionProviderInputRejectedBeforeEffectReason;
+            }>) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                abortSignal?.removeEventListener('abort', onAbort);
+                const waiters = this.providerInputOutcomeWaiters.get(exactLocalId);
+                waiters?.delete(onOutcome);
+                if (waiters?.size === 0) this.providerInputOutcomeWaiters.delete(exactLocalId);
+                resolve(outcome);
+            };
+            const onOutcome = (outcome: Readonly<{
+                kind: 'accepted' | 'rejected_before_effect';
+                providerTurnId?: string;
+                reason?: SessionProviderInputRejectedBeforeEffectReason;
+            }>) => finish(outcome);
+            const onAbort = () => finish({ kind: 'pending' });
+            const timer = setTimeout(() => finish({ kind: 'pending' }), Math.max(1, timeoutMs));
+            timer.unref?.();
+            let waiters = this.providerInputOutcomeWaiters.get(exactLocalId);
+            if (!waiters) {
+                waiters = new Set();
+                this.providerInputOutcomeWaiters.set(exactLocalId, waiters);
+            }
+            waiters.add(onOutcome);
+            abortSignal?.addEventListener('abort', onAbort, { once: true });
+            if (abortSignal?.aborted) {
+                onAbort();
+                return;
+            }
+            const afterRegistration = this.providerInputTerminalOutcomeByLocalId.get(exactLocalId);
+            if (afterRegistration === 'accepted') {
+                const providerTurnId = this.providerInputAcceptedTurnIdByLocalId.get(exactLocalId);
+                finish({ kind: 'accepted', ...(providerTurnId ? { providerTurnId } : {}) });
+            } else if (afterRegistration) {
+                const reason = this.providerInputRejectedReasonByLocalId.get(exactLocalId);
+                finish({ kind: afterRegistration, ...(reason ? { reason } : {}) });
+            }
+        });
+    }
+
     setProviderOwnedUserMessageEchoClassifier(classifier: ProviderOwnedUserMessageEchoClassifier | null): void {
         this.providerOwnedUserMessageEchoClassifier = classifier;
     }
@@ -1743,6 +1898,8 @@ export class ApiSessionClient extends EventEmitter {
         if (this.canonicalPendingDeliveryByLocalId.delete(localId)) didClear = true;
         if (this.serverBlockedCanonicalPendingDeliveryLocalIds.delete(localId)) didClear = true;
         if (this.providerInputTerminalOutcomeByLocalId.delete(localId)) didClear = true;
+        if (this.providerInputAcceptedTurnIdByLocalId.delete(localId)) didClear = true;
+        if (this.providerInputRejectedReasonByLocalId.delete(localId)) didClear = true;
         if (this.providerInputUncertainLocalIds.delete(localId)) didClear = true;
         const hadMaterializedLocalId = this.hasMaterializedLocalId(localId);
         if (didClear || hadMaterializedLocalId) {
@@ -2614,7 +2771,7 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private shouldKeepUserSocketConnected(): boolean {
-        return this.pendingMessageCallback !== null
+        return this.pendingMessageRegistration !== null
             || this.pendingMaterializedLocalIds.size > 0
             || this.committedLocalIdsAwaitingEcho.size > 0
             || this.pendingQueueMaterializedLocalIds.size > 0
@@ -3761,6 +3918,26 @@ export class ApiSessionClient extends EventEmitter {
         const userMessage = this.readPendingQueueUserMessage(message);
         if (!userMessage) return false;
         const localId = readPendingLocalId(userMessage.localId);
+        if (message?.requestedAction?.kind === 'steer_now_bound') {
+            const registration = this.pendingMessageRegistration;
+            const boundHandler = registration?.boundCodexSteer;
+            if (!localId || message.providerAction !== 'steer' || !opts.providerAcceptancePending || !boundHandler) {
+                if (localId) await this.blockPendingQueueDeliveryLocalId(localId, 'unsupported_action', { canonicalOnly: true });
+                // Handled as refusal; never enter the ordinary callback or its buffer.
+                return true;
+            }
+            await boundHandler(userMessage, {
+                localId,
+                requestedAction: message.requestedAction,
+                providerAction: 'steer',
+                providerAcceptancePending: true,
+                seq: message.seq,
+                isCurrentRegistration: () => this.pendingMessageRegistration === registration
+                    && !this.closed && !this.runtimeTerminationStarted
+                    && this.canonicalPendingDeliveryByLocalId.get(localId)?.requestedAction === message.requestedAction,
+            });
+            return true;
+        }
         if (localId) {
             if (this.hasAgentQueueDeliveredLocalId(localId)) {
                 return true;
@@ -3768,8 +3945,8 @@ export class ApiSessionClient extends EventEmitter {
             this.markAgentQueueEchoSuppressedLocalId(localId);
             this.markAgentQueueDeliveredLocalId(localId);
         }
-        if (this.pendingMessageCallback) {
-            await this.pendingMessageCallback(userMessage, {
+        if (this.pendingMessageRegistration) {
+            await this.pendingMessageRegistration.ordinary(userMessage, {
                 seq: typeof message?.seq === 'number' && Number.isFinite(message.seq) ? message.seq : null,
                 ...(opts.providerAcceptancePending ? { providerAcceptancePending: true } : {}),
                 ...(message?.providerAction ? { pendingProviderAction: message.providerAction } : {}),
@@ -3787,14 +3964,17 @@ export class ApiSessionClient extends EventEmitter {
         return true;
     }
 
-    onUserMessage(callback: (data: UserMessage, info?: SessionUserMessageDeliveryInfo) => unknown | Promise<unknown>) {
+    onUserMessage(
+        callback: (data: UserMessage, info?: SessionUserMessageDeliveryInfo) => unknown | Promise<unknown>,
+        opts?: Readonly<{ onBoundCodexSteer: (message: UserMessage, delivery: import('./sessionClientPort').BoundCodexSteerDelivery) => unknown | Promise<unknown> }>,
+    ) {
         logger.debug('[API] onUserMessage callback attached', {
             sessionId: this.sessionId,
             startedByDaemonProcess: this.startedByDaemonProcess,
             metadataStartedBy: this.metadata?.startedBy ?? null,
             metadataStartedFromDaemon: this.metadata?.startedFromDaemon ?? null,
         });
-        this.pendingMessageCallback = callback;
+        this.pendingMessageRegistration = { ordinary: callback, ...(opts ? { boundCodexSteer: opts.onBoundCodexSteer } : {}) };
         if (this.userSocketDisconnectTimer) {
             clearTimeout(this.userSocketDisconnectTimer);
             this.userSocketDisconnectTimer = null;
@@ -5888,6 +6068,8 @@ export class ApiSessionClient extends EventEmitter {
         for (const trackedLocalId of this.providerInputTerminalOutcomeByLocalId.keys()) {
             if (!this.canonicalPendingDeliveryByLocalId.has(trackedLocalId)) {
                 this.providerInputTerminalOutcomeByLocalId.delete(trackedLocalId);
+                this.providerInputAcceptedTurnIdByLocalId.delete(trackedLocalId);
+                this.providerInputRejectedReasonByLocalId.delete(trackedLocalId);
             }
         }
         for (const trackedLocalId of this.providerInputUncertainLocalIds) {
@@ -5980,6 +6162,21 @@ export class ApiSessionClient extends EventEmitter {
         }
         this.providerInputUncertainLocalIds.delete(localId);
         this.providerInputTerminalOutcomeByLocalId.set(localId, terminalOutcome);
+        if (outcome.kind === 'accepted') {
+            const providerTurnId = readNonBlankOpaqueIdentifier(outcome.providerTurnId);
+            if (providerTurnId) this.providerInputAcceptedTurnIdByLocalId.set(localId, providerTurnId);
+        } else {
+            this.providerInputRejectedReasonByLocalId.set(localId, outcome.reason);
+        }
+        for (const notify of [...(this.providerInputOutcomeWaiters.get(localId) ?? [])]) {
+            notify({
+                kind: terminalOutcome,
+                ...(outcome.kind === 'accepted' && readNonBlankOpaqueIdentifier(outcome.providerTurnId)
+                    ? { providerTurnId: readNonBlankOpaqueIdentifier(outcome.providerTurnId)! }
+                    : {}),
+                ...(outcome.kind === 'rejected_before_effect' ? { reason: outcome.reason } : {}),
+            });
+        }
 
         if (terminalOutcome === 'accepted') {
             // Exact provider acceptance supersedes any earlier ambiguity/pre-effect block write
@@ -6367,6 +6564,8 @@ export class ApiSessionClient extends EventEmitter {
         this.explicitUserRecoveryDecisionsByLocalId.clear();
         this.acceptedProviderInputLocalIds.clear();
         this.providerInputTerminalOutcomeByLocalId.clear();
+        this.providerInputAcceptedTurnIdByLocalId.clear();
+        this.providerInputRejectedReasonByLocalId.clear();
         this.providerInputUncertainLocalIds.clear();
         this.acceptedCanonicalPendingDeliveryResolutionWrites.clear();
         this.acceptedCanonicalPendingDeliveryResolutionLocalIdsInFlight.clear();
@@ -6671,6 +6870,7 @@ export class ApiSessionClient extends EventEmitter {
      * and resolved into the transcript only when the provider proves custody.
      */
     private async runMaterializeNextPendingMessageInner(opts: {
+        requestedLocalId?: string;
         expectedPendingVersion?: number;
         expectedRuntimeActivityRevision?: number;
         pendingQueueDeliveryTiming?: SessionPendingQueueDeliveryTiming;
@@ -6728,6 +6928,9 @@ export class ApiSessionClient extends EventEmitter {
             // claim on this one, so neither a wake nor a timer may retry it.
             return { didMaterialize: false, result: { type: 'publisher_lost' } };
         }
+        if (opts.requestedLocalId && !supportsPendingExactLocalIdV1(serverContract)) {
+            return { didMaterialize: false, result: { type: 'retryable_transport' } };
+        }
         let materializeResult: PendingQueueMaterializeNextResult;
         reportPendingMaterializationDiagnosticPhase(opts.onDiagnosticPhase, 'materialize.server_claim');
         if (serverContract.pendingInput === 'released_server_v0_2_1') {
@@ -6769,6 +6972,7 @@ export class ApiSessionClient extends EventEmitter {
                     request: async () => materializeNextPendingQueueV2Message({
                         token: this.token,
                         sessionId: this.sessionId,
+                        requestedLocalId: opts.requestedLocalId,
                         socket: this.socket,
                         expectedPendingVersion: opts.expectedPendingVersion,
                         expectedRuntimeActivityRevision: opts.expectedRuntimeActivityRevision,
@@ -7176,6 +7380,7 @@ export class ApiSessionClient extends EventEmitter {
         opts.expectedPendingVersion ??= this.pendingQueueState.pendingVersion;
 
         const inner = await this.runMaterializeNextPendingMessageInner({
+            requestedLocalId: opts.requestedLocalId,
             expectedPendingVersion: opts.expectedPendingVersion,
             expectedRuntimeActivityRevision: opts.expectedRuntimeActivityRevision,
             pendingQueueDeliveryTiming: opts.pendingQueueDeliveryTiming,

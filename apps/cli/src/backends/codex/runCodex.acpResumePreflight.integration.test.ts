@@ -105,7 +105,8 @@ function resolvePromptLocalIds(options?: Readonly<{
 }
 
 const createCodexAppServerRuntimeSpy = vi.fn<(...args: any[]) => any>((..._args) => createDefaultCodexAppServerRuntimeMock());
-vi.mock('./appServer/runtime', () => ({
+vi.mock('./appServer/runtime', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./appServer/runtime')>(),
   createCodexAppServerRuntime: (...args: any[]) => createCodexAppServerRuntimeSpy(...args),
 }));
 
@@ -152,6 +153,7 @@ const createSessionProviderInputConsumerSpy = vi.fn((opts: any) => {
     setPendingMaterializationRetryEpisodeExhaustedHandler: vi.fn(),
     runProviderInputDispatch: async ({ dispatch }: any) => ({ status: 'dispatched', value: await dispatch() }),
     closeProviderInputAdmissionAndWaitForDispatches: vi.fn(async () => undefined),
+    pumpPendingWhileActive: async () => {},
     drainPending: (...args: any[]) => inputConsumerDrainPendingSpy(...args),
   };
 });
@@ -471,6 +473,113 @@ function mockAttachedSessionMetadata(metadata: Record<string, unknown>): void {
 }
 
 describe('runCodex CodexACP resume behavior', () => {
+  it('[abort-bound-lifetime] fences native steering during permission flush and admits a later generation', async () => {
+    resolveRunnerMcpServersSpy.mockResolvedValueOnce({ happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() }, mcpServers: {} });
+    const preparationStarted = createDeferred<void>();
+    const preparation = createDeferred<void>();
+    const flushStarted = createDeferred<void>();
+    const flush = createDeferred<void>();
+    const loopStarted = createDeferred<void>();
+    const stopLoop = createDeferred<void>();
+    let boundHandler: Parameters<import('@/api/session/sessionClient').ApiSessionClient['onUserMessage']>[1];
+    let control: import('@/rpc/handlers/sessionControls').SessionRuntimeControls['interruptPendingInputAndRun'];
+    let selectedBindingId = '';
+    let prepareReads = 0;
+    let holdPermissionFlush = false;
+    initializeBackendRunSessionSpy.mockImplementationOnce(async (opts: any) => {
+      const initialized = await initializeDefaultBackendRunSession(opts);
+      const session = initialized.session;
+      session.onUserMessage = (_ordinary: unknown, handlers: typeof boundHandler) => { boundHandler = handlers; };
+      session.registerSessionRuntimeControls = (controls: import('@/rpc/handlers/sessionControls').SessionRuntimeControls) => {
+        control = controls.interruptPendingInputAndRun; return () => {};
+      };
+      session.requestPendingInputSteerNow = async (_localId: string, bindingId: string) => { selectedBindingId = bindingId; return { kind: 'admitted' }; };
+      session.waitForProviderInputTerminalOutcome = async () => ({ kind: 'pending' });
+      session.getMetadataSnapshot = () => ({ flavor: 'codex', codexSessionId: 'thread-original', codexBackendMode: 'appServer' });
+      session.refreshSessionSnapshotFromServerBestEffort = async () => {
+        if (++prepareReads === 1) { preparationStarted.resolve(); await preparation.promise; }
+      };
+      // Real BasePermissionHandler always awaits this external session flush, even with no permissions pending.
+      session.flush = async () => { if (holdPermissionFlush) { flushStarted.resolve(); await flush.promise; } };
+      return initialized;
+    });
+    const permission = await vi.importActual<typeof import('./utils/createCodexPermissionHandler')>('./utils/createCodexPermissionHandler');
+    vi.mocked(createCodexPermissionHandler).mockImplementationOnce(permission.createCodexPermissionHandler);
+    const actual = await vi.importActual<typeof import('./appServer/runtime')>('./appServer/runtime');
+    const clientModule = await import('./appServer/client/createCodexAppServerClient');
+    const notifications = new Map<string, (params: unknown) => void | Promise<void>>();
+    let turnCount = 0;
+    let nativeTurn = '';
+    const nativeRequest = vi.fn(async (method: string) => {
+      if (method === 'thread/resume' || method === 'thread/start') return { thread: { id: 'thread-original', turns: [] } };
+      if (method === 'collaborationMode/list' || method === 'model/list') return { data: [] };
+      if (method === 'thread/goal/get') return { goal: null };
+      if (method === 'turn/start') { nativeTurn = `T${++turnCount}`; return { turn: { id: nativeTurn } }; }
+      if (method === 'turn/steer') return {};
+      if (method === 'turn/interrupt') {
+        await notifications.get('turn/completed')?.({ threadId: 'thread-original', turn: { id: nativeTurn, status: 'interrupted' } });
+        return {};
+      }
+      throw new Error(`Unconfigured synthetic provider request: ${method}`);
+    });
+    const spawnBoundary = vi.spyOn(clientModule, 'createCodexAppServerClient').mockResolvedValue({
+      request: nativeRequest, notify: async () => {}, dispose: async () => {}, onExit: () => () => {},
+      registerRequestHandler: () => () => {},
+      registerNotificationHandler: (method, handler) => { notifications.set(method, handler); return () => { notifications.delete(method); }; },
+    });
+    let runtime: ReturnType<typeof actual.createCodexAppServerRuntime> | undefined;
+    createCodexAppServerRuntimeSpy.mockImplementationOnce((params) => {
+      runtime = actual.createCodexAppServerRuntime({ ...params, processEnv: {} });
+      return runtime;
+    });
+    sessionInputConsumerWaitForNextInputImpl = async () => { loopStarted.resolve(); await stopLoop.promise; return null; };
+    inputConsumerDrainPendingSpy.mockImplementation(async (options) => {
+      const localId = options.requestedLocalId;
+      if (typeof localId !== 'string') return { materialized: 0, stoppedReason: 'no_pending' };
+      if (!boundHandler) throw new Error('Bound delivery was not installed');
+      await boundHandler.onBoundCodexSteer({ role: 'user', content: { type: 'text', text: 'bound input' }, localId }, {
+        localId, requestedAction: { v: 1, kind: 'steer_now_bound', bindingId: selectedBindingId },
+        providerAction: 'steer', providerAcceptancePending: true, seq: null, isCurrentRegistration: () => true,
+      });
+      return { materialized: 1, stoppedReason: 'max_pop_per_wake' };
+    });
+    const { runCodex } = await import('./runCodex');
+    const run = runCodex({ credentials: { token: 'test' } as Credentials, startedBy: 'daemon',
+      startingMode: 'remote', existingSessionId: 'existing-123', codexBackendMode: 'appServer',
+      permissionMode: 'default', permissionModeUpdatedAt: 1 });
+    let active: Promise<void> | undefined;
+    try {
+      await Promise.race([loopStarted.promise, run.then(() => { throw new Error('Run ended before the input loop'); })]);
+      if (!runtime || !control) throw new Error('Real native runtime/control was not installed');
+      active = runtime.sendPrompt('original native turn');
+      await Promise.race([vi.waitFor(() => expect(runtime?.canSteerPrompt()).toBe(true)), active.then(() => { throw new Error('Native turn ended before steerable admission'); })]);
+      const delivery = Promise.resolve(control({ sessionId: 'sess_1', localId: 'L1' }));
+      await Promise.race([preparationStarted.promise, delivery.then(() => { throw new Error('Delivery ended before prompt preparation'); })]);
+      const abort = registerSessionRpcHandlerMock.mock.calls.find((call) => call[0] === 'abort')?.[1];
+      if (typeof abort !== 'function') throw new Error('Abort RPC missing');
+      holdPermissionFlush = true;
+      const aborting = abort();
+      await Promise.race([flushStarted.promise, Promise.resolve(aborting).then(() => { throw new Error('Abort ended before permission flush'); })]);
+      preparation.resolve();
+      await delivery;
+      expect(nativeRequest.mock.calls.filter(([method]) => method === 'turn/steer')).toEqual([]);
+      expect(providerInputOutcomeObserverMock).toHaveBeenCalledWith({ kind: 'rejected_before_effect', localId: 'L1', reason: 'steering_unavailable' });
+      flush.resolve(); await aborting; await active;
+      holdPermissionFlush = false;
+      active = runtime.sendPrompt('legitimate next native turn');
+      await Promise.race([vi.waitFor(() => expect(runtime?.canSteerPrompt()).toBe(true)), active.then(() => { throw new Error('Next native turn ended before steerable admission'); })]);
+      await control({ sessionId: 'sess_1', localId: 'L2' });
+      expect(nativeRequest.mock.calls.filter(([method]) => method === 'turn/steer')).toHaveLength(1);
+    } finally {
+      preparation.resolve(); flush.resolve(); holdPermissionFlush = false;
+      await notifications.get('turn/completed')?.({ threadId: 'thread-original', turn: { id: nativeTurn, status: 'completed' } });
+      await active?.catch(() => {});
+      stopLoop.resolve(); await run;
+      inputConsumerDrainPendingSpy.mockImplementation(async () => ({ materialized: 0, stoppedReason: 'no_pending' }));
+      spawnBoundary.mockRestore();
+    }
+  });
+
   beforeEach(async () => {
     providerInputOutcomeObserverMock.mockReset();
     probeCodexAcpLoadSessionSupportSpy.mockReset();
@@ -3407,11 +3516,12 @@ describe('runCodex CodexACP resume behavior', () => {
       userMessageSeq: null,
     });
     expect(sendPrompt).not.toHaveBeenCalled();
-    expect(lastSessionClient?.blockPendingMessageDelivery).toHaveBeenCalledWith({
-      localIds: ['local-stale-steer'],
+    expect(providerInputOutcomeObserverMock).toHaveBeenCalledWith({
+      kind: 'rejected_before_effect',
+      localId: 'local-stale-steer',
       reason: 'steering_unavailable',
-      providerEffect: 'none',
     });
+    expect(lastSessionClient?.blockPendingMessageDelivery).not.toHaveBeenCalled();
     const emittedMessages = (lastSessionClient?.sendSessionEvent as ReturnType<typeof vi.fn> | undefined)?.mock.calls
       .map((call) => call[0]?.message)
       .filter((message): message is string => typeof message === 'string') ?? [];

@@ -75,12 +75,14 @@ function buildMaterializeOptions(
   activeTurnSteerability: PendingForegroundSteerability | undefined,
   pendingQueueDeliveryTiming: PendingQueueDeliveryTiming | undefined,
   expectedRuntimeActivityRevision?: number,
+  requestedLocalId?: string,
 ): MaterializeNextPendingOptions {
   return {
     reconcileWhenEmpty,
     ...(activeTurnSteerability ? { activeTurnSteerability } : {}),
     ...(pendingQueueDeliveryTiming ? { pendingQueueDeliveryTiming } : {}),
     ...(expectedRuntimeActivityRevision !== undefined ? { expectedRuntimeActivityRevision } : {}),
+    ...(requestedLocalId ? { requestedLocalId } : {}),
   };
 }
 
@@ -803,6 +805,8 @@ async function materializeNextPendingForDrain(
         reconcileWhenEmpty,
         activeTurnSteerability,
         pendingQueueDeliveryTiming,
+        undefined,
+        opts.requestedLocalId,
       ),
       opts.abortSignal ?? new AbortController().signal,
     );

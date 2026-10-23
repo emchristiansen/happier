@@ -64,7 +64,8 @@ export type PendingQueueMaterializeDeferredReason =
     | 'runtime_activity_unknown'
     | 'pending_version_mismatch'
     | 'waiting_for_predecessor'
-    | 'waiting_for_foreground_turn';
+    | 'waiting_for_foreground_turn'
+    | 'requested_local_id_unavailable';
 
 export type PendingQueueMaterializationTransportClassification =
     | 'server_rejected'
@@ -177,6 +178,7 @@ export type ReleasedServerV021MaterializeAck =
 
 type PendingMaterializePayload = Readonly<{
     sid: string;
+    requestedLocalId?: string;
     pendingVersion?: number;
     expectedPendingVersion?: number;
     expectedRuntimeActivityRevision?: number;
@@ -318,6 +320,9 @@ function readPendingMaterializePayload(payload: unknown): PendingMaterializePayl
     const expectedRuntimeActivityRevision = record.expectedRuntimeActivityRevision;
     return {
         sid: record.sid,
+        ...(record.requestedLocalId === undefined
+            ? {}
+            : { requestedLocalId: requirePendingLocalId(record.requestedLocalId) }),
         ...(typeof pendingVersion === 'number' && Number.isSafeInteger(pendingVersion) && pendingVersion >= 0
             ? { pendingVersion }
             : {}),
@@ -349,6 +354,7 @@ function readPendingMaterializeDeferredReason(value: unknown): PendingQueueMater
         || reason === 'pending_version_mismatch'
         || reason === 'waiting_for_predecessor'
         || reason === 'waiting_for_foreground_turn'
+        || reason === 'requested_local_id_unavailable'
         ? reason
         : undefined;
 }
@@ -553,6 +559,7 @@ async function fetchPendingQueueV2Projection(params: {
 }
 
 function buildPendingMaterializeBody(params: {
+    requestedLocalId?: string;
     expectedPendingVersion?: number;
     expectedRuntimeActivityRevision?: number;
     deliveryStateOptIn?: boolean;
@@ -560,6 +567,7 @@ function buildPendingMaterializeBody(params: {
     foregroundState?: 'ready' | 'active_steerable' | 'active_unsteerable';
 }): Record<string, unknown> {
     return {
+        ...(params.requestedLocalId ? { requestedLocalId: requirePendingLocalId(params.requestedLocalId) } : {}),
         ...(typeof params.expectedPendingVersion === 'number'
             ? { expectedPendingVersion: params.expectedPendingVersion }
             : {}),
@@ -578,8 +586,15 @@ function createPendingMaterializeAckSocket(socket: Socket<ServerToClientEvents, 
     const build = (target: Socket<ServerToClientEvents, ClientToServerEvents>): PendingMaterializeAckSocket => ({
         connected: target.connected,
         emitWithAck: async (event, payload) => {
-            if (event !== 'pending-materialize-next') {
+            if (event !== 'pending-materialize-next' && event !== 'pending-materialize-exact-v1') {
                 throw new Error(`Unexpected pending queue socket ACK event: ${event}`);
+            }
+            if (event === 'pending-materialize-exact-v1') {
+                const parsed = readPendingMaterializePayload(payload);
+                if (typeof parsed.requestedLocalId !== 'string') {
+                    throw new Error('Exact pending materialize requires requestedLocalId');
+                }
+                return await target.emitWithAck('pending-materialize-exact-v1', parsed as never);
             }
             return await target.emitWithAck('pending-materialize-next', readPendingMaterializePayload(payload));
         },
@@ -1036,6 +1051,7 @@ async function postPendingQueueV2DeliveryAction(params: {
 async function tryMaterializeNextViaSocket(params: {
     socket: Socket<ServerToClientEvents, ClientToServerEvents>;
     sessionId: string;
+    requestedLocalId?: string;
     expectedPendingVersion?: number;
     expectedRuntimeActivityRevision?: number;
     knownPendingVersion?: number;
@@ -1046,9 +1062,10 @@ async function tryMaterializeNextViaSocket(params: {
     try {
         const rawAck = await emitSocketWithAck<Record<string, unknown>>({
             socket: createPendingMaterializeAckSocket(params.socket),
-            event: 'pending-materialize-next',
+            event: params.requestedLocalId ? 'pending-materialize-exact-v1' : 'pending-materialize-next',
             payload: {
                 sid: params.sessionId,
+                ...(params.requestedLocalId ? { requestedLocalId: requirePendingLocalId(params.requestedLocalId) } : {}),
                 ...(typeof params.expectedPendingVersion === 'number'
                     ? { expectedPendingVersion: params.expectedPendingVersion }
                     : typeof params.knownPendingVersion === 'number'
@@ -1148,6 +1165,7 @@ async function tryMaterializeNextViaSocket(params: {
 async function tryMaterializeNextViaHttp(params: {
     token: string;
     sessionId: string;
+    requestedLocalId?: string;
     expectedPendingVersion?: number;
     expectedRuntimeActivityRevision?: number;
     deliveryStateOptIn?: boolean;
@@ -1211,6 +1229,7 @@ async function tryMaterializeNextViaHttp(params: {
 export async function materializeNextPendingQueueV2MessageViaHttp(params: {
     token: string;
     sessionId: string;
+    requestedLocalId?: string;
     expectedPendingVersion?: number;
     expectedRuntimeActivityRevision?: number;
     deliveryStateOptIn?: boolean;
@@ -1266,6 +1285,7 @@ export async function materializeNextPendingQueueV2Message(params: {
     token: string;
     sessionId: string;
     socket?: Socket<ServerToClientEvents, ClientToServerEvents> | null;
+    requestedLocalId?: string;
     expectedPendingVersion?: number;
     expectedRuntimeActivityRevision?: number;
     knownPendingVersion?: number;
@@ -1273,6 +1293,9 @@ export async function materializeNextPendingQueueV2Message(params: {
     deliveryTiming?: SessionPendingQueueDeliveryTiming;
     foregroundState?: 'ready' | 'active_steerable' | 'active_unsteerable';
 }): Promise<PendingQueueMaterializeNextResult> {
+    const requestedLocalId = params.requestedLocalId === undefined
+        ? undefined
+        : requirePendingLocalId(params.requestedLocalId);
     // Strict by default: callers that want best-effort suppression must do so explicitly.
     if (params.socket && params.socket.connected !== true) {
         throw new PendingQueueMaterializationTransportAmbiguousError(
@@ -1281,10 +1304,17 @@ export async function materializeNextPendingQueueV2Message(params: {
         );
     }
     const connectedSocket = params.socket?.connected === true ? params.socket : null;
+    if (requestedLocalId && !connectedSocket) {
+        throw new PendingQueueMaterializationTransportAmbiguousError(
+            new Error('Exact pending queue materialization requires the negotiated publisher socket'),
+            'socket_disconnected',
+        );
+    }
     const socketRes = connectedSocket
         ? await tryMaterializeNextViaSocket({
             socket: connectedSocket,
             sessionId: params.sessionId,
+            requestedLocalId: params.requestedLocalId,
             expectedPendingVersion: params.expectedPendingVersion,
             expectedRuntimeActivityRevision: params.expectedRuntimeActivityRevision,
             knownPendingVersion: params.knownPendingVersion,
@@ -1304,12 +1334,19 @@ export async function materializeNextPendingQueueV2Message(params: {
         res = await tryMaterializeNextViaHttp({
             token: params.token,
             sessionId: params.sessionId,
+            requestedLocalId: params.requestedLocalId,
             expectedPendingVersion: params.expectedPendingVersion,
             expectedRuntimeActivityRevision: params.expectedRuntimeActivityRevision,
             deliveryStateOptIn: params.deliveryStateOptIn === true,
             deliveryTiming: params.deliveryTiming,
             foregroundState: params.foregroundState,
         });
+    }
+    if (requestedLocalId && res.didMaterialize && res.localId !== requestedLocalId) {
+        throw new PendingQueueMaterializationTransportAmbiguousError(
+            new Error('Exact pending queue materialization returned a different localId'),
+            'malformed_ack',
+        );
     }
     if (!res.didMaterialize) {
         return {
@@ -1331,4 +1368,37 @@ export async function materializeNextPendingQueueV2Message(params: {
         ...(res.pendingQueueState ? { pendingQueueState: res.pendingQueueState } : {}),
         ...(res.runtimeActivityNotice ? { runtimeActivityNotice: res.runtimeActivityNotice } : {}),
     };
+}
+
+export async function requestPendingQueueV2SteerNow(params: {
+    token: string;
+    sessionId: string;
+    localId: string;
+    bindingId: string;
+}): Promise<Readonly<{ didUpdate: boolean }>> {
+    const localId = requirePendingLocalId(params.localId);
+    const requestedAction = PendingRequestedActionV1Schema.parse({ v: 1, kind: 'steer_now_bound', bindingId: params.bindingId });
+    const serverUrl = resolveServerHttpBaseUrl();
+    const response = await axios.patch(
+        `${serverUrl}/v2/sessions/${encodeURIComponent(params.sessionId)}/pending/${encodeURIComponent(localId)}/action`,
+        { requestedAction },
+        {
+            headers: buildSessionRunnerHttpHeaders(params.token, 'application/json'),
+            timeout: 10_000,
+        },
+    );
+    const data = response?.data;
+    if (!data || typeof data !== 'object' || (data as Record<string, unknown>).ok !== true) {
+        throw new Error('Invalid pending queue steer-now response');
+    }
+    const record = data as Record<string, unknown>;
+    if (
+        record.requestedAction === undefined
+        || PendingRequestedActionV1Schema.safeParse(record.requestedAction).success !== true
+        || JSON.stringify(PendingRequestedActionV1Schema.parse(record.requestedAction)) !== JSON.stringify(requestedAction)
+        || typeof record.didUpdate !== 'boolean'
+    ) {
+        throw new Error('Invalid pending queue steer-now acknowledgement');
+    }
+    return { didUpdate: record.didUpdate };
 }
