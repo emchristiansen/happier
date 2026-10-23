@@ -551,7 +551,6 @@ describe('createCliActionExecutorHarness', () => {
         { sessionId: 'sess_target', message: 'hello' },
         { surface: 'cli', defaultSessionId: null, providerToolCallId: 'call-p' },
       );
-      expect(requests.get('approval_sender_1')?.invocationIdentity).toEqual({ providerToolCallId: 'call-p', senderSessionId: 'sess_A' });
 
       failExecutionRecordWrites = true;
       await approver.executor.execute(
@@ -571,12 +570,12 @@ describe('createCliActionExecutorHarness', () => {
       expect(requests.get('approval_sender_1')).toMatchObject({ status: 'executed' });
 
       expect(sendSessionMessageService).toHaveBeenCalledTimes(2);
-      for (const [args] of sendSessionMessageService.mock.calls as unknown[][]) {
-        expect((args as Record<string, unknown>).idempotency).toEqual({
+      expect((sendSessionMessageService.mock.calls as unknown[][]).map(([args]) => (args as Record<string, unknown>).idempotency))
+        .toEqual(Array.from({ length: 2 }, () => ({
           kind: 'derived',
           identity: { senderSessionId: 'sess_A', providerToolCallId: 'call-p' },
-        });
-      }
+        })));
+      expect(requests.get('approval_sender_1')?.invocationIdentity).toEqual({ providerToolCallId: 'call-p', senderSessionId: 'sess_A' });
     });
   });
 });
