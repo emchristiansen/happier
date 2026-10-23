@@ -464,12 +464,35 @@ function readPendingRowDeliveryStatus(record: Record<string, unknown>): PendingD
         : parseLegacyPendingRowDeliveryStatus(record);
 }
 
+function arePendingDeliveryStatusesEqual(left: PendingDeliveryStatusV1, right: PendingDeliveryStatusV1): boolean {
+    if (left.status !== right.status) return false;
+    if (left.status === 'blocked' && right.status === 'blocked') return left.reason === right.reason;
+    if (left.status === 'discarded' && right.status === 'discarded') return left.reason === right.reason;
+    return true;
+}
+
+/**
+ * Whether a row's persisted fields read as the same status as its typed `deliveryStatus`. They differ
+ * where the server overrides the typed status, as for a queued row whose requested action it cannot
+ * parse (persisted queued, typed blocked `unsupported_action`). A row with only one representation
+ * has nothing to contradict.
+ */
+function doPersistedFieldsMatchTypedStatus(record: Record<string, unknown>, typedStatus: PendingDeliveryStatusV1): boolean {
+    const hasPersistedFields = hasOwn(record, 'status')
+        || hasOwn(record, 'deliveryState')
+        || hasOwn(record, 'deliveryBlockedReason')
+        || hasOwn(record, 'discardedReason');
+    if (!hasOwn(record, 'deliveryStatus') || !hasPersistedFields) return true;
+    const persistedStatus = parseLegacyPendingRowDeliveryStatus(record);
+    return persistedStatus !== null && arePendingDeliveryStatusesEqual(persistedStatus, typedStatus);
+}
+
 type PendingQueueV2ProjectionEntry = Readonly<{
     localId: string;
     deliveryStatus: PendingDeliveryStatusV1;
     messageRole: SessionMessageRole | null;
     requestedAction: PendingRequestedActionV1 | null;
-    requestedActionMalformed: boolean;
+    persistedFieldsMatchTypedStatus: boolean;
 }>;
 
 function parsePendingQueueV2Projection(value: unknown): PendingQueueV2ProjectionEntry[] {
@@ -504,7 +527,7 @@ function parsePendingQueueV2Projection(value: unknown): PendingQueueV2Projection
             deliveryStatus,
             messageRole: messageRole.success ? messageRole.data : null,
             requestedAction: requestedAction.success ? requestedAction.data : null,
-            requestedActionMalformed: pendingRecord.requestedActionMalformed === true,
+            persistedFieldsMatchTypedStatus: doPersistedFieldsMatchTypedStatus(pendingRecord, deliveryStatus),
         });
     }
     return entries;
@@ -749,8 +772,9 @@ export async function listPendingQueueV2LocalIdsFromServer(params: {
 /**
  * Local ids of the rows a mode switch or a switch-to-local discard acts on: every pending row except
  * one the app handed to an external terminal (`external_handoff`, whose custody is outside this
- * runner) and one whose requested action the server could not parse (`requestedActionMalformed`,
- * reported as blocked `unsupported_action`). Queued, delivering and blocked rows all count.
+ * runner) and one whose typed status the server overrode so that it no longer matches the persisted
+ * fields (a queued row whose requested action the server cannot parse). Queued, delivering and
+ * blocked rows count, including a malformed action already persisted as blocked.
  * `listPendingQueueV2LocalIdsFromServer` remains the complete inventory.
  */
 export async function listPendingQueueV2ActionableLocalIdsFromServer(params: {
@@ -759,7 +783,7 @@ export async function listPendingQueueV2ActionableLocalIdsFromServer(params: {
 }): Promise<string[]> {
     const pending = await fetchPendingQueueV2Projection(params);
     return pending
-        .filter((entry) => entry.deliveryStatus.status !== 'external_handoff' && !entry.requestedActionMalformed)
+        .filter((entry) => entry.deliveryStatus.status !== 'external_handoff' && entry.persistedFieldsMatchTypedStatus)
         .map((entry) => entry.localId);
 }
 
