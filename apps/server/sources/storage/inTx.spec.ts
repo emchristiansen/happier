@@ -336,7 +336,7 @@ describe("inTx", () => {
             expect(unhandled).toEqual([]);
         });
 
-        it("keeps the committed result when the failure log itself throws", async () => {
+        it("keeps the committed result, without a retry or an unhandled rejection, when the failure log itself throws", async () => {
             const { inTx, afterTx } = await import("./inTx");
             warnMock.mockImplementation(() => {
                 throw new Error("logger failure");
@@ -355,7 +355,9 @@ describe("inTx", () => {
                 expect(result).toBe(135);
             });
 
+            // pino serializes the log object inside the `warn` call, so a serializer failure surfaces here too.
             expect(warnMock).toHaveBeenCalledTimes(2);
+            expect(transaction).toHaveBeenCalledTimes(1);
             expect(unhandled).toEqual([]);
         });
     });
