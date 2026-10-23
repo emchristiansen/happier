@@ -495,6 +495,7 @@ import {
   shouldReconcileConnectedServiceRuntimeTargetRegistration,
 } from './connectedServices/startup/runtimeTargetRegistration';
 import { rehydrateLiveExecutionRunRuntimeTargets } from './connectedServices/startup/executionRunTargetRehydration';
+import { createConnectedServiceSessionReadinessReconciliation } from './connectedServices/startup/sessionReadinessReconciliation';
 import { listExecutionRunMarkers } from './executionRunRegistry';
 import { createAdoptedExecutionRunRootCleanup } from './connectedServices/runsBridge/createAdoptedExecutionRunRootCleanup';
 import { startConnectedServiceRefreshStartup } from './connectedServices/startup/refreshStartup';
@@ -2586,6 +2587,13 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           });
           return reconciliation;
         };
+        const awaitConnectedServiceSessionReadinessReconciliation = createConnectedServiceSessionReadinessReconciliation({
+          reconcile: async (registration) => await enqueueConnectedServiceRuntimeTargetRegistrationReconciliation(
+            registration,
+            true,
+          ),
+          isCurrent: (registration) => connectedServiceRuntimeRegistry.isCurrentTargetRegistration(registration),
+        });
         const connectedServiceRuntimeRegistrationCleanup = connectedServiceRuntimeRegistry.onTargetRegistration(
           (registration) => {
             if (!shouldReconcileConnectedServiceRuntimeTargetRegistration({
@@ -2897,10 +2905,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               }
             }
             if (!target || target.pid !== tracked.pid || target.sessionId !== sessionId) return;
-            await enqueueConnectedServiceRuntimeTargetRegistrationReconciliation({
+            await awaitConnectedServiceSessionReadinessReconciliation({
               key: { kind: 'session', pid: tracked.pid },
               target,
-            }, true);
+            });
           },
           onTrackedSessionReported: async (tracked) => {
             persistPiResumeEnvironment({ tracked, happyHomeDir: configuration.happyHomeDir, logger });

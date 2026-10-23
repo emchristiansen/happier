@@ -20,7 +20,10 @@ import {
   type ConnectedServiceBindingSelection,
   type ConnectedServicesBindingsV1,
 } from './parseConnectedServicesBindings';
-import { resolveConnectedServiceCredentialsWithRevisions } from '@/cloud/connectedServices/resolveConnectedServiceCredentials';
+import {
+  ConnectedServiceCredentialResolutionError,
+  resolveConnectedServiceCredentialsWithRevisions,
+} from '@/cloud/connectedServices/resolveConnectedServiceCredentials';
 import {
   materializeConnectedServicesForSpawn,
   type ConnectedServiceResolvedSelection,
@@ -294,6 +297,7 @@ async function applySpawnPreflightRefresh(params: Readonly<{
   refreshService: ConnectedServiceSpawnCredentialRefreshService | null;
   /** Read at each credential decision: the refresh and earlier reads are awaited first. */
   clock: () => number;
+  readServerCurrentCredential: ReadServerCurrentSpawnCredential;
   forceOauthRefresh: boolean;
 }>): Promise<void> {
   for (const binding of params.credentialBindings) {
@@ -324,13 +328,15 @@ async function applySpawnPreflightRefresh(params: Readonly<{
       profileId: binding.profileId,
       ...(params.forceOauthRefresh ? { force: true } : {}),
     });
-    const outcome = resolveSpawnRefreshOutcome({
+    const outcome = await resolveSpawnRefreshOutcome({
+      binding,
       result,
       current: {
         record,
         credentialRevision: params.credentialRevisionsByServiceId.get(binding.serviceId) ?? null,
       },
       clock: params.clock,
+      readServerCurrentCredential: params.readServerCurrentCredential,
     });
     params.recordsByServiceId.set(binding.serviceId, outcome.record);
     params.credentialRevisionsByServiceId.set(binding.serviceId, outcome.credentialRevision);
@@ -342,6 +348,11 @@ type SpawnCredential = Readonly<{
   credentialRevision: ConnectedServiceCredentialRevisionV1 | null;
 }>;
 
+type SpawnCredentialBinding = Readonly<{ serviceId: ConnectedServiceId; profileId: string }>;
+
+/** Reads the credential the server currently stores for a profile, with its revision. */
+type ReadServerCurrentSpawnCredential = (binding: SpawnCredentialBinding) => Promise<SpawnCredential>;
+
 /**
  * Canonical policy for a spawn-context credential refresh outcome — the SINGLE owner consumed by
  * BOTH the spawn preflight and the materialization-time refresh callback. Reconnect-required
@@ -352,19 +363,25 @@ type SpawnCredential = Readonly<{
  * into a user-visible "Failed to resume session" (live incident 2026-07-08 19:39). Expired records
  * still fail the spawn.
  *
- * A `refreshed` credential that has already expired is refused in favour of the current record; if
- * that has expired too, the spawn fails. The coordinator hands a spawn preflight the persisted
- * credential of a rotation still in flight (`adoptCredentialReadyFromInFlightRefresh`). Incident
- * 2026-10-22/23: a deadlocked rotation stayed in flight for hours, and every spawn adopted its
- * credential after it expired. Expiry is judged by `clock` at each decision, after the awaited
- * refresh, not at spawn entry.
+ * The coordinator hands a spawn preflight the persisted credential of a rotation still in flight
+ * (`adoptCredentialReadyFromInFlightRefresh`), which may have been persisted before the record this
+ * spawn read. When the `refreshed` revision differs from the spawn's, the server's current record
+ * decides which is current: it stores one credential per profile, while revisions are random and a
+ * record's `updatedAt` is its writer's clock, so neither orders two revisions.
+ *
+ * A credential so chosen that has already expired is refused in favour of the current record; if
+ * that has expired too, the spawn fails. Incident 2026-10-22/23: a deadlocked rotation stayed in
+ * flight for hours, and every spawn adopted its credential after it expired, over a newer server
+ * record. Expiry is judged by `clock` at each decision, after the awaited reads, not at spawn entry.
  */
-function resolveSpawnRefreshOutcome(params: Readonly<{
+async function resolveSpawnRefreshOutcome(params: Readonly<{
+  binding: SpawnCredentialBinding;
   result: Awaited<ReturnType<ConnectedServiceSpawnCredentialRefreshService['refreshConnectedServiceCredentialForSpawnPreflight']>>;
   current: SpawnCredential;
   clock: () => number;
-}>): SpawnCredential {
-  const { result, current, clock } = params;
+  readServerCurrentCredential: ReadServerCurrentSpawnCredential;
+}>): Promise<SpawnCredential> {
+  const { binding, result, current, clock } = params;
   const record = current.record;
   if (result.status === 'refreshed' && result.credential) {
     const revision = ConnectedServiceCredentialRevisionV1Schema.safeParse(result.credentialRevision);
@@ -372,14 +389,27 @@ function resolveSpawnRefreshOutcome(params: Readonly<{
       record: result.credential,
       credentialRevision: revision.success ? revision.data : null,
     };
+    const adopted = refreshed.credentialRevision !== null
+      && refreshed.credentialRevision === current.credentialRevision
+      ? refreshed
+      : await params.readServerCurrentCredential(binding);
+    if (adopted.credentialRevision !== refreshed.credentialRevision) {
+      logger.warn('[DAEMON RUN] Spawn preflight refused a refreshed connected-service credential the server has superseded', {
+        serviceId: binding.serviceId,
+        profileId: binding.profileId,
+        refreshedCredentialRevision: refreshed.credentialRevision,
+        spawnCredentialRevision: current.credentialRevision,
+        serverCredentialRevision: adopted.credentialRevision,
+      });
+    }
     const decidedAtMs = clock();
-    if (isRecordStillUsableForSpawn(refreshed.record, decidedAtMs)) return refreshed;
+    if (isRecordStillUsableForSpawn(adopted.record, decidedAtMs)) return adopted;
     const currentUsable = isRecordStillUsableForSpawn(record, clock());
     logger.warn('[DAEMON RUN] Spawn preflight refused an expired refreshed connected-service credential', {
-      serviceId: result.diagnostic.serviceId,
-      profileId: result.diagnostic.profileId,
-      refreshedCredentialRevision: refreshed.credentialRevision,
-      refreshedExpiresAt: refreshed.record.expiresAt,
+      serviceId: binding.serviceId,
+      profileId: binding.profileId,
+      refreshedCredentialRevision: adopted.credentialRevision,
+      refreshedExpiresAt: adopted.record.expiresAt,
       currentCredentialRevision: current.credentialRevision,
       currentExpiresAt: record.expiresAt,
       decidedAtMs: decidedAtMs,
@@ -1130,6 +1160,7 @@ async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly
   forceOauthRefresh: boolean;
   /** Read at each credential decision in the materialization-time refresh. */
   clock: () => number;
+  readServerCurrentCredential: ReadServerCurrentSpawnCredential;
   vendorResumeId: string | null;
   resumeReachabilityRequired: boolean;
   candidatePersistedSessionFile: string | null;
@@ -1154,13 +1185,15 @@ async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly
             profileId,
             ...(params.forceOauthRefresh ? { force: true } : {}),
           });
-          const outcome = resolveSpawnRefreshOutcome({
+          const outcome = await resolveSpawnRefreshOutcome({
+            binding: { serviceId, profileId },
             result,
             current: {
               record,
               credentialRevision: params.credentialRevisionsByServiceId.get(serviceId) ?? null,
             },
             clock: params.clock,
+            readServerCurrentCredential: params.readServerCurrentCredential,
           });
           // Other results keep their previous handling here: they report the result's own revision.
           const resultRevision = ConnectedServiceCredentialRevisionV1Schema.safeParse(result.credentialRevision);
@@ -1277,6 +1310,15 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
     resolvedCredentials,
     ([serviceId, resolved]) => [serviceId, resolved.credentialRevision],
   ));
+  const readServerCurrentCredential: ReadServerCurrentSpawnCredential = async (binding) => {
+    const resolved = (await resolveConnectedServiceCredentialsWithRevisions({
+      credentials: params.credentials,
+      api: params.api,
+      bindings: [binding],
+    })).get(binding.serviceId);
+    if (!resolved) throw new ConnectedServiceCredentialResolutionError(binding);
+    return { record: resolved.record, credentialRevision: resolved.credentialRevision };
+  };
   const groupSelections = new Map(resolvedBindings.groupSelections);
   const maxPreflightAttempts = resolveMaxSpawnMaterializationAttempts(groupSelections);
   for (let attempt = 0; attempt < maxPreflightAttempts; attempt += 1) {
@@ -1292,6 +1334,7 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
         credentialBindings,
         refreshService: params.credentialRefreshService ?? null,
         clock,
+        readServerCurrentCredential,
         forceOauthRefresh: forceSpawnPreflightOauthRefresh,
       });
       break;
@@ -1340,6 +1383,7 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
         refreshService: params.credentialRefreshService ?? null,
         forceOauthRefresh: forceSpawnPreflightOauthRefresh,
         clock,
+        readServerCurrentCredential,
         vendorResumeId: params.vendorResumeId ?? null,
         resumeReachabilityRequired: params.resumeReachabilityRequired ?? false,
         candidatePersistedSessionFile: params.candidatePersistedSessionFile ?? null,
