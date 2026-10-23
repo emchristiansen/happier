@@ -3,7 +3,10 @@ import { sendSessionMessage } from '@/session/services/sendSessionMessage';
 
 import { continueTrackedTemporaryThrottleSession } from '../temporaryThrottle/continueTrackedTemporaryThrottleSession';
 import type { TemporaryThrottleResumeSource } from '../temporaryThrottle/resolveInactiveTemporaryThrottleResumeSource';
-import type { ConnectedServiceSessionAuthSwitchCore } from './connectedServiceSessionAuthSwitchCore';
+import {
+  ConnectedServiceSessionAuthSwitchAcquisitionError,
+  type ConnectedServiceSessionAuthSwitchCore,
+} from './connectedServiceSessionAuthSwitchCore';
 import type { RuntimeAuthFailureSourceAuthorization } from './handleConnectedServiceRuntimeAuthFailureForSession';
 import type { RuntimeAuthLimitResetRetryInput, RuntimeAuthLimitResetRetryResult } from './RuntimeAuthRecoveryScheduler';
 
@@ -20,7 +23,37 @@ export async function retryRuntimeAuthLimitAfterReset(input: RuntimeAuthLimitRes
   authorizeSource: () => Promise<RuntimeAuthFailureSourceAuthorization>;
   switchCore: ConnectedServiceSessionAuthSwitchCore;
 }>): Promise<RuntimeAuthLimitResetRetryResult> {
+  let entered = false;
+  try {
+    return await runWithinSessionLane(input, () => { entered = true; });
+  } catch (error) {
+    // A queued acquisition cancelled before this callback ran made no attempt:
+    // defer so the scheduler rolls back this unattempted trial. An acquisition
+    // error raised inside an executing callback is that callback's failure.
+    if (!entered && isPreEntryAcquisitionCancellation(error, input.sessionId)) return { status: 'deferred' };
+    throw error;
+  }
+}
+
+function isPreEntryAcquisitionCancellation(error: unknown, sessionId: string): boolean {
+  if (!(error instanceof ConnectedServiceSessionAuthSwitchAcquisitionError) || error.sessionId !== sessionId) return false;
+  switch (error.reason) {
+    case 'timed_out':
+    case 'session_stopped':
+      // Explicit Stop also cancels the recovery durably, which this deferral
+      // cannot undo; normal final-child cleanup leaves it to retry later.
+      return true;
+    default:
+      return error.reason satisfies never;
+  }
+}
+
+async function runWithinSessionLane(
+  input: Parameters<typeof retryRuntimeAuthLimitAfterReset>[0],
+  onEntered: () => void,
+): Promise<RuntimeAuthLimitResetRetryResult> {
   return await input.switchCore.run({ sessionId: input.sessionId, reason: 'automatic_runtime_failure', execute: async () => {
+    onEntered();
     if (!input.isCurrent()) return { status: 'deferred' };
     if (input.resumePromptMode === 'off') {
       return { status: 'terminal', lastError: 'limit_reset_continuation_disabled' };

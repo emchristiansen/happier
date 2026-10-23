@@ -33,6 +33,28 @@ function deferred() {
   return { promise, resolve };
 }
 
+/** Hold the session lane with an executing owner, as a long credential refresh does. */
+function holdSessionLane(switchCore: ReturnType<typeof createConnectedServiceSessionAuthSwitchCore>) {
+  const entered = deferred(); const release = deferred();
+  const owner = switchCore.run({ sessionId, reason: 'automatic_runtime_failure', execute: async () => {
+    entered.resolve(); await release.promise;
+  } });
+  return { entered: entered.promise, release: release.resolve, owner };
+}
+
+/** Resolve once the next acquisition is queued behind the held lane. */
+function observeNextAcquisition(switchCore: ReturnType<typeof createConnectedServiceSessionAuthSwitchCore>) {
+  const queued = deferred();
+  const run = switchCore.run;
+  vi.spyOn(switchCore, 'run').mockImplementation((params) => {
+    // The core queues synchronously before returning its pending acquisition.
+    const result = run(params);
+    queued.resolve();
+    return result;
+  });
+  return queued.promise;
+}
+
 function harness(input: { lookupGate?: () => Promise<void>; loseAcknowledgement?: boolean; acceptFirst?: boolean;
   alwaysLoseAcknowledgement?: boolean; alwaysLoseAcknowledgementAfterFirst?: boolean; loseAcknowledgementAttempts?: ReadonlyArray<number>; postGate?: () => Promise<void>;
   durableStore?: ConstructorParameters<typeof RuntimeAuthRecoveryScheduler>[0]['durableStore'];
@@ -345,6 +367,87 @@ describe('expired limit trial admission and source ownership', () => {
       expect(h.post.mock.calls[2]?.[1]).toEqual(h.post.mock.calls[1]?.[1]);
       expect(h.scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'resumed_awaiting_proof', limitResetRetryCount: 2 });
     } finally { h.scheduler.dispose(); }
+  });
+
+  it('defers and later retries a trial whose queued acquisition timed out behind a long owner', async () => {
+    const h = harness();
+    const lane = holdSessionLane(h.switchCore);
+    try {
+      await h.arm(); await lane.entered;
+      const queued = observeNextAcquisition(h.switchCore);
+      const wake = h.wake(); await queued;
+      await vi.advanceTimersByTimeAsync(30_000); await wake;
+      expect(h.spawnSession).not.toHaveBeenCalled(); expect(h.post).not.toHaveBeenCalled();
+      const deferredIntent = h.scheduler.readByKey(recoveryKey);
+      expect(deferredIntent).toMatchObject({ status: 'waiting', lastError: 'limit_reset_retry_deferred', limitResetRetryCount: 0 });
+      expect(deferredIntent?.limitResetTrial).toBeUndefined();
+      expect(deferredIntent?.nextRetryAtMs).toEqual(expect.any(Number));
+      lane.release(); await lane.owner;
+      await h.wake();
+      expect(h.post).toHaveBeenCalledTimes(1);
+      expect(h.scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'resumed_awaiting_proof', limitResetRetryCount: 1 });
+    } finally { lane.release(); h.scheduler.dispose(); }
+  });
+
+  it('defers a queued trial when normal final-child exit clears the session lane', async () => {
+    const h = harness();
+    const lane = holdSessionLane(h.switchCore);
+    try {
+      await h.arm(); await lane.entered;
+      const queued = observeNextAcquisition(h.switchCore);
+      const wake = h.wake(); await queued;
+      // Final-child cleanup without a surviving runner clears the core only; it does not cancel recovery.
+      h.switchCore.clearSession(sessionId); await wake;
+      expect(h.spawnSession).not.toHaveBeenCalled(); expect(h.post).not.toHaveBeenCalled();
+      const deferredIntent = h.scheduler.readByKey(recoveryKey);
+      expect(deferredIntent).toMatchObject({ status: 'waiting', lastError: 'limit_reset_retry_deferred', limitResetRetryCount: 0 });
+      expect(deferredIntent?.limitResetTrial).toBeUndefined();
+      lane.release(); await lane.owner;
+      await h.wake();
+      expect(h.post).toHaveBeenCalledTimes(1);
+      expect(h.scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'resumed_awaiting_proof', limitResetRetryCount: 1 });
+    } finally { lane.release(); h.scheduler.dispose(); }
+  });
+
+  it('keeps explicit Stop authoritative over a queued trial cancelled by its lane clear', async () => {
+    const h = harness();
+    const lane = holdSessionLane(h.switchCore);
+    try {
+      await h.arm(); await lane.entered;
+      const queued = observeNextAcquisition(h.switchCore);
+      const wake = h.wake(); await queued;
+      // Mirror daemon Stop: clear queued acquisitions synchronously, then cancel recovery asynchronously.
+      h.switchCore.clearSession(sessionId);
+      const stop = Promise.resolve().then(async () => await h.scheduler.cancel({ sessionId }));
+      await wake; await stop;
+      lane.release(); await lane.owner;
+      await vi.advanceTimersByTimeAsync(60_000); await h.wake();
+      expect(h.spawnSession).not.toHaveBeenCalled(); expect(h.post).not.toHaveBeenCalled();
+      expect(h.scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'cancelled', nextRetryAtMs: null });
+    } finally { lane.release(); h.scheduler.dispose(); }
+  });
+
+  it('preserves an earlier ambiguous admission when its reconciliation cannot acquire the lane', async () => {
+    const h = harness({ loseAcknowledgementAttempts: [1] });
+    let lane: ReturnType<typeof holdSessionLane> | undefined;
+    try {
+      await h.arm(); await h.wake();
+      const unresolved = h.scheduler.readByKey(recoveryKey);
+      expect(unresolved?.limitResetTrial).toMatchObject({ retryCount: 1, admissionAttemptCount: 1, admissionBody: expect.anything() });
+      lane = holdSessionLane(h.switchCore); await lane.entered;
+      const queued = observeNextAcquisition(h.switchCore);
+      const wake = h.wake(); await queued;
+      h.switchCore.clearSession(sessionId); await wake;
+      expect(h.post).toHaveBeenCalledTimes(1);
+      expect(h.scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'waiting', lastError: 'limit_reset_retry_deferred',
+        attemptId: unresolved?.attemptId, limitResetRetryCount: 1, limitResetTrial: unresolved?.limitResetTrial });
+      lane.release(); await lane.owner;
+      await h.wake();
+      expect(h.post).toHaveBeenCalledTimes(2);
+      expect(h.post.mock.calls[1]?.[1]).toEqual(h.post.mock.calls[0]?.[1]);
+      expect(h.terminal.size).toBe(1);
+      expect(h.scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'resumed_awaiting_proof', limitResetRetryCount: 1 });
+    } finally { lane?.release(); h.scheduler.dispose(); }
   });
 
 });
