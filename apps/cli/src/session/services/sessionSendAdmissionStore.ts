@@ -35,7 +35,8 @@ import {
  * window the attempt both started and ended in; a decision found only in the
  * previous window is first re-published in the current one. The decisions any
  * two returns rely on therefore share one exclusive name, or are ordered
- * through it, and no attempt issues a body while another body is current.
+ * through it, so attempts of one request issue the same body while that body
+ * stays current (unexpired and not evicted).
  *
  * Removal, applied after a publication: bodies older than the retention, then
  * the oldest bodies beyond `SESSION_SEND_ADMISSION_MAX_ENTRIES` (by
