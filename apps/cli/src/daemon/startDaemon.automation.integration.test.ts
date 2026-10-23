@@ -920,7 +920,9 @@ function createDaemonPiReadinessMetadata(pid: number): Metadata {
   };
 }
 
-async function installActualDaemonClaudeReadinessWebhook(pid: number): Promise<Readonly<{
+async function installActualDaemonClaudeReadinessWebhook(pid: number, options: Readonly<{
+  onTrackedSessionReadyEntered?: (tracked: TrackedSession) => void;
+}> = {}): Promise<Readonly<{
   getTrackedSession: () => TrackedSession;
   installTrackedSession: (tracked: TrackedSession) => void;
 }>> {
@@ -941,8 +943,17 @@ async function installActualDaemonClaudeReadinessWebhook(pid: number): Promise<R
     trackedSessionsByPid = params.pidToTrackedSession;
     trackedSession = createDaemonGroupBoundClaudeTrackedSession(pid);
     params.pidToTrackedSession.set(pid, trackedSession);
+    const onTrackedSessionReady = params.onTrackedSessionReady;
     return actualWebhookModule.createOnHappySessionWebhook({
       ...params,
+      ...(onTrackedSessionReady && options.onTrackedSessionReadyEntered
+        ? {
+            onTrackedSessionReady: async (tracked: TrackedSession) => {
+              options.onTrackedSessionReadyEntered?.(tracked);
+              await onTrackedSessionReady(tracked);
+            },
+          }
+        : {}),
       findHappyProcessByPidFn: async () => null,
       writeSessionMarkerFn: async () => {},
       readCredentialsFn: async () => automationCredentials,
@@ -2078,6 +2089,99 @@ describe('startDaemon automation wiring (integration)', () => {
       })).resolves.toMatchObject({ statusCode: 200 });
       expect(fetchAccountProfile).toHaveBeenCalledTimes(2);
       expect(callSessionRpc).toHaveBeenCalledOnce();
+    } finally {
+      if (app) await app.close();
+      harness.requestShutdown('happier-cli');
+      if (run) await run;
+      exitSpy.mockRestore();
+    }
+  });
+
+  it.each([
+    {
+      name: 'coalesces forced startup reconciliations for one runtime target into a single follow-up',
+      pids: [7431, 7431, 7431, 7431],
+    },
+    {
+      name: 'shares one account-profile fetch across forced startup reconciliations for several targets',
+      pids: [7432, 7433, 7434, 7435],
+    },
+  ])('$name', async ({ pids }) => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    let run: Promise<void> | null = null;
+    let app: Awaited<ReturnType<typeof createCapturedDaemonControlApp>> | null = null;
+    harness.setAutoShutdownAfterAutomationStart(false);
+    const firstPid = pids[0]!;
+    let readyEntries = 0;
+
+    try {
+      const webhook = await installActualDaemonClaudeReadinessWebhook(firstPid, {
+        onTrackedSessionReadyEntered: () => {
+          readyEntries += 1;
+        },
+      });
+      const { fetchAccountProfile } = await import('@/api/accountProfile');
+      const profileGate = createDeferred<void>();
+      let profileFetchesInFlight = 0;
+      let maxProfileFetchesInFlight = 0;
+      vi.mocked(fetchAccountProfile).mockImplementation(async () => {
+        profileFetchesInFlight += 1;
+        maxProfileFetchesInFlight = Math.max(maxProfileFetchesInFlight, profileFetchesInFlight);
+        try {
+          await profileGate.promise;
+        } finally {
+          profileFetchesInFlight -= 1;
+        }
+        return {
+          connectedServicesV2: [],
+          connectedServiceCredentialRevisionsV1: [],
+        } as unknown as Awaited<ReturnType<typeof fetchAccountProfile>>;
+      });
+
+      const { startDaemon } = await import('./startDaemon');
+      run = startDaemon();
+      await waitForCondition(
+        () => harness.connectedServicesProjectionChangeListeners.length === 1
+          && harness.getDaemonControlServerParams() !== null,
+        'Expected canonical consumer and control-server composition',
+      );
+      for (const pid of new Set(pids)) {
+        if (pid !== firstPid) webhook.installTrackedSession(createDaemonGroupBoundClaudeTrackedSession(pid));
+      }
+      app = await createCapturedDaemonControlApp();
+      const controlToken = readCapturedDaemonControlToken();
+      const reportSessionStarted = (pid: number) => app!.inject({
+        method: 'POST',
+        url: '/session-started',
+        headers: { 'x-happier-daemon-token': controlToken },
+        payload: {
+          sessionId: `session-claude-coalesced-${pid}`,
+          metadata: createDaemonClaudeReadinessMetadata(pid),
+        },
+      });
+
+      const responses = [reportSessionStarted(firstPid)];
+      await waitForCondition(
+        () => vi.mocked(fetchAccountProfile).mock.calls.length === 1,
+        'Expected the first forced startup reconciliation to fetch the account profile',
+      );
+      for (const pid of pids.slice(1)) responses.push(reportSessionStarted(pid));
+      await waitForCondition(
+        () => readyEntries === pids.length,
+        'Expected every startup report to request forced reconciliation while the first fetch is held',
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      // Every later forced request arrived while the first fetch was in flight: it may neither
+      // start its own concurrent fetch nor be answered by the fetch that began before it.
+      expect(fetchAccountProfile).toHaveBeenCalledTimes(1);
+      profileGate.resolve();
+      const settled = await Promise.all(responses);
+
+      expect(settled.map((response) => response.statusCode)).toEqual(pids.map(() => 200));
+      expect(maxProfileFetchesInFlight).toBe(1);
+      // One fetch for the run that was active, one shared follow-up for everything that arrived meanwhile.
+      expect(fetchAccountProfile).toHaveBeenCalledTimes(2);
     } finally {
       if (app) await app.close();
       harness.requestShutdown('happier-cli');
