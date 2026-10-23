@@ -9,6 +9,7 @@ import {
     readBlockedPendingQueueV2DeliveryByLocalIdFromServer,
     readPendingQueueV2ActivationEligibilityFromServer,
     listPendingQueueV2LocalIdsFromServer,
+    listPendingQueueV2MaterializableLocalIdsFromServer,
     listPendingQueueV2DeliveryStatusesFromServer,
     listPendingQueueV2ProviderDeliveryLocalIdsFromServer,
     markPendingQueueV2DeliveryHandled,
@@ -1861,6 +1862,34 @@ describe('pendingQueueV2Transport', () => {
                 token: 'token',
                 sessionId: 'session-1',
             })).resolves.toEqual(['queued-local', 'handoff-local']);
+        });
+
+        it('lists only rows a runner can materialize for action counts', async () => {
+            mockGet.mockResolvedValueOnce({
+                data: {
+                    pending: [
+                        handoffRow,
+                        serverPendingRow({ localId: 'queued-local', deliveryStatus: { status: 'queued' } }),
+                        serverPendingRow({
+                            localId: 'delivering-local',
+                            deliveryState: 'delivering',
+                            deliveryStatus: { status: 'delivering', detail: 'awaiting_acceptance' },
+                        }),
+                        serverPendingRow({
+                            localId: 'blocked-local',
+                            deliveryState: 'blocked',
+                            deliveryBlockedReason: 'runtime_disposed_before_delivery',
+                            deliveryStatus: { status: 'blocked', reason: 'runtime_disposed_before_delivery' },
+                        }),
+                        { localId: 'legacy-queued-local', status: 'queued', deliveryState: null },
+                    ],
+                },
+            });
+
+            await expect(listPendingQueueV2MaterializableLocalIdsFromServer({
+                token: 'token',
+                sessionId: 'session-1',
+            })).resolves.toEqual(['queued-local', 'legacy-queued-local']);
         });
 
         it('projects the external handoff status, including from persisted fields alone', async () => {

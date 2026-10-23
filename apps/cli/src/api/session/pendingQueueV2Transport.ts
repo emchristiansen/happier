@@ -828,6 +828,22 @@ export async function listPendingQueueV2LocalIdsFromServer(params: {
     return pending.map((entry) => entry.localId);
 }
 
+/**
+ * Local ids of rows a runner can still materialize: canonical `queued` status only. Delivering,
+ * external-handoff and blocked rows (including a malformed requested action) are held elsewhere or
+ * need explicit settlement, so they are not work a mode switch or discard gate should act on.
+ * `listPendingQueueV2LocalIdsFromServer` remains the complete inventory.
+ */
+export async function listPendingQueueV2MaterializableLocalIdsFromServer(params: {
+    token: string;
+    sessionId: string;
+}): Promise<string[]> {
+    const pending = await fetchPendingQueueV2Projection(params);
+    return pending
+        .filter((entry) => entry.deliveryStatus.status === 'queued')
+        .map((entry) => entry.localId);
+}
+
 export type PendingQueueV2ActivationEligibility = 'eligible' | 'missing' | 'ineligible';
 
 export async function readPendingQueueV2ActivationEligibilityFromServer(params: {

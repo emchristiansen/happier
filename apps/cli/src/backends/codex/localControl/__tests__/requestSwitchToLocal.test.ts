@@ -14,7 +14,7 @@ describe('requestSwitchToLocal', () => {
     const switched = await requestSwitchToLocal({
       queue,
       session: {
-        peekPendingMessageQueueV2Count: vi.fn().mockResolvedValue(2),
+        peekMaterializablePendingMessageQueueV2Count: vi.fn().mockResolvedValue(2),
         discardPendingMessageQueueV2All: vi.fn(),
         discardCommittedMessageLocalIds: vi.fn(),
         sendSessionEvent: vi.fn(),
@@ -36,7 +36,7 @@ describe('requestSwitchToLocal', () => {
     const switched = await requestSwitchToLocal({
       queue,
       session: {
-        peekPendingMessageQueueV2Count: vi.fn().mockResolvedValue(0),
+        peekMaterializablePendingMessageQueueV2Count: vi.fn().mockResolvedValue(0),
         discardPendingMessageQueueV2All: vi.fn(),
         discardCommittedMessageLocalIds: vi.fn(),
         sendSessionEvent: vi.fn(),
