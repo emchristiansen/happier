@@ -1,8 +1,9 @@
 import type { ConnectedServiceCredentialRevisionV1, ConnectedServiceId } from '@happier-dev/protocol';
 import type { ConnectedServiceChildSelection } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
-import type {
-  ConnectedServiceSessionAuthSwitchLockRegistry,
-  ConnectedServiceSessionAuthSwitchReason,
+import {
+  ConnectedServiceSessionAuthSwitchAcquisitionError,
+  type ConnectedServiceSessionAuthSwitchLockRegistry,
+  type ConnectedServiceSessionAuthSwitchReason,
 } from '@/daemon/connectedServices/runtimeAuth/connectedServiceSessionAuthSwitchCore';
 import { logger } from '@/ui/logger';
 import type { ConnectedServiceRefreshCoordinator } from './ConnectedServiceRefreshCoordinator';
@@ -36,7 +37,7 @@ export type RefreshedAuthRestartRequiredDiagnostic = Readonly<{
 /** The per-session auth locks that the live application owner (`switchSessionConnectedServiceAuth`) takes. */
 export type RefreshedConnectedServiceAuthSessionLocks = Pick<
   ConnectedServiceSessionAuthSwitchLockRegistry,
-  'isHeldByAnotherOwner' | 'runExclusive'
+  'isHeldByAnotherOwner' | 'runExclusive' | 'runExclusiveDeferredBackground'
 >;
 
 type RefreshedConnectedServiceAuthApplicationInput = Parameters<RefreshedConnectedServiceAuthApplication>[0];
@@ -80,11 +81,16 @@ function isSameSessionSelection(
  * for the rotation it had joined, and the application waited for S's lock; neither could finish.
  * A held session is therefore deferred: its application is queued on the session's lock, which
  * runs it after every transition already holding or awaiting that lock, and it is left out of the
- * returned applied identities. Once it holds the lock it applies only if the session still has the
- * selection this event captured; a session that switched in the meantime keeps its own switch.
- * The live application owner's credential-revision check (`expectedCredentialRevisionByServiceId`)
- * still rejects a credential the server has since replaced. A transition already holding the lock
- * in the calling async context re-enters it and applies at once.
+ * returned applied identities. Nobody awaits that application, so its queued acquisition has no
+ * 30-second bound (`runExclusiveDeferredBackground`): a slow but healthy holder does not drop it.
+ * Only Stop or final child cleanup (`clearSession`) cancels it while queued; it then never applies.
+ * Once it holds the lock it applies only if the session still has the selection this event
+ * captured; a session that switched in the meantime keeps its own switch. The live application
+ * owner's credential-revision check (`expectedCredentialRevisionByServiceId`) still rejects a
+ * credential the server has since replaced. A deferred failure is logged and has no dedicated
+ * retry. A transition already holding the lock in the calling async context re-enters it and
+ * applies at once. Every free session's application is awaited, concurrently with the others, and
+ * a failure among them still fails the notification.
  */
 export function createRefreshedConnectedServiceAuthUpdatedHandler(params: Readonly<{
   applyRefreshedAuth: RefreshedConnectedServiceAuthApplication;
@@ -128,7 +134,7 @@ export function createRefreshedConnectedServiceAuthUpdatedHandler(params: Readon
       '[ConnectedServiceRefresh] Refreshed credential application deferred: session auth lock is held',
       logContext,
     );
-    void params.sessionLocks.runExclusive(application.sessionId, async () => {
+    void params.sessionLocks.runExclusiveDeferredBackground(application.sessionId, async () => {
       const currentSelection = params.readCurrentSelection(application.sessionId, event.binding.serviceId);
       if (!isSameSessionSelection(currentSelection, selection)) {
         logger.infoFile(
@@ -155,6 +161,13 @@ export function createRefreshedConnectedServiceAuthUpdatedHandler(params: Readon
         errorCode: result.errorCode ?? 'unknown',
       });
     }).catch((error: unknown) => {
+      if (error instanceof ConnectedServiceSessionAuthSwitchAcquisitionError && error.reason === 'session_stopped') {
+        logger.infoFile(
+          '[ConnectedServiceRefresh] Deferred refreshed credential application cancelled: session stopped',
+          logContext,
+        );
+        return;
+      }
       logger.warn('[ConnectedServiceRefresh] Deferred refreshed credential application failed', {
         ...logContext,
         error,
@@ -168,12 +181,13 @@ export function createRefreshedConnectedServiceAuthUpdatedHandler(params: Readon
       return { appliedRuntimeIdentityKeys: new Set<string>() };
     }
 
-    const appliedSessionIds = new Set<string>();
-    const deferredSessionIds = new Set<string>();
+    // One attempt per session per notification, whether applied now or deferred.
+    const attemptedSessionIds = new Set<string>();
+    const applications: Promise<void>[] = [];
     const appliedRuntimeIdentityKeys = new Set<string>();
     for (const target of event.affectedTargets) {
       const sessionId = String(target.sessionId ?? '').trim();
-      if (!sessionId || appliedSessionIds.has(sessionId) || deferredSessionIds.has(sessionId)) continue;
+      if (!sessionId || attemptedSessionIds.has(sessionId)) continue;
       const selection = target.selectionsByServiceId.get(event.binding.serviceId);
       if (!selection) continue;
       const activeProfileId = selection.kind === 'profile'
@@ -192,36 +206,45 @@ export function createRefreshedConnectedServiceAuthUpdatedHandler(params: Readon
         switchReason: 'automatic_runtime_failure',
         fromProfileId: activeProfileId,
       };
+      attemptedSessionIds.add(sessionId);
       if (params.sessionLocks.isHeldByAnotherOwner(sessionId)) {
-        deferredSessionIds.add(sessionId);
         deferApplication({ event, target, selection, application });
         continue;
       }
-      // Queue on the free lock at once, so no transition arriving later can come between this
-      // check and the application owner's own acquisition (a re-entry for this context).
-      const result = await params.sessionLocks.runExclusive(
-        sessionId,
-        async () => await params.applyRefreshedAuth(application),
-      );
-      if (!result.ok) {
-        if (result.errorCode === 'restart_disallowed_by_execution_policy') continue;
-        if (result.errorCode === 'hot_apply_restart_required') {
-          reportRestartRequired(event, target, sessionId);
-          continue;
+      applications.push((async () => {
+        // Queue on the free lock at once, before this async function's first await, so no
+        // transition arriving later can come between the check above and the application
+        // owner's own acquisition (a re-entry for this context).
+        const result = await params.sessionLocks.runExclusive(
+          sessionId,
+          async () => await params.applyRefreshedAuth(application),
+        );
+        if (!result.ok) {
+          if (result.errorCode === 'restart_disallowed_by_execution_policy') return;
+          if (result.errorCode === 'hot_apply_restart_required') {
+            reportRestartRequired(event, target, sessionId);
+            return;
+          }
+          throw new Error(`connected_service_refreshed_auth_application_failed:${result.errorCode ?? 'unknown'}`);
         }
-        throw new Error(`connected_service_refreshed_auth_application_failed:${result.errorCode ?? 'unknown'}`);
-      }
-      if (result.action !== 'hot_applied') continue;
-      appliedSessionIds.add(sessionId);
-      for (const affectedTarget of event.affectedTargets) {
-        if (
-          affectedTarget.sessionId === sessionId
-          && affectedTarget.pid === target.pid
-        ) {
-          appliedRuntimeIdentityKeys.add(affectedTarget.runtimeIdentityKey);
+        if (result.action !== 'hot_applied') return;
+        for (const affectedTarget of event.affectedTargets) {
+          if (
+            affectedTarget.sessionId === sessionId
+            && affectedTarget.pid === target.pid
+          ) {
+            appliedRuntimeIdentityKeys.add(affectedTarget.runtimeIdentityKey);
+          }
         }
-      }
+      })());
     }
+
+    // Settle every awaited immediate application before failing the notification, so one
+    // failure does not abandon the others. Held sessions were deferred above and are not awaited
+    // here. Applying concurrently keeps one slow hot-apply from delaying the other sessions.
+    const outcomes = await Promise.allSettled(applications);
+    const failure = outcomes.find((outcome) => outcome.status === 'rejected');
+    if (failure?.status === 'rejected') throw failure.reason;
 
     await params.restartAfterAuthUpdated(event);
     return { appliedRuntimeIdentityKeys };
