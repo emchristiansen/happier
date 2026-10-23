@@ -33,7 +33,7 @@ export async function runDaemonSessionDebugLogCommand(
     }
     return 0;
   } catch (error) {
-    console.error(`Failed to update the session runner debug log switch: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`Failed to ${action === 'status' ? 'read' : 'update'} the session runner debug log switch: ${error instanceof Error ? error.message : String(error)}`);
     return 1;
   }
 }

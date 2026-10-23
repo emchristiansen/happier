@@ -252,7 +252,7 @@ import { waitForSessionWebhook } from './spawn/waitForSessionWebhook';
 import { resolveSpawnChildEnvironment } from './spawn/resolveSpawnChildEnvironment';
 import { buildSpawnChildProcessEnv } from './spawn/buildSpawnChildProcessEnv';
 import { resolveStackProcessKindOverrideForSessionSpawn } from './spawn/resolveStackProcessKindOverrideForSessionSpawn';
-import { resolveSessionRunnerDebugLogEnv } from './spawn/sessionRunnerDebugLog';
+import { resolveSessionRunnerDebugLogEnvForSpawn } from './spawn/sessionRunnerDebugLog';
 import { createSpawnConcurrencyGate } from './spawn/createSpawnConcurrencyGate';
 import { computeDaemonSpawnRequestKey, createSpawnRequestCoalescer } from './spawn/spawnRequestCoalescer';
 import { createDaemonSpawnAttemptRegistry } from './spawn/daemonSpawnAttemptRegistry';
@@ -3864,10 +3864,12 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             const stackProcessKindOverride = resolveStackProcessKindOverrideForSessionSpawn(process.env);
             // Read at every spawn: `happier daemon session-debug-log` changes one session's runner
             // level from its next start without a daemon restart.
+            // A failure to read the switch leaves it off and is logged; it never fails the spawn.
             const sessionRunnerDebugLogEnv = normalizedExistingSessionId
-              ? await resolveSessionRunnerDebugLogEnv({
-                daemonStateDir: dirname(configuration.daemonStateFile),
+              ? await resolveSessionRunnerDebugLogEnvForSpawn({
                 sessionId: normalizedExistingSessionId,
+                resolveDaemonStateDir: () => dirname(configuration.daemonStateFile),
+                warn: (message, details) => logger.warn(message, details),
               })
               : {};
             if (sessionRunnerDebugLogEnv.HAPPIER_LOG_LEVEL) {

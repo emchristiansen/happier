@@ -1,12 +1,14 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { buildSpawnChildProcessEnv } from './buildSpawnChildProcessEnv';
 import {
   readSessionRunnerDebugLog,
   resolveSessionRunnerDebugLogEnv,
+  resolveSessionRunnerDebugLogEnvForSpawn,
+  SESSION_RUNNER_DEBUG_LOG_DIRNAME,
   writeSessionRunnerDebugLog,
 } from './sessionRunnerDebugLog';
 import { runDaemonSessionDebugLogCommand } from '@/cli/commands/daemonSessionDebugLog';
@@ -85,5 +87,77 @@ describe('per-session runner debug log switch', () => {
     await expect(runDaemonSessionDebugLogCommand(['maybe', sessionId], { daemonStateDir })).resolves.toBe(1);
     await expect(runDaemonSessionDebugLogCommand(['on'], { daemonStateDir })).resolves.toBe(1);
     expect(error).toHaveBeenCalled();
+  });
+
+  describe('at spawn, a switch that cannot be read is off and never fails the spawn', () => {
+    async function spawnEnvAtSpawn(params: Readonly<{
+      sessionId: string;
+      resolveDaemonStateDir: () => string;
+    }>): Promise<Readonly<{ env: NodeJS.ProcessEnv; warn: ReturnType<typeof vi.fn> }>> {
+      const warn = vi.fn();
+      const debugLogEnv = await resolveSessionRunnerDebugLogEnvForSpawn({ ...params, warn });
+      const env = buildSpawnChildProcessEnv({ processEnv: { PATH: '/bin' }, extraEnv: { CUSTOM: 'x', ...debugLogEnv } });
+      return { env, warn };
+    }
+
+    it('spawns at the default level, warning once with the error, when locating the switch throws', async () => {
+      // The daemon derives the directory from its configuration; dirname() of a missing value throws.
+      const { env, warn } = await spawnEnvAtSpawn({
+        sessionId: 'cmthrowingread0005',
+        resolveDaemonStateDir: () => dirname(undefined as unknown as string),
+      });
+
+      expect(env.HAPPIER_LOG_LEVEL).toBeUndefined();
+      expect(env.CUSTOM).toBe('x');
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]?.[1]).toEqual({
+        sessionId: 'cmthrowingread0005',
+        error: expect.objectContaining({ name: 'TypeError', code: 'ERR_INVALID_ARG_TYPE' }),
+      });
+    });
+
+    it('spawns at the default level, warning once with the error, when the switch directory is unreadable', async () => {
+      const sessionId = 'cmunreadableswitch6';
+      await writeSessionRunnerDebugLog({ daemonStateDir, sessionId, enabled: true });
+      const switchDir = join(daemonStateDir, SESSION_RUNNER_DEBUG_LOG_DIRNAME);
+      await chmod(switchDir, 0o000);
+      try {
+        const { env, warn } = await spawnEnvAtSpawn({ sessionId, resolveDaemonStateDir: () => daemonStateDir });
+
+        expect(env.HAPPIER_LOG_LEVEL).toBeUndefined();
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn.mock.calls[0]?.[1]).toEqual({ sessionId, error: expect.objectContaining({ code: 'EACCES' }) });
+      } finally {
+        await chmod(switchDir, 0o700);
+      }
+    });
+
+    it('spawns at the default level, warning once, when the marker is not a regular file', async () => {
+      const sessionId = 'cmdirectorymarker07';
+      await mkdir(join(daemonStateDir, SESSION_RUNNER_DEBUG_LOG_DIRNAME, sessionId), { recursive: true });
+
+      const { env, warn } = await spawnEnvAtSpawn({ sessionId, resolveDaemonStateDir: () => daemonStateDir });
+
+      expect(env.HAPPIER_LOG_LEVEL).toBeUndefined();
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]?.[1]).toEqual({ sessionId, error: expect.any(Error) });
+    });
+
+    it('treats a missing switch directory as off without a warning, and any regular-file marker as on', async () => {
+      const missing = await spawnEnvAtSpawn({
+        sessionId: 'cmmissingswitchdir8',
+        resolveDaemonStateDir: () => join(daemonStateDir, 'no-such-daemon-state-dir'),
+      });
+      expect(missing.env.HAPPIER_LOG_LEVEL).toBeUndefined();
+      expect(missing.warn).not.toHaveBeenCalled();
+
+      // The marker's contents are informational; the switch is the marker's existence as a file.
+      const sessionId = 'cmmalformedmarker09';
+      await mkdir(join(daemonStateDir, SESSION_RUNNER_DEBUG_LOG_DIRNAME), { recursive: true });
+      await writeFile(join(daemonStateDir, SESSION_RUNNER_DEBUG_LOG_DIRNAME, sessionId), 'not json');
+      const malformed = await spawnEnvAtSpawn({ sessionId, resolveDaemonStateDir: () => daemonStateDir });
+      expect(malformed.env.HAPPIER_LOG_LEVEL).toBe('debug');
+      expect(malformed.warn).not.toHaveBeenCalled();
+    });
   });
 });
