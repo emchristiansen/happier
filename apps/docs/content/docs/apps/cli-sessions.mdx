@@ -160,6 +160,15 @@ happier session archive <session-id-or-prefix>
 happier session unarchive <session-id-or-prefix>
 ```
 
+Move a session into a folder, or out of every folder:
+
+```bash
+happier session set-folder <session-id-or-prefix> <folder-id>
+happier session set-folder <session-id-or-prefix> --none
+```
+
+The folder is named by its id. After the change the command reads the session's folder back from the server and reports it (`data.readback.folderId` with `--json`); it fails with `folder_not_found` when the id is not an active folder of the account, and with `readback_mismatch` when the server reports a different folder afterwards.
+
 Update metadata:
 
 ```bash
