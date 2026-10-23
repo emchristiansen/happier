@@ -132,9 +132,10 @@ async function readBack(token: string, sessionId: string, localId: string): Prom
  * The route itself checks only that the row is in a resolvable state; it has no compare-and-set
  * on the state the caller observed. This function therefore refuses unless a fresh read shows
  * the row in exactly the expected state, posts once (never retrying), and reads the queue back.
- * Between the pre-read and the POST another writer can still move the row, so the readback, not
- * the pre-read, is the proof of what happened. The receipt never claims delivery: the caller must
- * hold that proof independently.
+ * Between the pre-read and the POST another writer can still move the row, so the pre-read does not
+ * show the state the POST acted on. The committed transcript message in the POST response
+ * establishes that this request resolved the row; the readback only reports what two later reads
+ * observed. The receipt never claims delivery: the caller must hold that proof independently.
  */
 export async function markSessionPendingInputHandled(params: Readonly<{
   credentials: Credentials | undefined;
@@ -178,14 +179,24 @@ export async function markSessionPendingInputHandled(params: Readonly<{
       sessionId: request.sessionId,
       localId: request.localId,
     });
-    const counts = {
-      pendingCount: posted.pendingQueueState?.pendingCount ?? null,
-      pendingBlockedCount: posted.pendingQueueState?.pendingBlockedCount ?? null,
-      pendingVersion: posted.pendingQueueState?.pendingVersion ?? null,
-    };
-    postOutcome = posted.transcriptMessage
-      ? { outcome: 'resolved', post: { ...counts, transcriptMessage: posted.transcriptMessage } }
-      : { outcome: 'not_resolved', post: counts };
+    postOutcome = posted.transcriptMessage === null
+      ? {
+          outcome: 'not_resolved',
+          post: {
+            pendingCount: posted.pendingQueueState.pendingCount,
+            pendingBlockedCount: posted.pendingQueueState.pendingBlockedCount,
+            pendingVersion: posted.pendingQueueState.pendingVersion,
+          },
+        }
+      : {
+          outcome: 'resolved',
+          post: {
+            pendingCount: posted.pendingQueueState?.pendingCount ?? null,
+            pendingBlockedCount: posted.pendingQueueState?.pendingBlockedCount ?? null,
+            pendingVersion: posted.pendingQueueState?.pendingVersion ?? null,
+            transcriptMessage: posted.transcriptMessage,
+          },
+        };
   } catch (error) {
     postOutcome = classifyPostFailure(error);
   }
