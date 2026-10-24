@@ -9,6 +9,7 @@ import {
     discardPendingMessage,
     dismissPendingDelivery,
     enqueuePendingMessage,
+    getPendingDeliveryStatus,
     listPendingMessages,
     markPendingDeliveryHandled,
     markPendingActivationFailed,
@@ -66,6 +67,25 @@ function getOptionalErrorCode(value: unknown): string | undefined {
 }
 
 export function sessionPendingRoutes(app: Fastify) {
+    app.get(
+        "/v2/sessions/:sessionId/pending/:localId/status",
+        {
+            preHandler: app.authenticate,
+            schema: { params: z.object({ sessionId: z.string(), localId: PendingLocalIdSchema }) },
+            config: { rateLimit: resolveApiHotEndpointRateLimit(process.env, "session.pending") },
+        },
+        async (request, reply) => {
+            const result = await getPendingDeliveryStatus({ actorUserId: request.userId, ...request.params });
+            if (!result.ok) {
+                const status = result.error === "forbidden" ? 403
+                    : result.error === "not-found" || result.error === "session-not-found" ? 404
+                        : result.error === "invalid-params" ? 400 : 500;
+                return reply.code(status).send({ error: result.error });
+            }
+            return reply.send({ localId: result.localId, deliveryStatus: result.deliveryStatus });
+        },
+    );
+
     app.get(
         "/v2/sessions/:sessionId/pending",
         {

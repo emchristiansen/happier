@@ -26,7 +26,7 @@ const boundary = vi.hoisted(() => {
     vi.stubEnv(key, "https://relay.example.invalid");
   }
   vi.stubEnv("HAPPIER_HOME_DIR", `${process.env.TMPDIR}/pending-discovery-fixture`);
-  return { get: vi.fn(), beforeJournalRead: null as (() => Promise<void>) | null };
+  return { get: vi.fn(), post: vi.fn(), beforeJournalRead: null as (() => Promise<void>) | null };
 });
 const origin = "https://relay.example.invalid";
 const home = join(tmpdir(), "pending-discovery-fixture");
@@ -37,7 +37,17 @@ let userSocket: ApiSessionSocketStub;
 // Snapshot parsing, session custody, reconciliation, queue and input consumer stay real.
 vi.mock("axios", async () => {
   const { createOfflineAxios } = await import("@/testkit/http/offlineAxios");
-  return { default: createOfflineAxios((url) => boundary.get(url)) };
+  return {
+    default: {
+      ...createOfflineAxios((url) => boundary.get(url)),
+      post: (url: string, body: unknown) => {
+        if (new URL(url).origin !== "https://relay.example.invalid") {
+          throw new Error(`Offline HTTP boundary refused origin: ${new URL(url).origin}`);
+        }
+        return boundary.post(url, body);
+      },
+    },
+  };
 });
 // The journal read is a filesystem boundary; all outbox/readiness logic stays real.
 vi.mock("node:fs/promises", async (importOriginal) => {
@@ -275,6 +285,7 @@ describe("authoritative pending discovery through the session client and consume
     detailReads.mockClear();
     claims.mockClear();
     settlements.mockClear();
+    boundary.post.mockReset().mockRejectedValue(new Error("Unconfigured offline HTTP POST"));
     boundary.get.mockReset().mockImplementation(async (url: string) => {
       const path = new URL(url).pathname;
       if (path === `/v2/sessions/${snapshot.id}`) {
@@ -306,6 +317,183 @@ describe("authoritative pending discovery through the session client and consume
     }
     vi.restoreAllMocks();
     vi.useRealTimers();
+  });
+
+  it("re-offers blocked-only pending work after 60 seconds without another hint", async () => {
+    snapshot = { ...snapshot, pendingCount: 1, pendingBlockedCount: 1, pendingVersion: 1 };
+    const { client } = await createClient();
+    await client.reconcilePendingQueueState({ force: true });
+    const { consumer, controller } = consume(client);
+    let delivered: Awaited<ReturnType<typeof consumer.waitForNextInput>> | undefined;
+    const waiting = consumer.waitForNextInput({ abortSignal: controller.signal }).then((batch) => { delivered = batch; });
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(claims).not.toHaveBeenCalled();
+    // An unchanged snapshot must not postpone the already armed attempt.
+    await client.reconcilePendingQueueState({ force: true });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(delivered?.message).toEqual({ ...originalPrompt, createdAt: 1_000 });
+    expect(claims).toHaveBeenCalledWith(expect.objectContaining({
+      foregroundState: "ready", heldLocalIds: [],
+    }));
+    controller.abort();
+    await waiting;
+  });
+
+  it("repeats a delayed blocked-row attempt and stops when the authoritative blocked count clears", async () => {
+    snapshot = { ...snapshot, pendingCount: 1, pendingBlockedCount: 1, pendingVersion: 1 };
+    const { client } = await createClient();
+    await client.reconcilePendingQueueState({ force: true });
+    materialize = async () => ({ ok: true, didMaterialize: false, pendingCount: 1, pendingBlockedCount: 1, pendingVersion: 1 });
+    const { consumer, controller } = consume(client);
+    const waiting = consumer.waitForNextInput({ abortSignal: controller.signal });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(claims).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(claims).toHaveBeenCalledTimes(2);
+    snapshot = { ...snapshot, pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 2 };
+    await client.reconcilePendingQueueState({ force: true });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(claims).toHaveBeenCalledTimes(2);
+    controller.abort();
+    await waiting;
+  });
+
+  it("retries through the real consumer 60 seconds after a successful claim becomes delayed-blocked", async () => {
+    snapshot = { ...snapshot, pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 1 };
+    const { client } = await createClient();
+    await client.reconcilePendingQueueState({ force: true });
+    const { consumer, controller } = consume(client);
+    const first = await consumer.waitForNextInput({ abortSignal: controller.signal });
+    expect(first?.message.localId).toBe(originalPrompt.localId);
+    expect(claims).toHaveBeenCalledTimes(1);
+    detailReads.mockClear();
+    boundary.post.mockResolvedValueOnce({
+      status: 200,
+      data: { ok: true, pendingCount: 1, pendingBlockedCount: 1, pendingVersion: 3 },
+    });
+    await expect(client.blockPendingMessageDelivery({
+      localIds: [originalPrompt.localId], reason: "provider_unavailable_before_acceptance", providerEffect: "none",
+    })).resolves.toBe(true);
+    expect(boundary.post).toHaveBeenCalledWith(
+      `${origin}/v2/sessions/${snapshot.id}/pending/${originalPrompt.localId}/delivery/block`,
+      { reason: "provider_unavailable_before_acceptance" },
+    );
+    const replacementPrompt = { ...originalPrompt, localId: "replacement-after-delayed-block" };
+    materialize = async () => ({
+      ...claimed(), localId: replacementPrompt.localId, pendingVersion: 4,
+      message: { ...claimed().message, localId: replacementPrompt.localId, content: { t: "plain", v: replacementPrompt } },
+    });
+    let next: Awaited<ReturnType<typeof consumer.waitForNextInput>> | undefined;
+    const waiting = consumer.waitForNextInput({ abortSignal: controller.signal }).then((batch) => { next = batch; });
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(claims).toHaveBeenCalledTimes(1);
+    expect(detailReads).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(claims).toHaveBeenCalledTimes(2);
+    expect(next?.message).toEqual({ ...replacementPrompt, createdAt: 1_000 });
+    expect(detailReads).not.toHaveBeenCalled();
+    controller.abort();
+    await waiting;
+  });
+
+  it("rearms the minute retry when blocked A remains after successful claim and settlement of B", async () => {
+    snapshot = { ...snapshot, pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 1 };
+    const { client, observe } = await createClient();
+    await client.reconcilePendingQueueState({ force: true });
+    materialize = async () => ({ ...claimed(), pendingCount: 2, pendingBlockedCount: 1 });
+    const { consumer, controller } = consume(client);
+    const first = await consumer.waitForNextInput({ abortSignal: controller.signal });
+    expect(first?.message.localId).toBe(originalPrompt.localId);
+    expect(claims).toHaveBeenCalledTimes(1);
+    detailReads.mockClear();
+    settle = async () => ({ ...committed(), pendingCount: 1, pendingBlockedCount: 1 });
+    observe({ kind: "accepted", localId: originalPrompt.localId });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settlements).toHaveBeenCalledTimes(1);
+    expect(client.hasCanonicalPendingProviderInputDelivery(originalPrompt.localId)).toBe(false);
+    const replacementPrompt = { ...originalPrompt, localId: "replacement-of-blocked-A" };
+    materialize = async () => ({
+      ...claimed(), localId: replacementPrompt.localId, pendingVersion: 4,
+      message: { ...claimed().message, localId: replacementPrompt.localId, content: { t: "plain", v: replacementPrompt } },
+    });
+    let next: Awaited<ReturnType<typeof consumer.waitForNextInput>> | undefined;
+    const waiting = consumer.waitForNextInput({ abortSignal: controller.signal }).then((batch) => { next = batch; });
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(claims).toHaveBeenCalledTimes(1);
+    expect(detailReads).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(claims).toHaveBeenCalledTimes(2);
+    expect(next?.message).toEqual({ ...replacementPrompt, createdAt: 1_000 });
+    expect(detailReads).not.toHaveBeenCalled();
+    controller.abort();
+    await waiting;
+  });
+
+  it("arms the minute retry from a blocked-only hint after an empty authoritative discovery", async () => {
+    const { client } = await createClient();
+    await client.reconcilePendingQueueState({ force: true });
+    const { consumer, controller } = consume(client);
+    let delivered: Awaited<ReturnType<typeof consumer.waitForNextInput>> | undefined;
+    const waiting = consumer.waitForNextInput({ abortSignal: controller.signal }).then((batch) => { delivered = batch; });
+    await vi.advanceTimersByTimeAsync(0);
+    userSocket.trigger("update", {
+      id: "blocked-after-empty-discovery", seq: 2, createdAt: Date.now(),
+      body: { t: "pending-changed", sid: snapshot.id, pendingCount: 1, pendingBlockedCount: 1, pendingVersion: 1 },
+    });
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(claims).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(claims).toHaveBeenCalledTimes(1);
+    expect(delivered?.message).toEqual({ ...originalPrompt, createdAt: 1_000 });
+    controller.abort();
+    await waiting;
+  });
+
+  it("re-offers an external-handoff-only queue after an early no-claim response without another hint", async () => {
+    snapshot = { ...snapshot, pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 1 };
+    const { client } = await createClient();
+    await client.reconcilePendingQueueState({ force: true });
+    const startedAt = Date.now();
+    materialize = async () => Date.now() - startedAt >= 60_000 ? claimed() : ({
+      ok: true, didMaterialize: false, pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 1,
+    });
+    const { consumer, controller } = consume(client);
+    let delivered: Awaited<ReturnType<typeof consumer.waitForNextInput>> | undefined;
+    const waiting = consumer.waitForNextInput({ abortSignal: controller.signal }).then((batch) => { delivered = batch; });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(claims).toHaveBeenCalledTimes(1);
+    expect(delivered).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(59_999);
+    await client.reconcilePendingQueueState({ force: true });
+    expect(claims).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(claims).toHaveBeenCalledTimes(2);
+    expect(delivered?.message).toEqual({ ...originalPrompt, createdAt: 1_000 });
+    controller.abort();
+    await waiting;
+  });
+
+  it("repeats minute attempts while an old-server head stays held despite healthy unchanged discovery", async () => {
+    snapshot = { ...snapshot, pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 1 };
+    const { client } = await createClient();
+    await client.reconcilePendingQueueState({ force: true });
+    materialize = async () => ({
+      ok: true, didMaterialize: false, deferredReason: 'waiting_for_predecessor',
+      pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 1,
+    });
+    const { consumer, controller } = consume(client);
+    const waiting = consumer.waitForNextInput({ abortSignal: controller.signal });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(claims).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(detailReads).toHaveBeenCalled();
+    expect(claims).toHaveBeenCalledTimes(6);
+    snapshot = { ...snapshot, pendingCount: 0, pendingVersion: 2 };
+    await client.reconcilePendingQueueState({ force: true });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(claims).toHaveBeenCalledTimes(6);
+    controller.abort();
+    await waiting;
   });
 
   it("discovers a completely missed hint from cached empty and delivers the complete original input once", async () => {
@@ -535,7 +723,7 @@ describe("authoritative pending discovery through the session client and consume
     expect(detailReads).toHaveBeenCalledTimes(1);
   });
 
-  it("retains a reserved/accepted input across ticks and a lost settlement ACK without another provider entry", async () => {
+  it("retains reserved input until the watchdog deadline and settles a lost ACK without another provider entry", async () => {
     const { client, observe } = await createClient();
     const { consumer, controller } = consume(client);
     const waiting = consumer.waitForNextInput({ abortSignal: controller.signal });
@@ -545,7 +733,7 @@ describe("authoritative pending discovery through the session client and consume
     const batch = await waiting;
     expect(batch?.message).toEqual({ ...originalPrompt, createdAt: 1_000 });
     const readsAtReservation = detailReads.mock.calls.length;
-    await vi.advanceTimersByTimeAsync(1_800_000);
+    await vi.advanceTimersByTimeAsync(119_999);
     await expect(consumer.drainPending({ abortSignal: controller.signal })).resolves.toMatchObject({
       materialized: 0,
     });
@@ -584,46 +772,36 @@ describe("authoritative pending discovery through the session client and consume
     ]);
   });
 
-  it("names a held accepted input once when the consumer's custody gate stops materialization", async () => {
-    const infoSpy = vi.spyOn(logger, "infoFile");
-    const heldLines = () =>
-      infoSpy.mock.calls.filter(([message]) => message === "[pendingQueue] materialization held by provider custody");
+  it("delivers later input through the consumer while an accepted settlement remains unfinished", async () => {
     const { client, observe } = await createClient();
     const { consumer, controller } = consume(client);
     const waiting = consumer.waitForNextInput({ abortSignal: controller.signal });
     snapshot = { ...snapshot, pendingCount: 1, pendingVersion: 1 };
     await vi.advanceTimersByTimeAsync(300_000);
     expect(await waiting).toBeTruthy();
-    // The server refuses the accepted input's settlement without a retry, so its custody stays held.
     settle = async () => ({ ok: false, error: "transcript-conflict" });
     await consumer.runProviderInputDispatch({
       abortSignal: controller.signal,
-      dispatch: async () => {
-        observe({ kind: "accepted", localId: originalPrompt.localId });
-      },
+      dispatch: async () => { observe({ kind: "accepted", localId: originalPrompt.localId }); },
     });
     await vi.advanceTimersByTimeAsync(1_000);
     expect(settlements).toHaveBeenCalledTimes(1);
     expect(client.hasCanonicalPendingProviderInputDelivery(originalPrompt.localId)).toBe(true);
-
-    // A later input queues behind it; each drain stops at the consumer's custody gate.
-    snapshot = { ...snapshot, pendingCount: 1, pendingVersion: 4 };
+    snapshot = { ...snapshot, pendingCount: 2, pendingVersion: 4 };
+    const laterPrompt = { ...originalPrompt, localId: "later-after-unsettled-acceptance" };
+    materialize = async () => ({
+      ...claimed(), localId: laterPrompt.localId, pendingVersion: 5,
+      message: { ...claimed().message, localId: laterPrompt.localId, content: { t: "plain", v: laterPrompt } },
+    });
     await client.reconcilePendingQueueState({ force: true });
-    for (let drain = 0; drain < 2; drain += 1) {
-      await expect(consumer.drainPending({ abortSignal: controller.signal })).resolves.toMatchObject({
-        materialized: 0,
-        stoppedReason: "materialization_blocked",
-      });
-    }
-
-    expect(heldLines()).toEqual([[
-      "[pendingQueue] materialization held by provider custody",
-      expect.objectContaining({ localId: originalPrompt.localId, providerInputOutcome: "accepted" }),
-    ]]);
-    expect(claims).toHaveBeenCalledTimes(1);
+    await expect(consumer.drainPending({ abortSignal: controller.signal })).resolves.toMatchObject({ materialized: 1 });
+    expect(claims.mock.calls[1]?.[0]).toMatchObject({ heldLocalIds: [originalPrompt.localId] });
+    const later = await consumer.waitForNextInput({ abortSignal: controller.signal });
+    expect(later?.message.localId).toBe(laterPrompt.localId);
+    expect(client.hasCanonicalPendingProviderInputDelivery(originalPrompt.localId)).toBe(true);
   });
 
-  it("renews one exhausted consumer episode after observed read recovery, never from elapsed or unchanged healthy ticks", async () => {
+  it("keeps transport failures bounded until read recovery, then renews minute attempts while pending rows remain", async () => {
     const { client } = await createClient(1);
     const { consumer, controller } = consume(client);
     readSnapshot = async () => {
@@ -640,10 +818,16 @@ describe("authoritative pending discovery through the session client and consume
     expect(attempts).toHaveBeenCalledTimes(12);
     snapshot = { ...snapshot, pendingCount: 1, pendingVersion: 0 };
     readSnapshot = async () => ({ status: 200, data: { session: snapshot } });
+    materialize = async () => ({
+      ok: true, didMaterialize: false, pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 0,
+    });
     await vi.advanceTimersByTimeAsync(60 * 60_000);
-    expect(attempts).toHaveBeenCalledTimes(24);
-    await vi.advanceTimersByTimeAsync(4 * 60 * 60_000);
-    expect(attempts).toHaveBeenCalledTimes(24);
+    expect(attempts.mock.calls.length).toBeGreaterThan(12);
+    const afterRecovery = attempts.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(attempts).toHaveBeenCalledTimes(afterRecovery + 1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(attempts).toHaveBeenCalledTimes(afterRecovery + 2);
     controller.abort();
     await waiting;
   });

@@ -184,6 +184,7 @@ type PendingMaterializePayload = Readonly<{
     deliveryState?: 'provider';
     deliveryTiming?: SessionPendingQueueDeliveryTiming;
     foregroundState?: 'ready' | 'active_steerable' | 'active_unsteerable';
+    heldLocalIds?: readonly string[];
 }>;
 
 export type PendingQueueDeliveryBlockedReason = PendingDeliveryBlockedReason;
@@ -335,6 +336,9 @@ function readPendingMaterializePayload(payload: unknown): PendingMaterializePayl
         ...(record.deliveryState === 'provider' ? { deliveryState: 'provider' } : {}),
         ...(record.deliveryTiming === 'after_foreground_ready' || record.deliveryTiming === 'after_runtime_idle'
             ? { deliveryTiming: record.deliveryTiming }
+            : {}),
+        ...(Array.isArray(record.heldLocalIds) && record.heldLocalIds.every((id) => typeof id === 'string')
+            ? { heldLocalIds: record.heldLocalIds }
             : {}),
         ...(record.foregroundState === 'ready' || record.foregroundState === 'active_steerable' || record.foregroundState === 'active_unsteerable'
             ? { foregroundState: record.foregroundState }
@@ -638,6 +642,7 @@ function buildPendingMaterializeBody(params: {
     deliveryStateOptIn?: boolean;
     deliveryTiming?: SessionPendingQueueDeliveryTiming;
     foregroundState?: 'ready' | 'active_steerable' | 'active_unsteerable';
+    heldLocalIds?: readonly string[];
 }): Record<string, unknown> {
     return {
         ...(typeof params.expectedPendingVersion === 'number'
@@ -651,6 +656,7 @@ function buildPendingMaterializeBody(params: {
             ? { deliveryTiming: params.deliveryTiming }
             : {}),
         ...(params.foregroundState ? { foregroundState: params.foregroundState } : {}),
+        ...(params.heldLocalIds ? { heldLocalIds: params.heldLocalIds } : {}),
     };
 }
 
@@ -891,6 +897,7 @@ export async function readPendingQueueV2ActivationEligibilityFromServer(params: 
 export type PendingQueueV2DeliveryStatusEntry = Readonly<{
     localId: string;
     status: PendingDeliveryStatusV1['status'];
+    discardedReason?: string | null;
 }>;
 
 /**
@@ -902,7 +909,36 @@ export type PendingQueueV2DeliveryStatusEntry = Readonly<{
 export async function listPendingQueueV2DeliveryStatusesFromServer(params: {
     token: string;
     sessionId: string;
+    localIds?: readonly string[];
 }): Promise<PendingQueueV2DeliveryStatusEntry[]> {
+    if (params.localIds) {
+        const localIds = [...new Set(params.localIds.map(requirePendingLocalId))];
+        const exact = await Promise.all(localIds.map(async (localId): Promise<PendingQueueV2DeliveryStatusEntry | null> => {
+            try {
+                const response = await axios.get(
+                    `${resolveServerHttpBaseUrl()}/v2/sessions/${encodeURIComponent(params.sessionId)}/pending/${encodeURIComponent(localId)}/status`,
+                    { headers: buildSessionRunnerHttpHeaders(params.token), timeout: 10_000 },
+                );
+                const status = parsePendingDeliveryStatusV1(response?.data?.deliveryStatus);
+                if (response?.data?.localId !== localId || !status) throw new Error('Invalid exact pending delivery status');
+                return {
+                    localId, status: status.status,
+                    ...(status.status === 'discarded' ? { discardedReason: status.reason } : {}),
+                };
+            } catch (error) {
+                if ((error as { response?: { status?: unknown } })?.response?.status === 404) return null;
+                throw error;
+            }
+        }));
+        // An old route or absent exact row supplies no recovery proof. Preserve the existing
+        // listing fallback for those IDs; absence never becomes a terminal outcome.
+        const missing = new Set(localIds.filter((_, index) => exact[index] === null));
+        const legacy = missing.size > 0 ? await fetchPendingQueueV2Projection(params) : [];
+        return [
+            ...exact.filter((entry): entry is PendingQueueV2DeliveryStatusEntry => entry !== null),
+            ...legacy.filter((entry) => missing.has(entry.localId)).map((entry) => ({ localId: entry.localId, status: entry.deliveryStatus.status })),
+        ];
+    }
     const pending = await fetchPendingQueueV2Projection(params);
     return pending.map((entry) => ({
         localId: entry.localId,
@@ -1213,6 +1249,7 @@ async function tryMaterializeNextViaSocket(params: {
     deliveryStateOptIn?: boolean;
     deliveryTiming?: SessionPendingQueueDeliveryTiming;
     foregroundState?: 'ready' | 'active_steerable' | 'active_unsteerable';
+    heldLocalIds?: readonly string[];
 }): Promise<PendingQueueSocketMaterializeResult> {
     try {
         const rawAck = await emitSocketWithAck<Record<string, unknown>>({
@@ -1233,6 +1270,7 @@ async function tryMaterializeNextViaSocket(params: {
                     ? { deliveryTiming: params.deliveryTiming }
                     : {}),
                 ...(params.foregroundState ? { foregroundState: params.foregroundState } : {}),
+                ...(params.heldLocalIds ? { heldLocalIds: params.heldLocalIds } : {}),
             },
         });
         if (!rawAck || typeof rawAck !== 'object' || Array.isArray(rawAck)) {
@@ -1324,6 +1362,7 @@ async function tryMaterializeNextViaHttp(params: {
     deliveryStateOptIn?: boolean;
     deliveryTiming?: SessionPendingQueueDeliveryTiming;
     foregroundState?: 'ready' | 'active_steerable' | 'active_unsteerable';
+    heldLocalIds?: readonly string[];
 }): Promise<PendingQueueHttpMaterializeResult> {
     const serverUrl = resolveServerHttpBaseUrl();
     const response = await axios.post(
@@ -1387,6 +1426,7 @@ export async function materializeNextPendingQueueV2MessageViaHttp(params: {
     deliveryStateOptIn?: boolean;
     deliveryTiming?: SessionPendingQueueDeliveryTiming;
     foregroundState?: 'ready' | 'active_steerable' | 'active_unsteerable';
+    heldLocalIds?: readonly string[];
 }): Promise<PendingQueueMaterializeNextResult> {
     const res = await tryMaterializeNextViaHttp({
         ...params,
@@ -1443,6 +1483,7 @@ export async function materializeNextPendingQueueV2Message(params: {
     deliveryStateOptIn?: boolean;
     deliveryTiming?: SessionPendingQueueDeliveryTiming;
     foregroundState?: 'ready' | 'active_steerable' | 'active_unsteerable';
+    heldLocalIds?: readonly string[];
 }): Promise<PendingQueueMaterializeNextResult> {
     // Strict by default: callers that want best-effort suppression must do so explicitly.
     if (params.socket && params.socket.connected !== true) {
@@ -1462,6 +1503,7 @@ export async function materializeNextPendingQueueV2Message(params: {
             deliveryStateOptIn: params.deliveryStateOptIn === true,
             deliveryTiming: params.deliveryTiming,
             foregroundState: params.foregroundState,
+            heldLocalIds: params.heldLocalIds,
         })
         : null;
     let res: PendingQueueSocketMaterializeResult | PendingQueueHttpMaterializeResult;
@@ -1480,6 +1522,7 @@ export async function materializeNextPendingQueueV2Message(params: {
             deliveryStateOptIn: params.deliveryStateOptIn === true,
             deliveryTiming: params.deliveryTiming,
             foregroundState: params.foregroundState,
+            heldLocalIds: params.heldLocalIds,
         });
     }
     if (!res.didMaterialize) {

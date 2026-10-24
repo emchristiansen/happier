@@ -301,6 +301,42 @@ describe('pendingQueueV2Transport', () => {
         expect(mockPost).not.toHaveBeenCalled();
     });
 
+    it.each([
+        materializeNextPendingQueueV2MessageViaHttp,
+        materializeNextPendingQueueV2Message,
+    ])('sends held claim identities over HTTP materialization', async (materialize) => {
+        mockPost.mockResolvedValueOnce({ data: { ok: true, didMaterialize: false } });
+        await materialize({
+            token: 'token',
+            sessionId: 'session-1',
+            heldLocalIds: ['accepted-local', 'uncertain-local'],
+        });
+        expect(mockPost.mock.calls[0]?.[1]).toEqual({
+            heldLocalIds: ['accepted-local', 'uncertain-local'],
+        });
+    });
+
+    it('sends held claim identities over socket materialization', async () => {
+        const socket = {
+            connected: true,
+            timeout: () => socket,
+            emitWithAck: vi.fn(async () => ({ ok: true, didMaterialize: false })),
+        };
+        // Socket.IO is the external boundary; the fixture implements the ACK surface used here.
+        const transport = socket as unknown as NonNullable<Parameters<typeof materializeNextPendingQueueV2Message>[0]['socket']>;
+        await materializeNextPendingQueueV2Message({
+            token: 'token',
+            sessionId: 'session-1',
+            socket: transport,
+            heldLocalIds: ['accepted-local', 'uncertain-local'],
+        });
+        expect(socket.emitWithAck).toHaveBeenCalledWith('pending-materialize-next', {
+            sid: 'session-1',
+            heldLocalIds: ['accepted-local', 'uncertain-local'],
+        });
+        expect(mockPost).not.toHaveBeenCalled();
+    });
+
     it('sends runtime-idle delivery timing in HTTP materialization requests', async () => {
         mockPost.mockResolvedValueOnce({
             data: {
@@ -1652,6 +1688,49 @@ describe('pendingQueueV2Transport', () => {
                 timeout: 10_000,
             }),
         );
+    });
+
+    it.each(['resent_as_new', 'dismissed_uncertain'])('reads exact %s custody evidence only for the requested opaque claim IDs', async (reason) => {
+        const localId = ' exact/claim ';
+        mockGet.mockResolvedValueOnce({ data: { localId, deliveryStatus: { status: 'discarded', reason } } });
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 'session/1', localIds: [localId, localId] }))
+            .resolves.toEqual([{ localId, status: 'discarded', discardedReason: reason }]);
+        expect(mockGet).toHaveBeenCalledTimes(1);
+        expect(mockGet).toHaveBeenCalledWith(expect.stringContaining('/v2/sessions/session%2F1/pending/%20exact%2Fclaim%20/status'),
+            expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer token' }), timeout: 10_000 }));
+    });
+
+    it.each(['missing row', 'old server'])('falls back on a 404 (%s) without inventing hidden tombstone evidence', async () => {
+        mockGet.mockRejectedValueOnce({ response: { status: 404 } });
+        mockGet.mockResolvedValueOnce({ data: { pending: [{ localId: 'unrelated', deliveryStatus: { status: 'queued' } }] } });
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 's1', localIds: ['A'] })).resolves.toEqual([]);
+        expect(mockGet).toHaveBeenCalledTimes(2);
+    });
+
+    it('preserves the old-server visible blocked status fallback for an exact held ID', async () => {
+        mockGet.mockRejectedValueOnce({ response: { status: 404 } });
+        mockGet.mockResolvedValueOnce({ data: { pending: [{ localId: 'A', deliveryStatus: { status: 'blocked', reason: 'unknown' } }] } });
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 's1', localIds: ['A'] }))
+            .resolves.toEqual([{ localId: 'A', status: 'blocked' }]);
+    });
+
+    it.each([
+        { localId: 'different', deliveryStatus: { status: 'discarded', reason: 'resent_as_new' } },
+        { localId: 'A', deliveryStatus: { status: 'resolved' } },
+        { localId: 'A' },
+    ])('rejects mismatched or malformed exact evidence: %j', async (data) => {
+        mockGet.mockResolvedValueOnce({ data });
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 's1', localIds: ['A'] }))
+            .rejects.toThrow('Invalid exact pending delivery status');
+    });
+
+    it('does not swallow authorization failures or query without local claim IDs', async () => {
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 's1', localIds: [] })).resolves.toEqual([]);
+        expect(mockGet).not.toHaveBeenCalled();
+        const error = { response: { status: 403 } };
+        mockGet.mockRejectedValueOnce(error);
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 's1', localIds: ['A'] })).rejects.toBe(error);
+        expect(mockGet).toHaveBeenCalledTimes(1);
     });
 
     it('requires the exact queued user send-now row for inactive-session activation', async () => {

@@ -413,7 +413,7 @@ describe('ApiSessionClient session.userMessage.send delivery', () => {
     await vi.waitFor(() => expect(blockPendingQueueV2DeliveryMock).toHaveBeenCalledTimes(1));
     await (client as any).blockUnresolvedCanonicalPendingDeliveriesBeforeClose();
 
-    expect(blockPendingQueueV2DeliveryMock).toHaveBeenCalledTimes(2);
+    expect(blockPendingQueueV2DeliveryMock).toHaveBeenCalledTimes(1);
     expect(blockPendingQueueV2DeliveryMock).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: 's1',
       localId: 'uncertain-shutdown',
