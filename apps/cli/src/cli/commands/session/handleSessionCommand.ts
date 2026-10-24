@@ -13,6 +13,8 @@ import { cmdSessionStop } from './stop';
 import { cmdSessionArchive } from './archive';
 import { cmdSessionUnarchive } from './unarchive';
 import { cmdSessionSetTitle } from './setTitle';
+import { cmdSessionSetFolder, SESSION_SET_FOLDER_USAGE } from './setFolder';
+import { cmdSessionFolders, SESSION_FOLDERS_USAGE } from './folders';
 import { cmdSessionSetPermissionMode } from './setPermissionMode';
 import { cmdSessionSetModel } from './setModel';
 import { wantsJson, printJsonEnvelope } from '@/cli/output/jsonEnvelope';
@@ -43,6 +45,8 @@ function inferSessionKind(argv: readonly string[]): string {
   if (sub === 'status') return 'session_status';
   if (sub === 'create') return 'session_create';
   if (sub === 'set-title') return 'session_set_title';
+  if (sub === 'set-folder') return 'session_set_folder';
+  if (sub === 'folders') return 'session_folders';
   if (sub === 'set-permission-mode') return 'session_set_permission_mode';
   if (sub === 'set-model') return 'session_set_model';
   if (sub === 'send') return 'session_send';
@@ -88,6 +92,8 @@ const SESSION_HELP_BY_COMMAND = {
   stop: 'happier session stop <session-id-or-prefix-or-tag> [--json]',
   history: 'happier session history <session-id-or-prefix-or-tag> [--limit N] [--format compact|raw] [--include-meta] [--include-structured-payload] [--json]',
   'set-title': 'happier session set-title <session-id-or-prefix-or-tag> <title> [--json]',
+  folders: SESSION_FOLDERS_USAGE,
+  'set-folder': SESSION_SET_FOLDER_USAGE,
   'set-permission-mode': 'happier session set-permission-mode <session-id-or-prefix-or-tag> <mode> [--json]',
   'set-model': 'happier session set-model <session-id-or-prefix-or-tag> <model-id> [--json]',
   archive: 'happier session archive <session-id-or-prefix-or-tag> [--json]',
@@ -208,6 +214,12 @@ export async function handleSessionCommand(
         return;
       case 'set-title':
         await cmdSessionSetTitle(argv, { readCredentialsFn });
+        return;
+      case 'folders':
+        await cmdSessionFolders(argv, { readCredentialsFn });
+        return;
+      case 'set-folder':
+        await cmdSessionSetFolder(argv, { readCredentialsFn });
         return;
       case 'set-permission-mode':
         await cmdSessionSetPermissionMode(argv, { readCredentialsFn });

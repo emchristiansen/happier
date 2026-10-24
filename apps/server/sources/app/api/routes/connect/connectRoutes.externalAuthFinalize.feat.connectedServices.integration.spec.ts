@@ -7,6 +7,7 @@ import tweetnacl from "tweetnacl";
 import { db } from "@/storage/db";
 import { connectRoutes } from "./connectRoutes";
 import { auth } from "@/app/auth/auth";
+import { enforceLoginEligibility } from "@/app/auth/enforceLoginEligibility";
 import { encryptString } from "@/modules/encrypt";
 import { createAppCloseTracker } from "../../testkit/appLifecycle";
 
@@ -294,6 +295,97 @@ describe("connectRoutes (external auth finalize) (integration)", () => {
         });
         expect(identity?.providerUserId).toBe(String(githubProfile.id));
         expect(identity?.providerLogin).toBe("octocat");
+
+        await app.close();
+    });
+
+    it("rejects a login-eligibility check after rollback deletes an account whose standing a concurrent login cached", async () => {
+        applyGithubExternalAuthFinalizeEnv(harness, { AUTH_REQUIRED_LOGIN_PROVIDERS: "" });
+
+        const { body, publicKeyHex } = createAuthBody(12);
+
+        const pending = "oauth_pending_rollbackCachedA1";
+        const githubProfile = {
+            id: 1201,
+            login: "octocache",
+            avatar_url: "https://avatars.example.test/octo-cache.png",
+            name: "Octo Cache",
+        };
+        const tokenEnc = privacyKit.encodeBase64(
+            encryptString(["auth", "external", "github", "pending", pending, publicKeyHex], "tok_12"),
+        );
+        const profileEnc = privacyKit.encodeBase64(
+            encryptString(
+                ["auth", "external", "github", "pending", pending, publicKeyHex, "profile"],
+                JSON.stringify(githubProfile),
+            ),
+        );
+        await db.repeatKey.create({
+            data: {
+                key: pending,
+                value: JSON.stringify({
+                    flow: "auth",
+                    provider: "github",
+                    publicKeyHex,
+                    profileEnc,
+                    accessTokenEnc: tokenEnc,
+                    suggestedUsername: "octocache",
+                    usernameRequired: false,
+                    usernameReason: null,
+                }),
+                expiresAt: new Date(Date.now() + 60_000),
+            },
+        });
+
+        // While finalize awaits the avatar fetch, the provisional account is committed and visible. Stand in for a
+        // concurrent key-challenge login by running its eligibility check then, which caches the standing as active.
+        // githubConnect swallows avatar-fetch errors, so record what happened here and assert it afterwards.
+        let provisionalAccountId: string | null = null;
+        let concurrentEligibility: unknown = null;
+        vi.stubGlobal("fetch", (async (url: any) => {
+            if (url === githubProfile.avatar_url) {
+                const provisional = await db.account.findFirst({ where: { publicKey: publicKeyHex }, select: { id: true } });
+                provisionalAccountId = provisional?.id ?? null;
+                if (provisionalAccountId) {
+                    concurrentEligibility = await enforceLoginEligibility({ accountId: provisionalAccountId, env: process.env });
+                }
+                return { ok: false, arrayBuffer: async () => new ArrayBuffer(0) } as any;
+            }
+            throw new Error(`Unexpected fetch: ${String(url)}`);
+        }) as any);
+
+        // Fail the pending-record cleanup after a successful connect; finalize then rolls the new account back.
+        const originalDeleteMany = db.repeatKey.deleteMany.bind(db.repeatKey);
+        const deleteManySpy = vi.spyOn(db.repeatKey, "deleteMany").mockImplementation((async (args: any) => {
+            if (args?.where?.key === pending) {
+                throw new Error("pending cleanup failed");
+            }
+            return await originalDeleteMany(args);
+        }) as any);
+
+        const app = createTestApp();
+        connectRoutes(app as any);
+        await app.ready();
+        try {
+            const res = await app.inject({
+                method: "POST",
+                url: "/v1/auth/external/github/finalize",
+                headers: { "content-type": "application/json" },
+                payload: { pending, ...body },
+            });
+            expect(res.statusCode).toBe(500);
+        } finally {
+            // Not mockRestore: restoring a spy on a Prisma delegate reached through the db proxy leaves the method
+            // undefined for later callers in this file.
+            deleteManySpy.mockImplementation(originalDeleteMany as any);
+        }
+
+        expect(provisionalAccountId).not.toBeNull();
+        expect(concurrentEligibility).toEqual({ ok: true });
+        expect(await db.account.findUnique({ where: { id: provisionalAccountId! }, select: { id: true } })).toBeNull();
+        await expect(
+            enforceLoginEligibility({ accountId: provisionalAccountId!, env: process.env }),
+        ).resolves.toEqual({ ok: false, statusCode: 401, error: "invalid-token" });
 
         await app.close();
     });
@@ -1097,4 +1189,5 @@ describe("connectRoutes (external auth finalize) (integration)", () => {
             vi.resetModules();
         }
     });
+
 });

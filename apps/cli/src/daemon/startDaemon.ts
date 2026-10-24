@@ -153,7 +153,6 @@ import { waitForVisibleConsoleSessionWebhook } from './sessions/visibleConsoleSp
 import {
   createStopSession,
   isExactStopRunnerSoleTrackedRunner,
-  type StopSessionOptions,
 } from './sessions/stopSession';
 import {
   isTerminalHostPhysicallyRetiredStopResult,
@@ -802,6 +801,16 @@ async function resumeInactiveSessionWhenUsageLimitReady(params: Readonly<{
   const result = await params.spawnSession(spawnOptions);
   return result.type === 'success';
 }
+
+/**
+ * What a daemon Stop of a session means. An explicit Stop ends the session, so it also supersedes
+ * every automatic recovery owner. Replacing one exact runner incarnation that lost its publisher
+ * keeps the session: Resume spawns the successor at once, and automatic recovery, including the
+ * recovery whose own Resume asked for the replacement, continues under its own currentness checks.
+ */
+type DaemonSessionStopIntent =
+  | Readonly<{ kind: 'explicit_stop' }>
+  | Readonly<{ kind: 'replace_runner_incarnation'; exactRunner: MatchedLostPublisherRunner }>;
 
 async function persistExplicitSessionStopRecoveryCancellation(params: Readonly<{
   credentials: Credentials;
@@ -2372,7 +2381,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             return false;
           }
         };
-        const stopSessionInFlightBySessionId = new Map<string, Promise<StopSessionResult>>();
+        const stopSessionInFlightBySessionId = new Map<string, Readonly<{
+          intent: DaemonSessionStopIntent['kind'];
+          operation: Promise<StopSessionResult>;
+        }>>();
         const completedStopSessionIds = new Set<string>();
         const physicallyRetiredTerminalAttachmentIdBySessionId = new Map<string, string>();
         let terminalHostAdaptersPromise: ReturnType<typeof createDefaultTerminalHostRegistry> | null = null;
@@ -3045,7 +3057,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               const inFlightStop = stopSessionInFlightBySessionId.get(normalizedExistingSessionId);
               let precedingStopResult: StopSessionResult | null = null;
               if (inFlightStop) {
-                precedingStopResult = await inFlightStop;
+                precedingStopResult = await inFlightStop.operation;
               }
               // A new Resume attempt starts a new lifecycle generation. Never let a prior
               // completed Stop make a racing or subsequently failed stop look successful.
@@ -3118,8 +3130,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               });
               const initialResumeDecision = resolveSessionRunnerResumeDecision(initialServiceability);
               // A local runner that itself reports `publisher_lost` is alive but can never claim the
-              // queued input again. Replace it as a person would: Stop exactly that runner incarnation,
-              // then the ordinary spawn below, once the session's runner is proven absent.
+              // queued input again. Replace it: stop exactly that runner incarnation, then the ordinary
+              // spawn below, once the session's runner is proven absent. This is not an explicit Stop
+              // of the session, so it leaves automatic recovery, including any that requested this
+              // Resume, to continue against the successor.
               const replacePublisherLostRunner = async (
                 target: MatchedLostPublisherRunner,
               ): Promise<Extract<SpawnSessionResult, { type: 'error' }> | null> => {
@@ -3145,7 +3159,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   sessionId: normalizedExistingSessionId,
                   pid: target.pid,
                 });
-                const stopResult = await stopSession(normalizedExistingSessionId, { exactRunner: target });
+                const stopResult = await stopSession(normalizedExistingSessionId, {
+                  kind: 'replace_runner_incarnation',
+                  exactRunner: target,
+                });
                 if (
                   (stopResult.status === 'stopped' || stopResult.status === 'not_found')
                   && (await probeSessionRunnerServiceability(normalizedExistingSessionId)).state === 'runner_absent'
@@ -5713,54 +5730,73 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           }
         };
 
-        const stopSession = async (sessionId: string, options?: StopSessionOptions): Promise<StopSessionResult> => {
+        const supersedeAutomaticRecoveryForExplicitStop = async (normalizedSessionId: string): Promise<void> => {
+          const automaticRecoveryCancellations = await Promise.allSettled([
+            inactiveUsageLimitRecoveryCheckOwner.cancelSession({
+              sessionId: normalizedSessionId,
+              scheduler: inactiveUsageLimitRecoveryScheduler,
+            }),
+            runtimeAuthRecoveryScheduler?.cancel({ sessionId: normalizedSessionId }) ?? Promise.resolve(null),
+            temporaryThrottleRecoveryScheduler.stopRetrying({ sessionId: normalizedSessionId }),
+          ]);
+          const automaticRecoveryOwners = ['inactive_usage_limit', 'runtime_auth', 'temporary_throttle'] as const;
+          automaticRecoveryCancellations.forEach((result, index) => {
+            if (result.status !== 'rejected') return;
+            logger.warn('[DAEMON RUN] Automatic recovery cancellation failed after explicit Stop', {
+              sessionId: normalizedSessionId,
+              owner: automaticRecoveryOwners[index],
+              error: serializeAxiosErrorForLog(result.reason),
+            });
+          });
+          temporaryThrottleResumeSnapshotsBySessionId.delete(normalizedSessionId);
+          await clearConnectedServiceRecoveryAfterSupersession({
+            sessionId: normalizedSessionId,
+            event: {
+              kind: 'manual_session_supersession',
+              reason: 'stop',
+            },
+          });
+          await persistExplicitSessionStopRecoveryCancellation({
+            credentials,
+            sessionId: normalizedSessionId,
+          }).catch((error) => {
+            logger.warn('[DAEMON RUN] Failed to publish usage-limit recovery cancellation after explicit Stop', {
+              sessionId: normalizedSessionId,
+              error: serializeAxiosErrorForLog(error),
+            });
+          });
+        };
+
+        const stopSession = async (
+          sessionId: string,
+          intent: DaemonSessionStopIntent = { kind: 'explicit_stop' },
+        ): Promise<StopSessionResult> => {
           const normalizedSessionId = String(sessionId ?? '').trim();
           const existingStop = stopSessionInFlightBySessionId.get(normalizedSessionId);
-          if (existingStop) return await existingStop;
+          if (existingStop) {
+            // A replacement in flight retires only its runner. An explicit Stop that joins it still
+            // ends the session, so it supersedes automatic recovery itself before sharing the result.
+            if (intent.kind === 'explicit_stop' && existingStop.intent === 'replace_runner_incarnation') {
+              // Cancel queued auth applications before this Stop's asynchronous cleanup can wait on them.
+              // The executing owner retains exclusion until its own operation unwinds.
+              connectedServiceSessionAuthSwitchCore.clearSession(normalizedSessionId);
+              await supersedeAutomaticRecoveryForExplicitStop(normalizedSessionId);
+            }
+            return await existingStop.operation;
+          }
 
           // Cancel queued auth applications before any asynchronous Stop cleanup can wait on them.
           // The executing owner retains exclusion until its own operation unwinds.
           connectedServiceSessionAuthSwitchCore.clearSession(normalizedSessionId);
           const operation = Promise.resolve().then(async (): Promise<StopSessionResult> => {
             sessionRunnerRespawnManager.markStopRequested(normalizedSessionId, { reason: 'daemon_stop_session', requestedAtMs: Date.now() });
-            const automaticRecoveryCancellations = await Promise.allSettled([
-              inactiveUsageLimitRecoveryCheckOwner.cancelSession({
-                sessionId: normalizedSessionId,
-                scheduler: inactiveUsageLimitRecoveryScheduler,
-              }),
-              runtimeAuthRecoveryScheduler?.cancel({ sessionId: normalizedSessionId }) ?? Promise.resolve(null),
-              temporaryThrottleRecoveryScheduler.stopRetrying({ sessionId: normalizedSessionId }),
-            ]);
-            const automaticRecoveryOwners = ['inactive_usage_limit', 'runtime_auth', 'temporary_throttle'] as const;
-            automaticRecoveryCancellations.forEach((result, index) => {
-              if (result.status !== 'rejected') return;
-              logger.warn('[DAEMON RUN] Automatic recovery cancellation failed after explicit Stop', {
-                sessionId: normalizedSessionId,
-                owner: automaticRecoveryOwners[index],
-                error: serializeAxiosErrorForLog(result.reason),
-              });
-            });
-            temporaryThrottleResumeSnapshotsBySessionId.delete(normalizedSessionId);
-            await clearConnectedServiceRecoveryAfterSupersession({
-              sessionId: normalizedSessionId,
-              event: {
-                kind: 'manual_session_supersession',
-                reason: 'stop',
-              },
-            });
-            await persistExplicitSessionStopRecoveryCancellation({
-              credentials,
-              sessionId: normalizedSessionId,
-            }).catch((error) => {
-              logger.warn('[DAEMON RUN] Failed to publish usage-limit recovery cancellation after explicit Stop', {
-                sessionId: normalizedSessionId,
-                error: serializeAxiosErrorForLog(error),
-              });
-            });
+            if (intent.kind === 'explicit_stop') {
+              await supersedeAutomaticRecoveryForExplicitStop(normalizedSessionId);
+            }
             physicallyRetiredTerminalAttachmentIdBySessionId.delete(normalizedSessionId);
-            const trackedStopResult = options === undefined
-              ? await stopSessionCore(normalizedSessionId)
-              : await stopSessionCore(normalizedSessionId, options);
+            const trackedStopResult = intent.kind === 'replace_runner_incarnation'
+              ? await stopSessionCore(normalizedSessionId, { exactRunner: intent.exactRunner })
+              : await stopSessionCore(normalizedSessionId);
             const physicallyRetiredAttachmentId = physicallyRetiredTerminalAttachmentIdBySessionId.get(normalizedSessionId);
             physicallyRetiredTerminalAttachmentIdBySessionId.delete(normalizedSessionId);
             if (isTerminalHostPhysicallyRetiredStopResult(trackedStopResult) && physicallyRetiredAttachmentId) {
@@ -5840,11 +5876,11 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             }
             return result;
           });
-          stopSessionInFlightBySessionId.set(normalizedSessionId, operation);
+          stopSessionInFlightBySessionId.set(normalizedSessionId, { intent: intent.kind, operation });
           try {
             return await operation;
           } finally {
-            if (stopSessionInFlightBySessionId.get(normalizedSessionId) === operation) {
+            if (stopSessionInFlightBySessionId.get(normalizedSessionId)?.operation === operation) {
               stopSessionInFlightBySessionId.delete(normalizedSessionId);
             }
           }

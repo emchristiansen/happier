@@ -92,7 +92,7 @@ let sessionSocketStub: ApiSessionSocketStub | null = null;
 let userSocketStub: ApiSessionSocketStub | null = null;
 let supervisorStartCount = 0;
 let materializeNextPendingQueueV2MessageStub: null | (() => Promise<unknown>) = null;
-let listPendingQueueV2LocalIdsFromServerStub: null | (() => Promise<string[]>) = null;
+let listPendingQueueV2ActionableLocalIdsFromServerStub: null | (() => Promise<string[]>) = null;
 let fetchSessionSnapshotUpdateFromServerStub: null | (() => Promise<unknown>) = null;
 
 vi.mock('./sockets', () => ({
@@ -143,11 +143,11 @@ vi.mock('./pendingQueueV2Transport', async (importOriginal) => {
       }
       return await actual.materializeNextPendingQueueV2Message(...args);
     },
-    listPendingQueueV2LocalIdsFromServer: async (...args: Parameters<typeof actual.listPendingQueueV2LocalIdsFromServer>) => {
-      if (listPendingQueueV2LocalIdsFromServerStub) {
-        return await listPendingQueueV2LocalIdsFromServerStub();
+    listPendingQueueV2ActionableLocalIdsFromServer: async (...args: Parameters<typeof actual.listPendingQueueV2ActionableLocalIdsFromServer>) => {
+      if (listPendingQueueV2ActionableLocalIdsFromServerStub) {
+        return await listPendingQueueV2ActionableLocalIdsFromServerStub();
       }
-      return await actual.listPendingQueueV2LocalIdsFromServer(...args);
+      return await actual.listPendingQueueV2ActionableLocalIdsFromServer(...args);
     },
   };
 });
@@ -889,7 +889,7 @@ describe('ApiSessionClient message commit queue', () => {
         pendingVersion: 6,
       },
     });
-    listPendingQueueV2LocalIdsFromServerStub = async () => ['pending-user-1'];
+    listPendingQueueV2ActionableLocalIdsFromServerStub = async () => ['pending-user-1'];
     sessionSocketStub = createApiSessionSocketStub({
       connected: true,
       emitWithAckResult: { ok: true, id: 'm1', seq: 1, localId: 'ack-1' },
@@ -904,11 +904,11 @@ describe('ApiSessionClient message commit queue', () => {
         pendingVersion: 5,
       }));
 
-      await expect(client.peekPendingMessageQueueV2Count()).resolves.toBe(1);
+      await expect(client.peekActionablePendingMessageQueueV2Count()).resolves.toBe(1);
       expect(client.shouldAttemptPendingMaterialization()).toBe(true);
     } finally {
       fetchSessionSnapshotUpdateFromServerStub = null;
-      listPendingQueueV2LocalIdsFromServerStub = null;
+      listPendingQueueV2ActionableLocalIdsFromServerStub = null;
     }
   });
 

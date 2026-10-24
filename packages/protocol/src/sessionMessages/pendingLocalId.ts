@@ -14,3 +14,6 @@ export const PendingLocalIdSchema = z.string().refine(isPendingLocalId, {
 });
 
 export type PendingLocalId = z.infer<typeof PendingLocalIdSchema>;
+
+/** Optional materialize request field; omission preserves the released rejoin behavior. */
+export const PendingMaterializeHeldLocalIdsSchema = z.array(PendingLocalIdSchema);
