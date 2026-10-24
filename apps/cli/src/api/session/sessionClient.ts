@@ -1535,7 +1535,7 @@ export class ApiSessionClient extends EventEmitter {
         }
         this.sessionRuntimeControls.wakePendingMaterialization = () => this.wakePendingMaterialization();
         this.sessionRuntimeControls.readPendingMaterializationServiceability = (): PendingMaterializationServiceability => {
-            if (this.closed || this.runtimeTerminationStarted) return { state: 'unservable', reason: 'runtime_terminating' };
+            if (this.closeStarted || this.closed || this.runtimeTerminationStarted) return { state: 'unservable', reason: 'runtime_terminating' };
             switch (this.pendingPublisherRecovery.state) {
                 case 'publisher_lost':
                     return { state: 'unservable', reason: 'publisher_lost', respondent: this.readPendingPublisherRespondent() };
