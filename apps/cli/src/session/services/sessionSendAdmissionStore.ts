@@ -18,8 +18,9 @@ import {
  * target's current model and permission metadata, so a metadata change between
  * attempts turns a retry of a committed message into a refusal.
  *
- * No pathname that a reader may resolve as the current body is ever deleted,
- * renamed or overwritten. Two kinds of immutable file exist per key:
+ * Body names are unique and never reused or overwritten. Cleanup can remove
+ * an expired or evicted body, but removing an old body's name cannot remove a
+ * replacement body. Two kinds of immutable file exist per key:
  *
  * - A body, `<key>.<storedAtMs>-<uuid>.json`, holds one attempt's admission
  *   body. Its name is unique to the attempt that wrote it and is never reused.
@@ -31,13 +32,16 @@ import {
  *   the highest one is no longer current.
  *
  * An attempt reads the decisions of the previous, its current and the next
- * window, and writes only in its current window. A current decision in the
- * next window governs; one exists only if the clock stepped back across a
- * boundary after it was made. Otherwise the highest decision of the current
- * window governs, and without one the highest of the previous window, which
- * is first re-published in the current window. A decision determines a return
- * only when it is in the attempt's current or next window and the attempt's
- * window did not change while it read. A paused writer can still link a
+ * window, and writes only in its current window. A current body named by a
+ * decision in the next sampled window takes precedence. It can determine a
+ * return only if the iteration starts and ends in the same window. Such a
+ * return requires a backward boundary crossing; the decision may have been
+ * linked after that crossing by a writer that sampled the later window
+ * earlier. Otherwise the highest decision of the current window governs, and
+ * without one the highest of the previous window, which is first re-published
+ * in the current window. A decision determines a return only when it is in
+ * the attempt's current or next window and the iteration starts and ends in
+ * the same window. A paused writer can still link a
  * decision under a window name it read earlier; it then reads again, so that
  * decision determines its return only through these rules. While the host
  * clock does not step back across a window boundary, the decisions any two
@@ -51,17 +55,19 @@ import {
  * link after the clock stepped back and another attempt, now in W, published
  * and returned its own body; the W+1 decision then governs the first
  * attempt's next read. The two decision names differ, so no exclusive link
- * arbitrates between them. A backward step of a whole window or more can
- * likewise make a retry seal again. The bodies differ only if the target
- * metadata changed between the two preparations. The relay then refuses the
- * later send (409 while the first is queued, 400 once it is in the
- * transcript), so it is never duplicated.
+ * arbitrates between them. A rollback that moves a retained decision beyond
+ * the adjacent windows scanned can also cause resealing. For the same request
+ * and unchanged encryption context, deterministic sealing yields identical
+ * bodies unless the resolved model or permission metadata differs; the trace
+ * above needs such a change between the two preparations. The relay then
+ * refuses the later send (409 while the first is queued, 400 once it is in
+ * the transcript), so it is never duplicated.
  *
  * Removal, applied after a publication: bodies older than the retention, then
  * the oldest bodies beyond `SESSION_SEND_ADMISSION_MAX_ENTRIES` (by
  * storedAtMs, then name); decisions two or more windows behind the remover's
- * clock, which no attempt reads unless its clock is at least one window
- * behind the remover's;
+ * sampled window, which a reader includes only if its sampled iteration
+ * window is at least one behind the remover's sampled window;
  * temporary files whose mtime is older than the retention, the cleanup
  * criterion for a write that never completed. Every removal names one unique
  * file. A decision whose body was removed counts as not current.
@@ -268,11 +274,13 @@ export async function preserveSessionSendAdmission(params: Readonly<{
         const stored = bodyName ? await readCurrent(bodyName) : null;
         return bodyName && stored ? { decision, bodyName, stored } : null;
       };
-      // A current decision in the next window exists only if the clock stepped
-      // back across the boundary, and it governs. It may have been linked
-      // after the step by a writer that sampled the later window first (the
-      // known limit above). Otherwise this window's highest decision governs,
-      // and only without one the previous window's.
+      // A current body named by a decision in the next sampled window takes
+      // precedence. It can determine a return only if the iteration starts and
+      // ends in the same window. Such a return requires a backward boundary
+      // crossing; the decision may have been linked after that crossing by a
+      // writer that sampled the later window earlier (the known limit above).
+      // Otherwise this window's highest decision governs, and only without one
+      // the previous window's.
       const top = tops.get(window) ?? tops.get(window - 1);
       const decided = (await resolve(tops.get(window + 1))) ?? (await resolve(top));
       const decidedBodyName = decided?.bodyName ?? null;
