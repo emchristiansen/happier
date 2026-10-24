@@ -42,8 +42,22 @@ export class SessionArchiveInputAdmission {
             token: this.opts.token, sessionId: this.opts.sessionId, signal: passSignal,
           });
           if (lifetime.aborted) return { kind: 'refused' } as const;
-          if (epoch !== this.opts.connectionEpoch() || archive.kind === 'unavailable') {
-            this.retry.failed(archive.kind === 'unavailable' ? archive.retryAfterMs : undefined);
+          const epochChanged = epoch !== this.opts.connectionEpoch();
+          if (epochChanged || archive.kind === 'unavailable') {
+            const serverRetryAfterMs = archive.kind === 'unavailable' ? archive.retryAfterMs : undefined;
+            const retryState = this.retry.failed(serverRetryAfterMs);
+            // Without this line a runner can wait here indefinitely with nothing in its file log:
+            // each wake renews the retry budget, so exhaustion alone is not enough to see it.
+            logger.infoFile('[archiveAdmission] archive state read failed; retrying', {
+              sessionId: this.opts.sessionId,
+              cause: epochChanged ? 'connection_epoch_changed' : 'unavailable',
+              ...(serverRetryAfterMs !== undefined ? { serverRetryAfterMs } : {}),
+              status: retryState.status,
+              ...(retryState.status === 'idle' ? {} : { failedAttempts: retryState.failedAttempts }),
+              ...(retryState.status === 'retrying'
+                ? { retryInMs: Math.max(0, retryState.retryAtMs - Date.now()) }
+                : { retryOn: 'next_wake' }),
+            });
             return { kind: 'waiting' } as const;
           }
           if (archive.kind === 'archived') {

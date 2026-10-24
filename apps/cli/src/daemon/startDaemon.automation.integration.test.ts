@@ -405,6 +405,7 @@ vi.mock('@/configuration', () => ({
     apiServerUrl: 'https://api.happier.dev',
     webappUrl: 'https://happier.dev',
     activeServerDir: '/tmp/server',
+    daemonStateFile: '/tmp/server/daemon.state.json',
     daemonSpawnExistingSessionWaitForExitMs: 5_000,
     daemonSpawnExistingSessionWaitForExitPollIntervalMs: 50,
   },
