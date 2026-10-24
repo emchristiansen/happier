@@ -37,6 +37,7 @@ import { HAPPIER_SPAWN_EXPLICIT_ENV_KEYS_JSON_ENV_VAR } from '@/daemon/spawn/spa
 import { logger } from '@/ui/logger';
 
 import { createCodexAppServerRuntime, writeUsageLimitRecoveryIntentToMetadata } from './runtime';
+import { CodexAppServerSteerUnavailableError } from './appServerCompatibility';
 import { createCodexAppServerProcessEnv, createCodexAppServerTestEnvScope } from './testkit/fakeCodexAppServer';
 
 // These partial session fixtures model create/load; existing-ID admission uses real API/RPC tests.
@@ -4380,7 +4381,7 @@ describe('createCodexAppServerRuntime', () => {
                     ],
                 },
             },
-        })).rejects.toThrow('Codex app-server active turn is not steerable');
+        })).rejects.toBeInstanceOf(CodexAppServerSteerUnavailableError);
         await sendPromptPromise;
 
         const requestLog = await readRequestLog(requestLogPath);
@@ -4462,7 +4463,7 @@ describe('createCodexAppServerRuntime', () => {
     });
 
     it('marks a completed turn as non-steerable while completion is still settling', async () => {
-        const { root } = await createRuntimeFixture('happier-codex-app-server-runtime-steer-settle-');
+        const { root, requestLogPath } = await createRuntimeFixture('happier-codex-app-server-runtime-steer-settle-');
         const activeTurnPendingPump: {
             signal?: AbortSignal;
             resolve?: () => void;
@@ -4506,8 +4507,9 @@ describe('createCodexAppServerRuntime', () => {
 
         expect(runtime.isTurnInFlight()).toBe(true);
         expect(activeTurnPendingPump.signal?.aborted).toBe(false);
-        await expect(runtime.steerPrompt('late-nudge')).rejects.toThrow('Codex app-server active turn is not steerable');
+        await expect(runtime.steerPrompt('late-nudge')).rejects.toBeInstanceOf(CodexAppServerSteerUnavailableError);
         await sendPromptPromise;
+        expect((await readRequestLog(requestLogPath)).filter((entry) => entry.method === 'turn/steer')).toHaveLength(0);
         expect(activeTurnPendingPump.signal?.aborted).toBe(true);
         activeTurnPendingPump.resolve?.();
     });
@@ -4673,7 +4675,7 @@ describe('createCodexAppServerRuntime', () => {
         };
 
         await expect(runtime.steerPrompt('must-not-steer-after-owner-change', { metadata }))
-            .rejects.toThrow('Codex app-server active turn is not steerable');
+            .rejects.toBeInstanceOf(CodexAppServerSteerUnavailableError);
         await sendPromptPromise;
 
         const requestLog = await readRequestLog(requestLogPath);

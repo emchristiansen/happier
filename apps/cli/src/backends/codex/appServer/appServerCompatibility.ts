@@ -1,3 +1,11 @@
+/** A local refusal before the next turn/steer request can have an effect. */
+export class CodexAppServerSteerUnavailableError extends Error {
+    constructor() {
+        super('Codex app-server active turn is not steerable');
+        this.name = 'CodexAppServerSteerUnavailableError';
+    }
+}
+
 export type CodexAppServerRpcError = Error & Readonly<{
     code?: number;
     data?: unknown;
@@ -29,6 +37,12 @@ export function isCodexAppServerNoActiveTurnToSteerError(error: unknown): boolea
     const method = (error as Partial<CodexAppServerRpcError>).method;
     if (typeof method === 'string' && method !== 'turn/steer') return false;
     return /\bno\s+active\s+turn\s+to\s+steer\b/i.test(error.message);
+}
+
+/** Caller classification only: a local refusal does not prove native termination. */
+export function isCodexAppServerSteerRejectedBeforeEffectError(error: unknown): boolean {
+    return error instanceof CodexAppServerSteerUnavailableError
+        || isCodexAppServerNoActiveTurnToSteerError(error);
 }
 
 function readCode(error: unknown): number | null {

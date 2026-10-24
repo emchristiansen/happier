@@ -99,6 +99,7 @@ import {
     publishLatestTurnRollbackRangeMetadata,
 } from './rollbackMetadata';
 import {
+    CodexAppServerSteerUnavailableError,
     isCodexAppServerInvalidRequestForMethodError,
     isCodexAppServerInvalidRequestMapExpectedStringError,
     isCodexAppServerInvalidParamsForFieldError,
@@ -4678,7 +4679,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
             const client = await ensureClient();
             const expectedTurnId = await waitForSteerableActiveTurnId(activeTurn);
             if (pendingTurn?.promise !== activeTurn.promise || !canSteerPrompt()) {
-                throw new Error('Codex app-server active turn is not steerable');
+                throw new CodexAppServerSteerUnavailableError();
             }
             if (!expectedTurnId) {
                 throw new Error('Codex app-server steerPrompt requires an active turn id');
@@ -4686,7 +4687,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
 
             const structuredInput = await buildCodexTurnInputForPrompt(prompt, params.directory, options);
             if (pendingTurn?.promise !== activeTurn.promise || !canSteerPrompt()) {
-                throw new Error('Codex app-server active turn is not steerable');
+                throw new CodexAppServerSteerUnavailableError();
             }
             const textOnlyInput: CodexAppServerTurnInputItem[] = [{ type: 'text', text: prompt }];
             const pendingProviderPrompt = trackPendingProviderPrompt(prompt, options);
@@ -4709,7 +4710,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
                 turnIdKey: 'expectedTurnId' | 'turnId',
             ): Promise<void> => {
                 if (pendingTurn?.promise !== activeTurn.promise || !canSteerPrompt()) {
-                    throw new Error('Codex app-server active turn is not steerable');
+                    throw new CodexAppServerSteerUnavailableError();
                 }
                 await client.request('turn/steer', {
                     ...payload,
