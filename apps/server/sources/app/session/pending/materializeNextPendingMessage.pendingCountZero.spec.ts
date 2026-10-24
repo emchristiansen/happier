@@ -108,6 +108,14 @@ const pendingRow = (
     ...overrides,
 });
 
+// The database boundary honors the recovery query's held-state filter.
+function setQueuedPendingRows(rows: ReturnType<typeof pendingRow>[]): void {
+    txSessionPendingMessageFindMany.mockImplementation(async (query: { where: { deliveryState?: null | { in: readonly string[] } } }) => {
+        const filter = query.where.deliveryState;
+        return filter && "in" in filter ? [] : rows;
+    });
+}
+
 describe("materializeNextPendingMessage current Pending owner", () => {
     beforeAll(async () => {
         ({ materializeNextPendingMessage } = await import("./materializeNextPendingMessage"));
@@ -168,7 +176,7 @@ describe("materializeNextPendingMessage current Pending owner", () => {
         txSessionFindUniqueOrThrow
             .mockResolvedValueOnce(malformedActivity)
             .mockResolvedValueOnce({ pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 9 });
-        txSessionPendingMessageFindMany.mockResolvedValue([pendingRow("send_now")]);
+        setQueuedPendingRows([pendingRow("send_now")]);
 
         const result = await materializeNextPendingMessage({
             actorUserId: "u1",
@@ -215,7 +223,7 @@ describe("materializeNextPendingMessage current Pending owner", () => {
         const before = sessionRow(projection);
         selectedSessionRow = before;
         txSessionFindUniqueOrThrow.mockResolvedValue(before);
-        txSessionPendingMessageFindMany.mockResolvedValue([pendingRow("enqueue")]);
+        setQueuedPendingRows([pendingRow("enqueue")]);
 
         const result = await materializeNextPendingMessage({
             actorUserId: "u1",
@@ -239,7 +247,7 @@ describe("materializeNextPendingMessage current Pending owner", () => {
         };
         selectedSessionRow = idle;
         txSessionPendingMessageFindFirst.mockResolvedValue(null);
-        txSessionPendingMessageFindMany.mockResolvedValue([pendingRow("enqueue")]);
+        setQueuedPendingRows([pendingRow("enqueue")]);
         txSessionFindUniqueOrThrow
             .mockResolvedValueOnce(idle)
             .mockResolvedValueOnce(idle)
@@ -270,7 +278,7 @@ describe("materializeNextPendingMessage current Pending owner", () => {
         selectedSessionRow = idle;
         installSessionFindUniqueResponses();
         txSessionPendingMessageFindFirst.mockResolvedValue(null);
-        txSessionPendingMessageFindMany.mockResolvedValue([pendingRow("enqueue")]);
+        setQueuedPendingRows([pendingRow("enqueue")]);
         txSessionFindUniqueOrThrow
             .mockResolvedValueOnce(idle)
             .mockResolvedValueOnce(idle)
