@@ -1459,7 +1459,7 @@ export class ApiSessionClient extends EventEmitter {
                 })) return;
                 // On publisher-fenced servers, converged readiness includes this connection's settled publisher claim.
                 this.observePendingPublisherClaim(connectionEpoch);
-                this.reofferAcceptedCanonicalPendingDeliveriesAfterConnection();
+                this.reofferAcceptedCanonicalPendingDeliveries();
                 this.clearPendingDiscoveryTimer();
                 this.schedulePendingDiscovery();
 
@@ -1935,7 +1935,7 @@ export class ApiSessionClient extends EventEmitter {
         });
     }
 
-    private reofferAcceptedCanonicalPendingDeliveriesAfterConnection(): void {
+    private reofferAcceptedCanonicalPendingDeliveries(): void {
         const producerGeneration = this.providerInputOutcomeProducerGeneration;
         const sessionConnectionEpoch = this.sessionConnectionEpoch;
         const precedingResolutions = [...this.acceptedCanonicalPendingDeliveryResolutionWrites];
@@ -5979,6 +5979,7 @@ export class ApiSessionClient extends EventEmitter {
         this.pendingDiscoveryReadFailed = false;
         this.pendingDiscoveryDelayMs = PENDING_DISCOVERY_BASE_DELAY_MS;
         this.schedulePendingDiscovery();
+        this.reofferAcceptedCanonicalPendingDeliveries();
 
         return (outcome) => {
             if (

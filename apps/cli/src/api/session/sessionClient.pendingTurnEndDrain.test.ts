@@ -2928,6 +2928,26 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect((client as any).canonicalPendingDeliveryByLocalId.has('runtime-fenced-settlement')).toBe(true);
   });
 
+  it('resumes unfinished accepted settlement when a replacement provider producer binds', async () => {
+    const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 });
+    await waitForCurrentPendingInputContract(client);
+    const observe = client.bindProviderInputOutcomeProducer({ providerId: 'codex', mode: 'unifiedTerminal', matchesCurrentSession: () => true });
+    vi.useFakeTimers();
+    materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult('rebound-settlement', 2));
+    resolveAcceptedPendingDeliveryMock.mockRejectedValueOnce(Object.assign(new Error('ack lost'), { code: 'socket_ack_timeout', retryable: true }));
+    const delivered = vi.fn();
+    client.onUserMessage(delivered);
+    await client.materializeNextPendingMessageSafely();
+    observe({ kind: 'accepted', localId: 'rebound-settlement' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
+    client.bindProviderInputOutcomeProducer({ providerId: 'codex', mode: 'unifiedTerminal', matchesCurrentSession: () => true });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(2);
+    expect(client.hasCanonicalPendingProviderInputDelivery('rebound-settlement')).toBe(false);
+    expect(delivered).toHaveBeenCalledTimes(1);
+  });
+
   it('rejoins the same operation after a socket ACK timeout without granting unrelated wakes retry authority', async () => {
     const client = await createClient({
       latestTurnStatus: 'completed',
