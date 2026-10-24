@@ -276,6 +276,23 @@ describe('preserveSessionSendAdmission', () => {
       .toEqual(body('y', 'local-y'));
   }, 120_000);
 
+  it('keeps issuing a body decided just after a window boundary when the clock steps back across it', async () => {
+    const boundary = 2 * SESSION_SEND_ADMISSION_RETENTION_MS;
+    // An explicit localId: B is decided in the later window and returned.
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('B', 'explicit-x'), nowMs: () => boundary + 5 }))
+      .toEqual(body('B', 'explicit-x'));
+    const decisionsBefore = (await readdir(await storeDirectory())).filter((name) => name.endsWith('.decision')).sort();
+
+    // The host clock steps back 10 ms, into the earlier window; the retry
+    // carries resealed bytes C.
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('C', 'explicit-x'), nowMs: () => boundary - 5 }))
+      .toEqual(body('B', 'explicit-x'));
+    expect(await preserveSessionSendAdmission({ sessionId: 'sess-a', candidate: body('D', 'explicit-x'), nowMs: () => boundary + 20 }))
+      .toEqual(body('B', 'explicit-x'));
+    // Reading the later window wrote nothing.
+    expect((await readdir(await storeDirectory())).filter((name) => name.endsWith('.decision')).sort()).toEqual(decisionsBefore);
+  });
+
   it('converges two attempts on one body across a window boundary', async () => {
     const boundary = 2 * SESSION_SEND_ADMISSION_RETENTION_MS;
     let lateNowMs = boundary - 1;

@@ -30,21 +30,30 @@ import {
  *   counts decisions within a window: a new one is made only when the body of
  *   the highest one is no longer current.
  *
- * An attempt reads the decisions of the current and the previous window, and
- * takes the highest. It returns a body only when that decision is in the
- * window the attempt both started and ended in; a decision found only in the
- * previous window is first re-published in the current one. The decisions any
+ * An attempt reads the decisions of the previous, its current and the next
+ * window, and writes only in its current window. A current decision in the
+ * next window governs; one exists only if the clock stepped back across a
+ * boundary after it was made. Otherwise the highest decision of the current
+ * window governs, and without one the highest of the previous window, which
+ * is first re-published in the current window. A decision determines a return
+ * only when it is in the attempt's current or next window and the attempt's
+ * window did not change while it read. A paused writer can still link a
+ * decision under a window name it read earlier; it then reads again, so that
+ * decision determines its return only through these rules. The decisions any
  * two returns rely on therefore share one exclusive name, or are ordered
  * through it, so attempts of one request issue the same body while that body
- * stays current (unexpired and not evicted).
+ * stays current (unexpired and not evicted). This holds as long as the window
+ * index of the host clock never moves back by more than one: a backward clock
+ * step of under 60 minutes is tolerated, and a larger one can make a retry
+ * seal again.
  *
  * Removal, applied after a publication: bodies older than the retention, then
  * the oldest bodies beyond `SESSION_SEND_ADMISSION_MAX_ENTRIES` (by
- * storedAtMs, then name); decisions two or more windows old, which no attempt
- * reads or writes again (assuming the host clock does not step back by a
- * window); temporary files whose mtime is older than the retention, the
- * cleanup criterion for a write that never completed. Every removal names one
- * unique file. A decision whose body was removed counts as not current.
+ * storedAtMs, then name); decisions two or more windows behind the remover's
+ * clock, which, within that clock limit, can no longer determine a return;
+ * temporary files whose mtime is older than the retention, the cleanup
+ * criterion for a write that never completed. Every removal names one unique
+ * file. A decision whose body was removed counts as not current.
  */
 
 export const SESSION_SEND_ADMISSION_RETENTION_MS = 60 * 60_000;
@@ -234,28 +243,39 @@ export async function preserveSessionSendAdmission(params: Readonly<{
   try {
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
       const window = windowOf(now());
-      let top: Decision | null = null;
+      // The highest decision of the previous, this and the next window.
+      const tops = new Map<number, Decision>();
       for (const name of await readdir(directory)) {
         const parsed = parseDecisionName(name);
-        if (!parsed || parsed.key !== key || (parsed.window !== window && parsed.window !== window - 1)) continue;
-        if (!top || parsed.window > top.window || (parsed.window === top.window && parsed.n > top.n)) {
-          top = { name, window: parsed.window, n: parsed.n };
-        }
+        if (!parsed || parsed.key !== key || parsed.window < window - 1 || parsed.window > window + 1) continue;
+        const known = tops.get(parsed.window);
+        if (!known || parsed.n > known.n) tops.set(parsed.window, { name, window: parsed.window, n: parsed.n });
       }
-      const decidedBodyName = top ? parseDecisionBodyName((await readIfPresent(join(directory, top.name))) ?? '') : null;
-      const decided = decidedBodyName ? await readCurrent(decidedBodyName) : null;
+      const resolve = async (decision: Decision | undefined) => {
+        if (!decision) return null;
+        const bodyName = parseDecisionBodyName((await readIfPresent(join(directory, decision.name))) ?? '');
+        const stored = bodyName ? await readCurrent(bodyName) : null;
+        return bodyName && stored ? { decision, bodyName, stored } : null;
+      };
+      // A current decision in the next window was made before this host's
+      // clock stepped back across the boundary; it governs. Otherwise this
+      // window's highest decision governs, and only without one the previous
+      // window's.
+      const top = tops.get(window) ?? tops.get(window - 1);
+      const decided = (await resolve(tops.get(window + 1))) ?? (await resolve(top));
+      const decidedBodyName = decided?.bodyName ?? null;
 
-      if (decided && top!.window === window) {
-        // Decided in this window. A window change during the read means the
-        // decision must first be carried into the new window.
+      if (decided && decided.decision.window >= window) {
+        // A window change during the read means the decision must first be
+        // carried into the new window.
         if (windowOf(now()) !== window) continue;
         if (decidedBodyName === ownBodyName) ownBodyDecided = true;
-        return choose(decided);
+        return choose(decided.stored);
       }
 
       // Record a decision in this window: the previous window's current body,
       // or else this attempt's own.
-      let bodyName: string | null = decided ? decidedBodyName! : ownBodyName;
+      let bodyName: string | null = decidedBodyName ?? ownBodyName;
       if (!bodyName) {
         const storedAtMs = now();
         const record: StoredAdmission = {
@@ -270,7 +290,8 @@ export async function preserveSessionSendAdmission(params: Readonly<{
         await rename(tmpPath, join(directory, ownBodyName));
         bodyName = ownBodyName;
       }
-      const n = top && top.window === window ? top.n + 1 : 0;
+      // Decisions are written only in this window, never the next.
+      const n = (tops.get(window)?.n ?? -1) + 1;
       await params.beforeLink?.();
       const linked = await linkExclusive(directory, `${key}.${window}.${n}.decision`, JSON.stringify({ v: 2, bodyName }));
       if (linked && bodyName === ownBodyName) {
