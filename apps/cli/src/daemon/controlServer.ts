@@ -82,6 +82,7 @@ import {
   RestartSessionRunnerRequestV1Schema,
   RestartSessionRunnerResultV1Schema,
   SessionConnectedServiceAuthSwitchRpcParamsSchema,
+  SessionPublisherIncarnationIdSchema,
   SessionRunnerRuntimeStateV1Schema,
   SessionRunnerStatusGetRequestV1Schema,
   type ConnectedServiceId,
@@ -126,6 +127,11 @@ import {
 } from './connectedServices/runtimeAuth/projection/connectedServiceRuntimeAuthRecoveryProjection';
 import { buildRuntimeAuthRecoveryKey } from './connectedServices/runtimeAuth/recoveryKey/runtimeAuthRecoveryKey';
 import { buildRuntimeAuthRecoveryAttemptTransitionLocalId } from './connectedServices/runtimeAuth/commitConnectedServiceRuntimeAuthRecoverySessionEvent';
+import {
+  SESSION_STARTED_READINESS_ANSWER_TIMEOUT_MS,
+  SESSION_STARTED_READINESS_NOT_READY_ERROR_CODES,
+  type SessionStartedRunnerReport,
+} from './sessionStartedReadiness';
 
 const DEFAULT_DAEMON_CONTROL_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
 const DAEMON_CONTROL_BODY_LIMIT_BYTES_ENV_KEY = 'HAPPIER_DAEMON_CONTROL_BODY_LIMIT_BYTES';
@@ -387,7 +393,11 @@ export function createDaemonControlApp({
   resolveSpawnSessionByNonce?: (spawnNonce: string) => Promise<SpawnSessionNonceResolution> | SpawnSessionNonceResolution;
   requestShutdown: () => void;
   beforeShutdown?: () => Promise<void>;
-  onHappySessionWebhook: (sessionId: string, metadata: Metadata) => Promise<void> | void;
+  onHappySessionWebhook: (
+    sessionId: string,
+    metadata: Metadata,
+    report?: SessionStartedRunnerReport,
+  ) => Promise<void> | void;
   controlToken: string;
   // Run-materialization bridge: given a run-scoped selection, the daemon (sole CS owner) resolves +
   // materializes + registers the run PID and returns the env map (paths only, no secrets).
@@ -753,6 +763,7 @@ export function createDaemonControlApp({
       body: z.object({
         sessionId: z.string(),
         metadata: z.any(), // Metadata type from API
+        publisherIncarnationId: SessionPublisherIncarnationIdSchema.optional(),
       }),
       response: {
         200: z.object({
@@ -761,18 +772,22 @@ export function createDaemonControlApp({
         401: authSchema401,
         503: z.object({
           status: z.literal('error'),
-          errorCode: z.literal('session_startup_reconciliation_failed'),
+          errorCode: z.enum(SESSION_STARTED_READINESS_NOT_READY_ERROR_CODES),
         }),
       }
     },
     preHandler: requireAuth,
   }, async (request, reply) => {
-    const { sessionId, metadata } = request.body;
+    const { sessionId, metadata, publisherIncarnationId } = request.body;
 
     logger.debug(`[CONTROL SERVER] Session started: ${sessionId}`);
     let readiness: Promise<void>;
     try {
-      readiness = Promise.resolve(onHappySessionWebhook(sessionId, metadata));
+      readiness = Promise.resolve(onHappySessionWebhook(
+        sessionId,
+        metadata,
+        publisherIncarnationId ? { publisherIncarnationId } : {},
+      ));
     } catch (error) {
       logger.warn('[CONTROL SERVER] Session startup webhook intake failed', {
         sessionId,
@@ -784,8 +799,17 @@ export function createDaemonControlApp({
         errorCode: 'session_startup_reconciliation_failed' as const,
       };
     }
+    // Answer within the runner's attempt timeout even while readiness waits on a slow server.
+    // Readiness keeps running; the runner's next attempt joins it.
+    let answerTimer: ReturnType<typeof setTimeout> | undefined;
+    let readinessOutcome: 'ready' | 'pending';
     try {
-      await readiness;
+      readinessOutcome = await Promise.race([
+        readiness.then(() => 'ready' as const),
+        new Promise<'pending'>((resolve) => {
+          answerTimer = setTimeout(() => resolve('pending'), SESSION_STARTED_READINESS_ANSWER_TIMEOUT_MS);
+        }),
+      ]);
     } catch (error) {
       logger.warn('[CONTROL SERVER] Post-registration session startup reconciliation failed', {
         sessionId,
@@ -795,6 +819,19 @@ export function createDaemonControlApp({
       return {
         status: 'error' as const,
         errorCode: 'session_startup_reconciliation_failed' as const,
+      };
+    } finally {
+      clearTimeout(answerTimer);
+    }
+    if (readinessOutcome === 'pending') {
+      logger.warn('[CONTROL SERVER] Post-registration session startup reconciliation still settling; asking the runner to retry', {
+        sessionId,
+        answerTimeoutMs: SESSION_STARTED_READINESS_ANSWER_TIMEOUT_MS,
+      });
+      reply.code(503);
+      return {
+        status: 'error' as const,
+        errorCode: 'session_startup_reconciliation_pending' as const,
       };
     }
 
@@ -2254,7 +2291,11 @@ export function startDaemonControlServer({
   resolveSpawnSessionByNonce?: (spawnNonce: string) => Promise<SpawnSessionNonceResolution> | SpawnSessionNonceResolution;
   requestShutdown: () => void;
   beforeShutdown?: () => Promise<void>;
-  onHappySessionWebhook: (sessionId: string, metadata: Metadata) => Promise<void> | void;
+  onHappySessionWebhook: (
+    sessionId: string,
+    metadata: Metadata,
+    report?: SessionStartedRunnerReport,
+  ) => Promise<void> | void;
   controlToken: string;
   handleExecutionRunConnectedServiceMaterialize?: (input: Readonly<{
     runId: string;

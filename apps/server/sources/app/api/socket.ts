@@ -4,6 +4,7 @@ import { buildMachineActivityEphemeral, ClientConnection, eventRouter } from "@/
 import {
     buildMachineOwnerConflictSocketPayload,
     readMachineDaemonOwnershipMetadataFromSocketAuth,
+    SessionPublisherIncarnationIdSchema,
 } from "@happier-dev/protocol";
 import { Server, Socket } from "socket.io";
 import { log } from "@/utils/logging/log";
@@ -31,7 +32,10 @@ import { createMachineSocketOwnershipRegistry } from "./socket/machineSocketOwne
 import { createSessionPublisherPresence } from "@/app/presence/sessionPublisherPresence";
 import { publishMachinePresenceSnapshot } from "@/app/presence/publishMachinePresenceSnapshot";
 import { describeLoggableError } from "@/utils/logging/describeLoggableError";
-import { registerSessionRuntimeActivitySnapshotSocketEvent } from "@/app/session/runtimeActivity/socketEvents";
+import {
+    registerMachineSessionRunnerExitedSocketEvent,
+    registerSessionRuntimeActivitySnapshotSocketEvent,
+} from "@/app/session/runtimeActivity/socketEvents";
 import { publishSessionPublisherLifecycleUpdate } from "@/app/session/runtimeActivity/publishPublisherLifecycleUpdate";
 import { readHappierSocketData } from "./socket/socketData";
 import { registerReleasedUiV021SessionEndSocketEvent } from "@/app/session/compatibility/registerReleasedUiV021SessionEndSocketEvent";
@@ -434,6 +438,14 @@ export function startSocket(app: Fastify) {
                 }
                 : undefined,
         );
+        if (connection.connectionType === "machine-scoped") {
+            registerMachineSessionRunnerExitedSocketEvent({
+                socket,
+                presence: sessionPublisherPresence,
+                accountId: userId,
+                machineId: connection.machineId,
+            });
+        }
         if (connection.connectionType === "user-scoped") {
             registerReleasedUiV021SessionEndSocketEvent({
                 socket,
@@ -444,6 +456,9 @@ export function startSocket(app: Fastify) {
         if (connection.connectionType === "session-scoped") {
             if (sessionBinding) {
                 if (sessionBinding.proof === "machine-access-key" && sessionBinding.machineId) {
+                    const publisherIncarnationId = SessionPublisherIncarnationIdSchema.safeParse(
+                        (socket.handshake.auth as Record<string, unknown> | undefined)?.publisherIncarnationId,
+                    );
                     registerSessionRuntimeActivitySnapshotSocketEvent({
                         socket,
                         presence: sessionPublisherPresence,
@@ -452,6 +467,7 @@ export function startSocket(app: Fastify) {
                             machineId: sessionBinding.machineId,
                             sessionId: sessionBinding.sessionId,
                         },
+                        ...(publisherIncarnationId.success ? { publisherIncarnationId: publisherIncarnationId.data } : {}),
                         publish: async ({
                             sessionId: publishedSessionId,
                             projection,

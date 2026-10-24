@@ -288,7 +288,7 @@ sequenceDiagram
 - `/stop-session`
 - `/spawn-session`
 - `/stop` (shutdown daemon)
-- `/session-started` (session self-report)
+- `/session-started` (session self-report). A daemon-started runner's readiness waits on a server account check; the daemon answers within `SESSION_STARTED_READINESS_ANSWER_TIMEOUT_MS` (`src/daemon/sessionStartedReadiness.ts`), with 503 `session_startup_reconciliation_pending` if the check is still running, and the runner's retry joins that check. A runner that needs this acknowledgement keeps retrying while the daemon answers pending, for at most `DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS` (10 minutes) from its first attempt. That ceiling is a deadline: each attempt, from reading the daemon state through the HTTP answer, is aborted when it passes; each pause is clipped to the time left; and an acknowledgement that settles after it is not accepted. The report also carries the runner's `publisherIncarnationId`, which the daemon records on the tracked session and later names when it reports that runner's exit to the server.
 
 The CLI talks to this server via `controlClient.ts`, using a port stored in `daemon.state.json`.
 

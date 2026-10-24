@@ -701,4 +701,158 @@ describe('createOnChildExited', () => {
     expect(pidToTrackedSession.has(pid)).toBe(false);
     expect(spawnCleanup).toHaveBeenCalledOnce();
   });
+
+  it('tells the server that a session runner exited before any respawn is scheduled', async () => {
+    // 2026-10-23: runner 1144367 exited FATAL and the server kept cmvjutye active for 8 minutes.
+    const pid = 792;
+    const tracked = {
+      pid,
+      startedBy: 'daemon',
+      happySessionId: 'session-runner-fatal',
+      publisherIncarnationId: 'incarnation-1144367',
+    };
+    const pidToTrackedSession = new Map<number, any>([[pid, tracked]]);
+    const reportSessionRunnerExited = vi.fn(async (report: { sessionId: string }) => ({
+      kind: 'acknowledged' as const,
+      ack: { status: 'closed' as const, sessionId: report.sessionId },
+    }));
+    const onUnexpectedExit = vi.fn();
+
+    const onChildExited = createOnChildExited({
+      pidToTrackedSession,
+      spawnResourceCleanupByPid: new Map(),
+      sessionAttachCleanupByPid: new Map(),
+      getApiMachineForSessions: () => ({
+        enqueueDaemonTerminalExactTurnEnd: vi.fn(async () => {}),
+        reportSessionRunnerExited,
+      }) as any,
+      removeSessionMarkerFn: vi.fn(async () => {}),
+      onUnexpectedExit,
+    } as any);
+
+    await onChildExited(pid, { reason: 'process-exited', code: 1, signal: null });
+
+    expect(reportSessionRunnerExited).toHaveBeenCalledOnce();
+    // The report names the exact runner incarnation that died, never just the session.
+    expect(reportSessionRunnerExited).toHaveBeenCalledWith({
+      sessionId: 'session-runner-fatal',
+      publisherIncarnationId: 'incarnation-1144367',
+    });
+    expect(onUnexpectedExit).toHaveBeenCalledOnce();
+    expect(reportSessionRunnerExited.mock.invocationCallOrder[0]!).toBeLessThan(
+      onUnexpectedExit.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it('does not report a runner exit while another live runner owns the same session', async () => {
+    const obsoletePid = 793;
+    const livePid = 794;
+    const pidToTrackedSession = new Map<number, any>([
+      [obsoletePid, { pid: obsoletePid, startedBy: 'daemon', happySessionId: 'session-replaced', publisherIncarnationId: 'incarnation-a' }],
+      [livePid, { pid: livePid, startedBy: 'daemon', happySessionId: 'session-replaced', publisherIncarnationId: 'incarnation-b' }],
+    ]);
+    const reportSessionRunnerExited = vi.fn(async () => ({ kind: 'not_delivered' as const, reason: 'unacknowledged' as const }));
+    const originalKill = process.kill.bind(process);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(((targetPid: number, signal?: any) => {
+      if (targetPid === livePid && signal === 0) return true;
+      return originalKill(targetPid, signal as any);
+    }) as any);
+
+    try {
+      const onChildExited = createOnChildExited({
+        pidToTrackedSession,
+        spawnResourceCleanupByPid: new Map(),
+        sessionAttachCleanupByPid: new Map(),
+        getApiMachineForSessions: () => ({
+          enqueueDaemonTerminalExactTurnEnd: vi.fn(async () => {}),
+          reportSessionRunnerExited,
+        }) as any,
+        removeSessionMarkerFn: vi.fn(async () => {}),
+      } as any);
+
+      await onChildExited(obsoletePid, { reason: 'process-missing', code: null, signal: null });
+
+      expect(reportSessionRunnerExited).not.toHaveBeenCalled();
+    } finally {
+      killSpy.mockRestore();
+    }
+  });
+
+  it('reports the exited runner by its own incarnation when a successor appears during delayed staging', async () => {
+    const exitedPid = 795;
+    const successorPid = 796;
+    const sessionId = 'session-successor-during-staging';
+    const pidToTrackedSession = new Map<number, any>([
+      [exitedPid, { pid: exitedPid, startedBy: 'daemon', happySessionId: sessionId, publisherIncarnationId: 'incarnation-a' }],
+    ]);
+    let releaseStaging = (): void => {
+      throw new Error('Staging release was not installed');
+    };
+    const stageObservedExitFn = vi.fn(() => new Promise<any>((resolve) => {
+      releaseStaging = () => resolve({ status: 'no_exact_turn' as const, markerPid: exitedPid });
+    }));
+    const reportSessionRunnerExited = vi.fn(async (report: { sessionId: string }) => ({
+      kind: 'acknowledged' as const,
+      ack: { status: 'rejected' as const, sessionId: report.sessionId, reason: 'unmatched' as const },
+    }));
+    const originalKill = process.kill.bind(process);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(((targetPid: number, signal?: any) => {
+      if (targetPid === successorPid && signal === 0) return true;
+      return originalKill(targetPid, signal as any);
+    }) as any);
+
+    try {
+      const onChildExited = createOnChildExited({
+        pidToTrackedSession,
+        spawnResourceCleanupByPid: new Map(),
+        sessionAttachCleanupByPid: new Map(),
+        getApiMachineForSessions: () => ({
+          enqueueDaemonTerminalExactTurnEnd: vi.fn(async () => {}),
+          reportSessionRunnerExited,
+        }) as any,
+        removeSessionMarkerFn: vi.fn(async () => {}),
+        stageObservedExitFn,
+      } as any);
+
+      const completion = onChildExited(exitedPid, { reason: 'process-exited', code: 1, signal: null });
+      await vi.waitFor(() => expect(stageObservedExitFn).toHaveBeenCalledOnce());
+      // A successor for the same session registers while the exit is still being staged.
+      pidToTrackedSession.set(successorPid, {
+        pid: successorPid,
+        startedBy: 'daemon',
+        happySessionId: sessionId,
+        publisherIncarnationId: 'incarnation-b',
+      });
+      releaseStaging();
+      await completion;
+
+      expect(reportSessionRunnerExited).toHaveBeenCalledOnce();
+      expect(reportSessionRunnerExited).toHaveBeenCalledWith({ sessionId, publisherIncarnationId: 'incarnation-a' });
+    } finally {
+      killSpy.mockRestore();
+    }
+  });
+
+  it('does not report an exit for a runner whose publisher incarnation the daemon never learned', async () => {
+    const pid = 797;
+    const pidToTrackedSession = new Map<number, any>([
+      [pid, { pid, startedBy: 'daemon', happySessionId: 'session-unknown-incarnation' }],
+    ]);
+    const reportSessionRunnerExited = vi.fn();
+
+    const onChildExited = createOnChildExited({
+      pidToTrackedSession,
+      spawnResourceCleanupByPid: new Map(),
+      sessionAttachCleanupByPid: new Map(),
+      getApiMachineForSessions: () => ({
+        enqueueDaemonTerminalExactTurnEnd: vi.fn(async () => {}),
+        reportSessionRunnerExited,
+      }) as any,
+      removeSessionMarkerFn: vi.fn(async () => {}),
+    } as any);
+
+    await onChildExited(pid, { reason: 'process-exited', code: 1, signal: null });
+
+    expect(reportSessionRunnerExited).not.toHaveBeenCalled();
+  });
 });

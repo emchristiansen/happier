@@ -12,13 +12,11 @@ import { findHappyProcessByPid } from '../doctor';
 import type { TrackedSession } from '../types';
 import { hashProcessCommand, writeSessionMarker } from '../sessionRegistry';
 import { buildSessionRunnerRespawnDescriptorV1FromSpawnOptions } from '../processSupervision/sessionRunnerRespawnDescriptor';
+import { isPidPlaceholderSessionId } from './pidPlaceholderSessionId';
+import type { SessionStartedRunnerReport } from '../sessionStartedReadiness';
 
 const DEFAULT_PARENT_PID_LOOKUP_TIMEOUT_MS = 1000;
 const PARENT_PID_LOOKUP_TIMEOUT_ENV_KEY = 'HAPPIER_DAEMON_PARENT_PID_LOOKUP_TIMEOUT_MS';
-
-function isPidPlaceholderSessionId(value: string): boolean {
-  return /^PID-\d+$/.test(value);
-}
 
 function adoptReportedHappySessionId(tracked: TrackedSession, reportedSessionId: string): string {
   const currentSessionId = normalizeNonEmptyString(tracked.happySessionId);
@@ -136,7 +134,7 @@ export function createOnHappySessionWebhook(params: Readonly<{
   readCredentialsFn?: typeof readCredentials;
   onTrackedSessionReady?: (tracked: TrackedSession) => Promise<void> | void;
   onTrackedSessionReported?: (tracked: TrackedSession) => Promise<void> | void;
-}>): (sessionId: string, sessionMetadata: Metadata) => Promise<void> {
+}>): (sessionId: string, sessionMetadata: Metadata, report?: SessionStartedRunnerReport) => Promise<void> {
   const {
     pidToTrackedSession,
     pidToAwaiter,
@@ -148,7 +146,7 @@ export function createOnHappySessionWebhook(params: Readonly<{
     onTrackedSessionReported,
   } = params;
 
-  return async (sessionId: string, sessionMetadata: Metadata) => {
+  return async (sessionId: string, sessionMetadata: Metadata, report: SessionStartedRunnerReport = {}) => {
     const normalizedPath = expandHomeDirPath(sessionMetadata.path, process.env);
     const normalizedMetadata =
       normalizedPath === sessionMetadata.path ? sessionMetadata : { ...sessionMetadata, path: normalizedPath };
@@ -324,6 +322,8 @@ export function createOnHappySessionWebhook(params: Readonly<{
     }
 
     if (trackedForPid) {
+      // The reporting process is this tracked session's runner; remember which publisher incarnation it is.
+      if (report.publisherIncarnationId) trackedForPid.publisherIncarnationId = report.publisherIncarnationId;
       const agentId = inferAgentIdFromSessionMetadata(normalizedMetadata);
       const vendorResumeId = resolveVendorResumeIdFromSessionMetadata(agentId, normalizedMetadata);
       if (vendorResumeId) trackedForPid.vendorResumeId = vendorResumeId;

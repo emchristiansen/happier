@@ -5,6 +5,7 @@ import { writeSessionExitReport } from '@/session/diagnostics/sessionExitReport'
 import type { TrackedSession } from '../types';
 import { removeSessionMarker, updateSessionMarkerActiveTurn } from '../sessionRegistry';
 import { cleanupPidSessionResources } from './cleanupPidSessionResources';
+import { isPidPlaceholderSessionId } from './pidPlaceholderSessionId';
 import { stageObservedExit } from './stageObservedExit';
 
 export type ChildExit = { reason: string; code: number | null; signal: string | null };
@@ -43,6 +44,39 @@ function findLiveReplacementForSameSession(
   }
 
   return null;
+}
+
+/**
+ * Tell the server that this exact runner incarnation exited, so the session stops reading `active`
+ * instead of waiting out the presence timeout. A dead runner cannot close its own publisher fence,
+ * and a dropped connection does not clear `active`. The server retires the fence only while this
+ * incarnation is still the current publisher, so a report that arrives after a successor registered
+ * leaves the successor alone. The exit lifecycle never waits on this report.
+ */
+function reportSessionRunnerExit(
+  apiMachine: ApiMachineClient,
+  report: Readonly<{ sessionId: string; publisherIncarnationId: string }>,
+  pid: number,
+): void {
+  const { sessionId } = report;
+  const reportFailure = (detail: Readonly<Record<string, unknown>>): void => {
+    logger.warn('[DAEMON RUN] Server did not retire the exited runner; the session reads active until the server presence timeout', {
+      sessionId,
+      pid,
+      ...detail,
+    });
+  };
+  try {
+    void apiMachine.reportSessionRunnerExited(report).then((outcome) => {
+      if (outcome.kind === 'acknowledged' && (outcome.ack.status === 'closed' || outcome.ack.status === 'already_inactive')) {
+        logger.debug('[DAEMON RUN] Server retired the exited runner', { sessionId, pid, status: outcome.ack.status });
+        return;
+      }
+      reportFailure({ outcome });
+    }, (error: unknown) => reportFailure({ error }));
+  } catch (error) {
+    reportFailure({ error });
+  }
 }
 
 export function createOnChildExited(params: Readonly<{
@@ -192,6 +226,20 @@ export function createOnChildExited(params: Readonly<{
             error,
           });
         }
+      }
+      const exitedSessionId = normalizeSessionId(tracked.happySessionId);
+      const exitedPublisherIncarnationId = tracked.publisherIncarnationId;
+      if (
+        shouldReportSessionEnd
+        && exitedSessionId
+        && !isPidPlaceholderSessionId(exitedSessionId)
+        && exitedPublisherIncarnationId
+        && apiMachineForSessions
+      ) {
+        reportSessionRunnerExit(apiMachineForSessions, {
+          sessionId: exitedSessionId,
+          publisherIncarnationId: exitedPublisherIncarnationId,
+        }, pid);
       }
       if (shouldReportSessionEnd && isUnexpected && typeof tracked.happySessionId === 'string' && tracked.happySessionId.trim().length > 0) {
         try {

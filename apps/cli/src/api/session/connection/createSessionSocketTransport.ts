@@ -6,6 +6,7 @@ import type { ClientToServerEvents, ServerToClientEvents } from '@/api/types';
 import { createSocketTransportAdapter } from '@/api/connection/createSocketTransportAdapter';
 import { configuration } from '@/configuration';
 import { ensureSessionMachineAccessKeyBinding } from '@/api/session/ensureSessionMachineAccessKeyBinding';
+import { RUNNER_PUBLISHER_INCARNATION_ID } from '@/api/session/publisherIncarnation';
 import { getSocketIoProxyOptions } from '@/utils/proxy/socketIoProxy';
 import { normalizeServerHttpBaseUrl, resolveServerHttpBaseUrl } from '@/session/transport/http/serverHttpBaseUrl';
 import { resolveSessionControlSocketConnectTimeoutMs } from '@/session/transport/shared/sessionTimeouts';
@@ -34,6 +35,7 @@ export function createSessionSocketTransport(params: Readonly<{
             clientType: 'session-scoped' as const,
             sessionId: params.sessionId,
             ...(params.machineId ? { machineId: params.machineId } : null),
+            publisherIncarnationId: RUNNER_PUBLISHER_INCARNATION_ID,
         },
         path: '/v1/updates',
         reconnection: false,

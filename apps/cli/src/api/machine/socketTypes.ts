@@ -1,7 +1,10 @@
 import type { SocketRpcCallPayload, SocketRpcCallResponse, SocketRpcRequestPayload, Update } from '../types';
 import { SOCKET_RPC_EVENTS } from '@happier-dev/protocol/socketRpc';
+import { MACHINE_SESSION_RUNNER_EXITED_EVENT } from '@happier-dev/protocol';
 import type {
   DirectSessionTranscriptDeltaEphemeral,
+  MachineSessionRunnerExitedAck,
+  MachineSessionRunnerExitedRequest,
   ActionOperationRevisionEphemeralV1,
   MachineUpdateMetadataRequest,
   MachineUpdateMetadataResponse,
@@ -39,6 +42,11 @@ export interface DaemonToServerEvents {
         | { result: 'version-mismatch'; version: number; daemonState: string }
         | { result: 'success'; version: number; daemonState: string }
     ) => void
+  ) => void;
+
+  [MACHINE_SESSION_RUNNER_EXITED_EVENT]: (
+    data: MachineSessionRunnerExitedRequest,
+    cb: (answer: MachineSessionRunnerExitedAck) => void
   ) => void;
 
   [SOCKET_RPC_EVENTS.REGISTER]: (data: { method: string }) => void;

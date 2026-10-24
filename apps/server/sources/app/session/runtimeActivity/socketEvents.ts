@@ -1,4 +1,7 @@
 import {
+    MACHINE_SESSION_RUNNER_EXITED_EVENT,
+    MachineSessionRunnerExitedAckSchema,
+    MachineSessionRunnerExitedRequestSchema,
     SESSION_PUBLISHER_LEGACY_ALIVE_EVENT,
     SESSION_PUBLISHER_LEGACY_END_EVENT,
     SESSION_RUNTIME_ACTIVITY_CLOSE_EVENT,
@@ -15,6 +18,8 @@ import {
 } from '@happier-dev/protocol';
 
 import type { SessionParticipantCursor } from '@/app/session/changeTracking/markSessionParticipantsChanged';
+import { publishSessionPublisherLifecycleUpdate } from '@/app/session/runtimeActivity/publishPublisherLifecycleUpdate';
+import { emitPendingActivationWake } from '@/app/presence/pendingActivationWake';
 import type { createSessionPublisherPresence } from '@/app/presence/sessionPublisherPresence';
 import { describeLoggableError } from '@/utils/logging/describeLoggableError';
 import { warn } from '@/utils/logging/log';
@@ -72,11 +77,19 @@ export function registerSessionRuntimeActivitySnapshotSocketEvent(params: Readon
     socket: RuntimeActivitySnapshotEventSocket;
     presence: RuntimeActivitySnapshotPresence;
     binding: Readonly<{ accountId: string; machineId: string; sessionId: string }>;
+    /** The runner process this publisher socket named in its handshake, when it named one. */
+    publisherIncarnationId?: string;
     publish: PublishRuntimeActivitySnapshotProjection;
     /** Clock for the released-heartbeat persistence window (mirrors `createSessionPublisherPresence`). */
     nowMs?: () => number;
 }>): void {
     const nowMs = params.nowMs ?? (() => Date.now());
+    if (params.publisherIncarnationId) {
+        params.presence.bindPublisherIncarnation({
+            socket: params.socket,
+            publisherIncarnationId: params.publisherIncarnationId,
+        });
+    }
     const publishParticipants = async (published: Readonly<{
         participantCursors: readonly SessionParticipantCursor[];
         projection?: SessionRuntimeActivityProjection;
@@ -305,6 +318,72 @@ export function registerSessionRuntimeActivitySnapshotSocketEvent(params: Readon
                 'Failed to adapt released session-end event',
             );
             // Released end events have no required acknowledgement; timeout remains authoritative.
+        }
+    });
+}
+
+/**
+ * A daemon that observed one exact runner incarnation exit retires that runner's publisher fence,
+ * so the session stops reading `active` instead of waiting for the presence timeout. A dead runner
+ * cannot close its own fence, and a dropped connection only forgets the in-memory publisher.
+ *
+ * The report names the exited runner's publisher incarnation. The presence owner retires the fence
+ * only while that incarnation's latest registration is still the current publisher generation and
+ * the reporting machine still hosts the session. A late report for a predecessor is rejected as
+ * `unmatched` and never retires a successor; no turn is ended. When the retirement makes the
+ * session inactive, a waiting activation request is woken again, as the presence timeout does.
+ */
+export function registerMachineSessionRunnerExitedSocketEvent(params: Readonly<{
+    socket: RuntimeActivitySnapshotEventSocket;
+    presence: RuntimeActivitySnapshotPresence;
+    accountId: string;
+    machineId: string;
+}>): void {
+    params.socket.on(MACHINE_SESSION_RUNNER_EXITED_EVENT, async (value, acknowledge) => {
+        const request = MachineSessionRunnerExitedRequestSchema.safeParse(value);
+        if (!request.success) {
+            acknowledge?.(MachineSessionRunnerExitedAckSchema.parse({ status: 'rejected', reason: 'invalid_request' }));
+            return;
+        }
+        const { sessionId, publisherIncarnationId } = request.data;
+        try {
+            const retired = await params.presence.retireExitedPublisher({
+                binding: { accountId: params.accountId, machineId: params.machineId, sessionId },
+                publisherIncarnationId,
+            });
+            if (retired.status === 'closed') {
+                await publishSessionPublisherLifecycleUpdate({
+                    sessionId,
+                    participantCursors: retired.participantCursors,
+                    active: false,
+                    activeAt: retired.activeAt.getTime(),
+                    ...(retired.projection ? { projection: retired.projection } : {}),
+                });
+                if (retired.activationWake) {
+                    await emitPendingActivationWake({
+                        sessionId,
+                        participantCursors: retired.participantCursors,
+                        wake: retired.activationWake,
+                    });
+                }
+            }
+            acknowledge?.(MachineSessionRunnerExitedAckSchema.parse(
+                retired.status === 'closed' || retired.status === 'already_inactive'
+                    ? { status: retired.status, sessionId }
+                    : retired.status === 'superseded'
+                        ? { status: 'rejected', sessionId, reason: 'superseded' }
+                        : {
+                            status: 'rejected',
+                            sessionId,
+                            reason: retired.reason === 'unauthorized' ? 'machine_control_unavailable' : retired.reason,
+                        },
+            ));
+        } catch (error) {
+            warn(
+                { module: 'session-publisher-presence', sessionId, error: describeLoggableError(error) },
+                'Failed to retire an exited session runner',
+            );
+            acknowledge?.(MachineSessionRunnerExitedAckSchema.parse({ status: 'retryable', sessionId, reason: 'internal' }));
         }
     });
 }
