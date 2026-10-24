@@ -74,7 +74,7 @@ async function main() {
     // Freeze only the custody clock. Socket.IO, the server and test deadlines keep real time.
     const realSetTimeout = globalThis.setTimeout;
     const frozenCustodyTimers = new Set<ReturnType<typeof setTimeout>>();
-    globalThis.setTimeout = ((callback, delay, ...args) => {
+    globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
       if (delay === custodyTimeoutMs) {
         const timer = realSetTimeout(() => {}, custodyTimeoutMs);
         frozenCustodyTimers.add(timer);
