@@ -58,6 +58,7 @@ import { getSessionRecentMessages } from '@/session/services/getSessionRecentMes
 import { getSessionStatus } from '@/session/services/getSessionStatus';
 import { getSessionTranscript } from '@/session/services/getSessionTranscript';
 import { listSessions } from '@/session/services/listSessions';
+import { markSessionPendingInputHandled } from '@/session/services/markSessionPendingInputHandled';
 import { requestSessionStop } from '@/session/services/requestSessionStop';
 import {
   ensureSessionRuntimeForPendingInput,
@@ -1800,6 +1801,20 @@ export function createCliActionDeps(params: Readonly<{
         sessionId,
         localId,
         ...(typeof expectedStateAtMs === 'number' ? { expectedStateAtMs } : {}),
+      });
+    },
+
+    sessionPendingInputMarkHandled: async ({ sessionId, localId, expectedDeliveryState, expectedBlockedReason }) => {
+      // Settled by the server's handled route directly with this CLI's own credentials, never
+      // through the session runner.
+      return await markSessionPendingInputHandled({
+        credentials: params.credentials,
+        request: {
+          sessionId,
+          localId,
+          expectedDeliveryState,
+          ...(expectedBlockedReason ? { expectedBlockedReason } : {}),
+        },
       });
     },
 

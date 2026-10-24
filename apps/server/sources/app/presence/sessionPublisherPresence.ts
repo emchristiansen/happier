@@ -23,7 +23,7 @@ import {
 } from "@/app/session/runtimeActivity/writeProjection";
 import { db } from "@/storage/db";
 import { inTx } from "@/storage/inTx";
-import { blockInheritedProviderDeliveryClaims } from "@/app/session/pending/providerDeliveryClaimStaleness";
+import { reofferInheritedProviderDeliveryClaims } from "@/app/session/pending/providerDeliveryClaimStaleness";
 import { applyLatestSessionTurnEndInTx } from "@/app/session/sessionWriteService";
 import { AsyncLock } from "@/utils/runtime/lock";
 import type { Tx } from "@/storage/inTx";
@@ -140,7 +140,7 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
                 return { status: "rejected", reason: "revision_overflow" };
             }
 
-            await blockInheritedProviderDeliveryClaims({ tx, sessionId: binding.sessionId });
+            await reofferInheritedProviderDeliveryClaims({ tx, sessionId: binding.sessionId, now: now() });
 
             const activity = await writeSessionRuntimeActivityProjectionInTx({
                 tx,

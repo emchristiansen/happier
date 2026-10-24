@@ -40,7 +40,8 @@ type ApiSessionClientStubContract = Pick<
     | 'materializeNextPendingMessageSafely'
     | 'popPendingMessage'
     | 'listPendingMessageQueueV2LocalIds'
-    | 'peekPendingMessageQueueV2Count'
+    | 'listActionablePendingMessageQueueV2LocalIds'
+    | 'peekActionablePendingMessageQueueV2Count'
     | 'discardPendingMessageQueueV2All'
     | 'discardCommittedMessageLocalIds'
     | 'getCommittedUserMessageSeq'
@@ -105,7 +106,8 @@ class OfflineSessionStub extends EventEmitter implements ApiSessionClientStubCon
     }
     async popPendingMessage(): Promise<boolean> { return false; }
     async listPendingMessageQueueV2LocalIds(): Promise<string[]> { return []; }
-    async peekPendingMessageQueueV2Count(): Promise<number> { return 0; }
+    async listActionablePendingMessageQueueV2LocalIds(): Promise<string[]> { return []; }
+    async peekActionablePendingMessageQueueV2Count(): Promise<number> { return 0; }
     async discardPendingMessageQueueV2All(_opts: { reason: 'switch_to_local' | 'manual' }): Promise<number> { return 0; }
     async discardCommittedMessageLocalIds(_opts: { localIds: string[]; reason: 'switch_to_local' | 'manual' }): Promise<number> { return 0; }
     getCommittedUserMessageSeq(_localId: string): number | null { return null; }

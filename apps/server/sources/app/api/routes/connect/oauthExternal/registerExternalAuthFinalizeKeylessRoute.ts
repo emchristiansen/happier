@@ -14,6 +14,7 @@ import { loadValidOAuthPending, deleteOAuthPendingBestEffort } from "../connectR
 import { authPendingSchema } from "./oauthExternalSchemas";
 import { readAuthOauthKeylessFeatureEnv } from "@/app/features/catalog/readFeatureEnv";
 import { resolveKeylessAutoProvisionEligibility } from "@/app/auth/keyless/resolveKeylessAutoProvisionEligibility";
+import { deleteProvisionalAccount } from "@/app/auth/deleteProvisionalAccount";
 import { resolveKeylessAccountsAvailability } from "@/app/features/e2ee/resolveKeylessAccountsEnabled";
 import { resolveEffectiveAccountEncryptionModeFromAccountRow } from "@/app/encryption/accountEncryptionMode";
 
@@ -193,7 +194,7 @@ export function registerExternalAuthFinalizeKeylessRoute(app: Fastify) {
             });
             await db.repeatKey.deleteMany({ where: { key: pendingKey } });
         } catch (error) {
-            await db.account.delete({ where: { id: account.id } }).catch(() => {});
+            await deleteProvisionalAccount(account.id);
             await db.repeatKey.deleteMany({ where: { key: pendingKey } });
             if (error instanceof Error && error.message === "not-eligible") {
                 return reply.code(403).send({ error: "not-eligible" });
