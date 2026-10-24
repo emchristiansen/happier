@@ -39,18 +39,29 @@ import {
  * only when it is in the attempt's current or next window and the attempt's
  * window did not change while it read. A paused writer can still link a
  * decision under a window name it read earlier; it then reads again, so that
- * decision determines its return only through these rules. The decisions any
- * two returns rely on therefore share one exclusive name, or are ordered
- * through it, so attempts of one request issue the same body while that body
- * stays current (unexpired and not evicted). This holds as long as the window
- * index of the host clock never moves back by more than one: a backward clock
- * step of under 60 minutes is tolerated, and a larger one can make a retry
- * seal again.
+ * decision determines its return only through these rules. While the host
+ * clock does not step back across a window boundary, the decisions any two
+ * returns rely on therefore share one exclusive name, or are ordered through
+ * it, so attempts of one request issue the same body while that body stays
+ * current (unexpired and not evicted).
+ *
+ * Known limit: a backward clock step across a window boundary, while a first
+ * publication is in flight, can make two attempts at one key return different
+ * bodies. An attempt that sampled window W+1 and paused before its link can
+ * link after the clock stepped back and another attempt, now in W, published
+ * and returned its own body; the W+1 decision then governs the first
+ * attempt's next read. The two decision names differ, so no exclusive link
+ * arbitrates between them. A backward step of a whole window or more can
+ * likewise make a retry seal again. The bodies differ only if the target
+ * metadata changed between the two preparations. The relay then refuses the
+ * later send (409 while the first is queued, 400 once it is in the
+ * transcript), so it is never duplicated.
  *
  * Removal, applied after a publication: bodies older than the retention, then
  * the oldest bodies beyond `SESSION_SEND_ADMISSION_MAX_ENTRIES` (by
  * storedAtMs, then name); decisions two or more windows behind the remover's
- * clock, which, within that clock limit, can no longer determine a return;
+ * clock, which no attempt reads unless its clock is at least one window
+ * behind the remover's;
  * temporary files whose mtime is older than the retention, the cleanup
  * criterion for a write that never completed. Every removal names one unique
  * file. A decision whose body was removed counts as not current.
@@ -257,10 +268,11 @@ export async function preserveSessionSendAdmission(params: Readonly<{
         const stored = bodyName ? await readCurrent(bodyName) : null;
         return bodyName && stored ? { decision, bodyName, stored } : null;
       };
-      // A current decision in the next window was made before this host's
-      // clock stepped back across the boundary; it governs. Otherwise this
-      // window's highest decision governs, and only without one the previous
-      // window's.
+      // A current decision in the next window exists only if the clock stepped
+      // back across the boundary, and it governs. It may have been linked
+      // after the step by a writer that sampled the later window first (the
+      // known limit above). Otherwise this window's highest decision governs,
+      // and only without one the previous window's.
       const top = tops.get(window) ?? tops.get(window - 1);
       const decided = (await resolve(tops.get(window + 1))) ?? (await resolve(top));
       const decidedBodyName = decided?.bodyName ?? null;
