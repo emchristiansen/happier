@@ -20,6 +20,7 @@ import {
     isPendingDeliveryStatusTransitionAllowedV1,
     isSessionAgentTransitionDividerLocalId,
     PENDING_DELIVERY_HIDDEN_DISCARDED_REASONS_V1,
+    PENDING_DELIVERY_REOFFER_TIER,
     normalizePendingDeliveryBlockedReason,
     normalizePendingDeliveryStatusV1,
     pendingDeliveryStatusV1ToPersistedFields,
@@ -34,7 +35,7 @@ import { resolveEncryptionWriteRejectionCode, type EncryptionPolicyRejectionCode
 import { reserveNextPendingQueuePosition } from "@/app/session/pending/reserveNextPendingQueuePosition";
 import { parseSessionMessageRole, resolveSessionMessageRole } from "@/app/session/messageRole/resolveSessionMessageRole";
 import { isDeepStrictEqual } from "node:util";
-import { createHash } from "node:crypto";
+import { derivePendingSendAsNewLocalId, reofferPendingRowAsNewInTx } from "@/app/session/pending/reofferPendingRowAsNewInTx";
 import { markSessionParticipantsChanged } from "@/app/session/changeTracking/markSessionParticipantsChanged";
 import {
     createSessionMessageFromPending,
@@ -1357,21 +1358,6 @@ export async function resolveAcceptedPendingDelivery(params: {
                 } as const;
             }
 
-            const requestedAction = PendingRequestedActionV1Schema.safeParse(existing.requestedAction);
-            const isExactAction = requestedAction.success && requestedAction.data.kind !== "enqueue";
-            const earlierUnresolved = isUncertainTombstone || isExactAction ? null : await tx.sessionPendingMessage.findFirst({
-                where: {
-                    sessionId,
-                    status: "queued",
-                    position: { lt: existing.position },
-                },
-                select: { localId: true },
-                orderBy: [{ position: "asc" }, { createdAt: "asc" }, { localId: "asc" }],
-            });
-            if (earlierUnresolved) {
-                return { ok: false, error: "blocked-by-earlier-pending" } as const;
-            }
-
             const resolved = await commitResolvedPendingDelivery(tx, {
                 actorUserId,
                 sessionId,
@@ -1427,7 +1413,7 @@ async function readCurrentPendingMutationState(tx: PendingServiceTx, sessionId: 
 }
 
 export type BlockPendingDeliveryResult =
-    | { ok: true; pendingVersion: number; pendingCount: number; pendingBlockedCount: number; participantCursors: ParticipantCursor[]; badgeAttentionChanged: boolean; didUpdate: boolean }
+    | { ok: true; pendingVersion: number; pendingCount: number; pendingBlockedCount: number; participantCursors: ParticipantCursor[]; badgeAttentionChanged: boolean; didUpdate: boolean; activationTarget?: PendingActivationTarget }
     | { ok: false; error: "session-not-found" | "forbidden" | "invalid-params" | "not-found" | "delivery-settlement-conflict" | "internal" };
 
 export async function blockPendingDelivery(params: {
@@ -1513,6 +1499,10 @@ export async function blockPendingDelivery(params: {
             }
             if (existing.status !== "queued") {
                 return { ok: true, ...(await readCurrentPendingMutationState(tx, sessionId)), didUpdate: false };
+            }
+            if (PENDING_DELIVERY_REOFFER_TIER[reason] === "immediate") {
+                const state = await reofferPendingRowAsNewInTx(tx, sessionId, localId, new Date());
+                return { ok: true, ...state, didUpdate: true } as const;
             }
             if (existing.deliveryState === "blocked" && existing.deliveryBlockedReason === reason) {
                 return { ok: true, ...(await readCurrentPendingMutationState(tx, sessionId)), didUpdate: false };
@@ -1679,15 +1669,8 @@ export async function dismissPendingDelivery(params: {
     }
 }
 
-function derivePendingSendAsNewLocalId(sessionId: string, localId: string): string {
-    const digest = createHash("sha256")
-        .update(`happier.pending.send-as-new.v1\0${sessionId}\0${localId}`, "utf8")
-        .digest("hex");
-    return `send-as-new-${digest}`;
-}
-
 export type SendPendingDeliveryAsNewResult =
-    | { ok: true; didWrite: boolean; pendingVersion: number; pendingCount: number; pendingBlockedCount: number; participantCursors: ParticipantCursor[]; badgeAttentionChanged: boolean }
+    | { ok: true; didWrite: boolean; pendingVersion: number; pendingCount: number; pendingBlockedCount: number; participantCursors: ParticipantCursor[]; badgeAttentionChanged: boolean; activationTarget?: PendingActivationTarget }
     | { ok: false; error: "session-not-found" | "forbidden" | "invalid-params" | "not-found" | "delivery-settlement-conflict" | "identity-conflict" | "internal" };
 
 export async function sendPendingDeliveryAsNew(params: {
@@ -1745,35 +1728,7 @@ export async function sendPendingDeliveryAsNew(params: {
             }
             if (replacement) return { ok: false, error: "identity-conflict" } as const;
 
-            const position = await reserveNextPendingQueuePosition(tx, sessionId);
-            await tx.sessionPendingMessage.create({
-                data: {
-                    sessionId,
-                    localId: replacementLocalId,
-                    messageRole: existing.messageRole,
-                    content: existing.content as PrismaJson.SessionPendingMessageContent,
-                    requestedAction: { v: 1, kind: "enqueue" },
-                    status: "queued",
-                    deliveryState: null,
-                    position,
-                    authorAccountId: actorUserId,
-                },
-            });
-            await tx.sessionPendingMessage.update({
-                where: { sessionId_localId: { sessionId, localId } },
-                data: {
-                    status: "discarded",
-                    deliveryState: null,
-                    deliveryBlockedReason: null,
-                    discardedAt: now,
-                    discardedReason: "resent_as_new",
-                },
-            });
-            const state = await applyPendingSessionStateChange({
-                tx,
-                sessionId,
-                pendingBlockedCountDelta: existing.deliveryState === "blocked" ? -1 : 0,
-            });
+            const state = await reofferPendingRowAsNewInTx(tx, sessionId, localId, now, { replacementLocalId });
             return { ok: true, didWrite: true, ...state } as const;
         }));
     } catch {
