@@ -2600,13 +2600,15 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       error: Object.assign(new Error('private-untyped-failure'), { code: 'private-unrecognized-code' }),
       failure: { kind: 'unknown' },
     },
-  ])('reports the accepted no-retry shape for $name without changing exact custody or dispatch', async ({ localId, error, failure }) => {
+  ])('retries an unresolved accepted settlement for $name without repeating provider input', async ({ localId, error, failure }) => {
     const infoSpy = vi.spyOn(logger, 'infoFile');
     const warningSpy = vi.spyOn(logger, 'warn');
     const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 });
     await waitForCurrentPendingInputContract(client);
+    vi.useFakeTimers();
+    const retryAt = Date.now() + 120_000;
     const original = createProviderDeliveryMaterializeResult(localId);
-    materializeNextMock.mockResolvedValueOnce(original);
+    materializeNextMock.mockResolvedValue(original);
     listDeliveryStatusesMock.mockResolvedValue([{ localId, status: 'delivering' }]);
     resolveAcceptedPendingDeliveryMock.mockRejectedValueOnce(error);
     const providerEntry = vi.fn((message: unknown) => {
@@ -2618,22 +2620,21 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toMatchObject({
       type: 'materialized', localId,
     });
-    await waitUntil(() => warningSpy.mock.calls.some(([message, details]) => (
-      message === '[pendingQueue] accepted provider settlement remains unresolved'
-      && typeof details === 'object' && details !== null && 'localId' in details && details.localId === localId
-    )));
+    await vi.advanceTimersByTimeAsync(0);
     expect(infoSpy).toHaveBeenCalledWith('[pendingQueue] provider acceptance handoff', expect.objectContaining({
       sessionId: 's1', localId, stage: 'settlement_admitted', canonicalCustody: true,
       producerGeneration: expect.any(Number), sessionConnectionEpoch: expect.any(Number),
     }));
     expect(warningSpy).toHaveBeenCalledWith('[pendingQueue] accepted provider settlement remains unresolved', expect.objectContaining({
-      sessionId: 's1', localId, attempt: 1, retryAfterMs: null, willRetry: false,
-      retryDisposition: 'retained_without_retry', failure,
+      sessionId: 's1', localId, attempt: 1, retryAfterMs: 120_000, willRetry: true,
+      retryDisposition: 'same_operation_after_backoff', failure,
       producerGeneration: expect.any(Number), sessionConnectionEpoch: expect.any(Number),
     }));
-    logger.flushSync();
+    await vi.waitFor(() => {
+      logger.flushSync();
+      expect(readFileSync(logger.getLogPath(), 'utf8')).toContain(`"failure":${JSON.stringify(failure)}`);
+    });
     const fileLog = readFileSync(logger.getLogPath(), 'utf8');
-    expect(fileLog).toContain(`"failure":${JSON.stringify(failure)}`);
     expect(fileLog).not.toContain('private socket detail');
     expect(fileLog).not.toContain('private-unrecognized-server-value');
     expect(fileLog).not.toContain('private-unrecognized-code');
@@ -2642,9 +2643,15 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
     await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toEqual({ type: 'no_pending' });
     expect(providerEntry).toHaveBeenCalledTimes(1);
-    expect(materializeNextMock).toHaveBeenCalledTimes(1);
+    expect(materializeNextMock).toHaveBeenCalledTimes(2);
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledExactlyOnceWith({ socket: sessionSocketStub, sessionId: 's1', localId });
     expect(blockPendingDeliveryMock).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(retryAt - Date.now() - 1);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(2);
+    expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(false);
+    expect(providerEntry).toHaveBeenCalledTimes(1);
   });
 
   it('logs once per held input when held provider custody stops materialization', async () => {
@@ -2654,22 +2661,19 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     await waitForCurrentPendingInputContract(client);
     materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult(localId));
     listDeliveryStatusesMock.mockResolvedValue([{ localId, status: 'delivering' }]);
-    resolveAcceptedPendingDeliveryMock.mockRejectedValueOnce(new PendingQueueAcceptedSettlementError('transcript-conflict'));
-    client.onUserMessage(() => confirmProviderInputAccepted(client, localId));
     await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
       .resolves.toMatchObject({ type: 'materialized', localId });
-    await waitUntil(() => resolveAcceptedPendingDeliveryMock.mock.calls.length === 1);
     const heldLines = () => infoSpy.mock.calls.filter(([message]) => message === '[pendingQueue] materialization held by provider custody');
 
     await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toEqual({ type: 'no_pending' });
     await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toEqual({ type: 'no_pending' });
 
     expect(heldLines()).toEqual([['[pendingQueue] materialization held by provider custody', {
-      sessionId: 's1', localId, providerInputOutcome: 'accepted', publisherRecovery: 'current',
+      sessionId: 's1', localId, providerInputOutcome: null, publisherRecovery: 'current',
       sessionConnectionEpoch: expect.any(Number),
     }]]);
     logger.flushSync();
-    expect(readFileSync(logger.getLogPath(), 'utf8')).toContain(`"localId":"${localId}","providerInputOutcome":"accepted"`);
+    expect(readFileSync(logger.getLogPath(), 'utf8')).toContain(`"localId":"${localId}","providerInputOutcome":null`);
   });
 
   it.each([true, false])('retries the original accepted settlement after a pre-emit socket drop recovers without another provider entry (didResolve=%s)', async (didResolve) => {
@@ -3857,6 +3861,85 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(blockPendingDeliveryMock).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { configured: undefined, timeoutMs: 120_000 },
+    { configured: '1000', timeoutMs: 1_000 },
+  ])('expires unresolved custody after $timeoutMs ms and permits a later claim', async ({ configured, timeoutMs }) => {
+    vi.stubEnv('HAPPIER_PENDING_CUSTODY_OUTCOME_TIMEOUT_MS', configured);
+    const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 2, pendingVersion: 1 });
+    await waitForCurrentPendingInputContract(client);
+    providerInputOutcomeObserver(client);
+    vi.useFakeTimers();
+    const delivered: string[] = [];
+    client.onUserMessage((message) => { if (message.localId) delivered.push(message.localId); });
+    materializeNextMock
+      .mockResolvedValueOnce(createProviderDeliveryMaterializeResult('watchdog-original', 2))
+      .mockResolvedValueOnce(createProviderDeliveryMaterializeResult('later-after-watchdog', 4));
+    blockPendingDeliveryMock.mockResolvedValueOnce({
+      pendingQueueState: { known: true, pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 3 },
+    });
+    await client.materializeNextPendingMessageSafely();
+    expect(client.shouldAttemptPendingMaterialization()).toBe(false);
+    await vi.advanceTimersByTimeAsync(timeoutMs - 1);
+    expect(blockPendingDeliveryMock).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(blockPendingDeliveryMock).toHaveBeenCalledWith({
+      token: 'tok', sessionId: 's1', localId: 'watchdog-original', reason: 'delivery_outcome_uncertain',
+    });
+    expect(client.shouldAttemptPendingMaterialization()).toBe(true);
+    await expect(client.materializeNextPendingMessageSafely()).resolves.toMatchObject({
+      type: 'materialized', localId: 'later-after-watchdog',
+    });
+    expect(delivered).toEqual(['watchdog-original', 'later-after-watchdog']);
+    expect(materializeNextMock.mock.calls[1]?.[0]).toMatchObject({ heldLocalIds: ['watchdog-original'] });
+    expect(client.hasCanonicalPendingProviderInputDelivery('watchdog-original')).toBe(true);
+    confirmProviderInputAccepted(client, 'watchdog-original');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.hasPendingProviderInputAcceptance('watchdog-original')).toBe(true);
+    expect(client.hasCanonicalPendingProviderInputDelivery('watchdog-original')).toBe(false);
+  });
+
+  it('keeps accepted custody non-blocking while its settlement is still in flight', async () => {
+    const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 2, pendingVersion: 1 });
+    await waitForCurrentPendingInputContract(client);
+    const settlement = createDeferred<{ didResolve: boolean }>();
+    resolveAcceptedPendingDeliveryMock.mockReturnValueOnce(settlement.promise);
+    materializeNextMock
+      .mockResolvedValueOnce(createProviderDeliveryMaterializeResult('accepted-in-flight', 2))
+      .mockResolvedValueOnce(createProviderDeliveryMaterializeResult('later-before-settlement', 3));
+    try {
+      await client.materializeNextPendingMessageSafely();
+      confirmProviderInputAccepted(client, 'accepted-in-flight');
+      expect(client.shouldAttemptPendingMaterialization()).toBe(true);
+      await expect(client.materializeNextPendingMessageSafely()).resolves.toMatchObject({
+        type: 'materialized', localId: 'later-before-settlement',
+      });
+      expect(materializeNextMock.mock.calls[1]?.[0]).toMatchObject({ heldLocalIds: ['accepted-in-flight'] });
+      expect(client.hasCanonicalPendingProviderInputDelivery('accepted-in-flight')).toBe(true);
+    } finally {
+      settlement.resolve({ didResolve: true });
+    }
+  });
+
+  it.each(['accepted', 'termination', 'close'] as const)(
+    'cancels the custody watchdog after %s', async (terminal) => {
+      const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 });
+      await waitForCurrentPendingInputContract(client);
+      providerInputOutcomeObserver(client);
+      vi.useFakeTimers();
+      materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult('watchdog-cancelled', 2));
+      await client.materializeNextPendingMessageSafely();
+      if (terminal === 'accepted') {
+        resolveAcceptedPendingDeliveryMock.mockResolvedValueOnce({ didResolve: false });
+        confirmProviderInputAccepted(client, 'watchdog-cancelled');
+      } else if (terminal === 'termination') client.beginRuntimeTermination();
+      else await client.close();
+      blockPendingDeliveryMock.mockClear();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(blockPendingDeliveryMock).not.toHaveBeenCalled();
+    },
+  );
+
   it('clears accepted canonical pending delivery so later pending rows can materialize', async () => {
     const deliveryState = { mode: 'provider' as const, unresolved: true };
     const client = await createClient({
@@ -4231,7 +4314,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(listDeliveryStatusesMock).not.toHaveBeenCalled();
   });
 
-  it('keeps later materialization blocked after a permanent accepted-settlement failure', async () => {
+  it('delivers later pending input after a permanent accepted-settlement failure', async () => {
     const deliveryState = { mode: 'provider' as const, unresolved: true };
     const client = await createClient({
       latestTurnStatus: 'completed',
@@ -4305,11 +4388,11 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     confirmProviderInputAccepted(client, 'retry-provider-m1');
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toEqual({
-      type: 'no_pending',
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toMatchObject({
+      type: 'materialized', localId: 'retry-provider-m2',
     });
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
-    expect(materializeNextMock).toHaveBeenCalledTimes(1);
+    expect(materializeNextMock).toHaveBeenCalledTimes(2);
   });
 
   it('does not let a newer pending-change wake retry accepted-delivery settlement', async () => {
@@ -4476,7 +4559,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(materializeNextMock).toHaveBeenCalledTimes(2);
   });
 
-  it('retains accepted custody after not-found and absence until exact committed proof releases the later row', async () => {
+  it('retains accepted settlement identity after not-found without holding the later row', async () => {
     const deliveryState = { mode: 'provider' as const, unresolved: true };
     const client = await createClient({
       latestTurnStatus: 'completed',
@@ -4555,16 +4638,12 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
 
     listDeliveryStatusesMock.mockResolvedValueOnce([]);
     await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
-      .resolves.toEqual({ type: 'no_pending' });
-    expect(materializeNextMock).toHaveBeenCalledTimes(1);
+      .resolves.toMatchObject({ type: 'materialized', localId: 'stale-accepted-provider-m2' });
+    expect(materializeNextMock).toHaveBeenCalledTimes(2);
     expect((client as any).canonicalPendingDeliveryByLocalId.has('stale-accepted-provider-m1')).toBe(true);
     expect(hasProviderInputAcceptance(client, 'stale-accepted-provider-m1')).toBe(true);
     triggerCommittedUserMessage({ seq: 71, localId: 'stale-accepted-provider-m1' });
     expect(client.getCommittedUserMessageSeq('stale-accepted-provider-m1')).toBe(71);
-    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toMatchObject({
-      type: 'materialized',
-      localId: 'stale-accepted-provider-m2',
-    });
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
     expect(materializeNextMock).toHaveBeenCalledTimes(2);
     expect((client as any).canonicalPendingDeliveryByLocalId.has('stale-accepted-provider-m1')).toBe(false);
@@ -4912,180 +4991,67 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     },
   );
 
-  it('retains the canonical claim when the server block write fails without redriving it', async () => {
-    const deliveryState = { mode: 'provider' as const, unresolved: true };
-    const client = await createClient({
-      latestTurnStatus: 'completed',
-      pendingCount: 1,
-      pendingVersion: 1,
-      metadata: { deliveredUserMessageSeqV1: 0 },
-    });
-    blockPendingDeliveryMock
-      .mockRejectedValueOnce(new Error('temporary block failure'))
-      .mockResolvedValueOnce({
-        pendingQueueState: { known: true, pendingCount: 1, pendingVersion: 3 },
-      });
-    listDeliveryStatusesMock.mockResolvedValue([
-      { localId: 'retry-block-provider-m1', status: 'delivering' },
-    ]);
+  it.each([
+    { source: 'pre-effect', reason: 'provider_unavailable_before_acceptance' as const },
+    { source: 'watchdog', reason: 'delivery_outcome_uncertain' as const },
+  ])('releases local custody after a failed $source block and retries the original reason', async ({ source, reason }) => {
+    vi.stubEnv('HAPPIER_PENDING_CUSTODY_OUTCOME_TIMEOUT_MS', '1000');
+    const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 2, pendingVersion: 1 });
+    await waitForCurrentPendingInputContract(client);
+    providerInputOutcomeObserver(client);
+    vi.useFakeTimers();
+    const localId = 'failed-block-original';
     materializeNextMock
+      .mockResolvedValueOnce(createProviderDeliveryMaterializeResult(localId, 2))
+      .mockResolvedValueOnce(createProviderDeliveryMaterializeResult('later-after-failed-block', 3));
+    blockPendingDeliveryMock
+      .mockRejectedValueOnce(new Error('block response lost'))
       .mockResolvedValueOnce({
-        didMaterialize: true,
-        localId: 'retry-block-provider-m1',
-        didWrite: true,
-        pendingQueueState: { known: true, pendingCount: 1, pendingVersion: 2 },
-        message: {
-          id: 'm-retry-block-provider-1',
-          seq: 81,
-          localId: 'retry-block-provider-m1',
-          messageRole: 'user',
-          deliveryState,
-          content: {
-            t: 'plain',
-            v: {
-              role: 'user',
-              content: { type: 'text', text: 'provider prompt to block' },
-              localId: 'retry-block-provider-m1',
-              meta: { source: 'ui', sentFrom: 'web' },
-            },
-          },
-          createdAt: 1000,
-          updatedAt: 1000,
-        },
-      })
-      .mockResolvedValueOnce({
-        didMaterialize: true,
-        localId: 'retry-block-provider-m2',
-        didWrite: true,
-        pendingQueueState: { known: true, pendingCount: 0, pendingVersion: 4 },
-        message: {
-          id: 'm-retry-block-provider-2',
-          seq: 82,
-          localId: 'retry-block-provider-m2',
-          messageRole: 'user',
-          content: {
-            t: 'plain',
-            v: {
-              role: 'user',
-              content: { type: 'text', text: 'next prompt after block retry' },
-              localId: 'retry-block-provider-m2',
-              meta: { source: 'ui', sentFrom: 'web' },
-            },
-          },
-          createdAt: 1001,
-          updatedAt: 1001,
-        },
+        pendingQueueState: { known: true, pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 4 },
       });
-
-    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toMatchObject({
-      type: 'materialized',
-      localId: 'retry-block-provider-m1',
-      deliveryState,
+    await client.materializeNextPendingMessageSafely();
+    if (source === 'watchdog') await vi.advanceTimersByTimeAsync(1_000);
+    else await client.blockPendingMessageDelivery({ localIds: [localId], reason, providerEffect: 'none' });
+    expect(client.shouldAttemptPendingMaterialization()).toBe(true);
+    await expect(client.materializeNextPendingMessageSafely()).resolves.toMatchObject({
+      type: 'materialized', localId: 'later-after-failed-block',
     });
-
-    await expect(client.blockPendingMessageDelivery({
-      localIds: ['retry-block-provider-m1'],
-      reason: 'runtime_disposed_before_delivery',
-    })).resolves.toBe(true);
-    expect(client.shouldAttemptPendingMaterialization()).toBe(false);
-
-    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toEqual({
-      type: 'no_pending',
-    });
+    confirmProviderInputAccepted(client, 'later-after-failed-block');
+    expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
     expect(blockPendingDeliveryMock).toHaveBeenCalledTimes(1);
-    expect(materializeNextMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(blockPendingDeliveryMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(blockPendingDeliveryMock.mock.calls.map(([request]) => request)).toEqual([
+      { token: 'tok', sessionId: 's1', localId, reason },
+      { token: 'tok', sessionId: 's1', localId, reason },
+    ]);
+    confirmProviderInputAccepted(client, localId);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(false);
   });
 
-  it('retains custody after failed block and absence until accepted exact committed proof releases the later row', async () => {
-    const deliveryState = { mode: 'provider' as const, unresolved: true };
-    const client = await createClient({
-      latestTurnStatus: 'completed',
-      pendingCount: 1,
-      pendingVersion: 1,
-      metadata: { deliveredUserMessageSeqV1: 0 },
-    });
-    blockPendingDeliveryMock.mockRejectedValue(createPendingDeliveryHttpError(404, 'not-found'));
+  it('retries a rejected-before-effect outcome after not-found while later input proceeds', async () => {
+    vi.stubEnv('HAPPIER_PENDING_CUSTODY_OUTCOME_TIMEOUT_MS', '1000');
+    const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 2, pendingVersion: 1 });
+    await waitForCurrentPendingInputContract(client);
+    const observe = client.bindProviderInputOutcomeProducer({ providerId: 'codex', mode: 'unifiedTerminal', matchesCurrentSession: () => true });
+    vi.useFakeTimers();
     materializeNextMock
-      .mockResolvedValueOnce({
-        didMaterialize: true,
-        localId: 'stale-block-provider-m1',
-        didWrite: true,
-        pendingQueueState: { known: true, pendingCount: 1, pendingVersion: 2 },
-        message: {
-          id: 'm-stale-block-provider-1',
-          seq: 81,
-          localId: 'stale-block-provider-m1',
-          messageRole: 'user',
-          deliveryState,
-          content: {
-            t: 'plain',
-            v: {
-              role: 'user',
-              content: { type: 'text', text: 'provider prompt whose block is stale' },
-              localId: 'stale-block-provider-m1',
-              meta: { source: 'ui', sentFrom: 'web' },
-            },
-          },
-          createdAt: 1000,
-          updatedAt: 1000,
-        },
-      })
-      .mockResolvedValueOnce({
-        didMaterialize: true,
-        localId: 'stale-block-provider-m2',
-        didWrite: true,
-        pendingQueueState: { known: true, pendingCount: 0, pendingVersion: 4 },
-        message: {
-          id: 'm-stale-block-provider-2',
-          seq: 82,
-          localId: 'stale-block-provider-m2',
-          messageRole: 'user',
-          content: {
-            t: 'plain',
-            v: {
-              role: 'user',
-              content: { type: 'text', text: 'next prompt after stale block claim' },
-              localId: 'stale-block-provider-m2',
-              meta: { source: 'ui', sentFrom: 'web' },
-            },
-          },
-          createdAt: 1001,
-          updatedAt: 1001,
-        },
-      });
-
-    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toMatchObject({
-      type: 'materialized',
-      localId: 'stale-block-provider-m1',
-      deliveryState,
-    });
-
-    await expect(client.blockPendingMessageDelivery({
-      localIds: ['stale-block-provider-m1'],
-      reason: 'runtime_disposed_before_delivery',
-    })).resolves.toBe(false);
-    expect(client.shouldAttemptPendingMaterialization()).toBe(false);
-
-    listDeliveryStatusesMock.mockResolvedValueOnce([]);
-    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
-      .resolves.toEqual({ type: 'no_pending' });
-    expect(materializeNextMock).toHaveBeenCalledTimes(1);
-    expect((client as any).canonicalPendingDeliveryByLocalId.has('stale-block-provider-m1')).toBe(true);
-    expect(hasProviderInputAcceptance(client, 'stale-block-provider-m1')).toBe(false);
-    resolveAcceptedPendingDeliveryMock.mockResolvedValueOnce({ didResolve: false });
-    confirmProviderInputAccepted(client, 'stale-block-provider-m1');
-    await waitUntil(() => resolveAcceptedPendingDeliveryMock.mock.calls.length === 1);
-    expect((client as any).canonicalPendingDeliveryByLocalId.has('stale-block-provider-m1')).toBe(true);
-    triggerCommittedUserMessage({ seq: 81, localId: 'stale-block-provider-m1' });
-    expect(client.getCommittedUserMessageSeq('stale-block-provider-m1')).toBe(81);
-    const secondResult = await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
-    expect(materializeNextMock).toHaveBeenCalledTimes(2);
-    expect(secondResult).toMatchObject({
-      type: 'materialized',
-      localId: 'stale-block-provider-m2',
-    });
-    expect(blockPendingDeliveryMock).toHaveBeenCalledTimes(1);
-    expect(hasProviderInputAcceptance(client, 'stale-block-provider-m1')).toBe(true);
+      .mockResolvedValueOnce(createProviderDeliveryMaterializeResult('rejected-block-not-found', 2))
+      .mockResolvedValueOnce(createProviderDeliveryMaterializeResult('later-after-rejection', 3));
+    blockPendingDeliveryMock.mockRejectedValueOnce(createPendingDeliveryHttpError(404, 'not-found')).mockResolvedValueOnce({});
+    await client.materializeNextPendingMessageSafely();
+    observe({ kind: 'rejected_before_effect', localId: 'rejected-block-not-found', reason: 'provider_rejected_before_acceptance' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.shouldAttemptPendingMaterialization()).toBe(true);
+    await expect(client.materializeNextPendingMessageSafely()).resolves.toMatchObject({ type: 'materialized', localId: 'later-after-rejection' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    const originalWrites = blockPendingDeliveryMock.mock.calls.map(([request]) => request).filter((request) => request.localId === 'rejected-block-not-found');
+    expect(originalWrites).toEqual([
+      { token: 'tok', sessionId: 's1', localId: 'rejected-block-not-found', reason: 'provider_rejected_before_acceptance' },
+      { token: 'tok', sessionId: 's1', localId: 'rejected-block-not-found', reason: 'provider_rejected_before_acceptance' },
+    ]);
   });
 
   it('does not use turn-end catch-up as a hidden transcript queue for canonical pending deliveries', async () => {

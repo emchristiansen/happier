@@ -301,6 +301,42 @@ describe('pendingQueueV2Transport', () => {
         expect(mockPost).not.toHaveBeenCalled();
     });
 
+    it.each([
+        materializeNextPendingQueueV2MessageViaHttp,
+        materializeNextPendingQueueV2Message,
+    ])('sends held claim identities over HTTP materialization', async (materialize) => {
+        mockPost.mockResolvedValueOnce({ data: { ok: true, didMaterialize: false } });
+        await materialize({
+            token: 'token',
+            sessionId: 'session-1',
+            heldLocalIds: ['accepted-local', 'uncertain-local'],
+        });
+        expect(mockPost.mock.calls[0]?.[1]).toEqual({
+            heldLocalIds: ['accepted-local', 'uncertain-local'],
+        });
+    });
+
+    it('sends held claim identities over socket materialization', async () => {
+        const socket = {
+            connected: true,
+            timeout: () => socket,
+            emitWithAck: vi.fn(async () => ({ ok: true, didMaterialize: false })),
+        };
+        // Socket.IO is the external boundary; the fixture implements the ACK surface used here.
+        const transport = socket as unknown as NonNullable<Parameters<typeof materializeNextPendingQueueV2Message>[0]['socket']>;
+        await materializeNextPendingQueueV2Message({
+            token: 'token',
+            sessionId: 'session-1',
+            socket: transport,
+            heldLocalIds: ['accepted-local', 'uncertain-local'],
+        });
+        expect(socket.emitWithAck).toHaveBeenCalledWith('pending-materialize-next', {
+            sid: 'session-1',
+            heldLocalIds: ['accepted-local', 'uncertain-local'],
+        });
+        expect(mockPost).not.toHaveBeenCalled();
+    });
+
     it('sends runtime-idle delivery timing in HTTP materialization requests', async () => {
         mockPost.mockResolvedValueOnce({
             data: {
