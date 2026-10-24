@@ -28,6 +28,7 @@ import {
     readPendingLocalId,
     SessionMessageDeliveryResolutionV1Schema,
     type PendingRequestedActionV1,
+    type PendingDeliveryStatusV1,
     type PendingDeliveryBlockedReason,
     type SessionStoredContentKind,
 } from "@happier-dev/protocol";
@@ -192,6 +193,32 @@ export async function readSessionPendingState(params: {
             pendingBlockedCount: session.pendingBlockedCount ?? 0,
             pendingVersion: session.pendingVersion ?? 0,
         };
+    } catch {
+        return { ok: false, error: "internal" };
+    }
+}
+
+/** Owner-only exact custody evidence, including tombstones hidden from pending history. */
+export async function getPendingDeliveryStatus(params: Readonly<{
+    actorUserId: string;
+    sessionId: string;
+    localId: string;
+}>): Promise<
+    | { ok: true; localId: string; deliveryStatus: PendingDeliveryStatusV1 }
+    | { ok: false; error: "invalid-params" | "session-not-found" | "forbidden" | "not-found" | "internal" }
+> {
+    const localId = readPendingLocalId(params.localId);
+    if (!params.actorUserId || !params.sessionId || localId === null) return { ok: false, error: "invalid-params" };
+    const access = await resolveSessionPendingOwnerAccess(params.actorUserId, params.sessionId);
+    if (!access.ok) return { ok: false, error: access.error };
+    try {
+        const row = await db.sessionPendingMessage.findUnique({
+            where: { sessionId_localId: { sessionId: params.sessionId, localId } },
+            select: { status: true, deliveryState: true, deliveryBlockedReason: true, discardedReason: true },
+        });
+        return row
+            ? { ok: true, localId, deliveryStatus: normalizePendingDeliveryStatusV1(row) }
+            : { ok: false, error: "not-found" };
     } catch {
         return { ok: false, error: "internal" };
     }
