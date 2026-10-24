@@ -1854,9 +1854,9 @@ export class ApiSessionClient extends EventEmitter {
                         && typeof result.message.seq === 'number';
                     if (result.didResolve !== true && !hasExactCommittedReplay) {
                         logger.warn('[pendingQueue] accepted settlement lacks exact committed proof; retrying', {
-                            sessionId: this.sessionId, localId, retryAfterMs: this.pendingCustodyOutcomeTimeoutMs(),
+                            sessionId: this.sessionId, localId, retryAfterMs: this.pendingOutcomeWriteRetryDelayMs(),
                         });
-                        await delayUnrefAbortable(this.pendingCustodyOutcomeTimeoutMs(), authority.abortSignal);
+                        await delayUnrefAbortable(this.pendingOutcomeWriteRetryDelayMs(), authority.abortSignal);
                         continue;
                     }
                     // This mutation targets one exact localId. A successful server settlement is the
@@ -1883,7 +1883,7 @@ export class ApiSessionClient extends EventEmitter {
                                 retryDirective ? Math.max(250, retryDirective.retryAfterMs) : 1_000,
                                 previousRetryDelayMs * 2,
                             ))
-                            : this.pendingCustodyOutcomeTimeoutMs();
+                            : this.pendingOutcomeWriteRetryDelayMs();
                         // The server refuses settlement as `forbidden` only when this connection no
                         // longer publishes the session (its session binding or publisher fence), so no
                         // retry on it can succeed. A connection that reclaims publisher status re-offers it.
@@ -2163,6 +2163,10 @@ export class ApiSessionClient extends EventEmitter {
         ));
     }
 
+    private pendingOutcomeWriteRetryDelayMs(): number {
+        return Math.min(PENDING_CUSTODY_OUTCOME_TIMEOUT_MS, this.pendingCustodyOutcomeTimeoutMs());
+    }
+
     private needsPendingCustodyOutcomeWrite(localId: string): boolean {
         if (!this.canonicalPendingDeliveryByLocalId.has(localId)
             || this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted') return false;
@@ -2177,7 +2181,9 @@ export class ApiSessionClient extends EventEmitter {
             || !this.needsPendingCustodyOutcomeWrite(localId)
             || this.canonicalPendingDeliveryBlockWritesByLocalId.has(localId)
             || this.pendingCustodyOutcomeTimers.has(localId)) return;
-        const timeoutMs = this.pendingCustodyOutcomeTimeoutMs();
+        const timeoutMs = this.canonicalPendingDeliveryBlocks.has(localId)
+            ? this.pendingOutcomeWriteRetryDelayMs()
+            : this.pendingCustodyOutcomeTimeoutMs();
         const timer = setTimeout(() => {
             this.pendingCustodyOutcomeTimers.delete(localId);
             if (this.closed || this.closeStarted || this.runtimeTerminationStarted
@@ -6560,25 +6566,28 @@ export class ApiSessionClient extends EventEmitter {
         return this.runtimeTerminationStarted;
     }
 
+    private async blockPendingDeliveryBeforeClose(localId: string, canonicalOnly: boolean): Promise<void> {
+        if (this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted') {
+            logger.debug('[pendingQueue] preserving provider-accepted delivery during close for exact reconciliation', {
+                sessionId: this.sessionId,
+                localId,
+            });
+            return;
+        }
+        const block = this.canonicalPendingDeliveryBlocks.get(localId);
+        const reason = block?.reason ?? (this.providerInputUncertainLocalIds.has(localId)
+            ? 'delivery_outcome_uncertain'
+            : 'runtime_disposed_before_delivery');
+        await this.blockPendingQueueDeliveryLocalId(localId, reason, {
+            canonicalOnly,
+            ...(block?.providerEffect ? { providerEffect: block.providerEffect } : {}),
+        });
+    }
+
     private async blockUnresolvedCanonicalPendingDeliveriesBeforeClose(): Promise<void> {
         const localIds = [...this.canonicalPendingDeliveryByLocalId.keys()];
         for (const localId of localIds) {
-            if (this.providerInputUncertainLocalIds.has(localId)) {
-                await this.blockPendingQueueDeliveryLocalId(localId, 'delivery_outcome_uncertain', {
-                    canonicalOnly: true,
-                });
-                continue;
-            }
-            if (this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted') {
-                logger.debug('[pendingQueue] preserving provider-accepted delivery during close for exact reconciliation', {
-                    sessionId: this.sessionId,
-                    localId,
-                });
-                continue;
-            }
-            await this.blockPendingQueueDeliveryLocalId(localId, 'runtime_disposed_before_delivery', {
-                canonicalOnly: true,
-            });
+            await this.blockPendingDeliveryBeforeClose(localId, true);
         }
     }
 
@@ -6610,22 +6619,7 @@ export class ApiSessionClient extends EventEmitter {
         }
 
         for (const localId of localIds) {
-            if (this.providerInputUncertainLocalIds.has(localId)) {
-                await this.blockPendingQueueDeliveryLocalId(localId, 'delivery_outcome_uncertain', {
-                    canonicalOnly: false,
-                });
-                continue;
-            }
-            if (this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted') {
-                logger.debug('[pendingQueue] preserving durable provider-accepted delivery during close for exact reconciliation', {
-                    sessionId: this.sessionId,
-                    localId,
-                });
-                continue;
-            }
-            await this.blockPendingQueueDeliveryLocalId(localId, 'runtime_disposed_before_delivery', {
-                canonicalOnly: false,
-            });
+            await this.blockPendingDeliveryBeforeClose(localId, false);
         }
     }
 

@@ -5051,6 +5051,66 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(false);
   });
 
+  it.each(['provider_unavailable_before_acceptance', 'invalid_prompt_text'] as const)(
+    'preserves the original failed %s block when closing', async (reason) => {
+      const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 });
+      await waitForCurrentPendingInputContract(client);
+      materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult('close-original-block', 2));
+      blockPendingDeliveryMock
+        .mockRejectedValueOnce(new Error('first block failed'))
+        .mockRejectedValueOnce(new Error('canonical close block failed'))
+        .mockResolvedValueOnce({});
+      listProviderDeliveryLocalIdsMock.mockResolvedValueOnce(['close-original-block']);
+      await client.materializeNextPendingMessageSafely();
+      await client.blockPendingMessageDelivery({ localIds: ['close-original-block'], reason, providerEffect: 'none' });
+      await client.close();
+      expect(blockPendingDeliveryMock.mock.calls.map(([request]) => request)).toEqual([
+        { token: 'tok', sessionId: 's1', localId: 'close-original-block', reason },
+        { token: 'tok', sessionId: 's1', localId: 'close-original-block', reason },
+        { token: 'tok', sessionId: 's1', localId: 'close-original-block', reason },
+      ]);
+    },
+  );
+
+  it.each(['pre-effect block', 'watchdog block', 'accepted failure', 'accepted no-op'] as const)(
+    'retries a failed %s within 120 seconds with a longer configured watchdog', async (outcome) => {
+      vi.stubEnv('HAPPIER_PENDING_CUSTODY_OUTCOME_TIMEOUT_MS', '300000');
+      const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 });
+      await waitForCurrentPendingInputContract(client);
+      providerInputOutcomeObserver(client);
+      vi.useFakeTimers();
+      const localId = 'long-watchdog-retry';
+      const delivered = vi.fn();
+      client.onUserMessage(delivered);
+      materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult(localId, 2));
+      await client.materializeNextPendingMessageSafely();
+      const isAccepted = outcome === 'accepted failure' || outcome === 'accepted no-op';
+      if (isAccepted) {
+        if (outcome === 'accepted failure') resolveAcceptedPendingDeliveryMock.mockRejectedValueOnce(new Error('settlement failed'));
+        else resolveAcceptedPendingDeliveryMock.mockResolvedValueOnce({ didResolve: false });
+        confirmProviderInputAccepted(client, localId);
+      } else {
+        blockPendingDeliveryMock.mockRejectedValueOnce(new Error('block failed'));
+        if (outcome === 'pre-effect block') {
+          await client.blockPendingMessageDelivery({ localIds: [localId], reason: 'provider_unavailable_before_acceptance', providerEffect: 'none' });
+        } else {
+          await vi.advanceTimersByTimeAsync(299_999);
+          expect(blockPendingDeliveryMock).not.toHaveBeenCalled();
+          await vi.advanceTimersByTimeAsync(1);
+        }
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      const writes = isAccepted ? resolveAcceptedPendingDeliveryMock : blockPendingDeliveryMock;
+      expect(writes).toHaveBeenCalledTimes(1);
+      expect(client.shouldAttemptPendingMaterialization()).toBe(true);
+      await vi.advanceTimersByTimeAsync(119_999);
+      expect(writes).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(writes).toHaveBeenCalledTimes(2);
+      expect(delivered).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it('retries a rejected-before-effect outcome after not-found while later input proceeds', async () => {
     vi.stubEnv('HAPPIER_PENDING_CUSTODY_OUTCOME_TIMEOUT_MS', '1000');
     const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 2, pendingVersion: 1 });
