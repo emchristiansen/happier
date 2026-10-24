@@ -357,7 +357,7 @@ describe('DeferredApiSessionClient', () => {
       waitForMetadataUpdate: vi.fn(async () => true),
       waitForPendingEligibilityUpdate: vi.fn(async () => true),
       popPendingMessage: vi.fn(async () => true),
-      peekPendingMessageQueueV2Count: vi.fn(async () => 3),
+      peekActionablePendingMessageQueueV2Count: vi.fn(async () => 3),
       discardPendingMessageQueueV2All: vi.fn(async () => 1),
       discardCommittedMessageLocalIds: vi.fn(async () => 2),
       sendSessionDeath: vi.fn(),
@@ -373,7 +373,7 @@ describe('DeferredApiSessionClient', () => {
     await expect(deferred.waitForMetadataUpdate()).resolves.toBe(true);
     await expect(deferred.waitForPendingEligibilityUpdate()).resolves.toBe(true);
     await expect(deferred.popPendingMessage()).resolves.toBe(true);
-    await expect(deferred.peekPendingMessageQueueV2Count({ reconcileWhenEmpty: 'skip' })).resolves.toBe(3);
+    await expect(deferred.peekActionablePendingMessageQueueV2Count({ reconcileWhenEmpty: 'skip' })).resolves.toBe(3);
     await expect(deferred.fetchCommittedClaudeJsonlMessageBaseline({ take: 1 })).resolves.toEqual(
       { keys: new Set(['claude-jsonl:main:user:u1']), complete: true, oldestCoveredAtMs: null },
     );
@@ -394,7 +394,7 @@ describe('DeferredApiSessionClient', () => {
 
     expect(real.waitForMetadataUpdate).toHaveBeenCalledTimes(1);
     expect(real.waitForPendingEligibilityUpdate).toHaveBeenCalledTimes(1);
-    expect(real.peekPendingMessageQueueV2Count).toHaveBeenCalledWith({ reconcileWhenEmpty: 'skip' });
+    expect(real.peekActionablePendingMessageQueueV2Count).toHaveBeenCalledWith({ reconcileWhenEmpty: 'skip' });
     expect(real.fetchCommittedClaudeJsonlMessageBaseline).toHaveBeenCalledWith({ take: 1 });
     expect(real.fetchRecentTranscriptTextItemsForAcpImport).toHaveBeenCalledWith({ take: 1 });
     expect(real.recordClaudeJsonlMessageConsumed).toHaveBeenCalledWith({ type: 'user', uuid: 'u1' }, undefined);
@@ -452,7 +452,7 @@ describe('DeferredApiSessionClient', () => {
         reason: 'supervisor_offline' as const,
       })),
       popPendingMessage: vi.fn(async () => true),
-      peekPendingMessageQueueV2Count: vi.fn(async () => 3),
+      peekActionablePendingMessageQueueV2Count: vi.fn(async () => 3),
       discardPendingMessageQueueV2All: vi.fn(async () => 1),
       discardCommittedMessageLocalIds: vi.fn(async () => 2),
       sendSessionDeath: vi.fn(),
@@ -487,7 +487,7 @@ describe('DeferredApiSessionClient', () => {
       updateMetadata: vi.fn(), updateAgentState: vi.fn(), keepAlive: vi.fn(),
       getMetadataSnapshot: vi.fn(() => createMetadataStub()), waitForMetadataUpdate: vi.fn(async () => true),
       wakePendingMaterialization,
-      popPendingMessage: vi.fn(async () => false), peekPendingMessageQueueV2Count: vi.fn(async () => 0),
+      popPendingMessage: vi.fn(async () => false), peekActionablePendingMessageQueueV2Count: vi.fn(async () => 0),
       discardPendingMessageQueueV2All: vi.fn(async () => 0), discardCommittedMessageLocalIds: vi.fn(async () => 0),
       sendSessionDeath: vi.fn(), flush: vi.fn(async () => {}), close: vi.fn(async () => {}),
     } as const;
@@ -514,7 +514,7 @@ describe('DeferredApiSessionClient', () => {
       sendAgentMessageCommitted: vi.fn(async () => {}), sendCodexMessage: vi.fn(), sendUserTextMessage: vi.fn(),
       updateMetadata: vi.fn(), updateAgentState: vi.fn(), keepAlive: vi.fn(), getMetadataSnapshot: vi.fn(() => null),
       waitForMetadataUpdate: vi.fn(async () => true), wakePendingMaterialization,
-      popPendingMessage: vi.fn(async () => false), peekPendingMessageQueueV2Count: vi.fn(async () => 0),
+      popPendingMessage: vi.fn(async () => false), peekActionablePendingMessageQueueV2Count: vi.fn(async () => 0),
       discardPendingMessageQueueV2All: vi.fn(async () => 0), discardCommittedMessageLocalIds: vi.fn(async () => 0),
       sendSessionDeath: vi.fn(), flush: vi.fn(async () => {}), close: vi.fn(async () => {}),
     });
@@ -541,7 +541,7 @@ describe('DeferredApiSessionClient', () => {
       getMetadataSnapshot: vi.fn(() => createMetadataStub()),
       waitForMetadataUpdate: vi.fn(async () => true),
       popPendingMessage: vi.fn(async () => false),
-      peekPendingMessageQueueV2Count: vi.fn(async () => 1),
+      peekActionablePendingMessageQueueV2Count: vi.fn(async () => 1),
       discardPendingMessageQueueV2All: vi.fn(async () => 0),
       discardCommittedMessageLocalIds: vi.fn(async () => 0),
       sendSessionDeath: vi.fn(),
@@ -554,7 +554,7 @@ describe('DeferredApiSessionClient', () => {
     await expect(deferred.materializeNextPendingMessageSafely()).resolves.toEqual({
       type: 'retryable_transport',
     });
-    expect(real.peekPendingMessageQueueV2Count).not.toHaveBeenCalled();
+    expect(real.peekActionablePendingMessageQueueV2Count).not.toHaveBeenCalled();
     expect(real.popPendingMessage).not.toHaveBeenCalled();
   });
 
@@ -584,7 +584,7 @@ describe('DeferredApiSessionClient', () => {
       getMetadataSnapshot: vi.fn(() => createMetadataStub()),
       waitForMetadataUpdate: vi.fn(async () => true),
       popPendingMessage: vi.fn(async () => true),
-      peekPendingMessageQueueV2Count: vi.fn(async () => 0),
+      peekActionablePendingMessageQueueV2Count: vi.fn(async () => 0),
       discardPendingMessageQueueV2All: vi.fn(async () => 0),
       discardCommittedMessageLocalIds: vi.fn(async () => 0),
       sendSessionDeath: vi.fn(),
@@ -626,7 +626,7 @@ describe('DeferredApiSessionClient', () => {
       getMetadataSnapshot: vi.fn(() => createMetadataStub()),
       waitForMetadataUpdate: vi.fn(async () => true),
       popPendingMessage: vi.fn(async () => true),
-      peekPendingMessageQueueV2Count: vi.fn(async () => 0),
+      peekActionablePendingMessageQueueV2Count: vi.fn(async () => 0),
       discardPendingMessageQueueV2All: vi.fn(async () => 0),
       discardCommittedMessageLocalIds: vi.fn(async () => 0),
       sendSessionDeath: vi.fn(),
@@ -668,7 +668,7 @@ describe('DeferredApiSessionClient', () => {
       getMetadataSnapshot: vi.fn(() => createMetadataStub()),
       waitForMetadataUpdate: vi.fn(async () => true),
       popPendingMessage: vi.fn(async () => true),
-      peekPendingMessageQueueV2Count: vi.fn(async () => 0),
+      peekActionablePendingMessageQueueV2Count: vi.fn(async () => 0),
       discardPendingMessageQueueV2All: vi.fn(async () => 0),
       discardCommittedMessageLocalIds: vi.fn(async () => 0),
       sendSessionDeath: vi.fn(),
@@ -714,7 +714,7 @@ describe('DeferredApiSessionClient', () => {
       getMetadataSnapshot: vi.fn(() => null),
       waitForMetadataUpdate: vi.fn(async () => false),
       popPendingMessage: vi.fn(async () => false),
-      peekPendingMessageQueueV2Count: vi.fn(async () => 0),
+      peekActionablePendingMessageQueueV2Count: vi.fn(async () => 0),
       discardPendingMessageQueueV2All: vi.fn(async () => 0),
       discardCommittedMessageLocalIds: vi.fn(async () => 0),
       sendSessionDeath: vi.fn(),
@@ -737,7 +737,7 @@ describe('DeferredApiSessionClient', () => {
       getMetadataSnapshot: vi.fn(() => null),
       waitForMetadataUpdate: vi.fn(async () => false),
       popPendingMessage: vi.fn(async () => false),
-      peekPendingMessageQueueV2Count: vi.fn(async () => 0),
+      peekActionablePendingMessageQueueV2Count: vi.fn(async () => 0),
       discardPendingMessageQueueV2All: vi.fn(async () => 0),
       discardCommittedMessageLocalIds: vi.fn(async () => 0),
       sendSessionDeath: vi.fn(),
@@ -815,7 +815,7 @@ describe('DeferredApiSessionClient', () => {
       getMetadataSnapshot: vi.fn(() => null),
       waitForMetadataUpdate: vi.fn(async () => false),
       popPendingMessage: vi.fn(async () => false),
-      peekPendingMessageQueueV2Count: vi.fn(async () => 0),
+      peekActionablePendingMessageQueueV2Count: vi.fn(async () => 0),
       discardPendingMessageQueueV2All: vi.fn(async () => 0),
       discardCommittedMessageLocalIds: vi.fn(async () => 0),
       sendSessionDeath: vi.fn(),
@@ -870,7 +870,7 @@ describe('DeferredApiSessionClient', () => {
       getMetadataSnapshot: vi.fn(() => null),
       waitForMetadataUpdate: vi.fn(async () => false),
       popPendingMessage: vi.fn(async () => false),
-      peekPendingMessageQueueV2Count: vi.fn(async () => 0),
+      peekActionablePendingMessageQueueV2Count: vi.fn(async () => 0),
       discardPendingMessageQueueV2All: vi.fn(async () => 0),
       discardCommittedMessageLocalIds: vi.fn(async () => 0),
       sendSessionDeath: vi.fn(),
@@ -920,7 +920,7 @@ describe('DeferredApiSessionClient', () => {
       getMetadataSnapshot: vi.fn(() => null),
       waitForMetadataUpdate: vi.fn(async () => false),
       popPendingMessage: vi.fn(async () => false),
-      peekPendingMessageQueueV2Count: vi.fn(async () => 0),
+      peekActionablePendingMessageQueueV2Count: vi.fn(async () => 0),
       discardPendingMessageQueueV2All: vi.fn(async () => 0),
       discardCommittedMessageLocalIds: vi.fn(async () => 0),
       sendSessionDeath: vi.fn(),
@@ -963,7 +963,7 @@ describe('DeferredApiSessionClient', () => {
       getMetadataSnapshot: vi.fn(() => null),
       waitForMetadataUpdate: vi.fn(async () => false),
       popPendingMessage: vi.fn(async () => false),
-      peekPendingMessageQueueV2Count: vi.fn(async () => 0),
+      peekActionablePendingMessageQueueV2Count: vi.fn(async () => 0),
       discardPendingMessageQueueV2All: vi.fn(async () => 0),
       discardCommittedMessageLocalIds: vi.fn(async () => 0),
       sendSessionDeath: vi.fn(),
@@ -1014,7 +1014,7 @@ describe('DeferredApiSessionClient', () => {
         getMetadataSnapshot: vi.fn(() => createMetadataStub()),
         waitForMetadataUpdate: vi.fn(async () => true),
         popPendingMessage: vi.fn(async () => true),
-        peekPendingMessageQueueV2Count: vi.fn(async () => 0),
+        peekActionablePendingMessageQueueV2Count: vi.fn(async () => 0),
         discardPendingMessageQueueV2All: vi.fn(async () => 0),
         discardCommittedMessageLocalIds: vi.fn(async () => 0),
         sendSessionDeath: vi.fn(),

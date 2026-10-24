@@ -2553,4 +2553,591 @@ describe('createCliActionDeps session controls', () => {
       request: input,
     }));
   });
+
+  describe('session.pendingInput.markHandled', () => {
+    const blockedRow = {
+      localId: 'local-1',
+      status: 'queued',
+      deliveryState: 'blocked',
+      deliveryBlockedReason: 'delivery_outcome_uncertain',
+      deliveryStatus: { status: 'blocked', reason: 'delivery_outcome_uncertain' },
+      position: 0,
+      content: { t: 'plain', v: 'proven elsewhere' },
+    };
+    const followerRow = {
+      localId: 'local-2',
+      status: 'queued',
+      deliveryStatus: { status: 'queued' },
+      position: 1,
+      content: { t: 'plain', v: 'waiting behind the head' },
+    };
+    const expectedPreRead = {
+      localId: 'local-1',
+      status: 'queued',
+      deliveryState: 'blocked',
+      deliveryBlockedReason: 'delivery_outcome_uncertain',
+      position: 0,
+    };
+    const expectation = { deliveryState: 'blocked', blockedReason: 'delivery_outcome_uncertain' };
+
+    function sessionRecord(counts: Readonly<{ pendingCount: number; pendingBlockedCount: number; pendingVersion: number }>) {
+      return {
+        id: 'sess_1',
+        seq: 1,
+        createdAt: 1,
+        updatedAt: 2,
+        active: true,
+        activeAt: 2,
+        metadata: 'metadata',
+        metadataVersion: 1,
+        agentState: null,
+        agentStateVersion: 0,
+        dataEncryptionKey: null,
+        ...counts,
+      };
+    }
+
+    function routeReads(params: Readonly<{
+      pendingLists: ReadonlyArray<unknown>;
+      session?: unknown;
+      sessionError?: unknown;
+    }>) {
+      const pendingLists = [...params.pendingLists];
+      mocks.axiosGet.mockImplementation(async (...args: unknown[]) => {
+        const url = String(args[0]);
+        if (url.endsWith('/v2/sessions/sess_1/pending')) {
+          const next = pendingLists.shift();
+          if (next instanceof Error || (next && typeof next === 'object' && 'isAxiosError' in next)) throw next;
+          return { status: 200, data: next };
+        }
+        if (url.endsWith('/v2/sessions/sess_1')) {
+          if (params.sessionError) throw params.sessionError;
+          return { status: 200, data: { session: params.session } };
+        }
+        throw new Error(`unexpected GET ${url}`);
+      });
+    }
+
+    function getCalls(): string[] {
+      return (mocks.axiosGet.mock.calls as unknown[][]).map((call) => String(call[0]));
+    }
+
+    function createMarkHandledDeps(options: Readonly<{ withCredentials: boolean }> = { withCredentials: true }) {
+      return createCliActionDeps({
+        token: 'ambient-token',
+        ...(options.withCredentials ? { credentials: createCredentials() } : {}),
+        sessionId: 'sess_1',
+        ctx: {
+          encryptionKey: new Uint8Array(32).fill(1),
+          encryptionVariant: 'legacy',
+        },
+        mode: 'plain',
+        rawSession: { metadata: {} },
+      });
+    }
+
+    it('refuses without any POST when the row is not in the expected delivery state', async () => {
+      routeReads({
+        pendingLists: [
+          { pending: [blockedRow, followerRow] },
+          { pending: [blockedRow, followerRow] },
+          { pending: [blockedRow, followerRow] },
+        ],
+      });
+      const deps = createMarkHandledDeps();
+
+      await expect(deps.sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'delivering',
+      })).resolves.toEqual({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectation: { deliveryState: 'delivering', blockedReason: null },
+        claimsDelivery: false,
+        outcome: 'refused',
+        refusal: { reason: 'state_mismatch', row: expectedPreRead },
+      });
+
+      await expect(deps.sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'blocked',
+        expectedBlockedReason: 'ambiguous_terminal_delivery',
+      })).resolves.toMatchObject({
+        outcome: 'refused',
+        refusal: { reason: 'state_mismatch', row: expectedPreRead },
+      });
+
+      await expect(deps.sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-absent',
+        expectedDeliveryState: 'blocked',
+      })).resolves.toEqual({
+        sessionId: 'sess_1',
+        localId: 'local-absent',
+        expectation: { deliveryState: 'blocked', blockedReason: null },
+        claimsDelivery: false,
+        outcome: 'refused',
+        refusal: { reason: 'row_missing' },
+      });
+
+      expect(mocks.axiosPost).not.toHaveBeenCalled();
+    });
+
+    it('refuses without any POST when the pre-read fails or credentials are absent', async () => {
+      routeReads({
+        pendingLists: [{ isAxiosError: true, code: 'ERR_BAD_REQUEST', response: { status: 404, data: { error: 'session-not-found' } } }],
+      });
+
+      await expect(createMarkHandledDeps().sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'blocked',
+      })).resolves.toMatchObject({
+        outcome: 'refused',
+        refusal: { reason: 'pre_read_failed', httpStatus: 404, errorCode: 'ERR_BAD_REQUEST' },
+      });
+
+      mocks.axiosGet.mockClear();
+      await expect(createMarkHandledDeps({ withCredentials: false }).sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'blocked',
+      })).resolves.toMatchObject({
+        outcome: 'refused',
+        refusal: { reason: 'not_authenticated' },
+      });
+      expect(mocks.axiosGet).not.toHaveBeenCalled();
+      expect(mocks.axiosPost).not.toHaveBeenCalled();
+    });
+
+    it('posts once with the CLI credentials and returns a resolved receipt proven by the readback', async () => {
+      routeReads({
+        pendingLists: [{ pending: [blockedRow, followerRow] }, { pending: [followerRow] }],
+        session: sessionRecord({ pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 9 }),
+      });
+      mocks.axiosPost.mockResolvedValueOnce({
+        data: {
+          ok: true,
+          pendingCount: 1,
+          pendingBlockedCount: 0,
+          pendingVersion: 9,
+          message: {
+            id: 'msg-1',
+            seq: 41,
+            localId: 'local-1',
+            content: { t: 'plain', v: 'proven elsewhere' },
+            deliveryResolution: { v: 1, kind: 'manual_handled' },
+            createdAt: 1,
+            updatedAt: 2,
+          },
+        },
+      });
+
+      await expect(createMarkHandledDeps().sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'blocked',
+        expectedBlockedReason: 'delivery_outcome_uncertain',
+      })).resolves.toEqual({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectation,
+        claimsDelivery: false,
+        outcome: 'resolved',
+        preRead: expectedPreRead,
+        post: {
+          pendingCount: 1,
+          pendingBlockedCount: 0,
+          pendingVersion: 9,
+          transcriptMessage: {
+            id: 'msg-1',
+            seq: 41,
+            localId: 'local-1',
+            deliveryResolution: { v: 1, kind: 'manual_handled' },
+          },
+        },
+        readback: {
+          pendingRows: { status: 'read', row: null, rowGoneFromQueuedList: true },
+          sessionCounts: { status: 'read', pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 9 },
+        },
+      });
+
+      expect(mocks.axiosPost).toHaveBeenCalledTimes(1);
+      expect(mocks.axiosPost).toHaveBeenCalledWith(
+        expect.stringContaining('/v2/sessions/sess_1/pending/local-1/delivery/handled'),
+        {},
+        expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer token' }) }),
+      );
+      for (const call of mocks.axiosGet.mock.calls as unknown[][]) {
+        expect(call[1]).toEqual(expect.objectContaining({
+          headers: expect.objectContaining({ Authorization: 'Bearer token' }),
+        }));
+      }
+      expect(getCalls().filter((url) => url.endsWith('/pending'))).toHaveLength(2);
+    });
+
+    it('reports a not-resolved receipt when the server answers without resolving the row', async () => {
+      routeReads({
+        pendingLists: [{ pending: [blockedRow, followerRow] }, { pending: [blockedRow, followerRow] }],
+        session: sessionRecord({ pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 8 }),
+      });
+      mocks.axiosPost.mockResolvedValueOnce({
+        data: { ok: true, pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 8 },
+      });
+
+      await expect(createMarkHandledDeps().sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'blocked',
+        expectedBlockedReason: 'delivery_outcome_uncertain',
+      })).resolves.toEqual({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectation,
+        claimsDelivery: false,
+        outcome: 'not_resolved',
+        preRead: expectedPreRead,
+        post: { pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 8 },
+        readback: {
+          pendingRows: { status: 'read', row: expectedPreRead, rowGoneFromQueuedList: false },
+          sessionCounts: { status: 'read', pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 8 },
+        },
+      });
+      expect(mocks.axiosPost).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports a transcript conflict as a rejected receipt with the row state read back', async () => {
+      const reblockedRow = {
+        ...blockedRow,
+        deliveryBlockedReason: 'unknown',
+        deliveryStatus: { status: 'blocked', reason: 'unknown' },
+      };
+      routeReads({
+        pendingLists: [{ pending: [blockedRow, followerRow] }, { pending: [reblockedRow, followerRow] }],
+        session: sessionRecord({ pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 9 }),
+      });
+      mocks.axiosPost.mockRejectedValueOnce({
+        isAxiosError: true,
+        code: 'ERR_BAD_REQUEST',
+        response: { status: 409, data: { error: 'transcript-conflict' } },
+      });
+
+      await expect(createMarkHandledDeps().sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'blocked',
+        expectedBlockedReason: 'delivery_outcome_uncertain',
+      })).resolves.toEqual({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectation,
+        claimsDelivery: false,
+        outcome: 'rejected',
+        preRead: expectedPreRead,
+        post: { errorKind: 'transcript_conflict', httpStatus: 409, serverError: 'transcript-conflict' },
+        readback: {
+          pendingRows: {
+            status: 'read',
+            row: { ...expectedPreRead, deliveryBlockedReason: 'unknown' },
+            rowGoneFromQueuedList: false,
+          },
+          sessionCounts: { status: 'read', pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 9 },
+        },
+      });
+      expect(mocks.axiosPost).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports a transport failure as uncertain and never retries the POST', async () => {
+      routeReads({
+        pendingLists: [
+          { pending: [blockedRow, followerRow] },
+          { isAxiosError: true, code: 'ECONNREFUSED' },
+        ],
+        sessionError: { isAxiosError: true, code: 'ECONNREFUSED' },
+      });
+      mocks.axiosPost.mockRejectedValueOnce({ isAxiosError: true, code: 'ECONNABORTED' });
+
+      await expect(createMarkHandledDeps().sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'blocked',
+      })).resolves.toEqual({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectation: { deliveryState: 'blocked', blockedReason: null },
+        claimsDelivery: false,
+        outcome: 'uncertain',
+        preRead: expectedPreRead,
+        post: { errorKind: 'transport_failure', httpStatus: null, errorCode: 'ECONNABORTED' },
+        readback: {
+          pendingRows: { status: 'failed', httpStatus: null, errorCode: 'ECONNREFUSED' },
+          sessionCounts: { status: 'failed', httpStatus: null, errorCode: 'ECONNREFUSED' },
+        },
+      });
+      expect(mocks.axiosPost).toHaveBeenCalledTimes(1);
+    });
+
+    it('treats a server error or unreadable success body as uncertain rather than rejected', async () => {
+      routeReads({
+        pendingLists: [{ pending: [blockedRow] }, { pending: [] }],
+        session: sessionRecord({ pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 10 }),
+      });
+      mocks.axiosPost.mockRejectedValueOnce({
+        isAxiosError: true,
+        code: 'ERR_BAD_RESPONSE',
+        response: { status: 500, data: { error: 'internal' } },
+      });
+
+      await expect(createMarkHandledDeps().sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'blocked',
+      })).resolves.toMatchObject({
+        outcome: 'uncertain',
+        post: { errorKind: 'non_final_status', httpStatus: 500, errorCode: 'ERR_BAD_RESPONSE' },
+        readback: { pendingRows: { status: 'read', row: null, rowGoneFromQueuedList: true } },
+      });
+
+      routeReads({
+        pendingLists: [{ pending: [blockedRow] }, { pending: [] }],
+        session: sessionRecord({ pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 10 }),
+      });
+      mocks.axiosPost.mockResolvedValueOnce({
+        data: {
+          ok: true,
+          pendingCount: 0,
+          pendingBlockedCount: 0,
+          pendingVersion: 10,
+          message: { id: 'msg-1', seq: 41, localId: 'local-other', deliveryResolution: { v: 1, kind: 'manual_handled' } },
+        },
+      });
+
+      await expect(createMarkHandledDeps().sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'blocked',
+      })).resolves.toMatchObject({
+        outcome: 'uncertain',
+        post: { errorKind: 'malformed_response', httpStatus: null, errorCode: 'invalid_response_shape' },
+      });
+      expect(mocks.axiosPost).toHaveBeenCalledTimes(2);
+    });
+
+    // The server's projection of a queued row whose stored requested action it cannot parse
+    // (mapPendingMessageRow): typed blocked `unsupported_action` over unchanged persisted fields.
+    const unsupportedActionFollowerRow = {
+      localId: 'local-2',
+      requestedActionMalformed: true,
+      status: 'queued',
+      deliveryStatus: { status: 'blocked', reason: 'unsupported_action' },
+      position: 1,
+      content: { t: 'plain', v: 'stored with an unreadable action' },
+      discardedReason: null,
+    };
+
+    it('posts once for an eligible row beside a server-projected unsupported-action row and reads it back', async () => {
+      routeReads({
+        pendingLists: [
+          { pending: [blockedRow, unsupportedActionFollowerRow] },
+          { pending: [unsupportedActionFollowerRow] },
+        ],
+        session: sessionRecord({ pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 9 }),
+      });
+      mocks.axiosPost.mockResolvedValueOnce({
+        data: {
+          ok: true,
+          pendingCount: 1,
+          pendingBlockedCount: 0,
+          pendingVersion: 9,
+          message: { id: 'msg-1', seq: 41, localId: 'local-1', deliveryResolution: { v: 1, kind: 'manual_handled' } },
+        },
+      });
+
+      await expect(createMarkHandledDeps().sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'blocked',
+        expectedBlockedReason: 'delivery_outcome_uncertain',
+      })).resolves.toMatchObject({
+        outcome: 'resolved',
+        preRead: expectedPreRead,
+        readback: {
+          pendingRows: { status: 'read', row: null, rowGoneFromQueuedList: true },
+          sessionCounts: { status: 'read', pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 9 },
+        },
+      });
+      expect(mocks.axiosPost).toHaveBeenCalledTimes(1);
+    });
+
+    it('reads a server-projected unsupported-action row back by its persisted fields', async () => {
+      const projectedTargetRow = {
+        ...blockedRow,
+        requestedActionMalformed: true,
+        deliveryStatus: { status: 'blocked', reason: 'unsupported_action' },
+      };
+      routeReads({
+        pendingLists: [
+          { pending: [blockedRow, followerRow] },
+          { pending: [projectedTargetRow, unsupportedActionFollowerRow] },
+        ],
+        session: sessionRecord({ pendingCount: 2, pendingBlockedCount: 2, pendingVersion: 9 }),
+      });
+      mocks.axiosPost.mockResolvedValueOnce({
+        data: { ok: true, pendingCount: 2, pendingBlockedCount: 2, pendingVersion: 9 },
+      });
+
+      await expect(createMarkHandledDeps().sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'blocked',
+        expectedBlockedReason: 'delivery_outcome_uncertain',
+      })).resolves.toMatchObject({
+        outcome: 'not_resolved',
+        post: { pendingCount: 2, pendingBlockedCount: 2, pendingVersion: 9 },
+        readback: {
+          pendingRows: { status: 'read', row: expectedPreRead, rowGoneFromQueuedList: false },
+        },
+      });
+      expect(mocks.axiosPost).toHaveBeenCalledTimes(1);
+    });
+
+    it('guards on the persisted fields of a server-projected row, never on its typed projection', async () => {
+      const projectedTargetRow = { ...unsupportedActionFollowerRow, localId: 'local-1', position: 0 };
+      routeReads({ pendingLists: [{ pending: [projectedTargetRow] }] });
+
+      await expect(createMarkHandledDeps().sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'blocked',
+        expectedBlockedReason: 'unsupported_action',
+      })).resolves.toMatchObject({
+        outcome: 'refused',
+        refusal: {
+          reason: 'state_mismatch',
+          row: { localId: 'local-1', status: 'queued', deliveryState: null, deliveryBlockedReason: null, position: 0 },
+        },
+      });
+      expect(mocks.axiosPost).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['nothing but ok', { ok: true }],
+      ['no counts', { ok: true, pendingVersion: 8 }],
+      ['invalid counts', { ok: true, pendingCount: -1, pendingBlockedCount: 'one', pendingVersion: 8 }],
+    ])('reports a success body with no message and %s as uncertain, even when every readback fails', async (_case, data) => {
+      routeReads({
+        pendingLists: [
+          { pending: [blockedRow, followerRow] },
+          { isAxiosError: true, code: 'ECONNREFUSED' },
+        ],
+        sessionError: { isAxiosError: true, code: 'ECONNREFUSED' },
+      });
+      mocks.axiosPost.mockResolvedValueOnce({ data });
+
+      await expect(createMarkHandledDeps().sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'blocked',
+      })).resolves.toEqual({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectation: { deliveryState: 'blocked', blockedReason: null },
+        claimsDelivery: false,
+        outcome: 'uncertain',
+        preRead: expectedPreRead,
+        post: { errorKind: 'malformed_response', httpStatus: null, errorCode: 'invalid_response_shape' },
+        readback: {
+          pendingRows: { status: 'failed', httpStatus: null, errorCode: 'ECONNREFUSED' },
+          sessionCounts: { status: 'failed', httpStatus: null, errorCode: 'ECONNREFUSED' },
+        },
+      });
+      expect(mocks.axiosPost).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports a success body with no message and incomplete counts as uncertain when the readback succeeds', async () => {
+      routeReads({
+        pendingLists: [{ pending: [blockedRow, followerRow] }, { pending: [blockedRow, followerRow] }],
+        session: sessionRecord({ pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 8 }),
+      });
+      mocks.axiosPost.mockResolvedValueOnce({ data: { ok: true, pendingCount: 2, pendingVersion: 8 } });
+
+      await expect(createMarkHandledDeps().sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'blocked',
+      })).resolves.toMatchObject({
+        outcome: 'uncertain',
+        post: { errorKind: 'malformed_response', httpStatus: null, errorCode: 'invalid_response_shape' },
+        readback: {
+          pendingRows: { status: 'read', row: expectedPreRead, rowGoneFromQueuedList: false },
+          sessionCounts: { status: 'read', pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 8 },
+        },
+      });
+      expect(mocks.axiosPost).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports a validated committed message as resolved even when the success body has no counts', async () => {
+      routeReads({
+        pendingLists: [{ pending: [blockedRow] }, { isAxiosError: true, code: 'ECONNREFUSED' }],
+        sessionError: { isAxiosError: true, code: 'ECONNREFUSED' },
+      });
+      mocks.axiosPost.mockResolvedValueOnce({
+        data: {
+          ok: true,
+          message: { id: 'msg-1', seq: 41, localId: 'local-1', deliveryResolution: { v: 1, kind: 'manual_handled' } },
+        },
+      });
+
+      await expect(createMarkHandledDeps().sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'blocked',
+      })).resolves.toMatchObject({
+        outcome: 'resolved',
+        post: {
+          pendingCount: null,
+          pendingBlockedCount: null,
+          pendingVersion: null,
+          transcriptMessage: { id: 'msg-1', seq: 41, localId: 'local-1', deliveryResolution: { v: 1, kind: 'manual_handled' } },
+        },
+        readback: { pendingRows: { status: 'failed', httpStatus: null, errorCode: 'ECONNREFUSED' } },
+      });
+      expect(mocks.axiosPost).toHaveBeenCalledTimes(1);
+    });
+
+    it('accepts an external handoff row as the expected state', async () => {
+      const handoffRow = {
+        localId: 'local-1',
+        status: 'queued',
+        deliveryState: 'external_handoff',
+        deliveryStatus: { status: 'external_handoff' },
+        position: 0,
+      };
+      routeReads({
+        pendingLists: [{ pending: [handoffRow] }, { pending: [] }],
+        session: sessionRecord({ pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 4 }),
+      });
+      mocks.axiosPost.mockResolvedValueOnce({
+        data: {
+          ok: true,
+          pendingCount: 0,
+          pendingBlockedCount: 0,
+          pendingVersion: 4,
+          message: { id: 'msg-2', seq: 7, localId: 'local-1', deliveryResolution: { v: 1, kind: 'manual_handled' } },
+        },
+      });
+
+      await expect(createMarkHandledDeps().sessionPendingInputMarkHandled?.({
+        sessionId: 'sess_1',
+        localId: 'local-1',
+        expectedDeliveryState: 'external_handoff',
+      })).resolves.toMatchObject({
+        outcome: 'resolved',
+        preRead: { localId: 'local-1', status: 'queued', deliveryState: 'external_handoff', deliveryBlockedReason: null, position: 0 },
+        readback: { pendingRows: { status: 'read', row: null, rowGoneFromQueuedList: true } },
+      });
+    });
+  });
 });

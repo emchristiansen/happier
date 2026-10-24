@@ -1756,6 +1756,22 @@ export {
 } from './sessionControl/sessionPendingInputInterruptAndRunV1.js';
 
 export {
+  SessionPendingInputMarkHandledExpectedDeliveryStateV1Schema,
+  SessionPendingInputMarkHandledRejectionKindV1Schema,
+  SessionPendingInputMarkHandledRequestV1Schema,
+  SessionPendingInputMarkHandledResultV1Schema,
+  SessionPendingInputMarkHandledUncertaintyKindV1Schema,
+  SessionPendingInputRowSnapshotV1Schema,
+  type SessionPendingInputMarkHandledExpectedDeliveryStateV1,
+  type SessionPendingInputMarkHandledReadbackV1,
+  type SessionPendingInputMarkHandledRejectionKindV1,
+  type SessionPendingInputMarkHandledRequestV1,
+  type SessionPendingInputMarkHandledResultV1,
+  type SessionPendingInputMarkHandledUncertaintyKindV1,
+  type SessionPendingInputRowSnapshotV1,
+} from './sessionControl/sessionPendingInputMarkHandledV1.js';
+
+export {
   DefaultSessionFoldersV1,
   MoveSessionFolderAssignmentsRequestSchema,
   MoveSessionFolderAssignmentsResponseSchema,
