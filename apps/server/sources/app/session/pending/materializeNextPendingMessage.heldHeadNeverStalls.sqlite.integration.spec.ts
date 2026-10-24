@@ -7,7 +7,7 @@ import { createSessionPublisherPresence } from "@/app/presence/sessionPublisherP
 import { db } from "@/storage/db";
 import { createLightSqliteHarness, type LightSqliteHarness } from "@/testkit/lightSqliteHarness";
 import { derivePendingSendAsNewLocalId } from "./reofferPendingRowAsNewInTx";
-import { blockPendingDelivery, enqueuePendingMessage, materializeNextPendingMessageForCurrentPublisher, resolveAcceptedPendingDelivery } from "./pendingMessageService";
+import { blockPendingDelivery, discardPendingMessage, enqueuePendingMessage, materializeNextPendingMessageForCurrentPublisher, resolveAcceptedPendingDelivery } from "./pendingMessageService";
 
 const immediateReasons = new Set<string>([
     "delivery_outcome_uncertain", "ambiguous_terminal_delivery", "unknown",
@@ -142,13 +142,18 @@ describe("materialization never holds later input behind a held head (SQLite)", 
 
     it.each([
         ["materialize", "pending"], ["turnover", "pending"],
+        ["materialize", "discarded"], ["turnover", "discarded"],
         ["materialize", "transcript"], ["turnover", "transcript"],
     ] as const)("%s recovers around an occupied replacement identity in %s without holding later input", async (recovery, occupiedIn) => {
         const f = await fixture();
         await f.enqueue("original");
         const occupiedLocalId = derivePendingSendAsNewLocalId(f.session.id, "original");
-        if (occupiedIn === "pending") {
+        if (occupiedIn !== "transcript") {
             await f.enqueue(occupiedLocalId);
+            if (occupiedIn === "discarded") {
+                await expect(discardPendingMessage({ ...f.common, localId: occupiedLocalId }))
+                    .resolves.toMatchObject({ ok: true });
+            }
         } else {
             await db.session.update({ where: { id: f.session.id }, data: { seq: 1 } });
             await db.sessionMessage.create({ data: {
@@ -188,6 +193,10 @@ describe("materialization never holds later input behind a held head (SQLite)", 
         });
         expect(replacement.localId).not.toBe(occupiedLocalId);
         expect(replacement).toMatchObject({ requestedAction: { v: 1, kind: "enqueue" }, content: { t: "encrypted", c: "cipher-original" } });
+        if (occupiedIn === "discarded") {
+            await expect(db.sessionPendingMessage.findUniqueOrThrow({ where: { sessionId_localId: { sessionId: f.session.id, localId: occupiedLocalId } } }))
+                .resolves.toMatchObject({ status: "discarded", content: { t: "encrypted", c: `cipher-${occupiedLocalId}` } });
+        }
         if (occupiedIn === "transcript") {
             await expect(db.sessionMessage.findFirstOrThrow({ where: { sessionId: f.session.id, localId: occupiedLocalId } }))
                 .resolves.toMatchObject({ content: { t: "encrypted", c: "existing-transcript" } });
