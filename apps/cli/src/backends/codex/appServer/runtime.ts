@@ -4705,18 +4705,30 @@ export function createCodexAppServerRuntime(params: Readonly<{
                 }
                 options?.onProviderPromptAccepted?.();
             };
+            let steerRpcAttempted = false;
+            let previousSteerRpcError: unknown;
             const requestSteer = async (
                 input: CodexAppServerTurnInputItem[],
                 turnIdKey: 'expectedTurnId' | 'turnId',
             ): Promise<void> => {
                 if (pendingTurn?.promise !== activeTurn.promise || !canSteerPrompt()) {
+                    if (steerRpcAttempted) {
+                        // The guard rules out only the next request, not effects of an earlier one.
+                        throw new Error('Codex app-server active turn is not steerable', { cause: previousSteerRpcError });
+                    }
                     throw new CodexAppServerSteerUnavailableError();
                 }
-                await client.request('turn/steer', {
-                    ...payload,
-                    input,
-                    [turnIdKey]: expectedTurnId,
-                });
+                steerRpcAttempted = true;
+                try {
+                    await client.request('turn/steer', {
+                        ...payload,
+                        input,
+                        [turnIdKey]: expectedTurnId,
+                    });
+                } catch (error) {
+                    previousSteerRpcError = error;
+                    throw error;
+                }
             };
             const requestSteerWithStaleTurnRecovery = async (
                 input: CodexAppServerTurnInputItem[],

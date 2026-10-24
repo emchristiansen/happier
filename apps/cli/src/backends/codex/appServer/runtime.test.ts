@@ -35,9 +35,10 @@ import {
 import { setActiveAccountSettingsSnapshot } from '@/settings/accountSettings/activeAccountSettingsSnapshot';
 import { HAPPIER_SPAWN_EXPLICIT_ENV_KEYS_JSON_ENV_VAR } from '@/daemon/spawn/spawnExplicitEnvKeysMarker';
 import { logger } from '@/ui/logger';
+import { resolveProviderPromptFailureDeliveryReason } from '@/agent/runtime/providerPromptSubmission';
 
 import { createCodexAppServerRuntime, writeUsageLimitRecoveryIntentToMetadata } from './runtime';
-import { CodexAppServerSteerUnavailableError } from './appServerCompatibility';
+import { CodexAppServerSteerUnavailableError, isCodexAppServerSteerRejectedBeforeEffectError } from './appServerCompatibility';
 import { createCodexAppServerProcessEnv, createCodexAppServerTestEnvScope } from './testkit/fakeCodexAppServer';
 
 // These partial session fixtures model create/load; existing-ID admission uses real API/RPC tests.
@@ -1547,6 +1548,18 @@ async function writeFakeCodexAppServerScript(params: Readonly<{
         '        const expectedTurnId = typeof msg.params?.expectedTurnId === "string" ? msg.params.expectedTurnId : null;',
         '        const turnId = typeof msg.params?.turnId === "string" ? msg.params.turnId : null;',
         '        const selected = expectedTurnId ?? turnId;',
+        '        if (steerText.startsWith("ambiguous-fallback-owner-change-")) {',
+        '            if (steerText === "ambiguous-fallback-owner-change-legacy-structured" && expectedTurnId) {',
+        '                process.stdout.write(JSON.stringify({ id: msg.id, error: { code: -32600, message: "unknown expectedTurnId" } }) + "\\n");',
+        '                continue;',
+        '            }',
+        '            process.stdout.write(JSON.stringify({ method: "turn/completed", params: { threadId: msg.params?.threadId ?? null, turn: { id: selected } } }) + "\\n");',
+        '            setTimeout(() => {',
+        '                process.stderr.write(steerText === "ambiguous-fallback-owner-change-legacy" ? "unknown expectedTurnId after request submission\\n" : "invalid params after request submission\\n");',
+        '                process.exit(1);',
+        '            }, 20);',
+        '            continue;',
+        '        }',
         `        if (${JSON.stringify(params.rejectStructuredSteerInput === true)} && Array.isArray(msg.params?.input) && msg.params.input.length > 1) {`,
         '            if (steerText === "structured-fallback-owner-change") {',
         '                process.stdout.write(JSON.stringify({ method: "turn/completed", params: { threadId: msg.params?.threadId ?? null, turn: { id: selected } } }) + "\\n");',
@@ -4373,7 +4386,7 @@ describe('createCodexAppServerRuntime', () => {
             label: 'active turn to become steerable before structured fallback race',
         });
 
-        await expect(runtime.steerPrompt('structured-fallback-owner-change', {
+        const steerError = await runtime.steerPrompt('structured-fallback-owner-change', {
             metadata: {
                 happierStructuredInputV1: {
                     vendorPluginMentions: [
@@ -4381,11 +4394,58 @@ describe('createCodexAppServerRuntime', () => {
                     ],
                 },
             },
-        })).rejects.toBeInstanceOf(CodexAppServerSteerUnavailableError);
+        }).then(() => null, (error: unknown) => error);
+        expect(isCodexAppServerSteerRejectedBeforeEffectError(steerError)).toBe(false);
+        const priorError = steerError instanceof Error && steerError.cause instanceof Error ? steerError.cause : steerError;
+        expect(priorError).toMatchObject({ code: -32602, method: 'turn/steer' });
         await sendPromptPromise;
 
         const requestLog = await readRequestLog(requestLogPath);
         expect(requestLog.filter((entry) => entry.method === 'turn/steer')).toHaveLength(1);
+    });
+
+    it.each([
+        ['structured', true, 1, 'invalid params after request submission'],
+        ['legacy', false, 1, 'unknown expectedTurnId after request submission'],
+        ['legacy-structured', true, 2, 'invalid params after request submission'],
+    ] as const)('preserves ambiguous steer failures when the %s fallback loses turn ownership', async (route, structured, expectedRequests, diagnostic) => {
+        const { root, requestLogPath } = await createRuntimeFixture(
+            'happier-codex-app-server-runtime-steer-ambiguous-fallback-',
+        );
+        const runtime = createCodexAppServerRuntime({
+            directory: root,
+            onThinkingChange: vi.fn(),
+            session: { updateMetadata: vi.fn() } as any,
+        });
+        await runtime.startOrLoad({});
+        // The fake process exits after the terminal event and before acknowledging the steer.
+        const sendPromptOutcome = Promise.allSettled([runtime.sendPrompt('overlap-start')]);
+        await waitForCondition(() => runtime.canSteerPrompt(), {
+            timeoutMs: 1_000,
+            intervalMs: 10,
+            label: 'active turn before an ambiguous steer and terminal ownership loss',
+        });
+        const onProviderPromptAccepted = vi.fn();
+        const steerError = await runtime.steerPrompt(`ambiguous-fallback-owner-change-${route}`, {
+            onProviderPromptAccepted,
+            ...(structured ? {
+                metadata: {
+                    happierStructuredInputV1: {
+                        vendorPluginMentions: [{ displayName: 'Reviewer', vendorPluginRef: 'plugin://reviewer@codex' }],
+                    },
+                },
+            } : {}),
+        }).then(() => null, (error: unknown) => error);
+        await sendPromptOutcome;
+
+        expect(steerError).toBeInstanceOf(Error);
+        expect(isCodexAppServerSteerRejectedBeforeEffectError(steerError)).toBe(false);
+        expect(resolveProviderPromptFailureDeliveryReason(steerError, true)).toBe('ambiguous_terminal_delivery');
+        const priorError = steerError instanceof Error && steerError.cause instanceof Error ? steerError.cause : steerError;
+        expect(priorError).toEqual(expect.objectContaining({ message: expect.stringContaining(diagnostic) }));
+        expect(onProviderPromptAccepted).not.toHaveBeenCalled();
+        const requestLog = await readRequestLog(requestLogPath);
+        expect(requestLog.filter((entry) => entry.method === 'turn/steer')).toHaveLength(expectedRequests);
     });
 
     it('records one durable turn-start boundary for a steered turn and rejects the steer user row as a point rollback target', async () => {
