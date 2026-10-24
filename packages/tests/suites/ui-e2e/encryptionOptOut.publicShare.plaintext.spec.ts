@@ -135,7 +135,7 @@ test.describe('ui e2e: plaintext mode + public share', () => {
         HAPPIER_FEATURE_ENCRYPTION__STORAGE_POLICY: 'optional',
         HAPPIER_FEATURE_ENCRYPTION__ALLOW_ACCOUNT_OPTOUT: '1',
         // Make presence timeouts fast enough for UI E2E reconnect flows.
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '60000',
+        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
         HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
         HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
       },
