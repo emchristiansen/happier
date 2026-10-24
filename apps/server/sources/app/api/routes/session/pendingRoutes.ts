@@ -25,6 +25,7 @@ import {
     isSessionAgentTransitionDividerLocalId,
     PendingDeliveryBlockedReasonSchema,
     PendingLocalIdSchema,
+    PendingMaterializeHeldLocalIdsSchema,
     PendingRequestedActionV1Schema,
     PendingActivationFailureRequestV1Schema,
     SessionStoredMessageContentSchema,
@@ -521,6 +522,7 @@ export function sessionPendingRoutes(app: Fastify) {
                 pendingBlockedCount: res.pendingBlockedCount,
                 pendingVersion: res.pendingVersion,
                 participantCursors: res.participantCursors,
+                activationTarget: res.activationTarget,
             });
             await refreshSessionParticipantBadgePushes({
                 badgeAttentionChanged: res.badgeAttentionChanged,
@@ -678,6 +680,7 @@ export function sessionPendingRoutes(app: Fastify) {
                 pendingBlockedCount: res.pendingBlockedCount,
                 pendingVersion: res.pendingVersion,
                 participantCursors: res.participantCursors,
+                activationTarget: res.activationTarget,
             });
             await refreshSessionParticipantBadgePushes({
                 badgeAttentionChanged: res.badgeAttentionChanged,
@@ -814,6 +817,7 @@ export function sessionPendingRoutes(app: Fastify) {
                 body: z
                     .object({
                         expectedPendingVersion: z.number().int().nonnegative().optional(),
+                        heldLocalIds: PendingMaterializeHeldLocalIdsSchema.optional(),
                         deliveryState: z.literal("provider").optional(),
                         deliveryTiming: z
                             .union([z.literal("after_foreground_ready"), z.literal("after_runtime_idle")])

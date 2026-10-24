@@ -28,6 +28,27 @@ export const PendingDeliveryBlockedReasonSchema = z.enum(PENDING_DELIVERY_BLOCKE
 
 export type PendingDeliveryBlockedReason = z.infer<typeof PendingDeliveryBlockedReasonSchema>;
 
+/** Automatic recovery never repeats an interrupt or waits for proof of non-delivery. */
+export const PENDING_DELIVERY_REOFFER_TIER = {
+  delivery_outcome_uncertain: 'immediate',
+  ambiguous_terminal_delivery: 'immediate',
+  unknown: 'immediate',
+  runtime_disposed_before_delivery: 'immediate',
+  attempt_expired_before_write: 'immediate',
+  steering_unavailable: 'immediate',
+  provider_rejected_before_acceptance: 'delayed',
+  provider_unavailable_before_acceptance: 'delayed',
+  terminal_host_unreachable: 'delayed',
+  runtime_config_blocked: 'delayed',
+  terminal_composer_draft: 'delayed',
+  unsupported_action: 'terminal',
+  invalid_prompt_text: 'terminal',
+  payload_too_large: 'terminal',
+  manual_user_handled: 'terminal',
+  // This is an operation on a conditional claim, never a persisted block.
+  conditional_steer_unavailable: 'settlement',
+} as const satisfies Record<PendingDeliveryBlockedReason, 'immediate' | 'delayed' | 'terminal' | 'settlement'>;
+
 export function isPendingDeliveryBlockedReason(value: unknown): value is PendingDeliveryBlockedReason {
   return PendingDeliveryBlockedReasonSchema.safeParse(value).success;
 }
