@@ -106,6 +106,7 @@ import {
     isCodexAppServerInvalidParamsError,
     isCodexAppServerMethodNotFoundError,
     isCodexAppServerNoActiveTurnToSteerError,
+    isCodexAppServerSteerRpcErrorResponse,
 } from './appServerCompatibility';
 import { readCodexRateLimitsSnapshot } from './readCodexRateLimitsSnapshot';
 import {
@@ -4705,20 +4706,21 @@ export function createCodexAppServerRuntime(params: Readonly<{
                 }
                 options?.onProviderPromptAccepted?.();
             };
-            let steerRpcAttempted = false;
-            let previousSteerRpcError: unknown;
+            let steerRpcMayHaveEffect = false;
+            let previousUnconfirmedSteerRpcError: unknown;
             const requestSteer = async (
                 input: CodexAppServerTurnInputItem[],
                 turnIdKey: 'expectedTurnId' | 'turnId',
             ): Promise<void> => {
                 if (pendingTurn?.promise !== activeTurn.promise || !canSteerPrompt()) {
-                    if (steerRpcAttempted) {
+                    if (steerRpcMayHaveEffect) {
                         // The guard rules out only the next request, not effects of an earlier one.
-                        throw new Error('Codex app-server active turn is not steerable', { cause: previousSteerRpcError });
+                        throw new Error('Codex app-server active turn is not steerable', { cause: previousUnconfirmedSteerRpcError });
                     }
                     throw new CodexAppServerSteerUnavailableError();
                 }
-                steerRpcAttempted = true;
+                const earlierSteerRpcMayHaveEffect = steerRpcMayHaveEffect;
+                steerRpcMayHaveEffect = true;
                 try {
                     await client.request('turn/steer', {
                         ...payload,
@@ -4726,7 +4728,12 @@ export function createCodexAppServerRuntime(params: Readonly<{
                         [turnIdKey]: expectedTurnId,
                     });
                 } catch (error) {
-                    previousSteerRpcError = error;
+                    if (isCodexAppServerSteerRpcErrorResponse(error)) {
+                        // A correlated rejection rules out this attempt, never an earlier one.
+                        steerRpcMayHaveEffect = earlierSteerRpcMayHaveEffect;
+                    } else {
+                        previousUnconfirmedSteerRpcError = error;
+                    }
                     throw error;
                 }
             };

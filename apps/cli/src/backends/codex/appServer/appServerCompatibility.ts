@@ -32,6 +32,13 @@ export function createCodexAppServerRpcError(params: Readonly<{
     return error;
 }
 
+/** The client marks only error replies matched to a pending JSON-RPC request. */
+export function isCodexAppServerSteerRpcErrorResponse(error: unknown): boolean {
+    if (!error || typeof error !== 'object') return false;
+    return (error as { method?: unknown }).method === 'turn/steer'
+        && (error as { [CODEX_APP_SERVER_RPC_ERROR]?: unknown })[CODEX_APP_SERVER_RPC_ERROR] === true;
+}
+
 export function isCodexAppServerNoActiveTurnToSteerError(error: unknown): boolean {
     if (!(error instanceof Error)) return false;
     const method = (error as Partial<CodexAppServerRpcError>).method;

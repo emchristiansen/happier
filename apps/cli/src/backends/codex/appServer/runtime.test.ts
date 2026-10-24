@@ -4386,7 +4386,7 @@ describe('createCodexAppServerRuntime', () => {
             label: 'active turn to become steerable before structured fallback race',
         });
 
-        const steerError = await runtime.steerPrompt('structured-fallback-owner-change', {
+        await expect(runtime.steerPrompt('structured-fallback-owner-change', {
             metadata: {
                 happierStructuredInputV1: {
                     vendorPluginMentions: [
@@ -4394,10 +4394,7 @@ describe('createCodexAppServerRuntime', () => {
                     ],
                 },
             },
-        }).then(() => null, (error: unknown) => error);
-        expect(isCodexAppServerSteerRejectedBeforeEffectError(steerError)).toBe(false);
-        const priorError = steerError instanceof Error && steerError.cause instanceof Error ? steerError.cause : steerError;
-        expect(priorError).toMatchObject({ code: -32602, method: 'turn/steer' });
+        })).rejects.toBeInstanceOf(CodexAppServerSteerUnavailableError);
         await sendPromptPromise;
 
         const requestLog = await readRequestLog(requestLogPath);
