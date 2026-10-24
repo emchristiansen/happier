@@ -1690,11 +1690,11 @@ describe('pendingQueueV2Transport', () => {
         );
     });
 
-    it('reads exact hidden custody evidence only for the requested opaque claim IDs', async () => {
+    it.each(['resent_as_new', 'dismissed_uncertain'])('reads exact %s custody evidence only for the requested opaque claim IDs', async (reason) => {
         const localId = ' exact/claim ';
-        mockGet.mockResolvedValueOnce({ data: { localId, deliveryStatus: { status: 'discarded', reason: 'resent_as_new' } } });
+        mockGet.mockResolvedValueOnce({ data: { localId, deliveryStatus: { status: 'discarded', reason } } });
         await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 'session/1', localIds: [localId, localId] }))
-            .resolves.toEqual([{ localId, status: 'discarded', discardedReason: 'resent_as_new' }]);
+            .resolves.toEqual([{ localId, status: 'discarded', discardedReason: reason }]);
         expect(mockGet).toHaveBeenCalledTimes(1);
         expect(mockGet).toHaveBeenCalledWith(expect.stringContaining('/v2/sessions/session%2F1/pending/%20exact%2Fclaim%20/status'),
             expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer token' }), timeout: 10_000 }));

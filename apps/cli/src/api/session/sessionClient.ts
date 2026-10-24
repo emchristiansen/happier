@@ -560,6 +560,11 @@ const SESSION_CLIENT_RECEIVED_MESSAGE_ID_CACHE_MAX_ENTRIES = 1_000;
 const SESSION_CLIENT_TOOL_CALL_CACHE_MAX_ENTRIES = 1_000;
 const PENDING_REOFFER_DELAY_MS = 60_000;
 const PENDING_CUSTODY_OUTCOME_TIMEOUT_MS = 120_000;
+// Keep equal to apps/server/sources/app/session/pending/pendingMessageService.ts
+// UNCERTAIN_DELIVERY_TOMBSTONE_REASONS: both retain identity for exact late acceptance.
+const UNCERTAIN_PENDING_DELIVERY_TOMBSTONE_REASONS: ReadonlySet<string> = new Set([
+    'dismissed_uncertain', 'resent_as_new',
+]);
 // Recovery only: hints and turn-end remain the fast path. Slow *successful* reads also
 // stretch the cadence so a saturated relay does not need to fail before we shed reads.
 const PENDING_DISCOVERY_BASE_DELAY_MS = 300_000;
@@ -2227,7 +2232,7 @@ export class ApiSessionClient extends EventEmitter {
             for (const localId of blockingLocalIds) {
                 const entry = statusByLocalId.get(localId);
                 const status = entry?.status;
-                if ((status === 'blocked' || (status === 'discarded' && entry?.discardedReason === 'resent_as_new'))
+                if ((status === 'blocked' || (status === 'discarded' && UNCERTAIN_PENDING_DELIVERY_TOMBSTONE_REASONS.has(entry?.discardedReason ?? '')))
                     && this.canonicalPendingDeliveryByLocalId.has(localId)) {
                     // The server already owns this outcome. Retain identity for late acceptance,
                     // but neither hold later rows nor manufacture another uncertainty write.

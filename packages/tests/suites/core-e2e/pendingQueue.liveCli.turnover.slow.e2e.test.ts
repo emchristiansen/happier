@@ -17,7 +17,7 @@ describe('core e2e: live CLI custody across real publisher turnover', () => {
   }, 180_000);
   afterAll(async () => { await server?.stop(); });
 
-  it.each(['ordinary', 'collision', 'absence', 'old-server'])('preserves exact custody across turnover (%s)', async (scenario) => {
+  it.each(['ordinary', 'collision', 'absence', 'old-server', 'dismissed-uncertain'])('preserves exact custody across turnover (%s)', async (scenario) => {
     const root = repoRootDir();
     const testDir = run.testDir(`live-cli-turnover-${scenario}`);
     const hook = resolveTsxImportHookSpecifier();

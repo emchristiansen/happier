@@ -5055,6 +5055,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
   it.each([
     ['blocked', 'late acceptance'], ['blocked', 'close'],
     ['resent_as_new', 'late acceptance'], ['resent_as_new', 'close'],
+    ['dismissed_uncertain', 'late acceptance'], ['dismissed_uncertain', 'close'],
   ] as const)('releases server-%s custody immediately through %s without another outcome write', async (serverOutcome, continuation) => {
     const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 2, pendingVersion: 1 });
     await waitForCurrentPendingInputContract(client);
@@ -5066,7 +5067,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     await client.materializeNextPendingMessageSafely();
     expect(client.shouldAttemptPendingMaterialization()).toBe(false);
     listDeliveryStatusesMock.mockResolvedValue([{ localId: 'server-blocked-original',
-      ...(serverOutcome === 'blocked' ? { status: 'blocked' } : { status: 'discarded', discardedReason: 'resent_as_new' }),
+      ...(serverOutcome === 'blocked' ? { status: 'blocked' } : { status: 'discarded', discardedReason: serverOutcome }),
     }]);
     const wake = vi.fn();
     client.on('metadata-updated', wake);

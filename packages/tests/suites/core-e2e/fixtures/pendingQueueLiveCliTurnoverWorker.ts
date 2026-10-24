@@ -112,6 +112,30 @@ async function main() {
       assert.deepEqual(a.userMessageLocalIds, ['A']);
       assert.equal(state.canonicalPendingDeliveryByLocalId.has('A'), true);
       assert.equal(state.pendingCustodyOutcomeTimers.has('A'), true);
+      if (scenario === 'dismissed-uncertain') {
+        await enqueue('C');
+        const dismissed = await fetchJson(`${server.baseUrl}/v2/sessions/${sessionId}/pending/A/delivery/dismiss`, {
+          method: 'POST', headers: { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
+          body: '{}',
+        });
+        assert.equal(dismissed.status, 200);
+        await client.reconcilePendingQueueState({ force: true });
+        const c = await take();
+        assert.deepEqual(c.userMessageLocalIds, ['C']);
+        const residentBeforeAcceptance = state.canonicalPendingDeliveryByLocalId.has('A');
+        assert.equal(state.pendingCustodyOutcomeTimers.has('A'), false);
+        const countBeforeAcceptance = (await fetchSessionV2(server.baseUrl, auth.token, sessionId)).pendingCount;
+        observe({ kind: 'accepted', localId: 'A' });
+        await waitFor(async () => (await fetchAllMessages(server.baseUrl, auth.token, sessionId))
+          .some((row) => row.localId === 'A'), { timeoutMs: 10_000, context: 'dismissed A exact late acceptance commits on the real server' });
+        assert.equal(residentBeforeAcceptance, true);
+        await waitFor(() => !state.canonicalPendingDeliveryByLocalId.has('A'), { timeoutMs: 20_000 });
+        assert.notEqual(client.getCommittedUserMessageSeq('A'), null);
+        assert.equal((await fetchSessionV2(server.baseUrl, auth.token, sessionId)).pendingCount, countBeforeAcceptance);
+        observe({ kind: 'accepted', localId: 'C' });
+        await waitFor(() => client.getCommittedUserMessageSeq('C') !== null, { timeoutMs: 20_000 });
+        return;
+      }
       if (collision) {
         const reserved = `send-as-new-${createHash('sha256')
           .update(`happier.pending.send-as-new.v1\0${sessionId}\0A`).digest('hex')}`;
