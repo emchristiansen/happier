@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createServer } from "node:net";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockPrismaMetrics = vi.fn();
 const mockQueryRaw = vi.fn();
@@ -24,7 +25,46 @@ vi.mock("@/utils/logging/log", () => ({
     log: mockLog,
 }));
 
+async function listenOnce(port: number): Promise<void> {
+    const server = createServer();
+    await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen({ port, host: "0.0.0.0" }, () => resolve());
+    });
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
+async function reserveFreePort(): Promise<number> {
+    const server = createServer();
+    await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen({ port: 0, host: "0.0.0.0" }, () => resolve());
+    });
+    const address = server.address();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (address === null || typeof address === "string") {
+        throw new Error("Expected a TCP address for the probe server");
+    }
+    return address.port;
+}
+
 describe("metrics server", () => {
+    const originalMetricsEnabled = process.env.METRICS_ENABLED;
+    const originalMetricsPort = process.env.METRICS_PORT;
+
+    afterEach(() => {
+        if (originalMetricsEnabled === undefined) {
+            delete process.env.METRICS_ENABLED;
+        } else {
+            process.env.METRICS_ENABLED = originalMetricsEnabled;
+        }
+        if (originalMetricsPort === undefined) {
+            delete process.env.METRICS_PORT;
+        } else {
+            process.env.METRICS_PORT = originalMetricsPort;
+        }
+    });
+
     beforeEach(() => {
         vi.resetModules();
         mockPrismaMetrics.mockReset();
@@ -101,5 +141,21 @@ describe("metrics server", () => {
         } finally {
             await app.close().catch(() => {});
         }
+    });
+
+    it("releases the metrics port when shutdown is initiated", async () => {
+        const port = await reserveFreePort();
+        process.env.METRICS_ENABLED = "true";
+        process.env.METRICS_PORT = String(port);
+
+        const { startMetricsServer } = await import("./metrics");
+        const { initiateShutdown } = await import("@/utils/process/shutdown");
+
+        await expect(startMetricsServer()).resolves.toBe(true);
+        await expect(listenOnce(port)).rejects.toMatchObject({ code: "EADDRINUSE" });
+
+        await initiateShutdown("test");
+
+        await expect(listenOnce(port)).resolves.toBeUndefined();
     });
 });
