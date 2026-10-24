@@ -26,7 +26,7 @@ const boundary = vi.hoisted(() => {
     vi.stubEnv(key, "https://relay.example.invalid");
   }
   vi.stubEnv("HAPPIER_HOME_DIR", `${process.env.TMPDIR}/pending-discovery-fixture`);
-  return { get: vi.fn(), beforeJournalRead: null as (() => Promise<void>) | null };
+  return { get: vi.fn(), post: vi.fn(), beforeJournalRead: null as (() => Promise<void>) | null };
 });
 const origin = "https://relay.example.invalid";
 const home = join(tmpdir(), "pending-discovery-fixture");
@@ -37,7 +37,17 @@ let userSocket: ApiSessionSocketStub;
 // Snapshot parsing, session custody, reconciliation, queue and input consumer stay real.
 vi.mock("axios", async () => {
   const { createOfflineAxios } = await import("@/testkit/http/offlineAxios");
-  return { default: createOfflineAxios((url) => boundary.get(url)) };
+  return {
+    default: {
+      ...createOfflineAxios((url) => boundary.get(url)),
+      post: (url: string, body: unknown) => {
+        if (new URL(url).origin !== "https://relay.example.invalid") {
+          throw new Error(`Offline HTTP boundary refused origin: ${new URL(url).origin}`);
+        }
+        return boundary.post(url, body);
+      },
+    },
+  };
 });
 // The journal read is a filesystem boundary; all outbox/readiness logic stays real.
 vi.mock("node:fs/promises", async (importOriginal) => {
@@ -275,6 +285,7 @@ describe("authoritative pending discovery through the session client and consume
     detailReads.mockClear();
     claims.mockClear();
     settlements.mockClear();
+    boundary.post.mockReset().mockRejectedValue(new Error("Unconfigured offline HTTP POST"));
     boundary.get.mockReset().mockImplementation(async (url: string) => {
       const path = new URL(url).pathname;
       if (path === `/v2/sessions/${snapshot.id}`) {
@@ -343,6 +354,44 @@ describe("authoritative pending discovery through the session client and consume
     await client.reconcilePendingQueueState({ force: true });
     await vi.advanceTimersByTimeAsync(60_000);
     expect(claims).toHaveBeenCalledTimes(2);
+    controller.abort();
+    await waiting;
+  });
+
+  it("retries through the real consumer 60 seconds after a successful claim becomes delayed-blocked", async () => {
+    snapshot = { ...snapshot, pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 1 };
+    const { client } = await createClient();
+    await client.reconcilePendingQueueState({ force: true });
+    const { consumer, controller } = consume(client);
+    const first = await consumer.waitForNextInput({ abortSignal: controller.signal });
+    expect(first?.message.localId).toBe(originalPrompt.localId);
+    expect(claims).toHaveBeenCalledTimes(1);
+    detailReads.mockClear();
+    boundary.post.mockResolvedValueOnce({
+      status: 200,
+      data: { ok: true, pendingCount: 1, pendingBlockedCount: 1, pendingVersion: 3 },
+    });
+    await expect(client.blockPendingMessageDelivery({
+      localIds: [originalPrompt.localId], reason: "provider_unavailable_before_acceptance", providerEffect: "none",
+    })).resolves.toBe(true);
+    expect(boundary.post).toHaveBeenCalledWith(
+      `${origin}/v2/sessions/${snapshot.id}/pending/${originalPrompt.localId}/delivery/block`,
+      { reason: "provider_unavailable_before_acceptance" },
+    );
+    const replacementPrompt = { ...originalPrompt, localId: "replacement-after-delayed-block" };
+    materialize = async () => ({
+      ...claimed(), localId: replacementPrompt.localId, pendingVersion: 4,
+      message: { ...claimed().message, localId: replacementPrompt.localId, content: { t: "plain", v: replacementPrompt } },
+    });
+    let next: Awaited<ReturnType<typeof consumer.waitForNextInput>> | undefined;
+    const waiting = consumer.waitForNextInput({ abortSignal: controller.signal }).then((batch) => { next = batch; });
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(claims).toHaveBeenCalledTimes(1);
+    expect(detailReads).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(claims).toHaveBeenCalledTimes(2);
+    expect(next?.message).toEqual({ ...replacementPrompt, createdAt: 1_000 });
+    expect(detailReads).not.toHaveBeenCalled();
     controller.abort();
     await waiting;
   });

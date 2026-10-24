@@ -2343,7 +2343,9 @@ export class ApiSessionClient extends EventEmitter {
             this.pendingReofferDue = false;
             return;
         }
-        if (!this.pendingReofferNeeded) {
+        // A later outcome can make every remaining row unclaimable after a successful claim.
+        // Such projections still need a retry opportunity without another discovery read.
+        if (!this.pendingReofferNeeded && countMaterializablePendingRows(this.pendingQueueState) > 0) {
             this.clearPendingReofferTimer();
             this.pendingReofferDue = false;
             return;
