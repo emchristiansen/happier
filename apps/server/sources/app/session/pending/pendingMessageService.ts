@@ -1728,7 +1728,7 @@ export async function sendPendingDeliveryAsNew(params: {
             }
             if (replacement) return { ok: false, error: "identity-conflict" } as const;
 
-            const state = await reofferPendingRowAsNewInTx(tx, sessionId, localId, now);
+            const state = await reofferPendingRowAsNewInTx(tx, sessionId, localId, now, { replacementLocalId });
             return { ok: true, didWrite: true, ...state } as const;
         }));
     } catch {

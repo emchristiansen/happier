@@ -16,6 +16,7 @@ import { createSessionPublisherPresence } from "@/app/presence/sessionPublisherP
 import { db } from "@/storage/db";
 import { createLightSqliteHarness, type LightSqliteHarness } from "@/testkit/lightSqliteHarness";
 import { enqueuePendingMessage, materializeNextPendingMessageForCurrentPublisher, resolveAcceptedPendingDelivery, sendPendingDeliveryAsNew } from "./pendingMessageService";
+import { derivePendingSendAsNewLocalId } from "./reofferPendingRowAsNewInTx";
 
 const immediateReasons = [
     "delivery_outcome_uncertain", "ambiguous_terminal_delivery", "unknown",
@@ -244,6 +245,25 @@ describe("pending delivery reoffer tiers (real SQLite)", () => {
         expect(f.updates.filter((update) => update.body.t === "pending-changed")).toContainEqual(expect.objectContaining({
             body: expect.objectContaining({ pendingActivationAuthorization: expect.objectContaining({ requestId: replacement.localId, status: "waiting" }) }),
         }));
+    });
+
+    it("keeps manual retry identity stable when the deterministic ID exists only in the transcript", async () => {
+        const f = await fixture();
+        await f.enqueue("original");
+        await expect(f.materialize()).resolves.toMatchObject({ ok: true, didMaterialize: true });
+        const replacementLocalId = derivePendingSendAsNewLocalId(f.session.id, "original");
+        await db.session.update({ where: { id: f.session.id }, data: { seq: 1 } });
+        await db.sessionMessage.create({ data: {
+            sessionId: f.session.id, seq: 1, localId: replacementLocalId, messageRole: "user",
+            content: { t: "encrypted", c: "prior-transcript" },
+        } });
+        await expect(sendPendingDeliveryAsNew({ ...f.common, localId: "original" }))
+            .resolves.toMatchObject({ ok: true, didWrite: true });
+        await expect(sendPendingDeliveryAsNew({ ...f.common, localId: "original" }))
+            .resolves.toMatchObject({ ok: true, didWrite: false });
+        await expect(f.row(replacementLocalId)).resolves.toMatchObject({ status: "queued", content: { t: "encrypted", c: "cipher-original" } });
+        await expect(db.sessionMessage.findFirstOrThrow({ where: { sessionId: f.session.id, localId: replacementLocalId } }))
+            .resolves.toMatchObject({ content: { t: "encrypted", c: "prior-transcript" } });
     });
 
     it("keeps manual send-as-new guards and idempotent replacement semantics", async () => {

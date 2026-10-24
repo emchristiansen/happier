@@ -6,7 +6,8 @@ import { PENDING_DELIVERY_BLOCKED_REASONS } from "@happier-dev/protocol";
 import { createSessionPublisherPresence } from "@/app/presence/sessionPublisherPresence";
 import { db } from "@/storage/db";
 import { createLightSqliteHarness, type LightSqliteHarness } from "@/testkit/lightSqliteHarness";
-import { enqueuePendingMessage, materializeNextPendingMessageForCurrentPublisher, resolveAcceptedPendingDelivery } from "./pendingMessageService";
+import { derivePendingSendAsNewLocalId } from "./reofferPendingRowAsNewInTx";
+import { blockPendingDelivery, enqueuePendingMessage, materializeNextPendingMessageForCurrentPublisher, resolveAcceptedPendingDelivery } from "./pendingMessageService";
 
 const immediateReasons = new Set<string>([
     "delivery_outcome_uncertain", "ambiguous_terminal_delivery", "unknown",
@@ -51,7 +52,7 @@ describe("materialization never holds later input behind a held head (SQLite)", 
             };
             return materializeNextPendingMessageForCurrentPublisher(params);
         };
-        return { session, common, trustedPublisherFence, enqueue, materialize };
+        return { session, common, binding, trustedPublisherFence, enqueue, materialize };
     }
 
     it.each(PENDING_DELIVERY_BLOCKED_REASONS)("claims later enqueue input with a persisted %s head", async (reason) => {
@@ -137,6 +138,60 @@ describe("materialization never holds later input behind a held head (SQLite)", 
         await expect(resolveAcceptedPendingDelivery({ ...f.common, trustedPublisherFence: f.trustedPublisherFence, localId: "later" }))
             .resolves.toMatchObject({ ok: true, didResolve: true });
         await expect(f.materialize()).resolves.toMatchObject({ ok: true, didMaterialize: true, message: { localId: replacement.localId } });
+    });
+
+    it.each([
+        ["materialize", "pending"], ["turnover", "pending"],
+        ["materialize", "transcript"], ["turnover", "transcript"],
+    ] as const)("%s recovers around an occupied replacement identity in %s without holding later input", async (recovery, occupiedIn) => {
+        const f = await fixture();
+        await f.enqueue("original");
+        const occupiedLocalId = derivePendingSendAsNewLocalId(f.session.id, "original");
+        if (occupiedIn === "pending") {
+            await f.enqueue(occupiedLocalId);
+        } else {
+            await db.session.update({ where: { id: f.session.id }, data: { seq: 1 } });
+            await db.sessionMessage.create({ data: {
+                sessionId: f.session.id, seq: 1, localId: occupiedLocalId,
+                messageRole: "user", content: { t: "encrypted", c: "existing-transcript" },
+            } });
+        }
+        await f.enqueue("later");
+        await expect(blockPendingDelivery({ ...f.common, localId: "original", reason: "runtime_config_blocked" }))
+            .resolves.toMatchObject({ ok: true });
+        await db.sessionPendingMessage.update({
+            where: { sessionId_localId: { sessionId: f.session.id, localId: "original" } },
+            data: { updatedAt: new Date(Date.now() - 60_001) },
+        });
+        let fence = f.trustedPublisherFence;
+        if (recovery === "turnover") {
+            const registered = await createSessionPublisherPresence().registerPublisher({
+                socket: {}, binding: f.binding, completeActivitySnapshot: { state: "idle", activeCount: 0 },
+            });
+            expect(registered.status).toBe("registered");
+            if (registered.status !== "registered") throw new Error("expected successor registration");
+            fence = { ...f.binding, committedFence: registered.committedFence };
+        }
+        const materialize = () => materializeNextPendingMessageForCurrentPublisher({
+            ...f.common, trustedPublisherFence: fence, foregroundState: "ready", deliveryTiming: "after_foreground_ready",
+        });
+        if (occupiedIn === "pending") {
+            await expect(materialize()).resolves.toMatchObject({ ok: true, didMaterialize: true, message: { localId: occupiedLocalId, content: { t: "encrypted", c: `cipher-${occupiedLocalId}` } } });
+            await expect(resolveAcceptedPendingDelivery({ ...f.common, trustedPublisherFence: fence, localId: occupiedLocalId }))
+                .resolves.toMatchObject({ ok: true, didResolve: true });
+        }
+        await expect(materialize()).resolves.toMatchObject({ ok: true, didMaterialize: true, message: { localId: "later" } });
+        await expect(db.sessionPendingMessage.findUniqueOrThrow({ where: { sessionId_localId: { sessionId: f.session.id, localId: "original" } } }))
+            .resolves.toMatchObject({ status: "discarded", discardedReason: "resent_as_new" });
+        const replacement = await db.sessionPendingMessage.findFirstOrThrow({
+            where: { sessionId: f.session.id, status: "queued", localId: { not: "later" } },
+        });
+        expect(replacement.localId).not.toBe(occupiedLocalId);
+        expect(replacement).toMatchObject({ requestedAction: { v: 1, kind: "enqueue" }, content: { t: "encrypted", c: "cipher-original" } });
+        if (occupiedIn === "transcript") {
+            await expect(db.sessionMessage.findFirstOrThrow({ where: { sessionId: f.session.id, localId: occupiedLocalId } }))
+                .resolves.toMatchObject({ content: { t: "encrypted", c: "existing-transcript" } });
+        }
     });
 
     it("skips claims named by the runner's heldLocalIds", async () => {

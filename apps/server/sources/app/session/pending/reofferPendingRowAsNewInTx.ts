@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { normalizePendingDeliveryBlockedReason, PENDING_DELIVERY_REOFFER_TIER } from "@happier-dev/protocol";
 import { applyPendingSessionStateChange } from "@/app/session/pending/applyPendingSessionStateChange";
@@ -14,14 +14,37 @@ export function derivePendingSendAsNewLocalId(sessionId: string, localId: string
     return `send-as-new-${digest}`;
 }
 
-/** Replaces one live row atomically; all callers share the same enqueue-only recovery. */
-export async function reofferPendingRowAsNewInTx(tx: Tx, sessionId: string, localId: string, now: Date) {
+/**
+ * Replaces one live row atomically. Manual send-as-new pins its guarded deterministic identity;
+ * automatic recovery picks an unoccupied identity rather than letting client-owned IDs hold input.
+ */
+export async function reofferPendingRowAsNewInTx(
+    tx: Tx,
+    sessionId: string,
+    localId: string,
+    now: Date,
+    manualIdentity?: Readonly<{ replacementLocalId: string }>,
+) {
     const existing = await tx.sessionPendingMessage.findUniqueOrThrow({
         where: { sessionId_localId: { sessionId, localId } },
     });
     if (existing.status !== "queued") throw new Error("pending reoffer requires a live row");
-    const replacementLocalId = derivePendingSendAsNewLocalId(sessionId, localId);
+    // Reserving a position locks the Session row before the identity check, as enqueue and
+    // transcript writers do. No concurrent ingress can occupy the checked ID before creation.
     const position = await reserveNextPendingQueuePosition(tx, sessionId);
+    let replacementLocalId = manualIdentity?.replacementLocalId ?? derivePendingSendAsNewLocalId(sessionId, localId);
+    if (!manualIdentity) {
+        while (
+            await tx.sessionPendingMessage.findUnique({
+                where: { sessionId_localId: { sessionId, localId: replacementLocalId } }, select: { id: true },
+            })
+            || await tx.sessionMessage.findUnique({
+                where: { sessionId_localId: { sessionId, localId: replacementLocalId } }, select: { id: true },
+            })
+        ) {
+            replacementLocalId = `send-as-new-${randomUUID()}`;
+        }
+    }
     await tx.sessionPendingMessage.create({
         data: {
             sessionId,
