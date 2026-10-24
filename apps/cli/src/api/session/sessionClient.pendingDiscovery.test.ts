@@ -396,6 +396,39 @@ describe("authoritative pending discovery through the session client and consume
     await waiting;
   });
 
+  it("rearms the minute retry when blocked A remains after successful claim and settlement of B", async () => {
+    snapshot = { ...snapshot, pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 1 };
+    const { client, observe } = await createClient();
+    await client.reconcilePendingQueueState({ force: true });
+    materialize = async () => ({ ...claimed(), pendingCount: 2, pendingBlockedCount: 1 });
+    const { consumer, controller } = consume(client);
+    const first = await consumer.waitForNextInput({ abortSignal: controller.signal });
+    expect(first?.message.localId).toBe(originalPrompt.localId);
+    expect(claims).toHaveBeenCalledTimes(1);
+    detailReads.mockClear();
+    settle = async () => ({ ...committed(), pendingCount: 1, pendingBlockedCount: 1 });
+    observe({ kind: "accepted", localId: originalPrompt.localId });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settlements).toHaveBeenCalledTimes(1);
+    expect(client.hasCanonicalPendingProviderInputDelivery(originalPrompt.localId)).toBe(false);
+    const replacementPrompt = { ...originalPrompt, localId: "replacement-of-blocked-A" };
+    materialize = async () => ({
+      ...claimed(), localId: replacementPrompt.localId, pendingVersion: 4,
+      message: { ...claimed().message, localId: replacementPrompt.localId, content: { t: "plain", v: replacementPrompt } },
+    });
+    let next: Awaited<ReturnType<typeof consumer.waitForNextInput>> | undefined;
+    const waiting = consumer.waitForNextInput({ abortSignal: controller.signal }).then((batch) => { next = batch; });
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(claims).toHaveBeenCalledTimes(1);
+    expect(detailReads).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(claims).toHaveBeenCalledTimes(2);
+    expect(next?.message).toEqual({ ...replacementPrompt, createdAt: 1_000 });
+    expect(detailReads).not.toHaveBeenCalled();
+    controller.abort();
+    await waiting;
+  });
+
   it("arms the minute retry from a blocked-only hint after an empty authoritative discovery", async () => {
     const { client } = await createClient();
     await client.reconcilePendingQueueState({ force: true });
