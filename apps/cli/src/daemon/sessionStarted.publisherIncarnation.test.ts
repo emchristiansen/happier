@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { RUNNER_PUBLISHER_INCARNATION_ID } from '@/api/session/publisherIncarnation';
+import { getRunnerPublisherIncarnationId } from '@/api/session/publisherIncarnation';
 import type { Metadata } from '@/api/types';
 import { reloadConfiguration } from '@/configuration';
 import { clearDaemonStateForTests, writeDaemonState } from '@/persistence';
@@ -80,7 +80,7 @@ describe('runner publisher incarnation reaches the daemon through /session-start
 
             expect(result).toEqual({ status: 'ok' });
             expect(tracked.happySessionId).toBe('session-incarnation');
-            expect(tracked.publisherIncarnationId).toBe(RUNNER_PUBLISHER_INCARNATION_ID);
+            expect(tracked.publisherIncarnationId).toBe(getRunnerPublisherIncarnationId());
         } finally {
             await app.close();
         }
