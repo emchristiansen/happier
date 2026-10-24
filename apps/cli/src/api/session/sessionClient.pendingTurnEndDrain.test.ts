@@ -4091,6 +4091,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(listDeliveryStatusesMock).toHaveBeenCalledWith({
       token: 'tok',
       sessionId: 's1',
+      localIds: ['manual-handled-local'],
     });
     expect(materializeNextMock).toHaveBeenCalledTimes(2);
     expect(providerInvocations).toEqual(['manual-handled-local', 'later-local']);
@@ -5051,7 +5052,10 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(false);
   });
 
-  it.each(['late acceptance', 'close'] as const)('releases server-blocked custody immediately through %s without another outcome write', async (continuation) => {
+  it.each([
+    ['blocked', 'late acceptance'], ['blocked', 'close'],
+    ['resent_as_new', 'late acceptance'], ['resent_as_new', 'close'],
+  ] as const)('releases server-%s custody immediately through %s without another outcome write', async (serverOutcome, continuation) => {
     const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 2, pendingVersion: 1 });
     await waitForCurrentPendingInputContract(client);
     providerInputOutcomeObserver(client);
@@ -5061,11 +5065,14 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       .mockResolvedValueOnce(createProviderDeliveryMaterializeResult('later-after-server-block', 3));
     await client.materializeNextPendingMessageSafely();
     expect(client.shouldAttemptPendingMaterialization()).toBe(false);
-    listDeliveryStatusesMock.mockResolvedValue([{ localId: 'server-blocked-original', status: 'blocked' }]);
+    listDeliveryStatusesMock.mockResolvedValue([{ localId: 'server-blocked-original',
+      ...(serverOutcome === 'blocked' ? { status: 'blocked' } : { status: 'discarded', discardedReason: 'resent_as_new' }),
+    }]);
     const wake = vi.fn();
     client.on('metadata-updated', wake);
     await client.reconcilePendingQueueState({ force: true });
     expect(wake).toHaveBeenCalled();
+    expect(listDeliveryStatusesMock).toHaveBeenLastCalledWith({ token: 'tok', sessionId: 's1', localIds: ['server-blocked-original'] });
     expect(client.shouldAttemptPendingMaterialization()).toBe(true);
     await expect(client.materializeNextPendingMessageSafely()).resolves.toMatchObject({
       type: 'materialized', localId: 'later-after-server-block',

@@ -897,6 +897,7 @@ export async function readPendingQueueV2ActivationEligibilityFromServer(params: 
 export type PendingQueueV2DeliveryStatusEntry = Readonly<{
     localId: string;
     status: PendingDeliveryStatusV1['status'];
+    discardedReason?: string | null;
 }>;
 
 /**
@@ -908,7 +909,36 @@ export type PendingQueueV2DeliveryStatusEntry = Readonly<{
 export async function listPendingQueueV2DeliveryStatusesFromServer(params: {
     token: string;
     sessionId: string;
+    localIds?: readonly string[];
 }): Promise<PendingQueueV2DeliveryStatusEntry[]> {
+    if (params.localIds) {
+        const localIds = [...new Set(params.localIds.map(requirePendingLocalId))];
+        const exact = await Promise.all(localIds.map(async (localId): Promise<PendingQueueV2DeliveryStatusEntry | null> => {
+            try {
+                const response = await axios.get(
+                    `${resolveServerHttpBaseUrl()}/v2/sessions/${encodeURIComponent(params.sessionId)}/pending/${encodeURIComponent(localId)}/status`,
+                    { headers: buildSessionRunnerHttpHeaders(params.token), timeout: 10_000 },
+                );
+                const status = parsePendingDeliveryStatusV1(response?.data?.deliveryStatus);
+                if (response?.data?.localId !== localId || !status) throw new Error('Invalid exact pending delivery status');
+                return {
+                    localId, status: status.status,
+                    ...(status.status === 'discarded' ? { discardedReason: status.reason } : {}),
+                };
+            } catch (error) {
+                if ((error as { response?: { status?: unknown } })?.response?.status === 404) return null;
+                throw error;
+            }
+        }));
+        // An old route or absent exact row supplies no recovery proof. Preserve the existing
+        // listing fallback for those IDs; absence never becomes a terminal outcome.
+        const missing = new Set(localIds.filter((_, index) => exact[index] === null));
+        const legacy = missing.size > 0 ? await fetchPendingQueueV2Projection(params) : [];
+        return [
+            ...exact.filter((entry): entry is PendingQueueV2DeliveryStatusEntry => entry !== null),
+            ...legacy.filter((entry) => missing.has(entry.localId)).map((entry) => ({ localId: entry.localId, status: entry.deliveryStatus.status })),
+        ];
+    }
     const pending = await fetchPendingQueueV2Projection(params);
     return pending.map((entry) => ({
         localId: entry.localId,

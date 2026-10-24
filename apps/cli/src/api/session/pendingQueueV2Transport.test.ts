@@ -1690,6 +1690,49 @@ describe('pendingQueueV2Transport', () => {
         );
     });
 
+    it('reads exact hidden custody evidence only for the requested opaque claim IDs', async () => {
+        const localId = ' exact/claim ';
+        mockGet.mockResolvedValueOnce({ data: { localId, deliveryStatus: { status: 'discarded', reason: 'resent_as_new' } } });
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 'session/1', localIds: [localId, localId] }))
+            .resolves.toEqual([{ localId, status: 'discarded', discardedReason: 'resent_as_new' }]);
+        expect(mockGet).toHaveBeenCalledTimes(1);
+        expect(mockGet).toHaveBeenCalledWith(expect.stringContaining('/v2/sessions/session%2F1/pending/%20exact%2Fclaim%20/status'),
+            expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer token' }), timeout: 10_000 }));
+    });
+
+    it.each(['missing row', 'old server'])('falls back on a 404 (%s) without inventing hidden tombstone evidence', async () => {
+        mockGet.mockRejectedValueOnce({ response: { status: 404 } });
+        mockGet.mockResolvedValueOnce({ data: { pending: [{ localId: 'unrelated', deliveryStatus: { status: 'queued' } }] } });
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 's1', localIds: ['A'] })).resolves.toEqual([]);
+        expect(mockGet).toHaveBeenCalledTimes(2);
+    });
+
+    it('preserves the old-server visible blocked status fallback for an exact held ID', async () => {
+        mockGet.mockRejectedValueOnce({ response: { status: 404 } });
+        mockGet.mockResolvedValueOnce({ data: { pending: [{ localId: 'A', deliveryStatus: { status: 'blocked', reason: 'unknown' } }] } });
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 's1', localIds: ['A'] }))
+            .resolves.toEqual([{ localId: 'A', status: 'blocked' }]);
+    });
+
+    it.each([
+        { localId: 'different', deliveryStatus: { status: 'discarded', reason: 'resent_as_new' } },
+        { localId: 'A', deliveryStatus: { status: 'resolved' } },
+        { localId: 'A' },
+    ])('rejects mismatched or malformed exact evidence: %j', async (data) => {
+        mockGet.mockResolvedValueOnce({ data });
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 's1', localIds: ['A'] }))
+            .rejects.toThrow('Invalid exact pending delivery status');
+    });
+
+    it('does not swallow authorization failures or query without local claim IDs', async () => {
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 's1', localIds: [] })).resolves.toEqual([]);
+        expect(mockGet).not.toHaveBeenCalled();
+        const error = { response: { status: 403 } };
+        mockGet.mockRejectedValueOnce(error);
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 's1', localIds: ['A'] })).rejects.toBe(error);
+        expect(mockGet).toHaveBeenCalledTimes(1);
+    });
+
     it('requires the exact queued user send-now row for inactive-session activation', async () => {
         mockGet.mockResolvedValueOnce({
             data: {

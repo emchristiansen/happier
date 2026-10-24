@@ -2221,11 +2221,14 @@ export class ApiSessionClient extends EventEmitter {
             const statuses = await listPendingQueueV2DeliveryStatusesFromServer({
                 token: this.token,
                 sessionId: this.sessionId,
+                localIds: blockingLocalIds,
             });
-            const statusByLocalId = new Map(statuses.map((entry) => [entry.localId, entry.status]));
+            const statusByLocalId = new Map(statuses.map((entry) => [entry.localId, entry]));
             for (const localId of blockingLocalIds) {
-                const status = statusByLocalId.get(localId);
-                if (status === 'blocked' && this.canonicalPendingDeliveryByLocalId.has(localId)) {
+                const entry = statusByLocalId.get(localId);
+                const status = entry?.status;
+                if ((status === 'blocked' || (status === 'discarded' && entry?.discardedReason === 'resent_as_new'))
+                    && this.canonicalPendingDeliveryByLocalId.has(localId)) {
                     // The server already owns this outcome. Retain identity for late acceptance,
                     // but neither hold later rows nor manufacture another uncertainty write.
                     this.serverBlockedCanonicalPendingDeliveryLocalIds.add(localId);
