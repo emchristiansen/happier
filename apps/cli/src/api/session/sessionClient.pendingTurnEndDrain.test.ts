@@ -4130,7 +4130,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect((client as any).canonicalPendingDeliveryByLocalId.has('discarded-local')).toBe(false);
   });
 
-  it.each(['queued', 'delivering', 'blocked'] as const)(
+  it.each(['queued', 'delivering'] as const)(
     'retains exact local custody while the server row remains %s',
     async (status) => {
       const client = await createClient({
@@ -5049,6 +5049,41 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     confirmProviderInputAccepted(client, localId);
     await vi.advanceTimersByTimeAsync(0);
     expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(false);
+  });
+
+  it.each(['late acceptance', 'close'] as const)('releases server-blocked custody immediately through %s without another outcome write', async (continuation) => {
+    const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 2, pendingVersion: 1 });
+    await waitForCurrentPendingInputContract(client);
+    providerInputOutcomeObserver(client);
+    vi.useFakeTimers();
+    materializeNextMock
+      .mockResolvedValueOnce(createProviderDeliveryMaterializeResult('server-blocked-original', 2))
+      .mockResolvedValueOnce(createProviderDeliveryMaterializeResult('later-after-server-block', 3));
+    await client.materializeNextPendingMessageSafely();
+    expect(client.shouldAttemptPendingMaterialization()).toBe(false);
+    listDeliveryStatusesMock.mockResolvedValue([{ localId: 'server-blocked-original', status: 'blocked' }]);
+    const wake = vi.fn();
+    client.on('metadata-updated', wake);
+    await client.reconcilePendingQueueState({ force: true });
+    expect(wake).toHaveBeenCalled();
+    expect(client.shouldAttemptPendingMaterialization()).toBe(true);
+    await expect(client.materializeNextPendingMessageSafely()).resolves.toMatchObject({
+      type: 'materialized', localId: 'later-after-server-block',
+    });
+    expect(materializeNextMock.mock.calls[1]?.[0]).toMatchObject({ heldLocalIds: ['server-blocked-original'] });
+    confirmProviderInputAccepted(client, 'later-after-server-block');
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(blockPendingDeliveryMock).not.toHaveBeenCalled();
+    expect(client.hasCanonicalPendingProviderInputDelivery('server-blocked-original')).toBe(true);
+    if (continuation === 'close') {
+      await client.close();
+      expect(blockPendingDeliveryMock).not.toHaveBeenCalled();
+      return;
+    }
+    confirmProviderInputAccepted(client, 'server-blocked-original');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledWith(expect.objectContaining({ localId: 'server-blocked-original' }));
+    expect(client.hasCanonicalPendingProviderInputDelivery('server-blocked-original')).toBe(false);
   });
 
   it.each(['provider_unavailable_before_acceptance', 'invalid_prompt_text'] as const)(

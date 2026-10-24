@@ -558,7 +558,7 @@ const SESSION_PRESENCE_RECONNECT_REASSERT_DELAY_MS = 2_000;
 const STUCK_THINKING_TERMINAL_KEEPALIVE_GUARD_MS = 15_000;
 const SESSION_CLIENT_RECEIVED_MESSAGE_ID_CACHE_MAX_ENTRIES = 1_000;
 const SESSION_CLIENT_TOOL_CALL_CACHE_MAX_ENTRIES = 1_000;
-const PENDING_BLOCKED_REOFFER_DELAY_MS = 60_000;
+const PENDING_REOFFER_DELAY_MS = 60_000;
 const PENDING_CUSTODY_OUTCOME_TIMEOUT_MS = 120_000;
 // Recovery only: hints and turn-end remain the fast path. Slow *successful* reads also
 // stretch the cadence so a saturated relay does not need to fail before we shed reads.
@@ -720,8 +720,9 @@ export class ApiSessionClient extends EventEmitter {
         request: { force: boolean; discovery: boolean };
         promise: Promise<boolean>;
     } | null = null;
-    private pendingBlockedReofferTimer: ReturnType<typeof setTimeout> | null = null;
-    private pendingBlockedReofferDue = false;
+    private pendingReofferTimer: ReturnType<typeof setTimeout> | null = null;
+    private pendingReofferDue = false;
+    private pendingReofferNeeded = false;
     private pendingDiscoveryTimer: ReturnType<typeof setTimeout> | null = null;
     private pendingDiscoveryProducer: Readonly<{ generation: number; producer: SessionProviderInputOutcomeProducer }> | null = null;
     private pendingDiscoveryDelayMs = PENDING_DISCOVERY_BASE_DELAY_MS;
@@ -1732,7 +1733,7 @@ export class ApiSessionClient extends EventEmitter {
     private applyPendingQueueState(state: KnownPendingQueueState, opts?: { emit?: boolean }): boolean {
         const applied = applyKnownPendingQueueState(this.pendingQueueState, state);
         this.pendingQueueState = applied.state;
-        this.schedulePendingBlockedReoffer();
+        this.schedulePendingReoffer();
         if (applied.changed) {
             this.pendingWakeSeq += 1;
             if (!this.closed) {
@@ -2201,7 +2202,7 @@ export class ApiSessionClient extends EventEmitter {
                     });
                 })
                 .finally(() => {
-                    // A failed write retains the exact claim and retries after the same delay.
+                    // A failed write retains the exact claim and retries on the bounded outcome-write cadence.
                     this.schedulePendingCustodyOutcomeTimeout(localId);
                     if (!this.closed && !this.closeStarted && !this.runtimeTerminationStarted) {
                         this.publishPendingEligibilityWake();
@@ -2224,6 +2225,14 @@ export class ApiSessionClient extends EventEmitter {
             const statusByLocalId = new Map(statuses.map((entry) => [entry.localId, entry.status]));
             for (const localId of blockingLocalIds) {
                 const status = statusByLocalId.get(localId);
+                if (status === 'blocked' && this.canonicalPendingDeliveryByLocalId.has(localId)) {
+                    // The server already owns this outcome. Retain identity for late acceptance,
+                    // but neither hold later rows nor manufacture another uncertainty write.
+                    this.serverBlockedCanonicalPendingDeliveryLocalIds.add(localId);
+                    this.clearPendingCustodyOutcomeTimer(localId);
+                    this.publishPendingEligibilityWake();
+                    continue;
+                }
                 // Absence cannot settle an accepted result or a batch reserved between dequeue
                 // and provider entry. Only the exact existing settlement/terminal proof may do so.
                 if (status !== 'discarded') continue;
@@ -2323,32 +2332,37 @@ export class ApiSessionClient extends EventEmitter {
         return await reconcile;
     }
 
-    private clearPendingBlockedReofferTimer(): void {
-        if (this.pendingBlockedReofferTimer) clearTimeout(this.pendingBlockedReofferTimer);
-        this.pendingBlockedReofferTimer = null;
+    private clearPendingReofferTimer(): void {
+        if (this.pendingReofferTimer) clearTimeout(this.pendingReofferTimer);
+        this.pendingReofferTimer = null;
     }
 
-    private schedulePendingBlockedReoffer(): void {
-        if (!this.pendingQueueState.known || this.pendingQueueState.pendingBlockedCount <= 0) {
-            this.clearPendingBlockedReofferTimer();
-            this.pendingBlockedReofferDue = false;
+    private schedulePendingReoffer(): void {
+        if (!this.pendingQueueState.known || this.pendingQueueState.pendingCount <= 0) {
+            this.clearPendingReofferTimer();
+            this.pendingReofferDue = false;
             return;
         }
-        if (this.pendingBlockedReofferTimer || this.pendingBlockedReofferDue
+        if (!this.pendingReofferNeeded) {
+            this.clearPendingReofferTimer();
+            this.pendingReofferDue = false;
+            return;
+        }
+        if (this.pendingReofferTimer || this.pendingReofferDue
             || !this.isPendingDiscoveryProducerCurrent() || this.closeStarted) return;
-        this.pendingBlockedReofferTimer = setTimeout(() => {
-            this.pendingBlockedReofferTimer = null;
+        this.pendingReofferTimer = setTimeout(() => {
+            this.pendingReofferTimer = null;
             if (!this.isPendingDiscoveryProducerCurrent() || this.closeStarted) return;
-            this.pendingBlockedReofferDue = true;
-            // The consumer owns provider dispatch; wake it for one real materialize attempt,
-            // including when the cached projection counts only blocked rows.
+            this.pendingReofferDue = true;
+            // No claim/discovery progress with rows remaining warrants another attempt,
+            // regardless of server reason tiers. The consumer still owns provider dispatch.
             this.publishPendingEligibilityWake();
-        }, PENDING_BLOCKED_REOFFER_DELAY_MS);
-        this.pendingBlockedReofferTimer.unref?.();
+        }, PENDING_REOFFER_DELAY_MS);
+        this.pendingReofferTimer.unref?.();
     }
 
     private hasPendingMaterializationWork(): boolean {
-        return countMaterializablePendingRows(this.pendingQueueState) > 0 || this.pendingBlockedReofferDue;
+        return countMaterializablePendingRows(this.pendingQueueState) > 0 || this.pendingReofferDue;
     }
 
     private clearPendingDiscoveryTimer(): void {
@@ -2423,8 +2437,8 @@ export class ApiSessionClient extends EventEmitter {
         if (result.archived) {
             this.pendingDiscoveryArchived = true;
             this.clearPendingDiscoveryTimer();
-            this.clearPendingBlockedReofferTimer();
-            this.pendingBlockedReofferDue = false;
+            this.clearPendingReofferTimer();
+            this.pendingReofferDue = false;
             return;
         }
         if (result.elapsedMs >= PENDING_DISCOVERY_SLOW_READ_MS) {
@@ -2668,6 +2682,7 @@ export class ApiSessionClient extends EventEmitter {
                 }
 
                 if (update.pendingQueueState) {
+                    this.pendingReofferNeeded = true;
                     this.applyPendingQueueState(update.pendingQueueState, { emit: true });
                     if (latestTurnStatus !== undefined && this.pendingQueueState.known
                         && update.pendingQueueState.pendingVersion === this.pendingQueueState.pendingVersion) {
@@ -3270,7 +3285,7 @@ export class ApiSessionClient extends EventEmitter {
                     ? pendingWakeSeqBefore
                     : stateUpdateResult.pendingWakeSeq;
                 this.pendingQueueState = stateUpdateResult.pendingQueueState;
-                this.schedulePendingBlockedReoffer();
+                this.schedulePendingReoffer();
                 this.applyRuntimeActivityProjectionFromServer(stateUpdateResult.runtimeActivityProjection, {
                     // handleSessionStateUpdate is the one wake-sequence owner for this envelope.
                     // The projection applier updates local Activity state without publishing a
@@ -5980,8 +5995,8 @@ export class ApiSessionClient extends EventEmitter {
         const generation = ++this.providerInputOutcomeProducerGeneration;
         this.clearPendingDiscoveryTimer();
         this.pendingDiscoveryProducer = { generation, producer };
-        this.clearPendingBlockedReofferTimer();
-        this.schedulePendingBlockedReoffer();
+        this.clearPendingReofferTimer();
+        this.schedulePendingReoffer();
         this.pendingDiscoveryReadFailed = false;
         this.pendingDiscoveryDelayMs = PENDING_DISCOVERY_BASE_DELAY_MS;
         this.schedulePendingDiscovery();
@@ -6471,8 +6486,8 @@ export class ApiSessionClient extends EventEmitter {
         // draining RPC executions so closing cannot wait on its own lifetime abort.
         this.archiveAdmissionTermination.abort();
         this.clearPendingDiscoveryTimer();
-        this.clearPendingBlockedReofferTimer();
-        this.pendingBlockedReofferDue = false;
+        this.clearPendingReofferTimer();
+        this.pendingReofferDue = false;
         this.clearPendingCustodyOutcomeTimers();
         this.clearPendingPublisherRecoveryDeadline();
         this.accountSettingsRetryAbortController?.abort();
@@ -6554,8 +6569,8 @@ export class ApiSessionClient extends EventEmitter {
         this.runtimeTerminationStarted = true;
         this.archiveAdmissionTermination.abort();
         this.clearPendingDiscoveryTimer();
-        this.clearPendingBlockedReofferTimer();
-        this.pendingBlockedReofferDue = false;
+        this.clearPendingReofferTimer();
+        this.pendingReofferDue = false;
         this.clearPendingCustodyOutcomeTimers();
         this.clearPendingPublisherRecoveryDeadline();
         this.providerInputOutcomeProducerGeneration += 1;
@@ -6575,6 +6590,7 @@ export class ApiSessionClient extends EventEmitter {
             return;
         }
         const block = this.canonicalPendingDeliveryBlocks.get(localId);
+        if (!block && this.serverBlockedCanonicalPendingDeliveryLocalIds.has(localId)) return;
         const reason = block?.reason ?? (this.providerInputUncertainLocalIds.has(localId)
             ? 'delivery_outcome_uncertain'
             : 'runtime_disposed_before_delivery');
@@ -6895,8 +6911,8 @@ export class ApiSessionClient extends EventEmitter {
             // claim on this one, so neither a wake nor a timer may retry it.
             return { didMaterialize: false, result: { type: 'publisher_lost' } };
         }
-        this.pendingBlockedReofferDue = false;
-        this.schedulePendingBlockedReoffer();
+        this.pendingReofferDue = false;
+        this.schedulePendingReoffer();
         let materializeResult: PendingQueueMaterializeNextResult;
         reportPendingMaterializationDiagnosticPhase(opts.onDiagnosticPhase, 'materialize.server_claim');
         if (serverContract.pendingInput === 'released_server_v0_2_1') {
@@ -7027,7 +7043,8 @@ export class ApiSessionClient extends EventEmitter {
             authoritativeState: materializeResult.pendingQueueState ?? null,
         });
         this.pendingQueueState = pendingStateUpdate.state;
-        this.schedulePendingBlockedReoffer();
+        this.pendingReofferNeeded = !materializeResult.didMaterialize;
+        this.schedulePendingReoffer();
         if (pendingStateUpdate.changed) {
             this.pendingWakeSeq += 1;
         }
@@ -7123,6 +7140,8 @@ export class ApiSessionClient extends EventEmitter {
             && materializedMessage.localId
         ) {
             if (this.canonicalPendingDeliveryByLocalId.has(materializedMessage.localId)) {
+                this.pendingReofferNeeded = true;
+                this.schedulePendingReoffer();
                 logger.debug('[pendingQueue] materialize result suppressed for already-unresolved provider delivery state', {
                     sessionId: this.sessionId,
                     localId: materializedMessage.localId,
