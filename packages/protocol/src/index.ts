@@ -29,6 +29,7 @@ export {
   isPendingLocalId,
   readPendingLocalId,
   PendingLocalIdSchema,
+  PendingMaterializeHeldLocalIdsSchema,
   type PendingLocalId,
 } from './sessionMessages/pendingLocalId.js';
 
@@ -890,6 +891,7 @@ export {
 } from './sessionMessages/sessionStoredMessageContent.js';
 export {
   PENDING_DELIVERY_BLOCKED_REASONS,
+  PENDING_DELIVERY_REOFFER_TIER,
   PendingDeliveryBlockedReasonSchema,
   isConditionalPendingSteerClaim,
   isPendingDeliveryBlockedReason,

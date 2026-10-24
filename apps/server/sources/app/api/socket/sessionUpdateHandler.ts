@@ -1,3 +1,4 @@
+import { PendingMaterializeHeldLocalIdsSchema } from "@happier-dev/protocol";
 import { socketMessageAckCounter, websocketEventsCounter } from "@/app/monitoring/metrics2";
 import {
     buildMessageUpdatedUpdate,
@@ -1105,7 +1106,13 @@ export function sessionUpdateHandler(
                     respond({ ok: false, error: 'invalid-params' });
                     return;
                 }
+                const heldLocalIds = PendingMaterializeHeldLocalIdsSchema.optional().safeParse(data?.heldLocalIds);
+                if (!heldLocalIds.success) {
+                    respond({ ok: false, error: "invalid-params" });
+                    return;
+                }
                 const commonMaterializeParams = {
+                    ...(heldLocalIds.data !== undefined ? { heldLocalIds: heldLocalIds.data } : {}),
                     actorUserId: userId,
                     sessionId: sid,
                     ...(expectedPendingVersion !== undefined ? { expectedPendingVersion } : {}),
