@@ -3230,6 +3230,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     errorMessage: 'The existing session runtime could not be verified. Retry resume after connectivity recovers.',
                   };
                 }
+                if (resumeDecisionAfterWait.action === 'wait_for_exit') {
+                  await publishSessionRunnerControlServiceability(normalizedExistingSessionId, serviceabilityAfterWait);
+                  return {
+                    type: 'error',
+                    errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
+                    errorMessage: 'The previous session runtime is still shutting down. Retry resume after it exits.',
+                  };
+                }
                 if (resumeDecisionAfterWait.action === 'adopt') {
                   if (!await waitForDaemonSessionArchiveAdmission({
                     sessionId: normalizedExistingSessionId, credentials,
