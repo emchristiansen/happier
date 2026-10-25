@@ -23,10 +23,11 @@ import {
 } from "@/app/session/runtimeActivity/writeProjection";
 import { db } from "@/storage/db";
 import { inTx } from "@/storage/inTx";
-import { blockInheritedProviderDeliveryClaims } from "@/app/session/pending/providerDeliveryClaimStaleness";
+import { reofferInheritedProviderDeliveryClaims } from "@/app/session/pending/providerDeliveryClaimStaleness";
 import { applyLatestSessionTurnEndInTx } from "@/app/session/sessionWriteService";
 import { AsyncLock } from "@/utils/runtime/lock";
 import type { Tx } from "@/storage/inTx";
+import { readPendingActivationWakeInTx, type PendingActivationWake } from "./pendingActivationWake";
 
 export interface PublisherBinding {
     readonly accountId: string;
@@ -55,6 +56,8 @@ export type ClosePublisherResult =
             lastRuntimeIssue: SessionRuntimeIssueV1 | null;
             badgeAttentionChanged: boolean;
         }>;
+        /** The session's waiting activation request, for a close that asked to wake it. */
+        activationWake?: PendingActivationWake;
       }
     | { status: "already_inactive" }
     | { status: "superseded" }
@@ -69,6 +72,9 @@ export type CaptureExplicitMachineStopResult =
     | { status: "captured"; target: ExplicitMachineStopTarget }
     | { status: "already_inactive" }
     | { status: "rejected"; reason: "not_found" | "machine_control_unavailable" };
+export type RetireExitedPublisherResult =
+    | ClosePublisherResult
+    | { status: "rejected"; reason: "unmatched" | "machine_control_unavailable" };
 export type CurrentPublisherResult =
     | {
         status: "current";
@@ -111,6 +117,19 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
     const registrationAttempts = new WeakMap<object, RegistrationAttempt>();
     const closeResults = new WeakMap<object, Promise<ClosePublisherResult>>();
     const operationLocks = new WeakMap<object, AsyncLock>();
+    // A runner names its process in its socket handshake. Each successful registration records which
+    // incarnation holds which publisher generation, so a daemon's later exit report can retire
+    // exactly that runner's fence. One entry per session registered on this server process, replaced
+    // by the session's next registration here. The record is in memory: when this process holds no
+    // entry for the incarnation (it registered elsewhere, or before a restart) the report is rejected
+    // as unmatched, and when its entry is stale (a successor registered elsewhere) the close
+    // transaction rejects it as superseded. Either way the presence timeout then applies.
+    const incarnationsBySocket = new WeakMap<object, string>();
+    const latestIncarnationRegistrationBySession = new Map<string, Readonly<{
+        publisherIncarnationId: string;
+        binding: PublisherBinding;
+        publisherGeneration: bigint;
+    }>>();
 
     const serialize = async <T>(
         socket: object,
@@ -140,7 +159,7 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
                 return { status: "rejected", reason: "revision_overflow" };
             }
 
-            await blockInheritedProviderDeliveryClaims({ tx, sessionId: binding.sessionId });
+            await reofferInheritedProviderDeliveryClaims({ tx, sessionId: binding.sessionId, now: now() });
 
             const activity = await writeSessionRuntimeActivityProjectionInTx({
                 tx,
@@ -194,6 +213,16 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
                 committedFence: new Date(result.committedFence.getTime()),
                 publisherGeneration: result.publisherGeneration,
             });
+            const publisherIncarnationId = incarnationsBySocket.get(params.socket);
+            if (publisherIncarnationId) {
+                latestIncarnationRegistrationBySession.set(params.binding.sessionId, {
+                    publisherIncarnationId,
+                    binding: { ...params.binding },
+                    publisherGeneration: result.publisherGeneration,
+                });
+            } else {
+                latestIncarnationRegistrationBySession.delete(params.binding.sessionId);
+            }
         }
         return result;
     };
@@ -232,7 +261,13 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
     const closeBinding = async (params: Readonly<{
         binding: PublisherBinding;
         authority: PublisherCloseAuthority;
-        mutationId: string;
+        /** Ends the session's latest turn with this mutation id; `null` ends no turn. */
+        latestTurnEnd: Readonly<{ mutationId: string }> | null;
+        /**
+         * Reads the session's waiting activation request when this close makes it inactive, as the
+         * presence timeout does, so the caller can wake the owner's machines for it.
+         */
+        wakeWaitingActivation: boolean;
     }>): Promise<ClosePublisherResult> => await inTx(async (tx): Promise<ClosePublisherResult> => {
         const session = await tx.session.findUnique({
             where: { id: params.binding.sessionId },
@@ -310,12 +345,14 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
             data: { active: false, publisherGenerationLastActiveAt: null },
         });
         if (updated.count === 0) return { status: "superseded" };
-        const turnResult = await applyLatestSessionTurnEndInTx({
-            tx,
-            sessionId: params.binding.sessionId,
-            mutationId: params.mutationId,
-            observedAt: now().getTime(),
-        });
+        const turnResult = params.latestTurnEnd
+            ? await applyLatestSessionTurnEndInTx({
+                tx,
+                sessionId: params.binding.sessionId,
+                mutationId: params.latestTurnEnd.mutationId,
+                observedAt: now().getTime(),
+            })
+            : null;
         // Archive already owns the terminal Activity projection. Physical-stop proof
         // retires reachability and the publisher fence without granting Activity writes.
         const activity = session.archivedAt === null
@@ -331,10 +368,14 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
             tx,
             sessionId: params.binding.sessionId,
         });
+        const activationWake = params.wakeWaitingActivation
+            ? await readPendingActivationWakeInTx({ tx, sessionId: params.binding.sessionId })
+            : undefined;
         return {
             status: "closed",
             activeAt: session.lastActiveAt,
             participantCursors,
+            ...(activationWake ? { activationWake } : {}),
             ...(activity?.status === "applied" ? { projection: activity.projection } : {}),
             ...(turnResult?.didApply
                 ? {
@@ -394,10 +435,44 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
     }>): Promise<ClosePublisherResult> => await closeBinding({
         binding: params.target.binding,
         authority: params.target.authority,
-        mutationId: params.target.authority.kind === "generation"
-            ? `explicit-machine-stop:generation:${params.target.authority.publisherGeneration}`
-            : `explicit-machine-stop:legacy-heartbeat:${params.target.authority.committedFence.getTime()}`,
+        latestTurnEnd: {
+            mutationId: params.target.authority.kind === "generation"
+                ? `explicit-machine-stop:generation:${params.target.authority.publisherGeneration}`
+                : `explicit-machine-stop:legacy-heartbeat:${params.target.authority.committedFence.getTime()}`,
+        },
+        wakeWaitingActivation: false,
     });
+
+    /**
+     * Retire the publisher fence of a runner incarnation its machine observed exit. Only that
+     * incarnation's latest registration qualifies, and only while its generation is still the
+     * session's current publisher generation (checked inside the close transaction), so a successor
+     * runner is never retired. No turn is ended: exact turn custody for an observed exit belongs to
+     * the daemon's staged exact-turn end, and the latest turn may already belong to a successor.
+     * A retirement that makes the session inactive returns its waiting activation request, as the
+     * presence timeout would have, because the timeout no longer selects an inactive session.
+     */
+    const retireExitedPublisher = async (params: Readonly<{
+        binding: PublisherBinding;
+        publisherIncarnationId: string;
+    }>): Promise<RetireExitedPublisherResult> => {
+        const registration = latestIncarnationRegistrationBySession.get(params.binding.sessionId);
+        if (!registration || registration.publisherIncarnationId !== params.publisherIncarnationId) {
+            return { status: "rejected", reason: "unmatched" };
+        }
+        if (
+            registration.binding.accountId !== params.binding.accountId
+            || registration.binding.machineId !== params.binding.machineId
+        ) {
+            return { status: "rejected", reason: "machine_control_unavailable" };
+        }
+        return await closeBinding({
+            binding: registration.binding,
+            authority: { kind: "generation", publisherGeneration: registration.publisherGeneration },
+            latestTurnEnd: null,
+            wakeWaitingActivation: true,
+        });
+    };
 
     const closePublisher = (params: Readonly<{ socket: object }>): Promise<ClosePublisherResult> => {
         const existing = closeResults.get(params.socket);
@@ -412,7 +487,8 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
                     committedFence: registration.committedFence,
                     publisherGeneration: registration.publisherGeneration,
                 },
-                mutationId: `publisher-close:${registration.committedFence.getTime()}`,
+                latestTurnEnd: { mutationId: `publisher-close:${registration.committedFence.getTime()}` },
+                wakeWaitingActivation: false,
             });
         });
         closeResults.set(params.socket, result);
@@ -698,12 +774,19 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
         }
     };
 
+    /** Records the runner incarnation a publisher socket named in its handshake, before it registers. */
+    const bindPublisherIncarnation = (params: Readonly<{ socket: object; publisherIncarnationId: string }>): void => {
+        incarnationsBySocket.set(params.socket, params.publisherIncarnationId);
+    };
+
     return {
         registerPublisher,
         touchPublisher,
         closePublisher,
         captureExplicitMachineStop,
         finalizeExplicitMachineStop,
+        bindPublisherIncarnation,
+        retireExitedPublisher,
         resolveCurrentPublisher,
         runAsCurrentPublisher,
         runAsCurrentPublisherInTx,

@@ -9,10 +9,12 @@ import {
     readBlockedPendingQueueV2DeliveryByLocalIdFromServer,
     readPendingQueueV2ActivationEligibilityFromServer,
     listPendingQueueV2LocalIdsFromServer,
+    listPendingQueueV2ActionableLocalIdsFromServer,
     listPendingQueueV2DeliveryStatusesFromServer,
     listPendingQueueV2ProviderDeliveryLocalIdsFromServer,
     markPendingQueueV2DeliveryHandled,
     requestPendingQueueV2SteerNow,
+    readPendingQueueV2RowSnapshotsFromServer,
     materializeNextPendingQueueV2Message,
     materializeNextPendingQueueV2MessageOnReleasedServer,
     materializeNextPendingQueueV2MessageViaHttp,
@@ -352,6 +354,42 @@ describe('pendingQueueV2Transport', () => {
         });
         await expect(materialization).rejects.toBeInstanceOf(PendingQueueMaterializationTransportAmbiguousError);
 
+        expect(mockPost).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        materializeNextPendingQueueV2MessageViaHttp,
+        materializeNextPendingQueueV2Message,
+    ])('sends held claim identities over HTTP materialization', async (materialize) => {
+        mockPost.mockResolvedValueOnce({ data: { ok: true, didMaterialize: false } });
+        await materialize({
+            token: 'token',
+            sessionId: 'session-1',
+            heldLocalIds: ['accepted-local', 'uncertain-local'],
+        });
+        expect(mockPost.mock.calls[0]?.[1]).toEqual({
+            heldLocalIds: ['accepted-local', 'uncertain-local'],
+        });
+    });
+
+    it('sends held claim identities over socket materialization', async () => {
+        const socket = {
+            connected: true,
+            timeout: () => socket,
+            emitWithAck: vi.fn(async () => ({ ok: true, didMaterialize: false })),
+        };
+        // Socket.IO is the external boundary; the fixture implements the ACK surface used here.
+        const transport = socket as unknown as NonNullable<Parameters<typeof materializeNextPendingQueueV2Message>[0]['socket']>;
+        await materializeNextPendingQueueV2Message({
+            token: 'token',
+            sessionId: 'session-1',
+            socket: transport,
+            heldLocalIds: ['accepted-local', 'uncertain-local'],
+        });
+        expect(socket.emitWithAck).toHaveBeenCalledWith('pending-materialize-next', {
+            sid: 'session-1',
+            heldLocalIds: ['accepted-local', 'uncertain-local'],
+        });
         expect(mockPost).not.toHaveBeenCalled();
     });
 
@@ -1737,6 +1775,49 @@ describe('pendingQueueV2Transport', () => {
         );
     });
 
+    it.each(['resent_as_new', 'dismissed_uncertain'])('reads exact %s custody evidence only for the requested opaque claim IDs', async (reason) => {
+        const localId = ' exact/claim ';
+        mockGet.mockResolvedValueOnce({ data: { localId, deliveryStatus: { status: 'discarded', reason } } });
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 'session/1', localIds: [localId, localId] }))
+            .resolves.toEqual([{ localId, status: 'discarded', discardedReason: reason }]);
+        expect(mockGet).toHaveBeenCalledTimes(1);
+        expect(mockGet).toHaveBeenCalledWith(expect.stringContaining('/v2/sessions/session%2F1/pending/%20exact%2Fclaim%20/status'),
+            expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer token' }), timeout: 10_000 }));
+    });
+
+    it.each(['missing row', 'old server'])('falls back on a 404 (%s) without inventing hidden tombstone evidence', async () => {
+        mockGet.mockRejectedValueOnce({ response: { status: 404 } });
+        mockGet.mockResolvedValueOnce({ data: { pending: [{ localId: 'unrelated', deliveryStatus: { status: 'queued' } }] } });
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 's1', localIds: ['A'] })).resolves.toEqual([]);
+        expect(mockGet).toHaveBeenCalledTimes(2);
+    });
+
+    it('preserves the old-server visible blocked status fallback for an exact held ID', async () => {
+        mockGet.mockRejectedValueOnce({ response: { status: 404 } });
+        mockGet.mockResolvedValueOnce({ data: { pending: [{ localId: 'A', deliveryStatus: { status: 'blocked', reason: 'unknown' } }] } });
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 's1', localIds: ['A'] }))
+            .resolves.toEqual([{ localId: 'A', status: 'blocked' }]);
+    });
+
+    it.each([
+        { localId: 'different', deliveryStatus: { status: 'discarded', reason: 'resent_as_new' } },
+        { localId: 'A', deliveryStatus: { status: 'resolved' } },
+        { localId: 'A' },
+    ])('rejects mismatched or malformed exact evidence: %j', async (data) => {
+        mockGet.mockResolvedValueOnce({ data });
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 's1', localIds: ['A'] }))
+            .rejects.toThrow('Invalid exact pending delivery status');
+    });
+
+    it('does not swallow authorization failures or query without local claim IDs', async () => {
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 's1', localIds: [] })).resolves.toEqual([]);
+        expect(mockGet).not.toHaveBeenCalled();
+        const error = { response: { status: 403 } };
+        mockGet.mockRejectedValueOnce(error);
+        await expect(listPendingQueueV2DeliveryStatusesFromServer({ token: 'token', sessionId: 's1', localIds: ['A'] })).rejects.toBe(error);
+        expect(mockGet).toHaveBeenCalledTimes(1);
+    });
+
     it('requires the exact queued user send-now row for inactive-session activation', async () => {
         mockGet.mockResolvedValueOnce({
             data: {
@@ -1789,14 +1870,6 @@ describe('pendingQueueV2Transport', () => {
         ['invalid typed delivery status', {
             pending: [{ localId: 'invalid-typed', deliveryStatus: { status: 'future' } }],
         }],
-        ['contradictory typed and persisted delivery status', {
-            pending: [{
-                localId: 'contradictory',
-                status: 'queued',
-                deliveryState: 'delivering',
-                deliveryStatus: { status: 'discarded', reason: null },
-            }],
-        }],
         ['duplicate local id with identical status', {
             pending: [
                 { localId: 'duplicate-identical', status: 'queued', deliveryState: 'delivering' },
@@ -1827,14 +1900,7 @@ describe('pendingQueueV2Transport', () => {
         const invalidProjections = [
             {},
             { pending: [{ localId: 'malformed-without-status' }] },
-            {
-                pending: [{
-                    localId: 'contradictory',
-                    status: 'queued',
-                    deliveryState: 'delivering',
-                    deliveryStatus: { status: 'discarded', reason: null },
-                }],
-            },
+            { pending: [{ localId: 'invalid-typed', status: 'queued', deliveryStatus: { status: 'future' } }] },
             {
                 pending: [
                     { localId: 'duplicate', status: 'queued', deliveryState: 'delivering' },
@@ -1885,11 +1951,232 @@ describe('pendingQueueV2Transport', () => {
         );
     });
 
+    it('takes the typed delivery status over persisted fields the server overrides', async () => {
+        // Server `mapPendingMessageRow` reports a queued row whose requested action it cannot parse
+        // as blocked `unsupported_action`, while the persisted fields still say queued.
+        const malformedActionRow = {
+            localId: 'malformed-action',
+            messageRole: 'user',
+            content: { t: 'encrypted', c: 'cipher' },
+            requestedActionMalformed: true,
+            status: 'queued',
+            deliveryStatus: { status: 'blocked', reason: 'unsupported_action' },
+            position: 0,
+            createdAt: 1_700_000_000_000,
+            updatedAt: 1_700_000_000_000,
+            discardedAt: null,
+            discardedReason: null,
+            authorAccountId: 'account-1',
+        };
+        mockGet.mockResolvedValueOnce({ data: { pending: [malformedActionRow] } });
+
+        await expect(readBlockedPendingQueueV2DeliveryByLocalIdFromServer({
+            token: 'token',
+            sessionId: 'session-1',
+            localId: 'malformed-action',
+        })).resolves.toEqual({ localId: 'malformed-action', reason: 'unsupported_action' });
+    });
+
+    describe('on a session holding a row the app handed to an external terminal', () => {
+        // The exact shape `GET /v2/sessions/:id/pending` sends (server `toPendingJson`) for a row
+        // enqueued with `deliveryMode: 'external_handoff'`: persisted fields and typed status together.
+        function serverPendingRow(overrides: Readonly<{
+            localId: string;
+            requestedAction?: Readonly<{ v: 1; kind: 'enqueue' | 'send_now' }>;
+            deliveryState?: 'delivering' | 'external_handoff' | 'blocked';
+            deliveryBlockedReason?: string;
+            deliveryStatus: Readonly<Record<string, unknown>>;
+        }>) {
+            return {
+                localId: overrides.localId,
+                messageRole: 'user',
+                content: { t: 'encrypted', c: `cipher-${overrides.localId}` },
+                requestedAction: overrides.requestedAction ?? { v: 1, kind: 'enqueue' },
+                status: 'queued',
+                ...(overrides.deliveryState ? { deliveryState: overrides.deliveryState } : {}),
+                ...(overrides.deliveryBlockedReason ? { deliveryBlockedReason: overrides.deliveryBlockedReason } : {}),
+                deliveryStatus: overrides.deliveryStatus,
+                position: 0,
+                createdAt: 1_700_000_000_000,
+                updatedAt: 1_700_000_000_000,
+                discardedAt: null,
+                discardedReason: null,
+                authorAccountId: 'account-1',
+            };
+        }
+
+        const handoffRow = serverPendingRow({
+            localId: 'handoff-local',
+            requestedAction: { v: 1, kind: 'send_now' },
+            deliveryState: 'external_handoff',
+            deliveryStatus: { status: 'external_handoff' },
+        });
+
+        it('lists every pending local id', async () => {
+            mockGet.mockResolvedValueOnce({
+                data: {
+                    pending: [
+                        serverPendingRow({ localId: 'queued-local', deliveryStatus: { status: 'queued' } }),
+                        handoffRow,
+                    ],
+                },
+            });
+
+            await expect(listPendingQueueV2LocalIdsFromServer({
+                token: 'token',
+                sessionId: 'session-1',
+            })).resolves.toEqual(['queued-local', 'handoff-local']);
+        });
+
+        it('leaves handed-off and raw-queued malformed-action rows out of the actionable rows', async () => {
+            mockGet.mockResolvedValueOnce({
+                data: {
+                    pending: [
+                        handoffRow,
+                        serverPendingRow({ localId: 'queued-local', deliveryStatus: { status: 'queued' } }),
+                        serverPendingRow({
+                            localId: 'delivering-local',
+                            deliveryState: 'delivering',
+                            deliveryStatus: { status: 'delivering', detail: 'awaiting_acceptance' },
+                        }),
+                        serverPendingRow({
+                            localId: 'blocked-local',
+                            deliveryState: 'blocked',
+                            deliveryBlockedReason: 'runtime_disposed_before_delivery',
+                            deliveryStatus: { status: 'blocked', reason: 'runtime_disposed_before_delivery' },
+                        }),
+                        { localId: 'legacy-queued-local', status: 'queued', deliveryState: null },
+                        {
+                            ...serverPendingRow({
+                                localId: 'malformed-action-local',
+                                deliveryStatus: { status: 'blocked', reason: 'unsupported_action' },
+                            }),
+                            requestedAction: undefined,
+                            requestedActionMalformed: true,
+                        },
+                        {
+                            ...serverPendingRow({
+                                localId: 'persisted-blocked-malformed-action-local',
+                                deliveryState: 'blocked',
+                                deliveryBlockedReason: 'unsupported_action',
+                                deliveryStatus: { status: 'blocked', reason: 'unsupported_action' },
+                            }),
+                            requestedAction: undefined,
+                            requestedActionMalformed: true,
+                        },
+                    ],
+                },
+            });
+
+            await expect(listPendingQueueV2ActionableLocalIdsFromServer({
+                token: 'token',
+                sessionId: 'session-1',
+            })).resolves.toEqual([
+                'queued-local',
+                'delivering-local',
+                'blocked-local',
+                'legacy-queued-local',
+                'persisted-blocked-malformed-action-local',
+            ]);
+        });
+
+        it('projects the external handoff status, including from persisted fields alone', async () => {
+            mockGet.mockResolvedValueOnce({
+                data: {
+                    pending: [
+                        handoffRow,
+                        { localId: 'legacy-handoff-local', status: 'queued', deliveryState: 'external_handoff' },
+                        serverPendingRow({
+                            localId: 'delivering-local',
+                            deliveryState: 'delivering',
+                            deliveryStatus: { status: 'delivering', detail: 'awaiting_acceptance' },
+                        }),
+                    ],
+                },
+            });
+
+            await expect(listPendingQueueV2DeliveryStatusesFromServer({
+                token: 'token',
+                sessionId: 'session-1',
+            })).resolves.toEqual([
+                { localId: 'handoff-local', status: 'external_handoff' },
+                { localId: 'legacy-handoff-local', status: 'external_handoff' },
+                { localId: 'delivering-local', status: 'delivering' },
+            ]);
+        });
+
+        it('leaves the handed-off row out of this runner\'s provider deliveries', async () => {
+            mockGet.mockResolvedValueOnce({
+                data: {
+                    pending: [
+                        handoffRow,
+                        serverPendingRow({
+                            localId: 'delivering-local',
+                            deliveryState: 'delivering',
+                            deliveryStatus: { status: 'delivering', detail: 'awaiting_acceptance' },
+                        }),
+                    ],
+                },
+            });
+
+            await expect(listPendingQueueV2ProviderDeliveryLocalIdsFromServer({
+                token: 'token',
+                sessionId: 'session-1',
+            })).resolves.toEqual(['delivering-local']);
+        });
+
+        it('reads a blocked row beside it and reports the handed-off row as not blocked', async () => {
+            const pending = [
+                handoffRow,
+                serverPendingRow({
+                    localId: 'blocked-local',
+                    deliveryState: 'blocked',
+                    deliveryBlockedReason: 'runtime_disposed_before_delivery',
+                    deliveryStatus: { status: 'blocked', reason: 'runtime_disposed_before_delivery' },
+                }),
+            ];
+            mockGet.mockResolvedValueOnce({ data: { pending } });
+            await expect(readBlockedPendingQueueV2DeliveryByLocalIdFromServer({
+                token: 'token',
+                sessionId: 'session-1',
+                localId: 'blocked-local',
+            })).resolves.toEqual({ localId: 'blocked-local', reason: 'runtime_disposed_before_delivery' });
+
+            mockGet.mockResolvedValueOnce({ data: { pending } });
+            await expect(readBlockedPendingQueueV2DeliveryByLocalIdFromServer({
+                token: 'token',
+                sessionId: 'session-1',
+                localId: 'handoff-local',
+            })).resolves.toBeNull();
+        });
+
+        it('activates a queued send-now row beside it but never the handed-off row', async () => {
+            const pending = [
+                handoffRow,
+                serverPendingRow({
+                    localId: 'send-now-local',
+                    requestedAction: { v: 1, kind: 'send_now' },
+                    deliveryStatus: { status: 'queued' },
+                }),
+            ];
+            mockGet.mockResolvedValueOnce({ data: { pending } });
+            await expect(readPendingQueueV2ActivationEligibilityFromServer({
+                token: 'token', sessionId: 'session-1', requestId: 'send-now-local',
+            })).resolves.toBe('eligible');
+
+            mockGet.mockResolvedValueOnce({ data: { pending } });
+            await expect(readPendingQueueV2ActivationEligibilityFromServer({
+                token: 'token', sessionId: 'session-1', requestId: 'handoff-local',
+            })).resolves.toBe('ineligible');
+        });
+    });
+
     it('posts explicit handled resolution to the dedicated pending route', async () => {
         mockPost.mockResolvedValueOnce({
             data: {
                 ok: true,
                 pendingCount: 0,
+                pendingBlockedCount: 0,
                 pendingVersion: 12,
             },
         });
@@ -1905,6 +2192,7 @@ describe('pendingQueueV2Transport', () => {
                 pendingVersion: 12,
                 pendingBlockedCount: 0,
             },
+            transcriptMessage: null,
         });
 
         expect(mockPost).toHaveBeenCalledWith(
@@ -1914,5 +2202,298 @@ describe('pendingQueueV2Transport', () => {
                 headers: expect.objectContaining({ Authorization: 'Bearer token' }),
             }),
         );
+    });
+
+    it('returns the committed transcript message as the handled resolution proof', async () => {
+        mockPost.mockResolvedValueOnce({
+            data: {
+                ok: true,
+                pendingCount: 2,
+                pendingBlockedCount: 0,
+                pendingVersion: 13,
+                message: {
+                    id: 'message-9',
+                    seq: 41,
+                    localId: ' local-1 ',
+                    content: { t: 'plain', v: 'hello' },
+                    deliveryResolution: { v: 1, kind: 'manual_handled' },
+                    createdAt: 1,
+                    updatedAt: 2,
+                },
+            },
+        });
+
+        await expect(markPendingQueueV2DeliveryHandled({
+            token: 'token',
+            sessionId: 'session-1',
+            localId: ' local-1 ',
+        })).resolves.toEqual({
+            pendingQueueState: { known: true, pendingCount: 2, pendingBlockedCount: 0, pendingVersion: 13 },
+            transcriptMessage: {
+                id: 'message-9',
+                seq: 41,
+                localId: ' local-1 ',
+                deliveryResolution: { v: 1, kind: 'manual_handled' },
+            },
+        });
+        expect(mockPost).toHaveBeenCalledTimes(1);
+        expect(mockPost).toHaveBeenCalledWith(
+            expect.stringContaining('/v2/sessions/session-1/pending/%20local-1%20/delivery/handled'),
+            {},
+            expect.any(Object),
+        );
+    });
+
+    it.each([
+        ['another local id', { id: 'message-9', seq: 41, localId: 'local-2', deliveryResolution: { v: 1, kind: 'manual_handled' } }],
+        ['no manual resolution', { id: 'message-9', seq: 41, localId: 'local-1' }],
+        ['a negative sequence', { id: 'message-9', seq: -1, localId: 'local-1', deliveryResolution: { v: 1, kind: 'manual_handled' } }],
+        ['a blank message id', { id: ' ', seq: 41, localId: 'local-1', deliveryResolution: { v: 1, kind: 'manual_handled' } }],
+    ])('treats a handled response whose message has %s as an unreadable response', async (_case, message) => {
+        mockPost.mockResolvedValueOnce({
+            data: { ok: true, pendingCount: 2, pendingBlockedCount: 0, pendingVersion: 13, message },
+        });
+
+        await expect(markPendingQueueV2DeliveryHandled({
+            token: 'token',
+            sessionId: 'session-1',
+            localId: 'local-1',
+        })).rejects.toMatchObject({ code: 'invalid_response_shape' });
+        expect(mockPost).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns a validated committed transcript message as resolved even without queue counts', async () => {
+        mockPost.mockResolvedValueOnce({
+            data: {
+                ok: true,
+                message: { id: 'message-9', seq: 41, localId: 'local-1', deliveryResolution: { v: 1, kind: 'manual_handled' } },
+            },
+        });
+
+        await expect(markPendingQueueV2DeliveryHandled({
+            token: 'token',
+            sessionId: 'session-1',
+            localId: 'local-1',
+        })).resolves.toEqual({
+            transcriptMessage: {
+                id: 'message-9',
+                seq: 41,
+                localId: 'local-1',
+                deliveryResolution: { v: 1, kind: 'manual_handled' },
+            },
+        });
+        expect(mockPost).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+        ['nothing but ok', { ok: true }],
+        ['no pending count', { ok: true, pendingBlockedCount: 0, pendingVersion: 13 }],
+        ['no blocked count', { ok: true, pendingCount: 2, pendingVersion: 13 }],
+        ['no pending version', { ok: true, pendingCount: 2, pendingBlockedCount: 0 }],
+        ['a negative pending count', { ok: true, pendingCount: -1, pendingBlockedCount: 0, pendingVersion: 13 }],
+        ['a fractional blocked count', { ok: true, pendingCount: 2, pendingBlockedCount: 0.5, pendingVersion: 13 }],
+        ['a string pending version', { ok: true, pendingCount: 2, pendingBlockedCount: 0, pendingVersion: '13' }],
+    ])('treats a handled response without a message and with %s as an unreadable response', async (_case, data) => {
+        mockPost.mockResolvedValueOnce({ data });
+
+        await expect(markPendingQueueV2DeliveryHandled({
+            token: 'token',
+            sessionId: 'session-1',
+            localId: 'local-1',
+        })).rejects.toMatchObject({ code: 'invalid_response_shape' });
+        expect(mockPost).toHaveBeenCalledTimes(1);
+    });
+
+    it('marks unreadable delivery-action success bodies with the invalid-response code', async () => {
+        mockPost.mockResolvedValueOnce({ data: 'not-json' });
+        await expect(markPendingQueueV2DeliveryHandled({
+            token: 'token', sessionId: 'session-1', localId: 'local-1',
+        })).rejects.toMatchObject({
+            code: 'invalid_response_shape',
+            message: 'Invalid pending delivery handled response',
+        });
+
+        mockPost.mockResolvedValueOnce({ data: { ok: false, error: 'internal' } });
+        await expect(markPendingQueueV2DeliveryHandled({
+            token: 'token', sessionId: 'session-1', localId: 'local-1',
+        })).rejects.toMatchObject({
+            code: 'invalid_response_shape',
+            message: 'Pending delivery handled failed: internal',
+        });
+    });
+
+    it('keeps block settlement failures uncoded so their retry classification is unchanged', async () => {
+        mockPost.mockResolvedValueOnce({ data: { ok: false, error: 'internal' } });
+
+        const failure = await blockPendingQueueV2Delivery({
+            token: 'token', sessionId: 'session-1', localId: 'local-1', reason: 'payload_too_large',
+        }).then(() => null, (error: unknown) => error);
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).message).toBe('Pending delivery block failed: internal');
+        expect((failure as { code?: unknown }).code).toBeUndefined();
+    });
+
+    it('surfaces a handled transcript conflict with its HTTP status and server error after one POST', async () => {
+        mockPost.mockRejectedValueOnce({
+            isAxiosError: true,
+            response: { status: 409, data: { error: 'transcript-conflict' } },
+        });
+
+        await expect(markPendingQueueV2DeliveryHandled({
+            token: 'token',
+            sessionId: 'session-1',
+            localId: 'local-1',
+        })).rejects.toMatchObject({
+            response: { status: 409, data: { error: 'transcript-conflict' } },
+        });
+        expect(mockPost).toHaveBeenCalledTimes(1);
+    });
+
+    it('reads exact pending row snapshots, including external handoff rows and their positions', async () => {
+        mockGet.mockResolvedValueOnce({
+            data: {
+                pending: [
+                    {
+                        localId: 'blocked-1',
+                        status: 'queued',
+                        deliveryState: 'blocked',
+                        deliveryBlockedReason: 'delivery_outcome_uncertain',
+                        deliveryStatus: { status: 'blocked', reason: 'delivery_outcome_uncertain' },
+                        position: 0,
+                    },
+                    {
+                        localId: 'handoff-1',
+                        status: 'queued',
+                        deliveryState: 'external_handoff',
+                        deliveryStatus: { status: 'external_handoff' },
+                        position: 1,
+                    },
+                    {
+                        localId: 'delivering-1',
+                        status: 'queued',
+                        deliveryState: 'delivering',
+                        deliveryStatus: { status: 'delivering', detail: 'custody_observed' },
+                        position: 2,
+                    },
+                    { localId: 'queued-1', status: 'queued', deliveryStatus: { status: 'queued' }, position: 3 },
+                    {
+                        localId: 'future-1',
+                        status: 'queued',
+                        deliveryState: 'blocked',
+                        deliveryBlockedReason: 'future_reason',
+                        deliveryStatus: { status: 'blocked', reason: 'unknown' },
+                        position: 4,
+                    },
+                ],
+            },
+        });
+
+        await expect(readPendingQueueV2RowSnapshotsFromServer({
+            token: 'token',
+            sessionId: 'session/with spaces',
+        })).resolves.toEqual([
+            { localId: 'blocked-1', status: 'queued', deliveryState: 'blocked', deliveryBlockedReason: 'delivery_outcome_uncertain', position: 0 },
+            { localId: 'handoff-1', status: 'queued', deliveryState: 'external_handoff', deliveryBlockedReason: null, position: 1 },
+            { localId: 'delivering-1', status: 'queued', deliveryState: 'delivering', deliveryBlockedReason: null, position: 2 },
+            { localId: 'queued-1', status: 'queued', deliveryState: null, deliveryBlockedReason: null, position: 3 },
+            { localId: 'future-1', status: 'queued', deliveryState: 'blocked', deliveryBlockedReason: 'future_reason', position: 4 },
+        ]);
+        expect(mockGet).toHaveBeenCalledWith(
+            expect.stringContaining('/v2/sessions/session%2Fwith%20spaces/pending'),
+            expect.objectContaining({
+                headers: expect.objectContaining({ Authorization: 'Bearer token' }),
+                timeout: 10_000,
+            }),
+        );
+    });
+
+    it('reads the server projection of an unreadable requested action with the persisted fields unchanged', async () => {
+        // mapPendingMessageRow reports a non-discarded row whose stored requested action it cannot
+        // parse as blocked `unsupported_action` in the typed status, while the persisted fields
+        // keep what is stored.
+        const unsupportedAction = { status: 'blocked', reason: 'unsupported_action' };
+        mockGet.mockResolvedValueOnce({
+            data: {
+                pending: [
+                    {
+                        localId: 'queued-malformed',
+                        requestedActionMalformed: true,
+                        status: 'queued',
+                        deliveryStatus: unsupportedAction,
+                        position: 0,
+                        discardedReason: null,
+                    },
+                    {
+                        localId: 'blocked-malformed',
+                        requestedActionMalformed: true,
+                        status: 'queued',
+                        deliveryState: 'blocked',
+                        deliveryBlockedReason: 'future_reason',
+                        deliveryStatus: unsupportedAction,
+                        position: 1,
+                        discardedReason: null,
+                    },
+                    {
+                        localId: 'delivering-malformed',
+                        requestedActionMalformed: true,
+                        status: 'queued',
+                        deliveryState: 'delivering',
+                        deliveryStatus: unsupportedAction,
+                        position: 2,
+                        discardedReason: null,
+                    },
+                    {
+                        localId: 'discarded-malformed',
+                        requestedActionMalformed: true,
+                        status: 'discarded',
+                        deliveryStatus: { status: 'discarded', reason: 'user_discarded' },
+                        position: 3,
+                        discardedReason: 'user_discarded',
+                    },
+                ],
+            },
+        });
+
+        await expect(readPendingQueueV2RowSnapshotsFromServer({
+            token: 'token',
+            sessionId: 'session-1',
+        })).resolves.toEqual([
+            { localId: 'queued-malformed', status: 'queued', deliveryState: null, deliveryBlockedReason: null, position: 0 },
+            { localId: 'blocked-malformed', status: 'queued', deliveryState: 'blocked', deliveryBlockedReason: 'future_reason', position: 1 },
+            { localId: 'delivering-malformed', status: 'queued', deliveryState: 'delivering', deliveryBlockedReason: null, position: 2 },
+            { localId: 'discarded-malformed', status: 'discarded', deliveryState: null, deliveryBlockedReason: null, position: 3 },
+        ]);
+    });
+
+    it.each([
+        ['missing pending list', {}],
+        ['blank local id', { pending: [{ localId: ' ', status: 'queued', position: 0 }] }],
+        ['missing position', { pending: [{ localId: 'a', status: 'queued' }] }],
+        ['unknown row status', { pending: [{ localId: 'a', status: 'future', position: 0 }] }],
+        ['unknown delivery state', { pending: [{ localId: 'a', status: 'queued', deliveryState: 'future', position: 0 }] }],
+        ['blocked reason without blocked state', {
+            pending: [{ localId: 'a', status: 'queued', deliveryState: 'delivering', deliveryBlockedReason: 'unknown', position: 0 }],
+        }],
+        ['a typed status the protocol cannot read', {
+            pending: [{
+                localId: 'a', status: 'queued', deliveryState: 'external_handoff', deliveryStatus: { status: 'future' }, position: 0,
+            }],
+        }],
+        ['no typed status and persisted fields that are not a persisted status', {
+            pending: [{ localId: 'a', status: 'queued', deliveryState: 'blocked', discardedReason: 'resent_as_new', position: 0 }],
+        }],
+        ['duplicate local id', {
+            pending: [
+                { localId: 'a', status: 'queued', deliveryState: 'blocked', position: 0 },
+                { localId: 'a', status: 'queued', deliveryState: 'blocked', position: 1 },
+            ],
+        }],
+    ])('rejects a pending row snapshot with %s', async (_case, data) => {
+        mockGet.mockResolvedValueOnce({ data });
+
+        await expect(readPendingQueueV2RowSnapshotsFromServer({
+            token: 'token',
+            sessionId: 'session-1',
+        })).rejects.toMatchObject({ code: 'invalid_response_shape' });
     });
 });

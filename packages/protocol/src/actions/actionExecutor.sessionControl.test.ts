@@ -647,6 +647,85 @@ describe('createActionExecutor (session control)', () => {
     });
   });
 
+  it('executes pending-input mark-handled through protocol deps with the exact expectation', async () => {
+    const sessionPendingInputMarkHandled = vi.fn(async () => ({ outcome: 'refused' }));
+    const executor = createExecutor({
+      sessionPendingInputMarkHandled,
+      resolveServerIdForSessionId: (sessionId) => sessionId === 's1' ? 'server-a' : null,
+    });
+
+    await expect(executor.execute(
+      'session.pendingInput.markHandled',
+      {
+        sessionId: 's1',
+        localId: ' local-1 ',
+        expectedDeliveryState: 'blocked',
+        expectedBlockedReason: 'ambiguous_terminal_delivery',
+      },
+      { surface: 'cli' },
+    )).resolves.toEqual({ ok: true, result: { outcome: 'refused' } });
+    expect(sessionPendingInputMarkHandled).toHaveBeenCalledWith({
+      sessionId: 's1',
+      localId: ' local-1 ',
+      expectedDeliveryState: 'blocked',
+      expectedBlockedReason: 'ambiguous_terminal_delivery',
+      serverId: 'server-a',
+    });
+
+    sessionPendingInputMarkHandled.mockClear();
+    await executor.execute(
+      'session.pendingInput.markHandled',
+      { sessionId: 's2', localId: 'local-2', expectedDeliveryState: 'external_handoff' },
+      { surface: 'cli' },
+    );
+    expect(sessionPendingInputMarkHandled).toHaveBeenCalledWith({
+      sessionId: 's2',
+      localId: 'local-2',
+      expectedDeliveryState: 'external_handoff',
+    });
+  });
+
+  it('rejects pending-input mark-handled without an expected state before reaching deps', async () => {
+    const sessionPendingInputMarkHandled = vi.fn(async () => ({}));
+    const executor = createExecutor({ sessionPendingInputMarkHandled });
+
+    await expect(executor.execute(
+      'session.pendingInput.markHandled',
+      { sessionId: 's1', localId: 'local-1' },
+      { surface: 'cli' },
+    )).resolves.toEqual({ ok: false, errorCode: 'invalid_parameters', error: 'invalid_parameters' });
+    expect(sessionPendingInputMarkHandled).not.toHaveBeenCalled();
+  });
+
+  it('fails pending-input mark-handled closed when deps are unavailable', async () => {
+    const executor = createExecutor();
+
+    await expect(executor.execute(
+      'session.pendingInput.markHandled',
+      { sessionId: 's1', localId: 'local-1', expectedDeliveryState: 'delivering' },
+      { surface: 'cli' },
+    )).resolves.toEqual({
+      ok: false,
+      errorCode: 'unsupported_action',
+      error: 'unsupported_action:session.pendingInput.markHandled',
+    });
+  });
+
+  it('keeps pending-input mark-handled off the session-agent and MCP surfaces', async () => {
+    const sessionPendingInputMarkHandled = vi.fn(async () => ({}));
+    const executor = createExecutor({ sessionPendingInputMarkHandled });
+
+    for (const surface of ['session_agent', 'mcp'] as const) {
+      const res = await executor.execute(
+        'session.pendingInput.markHandled',
+        { sessionId: 's1', localId: 'local-1', expectedDeliveryState: 'delivering' },
+        { surface },
+      );
+      expect(res.ok).toBe(false);
+    }
+    expect(sessionPendingInputMarkHandled).not.toHaveBeenCalled();
+  });
+
   it('executes vendor plugin and skill catalog list actions through protocol deps', async () => {
     const sessionVendorPluginCatalogList = vi.fn(async () => ({ vendorPlugins: [] }));
     const sessionSkillCatalogList = vi.fn(async () => ({ skills: [] }));

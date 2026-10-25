@@ -23,6 +23,11 @@ export interface TrackedSession {
   startedBy: 'daemon' | string;
   happySessionId?: string;
   happySessionMetadataFromLocalWebhook?: Metadata;
+  /**
+   * Publisher incarnation the runner reported on `/session-started` (in-memory only). The daemon's
+   * exit report names it so the server retires exactly this runner's publisher fence.
+   */
+  publisherIncarnationId?: string;
   /** Spawn options used to start the current runner process (in-memory only). */
   spawnOptions?: SpawnSessionOptions;
   /** Vendor resume id (e.g. Claude/Codex session id) supplied/derived at spawn time. */

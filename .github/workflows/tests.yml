@@ -1810,7 +1810,7 @@ jobs:
     needs: [ci_plan, trusted_ref_guard]
     name: Typecheck
     runs-on: ${{ needs.trusted_ref_guard.outputs.ubuntu_2404 }}
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262

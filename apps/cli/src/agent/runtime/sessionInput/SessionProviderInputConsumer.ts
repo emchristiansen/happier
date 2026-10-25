@@ -40,6 +40,7 @@ export interface SessionProviderInputConsumerSession {
   waitForProviderInputAdmission: (abortSignal: AbortSignal) => Promise<boolean>;
   materializeNextPendingMessageSafely: (opts?: MaterializeNextPendingOptions) => Promise<PendingMaterializationResult>;
   shouldAttemptPendingMaterialization?: ((opts?: {
+    requestedLocalId?: string;
     activeTurnSteerability?: PendingForegroundSteerability;
     pendingQueueDeliveryTiming?: PendingQueueDeliveryTiming;
   }) => boolean) | undefined;
@@ -82,7 +83,7 @@ function buildMaterializeOptions(
     ...(activeTurnSteerability ? { activeTurnSteerability } : {}),
     ...(pendingQueueDeliveryTiming ? { pendingQueueDeliveryTiming } : {}),
     ...(expectedRuntimeActivityRevision !== undefined ? { expectedRuntimeActivityRevision } : {}),
-    ...(requestedLocalId ? { requestedLocalId } : {}),
+    ...(requestedLocalId !== undefined ? { requestedLocalId } : {}),
   };
 }
 
@@ -163,11 +164,14 @@ function readPendingQueueDeliveryTiming(opts: {
 function buildAttemptOptions(
   activeTurnSteerability: PendingForegroundSteerability | undefined,
   pendingQueueDeliveryTiming: PendingQueueDeliveryTiming | undefined,
+  requestedLocalId?: string,
 ): {
+  requestedLocalId?: string;
   activeTurnSteerability?: PendingForegroundSteerability;
   pendingQueueDeliveryTiming?: PendingQueueDeliveryTiming;
 } {
   return {
+    ...(requestedLocalId !== undefined ? { requestedLocalId } : {}),
     ...(activeTurnSteerability ? { activeTurnSteerability } : {}),
     ...(pendingQueueDeliveryTiming ? { pendingQueueDeliveryTiming } : {}),
   };
@@ -758,7 +762,7 @@ async function drainPendingMessages(
 
       const activeTurnSteerability = readActiveTurnSteerability(opts);
       const pendingQueueDeliveryTiming = readPendingQueueDeliveryTiming(opts);
-      const attemptOpts = buildAttemptOptions(activeTurnSteerability, pendingQueueDeliveryTiming);
+      const attemptOpts = buildAttemptOptions(activeTurnSteerability, pendingQueueDeliveryTiming, opts.requestedLocalId);
       const canMaterialize = opts.session.shouldAttemptPendingMaterialization?.(attemptOpts) ?? true;
       if (!canMaterialize) {
         await opts.session.reconcilePendingQueueState?.({ force: true });

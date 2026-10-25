@@ -39,7 +39,7 @@ export async function runCodexLocalModePass<Mode extends QueueModeWithLocalId>(o
   let cachedServerPendingCount: number | null = null;
   const getServerPendingCount = async (): Promise<number> => {
     if (cachedServerPendingCount !== null) return cachedServerPendingCount;
-    cachedServerPendingCount = (await opts.session.listPendingMessageQueueV2LocalIds()).length;
+    cachedServerPendingCount = (await opts.session.listActionablePendingMessageQueueV2LocalIds()).length;
     return cachedServerPendingCount;
   };
 

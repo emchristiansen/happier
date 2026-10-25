@@ -32,7 +32,7 @@ function createSessionClientStub(): SessionClientPort {
     waitForMetadataUpdate: vi.fn(async () => false),
     waitForPendingEligibilityUpdate: vi.fn(async () => false),
     popPendingMessage: vi.fn(async () => false),
-    peekPendingMessageQueueV2Count: vi.fn(async () => 0),
+    peekActionablePendingMessageQueueV2Count: vi.fn(async () => 0),
     discardPendingMessageQueueV2All: vi.fn(async () => 0),
     discardCommittedMessageLocalIds: vi.fn(async () => 0),
     updateMetadata: vi.fn(async () => {}),

@@ -142,6 +142,16 @@ const EMPTY_AUTH_UPDATED_APPLICATION_RESULT: ConnectedServiceAuthUpdatedApplicat
 });
 
 /**
+ * A credential refresh result and whether its rotation's distribution has finished. `in_flight`
+ * means the caller adopted another caller's persisted rotation (`credentialReady`) while that
+ * rotation's distribution, `onAuthUpdated` included, was still running.
+ */
+type OauthBindingRefreshOutcome = Readonly<{
+  result: ConnectedServiceCredentialRefreshResult;
+  distribution: 'settled' | 'in_flight';
+}>;
+
+/**
  * A forced caller may adopt an already-in-flight refresh only when that refresh actually
  * exercised (or attempted) a rotation. A `not_needed` early-return performed no rotation, so a
  * forced caller must still run its own refresh; every other outcome is either a real rotation or a
@@ -790,15 +800,21 @@ export class ConnectedServiceRefreshCoordinator {
     sessionId?: string | null;
   }>): Promise<ConnectedServiceRuntimeAuthCredentialRefreshResult> {
     const binding = { serviceId: input.serviceId, profileId: input.profileId } satisfies BoundProfile;
-    const result = await this.refreshOauthBinding(
+    // The runtime-auth caller holds its session's auth lock. A rotation already in flight
+    // distributes through `onAuthUpdated`, which needs that lock, so this caller adopts the
+    // rotation's persisted credential instead of awaiting its distribution (incident 2026-10-22).
+    const outcome = await this.refreshOauthBindingOutcome(
       binding,
       this.params.now(),
-      { force: true, reason: 'runtime_auth_failure' },
+      { force: true, reason: 'runtime_auth_failure', adoptCredentialReadyFromInFlightRefresh: true },
     );
+    const result = outcome.result;
     if (result.status !== 'refreshed') return result;
 
-    const rematerialization = this.lastRefreshedDistributionByKey.get(bindingKey(binding))
-      ?? await this.rematerializeTargetsForBindingAfterRefresh(binding);
+    // An adopted rotation has not recorded its distribution yet; the recorded one is older.
+    const rematerialization = (
+      outcome.distribution === 'settled' ? this.lastRefreshedDistributionByKey.get(bindingKey(binding)) : undefined
+    ) ?? await this.rematerializeTargetsForBindingAfterRefresh(binding);
     const targetFailures = resolveRuntimeAuthRematerializationFailures({
       result: rematerialization,
       sessionId: input.sessionId ?? null,
@@ -835,13 +851,46 @@ export class ConnectedServiceRefreshCoordinator {
     }
     if (rematerialization.rematerializedTargets.length > 0) {
       const refreshedRevision = ConnectedServiceCredentialRevisionV1Schema.safeParse(result.credentialRevision);
-      await this.notifyAuthUpdatedForRefreshedBinding(
-        binding,
-        refreshedRevision.success ? refreshedRevision.data : null,
-        rematerialization.rematerializedTargets,
-      );
+      const credentialRevision = refreshedRevision.success ? refreshedRevision.data : null;
+      if (outcome.distribution === 'settled') {
+        await this.notifyAuthUpdatedForRefreshedBinding(
+          binding,
+          credentialRevision,
+          rematerialization.rematerializedTargets,
+        );
+      } else {
+        await this.applyAdoptedRotationToRuntimeAuthSession({
+          binding,
+          credentialRevision,
+          rematerializedTargets: rematerialization.rematerializedTargets,
+          sessionId: input.sessionId ?? null,
+        });
+      }
     }
     return result;
+  }
+
+  /**
+   * The adopted rotation's own distribution applies the credential to every bound session and
+   * advances registry revisions. This caller holds its session's auth lock, so it applies the
+   * credential to that session alone, directly: joining the distribution's shared notification
+   * would wait on the lock this caller holds.
+   */
+  private async applyAdoptedRotationToRuntimeAuthSession(input: Readonly<{
+    binding: BoundProfile;
+    credentialRevision: ConnectedServiceCredentialRevisionV1 | null;
+    rematerializedTargets: ReadonlyArray<SpawnTarget>;
+    sessionId: string | null;
+  }>): Promise<void> {
+    if (!input.sessionId || !this.params.onAuthUpdated) return;
+    const sessionTargets = input.rematerializedTargets.filter((target) => target.sessionId === input.sessionId);
+    if (sessionTargets.length === 0) return;
+    await this.params.onAuthUpdated({
+      binding: input.binding,
+      affectedTargets: sessionTargets,
+      credentialRevision: input.credentialRevision,
+      trigger: 'refresh_triggered_restart',
+    });
   }
 
   private async didRegisteredRuntimeAuthSessionAdvanceToAnotherGroupMember(input: Readonly<{
@@ -1072,13 +1121,26 @@ export class ConnectedServiceRefreshCoordinator {
       adoptCredentialReadyFromInFlightRefresh?: boolean;
     }>,
   ): Promise<ConnectedServiceCredentialRefreshResult> {
+    return (await this.refreshOauthBindingOutcome(binding, now, options)).result;
+  }
+
+  private async refreshOauthBindingOutcome(
+    binding: BoundProfile,
+    now: number,
+    options: Readonly<{
+      force: boolean;
+      reason: ConnectedServiceRefreshReason;
+      adoptCredentialReadyFromInFlightRefresh?: boolean;
+    }>,
+  ): Promise<OauthBindingRefreshOutcome> {
     // Coalesce + serialize the credential rotation per `{serviceId, profileId}` binding (NOT split on
     // `force`). Downstream distribution is deliberately tracked as a separate completion: a restarted
     // runner's spawn preflight may need the credential that the owner has already persisted while that
     // same owner is waiting for the runner to respawn before distribution can finish. Making the
     // credential-ready result wait on distribution creates a circular wait and poisons the daemon's
     // global spawn gate. The initiating caller still owns and awaits the one distribution transaction;
-    // only a joining spawn preflight may adopt the already-persisted rotation early.
+    // a joining spawn preflight or runtime-auth recovery adopts the already-persisted rotation early.
+    // Runtime-auth recovery holds its session's auth lock, which the distribution needs.
     const key = bindingKey(binding);
     while (true) {
       const existing = this.inFlightRefreshes.get(key);
@@ -1090,8 +1152,8 @@ export class ConnectedServiceRefreshCoordinator {
         if (inFlightResultSatisfiesCaller(observed, options)) {
           this.observeScheduledStage(binding, 'credential_refresh_completion');
           return options.adoptCredentialReadyFromInFlightRefresh === true && observed.status === 'refreshed'
-            ? observed
-            : await existing.completion;
+            ? { result: observed, distribution: 'in_flight' }
+            : { result: await existing.completion, distribution: 'settled' };
         }
         // Preserve the existing serialized forced-after-non-forced contract: health persistence and
         // any non-rotation completion work settle before the forced retry re-reads canonical state.
@@ -1108,7 +1170,7 @@ export class ConnectedServiceRefreshCoordinator {
       const inFlight = { credentialReady, completion } as const;
       this.inFlightRefreshes.set(key, inFlight);
       try {
-        return await completion;
+        return { result: await completion, distribution: 'settled' };
       } finally {
         if (this.inFlightRefreshes.get(key) === inFlight) {
           this.inFlightRefreshes.delete(key);

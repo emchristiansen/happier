@@ -254,20 +254,29 @@ describe('SessionProviderInputConsumer drainPending', () => {
     expect(bindings.get('L')).toBe(newer);
   });
 
-  it('passes an exact requested localId through one canonical drain pass', async () => {
+  it('passes an opaque exact selector through both preflights and the canonical drain', async () => {
     const materializeNextPendingMessageSafely = vi.fn(async () => ({ type: 'no_pending' as const }));
+    const shouldAttemptPendingMaterialization = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+    const reconcilePendingQueueState = vi.fn(async () => {});
     const consumer = createDrainConsumer({
+      shouldAttemptPendingMaterialization,
+      reconcilePendingQueueState,
       materializeNextPendingMessageSafely,
       waitForPendingEligibilityUpdate: async () => false,
     });
 
-    await expect(consumer.drainPending({ requestedLocalId: 'urgent-local', reason: 'exact-steer' })).resolves.toEqual({
+    await expect(consumer.drainPending({ requestedLocalId: ' urgent-local ', reason: 'exact-steer' })).resolves.toEqual({
       materialized: 0,
       stoppedReason: 'no_pending',
     });
+    expect(shouldAttemptPendingMaterialization).toHaveBeenCalledTimes(2);
+    for (const [attempt] of shouldAttemptPendingMaterialization.mock.calls) {
+      expect(attempt).toMatchObject({ requestedLocalId: ' urgent-local ' });
+    }
+    expect(reconcilePendingQueueState).toHaveBeenCalledWith({ force: true });
     expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(1);
     expect(materializeNextPendingMessageSafely).toHaveBeenCalledWith(expect.objectContaining({
-      requestedLocalId: 'urgent-local',
+      requestedLocalId: ' urgent-local ',
       reconcileWhenEmpty: 'force',
     }));
   });

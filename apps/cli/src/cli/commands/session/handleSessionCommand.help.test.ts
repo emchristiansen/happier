@@ -19,6 +19,8 @@ describe('handleSessionCommand help output', () => {
       expect(output.text()).toContain('happier session wait <session-id-or-prefix-or-tag> [--timeout <seconds>] [--json]');
       expect(output.text()).toContain('happier session stop <session-id-or-prefix-or-tag> [--json]');
       expect(output.text()).toContain('happier session set-title <session-id-or-prefix-or-tag> <title> [--json]');
+      expect(output.text()).toContain('happier session folders [--session <session-id-or-prefix-or-tag>] [--json]');
+      expect(output.text()).toContain('happier session set-folder <session-id-or-prefix-or-tag> (<folder-id> | --none) [--json]');
       expect(output.text()).toContain('happier session set-permission-mode <session-id-or-prefix-or-tag> <mode> [--json]');
       expect(output.text()).toContain('happier session set-model <session-id-or-prefix-or-tag> <model-id> [--json]');
       expect(output.text()).toContain('happier session archive <session-id-or-prefix-or-tag> [--json]');
@@ -51,6 +53,8 @@ describe('handleSessionCommand help output', () => {
     [['stop', '--help'], 'happier session stop <session-id-or-prefix-or-tag>'],
     [['history', '--help'], 'happier session history <session-id-or-prefix-or-tag>'],
     [['set-title', '--help'], 'happier session set-title <session-id-or-prefix-or-tag> <title>'],
+    [['folders', '--help'], 'happier session folders [--session <session-id-or-prefix-or-tag>]'],
+    [['set-folder', '--help'], 'happier session set-folder <session-id-or-prefix-or-tag> (<folder-id> | --none)'],
     [['set-permission-mode', '--help'], 'happier session set-permission-mode <session-id-or-prefix-or-tag> <mode>'],
     [['set-model', '--help'], 'happier session set-model <session-id-or-prefix-or-tag> <model-id>'],
     [['archive', '--help'], 'happier session archive <session-id-or-prefix-or-tag>'],
