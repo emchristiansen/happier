@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -29,7 +30,14 @@ import { ConnectedServiceAuthGroupQuotaProbeIncompleteError } from './connectedS
 import { isConnectedServiceUxDiagnosticSpawnErrorDetail } from '@happier-dev/protocol';
 import { UsageLimitRecoveryScheduler } from './connectedServices/usageLimitRecovery/UsageLimitRecoveryScheduler';
 import { RuntimeAuthRecoveryScheduler } from './connectedServices/runtimeAuth/RuntimeAuthRecoveryScheduler';
+import {
+  ConnectedServiceSessionAuthSwitchAcquisitionError,
+  ConnectedServiceSessionAuthSwitchLockRegistry,
+} from './connectedServices/runtimeAuth/connectedServiceSessionAuthSwitchCore';
 import { TemporaryThrottleRecoveryScheduler } from './connectedServices/temporaryThrottle/TemporaryThrottleRecoveryScheduler';
+import { handleConnectedServiceRuntimeAuthFailure } from './connectedServices/runtimeAuth/handleConnectedServiceRuntimeAuthFailure';
+import { buildRuntimeAuthRecoveryKey } from './connectedServices/runtimeAuth/recoveryKey/runtimeAuthRecoveryKey';
+import type { ConnectedServiceRuntimeFailureClassification } from './connectedServices/runtimeAuth/types';
 import type { StopSessionResult } from './sessions/stopSessionContract';
 import type { TerminalHostAdapter } from '@/integrations/terminalHost/_types';
 import type { TerminalAttachmentInfo } from '@/terminal/attachment/terminalAttachmentInfo';
@@ -46,6 +54,7 @@ type StopSessionOptions = import('./sessions/stopSession').StopSessionOptions;
 type CallSessionRpc = typeof callSessionRpc;
 type ReadProcessRunState = typeof import('./processRunState').readProcessRunState;
 type ReadSessionRunnerLockStatus = typeof import('./sessionRunnerLock').readSessionRunnerLockStatus;
+type SendSessionMessage = typeof import('@/session/services/sendSessionMessage').sendSessionMessage;
 
 function createRegisteredMachine(machineId: string) {
   return {
@@ -203,6 +212,11 @@ const pendingMaterializationRpcMocks = vi.hoisted(() => {
     })),
   };
 });
+// Pending admission is the network edge of a continuation. Other daemon paths keep the real sender.
+const continuationAdmissionMocks = vi.hoisted(() => ({
+  actualSendSessionMessage: null as SendSessionMessage | null,
+  sendSessionMessage: vi.fn<SendSessionMessage>(),
+}));
 const stopSessionMocks = vi.hoisted(() => {
   const stopSession = vi.fn<(_: string, __?: StopSessionOptions) => Promise<StopSessionResult>>(async () => ({ status: 'stopped' }));
   return {
@@ -243,6 +257,7 @@ const harness = vi.hoisted(() => {
     terminalStatus?: string;
   }) => Promise<unknown>) | null = null;
   let resolveSpawnSessionByNonceRef: ((spawnNonce: string) => Promise<unknown> | unknown) | null = null;
+  let runtimeAuthRecoverySchedulerRef: import('./connectedServices/runtimeAuth/RuntimeAuthRecoveryScheduler').RuntimeAuthRecoveryScheduler | null = null;
   let pendingSessionActivationHintListenerRef: ((hint: {
     sessionId: string;
     requestId: string;
@@ -302,6 +317,12 @@ const harness = vi.hoisted(() => {
       resolveSpawnSessionByNonceRef = fn;
     },
     getResolveSpawnSessionByNonce: () => resolveSpawnSessionByNonceRef,
+    setRuntimeAuthRecoveryScheduler: (
+      scheduler: import('./connectedServices/runtimeAuth/RuntimeAuthRecoveryScheduler').RuntimeAuthRecoveryScheduler,
+    ) => {
+      runtimeAuthRecoverySchedulerRef = scheduler;
+    },
+    getRuntimeAuthRecoveryScheduler: () => runtimeAuthRecoverySchedulerRef,
     setStopSession: (fn: (sessionId: string) => Promise<import('./sessions/stopSessionContract').StopSessionResult>) => {
       stopSessionRef = fn;
     },
@@ -340,6 +361,7 @@ const harness = vi.hoisted(() => {
       isShuttingDownRef = null;
       turnLifecycleHandlerRef = null;
       resolveSpawnSessionByNonceRef = null;
+      runtimeAuthRecoverySchedulerRef = null;
       pendingSessionActivationHintListenerRef = null;
     },
   };
@@ -686,6 +708,7 @@ vi.mock('./controlServer', () => ({
     isShuttingDown,
     handleConnectedServiceTurnLifecycle,
     resolveSpawnSessionByNonce,
+    runtimeAuthRecoveryScheduler,
   }: {
     spawnSession: (options: any) => Promise<any>;
     stopSession: (sessionId: string) => Promise<import('./sessions/stopSessionContract').StopSessionResult>;
@@ -698,8 +721,12 @@ vi.mock('./controlServer', () => ({
       terminalStatus?: string;
     }) => Promise<unknown>;
     resolveSpawnSessionByNonce?: (spawnNonce: string) => Promise<unknown> | unknown;
+    runtimeAuthRecoveryScheduler?: import('./connectedServices/runtimeAuth/RuntimeAuthRecoveryScheduler').RuntimeAuthRecoveryScheduler;
   }) => {
     harness.setSpawnSession(spawnSession);
+    if (runtimeAuthRecoveryScheduler) {
+      harness.setRuntimeAuthRecoveryScheduler(runtimeAuthRecoveryScheduler);
+    }
     harness.setStopSession(stopSession);
     if (prepareStopSession) {
       harness.setPrepareStopSession(prepareStopSession);
@@ -809,6 +836,13 @@ vi.mock('@/api/session/pendingQueueV2Transport', () => ({
 vi.mock('@/session/transport/rpc/sessionRpc', () => ({
   callSessionRpc: pendingMaterializationRpcMocks.callSessionRpc,
 }));
+
+vi.mock('@/session/services/sendSessionMessage', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/session/services/sendSessionMessage')>();
+  continuationAdmissionMocks.actualSendSessionMessage = actual.sendSessionMessage;
+  continuationAdmissionMocks.sendSessionMessage.mockImplementation(actual.sendSessionMessage);
+  return { ...actual, sendSessionMessage: continuationAdmissionMocks.sendSessionMessage };
+});
 
 vi.mock('@/session/services/resolveSessionTransportContext', () => ({
   resolveSessionTransportContext: pendingMaterializationRpcMocks.resolveSessionTransportContext,
@@ -968,6 +1002,10 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     vi.mocked(fetchSessionsPage).mockResolvedValue({ sessions: [], nextCursor: null, hasNext: false });
     vi.mocked(callSessionRpc).mockClear();
     vi.mocked(resolveSessionTransportContext).mockClear();
+    continuationAdmissionMocks.sendSessionMessage.mockReset();
+    if (continuationAdmissionMocks.actualSendSessionMessage) {
+      continuationAdmissionMocks.sendSessionMessage.mockImplementation(continuationAdmissionMocks.actualSendSessionMessage);
+    }
     stopSessionMocks.createStopSession.mockClear();
     stopSessionMocks.stopSession.mockClear();
     stopSessionMocks.stopSession.mockResolvedValue({ status: 'stopped' });
@@ -3826,6 +3864,10 @@ describe('startDaemon spawn resume wiring (integration)', () => {
       capability: () => Promise<unknown>;
       stopEffect?: 'runner_exits' | 'runner_stays';
       stopResult?: StopSessionResult;
+      /** Runs once the daemon tracks the live runner, in place of an explicit Resume. */
+      drive?: () => Promise<unknown>;
+      /** Runs inside the exact runner Stop, before the runner exits. */
+      duringStop?: () => Promise<void>;
     }>) {
       const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
       sessionRunnerActivityBoundaryMocks.readProcessRunState.mockResolvedValue('servable');
@@ -3843,6 +3885,7 @@ describe('startDaemon spawn resume wiring (integration)', () => {
       });
       // The existing Stop path is the one owner of runner termination; model its effect on presence.
       stopSessionMocks.stopSession.mockImplementation(async () => {
+        await params.duringStop?.();
         if ((params.stopEffect ?? 'runner_exits') === 'runner_exits') {
           sessionRunnerActivityBoundaryMocks.readProcessRunState.mockResolvedValue('dead');
         }
@@ -3867,6 +3910,7 @@ describe('startDaemon spawn resume wiring (integration)', () => {
           spawnOptions: { directory: tmpdir(), existingSessionId: id, backendTarget: { kind: 'builtInAgent', agentId: 'codex' } },
         });
 
+        if (params.drive) return await params.drive();
         return await spawnSession({
           directory: tmpdir(),
           existingSessionId: id,
@@ -3963,6 +4007,198 @@ describe('startDaemon spawn resume wiring (integration)', () => {
         exactRunner: expect.objectContaining({ pid: runnerPid, processInstanceFingerprint: runnerFingerprint }),
       });
       expect(spawnHappyCLI).toHaveBeenCalledTimes(1);
+    });
+
+    // A due limit-reset retry owns the session's auth lane while its runner Resume replaces a
+    // lost publisher. The daemon's runtime-auth scheduler with its file-backed store, the switch
+    // core, the limit-reset retry, Resume and the daemon Stop wrapper are composed for real. The
+    // surrounding edges are this file's harness mocks: the control server, session metadata
+    // writes, process-state and process-identity readers, session RPC and transport, the
+    // child-exit base, Stop's runner-signalling core and process spawn. The fixture supplies the
+    // tracked runner and the lost-publisher capability response, and the sender below stands in
+    // for Pending: it runs the admission currentness guard and reports success, so it proves
+    // admission was reached, not Pending durability or provider execution.
+    async function armDueLimitResetRetry() {
+      const scheduler = harness.getRuntimeAuthRecoveryScheduler();
+      if (!scheduler) throw new Error('Expected the daemon runtime-auth recovery scheduler');
+      const classification: ConnectedServiceRuntimeFailureClassification = {
+        kind: 'usage_limit', serviceId: 'openai-codex', groupId: null,
+        // A fresh profile keeps this run's durable key apart from earlier runs sharing the store.
+        profileId: `primary-${randomUUID()}`,
+        resetsAtMs: Date.now() + 100, retryAfterMs: null, planType: null, rateLimits: null,
+        source: 'structured_provider_error', sourceKey: 'provider-source-0',
+      };
+      const recoveryKey = buildRuntimeAuthRecoveryKey({ sessionId: id, ...classification });
+      const intake = await scheduler.beginClassifiedFailure({ reportId: 'limit-report', sessionId: id,
+        switchesThisTurn: 0, classification, resumePromptMode: 'standard' });
+      await scheduler.markDurableWaitForResultByKey({
+        recoveryKey,
+        result: await handleConnectedServiceRuntimeAuthFailure({
+          sessionId: id,
+          selection: { kind: 'profile', serviceId: classification.serviceId, profileId: classification.profileId! },
+          classification, switchesThisTurn: 0,
+          switchCoordinator: { switchAfterClassifiedFailure: async () => { throw new Error('no group switch for a profile'); } },
+        }),
+        classificationFailureKind: classification.kind, classificationResetsAtMs: classification.resetsAtMs,
+        expectedAttemptId: intake.attemptId,
+      });
+      expect(scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'waiting' });
+      return {
+        scheduler,
+        recoveryKey,
+        // Joins the reset timer's wake if it is already running; otherwise runs the due retry.
+        wakeAfterReset: async () => {
+          await new Promise((resolve) => setTimeout(resolve, Math.max(0, (classification.resetsAtMs ?? 0) - Date.now()) + 20));
+          await scheduler.wakeByKey({ recoveryKey, reason: 'timer' });
+        },
+      };
+    }
+
+    function admitContinuations() {
+      continuationAdmissionMocks.sendSessionMessage.mockImplementation(async (request) => {
+        request.assertCanAdmit?.();
+        return { ok: true, sessionId: id, localId: request.localId ?? 'accepted', waited: false };
+      });
+    }
+
+    it('admits the limit-reset continuation whose Resume replaced the lost-publisher runner', async () => {
+      admitContinuations();
+      const usageLimitCancelSpy = vi.spyOn(UsageLimitRecoveryScheduler.prototype, 'cancel');
+      const temporaryThrottleCancelSpy = vi.spyOn(TemporaryThrottleRecoveryScheduler.prototype, 'stopRetrying');
+      let recovery: Awaited<ReturnType<typeof armDueLimitResetRetry>> | null = null;
+      await resumeAgainstLiveRunner({
+        capability: async () => publisherLost(localRunner),
+        drive: async () => {
+          recovery = await armDueLimitResetRetry();
+          await recovery.wakeAfterReset();
+        },
+      });
+
+      expect(stopSessionMocks.stopSession).toHaveBeenCalledExactlyOnceWith(id, {
+        exactRunner: expect.objectContaining({ pid: runnerPid, processInstanceFingerprint: runnerFingerprint }),
+      });
+      expect(spawnHappyCLI).toHaveBeenCalledTimes(1);
+      expect(recovery!.scheduler.readByKey(recovery!.recoveryKey)).toMatchObject({ status: 'resumed_awaiting_proof' });
+      expect(continuationAdmissionMocks.sendSessionMessage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        idOrPrefix: id,
+        requestedAction: { v: 1, kind: 'send_now' },
+        pendingAdmissionMode: 'continuation_if_no_queued_user_input',
+      }));
+      // Replacing one runner incarnation is not the user's Stop of the session.
+      expect(usageLimitCancelSpy).not.toHaveBeenCalled();
+      expect(temporaryThrottleCancelSpy).not.toHaveBeenCalled();
+    });
+
+    it('still lets an explicit Stop that races the replacement cancel the limit-reset recovery and queued auth work', async () => {
+      admitContinuations();
+      // Hold the joining Stop's asynchronous cleanup at its recovery cancellation, so queued auth
+      // work is observed while that cleanup has not finished and the recovery still owns the lane.
+      const cancelRecovery = RuntimeAuthRecoveryScheduler.prototype.cancel;
+      const cleanupGate = createDeferred();
+      const runtimeAuthCancelSpy = vi.spyOn(RuntimeAuthRecoveryScheduler.prototype, 'cancel')
+        .mockImplementation(async function (this: RuntimeAuthRecoveryScheduler, input) {
+          await cleanupGate.promise;
+          return await cancelRecovery.call(this, input);
+        });
+      const clearSessionSpy = vi.spyOn(ConnectedServiceSessionAuthSwitchLockRegistry.prototype, 'clearSession');
+      const recovery: { current: Awaited<ReturnType<typeof armDueLimitResetRetry>> | null } = { current: null };
+      const replacementStopping = createDeferred();
+      const releaseReplacementStop = createDeferred();
+      const events: string[] = [];
+      const state: {
+        explicitStop: Promise<StopSessionResult> | null;
+        laterWork: Promise<void> | null;
+        cancelledWorkRan: boolean;
+        cancelledWorkOutcome: Readonly<{ status: 'pending' } | { status: 'fulfilled' } | { status: 'rejected'; error: unknown }>;
+        atObservation: Readonly<{
+          cancelledWorkOutcome: unknown;
+          recoveryOwnerHeld: boolean;
+          recoveryStatus: unknown;
+        }> | null;
+        registry: ConnectedServiceSessionAuthSwitchLockRegistry | null;
+      } = {
+        explicitStop: null,
+        laterWork: null,
+        cancelledWorkRan: false,
+        cancelledWorkOutcome: { status: 'pending' },
+        atObservation: null,
+        registry: null,
+      };
+      // The user's Stop and a refreshed-credential application arrive from callers outside the
+      // recovery's auth lane, so the application queues behind that owner instead of re-entering it.
+      const independentCaller = (async () => {
+        await replacementStopping.promise;
+        try {
+          // The replacement's own Stop has already cleared the daemon's lock registry once.
+          const replacementClear = clearSessionSpy.mock.calls.findIndex(([sessionId]) => sessionId === id);
+          const registry = clearSessionSpy.mock.contexts[replacementClear] as ConnectedServiceSessionAuthSwitchLockRegistry | undefined;
+          if (!registry) throw new Error('Expected the replacement Stop to clear the daemon lock registry');
+          state.registry = registry;
+          void registry.runExclusiveDeferredBackground(id, async () => {
+            state.cancelledWorkRan = true;
+          }).then(
+            () => { state.cancelledWorkOutcome = { status: 'fulfilled' }; },
+            (error: unknown) => { state.cancelledWorkOutcome = { status: 'rejected', error }; },
+          );
+          const stopSession = harness.getStopSession();
+          if (!stopSession) throw new Error('Expected stopSession to be registered');
+          state.explicitStop = stopSession(id);
+          await new Promise((resolve) => setImmediate(resolve));
+          state.atObservation = {
+            cancelledWorkOutcome: state.cancelledWorkOutcome,
+            recoveryOwnerHeld: registry.isHeldByAnotherOwner(id),
+            recoveryStatus: recovery.current?.scheduler.readByKey(recovery.current.recoveryKey)?.status,
+          };
+          state.laterWork = registry.runExclusive(id, async () => {
+            events.push('later_work_started');
+          });
+        } finally {
+          cleanupGate.resolve();
+          // The user's Stop lands its recovery cancellation while the replacement's exact Stop runs.
+          await runtimeAuthCancelSpy.mock.results[0]?.value;
+          releaseReplacementStop.resolve();
+        }
+      })();
+      await resumeAgainstLiveRunner({
+        capability: async () => publisherLost(localRunner),
+        duringStop: async () => {
+          replacementStopping.resolve();
+          await releaseReplacementStop.promise;
+          events.push('replacement_stop_released');
+        },
+        drive: async () => {
+          recovery.current = await armDueLimitResetRetry();
+          await recovery.current.wakeAfterReset();
+        },
+      });
+      // The replacement reached its exact Stop, so the independent caller ran.
+      expect(events).toContain('replacement_stop_released');
+      await independentCaller;
+      await state.laterWork;
+
+      // The joining Stop cancels work queued after the replacement's own clear, before its
+      // asynchronous cleanup finishes and while the recovery still holds the lane.
+      expect(state.atObservation?.cancelledWorkOutcome).toEqual({
+        status: 'rejected',
+        error: expect.any(ConnectedServiceSessionAuthSwitchAcquisitionError),
+      });
+      expect(state.atObservation?.recoveryOwnerHeld).toBe(true);
+      expect(state.atObservation?.recoveryStatus).toBeDefined();
+      expect(state.atObservation?.recoveryStatus).not.toBe('cancelled');
+      expect(state.cancelledWorkOutcome).toMatchObject({
+        status: 'rejected',
+        error: { sessionId: id, reason: 'session_stopped' },
+      });
+      // The cancelled work never runs, and the owner kept exclusion until it finished.
+      expect(state.cancelledWorkRan).toBe(false);
+      expect(events).toEqual(['replacement_stop_released', 'later_work_started']);
+      expect(state.registry!.isHeldByAnotherOwner(id)).toBe(false);
+
+      await expect(state.explicitStop).resolves.toEqual({ status: 'stopped' });
+      expect(runtimeAuthCancelSpy).toHaveBeenCalledExactlyOnceWith({ sessionId: id });
+      expect(stopSessionMocks.stopSession).toHaveBeenCalledTimes(1);
+      expect(continuationAdmissionMocks.sendSessionMessage).not.toHaveBeenCalled();
+      expect(recovery.current!.scheduler.readByKey(recovery.current!.recoveryKey)).toMatchObject({ status: 'cancelled' });
     });
   });
 

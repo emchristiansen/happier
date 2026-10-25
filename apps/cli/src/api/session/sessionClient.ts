@@ -19,6 +19,7 @@ import {
 import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
 import { inferAgentIdFromSessionMetadata } from '@happier-dev/agents';
 import { configuration } from '@/configuration';
+import { readPositiveIntEnv } from '@/utils/readPositiveIntEnv';
 import type { RawJSONLines } from '@/backends/claude/types';
 import {
     buildClaudeJsonlLocalId,
@@ -204,6 +205,7 @@ import {
     enqueuePendingQueueV2MessageViaHttp,
     listPendingQueueV2DeliveryStatusesFromServer,
     listPendingQueueV2LocalIdsFromServer,
+    listPendingQueueV2ActionableLocalIdsFromServer,
     listPendingQueueV2ProviderDeliveryLocalIdsFromServer,
     materializeNextPendingQueueV2Message,
     blockPendingQueueV2Delivery,
@@ -423,10 +425,6 @@ export type SessionProviderInputOutcome =
 
 export type SessionProviderInputOutcomeObserver = (outcome: SessionProviderInputOutcome) => void;
 
-type ProviderInputTerminalOutcome =
-    | Readonly<{ kind: 'accepted' }>
-    | Readonly<{ kind: 'rejected_before_effect'; reason: SessionProviderInputRejectedBeforeEffectReason }>;
-
 function resolveSessionCatalogAgentId(metadata: unknown): CatalogAgentId {
     return inferAgentIdFromSessionMetadata(metadata, 'claude');
 }
@@ -560,6 +558,13 @@ const SESSION_PRESENCE_RECONNECT_REASSERT_DELAY_MS = 2_000;
 const STUCK_THINKING_TERMINAL_KEEPALIVE_GUARD_MS = 15_000;
 const SESSION_CLIENT_RECEIVED_MESSAGE_ID_CACHE_MAX_ENTRIES = 1_000;
 const SESSION_CLIENT_TOOL_CALL_CACHE_MAX_ENTRIES = 1_000;
+const PENDING_REOFFER_DELAY_MS = 60_000;
+const PENDING_CUSTODY_OUTCOME_TIMEOUT_MS = 120_000;
+// Keep equal to apps/server/sources/app/session/pending/pendingMessageService.ts
+// UNCERTAIN_DELIVERY_TOMBSTONE_REASONS: both retain identity for exact late acceptance.
+const UNCERTAIN_PENDING_DELIVERY_TOMBSTONE_REASONS: ReadonlySet<string> = new Set([
+    'dismissed_uncertain', 'resent_as_new',
+]);
 // Recovery only: hints and turn-end remain the fast path. Slow *successful* reads also
 // stretch the cadence so a saturated relay does not need to fail before we shed reads.
 const PENDING_DISCOVERY_BASE_DELAY_MS = 300_000;
@@ -567,13 +572,6 @@ const PENDING_DISCOVERY_MAX_DELAY_MS = 1_800_000;
 const PENDING_DISCOVERY_MAX_TIMER_DELAY_MS = 2_147_483_647;
 const PENDING_DISCOVERY_FAST_READ_MS = 1_000;
 const PENDING_DISCOVERY_SLOW_READ_MS = 2_000;
-// Backstop for a provider that takes an input and never reports its outcome. While the session
-// is idle, a held input with no outcome is treated as uncertain after this long, so the Queue
-// cannot wait forever. The value is a heuristic, not a bound on legitimate waits: Codex
-// `thread/resume`, `turn/start` and `turn/steer` have no request timeout. In the 2026-10-21 and
-// 2026-10-22 runner logs no session's first input took longer than 25 s from its hold to its
-// acceptance. A later exact acceptance still settles the input.
-export const PROVIDER_INPUT_OUTCOME_IDLE_GRACE_MS = 180_000;
 type SessionSnapshotReadResult =
     | Readonly<{ status: 'readable'; elapsedMs: number; pendingQueueState: KnownPendingQueueState | null; archived: boolean }>
     | Readonly<{ status: 'failed'; retryable: boolean; retryAfterMs?: number }>
@@ -695,6 +693,12 @@ export class ApiSessionClient extends EventEmitter {
     // Generic reversible provider-path blocks retain identity so exact late provider evidence can
     // still settle the row. A proven pre-provider lifecycle failure retires it after durable block.
     private readonly serverBlockedCanonicalPendingDeliveryLocalIds = new Set<string>();
+    private readonly pendingCustodyOutcomeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    private readonly canonicalPendingDeliveryBlocks = new Map<string, Readonly<{
+        reason: PendingQueueDeliveryBlockedReason;
+        providerEffect?: 'none';
+        status: 'pending' | 'written';
+    }>>();
     // The provider can report a precise rejection while a terminal turn observer reports only
     // ambiguity. Serialize those writes per exact claim so a later weaker report observes the
     // already-settled claim instead of overwriting the durable reason.
@@ -704,9 +708,7 @@ export class ApiSessionClient extends EventEmitter {
     private readonly explicitUserRecoveryDecisionsByLocalId = new Map<string, Promise<ExplicitUserRecoveryDecision>>();
     private readonly acceptedProviderInputLocalIds = new Set<string>();
     private providerInputOutcomeProducerGeneration = 0;
-    private readonly providerInputTerminalOutcomeByLocalId = new Map<string, ProviderInputTerminalOutcome>();
-    // Local IDs whose owed durable block (see `readOwedProviderInputBlock`) is being driven now.
-    private readonly owedProviderInputBlockDrivers = new Map<string, AcceptedCanonicalPendingDeliveryOperationAuthority>();
+    private readonly providerInputTerminalOutcomeByLocalId = new Map<string, 'accepted' | 'rejected_before_effect'>();
     private readonly providerInputUncertainLocalIds = new Set<string>();
     private readonly acceptedCanonicalPendingDeliveryResolutionWrites = new Set<Promise<void>>();
     private readonly acceptedCanonicalPendingDeliveryResolutionLocalIdsInFlight = new Set<string>();
@@ -723,13 +725,10 @@ export class ApiSessionClient extends EventEmitter {
         request: { force: boolean; discovery: boolean };
         promise: Promise<boolean>;
     } | null = null;
+    private pendingReofferTimer: ReturnType<typeof setTimeout> | null = null;
+    private pendingReofferDue = false;
+    private pendingReofferNeeded = false;
     private pendingDiscoveryTimer: ReturnType<typeof setTimeout> | null = null;
-    // Armed while the session is idle and some held input has no provider outcome. It expires only
-    // the inputs that were already without an outcome when it was armed.
-    private providerInputOutcomeIdleBackstop: Readonly<{
-        timer: ReturnType<typeof setTimeout>;
-        localIds: ReadonlySet<string>;
-    }> | null = null;
     private pendingDiscoveryProducer: Readonly<{ generation: number; producer: SessionProviderInputOutcomeProducer }> | null = null;
     private pendingDiscoveryDelayMs = PENDING_DISCOVERY_BASE_DELAY_MS;
     private pendingDiscoveryNotBeforeMs = 0;
@@ -1466,7 +1465,7 @@ export class ApiSessionClient extends EventEmitter {
                 })) return;
                 // On publisher-fenced servers, converged readiness includes this connection's settled publisher claim.
                 this.observePendingPublisherClaim(connectionEpoch);
-                this.reofferAcceptedCanonicalPendingDeliveriesAfterConnection();
+                this.reofferAcceptedCanonicalPendingDeliveries();
                 this.clearPendingDiscoveryTimer();
                 this.schedulePendingDiscovery();
 
@@ -1739,6 +1738,7 @@ export class ApiSessionClient extends EventEmitter {
     private applyPendingQueueState(state: KnownPendingQueueState, opts?: { emit?: boolean }): boolean {
         const applied = applyKnownPendingQueueState(this.pendingQueueState, state);
         this.pendingQueueState = applied.state;
+        this.schedulePendingReoffer();
         if (applied.changed) {
             this.pendingWakeSeq += 1;
             if (!this.closed) {
@@ -1758,6 +1758,8 @@ export class ApiSessionClient extends EventEmitter {
     private clearCanonicalPendingDeliveryLocalState(
         localId: string,
     ): boolean {
+        this.clearPendingCustodyOutcomeTimer(localId);
+        this.canonicalPendingDeliveryBlocks.delete(localId);
         let didClear = false;
         if (this.canonicalPendingDeliveryByLocalId.delete(localId)) didClear = true;
         if (this.serverBlockedCanonicalPendingDeliveryLocalIds.delete(localId)) didClear = true;
@@ -1833,7 +1835,7 @@ export class ApiSessionClient extends EventEmitter {
                 if (
                     !this.isAcceptedCanonicalPendingDeliveryOperationCurrent(authority)
                     || !this.canonicalPendingDeliveryByLocalId.has(localId)
-                    || this.providerInputTerminalOutcomeByLocalId.get(localId)?.kind !== 'accepted'
+                    || this.providerInputTerminalOutcomeByLocalId.get(localId) !== 'accepted'
                 ) {
                     return;
                 }
@@ -1857,9 +1859,11 @@ export class ApiSessionClient extends EventEmitter {
                         && result.message?.localId === localId
                         && typeof result.message.seq === 'number';
                     if (result.didResolve !== true && !hasExactCommittedReplay) {
-                        // A live no-op cannot prove that this exact accepted row committed. Keep its
-                        // claim visible for reconciliation; unrelated wakes must not become retry authority.
-                        return;
+                        logger.warn('[pendingQueue] accepted settlement lacks exact committed proof; retrying', {
+                            sessionId: this.sessionId, localId, retryAfterMs: this.pendingOutcomeWriteRetryDelayMs(),
+                        });
+                        await delayUnrefAbortable(this.pendingOutcomeWriteRetryDelayMs(), authority.abortSignal);
+                        continue;
                     }
                     // This mutation targets one exact localId. A successful server settlement is the
                     // authoritative sequence result; the provider callback sequence was only a hint
@@ -1876,7 +1880,7 @@ export class ApiSessionClient extends EventEmitter {
                         error: serializeAcceptedPendingSettlementErrorForLog(error),
                     });
                     if (!this.isAcceptedCanonicalPendingDeliveryOperationCurrent(authority)) return;
-                    if (await this.retireStaleCanonicalPendingDeliveryAfterTerminalMiss(localId, 'accepted', error)) return;
+                    await this.retireStaleCanonicalPendingDeliveryAfterTerminalMiss(localId, 'accepted', error);
                     if (!this.isAcceptedCanonicalPendingDeliveryOperationCurrent(authority)) return;
                     if (this.canonicalPendingDeliveryByLocalId.has(localId)) {
                         const retryDirective = readAcceptedPendingQueueV2DeliveryRetryDirective(error);
@@ -1885,7 +1889,7 @@ export class ApiSessionClient extends EventEmitter {
                                 retryDirective ? Math.max(250, retryDirective.retryAfterMs) : 1_000,
                                 previousRetryDelayMs * 2,
                             ))
-                            : null;
+                            : this.pendingOutcomeWriteRetryDelayMs();
                         // The server refuses settlement as `forbidden` only when this connection no
                         // longer publishes the session (its session binding or publisher fence), so no
                         // retry on it can succeed. A connection that reclaims publisher status re-offers it.
@@ -1896,11 +1900,9 @@ export class ApiSessionClient extends EventEmitter {
                                 sessionId: this.sessionId,
                                 localId,
                                 attempt,
-                                retryAfterMs,
-                                willRetry: retryAfterMs !== null,
-                                retryDisposition: retryAfterMs !== null
-                                    ? 'same_operation_after_backoff'
-                                    : isPublisherLost ? 'retained_for_publisher_recovery' : 'retained_without_retry',
+                                retryAfterMs: isPublisherLost ? null : retryAfterMs,
+                                willRetry: !isPublisherLost,
+                                retryDisposition: isPublisherLost ? 'retained_for_publisher_recovery' : 'same_operation_after_backoff',
                                 failure: readAcceptedPendingSettlementFailureDiagnostic(error),
                                 producerGeneration: authority.producerGeneration,
                                 sessionConnectionEpoch: authority.sessionConnectionEpoch,
@@ -1909,8 +1911,9 @@ export class ApiSessionClient extends EventEmitter {
                         } catch {
                             // Diagnostic sink failure must not change accepted settlement custody or retries.
                         }
-                        if (retryAfterMs === null) {
-                            if (isPublisherLost) this.observePendingPublisherLost(authority.sessionConnectionEpoch);
+                        if (isPublisherLost) {
+                            // This publisher cannot write; its reconnect owner re-offers the retained outcome.
+                            this.observePendingPublisherLost(authority.sessionConnectionEpoch);
                             return;
                         }
                         previousRetryDelayMs = retryAfterMs;
@@ -1938,7 +1941,7 @@ export class ApiSessionClient extends EventEmitter {
         });
     }
 
-    private reofferAcceptedCanonicalPendingDeliveriesAfterConnection(): void {
+    private reofferAcceptedCanonicalPendingDeliveries(): void {
         const producerGeneration = this.providerInputOutcomeProducerGeneration;
         const sessionConnectionEpoch = this.sessionConnectionEpoch;
         const precedingResolutions = [...this.acceptedCanonicalPendingDeliveryResolutionWrites];
@@ -1955,10 +1958,7 @@ export class ApiSessionClient extends EventEmitter {
             const authority = this.captureAcceptedCanonicalPendingDeliveryOperationAuthority(producerGeneration);
             if (!authority) return;
             for (const localId of this.canonicalPendingDeliveryByLocalId.keys()) {
-                if (this.providerInputTerminalOutcomeByLocalId.get(localId)?.kind !== 'accepted') {
-                    this.driveOwedProviderInputBlock(localId);
-                    continue;
-                }
+                if (this.providerInputTerminalOutcomeByLocalId.get(localId) !== 'accepted') continue;
                 this.trackAcceptedCanonicalPendingDeliveryResolution(
                     this.resolveAcceptedCanonicalPendingDelivery(localId, authority),
                 );
@@ -2016,6 +2016,22 @@ export class ApiSessionClient extends EventEmitter {
         opts: Readonly<{ canonicalOnly: boolean; providerEffect?: 'none' }>,
     ): Promise<boolean> {
         const precedingWrite = this.canonicalPendingDeliveryBlockWritesByLocalId.get(localId);
+        if (this.canonicalPendingDeliveryByLocalId.has(localId)) {
+            if (this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted') return Promise.resolve(false);
+            const existing = this.canonicalPendingDeliveryBlocks.get(localId);
+            const isUncertain = (value: PendingQueueDeliveryBlockedReason) => value === 'delivery_outcome_uncertain'
+                || value === 'ambiguous_terminal_delivery' || value === 'unknown';
+            if (existing && !isUncertain(existing.reason) && isUncertain(reason)) {
+                return precedingWrite ? precedingWrite.then(() => false) : Promise.resolve(false);
+            }
+            if (!existing || existing.reason !== reason || existing.providerEffect !== opts.providerEffect) {
+                this.canonicalPendingDeliveryBlocks.set(localId, {
+                    reason, ...(opts.providerEffect ? { providerEffect: opts.providerEffect } : {}), status: 'pending',
+                });
+            }
+            this.clearPendingCustodyOutcomeTimer(localId);
+            if (!this.closed && !this.closeStarted && !this.runtimeTerminationStarted) this.publishPendingEligibilityWake();
+        }
         const write = (async () => {
             if (precedingWrite) {
                 await precedingWrite;
@@ -2026,6 +2042,7 @@ export class ApiSessionClient extends EventEmitter {
         const clearWrite = () => {
             if (this.canonicalPendingDeliveryBlockWritesByLocalId.get(localId) === write) {
                 this.canonicalPendingDeliveryBlockWritesByLocalId.delete(localId);
+                this.schedulePendingCustodyOutcomeTimeout(localId);
             }
         };
         void write.then(clearWrite, clearWrite);
@@ -2041,6 +2058,11 @@ export class ApiSessionClient extends EventEmitter {
         const canonicalClaim = this.canonicalPendingDeliveryByLocalId.get(localId);
         const wasCanonical = canonicalClaim !== undefined;
         if (opts.canonicalOnly && !wasCanonical) return false;
+        if (wasCanonical && this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted') return false;
+        const blockIntent = this.canonicalPendingDeliveryBlocks.get(localId);
+        if (blockIntent?.status === 'written') return true;
+        reason = blockIntent?.reason ?? reason;
+        opts = { ...opts, ...(blockIntent?.providerEffect ? { providerEffect: blockIntent.providerEffect } : {}) };
 
         const settlementReason =
             reason === 'steering_unavailable'
@@ -2071,6 +2093,9 @@ export class ApiSessionClient extends EventEmitter {
                 })
                 : await request();
 
+            if (blockIntent && this.canonicalPendingDeliveryBlocks.get(localId) === blockIntent) {
+                this.canonicalPendingDeliveryBlocks.set(localId, { ...blockIntent, status: 'written' });
+            }
             const didRequeueConditionalSteer =
                 settlementReason === 'conditional_steer_unavailable'
                 && result.usedLegacySteeringUnavailableFallback !== true;
@@ -2086,6 +2111,7 @@ export class ApiSessionClient extends EventEmitter {
                     this.clearCanonicalPendingDeliveryLocalState(localId);
                 } else {
                     this.serverBlockedCanonicalPendingDeliveryLocalIds.add(localId);
+                    this.clearPendingCustodyOutcomeTimer(localId);
                 }
             }
             if (result.pendingQueueState) {
@@ -2111,17 +2137,85 @@ export class ApiSessionClient extends EventEmitter {
             });
             return true;
         } catch (error) {
-            logger.debug('[pendingQueue] provider delivery block failed', {
+            logger.infoFile('[pendingQueue] provider delivery block failed', {
                 sessionId: this.sessionId,
                 localId,
                 reason: settlementReason,
-                    error: serializeAxiosErrorForLog(error),
-                });
+                willRetry: wasCanonical && this.canonicalPendingDeliveryBlocks.get(localId)?.status === 'pending',
+                error: serializeAxiosErrorForLog(error),
+            });
             if (await this.retireStaleCanonicalPendingDeliveryAfterTerminalMiss(localId, 'block', error)) {
                 return false;
             }
             return opts.canonicalOnly && wasCanonical;
         }
+    }
+
+    private clearPendingCustodyOutcomeTimer(localId: string): void {
+        const timer = this.pendingCustodyOutcomeTimers.get(localId);
+        if (timer) clearTimeout(timer);
+        this.pendingCustodyOutcomeTimers.delete(localId);
+    }
+
+    private clearPendingCustodyOutcomeTimers(): void {
+        for (const localId of this.pendingCustodyOutcomeTimers.keys()) {
+            this.clearPendingCustodyOutcomeTimer(localId);
+        }
+    }
+
+    private pendingCustodyOutcomeTimeoutMs(): number {
+        return Math.min(PENDING_DISCOVERY_MAX_TIMER_DELAY_MS, readPositiveIntEnv(
+            'HAPPIER_PENDING_CUSTODY_OUTCOME_TIMEOUT_MS', PENDING_CUSTODY_OUTCOME_TIMEOUT_MS,
+        ));
+    }
+
+    private pendingOutcomeWriteRetryDelayMs(): number {
+        return Math.min(PENDING_CUSTODY_OUTCOME_TIMEOUT_MS, this.pendingCustodyOutcomeTimeoutMs());
+    }
+
+    private needsPendingCustodyOutcomeWrite(localId: string): boolean {
+        if (!this.canonicalPendingDeliveryByLocalId.has(localId)
+            || this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted') return false;
+        const block = this.canonicalPendingDeliveryBlocks.get(localId);
+        return block ? block.status === 'pending'
+            : !this.providerInputTerminalOutcomeByLocalId.has(localId)
+                && !this.serverBlockedCanonicalPendingDeliveryLocalIds.has(localId);
+    }
+
+    private schedulePendingCustodyOutcomeTimeout(localId: string): void {
+        if (this.closed || this.closeStarted || this.runtimeTerminationStarted
+            || !this.needsPendingCustodyOutcomeWrite(localId)
+            || this.canonicalPendingDeliveryBlockWritesByLocalId.has(localId)
+            || this.pendingCustodyOutcomeTimers.has(localId)) return;
+        const timeoutMs = this.canonicalPendingDeliveryBlocks.has(localId)
+            ? this.pendingOutcomeWriteRetryDelayMs()
+            : this.pendingCustodyOutcomeTimeoutMs();
+        const timer = setTimeout(() => {
+            this.pendingCustodyOutcomeTimers.delete(localId);
+            if (this.closed || this.closeStarted || this.runtimeTerminationStarted
+                || !this.needsPendingCustodyOutcomeWrite(localId)) return;
+            const block = this.canonicalPendingDeliveryBlocks.get(localId);
+            logger.infoFile(block ? '[pendingQueue] retrying provider delivery block' : '[pendingQueue] provider custody outcome timed out', {
+                sessionId: this.sessionId, localId, timeoutMs,
+            });
+            void this.blockPendingQueueDeliveryLocalId(localId, block?.reason ?? 'delivery_outcome_uncertain', {
+                canonicalOnly: true, ...(block?.providerEffect ? { providerEffect: block.providerEffect } : {}),
+            })
+                .catch((error) => {
+                    logger.infoFile('[pendingQueue] custody timeout block failed', {
+                        sessionId: this.sessionId, localId, error: serializeAxiosErrorForLog(error),
+                    });
+                })
+                .finally(() => {
+                    // A failed write retains the exact claim and retries on the bounded outcome-write cadence.
+                    this.schedulePendingCustodyOutcomeTimeout(localId);
+                    if (!this.closed && !this.closeStarted && !this.runtimeTerminationStarted) {
+                        this.publishPendingEligibilityWake();
+                    }
+                });
+        }, timeoutMs);
+        timer.unref?.();
+        this.pendingCustodyOutcomeTimers.set(localId, timer);
     }
 
     private async reconcileCanonicalPendingDeliveriesBeforeMaterialization(): Promise<boolean> {
@@ -2132,14 +2226,25 @@ export class ApiSessionClient extends EventEmitter {
             const statuses = await listPendingQueueV2DeliveryStatusesFromServer({
                 token: this.token,
                 sessionId: this.sessionId,
+                localIds: blockingLocalIds,
             });
-            const statusByLocalId = new Map(statuses.map((entry) => [entry.localId, entry.status]));
+            const statusByLocalId = new Map(statuses.map((entry) => [entry.localId, entry]));
             for (const localId of blockingLocalIds) {
-                const status = statusByLocalId.get(localId);
+                const entry = statusByLocalId.get(localId);
+                const status = entry?.status;
+                if ((status === 'blocked' || (status === 'discarded' && UNCERTAIN_PENDING_DELIVERY_TOMBSTONE_REASONS.has(entry?.discardedReason ?? '')))
+                    && this.canonicalPendingDeliveryByLocalId.has(localId)) {
+                    // The server already owns this outcome. Retain identity for late acceptance,
+                    // but neither hold later rows nor manufacture another uncertainty write.
+                    this.serverBlockedCanonicalPendingDeliveryLocalIds.add(localId);
+                    this.clearPendingCustodyOutcomeTimer(localId);
+                    this.publishPendingEligibilityWake();
+                    continue;
+                }
                 // Absence cannot settle an accepted result or a batch reserved between dequeue
                 // and provider entry. Only the exact existing settlement/terminal proof may do so.
                 if (status !== 'discarded') continue;
-                if (this.providerInputTerminalOutcomeByLocalId.get(localId)?.kind === 'accepted') continue;
+                if (this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted') continue;
                 if (!this.canonicalPendingDeliveryByLocalId.has(localId)) continue;
                 logger.debug('[pendingQueue] exact discarded row retired unaccepted local provider custody', {
                     sessionId: this.sessionId,
@@ -2168,8 +2273,9 @@ export class ApiSessionClient extends EventEmitter {
 
     private listMaterializationBlockingCanonicalPendingDeliveryLocalIds(): string[] {
         return [...this.canonicalPendingDeliveryByLocalId.keys()].filter((localId) => (
-            this.providerInputTerminalOutcomeByLocalId.get(localId)?.kind === 'accepted'
-            || !this.serverBlockedCanonicalPendingDeliveryLocalIds.has(localId)
+            !this.providerInputTerminalOutcomeByLocalId.has(localId)
+            && !this.canonicalPendingDeliveryBlocks.has(localId)
+            && !this.serverBlockedCanonicalPendingDeliveryLocalIds.has(localId)
         ));
     }
 
@@ -2188,7 +2294,7 @@ export class ApiSessionClient extends EventEmitter {
             logger.infoFile('[pendingQueue] materialization held by provider custody', {
                 sessionId: this.sessionId,
                 localId,
-                providerInputOutcome: this.providerInputTerminalOutcomeByLocalId.get(localId)?.kind ?? null,
+                providerInputOutcome: this.providerInputTerminalOutcomeByLocalId.get(localId) ?? null,
                 publisherRecovery: this.pendingPublisherRecovery.state,
                 sessionConnectionEpoch: this.sessionConnectionEpoch,
             });
@@ -2232,6 +2338,41 @@ export class ApiSessionClient extends EventEmitter {
         });
         this.pendingQueueStateReconcileInFlight = { request, promise: reconcile };
         return await reconcile;
+    }
+
+    private clearPendingReofferTimer(): void {
+        if (this.pendingReofferTimer) clearTimeout(this.pendingReofferTimer);
+        this.pendingReofferTimer = null;
+    }
+
+    private schedulePendingReoffer(): void {
+        if (!this.pendingQueueState.known || this.pendingQueueState.pendingCount <= 0) {
+            this.clearPendingReofferTimer();
+            this.pendingReofferDue = false;
+            return;
+        }
+        // A later outcome can make every remaining row unclaimable after a successful claim.
+        // Such projections still need a retry opportunity without another discovery read.
+        if (!this.pendingReofferNeeded && countMaterializablePendingRows(this.pendingQueueState) > 0) {
+            this.clearPendingReofferTimer();
+            this.pendingReofferDue = false;
+            return;
+        }
+        if (this.pendingReofferTimer || this.pendingReofferDue
+            || !this.isPendingDiscoveryProducerCurrent() || this.closeStarted) return;
+        this.pendingReofferTimer = setTimeout(() => {
+            this.pendingReofferTimer = null;
+            if (!this.isPendingDiscoveryProducerCurrent() || this.closeStarted) return;
+            this.pendingReofferDue = true;
+            // No claim/discovery progress with rows remaining warrants another attempt,
+            // regardless of server reason tiers. The consumer still owns provider dispatch.
+            this.publishPendingEligibilityWake();
+        }, PENDING_REOFFER_DELAY_MS);
+        this.pendingReofferTimer.unref?.();
+    }
+
+    private hasPendingMaterializationWork(): boolean {
+        return countMaterializablePendingRows(this.pendingQueueState) > 0 || this.pendingReofferDue;
     }
 
     private clearPendingDiscoveryTimer(): void {
@@ -2306,6 +2447,8 @@ export class ApiSessionClient extends EventEmitter {
         if (result.archived) {
             this.pendingDiscoveryArchived = true;
             this.clearPendingDiscoveryTimer();
+            this.clearPendingReofferTimer();
+            this.pendingReofferDue = false;
             return;
         }
         if (result.elapsedMs >= PENDING_DISCOVERY_SLOW_READ_MS) {
@@ -2332,7 +2475,7 @@ export class ApiSessionClient extends EventEmitter {
             this.logMaterializationHeldByProviderCustody();
             return false;
         }
-        return countMaterializablePendingRows(this.pendingQueueState) > 0;
+        return this.hasPendingMaterializationWork();
     }
 
     private resolvePendingForegroundState(
@@ -2396,7 +2539,6 @@ export class ApiSessionClient extends EventEmitter {
                 this.localActiveTurnStartedAtMs = observedAtMs;
             }
             this.lastLocalActiveTurnProgressAtMs = observedAtMs;
-            this.clearProviderInputOutcomeIdleBackstop();
         }
         const mapped = latestTurnStatusForTurnLifecycleEvent(event, terminalStatus);
         if (mapped !== undefined) {
@@ -2413,7 +2555,6 @@ export class ApiSessionClient extends EventEmitter {
         });
         this.publishPendingEligibilityWake();
         void this.reconcilePendingQueueState({ force: true }).catch(() => undefined);
-        this.armProviderInputOutcomeIdleBackstop();
     }
 
     /**
@@ -2551,6 +2692,7 @@ export class ApiSessionClient extends EventEmitter {
                 }
 
                 if (update.pendingQueueState) {
+                    this.pendingReofferNeeded = true;
                     this.applyPendingQueueState(update.pendingQueueState, { emit: true });
                     if (latestTurnStatus !== undefined && this.pendingQueueState.known
                         && update.pendingQueueState.pendingVersion === this.pendingQueueState.pendingVersion) {
@@ -3011,14 +3153,27 @@ export class ApiSessionClient extends EventEmitter {
         void current.then((didApply) => {
             if (
                 this.closed
-                || opts.socket !== this.userSocket
-                || opts.socket.connected !== true
                 || revision !== this.accountSettingsEventRevision
                 || this.accountSettingsSyncBarrier !== current
             ) return;
-            if (!didApply) {
+            // A stale source still has to settle its own barrier. Leaving a resolved
+            // false promise marked applying makes every later reconnect join it forever.
+            if (!didApply
+                || opts.socket !== this.userSocket
+                || opts.socket.connected !== true
+                || sourceUserSocketConnectionEpoch !== this.userSocketSettingsConnectionEpoch) {
+                if (didApply) {
+                    this.recordAccountSettingsConvergenceFailure(
+                        new Error('Account settings live source changed before convergence settled'),
+                    );
+                }
                 this.accountSettingsSyncBarrierState = 'failed';
                 this.userSocketSettingsConvergedEpoch = -1;
+                logger.infoFile('[accountSettings] Live settings convergence failed; retaining barrier for retry', {
+                    settingsVersion,
+                    sourceConnectionEpoch: sourceUserSocketConnectionEpoch,
+                    currentConnectionEpoch: this.userSocketSettingsConnectionEpoch,
+                });
                 this.rearmAccountSettingsEligibilityWaiters();
                 if (this.accountSettingsPendingEligibilityWakeWithheld) {
                     this.accountSettingsPendingEligibilityWakeWithheld = false;
@@ -3153,6 +3308,7 @@ export class ApiSessionClient extends EventEmitter {
                     ? pendingWakeSeqBefore
                     : stateUpdateResult.pendingWakeSeq;
                 this.pendingQueueState = stateUpdateResult.pendingQueueState;
+                this.schedulePendingReoffer();
                 this.applyRuntimeActivityProjectionFromServer(stateUpdateResult.runtimeActivityProjection, {
                     // handleSessionStateUpdate is the one wake-sequence owner for this envelope.
                     // The projection applier updates local Activity state without publishing a
@@ -3223,7 +3379,7 @@ export class ApiSessionClient extends EventEmitter {
         if (
             localId === null
             || committedSeq === null
-            || this.providerInputTerminalOutcomeByLocalId.get(localId)?.kind !== 'accepted'
+            || this.providerInputTerminalOutcomeByLocalId.get(localId) !== 'accepted'
             || !this.canonicalPendingDeliveryByLocalId.has(localId)
         ) {
             return;
@@ -5862,9 +6018,12 @@ export class ApiSessionClient extends EventEmitter {
         const generation = ++this.providerInputOutcomeProducerGeneration;
         this.clearPendingDiscoveryTimer();
         this.pendingDiscoveryProducer = { generation, producer };
+        this.clearPendingReofferTimer();
+        this.schedulePendingReoffer();
         this.pendingDiscoveryReadFailed = false;
         this.pendingDiscoveryDelayMs = PENDING_DISCOVERY_BASE_DELAY_MS;
         this.schedulePendingDiscovery();
+        this.reofferAcceptedCanonicalPendingDeliveries();
 
         return (outcome) => {
             if (
@@ -5929,7 +6088,12 @@ export class ApiSessionClient extends EventEmitter {
                 outcomeKind: outcome.kind,
             });
             if (outcome.kind === 'effect_may_have_occurred') {
-                this.markProviderInputOutcomeUncertain(localId);
+                if (this.providerInputUncertainLocalIds.has(localId)) return;
+                this.providerInputUncertainLocalIds.add(localId);
+                void this.blockPendingMessageDelivery({
+                    localIds: [localId],
+                    reason: 'delivery_outcome_uncertain',
+                });
             }
             return;
         }
@@ -5948,19 +6112,17 @@ export class ApiSessionClient extends EventEmitter {
             return;
         }
 
-        const terminalOutcome: ProviderInputTerminalOutcome = outcome.kind === 'accepted'
-            ? { kind: 'accepted' }
-            : { kind: 'rejected_before_effect', reason: outcome.reason };
+        const terminalOutcome = outcome.kind;
         const existingTerminalOutcome = this.providerInputTerminalOutcomeByLocalId.get(localId);
         if (existingTerminalOutcome) {
-            if (existingTerminalOutcome.kind !== terminalOutcome.kind) {
+            if (existingTerminalOutcome !== terminalOutcome) {
                 logger.warn('[pendingQueue] ignored conflicting provider-input terminal outcome', {
                     sessionId: this.sessionId,
                     providerId: producer.providerId,
                     providerMode: producer.mode,
                     localId,
-                    acceptedOutcome: existingTerminalOutcome.kind,
-                    ignoredOutcome: terminalOutcome.kind,
+                    acceptedOutcome: existingTerminalOutcome,
+                    ignoredOutcome: terminalOutcome,
                 });
             }
             return;
@@ -6001,11 +6163,14 @@ export class ApiSessionClient extends EventEmitter {
         }
         this.providerInputUncertainLocalIds.delete(localId);
         this.providerInputTerminalOutcomeByLocalId.set(localId, terminalOutcome);
+        this.clearPendingCustodyOutcomeTimer(localId);
 
-        if (terminalOutcome.kind === 'accepted') {
+        if (terminalOutcome === 'accepted') {
+            this.canonicalPendingDeliveryBlocks.delete(localId);
             // Exact provider acceptance supersedes any earlier ambiguity/pre-effect block write
             // that failed and was parked for retry. A late failure must not resurrect that block.
             this.acceptedProviderInputLocalIds.add(localId);
+            this.publishPendingEligibilityWake();
             const authority = this.captureAcceptedCanonicalPendingDeliveryOperationAuthority(producerGeneration);
             if (!authority) {
                 reportAcceptedHandoff('authority_unavailable');
@@ -6018,144 +6183,11 @@ export class ApiSessionClient extends EventEmitter {
             return;
         }
 
-        this.driveOwedProviderInputBlock(localId);
-    }
-
-    private markProviderInputOutcomeUncertain(localId: string): void {
-        if (this.providerInputUncertainLocalIds.has(localId)) return;
-        this.providerInputUncertainLocalIds.add(localId);
-        this.driveOwedProviderInputBlock(localId);
-    }
-
-    /**
-     * The durable block a held input still owes the server because of a provider outcome this
-     * client observed: uncertain, or rejected before effect. The observation is local state; the
-     * obligation ends when the server acknowledges the block (the claim is released or marked
-     * server-blocked), when exact acceptance supersedes it, or when custody ends by discard.
-     */
-    private readOwedProviderInputBlock(localId: string): Readonly<{
-        reason: PendingQueueDeliveryBlockedReason;
-        providerEffect?: 'none';
-    }> | null {
-        if (!this.canonicalPendingDeliveryByLocalId.has(localId)) return null;
-        if (this.serverBlockedCanonicalPendingDeliveryLocalIds.has(localId)) return null;
-        const terminalOutcome = this.providerInputTerminalOutcomeByLocalId.get(localId);
-        if (terminalOutcome) {
-            switch (terminalOutcome.kind) {
-                case 'accepted':
-                    return null;
-                case 'rejected_before_effect':
-                    return { reason: terminalOutcome.reason, providerEffect: 'none' };
-                default: {
-                    const exhaustive: never = terminalOutcome;
-                    return exhaustive;
-                }
-            }
-        }
-        return this.providerInputUncertainLocalIds.has(localId)
-            ? { reason: 'delivery_outcome_uncertain' }
-            : null;
-    }
-
-    /**
-     * Write an owed block until the server acknowledges it or it stops being owed. Retries stay
-     * under the current connection's operation authority; a later connection re-offers them.
-     */
-    private driveOwedProviderInputBlock(localId: string): void {
-        if (!this.readOwedProviderInputBlock(localId)) return;
-        const authority = this.captureAcceptedCanonicalPendingDeliveryOperationAuthority();
-        if (!authority) return;
-        const existingDriver = this.owedProviderInputBlockDrivers.get(localId);
-        if (existingDriver && this.isAcceptedCanonicalPendingDeliveryOperationCurrent(existingDriver)) return;
-        this.owedProviderInputBlockDrivers.set(localId, authority);
-        const isCurrentDriver = () => this.owedProviderInputBlockDrivers.get(localId) === authority
-            && this.isAcceptedCanonicalPendingDeliveryOperationCurrent(authority);
-        const drive = async () => {
-            let attempt = 0;
-            let previousRetryDelayMs = 0;
-            while (isCurrentDriver()) {
-                const owed = this.readOwedProviderInputBlock(localId);
-                if (!owed) return;
-                attempt += 1;
-                await this.blockPendingQueueDeliveryLocalId(localId, owed.reason, {
-                    canonicalOnly: true,
-                    ...(owed.providerEffect ? { providerEffect: owed.providerEffect } : {}),
-                });
-                if (!this.readOwedProviderInputBlock(localId) || !isCurrentDriver()) return;
-                const retryAfterMs = Math.min(60_000, Math.max(1_000, previousRetryDelayMs * 2));
-                previousRetryDelayMs = retryAfterMs;
-                logger.warn('[pendingQueue] owed provider-input block was not acknowledged; retrying', {
-                    sessionId: this.sessionId,
-                    localId,
-                    reason: owed.reason,
-                    attempt,
-                    retryAfterMs,
-                    sessionConnectionEpoch: authority.sessionConnectionEpoch,
-                });
-                await delayUnrefAbortable(retryAfterMs, authority.abortSignal);
-            }
-        };
-        void drive()
-            .catch((error) => {
-                logger.debug('[pendingQueue] owed provider-input block driver stopped', {
-                    sessionId: this.sessionId,
-                    localId,
-                    error: serializeAxiosErrorForLog(error),
-                });
-            })
-            .finally(() => {
-                if (this.owedProviderInputBlockDrivers.get(localId) === authority) {
-                    this.owedProviderInputBlockDrivers.delete(localId);
-                }
-            });
-    }
-
-    /** Held inputs with no outcome yet: not accepted, rejected, uncertain or blocked on the server. */
-    private listHeldProviderInputLocalIdsWithoutOutcome(): string[] {
-        return [...this.canonicalPendingDeliveryByLocalId.keys()].filter((localId) => (
-            !this.providerInputTerminalOutcomeByLocalId.has(localId)
-            && !this.providerInputUncertainLocalIds.has(localId)
-            && !this.serverBlockedCanonicalPendingDeliveryLocalIds.has(localId)
-        ));
-    }
-
-    private armProviderInputOutcomeIdleBackstop(): void {
-        if (
-            this.providerInputOutcomeIdleBackstop
-            || this.closed
-            || this.runtimeTerminationStarted
-            || this.sessionTurnLifecycle.hasActiveTurn()
-        ) {
-            return;
-        }
-        const localIds: ReadonlySet<string> = new Set(this.listHeldProviderInputLocalIdsWithoutOutcome());
-        if (localIds.size === 0) return;
-        const timer = setTimeout(() => {
-            this.providerInputOutcomeIdleBackstop = null;
-            this.expireProviderInputOutcomesAtIdle(localIds);
-        }, PROVIDER_INPUT_OUTCOME_IDLE_GRACE_MS);
-        this.providerInputOutcomeIdleBackstop = { timer, localIds };
-    }
-
-    private clearProviderInputOutcomeIdleBackstop(): void {
-        if (!this.providerInputOutcomeIdleBackstop) return;
-        clearTimeout(this.providerInputOutcomeIdleBackstop.timer);
-        this.providerInputOutcomeIdleBackstop = null;
-    }
-
-    private expireProviderInputOutcomesAtIdle(armedLocalIds: ReadonlySet<string>): void {
-        if (this.closed || this.runtimeTerminationStarted || this.sessionTurnLifecycle.hasActiveTurn()) return;
-        for (const localId of this.listHeldProviderInputLocalIdsWithoutOutcome()) {
-            if (!armedLocalIds.has(localId)) continue;
-            logger.infoFile('[pendingQueue] held provider input had no outcome after the idle grace; blocking it as uncertain', {
-                sessionId: this.sessionId,
-                localId,
-                graceMs: PROVIDER_INPUT_OUTCOME_IDLE_GRACE_MS,
-                sessionConnectionEpoch: this.sessionConnectionEpoch,
-            });
-            this.markProviderInputOutcomeUncertain(localId);
-        }
-        this.armProviderInputOutcomeIdleBackstop();
+        void this.blockPendingMessageDelivery({
+            localIds: [localId],
+            reason: outcome.reason,
+            providerEffect: 'none',
+        });
     }
 
     hasPendingProviderInputAcceptance(localId: string): boolean {
@@ -6477,7 +6509,9 @@ export class ApiSessionClient extends EventEmitter {
         // draining RPC executions so closing cannot wait on its own lifetime abort.
         this.archiveAdmissionTermination.abort();
         this.clearPendingDiscoveryTimer();
-        this.clearProviderInputOutcomeIdleBackstop();
+        this.clearPendingReofferTimer();
+        this.pendingReofferDue = false;
+        this.clearPendingCustodyOutcomeTimers();
         this.clearPendingPublisherRecoveryDeadline();
         this.accountSettingsRetryAbortController?.abort();
         this.executionRunPermissionHandler?.reset();
@@ -6516,6 +6550,7 @@ export class ApiSessionClient extends EventEmitter {
         this.canonicalPendingDeliveryByLocalId.clear();
         this.serverBlockedCanonicalPendingDeliveryLocalIds.clear();
         this.canonicalPendingDeliveryBlockWritesByLocalId.clear();
+        this.canonicalPendingDeliveryBlocks.clear();
         this.committedUserMessageSeqTracker.clear();
         this.agentQueueEchoSuppressedLocalIds.clear();
         this.agentQueueDeliveredLocalIds.clear();
@@ -6557,7 +6592,9 @@ export class ApiSessionClient extends EventEmitter {
         this.runtimeTerminationStarted = true;
         this.archiveAdmissionTermination.abort();
         this.clearPendingDiscoveryTimer();
-        this.clearProviderInputOutcomeIdleBackstop();
+        this.clearPendingReofferTimer();
+        this.pendingReofferDue = false;
+        this.clearPendingCustodyOutcomeTimers();
         this.clearPendingPublisherRecoveryDeadline();
         this.providerInputOutcomeProducerGeneration += 1;
         this.acceptedCanonicalPendingDeliveryOperationAbortController.abort();
@@ -6567,25 +6604,29 @@ export class ApiSessionClient extends EventEmitter {
         return this.runtimeTerminationStarted;
     }
 
+    private async blockPendingDeliveryBeforeClose(localId: string, canonicalOnly: boolean): Promise<void> {
+        if (this.providerInputTerminalOutcomeByLocalId.get(localId) === 'accepted') {
+            logger.debug('[pendingQueue] preserving provider-accepted delivery during close for exact reconciliation', {
+                sessionId: this.sessionId,
+                localId,
+            });
+            return;
+        }
+        const block = this.canonicalPendingDeliveryBlocks.get(localId);
+        if (!block && this.serverBlockedCanonicalPendingDeliveryLocalIds.has(localId)) return;
+        const reason = block?.reason ?? (this.providerInputUncertainLocalIds.has(localId)
+            ? 'delivery_outcome_uncertain'
+            : 'runtime_disposed_before_delivery');
+        await this.blockPendingQueueDeliveryLocalId(localId, reason, {
+            canonicalOnly,
+            ...(block?.providerEffect ? { providerEffect: block.providerEffect } : {}),
+        });
+    }
+
     private async blockUnresolvedCanonicalPendingDeliveriesBeforeClose(): Promise<void> {
         const localIds = [...this.canonicalPendingDeliveryByLocalId.keys()];
         for (const localId of localIds) {
-            if (this.providerInputUncertainLocalIds.has(localId)) {
-                await this.blockPendingQueueDeliveryLocalId(localId, 'delivery_outcome_uncertain', {
-                    canonicalOnly: true,
-                });
-                continue;
-            }
-            if (this.providerInputTerminalOutcomeByLocalId.get(localId)?.kind === 'accepted') {
-                logger.debug('[pendingQueue] preserving provider-accepted delivery during close for exact reconciliation', {
-                    sessionId: this.sessionId,
-                    localId,
-                });
-                continue;
-            }
-            await this.blockPendingQueueDeliveryLocalId(localId, 'runtime_disposed_before_delivery', {
-                canonicalOnly: true,
-            });
+            await this.blockPendingDeliveryBeforeClose(localId, true);
         }
     }
 
@@ -6617,22 +6658,7 @@ export class ApiSessionClient extends EventEmitter {
         }
 
         for (const localId of localIds) {
-            if (this.providerInputUncertainLocalIds.has(localId)) {
-                await this.blockPendingQueueDeliveryLocalId(localId, 'delivery_outcome_uncertain', {
-                    canonicalOnly: false,
-                });
-                continue;
-            }
-            if (this.providerInputTerminalOutcomeByLocalId.get(localId)?.kind === 'accepted') {
-                logger.debug('[pendingQueue] preserving durable provider-accepted delivery during close for exact reconciliation', {
-                    sessionId: this.sessionId,
-                    localId,
-                });
-                continue;
-            }
-            await this.blockPendingQueueDeliveryLocalId(localId, 'runtime_disposed_before_delivery', {
-                canonicalOnly: false,
-            });
+            await this.blockPendingDeliveryBeforeClose(localId, false);
         }
     }
 
@@ -6681,11 +6707,27 @@ export class ApiSessionClient extends EventEmitter {
         });
     }
 
+    /** Complete inventory of the server pending queue, whatever each row's delivery status. */
     async listPendingMessageQueueV2LocalIds(): Promise<string[]> {
-        const request = () => listPendingQueueV2LocalIdsFromServer({
+        return this.runPendingQueueRead(() => listPendingQueueV2LocalIdsFromServer({
             token: this.token,
             sessionId: this.sessionId,
-        });
+        }));
+    }
+
+    /**
+     * Server pending rows a mode switch or a switch-to-local discard acts on: every row except one
+     * handed to an external terminal or one whose typed status the server overrode (a queued row
+     * whose requested action it cannot parse).
+     */
+    async listActionablePendingMessageQueueV2LocalIds(): Promise<string[]> {
+        return this.runPendingQueueRead(() => listPendingQueueV2ActionableLocalIdsFromServer({
+            token: this.token,
+            sessionId: this.sessionId,
+        }));
+    }
+
+    private async runPendingQueueRead<T>(request: () => Promise<T>): Promise<T> {
         const supervisor = this.sessionConnectionSupervisor;
         if (!supervisor) {
             return request();
@@ -6698,7 +6740,11 @@ export class ApiSessionClient extends EventEmitter {
         });
     }
 
-    async peekPendingMessageQueueV2Count(opts?: PendingQueueReadOptions): Promise<number> {
+    /**
+     * Pending work a mode switch or discard gate should act on: actionable server rows plus inputs
+     * already materialized locally but not yet observed in the transcript.
+     */
+    async peekActionablePendingMessageQueueV2Count(opts?: PendingQueueReadOptions): Promise<number> {
         const policy = resolvePendingQueueReconcileWhenEmpty(opts, 'force');
         if (!this.pendingQueueState.known) {
             await this.reconcilePendingQueueState({ force: true });
@@ -6718,7 +6764,7 @@ export class ApiSessionClient extends EventEmitter {
             return this.pendingQueueMaterializedLocalIds.size;
         }
 
-        const localIds = await this.listPendingMessageQueueV2LocalIds();
+        const localIds = await this.listActionablePendingMessageQueueV2LocalIds();
         // Include materialized-but-not-yet-observed messages as "pending-ish" work.
         // These are messages we already removed from the server pending queue but haven't
         // seen broadcast into the transcript yet; switching modes during this window can
@@ -6726,8 +6772,12 @@ export class ApiSessionClient extends EventEmitter {
         return localIds.length + this.pendingQueueMaterializedLocalIds.size;
     }
 
+    /**
+     * Discards the same server-row selection the switch count reads (its own fresh read; the count may
+     * also include local in-flight inputs). Handed-off and server-overridden rows stay.
+     */
     async discardPendingMessageQueueV2All(opts: { reason: 'switch_to_local' | 'manual' }): Promise<number> {
-        const localIds = await this.listPendingMessageQueueV2LocalIds();
+        const localIds = await this.listActionablePendingMessageQueueV2LocalIds();
         if (localIds.length === 0) return 0;
         const request = () => discardPendingQueueV2Messages({
             token: this.token,
@@ -6884,6 +6934,8 @@ export class ApiSessionClient extends EventEmitter {
             // claim on this one, so neither a wake nor a timer may retry it.
             return { didMaterialize: false, result: { type: 'publisher_lost' } };
         }
+        this.pendingReofferDue = false;
+        this.schedulePendingReoffer();
         let materializeResult: PendingQueueMaterializeNextResult;
         reportPendingMaterializationDiagnosticPhase(opts.onDiagnosticPhase, 'materialize.server_claim');
         if (serverContract.pendingInput === 'released_server_v0_2_1') {
@@ -6945,6 +6997,7 @@ export class ApiSessionClient extends EventEmitter {
                             : opts.pendingQueueDeliveryTiming
                                 ?? resolveSessionPendingQueueDeliveryTiming(null),
                         foregroundState: opts.foregroundState ?? this.resolvePendingForegroundState(),
+                        heldLocalIds: [...this.canonicalPendingDeliveryByLocalId.keys()],
                     }),
                 });
             } catch (error) {
@@ -7013,6 +7066,8 @@ export class ApiSessionClient extends EventEmitter {
             authoritativeState: materializeResult.pendingQueueState ?? null,
         });
         this.pendingQueueState = pendingStateUpdate.state;
+        this.pendingReofferNeeded = !materializeResult.didMaterialize;
+        this.schedulePendingReoffer();
         if (pendingStateUpdate.changed) {
             this.pendingWakeSeq += 1;
         }
@@ -7108,6 +7163,8 @@ export class ApiSessionClient extends EventEmitter {
             && materializedMessage.localId
         ) {
             if (this.canonicalPendingDeliveryByLocalId.has(materializedMessage.localId)) {
+                this.pendingReofferNeeded = true;
+                this.schedulePendingReoffer();
                 logger.debug('[pendingQueue] materialize result suppressed for already-unresolved provider delivery state', {
                     sessionId: this.sessionId,
                     localId: materializedMessage.localId,
@@ -7127,7 +7184,7 @@ export class ApiSessionClient extends EventEmitter {
                         : {}),
                 },
             );
-            this.armProviderInputOutcomeIdleBackstop();
+            this.schedulePendingCustodyOutcomeTimeout(materializedMessage.localId);
         }
 
         if (materializeResult.providerDeliveryContractInvalid === true) {
@@ -7297,7 +7354,6 @@ export class ApiSessionClient extends EventEmitter {
         reportPendingMaterializationDiagnosticPhase(opts.onDiagnosticPhase, 'materialize.delivery_reconcile');
         if (!await this.reconcileCanonicalPendingDeliveriesBeforeMaterialization()) {
             this.logMaterializationHeldByProviderCustody();
-            this.armProviderInputOutcomeIdleBackstop();
             return { type: 'no_pending' };
         }
 
@@ -7305,7 +7361,7 @@ export class ApiSessionClient extends EventEmitter {
         if (!this.pendingQueueState.known) {
             reportPendingMaterializationDiagnosticPhase(opts.onDiagnosticPhase, 'materialize.pending_snapshot');
             await this.reconcilePendingQueueState({ force: true });
-        } else if (countMaterializablePendingRows(this.pendingQueueState) <= 0) {
+        } else if (!this.hasPendingMaterializationWork()) {
             if (policy === 'force') {
                 reportPendingMaterializationDiagnosticPhase(opts.onDiagnosticPhase, 'materialize.pending_snapshot');
                 await this.reconcilePendingQueueState({ force: true });
@@ -7317,7 +7373,7 @@ export class ApiSessionClient extends EventEmitter {
         if (!this.pendingQueueState.known) {
             return { type: 'retryable_transport' };
         }
-        if (countMaterializablePendingRows(this.pendingQueueState) <= 0) {
+        if (!this.hasPendingMaterializationWork()) {
             return { type: 'no_pending' };
         }
         reportPendingMaterializationDiagnosticPhase(opts.onDiagnosticPhase, 'materialize.turn_status');
@@ -7328,7 +7384,7 @@ export class ApiSessionClient extends EventEmitter {
             this.logPendingMaterializationSkip('turn_status_refresh_failed');
             return { type: 'retryable_transport' };
         }
-        if (countMaterializablePendingRows(this.pendingQueueState) <= 0) {
+        if (!this.hasPendingMaterializationWork()) {
             return { type: 'no_pending' };
         }
         opts.expectedPendingVersion ??= this.pendingQueueState.pendingVersion;
@@ -7368,17 +7424,17 @@ export class ApiSessionClient extends EventEmitter {
         if (!await this.reconcileCanonicalPendingDeliveriesBeforeMaterialization()) {
             return false;
         }
-        if (countMaterializablePendingRows(this.pendingQueueState) <= 0) {
+        if (!this.hasPendingMaterializationWork()) {
             await this.reconcilePendingQueueState({ force: !this.pendingQueueState.known });
         }
-        if (countMaterializablePendingRows(this.pendingQueueState) <= 0) {
+        if (!this.hasPendingMaterializationWork()) {
             return false;
         }
         const refreshedTurnStatus = await this.reconcileTurnStatusBeforePendingMaterializationIfNeeded();
         if (!refreshedTurnStatus) {
             return false;
         }
-        if (countMaterializablePendingRows(this.pendingQueueState) <= 0) {
+        if (!this.hasPendingMaterializationWork()) {
             return false;
         }
         const inner = await this.runMaterializeNextPendingMessageInner({

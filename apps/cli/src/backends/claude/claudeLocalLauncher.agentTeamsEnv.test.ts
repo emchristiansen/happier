@@ -58,7 +58,7 @@ function createSessionStub(sessionId: string = 'api-session-1'): Session {
     waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted,
     waitForPendingEligibilityUpdate: vi.fn(async () => true),
     popPendingMessage: vi.fn(async () => false),
-    peekPendingMessageQueueV2Count: vi.fn(async () => 0),
+    peekActionablePendingMessageQueueV2Count: vi.fn(async () => 0),
     discardPendingMessageQueueV2All: vi.fn(async () => 0),
     discardCommittedMessageLocalIds: vi.fn(async () => 0),
     sendSessionDeath: vi.fn(),

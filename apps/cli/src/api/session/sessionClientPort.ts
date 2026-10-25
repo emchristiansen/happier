@@ -191,7 +191,7 @@ export interface SessionClientPort {
   materializeNextPendingMessageSafely?(opts?: MaterializeNextPendingOptions): Promise<MaterializeNextPendingResult>;
   popPendingMessage(): Promise<boolean>;
 
-  peekPendingMessageQueueV2Count(opts?: PendingQueueReadOptions): Promise<number>;
+  peekActionablePendingMessageQueueV2Count(opts?: PendingQueueReadOptions): Promise<number>;
   discardPendingMessageQueueV2All(opts: { reason: 'switch_to_local' | 'manual' }): Promise<number>;
   discardCommittedMessageLocalIds(opts: { localIds: string[]; reason: 'switch_to_local' | 'manual' }): Promise<number>;
 

@@ -5,7 +5,37 @@ export type ConnectedServiceSessionAuthSwitchReason =
   | 'manual'
   | 'pre_turn_group_policy';
 
-type LockTail = Promise<void>;
+// Ordinary queued acquisition, not execution, is bounded: the executing owner keeps exclusion
+// until it finishes. This is below the default 60s turn deferral and the 120s refresh scheduling
+// lease. The one unbounded exception is `runExclusiveDeferredBackground`, for work nobody awaits.
+const SESSION_AUTH_SWITCH_ACQUISITION_TIMEOUT_MS = 30_000;
+
+type AcquisitionCancellationReason = 'timed_out' | 'session_stopped';
+
+// How long a queued acquisition may wait. Both kinds stay cancellable by `clearSession`.
+type AcquisitionBound =
+  | Readonly<{ kind: 'bounded'; timeoutMs: number }>
+  | Readonly<{ kind: 'until_acquired_or_stopped' }>;
+
+export class ConnectedServiceSessionAuthSwitchAcquisitionError extends Error {
+  constructor(
+    readonly sessionId: string,
+    readonly reason: AcquisitionCancellationReason,
+  ) {
+    super(`connected_service_session_auth_switch_acquisition_${reason}:${sessionId}`);
+    this.name = 'ConnectedServiceSessionAuthSwitchAcquisitionError';
+  }
+}
+
+type QueuedAcquisition = Readonly<{
+  start(): void;
+  cancel(reason: AcquisitionCancellationReason): void;
+}>;
+
+type SessionLock = {
+  ownerId: symbol | null;
+  queue: Set<QueuedAcquisition>;
+};
 type ActiveSessionLockOwner = Readonly<{
   registry: ConnectedServiceSessionAuthSwitchLockRegistry;
   sessionId: string;
@@ -15,78 +45,132 @@ type ActiveSessionLockOwner = Readonly<{
 const activeSessionLockOwners = new AsyncLocalStorage<ReadonlyArray<ActiveSessionLockOwner>>();
 
 export class ConnectedServiceSessionAuthSwitchLockRegistry {
-  private readonly tailsBySessionId = new Map<string, LockTail>();
-  private readonly activeOwnerIdsBySessionId = new Map<string, Set<symbol>>();
+  private readonly locksBySessionId = new Map<string, SessionLock>();
 
-  async runExclusive<T>(
+  /**
+   * Runs `operation` while holding the session's lock. A queued acquisition fails with
+   * `timed_out` after 30 seconds, or with `session_stopped` when `clearSession` cancels it.
+   */
+  runExclusive<T>(
     sessionId: string,
     operation: () => Promise<T>,
+  ): Promise<T> {
+    return this.acquire(sessionId, operation, {
+      kind: 'bounded',
+      timeoutMs: SESSION_AUTH_SWITCH_ACQUISITION_TIMEOUT_MS,
+    });
+  }
+
+  /**
+   * Like `runExclusive`, on the same lock and FIFO queue, with the same re-entry and caller
+   * ancestry, except that a queued acquisition has no timeout: it runs after every transition
+   * already holding or awaiting the lock, however long they take. Only `clearSession` (explicit
+   * Stop or final child cleanup) cancels it while queued, with `session_stopped`; a cancelled
+   * acquisition never runs later and is not requeued.
+   *
+   * Only work that nobody awaits may use this: the refreshed-credential distribution's deferred
+   * application for a session whose lock another transition holds. An awaited caller uses
+   * `runExclusive`, whose bound keeps it from waiting indefinitely. An owner that never finishes
+   * keeps such an acquisition queued until the session is stopped.
+   */
+  runExclusiveDeferredBackground<T>(
+    sessionId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    return this.acquire(sessionId, operation, { kind: 'until_acquired_or_stopped' });
+  }
+
+  private async acquire<T>(
+    sessionId: string,
+    operation: () => Promise<T>,
+    bound: AcquisitionBound,
   ): Promise<T> {
     if (this.hasActiveOwner(sessionId)) {
       return await operation();
     }
 
-    const previous = this.tailsBySessionId.get(sessionId) ?? Promise.resolve();
-    let release!: () => void;
-    const current = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const nextTail = previous.then(() => current, () => current);
-    this.tailsBySessionId.set(sessionId, nextTail);
-
-    await previous.catch(() => {});
-    const ownerId = Symbol('connected-service-session-auth-switch-lock-owner');
-    this.addActiveOwner(sessionId, ownerId);
-    try {
-      const parentOwners = activeSessionLockOwners.getStore() ?? [];
-      return await activeSessionLockOwners.run([
-        ...parentOwners,
-        { registry: this, sessionId, ownerId },
-      ], operation);
-    } finally {
-      this.removeActiveOwner(sessionId, ownerId);
-      release();
-      if (this.tailsBySessionId.get(sessionId) === nextTail) {
-        this.tailsBySessionId.delete(sessionId);
+    const parentOwners = activeSessionLockOwners.getStore() ?? [];
+    const lock = this.locksBySessionId.get(sessionId) ?? { ownerId: null, queue: new Set<QueuedAcquisition>() };
+    this.locksBySessionId.set(sessionId, lock);
+    return await new Promise<T>((resolve, reject) => {
+      let phase: 'queued' | 'acquired' | 'cancelled' = 'queued';
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const removeQueued = () => {
+        if (timer !== undefined) clearTimeout(timer);
+        lock.queue.delete(acquisition);
+      };
+      const acquisition: QueuedAcquisition = {
+        start: () => {
+          if (phase !== 'queued') return;
+          phase = 'acquired';
+          removeQueued();
+          const ownerId = Symbol('connected-service-session-auth-switch-lock-owner');
+          lock.ownerId = ownerId;
+          void this.runAsOwner(sessionId, lock, ownerId, parentOwners, operation).then(resolve, reject);
+        },
+        cancel: (reason) => {
+          if (phase !== 'queued') return;
+          phase = 'cancelled';
+          removeQueued();
+          reject(new ConnectedServiceSessionAuthSwitchAcquisitionError(sessionId, reason));
+        },
+      };
+      if (lock.ownerId === null) {
+        acquisition.start();
+      } else {
+        lock.queue.add(acquisition);
+        if (bound.kind === 'bounded') {
+          timer = setTimeout(() => acquisition.cancel('timed_out'), bound.timeoutMs);
+        }
       }
-    }
+    });
   }
 
   clearSession(sessionId: string): void {
-    // Runner exit is not cancellation of an in-flight auth transition. Its
-    // finally block owns release, including switches already queued behind it.
-    if (this.tailsBySessionId.has(sessionId)) return;
-    this.activeOwnerIdsBySessionId.delete(sessionId);
+    const lock = this.locksBySessionId.get(sessionId);
+    if (!lock) return;
+    for (const acquisition of lock.queue) acquisition.cancel('session_stopped');
+    // Runner exit or Stop is not cancellation of an in-flight auth transition. An active
+    // owner may still be unwinding: keep its lock and reentrant capability until its own
+    // finally block releases them, so a later request cannot run concurrently with it.
+  }
+
+  private async runAsOwner<T>(
+    sessionId: string,
+    lock: SessionLock,
+    ownerId: symbol,
+    parentOwners: ReadonlyArray<ActiveSessionLockOwner>,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await activeSessionLockOwners.run([
+        ...parentOwners,
+        { registry: this, sessionId, ownerId },
+      ], async () => await operation());
+    } finally {
+      lock.ownerId = null;
+      const next = lock.queue.values().next().value;
+      if (next) next.start();
+      else this.locksBySessionId.delete(sessionId);
+    }
+  }
+
+  /**
+   * Whether another transition holds or awaits this session's lock. The calling async context's
+   * own hold does not count, because its re-entry runs at once.
+   */
+  isHeldByAnotherOwner(sessionId: string): boolean {
+    return this.locksBySessionId.has(sessionId) && !this.hasActiveOwner(sessionId);
   }
 
   private hasActiveOwner(sessionId: string): boolean {
     const owners = activeSessionLockOwners.getStore();
-    if (!owners) return false;
-    const activeOwnerIds = this.activeOwnerIdsBySessionId.get(sessionId);
-    if (!activeOwnerIds) return false;
-    return owners.some((owner) => (
+    const ownerId = this.locksBySessionId.get(sessionId)?.ownerId;
+    return ownerId != null && (owners?.some((owner) => (
       owner.registry === this
       && owner.sessionId === sessionId
-      && activeOwnerIds.has(owner.ownerId)
-    ));
-  }
-
-  private addActiveOwner(sessionId: string, ownerId: symbol): void {
-    const existing = this.activeOwnerIdsBySessionId.get(sessionId);
-    if (existing) {
-      existing.add(ownerId);
-      return;
-    }
-    this.activeOwnerIdsBySessionId.set(sessionId, new Set([ownerId]));
-  }
-
-  private removeActiveOwner(sessionId: string, ownerId: symbol): void {
-    const existing = this.activeOwnerIdsBySessionId.get(sessionId);
-    if (!existing) return;
-    existing.delete(ownerId);
-    if (existing.size === 0) {
-      this.activeOwnerIdsBySessionId.delete(sessionId);
-    }
+      && owner.ownerId === ownerId
+    )) ?? false);
   }
 }
 

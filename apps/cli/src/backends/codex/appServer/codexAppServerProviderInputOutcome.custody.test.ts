@@ -541,6 +541,7 @@ describe('Codex app-server provider-input outcomes reach Queue custody', () => {
   });
 
   it('retries a failed uncertain block on the same live client until the server acknowledges it', async () => {
+    vi.stubEnv('HAPPIER_PENDING_CUSTODY_OUTCOME_TIMEOUT_MS', '1000');
     const localId = 'steer-uncertain-block-retried-local';
     const client = await createCodexSessionClient();
     const { root, endActiveTurn } = await startScriptedCodexAppServer();
@@ -558,15 +559,16 @@ describe('Codex app-server provider-input outcomes reach Queue custody', () => {
     await endActiveTurn();
     await activeTurn;
     await waitUntil(() => blockReasonsFor(localId).length === 1);
+    // A retained failed-write obligation releases the queue before its durable retry succeeds.
+    materializeNextMock.mockResolvedValueOnce(emptyQueueMaterializeResult());
     await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
       .resolves.toEqual({ type: 'no_pending' });
+    expect(materializeNextMock).toHaveBeenCalledTimes(2);
 
-    // Transport has recovered; the same client writes the owed block again and releases the hold.
+    // Transport has recovered; the same canonical owner retries the owed block without restoring the hold.
     await waitUntil(() => blockReasonsFor(localId).length === 2, 5_000);
     expect(blockReasonsFor(localId)).toEqual(['delivery_outcome_uncertain', 'delivery_outcome_uncertain']);
-    materializeNextMock.mockResolvedValueOnce(emptyQueueMaterializeResult());
-    await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
-    expect(materializeNextMock).toHaveBeenCalledTimes(2);
+    expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
     await new Promise((resolve) => setTimeout(resolve, 2_500));
     expect(blockReasonsFor(localId)).toHaveLength(2);
   });
@@ -675,7 +677,7 @@ describe('Codex app-server provider-input outcomes reach Queue custody', () => {
   });
 });
 
-describe('Queue custody idle backstop', () => {
+describe('Queue canonical custody watchdog', () => {
   beforeAll(async () => {
     sessionClientModulePromise ??= import('@/api/session/sessionClient');
     await sessionClientModulePromise;
@@ -715,38 +717,26 @@ describe('Queue custody idle backstop', () => {
     vi.unstubAllGlobals();
   });
 
-  it('turns a held input with no provider outcome into an uncertain block after the idle grace, never during a turn', async () => {
-    const { PROVIDER_INPUT_OUTCOME_IDLE_GRACE_MS } = await import('@/api/session/sessionClient');
+  it.each([false, true])('blocks missing outcomes at the existing 120s timeout (active=%s)', async (active) => {
     const localId = 'held-without-outcome-local';
     const client = await createCodexSessionClient();
-    // The provider takes the input and never reports any outcome for it.
     const handedToProvider = vi.fn();
-    client.onUserMessage(() => {
-      handedToProvider();
-    });
+    client.onUserMessage(handedToProvider);
     materializeNextMock.mockResolvedValueOnce(providerDeliveryMaterializeResult(localId, 'never answered'));
     vi.useFakeTimers();
-
-    // A turn is running: holding the input is legitimate however long the turn lasts.
-    await client.sessionTurnLifecycle.beginTurn({ provider: 'codex' });
-    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+    if (active) await client.sessionTurnLifecycle.beginTurn({ provider: 'codex' });
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force', activeTurnSteerability: 'steerable' }))
       .resolves.toMatchObject({ type: 'materialized', localId });
     expect(handedToProvider).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(2 * PROVIDER_INPUT_OUTCOME_IDLE_GRACE_MS);
+    await vi.advanceTimersByTimeAsync(119_999);
     expect(blockReasonsFor(localId)).toEqual([]);
-
-    // Idle: the hold is now waiting on nothing, so it lasts only the grace.
-    await client.sessionTurnLifecycle.completeTurn({ provider: 'codex' });
-    await vi.advanceTimersByTimeAsync(PROVIDER_INPUT_OUTCOME_IDLE_GRACE_MS - 1);
-    expect(blockReasonsFor(localId)).toEqual([]);
-    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
-      .resolves.toEqual({ type: 'no_pending' });
-    expect(materializeNextMock).toHaveBeenCalledTimes(1);
-
     await vi.advanceTimersByTimeAsync(1);
     expect(blockReasonsFor(localId)).toEqual(['delivery_outcome_uncertain']);
+    expect(client.shouldAttemptPendingMaterialization()).toBe(true);
     materializeNextMock.mockResolvedValueOnce(emptyQueueMaterializeResult());
-    await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+    await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force', activeTurnSteerability: 'steerable' });
     expect(materializeNextMock).toHaveBeenCalledTimes(2);
+    // Blocking releases the queue but retains the original ID for qualified late acceptance.
+    expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
   });
 });
