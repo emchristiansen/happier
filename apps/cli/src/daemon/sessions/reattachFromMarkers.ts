@@ -1,4 +1,6 @@
 import { logger } from '@/ui/logger';
+import { configuration } from '@/configuration';
+import { resolveHappierHomeDirComparableKey } from '../ownership/happierHomeDirComparableKey';
 import type { Credentials } from '@/persistence';
 import { parseOptionalBooleanEnv } from '@happier-dev/protocol';
 import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
@@ -192,13 +194,7 @@ function readConnectedServiceRestartIntent(marker: DaemonSessionMarker): Readonl
 }
 
 async function recoverMarkerlessDaemonSpawnedSessions(params: Readonly<{
-  happyProcesses: ReadonlyArray<{
-    pid: number;
-    command: string;
-    type: string;
-    cwd?: string;
-    environmentVariables?: Record<string, string>;
-  }>;
+  happyProcesses: ReadonlyArray<HappyProcessInfo>;
   incompleteMarkerByPid: ReadonlyMap<number, Readonly<{
     happySessionId: string;
     startedBy?: string;
@@ -212,12 +208,20 @@ async function recoverMarkerlessDaemonSpawnedSessions(params: Readonly<{
   credentials?: Credentials | null;
 }>): Promise<number> {
   const { happyProcesses, incompleteMarkerByPid, markedPids, pidToTrackedSession, credentials } = params;
+  const currentHomeKey = resolveHappierHomeDirComparableKey(configuration.happyHomeDir);
+  if (currentHomeKey === null) return 0;
   let recovered = 0;
 
   for (const processInfo of happyProcesses) {
     if (markedPids.has(processInfo.pid) || pidToTrackedSession.has(processInfo.pid)) {
       continue;
     }
+    // A shared runtime identifies the install, not the daemon home. Even an incomplete
+    // local marker cannot replace explicit home ownership from the live process.
+    const processHomeKey = resolveHappierHomeDirComparableKey(
+      processInfo.daemonOwnershipEnvironmentVariables?.HAPPIER_HOME_DIR,
+    );
+    if (processHomeKey === null || processHomeKey !== currentHomeKey) continue;
     const incompleteMarker = incompleteMarkerByPid.get(processInfo.pid);
     const isGenericHappySession = processInfo.type === 'user-session' || processInfo.type === 'dev-session';
     const liveExistingSessionId = extractExistingSessionIdFromCommand(processInfo.command);
