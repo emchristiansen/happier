@@ -25,6 +25,11 @@ vi.mock("@/utils/logging/log", () => ({
     log: mockLog,
 }));
 
+vi.mock("fastify", async (importOriginal) => {
+    const actual = await importOriginal<typeof import("fastify")>();
+    return { ...actual, default: vi.fn(actual.default) };
+});
+
 async function listenOnce(port: number): Promise<void> {
     const server = createServer();
     await new Promise<void>((resolve, reject) => {
@@ -65,8 +70,9 @@ describe("metrics server", () => {
         }
     });
 
-    beforeEach(() => {
+    beforeEach(async () => {
         vi.resetModules();
+        vi.mocked((await import("fastify")).default).mockClear();
         mockPrismaMetrics.mockReset();
         mockQueryRaw.mockReset();
         mockRegisterMetrics.mockReset();
@@ -148,8 +154,7 @@ describe("metrics server", () => {
         process.env.METRICS_ENABLED = "true";
         process.env.METRICS_PORT = String(port);
 
-        const fastifyModule = await import("fastify");
-        const fastifyFactory = vi.spyOn(fastifyModule, "default");
+        const fastifyFactory = vi.mocked((await import("fastify")).default);
 
         try {
             const { startMetricsServer } = await import("./metrics");
@@ -169,7 +174,7 @@ describe("metrics server", () => {
                     }
                 }
             } finally {
-                fastifyFactory.mockRestore();
+                fastifyFactory.mockClear();
             }
         }
     });
