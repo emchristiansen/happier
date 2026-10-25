@@ -5,7 +5,8 @@ import { z } from "zod";
 import { readEncryptionFeatureEnv } from "@/app/features/catalog/readFeatureEnv";
 import { resolveEncryptionWriteRejectionCode, type EncryptionPolicyRejectionCode } from "@/app/session/encryptionRejectionCodes";
 import { checkSessionAccess, requireAccessLevel } from "@/app/share/accessControl";
-import { inTx } from "@/storage/inTx";
+import { db } from "@/storage/db";
+import { inTx, type Tx } from "@/storage/inTx";
 import { isPrismaErrorCode } from "@/storage/prisma";
 import {
     isStoredContentKindAllowedForSessionByStoragePolicy,
@@ -283,74 +284,50 @@ async function upsertSessionSystemRecordWithRetry(
     if (!access.ok) return access;
 
     try {
+        // Fast path: an upsert that would change nothing is answered from committed rows without
+        // opening a write transaction. Only the transaction's own "unchanged" outcome is taken here;
+        // every other outcome runs the transaction below, which re-reads everything. See
+        // readSessionSystemRecordUpsertState for why this is linearizable.
+        // The fast path is strictly optional: if its read fails for any reason, the transaction below
+        // runs as before. It re-runs this same decision through the transaction client, so an error
+        // the transactional path would surface surfaces there again, and a transient one gets
+        // inTx's bounded retry, exactly as before the fast path existed.
+        const fast = await readSessionSystemRecordUpsertState(db, params).catch(() => null);
+        if (fast?.kind === "unchanged") return fast.result;
+
         return await inTx(async (tx) => {
-            const session = await tx.session.findUnique({
-                where: { id: params.sessionId },
-                select: { accountId: true, encryptionMode: true },
-            });
-            if (!session) return { ok: false, error: "session-not-found" };
-            const recordScope = resolveSystemRecordAccountScope({
-                namespace: params.namespace,
-                actorUserId: params.actorUserId,
-                sessionAccountId: typeof session.accountId === "string" ? session.accountId : undefined,
-            });
-
-            const sessionEncryptionMode: "e2ee" | "plain" = session.encryptionMode === "plain" ? "plain" : "e2ee";
-            const storageMode = buildStorageModeRejection({
-                storagePolicy: readEncryptionFeatureEnv(process.env).storagePolicy,
-                sessionEncryptionMode,
-                content: params.content,
-            });
-            if (!storageMode.ok) {
-                return { ok: false, error: "invalid-params", code: storageMode.code };
-            }
-
-            const existing = await tx.sessionSystemRecord.findUnique({
-                where: {
-                    accountId_sessionId_namespace_localId: {
-                        accountId: recordScope.accountId,
-                        sessionId: params.sessionId,
-                        namespace: params.namespace,
-                        localId: params.localId,
-                    },
-                },
-                select: SESSION_SYSTEM_RECORD_SELECT,
-            });
-
-            if (existing) {
-                if (existing.kind !== params.kind) {
-                    return { ok: false, error: "conflict" };
+            const state = await readSessionSystemRecordUpsertState(tx, params);
+            switch (state.kind) {
+                case "unchanged":
+                case "rejected":
+                    return state.result;
+                case "update": {
+                    const updated = await tx.sessionSystemRecord.update({
+                        where: { id: state.existingId },
+                        data: { content: params.content },
+                        select: SESSION_SYSTEM_RECORD_SELECT,
+                    });
+                    const updatedRecord = toSessionSystemRecordRow(updated);
+                    if (!updatedRecord) return { ok: false, error: "internal" };
+                    return { ok: true, didCreate: false, didUpdate: true, record: updatedRecord };
                 }
-                const existingRecord = toSessionSystemRecordRow(existing);
-                if (!existingRecord) return { ok: false, error: "internal" };
-                if (isDeepStrictEqual(existingRecord.content, params.content)) {
-                    return { ok: true, didCreate: false, didUpdate: false, record: existingRecord };
+                case "create": {
+                    const created = await tx.sessionSystemRecord.create({
+                        data: {
+                            ...state.recordScope,
+                            sessionId: params.sessionId,
+                            namespace: params.namespace,
+                            kind: params.kind,
+                            localId: params.localId,
+                            content: params.content,
+                        },
+                        select: SESSION_SYSTEM_RECORD_SELECT,
+                    });
+                    const createdRecord = toSessionSystemRecordRow(created);
+                    if (!createdRecord) return { ok: false, error: "internal" };
+                    return { ok: true, didCreate: true, didUpdate: false, record: createdRecord };
                 }
-
-                const updated = await tx.sessionSystemRecord.update({
-                    where: { id: existing.id },
-                    data: { content: params.content },
-                    select: SESSION_SYSTEM_RECORD_SELECT,
-                });
-                const updatedRecord = toSessionSystemRecordRow(updated);
-                if (!updatedRecord) return { ok: false, error: "internal" };
-                return { ok: true, didCreate: false, didUpdate: true, record: updatedRecord };
             }
-
-            const created = await tx.sessionSystemRecord.create({
-                data: {
-                    ...recordScope,
-                    sessionId: params.sessionId,
-                    namespace: params.namespace,
-                    kind: params.kind,
-                    localId: params.localId,
-                    content: params.content,
-                },
-                select: SESSION_SYSTEM_RECORD_SELECT,
-            });
-            const createdRecord = toSessionSystemRecordRow(created);
-            if (!createdRecord) return { ok: false, error: "internal" };
-            return { ok: true, didCreate: true, didUpdate: false, record: createdRecord };
         });
     } catch (error) {
         if (retryUniqueRace && isPrismaErrorCode(error, "P2002")) {
@@ -358,6 +335,73 @@ async function upsertSessionSystemRecordWithRetry(
         }
         return { ok: false, error: "internal" };
     }
+}
+
+type SessionSystemRecordReader = Pick<Tx, "session" | "sessionSystemRecord">;
+
+type SessionSystemRecordUpsertState =
+    | Readonly<{ kind: "unchanged"; result: Extract<UpsertSessionSystemRecordResult, { ok: true }> }>
+    | Readonly<{ kind: "rejected"; result: Extract<UpsertSessionSystemRecordResult, { ok: false }> }>
+    | Readonly<{ kind: "update"; existingId: string }>
+    | Readonly<{ kind: "create"; recordScope: SessionRecordAccountScope }>;
+
+/**
+ * The read-only part of an upsert: what it would do, decided from `reader`.
+ *
+ * Inside the transaction `reader` is the transaction client. The fast path calls it with the plain
+ * client and acts only on "unchanged". That answer is linearizable at the record read: a record
+ * naming the session proves the session existed at that instant (SessionSystemRecord.sessionId is
+ * ON DELETE CASCADE, and foreign keys are enforced), and the session fields read just before
+ * (accountId, which fixes the record scope, and encryptionMode, which the storage policy checks)
+ * never change after the session is created.
+ */
+async function readSessionSystemRecordUpsertState(
+    reader: SessionSystemRecordReader,
+    params: UpsertSessionSystemRecordParams,
+): Promise<SessionSystemRecordUpsertState> {
+    const session = await reader.session.findUnique({
+        where: { id: params.sessionId },
+        select: { accountId: true, encryptionMode: true },
+    });
+    if (!session) return { kind: "rejected", result: { ok: false, error: "session-not-found" } };
+    const recordScope = resolveSystemRecordAccountScope({
+        namespace: params.namespace,
+        actorUserId: params.actorUserId,
+        sessionAccountId: typeof session.accountId === "string" ? session.accountId : undefined,
+    });
+
+    const sessionEncryptionMode: "e2ee" | "plain" = session.encryptionMode === "plain" ? "plain" : "e2ee";
+    const storageMode = buildStorageModeRejection({
+        storagePolicy: readEncryptionFeatureEnv(process.env).storagePolicy,
+        sessionEncryptionMode,
+        content: params.content,
+    });
+    if (!storageMode.ok) {
+        return { kind: "rejected", result: { ok: false, error: "invalid-params", code: storageMode.code } };
+    }
+
+    const existing = await reader.sessionSystemRecord.findUnique({
+        where: {
+            accountId_sessionId_namespace_localId: {
+                accountId: recordScope.accountId,
+                sessionId: params.sessionId,
+                namespace: params.namespace,
+                localId: params.localId,
+            },
+        },
+        select: SESSION_SYSTEM_RECORD_SELECT,
+    });
+    if (!existing) return { kind: "create", recordScope };
+
+    if (existing.kind !== params.kind) {
+        return { kind: "rejected", result: { ok: false, error: "conflict" } };
+    }
+    const existingRecord = toSessionSystemRecordRow(existing);
+    if (!existingRecord) return { kind: "rejected", result: { ok: false, error: "internal" } };
+    if (isDeepStrictEqual(existingRecord.content, params.content)) {
+        return { kind: "unchanged", result: { ok: true, didCreate: false, didUpdate: false, record: existingRecord } };
+    }
+    return { kind: "update", existingId: existing.id };
 }
 
 export async function listSessionSystemRecords(
