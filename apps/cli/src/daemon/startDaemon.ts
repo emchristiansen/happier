@@ -2890,6 +2890,11 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           });
 
         const connectedServicesRestartRequestedPids = new Set<number>();
+        // A starting runner retries /session-started until it is answered. Each retry asks the same
+        // readiness question for the same runtime-target registration, so it joins the check still in
+        // flight instead of queueing another forced account-profile read behind it. A settled check is
+        // forgotten, so a later report fetches fresh account-profile data.
+        const sessionReadinessReconciliationByRuntimeTarget = new WeakMap<ConnectedServiceRuntimeTarget, Promise<void>>();
 
         // Handle webhook from happy session reporting itself
         const onHappySessionWebhook = createOnHappySessionWebhook({
@@ -2909,10 +2914,22 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               }
             }
             if (!target || target.pid !== tracked.pid || target.sessionId !== sessionId) return;
-            await enqueueConnectedServiceRuntimeTargetRegistrationReconciliation({
+            const inFlightReadiness = sessionReadinessReconciliationByRuntimeTarget.get(target);
+            if (inFlightReadiness) {
+              await inFlightReadiness;
+              return;
+            }
+            const readiness = enqueueConnectedServiceRuntimeTargetRegistrationReconciliation({
               key: { kind: 'session', pid: tracked.pid },
               target,
             }, true);
+            sessionReadinessReconciliationByRuntimeTarget.set(target, readiness);
+            void readiness.finally(() => {
+              if (sessionReadinessReconciliationByRuntimeTarget.get(target) === readiness) {
+                sessionReadinessReconciliationByRuntimeTarget.delete(target);
+              }
+            }).catch(() => {});
+            await readiness;
           },
           onTrackedSessionReported: async (tracked) => {
             persistPiResumeEnvironment({ tracked, happyHomeDir: configuration.happyHomeDir, logger });
