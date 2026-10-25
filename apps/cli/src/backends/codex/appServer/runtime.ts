@@ -99,12 +99,14 @@ import {
     publishLatestTurnRollbackRangeMetadata,
 } from './rollbackMetadata';
 import {
+    CodexAppServerSteerUnavailableError,
     isCodexAppServerInvalidRequestForMethodError,
     isCodexAppServerInvalidRequestMapExpectedStringError,
     isCodexAppServerInvalidParamsForFieldError,
     isCodexAppServerInvalidParamsError,
     isCodexAppServerMethodNotFoundError,
     isCodexAppServerNoActiveTurnToSteerError,
+    isCodexAppServerSteerRpcErrorResponse,
 } from './appServerCompatibility';
 import { readCodexRateLimitsSnapshot } from './readCodexRateLimitsSnapshot';
 import {
@@ -4828,7 +4830,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
             const steerClientGeneration = clientLifecycleGeneration;
             const expectedTurnId = await waitForSteerableActiveTurnId(activeTurn);
             if (pendingTurn?.promise !== activeTurn.promise || !canSteerPrompt()) {
-                throw new Error('Codex app-server active turn is not steerable');
+                throw new CodexAppServerSteerUnavailableError();
             }
             if (!expectedTurnId) {
                 throw new Error('Codex app-server steerPrompt requires an active turn id');
@@ -4836,7 +4838,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
 
             const structuredInput = await buildCodexTurnInputForPrompt(prompt, params.directory, options);
             if (pendingTurn?.promise !== activeTurn.promise || !canSteerPrompt()) {
-                throw new Error('Codex app-server active turn is not steerable');
+                throw new CodexAppServerSteerUnavailableError();
             }
             const textOnlyInput: CodexAppServerTurnInputItem[] = [{ type: 'text', text: prompt }];
             const pendingProviderPrompt = trackPendingProviderPrompt(prompt, options);
@@ -4865,18 +4867,36 @@ export function createCodexAppServerRuntime(params: Readonly<{
                 clearPendingProviderPrompt(pendingProviderPrompt);
                 return error;
             };
+            let steerRpcMayHaveEffect = false;
+            let previousUnconfirmedSteerRpcError: unknown;
             const requestSteer = async (
                 input: CodexAppServerTurnInputItem[],
                 turnIdKey: 'expectedTurnId' | 'turnId',
             ): Promise<void> => {
                 if (pendingTurn?.promise !== activeTurn.promise || !canSteerPrompt()) {
-                    throw new Error('Codex app-server active turn is not steerable');
+                    if (steerRpcMayHaveEffect) {
+                        // The guard rules out only the next request, not effects of an earlier one.
+                        throw new Error('Codex app-server active turn is not steerable', { cause: previousUnconfirmedSteerRpcError });
+                    }
+                    throw new CodexAppServerSteerUnavailableError();
                 }
-                await client.request('turn/steer', {
-                    ...payload,
-                    input,
-                    [turnIdKey]: expectedTurnId,
-                });
+                const earlierSteerRpcMayHaveEffect = steerRpcMayHaveEffect;
+                steerRpcMayHaveEffect = true;
+                try {
+                    await client.request('turn/steer', {
+                        ...payload,
+                        input,
+                        [turnIdKey]: expectedTurnId,
+                    });
+                } catch (error) {
+                    if (isCodexAppServerSteerRpcErrorResponse(error)) {
+                        // A correlated rejection rules out this attempt, never an earlier one.
+                        steerRpcMayHaveEffect = earlierSteerRpcMayHaveEffect;
+                    } else {
+                        previousUnconfirmedSteerRpcError = error;
+                    }
+                    throw error;
+                }
             };
             const requestSteerWithStaleTurnRecovery = async (
                 input: CodexAppServerTurnInputItem[],
