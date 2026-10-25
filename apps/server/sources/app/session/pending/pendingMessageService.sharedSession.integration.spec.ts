@@ -111,6 +111,18 @@ describe("pendingMessageService (shared sessions)", () => {
         });
     };
 
+    // Released servers persisted these states; current immediate blocks reoffer automatically.
+    const seedHistoricalBlockedPendingMessage = async (params: Parameters<typeof blockPendingDelivery>[0]) => {
+        await db.sessionPendingMessage.update({
+            where: { sessionId_localId: { sessionId: params.sessionId, localId: params.localId } },
+            data: { deliveryState: "blocked", deliveryBlockedReason: params.reason },
+        });
+        await db.session.update({
+            where: { id: params.sessionId },
+            data: { pendingBlockedCount: { increment: 1 }, pendingVersion: { increment: 1 } },
+        });
+    };
+
     const createCommittedTranscriptMessage = async (params: {
         sessionId: string;
         localId: string;
@@ -1282,6 +1294,7 @@ describe("pendingMessageService (shared sessions)", () => {
             ciphertext: "cipher-pending-authoritative",
         })).resolves.toMatchObject({ ok: true });
 
+        await createCurrentPendingEvidencePublisher({ accountId: owner.id, sessionId: session.id });
         await markPendingProviderDeliveryClaimed({ sessionId: session.id, localId });
         await createCommittedTranscriptMessage({
             sessionId: session.id,
@@ -1320,7 +1333,7 @@ describe("pendingMessageService (shared sessions)", () => {
         });
     });
 
-    it("leaves legacy materialization pending when it collides with divergent transcript content", async () => {
+    it("reoffers legacy materialization after a transcript collision without rewriting the transcript", async () => {
         const owner = await createAccount("owner");
         const session = await createSession(owner.id);
         const localId = `legacy-materialize-conflict-${randomUUID()}`;
@@ -1344,9 +1357,12 @@ describe("pendingMessageService (shared sessions)", () => {
         });
 
         const materialized = await materializeNextPendingMessage({ actorUserId: owner.id, sessionId: session.id });
-        expect(materialized.ok).toBe(false);
-        if (materialized.ok) throw new Error("expected materialization conflict");
-        expect(materialized.error).toBe("transcript-conflict");
+        expect(materialized).toMatchObject({
+            ok: true, didMaterialize: true, didWriteMessage: false,
+            message: { content: { t: "encrypted", c: "cipher-legacy-pending-authoritative" }, requestedAction: { v: 1, kind: "enqueue" }, providerAction: "send" },
+        });
+        if (!materialized.ok || !materialized.didMaterialize) throw new Error("expected replacement claim");
+        expect(materialized.message.localId).not.toBe(localId);
 
         await expect(db.sessionMessage.findUniqueOrThrow({
             where: { sessionId_localId: { sessionId: session.id, localId } },
@@ -1354,16 +1370,21 @@ describe("pendingMessageService (shared sessions)", () => {
         })).resolves.toEqual({ content: { t: "encrypted", c: "cipher-legacy-stale-transcript" }, messageRole: "user" });
         await expect(db.sessionPendingMessage.findUniqueOrThrow({
             where: { sessionId_localId: { sessionId: session.id, localId } },
-            select: { status: true, deliveryState: true, deliveryBlockedReason: true, content: true },
+            select: { status: true, deliveryState: true, deliveryBlockedReason: true, discardedReason: true, content: true },
         })).resolves.toEqual({
-            status: "queued",
+            status: "discarded",
             deliveryState: null,
             deliveryBlockedReason: null,
+            discardedReason: "resent_as_new",
             content: { t: "encrypted", c: "cipher-legacy-pending-authoritative" },
         });
+        await expect(db.sessionPendingMessage.findUniqueOrThrow({
+            where: { sessionId_localId: { sessionId: session.id, localId: materialized.message.localId } },
+            select: { status: true, deliveryState: true, requestedAction: true },
+        })).resolves.toEqual({ status: "queued", deliveryState: "delivering", requestedAction: { v: 1, kind: "enqueue" } });
     });
 
-    it("leaves provider materialization pending when it collides with divergent transcript content", async () => {
+    it("reoffers provider materialization after a transcript collision without rewriting the transcript", async () => {
         const owner = await createAccount("owner");
         const session = await createSession(owner.id);
         const localId = `provider-materialize-conflict-${randomUUID()}`;
@@ -1388,9 +1409,12 @@ describe("pendingMessageService (shared sessions)", () => {
             sessionId: session.id,
             deliveryState: "provider",
         });
-        expect(materialized.ok).toBe(false);
-        if (materialized.ok) throw new Error("expected materialization conflict");
-        expect(materialized.error).toBe("transcript-conflict");
+        expect(materialized).toMatchObject({
+            ok: true, didMaterialize: true, didWriteMessage: false,
+            message: { content: { t: "encrypted", c: "cipher-provider-pending-authoritative" }, requestedAction: { v: 1, kind: "enqueue" }, providerAction: "send" },
+        });
+        if (!materialized.ok || !materialized.didMaterialize) throw new Error("expected replacement claim");
+        expect(materialized.message.localId).not.toBe(localId);
 
         await expect(db.sessionMessage.findUniqueOrThrow({
             where: { sessionId_localId: { sessionId: session.id, localId } },
@@ -1398,13 +1422,18 @@ describe("pendingMessageService (shared sessions)", () => {
         })).resolves.toEqual({ content: { t: "encrypted", c: "cipher-provider-stale-transcript" }, messageRole: "user" });
         await expect(db.sessionPendingMessage.findUniqueOrThrow({
             where: { sessionId_localId: { sessionId: session.id, localId } },
-            select: { status: true, deliveryState: true, deliveryBlockedReason: true, content: true },
+            select: { status: true, deliveryState: true, deliveryBlockedReason: true, discardedReason: true, content: true },
         })).resolves.toEqual({
-            status: "queued",
+            status: "discarded",
             deliveryState: null,
             deliveryBlockedReason: null,
+            discardedReason: "resent_as_new",
             content: { t: "encrypted", c: "cipher-provider-pending-authoritative" },
         });
+        await expect(db.sessionPendingMessage.findUniqueOrThrow({
+            where: { sessionId_localId: { sessionId: session.id, localId: materialized.message.localId } },
+            select: { status: true, deliveryState: true, requestedAction: true },
+        })).resolves.toEqual({ status: "queued", deliveryState: "delivering", requestedAction: { v: 1, kind: "enqueue" } });
     });
 
     it("joins accepted provider delivery with a compatible transcript row without rewriting content", async () => {
@@ -1455,6 +1484,7 @@ describe("pendingMessageService (shared sessions)", () => {
             messageRole: "user",
         })).resolves.toMatchObject({ ok: true });
 
+        await createCurrentPendingEvidencePublisher({ accountId: owner.id, sessionId: session.id });
         await markPendingProviderDeliveryClaimed({ sessionId: session.id, localId });
         await createCommittedTranscriptMessage({
             sessionId: session.id,
@@ -1945,10 +1975,10 @@ describe("pendingMessageService (shared sessions)", () => {
         await expect(db.sessionPendingMessage.findMany({
             where: { sessionId: session.id },
             orderBy: [{ position: "asc" }, { localId: "asc" }],
-            select: { localId: true, deliveryState: true },
+            select: { localId: true, deliveryState: true, deliveryBlockedReason: true },
         })).resolves.toEqual([
-            { localId: malformedLocalId, deliveryState: null },
-            { localId: urgentLocalId, deliveryState: "delivering" },
+            { localId: malformedLocalId, deliveryState: "blocked", deliveryBlockedReason: "unsupported_action" },
+            { localId: urgentLocalId, deliveryState: "delivering", deliveryBlockedReason: null },
         ]);
     });
 
@@ -2222,19 +2252,19 @@ describe("pendingMessageService (shared sessions)", () => {
             ciphertext: "cipher-requested-action-other-blocked",
             requestedAction: { v: 1, kind: "send_now" },
         });
-        await blockPendingDelivery({
+        await seedHistoricalBlockedPendingMessage({
             actorUserId: owner.id,
             sessionId: session.id,
             localId: releasableConditionalLocalId,
             reason: "steering_unavailable",
         });
-        await blockPendingDelivery({
+        await seedHistoricalBlockedPendingMessage({
             actorUserId: owner.id,
             sessionId: session.id,
             localId: releasableLocalId,
             reason: "steering_unavailable",
         });
-        await blockPendingDelivery({
+        await seedHistoricalBlockedPendingMessage({
             actorUserId: owner.id,
             sessionId: session.id,
             localId: otherBlockedLocalId,
@@ -2361,7 +2391,7 @@ describe("pendingMessageService (shared sessions)", () => {
         });
     });
 
-    it("keeps an explicit steer strict when steering is unavailable before provider effect", async () => {
+    it("rejects conditional fallback for an explicit steer and reoffers its actual failure as enqueue", async () => {
         const owner = await createAccount("explicit-steer-unavailable-owner");
         const session = await createSession(owner.id);
         const localId = `explicit-steer-unavailable-${randomUUID()}`;
@@ -2397,8 +2427,16 @@ describe("pendingMessageService (shared sessions)", () => {
         })).resolves.toMatchObject({
             ok: true,
             didUpdate: true,
-            pendingBlockedCount: 1,
+            pendingBlockedCount: 0,
         });
+        await expect(db.sessionPendingMessage.findUniqueOrThrow({
+            where: { sessionId_localId: { sessionId: session.id, localId } },
+            select: { status: true, discardedReason: true },
+        })).resolves.toEqual({ status: "discarded", discardedReason: "resent_as_new" });
+        await expect(db.sessionPendingMessage.findFirstOrThrow({
+            where: { sessionId: session.id, status: "queued" },
+            select: { deliveryState: true, providerAction: true, requestedAction: true },
+        })).resolves.toEqual({ deliveryState: null, providerAction: null, requestedAction: { v: 1, kind: "enqueue" } });
     });
 
     it.each([
@@ -2493,7 +2531,7 @@ describe("pendingMessageService (shared sessions)", () => {
             ciphertext: "cipher-requested-action-runtime-disposed",
             requestedAction: { v: 1, kind: "enqueue" },
         });
-        await blockPendingDelivery({
+        await seedHistoricalBlockedPendingMessage({
             actorUserId: owner.id,
             sessionId: session.id,
             localId,
@@ -2586,12 +2624,12 @@ describe("pendingMessageService (shared sessions)", () => {
         if (!firstMaterialize.ok || !firstMaterialize.didMaterialize) throw new Error("expected provider claim");
         expect(firstMaterialize.didWriteMessage).toBe(false);
 
-        await expect(blockPendingDelivery({
+        await seedHistoricalBlockedPendingMessage({
             actorUserId: owner.id,
             sessionId: session.id,
             localId,
             reason: "delivery_outcome_uncertain",
-        })).resolves.toMatchObject({ ok: true, pendingBlockedCount: 1 });
+        });
         await createCommittedTranscriptMessage({
             sessionId: session.id,
             localId,
@@ -2673,12 +2711,12 @@ describe("pendingMessageService (shared sessions)", () => {
         if (!materialize.ok || !materialize.didMaterialize) throw new Error("expected materialization");
         expect(materialize.didWriteMessage).toBe(false);
 
-        await expect(blockPendingDelivery({
+        await seedHistoricalBlockedPendingMessage({
             actorUserId: owner.id,
             sessionId: session.id,
             localId,
             reason: "ambiguous_terminal_delivery",
-        })).resolves.toMatchObject({ ok: true, pendingCount: 1 });
+        });
 
         const handled = await markPendingDeliveryHandled({ actorUserId: owner.id, sessionId: session.id, localId });
         expect(handled.ok).toBe(true);
@@ -2714,12 +2752,12 @@ describe("pendingMessageService (shared sessions)", () => {
             sessionId: session.id,
             deliveryState: "provider",
         })).resolves.toMatchObject({ ok: true, didMaterialize: true });
-        await expect(blockPendingDelivery({
+        await seedHistoricalBlockedPendingMessage({
             actorUserId: owner.id,
             sessionId: session.id,
             localId,
             reason: "delivery_outcome_uncertain",
-        })).resolves.toMatchObject({ ok: true });
+        });
 
         await expect(dismissPendingDelivery({ actorUserId: owner.id, sessionId: session.id, localId }))
             .resolves.toMatchObject({ ok: true, didDismiss: true, pendingCount: 0, pendingBlockedCount: 0 });
@@ -2754,8 +2792,7 @@ describe("pendingMessageService (shared sessions)", () => {
         })).resolves.toMatchObject({ ok: true });
         await expect(materializeNextPendingMessage({ actorUserId: owner.id, sessionId: session.id, deliveryState: "provider" }))
             .resolves.toMatchObject({ ok: true, didMaterialize: true });
-        await expect(blockPendingDelivery({ actorUserId: owner.id, sessionId: session.id, localId, reason: "delivery_outcome_uncertain" }))
-            .resolves.toMatchObject({ ok: true });
+        await seedHistoricalBlockedPendingMessage({ actorUserId: owner.id, sessionId: session.id, localId, reason: "delivery_outcome_uncertain" });
 
         await expect(sendPendingDeliveryAsNew({ actorUserId: owner.id, sessionId: session.id, localId }))
             .resolves.toMatchObject({ ok: true, didWrite: true, pendingCount: 1, pendingBlockedCount: 0 });
@@ -2880,12 +2917,12 @@ describe("pendingMessageService (shared sessions)", () => {
         if (!materialize.ok || !materialize.didMaterialize) throw new Error("expected provider claim");
         expect(materialize.didWriteMessage).toBe(false);
 
-        await expect(blockPendingDelivery({
+        await seedHistoricalBlockedPendingMessage({
             actorUserId: owner.id,
             sessionId: session.id,
             localId,
             reason: "delivery_outcome_uncertain",
-        })).resolves.toMatchObject({ ok: true, pendingBlockedCount: 1 });
+        });
         await createCommittedTranscriptMessage({
             sessionId: session.id,
             localId,
@@ -3433,7 +3470,7 @@ describe("pendingMessageService (shared sessions)", () => {
         })).resolves.toEqual({ pendingCount: 1, pendingBlockedCount: 0 });
     });
 
-    it("blocks accepted ordinary enqueue settlement behind its earlier executable neighbor", async () => {
+    it.each([false, true])("settles accepted ordinary enqueue with an earlier row (blocked=%s)", async (blocked) => {
         const owner = await createAccount("provider-delivery-fifo-settlement");
         const session = await createSession(owner.id);
         const earlierLocalId = `provider-delivery-fifo-earlier-${randomUUID()}`;
@@ -3451,6 +3488,9 @@ describe("pendingMessageService (shared sessions)", () => {
             localId: selectedLocalId,
             ciphertext: "cipher-provider-delivery-fifo-selected",
         })).resolves.toMatchObject({ ok: true });
+        if (blocked) {
+            await blockPendingDelivery({ actorUserId: owner.id, sessionId: session.id, localId: earlierLocalId, reason: "unsupported_action" });
+        }
         await createCurrentPendingEvidencePublisher({
             accountId: owner.id,
             sessionId: session.id,
@@ -3465,23 +3505,22 @@ describe("pendingMessageService (shared sessions)", () => {
             actorUserId: owner.id,
             sessionId: session.id,
             localId: selectedLocalId,
-        })).resolves.toEqual({ ok: false, error: "blocked-by-earlier-pending" });
+        })).resolves.toMatchObject({ ok: true, didResolve: true });
 
         await expect(db.sessionPendingMessage.findMany({
             where: { sessionId: session.id },
             orderBy: { position: "asc" },
             select: { localId: true, status: true, deliveryState: true },
         })).resolves.toEqual([
-            { localId: earlierLocalId, status: "queued", deliveryState: null },
-            { localId: selectedLocalId, status: "queued", deliveryState: "delivering" },
+            { localId: earlierLocalId, status: "queued", deliveryState: blocked ? "blocked" : null },
         ]);
         await expect(db.sessionMessage.count({
             where: { sessionId: session.id, localId: { in: [earlierLocalId, selectedLocalId] } },
-        })).resolves.toBe(0);
+        })).resolves.toBe(1);
         await expect(db.session.findUniqueOrThrow({
             where: { id: session.id },
             select: { pendingCount: true, pendingBlockedCount: true },
-        })).resolves.toEqual({ pendingCount: 2, pendingBlockedCount: 0 });
+        })).resolves.toEqual({ pendingCount: 1, pendingBlockedCount: blocked ? 1 : 0 });
     });
 
     it("rejects accepted provider delivery when neither a pending row nor a committed legacy message exists", async () => {
@@ -3726,7 +3765,7 @@ describe("pendingMessageService (shared sessions)", () => {
         await expect(db.sessionMessage.count({ where: { sessionId: session.id, localId } })).resolves.toBe(0);
     });
 
-    it("converts an actionless delivering row to uncertainty once instead of inferring a rejoin action", async () => {
+    it("reoffers an actionless delivering row once and claims a fresh enqueue instead of inferring its old action", async () => {
         const owner = await createAccount("provider-actionless-rejoin");
         const session = await createSession(owner.id);
         const publisher = await createCurrentPendingEvidencePublisher({ accountId: owner.id, sessionId: session.id });
@@ -3762,19 +3801,47 @@ describe("pendingMessageService (shared sessions)", () => {
             ok: true,
             didMaterialize: false,
             pendingCount: 1,
-            pendingBlockedCount: 1,
+            pendingBlockedCount: 0,
             pendingVersion: 1,
+            deferredReason: "pending_version_mismatch",
             deliveryState: { mode: "provider", unresolved: false },
         });
         await expect(db.sessionPendingMessage.findUniqueOrThrow({
             where: { sessionId_localId: { sessionId: session.id, localId } },
-            select: { deliveryState: true, deliveryBlockedReason: true, providerAction: true },
+            select: { status: true, deliveryState: true, deliveryBlockedReason: true, discardedReason: true, providerAction: true },
         })).resolves.toEqual({
-            deliveryState: "blocked",
-            deliveryBlockedReason: "delivery_outcome_uncertain",
+            status: "discarded",
+            deliveryState: null,
+            deliveryBlockedReason: null,
+            discardedReason: "resent_as_new",
+            providerAction: null,
+        });
+        const replacement = await db.sessionPendingMessage.findFirstOrThrow({
+            where: { sessionId: session.id, status: "queued" },
+            select: { localId: true, content: true, requestedAction: true, providerAction: true },
+        });
+        expect(replacement.localId).not.toBe(localId);
+        expect(replacement).toMatchObject({
+            content: { t: "encrypted", c: "cipher-actionless-rejoin" },
+            requestedAction: { v: 1, kind: "enqueue" },
             providerAction: null,
         });
 
+        const second = await materializeNextPendingMessageForCurrentPublisher({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            deliveryTiming: "after_foreground_ready",
+            foregroundState: "ready",
+            trustedPublisherFence,
+        });
+        expect(second).toMatchObject({
+            ok: true,
+            didMaterialize: true,
+            pendingCount: 1,
+            pendingBlockedCount: 0,
+            message: { localId: replacement.localId, requestedAction: { v: 1, kind: "enqueue" }, providerAction: "send" },
+        });
+        if (!second.ok || !second.didMaterialize) throw new Error("expected replacement claim");
         await expect(materializeNextPendingMessageForCurrentPublisher({
             actorUserId: owner.id,
             sessionId: session.id,
@@ -3782,12 +3849,10 @@ describe("pendingMessageService (shared sessions)", () => {
             foregroundState: "ready",
             trustedPublisherFence,
         })).resolves.toMatchObject({
-            ok: true,
-            didMaterialize: false,
-            pendingCount: 1,
-            pendingBlockedCount: 1,
-            pendingVersion: 1,
+            ok: true, didMaterialize: true, pendingVersion: second.pendingVersion,
+            message: { localId: replacement.localId, providerAction: "send" },
         });
+        await expect(db.sessionPendingMessage.count({ where: { sessionId: session.id } })).resolves.toBe(2);
     });
 
     it("claims ordinary after-runtime-idle work from the exact current-publisher idle revision", async () => {

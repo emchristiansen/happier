@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { db } from "@/storage/db";
+
 import { createFakeSocket, getSocketHandler } from "../testkit/socketHarness";
 
 type CheckSessionAccessFn = typeof import("@/app/share/accessControl").checkSessionAccess;
@@ -172,8 +174,13 @@ describe("sessionUpdateHandler (execution-run-updated)", () => {
             },
         });
 
-        expect(checkSessionAccess).toHaveBeenCalledWith("u1", "s1");
-        expect(getSessionParticipantUserIds).toHaveBeenCalledWith({ sessionId: "s1" });
+        // The relay-auth resolution passes its reader explicitly: the global db, the client both
+        // helpers default to, so these are the same reads as before through the same client.
+        expect(checkSessionAccess).toHaveBeenCalledWith("u1", "s1", db);
+        expect(getSessionParticipantUserIds).toHaveBeenCalledWith({ sessionId: "s1", tx: db });
+        // toHaveBeenCalledWith compares structurally; these pin the reader to the global db itself.
+        expect(checkSessionAccess.mock.calls[0]?.[2]).toBe(db);
+        expect(getSessionParticipantUserIds.mock.calls[0]?.[0]?.tx).toBe(db);
 
         expect(emitEphemeral).toHaveBeenCalledTimes(2);
         expect(emitEphemeral).toHaveBeenCalledWith(expect.objectContaining({
@@ -606,7 +613,10 @@ describe("sessionUpdateHandler (transcript-stream-segment)", () => {
             },
         });
 
-        expect(getSessionParticipantUserIds).toHaveBeenCalledWith({ sessionId: "s1" });
+        expect(getSessionParticipantUserIds).toHaveBeenCalledWith({ sessionId: "s1", tx: db });
+        // toHaveBeenCalledWith compares structurally; these pin the reader to the global db itself.
+        expect(checkSessionAccess.mock.calls[0]?.[2]).toBe(db);
+        expect(getSessionParticipantUserIds.mock.calls[0]?.[0]?.tx).toBe(db);
         expect(emitEphemeral).toHaveBeenCalledTimes(2);
         const ownerCall = emitEphemeral.mock.calls
             .map((call) => call[0])

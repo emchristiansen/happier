@@ -29,6 +29,7 @@ export {
   isPendingLocalId,
   readPendingLocalId,
   PendingLocalIdSchema,
+  PendingMaterializeHeldLocalIdsSchema,
   type PendingLocalId,
 } from './sessionMessages/pendingLocalId.js';
 
@@ -890,6 +891,7 @@ export {
 } from './sessionMessages/sessionStoredMessageContent.js';
 export {
   PENDING_DELIVERY_BLOCKED_REASONS,
+  PENDING_DELIVERY_REOFFER_TIER,
   PendingDeliveryBlockedReasonSchema,
   isConditionalPendingSteerClaim,
   isPendingDeliveryBlockedReason,
@@ -1754,6 +1756,22 @@ export {
   type SessionPendingInputInterruptAndRunRequestV1,
   type SessionPendingInputInterruptAndRunResultV1,
 } from './sessionControl/sessionPendingInputInterruptAndRunV1.js';
+
+export {
+  SessionPendingInputMarkHandledExpectedDeliveryStateV1Schema,
+  SessionPendingInputMarkHandledRejectionKindV1Schema,
+  SessionPendingInputMarkHandledRequestV1Schema,
+  SessionPendingInputMarkHandledResultV1Schema,
+  SessionPendingInputMarkHandledUncertaintyKindV1Schema,
+  SessionPendingInputRowSnapshotV1Schema,
+  type SessionPendingInputMarkHandledExpectedDeliveryStateV1,
+  type SessionPendingInputMarkHandledReadbackV1,
+  type SessionPendingInputMarkHandledRejectionKindV1,
+  type SessionPendingInputMarkHandledRequestV1,
+  type SessionPendingInputMarkHandledResultV1,
+  type SessionPendingInputMarkHandledUncertaintyKindV1,
+  type SessionPendingInputRowSnapshotV1,
+} from './sessionControl/sessionPendingInputMarkHandledV1.js';
 
 export {
   DefaultSessionFoldersV1,

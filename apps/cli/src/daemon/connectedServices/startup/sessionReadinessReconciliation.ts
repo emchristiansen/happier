@@ -8,9 +8,12 @@ import type {
 
 /**
  * How long a runner's `/session-started` readiness waits for its connected-service reconciliation.
- * A daemon-started runner gives each report 10 s (`defaultReportAttemptTimeoutMs` in
- * `agent/runtime/startupSideEffects.ts`) and exits after 90 s without an answer. Half the attempt
- * leaves the rest for session intake, target registration and the answer itself.
+ * By default, the daemon bounds readiness answers at 20 s (`sessionStartedReadiness.ts`), and a
+ * daemon-started runner uses 30 s HTTP attempts (`agent/runtime/startupSideEffects.ts`). A runner
+ * requiring acknowledgement has a ten-minute hard ceiling while receiving readiness answers and
+ * a 90 s retry window without them; its attempt timeout and retry window can be configured.
+ * This five-second wait leaves room for the rest of readiness handling. It does not bound session
+ * intake, target registration or the whole HTTP round trip.
  */
 export const CONNECTED_SERVICE_SESSION_READINESS_WAIT_MS = 5_000;
 
@@ -40,8 +43,8 @@ export const CONNECTED_SERVICE_SESSION_READINESS_RETRY_DELAY_MS = Object.freeze(
  */
 export function createConnectedServiceSessionReadinessReconciliation(deps: Readonly<{
   /**
-   * Runs the target's forced reconciliation. When one is already running, the forced run follows
-   * it with another.
+   * Runs or joins the target's forced reconciliation. Readiness calls and retries share its raw
+   * promise until it settles.
    */
   reconcile: (registration: ConnectedServiceRuntimeTargetRegistration) => Promise<void>;
   isCurrent: (registration: ConnectedServiceRuntimeTargetRegistration) => boolean;
