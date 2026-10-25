@@ -91,7 +91,7 @@ import {
     type CodexAppServerProviderInputOutcomeBridge,
 } from './appServer/codexAppServerProviderInputOutcome';
 import { reportSessionToDaemonIfRunning } from '@/agent/runtime/startupSideEffects';
-import { isCodexAppServerNoActiveTurnToSteerError } from './appServer/appServerCompatibility';
+import { isCodexAppServerSteerRejectedBeforeEffectError } from './appServer/appServerCompatibility';
 import { rememberCodexUsageLimitRecoveryPreference } from './appServer/rememberCodexUsageLimitRecoveryPreference';
 import { resolveConfiguredCodexHome } from './utils/resolveConfiguredCodexHome';
 import { buildCodexAppServerConfigOverrides } from './appServer/buildCodexAppServerConfigOverrides';
@@ -1200,7 +1200,7 @@ export async function runCodex(opts: {
                             permissionModeUpdatedAt: activeTurnPermissionModeUpdatedAtBeforeMessage,
                         });
                     }
-                    if (!isCodexAppServerNoActiveTurnToSteerError(error)) {
+                    if (!isCodexAppServerSteerRejectedBeforeEffectError(error)) {
                         await blockProviderPromptDeliveryBeforeAcceptance({
                             localIds,
                             reason: resolveProviderPromptFailureDeliveryReason(error, true),
@@ -2551,7 +2551,7 @@ export async function runCodex(opts: {
                             await awaitReplaySeedSettlement();
                             continue;
                         } catch (error) {
-                            if (!isCodexAppServerNoActiveTurnToSteerError(error)) {
+                            if (!isCodexAppServerSteerRejectedBeforeEffectError(error)) {
                                 throw error;
                             }
                             await blockProviderPromptDeliveryBeforeAcceptance({

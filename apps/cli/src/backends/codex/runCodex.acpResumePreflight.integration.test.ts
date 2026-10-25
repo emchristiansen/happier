@@ -18,6 +18,7 @@ import { applyPermissionModeToCodexPermissionHandler } from './utils/applyPermis
 import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
 import { createDeferred } from '@/testkit/async/deferred';
 import { createMutableApiSessionClientFixture } from '@/testkit/backends/sessionFixtures';
+import { CodexAppServerSteerUnavailableError } from './appServer/appServerCompatibility';
 
 const modelSyncFlushPendingAfterStartSpy = vi.fn(async () => {});
 const sessionModeSyncFlushPendingAfterStartSpy = vi.fn(async () => {});
@@ -3191,7 +3192,11 @@ describe('runCodex CodexACP resume behavior', () => {
     });
   });
 
-  it('marks directly requeued stale app-server steer messages as already echoed', async () => {
+  it.each([
+    ['native no-active-turn', Object.assign(new Error('no active turn to steer'), { method: 'turn/steer', code: -32000 }), undefined],
+    ['local not-steerable', new CodexAppServerSteerUnavailableError(), undefined],
+    ['explicit local not-steerable', new CodexAppServerSteerUnavailableError(), 'steer'],
+  ] as const)('preserves the requested action after a direct stale steer: %s', async (_kind, error, pendingProviderAction) => {
     resolveRunnerMcpServersSpy.mockImplementationOnce(async () => ({
       happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() },
       mcpServers: {},
@@ -3213,10 +3218,7 @@ describe('runCodex CodexACP resume behavior', () => {
       flushTurn: vi.fn(async () => {}),
       rollbackConversation: vi.fn(async () => ({ ok: true as const, target: { type: 'latest_turn' }, threadId: 'thread-app-server' })),
     };
-    appServerRuntime.steerPrompt.mockRejectedValue(Object.assign(new Error('no active turn to steer'), {
-      method: 'turn/steer',
-      code: -32000,
-    }));
+    appServerRuntime.steerPrompt.mockRejectedValue(error);
     createCodexAppServerRuntimeSpy.mockImplementationOnce(() => appServerRuntime);
 
     let observedSuppressUserEcho: boolean | undefined;
@@ -3224,13 +3226,14 @@ describe('runCodex CodexACP resume behavior', () => {
       if (!lastOnUserMessageHandler) {
         throw new Error('missing-onUserMessage-handler');
       }
-      lastOnUserMessageHandler({
+      await lastOnUserMessageHandler({
         content: { text: 'recover directly from stale steer' },
         meta: {},
         localId: 'local-direct-stale-steer',
-      });
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      const batch = await opts.messageQueue.waitForMessagesAndGetAsString();
+      }, { seq: null, pendingProviderAction });
+      const batch = opts.messageQueue.size() > 0
+        ? await opts.messageQueue.waitForMessagesAndGetAsString()
+        : null;
       observedSuppressUserEcho = batch?.mode?.suppressUserEcho;
       throw new Error('stop-after-direct-requeue');
     };
@@ -3252,14 +3255,27 @@ describe('runCodex CodexACP resume behavior', () => {
       localId: 'local-direct-stale-steer',
       userMessageSeq: null,
     });
-    expect(observedSuppressUserEcho).toBe(true);
+    if (pendingProviderAction === 'steer') {
+      expect(observedSuppressUserEcho).toBeUndefined();
+      expect(lastSessionClient?.blockPendingMessageDelivery).toHaveBeenCalledWith({
+        localIds: ['local-direct-stale-steer'],
+        reason: 'steering_unavailable',
+        providerEffect: 'none',
+      });
+    } else {
+      expect(observedSuppressUserEcho).toBe(true);
+      expect(lastSessionClient?.blockPendingMessageDelivery).not.toHaveBeenCalled();
+    }
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) {
       expect(outcome.error).toEqual(expect.objectContaining({ message: 'stop-after-direct-requeue' }));
     }
   });
 
-  it('does not requeue an app-server steer after an ambiguous transport failure', async () => {
+  it.each([
+    ['transport failure', Object.assign(new Error('temporary steer transport failure'), { method: 'turn/steer', code: 'ECONNRESET' })],
+    ['untyped not-steerable', new Error('Codex app-server active turn is not steerable')],
+  ] as const)('does not requeue an app-server steer after an ambiguous failure: %s', async (_kind, error) => {
     resolveRunnerMcpServersSpy.mockImplementationOnce(async () => ({
       happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() },
       mcpServers: {},
@@ -3277,10 +3293,7 @@ describe('runCodex CodexACP resume behavior', () => {
       setSessionModel: vi.fn(async () => {}),
       setSessionConfigOption: vi.fn(async () => {}),
       steerPrompt: vi.fn(async () => {
-        throw Object.assign(new Error('temporary steer transport failure'), {
-          method: 'turn/steer',
-          code: 'ECONNRESET',
-        });
+        throw error;
       }),
       sendPrompt: vi.fn(async () => {}),
       flushTurn: vi.fn(async () => {}),
@@ -3294,12 +3307,11 @@ describe('runCodex CodexACP resume behavior', () => {
         throw new Error('missing-onUserMessage-handler');
       }
       lastSessionClient!.blockPendingMessageDelivery.mockResolvedValueOnce(true);
-      lastOnUserMessageHandler({
+      await lastOnUserMessageHandler({
         content: { text: 'possibly accepted direct steer' },
         meta: {},
         localId: 'local-direct-ambiguous-steer',
       });
-      await new Promise((resolve) => setTimeout(resolve, 0));
       observedQueuedMessageCount = opts.messageQueue.size();
       throw new Error('stop-after-ambiguous-direct-steer');
     };
@@ -3328,7 +3340,12 @@ describe('runCodex CodexACP resume behavior', () => {
     });
   });
 
-  it('blocks exact pending custody when stale steer reports no active turn', async () => {
+  it.each([
+    ['native no-active-turn', Object.assign(new Error('no active turn to steer'), { method: 'turn/steer', code: -32000 }), 'steering_unavailable', 'none'],
+    ['local not-steerable', new CodexAppServerSteerUnavailableError(), 'steering_unavailable', 'none'],
+    ['untyped not-steerable', new Error('Codex app-server active turn is not steerable'), 'ambiguous_terminal_delivery', undefined],
+    ['transport failure', Object.assign(new Error('temporary steer transport failure'), { method: 'turn/steer', code: 'ECONNRESET' }), 'ambiguous_terminal_delivery', undefined],
+  ] as const)('classifies exact pending custody after a stale steer: %s', async (_kind, staleSteerError, reason, providerEffect) => {
     resolveRunnerMcpServersSpy.mockImplementationOnce(async () => ({
       happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() },
       mcpServers: {},
@@ -3336,10 +3353,6 @@ describe('runCodex CodexACP resume behavior', () => {
     mockAttachedSessionMetadata({ codexSessionId: 'thread-stale-steer', codexBackendMode: 'appServer' });
 
     let turnInFlight = true;
-    const staleSteerError = Object.assign(new Error('no active turn to steer'), {
-      method: 'turn/steer',
-      code: -32000,
-    });
     const sendPrompt = vi.fn(async () => {
       turnInFlight = false;
     });
@@ -3410,8 +3423,8 @@ describe('runCodex CodexACP resume behavior', () => {
     expect(sendPrompt).not.toHaveBeenCalled();
     expect(lastSessionClient?.blockPendingMessageDelivery).toHaveBeenCalledWith({
       localIds: ['local-stale-steer'],
-      reason: 'steering_unavailable',
-      providerEffect: 'none',
+      reason,
+      ...(providerEffect ? { providerEffect } : {}),
     });
     const emittedMessages = (lastSessionClient?.sendSessionEvent as ReturnType<typeof vi.fn> | undefined)?.mock.calls
       .map((call) => call[0]?.message)

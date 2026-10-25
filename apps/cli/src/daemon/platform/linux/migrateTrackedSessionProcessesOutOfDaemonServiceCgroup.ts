@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, posix } from 'node:path';
 
 import type { TrackedSession } from '@/daemon/types';
@@ -44,49 +44,6 @@ async function readProcessChildren(
       .split(/\s+/)
       .map((value) => Number.parseInt(value, 10))
       .filter((value) => Number.isInteger(value) && value > 0);
-  } catch {
-    return [];
-  }
-}
-
-async function readCgroupProcessIds(params: Readonly<{
-  relativePath: string;
-  cgroupRootDir: string;
-}>): Promise<readonly number[]> {
-  try {
-    const raw = await readFile(join(params.cgroupRootDir, params.relativePath, 'cgroup.procs'), 'utf8');
-    return raw
-      .trim()
-      .split(/\s+/)
-      .map((value) => Number.parseInt(value, 10))
-      .filter((value) => Number.isInteger(value) && value > 0);
-  } catch {
-    return [];
-  }
-}
-
-async function readLegacySessionScopeProcessIds(params: Readonly<{
-  legacySessionScopeSubtreeRelativePath: string;
-  cgroupRootDir: string;
-}>): Promise<readonly number[]> {
-  try {
-    const dirEntries = await readdir(
-      join(params.cgroupRootDir, params.legacySessionScopeSubtreeRelativePath),
-      { withFileTypes: true },
-    );
-    const pids = new Set<number>();
-    for (const dirEntry of dirEntries) {
-      if (!dirEntry.isDirectory()) continue;
-      if (!/^happier-session-\d+\.scope$/.test(dirEntry.name)) continue;
-      const scopeProcessIds = await readCgroupProcessIds({
-        relativePath: posix.join(params.legacySessionScopeSubtreeRelativePath, dirEntry.name),
-        cgroupRootDir: params.cgroupRootDir,
-      });
-      for (const pid of scopeProcessIds) {
-        pids.add(pid);
-      }
-    }
-    return Array.from(pids);
   } catch {
     return [];
   }
@@ -220,10 +177,9 @@ export async function migrateTrackedSessionProcessesOutOfDaemonServiceCgroup(par
   const procfsRootDir = params.procfsRootDir ?? '/proc';
   const cgroupRootDir = params.cgroupRootDir ?? '/sys/fs/cgroup';
   const migrated = new Map<number, ProcessCgroupMigration>();
-  const daemonServiceRelativePath = await readUnifiedProcessCgroupRelativePath(daemonPid, procfsRootDir);
-  const daemonLegacySessionScopeSubtreeRelativePath =
-    daemonServiceRelativePath ? resolveDaemonLegacySessionScopeSubtreeRelativePath(daemonServiceRelativePath) : null;
-
+  // Restrict startup migration to the existing marker-reattached classification.
+  // Manual/test daemons can share their cgroup with unrelated processes, and
+  // sibling session scopes can belong to another daemon home.
   for (const trackedSession of params.trackedSessions) {
     if (trackedSession.startedBy !== 'daemon' || trackedSession.reattachedFromDiskMarker !== true) {
       continue;
@@ -252,46 +208,6 @@ export async function migrateTrackedSessionProcessesOutOfDaemonServiceCgroup(par
       const migration = await moveProcessOutOfDaemonServiceCgroup({
         pid,
         daemonPid: params.daemonPid,
-        procfsRootDir,
-        cgroupRootDir,
-      });
-      if (!migration) {
-        continue;
-      }
-      migrated.set(pid, migration);
-    }
-  }
-
-  if (daemonServiceRelativePath) {
-    const residualPids = await readCgroupProcessIds({
-      relativePath: daemonServiceRelativePath,
-      cgroupRootDir,
-    });
-    for (const pid of residualPids) {
-      if (pid === daemonPid || migrated.has(pid)) continue;
-      const migration = await moveProcessOutOfDaemonServiceCgroup({
-        pid,
-        daemonPid,
-        procfsRootDir,
-        cgroupRootDir,
-      });
-      if (!migration) {
-        continue;
-      }
-      migrated.set(pid, migration);
-    }
-  }
-
-  if (daemonLegacySessionScopeSubtreeRelativePath) {
-    const residualLegacyScopePids = await readLegacySessionScopeProcessIds({
-      legacySessionScopeSubtreeRelativePath: daemonLegacySessionScopeSubtreeRelativePath,
-      cgroupRootDir,
-    });
-    for (const pid of residualLegacyScopePids) {
-      if (pid === daemonPid || migrated.has(pid)) continue;
-      const migration = await moveProcessOutOfDaemonServiceCgroup({
-        pid,
-        daemonPid,
         procfsRootDir,
         cgroupRootDir,
       });
