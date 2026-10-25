@@ -90,10 +90,11 @@ function resolveDaemonReportRetryValue(raw: string | undefined, fallback: number
  * `session_startup_reconciliation_failed`.
  *
  * These are requested sleeps only. Attempt count and elapsed time also depend on how long each
- * request takes and on timer scheduling. The loop (unchanged here) has no deadline check before
- * starting the next request, and each request's timeout is the full per-attempt timeout bounded by
- * the whole budget, not by the time remaining, so a late timer can start a request after the
- * deadline and a request started at the deadline can finish after it.
+ * request takes and on timer scheduling. The retry-window guard runs after a failed request,
+ * not before the next one, and its remaining time does not shorten the attempt timeout. Legacy
+ * reports can therefore start or finish beyond that window. Reports requiring acknowledgement
+ * also enforce a separate hard readiness ceiling: they check it before each attempt, cap its
+ * timeout, abort the whole attempt, and reject acknowledgements arriving at or after the ceiling.
  *
  * - base 250 ms (`HAPPIER_DAEMON_REPORT_SESSION_RETRY_INTERVAL_MS`, formerly the fixed interval): a
  *   daemon that is simply not listening yet still gets answered within the first few hundred ms.
