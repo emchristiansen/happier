@@ -34,7 +34,8 @@ auth: {
   token: "<bearer token>",
   clientType: "user-scoped" | "session-scoped" | "machine-scoped",
   sessionId?: "<session id>",
-  machineId?: "<machine id>"
+  machineId?: "<machine id>",
+  publisherIncarnationId?: "<runner process id>"
 }
 ```
 
@@ -42,6 +43,7 @@ Rules enforced server-side:
 - `token` is required.
 - `session-scoped` requires `sessionId`.
 - `machine-scoped` requires `machineId`.
+- `publisherIncarnationId` is optional. A session runner sends a random identifier generated once per runner process; on a machine-authenticated `session-scoped` connection the server records which publisher generation that incarnation registered, so `machine-session-runner-exited` can retire exactly that runner.
 
 ### Connection types
 - `user-scoped`: receives account-wide updates.
@@ -161,6 +163,13 @@ Field names below match on-wire payloads.
 - `machine-update-state`
   - `{ machineId, daemonState, expectedVersion }`
   - Response: `{ result: "success", version, daemonState }` or `{ result: "version-mismatch", version, daemonState }`
+
+- `machine-session-runner-exited`
+  - Machine-scoped connections only. `{ sessionId, publisherIncarnationId }`; both are required.
+  - Sent by a daemon that observed the session's runner process exit while no other live local runner owns the session. `publisherIncarnationId` is the identifier that runner sent in its `/session-started` report and its socket handshake. The server retires the publisher fence only while that incarnation's latest registration on this server process still holds the session's current publisher generation and the reporting machine still hosts the session, so the session stops reading `active` without waiting for the presence timeout. It ends no turn. If the session holds a waiting activation request when this makes it inactive, the server sends that request's activation hint to the owner's machines again, as the presence timeout does.
+  - A report for an incarnation that is not the latest registered one, including a predecessor whose successor has already registered, is rejected as `unmatched` and changes nothing. The record of registrations is in memory on each server process. When the receiving process holds no qualifying current registration for the incarnation (for example, the runner registered on another process, or before a restart), the report is rejected, as `unmatched` or, if that process's record is stale because a successor registered elsewhere, `superseded`; the presence timeout then clears `active`.
+  - Response: `{ status: "closed" | "already_inactive", sessionId }`, `{ status: "rejected", sessionId, reason: "not_found" | "machine_control_unavailable" | "archived" | "superseded" | "unmatched" }`, `{ status: "retryable", sessionId, reason: "internal" }` or `{ status: "rejected", reason: "invalid_request" }`.
+  - A server that predates the event ignores it. The daemon sends the report once, only while connected, and never buffers it. A runner that sent no incarnation is not reported.
 
 - `artifact-read`
   - `{ artifactId }`

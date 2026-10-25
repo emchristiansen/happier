@@ -70,6 +70,7 @@ import {
 } from './sessions/stopSessionContract';
 import { readProcessRunState } from './processRunState';
 import { classifyDaemonLifecycleProcessByPid } from './doctor';
+import { getRunnerPublisherIncarnationId } from '@/api/session/publisherIncarnation';
 
 export type DaemonControlRequestOptions = {
   /** `null` leaves a local control request owned by caller/daemon lifecycle. */
@@ -354,8 +355,45 @@ export async function inspectDaemonRunningStateAndCleanupStaleState(): Promise<D
   }
 }
 
+/** Settles as `promise` does, unless `signal` aborts first; then rejects with the abort reason. */
+function settleUnlessAborted<T>(promise: Promise<T>, signal: AbortSignal | null): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 async function daemonPost(path: string, body?: any, options: DaemonPostOptions = {}): Promise<{ error?: string } | any> {
-  const state = await readDaemonState();
+  // The request budget (the timeout and the caller's signal) covers reading the daemon state as well
+  // as the HTTP exchange.
+  const timeout = resolveDaemonControlTimeoutMs(path, options);
+  const timeoutSignal = timeout === null ? null : AbortSignal.timeout(timeout);
+  const signal = options.signal
+    ? (timeoutSignal ? AbortSignal.any([options.signal, timeoutSignal]) : options.signal)
+    : timeoutSignal;
+  let state: Awaited<ReturnType<typeof readDaemonState>>;
+  try {
+    state = await settleUnlessAborted(readDaemonState(), signal);
+  } catch (error) {
+    if (!signal?.aborted) throw error;
+    const errorMessage = `Request failed: ${path}, ${error instanceof Error ? error.message : 'Unknown error'}`;
+    logger.debug(`[CONTROL CLIENT] ${errorMessage}`);
+    return {
+      error: errorMessage
+    };
+  }
   if (!state?.httpPort) {
     const errorMessage = 'No daemon running, no state file found';
     logger.debug(`[CONTROL CLIENT] ${errorMessage}`);
@@ -375,7 +413,6 @@ async function daemonPost(path: string, body?: any, options: DaemonPostOptions =
   }
 
   try {
-    const timeout = resolveDaemonControlTimeoutMs(path, options);
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     const authToken = options.authScope === 'connected-service-broker-refresh'
       ? deriveConnectedServiceBrokerRefreshToken(state.controlToken)
@@ -385,10 +422,6 @@ async function daemonPost(path: string, body?: any, options: DaemonPostOptions =
     if (authToken) {
       headers['x-happier-daemon-token'] = authToken;
     }
-    const timeoutSignal = timeout === null ? null : AbortSignal.timeout(timeout);
-    const signal = options.signal
-      ? (timeoutSignal ? AbortSignal.any([options.signal, timeoutSignal]) : options.signal)
-      : timeoutSignal;
     const response = await fetch(`http://127.0.0.1:${state.httpPort}${path}`, {
       method: 'POST',
       headers,
@@ -474,6 +507,7 @@ export async function notifyDaemonSessionStarted(
   return await daemonPost('/session-started', {
     sessionId,
     metadata,
+    publisherIncarnationId: getRunnerPublisherIncarnationId(),
   }, options);
 }
 
