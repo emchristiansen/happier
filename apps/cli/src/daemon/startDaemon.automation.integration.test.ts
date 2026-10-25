@@ -2086,6 +2086,78 @@ describe('startDaemon automation wiring (integration)', () => {
     }
   });
 
+  it('joins the in-flight account check when a starting runner retries /session-started', async () => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const pid = 7431;
+    const emptyProfile = {
+      connectedServicesV2: [],
+      connectedServiceCredentialRevisionsV1: [],
+    } as unknown as Awaited<ReturnType<typeof import('@/api/accountProfile').fetchAccountProfile>>;
+    const firstCheck = createDeferred<typeof emptyProfile>();
+    const queuedCheck = createDeferred<typeof emptyProfile>();
+    let run: Promise<void> | null = null;
+    let app: Awaited<ReturnType<typeof createCapturedDaemonControlApp>> | null = null;
+    harness.setAutoShutdownAfterAutomationStart(false);
+
+    try {
+      await installActualDaemonClaudeReadinessWebhook(pid);
+      const { callSessionRpc } = await import('@/session/transport/rpc/sessionRpc');
+      const { fetchAccountProfile } = await import('@/api/accountProfile');
+      vi.mocked(callSessionRpc).mockReset().mockResolvedValue({ ok: true, appliedVia: 'current_truth_fence' });
+      // The server is slow: the first GET /v1/account/profile is still in flight when the runner retries.
+      vi.mocked(fetchAccountProfile)
+        .mockReset()
+        .mockImplementationOnce(async () => await firstCheck.promise)
+        .mockImplementation(async () => await queuedCheck.promise);
+
+      const { startDaemon } = await import('./startDaemon');
+      run = startDaemon();
+      // A cold daemon module graph can take far longer than the helper's default 2 s to compose.
+      await waitForCondition(
+        () => harness.connectedServicesProjectionChangeListeners.length === 1
+          && harness.getDaemonControlServerParams() !== null,
+        'Expected canonical consumer and projection listener composition',
+        12_000,
+      );
+      app = await createCapturedDaemonControlApp();
+      const controlToken = readCapturedDaemonControlToken();
+      const reportReadiness = () => app!.inject({
+        method: 'POST',
+        url: '/session-started',
+        headers: { 'x-happier-daemon-token': controlToken },
+        payload: {
+          sessionId: 'session-claude-readiness-retry',
+          metadata: createDaemonClaudeReadinessMetadata(pid),
+        },
+      });
+
+      const firstAttempt = reportReadiness();
+      await waitForCondition(
+        () => vi.mocked(fetchAccountProfile).mock.calls.length === 1,
+        'Expected the first readiness attempt to start the account check',
+      );
+      const retries = [reportReadiness(), reportReadiness()];
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(fetchAccountProfile).toHaveBeenCalledOnce();
+
+      firstCheck.resolve(emptyProfile);
+      const settled = await Promise.race([
+        Promise.all([firstAttempt, ...retries]),
+        new Promise<'still_waiting'>((resolve) => setTimeout(() => resolve('still_waiting'), 2_000)),
+      ]);
+
+      expect(settled).not.toBe('still_waiting');
+      expect((settled as Array<{ statusCode: number }>).map((response) => response.statusCode)).toEqual([200, 200, 200]);
+      expect(fetchAccountProfile).toHaveBeenCalledOnce();
+    } finally {
+      queuedCheck.resolve(emptyProfile);
+      if (app) await app.close();
+      harness.requestShutdown('happier-cli');
+      if (run) await run;
+      exitSpy.mockRestore();
+    }
+  });
+
   it('ACKs an exact newcomer without waiting for an unrelated blocked aggregate sibling', async () => {
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
     const newcomerPid = 7423;

@@ -1,5 +1,6 @@
 import { sealAccountScopedBlobCiphertext } from '@happier-dev/protocol';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { configuration } from '@/configuration';
 
 import { reattachTrackedSessionsFromMarkers } from './reattachFromMarkers';
 import { findAllHappyProcesses, findHappyProcessByPid } from '../doctor';
@@ -30,8 +31,15 @@ const emptyAdoptResult = {
 } satisfies ReturnType<typeof adoptSessionsFromMarkers>;
 
 function mockHappyProcessesForDiscovery(processes: ReadonlyArray<HappyProcessInfo>): void {
-  vi.mocked(findAllHappyProcesses).mockResolvedValue([...processes]);
-  vi.mocked(findHappyProcessByPid).mockImplementation(async (pid) => processes.find((processInfo) => processInfo.pid === pid) ?? null);
+  // These existing recovery scenarios concern this home's processes. Model the OS
+  // ownership field explicitly; the real-owner suite covers absent/foreign identities.
+  const ownedProcesses = processes.map((processInfo) => ({
+    ...processInfo,
+    daemonOwnershipEnvironmentVariables: processInfo.daemonOwnershipEnvironmentVariables
+      ?? { HAPPIER_HOME_DIR: configuration.happyHomeDir },
+  }));
+  vi.mocked(findAllHappyProcesses).mockResolvedValue(ownedProcesses);
+  vi.mocked(findHappyProcessByPid).mockImplementation(async (pid) => ownedProcesses.find((processInfo) => processInfo.pid === pid) ?? null);
 }
 
 type TestConnectedServiceRestartIntentMarker = DaemonSessionMarker & Readonly<{
@@ -65,6 +73,12 @@ function mockTerminalAttachmentState(state: TerminalAttachmentReadState): void {
 vi.mock('../doctor', () => ({
   findAllHappyProcesses: vi.fn(async () => []),
   findHappyProcessByPid: vi.fn(async () => null),
+}));
+
+// Synthetic fixture PIDs must not read a coincidentally live host process's identity.
+vi.mock('@happier-dev/cli-common/processInstance', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@happier-dev/cli-common/processInstance')>(),
+  readProcessInstanceFingerprintSync: () => null,
 }));
 
 vi.mock('../reattach', () => ({
@@ -834,6 +848,7 @@ describe('reattachTrackedSessionsFromMarkers', () => {
             pid: 12345,
             type: 'daemon-spawned-session',
             cwd: '/tmp/project',
+            daemonOwnershipEnvironmentVariables: { HAPPIER_HOME_DIR: configuration.happyHomeDir },
             environmentVariables: {
               CLAUDE_CONFIG_DIR: '/tmp/claude-config',
             },
@@ -1642,6 +1657,7 @@ describe('reattachTrackedSessionsFromMarkers', () => {
       type: 'user-session',
       cwd: '/tmp/project',
       command: 'node',
+      daemonOwnershipEnvironmentVariables: { HAPPIER_HOME_DIR: configuration.happyHomeDir },
     } satisfies HappyProcessInfo);
     vi.spyOn(process, 'kill').mockImplementation(() => true);
 

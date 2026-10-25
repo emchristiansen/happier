@@ -88,10 +88,10 @@ describe('accepted settlement through real ACK transport', () => {
     { kind: 'malformed response', response: { ok: true } },
     { kind: 'unavailable response', response: undefined },
     { kind: 'uncertain internal NACK', response: { ok: false, error: 'internal' } },
-  ])('retries $kind with the same accepted identity and releases its materialization gate', async ({ response }) => {
+  ])('retries $kind with the same accepted identity without blocking later materialization', async ({ response }) => {
     const { client, state, sent } = await createAcceptedClient([response, committed()]);
     expect(client.hasPendingProviderInputAcceptance('accepted-original')).toBe(true);
-    expect(state.hasMaterializationBlockingCanonicalPendingDelivery()).toBe(true);
+    expect(state.hasMaterializationBlockingCanonicalPendingDelivery()).toBe(false);
     await vi.advanceTimersByTimeAsync(1_000);
     expect(sent).toEqual([
       { v: 1, sessionId: 's1', localId: 'accepted-original' },

@@ -10,6 +10,7 @@ import { eventRouter } from "@/app/events/eventRouter";
 import { createSessionPublisherPresence } from "./sessionPublisherPresence";
 import { expireSessionPublisherCandidates } from "./sessionPublisherPresenceTimeout";
 import { runPresenceTimeoutTick } from "./timeout";
+import { materializeNextPendingMessageForCurrentPublisher } from "@/app/session/pending/materializeNextPendingMessage";
 
 describe("session publisher presence on SQLite", () => {
     let harness: LightSqliteHarness;
@@ -166,7 +167,7 @@ describe("session publisher presence on SQLite", () => {
         expect(secondActionBody).not.toHaveBeenCalled();
     });
 
-    it("contracts inherited provider delivery before successor publisher authority becomes usable", async () => {
+    it("re-offers inherited provider delivery before successor publisher authority becomes usable", async () => {
         const seeded = await seed();
         await db.sessionPendingMessage.createMany({
             data: [{
@@ -206,26 +207,68 @@ describe("session publisher presence on SQLite", () => {
         });
 
         expect(registered.status).toBe("registered");
-        await expect(db.sessionPendingMessage.findMany({
+        const rows = await db.sessionPendingMessage.findMany({
             where: { sessionId: seeded.binding.sessionId },
             orderBy: { position: "asc" },
-            select: { deliveryState: true, deliveryBlockedReason: true, providerAction: true },
-        })).resolves.toEqual([
-            {
-                deliveryState: "blocked",
-                deliveryBlockedReason: "delivery_outcome_uncertain",
-                providerAction: "send",
-            },
-            {
-                deliveryState: "blocked",
-                deliveryBlockedReason: "delivery_outcome_uncertain",
-                providerAction: null,
-            },
+        });
+        expect(rows).toHaveLength(4);
+        expect(rows.slice(0, 2)).toEqual([
+            expect.objectContaining({ status: "discarded", discardedReason: "resent_as_new" }),
+            expect.objectContaining({ status: "discarded", discardedReason: "resent_as_new" }),
         ]);
+        for (const row of rows.slice(2)) {
+            expect(row).toMatchObject({ status: "queued", deliveryState: null, providerAction: null, requestedAction: { v: 1, kind: "enqueue" } });
+            expect(row.position).toBeGreaterThan(2);
+        }
         await expect(db.session.findUniqueOrThrow({
             where: { id: seeded.binding.sessionId },
-            select: { pendingBlockedCount: true, pendingVersion: true, active: true },
-        })).resolves.toEqual({ pendingBlockedCount: 2, pendingVersion: 1, active: true });
+            select: { pendingCount: true, pendingBlockedCount: true, pendingVersion: true, active: true },
+        })).resolves.toEqual({ pendingCount: 2, pendingBlockedCount: 0, pendingVersion: 2, active: true });
+        if (registered.status !== "registered") throw new Error("expected registration");
+        await expect(materializeNextPendingMessageForCurrentPublisher({
+            actorUserId: seeded.binding.accountId,
+            sessionId: seeded.binding.sessionId,
+            trustedPublisherFence: { ...seeded.binding, committedFence: registered.committedFence },
+            deliveryTiming: "after_foreground_ready",
+            foregroundState: "ready",
+        })).resolves.toMatchObject({ ok: true, didMaterialize: true, message: { localId: rows[2].localId, providerAction: "send" } });
+    });
+
+    it("recovers due blocked and external-handoff rows at turnover without resending terminal or fresh refusals", async () => {
+        const seeded = await seed();
+        const now = new Date(seeded.fence.getTime() + 120_000);
+        const dueAt = new Date(now.getTime() - 60_000);
+        const reasons = ["delivery_outcome_uncertain", "ambiguous_terminal_delivery", "unknown", "runtime_disposed_before_delivery", "attempt_expired_before_write", "steering_unavailable",
+            "provider_rejected_before_acceptance", "provider_unavailable_before_acceptance", "terminal_host_unreachable", "runtime_config_blocked", "terminal_composer_draft"];
+        await db.sessionPendingMessage.createMany({ data: [
+            ...reasons.map((reason, index) => ({
+                sessionId: seeded.binding.sessionId, authorAccountId: seeded.binding.accountId,
+                localId: reason, content: { t: "encrypted" as const, c: reason }, requestedAction: { v: 1, kind: "send_now" },
+                position: index + 1, status: "queued" as const, deliveryState: "blocked", deliveryBlockedReason: reason, updatedAt: dueAt,
+            })),
+            { sessionId: seeded.binding.sessionId, authorAccountId: seeded.binding.accountId, localId: "external",
+                content: { t: "encrypted", c: "handoff" }, requestedAction: { v: 1, kind: "enqueue" },
+                position: 12, status: "queued" as const, deliveryState: "external_handoff", updatedAt: dueAt },
+            { sessionId: seeded.binding.sessionId, authorAccountId: seeded.binding.accountId, localId: "terminal",
+                content: { t: "encrypted", c: "terminal" }, requestedAction: { v: 1, kind: "enqueue" },
+                position: 13, status: "queued" as const, deliveryState: "blocked", deliveryBlockedReason: "unsupported_action", updatedAt: dueAt },
+            { sessionId: seeded.binding.sessionId, authorAccountId: seeded.binding.accountId, localId: "fresh",
+                content: { t: "encrypted", c: "fresh" }, requestedAction: { v: 1, kind: "enqueue" },
+                position: 14, status: "queued" as const, deliveryState: "blocked", deliveryBlockedReason: "runtime_config_blocked", updatedAt: now },
+        ] });
+        await db.session.update({ where: { id: seeded.binding.sessionId }, data: { pendingCount: 14, pendingBlockedCount: 13 } });
+        const result = await createSessionPublisherPresence({ now: () => now }).registerPublisher({
+            socket: {}, binding: seeded.binding, completeActivitySnapshot: { state: "idle", activeCount: 0 },
+        });
+        expect(result.status).toBe("registered");
+        await expect(db.sessionPendingMessage.count({ where: { sessionId: seeded.binding.sessionId, discardedReason: "resent_as_new" } })).resolves.toBe(12);
+        const replacements = await db.sessionPendingMessage.findMany({ where: { sessionId: seeded.binding.sessionId, status: "queued" as const, deliveryState: null } });
+        expect(replacements).toHaveLength(12);
+        for (const row of replacements) expect(row).toMatchObject({ requestedAction: { v: 1, kind: "enqueue" }, providerAction: null });
+        await expect(db.sessionPendingMessage.findMany({ where: { sessionId: seeded.binding.sessionId, deliveryState: "blocked" }, orderBy: { position: "asc" }, select: { localId: true } }))
+            .resolves.toEqual([{ localId: "terminal" }, { localId: "fresh" }]);
+        await expect(db.session.findUniqueOrThrow({ where: { id: seeded.binding.sessionId }, select: { pendingCount: true, pendingBlockedCount: true } }))
+            .resolves.toEqual({ pendingCount: 14, pendingBlockedCount: 2 });
     });
 
     it("keeps a newer server instance's fence and baseline when the previous instance closes or times out", async () => {
@@ -1210,6 +1253,89 @@ describe("session publisher presence on SQLite", () => {
         await expect(presence.registerPublisher({
             socket: {}, binding: seeded.binding, completeActivitySnapshot: { state: "idle", activeCount: 0 },
         })).resolves.toEqual({ status: "rejected", reason: "archived" });
+    });
+
+
+    it("retires an exited runner incarnation only while its registration still holds the current publisher generation", async () => {
+        const seeded = await seed();
+        let now = new Date(seeded.fence.getTime());
+        const reportingServer = createSessionPublisherPresence({ now: () => now });
+        const otherServer = createSessionPublisherPresence({ now: () => now });
+        const exitedRunner = {};
+        reportingServer.bindPublisherIncarnation({ socket: exitedRunner, publisherIncarnationId: "incarnation-a" });
+        const exited = await reportingServer.registerPublisher({
+            socket: exitedRunner,
+            binding: seeded.binding,
+            completeActivitySnapshot: { state: "active", activeCount: 1 },
+        });
+        if (exited.status !== "registered") throw new Error("expected registration");
+
+        // The successor registers on another server process, so the reporting server's record of
+        // incarnation A is stale; only the generation check inside the close transaction sees it.
+        now = new Date(exited.committedFence.getTime() + 10);
+        const successorRunner = {};
+        otherServer.bindPublisherIncarnation({ socket: successorRunner, publisherIncarnationId: "incarnation-b" });
+        const successor = await otherServer.registerPublisher({
+            socket: successorRunner,
+            binding: seeded.binding,
+            completeActivitySnapshot: { state: "active", activeCount: 1 },
+        });
+        if (successor.status !== "registered") throw new Error("expected successor registration");
+        expect(successor.publisherGeneration).not.toBe(exited.publisherGeneration);
+        const before = await db.session.findUniqueOrThrow({
+            where: { id: seeded.binding.sessionId },
+            select: { active: true, lastActiveAt: true, publisherGeneration: true, publisherGenerationLastActiveAt: true },
+        });
+
+        await expect(reportingServer.retireExitedPublisher({
+            binding: seeded.binding,
+            publisherIncarnationId: "incarnation-a",
+        })).resolves.toEqual({ status: "superseded" });
+        await expect(db.session.findUniqueOrThrow({
+            where: { id: seeded.binding.sessionId },
+            select: { active: true, lastActiveAt: true, publisherGeneration: true, publisherGenerationLastActiveAt: true },
+        })).resolves.toEqual(before);
+        expect(before).toMatchObject({ active: true, publisherGeneration: successor.publisherGeneration });
+
+        const retired = await otherServer.retireExitedPublisher({
+            binding: seeded.binding,
+            publisherIncarnationId: "incarnation-b",
+        });
+        expect(retired.status).toBe("closed");
+        await expect(db.session.findUniqueOrThrow({
+            where: { id: seeded.binding.sessionId },
+            select: { active: true, publisherGenerationLastActiveAt: true },
+        })).resolves.toEqual({ active: false, publisherGenerationLastActiveAt: null });
+    });
+
+    it("rejects a predecessor's exit report once a successor without an incarnation has registered", async () => {
+        const seeded = await seed();
+        let now = new Date(seeded.fence.getTime());
+        const presence = createSessionPublisherPresence({ now: () => now });
+        const exitedRunner = {};
+        presence.bindPublisherIncarnation({ socket: exitedRunner, publisherIncarnationId: "incarnation-a" });
+        const exited = await presence.registerPublisher({
+            socket: exitedRunner,
+            binding: seeded.binding,
+            completeActivitySnapshot: { state: "active", activeCount: 1 },
+        });
+        if (exited.status !== "registered") throw new Error("expected registration");
+        now = new Date(exited.committedFence.getTime() + 10);
+        const legacySuccessor = await presence.registerPublisher({
+            socket: {},
+            binding: seeded.binding,
+            completeActivitySnapshot: { state: "active", activeCount: 1 },
+        });
+        expect(legacySuccessor.status).toBe("registered");
+
+        await expect(presence.retireExitedPublisher({
+            binding: seeded.binding,
+            publisherIncarnationId: "incarnation-a",
+        })).resolves.toEqual({ status: "rejected", reason: "unmatched" });
+        await expect(db.session.findUniqueOrThrow({
+            where: { id: seeded.binding.sessionId },
+            select: { active: true },
+        })).resolves.toEqual({ active: true });
     });
 
 });
