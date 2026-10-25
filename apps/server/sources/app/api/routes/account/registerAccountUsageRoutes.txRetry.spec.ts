@@ -17,6 +17,7 @@ vi.mock("@/app/monitoring/metrics2", () => ({
 }));
 
 const dbSessionFindFirst = vi.fn();
+const dbUsageReportFindUnique = vi.fn();
 const dbUsageReportUpsert = vi.fn();
 const txSessionFindFirst = vi.fn();
 const txUsageReportFindUnique = vi.fn();
@@ -32,7 +33,8 @@ const inTx = vi.fn(async (run: (tx: unknown) => Promise<unknown>) => run({
 vi.mock("@/storage/db", () => ({
     db: {
         session: { findFirst: dbSessionFindFirst },
-        usageReport: { upsert: dbUsageReportUpsert },
+        // Read by the unchanged-report fast path before any transaction; writes must not use db.
+        usageReport: { findUnique: dbUsageReportFindUnique, upsert: dbUsageReportUpsert },
     },
 }));
 
@@ -42,6 +44,7 @@ describe("registerAccountUsageRoutes usage writes", () => {
     beforeEach(() => {
         vi.clearAllMocks();
         dbSessionFindFirst.mockResolvedValue({ id: "s1" });
+        dbUsageReportFindUnique.mockResolvedValue(null);
         dbUsageReportUpsert.mockRejectedValue(Object.assign(new Error("Socket timeout"), { code: "P1008" }));
         txSessionFindFirst.mockResolvedValue({ id: "s1" });
         txUsageReportFindUnique.mockResolvedValue(null);
