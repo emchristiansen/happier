@@ -2516,6 +2516,45 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
     });
 
+    it('reports runtime_terminating when close starts during publisher recovery', async () => {
+      const client = await createClient({
+        latestTurnStatus: 'completed',
+        pendingCount: 1,
+        pendingBlockedCount: 0,
+        pendingVersion: 1,
+      });
+      await waitForCurrentPendingInputContract(client);
+      vi.useFakeTimers();
+      materializeNextMock.mockRejectedValueOnce(publisherLost());
+
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toEqual({ type: 'publisher_lost' });
+      await expect(readWakeCapability(client)).resolves.toEqual(publisherRecoveringCapability);
+
+      // Keep the real close drain pending on an in-flight RPC, before `closed` becomes true.
+      const closeDrainGate = createDeferred<void>();
+      client.rpcHandlerManager.registerHandler('test-pending-close-drain', async () => {
+        await closeDrainGate.promise;
+      });
+      const inFlightRpc = client.rpcHandlerManager.invokeLocal('test-pending-close-drain', {});
+      const waitForIdle = vi.spyOn(client.rpcHandlerManager, 'waitForIdle');
+      let closeSettled = false;
+      const closing = client.close().then(() => { closeSettled = true; });
+      try {
+        await vi.waitFor(() => expect(waitForIdle).toHaveBeenCalled());
+        expect(closeSettled).toBe(false);
+        await expect(readWakeCapability(client)).resolves.toEqual({
+          ok: false,
+          error: 'pending_materialization_wake_unavailable',
+          errorCode: 'runtime_terminating',
+        });
+      } finally {
+        closeDrainGate.resolve();
+        await inFlightRpc;
+        await closing;
+      }
+    });
+
     it('arms no recovery deadline for a refusal that lands while close is in progress', async () => {
       const client = await createClient({
         latestTurnStatus: 'completed',

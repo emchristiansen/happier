@@ -2,6 +2,7 @@ import fastify from 'fastify';
 import { db } from '@/storage/db';
 import { register } from '@/app/monitoring/metrics2';
 import { log } from '@/utils/logging/log';
+import { onShutdown } from '@/utils/process/shutdown';
 import { sendDatabaseReadinessResponse, sendLivenessResponse } from './readiness';
 
 export async function createMetricsServer() {
@@ -51,6 +52,9 @@ export async function startMetricsServer(): Promise<boolean> {
     
     try {
         await app.listen({ port, host: '0.0.0.0' });
+        onShutdown('metrics', async () => {
+            await app.close();
+        });
         log({ module: 'metrics' }, `Metrics server listening on port ${port}`);
         return true;
     } catch (error) {
