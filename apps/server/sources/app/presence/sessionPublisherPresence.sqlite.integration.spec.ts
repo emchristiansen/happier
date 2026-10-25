@@ -1255,4 +1255,87 @@ describe("session publisher presence on SQLite", () => {
         })).resolves.toEqual({ status: "rejected", reason: "archived" });
     });
 
+
+    it("retires an exited runner incarnation only while its registration still holds the current publisher generation", async () => {
+        const seeded = await seed();
+        let now = new Date(seeded.fence.getTime());
+        const reportingServer = createSessionPublisherPresence({ now: () => now });
+        const otherServer = createSessionPublisherPresence({ now: () => now });
+        const exitedRunner = {};
+        reportingServer.bindPublisherIncarnation({ socket: exitedRunner, publisherIncarnationId: "incarnation-a" });
+        const exited = await reportingServer.registerPublisher({
+            socket: exitedRunner,
+            binding: seeded.binding,
+            completeActivitySnapshot: { state: "active", activeCount: 1 },
+        });
+        if (exited.status !== "registered") throw new Error("expected registration");
+
+        // The successor registers on another server process, so the reporting server's record of
+        // incarnation A is stale; only the generation check inside the close transaction sees it.
+        now = new Date(exited.committedFence.getTime() + 10);
+        const successorRunner = {};
+        otherServer.bindPublisherIncarnation({ socket: successorRunner, publisherIncarnationId: "incarnation-b" });
+        const successor = await otherServer.registerPublisher({
+            socket: successorRunner,
+            binding: seeded.binding,
+            completeActivitySnapshot: { state: "active", activeCount: 1 },
+        });
+        if (successor.status !== "registered") throw new Error("expected successor registration");
+        expect(successor.publisherGeneration).not.toBe(exited.publisherGeneration);
+        const before = await db.session.findUniqueOrThrow({
+            where: { id: seeded.binding.sessionId },
+            select: { active: true, lastActiveAt: true, publisherGeneration: true, publisherGenerationLastActiveAt: true },
+        });
+
+        await expect(reportingServer.retireExitedPublisher({
+            binding: seeded.binding,
+            publisherIncarnationId: "incarnation-a",
+        })).resolves.toEqual({ status: "superseded" });
+        await expect(db.session.findUniqueOrThrow({
+            where: { id: seeded.binding.sessionId },
+            select: { active: true, lastActiveAt: true, publisherGeneration: true, publisherGenerationLastActiveAt: true },
+        })).resolves.toEqual(before);
+        expect(before).toMatchObject({ active: true, publisherGeneration: successor.publisherGeneration });
+
+        const retired = await otherServer.retireExitedPublisher({
+            binding: seeded.binding,
+            publisherIncarnationId: "incarnation-b",
+        });
+        expect(retired.status).toBe("closed");
+        await expect(db.session.findUniqueOrThrow({
+            where: { id: seeded.binding.sessionId },
+            select: { active: true, publisherGenerationLastActiveAt: true },
+        })).resolves.toEqual({ active: false, publisherGenerationLastActiveAt: null });
+    });
+
+    it("rejects a predecessor's exit report once a successor without an incarnation has registered", async () => {
+        const seeded = await seed();
+        let now = new Date(seeded.fence.getTime());
+        const presence = createSessionPublisherPresence({ now: () => now });
+        const exitedRunner = {};
+        presence.bindPublisherIncarnation({ socket: exitedRunner, publisherIncarnationId: "incarnation-a" });
+        const exited = await presence.registerPublisher({
+            socket: exitedRunner,
+            binding: seeded.binding,
+            completeActivitySnapshot: { state: "active", activeCount: 1 },
+        });
+        if (exited.status !== "registered") throw new Error("expected registration");
+        now = new Date(exited.committedFence.getTime() + 10);
+        const legacySuccessor = await presence.registerPublisher({
+            socket: {},
+            binding: seeded.binding,
+            completeActivitySnapshot: { state: "active", activeCount: 1 },
+        });
+        expect(legacySuccessor.status).toBe("registered");
+
+        await expect(presence.retireExitedPublisher({
+            binding: seeded.binding,
+            publisherIncarnationId: "incarnation-a",
+        })).resolves.toEqual({ status: "rejected", reason: "unmatched" });
+        await expect(db.session.findUniqueOrThrow({
+            where: { id: seeded.binding.sessionId },
+            select: { active: true },
+        })).resolves.toEqual({ active: true });
+    });
+
 });

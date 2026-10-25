@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { DAEMON_STARTED_REPORT_ATTEMPT_TIMEOUT_MS } from '@/agent/runtime/startupSideEffects';
 import type { Metadata } from '@/api/types';
 import { SPAWN_SESSION_ERROR_CODES } from '@/rpc/handlers/registerSessionHandlers';
 import { logger } from '@/ui/logger';
@@ -59,7 +60,7 @@ describe('createDaemonControlApp /session-started body limit', () => {
 
             expect(response.statusCode).toBe(200);
             expect(response.json()).toEqual({ status: 'ok' });
-            expect(onHappySessionWebhook).toHaveBeenCalledWith('test-session-large', metadata);
+            expect(onHappySessionWebhook).toHaveBeenCalledWith('test-session-large', metadata, {});
         } finally {
             await app.close();
         }
@@ -204,6 +205,71 @@ describe('createDaemonControlApp /session-started body limit', () => {
         } finally {
             resolveReadiness();
             resolveMarker();
+            await app.close();
+        }
+    });
+
+    it('answers a starting runner before its attempt times out while readiness is still settling', async () => {
+        const tracked: TrackedSession = { pid: 99996, startedBy: 'daemon' };
+        // The account check behind readiness is still waiting on a slow server.
+        const onTrackedSessionReady = vi.fn(async () => await new Promise<void>(() => {}));
+        const onHappySessionWebhook = createOnHappySessionWebhook({
+            pidToTrackedSession: new Map([[tracked.pid, tracked]]),
+            pidToAwaiter: new Map([[tracked.pid, vi.fn()]]),
+            findHappyProcessByPidFn: async () => null,
+            writeSessionMarkerFn: vi.fn(async () => {}),
+            onTrackedSessionReady,
+        });
+        const app = createDaemonControlApp({
+            getChildren: () => [tracked],
+            machineId: 'machine-1',
+            stopSession: vi.fn(async () => ({ status: 'stopped' as const })),
+            spawnSession: vi.fn(async () => ({
+                type: 'error' as const,
+                errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
+                errorMessage: 'unused',
+            })),
+            requestShutdown: vi.fn(),
+            onHappySessionWebhook,
+            controlToken: 'control-token',
+        });
+        await app.ready();
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+
+        try {
+            let settledResponse: Awaited<ReturnType<typeof app.inject>> | null = null;
+            void app.inject({
+                method: 'POST',
+                url: '/session-started',
+                headers: { 'x-happier-daemon-token': 'control-token' },
+                payload: {
+                    sessionId: 'session-slow-readiness',
+                    metadata: {
+                        path: '/test/path',
+                        host: 'test-host',
+                        homeDir: '/test/home',
+                        happyHomeDir: '',
+                        happyLibDir: '/test/happy-lib',
+                        happyToolsDir: '/test/happy-tools',
+                        hostPid: tracked.pid,
+                        startedBy: 'daemon',
+                        machineId: 'machine-1',
+                    } satisfies Metadata,
+                },
+            }).then((response) => {
+                settledResponse = response;
+            });
+
+            await vi.waitFor(() => expect(onTrackedSessionReady).toHaveBeenCalledOnce());
+            await vi.advanceTimersByTimeAsync(DAEMON_STARTED_REPORT_ATTEMPT_TIMEOUT_MS - 1);
+            await vi.waitFor(() => expect(settledResponse).not.toBeNull());
+            expect(settledResponse!.statusCode).toBe(503);
+            expect(settledResponse!.json()).toEqual({
+                status: 'error',
+                errorCode: 'session_startup_reconciliation_pending',
+            });
+        } finally {
+            vi.useRealTimers();
             await app.close();
         }
     });
