@@ -2358,11 +2358,17 @@ export class ApiSessionClient extends EventEmitter {
             this.pendingReofferDue = false;
             return;
         }
-        if (this.pendingReofferTimer || this.pendingReofferDue
-            || !this.isPendingDiscoveryProducerCurrent() || this.closeStarted) return;
+        const producerGeneration = this.providerInputOutcomeProducerGeneration;
+        const isCurrent = () => !this.closed
+            && !this.closeStarted
+            && !this.runtimeTerminationStarted
+            && !this.pendingDiscoveryArchived
+            && producerGeneration === this.providerInputOutcomeProducerGeneration
+            && (producerGeneration === 0 || this.isPendingDiscoveryProducerCurrent());
+        if (this.pendingReofferTimer || this.pendingReofferDue || !isCurrent()) return;
         this.pendingReofferTimer = setTimeout(() => {
             this.pendingReofferTimer = null;
-            if (!this.isPendingDiscoveryProducerCurrent() || this.closeStarted) return;
+            if (!isCurrent()) return;
             this.pendingReofferDue = true;
             // No claim/discovery progress with rows remaining warrants another attempt,
             // regardless of server reason tiers. The consumer still owns provider dispatch.

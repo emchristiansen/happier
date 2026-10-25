@@ -13,6 +13,7 @@ import {
 } from "@/testkit/backends/sessionFixtures";
 import { MessageQueue2 } from "@/agent/runtime/modeMessageQueue";
 import { createSessionProviderInputConsumer } from "@/agent/runtime/sessionInput/SessionProviderInputConsumer";
+import type { PendingQueueDeliveryTiming } from "@/agent/runtime/sessionInput/types";
 import type { UserMessage } from "@/api/types";
 import { logger } from "@/ui/logger";
 
@@ -97,6 +98,7 @@ let readSnapshot: () => Promise<unknown>;
 let readFeatures: () => Promise<Response>;
 let materialize: () => Promise<unknown>;
 let settle: (payload: unknown) => Promise<unknown>;
+let accountDeliveryTiming: PendingQueueDeliveryTiming | undefined;
 const detailReads = vi.fn();
 const claims = vi.fn();
 const settlements = vi.fn();
@@ -144,15 +146,18 @@ function committed(didResolve = true) {
   };
 }
 
-function bind(client: import("./sessionClient").ApiSessionClient) {
+function bind(
+  client: import("./sessionClient").ApiSessionClient,
+  matchesCurrentSession = () => true,
+) {
   return client.bindProviderInputOutcomeProducer({
     providerId: "codex",
     mode: "unifiedTerminal",
-    matchesCurrentSession: () => true,
+    matchesCurrentSession,
   });
 }
 
-async function createClient(pendingCount = 0) {
+async function createClientWithoutProducer(pendingCount = 0) {
   sessionSocket = createApiSessionSocketStub({
     id: "discovery-session-socket",
     connected: false,
@@ -215,13 +220,23 @@ async function createClient(pendingCount = 0) {
   );
   settingsWait.abort();
   await settingsReady;
+  await vi.advanceTimersByTimeAsync(0);
+  detailReads.mockClear();
+  return client;
+}
+
+async function createClient(pendingCount = 0) {
+  const client = await createClientWithoutProducer(pendingCount);
   const observe = bind(client);
   await vi.advanceTimersByTimeAsync(0);
   detailReads.mockClear();
   return { client, observe };
 }
 
-function consume(client: import("./sessionClient").ApiSessionClient) {
+function consume(
+  client: import("./sessionClient").ApiSessionClient,
+  pendingQueueDeliveryTiming?: PendingQueueDeliveryTiming,
+) {
   const queue = new MessageQueue2<string, UserMessage>(() => "same-mode", {
     batcher: (messages) => messages[0]!,
   });
@@ -237,10 +252,49 @@ function consume(client: import("./sessionClient").ApiSessionClient) {
     messageQueue: queue,
     session: client,
     reconcileWhenEmpty: "skip",
+    ...(pendingQueueDeliveryTiming ? { pendingQueueDeliveryTiming } : {}),
   });
   const controller = new AbortController();
   controllers.push(controller);
   return { consumer, controller };
+}
+
+async function waitOnUnknownRuntimeActivity(bound: boolean) {
+  accountDeliveryTiming = "after_runtime_idle";
+  snapshot = { ...snapshot, pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 1 };
+  const client = bound
+    ? (await createClient(1)).client
+    : await createClientWithoutProducer(1);
+  await client.reconcilePendingQueueState({ force: true });
+  materialize = async () => ({
+    ok: true,
+    didMaterialize: false,
+    pendingCount: 1,
+    pendingBlockedCount: 0,
+    pendingVersion: 1,
+    deferredReason: "runtime_activity_unknown",
+  });
+  const eligibilityAt: number[] = [];
+  client.on("pending-eligibility-updated", () => eligibilityAt.push(Date.now()));
+  const { consumer, controller } = consume(client, "after_runtime_idle");
+  const batches: unknown[] = [];
+  const waiting = consumer.waitForNextInput({ abortSignal: controller.signal }).then((batch) => {
+    if (batch) batches.push(batch);
+    return batch;
+  });
+  await vi.advanceTimersByTimeAsync(0);
+  // The initial claim and its exact-idle-revision retry both returned unknown. This
+  // reaches the idle wait after the real runtime-tail helper has returned.
+  expect(claims).toHaveBeenCalledTimes(2);
+  expect(claims).toHaveBeenLastCalledWith(expect.objectContaining({
+    deliveryTiming: "after_runtime_idle",
+    foregroundState: "ready",
+    expectedRuntimeActivityRevision: client.readRuntimeActivitySnapshotTail().settlement?.committedRevision,
+  }));
+  expect(eligibilityAt).toEqual([]);
+  expect(batches).toEqual([]);
+  expect(settlements).not.toHaveBeenCalled();
+  return { client, consumer, controller, waiting, eligibilityAt, batches };
 }
 
 describe("authoritative pending discovery through the session client and consumer", () => {
@@ -282,6 +336,7 @@ describe("authoritative pending discovery through the session client and consume
     readFeatures = async () => new Response(JSON.stringify(features), { status: 200 });
     materialize = async () => claimed();
     settle = async () => committed();
+    accountDeliveryTiming = undefined;
     detailReads.mockClear();
     claims.mockClear();
     settlements.mockClear();
@@ -298,7 +353,16 @@ describe("authoritative pending discovery through the session client and consume
       if (path === "/v2/account/settings")
         return {
           status: 200,
-          data: { version: 1, content: { t: "plain", v: { schemaVersion: 6 } } },
+          data: {
+            version: 1,
+            content: {
+              t: "plain",
+              v: {
+                schemaVersion: 6,
+                ...(accountDeliveryTiming ? { sessionPendingQueueDeliveryTiming: accountDeliveryTiming } : {}),
+              },
+            },
+          },
         };
       if (path === "/health") return { status: 200, data: {} };
       if (path === "/v1/features") return { status: 200, data: features };
@@ -317,6 +381,155 @@ describe("authoritative pending discovery through the session client and consume
     }
     vi.restoreAllMocks();
     vi.useRealTimers();
+  });
+
+  it.each([false, true])(
+    "reconsiders unknown runtime activity at the existing minute cadence with provider already bound=%s",
+    async (bound) => {
+      const { controller, waiting, eligibilityAt, batches } = await waitOnUnknownRuntimeActivity(bound);
+      const startedAt = Date.now();
+      try {
+        await vi.advanceTimersByTimeAsync(59_999);
+        expect(claims).toHaveBeenCalledTimes(2);
+        expect(eligibilityAt).toEqual([]);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(eligibilityAt).toEqual([startedAt + 60_000]);
+        expect(claims.mock.calls.length).toBeGreaterThan(2);
+        // Reconsideration does not make an unknown runtime admissible or prove acceptance.
+        expect(batches).toEqual([]);
+        expect(settlements).not.toHaveBeenCalled();
+      } finally {
+        controller.abort();
+        await waiting;
+      }
+    },
+  );
+
+  it.each(["close", "termination"] as const)(
+    "retires pre-provider unknown-activity reconsideration on %s",
+    async (loss) => {
+      const { client, controller, waiting, eligibilityAt, batches } = await waitOnUnknownRuntimeActivity(false);
+      try {
+        if (loss === "close") await client.close();
+        else client.beginRuntimeTermination();
+        await vi.advanceTimersByTimeAsync(180_000);
+        expect(claims).toHaveBeenCalledTimes(2);
+        expect(eligibilityAt).toEqual([]);
+        expect(batches).toEqual([]);
+        expect(settlements).not.toHaveBeenCalled();
+      } finally {
+        controller.abort();
+        await waiting;
+      }
+    },
+  );
+
+  it("retires an old binding's reconsideration deadline when the current provider rebinds", async () => {
+    const { client, controller, waiting, eligibilityAt, batches } = await waitOnUnknownRuntimeActivity(true);
+    const startedAt = Date.now();
+    try {
+      await vi.advanceTimersByTimeAsync(30_000);
+      bind(client);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(eligibilityAt).toEqual([]);
+      expect(claims).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(eligibilityAt).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(eligibilityAt).toEqual([startedAt + 90_000]);
+      expect(claims.mock.calls.length).toBeGreaterThan(2);
+      expect(batches).toEqual([]);
+      expect(settlements).not.toHaveBeenCalled();
+    } finally {
+      controller.abort();
+      await waiting;
+    }
+  });
+
+  it.each([false, true])(
+    "claims an admissible input once when duplicate eligibility wakes meet the minute deadline, bound=%s",
+    async (bound) => {
+      const { client, controller, waiting, batches } = await waitOnUnknownRuntimeActivity(bound);
+      try {
+        await vi.advanceTimersByTimeAsync(59_999);
+        expect(batches).toEqual([]);
+        expect(settlements).not.toHaveBeenCalled();
+        materialize = async () => claimed();
+        setTimeout(() => {
+          client.emit("pending-eligibility-updated");
+          client.emit("pending-eligibility-updated");
+        }, 1);
+        await vi.advanceTimersByTimeAsync(1);
+        await expect(waiting).resolves.toMatchObject({
+          message: { ...originalPrompt, createdAt: 1_000 },
+          userMessageLocalIds: [originalPrompt.localId],
+        });
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(claims).toHaveBeenCalledTimes(3);
+        expect(batches).toHaveLength(1);
+        expect(settlements).not.toHaveBeenCalled();
+      } finally {
+        controller.abort();
+        await waiting;
+      }
+    },
+  );
+
+  it("does not reoffer through a positive-generation producer that no longer matches the session", async () => {
+    const { client, controller, waiting, eligibilityAt, batches } = await waitOnUnknownRuntimeActivity(true);
+    let matches = true;
+    bind(client, () => matches);
+    matches = false;
+    try {
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(claims).toHaveBeenCalledTimes(2);
+      expect(eligibilityAt).toEqual([]);
+      expect(batches).toEqual([]);
+      expect(settlements).not.toHaveBeenCalled();
+    } finally {
+      controller.abort();
+      await waiting;
+    }
+  });
+
+  it("does not regain bootstrap reoffers after a permanent discovery failure clears a bound producer", async () => {
+    const { controller, waiting, eligibilityAt, batches } = await waitOnUnknownRuntimeActivity(true);
+    detailReads.mockClear();
+    readSnapshot = async () => ({ status: 400, data: { error: "invalid-session-request" } });
+    try {
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(detailReads).toHaveBeenCalledTimes(1);
+      const claimCount = claims.mock.calls.length;
+      const eligibilityCount = eligibilityAt.length;
+      expect(claimCount).toBeGreaterThan(2);
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(detailReads).toHaveBeenCalledTimes(1);
+      expect(claims).toHaveBeenCalledTimes(claimCount);
+      expect(eligibilityAt).toHaveLength(eligibilityCount);
+      expect(batches).toEqual([]);
+      expect(settlements).not.toHaveBeenCalled();
+    } finally {
+      controller.abort();
+      await waiting;
+    }
+  });
+
+  it("retires a bootstrap reoffer after an authoritative archived snapshot", async () => {
+    const { client, controller, waiting, eligibilityAt, batches } = await waitOnUnknownRuntimeActivity(false);
+    snapshot = { ...snapshot, archivedAt: Date.now() };
+    try {
+      await client.reconcilePendingQueueState({ force: true });
+      expect(detailReads).toHaveBeenCalledTimes(2);
+      expect(client.shouldAttemptPendingMaterialization()).toBe(false);
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(claims).toHaveBeenCalledTimes(2);
+      expect(eligibilityAt).toEqual([]);
+      expect(batches).toEqual([]);
+      expect(settlements).not.toHaveBeenCalled();
+    } finally {
+      controller.abort();
+      await waiting;
+    }
   });
 
   it("re-offers blocked-only pending work after 60 seconds without another hint", async () => {
