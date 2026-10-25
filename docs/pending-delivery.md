@@ -14,7 +14,11 @@ The strict `pendingInput` object keeps its existing shape, so older readers can
 ignore the optional sibling. A client requires both Pending-input support and
 the exact-local-ID capability. The exact materialization event selects only the
 requested eligible `steer_now_bound` row; an unavailable target never substitutes another
-urgent input, and another unresolved delivery claim still defers materialization.
+urgent input. Ordinary materialization may defer on an unresolved delivery claim;
+exact selection of an eligible input can bypass an unrelated held input, while
+custody of the selected input still prevents duplicate dispatch. Publisher authority,
+the original runtime/turn binding and existing fail-closed checks still apply;
+selection does not prove provider acceptance.
 
 The control observes provider outcomes before sending the admission PATCH because
 a Pending wake can deliver the input before that HTTP acknowledgement returns.
@@ -42,7 +46,10 @@ retry only when the error explicitly carries `retryable: true`. An unqualified
 failure does not gain retry permission. The existing authority checks still stop
 the originating operation if its connection or runtime is no longer current.
 
-Successful settlement releases the local gate that holds later materialization.
+Successful settlement or exact committed replay releases that accepted input's
+retained local state. Acceptance already permits later inputs to materialize;
+settlement is not a global queue gate. Canonical custody of the same input still
+protects against duplicate dispatch.
 Continued transport failure cannot promise queue progress. Disconnect, producer
 replacement and shutdown stop the originating operation; reconnect retains the
 existing exact-intent reconciliation path.
