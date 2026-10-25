@@ -5,6 +5,12 @@ import { ConnectedServiceQuotaSnapshotV1Schema, buildConnectedServiceCredentialR
 import * as claudeSubscriptionQuotaFetcherModule from './quotaFetcher';
 import { createClaudeSubscriptionQuotaFetcher } from './quotaFetcher';
 
+// User-agent detection must not execute an installed provider CLI in these quota fixtures.
+vi.mock('node:child_process', async (importOriginal) => ({
+  ...await importOriginal<typeof import('node:child_process')>(),
+  execFileSync: vi.fn(() => '0.0.0'),
+}));
+
 type QuotaDescriptorModule = Readonly<{
   claudeSubscriptionQuotaFetcherDescriptor?: Readonly<{
     loadQuota: (params: Readonly<{
@@ -216,7 +222,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
     const parsed = ConnectedServiceQuotaSnapshotV1Schema.safeParse(snapshot);
     expect(parsed.success).toBe(true);
     if (parsed.success) {
-      expect(parsed.data.planLabel).toBe('max');
+      expect(parsed.data.planLabel).toBe('max_20x');
       expect(parsed.data.meters.map((m) => m.meterId)).toContain('five_hour');
       expect(parsed.data.meters.map((m) => m.meterId)).toContain('seven_day');
       expect(parsed.data.meters.map((m) => m.meterId)).toContain('extra_usage');
@@ -551,7 +557,77 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
       signal: new AbortController().signal,
     });
 
-    expect(snapshot?.planLabel).toBe('team');
+    expect(snapshot?.planLabel).toBe('team_5x');
+  });
+
+  it.each([
+    { subscriptionType: 'max', rateLimitTier: 'max_5x', expected: 'max_5x' },
+    { subscriptionType: 'max', rateLimitTier: 'default_claude_max_5x', expected: 'default_claude_max_5x' },
+    { subscriptionType: 'max', rateLimitTier: 'default_claude_max_20x', expected: 'default_claude_max_20x' },
+    { subscriptionType: 'max', rateLimitTier: 'future_provider_tier', expected: 'future_provider_tier' },
+    { subscriptionType: 'max', rateLimitTier: undefined, expected: 'max' },
+    { subscriptionType: 'max', rateLimitTier: '  ', expected: 'max' },
+    { subscriptionType: undefined, rateLimitTier: undefined, expected: null },
+  ])('preserves recorded plan metadata without inferring a multiplier: $rateLimitTier / $subscriptionType', async ({
+    subscriptionType, rateLimitTier, expected,
+  }) => {
+    const now = 1_000_000;
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ five_hour: { utilization: 10 } }),
+    }));
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+    const record = buildConnectedServiceCredentialRecord({
+      now,
+      serviceId: 'claude-subscription',
+      profileId: 'work',
+      kind: 'oauth',
+      expiresAt: now + 60_000,
+      oauth: {
+        accessToken: 'at',
+        refreshToken: 'rt',
+        idToken: null,
+        scope: claudeCodeScope,
+        tokenType: null,
+        providerAccountId: null,
+        providerEmail: 'user@example.com',
+        raw: { claudeAiOauth: { subscriptionType, rateLimitTier } },
+      },
+    });
+
+    const fetcher = createClaudeSubscriptionQuotaFetcher({ staleAfterMs: 300_000 });
+    const snapshot = await fetcher.fetch({ record, now, signal: new AbortController().signal });
+
+    expect(snapshot?.planLabel).toBe(expected);
+  });
+
+  it('retains the recorded tier when private usage polling is disabled', async () => {
+    const now = 1_000_000;
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+    const record = buildConnectedServiceCredentialRecord({
+      now,
+      serviceId: 'claude-subscription',
+      profileId: 'work',
+      kind: 'oauth',
+      expiresAt: now + 60_000,
+      oauth: {
+        accessToken: 'at',
+        refreshToken: 'rt',
+        idToken: null,
+        scope: claudeCodeScope,
+        tokenType: null,
+        providerAccountId: null,
+        providerEmail: 'user@example.com',
+        raw: { claudeAiOauth: { subscriptionType: 'max', rateLimitTier: 'max_20x' } },
+      },
+    });
+
+    const fetcher = createClaudeSubscriptionQuotaFetcher({ staleAfterMs: 300_000, disablePrivateEndpoint: true });
+    const snapshot = await fetcher.fetch({ record, now, signal: new AbortController().signal });
+
+    expect(snapshot?.planLabel).toBe('max_20x');
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('does not refresh oauth credentials when usage polling is unauthorized', async () => {
