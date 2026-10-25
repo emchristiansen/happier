@@ -149,6 +149,43 @@ describe('ApiSessionClient account settings retry', () => {
     }
   });
 
+  it('recovers settings convergence after its live source disconnects before applying', async () => {
+    const client = createClient();
+    await expect(client.waitForPendingEligibilityUpdate()).resolves.toBe(true);
+    const owner = client as unknown as {
+      accountSettingsSyncBarrier: Promise<boolean> | null;
+      accountSettingsSyncBarrierState: string | null;
+    };
+    userSocket.trigger('update', {
+      id: 'settings-source-disconnect', seq: 1, createdAt: Date.now(),
+      body: { t: 'update-account', id: 'retry-account', settingsV2: settings(2).data },
+    });
+    userSocket.connected = false;
+    const failedBarrier = owner.accountSettingsSyncBarrier;
+    await expect(failedBarrier).resolves.toBe(false);
+    expect(owner.accountSettingsSyncBarrierState).toBe('failed');
+    expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(1);
+
+    readSettings = async () => ({
+      status: 200,
+      data: { version: 3, content: { t: 'plain', v: { sessionPendingQueueDeliveryTiming: 'after_foreground_ready' } } },
+    });
+    const abort = new AbortController();
+    const wait = client.waitForPendingEligibilityUpdate(abort.signal);
+    try {
+      await expect(wait).resolves.toBe(true);
+      expect(owner.accountSettingsSyncBarrier).toBeNull();
+      expect(owner.accountSettingsSyncBarrierState).toBeNull();
+      expect(snapshots.getActiveAccountSettingsSnapshot()?.settingsVersion).toBe(3);
+      expect(snapshots.getActiveAccountSettingsSnapshot()?.settings.sessionPendingQueueDeliveryTiming)
+        .toBe('after_foreground_ready');
+      expect(maxActiveSettingsRequests).toBe(1);
+    } finally {
+      abort.abort();
+      await wait;
+    }
+  });
+
   it('shares recovery across waiters and keeps it alive when one waiter aborts', async () => {
     const firstRead = createDeferred<unknown>();
     const requested = createDeferred<void>();

@@ -3153,14 +3153,27 @@ export class ApiSessionClient extends EventEmitter {
         void current.then((didApply) => {
             if (
                 this.closed
-                || opts.socket !== this.userSocket
-                || opts.socket.connected !== true
                 || revision !== this.accountSettingsEventRevision
                 || this.accountSettingsSyncBarrier !== current
             ) return;
-            if (!didApply) {
+            // A stale source still has to settle its own barrier. Leaving a resolved
+            // false promise marked applying makes every later reconnect join it forever.
+            if (!didApply
+                || opts.socket !== this.userSocket
+                || opts.socket.connected !== true
+                || sourceUserSocketConnectionEpoch !== this.userSocketSettingsConnectionEpoch) {
+                if (didApply) {
+                    this.recordAccountSettingsConvergenceFailure(
+                        new Error('Account settings live source changed before convergence settled'),
+                    );
+                }
                 this.accountSettingsSyncBarrierState = 'failed';
                 this.userSocketSettingsConvergedEpoch = -1;
+                logger.infoFile('[accountSettings] Live settings convergence failed; retaining barrier for retry', {
+                    settingsVersion,
+                    sourceConnectionEpoch: sourceUserSocketConnectionEpoch,
+                    currentConnectionEpoch: this.userSocketSettingsConnectionEpoch,
+                });
                 this.rearmAccountSettingsEligibilityWaiters();
                 if (this.accountSettingsPendingEligibilityWakeWithheld) {
                     this.accountSettingsPendingEligibilityWakeWithheld = false;
