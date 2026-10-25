@@ -1,11 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS,
+  DAEMON_STARTED_REPORT_ATTEMPT_TIMEOUT_MS,
   primeAgentStateForUi,
   reportSessionToDaemonIfRunning,
   resolveTerminalAttachmentPersistenceBinding,
 } from '@/agent/runtime/startupSideEffects';
 import type { Metadata } from '@/api/types';
+import { SESSION_STARTED_READINESS_ANSWER_TIMEOUT_MS } from '@/daemon/sessionStartedReadiness';
 
 const metadataStub = {} as Metadata;
 
@@ -239,7 +242,7 @@ describe('startup side effects: daemon session reporting retry', () => {
       },
     );
 
-    expect(observedTimeouts).toEqual([2_500, 10_000]);
+    expect(observedTimeouts).toEqual([2_500, DAEMON_STARTED_REPORT_ATTEMPT_TIMEOUT_MS]);
   });
 
   it('uses a longer default retry window for daemon-started sessions', async () => {
@@ -279,6 +282,174 @@ describe('startup side effects: daemon session reporting retry', () => {
         retryTimeoutMs: 0,
       },
     )).rejects.toThrow('Claude runtime readiness was not acknowledged by the daemon');
+  });
+
+  it('keeps a daemon-started runner waiting while a slow daemon still answers readiness', async () => {
+    // 2026-10-23: the daemon answered /session-started only after its 15 s account-profile check,
+    // so every 10 s attempt timed out and a runner whose daemon was alive exited FATAL after 90 s.
+    const daemonAccountCheckMs = 15_000;
+    const serverRecoversAtMs = 4 * 60_000;
+    let now = 0;
+    let answeredAttempts = 0;
+
+    await expect(reportSessionToDaemonIfRunning(
+      {
+        sessionId: 'session-slow-daemon',
+        metadata: { startedBy: 'daemon' } as Metadata,
+        requireDaemonAck: true,
+      },
+      {
+        notifyDaemonSessionStartedFn: async (_sessionId, _metadata, options) => {
+          const attemptTimeoutMs = options?.timeoutMs ?? 0;
+          if (attemptTimeoutMs <= daemonAccountCheckMs) {
+            now += attemptTimeoutMs;
+            return { error: 'Request failed: /session-started, The operation was aborted due to timeout' };
+          }
+          now += daemonAccountCheckMs;
+          answeredAttempts += 1;
+          if (now < serverRecoversAtMs) {
+            return {
+              error: 'Request failed: /session-started, HTTP 503 (session_startup_reconciliation_failed)',
+              errorCode: 'session_startup_reconciliation_failed',
+            };
+          }
+          return { status: 'ok' };
+        },
+        sleepFn: async (ms) => {
+          now += ms;
+        },
+        nowFn: () => now,
+      },
+    )).resolves.toBeUndefined();
+    expect(answeredAttempts).toBeGreaterThan(1);
+    expect(now).toBeGreaterThanOrEqual(serverRecoversAtMs);
+  });
+
+  it('gives up on a daemon that keeps answering readiness failures once the total ceiling passes', async () => {
+    let now = 0;
+
+    await expect(reportSessionToDaemonIfRunning(
+      {
+        sessionId: 'session-never-ready',
+        metadata: { startedBy: 'daemon' } as Metadata,
+        requireDaemonAck: true,
+      },
+      {
+        notifyDaemonSessionStartedFn: async () => {
+          now += 1_000;
+          return {
+            error: 'Request failed: /session-started, HTTP 503 (session_startup_reconciliation_pending)',
+            errorCode: 'session_startup_reconciliation_pending',
+          };
+        },
+        sleepFn: async (ms) => {
+          now += ms;
+        },
+        nowFn: () => now,
+      },
+    )).rejects.toThrow('Claude runtime readiness was not acknowledged by the daemon');
+    expect(now).toBeGreaterThanOrEqual(DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS);
+    expect(now).toBeLessThan(DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS + 5_000);
+  });
+
+  /** A daemon at the production schedule: it answers "pending" at its readiness bound, or not at all within a shorter attempt. */
+  function productionScheduleDaemon(params: Readonly<{
+    clock: { now: number };
+    readyAtMs: number;
+    attemptDeadlines: number[];
+  }>) {
+    return async (_sessionId: string, _metadata: Metadata, options?: { timeoutMs?: number | null }) => {
+      const attemptTimeoutMs = options?.timeoutMs ?? Number.POSITIVE_INFINITY;
+      params.attemptDeadlines.push(params.clock.now + attemptTimeoutMs);
+      if (attemptTimeoutMs < SESSION_STARTED_READINESS_ANSWER_TIMEOUT_MS) {
+        params.clock.now += attemptTimeoutMs;
+        return { error: 'Request failed: /session-started, The operation was aborted due to timeout' };
+      }
+      params.clock.now += SESSION_STARTED_READINESS_ANSWER_TIMEOUT_MS;
+      if (params.clock.now >= params.readyAtMs) return { status: 'ok' };
+      return {
+        error: 'Request failed: /session-started, HTTP 503 (session_startup_reconciliation_pending)',
+        errorCode: 'session_startup_reconciliation_pending',
+      };
+    };
+  }
+
+  it('fails a runner whose daemon stays pending exactly at the ceiling under the production answer schedule', async () => {
+    const clock = { now: 0 };
+    const attemptDeadlines: number[] = [];
+
+    await expect(reportSessionToDaemonIfRunning(
+      {
+        sessionId: 'session-pending-production-schedule',
+        metadata: { startedBy: 'daemon' } as Metadata,
+        requireDaemonAck: true,
+      },
+      {
+        notifyDaemonSessionStartedFn: productionScheduleDaemon({
+          clock,
+          readyAtMs: Number.POSITIVE_INFINITY,
+          attemptDeadlines,
+        }),
+        sleepFn: async (ms) => {
+          clock.now += ms;
+        },
+        nowFn: () => clock.now,
+      },
+    )).rejects.toThrow('Claude runtime readiness was not acknowledged by the daemon');
+    expect(clock.now).toBeLessThanOrEqual(DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS);
+    expect(Math.max(...attemptDeadlines)).toBeLessThanOrEqual(DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS);
+  });
+
+  it('does not accept a readiness answer the daemon could only give after the ceiling', async () => {
+    const clock = { now: 0 };
+    const attemptDeadlines: number[] = [];
+
+    await expect(reportSessionToDaemonIfRunning(
+      {
+        sessionId: 'session-ready-after-ceiling',
+        metadata: { startedBy: 'daemon' } as Metadata,
+        requireDaemonAck: true,
+      },
+      {
+        notifyDaemonSessionStartedFn: productionScheduleDaemon({
+          clock,
+          readyAtMs: DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS + 1,
+          attemptDeadlines,
+        }),
+        sleepFn: async (ms) => {
+          clock.now += ms;
+        },
+        nowFn: () => clock.now,
+      },
+    )).rejects.toThrow('Claude runtime readiness was not acknowledged by the daemon');
+    expect(clock.now).toBeLessThanOrEqual(DAEMON_READINESS_ANSWERED_WAIT_CEILING_MS);
+  });
+
+  it('still fails a daemon-started runner whose daemon never answers', async () => {
+    let now = 0;
+    let attempts = 0;
+
+    await expect(reportSessionToDaemonIfRunning(
+      {
+        sessionId: 'session-dead-daemon',
+        metadata: { startedBy: 'daemon' } as Metadata,
+        requireDaemonAck: true,
+      },
+      {
+        notifyDaemonSessionStartedFn: async () => {
+          attempts += 1;
+          now += 5;
+          return { error: 'Request failed: /session-started, fetch failed' };
+        },
+        sleepFn: async (ms) => {
+          now += ms;
+        },
+        nowFn: () => now,
+      },
+    )).rejects.toThrow('Claude runtime readiness was not acknowledged by the daemon');
+    expect(attempts).toBeGreaterThan(1);
+    expect(now).toBeGreaterThanOrEqual(90_000);
+    expect(now).toBeLessThan(91_000);
   });
 
   it('uses a longer default retry window when daemon autostart is enabled for terminal sessions', async () => {
