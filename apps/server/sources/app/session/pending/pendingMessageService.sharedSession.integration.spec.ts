@@ -1617,6 +1617,7 @@ describe("pendingMessageService (shared sessions)", () => {
     it.each(["queued", "claimed", "held"] as const)("materializes exact B past an earlier %s urgent A", async (earlierState) => {
         const owner = await createAccount("exact-steer-target-owner");
         const session = await createSession(owner.id);
+        await createCurrentPendingEvidencePublisher({ accountId: owner.id, sessionId: session.id });
         const earlierLocalId = `exact-steer-earlier-${randomUUID()}`;
         const targetLocalId = `exact-steer-target-${randomUUID()}`;
 
@@ -1729,6 +1730,7 @@ describe("pendingMessageService (shared sessions)", () => {
     it.each(["missing action", "transcript conflict"] as const)("keeps exact B unavailable after %s reoffers a new ordinary ID", async (cause) => {
         const owner = await createAccount("exact-reoffer-owner");
         const session = await createSession(owner.id);
+        await createCurrentPendingEvidencePublisher({ accountId: owner.id, sessionId: session.id });
         const localId = ` B-${randomUUID()} `;
         await enqueuePendingMessage({ actorUserId: owner.id, sessionId: session.id, localId,
             ciphertext: "selected-content", requestedAction: { v: 1, kind: "steer_now" } });
