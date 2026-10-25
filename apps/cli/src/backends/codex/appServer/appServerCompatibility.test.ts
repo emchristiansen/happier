@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+    CodexAppServerSteerUnavailableError,
+    createCodexAppServerRpcError,
     isCodexAppServerExperimentalApiUnavailableError,
     isCodexAppServerInvalidRequestForMethodError,
     isCodexAppServerInvalidRequestMapExpectedStringError,
     isCodexAppServerInvalidParamsError,
     isCodexAppServerMethodNotFoundError,
+    isCodexAppServerNoActiveTurnToSteerError,
+    isCodexAppServerSteerRejectedBeforeEffectError,
+    isCodexAppServerSteerRpcErrorResponse,
 } from './appServerCompatibility';
 
 function makeError(message: string, code?: number): Error {
@@ -17,6 +22,40 @@ function makeError(message: string, code?: number): Error {
 }
 
 describe('appServerCompatibility', () => {
+    it('requires the client response marker and steering method for a correlated steer rejection', () => {
+        expect(isCodexAppServerSteerRpcErrorResponse(createCodexAppServerRpcError({
+            method: 'turn/steer', code: -32602, message: 'invalid params',
+        }))).toBe(true);
+        expect(isCodexAppServerSteerRpcErrorResponse(Object.assign(new Error('invalid params'), {
+            method: 'turn/steer', code: -32602,
+        }))).toBe(false);
+        expect(isCodexAppServerSteerRpcErrorResponse(new Error('invalid params'))).toBe(false);
+        expect(isCodexAppServerSteerRpcErrorResponse(createCodexAppServerRpcError({
+            method: 'turn/start', code: -32602, message: 'invalid params',
+        }))).toBe(false);
+    });
+
+    it('classifies local steer refusal without treating it as native turn termination', () => {
+        const error = new CodexAppServerSteerUnavailableError();
+        expect(isCodexAppServerSteerRejectedBeforeEffectError(error)).toBe(true);
+        expect(isCodexAppServerNoActiveTurnToSteerError(error)).toBe(false);
+        expect(isCodexAppServerSteerRejectedBeforeEffectError(new Error(error.message))).toBe(false);
+        expect(isCodexAppServerSteerRejectedBeforeEffectError(createCodexAppServerRpcError({
+            method: 'turn/steer', code: -32000, message: error.message,
+        }))).toBe(false);
+    });
+
+    it('retains native no-active-turn recognition only for steering', () => {
+        const nativeError = createCodexAppServerRpcError({
+            method: 'turn/steer', code: -32000, message: 'no active turn to steer',
+        });
+        expect(isCodexAppServerNoActiveTurnToSteerError(nativeError)).toBe(true);
+        expect(isCodexAppServerSteerRejectedBeforeEffectError(nativeError)).toBe(true);
+        expect(isCodexAppServerSteerRejectedBeforeEffectError(createCodexAppServerRpcError({
+            method: 'turn/start', code: -32000, message: 'no active turn to steer',
+        }))).toBe(false);
+    });
+
     it('detects method-not-found errors by code or message', () => {
         expect(isCodexAppServerMethodNotFoundError(makeError('nope', -32601))).toBe(true);
         expect(isCodexAppServerMethodNotFoundError(makeError('Method not found'))).toBe(true);

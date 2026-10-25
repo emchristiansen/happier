@@ -5,6 +5,7 @@ import { installDbModuleMock } from "../app/api/testkit/dbMocks";
 
 const transaction = vi.fn(async (fn: any, _opts?: any) => fn({} as any));
 const delayMock = vi.fn(async () => {});
+const { warnMock } = vi.hoisted(() => ({ warnMock: vi.fn() }));
 
 installDbModuleMock({
     db: {
@@ -13,6 +14,10 @@ installDbModuleMock({
 });
 
 vi.mock("@/utils/runtime/delay", () => ({ delay: delayMock }));
+vi.mock("@/utils/logging/log", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("@/utils/logging/log")>()),
+    warn: warnMock,
+}));
 
 describe("inTx", () => {
     const envSnapshot = snapshotEnv();
@@ -22,6 +27,7 @@ describe("inTx", () => {
         vi.restoreAllMocks();
         transaction.mockClear();
         delayMock.mockClear();
+        warnMock.mockReset();
     });
 
     it("uses serializable transactions by default", async () => {
@@ -215,5 +221,144 @@ describe("inTx", () => {
 
         expect(transaction).toHaveBeenCalledTimes(1);
         expect(delayMock).not.toHaveBeenCalled();
+    });
+
+    describe("after-commit callbacks", () => {
+        // Node reports an unhandled rejection only after the microtask queue drains, so wait a full macrotask turn.
+        const settleUnhandledRejectionDetection = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+        async function captureUnhandledRejections(run: () => Promise<void>): Promise<unknown[]> {
+            const unhandled: unknown[] = [];
+            const onUnhandledRejection = (reason: unknown) => {
+                unhandled.push(reason);
+            };
+            process.on("unhandledRejection", onUnhandledRejection);
+            try {
+                await run();
+                await settleUnhandledRejectionDetection();
+            } finally {
+                process.off("unhandledRejection", onUnhandledRejection);
+            }
+            return unhandled;
+        }
+
+        const failureMessage = "afterTx callback failed after commit; the committed transaction is unaffected";
+
+        function expectedFailureLog(failure: "threw" | "rejected", err: unknown, callbackName?: string) {
+            return [
+                {
+                    module: "storage",
+                    event: "after-tx-callback-failed",
+                    failure,
+                    // The frame that called afterTx: the transaction body in this spec file.
+                    callSite: expect.stringMatching(/inTx\.spec\.ts:\d+:\d+/),
+                    callbackName,
+                    err,
+                },
+                failureMessage,
+            ];
+        }
+
+        it("logs a synchronously throwing callback at warn and still runs the later callbacks", async () => {
+            const { inTx, afterTx } = await import("./inTx");
+            const failure = new Error("sync after-commit failure");
+            const later = vi.fn();
+
+            const unhandled = await captureUnhandledRejections(async () => {
+                const result = await inTx(async (tx) => {
+                    afterTx(tx, () => {
+                        throw failure;
+                    });
+                    afterTx(tx, later);
+                    return 321;
+                });
+                expect(result).toBe(321);
+            });
+
+            expect(later).toHaveBeenCalledTimes(1);
+            expect(warnMock).toHaveBeenCalledTimes(1);
+            expect(warnMock.mock.calls[0]).toEqual(expectedFailureLog("threw", failure));
+            expect(unhandled).toEqual([]);
+        });
+
+        it("logs a rejected async callback with the same log line as a synchronous throw, without an unhandled rejection", async () => {
+            const { inTx, afterTx } = await import("./inTx");
+            const failure = new Error("async after-commit failure");
+            const later = vi.fn();
+            const emitAfterCommit = async () => {
+                throw failure;
+            };
+
+            const unhandled = await captureUnhandledRejections(async () => {
+                const result = await inTx(async (tx) => {
+                    afterTx(tx, emitAfterCommit);
+                    afterTx(tx, later);
+                    return 654;
+                });
+                expect(result).toBe(654);
+            });
+
+            expect(later).toHaveBeenCalledTimes(1);
+            expect(warnMock).toHaveBeenCalledTimes(1);
+            expect(warnMock.mock.calls[0]).toEqual(expectedFailureLog("rejected", failure, "emitAfterCommit"));
+            expect(unhandled).toEqual([]);
+        });
+
+        it("returns the transaction result without waiting for an async callback to settle", async () => {
+            const { inTx, afterTx } = await import("./inTx");
+            let rejectCallback!: (error: unknown) => void;
+            const pending = new Promise<void>((_resolve, reject) => {
+                rejectCallback = reject;
+            });
+            const lateFailure = new Error("late async after-commit failure");
+            const order: string[] = [];
+
+            const unhandled = await captureUnhandledRejections(async () => {
+                const result = await inTx(async (tx) => {
+                    afterTx(tx, () => {
+                        order.push("async callback started");
+                        return pending;
+                    });
+                    afterTx(tx, () => {
+                        order.push("next callback ran");
+                    });
+                    return 987;
+                });
+                order.push("inTx returned");
+                expect(result).toBe(987);
+                expect(warnMock).not.toHaveBeenCalled();
+                rejectCallback(lateFailure);
+            });
+
+            expect(order).toEqual(["async callback started", "next callback ran", "inTx returned"]);
+            expect(warnMock).toHaveBeenCalledTimes(1);
+            expect(warnMock.mock.calls[0]).toEqual(expectedFailureLog("rejected", lateFailure));
+            expect(unhandled).toEqual([]);
+        });
+
+        it("keeps the committed result, without a retry or an unhandled rejection, when the failure log itself throws", async () => {
+            const { inTx, afterTx } = await import("./inTx");
+            warnMock.mockImplementation(() => {
+                throw new Error("logger failure");
+            });
+
+            const unhandled = await captureUnhandledRejections(async () => {
+                const result = await inTx(async (tx) => {
+                    afterTx(tx, () => {
+                        throw new Error("sync after-commit failure");
+                    });
+                    afterTx(tx, async () => {
+                        throw new Error("async after-commit failure");
+                    });
+                    return 135;
+                });
+                expect(result).toBe(135);
+            });
+
+            // pino serializes the log object inside the `warn` call, so a serializer failure surfaces here too.
+            expect(warnMock).toHaveBeenCalledTimes(2);
+            expect(transaction).toHaveBeenCalledTimes(1);
+            expect(unhandled).toEqual([]);
+        });
     });
 });

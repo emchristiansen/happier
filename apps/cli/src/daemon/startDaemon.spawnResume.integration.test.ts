@@ -5375,6 +5375,76 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     }
   });
 
+  it('refuses resume without launch or marker effects when the second probe reports termination', async () => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const refreshEnvOriginal = process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;
+    process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = 'false';
+    const sessionId = 'sess_resume_turns_terminating';
+    sessionRunnerActivityBoundaryMocks.readProcessRunState.mockResolvedValue('servable');
+    sessionRunnerActivityBoundaryMocks.readSessionRunnerLockStatus.mockImplementation(async (params) => (
+      params.sessionId === sessionId
+        ? { ok: true, lock: { sessionId, pid: 8123, acquiredAtMs: 1 } }
+        : { ok: false, reason: 'not_found' }
+    ));
+    let capabilityProbes = 0;
+    vi.mocked(callSessionRpc).mockImplementation(async (params) => {
+      if (params.method === `${sessionId}:session.pendingQueue.wakeCapability.v1.get`) {
+        capabilityProbes += 1;
+        // Drive the real Resume decision owner from adopt to wait_for_exit.
+        return capabilityProbes === 1
+          ? { ok: true, capability: 'pending_queue_wake_v1', protocolVersion: 1, method: 'session.pendingQueue.wake.v1' }
+          : { ok: false, error: 'pending_materialization_wake_unavailable', errorCode: 'runtime_terminating' };
+      }
+      return { ok: true, result: 'wake_published' };
+    });
+    pendingMaterializationRpcMocks.resolveSessionTransportContext.mockResolvedValue({
+      ok: true,
+      sessionId,
+      rawSession: { id: sessionId, active: true, encryptionMode: 'plain' },
+      mode: 'plain',
+      ctx: pendingMaterializationRpcMocks.ctx,
+    });
+    vi.mocked(waitForSessionWebhook).mockResolvedValueOnce({ type: 'success', sessionId });
+
+    let run: Promise<void> | null = null;
+    try {
+      const { startDaemon } = await import('./startDaemon');
+      run = startDaemon();
+      const spawnSession = await waitForSpawnSessionRegistration();
+      const respawnManager = sessionRespawnManagerCapture.instances.at(-1);
+      expect(respawnManager).toBeDefined();
+      sessionRegistryCapture.writeSessionMarker.mockClear();
+      respawnManager?.clearStopRequested.mockClear();
+
+      const result = await spawnSession({
+        directory: tmpdir(),
+        backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+        existingSessionId: sessionId,
+        token: 'token-from-spawn-options',
+        codexBackendMode: 'appServer',
+      });
+
+      expect(capabilityProbes).toBeGreaterThanOrEqual(2);
+      expect.soft(spawnHappyCLI).not.toHaveBeenCalled();
+      expect.soft(spawnChildProcess).not.toHaveBeenCalled();
+      expect.soft(sessionRegistryCapture.writeSessionMarker).not.toHaveBeenCalled();
+      expect.soft(respawnManager?.clearStopRequested).not.toHaveBeenCalled();
+      expect.soft(result).toEqual({
+        type: 'error',
+        errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
+        errorMessage: 'The previous session runtime is still shutting down. Retry resume after it exits.',
+      });
+    } finally {
+      if (run) {
+        harness.requestShutdown('happier-cli');
+        await run;
+      }
+      if (refreshEnvOriginal === undefined) delete process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;
+      else process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = refreshEnvOriginal;
+      exitSpy.mockRestore();
+    }
+  });
+
   it('waits for a terminating predecessor to exit before spawning the explicit resume successor', async () => {
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
     const refreshEnvOriginal = process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;
