@@ -1059,7 +1059,7 @@ export async function runCodex(opts: {
         return {
             waitForProviderInputAdmission: (signal) => session.waitForProviderInputAdmission(signal),
             materializeNextPendingMessageSafely,
-            shouldAttemptPendingMaterialization: () => session.shouldAttemptPendingMaterialization?.() ?? true,
+            shouldAttemptPendingMaterialization: (attemptOpts) => session.shouldAttemptPendingMaterialization?.(attemptOpts) ?? true,
             reconcilePendingQueueState: (opts) => session.reconcilePendingQueueState?.(opts),
             waitForPendingEligibilityUpdate: (signal) => session.waitForPendingEligibilityUpdate(signal),
             ...(typeof session.readRuntimeActivitySnapshotTail === 'function'

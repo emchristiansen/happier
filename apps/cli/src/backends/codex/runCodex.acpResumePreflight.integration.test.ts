@@ -18,6 +18,7 @@ import { applyPermissionModeToCodexPermissionHandler } from './utils/applyPermis
 import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
 import { createDeferred } from '@/testkit/async/deferred';
 import { createMutableApiSessionClientFixture } from '@/testkit/backends/sessionFixtures';
+import type { SessionProviderInputConsumerSession } from '@/agent/runtime/sessionInput/SessionProviderInputConsumer';
 
 const modelSyncFlushPendingAfterStartSpy = vi.fn(async () => {});
 const sessionModeSyncFlushPendingAfterStartSpy = vi.fn(async () => {});
@@ -3192,6 +3193,96 @@ describe('runCodex CodexACP resume behavior', () => {
       type: 'retryable_transport',
     });
     expect(lastSessionClient.popPendingMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('[exact-adapter] preserves opaque B through the real preflights (forced reconciliation=%s)', async (forceReconciliation) => {
+    resolveRunnerMcpServersSpy.mockResolvedValueOnce({
+      happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() }, mcpServers: {},
+    });
+    createCodexAppServerRuntimeSpy.mockReturnValueOnce({
+      ...createDefaultCodexAppServerRuntimeMock(),
+      getSessionId: () => 'thread-exact-adapter',
+      supportsInFlightSteer: () => true,
+      startOrLoad: vi.fn(async () => {}),
+    });
+    const loopStarted = createDeferred<void>();
+    const stopLoop = createDeferred<void>();
+    sessionInputConsumerWaitForNextInputImpl = async () => {
+      loopStarted.resolve();
+      await stopLoop.promise;
+      return null;
+    };
+    const { runCodex } = await import('./runCodex');
+    const run = runCodex({ credentials: { token: 'test' } as Credentials, startedBy: 'terminal',
+      startingMode: 'remote', codexBackendMode: 'appServer',
+      permissionMode: 'default', permissionModeUpdatedAt: 1 });
+    try {
+      await Promise.race([loopStarted.promise, run.then(() => { throw new Error('Run ended before adapter capture'); })]);
+      if (!lastSessionClient) throw new Error('Session adapter target missing');
+      const session = lastSessionClient;
+      const consumerOptions = createSessionProviderInputConsumerSpy.mock.calls.at(-1)?.[0];
+      if (!consumerOptions) throw new Error('Codex consumer options missing');
+      // Keep the actual runCodex adapter. The default harness consumer is a spy, so enter
+      // the existing importActual seam to exercise both real consumer predicate calls.
+      const actual = await vi.importActual<typeof import('@/agent/runtime/sessionInput/SessionProviderInputConsumer')>(
+        '@/agent/runtime/sessionInput/SessionProviderInputConsumer',
+      );
+      session.waitForProviderInputAdmission = createMutableApiSessionClientFixture().waitForProviderInputAdmission;
+      const localId = ' B ';
+      const held = new Set(['A']);
+      let reconciled = !forceReconciliation;
+      const preflight = vi.fn(function (this: typeof session,
+        attemptOpts: Parameters<NonNullable<SessionProviderInputConsumerSession['shouldAttemptPendingMaterialization']>>[0],
+      ) {
+        expect(this).toBe(session);
+        // Reconciliation changes readiness only: it never removes A or repairs a lost selector.
+        if (attemptOpts?.requestedLocalId !== localId || held.has(localId)) return false;
+        return reconciled;
+      });
+      session.shouldAttemptPendingMaterialization = preflight;
+      session.reconcilePendingQueueState = vi.fn(async (
+        opts: Parameters<NonNullable<SessionProviderInputConsumerSession['reconcilePendingQueueState']>>[0],
+      ) => {
+        expect(opts).toEqual({ force: true });
+        reconciled = true;
+        return true;
+      });
+      const materialize = vi.fn(async function (this: typeof session,
+        opts: Parameters<SessionProviderInputConsumerSession['materializeNextPendingMessageSafely']>[0],
+      ) {
+        expect(this).toBe(session);
+        expect(opts).toMatchObject({ requestedLocalId: localId, activeTurnSteerability: 'steerable',
+          pendingQueueDeliveryTiming: 'after_foreground_ready', reconcileWhenEmpty: 'force' });
+        // The exact attempt still returns no_pending; no provider delivery or acceptance is simulated.
+        return { type: 'no_pending' as const };
+      });
+      session.materializeNextPendingMessageSafely = materialize;
+      const consumer = actual.createSessionProviderInputConsumer(consumerOptions);
+      const drainOpts = { requestedLocalId: localId, activeTurnSteerability: 'steerable' as const,
+        pendingQueueDeliveryTiming: 'after_foreground_ready' as const };
+      await expect(consumer.drainPending(drainOpts)).resolves.toEqual({ materialized: 0, stoppedReason: 'no_pending' });
+      expect(preflight).toHaveBeenCalledTimes(forceReconciliation ? 2 : 1);
+      for (const [attemptOpts] of preflight.mock.calls) expect(attemptOpts).toEqual(drainOpts);
+      expect(session.reconcilePendingQueueState).toHaveBeenCalledTimes(forceReconciliation ? 1 : 0);
+      expect(materialize).toHaveBeenCalledTimes(1);
+      expect(held).toEqual(new Set(['A']));
+
+      held.add(localId);
+      preflight.mockClear();
+      session.reconcilePendingQueueState.mockClear();
+      await expect(consumer.drainPending(drainOpts)).resolves.toEqual({ materialized: 0, stoppedReason: 'materialization_blocked' });
+      expect(preflight).toHaveBeenCalledTimes(2);
+      for (const [attemptOpts] of preflight.mock.calls) expect(attemptOpts).toEqual(drainOpts);
+      expect(session.reconcilePendingQueueState).toHaveBeenCalledExactlyOnceWith({ force: true });
+      expect(held.has(localId)).toBe(true);
+      expect(materialize).toHaveBeenCalledTimes(1);
+
+      delete session.shouldAttemptPendingMaterialization;
+      expect(consumerOptions.session.shouldAttemptPendingMaterialization(drainOpts)).toBe(true);
+    } finally {
+      stopLoop.resolve();
+      await run;
+    }
   });
 
   it('resumes and accepts an exact pending row from predecessor metadata', async () => {
