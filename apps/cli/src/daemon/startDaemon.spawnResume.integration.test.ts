@@ -30,6 +30,10 @@ import { ConnectedServiceAuthGroupQuotaProbeIncompleteError } from './connectedS
 import { isConnectedServiceUxDiagnosticSpawnErrorDetail } from '@happier-dev/protocol';
 import { UsageLimitRecoveryScheduler } from './connectedServices/usageLimitRecovery/UsageLimitRecoveryScheduler';
 import { RuntimeAuthRecoveryScheduler } from './connectedServices/runtimeAuth/RuntimeAuthRecoveryScheduler';
+import {
+  ConnectedServiceSessionAuthSwitchAcquisitionError,
+  ConnectedServiceSessionAuthSwitchLockRegistry,
+} from './connectedServices/runtimeAuth/connectedServiceSessionAuthSwitchCore';
 import { TemporaryThrottleRecoveryScheduler } from './connectedServices/temporaryThrottle/TemporaryThrottleRecoveryScheduler';
 import { handleConnectedServiceRuntimeAuthFailure } from './connectedServices/runtimeAuth/handleConnectedServiceRuntimeAuthFailure';
 import { buildRuntimeAuthRecoveryKey } from './connectedServices/runtimeAuth/recoveryKey/runtimeAuthRecoveryKey';
@@ -4086,34 +4090,116 @@ describe('startDaemon spawn resume wiring (integration)', () => {
       expect(temporaryThrottleCancelSpy).not.toHaveBeenCalled();
     });
 
-    it('still lets an explicit Stop that races the replacement cancel the limit-reset recovery', async () => {
+    it('still lets an explicit Stop that races the replacement cancel the limit-reset recovery and queued auth work', async () => {
       admitContinuations();
-      const runtimeAuthCancelSpy = vi.spyOn(RuntimeAuthRecoveryScheduler.prototype, 'cancel');
-      let recovery: Awaited<ReturnType<typeof armDueLimitResetRetry>> | null = null;
-      let explicitStop: Promise<StopSessionResult> | null = null;
+      // Hold the joining Stop's asynchronous cleanup at its recovery cancellation, so queued auth
+      // work is observed while that cleanup has not finished and the recovery still owns the lane.
+      const cancelRecovery = RuntimeAuthRecoveryScheduler.prototype.cancel;
+      const cleanupGate = createDeferred();
+      const runtimeAuthCancelSpy = vi.spyOn(RuntimeAuthRecoveryScheduler.prototype, 'cancel')
+        .mockImplementation(async function (this: RuntimeAuthRecoveryScheduler, input) {
+          await cleanupGate.promise;
+          return await cancelRecovery.call(this, input);
+        });
+      const clearSessionSpy = vi.spyOn(ConnectedServiceSessionAuthSwitchLockRegistry.prototype, 'clearSession');
+      const recovery: { current: Awaited<ReturnType<typeof armDueLimitResetRetry>> | null } = { current: null };
+      const replacementStopping = createDeferred();
+      const releaseReplacementStop = createDeferred();
+      const events: string[] = [];
+      const state: {
+        explicitStop: Promise<StopSessionResult> | null;
+        laterWork: Promise<void> | null;
+        cancelledWorkRan: boolean;
+        cancelledWorkOutcome: Readonly<{ status: 'pending' } | { status: 'fulfilled' } | { status: 'rejected'; error: unknown }>;
+        atObservation: Readonly<{
+          cancelledWorkOutcome: unknown;
+          recoveryOwnerHeld: boolean;
+          recoveryStatus: unknown;
+        }> | null;
+        registry: ConnectedServiceSessionAuthSwitchLockRegistry | null;
+      } = {
+        explicitStop: null,
+        laterWork: null,
+        cancelledWorkRan: false,
+        cancelledWorkOutcome: { status: 'pending' },
+        atObservation: null,
+        registry: null,
+      };
+      // The user's Stop and a refreshed-credential application arrive from callers outside the
+      // recovery's auth lane, so the application queues behind that owner instead of re-entering it.
+      const independentCaller = (async () => {
+        await replacementStopping.promise;
+        try {
+          // The replacement's own Stop has already cleared the daemon's lock registry once.
+          const replacementClear = clearSessionSpy.mock.calls.findIndex(([sessionId]) => sessionId === id);
+          const registry = clearSessionSpy.mock.contexts[replacementClear] as ConnectedServiceSessionAuthSwitchLockRegistry | undefined;
+          if (!registry) throw new Error('Expected the replacement Stop to clear the daemon lock registry');
+          state.registry = registry;
+          void registry.runExclusiveDeferredBackground(id, async () => {
+            state.cancelledWorkRan = true;
+          }).then(
+            () => { state.cancelledWorkOutcome = { status: 'fulfilled' }; },
+            (error: unknown) => { state.cancelledWorkOutcome = { status: 'rejected', error }; },
+          );
+          const stopSession = harness.getStopSession();
+          if (!stopSession) throw new Error('Expected stopSession to be registered');
+          state.explicitStop = stopSession(id);
+          await new Promise((resolve) => setImmediate(resolve));
+          state.atObservation = {
+            cancelledWorkOutcome: state.cancelledWorkOutcome,
+            recoveryOwnerHeld: registry.isHeldByAnotherOwner(id),
+            recoveryStatus: recovery.current?.scheduler.readByKey(recovery.current.recoveryKey)?.status,
+          };
+          state.laterWork = registry.runExclusive(id, async () => {
+            events.push('later_work_started');
+          });
+        } finally {
+          cleanupGate.resolve();
+          // The user's Stop lands its recovery cancellation while the replacement's exact Stop runs.
+          await runtimeAuthCancelSpy.mock.results[0]?.value;
+          releaseReplacementStop.resolve();
+        }
+      })();
       await resumeAgainstLiveRunner({
         capability: async () => publisherLost(localRunner),
         duringStop: async () => {
-          const stopSession = harness.getStopSession();
-          if (!stopSession) throw new Error('Expected stopSession to be registered');
-          explicitStop = stopSession(id);
-          // The user's Stop lands its recovery cancellation while the replacement's exact Stop runs.
-          for (let attempt = 0; attempt < 200 && runtimeAuthCancelSpy.mock.results.length === 0; attempt += 1) {
-            await new Promise((resolve) => setTimeout(resolve, 5));
-          }
-          await runtimeAuthCancelSpy.mock.results[0]?.value;
+          replacementStopping.resolve();
+          await releaseReplacementStop.promise;
+          events.push('replacement_stop_released');
         },
         drive: async () => {
-          recovery = await armDueLimitResetRetry();
-          await recovery.wakeAfterReset();
+          recovery.current = await armDueLimitResetRetry();
+          await recovery.current.wakeAfterReset();
         },
       });
+      // The replacement reached its exact Stop, so the independent caller ran.
+      expect(events).toContain('replacement_stop_released');
+      await independentCaller;
+      await state.laterWork;
 
-      await expect(explicitStop).resolves.toEqual({ status: 'stopped' });
+      // The joining Stop cancels work queued after the replacement's own clear, before its
+      // asynchronous cleanup finishes and while the recovery still holds the lane.
+      expect(state.atObservation?.cancelledWorkOutcome).toEqual({
+        status: 'rejected',
+        error: expect.any(ConnectedServiceSessionAuthSwitchAcquisitionError),
+      });
+      expect(state.atObservation?.recoveryOwnerHeld).toBe(true);
+      expect(state.atObservation?.recoveryStatus).toBeDefined();
+      expect(state.atObservation?.recoveryStatus).not.toBe('cancelled');
+      expect(state.cancelledWorkOutcome).toMatchObject({
+        status: 'rejected',
+        error: { sessionId: id, reason: 'session_stopped' },
+      });
+      // The cancelled work never runs, and the owner kept exclusion until it finished.
+      expect(state.cancelledWorkRan).toBe(false);
+      expect(events).toEqual(['replacement_stop_released', 'later_work_started']);
+      expect(state.registry!.isHeldByAnotherOwner(id)).toBe(false);
+
+      await expect(state.explicitStop).resolves.toEqual({ status: 'stopped' });
       expect(runtimeAuthCancelSpy).toHaveBeenCalledExactlyOnceWith({ sessionId: id });
       expect(stopSessionMocks.stopSession).toHaveBeenCalledTimes(1);
       expect(continuationAdmissionMocks.sendSessionMessage).not.toHaveBeenCalled();
-      expect(recovery!.scheduler.readByKey(recovery!.recoveryKey)).toMatchObject({ status: 'cancelled' });
+      expect(recovery.current!.scheduler.readByKey(recovery.current!.recoveryKey)).toMatchObject({ status: 'cancelled' });
     });
   });
 

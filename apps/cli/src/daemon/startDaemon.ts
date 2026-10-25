@@ -2891,6 +2891,11 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           });
 
         const connectedServicesRestartRequestedPids = new Set<number>();
+        // A starting runner retries /session-started until it is answered. Each retry asks the same
+        // readiness question for the same runtime-target registration, so it joins the check still in
+        // flight instead of queueing another forced account-profile read behind it. A settled check is
+        // forgotten, so a later report fetches fresh account-profile data.
+        const sessionReadinessReconciliationByRuntimeTarget = new WeakMap<ConnectedServiceRuntimeTarget, Promise<void>>();
 
         // Handle webhook from happy session reporting itself
         const onHappySessionWebhook = createOnHappySessionWebhook({
@@ -2910,10 +2915,22 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               }
             }
             if (!target || target.pid !== tracked.pid || target.sessionId !== sessionId) return;
-            await enqueueConnectedServiceRuntimeTargetRegistrationReconciliation({
+            const inFlightReadiness = sessionReadinessReconciliationByRuntimeTarget.get(target);
+            if (inFlightReadiness) {
+              await inFlightReadiness;
+              return;
+            }
+            const readiness = enqueueConnectedServiceRuntimeTargetRegistrationReconciliation({
               key: { kind: 'session', pid: tracked.pid },
               target,
             }, true);
+            sessionReadinessReconciliationByRuntimeTarget.set(target, readiness);
+            void readiness.finally(() => {
+              if (sessionReadinessReconciliationByRuntimeTarget.get(target) === readiness) {
+                sessionReadinessReconciliationByRuntimeTarget.delete(target);
+              }
+            }).catch(() => {});
+            await readiness;
           },
           onTrackedSessionReported: async (tracked) => {
             persistPiResumeEnvironment({ tracked, happyHomeDir: configuration.happyHomeDir, logger });
@@ -5794,11 +5811,17 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             // A replacement in flight retires only its runner. An explicit Stop that joins it still
             // ends the session, so it supersedes automatic recovery itself before sharing the result.
             if (intent.kind === 'explicit_stop' && existingStop.intent === 'replace_runner_incarnation') {
+              // Cancel queued auth applications before this Stop's asynchronous cleanup can wait on them.
+              // The executing owner retains exclusion until its own operation unwinds.
+              connectedServiceSessionAuthSwitchCore.clearSession(normalizedSessionId);
               await supersedeAutomaticRecoveryForExplicitStop(normalizedSessionId);
             }
             return await existingStop.operation;
           }
 
+          // Cancel queued auth applications before any asynchronous Stop cleanup can wait on them.
+          // The executing owner retains exclusion until its own operation unwinds.
+          connectedServiceSessionAuthSwitchCore.clearSession(normalizedSessionId);
           const operation = Promise.resolve().then(async (): Promise<StopSessionResult> => {
             sessionRunnerRespawnManager.markStopRequested(normalizedSessionId, { reason: 'daemon_stop_session', requestedAtMs: Date.now() });
             if (intent.kind === 'explicit_stop') {

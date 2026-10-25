@@ -37,6 +37,11 @@ describe('createSessionSocketTransport', () => {
         const opts = mockIo.mock.calls[0]?.[1] as Record<string, unknown>;
         expect(opts.reconnection).toBe(false);
         expect(opts.autoConnect).toBe(false);
+        // The publisher names this runner process, so the daemon's later exit report can match it exactly.
+        const { getRunnerPublisherIncarnationId } = await import('@/api/session/publisherIncarnation');
+        const runnerPublisherIncarnationId = getRunnerPublisherIncarnationId();
+        expect(opts.auth).toMatchObject({ publisherIncarnationId: runnerPublisherIncarnationId });
+        expect(runnerPublisherIncarnationId).toMatch(/^[0-9a-f-]{36}$/);
 
         const connectedListener = vi.fn();
         const disconnectedListener = vi.fn<(event: TransportDisconnectEvent) => void>();
