@@ -1,9 +1,15 @@
 import { resolveAuthPolicyFromEnv } from "@/app/auth/authPolicy";
 import type { LoginEligibilityResult } from "@/app/auth/loginEligibilityResult";
-import { isAccountDisabled } from "@/app/auth/accountDisable";
+import { readAccountStanding, type AccountStanding } from "@/app/auth/accountStanding";
+import { accountStandingCache } from "@/app/auth/accountStandingCache";
 import { findIdentityProviderById } from "@/app/auth/providers/identityProviders/registry";
-import { db } from "@/storage/db";
 import { log } from "@/utils/logging/log";
+
+const REJECTION_BY_STANDING: Readonly<Record<Exclude<AccountStanding["kind"], "active">, LoginEligibilityResult>> = {
+    "not-found": { ok: false, statusCode: 401, error: "invalid-token" },
+    disabled: { ok: false, statusCode: 403, error: "account-disabled" },
+    unavailable: { ok: false, statusCode: 503, error: "upstream_error" },
+};
 
 export async function enforceLoginEligibility(params: {
     accountId: string;
@@ -14,33 +20,9 @@ export async function enforceLoginEligibility(params: {
     if (!accountId) return { ok: false, statusCode: 401, error: "invalid-token" };
 
     const policy = resolveAuthPolicyFromEnv(params.env);
-    let account: { id: string } | null = null;
-    try {
-        account = await db.account.findUnique({
-            where: { id: accountId },
-            select: { id: true },
-        });
-    } catch (error) {
-        log(
-            { module: "auth-login-eligibility", level: "error" },
-            "Failed to look up account for eligibility enforcement",
-            { accountId, error },
-        );
-        return { ok: false, statusCode: 503, error: "upstream_error" };
-    }
-    if (!account) return { ok: false, statusCode: 401, error: "invalid-token" };
-    let disabled = false;
-    try {
-        disabled = await isAccountDisabled({ accountId: account.id });
-    } catch (error) {
-        log(
-            { module: "auth-login-eligibility", level: "error" },
-            "Failed to check account disabled status",
-            { accountId: account.id, error },
-        );
-        return { ok: false, statusCode: 503, error: "upstream_error" };
-    }
-    if (disabled) return { ok: false, statusCode: 403, error: "account-disabled" };
+    // The account row and its disable marker are cached for a bounded time; see accountStandingCache.ts.
+    const standing = await accountStandingCache.resolve(accountId, readAccountStanding);
+    if (standing.kind !== "active") return REJECTION_BY_STANDING[standing.kind];
 
     if (policy.requiredLoginProviders.length === 0) {
         return { ok: true };
@@ -64,7 +46,7 @@ export async function enforceLoginEligibility(params: {
         let result: LoginEligibilityResult;
         try {
             result = await provider.enforceLoginEligibility({
-                accountId: account.id,
+                accountId,
                 env: params.env,
                 policy,
                 now,
@@ -73,7 +55,7 @@ export async function enforceLoginEligibility(params: {
             log(
                 { module: "auth-login-eligibility", level: "error" },
                 "Required login provider eligibility enforcement failed",
-                { accountId: account.id, providerId, error },
+                { accountId, providerId, error },
             );
             return { ok: false, statusCode: 503, error: "upstream_error" };
         }
