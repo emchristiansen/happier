@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { describe, expect, it } from 'vitest';
 
 import { createKeyedFollowUpRuns, type KeyedFollowUpRunContext } from './keyedFollowUpRuns';
@@ -31,6 +32,40 @@ function createHarness() {
 }
 
 describe('createKeyedFollowUpRuns', () => {
+  it.each(['fulfilled', 'rejected'] as const)(
+    'runs each cohort in its first requester’s context after the active run %s',
+    async (settlement) => {
+      const caller = new AsyncLocalStorage<string>();
+      const seen: Array<string | undefined> = [];
+      const runs: Array<ReturnType<typeof createDeferred<string>>> = [];
+      const queue = createKeyedFollowUpRuns<string, string, string>({
+        run: async () => {
+          seen.push(caller.getStore());
+          const run = createDeferred<string>();
+          runs.push(run);
+          return await run.promise;
+        },
+      });
+      const initial = caller.run('initial', () => queue.request('target', 'initial', { requireStartAfterRequest: false }));
+      void initial.catch(() => {});
+      await flushMicrotasks();
+      const forced = caller.run('first-forced', () => queue.request('target', 'first', { requireStartAfterRequest: true }));
+      const joined = caller.run('later-forced', () => queue.request('target', 'later', { requireStartAfterRequest: true }));
+      expect(joined).toBe(forced);
+      if (settlement === 'fulfilled') runs[0]!.resolve('initial');
+      else runs[0]!.reject(new Error('initial failed'));
+      await initial.catch(() => {});
+      await flushMicrotasks();
+      const next = caller.run('next-cohort', () => queue.request('target', 'next', { requireStartAfterRequest: true }));
+      runs[1]!.resolve('forced');
+      await forced;
+      await flushMicrotasks();
+      runs[2]!.resolve('next');
+      await next;
+      expect(seen).toEqual(['initial', 'first-forced', 'next-cohort']);
+    },
+  );
+
   it('queues exactly one follow-up for any number of start-after requests during an active run', async () => {
     const { runs, queue } = createHarness();
     const first = queue.request('target', 'r1', { requireStartAfterRequest: true });

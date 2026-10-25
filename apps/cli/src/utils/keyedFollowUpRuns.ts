@@ -1,3 +1,5 @@
+import { AsyncResource } from 'node:async_hooks';
+
 /**
  * Keyed async runs that coalesce concurrent requests into at most one queued follow-up per key.
  *
@@ -7,6 +9,8 @@
  * - active, request with `requireStartAfterRequest`: joins the key's single queued `followUp`,
  *   creating it if absent. The follow-up starts only after `active` settles (fulfilled or rejected),
  *   so it starts after every request that joined it, and it receives every joined input.
+ *   It runs in the async context of the request that created that follow-up, preserving that
+ *   caller's nesting without borrowing capabilities from the caller of the preceding run.
  *
  * However many requests arrive while a run is active, at most one more run is queued for that key.
  */
@@ -40,6 +44,7 @@ type QueuedFollowUp<I, T> = {
   readonly inputs: I[];
   readonly promise: Promise<T>;
   readonly resolve: (value: T | PromiseLike<T>) => void;
+  readonly start: () => Promise<T>;
 };
 
 type ActiveKeyState<I, T> = {
@@ -47,7 +52,8 @@ type ActiveKeyState<I, T> = {
   followUp: QueuedFollowUp<I, T> | null;
 };
 
-function createQueuedFollowUp<I, T>(input: I): QueuedFollowUp<I, T> {
+function createQueuedFollowUp<I, T>(input: I, run: (inputs: readonly I[]) => Promise<T>): QueuedFollowUp<I, T> {
+  const inputs = [input];
   let resolve!: (value: T | PromiseLike<T>) => void;
   const promise = new Promise<T>((promiseResolve) => {
     resolve = promiseResolve;
@@ -55,7 +61,10 @@ function createQueuedFollowUp<I, T>(input: I): QueuedFollowUp<I, T> {
   // Callers observe the rejection through `promise`; this only keeps an unobserved follow-up
   // rejection from surfacing as an unhandled rejection.
   promise.catch(() => {});
-  return { inputs: [input], promise, resolve };
+  // Promotion belongs to the previous run's settlement handler. Capture this requester now so
+  // starting its cohort there cannot inherit the previous caller's live auth-lock ownership.
+  const start = AsyncResource.bind(() => run([...inputs]));
+  return { inputs, promise, resolve, start };
 }
 
 export function createKeyedFollowUpRuns<K, I, T>(params: Readonly<{
@@ -84,7 +93,7 @@ export function createKeyedFollowUpRuns<K, I, T>(params: Readonly<{
         states.delete(key);
         return;
       }
-      followUp.resolve(start(key, [...followUp.inputs], 'follow_up', true));
+      followUp.resolve(followUp.start());
     };
     active.then(promoteFollowUp, promoteFollowUp);
     return active;
@@ -99,7 +108,7 @@ export function createKeyedFollowUpRuns<K, I, T>(params: Readonly<{
         state.followUp.inputs.push(input);
         return state.followUp.promise;
       }
-      const followUp = createQueuedFollowUp<I, T>(input);
+      const followUp = createQueuedFollowUp<I, T>(input, (inputs) => start(key, inputs, 'follow_up', true));
       state.followUp = followUp;
       return followUp.promise;
     },
