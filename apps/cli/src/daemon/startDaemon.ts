@@ -5805,11 +5805,17 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             // A replacement in flight retires only its runner. An explicit Stop that joins it still
             // ends the session, so it supersedes automatic recovery itself before sharing the result.
             if (intent.kind === 'explicit_stop' && existingStop.intent === 'replace_runner_incarnation') {
+              // Cancel queued auth applications before this Stop's asynchronous cleanup can wait on them.
+              // The executing owner retains exclusion until its own operation unwinds.
+              connectedServiceSessionAuthSwitchCore.clearSession(normalizedSessionId);
               await supersedeAutomaticRecoveryForExplicitStop(normalizedSessionId);
             }
             return await existingStop.operation;
           }
 
+          // Cancel queued auth applications before any asynchronous Stop cleanup can wait on them.
+          // The executing owner retains exclusion until its own operation unwinds.
+          connectedServiceSessionAuthSwitchCore.clearSession(normalizedSessionId);
           const operation = Promise.resolve().then(async (): Promise<StopSessionResult> => {
             sessionRunnerRespawnManager.markStopRequested(normalizedSessionId, { reason: 'daemon_stop_session', requestedAtMs: Date.now() });
             if (intent.kind === 'explicit_stop') {
