@@ -148,14 +148,29 @@ describe("metrics server", () => {
         process.env.METRICS_ENABLED = "true";
         process.env.METRICS_PORT = String(port);
 
-        const { startMetricsServer } = await import("./metrics");
-        const { initiateShutdown } = await import("@/utils/process/shutdown");
+        const fastifyModule = await import("fastify");
+        const fastifyFactory = vi.spyOn(fastifyModule, "default");
 
-        await expect(startMetricsServer()).resolves.toBe(true);
-        await expect(listenOnce(port)).rejects.toMatchObject({ code: "EADDRINUSE" });
+        try {
+            const { startMetricsServer } = await import("./metrics");
+            const { initiateShutdown } = await import("@/utils/process/shutdown");
 
-        await initiateShutdown("test");
+            await expect(startMetricsServer()).resolves.toBe(true);
+            await expect(listenOnce(port)).rejects.toMatchObject({ code: "EADDRINUSE" });
 
-        await expect(listenOnce(port)).resolves.toBeUndefined();
+            await initiateShutdown("test");
+
+            await expect(listenOnce(port)).resolves.toBeUndefined();
+        } finally {
+            try {
+                for (const result of fastifyFactory.mock.results) {
+                    if (result.type === "return") {
+                        await result.value.close();
+                    }
+                }
+            } finally {
+                fastifyFactory.mockRestore();
+            }
+        }
     });
 });
