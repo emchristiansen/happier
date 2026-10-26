@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   buildProviderAccountUsageRecordId,
   sealAccountScopedBlobCiphertext,
+  type ConnectedServiceCredentialRecordV1,
   type ProviderAccountUsageRecordKeyV1,
   type ProviderAccountUsageSnapshotV1,
 } from '@happier-dev/protocol';
@@ -28,6 +29,7 @@ import {
   resolveConnectedServiceAuthForSpawn,
 } from './resolveConnectedServiceAuthForSpawn';
 import type { ConnectedServicesMaterializationDiagnostic } from './materialize/providerMaterializerTypes';
+import type { ConnectedServiceCredentialRefreshResult } from './refresh/ConnectedServiceRefreshCoordinator';
 import { resolveClaudeCodeCredentialsFilePath } from '@/backends/claude/connectedServices/nativeAuth/claudeCodeCredentialFile';
 import { normalizeMaterializationKeyForPath } from './materialize/normalizeMaterializationKeyForPath';
 
@@ -50,6 +52,43 @@ function resolveCodexHomeForMaterialization(baseDir: string, materializationKey:
 async function readClaudeCodeNativeCredential(claudeConfigDir: string): Promise<Record<string, unknown>> {
   return JSON.parse(await readFile(resolveClaudeCodeCredentialsFilePath(claudeConfigDir), 'utf8')) as Record<string, unknown>;
 }
+
+/**
+ * The server stores one credential per profile, and a persisted rotation replaces it. Spawn reads
+ * the current one through `getConnectedServiceCredentialSealed`. Without a revision the server
+ * answers in the exact-0.2.1 no-revision shape.
+ */
+function createSealedCredentialServer(input: Readonly<{
+  credentials: Credentials;
+  record: ConnectedServiceCredentialRecordV1;
+  credentialRevision?: string;
+}>) {
+  const encryption = input.credentials.encryption;
+  if (encryption.type !== 'legacy') throw new Error('test fixture expected legacy encryption');
+  let record = input.record;
+  let credentialRevision = input.credentialRevision ?? null;
+  return {
+    persist(next: ConnectedServiceCredentialRecordV1, nextRevision?: string): void {
+      record = next;
+      credentialRevision = nextRevision ?? null;
+    },
+    getConnectedServiceCredentialSealed: vi.fn(async () => ({
+      sealed: {
+        format: 'account_scoped_v1',
+        ciphertext: sealAccountScopedBlobCiphertext({
+          kind: 'connected_service_credential',
+          material: { type: 'legacy', secret: encryption.secret },
+          payload: record,
+          randomBytes: (length) => randomBytes(length),
+        }),
+      },
+      metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: record.expiresAt },
+      ...(credentialRevision ? { revisionSemantics: 'revisioned', credentialRevision } : {}),
+    })),
+  };
+}
+
+type SealedCredentialServer = ReturnType<typeof createSealedCredentialServer>;
 
 async function createIsolatedClaudeSourceEnv(): Promise<NodeJS.ProcessEnv> {
   const homeDir = await mkdtemp(join(tmpdir(), 'happier-claude-source-home-'));
@@ -187,31 +226,27 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       throw new Error('test fixture expected legacy encryption');
     }
 
-    const ciphertext = sealAccountScopedBlobCiphertext({
-      kind: 'connected_service_credential',
-      material: { type: 'legacy', secret: credentials.encryption.secret },
-      payload: expiredRecord,
-      randomBytes: (length) => randomBytes(length),
-    });
-    const refreshConnectedServiceCredentialForSpawnPreflight = vi.fn(async () => ({
-      status: 'refreshed' as const,
-      credential: refreshedRecord,
-      diagnostic: {
-        serviceId: 'claude-subscription' as const,
-        profileId: 'work',
-        reason: 'spawn_preflight' as const,
+    // The refresh persists its rotation: the server then stores the refreshed record.
+    const server = createSealedCredentialServer({ credentials, record: expiredRecord });
+    const refreshConnectedServiceCredentialForSpawnPreflight = vi.fn(async () => {
+      server.persist(refreshedRecord);
+      return {
         status: 'refreshed' as const,
-        expiresAt: refreshedExpiresAt,
-        expiryAgeMs: now - refreshedExpiresAt,
-        refreshWindowMs: 60_000,
-      },
-    }));
+        credential: refreshedRecord,
+        diagnostic: {
+          serviceId: 'claude-subscription' as const,
+          profileId: 'work',
+          reason: 'spawn_preflight' as const,
+          status: 'refreshed' as const,
+          expiresAt: refreshedExpiresAt,
+          expiryAgeMs: now - refreshedExpiresAt,
+          refreshWindowMs: 60_000,
+        },
+      };
+    });
 
     const api = {
-      getConnectedServiceCredentialSealed: async () => ({
-        sealed: { format: 'account_scoped_v1', ciphertext },
-        metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: expiredExpiresAt },
-      }),
+      getConnectedServiceCredentialSealed: server.getConnectedServiceCredentialSealed,
     } as unknown as ApiClient;
 
     const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
@@ -252,12 +287,13 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
 
   describe('when spawn preflight joins a rotation still in flight', () => {
     // Incident 2026-10-22/23: a deadlocked rotation stayed registered as in flight. Every spawn
-    // preflight adopted its credential, minted at the rotation's start, even after it expired, and
-    // handed it to new runners.
+    // preflight adopted its credential, minted at the rotation's start, even after it expired and
+    // after a newer credential reached the server, and handed it to new runners.
     const now = 1_792_740_000_000;
     const hourMs = 60 * 60_000;
     const currentRevision = 'csr_currentcurrentcurrent01';
     const inFlightRevision = 'csr_inflightinflightinflt01';
+    const thirdRevision = 'csr_thirdthirdthirdthird001';
 
     function claudeRecord(input: Readonly<{ accessToken: string; updatedAt: number; expiresAt: number }>) {
       return {
@@ -282,12 +318,24 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     }
 
     async function spawnWithInFlightRotation(input: Readonly<{
+      /** The server's record when the spawn reads it. */
       current: ReturnType<typeof claudeRecord>;
       inFlight: ReturnType<typeof claudeRecord>;
+      /**
+       * What the joined refresh answers on each call (1-based): the in-flight rotation's credential,
+       * or `not_needed` with the record it was asked about. Defaults to the in-flight credential.
+       */
+      answer?: (call: number) => 'in_flight' | 'not_needed';
+      /**
+       * Whether the in-flight rotation reaches the server during the first refresh call, after the
+       * spawn read the server. Defaults to true; false means it was persisted before that read and
+       * has been superseded on the server since.
+       */
+      rotationPersisted?: boolean;
       /** The spawn's clock; a test moves it while the refresh is awaited. */
       clock?: { nowMs: number };
       /** Runs inside each awaited refresh call (1-based), before it answers. */
-      duringRefresh?: (call: number) => void;
+      duringRefresh?: (call: number, server: SealedCredentialServer) => void;
     }>) {
       const clock = input.clock ?? { nowMs: now };
       const baseDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-test-'));
@@ -297,36 +345,45 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
         token: 'happy-token',
         encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
       };
-      if (credentials.encryption.type !== 'legacy') throw new Error('test fixture expected legacy encryption');
-      const ciphertext = sealAccountScopedBlobCiphertext({
-        kind: 'connected_service_credential',
-        material: { type: 'legacy', secret: credentials.encryption.secret },
-        payload: input.current,
-        randomBytes: (length) => randomBytes(length),
+      const server = createSealedCredentialServer({
+        credentials,
+        record: input.current,
+        credentialRevision: currentRevision,
       });
       const api = {
-        getConnectedServiceCredentialSealed: async () => ({
-          sealed: { format: 'account_scoped_v1', ciphertext },
-          metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: input.current.expiresAt },
-          revisionSemantics: 'revisioned',
-          credentialRevision: currentRevision,
-        }),
+        getConnectedServiceCredentialSealed: server.getConnectedServiceCredentialSealed,
       } as unknown as ApiClient;
       // The coordinator's adoption of an in-flight rotation's credentialReady result
       // (`adoptCredentialReadyFromInFlightRefresh`) returns that rotation's credential as `refreshed`.
       let refreshCalls = 0;
-      const refreshConnectedServiceCredentialForSpawnPreflight = vi.fn(async () => {
+      const refreshConnectedServiceCredentialForSpawnPreflight = vi.fn(async (): Promise<ConnectedServiceCredentialRefreshResult> => {
         refreshCalls += 1;
-        input.duringRefresh?.(refreshCalls);
+        if (refreshCalls === 1 && input.rotationPersisted !== false) server.persist(input.inFlight, inFlightRevision);
+        input.duringRefresh?.(refreshCalls, server);
+        if ((input.answer?.(refreshCalls) ?? 'in_flight') === 'not_needed') {
+          return {
+            status: 'not_needed',
+            credential: input.current,
+            diagnostic: {
+              serviceId: 'claude-subscription',
+              profileId: 'work',
+              reason: 'spawn_preflight',
+              status: 'not_needed',
+              expiresAt: input.current.expiresAt,
+              expiryAgeMs: now - (input.current.expiresAt ?? now),
+              refreshWindowMs: 600_000,
+            },
+          };
+        }
         return {
-          status: 'refreshed' as const,
+          status: 'refreshed',
           credential: input.inFlight,
           credentialRevision: inFlightRevision,
           diagnostic: {
-            serviceId: 'claude-subscription' as const,
+            serviceId: 'claude-subscription',
             profileId: 'work',
-            reason: 'spawn_preflight' as const,
-            status: 'refreshed' as const,
+            reason: 'spawn_preflight',
+            status: 'refreshed',
             expiresAt: input.inFlight.expiresAt,
             expiryAgeMs: now - (input.inFlight.expiresAt ?? now),
             refreshWindowMs: 600_000,
@@ -353,8 +410,79 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       return { spawn, refreshConnectedServiceCredentialForSpawnPreflight };
     }
 
-    it('refuses an expired in-flight credential and materializes the current server record', async () => {
+    describe('when the spawn record and the in-flight credential carry different revisions', () => {
+      // Revisions are random and `updatedAt` is the writer's clock: neither orders two revisions.
+      // D43-001's example: a stale rotation stamped 2000, then a sign-in committed at 1900.
+      it.each([
+        { name: 'a later payload timestamp', inFlightUpdatedAt: now - hourMs + 100 },
+        { name: 'an equal payload timestamp', inFlightUpdatedAt: now - hourMs },
+      ])('keeps the newer server record over a stale unexpired in-flight credential with $name', async ({ inFlightUpdatedAt }) => {
+        const { spawn } = await spawnWithInFlightRotation({
+          // The server already stores the newer sign-in; the in-flight rotation was persisted before it.
+          rotationPersisted: false,
+          current: claudeRecord({ accessToken: 'newer-signin-access', updatedAt: now - hourMs, expiresAt: now + 8 * hourMs }),
+          inFlight: claudeRecord({ accessToken: 'stale-access', updatedAt: inFlightUpdatedAt, expiresAt: now + 6 * hourMs }),
+        });
+
+        const connectedServiceAuth = await spawn;
+
+        const credential = await readClaudeCodeNativeCredential(connectedServiceAuth!.env.CLAUDE_CONFIG_DIR!);
+        expect(credential).toMatchObject({ claudeAiOauth: { accessToken: 'newer-signin-access' } });
+      });
+
+      it('adopts a rotation the server committed after the spawn read, though its payload timestamp is older', async () => {
+        const { spawn } = await spawnWithInFlightRotation({
+          current: claudeRecord({ accessToken: 'superseded-access', updatedAt: now - hourMs, expiresAt: now + 5 * 60_000 }),
+          inFlight: claudeRecord({ accessToken: 'rotated-access', updatedAt: now - 2 * hourMs, expiresAt: now + 8 * hourMs }),
+        });
+
+        const connectedServiceAuth = await spawn;
+
+        const credential = await readClaudeCodeNativeCredential(connectedServiceAuth!.env.CLAUDE_CONFIG_DIR!);
+        expect(credential).toMatchObject({ claudeAiOauth: { accessToken: 'rotated-access' } });
+      });
+
+      it('adopts the record the server committed while the spawn waited over both earlier revisions', async () => {
+        const { spawn } = await spawnWithInFlightRotation({
+          rotationPersisted: false,
+          duringRefresh: (call, server) => {
+            if (call === 1) {
+              server.persist(
+                claudeRecord({ accessToken: 'third-access', updatedAt: now - 3 * hourMs, expiresAt: now + 8 * hourMs }),
+                thirdRevision,
+              );
+            }
+          },
+          current: claudeRecord({ accessToken: 'spawn-read-access', updatedAt: now - hourMs, expiresAt: now + 7 * hourMs }),
+          inFlight: claudeRecord({ accessToken: 'stale-access', updatedAt: now, expiresAt: now + 6 * hourMs }),
+        });
+
+        const connectedServiceAuth = await spawn;
+
+        const credential = await readClaudeCodeNativeCredential(connectedServiceAuth!.env.CLAUDE_CONFIG_DIR!);
+        expect(credential).toMatchObject({ claudeAiOauth: { accessToken: 'third-access' } });
+      });
+
+      it('keeps, in the materialization-time refresh, the newer server record over a stale in-flight credential', async () => {
+        const { spawn, refreshConnectedServiceCredentialForSpawnPreflight } = await spawnWithInFlightRotation({
+          // Preflight finds nothing to refresh; the materializer's own refresh call joins the stale rotation.
+          answer: (call) => (call === 1 ? 'not_needed' : 'in_flight'),
+          rotationPersisted: false,
+          current: claudeRecord({ accessToken: 'newer-signin-access', updatedAt: now - hourMs, expiresAt: now + 8 * hourMs }),
+          inFlight: claudeRecord({ accessToken: 'stale-access', updatedAt: now, expiresAt: now + 6 * hourMs }),
+        });
+
+        const connectedServiceAuth = await spawn;
+
+        expect(refreshConnectedServiceCredentialForSpawnPreflight).toHaveBeenCalledTimes(2);
+        const credential = await readClaudeCodeNativeCredential(connectedServiceAuth!.env.CLAUDE_CONFIG_DIR!);
+        expect(credential).toMatchObject({ claudeAiOauth: { accessToken: 'newer-signin-access' } });
+      });
+    });
+
+    it('refuses an expired in-flight credential and materializes the record the server still holds', async () => {
       const { spawn, refreshConnectedServiceCredentialForSpawnPreflight } = await spawnWithInFlightRotation({
+        rotationPersisted: false,
         current: claudeRecord({ accessToken: 'current-access', updatedAt: now - hourMs, expiresAt: now + 7 * hourMs }),
         inFlight: claudeRecord({ accessToken: 'stuck-access', updatedAt: now - 9 * hourMs, expiresAt: now - hourMs }),
       });
@@ -364,6 +492,22 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       expect(refreshConnectedServiceCredentialForSpawnPreflight).toHaveBeenCalled();
       const credential = await readClaudeCodeNativeCredential(connectedServiceAuth!.env.CLAUDE_CONFIG_DIR!);
       expect(credential).toMatchObject({ claudeAiOauth: { accessToken: 'current-access' } });
+    });
+
+    // F46-001: once the server's read shows the spawn's record superseded, an expired server record
+    // fails the spawn; restoring the superseded record could hand the runner a revoked credential.
+    it('fails the spawn rather than restore a superseded record when the server holds an expired rotation', async () => {
+      const { spawn } = await spawnWithInFlightRotation({
+        current: claudeRecord({ accessToken: 'superseded-access', updatedAt: now - hourMs, expiresAt: now + 7 * hourMs }),
+        inFlight: claudeRecord({ accessToken: 'stuck-access', updatedAt: now - 9 * hourMs, expiresAt: now - hourMs }),
+      });
+
+      await expect(spawn).rejects.toMatchObject({
+        name: 'ConnectedServiceSpawnCredentialRefreshError',
+        kind: 'transient_refresh_failed',
+        serviceId: 'claude-subscription',
+        profileId: 'work',
+      });
     });
 
     it('fails the spawn with a clear error when both the in-flight credential and the server record have expired', async () => {
@@ -380,26 +524,55 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       });
     });
 
-    it('refuses an in-flight credential that expires while the preflight refresh is awaited', async () => {
+    it('fails the spawn when the rotation the server holds expires while the preflight refresh is awaited', async () => {
       const clock = { nowMs: now };
       const { spawn } = await spawnWithInFlightRotation({
         clock,
-        // Valid when the spawn starts; expired by the time the joined rotation answers.
+        // Persisted after the spawn's read and valid then; expired by the time the joined rotation
+        // answers. The spawn's own record is superseded, so it is no fallback.
         duringRefresh: () => { clock.nowMs = now + 1_000; },
-        current: claudeRecord({ accessToken: 'current-access', updatedAt: now - 2 * hourMs, expiresAt: now + 7 * hourMs }),
+        current: claudeRecord({ accessToken: 'superseded-access', updatedAt: now - 2 * hourMs, expiresAt: now + 7 * hourMs }),
         inFlight: claudeRecord({ accessToken: 'expiring-access', updatedAt: now - hourMs, expiresAt: now + 500 }),
       });
 
-      const connectedServiceAuth = await spawn;
+      await expect(spawn).rejects.toMatchObject({
+        name: 'ConnectedServiceSpawnCredentialRefreshError',
+        kind: 'transient_refresh_failed',
+      });
+    });
 
-      const credential = await readClaudeCodeNativeCredential(connectedServiceAuth!.env.CLAUDE_CONFIG_DIR!);
-      expect(credential).toMatchObject({ claudeAiOauth: { accessToken: 'current-access' } });
+    it('fails, in the materialization-time refresh, rather than restore a record the server shows superseded', async () => {
+      const clock = { nowMs: now };
+      const { spawn, refreshConnectedServiceCredentialForSpawnPreflight } = await spawnWithInFlightRotation({
+        clock,
+        // Preflight finds nothing to refresh. The rotation reaches the server while the materializer's
+        // own refresh call waits on it, and expires before that call answers.
+        answer: (call) => (call === 1 ? 'not_needed' : 'in_flight'),
+        rotationPersisted: false,
+        duringRefresh: (call, server) => {
+          if (call !== 2) return;
+          server.persist(
+            claudeRecord({ accessToken: 'expiring-access', updatedAt: now - hourMs, expiresAt: now + 500 }),
+            inFlightRevision,
+          );
+          clock.nowMs = now + 1_000;
+        },
+        current: claudeRecord({ accessToken: 'superseded-access', updatedAt: now - 2 * hourMs, expiresAt: now + 7 * hourMs }),
+        inFlight: claudeRecord({ accessToken: 'expiring-access', updatedAt: now - hourMs, expiresAt: now + 500 }),
+      });
+
+      await expect(spawn).rejects.toMatchObject({
+        name: 'ConnectedServiceSpawnCredentialRefreshError',
+        kind: 'transient_refresh_failed',
+      });
+      expect(refreshConnectedServiceCredentialForSpawnPreflight).toHaveBeenCalledTimes(2);
     });
 
     it('does not fall back to a server record that expired while the preflight refresh was awaited', async () => {
       const clock = { nowMs: now };
       const { spawn } = await spawnWithInFlightRotation({
         clock,
+        rotationPersisted: false,
         duringRefresh: () => { clock.nowMs = now + 1_000; },
         current: claudeRecord({ accessToken: 'current-access', updatedAt: now - 2 * hourMs, expiresAt: now + 500 }),
         inFlight: claudeRecord({ accessToken: 'stuck-access', updatedAt: now - 9 * hourMs, expiresAt: now - hourMs }),
@@ -551,31 +724,27 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       throw new Error('test fixture expected legacy encryption');
     }
 
-    const ciphertext = sealAccountScopedBlobCiphertext({
-      kind: 'connected_service_credential',
-      material: { type: 'legacy', secret: credentials.encryption.secret },
-      payload: nearExpiryRecord,
-      randomBytes: (length) => randomBytes(length),
-    });
-    const refreshConnectedServiceCredentialForSpawnPreflight = vi.fn(async () => ({
-      status: 'refreshed' as const,
-      credential: refreshedRecord,
-      diagnostic: {
-        serviceId: 'claude-subscription' as const,
-        profileId: 'work',
-        reason: 'spawn_preflight' as const,
+    // The refresh persists its rotation: the server then stores the refreshed record.
+    const server = createSealedCredentialServer({ credentials, record: nearExpiryRecord });
+    const refreshConnectedServiceCredentialForSpawnPreflight = vi.fn(async () => {
+      server.persist(refreshedRecord);
+      return {
         status: 'refreshed' as const,
-        expiresAt: refreshedExpiresAt,
-        expiryAgeMs: now - refreshedExpiresAt,
-        refreshWindowMs: 60_000,
-      },
-    }));
+        credential: refreshedRecord,
+        diagnostic: {
+          serviceId: 'claude-subscription' as const,
+          profileId: 'work',
+          reason: 'spawn_preflight' as const,
+          status: 'refreshed' as const,
+          expiresAt: refreshedExpiresAt,
+          expiryAgeMs: now - refreshedExpiresAt,
+          refreshWindowMs: 60_000,
+        },
+      };
+    });
 
     const api = {
-      getConnectedServiceCredentialSealed: async () => ({
-        sealed: { format: 'account_scoped_v1', ciphertext },
-        metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: nearExpiryExpiresAt },
-      }),
+      getConnectedServiceCredentialSealed: server.getConnectedServiceCredentialSealed,
     } as unknown as ApiClient;
 
     const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
@@ -662,31 +831,27 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       throw new Error('test fixture expected legacy encryption');
     }
 
-    const ciphertext = sealAccountScopedBlobCiphertext({
-      kind: 'connected_service_credential',
-      material: { type: 'legacy', secret: credentials.encryption.secret },
-      payload: futureRecord,
-      randomBytes: (length) => randomBytes(length),
-    });
-    const refreshConnectedServiceCredentialForSpawnPreflight = vi.fn(async () => ({
-      status: 'refreshed' as const,
-      credential: refreshedRecord,
-      diagnostic: {
-        serviceId: 'claude-subscription' as const,
-        profileId: 'work',
-        reason: 'spawn_preflight' as const,
+    // The refresh persists its rotation: the server then stores the refreshed record.
+    const server = createSealedCredentialServer({ credentials, record: futureRecord });
+    const refreshConnectedServiceCredentialForSpawnPreflight = vi.fn(async () => {
+      server.persist(refreshedRecord);
+      return {
         status: 'refreshed' as const,
-        expiresAt: refreshedRecord.expiresAt,
-        expiryAgeMs: now - (refreshedRecord.expiresAt ?? now),
-        refreshWindowMs: 60_000,
-      },
-    }));
+        credential: refreshedRecord,
+        diagnostic: {
+          serviceId: 'claude-subscription' as const,
+          profileId: 'work',
+          reason: 'spawn_preflight' as const,
+          status: 'refreshed' as const,
+          expiresAt: refreshedRecord.expiresAt,
+          expiryAgeMs: now - (refreshedRecord.expiresAt ?? now),
+          refreshWindowMs: 60_000,
+        },
+      };
+    });
 
     const api = {
-      getConnectedServiceCredentialSealed: async () => ({
-        sealed: { format: 'account_scoped_v1', ciphertext },
-        metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: futureExpiresAt },
-      }),
+      getConnectedServiceCredentialSealed: server.getConnectedServiceCredentialSealed,
     } as unknown as ApiClient;
 
     const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
