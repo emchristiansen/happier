@@ -8,6 +8,7 @@ import {
   type PermissionIntent,
 } from '@happier-dev/agents';
 import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
+import { isRpcMethodNotAvailableError, isRpcMethodNotFoundError } from '@happier-dev/protocol/rpcErrors';
 import { readPendingLocalId, type PendingRequestedActionV1 } from '@happier-dev/protocol';
 
 import { fetchEncryptedTranscriptPageAfterSeq } from '@/api/session/fetchEncryptedTranscriptWindow';
@@ -41,6 +42,7 @@ import {
 
 import { resolveSessionTransportContext } from './resolveSessionTransportContext';
 import { requestInactiveSessionResume } from './requestInactiveSessionResume';
+import { probeSessionPendingQueueWakeCapabilityV1 } from '@/daemon/sessions/pendingQueueWake';
 
 export type SendSessionMessageResult =
   | Readonly<{ ok: true; sessionId: string; localId: string; waited: boolean; suppressed?: true }>
@@ -541,14 +543,38 @@ export async function sendSessionMessage(params: Readonly<{
       // The common wait path below observes exact materialization and terminal
       // evidence; resume acknowledgement alone is never provider acceptance.
     } else {
-      return {
-        ok: false,
-        code: resumeResult.code,
-        message: resumeResult.message,
-        pendingCustody: 'confirmed',
-        sessionId,
-        localId,
-      };
+      // Custody is already confirmed. A refused duplicate Resume need not fail the send
+      // while the existing publisher is recovering, or has recovered since that refusal.
+      const serviceability = resumeResult.code === 'resume_failed'
+        ? await probeSessionPendingQueueWakeCapabilityV1({
+          sessionId,
+          token: params.credentials.token,
+          resolveTransport: async () => sessionTarget,
+          callRpc: async (method, request) => await callSessionRpc({
+            token: params.credentials.token,
+            sessionId,
+            mode: sessionTarget.mode,
+            ctx: sessionTarget.ctx,
+            method,
+            request,
+            timeoutMs: Math.min(5_000, params.timeoutMs),
+          }),
+          isMethodUnavailable: (error) => isRpcMethodNotAvailableError(error) || isRpcMethodNotFoundError(error),
+        })
+        : null;
+      if (serviceability?.state !== 'servable'
+        && !(serviceability?.state === 'recoverable_unservable' && serviceability.reason === 'publisher_recovering')) {
+        return {
+          ok: false,
+          code: resumeResult.code,
+          message: resumeResult.message,
+          pendingCustody: 'confirmed',
+          sessionId,
+          localId,
+        };
+      }
+      // Continue through the existing wait path when requested. Neither capability nor
+      // confirmed Pending custody establishes materialization or assistant completion.
     }
   }
 
