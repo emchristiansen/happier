@@ -65,7 +65,32 @@ export type CodexAppServerPrivateIoEvent =
     | Readonly<{ kind: 'frame'; text: string }>
     | Readonly<{ kind: 'message'; direction: 'incoming' | 'outgoing'; message: unknown }>
     | Readonly<{ kind: 'failure'; operation: string; error: unknown }>
+    | Readonly<{
+        kind: 'auth-record-gap'; stream: 'stdin'; writeOrdinal: number;
+        reconstruction: 'payload cannot be reconstructed from this record';
+    } & (
+        | { operation: 'login'; method: 'account/login/start' }
+        | { operation: 'refresh_result'; method: 'account/chatgptAuthTokens/refresh' }
+    )>
+    | Readonly<{ kind: 'malformed-auth-channel/nonrecorded'; occurrence: number; position: number }>
     | Readonly<{ kind: 'close'; code: number | null; signal: NodeJS.Signals | null }>;
+
+type PrivateAuthRecord =
+    | Readonly<{ kind: 'exact' }>
+    | Readonly<{ kind: 'login-gap'; method: 'account/login/start'; reconstruction: 'payload cannot be reconstructed from this record' }>
+    | Readonly<{ kind: 'refresh-result-gap'; method: 'account/chatgptAuthTokens/refresh'; reconstruction: 'payload cannot be reconstructed from this record' }>;
+
+type PrivateNativeAuthTransport = Readonly<{
+    reserveClientRequestId: () => number;
+    writeSdkFrame: (input: Readonly<{ bytes: Uint8Array; recording: PrivateAuthRecord; signal: AbortSignal }>) => Promise<void>;
+}>;
+
+/** The private HOST owns SDK phases; this client owns only the one native transport. */
+type PrivateSdkAuthOwner = Readonly<{
+    bootstrap: (transport: PrivateNativeAuthTransport) => Promise<void>;
+    routeIncoming: (line: Uint8Array) => Promise<'handled' | 'ordinary'>;
+    authorizeOrdinaryWrite: (input: Readonly<{ kind: 'request' | 'notification' | 'reply'; method: string }>) => Promise<void>;
+}>;
 
 /** Captures custody synchronously; flush settles the owner's pending private writes. */
 export type CodexAppServerPrivateIoOwner = Readonly<{
@@ -96,7 +121,7 @@ type CodexAppServerClientParameters = Readonly<{
     configOverrides?: ReadonlyArray<string>;
     disableUserMcpServers?: boolean;
     initializeRequestOptions?: CodexAppServerRequestOptions;
-    io?: Readonly<{ kind: 'ordinary' }> | Readonly<{ kind: 'private'; owner: CodexAppServerPrivateIoOwner }>;
+    io?: Readonly<{ kind: 'ordinary' }> | Readonly<{ kind: 'private'; owner: CodexAppServerPrivateIoOwner; sdkAuth?: PrivateSdkAuthOwner }>;
 }>;
 
 type MessageQueueState = {
@@ -403,6 +428,10 @@ export async function createCodexAppServerClient(params: CodexAppServerClientPar
     )) {
         throw new CodexAppServerPrivateIoError('owner construction');
     }
+    if (params.io?.kind === 'private' && params.io.sdkAuth !== undefined && (
+        !params.io.sdkAuth || typeof params.io.sdkAuth.bootstrap !== 'function'
+        || typeof params.io.sdkAuth.routeIncoming !== 'function' || typeof params.io.sdkAuth.authorizeOrdinaryWrite !== 'function'
+    )) throw new CodexAppServerPrivateIoError('SDK owner construction');
     let flushPromise: Promise<void> | null = null;
     const privateOwner = selectedOwner ? {
         capture: selectedOwner.capture.bind(selectedOwner),
@@ -426,6 +455,8 @@ async function createOwnedCodexAppServerClient(
     params: CodexAppServerClientParameters,
     privateOwner: CodexAppServerPrivateIoOwner | null,
 ): Promise<DisposableCodexAppServerClient> {
+    const sdkAuth = params.io?.kind === 'private' ? params.io.sdkAuth : undefined;
+    let sdkReady = sdkAuth === undefined;
     let privateCustodyFailure: Error | null = null;
     const audienceFailure = (operation: string, error: unknown): Error => {
         const failure = privateOwner
@@ -491,6 +522,9 @@ async function createOwnedCodexAppServerClient(
     const exitHandlers = new Set<CodexAppServerExitHandler>();
     let reportedExitFailure: Error | null = null;
     let writeChain = Promise.resolve();
+    let incomingChain = Promise.resolve();
+    let incomingBytes = Buffer.alloc(0);
+    let writeOrdinal = 0;
     let nextId = 0;
     let disposing = false;
     let disposePromise: Promise<void> | null = null;
@@ -539,48 +573,41 @@ async function createOwnedCodexAppServerClient(
         }
     };
 
-    const sendMessage = async (message: Record<string, unknown>): Promise<void> => {
-        if (privateCustodyFailure) throw privateCustodyFailure;
-        if (state.fatalError) {
-            throw state.fatalError;
-        }
-        capturePrivate({ kind: 'message', direction: 'outgoing', message });
-        rpcLogger?.append({
-            direction: 'outgoing',
-            id: (message as JsonRpcMessage).id ?? null,
-            method: (message as JsonRpcMessage).method,
-            params: (message as JsonRpcMessage).params ?? null,
-            result: (message as JsonRpcMessage).result ?? null,
-            error: ((message as JsonRpcMessage).error as RpcLogEntry['error']) ?? null,
-        });
-        let payload: string;
-        try {
-            payload = `${safeJsonStringify(message)}\n`;
-        } catch (error) {
-            const reason = error instanceof Error ? error.message : String(error);
-            const method = typeof message.method === 'string' ? message.method : 'notification';
-            throw privateOwner ? audienceFailure('serialization', error) : new Error(`Failed to serialize Codex app-server ${method} message: ${reason}`);
-        }
+    const queueWrite = async (payload: string | Buffer, capture: (ordinal: number) => void, signal?: AbortSignal): Promise<void> => {
         const nextWrite = writeChain.then(async () => {
             // A queued write must not outlive a failure while capturing another message.
             if (privateCustodyFailure) throw privateCustodyFailure;
+            if (sdkAuth && state.fatalError) throw state.fatalError;
+            if (signal && (signal.aborted || state.fatalError)) throw state.fatalError ?? new CodexAppServerPrivateIoError('SDK write aborted');
             if (privateOwner && disposing) throw state.fatalError ?? new CodexAppServerPrivateIoError('write after disposal');
             const stdin = child.stdin;
             if (!stdin || stdin.writableEnded || stdin.destroyed) {
                 throw state.fatalError ?? createDisposedError();
             }
             await new Promise<void>((resolve, reject) => {
+                const onAbort = () => reject(new CodexAppServerPrivateIoError('SDK write aborted'));
+                signal?.addEventListener('abort', onAbort, { once: true });
+                const cleanup = () => signal?.removeEventListener('abort', onAbort);
                 try {
-                    capturePrivate({ kind: 'raw', stream: 'stdin', bytes: Buffer.from(payload, 'utf8') });
+                    capture(++writeOrdinal);
                     if (privateOwner && disposing) throw state.fatalError ?? new CodexAppServerPrivateIoError('write after disposal');
+                    if (signal?.aborted) throw new CodexAppServerPrivateIoError('SDK write aborted');
                     stdin.write(payload, 'utf8', (error) => {
+                        cleanup();
                         if (error) {
                             reject(error);
+                            return;
+                        }
+                        // Only this original child's complete callback can release
+                        // SDK write ownership. Close, abort or custody failure wins.
+                        if (signal && (signal.aborted || disposing || state.fatalError || privateCustodyFailure || stdin.destroyed || stdin.writableEnded)) {
+                            reject(state.fatalError ?? privateCustodyFailure ?? new CodexAppServerPrivateIoError('SDK write lost ownership'));
                             return;
                         }
                         resolve();
                     });
                 } catch (error) {
+                    cleanup();
                     reject(error);
                 }
             });
@@ -593,6 +620,77 @@ async function createOwnedCodexAppServerClient(
         }
     };
 
+    const sendMessage = async (message: Record<string, unknown>, replyMethod?: string): Promise<void> => {
+        if (privateCustodyFailure) throw privateCustodyFailure;
+        if (state.fatalError) throw state.fatalError;
+        if (sdkAuth) {
+            try {
+                if (!sdkReady) throw new CodexAppServerPrivateIoError('ordinary write before SDK bootstrap');
+                const method = typeof message.method === 'string' ? message.method : replyMethod;
+                if (!method) throw new CodexAppServerPrivateIoError('unbound ordinary reply');
+                await sdkAuth.authorizeOrdinaryWrite({
+                    kind: typeof message.method === 'string' ? message.id === undefined ? 'notification' : 'request' : 'reply',
+                    method,
+                });
+            } catch (error) {
+                failWith(error, { operation: 'ordinary SDK authorization' });
+                throw state.fatalError;
+            }
+            if (state.fatalError || privateCustodyFailure || disposing) throw state.fatalError ?? privateCustodyFailure ?? createDisposedError();
+        }
+        capturePrivate({ kind: 'message', direction: 'outgoing', message });
+        rpcLogger?.append({
+            direction: 'outgoing', id: (message as JsonRpcMessage).id ?? null,
+            method: (message as JsonRpcMessage).method, params: (message as JsonRpcMessage).params ?? null,
+            result: (message as JsonRpcMessage).result ?? null, error: ((message as JsonRpcMessage).error as RpcLogEntry['error']) ?? null,
+        });
+        let payload: string;
+        try { payload = `${safeJsonStringify(message)}\n`; }
+        catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            const method = typeof message.method === 'string' ? message.method : 'notification';
+            throw privateOwner ? audienceFailure('serialization', error) : new Error(`Failed to serialize Codex app-server ${method} message: ${reason}`);
+        }
+        await queueWrite(payload, () => capturePrivate({ kind: 'raw', stream: 'stdin', bytes: Buffer.from(payload, 'utf8') }));
+    };
+
+    const authTransport: PrivateNativeAuthTransport = {
+        reserveClientRequestId: () => {
+            if (disposing || state.fatalError || privateCustodyFailure || nextId >= Number.MAX_SAFE_INTEGER) {
+                throw state.fatalError ?? privateCustodyFailure ?? new CodexAppServerPrivateIoError('SDK request ID allocation');
+            }
+            return ++nextId;
+        },
+        writeSdkFrame: async ({ bytes, recording, signal }) => {
+            try {
+                if (!sdkAuth || !privateOwner) throw new CodexAppServerPrivateIoError('SDK write without owner');
+                // Copy the owned full line before queuing; do not parse or re-encode
+                // directional IDs or inspect payloads to choose record treatment.
+                const payload = Buffer.from(bytes);
+                if (payload.length === 0 || payload[payload.length - 1] !== 10 || payload.subarray(0, -1).includes(10)) {
+                    throw new CodexAppServerPrivateIoError('incomplete SDK frame');
+                }
+                await queueWrite(payload, (ordinal) => {
+                    switch (recording.kind) {
+                        case 'exact': capturePrivate({ kind: 'raw', stream: 'stdin', bytes: Buffer.from(payload) }); break;
+                        case 'login-gap':
+                            capturePrivate({ kind: 'auth-record-gap', stream: 'stdin', writeOrdinal: ordinal,
+                                operation: 'login', method: 'account/login/start', reconstruction: 'payload cannot be reconstructed from this record' });
+                            break;
+                        case 'refresh-result-gap':
+                            capturePrivate({ kind: 'auth-record-gap', stream: 'stdin', writeOrdinal: ordinal,
+                                operation: 'refresh_result', method: 'account/chatgptAuthTokens/refresh', reconstruction: 'payload cannot be reconstructed from this record' });
+                            break;
+                        default: throw new CodexAppServerPrivateIoError('unknown SDK recording operation');
+                    }
+                }, signal);
+            } catch (error) {
+                failWith(error, { operation: 'SDK native write' });
+                throw state.fatalError;
+            }
+        },
+    };
+
     const handleServerRequest = async (message: JsonRpcMessage): Promise<void> => {
         if (typeof message.method !== 'string') return;
         const requestKey = toMessageKey(message.id);
@@ -602,21 +700,21 @@ async function createOwnedCodexAppServerClient(
             await sendMessage({
                 id: message.id,
                 error: createJsonRpcError(`No handler registered for ${message.method}`, -32601),
-            });
+            }, message.method);
             return;
         }
         try {
             const result = await (privateOwner
                 ? invokePrivateCallback(() => handler(message.params, message))
                 : handler(message.params, message));
-            await sendMessage({ id: message.id, result: result ?? null });
+            await sendMessage({ id: message.id, result: result ?? null }, message.method);
         } catch (error) {
             if (privateOwner) audienceFailure('request handler', error);
             const failure = error instanceof Error ? error : new Error(String(error));
             await sendMessage({
                 id: message.id,
                 error: createJsonRpcError(failure.message),
-            });
+            }, message.method);
         }
     };
 
@@ -767,6 +865,26 @@ async function createOwnedCodexAppServerClient(
         try {
             if (privateOwner) capturePrivate({ kind: 'raw', stream: 'stdout', bytes: Buffer.from(chunk) });
             if (state.fatalError) return;
+            if (sdkAuth) {
+                incomingBytes = Buffer.concat([incomingBytes, Buffer.from(chunk)]);
+                let newline: number;
+                while ((newline = incomingBytes.indexOf(10)) !== -1) {
+                    const line = Buffer.from(incomingBytes.subarray(0, newline + 1));
+                    incomingBytes = incomingBytes.subarray(newline + 1);
+                    if (line.length > readMaxJsonLineChars(sourceProcessEnv)) throw new CodexAppServerJsonLineTooLargeError(readMaxJsonLineChars(sourceProcessEnv));
+                    // Keep full signed-i64/string IDs and original bytes outside
+                    // JSON.parse until the SDK owner explicitly returns Other.
+                    const route = incomingChain.then(async () => {
+                        if (state.fatalError || disposing) return;
+                        const result = await sdkAuth.routeIncoming(line);
+                        if (result === 'ordinary') jsonLineReader.push(stdoutDecoder!.write(line));
+                        else if (result !== 'handled') throw new CodexAppServerPrivateIoError('invalid SDK route');
+                    });
+                    incomingChain = route.catch((error) => { failWith(error, { operation: 'SDK incoming route' }); });
+                }
+                if (incomingBytes.length > readMaxJsonLineChars(sourceProcessEnv)) throw new CodexAppServerJsonLineTooLargeError(readMaxJsonLineChars(sourceProcessEnv));
+                return;
+            }
             jsonLineReader.push(stdoutDecoder ? stdoutDecoder.write(Buffer.from(chunk)) : chunk as string);
         } catch (error) {
             failWith(privateOwner ? error : new Error(`Invalid Codex app-server JSON output: ${error instanceof Error ? error.message : String(error)}`), { operation: 'stdout' });
@@ -939,6 +1057,7 @@ async function createOwnedCodexAppServerClient(
                     await terminateChild();
                     await closedPromise;
                     if (privateOwner) {
+                        await incomingChain;
                         await Promise.all(privateCallbackTasks);
                         await writeChain;
                     }
@@ -993,7 +1112,12 @@ async function createOwnedCodexAppServerClient(
     };
 
     try {
-        await request('initialize', {
+        if (sdkAuth) {
+            await sdkAuth.bootstrap(authTransport);
+            if (state.fatalError || privateCustodyFailure || disposing) throw state.fatalError ?? privateCustodyFailure ?? createDisposedError();
+            sdkReady = true;
+        } else {
+            await request('initialize', {
             clientInfo: {
                 name: 'happier_cli',
                 title: 'Happier',
@@ -1003,7 +1127,8 @@ async function createOwnedCodexAppServerClient(
                 experimentalApi: true,
             },
         }, params.initializeRequestOptions);
-        await notify('initialized');
+            await notify('initialized');
+        }
 
         return {
             request: privateOwner ? async (...args: Parameters<typeof request>) => {

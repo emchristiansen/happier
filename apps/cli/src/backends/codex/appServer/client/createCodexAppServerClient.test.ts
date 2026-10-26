@@ -67,6 +67,53 @@ async function createPrivateProcessBoundary(owner: CodexAppServerPrivateIoOwner,
 }
 
 describe('createCodexAppServerClient', () => {
+    it('[private-sdk] replaces only the private initialization with the retained SDK bootstrap', async () => {
+        const writes: Record<string, unknown>[] = [];
+        const events: CodexAppServerPrivateIoEvent[] = [];
+        const boundary = createPipedProcessBoundary((message) => {
+            writes.push(message);
+            if (message.method === 'initialize') boundary.stdout.write(JSON.stringify({ id: message.id, result: {} }) + '\n');
+        });
+        const bootstrap = vi.fn(async (transport: Readonly<{
+            reserveClientRequestId: () => number;
+            writeSdkFrame: (input: Readonly<{ bytes: Uint8Array; recording: Readonly<{ kind: 'exact' }>; signal: AbortSignal }>) => Promise<void>;
+        }>) => {
+            const id = transport.reserveClientRequestId();
+            await transport.writeSdkFrame({
+                bytes: Buffer.from(`{"id":${id},"method":"initialize","params":{"clientInfo":{"name":"codex-tui","title":null,"version":"0.162.1"},"capabilities":{"explicitGatewayOauth":true,"experimentalApi":true,"requestAttestation":false,"optOutNotificationMethods":null}}}\n`),
+                recording: { kind: 'exact' }, signal: new AbortController().signal,
+            });
+            await transport.writeSdkFrame({ bytes: Buffer.from('{"method":"initialized"}\n'), recording: { kind: 'exact' }, signal: new AbortController().signal });
+        });
+        const parameters = {
+            processEnv: { HAPPIER_CODEX_APP_SERVER_BIN: process.execPath },
+            io: { kind: 'private' as const, owner: { capture: (event: CodexAppServerPrivateIoEvent) => { events.push(event); }, flush: async () => {} },
+                sdkAuth: { bootstrap, routeIncoming: async (_line: Uint8Array) => 'handled' as const, authorizeOrdinaryWrite: async () => {} } },
+        };
+        const client = await createCodexAppServerClient(parameters);
+        try {
+            expect(bootstrap).toHaveBeenCalledTimes(1);
+            expect(writes).toHaveLength(2);
+            expect(writes[0]).toMatchObject({ id: 1, method: 'initialize', params: { clientInfo: { name: 'codex-tui', version: '0.162.1' } } });
+            expect(writes[1]).toEqual({ method: 'initialized' });
+        } finally {
+            const disposal = client.dispose(); boundary.child.emit('close', 0, null); await disposal;
+        }
+    });
+
+    it('[private-sdk] preserves the complete default initialization fixture bytes without a bootstrap', async () => {
+        const events: CodexAppServerPrivateIoEvent[] = [];
+        const boundary = await createPrivateProcessBoundary({ capture: (event) => { events.push(event); }, flush: async () => {} });
+        try {
+            const raw = events.filter((event) => event.kind === 'raw' && event.stream === 'stdin')
+                .map((event) => event.kind === 'raw' ? Buffer.from(event.bytes) : Buffer.alloc(0));
+            expect(raw).toEqual([
+                Buffer.from('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"happier_cli","title":"Happier","version":"0.1.0"},"capabilities":{"experimentalApi":true}}}\n'),
+                Buffer.from('{"method":"initialized","params":{}}\n'),
+            ]);
+        } finally { await boundary.dispose(); }
+    });
+
     it('[private-io] owns the first raw and parsed frame before initialization completes without ordinary RPC logging', async () => {
         await withTempDir('happier-private-native-io-first-frame-', async (root) => {
             const events: unknown[] = [];
