@@ -107,14 +107,28 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
     };
   }
 
+  function createPlannedRestartRequester(restartRequestedPids: Set<number>, pidToTrackedSession: Map<number, TrackedSession>) {
+    return vi.fn((input: RestartSignalParams) => requestPlannedRunnerRestart({
+      sessionId: input.sessionId ?? '', tracked: input.tracked, reason: 'connected_service_switch',
+      restartRequestedPids, pidToTrackedSession, deferral: { kind: 'none' },
+      isProcessSafeToSignal: async () => true, canSignal: async () => await input.shouldSignal?.(),
+      // Only the OS signal boundary is synthetic; reservation/currentness use the real owner.
+      requestSignal: async ({ shouldSignal }) => await shouldSignal()
+        ? { status: 'requested' as const }
+        : { status: 'skipped_stale_owner' as const },
+      logDebug: () => {},
+    }));
+  }
+
   it('marks restart-required targets and requests a restart signal without killing the child directly', async () => {
     const restartRequestedPids = new Set<number>();
     const kill = vi.fn();
-    const requestRestartSignal = vi.fn(async (_params: RestartSignalParams) => ({ signaled: true }));
     const pidToTrackedSession = new Map<number, TrackedSession>([
       [1, createTrackedSession({ pid: 1, sessionId: 's1' })],
       [2, createTrackedSession({ pid: 2, sessionId: 's2' })],
     ]);
+
+    const requestRestartSignal = createPlannedRestartRequester(restartRequestedPids, pidToTrackedSession);
 
     const handler = createConnectedServicesAuthUpdatedRestartHandler({
       restartRequestedPids,
@@ -182,26 +196,43 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
     expect(requestRestartSignal).not.toHaveBeenCalled();
   });
 
-  it('schedules a turn-deferred credential restart without holding refresh propagation open', async () => {
+  it('coalesces turn-deferred credential restarts without holding refresh propagation open', async () => {
     const tracked = createTrackedSession({ pid: 1, sessionId: 's1' });
+    const pidToTrackedSession = new Map([[1, tracked]]);
     const restartRequestedPids = new Set<number>();
-    const requestRestartSignal = vi.fn(() => new Promise<Readonly<{ signaled: boolean }>>(() => {}));
+    const queue = createConnectedServiceSwitchDeferralQueue({ timeoutMs: 60_000, disableDeferral: false });
+    queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'task_started' });
+    const signals = vi.fn(async () => ({ status: 'requested' as const }));
+    const pending: ReturnType<typeof requestPlannedRunnerRestart>[] = [];
     const handler = createConnectedServicesAuthUpdatedRestartHandler({
-      restartRequestedPids,
-      pidToTrackedSession: new Map([[1, tracked]]),
+      restartRequestedPids, pidToTrackedSession,
       resolveLifecycleDescriptor: async (agentId) => createLifecycleDescriptor(agentId, 'restart_required'),
-      resolveProcessGroupPid: (session) => session.pid,
-      requestRestartSignal,
-      restartSignalDelayMs: 250,
-    } satisfies RestartHandlerParams);
-
-    await expect(handler({
-      binding: { serviceId: 'claude-subscription', profileId: 'work' },
-      affectedTargets: [{ pid: 1, agentId: 'claude' }],
-    })).resolves.toBeUndefined();
-
-    expect(requestRestartSignal).toHaveBeenCalledOnce();
-    expect(restartRequestedPids.has(1)).toBe(true);
+      resolveProcessGroupPid: (session) => session.pid, restartSignalDelayMs: 0,
+      requestRestartSignal: (input) => {
+        const request = requestPlannedRunnerRestart({
+          sessionId: 's1', tracked, reason: 'connected_service_switch', restartRequestedPids, pidToTrackedSession,
+          deferral: { kind: 'connected_service_switch', source: 'automatic', policy: 'defer_until_turn_boundary',
+            target: { serviceId: input.target.serviceId, profileId: input.target.profileId, groupId: input.target.groupId, generation: input.target.generation ?? 0 }, turnDeferralQueue: queue },
+          isProcessSafeToSignal: async () => true, canSignal: async () => await input.shouldSignal?.(),
+          requestSignal: async ({ shouldSignal }) => await shouldSignal() ? await signals() : { status: 'skipped_stale_owner' as const },
+          logDebug: () => {},
+        });
+        pending.push(request); return request;
+      },
+    });
+    const event = { binding: { serviceId: 'claude-subscription' as const, profileId: 'work' }, affectedTargets: [{ pid: 1, agentId: 'claude' as const }] };
+    try {
+      await expect(handler(event)).resolves.toBeUndefined();
+      await expect(handler(event)).resolves.toBeUndefined();
+      expect(signals).not.toHaveBeenCalled();
+      // Pending deduplication belongs to the queue; this Set records actual restart intent.
+      expect(restartRequestedPids.size).toBe(0);
+      queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'assistant_message_end' });
+      expect(await Promise.all(pending)).toEqual([{ signaled: true }, { signaled: false }]);
+      await Promise.resolve();
+      expect(signals).toHaveBeenCalledOnce();
+      expect(restartRequestedPids.has(1)).toBe(true);
+    } finally { queue.cancelAll('daemon_shutdown'); await Promise.allSettled(pending); }
   });
 
   it('rejects credential deletion acknowledgement when canonical stop reports incomplete termination', async () => {
@@ -321,10 +352,12 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
       ...createTrackedSession({ pid: 41, sessionId: 'reattached-session' }),
       reattachedFromDiskMarker: true,
     } satisfies TrackedSession;
-    const requestRestartSignal = vi.fn(async (_params: RestartSignalParams) => ({ signaled: true }));
+    const pidToTrackedSession = new Map([[tracked.pid, tracked]]);
+    const requestRestartSignal = createPlannedRestartRequester(restartRequestedPids, pidToTrackedSession);
+
     const handler = createConnectedServicesAuthUpdatedRestartHandler({
       restartRequestedPids,
-      pidToTrackedSession: new Map([[tracked.pid, tracked]]),
+      pidToTrackedSession,
       resolveLifecycleDescriptor: async (agentId) => createLifecycleDescriptor(agentId, 'restart_required'),
       resolveProcessGroupPid: () => tracked.pid,
       requestRestartSignal,
@@ -408,10 +441,11 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
 
   it('keeps restart fallback for targets without an active access-token callback', async () => {
     const restartRequestedPids = new Set<number>();
-    const requestRestartSignal = vi.fn(async (_params: RestartSignalParams) => ({ signaled: true }));
     const pidToTrackedSession = new Map<number, TrackedSession>([
       [1, createTrackedSession({ pid: 1, sessionId: 's1' })],
     ]);
+
+    const requestRestartSignal = createPlannedRestartRequester(restartRequestedPids, pidToTrackedSession);
 
     const handler = createConnectedServicesAuthUpdatedRestartHandler({
       restartRequestedPids,
@@ -604,10 +638,11 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
     // env), so a reconnected credential can only reach the running Pi process via a restart. The
     // absence of PI_BROKER_SELECTIONS_ENV on the tracked session marks it as the setup-token shape.
     const restartRequestedPids = new Set<number>();
-    const requestRestartSignal = vi.fn(async (_params: RestartSignalParams) => ({ signaled: true }));
     const pidToTrackedSession = new Map<number, TrackedSession>([
       [1, createTrackedSession({ pid: 1, sessionId: 'pi-setup-token-session' })],
     ]);
+
+    const requestRestartSignal = createPlannedRestartRequester(restartRequestedPids, pidToTrackedSession);
 
     const handler = createConnectedServicesAuthUpdatedRestartHandler({
       restartRequestedPids,
@@ -672,10 +707,11 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
 
   it('still restarts OpenCode when a direct API-key connected service is reconnected', async () => {
     const restartRequestedPids = new Set<number>();
-    const requestRestartSignal = vi.fn(async (_params: RestartSignalParams) => ({ signaled: true }));
     const pidToTrackedSession = new Map<number, TrackedSession>([
       [1, createTrackedSession({ pid: 1, sessionId: 'opencode-session' })],
     ]);
+
+    const requestRestartSignal = createPlannedRestartRequester(restartRequestedPids, pidToTrackedSession);
 
     const handler = createConnectedServicesAuthUpdatedRestartHandler({
       restartRequestedPids,
@@ -807,12 +843,8 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
   });
 
   it('does not reserve the pid when the gated restart returns WITHOUT signalling (switch_cancelled must not leak the reservation)', async () => {
-    // Regression: the handler used to reserve the pid in restartRequestedPids BEFORE awaiting the
-    // gated restart dependency. When the deferred restart is superseded by a newer switch the
-    // dependency returns success WITHOUT signalling (no onSignalFailure, no throw). The pid then
-    // stayed reserved forever, suppressing every later refresh restart for that process until exit.
-    // The dependency now reports whether it actually signalled; an un-signalled restart must leave
-    // the pid UNRESERVED so a subsequent refresh can restart it.
+    // A canonical request cancelled before signalling creates no reservation. The handler must
+    // not manufacture one, so a subsequent refresh remains eligible for the same process.
     const restartRequestedPids = new Set<number>();
     const requestRestartSignal = vi.fn(async (_params: RestartSignalParams) => ({ signaled: false }));
     const tracked = createTrackedSession({ pid: 1, sessionId: 's1' });
@@ -845,9 +877,10 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
 
   it('reserves the pid only when the gated restart actually signalled', async () => {
     const restartRequestedPids = new Set<number>();
-    const requestRestartSignal = vi.fn(async (_params: RestartSignalParams) => ({ signaled: true }));
     const tracked = createTrackedSession({ pid: 1, sessionId: 's1' });
     const pidToTrackedSession = new Map<number, TrackedSession>([[1, tracked]]);
+
+    const requestRestartSignal = createPlannedRestartRequester(restartRequestedPids, pidToTrackedSession);
 
     const handler = createConnectedServicesAuthUpdatedRestartHandler({
       restartRequestedPids,
@@ -892,18 +925,27 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
 
   it('does not mark the pid for restart when restart signaling throws', async () => {
     const restartRequestedPids = new Set<number>();
-    const requestRestartSignal = vi.fn(async (_params: RestartSignalParams) => {
-      throw new Error('kill-failed');
-    });
     const pidToTrackedSession = new Map<number, TrackedSession>([
       [1, createTrackedSession({ pid: 1, sessionId: 's1' })],
     ]);
+
+    const requestRestartSignal = vi.fn((input: RestartSignalParams) => requestPlannedRunnerRestart({
+      sessionId: 's1', tracked: input.tracked, reason: 'connected_service_switch', restartRequestedPids, pidToTrackedSession,
+      deferral: { kind: 'none' }, isProcessSafeToSignal: async () => true,
+      canSignal: async () => await input.shouldSignal?.(),
+      requestSignal: async ({ shouldSignal, onSignalFailure }) => {
+        if (!await shouldSignal()) return { status: 'skipped_stale_owner' as const };
+        const failure = new Error('kill-failed');
+        onSignalFailure(failure); // The external signal boundary reports failure to its canonical owner.
+        throw failure;
+      }, logDebug: () => {},
+    }));
 
     const handler = createConnectedServicesAuthUpdatedRestartHandler({
       restartRequestedPids,
       pidToTrackedSession,
       resolveLifecycleDescriptor: async (agentId) => createLifecycleDescriptor(agentId, 'restart_required'),
-      resolveProcessGroupPid: () => null,
+      resolveProcessGroupPid: () => 1,
       requestRestartSignal,
       restartSignalDelayMs: 0,
     } satisfies RestartHandlerParams);
@@ -913,6 +955,8 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
       affectedTargets: [{ pid: 1, agentId: 'claude' }],
     })).resolves.toBeUndefined();
 
+    expect(requestRestartSignal).toHaveBeenCalledOnce();
+    await Promise.allSettled(requestRestartSignal.mock.results.map((result) => result.value));
     expect(restartRequestedPids.size).toBe(0);
   });
 
@@ -955,10 +999,11 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
   });
   it.each([true, false])('uses an explicit adapter requirement despite a generic exemption while respecting restart-disable (%s)', async (restartEnabled) => {
     const tracked = createTrackedSession({ pid: 1, sessionId: 's1' });
-    const requestRestartSignal = vi.fn(async (_params: RestartSignalParams) => ({ signaled: true }));
     const restartRequestedPids = new Set<number>();
+    const pidToTrackedSession = new Map([[1, tracked]]);
+    const requestRestartSignal = createPlannedRestartRequester(restartRequestedPids, pidToTrackedSession);
     const handler = createConnectedServicesAuthUpdatedRestartHandler({
-      restartRequestedPids, pidToTrackedSession: new Map([[1, tracked]]), restartEnabled,
+      restartRequestedPids, pidToTrackedSession, restartEnabled,
       resolveLifecycleDescriptor: async () => createLifecycleDescriptor('claude', 'no_restart_required'),
       resolveProcessGroupPid: () => 1, requestRestartSignal, restartSignalDelayMs: 0,
     });
@@ -1047,8 +1092,156 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
       await Promise.resolve();
       expect(signals).toEqual(mode === 'boundary' ? [1] : []);
       expect(reservations.has(1)).toBe(mode === 'boundary');
-      expect(requestRestartSignal).toHaveBeenCalledTimes(1);
+      expect(requestRestartSignal).toHaveBeenCalledTimes(mode === 'manual' ? 1 : 2);
     } finally { queue.cancelAll('daemon_shutdown'); await Promise.allSettled(pending); }
   });
 
+  it('preserves a queued manual restart reservation when the automatic required request joins without signalling', async () => {
+    const tracked = createTrackedSession({ pid: 1, sessionId: 's1' });
+    // Synthetic child boundary: no process is spawned or signalled.
+    tracked.childProcess = { exitCode: null, signalCode: null } as NonNullable<TrackedSession['childProcess']>;
+    const sessions = new Map([[1, tracked]]);
+    const reservations = new Set<number>();
+    const queue = createConnectedServiceSwitchDeferralQueue({ timeoutMs: 60_000, disableDeferral: false });
+    queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'task_started' });
+    const descriptorEntered = createDeferred<void>();
+    const descriptor = createDeferred<ConnectedServiceCredentialLifecycleDescriptor>();
+    const subscription = { serviceId: 'claude-subscription' as const, profileId: 'work', groupId: 'team', generation: 7 };
+    const signals: string[] = [];
+    let automatic: ReturnType<typeof requestPlannedRunnerRestart> | undefined;
+    const handler = createConnectedServicesAuthUpdatedRestartHandler({
+      restartRequestedPids: reservations, pidToTrackedSession: sessions,
+      resolveLifecycleDescriptor: () => { descriptorEntered.resolve(); return descriptor.promise; },
+      resolveProcessGroupPid: () => 1, restartSignalDelayMs: 0,
+      requestRestartSignal: (input) => {
+        automatic = requestPlannedRunnerRestart({
+          sessionId: 's1', tracked, reason: 'connected_service_switch', restartRequestedPids: reservations, pidToTrackedSession: sessions,
+          deferral: { kind: 'connected_service_switch', source: 'automatic', policy: 'defer_until_turn_boundary', target: subscription, turnDeferralQueue: queue },
+          isProcessSafeToSignal: async () => true, canSignal: async () => await input.shouldSignal?.(),
+          requestSignal: async ({ shouldSignal }) => {
+            if (!await shouldSignal()) return { status: 'skipped_stale_owner' as const };
+            signals.push('automatic'); return { status: 'requested' as const };
+          }, logDebug: () => {},
+        });
+        return automatic;
+      },
+    });
+    // The application has completed before this handler's descriptor await. An unrelated
+    // anthropic switch retains the subscription selection and its authoritative revision.
+    const application = handler({
+      binding: subscription, affectedTargets: [{ pid: 1, agentId: 'claude' }],
+      requiredRestarts: new Map([[1, { tracked, sessionId: 's1', runtimeIdentityKey: 'runtime-1', isCurrent: async () => true,
+        requirement: { ...subscription, kind: 'restart_resume', source: 'failed_adapter_hot_apply', credentialRevision: 'csr_abcdefghijklmnopqrstuv' },
+      }]]),
+    });
+    await descriptorEntered.promise;
+    // This is the actual daemon target for a full multi-service manual request.
+    const manual = requestPlannedRunnerRestart({
+      sessionId: 's1', tracked, reason: 'connected_service_switch', restartRequestedPids: reservations, pidToTrackedSession: sessions,
+      deferral: { kind: 'connected_service_switch', source: 'manual', policy: 'defer_until_turn_boundary',
+        target: { serviceId: '__multi_service_switch__', profileId: '', groupId: '', generation: 0 }, turnDeferralQueue: queue },
+      isProcessSafeToSignal: async () => true,
+      requestSignal: async ({ shouldSignal }) => {
+        if (!await shouldSignal()) return { status: 'skipped_stale_owner' as const };
+        signals.push('manual'); return { status: 'requested' as const };
+      }, logDebug: () => {},
+    });
+    try {
+      expect(reservations.size).toBe(0);
+      descriptor.resolve(createLifecycleDescriptor('claude', 'no_restart_required'));
+      await application;
+      expect(automatic).toBeDefined();
+      queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'assistant_message_end' });
+      expect(await manual).toEqual({ signaled: true });
+      expect(await automatic).toEqual({ signaled: false });
+      await Promise.resolve();
+      expect(signals).toEqual(['manual']);
+      // The daemon's existing exit consumer reads this Set to select forced respawn.
+      // Child exit is deliberately delayed until both request settlements have completed.
+      expect(reservations.has(tracked.pid)).toBe(true);
+    } finally {
+      descriptor.resolve(createLifecycleDescriptor('claude', 'no_restart_required'));
+      queue.cancelAll('daemon_shutdown');
+      await Promise.allSettled([application, manual, ...(automatic ? [automatic] : [])]);
+    }
+  });
+
+  it.each(['exitCode', 'signalCode', 'killed'] as const)('uses terminal child evidence rather than signal-request state before authority: %s', async (field) => {
+    const tracked = createTrackedSession({ pid: 1, sessionId: 's1' });
+    // ChildProcess-shaped OS boundary; killed alone does not establish that the child exited.
+    tracked.childProcess = {
+      exitCode: field === 'exitCode' ? 0 : null,
+      signalCode: field === 'signalCode' ? 'SIGTERM' : null,
+      killed: field === 'killed',
+    } as NonNullable<TrackedSession['childProcess']>;
+    const reservations = new Set<number>();
+    const requestRestartSignal = createPlannedRestartRequester(reservations, new Map([[1, tracked]]));
+    const current = vi.fn(async () => true);
+    const handler = createConnectedServicesAuthUpdatedRestartHandler({
+      restartRequestedPids: reservations, pidToTrackedSession: new Map([[1, tracked]]),
+      resolveLifecycleDescriptor: async () => createLifecycleDescriptor('claude', 'no_restart_required'),
+      resolveProcessGroupPid: () => 1, requestRestartSignal, restartSignalDelayMs: 0,
+    });
+    await handler({ binding: { serviceId: 'claude-subscription', profileId: 'work' }, affectedTargets: [{ pid: 1, agentId: 'claude' }],
+      requiredRestarts: new Map([[1, { tracked, sessionId: 's1', runtimeIdentityKey: 'runtime-1', isCurrent: current,
+        requirement: { kind: 'restart_resume', source: 'failed_adapter_hot_apply', serviceId: 'claude-subscription', profileId: 'work', groupId: null, generation: null, credentialRevision: 'csr_abcdefghijklmnopqrstuv' },
+      }]]),
+    });
+    if (field === 'killed') {
+      expect(await requestRestartSignal.mock.results[0]?.value).toEqual({ signaled: true });
+      expect(reservations.has(1)).toBe(true);
+    } else {
+      expect(current).not.toHaveBeenCalled();
+      expect(requestRestartSignal).not.toHaveBeenCalled();
+      expect(reservations.size).toBe(0);
+    }
+  });
+
+  it.each(['exitCode', 'signalCode'] as const)('refuses a retained child whose %s becomes terminal during final authority', async (terminalField) => {
+    const tracked = createTrackedSession({ pid: 1, sessionId: 's1' });
+    const child = { exitCode: null as number | null, signalCode: null as NodeJS.Signals | null };
+    // Synthetic ChildProcess state models exit staging retaining the same tracked owner.
+    tracked.childProcess = child as NonNullable<TrackedSession['childProcess']>;
+    const sessions = new Map([[1, tracked]]);
+    const reservations = new Set<number>();
+    const authorityEntered = createDeferred<void>();
+    const authority = createDeferred<boolean>();
+    let reads = 0;
+    const signals: number[] = [];
+    const safety = vi.fn(async () => true);
+    let restart: ReturnType<typeof requestPlannedRunnerRestart> | undefined;
+    const handler = createConnectedServicesAuthUpdatedRestartHandler({
+      restartRequestedPids: reservations, pidToTrackedSession: sessions,
+      resolveLifecycleDescriptor: async () => createLifecycleDescriptor('claude', 'no_restart_required'),
+      resolveProcessGroupPid: () => 1, restartSignalDelayMs: 0,
+      requestRestartSignal: (input) => {
+        restart = requestPlannedRunnerRestart({
+          sessionId: 's1', tracked, reason: 'connected_service_switch', restartRequestedPids: reservations, pidToTrackedSession: sessions,
+          deferral: { kind: 'none' }, isProcessSafeToSignal: safety, canSignal: async () => await input.shouldSignal?.(),
+          requestSignal: async ({ shouldSignal }) => {
+            if (!await shouldSignal()) return { status: 'skipped_stale_owner' as const };
+            signals.push(1); return { status: 'requested' as const };
+          }, logDebug: () => {},
+        });
+        return restart;
+      },
+    });
+    try {
+      await handler({ binding: { serviceId: 'claude-subscription', profileId: 'work' }, affectedTargets: [{ pid: 1, agentId: 'claude' }],
+        requiredRestarts: new Map([[1, { tracked, sessionId: 's1', runtimeIdentityKey: 'runtime-1',
+          isCurrent: async () => { if (++reads === 1) return true; authorityEntered.resolve(); return await authority.promise; },
+          requirement: { kind: 'restart_resume', source: 'failed_adapter_hot_apply', serviceId: 'claude-subscription', profileId: 'work', groupId: null, generation: null, credentialRevision: 'csr_abcdefghijklmnopqrstuv' },
+        }]]),
+      });
+      await authorityEntered.promise;
+      expect(safety).toHaveBeenCalledOnce();
+      if (terminalField === 'exitCode') child.exitCode = 0;
+      else child.signalCode = 'SIGTERM';
+      expect(sessions.get(1)).toBe(tracked);
+      authority.resolve(true);
+      expect(await restart).toMatchObject({ signaled: false });
+      expect(signals).toEqual([]);
+      expect(reservations.size).toBe(0);
+    } finally { authority.resolve(true); await restart; }
+  });
 });

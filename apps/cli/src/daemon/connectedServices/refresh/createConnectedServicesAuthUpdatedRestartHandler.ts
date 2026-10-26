@@ -119,8 +119,8 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
    * pid/signal fields. The daemon wires this to the gated restart primitive
    * (requestConnectedServiceRestartWithDeferral) so a credential-refresh /
    * reconnect restart inherits turn-deferral + the spawn-time reachability gate
-   * instead of sending a raw mid-turn SIGTERM. A raw-signal adapter may still be
-   * supplied in tests; the extra context is additive.
+   * instead of sending a raw mid-turn SIGTERM. This canonical dependency owns
+   * restartRequestedPids; this handler never reserves or releases its intent.
    */
   requestRestartSignal: (params: Readonly<{
     pid: number;
@@ -142,9 +142,9 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
     /**
      * Reports whether a restart signal was ACTUALLY emitted. The gated restart dependency can
      * resolve successfully WITHOUT signalling (e.g. the deferred restart was superseded by a newer
-     * switch — `switch_cancelled`). The handler reserves the pid in `restartRequestedPids` only when
-     * `signaled` is true, so an un-signalled restart never leaks a reservation that would suppress
-     * later refresh restarts for the same process.
+     * switch — `switch_cancelled`, or joined a queued manual request). A joined caller's false
+     * result must not release the executing owner's reservation. Pending requests coalesce in the
+     * existing deferral queue; the canonical dependency owns signal reservation and cleanup.
      */
   }>) => Promise<Readonly<{ signaled: boolean; notSignaledReason?: string }>>;
   stopSessionForCredentialDeletion?: (input: Readonly<{
@@ -221,7 +221,9 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
         && params.pidToTrackedSession.get(target.pid) === required.tracked
         && tracked === required.tracked
         && required.tracked.pid === target.pid
-        && required.tracked.happySessionId === required.sessionId);
+        && required.tracked.happySessionId === required.sessionId
+        && required.tracked.childProcess?.exitCode == null
+        && required.tracked.childProcess?.signalCode == null);
       const requirementIsCurrent = async (): Promise<boolean> => {
         if (!required) return params.pidToTrackedSession.get(target.pid) === tracked;
         if (!capturedOwnerIsCurrent()) {
@@ -311,12 +313,9 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
       // Descriptor lookup can yield; validate the captured request afterward, before reserving.
       if (required && !await requirementIsCurrent()) continue;
       if (params.restartRequestedPids.has(target.pid)) continue;
-      // The gated restart owner may intentionally remain pending until a safe turn boundary.
-      // Scheduling that existing owner is sufficient; refresh/reconnect distribution must not
-      // retain credential-rotation custody while waiting for future conversational activity.
-      // Reserve while the canonical request itself is pending so a later refresh cannot schedule a
-      // duplicate restart. A resolved no-signal/cancelled request releases the reservation below.
-      params.restartRequestedPids.add(target.pid);
+      // The canonical queue coalesces pending requests; its executing owner alone reserves the PID.
+      // Schedule without retaining refresh custody until a future turn boundary. This call may join
+      // another owner's restart, so its own no-signal result grants no reservation cleanup authority.
       let restartRequest: Promise<Readonly<{ signaled: boolean; notSignaledReason?: string }>>;
       try {
         // K5:gated_restart credential refresh inherits canonical deferral and reachability checks.
@@ -346,25 +345,19 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
           recordRestartDiagnostic: params.recordRestartDiagnostic,
           nowMs: params.nowMs,
           onSignalFailure: (error) => {
-            params.restartRequestedPids.delete(target.pid);
             params.onRestartSignalFailure?.(error, target);
           },
         });
       } catch (error) {
-        params.restartRequestedPids.delete(target.pid);
         params.onRestartSignalFailure?.(error, target);
         if (required) emitBlocked(target, tracked, processGroupPid, 'restart_request_failed');
         continue;
       }
       void restartRequest.then(({ signaled, notSignaledReason }) => {
-        // A gated restart that resolves without signalling (e.g. superseded by a newer switch /
-        // switch_cancelled) must not leave a reservation behind.
         if (!signaled) {
-          params.restartRequestedPids.delete(target.pid);
           if (required) emitBlocked(target, tracked, processGroupPid, 'restart_not_signaled', notSignaledReason);
         }
       }).catch((error) => {
-        params.restartRequestedPids.delete(target.pid);
         params.onRestartSignalFailure?.(error, target);
         if (required) emitBlocked(target, tracked, processGroupPid, 'restart_request_failed');
       });

@@ -7475,9 +7475,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 routedThroughGatedPrimitive: true,
               });
               // K5:gated_restart refresh/reconnect restart deferred until turn boundary,
-              // reachability re-verified at respawn (no raw mid-turn SIGTERM). The handler reserves
-              // the pid only when the gated restart actually signalled; a superseded/cancelled
-              // deferral returns { signaled: false } so the reservation is not leaked.
+              // reachability re-verified at respawn (no raw mid-turn SIGTERM). The canonical planned
+              // owner alone reserves and releases restart intent. A joined or cancelled caller's own
+              // { signaled: false } result does not authorize cleanup of another owner's reservation.
               return await requestConnectedServiceRestartWithDeferral({
                 sessionId: signalParams.sessionId ?? signalParams.tracked.happySessionId ?? '',
                 tracked: signalParams.tracked,
