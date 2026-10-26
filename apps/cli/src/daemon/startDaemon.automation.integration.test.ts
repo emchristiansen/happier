@@ -920,7 +920,9 @@ function createDaemonPiReadinessMetadata(pid: number): Metadata {
   };
 }
 
-async function installActualDaemonClaudeReadinessWebhook(pid: number): Promise<Readonly<{
+async function installActualDaemonClaudeReadinessWebhook(pid: number, options: Readonly<{
+  onTrackedSessionReadyEntered?: (tracked: TrackedSession) => void;
+}> = {}): Promise<Readonly<{
   getTrackedSession: () => TrackedSession;
   installTrackedSession: (tracked: TrackedSession) => void;
 }>> {
@@ -941,8 +943,17 @@ async function installActualDaemonClaudeReadinessWebhook(pid: number): Promise<R
     trackedSessionsByPid = params.pidToTrackedSession;
     trackedSession = createDaemonGroupBoundClaudeTrackedSession(pid);
     params.pidToTrackedSession.set(pid, trackedSession);
+    const onTrackedSessionReady = params.onTrackedSessionReady;
     return actualWebhookModule.createOnHappySessionWebhook({
       ...params,
+      ...(onTrackedSessionReady && options.onTrackedSessionReadyEntered
+        ? {
+            onTrackedSessionReady: async (tracked: TrackedSession) => {
+              options.onTrackedSessionReadyEntered?.(tracked);
+              await onTrackedSessionReady(tracked);
+            },
+          }
+        : {}),
       findHappyProcessByPidFn: async () => null,
       writeSessionMarkerFn: async () => {},
       readCredentialsFn: async () => automationCredentials,
@@ -2086,6 +2097,101 @@ describe('startDaemon automation wiring (integration)', () => {
     }
   });
 
+  it.each([
+    {
+      name: 'shares one readiness reconciliation across concurrent startup reports for one target',
+      expectedProfileFetches: 1,
+      pids: [7431, 7431, 7431, 7431],
+    },
+    {
+      name: 'shares one account-profile fetch across forced startup reconciliations for several targets',
+      expectedProfileFetches: 2,
+      pids: [7432, 7433, 7434, 7435],
+    },
+  ])('$name', async ({ pids, expectedProfileFetches }) => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    let run: Promise<void> | null = null;
+    let app: Awaited<ReturnType<typeof createCapturedDaemonControlApp>> | null = null;
+    harness.setAutoShutdownAfterAutomationStart(false);
+    const firstPid = pids[0]!;
+    let readyEntries = 0;
+
+    try {
+      const webhook = await installActualDaemonClaudeReadinessWebhook(firstPid, {
+        onTrackedSessionReadyEntered: () => {
+          readyEntries += 1;
+        },
+      });
+      const { fetchAccountProfile } = await import('@/api/accountProfile');
+      const profileGate = createDeferred<void>();
+      let profileFetchesInFlight = 0;
+      let maxProfileFetchesInFlight = 0;
+      vi.mocked(fetchAccountProfile).mockImplementation(async () => {
+        profileFetchesInFlight += 1;
+        maxProfileFetchesInFlight = Math.max(maxProfileFetchesInFlight, profileFetchesInFlight);
+        try {
+          await profileGate.promise;
+        } finally {
+          profileFetchesInFlight -= 1;
+        }
+        return {
+          connectedServicesV2: [],
+          connectedServiceCredentialRevisionsV1: [],
+        } as unknown as Awaited<ReturnType<typeof fetchAccountProfile>>;
+      });
+
+      const { startDaemon } = await import('./startDaemon');
+      run = startDaemon();
+      await waitForCondition(
+        () => harness.connectedServicesProjectionChangeListeners.length === 1
+          && harness.getDaemonControlServerParams() !== null,
+        'Expected canonical consumer and control-server composition',
+      );
+      for (const pid of new Set(pids)) {
+        if (pid !== firstPid) webhook.installTrackedSession(createDaemonGroupBoundClaudeTrackedSession(pid));
+      }
+      app = await createCapturedDaemonControlApp();
+      const controlToken = readCapturedDaemonControlToken();
+      const reportSessionStarted = (pid: number) => app!.inject({
+        method: 'POST',
+        url: '/session-started',
+        headers: { 'x-happier-daemon-token': controlToken },
+        payload: {
+          sessionId: `session-claude-coalesced-${pid}`,
+          metadata: createDaemonClaudeReadinessMetadata(pid),
+        },
+      });
+
+      const responses = [reportSessionStarted(firstPid)];
+      await waitForCondition(
+        () => vi.mocked(fetchAccountProfile).mock.calls.length === 1,
+        'Expected the first forced startup reconciliation to fetch the account profile',
+      );
+      for (const pid of pids.slice(1)) responses.push(reportSessionStarted(pid));
+      await waitForCondition(
+        () => readyEntries === pids.length,
+        'Expected every startup report to request forced reconciliation while the first fetch is held',
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      // Concurrent reports for one current target join its readiness check; distinct targets
+      // still require the shared profile owner’s follow-up after their own request.
+      expect(fetchAccountProfile).toHaveBeenCalledTimes(1);
+      profileGate.resolve();
+      const settled = await Promise.all(responses);
+
+      expect(settled.map((response) => response.statusCode)).toEqual(pids.map(() => 200));
+      expect(maxProfileFetchesInFlight).toBe(1);
+      // One target joins readiness; several targets share one additional profile fetch.
+      expect(fetchAccountProfile).toHaveBeenCalledTimes(expectedProfileFetches);
+    } finally {
+      if (app) await app.close();
+      harness.requestShutdown('happier-cli');
+      if (run) await run;
+      exitSpy.mockRestore();
+    }
+  });
+
   it('joins the in-flight account check when a starting runner retries /session-started', async () => {
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
     const pid = 7431;
@@ -2157,6 +2263,7 @@ describe('startDaemon automation wiring (integration)', () => {
       exitSpy.mockRestore();
     }
   });
+
 
   it('ACKs an exact newcomer without waiting for an unrelated blocked aggregate sibling', async () => {
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
