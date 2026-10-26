@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { TrackedSession } from '@/daemon/types';
 import type { SpawnSessionOptions } from '@/rpc/handlers/registerSessionHandlers';
-import { ConnectedServiceSwitchDeferralConflictError } from '@/daemon/connectedServices/sessionAuthSwitch/connectedServiceSwitchDeferralQueue';
+import { ConnectedServiceSwitchDeferralConflictError, createConnectedServiceSwitchDeferralQueue } from '@/daemon/connectedServices/sessionAuthSwitch/connectedServiceSwitchDeferralQueue';
+import { requestConnectedServiceSessionRestartSignal } from '@/daemon/connectedServices/sessionAuthSwitch/requestConnectedServiceSessionRestartSignal';
 
 import { requestPlannedRunnerRestart } from './requestPlannedRunnerRestart';
 
@@ -22,6 +23,79 @@ function trackedSession(overrides: Partial<TrackedSession> = {}): TrackedSession
 }
 
 describe('requestPlannedRunnerRestart', () => {
+  it.each(['idle', 'deferred'] as const)('cleans its reservation when shutdown overtakes an admitted $0 restart', async (admission) => {
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const tracked = trackedSession();
+    const pidToTrackedSession = new Map([[tracked.pid, tracked]]);
+    const restartRequestedPids = new Set<number>();
+    const clearRestartIntentForPid = vi.fn();
+    const queue = createConnectedServiceSwitchDeferralQueue({ timeoutMs: 60_000, disableDeferral: false });
+    let shutdown = false;
+    let resolveAuthority!: (safe: boolean) => void;
+    let announceAuthority!: () => void;
+    const authority = new Promise<boolean>((resolve) => { resolveAuthority = resolve; });
+    const authorityEntered = new Promise<void>((resolve) => { announceAuthority = resolve; });
+    let announceRunFinished!: () => void;
+    const runFinished = new Promise<void>((resolve) => { announceRunFinished = resolve; });
+    if (admission === 'deferred') {
+      queue.recordTurnLifecycleEvent({ sessionId: 'sess-1', event: 'task_started' });
+    }
+    const request = requestPlannedRunnerRestart({
+      sessionId: 'sess-1', tracked, reason: 'connected_service_switch',
+      deferral: {
+        kind: 'connected_service_switch', source: 'automatic', policy: 'defer_until_turn_boundary',
+        target: { serviceId: 'anthropic', profileId: 'work', groupId: 'primary', generation: 2, credentialRevision: 'opaque-R1' },
+        turnDeferralQueue: {
+          requestSwitch: (input) => queue.requestSwitch({
+            ...input,
+            runSwitch: async () => {
+              try { await input.runSwitch(); } finally { announceRunFinished(); }
+            },
+          }),
+        },
+      },
+      restartRequestedPids, pidToTrackedSession,
+      isProcessSafeToSignal: async () => { announceAuthority(); return await authority; },
+      requestSignal: async ({ shouldSignal, onSignalFailure, onProcessAlreadyMissing }) =>
+        await requestConnectedServiceSessionRestartSignal({
+          pid: tracked.pid, delayMs: 0, shouldSignal, onSignalFailure, onProcessAlreadyMissing,
+          isShutdownRequested: () => shutdown,
+        }),
+      clearRestartIntentForPid, logDebug: () => {},
+    });
+    // A deferred caller is rejected at cancelAll while its executing callback still owns cleanup.
+    const settled = request.then((result) => ({ result }), (error: unknown) => ({ error }));
+    try {
+      if (admission === 'deferred') {
+        queue.recordTurnLifecycleEvent({ sessionId: 'sess-1', event: 'assistant_message_end' });
+      }
+      await authorityEntered;
+      expect(restartRequestedPids.has(tracked.pid)).toBe(true);
+      shutdown = true;
+      queue.cancelAll('daemon_shutdown');
+      resolveAuthority(true);
+      const outcome = await settled;
+      if (admission === 'idle') {
+        expect(outcome).toEqual({ result: { signaled: false } });
+      } else {
+        expect(outcome).toEqual({ error: expect.objectContaining({ code: 'daemon_shutdown' }) });
+      }
+      // The rejected caller alone is not cleanup proof; wait for the canonical cleanup callback.
+      await runFinished;
+      expect(clearRestartIntentForPid).toHaveBeenCalledWith(tracked.pid);
+      expect(pidToTrackedSession.get(tracked.pid)).toBe(tracked);
+      expect(restartRequestedPids.size).toBe(0);
+      expect(kill).not.toHaveBeenCalled();
+    } finally {
+      shutdown = true;
+      resolveAuthority(true);
+      queue.cancelAll('daemon_shutdown');
+      await settled;
+      await runFinished;
+      kill.mockRestore();
+    }
+  });
+
   it('routes connected-service restarts through deferral before reserving and signalling the runner', async () => {
     const tracked = trackedSession();
     const pidToTrackedSession = new Map([[tracked.pid, tracked]]);

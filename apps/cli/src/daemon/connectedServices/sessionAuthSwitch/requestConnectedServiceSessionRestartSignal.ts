@@ -254,6 +254,8 @@ export async function requestConnectedServiceSessionRestartSignal(params: Readon
   processGroupPid?: number | null;
   delayMs: number;
   shouldSignal?: () => boolean | Promise<boolean>;
+  /** Synchronous daemon lifetime check, including after the final asynchronous authority check. */
+  isShutdownRequested?: () => boolean;
   onSignalFailure: (error: unknown) => void;
   onProcessAlreadyMissing?: () => void;
   restartDiagnostic?: ConnectedServiceDaemonRestartDiagnosticInput;
@@ -276,7 +278,17 @@ export async function requestConnectedServiceSessionRestartSignal(params: Readon
   };
 
   const signal = async (): Promise<ConnectedServiceSessionRestartSignalResult> => {
+    if (params.isShutdownRequested?.()) {
+      recordDiagnostic('skipped_stale_owner');
+      return { status: 'skipped_stale_owner' };
+    }
     if (params.shouldSignal && !await params.shouldSignal()) {
+      recordDiagnostic('skipped_stale_owner');
+      return { status: 'skipped_stale_owner' };
+    }
+    // Awaiting even an already-fulfilled authority result yields. Shutdown may begin before this
+    // continuation resumes; keep the final lifetime check synchronous with the signal below.
+    if (params.isShutdownRequested?.()) {
       recordDiagnostic('skipped_stale_owner');
       return { status: 'skipped_stale_owner' };
     }
