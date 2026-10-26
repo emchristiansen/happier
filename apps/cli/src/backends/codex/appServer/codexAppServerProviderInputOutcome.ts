@@ -36,6 +36,8 @@ type CodexAppServerProviderInputAcceptance = Readonly<{
 export type CodexAppServerProviderInputOutcomeBridge = Readonly<{
     observeAccepted: (input: CodexAppServerProviderInputAcceptance) => boolean;
     observeAcceptedLocalInput: (input: Readonly<{ localIds?: readonly string[] | null }>) => boolean;
+    /** Codex took the input but never confirmed it; Queue custody blocks it as uncertain. */
+    observeEffectMayHaveOccurred: (input: Readonly<{ localIds?: readonly string[] | null }>) => boolean;
 }>;
 
 export type CodexAcpProviderInputOutcomeBridge = Readonly<{
@@ -91,6 +93,13 @@ export function createCodexAppServerProviderInputOutcomeBridge(
             const localId = readExactLocalInput(localIds);
             if (localId === null) return false;
             observe({ kind: 'accepted', localId });
+            return true;
+        },
+        observeEffectMayHaveOccurred: ({ localIds }) => {
+            if (!observe) return false;
+            const localId = readExactLocalInput(localIds);
+            if (localId === null) return false;
+            observe({ kind: 'effect_may_have_occurred', localId });
             return true;
         },
     });
