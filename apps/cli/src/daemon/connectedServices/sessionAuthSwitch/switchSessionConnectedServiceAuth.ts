@@ -1,3 +1,4 @@
+import type { HotApplyRestartRequirement } from './sessionConnectedServiceAuthHotApply';
 import {
   CONNECTED_SERVICE_UX_DIAGNOSTIC_CODES,
   ConnectedServiceUxDiagnosticCodeV1Schema,
@@ -236,6 +237,7 @@ export type SessionConnectedServiceAuthSwitchResult =
   | Readonly<{
       ok: false;
       errorCode: SessionConnectedServiceAuthSwitchErrorCode;
+      restartRequirement?: HotApplyRestartRequirement;
       serviceId?: string;
       continuityByServiceId?: Readonly<Record<string, SessionConnectedServiceSwitchContinuity['mode']>>;
       diagnostics?: SessionConnectedServiceAuthSwitchDiagnostics;
@@ -399,6 +401,7 @@ export type SwitchSessionConnectedServiceAuthInput = Readonly<{
     | Readonly<{
         ok: false;
         errorCode?: string;
+        restartRequirement?: HotApplyRestartRequirement;
         serviceId?: string;
         serviceResultsByServiceId?: Readonly<Record<string, SessionConnectedServiceAuthSwitchServiceResult>>;
         underlyingError?: string;
@@ -1807,17 +1810,20 @@ async function rematerializeUnchangedConnectedServiceBinding(input: Readonly<{
       }
       if (!hotApplyResult.ok) {
         input.tracked.spawnOptions = previousSpawnOptions;
-	        return failureResult('hot_apply_failed', {
-	          serviceId: hotApplyResult.serviceId ?? serviceId,
-	          continuityByServiceId: { [serviceId]: continuity.mode },
-	          failurePhase: 'hot_apply',
-	          diagnosticSource: input.diagnosticSource,
-	          partialState: readHotApplyFailurePartialState(hotApplyResult.serviceResultsByServiceId),
-          serviceResultsByServiceId: hotApplyResult.serviceResultsByServiceId,
-          ...(hotApplyResult.underlyingError
-            ? { underlyingError: sanitizeConnectedServiceSwitchUnderlyingError(hotApplyResult.underlyingError) }
-            : {}),
-        });
+        return {
+          ...failureResult('hot_apply_failed', {
+            serviceId: hotApplyResult.serviceId ?? serviceId,
+            continuityByServiceId: { [serviceId]: continuity.mode },
+            failurePhase: 'hot_apply',
+            diagnosticSource: input.diagnosticSource,
+            partialState: readHotApplyFailurePartialState(hotApplyResult.serviceResultsByServiceId),
+            serviceResultsByServiceId: hotApplyResult.serviceResultsByServiceId,
+            ...(hotApplyResult.underlyingError
+              ? { underlyingError: sanitizeConnectedServiceSwitchUnderlyingError(hotApplyResult.underlyingError) }
+              : {}),
+          }),
+          ...(hotApplyResult.restartRequirement ? { restartRequirement: hotApplyResult.restartRequirement } : {}),
+        };
       }
       input.registerHotApplyTargets(
         input.tracked,
@@ -2360,17 +2366,20 @@ export async function switchSessionConnectedServiceAuth(
 	                });
 	              }
             }
-	            return failureResult('hot_apply_failed', {
-	              serviceId: hotApplyResult.serviceId,
-	              continuityByServiceId,
-	              failurePhase: 'hot_apply',
-	              diagnosticSource,
-	              ...(partialState ? { partialState } : {}),
+            return {
+              ...failureResult('hot_apply_failed', {
+                serviceId: hotApplyResult.serviceId,
+                continuityByServiceId,
+                failurePhase: 'hot_apply',
+                diagnosticSource,
+                ...(partialState ? { partialState } : {}),
                 serviceResultsByServiceId: hotApplyResult.serviceResultsByServiceId,
                 ...(hotApplyResult.underlyingError
                   ? { underlyingError: sanitizeConnectedServiceSwitchUnderlyingError(hotApplyResult.underlyingError) }
                   : {}),
-              });
+              }),
+              ...(hotApplyResult.restartRequirement ? { restartRequirement: hotApplyResult.restartRequirement } : {}),
+            };
           } else {
             input.registerHotApplyTargets(
               tracked,

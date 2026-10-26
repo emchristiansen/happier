@@ -1,3 +1,4 @@
+import type { HotApplyRestartRequirement } from '../sessionAuthSwitch/sessionConnectedServiceAuthHotApply';
 import type { CatalogAgentId } from '@/backends/types';
 import type { TrackedSession } from '@/daemon/types';
 import type { ConnectedServiceCredentialLifecycleDescriptor } from '@/daemon/connectedServices/credentials/lifecycleTypes';
@@ -26,6 +27,15 @@ type ConnectedServiceSpawnTargetRef = Readonly<{
   }> | null;
 }>;
 
+/** Refresh-local ownership evidence; never part of the public FSM/wire result. */
+export type RequiredAuthRestart = Readonly<{
+  requirement: HotApplyRestartRequirement;
+  tracked: TrackedSession;
+  sessionId: string;
+  runtimeIdentityKey: string;
+  isCurrent: () => boolean | Promise<boolean>;
+}>;
+
 export type ConnectedServicesAuthUpdatedRestartBlockedDiagnostic = Readonly<{
   serviceId: string;
   profileId: string;
@@ -34,7 +44,16 @@ export type ConnectedServicesAuthUpdatedRestartBlockedDiagnostic = Readonly<{
   reason:
     | 'tracked_session_missing'
     | 'not_daemon_started'
-    | 'unsupported_restart_signal';
+    | 'unsupported_restart_signal'
+    | 'service_unsupported'
+    | 'restart_disabled'
+    | 'stale_restart_requirement'
+    | 'restart_requirement_currentness_unproven'
+    | 'restart_requirement_identity_missing'
+    | 'restart_not_signaled'
+    | 'restart_request_failed';
+  restartRequirement?: HotApplyRestartRequirement;
+  notSignaledReason?: string;
   startedBy: string | null;
   hasChildProcess: boolean;
   hasProcessGroupPid: boolean;
@@ -115,7 +134,7 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
     }>;
     processGroupPid?: number | null;
     delayMs: number;
-    shouldSignal?: () => boolean;
+    shouldSignal?: () => boolean | Promise<boolean>;
     onSignalFailure: (error: unknown) => void;
     restartDiagnostic?: ConnectedServiceDaemonRestartDiagnosticInput;
     recordRestartDiagnostic?: ConnectedServiceDaemonRestartDiagnosticRecorder;
@@ -127,7 +146,7 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
      * `signaled` is true, so an un-signalled restart never leaks a reservation that would suppress
      * later refresh restarts for the same process.
      */
-  }>) => Promise<Readonly<{ signaled: boolean }>>;
+  }>) => Promise<Readonly<{ signaled: boolean; notSignaledReason?: string }>>;
   stopSessionForCredentialDeletion?: (input: Readonly<{
     tracked: TrackedSession;
     target: ConnectedServiceSpawnTargetRef;
@@ -143,6 +162,7 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
 }>): (event: Readonly<{
   binding: ConnectedServiceBindingRef;
   affectedTargets: ReadonlyArray<ConnectedServiceSpawnTargetRef>;
+  requiredRestarts?: ReadonlyMap<number, RequiredAuthRestart>;
   mutation?: 'replaced' | 'deleted';
   trigger?: Extract<ConnectedServiceDaemonRestartTrigger, 'refresh_triggered_restart' | 'reconnect_propagation'>;
 }>) => Promise<void> {
@@ -153,6 +173,7 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
       tracked: TrackedSession | null,
       processGroupPid: number | null,
       reason: ConnectedServicesAuthUpdatedRestartBlockedDiagnostic['reason'],
+      notSignaledReason?: string,
     ) => {
       params.onRestartBlocked?.({
         serviceId: event.binding.serviceId,
@@ -160,6 +181,8 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
         agentId: target.agentId,
         pid: target.pid,
         reason,
+        ...(event.requiredRestarts?.get(target.pid) ? { restartRequirement: event.requiredRestarts.get(target.pid)!.requirement } : {}),
+        ...(notSignaledReason ? { notSignaledReason } : {}),
         startedBy: tracked?.startedBy ?? null,
         hasChildProcess: Boolean(tracked?.childProcess),
         hasProcessGroupPid: processGroupPid !== null,
@@ -193,22 +216,62 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
           stopResult,
         );
       }
-      if (params.restartEnabled === false) continue;
+      const required = event.requiredRestarts?.get(target.pid);
+      const capturedOwnerIsCurrent = () => Boolean(required
+        && params.pidToTrackedSession.get(target.pid) === required.tracked
+        && tracked === required.tracked
+        && required.tracked.pid === target.pid
+        && required.tracked.happySessionId === required.sessionId);
+      const requirementIsCurrent = async (): Promise<boolean> => {
+        if (!required) return params.pidToTrackedSession.get(target.pid) === tracked;
+        if (!capturedOwnerIsCurrent()) {
+          emitBlocked(target, tracked ?? null, null, 'stale_restart_requirement');
+          return false;
+        }
+        let current = false;
+        try { current = await required.isCurrent(); } catch { /* Leave unavailable currentness unproven. */ }
+        if (!capturedOwnerIsCurrent()) {
+          emitBlocked(target, tracked ?? null, null, 'stale_restart_requirement');
+          return false;
+        }
+        if (!current) emitBlocked(target, tracked ?? null, null, 'restart_requirement_currentness_unproven');
+        return current;
+      };
+      if (params.restartEnabled === false) {
+        if (required) emitBlocked(target, tracked ?? null, null, 'restart_disabled');
+        continue;
+      }
+      if (required) {
+        const requirement = required.requirement;
+        if (requirement.kind !== 'restart_resume' || requirement.source !== 'failed_adapter_hot_apply'
+          || !required.sessionId || !required.runtimeIdentityKey || !requirement.profileId || !requirement.credentialRevision
+          || requirement.serviceId !== event.binding.serviceId || requirement.profileId !== event.binding.profileId
+          || (requirement.groupId !== null && (requirement.generation === null || !Number.isSafeInteger(requirement.generation)))
+          || (event.binding.groupId !== undefined && event.binding.groupId !== requirement.groupId)
+          || (event.binding.generation !== undefined && event.binding.generation !== requirement.generation)) {
+          emitBlocked(target, tracked ?? null, null, 'restart_requirement_identity_missing');
+          continue;
+        }
+        if (!capturedOwnerIsCurrent()) { emitBlocked(target, tracked ?? null, null, 'stale_restart_requirement'); continue; }
+      }
       const descriptor = await observeConnectedServiceAuthStage({
         sessionId: tracked?.happySessionId ?? null,
         bindings: [event.binding],
       }, 'descriptor_lookup', () => params.resolveLifecycleDescriptor(target.agentId));
-      if (!(descriptor.serviceIds as readonly string[]).includes(event.binding.serviceId)) continue;
+      if (!(descriptor.serviceIds as readonly string[]).includes(event.binding.serviceId)) {
+        if (required) emitBlocked(target, tracked ?? null, null, 'service_unsupported');
+        continue;
+      }
       const refreshedCredentialApplication = descriptor.refreshedCredentialApplication;
-      if (refreshedCredentialApplication.mode !== 'restart_required') continue;
-      if ((refreshedCredentialApplication.noRestartRequiredServiceIds ?? []).some((serviceId) => serviceId === event.binding.serviceId)) continue;
+      if (!required && refreshedCredentialApplication.mode !== 'restart_required') continue;
+      if (!required && (refreshedCredentialApplication.noRestartRequiredServiceIds ?? []).some((serviceId) => serviceId === event.binding.serviceId)) continue;
       const callbackConditionalService = (
         refreshedCredentialApplication.noRestartRequiredWhenAccessTokenCallbackServiceIds ?? []
       ).some((serviceId) => serviceId === event.binding.serviceId);
       const accessTokenCallbackActive = target.accessTokenRefresh?.mode === 'daemon_callback'
         && target.accessTokenRefresh.serviceIds.includes(event.binding.serviceId);
       if (
-        accessTokenCallbackActive
+        !required && accessTokenCallbackActive
         && callbackConditionalService
       ) {
         continue;
@@ -219,7 +282,7 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
       // falls through to a restart instead of being silently skipped by service id alone.
       const brokerConditionalServiceId = (refreshedCredentialApplication.noRestartRequiredWhenBrokeredServiceIds ?? [])
         .find((serviceId) => serviceId === event.binding.serviceId);
-      if (brokerConditionalServiceId) {
+      if (!required && brokerConditionalServiceId) {
         const brokered = refreshedCredentialApplication.isTargetBrokeredForBinding?.({
           serviceId: brokerConditionalServiceId,
           environmentVariables: params.pidToTrackedSession.get(target.pid)?.spawnOptions?.environmentVariables ?? {},
@@ -242,17 +305,19 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
         continue;
       }
 
-      const bindingGroupMetadata = resolveConnectedServiceBindingGroupMetadata({
-        tracked,
-        binding: event.binding,
-      });
+      const bindingGroupMetadata = required
+        ? { groupId: required.requirement.groupId, generation: required.requirement.generation }
+        : resolveConnectedServiceBindingGroupMetadata({ tracked, binding: event.binding });
+      // Descriptor lookup can yield; validate the captured request afterward, before reserving.
+      if (required && !await requirementIsCurrent()) continue;
+      if (params.restartRequestedPids.has(target.pid)) continue;
       // The gated restart owner may intentionally remain pending until a safe turn boundary.
       // Scheduling that existing owner is sufficient; refresh/reconnect distribution must not
       // retain credential-rotation custody while waiting for future conversational activity.
       // Reserve while the canonical request itself is pending so a later refresh cannot schedule a
       // duplicate restart. A resolved no-signal/cancelled request releases the reservation below.
       params.restartRequestedPids.add(target.pid);
-      let restartRequest: Promise<Readonly<{ signaled: boolean }>>;
+      let restartRequest: Promise<Readonly<{ signaled: boolean; notSignaledReason?: string }>>;
       try {
         // K5:gated_restart credential refresh inherits canonical deferral and reachability checks.
         restartRequest = params.requestRestartSignal({
@@ -267,7 +332,7 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
           },
           processGroupPid,
           delayMs: params.restartSignalDelayMs,
-          shouldSignal: () => params.pidToTrackedSession.get(target.pid) === tracked,
+          shouldSignal: required ? requirementIsCurrent : () => params.pidToTrackedSession.get(target.pid) === tracked,
           restartDiagnostic: {
             trigger,
             sessionId: tracked.happySessionId ?? null,
@@ -288,15 +353,20 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
       } catch (error) {
         params.restartRequestedPids.delete(target.pid);
         params.onRestartSignalFailure?.(error, target);
+        if (required) emitBlocked(target, tracked, processGroupPid, 'restart_request_failed');
         continue;
       }
-      void restartRequest.then(({ signaled }) => {
+      void restartRequest.then(({ signaled, notSignaledReason }) => {
         // A gated restart that resolves without signalling (e.g. superseded by a newer switch /
         // switch_cancelled) must not leave a reservation behind.
-        if (!signaled) params.restartRequestedPids.delete(target.pid);
+        if (!signaled) {
+          params.restartRequestedPids.delete(target.pid);
+          if (required) emitBlocked(target, tracked, processGroupPid, 'restart_not_signaled', notSignaledReason);
+        }
       }).catch((error) => {
         params.restartRequestedPids.delete(target.pid);
         params.onRestartSignalFailure?.(error, target);
+        if (required) emitBlocked(target, tracked, processGroupPid, 'restart_request_failed');
       });
     }
   };

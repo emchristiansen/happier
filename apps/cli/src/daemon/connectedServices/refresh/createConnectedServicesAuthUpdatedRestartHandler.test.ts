@@ -1,3 +1,5 @@
+import { requestPlannedRunnerRestart } from '@/daemon/plannedRunnerRestart/requestPlannedRunnerRestart';
+import { createConnectedServiceSwitchDeferralQueue } from '../sessionAuthSwitch/connectedServiceSwitchDeferralQueue';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { ConnectedServiceId } from '@happier-dev/protocol';
@@ -951,4 +953,102 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
       reattachedFromDiskMarker: false,
     });
   });
+  it.each([true, false])('uses an explicit adapter requirement despite a generic exemption while respecting restart-disable (%s)', async (restartEnabled) => {
+    const tracked = createTrackedSession({ pid: 1, sessionId: 's1' });
+    const requestRestartSignal = vi.fn(async (_params: RestartSignalParams) => ({ signaled: true }));
+    const restartRequestedPids = new Set<number>();
+    const handler = createConnectedServicesAuthUpdatedRestartHandler({
+      restartRequestedPids, pidToTrackedSession: new Map([[1, tracked]]), restartEnabled,
+      resolveLifecycleDescriptor: async () => createLifecycleDescriptor('claude', 'no_restart_required'),
+      resolveProcessGroupPid: () => 1, requestRestartSignal, restartSignalDelayMs: 0,
+    });
+    const requiredRestarts = new Map([[1, {
+      tracked, sessionId: 's1', runtimeIdentityKey: 'runtime-1', isCurrent: async () => true,
+      requirement: { kind: 'restart_resume' as const, source: 'failed_adapter_hot_apply' as const, serviceId: 'claude-subscription' as const, profileId: 'work', groupId: null, generation: null, credentialRevision: 'csr_abcdefghijklmnopqrstuv' as const },
+    }]]);
+    await handler({ binding: { serviceId: 'claude-subscription', profileId: 'work' }, affectedTargets: [{ pid: 1, agentId: 'claude' }], requiredRestarts });
+    expect(requestRestartSignal).toHaveBeenCalledTimes(restartEnabled ? 1 : 0);
+    expect(restartRequestedPids.has(1)).toBe(restartEnabled);
+  });
+
+  it('rechecks captured ownership after an asynchronous final currentness read', async () => {
+    const tracked = createTrackedSession({ pid: 1, sessionId: 's1' });
+    const sessions = new Map([[1, tracked]]);
+    const finalRead = createDeferred<boolean>();
+    let reads = 0;
+    let signalInput: RestartSignalParams | undefined;
+    const handler = createConnectedServicesAuthUpdatedRestartHandler({
+      restartRequestedPids: new Set(), pidToTrackedSession: sessions,
+      resolveLifecycleDescriptor: async () => createLifecycleDescriptor('claude', 'no_restart_required'),
+      resolveProcessGroupPid: () => 1, restartSignalDelayMs: 0,
+      requestRestartSignal: async (input) => { signalInput = input; return { signaled: false }; },
+    });
+    await handler({
+      binding: { serviceId: 'claude-subscription', profileId: 'work' }, affectedTargets: [{ pid: 1, agentId: 'claude' }],
+      requiredRestarts: new Map([[1, {
+        tracked, sessionId: 's1', runtimeIdentityKey: 'runtime-1',
+        isCurrent: async () => ++reads === 1 ? true : await finalRead.promise,
+        requirement: { kind: 'restart_resume', source: 'failed_adapter_hot_apply', serviceId: 'claude-subscription', profileId: 'work', groupId: null, generation: null, credentialRevision: 'csr_abcdefghijklmnopqrstuv' },
+      }]]),
+    });
+    expect(signalInput).toBeDefined();
+    const eligible = signalInput!.shouldSignal!();
+    sessions.set(1, createTrackedSession({ pid: 1, sessionId: 'replacement' }));
+    finalRead.resolve(true);
+    expect(await eligible).toBe(false);
+  });
+
+  it.each(['boundary', 'stale_revision', 'stop', 'superseded', 'manual'] as const)('retains canonical deferral and reservation behavior for a required restart: %s', async (mode) => {
+    const tracked = createTrackedSession({ pid: 1, sessionId: 's1' });
+    const sessions = new Map([[1, tracked]]);
+    const reservations = new Set<number>();
+    const queue = createConnectedServiceSwitchDeferralQueue({ timeoutMs: 60_000, disableDeferral: false });
+    queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'task_started' });
+    const target = { serviceId: 'claude-subscription' as const, profileId: 'work', groupId: 'team', generation: 7 };
+    let current = true;
+    const signals: number[] = [];
+    const manual = mode === 'manual' ? queue.requestSwitch({ sessionId: 's1', source: 'manual', policy: 'defer_until_turn_boundary', target, runSwitch: async () => {} }) : Promise.resolve();
+    const pending: Promise<unknown>[] = [manual];
+    const requestRestartSignal = vi.fn((input: RestartSignalParams) => {
+      const request = requestPlannedRunnerRestart({
+        sessionId: 's1', tracked, reason: 'connected_service_switch', restartRequestedPids: reservations, pidToTrackedSession: sessions,
+        deferral: { kind: 'connected_service_switch', source: 'automatic', policy: 'defer_until_turn_boundary', target, turnDeferralQueue: queue },
+        isProcessSafeToSignal: async () => true,
+        canSignal: async () => await input.shouldSignal?.(),
+        requestSignal: async ({ shouldSignal }) => {
+          if (!await shouldSignal()) return { status: 'skipped_stale_owner' as const };
+          signals.push(tracked.pid); return { status: 'requested' as const };
+        }, logDebug: () => {},
+      });
+      pending.push(request); return request;
+    });
+    const handler = createConnectedServicesAuthUpdatedRestartHandler({
+      restartRequestedPids: reservations, pidToTrackedSession: sessions,
+      resolveLifecycleDescriptor: async () => createLifecycleDescriptor('claude', 'no_restart_required'),
+      resolveProcessGroupPid: () => 1, requestRestartSignal, restartSignalDelayMs: 0,
+    });
+    const event = {
+      binding: target, affectedTargets: [{ pid: 1, agentId: 'claude' as const }],
+      requiredRestarts: new Map([[1, { tracked, sessionId: 's1', runtimeIdentityKey: 'runtime-1', isCurrent: async () => current,
+        requirement: { ...target, kind: 'restart_resume' as const, source: 'failed_adapter_hot_apply' as const, credentialRevision: 'csr_abcdefghijklmnopqrstuv' as const },
+      }]]),
+    };
+    try {
+      await handler(event);
+      if (mode !== 'manual') await handler(event);
+      expect(signals).toEqual([]);
+      if (mode === 'stale_revision') current = false;
+      if (mode === 'stop') queue.cancelSession('s1', 'session_terminated');
+      if (mode === 'superseded') pending.push(queue.requestSwitch({ sessionId: 's1', source: 'automatic', policy: 'defer_until_turn_boundary', target: { ...target, generation: 8 }, runSwitch: async () => {} }));
+      // A failed turn releases the boundary; it is not provider-account verification.
+      queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'turn_cancelled' });
+      queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'assistant_message_end' });
+      await Promise.allSettled(pending);
+      await Promise.resolve();
+      expect(signals).toEqual(mode === 'boundary' ? [1] : []);
+      expect(reservations.has(1)).toBe(mode === 'boundary');
+      expect(requestRestartSignal).toHaveBeenCalledTimes(1);
+    } finally { queue.cancelAll('daemon_shutdown'); await Promise.allSettled(pending); }
+  });
+
 });
