@@ -26,6 +26,10 @@ import { createCodexAppServerTestEnvScope, writeFakeCodexAppServerScript } from 
 // The fakes are the network edges (server HTTP, sockets, mutation outbox) and the Codex
 // app-server process, which is a scripted JSON-RPC peer over stdio.
 
+// This fixed Node peer spawns no descendants. Mock only the host census; real child
+// termination and the app-server client's awaited close remain part of cleanup.
+vi.mock('ps-list', () => ({ default: vi.fn().mockResolvedValue([]) }));
+
 const offlineBoundary = vi.hoisted(() => {
   vi.stubEnv('HAPPIER_LOG_LEVEL', 'info');
   vi.stubEnv('DEBUG', '');
@@ -550,27 +554,57 @@ describe('Codex app-server provider-input outcomes reach Queue custody', () => {
       await runtime.steerPrompt(message.content.text, { localId: message.localId });
     });
     materializeNextMock.mockResolvedValueOnce(providerDeliveryMaterializeResult(localId, 'steer-without-echo'));
-    // The first block write fails in transport before the server changes the row.
-    blockPendingDeliveryMock.mockRejectedValueOnce(new Error('socket hang up'));
+    let releaseFirstBlockResponse!: () => void;
+    const firstBlockResponse = new Promise<void>((resolve) => {
+      releaseFirstBlockResponse = resolve;
+    });
+    let acknowledgeRetry!: () => void;
+    const retryAcknowledgment = new Promise<void>((resolve) => {
+      acknowledgeRetry = resolve;
+    });
+    blockPendingDeliveryMock
+      .mockImplementationOnce(async () => {
+        await firstBlockResponse;
+        throw new Error('socket hang up');
+      })
+      .mockImplementationOnce(async () => {
+        await retryAcknowledgment;
+        return {};
+      });
 
-    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
-      .resolves.toMatchObject({ type: 'materialized', localId });
-    await waitUntil(() => client.hasCanonicalPendingProviderInputDelivery(localId));
-    await endActiveTurn();
-    await activeTurn;
-    await waitUntil(() => blockReasonsFor(localId).length === 1);
-    // A retained failed-write obligation releases the queue before its durable retry succeeds.
-    materializeNextMock.mockResolvedValueOnce(emptyQueueMaterializeResult());
-    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
-      .resolves.toEqual({ type: 'no_pending' });
-    expect(materializeNextMock).toHaveBeenCalledTimes(2);
+    try {
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toMatchObject({ type: 'materialized', localId });
+      await waitUntil(() => client.hasCanonicalPendingProviderInputDelivery(localId));
+      // The first response is still held, so its serialized retry cannot pass this observation.
+      await waitUntil(() => blockReasonsFor(localId).length === 1);
+      expect(blockReasonsFor(localId)).toEqual(['delivery_outcome_uncertain']);
+      releaseFirstBlockResponse();
+      await expect(blockPendingDeliveryMock.mock.results[0]!.value).rejects.toThrow('socket hang up');
+      // Let the canonical owner retry before turn-end observation can join the pending write.
+      await waitUntil(() => blockReasonsFor(localId).length === 2, 5_000);
+      await endActiveTurn();
+      await activeTurn;
 
-    // Transport has recovered; the same canonical owner retries the owed block without restoring the hold.
-    await waitUntil(() => blockReasonsFor(localId).length === 2, 5_000);
-    expect(blockReasonsFor(localId)).toEqual(['delivery_outcome_uncertain', 'delivery_outcome_uncertain']);
-    expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
-    await new Promise((resolve) => setTimeout(resolve, 2_500));
-    expect(blockReasonsFor(localId)).toHaveLength(2);
+      // The failed-write obligation releases the queue while any later retry acknowledgment is held.
+      materializeNextMock.mockResolvedValueOnce(emptyQueueMaterializeResult());
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toEqual({ type: 'no_pending' });
+      expect(materializeNextMock).toHaveBeenCalledTimes(2);
+
+      expect(blockPendingDeliveryMock).toHaveBeenCalledTimes(2);
+      expect(blockReasonsFor(localId)).toEqual(['delivery_outcome_uncertain', 'delivery_outcome_uncertain']);
+      expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
+      acknowledgeRetry();
+      await expect(blockPendingDeliveryMock.mock.results[1]!.value).resolves.toEqual({});
+      await new Promise((resolve) => setTimeout(resolve, 2_500));
+      expect(blockPendingDeliveryMock).toHaveBeenCalledTimes(2);
+      expect(blockReasonsFor(localId)).toHaveLength(2);
+    } finally {
+      // Let the existing afterEach runtime/client cleanup settle every pending mock response.
+      releaseFirstBlockResponse();
+      acknowledgeRetry();
+    }
   });
 
   it('settles an uncertain steer as accepted when Codex echoes it exactly after its turn ended', async () => {
