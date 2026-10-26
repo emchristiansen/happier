@@ -261,6 +261,7 @@ describe('startup side effects: daemon session reporting retry', () => {
         },
         nowFn: () => now,
         retryIntervalMs: 30_000,
+        randomFn: () => 0,
       },
     );
 
@@ -291,6 +292,7 @@ describe('startup side effects: daemon session reporting retry', () => {
     const serverRecoversAtMs = 4 * 60_000;
     let now = 0;
     let answeredAttempts = 0;
+    const sleepsAfterOriginalWindow: number[] = [];
 
     await expect(reportSessionToDaemonIfRunning(
       {
@@ -316,12 +318,15 @@ describe('startup side effects: daemon session reporting retry', () => {
           return { status: 'ok' };
         },
         sleepFn: async (ms) => {
+          if (now >= 90_000) sleepsAfterOriginalWindow.push(ms);
           now += ms;
         },
         nowFn: () => now,
       },
     )).resolves.toBeUndefined();
     expect(answeredAttempts).toBeGreaterThan(1);
+    expect(sleepsAfterOriginalWindow.length).toBeGreaterThan(0);
+    expect(sleepsAfterOriginalWindow.every((ms) => ms > 0)).toBe(true);
     expect(now).toBeGreaterThanOrEqual(serverRecoversAtMs);
   });
 
@@ -472,6 +477,7 @@ describe('startup side effects: daemon session reporting retry', () => {
           },
           nowFn: () => now,
           retryIntervalMs: 10_000,
+          randomFn: () => 0,
         },
       );
 
@@ -481,6 +487,128 @@ describe('startup side effects: daemon session reporting retry', () => {
     } finally {
       if (previousAutostart === undefined) delete process.env.HAPPIER_SESSION_AUTOSTART_DAEMON;
       else process.env.HAPPIER_SESSION_AUTOSTART_DAEMON = previousAutostart;
+    }
+  });
+});
+
+describe('startup side effects: daemon session report backoff', () => {
+  const reconciliationFailure = {
+    error: 'Request failed: /session-started, HTTP 503 (session_startup_reconciliation_failed)',
+  };
+
+  function createClock() {
+    let now = 0;
+    const sleeps: number[] = [];
+    const attemptTimes: number[] = [];
+    return {
+      sleeps,
+      attemptTimes,
+      sleepFn: async (ms: number) => {
+        sleeps.push(ms);
+        now += ms;
+      },
+      nowFn: () => now,
+      recordAttempt: () => {
+        attemptTimes.push(now);
+      },
+    };
+  }
+
+  it('backs off repeated daemon 503 reconciliation failures exponentially up to the cap', async () => {
+    const clock = createClock();
+    let calls = 0;
+
+    await reportSessionToDaemonIfRunning(
+      { sessionId: 'session-backoff-503', metadata: { startedBy: 'daemon' } as Metadata },
+      {
+        notifyDaemonSessionStartedFn: async () => {
+          clock.recordAttempt();
+          calls += 1;
+          return calls <= 8 ? reconciliationFailure : {};
+        },
+        sleepFn: clock.sleepFn,
+        nowFn: clock.nowFn,
+        randomFn: () => 0,
+      },
+    );
+
+    expect(calls).toBe(9);
+    // Base 250 ms, factor 2, cap 5 s; no 503 is followed by an immediate retry.
+    expect(clock.sleeps).toEqual([250, 500, 1_000, 2_000, 4_000, 5_000, 5_000, 5_000]);
+    expect(clock.attemptTimes).toEqual([0, 250, 750, 1_750, 3_750, 7_750, 12_750, 17_750, 22_750]);
+  });
+
+  it('jitters each wait downward by at most half of the nominal delay', async () => {
+    const clock = createClock();
+    let calls = 0;
+    const draws = [0.4, 1, 0.5, 0, 0.9999];
+
+    await reportSessionToDaemonIfRunning(
+      { sessionId: 'session-backoff-jitter', metadata: { startedBy: 'daemon' } as Metadata },
+      {
+        notifyDaemonSessionStartedFn: async () => {
+          calls += 1;
+          return calls <= draws.length ? reconciliationFailure : {};
+        },
+        sleepFn: clock.sleepFn,
+        nowFn: clock.nowFn,
+        randomFn: () => draws[clock.sleeps.length] ?? 0,
+      },
+    );
+
+    // nominal 250, 500, 1000, 2000, 4000 scaled by (1 - draw / 2)
+    expect(clock.sleeps).toEqual([200, 250, 750, 2_000, 2_000]);
+  });
+
+  it('keeps the daemon-started 90 s retry budget and clamps the last wait to the deadline', async () => {
+    const clock = createClock();
+
+    await reportSessionToDaemonIfRunning(
+      { sessionId: 'session-backoff-budget', metadata: { startedBy: 'daemon' } as Metadata },
+      {
+        notifyDaemonSessionStartedFn: async () => {
+          clock.recordAttempt();
+          return reconciliationFailure;
+        },
+        sleepFn: clock.sleepFn,
+        nowFn: clock.nowFn,
+        randomFn: () => 0,
+      },
+    );
+
+    expect(clock.attemptTimes.at(-1)).toBe(90_000);
+    expect(Math.max(...clock.sleeps)).toBe(5_000);
+    expect(clock.sleeps.at(-1)).toBe(2_250);
+    // 250..4000 doubling (5 waits, 7.75 s), then 16 capped 5 s waits, then the clamped 2.25 s wait.
+    expect(clock.attemptTimes).toHaveLength(23);
+  });
+
+  it('maps the interval env override to the first delay and the max-interval env override to the cap', async () => {
+    const previousInterval = process.env.HAPPIER_DAEMON_REPORT_SESSION_RETRY_INTERVAL_MS;
+    const previousMax = process.env.HAPPIER_DAEMON_REPORT_SESSION_RETRY_MAX_INTERVAL_MS;
+    process.env.HAPPIER_DAEMON_REPORT_SESSION_RETRY_INTERVAL_MS = '100';
+    process.env.HAPPIER_DAEMON_REPORT_SESSION_RETRY_MAX_INTERVAL_MS = '300';
+    try {
+      const clock = createClock();
+      let calls = 0;
+      await reportSessionToDaemonIfRunning(
+        { sessionId: 'session-backoff-env', metadata: { startedBy: 'daemon' } as Metadata },
+        {
+          notifyDaemonSessionStartedFn: async () => {
+            calls += 1;
+            return calls <= 4 ? reconciliationFailure : {};
+          },
+          sleepFn: clock.sleepFn,
+          nowFn: clock.nowFn,
+          randomFn: () => 0,
+        },
+      );
+      expect(clock.sleeps).toEqual([100, 200, 300, 300]);
+    } finally {
+      if (previousInterval === undefined) delete process.env.HAPPIER_DAEMON_REPORT_SESSION_RETRY_INTERVAL_MS;
+      else process.env.HAPPIER_DAEMON_REPORT_SESSION_RETRY_INTERVAL_MS = previousInterval;
+      if (previousMax === undefined) delete process.env.HAPPIER_DAEMON_REPORT_SESSION_RETRY_MAX_INTERVAL_MS;
+      else process.env.HAPPIER_DAEMON_REPORT_SESSION_RETRY_MAX_INTERVAL_MS = previousMax;
     }
   });
 });
