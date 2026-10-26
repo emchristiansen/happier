@@ -31,15 +31,18 @@ export const CONNECTED_SERVICE_SESSION_READINESS_RETRY_DELAY_MS = Object.freeze(
 /**
  * Owns a starting runner's readiness wait on its connected-service reconciliation.
  *
- * Readiness answers once the reconciliation succeeds, or after `waitMs` while it is still running;
- * a failure inside the wait fails readiness, and the runner reports again. A reconciliation readiness
- * stopped waiting for keeps running. It records the target's projection epoch only after the live
- * applications it awaits succeed, so an ordinary application failure leaves the target unreconciled.
- * The exception: for a session whose auth lock another owner holds, the refreshed-auth handler
- * queues the application and returns, so that application can fail after the reconciliation has
- * succeeded, unseen here. If a reconciliation fails after readiness answered, this owner runs it
- * again, with backoff, until one run succeeds, the registration is replaced, or daemon shutdown
- * begins. Shutdown stops new runs only; a run already in progress is not cancelled.
+ * Readiness answers when raw reconciliation fulfills, or after `waitMs` while it is still running;
+ * rejection inside the wait fails readiness, and the runner reports again. Raw reconciliation keeps
+ * running after readiness stops waiting. A target's projection epoch is recorded only after the
+ * handlers reconciliation awaits complete without rejection, not as proof of credential adoption.
+ * Later work can remain outside that promise: a foreign-held auth lock queues application for later;
+ * a handled failed-adapter typed restart requirement hands control to the canonical restart owner
+ * without awaiting a turn boundary, signal, retirement or respawn. Either later path can fail or be
+ * suppressed after raw reconciliation fulfills, unseen here. The daemon WeakMap cleanup and this
+ * helper's retries observe only the actual raw promise's settlement or rejection, not that later work.
+ * If raw reconciliation rejects after readiness answered, this owner runs it again, with backoff,
+ * until a run fulfills, the registration is replaced, or daemon shutdown begins. Shutdown stops new
+ * runs only; a run already in progress is not cancelled.
  */
 export function createConnectedServiceSessionReadinessReconciliation(deps: Readonly<{
   /**

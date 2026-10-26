@@ -6270,4 +6270,74 @@ describe('switchSessionConnectedServiceAuth', () => {
       },
     });
   });
+  it.each([false, true])('preserves the actual adapter restart requirement without restarting inline (unchanged: %s)', async (unchanged) => {
+    const profileId = unchanged ? 'old-profile' : 'new-profile';
+    const tracked = trackedSession();
+    const restartSession = vi.fn();
+    const continueAfterRuntimeAuthSwitch = vi.fn();
+    const verifyProviderAccountAdoption = vi.fn();
+    const materializeRuntimeAuthSelection = vi.fn(async () => ({
+      serviceId: 'anthropic', profileId, credentialRevision,
+    }));
+    const hotApply = createSessionConnectedServiceAuthHotApply({
+      resolveRuntimeAuthAdapter: async () => ({
+        ...createCodexConnectedServiceRuntimeAuthAdapter(),
+        hotApply: async () => ({ applied: false, recovery: 'restart_resume' }),
+      }),
+    });
+    const result = await switchSessionConnectedServiceAuth({
+      core: createCore(), getChildren: () => [tracked],
+      executionPolicy: { allowRestartResume: false, allowContinuation: false, source: 'startup_reconciliation' },
+      api: {
+        listConnectedServiceProfiles: async () => ({ serviceId: 'anthropic', profiles: [{ profileId, status: 'connected' }] }),
+        getConnectedServiceAuthGroup: async () => null,
+      },
+      materializeRuntimeAuthSelection,
+      resolveContinuity: async () => ({ mode: 'hot_apply' }),
+      restartSession, hotApply, continueAfterRuntimeAuthSwitch, verifyProviderAccountAdoption,
+      persistSessionBindings: vi.fn(), registerHotApplyTargets: vi.fn(), emitSessionEvent: vi.fn(),
+      request: { sessionId: 'sess_1', agentId: 'claude', bindings: bindings(profileId), ...(unchanged ? { rematerializeServiceId: 'anthropic' as const } : {}) },
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      restartRequirement: {
+        kind: 'restart_resume', source: 'failed_adapter_hot_apply', serviceId: 'anthropic',
+        profileId, groupId: null, generation: null, credentialRevision,
+      },
+    });
+    expect(JSON.parse(JSON.stringify(result))).toEqual(result);
+    expect(tracked.spawnOptions?.connectedServices).toEqual(bindings('old-profile'));
+    expect(restartSession).not.toHaveBeenCalled();
+    expect(continueAfterRuntimeAuthSwitch).not.toHaveBeenCalled();
+    expect(verifyProviderAccountAdoption).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { applied: false, recovery: 'restart_rematerialize' },
+    { applied: false, recovery: 'restart_resume', reason: 'credential_revision_superseded' },
+    { applied: false, reason: 'hot_apply_restart_required' },
+  ])('does not manufacture a restart-resume requirement from other adapter outcomes: %j', async (outcome) => {
+    const hotApply = createSessionConnectedServiceAuthHotApply({
+      resolveRuntimeAuthAdapter: async () => ({ ...createCodexConnectedServiceRuntimeAuthAdapter(), hotApply: async () => outcome }),
+    });
+    const result = await hotApply({ tracked: trackedSession(), normalizedBindings: bindings('new-profile') });
+    expect(result.ok).toBe(false);
+    expect(result).not.toHaveProperty('restartRequirement');
+  });
+
+  it('captures the materialized group generation and credential revision in the adapter requirement', async () => {
+    const hotApply = createSessionConnectedServiceAuthHotApply({
+      resolveRuntimeAuthAdapter: async () => ({ ...createCodexConnectedServiceRuntimeAuthAdapter(), hotApply: async () => ({ applied: false, recovery: 'restart_resume' }) }),
+    });
+    const result = await hotApply({
+      tracked: trackedSession(),
+      normalizedBindings: { v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'team', profileId: 'work' } } },
+      runtimeAuthSelectionsByServiceId: new Map([['claude-subscription', { groupId: 'team', activeProfileId: 'work', groupGeneration: 7, credentialRevision }]]),
+    });
+    expect(result).toMatchObject({ ok: false, restartRequirement: {
+      kind: 'restart_resume', source: 'failed_adapter_hot_apply', serviceId: 'claude-subscription',
+      profileId: 'work', groupId: 'team', generation: 7, credentialRevision,
+    } });
+  });
+
 });

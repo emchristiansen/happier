@@ -534,4 +534,70 @@ describe('connectedServiceSwitchDeferralQueue', () => {
       reason: 'daemon_shutdown',
     }));
   });
+  it.each([
+    ['csr_z_first', 'csr_a_current'],
+    ['csr_same', ' csr_same '],
+    [undefined, 'csr_required'],
+    ['csr_required', undefined],
+  ])('replaces a distinct opaque automatic target without revision ordering (%s -> %s)', async (firstRevision, currentRevision) => {
+    const queue = createConnectedServiceSwitchDeferralQueue({ timeoutMs: 60_000, disableDeferral: false });
+    const first = vi.fn(async () => {});
+    const current = vi.fn(async () => {});
+    queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'task_started' });
+    const request = (credentialRevision: string | undefined, runSwitch: () => Promise<void>) => queue.requestSwitch({
+      sessionId: 's1', policy: 'defer_until_turn_boundary', source: 'automatic',
+      target: { ...target(), ...(credentialRevision === undefined ? {} : { credentialRevision }) }, runSwitch,
+    });
+    const old = request(firstRevision, first).then(() => null, (error: unknown) => error);
+    const replacement = request(currentRevision, current);
+    try {
+      queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'assistant_message_end' });
+      await replacement;
+      expect(current).toHaveBeenCalledOnce();
+      expect(first).not.toHaveBeenCalled();
+      expect(await old).toBeInstanceOf(ConnectedServiceSwitchDeferralConflictError);
+    } finally { queue.cancelAll('daemon_shutdown'); await Promise.allSettled([old, replacement]); }
+  });
+
+  it.each([undefined, 'csr_exact'])('joins exact opaque revision duplicates (%s)', async (credentialRevision) => {
+    const queue = createConnectedServiceSwitchDeferralQueue({ timeoutMs: 60_000, disableDeferral: false });
+    queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'task_started' });
+    const first = vi.fn(async () => {});
+    const duplicate = vi.fn(async () => {});
+    const sameTarget = { ...target(), ...(credentialRevision === undefined ? {} : { credentialRevision }) };
+    const pending = [first, duplicate].map((runSwitch) => queue.requestSwitch({
+      sessionId: 's1', policy: 'defer_until_turn_boundary', source: 'automatic', target: sameTarget, runSwitch,
+    }));
+    try {
+      queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'assistant_message_end' });
+      await Promise.all(pending);
+      expect(first).toHaveBeenCalledOnce();
+      expect(duplicate).not.toHaveBeenCalled();
+    } finally { queue.cancelAll('daemon_shutdown'); await Promise.allSettled(pending); }
+  });
+
+  it.each(['older', 'newer', 'manual', 'stop'] as const)('preserves generation, manual and cancellation gates with opaque revisions: %s', async (mode) => {
+    const queue = createConnectedServiceSwitchDeferralQueue({ timeoutMs: 60_000, disableDeferral: false });
+    queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'task_started' });
+    const first = vi.fn(async () => {});
+    const incoming = vi.fn(async () => {});
+    const firstTarget = mode === 'manual'
+      ? { serviceId: '__multi_service_switch__', profileId: '', groupId: '', generation: 0 }
+      : { ...target(), credentialRevision: 'csr_z_first' };
+    const old = queue.requestSwitch({ sessionId: 's1', source: mode === 'manual' ? 'manual' : 'automatic',
+      policy: 'defer_until_turn_boundary', target: firstTarget, runSwitch: first }).then(() => null, (error: unknown) => error);
+    const next = queue.requestSwitch({ sessionId: 's1', source: 'automatic', policy: 'defer_until_turn_boundary',
+      target: { ...target({ generation: mode === 'older' ? 4 : mode === 'newer' ? 6 : 5 }), credentialRevision: 'csr_a_current' },
+      runSwitch: incoming }).then(() => null, (error: unknown) => error);
+    try {
+      if (mode === 'stop') queue.cancelSession('s1', 'session_terminated');
+      queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'assistant_message_end' });
+      const outcomes = await Promise.all([old, next]);
+      expect(first).toHaveBeenCalledTimes(mode === 'older' || mode === 'manual' ? 1 : 0);
+      expect(incoming).toHaveBeenCalledTimes(mode === 'newer' ? 1 : 0);
+      if (mode === 'newer' || mode === 'stop') expect(outcomes[0]).toBeInstanceOf(ConnectedServiceSwitchDeferralConflictError);
+      if (mode === 'older' || mode === 'stop') expect(outcomes[1]).toBeInstanceOf(ConnectedServiceSwitchDeferralConflictError);
+    } finally { queue.cancelAll('daemon_shutdown'); await Promise.allSettled([old, next]); }
+  });
+
 });
