@@ -403,7 +403,7 @@ import { logConnectedServiceDaemonRestartDiagnostic } from './connectedServices/
 import { logConnectedServiceAuthSwitchResult } from './connectedServices/sessionAuthSwitch/logConnectedServiceAuthSwitchResult';
 import { resolveSharedStateRequiredSwitchContinuity } from './connectedServices/sessionAuthSwitch/resolveSharedStateRequiredSwitchContinuity';
 import { resolveUnsupportedSwitchContinuityErrorCode } from './connectedServices/sessionAuthSwitch/diagnostics/resolveUnsupportedSwitchContinuityErrorCode';
-import { createSessionConnectedServiceAuthHotApply } from './connectedServices/sessionAuthSwitch/sessionConnectedServiceAuthHotApply';
+import { createSessionConnectedServiceAuthHotApply, type HotApplyRestartRequirement } from './connectedServices/sessionAuthSwitch/sessionConnectedServiceAuthHotApply';
 import { createSessionConnectedServiceAccountAdoptionVerifier } from './connectedServices/accountTransitions/createSessionConnectedServiceAccountAdoptionVerifier';
 import { resolveInactiveConnectedServiceSessionForAuthSwitch } from './connectedServices/sessionAuthSwitch/resolveInactiveConnectedServiceSessionForAuthSwitch';
 import { dispatchConnectedServiceCredentialHealthNotificationAsync } from './connectedServices/notifications/dispatchConnectedServiceCredentialHealthNotification';
@@ -5104,6 +5104,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           profileId?: string | null;
           groupId?: string | null;
           generation?: number | null;
+          credentialRevision?: string;
         }>): ConnectedServiceSwitchTarget => ({
           serviceId: typeof input.serviceId === 'string' ? input.serviceId : '',
           profileId: typeof input.profileId === 'string' ? input.profileId : '',
@@ -5111,6 +5112,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           generation: typeof input.generation === 'number' && Number.isFinite(input.generation)
             ? Math.max(0, Math.trunc(input.generation))
             : 0,
+          ...(input.credentialRevision === undefined ? {} : { credentialRevision: input.credentialRevision }),
         });
 
         const requestConnectedServiceRestartWithDeferral = async (input: Readonly<{
@@ -5124,7 +5126,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           transcriptEventOwner: ConnectedServiceRestartRequestedTranscriptEventOwner;
           onSignalFailureLogMessage: string;
           awaitPreviousRunnerRetirement?: boolean;
-        }>): Promise<Readonly<{ signaled: boolean }>> => {
+          shouldSignal?: () => boolean | Promise<boolean>;
+        }>): Promise<Readonly<{ signaled: boolean; notSignaledReason?: PlannedRunnerRestartNotSignaledReason }>> => {
           // K5:gated_restart connected-service restarts route through the generic planned runner
           // restart primitive, preserving deferral, stale-owner checks, PID reservation, and respawn.
           const completionWaiter = input.awaitPreviousRunnerRetirement
@@ -5144,7 +5147,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               },
               restartRequestedPids: connectedServicesRestartRequestedPids,
               pidToTrackedSession,
-              canSignal: () => resolveSessionRunnerActivityDisabledReason(input.sessionId) ?? true,
+              canSignal: async () => {
+                 if (input.shouldSignal && !await input.shouldSignal()) return false;
+                 return resolveSessionRunnerActivityDisabledReason(input.sessionId) ?? true;
+               },
               requestSignal: async ({ shouldSignal, onSignalFailure, onProcessAlreadyMissing }) =>
                 // K5:gated_restart raw signal is owned by planned runner restart deferral/reservation.
                 await requestConnectedServiceSessionRestartSignal({
@@ -5328,6 +5334,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           ok: boolean;
           action?: string;
           errorCode?: string;
+          restartRequirement?: HotApplyRestartRequirement;
           // Failure diagnostics OR the INC-6 success continuity proof for switch telemetry.
           diagnostics?: SessionConnectedServiceAuthSwitchDiagnostics | Readonly<{ continuity: ConnectedServiceResumeContinuityProofDiagnostics }>;
         }>> => {
@@ -5647,6 +5654,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             : {
                 ok: false,
                 errorCode: result.errorCode,
+                ...(result.restartRequirement ? { restartRequirement: result.restartRequirement } : {}),
                 ...(result.diagnostics ? { diagnostics: result.diagnostics } : {}),
               };
         };
@@ -7497,9 +7505,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 routedThroughGatedPrimitive: true,
               });
               // K5:gated_restart refresh/reconnect restart deferred until turn boundary,
-              // reachability re-verified at respawn (no raw mid-turn SIGTERM). The handler reserves
-              // the pid only when the gated restart actually signalled; a superseded/cancelled
-              // deferral returns { signaled: false } so the reservation is not leaked.
+              // reachability re-verified at respawn (no raw mid-turn SIGTERM). The canonical planned
+              // owner alone reserves and releases restart intent. A joined or cancelled caller's own
+              // { signaled: false } result does not authorize cleanup of another owner's reservation.
               return await requestConnectedServiceRestartWithDeferral({
                 sessionId: signalParams.sessionId ?? signalParams.tracked.happySessionId ?? '',
                 tracked: signalParams.tracked,
@@ -7510,8 +7518,11 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   profileId: signalParams.target.profileId,
                   groupId: signalParams.target.groupId,
                   generation: signalParams.target.generation,
+                  ...(signalParams.target.credentialRevision === undefined
+                    ? {} : { credentialRevision: signalParams.target.credentialRevision }),
                 }),
                 restartSignalDelayMs: signalParams.delayMs,
+                shouldSignal: signalParams.shouldSignal,
                 restartDiagnostic: signalParams.restartDiagnostic ?? {
                   trigger: 'refresh_triggered_restart',
                   sessionId: signalParams.sessionId,
@@ -7544,6 +7555,43 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       > = createRefreshedConnectedServiceAuthUpdatedHandler({
         applyRefreshedAuth: applyRefreshedConnectedServiceAuth,
         restartAfterAuthUpdated,
+        captureRestartTarget: (target) => {
+          const tracked = pidToTrackedSession.get(target.pid);
+          const sessionId = target.sessionId;
+          if (!tracked || !sessionId || tracked.happySessionId !== sessionId) return null;
+          const isLocallyCurrent = (requirement: HotApplyRestartRequirement): boolean => {
+            const runtime = connectedServiceRuntimeRegistry.getByPid(target.pid);
+            if (pidToTrackedSession.get(target.pid) !== tracked || tracked.happySessionId !== sessionId
+              || stopSessionInFlightBySessionId.has(sessionId)
+              || runtime?.sessionId !== sessionId || runtime.runtimeIdentityKey !== target.runtimeIdentityKey
+              || runtime.agentId !== target.agentId) return false;
+            const current = findConnectedServiceChildSelection(tracked.spawnOptions?.environmentVariables ?? {}, requirement.serviceId);
+            const captured = target.selectionsByServiceId.get(requirement.serviceId);
+            const matches = (selection: typeof current): boolean => selection !== null && selection !== undefined && (
+              selection.kind === 'profile'
+                ? requirement.groupId === null && requirement.generation === null && selection.profileId === requirement.profileId
+                : selection.groupId === requirement.groupId && selection.activeProfileId === requirement.profileId && selection.generation === requirement.generation
+            );
+            return matches(current) && matches(captured ?? null);
+          };
+          return {
+            tracked,
+            isCurrent: async (requirement) => {
+              if (!isLocallyCurrent(requirement) || requirement.profileId === null || requirement.credentialRevision === null) return false;
+              const authoritative = requirement.groupId !== null && requirement.generation !== null
+                ? await validateConnectedServiceGroupMutationCurrentness({
+                    serviceId: requirement.serviceId, profileId: requirement.profileId,
+                    groupId: requirement.groupId, generation: requirement.generation,
+                    credentialRevision: requirement.credentialRevision,
+                  }).then((result) => result.current).catch(() => false)
+                : await resolveConnectedServiceCredentialsWithRevisions({
+                    api, credentials, bindings: [{ serviceId: requirement.serviceId, profileId: requirement.profileId }],
+                  }).then((records) => records.get(requirement.serviceId)?.credentialRevision === requirement.credentialRevision).catch(() => false);
+              // The authoritative read yields; never let its result authorize a replacement runner.
+              return authoritative && isLocallyCurrent(requirement);
+            },
+          };
+        },
         sessionLocks: connectedServiceSessionAuthSwitchLocks,
         // The live switch owner rewrites this environment when it switches the session.
         readCurrentSelection: (sessionId, serviceId) => {
@@ -7554,7 +7602,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         },
         onRestartRequired: (diagnostic) => {
           logger.warn(
-            '[DAEMON RUN] Refreshed connected-service credential could not be hot-applied; left to the lifecycle restart policy',
+            '[DAEMON RUN] Refreshed connected-service credential could not be hot-applied; restart requirement diagnostic',
             diagnostic,
           );
         },
