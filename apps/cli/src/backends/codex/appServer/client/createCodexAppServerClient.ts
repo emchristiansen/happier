@@ -578,20 +578,34 @@ async function createOwnedCodexAppServerClient(
             // A queued write must not outlive a failure while capturing another message.
             if (privateCustodyFailure) throw privateCustodyFailure;
             if (sdkAuth && state.fatalError) throw state.fatalError;
-            if (signal && (signal.aborted || state.fatalError)) throw state.fatalError ?? new CodexAppServerPrivateIoError('SDK write aborted');
+            if (signal && (signal.aborted || state.fatalError)) throw state.fatalError ?? new Error('Private Codex app-server SDK write aborted');
             if (privateOwner && disposing) throw state.fatalError ?? new CodexAppServerPrivateIoError('write after disposal');
             const stdin = child.stdin;
             if (!stdin || stdin.writableEnded || stdin.destroyed) {
                 throw state.fatalError ?? createDisposedError();
             }
             await new Promise<void>((resolve, reject) => {
-                const onAbort = () => reject(new CodexAppServerPrivateIoError('SDK write aborted'));
+                const cleanup = () => {
+                    signal?.removeEventListener('abort', onAbort);
+                    if (signal) {
+                        child.removeListener('close', onClosed);
+                        child.removeListener('error', onError);
+                        stdin.removeListener('error', onError);
+                    }
+                };
+                const onAbort = () => { cleanup(); reject(new Error('Private Codex app-server SDK write aborted')); };
+                const onClosed = () => { cleanup(); reject(state.fatalError ?? new CodexAppServerPrivateIoError('SDK child closed')); };
+                const onError = (error: Error) => { cleanup(); reject(error); };
                 signal?.addEventListener('abort', onAbort, { once: true });
-                const cleanup = () => signal?.removeEventListener('abort', onAbort);
+                if (signal) {
+                    child.once('close', onClosed);
+                    child.once('error', onError);
+                    stdin.once('error', onError);
+                }
                 try {
                     capture(++writeOrdinal);
                     if (privateOwner && disposing) throw state.fatalError ?? new CodexAppServerPrivateIoError('write after disposal');
-                    if (signal?.aborted) throw new CodexAppServerPrivateIoError('SDK write aborted');
+                    if (signal?.aborted) throw new Error('Private Codex app-server SDK write aborted');
                     stdin.write(payload, 'utf8', (error) => {
                         cleanup();
                         if (error) {
@@ -628,10 +642,10 @@ async function createOwnedCodexAppServerClient(
                 if (!sdkReady) throw new CodexAppServerPrivateIoError('ordinary write before SDK bootstrap');
                 const method = typeof message.method === 'string' ? message.method : replyMethod;
                 if (!method) throw new CodexAppServerPrivateIoError('unbound ordinary reply');
-                await sdkAuth.authorizeOrdinaryWrite({
+                await invokePrivateCallback(() => sdkAuth.authorizeOrdinaryWrite({
                     kind: typeof message.method === 'string' ? message.id === undefined ? 'notification' : 'request' : 'reply',
                     method,
-                });
+                }));
             } catch (error) {
                 failWith(error, { operation: 'ordinary SDK authorization' });
                 throw state.fatalError;
@@ -874,13 +888,22 @@ async function createOwnedCodexAppServerClient(
                     if (line.length > readMaxJsonLineChars(sourceProcessEnv)) throw new CodexAppServerJsonLineTooLargeError(readMaxJsonLineChars(sourceProcessEnv));
                     // Keep full signed-i64/string IDs and original bytes outside
                     // JSON.parse until the SDK owner explicitly returns Other.
-                    const route = incomingChain.then(async () => {
+                    // The SDK must see a second request while a first source
+                    // operation is busy, so it can refuse the overlap. Only
+                    // ordinary JSON dispatch waits for preceding line outcomes.
+                    const route = Promise.resolve().then(async () => {
+                        if (state.fatalError || disposing) return 'handled' as const;
+                        return await invokePrivateCallback(() => sdkAuth.routeIncoming(line));
+                    }).catch((error) => {
+                        failWith(error, { operation: 'SDK incoming route' });
+                        return 'handled' as const;
+                    });
+                    incomingChain = incomingChain.then(async () => {
+                        const result = await route;
                         if (state.fatalError || disposing) return;
-                        const result = await sdkAuth.routeIncoming(line);
                         if (result === 'ordinary') jsonLineReader.push(stdoutDecoder!.write(line));
                         else if (result !== 'handled') throw new CodexAppServerPrivateIoError('invalid SDK route');
-                    });
-                    incomingChain = route.catch((error) => { failWith(error, { operation: 'SDK incoming route' }); });
+                    }).catch((error) => { failWith(error, { operation: 'SDK incoming route' }); });
                 }
                 if (incomingBytes.length > readMaxJsonLineChars(sourceProcessEnv)) throw new CodexAppServerJsonLineTooLargeError(readMaxJsonLineChars(sourceProcessEnv));
                 return;

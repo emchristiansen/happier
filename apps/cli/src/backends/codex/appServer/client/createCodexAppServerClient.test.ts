@@ -1,7 +1,9 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readlink, writeFile } from 'node:fs/promises';
+import { connect, createServer, type Socket } from 'node:net';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import * as childProcess from 'node:child_process';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 
 import { describe, expect, it, vi } from 'vitest';
@@ -66,7 +68,255 @@ async function createPrivateProcessBoundary(owner: CodexAppServerPrivateIoOwner,
     return { ...boundary, client, dispose };
 }
 
+type SdkOwner = NonNullable<Extract<NonNullable<Parameters<typeof createCodexAppServerClient>[0]['io']>, { kind: 'private' }>['sdkAuth']>;
+type SdkTransport = Parameters<SdkOwner['bootstrap']>[0];
+
+async function createSdkProcessBoundary(options: Readonly<{
+    sdk?: Partial<SdkOwner>;
+    onWrite?: (message: Record<string, unknown>) => void;
+    onCapture?: (event: CodexAppServerPrivateIoEvent) => void;
+}> = {}) {
+    const events: CodexAppServerPrivateIoEvent[] = [];
+    const nativeWrites: Buffer[] = [];
+    const order: string[] = [];
+    const boundary = createPipedProcessBoundary((message) => { options.onWrite?.(message); });
+    const write = boundary.stdin._write.bind(boundary.stdin);
+    boundary.stdin._write = (chunk, encoding, callback) => {
+        nativeWrites.push(Buffer.from(chunk)); order.push('native-write'); write(chunk, encoding, callback);
+    };
+    let transport: SdkTransport | undefined;
+    const client = await createCodexAppServerClient({
+        processEnv: { HAPPIER_CODEX_APP_SERVER_BIN: process.execPath },
+        io: { kind: 'private', owner: { capture: (event) => {
+            events.push(event); order.push(event.kind); options.onCapture?.(event);
+        }, flush: async () => {} }, sdkAuth: {
+            bootstrap: async (value) => { transport = value; await options.sdk?.bootstrap?.(value); },
+            routeIncoming: options.sdk?.routeIncoming ?? (async () => 'ordinary'),
+            authorizeOrdinaryWrite: options.sdk?.authorizeOrdinaryWrite ?? (async () => {}),
+        } },
+    });
+    if (!transport) throw new Error('the actual constructor did not install its SDK transport');
+    const dispose = async () => {
+        const disposal = client.dispose(); boundary.child.emit('close', 0, null); await disposal;
+    };
+    return { ...boundary, client, transport, events, nativeWrites, order, dispose };
+}
+
 describe('createCodexAppServerClient', () => {
+    it.skipIf(process.platform !== 'linux')('[private-sdk-descriptors] denies both held socket endpoints to the actual native child and its descendant', async () => {
+        await withTempDir('happier-sdk-descriptor-custody-', async (root) => {
+            const server = createServer();
+            // The scratch root can exceed the Unix pathname-socket limit.
+            // This unique synthetic Linux abstract address touches no path.
+            const path = `\0happier-private-sdk-${randomUUID()}`;
+            server.listen(path); await once(server, 'listening');
+            const connected = once(server, 'connection');
+            const first = connect(path); await once(first, 'connect');
+            const [second] = await connected as [Socket];
+            // Node does not expose its owned socket FD in the public type. This
+            // OS-boundary fixture reads only these two owned descriptor links.
+            const fd = (socket: Socket) => (socket as unknown as { _handle: { fd: number } })._handle.fd;
+            const endpoints = [await readlink(`/proc/self/fd/${fd(first)}`), await readlink(`/proc/self/fd/${fd(second)}`)];
+            let client: Awaited<ReturnType<typeof createCodexAppServerClient>> | undefined;
+            try {
+                // Prove the absence oracle detects an endpoint deliberately
+                // inherited by this owned control child, rather than merely
+                // comparing unrelated descriptor identities.
+                const control = childProcess.spawnSync(process.execPath, ['-e',
+                    "process.stdout.write(require('node:fs').readlinkSync('/proc/self/fd/3'))"],
+                    { stdio: ['ignore', 'pipe', 'pipe', fd(first)] });
+                expect(control.status).toBe(0);
+                expect(control.stdout.toString('utf8')).toBe(endpoints[0]);
+                const fake = await writeFakeCodexAppServerScript({ dir: root,
+                    importLines: ["import fs from 'node:fs';", "import { spawnSync } from 'node:child_process';"],
+                    bodyLines: [`
+                        const scan = () => fs.readdirSync('/proc/self/fd').flatMap(name => {
+                            try { return [fs.readlinkSync('/proc/self/fd/' + name)]; }
+                            catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+                        });
+                        for await (const line of rl) {
+                            const msg = JSON.parse(line);
+                            if (msg.method === 'fixture/descriptors') {
+                                const inspect = "const fs=require('node:fs');process.stdout.write(JSON.stringify(fs.readdirSync('/proc/self/fd').flatMap(name=>{try{return[fs.readlinkSync('/proc/self/fd/'+name)]}catch(error){if(error.code==='ENOENT')return[];throw error}})))";
+                                const child = spawnSync(process.execPath, ['-e', inspect], { stdio: ['ignore', 'pipe', 'pipe'] });
+                                if (child.status !== 0) throw new Error('the synthetic descendant descriptor check failed');
+                                process.stdout.write(JSON.stringify({ id: msg.id, result: { native: scan(), descendant: JSON.parse(child.stdout.toString('utf8')) } }) + '\\n');
+                            }
+                        }
+                    `],
+                });
+                client = await createCodexAppServerClient({
+                    processEnv: createCodexAppServerProcessEnv(fake),
+                    io: { kind: 'private', owner: { capture: () => {}, flush: async () => {} }, sdkAuth: {
+                        bootstrap: async () => {}, routeIncoming: async () => 'ordinary', authorizeOrdinaryWrite: async () => {},
+                    } },
+                });
+                const result = await client.request('fixture/descriptors') as { native: string[]; descendant: string[] };
+                for (const endpoint of endpoints) {
+                    expect(result.native).not.toContain(endpoint);
+                    expect(result.descendant).not.toContain(endpoint);
+                }
+                // The resource is still held by its original parent owner.
+                expect(await readlink(`/proc/self/fd/${fd(first)}`)).toBe(endpoints[0]);
+            } finally {
+                try { if (client) await client.dispose(); }
+                finally {
+                    first.destroy(); second.destroy();
+                    await new Promise<void>((resolve) => server.close(() => resolve()));
+                }
+            }
+        });
+    });
+
+    it('[private-sdk] offers an overlapping raw request while the original SDK request is still owned', async () => {
+        const firstEntered = createDeferred<void>();
+        const finishFirst = createDeferred<'handled'>();
+        const routed: Buffer[] = [];
+        const boundary = await createSdkProcessBoundary({ sdk: { routeIncoming: async (line) => {
+            routed.push(Buffer.from(line));
+            if (routed.length === 1) { firstEntered.resolve(); return await finishFirst.promise; }
+            return 'handled';
+        } } });
+        const first = Buffer.from('{"id":1,"method":"account/chatgptAuthTokens/refresh","params":{}}\n');
+        const second = Buffer.from('{"id":2,"method":"account/chatgptAuthTokens/refresh","params":{}}\n');
+        try {
+            boundary.stdout.write(first); await firstEntered.promise;
+            boundary.stdout.write(second);
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            expect(routed).toEqual([first, second]);
+            expect(boundary.nativeWrites).toEqual([]);
+        } finally { finishFirst.resolve('handled'); await boundary.dispose(); }
+    });
+
+    it.each([
+        { operation: 'initialize', frame: '{"id":1,"method":"initialize","params":{}}\n', recording: { kind: 'exact' } },
+        { operation: 'initialized', frame: '{"method":"initialized"}\n', recording: { kind: 'exact' } },
+        { operation: 'login', frame: '{"id":2,"method":"account/login/start","params":{"accessToken":"synthetic-login"}}\n', recording: { kind: 'login-gap', method: 'account/login/start', reconstruction: 'payload cannot be reconstructed from this record' } },
+        { operation: 'refresh_result', frame: '{"id":9223372036854775807,"result":{"accessToken":"synthetic-refresh"}}\n', recording: { kind: 'refresh-result-gap', method: 'account/chatgptAuthTokens/refresh', reconstruction: 'payload cannot be reconstructed from this record' } },
+        { operation: 'unavailable', frame: '{"id":-9223372036854775808,"error":{"code":-32000,"message":"unavailable"}}\n', recording: { kind: 'exact' } },
+        { operation: 'refuse', frame: '{"id":"original-refresh-id","error":{"code":-32602,"message":"refused"}}\n', recording: { kind: 'exact' } },
+    ] as const)('[private-sdk] keeps $operation native bytes and its one prescribed record', async ({ frame, recording }) => {
+        const boundary = await createSdkProcessBoundary();
+        try {
+            const bytes = Buffer.from(frame);
+            await boundary.transport.writeSdkFrame({ bytes, recording, signal: new AbortController().signal });
+            expect(boundary.nativeWrites).toEqual([bytes]);
+            const gaps = boundary.events.filter((event) => event.kind === 'auth-record-gap');
+            const raw = boundary.events.filter((event) => event.kind === 'raw' && event.stream === 'stdin');
+            if (recording.kind === 'exact') {
+                expect(gaps).toEqual([]);
+                expect(raw).toEqual([{ kind: 'raw', stream: 'stdin', bytes }]);
+            } else {
+                expect(gaps).toEqual([{ kind: 'auth-record-gap', stream: 'stdin', writeOrdinal: 1,
+                    operation: recording.kind === 'login-gap' ? 'login' : 'refresh_result',
+                    method: recording.method, reconstruction: 'payload cannot be reconstructed from this record' }]);
+                expect(raw).toEqual([]);
+                expect(boundary.events.filter((event) => event.kind === 'message')).toEqual([]);
+                expect(boundary.order).toEqual(['auth-record-gap', 'native-write']);
+            }
+        } finally { await boundary.dispose(); }
+    });
+
+    it.each([
+        '{"id":9223372036854775807,"method":"account/chatgptAuthTokens/refresh","params":{"reason":"unauthorized"}}\n',
+        '{"id":-9223372036854775808,"method":"account/chatgptAuthTokens/refresh","params":{"reason":"unauthorized"}}\n',
+        '{"id":"original-α-id","method":"account/chatgptAuthTokens/refresh","params":{"reason":"unauthorized"}}\n',
+    ])('[private-sdk] offers the complete original directional ID line before generic handling: %s', async (frame) => {
+        const received = createDeferred<Uint8Array>();
+        const boundary = await createSdkProcessBoundary({ sdk: { routeIncoming: async (line) => {
+            received.resolve(line); return 'handled';
+        } } });
+        try {
+            const bytes = Buffer.from(frame); const cut = bytes.length - 3;
+            boundary.stdout.write(bytes.subarray(0, cut)); boundary.stdout.write(bytes.subarray(cut));
+            expect(Buffer.from(await received.promise)).toEqual(bytes);
+            expect(boundary.nativeWrites).toEqual([]);
+            expect(boundary.events.filter((event) => event.kind === 'message' || event.kind === 'frame')).toEqual([]);
+        } finally { await boundary.dispose(); }
+    });
+
+    it('[private-sdk] releases a write only after the original stdin callback', async () => {
+        const boundary = await createSdkProcessBoundary();
+        const started = createDeferred<() => void>();
+        boundary.stdin._write = (_bytes, _encoding, callback) => { started.resolve(() => callback()); };
+        let completed = false;
+        const write = boundary.transport.writeSdkFrame({ bytes: Buffer.from('{"method":"initialized"}\n'), recording: { kind: 'exact' }, signal: new AbortController().signal })
+            .then(() => { completed = true; });
+        const completeWrite = await started.promise;
+        try {
+            expect(completed).toBe(false);
+            completeWrite(); await write; expect(completed).toBe(true);
+        } finally { await boundary.dispose(); }
+    });
+
+    it.each(['abort', 'close', 'failure'] as const)('[private-sdk] rejects %s before a pending write callback and retains the later failure separately', async (failure) => {
+        const boundary = await createSdkProcessBoundary();
+        const started = createDeferred<(error?: Error) => void>();
+        boundary.stdin._write = (_bytes, _encoding, callback) => { started.resolve(callback); };
+        const abort = new AbortController();
+        const bytes = Buffer.from('{"id":1,"method":"account/login/start","params":{"accessToken":"synthetic-login"}}\n');
+        const write = boundary.transport.writeSdkFrame({ bytes, recording: { kind: 'login-gap', method: 'account/login/start', reconstruction: 'payload cannot be reconstructed from this record' }, signal: abort.signal })
+            .then(() => 'incorrect-success', (error: unknown) => error);
+        const completeWrite = await started.promise;
+        try {
+            if (failure === 'abort') abort.abort();
+            if (failure === 'close') boundary.child.emit('close', 0, null);
+            if (failure === 'failure') boundary.stdin.emit('error', new Error('synthetic write failure'));
+            expect(await write).toBeInstanceOf(Error);
+            completeWrite();
+            expect(boundary.events.filter((event) => event.kind === 'auth-record-gap')).toHaveLength(1);
+            expect(boundary.events.some((event) => event.kind === 'failure')).toBe(true);
+            expect(boundary.events.filter((event) => event.kind === 'raw' && event.stream === 'stdin')).toEqual([]);
+            await expect(boundary.client.notify('later/notification')).rejects.toBeInstanceOf(Error);
+        } finally { await boundary.dispose(); }
+    });
+
+    it('[private-sdk] stops before native writing if selected-gap custody fails', async () => {
+        const boundary = await createSdkProcessBoundary({ onCapture: (event) => {
+            if (event.kind === 'auth-record-gap') throw new Error('synthetic recorder failure');
+        } });
+        try {
+            await expect(boundary.transport.writeSdkFrame({ bytes: Buffer.from('{"id":1,"result":{}}\n'), recording: { kind: 'refresh-result-gap', method: 'account/chatgptAuthTokens/refresh', reconstruction: 'payload cannot be reconstructed from this record' }, signal: new AbortController().signal })).rejects.toBeInstanceOf(Error);
+            expect(boundary.nativeWrites).toEqual([]);
+            await expect(boundary.client.notify('later/notification')).rejects.toBeInstanceOf(Error);
+        } finally { await expect(boundary.dispose()).rejects.toBeInstanceOf(Error); }
+    });
+
+    it('[private-sdk] authorizes requests, notifications and each bound handler reply before capture', async () => {
+        const checked: unknown[] = [];
+        let answer: ((message: Record<string, unknown>) => void) | undefined;
+        const responses: Record<string, unknown>[] = [];
+        const boundary = await createSdkProcessBoundary({ sdk: { authorizeOrdinaryWrite: async (input) => { checked.push(input); } }, onWrite: (message) => {
+            if (message.method === 'ordinary/request') answer?.(message);
+            if (message.id === 'success' || message.id === 'failure' || message.id === 'missing') responses.push(message);
+        } });
+        answer = (message) => { boundary.stdout.write(JSON.stringify({ id: message.id, result: 'ordinary-result' }) + '\n'); };
+        try {
+            expect(await boundary.client.request('ordinary/request')).toBe('ordinary-result');
+            await boundary.client.notify('ordinary/notify');
+            boundary.client.registerRequestHandler('ordinary/success', () => 'accepted');
+            boundary.client.registerRequestHandler('ordinary/failure', () => { throw new Error('synthetic handler failure'); });
+            for (const [id, method] of [['success', 'ordinary/success'], ['failure', 'ordinary/failure'], ['missing', 'ordinary/missing']]) {
+                boundary.stdout.write(JSON.stringify({ id, method, params: {} }) + '\n');
+            }
+            await waitForCondition(() => responses.length === 3, { timeoutMs: 5_000, label: 'the three authorized handler replies' });
+            expect(checked).toHaveLength(5);
+            expect(checked).toEqual(expect.arrayContaining([
+                { kind: 'request', method: 'ordinary/request' }, { kind: 'notification', method: 'ordinary/notify' },
+                { kind: 'reply', method: 'ordinary/success' }, { kind: 'reply', method: 'ordinary/failure' }, { kind: 'reply', method: 'ordinary/missing' },
+            ]));
+        } finally { await boundary.dispose(); }
+    });
+
+    it('[private-sdk] refuses an unauthorized ordinary method before it reaches any output capture', async () => {
+        const boundary = await createSdkProcessBoundary({ sdk: { authorizeOrdinaryWrite: async () => { throw new Error('synthetic SDK and Wire refusal'); } } });
+        try {
+            await expect(boundary.client.request('account/login/start', { synthetic: 'ordinary-bypass' })).rejects.toBeInstanceOf(Error);
+            expect(boundary.nativeWrites).toEqual([]);
+            expect(boundary.events.some((event) => event.kind === 'message' && event.direction === 'outgoing')).toBe(false);
+        } finally { await boundary.dispose(); }
+    });
+
     it('[private-sdk] replaces only the private initialization with the retained SDK bootstrap', async () => {
         const writes: Record<string, unknown>[] = [];
         const events: CodexAppServerPrivateIoEvent[] = [];
