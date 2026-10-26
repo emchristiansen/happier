@@ -131,6 +131,7 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
       profileId: string;
       groupId: string;
       generation: number | null;
+      credentialRevision?: string;
     }>;
     processGroupPid?: number | null;
     delayMs: number;
@@ -328,6 +329,8 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
             profileId: event.binding.profileId,
             groupId: bindingGroupMetadata.groupId ?? '',
             generation: bindingGroupMetadata.generation,
+            ...(required?.requirement.credentialRevision == null
+              ? {} : { credentialRevision: required.requirement.credentialRevision }),
           },
           processGroupPid,
           delayMs: params.restartSignalDelayMs,

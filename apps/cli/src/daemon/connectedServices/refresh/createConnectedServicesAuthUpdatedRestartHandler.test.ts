@@ -1,3 +1,10 @@
+import { buildConnectedServiceCredentialRecord, ConnectedServiceAuthGroupPolicyV1Schema } from '@happier-dev/protocol';
+import { resolveClaudeConnectedServiceSwitchContinuity } from '@/backends/claude/connectedServices/resolveClaudeConnectedServiceSwitchContinuity';
+import { createClaudeConnectedServiceRuntimeAuthAdapter } from '@/backends/claude/connectedServices/createClaudeConnectedServiceRuntimeAuthAdapter';
+import { CLAUDE_CODE_RECOMMENDED_OAUTH_SCOPE } from '@/backends/claude/connectedServices/nativeAuth/claudeCodeCredentialScopes';
+import { ConnectedServiceSessionAuthSwitchLockRegistry, createConnectedServiceSessionAuthSwitchCore } from '../runtimeAuth/connectedServiceSessionAuthSwitchCore';
+import { createSessionConnectedServiceAuthHotApply } from '../sessionAuthSwitch/sessionConnectedServiceAuthHotApply';
+import { switchSessionConnectedServiceAuth } from '../sessionAuthSwitch/switchSessionConnectedServiceAuth';
 import { requestPlannedRunnerRestart } from '@/daemon/plannedRunnerRestart/requestPlannedRunnerRestart';
 import { createConnectedServiceSwitchDeferralQueue } from '../sessionAuthSwitch/connectedServiceSwitchDeferralQueue';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -1057,7 +1064,7 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
     const requestRestartSignal = vi.fn((input: RestartSignalParams) => {
       const request = requestPlannedRunnerRestart({
         sessionId: 's1', tracked, reason: 'connected_service_switch', restartRequestedPids: reservations, pidToTrackedSession: sessions,
-        deferral: { kind: 'connected_service_switch', source: 'automatic', policy: 'defer_until_turn_boundary', target, turnDeferralQueue: queue },
+        deferral: { kind: 'connected_service_switch', source: 'automatic', policy: 'defer_until_turn_boundary', target: { ...input.target, generation: input.target.generation ?? 0 }, turnDeferralQueue: queue },
         isProcessSafeToSignal: async () => true,
         canSignal: async () => await input.shouldSignal?.(),
         requestSignal: async ({ shouldSignal }) => {
@@ -1116,7 +1123,7 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
       requestRestartSignal: (input) => {
         automatic = requestPlannedRunnerRestart({
           sessionId: 's1', tracked, reason: 'connected_service_switch', restartRequestedPids: reservations, pidToTrackedSession: sessions,
-          deferral: { kind: 'connected_service_switch', source: 'automatic', policy: 'defer_until_turn_boundary', target: subscription, turnDeferralQueue: queue },
+          deferral: { kind: 'connected_service_switch', source: 'automatic', policy: 'defer_until_turn_boundary', target: { ...input.target, generation: input.target.generation ?? 0 }, turnDeferralQueue: queue },
           isProcessSafeToSignal: async () => true, canSignal: async () => await input.shouldSignal?.(),
           requestSignal: async ({ shouldSignal }) => {
             if (!await shouldSignal()) return { status: 'skipped_stale_owner' as const };
@@ -1244,4 +1251,167 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
       expect(reservations.size).toBe(0);
     } finally { authority.resolve(true); await restart; }
   });
+  it.each([true, false])('executes the current revision after two serialized real Claude failed-adapter requirements roll back (distinct: %s)', async (distinct) => {
+    const serviceId = 'claude-subscription' as const;
+    const target = { serviceId, profileId: 'work', groupId: 'team', generation: 7 };
+    // The spawn owner deliberately omits profileId on the raw group binding.
+    const rawBindings = { v: 1 as const, bindingsByServiceId: {
+      [serviceId]: { source: 'connected' as const, selection: 'group' as const, groupId: 'team' },
+    } };
+    const tracked = createTrackedSession({ pid: 1, sessionId: 's1', spawnOptions: {
+      directory: '/synthetic/project', backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+      connectedServices: rawBindings,
+      environmentVariables: { HAPPIER_CONNECTED_SERVICE_SELECTIONS_JSON: JSON.stringify([{
+        kind: 'group', serviceId, groupId: 'team', activeProfileId: 'work', fallbackProfileId: 'work',
+        generation: 7, credentialRevision: 'csr_originalabcdefghijklmnop',
+      }]) },
+    } });
+    tracked.childProcess = { exitCode: null, signalCode: null } as NonNullable<TrackedSession['childProcess']>;
+    const sessions = new Map([[1, tracked]]);
+    const reservations = new Set<number>();
+    const locks = new ConnectedServiceSessionAuthSwitchLockRegistry();
+    const core = createConnectedServiceSessionAuthSwitchCore({ locks });
+    const queue = createConnectedServiceSwitchDeferralQueue({ timeoutMs: 60_000, disableDeferral: false });
+    queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'task_started' });
+    const r1 = 'csr_zzzzzzzzzzzzzzzzzzzzzzzz';
+    const r2 = distinct ? 'csr_aaaaaaaaaaaaaaaaaaaaaaaa' : r1;
+    let authoritativeRevision = r1;
+    const signals: string[] = [];
+    const requests: ReturnType<typeof requestPlannedRunnerRestart>[] = [];
+    const requestRestartSignal = vi.fn((input: RestartSignalParams) => {
+      const request = requestPlannedRunnerRestart({
+        sessionId: 's1', tracked, reason: 'connected_service_switch', restartRequestedPids: reservations, pidToTrackedSession: sessions,
+        deferral: { kind: 'connected_service_switch', source: 'automatic', policy: 'defer_until_turn_boundary',
+          target: { ...input.target, generation: input.target.generation ?? 0 }, turnDeferralQueue: queue },
+        isProcessSafeToSignal: async () => true, canSignal: async () => await input.shouldSignal?.(),
+        requestSignal: async ({ shouldSignal }) => {
+          if (!await shouldSignal()) return { status: 'skipped_stale_owner' as const };
+          signals.push(authoritativeRevision); return { status: 'requested' as const };
+        }, logDebug: () => {},
+      });
+      requests.push(request); return request;
+    });
+    const handler = createConnectedServicesAuthUpdatedRestartHandler({
+      restartRequestedPids: reservations, pidToTrackedSession: sessions,
+      resolveLifecycleDescriptor: async () => createLifecycleDescriptor('claude', 'no_restart_required'),
+      resolveProcessGroupPid: () => 1, requestRestartSignal, restartSignalDelayMs: 0,
+    });
+    const persist = vi.fn(async () => {});
+    const register = vi.fn();
+    const verify = vi.fn();
+    const restartInline = vi.fn();
+    const continuation = vi.fn();
+    const continuityModes: string[] = [];
+    const adapterFailure = vi.fn(async () => ({ applied: false as const, recovery: 'restart_resume' as const }));
+    const hotApply = createSessionConnectedServiceAuthHotApply({
+      // Only the adapter result is synthetic. This does not execute a filesystem fault or provider.
+      resolveRuntimeAuthAdapter: async () => ({ ...createClaudeConnectedServiceRuntimeAuthAdapter(), hotApply: adapterFailure }),
+    });
+    const record = buildConnectedServiceCredentialRecord({
+      now: 1_000, serviceId, profileId: 'work', kind: 'oauth', expiresAt: 301_000,
+      oauth: { accessToken: 'synthetic-access', refreshToken: 'synthetic-refresh', idToken: null,
+        scope: CLAUDE_CODE_RECOMMENDED_OAUTH_SCOPE, tokenType: 'Bearer', providerAccountId: 'synthetic-account', providerEmail: 'synthetic@example.test' },
+    });
+    const produce = async (credentialRevision: string) => {
+      const result = await switchSessionConnectedServiceAuth({
+        core, getChildren: () => [tracked],
+        executionPolicy: { allowRestartResume: false, allowContinuation: false, source: 'startup_reconciliation' },
+        switchReason: 'automatic_runtime_failure', expectedCredentialRevisionByServiceId: { [serviceId]: credentialRevision },
+        api: {
+          listConnectedServiceProfiles: async () => ({ serviceId, profiles: [{ profileId: 'work', status: 'connected' }] }),
+          getConnectedServiceAuthGroup: async () => ({ v: 1, ...target, activeProfileId: 'work', displayName: 'Team',
+            policy: ConnectedServiceAuthGroupPolicyV1Schema.parse({}), runtimeStateRevision: 0, state: { v: 1 },
+            members: [{ v: 1, serviceId, groupId: 'team', profileId: 'work', priority: 100, enabled: true, state: {}, createdAt: 1, updatedAt: 1 }],
+            createdAt: 1, updatedAt: 1 }),
+        },
+        materializeRuntimeAuthSelection: async () => ({ serviceId, record, groupId: 'team', activeProfileId: 'work', generation: 7,
+          credentialRevision, targetMaterializedRoot: '/synthetic/group', targetMaterializedEnv: { CLAUDE_CONFIG_DIR: '/synthetic/group/claude' },
+          claudeRuntimeAuthSharedGroupSurface: { mode: 'shared_group_auth_surface', runtimeClaudeConfigDir: '/synthetic/group/claude',
+            runtimeMaterializedRoot: '/synthetic/group', sourceClaudeConfigDir: '/synthetic/source' } }),
+        resolveContinuity: async ({ previous, next, previousBindings, normalizedBindings, runtimeAuthSelection }) => {
+          const result = await resolveClaudeConnectedServiceSwitchContinuity({ sessionId: 's1', agentId: 'claude', serviceId,
+            previousBinding: previous, nextBinding: next, fromBindings: previousBindings, toBindings: normalizedBindings,
+            runtimeAuthSelection, targetMaterializedRoot: '/synthetic/group', targetMaterializedEnv: { CLAUDE_CONFIG_DIR: '/synthetic/group/claude' } });
+          continuityModes.push(result.mode);
+          if (result.mode !== 'hot_apply') throw new Error('real Claude group continuity must permit hot apply');
+          return { mode: result.mode };
+        },
+        hotApply, persistSessionBindings: persist, registerHotApplyTargets: register, emitSessionEvent: vi.fn(),
+        restartSession: restartInline, continueAfterRuntimeAuthSwitch: continuation, verifyProviderAccountAdoption: verify,
+        request: { sessionId: 's1', agentId: 'claude', bindings: { v: 1, bindingsByServiceId: { [serviceId]: { source: 'connected', selection: 'group', groupId: 'team', profileId: 'work' } } }, expectedGroupGenerationByServiceId: { [serviceId]: 7 } },
+      });
+      expect(result).toMatchObject({ ok: false, errorCode: 'hot_apply_failed', restartRequirement: expect.any(Object) });
+      if (result.ok || !result.restartRequirement) throw new Error('actual failed adapter must produce its typed restart requirement');
+      expect(result.restartRequirement).toEqual({ kind: 'restart_resume', source: 'failed_adapter_hot_apply', ...target, credentialRevision });
+      expect(tracked.spawnOptions?.connectedServices).toEqual(rawBindings);
+      expect(locks.isHeldByAnotherOwner('s1')).toBe(false);
+      await handler({ binding: target, affectedTargets: [{ pid: 1, agentId: 'claude' }],
+        requiredRestarts: new Map([[1, { tracked, sessionId: 's1', runtimeIdentityKey: 'runtime-original',
+          requirement: result.restartRequirement, isCurrent: async () => authoritativeRevision === credentialRevision }]]) });
+    };
+    try {
+      await produce(r1);
+      expect(reservations.size).toBe(0);
+      authoritativeRevision = r2;
+      await produce(r2);
+      expect(adapterFailure).toHaveBeenCalledTimes(2);
+      expect(continuityModes).toEqual(['hot_apply', 'hot_apply']);
+      expect(persist).toHaveBeenCalledTimes(4); // update plus successful rollback for each attempt
+      expect(signals).toEqual([]);
+      queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'assistant_message_end' });
+      const outcomes = await Promise.all(requests);
+      expect(signals).toEqual([r2]);
+      expect(outcomes).toEqual(distinct
+        ? [{ signaled: false, notSignaledReason: 'superseded' }, { signaled: true }]
+        : [{ signaled: true }, { signaled: false }]);
+      expect(reservations.has(1)).toBe(true);
+      expect(requestRestartSignal.mock.calls.map(([input]) => input.target)).toEqual([
+        { ...target, credentialRevision: r1 }, { ...target, credentialRevision: r2 },
+      ]);
+      expect(register).not.toHaveBeenCalled();
+      expect(restartInline).not.toHaveBeenCalled();
+      expect(continuation).not.toHaveBeenCalled();
+      expect(verify).not.toHaveBeenCalled();
+    } finally { queue.cancelAll('daemon_shutdown'); await Promise.allSettled(requests); }
+  });
+
+  it.each(['stale', 'unavailable'] as const)('refuses a required revision when final authority becomes %s', async (mode) => {
+    const tracked = createTrackedSession({ pid: 1, sessionId: 's1' });
+    const sessions = new Map([[1, tracked]]);
+    const reservations = new Set<number>();
+    const queue = createConnectedServiceSwitchDeferralQueue({ timeoutMs: 60_000, disableDeferral: false });
+    queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'task_started' });
+    let current = true;
+    const signal = vi.fn(async () => ({ status: 'requested' as const }));
+    let pending: ReturnType<typeof requestPlannedRunnerRestart> | undefined;
+    const handler = createConnectedServicesAuthUpdatedRestartHandler({
+      restartRequestedPids: reservations, pidToTrackedSession: sessions,
+      resolveLifecycleDescriptor: async () => createLifecycleDescriptor('claude', 'no_restart_required'),
+      resolveProcessGroupPid: () => 1, restartSignalDelayMs: 0,
+      requestRestartSignal: (input) => {
+        pending = requestPlannedRunnerRestart({
+          sessionId: 's1', tracked, reason: 'connected_service_switch', restartRequestedPids: reservations, pidToTrackedSession: sessions,
+          deferral: { kind: 'connected_service_switch', source: 'automatic', policy: 'defer_until_turn_boundary',
+            target: { ...input.target, generation: input.target.generation ?? 0 }, turnDeferralQueue: queue },
+          isProcessSafeToSignal: async () => true, canSignal: async () => await input.shouldSignal?.(),
+          requestSignal: async ({ shouldSignal }) => await shouldSignal() ? await signal() : { status: 'skipped_stale_owner' as const }, logDebug: () => {},
+        });
+        return pending;
+      },
+    });
+    try {
+      await handler({ binding: { serviceId: 'claude-subscription', profileId: 'work' }, affectedTargets: [{ pid: 1, agentId: 'claude' }],
+        requiredRestarts: new Map([[1, { tracked, sessionId: 's1', runtimeIdentityKey: 'runtime-1',
+          isCurrent: async () => { if (!current && mode === 'unavailable') throw new Error('synthetic unavailable authority'); return current; },
+          requirement: { kind: 'restart_resume', source: 'failed_adapter_hot_apply', serviceId: 'claude-subscription', profileId: 'work',
+            groupId: null, generation: null, credentialRevision: 'csr_abcdefghijklmnopqrstuv' },
+        }]]) });
+      current = false;
+      queue.recordTurnLifecycleEvent({ sessionId: 's1', event: 'assistant_message_end' });
+      expect(await pending).toMatchObject({ signaled: false });
+      expect(signal).not.toHaveBeenCalled();
+      expect(reservations.size).toBe(0);
+    } finally { queue.cancelAll('daemon_shutdown'); await pending; }
+  });
+
 });

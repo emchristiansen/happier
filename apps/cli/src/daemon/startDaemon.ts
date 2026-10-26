@@ -5076,6 +5076,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           profileId?: string | null;
           groupId?: string | null;
           generation?: number | null;
+          credentialRevision?: string;
         }>): ConnectedServiceSwitchTarget => ({
           serviceId: typeof input.serviceId === 'string' ? input.serviceId : '',
           profileId: typeof input.profileId === 'string' ? input.profileId : '',
@@ -5083,6 +5084,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           generation: typeof input.generation === 'number' && Number.isFinite(input.generation)
             ? Math.max(0, Math.trunc(input.generation))
             : 0,
+          ...(input.credentialRevision === undefined ? {} : { credentialRevision: input.credentialRevision }),
         });
 
         const requestConnectedServiceRestartWithDeferral = async (input: Readonly<{
@@ -7488,6 +7490,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   profileId: signalParams.target.profileId,
                   groupId: signalParams.target.groupId,
                   generation: signalParams.target.generation,
+                  ...(signalParams.target.credentialRevision === undefined
+                    ? {} : { credentialRevision: signalParams.target.credentialRevision }),
                 }),
                 restartSignalDelayMs: signalParams.delayMs,
                 shouldSignal: signalParams.shouldSignal,
