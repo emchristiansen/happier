@@ -32,6 +32,7 @@ import { createConnectedServiceCredentialApi } from '@/api/connectedServices/con
 import { resolveRoutedUsageLimitRecoveryResumePromptMode } from '@/session/usageLimitRecoveryControls/resolveRoutedUsageLimitRecoveryResumePromptMode';
 import type { ApiMachineClient } from '@/api/apiMachine';
 import { fetchAccountProfile } from '@/api/accountProfile';
+import { createKeyedFollowUpRuns } from '@/utils/keyedFollowUpRuns';
 import { applyInitialTranscriptAfterSeqToAttachPayload } from '@/daemon/sessionEncryption/applyInitialTranscriptAfterSeqToAttachPayload';
 import { TrackedSession } from './types';
 import { MachineMetadata, DaemonState, type Metadata } from '@/api/types';
@@ -2493,16 +2494,35 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         let connectedServiceProjectionReconciliationBaseline: ConnectedServiceProjectionSnapshot | null = null;
         let connectedServiceProjectionEpoch = 0;
         const lastReconciledProjectionEpochByRuntimeTarget = new WeakMap<ConnectedServiceRuntimeTarget, number>();
-        const activeRegistrationReconciliationByRuntimeTarget = new WeakMap<ConnectedServiceRuntimeTarget, Promise<void>>();
-        const fetchConnectedServiceProjectionSnapshot = async (): Promise<ConnectedServiceProjectionSnapshot> => {
-          const profile = await fetchAccountProfile({ token: credentials.token });
-          const snapshot = parseConnectedServiceProjectionSnapshot({
-            connectedServicesV2: profile.connectedServicesV2,
-            connectedServiceCredentialRevisionsV1: profile.connectedServiceCredentialRevisionsV1,
-          });
-          latestConnectedServiceProjectionSnapshot = snapshot;
-          return snapshot;
-        };
+        // Profile-fetch owner for forced runtime-target registration reconciliation (startup readiness,
+        // runtime-auth recovery): one active GET and one queued follow-up. A caller that arrives while
+        // a GET is in flight does not take that GET's answer (it was requested before the caller, e.g.
+        // before a credential rotation or group switch the caller must observe); it shares the single
+        // queued follow-up GET, which starts after the in-flight one settles and therefore after the
+        // caller. Forced GETs publish to `latestConnectedServiceProjectionSnapshot` in order relative to
+        // each other. Other profile GETs, such as ApiMachineClient's projection-change notification
+        // fetch, are not owned here: they can overlap these, and the notification path can replace
+        // `latestConnectedServiceProjectionSnapshot` before a forced caller reads it.
+        const accountProfileProjectionSnapshotFetches = createKeyedFollowUpRuns<
+          'account_profile',
+          null,
+          ConnectedServiceProjectionSnapshot
+        >({
+          run: async () => {
+            const profile = await fetchAccountProfile({ token: credentials.token });
+            const snapshot = parseConnectedServiceProjectionSnapshot({
+              connectedServicesV2: profile.connectedServicesV2,
+              connectedServiceCredentialRevisionsV1: profile.connectedServiceCredentialRevisionsV1,
+            });
+            latestConnectedServiceProjectionSnapshot = snapshot;
+            return snapshot;
+          },
+        });
+        const fetchConnectedServiceProjectionSnapshot = async (): Promise<ConnectedServiceProjectionSnapshot> => (
+          await accountProfileProjectionSnapshotFetches.request('account_profile', null, {
+            requireStartAfterRequest: true,
+          })
+        );
         const resolveRuntimeGenerationApplicationProofs = createRuntimeGenerationApplicationProofResolver({
           resolveLifecycleDescriptor: resolveConnectedServiceCredentialLifecycleDescriptor,
           getCurrentGroup: async (group) => await api.getConnectedServiceAuthGroup(group),
@@ -2556,48 +2576,56 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           });
           if (isCurrent()) lastReconciledProjectionEpochByRuntimeTarget.set(target, reconciliationEpoch);
         };
+        const describeRuntimeTargetRegistrationKey = (registration: ConnectedServiceRuntimeTargetRegistration): string => (
+          registration.key.kind === 'session' ? `session:${registration.key.pid}` : `run:${registration.key.runKey}`
+        );
+        // Per runtime target: at most one active reconciliation plus one queued forced follow-up.
+        // A forced request (startup readiness, runtime-auth recovery) must observe a reconciliation
+        // that started after it, so while a run is active it joins the single follow-up instead of
+        // appending a run of its own; a passive request joins the active run.
+        const runtimeTargetRegistrationReconciliations = createKeyedFollowUpRuns<
+          ConnectedServiceRuntimeTarget,
+          ConnectedServiceRuntimeTargetRegistration,
+          void
+        >({
+          run: async ({ inputs, kind, servesStartAfterRequest }) => {
+            const registrationsByKey = new Map<string, ConnectedServiceRuntimeTargetRegistration>();
+            for (const registration of inputs) {
+              if (kind === 'follow_up' && !connectedServiceRuntimeRegistry.isCurrentTargetRegistration(registration)) continue;
+              registrationsByKey.set(describeRuntimeTargetRegistrationKey(registration), registration);
+            }
+            const registrations = Array.from(registrationsByKey.values());
+            const lastRegistration = registrations.at(-1);
+            if (!lastRegistration) return;
+            try {
+              if (servesStartAfterRequest && !connectedServiceAuthGroupGenerationConsumer) {
+                throw new Error('connected_service_generation_consumer_unavailable');
+              }
+              const snapshot = servesStartAfterRequest
+                ? await fetchConnectedServiceProjectionSnapshot()
+                : latestConnectedServiceProjectionSnapshot;
+              if (!snapshot) return;
+              for (const registration of registrations) {
+                await reconcileConnectedServiceRuntimeTargetRegistrationNow(registration, snapshot);
+              }
+            } catch (error) {
+              logger.warn('[DAEMON RUN] Connected-service runtime registration reconciliation failed', {
+                key: lastRegistration.key,
+                pid: lastRegistration.target.pid,
+                sessionId: lastRegistration.target.sessionId,
+                kind,
+                error: serializeAxiosErrorForLog(error),
+              });
+              throw error;
+            }
+          },
+        });
         const enqueueConnectedServiceRuntimeTargetRegistrationReconciliation = (
           registration: ConnectedServiceRuntimeTargetRegistration,
           force = false,
-        ): Promise<void> => {
-          const active = activeRegistrationReconciliationByRuntimeTarget.get(registration.target);
-          if (active) {
-            if (!force) return active;
-            const continueForcedReconciliation = async () => {
-              if (!connectedServiceRuntimeRegistry.isCurrentTargetRegistration(registration)) return;
-              await enqueueConnectedServiceRuntimeTargetRegistrationReconciliation(registration, true);
-            };
-            return active.then(
-              continueForcedReconciliation,
-              continueForcedReconciliation,
-            );
-          }
-          const reconciliation = Promise.resolve().then(async () => {
-            if (force && !connectedServiceAuthGroupGenerationConsumer) {
-              throw new Error('connected_service_generation_consumer_unavailable');
-            }
-            const snapshot = force
-              ? await fetchConnectedServiceProjectionSnapshot()
-              : latestConnectedServiceProjectionSnapshot;
-            if (!snapshot) return;
-            await reconcileConnectedServiceRuntimeTargetRegistrationNow(registration, snapshot);
-          });
-          activeRegistrationReconciliationByRuntimeTarget.set(registration.target, reconciliation);
-          void reconciliation.finally(() => {
-            if (activeRegistrationReconciliationByRuntimeTarget.get(registration.target) === reconciliation) {
-              activeRegistrationReconciliationByRuntimeTarget.delete(registration.target);
-            }
-          }).catch(() => {});
-          void reconciliation.catch((error) => {
-            logger.warn('[DAEMON RUN] Connected-service runtime registration reconciliation failed', {
-              key: registration.key,
-              pid: registration.target.pid,
-              sessionId: registration.target.sessionId,
-              error: serializeAxiosErrorForLog(error),
-            });
-          });
-          return reconciliation;
-        };
+        ): Promise<void> => runtimeTargetRegistrationReconciliations.request(registration.target, registration, {
+          requireStartAfterRequest: force,
+        });
         const connectedServiceRuntimeRegistrationCleanup = connectedServiceRuntimeRegistry.onTargetRegistration(
           (registration) => {
             if (!shouldReconcileConnectedServiceRuntimeTargetRegistration({
