@@ -1,3 +1,6 @@
+import type { TrackedSession } from '@/daemon/types';
+import type { HotApplyRestartRequirement } from '../sessionAuthSwitch/sessionConnectedServiceAuthHotApply';
+import type { RequiredAuthRestart } from './createConnectedServicesAuthUpdatedRestartHandler';
 import type { ConnectedServiceCredentialRevisionV1, ConnectedServiceId } from '@happier-dev/protocol';
 import type { ConnectedServiceChildSelection } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 import {
@@ -23,7 +26,7 @@ export type RefreshedConnectedServiceAuthApplication = (input: Readonly<{
   reason: string;
   switchReason: ConnectedServiceSessionAuthSwitchReason;
   fromProfileId?: string | null;
-}>) => Promise<Readonly<{ ok: boolean; action?: string; errorCode?: string }>>;
+}>) => Promise<Readonly<{ ok: boolean; action?: string; errorCode?: string; restartRequirement?: HotApplyRestartRequirement }>>;
 
 export type RefreshedAuthRestartRequiredDiagnostic = Readonly<{
   sessionId: string;
@@ -32,6 +35,9 @@ export type RefreshedAuthRestartRequiredDiagnostic = Readonly<{
   serviceId: string;
   profileId: string;
   errorCode: 'hot_apply_restart_required';
+  restartRequirement?: HotApplyRestartRequirement;
+  runtimeIdentityKey?: string;
+  reason?: 'restart_target_identity_missing' | 'attempted_target_mismatch' | 'policy_refusal';
 }>;
 
 /** The per-session auth locks that the live application owner (`switchSessionConnectedServiceAuth`) takes. */
@@ -58,43 +64,18 @@ function isSameSessionSelection(
 }
 
 /**
- * Applies a refreshed or reconnected credential to every running session bound to it, then hands
- * the event to the descriptor-driven restart handler.
- *
- * A session whose runtime cannot hot-apply the credential (`hot_apply_restart_required`) is left
- * to that restart handler instead of failing the whole event. Throwing here broke both callers for
- * as long as such a session ran: the account changes sync failed before saving its cursor and kept
- * retrying, and `/session-started` reconciliation (via `handleExternalCredentialUpdate`) answered
- * 503. What happens to the skipped session depends on its agent's lifecycle descriptor, exactly as
- * for any other refresh:
- * - Claude on `claude-subscription` needs no restart by design: its runners re-read the refreshed
- *   `.credentials.json` the daemon writes, and the descriptor exempts that service.
- * - Agents whose descriptor requires a restart get the handler's gated restart at a turn boundary.
- * - Codex (mode `hot_apply`), and OpenCode and Pi for the services their descriptors exempt, are
- *   NOT restarted: such a session keeps its previous credential. That was already so when this
- *   threw; it is now reported through `onRestartRequired` instead of looping.
- * Every other result keeps its previous handling: a session skipped under its execution policy
- * (`restart_disallowed_by_execution_policy`) is still skipped, and any other failure still throws.
- *
- * The handler never waits for a session auth lock that another transition holds. Incident
- * 2026-10-22: a runtime-auth recovery held session S's lock while it awaited this very application
- * for the rotation it had joined, and the application waited for S's lock; neither could finish.
- * A held session is therefore deferred: its application is queued on the session's lock, which
- * runs it after every transition already holding or awaiting that lock, and it is left out of the
- * returned applied identities. Nobody awaits that application, so its queued acquisition has no
- * 30-second bound (`runExclusiveDeferredBackground`): a slow but healthy holder does not drop it.
- * Only Stop or final child cleanup (`clearSession`) cancels it while queued; it then never applies.
- * Once it holds the lock it applies only if the session still has the selection this event
- * captured; a session that switched in the meantime keeps its own switch. The live application
- * owner's credential-revision check (`expectedCredentialRevisionByServiceId`) still rejects a
- * credential the server has since replaced. A deferred failure is logged and has no dedicated
- * retry. A transition already holding the lock in the calling async context re-enters it and
- * applies at once. Every free session's application is awaited, concurrently with the others, and
- * a failure among them still fails the notification.
+ * Applies refreshes without waiting for another auth-lock owner. Immediate and deferred
+ * application completion hand actual adapter requirements to the existing restart owner.
+ * Pre-side-effect policy refusals never become restart requirements. Held acquisitions remain
+ * FIFO, cancellable by Stop, and unbounded only while nobody awaits their completion.
  */
 export function createRefreshedConnectedServiceAuthUpdatedHandler(params: Readonly<{
   applyRefreshedAuth: RefreshedConnectedServiceAuthApplication;
-  restartAfterAuthUpdated: (event: AuthUpdatedEvent) => Promise<void>;
+  restartAfterAuthUpdated: (event: AuthUpdatedEvent & Readonly<{ requiredRestarts?: ReadonlyMap<number, RequiredAuthRestart> }>) => Promise<void>;
+  captureRestartTarget?: (target: AuthUpdatedEvent['affectedTargets'][number]) => Readonly<{
+    tracked: TrackedSession;
+    isCurrent: (requirement: HotApplyRestartRequirement) => boolean | Promise<boolean>;
+  }> | null;
   onRestartRequired: (diagnostic: RefreshedAuthRestartRequiredDiagnostic) => void;
   sessionLocks: RefreshedConnectedServiceAuthSessionLocks;
   /** The session's current selection for the service, as its own switches last left it. */
@@ -104,6 +85,8 @@ export function createRefreshedConnectedServiceAuthUpdatedHandler(params: Readon
     event: AuthUpdatedEvent,
     target: AuthUpdatedEvent['affectedTargets'][number],
     sessionId: string,
+    restartRequirement?: HotApplyRestartRequirement,
+    reason?: RefreshedAuthRestartRequiredDiagnostic['reason'],
   ): void => {
     params.onRestartRequired({
       sessionId,
@@ -112,66 +95,77 @@ export function createRefreshedConnectedServiceAuthUpdatedHandler(params: Readon
       serviceId: event.binding.serviceId,
       profileId: event.binding.profileId,
       errorCode: 'hot_apply_restart_required',
+      ...(restartRequirement ? { restartRequirement, runtimeIdentityKey: target.runtimeIdentityKey } : {}),
+      ...(reason ? { reason } : !restartRequirement ? { reason: 'policy_refusal' as const } : {}),
     });
   };
 
-  const deferApplication = (input: Readonly<{
+  type ApplicationContext = Readonly<{
     event: AuthUpdatedEvent;
     target: AuthUpdatedEvent['affectedTargets'][number];
     selection: ConnectedServiceChildSelection;
     application: RefreshedConnectedServiceAuthApplicationInput;
-  }>): void => {
-    const { event, target, selection, application } = input;
+    captured: ReturnType<NonNullable<typeof params.captureRestartTarget>>;
+  }>;
+
+  const handOffRequirement = async (context: ApplicationContext, requirement: HotApplyRestartRequirement): Promise<void> => {
+    const { event, target, application, captured } = context;
+    const sameAttempt = requirement.serviceId === application.serviceId
+      && requirement.profileId === application.activeProfileId
+      && requirement.groupId === application.groupId
+      && requirement.generation === application.generation
+      && (application.credentialRevision == null || requirement.credentialRevision === application.credentialRevision);
+    if (!sameAttempt || !captured) {
+      reportRestartRequired(event, target, application.sessionId, requirement,
+        !sameAttempt ? 'attempted_target_mismatch' : 'restart_target_identity_missing');
+      return;
+    }
+    reportRestartRequired(event, target, application.sessionId, requirement);
+    await params.restartAfterAuthUpdated({
+      ...event,
+      affectedTargets: [target],
+      requiredRestarts: new Map([[target.pid, {
+        requirement, tracked: captured.tracked, sessionId: application.sessionId,
+        runtimeIdentityKey: target.runtimeIdentityKey,
+        isCurrent: () => captured.isCurrent(requirement),
+      }]]),
+    });
+  };
+
+  const deferApplication = (context: ApplicationContext): void => {
+    const { event, target, selection, application } = context;
     const logContext = {
-      sessionId: application.sessionId,
-      pid: target.pid,
-      serviceId: event.binding.serviceId,
-      profileId: event.binding.profileId,
-      credentialRevision: event.credentialRevision ?? null,
-      trigger: event.trigger,
+      sessionId: application.sessionId, pid: target.pid, serviceId: event.binding.serviceId,
+      profileId: event.binding.profileId, credentialRevision: event.credentialRevision ?? null, trigger: event.trigger,
     };
-    logger.infoFile(
-      '[ConnectedServiceRefresh] Refreshed credential application deferred: session auth lock is held',
-      logContext,
-    );
+    logger.infoFile('[ConnectedServiceRefresh] Refreshed credential application deferred: session auth lock is held', logContext);
     void params.sessionLocks.runExclusiveDeferredBackground(application.sessionId, async () => {
-      const currentSelection = params.readCurrentSelection(application.sessionId, event.binding.serviceId);
-      if (!isSameSessionSelection(currentSelection, selection)) {
-        logger.infoFile(
-          '[ConnectedServiceRefresh] Deferred refreshed credential application dropped: session selection changed',
-          logContext,
-        );
-        return;
+      const current = params.readCurrentSelection(application.sessionId, event.binding.serviceId);
+      if (!isSameSessionSelection(current, selection)) {
+        logger.infoFile('[ConnectedServiceRefresh] Deferred refreshed credential application dropped: session selection changed', logContext);
+        return null;
       }
-      const result: RefreshedConnectedServiceAuthApplicationResult = await params.applyRefreshedAuth(application);
-      if (result.ok) {
-        logger.infoFile('[ConnectedServiceRefresh] Deferred refreshed credential application completed', {
-          ...logContext,
-          action: result.action ?? null,
-        });
-        return;
-      }
-      if (result.errorCode === 'restart_disallowed_by_execution_policy') return;
-      if (result.errorCode === 'hot_apply_restart_required') {
+      return await params.applyRefreshedAuth(application);
+    }).then(async (result) => {
+      // The acquired operation has unwound. A later queued owner may already be running;
+      // the captured requirement therefore still needs its final currentness gate.
+      if (!result) return;
+      if (!result.ok && result.restartRequirement) {
+        await handOffRequirement(context, result.restartRequirement);
+      } else if (result.ok) {
+        logger.infoFile('[ConnectedServiceRefresh] Deferred refreshed credential application completed', { ...logContext, action: result.action ?? null });
+        await params.restartAfterAuthUpdated({ ...event, affectedTargets: [target] });
+      } else if (result.errorCode === 'hot_apply_restart_required') {
         reportRestartRequired(event, target, application.sessionId);
-        return;
+      } else if (result.errorCode !== 'restart_disallowed_by_execution_policy') {
+        logger.warn('[ConnectedServiceRefresh] Deferred refreshed credential application failed', { ...logContext, errorCode: result.errorCode ?? 'unknown' });
       }
-      logger.warn('[ConnectedServiceRefresh] Deferred refreshed credential application failed', {
-        ...logContext,
-        errorCode: result.errorCode ?? 'unknown',
-      });
     }).catch((error: unknown) => {
       if (error instanceof ConnectedServiceSessionAuthSwitchAcquisitionError && error.reason === 'session_stopped') {
-        logger.infoFile(
-          '[ConnectedServiceRefresh] Deferred refreshed credential application cancelled: session stopped',
-          logContext,
-        );
+        logger.infoFile('[ConnectedServiceRefresh] Deferred refreshed credential application cancelled: session stopped', logContext);
         return;
       }
-      logger.warn('[ConnectedServiceRefresh] Deferred refreshed credential application failed', {
-        ...logContext,
-        error,
-      });
+      logger.warn('[ConnectedServiceRefresh] Deferred refreshed credential application failed', { ...logContext, error });
     });
   };
 
@@ -185,6 +179,7 @@ export function createRefreshedConnectedServiceAuthUpdatedHandler(params: Readon
     const attemptedSessionIds = new Set<string>();
     const applications: Promise<void>[] = [];
     const appliedRuntimeIdentityKeys = new Set<string>();
+    const excludedFromGenericRestart = new Set<string>();
     for (const target of event.affectedTargets) {
       const sessionId = String(target.sessionId ?? '').trim();
       if (!sessionId || attemptedSessionIds.has(sessionId)) continue;
@@ -207,8 +202,10 @@ export function createRefreshedConnectedServiceAuthUpdatedHandler(params: Readon
         fromProfileId: activeProfileId,
       };
       attemptedSessionIds.add(sessionId);
+      const context: ApplicationContext = { event, target, selection, application, captured: params.captureRestartTarget?.(target) ?? null };
       if (params.sessionLocks.isHeldByAnotherOwner(sessionId)) {
-        deferApplication({ event, target, selection, application });
+        excludedFromGenericRestart.add(sessionId);
+        deferApplication(context);
         continue;
       }
       applications.push((async () => {
@@ -220,8 +217,17 @@ export function createRefreshedConnectedServiceAuthUpdatedHandler(params: Readon
           async () => await params.applyRefreshedAuth(application),
         );
         if (!result.ok) {
-          if (result.errorCode === 'restart_disallowed_by_execution_policy') return;
+          if (result.restartRequirement) {
+            excludedFromGenericRestart.add(sessionId);
+            await handOffRequirement(context, result.restartRequirement);
+            return;
+          }
+          if (result.errorCode === 'restart_disallowed_by_execution_policy') {
+            excludedFromGenericRestart.add(sessionId);
+            return;
+          }
           if (result.errorCode === 'hot_apply_restart_required') {
+            excludedFromGenericRestart.add(sessionId);
             reportRestartRequired(event, target, sessionId);
             return;
           }
@@ -246,7 +252,8 @@ export function createRefreshedConnectedServiceAuthUpdatedHandler(params: Readon
     const failure = outcomes.find((outcome) => outcome.status === 'rejected');
     if (failure?.status === 'rejected') throw failure.reason;
 
-    await params.restartAfterAuthUpdated(event);
+    const genericTargets = event.affectedTargets.filter((target) => !excludedFromGenericRestart.has(String(target.sessionId ?? '').trim()));
+    if (genericTargets.length > 0) await params.restartAfterAuthUpdated({ ...event, affectedTargets: genericTargets });
     return { appliedRuntimeIdentityKeys };
   };
 }

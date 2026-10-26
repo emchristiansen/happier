@@ -23,7 +23,18 @@ type HotApplyServiceResult = Readonly<{
   errorCode?: string;
 }>;
 
-type HotApplyResult =
+/** A failed adapter explicitly requires restart/resume; policy refusals never produce this. */
+export type HotApplyRestartRequirement = Readonly<{
+  kind: 'restart_resume';
+  source: 'failed_adapter_hot_apply';
+  serviceId: ConnectedServiceId;
+  profileId: string | null;
+  groupId: string | null;
+  generation: number | null;
+  credentialRevision: ConnectedServiceCredentialRevisionV1 | null;
+}>;
+
+export type HotApplyResult =
   | Readonly<{
       ok: true;
       verificationByServiceId?: AcceptedConnectedServiceAccountVerificationByServiceId;
@@ -34,6 +45,7 @@ type HotApplyResult =
       serviceId?: string;
       serviceResultsByServiceId?: Readonly<Record<string, HotApplyServiceResult>>;
       underlyingError?: string;
+      restartRequirement?: HotApplyRestartRequirement;
     }>;
 
 function isCatalogAgentId(value: string): value is CatalogAgentId {
@@ -252,6 +264,25 @@ export function createSessionConnectedServiceAuthHotApply(deps?: Readonly<{
           errorCode,
           serviceId,
           serviceResultsByServiceId,
+          ...(result.recovery === 'restart_resume' && errorCode !== 'credential_revision_superseded'
+            ? {
+                restartRequirement: {
+                  kind: 'restart_resume' as const,
+                  source: 'failed_adapter_hot_apply' as const,
+                  serviceId,
+                  profileId: readString(materializedSelectionRecord?.activeProfileId)
+                    ?? readString(materializedSelectionRecord?.profileId)
+                    ?? readString(binding.profileId),
+                  groupId: binding.selection === 'group'
+                    ? readString(materializedSelectionRecord?.groupId) ?? binding.groupId
+                    : null,
+                  generation: binding.selection === 'group' && typeof groupGeneration === 'number' && Number.isSafeInteger(groupGeneration)
+                    ? groupGeneration
+                    : null,
+                  credentialRevision: credentialRevision.success ? credentialRevision.data : null,
+                },
+              }
+            : {}),
         };
       }
       serviceResultsByServiceId[serviceId] = { status: 'applied' };

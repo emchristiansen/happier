@@ -72,7 +72,7 @@ function applyResults(
 }
 
 describe('createRefreshedConnectedServiceAuthUpdatedHandler', () => {
-  it('leaves a session whose hot-apply needs a restart to the restart policy instead of throwing', async () => {
+  it('reports an untyped policy refusal without throwing or authorizing a restart', async () => {
     // Regression: this used to throw connected_service_refreshed_auth_application_failed:
     // hot_apply_restart_required, which escaped the account changes sync before its cursor saved.
     const restartAfterAuthUpdated = vi.fn(async (_event: AuthUpdatedEvent) => {});
@@ -90,7 +90,7 @@ describe('createRefreshedConnectedServiceAuthUpdatedHandler', () => {
     const result = await handler(event);
 
     expect(result).toEqual({ appliedRuntimeIdentityKeys: new Set() });
-    expect(restartAfterAuthUpdated).toHaveBeenCalledWith(event);
+    expect(restartAfterAuthUpdated).not.toHaveBeenCalled();
     expect(onRestartRequired).toHaveBeenCalledWith({
       sessionId: 's1',
       pid: 1,
@@ -98,6 +98,7 @@ describe('createRefreshedConnectedServiceAuthUpdatedHandler', () => {
       serviceId: 'claude-subscription',
       profileId: 'work',
       errorCode: 'hot_apply_restart_required',
+      reason: 'policy_refusal',
     });
   });
 
@@ -169,29 +170,12 @@ describe('createRefreshedConnectedServiceAuthUpdatedHandler', () => {
       return requestRestartSignal.mock.calls.map(([params]) => params);
     }
 
-    it('does not restart Claude for a refreshed claude-subscription credential, by design', async () => {
-      // Claude's descriptor exempts claude-subscription: every runner re-reads the refreshed
-      // .credentials.json the daemon writes, so no restart is needed.
-      expect(await restartsFor({ agentId: 'claude', serviceId: 'claude-subscription' })).toEqual([]);
-    });
-
-    it('requests the gated restart where the descriptor requires one', async () => {
-      // Gemini's descriptor requires a restart for a refreshed gemini credential and exempts
-      // nothing, so the skipped session gets the handler's deferred, gated restart.
-      expect(await restartsFor({ agentId: 'gemini', serviceId: 'gemini' })).toEqual([
-        expect.objectContaining({
-          pid: 1,
-          sessionId: 's1',
-          target: expect.objectContaining({ serviceId: 'gemini', profileId: 'work' }),
-        }),
-      ]);
-    });
-
-    it('does not restart Codex either: its session keeps its previous credential', async () => {
-      // Codex's descriptor mode is hot_apply, so the restart handler never restarts it. Before this
-      // change the same case threw instead; neither restarted the session. A true deferred restart
-      // for this case is a separate decision.
-      expect(await restartsFor({ agentId: 'codex', serviceId: 'openai-codex' })).toEqual([]);
+    it.each([
+      { agentId: 'claude' as const, serviceId: 'claude-subscription' as const },
+      { agentId: 'gemini' as const, serviceId: 'gemini' as const },
+      { agentId: 'codex' as const, serviceId: 'openai-codex' as const },
+    ])('does not convert a bare policy refusal to restart through the real $agentId descriptor', async (input) => {
+      expect(await restartsFor(input)).toEqual([]);
     });
   });
 
@@ -357,7 +341,7 @@ describe('createRefreshedConnectedServiceAuthUpdatedHandler', () => {
         expect(outcome).toEqual({ appliedRuntimeIdentityKeys: new Set(['runtime-3']) });
         expect(applied).toEqual(['ready']);
         expect(restartAfterAuthUpdated).toHaveBeenCalledTimes(1);
-        expect(restartAfterAuthUpdated).toHaveBeenCalledWith(event);
+        expect(restartAfterAuthUpdated).toHaveBeenCalledWith({ ...event, affectedTargets: event.affectedTargets.filter((target) => target.sessionId === 'ready') });
         for (const sessionId of ['busy-1', 'busy-2']) {
           expect(info).toHaveBeenCalledWith(
             '[ConnectedServiceRefresh] Refreshed credential application deferred: session auth lock is held',
@@ -383,9 +367,9 @@ describe('createRefreshedConnectedServiceAuthUpdatedHandler', () => {
           '[ConnectedServiceRefresh] Deferred refreshed credential application completed',
           expect.objectContaining({ sessionId: 'busy-2', action: 'hot_applied' }),
         );
-        // The deferred applications credit no runtime identity and trigger no second restart pass.
+        // Deferred completion credits no runtime identity; each successful target reaches its ordinary descriptor policy after application.
         expect(outcome).toEqual({ appliedRuntimeIdentityKeys: new Set(['runtime-3']) });
-        expect(restartAfterAuthUpdated).toHaveBeenCalledTimes(1);
+        expect(restartAfterAuthUpdated).toHaveBeenCalledTimes(3);
         expect(warn).not.toHaveBeenCalled();
       } finally {
         releases.forEach((release) => release());
@@ -522,4 +506,112 @@ describe('createRefreshedConnectedServiceAuthUpdatedHandler', () => {
       expect(outcome).toEqual({ appliedRuntimeIdentityKeys: new Set() });
     });
   });
+  describe('post-hot-apply restart requirements', () => {
+    const serviceId = 'claude-subscription' as const;
+    const revision = 'csr_abcdefghijklmnopqrstuv' as const;
+    const requirement = {
+      kind: 'restart_resume' as const, source: 'failed_adapter_hot_apply' as const,
+      serviceId, profileId: 'work', groupId: null, generation: null, credentialRevision: revision,
+    };
+
+    it.each([false, true])('hands an actual requirement to the real exempt descriptor once after application (held: %s)', async (held) => {
+      const { resolveConnectedServiceCredentialLifecycleDescriptor } = await import('@/backends/catalog');
+      const locks = new ConnectedServiceSessionAuthSwitchLockRegistry();
+      const tracked: TrackedSession = { pid: 1, startedBy: 'daemon', happySessionId: 's1' };
+      const requestRestartSignal = vi.fn(async (_input: Parameters<Parameters<typeof createConnectedServicesAuthUpdatedRestartHandler>[0]['requestRestartSignal']>[0]) => ({ signaled: true }));
+      const restart = createConnectedServicesAuthUpdatedRestartHandler({
+        restartRequestedPids: new Set(), pidToTrackedSession: new Map([[1, tracked]]),
+        resolveLifecycleDescriptor: resolveConnectedServiceCredentialLifecycleDescriptor,
+        resolveProcessGroupPid: () => 1, requestRestartSignal, restartSignalDelayMs: 0,
+      });
+      let release!: () => void;
+      const holder = held ? locks.runExclusive('s1', async () => await new Promise<void>((resolve) => { release = resolve; })) : Promise.resolve();
+      let applied = false;
+      const captureRestartTarget = () => ({ tracked, isCurrent: async () => true });
+      const handler = createRefreshedConnectedServiceAuthUpdatedHandler({
+        applyRefreshedAuth: async () => { applied = true; return { ok: false, errorCode: 'hot_apply_failed', restartRequirement: requirement }; },
+        captureRestartTarget,
+        restartAfterAuthUpdated: async (event) => { expect(applied).toBe(true); expect(locks.isHeldByAnotherOwner('s1')).toBe(false); await restart(event); },
+        onRestartRequired: vi.fn(), sessionLocks: locks,
+        readCurrentSelection: () => ({ kind: 'profile', serviceId, profileId: 'work', credentialRevision: null }),
+      });
+      try {
+        const result = await handler({ ...refreshEvent(serviceId, 'work', [spawnTarget({ pid: 1, sessionId: 's1', agentId: 'claude', serviceId, profileId: 'work' })]), credentialRevision: revision });
+        expect(result).toEqual({ appliedRuntimeIdentityKeys: new Set() });
+        if (held) { expect(applied).toBe(false); expect(requestRestartSignal).not.toHaveBeenCalled(); release(); await holder; await nextMacrotask(); }
+        expect(requestRestartSignal).toHaveBeenCalledTimes(1);
+        expect(requestRestartSignal.mock.calls[0]?.[0]).toMatchObject({ tracked, sessionId: 's1', target: { serviceId, profileId: 'work' } });
+      } finally { if (held) release(); await holder; }
+    });
+
+    it.each(['hot_apply_restart_required', 'restart_disallowed_by_execution_policy'])('does not restart a policy refusal through the generic pass: %s', async (errorCode) => {
+      const restart = vi.fn(async (_event: AuthUpdatedEvent) => {});
+      const handler = createRefreshedConnectedServiceAuthUpdatedHandler({
+        applyRefreshedAuth: async () => ({ ok: false, errorCode }), restartAfterAuthUpdated: restart,
+        onRestartRequired: vi.fn(), ...unlockedSessions(),
+      });
+      await handler(refreshEvent(serviceId, 'work', [spawnTarget({ pid: 1, sessionId: 's1', agentId: 'claude', serviceId, profileId: 'work' })]));
+      expect(restart.mock.calls.flatMap((args) => (args[0] as unknown as AuthUpdatedEvent).affectedTargets)).toEqual([]);
+    });
+  });
+
+  it.each(['stop', 'selection', 'generation', 'revision', 'runtime'] as const)('does not hand off a held requirement after cancellation/currentness changes: %s', async (mode) => {
+    const locks = new ConnectedServiceSessionAuthSwitchLockRegistry();
+    let release!: () => void;
+    const holder = locks.runExclusive('s1', async () => await new Promise<void>((resolve) => { release = resolve; }));
+    const serviceId = 'claude-subscription' as const;
+    const tracked: TrackedSession = { pid: 1, startedBy: 'daemon', happySessionId: 's1' };
+    const requestRestartSignal = vi.fn(async () => ({ signaled: true }));
+    let current = true;
+    let selected = true;
+    const restart = createConnectedServicesAuthUpdatedRestartHandler({
+      restartRequestedPids: new Set(), pidToTrackedSession: new Map([[1, tracked]]),
+      resolveLifecycleDescriptor: async () => (await import('@/backends/catalog')).resolveConnectedServiceCredentialLifecycleDescriptor('claude'),
+      resolveProcessGroupPid: () => 1, requestRestartSignal, restartSignalDelayMs: 0,
+    });
+    const applied = vi.fn(async () => ({ ok: false, errorCode: 'hot_apply_failed', restartRequirement: {
+      kind: 'restart_resume' as const, source: 'failed_adapter_hot_apply' as const,
+      serviceId, profileId: 'work', groupId: null, generation: null, credentialRevision: 'csr_abcdefghijklmnopqrstuv',
+    } }));
+    const handler = createRefreshedConnectedServiceAuthUpdatedHandler({
+      applyRefreshedAuth: applied, sessionLocks: locks, onRestartRequired: vi.fn(), restartAfterAuthUpdated: restart,
+      captureRestartTarget: () => ({ tracked, isCurrent: async () => current }),
+      readCurrentSelection: () => ({ kind: 'profile', serviceId, profileId: selected ? 'work' : 'other', credentialRevision: null }),
+    });
+    try {
+      await handler(refreshEvent(serviceId, 'work', [spawnTarget({ pid: 1, sessionId: 's1', agentId: 'claude', serviceId, profileId: 'work' })]));
+      if (mode === 'stop') locks.clearSession('s1');
+      else if (mode === 'selection') selected = false;
+      else current = false; // Injected authoritative generation/revision or runtime identity rejection.
+      release(); await holder; await nextMacrotask();
+      expect(requestRestartSignal).not.toHaveBeenCalled();
+      expect(applied).toHaveBeenCalledTimes(mode === 'stop' || mode === 'selection' ? 0 : 1);
+    } finally { release(); locks.clearSession('s1'); await holder; }
+  });
+
+  it('schedules a typed requirement without waiting for a turn boundary under same-owner lock re-entry', async () => {
+    const serviceId = 'claude-subscription' as const;
+    const locks = new ConnectedServiceSessionAuthSwitchLockRegistry();
+    const tracked: TrackedSession = { pid: 1, startedBy: 'daemon', happySessionId: 's1' };
+    const signal = vi.fn(() => new Promise<Readonly<{ signaled: boolean }>>(() => {}));
+    const restart = createConnectedServicesAuthUpdatedRestartHandler({
+      restartRequestedPids: new Set(), pidToTrackedSession: new Map([[1, tracked]]),
+      resolveLifecycleDescriptor: async () => (await import('@/backends/catalog')).resolveConnectedServiceCredentialLifecycleDescriptor('claude'),
+      resolveProcessGroupPid: () => 1, requestRestartSignal: signal, restartSignalDelayMs: 0,
+    });
+    const handler = createRefreshedConnectedServiceAuthUpdatedHandler({
+      applyRefreshedAuth: async () => await locks.runExclusive('s1', async () => ({ ok: false, errorCode: 'hot_apply_failed', restartRequirement: {
+        kind: 'restart_resume', source: 'failed_adapter_hot_apply', serviceId, profileId: 'work', groupId: null, generation: null, credentialRevision: 'csr_abcdefghijklmnopqrstuv',
+      } })),
+      restartAfterAuthUpdated: restart, onRestartRequired: vi.fn(), sessionLocks: locks,
+      captureRestartTarget: () => ({ tracked, isCurrent: async () => true }), readCurrentSelection: () => null,
+    });
+    await locks.runExclusive('s1', async () => {
+      await handler(refreshEvent(serviceId, 'work', [spawnTarget({ pid: 1, sessionId: 's1', agentId: 'claude', serviceId, profileId: 'work' })]));
+      expect(signal).toHaveBeenCalledTimes(1);
+      // This context still owns the outer lock; completion never claims that it was released.
+      expect(locks.isHeldByAnotherOwner('s1')).toBe(false);
+    });
+  });
+
 });

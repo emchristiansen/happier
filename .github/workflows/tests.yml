@@ -1034,7 +1034,7 @@ jobs:
 
       - name: Run integration tests
         id: integration-tests
-        if: ${{ matrix.part == 1 && !cancelled() }}
+        if: ${{ !cancelled() }}
         continue-on-error: true
         run: yarn workspace @happier-dev/cli test:integration
 
@@ -1046,7 +1046,7 @@ jobs:
           CLI_COMMON_DIST_OUTCOME: ${{ steps.cli-common-dist.outcome }}
           INTEGRATION_TESTS_OUTCOME: ${{ steps.integration-tests.outcome }}
         run: |
-          if [ "$UNIT_TESTS_OUTCOME" != "success" ] || { [ "$CLI_PART" = "1" ] && { [ "$CLI_COMMON_DIST_OUTCOME" != "success" ] || [ "$INTEGRATION_TESTS_OUTCOME" != "success" ]; }; }; then
+          if [ "$UNIT_TESTS_OUTCOME" != "success" ] || [ "$INTEGRATION_TESTS_OUTCOME" != "success" ] || { [ "$CLI_PART" = "1" ] && [ "$CLI_COMMON_DIST_OUTCOME" != "success" ]; }; then
             echo "One or more cli test lanes failed: unit=$UNIT_TESTS_OUTCOME common_dist=$CLI_COMMON_DIST_OUTCOME integration=$INTEGRATION_TESTS_OUTCOME" >&2
             exit 1
           fi
