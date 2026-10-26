@@ -485,16 +485,36 @@ async function materializeNextPendingMessageInTx(
                     where: { sessionId, status: "queued", deliveryState: "blocked" },
                 });
                 if ((sessionBefore.pendingCount ?? 0) !== pendingCount || (sessionBefore.pendingBlockedCount ?? 0) !== blockedCount) {
-                    changes.push(await applyPendingSessionStateChange({
-                        tx,
-                        sessionId,
-                        pendingCountDelta: pendingCount - (sessionBefore.pendingCount ?? 0),
-                        pendingBlockedCountDelta: blockedCount - (sessionBefore.pendingBlockedCount ?? 0),
-                    }));
+                    const repaired = await tx.session.updateMany({
+                        where: {
+                            id: sessionId,
+                            pendingCount: sessionBefore.pendingCount,
+                            pendingBlockedCount: sessionBefore.pendingBlockedCount,
+                            pendingVersion: sessionBefore.pendingVersion,
+                        },
+                        data: { pendingCount, pendingBlockedCount: blockedCount, pendingVersion: { increment: 1 } },
+                    });
                     const latestSession = await tx.session.findUniqueOrThrow({
                         where: { id: sessionId },
                         select: { pendingCount: true, pendingBlockedCount: true, pendingVersion: true },
                     });
+                    if (repaired.count > 0) {
+                        const participantCursors = await markPendingStateChangedParticipants({
+                            tx,
+                            sessionId,
+                            pendingVersion: latestSession.pendingVersion,
+                            pendingCount: latestSession.pendingCount,
+                            pendingBlockedCount: latestSession.pendingBlockedCount,
+                        });
+                        changes.push({
+                            ...latestSession,
+                            participantCursors,
+                            badgeAttentionChanged: didSessionActivityBadgeContributionChange(
+                                sessionBefore,
+                                { ...sessionBefore, ...latestSession },
+                            ),
+                        });
+                    }
                     return {
                         ok: true,
                         didMaterialize: false,

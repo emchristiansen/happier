@@ -2034,6 +2034,67 @@ describe("pendingMessageService (shared sessions)", () => {
         })).resolves.toEqual({ pendingCount: 1 });
     });
 
+    it("parks a sole unsupported row once without applying its blocked-counter change twice", async () => {
+        const owner = await createAccount("unsupported-row-counter-repair-owner");
+        const session = await createSession(owner.id);
+        await createCurrentPendingEvidencePublisher({ accountId: owner.id, sessionId: session.id });
+        const localId = `unsupported-row-counter-repair-${randomUUID()}`;
+
+        await expect(enqueuePendingMessage({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            localId,
+            ciphertext: "cipher-unsupported-row-counter-repair",
+        })).resolves.toMatchObject({ ok: true });
+        await db.sessionPendingMessage.update({
+            where: { sessionId_localId: { sessionId: session.id, localId } },
+            data: { requestedAction: { v: 1, kind: "future_action" } },
+        });
+        const before = await db.session.findUniqueOrThrow({
+            where: { id: session.id },
+            select: { pendingCount: true, pendingBlockedCount: true, pendingVersion: true },
+        });
+        expect(before).toMatchObject({ pendingCount: 1, pendingBlockedCount: 0 });
+
+        const result = await materializeNextPendingMessage({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            deliveryState: "provider",
+            foregroundState: "ready",
+        });
+
+        // Parking changes the counters before empty-queue reconciliation reads the same transaction.
+        expect(result).toMatchObject({
+            ok: true,
+            didMaterialize: false,
+            pendingCount: 1,
+            pendingBlockedCount: 1,
+            pendingVersion: before.pendingVersion + 1,
+            pendingStateChanged: true,
+            badgeAttentionChanged: true,
+        });
+        if (!result.ok) throw new Error("expected unsupported row parking result");
+        expect(result.participantCursorsPending?.length).toBeGreaterThan(0);
+        await expect(db.session.findUniqueOrThrow({
+            where: { id: session.id },
+            select: { pendingCount: true, pendingBlockedCount: true, pendingVersion: true },
+        })).resolves.toEqual({
+            pendingCount: 1,
+            pendingBlockedCount: 1,
+            pendingVersion: before.pendingVersion + 1,
+        });
+        await expect(db.sessionPendingMessage.findMany({
+            where: { sessionId: session.id },
+            select: { localId: true, status: true, deliveryState: true, deliveryBlockedReason: true, providerAction: true },
+        })).resolves.toEqual([{
+            localId,
+            status: "queued",
+            deliveryState: "blocked",
+            deliveryBlockedReason: "unsupported_action",
+            providerAction: null,
+        }]);
+    });
+
     it.each([
         ["send_now", "active_unsteerable", "interrupt_and_send"],
         ["steer_now", "active_steerable", "steer"],
