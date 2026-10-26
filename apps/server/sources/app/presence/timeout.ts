@@ -9,6 +9,7 @@ import { warn } from "@/utils/logging/log";
 import { expireSessionPublisherCandidates } from "./sessionPublisherPresenceTimeout";
 import { publishSessionPublisherLifecycleUpdate } from "@/app/session/runtimeActivity/publishPublisherLifecycleUpdate";
 import { emitPendingActivationWake } from "./pendingActivationWake";
+import { RELEASED_ALIVE_PERSISTENCE_INTERVAL_MS } from "@/app/session/runtimeActivity/releasedAliveTiming";
 
 export interface PresenceTimeoutConfig {
     sessionTimeoutMs: number;
@@ -21,8 +22,15 @@ const DEFAULT_PRESENCE_MACHINE_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_PRESENCE_TIMEOUT_TICK_MS = 60 * 1000;
 
 export function resolvePresenceTimeoutConfig(env: NodeJS.ProcessEnv = process.env): PresenceTimeoutConfig {
+    const sessionTimeoutMs = parseIntEnv(env.HAPPIER_PRESENCE_SESSION_TIMEOUT_MS, DEFAULT_PRESENCE_SESSION_TIMEOUT_MS, { min: 1 });
+    // Released heartbeats can leave a live publisher's committed fence unchanged for this interval.
+    if (sessionTimeoutMs <= RELEASED_ALIVE_PERSISTENCE_INTERVAL_MS) {
+        throw new Error(
+            `HAPPIER_PRESENCE_SESSION_TIMEOUT_MS (${sessionTimeoutMs} ms) must be greater than the released heartbeat persistence interval (${RELEASED_ALIVE_PERSISTENCE_INTERVAL_MS} ms)`,
+        );
+    }
     return {
-        sessionTimeoutMs: parseIntEnv(env.HAPPIER_PRESENCE_SESSION_TIMEOUT_MS, DEFAULT_PRESENCE_SESSION_TIMEOUT_MS, { min: 1 }),
+        sessionTimeoutMs,
         machineTimeoutMs: parseIntEnv(env.HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS, DEFAULT_PRESENCE_MACHINE_TIMEOUT_MS, { min: 1 }),
         tickMs: parseIntEnv(env.HAPPIER_PRESENCE_TIMEOUT_TICK_MS, DEFAULT_PRESENCE_TIMEOUT_TICK_MS, { min: 1 }),
     };

@@ -1484,3 +1484,163 @@ describe('sendSessionMessage encryption admission', () => {
         });
     });
 });
+
+describe('sendSessionMessage confirmed custody during publisher recovery', () => {
+    const sessionId = 'c222222222222222222222222';
+    const localId = 'publisher-recovery-input';
+    const previousExitCode = process.exitCode;
+
+    beforeEach(() => {
+        vi.resetModules();
+        vi.doUnmock('axios');
+        vi.doUnmock('./resolveSessionTransportContext');
+        vi.doUnmock('@/session/transport/http/sessionsHttp');
+        vi.doUnmock('@/api/session/pendingQueueV2Transport');
+        vi.doUnmock('./requestInactiveSessionResume');
+        vi.doUnmock('@/api/session/fetchEncryptedTranscriptWindow');
+        vi.doUnmock('@/api/session/transcriptMessageLookup');
+        vi.doUnmock('@/session/transport/socket/sessionSocketAgentState');
+        vi.doUnmock('@/session/transport/socket/sessionSocketSendMessage');
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.doUnmock('@/session/transport/rpc/sessionRpc');
+        vi.doUnmock('@/session/transport/rpc/machineRpc');
+        vi.resetModules();
+        process.exitCode = previousExitCode;
+    });
+
+    async function prepareRecovery(capability: unknown, options: {
+        admissionFails?: boolean;
+        resume?: 'failed' | 'timeout' | 'unsupported';
+        probeFails?: boolean;
+    } = {}) {
+        const { createSessionRecordFixture } = await import('@/testkit/backends/sessionFixtures');
+        const session = createSessionRecordFixture({
+            id: sessionId,
+            active: false,
+            encryptionMode: 'plain',
+            metadata: JSON.stringify({
+                flavor: 'claude', claudeSessionId: 'provider-thread', path: '/repo', machineId: 'machine-1',
+            }),
+        });
+        const credentials: import('@/persistence').Credentials = {
+            token: 'synthetic-account-token',
+            encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
+        };
+        const axios = (await import('axios')).default;
+        const get = vi.spyOn(axios, 'get').mockImplementation(async (url) => {
+            if (String(url).endsWith(`/v2/sessions/${sessionId}`)) return { status: 200, data: { session } };
+            if (String(url).includes(`/sessions/${sessionId}/messages`)) return { status: 200, data: { messages: [] } };
+            throw new Error(`Unexpected HTTP GET: ${url}`);
+        });
+        const post = vi.spyOn(axios, 'post').mockImplementation(async (url) => {
+            if (!String(url).endsWith(`/v2/sessions/${sessionId}/pending`)) throw new Error(`Unexpected HTTP POST: ${url}`);
+            if (options.admissionFails) throw new Error('Pending acknowledgement timed out');
+            return { status: 200, data: { didWrite: true } };
+        });
+        const callMachineRpc = vi.fn(async () => {
+            if (options.resume === 'timeout') throw Object.assign(new Error('Machine acknowledgement timed out'), { code: 'MACHINE_RPC_TIMEOUT' });
+            if (options.resume === 'unsupported') return { type: 'success', sessionId: 'different-session' };
+            return { type: 'error', errorMessage: 'Resume rejected' };
+        });
+        const callSessionRpc = vi.fn(async () => {
+            if (options.probeFails) throw new Error('RPC transport unavailable');
+            return capability;
+        });
+        vi.doMock('@/session/transport/rpc/machineRpc', () => ({ callMachineRpc }));
+        vi.doMock('@/session/transport/rpc/sessionRpc', () => ({ callSessionRpc }));
+        const { sendSessionMessage } = await import('./sendSessionMessage');
+        const send = (overrides: Partial<Parameters<typeof sendSessionMessage>[0]> = {}) => sendSessionMessage({
+            credentials, idOrPrefix: sessionId, message: 'continue', localId, wait: false, timeoutMs: 1_000,
+            ...overrides,
+        });
+        return { credentials, send, get, post, callMachineRpc, callSessionRpc };
+    }
+
+    const recovering = {
+        ok: false, error: 'pending_materialization_wake_unavailable', errorCode: 'publisher_recovering',
+    };
+    const servable = {
+        ok: true, capability: 'pending_queue_wake_v1', protocolVersion: 1, method: 'session.pendingQueue.wake.v1',
+    };
+
+    it.each([['recovering', recovering], ['already recovered', servable]] as const)(
+        'reports exact admitted custody when the existing runner is %s', async (_state, capability) => {
+            const { send, post, callMachineRpc, callSessionRpc } = await prepareRecovery(capability);
+            expect(await send()).toEqual({ ok: true, sessionId, localId, waited: false });
+            expect(post).toHaveBeenCalledOnce();
+            expect(callMachineRpc).toHaveBeenCalledOnce();
+            expect(post.mock.invocationCallOrder[0]).toBeLessThan(callMachineRpc.mock.invocationCallOrder[0]);
+            expect(callSessionRpc).toHaveBeenCalledOnce();
+            expect(callSessionRpc).toHaveBeenCalledWith(expect.objectContaining({
+                sessionId, mode: 'plain', method: `${sessionId}:session.pendingQueue.wakeCapability.v1.get`, request: {}, timeoutMs: 1_000,
+            }));
+        },
+    );
+
+    it.each([
+        ['terminating', { ...recovering, errorCode: 'runtime_terminating' }],
+        ['lost', { ...recovering, errorCode: 'publisher_lost' }],
+        ['upgrade required', { ...recovering, errorCode: 'runtime_upgrade_required' }],
+        ['malformed', { ...recovering, unexpected: true }],
+        ['unavailable', null],
+    ])('retains the failed resume and exact custody for a %s capability', async (_state, capability) => {
+        const { send } = await prepareRecovery(capability);
+        expect(await send()).toEqual({
+            ok: false, code: 'resume_failed', message: 'Resume rejected', pendingCustody: 'confirmed', sessionId, localId,
+        });
+    });
+
+    it('retains custody and the original failure when the probe transport fails', async () => {
+        const { send } = await prepareRecovery(recovering, { probeFails: true });
+        expect(await send()).toMatchObject({ ok: false, code: 'resume_failed', pendingCustody: 'confirmed', sessionId, localId });
+    });
+
+    it.each(['timeout', 'unsupported'] as const)('preserves %s without probing', async (resume) => {
+        const { send, callSessionRpc } = await prepareRecovery(recovering, { resume });
+        expect(await send()).toMatchObject({ ok: false, code: resume, pendingCustody: 'confirmed', sessionId, localId });
+        expect(callSessionRpc).not.toHaveBeenCalled();
+    });
+
+    it('does not resume or probe before custody is confirmed', async () => {
+        const { send, callMachineRpc, callSessionRpc } = await prepareRecovery(recovering, { admissionFails: true });
+        expect(await send()).toEqual({ ok: false, code: 'timeout', message: 'Pending acknowledgement timed out' });
+        expect(callMachineRpc).not.toHaveBeenCalled();
+        expect(callSessionRpc).not.toHaveBeenCalled();
+    });
+
+    it('preserves pending-only admission without a resume or probe', async () => {
+        const { send, callMachineRpc, callSessionRpc } = await prepareRecovery(recovering);
+        expect(await send({ resumeInactiveSession: false })).toEqual({ ok: true, sessionId, localId, waited: false });
+        expect(callMachineRpc).not.toHaveBeenCalled();
+        expect(callSessionRpc).not.toHaveBeenCalled();
+    });
+
+    it('does not report waited success without exact prompt materialization', async () => {
+        const { send, get } = await prepareRecovery(recovering);
+        const result = await send({ wait: true, timeoutMs: 25 });
+        expect(result).toMatchObject({ ok: false, code: expect.stringMatching(/^(timeout|wait_failed)$/) });
+        expect(get.mock.calls.some(([url]) => String(url).includes(`/sessions/${sessionId}/messages`))).toBe(true);
+    });
+
+    it('prints admitted custody as JSON success without a failing CLI exit', async () => {
+        const { credentials, post, callMachineRpc } = await prepareRecovery(recovering);
+        const { captureStdoutJsonOutput } = await import('@/testkit/logger/captureOutput');
+        const { cmdSessionSend } = await import('@/cli/commands/session/send');
+        process.exitCode = 0;
+        const output = captureStdoutJsonOutput();
+        try {
+            await cmdSessionSend(['send', sessionId, 'continue', '--json'], { readCredentialsFn: async () => credentials });
+            expect(output.json()).toMatchObject({
+                v: 1, ok: true, kind: 'session_send', data: { sessionId, localId: expect.any(String), waited: false },
+            });
+            expect(process.exitCode).toBe(0);
+            expect(post).toHaveBeenCalledOnce();
+            expect(callMachineRpc).toHaveBeenCalledOnce();
+        } finally {
+            output.restore();
+        }
+    });
+});

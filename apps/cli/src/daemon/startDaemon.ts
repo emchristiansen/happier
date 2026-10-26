@@ -32,6 +32,7 @@ import { createConnectedServiceCredentialApi } from '@/api/connectedServices/con
 import { resolveRoutedUsageLimitRecoveryResumePromptMode } from '@/session/usageLimitRecoveryControls/resolveRoutedUsageLimitRecoveryResumePromptMode';
 import type { ApiMachineClient } from '@/api/apiMachine';
 import { fetchAccountProfile } from '@/api/accountProfile';
+import { createKeyedFollowUpRuns } from '@/utils/keyedFollowUpRuns';
 import { applyInitialTranscriptAfterSeqToAttachPayload } from '@/daemon/sessionEncryption/applyInitialTranscriptAfterSeqToAttachPayload';
 import { TrackedSession } from './types';
 import { MachineMetadata, DaemonState, type Metadata } from '@/api/types';
@@ -402,7 +403,7 @@ import { logConnectedServiceDaemonRestartDiagnostic } from './connectedServices/
 import { logConnectedServiceAuthSwitchResult } from './connectedServices/sessionAuthSwitch/logConnectedServiceAuthSwitchResult';
 import { resolveSharedStateRequiredSwitchContinuity } from './connectedServices/sessionAuthSwitch/resolveSharedStateRequiredSwitchContinuity';
 import { resolveUnsupportedSwitchContinuityErrorCode } from './connectedServices/sessionAuthSwitch/diagnostics/resolveUnsupportedSwitchContinuityErrorCode';
-import { createSessionConnectedServiceAuthHotApply } from './connectedServices/sessionAuthSwitch/sessionConnectedServiceAuthHotApply';
+import { createSessionConnectedServiceAuthHotApply, type HotApplyRestartRequirement } from './connectedServices/sessionAuthSwitch/sessionConnectedServiceAuthHotApply';
 import { createSessionConnectedServiceAccountAdoptionVerifier } from './connectedServices/accountTransitions/createSessionConnectedServiceAccountAdoptionVerifier';
 import { resolveInactiveConnectedServiceSessionForAuthSwitch } from './connectedServices/sessionAuthSwitch/resolveInactiveConnectedServiceSessionForAuthSwitch';
 import { dispatchConnectedServiceCredentialHealthNotificationAsync } from './connectedServices/notifications/dispatchConnectedServiceCredentialHealthNotification';
@@ -2493,16 +2494,35 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         let connectedServiceProjectionReconciliationBaseline: ConnectedServiceProjectionSnapshot | null = null;
         let connectedServiceProjectionEpoch = 0;
         const lastReconciledProjectionEpochByRuntimeTarget = new WeakMap<ConnectedServiceRuntimeTarget, number>();
-        const activeRegistrationReconciliationByRuntimeTarget = new WeakMap<ConnectedServiceRuntimeTarget, Promise<void>>();
-        const fetchConnectedServiceProjectionSnapshot = async (): Promise<ConnectedServiceProjectionSnapshot> => {
-          const profile = await fetchAccountProfile({ token: credentials.token });
-          const snapshot = parseConnectedServiceProjectionSnapshot({
-            connectedServicesV2: profile.connectedServicesV2,
-            connectedServiceCredentialRevisionsV1: profile.connectedServiceCredentialRevisionsV1,
-          });
-          latestConnectedServiceProjectionSnapshot = snapshot;
-          return snapshot;
-        };
+        // Profile-fetch owner for forced runtime-target registration reconciliation (startup readiness,
+        // runtime-auth recovery): one active GET and one queued follow-up. A caller that arrives while
+        // a GET is in flight does not take that GET's answer (it was requested before the caller, e.g.
+        // before a credential rotation or group switch the caller must observe); it shares the single
+        // queued follow-up GET, which starts after the in-flight one settles and therefore after the
+        // caller. Forced GETs publish to `latestConnectedServiceProjectionSnapshot` in order relative to
+        // each other. Other profile GETs, such as ApiMachineClient's projection-change notification
+        // fetch, are not owned here: they can overlap these, and the notification path can replace
+        // `latestConnectedServiceProjectionSnapshot` before a forced caller reads it.
+        const accountProfileProjectionSnapshotFetches = createKeyedFollowUpRuns<
+          'account_profile',
+          null,
+          ConnectedServiceProjectionSnapshot
+        >({
+          run: async () => {
+            const profile = await fetchAccountProfile({ token: credentials.token });
+            const snapshot = parseConnectedServiceProjectionSnapshot({
+              connectedServicesV2: profile.connectedServicesV2,
+              connectedServiceCredentialRevisionsV1: profile.connectedServiceCredentialRevisionsV1,
+            });
+            latestConnectedServiceProjectionSnapshot = snapshot;
+            return snapshot;
+          },
+        });
+        const fetchConnectedServiceProjectionSnapshot = async (): Promise<ConnectedServiceProjectionSnapshot> => (
+          await accountProfileProjectionSnapshotFetches.request('account_profile', null, {
+            requireStartAfterRequest: true,
+          })
+        );
         const resolveRuntimeGenerationApplicationProofs = createRuntimeGenerationApplicationProofResolver({
           resolveLifecycleDescriptor: resolveConnectedServiceCredentialLifecycleDescriptor,
           getCurrentGroup: async (group) => await api.getConnectedServiceAuthGroup(group),
@@ -2556,48 +2576,56 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           });
           if (isCurrent()) lastReconciledProjectionEpochByRuntimeTarget.set(target, reconciliationEpoch);
         };
+        const describeRuntimeTargetRegistrationKey = (registration: ConnectedServiceRuntimeTargetRegistration): string => (
+          registration.key.kind === 'session' ? `session:${registration.key.pid}` : `run:${registration.key.runKey}`
+        );
+        // Per runtime target: at most one active reconciliation plus one queued forced follow-up.
+        // A forced request (startup readiness, runtime-auth recovery) must observe a reconciliation
+        // that started after it, so while a run is active it joins the single follow-up instead of
+        // appending a run of its own; a passive request joins the active run.
+        const runtimeTargetRegistrationReconciliations = createKeyedFollowUpRuns<
+          ConnectedServiceRuntimeTarget,
+          ConnectedServiceRuntimeTargetRegistration,
+          void
+        >({
+          run: async ({ inputs, kind, servesStartAfterRequest }) => {
+            const registrationsByKey = new Map<string, ConnectedServiceRuntimeTargetRegistration>();
+            for (const registration of inputs) {
+              if (kind === 'follow_up' && !connectedServiceRuntimeRegistry.isCurrentTargetRegistration(registration)) continue;
+              registrationsByKey.set(describeRuntimeTargetRegistrationKey(registration), registration);
+            }
+            const registrations = Array.from(registrationsByKey.values());
+            const lastRegistration = registrations.at(-1);
+            if (!lastRegistration) return;
+            try {
+              if (servesStartAfterRequest && !connectedServiceAuthGroupGenerationConsumer) {
+                throw new Error('connected_service_generation_consumer_unavailable');
+              }
+              const snapshot = servesStartAfterRequest
+                ? await fetchConnectedServiceProjectionSnapshot()
+                : latestConnectedServiceProjectionSnapshot;
+              if (!snapshot) return;
+              for (const registration of registrations) {
+                await reconcileConnectedServiceRuntimeTargetRegistrationNow(registration, snapshot);
+              }
+            } catch (error) {
+              logger.warn('[DAEMON RUN] Connected-service runtime registration reconciliation failed', {
+                key: lastRegistration.key,
+                pid: lastRegistration.target.pid,
+                sessionId: lastRegistration.target.sessionId,
+                kind,
+                error: serializeAxiosErrorForLog(error),
+              });
+              throw error;
+            }
+          },
+        });
         const enqueueConnectedServiceRuntimeTargetRegistrationReconciliation = (
           registration: ConnectedServiceRuntimeTargetRegistration,
           force = false,
-        ): Promise<void> => {
-          const active = activeRegistrationReconciliationByRuntimeTarget.get(registration.target);
-          if (active) {
-            if (!force) return active;
-            const continueForcedReconciliation = async () => {
-              if (!connectedServiceRuntimeRegistry.isCurrentTargetRegistration(registration)) return;
-              await enqueueConnectedServiceRuntimeTargetRegistrationReconciliation(registration, true);
-            };
-            return active.then(
-              continueForcedReconciliation,
-              continueForcedReconciliation,
-            );
-          }
-          const reconciliation = Promise.resolve().then(async () => {
-            if (force && !connectedServiceAuthGroupGenerationConsumer) {
-              throw new Error('connected_service_generation_consumer_unavailable');
-            }
-            const snapshot = force
-              ? await fetchConnectedServiceProjectionSnapshot()
-              : latestConnectedServiceProjectionSnapshot;
-            if (!snapshot) return;
-            await reconcileConnectedServiceRuntimeTargetRegistrationNow(registration, snapshot);
-          });
-          activeRegistrationReconciliationByRuntimeTarget.set(registration.target, reconciliation);
-          void reconciliation.finally(() => {
-            if (activeRegistrationReconciliationByRuntimeTarget.get(registration.target) === reconciliation) {
-              activeRegistrationReconciliationByRuntimeTarget.delete(registration.target);
-            }
-          }).catch(() => {});
-          void reconciliation.catch((error) => {
-            logger.warn('[DAEMON RUN] Connected-service runtime registration reconciliation failed', {
-              key: registration.key,
-              pid: registration.target.pid,
-              sessionId: registration.target.sessionId,
-              error: serializeAxiosErrorForLog(error),
-            });
-          });
-          return reconciliation;
-        };
+        ): Promise<void> => runtimeTargetRegistrationReconciliations.request(registration.target, registration, {
+          requireStartAfterRequest: force,
+        });
         const connectedServiceRuntimeRegistrationCleanup = connectedServiceRuntimeRegistry.onTargetRegistration(
           (registration) => {
             if (!shouldReconcileConnectedServiceRuntimeTargetRegistration({
@@ -5076,6 +5104,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           profileId?: string | null;
           groupId?: string | null;
           generation?: number | null;
+          credentialRevision?: string;
         }>): ConnectedServiceSwitchTarget => ({
           serviceId: typeof input.serviceId === 'string' ? input.serviceId : '',
           profileId: typeof input.profileId === 'string' ? input.profileId : '',
@@ -5083,6 +5112,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           generation: typeof input.generation === 'number' && Number.isFinite(input.generation)
             ? Math.max(0, Math.trunc(input.generation))
             : 0,
+          ...(input.credentialRevision === undefined ? {} : { credentialRevision: input.credentialRevision }),
         });
 
         const requestConnectedServiceRestartWithDeferral = async (input: Readonly<{
@@ -5096,7 +5126,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           transcriptEventOwner: ConnectedServiceRestartRequestedTranscriptEventOwner;
           onSignalFailureLogMessage: string;
           awaitPreviousRunnerRetirement?: boolean;
-        }>): Promise<Readonly<{ signaled: boolean }>> => {
+          shouldSignal?: () => boolean | Promise<boolean>;
+        }>): Promise<Readonly<{ signaled: boolean; notSignaledReason?: PlannedRunnerRestartNotSignaledReason }>> => {
           // K5:gated_restart connected-service restarts route through the generic planned runner
           // restart primitive, preserving deferral, stale-owner checks, PID reservation, and respawn.
           const completionWaiter = input.awaitPreviousRunnerRetirement
@@ -5116,7 +5147,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               },
               restartRequestedPids: connectedServicesRestartRequestedPids,
               pidToTrackedSession,
-              canSignal: () => resolveSessionRunnerActivityDisabledReason(input.sessionId) ?? true,
+              canSignal: async () => {
+                 if (input.shouldSignal && !await input.shouldSignal()) return false;
+                 return resolveSessionRunnerActivityDisabledReason(input.sessionId) ?? true;
+               },
               requestSignal: async ({ shouldSignal, onSignalFailure, onProcessAlreadyMissing }) =>
                 // K5:gated_restart raw signal is owned by planned runner restart deferral/reservation.
                 await requestConnectedServiceSessionRestartSignal({
@@ -5300,6 +5334,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           ok: boolean;
           action?: string;
           errorCode?: string;
+          restartRequirement?: HotApplyRestartRequirement;
           // Failure diagnostics OR the INC-6 success continuity proof for switch telemetry.
           diagnostics?: SessionConnectedServiceAuthSwitchDiagnostics | Readonly<{ continuity: ConnectedServiceResumeContinuityProofDiagnostics }>;
         }>> => {
@@ -5619,6 +5654,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             : {
                 ok: false,
                 errorCode: result.errorCode,
+                ...(result.restartRequirement ? { restartRequirement: result.restartRequirement } : {}),
                 ...(result.diagnostics ? { diagnostics: result.diagnostics } : {}),
               };
         };
@@ -7469,9 +7505,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 routedThroughGatedPrimitive: true,
               });
               // K5:gated_restart refresh/reconnect restart deferred until turn boundary,
-              // reachability re-verified at respawn (no raw mid-turn SIGTERM). The handler reserves
-              // the pid only when the gated restart actually signalled; a superseded/cancelled
-              // deferral returns { signaled: false } so the reservation is not leaked.
+              // reachability re-verified at respawn (no raw mid-turn SIGTERM). The canonical planned
+              // owner alone reserves and releases restart intent. A joined or cancelled caller's own
+              // { signaled: false } result does not authorize cleanup of another owner's reservation.
               return await requestConnectedServiceRestartWithDeferral({
                 sessionId: signalParams.sessionId ?? signalParams.tracked.happySessionId ?? '',
                 tracked: signalParams.tracked,
@@ -7482,8 +7518,11 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   profileId: signalParams.target.profileId,
                   groupId: signalParams.target.groupId,
                   generation: signalParams.target.generation,
+                  ...(signalParams.target.credentialRevision === undefined
+                    ? {} : { credentialRevision: signalParams.target.credentialRevision }),
                 }),
                 restartSignalDelayMs: signalParams.delayMs,
+                shouldSignal: signalParams.shouldSignal,
                 restartDiagnostic: signalParams.restartDiagnostic ?? {
                   trigger: 'refresh_triggered_restart',
                   sessionId: signalParams.sessionId,
@@ -7516,6 +7555,43 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       > = createRefreshedConnectedServiceAuthUpdatedHandler({
         applyRefreshedAuth: applyRefreshedConnectedServiceAuth,
         restartAfterAuthUpdated,
+        captureRestartTarget: (target) => {
+          const tracked = pidToTrackedSession.get(target.pid);
+          const sessionId = target.sessionId;
+          if (!tracked || !sessionId || tracked.happySessionId !== sessionId) return null;
+          const isLocallyCurrent = (requirement: HotApplyRestartRequirement): boolean => {
+            const runtime = connectedServiceRuntimeRegistry.getByPid(target.pid);
+            if (pidToTrackedSession.get(target.pid) !== tracked || tracked.happySessionId !== sessionId
+              || stopSessionInFlightBySessionId.has(sessionId)
+              || runtime?.sessionId !== sessionId || runtime.runtimeIdentityKey !== target.runtimeIdentityKey
+              || runtime.agentId !== target.agentId) return false;
+            const current = findConnectedServiceChildSelection(tracked.spawnOptions?.environmentVariables ?? {}, requirement.serviceId);
+            const captured = target.selectionsByServiceId.get(requirement.serviceId);
+            const matches = (selection: typeof current): boolean => selection !== null && selection !== undefined && (
+              selection.kind === 'profile'
+                ? requirement.groupId === null && requirement.generation === null && selection.profileId === requirement.profileId
+                : selection.groupId === requirement.groupId && selection.activeProfileId === requirement.profileId && selection.generation === requirement.generation
+            );
+            return matches(current) && matches(captured ?? null);
+          };
+          return {
+            tracked,
+            isCurrent: async (requirement) => {
+              if (!isLocallyCurrent(requirement) || requirement.profileId === null || requirement.credentialRevision === null) return false;
+              const authoritative = requirement.groupId !== null && requirement.generation !== null
+                ? await validateConnectedServiceGroupMutationCurrentness({
+                    serviceId: requirement.serviceId, profileId: requirement.profileId,
+                    groupId: requirement.groupId, generation: requirement.generation,
+                    credentialRevision: requirement.credentialRevision,
+                  }).then((result) => result.current).catch(() => false)
+                : await resolveConnectedServiceCredentialsWithRevisions({
+                    api, credentials, bindings: [{ serviceId: requirement.serviceId, profileId: requirement.profileId }],
+                  }).then((records) => records.get(requirement.serviceId)?.credentialRevision === requirement.credentialRevision).catch(() => false);
+              // The authoritative read yields; never let its result authorize a replacement runner.
+              return authoritative && isLocallyCurrent(requirement);
+            },
+          };
+        },
         sessionLocks: connectedServiceSessionAuthSwitchLocks,
         // The live switch owner rewrites this environment when it switches the session.
         readCurrentSelection: (sessionId, serviceId) => {
@@ -7526,7 +7602,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         },
         onRestartRequired: (diagnostic) => {
           logger.warn(
-            '[DAEMON RUN] Refreshed connected-service credential could not be hot-applied; left to the lifecycle restart policy',
+            '[DAEMON RUN] Refreshed connected-service credential could not be hot-applied; restart requirement diagnostic',
             diagnostic,
           );
         },

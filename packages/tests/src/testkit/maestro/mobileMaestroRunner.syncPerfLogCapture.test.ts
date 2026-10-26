@@ -21,6 +21,41 @@ function createLogcatProcess(): MockLogcatProcess {
     return process;
 }
 
+const pendingLogcatCloses = new Set<() => void>();
+
+function mockExitThenClose(
+    child: MockLogcatProcess,
+    scheduleClose: (callback: () => void) => () => void = (callback) => {
+        const timer = setTimeout(callback, 0);
+        return () => clearTimeout(timer);
+    },
+): void {
+    let active = true;
+    let scheduled = false;
+    let cancelClose: (() => void) | undefined;
+    const dispose = () => {
+        active = false;
+        cancelClose?.();
+        pendingLogcatCloses.delete(dispose);
+    };
+    pendingLogcatCloses.add(dispose);
+    child.kill = vi.fn(() => {
+        if (scheduled) return true;
+        scheduled = true;
+        queueMicrotask(() => {
+            if (!active) return;
+            child.emit('exit', 0);
+            cancelClose = scheduleClose(() => {
+                if (!active) return;
+                dispose();
+                child.stdout.write('05-04 13:00:01.000 1 1 I ReactNativeJS: [sync-perf] {"events":["after-exit"]}\n');
+                child.emit('close', 0);
+            });
+        });
+        return true;
+    });
+}
+
 const spawnMock = vi.fn((
     _command: string,
     _args: string[],
@@ -34,6 +69,7 @@ vi.mock('node:child_process', () => ({
 
 describe('mobileMaestroRunner sync performance log capture', () => {
     afterEach(() => {
+        for (const dispose of pendingLogcatCloses) dispose();
         logcatProcess.stdout.destroy();
         logcatProcess.stderr.destroy();
         logcatProcess.removeAllListeners();
@@ -55,9 +91,9 @@ describe('mobileMaestroRunner sync performance log capture', () => {
     });
 
     it('captures Android logcat into the run manifest for sync-perf parser discovery', async () => {
-        logcatProcess = createLogcatProcess();
-        logcatProcess.kill = vi.fn(() => {
-            queueMicrotask(() => logcatProcess.emit('close', 0));
+        const child = logcatProcess = createLogcatProcess();
+        child.kill = vi.fn(() => {
+            queueMicrotask(() => child.emit('close', 0));
             return true;
         });
         spawnMock.mockClear();
@@ -65,7 +101,7 @@ describe('mobileMaestroRunner sync performance log capture', () => {
         const { runMobileMaestro } = await import('./mobileMaestroRunner');
 
         const runMaestro = vi.fn(async () => {
-            logcatProcess.stdout.write('05-04 13:00:00.000 1 1 I ReactNativeJS: [sync-perf] {"events":[]}\n');
+            child.stdout.write('05-04 13:00:00.000 1 1 I ReactNativeJS: [sync-perf] {"events":[]}\n');
             return { exitCode: 0 };
         });
 
@@ -118,17 +154,8 @@ describe('mobileMaestroRunner sync performance log capture', () => {
     });
 
     it('waits for Android logcat close before finalizing the log artifact', async () => {
-        logcatProcess = createLogcatProcess();
-        logcatProcess.kill = vi.fn(() => {
-            queueMicrotask(() => {
-                logcatProcess.emit('exit', 0);
-                setTimeout(() => {
-                    logcatProcess.stdout.write('05-04 13:00:01.000 1 1 I ReactNativeJS: [sync-perf] {"events":["after-exit"]}\n');
-                    logcatProcess.emit('close', 0);
-                }, 0);
-            });
-            return true;
-        });
+        const child = logcatProcess = createLogcatProcess();
+        mockExitThenClose(child);
         spawnMock.mockClear();
 
         const { runMobileMaestro } = await import('./mobileMaestroRunner');
@@ -165,11 +192,92 @@ describe('mobileMaestroRunner sync performance log capture', () => {
         expect(readFileSync(`${result.runDir}/android-logcat.log`, 'utf8')).toContain('after-exit');
     });
 
-    it('escalates Android logcat shutdown before resolving when the child ignores SIGTERM', async () => {
-        logcatProcess = createLogcatProcess();
-        logcatProcess.kill = vi.fn((signal?: string) => {
+    it('keeps a delayed old logcat close from closing its successor', async () => {
+        const { runMobileMaestro } = await import('./mobileMaestroRunner');
+        const previous = logcatProcess = createLogcatProcess();
+        const previousClose = vi.fn();
+        previous.on('close', previousClose);
+        const heldCloses: Array<() => void> = [];
+        let onCloseScheduled!: () => void;
+        const closeScheduled = new Promise<void>((resolve) => { onCloseScheduled = resolve; });
+        mockExitThenClose(previous, (callback) => {
+            heldCloses.push(callback);
+            onCloseScheduled();
+            return vi.fn();
+        });
+        const params = {
+            argv: [
+                'node', 'script', '--platform', 'android',
+                '--flows', 'suites/mobile-e2e/flows/F12.populatedRelaySessionPerformanceSmoke.yaml',
+                '--appId', 'dev.happier.app.internaldev',
+                '--serverUrl', 'http://127.0.0.1:52753', '--skip-app-install-check',
+            ],
+            cwd: process.cwd(),
+            env: {
+                ...process.env,
+                HAPPIER_E2E_MOBILE_MANAGE_METRO: '0',
+                HAPPIER_E2E_ANDROID_PRIME_APP_LAUNCH: '0',
+                HAPPIER_E2E_MOBILE_CONNECTED_MACHINE_MODE: '',
+                HAPPIER_E2E_ANDROID_LOGCAT_CAPTURE: '1',
+                HAPPIER_E2E_ANDROID_LOGCAT_STOP_TIMEOUT_MS: '1',
+            },
+        };
+        const deps = {
+            runMaestro: vi.fn(async () => ({ exitCode: 0 })),
+            adbReversePorts: vi.fn(() => ({ enabled: false, reversedPorts: [] })),
+            primeAppLaunch: vi.fn(async () => {}),
+        };
+        const previousRun = runMobileMaestro(params, deps);
+        await closeScheduled;
+
+        const successor = logcatProcess = createLogcatProcess();
+        const successorWrite = vi.spyOn(successor.stdout, 'write');
+        const successorClose = vi.fn();
+        successor.on('close', successorClose);
+        let onSuccessorStopping!: () => void;
+        const successorStopping = new Promise<void>((resolve) => { onSuccessorStopping = resolve; });
+        let escalatedBeforeCompletion = false;
+        successor.kill = vi.fn((signal?: string) => {
+            if (signal === 'SIGTERM') onSuccessorStopping();
             if (signal === 'SIGKILL') {
-                queueMicrotask(() => logcatProcess.emit('close', 0));
+                escalatedBeforeCompletion = !successorSettled;
+                queueMicrotask(() => successor.emit('close', 0));
+            }
+            return true;
+        });
+        let successorSettled = false;
+        const successorRun = runMobileMaestro(params, deps).then((result) => {
+            successorSettled = true;
+            return result;
+        });
+        await successorStopping;
+        expect(successorSettled).toBe(false);
+        heldCloses[0]!();
+        heldCloses[0]!();
+        const closedByOldCallback = successorClose.mock.calls.length;
+        const [previousResult] = await Promise.all([previousRun, successorRun]);
+
+        expect(closedByOldCallback).toBe(0);
+        expect(successorWrite).not.toHaveBeenCalled();
+        const successorSignals = successor.kill.mock.calls.map(([signal]) => signal);
+        expect(successorSignals[0]).toBe('SIGTERM');
+        expect(successorSignals).toContain('SIGKILL');
+        expect(escalatedBeforeCompletion).toBe(true);
+        expect(successorClose).toHaveBeenCalledOnce();
+        expect(heldCloses).toHaveLength(1);
+        expect(previousClose).toHaveBeenCalledOnce();
+        expect(pendingLogcatCloses.size).toBe(0);
+        expect(readFileSync(`${previousResult.runDir}/android-logcat.log`, 'utf8')).toContain('after-exit');
+        previous.stdout.destroy();
+        previous.stderr.destroy();
+        previous.removeAllListeners();
+    });
+
+    it('escalates Android logcat shutdown before resolving when the child ignores SIGTERM', async () => {
+        const child = logcatProcess = createLogcatProcess();
+        child.kill = vi.fn((signal?: string) => {
+            if (signal === 'SIGKILL') {
+                queueMicrotask(() => child.emit('close', 0));
             }
             return true;
         });
@@ -213,9 +321,9 @@ describe('mobileMaestroRunner sync performance log capture', () => {
     });
 
     it('does not pass restore material to Android logcat capture', async () => {
-        logcatProcess = createLogcatProcess();
-        logcatProcess.kill = vi.fn(() => {
-            queueMicrotask(() => logcatProcess.emit('close', 0));
+        const child = logcatProcess = createLogcatProcess();
+        child.kill = vi.fn(() => {
+            queueMicrotask(() => child.emit('close', 0));
             return true;
         });
         spawnMock.mockClear();
@@ -257,9 +365,9 @@ describe('mobileMaestroRunner sync performance log capture', () => {
     });
 
     it('captures iOS simulator logs into the run manifest for sync-perf parser discovery', async () => {
-        logcatProcess = createLogcatProcess();
-        logcatProcess.kill = vi.fn(() => {
-            queueMicrotask(() => logcatProcess.emit('close', 0));
+        const child = logcatProcess = createLogcatProcess();
+        child.kill = vi.fn(() => {
+            queueMicrotask(() => child.emit('close', 0));
             return true;
         });
         spawnMock.mockClear();
@@ -267,7 +375,7 @@ describe('mobileMaestroRunner sync performance log capture', () => {
         const { runMobileMaestro } = await import('./mobileMaestroRunner');
 
         const runMaestro = vi.fn(async () => {
-            logcatProcess.stdout.write('ReactNativeJS: [sync-perf] {"events":["ios"]}\n');
+            child.stdout.write('ReactNativeJS: [sync-perf] {"events":["ios"]}\n');
             return { exitCode: 0 };
         });
 
@@ -316,10 +424,10 @@ describe('mobileMaestroRunner sync performance log capture', () => {
     });
 
     it('escalates iOS simulator log shutdown before resolving when the child ignores SIGTERM', async () => {
-        logcatProcess = createLogcatProcess();
-        logcatProcess.kill = vi.fn((signal?: string) => {
+        const child = logcatProcess = createLogcatProcess();
+        child.kill = vi.fn((signal?: string) => {
             if (signal === 'SIGKILL') {
-                queueMicrotask(() => logcatProcess.emit('close', 0));
+                queueMicrotask(() => child.emit('close', 0));
             }
             return true;
         });

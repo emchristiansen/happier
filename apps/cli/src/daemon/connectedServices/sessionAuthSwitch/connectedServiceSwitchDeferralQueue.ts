@@ -16,6 +16,8 @@ export type ConnectedServiceSwitchTarget = Readonly<{
   profileId: string;
   groupId: string;
   generation: number;
+  /** Exact opaque identity of a typed failed-adapter restart requirement. */
+  credentialRevision?: string;
 }>;
 
 export type ConnectedServiceTurnLifecycleEvent =
@@ -93,6 +95,7 @@ function normalizeTarget(target: ConnectedServiceSwitchTarget): ConnectedService
     profileId: String(target.profileId ?? '').trim(),
     groupId: String(target.groupId ?? '').trim(),
     generation: Number.isFinite(target.generation) ? Math.max(0, Math.trunc(target.generation)) : 0,
+    ...(target.credentialRevision === undefined ? {} : { credentialRevision: target.credentialRevision }),
   };
 }
 
@@ -100,7 +103,8 @@ function isSameTarget(a: ConnectedServiceSwitchTarget, b: ConnectedServiceSwitch
   return a.serviceId === b.serviceId
     && a.profileId === b.profileId
     && a.groupId === b.groupId
-    && a.generation === b.generation;
+    && a.generation === b.generation
+    && a.credentialRevision === b.credentialRevision;
 }
 
 function isOlderGeneration(input: Readonly<{

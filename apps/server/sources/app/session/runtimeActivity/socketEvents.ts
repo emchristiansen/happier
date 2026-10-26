@@ -19,6 +19,7 @@ import {
 
 import type { SessionParticipantCursor } from '@/app/session/changeTracking/markSessionParticipantsChanged';
 import { publishSessionPublisherLifecycleUpdate } from '@/app/session/runtimeActivity/publishPublisherLifecycleUpdate';
+import { RELEASED_ALIVE_PERSISTENCE_INTERVAL_MS } from '@/app/session/runtimeActivity/releasedAliveTiming';
 import { emitPendingActivationWake } from '@/app/presence/pendingActivationWake';
 import type { createSessionPublisherPresence } from '@/app/presence/sessionPublisherPresence';
 import { describeLoggableError } from '@/utils/logging/describeLoggableError';
@@ -31,7 +32,6 @@ type RuntimeActivitySnapshotEventSocket = Readonly<{
 type RuntimeActivitySnapshotPresence = ReturnType<typeof createSessionPublisherPresence>;
 
 const releasedAliveOperationTails = new WeakMap<object, Promise<void>>();
-const RELEASED_ALIVE_PERSISTENCE_INTERVAL_MS = 60_000;
 /**
  * Backoff after an attempt that did not persist. The first unproductive attempt retries on the very
  * next heartbeat so a one-off transient failure recovers immediately; consecutive ones back off
