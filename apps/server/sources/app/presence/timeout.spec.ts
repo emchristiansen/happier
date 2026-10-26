@@ -60,11 +60,33 @@ describe("presence timeout config", () => {
     it("accepts env overrides", async () => {
         const { resolvePresenceTimeoutConfig } = await importTimeoutModule();
         const config = resolvePresenceTimeoutConfig({
-            HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: "35000",
+            HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: "75000",
             HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: "45000",
             HAPPIER_PRESENCE_TIMEOUT_TICK_MS: "1000",
         });
-        expect(config).toEqual({ sessionTimeoutMs: 35_000, machineTimeoutMs: 45_000, tickMs: 1_000 });
+        expect(config).toEqual({ sessionTimeoutMs: 75_000, machineTimeoutMs: 45_000, tickMs: 1_000 });
+    });
+
+    it.each([1, 59_999, 60_000])("rejects a session timeout of %i ms that cannot outlast released heartbeat persistence", async (timeoutMs) => {
+        const { resolvePresenceTimeoutConfig } = await importTimeoutModule();
+        expect(() => resolvePresenceTimeoutConfig({
+            HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: String(timeoutMs),
+        })).toThrow(/HAPPIER_PRESENCE_SESSION_TIMEOUT_MS.*60000/);
+    });
+
+    it("accepts a session timeout just above the persistence floor without changing machine or tick bounds", async () => {
+        const { resolvePresenceTimeoutConfig } = await importTimeoutModule();
+        expect(resolvePresenceTimeoutConfig({
+            HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: "60001",
+            HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: "1",
+            HAPPIER_PRESENCE_TIMEOUT_TICK_MS: "1",
+        })).toEqual({ sessionTimeoutMs: 60_001, machineTimeoutMs: 1, tickMs: 1 });
+    });
+
+    it.each(["0", "-1"])("retains the existing fallback for nonpositive session timeout %s", async (value) => {
+        const { resolvePresenceTimeoutConfig } = await importTimeoutModule();
+        expect(resolvePresenceTimeoutConfig({ HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: value }).sessionTimeoutMs)
+            .toBe(600_000);
     });
 
     it("falls back when env is invalid", async () => {
