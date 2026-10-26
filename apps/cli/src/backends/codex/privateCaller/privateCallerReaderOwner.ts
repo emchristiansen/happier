@@ -21,47 +21,87 @@ export type PrivateCallerReaderOwner = CodexAppServerPrivateIoOwner & Readonly<{
     close: () => Promise<void>;
 }>;
 
+export type PrivateCallerReceiverTerminal =
+    | Readonly<{ kind: 'closed' }>
+    | Readonly<{
+        kind: 'failed';
+        error: unknown;
+        custody: Readonly<{ kind: 'captured' }> | Readonly<{ kind: 'failed'; error: unknown }>;
+        notification: Readonly<{ kind: 'sent' }> | Readonly<{ kind: 'failed'; error: unknown }>;
+    }>;
+
 /** Attach the real private receiver before native startup. The endpoint itself
- * fixes the recipient; an ID, path or claimed role never selects another one. */
+ * fixes the recipient; an ID, path or claimed role never selects another one.
+ * Keep this handle: terminal retains the original failure even if the recorder
+ * or structured clone cannot accept it. Terminal is not callback cancellation. */
 export function bindPrivateCallerReceiver(
     port: MessagePort,
     receive: (event: CodexAppServerPrivateIoEvent) => void | Promise<void>,
-): () => void {
+    recording: CodexAppServerPrivateIoOwner,
+): (() => void) & Readonly<{ terminal: Promise<PrivateCallerReceiverTerminal> }> {
     let queue = Promise.resolve();
     let closed = false;
+    let settle!: (result: PrivateCallerReceiverTerminal) => void;
+    const terminal = new Promise<PrivateCallerReceiverTerminal>((resolve) => { settle = resolve; });
+    const finish = (result: PrivateCallerReceiverTerminal) => {
+        if (!closed) {
+            closed = true;
+            port.off('message', onMessage);
+            port.off('close', onClose);
+            port.close();
+        }
+        if (result.kind === 'failed') settle(result);
+        else {
+            // A closed channel does not cancel a callback already running. If
+            // it later fails, retain that original failure before settling.
+            void queue.then(() => settle(result));
+        }
+    };
+    const onClose = () => finish({ kind: 'closed' });
+    const failed = (error: unknown) => {
+        let custody: Extract<PrivateCallerReceiverTerminal, { kind: 'failed' }>['custody'];
+
+        try {
+            // Record the original value before attempting transport. Neither a
+            // clone failure nor the channel's closure replaces that value.
+            recording.capture({ kind: 'failure', operation: 'private receiver callback', error });
+            custody = { kind: 'captured' };
+        } catch (custodyError) { custody = { kind: 'failed', error: custodyError }; }
+        const notification = (() => {
+            try {
+                port.postMessage({ wire, kind: 'failed', error });
+                return { kind: 'sent' } as const;
+            } catch (notificationError) { return { kind: 'failed', error: notificationError } as const; }
+        })();
+        // Closing the channel notifies the owner even when the full error
+        // cannot cross it. The local terminal handle retains both failures.
+        finish({ kind: 'failed', error, custody, notification });
+    };
     const onMessage = (value: unknown) => {
         if (closed) return;
         if (!value || typeof value !== 'object' || !('wire' in value) || value.wire !== wire || !('kind' in value)) {
-            closed = true;
-            port.close();
+            finish({ kind: 'closed' });
             return;
         }
         if (value.kind === 'install' && 'nonce' in value && typeof value.nonce === 'string') {
-            port.postMessage({ wire, kind: 'ready', nonce: value.nonce });
+            try { port.postMessage({ wire, kind: 'ready', nonce: value.nonce }); }
+            catch (error) { failed(error); }
         } else if (value.kind === 'event' && 'sequence' in value && typeof value.sequence === 'number' && 'event' in value) {
             const { sequence, event } = value;
             // Only the opposite, retained owner can write this private port.
             queue = queue.then(async () => {
-                if (closed) throw new PrivateCallerReaderError('reader_closed');
+                if (closed) return;
                 await receive(event as CodexAppServerPrivateIoEvent);
-                port.postMessage({ wire, kind: 'accepted', sequence });
-            }).catch((error: unknown) => {
-                closed = true;
-                port.postMessage({ wire, kind: 'failed', error });
-                port.close();
-            });
+                if (!closed) port.postMessage({ wire, kind: 'accepted', sequence });
+            }).catch(failed);
         } else {
-            closed = true;
-            port.close();
+            finish({ kind: 'closed' });
         }
     };
     port.on('message', onMessage);
+    port.on('close', onClose);
     port.start();
-    return () => {
-        closed = true;
-        port.off('message', onMessage);
-        port.close();
-    };
+    return Object.assign(() => finish({ kind: 'closed' }), { terminal });
 }
 
 /** Install exactly the original continuation and Eric's private receiver.
@@ -170,11 +210,12 @@ export async function createPrivateCallerReaderOwner(params: Readonly<{
         port.postMessage({ wire, kind: 'event', sequence: ordinal, event });
     };
     const capture = (event: CodexAppServerPrivateIoEvent) => {
-        requireOpen();
         try {
             // Full private custody precedes decoding or receiver publication.
             recording.capture(event);
-            requireOpen();
+            // The original producer still owns shutdown output after audience
+            // loss. Keep its custody without admitting another publication.
+            if (phase !== 'open') return;
             const ordinal = ++sequence;
             let resolve!: () => void;
             let reject!: (error: unknown) => void;
@@ -211,7 +252,7 @@ export async function createPrivateCallerReaderOwner(params: Readonly<{
         subscribe(receiver: unknown) {
             requireOpen();
             if (receiver !== originalContinuation && receiver !== eric) throw new PrivateCallerReaderError('reader_not_authorized');
-            return Object.freeze({ deliver: capture });
+            return Object.freeze({ deliver(event: CodexAppServerPrivateIoEvent) { requireOpen(); capture(event); } });
         },
         revoke: abort,
         async close() {
