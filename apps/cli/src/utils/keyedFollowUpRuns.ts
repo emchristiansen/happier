@@ -18,12 +18,16 @@ export type KeyedFollowUpRunKind = 'initial' | 'follow_up';
 
 export type KeyedFollowUpRunContext<K, I> = Readonly<{
   key: K;
-  /** Inputs of every request this run serves, in arrival order. */
+  /**
+   * Inputs from the request that created an initial run, or from requests that created or joined a
+   * queued forced follow-up, in arrival order. Requests that only wait on an active run add no input.
+   */
   inputs: readonly I[];
   kind: KeyedFollowUpRunKind;
   /**
-   * True when a request served by this run asked for `requireStartAfterRequest` (always true for a
-   * follow-up). The run started after every request it serves either way.
+   * True when a request in this input cohort asked for `requireStartAfterRequest` (always true for a
+   * follow-up). The run started after every request in its input cohort. Requests that only wait on
+   * an already active run have no later-start guarantee.
    */
   servesStartAfterRequest: boolean;
 }>;

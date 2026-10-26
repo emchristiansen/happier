@@ -72,8 +72,8 @@ function resolveClaudeSubscriptionPlanLabel(record: ConnectedServiceCredentialRe
     : isRecord(raw?.['claude.ai_oauth'])
       ? raw['claude.ai_oauth']
       : null;
-  return normalizePlanLabel(claudeAiOauth?.subscriptionType)
-    ?? normalizePlanLabel(claudeAiOauth?.rateLimitTier);
+  return normalizePlanLabel(claudeAiOauth?.rateLimitTier)
+    ?? normalizePlanLabel(claudeAiOauth?.subscriptionType);
 }
 
 function buildCredentialBackoffKey(record: ConnectedServiceCredentialRecordV1): string | null {

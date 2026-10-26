@@ -266,6 +266,15 @@ describe('createSessionConnectedServiceAuthHotApply', () => {
       ok: false,
       errorCode: 'hot_apply_restart_required',
       serviceId: 'openai-codex',
+      restartRequirement: {
+        kind: 'restart_resume',
+        source: 'failed_adapter_hot_apply',
+        serviceId: 'openai-codex',
+        profileId: 'work',
+        groupId: null,
+        generation: null,
+        credentialRevision: null,
+      },
       serviceResultsByServiceId: {
         'openai-codex': { status: 'failed', errorCode: 'hot_apply_restart_required' },
       },
