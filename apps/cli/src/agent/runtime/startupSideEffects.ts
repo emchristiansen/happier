@@ -18,7 +18,12 @@ type DaemonReportDeps = {
     sleepFn?: (ms: number) => Promise<void>;
     nowFn?: () => number;
     retryTimeoutMs?: number;
+    /** First retry delay (backoff base). */
     retryIntervalMs?: number;
+    /** Retry delay cap; never below the base. */
+    retryMaxIntervalMs?: number;
+    /** Jitter source in [0, 1); injectable for tests. */
+    randomFn?: () => number;
     reportAttemptTimeoutMs?: number;
     onReported?: (opts: { sessionId: string }) => Promise<void> | void;
 };
@@ -71,6 +76,54 @@ function resolveDaemonReportRetryValue(raw: string | undefined, fallback: number
     const parsed = Number.parseInt(value, 10);
     if (!Number.isFinite(parsed)) return fallback;
     return Math.min(bounds.max, Math.max(bounds.min, parsed));
+}
+
+/**
+ * Retry spacing for the runner's `/session-started` report.
+ *
+ * After the n-th consecutive failed attempt the runner requests a sleep of nominal
+ * `min(cap, base * FACTOR^(n-1))`: with the defaults 250, 500, 1000, 2000 and 4000 ms after
+ * failures 1-5, and the 5 s cap from the 6th failure on. Jitter then scales the nominal value by
+ * `1 - JITTER_FRACTION * random`, i.e. into [nominal / 2, nominal], and finally the sleep is clamped
+ * to what remains of the retry budget, so the last sleep before the deadline can be shorter than
+ * half its nominal value. Every transient failure counts, including the daemon's 503
+ * `session_startup_reconciliation_failed`.
+ *
+ * These are requested sleeps only. Attempt count and elapsed time also depend on how long each
+ * request takes and on timer scheduling. The retry-window guard runs after a failed request,
+ * not before the next one, and its remaining time does not shorten the attempt timeout. Legacy
+ * reports can therefore start or finish beyond that window. Reports requiring acknowledgement
+ * also enforce a separate hard readiness ceiling: they check it before each attempt, cap its
+ * timeout, abort the whole attempt, and reject acknowledgements arriving at or after the ceiling.
+ *
+ * - base 250 ms (`HAPPIER_DAEMON_REPORT_SESSION_RETRY_INTERVAL_MS`, formerly the fixed interval): a
+ *   daemon that is simply not listening yet still gets answered within the first few hundred ms.
+ * - factor 2: the nominal sleep doubles per failure until the cap.
+ * - cap 5 s (`HAPPIER_DAEMON_REPORT_SESSION_RETRY_MAX_INTERVAL_MS`, raised to the base when lower):
+ *   a 503 means the daemon's startup reconciliation failed (a relay round trip with a 15 s
+ *   timeout failing is one cause; a missing generation consumer or another reconciliation error is
+ *   another), so retrying more often than every few seconds mostly repeats that work. The cap
+ *   bounds the requested sleep, not the time from daemon recovery to acknowledgement.
+ * - jitter down to half of the nominal sleep ("equal jitter"): runners started together by one
+ *   daemon spread their retries instead of arriving in waves, and apart from the budget clamp no
+ *   sleep drops below half its nominal value.
+ */
+const DAEMON_REPORT_RETRY_BASE_MS = 250;
+const DAEMON_REPORT_RETRY_FACTOR = 2;
+const DAEMON_REPORT_RETRY_MAX_MS = 5_000;
+const DAEMON_REPORT_RETRY_JITTER_FRACTION = 0.5;
+
+export function resolveDaemonReportRetryDelayMs(input: Readonly<{
+    consecutiveFailures: number;
+    baseMs: number;
+    maxMs: number;
+    random: number;
+}>): number {
+    const cap = Math.max(input.baseMs, input.maxMs);
+    const exponent = Math.min(Math.max(input.consecutiveFailures - 1, 0), 30);
+    const nominal = Math.min(cap, input.baseMs * DAEMON_REPORT_RETRY_FACTOR ** exponent);
+    const random = Math.min(Math.max(input.random, 0), 1);
+    return Math.round(nominal * (1 - DAEMON_REPORT_RETRY_JITTER_FRACTION * random));
 }
 
 function isTruthyEnvFlag(raw: string | undefined): boolean {
@@ -150,16 +203,24 @@ async function runDaemonSessionReport(
     const notifyFn = deps.notifyDaemonSessionStartedFn ?? notifyDaemonSessionStarted;
     const sleepFn = deps.sleepFn ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     const nowFn = deps.nowFn ?? (() => Date.now());
+    const randomFn = deps.randomFn ?? Math.random;
     const retryIntervalMs =
         deps.retryIntervalMs ??
-        resolveDaemonReportRetryValue(process.env.HAPPIER_DAEMON_REPORT_SESSION_RETRY_INTERVAL_MS, 250, {
+        resolveDaemonReportRetryValue(process.env.HAPPIER_DAEMON_REPORT_SESSION_RETRY_INTERVAL_MS, DAEMON_REPORT_RETRY_BASE_MS, {
             min: 50,
             max: 10_000,
+        });
+    const retryMaxIntervalMs =
+        deps.retryMaxIntervalMs ??
+        resolveDaemonReportRetryValue(process.env.HAPPIER_DAEMON_REPORT_SESSION_RETRY_MAX_INTERVAL_MS, DAEMON_REPORT_RETRY_MAX_MS, {
+            min: 50,
+            max: 60_000,
         });
 
     const startedAt = nowFn();
     let lastDaemonAnswerAt: number | null = null;
     let attempt = 0;
+    let consecutiveFailures = 0;
     while (true) {
         attempt += 1;
         const revision = state.revision;
@@ -207,7 +268,20 @@ async function runDaemonSessionReport(
             return now - startedAt >= retryTimeoutMs;
         };
         const pauseBeforeNextAttempt = async (): Promise<void> => {
-            await sleepFn(Math.min(retryIntervalMs, Math.max(0, remainingCeilingMs())));
+            consecutiveFailures += 1;
+            const delayMs = resolveDaemonReportRetryDelayMs({
+                consecutiveFailures,
+                baseMs: retryIntervalMs,
+                maxMs: retryMaxIntervalMs,
+                random: randomFn(),
+            });
+            // Use the same window as the exhaustion guard: a live readiness answer moves its
+            // origin, while an unanswered daemon keeps the original budget. Both obey the ceiling.
+            const windowStartedAt = state.requireDaemonAck && lastDaemonAnswerAt !== null
+                ? lastDaemonAnswerAt
+                : startedAt;
+            const remainingBudgetMs = Math.max(0, retryTimeoutMs - (nowFn() - windowStartedAt));
+            await sleepFn(Math.min(delayMs, remainingBudgetMs, Math.max(0, remainingCeilingMs())));
         };
 
         // The control client floors an explicit timeout at 100 ms and reads the daemon state before
