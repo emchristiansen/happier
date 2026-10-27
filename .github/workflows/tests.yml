@@ -954,14 +954,34 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22.x
-          cache: yarn
-          cache-dependency-path: yarn.lock
 
       - name: Setup Node (act)
         if: env.ACT == 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22.x
+
+      - name: Resolve Yarn cache inputs
+        id: yarn-cache-inputs
+        if: env.ACT != 'true'
+        shell: bash
+        env:
+          YARN_LOCK_HASH: ${{ hashFiles('yarn.lock') }}
+        run: |
+          set -euo pipefail
+          cache_path="$(yarn cache dir)"
+          test -n "$cache_path"
+          test -n "$YARN_LOCK_HASH"
+          node_arch="$(node -p 'process.arch')"
+          printf 'path=%s\narch=%s\nlock-hash=%s\n' "$cache_path" "$node_arch" "$YARN_LOCK_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Yarn dependency cache
+        if: env.ACT != 'true'
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684
+        with:
+          path: ${{ steps.yarn-cache-inputs.outputs.path }}
+          key: node-cache-${{ runner.os }}-${{ steps.yarn-cache-inputs.outputs.arch }}-yarn-${{ steps.yarn-cache-inputs.outputs.lock-hash }}
+          fail-on-cache-miss: false
 
       - name: Enable Corepack
         uses: ./.github/actions/enable-corepack-yarn
@@ -1116,8 +1136,26 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22.x
-          cache: yarn
-          cache-dependency-path: yarn.lock
+
+      - name: Resolve Yarn cache inputs
+        id: yarn-cache-inputs
+        shell: bash
+        env:
+          YARN_LOCK_HASH: ${{ hashFiles('yarn.lock') }}
+        run: |
+          set -euo pipefail
+          cache_path="$(yarn cache dir)"
+          test -n "$cache_path"
+          test -n "$YARN_LOCK_HASH"
+          node_arch="$(node -p 'process.arch')"
+          printf 'path=%s\narch=%s\nlock-hash=%s\n' "$cache_path" "$node_arch" "$YARN_LOCK_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Yarn dependency cache
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684
+        with:
+          path: ${{ steps.yarn-cache-inputs.outputs.path }}
+          key: node-cache-${{ runner.os }}-${{ steps.yarn-cache-inputs.outputs.arch }}-yarn-${{ steps.yarn-cache-inputs.outputs.lock-hash }}
+          fail-on-cache-miss: false
 
       - name: Enable Corepack
         uses: ./.github/actions/enable-corepack-yarn
