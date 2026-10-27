@@ -1,4 +1,5 @@
 import chalk from 'chalk';
+import { dirname } from 'node:path';
 
 import { createServerUrlComparableKey, type RestartSessionRunnerResultV1 } from '@happier-dev/protocol';
 
@@ -51,6 +52,7 @@ import { resolveDaemonServiceCliRuntimeFromEnv } from '@/daemon/service/cli';
 
 import type { CommandContext } from '@/cli/commandRegistry';
 import { writeJsonStdout } from '@/cli/output/jsonEnvelope';
+import { runDaemonSessionDebugLogCommand } from './daemonSessionDebugLog';
 
 async function printDaemonJson(payload: unknown): Promise<void> {
   await writeJsonStdout(payload);
@@ -86,6 +88,7 @@ ${chalk.bold('Usage:')}
   happier daemon restart [--takeover]  Restart the daemon (stop -> start)
   happier daemon restart --restart-session-runners  Restart the daemon, preserve sessions, then restart tracked session runners on the current CLI
   happier daemon restart-session-runners [--session-id <id>] [--dry-run] [--force-current-cli]  Restart eligible tracked session runners on the current CLI
+  happier daemon session-debug-log <on|off|status> <session-id>  Spawn that session's runner with HAPPIER_LOG_LEVEL=debug from its next start (other sessions unchanged)
   happier daemon stop               Stop a manual daemon (sessions stay alive; use happier service stop for installed background services)
   happier daemon stop --kill-sessions  Stop a manual daemon and its tracked sessions
   happier daemon stop --all         Stop daemons for all configured relays
@@ -208,6 +211,12 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
       console.log('No daemon running');
     }
     return;
+  }
+
+  if (daemonSubcommand === 'session-debug-log') {
+    process.exit(await runDaemonSessionDebugLogCommand(args.slice(2), {
+      daemonStateDir: dirname(configuration.daemonStateFile),
+    }));
   }
 
   if (daemonSubcommand === 'stop-session') {

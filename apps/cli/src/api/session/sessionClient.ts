@@ -557,6 +557,24 @@ export function classifySessionTransportErrorToProbeResult(
 
 const SESSION_CONNECTION_STATE_EVENT = 'session-connection-state';
 const SESSION_PRESENCE_RECONNECT_REASSERT_DELAY_MS = 2_000;
+// Bounded retry of a connected socket's setup after it returned false: 250 ms doubling to a 30 s
+// cap, ten attempts (about 92 s). After that, a pending-input pass or a reconnect starts setup.
+const SESSION_SOCKET_SETUP_RETRY_BASE_MS = 250;
+const SESSION_SOCKET_SETUP_RETRY_MAX_MS = 30_000;
+const SESSION_SOCKET_SETUP_MAX_CONNECT_ATTEMPTS = 10;
+
+/** One connection's setup: readiness convergence (retried on failure), then its completion steps once. */
+type ConnectedSessionSetup = {
+    readonly epoch: number;
+    readonly socket: Socket<ServerToClientEvents, ClientToServerEvents>;
+    readonly isReconnect: boolean;
+    /** Aborted when a newer connection replaces this one or the client starts closing. */
+    readonly lifetime: AbortController;
+    contractPrepared: boolean;
+    failedAttempts: number;
+    attempt: Promise<boolean> | null;
+    completion: Promise<void> | null;
+};
 // How long a `thinking=true` keepalive may persist against an already-terminal turn status
 // before the publisher self-heals it to idle. Comfortably longer than a new turn's
 // status-update lag, well under the UI's ~120s thinking-freshness window.
@@ -804,6 +822,8 @@ export class ApiSessionClient extends EventEmitter {
     private closeStarted = false;
     private pendingInputReadinessAbortController: AbortController | null = null;
     private convergePendingInputReadiness: ((onContractPrepared?: () => void) => Promise<boolean>) | null = null;
+    private ensureConnectedSessionSetupForPendingInput: (() => void) | null = null;
+    private retireConnectedSessionSetup: (() => void) | null = null;
     private changesSyncInFlight: Promise<void> | null = null;
     private readonly sessionChangesCursorByAccountId = new Map<string, number>();
     private accountIdPromise: Promise<string> | null = null;
@@ -1341,7 +1361,7 @@ export class ApiSessionClient extends EventEmitter {
         this.convergePendingInputReadiness = (onContractPrepared) => {
             const socket = currentTransportSocket;
             const epoch = this.sessionConnectionEpoch;
-            if (!socket || socket.connected !== true || this.closed || this.runtimeTerminationStarted) {
+            if (!socket || socket.connected !== true || this.closeStarted || this.closed || this.runtimeTerminationStarted) {
                 return Promise.resolve(false);
             }
             if (readinessConvergence?.epoch === epoch && readinessConvergence.socket === socket) {
@@ -1358,6 +1378,8 @@ export class ApiSessionClient extends EventEmitter {
                     && serverContract.socket === this.socket
                     && this.socket === currentTransportSocket
                     && this.socket.connected === true
+                    // close() aborts readiness once, at entry; no later step may re-establish it.
+                    && !this.closeStarted
                     && !this.closed
                     && !this.runtimeTerminationStarted
                 );
@@ -1430,6 +1452,149 @@ export class ApiSessionClient extends EventEmitter {
             readinessConvergence = { epoch, socket, promise };
             return promise;
         };
+        // Setup for the current connection: readiness convergence, then (once) the steps that need
+        // the converged contract. onConnected retries a failed convergence with bounded backoff, and
+        // a pending-input pass that finds no current contract starts another attempt, so a setup
+        // that returned false never leaves materialization in silent retryable_transport.
+        let connectedSessionSetup: ConnectedSessionSetup | null = null;
+        const isConnectedSessionSetupCurrent = (setup: ConnectedSessionSetup): boolean => (
+            setup === connectedSessionSetup
+            && setup.epoch === this.sessionConnectionEpoch
+            && setup.socket === this.socket
+            && this.socket.connected === true
+            && !setup.lifetime.signal.aborted
+            && !this.closeStarted
+            && !this.closed
+            && !this.runtimeTerminationStarted
+        );
+        const completeConnectedSessionSetup = async (setup: ConnectedSessionSetup): Promise<void> => {
+            // On publisher-fenced servers, converged readiness includes this connection's settled publisher claim.
+            this.observePendingPublisherClaim(setup.epoch);
+            this.reofferAcceptedCanonicalPendingDeliveries();
+            this.clearPendingDiscoveryTimer();
+            this.schedulePendingDiscovery();
+
+            await this.syncChangesOnConnect({ reason: setup.isReconnect ? 'reconnect' : 'connect' }).catch((error) => {
+                logger.debug('[API] Session changes sync on connect failed (non-fatal)', {
+                    error: serializeAxiosErrorForLog(error),
+                });
+            });
+            if (shouldSyncSessionSnapshotOnConnect({ metadataVersion: this.metadataVersion, agentStateVersion: this.agentStateVersion })) {
+                void this.syncSessionSnapshotFromServer({ reason: 'connect' });
+            }
+
+            await this.flushQueuedSessionMessagesOnReconnect().catch((error) => {
+                logger.debug('[API] Failed to replay queued session messages on reconnect', {
+                    error: serializeAxiosErrorForLog(error),
+                });
+            });
+
+            // A reconnect, or a setup that completed only on retry, can restore the negotiated
+            // materialization contract without changing the pending projection. Publish the
+            // canonical eligibility wake so a consumer that previously observed retryable
+            // transport re-runs against the healthy session generation instead of waiting for
+            // another queue mutation.
+            this.publishPendingEligibilityWake();
+        };
+        const attemptConnectedSessionSetup = (
+            setup: ConnectedSessionSetup,
+            trigger: 'connect' | 'pending_input',
+        ): Promise<boolean> => {
+            if (setup.completion) return Promise.resolve(true);
+            if (setup.attempt) return setup.attempt;
+            const attempt = (async () => {
+                let ready = false;
+                try {
+                    ready = await this.convergePendingInputReadiness?.(() => {
+                        if (setup.contractPrepared) return;
+                        setup.contractPrepared = true;
+                        if (this.shouldKeepUserSocketConnected()) {
+                            this.kickUserSocketConnect();
+                        }
+                        if (setup.isReconnect) {
+                            this.reassertSessionPresenceAfterReconnect();
+                        }
+                    }) === true;
+                } catch (error) {
+                    logger.infoFile('[API] session socket setup threw; error details not shown', {
+                        sessionId: this.sessionId,
+                        connectionEpoch: setup.epoch,
+                        trigger,
+                        errorName: error instanceof Error ? error.name : typeof error,
+                    });
+                }
+                if (ready && isConnectedSessionSetupCurrent(setup)) {
+                    setup.completion ??= completeConnectedSessionSetup(setup).catch((error) => {
+                        logger.debug('[API] Session socket setup completion failed (non-fatal)', {
+                            error: serializeAxiosErrorForLog(error),
+                        });
+                    });
+                    return true;
+                }
+                if (isConnectedSessionSetupCurrent(setup)) setup.failedAttempts += 1;
+                return false;
+            })().finally(() => {
+                if (setup.attempt === attempt) setup.attempt = null;
+            });
+            setup.attempt = attempt;
+            return attempt;
+        };
+        const runConnectedSessionSetupWithRetry = async (setup: ConnectedSessionSetup): Promise<void> => {
+            while (true) {
+                if (await attemptConnectedSessionSetup(setup, 'connect')) {
+                    await setup.completion;
+                    return;
+                }
+                // A disconnect or a newer connection owns setup from here.
+                if (!isConnectedSessionSetupCurrent(setup)) return;
+                const contract = this.sessionSyncPendingInputServerContract;
+                if (
+                    contract?.mode === 'auth_failed'
+                    && contract.sessionConnectionEpoch === setup.epoch
+                    && contract.socket === setup.socket
+                ) {
+                    // Authentication failure is reported to the connection supervisor and is
+                    // terminal for this connection; retrying setup cannot change it.
+                    logger.infoFile('[API] session socket setup stopped: authentication failed', {
+                        sessionId: this.sessionId,
+                        connectionEpoch: setup.epoch,
+                    });
+                    return;
+                }
+                const exhausted = setup.failedAttempts >= SESSION_SOCKET_SETUP_MAX_CONNECT_ATTEMPTS;
+                const retryInMs = Math.min(
+                    SESSION_SOCKET_SETUP_RETRY_MAX_MS,
+                    SESSION_SOCKET_SETUP_RETRY_BASE_MS * 2 ** Math.max(0, setup.failedAttempts - 1),
+                );
+                logger.infoFile('[API] session socket setup did not complete', {
+                    sessionId: this.sessionId,
+                    connectionEpoch: setup.epoch,
+                    trigger: 'connect',
+                    failedAttempts: setup.failedAttempts,
+                    ...(exhausted ? { retryOn: 'next_pending_input_pass_or_reconnect' } : { retryInMs }),
+                });
+                if (exhausted) return;
+                await delayUnrefAbortable(retryInMs, setup.lifetime.signal);
+                if (!isConnectedSessionSetupCurrent(setup)) return;
+            }
+        };
+        this.retireConnectedSessionSetup = () => {
+            connectedSessionSetup?.lifetime.abort();
+        };
+        this.ensureConnectedSessionSetupForPendingInput = () => {
+            const setup = connectedSessionSetup;
+            if (!setup || !isConnectedSessionSetupCurrent(setup) || setup.completion || setup.attempt) return;
+            void attemptConnectedSessionSetup(setup, 'pending_input').then((ready) => {
+                if (ready || !isConnectedSessionSetupCurrent(setup)) return;
+                logger.infoFile('[API] session socket setup did not complete', {
+                    sessionId: this.sessionId,
+                    connectionEpoch: setup.epoch,
+                    trigger: 'pending_input',
+                    failedAttempts: setup.failedAttempts,
+                    retryOn: 'next_pending_input_pass_or_reconnect',
+                });
+            });
+        };
         this.sessionConnectionSupervisor = createManagedConnectionSupervisor({
             ...DEFAULT_MANAGED_CONNECTION_POLICY,
             createTransport: () => {
@@ -1470,40 +1635,20 @@ export class ApiSessionClient extends EventEmitter {
                 this.sessionConnectionEpoch += 1;
                 const connectionEpoch = this.sessionConnectionEpoch;
                 this.resetAccountSettingsRetryForEvent();
-                if (!await this.convergePendingInputReadiness?.(() => {
-                    if (this.shouldKeepUserSocketConnected()) {
-                        this.kickUserSocketConnect();
-                    }
-                    if (isReconnect) {
-                        this.reassertSessionPresenceAfterReconnect();
-                    }
-                })) return;
-                // On publisher-fenced servers, converged readiness includes this connection's settled publisher claim.
-                this.observePendingPublisherClaim(connectionEpoch);
-                this.reofferAcceptedCanonicalPendingDeliveries();
-                this.clearPendingDiscoveryTimer();
-                this.schedulePendingDiscovery();
-
-                await this.syncChangesOnConnect({ reason: isReconnect ? 'reconnect' : 'connect' }).catch((error) => {
-                    logger.debug('[API] Session changes sync on connect failed (non-fatal)', {
-                        error: serializeAxiosErrorForLog(error),
-                    });
-                });
-                if (shouldSyncSessionSnapshotOnConnect({ metadataVersion: this.metadataVersion, agentStateVersion: this.agentStateVersion })) {
-                    void this.syncSessionSnapshotFromServer({ reason: 'connect' });
-                }
-
-                await this.flushQueuedSessionMessagesOnReconnect().catch((error) => {
-                    logger.debug('[API] Failed to replay queued session messages on reconnect', {
-                        error: serializeAxiosErrorForLog(error),
-                    });
-                });
-
-                // A reconnect can restore the negotiated materialization contract without
-                // changing the pending projection. Publish the canonical eligibility wake so
-                // a consumer that previously observed retryable transport re-runs against the
-                // healthy session generation instead of waiting for another queue mutation.
-                this.publishPendingEligibilityWake();
+                connectedSessionSetup?.lifetime.abort();
+                if (this.closeStarted) return;
+                const setup: ConnectedSessionSetup = {
+                    epoch: connectionEpoch,
+                    socket: this.socket,
+                    isReconnect,
+                    lifetime: new AbortController(),
+                    contractPrepared: false,
+                    failedAttempts: 0,
+                    attempt: null,
+                    completion: null,
+                };
+                connectedSessionSetup = setup;
+                await runConnectedSessionSetupWithRetry(setup);
             },
             onDisconnected: async ({ event }) => {
                 logger.debug('[API] Socket disconnected:', event.reason ?? 'unknown');
@@ -6718,6 +6863,9 @@ export class ApiSessionClient extends EventEmitter {
     async close() {
         logger.debug('[API] socket.close() called');
         this.closeStarted = true;
+        // Retire this connection's setup before aborting its readiness: a setup attempt that the
+        // abort below makes return false must not be retried while the drains below run.
+        this.retireConnectedSessionSetup?.();
         // Pending control RPCs can be waiting here; release archive admission before
         // draining RPC executions so closing cannot wait on its own lifetime abort.
         this.archiveAdmissionTermination.abort();
@@ -7109,6 +7257,20 @@ export class ApiSessionClient extends EventEmitter {
         if (!supervisor) {
             return { didMaterialize: false, result: { type: 'retryable_transport' } };
         }
+        const contractBeforeSetupCheck = this.sessionSyncPendingInputServerContract;
+        if (
+            this.socket.connected === true
+            && (
+                !contractBeforeSetupCheck
+                || contractBeforeSetupCheck.sessionConnectionEpoch !== this.sessionConnectionEpoch
+                || contractBeforeSetupCheck.socket !== this.socket
+            )
+        ) {
+            // This connected socket's setup has not completed: it returned false, or is still
+            // running. Start another attempt (never a second concurrent one) instead of only
+            // answering retryable_transport; its completion publishes the eligibility wake.
+            this.ensureConnectedSessionSetupForPendingInput?.();
+        }
         const previousContract = this.sessionSyncPendingInputServerContract;
         if (
             previousContract?.pendingInput === 'indeterminate'
@@ -7293,6 +7455,11 @@ export class ApiSessionClient extends EventEmitter {
         this.schedulePendingReoffer();
         if (pendingStateUpdate.changed) {
             this.pendingWakeSeq += 1;
+            // A waiting consumer armed its wake before this pass and checks the sequence only
+            // when it starts waiting; without the event, adopting newer state here (for example
+            // after pending_version_mismatch) loses the wake when the matching broadcast arrives
+            // later and reads as unchanged.
+            if (!this.closed) this.emitPendingEligibilityUpdated();
         }
         if (this.closed || this.runtimeTerminationStarted) {
             return { didMaterialize: false, result: { type: 'retryable_transport' } };

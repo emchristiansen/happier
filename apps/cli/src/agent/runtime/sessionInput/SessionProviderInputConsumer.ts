@@ -109,10 +109,16 @@ function readCommittedIdleRuntimeActivityRevision(
   return settlement.committedRevision;
 }
 
+/**
+ * Every answer the server gives is reported to `observeAnswer` as soon as it arrives, including a
+ * first runtime_activity_unknown answer before this helper waits on the Runtime Activity tail
+ * (which can last indefinitely) and the exact-revision retry's answer.
+ */
 async function materializeWithRuntimeActivityTail(
   session: SessionProviderInputConsumerSession,
   options: ReturnType<typeof buildMaterializeOptions>,
   abortSignal: AbortSignal,
+  observeAnswer: (result: PendingMaterializationResult) => void,
 ): Promise<PendingMaterializationResult> {
   const first = await observePendingInputPhase(
     'materialize',
@@ -121,6 +127,7 @@ async function materializeWithRuntimeActivityTail(
       onDiagnosticPhase,
     }),
   );
+  observeAnswer(first);
   if (
     options.pendingQueueDeliveryTiming !== 'after_runtime_idle'
     || first.type !== 'deferred'
@@ -132,7 +139,7 @@ async function materializeWithRuntimeActivityTail(
     if (!tail) return first;
     const expectedRuntimeActivityRevision = readCommittedIdleRuntimeActivityRevision(tail);
     if (expectedRuntimeActivityRevision !== undefined) {
-      return await observePendingInputPhase(
+      const retried = await observePendingInputPhase(
         'materialize_runtime_tail_retry',
         async (onDiagnosticPhase) => await session.materializeNextPendingMessageSafely({
           ...options,
@@ -140,6 +147,8 @@ async function materializeWithRuntimeActivityTail(
           onDiagnosticPhase,
         }),
       );
+      observeAnswer(retried);
+      return retried;
     }
     if (tail.custody === null || !session.waitForRuntimeActivitySnapshotTailChange) return first;
     if (!await session.waitForRuntimeActivitySnapshotTailChange(tail.sequence, abortSignal)) return first;
@@ -198,6 +207,79 @@ function logInputConsumerMaterializationDecision(opts: {
   });
 }
 
+/** An identical non-materialized answer is logged again at most once per this interval. */
+export const INPUT_CONSUMER_NO_INPUT_LOG_REPEAT_MS = 60_000;
+
+type InputConsumerNoInputObservation =
+  | Readonly<{ kind: 'answer'; result: PendingMaterializationResult }>
+  | Readonly<{ kind: 'request_failed'; errorName: string }>;
+
+/**
+ * File-level (info) record of every non-materialized answer one input consumer receives, so a
+ * runner that waits for input without starting its provider says why in its default log.
+ * Logs IDs, kinds, states and counts only; never message content or error details.
+ *
+ * A wake storm repeats the same answer many times, so an answer is logged when its
+ * (source, kind, reason) differs from the last logged one, and an unchanged answer at most once
+ * per INPUT_CONSUMER_NO_INPUT_LOG_REPEAT_MS with the count of answers suppressed since the last
+ * line. A materialized answer ends the streak, so the next stall is logged at once.
+ */
+class InputConsumerNoInputLog {
+  private lastKey: string | null = null;
+  private lastLoggedAtMs = 0;
+  private suppressedSinceLastLog = 0;
+
+  observe(opts: Readonly<{
+    source: 'waitForNextInput' | 'drainPending';
+    activeTurnSteerability: PendingForegroundSteerability | undefined;
+    pendingQueueDeliveryTiming: PendingQueueDeliveryTiming | undefined;
+    observation: InputConsumerNoInputObservation;
+  }>): void {
+    const observation = opts.observation;
+    if (observation.kind === 'answer' && observation.result.type === 'materialized') {
+      this.lastKey = null;
+      this.suppressedSinceLastLog = 0;
+      return;
+    }
+    const resultType = observation.kind === 'answer' ? observation.result.type : 'request_failed';
+    const result = observation.kind === 'answer' ? observation.result : null;
+    const deferredReason = result?.type === 'deferred' ? result.reason : undefined;
+    const errorName = observation.kind === 'request_failed' ? observation.errorName : undefined;
+    const key = [opts.source, resultType, deferredReason ?? '', errorName ?? ''].join('|');
+    const now = Date.now();
+    if (key === this.lastKey && now - this.lastLoggedAtMs < INPUT_CONSUMER_NO_INPUT_LOG_REPEAT_MS) {
+      this.suppressedSinceLastLog += 1;
+      return;
+    }
+    const repeatsSinceLastLog = key === this.lastKey ? this.suppressedSinceLastLog : 0;
+    this.lastKey = key;
+    this.lastLoggedAtMs = now;
+    this.suppressedSinceLastLog = 0;
+    const retryAfterMs = result?.type === 'deferred' || result?.type === 'retryable_transport'
+      ? result.retryAfterMs
+      : undefined;
+    try {
+      logger.infoFile('[pendingQueue] input consumer received no input', {
+        source: opts.source,
+        resultType,
+        ...(deferredReason ? { deferredReason } : {}),
+        ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+        ...(result?.type === 'auth_failure' ? { statusCode: result.statusCode } : {}),
+        ...(errorName ? { errorName, errorDetails: 'not shown' } : {}),
+        activeTurnSteerability: opts.activeTurnSteerability ?? 'unsteerable',
+        ...(opts.pendingQueueDeliveryTiming ? { pendingQueueDeliveryTiming: opts.pendingQueueDeliveryTiming } : {}),
+        repeatsSinceLastLog,
+      });
+    } catch {
+      // A diagnostic sink failure never changes input delivery.
+    }
+  }
+}
+
+function readErrorName(error: unknown): string {
+  return error instanceof Error && error.name.trim().length > 0 ? error.name : typeof error;
+}
+
 function readPendingDeliveryLocalIdsFromError(error: unknown): string[] {
   if (!error || typeof error !== 'object') return [];
   const record = error as {
@@ -225,6 +307,7 @@ export function createSessionProviderInputConsumer<Mode, Message>(
   opts: SessionProviderInputConsumerOptions<Mode, Message>,
 ): SessionProviderInputConsumer<Mode, Message> {
   let waitForNextInputTurn: Promise<void> = Promise.resolve();
+  const noInputLog = new InputConsumerNoInputLog();
   const materializationRetryEpisode = new PendingInputRetryEpisode('materialization');
   let materializationTurn: Promise<void> = Promise.resolve();
   // Idle and active consumers share the complete pass, including failure accounting.
@@ -391,21 +474,24 @@ export function createSessionProviderInputConsumer<Mode, Message>(
         return { materialized: 0, stoppedReason: 'drain_disallowed' } as const;
       }
       const callerShouldContinue = drainOpts?.shouldContinue;
-      return await drainPendingMessages(withDefaultDrainOptions(
-        admissionTrackedSession,
-        opts.pendingDrainMaxPopPerWake,
-        opts.activeTurnSteerability,
-        opts.resolveActiveTurnSteerability,
-        opts.pendingQueueDeliveryTiming,
-        opts.resolvePendingQueueDeliveryTiming,
-        {
-          ...drainOpts,
-          shouldContinue: () => (
-            providerInputAdmissionOpen
-            && (callerShouldContinue?.() ?? true)
-          ),
-        },
-      ));
+      return await drainPendingMessages({
+        ...withDefaultDrainOptions(
+          admissionTrackedSession,
+          opts.pendingDrainMaxPopPerWake,
+          opts.activeTurnSteerability,
+          opts.resolveActiveTurnSteerability,
+          opts.pendingQueueDeliveryTiming,
+          opts.resolvePendingQueueDeliveryTiming,
+          {
+            ...drainOpts,
+            shouldContinue: () => (
+              providerInputAdmissionOpen
+              && (callerShouldContinue?.() ?? true)
+            ),
+          },
+        ),
+        noInputLog,
+      });
     }, (passResult) => passResult.stoppedReason === 'retryable_transport'
       ? { retryAfterMs: passResult.retryAfterMs } : null);
     if (result) return result;
@@ -448,7 +534,13 @@ export function createSessionProviderInputConsumer<Mode, Message>(
           abortSignal: waitOpts.abortSignal,
           isProviderInputAdmissionOpen: () => providerInputAdmissionOpen,
           retryEpisode: materializationRetryEpisode,
-          materialize: (pass) => runMaterializationPass(waitOpts.abortSignal, pass, (result) => result),
+          noInputLog,
+          // A server deferral is an answer, not a failure: it never spends the retry budget.
+          materialize: (pass) => runMaterializationPass(
+            waitOpts.abortSignal,
+            pass,
+            (result) => (result?.kind === 'retry' ? result : null),
+          ),
         });
         if (
           batch?.pendingProviderAction !== undefined
@@ -557,12 +649,32 @@ async function waitForSerializedWaitTurn(previousTurn: Promise<void>, abortSigna
   });
 }
 
+/**
+ * One idle materialization pass's outcome: `retry` is a retryable failure (it spends the retry
+ * episode), `recheck` a server deferral that names when to ask again, and null anything else.
+ */
+type MaterializationPassOutcome =
+  | Readonly<{ kind: 'retry'; retryAfterMs?: number }>
+  | Readonly<{ kind: 'recheck'; afterMs: number }>
+  | null;
+
+/** Upper bound on a server-supplied deferral delay, matching the retry episode's local cap. */
+const MAX_DEFERRAL_RECHECK_MS = 300_000;
+
+function readDeferralRecheckAfterMs(result: PendingMaterializationResult): number | undefined {
+  if (result.type !== 'deferred') return undefined;
+  const retryAfterMs = result.retryAfterMs;
+  if (typeof retryAfterMs !== 'number' || !Number.isFinite(retryAfterMs) || retryAfterMs <= 0) return undefined;
+  return Math.min(MAX_DEFERRAL_RECHECK_MS, Math.ceil(retryAfterMs));
+}
+
 async function waitForNextInput<Mode, Message>(
   opts: SessionProviderInputConsumerOptions<Mode, Message> & {
     abortSignal: AbortSignal;
     isProviderInputAdmissionOpen: () => boolean;
     retryEpisode: PendingInputRetryEpisode;
-    materialize: (pass: () => Promise<Readonly<{ retryAfterMs?: number }> | null>) => Promise<Readonly<{ retryAfterMs?: number }> | null | undefined>;
+    noInputLog: InputConsumerNoInputLog;
+    materialize: (pass: () => Promise<MaterializationPassOutcome>) => Promise<MaterializationPassOutcome | undefined>;
   },
 ): Promise<MessageBatch<Mode, Message> | null> {
   const metadataWaitRetryBackoffMs = opts.metadataWaitRetryBackoffMs ?? DEFAULT_SESSION_METADATA_WAIT_RETRY_BACKOFF_MS;
@@ -596,8 +708,10 @@ async function waitForNextInput<Mode, Message>(
       if (!await opts.session.waitForProviderInputAdmission(opts.abortSignal)
         || opts.abortSignal.aborted || !opts.isProviderInputAdmissionOpen()) return null;
       let batch = await collectQueuedBatch(opts.messageQueue, opts.abortSignal);
+      let recheckAfterMs: number | undefined;
       if (!batch) {
-        await opts.materialize(() => materializePendingMessage(opts));
+        const outcome = await opts.materialize(() => materializePendingMessage(opts));
+        if (outcome?.kind === 'recheck') recheckAfterMs = outcome.afterMs;
         batch = await collectQueuedBatch(opts.messageQueue, opts.abortSignal);
       }
       if (opts.abortSignal.aborted || !opts.isProviderInputAdmissionOpen()) return null;
@@ -623,6 +737,20 @@ async function waitForNextInput<Mode, Message>(
         // A timer rejoins the same episode. Only applyWake renews its budget.
         continue;
       }
+      if (recheckAfterMs !== undefined) {
+        // The server said when this deferral may clear (for example runtime activity); ask
+        // again then rather than waiting only for an external wake that may never come.
+        const recheckOrWake = await Promise.race([
+          wakePromise.then((winner) => ({ kind: 'wake' as const, winner })),
+          waitForSessionMetadataRetryBackoff({
+            abortSignal: controller.signal,
+            backoffMs: recheckAfterMs,
+            minMs: 1,
+          }).then(() => ({ kind: 'recheck' as const })),
+        ]);
+        if (recheckOrWake.kind === 'wake' && !await applyWake(recheckOrWake.winner)) return null;
+        continue;
+      }
       if (!await applyWake(await wakePromise)) return null;
     } finally {
       controller.abort('sessionProviderInputConsumer-pass-complete');
@@ -646,15 +774,17 @@ async function materializePendingMessage<Mode, Message>(
   opts: SessionProviderInputConsumerOptions<Mode, Message> & {
     abortSignal: AbortSignal;
     isProviderInputAdmissionOpen: () => boolean;
+    noInputLog: InputConsumerNoInputLog;
   },
-): Promise<Readonly<{ retryAfterMs?: number }> | null> {
+): Promise<MaterializationPassOutcome> {
   const reconcileWhenEmpty = opts.reconcileWhenEmpty ?? 'skip';
   let activeTurnSteerability = readActiveTurnSteerability(opts);
+  let pendingQueueDeliveryTiming = readPendingQueueDeliveryTiming(opts);
   let result: PendingMaterializationResult;
   try {
     if (!opts.isProviderInputAdmissionOpen()) return null;
     activeTurnSteerability = readActiveTurnSteerability(opts);
-    const pendingQueueDeliveryTiming = readPendingQueueDeliveryTiming(opts);
+    pendingQueueDeliveryTiming = readPendingQueueDeliveryTiming(opts);
     result = await materializeWithRuntimeActivityTail(
       opts.session,
       buildMaterializeOptions(
@@ -663,6 +793,12 @@ async function materializePendingMessage<Mode, Message>(
         pendingQueueDeliveryTiming,
       ),
       opts.abortSignal,
+      (answer) => opts.noInputLog.observe({
+        source: 'waitForNextInput',
+        activeTurnSteerability,
+        pendingQueueDeliveryTiming,
+        observation: { kind: 'answer', result: answer },
+      }),
     );
   } catch (error) {
     if (
@@ -674,6 +810,12 @@ async function materializePendingMessage<Mode, Message>(
       throw new PendingQueueMaterializationAuthError();
     }
     logger.debug('[pendingQueue] input consumer materialization failed (non-fatal)', error);
+    opts.noInputLog.observe({
+      source: 'waitForNextInput',
+      activeTurnSteerability,
+      pendingQueueDeliveryTiming,
+      observation: { kind: 'request_failed', errorName: readErrorName(error) },
+    });
     const localIds = readPendingDeliveryLocalIdsFromError(error);
     if (localIds.length === 1 && opts.session.blockPendingMessageDelivery) {
       await opts.session.blockPendingMessageDelivery({
@@ -683,7 +825,9 @@ async function materializePendingMessage<Mode, Message>(
     }
     if (localIds.length === 0 && !isPermanentRequestError(error)) {
       const classified = classifyServerEndpointError(error);
-      return classified.retryAfterMs === undefined ? {} : { retryAfterMs: classified.retryAfterMs };
+      return classified.retryAfterMs === undefined
+        ? { kind: 'retry' }
+        : { kind: 'retry', retryAfterMs: classified.retryAfterMs };
     }
     return null;
   }
@@ -703,6 +847,8 @@ async function materializePendingMessage<Mode, Message>(
   if (result.type === 'deferred' && result.reason === 'supervisor_auth_failed') {
     throw new PendingQueueMaterializationAuthError();
   }
+  const recheckAfterMs = readDeferralRecheckAfterMs(result);
+  if (recheckAfterMs !== undefined) return { kind: 'recheck', afterMs: recheckAfterMs };
   if (result.type !== 'retryable_transport') return null;
 
   // Reconcile through the same authoritative owner; no alternate claim or delivery path.
@@ -714,7 +860,9 @@ async function materializePendingMessage<Mode, Message>(
       logger.debug('[pendingQueue] retryable transport reconciliation failed (non-fatal)', error);
     }
   }
-  return result.retryAfterMs === undefined ? {} : { retryAfterMs: result.retryAfterMs };
+  return result.retryAfterMs === undefined
+    ? { kind: 'retry' }
+    : { kind: 'retry', retryAfterMs: result.retryAfterMs };
 }
 
 function withDefaultDrainOptions(
@@ -743,7 +891,7 @@ function withDefaultDrainOptions(
 }
 
 async function drainPendingMessages(
-  opts: DrainPendingOptions & { session: SessionProviderInputConsumerSession },
+  opts: DrainPendingOptions & { session: SessionProviderInputConsumerSession; noInputLog: InputConsumerNoInputLog },
 ): Promise<DrainPendingResult> {
   // A materialized row has already left durable server custody and may be replaced locally by a
   // later isolate/control prompt. Keep the claim boundary one row wide regardless of legacy
@@ -795,14 +943,15 @@ async function drainPendingMessages(
 
 async function materializeNextPendingForDrain(
   session: SessionProviderInputConsumerSession,
-  opts: DrainPendingOptions,
+  opts: DrainPendingOptions & { noInputLog: InputConsumerNoInputLog },
 ): Promise<Exclude<DrainPendingResult['stoppedReason'], 'aborted' | 'drain_disallowed' | 'materialization_blocked' | 'max_pop_per_wake' | 'retryable_transport'> | 'materialized' | Readonly<{ stoppedReason: 'retryable_transport'; retryAfterMs?: number }>> {
+  let activeTurnSteerability = readActiveTurnSteerability(opts);
+  let pendingQueueDeliveryTiming = readPendingQueueDeliveryTiming(opts);
   try {
     const reconcileWhenEmpty = 'force';
-    let activeTurnSteerability = readActiveTurnSteerability(opts);
     if (opts.shouldContinue && !opts.shouldContinue()) return 'no_pending';
     activeTurnSteerability = readActiveTurnSteerability(opts);
-    const pendingQueueDeliveryTiming = readPendingQueueDeliveryTiming(opts);
+    pendingQueueDeliveryTiming = readPendingQueueDeliveryTiming(opts);
     const result = await materializeWithRuntimeActivityTail(
       session,
       buildMaterializeOptions(
@@ -813,6 +962,12 @@ async function materializeNextPendingForDrain(
         opts.requestedLocalId,
       ),
       opts.abortSignal ?? new AbortController().signal,
+      (answer) => opts.noInputLog.observe({
+        source: 'drainPending',
+        activeTurnSteerability,
+        pendingQueueDeliveryTiming,
+        observation: { kind: 'answer', result: answer },
+      }),
     );
     logInputConsumerMaterializationDecision({
       source: 'drainPending',
@@ -842,6 +997,12 @@ async function materializeNextPendingForDrain(
     if (result.type === 'publisher_lost') return 'publisher_lost';
     return 'no_pending';
   } catch (error) {
+    opts.noInputLog.observe({
+      source: 'drainPending',
+      activeTurnSteerability,
+      pendingQueueDeliveryTiming,
+      observation: { kind: 'request_failed', errorName: readErrorName(error) },
+    });
     const result = readDrainErrorResult(error, opts);
     return result.stoppedReason === 'retryable_transport' ? result : result.stoppedReason;
   }

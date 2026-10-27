@@ -442,6 +442,7 @@ vi.mock('@/configuration', () => ({
     privateKeyFile: join(tmpdir(), 'f1-daemon-key'),
     happyHomeDir: join(tmpdir(), 'f1-daemon-home'),
     activeServerDir: join(tmpdir(), 'f1-daemon-home/servers/active'),
+    daemonStateFile: join(tmpdir(), 'f1-daemon-home/servers/active/daemon.state.json'),
     activeServerId: 'test-server',
     apiServerUrl: 'https://relay.example.invalid',
     currentCliVersion: '0.0.0-test',
