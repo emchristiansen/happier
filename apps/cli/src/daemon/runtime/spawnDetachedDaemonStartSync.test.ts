@@ -101,6 +101,7 @@ describe('spawnDetachedDaemonStartSync', () => {
         '--scope',
         '--quiet',
         '--slice=happier-critical.slice',
+        '--expand-environment=no',
         '--',
         '/usr/bin/node',
         '--no-warnings',

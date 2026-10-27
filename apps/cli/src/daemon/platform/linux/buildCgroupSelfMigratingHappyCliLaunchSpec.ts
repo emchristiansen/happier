@@ -7,8 +7,13 @@ import {
 } from '@/utils/spawnHappyCLI';
 import { resolveDaemonSessionScopeBaseRelativePath } from './resolveDaemonSessionScopeBaseRelativePath';
 import {
+    buildSessionLaunchPlacementIntent,
+    type SessionLaunchPlacementIntent,
+} from './observeSessionLaunchPlacement';
+import type { SessionLaunchId } from './sessionLaunchId';
+import {
     buildSystemdUserScopedLaunchSpec,
-    isSystemdUserResourceGovernorReady,
+    probeSystemdUserResourceGovernor,
     type SystemdUserResourceGovernorExecFile,
 } from './systemdUserResourceGovernor';
 
@@ -40,7 +45,18 @@ export type ExecutableLaunchSpec = Readonly<{
     env?: Record<string, string>;
 }>;
 
+/**
+ * The launch for one attempt plus what it asked for. `launchSpec` is null when the
+ * caller should use its plain launch; `placement` is the intent the attempt's
+ * `launch-placement` line starts from.
+ */
+export type SessionLaunchPlan = Readonly<{
+    launchSpec: ExecutableLaunchSpec | null;
+    placement: SessionLaunchPlacementIntent;
+}>;
+
 export async function buildCgroupSelfMigratingHappyCliLaunchSpec(params: Readonly<{
+    launchId: SessionLaunchId;
     daemonPid?: number;
     procfsRootDir?: string;
     cgroupRootDir?: string;
@@ -49,17 +65,18 @@ export async function buildCgroupSelfMigratingHappyCliLaunchSpec(params: Readonl
 } & (
     | { args: string[]; launchOptions?: HappyCliSubprocessLaunchOptions; launchSpec?: never }
     | { launchSpec: HappyCliSubprocessLaunchSpec; args?: never; launchOptions?: never }
-)>): Promise<ExecutableLaunchSpec | null> {
+)>): Promise<SessionLaunchPlan> {
     const daemonPid = normalizePid(params.daemonPid) ?? process.pid;
     const procfsRootDir = params.procfsRootDir ?? '/proc';
     const cgroupRootDir = params.cgroupRootDir ?? '/sys/fs/cgroup';
     const baseLaunchSpec = params.launchSpec ?? buildHappyCliSubprocessLaunchSpec(params.args, params.launchOptions);
-    const systemdUserResourceGovernorReady = await isSystemdUserResourceGovernorReady({
+    const probe = await probeSystemdUserResourceGovernor({
         environment: params.environment ?? process.env,
         execFile: params.systemdUserResourceGovernorExecFile,
     });
-    if (systemdUserResourceGovernorReady) {
-        return buildSystemdUserScopedLaunchSpec({
+    if (probe.kind === 'ready') {
+        const launchSpec = buildSystemdUserScopedLaunchSpec({
+            launchId: params.launchId,
             launchSpec: {
                 filePath: baseLaunchSpec.filePath,
                 args: baseLaunchSpec.args,
@@ -71,21 +88,26 @@ export async function buildCgroupSelfMigratingHappyCliLaunchSpec(params: Readonl
                 },
             },
         });
+        return { launchSpec, placement: buildSessionLaunchPlacementIntent(params.launchId) };
     }
+
+    // Best-effort coverage: a failed probe launches exactly as before, unscoped, and the
+    // attempt's placement line carries the probe's reason.
+    const unscoped: SessionLaunchPlacementIntent = { kind: 'unscoped', probe };
 
     const daemonServiceRelativePath = await readUnifiedProcessCgroupRelativePath(daemonPid, procfsRootDir);
     if (!daemonServiceRelativePath) {
-        return null;
+        return { launchSpec: null, placement: unscoped };
     }
 
     const sessionScopeBaseRelativePath = resolveDaemonSessionScopeBaseRelativePath(daemonServiceRelativePath);
     if (!sessionScopeBaseRelativePath || sessionScopeBaseRelativePath === '.' || sessionScopeBaseRelativePath === daemonServiceRelativePath) {
-        return null;
+        return { launchSpec: null, placement: unscoped };
     }
 
     const appSliceAbsolutePath = join(cgroupRootDir, sessionScopeBaseRelativePath);
 
-    return {
+    const legacyLaunchSpec: ExecutableLaunchSpec = {
         filePath: '/bin/sh',
         args: [
             '-lc',
@@ -99,4 +121,5 @@ export async function buildCgroupSelfMigratingHappyCliLaunchSpec(params: Readonl
             HAPPIER_DAEMON_SESSION_CGROUP_BASE_DIR: appSliceAbsolutePath,
         },
     };
+    return { launchSpec: legacyLaunchSpec, placement: unscoped };
 }
