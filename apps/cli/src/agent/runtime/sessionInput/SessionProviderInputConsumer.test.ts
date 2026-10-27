@@ -1,9 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
+import axios from 'axios';
+import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
 
 import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import { HttpStatusError } from '@/api/client/httpStatusError';
+import type { RpcHandler } from '@/api/rpc/types';
+import { requestPendingQueueV2SteerNow } from '@/api/session/pendingQueueV2Transport';
 import type { MaterializeNextPendingResult } from '@/api/session/sessionClientPort';
 import type { RuntimeActivitySnapshotTail } from '@/api/session/mutations/createSessionMutationOutbox';
+import { createCodexPendingInputSteerControl, createCodexPendingInputBoundSteerHandler } from '@/backends/codex/runCodex';
+import { registerSessionControlHandlers } from '@/rpc/handlers/sessionControls';
 import { logger } from '@/ui/logger';
 
 import {
@@ -36,6 +42,245 @@ function createDrainConsumer(
 }
 
 describe('SessionProviderInputConsumer drainPending', () => {
+  it('[bound-retry] retires a proven early refusal and admits a fresh explicit invocation on T2', async () => {
+    let turn: string | null = 'T1';
+    const runtime = { getActiveSteerableTurnId: async () => turn };
+    const bindings: Parameters<typeof createCodexPendingInputSteerControl>[0]['turnBindings'] = new Map();
+    let outcome = createDeferred<Awaited<ReturnType<import('@/api/session/sessionClient').ApiSessionClient['waitForProviderInputTerminalOutcome']>>>();
+    let actionBinding = '';
+    const admitted: string[] = [];
+    const steer = vi.fn(async () => { outcome.resolve({ kind: 'accepted', providerTurnId: 'T2' }); });
+    const handler = createCodexPendingInputBoundSteerHandler({
+      turnBindings: bindings, getRuntime: () => runtime, isAdmissionOpen: () => true, steer,
+      refuse: async () => { outcome.resolve({ kind: 'rejected_before_effect', reason: 'steering_unavailable' }); },
+    });
+    const control = createCodexPendingInputSteerControl({ getDispatchSignal: () => new AbortController().signal,
+      session: {
+        sessionId: 's1', requestPendingInputSteerNow: async (_localId, bindingId) => {
+          admitted.push(bindingId); actionBinding = bindingId;
+          if (admitted.length === 1) turn = null;
+          return { kind: 'admitted' };
+        },
+        waitForProviderInputTerminalOutcome: async () => outcome.promise,
+      },
+      runtime, turnBindings: bindings, isAdmissionOpen: () => true,
+      inputConsumer: { drainPending: async () => {
+        await handler({ role: 'user', content: { type: 'text', text: 'exact input' }, localId: ' L ' }, {
+          localId: ' L ', requestedAction: { v: 1, kind: 'steer_now_bound', bindingId: actionBinding },
+          providerAction: 'steer', providerAcceptancePending: true, seq: null, isCurrentRegistration: () => true,
+        });
+        return { materialized: 1, stoppedReason: 'max_pop_per_wake' };
+      } },
+    });
+    await expect(control({ sessionId: 's1', localId: ' L ' })).resolves.toMatchObject({ ok: false, errorCode: 'steering_unavailable' });
+    expect(bindings.has(' L ')).toBe(false);
+    turn = 'T2'; outcome = createDeferred();
+    await expect(control({ sessionId: 's1', localId: ' L ' })).resolves.toMatchObject({ ok: true, status: 'admitted_and_steered' });
+    expect(admitted).toHaveLength(2);
+    expect(admitted[1]).not.toBe(admitted[0]);
+    expect(steer).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['replacement', 'failed_refusal', 'uncertain'] as const)('[bound-retry] preserves %s custody', async (kind) => {
+    const runtime = { getActiveSteerableTurnId: async () => null };
+    const binding = Object.freeze({ bindingId: 'B1', turnId: 'T1', runtime, dispatchSignal: new AbortController().signal });
+    const newer = Object.freeze({ bindingId: 'B2', turnId: 'T2', runtime, dispatchSignal: new AbortController().signal });
+    const bindings: Parameters<typeof createCodexPendingInputBoundSteerHandler>[0]['turnBindings'] = new Map([['L', binding]]);
+    const refusal = createDeferred<void>();
+    const handler = createCodexPendingInputBoundSteerHandler({
+      turnBindings: bindings, getRuntime: () => runtime, isAdmissionOpen: () => true,
+      steer: async () => { throw new Error('Unexpected steer'); },
+      refuse: async () => {
+        if (kind === 'failed_refusal') throw new Error('No qualified refusal');
+        await refusal.promise;
+      },
+    });
+    if (kind === 'uncertain') {
+      const patch = vi.fn(async () => ({ kind: 'admission_uncertain' as const }));
+      const control = createCodexPendingInputSteerControl({ getDispatchSignal: () => new AbortController().signal,
+        session: { sessionId: 's1', requestPendingInputSteerNow: patch, waitForProviderInputTerminalOutcome: async () => ({ kind: 'pending' }) },
+        runtime: { getActiveSteerableTurnId: async () => 'T1' }, turnBindings: bindings, isAdmissionOpen: () => true,
+        inputConsumer: { drainPending: async () => ({ materialized: 0, stoppedReason: 'no_pending' }) },
+      });
+      bindings.clear();
+      await control({ sessionId: 's1', localId: 'L' });
+      const retained = bindings.get('L');
+      await expect(control({ sessionId: 's1', localId: 'L' })).resolves.toMatchObject({ status: 'not_safe' });
+      expect(bindings.get('L')).toBe(retained);
+      expect(patch).toHaveBeenCalledTimes(1);
+      return;
+    }
+    const delivery = handler({ role: 'user', content: { type: 'text', text: 'input' }, localId: 'L' }, {
+      localId: 'L', requestedAction: { v: 1, kind: 'steer_now_bound', bindingId: 'B1' }, providerAction: 'steer', providerAcceptancePending: true, seq: null, isCurrentRegistration: () => true,
+    });
+    if (kind === 'replacement') bindings.set('L', newer);
+    refusal.resolve();
+    if (kind === 'failed_refusal') await expect(delivery).rejects.toThrow('No qualified refusal');
+    else await delivery;
+    expect(bindings.get('L')).toBe(kind === 'replacement' ? newer : binding);
+  });
+
+  it('keeps the selected opaque row identity through the RPC, Codex factory, PATCH and drain', async () => {
+    const rows = new Map<string, { requestedAction?: 'steer_now_bound'; claimed: boolean }>([
+      ['x', { claimed: false }],
+      [' x ', { claimed: false }],
+    ]);
+    const patch = vi.spyOn(axios, 'patch').mockImplementation(async (url, body) => {
+      const localId = decodeURIComponent(new URL(String(url)).pathname.split('/')[5]);
+      const row = rows.get(localId);
+      if (!row) throw new Error('Selected pending row does not exist');
+      row.requestedAction = 'steer_now_bound';
+      return { data: { ok: true, didUpdate: true, requestedAction: (body as { requestedAction: unknown }).requestedAction } };
+    });
+    const materializeNextPendingMessageSafely = vi.fn(async (opts?: { requestedLocalId?: string }) => {
+      const localId = opts?.requestedLocalId;
+      if (localId === undefined) throw new Error('Exact pending row identity is required');
+      const row = rows.get(localId);
+      if (!row || row.requestedAction !== 'steer_now_bound') throw new Error('Exact pending row was not admitted');
+      row.claimed = true;
+      return { type: 'materialized' as const, localId, seq: 12, content: null };
+    });
+    const consumer = createDrainConsumer({
+      materializeNextPendingMessageSafely,
+      waitForPendingEligibilityUpdate: async () => false,
+    });
+    const waitForProviderInputTerminalOutcome = vi.fn(async () => ({
+      kind: 'accepted' as const,
+      providerTurnId: 'turn-1',
+    }));
+    const turnBindings: Parameters<typeof createCodexPendingInputSteerControl>[0]['turnBindings'] = new Map();
+    const handlers = new Map<string, RpcHandler>();
+    registerSessionControlHandlers({
+      registerHandler: (method, handler) => { handlers.set(method, handler); },
+    }, {
+      sessionRuntimeControls: {
+        interruptPendingInputAndRun: createCodexPendingInputSteerControl({ getDispatchSignal: () => new AbortController().signal,
+          session: {
+            sessionId: 'session-1',
+            requestPendingInputSteerNow: async (localId, bindingId) => {
+              await requestPendingQueueV2SteerNow({ token: 'token', sessionId: 'session-1', localId, bindingId });
+              return { kind: 'admitted' };
+            },
+            waitForProviderInputTerminalOutcome,
+          },
+          runtime: { getActiveSteerableTurnId: async () => 'turn-1' },
+          inputConsumer: consumer,
+          turnBindings,
+          isAdmissionOpen: () => true,
+        }),
+      },
+    });
+
+    try {
+      const handler = handlers.get(SESSION_RPC_METHODS.SESSION_PENDING_INPUT_INTERRUPT_AND_RUN);
+      if (!handler) throw new Error('Pending interrupt-and-run RPC was not registered');
+      const result = await handler({ sessionId: 'session-1', localId: ' x ' });
+      expect(rows.get('x')).toEqual({ claimed: false });
+      expect(rows.get(' x ')).toEqual({ requestedAction: 'steer_now_bound', claimed: true });
+      expect(result).toEqual({
+        ok: true,
+        status: 'admitted_and_steered',
+        sessionId: 'session-1',
+        localId: ' x ',
+      });
+      expect(patch).toHaveBeenCalledTimes(1);
+      expect(patch).toHaveBeenCalledWith(
+        expect.stringMatching(/\/v2\/sessions\/session-1\/pending\/%20x%20\/action$/),
+        { requestedAction: { v: 1, kind: 'steer_now_bound', bindingId: expect.any(String) } },
+        expect.any(Object),
+      );
+      expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(1);
+      expect(materializeNextPendingMessageSafely).toHaveBeenCalledWith(expect.objectContaining({
+        requestedLocalId: ' x ',
+      }));
+      expect(waitForProviderInputTerminalOutcome).toHaveBeenCalledWith(' x ', 10_000, expect.any(AbortSignal));
+      expect(turnBindings.has(' x ')).toBe(true);
+      expect(turnBindings.has('x')).toBe(false);
+    } finally {
+      patch.mockRestore();
+    }
+  });
+
+  it.each(['missing', 'wrong_binding', 'closed', 'replaced_runtime', 'T2', 'registration', 'B2'] as const)(
+    '[bound-lifetime] refuses an unavailable original invocation: %s', async (change) => {
+      const resolvingTurn = createDeferred<string | null>();
+      const runtime = { getActiveSteerableTurnId: () => resolvingTurn.promise };
+      const binding = Object.freeze({ bindingId: 'B1', turnId: 'T1', runtime, dispatchSignal: new AbortController().signal });
+      const bindings: Parameters<typeof createCodexPendingInputBoundSteerHandler>[0]['turnBindings'] = new Map([[' L ', binding]]);
+      let admission = true;
+      let registered = true;
+      let activeRuntime: typeof runtime | null = runtime;
+      const steer = vi.fn(async () => {});
+      const refuse = vi.fn(async () => {});
+      const handler = createCodexPendingInputBoundSteerHandler({ turnBindings: bindings, getRuntime: () => activeRuntime, isAdmissionOpen: () => admission, steer, refuse });
+      if (change === 'missing') bindings.clear();
+      const delivery = handler({ role: 'user', content: { type: 'text', text: 'bound input' }, localId: ' L ' }, {
+        localId: ' L ', requestedAction: { v: 1, kind: 'steer_now_bound', bindingId: change === 'wrong_binding' ? 'wrong' : 'B1' },
+        providerAction: 'steer', providerAcceptancePending: true, seq: null, isCurrentRegistration: () => registered,
+      });
+      if (change === 'closed') admission = false;
+      if (change === 'replaced_runtime') activeRuntime = null;
+      if (change === 'registration') registered = false;
+      const newer = Object.freeze({ bindingId: 'B2', turnId: 'T2', runtime, dispatchSignal: new AbortController().signal });
+      if (change === 'B2') bindings.set(' L ', newer);
+      resolvingTurn.resolve(change === 'T2' ? 'T2' : 'T1');
+      await delivery;
+      expect(steer).not.toHaveBeenCalled();
+      expect(refuse).toHaveBeenCalledWith(' L ', null);
+      if (change === 'B2') expect(bindings.get(' L ')).toBe(newer);
+    },
+  );
+
+  it('[bound-lifetime] gives only the original invocation a mandatory T1 context and revokes it when B2 replaces it', async () => {
+    const runtime = { getActiveSteerableTurnId: async () => 'T1' };
+    const binding = Object.freeze({ bindingId: 'B1', turnId: 'T1', runtime, dispatchSignal: new AbortController().signal });
+    const bindings: Parameters<typeof createCodexPendingInputBoundSteerHandler>[0]['turnBindings'] = new Map([['L', binding]]);
+    let context: import('@/backends/codex/appServer/runtime').CodexBoundSteerContext | null = null;
+    const handler = createCodexPendingInputBoundSteerHandler({
+      turnBindings: bindings, getRuntime: () => runtime, isAdmissionOpen: () => true,
+      steer: async (_message, _info, attempt) => { context = attempt.context; expect(attempt.binding).toBe(binding); },
+      refuse: async () => { throw new Error('Original binding refused'); },
+    });
+    await handler({ role: 'user', content: { type: 'text', text: 'bound input' }, localId: 'L' }, {
+      localId: 'L', requestedAction: { v: 1, kind: 'steer_now_bound', bindingId: 'B1' }, providerAction: 'steer', providerAcceptancePending: true, seq: null, isCurrentRegistration: () => true,
+    });
+    if (!context) throw new Error('No mandatory native context');
+    const captured = context as import('@/backends/codex/appServer/runtime').CodexBoundSteerContext;
+    expect(captured.expectedTurnId).toBe('T1');
+    expect(captured.isCurrentBinding()).toBe(true);
+    const newer = Object.freeze({ bindingId: 'B2', turnId: 'T2', runtime, dispatchSignal: new AbortController().signal });
+    bindings.set('L', newer);
+    expect(captured.isCurrentBinding()).toBe(false);
+    expect(bindings.get('L')).toBe(newer);
+  });
+
+  it('passes an opaque exact selector through both preflights and the canonical drain', async () => {
+    const materializeNextPendingMessageSafely = vi.fn(async () => ({ type: 'no_pending' as const }));
+    const shouldAttemptPendingMaterialization = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+    const reconcilePendingQueueState = vi.fn(async () => {});
+    const consumer = createDrainConsumer({
+      shouldAttemptPendingMaterialization,
+      reconcilePendingQueueState,
+      materializeNextPendingMessageSafely,
+      waitForPendingEligibilityUpdate: async () => false,
+    });
+
+    await expect(consumer.drainPending({ requestedLocalId: ' urgent-local ', reason: 'exact-steer' })).resolves.toEqual({
+      materialized: 0,
+      stoppedReason: 'no_pending',
+    });
+    expect(shouldAttemptPendingMaterialization).toHaveBeenCalledTimes(2);
+    for (const [attempt] of shouldAttemptPendingMaterialization.mock.calls) {
+      expect(attempt).toMatchObject({ requestedLocalId: ' urgent-local ' });
+    }
+    expect(reconcilePendingQueueState).toHaveBeenCalledWith({ force: true });
+    expect(materializeNextPendingMessageSafely).toHaveBeenCalledTimes(1);
+    expect(materializeNextPendingMessageSafely).toHaveBeenCalledWith(expect.objectContaining({
+      requestedLocalId: ' urgent-local ',
+      reconcileWhenEmpty: 'force',
+    }));
+  });
+
   it('arms the Pending wake before an active-turn pass and drains once for the wake without polling', async () => {
     const metadataWakes: Array<(updated: boolean) => void> = [];
     const materializeNextPendingMessageSafely = vi

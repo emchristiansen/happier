@@ -1400,10 +1400,11 @@ describe("sessionUpdateHandler", () => {
             },
         );
 
-        const handler = getSocketHandler(socket, "pending-materialize-next");
+        const handler = getSocketHandler(socket, "pending-materialize-exact-v1");
         const callback = vi.fn();
         await handler({
             sid: "s-provider",
+            requestedLocalId: "pending-provider",
             deliveryState: "provider",
             deliveryTiming: "after_foreground_ready",
             foregroundState: "ready",
@@ -1413,6 +1414,7 @@ describe("sessionUpdateHandler", () => {
             tx: {},
             actorUserId: "user-1",
             sessionId: "s-provider",
+            requestedLocalId: "pending-provider",
             deliveryTiming: "after_foreground_ready",
             foregroundState: "ready",
             trustedPublisherFence: {
@@ -1422,6 +1424,14 @@ describe("sessionUpdateHandler", () => {
                 committedFence: currentPublisher.committedFence,
             },
         });
+
+        const genericCallback = vi.fn();
+        await getSocketHandler(socket, "pending-materialize-next")({
+            sid: "s-provider",
+            requestedLocalId: "pending-provider",
+        }, genericCallback);
+        expect(genericCallback).toHaveBeenCalledWith({ ok: false, error: "invalid-params" });
+        expect(materializeNextPendingMessageForCurrentPublisher).toHaveBeenCalledTimes(1);
         expect(materializeNextPendingMessage).not.toHaveBeenCalled();
         expect(callback).toHaveBeenCalledWith(expect.objectContaining({
             ok: true,

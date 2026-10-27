@@ -5,6 +5,26 @@ import type { SessionProviderInputOutcomeProducer } from '@/api/session/sessionC
 import { createCodexAppServerProviderInputOutcomeBridge } from './codexAppServerProviderInputOutcome';
 
 describe('createCodexAppServerProviderInputOutcomeBridge', () => {
+    it('publishes a proven pre-effect rejection through the qualified exact-localId producer', () => {
+        const observe = vi.fn();
+        const bridge = createCodexAppServerProviderInputOutcomeBridge({
+            bindProviderInputOutcomeProducer: () => observe,
+        }, { isCurrentRuntimeMode: () => true });
+
+        expect(bridge.observeRejectedBeforeEffect({
+            localIds: ['rejected-exact-local'],
+            reason: 'steering_unavailable',
+        })).toBe(true);
+        expect(observe).toHaveBeenCalledWith({
+            kind: 'rejected_before_effect',
+            localId: 'rejected-exact-local',
+            reason: 'steering_unavailable',
+        });
+        observe.mockClear();
+        expect(bridge.observeRejectedBeforeEffect({ localIds: ['a', 'b'], reason: 'steering_unavailable' })).toBe(false);
+        expect(observe).not.toHaveBeenCalled();
+    });
+
     it('publishes exact provider acceptance with the Queue localId and Codex turn identity', () => {
         const observe = vi.fn();
         const bindProviderInputOutcomeProducer = vi.fn(
@@ -31,6 +51,11 @@ describe('createCodexAppServerProviderInputOutcomeBridge', () => {
         expect(observe).toHaveBeenLastCalledWith({
             kind: 'accepted',
             localId: 'local-command',
+        });
+        expect(bridge.observeEffectMayHaveOccurred({ localIds: ['local-unechoed-steer'] })).toBe(true);
+        expect(observe).toHaveBeenLastCalledWith({
+            kind: 'effect_may_have_occurred',
+            localId: 'local-unechoed-steer',
         });
 
         expect(bridge.observeAccepted({
@@ -73,6 +98,8 @@ describe('createCodexAppServerProviderInputOutcomeBridge', () => {
         expect(bridge.observeAcceptedLocalInput({ localIds: [] })).toBe(false);
         expect(bridge.observeAcceptedLocalInput({ localIds: ['a', 'b'] })).toBe(false);
         expect(bridge.observeAcceptedLocalInput({ localIds: ['   '] })).toBe(false);
+        expect(bridge.observeEffectMayHaveOccurred({ localIds: [] })).toBe(false);
+        expect(bridge.observeEffectMayHaveOccurred({ localIds: ['a', 'b'] })).toBe(false);
         expect(observe).not.toHaveBeenCalled();
     });
 });

@@ -18,6 +18,7 @@ import { applyPermissionModeToCodexPermissionHandler } from './utils/applyPermis
 import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
 import { createDeferred } from '@/testkit/async/deferred';
 import { createMutableApiSessionClientFixture } from '@/testkit/backends/sessionFixtures';
+import type { SessionProviderInputConsumerSession } from '@/agent/runtime/sessionInput/SessionProviderInputConsumer';
 import { CodexAppServerSteerUnavailableError } from './appServer/appServerCompatibility';
 
 const modelSyncFlushPendingAfterStartSpy = vi.fn(async () => {});
@@ -106,7 +107,8 @@ function resolvePromptLocalIds(options?: Readonly<{
 }
 
 const createCodexAppServerRuntimeSpy = vi.fn<(...args: any[]) => any>((..._args) => createDefaultCodexAppServerRuntimeMock());
-vi.mock('./appServer/runtime', () => ({
+vi.mock('./appServer/runtime', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./appServer/runtime')>(),
   createCodexAppServerRuntime: (...args: any[]) => createCodexAppServerRuntimeSpy(...args),
 }));
 
@@ -153,6 +155,7 @@ const createSessionProviderInputConsumerSpy = vi.fn((opts: any) => {
     setPendingMaterializationRetryEpisodeExhaustedHandler: vi.fn(),
     runProviderInputDispatch: async ({ dispatch }: any) => ({ status: 'dispatched', value: await dispatch() }),
     closeProviderInputAdmissionAndWaitForDispatches: vi.fn(async () => undefined),
+    pumpPendingWhileActive: async () => {},
     drainPending: (...args: any[]) => inputConsumerDrainPendingSpy(...args),
   };
 });
@@ -473,6 +476,113 @@ function mockAttachedSessionMetadata(metadata: Record<string, unknown>): void {
 }
 
 describe('runCodex CodexACP resume behavior', () => {
+  it('[abort-bound-lifetime] fences native steering during permission flush and admits a later generation', async () => {
+    resolveRunnerMcpServersSpy.mockResolvedValueOnce({ happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() }, mcpServers: {} });
+    const preparationStarted = createDeferred<void>();
+    const preparation = createDeferred<void>();
+    const flushStarted = createDeferred<void>();
+    const flush = createDeferred<void>();
+    const loopStarted = createDeferred<void>();
+    const stopLoop = createDeferred<void>();
+    let boundHandler: Parameters<import('@/api/session/sessionClient').ApiSessionClient['onUserMessage']>[1];
+    let control: import('@/rpc/handlers/sessionControls').SessionRuntimeControls['interruptPendingInputAndRun'];
+    let selectedBindingId = '';
+    let prepareReads = 0;
+    let holdPermissionFlush = false;
+    initializeBackendRunSessionSpy.mockImplementationOnce(async (opts: any) => {
+      const initialized = await initializeDefaultBackendRunSession(opts);
+      const session = initialized.session;
+      session.onUserMessage = (_ordinary: unknown, handlers: typeof boundHandler) => { boundHandler = handlers; };
+      session.registerSessionRuntimeControls = (controls: import('@/rpc/handlers/sessionControls').SessionRuntimeControls) => {
+        control = controls.interruptPendingInputAndRun; return () => {};
+      };
+      session.requestPendingInputSteerNow = async (_localId: string, bindingId: string) => { selectedBindingId = bindingId; return { kind: 'admitted' }; };
+      session.waitForProviderInputTerminalOutcome = async () => ({ kind: 'pending' });
+      session.getMetadataSnapshot = () => ({ flavor: 'codex', codexSessionId: 'thread-original', codexBackendMode: 'appServer' });
+      session.refreshSessionSnapshotFromServerBestEffort = async () => {
+        if (++prepareReads === 1) { preparationStarted.resolve(); await preparation.promise; }
+      };
+      // Real BasePermissionHandler always awaits this external session flush, even with no permissions pending.
+      session.flush = async () => { if (holdPermissionFlush) { flushStarted.resolve(); await flush.promise; } };
+      return initialized;
+    });
+    const permission = await vi.importActual<typeof import('./utils/createCodexPermissionHandler')>('./utils/createCodexPermissionHandler');
+    vi.mocked(createCodexPermissionHandler).mockImplementationOnce(permission.createCodexPermissionHandler);
+    const actual = await vi.importActual<typeof import('./appServer/runtime')>('./appServer/runtime');
+    const clientModule = await import('./appServer/client/createCodexAppServerClient');
+    const notifications = new Map<string, (params: unknown) => void | Promise<void>>();
+    let turnCount = 0;
+    let nativeTurn = '';
+    const nativeRequest = vi.fn(async (method: string) => {
+      if (method === 'thread/resume' || method === 'thread/start') return { thread: { id: 'thread-original', turns: [] } };
+      if (method === 'collaborationMode/list' || method === 'model/list') return { data: [] };
+      if (method === 'thread/goal/get') return { goal: null };
+      if (method === 'turn/start') { nativeTurn = `T${++turnCount}`; return { turn: { id: nativeTurn } }; }
+      if (method === 'turn/steer') return {};
+      if (method === 'turn/interrupt') {
+        await notifications.get('turn/completed')?.({ threadId: 'thread-original', turn: { id: nativeTurn, status: 'interrupted' } });
+        return {};
+      }
+      throw new Error(`Unconfigured synthetic provider request: ${method}`);
+    });
+    const spawnBoundary = vi.spyOn(clientModule, 'createCodexAppServerClient').mockResolvedValue({
+      request: nativeRequest, notify: async () => {}, dispose: async () => {}, onExit: () => () => {},
+      registerRequestHandler: () => () => {},
+      registerNotificationHandler: (method, handler) => { notifications.set(method, handler); return () => { notifications.delete(method); }; },
+    });
+    let runtime: ReturnType<typeof actual.createCodexAppServerRuntime> | undefined;
+    createCodexAppServerRuntimeSpy.mockImplementationOnce((params) => {
+      runtime = actual.createCodexAppServerRuntime({ ...params, processEnv: {} });
+      return runtime;
+    });
+    sessionInputConsumerWaitForNextInputImpl = async () => { loopStarted.resolve(); await stopLoop.promise; return null; };
+    inputConsumerDrainPendingSpy.mockImplementation(async (options) => {
+      const localId = options.requestedLocalId;
+      if (typeof localId !== 'string') return { materialized: 0, stoppedReason: 'no_pending' };
+      if (!boundHandler) throw new Error('Bound delivery was not installed');
+      await boundHandler.onBoundCodexSteer({ role: 'user', content: { type: 'text', text: 'bound input' }, localId }, {
+        localId, requestedAction: { v: 1, kind: 'steer_now_bound', bindingId: selectedBindingId },
+        providerAction: 'steer', providerAcceptancePending: true, seq: null, isCurrentRegistration: () => true,
+      });
+      return { materialized: 1, stoppedReason: 'max_pop_per_wake' };
+    });
+    const { runCodex } = await import('./runCodex');
+    const run = runCodex({ credentials: { token: 'test' } as Credentials, startedBy: 'daemon',
+      startingMode: 'remote', existingSessionId: 'existing-123', codexBackendMode: 'appServer',
+      permissionMode: 'default', permissionModeUpdatedAt: 1 });
+    let active: Promise<void> | undefined;
+    try {
+      await Promise.race([loopStarted.promise, run.then(() => { throw new Error('Run ended before the input loop'); })]);
+      if (!runtime || !control) throw new Error('Real native runtime/control was not installed');
+      active = runtime.sendPrompt('original native turn');
+      await Promise.race([vi.waitFor(() => expect(runtime?.canSteerPrompt()).toBe(true)), active.then(() => { throw new Error('Native turn ended before steerable admission'); })]);
+      const delivery = Promise.resolve(control({ sessionId: 'sess_1', localId: 'L1' }));
+      await Promise.race([preparationStarted.promise, delivery.then(() => { throw new Error('Delivery ended before prompt preparation'); })]);
+      const abort = registerSessionRpcHandlerMock.mock.calls.find((call) => call[0] === 'abort')?.[1];
+      if (typeof abort !== 'function') throw new Error('Abort RPC missing');
+      holdPermissionFlush = true;
+      const aborting = abort();
+      await Promise.race([flushStarted.promise, Promise.resolve(aborting).then(() => { throw new Error('Abort ended before permission flush'); })]);
+      preparation.resolve();
+      await delivery;
+      expect(nativeRequest.mock.calls.filter(([method]) => method === 'turn/steer')).toEqual([]);
+      expect(providerInputOutcomeObserverMock).toHaveBeenCalledWith({ kind: 'rejected_before_effect', localId: 'L1', reason: 'steering_unavailable' });
+      flush.resolve(); await aborting; await active;
+      holdPermissionFlush = false;
+      active = runtime.sendPrompt('legitimate next native turn');
+      await Promise.race([vi.waitFor(() => expect(runtime?.canSteerPrompt()).toBe(true)), active.then(() => { throw new Error('Next native turn ended before steerable admission'); })]);
+      await control({ sessionId: 'sess_1', localId: 'L2' });
+      expect(nativeRequest.mock.calls.filter(([method]) => method === 'turn/steer')).toHaveLength(1);
+    } finally {
+      preparation.resolve(); flush.resolve(); holdPermissionFlush = false;
+      await notifications.get('turn/completed')?.({ threadId: 'thread-original', turn: { id: nativeTurn, status: 'completed' } });
+      await active?.catch(() => {});
+      stopLoop.resolve(); await run;
+      inputConsumerDrainPendingSpy.mockImplementation(async () => ({ materialized: 0, stoppedReason: 'no_pending' }));
+      spawnBoundary.mockRestore();
+    }
+  });
+
   beforeEach(async () => {
     providerInputOutcomeObserverMock.mockReset();
     probeCodexAcpLoadSessionSupportSpy.mockReset();
@@ -3086,6 +3196,96 @@ describe('runCodex CodexACP resume behavior', () => {
     expect(lastSessionClient.popPendingMessage).not.toHaveBeenCalled();
   });
 
+  it.each([false, true])('[exact-adapter] preserves opaque B through the real preflights (forced reconciliation=%s)', async (forceReconciliation) => {
+    resolveRunnerMcpServersSpy.mockResolvedValueOnce({
+      happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() }, mcpServers: {},
+    });
+    createCodexAppServerRuntimeSpy.mockReturnValueOnce({
+      ...createDefaultCodexAppServerRuntimeMock(),
+      getSessionId: () => 'thread-exact-adapter',
+      supportsInFlightSteer: () => true,
+      startOrLoad: vi.fn(async () => {}),
+    });
+    const loopStarted = createDeferred<void>();
+    const stopLoop = createDeferred<void>();
+    sessionInputConsumerWaitForNextInputImpl = async () => {
+      loopStarted.resolve();
+      await stopLoop.promise;
+      return null;
+    };
+    const { runCodex } = await import('./runCodex');
+    const run = runCodex({ credentials: { token: 'test' } as Credentials, startedBy: 'terminal',
+      startingMode: 'remote', codexBackendMode: 'appServer',
+      permissionMode: 'default', permissionModeUpdatedAt: 1 });
+    try {
+      await Promise.race([loopStarted.promise, run.then(() => { throw new Error('Run ended before adapter capture'); })]);
+      if (!lastSessionClient) throw new Error('Session adapter target missing');
+      const session = lastSessionClient;
+      const consumerOptions = createSessionProviderInputConsumerSpy.mock.calls.at(-1)?.[0];
+      if (!consumerOptions) throw new Error('Codex consumer options missing');
+      // Keep the actual runCodex adapter. The default harness consumer is a spy, so enter
+      // the existing importActual seam to exercise both real consumer predicate calls.
+      const actual = await vi.importActual<typeof import('@/agent/runtime/sessionInput/SessionProviderInputConsumer')>(
+        '@/agent/runtime/sessionInput/SessionProviderInputConsumer',
+      );
+      session.waitForProviderInputAdmission = createMutableApiSessionClientFixture().waitForProviderInputAdmission;
+      const localId = ' B ';
+      const held = new Set(['A']);
+      let reconciled = !forceReconciliation;
+      const preflight = vi.fn(function (this: typeof session,
+        attemptOpts: Parameters<NonNullable<SessionProviderInputConsumerSession['shouldAttemptPendingMaterialization']>>[0],
+      ) {
+        expect(this).toBe(session);
+        // Reconciliation changes readiness only: it never removes A or repairs a lost selector.
+        if (attemptOpts?.requestedLocalId !== localId || held.has(localId)) return false;
+        return reconciled;
+      });
+      session.shouldAttemptPendingMaterialization = preflight;
+      session.reconcilePendingQueueState = vi.fn(async (
+        opts: Parameters<NonNullable<SessionProviderInputConsumerSession['reconcilePendingQueueState']>>[0],
+      ) => {
+        expect(opts).toEqual({ force: true });
+        reconciled = true;
+        return true;
+      });
+      const materialize = vi.fn(async function (this: typeof session,
+        opts: Parameters<SessionProviderInputConsumerSession['materializeNextPendingMessageSafely']>[0],
+      ) {
+        expect(this).toBe(session);
+        expect(opts).toMatchObject({ requestedLocalId: localId, activeTurnSteerability: 'steerable',
+          pendingQueueDeliveryTiming: 'after_foreground_ready', reconcileWhenEmpty: 'force' });
+        // The exact attempt still returns no_pending; no provider delivery or acceptance is simulated.
+        return { type: 'no_pending' as const };
+      });
+      session.materializeNextPendingMessageSafely = materialize;
+      const consumer = actual.createSessionProviderInputConsumer(consumerOptions);
+      const drainOpts = { requestedLocalId: localId, activeTurnSteerability: 'steerable' as const,
+        pendingQueueDeliveryTiming: 'after_foreground_ready' as const };
+      await expect(consumer.drainPending(drainOpts)).resolves.toEqual({ materialized: 0, stoppedReason: 'no_pending' });
+      expect(preflight).toHaveBeenCalledTimes(forceReconciliation ? 2 : 1);
+      for (const [attemptOpts] of preflight.mock.calls) expect(attemptOpts).toEqual(drainOpts);
+      expect(session.reconcilePendingQueueState).toHaveBeenCalledTimes(forceReconciliation ? 1 : 0);
+      expect(materialize).toHaveBeenCalledTimes(1);
+      expect(held).toEqual(new Set(['A']));
+
+      held.add(localId);
+      preflight.mockClear();
+      session.reconcilePendingQueueState.mockClear();
+      await expect(consumer.drainPending(drainOpts)).resolves.toEqual({ materialized: 0, stoppedReason: 'materialization_blocked' });
+      expect(preflight).toHaveBeenCalledTimes(2);
+      for (const [attemptOpts] of preflight.mock.calls) expect(attemptOpts).toEqual(drainOpts);
+      expect(session.reconcilePendingQueueState).toHaveBeenCalledExactlyOnceWith({ force: true });
+      expect(held.has(localId)).toBe(true);
+      expect(materialize).toHaveBeenCalledTimes(1);
+
+      delete session.shouldAttemptPendingMaterialization;
+      expect(consumerOptions.session.shouldAttemptPendingMaterialization(drainOpts)).toBe(true);
+    } finally {
+      stopLoop.resolve();
+      await run;
+    }
+  });
+
   it('resumes and accepts an exact pending row from predecessor metadata', async () => {
     // cli-v0.2.1 and cli-v0.2.2-preview.1775586717.26498 metadata carry the binding but
     // predate connected-service materialization identity.
@@ -3257,11 +3457,12 @@ describe('runCodex CodexACP resume behavior', () => {
     });
     if (pendingProviderAction === 'steer') {
       expect(observedSuppressUserEcho).toBeUndefined();
-      expect(lastSessionClient?.blockPendingMessageDelivery).toHaveBeenCalledWith({
-        localIds: ['local-direct-stale-steer'],
+      expect(providerInputOutcomeObserverMock).toHaveBeenCalledWith({
+        kind: 'rejected_before_effect',
+        localId: 'local-direct-stale-steer',
         reason: 'steering_unavailable',
-        providerEffect: 'none',
       });
+      expect(lastSessionClient?.blockPendingMessageDelivery).not.toHaveBeenCalled();
     } else {
       expect(observedSuppressUserEcho).toBe(true);
       expect(lastSessionClient?.blockPendingMessageDelivery).not.toHaveBeenCalled();
@@ -3421,11 +3622,23 @@ describe('runCodex CodexACP resume behavior', () => {
       userMessageSeq: null,
     });
     expect(sendPrompt).not.toHaveBeenCalled();
-    expect(lastSessionClient?.blockPendingMessageDelivery).toHaveBeenCalledWith({
-      localIds: ['local-stale-steer'],
-      reason,
-      ...(providerEffect ? { providerEffect } : {}),
-    });
+    if (providerEffect === 'none') {
+      expect(providerInputOutcomeObserverMock).toHaveBeenCalledWith({
+        kind: 'rejected_before_effect',
+        localId: 'local-stale-steer',
+        reason: 'steering_unavailable',
+      });
+      expect(lastSessionClient?.blockPendingMessageDelivery).not.toHaveBeenCalled();
+    } else {
+      expect(lastSessionClient?.blockPendingMessageDelivery).toHaveBeenCalledWith({
+        localIds: ['local-stale-steer'],
+        reason,
+      });
+      expect(providerInputOutcomeObserverMock).not.toHaveBeenCalledWith(expect.objectContaining({
+        kind: 'rejected_before_effect',
+        localId: 'local-stale-steer',
+      }));
+    }
     const emittedMessages = (lastSessionClient?.sendSessionEvent as ReturnType<typeof vi.fn> | undefined)?.mock.calls
       .map((call) => call[0]?.message)
       .filter((message): message is string => typeof message === 'string') ?? [];
