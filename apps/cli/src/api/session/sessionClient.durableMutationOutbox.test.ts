@@ -531,6 +531,7 @@ describe('ApiSessionClient durable mutation outbox', () => {
       mode: 'session_sync_v2_pending_input_v1',
       runtimeActivity: 'v2',
       pendingInput: 'v1',
+      pendingExactLocalId: 'unsupported',
       sessionConnectionEpoch: 1,
       socket: sessionSocketStub,
     });

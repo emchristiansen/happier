@@ -1048,7 +1048,13 @@ export function sessionUpdateHandler(
         }
     });
 
-    socket.on('pending-materialize-next', async (data: any, callback?: (response: any) => void) => {
+    const handlePendingMaterialize = async (
+        data: any,
+        callback?: (response: any) => void,
+        exactLocalIdRequired = false,
+    ) => {
+        // One handler serves both events; refusal warnings name the event the runner sent.
+        const materializeEvent = exactLocalIdRequired ? "pending-materialize-exact-v1" : "pending-materialize-next";
         const respond = (response: any) => {
             if (typeof callback === 'function') {
                 callback(response);
@@ -1060,6 +1066,15 @@ export function sessionUpdateHandler(
             try {
                 const sid = typeof data?.sid === 'string' ? data.sid : null;
                 if (!sid) {
+                    respond({ ok: false, error: 'invalid-params' });
+                    return;
+                }
+                const requestedLocalId = data?.requestedLocalId === undefined
+                    ? undefined
+                    : readPendingLocalId(data.requestedLocalId) ?? null;
+                if ((data?.requestedLocalId !== undefined && requestedLocalId === null)
+                    || (exactLocalIdRequired && requestedLocalId === undefined)
+                    || (!exactLocalIdRequired && requestedLocalId !== undefined)) {
                     respond({ ok: false, error: 'invalid-params' });
                     return;
                 }
@@ -1077,7 +1092,7 @@ export function sessionUpdateHandler(
                 const deliveryState = resolvePendingMaterializeDeliveryStateOptIn(data);
                 if (deliveryState !== "provider") {
                     warnPendingPublisherAuthorityRefused({
-                        event: "pending-materialize-next",
+                        event: materializeEvent,
                         socket,
                         connection,
                         trusted: trustedTranscriptObservationPublisher,
@@ -1115,6 +1130,7 @@ export function sessionUpdateHandler(
                     ...(heldLocalIds.data !== undefined ? { heldLocalIds: heldLocalIds.data } : {}),
                     actorUserId: userId,
                     sessionId: sid,
+                    ...(requestedLocalId ? { requestedLocalId } : {}),
                     ...(expectedPendingVersion !== undefined ? { expectedPendingVersion } : {}),
                     deliveryTiming,
                     foregroundState,
@@ -1129,7 +1145,7 @@ export function sessionUpdateHandler(
                     || trusted.binding.sessionId !== sid
                 ) {
                     warnPendingPublisherAuthorityRefused({
-                        event: "pending-materialize-next",
+                        event: materializeEvent,
                         socket,
                         connection,
                         trusted,
@@ -1159,7 +1175,7 @@ export function sessionUpdateHandler(
                 });
                 if (current.status !== "current") {
                     warnPendingPublisherAuthorityRefused({
-                        event: "pending-materialize-next",
+                        event: materializeEvent,
                         socket,
                         connection,
                         trusted,
@@ -1173,7 +1189,7 @@ export function sessionUpdateHandler(
                 if (!result.ok) {
                     if (result.error === "forbidden") {
                         warnPendingPublisherAuthorityRefused({
-                            event: "pending-materialize-next",
+                            event: materializeEvent,
                             socket,
                             connection,
                             trusted,
@@ -1277,7 +1293,7 @@ export function sessionUpdateHandler(
                 const failure = mapPendingMaterializationError(error);
                 if (!failure.ok && failure.error === "forbidden") {
                     warnPendingPublisherAuthorityRefused({
-                        event: "pending-materialize-next",
+                        event: materializeEvent,
                         socket,
                         connection,
                         trusted: trustedTranscriptObservationPublisher,
@@ -1309,6 +1325,8 @@ export function sessionUpdateHandler(
             log({ module: 'websocket', level: 'error' }, `Error admitting pending-materialize-next: ${error}`);
             respond({ ok: false, error: 'internal' });
         }
-    });
+    };
+    socket.on('pending-materialize-next', (data, callback) => handlePendingMaterialize(data, callback));
+    socket.on('pending-materialize-exact-v1', (data, callback) => handlePendingMaterialize(data, callback, true));
 
 }

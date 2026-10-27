@@ -1,22 +1,62 @@
 # Pending delivery architecture
 
+## Exact Codex steering (development)
+
+An explicit pending-input action can steer the selected `localId` into the
+currently active Codex app-server turn. The runner captures that native turn
+before admitting the action and sends it as `expectedTurnId` at provider dispatch.
+If that turn ends, the input is refused before effect rather than redirected into
+a later turn. The action uses the existing Pending custody and delivery owners.
+
+The server advertises this operation separately as
+`capabilities.session.pendingInputExactLocalId: { protocolVersion: 1 }`.
+The strict `pendingInput` object keeps its existing shape, so older readers can
+ignore the optional sibling. A client requires both Pending-input support and
+the exact-local-ID capability. The exact materialization event selects only the
+requested eligible `steer_now_bound` row; an unavailable target never substitutes another
+urgent input. Ordinary materialization may defer on an unresolved delivery claim;
+exact selection of an eligible input can bypass an unrelated held input, while
+custody of the selected input still prevents duplicate dispatch. Publisher authority,
+the original runtime/turn binding and existing fail-closed checks still apply;
+selection does not prove provider acceptance.
+
+The control observes provider outcomes before sending the admission PATCH because
+a Pending wake can deliver the input before that HTTP acknowledgement returns.
+A durable admission acknowledgement alone does not prove provider delivery.
+`admitted_and_steered` requires observed acceptance on the captured turn;
+`admitted_delivery_unobserved` means admission is known but delivery was not
+observed. A lost or uncertain admission response retains the captured binding
+without claiming admission or replaying the provider input. Known rejection before
+effect remains distinct from that uncertainty. Session replacement and cleanup
+retain the existing publisher, generation and lifetime checks.
+
 ## Accepted settlement retry (development)
 
 Once a provider accepts a Pending input, the session client retains that exact
 accepted `localId` until settlement or exact committed replay proves delivery.
-Lost responses, unavailable or malformed acknowledgements, and an `internal`
-settlement failure leave the outcome uncertain. The existing settlement loop
-retries that same identity with capped exponential backoff while its socket,
-connection epoch, producer and session lifetime remain current. It never submits
-the provider input again. An explicit definitive refusal ends that operation's
-retries while preserving its unresolved custody.
+The settlement loop retries the same accepted identity while canonical custody
+and its accepted outcome remain retained, and the captured connected socket,
+connection epoch, producer generation and session lifetime remain current. It
+never submits the provider input again. A typed `forbidden` settlement refusal
+marks publisher loss: it stops the originating operation while retaining
+unresolved custody. The existing recovery path can reoffer that settlement after
+a connection reclaims publisher status.
 
-The local pre-emit `socket_not_connected` failure also permits that same settlement
-retry only when the error explicitly carries `retryable: true`. An unqualified
-failure does not gain retry permission. The existing authority checks still stop
-the originating operation if its connection or runtime is no longer current.
+The retry classifier and supported settlement retry directives select cadence,
+not permission to retry retained accepted custody. Recognized retryable failures
+or directives use exponential backoff capped at 60,000 ms; other failures use the
+existing outcome-write delay, capped at 120,000 ms. An unqualified
+`socket_not_connected` error or another definitive refusal does not by itself end
+that retained loop; `retryable: true` is not a prerequisite for its continued
+retry. An actual disconnect, stale socket or epoch, changed producer, aborted
+lifetime, missing custody or nonaccepted outcome still stops the originating
+operation through its existing guards. Capped delays do not bound total attempts
+or end-to-end recovery.
 
-Successful settlement releases the local gate that holds later materialization.
+Successful settlement or exact committed replay releases that accepted input's
+retained local state. Acceptance already permits later inputs to materialize;
+settlement is not a global queue gate. Canonical custody of the same input still
+protects against duplicate dispatch.
 Continued transport failure cannot promise queue progress. Disconnect, producer
 replacement and shutdown stop the originating operation; reconnect retains the
 existing exact-intent reconciliation path.

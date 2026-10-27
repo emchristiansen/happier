@@ -1,5 +1,6 @@
 import {
     FeaturesResponseSchema,
+    PENDING_INPUT_EXACT_LOCAL_ID_PROTOCOL_VERSION_V1,
     PENDING_INPUT_PROTOCOL_VERSION_V1,
     SESSION_SYNC_PROTOCOL_VERSION_RUNTIME_ACTIVITY,
 } from '@happier-dev/protocol';
@@ -8,6 +9,7 @@ import { normalizeBaseUrl } from '@/diagnostics/httpClient';
 
 export type RuntimeActivityServerContract = 'v2' | 'legacy' | 'unsupported' | 'indeterminate';
 export type PendingInputServerContract = 'v1' | 'released_server_v0_2_1' | 'unsupported' | 'indeterminate';
+export type PendingExactLocalIdServerContract = 'v1' | 'unsupported' | 'indeterminate';
 
 /**
  * Retained only as a compatibility projection for callers that have not yet
@@ -26,6 +28,7 @@ export type SessionSyncPendingInputServerContractResult = Readonly<{
     mode: SessionSyncPendingInputServerContractMode;
     runtimeActivity: RuntimeActivityServerContract;
     pendingInput: PendingInputServerContract;
+    pendingExactLocalId: PendingExactLocalIdServerContract;
     sessionConnectionEpoch: number;
     socket: ProbeSocket;
 }>;
@@ -39,11 +42,13 @@ type ContractProbe = Readonly<{
 type CapabilitySelection = Readonly<{
     runtimeActivity: RuntimeActivityServerContract;
     pendingInput: PendingInputServerContract;
+    pendingExactLocalId: PendingExactLocalIdServerContract;
 }>;
 
 const INDETERMINATE: CapabilitySelection = Object.freeze({
     runtimeActivity: 'indeterminate',
     pendingInput: 'indeterminate',
+    pendingExactLocalId: 'indeterminate',
 });
 
 function isReleasedServerV021(features: ReturnType<typeof FeaturesResponseSchema.parse>): boolean {
@@ -61,6 +66,7 @@ export function resolveSessionServerCapabilities(raw: unknown): CapabilitySelect
         return {
             runtimeActivity: 'legacy',
             pendingInput: 'released_server_v0_2_1',
+            pendingExactLocalId: 'unsupported',
         };
     }
 
@@ -68,6 +74,8 @@ export function resolveSessionServerCapabilities(raw: unknown): CapabilitySelect
         parsed.data.capabilities.session.runtimeActivity?.protocolVersion;
     const pendingInputVersion =
         parsed.data.capabilities.session.pendingInput?.protocolVersion;
+    const pendingExactLocalIdVersion =
+        parsed.data.capabilities.session.pendingInputExactLocalId?.protocolVersion;
     return {
         runtimeActivity:
             typeof runtimeActivityVersion === 'number'
@@ -76,6 +84,13 @@ export function resolveSessionServerCapabilities(raw: unknown): CapabilitySelect
                 : 'unsupported',
         pendingInput:
             typeof pendingInputVersion === 'number'
+            && pendingInputVersion >= PENDING_INPUT_PROTOCOL_VERSION_V1
+                ? 'v1'
+                : 'unsupported',
+        pendingExactLocalId:
+            typeof pendingExactLocalIdVersion === 'number'
+            && pendingExactLocalIdVersion >= PENDING_INPUT_EXACT_LOCAL_ID_PROTOCOL_VERSION_V1
+            && typeof pendingInputVersion === 'number'
             && pendingInputVersion >= PENDING_INPUT_PROTOCOL_VERSION_V1
                 ? 'v1'
                 : 'unsupported',
@@ -110,6 +125,12 @@ export function supportsPendingInputV1(
     result: SessionSyncPendingInputServerContractResult | null | undefined,
 ): boolean {
     return result?.pendingInput === 'v1';
+}
+
+export function supportsPendingExactLocalIdV1(
+    result: SessionSyncPendingInputServerContractResult | null | undefined,
+): boolean {
+    return result?.pendingExactLocalId === 'v1';
 }
 
 export function createSessionSyncPendingInputServerContractController(options: Readonly<{
@@ -198,6 +219,7 @@ export function createSessionSyncPendingInputServerContractController(options: R
                     active === attempt
                     && result.runtimeActivity === 'indeterminate'
                     && result.pendingInput === 'indeterminate'
+                    && result.pendingExactLocalId === 'indeterminate'
                 ) {
                     active = null;
                 }
