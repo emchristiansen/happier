@@ -9,6 +9,9 @@ const mocks = vi.hoisted(() => ({
 }));
 
 import { buildCgroupSelfMigratingHappyCliLaunchSpec } from './buildCgroupSelfMigratingHappyCliLaunchSpec';
+import type { SessionLaunchId } from './sessionLaunchId';
+
+const LAUNCH_ID = '5f0e9d8c-7b6a-4954-8372-615049382716' as SessionLaunchId;
 
 describe('buildCgroupSelfMigratingHappyCliLaunchSpec', () => {
   let sandboxDir: string | null = null;
@@ -35,12 +38,14 @@ describe('buildCgroupSelfMigratingHappyCliLaunchSpec', () => {
       'utf8',
     );
 
-    const result = await buildCgroupSelfMigratingHappyCliLaunchSpec({
+    const plan = await buildCgroupSelfMigratingHappyCliLaunchSpec({
+      launchId: LAUNCH_ID,
       args: ['codex', '--happy-starting-mode', 'remote'],
       daemonPid: 111,
       procfsRootDir,
       systemdUserResourceGovernorExecFile: mocks.systemdResourceGovernorExecFile,
     });
+    const result = plan.launchSpec;
 
     expect(result?.filePath).toBe('/bin/sh');
     expect(result?.env?.HAPPIER_DAEMON_SESSION_CGROUP_BASE_DIR).toBe(
@@ -65,7 +70,8 @@ describe('buildCgroupSelfMigratingHappyCliLaunchSpec', () => {
     );
     const immutableEntrypoint = '/runtime/.runner-snapshots/0123456789abcdef/index.mjs';
 
-    const result = await buildCgroupSelfMigratingHappyCliLaunchSpec({
+    const plan = await buildCgroupSelfMigratingHappyCliLaunchSpec({
+      launchId: LAUNCH_ID,
       args: ['codex', '--happy-terminal-mode', 'plain'],
       daemonPid: 222,
       procfsRootDir,
@@ -78,6 +84,7 @@ describe('buildCgroupSelfMigratingHappyCliLaunchSpec', () => {
         },
       },
     });
+    const result = plan.launchSpec;
 
     expect(result?.args).toEqual(expect.arrayContaining([
       immutableEntrypoint,
@@ -102,7 +109,8 @@ describe('buildCgroupSelfMigratingHappyCliLaunchSpec', () => {
     });
 
     try {
-      const result = await buildCgroupSelfMigratingHappyCliLaunchSpec({
+      const plan = await buildCgroupSelfMigratingHappyCliLaunchSpec({
+        launchId: LAUNCH_ID,
         args: ['codex', '--happy-starting-mode', 'remote'],
         daemonPid: 333,
         procfsRootDir: '/proc-that-is-not-used-when-systemd-is-ready',
@@ -111,16 +119,24 @@ describe('buildCgroupSelfMigratingHappyCliLaunchSpec', () => {
         },
         systemdUserResourceGovernorExecFile: mocks.systemdResourceGovernorExecFile,
       });
+      const result = plan.launchSpec;
 
       expect(result?.filePath).toBe('systemd-run');
       expect(result?.args).toEqual(expect.arrayContaining([
         '--user',
         '--scope',
         '--slice=happier-jobs.slice',
+        `--unit=happier-launch-${LAUNCH_ID}.scope`,
         '--nice=10',
+        '--expand-environment=no',
         '--',
         'codex',
       ]));
+      expect(plan.placement).toEqual({
+        kind: 'systemd-scope',
+        launchId: LAUNCH_ID,
+        unitName: `happier-launch-${LAUNCH_ID}.scope`,
+      });
       expect(result?.args.join(' ')).not.toMatch(/MemoryMax|MemoryHigh|MemoryLimit|OOM/u);
       expect(result?.env?.HAPPIER_DAEMON_SPAWN_SELF_MIGRATE_CGROUP).toBe('');
       expect(mocks.systemdResourceGovernorExecFile).toHaveBeenCalledWith(
@@ -169,7 +185,8 @@ describe('buildCgroupSelfMigratingHappyCliLaunchSpec', () => {
     });
 
     try {
-      const result = await buildCgroupSelfMigratingHappyCliLaunchSpec({
+      const plan = await buildCgroupSelfMigratingHappyCliLaunchSpec({
+        launchId: LAUNCH_ID,
         args: ['codex'],
         daemonPid: 444,
         procfsRootDir,
@@ -178,11 +195,16 @@ describe('buildCgroupSelfMigratingHappyCliLaunchSpec', () => {
         },
         systemdUserResourceGovernorExecFile: mocks.systemdResourceGovernorExecFile,
       });
+      const result = plan.launchSpec;
 
       expect(result?.filePath).toBe('/bin/sh');
       expect(result?.env?.HAPPIER_DAEMON_SESSION_CGROUP_BASE_DIR).toBe(
         '/sys/fs/cgroup/user.slice/user-501.slice/user@501.service',
       );
+      expect(plan.placement).toEqual({
+        kind: 'unscoped',
+        probe: { kind: 'slice-mismatch', property: 'MemoryHigh', expected: 'positive-finite', actual: 'infinity' },
+      });
     } finally {
       Object.defineProperty(process, 'platform', {
         configurable: true,

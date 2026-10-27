@@ -215,6 +215,12 @@ import { removeRuntimeAuthFailureReportOutboxItemsForSession } from './connected
 import { createConnectedServiceRecoverySupersessionCleaner } from './connectedServices/continuation/continuationRecoverySupersession';
 import { buildCgroupSelfMigratingHappyCliLaunchSpec } from './platform/linux/buildCgroupSelfMigratingHappyCliLaunchSpec';
 import { shouldUseSystemdUserSessionResourceGovernor } from './platform/linux/systemdUserResourceGovernor';
+import { createSessionLaunchId } from './platform/linux/sessionLaunchId';
+import {
+  resolveSessionLaunchPlacement,
+  type SessionLaunchPlacementIntent,
+} from './platform/linux/observeSessionLaunchPlacement';
+import { startSessionLaunchOutcomeLog, type SessionLaunchOutcomeLogWriter } from './spawn/sessionLaunchOutcomeLog';
 import { applySpawnedChildOomScoreAdjustment } from './platform/linux/applySpawnedChildOomScoreAdjustment';
 import { resolveWindowsRemoteSessionConsoleMode } from './platform/windows/windowsSessionConsoleMode';
 import { startHappySessionInVisibleWindowsConsole } from './platform/windows/spawnHappyCliVisibleConsole';
@@ -249,6 +255,7 @@ import { resolveDaemonDiagnosticSubsystemGates } from './startup/diagnosticSubsy
 import { createDaemonEventLoopStallMonitor } from './diagnostics/daemonEventLoopStallMonitor';
 import { resolveStartDaemonMachinePreflightDecision } from './startup/machinePreflightDecision';
 import { waitForSessionWebhook } from './spawn/waitForSessionWebhook';
+import { settlePendingSpawnBeforeWebhook } from './spawn/settlePendingSpawnBeforeWebhook';
 import { resolveSpawnChildEnvironment } from './spawn/resolveSpawnChildEnvironment';
 import { buildSpawnChildProcessEnv } from './spawn/buildSpawnChildProcessEnv';
 import { resolveStackProcessKindOverrideForSessionSpawn } from './spawn/resolveStackProcessKindOverrideForSessionSpawn';
@@ -512,6 +519,13 @@ import { readCredentialAccountIdentity } from './connectedServices/quotas/coordi
 import { startConnectedServiceStableHomeReconcileScheduler } from './connectedServices/startup/stableHomeReconcile';
 import { tryDecryptSessionMetadata } from '@/session/transport/encryption/sessionEncryptionContext';
 import { sendSessionMessage } from '@/session/services/sendSessionMessage';
+
+// Launch-outcome lines (launch-placement, launch-failed, launch-session-bound) go to the
+// daemon log file; a failed launch is also a warning.
+const sessionLaunchOutcomeLogWriter: SessionLaunchOutcomeLogWriter = {
+  info: (line) => logger.infoFile(line),
+  warn: (line) => logger.warn(line),
+};
 
 function resolvePositiveIntEnv(raw: string | undefined, fallback: number, bounds: { min: number; max: number }): number {
   const value = (raw ?? '').trim();
@@ -4053,7 +4067,11 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 ...(tmuxTmpDir ? ['--happy-tmux-tmpdir', tmuxTmpDir] : []),
               ];
 
-                  const { commandTokens, tmuxEnv } = await buildTmuxSpawnConfig({
+                  // One launch identity per physical attempt; a failed tmux attempt that
+                  // falls back to a regular spawn gets a fresh one there.
+                  const tmuxLaunchId = createSessionLaunchId();
+                  const { commandTokens, tmuxEnv, placement: tmuxPlacementIntent } = await buildTmuxSpawnConfig({
+                    launchId: tmuxLaunchId,
                     agent: agentSubcommand,
                     directory: resolvedDirectory,
                     extraEnv: extraEnvForChildWithMessage,
@@ -4103,6 +4121,21 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               throw new Error('Tmux window created but no PID returned');
             }
             const tmuxPid = tmuxResult.pid;
+            // tmuxPid is the pane process. The pane runs a quoted shell command, so its
+            // shell may stay outside while its child enters the scope; observing only
+            // this PID then yields `unknown`, which best-effort coverage accepts.
+            const tmuxLaunchOutcomeLog = startSessionLaunchOutcomeLog({
+              launchId: tmuxLaunchId,
+              mode: 'tmux',
+              existingSessionId: normalizedExistingSessionId,
+              pid: tmuxPid,
+              placement: resolveSessionLaunchPlacement({
+                intent: tmuxPlacementIntent,
+                pid: tmuxPid,
+                uid: process.getuid?.() ?? null,
+              }),
+              write: sessionLaunchOutcomeLogWriter,
+            });
 
             // Resolve the actual tmux session name used (important when sessionName was empty/undefined)
             const tmuxSession = tmuxResult.sessionName ?? (resolvedTmuxSessionName || 'happy');
@@ -4171,6 +4204,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 timeoutErrorMessage: `Session webhook timeout for PID ${tmuxPid} (tmux)`,
                 onTimeout: () => {
                   logger.debug(`[DAEMON RUN] Session webhook timeout for PID ${tmuxPid} (tmux)`);
+                  // No exit-code channel exists on this path; the webhook is the only outcome.
+                  tmuxLaunchOutcomeLog.webhookTimedOut();
                 },
               onSuccess: (completedSession) => {
                 logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook (tmux)`);
@@ -4183,6 +4218,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 warn: (message) => logger.warn(message),
               });
               if (resolved.type === 'success' && resolved.sessionId) {
+                tmuxLaunchOutcomeLog.sessionBound(resolved.sessionId);
                 await bindSpawnedTmuxTerminalAttachment({
                   happyHomeDir: configuration.happyHomeDir,
                   sessionId: resolved.sessionId,
@@ -4538,15 +4574,20 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 windowsHide: true,
                 env: childProcessEnv,
               };
-              const cgroupSelfMigratingLaunchSpec =
+              const childLaunchId = createSessionLaunchId();
+              const childLaunchPlan =
                 shouldUseSystemdUserSessionResourceGovernor({ platform: process.platform, startupSource })
                   ? await buildCgroupSelfMigratingHappyCliLaunchSpec({
+                    launchId: childLaunchId,
                     args,
                     daemonPid: process.pid,
                     environment: childProcessEnv,
                     launchOptions: runnerLaunchOptions,
                   })
                   : null;
+              const cgroupSelfMigratingLaunchSpec = childLaunchPlan?.launchSpec ?? null;
+              const childPlacementIntent: SessionLaunchPlacementIntent = childLaunchPlan?.placement
+                ?? { kind: 'unscoped', probe: { kind: 'unsupported-platform', platform: process.platform } };
               const happyProcess = cgroupSelfMigratingLaunchSpec
                 ? spawnChildProcess(
                   cgroupSelfMigratingLaunchSpec.filePath,
@@ -4581,6 +4622,21 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
 
               logger.debug(`[DAEMON RUN] Spawned process with PID ${happyProcess.pid}`);
               happyProcess.unref();
+              const childProcessKnownGone = () => happyProcess.exitCode !== null || happyProcess.signalCode !== null;
+              // Observation runs beside the fast acknowledgement and never delays or gates it.
+              const childLaunchOutcomeLog = startSessionLaunchOutcomeLog({
+                launchId: childLaunchId,
+                mode: 'child',
+                existingSessionId: normalizedExistingSessionId,
+                pid: happyProcess.pid,
+                placement: resolveSessionLaunchPlacement({
+                  intent: childPlacementIntent,
+                  pid: happyProcess.pid,
+                  uid: process.getuid?.() ?? null,
+                  isKnownGone: childProcessKnownGone,
+                }),
+                write: sessionLaunchOutcomeLogWriter,
+              });
               void applySpawnedChildOomScoreAdjustment({
                 pid: happyProcess.pid,
                 startupSource,
@@ -4642,18 +4698,20 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           happyProcess.on('exit', (code, signal) => {
             logger.debug(`[DAEMON RUN] Child PID ${happyProcess.pid} exited with code ${code}, signal ${signal}`);
             if (happyProcess.pid) {
-              const resolveSpawn = pidToSpawnResultResolver.get(happyProcess.pid);
-              if (resolveSpawn) {
-                pidToSpawnResultResolver.delete(happyProcess.pid);
-                const timeout = pidToSpawnWebhookTimeout.get(happyProcess.pid);
-                if (timeout) clearTimeout(timeout);
-                pidToSpawnWebhookTimeout.delete(happyProcess.pid);
-                pidToAwaiter.delete(happyProcess.pid);
-                resolveSpawn({
+              const settledPendingLaunch = settlePendingSpawnBeforeWebhook({
+                pid: happyProcess.pid,
+                pidToAwaiter,
+                pidToSpawnResultResolver,
+                pidToSpawnWebhookTimeout,
+                result: {
                   type: 'error',
                   errorCode: SPAWN_SESSION_ERROR_CODES.CHILD_EXITED_BEFORE_WEBHOOK,
                   errorMessage: `Child process exited before session webhook (pid=${happyProcess.pid}, code=${code ?? 'null'}, signal=${signal ?? 'null'})`,
-                });
+                },
+              });
+              // Only a still-pending launch failed; an ordinary session end is not a failed launch.
+              if (settledPendingLaunch) {
+                childLaunchOutcomeLog.childExitedBeforeWebhook({ code, signal });
               }
               void onChildExited(happyProcess.pid, { reason: 'process-exited', code, signal }).catch((error) => {
                 logger.warn('[DAEMON RUN] Failed to complete child-exit lifecycle after process exit', { pid: happyProcess.pid, error });
@@ -4664,18 +4722,19 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           happyProcess.on('error', (error) => {
             logger.debug(`[DAEMON RUN] Child process error:`, error);
             if (happyProcess.pid) {
-              const resolveSpawn = pidToSpawnResultResolver.get(happyProcess.pid);
-              if (resolveSpawn) {
-                pidToSpawnResultResolver.delete(happyProcess.pid);
-                const timeout = pidToSpawnWebhookTimeout.get(happyProcess.pid);
-                if (timeout) clearTimeout(timeout);
-                pidToSpawnWebhookTimeout.delete(happyProcess.pid);
-                pidToAwaiter.delete(happyProcess.pid);
-                resolveSpawn({
+              const settledPendingLaunch = settlePendingSpawnBeforeWebhook({
+                pid: happyProcess.pid,
+                pidToAwaiter,
+                pidToSpawnResultResolver,
+                pidToSpawnWebhookTimeout,
+                result: {
                   type: 'error',
                   errorCode: SPAWN_SESSION_ERROR_CODES.CHILD_EXITED_BEFORE_WEBHOOK,
                   errorMessage: `Child process error before session webhook (pid=${happyProcess.pid})`,
-                });
+                },
+              });
+              if (settledPendingLaunch) {
+                childLaunchOutcomeLog.childErrorBeforeWebhook(error);
               }
               void onChildExited(happyProcess.pid, { reason: 'process-error', code: null, signal: null }).catch((error) => {
                 logger.warn('[DAEMON RUN] Failed to complete child-exit lifecycle after process error', { pid: happyProcess.pid, error });
@@ -4698,6 +4757,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 timeoutErrorMessage: `Session webhook timeout for PID ${happyProcess.pid}`,
                 onTimeout: () => {
                   logger.debug(`[DAEMON RUN] Session webhook timeout for PID ${happyProcess.pid}`);
+                  childLaunchOutcomeLog.webhookTimedOut({ processRunning: !childProcessKnownGone() });
                 },
                 onSuccess: (completedSession) => {
                   logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook`);
@@ -4709,6 +4769,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               pidToTrackedSession,
               warn: (message) => logger.warn(message),
             });
+            if (resolved.type === 'success' && resolved.sessionId) {
+              childLaunchOutcomeLog.sessionBound(resolved.sessionId);
+            }
             daemonSpawnAttemptRegistry.settle(trackedSpawnOptions.spawnNonce ?? '', resolved);
             const nudgeResult = await nudgeAttachedExistingSessionPendingQueue({
               requestedExistingSessionId: normalizedExistingSessionId,

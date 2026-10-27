@@ -1,6 +1,8 @@
 import { buildHappyCliSubprocessLaunchSpec, type HappyCliSubprocessLaunchOptions } from '@/utils/spawnHappyCLI';
 import type { CatalogAgentId } from '@/backends/types';
 import { buildCgroupSelfMigratingHappyCliLaunchSpec } from '../linux/buildCgroupSelfMigratingHappyCliLaunchSpec';
+import type { SessionLaunchPlacementIntent } from '../linux/observeSessionLaunchPlacement';
+import type { SessionLaunchId } from '../linux/sessionLaunchId';
 
 type TmuxSpawnAgentId = CatalogAgentId | 'acp-catalog';
 
@@ -34,6 +36,7 @@ export function buildTmuxWindowEnv(
 }
 
 export async function buildTmuxSpawnConfig(params: {
+  launchId: SessionLaunchId;
   agent: TmuxSpawnAgentId;
   directory: string;
   extraEnv: Record<string, string>;
@@ -45,6 +48,7 @@ export async function buildTmuxSpawnConfig(params: {
   tmuxEnv: Record<string, string>;
   tmuxCommandEnv: Record<string, string>;
   directory: string;
+  placement: SessionLaunchPlacementIntent;
 }> {
   const args = [
     params.agent,
@@ -57,10 +61,12 @@ export async function buildTmuxSpawnConfig(params: {
 
   const launchSpec = buildHappyCliSubprocessLaunchSpec(args, params.launchOptions);
   const tmuxEnv = buildTmuxWindowEnv(process.env, { ...params.extraEnv, ...(launchSpec.env ?? {}) });
-  const scopedLaunchSpec = process.platform === 'linux'
-    ? await buildCgroupSelfMigratingHappyCliLaunchSpec({ launchSpec, environment: tmuxEnv })
+  const launchPlan = process.platform === 'linux'
+    ? await buildCgroupSelfMigratingHappyCliLaunchSpec({ launchId: params.launchId, launchSpec, environment: tmuxEnv })
     : null;
-  const effectiveLaunchSpec = scopedLaunchSpec ?? launchSpec;
+  const effectiveLaunchSpec = launchPlan?.launchSpec ?? launchSpec;
+  const placement: SessionLaunchPlacementIntent = launchPlan?.placement
+    ?? { kind: 'unscoped', probe: { kind: 'unsupported-platform', platform: process.platform } };
   const commandTokens = [effectiveLaunchSpec.filePath, ...effectiveLaunchSpec.args];
 
   const tmuxCommandEnv: Record<string, string> = { ...(params.tmuxCommandEnv ?? {}) };
@@ -74,5 +80,6 @@ export async function buildTmuxSpawnConfig(params: {
     tmuxEnv: { ...tmuxEnv, ...(effectiveLaunchSpec.env ?? {}) },
     tmuxCommandEnv,
     directory: params.directory,
+    placement,
   };
 }

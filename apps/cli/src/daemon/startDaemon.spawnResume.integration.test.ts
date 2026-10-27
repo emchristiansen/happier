@@ -545,20 +545,23 @@ const providerActivityRecorderCapture = vi.hoisted(() => ({
 }));
 
 const buildCgroupSelfMigratingHappyCliLaunchSpec = vi.hoisted(() => vi.fn(async () => ({
-  filePath: '/bin/sh',
-  args: [
-    '-lc',
-    'target_dir="$HAPPIER_DAEMON_SESSION_CGROUP_BASE_DIR/happier-session-$$.scope" && mkdir -p "$target_dir" && printf "%s\\n" "$$" > "$target_dir/cgroup.procs" && exec "$@"',
-    'sh',
-    '/tmp/happier-runtime',
-    'codex',
-    '--happy-starting-mode',
-    'remote',
-    '--started-by',
-    'daemon',
-  ],
-  env: {
-    HAPPIER_DAEMON_SESSION_CGROUP_BASE_DIR: '/sys/fs/cgroup/user.slice/user-501.slice/user@501.service/app.slice',
+  placement: { kind: 'unscoped' as const, probe: { kind: 'no-user-bus' as const } },
+  launchSpec: {
+    filePath: '/bin/sh',
+    args: [
+      '-lc',
+      'target_dir="$HAPPIER_DAEMON_SESSION_CGROUP_BASE_DIR/happier-session-$$.scope" && mkdir -p "$target_dir" && printf "%s\\n" "$$" > "$target_dir/cgroup.procs" && exec "$@"',
+      'sh',
+      '/tmp/happier-runtime',
+      'codex',
+      '--happy-starting-mode',
+      'remote',
+      '--started-by',
+      'daemon',
+    ],
+    env: {
+      HAPPIER_DAEMON_SESSION_CGROUP_BASE_DIR: '/sys/fs/cgroup/user.slice/user-501.slice/user@501.service/app.slice',
+    },
   },
 })));
 
