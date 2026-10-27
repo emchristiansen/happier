@@ -247,6 +247,7 @@ const harness = vi.hoisted(() => {
   let resolveShutdown: ((value: { source: ShutdownSource; errorMessage?: string }) => void) | null = null;
   let requestShutdownRef: ((source: ShutdownSource, errorMessage?: string) => void) | null = null;
   let spawnSessionRef: ((options: any, hooks?: any) => Promise<any>) | null = null;
+  const spawnSessionRegistrationWaiters = new Set<(spawn: NonNullable<typeof spawnSessionRef>) => void>();
   let stopSessionRef: ((sessionId: string) => Promise<import('./sessions/stopSessionContract').StopSessionResult>) | null = null;
   let prepareStopSessionRef: ((child: any) => Promise<void> | void) | null = null;
   let beforeShutdownRef: (() => Promise<void>) | null = null;
@@ -311,8 +312,14 @@ const harness = vi.hoisted(() => {
     requestShutdown: (source: ShutdownSource) => requestShutdownRef?.(source),
     setSpawnSession: (fn: (options: any, hooks?: any) => Promise<any>) => {
       spawnSessionRef = fn;
+      for (const resolve of spawnSessionRegistrationWaiters) resolve(fn);
+      spawnSessionRegistrationWaiters.clear();
     },
     getSpawnSession: () => spawnSessionRef,
+    waitForSpawnSessionRegistration: () => new Promise<NonNullable<typeof spawnSessionRef>>((resolve) => {
+      if (spawnSessionRef) resolve(spawnSessionRef);
+      else spawnSessionRegistrationWaiters.add(resolve);
+    }),
     setResolveSpawnSessionByNonce: (fn: (spawnNonce: string) => Promise<unknown> | unknown) => {
       resolveSpawnSessionByNonceRef = fn;
     },
@@ -355,6 +362,7 @@ const harness = vi.hoisted(() => {
     }) => await pendingSessionActivationHintListenerRef?.(hint),
     resetControlRefs: () => {
       spawnSessionRef = null;
+      spawnSessionRegistrationWaiters.clear();
       stopSessionRef = null;
       prepareStopSessionRef = null;
       beforeShutdownRef = null;
@@ -4022,42 +4030,61 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     // for Pending: it runs the admission currentness guard and reports success, so it proves
     // admission was reached, not Pending durability or provider execution.
     async function armDueLimitResetRetry() {
-      const scheduler = harness.getRuntimeAuthRecoveryScheduler();
-      if (!scheduler) throw new Error('Expected the daemon runtime-auth recovery scheduler');
-      const classification: ConnectedServiceRuntimeFailureClassification = {
-        kind: 'usage_limit', serviceId: 'openai-codex', groupId: null,
-        // A fresh profile keeps this run's durable key apart from earlier runs sharing the store.
-        profileId: `primary-${randomUUID()}`,
-        resetsAtMs: Date.now() + 100, retryAfterMs: null, planType: null, rateLimits: null,
-        source: 'structured_provider_error', sourceKey: 'provider-source-0',
-      };
-      const recoveryKey = buildRuntimeAuthRecoveryKey({ sessionId: id, ...classification });
-      const intake = await scheduler.beginClassifiedFailure({ reportId: 'limit-report', sessionId: id,
-        switchesThisTurn: 0, classification, resumePromptMode: 'standard' });
-      await scheduler.markDurableWaitForResultByKey({
-        recoveryKey,
-        result: await handleConnectedServiceRuntimeAuthFailure({
-          sessionId: id,
-          selection: { kind: 'profile', serviceId: classification.serviceId, profileId: classification.profileId! },
-          classification, switchesThisTurn: 0,
-          switchCoordinator: { switchAfterClassifiedFailure: async () => { throw new Error('no group switch for a profile'); } },
-        }),
-        classificationFailureKind: classification.kind, classificationResetsAtMs: classification.resetsAtMs,
-        expectedAttemptId: intake.attemptId,
-      });
-      expect(scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'waiting' });
-      return {
-        scheduler,
-        recoveryKey,
-        // Joins the reset timer's wake if it is already running; otherwise runs the due retry.
-        wakeAfterReset: async () => {
-          await new Promise((resolve) => setTimeout(resolve, Math.max(0, (classification.resetsAtMs ?? 0) - Date.now()) + 20));
-          await scheduler.wakeByKey({ recoveryKey, reason: 'timer' });
-        },
-      };
+      // Durable setup can outlast a short wall-clock reset. The scheduler and its
+      // classification share one logical clock; file I/O and timers stay real.
+      let logicalNowMs = Date.now();
+      const dateNowSpy = vi.spyOn(Date, 'now').mockImplementation(() => logicalNowMs);
+      const resetAtMs = logicalNowMs + 100;
+      try {
+        const scheduler = harness.getRuntimeAuthRecoveryScheduler();
+        if (!scheduler) throw new Error('Expected the daemon runtime-auth recovery scheduler');
+        const classification: ConnectedServiceRuntimeFailureClassification = {
+          kind: 'usage_limit', serviceId: 'openai-codex', groupId: null,
+          // A fresh profile keeps this run's durable key apart from earlier runs sharing the store.
+          profileId: `primary-${randomUUID()}`,
+          resetsAtMs: resetAtMs, retryAfterMs: null, planType: null, rateLimits: null,
+          source: 'structured_provider_error', sourceKey: 'provider-source-0',
+        };
+        const recoveryKey = buildRuntimeAuthRecoveryKey({ sessionId: id, ...classification });
+        const intake = await scheduler.beginClassifiedFailure({ reportId: 'limit-report', sessionId: id,
+          switchesThisTurn: 0, classification, resumePromptMode: 'standard' });
+        await scheduler.markDurableWaitForResultByKey({
+          recoveryKey,
+          result: await handleConnectedServiceRuntimeAuthFailure({
+            sessionId: id,
+            selection: { kind: 'profile', serviceId: classification.serviceId, profileId: classification.profileId! },
+            classification, switchesThisTurn: 0,
+            switchCoordinator: { switchAfterClassifiedFailure: async () => { throw new Error('no group switch for a profile'); } },
+          }),
+          classificationFailureKind: classification.kind, classificationResetsAtMs: classification.resetsAtMs,
+          expectedAttemptId: intake.attemptId,
+        });
+        expect(scheduler.readByKey(recoveryKey)).toMatchObject({ status: 'waiting' });
+        expect(scheduler.readByKey(recoveryKey)?.nextRetryAtMs).toBe(resetAtMs);
+        return {
+          scheduler,
+          recoveryKey,
+          wakeAfterReset: async () => {
+            try {
+              // Join any early timer wake before moving the clock, so a due wake
+              // cannot accidentally join a wake that sampled the pre-reset time.
+              await expect(scheduler.wakeByKey({ recoveryKey, reason: 'timer' })).resolves.toEqual({ status: 'waiting' });
+              logicalNowMs = resetAtMs;
+              return await scheduler.wakeByKey({ recoveryKey, reason: 'timer' });
+            } finally {
+              dateNowSpy.mockRestore();
+            }
+          },
+        };
+      } catch (error) {
+        dateNowSpy.mockRestore();
+        throw error;
+      }
     }
 
-    function admitContinuations() {
+    async function admitContinuations() {
+      // Initialize the boundary factory before replacing its default real sender.
+      await import('@/session/services/sendSessionMessage');
       continuationAdmissionMocks.sendSessionMessage.mockImplementation(async (request) => {
         request.assertCanAdmit?.();
         return { ok: true, sessionId: id, localId: request.localId ?? 'accepted', waited: false };
@@ -4065,7 +4092,7 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     }
 
     it('admits the limit-reset continuation whose Resume replaced the lost-publisher runner', async () => {
-      admitContinuations();
+      await admitContinuations();
       const usageLimitCancelSpy = vi.spyOn(UsageLimitRecoveryScheduler.prototype, 'cancel');
       const temporaryThrottleCancelSpy = vi.spyOn(TemporaryThrottleRecoveryScheduler.prototype, 'stopRetrying');
       let recovery: Awaited<ReturnType<typeof armDueLimitResetRetry>> | null = null;
@@ -4073,7 +4100,7 @@ describe('startDaemon spawn resume wiring (integration)', () => {
         capability: async () => publisherLost(localRunner),
         drive: async () => {
           recovery = await armDueLimitResetRetry();
-          await recovery.wakeAfterReset();
+          await expect(recovery.wakeAfterReset()).resolves.toEqual({ status: 'waiting' });
         },
       });
 
@@ -4081,6 +4108,7 @@ describe('startDaemon spawn resume wiring (integration)', () => {
         exactRunner: expect.objectContaining({ pid: runnerPid, processInstanceFingerprint: runnerFingerprint }),
       });
       expect(spawnHappyCLI).toHaveBeenCalledTimes(1);
+      await expect(continuationAdmissionMocks.sendSessionMessage.mock.results[0]?.value).resolves.toMatchObject({ ok: true });
       expect(recovery!.scheduler.readByKey(recovery!.recoveryKey)).toMatchObject({ status: 'resumed_awaiting_proof' });
       expect(continuationAdmissionMocks.sendSessionMessage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
         idOrPrefix: id,
@@ -4093,7 +4121,7 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     });
 
     it('still lets an explicit Stop that races the replacement cancel the limit-reset recovery and queued auth work', async () => {
-      admitContinuations();
+      await admitContinuations();
       // Hold the joining Stop's asynchronous cleanup at its recovery cancellation, so queued auth
       // work is observed while that cleanup has not finished and the recovery still owns the lane.
       const cancelRecovery = RuntimeAuthRecoveryScheduler.prototype.cancel;
@@ -4171,7 +4199,7 @@ describe('startDaemon spawn resume wiring (integration)', () => {
         },
         drive: async () => {
           recovery.current = await armDueLimitResetRetry();
-          await recovery.current.wakeAfterReset();
+          await expect(recovery.current.wakeAfterReset()).resolves.toEqual({ status: 'inactive' });
         },
       });
       // The replacement reached its exact Stop, so the independent caller ran.
@@ -5808,18 +5836,17 @@ describe('startDaemon spawn resume wiring (integration)', () => {
         ? { ok: true, capability: 'pending_queue_wake_v1', protocolVersion: 1, method: 'session.pendingQueue.wake.v1' }
         : { ok: true, result: 'wake_published' });
 
+    let run: Promise<void> | null = null;
     try {
       const { startDaemon } = await import('./startDaemon');
 
-      const run = startDaemon();
-      let spawnSession = harness.getSpawnSession();
-      for (let attempt = 0; attempt < 20 && !spawnSession; attempt += 1) {
-        await vi.advanceTimersByTimeAsync(0);
-        spawnSession = harness.getSpawnSession();
-      }
-      if (!spawnSession) {
-        throw new Error('Expected spawnSession to be registered');
-      }
+      run = startDaemon();
+      // Registration is an event at the mocked control-server boundary. Fake
+      // timer turns do not bound the real marker I/O that startup awaits.
+      const spawnSession = await Promise.race([
+        harness.waitForSpawnSessionRegistration(),
+        run.then(() => { throw new Error('Daemon exited before spawnSession registration'); }),
+      ]);
 
       const resultPromise = spawnSession({
         directory: '/tmp',
@@ -5837,18 +5864,27 @@ describe('startDaemon spawn resume wiring (integration)', () => {
       harness.requestShutdown('happier-cli');
       await vi.advanceTimersByTimeAsync(0);
       await run;
+      run = null;
 
       await vi.advanceTimersByTimeAsync(60_000);
       expect(callSessionRpc).toHaveBeenCalledTimes(2);
       expect(vi.getTimerCount()).toBeLessThanOrEqual(timerCountAfterWake);
     } finally {
-      vi.useRealTimers();
-      if (refreshEnvOriginal === undefined) {
-        delete process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;
-      } else {
-        process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = refreshEnvOriginal;
+      try {
+        if (run) {
+          harness.requestShutdown('happier-cli');
+          await vi.advanceTimersByTimeAsync(0);
+          await run;
+        }
+      } finally {
+        vi.useRealTimers();
+        if (refreshEnvOriginal === undefined) {
+          delete process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;
+        } else {
+          process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = refreshEnvOriginal;
+        }
+        exitSpy.mockRestore();
       }
-      exitSpy.mockRestore();
     }
   });
 
