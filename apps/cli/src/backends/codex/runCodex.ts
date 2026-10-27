@@ -1295,6 +1295,13 @@ export async function runCodex(opts: {
                 try {
                     const inputConsumer = providerInputConsumer;
                     if (!inputConsumer) {
+                        // Nothing was handed to Codex. Release Queue custody instead of holding it.
+                        await blockProviderPromptDeliveryBeforeAcceptance({
+                            localIds: normalizeProviderPromptLocalIds([message.localId ?? null]),
+                            reason: 'provider_unavailable_before_acceptance',
+                            userMessageSeq,
+                            providerEffect: 'none',
+                        });
                         return;
                     }
                     await liveSteerReplaySeedRetirement.drain();
@@ -2197,6 +2204,20 @@ export async function runCodex(opts: {
                     reason: 'provider_rejected_before_acceptance',
                     userMessageSeq: prompt.userMessageSeq,
                 });
+            }
+        });
+        codexAppServerRuntime.setOnPromptsEffectMayHaveOccurred?.((prompts) => {
+            for (const prompt of prompts) {
+                const localIds = normalizeProviderPromptLocalIds(prompt.localIds ?? []);
+                const publishedExactOutcome = codexAppServerProviderInputOutcomes?.observeEffectMayHaveOccurred({
+                    localIds,
+                }) === true;
+                if (!publishedExactOutcome) {
+                    logger.debug('[codex-app-server] ignored uncertain provider input without one exact Queue localId outcome binding', {
+                        localIdCount: localIds.length,
+                        userMessageSeq: prompt.userMessageSeq,
+                    });
+                }
             }
         });
         session.setSessionRuntimeControls?.(codexAppServerRuntime);

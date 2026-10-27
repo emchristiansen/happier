@@ -52,6 +52,11 @@ describe('createCodexAppServerProviderInputOutcomeBridge', () => {
             kind: 'accepted',
             localId: 'local-command',
         });
+        expect(bridge.observeEffectMayHaveOccurred({ localIds: ['local-unechoed-steer'] })).toBe(true);
+        expect(observe).toHaveBeenLastCalledWith({
+            kind: 'effect_may_have_occurred',
+            localId: 'local-unechoed-steer',
+        });
 
         expect(bridge.observeAccepted({
             localIds: ['   '],
@@ -93,6 +98,8 @@ describe('createCodexAppServerProviderInputOutcomeBridge', () => {
         expect(bridge.observeAcceptedLocalInput({ localIds: [] })).toBe(false);
         expect(bridge.observeAcceptedLocalInput({ localIds: ['a', 'b'] })).toBe(false);
         expect(bridge.observeAcceptedLocalInput({ localIds: ['   '] })).toBe(false);
+        expect(bridge.observeEffectMayHaveOccurred({ localIds: [] })).toBe(false);
+        expect(bridge.observeEffectMayHaveOccurred({ localIds: ['a', 'b'] })).toBe(false);
         expect(observe).not.toHaveBeenCalled();
     });
 });

@@ -405,14 +405,65 @@ type CodexAppServerUndeliverablePrompt = Readonly<{
     userMessageSeq: number | null;
 }>;
 
+/** The exact Codex turn a successful `turn/steer` appended its input to, on one client generation. */
+type CodexAppServerSteeredTurn = Readonly<{
+    threadId: string;
+    turnId: string;
+    clientGeneration: number;
+}>;
+
+/**
+ * Where one tracked prompt stands with Codex. A prompt whose request was answered keeps one
+ * outcome: accepted, undeliverable, or effect-may-have-occurred.
+ */
+type CodexAppServerPendingProviderPromptPhase =
+    /** `turn/start` or `turn/steer` has not been answered yet. */
+    | Readonly<{ kind: 'submitting' }>
+    /** `turn/steer` succeeded; Codex has not echoed the correlated user message yet. */
+    | Readonly<{ kind: 'awaiting_echo'; steeredTurn: CodexAppServerSteeredTurn }>
+    /**
+     * The steered turn ended without the echo and the prompt was reported as
+     * effect-may-have-occurred. An exact echo for that same turn still accepts it.
+     */
+    | Readonly<{ kind: 'outcome_uncertain'; steeredTurn: CodexAppServerSteeredTurn }>
+    | Readonly<{ kind: 'accepted' }>;
+
 type CodexAppServerPendingProviderPrompt = CodexAppServerUndeliverablePrompt & {
-    accepted: boolean;
+    phase: CodexAppServerPendingProviderPromptPhase;
     appliedModelId?: string;
 };
 
 type CodexAppServerUndeliverablePromptsCallback = (
     prompts: ReadonlyArray<CodexAppServerUndeliverablePrompt>,
 ) => void;
+
+type CodexAppServerPromptEffectMayHaveOccurred = Readonly<{
+    localIds?: readonly string[] | null;
+    userMessageSeq: number | null;
+}>;
+
+type CodexAppServerPromptsEffectMayHaveOccurredCallback = (
+    prompts: ReadonlyArray<CodexAppServerPromptEffectMayHaveOccurred>,
+) => void;
+
+/** What the runtime reports for a tracked prompt it stops waiting on before Codex accepted it. */
+function resolveAbandonedProviderPromptOutcome(
+    phase: CodexAppServerPendingProviderPromptPhase,
+): 'undeliverable' | 'effect_may_have_occurred' | 'already_reported' {
+    switch (phase.kind) {
+        case 'submitting':
+            return 'undeliverable';
+        case 'awaiting_echo':
+            return 'effect_may_have_occurred';
+        case 'outcome_uncertain':
+        case 'accepted':
+            return 'already_reported';
+        default: {
+            const exhaustive: never = phase;
+            return exhaustive;
+        }
+    }
+}
 
 function normalizeCodexAppServerPromptLocalIds(options: CodexAppServerPromptOptions | undefined): string[] {
     const values = [
@@ -457,7 +508,7 @@ function codexAppServerPromptHasDeliveryIdentity(
 function buildCodexAppServerRetryDeliveryIdentityOptions(
     pending: CodexAppServerPendingProviderPrompt | null | undefined,
 ): CodexAppServerPromptOptions | undefined {
-    if (!pending || pending.accepted || !codexAppServerPromptHasDeliveryIdentity(pending)) {
+    if (!pending || pending.phase.kind !== 'submitting' || !codexAppServerPromptHasDeliveryIdentity(pending)) {
         return undefined;
     }
     return {
@@ -1267,6 +1318,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
     sendPrompt: (_prompt: string, _options?: CodexAppServerPromptOptions) => Promise<void>;
     setOnPromptAcceptedByProvider: (_callback: CodexAppServerPromptAcceptedCallback | null) => void;
     setOnUndeliverablePrompts: (_callback: CodexAppServerUndeliverablePromptsCallback | null) => void;
+    setOnPromptsEffectMayHaveOccurred: (_callback: CodexAppServerPromptsEffectMayHaveOccurredCallback | null) => void;
     startReview: (_request: CodexAppServerReviewStartRequest) => Promise<void | UnsupportedSessionRuntimeMethodResult>;
     startInlineReview: (_input: unknown) => Promise<Readonly<{ ok: true; reviewTurnId: string | null }> | UnsupportedSessionRuntimeMethodResult | Readonly<{ ok: false; errorCode: 'invalid_parameters' | 'inline_review_not_supported'; error: string }>>;
     handleUserMessage: (_request: Readonly<{
@@ -1378,6 +1430,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
     let lastRateLimitSnapshot: unknown = null;
     let onPromptAcceptedByProvider: CodexAppServerPromptAcceptedCallback | null = null;
     let onUndeliverablePrompts: CodexAppServerUndeliverablePromptsCallback | null = null;
+    let onPromptsEffectMayHaveOccurred: CodexAppServerPromptsEffectMayHaveOccurredCallback | null = null;
     const pendingProviderPrompts = new Set<CodexAppServerPendingProviderPrompt>();
     const turnBoundaryTracker = createCodexAppServerSessionTurnTracker({
         session: params.session,
@@ -1596,7 +1649,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
             ...codexAppServerPromptLocalIdPayload(normalizeCodexAppServerPromptLocalIds(options)),
             text,
             userMessageSeq: typeof options?.userMessageSeq === 'number' ? options.userMessageSeq : null,
-            accepted: false,
+            phase: { kind: 'submitting' },
             ...(readNonBlankOpaqueIdentifier(options?.appliedModelId)
                 ? { appliedModelId: readNonBlankOpaqueIdentifier(options?.appliedModelId)! }
                 : {}),
@@ -1610,7 +1663,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
         rawProviderTurnId: string | null | undefined,
     ): void => {
         if (!pending || !pendingProviderPrompts.has(pending)) return;
-        pending.accepted = true;
+        pending.phase = { kind: 'accepted' };
         const providerTurnId = trimSessionId(rawProviderTurnId);
         if (!providerTurnId) return;
         pendingProviderPrompts.delete(pending);
@@ -1629,10 +1682,46 @@ export function createCodexAppServerRuntime(params: Readonly<{
     ): void => {
         const clientUserMessageId = readProviderUserMessageClientId(notificationParams);
         if (!clientUserMessageId) return;
+        // A steer already reported uncertain is accepted only by `acceptLateEchoOfUncertainSteer`,
+        // whose exact generation, thread and turn match this local-ID-only search cannot provide.
         const pending = Array.from(pendingProviderPrompts).find(
-            (candidate) => candidate.localIds?.length === 1 && candidate.localIds[0] === clientUserMessageId,
+            (candidate) => candidate.phase.kind !== 'outcome_uncertain'
+                && candidate.localIds?.length === 1
+                && candidate.localIds[0] === clientUserMessageId,
         );
         markPendingProviderPromptAccepted(pending, rawProviderTurnId);
+    };
+
+    /**
+     * Once a steered turn is over, the history boundary treats the turn as consumed and drops its
+     * notifications. A late user-message echo can still settle a steer already reported as
+     * uncertain, but only on its own client generation, with its exact local ID and its exact
+     * thread and turn. The echo is used only as acceptance evidence; it is never replayed into
+     * the transcript.
+     */
+    const acceptLateEchoOfUncertainSteer = (
+        notificationParams: unknown,
+        clientGeneration: number,
+    ): void => {
+        const clientUserMessageId = readProviderUserMessageClientId(notificationParams);
+        const threadIdFromEcho = readThreadId(notificationParams);
+        const turnIdFromEcho = readProviderEventTurnId(notificationParams);
+        if (!clientUserMessageId || !threadIdFromEcho || !turnIdFromEcho) return;
+        for (const pending of pendingProviderPrompts) {
+            if (pending.phase.kind !== 'outcome_uncertain') continue;
+            const { steeredTurn } = pending.phase;
+            if (
+                steeredTurn.clientGeneration !== clientGeneration
+                || steeredTurn.threadId !== threadIdFromEcho
+                || steeredTurn.turnId !== turnIdFromEcho
+                || pending.localIds?.length !== 1
+                || pending.localIds[0] !== clientUserMessageId
+            ) {
+                continue;
+            }
+            markPendingProviderPromptAccepted(pending, steeredTurn.turnId);
+            return;
+        }
     };
 
     const clearPendingProviderPrompt = (pending: CodexAppServerPendingProviderPrompt | null | undefined): void => {
@@ -1640,32 +1729,86 @@ export function createCodexAppServerRuntime(params: Readonly<{
         pendingProviderPrompts.delete(pending);
     };
 
-    const emitPendingProviderPromptAsUndeliverable = (
-        pending: CodexAppServerPendingProviderPrompt | null | undefined,
+    const reportPromptsEffectMayHaveOccurred = (
+        prompts: readonly CodexAppServerPendingProviderPrompt[],
     ): void => {
-        if (!pending || pending.accepted || !pendingProviderPrompts.has(pending)) return;
-        pendingProviderPrompts.delete(pending);
-        onUndeliverablePrompts?.([{
+        if (prompts.length === 0) return;
+        onPromptsEffectMayHaveOccurred?.(prompts.map((pending) => ({
             ...codexAppServerPromptLocalIdPayload(pending.localIds),
-            text: pending.text,
             userMessageSeq: pending.userMessageSeq,
-        }]);
+        })));
     };
 
-    const emitAllPendingProviderPromptsAsUndeliverable = (): void => {
-        const prompts = Array.from(pendingProviderPrompts);
-        pendingProviderPrompts.clear();
-        const undeliverable = prompts
-            .filter((pending) => !pending.accepted)
-            .map((pending) => ({
-                ...codexAppServerPromptLocalIdPayload(pending.localIds),
-                text: pending.text,
-                userMessageSeq: pending.userMessageSeq,
-            }));
+    /**
+     * Codex has an answered steer it never echoed, and the turn it was steered into has ended.
+     * Its effect is unknown: report it, and keep it tracked so a late echo can still accept it.
+     */
+    const reportUnechoedSteers = (prompts: Iterable<CodexAppServerPendingProviderPrompt>): void => {
+        const unechoed: CodexAppServerPendingProviderPrompt[] = [];
+        for (const pending of prompts) {
+            if (pending.phase.kind !== 'awaiting_echo' || !pendingProviderPrompts.has(pending)) continue;
+            pending.phase = { kind: 'outcome_uncertain', steeredTurn: pending.phase.steeredTurn };
+            unechoed.push(pending);
+        }
+        reportPromptsEffectMayHaveOccurred(unechoed);
+    };
+
+    const markSteerAwaitingEcho = (
+        pending: CodexAppServerPendingProviderPrompt,
+        activeTurnAtSteer: Readonly<{ promise: Promise<void> }>,
+        steeredTurn: CodexAppServerSteeredTurn,
+    ): void => {
+        if (pending.phase.kind !== 'submitting' || !pendingProviderPrompts.has(pending)) return;
+        pending.phase = { kind: 'awaiting_echo', steeredTurn };
+        if (pendingTurn?.promise !== activeTurnAtSteer.promise) {
+            // The steered turn ended while `turn/steer` was in flight; no turn end will sweep it.
+            reportUnechoedSteers([pending]);
+        }
+    };
+
+    /** Stop waiting on prompts Codex has not accepted, reporting each one's outcome once. */
+    const abandonPendingProviderPrompts = (prompts: readonly CodexAppServerPendingProviderPrompt[]): void => {
+        const undeliverable: CodexAppServerUndeliverablePrompt[] = [];
+        const effectMayHaveOccurred: CodexAppServerPendingProviderPrompt[] = [];
+        for (const pending of prompts) {
+            pendingProviderPrompts.delete(pending);
+            const outcome = resolveAbandonedProviderPromptOutcome(pending.phase);
+            switch (outcome) {
+                case 'undeliverable':
+                    undeliverable.push({
+                        ...codexAppServerPromptLocalIdPayload(pending.localIds),
+                        text: pending.text,
+                        userMessageSeq: pending.userMessageSeq,
+                    });
+                    break;
+                case 'effect_may_have_occurred':
+                    effectMayHaveOccurred.push(pending);
+                    break;
+                case 'already_reported':
+                    break;
+                default: {
+                    const exhaustive: never = outcome;
+                    return exhaustive;
+                }
+            }
+        }
         if (undeliverable.length > 0) {
             onUndeliverablePrompts?.(undeliverable);
         }
+        reportPromptsEffectMayHaveOccurred(effectMayHaveOccurred);
     };
+
+    const abandonPendingProviderPrompt = (
+        pending: CodexAppServerPendingProviderPrompt | null | undefined,
+    ): void => {
+        if (!pending || !pendingProviderPrompts.has(pending)) return;
+        abandonPendingProviderPrompts([pending]);
+    };
+
+    const abandonAllPendingProviderPrompts = (): void => {
+        abandonPendingProviderPrompts(Array.from(pendingProviderPrompts));
+    };
+
     const normalizedAssistantFinalItemKeys = new Set<string>();
     const nativeReviewCompletionTextByStreamScope = new Map<string, string>();
     const rawAssistantFinalByItemKey = new Map<string, PendingRawAssistantFinal>();
@@ -3037,12 +3180,15 @@ export function createCodexAppServerRuntime(params: Readonly<{
         }
         latestPendingTurnId = null;
         setThinking(false);
+        // Codex echoes a steered input inside the turn it was steered into. Once that turn is
+        // over, an answered steer still waiting for its echo has no outcome left to arrive.
+        reportUnechoedSteers(pendingProviderPrompts);
         if (!activeTurn) return;
         if (options?.error) {
             if (options.emitUndeliverablePrompt === false) {
                 clearPendingProviderPrompt(activeTurn.providerPrompt);
             } else {
-                emitPendingProviderPromptAsUndeliverable(activeTurn.providerPrompt);
+                abandonPendingProviderPrompt(activeTurn.providerPrompt);
             }
             activeTurn.reject(options.error);
             return;
@@ -3596,6 +3742,9 @@ export function createCodexAppServerRuntime(params: Readonly<{
     ): void => {
         client.registerNotificationHandler(method, (notificationParams) => {
             if (attachedClientGeneration !== clientLifecycleGeneration) return;
+            if (method === 'item/started' || method === 'item/completed') {
+                acceptLateEchoOfUncertainSteer(notificationParams, attachedClientGeneration);
+            }
             const historyIdentityParams = (() => {
                 const record = readRecord(notificationParams);
                 const activeTurn = pendingTurn;
@@ -3996,7 +4145,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
     }>): Promise<void> => {
         clientLifecycleGeneration += 1;
         if (options?.emitUndeliverablePrompts !== false) {
-            emitAllPendingProviderPromptsAsUndeliverable();
+            abandonAllPendingProviderPrompts();
         }
         const activeClientPromise = clientPromise;
         clientPromise = null;
@@ -4587,6 +4736,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
         assertConnectedServiceAuthGroupAvailable();
         const client = await ensureClient();
         assertBoundSteerCurrent();
+        const steerClientGeneration = clientLifecycleGeneration;
         const expectedTurnId = await waitForSteerableActiveTurnId(activeTurn);
         assertBoundSteerCurrent();
         if (pendingTurn?.promise !== activeTurn.promise || !canSteerPrompt()) {
@@ -4614,11 +4764,22 @@ export function createCodexAppServerRuntime(params: Readonly<{
             ...(clientUserMessageId ? { clientUserMessageId } : {}),
         };
         const finishAcceptedSteer = async (): Promise<void> => {
+            if (clientUserMessageId) {
+                markSteerAwaitingEcho(pendingProviderPrompt, activeTurn, {
+                    threadId: activeTurn.threadId,
+                    turnId: expectedTurnId,
+                    clientGeneration: steerClientGeneration,
+                });
+            }
             await turnBoundaryTracker.appendSteerMessage({ localId: options?.localId ?? null });
             if (!clientUserMessageId) {
                 markPendingProviderPromptAccepted(pendingProviderPrompt, expectedTurnId);
             }
             options?.onProviderPromptAccepted?.();
+        };
+        const failSteer = (error: unknown): unknown => {
+            clearPendingProviderPrompt(pendingProviderPrompt);
+            return error;
         };
         let steerRpcMayHaveEffect = false;
         let previousUnconfirmedSteerRpcError: unknown;
@@ -4677,8 +4838,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
                 try {
                     await requestSteerWithStaleTurnRecovery(textOnlyInput, 'expectedTurnId');
                 } catch (fallbackError) {
-                    clearPendingProviderPrompt(pendingProviderPrompt);
-                    throw fallbackError;
+                    throw failSteer(fallbackError);
                 }
                 await finishAcceptedSteer();
                 return;
@@ -4691,8 +4851,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
                 (normalized.includes('expectedturnid') || normalized.includes('expected turn') || normalized.includes('turnid'))
                 && (normalized.includes('require') || normalized.includes('missing') || normalized.includes('unknown') || normalized.includes('invalid'));
             if (!looksLikeParamMismatch) {
-                clearPendingProviderPrompt(pendingProviderPrompt);
-                throw error;
+                throw failSteer(error);
             }
             try {
                 await requestSteerWithStaleTurnRecovery(structuredInput, 'turnId');
@@ -4701,14 +4860,12 @@ export function createCodexAppServerRuntime(params: Readonly<{
                     try {
                         await requestSteerWithStaleTurnRecovery(textOnlyInput, 'turnId');
                     } catch (fallbackError) {
-                        clearPendingProviderPrompt(pendingProviderPrompt);
-                        throw fallbackError;
+                        throw failSteer(fallbackError);
                     }
                     await finishAcceptedSteer();
                     return;
                 }
-                clearPendingProviderPrompt(pendingProviderPrompt);
-                throw legacyError;
+                throw failSteer(legacyError);
             }
         }
         await finishAcceptedSteer();
@@ -4738,13 +4895,13 @@ export function createCodexAppServerRuntime(params: Readonly<{
             await waitForNativeTurnHandoff();
             const activeTurn = pendingTurn;
             if (!activeTurn) {
-                emitAllPendingProviderPromptsAsUndeliverable();
+                abandonAllPendingProviderPrompts();
                 turnInFlight = false;
                 clearActiveTurnSteerability();
                 setThinking(false);
                 return;
             }
-            emitAllPendingProviderPromptsAsUndeliverable();
+            abandonAllPendingProviderPrompts();
             markActiveTurnNonSteerable();
             const client = await ensureClient();
             const interruptTurnId = (activeTurn.turnId ?? latestPendingTurnId) ?? (await waitForActiveTurnId());
@@ -5041,6 +5198,9 @@ export function createCodexAppServerRuntime(params: Readonly<{
         },
         setOnUndeliverablePrompts: (callback) => {
             onUndeliverablePrompts = callback;
+        },
+        setOnPromptsEffectMayHaveOccurred: (callback) => {
+            onPromptsEffectMayHaveOccurred = callback;
         },
         flushTurn: async () => {
             await finishPendingTurn({ flushReason: 'turn-end' });
