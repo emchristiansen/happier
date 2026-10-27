@@ -21,6 +21,45 @@ describe('connectedServiceSwitchDeferralQueue', () => {
     vi.useFakeTimers();
   });
 
+  it.each([
+    { disableDeferral: false, source: 'automatic' as const },
+    { disableDeferral: true, source: 'automatic' as const },
+    { disableDeferral: false, source: 'manual' as const },
+    { disableDeferral: true, source: 'manual' as const },
+  ])('keeps shutdown terminal for late $source requests with disableDeferral=$disableDeferral', async ({ disableDeferral, source }) => {
+    const queue = createConnectedServiceSwitchDeferralQueue({ timeoutMs: 60_000, disableDeferral });
+    const runSwitch = vi.fn(async () => {});
+    queue.cancelAll('daemon_shutdown');
+    queue.recordTurnLifecycleEvent({ sessionId: 'sess_1', event: 'task_started' });
+    queue.recordTurnLifecycleEvent({ sessionId: 'sess_1', event: 'assistant_message_end' });
+
+    await expect(queue.requestSwitch({
+      sessionId: 'sess_1', policy: 'defer_until_turn_boundary', source, target: target(), runSwitch,
+    })).rejects.toMatchObject({
+      name: 'ConnectedServiceSwitchDeferralConflictError', code: 'daemon_shutdown',
+    });
+    expect(runSwitch).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('rejects a pending caller at shutdown and refuses a successor after its boundary', async () => {
+    const queue = createConnectedServiceSwitchDeferralQueue({ timeoutMs: 60_000, disableDeferral: false });
+    const runSwitch = vi.fn(async () => {});
+    queue.recordTurnLifecycleEvent({ sessionId: 'sess_1', event: 'task_started' });
+    const pending = queue.requestSwitch({
+      sessionId: 'sess_1', policy: 'defer_until_turn_boundary', source: 'automatic', target: target(), runSwitch,
+    });
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'daemon_shutdown' });
+    queue.cancelAll('daemon_shutdown');
+    await rejected;
+    queue.recordTurnLifecycleEvent({ sessionId: 'sess_1', event: 'assistant_message_end' });
+    await expect(queue.requestSwitch({
+      sessionId: 'sess_1', policy: 'defer_until_idle', source: 'automatic', target: target(), runSwitch,
+    })).rejects.toMatchObject({ code: 'daemon_shutdown' });
+    expect(runSwitch).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('defers restart_resume until assistant-message-end when the session is mid-turn', async () => {
     const emitSessionEvent = vi.fn();
     const runSwitch = vi.fn(async () => {});
