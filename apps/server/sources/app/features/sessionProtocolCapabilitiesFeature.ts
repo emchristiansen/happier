@@ -1,5 +1,6 @@
 import {
     CURRENT_PENDING_INPUT_PROTOCOL_VERSION,
+    PENDING_INPUT_EXACT_LOCAL_ID_PROTOCOL_VERSION_V1,
     SESSION_SYNC_PROTOCOL_VERSION_RUNTIME_ACTIVITY,
 } from '@happier-dev/protocol';
 
@@ -14,6 +15,9 @@ export function resolveSessionProtocolCapabilitiesFeature(): FeaturesPayloadDelt
                 },
                 pendingInput: {
                     protocolVersion: CURRENT_PENDING_INPUT_PROTOCOL_VERSION,
+                },
+                pendingInputExactLocalId: {
+                    protocolVersion: PENDING_INPUT_EXACT_LOCAL_ID_PROTOCOL_VERSION_V1,
                 },
             },
         },

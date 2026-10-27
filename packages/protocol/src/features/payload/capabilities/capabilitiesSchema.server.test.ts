@@ -12,11 +12,18 @@ describe('CapabilitiesSchema (server capabilities)', () => {
         pendingInput: {
           protocolVersion: 2,
         },
+        pendingInputExactLocalId: { protocolVersion: 1 },
       },
     });
 
     expect(parsed.session.runtimeActivity).toEqual({ protocolVersion: 2 });
     expect(parsed.session.pendingInput).toEqual({ protocolVersion: 2 });
+    expect(parsed.session.pendingInputExactLocalId).toEqual({ protocolVersion: 1 });
+    expect(CapabilitiesSchema.safeParse({
+      session: {
+        pendingInput: { protocolVersion: 2, exactLocalIdProtocolVersion: 1 },
+      },
+    }).success).toBe(false);
     expect(CapabilitiesSchema.safeParse({
       server: {
         runtimeActivity: { protocolVersion: 2 },

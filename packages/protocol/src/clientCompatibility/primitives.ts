@@ -4,6 +4,7 @@ export const SESSION_SYNC_PROTOCOL_VERSION_RUNTIME_ACTIVITY = 2 as const;
 export const PENDING_INPUT_PROTOCOL_VERSION_V1 = 1 as const;
 export const PENDING_INPUT_PROTOCOL_VERSION_V2 = 2 as const;
 export const CURRENT_PENDING_INPUT_PROTOCOL_VERSION = PENDING_INPUT_PROTOCOL_VERSION_V2;
+export const PENDING_INPUT_EXACT_LOCAL_ID_PROTOCOL_VERSION_V1 = 1 as const;
 
 export const ClientKindSchema = z.enum([
   'ui-web',

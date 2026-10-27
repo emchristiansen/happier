@@ -49,6 +49,31 @@ function createExecutor(overrides: Partial<ActionExecutorDeps> = {}) {
 }
 
 describe('createActionExecutor (session control)', () => {
+  it('[opaque-pending-id] selects the exact spaced row through the real action executor', async () => {
+    const rows = new Map([['x', { selected: false }], [' x ', { selected: false }]]);
+    const executor = createExecutor({
+      sessionPendingInputInterruptAndRun: async ({ localId }) => {
+        const row = rows.get(localId);
+        if (!row) throw new Error('Selected row is absent');
+        row.selected = true;
+        return { ok: true, status: 'admitted_delivery_unobserved', sessionId: 's1', localId };
+      },
+    });
+    await expect(executor.execute('session.pendingInput.interruptAndRun',
+      { sessionId: 's1', localId: ' x ' }, { surface: 'ui_button' }))
+      .resolves.toMatchObject({ ok: true, result: { localId: ' x ' } });
+    expect(rows.get('x')?.selected).toBe(false);
+    expect(rows.get(' x ')?.selected).toBe(true);
+  });
+
+  it.each(['', ' ', '\t\n'])('[opaque-pending-id] rejects blank identity %j before dispatch', async (localId) => {
+    const dispatch = vi.fn(async () => ({}));
+    const executor = createExecutor({ sessionPendingInputInterruptAndRun: dispatch });
+    await expect(executor.execute('session.pendingInput.interruptAndRun',
+      { sessionId: 's1', localId }, { surface: 'ui_button' })).resolves.toMatchObject({ ok: false });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
   it('executes session.message.send via deps.sessionSendMessage (including optional overrides)', async () => {
     const sessionSendMessage = vi.fn(async () => ({ ok: true }));
     const executor = createExecutor({ sessionSendMessage });
