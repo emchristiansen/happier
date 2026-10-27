@@ -35,6 +35,7 @@ function serverContract(mode: SessionSyncPendingInputServerContractMode) {
         mode,
         runtimeActivity: mode === 'session_sync_v2_pending_input_v1' ? 'v2' : mode === 'released_server_v0_2_1' ? 'legacy' : 'indeterminate',
         pendingInput: mode === 'session_sync_v2_pending_input_v1' ? 'v1' : mode === 'released_server_v0_2_1' ? 'released_server_v0_2_1' : 'indeterminate',
+        pendingExactLocalId: mode === 'session_sync_v2_pending_input_v1' || mode === 'released_server_v0_2_1' ? 'unsupported' : 'indeterminate',
         sessionConnectionEpoch: 1,
         socket: { connected: true },
     } as const;

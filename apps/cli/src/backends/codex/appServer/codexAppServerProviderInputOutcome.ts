@@ -1,6 +1,7 @@
 import type {
     SessionProviderInputOutcomeObserver,
     SessionProviderInputOutcomeProducer,
+    SessionProviderInputRejectedBeforeEffectReason,
 } from '@/api/session/sessionClient';
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers';
 import { readPendingLocalId } from '@happier-dev/protocol';
@@ -36,6 +37,10 @@ type CodexAppServerProviderInputAcceptance = Readonly<{
 export type CodexAppServerProviderInputOutcomeBridge = Readonly<{
     observeAccepted: (input: CodexAppServerProviderInputAcceptance) => boolean;
     observeAcceptedLocalInput: (input: Readonly<{ localIds?: readonly string[] | null }>) => boolean;
+    observeRejectedBeforeEffect: (input: Readonly<{
+        localIds?: readonly string[] | null;
+        reason: SessionProviderInputRejectedBeforeEffectReason;
+    }>) => boolean;
     /** Codex took the input but never confirmed it; Queue custody blocks it as uncertain. */
     observeEffectMayHaveOccurred: (input: Readonly<{ localIds?: readonly string[] | null }>) => boolean;
 }>;
@@ -81,6 +86,13 @@ export function createCodexAppServerProviderInputOutcomeBridge(
     ) ?? null;
 
     return Object.freeze({
+        observeRejectedBeforeEffect: ({ localIds, reason }) => {
+            if (!observe) return false;
+            const localId = readExactLocalInput(localIds);
+            if (localId === null) return false;
+            observe({ kind: 'rejected_before_effect', localId, reason });
+            return true;
+        },
         observeAccepted: (input) => {
             if (!observe) return false;
             const acceptance = readExactAcceptance(input);

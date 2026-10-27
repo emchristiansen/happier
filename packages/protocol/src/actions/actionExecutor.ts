@@ -26,6 +26,7 @@ import { ApprovalRequestOriginV1Schema, ApprovalRequestV1Schema, type ApprovalRe
 import type { PromptRegistryConfiguredSourceV1 } from '../promptLibrary/promptRegistriesV1.js';
 import { BackendTargetKeySchema, BackendTargetRefSchema, buildBackendTargetKey, parseBackendTargetKey, type BackendTargetRefV1 } from '../backendTargets/backendTargetRef.js';
 import type { SessionRollbackTarget } from '../sessionRollback.js';
+import type { SessionPendingInputInterruptAndRunRequestV1 } from '../sessionControl/sessionPendingInputInterruptAndRunV1.js';
 import type { PendingDeliveryBlockedReason } from '../sessionMessages/pendingDeliveryBlockedReason.js';
 import type {
   SessionPendingInputMarkHandledExpectedDeliveryStateV1,
@@ -2455,7 +2456,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
 
         if (actionId === 'session.pendingInput.interruptAndRun') {
           const sessionId = normalizeId((parsed.data as any).sessionId);
-          const localId = normalizeId((parsed.data as any).localId);
+          const localId = (parsed.data as SessionPendingInputInterruptAndRunRequestV1).localId;
           if (!sessionId || !localId) return { ok: false, errorCode: 'invalid_parameters', error: 'invalid_parameters' };
           if (!deps.sessionPendingInputInterruptAndRun) {
             return { ok: false, errorCode: 'unsupported_action', error: 'unsupported_action:session.pendingInput.interruptAndRun' };

@@ -231,6 +231,35 @@ export interface ClientToServerEvents {
     error?: string;
     retryAfterMs?: number;
   }) => void) => void,
+  'pending-materialize-exact-v1': (data: {
+    sid: string;
+    requestedLocalId: string;
+    expectedPendingVersion?: number;
+    expectedRuntimeActivityRevision?: number;
+    deliveryState?: 'provider';
+    deliveryTiming?: 'after_foreground_ready' | 'after_runtime_idle';
+    foregroundState?: 'ready' | 'active_steerable' | 'active_unsteerable';
+  }, cb?: (answer: {
+    ok: boolean;
+    didMaterialize?: boolean;
+    didWrite?: boolean;
+    pendingCount?: number;
+    pendingBlockedCount?: number;
+    pendingVersion?: number;
+    deferredReason?: 'waiting_for_runtime_activity' | 'runtime_activity_unknown' | 'pending_version_mismatch' | 'waiting_for_predecessor' | 'waiting_for_foreground_turn' | 'requested_local_id_unavailable';
+    deliveryState?: { mode: 'provider'; unresolved: boolean };
+    message?: {
+      id?: string | null;
+      seq?: number | null;
+      localId?: string;
+      messageRole?: SessionMessageRole | null;
+      content?: SessionMessageContent;
+      createdAt?: number;
+      updatedAt?: number;
+    };
+    error?: string;
+    retryAfterMs?: number;
+  }) => void) => void,
   'execution-run-updated': (data: {
     sid: string;
     run: ExecutionRunPublicState;

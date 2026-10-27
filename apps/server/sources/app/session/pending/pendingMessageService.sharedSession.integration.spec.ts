@@ -1614,6 +1614,159 @@ describe("pendingMessageService (shared sessions)", () => {
         ]);
     });
 
+    it.each(["queued", "claimed", "held"] as const)("materializes exact B past an earlier %s urgent A", async (earlierState) => {
+        const owner = await createAccount("exact-steer-target-owner");
+        const session = await createSession(owner.id);
+        await createCurrentPendingEvidencePublisher({ accountId: owner.id, sessionId: session.id });
+        const earlierLocalId = `exact-steer-earlier-${randomUUID()}`;
+        const targetLocalId = `exact-steer-target-${randomUUID()}`;
+
+        await enqueuePendingMessage({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            localId: earlierLocalId,
+            ciphertext: "cipher-exact-steer-earlier",
+            requestedAction: { v: 1, kind: "steer_now" },
+        });
+        await enqueuePendingMessage({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            localId: targetLocalId,
+            ciphertext: "cipher-exact-steer-target",
+            requestedAction: { v: 1, kind: "enqueue" },
+        });
+        await expect(updatePendingRequestedAction({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            localId: targetLocalId,
+            requestedAction: { v: 1, kind: "steer_now" },
+        })).resolves.toMatchObject({ ok: true, didUpdate: true });
+
+        if (earlierState !== "queued") {
+            await db.sessionPendingMessage.update({
+                where: { sessionId_localId: { sessionId: session.id, localId: earlierLocalId } },
+                data: { deliveryState: "delivering", providerAction: "steer" },
+            });
+        }
+        const result = await materializeNextPendingMessage({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            requestedLocalId: targetLocalId,
+            ...(earlierState === "held" ? { heldLocalIds: [earlierLocalId] } : {}),
+            deliveryState: "provider",
+            foregroundState: "active_steerable",
+        });
+
+        expect(result).toMatchObject({
+            ok: true,
+            didMaterialize: true,
+            message: {
+                localId: targetLocalId,
+                requestedAction: { v: 1, kind: "steer_now" },
+                providerAction: "steer",
+            },
+        });
+        await expect(db.sessionPendingMessage.findMany({
+            where: { sessionId: session.id },
+            orderBy: [{ position: "asc" }, { localId: "asc" }],
+            select: { localId: true, deliveryState: true },
+        })).resolves.toEqual([
+            { localId: earlierLocalId, deliveryState: earlierState === "queued" ? null : "delivering" },
+            { localId: targetLocalId, deliveryState: "delivering" },
+        ]);
+    });
+
+    it.each([false, true])("[bound-lifetime] preserves the complete bound action through %s exact selection and claim rejoin", async (exact) => {
+        const owner = await createAccount("bound-steer-owner");
+        const session = await createSession(owner.id);
+        const earlier = `earlier-${randomUUID()}`;
+        const localId = ` bound-${randomUUID()} `;
+        const requestedAction = { v: 1, kind: "steer_now_bound", bindingId: " B1 " } as const;
+        await enqueuePendingMessage({ actorUserId: owner.id, sessionId: session.id, localId: earlier, ciphertext: "earlier", requestedAction: { v: 1, kind: "enqueue" } });
+        await enqueuePendingMessage({ actorUserId: owner.id, sessionId: session.id, localId, ciphertext: "bound", requestedAction: { v: 1, kind: "enqueue" } });
+        await expect(updatePendingRequestedAction({ actorUserId: owner.id, sessionId: session.id, localId, requestedAction })).resolves.toMatchObject({ ok: true, didUpdate: true });
+        await expect(updatePendingRequestedAction({ actorUserId: owner.id, sessionId: session.id, localId, requestedAction })).resolves.toMatchObject({ ok: true, didUpdate: false });
+        const params = { actorUserId: owner.id, sessionId: session.id, deliveryState: "provider" as const, foregroundState: "active_steerable" as const, ...(exact ? { requestedLocalId: localId } : {}) };
+        for (let pass = 0; pass < 2; pass++) {
+            await expect(materializeNextPendingMessage(params)).resolves.toMatchObject({
+                ok: true, didMaterialize: true, message: { localId, requestedAction, providerAction: "steer", content: { t: "encrypted", c: "bound" } },
+            });
+        }
+        await expect(db.sessionPendingMessage.findUniqueOrThrow({ where: { sessionId_localId: { sessionId: session.id, localId: earlier } }, select: { deliveryState: true, providerAction: true } })).resolves.toEqual({ deliveryState: null, providerAction: null });
+        await expect(blockPendingDelivery({ actorUserId: owner.id, sessionId: session.id, localId, reason: "conditional_steer_unavailable" })).resolves.toEqual({ ok: false, error: "delivery-settlement-conflict" });
+        await expect(db.sessionPendingMessage.findUniqueOrThrow({ where: { sessionId_localId: { sessionId: session.id, localId } }, select: { requestedAction: true, providerAction: true } })).resolves.toEqual({ requestedAction, providerAction: "steer" });
+    });
+
+    it("does not fall back to another urgent row when an exact steer target is unavailable", async () => {
+        const owner = await createAccount("missing-exact-steer-target-owner");
+        const session = await createSession(owner.id);
+        const queuedLocalId = `exact-steer-unrelated-${randomUUID()}`;
+
+        await enqueuePendingMessage({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            localId: queuedLocalId,
+            ciphertext: "cipher-exact-steer-unrelated",
+            requestedAction: { v: 1, kind: "steer_now" },
+        });
+
+        await expect(materializeNextPendingMessage({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            requestedLocalId: `missing-${randomUUID()}`,
+            deliveryState: "provider",
+            foregroundState: "active_steerable",
+        })).resolves.toMatchObject({
+            ok: true,
+            didMaterialize: false,
+            deferredReason: "requested_local_id_unavailable",
+        });
+        await expect(db.sessionPendingMessage.findUniqueOrThrow({
+            where: { sessionId_localId: { sessionId: session.id, localId: queuedLocalId } },
+            select: { deliveryState: true, providerAction: true },
+        })).resolves.toEqual({ deliveryState: null, providerAction: null });
+    });
+
+    it.each(["missing action", "transcript conflict"] as const)("keeps exact B unavailable after %s reoffers a new ordinary ID", async (cause) => {
+        const owner = await createAccount("exact-reoffer-owner");
+        const session = await createSession(owner.id);
+        await createCurrentPendingEvidencePublisher({ accountId: owner.id, sessionId: session.id });
+        const localId = ` B-${randomUUID()} `;
+        await enqueuePendingMessage({ actorUserId: owner.id, sessionId: session.id, localId,
+            ciphertext: "selected-content", requestedAction: { v: 1, kind: "steer_now" } });
+        if (cause === "missing action") {
+            await db.sessionPendingMessage.update({ where: { sessionId_localId: { sessionId: session.id, localId } },
+                data: { deliveryState: "delivering", providerAction: null } });
+        } else {
+            await db.session.update({ where: { id: session.id }, data: { seq: 1 } });
+            await db.sessionMessage.create({ data: { sessionId: session.id, localId, seq: 1,
+                messageRole: "user", content: { t: "encrypted", c: "different-transcript" } } });
+        }
+        const result = await materializeNextPendingMessage({ actorUserId: owner.id, sessionId: session.id,
+            requestedLocalId: localId, heldLocalIds: [], deliveryState: "provider", foregroundState: "active_steerable" });
+        expect(result).toMatchObject({ ok: true, didMaterialize: false,
+            deferredReason: "requested_local_id_unavailable", pendingStateChanged: true, pendingCount: 1 });
+        if (!result.ok) throw new Error("expected exact unavailable result");
+        expect(result.participantCursorsPending?.length).toBeGreaterThan(0);
+        await expect(db.sessionPendingMessage.findUniqueOrThrow({ where: { sessionId_localId: { sessionId: session.id, localId } } }))
+            .resolves.toMatchObject({ status: "discarded", discardedReason: "resent_as_new" });
+        const replacement = await db.sessionPendingMessage.findFirstOrThrow({ where: { sessionId: session.id, status: "queued" } });
+        expect(replacement.localId).not.toBe(localId);
+        expect(replacement).toMatchObject({ requestedAction: { v: 1, kind: "enqueue" }, providerAction: null });
+    });
+
+    it('publishes counter repair while an empty exact selection stays unavailable', async () => {
+        const owner = await createAccount("exact-empty-repair-owner");
+        const session = await createSession(owner.id);
+        await db.session.update({ where: { id: session.id }, data: { pendingCount: 3, pendingBlockedCount: 1 } });
+        const result = await materializeNextPendingMessage({ actorUserId: owner.id, sessionId: session.id,
+            requestedLocalId: " B ", deliveryState: "provider", foregroundState: "active_steerable" });
+        expect(result).toMatchObject({ ok: true, didMaterialize: false, deferredReason: "requested_local_id_unavailable",
+            pendingCount: 0, pendingBlockedCount: 0, pendingStateChanged: true });
+        if (!result.ok) throw new Error("expected exact unavailable result");
+        expect(result.participantCursorsPending?.length).toBeGreaterThan(0);
+    });
+
     it("persists the canonical requested action and rejects same-localId content or action drift", async () => {
         const owner = await createAccount("owner");
         const session = await createSession(owner.id);
@@ -1879,6 +2032,67 @@ describe("pendingMessageService (shared sessions)", () => {
             where: { id: session.id },
             select: { pendingCount: true },
         })).resolves.toEqual({ pendingCount: 1 });
+    });
+
+    it("parks a sole unsupported row once without applying its blocked-counter change twice", async () => {
+        const owner = await createAccount("unsupported-row-counter-repair-owner");
+        const session = await createSession(owner.id);
+        await createCurrentPendingEvidencePublisher({ accountId: owner.id, sessionId: session.id });
+        const localId = `unsupported-row-counter-repair-${randomUUID()}`;
+
+        await expect(enqueuePendingMessage({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            localId,
+            ciphertext: "cipher-unsupported-row-counter-repair",
+        })).resolves.toMatchObject({ ok: true });
+        await db.sessionPendingMessage.update({
+            where: { sessionId_localId: { sessionId: session.id, localId } },
+            data: { requestedAction: { v: 1, kind: "future_action" } },
+        });
+        const before = await db.session.findUniqueOrThrow({
+            where: { id: session.id },
+            select: { pendingCount: true, pendingBlockedCount: true, pendingVersion: true },
+        });
+        expect(before).toMatchObject({ pendingCount: 1, pendingBlockedCount: 0 });
+
+        const result = await materializeNextPendingMessage({
+            actorUserId: owner.id,
+            sessionId: session.id,
+            deliveryState: "provider",
+            foregroundState: "ready",
+        });
+
+        // Parking changes the counters before empty-queue reconciliation reads the same transaction.
+        expect(result).toMatchObject({
+            ok: true,
+            didMaterialize: false,
+            pendingCount: 1,
+            pendingBlockedCount: 1,
+            pendingVersion: before.pendingVersion + 1,
+            pendingStateChanged: true,
+            badgeAttentionChanged: true,
+        });
+        if (!result.ok) throw new Error("expected unsupported row parking result");
+        expect(result.participantCursorsPending?.length).toBeGreaterThan(0);
+        await expect(db.session.findUniqueOrThrow({
+            where: { id: session.id },
+            select: { pendingCount: true, pendingBlockedCount: true, pendingVersion: true },
+        })).resolves.toEqual({
+            pendingCount: 1,
+            pendingBlockedCount: 1,
+            pendingVersion: before.pendingVersion + 1,
+        });
+        await expect(db.sessionPendingMessage.findMany({
+            where: { sessionId: session.id },
+            select: { localId: true, status: true, deliveryState: true, deliveryBlockedReason: true, providerAction: true },
+        })).resolves.toEqual([{
+            localId,
+            status: "queued",
+            deliveryState: "blocked",
+            deliveryBlockedReason: "unsupported_action",
+            providerAction: null,
+        }]);
     });
 
     it.each([

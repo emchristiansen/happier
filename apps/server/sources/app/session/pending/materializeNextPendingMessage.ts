@@ -66,7 +66,7 @@ export type MaterializeNextPendingMessageResult =
         participantCursorsPending?: ParticipantCursor[];
         badgeAttentionChanged?: boolean;
         deliveryState?: PendingMaterializationDeliveryState;
-        deferredReason?: RuntimeActivityPendingDeferredReason | "waiting_for_foreground_turn" | "pending_version_mismatch" | "waiting_for_predecessor";
+        deferredReason?: RuntimeActivityPendingDeferredReason | "waiting_for_foreground_turn" | "pending_version_mismatch" | "waiting_for_predecessor" | "requested_local_id_unavailable";
         retryAfterMs?: number;
       }
     | {
@@ -93,6 +93,7 @@ async function tryRejoinProviderClaimInTx(params: Readonly<{
     actorUserId: string;
     sessionId: string;
     trustedPublisherFence: TrustedPendingPublisherFence;
+    requestedLocalId?: string;
     heldLocalIds?: readonly string[];
     recordChange: (state: Awaited<ReturnType<typeof applyPendingSessionStateChange>>) => void;
 }>): Promise<MaterializeNextPendingMessageResult | null> {
@@ -102,7 +103,12 @@ async function tryRejoinProviderClaimInTx(params: Readonly<{
                     sessionId: params.sessionId,
                     status: "queued",
                     deliveryState: "delivering",
-                    ...(params.heldLocalIds?.length ? { localId: { notIn: [...params.heldLocalIds] } } : {}),
+                    ...(params.requestedLocalId !== undefined || params.heldLocalIds?.length ? {
+                        localId: {
+                            ...(params.requestedLocalId !== undefined ? { equals: params.requestedLocalId } : {}),
+                            ...(params.heldLocalIds?.length ? { notIn: [...params.heldLocalIds] } : {}),
+                        },
+                    } : {}),
                 },
                 orderBy: [{ position: "asc" }, { createdAt: "asc" }, { localId: "asc" }],
                 select: {
@@ -172,6 +178,7 @@ async function tryRejoinProviderClaimInTx(params: Readonly<{
 export async function materializeNextPendingMessageForCurrentPublisher(params: Readonly<{
     actorUserId: string;
     sessionId: string;
+    requestedLocalId?: string;
     trustedPublisherFence: TrustedPendingPublisherFence;
     heldLocalIds?: readonly string[];
     expectedPendingVersion?: number;
@@ -194,6 +201,7 @@ export async function materializeNextPendingMessageForCurrentPublisherInTx(param
     tx: Tx;
     actorUserId: string;
     sessionId: string;
+    requestedLocalId?: string;
     trustedPublisherFence: TrustedPendingPublisherFence;
     heldLocalIds?: readonly string[];
     expectedPendingVersion?: number;
@@ -207,6 +215,7 @@ export async function materializeNextPendingMessageForCurrentPublisherInTx(param
 type MaterializeNextPendingMessageCommonParams = Readonly<{
     actorUserId: string;
     sessionId: string;
+    requestedLocalId?: string;
     heldLocalIds?: readonly string[];
     expectedPendingVersion?: number;
     deliveryTiming?: SessionPendingQueueDeliveryTiming;
@@ -242,6 +251,12 @@ async function materializeNextPendingMessageInTx(
     const tx = params.tx;
     const actorUserId = typeof params.actorUserId === "string" ? params.actorUserId : "";
     const sessionId = typeof params.sessionId === "string" ? params.sessionId : "";
+    const requestedLocalId = params.requestedLocalId === undefined
+        ? undefined
+        : readPendingLocalId(params.requestedLocalId) ?? "";
+    if (params.requestedLocalId !== undefined && !requestedLocalId) {
+        return { ok: false, error: "invalid-params" };
+    }
     const materializedDeliveryState = {
         mode: "provider",
         unresolved: true,
@@ -282,6 +297,7 @@ async function materializeNextPendingMessageInTx(
     const rejoined = await tryRejoinProviderClaimInTx({
         tx, actorUserId, sessionId,
         trustedPublisherFence: params.trustedPublisherFence,
+        ...(requestedLocalId !== undefined ? { requestedLocalId } : {}),
         heldLocalIds: params.heldLocalIds,
         recordChange: (state) => { changes.push(state); },
     });
@@ -301,6 +317,7 @@ async function materializeNextPendingMessageInTx(
             params.expectedPendingVersion !== undefined
             && (!Number.isSafeInteger(params.expectedPendingVersion) || params.expectedPendingVersion < 0)
         )
+        || (params.requestedLocalId !== undefined && !requestedLocalId)
     ) return { ok: false, error: "invalid-params" };
 
     // Released claim writers omitted this field and historically meant foreground-ready.
@@ -327,7 +344,7 @@ async function materializeNextPendingMessageInTx(
         },
     });
     if (!sessionRow) return { ok: false, error: "session-not-found" };
-    if ((sessionRow.pendingCount ?? 0) <= 0 && params.expectedPendingVersion === undefined) {
+    if (requestedLocalId === undefined && (sessionRow.pendingCount ?? 0) <= 0 && params.expectedPendingVersion === undefined) {
         // pendingCount is a denormalized counter; treat it as a fast-path hint, not a source of truth.
         // If the counter is inconsistent (e.g. race/data corruption), fall back to checking the queue.
         const hasEligibleQueued = await tx.sessionPendingMessage.findFirst({
@@ -343,14 +360,14 @@ async function materializeNextPendingMessageInTx(
                 // Retained rows exist but none is eligible for the released materializer.
                 // Let the transactional path reconcile the aggregate pending counter.
             } else {
-                return {
+                return await finish({
                     ok: true,
                     didMaterialize: false,
                     pendingCount: sessionRow.pendingCount ?? 0,
                     pendingBlockedCount: sessionRow.pendingBlockedCount ?? 0,
                     pendingVersion: sessionRow.pendingVersion ?? 0,
                     ...(noopDeliveryState ? { deliveryState: noopDeliveryState } : {}),
-                };
+                });
             }
         }
     }
@@ -446,11 +463,14 @@ async function materializeNextPendingMessageInTx(
             }
             const queueHead = queuedPending[0];
             const exactActionCandidate = queuedPending.find((row) => {
+                if (requestedLocalId !== undefined && row.localId !== requestedLocalId) return false;
                 if (row.deliveryState !== null) return false;
                 const action = PendingRequestedActionV1Schema.safeParse(row.requestedAction);
                 if (!action.success) return false;
+                if (requestedLocalId !== undefined && action.data.kind !== "steer_now" && action.data.kind !== "steer_now_bound") return false;
                 return action.data.kind === "send_now"
                     || action.data.kind === "steer_now"
+                    || action.data.kind === "steer_now_bound"
                     || (
                         action.data.kind === "steer_if_active"
                         && foregroundState === "active_steerable"
@@ -465,7 +485,7 @@ async function materializeNextPendingMessageInTx(
                     where: { sessionId, status: "queued", deliveryState: "blocked" },
                 });
                 if ((sessionBefore.pendingCount ?? 0) !== pendingCount || (sessionBefore.pendingBlockedCount ?? 0) !== blockedCount) {
-                    await tx.session.updateMany({
+                    const repaired = await tx.session.updateMany({
                         where: {
                             id: sessionId,
                             pendingCount: sessionBefore.pendingCount,
@@ -478,12 +498,30 @@ async function materializeNextPendingMessageInTx(
                         where: { id: sessionId },
                         select: { pendingCount: true, pendingBlockedCount: true, pendingVersion: true },
                     });
+                    if (repaired.count > 0) {
+                        const participantCursors = await markPendingStateChangedParticipants({
+                            tx,
+                            sessionId,
+                            pendingVersion: latestSession.pendingVersion,
+                            pendingCount: latestSession.pendingCount,
+                            pendingBlockedCount: latestSession.pendingBlockedCount,
+                        });
+                        changes.push({
+                            ...latestSession,
+                            participantCursors,
+                            badgeAttentionChanged: didSessionActivityBadgeContributionChange(
+                                sessionBefore,
+                                { ...sessionBefore, ...latestSession },
+                            ),
+                        });
+                    }
                     return {
                         ok: true,
                         didMaterialize: false,
                         pendingCount: latestSession.pendingCount,
                         pendingBlockedCount: latestSession.pendingBlockedCount,
                         pendingVersion: latestSession.pendingVersion,
+                        ...(requestedLocalId !== undefined ? { deferredReason: "requested_local_id_unavailable" as const } : {}),
                         ...(noopDeliveryState ? { deliveryState: noopDeliveryState } : {}),
                     } as const;
                 }
@@ -494,11 +532,24 @@ async function materializeNextPendingMessageInTx(
                     pendingCount: sessionBefore.pendingCount ?? 0,
                     pendingBlockedCount: sessionBefore.pendingBlockedCount ?? 0,
                     pendingVersion: sessionBefore.pendingVersion ?? 0,
+                    ...(requestedLocalId !== undefined ? { deferredReason: "requested_local_id_unavailable" as const } : {}),
                     ...(noopDeliveryState ? { deliveryState: noopDeliveryState } : {}),
                 } as const;
             }
             if (readPendingLocalId(queueHead.localId) === null) {
                 return { ok: false, error: "invalid-params" } as const;
+            }
+
+            if (requestedLocalId !== undefined && !exactActionCandidate) {
+                return {
+                    ok: true,
+                    didMaterialize: false,
+                    pendingCount: sessionBefore.pendingCount ?? 0,
+                    pendingBlockedCount: sessionBefore.pendingBlockedCount ?? 0,
+                    pendingVersion: sessionBefore.pendingVersion ?? 0,
+                    deferredReason: "requested_local_id_unavailable",
+                    ...(noopDeliveryState ? { deliveryState: noopDeliveryState } : {}),
+                } as const;
             }
 
             const selectedAction = exactActionCandidate
@@ -536,6 +587,7 @@ async function materializeNextPendingMessageInTx(
             const nextPending = selected.row;
             const requestedAction = selected.action;
             const providerAction: PendingProviderAction = requestedAction.kind === "steer_now"
+                || requestedAction.kind === "steer_now_bound"
                 || (requestedAction.kind === "steer_if_active" && foregroundState === "active_steerable")
                 ? "steer"
                 : requestedAction.kind === "send_now" && foregroundState !== "ready"
@@ -637,6 +689,7 @@ async function materializeNextPendingMessageInTx(
                         pendingCount: latestSession.pendingCount,
                         pendingBlockedCount: latestSession.pendingBlockedCount,
                         pendingVersion: latestSession.pendingVersion,
+                        ...(requestedLocalId !== undefined ? { deferredReason: "requested_local_id_unavailable" as const } : {}),
                         ...(noopDeliveryState ? { deliveryState: noopDeliveryState } : {}),
                     } as const;
                 }

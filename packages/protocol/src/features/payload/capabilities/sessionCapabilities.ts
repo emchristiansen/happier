@@ -40,6 +40,7 @@ export const SessionCapabilitiesSchema = z
     messages: SessionMessagesCapabilitiesSchema,
     runtimeActivity: SessionRuntimeActivityCapabilitiesSchema.optional(),
     pendingInput: SessionPendingInputCapabilitiesSchema.optional(),
+    pendingInputExactLocalId: SessionProtocolCapabilitySchema.optional(),
   })
   .optional()
   .default(DEFAULT_SESSION_CAPABILITIES);

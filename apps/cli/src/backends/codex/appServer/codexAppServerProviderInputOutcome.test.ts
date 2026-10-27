@@ -5,6 +5,26 @@ import type { SessionProviderInputOutcomeProducer } from '@/api/session/sessionC
 import { createCodexAppServerProviderInputOutcomeBridge } from './codexAppServerProviderInputOutcome';
 
 describe('createCodexAppServerProviderInputOutcomeBridge', () => {
+    it('publishes a proven pre-effect rejection through the qualified exact-localId producer', () => {
+        const observe = vi.fn();
+        const bridge = createCodexAppServerProviderInputOutcomeBridge({
+            bindProviderInputOutcomeProducer: () => observe,
+        }, { isCurrentRuntimeMode: () => true });
+
+        expect(bridge.observeRejectedBeforeEffect({
+            localIds: ['rejected-exact-local'],
+            reason: 'steering_unavailable',
+        })).toBe(true);
+        expect(observe).toHaveBeenCalledWith({
+            kind: 'rejected_before_effect',
+            localId: 'rejected-exact-local',
+            reason: 'steering_unavailable',
+        });
+        observe.mockClear();
+        expect(bridge.observeRejectedBeforeEffect({ localIds: ['a', 'b'], reason: 'steering_unavailable' })).toBe(false);
+        expect(observe).not.toHaveBeenCalled();
+    });
+
     it('publishes exact provider acceptance with the Queue localId and Codex turn identity', () => {
         const observe = vi.fn();
         const bindProviderInputOutcomeProducer = vi.fn(

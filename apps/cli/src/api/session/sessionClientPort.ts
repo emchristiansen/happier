@@ -22,6 +22,7 @@ import type {
 } from './pendingQueueV2Transport';
 import type {
   PendingProviderAction,
+  PendingRequestedActionV1,
   SessionTranscriptObservationProvenanceV1,
   SessionPendingQueueDeliveryTiming,
   SessionSystemRecord,
@@ -65,6 +66,7 @@ export type PendingMaterializationDiagnosticPhase =
   | 'materialize.delivery_settlement';
 
 export type MaterializeNextPendingOptions = {
+  requestedLocalId?: string;
   expectedPendingVersion?: number;
   expectedRuntimeActivityRevision?: number;
   reconcileWhenEmpty?: PendingQueueReconcileWhenEmpty;
@@ -73,10 +75,24 @@ export type MaterializeNextPendingOptions = {
   onDiagnosticPhase?: (phase: PendingMaterializationDiagnosticPhase) => void;
 };
 
+export type PendingInputSteerNowAdmission =
+  | Readonly<{ kind: 'admitted' }>
+  | Readonly<{ kind: 'admission_uncertain' }>
+  | Readonly<{ kind: 'not_admitted'; reason: 'unsupported' | 'invalid_local_id' | 'server_rejected' }>;
+
 export type SessionUserMessageDeliveryInfo = Readonly<{
   seq: number | null;
   providerAcceptancePending?: boolean | undefined;
   pendingProviderAction?: PendingProviderAction | undefined;
+}>;
+
+export type BoundCodexSteerDelivery = Readonly<{
+  localId: string;
+  requestedAction: Extract<PendingRequestedActionV1, { kind: 'steer_now_bound' }>;
+  providerAction: 'steer';
+  providerAcceptancePending: true;
+  seq: number | null;
+  isCurrentRegistration: () => boolean;
 }>;
 
 export interface SessionClientPort {
@@ -178,6 +194,7 @@ export interface SessionClientPort {
   waitForProviderInputAdmission(abortSignal: AbortSignal): Promise<boolean>;
   waitForPendingEligibilityUpdate(abortSignal?: AbortSignal): Promise<boolean>;
   shouldAttemptPendingMaterialization?(opts?: {
+    requestedLocalId?: string;
     activeTurnSteerability?: PendingForegroundSteerability;
     pendingQueueDeliveryTiming?: SessionPendingQueueDeliveryTiming;
   }): boolean;

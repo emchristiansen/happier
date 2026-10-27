@@ -369,12 +369,25 @@ const CODEX_TRANSCRIPT_INITIAL_CHECKPOINT_DELAY_MS = 0;
 
 type CodexAppServerPermissionSupport = 'unknown' | 'supported' | 'legacy';
 
+export type CodexBoundSteerContext = Readonly<{
+    expectedTurnId: string;
+    isCurrentBinding: () => boolean;
+}>;
+
+export class CodexBoundSteerUnavailableError extends Error {
+    constructor(readonly providerEffect: 'none' | 'possible') {
+        super('Codex bound pending steer no longer owns its captured turn or invocation');
+        this.name = 'CodexBoundSteerUnavailableError';
+    }
+}
+
 type CodexAppServerPromptOptions = Readonly<{
     metadata?: unknown;
     localId?: string | null;
     localIds?: readonly string[] | null;
     trustedLocalImagePaths?: ReadonlySet<string>;
     userMessageSeq?: number | null;
+    expectedTurnId?: string;
     appliedModelId?: string | null;
     onProviderPromptAccepted?: () => void;
 }>;
@@ -1291,6 +1304,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
     canSteerPrompt: () => boolean;
     isTurnInFlight: () => boolean;
     hasActiveProviderTurn: () => boolean;
+    getActiveSteerableTurnId: () => Promise<string | null>;
     beginTurn: () => void;
     cancel: () => Promise<void>;
     reset: () => Promise<void>;
@@ -1299,6 +1313,7 @@ export function createCodexAppServerRuntime(params: Readonly<{
     setSessionModel: (_model: string) => Promise<void>;
     setSessionConfigOption: (_key: string, _value: unknown) => Promise<void>;
     steerPrompt: (_prompt: string, _options?: CodexAppServerPromptOptions) => Promise<void>;
+    steerPromptBound: (_prompt: string, _options: CodexAppServerPromptOptions, _context: CodexBoundSteerContext) => Promise<void>;
     compactContext: (_command: string) => Promise<void>;
     sendPrompt: (_prompt: string, _options?: CodexAppServerPromptOptions) => Promise<void>;
     setOnPromptAcceptedByProvider: (_callback: CodexAppServerPromptAcceptedCallback | null) => void;
@@ -4699,6 +4714,163 @@ export function createCodexAppServerRuntime(params: Readonly<{
         return { ok: true, reviewTurnId: reviewTurnResult ?? null };
     };
 
+    const steerPrompt = async (prompt: string, options?: CodexAppServerPromptOptions, boundContext?: CodexBoundSteerContext): Promise<void> => {
+        assertCodexAppServerPendingIdentity(options);
+        const activeTurn = pendingTurn;
+        let nativeRequestAttempted = false;
+        const assertBoundSteerCurrent = (): void => {
+            if (boundContext && (
+                !boundContext.isCurrentBinding()
+                || !activeTurn
+                || pendingTurn?.promise !== activeTurn.promise
+                || (pendingTurn.turnId ?? latestPendingTurnId) !== boundContext.expectedTurnId
+                || !canSteerPrompt()
+            )) {
+                throw new CodexBoundSteerUnavailableError(nativeRequestAttempted ? 'possible' : 'none');
+            }
+        };
+        assertBoundSteerCurrent();
+        if (!activeTurn) {
+            throw new Error('Codex app-server steerPrompt requires an active turn');
+        }
+        assertConnectedServiceAuthGroupAvailable();
+        const client = await ensureClient();
+        assertBoundSteerCurrent();
+        const steerClientGeneration = clientLifecycleGeneration;
+        const expectedTurnId = await waitForSteerableActiveTurnId(activeTurn);
+        assertBoundSteerCurrent();
+        if (pendingTurn?.promise !== activeTurn.promise || !canSteerPrompt()) {
+            throw new CodexAppServerSteerUnavailableError();
+        }
+        if (!expectedTurnId) {
+            throw new Error('Codex app-server steerPrompt requires an active turn id');
+        }
+        if (options?.expectedTurnId && options.expectedTurnId !== expectedTurnId) {
+            throw new Error('Codex app-server active turn changed before exact pending steer');
+        }
+
+        const structuredInput = await buildCodexTurnInputForPrompt(prompt, params.directory, options);
+        assertBoundSteerCurrent();
+        if (pendingTurn?.promise !== activeTurn.promise || !canSteerPrompt()) {
+            throw new CodexAppServerSteerUnavailableError();
+        }
+        const textOnlyInput: CodexAppServerTurnInputItem[] = [{ type: 'text', text: prompt }];
+        const pendingProviderPrompt = trackPendingProviderPrompt(prompt, options);
+        const clientUserMessageId = pendingProviderPrompt.localIds?.length === 1
+            ? pendingProviderPrompt.localIds[0]
+            : null;
+        const payload = {
+            threadId: activeTurn.threadId,
+            ...(clientUserMessageId ? { clientUserMessageId } : {}),
+        };
+        const finishAcceptedSteer = async (): Promise<void> => {
+            if (clientUserMessageId) {
+                markSteerAwaitingEcho(pendingProviderPrompt, activeTurn, {
+                    threadId: activeTurn.threadId,
+                    turnId: expectedTurnId,
+                    clientGeneration: steerClientGeneration,
+                });
+            }
+            await turnBoundaryTracker.appendSteerMessage({ localId: options?.localId ?? null });
+            if (!clientUserMessageId) {
+                markPendingProviderPromptAccepted(pendingProviderPrompt, expectedTurnId);
+            }
+            options?.onProviderPromptAccepted?.();
+        };
+        const failSteer = (error: unknown): unknown => {
+            clearPendingProviderPrompt(pendingProviderPrompt);
+            return error;
+        };
+        let steerRpcMayHaveEffect = false;
+        let previousUnconfirmedSteerRpcError: unknown;
+        const requestSteer = async (
+            input: CodexAppServerTurnInputItem[],
+            turnIdKey: 'expectedTurnId' | 'turnId',
+        ): Promise<void> => {
+            assertBoundSteerCurrent();
+            if (pendingTurn?.promise !== activeTurn.promise || !canSteerPrompt()) {
+                if (steerRpcMayHaveEffect) {
+                    // The guard rules out only the next request, not effects of an earlier one.
+                    throw new Error('Codex app-server active turn is not steerable', { cause: previousUnconfirmedSteerRpcError });
+                }
+                throw new CodexAppServerSteerUnavailableError();
+            }
+            const earlierSteerRpcMayHaveEffect = steerRpcMayHaveEffect;
+            steerRpcMayHaveEffect = true;
+            try {
+                nativeRequestAttempted = true;
+                await client.request('turn/steer', {
+                    ...payload,
+                    input,
+                    [turnIdKey]: expectedTurnId,
+                });
+            } catch (error) {
+                if (isCodexAppServerSteerRpcErrorResponse(error)) {
+                    // A correlated rejection rules out this attempt, never an earlier one.
+                    steerRpcMayHaveEffect = earlierSteerRpcMayHaveEffect;
+                } else {
+                    previousUnconfirmedSteerRpcError = error;
+                }
+                throw error;
+            }
+        };
+        const requestSteerWithStaleTurnRecovery = async (
+            input: CodexAppServerTurnInputItem[],
+            turnIdKey: 'expectedTurnId' | 'turnId',
+        ): Promise<void> => {
+            try {
+                await requestSteer(input, turnIdKey);
+            } catch (error) {
+                if (
+                    isCodexAppServerNoActiveTurnToSteerError(error)
+                    && pendingTurn?.promise === activeTurn.promise
+                ) {
+                    logger.debug('[codex-app-server] Native turn already inactive during steer; clearing local pending turn state');
+                    await finishPendingTurn({ flushReason: 'abort' });
+                }
+                throw error;
+            }
+        };
+        try {
+            await requestSteerWithStaleTurnRecovery(structuredInput, 'expectedTurnId');
+        } catch (error) {
+            if (structuredInput.length > 1 && isCodexAppServerInvalidParamsError(error)) {
+                try {
+                    await requestSteerWithStaleTurnRecovery(textOnlyInput, 'expectedTurnId');
+                } catch (fallbackError) {
+                    throw failSteer(fallbackError);
+                }
+                await finishAcceptedSteer();
+                return;
+            }
+            // Backward compatibility: older experimental app-server builds used `turnId` instead
+            // of `expectedTurnId`.
+            const message = error instanceof Error ? error.message : String(error ?? '');
+            const normalized = message.toLowerCase();
+            const looksLikeParamMismatch =
+                (normalized.includes('expectedturnid') || normalized.includes('expected turn') || normalized.includes('turnid'))
+                && (normalized.includes('require') || normalized.includes('missing') || normalized.includes('unknown') || normalized.includes('invalid'));
+            if (!looksLikeParamMismatch) {
+                throw failSteer(error);
+            }
+            try {
+                await requestSteerWithStaleTurnRecovery(structuredInput, 'turnId');
+            } catch (legacyError) {
+                if (structuredInput.length > 1 && isCodexAppServerInvalidParamsError(legacyError)) {
+                    try {
+                        await requestSteerWithStaleTurnRecovery(textOnlyInput, 'turnId');
+                    } catch (fallbackError) {
+                        throw failSteer(fallbackError);
+                    }
+                    await finishAcceptedSteer();
+                    return;
+                }
+                throw failSteer(legacyError);
+            }
+        }
+        await finishAcceptedSteer();
+    };
+
     return {
         getSessionId: () => threadId,
         getPublishedSessionId: () => lastPublishedThreadId.value,
@@ -4710,6 +4882,11 @@ export function createCodexAppServerRuntime(params: Readonly<{
         canSteerPrompt,
         isTurnInFlight: () => turnInFlight || nativeTurnHandoffBarrier !== null,
         hasActiveProviderTurn: () => pendingTurn !== null || nativeTurnHandoffBarrier !== null,
+        getActiveSteerableTurnId: async () => {
+            const activeTurn = pendingTurn;
+            if (!activeTurn) return null;
+            return await waitForSteerableActiveTurnId(activeTurn);
+        },
         beginTurn: () => {
             void beginTurnChangeTracking();
         },
@@ -4819,140 +4996,12 @@ export function createCodexAppServerRuntime(params: Readonly<{
             }
             throw new Error(`Unsupported Codex app-server config option: ${String(key)}`);
         },
-        steerPrompt: async (prompt: string, options?: CodexAppServerPromptOptions) => {
-            assertCodexAppServerPendingIdentity(options);
-            const activeTurn = pendingTurn;
-            if (!activeTurn) {
-                throw new Error('Codex app-server steerPrompt requires an active turn');
+        steerPrompt,
+        steerPromptBound: async (prompt: string, options: CodexAppServerPromptOptions, context: CodexBoundSteerContext): Promise<void> => {
+            if (!context || !context.expectedTurnId || typeof context.isCurrentBinding !== 'function') {
+                throw new CodexBoundSteerUnavailableError('none');
             }
-            assertConnectedServiceAuthGroupAvailable();
-            const client = await ensureClient();
-            const steerClientGeneration = clientLifecycleGeneration;
-            const expectedTurnId = await waitForSteerableActiveTurnId(activeTurn);
-            if (pendingTurn?.promise !== activeTurn.promise || !canSteerPrompt()) {
-                throw new CodexAppServerSteerUnavailableError();
-            }
-            if (!expectedTurnId) {
-                throw new Error('Codex app-server steerPrompt requires an active turn id');
-            }
-
-            const structuredInput = await buildCodexTurnInputForPrompt(prompt, params.directory, options);
-            if (pendingTurn?.promise !== activeTurn.promise || !canSteerPrompt()) {
-                throw new CodexAppServerSteerUnavailableError();
-            }
-            const textOnlyInput: CodexAppServerTurnInputItem[] = [{ type: 'text', text: prompt }];
-            const pendingProviderPrompt = trackPendingProviderPrompt(prompt, options);
-            const clientUserMessageId = pendingProviderPrompt.localIds?.length === 1
-                ? pendingProviderPrompt.localIds[0]
-                : null;
-            const payload = {
-                threadId: activeTurn.threadId,
-                ...(clientUserMessageId ? { clientUserMessageId } : {}),
-            };
-            const finishAcceptedSteer = async (): Promise<void> => {
-                if (clientUserMessageId) {
-                    markSteerAwaitingEcho(pendingProviderPrompt, activeTurn, {
-                        threadId: activeTurn.threadId,
-                        turnId: expectedTurnId,
-                        clientGeneration: steerClientGeneration,
-                    });
-                }
-                await turnBoundaryTracker.appendSteerMessage({ localId: options?.localId ?? null });
-                if (!clientUserMessageId) {
-                    markPendingProviderPromptAccepted(pendingProviderPrompt, expectedTurnId);
-                }
-                options?.onProviderPromptAccepted?.();
-            };
-            const failSteer = (error: unknown): unknown => {
-                clearPendingProviderPrompt(pendingProviderPrompt);
-                return error;
-            };
-            let steerRpcMayHaveEffect = false;
-            let previousUnconfirmedSteerRpcError: unknown;
-            const requestSteer = async (
-                input: CodexAppServerTurnInputItem[],
-                turnIdKey: 'expectedTurnId' | 'turnId',
-            ): Promise<void> => {
-                if (pendingTurn?.promise !== activeTurn.promise || !canSteerPrompt()) {
-                    if (steerRpcMayHaveEffect) {
-                        // The guard rules out only the next request, not effects of an earlier one.
-                        throw new Error('Codex app-server active turn is not steerable', { cause: previousUnconfirmedSteerRpcError });
-                    }
-                    throw new CodexAppServerSteerUnavailableError();
-                }
-                const earlierSteerRpcMayHaveEffect = steerRpcMayHaveEffect;
-                steerRpcMayHaveEffect = true;
-                try {
-                    await client.request('turn/steer', {
-                        ...payload,
-                        input,
-                        [turnIdKey]: expectedTurnId,
-                    });
-                } catch (error) {
-                    if (isCodexAppServerSteerRpcErrorResponse(error)) {
-                        // A correlated rejection rules out this attempt, never an earlier one.
-                        steerRpcMayHaveEffect = earlierSteerRpcMayHaveEffect;
-                    } else {
-                        previousUnconfirmedSteerRpcError = error;
-                    }
-                    throw error;
-                }
-            };
-            const requestSteerWithStaleTurnRecovery = async (
-                input: CodexAppServerTurnInputItem[],
-                turnIdKey: 'expectedTurnId' | 'turnId',
-            ): Promise<void> => {
-                try {
-                    await requestSteer(input, turnIdKey);
-                } catch (error) {
-                    if (
-                        isCodexAppServerNoActiveTurnToSteerError(error)
-                        && pendingTurn?.promise === activeTurn.promise
-                    ) {
-                        logger.debug('[codex-app-server] Native turn already inactive during steer; clearing local pending turn state');
-                        await finishPendingTurn({ flushReason: 'abort' });
-                    }
-                    throw error;
-                }
-            };
-            try {
-                await requestSteerWithStaleTurnRecovery(structuredInput, 'expectedTurnId');
-            } catch (error) {
-                if (structuredInput.length > 1 && isCodexAppServerInvalidParamsError(error)) {
-                    try {
-                        await requestSteerWithStaleTurnRecovery(textOnlyInput, 'expectedTurnId');
-                    } catch (fallbackError) {
-                        throw failSteer(fallbackError);
-                    }
-                    await finishAcceptedSteer();
-                    return;
-                }
-                // Backward compatibility: older experimental app-server builds used `turnId` instead
-                // of `expectedTurnId`.
-                const message = error instanceof Error ? error.message : String(error ?? '');
-                const normalized = message.toLowerCase();
-                const looksLikeParamMismatch =
-                    (normalized.includes('expectedturnid') || normalized.includes('expected turn') || normalized.includes('turnid'))
-                    && (normalized.includes('require') || normalized.includes('missing') || normalized.includes('unknown') || normalized.includes('invalid'));
-                if (!looksLikeParamMismatch) {
-                    throw failSteer(error);
-                }
-                try {
-                    await requestSteerWithStaleTurnRecovery(structuredInput, 'turnId');
-                } catch (legacyError) {
-                    if (structuredInput.length > 1 && isCodexAppServerInvalidParamsError(legacyError)) {
-                        try {
-                            await requestSteerWithStaleTurnRecovery(textOnlyInput, 'turnId');
-                        } catch (fallbackError) {
-                            throw failSteer(fallbackError);
-                        }
-                        await finishAcceptedSteer();
-                        return;
-                    }
-                    throw failSteer(legacyError);
-                }
-            }
-            await finishAcceptedSteer();
+            await steerPrompt(prompt, { ...options, expectedTurnId: context.expectedTurnId }, context);
         },
         compactContext: async (_command: string) => {
             const activeThreadId = threadId;

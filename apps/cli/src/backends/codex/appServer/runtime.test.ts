@@ -3858,6 +3858,7 @@ describe('createCodexAppServerRuntime', () => {
         await runtime.steerPrompt('nudge', {
             localId: ' local-steer-42\n',
             userMessageSeq: 42,
+            expectedTurnId: 'turn-overlap-start',
             onProviderPromptAccepted,
         });
         await sendPromptPromise;
@@ -3879,6 +3880,27 @@ describe('createCodexAppServerRuntime', () => {
             providerTurnId: 'turn-overlap-start',
         });
         expect(onProviderPromptAccepted).toHaveBeenCalledTimes(1);
+    });
+
+    it('fails closed when an exact steer targets a turn that is no longer active', async () => {
+        const { root, requestLogPath } = await createRuntimeFixture('happier-codex-app-server-runtime-exact-steer-turn-change-');
+        const runtime = createCodexAppServerRuntime({
+            directory: root,
+            onThinkingChange: vi.fn(),
+            session: { updateMetadata: vi.fn() } as any,
+        });
+        await runtime.startOrLoad({});
+        const sendPromptPromise = runtime.sendPrompt('overlap-start');
+        await new Promise((resolve) => setTimeout(resolve, 30));
+
+        await expect(runtime.steerPrompt('must-not-cross-turn-boundary', {
+            localId: 'exact-steer-target',
+            expectedTurnId: 'different-turn',
+        })).rejects.toThrow(/active turn changed/i);
+        await sendPromptPromise;
+
+        const requestLog = (await readFile(requestLogPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+        expect(requestLog.filter((entry: { method: string }) => entry.method === 'turn/steer')).toHaveLength(0);
     });
 
     it('places a correlated steer at the provider user-message boundary before accepting Pending custody', async () => {
@@ -4367,7 +4389,7 @@ describe('createCodexAppServerRuntime', () => {
         ]);
     });
 
-    it('does not retry a structured steer after the active turn owner terminates', async () => {
+    it.each([false, true])('does not retry a structured steer after the active turn owner terminates (bound=%s)', async (bound) => {
         const { root, requestLogPath } = await createRuntimeFixture(
             'happier-codex-app-server-runtime-steer-structured-fallback-owner-race-',
             { rejectStructuredSteerInput: true },
@@ -4386,7 +4408,7 @@ describe('createCodexAppServerRuntime', () => {
             label: 'active turn to become steerable before structured fallback race',
         });
 
-        await expect(runtime.steerPrompt('structured-fallback-owner-change', {
+        const options = {
             metadata: {
                 happierStructuredInputV1: {
                     vendorPluginMentions: [
@@ -4394,7 +4416,12 @@ describe('createCodexAppServerRuntime', () => {
                     ],
                 },
             },
-        })).rejects.toBeInstanceOf(CodexAppServerSteerUnavailableError);
+        };
+        const operation = bound
+            ? runtime.steerPromptBound('structured-fallback-owner-change', options, { expectedTurnId: (await runtime.getActiveSteerableTurnId())!, isCurrentBinding: () => true })
+            : runtime.steerPrompt('structured-fallback-owner-change', options);
+        if (bound) await expect(operation).rejects.toMatchObject({ name: 'CodexBoundSteerUnavailableError', providerEffect: 'possible' });
+        else await expect(operation).rejects.toBeInstanceOf(CodexAppServerSteerUnavailableError);
         await sendPromptPromise;
 
         const requestLog = await readRequestLog(requestLogPath);
@@ -4555,6 +4582,8 @@ describe('createCodexAppServerRuntime', () => {
             intervalMs: 10,
             label: 'Codex app-server turn to become steerable',
         });
+        const capturedTurnId = await runtime.getActiveSteerableTurnId();
+        expect(capturedTurnId).toBeTruthy();
 
         await waitForCondition(() => steerableRuntime.canSteerPrompt?.() === false, {
             timeoutMs: 1_000,
@@ -4564,11 +4593,14 @@ describe('createCodexAppServerRuntime', () => {
 
         expect(runtime.isTurnInFlight()).toBe(true);
         expect(activeTurnPendingPump.signal?.aborted).toBe(false);
-        await expect(runtime.steerPrompt('late-nudge')).rejects.toBeInstanceOf(CodexAppServerSteerUnavailableError);
+        await expect(runtime.steerPrompt('late-nudge', { expectedTurnId: capturedTurnId! }))
+            .rejects.toBeInstanceOf(CodexAppServerSteerUnavailableError);
         await sendPromptPromise;
         expect((await readRequestLog(requestLogPath)).filter((entry) => entry.method === 'turn/steer')).toHaveLength(0);
         expect(activeTurnPendingPump.signal?.aborted).toBe(true);
         activeTurnPendingPump.resolve?.();
+        const requestLog = await readRequestLog(requestLogPath);
+        expect(requestLog.filter((entry) => entry.method === 'turn/steer')).toHaveLength(0);
     });
 
     it('keeps an active app-server turn steerable when the selected session mode changes', async () => {
@@ -4676,7 +4708,7 @@ describe('createCodexAppServerRuntime', () => {
         }
     });
 
-    it('does not steer a turn whose ownership changes while structured input is resolving', async () => {
+    it.each([false, true])('does not steer a turn whose ownership changes while structured input is resolving (bound=%s)', async (bound) => {
         const { root, requestLogPath } = await createRuntimeFixture(
             'happier-codex-app-server-runtime-steer-input-owner-race-',
         );
@@ -4731,12 +4763,47 @@ describe('createCodexAppServerRuntime', () => {
             },
         };
 
-        await expect(runtime.steerPrompt('must-not-steer-after-owner-change', { metadata }))
-            .rejects.toBeInstanceOf(CodexAppServerSteerUnavailableError);
+        const operation = bound
+            ? runtime.steerPromptBound('must-not-steer-after-owner-change', { metadata }, { expectedTurnId: (await runtime.getActiveSteerableTurnId())!, isCurrentBinding: () => true })
+            : runtime.steerPrompt('must-not-steer-after-owner-change', { metadata });
+        if (bound) await expect(operation).rejects.toMatchObject({ name: 'CodexBoundSteerUnavailableError', providerEffect: 'none' });
+        else await expect(operation).rejects.toBeInstanceOf(CodexAppServerSteerUnavailableError);
         await sendPromptPromise;
 
         const requestLog = await readRequestLog(requestLogPath);
         expect(requestLog.filter((entry) => entry.method === 'turn/steer')).toHaveLength(0);
+    });
+
+    it('[bound-lifetime] steers the captured native turn using a mandatory current binding', async () => {
+        const { root, requestLogPath } = await createRuntimeFixture('happier-codex-bound-steer-success-');
+        const runtime = createCodexAppServerRuntime({ directory: root, onThinkingChange: vi.fn(), session: { updateMetadata: vi.fn() } as any });
+        await runtime.startOrLoad({});
+        const active = runtime.sendPrompt('overlap-start');
+        await waitForCondition(() => runtime.canSteerPrompt(), { timeoutMs: 1_000, intervalMs: 10, label: 'bound native turn to become steerable' });
+        const expectedTurnId = await runtime.getActiveSteerableTurnId();
+        if (!expectedTurnId) throw new Error('No native turn');
+        await expect(runtime.steerPromptBound('missing binding context', { localId: 'L' }, undefined as unknown as import('./runtime').CodexBoundSteerContext)).rejects.toMatchObject({ name: 'CodexBoundSteerUnavailableError', providerEffect: 'none' });
+        await runtime.steerPromptBound('bound T1', { localId: ' L ' }, { expectedTurnId, isCurrentBinding: () => true });
+        const requests = await readRequestLog(requestLogPath);
+        expect(requests.filter((entry) => entry.method === 'turn/steer')).toEqual([
+            expect.objectContaining({ params: expect.objectContaining({ expectedTurnId, clientUserMessageId: ' L ' }) }),
+        ]);
+        await active;
+    });
+
+    it('[bound-lifetime] refuses revoked binding during asynchronous structured input before native effect', async () => {
+        const { root, requestLogPath } = await createRuntimeFixture('happier-codex-bound-steer-revoked-');
+        const runtime = createCodexAppServerRuntime({ directory: root, onThinkingChange: vi.fn(), session: { updateMetadata: vi.fn() } as any });
+        await runtime.startOrLoad({});
+        const active = runtime.sendPrompt('overlap-start');
+        await waitForCondition(() => runtime.canSteerPrompt(), { timeoutMs: 1_000, intervalMs: 10, label: 'bound native turn to become steerable' });
+        const expectedTurnId = await runtime.getActiveSteerableTurnId();
+        if (!expectedTurnId) throw new Error('No native turn');
+        let current = true;
+        const metadata = { get happier() { queueMicrotask(() => { current = false; }); return undefined; } };
+        await expect(runtime.steerPromptBound('revoked before native request', { localId: 'L', metadata }, { expectedTurnId, isCurrentBinding: () => current })).rejects.toMatchObject({ name: 'CodexBoundSteerUnavailableError', providerEffect: 'none' });
+        expect((await readRequestLog(requestLogPath)).filter((entry) => entry.method === 'turn/steer')).toHaveLength(0);
+        await active;
     });
 
     it('bridges stream notifications into transcript deltas and tool updates during sendPrompt', async () => {
