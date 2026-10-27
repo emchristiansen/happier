@@ -166,6 +166,7 @@ export function createConnectedServiceSwitchDeferralQueue(
   const nowMs = params.nowMs ?? Date.now;
   const turnStateBySessionId = new Map<string, SessionTurnState>();
   const pendingBySessionId = new Map<string, PendingSwitch>();
+  let daemonShutdownRequested = false;
 
   const emit = (sessionId: string, event: unknown): void => {
     params.emitSessionEvent?.(sessionId, event);
@@ -315,6 +316,12 @@ export function createConnectedServiceSwitchDeferralQueue(
   const requestSwitch = async (input: ConnectedServiceSwitchRequest): Promise<void> => {
     const sessionId = String(input.sessionId ?? '').trim();
     if (!sessionId) return;
+    if (daemonShutdownRequested) {
+      throw new ConnectedServiceSwitchDeferralConflictError({
+        code: 'daemon_shutdown',
+        message: 'Connected-service switch refused because daemon shutdown has begun',
+      });
+    }
     const target = normalizeTarget(input.target);
     if (shouldRunImmediately(input)) {
       await input.runSwitch();
@@ -470,6 +477,8 @@ export function createConnectedServiceSwitchDeferralQueue(
   };
 
   const cancelAll = (reason: 'daemon_shutdown'): void => {
+    // This daemon-owned queue never reopens after shutdown, including for late refresh callbacks.
+    daemonShutdownRequested = true;
     const pendingEntries = [...pendingBySessionId.values()];
     turnStateBySessionId.clear();
     for (const pending of pendingEntries) {

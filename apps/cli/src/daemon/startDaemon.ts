@@ -5217,7 +5217,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               restartRequestedPids: connectedServicesRestartRequestedPids,
               pidToTrackedSession,
               canSignal: async () => {
+                 if (shutdownInitiated) return false;
                  if (input.shouldSignal && !await input.shouldSignal()) return false;
+                 if (shutdownInitiated) return false;
                  return resolveSessionRunnerActivityDisabledReason(input.sessionId) ?? true;
                },
               requestSignal: async ({ shouldSignal, onSignalFailure, onProcessAlreadyMissing }) =>
@@ -5227,6 +5229,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   processGroupPid: resolveConnectedServiceRestartProcessGroupPid(input.tracked),
                   delayMs: input.restartSignalDelayMs,
                   shouldSignal,
+                  isShutdownRequested: () => shutdownInitiated,
                   restartDiagnostic: input.restartDiagnostic,
                   recordRestartDiagnostic: recordConnectedServiceRestartDiagnostic,
                   restartAmplificationGuard: connectedServiceRestartAmplificationGuard,
@@ -7630,7 +7633,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           if (!tracked || !sessionId || tracked.happySessionId !== sessionId) return null;
           const isLocallyCurrent = (requirement: HotApplyRestartRequirement): boolean => {
             const runtime = connectedServiceRuntimeRegistry.getByPid(target.pid);
-            if (pidToTrackedSession.get(target.pid) !== tracked || tracked.happySessionId !== sessionId
+            if (shutdownInitiated
+              || pidToTrackedSession.get(target.pid) !== tracked || tracked.happySessionId !== sessionId
               || stopSessionInFlightBySessionId.has(sessionId)
               || runtime?.sessionId !== sessionId || runtime.runtimeIdentityKey !== target.runtimeIdentityKey
               || runtime.agentId !== target.agentId) return false;

@@ -13,6 +13,70 @@ describe('requestConnectedServiceSessionRestartSignal', () => {
     vi.restoreAllMocks();
   });
 
+  it('refuses shutdown before consulting asynchronous signal authority', async () => {
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const shouldSignal = vi.fn(async () => true);
+    await expect(requestConnectedServiceSessionRestartSignal({
+      pid: 123, delayMs: 0, shouldSignal, isShutdownRequested: () => true, onSignalFailure: () => {},
+    })).resolves.toEqual({ status: 'skipped_stale_owner' });
+    expect(shouldSignal).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('rechecks shutdown after in-flight signal authority returns true', async () => {
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    let shutdown = false;
+    let resolveAuthority!: (current: boolean) => void;
+    const authority = new Promise<boolean>((resolve) => { resolveAuthority = resolve; });
+    const request = requestConnectedServiceSessionRestartSignal({
+      pid: 123, delayMs: 0, shouldSignal: () => authority,
+      isShutdownRequested: () => shutdown, onSignalFailure: () => {},
+    });
+    shutdown = true;
+    resolveAuthority(true);
+    await expect(request).resolves.toEqual({ status: 'skipped_stale_owner' });
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('closes the microtask gap after a synchronously true authority result', async () => {
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    let shutdown = false;
+    await expect(requestConnectedServiceSessionRestartSignal({
+      pid: 123, delayMs: 0,
+      shouldSignal: () => {
+        queueMicrotask(() => { shutdown = true; });
+        return true;
+      },
+      isShutdownRequested: () => shutdown, onSignalFailure: () => {},
+    })).resolves.toEqual({ status: 'skipped_stale_owner' });
+    expect(shutdown).toBe(true);
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('refuses a delayed signal whose daemon shuts down before its timer', async () => {
+    vi.useFakeTimers();
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    let shutdown = false;
+    const request = requestConnectedServiceSessionRestartSignal({
+      pid: 123, delayMs: 50, shouldSignal: async () => true,
+      isShutdownRequested: () => shutdown, onSignalFailure: () => {},
+    });
+    shutdown = true;
+    await vi.advanceTimersByTimeAsync(50);
+    await expect(request).resolves.toEqual({ status: 'skipped_stale_owner' });
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('preserves an active daemon signal when the lifetime predicate stays false', async () => {
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    await expect(requestConnectedServiceSessionRestartSignal({
+      pid: 123, delayMs: 0, shouldSignal: async () => true,
+      isShutdownRequested: () => false, onSignalFailure: () => {},
+    })).resolves.toEqual({ status: 'requested' });
+    expect(kill).toHaveBeenCalledTimes(1);
+    expect(kill).toHaveBeenCalledWith(123, 'SIGTERM');
+  });
+
   it('assigns one transcript author to switch-FSM and direct-signal restart requests', () => {
     expect(shouldEmitConnectedServiceRestartRequestedSessionEvent({ owner: 'switch_fsm', signaled: true })).toBe(false);
     expect(shouldEmitConnectedServiceRestartRequestedSessionEvent({ owner: 'restart_signal', signaled: true })).toBe(true);
