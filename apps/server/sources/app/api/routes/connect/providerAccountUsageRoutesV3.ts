@@ -4,6 +4,7 @@ import type { FastifyReply } from "fastify";
 import type { Fastify } from "../../types";
 import { resolveApiHotEndpointRateLimit } from "@/app/api/utils/apiRateLimitCatalog";
 import { resolveEffectiveAccountEncryptionModeFromAccountRow } from "@/app/encryption/accountEncryptionMode";
+import { isServerFeatureEnabledForRequest } from "@/app/features/catalog/serverFeatureGate";
 import { db } from "@/storage/db";
 import {
     ConnectedServiceIdSchema,
@@ -12,7 +13,8 @@ import {
     ProviderAccountUsageRecordIdSchema,
     ProviderAccountUsageSnapshotV1Schema,
     ProviderAccountSubscriptionV1Schema,
-    splitProviderAccountUsageSubscription,
+    ConnectedServiceQuotaRecoveryCreditDetailsByIdV1Schema,
+    splitProviderAccountUsageSupplementalFacets,
     PROVIDER_ACCOUNT_SUBSCRIPTION_ACCEPT,
     StoredJsonContentEnvelopeSchema,
 } from "@happier-dev/protocol";
@@ -130,6 +132,7 @@ export function registerProviderAccountUsageRoutesV3(app: Fastify): void {
                     status: z.enum(["ok", "unavailable", "estimated", "error"]),
                     materialFingerprint: z.string().min(1).max(256).optional(),
                     subscription: ProviderAccountSubscriptionV1Schema.optional(),
+                    recoveryCreditDetails: ConnectedServiceQuotaRecoveryCreditDetailsByIdV1Schema.optional(),
                 }).strict(),
                 source: ConnectedServiceUsageSourceV1Schema.optional(),
             }).strict(),
@@ -143,9 +146,12 @@ export function registerProviderAccountUsageRoutesV3(app: Fastify): void {
         if (!account || request.body.content.t !== "plain") {
             return sendProviderAccountUsageInvalidParams(reply, "provider_account_usage_plaintext_required");
         }
-
         const parsed = ProviderAccountUsageSnapshotV1Schema.safeParse(request.body.content.v);
         if (!parsed.success) {
+            return sendProviderAccountUsageInvalidParams(reply, "provider_account_usage_payload_invalid");
+        }
+        if ((request.body.metadata.recoveryCreditDetails !== undefined || parsed.data.recoveryCreditDetails !== undefined)
+            && !isServerFeatureEnabledForRequest("connectedServices.quotaRecoveryCreditDetails", process.env)) {
             return sendProviderAccountUsageInvalidParams(reply, "provider_account_usage_payload_invalid");
         }
         if (parsed.data.recordId !== request.params.recordId) {
@@ -165,7 +171,11 @@ export function registerProviderAccountUsageRoutesV3(app: Fastify): void {
                 fetchedAt: request.body.metadata.fetchedAt,
                 staleAfterMs: request.body.metadata.staleAfterMs,
                 materialFingerprint: request.body.metadata.materialFingerprint,
-                snapshot: request.body.metadata.subscription ? { ...parsed.data, subscription: request.body.metadata.subscription } : parsed.data,
+                snapshot: {
+                    ...parsed.data,
+                    ...(request.body.metadata.subscription ? { subscription: request.body.metadata.subscription } : {}),
+                    ...(request.body.metadata.recoveryCreditDetails ? { recoveryCreditDetails: request.body.metadata.recoveryCreditDetails } : {}),
+                },
             };
             let sourceOutcome: ProviderAccountUsageSourceLinkOutcome | undefined;
             if (request.body.source) {
@@ -204,6 +214,7 @@ export function registerProviderAccountUsageRoutesV3(app: Fastify): void {
                 200: z.object({
                     content: StoredJsonContentEnvelopeSchema,
                     subscription: ProviderAccountSubscriptionV1Schema.optional(),
+                    recoveryCreditDetails: ConnectedServiceQuotaRecoveryCreditDetailsByIdV1Schema.optional(),
                     metadata: z.object({
                         fetchedAt: z.number().int().nonnegative(),
                         staleAfterMs: z.number().int().nonnegative(),
@@ -231,11 +242,12 @@ export function registerProviderAccountUsageRoutesV3(app: Fastify): void {
             providerAccountUsageRecordId: record.recordId,
         });
 
-        const projected = splitProviderAccountUsageSubscription(record.snapshot);
+        const projected = splitProviderAccountUsageSupplementalFacets(record.snapshot);
         return reply.send({
             content: { t: "plain", v: projected.snapshot },
             ...(request.headers.accept === PROVIDER_ACCOUNT_SUBSCRIPTION_ACCEPT && projected.subscription
                 ? { subscription: projected.subscription } : {}),
+            ...(projected.recoveryCreditDetails ? { recoveryCreditDetails: projected.recoveryCreditDetails } : {}),
             metadata: {
                 fetchedAt: record.fetchedAt ?? record.snapshot.fetchedAtMs,
                 staleAfterMs: record.staleAfterMs ?? record.snapshot.staleAfterMs,

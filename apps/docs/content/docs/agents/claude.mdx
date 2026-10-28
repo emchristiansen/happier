@@ -15,11 +15,11 @@ Happier supports two ways of running Claude:
 Remote mode has **three implementations**, selected in that order: unified
 terminal when it is enabled, otherwise Agent SDK, otherwise legacy.
 
-| Runtime | How Happier drives Claude | Terminal to join? |
+| Runtime | How Happier drives Claude | Native Claude TUI in remote mode? |
 | --- | --- | --- |
 | **Unified terminal** (opt-in) | Happier hosts Claude Code's own TUI in a terminal session and types prompts into its composer, so the app and the terminal share one Claude Code run. | Yes |
-| **Agent SDK** (default) | Runs Claude through the official `@anthropic-ai/claude-agent-sdk` in a background process, publishing capabilities and optionally file checkpointing. | No |
-| **Legacy remote** (fallback) | The older SDK-like shim that spawns `claude` with a streaming output format and forwards hooks for session info. | No |
+| **Agent SDK** (default) | Runs Claude through the official `@anthropic-ai/claude-agent-sdk` in a background process, publishing capabilities and optionally file checkpointing. | No. An attachable Happier runner can switch to local mode. |
+| **Legacy remote** (fallback) | The older SDK-like shim that spawns `claude` with a streaming output format and forwards hooks for session info. | No. An attachable Happier runner can switch to local mode. |
 
 The unified terminal is off until you turn it on, and it changes enough about
 how a session behaves — steering, queued input, which runtime controls apply
@@ -41,7 +41,7 @@ Local control is started from the terminal. Use `happier attach <session-id>` on
 
 If you send a message from the app while Claude is locally controlled, Happier stores it in the pending queue first. When Claude is idle, Happier can switch back to remote control and process the queued message. If Claude is still working in the terminal, Happier waits until the local turn finishes or stops before switching, so the app message does not interrupt the current Claude turn.
 
-On machines with `tmux`, this is usually a tmux-backed attach flow. On Windows, use Happier’s Windows remote session mode (`Windows Terminal`, `Console`, or `Hidden`) instead of expecting tmux.
+On macOS and Linux, the selected terminal host can be tmux, zellij, or Herdr. Herdr is supported in Happier CLI 0.2.16 and later, including stable releases: starting `happier claude` inside Herdr reuses the current pane. On Windows, use Happier’s Windows remote session mode (`Windows Terminal`, `Console`, or `Hidden`).
 
 For the full workflow, see [Features → Attach to a running session](/sessions/attach-to-session).
 
@@ -49,7 +49,7 @@ For the full workflow, see [Features → Attach to a running session](/sessions/
 
 Happier uses:
 
-- a **provider-agnostic permission mode** (`default`, `read-only`, `safe-yolo`, `yolo`)
+- a **provider-agnostic permission intent** (`read_only`, `default`, `auto`, `yolo`)
 - a separate Claude **session mode** surface (including **Plan**)
 
 For the full user guide (CLI flags, UI picker, defaults, and apply timing), see:
@@ -94,7 +94,7 @@ Permission mode is stored canonically in **session metadata**, so it follows the
 - open the same session on another device, or
 - switch between **local** and **remote** mode.
 
-Some permission behavior is implemented by Happier (tool approval gating) and can update immediately; other behavior depends on Claude’s own session flags and may only take effect when Claude is launched/resumed. The in-session picker’s “Effective policy” line is the source of truth for what will apply right now.
+Some permission behavior is implemented by Happier (tool approval gating) and can update immediately; other behavior depends on Claude’s own session flags and may only take effect when Claude is launched/resumed.
 
 When local permission bridge is enabled, Claude permission prompts can still be forwarded into Happier while the terminal owns the session. Message sending is separate from permission approval: app messages sent during exclusive local control still go through the pending queue and are delivered only after Happier can safely resume remote processing.
 
@@ -210,6 +210,7 @@ The one exception is **Experimental: local permission bridge**, which affects **
 
 | Setting | Default | What it does |
 | --- | --- | --- |
+| **Discover available models** | On | Lets Happier ask Anthropic which models are available to the selected Claude account. Turn it off to use Happier's built-in Claude model catalog without reading native Claude Code credentials or sending a model-catalog request. |
 | **Use Agent SDK (remote)** | On | Enables the official Agent SDK remote runner (`@anthropic-ai/claude-agent-sdk`). When off, Happier uses the legacy remote runner. |
 | **Setting sources** | User + Project | Controls what Claude settings get loaded: **Project only** loads repo config (for example `CLAUDE.md`); **User + Project** includes user-global config too (including user-defined MCP servers); **None** ignores both for maximum determinism. |
 | **Force-enable Agent Teams (experimental)** | Off | When enabled, Happier force-enables Claude Code experimental Agent Teams for all Claude starts (local + remote). When off, Happier does not force-disable and Claude uses its own defaults. |
@@ -232,6 +233,19 @@ Happier does not have a Claude-specific “env var” CLI flag. To set environme
 - **Remote mode (from the app UI)**: set env vars on the profile/session in the UI (Happier forwards them to the spawned Claude process).
 
 Remote Agent SDK mode uses a filtered environment by default, but **explicit** GUI/profile env vars (and connected-services auth env vars) are forwarded to the Claude subprocess so workflows like GitHub integration can work without leaking the full parent `process.env`.
+
+For a machine-local opt-out from dynamic Claude model discovery, set
+`HAPPIER_CLAUDE_DYNAMIC_MODEL_PROBE_ENABLED=0` in the Happier CLI/daemon environment. This has the
+same static-catalog result as turning off **Discover available models**, and the account setting
+cannot be overridden back on by the environment variable.
+
+## Claude Code session history (development source)
+
+The development source adds **Show sessions in Claude Code** under Claude settings. It is off by default. Turn it on before starting a new session to set `CLAUDE_CODE_ENTRYPOINT=happier` on Happier Claude launches, including Agent SDK, legacy remote, local terminal, unified terminal, and execution runs. Off leaves the provider runtime’s default attribution in place.
+
+Claude Code’s VS Code extension 2.1.296 excludes sessions attributed to `sdk-ts`, `sdk-py`, or `sdk-cli`. Happier attribution avoids that exclusion; it does not turn an SDK session into an interactive terminal session. Claude Code 2.1.283 and 2.1.296 rewrite `cli` to `sdk-cli` on noninteractive launches, so the setting uses `happier` instead. This is an internal Anthropic environment variable: changing it also affects SDK client attribution, some question formatting and built-in agent availability. Future Claude Code versions may behave differently. It is not a billing or usage-limit setting.
+
+Claude Code must still use the same configuration directory and project directory as Happier. The setting does not rewrite existing transcripts or remove other history filters, such as Claude-native daemon session kinds. Existing hidden sessions can still be resumed by ID with `claude --resume <session-id>`. Availability in a released Happier build depends on that build including this setting.
 
 ## Agent Teams (Claude swarms) in Happier
 

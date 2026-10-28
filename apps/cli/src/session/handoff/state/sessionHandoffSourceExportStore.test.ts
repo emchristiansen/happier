@@ -10,6 +10,27 @@ import { readWorkspaceReplicationManifestFromFile } from '../workspaceReplicatio
 import { createSessionHandoffSourceExportStore } from './sessionHandoffSourceExportStore';
 
 describe('sessionHandoffSourceExportStore', () => {
+  it('retains existing-state mode without a provider or workspace payload after cleanup', async () => {
+    const activeServerDir = await mkdtemp(join(os.tmpdir(), 'happier-handoff-existing-store-'));
+    try {
+      const store = createSessionHandoffSourceExportStore({ activeServerDir });
+      await store.save({
+        handoffId: 'existing-state',
+        sessionId: 'session-1',
+        stateTransfer: 'existing',
+        sourceMachineId: 'source',
+        targetMachineId: 'target',
+        exportedAtMs: 1,
+        workspaceSourceRootPath: '/repo',
+      });
+      await store.releaseTransferFiles('existing-state');
+      expect(await store.load('existing-state')).toMatchObject({ stateTransfer: 'existing', sessionId: 'session-1' });
+      expect(await store.load('existing-state')).not.toHaveProperty('providerBundle');
+      expect(await store.load('existing-state')).not.toHaveProperty('workspaceManifest');
+    } finally {
+      await rm(activeServerDir, { recursive: true, force: true });
+    }
+  });
   it('saves and loads a schema-versioned source export record', async () => {
     const activeServerDir = await mkdtemp(join(os.tmpdir(), 'happier-session-handoff-store-'));
     try {

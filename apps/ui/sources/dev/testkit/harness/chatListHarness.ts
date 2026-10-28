@@ -773,6 +773,7 @@ export function createFlashListChatListSyncModuleMock(
             loadOlderMessages: async () => ({ loaded: 0, hasMore: false, status: 'no_more' as const }),
             loadNewerMessages,
             hasDeferredNewerMessages,
+            getSessionTailDiscontinuityOlderAvailability: (_sessionId: string) => false,
             getSyncTuning: () => flashListChatListHarnessState.syncTuningState,
             // Stable identity: ChatList consumes this through useSyncExternalStore.
             getSessionTargetWindowState: () => inactiveSessionMessagesWindowState,

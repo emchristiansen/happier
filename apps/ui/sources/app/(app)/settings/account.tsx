@@ -29,7 +29,7 @@ import { ProviderIdentityItems } from '@/components/account/ProviderIdentityItem
 import { isLegacyAuthCredentials } from '@/auth/storage/tokenStorage';
 import { useFeatureEnabled } from '@/hooks/server/useFeatureEnabled';
 import { fetchAccountEncryptionMode } from '@/sync/api/account/apiAccountEncryptionMode';
-import { migrateAccountEncryptionMode } from '@/sync/api/account/apiAccountEncryptionMigrate';
+import { fetchAccountEncryptionMigrationMachines, migrateAccountEncryptionMode } from '@/sync/api/account/apiAccountEncryptionMigrate';
 import { Text } from '@/components/ui/text/Text';
 import { useRouter } from 'expo-router';
 import { isRunningOnMac } from '@/utils/platform/platform';
@@ -51,6 +51,7 @@ import {
     listNewSessionDraftEncryptionMigrationCandidates,
 } from '@/sync/ops/sessionDrafts/sessionDraftRepository';
 import { runAccountEncryptionModeMigration } from '@/sync/ops/account/runAccountEncryptionModeMigration';
+import { resolveUiClientEncryptionRequirement } from '@/sync/domains/settings/clientEncryptionRequirement';
 
 
 export default React.memo(() => {
@@ -62,17 +63,24 @@ export default React.memo(() => {
     const copyFeedback = useTemporaryCopyFeedback(2000);
     const [analyticsOptOut, setAnalyticsOptOut] = useSettingMutable('analyticsOptOut');
     const [crashReportsOptOut, setCrashReportsOptOut] = useSettingMutable('crashReportsOptOut');
+    const [clientEncryptionRequirement, setClientEncryptionRequirement] = useSettingMutable('clientEncryptionRequirementV1');
+    const [clientEncryptionRequirementLocal, setClientEncryptionRequirementLocal] = useSettingMutable('clientEncryptionRequirementLocalV1');
     const { connectAccount, isLoading: isConnecting } = useConnectAccount();
     const profile = useProfile();
     const friendsIdentityReadiness = useFriendsIdentityReadiness();
     const friendsEnabled = useFriendsEnabled();
     const applyProfile = storage((state) => state.applyProfile);
     const encryptionAccountOptOutEnabled = useFeatureEnabled('encryption.accountOptOut');
+    const plaintextMachineEnabled = useFeatureEnabled('encryption.plaintextMachine');
     const sessionDraftSyncEnabled = useFeatureEnabled('sessions.drafts');
 
     const [accountEncryptionMode, setAccountEncryptionMode] = useState<'e2ee' | 'plain' | null>(null);
     const [accountEncryptionModeLoading, setAccountEncryptionModeLoading] = useState(false);
     const [accountEncryptionModeSaving, setAccountEncryptionModeSaving] = useState(false);
+    const effectiveClientEncryptionRequirement = resolveUiClientEncryptionRequirement({
+        syncedSettings: { clientEncryptionRequirementV1: clientEncryptionRequirement },
+        localSettings: { clientEncryptionRequirementLocalV1: clientEncryptionRequirementLocal },
+    });
 
     // Get the current secret key
     const legacySecret =
@@ -378,6 +386,39 @@ export default React.memo(() => {
                 {encryptionAccountOptOutEnabled && (
                     <ItemGroup title={t('terminal.encryption')}>
                         <Item
+                            title={t('settingsAccount.requireE2ee')}
+                            subtitle={t('settingsAccount.requireE2eeDescription')}
+                            rightElement={
+                                <Switch
+                                    testID="settings-account-client-encryption-requirement-switch"
+                                    value={effectiveClientEncryptionRequirement === 'require_e2ee'}
+                                    disabled={
+                                        accountEncryptionModeLoading ||
+                                        accountEncryptionModeSaving ||
+                                        accountEncryptionMode == null
+                                    }
+                                    onValueChange={async (enabled) => {
+                                        if (enabled && accountEncryptionMode !== 'e2ee') {
+                                            await Modal.alertAsync(
+                                                t('settingsAccount.requireE2eeNeedsEncryptionTitle'),
+                                                t('settingsAccount.requireE2eeNeedsEncryptionDescription'),
+                                            );
+                                            return;
+                                        }
+                                        const nextRequirement = enabled ? 'require_e2ee' : 'follow_account';
+                                        if (enabled) {
+                                            setClientEncryptionRequirementLocal(nextRequirement);
+                                            setClientEncryptionRequirement(nextRequirement);
+                                        } else {
+                                            setClientEncryptionRequirement(nextRequirement);
+                                            setClientEncryptionRequirementLocal(nextRequirement);
+                                        }
+                                    }}
+                                />
+                            }
+                            showChevron={false}
+                        />
+                        <Item
                             title={t('terminal.endToEndEncrypted')}
                             rightElement={
                                 <Switch
@@ -386,6 +427,7 @@ export default React.memo(() => {
                                     disabled={
                                         accountEncryptionModeLoading ||
                                         accountEncryptionModeSaving ||
+                                        effectiveClientEncryptionRequirement === 'require_e2ee' ||
                                         !auth.credentials ||
                                         accountEncryptionMode == null
                                     }
@@ -415,6 +457,10 @@ export default React.memo(() => {
                                                 ? listNewSessionDraftEncryptionMigrationCandidates(sessionDraftScope)
                                                 : [];
 
+                                            const machines = plaintextMachineEnabled
+                                                ? await fetchAccountEncryptionMigrationMachines(credentials)
+                                                : undefined;
+
                                             let generatedSecret: string | null = null;
                                             const legacyCredentialsForE2ee = nextMode === 'e2ee'
                                                 ? (() => {
@@ -432,6 +478,8 @@ export default React.memo(() => {
                                                     connectedServiceProfiles,
                                                     automations,
                                                     sessionDrafts,
+                                                    machines,
+                                                    machineEncryption: sync.encryption,
                                                     fetchConnectedServiceCredentialSealed: async ({ serviceId, profileId }) =>
                                                         await getConnectedServiceCredentialSealed(credentials, { serviceId, profileId }),
                                                     decryptAutomationTemplateRaw: async (payloadCiphertext: string) =>
@@ -444,6 +492,8 @@ export default React.memo(() => {
                                                     connectedServiceProfiles,
                                                     automations,
                                                     sessionDrafts,
+                                                    machines,
+                                                    machineEncryption: sync.encryption,
                                                     fetchConnectedServiceCredentialPlain: async ({ serviceId, profileId }) =>
                                                         await getConnectedServiceCredentialPlain(credentials, { serviceId, profileId }),
                                                 });
@@ -472,7 +522,7 @@ export default React.memo(() => {
                                             }
 
                                             const contentBinding = nextMode === 'e2ee'
-                                                ? await buildContentKeyBinding(keyProof!.seed).catch(() => null)
+                                                ? await buildContentKeyBinding(keyProof!.seed)
                                                 : null;
 
                                             const migrationRequest = {
@@ -488,8 +538,10 @@ export default React.memo(() => {
                                                 request: migrationRequest,
                                                 migrate: async (nextRequest) =>
                                                     await migrateAccountEncryptionMode(credentials, nextRequest),
-                                                activateTargetMode: () => {
+                                                activateTargetMode: async () => {
+                                                    if (generatedSecret) await auth.login(credentials.token, generatedSecret);
                                                     sync.reconfigureSessionDraftRepositoryForAccountMode(targetCredentials, nextMode);
+                                                    if (machines) await sync.refreshMachines();
                                                 },
                                                 acknowledgeSessionDrafts: async (records) => {
                                                     if (!sessionDraftScope) {
@@ -501,7 +553,6 @@ export default React.memo(() => {
                                             setAccountEncryptionMode(result.mode);
 
                                             if (generatedSecret) {
-                                                await auth.login(auth.credentials.token, generatedSecret);
                                                 await Modal.alertAsync(t('settingsAccount.backup'), t('settingsAccount.backupDescription'));
                                             }
                                         } catch (e) {

@@ -193,6 +193,9 @@ export function SlideTransitionSwitch(props: SlideTransitionSwitchProps): React.
             current={currentSlot}
             next={incomingSlotForward}
             previous={incomingSlotBackward}
+            currentKey={displayedKey}
+            nextKey={props.contentKey}
+            previousKey={props.contentKey}
             progress={progress}
             blur={resolvedBlur}
             preset={resolvedPreset}

@@ -2,6 +2,7 @@ import * as React from 'react';
 import { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 import { invokeTestInstanceHandler, renderScreen } from '@/dev/testkit';
 import type { StoryDeckImageCard as ImageCardData } from '@/changelog/releaseNotes/types';
 
@@ -94,7 +95,7 @@ describe('StoryDeckImageCard', () => {
         });
 
         expect(screen.findByTestId('story-image-media-failed')).toBeTruthy();
-        expect(screen.findAllByType('ActivityIndicator')).toHaveLength(0);
+        expect(screen.findAllByType(ActivitySpinner)).toHaveLength(0);
     });
 
     it('shows a stable failure placeholder when image loading stalls past the media timeout', async () => {
@@ -116,7 +117,7 @@ describe('StoryDeckImageCard', () => {
             });
 
             expect(screen.findByTestId('story-image-media-failed')).toBeTruthy();
-            expect(screen.findAllByType('ActivityIndicator')).toHaveLength(0);
+            expect(screen.findAllByType(ActivitySpinner)).toHaveLength(0);
         } finally {
             vi.useRealTimers();
         }

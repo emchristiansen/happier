@@ -2,6 +2,7 @@ import React from 'react';
 import { act } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 import { createSessionFixture, renderScreen, standardCleanup } from '@/dev/testkit';
 import { lightTheme } from '@/theme';
 import type { Settings } from '@/sync/domains/settings/settings';
@@ -40,7 +41,10 @@ const AgentIconMock = 'AgentIcon' as unknown as React.ComponentType<{
 let platformOs: 'ios' | 'android' | 'web' = 'web';
 let isTabletDevice = false;
 
-vi.mock('react-native-reanimated', () => ({}));
+vi.mock('react-native-reanimated', async () => {
+    const { createReanimatedModuleMock } = await import('@/dev/testkit/mocks/reanimated');
+    return createReanimatedModuleMock();
+});
 
 vi.mock('react-native-gesture-handler', () => ({
     Swipeable: 'Swipeable',
@@ -49,12 +53,6 @@ vi.mock('react-native-gesture-handler', () => ({
 vi.mock('@expo/vector-icons', () => ({
     Ionicons: 'Ionicons',
     Octicons: 'Octicons',
-}));
-
-vi.mock('@/constants/Typography', () => ({
-    Typography: {
-        default: () => ({}),
-    },
 }));
 
 vi.mock('@/components/ui/text/Text', () => ({
@@ -235,7 +233,6 @@ function createSessionRowModel(overrides: Partial<SessionListRowModel> = {}): Se
         serverName: 'Server A',
         treeRowId: `session:${serverId ?? 'local'}:${sessionId}`,
         testID: `session-list-item-${sessionId}`,
-        dataIndex: 0,
         session,
         status: {
             state: 'thinking',
@@ -277,6 +274,7 @@ function createSessionRowModel(overrides: Partial<SessionListRowModel> = {}): Se
         isSelected: true,
         isPinned: true,
         isAttentionStanding: false,
+        reminder: null,
         attentionStandingEnabled: false,
         isArchived: false,
         isActive: true,
@@ -522,7 +520,7 @@ describe('SessionItem activity time', () => {
         expect(useSettingSpy).not.toHaveBeenCalled();
     });
 
-    it('renders background activity with the normal working spinner while retaining pending and unread row facts', async () => {
+    it('keeps the pending indicator over background activity while still showing the background status line', async () => {
         const { SessionItem } = await importSessionItemForTest();
         const rowModel = createSessionRowModel({
             status: {
@@ -557,7 +555,8 @@ describe('SessionItem activity time', () => {
         expect(rowModel.attention).toEqual({ listState: 'pending', rowState: 'pending' });
         expect(rowModel.hasUnreadMessages).toBe(true);
         expect(screen.findByTestId('session-list-status-subtitle-sess_row_model-pending')).toBeTruthy();
-        expect(screen.findByTestId('session-row-attention-indicator-spinner-sess_row_model-secondary')).toBeTruthy();
+        expect(screen.findByTestId('session-row-attention-indicator-spinner-sess_row_model-secondary')).toBeNull();
+        expect(screen.findByTestId('session-row-attention-indicator-dot-sess_row_model-secondary')).toBeTruthy();
         // The background line now renders the SESSION's status text, which is where the count
         // lives, instead of a second key the row would have to re-interpolate.
         expect(screen.findByTestId('session-list-status-subtitle-text-sess_row_model-pending')?.props.children)
@@ -725,11 +724,13 @@ describe('SessionItem activity time', () => {
         expect(screen.findByTestId('session-list-attention-indicator-sess_compact_active-trailing-working')).toBeTruthy();
         const spinner = findWorkingSpinner(screen, 'sess_compact_active-trailing');
         expect(spinner).toBeTruthy();
-        expect(flattenStyle(spinner?.props.style)).toMatchObject({
-            width: 12,
-            height: 12,
-            borderColor: lightTheme.colors.text.tertiary,
-        });
+        // The row owns which color its spinner gets; how the spinner draws it depends on the
+        // user's loading indicator style.
+        const spinnerColors = screen
+            .findAllByTestId('session-row-attention-indicator-spinner-sess_compact_active-trailing')
+            .map((node) => node.props?.color)
+            .filter((color) => color != null);
+        expect(spinnerColors).toContain(lightTheme.colors.text.tertiary);
         expect(screen.findAllByType('StatusDot')).toHaveLength(0);
         expect(screen.getTextContent()).not.toContain('working on it');
         expect(screen.getTextContent()).not.toContain('1m');
@@ -766,7 +767,7 @@ describe('SessionItem activity time', () => {
 
         expect(screen.findByTestId('session-row-attention-indicator-sess_compact_active_dot')).toBeNull();
         expect(screen.findByTestId('session-list-attention-indicator-sess_compact_active_dot-trailing-working')).toBeTruthy();
-        expect(screen.findAllByType('ActivityIndicator')).toHaveLength(0);
+        expect(screen.findAllByType(ActivitySpinner)).toHaveLength(0);
         const dots = screen.findAllByType('StatusDot');
         expect(dots).toHaveLength(1);
         expect(dots[0]?.props.isPulsing).toBe(true);
@@ -1136,10 +1137,6 @@ describe('SessionItem activity time', () => {
         expect(screen.findByTestId('session-list-status-subtitle-text-sess_status_pill-working')?.props.children).toBe('working on it');
         const spinner = findWorkingSpinner(screen, 'sess_status_pill-secondary');
         expect(spinner).toBeTruthy();
-        expect(flattenStyle(spinner?.props.style)).toMatchObject({
-            width: 12,
-            height: 12,
-        });
         expect(screen.findAllByType('StatusDot')).toHaveLength(0);
         const statusText = screen.findAllByType('Text').find((node) => node.props.children === 'working on it');
         const flat = flattenStyle(statusText?.props.style);
@@ -1179,7 +1176,7 @@ describe('SessionItem activity time', () => {
         );
 
         expect(screen.findByTestId('session-list-attention-indicator-sess_status_pill_dot-secondary-working')).toBeTruthy();
-        expect(screen.findAllByType('ActivityIndicator')).toHaveLength(0);
+        expect(screen.findAllByType(ActivitySpinner)).toHaveLength(0);
         const statusDots = screen.findAllByType('StatusDot');
         expect(statusDots).toHaveLength(1);
         expect(statusDots[0]?.props.isPulsing).toBe(true);

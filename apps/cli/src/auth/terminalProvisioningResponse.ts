@@ -1,13 +1,16 @@
 import {
   isTerminalProvisioningV3Payload,
   openBoxBundle,
-  openTerminalProvisioningV3Payload,
+  openTerminalProvisioningV3Response,
+  parseTerminalProvisioningV2Plaintext,
 } from '@happier-dev/protocol';
 
 export type TerminalPairingAuthentication = Readonly<{
   secret: Uint8Array;
   createdAtMs: number;
   expiresAtMs: number;
+  /** Effective approval deadline; absent/null when an older relay does not report it. */
+  requestExpiresAtMs?: number | null;
 }>;
 
 export type TerminalPairingRequirement = 'v3';
@@ -18,7 +21,7 @@ export type OpenTerminalProvisioningResponseResult = Readonly<{
   type: 'legacy' | 'dataKey';
   key: Uint8Array;
   authenticated: boolean;
-}>;
+}> | Readonly<{ type: 'tokenOnly'; authenticated: boolean }>;
 
 const TERMINAL_PAIRING_AUTHENTICATION_TTL_MS = 60 * 60 * 1_000;
 
@@ -48,6 +51,26 @@ export function createTerminalPairingAuthentication(params: Readonly<{
   };
 }
 
+export function applyTerminalAuthRequestExpiry(
+  pairing: TerminalPairingAuthentication,
+  response: unknown,
+): TerminalPairingAuthentication {
+  const expiresAt = response && typeof response === 'object' && 'expiresAt' in response
+    ? response.expiresAt
+    : undefined;
+  if (typeof expiresAt !== 'number' || !Number.isSafeInteger(expiresAt) || expiresAt <= pairing.createdAtMs) {
+    return { ...pairing, requestExpiresAtMs: null };
+  }
+  const expiresAtMs = Math.min(pairing.expiresAtMs, expiresAt);
+  return { ...pairing, expiresAtMs, requestExpiresAtMs: expiresAtMs };
+}
+
+export function formatTerminalPairingExpiryNotice(pairing: TerminalPairingAuthentication): string {
+  return pairing.requestExpiresAtMs == null
+    ? 'This link expires soon. Rerun the command if approval fails.'
+    : `This link expires at ${new Date(pairing.requestExpiresAtMs).toISOString()}. Rerun the command if approval fails.`;
+}
+
 export function openTerminalProvisioningResponse(params: Readonly<{
   payload: Uint8Array;
   terminalSecretKey: Uint8Array;
@@ -61,7 +84,7 @@ export function openTerminalProvisioningResponse(params: Readonly<{
 
   if (isV3) {
     if (!params.pairing) return null;
-    const key = openTerminalProvisioningV3Payload({
+    const opened = openTerminalProvisioningV3Response({
       payload: params.payload,
       recipientSecretKeyOrSeed: params.terminalSecretKey,
       terminalEphemeralPublicKey: params.terminalPublicKey,
@@ -70,7 +93,7 @@ export function openTerminalProvisioningResponse(params: Readonly<{
       expiresAtMs: params.pairing.expiresAtMs,
       nowMs: params.nowMs,
     });
-    return key ? { type: 'dataKey', key, authenticated: true } : null;
+    return opened ? { ...opened, authenticated: true } : null;
   }
 
   const opened = openBoxBundle({
@@ -81,8 +104,6 @@ export function openTerminalProvisioningResponse(params: Readonly<{
   if (opened.length === 32) {
     return { type: 'legacy', key: opened, authenticated: false };
   }
-  if (opened.length === 33 && opened[0] === 0) {
-    return { type: 'dataKey', key: opened.slice(1), authenticated: false };
-  }
-  return null;
+  const response = parseTerminalProvisioningV2Plaintext(opened);
+  return response ? { ...response, authenticated: false } : null;
 }

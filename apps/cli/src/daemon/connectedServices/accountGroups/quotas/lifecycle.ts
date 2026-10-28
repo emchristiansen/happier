@@ -99,7 +99,10 @@ function readMemberRuntimeStates(input: Readonly<{
       allowUnconfirmedConfidence: input.allowUnconfirmedConfidence,
     });
     if (!decision.ok) return { status: 'insufficient_evidence', decision };
-    const projectedState = projectProviderAccountUsageSnapshotToAuthGroupRuntimeState(snapshot);
+    const projectedState = projectProviderAccountUsageSnapshotToAuthGroupRuntimeState(
+      snapshot,
+      input.group.policy.quotaLimitSelection,
+    );
     if (!projectedState) return { status: 'insufficient_evidence' };
     memberStatesByProfileId.set(
       member.profileId,
@@ -149,6 +152,8 @@ export function evaluateConnectedServiceAuthGroupQuotaLifecycle(input: Readonly<
   if (policy.strategy === 'manual') return noEdge({ status: 'unblocked' });
 
   const selection = selectConnectedServiceAuthGroupCandidate({
+    lastSwitchReason: input.group.state.lastSwitchReason,
+    lastSwitchAt: input.group.state.lastSwitchAt,
     nowMs: input.nowMs,
     quotaFreshnessMs: input.quotaFreshnessMs,
     activeProfileId: input.group.activeProfileId,

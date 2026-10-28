@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
+import { normalizeSessionMetadataForRead, projectSessionMetadataForWire } from '@happier-dev/protocol';
 import type { Socket } from 'socket.io-client';
 
 import { createAuthenticationHttpStatusError, isAuthenticationError } from '@/api/client/httpStatusError';
@@ -29,7 +30,7 @@ function createMetadataUpdateError(message: string, code: MetadataUpdateErrorCod
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  return value as Record<string, unknown>;
+  return normalizeSessionMetadataForRead(value as Record<string, unknown>);
 }
 
 function cloneMetadataRecord(value: Record<string, unknown>): Record<string, unknown> {
@@ -103,7 +104,7 @@ export async function updateSessionMetadataWithRetry(params: Readonly<{
       if (updated === null) {
         return { version: expectedVersion, metadata: currentDecrypted };
       }
-      const updatedWireValue = encryptStoredSessionPayload({ mode, ctx, payload: updated });
+      const updatedWireValue = encryptStoredSessionPayload({ mode, ctx, payload: projectSessionMetadataForWire(updated) });
 
       const result = await patchSessionMetadata({
         token: params.token,
@@ -149,7 +150,7 @@ export async function updateSessionMetadataWithRetry(params: Readonly<{
       if (updated === null) {
         return { version: expectedVersion, metadata: currentDecrypted };
       }
-      const updatedWireValue = encryptStoredSessionPayload({ mode, ctx, payload: updated });
+      const updatedWireValue = encryptStoredSessionPayload({ mode, ctx, payload: projectSessionMetadataForWire(updated) });
 
       let ack: UpdateMetadataAck;
       try {

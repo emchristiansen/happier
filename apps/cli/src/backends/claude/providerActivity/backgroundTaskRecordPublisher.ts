@@ -153,8 +153,9 @@ export function createBackgroundTaskRecordPublisher(params: Readonly<{
   const tasks = new Map<string, TrackedBackgroundTask>();
   const dirtyTaskIds = new Set<string>();
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-  let inFlightDrain: Promise<void> | null = null;
   let disposed = false;
+  let activeFlushes = 0;
+  let liveDrainRequested = false;
 
   const clearDebounce = (): void => {
     if (debounceTimer === null) return;
@@ -195,18 +196,15 @@ export function createBackgroundTaskRecordPublisher(params: Readonly<{
   /**
    * Drain owned by the scheduler: retryable failures come back as a debounced retry.
    *
-   * `flush()` deliberately does NOT use this — retrying on a shutdown path would turn a persistently
-   * failing write into a thousand synchronous attempts at the moment the session is closing.
+   * A live drain requests delayed retries. A flush-driven attempt drops failures as before, so
+   * shutdown cannot repeatedly retry a failing record. Both run through the same scheduler.
    */
   const trackedDrain = (): Promise<void> => {
-    const drain = runDrain().then((retryable) => {
-      for (const taskId of retryable) scheduleRetry(taskId);
+    const retryFailures = liveDrainRequested;
+    liveDrainRequested = false;
+    return runDrain().then((retryable) => {
+      if (retryFailures) for (const taskId of retryable) scheduleRetry(taskId);
     });
-    const tracked = drain.finally(() => {
-      if (inFlightDrain === tracked) inFlightDrain = null;
-    });
-    inFlightDrain = tracked;
-    return tracked;
   };
 
   const scheduler = createCoalescedScheduler({
@@ -219,6 +217,7 @@ export function createBackgroundTaskRecordPublisher(params: Readonly<{
     if (disposed || debounceTimer !== null) return;
     debounceTimer = setTimeout(() => {
       debounceTimer = null;
+      liveDrainRequested = true;
       scheduler.trigger();
     }, debounceMs);
     debounceTimer.unref?.();
@@ -233,11 +232,12 @@ export function createBackgroundTaskRecordPublisher(params: Readonly<{
   function markDirty(taskId: string, immediate: boolean): void {
     if (disposed) return;
     dirtyTaskIds.add(taskId);
-    if (!immediate) {
+    if (!immediate && activeFlushes === 0) {
       scheduleDebounced();
       return;
     }
     clearDebounce();
+    if (activeFlushes === 0) liveDrainRequested = true;
     scheduler.trigger();
   }
 
@@ -316,19 +316,17 @@ export function createBackgroundTaskRecordPublisher(params: Readonly<{
   }
 
   async function flush(): Promise<void> {
-    // Drain to quiescence: `markDirty` fires drains fire-and-forget, so awaiting once could return
-    // while a terminal record is still in flight. Failures are NOT retried here (see `trackedDrain`),
-    // which is what bounds this loop: every pass either lands its writes or drops them for the next
-    // live drain, so it cannot spin on a persistently failing transport.
-    for (let iteration = 0; iteration < 1_000; iteration += 1) {
-      if (disposed) return;
-      clearDebounce();
-      if (inFlightDrain) {
-        await inFlightDrain;
-        continue;
-      }
-      if (dirtyTaskIds.size === 0) return;
-      await runDrain();
+    if (disposed) return;
+    activeFlushes += 1;
+    try {
+      do {
+        clearDebounce();
+        // This barrier also waits for live drains requested before the flush. Their queued
+        // failures receive the existing final flush attempt, which does not requeue a failure.
+        await scheduler.flush();
+      } while (!disposed && dirtyTaskIds.size > 0);
+    } finally {
+      activeFlushes -= 1;
     }
   }
 

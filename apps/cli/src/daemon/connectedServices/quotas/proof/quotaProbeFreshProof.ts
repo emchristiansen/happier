@@ -1,8 +1,10 @@
-import type { ConnectedServiceId, ConnectedServiceQuotaMeterV1, ConnectedServiceQuotaSnapshotV1 } from '@happier-dev/protocol';
-import { readConnectedServiceLimitCategoryV1 } from '@happier-dev/protocol';
+import type { ConnectedServiceCredentialRecordV1, ConnectedServiceId, ConnectedServiceQuotaMeterV1, ConnectedServiceQuotaSnapshotV1 } from '@happier-dev/protocol';
+import { isConnectedServiceQuotaObservationFresh, readConnectedServiceLimitCategoryV1 } from '@happier-dev/protocol';
 
 import { normalizeQuotaMeter, selectEffectiveQuotaMeter } from '../normalization';
 import type { ProviderOutcomeProofKind } from '../../recovery/providerOutcomeProof';
+import { readConnectedServiceCredentialOrganizationId } from '../../descriptors/connectedAccountDescriptors';
+import { computeConnectedServiceAccessTokenFingerprint } from '../../refresh/credentialFreshness/tokenFingerprint';
 
 export type QuotaProbeFreshNoProofReason =
   | 'service_mismatch'
@@ -21,6 +23,20 @@ export type QuotaProbeFreshProofResult =
 function normalizeRequiredString(value: string | null | undefined): string | null {
   const trimmed = typeof value === 'string' ? value.trim() : '';
   return trimmed ? trimmed : null;
+}
+
+export function matchesCurrentQuotaObservationCredential(input: Readonly<{
+  record: ConnectedServiceCredentialRecordV1 | null;
+  providerAccountId: string;
+  providerOrganizationId?: string | null;
+  credentialFingerprint: string;
+}>): boolean {
+  const record = input.record;
+  const providerOrganizationId = normalizeRequiredString(input.providerOrganizationId);
+  return record?.kind === 'oauth'
+    && normalizeRequiredString(record.oauth.providerAccountId) === input.providerAccountId
+    && (providerOrganizationId === null || readConnectedServiceCredentialOrganizationId(record) === providerOrganizationId)
+    && computeConnectedServiceAccessTokenFingerprint(record.oauth.accessToken) === input.credentialFingerprint;
 }
 
 function normalizeGeneration(value: number | null | undefined): number | null {
@@ -134,7 +150,7 @@ export function resolveQuotaProbeFreshProof(input: Readonly<{
     : configuredMaxAgeMs;
   const maxAgeMs = Math.min(configuredMaxAgeMs, snapshotMaxAgeMs);
   const nowMs = Math.max(0, Math.trunc(input.nowMs));
-  if (fetchedAt > nowMs || nowMs - fetchedAt > maxAgeMs) {
+  if (!isConnectedServiceQuotaObservationFresh({ observedAtMs: fetchedAt, nowMs, maxAgeMs })) {
     return { status: 'no_proof', reason: 'stale_snapshot' };
   }
   if (input.snapshot.meters.length > 0 && input.snapshot.meters.every(isUnavailableMeter)) {

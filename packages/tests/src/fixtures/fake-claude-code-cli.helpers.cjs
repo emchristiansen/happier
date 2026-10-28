@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { createHash } = require('node:crypto');
 
 function safeAppendJsonl(filePath, obj) {
   if (!filePath) return;
@@ -10,6 +11,15 @@ function safeAppendJsonl(filePath, obj) {
   } catch {
     // Best-effort diagnostics only.
   }
+}
+
+function fakeClaudeEchoResponseText(promptText) {
+  const promptHash = createHash('sha256').update(String(promptText)).digest('hex').slice(0, 16);
+  return fakeClaudeEchoResponseTextFromSha256(promptHash);
+}
+
+function fakeClaudeEchoResponseTextFromSha256(promptSha256) {
+  return `FAKE_CLAUDE_ECHO_${String(promptSha256).slice(0, 16)}`;
 }
 
 function parseMcpConfigs(argv) {
@@ -160,6 +170,8 @@ async function runHookForwarder(params) {
 }
 
 module.exports = {
+  fakeClaudeEchoResponseText,
+  fakeClaudeEchoResponseTextFromSha256,
   findArgValue,
   mergeMcpServers,
   parseHookForwarderCommand,

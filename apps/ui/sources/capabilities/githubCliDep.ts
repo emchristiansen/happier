@@ -2,6 +2,7 @@ import type { CapabilitiesDetectRequest, CapabilityDetectResult, CapabilityId } 
 import { GH_DEP_ID } from '@happier-dev/protocol/installables';
 
 import type { InstallableDepDataLike } from './installablesRegistry';
+import { isLatestVersionCheckDue } from '@/updates/latestVersionCheckFreshness';
 
 type LatestVersionCheck = InstallableDepDataLike['latestVersionCheck'];
 
@@ -38,9 +39,6 @@ export function shouldPrefetchGithubCliLatestVersion(params: {
     data?: Pick<InstallableDepDataLike, 'installed' | 'latestVersionCheck'> | null;
     requireExistingResult?: boolean;
 }): boolean {
-    const OK_STALE_MS = 24 * 60 * 60 * 1000;
-    const ERROR_RETRY_MS = 30 * 60 * 1000;
-
     const now = Date.now();
     const requireExistingResult = params.requireExistingResult === true;
     const result = params.result ?? null;
@@ -61,9 +59,7 @@ export function shouldPrefetchGithubCliLatestVersion(params: {
     if (!hasLatestVersionCheck) return true;
     if (checkedAt <= 0) return true;
 
-    const ageMs = now - checkedAt;
-    const threshold = isLatestVersionSuccess(latestVersionCheck) ? OK_STALE_MS : ERROR_RETRY_MS;
-    return ageMs > threshold;
+    return isLatestVersionCheckDue({ checkedAt, ok: isLatestVersionSuccess(latestVersionCheck), now });
 }
 
 export function buildGithubCliLatestVersionDetectRequest(): CapabilitiesDetectRequest {

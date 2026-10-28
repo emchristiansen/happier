@@ -287,7 +287,6 @@ describe('RelayHostEngine (installOrUpdate local legacy unit name)', () => {
 
   it('ignores and removes the legacy unsuffixed Windows wrapper when it is owned by the preview install root', async () => {
     const originalPlatform = process.platform;
-    const originalArch = process.arch;
 
     const homeDir = await mkdtemp(join(tmpdir(), 'happier-relay-host-legacy-windows-'));
     const payloadRoot = join(homeDir, 'payload');
@@ -299,7 +298,6 @@ describe('RelayHostEngine (installOrUpdate local legacy unit name)', () => {
     await writeFile(serverBinaryPath, 'stub exe\n', 'utf8');
 
     Object.defineProperty(process, 'platform', { value: 'win32' });
-    Object.defineProperty(process, 'arch', { value: 'x64' });
 
     try {
       vi.doMock('node:os', async () => {
@@ -378,7 +376,6 @@ describe('RelayHostEngine (installOrUpdate local legacy unit name)', () => {
       await expect(access(`${homeDir}\\.happier\\services\\happier-server-preview.ps1`)).resolves.toBeUndefined();
     } finally {
       Object.defineProperty(process, 'platform', { value: originalPlatform });
-      Object.defineProperty(process, 'arch', { value: originalArch });
       vi.resetModules();
       vi.clearAllMocks();
       await rm(homeDir, { recursive: true, force: true });

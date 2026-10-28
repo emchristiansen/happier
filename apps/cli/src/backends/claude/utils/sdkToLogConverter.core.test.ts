@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { SDKToLogConverter } from './sdkToLogConverter';
-import type { SDKAssistantMessage, SDKResultMessage, SDKSystemMessage, SDKUserMessage } from '@/backends/claude/sdk';
+import type { SDKMessage, SDKAssistantMessage, SDKResultMessage, SDKSystemMessage, SDKUserMessage } from '@/backends/claude/sdk';
 import { asRecord, conversionContext } from './sdkToLogConverter.testkit';
 
 describe('SDKToLogConverter core conversion', () => {
@@ -381,6 +381,27 @@ describe('SDKToLogConverter core conversion', () => {
   });
 
   describe('Internal Claude events', () => {
+    it('omits command lifecycle control frames without changing the conversation parent', () => {
+      const previous = converter.convert({ type: 'user', message: { role: 'user', content: 'hello' } });
+      // Claude Agent SDK 0.3.206 introduced this raw frame after the bundled SDK type union.
+      const lifecycle = {
+        type: 'command_lifecycle',
+        command_uuid: 'command-1',
+        session_id: 'provider-session',
+        state: 'completed',
+        uuid: 'lifecycle-1',
+      };
+      expect(converter.convert(lifecycle as unknown as SDKMessage)).toBeNull();
+      const next = converter.convert({ type: 'user', message: { role: 'user', content: 'next' } });
+      expect(next?.parentUuid).toBe(previous?.uuid);
+    });
+
+    it('preserves unknown provider events for visible unsupported-output diagnostics', () => {
+      // Raw external event outside the bundled SDK union, intentionally not classified as internal.
+      const future = { type: 'future_conversation_event', uuid: 'future-1', payload: { text: 'new content' } };
+      expect(converter.convert(future as unknown as SDKMessage)).toMatchObject(future);
+    });
+
     it('does not convert rate_limit_event messages (telemetry, not transcript content)', () => {
       const logMessage = converter.convert({
         type: 'rate_limit_event',

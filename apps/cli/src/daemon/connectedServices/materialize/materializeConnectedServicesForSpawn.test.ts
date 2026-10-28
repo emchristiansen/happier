@@ -15,6 +15,7 @@ import { HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_ENV_KEY } from '../conn
 import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '../connectedServiceChildEnvironment';
 import { HAPPIER_CONNECTED_SERVICE_TARGET_MATERIALIZED_ROOT_ENV_KEY } from '../connectedServiceChildEnvironment';
 import { CLAUDE_SUBSCRIPTION_OAUTH_SCOPE } from '../descriptors/connectedAccountDescriptors';
+import { resolveConnectedServiceHomeDir, resolveConnectedServiceGroupHomeDir } from '../homes/resolveConnectedServiceHomeDir';
 
 const { spawnSpy } = vi.hoisted(() => ({
   spawnSpy: vi.fn(),
@@ -65,6 +66,73 @@ describe('materializeConnectedServicesForSpawn', () => {
     spawnSpy.mockReset();
   });
 
+  it.each(['profile', 'group'] as const)('preserves existing Codex %s session state while publishing credentials in its stable home', async (selectionKind) => {
+    const baseDir = await mkdtemp(join(tmpdir(), 'happier-existing-codex-'));
+    const activeServerDir = join(baseDir, 'server');
+    const sourceCodexHome = join(baseDir, 'native');
+    const stableRoot = selectionKind === 'group'
+      ? resolveConnectedServiceGroupHomeDir({ activeServerDir, serviceId: 'openai-codex', groupId: 'team', agentId: 'codex' })
+      : resolveConnectedServiceHomeDir({ activeServerDir, serviceId: 'openai-codex', profileId: 'work', agentId: 'codex' });
+    const targetCodexHome = join(stableRoot, 'codex-home');
+    await mkdir(join(sourceCodexHome, 'sessions'), { recursive: true });
+    await mkdir(join(targetCodexHome, 'sessions'), { recursive: true });
+    const transcriptPath = join(targetCodexHome, 'sessions', 'existing.jsonl');
+    await writeFile(transcriptPath, 'target transcript\n');
+    await writeFile(join(sourceCodexHome, 'sessions', 'existing.jsonl'), 'different native transcript\n');
+    await writeFile(join(sourceCodexHome, 'sessions', 'absent.jsonl'), 'must not import\n');
+    const before = await lstat(transcriptPath);
+    const record = buildConnectedServiceCredentialRecord({
+      now: 10, serviceId: 'openai-codex', profileId: 'work', kind: 'oauth', expiresAt: null,
+      oauth: { accessToken: 'access', refreshToken: 'refresh', idToken: 'id', scope: null, tokenType: null, providerAccountId: 'acct', providerEmail: null },
+    });
+    const result = await materializeConnectedServicesForSpawn({
+      agentId: 'codex', materializationKey: 'handoff', activeServerDir, baseDir,
+      recordsByServiceId: new Map([['openai-codex', record]]),
+      selectionsByServiceId: new Map([['openai-codex', selectionKind === 'group'
+        ? { kind: 'group', serviceId: 'openai-codex', groupId: 'team', activeProfileId: 'work', fallbackProfileId: 'work', generation: 1, record, policy: {} }
+        : { kind: 'profile', serviceId: 'openai-codex', profileId: 'work', record }]]),
+      processEnv: { CODEX_HOME: sourceCodexHome },
+      sessionStateMode: 'existing',
+    });
+    expect(result?.env.CODEX_HOME).toBe(targetCodexHome);
+    expect(await readFile(transcriptPath, 'utf8')).toBe('target transcript\n');
+    expect((await lstat(transcriptPath)).mtimeMs).toBe(before.mtimeMs);
+    await expect(lstat(join(targetCodexHome, 'sessions', 'absent.jsonl'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await lstat(join(targetCodexHome, 'sessions'))).isDirectory()).toBe(true);
+    expect(JSON.parse(await readFile(join(targetCodexHome, 'auth.json'), 'utf8')).tokens.access_token).toBe('access');
+  });
+
+  it('preserves existing Claude session state even when incoming credentials need publication', async () => {
+    const baseDir = await mkdtemp(join(tmpdir(), 'happier-existing-claude-'));
+    const activeServerDir = join(baseDir, 'server');
+    const sourceHome = join(baseDir, 'native');
+    const stableRoot = resolveConnectedServiceHomeDir({ activeServerDir, serviceId: 'claude-subscription', profileId: 'work', agentId: 'claude' });
+    const targetHome = join(stableRoot, 'claude-config');
+    await mkdir(join(sourceHome, 'projects', 'project'), { recursive: true });
+    await mkdir(join(targetHome, 'projects', 'project'), { recursive: true });
+    const transcriptPath = join(targetHome, 'projects', 'project', 'existing.jsonl');
+    await writeFile(transcriptPath, 'target transcript\n');
+    await writeFile(join(sourceHome, 'projects', 'project', 'existing.jsonl'), 'different native transcript\n');
+    await writeFile(join(sourceHome, 'projects', 'project', 'absent.jsonl'), 'must not import\n');
+    const before = await lstat(transcriptPath);
+    const record = buildConnectedServiceCredentialRecord({
+      now: 10, serviceId: 'claude-subscription', profileId: 'work', kind: 'oauth', expiresAt: Date.now() + 3_600_000,
+      oauth: { accessToken: 'access', refreshToken: 'refresh', idToken: null, scope: CLAUDE_SUBSCRIPTION_OAUTH_SCOPE, tokenType: 'Bearer', providerAccountId: null, providerEmail: null },
+    });
+    const result = await materializeConnectedServicesForSpawn({
+      agentId: 'claude', materializationKey: 'handoff', activeServerDir, baseDir,
+      recordsByServiceId: new Map([['claude-subscription', record]]),
+      processEnv: { CLAUDE_CONFIG_DIR: sourceHome }, sessionStateMode: 'existing',
+      vendorResumeId: 'existing', candidatePersistedSessionFile: join(sourceHome, 'projects', 'project', 'existing.jsonl'),
+    });
+    expect(result?.env.CLAUDE_CONFIG_DIR).toBe(targetHome);
+    expect(await readFile(transcriptPath, 'utf8')).toBe('target transcript\n');
+    expect((await lstat(transcriptPath)).mtimeMs).toBe(before.mtimeMs);
+    await expect(lstat(join(targetHome, 'projects', 'project', 'absent.jsonl'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await lstat(join(targetHome, 'projects'))).isDirectory()).toBe(true);
+    expect(JSON.parse(await readFile(join(targetHome, '.credentials.json'), 'utf8')).claudeAiOauth.accessToken).toBe('access');
+  });
+
   it('materializes Codex auth.json and CODEX_HOME env', async () => {
     const baseDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-test-'));
     const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-server-test-'));
@@ -112,7 +180,9 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     expect(result).not.toBeNull();
-    const expectedCodexRoot = join(baseDir, normalizeMaterializationKeyForPath('session-1'), 'codex');
+    const expectedCodexRoot = resolveConnectedServiceHomeDir({
+      activeServerDir, serviceId: 'openai-codex', profileId: 'work', agentId: 'codex',
+    });
     expect(result!.env.CODEX_HOME).toBe(
       join(expectedCodexRoot, 'codex-home'),
     );
@@ -418,7 +488,9 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     expect(result).not.toBeNull();
-    const expectedCodexRoot = join(baseDir, normalizeMaterializationKeyForPath('session-1'), 'codex');
+    const expectedCodexRoot = resolveConnectedServiceGroupHomeDir({
+      activeServerDir, serviceId: 'openai-codex', groupId: 'main', agentId: 'codex',
+    });
     expect(result!.env.CODEX_HOME).toBe(
       join(expectedCodexRoot, 'codex-home'),
     );
@@ -469,7 +541,11 @@ describe('materializeConnectedServicesForSpawn', () => {
 
     expect(result).not.toBeNull();
     const codexHome = result!.env.CODEX_HOME!;
-    expect(resolve(codexHome).startsWith(resolve(baseDir))).toBe(true);
+    const expectedRoot = resolveConnectedServiceHomeDir({
+      activeServerDir, serviceId: 'openai-codex', profileId: 'work', agentId: 'codex',
+    });
+    expect(resolve(codexHome)).toBe(resolve(join(expectedRoot, 'codex-home')));
+    expect(result!.materializationRoot).toBe(expectedRoot);
     expect(codexHome).not.toContain('evil');
   });
 

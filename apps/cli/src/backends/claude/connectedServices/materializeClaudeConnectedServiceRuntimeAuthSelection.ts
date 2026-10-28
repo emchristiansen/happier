@@ -61,7 +61,7 @@ async function resolvePersistedClaudeSessionMetadata(params: Readonly<{
   const attachContext = await resolveExistingSessionAttachContext({
     token,
     sessionId: params.sessionId,
-    agent: params.agentId,
+    backendTarget: { kind: 'builtInAgent', agentId: params.agentId },
     credentials: params.credentials,
   }).catch(() => null);
   return attachContext?.ok === true ? attachContext.metadata : null;
@@ -199,7 +199,7 @@ export const materializeClaudeConnectedServiceRuntimeAuthSelection: ConnectedSer
   if (
     preflightSharedGroupMetadata
     && trackedRuntimeTargetsClaudeSharedGroupConfig(
-      params.input.tracked.spawnOptions?.environmentVariables,
+      params.input.tracked?.spawnOptions?.environmentVariables,
       preflightSharedGroupMetadata.runtimeClaudeConfigDir,
     )
   ) {
@@ -209,6 +209,8 @@ export const materializeClaudeConnectedServiceRuntimeAuthSelection: ConnectedSer
     agentId: params.input.agentId,
     baseDir: activeServerDir,
     tracked: params.input.tracked,
+    cwd: params.input.cwd,
+    persistedSessionMetadata: params.input.persistedSessionMetadata,
     resolveCandidatePersistedSessionFile: (_agentId, metadata) =>
       resolveClaudeConnectedServiceCandidatePersistedSessionFile({ metadata }),
   });
@@ -222,7 +224,8 @@ export const materializeClaudeConnectedServiceRuntimeAuthSelection: ConnectedSer
         agentId: params.input.agentId,
         baseDir: activeServerDir,
         tracked: params.input.tracked,
-        persistedSessionMetadata: await resolvePersistedClaudeSessionMetadata({
+        cwd: params.input.cwd,
+        persistedSessionMetadata: params.input.persistedSessionMetadata ?? await resolvePersistedClaudeSessionMetadata({
           credentials: params.credentials,
           sessionId: params.input.sessionId,
           agentId: params.input.agentId,
@@ -238,7 +241,7 @@ export const materializeClaudeConnectedServiceRuntimeAuthSelection: ConnectedSer
     selection,
     processEnv: params.processEnv ?? process.env,
     accountSettings: params.accountSettings ?? null,
-    sessionDirectory: params.input.tracked.spawnOptions?.directory ?? null,
+    sessionDirectory: params.input.tracked?.spawnOptions?.directory ?? params.input.cwd ?? null,
     vendorResumeId: continuityContext.vendorResumeId,
     candidatePersistedSessionFile: continuityContext.candidatePersistedSessionFile,
     validateGroupMutationCurrentness: createConnectedServiceGroupMutationCurrentnessValidator({

@@ -8,7 +8,7 @@ export const MAX_CLAUDE_REMOTE_ADVANCED_OPTIONS_JSON_CHARS = 16_384;
 const CLAUDE_SETTING_SOURCES_V2 = ['user', 'project', 'local'] as const;
 export type ClaudeSettingSourceV2 = (typeof CLAUDE_SETTING_SOURCES_V2)[number];
 
-export const CLAUDE_UNIFIED_TERMINAL_HOSTS = ['auto', 'tmux', 'zellij'] as const;
+export const CLAUDE_UNIFIED_TERMINAL_HOSTS = ['auto', 'tmux', 'zellij', 'herdr'] as const;
 export type ClaudeUnifiedTerminalHost = (typeof CLAUDE_UNIFIED_TERMINAL_HOSTS)[number];
 
 export const CLAUDE_UNIFIED_TERMINAL_RESUME_CHOICES = [
@@ -127,6 +127,13 @@ function serializeClaudeRemoteDebugCategories(raw: unknown): string {
 }
 
 export const CLAUDE_REMOTE_PROVIDER_FIELDS = {
+  claudeDynamicModelProbeEnabled: {
+    schema: z.boolean(),
+    default: true,
+    description: 'Let Happier query the selected Claude account for available models',
+    storageScope: 'account',
+    analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'boolean', privacy: 'safe', identityScope: 'person' },
+  },
   claudeRemoteAgentSdkEnabled: {
     schema: z.boolean(),
     default: true,
@@ -181,6 +188,13 @@ export const CLAUDE_REMOTE_PROVIDER_FIELDS = {
       identityScope: 'person',
       serializeCurrent: (value) => serializeClaudeSettingSourcesV2(value),
     },
+  },
+  claudeCodeIncludeInNativeHistory: {
+    schema: z.boolean(),
+    default: false,
+    description: 'Use Happier attribution for Claude sessions so they can appear in Claude Code history',
+    storageScope: 'account',
+    analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'boolean', privacy: 'safe', identityScope: 'person' },
   },
   claudeCodeExperimentalAgentTeamsEnabled: {
     schema: z.boolean(),
@@ -333,6 +347,7 @@ export function buildClaudeRemoteOutgoingMessageMetaExtras(settings: Readonly<Re
       ?? CLAUDE_REMOTE_PROVIDER_SETTINGS_DEFAULTS.claudeUnifiedTerminalWorkspaceTrust,
     claudeRemoteSettingSourcesV2: effectiveV2,
     ...(legacyFromV2 ? { claudeRemoteSettingSources: legacyFromV2 } : {}),
+    claudeCodeIncludeInNativeHistory: readBoolean('claudeCodeIncludeInNativeHistory'),
     claudeCodeExperimentalAgentTeamsEnabled: readBoolean('claudeCodeExperimentalAgentTeamsEnabled'),
     claudeLocalPermissionBridgeEnabled: readBoolean('claudeLocalPermissionBridgeEnabled'),
     claudeLocalPermissionBridgeWaitIndefinitely: readBoolean('claudeLocalPermissionBridgeWaitIndefinitely'),

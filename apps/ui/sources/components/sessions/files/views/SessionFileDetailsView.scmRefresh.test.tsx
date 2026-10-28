@@ -284,15 +284,6 @@ describe('SessionFileDetailsView (SCM refresh)', () => {
     const panels = tree.findAllByType('FileContentPanel' as any);
     expect(panels).toHaveLength(1);
     expect(panels[0]!.props.diffContent).toBe('diff-1');
-    expect(tree.root.findAllByType('View' as any)[0]?.props.style).toEqual(expect.arrayContaining([
-      expect.objectContaining({ flex: 1, minHeight: 0 }),
-    ]));
-    const boundedBody = tree.root.findAllByType('View' as any).find((view) => view.props.style?.position === 'relative');
-    expect(boundedBody?.props.style).toMatchObject({
-      flex: 1,
-      minHeight: 0,
-      position: 'relative',
-    });
 
     // Simulate a snapshot update that should change the selection fingerprint (e.g., commit applied).
     const currentSnapshot = scmSnapshot;

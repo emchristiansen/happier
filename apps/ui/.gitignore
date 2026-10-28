@@ -31,6 +31,8 @@ public/vendor/*
 !public/vendor/kokoro/
 public/vendor/kokoro/*
 !public/vendor/kokoro/kokoroTtsWorker.js
+!public/vendor/kokoro/resolveKokoroVoice.js
+!public/vendor/kokoro/resolveKokoroVoice.d.ts
 
 # Vendored by postinstall for Pierre diffs worker (do not commit).
 public/pierre-diff-worker*.js

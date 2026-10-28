@@ -107,6 +107,7 @@ describe('readAfterOpenCodeTranscript', () => {
 
     expect(after.items).toHaveLength(0);
     expect(after.truncated).toBe(true);
+    expect(after).toMatchObject({ truncationReason: 'source_discontinuity' });
   });
 
   it('advances the cursor only past returned items when maxItems truncates the page', async () => {
@@ -151,6 +152,7 @@ describe('readAfterOpenCodeTranscript', () => {
     expect(limited.items).toHaveLength(1);
     expect(((limited.items[0]?.raw as any)?.content as any)?.data?.message).toBe('four');
     expect(limited.truncated).toBe(true);
+    expect(limited).toMatchObject({ truncationReason: 'page_limit' });
 
     const next = await readAfterOpenCodeTranscript({
       source: { kind: 'opencodeServer', baseUrl: null, directory: null },

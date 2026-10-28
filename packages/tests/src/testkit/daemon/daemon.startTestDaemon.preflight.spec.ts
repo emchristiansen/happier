@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -28,6 +29,7 @@ import {
   resolveTestDaemonOwnershipLeasesDir,
   sanitizeDaemonEnvForSpawn,
   startTestDaemon,
+  waitForDaemonState,
 } from './daemon';
 import { repoRootDir } from '../paths';
 import { spawnDetachedTestProcess } from '../process/testSpawn';
@@ -132,7 +134,23 @@ async function writeReplacementDaemonScript(scriptPath: string, opts: { serverId
 }
 
 describe('startTestDaemon', () => {
-  it('launches the exact caller-supplied prepared daemon snapshot through the canonical resolver', async () => {
+  it('waits for fresh daemon state past a retired root state when the replacement writes per-server state', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'happier-daemon-fresh-state-'));
+    try {
+      await writeFile(resolve(homeDir, 'daemon.state.json'), JSON.stringify({ pid: 111, httpPort: 32_231 }), 'utf8');
+      const serverDir = resolve(homeDir, 'servers', 'replacement');
+      await mkdir(serverDir, { recursive: true });
+      await writeFile(resolve(serverDir, 'daemon.state.json'), JSON.stringify({ pid: 222, httpPort: 32_232 }), 'utf8');
+
+      const state = await waitForDaemonState(homeDir, { excludePid: 111 });
+
+      expect(state).toMatchObject({ pid: 222, httpPort: 32_232 });
+    } finally {
+      await rm(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it('launches the exact caller-supplied prepared daemon snapshot and restarts after its process retires', async () => {
     const testDir = await mkdtemp(join(tmpdir(), 'happier-daemon-prepared-dist-exact-candidate-'));
     const homeDir = resolve(testDir, 'home');
     const snapshotDir = resolve(testDir, 'immutable-cli-candidate');
@@ -164,6 +182,13 @@ describe('startTestDaemon', () => {
         'daemon',
         'start-sync',
       ]);
+      const originalPid = daemon.state.pid;
+      const originalArguments = daemon.proc.child.spawnargs;
+      await daemon.proc.stop();
+      cliLaunchSpecMock.resolveCliTestLaunchSpec.mockImplementationOnce(actualResolveCliTestLaunchSpec);
+      daemon = await daemon.restart();
+      expect(daemon.state.pid).not.toBe(originalPid);
+      expect(daemon.proc.child.spawnargs).toEqual(originalArguments);
     } finally {
       if (daemon) await daemon.stop();
       await rm(testDir, { recursive: true, force: true });
@@ -382,7 +407,7 @@ describe('startTestDaemon', () => {
           testDir,
           happyHomeDir: homeDir,
           env: {
-            HAPPIER_E2E_DAEMON_STARTUP_PHASE_TIMEOUT_MS: '5000',
+            HAPPIER_E2E_DAEMON_STARTUP_PHASE_TIMEOUT_MS: '250',
           },
         }).then(
           () => 'started',
@@ -393,7 +418,7 @@ describe('startTestDaemon', () => {
 
       expect(result).toBeInstanceOf(Error);
       expect(String((result as Error).message)).toContain('phase=waitForDaemonState');
-      expect(String((result as Error).message)).toContain('timeoutMs=5000');
+      expect(String((result as Error).message)).toContain('timeoutMs=250');
       expect(String((result as Error).message)).toContain('daemonStateExists=no');
     } finally {
       await rm(testDir, { recursive: true, force: true });
@@ -551,6 +576,10 @@ describe('startTestDaemon', () => {
 
       const staleProc = spawnDetachedTestProcess(process.execPath, [resolve(staleScriptDir, 'index.mjs'), 'daemon', 'start-sync'], {
         stdio: 'ignore',
+        env: {
+          ...process.env,
+          HAPPIER_HOME_DIR: homeDir,
+        },
       });
       stalePid = staleProc.pid ?? null;
       expect(typeof stalePid).toBe('number');
@@ -601,6 +630,7 @@ describe('startTestDaemon', () => {
   it('returns daemon state even if the daemon exits after persisting daemon.state.json', async () => {
     const testDir = await mkdtemp(join(tmpdir(), 'happier-daemon-exit-after-state-'));
     const homeDir = resolve(testDir, 'home');
+    let daemon: Awaited<ReturnType<typeof startTestDaemon>> | null = null;
 
     try {
       const fakeScriptDir = resolve(testDir, 'fake-daemon', 'dist');
@@ -627,19 +657,23 @@ describe('startTestDaemon', () => {
         env: {},
       });
 
-      const daemon = await startTestDaemon({
+      daemon = await startTestDaemon({
         testDir,
         happyHomeDir: homeDir,
         env: {},
         startupTimeoutMs: 15_000,
       });
 
+      // State can become readable before Node observes the fake daemon's exit.
+      if (daemon.proc.child.exitCode === null && daemon.proc.child.signalCode === null) {
+        await once(daemon.proc.child, 'exit');
+      }
+
       expect(daemon.state.httpPort).toBe(32_225);
       expect(daemon.state.pid).toBe(daemon.proc.child.pid);
       expect(daemon.proc.child.exitCode).toBe(1);
-
-      await daemon.stop();
     } finally {
+      if (daemon) await daemon.stop();
       await rm(testDir, { recursive: true, force: true });
     }
   });
@@ -679,6 +713,10 @@ describe('startTestDaemon', () => {
         'start-sync',
       ], {
         stdio: 'ignore',
+        env: {
+          ...process.env,
+          HAPPIER_HOME_DIR: homeDir,
+        },
       });
       originalPid = original.pid ?? null;
       expect(typeof originalPid).toBe('number');

@@ -62,6 +62,9 @@ describe('runSessionHandoffPickerFlow', () => {
             sessionId: 'sess_1',
             sourceMachineId: null,
             serverId: 'server_a',
+            retainOnSubmit: true,
+            onRetained: expect.any(Function),
+            onSubmitAgain: expect.any(Function),
         });
         expect(modalConfirmMock).not.toHaveBeenCalled();
         expect(runSessionHandoffUiFlowMock).not.toHaveBeenCalled();
@@ -95,6 +98,7 @@ describe('runSessionHandoffPickerFlow', () => {
         expect(modalConfirmMock).not.toHaveBeenCalled();
         expect(runSessionHandoffUiFlowMock).toHaveBeenCalledWith({
             execute,
+            onExistingStateUnavailable: expect.any(Function),
             sessionId: 'sess_1',
             targetMachineId: 'machine_target',
             targetSessionStorageMode: 'persisted',

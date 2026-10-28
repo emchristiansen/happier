@@ -102,6 +102,42 @@ describe('machineSpawnNewSession error mapping', () => {
     expect(result.errorMessage.toLowerCase()).toContain('rpc');
   });
 
+  it('refuses a new-service selection before spawning when the daemon has no materialization support', async () => {
+    machineRpcWithServerScopeMock.mockImplementation(async ({ method }) => method === RPC_METHODS.CAPABILITIES_INVOKE
+      ? { ok: false, error: { code: 'unsupported-method' } }
+      : { type: 'success', sessionId: 'wrong-native-session' });
+    const { machineSpawnNewSession } = await import('./machines');
+    const result = await machineSpawnNewSession({
+      machineId: 'machine-1', directory: '/tmp', serverId: 'server-b',
+      backendTarget: { kind: 'builtInAgent', agentId: 'agy' },
+      connectedServices: { v: 1, bindingsByServiceId: {
+        antigravity: { source: 'connected', selection: 'profile', profileId: 'google-work' },
+      } },
+    });
+    expect(result).toMatchObject({ type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.INVALID_REQUEST });
+    expect(prepareAccountSettingsForDaemonSpawnMock).not.toHaveBeenCalled();
+    expect(machineRpcWithServerScopeMock.mock.calls.some(([call]) =>
+      call.method === RPC_METHODS.SPAWN_HAPPY_SESSION_PROVIDER_SAFE || call.method === RPC_METHODS.SPAWN_HAPPY_SESSION,
+    )).toBe(false);
+  });
+
+  it('launches the exact new-service selection after actual materialization support is declared', async () => {
+    machineRpcWithServerScopeMock.mockImplementation(async ({ method }) => method === RPC_METHODS.CAPABILITIES_INVOKE
+      ? { ok: true, result: { supportedServiceIds: ['antigravity'] } }
+      : { type: 'success', sessionId: 'selected-google-session' });
+    const { machineSpawnNewSession } = await import('./machines');
+    const connectedServices = { v: 1, bindingsByServiceId: {
+      antigravity: { source: 'connected', selection: 'group', groupId: 'google-pool' },
+    } };
+    const result = await machineSpawnNewSession({
+      machineId: 'machine-1', directory: '/tmp', serverId: 'server-b',
+      backendTarget: { kind: 'builtInAgent', agentId: 'agy' }, connectedServices,
+    });
+    expect(result).toMatchObject({ type: 'success', sessionId: 'selected-google-session' });
+    expect(machineRpcWithServerScopeMock.mock.calls.find(([call]) => call.method === RPC_METHODS.SPAWN_HAPPY_SESSION_PROVIDER_SAFE)?.[0].payload.connectedServices)
+      .toEqual(connectedServices);
+  });
+
   it('prefers provider-safe spawn and falls back to legacy only after definitive method absence', async () => {
     machineRpcWithServerScopeMock
       .mockRejectedValueOnce(Object.assign(new Error('RPC method not available'), {

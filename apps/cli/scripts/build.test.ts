@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -101,6 +102,65 @@ describe('buildCliDist', () => {
         cwd: packageRoot,
         timeoutMs: 250,
       })).not.toThrow();
+    } finally {
+      rmSync(packageRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves the missing module and full require stack when a staged runtime import fails', () => {
+    const packageRoot = createTempDirSync('happier-cli-build-runtime-probe-diagnostic-');
+    try {
+      const entrypoint = join(packageRoot, 'index.mjs');
+      writeFileSync(entrypoint, [
+        'import { createRequire } from "node:module";',
+        'createRequire(import.meta.url)("./missing-runtime-sidecar.cjs");',
+      ].join('\n'), 'utf8');
+
+      expect(() => probeDistRuntimeImport(entrypoint, { cwd: packageRoot })).toThrow(
+        /Cannot find module '\.\/missing-runtime-sidecar\.cjs'[\s\S]*Require stack:[\s\S]*index\.mjs/,
+      );
+    } finally {
+      rmSync(packageRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('builds and imports the default source generation with its runtime sidecars', async () => {
+    const packageRoot = createTempDirSync('happier-cli-build-runtime-sidecars-');
+    try {
+      const cliDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+      writeRuntimeManifest(packageRoot);
+      mkdirSync(join(packageRoot, 'src', 'runtime', 'assets'), { recursive: true });
+      mkdirSync(join(packageRoot, 'scripts'), { recursive: true });
+      cpSync(join(cliDir, 'src', 'projectPath.ts'), join(packageRoot, 'src', 'projectPath.ts'));
+      cpSync(
+        join(cliDir, 'src', 'runtime', 'assets', 'resolveCliRuntimeAssetPath.ts'),
+        join(packageRoot, 'src', 'runtime', 'assets', 'resolveCliRuntimeAssetPath.ts'),
+      );
+      cpSync(join(cliDir, 'scripts', 'process_tree.cjs'), join(packageRoot, 'scripts', 'process_tree.cjs'));
+      cpSync(join(cliDir, 'tsconfig.json'), join(packageRoot, 'tsconfig.json'));
+      writeFileSync(join(packageRoot, 'tsconfig.build.json'), JSON.stringify({
+        extends: './tsconfig.json',
+        include: ['src/index.ts'],
+      }), 'utf8');
+      symlinkSync(
+        resolve(cliDir, '..', '..', 'node_modules'),
+        join(packageRoot, 'node_modules'),
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
+      writeFileSync(join(packageRoot, 'src', 'index.ts'), [
+        'import { createRequire } from "node:module";',
+        'import { resolveCliRuntimeAssetPath } from "./runtime/assets/resolveCliRuntimeAssetPath";',
+        'const owner = createRequire(import.meta.url)(resolveCliRuntimeAssetPath("scripts", "process_tree.cjs"));',
+        'export const ready = typeof owner.isPidAliveBySignal === "function";',
+        'if (!ready) throw new Error("process-tree sidecar was not loaded");',
+      ].join('\n'), 'utf8');
+
+      await expect(buildCliDist({
+        packageRoot,
+        skipLock: true,
+        env: { ...process.env, HAPPIER_CLI_BUILD_OUTPUT_DIR: '' },
+      })).resolves.toEqual({ outputDir: join(realpathSync.native(packageRoot), 'dist'), promoted: true });
+      expect(() => probeDistRuntimeImport(join(packageRoot, 'dist', 'index.mjs'), { cwd: packageRoot })).not.toThrow();
     } finally {
       rmSync(packageRoot, { recursive: true, force: true });
     }

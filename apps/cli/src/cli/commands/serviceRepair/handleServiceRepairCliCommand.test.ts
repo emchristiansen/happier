@@ -629,6 +629,54 @@ describe('handleServiceRepairCliCommand', () => {
     expect(applyBackgroundServiceRepairPlanMock).not.toHaveBeenCalled();
   });
 
+  it('names every service repair --yes removes and keeps pinned services of other relays', async () => {
+    resolveDaemonServiceListEntriesMock.mockImplementation(async (_runtime: unknown, options?: unknown) => {
+      const normalizedOptions = options as { mode?: 'user' | 'system' } | undefined;
+      if (normalizedOptions?.mode === 'system') {
+        return [];
+      }
+      const unit = (serverId: string, targetMode: 'pinned' | 'default-following', relayUrl: string | null) => ({
+        serverId,
+        activeServerId: targetMode === 'pinned' ? serverId : null,
+        name: serverId,
+        relayUrl,
+        installed: true,
+        path: `/tmp/user/.config/systemd/user/happier-daemon.${serverId}.service`,
+        platform: 'linux' as const,
+        mode: 'user' as const,
+        happierHomeDir: '/tmp/user/.happier',
+        releaseChannel: 'stable' as const,
+        label: `happier-daemon.${serverId}`,
+        targetMode,
+      });
+      return [
+        unit('default', 'default-following', null),
+        unit('legacy-default-relay', 'pinned', 'https://example.test'),
+        unit('company', 'pinned', 'https://company.example.test'),
+      ];
+    });
+
+    const { handleServiceRepairCliCommand } = await import('./handleServiceRepairCliCommand');
+    const output = captureConsoleText();
+    try {
+      await handleServiceRepairCliCommand({
+        argv: ['repair', '--yes'],
+        commandPath: 'happier doctor',
+      });
+    } finally {
+      output.restore();
+    }
+
+    const appliedPlan = applyBackgroundServiceRepairPlanMock.mock.calls[0]?.[0] as
+      | { actions: ReadonlyArray<{ kind: string; service?: { label: string } }> }
+      | undefined;
+    const removedLabels = (appliedPlan?.actions ?? []).flatMap((action) =>
+      action.kind === 'remove-service' && action.service ? [action.service.label] : []);
+    expect(removedLabels).toEqual(['happier-daemon.legacy-default-relay']);
+    expect(output.text()).toContain('happier-daemon.legacy-default-relay');
+    expect(output.text()).not.toContain('happier-daemon.company');
+  });
+
   it('reuses the sudo invoker as system user for system-mode repair installs', async () => {
     envScope.patch({
       SUDO_USER: 'developer',

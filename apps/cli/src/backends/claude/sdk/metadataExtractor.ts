@@ -15,6 +15,7 @@ import {
 import { getDefaultClaudeCodePath } from './utils'
 import { ensureClaudeJsRuntimeExecutable } from '@/backends/claude/utils/ensureClaudeJsRuntimeExecutable'
 import { logger } from '@/ui/logger'
+import { resolveClaudeSessionEnvOverlay } from '../spawn/resolveClaudeSessionEnvOverlay'
 
 export type { SDKMetadata } from './metadataCache'
 
@@ -22,14 +23,17 @@ export type { SDKMetadata } from './metadataCache'
  * Extract SDK metadata by running a minimal query and capturing the init message
  * @returns SDK metadata containing tools and slash commands
  */
-export async function extractSDKMetadata(): Promise<SDKMetadata> {
+export async function extractSDKMetadata(options?: Readonly<{ claudeCodeIncludeInNativeHistory?: boolean }>): Promise<SDKMetadata> {
     const abortController = new AbortController()
+    // A captured init inventory remains valid when abort or iterator teardown rejects.
+    const metadata: SDKMetadata = {}
 
     try {
         logger.debug('[metadataExtractor] Starting SDK metadata extraction')
         const runtimeExecutable = await ensureClaudeJsRuntimeExecutable()
         const claudePath = getDefaultClaudeCodePath()
-        const cacheKey = resolveSDKMetadataCacheKey({ claudePath, runtimeExecutable })
+        const env = resolveClaudeSessionEnvOverlay(options ?? {})
+        const cacheKey = resolveSDKMetadataCacheKey({ claudePath, runtimeExecutable, entrypoint: env.CLAUDE_CODE_ENTRYPOINT })
         const cached = cacheKey ? readCachedSDKMetadata(cacheKey) : null
         if (cached) {
             logger.debug('[metadataExtractor] Using cached SDK metadata:', cached)
@@ -41,6 +45,8 @@ export async function extractSDKMetadata(): Promise<SDKMetadata> {
             prompt: 'hello',
             options: {
                 maxTurns: 1,
+                extraArgs: ['--no-session-persistence'],
+                env,
                 executable: runtimeExecutable,
                 pathToClaudeCodeExecutable: claudePath,
                 abort: abortController.signal
@@ -52,7 +58,6 @@ export async function extractSDKMetadata(): Promise<SDKMetadata> {
             if (message.type === 'system' && message.subtype === 'init') {
                 const systemMessage = message as SDKSystemMessage
 
-                const metadata: SDKMetadata = {}
                 if (Array.isArray(systemMessage.tools)) metadata.tools = systemMessage.tools
                 if (Array.isArray(systemMessage.slash_commands)) metadata.slashCommands = systemMessage.slash_commands
 
@@ -70,16 +75,16 @@ export async function extractSDKMetadata(): Promise<SDKMetadata> {
         }
 
         logger.debug('[metadataExtractor] No init message received from SDK')
-        return {}
+        return metadata
 
     } catch (error) {
         // Check if it's an abort error (expected)
         if (error instanceof Error && error.name === 'AbortError') {
             logger.debug('[metadataExtractor] SDK query aborted after capturing metadata')
-            return {}
+            return metadata
         }
         logger.debug('[metadataExtractor] Error extracting SDK metadata:', error)
-        return {}
+        return metadata
     }
 }
 
@@ -87,8 +92,8 @@ export async function extractSDKMetadata(): Promise<SDKMetadata> {
  * Extract SDK metadata asynchronously without blocking
  * Fires the extraction and updates metadata when complete
  */
-export function extractSDKMetadataAsync(onComplete: (metadata: SDKMetadata) => void): void {
-    extractSDKMetadata()
+export function extractSDKMetadataAsync(onComplete: (metadata: SDKMetadata) => void, options?: Readonly<{ claudeCodeIncludeInNativeHistory?: boolean }>): void {
+    extractSDKMetadata(options)
         .then(metadata => {
             if (metadata.tools || metadata.slashCommands) {
                 onComplete(metadata)

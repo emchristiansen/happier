@@ -1,3 +1,4 @@
+import type { SessionListBackgroundWorkAttentionMode } from './sessionListBackgroundWorkAttention';
 import type { ServerSelectionPresentation } from '@/sync/domains/server/selection/serverSelectionTypes';
 import { syncPerformanceTelemetry } from '@/sync/runtime/syncPerformanceTelemetry';
 
@@ -17,8 +18,7 @@ import {
 import {
     applySessionListIndexAttentionPromotionWithinGroups,
     applySessionListIndexWorkingPlacementWithinGroups,
-    buildSessionListIndexAttentionPromotion,
-    buildSessionListIndexWorkingPlacement,
+    buildSessionListIndexGlobalPlacements,
 } from './attentionPromotion/sessionListIndexAttentionPromotion';
 import {
     normalizeSessionListAttentionPromotionMode,
@@ -74,6 +74,7 @@ export type ComputeVisibleSessionListIndexParams = Readonly<{
     storageFilterApplied?: boolean;
     attentionPromotion?: SessionListAttentionPromotionOptions;
     workingPlacement?: SessionListWorkingPlacementOptions;
+    backgroundWorkAttentionMode?: SessionListBackgroundWorkAttentionMode;
     retainWorkingSessionKeys?: SessionListWorkingRetentionKeySource;
     nowMs?: number;
 }>;
@@ -461,25 +462,28 @@ function computeVisibleSessionListIndexUnmeasured(
     });
 
     const globalAttentionSource = pruneOrphanSessionListIndexHeaders(orderedWithPinnedFlags);
-    const attentionPromotion = buildSessionListIndexAttentionPromotion({
+    const globalPlacements = buildSessionListIndexGlobalPlacements({
+        backgroundWorkAttentionMode: params.backgroundWorkAttentionMode,
         source: globalAttentionSource,
-        options: params.attentionPromotion,
+        attentionOptions: params.attentionPromotion,
+        workingOptions: params.workingPlacement,
+        retainedWorkingKeys: params.retainWorkingSessionKeys,
         resolveSessionRow: params.resolveSessionRow,
         nowMs: placementNowMs,
     });
-    const orderedWithoutGlobalAttention = attentionPromotion
-        ? pruneOrphanSessionListIndexHeaders(attentionPromotion.remainder)
+    const attentionPromotion = globalPlacements && globalPlacements.attentionPromotedCount > 0
+        ? {
+            attentionItems: globalPlacements.attentionItems,
+        }
+        : null;
+    const workingPlacement = globalPlacements && globalPlacements.workingPromotedCount > 0
+        ? {
+            workingItems: globalPlacements.workingItems,
+        }
+        : null;
+    const orderedWithoutGlobalWorking = globalPlacements
+        ? pruneOrphanSessionListIndexHeaders(globalPlacements.remainder)
         : globalAttentionSource;
-    const workingPlacement = buildSessionListIndexWorkingPlacement({
-        source: pruneOrphanSessionListIndexHeaders(orderedWithoutGlobalAttention),
-        options: params.workingPlacement,
-        retainedKeys: params.retainWorkingSessionKeys,
-        resolveSessionRow: params.resolveSessionRow,
-        nowMs: placementNowMs,
-    });
-    const orderedWithoutGlobalWorking = workingPlacement
-        ? pruneOrphanSessionListIndexHeaders(workingPlacement.remainder)
-        : orderedWithoutGlobalAttention;
 
     const { pinnedSessions, remainder: nonPinnedRemainder } = buildPinnedSessionListIndexItems({
         ordered: orderedWithoutGlobalWorking,
@@ -502,6 +506,7 @@ function computeVisibleSessionListIndexUnmeasured(
     const remainderPruned = pruneOrphanSessionListIndexHeaders(nonPinnedRemainder);
     const remainderAfterWorking = workingPlacementMode === 'withinGroups'
         ? applySessionListIndexWorkingPlacementWithinGroups({
+            backgroundWorkAttentionMode: params.backgroundWorkAttentionMode,
             source: remainderPruned,
             options: params.workingPlacement,
             retainedKeys: params.retainWorkingSessionKeys,
@@ -511,6 +516,7 @@ function computeVisibleSessionListIndexUnmeasured(
         : remainderPruned;
     const remainderAfterAttention = attentionPromotionMode === 'withinGroups'
         ? applySessionListIndexAttentionPromotionWithinGroups({
+            backgroundWorkAttentionMode: params.backgroundWorkAttentionMode,
             source: remainderAfterWorking,
             options: params.attentionPromotion,
             resolveSessionRow: params.resolveSessionRow,

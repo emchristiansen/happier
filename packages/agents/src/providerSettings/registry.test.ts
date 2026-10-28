@@ -49,6 +49,6 @@ describe('provider settings registry', () => {
   it('exposes Kimi settings from the canonical provider definition', () => {
     const kimiDefinition = getProviderSettingsDefinition('kimi' as any);
     expect(kimiDefinition).not.toBeNull();
-    expect(kimiDefinition?.fields.kimiAcpPythonSelector?.default).toBe('auto');
+    expect(kimiDefinition?.fields).toEqual({});
   });
 });

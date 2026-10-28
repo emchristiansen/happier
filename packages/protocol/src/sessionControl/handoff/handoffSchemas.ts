@@ -15,6 +15,7 @@ import {
   SessionHandoffProgressCheckpointSchema,
   SessionHandoffProgressWarningCodeSchema,
   SessionHandoffStatusSchema,
+  type SessionHandoffStatus,
   SessionHandoffWorkspacePreflightSummarySchema,
 } from './handoffStatus.js';
 import { TransferChunkEnvelopeSchema, TransferEndpointCandidateSchema } from '../../machineTransfer/transferStream.js';
@@ -25,11 +26,43 @@ const MAX_MACHINE_ID_LENGTH = 256;
 const MAX_PATH_LENGTH = 4096;
 const MAX_TRANSFER_ID_LENGTH = 512;
 const MAX_MANIFEST_HASH_LENGTH = 256;
-const MAX_ENDPOINT_CANDIDATES = 20;
 const MAX_PREFERRED_TRANSPORT_STRATEGIES = 4;
 const MAX_INCLUDE_GLOBS = 128;
 const MAX_SOURCE_CONTROLLER_METADATA_KEYS = 50;
 const MAX_SOURCE_CONTROLLER_METADATA_JSON_BYTES = 32 * 1024;
+
+// Capability replies are forward-extensible; only explicit true flags authorize a mode.
+export const SessionHandoffCapabilityV2Schema = z.object({
+  protocolVersion: z.literal(2),
+  atomicTargetResume: z.literal(true),
+  targetCleanup: z.literal(true),
+  sameMachineHandoff: z.unknown().optional().transform((value) => value === true),
+  existingState: z.unknown().optional().transform((value) => value === true),
+});
+export type SessionHandoffCapabilityV2 = z.infer<typeof SessionHandoffCapabilityV2Schema>;
+
+/** Reads daemon handoff failures while retaining their recovery identity and progress. */
+export function readSessionHandoffError(raw: unknown): Readonly<{
+  errorCode: string;
+  errorMessage: string;
+  handoffId?: string;
+  status?: SessionHandoffStatus;
+}> | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const value = raw as Record<string, unknown>;
+  const parsedStatus = SessionHandoffStatusSchema.safeParse(value.status);
+  const status = parsedStatus.success ? parsedStatus.data : undefined;
+  const handoffId = typeof value.handoffId === 'string' ? value.handoffId : status?.handoffId;
+  if ((value.ok === false && typeof value.errorCode === 'string') || typeof value.error === 'string') {
+    return {
+      errorCode: typeof value.errorCode === 'string' ? value.errorCode : 'UNEXPECTED',
+      errorMessage: typeof value.error === 'string' ? value.error : 'Session handoff failed',
+      ...(handoffId ? { handoffId } : {}),
+      ...(status ? { status } : {}),
+    };
+  }
+  return null;
+}
 
 export const SessionHandoffWorkspaceTransferSchema = z
   .object({
@@ -56,7 +89,8 @@ const SessionHandoffProviderBundleTransferPublicationSchema = z
     transferId: z.string().min(1).max(MAX_TRANSFER_ID_LENGTH),
     sizeBytes: z.number().int().min(0),
     manifestHash: z.string().min(1).max(MAX_MANIFEST_HASH_LENGTH),
-    endpointCandidates: z.array(TransferEndpointCandidateSchema).max(MAX_ENDPOINT_CANDIDATES).readonly().optional(),
+    // Hosts may advertise many network interfaces; validate each endpoint without dropping routes.
+    endpointCandidates: z.array(TransferEndpointCandidateSchema).readonly().optional(),
   })
   .strict();
 export type SessionHandoffProviderBundleTransferPublication = z.infer<
@@ -66,7 +100,7 @@ export type SessionHandoffProviderBundleTransferPublication = z.infer<
 const SessionHandoffWorkspaceReplicationManifestTransferPublicationSchema = z
   .object({
     transferId: z.string().min(1).max(MAX_TRANSFER_ID_LENGTH),
-    endpointCandidates: z.array(TransferEndpointCandidateSchema).max(MAX_ENDPOINT_CANDIDATES).readonly().optional(),
+    endpointCandidates: z.array(TransferEndpointCandidateSchema).readonly().optional(),
   })
   .strict();
 export type SessionHandoffWorkspaceReplicationManifestTransferPublication = z.infer<
@@ -128,6 +162,15 @@ const SessionHandoffResumePlanSchema = z
   .strict();
 export type SessionHandoffResumePlan = z.infer<typeof SessionHandoffResumePlanSchema>;
 
+function validateExistingStateWorkspaceTransfer(
+  value: Readonly<{ stateTransfer?: 'transfer' | 'existing'; workspaceTransfer?: SessionHandoffWorkspaceTransfer }>,
+  context: z.RefinementCtx,
+): void {
+  if (value.stateTransfer === 'existing' && value.workspaceTransfer?.enabled === true) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['workspaceTransfer'], message: 'Existing session state requires workspace copying to be disabled' });
+  }
+}
+
 export const SessionHandoffStartRequestSchema = z
   .object({
     requestId: z.string().min(1).max(2000).optional(),
@@ -136,6 +179,7 @@ export const SessionHandoffStartRequestSchema = z
     targetMachineId: z.string().min(1).max(MAX_MACHINE_ID_LENGTH),
     sessionStorageMode: SessionHandoffStorageModeSchema,
     targetSessionStorageMode: SessionHandoffStorageModeSchema.optional(),
+    stateTransfer: z.enum(['transfer', 'existing']).optional(),
     targetPath: z.string().min(1).max(MAX_PATH_LENGTH).optional(),
     preferredTransportStrategies: z
       .array(SessionHandoffTransportStrategySchema)
@@ -145,7 +189,8 @@ export const SessionHandoffStartRequestSchema = z
     negotiatedTransportStrategy: SessionHandoffTransportStrategySchema.optional(),
     workspaceTransfer: SessionHandoffWorkspaceTransferSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine(validateExistingStateWorkspaceTransfer);
 export type SessionHandoffStartRequest = z.infer<typeof SessionHandoffStartRequestSchema>;
 
 export const SessionHandoffPrepareTargetRequestSchema = z
@@ -157,19 +202,20 @@ export const SessionHandoffPrepareTargetRequestSchema = z
     allowServerRoutedFallback: z.boolean().optional(),
     sourceSessionStorageMode: SessionHandoffStorageModeSchema,
     targetSessionStorageMode: SessionHandoffStorageModeSchema.optional(),
+    stateTransfer: z.enum(['transfer', 'existing']).optional(),
     targetPath: z.string().min(1).max(MAX_PATH_LENGTH),
     endpointCandidates: z
       .array(TransferEndpointCandidateSchema)
-      .max(MAX_ENDPOINT_CANDIDATES)
       .readonly()
       .default(() => []),
     handoffMetadataV2: SessionHandoffMetadataV2Schema.optional(),
     workspaceTransfer: SessionHandoffWorkspaceTransferSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine(validateExistingStateWorkspaceTransfer);
 export type SessionHandoffPrepareTargetRequest = z.infer<typeof SessionHandoffPrepareTargetRequestSchema>;
 
-export const SessionHandoffPrepareTargetRequestV2Schema = SessionHandoffPrepareTargetRequestSchema.extend({
+export const SessionHandoffPrepareTargetRequestV2Schema = SessionHandoffPrepareTargetRequestSchema.safeExtend({
   sessionId: z.string().min(1).max(MAX_HANDOFF_ID_LENGTH),
 }).strict();
 export type SessionHandoffPrepareTargetRequestV2 = z.infer<typeof SessionHandoffPrepareTargetRequestV2Schema>;
@@ -242,7 +288,6 @@ export const SessionHandoffStartResponseSchema = z
     status: SessionHandoffStatusSchema,
     endpointCandidates: z
       .array(TransferEndpointCandidateSchema)
-      .max(MAX_ENDPOINT_CANDIDATES)
       .readonly()
       .default(() => []),
     targetPath: z.string().min(1).max(MAX_PATH_LENGTH),

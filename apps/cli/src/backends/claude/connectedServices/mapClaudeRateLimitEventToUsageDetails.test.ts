@@ -2,10 +2,50 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   mapClaudeRateLimitEventToUsageDetails,
+  mapClaudeProviderFailureToUsageDetails,
   mapClaudeStopFailureHookToUsageDetails,
 } from './mapClaudeRateLimitEventToUsageDetails';
+import { classifyClaudeConnectedServiceRuntimeAuthFailure } from './classifyClaudeConnectedServiceRuntimeAuthFailure';
+import { shouldHandleConnectedServiceProviderLimitFailure } from '@/daemon/connectedServices/accountGroups/quotas/quotaLimitSelection';
 
 describe('mapClaudeRateLimitEventToUsageDetails', () => {
+  it('admits an actual failed SDK result whose rejection evidence is in result and errors', () => {
+    expect(mapClaudeProviderFailureToUsageDetails({
+      type: 'result', subtype: 'error_during_execution', is_error: true,
+      result: 'Claude AI usage limit reached|1792656000', errors: ['Usage limit reached'],
+    })).toMatchObject({ resetAtMs: 1792656000000 });
+    expect(mapClaudeProviderFailureToUsageDetails({
+      type: 'result', subtype: 'success', is_error: false,
+      result: 'Previously saw a usage limit reached', errors: [],
+    })).toBeNull();
+  });
+
+  it('does not turn generic subscription rejection codes into unselected allowance identities', () => {
+    const selection = { mode: 'selected' as const, providerLimitIds: ['five_hour', 'seven_day'] };
+    for (const details of [
+      mapClaudeRateLimitEventToUsageDetails({
+        type: 'assistant', isApiErrorMessage: true, error: 'rate_limit',
+        message: { content: [{ type: 'text', text: "You've hit your session limit · resets 5:30pm (Europe/Amsterdam)" }] },
+      }),
+      mapClaudeStopFailureHookToUsageDetails({ hook_event_name: 'StopFailure', error: 'rate_limit' }),
+      mapClaudeRateLimitEventToUsageDetails({ type: 'result', is_error: true, api_error_status: 429 }),
+    ]) {
+      expect(details).not.toBeNull();
+      const failure = classifyClaudeConnectedServiceRuntimeAuthFailure({ details });
+      if (!failure) throw new Error('Expected a usage-limit classification');
+      expect(failure?.providerLimitId).toBeNull();
+      expect(shouldHandleConnectedServiceProviderLimitFailure({
+        selection, reason: failure.kind, providerLimitId: failure.providerLimitId,
+      })).toBe(true);
+    }
+    const excluded = classifyClaudeConnectedServiceRuntimeAuthFailure({ details: mapClaudeRateLimitEventToUsageDetails({
+      type: 'rate_limit_event', rate_limit_info: { status: 'rejected', rateLimitType: 'seven_day_opus' },
+    }) });
+    if (!excluded) throw new Error('Expected a specific allowance classification');
+    expect(shouldHandleConnectedServiceProviderLimitFailure({
+      selection, reason: excluded.kind, providerLimitId: excluded.providerLimitId,
+    })).toBe(false);
+  });
   afterEach(() => {
     vi.useRealTimers();
   });
@@ -169,7 +209,6 @@ describe('mapClaudeRateLimitEventToUsageDetails', () => {
       retryAfterMs: null,
       quotaScope: 'account',
       recoverability: 'wait',
-      providerLimitId: 'rate_limit',
       utilization: null,
     });
   });
@@ -191,7 +230,6 @@ describe('mapClaudeRateLimitEventToUsageDetails', () => {
       retryAfterMs: null,
       quotaScope: 'account',
       recoverability: 'wait',
-      providerLimitId: 'rate_limit',
     });
   });
 
@@ -246,7 +284,6 @@ describe('mapClaudeRateLimitEventToUsageDetails', () => {
       retryAfterMs: 45_000,
       quotaScope: 'account',
       recoverability: 'wait',
-      providerLimitId: 'rate_limit',
       utilization: null,
     });
   });
@@ -357,7 +394,6 @@ describe('mapClaudeRateLimitEventToUsageDetails', () => {
       retryAfterMs: 4_800_000,
       quotaScope: 'account',
       recoverability: 'wait',
-      providerLimitId: 'rate_limit',
     });
   });
 
@@ -371,7 +407,6 @@ describe('mapClaudeRateLimitEventToUsageDetails', () => {
       agent_id: 'agent-123',
     })).toMatchObject({
       v: 1,
-      providerLimitId: 'rate_limit',
       sourcedFromSidechain: true,
     });
 
@@ -399,7 +434,6 @@ describe('mapClaudeRateLimitEventToUsageDetails', () => {
       retryAfterMs: null,
       quotaScope: 'account',
       recoverability: 'wait',
-      providerLimitId: 'rate_limit',
       planType: null,
       utilization: null,
       overage: null,

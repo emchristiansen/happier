@@ -5,6 +5,9 @@ import { join, resolve } from 'node:path';
 
 import {
     buildConnectedServiceCredentialRecord,
+    buildProviderAccountUsageRecordId,
+    ProviderAccountUsageSnapshotV1Schema,
+    sealProviderAccountUsageSnapshot,
     sealAccountScopedBlobCiphertext,
     type ConnectedServiceId,
     type ConnectedServiceCredentialHealthV1,
@@ -27,6 +30,7 @@ import { waitForInitialAppUi } from '../../src/testkit/uiE2e/waitForInitialAppUi
 import { ensureAccountReadyForConnect } from '../../src/testkit/uiE2e/ensureAccountReadyForConnect';
 import { CLAUDE_CODE_E2E_OAUTH_SCOPE } from '../../src/testkit/connectedServicesRecovery';
 import { waitForDaemonMachineIdFromCliSettings } from '../../src/testkit/uiE2e/daemonMachineId';
+import { appendBrowserDiagnostics, collectBrowserDiagnostics } from '../../src/testkit/uiE2e/browserDiagnostics';
 
 const run = createRunDirs({ runLabel: 'ui-e2e' });
 const CONNECTED_SERVICE_FEATURE_ENV = {
@@ -652,7 +656,7 @@ test.describe('ui e2e: connected-service quota switch and recovery surfaces', ()
     });
 
     test('shows the provider quota composer badge and remaining-first popover', async ({ page }) => {
-        test.setTimeout(540_000);
+        test.setTimeout(180_000);
         if (!server || !uiBaseUrl) throw new Error('missing ui e2e fixtures');
 
         await page.setViewportSize({ width: 1440, height: 900 });
@@ -676,8 +680,92 @@ test.describe('ui e2e: connected-service quota switch and recovery surfaces', ()
         await expect(popover.getByTestId('agent-input-provider-usage-meter:daily')).toContainText(/44%/);
     });
 
+    test('shows saved Claude resets with unavailable status without allowing consumption', async ({ page }) => {
+        test.setTimeout(180_000);
+        if (!server || !uiBaseUrl) throw new Error('missing ui e2e fixtures');
+        const diagnostics = collectBrowserDiagnostics({ page });
+        try {
+            await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/?happier_hmr=0`, 180_000);
+            await waitForInitialAppUi({ page, timeoutMs: 180_000 });
+            await createAccountIfNeeded(page);
+            await enableConnectedServiceQuotaUi({ page, baseUrl: uiBaseUrl });
+            const auth = await readLegacyAuthCredentialsFromBrowserStorage(page);
+            const serviceId = 'claude-subscription' satisfies ConnectedServiceId;
+            const profileId = `saved-reset-${run.runId}`;
+            await createConnectedServiceProfile({
+                baseUrl: server.baseUrl, token: auth.token, secret: auth.secret,
+                serviceId, profileId, providerEmail: 'saved-reset@example.test',
+            });
+            const now = Date.now();
+            const recordKey = {
+                providerId: 'claude', accountSubjectId: `acct-${profileId}`,
+                subjectKind: 'account' as const, quotaScope: 'account' as const,
+            };
+            const snapshot = ProviderAccountUsageSnapshotV1Schema.parse({
+                v: 1, recordId: buildProviderAccountUsageRecordId(recordKey), recordKey,
+                providerId: recordKey.providerId, accountSubject: { kind: 'providerSubject', id: recordKey.accountSubjectId },
+                observedAtMs: now, fetchedAtMs: now, staleAfterMs: 60_000,
+                source: 'connectedServiceProbe', confidence: 'confirmed', state: 'loaded_data',
+                meters: [{
+                    meterId: 'weekly', label: 'Weekly', used: 88, limit: 100, unit: 'count',
+                    utilizationPct: 88, resetsAt: now + 3_600_000, status: 'ok',
+                    details: { providerLimitId: 'seven_day' },
+                }],
+                recoveryCredits: {
+                    kind: 'usage_limit_resets', availableCount: 0,
+                    credits: [{ providerCreditId: 'saved-reset', kind: 'rate_limit_reset', status: 'unknown', expiresAtMs: now + 86_400_000 }],
+                },
+                recoveryCreditDetails: {
+                    'saved-reset': {
+                        remainingCount: 2,
+                        appliesToProviderLimitIds: ['seven_day', 'provider_future_window'],
+                        unavailableReason: 'ineligible',
+                    },
+                },
+            });
+            const write = await fetchJson<{ success?: boolean }>(`${server.baseUrl}/v2/connect/provider-account-usage/${snapshot.recordId}`, {
+                method: 'POST', headers: { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    recordKey,
+                    sealed: sealProviderAccountUsageSnapshot({ material: { type: 'legacy', secret: auth.secret }, snapshot, randomBytes }),
+                    metadata: { fetchedAt: now, staleAfterMs: snapshot.staleAfterMs, status: 'ok' },
+                    source: { serviceId, profileId, bindingKind: 'profile' },
+                }),
+                timeoutMs: 20_000,
+            });
+            expect(write.status).toBe(200);
+            expect(write.data?.success).toBe(true);
+
+            const root = `account-block:${profileId}`;
+            const assertSavedReset = async () => {
+                const header = page.getByTestId(`${root}:header`);
+                await expect(header).toBeVisible({ timeout: 60_000 });
+                await expect(page.getByTestId(`${root}:reset-row:saved-reset`)).toBeVisible({ timeout: 60_000 });
+                await expect(page.getByTestId(`${root}:reset-count:saved-reset`)).toContainText('2');
+                await expect(page.getByTestId(`${root}:reset-applies-to:saved-reset`)).toContainText('Weekly');
+                await expect(page.getByTestId(`${root}:reset-applies-to:saved-reset`)).toContainText('provider_future_window');
+                await expect(page.getByTestId(`${root}:reset-unavailable:saved-reset`)).toContainText('Not eligible');
+                await expect(page.getByTestId(`${root}:reset-use:saved-reset`)).toBeDisabled();
+                await expect(page.getByTestId(`${root}:meter:weekly`)).toBeVisible();
+                await expect(page.getByTestId(`${root}:quota-error`)).toHaveCount(0);
+            };
+            await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/settings/connected-services/${serviceId}?happier_hmr=0`, 180_000);
+            await assertSavedReset();
+            await page.reload({ waitUntil: 'domcontentloaded' });
+            await assertSavedReset();
+            const use = page.getByTestId(`${root}:reset-use:saved-reset`);
+            await use.evaluate((element) => (element as HTMLElement).focus());
+            await page.keyboard.press('Enter');
+            await page.keyboard.press('Space');
+            await assertSavedReset();
+            await expect(page.getByRole('dialog')).toHaveCount(0);
+        } catch (error) {
+            throw appendBrowserDiagnostics(error, diagnostics());
+        }
+    });
+
     test('renders connected-service switch event rows and notification topic controls', async ({ page }) => {
-        test.setTimeout(540_000);
+        test.setTimeout(180_000);
         if (!server || !uiBaseUrl) throw new Error('missing ui e2e fixtures');
         await page.setViewportSize({ width: 1440, height: 900 });
         await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/?happier_hmr=0`, 180_000);
@@ -732,7 +820,7 @@ test.describe('ui e2e: connected-service quota switch and recovery surfaces', ()
     });
 
     test('routes reconnect-required connected profiles through the same profile identity', async ({ page }) => {
-        test.setTimeout(540_000);
+        test.setTimeout(180_000);
         if (!server || !uiBaseUrl) throw new Error('missing ui e2e fixtures');
 
         const serviceId = 'claude-subscription' satisfies ConnectedServiceId;
@@ -831,7 +919,7 @@ test.describe('ui e2e: connected-service quota switch and recovery surfaces', ()
     });
 
     test('shows connected-service restart status before inactive resume status', async ({ page }) => {
-        test.setTimeout(540_000);
+        test.setTimeout(180_000);
         if (!server || !uiBaseUrl) throw new Error('missing ui e2e fixtures');
 
         const serviceId = 'claude-subscription' satisfies ConnectedServiceId;
@@ -888,7 +976,7 @@ test.describe('ui e2e: connected-service quota switch and recovery surfaces', ()
     });
 
     test('records a switch event emitted by the real auth-group switch path', async ({ page }) => {
-        test.setTimeout(720_000);
+        test.setTimeout(180_000);
         if (!server || !uiBaseUrl) throw new Error('missing ui e2e fixtures');
 
         const serviceId = 'claude-subscription' satisfies ConnectedServiceId;
@@ -1027,7 +1115,7 @@ test.describe('ui e2e: connected-service quota switch and recovery surfaces', ()
     });
 
     test('hides app-server quota affordances for non-app-server Codex sessions', async ({ page }) => {
-        test.setTimeout(540_000);
+        test.setTimeout(180_000);
         if (!server || !uiBaseUrl) throw new Error('missing ui e2e fixtures');
         await page.setViewportSize({ width: 1440, height: 900 });
         await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/?happier_hmr=0`, 180_000);

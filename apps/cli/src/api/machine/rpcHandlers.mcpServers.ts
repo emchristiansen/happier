@@ -182,7 +182,7 @@ export function registerMachineMcpServersRpcHandlers(params: Readonly<{
       const settingsSecretsKey = deriveSettingsSecretsKeyForCredentials(credentials);
       const settingsSecretsReadKeys = deriveSettingsSecretsReadKeysForCredentials(credentials);
 
-      let mcpConfig: { serverName: string; config: McpServerConfig };
+      let mcpConfig: { serverName: string; config: McpServerConfig; cleanup: () => void };
       try {
         const materialized = await materializeMcpServerConfigRecord({
           resolved: resolution.resolved,
@@ -194,8 +194,11 @@ export function registerMachineMcpServersRpcHandlers(params: Readonly<{
           strictMode: true,
         });
         const config = materialized.mcpServers[resolution.serverName];
-        if (!config) throw new Error('materialize_missing_config');
-        mcpConfig = { serverName: resolution.serverName, config };
+        if (!config) {
+          materialized.cleanup();
+          throw new Error('materialize_missing_config');
+        }
+        mcpConfig = { serverName: resolution.serverName, config, cleanup: materialized.cleanup };
       } catch (error) {
         const durationMs = Math.max(0, nowMs(params.deps?.nowMs) - startedAt);
         return { ok: false, errorCode: 'materialization_failed', error: redactErrorText(error), durationMs };
@@ -221,6 +224,8 @@ export function registerMachineMcpServersRpcHandlers(params: Readonly<{
               ? 'mcp_list_tools_failed'
               : 'mcp_list_tools_failed';
         return { ok: false, errorCode: code, error: message, durationMs };
+      } finally {
+        mcpConfig.cleanup();
       }
     },
   );

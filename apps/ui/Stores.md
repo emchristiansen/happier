@@ -68,7 +68,7 @@ https://github.com/happier-dev/happier/blob/main/apps/ui/PRIVACY.md
 https://github.com/happier-dev/happier/issues
 
 ### Website / Marketing
-https://app.happier.dev
+https://cloud.happier.dev
 
 ## Additional Google Play Requirements
 

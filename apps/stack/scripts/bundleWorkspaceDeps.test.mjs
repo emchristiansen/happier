@@ -3,11 +3,57 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync, unlinkSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { execFileSync } from 'node:child_process';
 
 import { bundleWorkspaceDeps } from './bundleWorkspaceDeps.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+
+test('bundleWorkspaceDeps refreshes package-root imports targets through the real workspace copier', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stack-import-target-refresh-'));
+  try {
+    const stackDir = resolve(root, 'apps/stack');
+    const commonDir = resolve(root, 'packages/cli-common');
+    const sourceDir = resolve(root, 'packages/fixture');
+    const destinationDir = resolve(stackDir, 'node_modules/@happier-dev/fixture');
+    mkdirSync(stackDir, { recursive: true });
+    mkdirSync(resolve(commonDir, 'dist/workspaces'), { recursive: true });
+    mkdirSync(resolve(sourceDir, 'dist'), { recursive: true });
+    mkdirSync(resolve(sourceDir, 'runtime'), { recursive: true });
+    writeJson(resolve(root, 'package.json'), { name: 'fixture-root', private: true });
+    writeFileSync(resolve(root, 'yarn.lock'), '');
+    writeJson(resolve(stackDir, 'package.json'), { bundledDependencies: ['@happier-dev/fixture'] });
+    writeJson(resolve(commonDir, 'package.json'), { name: '@happier-dev/cli-common', type: 'module' });
+    // Exercise the real current source owner, not the older internal copier stub.
+    writeFileSync(resolve(commonDir, 'dist/workspaces/index.js'), `export * from ${JSON.stringify(new URL('../../../packages/cli-common/src/workspaces/index.ts', import.meta.url).href)};\n`);
+    writeJson(resolve(sourceDir, 'package.json'), {
+      name: '@happier-dev/fixture', version: '0.0.0', type: 'module',
+      exports: { '.': './dist/connect.js' },
+      imports: { '#http': { node: './runtime/node.js', default: './dist/fetch.js' }, '#fs': 'fs', '#disabled': null },
+    });
+    writeFileSync(resolve(sourceDir, 'dist/connect.js'), 'export { transport } from "#http";\n');
+    writeFileSync(resolve(sourceDir, 'dist/fetch.js'), 'export const transport = "fetch";\n');
+    const target = resolve(sourceDir, 'runtime/node.js');
+    writeFileSync(target, 'export const transport = "first";\n');
+    writeFileSync(resolve(sourceDir, 'fs'), 'not an imports file target\n');
+    // Compiler execution is an OS boundary; these fixture outputs are already
+    // present and forward to real source, so no compiler or repository publisher runs.
+    const options = { repoRoot: root, stackDir, ensureWorkspacePackagesBuiltByName: async () => {} };
+    await bundleWorkspaceDeps(options);
+    const manifest = JSON.parse(readFileSync(resolve(stackDir, 'node_modules/@happier-dev/.workspace-bundle-manifest.json'), 'utf8'));
+    assert.deepEqual(manifest.bundles[0].expectedRootFiles.map(({ relativePath }) => relativePath), ['runtime/node.js']);
+    writeFileSync(target, 'export const transport = "updated";\n');
+    await bundleWorkspaceDeps(options);
+    assert.equal(readFileSync(resolve(destinationDir, 'runtime/node.js'), 'utf8'), 'export const transport = "updated";\n');
+    const result = execFileSync(process.execPath, ['--input-type=module', '-e',
+      `console.log((await import(${JSON.stringify(pathToFileURL(resolve(destinationDir, 'dist/connect.js')).href)})).transport);`,
+    ], { encoding: 'utf8' }).trim();
+    assert.equal(result, 'updated');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function writeJson(path, value) {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, 'utf8');

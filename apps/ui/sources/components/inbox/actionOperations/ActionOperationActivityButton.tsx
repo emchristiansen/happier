@@ -7,6 +7,8 @@ import { Icon, ICON_SIZE } from '@/components/ui/icons/Icon';
 import { TabBadge } from '@/components/ui/navigation/tabBadge/TabBadge';
 import { FloatingOverlay } from '@/components/ui/overlays/FloatingOverlay';
 import { Popover } from '@/components/ui/popover';
+import { useActionOperationActivitySummary } from '@/sync/domains/actionOperations/useActionOperations';
+import { useActiveServerAccountScope } from '@/sync/domains/state/storage';
 import { t } from '@/text';
 
 import { ActionOperationLedger } from './ActionOperationLedger';
@@ -33,8 +35,28 @@ export type ActionOperationActivityButtonViewProps = Readonly<{
     testID?: string;
 }>;
 
-export const ActionOperationActivityButtonView = React.memo(function ActionOperationActivityButtonView(
-    props: ActionOperationActivityButtonViewProps,
+type ActionOperationActivityPopoverPlacement = Readonly<{
+    anchorRef: React.RefObject<View | null>;
+    anchor: Readonly<{
+        kind: 'rect';
+        rect: Readonly<{ left: number; top: number; width: number; height: number }>;
+        coordinateSpace: 'window';
+    }> | undefined;
+    onRequestClose: () => void;
+}>;
+
+type ActionOperationActivityButtonChromeProps = Readonly<{
+    activeCount: number;
+    hasAttention: boolean;
+    renderDetails: (placement: ActionOperationActivityPopoverPlacement) => React.ReactNode;
+    tintColor?: string;
+    buttonSize?: number;
+    iconSize?: number;
+    testID?: string;
+}>;
+
+const ActionOperationActivityButtonChrome = React.memo(function ActionOperationActivityButtonChrome(
+    props: ActionOperationActivityButtonChromeProps,
 ) {
     const { theme } = useUnistyles();
     const anchorRef = React.useRef<View>(null);
@@ -46,33 +68,7 @@ export const ActionOperationActivityButtonView = React.memo(function ActionOpera
         height: number;
     }> | null>(null);
     const visible = props.hasAttention || open;
-    const activeCount = props.activeCount ?? props.operations.reduce(
-        (count, operation) => count + (
-            (operation.state === 'accepted' || operation.state === 'running')
-            && props.observationForOperation(operation) !== 'status_unavailable'
-                ? 1
-                : 0
-        ),
-        0,
-    );
-
-    React.useEffect(() => {
-        if (open) props.onMarkVisibleTerminalSeen();
-    }, [open, props.onMarkVisibleTerminalSeen, props.operations]);
-
-    const handleOpenOperation = React.useCallback((operationId: string) => {
-        setOpen(false);
-        props.onOpenOperation(operationId);
-    }, [props.onOpenOperation]);
-    const handleCancelOperation = React.useCallback(async (operationId: string) => {
-        const operation = props.operations.find((candidate) => candidate.operationId === operationId);
-        if (!operation) return;
-        await requestActionOperationStop(operation);
-    }, [props.operations]);
-    const handleClearRecent = React.useCallback(() => {
-        props.onClearRecent?.();
-        setOpen(false);
-    }, [props.onClearRecent]);
+    const handleRequestClose = React.useCallback(() => setOpen(false), []);
 
     if (!visible) return null;
 
@@ -84,7 +80,6 @@ export const ActionOperationActivityButtonView = React.memo(function ActionOpera
                 accessibilityRole="button"
                 accessibilityLabel={t('inbox.updates')}
                 accessibilityState={{ expanded: open }}
-                hitSlop={8}
                 onPress={(event) => {
                     if (!open && Platform.OS === 'web') {
                         const target = event?.currentTarget as unknown as {
@@ -119,56 +114,166 @@ export const ActionOperationActivityButtonView = React.memo(function ActionOpera
             >
                 <View style={styles.glyph}>
                     <Icon name="pulse" size={props.iconSize ?? ICON_SIZE.md} color={tintColor} />
-                    {activeCount > 0 ? (
-                        <TabBadge testID="action-operation-activity-count" variant="count" value={activeCount} tone="neutral" />
+                    {props.activeCount > 0 ? (
+                        <TabBadge testID="action-operation-activity-count" variant="count" value={props.activeCount} tone="neutral" />
                     ) : (
                         <TabBadge testID="action-operation-activity-attention-dot" variant="dot" />
                     )}
                 </View>
             </Pressable>
-            {open ? (
-                <Popover
-                    open={true}
-                    anchorRef={anchorRef}
-                    anchor={webAnchorRect ? {
-                        kind: 'rect',
-                        rect: webAnchorRect,
-                        coordinateSpace: 'window',
-                    } : undefined}
-                    boundaryRef={null}
-                    placement="bottom"
-                    edgePadding={{ horizontal: 12, vertical: 12 }}
-                    portal={{ web: { target: 'body' }, native: true, matchAnchorWidth: false, anchorAlign: 'end' }}
-                    maxWidthCap={420}
-                    maxHeightCap={560}
-                    onRequestClose={() => setOpen(false)}
-                >
-                    {({ maxHeight, maxWidth }) => (
-                        <FloatingOverlay
-                            maxHeight={Math.min(maxHeight, 560)}
-                            edgeFades={{ top: true, bottom: true, size: 18 }}
-                            edgeIndicators={true}
-                            surfaceChrome="theme"
-                            containerStyle={{ width: Math.min(maxWidth, 400) }}
-                        >
-                            <ActionOperationLedger
-                                operations={props.operations}
-                                observationForOperation={props.observationForOperation}
-                                contextForOperation={props.contextForOperation}
-                                onOpenOperation={handleOpenOperation}
-                                onCancelOperation={handleCancelOperation}
-                                canDismissOperation={props.canDismissOperation}
-                                onDismissOperation={props.onDismissOperation}
-                                preferredSessionId={props.preferredSessionId}
-                                showEmptyState={false}
-                                onClearRecent={props.onClearRecent ? handleClearRecent : undefined}
-                            />
-                            <View style={styles.popoverBottomInset} />
-                        </FloatingOverlay>
-                    )}
-                </Popover>
-            ) : null}
+            {open ? props.renderDetails({
+                anchorRef,
+                anchor: webAnchorRect ? {
+                    kind: 'rect',
+                    rect: webAnchorRect,
+                    coordinateSpace: 'window',
+                } : undefined,
+                onRequestClose: handleRequestClose,
+            }) : null}
         </View>
+    );
+});
+
+type ActionOperationActivityDetailsViewProps = Pick<
+    ActionOperationActivityButtonViewProps,
+    | 'operations'
+    | 'preferredSessionId'
+    | 'observationForOperation'
+    | 'contextForOperation'
+    | 'onOpenOperation'
+    | 'onMarkVisibleTerminalSeen'
+    | 'onClearRecent'
+    | 'canDismissOperation'
+    | 'onDismissOperation'
+> & ActionOperationActivityPopoverPlacement;
+
+const ActionOperationActivityDetailsView = React.memo(function ActionOperationActivityDetailsView(
+    props: ActionOperationActivityDetailsViewProps,
+) {
+    React.useEffect(() => {
+        props.onMarkVisibleTerminalSeen();
+    }, [props.onMarkVisibleTerminalSeen, props.operations]);
+
+    const handleOpenOperation = React.useCallback((operationId: string) => {
+        props.onRequestClose();
+        props.onOpenOperation(operationId);
+    }, [props.onOpenOperation, props.onRequestClose]);
+    const handleCancelOperation = React.useCallback(async (operationId: string) => {
+        const operation = props.operations.find((candidate) => candidate.operationId === operationId);
+        if (!operation) return;
+        await requestActionOperationStop(operation);
+    }, [props.operations]);
+    const handleClearRecent = React.useCallback(() => {
+        props.onClearRecent?.();
+        props.onRequestClose();
+    }, [props.onClearRecent, props.onRequestClose]);
+
+    return (
+        <Popover
+            open={true}
+            anchorRef={props.anchorRef}
+            anchor={props.anchor}
+            boundaryRef={null}
+            placement="bottom"
+            edgePadding={{ horizontal: 12, vertical: 12 }}
+            portal={{ web: { target: 'body' }, native: true, matchAnchorWidth: false, anchorAlign: 'end' }}
+            maxWidthCap={420}
+            maxHeightCap={560}
+            onRequestClose={props.onRequestClose}
+        >
+            {({ maxHeight, maxWidth }) => (
+                <FloatingOverlay
+                    maxHeight={Math.min(maxHeight, 560)}
+                    edgeFades={{ top: true, bottom: true, size: 18 }}
+                    edgeIndicators={true}
+                    surfaceChrome="theme"
+                    containerStyle={{ width: Math.min(maxWidth, 400) }}
+                >
+                    <ActionOperationLedger
+                        operations={props.operations}
+                        observationForOperation={props.observationForOperation}
+                        contextForOperation={props.contextForOperation}
+                        onOpenOperation={handleOpenOperation}
+                        onCancelOperation={handleCancelOperation}
+                        canDismissOperation={props.canDismissOperation}
+                        onDismissOperation={props.onDismissOperation}
+                        preferredSessionId={props.preferredSessionId}
+                        showEmptyState={false}
+                        onClearRecent={props.onClearRecent ? handleClearRecent : undefined}
+                    />
+                    <View style={styles.popoverBottomInset} />
+                </FloatingOverlay>
+            )}
+        </Popover>
+    );
+});
+
+export const ActionOperationActivityButtonView = React.memo(function ActionOperationActivityButtonView(
+    props: ActionOperationActivityButtonViewProps,
+) {
+    const activeCount = props.activeCount ?? props.operations.reduce(
+        (count, operation) => count + (
+            (operation.state === 'accepted' || operation.state === 'running')
+            && props.observationForOperation(operation) !== 'status_unavailable'
+                ? 1
+                : 0
+        ),
+        0,
+    );
+    const renderDetails = React.useCallback((placement: ActionOperationActivityPopoverPlacement) => (
+        <ActionOperationActivityDetailsView
+            {...placement}
+            operations={props.operations}
+            preferredSessionId={props.preferredSessionId}
+            observationForOperation={props.observationForOperation}
+            contextForOperation={props.contextForOperation}
+            onOpenOperation={props.onOpenOperation}
+            onMarkVisibleTerminalSeen={props.onMarkVisibleTerminalSeen}
+            onClearRecent={props.onClearRecent}
+            canDismissOperation={props.canDismissOperation}
+            onDismissOperation={props.onDismissOperation}
+        />
+    ), [
+        props.canDismissOperation,
+        props.contextForOperation,
+        props.observationForOperation,
+        props.onClearRecent,
+        props.onDismissOperation,
+        props.onMarkVisibleTerminalSeen,
+        props.onOpenOperation,
+        props.operations,
+        props.preferredSessionId,
+    ]);
+    return (
+        <ActionOperationActivityButtonChrome
+            activeCount={activeCount}
+            hasAttention={props.hasAttention}
+            renderDetails={renderDetails}
+            tintColor={props.tintColor}
+            buttonSize={props.buttonSize}
+            iconSize={props.iconSize}
+            testID={props.testID}
+        />
+    );
+});
+
+const ActionOperationActivityDetails = React.memo(function ActionOperationActivityDetails(
+    props: ActionOperationActivityPopoverPlacement & Readonly<{ preferredSessionId?: string | null }>,
+) {
+    const model = useActionOperationActivityModel();
+    return (
+        <ActionOperationActivityDetailsView
+            {...props}
+            operations={model.operations}
+            preferredSessionId={props.preferredSessionId}
+            observationForOperation={model.observationForOperation}
+            contextForOperation={model.contextForOperation}
+            onOpenOperation={openActionOperationDetail}
+            onMarkVisibleTerminalSeen={model.markVisibleTerminalSeen}
+            onClearRecent={model.clearRecent}
+            canDismissOperation={model.canDismissOperation}
+            onDismissOperation={model.dismissOperation}
+        />
     );
 });
 
@@ -179,20 +284,19 @@ export const ActionOperationActivityButton = React.memo(function ActionOperation
     iconSize?: number;
     testID?: string;
 }>) {
-    const { markVisibleTerminalSeen, clearRecent, canDismissOperation, dismissOperation, ...model } = useActionOperationActivityModel();
+    const accountId = useActiveServerAccountScope()?.accountId ?? '';
+    const summary = useActionOperationActivitySummary(accountId);
+    const renderDetails = React.useCallback((placement: ActionOperationActivityPopoverPlacement) => (
+        <ActionOperationActivityDetails {...placement} preferredSessionId={props.preferredSessionId} />
+    ), [props.preferredSessionId]);
     return (
-        <ActionOperationActivityButtonView
-            {...model}
-            preferredSessionId={props.preferredSessionId}
+        <ActionOperationActivityButtonChrome
+            {...summary}
+            renderDetails={renderDetails}
             tintColor={props.tintColor}
             buttonSize={props.buttonSize}
             iconSize={props.iconSize}
             testID={props.testID}
-            onOpenOperation={openActionOperationDetail}
-            onMarkVisibleTerminalSeen={markVisibleTerminalSeen}
-            onClearRecent={clearRecent}
-            canDismissOperation={canDismissOperation}
-            onDismissOperation={dismissOperation}
         />
     );
 });

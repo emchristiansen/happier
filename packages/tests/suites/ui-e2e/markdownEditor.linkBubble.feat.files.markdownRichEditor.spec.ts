@@ -26,7 +26,7 @@ const run = createRunDirs({ runLabel: 'ui-e2e' });
 const originalUrl = 'https://github.com';
 const updatedUrl = 'https://example.com/e2e-updated';
 
-async function clickEditorLink(params: Readonly<{
+async function openEditorLinkBubble(params: Readonly<{
   page: Page;
   proseMirror: Locator;
   href: string;
@@ -44,12 +44,17 @@ async function clickEditorLink(params: Readonly<{
     try {
       await expect(bubbleSurface).toHaveCount(1, { timeout: 1_500 });
       await expect(bubbleUrl).toContainText(params.href, { timeout: 1_500 });
+      await params.page.getByTestId('markdown-link-bubble:edit').click({ trial: true, timeout: 1_500 });
       return true;
     } catch {
       await params.page.keyboard.press('Escape').catch(() => {});
       return false;
     }
   };
+
+  // Opening the URL keeps the bubble active. Clicking the editor again would
+  // dismiss it, and its exiting DOM must not be mistaken for an open bubble.
+  if (await bubbleSurface.count() > 0 && await waitForBubble()) return;
 
   await params.proseMirror.focus();
   const y = box.y + (box.height / 2);
@@ -122,9 +127,6 @@ test.describe('UI e2e: markdown rich editor link bubble', () => {
       extraEnv: {
         HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys',
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
         HAPPIER_E2E_PROVIDER_SKIP_SERVER_SHARED_DEPS_BUILD: '1',
         HAPPIER_E2E_PROVIDER_SKIP_SERVER_GENERATE: '1',
         HAPPIER_E2E_PROVIDER_USE_SERVER_SOURCE_ENTRYPOINT: '1',
@@ -153,7 +155,7 @@ test.describe('UI e2e: markdown rich editor link bubble', () => {
   test('opens, edits, saves, and unlinks a markdown link from the rich editor bubble', async ({
     page,
   }) => {
-    test.setTimeout(600_000);
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
     const browserDiagnostics = collectBrowserDiagnostics({ page });
@@ -198,7 +200,7 @@ test.describe('UI e2e: markdown rich editor link bubble', () => {
       });
 
       await installWindowOpenSpy(page);
-      await clickEditorLink({ page, proseMirror: opened.proseMirror, href: originalUrl });
+      await openEditorLinkBubble({ page, proseMirror: opened.proseMirror, href: originalUrl });
       await expectLinkBubble(page, originalUrl);
       await page.getByTestId('markdown-link-bubble:open').click();
       await expect
@@ -207,7 +209,7 @@ test.describe('UI e2e: markdown rich editor link bubble', () => {
         })
         .toBe(true);
 
-      await clickEditorLink({ page, proseMirror: opened.proseMirror, href: originalUrl });
+      await openEditorLinkBubble({ page, proseMirror: opened.proseMirror, href: originalUrl });
       await expectLinkBubble(page, originalUrl);
       await page.getByTestId('markdown-link-bubble:edit').click();
       const editInput = page.getByTestId('markdown-link-bubble:edit-input:input');
@@ -222,7 +224,7 @@ test.describe('UI e2e: markdown rich editor link bubble', () => {
         .toContain(`[GitHub](${updatedUrl})`);
 
       const reopened = await enterMarkdownRichEditorEditMode(page);
-      await clickEditorLink({ page, proseMirror: reopened.proseMirror, href: updatedUrl });
+      await openEditorLinkBubble({ page, proseMirror: reopened.proseMirror, href: updatedUrl });
       await expectLinkBubble(page, updatedUrl);
       await page.getByTestId('markdown-link-bubble:unlink').click();
       await expect(page.getByTestId('markdown-link-bubble:surface')).toHaveCount(0, { timeout: 60_000 });

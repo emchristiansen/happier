@@ -1,4 +1,5 @@
 import React, { useCallback } from 'react';
+import { useSessionArchivePending } from '@/hooks/session/useSessionArchivePending';
 import { View } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { Typography } from '@/constants/Typography';
@@ -66,7 +67,7 @@ import { completeSessionForkNavigation } from '@/components/sessions/transcript/
 import { createSessionActionTarget } from '@/components/sessions/actions/sessionActionContext';
 import { useSessionAttentionStandingInputs } from '@/hooks/session/useSessionAttentionStandingInputs';
 import { resolveSessionAttentionStanding } from '@/sync/domains/session/organization/attentionStanding';
-import { executeSessionAction } from '@/components/sessions/actions/sessionActionExecution';
+import { confirmSessionStop, executeSessionAction } from '@/components/sessions/actions/sessionActionExecution';
 import {
     SESSION_ACTION_ARCHIVE_ID,
     SESSION_ACTION_DELETE_ID,
@@ -737,8 +738,8 @@ function SessionInfoContent({ session, sessionServerId, sourceMachineIdForHandof
     }), [theme.colors.state.danger.foreground]);
     const archiveInfoItemProps = React.useMemo(() => createSessionActionInfoItemProps({
         actionId: SESSION_ACTION_ARCHIVE_ID,
-        iconColor: theme.colors.state.danger.foreground,
-    }), [theme.colors.state.danger.foreground]);
+        iconColor: theme.colors.accent.blue,
+    }), [theme.colors.accent.blue]);
     const deleteInfoItemProps = React.useMemo(() => createSessionActionInfoItemProps({
         actionId: SESSION_ACTION_DELETE_ID,
         iconColor: theme.colors.state.danger.foreground,
@@ -854,30 +855,23 @@ function SessionInfoContent({ session, sessionServerId, sourceMachineIdForHandof
     const [stoppingSession, performStop] = useHappyAction(handleStopAndMaybeArchive);
 
     const handleStopSession = useCallback(async () => {
-        const confirmed = await Modal.confirm(
-            t('sessionInfo.stopSession'),
-            t('sessionInfo.stopSessionConfirm'),
-            {
-                cancelText: t('common.cancel'),
-                confirmText: t('sessionInfo.stopSession'),
-                destructive: true,
-            },
-        );
-        if (!confirmed) return;
+        if (!await confirmSessionStop()) return;
         await performStop();
     }, [performStop]);
 
     const handleArchive = useCallback(async () => {
-        await executeSessionAction({
+        const result = await executeSessionAction({
             actionId: SESSION_ACTION_ARCHIVE_ID,
             target: sessionActionTarget,
             context: {
                 hideInactiveSessions,
             },
         });
+        if (result === false) return;
         handleExitAfterSessionMutation();
     }, [handleExitAfterSessionMutation, hideInactiveSessions, sessionActionTarget]);
     const [archivingSession, performArchive] = useHappyAction(handleArchive);
+    const archivePending = useSessionArchivePending(session.id, scopedMutationServerId);
 
     // A launcher only, exactly like the Session header: strategy is chosen
     // before any fork effect is issued, from every UI entry point.
@@ -955,16 +949,6 @@ function SessionInfoContent({ session, sessionServerId, sourceMachineIdForHandof
     const [handingOffSession, performHandoff] = useHappyAction(handleHandoffAction);
 
     const handleArchiveSession = useCallback(async () => {
-        const confirmed = await Modal.confirm(
-            t('sessionInfo.archiveSession'),
-            t('sessionInfo.archiveSessionConfirm'),
-            {
-                cancelText: t('common.cancel'),
-                confirmText: t('sessionInfo.archiveSession'),
-                destructive: true,
-            },
-        );
-        if (!confirmed) return;
         await performArchive();
     }, [performArchive]);
 
@@ -1238,13 +1222,14 @@ function SessionInfoContent({ session, sessionServerId, sourceMachineIdForHandof
                             {...stopInfoItemProps}
                             onPress={handleStopSession}
                             loading={stoppingSession}
+                            disabled={archivePending}
                         />
                     )}
                     {canArchiveSession && archiveInfoItemProps && (
                         <Item
                             {...archiveInfoItemProps}
                             onPress={handleArchiveSession}
-                            loading={archivingSession}
+                            loading={archivingSession || archivePending}
                         />
                     )}
                     {canDeleteSession && deleteInfoItemProps && (

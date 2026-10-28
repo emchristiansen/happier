@@ -8,6 +8,7 @@ import {
 } from '../../prompts/codingPromptBehaviorV1.js';
 import {
   ConnectedServicesDefaultAuthByAgentIdV1Schema,
+  ConnectedServicesAdditionalDefaultAuthByAgentIdV1Schema,
   ConnectedServicesProviderStateSharingSettingsV1Schema,
   DEFAULT_CONNECTED_SERVICES_DEFAULT_AUTH_BY_AGENT_ID_V1,
   DEFAULT_CONNECTED_SERVICES_PROVIDER_STATE_SHARING_SETTINGS_V1,
@@ -22,6 +23,7 @@ import {
   type NotificationChannelsV1,
 } from './notificationChannels.js';
 import { SESSION_PERMISSION_MODES } from '../../sessionMetadata/sessionPermissionModes.js';
+import { ClientEncryptionRequirementSchema } from '../../encryption/clientEncryptionRequirement.js';
 
 function rekeyLegacyBuiltInAgentMap<T>(raw: unknown): Record<string, T> {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
@@ -63,6 +65,8 @@ export const NotificationsSettingsV1Schema = z.preprocess(
     connectedServiceQuotaBlocked: z.boolean().default(true),
     connectedServiceQuotaRecovered: z.boolean().default(true),
     foregroundBehavior: ForegroundBehaviorSchema.default('full'),
+    // Missing on released clients: keep phone push delivery enabled.
+    mutePhoneWhenComputerFocused: z.boolean().optional(),
   })
   .catch({
     v: 1,
@@ -367,6 +371,7 @@ export const AccountSettingsSchema = z.preprocess(
         .min(0)
         .catch(ACCOUNT_SETTINGS_SUPPORTED_SCHEMA_VERSION)
         .default(ACCOUNT_SETTINGS_SUPPORTED_SCHEMA_VERSION),
+      clientEncryptionRequirementV1: ClientEncryptionRequirementSchema,
       backendEnabledByTargetKey: BackendEnabledByTargetKeySchema.default({}),
       backendCliSourcePreferenceByTargetKey: BackendCliSourcePreferenceByTargetKeySchema,
       scmIncludeCoAuthoredBy: z.boolean().optional().catch(undefined),
@@ -380,6 +385,9 @@ export const AccountSettingsSchema = z.preprocess(
       ),
       sessionAgentSpawnPolicyV1: SessionAgentSpawnPolicyV1Schema.default(DEFAULT_SESSION_AGENT_SPAWN_POLICY_V1),
       connectedServicesDefaultAuthByAgentIdV1: ConnectedServicesDefaultAuthByAgentIdV1Schema.default(
+        DEFAULT_CONNECTED_SERVICES_DEFAULT_AUTH_BY_AGENT_ID_V1,
+      ),
+      connectedServicesAdditionalDefaultAuthByAgentIdV1: ConnectedServicesAdditionalDefaultAuthByAgentIdV1Schema.default(
         DEFAULT_CONNECTED_SERVICES_DEFAULT_AUTH_BY_AGENT_ID_V1,
       ),
       connectedServicesProviderStateSharingSettingsV1:

@@ -131,8 +131,8 @@ describe('createAcpRuntime (transcript streaming vNext)', () => {
     backend.emit({ type: 'model-output', textDelta: 'Final answer.' } satisfies AgentMessage);
     backend.emit({ type: 'model-output', fullText: finalSnapshot, fullTextScope: snapshotScope } satisfies AgentMessage);
 
-    expect(tracker.getPreview()).toBe('Progress update.Final answer.');
-    await runtime.flushTurn();
+    await expect.poll(() => tracker.getPreview()).toBe('Progress update.Final answer.');
+    await expect(runtime.flushTurn()).resolves.toEqual({ assistantText: 'Progress update.Final answer.' });
 
     const completedAssistantMessages = durableCalls.flatMap((call) => {
       const streamMeta = call.meta?.happierStreamSegmentV1;
@@ -169,8 +169,57 @@ describe('createAcpRuntime (transcript streaming vNext)', () => {
       fullTextScope: 'segment',
     } satisfies AgentMessage);
 
-    expect(tracker.getPreview()).toBe('Shared prefixShared prefix continued');
+    await expect.poll(() => tracker.getPreview()).toBe('Shared prefixShared prefix continued');
     await runtime.flushTurn();
+  });
+
+  it.each([
+    { boundary: { type: 'tool-call', toolName: 'Read', args: {}, callId: 'tool-1' } satisfies AgentMessage },
+    { boundary: { type: 'status', status: 'running' } satisfies AgentMessage },
+  ])('replaces a corrected segment after $boundary.type in both the preview and its durable transcript row', async ({ boundary }) => {
+    const backend = createFakeAcpRuntimeBackend({ sessionId: 'sess_main' });
+    const tracker = createTurnAssistantPreviewTracker();
+    const persisted = new Map<string, ACPMessageData>();
+    const messageBuffer = new MessageBuffer();
+    const runtime = createAcpRuntime({
+      provider: 'pi',
+      directory: '/tmp',
+      session: createBasicSessionClientWithOverrides({
+        sendAgentMessageCommitted: async (_provider, body, opts) => {
+          persisted.set(opts.localId, body);
+        },
+      }),
+      messageBuffer,
+      mcpServers: {},
+      permissionHandler: createApprovedPermissionHandler(),
+      onThinkingChange: () => {},
+      ensureBackend: async () => backend,
+      turnAssistantPreviewTracker: tracker,
+    });
+    await runtime.startOrLoad({});
+    runtime.beginTurn();
+    backend.emit({ type: 'model-output', fullText: 'retained artifact', fullTextScope: 'segment' });
+    backend.emit(boundary);
+    backend.emit({ type: 'model-output', textDelta: 'draft' });
+    let draftId: string | undefined;
+    if (boundary.type === 'tool-call') {
+      await vi.waitFor(() => expect([...persisted.values()]).toContainEqual(
+        expect.objectContaining({ type: 'message', message: 'draft' }),
+      ));
+      draftId = [...persisted].find(([, body]) => body.type === 'message' && body.message === 'draft')?.[0];
+      expect(draftId).toBeDefined();
+    }
+    backend.emit({ type: 'model-output', fullText: 'corrected', fullTextScope: 'segment' });
+    await expect.poll(() => tracker.getPreview()).toBe('retained artifactcorrected');
+    await runtime.flushTurn();
+
+    expect(messageBuffer.getMessages().filter((message) => message.type === 'assistant').map((message) => message.content))
+      .toEqual(['retained artifactcorrected']);
+    expect([...persisted.values()]).toEqual([
+      expect.objectContaining({ type: 'message', message: 'retained artifact' }),
+      expect.objectContaining({ type: 'message', message: 'corrected' }),
+    ]);
+    if (draftId) expect(persisted.get(draftId)).toMatchObject({ type: 'message', message: 'corrected' });
   });
 
   it('closes an unflushed assistant segment before the next turn can append output', async () => {

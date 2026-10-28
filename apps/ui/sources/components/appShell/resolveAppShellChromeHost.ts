@@ -1,13 +1,11 @@
 export type AppShellChromeHost =
     | 'none'
-    | 'web-top-right'
     | 'unauth-shell'
     | 'narrow-desktop-fallback';
 
 export type ResolveAppShellChromeHostParams = Readonly<{
     isAuthenticated: boolean;
     isDesktopPetOverlayWindow: boolean;
-    isWeb: boolean;
     isTauriDesktop: boolean;
     isTablet: boolean;
     isTerminalConnectRoute: boolean;
@@ -18,10 +16,6 @@ export function resolveAppShellChromeHost(
 ): AppShellChromeHost {
     if (params.isTerminalConnectRoute || params.isDesktopPetOverlayWindow) {
         return 'none';
-    }
-
-    if (!params.isTauriDesktop && params.isWeb) {
-        return 'web-top-right';
     }
 
     if (!params.isTauriDesktop) {

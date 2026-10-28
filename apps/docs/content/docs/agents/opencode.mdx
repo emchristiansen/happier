@@ -8,7 +8,28 @@ This page documents how Happier integrates with **OpenCode** and what matters fo
 ## Requirements
 
 - OpenCode CLI installed on your machine.
-- Binary available on `PATH` (or set `HAPPIER_OPENCODE_PATH`).
+- Binary available on `PATH` as `opencode` or `opencode2` (or set `HAPPIER_OPENCODE_PATH`).
+
+<Callout type="warn">
+  The OpenCode V2 behavior below is in current development source, not Happier CLI 0.2.12 stable.
+  That stable CLI still sends V1 `/session` requests and cannot start OpenCode 2.x sessions.
+</Callout>
+
+Choose **Auto**, **Stable**, or **V2** under **Settings → AI & Agents → AI backends → OpenCode**.
+Auto prefers `opencode`, falls back to `opencode2`, and detects the
+server dialect after startup. Stable always selects the released `opencode` command, but does not
+assume that command is V1: the server health probe still decides whether Happier uses the V1 or V2
+wire contract. V2 prefers `opencode2` when installed and otherwise launches the released `opencode`
+command with V2 selected. Released OpenCode 2.0.15 provides both command names as aliases, so the
+name alone does not prove which API version is installed. The same executable selection applies to managed servers, ACP sessions,
+terminal attach, handoff, and resume helpers.
+
+In current development builds, Happier applies your selected V2 model, reasoning
+effort, and agent mode before opening the TUI, even before the first message.
+Standalone attachment asks the running Happier session to apply those controls
+first; if preparation fails, attachment stops rather than opening with different
+settings. Keep the attaching CLI and running session on a build that supports this
+preparation operation.
 
 ## Install OpenCode
 
@@ -66,6 +87,28 @@ For most users, the important part is:
 
 By default, Happier uses a **managed local OpenCode server** on the machine and reuses it across sessions. Advanced users can set an explicit OpenCode server URL in settings; when you do that, Happier will keep using that explicit server for the session.
 
+The server-native backend negotiates the installed server's V1 or V2 API over the same authenticated connection. Current development source adapts prompts, permissions, questions, transcript events, session diff, and manual compaction to the selected API. OpenCode 2.0.15 exposes different routes and message shapes from V1; selecting a V2 executable alone is not enough for an older Happier CLI to support it.
+
+Happier registers its MCP tools with both V1 and released V2 server-native sessions. V2 registration
+uses OpenCode's experimental MCP API; it is not the removed V1 registration route. ACP sessions
+continue to receive MCP servers through ACP.
+
+When server-native sessions share an OpenCode server, Happier gives each session's injected MCP
+servers distinct internal names. This keeps one session's tool registration from replacing another's,
+including when both select different configurations for the same named MCP server. Happier still
+shows the configured names in its tool timeline; stopping a session disconnects only its own MCP servers.
+
+Released OpenCode 2.0.15 can report a newly registered MCP server as connected before its tools are
+available to a prompt. Its public API provides no tool-catalog readiness signal. An immediate first
+tool call can therefore report an unknown tool; the connection status alone does not prove tool
+readiness. Happier does not hide this upstream race with a fixed startup delay.
+
+Current development source uses the matching connected-account integration for each generation:
+the callable auth plugin for V1 and a `{ id, setup }` request-hook plugin for released V2. Both
+use Happier's existing credential broker. Direct OpenAI/Anthropic API keys use V2's provider
+configuration rather than the removed `OPENCODE_AUTH_CONTENT` mechanism. These changes are not
+present in Happier CLI 0.2.12 stable.
+
 ## Start OpenCode from a terminal
 
 ```bash
@@ -83,23 +126,48 @@ This is useful when you want the provider TUI first, but still want the app to s
 
 ### Detach from the app
 
-If the session is locally attached, the session header in Happier shows **Detach terminal**.
+In current development builds, Happier offers **Detach terminal** when the session
+runner owns an attached OpenCode TUI. OpenCode remains shared-control: this is not
+an exclusive switch away from the app.
 
 Using it:
 
-- switches the session back to **remote** control,
 - keeps the same session id and transcript,
-- leaves the existing terminal open in a read-only/logs-only state until you attach again.
+- closes the runner-owned OpenCode TUI while the Happier session keeps running,
+- keeps the app writable against the same server-backed session.
+
+A separate `happier attach` client stays independent. Close it in its own terminal;
+the app's detach action does not close that client. Its exit also does not detach a
+different TUI owned by the session runner.
+
+In Happier CLI 0.2.16 and later, a client admitted inside its restored Herdr pane after a
+server restart is managed instead: **Detach terminal** closes that native client
+while preserving the restored shell and the same running OpenCode session.
+See [Attach to a running session](/sessions/attach-to-session) for the restoration
+requirements.
 
 You can later run `happier attach <session-id>` from a terminal on the same machine to get back into the OpenCode TUI.
+In current development builds, a session with a terminal host reopens its managed
+TUI in that existing host; attachment does not merely show the waiting Happier
+controller or create a second pane.
 
 ## Start OpenCode from the app
 
 If you start a new OpenCode session from the Happier app:
 
-- Happier starts it in **remote/server-only** mode in the background,
+- without a terminal host selected, Happier starts it in **remote/server-only** mode in the background,
 - the app can use the session immediately,
 - no terminal needs to be open yet.
+
+In current development builds, selecting a supported terminal host for new sessions opens OpenCode's TUI there automatically, against the same server-backed session. Selecting no host keeps the background behavior described above.
+
+With OpenCode V2, these builds also apply idle model, reasoning, and agent-mode changes
+to the running native session without requiring another prompt. With V1, changes are
+staged for the next prompt sent through Happier; they do not update an already-attached
+native TUI immediately. Available choices refresh when the server
+reports catalog changes or reconnects. A discovery failure keeps the last known
+choices; a successful empty inventory removes them. Choose a model offered by that
+server: saving an unavailable model in its native session does not make it usable.
 
 Later, on the same machine, you can attach a terminal to that live session with:
 
@@ -109,9 +177,12 @@ happier attach <session-id>
 
 After attaching:
 
-- the session switches into **local/shared control**,
 - the terminal shows the OpenCode TUI,
-- the app still stays connected to the same session and transcript.
+- the app still stays connected and writable against the same session and transcript.
+
+For Happier CLI 0.2.16 and later, a standalone attach client does not advertise an
+app-managed detach action unless the controller admits it as a managed restored
+Herdr client. Close an independent client in its terminal when you are done.
 
 This is the main “start in the app, continue in the terminal” workflow for OpenCode.
 
@@ -125,7 +196,7 @@ That means:
 - **Local mode**: you use the OpenCode TUI in a terminal
 - the transcript stays shared in both modes
 - the session stays writable from the app even when a terminal is attached
-- app messages do not need the same exclusive pending-queue handoff used by Claude and Codex local control
+- app messages do not need the pending-queue handoff used by exclusive local-control paths
 
 In practice, you can:
 
@@ -181,6 +252,11 @@ Important OpenCode notes:
 - Happier maps that intent to the closest OpenCode session permission ruleset,
 - some OpenCode behavior still depends on the installed OpenCode runtime.
 
+OpenCode's Bash tool can require approval even for `ls` or `cat` in `auto` mode.
+Permission rules apply to the tool; Happier does not infer whether an arbitrary
+shell command is read-only. Use OpenCode's native read/search tools when you want
+read-only operations to follow their own tool permissions.
+
 OpenCode can also expose provider-native session modes and model choices. When those are available, Happier surfaces them in the session UI.
 
 For the full user guide, see:
@@ -188,9 +264,28 @@ For the full user guide, see:
 - [Model and engine selection](/agents/model-and-engine-selection)
 - [Permissions](/sessions/permissions)
 
+## Managed OpenCode server credential
+
+OpenCode 2 protects every `opencode serve` with a password: it uses the one supplied in the
+environment, otherwise it generates a random secret at startup. Happier therefore supplies the
+password for the OpenCode server it manages for you:
+
+- If you set `OPENCODE_PASSWORD` (or the legacy `OPENCODE_SERVER_PASSWORD`), Happier starts the
+  managed server with your password and authenticates with it. Changing it starts a separate managed
+  server, because a server can only serve the sessions that authenticate with its own password.
+- Otherwise Happier generates the password for that server, keeps it in the owner-only managed-server
+  state file under `~/.happier/opencode/managed-servers/`, and reuses it for health checks, session
+  requests, and terminals it attaches to that server — including after a daemon restart.
+
+The generated password stays on your machine: it is passed to the server through the environment, is
+never written to Happier's OpenCode server logs, and is never sent to a remote OpenCode endpoint. To
+talk to the managed server yourself, read the password from that state file, or start the server with
+your own `OPENCODE_PASSWORD`.
+
 ## Notes
 
 - Resume availability is session-specific in Happier: the session must have valid OpenCode resume metadata, and your current backend/settings must allow resume.
+- Current development source reconciles exact saved message identities when resuming an existing OpenCode session, so settled native-terminal turns missing from Happier can be recovered without duplicating committed messages. Import identities preserve opaque IDs without delimiter collisions; older import identities require a separate matching native-session identity. If older history lacks provable identities, Happier reports an incomplete-history notice instead of guessing; those older rows may remain missing, while new native turns continue to sync. Failed or malformed history reads are not treated as empty history. These corrections are not available in CLI 0.2.12 stable.
 - Attach availability is also session-specific: the session must have the metadata/context Happier needs to reopen that OpenCode session locally.
 - Model, mode, and permission behavior can still vary by installed OpenCode runtime.
 - Tool events are normalized into Happier’s canonical tool timeline.
@@ -200,9 +295,12 @@ For the full user guide, see:
 
 If OpenCode is not detected:
 
-1. Verify `opencode --version` works.
-2. Restart Happier.
-3. Set `HAPPIER_OPENCODE_PATH` if your binary is not in PATH.
+1. Verify `opencode --version` or `opencode2 --version` works.
+2. Restart the Happier daemon after installing OpenCode or changing PATH:
+   `happier daemon restart`. A running daemon retains the environment it started with.
+3. Set `HAPPIER_OPENCODE_PATH` to the executable before starting the daemon if your
+   binary is not in its PATH. Current development source also checks
+   `~/.local/bin` for user-local installations.
 
 ### The session is visible in the app but I want the TUI again
 
@@ -216,7 +314,8 @@ Do this on the same machine and against the same Happier account/server profile 
 
 ### The terminal is open but no longer accepts prompts
 
-This usually means the session was detached back to remote mode from Happier. Reattach with `happier attach <session-id>` from a terminal on the same machine.
+If Happier detached its managed TUI, the session can still accept messages from the
+app. Reattach with `happier attach <session-id>` from a terminal on the same machine.
 
 ## Related
 

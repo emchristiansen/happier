@@ -56,7 +56,7 @@ installCodeBlockCommonModuleMocks({
 });
 
 vi.mock('expo-clipboard', () => ({
-    setStringAsync: vi.fn(async () => {}),
+    setStringAsync: vi.fn(async () => true),
 }));
 
 const featureSpy = vi.fn((id: string) => (id === 'files.diffSyntaxHighlighting' || id === 'files.syntaxHighlighting.advanced'));

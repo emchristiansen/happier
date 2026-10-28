@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 
+import { createDeferred } from '@/dev/testkit';
 import { storage } from '@/sync/domains/state/storage';
 import type { ServerAccountScope } from '@/sync/domains/scope/serverAccountScope';
 import type { DiscardedPendingMessage } from '@/sync/domains/state/storageTypes';
@@ -53,12 +54,13 @@ const withOutboxScope = <T extends { outboxScope: ServerAccountScope }>(
 ) => (params: Omit<T, 'outboxScope'>) =>
     // Test adapter restores the one deliberately omitted required boundary field.
     fn({ ...params, outboxScope } as T);
+const isCurrentPendingScope = () => true;
 const fetchAndApplyPendingMessagesV2 = (
     params: Omit<Parameters<typeof fetchAndApplyPendingMessagesV2Impl>[0], 'outboxScope'>,
 ) => fetchAndApplyPendingMessagesV2Impl({
     ...params,
     outboxScope,
-    isOutboxScopeCurrent: params.isOutboxScopeCurrent ?? (() => true),
+    isOutboxScopeCurrent: params.isOutboxScopeCurrent ?? isCurrentPendingScope,
 });
 const deletePendingMessageV2 = withOutboxScope(deletePendingMessageV2Impl);
 const discardPendingMessageV2 = withOutboxScope(discardPendingMessageV2Impl);
@@ -119,6 +121,169 @@ describe('pendingQueueV2 error handling', () => {
     beforeEach(() => {
         resetPendingQueueState();
     });
+
+    it.each([
+        { name: 'discard', mutate: discardPendingMessageV2 },
+        { name: 'handled delivery', mutate: markPendingDeliveryHandledV2 },
+    ])('does not restore a row from a held pre-write snapshot after successful $name', async ({ mutate }) => {
+        const sessionId = 's_pending_retirement_snapshot';
+        const localId = 'retired-local-id';
+        const freshLocalId = 'new-server-row-after-write';
+        const rawRecord = { role: 'user' as const, content: { type: 'text' as const, text: 'retire this row' }, meta: {} };
+        storage.getState().applySessions([buildSession({ sessionId, overrides: { encryptionMode: 'plain', pendingVersion: 1 } })]);
+        storage.getState().upsertPendingMessage(sessionId, {
+            id: localId, localId, createdAt: 1, updatedAt: 1,
+            source: 'server_pending', deliveryStatus: 'accepted', pendingDeliveryStatus: 'server_queued',
+            text: rawRecord.content.text, rawRecord,
+        });
+        const encryption = await createPendingQueueEncryption({ sessionId });
+        const readStarted = createDeferred<void>();
+        const oldRead = createDeferred<Response>();
+        const retired = createDeferred<void>();
+        const unsubscribe = storage.subscribe((state) => {
+            if (!(state.sessionPending[sessionId]?.messages ?? []).some((message) => message.localId === localId)) {
+                retired.resolve();
+            }
+        });
+        let firstRead = true;
+        const request = async (_path: string, init?: RequestInit): Promise<Response> => {
+            if (init?.method === 'POST') return Response.json({ ok: true });
+            if (firstRead) {
+                firstRead = false;
+                readStarted.resolve();
+                return oldRead.promise;
+            }
+            return Response.json({ pending: [{
+                localId: freshLocalId, content: { t: 'plain', v: rawRecord }, requestedAction: { v: 1, kind: 'enqueue' },
+                status: 'queued', position: 0, createdAt: 2, updatedAt: 2,
+            }] });
+        };
+        const refresh = fetchAndApplyPendingMessagesV2({ sessionId, encryption, request });
+        await readStarted.promise;
+        const mutation = mutate({ sessionId, pendingId: localId, encryption, request, isOutboxScopeCurrent: isCurrentPendingScope });
+        try {
+            await retired.promise;
+            oldRead.resolve(Response.json({ pending: [{
+                localId, content: { t: 'plain', v: rawRecord }, requestedAction: { v: 1, kind: 'enqueue' },
+                status: 'queued', position: 0, createdAt: 1, updatedAt: 1,
+            }] }));
+            await Promise.all([refresh, mutation]);
+            expect(storage.getState().sessionPending[sessionId]?.messages ?? []).toEqual([
+                expect.objectContaining({ localId: freshLocalId }),
+            ]);
+        } finally {
+            unsubscribe();
+        }
+    });
+
+    it('invalidates a pre-write snapshot as soon as requested-action PATCH succeeds while its body is still pending', async () => {
+        const sessionId = 's_pending_action_response_body';
+        const localId = 'action-local-id';
+        const rawRecord = { role: 'user' as const, content: { type: 'text' as const, text: 'send this row now' }, meta: {} };
+        storage.getState().applySessions([buildSession({ sessionId, overrides: { encryptionMode: 'plain', pendingVersion: 1 } })]);
+        storage.getState().upsertPendingMessage(sessionId, {
+            id: localId, localId, createdAt: 1, updatedAt: 1,
+            source: 'server_pending', deliveryStatus: 'accepted', pendingDeliveryStatus: 'server_queued',
+            requestedAction: { v: 1, kind: 'enqueue' }, text: rawRecord.content.text, rawRecord,
+        });
+        const encryption = await createPendingQueueEncryption({ sessionId });
+        const readStarted = createDeferred<void>();
+        const oldRead = createDeferred<Response>();
+        const bodyStarted = createDeferred<void>();
+        const body = createDeferred<{ didUpdate: boolean }>();
+        const successfulPatch = Response.json({ didUpdate: true });
+        successfulPatch.json = async () => {
+            bodyStarted.resolve();
+            return body.promise;
+        };
+        const snapshot = (kind: 'enqueue' | 'send_now') => Response.json({ pending: [{
+            localId, content: { t: 'plain', v: rawRecord }, requestedAction: { v: 1, kind },
+            status: 'queued', position: 0, createdAt: 1, updatedAt: 1,
+        }] });
+        let firstRead = true;
+        const request = async (_path: string, init?: RequestInit): Promise<Response> => {
+            if (init?.method === 'PATCH') return successfulPatch;
+            if (firstRead) {
+                firstRead = false;
+                readStarted.resolve();
+                return oldRead.promise;
+            }
+            return snapshot('send_now');
+        };
+        const refresh = fetchAndApplyPendingMessagesV2({ sessionId, encryption, request });
+        await readStarted.promise;
+        const mutation = updatePendingRequestedActionV2({
+            sessionId, localId, requestedAction: { v: 1, kind: 'send_now' }, request,
+        });
+        await bodyStarted.promise;
+        try {
+            const freshRefresh = fetchAndApplyPendingMessagesV2({ sessionId, encryption, request });
+            oldRead.resolve(snapshot('enqueue'));
+            await Promise.all([refresh, freshRefresh]);
+            expect(storage.getState().sessionPending[sessionId]?.messages).toEqual([
+                expect.objectContaining({ localId, requestedAction: { v: 1, kind: 'send_now' } }),
+            ]);
+        } finally {
+            body.resolve({ didUpdate: true });
+            await mutation;
+        }
+    });
+
+    it.each(['requested-action', 'enqueue', 'retry'] as const)(
+        'applies a removal snapshot started while the %s response body is loading', async (operation) => {
+            const sessionId = 's_pending_action_removal_during_body';
+            const localId = 'materialized-action-local-id';
+            storage.getState().applySessions([buildSession({ sessionId, overrides: { encryptionMode: 'plain' } })]);
+            storage.getState().upsertPendingMessage(sessionId, {
+                id: localId, localId, createdAt: 1, updatedAt: 1,
+                source: 'server_pending', deliveryStatus: 'accepted', pendingDeliveryStatus: 'server_queued',
+                text: 'already handled by the agent',
+                rawRecord: { role: 'user', content: { type: 'text', text: 'already handled by the agent' } },
+            });
+            const encryption = await createPendingQueueEncryption({ sessionId });
+            const bodyStarted = createDeferred<void>();
+            const payload = { didUpdate: true, requestedAction: { v: 1, kind: 'enqueue' }, pending: { localId } };
+            const body = createDeferred<typeof payload>();
+            const snapshotStarted = createDeferred<void>();
+            const snapshot = createDeferred<Response>();
+            const successfulResponse = Response.json({ didUpdate: true });
+            successfulResponse.json = async () => {
+                bodyStarted.resolve();
+                return body.promise;
+            };
+            if (operation === 'retry') {
+                await enqueuePendingMessageV2({
+                    sessionId, localId, text: 'already handled by the agent', encryption, outboxScope,
+                    request: async () => { throw new Error('lost enqueue response'); },
+                }).catch(() => undefined);
+            }
+            const request = async () => successfulResponse;
+            const mutation = operation === 'requested-action'
+                ? updatePendingRequestedActionV2({
+                    sessionId, localId, requestedAction: { v: 1, kind: 'send_now' }, request,
+                })
+                : operation === 'enqueue'
+                    ? enqueuePendingMessageV2({
+                        sessionId, localId, text: 'already handled by the agent', encryption, outboxScope, request,
+                    })
+                    : retryPendingOutboxOperationV2({ sessionId, localId, outboxScope, request });
+            await bodyStarted.promise;
+            const refresh = fetchAndApplyPendingMessagesV2({
+                sessionId, encryption,
+                request: async () => {
+                    snapshotStarted.resolve();
+                    return snapshot.promise;
+                },
+            });
+            await snapshotStarted.promise;
+            body.resolve(payload);
+            await mutation;
+            snapshot.resolve(Response.json({ pending: [] }));
+            await refresh;
+
+            expect(storage.getState().sessionPending[sessionId]?.messages).toEqual([]);
+        },
+    );
 
     it('clears discarded messages when the pending fetch fails', async () => {
         const sessionId = 's_test';
@@ -208,6 +373,35 @@ describe('pendingQueueV2 error handling', () => {
             request: async () => {
                 throw timeoutError;
             },
+        })).resolves.toEqual({
+            accepted: false,
+            localId: expect.any(String),
+        });
+
+        expect(storage.getState().sessionPending[sessionId]?.messages ?? []).toEqual([
+            expect.objectContaining({
+                source: 'local_outbound',
+                deliveryStatus: 'queued',
+                text: 'hello',
+            }),
+        ]);
+        expect(storage.getState().sessions[sessionId].optimisticThinkingAt ?? null).toBeNull();
+    });
+
+    it('keeps the local pending row when the server reports retryable transaction backpressure', async () => {
+        const sessionId = 's_test_enqueue_transaction_unavailable';
+        storage.getState().applySessions([buildSession({ sessionId, overrides: { encryptionMode: 'plain' } })]);
+        const encryption = await createPendingQueueEncryption({ sessionId, seedByte: 11 });
+
+        await expect(enqueuePendingMessageV2({
+            sessionId,
+            text: 'hello',
+            encryption,
+            outboxScope,
+            request: async () => new Response(
+                JSON.stringify({ error: 'transaction-unavailable', retryAfterMs: 1_000 }),
+                { status: 503, headers: { 'Retry-After': '1' } },
+            ),
         })).resolves.toEqual({
             accepted: false,
             localId: expect.any(String),

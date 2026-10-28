@@ -154,10 +154,16 @@ test('npm-e2e-smoke admits the read-only mounted monorepo before hstack clones i
   const entrypointPath = join(smokeDir, 'bin', 'stack-entrypoint.sh');
   const raw = await readFile(entrypointPath, 'utf8');
   const safeDirectory = 'git config --global --add safe.directory "$HSTACK_HAPPIER_REPO"';
+  const safeGitDirectory = 'git config --global --add safe.directory "$HSTACK_HAPPIER_REPO/.git"';
   assert.match(raw, /git config --global --add safe\.directory "\$HSTACK_HAPPIER_REPO"/);
+  assert.ok(raw.includes(safeGitDirectory), 'expected the mounted clone source /repo/.git to be admitted too');
   assert.ok(
     raw.indexOf(safeDirectory) < raw.indexOf('"${HSTACK_PREFIX[@]}" "${setup_args[@]}"'),
     'expected the mounted repository to be admitted before hstack setup asks Git to clone it',
+  );
+  assert.ok(
+    raw.indexOf(safeGitDirectory) < raw.indexOf('"${HSTACK_PREFIX[@]}" "${setup_args[@]}"'),
+    'expected the mounted .git clone source to be admitted before hstack setup',
   );
 });
 

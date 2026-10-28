@@ -3,6 +3,9 @@ import {
     SessionTurnMutationV1Schema,
     SessionTurnsProjectionV1Schema,
     buildSessionTurnsProjectionV1,
+    CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY,
+    projectSessionRuntimeIssueForReader,
+    readConnectedServiceReaderSupport,
 } from "@happier-dev/protocol";
 import { z } from "zod";
 
@@ -69,6 +72,7 @@ export function registerSessionTurnRoutes(app: Fastify) {
     app.get("/v1/sessions/:sessionId/turns", {
         preHandler: app.authenticate,
         schema: {
+            querystring: z.object({ [CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]: z.unknown().optional() }).optional(),
             params: z.object({ sessionId: z.string() }),
             response: {
                 200: SessionTurnsProjectionV1Schema,
@@ -99,11 +103,15 @@ export function registerSessionTurnRoutes(app: Fastify) {
             orderBy: [{ updatedAt: "asc" }, { createdAt: "asc" }],
         }) as SessionTurnStoredRow[];
 
+        const supportedIds = readConnectedServiceReaderSupport(request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]);
         return reply.send(buildSessionTurnsProjectionV1({
             sessionId,
             ...(session.latestTurnId ? { latestTurnId: session.latestTurnId } : {}),
             updatedAt: session.updatedAt.getTime(),
-            turns: parseStoredSessionTurns(rows),
+            turns: parseStoredSessionTurns(rows).map((turn) => ({
+                ...turn,
+                lastRuntimeIssue: projectSessionRuntimeIssueForReader(turn.lastRuntimeIssue, supportedIds),
+            })),
         }));
     });
 }

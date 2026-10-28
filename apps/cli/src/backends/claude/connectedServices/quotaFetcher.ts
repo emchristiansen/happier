@@ -1,9 +1,19 @@
-import type { ConnectedServiceCredentialRecordV1, ConnectedServiceQuotaMeterV1 } from '@happier-dev/protocol';
+import {
+  readClaudeOauthCredentialMetadata,
+  readClaudeOauthCredentialOrganizationId,
+  type ConnectedServiceCredentialRecordV1,
+  type ConnectedServiceQuotaMeterV1,
+} from '@happier-dev/protocol';
 import { createHash } from 'node:crypto';
 
 import { resolveClaudeCodeUserAgent } from '@/backends/claude/utils/claudeCodeUserAgent';
+import { claudeResetRequestId, parseClaudeQuotaResets } from './quotaResets';
+import { logger } from '@/ui/logger';
 
-import { resolveMissingClaudeSubscriptionClaudeCodeScopes } from '@/daemon/connectedServices/descriptors/connectedAccountDescriptors';
+import {
+  fetchClaudeSubscriptionProfileContext,
+  resolveMissingClaudeSubscriptionClaudeCodeScopes,
+} from '@/daemon/connectedServices/descriptors/connectedAccountDescriptors';
 import { isRecord, normalizePct, resolveConnectedServiceQuotaAccountLabel } from '@/daemon/connectedServices/quotas/quotaNormalization';
 import { parseRetryAfterHeader } from '@/daemon/connectedServices/quotas/normalization';
 import {
@@ -58,22 +68,10 @@ function resolveAccountLabel(record: ConnectedServiceCredentialRecordV1): string
   return resolveConnectedServiceQuotaAccountLabel(record);
 }
 
-function normalizePlanLabel(raw: unknown): string | null {
-  if (typeof raw !== 'string') return null;
-  const trimmed = raw.trim();
-  return trimmed ? trimmed : null;
-}
-
 function resolveClaudeSubscriptionPlanLabel(record: ConnectedServiceCredentialRecordV1): string | null {
   if (record.kind !== 'oauth') return null;
-  const raw = isRecord(record.oauth.raw) ? record.oauth.raw : null;
-  const claudeAiOauth = isRecord(raw?.claudeAiOauth)
-    ? raw.claudeAiOauth
-    : isRecord(raw?.['claude.ai_oauth'])
-      ? raw['claude.ai_oauth']
-      : null;
-  return normalizePlanLabel(claudeAiOauth?.rateLimitTier)
-    ?? normalizePlanLabel(claudeAiOauth?.subscriptionType);
+  const metadata = readClaudeOauthCredentialMetadata(record.oauth.raw);
+  return metadata?.rateLimitTier ?? metadata?.subscriptionType ?? null;
 }
 
 function buildCredentialBackoffKey(record: ConnectedServiceCredentialRecordV1): string | null {
@@ -170,6 +168,14 @@ const USAGE_WINDOW_ID_KEYS = [
   'rate_limit_type',
   'rateLimitType',
   'type',
+] as const;
+
+const USAGE_WINDOW_PROVIDER_LIMIT_ID_KEYS = [
+  'provider_limit_id',
+  'providerLimitId',
+  'limit_id',
+  'limitId',
+  'id',
 ] as const;
 
 const USAGE_WINDOW_WINDOW_KEYS = [
@@ -298,7 +304,8 @@ function formatWindowLabelSuffix(raw: string): string {
     .join(' ');
 }
 
-function resolveUsageWindowLabel(meterId: string): string {
+/** Label for a Claude subscription usage window (`five_hour`, `seven_day_*`, …); null for other ids. */
+export function resolveClaudeUsageWindowLabel(meterId: string): string | null {
   const known = WINDOW_LABELS[meterId];
   if (known) return known;
   for (const { prefix, label } of WINDOW_LABEL_PREFIXES) {
@@ -307,7 +314,11 @@ function resolveUsageWindowLabel(meterId: string): string {
       return suffix ? `${label} (${suffix})` : label;
     }
   }
-  return formatWindowLabelSuffix(meterId) || meterId;
+  return null;
+}
+
+function resolveUsageWindowLabel(meterId: string): string {
+  return resolveClaudeUsageWindowLabel(meterId) ?? (formatWindowLabelSuffix(meterId) || meterId);
 }
 
 function readNonEmptyStringProperty(
@@ -360,6 +371,41 @@ function readScopedUsageWindowModel(record: Record<string, unknown>): string | n
     'model_id',
     'modelId',
   ]);
+}
+
+function readScopedUsageWindowModelId(record: Record<string, unknown>): string | null {
+  const direct = readNonEmptyStringProperty(record, ['model_id', 'modelId']);
+  if (direct) return direct;
+  const directModel = record.model;
+  if (typeof directModel === 'string' && directModel.trim()) return directModel.trim();
+  if (isRecord(directModel)) {
+    const id = readNonEmptyStringProperty(directModel, ['id', 'model_id', 'modelId']);
+    if (id) return id;
+  }
+  const scope = isRecord(record.scope) ? record.scope : null;
+  if (!scope) return null;
+  const scopedModel = scope.model;
+  if (typeof scopedModel === 'string' && scopedModel.trim()) return scopedModel.trim();
+  if (isRecord(scopedModel)) return readNonEmptyStringProperty(scopedModel, ['id', 'model_id', 'modelId']);
+  return readNonEmptyStringProperty(scope, ['model_id', 'modelId']);
+}
+
+function readScopedUsageWindowModelDisplayName(record: Record<string, unknown>): string | null {
+  const direct = readNonEmptyStringProperty(record, ['model_display_name', 'modelDisplayName', 'model_name', 'modelName']);
+  if (direct) return direct;
+  const directModel = record.model;
+  if (isRecord(directModel)) {
+    const displayName = readNonEmptyStringProperty(directModel, ['display_name', 'displayName', 'name']);
+    if (displayName) return displayName;
+  }
+  const scope = isRecord(record.scope) ? record.scope : null;
+  if (!scope) return null;
+  const scopedModel = scope.model;
+  if (isRecord(scopedModel)) {
+    const displayName = readNonEmptyStringProperty(scopedModel, ['display_name', 'displayName', 'name']);
+    if (displayName) return displayName;
+  }
+  return readNonEmptyStringProperty(scope, ['model_display_name', 'modelDisplayName', 'model_name', 'modelName']);
 }
 
 function readFiniteNumberProperty(
@@ -486,16 +532,29 @@ function buildUsageWindowMeter(
   const utilizationPct = resolveUsageWindowUtilizationPct(window);
   const used = window ? readFiniteNumberProperty(window, USAGE_WINDOW_USED_KEYS) : null;
   const limit = window ? readFiniteNumberProperty(window, USAGE_WINDOW_LIMIT_KEYS) : null;
+  const providerLimitId = window
+    ? readNonEmptyStringProperty(window, USAGE_WINDOW_PROVIDER_LIMIT_ID_KEYS) ?? meterId
+    : meterId;
+  const modelId = window ? readScopedUsageWindowModelId(window) : null;
+  const modelDisplayName = window ? readScopedUsageWindowModelDisplayName(window) : null;
+  const rawKind = window ? readNonEmptyStringProperty(window, ['kind', 'type']) : null;
   return {
     meterId,
     label: resolveUsageWindowLabel(meterId),
+    ...(meterId === 'seven_day' || meterId.startsWith('seven_day_') ? { windowDurationMs: 604_800_000 }
+      : meterId === 'five_hour' || meterId.startsWith('five_hour_') ? { windowDurationMs: 18_000_000 } : {}),
     used,
     limit,
     unit: resolveUsageWindowUnit(window),
     utilizationPct,
+    providerLimitId,
+    ...(modelId ? { modelId } : {}),
     resetsAt: resolveUsageWindowResetAtMs(window),
     status: utilizationPct === null ? 'unavailable' : 'ok',
-    details: {},
+    details: {
+      ...(rawKind ? { rawScope: rawKind } : {}),
+      ...(modelDisplayName ? { modelDisplayName } : {}),
+    },
   };
 }
 
@@ -580,6 +639,46 @@ export function createClaudeSubscriptionQuotaFetcher(params?: Readonly<{
   const userAgent = resolveClaudeCodeUserAgent(params?.userAgent);
   const nowMs = params?.nowMs ?? (() => Date.now());
   const retryAfterBackoffByCredentialKey = new Map<string, number>();
+  const providerBackoffCredentialKeys = new Set<string>();
+  const resetUsageUrl = new URL(usageUrl);
+  resetUsageUrl.searchParams.set('cedar_ember', '1');
+  resetUsageUrl.searchParams.set('at_wall', '1');
+  resetUsageUrl.searchParams.set('skip_spend', '1');
+
+  function observeRateLimit(response: Response, record: ConnectedServiceCredentialRecordV1, now: number): void {
+    const key = buildCredentialBackoffKey(record);
+    if (!key || response.status !== 429) return;
+    const retryAfter = parseRetryAfterHeader(response.headers?.get?.('retry-after'), { nowMs: nowMs() });
+    retryAfterBackoffByCredentialKey.set(key, now + Math.max(15 * 60_000, retryAfter.retryAfterMs ?? 5 * 60_000));
+    providerBackoffCredentialKeys.add(key);
+  }
+
+  async function fetchProfileContext(record: Extract<ConnectedServiceCredentialRecordV1, { kind: 'oauth' }>, now: number, signal: AbortSignal) {
+    return await fetchClaudeSubscriptionProfileContext({
+      accessToken: record.oauth.accessToken,
+      expectedProviderAccountId: record.oauth.providerAccountId,
+      profileUrl: new URL('./profile', usageUrl).toString(),
+      signal,
+      fetcher: async (url, init) => {
+        const headers = new Headers(init?.headers);
+        headers.set('User-Agent', userAgent);
+        headers.set('anthropic-beta', betaHeaderValue);
+        const response = await fetch(url, { ...init, headers });
+        observeRateLimit(response, record, now);
+        return response;
+      },
+    });
+  }
+
+  async function discoverResets(record: ConnectedServiceCredentialRecordV1, now: number, signal: AbortSignal) {
+    if (record.kind !== 'oauth') return undefined;
+    const response = await fetchUsage({ usageUrl: resetUsageUrl.toString(), accessToken: record.oauth.accessToken,
+      betaHeaderValue, userAgent, signal });
+    observeRateLimit(response, record, now);
+    if (!response.ok) await throwUsageError(response);
+    const payload: unknown = await response.json();
+    return { inventory: parseClaudeQuotaResets(payload, now), payload };
+  }
 
   async function fetchUsage(params: Readonly<{
     usageUrl: string;
@@ -625,9 +724,83 @@ export function createClaudeSubscriptionQuotaFetcher(params?: Readonly<{
       minPollIntervalMs: 30 * 60_000,
       retryAfterBackoffMinMs: 15 * 60_000,
     },
+    consumeRecoveryCredit: async ({ record, now, idempotencyKey, providerCreditId, providerLimitIds, signal }) => {
+      if (record.kind !== 'oauth' || disablePrivateEndpoint) return 'not_available';
+      if (resolveMissingClaudeSubscriptionClaudeCodeScopes(record.oauth.scope).length > 0) {
+        throw createMissingClaudeCodeScopeQuotaError();
+      }
+      const backoffKey = buildCredentialBackoffKey(record);
+      if (backoffKey && providerBackoffCredentialKeys.has(backoffKey)
+        && (retryAfterBackoffByCredentialKey.get(backoffKey) ?? 0) > now) return 'not_available';
+      signal.throwIfAborted();
+      const resets = await discoverResets(record, now, signal);
+      const selected = resets?.inventory?.recoveryCredits.credits.find((credit) => credit.status === 'available'
+        && (!providerCreditId || credit.providerCreditId === providerCreditId));
+      if (!selected || !selected.providerCreditId) return 'not_available';
+      if (providerLimitIds !== undefined) {
+        const clears = resets?.inventory?.recoveryCreditDetails[selected.providerCreditId].appliesToProviderLimitIds ?? [];
+        const freshMeters = isRecord(resets?.payload) ? collectUsageWindowMeterEntries(resets.payload)
+          .map(({ meterId, window }) => buildUsageWindowMeter(meterId, window)) : [];
+        const exhaustedIds = new Set(freshMeters.filter((meter) => meter.utilizationPct !== null && meter.utilizationPct >= 100)
+          .map((meter) => meter.providerLimitId ?? meter.meterId));
+        if (!providerLimitIds.some((id) => clears.includes(id) && exhaustedIds.has(id))) return 'not_available';
+      }
+      signal.throwIfAborted();
+      const profile = await fetchProfileContext(record, now, signal);
+      if (profile.status === 'rejected') {
+        throw new ConnectedServiceQuotaFetchError('Claude reset profile authentication failed.', {
+          status: profile.providerStatus, quotaFetchErrorCode: 'auth_failure',
+        });
+      }
+      const organizationId = profile.status === 'accepted' ? readClaudeOauthCredentialOrganizationId(profile.raw) : null;
+      if (!organizationId) throw new ConnectedServiceQuotaFetchError('Claude reset organization is unavailable.', { quotaFetchErrorCode: 'malformed' });
+      const credentialOrganizationId = readClaudeOauthCredentialOrganizationId(record.oauth.raw);
+      if (credentialOrganizationId && organizationId !== credentialOrganizationId) {
+        throw new ConnectedServiceQuotaFetchError('Claude reset organization does not match the selected credential.', { quotaFetchErrorCode: 'malformed' });
+      }
+      const resetUrl = new URL(`/api/organizations/${encodeURIComponent(organizationId)}/reset_rate_limits`, usageUrl).toString();
+      signal.throwIfAborted();
+      let response: Response;
+      try {
+        response = await fetch(resetUrl, { method: 'POST', headers: {
+          Authorization: `Bearer ${record.oauth.accessToken}`, Accept: 'application/json', 'Content-Type': 'application/json',
+          'anthropic-beta': betaHeaderValue, 'User-Agent': userAgent },
+          body: JSON.stringify(selected.providerResetType === 'cedar_ember'
+            ? { program: 'cedar_ember', grant_id: selected.providerCreditId, request_id: claudeResetRequestId(idempotencyKey) }
+            : { program: 'juniper_tide' }), signal });
+      } catch {
+        throw new ConnectedServiceQuotaFetchError('Claude reset outcome is unknown after a transport failure.', {
+          quotaFetchErrorCode: 'network', recoveryCreditConsumeOutcomeUnknown: true });
+      }
+      observeRateLimit(response, record, now);
+      if (!response.ok) {
+        throw new ConnectedServiceQuotaFetchError('Claude reset request failed.', {
+          status: response.status, quotaFetchErrorCode: response.status === 401 || response.status === 403 ? 'auth_failure' : 'provider_backoff',
+          recoveryCreditConsumeOutcomeUnknown: response.status >= 500 || (response.status !== 401 && response.status !== 403 && response.status !== 429),
+        });
+      }
+      let result: unknown;
+      try { result = await response.json(); } catch { result = null; }
+      if (!isRecord(result) || (result.reason !== undefined && result.reason !== null && typeof result.reason !== 'string')
+        || (result.cleared !== undefined && (!Array.isArray(result.cleared) || result.cleared.some((id) => typeof id !== 'string')))) {
+        throw new ConnectedServiceQuotaFetchError('Claude reset response is malformed.', {
+          quotaFetchErrorCode: 'malformed', recoveryCreditConsumeOutcomeUnknown: true });
+      }
+      if (result.result === 'reset') {
+        if (backoffKey && !providerBackoffCredentialKeys.has(backoffKey)) retryAfterBackoffByCredentialKey.delete(backoffKey);
+        return 'consumed';
+      }
+      if (result.result === 'already_used') return 'already_consumed';
+      if (result.result === 'not_limited') return 'nothing_to_reset';
+      if (result.result === 'ineligible' || result.result === 'unavailable' || result.result === 'cooldown') return 'not_available';
+      throw new ConnectedServiceQuotaFetchError('Claude reset returned an unknown outcome.', {
+        quotaFetchErrorCode: 'malformed', recoveryCreditConsumeOutcomeUnknown: true });
+    },
     fetch: async ({ record, now, signal }) => {
       if (record.kind !== 'oauth') return null;
       const planLabel = resolveClaudeSubscriptionPlanLabel(record);
+      const providerAccountId = record.oauth.providerAccountId?.trim() || null;
+      const providerOrganizationId = readClaudeOauthCredentialOrganizationId(record.oauth.raw);
       if (resolveMissingClaudeSubscriptionClaudeCodeScopes(record.oauth.scope).length > 0) {
         throw createMissingClaudeCodeScopeQuotaError();
       }
@@ -636,6 +809,9 @@ export function createClaudeSubscriptionQuotaFetcher(params?: Readonly<{
           v: 1,
           serviceId: record.serviceId,
           profileId: record.profileId,
+          providerId: 'claude',
+          ...(providerAccountId ? { activeAccountId: providerAccountId } : {}),
+          ...(providerOrganizationId ? { providerOrganizationId } : {}),
           fetchedAt: now,
           staleAfterMs,
           planLabel,
@@ -650,6 +826,7 @@ export function createClaudeSubscriptionQuotaFetcher(params?: Readonly<{
       if (backoffUntil > now) {
         return null;
       }
+      if (backoffKey) providerBackoffCredentialKeys.delete(backoffKey);
       if (backoffKey) {
         retryAfterBackoffByCredentialKey.set(backoffKey, now + 15 * 60_000);
       }
@@ -663,11 +840,7 @@ export function createClaudeSubscriptionQuotaFetcher(params?: Readonly<{
       });
 
       if (!response.ok && response.status === 429) {
-        const retryAfter = parseRetryAfterHeader(response.headers?.get?.('retry-after'), { nowMs: nowMs() });
-        const retryAfterMs = retryAfter.retryAfterMs ?? 5 * 60_000;
-        if (backoffKey) {
-          retryAfterBackoffByCredentialKey.set(backoffKey, now + Math.max(15 * 60_000, retryAfterMs));
-        }
+        observeRateLimit(response, record, now);
         return null;
       }
 
@@ -704,7 +877,11 @@ export function createClaudeSubscriptionQuotaFetcher(params?: Readonly<{
           details: {},
         });
       }
-      if (backoffKey) {
+      let resetInventory: ReturnType<typeof parseClaudeQuotaResets>;
+      try { resetInventory = (await discoverResets(record, now, signal))?.inventory; } catch {
+        logger.infoFile('[WARN] [Claude quota] Reset discovery failed; ordinary usage remains available.');
+      }
+      if (backoffKey && !providerBackoffCredentialKeys.has(backoffKey)) {
         retryAfterBackoffByCredentialKey.delete(backoffKey);
       }
 
@@ -712,11 +889,15 @@ export function createClaudeSubscriptionQuotaFetcher(params?: Readonly<{
         v: 1,
         serviceId: record.serviceId,
         profileId: record.profileId,
+        providerId: 'claude',
+        ...(providerAccountId ? { activeAccountId: providerAccountId } : {}),
+        ...(providerOrganizationId ? { providerOrganizationId } : {}),
         fetchedAt: now,
         staleAfterMs,
         planLabel,
         accountLabel: resolveAccountLabel(record),
         meters,
+        ...resetInventory,
       };
     },
   };

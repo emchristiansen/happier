@@ -5,10 +5,34 @@ import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { resolveClaudeProjectId } from '../utils/path';
+import { resolveExistingClaudeSessionHandoffState } from '../sessionHandoff/resolveExistingSessionHandoffState';
 import { exportClaudeSessionBundle } from './exportClaudeSessionBundle';
 import { importClaudeSessionBundle } from './importClaudeSessionBundle';
 
 describe('claude session handoff bundle', () => {
+  it('keeps native default authentication unset for imported and existing target state', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-claude-handoff-native-auth-'));
+    const targetPath = join(root, 'workspace');
+    const env = { HOME: root, USERPROFILE: root };
+    const imported = await importClaudeSessionBundle({
+      bundle: {
+        providerId: 'claude', remoteSessionId: 'native-auth-session',
+        transcriptBase64: Buffer.from('{"type":"user"}\n').toString('base64'),
+      },
+      targetPath,
+      env,
+    });
+    const existing = await resolveExistingClaudeSessionHandoffState({
+      metadata: {}, vendorResumeId: 'native-auth-session', targetPath, env, sessionStorageMode: 'direct',
+    });
+
+    expect(imported.resume.environmentVariables).not.toHaveProperty('CLAUDE_CONFIG_DIR');
+    expect(existing.resume.environmentVariables).not.toHaveProperty('CLAUDE_CONFIG_DIR');
+    expect(existing.directSource).toEqual(imported.directSource);
+    const projectId = resolveClaudeProjectId(targetPath);
+    expect(await readFile(join(root, '.claude', 'projects', projectId, 'native-auth-session.jsonl'), 'utf8'))
+      .toBe('{"type":"user"}\n');
+  });
   it('exports the transcript from the explicit transcript path when available', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-claude-handoff-export-'));
     const transcriptPath = join(root, 'source.jsonl');
@@ -284,7 +308,7 @@ describe('claude session handoff bundle', () => {
     await expect(readFile(importedPath, 'utf8')).resolves.toBe('{"type":"assistant","text":"override"}\n');
   });
 
-  it('falls back to an explicit HOME-based Claude config dir when no override is provided', async () => {
+  it('uses the HOME-based transcript directory without an authentication override', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-claude-handoff-import-home-fallback-'));
     const targetPath = join(root, 'workspace');
     await mkdir(targetPath, { recursive: true });
@@ -307,9 +331,7 @@ describe('claude session handoff bundle', () => {
         configDir: join(root, '.claude'),
         projectId: resolveClaudeProjectId(targetPath),
       });
-      expect(result.resume.environmentVariables).toEqual({
-        CLAUDE_CONFIG_DIR: join(root, '.claude'),
-      });
+      expect(result.resume.environmentVariables).toEqual({});
 
       const projectId = resolveClaudeProjectId(targetPath);
       const importedPath = join(root, '.claude', 'projects', projectId, 'claude_session_home_fallback.jsonl');

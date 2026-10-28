@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { AccountProfileResponseSchema, type AccountProfileResponse } from '@happier-dev/protocol';
+import { AccountProfileResponseSchema, type AccountProfileResponse, withConnectedServiceReaderSupport } from '@happier-dev/protocol';
 
 import {
   createAuthenticationHttpStatusError,
@@ -10,7 +10,7 @@ import { resolveServerHttpBaseUrl } from '@/session/transport/http/serverHttpBas
 
 export async function fetchAccountProfile(opts: Readonly<{ token: string; signal?: AbortSignal }>): Promise<AccountProfileResponse> {
   const serverUrl = resolveServerHttpBaseUrl();
-  const response = await axios.get(`${serverUrl}/v1/account/profile`, {
+  const response = await axios.get(withConnectedServiceReaderSupport(`${serverUrl}/v1/account/profile`), {
     headers: {
       Authorization: `Bearer ${opts.token}`,
       'Content-Type': 'application/json',

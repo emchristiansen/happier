@@ -89,6 +89,12 @@ describe('ToolTimelineRowHeader', () => {
         return undefined;
     }
 
+    /** Enters the header's hover region (its outermost host, which spans the row and its actions). */
+    function hoverHeader(screen: { root: { findAll: (p: (n: any) => boolean) => Array<{ props: any }> } }) {
+        const outermostHost = screen.root.findAll((node) => typeof node.type === 'string')[0];
+        outermostHost?.props.onPointerEnter?.();
+    }
+
     afterEach(() => {
         standardCleanup();
         ioniconPropsState.length = 0;
@@ -224,7 +230,7 @@ describe('ToolTimelineRowHeader', () => {
         expect(getRevealOpacity()).toBe(0);
 
         await act(async () => {
-            screen.findByTestId('tool-timeline-row-open')?.props.onHoverIn?.();
+            hoverHeader(screen);
         });
 
         expect(getRevealOpacity()).toBe(1);
@@ -263,7 +269,7 @@ describe('ToolTimelineRowHeader', () => {
         const unhoveredTitleShrink = readTitleShrink();
 
         await act(async () => {
-            screen.findByTestId('tool-timeline-row')?.props.onHoverIn?.();
+            hoverHeader(screen);
         });
 
         expect(readAnimatedOpacity(pinSlot()?.props.style)).toBe(1);
@@ -317,6 +323,61 @@ describe('ToolTimelineRowHeader', () => {
         expect(readAnimatedOpacity(screen.findByTestId(TOOL_TIMELINE_ROW_PIN_SLOT_TEST_ID)?.props.style)).toBe(1);
     });
 
+    it('keeps the pin and open actions revealed while the pointer moves from the row onto them', async () => {
+        const { ToolTimelineRowHeader, TOOL_TIMELINE_ROW_PIN_SLOT_TEST_ID, TOOL_TIMELINE_ROW_REVEAL_SLOT_TEST_ID } =
+            await import('./ToolTimelineRowHeader');
+
+        const screen = await renderScreen(
+            <ToolTimelineRowHeader
+                testID="tool-timeline-row"
+                density="comfortable"
+                icon={React.createElement('Text', null, 'ICON')}
+                title="Title"
+                onPress={() => {}}
+                canOpen={true}
+                onOpen={() => {}}
+                openActionTestID="tool-timeline-row-open"
+                revealAction={React.createElement('Pressable', { testID: 'tool-timeline-row-pin' })}
+            />,
+        );
+
+        // The hover region is the smallest host element spanning the row and both actions: the
+        // pointer never leaves it while travelling from the row onto an action.
+        const contains = (node: { findAll: (p: (n: any) => boolean) => unknown[] }, testID: string) =>
+            node.findAll((child) => child.props?.testID === testID).length > 0;
+        const hoverRegions = screen.root.findAll((node) =>
+            typeof node.type === 'string'
+            && contains(node, 'tool-timeline-row')
+            && contains(node, TOOL_TIMELINE_ROW_PIN_SLOT_TEST_ID)
+            && contains(node, TOOL_TIMELINE_ROW_REVEAL_SLOT_TEST_ID));
+        const hoverRegion = hoverRegions[hoverRegions.length - 1];
+        const row = () => screen.findByTestId('tool-timeline-row');
+        const pinOpacity = () => readAnimatedOpacity(screen.findByTestId(TOOL_TIMELINE_ROW_PIN_SLOT_TEST_ID)?.props.style);
+        const openOpacity = () => readAnimatedOpacity(screen.findByTestId(TOOL_TIMELINE_ROW_REVEAL_SLOT_TEST_ID)?.props.style);
+
+        // Browser order when the pointer enters the row: the region, then the row inside it.
+        await act(async () => {
+            hoverRegion?.props.onPointerEnter?.();
+            row()?.props.onHoverIn?.();
+        });
+        expect(pinOpacity()).toBe(1);
+        expect(openOpacity()).toBe(1);
+
+        // Moving onto an action leaves the row but stays inside the region.
+        await act(async () => {
+            row()?.props.onHoverOut?.();
+        });
+        expect(pinOpacity()).toBe(1);
+        expect(openOpacity()).toBe(1);
+
+        // Leaving the whole region hides both again.
+        await act(async () => {
+            hoverRegion?.props.onPointerLeave?.();
+        });
+        expect(pinOpacity()).toBe(0);
+        expect(openOpacity()).toBe(0);
+    });
+
     it('crossfades the left icon to a chevron-down on hover when expandable (web)', async () => {
         const { ToolTimelineRowHeader } = await import('./ToolTimelineRowHeader');
 
@@ -344,7 +405,7 @@ describe('ToolTimelineRowHeader', () => {
         expect(getChevronLayerOpacity()).toBe(0);
 
         await act(async () => {
-            screen.findByTestId('tool-timeline-row')?.props.onHoverIn?.();
+            hoverHeader(screen);
         });
 
         expect(getChevronLayerOpacity()).toBe(1);

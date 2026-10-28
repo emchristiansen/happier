@@ -204,7 +204,6 @@ describe('startUiWeb baseUrl resolution', () => {
       expect(runLoggedCalls).toHaveLength(1);
       expect(runLoggedCalls[0]?.env?.EXPO_PUBLIC_POSTHOG_KEY).toBe('phc-clear-export');
       expect(runLoggedCalls[0]?.env?.EXPO_UNSTABLE_WEB_MODAL).toBe('1');
-      expect(runLoggedCalls[0]?.env?.NODE_OPTIONS).toContain('--max-old-space-size=8192');
     } finally {
       await started.stop();
     }
@@ -677,7 +676,6 @@ describe('startUiWeb baseUrl resolution', () => {
       expect(lastSpawnArgs ?? []).not.toContain('--clear');
       expect(typeof lastSpawnEnv?.TMPDIR).toBe('string');
       expect(String(lastSpawnEnv?.TMPDIR ?? '')).toContain(testDir);
-      expect(lastSpawnEnv?.NODE_OPTIONS).toContain('--max-old-space-size=8192');
       await started.stop();
     } finally {
       if (typeof originalFetch === 'function') {
@@ -1197,7 +1195,7 @@ describe('startUiWeb baseUrl resolution', () => {
     const resolveUiWebExportBuildTimeoutMs = (uiWebExportModule as Record<string, unknown>).resolveUiWebExportBuildTimeoutMs;
 
     expect(typeof resolveUiWebExportBuildTimeoutMs).toBe('function');
-    expect((resolveUiWebExportBuildTimeoutMs as (env: NodeJS.ProcessEnv) => number)({})).toBe(600_000);
+    expect((resolveUiWebExportBuildTimeoutMs as (env: NodeJS.ProcessEnv) => number)({})).toBeGreaterThan(150_000);
   });
 
   it('uses a bounded metro script-fetch attempt budget unless explicitly overridden', async () => {

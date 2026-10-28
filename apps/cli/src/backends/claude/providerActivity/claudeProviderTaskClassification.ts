@@ -55,12 +55,10 @@ const AGENT_FLAVOURED_TASK_TYPES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Agent launches whose liveness is owned by the authenticated hook path
- * (`readClaudeSessionHookProviderTaskActivity`), not by the SDK's `task_started` echo. Admitting
- * them here would change turn lifecycle for every subagent launch — a behaviour change that PLAN
- * 4.9.1 forbids as a side effect of classification, so these keep their `known-only` admission.
- *
- * `local_workflow` is deliberately ABSENT: it admits today and continues to.
+ * An agent-flavoured type alone cannot distinguish a foreground invocation from background work.
+ * Missing/false background evidence therefore stays known-only, relying on a proved async launch
+ * or authenticated resume. Native local_agent frames with is_backgrounded=true admit directly.
+ * `local_workflow` is deliberately absent: its typed start already proves detached work.
  */
 const LIVENESS_DEFERRED_TASK_TYPES: ReadonlySet<string> = new Set([
   'agent',
@@ -118,9 +116,12 @@ function normalizeTaskType(taskType: string | null | undefined): string | null {
  */
 export function resolveClaudeProviderTaskAdmission(
   taskType: string | null | undefined,
+  isBackgrounded?: boolean,
 ): ClaudeProviderTaskAdmission {
   const normalized = normalizeTaskType(taskType);
   if (normalized === null) return 'known-only';
+  // Current native SDK frames explicitly distinguish background local agents from foreground ones.
+  if (normalized === 'local_agent' && isBackgrounded === true) return 'admit';
   if (LIVENESS_DEFERRED_TASK_TYPES.has(normalized)) return 'known-only';
   if (INERT_TASK_TYPES.has(normalized)) return 'known-only';
   return 'admit';

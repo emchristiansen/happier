@@ -26,6 +26,10 @@ describe('ACP SDK 1.2 contract disposition', () => {
     expect(ACP_SDK_CLIENT_METHOD_DISPOSITION['terminal/kill']).toBe('supported_not_advertised');
   });
 
+  it('classifies session/delete as integrated once the direct-session candidate action consumes it', () => {
+    expect(ACP_SDK_AGENT_METHOD_DISPOSITION['session/delete']).toBe('integrated');
+  });
+
   it('keeps every stable session-update variant explicit at compile time', () => {
     expect(Object.keys(ACP_SDK_SESSION_UPDATE_DISPOSITION).sort()).toEqual([
       'agent_message_chunk',

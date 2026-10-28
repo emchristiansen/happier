@@ -39,6 +39,8 @@ export const MarkdownView = React.memo((props: {
     streamingMode?: MarkdownStreamingMode;
     streamingAnimated?: boolean;
     streamingParseCacheKey?: string | null;
+    /** Stable message identity, independent of streaming revisions, for per-block presentation state. */
+    codeBlockStateKey?: string;
     streamingRevealPreset?: StreamingTextRevealPreset;
     staticRenderPlaceholderEnabled?: boolean;
     sourceRangeLayoutObserver?: MarkdownSourceRangeLayoutObserver;
@@ -66,6 +68,7 @@ export const MarkdownView = React.memo((props: {
             streamingMode={props.streamingMode === 'streaming' ? 'streaming' : 'static'}
             streamingAnimated={props.streamingAnimated === true}
             streamingParseCacheKey={props.streamingParseCacheKey}
+            codeBlockStateKey={props.codeBlockStateKey}
             streamingRevealPreset={props.streamingRevealPreset}
             staticRenderPlaceholderEnabled={props.staticRenderPlaceholderEnabled}
             sourceRangeLayoutObserver={props.sourceRangeLayoutObserver}

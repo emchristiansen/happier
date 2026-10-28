@@ -253,6 +253,7 @@ vi.mock('@/sync/sync', () => ({
             }
         },
         onSessionVisible,
+        decryptSecretValue: (value: unknown) => (value ? 'test-secret-key' : null),
         encryption: {
             getSessionEncryption: vi.fn(() => ({})),
         },

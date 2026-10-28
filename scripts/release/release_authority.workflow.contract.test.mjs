@@ -76,17 +76,25 @@ test('every GitHub App token reachable from full or nightly release declares rep
   }
 });
 
-test('previously broad release-path tokens use the minimum current-repository contents permission', () => {
+test('release-path tokens use only the current-repository permissions their mutations require', () => {
   const expected = new Map([
     ['promote-branch.yml/promote/Create GitHub App token', 'write'],
     ['promote-ui.yml/promote/Create GitHub App token', 'write'],
     ['promote-website.yml/promote/Create GitHub App token', 'write'],
     ['promote-docs.yml/promote/Create GitHub App token', 'write'],
+    ['promote-server.yml/promote_deploy_ref/Create trusted promotion GitHub App token', 'write'],
     ['publish-docker.yml/publish/Create GitHub App token', 'read'],
     ['build-ui-mobile-local.yml/publish_android_apk/Create GitHub App token (APK publishing)', 'write'],
     ['publish-ui-mobile-dev.yml/publish/Create GitHub App token', 'read'],
     ['publish-ui-mobile-dev.yml/ios_cloud/Create GitHub App token', 'read'],
     ['publish-ui-mobile-dev.yml/ios_local/Create GitHub App token', 'read'],
+  ]);
+  const workflowWriters = new Set([
+    'promote-branch.yml/promote/Create GitHub App token',
+    'promote-ui.yml/promote/Create GitHub App token',
+    'promote-website.yml/promote/Create GitHub App token',
+    'promote-docs.yml/promote/Create GitHub App token',
+    'promote-server.yml/promote_deploy_ref/Create trusted promotion GitHub App token',
   ]);
   const reachable = reachableWorkflowNames(['release.yml', 'nightly-dev.yml']);
   const observed = new Set();
@@ -101,9 +109,10 @@ test('previously broad release-path tokens use the minimum current-repository co
         assert.equal(step.with.owner, '${{ github.repository_owner }}');
         assert.equal(step.with.repositories, '${{ github.event.repository.name }}');
         assert.equal(step.with['permission-contents'], expected.get(key));
+        assert.equal(step.with['permission-workflows'], workflowWriters.has(key) ? 'write' : undefined);
         assert.deepEqual(
           Object.keys(step.with).filter((field) => field.startsWith('permission-')),
-          ['permission-contents'],
+          workflowWriters.has(key) ? ['permission-contents', 'permission-workflows'] : ['permission-contents'],
           `${key} must not request additional App permissions`,
         );
       }

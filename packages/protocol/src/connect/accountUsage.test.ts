@@ -3,7 +3,9 @@ import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 
 import * as accountUsageModule from './accountUsage.js';
+import { ConnectedServiceQuotaSnapshotV1Schema, SealedConnectedServiceQuotaSnapshotV1Schema } from './connectedServiceSchemas.js';
 import * as protocol from '../index.js';
+import { ReleasedProviderAccountUsageSnapshotV1Schema, ReleasedSealedProviderAccountUsageSnapshotV1Schema, ReleasedProviderAccountUsagePlainWriteSchema } from './fixtures/releasedV0216AccountUsage.js';
 
 type ProviderAccountUsageRecordKeyV1 = Readonly<{
   providerId: string;
@@ -133,18 +135,42 @@ describe('provider account usage protocol', () => {
     expect(split({ ...base, subscription })).toEqual({ snapshot: base, subscription });
   });
 
-  it('keeps the sealed base compatible and rejects a subscription copied from another account record', () => {
-    const seal = requireExport<(input: unknown) => { ciphertext: string; subscription?: unknown }>('sealProviderAccountUsageSnapshot', isFunction);
+  it('keeps the sealed base compatible and binds supplemental facts to their account observation', () => {
+    const seal = requireExport<(input: unknown) => { ciphertext: string; subscription?: unknown; recoveryCreditDetails?: unknown }>('sealProviderAccountUsageSnapshot', isFunction);
     const open = requireExport<(input: unknown) => unknown>('openSealedProviderAccountUsageSnapshot', isFunction);
     const material = { type: 'legacy', secret: new Uint8Array(32).fill(7) } as const;
     const base = createSnapshot();
     const subscription = { status: 'subscribed', renewal: 'off', observedAtMs: 900, staleAfterMs: 60_000, currentPeriodEndAtMs: 1_800_000_000_000 };
-    const sealed = seal({ material, snapshot: { ...base, subscription }, randomBytes: (length: number) => new Uint8Array(length).fill(3) });
+    const recoveryCreditDetails = { grant: { remainingCount: 2, appliesToProviderLimitIds: ['five_hour', 'seven_day'], unavailableReason: 'cooldown' } };
+    const sealed = seal({ material, snapshot: { ...base, subscription, recoveryCreditDetails }, randomBytes: (length: number) => new Uint8Array(length).fill(3) });
+    const quotaEnvelope = SealedConnectedServiceQuotaSnapshotV1Schema.parse(sealed);
+    expect(open({ material, sealed: quotaEnvelope })).toEqual({ ...base, subscription, recoveryCreditDetails });
     expect(accountUsageModule.openProviderAccountUsageSnapshotCiphertext({ material, ciphertext: sealed.ciphertext })?.value).toEqual(base);
-    expect(open({ material, sealed })).toEqual({ ...base, subscription });
+    expect(open({ material, sealed })).toEqual({ ...base, subscription, recoveryCreditDetails });
     const other = createSnapshot({ recordKey: { ...base.recordKey, accountSubjectId: 'other' } });
     const otherSealed = seal({ material, snapshot: other, randomBytes: (length: number) => new Uint8Array(length).fill(4) });
     expect(open({ material, sealed: { ...otherSealed, subscription: sealed.subscription } })).toBeNull();
+    expect(open({ material, sealed: { ...otherSealed, recoveryCreditDetails: sealed.recoveryCreditDetails } })).toBeNull();
+    const newer = seal({ material, snapshot: { ...base, fetchedAtMs: base.fetchedAtMs + 1 }, randomBytes: (length: number) => new Uint8Array(length).fill(4) });
+    expect(open({ material, sealed: { ...newer, recoveryCreditDetails: sealed.recoveryCreditDetails } })).toBeNull();
+
+    // The released outer reader ignores the facet, and its strict body still decodes.
+    const releasedEnvelope = ReleasedSealedProviderAccountUsageSnapshotV1Schema.parse(sealed);
+    expect(releasedEnvelope).not.toHaveProperty('recoveryCreditDetails');
+    const releasedBase = accountUsageModule.openProviderAccountUsageSnapshotCiphertext({ material, ciphertext: releasedEnvelope.ciphertext });
+    expect(ReleasedProviderAccountUsageSnapshotV1Schema.parse(releasedBase?.value)).toEqual(base);
+    expect(ReleasedProviderAccountUsageSnapshotV1Schema.safeParse({ ...base, recoveryCreditDetails }).success).toBe(false);
+    // New readers accept released envelopes without requiring display facts.
+    expect(open({ material, sealed: otherSealed })).toEqual(other);
+
+    const split = accountUsageModule.splitProviderAccountUsageSupplementalFacets(
+      accountUsageModule.ProviderAccountUsageSnapshotV1Schema.parse({ ...base, recoveryCreditDetails }),
+    );
+    const releasedWrite = { content: { t: 'plain', v: split.snapshot }, metadata: { fetchedAt: base.fetchedAtMs, staleAfterMs: base.staleAfterMs, status: 'ok' } };
+    expect(ReleasedProviderAccountUsagePlainWriteSchema.safeParse(releasedWrite).success).toBe(true);
+    expect(ReleasedProviderAccountUsageSnapshotV1Schema.parse(split.snapshot)).toEqual(base);
+    // Strict older writers need the explicit server bit before sending this facet.
+    expect(ReleasedProviderAccountUsagePlainWriteSchema.safeParse({ ...releasedWrite, metadata: { ...releasedWrite.metadata, recoveryCreditDetails } }).success).toBe(false);
   });
 
   it('builds opaque stable record ids from canonical record keys', () => {
@@ -335,6 +361,31 @@ describe('provider account usage protocol', () => {
       }),
       meters: snapshot.meters,
     }));
+  });
+
+  it('preserves organization quota scope without replacing the provider account identity', () => {
+    const recordKey = {
+      providerId: 'claude', accountSubjectId: 'acct-user', subjectKind: 'account',
+      quotaScope: 'organization', quotaScopeId: 'org-work',
+    };
+    const projected = accountUsageModule.projectProviderAccountUsageToConnectedServiceQuotaSnapshot(
+      accountUsageModule.ProviderAccountUsageSnapshotV1Schema.parse(createSnapshot({ recordKey })),
+      { serviceId: 'anthropic', profileId: 'work', bindingKind: 'profile' },
+    );
+
+    expect(ConnectedServiceQuotaSnapshotV1Schema.parse(projected)).toMatchObject({
+      activeAccountId: 'acct-user',
+      providerOrganizationId: 'org-work',
+    });
+    expect(ReleasedProviderAccountUsageSnapshotV1Schema.safeParse(createSnapshot({ recordKey })).success).toBe(true);
+  });
+
+  it('does not invent organization context for account-only quota snapshots', () => {
+    const projected = accountUsageModule.projectProviderAccountUsageToConnectedServiceQuotaSnapshot(
+      accountUsageModule.ProviderAccountUsageSnapshotV1Schema.parse(createSnapshot()),
+      { serviceId: 'openai-codex', profileId: 'work', bindingKind: 'profile' },
+    );
+    expect(projected).not.toHaveProperty('providerOrganizationId');
   });
 
   it('does not export the connected-service quota back-projection helper', () => {

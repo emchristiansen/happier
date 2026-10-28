@@ -13,6 +13,7 @@ import {
   resolveImmutableCandidateIdentity,
 } from '../release/lib/immutable-release-candidate.mjs';
 import { buildRollingAssetPlan } from './rolling-release-asset-plan.mjs';
+import { downloadReleaseAssetWithRetry } from './lib/release-asset-transfer.mjs';
 
 const FULL_SHA = /^[a-f0-9]{40}$/;
 const DEFAULT_UPLOAD_ATTEMPTS = 8;
@@ -97,9 +98,9 @@ function isExplicitHttpNotFound(error) {
  * @param {string} cmd
  * @param {string[]} args
  * @param {string} destination
- * @param {{ env?: Record<string, string>; dryRun?: boolean; cwd?: string }} [opts]
+ * @param {{ env?: Record<string, string>; dryRun?: boolean; cwd?: string; timeoutMs: number }} opts
  */
-function runToFile(cmd, args, destination, opts = {}) {
+function runToFile(cmd, args, destination, opts) {
   const printable = `${cmd} ${args.map((arg) => (arg.includes(' ') ? JSON.stringify(arg) : arg)).join(' ')}`;
   if (opts.dryRun) {
     console.log(`[dry-run] ${printable}`);
@@ -111,7 +112,7 @@ function runToFile(cmd, args, destination, opts = {}) {
       cwd: opts.cwd ?? process.cwd(),
       env: { ...process.env, ...(opts.env ?? {}) },
       stdio: ['ignore', output, 'pipe'],
-      timeout: 10 * 60_000,
+      timeout: opts.timeoutMs,
     });
   } finally {
     closeSync(output);
@@ -429,14 +430,18 @@ function deleteReleaseIfPresent({ repo, releaseId, env, dryRun }) {
   });
 }
 
+/** @param {{ repo: string; assets: ReturnType<typeof readReleaseAssetRows>; destination: string; env: Record<string, string>; dryRun: boolean }} input */
 async function downloadReleaseAssetsById({ repo, assets, destination, env, dryRun }) {
   for (const { id: assetId, name } of assets) {
-    runToFile('gh', [
-      'api',
-      `repos/${repo}/releases/assets/${assetId}`,
-      '-H',
-      'Accept: application/octet-stream',
-    ], join(destination, name), { env, dryRun });
+    await downloadReleaseAssetWithRetry({
+      name: `${name} (asset ${assetId})`,
+      download: (timeoutMs) => runToFile('gh', [
+        'api',
+        `repos/${repo}/releases/assets/${assetId}`,
+        '-H',
+        'Accept: application/octet-stream',
+      ], join(destination, name), { env, dryRun, timeoutMs }),
+    });
   }
 }
 

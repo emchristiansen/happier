@@ -68,6 +68,7 @@ type PublicShareConsentResponse = {
 
 type PublicShareMessagesResponse = {
     messages: ApiMessage[];
+    hasMore?: boolean;
 };
 
 type PublicShareDataset = Readonly<{
@@ -240,6 +241,7 @@ export default memo(function PublicShareViewerScreen() {
                 return;
             }
 
+            const reducerSessionContext = { mainHistoryStartLoaded: messagesData.hasMore === false };
             const sessionEncryptionMode = data.session.encryptionMode === 'plain' ? 'plain' : 'e2ee';
             const plainMetadata = sessionEncryptionMode === 'plain'
                 ? parsePlainSessionMetadata(data.session.metadata)
@@ -254,7 +256,7 @@ export default memo(function PublicShareViewerScreen() {
                 sortNormalizedMessagesOldestFirst(normalized);
 
                 const reducerState = createReducer();
-                const reduced = reducer(reducerState, normalized, plainAgentState);
+                const reduced = reducer(reducerState, normalized, plainAgentState, reducerSessionContext);
 
                 setDataset({
                     share: data,
@@ -326,7 +328,7 @@ export default memo(function PublicShareViewerScreen() {
                 sortNormalizedMessagesOldestFirst(normalized);
 
                 const reducerState = createReducer();
-                const reduced = reducer(reducerState, normalized, e2eeAgentState);
+                const reduced = reducer(reducerState, normalized, e2eeAgentState, reducerSessionContext);
 
                 setDataset({
                     share: data,

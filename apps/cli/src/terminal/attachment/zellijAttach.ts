@@ -1,4 +1,3 @@
-import chalk from 'chalk';
 import { configuration } from '@/configuration';
 import {
   defaultZellijAttachActions,
@@ -13,6 +12,7 @@ import {
 
 import type { TerminalAttachmentInfo } from './terminalAttachmentInfo';
 import { createTerminalAttachPlan } from './terminalAttachPlan';
+import { fail } from '@happier-dev/cli-common/output';
 
 async function bestEffortFocusPaneBeforeAttach(params: Readonly<{
   actions: ZellijAttachActions;
@@ -63,14 +63,14 @@ export async function runZellijAttach(
     const reason = plan.type === 'not-attachable'
       ? plan.reason
       : 'Session is not backed by a zellij terminal host.';
-    console.error(chalk.red('Error:'), reason);
+    console.error(fail(reason));
     return 1;
   }
 
   const resolveZellijBinaryFn = deps.resolveZellijBinaryFn ?? resolveZellijRuntimeBinary;
   const zellijBinary = await resolveZellijBinaryFn();
   if (!zellijBinary) {
-    console.error(chalk.red('Error:'), 'Bundled zellij is unavailable; cannot attach to this terminal-hosted session.');
+    console.error(fail('Bundled zellij is unavailable; cannot attach to this terminal-hosted session.'));
     return 1;
   }
 
@@ -80,7 +80,7 @@ export async function runZellijAttach(
     env: process.env,
   })))();
   if (windowsGuard.status === 'disabled') {
-    console.error(chalk.red('Error:'), windowsGuard.message);
+    console.error(fail(windowsGuard.message));
     return 1;
   }
 
@@ -110,7 +110,7 @@ export async function runZellijAttach(
     sessionName: plan.sessionName,
   });
   if (result.exitCode !== 0) {
-    console.error(chalk.red('Error:'), result.stderr || result.stdout || `zellij attach exited with ${result.exitCode}.`);
+    console.error(fail(result.stderr || result.stdout || `zellij attach exited with ${result.exitCode}.`));
   }
   return result.exitCode;
 }

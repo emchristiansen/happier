@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AuthCredentials } from '@/auth/storage/tokenStorage';
 import { encodeBase64 } from '@/encryption/base64';
 import {
+    applySessionListRenderablePatch,
     buildSessionListRenderableFromSession,
     preserveSessionListRenderableStaleFields,
     type SessionListRenderableSession,
@@ -377,7 +378,7 @@ describe('fetchAndApplySessions (/v2/sessions snapshot)', () => {
                 runtimeActivityObservedAt: 1_000,
                 runtimeActivityRevision: 1,
             }),
-        ], { replace: true });
+        ], { replace: true, coversWholeList: true });
     });
 
     it('hydrates a required changed session when only its runtime activity tuple advanced', async () => {
@@ -1481,7 +1482,7 @@ describe('fetchAndApplySessions (/v2/sessions snapshot)', () => {
                 lastViewedSessionSeq: 5,
                 hasUnreadMessages: false,
             }),
-        ], { replace: true });
+        ], { replace: true, coversWholeList: true });
     });
 
     it('preserves existing ready metadata when v2 list rows have no readable seq projection', async () => {
@@ -1534,7 +1535,7 @@ describe('fetchAndApplySessions (/v2/sessions snapshot)', () => {
                 latestReadyEventAt: 2_000,
                 hasUnreadMessages: true,
             }),
-        ], { replace: true });
+        ], { replace: true, coversWholeList: true });
     });
 
     it('uses server row attention projection fields when building first-usable renderables and hydrated sessions', async () => {
@@ -1598,7 +1599,7 @@ describe('fetchAndApplySessions (/v2/sessions snapshot)', () => {
                 hasPendingPermissionRequests: true,
                 hasUnreadMessages: true,
             }),
-        ], { replace: true });
+        ], { replace: true, coversWholeList: true });
         expect(applySessions).toHaveBeenCalledWith([
             expect.objectContaining({
                 id: 's_row_projection',
@@ -1652,7 +1653,7 @@ describe('fetchAndApplySessions (/v2/sessions snapshot)', () => {
         );
     });
 
-    it('reuses warm cache list data when metadata and agentState versions match and the canonical session already exists', async () => {
+    it('prefers canonical session metadata over matching warm cache while reusing cached agent-state flags', async () => {
         const requestSpy = vi.fn(async () =>
             jsonResponse({
                 sessions: [
@@ -1743,19 +1744,19 @@ describe('fetchAndApplySessions (/v2/sessions snapshot)', () => {
                 pendingCount: 2,
                 pendingVersion: 11,
                 metadata: expect.objectContaining({
-                    name: 'Cached title',
-                    summaryText: 'Cached summary',
+                    name: 'Hydrated title',
+                    summaryText: null,
                     path: '/home/u/repo',
-                    homeDir: '/home/u',
+                    homeDir: null,
                     host: 'mbp',
                     machineId: 'm1',
-                    flavor: 'claude',
-                    directSessionV1: { v: 1, providerId: 'codex' },
+                    flavor: null,
+                    directSessionV1: null,
                     hiddenSystemSession: false,
                 }),
                 hasPendingUserActionRequests: true,
             }),
-        ], { replace: true });
+        ], { replace: true, coversWholeList: true });
     });
 
     it('hydrates matching warm cache rows when the canonical sessions map is empty', async () => {
@@ -1827,7 +1828,7 @@ describe('fetchAndApplySessions (/v2/sessions snapshot)', () => {
                     path: '/home/u/repo',
                 }),
             }),
-        ], { replace: true });
+        ], { replace: true, coversWholeList: true });
         await expect.poll(() => decryptMetadata.mock.calls.length).toBe(1);
         expect(decryptAgentState).toHaveBeenCalledTimes(1);
         await expect.poll(() => applySessions.mock.calls.length).toBe(1);
@@ -1993,7 +1994,7 @@ describe('fetchAndApplySessions (/v2/sessions snapshot)', () => {
                     hiddenSystemSession: false,
                 }),
             }),
-        ], { replace: true });
+        ], { replace: true, coversWholeList: true });
         const firstUsableEvent = syncPerformanceTelemetry.snapshot().events.find((event) =>
             event.name === 'sync.sessions.snapshot.firstUsableList',
         );
@@ -2078,7 +2079,7 @@ describe('fetchAndApplySessions (/v2/sessions snapshot)', () => {
                     flavor: 'codex',
                 }),
             }),
-        ], { replace: true });
+        ], { replace: true, coversWholeList: true });
         expect(decryptMetadata).toHaveBeenCalledWith(7, 'encrypted-meta');
         expect(decryptAgentState).toHaveBeenCalledWith(9, 'encrypted-state');
         expect(applySessions).toHaveBeenCalledWith([
@@ -2140,7 +2141,7 @@ describe('fetchAndApplySessions (/v2/sessions snapshot)', () => {
                 metadataVersion: 0,
                 metadata: null,
             }),
-        ], { replace: true });
+        ], { replace: true, coversWholeList: true });
         expect(decryptMetadata).toHaveBeenCalledWith(0, 'encrypted-zero-meta');
         expect(applySessions).toHaveBeenCalledWith([
             expect.objectContaining({
@@ -2262,7 +2263,7 @@ describe('fetchAndApplySessions (/v2/sessions snapshot)', () => {
                 id: 's_missing_data_key',
                 metadata: null,
             }),
-        ], { replace: true });
+        ], { replace: true, coversWholeList: true });
         expect(getSessionEncryption).toHaveBeenCalledWith('s_missing_data_key');
         expect(decryptMetadata).not.toHaveBeenCalled();
         expect(applySessions).not.toHaveBeenCalled();
@@ -2927,7 +2928,7 @@ describe('fetchAndApplySessions (/v2/sessions snapshot)', () => {
                 hasPendingPermissionRequests: false,
                 hasPendingUserActionRequests: true,
             }),
-        ], { replace: true });
+        ], { replace: true, coversWholeList: true });
         expect(applySessions).not.toHaveBeenCalled();
 
         await expect.poll(() => typeof resolveDataKeys).toBe('function');
@@ -3039,7 +3040,7 @@ describe('fetchAndApplySessions (/v2/sessions snapshot)', () => {
         expect(applySessionListRenderables).toHaveBeenCalledWith([
             expect.objectContaining({ id: 's_first', metadata: null }),
             expect.objectContaining({ id: 's_second', metadata: null }),
-        ], { replace: true });
+        ], { replace: true, coversWholeList: true });
         expect(decryptMetadata).not.toHaveBeenCalled();
         expect(sessionListBackgroundHydrationYield).toHaveBeenCalledTimes(1);
 
@@ -3460,6 +3461,54 @@ describe('fetchAndApplySessions (/v2/sessions snapshot)', () => {
                 }),
             },
         ]);
+    });
+
+    it('settles legacy pending flags from a newer hydrated request version after unrelated metadata advances', async () => {
+        const existing = buildExistingSession({
+            id: 's_legacy_pending', encryptionMode: 'plain', metadataVersion: 1,
+            metadata: { path: '/repo', host: 'host' }, agentStateVersion: 2,
+            agentState: { requests: { r1: { tool: 'Bash', arguments: {}, createdAt: 50 } } },
+            pendingPermissionRequestCount: 1, pendingUserActionRequestCount: 0, pendingRequestObservedAt: 50,
+        });
+        let current = buildSessionListRenderableFromSession(existing);
+        const resumeHydration = createDeferred<void>();
+        await fetchAndApplySessions({
+            credentials: { token: 't', secret: 's' },
+            encryption: Encryption.createWithoutKeyMaterial(),
+            sessionDataKeys: new Map(),
+            request: vi.fn(async () => jsonResponse({
+                sessions: [buildSessionRow({
+                    id: existing.id, encryptionMode: 'plain', updatedAt: 100,
+                    metadata: JSON.stringify(existing.metadata), metadataVersion: 1,
+                    agentState: JSON.stringify({ requests: {} }), agentStateVersion: 3,
+                })],
+                nextCursor: null, hasNext: false,
+            })),
+            getExistingSession: () => existing,
+            getCurrentSessionListRenderable: () => current,
+            applySessionListRenderables: rows => {
+                for (const row of rows) current = preserveSessionListRenderableStaleFields(current, row);
+            },
+            applySessionListRenderablePatches: patches => {
+                for (const { patch } of patches) current = applySessionListRenderablePatch(current, patch);
+            },
+            applySessions: () => { throw new Error('The older whole snapshot must not replace current metadata'); },
+            cachedSessionListEntries: {},
+            sessionListBackgroundHydrationYield: () => resumeHydration.promise,
+            repairInvalidReadStateV1: async () => {},
+            log: { log: () => {} },
+        });
+        expect(current).toMatchObject({ agentStateVersion: 2, hasPendingPermissionRequests: true });
+        current = applySessionListRenderablePatch(current, {
+            metadataVersion: 2, metadata: { path: '/renamed', host: 'host' }, updatedAt: 400,
+        });
+        resumeHydration.resolve();
+
+        await expect.poll(() => current.agentStateVersion).toBe(3);
+        expect(current).toMatchObject({
+            hasPendingPermissionRequests: false, hasPendingUserActionRequests: false,
+            pendingRequestObservedAt: null, metadataVersion: 2, metadata: { path: '/renamed' },
+        });
     });
 
     it('does not wait for background-yield scheduling before required session hydration', async () => {

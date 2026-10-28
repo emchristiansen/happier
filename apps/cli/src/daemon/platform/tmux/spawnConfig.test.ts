@@ -1,11 +1,17 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { getPriority, tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+// Scheduling priority is an OS boundary; keep the shared launch policy real.
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  return { ...actual, getPriority: vi.fn(() => 0) };
+});
+
+import { buildHostedRunnerSpawnConfig, buildTmuxSpawnConfig } from './spawnConfig';
 import type { SessionLaunchId } from '../linux/sessionLaunchId';
-import { buildTmuxSpawnConfig } from './spawnConfig';
 
 const LAUNCH_ID = '9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d' as SessionLaunchId;
 
@@ -13,11 +19,54 @@ describe('tmux session resource policy', () => {
   const originalPlatform = process.platform;
   let commandDirectory: string | null = null;
 
+  beforeEach(() => {
+    vi.mocked(getPriority).mockReturnValue(0);
+  });
+
   afterEach(async () => {
     Object.defineProperty(process, 'platform', { configurable: true, value: originalPlatform });
     vi.unstubAllEnvs();
     if (commandDirectory) await rm(commandDirectory, { recursive: true, force: true });
     commandDirectory = null;
+  });
+
+  it('preserves local terminal presentation for a hosted server-backed runner', async () => {
+    const config = await buildTmuxSpawnConfig({
+      launchId: LAUNCH_ID,
+      agent: 'codex',
+      directory: '/tmp',
+      extraEnv: {},
+      startingMode: 'local',
+    });
+
+    expect(config.commandTokens).toEqual(expect.arrayContaining([
+      'codex', '--happy-starting-mode', 'local', '--started-by', 'daemon',
+    ]));
+  });
+
+  it('passes the complete prepared child environment to a Herdr-hosted runner', async () => {
+    const config = await buildHostedRunnerSpawnConfig({
+      launchId: LAUNCH_ID,
+      host: 'herdr',
+      agent: 'codex',
+      directory: '/tmp',
+      extraEnv: { HAPPIER_CODEX_BACKEND_MODE: 'appServer' },
+      processEnv: { PATH: '/bin', XDG_CONFIG_HOME: '/test/config', HAPPIER_ACTIVE_SERVER_ID: 'stale' },
+      serverSelectionEnv: {
+        activeServerId: 'current',
+        canonicalServerUrl: 'https://relay.example.test',
+        apiServerUrl: 'https://relay.example.test',
+        webappUrl: 'https://relay.example.test',
+      },
+      startingMode: 'local',
+    });
+
+    expect(config.childEnv).toMatchObject({
+      XDG_CONFIG_HOME: '/test/config',
+      HAPPIER_ACTIVE_SERVER_ID: 'current',
+      HAPPIER_CODEX_BACKEND_MODE: 'appServer',
+    });
+    expect(config.commandTokens).toEqual(expect.arrayContaining(['codex', '--happy-starting-mode', 'local']));
   });
 
   async function provisionJobsProbe() {
@@ -38,6 +87,7 @@ describe('tmux session resource policy', () => {
   }
 
   it('uses the same provisioned jobs scope and child environment as regular session launches', async () => {
+    vi.mocked(getPriority).mockReturnValue(19);
     await provisionJobsProbe();
     const config = await buildTmuxSpawnConfig({
       launchId: LAUNCH_ID,
@@ -53,7 +103,7 @@ describe('tmux session resource policy', () => {
 
     expect(config.commandTokens[0]).toBe('systemd-run');
     expect(config.commandTokens).toEqual(expect.arrayContaining([
-      '--slice=happier-jobs.slice', `--unit=happier-launch-${LAUNCH_ID}.scope`, '--nice=10',
+      '--slice=happier-jobs.slice', `--unit=happier-launch-${LAUNCH_ID}.scope`, '--nice=19',
       '--expand-environment=no', '/test/admitted-runner.mjs', 'codex',
     ]));
     expect(config.placement).toEqual({
@@ -80,6 +130,39 @@ describe('tmux session resource policy', () => {
     expect(config.placement).toEqual({
       kind: 'unscoped',
       probe: { kind: 'unsupported-platform', platform: 'darwin' },
+    });
+  });
+
+  it('pins daemon-owned child keys so a long-lived tmux server cannot leak stale relay state', async () => {
+    const config = await buildTmuxSpawnConfig({
+      launchId: LAUNCH_ID,
+      agent: 'claude',
+      directory: '/tmp',
+      extraEnv: {},
+      processEnv: {
+        PATH: '/bin',
+        HAPPIER_ACTIVE_SERVER_ID: 'stale-server',
+        HAPPIER_SERVER_URL: 'https://stale.example.test',
+        HAPPIER_PUBLIC_SERVER_URL: 'https://stale-public.example.test',
+        HAPPIER_PUBLIC_RELEASE_CHANNEL: 'stable',
+        HAPPIER_DAEMON_STARTUP_SOURCE: 'background-service',
+      },
+      serverSelectionEnv: {
+        activeServerId: 'custom',
+        canonicalServerUrl: 'https://relay.example.test:27443',
+        apiServerUrl: 'https://relay.example.test:27443',
+        webappUrl: 'https://relay.example.test:27443',
+      },
+    });
+
+    expect(config.tmuxEnv).toMatchObject({
+      HAPPIER_ACTIVE_SERVER_ID: 'custom',
+      HAPPIER_SERVER_URL: 'https://relay.example.test:27443',
+      HAPPIER_WEBAPP_URL: 'https://relay.example.test:27443',
+      HAPPIER_PUBLIC_SERVER_URL: '',
+      HAPPIER_LOCAL_SERVER_URL: '',
+      HAPPIER_PUBLIC_RELEASE_CHANNEL: 'stable',
+      HAPPIER_DAEMON_STARTUP_SOURCE: '',
     });
   });
 });

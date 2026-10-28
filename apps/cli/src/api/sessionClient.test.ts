@@ -484,6 +484,7 @@ describe('ApiSessionClient connection handling', () => {
                     lastDisconnectedAt: null,
                     lastErrorMessage: null,
                 }),
+                captureProbeReportScope: () => ({ generation: 1 }),
                 reportProbeResult,
             },
         });
@@ -1279,7 +1280,7 @@ describe('ApiSessionClient connection handling', () => {
             status: 'auth_failed',
             statusCode: status,
             errorMessage: expect.any(String),
-        } satisfies ReadinessProbeResult);
+        } satisfies ReadinessProbeResult, { generation: 1 });
     });
 
     it('keeps retryable session snapshot refresh failures operation-local', async () => {
@@ -1892,7 +1893,7 @@ describe('ApiSessionClient connection handling', () => {
             status: 'auth_failed',
             statusCode: 401,
             errorMessage: 'expired token',
-        });
+        }, { generation: 1 });
     });
 
     it('reports permission intent transcript auth failures to the session supervisor', async () => {
@@ -1909,7 +1910,7 @@ describe('ApiSessionClient connection handling', () => {
             status: 'auth_failed',
             statusCode: 403,
             errorMessage: 'forbidden',
-        });
+        }, { generation: 1 });
     });
 
     it('normalizes outbound ACP permission-request toolName to V2 canonical keys (supports TodoWrite)', async () => {
@@ -2202,7 +2203,7 @@ describe('ApiSessionClient connection handling', () => {
             status: 'auth_failed',
             statusCode: 426,
             errorMessage: 'This Happier session runner must be upgraded before it can sync sessions.',
-        });
+        }, { generation: 1 });
     });
 
     it('close tears down the supervised session socket and closes the user-scoped socket', async () => {

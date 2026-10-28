@@ -14,6 +14,14 @@ import {
 } from '@/theme/profiles/themeProfilePersistence';
 import { SessionListFocusedFolderV1Schema } from '@/sync/domains/session/folders';
 import {
+    DEFAULT_LOADING_INDICATOR_PAUSE_ID,
+    DEFAULT_LOADING_INDICATOR_SPEED_ID,
+    DEFAULT_LOADING_INDICATOR_STYLE_ID,
+    LoadingIndicatorPauseIdSchema,
+    LoadingIndicatorSpeedIdSchema,
+    LoadingIndicatorStyleIdSchema,
+} from './loadingIndicatorStyleSetting';
+import {
     SESSION_LIST_FOLDER_SORT_MODE_DEFAULT_V1,
     SESSION_LIST_FOLDER_SORT_MODES_V1,
 } from '@/sync/domains/session/listing/sessionListFolderSortMode';
@@ -169,6 +177,12 @@ export const LOCAL_SETTING_DEFINITIONS = defineSettingDefinitions({
         description: 'Enable backdrop blur effects behind modals and overlay menus',
         storageScope: 'local',
     },
+    hapticsEnabled: {
+        schema: z.boolean().catch(true),
+        default: true,
+        description: 'Enable haptic feedback on this device',
+        storageScope: 'local',
+    },
     uiContentWidthMode: {
         schema: z.enum(['compact', 'medium', 'full']),
         default: 'compact',
@@ -202,6 +216,27 @@ export const LOCAL_SETTING_DEFINITIONS = defineSettingDefinitions({
         schema: z.enum(['comfortable', 'cozy', 'compact']),
         default: 'cozy',
         description: 'Preferred item density for Item-based UI rows',
+        storageScope: 'local',
+        analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'enum', privacy: 'safe', identityScope: 'device_user' },
+    },
+    loadingIndicatorStyle: {
+        schema: LoadingIndicatorStyleIdSchema,
+        default: DEFAULT_LOADING_INDICATOR_STYLE_ID,
+        description: 'Which loading indicator spinners draw: a dotted Happier mark or H, or the classic ring',
+        storageScope: 'local',
+        analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'enum', privacy: 'safe', identityScope: 'device_user' },
+    },
+    loadingIndicatorSpeed: {
+        schema: LoadingIndicatorSpeedIdSchema,
+        default: DEFAULT_LOADING_INDICATOR_SPEED_ID,
+        description: 'How fast dot loading indicators play: slow, normal or fast',
+        storageScope: 'local',
+        analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'enum', privacy: 'safe', identityScope: 'device_user' },
+    },
+    loadingIndicatorPause: {
+        schema: LoadingIndicatorPauseIdSchema,
+        default: DEFAULT_LOADING_INDICATOR_PAUSE_ID,
+        description: 'How long dot loading indicators rest between loops: none, short or long',
         storageScope: 'local',
         analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'enum', privacy: 'safe', identityScope: 'device_user' },
     },
@@ -390,6 +425,19 @@ export const LOCAL_SETTING_DEFINITIONS = defineSettingDefinitions({
         description: 'Discover Codex pet packages from local Codex homes on this device',
         storageScope: 'local',
         analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'boolean', privacy: 'safe', identityScope: 'device_user' },
+    },
+    desktopAlwaysMoveDefaultFollowingService: {
+        schema: z.boolean(),
+        default: false,
+        description: 'Move this device\u2019s default-following background service with the selected default relay without asking',
+        storageScope: 'local',
+        analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'boolean', privacy: 'safe', identityScope: 'device_user' },
+    },
+    desktopKeptBackgroundService: {
+        schema: z.object({ relayKey: z.string().min(1), accountId: z.string().min(1).nullable() }).nullable().catch(null),
+        default: null,
+        description: 'The background service this device chose to keep as it is: its relay and account (D5)',
+        storageScope: 'local',
     },
     desktopPetOverlayEnabledOverride: {
         schema: PetEnabledOverrideSchema,

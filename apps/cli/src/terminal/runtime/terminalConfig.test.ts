@@ -77,6 +77,18 @@ describe('resolveTerminalRequestFromSpawnOptions', () => {
     expect(resolved).toEqual({ requested: 'plain' });
   });
 
+  it('preserves explicit Herdr and Zellij requests instead of silently spawning plain', () => {
+    expect(resolveTerminalRequestFromSpawnOptions({
+      happyHomeDir: '/home/user/.happy',
+      terminal: { mode: 'herdr', herdr: { sessionName: 'work' } },
+    })).toEqual({ requested: 'herdr', herdr: { sessionName: 'work' } });
+
+    expect(resolveTerminalRequestFromSpawnOptions({
+      happyHomeDir: '/home/user/.happy',
+      terminal: { mode: 'zellij' },
+    })).toEqual({ requested: 'zellij' });
+  });
+
   it('preserves explicit empty typed sessionName and null tmpDir when isolated=false', () => {
     const resolved = resolveTerminalRequestFromSpawnOptions({
       happyHomeDir: '/home/user/.happy',

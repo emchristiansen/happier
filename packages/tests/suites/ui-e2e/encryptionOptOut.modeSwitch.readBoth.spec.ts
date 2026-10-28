@@ -35,7 +35,7 @@ async function toggleAccountEncryptionMode(params: Readonly<{
   await expect(params.page.getByTestId('settings-account-encryption-mode-switch')).toHaveCount(1, { timeout: 120_000 });
   const migrateOk = params.page.waitForResponse(
     (resp) =>
-      resp.url().endsWith('/v1/account/encryption/migrate') && resp.request().method() === 'POST' && resp.status() === 200,
+      new URL(resp.url()).pathname === '/v1/account/encryption/migrate' && resp.request().method() === 'POST' && resp.status() === 200,
     { timeout: 60_000 },
   );
   await params.page.getByTestId('settings-account-encryption-mode-switch').click();
@@ -67,7 +67,7 @@ async function createNewSessionDraft(params: Readonly<{
   if (!draftId) throw new Error('new-session draft route did not establish a draftId');
   expect(draftId).toBe(requestedDraftId);
   const mutation = params.page.waitForResponse(
-    (response) => response.url().endsWith('/v1/account/session-drafts/mutate')
+    (response) => new URL(response.url()).pathname === '/v1/account/session-drafts/mutate'
       && response.request().method() === 'POST'
       && response.status() === 200,
     { timeout: 60_000 },
@@ -99,7 +99,7 @@ async function createExistingSessionDraft(params: Readonly<{
   const composer = params.page.getByTestId('session-composer-input');
   await expect(composer).toBeVisible({ timeout: 60_000 });
   const mutation = params.page.waitForResponse(
-    (response) => response.url().endsWith('/v1/account/session-drafts/mutate')
+    (response) => new URL(response.url()).pathname === '/v1/account/session-drafts/mutate'
       && response.request().method() === 'POST'
       && response.status() === 200,
     { timeout: 60_000 },
@@ -160,9 +160,6 @@ test.describe('ui e2e: encryption opt-out mode switching', () => {
         HAPPIER_FEATURE_ENCRYPTION__STORAGE_POLICY: 'optional',
         HAPPIER_FEATURE_ENCRYPTION__ALLOW_ACCOUNT_OPTOUT: '1',
         HAPPIER_FEATURE_SESSIONS_DRAFTS__ENABLED: '1',
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
       },
     });
 
@@ -183,9 +180,9 @@ test.describe('ui e2e: encryption opt-out mode switching', () => {
     await server?.stop().catch(() => {});
   });
 
-  test('switches modes and keeps old sessions readable (e2ee → plain → e2ee)', async ({ page }, testInfo) => {
-    // This scenario performs two real account migrations and three daemon-backed session create/send flows.
-    test.setTimeout(600_000);
+  test('switches modes and keeps old sessions readable (e2ee → plain → e2ee)', { tag: "@smoke" }, async ({ page }, testInfo) => {
+    // Auth, daemon, CLI, and browser phases enforce their own deadlines throughout this composed scenario.
+    test.setTimeout(0);
     if (!server || !ui) throw new Error('missing server/ui fixtures');
     if (!uiBaseUrl) throw new Error('missing ui base url');
 
@@ -193,6 +190,14 @@ test.describe('ui e2e: encryption opt-out mode switching', () => {
     await mkdir(testDir, { recursive: true });
 
     const diagnostics = collectBrowserDiagnostics({ page });
+    const daemonEnv = {
+      ...process.env,
+      HAPPIER_SERVER_URL: server.baseUrl,
+      HAPPIER_WEBAPP_URL: uiBaseUrl,
+      HAPPIER_CLAUDE_PATH: fakeClaudeFixturePath(),
+      HAPPIER_VARIANT: 'dev',
+      HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+    };
 
     let daemon: StartedDaemon | null = null;
     let thrown: unknown = null;
@@ -203,9 +208,7 @@ test.describe('ui e2e: encryption opt-out mode switching', () => {
         cliHomeDir,
         serverUrl: server.baseUrl,
         uiBaseUrl,
-        extraEnv: {
-          HAPPIER_CLAUDE_PATH: fakeClaudeFixturePath(),
-        },
+        extraEnv: daemonEnv,
       });
 
       const draftAText = `account-mode draft A ${run.runId}`;
@@ -261,6 +264,8 @@ test.describe('ui e2e: encryption opt-out mode switching', () => {
       expect(sessionADraft.envelope).toBe('encrypted');
 
       const migrateDraftsToPlain = await toggleAccountEncryptionMode({ page, uiBaseUrl, expectedMode: 'plain' });
+      // Converting Machine content retires its previous daemon encryption context.
+      daemon = await daemon.restart();
       expectCompleteDraftMigration({
         request: migrateDraftsToPlain,
         draftIds: [draftAId, draftBId],
@@ -313,6 +318,7 @@ test.describe('ui e2e: encryption opt-out mode switching', () => {
       await expect(page.getByText(msgB, { exact: true }).first()).toBeVisible({ timeout: 120_000 });
 
       const migrateDraftsToE2ee = await toggleAccountEncryptionMode({ page, uiBaseUrl, expectedMode: 'e2ee' });
+      daemon = await daemon.restart();
       expectCompleteDraftMigration({
         request: migrateDraftsToE2ee,
         draftIds: [draftAId, draftBId],

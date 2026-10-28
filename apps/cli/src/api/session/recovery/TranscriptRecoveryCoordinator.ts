@@ -1,4 +1,8 @@
-import type { ManagedConnectionSupervisor } from '@happier-dev/connection-supervisor';
+import type {
+  ManagedConnectionSupervisor,
+  ManagedProbeReportScope,
+  ReadinessProbeResult,
+} from '@happier-dev/connection-supervisor';
 
 import { readAuthenticationStatus, readHttpStatus } from '@/api/client/httpStatusError';
 import { configuration } from '@/configuration';
@@ -108,11 +112,12 @@ export class TranscriptRecoveryCoordinator {
       if (currentSupervisorDeferral) return currentSupervisorDeferral;
       const currentBackoffDeferral = this.readBackoffDeferral(key);
       if (currentBackoffDeferral) return currentBackoffDeferral;
+      const probeReportScope = params.supervisor.captureProbeReportScope?.();
 
       try {
-        return this.mapLookupOutcome(key, params.supervisor, await params.runRequest());
+        return this.mapLookupOutcome(key, params.supervisor, probeReportScope, await params.runRequest());
       } catch (error) {
-        return this.mapThrownError(key, params.supervisor, error);
+        return this.mapThrownError(key, params.supervisor, probeReportScope, error);
       }
     });
   }
@@ -131,6 +136,7 @@ export class TranscriptRecoveryCoordinator {
   private mapLookupOutcome(
     key: string,
     supervisor: ManagedConnectionSupervisor,
+    probeReportScope: ManagedProbeReportScope | undefined,
     outcome: TranscriptLookupOutcome,
   ): TranscriptRecoveryResult<TranscriptMessageLookupResult> {
     switch (outcome.type) {
@@ -141,7 +147,7 @@ export class TranscriptRecoveryCoordinator {
         this.clearBackoff(key);
         return { type: 'not_found' };
       case 'auth_failed':
-        supervisor.reportProbeResult?.({
+        this.reportAuthenticationFailure(supervisor, probeReportScope, {
           status: 'auth_failed',
           statusCode: outcome.statusCode,
           errorMessage: readErrorMessage(outcome.error),
@@ -159,11 +165,12 @@ export class TranscriptRecoveryCoordinator {
   private mapThrownError(
     key: string,
     supervisor: ManagedConnectionSupervisor,
+    probeReportScope: ManagedProbeReportScope | undefined,
     error: unknown,
   ): TranscriptRecoveryResult<TranscriptMessageLookupResult> {
     const authStatus = readAuthenticationStatus(error);
     if (authStatus !== null) {
-      supervisor.reportProbeResult?.({
+      this.reportAuthenticationFailure(supervisor, probeReportScope, {
         status: 'auth_failed',
         statusCode: authStatus,
         errorMessage: readErrorMessage(error),
@@ -179,6 +186,18 @@ export class TranscriptRecoveryCoordinator {
 
     this.applyBackoff(key);
     return { type: 'error', reason: 'protocol_error', error };
+  }
+
+  private reportAuthenticationFailure(
+    supervisor: ManagedConnectionSupervisor,
+    probeReportScope: ManagedProbeReportScope | undefined,
+    probe: Extract<ReadinessProbeResult, { status: 'auth_failed' }>,
+  ): void {
+    if (probeReportScope === undefined) {
+      supervisor.reportProbeResult?.(probe);
+      return;
+    }
+    supervisor.reportProbeResult?.(probe, probeReportScope);
   }
 
   private clearBackoff(key: string): void {

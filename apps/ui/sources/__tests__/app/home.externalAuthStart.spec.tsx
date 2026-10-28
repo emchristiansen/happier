@@ -197,7 +197,7 @@ afterEach(() => {
 });
 
 describe('Home external auth start', () => {
-    it('redirects first-launch Tauri desktop users into /setup before showing auth actions', async () => {
+    it('lands first-launch Tauri desktop users on the welcome screen without forcing a relay picker (R1)', async () => {
         tauriDesktopState.value = true;
 
         const Home = await loadHome();
@@ -207,12 +207,8 @@ describe('Home external auth start', () => {
         await renderScreen(<Home />);
         await flushHookEffects({ cycles: 1, turns: 2 });
 
-        expect(setPendingSetupIntentMock).toHaveBeenCalledWith({
-            branch: 'thisComputer',
-            phase: 'pre_auth',
-            relayUrl: 'http://api.example.test',
-        });
-        expect(expoRouterMock.spies.replace).toHaveBeenCalledWith('/setup');
+        expect(setPendingSetupIntentMock).not.toHaveBeenCalled();
+        expect(expoRouterMock.spies.replace).not.toHaveBeenCalledWith('/setup');
     });
 
     it('does not redirect browser-web users into /setup by default', async () => {
@@ -264,7 +260,7 @@ describe('Home external auth start', () => {
         const Home = await loadHome();
         getPendingSetupIntentMock.mockReturnValue({
             branch: 'thisComputer',
-            phase: 'dismissed',
+            phase: 'post_auth',
             relayUrl: 'http://api.example.test',
         });
         getServerFeaturesSnapshotMock.mockResolvedValue({
@@ -286,7 +282,41 @@ describe('Home external auth start', () => {
         expect(expoRouterMock.spies.push).toHaveBeenCalledWith('/setup?openCustom=1');
     });
 
-    it('uses /setup as the auth returnTo when a setup continuation is pending', async () => {
+    it('uses /setup as the auth returnTo only for a remote-machine continuation', async () => {
+        tauriDesktopState.value = true;
+
+        const Home = await loadHome();
+        const provider = {
+            id: 'github',
+            getExternalAuthUrl: vi.fn(async () => 'https://oauth.example.test/auth'),
+        };
+        getAuthProviderMock.mockReturnValue(provider);
+        getPendingSetupIntentMock.mockReturnValue({
+            branch: 'remoteMachine',
+            phase: 'awaiting_auth',
+            relayUrl: 'https://relay.remote.example.test',
+            machineId: 'machine-remote-1',
+        });
+        mockGithubAuthFeatures('provision', 'keyed');
+
+        const screen = await renderScreen(<Home />);
+        await flushHookEffects({ cycles: 1, turns: 2 });
+
+        const signupButton = findActionButton(screen, 'welcome-signup-provider');
+        await act(async () => {
+            await (signupButton.props.action ?? signupButton.props.onPress)();
+            await flushHookEffects({ cycles: 1, turns: 2 });
+        });
+
+        expect(tokenStorageMock.setPendingExternalAuth).toHaveBeenCalledWith(
+            expect.objectContaining({
+                provider: 'github',
+                returnTo: '/setup',
+            }),
+        );
+    });
+
+    it('returns a this-computer continuation to the root gate, not to /setup (R9/INV1)', async () => {
         tauriDesktopState.value = true;
 
         const Home = await loadHome();
@@ -314,7 +344,7 @@ describe('Home external auth start', () => {
         expect(tokenStorageMock.setPendingExternalAuth).toHaveBeenCalledWith(
             expect.objectContaining({
                 provider: 'github',
-                returnTo: '/setup',
+                returnTo: '/',
             }),
         );
     });

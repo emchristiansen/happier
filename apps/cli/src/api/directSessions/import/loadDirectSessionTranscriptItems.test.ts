@@ -4,6 +4,29 @@ import { describe, expect, it, vi } from 'vitest';
 import { loadDirectSessionTranscriptItems } from './loadDirectSessionTranscriptItems';
 
 describe('loadDirectSessionTranscriptItems', () => {
+  it('continues page-limited history from its adjacent cursor', async () => {
+    const readPage = vi.fn()
+      .mockResolvedValueOnce({
+        items: [{ id: 'newer', createdAtMs: 2, raw: { role: 'user' } }],
+        nextCursor: 'older-page',
+        hasMore: true,
+        truncated: true,
+        truncationReason: 'page_limit',
+      })
+      .mockResolvedValueOnce({
+        items: [{ id: 'older', createdAtMs: 1, raw: { role: 'user' } }],
+        nextCursor: null,
+        hasMore: false,
+        truncated: false,
+      });
+
+    await expect(loadDirectSessionTranscriptItems({ readPage })).resolves.toEqual([
+      expect.objectContaining({ id: 'older' }),
+      expect.objectContaining({ id: 'newer' }),
+    ]);
+    expect(readPage).toHaveBeenNthCalledWith(2, 'older-page');
+  });
+
   it('returns backward transcript pages in chronological order', async () => {
     const newestItem: DirectTranscriptRawMessageV1 = {
       id: 'newest-item',

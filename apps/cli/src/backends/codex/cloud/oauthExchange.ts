@@ -24,7 +24,7 @@ function parseJwtPayload(token: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-function extractAccountId(idToken: string): string {
+export function extractAccountId(idToken: string): string {
   const payload = parseJwtPayload(idToken);
   const direct = payload.chatgpt_account_id;
   if (typeof direct === 'string' && direct) return direct;

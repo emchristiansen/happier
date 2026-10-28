@@ -1,4 +1,3 @@
-import { stat } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 
 import type { ConnectedServiceResumeContinuityDiagnostics } from '@/backends/types';
@@ -52,14 +51,6 @@ function asNonEmptyString(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-async function statFile(path: string): Promise<boolean> {
-  try {
-    return (await stat(path)).isFile();
-  } catch {
-    return false;
-  }
-}
-
 function toResultOk(input: Readonly<{
   source: ReachabilitySource;
   resolvedPath: string | null;
@@ -103,20 +94,6 @@ export async function canResumeFromMaterializedStateCore(
   const candidatePersistedSessionFile = asNonEmptyString(input.candidatePersistedSessionFile);
   const manifest = input.manifest ?? await readConnectedServiceStateSharingManifest(input.targetMaterializedRoot);
   const diagnostics = manifest.diagnostics;
-  for (const mapping of manifest.sessionFileMappings) {
-    if (mapping.vendorResumeId !== input.vendorResumeId) continue;
-    const candidatePath = resolveManifestCandidatePath({
-      root: input.targetMaterializedRoot,
-      destinationPath: mapping.destinationPath,
-    });
-    if (!await statFile(candidatePath)) continue;
-    return toResultOk({
-      source: 'manifest_cache_validated',
-      resolvedPath: candidatePath,
-      effectiveStateMode: input.effectiveStateMode,
-    });
-  }
-
   const providerReachability = await input.verifyResumeReachable({
     targetMaterializedRoot: input.targetMaterializedRoot,
     targetMaterializedEnv: input.targetMaterializedEnv,
@@ -125,8 +102,14 @@ export async function canResumeFromMaterializedStateCore(
     candidatePersistedSessionFile: input.candidatePersistedSessionFile ?? null,
   });
   if (providerReachability.ok) {
+    const validatedManifestMapping = manifest.sessionFileMappings.some((mapping) =>
+      mapping.vendorResumeId === input.vendorResumeId
+      && resolveManifestCandidatePath({ root: input.targetMaterializedRoot, destinationPath: mapping.destinationPath })
+        === providerReachability.resolvedPath,
+    );
     return toResultOk({
-      source: candidatePersistedSessionFile && providerReachability.resolvedPath === candidatePersistedSessionFile
+      source: validatedManifestMapping ? 'manifest_cache_validated'
+        : candidatePersistedSessionFile && providerReachability.resolvedPath === candidatePersistedSessionFile
         ? 'persisted_file'
         : 'provider_search',
       resolvedPath: providerReachability.resolvedPath,

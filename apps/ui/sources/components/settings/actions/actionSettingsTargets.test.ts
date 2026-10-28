@@ -3,8 +3,24 @@ import { describe, expect, it } from 'vitest';
 import { DEFAULT_ACTIONS_SETTINGS_V1 } from '@happier-dev/protocol';
 
 import { setActionEnabled, setActionTargetApprovalRequired, setActionTargetSelected } from './actionSettingsTargets';
+import { applyActionSettingsTargetControlState, resolveActionSettingsTargetControlState } from './resolveActionSettingsControlState';
 
 describe('actionSettingsTargets', () => {
+    it.each(['session.archive', 'session.unarchive'] as const)('configures confirmation for %s UI buttons', (actionId) => {
+        const askFirst = applyActionSettingsTargetControlState({
+            settings: DEFAULT_ACTIONS_SETTINGS_V1,
+            actionId,
+            targetId: 'contextual_ui',
+            value: 'ask_first',
+        });
+        expect(resolveActionSettingsTargetControlState({ settings: askFirst, actionId, targetId: 'contextual_ui' }))
+            .toMatchObject({ kind: 'approval', value: 'ask_first', approvalSurface: 'ui_button' });
+        const allowed = applyActionSettingsTargetControlState({
+            settings: askFirst, actionId, targetId: 'contextual_ui', value: 'allowed',
+        });
+        expect(resolveActionSettingsTargetControlState({ settings: allowed, actionId, targetId: 'contextual_ui' }))
+            .toMatchObject({ kind: 'approval', value: 'allowed', approvalSurface: 'ui_button' });
+    });
     it('enables opt-in placements through enabledPlacements', () => {
         const next = setActionTargetSelected({
             settings: DEFAULT_ACTIONS_SETTINGS_V1,

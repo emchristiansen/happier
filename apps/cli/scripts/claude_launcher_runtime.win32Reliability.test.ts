@@ -23,6 +23,7 @@ describe('claude_launcher_runtime buildClaudeBinarySpawnInvocation', () => {
 
     expect(inv).toEqual({
       command: 'C:\\Windows\\System32\\cmd.exe',
+      providerIsChild: false,
       args: ['/d', '/s', '/c', 'C:\\Users\\me\\AppData\\Roaming\\npm\\claude.cmd', '--print', 'hello'],
     });
   });
@@ -39,6 +40,7 @@ describe('claude_launcher_runtime buildClaudeBinarySpawnInvocation', () => {
 
     expect(inv).toEqual({
       command: 'cmd.exe',
+      providerIsChild: false,
       args: ['/d', '/s', '/c', 'C:\\Users\\me\\AppData\\Local\\Claude\\claude.exe', '--version'],
     });
   });
@@ -52,6 +54,7 @@ describe('claude_launcher_runtime buildClaudeBinarySpawnInvocation', () => {
 
     expect(inv).toEqual({
       command: '/opt/homebrew/bin/claude',
+      providerIsChild: true,
       args: ['--version'],
     });
   });

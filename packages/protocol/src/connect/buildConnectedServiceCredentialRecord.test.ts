@@ -11,6 +11,18 @@ function rawFromUntypedCaller(value: unknown): ConnectedServiceOauthCredentialRa
 }
 
 describe('buildConnectedServiceCredentialRecord', () => {
+  it('retains the selected Antigravity project while removing arbitrary native credential metadata', () => {
+    const record = buildConnectedServiceCredentialRecord({
+      now: 1, serviceId: 'antigravity', profileId: 'personal', kind: 'oauth',
+      oauth: {
+        accessToken: 'access', refreshToken: 'refresh', idToken: null,
+        scope: null, tokenType: 'Bearer', providerAccountId: null, providerEmail: null,
+        raw: rawFromUntypedCaller({ project_id: ' selected-project ', client_secret: 'native-secret',
+          refresh_token: 'duplicate-refresh', arbitrary: true }),
+      },
+    });
+    expect(record.oauth?.raw).toEqual({ project_id: 'selected-project' });
+  });
   it('builds an oauth record for codex tokens', () => {
     const now = 1700000000000;
     const rec = buildConnectedServiceCredentialRecord({
@@ -70,6 +82,7 @@ describe('buildConnectedServiceCredentialRecord', () => {
           claudeAiOauth: {
             subscriptionType: 'max',
             rateLimitTier: 'max_20x',
+            organizationUuid: 'organization-id',
           },
         },
       },
@@ -79,6 +92,7 @@ describe('buildConnectedServiceCredentialRecord', () => {
       claudeAiOauth: {
         subscriptionType: 'max',
         rateLimitTier: 'max_20x',
+        organizationUuid: 'organization-id',
       },
     });
   });

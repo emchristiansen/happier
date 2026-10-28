@@ -17,7 +17,7 @@ vi.mock('@/utils/web/reactNativeScreensCjs', () => ({
 }));
 
 vi.mock('expo-clipboard', () => ({
-  setStringAsync: vi.fn(async () => {}),
+  setStringAsync: vi.fn(async () => true),
 }));
 
 const persistSnapshotMock = vi.fn(async (..._args: unknown[]) => {});

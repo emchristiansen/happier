@@ -1,32 +1,32 @@
 import type {
     ConnectedServiceQuotaRecoveryCreditV1,
     ConnectedServiceQuotaRecoveryCreditsV1,
+    ConnectedServiceQuotaRecoveryCreditDetailsV1,
+    ConnectedServiceQuotaRecoveryCreditDetailsByIdV1,
 } from '@happier-dev/protocol';
 
 import { formatResetCountdownDays, type ResetCountdownDaysFormatter } from './formatResetCountdown';
+import { isAvailableRecoveryCredit } from './connectedServiceQuotaRecoveryCreditSummary';
 
 export type QuotaResetRow = Readonly<{
-    /** Stable React key — `providerCreditId` when present, else the row index. */
+    /** Provider credit id, or the stable aggregate key. */
     key: string;
-    /** Provider credit id to consume, or `null` for the aggregate fallback. */
+    /** Actionable provider credit id; `null` for aggregate or informational rows. */
     consumableCreditId: string | null;
-    /** Whether the `Use` action is permitted (has an id, or is the aggregate). */
+    /** Whether the provider reports this credit as actionable. */
     canUse: boolean;
-    /** True for the single placeholder row when only an available count is known. */
+    /** True for the available count not covered by individually actionable details. */
     isAggregate: boolean;
     expiresAtMs: number | null;
     countdownLabel: string | null;
+    title?: string | null;
+    description?: string | null;
+    details?: ConnectedServiceQuotaRecoveryCreditDetailsV1;
 }>;
 
 function readProviderCreditId(credit: ConnectedServiceQuotaRecoveryCreditV1): string | null {
     const raw = typeof credit.providerCreditId === 'string' ? credit.providerCreditId.trim() : '';
     return raw.length > 0 ? raw : null;
-}
-
-function isAvailableCredit(credit: ConnectedServiceQuotaRecoveryCreditV1, nowMs: number): boolean {
-    if (credit.status !== 'available') return false;
-    if (typeof credit.expiresAtMs !== 'number' || !Number.isFinite(credit.expiresAtMs)) return true;
-    return credit.expiresAtMs > nowMs;
 }
 
 function normalizeFutureExpiry(expiresAtMs: number | null | undefined, nowMs: number): number | null {
@@ -37,7 +37,7 @@ function normalizeFutureExpiry(expiresAtMs: number | null | undefined, nowMs: nu
 /**
  * Build per-credit QUOTA RESETS rows from a recovery-credit summary.
  *
- * - No available count ⇒ no rows.
+ * - Identified, unexpired unknown credits are informational disabled rows.
  * - Empty `credits[]` + positive `availableCount` ⇒ one aggregate placeholder
  *   row (`consumableCreditId: null`, `canUse: true`) consumed via the summary.
  * - Detailed credits ⇒ at most `availableCount` individually consumable rows.
@@ -48,12 +48,14 @@ export function buildQuotaResetRows(
     recoveryCredits: ConnectedServiceQuotaRecoveryCreditsV1 | null | undefined,
     nowMs: number,
     formatter: ResetCountdownDaysFormatter,
+    recoveryCreditDetails?: ConnectedServiceQuotaRecoveryCreditDetailsByIdV1,
 ): QuotaResetRow[] {
-    if (!recoveryCredits || recoveryCredits.availableCount <= 0) return [];
+    if (!recoveryCredits) return [];
 
     const detailedCredits = Array.isArray(recoveryCredits.credits) ? recoveryCredits.credits : [];
 
     if (detailedCredits.length === 0) {
+        if (recoveryCredits.availableCount <= 0) return [];
         const expiresAtMs = normalizeFutureExpiry(recoveryCredits.nextExpiresAtMs, nowMs);
         return [{
             key: 'aggregate',
@@ -66,7 +68,7 @@ export function buildQuotaResetRows(
     }
 
     const individuallyConsumableCredits = detailedCredits
-        .filter((credit) => isAvailableCredit(credit, nowMs))
+        .filter((credit) => isAvailableRecoveryCredit(credit, nowMs))
         .map((credit) => ({ credit, consumableCreditId: readProviderCreditId(credit) }))
         .filter((entry): entry is Readonly<{
             credit: ConnectedServiceQuotaRecoveryCreditV1;
@@ -82,6 +84,9 @@ export function buildQuotaResetRows(
             isAggregate: false,
             expiresAtMs,
             countdownLabel: formatResetCountdownDays(nowMs, expiresAtMs, formatter),
+            title: credit.title ?? null,
+            description: credit.description ?? null,
+            ...(recoveryCreditDetails?.[consumableCreditId] ? { details: recoveryCreditDetails[consumableCreditId] } : {}),
         };
     });
     const aggregateRemainder = Math.max(0, recoveryCredits.availableCount - individuallyConsumableCredits.length);
@@ -94,6 +99,23 @@ export function buildQuotaResetRows(
             isAggregate: true,
             expiresAtMs,
             countdownLabel: formatResetCountdownDays(nowMs, expiresAtMs, formatter),
+        });
+    }
+    for (const credit of detailedCredits) {
+        if (credit.status !== 'unknown') continue;
+        const creditId = readProviderCreditId(credit);
+        if (!creditId || (typeof credit.expiresAtMs === 'number' && credit.expiresAtMs <= nowMs)) continue;
+        const expiresAtMs = normalizeFutureExpiry(credit.expiresAtMs, nowMs);
+        rows.push({
+            key: creditId,
+            consumableCreditId: null,
+            canUse: false,
+            isAggregate: false,
+            expiresAtMs,
+            countdownLabel: formatResetCountdownDays(nowMs, expiresAtMs, formatter),
+            title: credit.title ?? null,
+            description: credit.description ?? null,
+            ...(recoveryCreditDetails?.[creditId] ? { details: recoveryCreditDetails[creditId] } : {}),
         });
     }
     return rows;

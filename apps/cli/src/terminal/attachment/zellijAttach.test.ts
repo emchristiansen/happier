@@ -212,7 +212,7 @@ describe('runZellijAttach', () => {
         resolveZellijBinaryFn: async () => null,
         happyHomeDir: '/home/happier',
       })).resolves.toBe(1);
-      expect(errorSpy).toHaveBeenCalledWith(expect.anything(), expect.stringContaining('zellij is unavailable'));
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('zellij is unavailable'));
     } finally {
       errorSpy.mockRestore();
     }
@@ -245,10 +245,7 @@ describe('runZellijAttach', () => {
         },
         happyHomeDir: '/home/happier',
       })).resolves.toBe(1);
-      expect(errorSpy).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.stringContaining('Windows ARM64'),
-      );
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('Windows ARM64'));
       expect(focusPane).not.toHaveBeenCalled();
       expect(attachForeground).not.toHaveBeenCalled();
     } finally {

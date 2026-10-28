@@ -5,8 +5,11 @@ import { randomBytes } from 'node:crypto';
 
 import { configuration, reloadConfiguration } from '@/configuration';
 import { authChallenge, encodeBase64 } from '@/api/encryption';
+import { resolveDaemonSpawnSessionByNonce, spawnDaemonSession } from '@/daemon/controlClient';
 import { readCredentials, writeCredentialsLegacy } from '@/persistence';
+import type { SpawnDaemonSessionRequest } from '@/rpc/handlers/spawnSessionOptionsContract';
 import { isLocalishServerUrl } from '@/server/serverUrlClassification';
+import { waitForCondition } from '@/testkit/async/waitFor';
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
 import { spawnTestProcess } from '@/testkit/process/spawn';
@@ -24,6 +27,48 @@ export type PreparedDaemonTestHome = {
 export type DaemonIntegrationCredentialBootstrapResult =
   | { ready: true; bootstrapped: boolean }
   | { ready: false; reason: string };
+
+export async function spawnDaemonSessionWithResolvedIdentity(
+  request: SpawnDaemonSessionRequest,
+  waitOptions: Readonly<{ timeoutMs: number; intervalMs?: number; label: string }>,
+): Promise<{ success: true; sessionId: string }> {
+  const response = await spawnDaemonSession(request) as {
+    success?: unknown;
+    sessionId?: unknown;
+    spawnNonce?: unknown;
+  };
+  if (response.success !== true) {
+    throw new Error(`daemon spawn failed: ${JSON.stringify(response)}`);
+  }
+  if (typeof response.sessionId === 'string' && response.sessionId.length > 0) {
+    return { success: true, sessionId: response.sessionId };
+  }
+
+  const spawnNonce = typeof response.spawnNonce === 'string' ? response.spawnNonce.trim() : '';
+  if (!spawnNonce) {
+    throw new Error(`accepted daemon spawn did not provide a resolution nonce: ${JSON.stringify(response)}`);
+  }
+
+  let resolvedSessionId: string | null = null;
+  let terminalError: string | null = null;
+  await waitForCondition(async () => {
+    const resolution = await resolveDaemonSpawnSessionByNonce(spawnNonce);
+    if (resolution.status === 'success') {
+      resolvedSessionId = resolution.sessionId;
+      return true;
+    }
+    if (resolution.status === 'error') {
+      terminalError = `${resolution.errorCode}: ${resolution.errorMessage}`;
+      return true;
+    }
+    return false;
+  }, waitOptions);
+
+  if (!resolvedSessionId) {
+    throw new Error(terminalError ?? `daemon spawn identity did not resolve for nonce ${spawnNonce}`);
+  }
+  return { success: true, sessionId: resolvedSessionId };
+}
 
 async function copyIfExists(sourcePath: string, targetPath: string): Promise<void> {
   if (!existsSync(sourcePath)) {

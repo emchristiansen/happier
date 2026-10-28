@@ -1,22 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('./sharedManagedServer', () => ({
+vi.mock('./sharedManagedServer', async (importOriginal) => ({
+    ...await importOriginal<typeof import('./sharedManagedServer')>(),
     ensureSharedManagedOpenCodeServerBaseUrl: vi.fn(),
-    isLoopbackManagedOpenCodeBaseUrl: (rawBaseUrl: string) => {
-        const value = rawBaseUrl.trim();
-        if (!value) return false;
-        try {
-            const url = new URL(value);
-            if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
-            const port = Number.parseInt(url.port, 10);
-            if (!Number.isFinite(port) || port <= 0) return false;
-            const host = url.hostname.toLowerCase();
-            return host === 'localhost' || host === '::1' || host.startsWith('127.');
-        } catch {
-            return false;
-        }
-    },
-    readSharedManagedOpenCodeServerStateBestEffort: vi.fn(),
+    readSharedManagedOpenCodeServerStateBestEffort: vi.fn(async () => null),
+    readSharedManagedOpenCodeServerStateByBaseUrlBestEffort: vi.fn(async () => null),
 }));
 
 import { MessageBuffer } from '@/ui/ink/messageBuffer';
@@ -104,7 +92,7 @@ describe('createOpenCodeServerRuntimeClient sessionMessagesList managed retry', 
         vi.useRealTimers();
     });
 
-    it('treats too-small timeout overrides as invalid to avoid flaking managed OpenCode calls', async () => {
+    it('honors a positive subsecond timeout instead of renewing the remaining request budget', async () => {
         process.env.HAPPIER_OPENCODE_SERVER_URL = 'http://127.0.0.1:9999';
         process.env.HAPPIER_OPENCODE_SERVER_HTTP_TIMEOUT_MS = '25';
 
@@ -149,9 +137,8 @@ describe('createOpenCodeServerRuntimeClient sessionMessagesList managed retry', 
         });
 
         const statusPromise = client.sessionStatusList();
-        const assertion = expect(statusPromise).resolves.toEqual({});
-        await vi.advanceTimersByTimeAsync(50);
-        await assertion;
+        const assertion = expect(statusPromise).rejects.toThrow(/timed out/i);
+        await Promise.all([assertion, vi.advanceTimersByTimeAsync(50)]);
         vi.useRealTimers();
     });
 

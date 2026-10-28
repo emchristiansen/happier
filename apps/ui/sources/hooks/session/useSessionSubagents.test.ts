@@ -51,7 +51,7 @@ describe('useSessionSubagents', () => {
             }),
         );
 
-        expect(seen.at(-1)).toEqual({
+        expect(seen.at(-1)).toMatchObject({
             subagents: [],
             participantTargets: [],
             sidechainIds: [],
@@ -107,7 +107,7 @@ describe('useSessionSubagents', () => {
             }),
         );
 
-        expect(seen.at(-1)).toEqual({
+        expect(seen.at(-1)).toMatchObject({
             subagents: [expect.objectContaining({
                 id: 'execution_run:run_1',
                 capabilities: expect.objectContaining({

@@ -70,14 +70,16 @@ export type InstallForm = 'oneliner' | 'inspectable';
 export type InstallVariant = 'stable' | 'preview' | 'dev';
 
 /**
- * Download destinations. `android-apk` and `android-play-testing` are separate
- * because they are separate products from the visitor's point of view: one is a
- * direct APK off a GitHub release, the other is a closed-track opt-in that only
- * works after a Google account joins the tester list (src/data/downloads.ts).
+ * Download destinations. The three Android entries are separate because they
+ * are separate products from the visitor's point of view: `android-play` is the
+ * public Play listing, `android-apk` is a direct APK off a GitHub release, and
+ * `android-play-testing` is the legacy closed-track opt-in that only worked
+ * after a Google account joined the tester list (src/data/downloads.ts).
  * Collapsing them to "android" would hide exactly the thing worth knowing.
  */
 export type DownloadStore =
     | 'ios'
+    | 'android-play'
     | 'android-apk'
     | 'android-play-testing'
     | 'desktop'
@@ -94,6 +96,7 @@ export type OutboundDestination =
     | 'discord'
     | 'webapp'
     | 'app-store'
+    | 'google-play'
     | 'android-apk'
     | 'play-testing'
     | 'github-releases'
@@ -228,6 +231,14 @@ export const SECTION_NAMES = [
     'enterprise-zdr',
     'enterprise-licence',
     'enterprise-cta',
+    // /download. Three steps, because the page has three distinct jobs:
+    // 'download-hub' is every download and the auto-redirect (which emits
+    // download_badge_clicked itself, since location.replace is not a click the
+    // delegated listener can see), 'download-guidance' explains which surface
+    // to choose, and 'download-cli' is the install command.
+    'download-hub',
+    'download-guidance',
+    'download-cli',
 ] as const;
 
 export type SectionName = (typeof SECTION_NAMES)[number];

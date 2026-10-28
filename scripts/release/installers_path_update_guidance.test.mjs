@@ -15,11 +15,13 @@ async function sha256(path) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-test('install.sh updates bash rc + login files and prints a reload hint', async () => {
+for (const separateStateHome of [false, true]) {
+test(`install.sh updates bash rc + login files${separateStateHome ? ' with a separate data home' : ''} and prints a reload hint`, async () => {
   const root = await mkdtemp(join(tmpdir(), 'happier-installer-path-hint-'));
   const homeDir = join(root, 'home');
   const binDir = join(root, 'bin');
   const installDir = join(root, 'install');
+  const stateHomeDir = separateStateHome ? join(root, 'data') : installDir;
   const outBinDir = join(root, 'out-bin');
   const fixtureDir = join(root, 'fixture');
 
@@ -174,6 +176,7 @@ printf '%s' '${releaseJson}'
     PATH: `${binDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
     HAPPIER_PRODUCT: 'cli',
     HAPPIER_INSTALL_DIR: installDir,
+    HAPPIER_HOME_DIR: separateStateHome ? stateHomeDir : '',
     HAPPIER_BIN_DIR: outBinDir,
     HAPPIER_NONINTERACTIVE: '1',
     HAPPIER_GITHUB_TOKEN: '',
@@ -186,7 +189,7 @@ printf '%s' '${releaseJson}'
   assert.equal(res.status, 0, `installer failed:\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}\n`);
 
   const exportLine = `export PATH="${outBinDir}:$PATH"`;
-  const homeExportLine = `export HAPPIER_HOME_DIR="${installDir}"`;
+  const homeExportLine = `export HAPPIER_HOME_DIR="${stateHomeDir}"`;
   const bashrc = await readFile(join(homeDir, '.bashrc'), 'utf8');
   const profile = await readFile(join(homeDir, '.profile'), 'utf8');
   assert.ok(bashrc.includes(exportLine), 'expected installer to add PATH export to ~/.bashrc');
@@ -209,6 +212,7 @@ printf '%s' '${releaseJson}'
 
   await rm(root, { recursive: true, force: true });
 });
+}
 
 test('install.sh removes stale HAPPIER_HOME_DIR exports when reinstalling back to the default home', async () => {
   const root = await mkdtemp(join(tmpdir(), 'happier-installer-default-home-cleanup-'));
@@ -355,6 +359,8 @@ printf '%s' '${releaseJson}'
     PATH: `${binDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
     HAPPIER_PRODUCT: 'cli',
     HAPPIER_BIN_DIR: outBinDir,
+    HAPPIER_INSTALL_DIR: '',
+    HAPPIER_HOME_DIR: '',
     HAPPIER_NONINTERACTIVE: '1',
     HAPPIER_GITHUB_TOKEN: '',
     GITHUB_TOKEN: '',

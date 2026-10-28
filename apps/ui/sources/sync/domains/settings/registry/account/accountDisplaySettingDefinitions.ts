@@ -54,6 +54,20 @@ export const ACCOUNT_DISPLAY_SETTING_DEFINITIONS = defineSettingDefinitions({
         storageScope: 'account',
         analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'boolean', privacy: 'safe', identityScope: 'person' },
     },
+    showChatCodeBlockWrapControls: {
+        schema: z.boolean(),
+        default: true,
+        description: 'Whether to show per-block wrapping controls in chat code blocks',
+        storageScope: 'account',
+        analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'boolean', privacy: 'safe', identityScope: 'person' },
+    },
+    wrapChatCodeBlocks: {
+        schema: z.boolean(),
+        default: false,
+        description: 'Whether chat code blocks wrap long lines by default',
+        storageScope: 'account',
+        analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'boolean', privacy: 'safe', identityScope: 'person' },
+    },
     wrapLinesInDiffs: {
         schema: z.boolean(),
         default: false,

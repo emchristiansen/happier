@@ -10,7 +10,7 @@ vi.spyOn(globalThis, 'setInterval').mockImplementation(() => 0 as any);
 vi.spyOn(globalThis, 'clearInterval').mockImplementation(() => {});
 
 const clipboardMocks = vi.hoisted(() => ({
-    setStringAsync: vi.fn(async () => {}),
+    setStringAsync: vi.fn(async () => true),
 }));
 const modalMocks = vi.hoisted(() => ({
     alertAsync: vi.fn(async () => undefined),

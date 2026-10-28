@@ -10,7 +10,9 @@ import { run, runCapture } from './utils/proc/proc.mjs';
 import { happyMonorepoSubdirForComponent, isHappyMonorepoRoot } from './utils/paths/paths.mjs';
 import { parseGithubPullRequest } from './utils/git/refs.mjs';
 import { isTty, prompt, promptSelect, withRl } from './utils/cli/wizard.mjs';
+import { createStepPrinter } from '@happier-dev/cli-common/output';
 import { bold, cyan, dim, green, red, yellow } from './utils/ui/ansi.mjs';
+import { banner } from './utils/ui/layout.mjs';
 import { clipboardAvailable, copyTextToClipboard } from './utils/ui/clipboard.mjs';
 import { detectInstalledLlmTools } from './utils/llm/tools.mjs';
 import { launchLlmAssistant } from './utils/llm/assist.mjs';
@@ -375,103 +377,25 @@ async function resolveGitPath(repoRoot, relPath) {
   return rel.startsWith('/') ? rel : join(repoRoot, rel);
 }
 
-function isTestTty() {
-  return String(process.env.HAPPIER_STACK_TEST_TTY ?? '').trim() === '1';
-}
-
 function shouldShowProgress({ json, silent = false } = {}) {
   if (silent) return false;
   if (json) return false;
   return true;
 }
 
-function createProgressReporter({ enabled, label = '[monorepo]' } = {}) {
-  const on = Boolean(enabled);
-  const canSpin = on && isTty() && !isTestTty();
-  const frames = ['|', '/', '-', '\\'];
-
-  const line = (s) => {
-    // eslint-disable-next-line no-console
-    console.log(s);
-  };
+// Progress for long git steps, drawn by the canonical step printer (spinner + ✓/x with timing).
+function createProgressReporter({ enabled } = {}) {
+  const steps = createStepPrinter({ enabled: Boolean(enabled) });
 
   const spinner = (text) => {
-    const msg = String(text ?? '').trim();
-    if (!on) {
-      return {
-        update: () => {},
-        succeed: () => {},
-        fail: () => {},
-      };
-    }
-
-    if (!canSpin) {
-      line(`${dim(label)} ${msg}`);
-      return {
-        update: () => {},
-        succeed: (doneText) => {
-          const done = String(doneText ?? '').trim();
-          if (done) line(`${green('✓')} ${done}`);
-        },
-        fail: (failText) => {
-          const fail = String(failText ?? '').trim();
-          if (fail) line(`${yellow('!')} ${fail}`);
-        },
-      };
-    }
-
-    let idx = 0;
-    let current = msg;
-    let active = true;
-
-    const render = () => {
-      if (!active) return;
-      const f = frames[idx % frames.length];
-      idx += 1;
-      try {
-        process.stdout.write(`\r${dim(label)} ${current} ${dim(f)}   `);
-      } catch {
-        // ignore
-      }
-    };
-
-    // Initial render + keepalive.
-    render();
-    const t = setInterval(render, 120);
-
-    const stop = () => {
-      active = false;
-      try {
-        clearInterval(t);
-      } catch {
-        // ignore
-      }
-      try {
-        process.stdout.write('\r' + ' '.repeat(Math.min(140, current.length + String(label).length + 16)) + '\r');
-      } catch {
-        // ignore
-      }
-    };
-
+    steps.start(String(text ?? '').trim());
     return {
-      update: (nextText) => {
-        current = String(nextText ?? '').trim() || current;
-        render();
-      },
-      succeed: (doneText) => {
-        stop();
-        const done = String(doneText ?? '').trim();
-        if (done) line(`${green('✓')} ${done}`);
-      },
-      fail: (failText) => {
-        stop();
-        const fail = String(failText ?? '').trim();
-        if (fail) line(`${yellow('!')} ${fail}`);
-      },
+      succeed: (doneText) => steps.stop('✓', String(doneText ?? '').trim() || String(text ?? '').trim()),
+      fail: (failText) => steps.stop('x', String(failText ?? '').trim() || String(text ?? '').trim()),
     };
   };
 
-  return { spinner, line };
+  return { spinner };
 }
 
 function section(title) {
@@ -800,19 +724,11 @@ async function applyPatches({ targetRepoRoot, directory, patches, threeWay, skip
   const failed = [];
   const total = patches.length;
   const targetLabel = directory ? `${directory}/` : '.';
-  const spin = progress?.spinner?.(`Applying patches into ${targetLabel} ${dim(`(0/${total})`)}`);
-  let lastUpdateAt = 0;
+  // One step for the whole series: a per-patch relabel would print a line per patch when not animated.
+  const spin = progress?.spinner?.(`Applying ${total} ${total === 1 ? 'patch' : 'patches'} into ${targetLabel}`);
 
   for (let i = 0; i < patches.length; i++) {
     const patch = patches[i];
-    if (spin?.update) {
-      const now = Date.now();
-      // Avoid hammering the terminal. Update at most ~5x/sec.
-      if (now - lastUpdateAt > 200) {
-        lastUpdateAt = now;
-        spin.update(`Applying patches into ${targetLabel} ${dim(`(${i + 1}/${total})`)}`);
-      }
-    }
     const patchFile = basename(patch);
     // eslint-disable-next-line no-await-in-loop
     const patchText = await readFile(patch, 'utf-8');
@@ -907,6 +823,7 @@ async function applyPatches({ targetRepoRoot, directory, patches, threeWay, skip
         paths: Array.from(new Set([...(applyMeta.paths ?? []), ...(amMeta.paths ?? [])])),
       });
       if (!continueOnFailure) {
+        spin?.fail?.(`Stopped applying patches into ${targetLabel} at ${subject || patchFile}`);
         throw new Error(
           [
             `[monorepo] failed applying patch: ${subject || patchFile}`,
@@ -926,9 +843,9 @@ async function applyPatches({ targetRepoRoot, directory, patches, threeWay, skip
     }
   }
 
-  spin?.succeed?.(
-    `Applied patches into ${targetLabel} ${dim(`(applied=${applied.length} skipped=${skippedAlreadyApplied.length + skippedAlreadyExistsIdentical.length} failed=${failed.length})`)}`
-  );
+  const summary = `Applied patches into ${targetLabel} ${dim(`(applied=${applied.length} skipped=${skippedAlreadyApplied.length + skippedAlreadyExistsIdentical.length} failed=${failed.length})`)}`;
+  if (failed.length > 0) spin?.fail?.(summary);
+  else spin?.succeed?.(summary);
   return {
     applied,
     skippedAlreadyApplied,
@@ -1535,7 +1452,7 @@ async function cmdPortGuide({ kv, flags, json }) {
     console.log(
       [
         '',
-        bold(`✨ ${cyan('hstack')} monorepo port ✨`),
+        banner('hstack monorepo port'),
         '',
         'This wizard ports commits from split repos into the Happy monorepo layout:',
         `- ${cyan('happy')} → apps/ui/ (or legacy expo-app/)`,

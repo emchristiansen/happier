@@ -41,6 +41,10 @@ function normalizeStatus(value: unknown): string | null {
   return /^[1-5]\d{2}$/u.test(status) ? status : null;
 }
 
+function hasProviderTimeoutEvidence(...values: Array<string | null>): boolean {
+  return values.some((value) => value !== null && /\b(?:timeout|timed out|etimedout)\b/iu.test(value));
+}
+
 function parseProviderErrorText(value: unknown): Record<string, unknown> | null {
   if (typeof value !== 'string' || value.length > 10_000) return null;
   const jsonStart = value.indexOf('{');
@@ -56,6 +60,7 @@ function readStructuredFields(payload: Record<string, unknown>): {
   code: string | null;
   status: string | null;
   message: string | null;
+  isTimeout: boolean;
 } {
   const messageRecord = asRecord(payload.message);
   const rawErrorText = messageRecord?.errorMessage
@@ -97,9 +102,10 @@ function readStructuredFields(payload: Record<string, unknown>): {
     payload.error_message,
     payload.detail,
     typeof payload.error === 'string' ? payload.error : null,
+    rawErrorText,
   ].map(sanitizeText).find((value): value is string => value !== null) ?? null;
 
-  return { code, status, message };
+  return { code, status, message, isTimeout: hasProviderTimeoutEvidence(code, message) };
 }
 
 function diagnosticPrefix(kind: FailureKind): string {
@@ -141,7 +147,7 @@ export function normalizePiProviderFailure(
     : `${diagnosticPrefix(kind)}${bareSuffix}`;
   return Object.freeze({
     classification: 'pi_provider_failure',
-    code: fields.code ?? 'pi_provider_session_error',
+    code: fields.code ?? (fields.isTimeout ? 'provider_timeout' : 'pi_provider_session_error'),
     sanitizedPreview,
   });
 }

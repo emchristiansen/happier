@@ -9,6 +9,7 @@ import {
 } from '@/sync/domains/session/agentActivity';
 import type { Message } from '@/sync/domains/messages/messageTypes';
 import { listSessionBackgroundTaskRecords } from '@/sync/domains/sessionActivity/sessionBackgroundTaskRecords';
+import { useSocketStatus } from '@/sync/domains/state/storage';
 
 /**
  * The durable background-task records for one session, refreshed on the session's own live pointer.
@@ -40,8 +41,8 @@ export const EMPTY_SESSION_BACKGROUND_TASK_ACTIVITY: SessionBackgroundTaskActivi
 export function useSessionBackgroundTaskActivity(params: Readonly<{
     sessionId: string;
     /**
-     * The session's runtime-activity projection revision. Advancing it is the only thing that makes
-     * this refetch, so a surface that does not have it gets one load and no churn.
+     * The session's runtime-activity projection revision. A transition or socket reconnect
+     * invalidates the inventory without polling.
      */
     activityRevision?: number | null;
     /**
@@ -54,15 +55,23 @@ export function useSessionBackgroundTaskActivity(params: Readonly<{
     enabled?: boolean;
 }>): SessionBackgroundTaskActivity {
     const { activityRevision, sessionId } = params;
+    const connectionGeneration = useSocketStatus().lastConnectedAt;
     const enabled = params.enabled !== false
         && sessionId.trim().length > 0
         && params.hasEverBeenActive !== false;
 
-    const [records, setRecords] = React.useState<readonly SessionBackgroundTaskRecordV1[]>(NO_RECORDS);
+    const [snapshot, setSnapshot] = React.useState<Readonly<{
+        sessionId: string;
+        records: readonly SessionBackgroundTaskRecordV1[];
+    }>>({ sessionId, records: NO_RECORDS });
+    // Last-known records belong to the session that supplied them. A route change cannot
+    // borrow the previous session's inventory while its own read is pending or failed.
+    const records = snapshot.sessionId === sessionId ? snapshot.records : NO_RECORDS;
 
     React.useEffect(() => {
         if (!enabled) {
-            setRecords(NO_RECORDS);
+            setSnapshot((previous) => previous.sessionId === sessionId && previous.records.length === 0
+                ? previous : { sessionId, records: NO_RECORDS });
             return undefined;
         }
         let cancelled = false;
@@ -71,18 +80,20 @@ export function useSessionBackgroundTaskActivity(params: Readonly<{
                 if (cancelled) return;
                 // Referential stability: an unchanged page must hand back the previous array so the
                 // merge below it, and every memoized row under that, sees no change at all.
-                setRecords((previous) => (areBackgroundTaskRecordsEquivalent(previous, next)
+                setSnapshot((previous) => (previous.sessionId === sessionId
+                    && areBackgroundTaskRecordsEquivalent(previous.records, next)
                     ? previous
-                    : next));
+                    : { sessionId, records: next }));
             })
             .catch(() => {
-                // The list helper already fails soft to an empty page; this only catches a rejected
-                // decrypt. Keep the last known records rather than claiming the tasks vanished.
+                if (cancelled) return;
+                // No private payloads or credentials in the default-visible failure signal.
+                console.warn('[SYNC] Background task inventory refresh failed; retaining last-known records');
             });
         return () => {
             cancelled = true;
         };
-    }, [activityRevision, enabled, sessionId]);
+    }, [activityRevision, connectionGeneration, enabled, sessionId]);
 
     return React.useMemo(() => {
         if (records.length === 0) return EMPTY_SESSION_BACKGROUND_TASK_ACTIVITY;

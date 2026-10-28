@@ -12,6 +12,7 @@ import * as catalog from './catalog';
 import {
   AGENTS,
   notifyTerminalAttachmentRetiredThroughCatalog,
+  resolveTerminalAttachmentControlDescriptorStatusThroughCatalog,
   getAcpForkContinuationHandler,
   getConnectedServiceMaterializer,
   getConnectedServiceStateSharingDescriptor,
@@ -29,6 +30,30 @@ import {
 import { DEFAULT_CATALOG_AGENT_ID } from './types';
 
 describe('AGENTS', () => {
+  it('distinguishes providers without attachment-bound control descriptors from missing descriptors', async () => {
+    const originalClaude = AGENTS.claude;
+    const originalCodex = AGENTS.codex;
+    const hasTerminalAttachmentControlDescriptor = vi.fn(async () => false);
+    AGENTS.claude = originalClaude ? { ...originalClaude, hasTerminalAttachmentControlDescriptor } : originalClaude;
+    AGENTS.codex = originalCodex ? { ...originalCodex, hasTerminalAttachmentControlDescriptor: undefined } : originalCodex;
+    const input = {
+      happyHomeDir: '/tmp/happier',
+      sessionId: 'session-1',
+      attachmentId: 'attachment-1' as never,
+    };
+
+    try {
+      await expect(resolveTerminalAttachmentControlDescriptorStatusThroughCatalog('codex', input))
+        .resolves.toBe('not_applicable');
+      await expect(resolveTerminalAttachmentControlDescriptorStatusThroughCatalog('claude', input))
+        .resolves.toBe('missing');
+      expect(hasTerminalAttachmentControlDescriptor).toHaveBeenCalledOnce();
+    } finally {
+      AGENTS.claude = originalClaude;
+      AGENTS.codex = originalCodex;
+    }
+  });
+
   it('fans exact terminal retirement out through provider-owned lifecycle hooks', async () => {
     const original = AGENTS.codex;
     const onTerminalAttachmentRetired = vi.fn(async () => {});
@@ -168,6 +193,10 @@ describe('AGENTS', () => {
   it('registers runnable CLI command handlers for built-in generic ACP agents', () => {
     expect(requireCatalogEntry('customAcp').getCliCommandHandler).toBeTypeOf('function');
     expect(requireCatalogEntry('kiro').getCliCommandHandler).toBeTypeOf('function');
+    expect(requireCatalogEntry('devin').getCliCommandHandler).toBeTypeOf('function');
+    expect(requireCatalogEntry('fx' as never).getCliCommandHandler).toBeTypeOf('function');
+    expect(requireCatalogEntry('droid' as never).getCliCommandHandler).toBeTypeOf('function');
+    expect(requireCatalogEntry('codebuddy').getCliCommandHandler).toBeTypeOf('function');
   });
 
   it('registers Cursor through provider-owned ACP, auth, detect, and preflight hooks', async () => {
@@ -187,7 +216,6 @@ describe('AGENTS', () => {
     await expect(entry.getPreflightSessionControlsProbeAdapter!()).resolves.toMatchObject({
       probeModelsRaw: expect.any(Function),
       probeModesRaw: expect.any(Function),
-      cliModelsCommandArgs: ['models'],
       probeConfigOptionsRaw: expect.any(Function),
     });
   });
@@ -225,9 +253,18 @@ describe('AGENTS', () => {
       getActivity: expect.any(Function),
       resolveTakeoverSpawnOptions: expect.any(Function),
     });
+    for (const providerId of ['auggie', 'qwen', 'kilo', 'devin', 'kimi', 'copilot', 'fx'] as const) {
+      await expect(getDirectSessionProviderOps(providerId)).resolves.toMatchObject({
+        listCandidates: expect.any(Function),
+      });
+    }
   });
 
   it('loads provider-attach ops through backend catalog hooks only for supporting providers', async () => {
+    await expect(getProviderAttachOps('codex')).resolves.toMatchObject({
+      evaluateEligibility: expect.any(Function),
+      runAttach: expect.any(Function),
+    });
     await expect(getProviderAttachOps('opencode')).resolves.toMatchObject({
       evaluateEligibility: expect.any(Function),
       runAttach: expect.any(Function),

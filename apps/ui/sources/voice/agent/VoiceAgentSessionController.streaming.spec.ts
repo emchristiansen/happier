@@ -443,7 +443,7 @@ describe('VoiceAgentSessionController (streaming)', () => {
   it('surfaces a clear error when starting local voice on a target flavor without local control support', async () => {
     setVoiceControllerState({
       sessions: {
-        s1: { id: 's1', active: true, presence: 'online', modelMode: 'default', metadata: { flavor: 'kimi' } },
+        s1: { id: 's1', active: true, presence: 'online', modelMode: 'default', metadata: { flavor: 'gemini' } },
       },
     });
 

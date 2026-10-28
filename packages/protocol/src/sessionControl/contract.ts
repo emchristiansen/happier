@@ -13,6 +13,7 @@ import { ActionUiPlacementSchema } from '../actions/actionUiPlacements.js';
 import { SubAgentRunResultV2Schema } from '../tools/v2/index.js';
 import { StopSessionIncompleteReasonSchema } from '../sessionStop.js';
 import { AccountEncryptionModeSchema } from '../features/payload/capabilities/encryptionCapabilities.js';
+import { SESSION_PERMISSION_MODES } from '../sessionMetadata/sessionPermissionModes.js';
 import {
   PrimaryTurnStatusV1Schema,
   SessionRuntimeIssueV1Schema,
@@ -109,6 +110,9 @@ export {
   SessionUsageLimitRecoveryResumePromptModeV1Schema,
   SessionUsageLimitRecoveryV1Schema,
   resolveSessionUsageLimitRecoveryResumePromptModeV1,
+  buildUsageLimitIssueFingerprint,
+  isSessionUsageLimitRecoveryForIssue,
+  readSessionUsageLimitRecoveryForIssue,
   type SessionUsageLimitRecoveryAuthSelectionV1,
   type SessionUsageLimitRecoveryResumePromptModeV1,
   type SessionUsageLimitRecoveryV1,
@@ -184,7 +188,7 @@ export type SessionControlEnvelopeBase = z.infer<typeof SessionControlEnvelopeBa
 export const AuthStatusResultSchema = z.object({
   authenticated: z.literal(true),
   encryption: z.object({
-    type: z.enum(['legacy', 'dataKey']),
+    type: z.enum(['legacy', 'dataKey', 'tokenOnly']),
   }).passthrough(),
   machineRegistered: z.boolean(),
   machineId: z.string().min(1).optional(),
@@ -207,6 +211,8 @@ export const SessionSummarySchema = z.object({
   title: z.string().min(1).optional(),
   path: z.string().optional(),
   host: z.string().optional(),
+  machineId: z.string().trim().min(1).optional(),
+  permissionMode: z.enum(SESSION_PERMISSION_MODES).exclude(['acceptEdits', 'bypassPermissions']).optional(),
   share: z.object({
     accessLevel: z.string().min(1),
     canApprovePermissions: z.boolean(),
@@ -215,7 +221,7 @@ export const SessionSummarySchema = z.object({
   systemPurpose: z.string().nullable().optional(),
   encryptionMode: AccountEncryptionModeSchema.optional(),
   encryption: z.object({
-    type: z.enum(['legacy', 'dataKey']),
+    type: z.enum(['legacy', 'dataKey', 'plain']),
   }).passthrough(),
   latestTurnId: z.string().min(1).nullable().optional(),
   latestTurnStatus: PrimaryTurnStatusV1Schema.nullable().optional(),
@@ -225,6 +231,7 @@ export const SessionSummarySchema = z.object({
   runtimeActivityObservedAt: z.number().int().nonnegative().nullable().optional(),
   runtimeActivityRevision: z.number().int().nonnegative().safe().optional(),
   pendingActivationAuthorization: PendingActivationAuthorizationV1Schema.optional(),
+  rollbackEligibleTurnStarts: z.array(z.number().int().nonnegative()).optional(),
 }).passthrough().superRefine(refineRuntimeActivityProjectionFields);
 export type SessionSummary = z.infer<typeof SessionSummarySchema>;
 
@@ -352,6 +359,7 @@ export const V2SessionRecordSchema = z
     runtimeActivityObservedAt: z.number().int().nonnegative().nullable().optional(),
     runtimeActivityRevision: z.number().int().nonnegative().safe().optional(),
     pendingActivationAuthorization: PendingActivationAuthorizationV1Schema.optional(),
+    rollbackEligibleTurnStarts: z.array(z.number().int().nonnegative()).optional(),
   })
   .passthrough()
   .superRefine(refineRuntimeActivityProjectionFields);
@@ -454,6 +462,20 @@ export type V2SessionMessageResponse = z.infer<typeof V2SessionMessageResponseSc
 
 export const SessionStatusResultSchema = z.object({
   session: SessionSummarySchema,
+  // Legacy status producers did not read recovery metadata. Omission is not absence.
+  usageLimitRecovery: z.discriminatedUnion('state', [
+    z.object({
+      state: z.literal('present'),
+      metadataVersion: z.number().int().nonnegative(),
+      recovery: SessionUsageLimitRecoveryV1Schema.pick({
+        status: true, issueFingerprint: true, armedAtMs: true, runtimeAuthRecoveryAttemptId: true,
+      }),
+    }).strict(),
+    z.object({ state: z.literal('absent'), metadataVersion: z.number().int().nonnegative() }).strict(),
+    z.object({ state: z.literal('malformed'), metadataVersion: z.number().int().nonnegative() }).strict(),
+    z.object({ state: z.literal('unreadable'), metadataVersion: z.number().int().nonnegative() }).strict(),
+    z.object({ state: z.literal('unsupported') }).strict(),
+  ]).default({ state: 'unsupported' }),
   agentState: z.object({
     controlledByUser: z.boolean().optional(),
     pendingRequestsCount: z.number().int().nonnegative(),

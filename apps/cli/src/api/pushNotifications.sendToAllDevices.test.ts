@@ -115,6 +115,36 @@ describe('PushNotificationClient.sendToAllDevicesAsync', () => {
     expect(logger.infoFile).toHaveBeenCalledWith('[PUSH] Expo rejected oversized notification payload', { count: 1 });
   });
 
+  it.each(['ticket', 'receipt'])('reports invalid Expo credentials from a %s without retrying a permanent failure', async (source) => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(axios.get).mockResolvedValueOnce({
+        data: { tokens: [{ id: '1', token: 'ExponentPushToken[a]' }] },
+      }).mockResolvedValueOnce({ data: { badgeCount: 0 } });
+      sendPushNotificationsAsyncSpy.mockResolvedValueOnce(source === 'ticket'
+        ? [{ status: 'error', details: { error: 'InvalidCredentials' } }]
+        : [{ status: 'ok', id: 'credential-error' }]);
+      if (source === 'receipt') {
+        getPushNotificationReceiptsAsyncSpy.mockResolvedValueOnce({
+          'credential-error': { status: 'error', details: { error: 'InvalidCredentials' } },
+        });
+      }
+      const result = new PushNotificationClient('t').sendToAllDevicesAsync('Title', 'Body');
+      const rejected = expect(result).rejects.toThrow(/InvalidCredentials/);
+
+      await vi.advanceTimersByTimeAsync(300_000);
+
+      await rejected;
+      expect(sendPushNotificationsAsyncSpy).toHaveBeenCalledTimes(1);
+      expect(logger.infoFile).toHaveBeenCalledWith(
+        '[PUSH] Expo rejected push notification credentials',
+        expect.objectContaining({ error: 'InvalidCredentials' }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('uses token-specific clientServerUrl when present', async () => {
     (axios as any).get.mockResolvedValue({
       data: {
@@ -352,5 +382,21 @@ describe('PushNotificationClient.sendToAllDevicesAsync', () => {
         token: 'ExponentPushToken[dead-token]',
       }),
     );
+  });
+});
+
+
+describe('focused computer push token query', () => {
+  it('asks freshly for suppression and resumes on the next delivery after blur', async () => {
+    sendPushNotificationsAsyncSpy.mockClear();
+    vi.mocked(axios.get).mockReset();
+    vi.mocked(axios.get).mockResolvedValueOnce({ data: { tokens: [], suppressedByFocusedComputer: true } });
+    const client = new PushNotificationClient('t', 'https://api.example.test');
+    await client.sendToAllDevicesAsync('Ready', 'Done', { sessionId: 's' }, { suppressIfComputerFocused: true });
+    expect(vi.mocked(axios.get).mock.calls[0][0]).toBe('https://api.example.test/v1/push-tokens?suppressIfComputerFocused=1');
+    expect(sendPushNotificationsAsyncSpy).not.toHaveBeenCalled();
+    vi.mocked(axios.get).mockResolvedValueOnce({ data: { tokens: [{ id: '1', token: 'ExponentPushToken[a]' }] } }).mockResolvedValueOnce({ data: { badgeCount: 0 } });
+    await client.sendToAllDevicesAsync('Ready', 'Done', { sessionId: 's' }, { suppressIfComputerFocused: true });
+    expect(sendPushNotificationsAsyncSpy).toHaveBeenCalledTimes(1);
   });
 });

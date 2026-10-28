@@ -1,3 +1,4 @@
+import { providers } from '@happier-dev/agents';
 import type { SessionMessageRole } from '@happier-dev/protocol';
 
 import type { MessageMeta } from '../domains/messages/messageMetaTypes';
@@ -10,6 +11,7 @@ import {
 import { markUnsupportedContentMeta } from '../domains/messages/unsupportedContentMeta';
 import { hasSessionMediaRenderItems } from '../domains/sessionMedia/sessionMediaMessageMeta';
 import { rawRecordSchema, type AgentEvent, type RawAgentContent, type RawRecord, type UsageData } from './schemas';
+import { isSessionToolAnswerDeliveryMeta, normalizeClaudeActivityStatusSignal } from '@happier-dev/protocol';
 import { buildUsageDataFromTokenCountMessage } from './tokenCountUsage';
 
 // Normalized types
@@ -354,6 +356,7 @@ export function normalizeRawMessage(
             };
     }
     const raw = parsed.data as RawRecord;
+    if (raw.role === 'user' && isSessionToolAnswerDeliveryMeta(raw.meta)) return null;
 
     const toolResultContentToText = (content: unknown): string => {
         if (content === null || content === undefined) return '';
@@ -529,10 +532,25 @@ export function normalizeRawMessage(
         };
 
 			        if (raw.content.type === 'output') {
-            // Skip Meta messages
-            if (raw.content.data.isMeta) {
+            const outputData: unknown = raw.content.data;
+            const outputOrigin = isPlainRecord(outputData) ? outputData.origin : null;
+            const nativeTaskNotification = isPlainRecord(outputOrigin) && outputOrigin.kind === 'task-notification';
+            // Older scanners persisted settled native task results with isMeta. Admit only the
+            // original tool result, never unrelated metadata or copied notification text.
+            const nativeTaskResult = nativeTaskNotification && isOutputUserData(raw.content.data)
+                && Array.isArray(raw.content.data.message.content)
+                && raw.content.data.message.content.length === 1
+                && raw.content.data.message.content.every(block => isPlainRecord(block)
+                    && block.type === 'tool_result' && typeof block.tool_use_id === 'string'
+                    && typeof outputOrigin.toolUseId === 'string' && outputOrigin.toolUseId === block.tool_use_id);
+            if (raw.content.data.isMeta && !nativeTaskResult) {
                 return null;
             }
+            // cli-v0.2.16 wrote is_error:false even for failed/stopped notifications.
+            // Translate that released envelope through the protocol's status owner.
+            const nativeTaskStatus = raw.content.data.isMeta && nativeTaskResult
+                ? normalizeClaudeActivityStatusSignal(outputOrigin.status)
+                : null;
 
             // Skip compact summary messages
             if (raw.content.data.isCompactSummary) {
@@ -566,8 +584,14 @@ export function normalizeRawMessage(
                 } satisfies NormalizedMessage;
             }
 
-            // Progress records are transport-level status updates and are not rendered in transcript.
-            if (raw.content.data.type === 'progress' || raw.content.data.type === 'tool_progress') {
+            // Use the same provider-owned exclusions as live SDK and JSONL ingestion, including
+            // internal events persisted by older writers. Unknown event types remain visible.
+            if (providers.claude.isClaudeInternalEventType(raw.content.data.type)) {
+                return null;
+            }
+
+            // Progress can carry sidechain data used by CLI observers, but is not a UI row.
+            if (raw.content.data.type === 'progress') {
                 return null;
             }
 
@@ -687,7 +711,7 @@ export function normalizeRawMessage(
 
                 // Handle regular user messages
                 if (raw.content.data.message && typeof raw.content.data.message.content === 'string') {
-                    if (isClaudeTaskNotificationText(raw.content.data.message.content)) {
+                    if (nativeTaskNotification && isClaudeTaskNotificationText(raw.content.data.message.content)) {
                         return null;
                     }
                     const normalized = {
@@ -719,11 +743,17 @@ export function normalizeRawMessage(
 	                    for (let c of raw.content.data.message.content) {
 		                        if (c.type === 'tool_result') {
 		                            const rawResultContent = raw.content.data.toolUseResult ?? c.content;
+                                    // Historical failed/stopped results only carried status in origin.
+                                    // Use the canonical Task result envelope so downstream readers
+                                    // retain the terminal status as well as the original findings.
+                                    const resultContent = nativeTaskStatus === 'failed' || nativeTaskStatus === 'cancelled'
+                                        ? { status: nativeTaskStatus, content: toolResultContentToText(rawResultContent) }
+                                        : rawResultContent;
 		                            content.push({
 		                                ...c,  // WOLOG: Preserve all fields including unknown ones
 	                                type: 'tool-result',
-	                                content: toolResultContentToText(rawResultContent),
-	                                is_error: c.is_error || false,
+	                                content: toolResultContentToText(resultContent),
+	                                is_error: nativeTaskStatus === 'failed' || nativeTaskStatus === 'cancelled' || c.is_error || false,
 		                                uuid: outputUuid,
 		                                parentUUID: raw.content.data.parentUuid ?? null,
 		                                permissions: normalizeToolResultPermissions(c.permissions),

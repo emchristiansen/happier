@@ -12,6 +12,8 @@
  * freeform answer.
  */
 
+import { dim, emphasis } from '@happier-dev/cli-common/output';
+
 import { promptInput } from './promptInput';
 
 export type YesNoDefault = 'yes' | 'no';
@@ -22,7 +24,8 @@ export async function promptConfirmYesNo(
 ): Promise<boolean> {
   const suffix = opts.default === 'yes' ? ' [Y/n] ' : ' [y/N] ';
   const maxAttempts = Math.max(1, opts.maxAttempts ?? 3);
-  const fullPrompt = `${message.trimEnd()}${suffix}`;
+  // The question reads like the rest of the CLI: bold, with the answer hint quiet beside it.
+  const fullPrompt = `${emphasis(message.trimEnd())}${dim(suffix)}`;
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const raw = (await promptInput(fullPrompt)).trim().toLowerCase();

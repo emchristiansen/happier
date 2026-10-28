@@ -16,9 +16,11 @@ import { fireAndForget } from '@/utils/system/fireAndForget';
 import {
     getCachedServerFeaturesSnapshot,
     getServerFeaturesSnapshot,
+    getServerFeaturesSnapshotRetryDelayMs,
+    subscribeServerFeaturesSnapshot,
     type ServerFeaturesSnapshot,
 } from '@/sync/api/capabilities/serverFeaturesClient';
-import { subscribeActiveServer } from '@/sync/domains/server/serverRuntime';
+import { getActiveServerSnapshot, subscribeActiveServer } from '@/sync/domains/server/serverRuntime';
 import { getFeatureBuildPolicyDecision } from './featureBuildPolicy';
 import { resolveLocalFeaturePolicyEnabled, type FeatureLocalPolicySettings } from './featureLocalPolicy';
 
@@ -32,32 +34,57 @@ export type ServerFeaturesMainSelectionSnapshot =
     | Readonly<{ status: 'loading'; serverIds: string[]; snapshotsByServerId: Record<string, ServerFeaturesSnapshot> }>
     | Readonly<{ status: 'ready'; serverIds: string[]; snapshotsByServerId: Record<string, ServerFeaturesSnapshot> }>;
 
+const LOADING_SERVER_FEATURES_SNAPSHOT = Object.freeze({ status: 'loading' as const });
+
 export function useServerFeaturesRuntimeSnapshot(options?: Readonly<{ enabled?: boolean }>): ServerFeaturesRuntimeSnapshot {
     const enabled = options?.enabled ?? true;
     const [snapshot, setSnapshot] = React.useState<ServerFeaturesRuntimeSnapshot>(() => {
-        if (!enabled) return { status: 'loading' };
+        if (!enabled) return LOADING_SERVER_FEATURES_SNAPSHOT;
         const cached = getCachedServerFeaturesSnapshot();
-        return cached ?? { status: 'loading' };
+        return cached ?? LOADING_SERVER_FEATURES_SNAPSHOT;
     });
 
     React.useEffect(() => {
         if (!enabled) {
-            setSnapshot({ status: 'loading' });
+            setSnapshot(LOADING_SERVER_FEATURES_SNAPSHOT);
             return;
         }
 
         let cancelled = false;
         let requestToken = 0;
+        let requestGeneration = 0;
+        let lastRequestedServerId = '\u0000';
+        let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-        const loadForServerId = async (serverId: string | undefined) => {
+        const loadForServerId = async (serverId: string | undefined, generation: number) => {
             const token = requestToken + 1;
             requestToken = token;
             const next = await getServerFeaturesSnapshot({
                 serverId,
             });
-            if (!cancelled && token === requestToken) {
+            if (!cancelled && token === requestToken && generation === requestGeneration) {
                 setSnapshot(next);
+                const retryDelayMs = getServerFeaturesSnapshotRetryDelayMs({ serverId, snapshot: next });
+                if (retryDelayMs !== null) {
+                    retryTimer = setTimeout(() => {
+                        if (cancelled || generation !== requestGeneration) return;
+                        retryTimer = null;
+                        fireAndForget(loadForServerId(serverId, generation), {
+                            tag: 'useServerFeaturesRuntimeSnapshot.retryTransientError',
+                        });
+                    }, retryDelayMs);
+                }
             }
+        };
+
+        const requestLoad = (serverId: string | undefined, tag: string) => {
+            const normalizedServerId = typeof serverId === 'string' ? serverId.trim() : '';
+            const nextKey = normalizedServerId || '(active)';
+            if (nextKey === lastRequestedServerId) return;
+            if (retryTimer) clearTimeout(retryTimer);
+            lastRequestedServerId = nextKey;
+            requestGeneration += 1;
+            fireAndForget(loadForServerId(normalizedServerId || undefined, requestGeneration), { tag });
         };
 
         const unsubscribe = subscribeActiveServer((active) => {
@@ -65,19 +92,43 @@ export function useServerFeaturesRuntimeSnapshot(options?: Readonly<{ enabled?: 
             if (!serverId) return;
 
             const cached = getCachedServerFeaturesSnapshot({ serverId });
-            setSnapshot(cached ?? { status: 'loading' });
-            fireAndForget(loadForServerId(serverId), { tag: 'useServerFeaturesSnapshot.subscribeActiveServer' });
+            setSnapshot(cached ?? LOADING_SERVER_FEATURES_SNAPSHOT);
+            requestLoad(serverId, 'useServerFeaturesSnapshot.subscribeActiveServer');
         });
 
-        fireAndForget((async () => {
-            const cached = getCachedServerFeaturesSnapshot();
-            if (cached && !cancelled) setSnapshot(cached);
-            await loadForServerId(undefined);
-        })(), { tag: 'useServerFeaturesSnapshot.initialLoad' });
+        const unsubscribeSnapshot = subscribeServerFeaturesSnapshot(() => {
+            if (cancelled) return;
+            const serverId = normalizeId(getActiveServerSnapshot().serverId);
+            const cached = getCachedServerFeaturesSnapshot(serverId ? { serverId } : undefined);
+            setSnapshot(cached ?? LOADING_SERVER_FEATURES_SNAPSHOT);
+            if (cached && !retryTimer) {
+                const retryDelayMs = getServerFeaturesSnapshotRetryDelayMs({
+                    serverId: serverId || undefined,
+                    snapshot: cached,
+                });
+                if (retryDelayMs !== null) {
+                    const generation = requestGeneration;
+                    retryTimer = setTimeout(() => {
+                        if (cancelled || generation !== requestGeneration) return;
+                        retryTimer = null;
+                        fireAndForget(loadForServerId(serverId || undefined, generation), {
+                            tag: 'useServerFeaturesRuntimeSnapshot.retryPublishedTransientError',
+                        });
+                    }, retryDelayMs);
+                }
+            }
+        });
+
+        const initialServerId = normalizeId(getActiveServerSnapshot().serverId);
+        const cached = getCachedServerFeaturesSnapshot(initialServerId ? { serverId: initialServerId } : undefined);
+        setSnapshot(cached ?? LOADING_SERVER_FEATURES_SNAPSHOT);
+        requestLoad(initialServerId || undefined, 'useServerFeaturesSnapshot.initialLoad');
 
         return () => {
             cancelled = true;
+            if (retryTimer) clearTimeout(retryTimer);
             unsubscribe();
+            unsubscribeSnapshot();
         };
     }, [enabled]);
 
@@ -91,20 +142,38 @@ export function useServerFeaturesSnapshotForServerId(
     const enabled = options?.enabled ?? true;
     const serverId = normalizeId(serverIdRaw);
     const [snapshot, setSnapshot] = React.useState<ServerFeaturesRuntimeSnapshot>(() => {
-        if (!enabled) return { status: 'loading' };
-        if (!serverId) return { status: 'loading' };
+        if (!enabled) return LOADING_SERVER_FEATURES_SNAPSHOT;
+        if (!serverId) return LOADING_SERVER_FEATURES_SNAPSHOT;
         const cached = getCachedServerFeaturesSnapshot({ serverId });
-        return cached ?? { status: 'loading' };
+        return cached ?? LOADING_SERVER_FEATURES_SNAPSHOT;
     });
 
     React.useEffect(() => {
         if (!enabled) {
-            setSnapshot({ status: 'loading' });
+            setSnapshot(LOADING_SERVER_FEATURES_SNAPSHOT);
             return () => undefined;
         }
 
         let cancelled = false;
         let requestToken = 0;
+        let retryTimer: ReturnType<typeof setTimeout> | null = null;
+        const unsubscribeSnapshot = subscribeServerFeaturesSnapshot(() => {
+            if (cancelled || !serverId) return;
+            const cached = getCachedServerFeaturesSnapshot({ serverId });
+            setSnapshot(cached ?? LOADING_SERVER_FEATURES_SNAPSHOT);
+            if (cached && !retryTimer) {
+                const retryDelayMs = getServerFeaturesSnapshotRetryDelayMs({ serverId, snapshot: cached });
+                if (retryDelayMs !== null) {
+                    retryTimer = setTimeout(() => {
+                        if (cancelled) return;
+                        retryTimer = null;
+                        fireAndForget(load(serverId), {
+                            tag: 'useServerFeaturesSnapshotForServerId.retryPublishedTransientError',
+                        });
+                    }, retryDelayMs);
+                }
+            }
+        });
 
         const load = async (serverId: string) => {
             const token = requestToken + 1;
@@ -112,22 +181,35 @@ export function useServerFeaturesSnapshotForServerId(
             const next = await getServerFeaturesSnapshot({ serverId });
             if (!cancelled && token === requestToken) {
                 setSnapshot(next);
+                const retryDelayMs = getServerFeaturesSnapshotRetryDelayMs({ serverId, snapshot: next });
+                if (retryDelayMs !== null) {
+                    retryTimer = setTimeout(() => {
+                        if (cancelled) return;
+                        retryTimer = null;
+                        fireAndForget(load(serverId), {
+                            tag: 'useServerFeaturesSnapshotForServerId.retryTransientError',
+                        });
+                    }, retryDelayMs);
+                }
             }
         };
 
         if (!serverId) {
-            setSnapshot({ status: 'loading' });
+            setSnapshot(LOADING_SERVER_FEATURES_SNAPSHOT);
             return () => {
                 cancelled = true;
+                unsubscribeSnapshot();
             };
         }
 
         const cached = getCachedServerFeaturesSnapshot({ serverId });
-        setSnapshot(cached ?? { status: 'loading' });
+        setSnapshot(cached ?? LOADING_SERVER_FEATURES_SNAPSHOT);
         fireAndForget(load(serverId), { tag: 'useServerFeaturesSnapshotForServerId.initialLoad' });
 
         return () => {
             cancelled = true;
+            if (retryTimer) clearTimeout(retryTimer);
+            unsubscribeSnapshot();
         };
     }, [enabled, serverId]);
 
@@ -193,6 +275,7 @@ export function useServerFeaturesMainSelectionSnapshot(
     React.useEffect(() => {
         let cancelled = false;
         let requestToken = 0;
+        let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
         if (!enabled) {
             setState({ status: 'ready', serverIds, snapshotsByServerId: {} });
@@ -223,29 +306,44 @@ export function useServerFeaturesMainSelectionSnapshot(
                 snapshotsByServerId[id] = snapshot;
             }
             setState({ status: 'ready', serverIds, snapshotsByServerId });
+
+            const retryDelays = results
+                .map(([serverId, snapshot]) => getServerFeaturesSnapshotRetryDelayMs({ serverId, snapshot }))
+                .filter((delay): delay is number => delay !== null);
+            if (retryDelays.length > 0) {
+                retryTimer = setTimeout(() => {
+                    if (cancelled) return;
+                    retryTimer = null;
+                    fireAndForget(load(serverIds), {
+                        tag: 'useServerFeaturesMainSelectionSnapshot.retryTransientError',
+                    });
+                }, Math.min(...retryDelays));
+            }
         };
 
+        const readCachedState = (): ServerFeaturesMainSelectionSnapshot => {
+            const snapshotsByServerId: Record<string, ServerFeaturesSnapshot> = {};
+            let missing = false;
+            for (const serverId of serverIds) {
+                const cached = getCachedServerFeaturesSnapshot({ serverId });
+                if (cached) snapshotsByServerId[serverId] = cached;
+                else missing = true;
+            }
+            return { status: missing ? 'loading' : 'ready', serverIds, snapshotsByServerId };
+        };
+
+        const unsubscribeSnapshot = subscribeServerFeaturesSnapshot(() => {
+            if (!cancelled) setState(readCachedState());
+        });
+
         // Recompute state from cache on any selection change.
-        const snapshotsByServerId: Record<string, ServerFeaturesSnapshot> = {};
-        const missing: string[] = [];
-        for (const serverId of serverIds) {
-            const cached = getCachedServerFeaturesSnapshot({ serverId });
-            if (cached) snapshotsByServerId[serverId] = cached;
-            else missing.push(serverId);
-        }
-
-        if (missing.length === 0) {
-            setState({ status: 'ready', serverIds, snapshotsByServerId });
-            return () => {
-                cancelled = true;
-            };
-        }
-
-        setState({ status: 'loading', serverIds, snapshotsByServerId });
+        setState(readCachedState());
         fireAndForget(load(serverIds), { tag: 'useServerFeaturesMainSelectionSnapshot.initialLoad' });
 
         return () => {
             cancelled = true;
+            if (retryTimer) clearTimeout(retryTimer);
+            unsubscribeSnapshot();
         };
     }, [enabled, serverIds]);
 

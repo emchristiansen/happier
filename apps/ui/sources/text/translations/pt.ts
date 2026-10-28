@@ -344,6 +344,7 @@ const ptAcpCatalogSettingsExtension = {
     acpCatalogAuthParser: 'Analisador de status',
     acpCatalogCapabilities: 'Capacidades',
     acpCatalogTransportProfile: 'Perfil de transporte',
+    acpCatalogSupportsLoadSession: 'Suporta a retomada de sessões',
     acpCatalogSupportsModes: 'Suporta modos',
     acpCatalogSupportsModels: 'Suporta modelos',
     acpCatalogSupportsConfigOptions: 'Suporta opções de configuração',
@@ -530,6 +531,15 @@ const promptLibraryUxRefinementTranslationExtension = {
 
 const sessionHandoffTranslationExtensions = {
   pt: {
+    transferSessionData: {
+      title: "Transferir dados da sessão",
+      subtitle: "Copia o histórico de conversa desta sessão para a outra máquina. Desative se já estiver lá.",
+      checking: "Verificando o suporte nas duas máquinas…",
+      agentRequiresTransfer: "Este Agente requer a transferência dos dados da sessão entre máquinas.",
+      updateRequired: "Atualize o Happier nas duas máquinas para desativar esta opção.",
+      sessionMissing: "O histórico desta sessão não está na máquina de destino. Ative “Transferir dados da sessão” e tente novamente.",
+      workspaceRequiresTransfer: "Ative “Transferir dados da sessão” para copiar ou sincronizar arquivos do espaço de trabalho.",
+    },
     activeWarning: {
       title: 'Esta sessão ainda está em execução aqui',
       message: 'A transferência vai parar esta sessão nesta máquina antes de transferi-la para a máquina selecionada.',
@@ -789,7 +799,9 @@ export const pt: TranslationStructure = {
     emptyDescription: "Nenhuma solicitação ou atualização pendente no momento.",
     approvals: "Aprovações",
     permissions: "Permissões",
-    unreadSessions: "Sessões não lidas",
+    errors: "Erros",
+    markAllRead: "Marcar tudo como lido",
+    openInbox: "Abrir caixa de entrada",
     updates: "Atividade",
     actionOperations: {
       sections: { inProgress: "Em andamento", needsAttention: "Requer atenção", recent: "Recentes" },
@@ -1232,6 +1244,10 @@ export const pt: TranslationStructure = {
     moreActionsHint: "Abre um menu com mais ações",
     cancel: "Cancelar",
     close: "Fechar",
+    minimizeWindow: "Minimizar janela",
+    maximizeWindow: "Maximizar janela",
+    restoreWindow: "Restaurar janela",
+    closeWindow: "Fechar janela",
     dismissKeyboard: 'Ocultar teclado',
     open: "Abrir",
     done: "Concluído",
@@ -1349,6 +1365,7 @@ export const pt: TranslationStructure = {
     working: "trabalhando...",
     workingRetained: "trabalhando, aguardando atualizações…",
     keptInAttention: "mantida em atenção",
+    archiving: "arquivando…",
     backgroundActive: ({ count }: { count: number }) => `${count} em execução em segundo plano`,
     activityUnknown: "estado da atividade indisponível",
     readyForReview: "pronto para revisão",
@@ -1363,6 +1380,11 @@ export const pt: TranslationStructure = {
 
     connectionStatus: {
       title: "Conexão",
+      thisComputerConnectedTo: ({ relay }: { relay: string }) => `Este computador está conectado a ${relay}`,
+      thisComputerRelayConnected: 'Conectado',
+      thisComputerRelayOffline: 'Desconectado',
+      thisComputerRelayNeedsAttention: 'Precisa de atenção',
+      thisComputerSetUpFor: ({ relay }: { relay: string }) => `Configurado para ${relay}`,
       labels: {
         server: "Servidor",
         socket: "WebSocket",
@@ -1370,6 +1392,7 @@ export const pt: TranslationStructure = {
         lastSync: "Última sincronização",
         nextRetry: "Próxima tentativa",
         lastError: "Último erro",
+        thisComputer: 'Este computador',
       },
     },
 
@@ -2592,6 +2615,19 @@ export const pt: TranslationStructure = {
   },
 
   connectedServices: {
+    importAccounts: {
+        unknownResult: "O resultado da importação é desconhecido. Atualize a lista de contas e confira este perfil antes de tentar novamente.",
+        title: "Importar login existente",
+        failed: "Não foi possível importar o login. Verifique se você está conectado na máquina selecionada e tente novamente.",
+        actionDescription: "Copiar um login de uma das suas máquinas",
+        description: "Copie o login para este perfil criptografado. Tokens de renovação compartilhados podem mudar, e o aplicativo local pode pedir um novo login.",
+        unsupported: "Importação indisponível. Escolha outra máquina ou atualize sua CLI.",
+        credentialsUnavailable: "Nenhum login utilizável. Entre no aplicativo local e tente novamente.",
+        profileConflict: "O perfil pertence a outra conta ou mudou durante a importação. Escolha um novo nome.",
+        reauthorizationRequired: "Entre novamente no aplicativo local e tente de novo.",
+        imported: "Login importado",
+        refreshFailed: "O login foi importado, mas a lista de contas não foi atualizada. Reabra os serviços conectados.",
+    },
       subscription: {
           title: "Assinatura",
           currentPeriod: "Período atual",
@@ -2621,6 +2657,7 @@ export const pt: TranslationStructure = {
       openai: "Chave de API da OpenAI",
       anthropic: "Chave de API da Anthropic",
       gemini: "Gemini do Google",
+      antigravity: 'Google Antigravity',
       github: "GitHub",
     },
     title: "Serviços conectados",
@@ -2642,6 +2679,7 @@ export const pt: TranslationStructure = {
                 profileMissing: 'A conta conectada selecionada não está mais disponível. Atualize a lista de contas e escolha outra.',
                 groupMissing: 'O Pool de contas selecionado não está mais disponível. Atualize a lista de contas e escolha outro Pool.',
                 metadataUpdateFailed: 'A sessão não conseguiu salvar a nova seleção de autenticação. Tente novamente depois que a sessão terminar a sincronização.',
+                restartDisallowedByExecutionPolicy: 'Esta alteração de autenticação exige uma reinicialização que não é permitida enquanto a sessão está em execução. Pare a sessão antes de alterar a autenticação.',
                 restartFailed: 'Não foi possível reiniciar a sessão com a nova seleção de autenticação. Pare a sessão e tente novamente.',
                 hotApplyFailed: 'A sessão em execução rejeitou a nova seleção de autenticação. Reinicie a sessão e tente novamente.',
                 agentMismatch: 'Esta seleção de autenticação não corresponde ao backend da sessão.',
@@ -2727,6 +2765,7 @@ export const pt: TranslationStructure = {
       },
     },
     quota: {
+      refreshing: "Atualizando uso…",
       loading: "Carregando…",
       error: ({ message }: { message: string }) => `Erro: ${message}`,
       lastUpdated: ({ time }: { time: string }) => `Última atualização: ${time}`,
@@ -2773,6 +2812,21 @@ export const pt: TranslationStructure = {
       resets: {
         use: "Usar",
         available: "Redefinição disponível",
+        remainingCount: ({ count }: { count: number }) => `Redefinições guardadas: ${count}`,
+        appliesTo: ({ limits }: { limits: string }) => `Aplica-se a: ${limits}`,
+        fiveHourLimit: "Limite de 5 horas",
+        weeklyLimit: "Limite semanal",
+        unavailableReasons: {
+          paused: "Em pausa",
+          cooldown: "Aguardando o período de espera",
+          ineligible: "Não elegível",
+          not_selected: "Não selecionado",
+          provider_unavailable: "Provedor indisponível",
+          not_started: "Ainda não iniciado",
+          expired: "Expirado",
+          consumed: "Já usado",
+          unknown: "Indisponível agora",
+        },
         rowLabel: ({ date, countdown }: { date: string; countdown: string }) => `Expira ${date} · ${countdown}`,
         now: "agora",
         inDays: ({ days }: { days: number }) => `em ${days}d`,
@@ -2794,6 +2848,12 @@ export const pt: TranslationStructure = {
       pasteRedirectUrlPromptBody:
         "Após concluir o OAuth, copie a URL final redirecionada da barra de endereços do navegador e cole aqui.",
       providerOverrides: {
+        antigravity: {
+          connectWebDescription: "Próximo passo: entre com o Google. O Antigravity mostra um código de autorização para copiar.",
+          pasteRedirectUrlPromptBody: "1) Entre com o Google. 2) Copie o código de autorização mostrado em antigravity.google. 3) Cole-o abaixo e mantenha este login aberto.",
+          pasteRedirectUrlPlaceholder: "Cole o código de autorização do Antigravity",
+          pasteRedirectUrlTitle: "Colar código de autorização",
+        },
         claudeSubscription: {
           connectWebDescription:
             "Próximo passo: faça login na página que abrir. O Claude pode mostrar uma sequência de código em vez de redirecionar automaticamente.",
@@ -2976,6 +3036,7 @@ export const pt: TranslationStructure = {
       addOauthProfileDeviceTitle: "Adicionar via autenticação do dispositivo",
       addOauthProfileDeviceSubtitle: "Recomendado para web/ambientes remotos",
       addOauthProfilePasteTitle: "Adicionar via colar redirecionamento",
+      signInWithGoogle: 'Entrar com o Google',
       addOauthProfilePasteSubtitle: "Fluxo manual de copiar/colar URL de redirecionamento",
       addOauthProfileBrowserTitle: "Adicionar via navegador no app",
       addOauthProfileBrowserSubtitle: "Use um navegador incorporado quando suportado",
@@ -3020,6 +3081,7 @@ export const pt: TranslationStructure = {
       errors: {
         credentialReferencedByGroup: "Esta conta ainda é usada por um Pool de contas. Remova-a do Pool e tente novamente.",
         credentialNotFound: "Esta conta conectada já foi removida.",
+        serviceUnsupportedServer: 'Este relay não suporta este serviço conectado. Atualize o relay para conectá-lo.',
         credentialRequestFailed: "A solicitação da conta conectada falhou. Atualize os serviços conectados e tente novamente.",
         groupRequestFailed: "A solicitação do Pool de contas falhou. Atualize os serviços conectados e tente novamente.",
         generationConflict: "Este Pool de contas mudou antes da ação terminar. Atualize os serviços conectados e tente novamente.",
@@ -3059,6 +3121,7 @@ export const pt: TranslationStructure = {
         autoFallbackDisabled: "Fallback automático desativado",
         strategyPriority: "Ordem de prioridade",
         strategyLeastLimited: "Menos limitado primeiro",
+        strategyExpiryFirst: "Primeiro a quota que expira antes",
         strategyManual: "Troca manual",
         priority: ({ priority }: { priority: string }) => `Prioridade ${priority}`,
         statusReady: "Pronto",
@@ -3077,6 +3140,7 @@ export const pt: TranslationStructure = {
         memberPlanUnavailableUntil: ({ time }: { time: string }) => `Plano indisponível até ${time}`,
         memberValidationBlockedUntil: ({ time }: { time: string }) => `Validação bloqueada até ${time}`,
         memberLastFailure: ({ reason }: { reason: string }) => `Último problema: ${reason}`,
+        memberAutoDisabledModelNotEntitled: "Desativada automaticamente: modelo selecionado indisponível",
         warningNoEnabledMembers: "Nenhum membro habilitado está disponível para fallback.",
         warningNoFallbackMember: "Adicione ou habilite outro membro antes que o fallback automático possa trocar contas.",
       },
@@ -3137,6 +3201,8 @@ export const pt: TranslationStructure = {
         autoSwitchTitle: "Fallback automático",
         autoQuotaResetTitle: "Usar redefinições de quota automaticamente",
         autoQuotaResetSubtitle: "Consome uma redefinição disponível apenas quando nenhuma conta do grupo está pronta e a quota esgotada pode ser redefinida. Desativado por padrão.",
+        autoDisablePlanInvalidTitle: "Desativar contas que não podem usar o modelo selecionado",
+        autoDisablePlanInvalidSubtitle: "Desativa automaticamente uma conta do grupo quando o seu plano não pode usar o modelo selecionado. Pode reativá-la manualmente. Desativado por padrão.",
         autoSwitchEnabledSubtitle: "Troque para outro membro quando a conta ativa precisar de recuperação.",
         autoSwitchDisabledSubtitle: "Continue usando o membro ativo até trocar manualmente.",
         strategyTitle: "Estratégia de seleção",
@@ -3144,6 +3210,7 @@ export const pt: TranslationStructure = {
         strategyPrioritySubtitle: "Tente primeiro os números de prioridade mais baixos.",
         strategyLeastLimitedTitle: "Menos limitado primeiro",
         strategyLeastLimitedSubtitle: "Prefira o membro com mais cota utilizável.",
+        strategyExpiryFirstSubtitle: "Priorize a quota utilizável que reinicia ou expira mais cedo, mantendo margem suficiente.",
         strategyManualTitle: "Troca manual",
         strategyManualSubtitle: "Use apenas o membro ativo até que ele seja alterado manualmente.",
         softSwitchThresholdTitle: "Limite de troca suave",
@@ -3206,6 +3273,18 @@ export const pt: TranslationStructure = {
         noMembersTitle: "Ainda não há membros",
         noMembersSubtitle: "Adicione uma conta conectada a este Pool.",
         behaviorTitle: "Comportamento",
+        quotaLimitsTitle: "Limites de uso",
+        quotaLimitsAll: "Todos os limites informados",
+        quotaLimitsAllDescription: "Usa todos os limites informados pelas contas ativadas do grupo; novos limites são incluídos automaticamente.",
+        quotaLimitsRefreshing: ({ count }: { count: number }) => `Atualizando ${count} ${count === 1 ? 'conta ativada' : 'contas ativadas'}; a lista pode estar incompleta.`,
+        quotaLimitsSelected: ({ count }: { count: number }) => `${count} ${count === 1 ? 'limite selecionado' : 'limites selecionados'}`,
+        quotaLimitsUnavailable: "Os limites aparecem após atualizar as contas.",
+        quotaLimitsSearch: "Buscar limites de uso",
+        quotaLimitNotReportedWithId: ({ id }: { id: string }) => `Não informado atualmente por uma conta ativada · ID do provedor: ${id}`,
+        quotaLimitProviderTitle: "Limite do provedor",
+        quotaLimitDetails: ({ windowCount, windowSummary, accountCount, totalAccountCount }: { windowCount: number; windowSummary: string | null; accountCount: number; totalAccountCount: number }) => `${windowSummary ? `${windowSummary} · ` : windowCount > 1 ? `${windowCount} janelas · ` : ''}${accountCount} de ${totalAccountCount} contas ativadas`,
+        quotaLimitModelDetails: ({ model, windowCount, windowSummary, accountCount, totalAccountCount }: { model: string; windowCount: number; windowSummary: string | null; accountCount: number; totalAccountCount: number }) => `${model} · ${windowSummary ? `${windowSummary} · ` : windowCount > 1 ? `${windowCount} janelas · ` : ''}${accountCount} de ${totalAccountCount} contas ativadas`,
+        quotaLimitProviderDetails: ({ id, windowCount, windowSummary, accountCount, totalAccountCount }: { id: string; windowCount: number; windowSummary: string | null; accountCount: number; totalAccountCount: number }) => `${windowSummary ? `${windowSummary} · ` : windowCount > 1 ? `${windowCount} janelas · ` : ''}${accountCount} de ${totalAccountCount} contas ativadas · ID: ${id}`,
         advancedTitle: "Avançado",
         advancedSubtitle: "Ajuste quando e como este Pool troca de conta.",
                 manualApplyDivergenceTitle: "Alterado no servidor, mas não nas sessões ativas",
@@ -3572,9 +3651,44 @@ export const pt: TranslationStructure = {
 
   settingsDesktop: {
     title: 'Área de trabalho',
-    footer: 'Controla as integrações de desktop do Tauri neste computador.',
-    startOnLoginTitle: 'Iniciar ao entrar',
-    startOnLoginSubtitle: 'Inicie o Happier automaticamente ao entrar neste computador.',
+    footer: 'Controla como o Happier se comporta neste computador.',
+    backgroundServiceTitle: 'Continuar acessível em segundo plano',
+    backgroundServiceSubtitle: 'Este computador continua respondendo depois de você sair do Happier, em cada relay ao qual está conectado: o Happier inicia quando você entra e fica na barra de menus ou na bandeja do sistema. Com isto desligado, sair do Happier para o serviço em segundo plano, e seu telefone e seu navegador não alcançam este computador até você abrir o app de novo.',
+    backgroundServiceUnknown: 'A linha de comando do Happier neste computador não informa se o serviço em segundo plano inicia ao entrar.',
+    backgroundServiceNotSetUp: 'Disponível quando este computador estiver configurado.',
+    backgroundServiceChangeFailed: 'A alteração não foi aplicada. Tente de novo.',
+    trayOpen: 'Abrir o Happier',
+    trayQuit: 'Sair do Happier',
+    trayQuitKeepServices: 'Sair do Happier (os serviços em segundo plano continuam em execução)',
+    trayQuitStopServices: 'Sair do Happier e parar os serviços em segundo plano',
+    trayOpenInHappier: 'Abrir no Happier',
+    traySettings: 'Ajustes…',
+    trayStartAtLogin: 'Iniciar ao entrar',
+    trayStopAndQuit: 'Parar os serviços em segundo plano e sair',
+    trayStart: 'Iniciar',
+    trayRestart: 'Reiniciar',
+    trayStop: 'Parar',
+    trayUserOwned: 'Configurado fora do Happier',
+    trayChecking: 'Verificando os serviços em segundo plano…',
+    trayReadFailed: 'Não foi possível ler os serviços em segundo plano',
+    trayIncomplete: 'Alguns serviços em segundo plano não puderam ser lidos',
+    trayNoServices: 'Este computador ainda não está configurado',
+    trayWorking: 'Trabalhando…',
+    trayStopConfirmTitle: ({ relay }: { relay: string }) => `Parar o serviço em segundo plano do Happier para ${relay}?`,
+    trayStopConfirmBody: ({ relay }: { relay: string }) => `As sessões de agentes em execução neste computador para ${relay} serão encerradas, e seu telefone e seu navegador não o alcançam lá até ele iniciar de novo.`,
+    trayStopAllConfirmTitle: 'Parar os serviços em segundo plano do Happier e sair?',
+    trayStopAllConfirmBody: 'As sessões de agentes em execução neste computador serão encerradas, e seu telefone e seu navegador não o alcançam até você abrir o Happier de novo.',
+    trayStopConfirmAction: 'Parar',
+    trayActionFailedTitle: 'Não deu certo',
+    trayLoginItemFailed: 'Não foi possível atualizar o item de início do Happier',
+    traySessions: ({ count }: { count: string }) => `Sessões: ${count}`,
+    closeStopTitle: 'Ainda há sessões de agente em execução',
+    closeStopBody: 'Fechar o Happier para o serviço em segundo plano deste computador e encerra as sessões executadas aqui.',
+    closeStopUnknownTitle: 'Parar o serviço em segundo plano?',
+    closeStopUnknownBody: 'O Happier não consegue ver quais sessões estão rodando neste computador. Fechá-lo para o serviço em segundo plano e encerra as que estiverem ativas.',
+    closeStopConfirm: 'Parar mesmo assim',
+    closeStopKeep: 'Deixar em execução',
+    closeStopFailedBody: 'O Happier não conseguiu parar os serviços em segundo plano, por isso continua na barra de menus ou na bandeja do sistema, onde pode tentar de novo.',
   },
 
   settingsPets: {
@@ -3658,6 +3772,8 @@ export const pt: TranslationStructure = {
   },
 
   settingsNotifications: {
+        mutePhoneWhenComputerFocusedTitle: "Silenciar o telefone ao usar o computador",
+        mutePhoneWhenComputerFocusedSubtitle: "Silencia as notificações de pronto e as solicitações enquanto alguma janela do Happier num computador estiver em foco. As notificações são retomadas quando nenhuma janela num computador estiver em foco.",
     badges: {
       title: 'Badges neste dispositivo',
       footer: 'Escolha quais atividades contribuem para o badge do ícone do app neste dispositivo.',
@@ -4079,6 +4195,10 @@ export const pt: TranslationStructure = {
             claude: {
                 title: "Claude Code",
                 sections: {
+                    claudeModelDiscovery: {
+                        title: "Descoberta de modelos",
+                        footer: "Controla se o Happier pergunta à Anthropic quais modelos estão disponíveis para a conta Claude selecionada."
+                    },
                     claudeUnifiedTerminal: {
                         title: "Runtime de terminal unificado",
                         footer: "Quando ativado, o Happier envia prompts para a mesma sessao de terminal do Claude Code em vez de iniciar um runner Agent SDK separado."
@@ -4093,6 +4213,10 @@ export const pt: TranslationStructure = {
                     }
                 },
                 fields: {
+                    claudeDynamicModelProbeEnabled: {
+                        title: "Descobrir modelos disponíveis",
+                        subtitle: "Permite que o Happier consulte a Anthropic com a conta Claude selecionada. Desative para usar o catálogo integrado do Happier sem ler as credenciais nativas do Claude Code."
+                    },
                     claudeUnifiedTerminalEnabled: {
                         title: "Usar runtime de terminal unificado",
                         subtitle: "Controle o Claude pela sessao de terminal para que a UI e o terminal compartilhem uma execucao do Claude Code."
@@ -4150,6 +4274,10 @@ export const pt: TranslationStructure = {
                                 subtitle: "Rejeitar o prompt atual do Claude recapturado para workspaces abertos pelo Happier."
                             }
                         }
+                    },
+                    claudeCodeIncludeInNativeHistory: {
+                        title: "Mostrar sessões no Claude Code",
+                        subtitle: "Usar a atribuição de Happier para novas sessões Claude, incluindo as do Agent SDK. Desativado mantém os padrões de execução."
                     },
                     claudeCodeExperimentalAgentTeamsEnabled: {
                         title: "Forcar ativacao do Agent Teams",
@@ -4248,6 +4376,10 @@ export const pt: TranslationStructure = {
             opencode: {
                 title: "OpenCode",
                 sections: {
+                    cliGeneration: {
+                        title: "Versão do OpenCode",
+                        footer: "Automático prefere opencode, recorre a opencode2 e detecta a API do servidor após a inicialização. Estável sempre seleciona opencode, mas ainda detecta V1 ou V2. V2 prefere opencode2 e, caso contrário, usa opencode com V2 selecionado. As ferramentas MCP do Happier funcionam com V2 no modo ACP; a API de servidor ainda não oferece registro MCP dinâmico."
+                    },
                     backendMode: {
                         title: "Modo de backend",
                         footer: "O modo servidor libera perguntas e fork nativo. O modo ACP e um fallback legado."
@@ -4258,6 +4390,15 @@ export const pt: TranslationStructure = {
                     }
                 },
                 fields: {
+                    opencodeCliGeneration: {
+                        title: "Geração da CLI",
+                        subtitle: "Escolha qual comando OpenCode instalado o Happier inicia.",
+                        options: {
+                            auto: { title: "Automático (recomendado)", subtitle: "Prefere opencode e recorre a opencode2." },
+                            stable: { title: "Estável", subtitle: "Sempre inicia opencode e detecta a API após a inicialização." },
+                            v2: { title: "V2", subtitle: "Prefere opencode2; caso contrário, inicia opencode com V2 selecionado." }
+                        }
+                    },
                     opencodeBackendMode: {
                         title: "Modo de backend do OpenCode",
                         subtitle: "Escolha o backend de integracao.",
@@ -4317,33 +4458,16 @@ export const pt: TranslationStructure = {
                 title: "Kilo"
             },
             kimi: {
-                title: "Kimi",
-                sections: {
-                    compatibility: {
-                        title: "Compatibilidade",
-                        footer: "Use o modo de compatibilidade apenas em ambientes Linux/contêiner onde a inicialização do Kimi ACP trava."
-                    }
-                },
-                fields: {
-                    kimiAcpPythonSelector: {
-                        title: "Seletor stdio do Python",
-                        subtitle: "Escolha como o Happier inicia o loop stdio Python do Kimi ACP.",
-                        options: {
-                            auto: {
-                                title: "Automático",
-                                subtitle: "Usar o seletor Python padrão do Kimi."
-                            },
-                            poll: {
-                                title: "Modo de compatibilidade",
-                                subtitle: "Use poll() em vez de epoll() para o stdio do Kimi ACP."
-                            }
-                        }
-                    }
-                }
+                title: "Kimi"
             },
             kiro: {
                 title: "Kiro"
             },
+            devin: { title: "Devin" },
+            agy: { title: 'Antigravity' },
+            fx: { title: "FX" },
+            droid: { title: "Factory Droid" },
+            codebuddy: { title: "CodeBuddy" },
             grok: {
                 title: "Grok Build"
             },
@@ -4457,6 +4581,9 @@ export const pt: TranslationStructure = {
       full: "Largura total",
       fullDescription: "Use a largura disponível da janela",
     },
+    feedback: "Resposta",
+    haptics: "Resposta tátil",
+    hapticsDescription: "Use a resposta tátil para ações e reordenação neste dispositivo.",
     backdropBlur: "Desfoque de fundo",
     backdropBlurDescription:
       "Use desfoque de fundo atrás de modais e menus. Desative para melhorar o desempenho do navegador.",
@@ -4486,6 +4613,13 @@ export const pt: TranslationStructure = {
       "Mostrar números de linha nas visualizações de ferramentas",
     showLineNumbersInToolViewsDescription:
       "Exibir números de linha nos diffs das visualizações de ferramentas",
+    chatCodeBlocks: {
+        title: 'Blocos de código do chat',
+        showWrapControls: 'Mostrar controles de quebra de linha',
+        showWrapControlsDescription: 'Mostrar um botão de quebra de linha em cada bloco de código do chat',
+        wrapByDefault: 'Quebrar linhas por padrão',
+        wrapByDefaultDescription: 'Quebrar linhas longas nos blocos de código do chat, salvo escolha diferente para um bloco',
+    },
     wrapLinesInDiffs: "Quebrar linhas nas visualizações de código",
     wrapLinesInDiffsDescription:
       "Quebrar linhas longas em pré-visualizações de código e editores em vez de rolar horizontalmente",
@@ -4509,6 +4643,51 @@ export const pt: TranslationStructure = {
       labels: "Rótulos",
       icons: "Somente ícones",
     },
+    loadingIndicator: "Indicador de carregamento",
+    loadingIndicatorStyle: "Estilo",
+    loadingIndicatorDescription: "Como os indicadores aparecem enquanto há trabalho em andamento",
+    loadingIndicatorFooter: "Com Reduzir movimento ativado, os estilos de pontos ficam parados e esmaecem suavemente, e o Anel clássico para de girar.",
+    loadingIndicatorOptions: {
+      wave: "Onda",
+      handwritten: "Manuscrito",
+      buildAndRelease: "Construir e soltar",
+      relay: "Revezamento",
+      twinStems: "Hastes gêmeas",
+      slowBreath: "Respiração lenta",
+      starfield: "Campo estelar",
+      sweep: "Varredura",
+      radar: "Radar",
+      ripple: "Ondulação",
+      aurora: "Aurora",
+      hWave: "H · Onda",
+      hHandwritten: "H · Manuscrito",
+      hBuildAndRelease: "H · Construir e soltar",
+      hRelay: "H · Revezamento",
+      hTwinStems: "H · Hastes gêmeas",
+      hSlowBreath: "H · Respiração lenta",
+      hStarfield: "H · Campo estelar",
+      hSweep: "H · Varredura",
+      hRadar: "H · Radar",
+      hRipple: "H · Ondulação",
+      hAurora: "H · Aurora",
+      classicRing: "Anel clássico",
+    },
+    loadingIndicatorSpeed: "Velocidade",
+    loadingIndicatorSpeedDescription: "A rapidez com que a luz percorre os pontos",
+    loadingIndicatorSpeedOptions: {
+      slow: "Lenta",
+      normal: "Normal",
+      fast: "Rápida",
+    },
+    loadingIndicatorPause: "Pausa",
+    loadingIndicatorPauseDescription: "Quanto tempo os pontos descansam antes de cada ciclo",
+    loadingIndicatorPauseOptions: {
+      none: "Nenhuma",
+      short: "Curta",
+      long: "Longa",
+    },
+    loadingIndicatorPauseUnavailable: "Este estilo repete sem descanso.",
+    loadingIndicatorSpeedUnavailable: "O anel clássico gira no seu próprio ritmo fixo.",
     avatarStyle: "Estilo do avatar",
     avatarStyleDescription: "Escolha a aparência do avatar da sessão",
     avatarOptions: {
@@ -4729,6 +4908,8 @@ export const pt: TranslationStructure = {
   },
 
   errors: {
+    machineRpcDecryptionFailed: "Não foi possível descriptografar os dados desta máquina. Entre com a chave de conta correspondente e tente novamente.",
+    machineRpcContextUnavailable: "A conexão com esta máquina está indisponível. Atualize suas máquinas e tente novamente.",
     networkError: "Ocorreu um erro de rede",
     serverError: "Ocorreu um erro do servidor",
     unknownError: "Ocorreu um erro desconhecido",
@@ -4831,11 +5012,26 @@ export const pt: TranslationStructure = {
     installed: "Instalado",
     installLog: ({ path }: { path: string }) => `Log de instalação: ${path}`,
     installable: {
+        downloading: "Baixando… Toque para atualizar.",
+        install: "Instalar",
+        update: "Atualizar",
+        reinstall: "Reinstalar",
+        localEmbeddings: {
+            title: "Runtime de embeddings locais",
+            description: "Instala apenas o runtime. Para pesquisa semântica offline, carregue também o modelo local selecionado enquanto estiver online.",
+        },
+        difftastic: {
+            title: "Difftastic",
+            description: "Instale o Difftastic para comparar código com base na sintaxe antes de ficar offline.",
+        },
       codexResume: {
         title: "Servidor de retomada do Codex",
       },
       codexAcp: {
         title: "Adaptador Codex ACP",
+      },
+      agyAcpServer: {
+          title: "Servidor ACP do Agy",
       },
       githubCli: {
         title: "CLI do GitHub",
@@ -4870,6 +5066,8 @@ export const pt: TranslationStructure = {
   },
 
   newSession: {
+    terminalHostUnavailableTitle: "Host de terminal indisponível",
+    terminalHostUnavailableBody: ({ host }: { host: string }) => `Instale ou atualize ${host} e reinicie seu servidor nesta máquina, ou escolha outro host de terminal. Seu rascunho é mantido.`,
     ...newSessionMcpTranslationExtension,
     ...acpCatalogTranslationExtension.newSession,
     // Used by new-session screen and launch flows
@@ -5156,6 +5354,18 @@ export const pt: TranslationStructure = {
       description:
         "Isso instala um adaptador ACP experimental em torno do Codex que oferece suporte a carregar/retomar threads.",
     },
+    agyAcpBanner: {
+        title: "Servidor ACP do Agy",
+        install: "Instalar",
+        update: "Atualizar",
+        reinstall: "Reinstalar",
+    },
+    agyAcpInstallModal: {
+        installTitle: "Instalar o servidor ACP do Agy?",
+        updateTitle: "Atualizar o servidor ACP do Agy?",
+        reinstallTitle: "Reinstalar o servidor ACP do Agy?",
+        description: "Isso instala o servidor ACP oficial e fixado do Agy usado nas sessões do Agy. A CLI interativa agy continua sendo instalada separadamente.",
+    },
         githubCliBanner: {
             title: 'GitHub CLI',
             install: 'Instalar',
@@ -5312,6 +5522,8 @@ export const pt: TranslationStructure = {
         statusPaused: "Pausado",
         statusComplete: "Concluído",
         statusBudgetLimited: "Limitado pelo orçamento",
+        budgetReachedBody: "Esta meta atingiu o orçamento de tokens. Remova o orçamento para continuar.",
+        removeBudgetAndResume: "Remover orçamento e continuar",
         statusInterrupted: "Interrompido",
         tokenBudget: "Orçamento de tokens",
         budgetProgress: ({ used, budget }: { used: string; budget: string }) => `${used} / ${budget}`,
@@ -5470,6 +5682,11 @@ export const pt: TranslationStructure = {
         composerBanners: {
             showBannerAction: 'Mostrar aviso',
             hideBannerAction: 'Ocultar aviso',
+	    },
+	    runnerRestartBackgroundWork: {
+	        title: 'Há trabalho em segundo plano em execução',
+	        body: ({ count }: { count: number }) => `Há trabalho em segundo plano em execução (${count}). Reiniciar irá interrompê-lo.`,
+	        confirmAction: 'Parar e reiniciar',
 	    },
 	    staleRunner: {
 	      title: "A sessão ainda está em uma CLI antiga",
@@ -5872,7 +6089,7 @@ export const pt: TranslationStructure = {
         discarded: {
           title: "Mensagens descartadas",
           subtitle:
-            "Essas mensagens não foram enviadas ao agente (por exemplo, ao mudar de remoto para local).",
+            "Estas mensagens já não estão na fila. A entrega pode ser incerta; verifique a transcrição antes de enviar novamente.",
           label: "Descartada",
           removeConfirm: {
             title: "Remover mensagem descartada?",
@@ -6078,6 +6295,28 @@ export const pt: TranslationStructure = {
     targetSession: "Sessão alvo",
     noTarget: "Nenhuma sessão selecionada",
     clearTarget: "Limpar alvo",
+    errors: {
+        sendFailed: "Não foi possível enviar sua mensagem para a sessão.",
+        sttFailed: "Não foi possível transcrever o que você disse. Tente novamente.",
+        sttTimeout: "O reconhecimento de voz excedeu o tempo limite. Verifique sua conexão e tente novamente.",
+        sttAuthFailed: "O reconhecimento de voz rejeitou a chave de API. Verifique a chave e suas restrições em Configurações → Voz.",
+        sttRateLimited: "O reconhecimento de voz atingiu o limite de solicitações. Aguarde um momento e tente novamente.",
+        missingSttBaseUrl: "Defina a URL do servidor de reconhecimento de voz em Configurações → Voz.",
+        missingSttApiKey: "Adicione uma chave de API de reconhecimento de voz em Configurações → Voz.",
+        recordingStartFailed: "Não foi possível iniciar o microfone. Verifique se nenhum outro app está usando.",
+        recordingStopFailed: "Não foi possível concluir a gravação. Tente novamente.",
+        deviceSttUnavailable: "O reconhecimento de voz não está disponível neste dispositivo. Escolha outro provedor de reconhecimento de voz em Configurações → Voz.",
+        speechPermissionDenied: "O acesso ao microfone ou ao reconhecimento de voz foi negado. Permita nas configurações do dispositivo.",
+        deviceSttStartFailed: "Não foi possível iniciar o reconhecimento de voz. Tente novamente.",
+        localNeuralSttUnavailable: "O reconhecimento de voz no dispositivo não está disponível nesta versão. Escolha outro provedor de reconhecimento de voz em Configurações → Voz.",
+        localNeuralPackNotInstalled: "Baixe o modelo de voz em Configurações → Voz.",
+        localNeuralSttStartFailed: "Não foi possível iniciar o reconhecimento de voz no dispositivo. Tente novamente.",
+        localNeuralAudioCaptureFailed: "O microfone parou inesperadamente. Tente novamente.",
+        ttsFailed: "Não foi possível reproduzir a resposta falada. Verifique a síntese de voz em Configurações → Voz.",
+        voiceAgentRequiresFeature: ({ feature }: { feature: string }) => `O modo agente precisa que “${feature}” esteja ativado em Configurações → Recursos.`,
+        voiceAgentUnavailable: "O agente de voz não está disponível neste servidor.",
+        generic: "A voz encontrou um problema.",
+    },
     a11y: {
       teleport: "Teletransportar agente de voz",
       toggleActivity: "Alternar atividade de voz",
@@ -6167,6 +6406,14 @@ export const pt: TranslationStructure = {
     removeServer: "Remover Relay",
     removeServerConfirm: ({ name }: { name: string }) =>
       `Remover "${name}" dos Relays salvos?`,
+    removeServerDisconnectsThisComputer: ({ name }: { name: string }) => `Este computador também vai se desconectar de "${name}", e as sessões de agente rodando aqui para ele vão parar.`,
+    removeServerMayDisconnectThisComputer: ({ name }: { name: string }) => `Se este computador estiver conectado a "${name}", ele também vai se desconectar, e as sessões de agente rodando aqui para ele vão parar.`,
+    removeServerEndsSessions: ({ count }: { count: number }) => count === 1 ? '1 sessão de agente está rodando aqui agora.' : `${count} sessões de agente estão rodando aqui agora.`,
+    removeServerKeepsUserService: ({ name }: { name: string }) => `O serviço em segundo plano deste computador para "${name}" foi configurado fora do Happier, então fica como está.`,
+    removeServerDisconnectFailed: 'Este computador não conseguiu se desconectar deste relay, então o relay foi mantido. Tente de novo.',
+    removeServerAnywayTitle: 'Remover mesmo assim?',
+    removeServerAnywayBody: ({ name }: { name: string }) => `Não foi possível verificar os serviços em segundo plano deste computador, então um serviço para "${name}" pode continuar rodando aqui depois de você removê-lo. Você pode removê-lo depois com a CLI do Happier.`,
+    removeServerAnywayConfirm: 'Remover mesmo assim',
     removeServerGroup: "Remover grupo de Relays",
     removeServerGroupConfirm: ({ name }: { name: string }) =>
       `Remover "${name}" dos grupos de Relays salvos?`,
@@ -6210,11 +6457,11 @@ export const pt: TranslationStructure = {
       "Um grupo de Relays deve incluir pelo menos um Relay.",
     relayDrift: {
         bannerDifferentRelayTitle: 'Seu serviço em segundo plano está conectado a outro Relay',
-        bannerDifferentRelayDescription: ({ activeRelayUrl, daemonRelayUrl }: { activeRelayUrl: string; daemonRelayUrl: string }) =>
-            `App: ${activeRelayUrl} · Serviço em segundo plano: ${daemonRelayUrl}`,
         bannerNeedsAuthTitle: 'Seu serviço em segundo plano precisa entrar neste Relay',
         bannerNeedsAuthDescription: ({ activeRelayUrl }: { activeRelayUrl: string }) =>
             `O app está usando ${activeRelayUrl}, mas o serviço em segundo plano ainda precisa de aprovação ou login.`,
+        bannerAccountMismatchTitle: 'Seu serviço em segundo plano está conectado com outra conta',
+        bannerAccountMismatchDescription: ({ relay, account, appAccount }: { relay: string; account: string; appAccount: string }) => `Este computador está conectado a ${relay} como ${account}, não como ${appAccount}.`,
         bannerNotConfiguredTitle: 'Seu serviço em segundo plano ainda não está conectado a este Relay',
         bannerNotConfiguredDescription: ({ activeRelayUrl }: { activeRelayUrl: string }) =>
             `O app está usando ${activeRelayUrl}, mas este computador ainda não terminou de conectar o serviço em segundo plano.`,
@@ -6225,11 +6472,13 @@ export const pt: TranslationStructure = {
         bannerNotRunningDescription: ({ activeRelayUrl }: { activeRelayUrl: string }) =>
             `O app está usando ${activeRelayUrl}, mas o serviço em segundo plano está parado e precisa ser iniciado novamente.`,
         repairAction: 'Conectar o serviço em segundo plano a este Relay',
+        connectHereAction: 'Conectar este computador aqui',
+        connectedElsewhere: ({ relay }: { relay: string }) => `Este computador está conectado a ${relay}.`,
+        connectedElsewhereAs: ({ relay, account }: { relay: string; account: string }) => `Este computador está conectado a ${relay} como ${account}.`,
+        serviceConnectedElsewhere: ({ relay }: { relay: string }) => `O serviço em segundo plano está conectado a ${relay}.`,
         progressTitle: 'Conectando o serviço em segundo plano a este Relay',
         progressStepPrepare: 'Preparar o serviço em segundo plano',
-        progressStepConfigureRelay: 'Atualizar a conexão do Relay',
         progressStepAuthenticate: 'Concluir o login e a aprovação',
-        progressStepFinish: 'Concluir reparo',
         statusUnknown: 'Desconhecido',
     },
     retention: {
@@ -6389,6 +6638,21 @@ export const pt: TranslationStructure = {
             updated: 'Sort by last activity',
         },
     attentionSectionTitle: 'Precisa de atenção',
+    reminders: {
+      due: 'Lembrete pendente',
+      title: 'Lembrar-me', inOneHour: 'Daqui a 1 hora', inThreeHours: 'Daqui a 3 horas',
+      tomorrowMorning: 'Amanhã de manhã', nextWeek: 'Na próxima semana', custom: 'Escolher data e hora…',
+      customTitle: 'Escolher data e hora', customMessage: 'Introduz uma data e hora locais',
+      customPlaceholder: '2026-09-08 09:00', futureTimeRequired: 'Escolhe uma hora futura.',
+      dateLabel: 'Data', timeLabel: 'Hora', addToPresets: 'Adicionar às predefinições',
+      datePlaceholder: 'AAAA-MM-DD', hourLabel: 'h', minuteLabel: 'min',
+      setReminder: 'Definir lembrete',
+      remove: 'Remover lembrete',
+      presetPreviewUnavailable: 'Escolhe uma hora futura válida para pré-visualizar.',
+      managePresets: 'Gerir predefinições', managePresetsMessage: 'Muda o nome, a ordem ou remove lembretes guardados.',
+      presetName: 'Nome da predefinição', movePresetUp: 'Mover para cima', movePresetDown: 'Mover para baixo',
+      noPresets: 'Sem predefinições guardadas', noPresetsMessage: 'Guarda uma ao escolheres um lembrete personalizado.',
+    },
     workingSectionTitle: 'Trabalhando',
     hideInactiveSessions: 'Ocultar sessões inativas',
     showInactiveSessions: 'Mostrar sessões inativas',
@@ -6406,6 +6670,7 @@ export const pt: TranslationStructure = {
     browseSourceCodexConnectedServices: ({ service }: { service: string }) => `${service} connected services`,
     browseSourceClaudeDefault: "Configuração padrão do Claude",
     browseSourceOpenCodeDefault: "Servidor padrão do OpenCode",
+    browseSourceAcpAgentSessions: 'Sessões do agente',
     browseSourcePiDefault: "Diretório padrão do agente Pi",
     browseCandidates: "Sessões disponíveis",
     browseNoMachines: "Ainda não há máquinas disponíveis para sessões diretas.",
@@ -6420,6 +6685,10 @@ export const pt: TranslationStructure = {
     browseLoadMore: "Carregar mais sessões",
     browseFailedToLoad: "Falha ao carregar sessões do provedor.",
     browseLinkFailed: "Falha ao vincular a sessão do provedor selecionada.",
+    deleteCandidateActionsAccessibilityLabel: ({ title }: { title: string }) => `Mais ações para ${title}`,
+    deleteCandidateConfirmTitle: "Excluir sessão do provedor?",
+    deleteCandidateConfirmMessage: ({ title, provider }: { title: string; provider: string }) => `Excluir “${title}” de ${provider}? Esta ação não pode ser desfeita.`,
+    deleteCandidateFailed: "Não foi possível excluir a sessão do provedor.",
   },
 
     workspacePresentation: {
@@ -6492,6 +6761,16 @@ export const pt: TranslationStructure = {
     kiroSessionId: "ID da sessão Kiro",
     kiroSessionIdCopied:
       "ID da sessão Kiro copiado para a área de transferência",
+    devinSessionId: "ID da sessão Devin",
+    devinSessionIdCopied: "ID da sessão Devin copiado para a área de transferência",
+    agySessionId: "ID da sessão Agy",
+    agySessionIdCopied: "ID da sessão Agy copiado para a área de transferência",
+    fxSessionId: "ID da sessão FX",
+    fxSessionIdCopied: "ID da sessão FX copiado para a área de transferência",
+    droidSessionId: "ID da sessão Factory Droid",
+    codebuddySessionId: "ID da sessão CodeBuddy",
+    droidSessionIdCopied: "ID da sessão Factory Droid copiado para a área de transferência",
+    codebuddySessionIdCopied: "ID da sessão CodeBuddy copiado para a área de transferência",
     customAcpSessionId: "ID da sessão ACP personalizada",
     grokSessionId: "ID da sessão Grok",
     grokSessionIdCopied: "ID da sessão Grok copiado para a área de transferência",
@@ -6712,6 +6991,8 @@ export const pt: TranslationStructure = {
     permissionMode: {
       title: "MODO DE PERMISSÃO",
       effectiveLabel: ({ label }: { label: string }) => `Efetivo: ${label}`,
+      nativeModeOverrides: ({ mode }: { mode: string }) => `O modo do agente ${mode} tem prioridade sobre esta permissão. Limpe a seleção de Modo para usar a permissão.`,
+            usePermissionSetting: 'Usar a configuração de permissões',
       default: "Padrão",
       readOnly: "Somente leitura",
       acceptEdits: "Aceitar edições",
@@ -6738,6 +7019,11 @@ export const pt: TranslationStructure = {
       kimi: "Kimi",
       kilo: "Kilo",
       kiro: "Kiro",
+      devin: "Devin",
+      agy: 'Antigravity',
+      fx: "FX",
+      droid: "Factory Droid",
+      codebuddy: "CodeBuddy",
       customAcp: "Custom ACP",
       pi: "Pi",
       copilot: "Copilot",
@@ -6814,6 +7100,7 @@ export const pt: TranslationStructure = {
     },
     context: {
       remaining: ({ percent }: { percent: number }) => `${percent}% restante`,
+      badgeLabel: "Contexto",
       windowTitle: "Janela de contexto",
       usedDetail: ({
         percent,
@@ -7041,6 +7328,7 @@ export const pt: TranslationStructure = {
       summaryEdits: ({ count }: { count: number }) =>
         `${count} ${plural({ count, singular: "edição", plural: "edições" })}`,
     },
+    subAgentTitle: ({ label }: { label: string }) => `${label} Agente`,
     names: {
       task: "Tarefa",
       subAgent: "Subagente",
@@ -7164,6 +7452,8 @@ export const pt: TranslationStructure = {
 	        copyPath: "Copiar caminho",
 	        download: "Baixar",
 	        downloadAsZip: "Baixar como ZIP",
+	        openWith: 'Abrir com',
+	        share: 'Compartilhar',
 	      },
 	      dropToUpload: "Solte arquivos para enviar",
 	      rename: {
@@ -7432,6 +7722,9 @@ export const pt: TranslationStructure = {
         `Alterações não preparadas (${count})`,
       // File viewer strings
       fileReadFailed: "Falha ao ler o arquivo",
+      androidFileActionsUnavailable: "As ações de arquivos do Android não estão disponíveis nesta versão do app. Atualize o Happier e tente novamente.",
+      fileSharingUnavailable: "O compartilhamento de arquivos não está disponível neste dispositivo.",
+      fileCleanupFailed: "Não foi possível remover o arquivo temporário",
       fileTooLargeToPreview: "O arquivo é grande demais para pré-visualizar",
       fileWriteFailed: "Falha ao escrever o arquivo",
       fileEditor: {
@@ -7511,6 +7804,7 @@ export const pt: TranslationStructure = {
       loadingFile: ({ fileName }: { fileName: string }) =>
         `Carregando ${fileName}...`,
         binaryFile: "Arquivo binário",
+        videoPreview: 'Prévia do vídeo',
         imagePreviewTooLarge: "A pré-visualização da imagem é grande demais para ser exibida",
         sessionMedia: {
           generatedImageA11y: ({ name }: { name: string }) => `Abrir imagem gerada ${name}`,
@@ -7844,7 +8138,7 @@ export const pt: TranslationStructure = {
         invalidActionSubtitle: 'Esta ação não está mais disponível nesta versão.',
         configureActionAccessibilityLabel: 'Configurar ação',
         approvalHelpTitle: 'Modos de aprovação',
-        approvalHelpBody: '“Perguntar primeiro” cria uma solicitação de aprovação antes que esta ação seja executada nessa superfície. Para sessões de IA, essa solicitação fica na superfície de aprovações existente e não aguarda em um modal. “Permitido” deixa a ação executar nessa superfície sem uma solicitação de aprovação.',
+        approvalHelpBody: "“Perguntar primeiro” exige aprovação antes de executar esta ação nessa superfície. Os controles do aplicativo podem mostrar uma caixa de confirmação. Para sessões de IA, a solicitação fica na superfície de aprovações existente e não aguarda em um modal. “Permitido” deixa a ação executar sem uma solicitação de aprovação.",
         toolExposure: {
             title: 'Exposição da ferramenta',
             footer: 'Controla se ações elegíveis aparecem como ferramentas diretas ou ficam disponíveis apenas pela descoberta de ações.',
@@ -7995,6 +8289,8 @@ export const pt: TranslationStructure = {
     },
 
 settingsSession: {
+    terminalHostTitle: 'Host de terminal para novas sessões',
+    terminalHostNone: 'Sem host de terminal',
     newSessionDraftEntry: {
         title: 'Rascunhos de nova sessão',
         footer: 'Escolha se Nova sessão continua o rascunho deste dispositivo ou abre um novo.',
@@ -8015,6 +8311,14 @@ settingsSession: {
 	          workingStatusAnimatedTextTitle: 'Texto de trabalho animado',
 	          workingStatusAnimatedTextEnabledSubtitle: 'Alterne verbos de trabalho enquanto uma sessão está em execução',
 	          workingStatusAnimatedTextDisabledSubtitle: 'Mostre um rótulo fixo trabalhando... enquanto uma sessão está em execução',
+	          backgroundWorkAttentionModeTitle: "Respostas não lidas durante o trabalho em segundo plano",
+	          backgroundWorkAttentionModeSubtitle: "Escolha onde mostrar as respostas não lidas enquanto o trabalho continua em segundo plano. As solicitações dirigidas a você continuam precisando de atenção.",
+	          backgroundWorkAttentionKeepWorkingTitle: "Manter o status de trabalho",
+	          backgroundWorkAttentionKeepWorkingSubtitle: "Manter o status de trabalho e mostrar um ponto central azul para respostas não lidas",
+	          backgroundWorkAttentionKeepWorkingUnreadTitle: "Mostrar o status não lido em Trabalhando",
+	          backgroundWorkAttentionKeepWorkingUnreadSubtitle: "Manter as sessões em Trabalhando e mostrar o status não lido até você ler a resposta",
+	          backgroundWorkAttentionShowUnreadTitle: "Mover sessões não lidas para Precisa de atenção",
+	          backgroundWorkAttentionShowUnreadSubtitle: "Mover as sessões com respostas não lidas para Precisa de atenção enquanto o trabalho continua em segundo plano",
 	          attentionPromotionModeTitle: 'Sessões que precisam de atenção',
 	          attentionPromotionModeSubtitle: 'Escolha onde aparecem as sessões aguardando você ou prontas para revisão',
 	          attentionPromotionModeOffTitle: 'Deixar na posição normal',
@@ -8023,6 +8327,8 @@ settingsSession: {
 	          attentionPromotionModeGlobalSubtitle: 'Mostra uma seção de atenção acima das demais',
 	          attentionPromotionModeWithinGroupsTitle: 'Mover para o topo do grupo atual',
 	          attentionPromotionModeWithinGroupsSubtitle: 'Mantenha as sessões na pasta ou workspace delas',
+	          reminderAutoClearOnOpenTitle: "Limpar lembretes ao abrir",
+	          reminderAutoClearOnOpenSubtitle: "Desative para remover manualmente os lembretes vencidos. Os futuros continuam agendados.",
 	          attentionStandingDefaultTitle: 'Manter sessões em Precisa de atenção',
 	          attentionStandingDefaultEnabledSubtitle: 'Cada sessão fica até você remover',
 	          attentionStandingDefaultDisabledSubtitle: 'Mantenha as sessões uma de cada vez',
@@ -8272,12 +8578,14 @@ settingsSession: {
       providerUsageGauge: {
         title: "Uso do provedor",
         footer:
-          "Controla o medidor de cota mostrado ao lado do compositor quando há uso confiável do provedor.",
+          "Escolha os indicadores do editor para todas as contas. Eles respeitam os limites selecionados em cada pool. Os favoritos adicionam indicadores para a conta ativa.",
         visibilityTitle: "Mostrar medidor de uso do provedor",
         visibilityEnabledSubtitle:
           "Mostra a cota restante do provedor ao lado do compositor quando disponível.",
         visibilityHiddenSubtitle: "Oculta a cota do provedor no compositor.",
-        windowTitle: "Janela do medidor",
+        windowTitle: "Janelas dos indicadores",
+        labelsTitle: 'Mostrar etiquetas de uso',
+        labelsSubtitle: 'Identificar os indicadores de contexto e do provedor.',
         windowMostConstrainedTitle: "Mais limitada",
         windowMostConstrainedSubtitle:
           "Mostra a janela de cota confiável com menos cota restante.",
@@ -8285,8 +8593,8 @@ settingsSession: {
         windowDailySubtitle: "Prefere a janela de cota diária.",
         windowWeeklyTitle: "Semanal",
         windowWeeklySubtitle: "Prefere a janela de cota semanal.",
-        windowSessionTitle: "Sessão",
-        windowSessionSubtitle: "Prefere a janela de cota da sessão atual.",
+        windowSessionTitle: "Janela curta",
+        windowSessionSubtitle: "Mostrar janelas curtas de cota, como um limite de cinco horas.",
         windowPrimaryTitle: "Primária",
         windowPrimarySubtitle: "Prefere a janela de cota primária do provedor.",
         windowSecondaryTitle: "Secundária",
@@ -9173,6 +9481,26 @@ settingsSession: {
           },
         },
       },
+      modelPackDownload: {
+        progress: ({ loaded, total }: { loaded: string; total: string }) => `${loaded} de ${total}`,
+        progressWithFiles: ({ loaded, total, filesDone, filesTotal }: { loaded: string; total: string; filesDone: number; filesTotal: number }) =>
+          `${loaded} de ${total} · ${filesDone} de ${filesTotal} ${filesTotal === 1 ? 'arquivo' : 'arquivos'}`,
+        progressAccessibilityLabel: "Progresso do download",
+        verifyingDetail: "Verificando",
+        verifyingProgress: ({ verified, total, filesDone, filesTotal }: { verified: string; total: string; filesDone: number; filesTotal: number }) =>
+          `Verificado ${verified} de ${total} · ${filesDone} de ${filesTotal} ${filesTotal === 1 ? 'arquivo' : 'arquivos'}`,
+        verifyingAccessibilityLabel: "Progresso da verificação",
+        failedDetail: "Falhou",
+        failedSubtitle: "Não foi possível preparar o modelo. Toque para tentar novamente.",
+        failedResumableSubtitle: ({ size }: { size: string }) => `O download não terminou. ${size} foram mantidos; toque para retomar.`,
+        incompleteDetail: "Incompleto",
+        incompleteSubtitle: ({ size }: { size: string }) => `${size} baixados até agora. Toque para continuar.`,
+        discardSubtitle: "Exclua o download incompleto para liberar espaço.",
+        discardConfirmTitle: "Descartar o download incompleto?",
+        discardConfirmBody: ({ size }: { size: string }) => `Isso exclui os ${size} baixados até agora. Você pode baixar o modelo novamente mais tarde.`,
+        insufficientStorage: ({ required, available }: { required: string; available: string }) =>
+            `Não há espaço livre suficiente. Este download precisa de ${required}, mas só há ${available} livres.`,
+      },
       localNeuralStt: {
         modelPack: {
           title: "Pacote de modelo",
@@ -9195,12 +9523,6 @@ settingsSession: {
           installedWithBuild: ({ build }: { build: string }) =>
             `Instalado • ${build}`,
           notInstalled: "Não instalado",
-        },
-        language: {
-          title: "Idioma",
-          subtitle: "Tag de idioma BCP-47 opcional.",
-          promptTitle: "Idioma",
-          promptBody: "Digite uma tag de idioma BCP-47 (ex.: en, en-US).",
         },
         alerts: {
           downloadFailedTitle: "Falha no download",
@@ -9235,6 +9557,8 @@ settingsSession: {
           enableTitle: "Ativar mãos livres",
           silenceTitle: "Tempo de silêncio (ms)",
           minSpeechTitle: "Fala mínima (ms)",
+          pushToTalkTitle: "Pressione para falar",
+          pushToTalkSubtitle: "Este provedor transcreve uma gravação concluída; toque no microfone novamente para enviar. Para mãos livres, escolha o reconhecimento de voz do dispositivo ou o neural local.",
         },
         customBackendIdSubtitle: "Digite um id de backend personalizado.",
         searchBackendsPlaceholder: "Buscar backends",
@@ -9492,8 +9816,7 @@ settingsSession: {
       sttProvider: "Provedor STT",
       neuralStt: {
         title: "STT no dispositivo",
-        webNotAvailableSubtitle:
-          "Indisponível na web. Use STT do dispositivo, compatível com OpenAI ou Gemini STT.",
+        webFallbackSubtitle: "Funciona apenas no app móvel. No navegador, a voz usa o reconhecimento de fala do navegador.",
       },
       ttsBaseUrl: "Base URL TTS",
       ttsBaseUrlTitle: "Base URL TTS",
@@ -9634,6 +9957,10 @@ settingsSession: {
     logoutConfirm:
       "Tem certeza de que quer sair? Certifique-se de ter feito backup da sua chave secreta!",
     encryptionUpdateFailed: "Falha ao atualizar a configuração de criptografia",
+    requireE2ee: "Exigir criptografia de ponta a ponta",
+    requireE2eeDescription: "Recusa configurações de conta e sessões em texto simples neste dispositivo e nos daemons sincronizados.",
+    requireE2eeNeedsEncryptionTitle: "Ative primeiro a criptografia",
+    requireE2eeNeedsEncryptionDescription: "Ative a criptografia de ponta a ponta para esta conta antes de exigi-la.",
     secretKeyMissing: "Chave secreta indisponível. Restaure sua conta primeiro.",
     restoreRequiredTitle: "Restauração necessária",
     restoreRequiredBody:
@@ -9660,15 +9987,128 @@ settingsSession: {
     pasteAuthUrl: "Cole a URL de autenticação do seu terminal",
   },
 
-  updateBanner: {
-    updateShort: "Atualizar",
-    updateAvailable: "Atualização disponível",
-    pressToApply: "Pressione para aplicar a atualização",
-    whatsNew: "Novidades",
-    seeLatest: "Veja as atualizações e melhorias mais recentes",
-    nativeUpdateAvailable: "Atualização do aplicativo disponível",
-    tapToUpdateAppStore: "Toque para atualizar na App Store",
-    tapToUpdatePlayStore: "Toque para atualizar na Play Store",
+  updates: {
+    title: "Atualizações",
+    thisAppTitle: "Happier",
+    happierCliTitle: "Happier CLI",
+    sections: {
+      thisApp: "Este app",
+      thisComputer: "Este computador",
+      machine: "Máquina",
+    },
+    offline: "Offline",
+    pill: {
+      updates: ({ count }: { count: number }) => plural({ count, singular: "atualização", plural: "atualizações" }),
+      running: "Atualizando…",
+      ready: "Reinicie para atualizar",
+      failed: "A atualização não terminou",
+      required: "Atualização necessária",
+      completed: "Atualizado",
+    },
+    a11y: {
+      pillAvailable: ({ count }: { count: number }) => plural({ count, singular: `Atualizações, ${count} disponível`, plural: `Atualizações, ${count} disponíveis` }),
+      pillRunning: "Atualizações, atualizando",
+      pillReady: "Atualizações, reinicie para concluir",
+      pillFailed: "Atualizações, uma atualização não terminou",
+      pillRequired: "Atualizações, atualização necessária",
+      pillCompleted: "Atualizações, concluído",
+      rowOn: ({ title, where }: { title: string; where: string }) => `${title} em ${where}`,
+      actionOn: ({ action, title, where }: { action: string; title: string; where: string }) => `${action} ${title} em ${where}`,
+      progress: ({ percent }: { percent: number }) => `${percent} por cento`,
+    },
+    summary: {
+      checking: "Procurando atualizações…",
+      available: ({ count }: { count: number }) => plural({ count, singular: "1 atualização disponível", plural: `${count} atualizações disponíveis` }),
+      updatingBatch: ({ done, total }: { done: number; total: number }) => `Atualizando ${Math.min(done + 1, total)} de ${total}…`,
+      updating: "Atualizando…",
+      keepWorking: "Você pode continuar trabalhando.",
+      ready: "Reinicie para concluir a atualização do Happier",
+      failedCount: ({ count }: { count: number }) => plural({ count, singular: "1 atualização não terminou", plural: `${count} atualizações não terminaram` }),
+      notCheckedYet: "Ainda não verificado",
+      required: "Uma atualização é necessária",
+      upToDate: "Tudo está atualizado",
+      unknown: "Não foi possível verificar algumas versões",
+      unchecked: "Nenhuma atualização conhecida",
+      uncheckedMeta: "Algumas ferramentas ainda não foram verificadas.",
+      offline: "Algumas máquinas estão offline",
+      checkedAt: ({ time }: { time: string }) => `Última verificação: ${time}`,
+      upToDateDescription: "O Happier, a linha de comando dele e seus agentes estão atualizados.",
+      unknownDescription: "Tudo o que pôde ser verificado está atualizado. O restante será verificado novamente quando estiver acessível.",
+      offlineDescription: "Tudo o que está acessível está atualizado. As máquinas offline serão verificadas quando voltarem.",
+    },
+    settingsSubtitle: {
+      upToDate: "Atualizado",
+      available: ({ count }: { count: number }) => plural({ count, singular: "1 atualização disponível", plural: `${count} atualizações disponíveis` }),
+      running: "Atualizando…",
+      ready: "Reinicie para concluir a atualização",
+      required: "Uma atualização é necessária",
+      failed: "Uma atualização não terminou",
+      unknown: "Não foi possível verificar todas as atualizações",
+      unchecked: "Algumas ferramentas não foram verificadas",
+      offline: "Algumas máquinas estão offline",
+      checking: "Procurando atualizações…",
+    },
+    action: {
+      update: "Atualizar",
+      updateAll: "Atualizar tudo",
+      restart: "Reiniciar para atualizar",
+      reload: "Recarregar",
+      storeIos: "Atualizar na App Store",
+      storeAndroid: "Atualizar no Google Play",
+      checkNow: "Procurar atualizações",
+      stopAfterThis: "Parar depois desta",
+      skipVersion: "Pular esta versão",
+      openUpdates: "Abrir Atualizações",
+      whatsNew: "Novidades",
+      viewLog: "Ver registro",
+    },
+    row: {
+      versionChange: ({ from, to }: { from: string; to: string }) => `${from} → ${to}`,
+      upToDateVersion: ({ version }: { version: string }) => `Atualizado · ${version}`,
+      available: ({ version }: { version: string }) => `${version} disponível`,
+      downloading: ({ version }: { version: string }) => `Baixando ${version}`,
+      downloadingUpdate: "Baixando atualização",
+      updatingTo: ({ version }: { version: string }) => `Atualizando para ${version}…`,
+      updating: "Atualizando…",
+      restarting: "Reiniciando…",
+      restartingService: "Reiniciando o serviço em segundo plano…",
+      readyVersion: ({ version }: { version: string }) => `${version} está pronta`,
+      ready: "Atualização pronta",
+      webNewBuild: "Uma versão mais recente do Happier está pronta",
+      requiredApp: "Esta versão não é mais compatível. Atualize para continuar usando o Happier.",
+      appCheckFailed: "Não foi possível verificar se há uma versão mais recente.",
+      appDownloadFailed: "O download não terminou.",
+      appInstallFailed: "Não foi possível instalar a atualização.",
+      latestUnknown: "Não foi possível verificar se há uma versão mais recente",
+      rolledBack: ({ kept, target }: { kept: string; target: string }) => `${target} não iniciou nesta máquina, então ela continua na ${kept}.`,
+      installedByYou: "Instalado por você",
+      updateItYourWay: "Atualize do mesmo jeito que você instalou.",
+      offline: "Não é possível atualizar offline",
+      skipped: ({ version }: { version: string }) => `${version} ignorada`,
+      checking: "Verificando…",
+      failedGeneric: "A atualização não terminou. Tente novamente.",
+      remoteUnsupported: "Esta máquina não pode atualizar a linha de comando remotamente. Atualize diretamente na máquina.",
+      archiveExpandedByteLimit: "O runtime transferido excede o limite de tamanho de extração. Atualize o Happier antes de tentar novamente.",
+      updateNotVerified: "A atualização foi executada, mas a versão não mudou.",
+      rolledBackLocal: "A atualização não iniciou, então este computador voltou para a versão anterior.",
+      smokeFailed: "A nova versão não funcionou neste computador, então nada mudou.",
+      waitingReconnect: "Instalada, aguardando esta máquina se reconectar",
+      couldNotStart: ({ message }: { message: string }) => `Não foi possível iniciar a atualização: ${message}`,
+      restartsService: 'Reinicia o serviço em segundo plano; as sessões se reconectam.',
+      alreadyCurrent: 'Já está atualizado',
+      anotherUpdateRunning: 'Outra atualização está em andamento nesta máquina. Tente novamente quando ela terminar.',
+      outcomeUnknown: 'Não foi possível confirmar que a atualização começou. Tente novamente para verificar.',
+      othersUpToDate: ({ count }: { count: number }) => plural({ count, singular: "Mais 1 atualizado", plural: `Mais ${count} atualizados` }),
+      waitingOffline: ({ count }: { count: number }) => plural({ count, singular: "1 atualização aguardando a máquina voltar a ficar online", plural: `${count} atualizações aguardando a máquina voltar a ficar online` }),
+    },
+    footer: "As atualizações são instaladas em cada máquina. Depois de uma atualização da linha de comando, o Happier reinicia o serviço em segundo plano daquela máquina.",
+    tray: {
+      available: ({ count }: { count: number }) => `Atualizações disponíveis (${count})…`,
+      running: "Atualizando…",
+      ready: "Reiniciar para atualizar o Happier",
+      required: "Atualização necessária…",
+      failed: "Uma atualização não terminou…",
+    },
   },
 
   changelog: {
@@ -9707,7 +10147,7 @@ settingsSession: {
                         "tuisTitle": "Use suas TUIs favoritas",
                         "tuisBody": "Execute Claude Code, Codex ou OpenCode na interface de terminal nativa. O Happier captura e sincroniza tudo em cada dispositivo.",
                         "inboxTitle": "Uma caixa de entrada. Todas as sessões.",
-                        "inboxBody": "Todas as aprovações pendentes, solicitações de permissão e atividades não lidas, de cada sessão e máquina, em um só lugar.",
+                        "inboxBody": "Todas as aprovações pendentes, solicitações de permissão e sessões prontas para revisão, de cada máquina, em um só lugar.",
                         "mcpTitle": "Uma configuração MCP. Todos os provedores.",
                         "mcpBody": "Defina servidores MCP uma única vez. Eles funcionam em todos os backends, inclusive provedores que não oferecem suporte nativo a MCP.",
                         "controlTitle": "Enfileire, guie, bifurque, reverta",
@@ -10052,6 +10492,8 @@ settingsSession: {
               startDaemon: ({ targetLabel }: { targetLabel: string }) =>
 
                   `Use o fluxo de configuração da área de trabalho para reconectar o serviço em segundo plano de ${targetLabel}. Abra os passos manuais apenas se você já estiver nesse computador.`,
+              connectMachineElsewhere: ({ targetLabel }: { targetLabel: string }) => `Abra o Happier no computador que você quer conectar a ${targetLabel}, ou execute nele os passos de terminal abaixo.`,
+              startDaemonElsewhere: ({ targetLabel }: { targetLabel: string }) => `Abra o Happier nesse computador para reconectar o serviço em segundo plano a ${targetLabel}, ou execute nele os passos de terminal abaixo.`,
 
               createSession: 'Comece uma sessão nova com o botão + ou a partir do terminal.',
 
@@ -10158,6 +10600,94 @@ settingsSession: {
       },
 
 
+    setupSurface: {
+        acquisitionResolvingReleaseStatus: "Buscando a versão da linha de comando do Happier.",
+        acquisitionDownloadingStatus: "Baixando a linha de comando do Happier.",
+        acquisitionVerifyingStatus: "Verificando o download.",
+        acquisitionUnpackingStatus: "Descompactando a linha de comando do Happier.",
+        acquisitionInstallingStatus: "Instalando a linha de comando do Happier.",
+        acquisitionFinalizingStatus: "Finalizando a instalação da linha de comando.",
+        acquisitionCheckingCliStatus: "Verificando a linha de comando do Happier.",
+        acquisitionCheckingDaemonStatus: "Verificando o serviço em segundo plano.",
+        acquisitionReleaseFailed: "O Happier não encontrou a versão da linha de comando. Tente novamente.",
+        acquisitionDownloadFailed: "O download da linha de comando não foi concluído. Tente novamente.",
+        acquisitionVerificationFailed: "O Happier não conseguiu verificar o download. Tente novamente.",
+        acquisitionInstallFailed: "A instalação da linha de comando não foi concluída. Tente novamente.",
+        acquisitionDownloadBytes: ({ received }: { received: string }) => `${received} baixados`,
+        acquisitionDownloadBytesTotal: ({ received, total }: { received: string; total: string }) => `${received} de ${total} baixados`,
+    checkingTitle: 'Verificando este computador',
+    checkingStatus: ({ relay }: { relay: string }) => `Estamos vendo o que este computador já tem para ${relay}.`,
+    workingTitle: 'Configurando este computador',
+    movingTitle: ({ relay }: { relay: string }) => `Movendo este computador para ${relay}`,
+    stagePrepareStatus: 'Preparando a linha de comando do Happier neste computador.',
+    stageConnectStatus: ({ relay }: { relay: string }) => `Conectando este computador a ${relay}. Você não precisa fazer nada.`,
+    stageConnectStatusAs: ({ relay, account }: { relay: string; account: string }) => `Conectando este computador a ${relay} como ${account}. Você não precisa fazer nada.`,
+    stageServiceStatus: 'Instalando o serviço em segundo plano que mantém suas sessões acessíveis.',
+    stageServiceStartStatus: 'Iniciando o serviço em segundo plano que mantém suas sessões acessíveis.',
+    stageServiceRestartStatus: 'Reiniciando o serviço em segundo plano com as novas configurações.',
+    stageVerifyStatus: ({ relay }: { relay: string }) => `Verificando se este computador responde em ${relay}.`,
+    blockedTitle: 'Configuração interrompida',
+    blockedStatusFallback: 'A configuração não pôde terminar. Sua conta e suas sessões continuam intactas.',
+    blockedServiceConflictStatus: 'Primeiro é preciso resolver outro serviço em segundo plano deste computador. Ele ficou como estava — abra Detalhes para ver qual.',
+    blockedServiceManagerUnavailableStatus: 'O Happier não pode configurar o serviço em segundo plano neste computador. Abra Detalhes para obter ajuda ou continue com suas outras máquinas.',
+    blockedConsentDeclinedStatus: 'A configuração parou. O serviço em segundo plano que já existia ficou exatamente como estava.',
+    blockedAccountKeptStatus: 'A configuração parou. Este computador continua conectado à conta em que está com sessão iniciada.',
+    blockedAccountChangedStatus: 'Este computador entrou em outra conta enquanto a configuração decorria, por isso ela parou antes do emparelhamento. Tente de novo.',
+    blockedPairingDeclinedStatus: 'Este computador não foi aprovado para se conectar. Sua conta e suas sessões continuam intactas.',
+    blockedPairingIncompleteStatus: 'A conexão deste computador não terminou.',
+    blockedCliOutdatedStatus: 'A linha de comando do Happier neste computador é mais antiga do que a configuração precisa. Atualize o Happier e tente de novo.',
+    blockedCliChannelOutdatedStatus: ({ channel }: { channel: string }) => `Este computador usa a CLI ${channel}, que é mais antiga do que este app precisa.`,
+    blockedCliChannelOutdatedVersionStatus: ({ channel, version }: { channel: string; version: string }) => `Este computador usa a CLI ${channel}. A versão mais recente, ${version}, é mais antiga do que este app precisa.`,
+    blockedCliUnresponsiveStatus: 'A linha de comando do Happier parou de responder.',
+        blockedCliUnavailableStatus: "O Happier não conseguiu iniciar sua linha de comando neste computador.",
+    blockedCliFailedStatus: 'O Happier não conseguiu terminar de ler a configuração deste computador.',
+    blockedStepStatus: ({ step }: { step: string }) => `Não foi possível concluir: ${step}`,
+    unreachableStatus: ({ relay }: { relay: string }) => `Este computador ainda não responde em ${relay}.`,
+    notConvergedStatus: ({ relay }: { relay: string }) => `O serviço em segundo plano deste computador ainda não terminou de iniciar para ${relay}.`,
+    canceledTitle: 'Configuração cancelada',
+    canceledStatus: 'Nada ficou pela metade. Executar a configuração de novo continua daqui.',
+    stepOfTotal: ({ step, total }: { step: number; total: number }) => `Etapa ${step} de ${total}`,
+    hideDetails: 'Ocultar detalhes',
+    consentTitle: 'Substituir o serviço em segundo plano deste computador?',
+    consentBodyFallback: 'Já existe um serviço em segundo plano do Happier neste computador que não é gerenciado por este app.',
+    consentServicesList: ({ services }: { services: string }) => `Serviços afetados: ${services}`,
+    consentConfirm: 'Substituir',
+    consentKeep: 'Manter o serviço atual',
+    relayMoveTitle: 'Mover o serviço em segundo plano para este Relay?',
+    relayMoveBody: ({ relay }: { relay: string }) => `O servi\u00e7o em segundo plano deste computador est\u00e1 noutro Relay. Mov\u00ea-lo para ${relay}?`,
+    relayMoveConfirm: 'Mover',
+    relayMoveKeep: 'Deixar como está',
+    relayMoveAlways: 'Mover sempre',
+    relayConnectToo: ({ relay }: { relay: string }) => `Conectar também a ${relay}`,
+    relayMoveBodyFromTo: ({ from, to }: { from: string; to: string }) => `O serviço em segundo plano deste computador está conectado a ${from}. Movê-lo para ${to}? Ele deixará de responder em ${from}.`,
+    accountMoveTitle: ({ account }: { account: string }) => `Mudar este computador para ${account}?`,
+    accountMoveBody: ({ from, to, relay }: { from: string; to: string; relay: string }) => `Este computador está conectado a ${relay} como ${from}. Depois de mudar para ${to}, ${from} não alcançará mais este computador.`,
+    accountMoveBodyAcrossRelays: ({ from, fromRelay, to, toRelay }: { from: string; fromRelay: string; to: string; toRelay: string }) => `Este computador está conectado a ${fromRelay} como ${from}. Depois de mudar para ${to} em ${toRelay}, ${from} não alcançará mais este computador.`,
+    accountMoveConfirm: 'Mudar',
+    consentTakeoverTitle: 'Deixar o Happier gerenciar o serviço em segundo plano aqui?',
+    consentTakeoverConfirm: 'Assumir',
+    continueWithoutAction: 'Continuar sem este computador',
+    updateCliAction: 'Atualizar',
+    cliChoiceTitle: ({ version }: { version: string }) => `A CLI do Happier ${version} já está instalada`,
+    cliChoiceTitleUnknownVersion: 'A CLI do Happier já está instalada',
+    cliChoiceBody: ({ path }: { path: string }) => `Ela está em ${path}. O Happier pode instalar a própria cópia, mantê-la atualizada e colocá-la primeiro no seu PATH, ou você pode continuar usando esta.`,
+    cliChoiceBodyOutdated: ({ path }: { path: string }) => `Ela está em ${path} e é antiga demais para a configuração. O Happier pode instalar a própria cópia atualizada e colocá-la primeiro no seu PATH, ou você pode manter a sua e atualizá-la você mesmo.`,
+    cliChoiceTitleMissing: 'Sua CLI do Happier não está mais instalada',
+    cliChoiceBodyMissing: ({ path }: { path: string }) => `Você escolheu manter a que estava em ${path}, e ela não está mais lá. O Happier pode instalar a própria cópia e mantê-la atualizada, ou você pode reinstalar a sua e continuar usando-a.`,
+    cliChoiceBodyKeepBlocked: ({ path, link }: { path: string; link: string }) => `Ela está em ${path}, mas novos terminais executam primeiro a CLI do Happier por meio de ${link}, que o Happier não adicionou. Deixe o Happier gerenciar a linha de comando, ou remova ${link} e execute a configuração de novo para manter a sua.`,
+    cliChoiceNotNow: 'Agora não',
+    cliChoiceManage: 'Deixar o Happier gerenciar',
+    cliChoiceKeep: 'Manter a minha',
+    blockedCliChoiceStatus: 'A configuração parou antes de alterar qualquer coisa. Escolha quem gerencia a linha de comando para continuar.',
+    blockedCliOwnOutdatedStatus: ({ command }: { command: string }) => `Sua linha de comando é antiga demais para a configuração. Atualize-a com ${command}`,
+    blockedCliOwnOutdatedUnknownStatus: 'Sua linha de comando é antiga demais para a configuração. Atualize-a onde você a instalou.',
+    blockedCliOwnMissingStatus: 'A linha de comando que você manteve não está mais instalada. Reinstale-a ou deixe o Happier gerenciar a linha de comando.',
+    cliTrustTitle: 'Aprovar esta linha de comandos?',
+    cliTrustBody: ({ command }: { command: string }) => `O Happier não instalou a linha de comandos em ${command}. Aprová-la permite-lhe ler e escrever as sessões desta conta. Aprove apenas a que colocou você mesmo.`,
+    cliTrustBodyUnknownCommand: 'O Happier não instalou esta linha de comandos. Aprová-la permite-lhe ler e escrever as sessões desta conta. Aprove apenas a que colocou você mesmo.',
+    cliTrustApprove: 'Aprovar',
+  },
+
   setupOnboarding: {
           screenTitle: 'Configura este computador',
           webDesktopOnlyTitle: 'É necessário o app de desktop',
@@ -10178,10 +10708,6 @@ settingsSession: {
     postAuthBody: 'Você entrou. Continue com o fluxo de configuração local para deixar este computador pronto para o Relay selecionado.',
     controlPanelTitle: 'Resumo de prontidão',
     activeRelaySummaryTitle: 'Relay ativo',
-    thisComputerSummaryTitle: 'Este computador',
-    nextActionSummaryTitle: 'Próxima ação',
-    thisComputerReady: 'Pronto para este Relay',
-    nextActionReady: 'Crie sua primeira sessão ou adicione outro computador abaixo.',
     resumeIntentTitle: 'Continuar a configuração neste computador',
           resumeIntentBody: 'Entre ou crie uma conta para continuar configurando este computador para o Relay selecionado.',
           openSetupAction: 'Configurar este computador',
@@ -10241,6 +10767,45 @@ settingsSession: {
       unknown: "Desconhecido",
       stopped: "Parado",
       likelyAlive: "Provavelmente ativo",
+    },
+    thisComputer: {
+        notSetUp: 'Este computador ainda não está configurado.',
+        connectedAs: ({ relay, account }: { relay: string; account: string }) => `Conectado a ${relay} como ${account}.`,
+        cliTitle: 'Linha de comando',
+        cliManaged: ({ version }: { version: string }) => `Happier ${version}, instalado por este app`,
+        cliManagedOnChannel: ({ channel, version }: { channel: string; version: string }) => `CLI ${channel} ${version}, instalado por este app`,
+        cliChoiceManaged: 'Gerenciada pelo Happier',
+        cliChoiceOwn: ({ path }: { path: string }) => `A sua — ${path}`,
+        cliChoiceChange: 'Mudar quem gerencia a linha de comando',
+        cliOldCopyTitle: 'Linha de comando antiga',
+        cliOldCopyRemove: ({ path, command }: { path: string; command: string }) => `Ainda instalada em ${path}. Remova-a com ${command}`,
+        cliOldCopyPath: ({ path }: { path: string }) => `Ainda instalada em ${path}.`,
+        cliChannelStable: 'Estável',
+        cliChannelPreview: 'Preview',
+        cliChannelDev: 'Dev',
+        cliManagedUnknownVersion: 'Instalada por este app',
+        cliFromPath: ({ version, path }: { version: string; path: string }) => `${version} de ${path}`,
+        updateCliTitle: 'Atualizar a linha de comando',
+        updateCliAvailable: ({ version }: { version: string }) => `Happier ${version} está disponível.`,
+        updateCliKept: ({ version, command }: { version: string; command: string }) => `Happier ${version} está disponível. Atualize-a com ${command}`,
+        relayAccount: ({ account }: { account: string }) => `Sessão iniciada como ${account}`,
+        updatingCli: 'Atualizando a linha de comando',
+        cliNotManaged: 'O Happier não instalou esta linha de comando, então não vai substituí-la.',
+        cliUpdateFailed: 'A atualização não terminou. Tente de novo.',
+        cliUpdateRestartNotConverged: 'A linha de comando foi atualizada, mas o serviço em segundo plano ainda executa a versão anterior. Tente de novo.',
+    },
+    cliPath: {
+      title: "Terminal",
+      footer: "O Happier Desktop só adiciona ou remove as entradas do PATH que ele criou; as escritas pelo instalador do shell ficam intactas.",
+      addTitle: "Adicionar happier ao PATH",
+      addSubtitle: "Disponibiliza o comando happier em novos terminais.",
+      removeTitle: "Remover happier do PATH",
+      removeSubtitle: "Remove apenas as entradas do PATH adicionadas pelo Happier Desktop.",
+      added: "Adicionado. Abra um novo terminal para usar o happier.",
+      alreadyPresent: "O happier já está no seu PATH.",
+      existingCommand: ({ path }: { path: string }) => `Outro happier em ${path} já responde no seu terminal, então nada foi adicionado.`,
+      removed: "As entradas do PATH adicionadas pelo Happier Desktop foram removidas.",
+      nothingToRemove: "O Happier Desktop não adicionou nenhuma entrada ao PATH.",
     },
     stopDaemon: "Parar daemon",
     stopDaemonConfirmTitle: "Parar daemon?",
@@ -10313,11 +10878,9 @@ settingsSession: {
     unknownPath: "caminho desconhecido",
     previousSessionsTitle: "Sessões anteriores (até as 5 mais recentes)",
     tmux: {
-      overrideTitle: "Substituir configurações globais do tmux",
-      overrideEnabledSubtitle:
-        "As configurações personalizadas do tmux se aplicam a novas sessões nesta máquina.",
-      overrideDisabledSubtitle:
-        "Novas sessões usam as configurações globais do tmux.",
+      overrideTitle: "Substituir o padrão da conta",
+      overrideEnabledSubtitle: "Esta máquina usa seu próprio host de terminal para novas sessões.",
+      overrideDisabledSubtitle: "Novas sessões herdam o host de terminal da sua conta.",
       notDetectedSubtitle: "tmux não foi detectado nesta máquina.",
       notDetectedMessage:
         "tmux não foi detectado nesta máquina. Instale o tmux e atualize a detecção.",
@@ -10370,6 +10933,7 @@ settingsSession: {
     providerStateSharingDegraded: "Compartilhamento de estado do provedor aplicado parcialmente",
     connectedServiceRuntimeAuthRecoveryRecovered: "Autenticação do provedor recuperada",
     connectedServiceRuntimeAuthRecoveryCancelled: "Recuperação de autenticação do provedor cancelada",
+        connectedServiceRuntimeAuthRecoveryStopped: "Recuperação do provedor interrompida; não haverá nova tentativa automática",
     runtimeConfigOutcomeAppliesBeforeNextMessage: "Será aplicado antes da sua próxima mensagem",
     runtimeConfigOutcomeQueuedUntilReady: "Na fila até estar pronto",
     runtimeConfigOutcomeAlreadySet: "Já configurado",
@@ -10405,6 +10969,19 @@ settingsSession: {
     switchingToPersistedTakeover: "Assumindo o controle e importando esta sessão…",
     takeOverDirect: "Assumir controle",
     takeOverPersist: "Assumir controle + importar",
+    directImportPreparing: "Preparando importação…",
+    directImportReading: "Lendo histórico…",
+    directImportImporting: "Importando histórico…",
+    directImportStarting: "Iniciando sessão…",
+    directImportConverting: "Concluindo tomada de controle…",
+    directImportCancelling: "Parando importação…",
+    directImportCancelled: "Importação interrompida. Seu histórico foi preservado; você pode tentar novamente.",
+    directImportFailed: "Falha na importação. Seu histórico foi preservado; você pode tentar novamente.",
+    directImportStatusUnavailable: "Progresso indisponível. Reconecte ou verifique novamente.",
+    directImportRequiresDaemonUpgrade: "Atualize o Happier nesta máquina para importar sessões com progresso e opção de parar.",
+    directImportStop: "Parar importação",
+    directImportCount: ({ count }: { count: number }) => `${count} mensagens importadas`,
+    directImportCountWithTotal: ({ count, total }: { count: number; total: number }) => `${count} de ${total} mensagens importadas`,
     directTakeoverDialogTitle: "Continuar esta sessão direta no Happier?",
     directTakeoverDialogBody: "Escolha como o Happier deve assumir o controle. Direto continua usando a transcrição do provedor. Importar leva a transcrição para o Happier.",
     directTakeoverDialogDirectTitle: "Assumir controle",
@@ -10684,8 +11261,8 @@ settingsSession: {
       anthropic: "Anthropic (Padrão)",
       deepseek: "DeepSeek (Raciocínio)",
       zai: "Z.AI (GLM-4.6)",
-      minimax: "MiniMax (M3)",
-      minimaxCn: "MiniMax (M3, CN)",
+      minimax: "MiniMax (M3.1 Flash)",
+      minimaxCn: "MiniMax (M3.1 Flash, CN)",
       codex: "Codex (Padrão)",
       openai: "OpenAI (GPT-5)",
       azureOpenai: "Azure OpenAI",
@@ -10849,9 +11426,14 @@ settingsSession: {
       geminiSubtitleExperimental: "CLI do Gemini (experimental)",
       auggieSubtitle: "CLI do Auggie",
       qwenSubtitleExperimental: "CLI do Qwen Code (experimental)",
-      kimiSubtitleExperimental: "CLI do Kimi (experimental)",
+      kimiSubtitleExperimental: "CLI do Kimi Code (experimental)",
       kiloSubtitleExperimental: "CLI do Kilo (experimental)",
       kiroSubtitleExperimental: "CLI do Kiro (experimental)",
+      devinSubtitleExperimental: "CLI do Devin (experimental)",
+      agySubtitleExperimental: "CLI do Antigravity (experimental)",
+      fxSubtitleExperimental: "CLI do FX (experimental)",
+      droidSubtitleExperimental: "CLI do Factory Droid (experimental)",
+      codebuddySubtitleExperimental: "CLI do CodeBuddy Code (experimental)",
       customAcpSubtitleExperimental: "CLI de ACP personalizada (experimental)",
       grokSubtitleExperimental: "CLI do Grok Build (experimental)",
       piSubtitleExperimental: "CLI do Pi (experimental)",

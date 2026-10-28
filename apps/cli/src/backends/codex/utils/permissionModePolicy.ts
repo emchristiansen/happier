@@ -1,4 +1,5 @@
 import type { PermissionMode } from '@/api/types';
+import { normalizePermissionModeToIntent } from '@/agent/runtime/permission/permissionModeCanonical';
 
 import type { CodexSessionConfig } from '../types';
 
@@ -67,17 +68,13 @@ export type CodexAppServerPolicy = {
  * This keeps approval + sandbox behavior consistent across mode switches.
  */
 export function resolveCodexMcpPolicyForPermissionMode(permissionMode: PermissionMode): CodexMcpPolicy {
-  switch (permissionMode) {
+  switch (normalizePermissionModeToIntent(permissionMode)) {
     case 'read-only':
       return { approvalPolicy: 'never', sandbox: 'read-only' };
     case 'safe-yolo':
       return { approvalPolicy: 'never', sandbox: 'workspace-write' };
     case 'yolo':
       return { approvalPolicy: 'never', sandbox: 'danger-full-access' };
-    case 'bypassPermissions':
-      return { approvalPolicy: 'never', sandbox: 'danger-full-access' };
-    case 'acceptEdits':
-      return { approvalPolicy: 'on-request', sandbox: 'workspace-write' };
     case 'plan':
       return { approvalPolicy: 'untrusted', sandbox: 'workspace-write' };
     case 'default':
@@ -88,12 +85,13 @@ export function resolveCodexMcpPolicyForPermissionMode(permissionMode: Permissio
 
 export function resolveCodexAppServerPolicyForPermissionMode(
   permissionMode: PermissionMode,
-  params: Readonly<{ directory: string; autoReviewAvailable?: boolean }>,
+  params: Readonly<{ directory: string; autoReviewAvailable?: boolean; managedScalarFallback?: boolean }>,
 ): CodexAppServerPolicy {
+  const canonicalMode = normalizePermissionModeToIntent(permissionMode);
   const policy = resolveCodexMcpPolicyForPermissionMode(permissionMode);
   const useWorkspaceApprovalRequests =
     policy.sandbox === 'workspace-write'
-    && (permissionMode === 'safe-yolo' || policy.approvalPolicy !== 'never');
+    && (canonicalMode === 'safe-yolo' || policy.approvalPolicy !== 'never');
   const autoReviewAvailable = params.autoReviewAvailable !== false;
   const granularApprovalPolicy: CodexAppServerApprovalPolicy = {
     granular: {
@@ -109,9 +107,11 @@ export function resolveCodexAppServerPolicyForPermissionMode(
   };
 
   return {
-    approvalPolicy: useWorkspaceApprovalRequests ? granularApprovalPolicy : 'never',
+    approvalPolicy: useWorkspaceApprovalRequests
+      ? params.managedScalarFallback && canonicalMode === 'safe-yolo' ? 'on-request' : granularApprovalPolicy
+      : 'never',
     ...(useWorkspaceApprovalRequests
-      ? { approvalsReviewer: permissionMode === 'safe-yolo' && autoReviewAvailable ? 'auto_review' : 'user' }
+      ? { approvalsReviewer: canonicalMode === 'safe-yolo' && autoReviewAvailable && !params.managedScalarFallback ? 'auto_review' : 'user' }
       : {}),
     sandbox:
       policy.sandbox === 'workspace-write'

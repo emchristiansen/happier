@@ -1,5 +1,5 @@
 import type { AgentState } from '@/api/types';
-import { updateAgentStateBestEffort } from '@/api/session/sessionWritesBestEffort';
+import { updateAgentStateBestEffort, type AgentStateWriteOptions } from '@/api/session/sessionWritesBestEffort';
 import { resolveAgentRequestKind } from '@/agent/permissions/requestKind';
 import {
     applyAgentStateRequestPushNotifiedAt,
@@ -19,6 +19,8 @@ import {
     isAgentStateRequestCoveredByCompletedRequests,
 } from '@happier-dev/agents';
 import { normalizeAskUserQuestionInputForPublication } from '@/agent/questions/normalizeAskUserQuestionInput';
+import { logger } from '@/ui/logger';
+import { deepEqual } from '@/utils/deterministicJson';
 
 type AgentStateRequestEntry = NonNullable<AgentState['requests']>[string];
 type AgentStateCompletedEntry = NonNullable<AgentState['completedRequests']>[string];
@@ -42,6 +44,15 @@ export function hasPermissionResponseClaimV1(value: unknown): value is Record<ty
     return hasOwnProperty(value, PERMISSION_RESPONSE_CLAIM_V1);
 }
 
+export function isSameAgentStateRequestOccurrence(left: unknown, right: unknown): boolean {
+    if (!left || typeof left !== 'object' || !right || typeof right !== 'object') return false;
+    const request = left as Record<string, unknown>;
+    const expected = right as Record<string, unknown>;
+    return request.createdAt === expected.createdAt && request.tool === expected.tool
+        && deepEqual(request.arguments, expected.arguments)
+        && (expected.source === undefined || request.source === expected.source);
+}
+
 export type AgentStateOutstandingRequest = Readonly<{
     requestId: string;
     toolName: string;
@@ -54,7 +65,8 @@ export type AgentStateOutstandingRequest = Readonly<{
 
 type SessionLike = Readonly<{
     sessionId: string;
-    updateAgentState: (updater: (state: AgentState) => AgentState) => Promise<void> | void;
+    updateAgentState: (updater: (state: AgentState) => AgentState, options?: AgentStateWriteOptions) => Promise<void> | void;
+    updateAgentStateRequestSettlement: (updater: (state: AgentState) => AgentState) => Promise<void>;
     getAgentStateSnapshot?: () => AgentState | null | undefined;
     getMetadataSnapshot?: () => unknown;
 }>;
@@ -188,7 +200,7 @@ export class AgentStateRequestStore {
         }
     }
 
-    completeRequest(params: Readonly<{
+    async completeRequest(params: Readonly<{
         requestId: string;
         status: string;
         decision?: string;
@@ -198,101 +210,122 @@ export class AgentStateRequestStore {
         updatedPermissions?: unknown;
         extraCompletedFields?: Readonly<Record<string, unknown>> | null;
         fallback?: Readonly<{ toolName: string; toolInput: unknown; createdAt: number; kind?: string; source?: string }> | null;
-        updateState?: (state: AgentState) => AgentState;
+        requireAck?: boolean;
+        /** An actual provider effect was observed, such as Claude PostToolUse. */
+        observedCompletion?: true;
     }>): Promise<void> {
+        const requireAck = params.requireAck === true
+            || (params.status !== 'canceled' && params.observedCompletion !== true);
         let completedRequest = false;
-        const completion = updateAgentStateBestEffort(
-            this.session,
-            (currentState) => {
-                const requests = cloneStringKeyedRecordToNullProto(currentState.requests);
-                const existing = requests[params.requestId] as unknown;
-                if (!existing && !params.fallback) {
-                    return currentState;
-                }
-                if (hasPermissionResponseClaimV1(existing)) {
-                    return currentState;
-                }
-                delete requests[params.requestId];
-
-                const completedRequests = cloneStringKeyedRecordToNullProto(currentState.completedRequests);
-                const completedEntry = clonePlainObjectToNullProto(existing) ?? Object.create(null);
-
-                if (!existing && params.fallback) {
-                    completedEntry.tool = params.fallback.toolName;
-                    completedEntry.arguments = params.fallback.toolInput;
-                    completedEntry.createdAt = params.fallback.createdAt;
-                    if (typeof params.fallback.kind === 'string') completedEntry.kind = params.fallback.kind;
-                    if (typeof params.fallback.source === 'string') completedEntry.source = params.fallback.source;
-                }
-
-                if (typeof completedEntry.kind !== 'string') {
-                    const toolName =
-                        typeof completedEntry.tool === 'string'
-                            ? completedEntry.tool
-                            : params.fallback?.toolName;
-                    if (toolName) {
-                        completedEntry.kind = resolveAgentRequestKind(toolName);
-                    }
-                }
-
-                completedEntry.completedAt = Date.now();
-                completedEntry.status = params.status;
-                if (typeof params.decision === 'string') completedEntry.decision = params.decision;
-                if (typeof params.reason === 'string' && params.reason.length > 0) completedEntry.reason = params.reason;
-                if (typeof params.mode === 'string') completedEntry.mode = params.mode;
-                if (Array.isArray(params.allowedTools) && params.allowedTools.length > 0) {
-                    completedEntry.allowedTools = [...params.allowedTools];
-                }
-                if (typeof params.updatedPermissions !== 'undefined') {
-                    completedEntry.updatedPermissions = params.updatedPermissions;
-                }
-                if (params.extraCompletedFields && typeof params.extraCompletedFields === 'object' && !Array.isArray(params.extraCompletedFields)) {
-                    const extra = clonePlainObjectToNullProto(params.extraCompletedFields) ?? Object.create(null);
-                    for (const [key, value] of Object.entries(extra)) {
-                        if (!key) continue;
-                        completedEntry[key] = value;
-                    }
-                }
-
-                completedRequests[params.requestId] = completedEntry as AgentStateCompletedEntry;
-                for (const [id, request] of Object.entries(requests)) {
-                    if (id === params.requestId) continue;
-                    if (!isAgentStateRequestCoveredByCompletedRequests({
-                        requestId: id,
-                        request,
-                        completedRequests: {
-                            [params.requestId]: completedEntry,
-                        },
-                        options: PENDING_REQUEST_COVERAGE_OPTIONS,
-                    })) continue;
-
-                    delete requests[id];
-                    const equivalentCompleted = clonePlainObjectToNullProto(request) ?? Object.create(null);
-                    equivalentCompleted.completedAt = completedEntry.completedAt;
-                    equivalentCompleted.status = completedEntry.status;
-                    if (typeof completedEntry.reason === 'string') equivalentCompleted.reason = completedEntry.reason;
-                    if (typeof completedEntry.decision === 'string') equivalentCompleted.decision = completedEntry.decision;
-                    completedRequests[id] = equivalentCompleted as AgentStateCompletedEntry;
-                    this.markPermissionRequestCompletedBestEffort(id);
-                }
-
-                const nextState: AgentState = {
-                    ...currentState,
-                    requests,
-                    completedRequests,
-                };
-                completedRequest = true;
-                return typeof params.updateState === 'function' ? params.updateState(nextState) : nextState;
-            },
-            this.logPrefix,
-            'complete_request',
-        );
-
-        return completion.then(() => {
-            if (completedRequest) {
-                this.markPermissionRequestCompletedBestEffort(params.requestId);
+        let expectedCompletion: AgentStateCompletedEntry | null = null;
+        const completedAt = Date.now();
+        const update = (currentState: AgentState): AgentState => {
+            completedRequest = false;
+            const requests = cloneStringKeyedRecordToNullProto(currentState.requests);
+            const existing = requests[params.requestId] as unknown;
+            if (!existing && !params.fallback) {
+                return currentState;
             }
-        });
+            if (hasPermissionResponseClaimV1(existing)) {
+                return currentState;
+            }
+            if (existing && params.fallback && !isSameAgentStateRequestOccurrence(existing, {
+                tool: params.fallback.toolName, arguments: params.fallback.toolInput,
+                createdAt: params.fallback.createdAt, source: params.fallback.source,
+            })) return currentState;
+            const previousCompletion = currentState.completedRequests?.[params.requestId];
+            if (requireAck && !existing && previousCompletion) {
+                // An ACK may have been lost after our exact write committed. A different
+                // terminal outcome belongs to its writer and cannot be replaced by fallback.
+                completedRequest = expectedCompletion !== null && deepEqual(previousCompletion, expectedCompletion);
+                return currentState;
+            }
+            delete requests[params.requestId];
+
+            const completedRequests = cloneStringKeyedRecordToNullProto(currentState.completedRequests);
+            const completedEntry = clonePlainObjectToNullProto(existing) ?? Object.create(null);
+
+            if (!existing && params.fallback) {
+                completedEntry.tool = params.fallback.toolName;
+                completedEntry.arguments = params.fallback.toolInput;
+                completedEntry.createdAt = params.fallback.createdAt;
+                if (typeof params.fallback.kind === 'string') completedEntry.kind = params.fallback.kind;
+                if (typeof params.fallback.source === 'string') completedEntry.source = params.fallback.source;
+            }
+
+            if (typeof completedEntry.kind !== 'string') {
+                const toolName =
+                    typeof completedEntry.tool === 'string'
+                        ? completedEntry.tool
+                        : params.fallback?.toolName;
+                if (toolName) {
+                    completedEntry.kind = resolveAgentRequestKind(toolName);
+                }
+            }
+
+            completedEntry.completedAt = completedAt;
+            completedEntry.status = params.status;
+            if (typeof params.decision === 'string') completedEntry.decision = params.decision;
+            if (typeof params.reason === 'string' && params.reason.length > 0) completedEntry.reason = params.reason;
+            if (typeof params.mode === 'string') completedEntry.mode = params.mode;
+            if (Array.isArray(params.allowedTools) && params.allowedTools.length > 0) {
+                completedEntry.allowedTools = [...params.allowedTools];
+            }
+            if (typeof params.updatedPermissions !== 'undefined') {
+                completedEntry.updatedPermissions = params.updatedPermissions;
+            }
+            if (params.extraCompletedFields && typeof params.extraCompletedFields === 'object' && !Array.isArray(params.extraCompletedFields)) {
+                const extra = clonePlainObjectToNullProto(params.extraCompletedFields) ?? Object.create(null);
+                for (const [key, value] of Object.entries(extra)) {
+                    if (!key) continue;
+                    completedEntry[key] = value;
+                }
+            }
+
+            expectedCompletion = completedEntry as AgentStateCompletedEntry;
+            completedRequests[params.requestId] = expectedCompletion;
+            for (const [id, request] of Object.entries(requests)) {
+                if (id === params.requestId) continue;
+                if (!isAgentStateRequestCoveredByCompletedRequests({
+                    requestId: id,
+                    request,
+                    completedRequests: {
+                        [params.requestId]: completedEntry,
+                    },
+                    options: PENDING_REQUEST_COVERAGE_OPTIONS,
+                })) continue;
+
+                delete requests[id];
+                const equivalentCompleted = clonePlainObjectToNullProto(request) ?? Object.create(null);
+                equivalentCompleted.completedAt = completedEntry.completedAt;
+                equivalentCompleted.status = completedEntry.status;
+                if (typeof completedEntry.reason === 'string') equivalentCompleted.reason = completedEntry.reason;
+                if (typeof completedEntry.decision === 'string') equivalentCompleted.decision = completedEntry.decision;
+                completedRequests[id] = equivalentCompleted as AgentStateCompletedEntry;
+                this.markPermissionRequestCompletedBestEffort(id);
+            }
+
+            const nextState: AgentState = {
+                ...currentState,
+                requests,
+                completedRequests,
+            };
+            completedRequest = true;
+            return nextState;
+        };
+        if (requireAck) await this.session.updateAgentState(update);
+        else await this.settleRequests(update);
+        if (!completedRequest) {
+            throw new Error(`Permission request ${params.requestId} did not match an outstanding request settlement`);
+        }
+        if (requireAck) {
+            const committed = this.session.getAgentStateSnapshot?.();
+            if (!expectedCompletion || committed?.requests?.[params.requestId] !== undefined
+                || !deepEqual(committed?.completedRequests?.[params.requestId], expectedCompletion)) {
+                throw new Error(`Permission request ${params.requestId} was superseded before acknowledgement`);
+            }
+        }
+        this.markPermissionRequestCompletedBestEffort(params.requestId);
     }
 
     recordCompletedRequest(params: Readonly<{
@@ -308,12 +341,13 @@ export class AgentStateRequestStore {
         kind?: string;
         source?: string;
         reason?: string;
-    }>): void {
+    }>): Promise<void> {
         let recordedCompletion = false;
-        void updateAgentStateBestEffort(
-            this.session,
+        return Promise.resolve(this.session.updateAgentState(
             (currentState) => {
-                if (hasPermissionResponseClaimV1(currentState.requests?.[params.requestId])) {
+                // Automatic history has no outstanding request authority. Existing requests settle
+                // through completeRequest's exact occurrence and claim checks instead.
+                if (currentState.requests?.[params.requestId] !== undefined) {
                     return currentState;
                 }
                 const completedRequests = cloneStringKeyedRecordToNullProto<AgentStateCompletedEntry>(currentState.completedRequests);
@@ -345,24 +379,32 @@ export class AgentStateRequestStore {
                 recordedCompletion = true;
                 return { ...currentState, completedRequests } satisfies AgentState;
             },
-            this.logPrefix,
-            'record_completed_request',
-        ).then(() => {
+            { retainPermissionCompletionsOnFailure: true },
+        )).then(() => {
             if (recordedCompletion) {
                 this.markPermissionRequestCompletedBestEffort(params.requestId);
             }
+        }).catch(() => {
+            logger.infoFile(`${this.logPrefix} Failed to publish automatic decision history`);
         });
     }
 
-    cancelAllRequests(params: Readonly<{ reason: string; decision?: string }>): void {
-        updateAgentStateBestEffort(
-            this.session,
+    cancelAllRequests(params: Readonly<{
+        reason: string; decision?: string; requestIds?: readonly string[];
+        shouldCancel?: (request: AgentStateRequestEntry) => boolean;
+    }>): Promise<void> {
+        const selected = new Map(Object.entries(this.session.getAgentStateSnapshot?.()?.requests ?? {})
+            .filter(([id, request]) => (!params.requestIds || params.requestIds.includes(id))
+                && (!params.shouldCancel || params.shouldCancel(request))));
+        return this.settleRequests(
             (currentState) => {
                 const pendingRequests = cloneStringKeyedRecordToNullProto(currentState.requests);
                 const completedRequests = cloneStringKeyedRecordToNullProto(currentState.completedRequests);
                 const now = Date.now();
 
                 for (const [id, request] of Object.entries(pendingRequests)) {
+                    const expected = selected.get(id);
+                    if (!expected || !isSameAgentStateRequestOccurrence(request, expected)) continue;
                     if (hasPermissionResponseClaimV1(request)) continue;
                     const entry = clonePlainObjectToNullProto(request) ?? Object.create(null);
                     entry.completedAt = now;
@@ -382,9 +424,20 @@ export class AgentStateRequestStore {
                     completedRequests,
                 };
             },
-            this.logPrefix,
-            'cancel_all_requests',
         );
+    }
+
+    private settleRequests(updater: (state: AgentState) => AgentState): Promise<void> {
+        try {
+            const result = this.session.updateAgentStateRequestSettlement(updater);
+            return Promise.resolve(result).catch((error) => {
+                logger.infoFile(`${this.logPrefix} Request settlement failed; provider completion was not admitted`);
+                throw error;
+            });
+        } catch (error) {
+            logger.infoFile(`${this.logPrefix} Request settlement failed; provider completion was not admitted`);
+            return Promise.reject(error);
+        }
     }
 
     dispose(): void {

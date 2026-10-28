@@ -265,6 +265,58 @@ function ensureWorkspacePackageManifests(snapshotNodeModulesDir: string, rootDir
   }
 }
 
+function collectPackageJsonRelativeFileTargets(value: unknown, result: Set<string>): void {
+  if (typeof value === 'string') {
+    if (value.startsWith('./') && !value.includes('*')) {
+      result.add(value.slice(2));
+    }
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectPackageJsonRelativeFileTargets(item, result);
+    return;
+  }
+  for (const nested of Object.values(value)) collectPackageJsonRelativeFileTargets(nested, result);
+}
+
+function ensureWorkspacePackageReferencedFiles(snapshotNodeModulesDir: string, rootDir: string): void {
+  const packagesDir = resolve(rootDir, 'packages');
+  for (const entry of listNodeModulesEntries(packagesDir)) {
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+
+    const sourcePackageDir = resolve(packagesDir, entry.name);
+    const packageJsonPath = resolve(sourcePackageDir, 'package.json');
+    let packageJson: Record<string, unknown>;
+    try {
+      packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+
+    const packageName = typeof packageJson.name === 'string' ? packageJson.name.trim() : '';
+    if (!packageName.startsWith('@happier-dev/')) continue;
+
+    const scopePackageName = packageName.slice('@happier-dev/'.length).trim();
+    if (!scopePackageName) continue;
+
+    const relativeFileTargets = new Set<string>();
+    collectPackageJsonRelativeFileTargets(packageJson.main, relativeFileTargets);
+    collectPackageJsonRelativeFileTargets(packageJson.module, relativeFileTargets);
+    collectPackageJsonRelativeFileTargets(packageJson.types, relativeFileTargets);
+    collectPackageJsonRelativeFileTargets(packageJson.exports, relativeFileTargets);
+
+    const snapshotPackageDir = resolve(snapshotNodeModulesDir, '@happier-dev', scopePackageName);
+    for (const relativeFilePath of relativeFileTargets) {
+      ensureCopiedTextFile(
+        resolve(snapshotPackageDir, relativeFilePath),
+        resolve(sourcePackageDir, relativeFilePath),
+        { overwriteExisting: true },
+      );
+    }
+  }
+}
+
 function ensureWorkspacePackageDistTrees(snapshotNodeModulesDir: string, rootDir: string): void {
   const packagesDir = resolve(rootDir, 'packages');
   let entries: Dirent[] = [];
@@ -538,6 +590,7 @@ export function ensureCliDistSnapshotNodeModules(params: {
       resolve(cliNodeModulesDir, '@happier-dev'),
     );
     ensureWorkspacePackageManifests(snapshotNodeModulesDir, params.rootDir);
+    ensureWorkspacePackageReferencedFiles(snapshotNodeModulesDir, params.rootDir);
     ensureWorkspacePackageDistTrees(snapshotNodeModulesDir, params.rootDir);
     ensureWorkspacePackageRuntimeDependencyTrees(snapshotNodeModulesDir, params.rootDir);
     ensureCopiedNodeModulesEntries(cliNodeModulesDir, snapshotNodeModulesDir, new Set(['@happier-dev']));

@@ -125,6 +125,15 @@ describe.runIf(process.platform !== 'win32')('materializeMcpServerConfigRecord p
       });
 
       expect(tools).toEqual([{ name: 'fixture_tool' }]);
+
+      const relaunchedTools = await probeMcpStdioServerTools({
+        config: materialized.mcpServers.alpha,
+        baseEnv: { ...process.env, HOME: goodHome },
+        connectTimeoutMs: 15_000,
+        listToolsTimeoutMs: 15_000,
+      });
+      expect(relaunchedTools).toEqual([{ name: 'fixture_tool' }]);
+      materialized.cleanup();
     } finally {
       process.chdir(originalCwd);
       await rm(root, { recursive: true, force: true });

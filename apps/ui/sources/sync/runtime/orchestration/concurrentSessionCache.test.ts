@@ -91,6 +91,43 @@ describe('resolveConcurrentTargets', () => {
         ]);
     });
 
+    it('publishes the selected promoted Home through the real concurrent reconciliation owner', async () => {
+        const { TokenStorage } = await import('@/auth/storage/tokenStorage');
+        const { storage } = await import('@/sync/domains/state/storageStore');
+        const profiles = await import('@/sync/domains/server/serverProfiles');
+        const { startConcurrentSessionCacheSync, stopConcurrentSessionCacheSync } = await import('./concurrentSessionCache');
+        vi.stubEnv('EXPO_PUBLIC_HAPPY_STORAGE_SCOPE', `concurrent-promoted-${Math.random()}`);
+        const active = profiles.upsertServerProfile({ serverUrl: 'https://concurrent-active.example.test' });
+        const remote = profiles.upsertServerProfile({ serverUrl: 'https://concurrent-promoted.example.test' });
+        profiles.setActiveServerId(active.id, { scope: 'device' });
+        profiles.setServerProfileIdentityForUrl(remote.serverUrl, 'srv_concurrent_promoted');
+        storage.setState(storage.getInitialState(), true);
+        storage.setState((state) => ({
+            settings: {
+                ...state.settings,
+                serverSelectionGroups: [{
+                    id: 'promoted', name: 'Promoted', serverIds: [active.id, 'srv_concurrent_promoted'],
+                    presentation: 'grouped',
+                }],
+                serverSelectionActiveTargetKind: 'group', serverSelectionActiveTargetId: 'promoted',
+            },
+        }));
+        // Native credential storage is outside this process; an unauthenticated Home publishes null.
+        const credentials = vi.spyOn(TokenStorage, 'getCredentialsForServerUrl').mockResolvedValue(null);
+        vi.useFakeTimers();
+        try {
+            startConcurrentSessionCacheSync();
+            await vi.advanceTimersByTimeAsync(0);
+            expect(storage.getState().sessionListViewDataByServerId).toEqual({ srv_concurrent_promoted: null });
+            expect(storage.getState().machineListStatusByServerId.srv_concurrent_promoted).toBe('signedOut');
+        } finally {
+            stopConcurrentSessionCacheSync();
+            credentials.mockRestore();
+            vi.useRealTimers();
+            vi.unstubAllEnvs();
+        }
+    });
+
     it('starts periodic refresh through the runtime-active gated interval', async () => {
         vi.resetModules();
         const stopInterval = vi.fn();

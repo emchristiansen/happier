@@ -1,35 +1,13 @@
-import { spawn } from 'node:child_process';
-
-import { resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process';
+import { createAttachedTerminalSupervisor, type AttachedTerminalSupervisor, type AttachedTerminalPresentation } from '@/agent/localControl/createAttachedTerminalSupervisor';
+import type { SharedManagedOpenCodeServerState } from '@/backends/opencode/server/sharedManagedServer';
 
 import { createOpenCodeAttachArgs } from './createOpenCodeAttachArgs';
+import {
+  resolveOpenCodeAttachChildEnv,
+  resolveOpenCodeAttachTargetAuthHeaders,
+} from './openCodeAttachTargetAuth';
+import { resolveOpenCodeAttachCliDialect } from './resolveOpenCodeAttachCliDialect';
 import { resolveOpenCodeCliLaunchSpec } from '../utils/resolveOpenCodeCliCommand';
-
-type SpawnedProcess = Readonly<{
-  pid?: number;
-  exitCode?: number | null;
-  killed?: boolean;
-  once: {
-    (event: 'exit', handler: (code: number | null, signal: NodeJS.Signals | null) => void): void;
-    (event: 'error', handler: (error: Error) => void): void;
-  };
-  kill: (signal?: NodeJS.Signals | number) => boolean;
-}>;
-
-async function waitForStartup(proc: SpawnedProcess): Promise<boolean> {
-  if (proc.exitCode !== null && proc.exitCode !== undefined) return false;
-  return await new Promise<boolean>((resolve) => {
-    let settled = false;
-    const finish = (value: boolean) => {
-      if (settled) return;
-      settled = true;
-      resolve(value);
-    };
-    proc.once('exit', () => finish(false));
-    proc.once('error', () => finish(false));
-    setImmediate(() => finish(true));
-  });
-}
 
 function resolveDetachTimeoutMs(): number {
   const raw = Number.parseInt(String(process.env.HAPPIER_OPENCODE_LOCAL_DETACH_TIMEOUT_MS ?? ''), 10);
@@ -37,44 +15,31 @@ function resolveDetachTimeoutMs(): number {
   return Math.max(100, Math.min(60_000, value));
 }
 
-async function waitForExit(proc: SpawnedProcess, timeoutMs: number): Promise<boolean> {
-  if (proc.exitCode !== null && proc.exitCode !== undefined) return true;
-  return await new Promise<boolean>((resolve) => {
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      resolve(false);
-    }, timeoutMs);
-    timer.unref?.();
-    proc.once('exit', () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(true);
-    });
-  });
-}
-
-export type OpenCodeTuiSupervisor = Readonly<{
-  isAttached: () => boolean;
-  attach: (params: { baseUrl: string; directory: string; sessionId: string }) => Promise<boolean>;
-  detach: () => Promise<void>;
-  dispose: () => Promise<void>;
+export type OpenCodeTuiAttachTarget = Readonly<{
+  baseUrl: string;
+  directory: string;
+  sessionId: string;
+  managedServerLaunchFingerprint?: string;
 }>;
 
+export type OpenCodeTuiSupervisor = AttachedTerminalSupervisor<OpenCodeTuiAttachTarget>;
+
 export function createOpenCodeTuiSupervisor(params?: Readonly<{
-  spawnProcess?: typeof spawn;
+  spawnProcess?: Parameters<typeof createAttachedTerminalSupervisor>[0]['spawnProcess'];
   command?: string;
   commandArgs?: readonly string[];
   env?: NodeJS.ProcessEnv;
   onExit?: () => void | Promise<void>;
+  terminalPresentation?: AttachedTerminalPresentation;
+  /** Overrides the target probe; omit in production so the actual server decides the dialect. */
+  resolveDialectFn?: typeof resolveOpenCodeAttachCliDialect;
+  readManagedServerStateFn?: () => Promise<SharedManagedOpenCodeServerState | null>;
 }>): OpenCodeTuiSupervisor {
-  const spawnProcess = params?.spawnProcess ?? spawn;
   const env = params?.env ?? process.env;
   const commandOverride = params?.command;
   let command: string;
   let commandArgs: readonly string[];
+  let launchApiGeneration: 'auto' | 'v2' | undefined;
   if (commandOverride) {
     command = commandOverride;
     commandArgs = params?.commandArgs ?? [];
@@ -82,62 +47,34 @@ export function createOpenCodeTuiSupervisor(params?: Readonly<{
     const launch = resolveOpenCodeCliLaunchSpec(env);
     command = launch.command;
     commandArgs = params?.commandArgs ?? launch.args;
+    launchApiGeneration = launch.apiGeneration;
   }
-  let proc: SpawnedProcess | null = null;
-
-  const clearProc = (): void => {
-    proc = null;
-  };
-
-  const detach = async (): Promise<void> => {
-    const child = proc;
-    if (!child) return;
-    child.kill('SIGINT');
-    const exitedGracefully = await waitForExit(child, resolveDetachTimeoutMs());
-    if (!exitedGracefully) {
-      child.kill('SIGKILL');
-      await waitForExit(child, resolveDetachTimeoutMs());
-    }
-    clearProc();
-  };
-
-  return {
-    isAttached: () => proc !== null,
-    attach: async ({ baseUrl, directory, sessionId }) => {
-      if (proc) return true;
-      const invocation = resolveWindowsCommandInvocation({
-        command,
-        args: [...commandArgs, ...createOpenCodeAttachArgs({ baseUrl, directory, sessionId })],
+  return createAttachedTerminalSupervisor({
+    spawnProcess: params?.spawnProcess,
+    env,
+    detachTimeoutMs: resolveDetachTimeoutMs(),
+    onExit: params?.onExit,
+    terminalPresentation: params?.terminalPresentation,
+    resolveInvocation: async ({ baseUrl, directory, sessionId, managedServerLaunchFingerprint }) => {
+      // The attached CLI talks to the target server itself: it needs that server's credential (loopback
+      // managed targets only) and the argv dialect the target actually speaks.
+      const readManagedServerStateFn = params?.readManagedServerStateFn;
+      const targetAuth = {
+        baseUrl,
         env,
-        resolveCommandOnPath: false,
-      });
-      const child = spawnProcess(invocation.command, invocation.args, {
-        stdio: 'inherit',
-        env,
-        ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-      }) as unknown as SpawnedProcess;
-      proc = child;
-      let startupCompleted = false;
-      let closeHandled = false;
-      const handleClosed = (): void => {
-        if (closeHandled) return;
-        closeHandled = true;
-        clearProc();
-        if (startupCompleted) {
-          void params?.onExit?.();
-        }
+        managedServerLaunchFingerprint,
+        ...(readManagedServerStateFn ? { readManagedServerStateFn } : {}),
       };
-      child.once('exit', handleClosed);
-      child.once('error', handleClosed);
-      const started = await waitForStartup(child);
-      if (!started) {
-        clearProc();
-        return false;
-      }
-      startupCompleted = true;
-      return true;
+      const dialect = await (params?.resolveDialectFn ?? resolveOpenCodeAttachCliDialect)({
+        baseUrl,
+        ...(launchApiGeneration ? { launchApiGeneration } : {}),
+        headers: await resolveOpenCodeAttachTargetAuthHeaders(targetAuth),
+      });
+      return {
+        command,
+        args: [...commandArgs, ...createOpenCodeAttachArgs({ baseUrl, directory, sessionId, dialect })],
+        env: await resolveOpenCodeAttachChildEnv(targetAuth),
+      };
     },
-    detach,
-    dispose: detach,
-  };
+  });
 }

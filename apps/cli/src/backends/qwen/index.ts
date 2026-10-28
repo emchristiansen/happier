@@ -1,5 +1,7 @@
 import { AGENTS_CORE } from '@happier-dev/agents';
 
+import { createAcpSessionListCatalogHook } from '@/agent/acp/catalog/createAcpSessionListCatalogHook';
+
 import { checklists } from './cli/checklists';
 import type { AgentCatalogEntry } from '../types';
 
@@ -11,6 +13,7 @@ export const agent = {
   getCliDetect: async () => (await import('@/backends/qwen/cli/detect')).cliDetect,
   getCliAuthSpec: async () => (await import('@/backends/qwen/cli/auth/qwenCliAuthSpec')).qwenCliAuthSpec,
   vendorResumeSupport: AGENTS_CORE.qwen.resume.vendorResume,
+  ...createAcpSessionListCatalogHook('qwen'),
   getAcpBackendFactory: async () => {
     const { createQwenBackend } = await import('@/backends/qwen/acp/backend');
     return (opts) => ({ backend: createQwenBackend(opts as any) });

@@ -23,6 +23,8 @@ export type ConnectedServiceAuthGroupSwitchState = Readonly<{
   serviceId: string;
   groupId: string;
   activeProfileId: string | null;
+  lastSwitchReason?: string | null;
+  lastSwitchAt?: number | null;
   generation: number;
   runtimeStateRevision: number;
   /** Exact credential epoch for the active profile when the projection can resolve it. */
@@ -605,10 +607,11 @@ export type ConnectedServiceAuthGroupSwitchPipelineRequest = Readonly<{
   switchesThisTurn?: number;
   sessionSwitchesThisHour?: number;
   deadlineAtMs?: number;
+  /** A durable post-reset retry may re-adopt the active member, but only with fresh positive quota proof. */
+  allowCurrentProfileRetry?: boolean;
 }>;
 
 export type ConnectedServiceAuthGroupSwitchPipelinePhase =
-  | 'lease_loser_non_apply'
   | 'lease_loser_apply'
   | 'record_observed_generation'
   | 'policy'

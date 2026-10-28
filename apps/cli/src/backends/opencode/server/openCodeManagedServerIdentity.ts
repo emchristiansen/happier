@@ -24,6 +24,7 @@ export type OpenCodeManagedServerIdentity = Readonly<{
   activeServerDir?: string;
   daemonInstanceId?: string;
   logPath?: string;
+  apiGeneration?: 'auto' | 'v2';
   generationKey: string;
 }>;
 
@@ -61,6 +62,7 @@ function computeGenerationKey(identity: Omit<OpenCodeManagedServerIdentity, 'gen
     `startedAtMs=${identity.startedAtMs}`,
     identity.startTimeMs ? `startTimeMs=${identity.startTimeMs}` : '',
     identity.launchEnvFingerprint ? `fp=${identity.launchEnvFingerprint}` : '',
+    identity.apiGeneration ? `api=${identity.apiGeneration}` : '',
     identity.baseUrl ? `baseUrl=${identity.baseUrl}` : '',
   ].filter((part) => part.length > 0);
   return createHash('sha256').update(parts.join('|')).digest('hex');
@@ -74,6 +76,9 @@ export function resolveOpenCodeManagedServerIdentity(
   const activeServerDir = readNonEmptyString(state.activeServerDir);
   const daemonInstanceId = readNonEmptyString(state.daemonInstanceId);
   const logPath = readNonEmptyString(state.logPath);
+  const apiGeneration = state.apiGeneration === 'auto' || state.apiGeneration === 'v2'
+    ? state.apiGeneration
+    : undefined;
   const startTimeMs = Number.isFinite(state.startTimeMs) && (state.startTimeMs ?? 0) > 0
     ? Math.floor(state.startTimeMs as number)
     : undefined;
@@ -88,6 +93,7 @@ export function resolveOpenCodeManagedServerIdentity(
     ...(activeServerDir ? { activeServerDir } : {}),
     ...(daemonInstanceId ? { daemonInstanceId } : {}),
     ...(logPath ? { logPath } : {}),
+    ...(apiGeneration ? { apiGeneration } : {}),
   };
 
   return {
@@ -123,5 +129,6 @@ export function describeOpenCodeManagedServerIdentityForLog(
     ...(identity.activeServerDir ? { activeServerDir: identity.activeServerDir } : {}),
     ...(identity.daemonInstanceId ? { daemonInstanceId: identity.daemonInstanceId } : {}),
     ...(identity.logPath ? { logPath: identity.logPath } : {}),
+    ...(identity.apiGeneration ? { apiGeneration: identity.apiGeneration } : {}),
   };
 }

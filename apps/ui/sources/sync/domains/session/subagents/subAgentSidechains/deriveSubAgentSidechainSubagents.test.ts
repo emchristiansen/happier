@@ -42,6 +42,12 @@ function deriveSingle(messages: readonly Message[]) {
     return subagents[0]!;
 }
 
+it.each(['stopped', 'cancelled', 'interrupted'])('keeps serialized native %s tool results cancelled', status => {
+    const message = createSubAgentMessage({ state: 'error' });
+    message.tool.result = JSON.stringify({ status, result: 'Agent ended' });
+    expect(deriveSingle([message]).status).toBe('cancelled');
+});
+
 describe('deriveSubAgentSidechainSubagents — elapsed time is never fabricated (D-8)', () => {
     it('records the genuine finish instant once the sidechain tool completes', () => {
         const subagent = deriveSingle([
@@ -230,7 +236,7 @@ describe('deriveSubAgentSidechainSubagents — an async launch acknowledgement i
         expect(deriveSingle([message]).status).toBe('failed');
     });
 
-    it('reports a subagent whose session process died as cancelled, not ambiguous', () => {
+    it('reports a subagent with lost observation as unknown', () => {
         // RULING-14 (terminal state on process death) already answers this for a workflow agent —
         // `terminalizeRunAgents` resolves it to `cancelled`, never `failed`: an agent that produced
         // no result while its host went away was cut off, it did not fail. A plain subagent is the
@@ -241,7 +247,10 @@ describe('deriveSubAgentSidechainSubagents — an async launch acknowledgement i
         // used as the fallback for a mapped one.
         const message = createAsyncLaunchedSubAgentMessage(JSON.stringify(ASYNC_LAUNCH_ACKNOWLEDGEMENT));
         message.tool.state = 'unavailable';
+        message.tool.completedAt = 4_000;
 
-        expect(deriveSingle([message]).status).toBe('cancelled');
+        const row = deriveSingle([message]);
+        expect(row.status).toBe('unknown');
+        expect(row.timestamps.finishedAtMs).toBeUndefined();
     });
 });

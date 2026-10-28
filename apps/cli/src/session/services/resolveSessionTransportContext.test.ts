@@ -83,6 +83,7 @@ describe('resolveSessionTransportContext', () => {
 
         expect(result).toMatchObject({ ok: true, sessionId: session.id, rawSession: session });
         if (!result.ok) throw new Error('Expected resolved session transport context');
+        if (result.ctx.encryptionVariant === 'plain') throw new Error('Expected encrypted session context');
         expect(Array.from(result.ctx.encryptionKey)).toEqual(Array.from(sessionDataKey));
         expect(fetchSessionById).toHaveBeenCalledTimes(1);
     });
@@ -196,6 +197,7 @@ describe('resolveSessionTransportContext', () => {
         if (!result.ok) {
             throw new Error(`Expected resolved session transport context, got ${JSON.stringify(result)}`);
         }
+        if (result.ctx.encryptionVariant === 'plain') throw new Error('Expected encrypted context');
         expect(Array.from(result.ctx.encryptionKey)).toEqual(Array.from(sessionDataKey));
     });
 });

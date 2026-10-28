@@ -21,6 +21,10 @@ const {
     refreshMachinesThrottledSpy,
     revokeSpy,
     alertAsyncSpy,
+    alertSpy,
+    promptSpy,
+    machineUpdateMetadataSpy,
+    stackOptionsState,
     routerBackSpy,
     routerMock,
     machineState,
@@ -34,6 +38,10 @@ const {
     refreshMachinesThrottledSpy: vi.fn(async () => {}),
     revokeSpy: vi.fn(async (_machineId: string) => ({ ok: true as const })),
     alertAsyncSpy: vi.fn(async () => {}),
+    alertSpy: vi.fn(),
+    promptSpy: vi.fn<(..._args: any[]) => Promise<string | null>>(async () => null),
+    machineUpdateMetadataSpy: vi.fn(async () => ({})),
+    stackOptionsState: { current: null as Record<string, unknown> | null },
     routerBackSpy: vi.fn(),
     routerMock: { back: vi.fn(), push: vi.fn(), replace: vi.fn() },
     machineState: { current: null as any, all: [] as any[] },
@@ -46,16 +54,26 @@ installMachineDetailsCommonModuleMocks({
         return createExpoRouterMock({
             router: { ...routerMock, back: routerBackSpy },
             params: { id: 'machine-1' },
+            stackOptionsCapture: {
+                record: (options) => {
+                    stackOptionsState.current = typeof options === 'function' ? options() : options;
+                },
+                reset: () => {
+                    stackOptionsState.current = null;
+                },
+                getRaw: () => stackOptionsState.current,
+                getResolved: () => stackOptionsState.current,
+            },
         }).module;
     },
     modal: async () => {
         const { createModalModuleMock } = await import('@/dev/testkit/mocks/modal');
         return createModalModuleMock({
             spies: {
-                alert: vi.fn(),
+                alert: alertSpy,
                 alertAsync: alertAsyncSpy,
                 confirm: confirmSpy,
-                prompt: vi.fn(),
+                prompt: promptSpy,
                 show: showSpy,
             },
         }).module;
@@ -112,7 +130,7 @@ vi.mock('@/sync/ops', () => ({
     machineSpawnNewSession: vi.fn(async () => ({ type: 'error', errorCode: 'unexpected', errorMessage: 'noop' })),
     machineStopDaemon: vi.fn(async () => ({ message: 'noop' })),
     machineStopSession: vi.fn(async () => ({ ok: true })),
-    machineUpdateMetadata: vi.fn(async () => ({})),
+    machineUpdateMetadata: machineUpdateMetadataSpy,
     machineExecutionRunsList: vi.fn(async () => ({ ok: true, runs: [] })),
     machineClearReplacementFromAccount: clearReplacementSpy,
     machineReplaceInAccount: replaceMachineSpy,
@@ -147,7 +165,6 @@ vi.mock('@/utils/sessions/machineUtils', () => ({
 }));
 vi.mock('@/utils/sessions/sessionUtils', () => ({ formatPathRelativeToHome: () => '', getSessionName: () => '', getSessionSubtitle: () => '' }));
 vi.mock('@/utils/path/pathUtils', () => ({ resolveAbsolutePath: () => '' }));
-vi.mock('@/sync/domains/settings/terminalSettings', () => ({ resolveTerminalSpawnOptions: () => ({}) }));
 vi.mock('@/sync/domains/session/spawn/windowsRemoteSessionConsole', () => ({ resolveWindowsRemoteSessionConsoleFromMachineMetadata: () => 'visible' }));
 vi.mock('@/sync/domains/session/spawn/windowsRemoteSessionLaunchMode', () => ({
     readMachineWindowsRemoteSessionLaunchMode: () => undefined,
@@ -214,7 +231,35 @@ describe('MachineDetailScreen (revoke/forget machine)', () => {
         refreshMachinesThrottledSpy.mockReset();
         revokeSpy.mockReset();
         alertAsyncSpy.mockReset();
+        alertSpy.mockReset();
+        promptSpy.mockReset();
+        promptSpy.mockResolvedValue(null);
+        machineUpdateMetadataSpy.mockReset();
+        machineUpdateMetadataSpy.mockResolvedValue({});
+        stackOptionsState.current = null;
         routerBackSpy.mockReset();
+    });
+
+    it('updates the visible machine name without interrupting success with an alert', async () => {
+        promptSpy.mockResolvedValueOnce('theo-devbox');
+        const { default: MachineDetailScreen } = await import('@/app/(app)/machine/[id]');
+
+        await renderScreen(React.createElement(MachineDetailScreen));
+
+        const headerRight = stackOptionsState.current?.headerRight;
+        expect(headerRight).toBeTypeOf('function');
+        const renameButton = (headerRight as () => React.ReactElement<{ onPress: () => unknown }>)();
+
+        await act(async () => {
+            await renameButton.props.onPress();
+        });
+
+        expect(machineUpdateMetadataSpy).toHaveBeenCalledWith(
+            'machine-1',
+            expect.objectContaining({ displayName: 'theo-devbox' }),
+            1,
+        );
+        expect(alertSpy).not.toHaveBeenCalled();
     });
 
     it('confirms and revokes the machine', async () => {

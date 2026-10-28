@@ -25,8 +25,8 @@ type UnpackToolsModule = typeof import('./unpack-tools.cjs') & {
     licenseName?: string;
     sha256?: string;
   }[];
-  areToolsUnpacked: (toolsDir: string, platformDir: string) => boolean;
-  unpackTools: (options?: { platformDir?: string; toolsDir?: string }) => Promise<{ success: boolean; alreadyUnpacked: boolean }>;
+  areToolsUnpacked: (toolsDir: string, platformDir: string, tools?: readonly string[]) => boolean;
+  unpackTools: (options?: { platformDir?: string; toolsDir?: string; tools?: readonly string[] }) => Promise<{ success: boolean; alreadyUnpacked: boolean }>;
 };
 
 async function sha256(path: string): Promise<string> {
@@ -61,19 +61,31 @@ async function writeManifestChecksums(archivesDir: string, checksums: Record<str
 }
 
 describe('unpack-tools script', () => {
-  it('manifest includes explicit zellij archive mappings including Windows zip', () => {
+  it('extracts and reuses a requested optional tool without requiring the other archives', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-unpack-selected-'));
+    const archives = join(root, 'archives');
+    const staging = join(root, 'staging');
+    await mkdir(archives);
+    await mkdir(staging);
+    await writeFile(join(staging, 'difft.exe'), 'optional difft');
+    await writeFile(join(archives, 'difftastic-LICENSE'), 'license');
+    const archive = join(archives, 'difftastic-x64-win32.tar.gz');
+    await createTarGz(staging, archive, ['difft.exe']);
+    await writeManifestChecksums(archives, { 'difftastic-x64-win32.tar.gz': await sha256(archive) });
+    const unpacker = require('./unpack-tools.cjs') as UnpackToolsModule;
+    const options = { toolsDir: root, platformDir: 'x64-win32', tools: ['difftastic'] };
+    await expect(unpacker.unpackTools(options)).resolves.toEqual({ success: true, alreadyUnpacked: false });
+    await expect(readFile(join(root, 'unpacked', 'difft.exe'), 'utf8')).resolves.toBe('optional difft');
+    expect(unpacker.areToolsUnpacked(root, 'x64-win32', ['difftastic'])).toBe(true);
+    expect(unpacker.areToolsUnpacked(root, 'x64-win32')).toBe(false);
+    await expect(unpacker.unpackTools(options)).resolves.toEqual({ success: true, alreadyUnpacked: true });
+  });
+
+  it('manifest includes zellij only for supported POSIX targets', () => {
     const unpackTools = require('./unpack-tools.cjs') as UnpackToolsModule;
-    expect(unpackTools.getToolArchiveManifest()).toEqual(
+    const manifest = unpackTools.getToolArchiveManifest();
+    expect(manifest).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({
-          tool: 'zellij',
-          platformDir: 'x64-win32',
-          archiveName: 'zellij-no-web-x86_64-pc-windows-msvc.zip',
-          archiveType: 'zip',
-          binaryName: 'zellij.exe',
-          licenseName: 'zellij-LICENSE',
-          version: '0.44.3',
-        }),
         expect.objectContaining({
           tool: 'zellij',
           platformDir: 'arm64-darwin',
@@ -85,6 +97,9 @@ describe('unpack-tools script', () => {
         }),
       ]),
     );
+    expect(manifest).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ tool: 'zellij', platformDir: 'x64-win32' }),
+    ]));
   });
 
   it('does not treat rg and difftastic alone as fully unpacked for zellij platforms', async () => {
@@ -135,7 +150,7 @@ describe('unpack-tools script', () => {
     });
   });
 
-  it('extracts tar.gz and zip archives, verifies checksums, copies licenses, and writes version markers', async () => {
+  it('extracts supported Windows tools without materializing zellij', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-unpack-tools-'));
     const archives = join(root, 'archives');
     const staging = join(root, 'staging');
@@ -168,10 +183,10 @@ describe('unpack-tools script', () => {
       alreadyUnpacked: false,
     });
 
-    await expect(readFile(join(root, 'unpacked', 'zellij.exe'), 'utf8')).resolves.toBe('zellij');
-    await expect(readFile(join(root, 'unpacked', 'zellij-LICENSE'), 'utf8')).resolves.toBe('zellij license');
-    await expect(readFile(join(root, 'unpacked', '.happier-tools-manifest.json'), 'utf8')).resolves.toContain('"zellij"');
-    await expect(stat(join(root, 'unpacked', 'zellij.exe'))).resolves.toMatchObject({ isFile: expect.any(Function) });
+    await expect(readFile(join(root, 'unpacked', 'rg.exe'), 'utf8')).resolves.toBe('rg');
+    await expect(stat(join(root, 'unpacked', 'zellij.exe'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(join(root, 'unpacked', 'zellij-LICENSE'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(readFile(join(root, 'unpacked', '.happier-tools-manifest.json'), 'utf8')).resolves.not.toContain('"zellij"');
   });
 
   it('fails closed on checksum mismatch', async () => {

@@ -1,13 +1,11 @@
 import * as React from 'react';
-import { Platform, Pressable, View } from 'react-native';
-import * as Clipboard from 'expo-clipboard';
+import { View } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import { Typography } from '@/constants/Typography';
 import { HorizontalOverflowScrollView } from '@/components/ui/scroll/HorizontalOverflowScrollView';
 import { Text } from '@/components/ui/text/Text';
-import { t } from '@/text';
-import { Icon } from '@/components/ui/icons/Icon';
+import { CopyIconButton } from '@/components/ui/copy/CopyIconButton';
 
 export type CodeBlockViewFrameProps = Readonly<{
     code: string;
@@ -31,58 +29,15 @@ export const CodeBlockViewFrame = React.memo<CodeBlockViewFrameProps>(({
     children,
 }) => {
     const { theme } = useUnistyles();
-    const isWeb = Platform.OS === 'web';
-    const [isHovered, setIsHovered] = React.useState(false);
-    const [copied, setCopied] = React.useState(false);
-    const resetTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
-
-    const onCopy = React.useCallback(async () => {
-        try {
-            await Clipboard.setStringAsync(code);
-            setCopied(true);
-            if (resetTimer.current) {
-                clearTimeout(resetTimer.current);
-            }
-            resetTimer.current = setTimeout(() => {
-                setCopied(false);
-            }, 1200);
-        } catch {
-            // Silent failure: no modal/toast here by design (matches message copy UX).
-        }
-    }, [code]);
-
-    React.useEffect(() => {
-        return () => {
-            if (resetTimer.current) {
-                clearTimeout(resetTimer.current);
-            }
-        };
-    }, []);
-
     const shouldRenderHeaderRow = Boolean(language) || Boolean(headerRight);
     const shouldOverlayCopyButton = showCopyButton && !shouldRenderHeaderRow;
     const contentPaddingStyle = shouldOverlayCopyButton ? [styles.codePadding, styles.codePaddingOverlay] : styles.codePadding;
 
     const copyButton = showCopyButton ? (
-        <Pressable
-            style={[
-                styles.copyButton,
-                shouldOverlayCopyButton ? styles.copyButtonOverlay : null,
-                shouldOverlayCopyButton ? { backgroundColor: theme.colors.surface.elevated, borderColor: theme.colors.border.default } : null,
-                (isWeb && isHovered) ? styles.copyButtonHovered : null,
-            ]}
-            onPress={onCopy}
-            onHoverIn={isWeb ? () => setIsHovered(true) : undefined}
-            onHoverOut={isWeb ? () => setIsHovered(false) : undefined}
-            accessibilityRole="button"
-            accessibilityLabel={t('common.copy')}
-        >
-            <Icon
-                name={copied ? 'check' : 'copy'}
-                size={14}
-                color={copied ? (theme.colors.state.success.foreground ?? theme.colors.text.secondary) : theme.colors.text.secondary}
-            />
-        </Pressable>
+        <CopyIconButton
+            text={code}
+            style={shouldOverlayCopyButton ? styles.copyButtonOverlay : undefined}
+        />
     ) : null;
 
     const header = shouldRenderHeaderRow ? (
@@ -117,6 +72,7 @@ export const CodeBlockViewFrame = React.memo<CodeBlockViewFrameProps>(({
             ) : (
                 <HorizontalOverflowScrollView
                     testID={scrollTestID}
+                    keepNativeTextSelection={!showCopyButton}
                     showsHorizontalScrollIndicator={false}
                     style={styles.scroll}
                     contentContainerStyle={contentPaddingStyle}
@@ -128,7 +84,7 @@ export const CodeBlockViewFrame = React.memo<CodeBlockViewFrameProps>(({
     );
 });
 
-const styles = StyleSheet.create(() => ({
+const styles = StyleSheet.create((theme) => ({
     container: {
         width: '100%',
         alignSelf: 'stretch',
@@ -157,22 +113,14 @@ const styles = StyleSheet.create(() => ({
         alignItems: 'center',
         gap: 8,
     },
-    copyButton: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        paddingHorizontal: 8,
-        paddingVertical: 6,
-        borderRadius: 8,
-    },
     copyButtonOverlay: {
         position: 'absolute',
         top: 8,
         right: 8,
         zIndex: 10,
         borderWidth: 1,
-    },
-    copyButtonHovered: {
-        opacity: 0.85,
+        backgroundColor: theme.colors.surface.elevated,
+        borderColor: theme.colors.border.default,
     },
     codePadding: {
         paddingHorizontal: 12,

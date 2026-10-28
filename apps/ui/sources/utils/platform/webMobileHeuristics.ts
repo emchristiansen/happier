@@ -3,7 +3,7 @@ import { Platform } from 'react-native';
 type NavigatorLike = {
     maxTouchPoints?: number;
     userAgent?: string;
-    userAgentData?: { mobile?: boolean };
+    userAgentData?: { mobile?: boolean; platform?: string };
 };
 
 const WEB_QR_SCANNER_MAX_VIEWPORT_MIN_EDGE_PX = 500;
@@ -27,6 +27,8 @@ function matchMedia(query: string): boolean {
 function isMobileUserAgent(nav: NavigatorLike | null): boolean {
     if (!nav) return false;
     if (nav.userAgentData?.mobile === true) return true;
+    // A desktop user agent cannot override an explicit mobile-platform client hint.
+    if (nav.userAgentData?.platform === 'Android' || nav.userAgentData?.platform === 'iOS') return true;
     const ua = typeof nav.userAgent === 'string' ? nav.userAgent : '';
     return /mobi|android|iphone|ipod|ipad/i.test(ua);
 }
@@ -43,6 +45,18 @@ function isTouchOrCoarsePointer(nav: NavigatorLike | null): boolean {
     if (fine) return false;
 
     return typeof nav?.maxTouchPoints === 'number' && nav.maxTouchPoints > 0;
+}
+
+/** Browser hardware classification, independent of responsive viewport width. */
+export function isWebMobileHost(): boolean {
+    const nav = readNavigator();
+    if (isMobileUserAgent(nav)) return true;
+    const ua = typeof nav?.userAgent === 'string' ? nav.userAgent : '';
+    // iPadOS can advertise a Mac user agent, including when a trackpad can hover.
+    if (/Macintosh/i.test(ua) && typeof nav?.maxTouchPoints === 'number' && nav.maxTouchPoints > 1) return true;
+    // Pointer capability alone cannot turn a touchscreen computer into a phone/tablet.
+    if (/Windows NT|X11|Macintosh|CrOS|Linux (?:x86_64|i[3-6]86|aarch64)/i.test(ua)) return false;
+    return isCoarsePrimaryPointerEnvironment();
 }
 
 /**

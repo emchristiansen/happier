@@ -8,6 +8,7 @@ import { wantsJson, printJsonEnvelope, writeJsonStdout } from '@/cli/output/json
 import { resolveSessionEncryptionContextFromCredentials, resolveSessionStoredContentEncryptionMode } from '@/session/transport/encryption/sessionEncryptionContext';
 import { readCommandPositionals, readFlagValue } from '@/cli/commands/shared/argvFlags';
 import { resolveSessionIdOrPrefix } from '@/session/query/resolveSessionId';
+import { cmd, fail } from '@happier-dev/cli-common/output';
 
 function splitCsv(value: string | null): string[] {
   if (!value) return [];
@@ -74,7 +75,7 @@ export async function cmdSessionReviewStart(
       await printJsonEnvelope({ ok: false, kind: 'session_review_start', error: { code: 'not_authenticated' } });
       return;
     }
-    console.error(chalk.red('Error:'), 'Not authenticated. Run "happier auth login" first.');
+    console.error(fail(`Not signed in. Run ${cmd('happier auth login')} first.`));
     process.exit(1);
   }
 
@@ -98,7 +99,7 @@ export async function cmdSessionReviewStart(
       await printJsonEnvelope({ ok: false, kind: 'session_review_start', error: { code: 'session_not_found', sessionId } });
       return;
     }
-    console.error(chalk.red('Error:'), `Session not found: ${sessionId}`);
+    console.error(fail(`Session not found: ${sessionId}`));
     process.exit(1);
   }
 
@@ -113,7 +114,7 @@ export async function cmdSessionReviewStart(
       await printJsonEnvelope({ ok: false, kind: 'session_review_start', error: { code: started.errorCode } });
       return;
     }
-    console.error(chalk.red('Error:'), started.errorCode);
+    console.error(fail(started.errorCode));
     process.exit(1);
   }
 

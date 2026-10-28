@@ -107,7 +107,7 @@ test.describe('ui e2e: custom theme profiles', () => {
   });
 
   test('creates, activates, exports, and imports a custom theme profile through Appearance settings', async ({ page }) => {
-    test.setTimeout(540_000);
+    test.setTimeout(180_000);
     if (!uiBaseUrl) throw new Error('missing ui fixture');
 
     await page.setViewportSize({ width: 390, height: 844 });
@@ -145,14 +145,17 @@ test.describe('ui e2e: custom theme profiles', () => {
     const saveButton = await expectVisibleTestId(page, 'settings-theme-profile-save');
     await expect(saveButton).toBeEnabled({ timeout: 60_000 });
     await saveButton.click();
-
-    await openThemeProfiles({ page, uiBaseUrl });
+    // Save activates asynchronously. Return within the app and observe the saved
+    // profile before a full navigation can interrupt the document's transition.
+    await page.goBack();
+    await expectVisibleTestId(page, 'settings-theme-profiles-screen');
     const profileId = await firstCustomProfileId(page);
     await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/settings/session?happier_hmr=0`, 180_000);
     await expectVisibleTestId(page, 'settings-session-sessionListDensity-trigger');
     await openThemeProfiles({ page, uiBaseUrl });
     await (await expectVisibleTestId(page, `settings-theme-edit-${profileId}`)).click();
     await expectVisibleTestId(page, 'settings-theme-profile-editor');
+    await expectVisibleTestId(page, 'settings-theme-profile-deactivate');
 
     await (await expectVisibleTestId(page, `settings-theme-profile-export-${profileId}`)).click();
     await expectVisibleTestId(page, 'settings-theme-profile-export-screen');

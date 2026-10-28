@@ -138,7 +138,7 @@ describe('SelectionList non-virtualized body scroll wrapper (R9 blocker 1)', () 
         expect(isInsideScroll).toBe(false);
     });
 
-    it('constrains the body so its contents do not push the footer below maxHeight (flex: 1, minHeight: 0)', async () => {
+    it('lets every nested flex item shrink so the ScrollView receives a bounded viewport', async () => {
         const root: SelectionListStep = {
             id: 'root',
             inputPlaceholder: 'Search',
@@ -161,14 +161,24 @@ describe('SelectionList non-virtualized body scroll wrapper (R9 blocker 1)', () 
         // The scroll frame, not the outer content-sized popover frame, must
         // own the bounded body area so the persistent footer stays outside
         // the scrollable rows.
+        const body = screen.findByTestId('sl:body') as any;
         const scrollHost = screen.findByTestId('sl:bodyScroll:fadeHost') as any;
+        const scrollView = screen.findByTestId('sl:bodyScroll') as any;
+        expect(body).not.toBeNull();
         expect(scrollHost).not.toBeNull();
-        const styleProp = scrollHost?.props?.style;
-        const flatStyle = Array.isArray(styleProp)
+        expect(scrollView).not.toBeNull();
+
+        const flattenStyle = (styleProp: unknown): Record<string, unknown> => Array.isArray(styleProp)
             ? Object.assign({}, ...styleProp.filter(Boolean))
-            : (styleProp ?? {});
-        expect(flatStyle.flexGrow).toBe(1);
-        expect(flatStyle.flexShrink).toBe(1);
+            : ((styleProp as Record<string, unknown> | undefined) ?? {});
+        for (const node of [body, scrollHost, scrollView]) {
+            const flatStyle = flattenStyle(node?.props?.style);
+            expect(flatStyle.flexGrow).toBe(1);
+            expect(flatStyle.flexShrink).toBe(1);
+            // On web, the default min-height:auto makes this flex item as tall
+            // as all rows, so the inner ScrollView has no overflow of its own.
+            expect(flatStyle.minHeight).toBe(0);
+        }
     });
 
     it('does not mount the ScrollView wrapper when only a virtualized section is present (FlashList owns scroll)', async () => {

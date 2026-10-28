@@ -9,9 +9,13 @@ import {
 } from './effort.js';
 
 describe('claude effort support', () => {
-  it('gives Opus 5.5 five effort levels and a medium default', () => {
+  it('uses the documented effort controls for Fable 5.1 and Opus 5.5', () => {
+    expect(resolveClaudeEffortLevelsForModelId('claude-fable-5-1')).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+    expect(resolveClaudeDefaultEffortLevelForModelId('claude-fable-5-1')).toBe('high');
     expect(resolveClaudeEffortLevelsForModelId('claude-opus-5-5')).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
     expect(resolveClaudeDefaultEffortLevelForModelId('claude-opus-5-5')).toBe('medium');
+    expect(isClaudeUltracodeSupportedModelId('claude-fable-5-1')).toBe(true);
+    expect(isClaudeUltracodeSupportedModelId('claude-opus-5-5')).toBe(true);
   });
   it('marks Fable 5 as effort+max capable with xhigh support and high default effort', () => {
     expect(isClaudeEffortSupportedModelId('claude-fable-5')).toBe(true);
@@ -25,6 +29,13 @@ describe('claude effort support', () => {
     expect(isClaudeEffortMaxSupportedModelId('claude-opus-5')).toBe(true);
     expect(resolveClaudeEffortLevelsForModelId('claude-opus-5')).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
     expect(resolveClaudeDefaultEffortLevelForModelId('claude-opus-5')).toBe('high');
+  });
+
+  it('marks Sonnet 5.5 as effort+max capable with xhigh support and high default effort', () => {
+    expect(isClaudeEffortSupportedModelId('claude-sonnet-5-5')).toBe(true);
+    expect(isClaudeEffortMaxSupportedModelId('claude-sonnet-5-5')).toBe(true);
+    expect(resolveClaudeEffortLevelsForModelId('claude-sonnet-5-5')).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+    expect(resolveClaudeDefaultEffortLevelForModelId('claude-sonnet-5-5')).toBe('high');
   });
 
   it('marks Sonnet 5 as effort+max capable with xhigh support and high default effort', () => {
@@ -86,6 +97,7 @@ describe('claude ultracode support', () => {
   it('marks xhigh-capable models as ultracode-capable (incl. [1m] variants)', () => {
     expect(isClaudeUltracodeSupportedModelId('claude-fable-5')).toBe(true);
     expect(isClaudeUltracodeSupportedModelId('claude-opus-5')).toBe(true);
+    expect(isClaudeUltracodeSupportedModelId('claude-sonnet-5-5')).toBe(true);
     expect(isClaudeUltracodeSupportedModelId('claude-sonnet-5')).toBe(true);
     expect(isClaudeUltracodeSupportedModelId('claude-opus-4-8')).toBe(true);
     expect(isClaudeUltracodeSupportedModelId('claude-opus-4-7')).toBe(true);

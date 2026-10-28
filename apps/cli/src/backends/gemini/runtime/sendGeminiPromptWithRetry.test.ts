@@ -403,6 +403,41 @@ describe('sendGeminiPromptWithRetry', () => {
     expect(backend.sendPromptWithEvidence).toHaveBeenCalledTimes(1);
   });
 
+  it('logs bounded retry metadata without provider error contents', async () => {
+    const secret = 'Bearer must-not-appear-in-gemini-retry-log';
+    const backend = {
+      sendPromptWithEvidence: vi.fn().mockResolvedValue(exactPromptResponseEvidence()),
+      waitForResponseComplete: vi.fn().mockResolvedValue(undefined),
+    } satisfies GeminiPromptBackend;
+    const beforeProviderPromptAttempt = vi.fn()
+      .mockRejectedValueOnce(new Error(`Model stream ended: ${secret}`))
+      .mockResolvedValueOnce(undefined);
+    const onDebug = vi.fn();
+
+    await sendGeminiPromptWithRetry({
+      backend,
+      acpSessionId: 'session-1',
+      prompt: 'hello',
+      messageBuffer: { addMessage: vi.fn() } as any,
+      session: { sendAgentMessage: vi.fn() } as any,
+      onDebug,
+      maxRetries: 2,
+      retryDelayMs: 1,
+      beforeProviderPromptAttempt,
+    });
+
+    expect(onDebug).toHaveBeenCalledWith(
+      '[gemini] Retrying provider prompt admission',
+      {
+        failedAttempt: 1,
+        nextAttempt: 2,
+        maxAttempts: 2,
+        failureKind: 'empty_response',
+      },
+    );
+    expect(JSON.stringify(onDebug.mock.calls)).not.toContain(secret);
+  });
+
   it('does not retry quota errors and forwards quota message to session', async () => {
     const promptError = new AcpPromptSubmissionPhaseError(
       'effect_may_have_occurred',

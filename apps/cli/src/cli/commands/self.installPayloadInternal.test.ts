@@ -98,6 +98,7 @@ describe('happier self __install-payload', () => {
         payloadRootAlreadyFiltered: true,
         processEnv: process.env,
         versionId: '1.2.3',
+        selectAsDefaultReleaseChannel: true,
       });
       expect(quiesceInstalledCliWindowsPayloadOwnersMock).toHaveBeenCalledWith({
         channel: 'stable',
@@ -134,6 +135,7 @@ describe('happier self __install-payload', () => {
         payloadRootAlreadyFiltered: true,
         processEnv: process.env,
         versionId: '1.2.3-dev.4',
+        selectAsDefaultReleaseChannel: true,
       });
       expect(quiesceInstalledCliWindowsPayloadOwnersMock).toHaveBeenCalledWith({
         channel: 'publicdev',
@@ -219,6 +221,7 @@ describe('happier self __install-payload', () => {
         payloadRootAlreadyFiltered: true,
         processEnv: process.env,
         versionId: '1.2.3-preview.4',
+        selectAsDefaultReleaseChannel: true,
       });
       expect(maybeRunVersionGatedRuntimeMigrationMock).not.toHaveBeenCalled();
     } finally {

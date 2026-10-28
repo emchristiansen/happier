@@ -41,6 +41,7 @@ const sessionHandoffPrepareTargetJobCommonShape = {
     lastErrorCode: z.string().min(1).optional(),
     lastErrorMessage: z.string().min(1).optional(),
     workspaceReplicationJobId: z.string().min(1).optional(),
+    existingStateSessionId: z.string().min(1).optional(),
     status: SessionHandoffStatusSchema,
     // Persist the validated prepare-target request so the daemon can resume/restart the job after a restart,
     // even when callers keep polling status/result without issuing a second PREPARE_TARGET call.

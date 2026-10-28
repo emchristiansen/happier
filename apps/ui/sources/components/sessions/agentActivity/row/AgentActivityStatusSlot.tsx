@@ -56,6 +56,7 @@ const STATUS_GLYPHS = {
 
 export type AgentActivityStatusSlotProps = Readonly<{
     status: AgentActivityStatusV1;
+    isActive?: boolean;
     /** Glyph ink size. The spinner diameter is derived from it, never chosen separately. */
     size?: number;
     /**
@@ -75,7 +76,7 @@ export const AgentActivityStatusSlot = React.memo((props: AgentActivityStatusSlo
     // Through the shared reduced-motion table, not a local `!reducedMotion`: the substitution below
     // is one row of a mapping that also governs the settle, the row entrance and the clock, and a
     // private conditional here is how one of those ends up disagreeing with the rest.
-    const spins = props.status === 'running'
+    const spins = props.isActive !== false && props.status === 'running'
         && resolveMotionPresentation('spinner', reducedMotion) === 'animate';
 
     const mark = spins ? (
@@ -87,7 +88,7 @@ export const AgentActivityStatusSlot = React.memo((props: AgentActivityStatusSlo
             animationEnabled={props.animationEnabled}
         />
     ) : (
-        <Icon name={STATUS_GLYPHS[props.status]} size={size} color={ink} />
+        <Icon name={props.isActive === false && props.status === 'running' ? 'circle' : STATUS_GLYPHS[props.status]} size={size} color={ink} />
     );
 
     return (
@@ -96,7 +97,7 @@ export const AgentActivityStatusSlot = React.memo((props: AgentActivityStatusSlo
             // The name a read-only row would otherwise lack: an interactive row's own label already
             // carries the status word, but an info row has no label at all, and a coloured glyph is
             // not a name.
-            accessibilityLabel={resolveAgentActivityStatusWord(props.status)}
+            accessibilityLabel={resolveAgentActivityStatusWord(props.status, props.isActive)}
         >
             {/*
               * The settle. Keyed on the status, so the mark resolves into the next one instead of
@@ -110,7 +111,7 @@ export const AgentActivityStatusSlot = React.memo((props: AgentActivityStatusSlo
               * would be a second one.
               */}
             <StatusTransition
-                transitionKey={props.status}
+                transitionKey={`${props.status}:${props.isActive ?? true}`}
                 size={size}
                 fromScale={ICON_CIRCLE_INK_RATIO}
                 // Passed rather than re-read, so the mark and its motion cannot disagree about the

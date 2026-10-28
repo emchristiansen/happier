@@ -599,6 +599,54 @@ describe('ensureCliDistSnapshotNodeModules', () => {
     expect(readFileSync(snapshotPackageJson, 'utf8')).toContain('@happier-dev/connection-supervisor');
   });
 
+  it('copies workspace package root files referenced by package exports', () => {
+    const rootDir = mkdtempSync(join(tmpdir(), 'happier-cli-dist-snapshot-root-export-'));
+    createdDirs.push(rootDir);
+    mkdirSync(join(rootDir, 'apps', 'cli', 'node_modules', '@happier-dev', 'cli-common', 'dist'), { recursive: true });
+    mkdirSync(join(rootDir, 'packages', 'cli-common', 'dist'), { recursive: true });
+    mkdirSync(join(rootDir, 'node_modules'), { recursive: true });
+
+    writeFileSync(
+      join(rootDir, 'packages', 'cli-common', 'package.json'),
+      JSON.stringify({
+        name: '@happier-dev/cli-common',
+        version: '0.0.0',
+        type: 'module',
+        main: './dist/index.js',
+        exports: {
+          '.': { default: './dist/index.js' },
+          './processInstance': {
+            types: './processInstance.d.mts',
+            import: './processInstance.mjs',
+            default: './processInstance.mjs',
+          },
+        },
+      }, null, 2),
+      'utf8',
+    );
+    writeFileSync(join(rootDir, 'packages', 'cli-common', 'dist', 'index.js'), 'export const common = true;\n', 'utf8');
+    writeFileSync(join(rootDir, 'packages', 'cli-common', 'processInstance.mjs'), 'export const processInstance = true;\n', 'utf8');
+    writeFileSync(join(rootDir, 'packages', 'cli-common', 'processInstance.d.mts'), 'export declare const processInstance: true;\n', 'utf8');
+
+    writeFileSync(
+      join(rootDir, 'apps', 'cli', 'node_modules', '@happier-dev', 'cli-common', 'package.json'),
+      JSON.stringify({ name: '@happier-dev/cli-common', version: '0.0.0', type: 'module' }),
+      'utf8',
+    );
+
+    const snapshotDir = mkdtempSync(join(tmpdir(), 'happier-cli-dist-snapshot-root-export-out-'));
+    createdDirs.push(snapshotDir);
+    const snapshotDistDir = resolve(snapshotDir, 'dist');
+    mkdirSync(snapshotDistDir, { recursive: true });
+
+    ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
+
+    expect(readFileSync(join(snapshotDir, 'node_modules', '@happier-dev', 'cli-common', 'processInstance.mjs'), 'utf8')).toContain(
+      'processInstance',
+    );
+    expect(existsSync(join(snapshotDir, 'node_modules', '@happier-dev', 'cli-common', 'processInstance.d.mts'))).toBe(true);
+  });
+
   it('overwrites stale bundled workspace manifests with canonical package manifests', () => {
     const rootDir = mkdtempSync(join(tmpdir(), 'happier-cli-dist-snapshot-stale-manifest-'));
     createdDirs.push(rootDir);

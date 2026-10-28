@@ -6,6 +6,7 @@ import type {
   TransportHandler,
 } from '@/agent/transport/TransportHandler';
 import { filterJsonObjectOrArrayLine } from '@/agent/transport/utils/jsonStdoutFilter';
+import { classifyProviderOutputFailure } from '@/agent/runtime/classifyProviderOutputFailure';
 import type { AgentMessage } from '@/agent/core';
 import {
   findToolNameFromId,
@@ -15,8 +16,6 @@ import {
 
 const KIMI_TIMEOUTS = {
   init: 90_000,
-  toolCall: 120_000,
-  think: 30_000,
   idle: 500,
 } as const;
 
@@ -80,12 +79,7 @@ export class KimiTransport implements TransportHandler {
     }
 
     // Authentication errors - surface an actionable message.
-    if (
-      trimmed.includes('401') ||
-      trimmed.toLowerCase().includes('invalid_authentication') ||
-      trimmed.toLowerCase().includes('unauthorized') ||
-      trimmed.toLowerCase().includes('api key')
-    ) {
+    if (classifyProviderOutputFailure(trimmed).authenticationError) {
       const message: AgentMessage = {
         type: 'status',
         status: 'error',
@@ -142,9 +136,8 @@ export class KimiTransport implements TransportHandler {
     return false;
   }
 
-  getToolCallTimeout(_toolCallId: string, toolKind?: string): number {
-    if (toolKind === 'think') return KIMI_TIMEOUTS.think;
-    return KIMI_TIMEOUTS.toolCall;
+  getToolCallTimeout(_toolCallId: string, _toolKind?: string): number | null {
+    return null;
   }
 
   getIdleTimeout(): number {

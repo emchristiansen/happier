@@ -337,6 +337,8 @@ test('rolling version allocation merges remote git tags when GitHub release look
     mkdirSync(bin);
     writeFileSync(join(bin, 'gh'), '#!/usr/bin/env bash\nexit 0\n');
     chmodSync(join(bin, 'gh'), 0o755);
+    // Keep real local Git discovery while isolating the unrelated npm registry read.
+    writeFileSync(join(bin, 'npm'), '#!/usr/bin/env bash\nprintf "[]\\n"\n', { mode: 0o755 });
 
     git(root, ['init', '--bare', origin]);
     git(repo, ['init']);

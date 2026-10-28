@@ -1,4 +1,3 @@
-import chalk from 'chalk';
 
 import type { CommandContext } from '@/cli/commandRegistry';
 import { mapUnknownErrorToControlError } from '@/cli/control/controlErrorMapping';
@@ -6,6 +5,7 @@ import { wantsJson, printJsonEnvelope } from '@/cli/output/jsonEnvelope';
 
 import { showProfilesHelp } from './profiles/help';
 import { runProfilesSubcommand } from './profiles/subcommands';
+import { fail } from '@happier-dev/cli-common/output';
 
 export async function handleProfilesCommand(args: string[]): Promise<void> {
   const json = wantsJson(args);
@@ -70,7 +70,7 @@ export async function handleProfilesCliCommand(context: CommandContext): Promise
       return;
     }
 
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     showProfilesHelp();
     if (process.env.DEBUG) console.error(error);
     process.exitCode = typeof process.exitCode === 'number' && process.exitCode > 1 ? process.exitCode : 1;

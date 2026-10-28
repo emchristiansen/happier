@@ -4,8 +4,9 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
+import { resolveHappyToolsBridgeBackendOptions } from './resolveHappyToolsBridgeBackendOptions';
 import {
   buildPiBridgeExtensionSource,
   PI_BRIDGE_EXTENSION_VERSION,
@@ -94,6 +95,79 @@ describe('buildPiBridgeExtensionSource', () => {
 });
 
 describe('pi bridge extension behavior', () => {
+  it('reports each extension input submission without reporting RPC inputs or image-only inputs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'happier-pi-bridge-input-'));
+    const notify = vi.fn<(message: string) => void>();
+    const ctx = { ui: { notify } };
+    try {
+      const configPath = join(dir, 'config.json');
+      writeFileSync(configPath, JSON.stringify({
+        v: 1,
+        sessionId: 'sess-input',
+        directTools: [],
+        promptAddition: '',
+        launch: { filePath: process.execPath, argPrefix: [], env: {} },
+      }));
+      const factory = await loadExtensionFactory();
+      const harness = createFakePi({ [PI_BRIDGE_CONFIG_PATH_FLAG]: configPath });
+      factory(harness.pi);
+      await harness.emit('session_start', {});
+
+      await harness.emit('input', { source: 'rpc', text: '/review concurrency' }, ctx);
+      await harness.emit('input', { source: 'rpc', text: 'handled by another extension' }, ctx);
+      await harness.emit('input', { source: 'interactive', text: 'native input' }, ctx);
+      await harness.emit('input', { source: 'extension', text: '', images: [{ type: 'image' }] }, ctx);
+      expect(notify).not.toHaveBeenCalled();
+
+      const text = 'handled by another extension\nrepeat';
+      await expect(harness.emit('input', { source: 'extension', text }, ctx)).resolves.toBeUndefined();
+      await harness.emit('input', { source: 'extension', text }, ctx);
+      expect(notify.mock.calls.map(([message]) => JSON.parse(String(message)))).toEqual([
+        { type: 'happy-pi-user-input', text },
+        { type: 'happy-pi-user-input', text },
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('registers host-generated JSON schemas without Zod runtime metadata', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'happier-pi-bridge-schemas-'));
+    try {
+      const resolved = await resolveHappyToolsBridgeBackendOptions({
+        agentDir: dir,
+        sessionId: 'sess-schemas',
+        settings: null,
+        memoryRecallGuidanceEnabled: true,
+        memoryMachineId: 'machine-1',
+      });
+      expect(resolved).not.toBeNull();
+      const configPath = join(dir, 'config.json');
+      writeFileSync(configPath, JSON.stringify(resolved!.sessionConfig));
+      const factory = await loadExtensionFactory();
+      const harness = createFakePi({ [PI_BRIDGE_CONFIG_PATH_FLAG]: configPath });
+      factory(harness.pi);
+      await harness.emit('session_start', {});
+
+      expect(harness.tools.map((tool) => tool.name)).toEqual(
+        expect.arrayContaining(['change_title', 'action_execute', 'memory_search']),
+      );
+      for (const tool of harness.tools) {
+        expect(tool.parameters, tool.name).not.toHaveProperty('~standard');
+        expect(tool.parameters, tool.name).toMatchObject({ type: 'object' });
+      }
+      expect(harness.tools.find((tool) => tool.name === 'change_title')?.parameters).toMatchObject({
+        properties: { title: { type: 'string' } },
+        required: ['title'],
+      });
+      const memorySchema = harness.tools.find((tool) => tool.name === 'memory_search')?.parameters;
+      expect(memorySchema).toMatchObject({ properties: { machineId: { type: 'string' } } });
+      expect(memorySchema).not.toHaveProperty('required', expect.arrayContaining(['machineId']));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('executes host-resolved tools through the Agent bridge with bounded typed results', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'happier-pi-bridge-execute-'));
     try {

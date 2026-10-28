@@ -73,7 +73,7 @@ describe('buildClaudeAgentSdkHooks', () => {
     const { hooks } = buildHooks();
 
     expect(hooks.PermissionRequest).toEqual([
-      expect.objectContaining({ matcher: '' }),
+      expect.objectContaining({ matcher: '*' }),
     ]);
     expect(hooks.PreToolUse).toEqual([
       expect.objectContaining({ matcher: 'AskUserQuestion' }),
@@ -126,5 +126,34 @@ describe('buildClaudeAgentSdkHooks', () => {
         decision: { behavior: 'allow', updatedInput, updatedPermissions },
       },
     });
+  });
+
+  it('approves the original operation without marking unchanged arguments as a rewrite', async () => {
+    const input = { command: 'git add --pathspec-from-file=paths.txt', description: 'Stage selected files' };
+    const updatedPermissions = [{
+      type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'git add:*' }],
+      behavior: 'allow', destination: 'session',
+    }];
+    const approvedInput = { ...input };
+    // The permission coordinator normalizes JSON records to null-prototype objects.
+    Object.setPrototypeOf(approvedInput, null);
+    const { hooks } = buildClaudeAgentSdkHooks({
+      cwd: '/tmp/project', claudeConfigDir: null, getMode: makeMode,
+      onSessionFound: () => {}, onSessionHook: () => {},
+      canCallTool: async () => ({ behavior: 'allow', updatedInput: approvedInput, updatedPermissions }),
+    });
+    const registrations = hooks.PermissionRequest as Array<{
+      hooks: Array<(input: unknown, toolUseId: string, options: { signal: AbortSignal }) => Promise<unknown>>;
+    }>;
+    const output = await registrations[0]!.hooks[0]!({
+      hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: input,
+    }, 'toolu_original', { signal: new AbortController().signal });
+
+    // Claude Code 2.1.280 rechecks any supplied updatedInput against ask rules before
+    // applying updatedPermissions. An approval of the original input is not a rewrite.
+    expect(output).toMatchObject({ hookSpecificOutput: {
+      hookEventName: 'PermissionRequest', decision: { behavior: 'allow', updatedPermissions },
+    } });
+    expect(output).not.toHaveProperty('hookSpecificOutput.decision.updatedInput');
   });
 });

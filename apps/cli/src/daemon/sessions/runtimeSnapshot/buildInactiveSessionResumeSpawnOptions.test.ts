@@ -104,9 +104,18 @@ describe('buildInactiveSessionResumeSpawnOptions', () => {
         backendId: 'custom-kiro',
         title: 'Custom Kiro',
       },
+      customAcpSessionId: 'provider-session-1',
     })).toMatchObject({
       backendTarget: { kind: 'configuredAcpBackend', backendId: 'custom-kiro' },
+      resume: 'provider-session-1',
     });
+  });
+
+  it('fails closed when configured metadata and flavor name different targets', () => {
+    expect(build({
+      flavor: 'acp:other-backend',
+      acpConfiguredBackendV1: { v: 1, updatedAt: 100, backendId: 'custom-kiro', title: 'Custom Kiro' },
+    })).toBeNull();
   });
 
   it('fails closed when a configured ACP backend also carries built-in Agent evidence', () => {

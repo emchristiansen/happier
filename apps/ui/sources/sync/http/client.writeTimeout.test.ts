@@ -60,7 +60,7 @@ describe('serverFetch write timeout', () => {
             if (url.endsWith('/health') || url.endsWith('/v1/auth/ping')) {
                 return new Response('ok', { status: 200, headers: new Headers() });
             }
-            if (url.endsWith('/v2/sessions/s1/pending')) {
+            if (new URL(url).pathname === '/v2/sessions/s1/pending') {
                 // Simulate a server that accepts the connection but never responds until aborted.
                 await new Promise<void>((_resolve, reject) => {
                     if (init?.signal) {
@@ -84,7 +84,11 @@ describe('serverFetch write timeout', () => {
         }));
 
         const { serverFetch } = await import('./client');
-        const promise = serverFetch('/v2/sessions/s1/pending', { method: 'POST', body: '{}' });
+        const promise = serverFetch(
+            '/v2/sessions/s1/pending',
+            { method: 'POST', body: '{}' },
+            { timeoutMs: 50 },
+        );
         const assertion = expect(promise).rejects.toMatchObject({
             name: 'ServerFetchWriteTimeoutError',
             retryable: true,

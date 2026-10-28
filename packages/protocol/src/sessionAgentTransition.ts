@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { BackendTargetRefSchema, matchesBackendTargetAgentId } from './backendTargets/backendTargetRef.js';
 
 import { AcpConfigOptionOverridesV1Schema } from './sessionMetadata/metadataOverridesV1.js';
 import { isSessionAgentTransitionDividerLocalId } from './sessionAgentTransitionDivider.js';
@@ -6,9 +7,11 @@ import { PendingLocalIdSchema } from './sessionMessages/pendingLocalId.js';
 import { SessionUserMessageSendRequestSchema } from './sessionUserMessageRpc.js';
 
 /**
- * Same-Session cross-Agent continuation — the frozen shared contract.
+ * Same-Session cross-Agent continuation.
  *
- * Both trees implement THIS shape. The outer request/result is closed and
+ * Built-in selections retain the shared released shape. Configured 0.2 targets
+ * extend it with the canonical backend reference; 0.3 uses its open Agent IDs.
+ * The outer request/result is closed and
  * versioned; the nested user input reuses the already-canonical user-message
  * schema so no second message vocabulary exists.
  *
@@ -25,10 +28,10 @@ import { SessionUserMessageSendRequestSchema } from './sessionUserMessageRpc.js'
  * catalogs. Every field below is present with the same shape in BOTH catalogs
  * (`agentId`, `modelId`, `acpSessionModeId`, `sessionConfigOptionOverrides`).
  *
+ * Built-in legacy requests continue to use the free catalog agent ID. Exact
+ * configured 0.2 targets additionally use BackendTargetRef; its configured ID
+ * must never be reduced to the generic customAcp transport placeholder.
  * Deliberately NOT used here:
- * - `kind:'builtInAgent'` target carriers with a hard-coded agent-id enum. The
- *   agent id is a free catalog identifier resolved and validated by each
- *   daemon's Agent catalog, so adding an Agent never requires a wire change.
  * - `AgentExecutionTargetV1` / `SessionModelSelectionV1`. Both are dev-only
  *   (zero occurrences in the predecessor tree) and cannot be a shared shape.
  *
@@ -44,10 +47,9 @@ import { SessionUserMessageSendRequestSchema } from './sessionUserMessageRpc.js'
  * - `sessionConfigOptionOverrides` -> carried through unchanged.
  *
  * predecessor (`remote-dev`, this tree)
- * - `agentId` -> validated against `CATALOG_AGENT_IDS`, then mapped onto the
- *   INTERNAL `{ kind: 'builtInAgent', agentId }` carrier in
- *   `apps/cli/src/rpc/handlers/spawnSessionOptionsContract.ts`. That carrier is
- *   an internal transport detail and never appears on this wire.
+ * - Built-in `agentId` -> validated against `CATALOG_AGENT_IDS`.
+ * - configured `backendTarget` -> exact account definition and configured ACP
+ *   factory, carried through current metadata and ordinary inactive activation.
  * - `modelId` -> the flat `modelId` spawn field.
  * - `acpSessionModeId` -> the flat `agentModeId` spawn field.
  * - `sessionConfigOptionOverrides` -> the flat field of the same name.
@@ -59,6 +61,8 @@ export const SessionAgentTransitionSelectionV1Schema = z
   .object({
     v: z.literal(1),
     agentId: z.string().trim().min(1).max(128),
+    /** Exact configured identity; legacy built-in selections remain agent-id-only. */
+    backendTarget: BackendTargetRefSchema.optional(),
     modelId: z.string().trim().min(1).max(256).optional(),
     /**
      * Model-provider connection. Accepted only where the receiving tree and the
@@ -72,6 +76,9 @@ export const SessionAgentTransitionSelectionV1Schema = z
   })
   .strict()
   .superRefine((selection, ctx) => {
+    if (selection.backendTarget && !matchesBackendTargetAgentId(selection.backendTarget, selection.agentId)) {
+      ctx.addIssue({ code: 'custom', path: ['backendTarget'], message: 'Agent and backend target identities must agree.' });
+    }
     if (selection.providerConnectionId == null) return;
     if (typeof selection.modelId === 'string' && selection.modelId.length > 0) return;
     ctx.addIssue({
@@ -121,10 +128,15 @@ export const SessionAgentTransitionRequestV1Schema = z
      * metadata tuple/version CAS instead.
      */
     expectedCurrentAgentId: z.string().trim().min(1).max(128),
+    expectedCurrentBackendTarget: BackendTargetRefSchema.optional(),
     selection: SessionAgentTransitionSelectionV1Schema,
     input: SessionAgentTransitionInputV1Schema,
   })
-  .strict();
+  .strict().superRefine((request, ctx) => {
+    if (request.expectedCurrentBackendTarget && !matchesBackendTargetAgentId(request.expectedCurrentBackendTarget, request.expectedCurrentAgentId)) {
+      ctx.addIssue({ code: 'custom', path: ['expectedCurrentBackendTarget'], message: 'Current Agent and backend target identities must agree.' });
+    }
+  });
 export type SessionAgentTransitionRequestV1 = z.infer<typeof SessionAgentTransitionRequestV1Schema>;
 
 /* ------------------------------------------------------------------------- *
@@ -364,6 +376,29 @@ export const SessionContinuationInspectionV1Schema = z.discriminatedUnion('type'
 export type SessionContinuationInspectionV1 = z.infer<typeof SessionContinuationInspectionV1Schema>;
 
 /**
+ * One picker projection asks about every target against the same source Session.
+ * The result array is positional: `inspections[i]` answers `selections[i]`.
+ */
+export const SessionContinuationInspectionBatchRequestV1Schema = z
+  .object({
+    v: z.literal(1),
+    sourceSessionId: z.string().trim().min(1),
+    selections: z.array(SessionAgentTransitionSelectionV1Schema).min(1),
+  })
+  .strict();
+export type SessionContinuationInspectionBatchRequestV1 =
+  z.infer<typeof SessionContinuationInspectionBatchRequestV1Schema>;
+
+export const SessionContinuationInspectionBatchResultV1Schema = z
+  .object({
+    v: z.literal(1),
+    inspections: z.array(SessionContinuationInspectionV1Schema),
+  })
+  .strict();
+export type SessionContinuationInspectionBatchResultV1 =
+  z.infer<typeof SessionContinuationInspectionBatchResultV1Schema>;
+
+/**
  * Machine reachability as the client already knows it, independent of this RPC.
  * Both trees expose `isMachineOnline(machine)` at
  * `apps/ui/sources/utils/sessions/machineUtils.ts`; `'unknown'` covers the case
@@ -459,8 +494,17 @@ export const SessionAgentTransitionBriefPreviewRequestV1Schema = z
      */
     sourceAgentId: z.string().trim().min(1).max(128),
     targetAgentId: z.string().trim().min(1).max(128),
+    sourceBackendTarget: BackendTargetRefSchema.optional(),
+    targetBackendTarget: BackendTargetRefSchema.optional(),
   })
-  .strict();
+  .strict().superRefine((request, ctx) => {
+    if (request.sourceBackendTarget && !matchesBackendTargetAgentId(request.sourceBackendTarget, request.sourceAgentId)) {
+      ctx.addIssue({ code: 'custom', path: ['sourceBackendTarget'], message: 'Source Agent and target must agree.' });
+    }
+    if (request.targetBackendTarget && !matchesBackendTargetAgentId(request.targetBackendTarget, request.targetAgentId)) {
+      ctx.addIssue({ code: 'custom', path: ['targetBackendTarget'], message: 'Target Agent and target must agree.' });
+    }
+  });
 export type SessionAgentTransitionBriefPreviewRequestV1 =
   z.infer<typeof SessionAgentTransitionBriefPreviewRequestV1Schema>;
 
@@ -529,8 +573,13 @@ export const ComposerAgentContinuationIntentV1Schema = z
     v: z.literal(1),
     mode: z.literal('same_session'),
     sourceAgentId: z.string().trim().min(1).max(128),
+    sourceBackendTarget: BackendTargetRefSchema.optional(),
     selection: SessionAgentTransitionSelectionV1Schema,
   })
-  .strict();
+  .strict().superRefine((intent, ctx) => {
+    if (intent.sourceBackendTarget && !matchesBackendTargetAgentId(intent.sourceBackendTarget, intent.sourceAgentId)) {
+      ctx.addIssue({ code: 'custom', path: ['sourceBackendTarget'], message: 'Source Agent and backend target identities must agree.' });
+    }
+  });
 export type ComposerAgentContinuationIntentV1 =
   z.infer<typeof ComposerAgentContinuationIntentV1Schema>;

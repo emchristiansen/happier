@@ -9,6 +9,7 @@ export {
 } from './archiveExtraction.js';
 export { downloadVerifiedReleaseAssetBundle } from './verifiedDownload.js';
 export { fetchGitHubLatestRelease, fetchGitHubReleaseByTag, fetchFirstGitHubReleaseByTags } from './github.js';
+export { requestJson } from './http.js';
 export {
   PUBLIC_RELEASE_RING_IDS,
   RELEASE_RING_IDS,

@@ -7,7 +7,7 @@ A Happier session normally runs under one coding Agent for its whole life. **Con
 
 ## Development status
 
-This capability exists in the current development source and is **not yet available in released Happier builds**. It has not passed an integrated live gate, so treat the behavior described below as the current development contract rather than as shipped behavior. Availability, copy, and failure handling can still change.
+This capability exists in the current development source and is **not yet available in released Happier builds**. Treat the behavior described below as the current development contract rather than as shipped behavior. Availability, copy, and failure handling can still change.
 
 The promise is narrow and worth stating exactly:
 
@@ -28,6 +28,13 @@ Open a running session and use the Agent picker in the message composer — the 
 
 The picker lists the Agents the current CLI can run for this session. The Agent currently running the session is marked as such and stays selectable, because that row is also where you edit its model and configuration.
 
+Configured ACP entries retain their own identities, even when two entries use
+the same executable. Continuing into one starts its exact configuration with
+the recent conversation as text. It does not reuse another entry's opaque ACP
+conversation ID. This development behavior requires a supporting CLI; older
+CLIs retain their existing built-in behavior while configured continuation
+remains unavailable.
+
 ## Arm an Agent, then send
 
 Selecting another Agent **arms** it. There is no separate confirm step:
@@ -41,6 +48,23 @@ To cancel, reselect the Agent that is currently running the session. Leaving the
 
 An armed choice is scoped to this session and to the Agent that was running it when you armed. If the session's Agent changes underneath you, or the feature is turned off on your server, the arm is discarded rather than silently surviving.
 
+While another Agent is armed, the composer shows that Agent's permission choices
+and a read-only preview of its configured connected-service default. An
+unavailable account stays visible as unavailable. Change the target's model,
+mode or configuration in its picker detail; the running Agent's standalone
+editors are hidden until you cancel the armed choice. The session's profile and
+permission intent still belong to the same session.
+
+With [permission changes applied on the next prompt](/sessions/permissions#apply-permission-changes),
+the switch sends the permission intent selected for that message. Happier checks
+that the CLI can accept a changed intent before stopping the current Agent. If
+that capability is unavailable or cannot be established, your draft and armed
+choice stay available. A retry keeps the first submitted message and authored
+permission intent; a different next-prompt choice made afterwards remains pending
+for a later prompt. When that first intent already matches the session policy,
+an older compatible CLI may apply the latest session policy instead, including
+an immediate permission change made while the current Agent is stopping.
+
 ## When it is available
 
 The switch works only for a **hosted** session whose current Agent Happier can name and is **strictly idle**. The Session's recorded machine is not a switch gate: the stop and activation owners determine whether this CLI can perform their work. A cold inactive Session counts as stopped once its canonical Session state confirms that fact.
@@ -51,7 +75,7 @@ It is not available when:
 - **You have read-only access to the session.** The picker says so once for the session rather than once per Agent.
 - **The current Agent is still working.** Send is refused with *"`{Agent}` is still working. Nothing was sent — try again once it finishes."* Wait for the turn to finish and send again.
 - **No reachable CLI can perform the operation, or its CLI is older than the feature.** Happier distinguishes the two where it can, and says "update or reconnect" when it genuinely cannot tell.
-- **The target is a Custom ACP backend.** Configured ACP backends stay visible in the picker so the catalog reads the same everywhere, but in-place switching to them is not supported yet rather than failing at send time.
+- **The configured ACP target is unavailable.** Its exact saved configuration must still exist, and the current CLI must support configured ACP continuation. Your draft and armed choice remain available when the switch is refused.
 
 The switch never moves a session to another machine. If you want that, use [session handoff](/sessions/session-handoff).
 

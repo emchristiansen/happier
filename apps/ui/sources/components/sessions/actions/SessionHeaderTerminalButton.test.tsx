@@ -9,9 +9,10 @@ import {
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 const layoutState = vi.hoisted(() => ({
+    useRealPane: false,
     dockLocation: 'bottom' as 'bottom' | 'details' | 'sidebar',
     deviceType: 'tablet' as 'phone' | 'tablet',
-    platformOS: 'web' as 'web' | 'ios',
+    platformOS: 'web' as 'web' | 'ios' | 'android',
     windowWidthPx: 1400,
 }));
 const routerPushSpy = vi.hoisted(() => vi.fn());
@@ -78,9 +79,10 @@ const pane = {
     setActiveDetailsTab: vi.fn(),
 };
 
-vi.mock('@/components/appShell/panes/hooks/useAppPaneScope', () => ({
-    useAppPaneScope: () => pane,
-}));
+vi.mock('@/components/appShell/panes/hooks/useAppPaneScope', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/components/appShell/panes/hooks/useAppPaneScope')>();
+    return { useAppPaneScope: (scopeId: string) => layoutState.useRealPane ? actual.useAppPaneScope(scopeId) : pane };
+});
 
 vi.mock('@/hooks/server/useFeatureEnabled', () => ({
     useFeatureEnabled: (_featureId: string, scope?: { scopeKind?: string; serverId?: string | null }) =>
@@ -94,6 +96,7 @@ vi.mock('@/utils/platform/responsive', () => ({
 
 describe('SessionHeaderTerminalButton', () => {
     beforeEach(() => {
+        layoutState.useRealPane = false;
         resetSessionActionsCommonModuleMockState();
         openBottomSpy.mockClear();
         closeBottomSpy.mockClear();
@@ -129,6 +132,41 @@ describe('SessionHeaderTerminalButton', () => {
         expect(openBottomSpy).toHaveBeenCalledWith({ tabId: 'terminal' });
     });
 
+    it('reveals a sidebar terminal hidden by details and preserves the details tabs', async () => {
+        const { act } = await import('react-test-renderer');
+        const { AppPaneProvider } = await import('@/components/appShell/panes/AppPaneProvider');
+        const { PaneActionRailContext } = await import('@/components/appShell/panes/PaneActionRailContext');
+        const { useAppPaneScope } = await import('@/components/appShell/panes/hooks/useAppPaneScope');
+        const { useSessionTerminalAction } = await import('../terminal/useSessionTerminalAction');
+        layoutState.useRealPane = true;
+        layoutState.dockLocation = 'sidebar';
+        let currentPane!: ReturnType<typeof useAppPaneScope>;
+        let action!: ReturnType<typeof useSessionTerminalAction>;
+        function Probe() {
+            currentPane = useAppPaneScope('session:s1');
+            action = useSessionTerminalAction({ sessionId: 's1', scopeId: 'session:s1' });
+            return null;
+        }
+        await renderScreen(
+            <AppPaneProvider>
+                <PaneActionRailContext.Provider value={{ visible: true, contentWidthPx: 900, rightPaneHiddenByDetails: true }}>
+                    <Probe />
+                </PaneActionRailContext.Provider>
+            </AppPaneProvider>,
+        );
+        await act(async () => {
+            currentPane.openRight({ tabId: 'terminal' });
+            currentPane.openDetailsTab({ key: 'review', kind: 'scmReview', title: 'Review', resource: { kind: 'scmReview', scope: 'working' } });
+        });
+        expect(action.available).toBe(true);
+        expect(action.active).toBe(false);
+        await act(async () => { action.onPress(); });
+        expect(currentPane.scopeState?.right.isOpen).toBe(true);
+        expect(currentPane.scopeState?.right.activeTabId).toBe('terminal');
+        expect(currentPane.scopeState?.details.isOpen).toBe(false);
+        expect(currentPane.scopeState?.details.tabs.map((tab) => tab.key)).toContain('review');
+    });
+
     it('opens terminal in the bottom pane when docked to bottom', async () => {
         const { SessionHeaderTerminalButton } = await import('./SessionHeaderTerminalButton');
 
@@ -140,6 +178,22 @@ describe('SessionHeaderTerminalButton', () => {
         expect(openBottomSpy).toHaveBeenCalledWith({ tabId: 'terminal' });
         expect(setBottomTabSpy).toHaveBeenCalledWith('terminal');
         expect(closeBottomSpy).not.toHaveBeenCalled();
+    });
+
+    it('uses an Android-native 48dp interactive box', async () => {
+        layoutState.platformOS = 'android';
+        layoutState.deviceType = 'phone';
+        layoutState.windowWidthPx = 390;
+
+        const { SessionHeaderTerminalButton } = await import('./SessionHeaderTerminalButton');
+        const screen = await renderScreen(<SessionHeaderTerminalButton sessionId="s1" scopeId="session:s1" serverId="server-session" />);
+        const button = screen.findByTestId('session-header-terminal-button');
+        if (!button || typeof button.props.style !== 'function') {
+            throw new Error('Expected the terminal Pressable style callback');
+        }
+
+        expect(button.props.style({ pressed: false })).toMatchObject({ width: 48, height: 48 });
+        expect(button.props.hitSlop).toBeUndefined();
     });
 
     it('closes the bottom pane when terminal is already open there', async () => {

@@ -9,13 +9,16 @@
 
 import type { ChildProcess } from 'node:child_process';
 
+import { logger } from '@/ui/logger';
+
 import { classifyChildExit, classifySpawnError } from './exitClassifier';
 import type { TerminationEvent } from './types';
 
 export type ManagedChildProcess = Readonly<{
   pid: number | null;
   /**
-   * Wait for the subprocess to terminate for any reason.
+   * Wait for failed process creation or physical subprocess exit.
+   * Operation errors from a running child are not termination evidence.
    * This promise must always resolve exactly once.
    */
   waitForTermination: () => Promise<TerminationEvent>;
@@ -37,8 +40,12 @@ export function createManagedChildProcess(child: ChildProcess): ManagedChildProc
   child.once('exit', (code, signal) => {
     resolveTermination(classifyChildExit({ code, signal: (signal as NodeJS.Signals | null) ?? null }));
   });
-  child.once('error', (error) => {
-    resolveTermination(classifySpawnError(error));
+  child.on('error', (error) => {
+    if (pid === null) {
+      resolveTermination(classifySpawnError(error));
+    } else if (!settled) {
+      logger.infoFile('[managedChildProcess] Child operation failed before physical exit', { pid });
+    }
   });
 
   return {

@@ -96,14 +96,23 @@ function resolveAttachedTerminalUnavailableMessage(
 }
 
 function parseAskUserQuestionAnswersFromToolResult(result: unknown): Record<string, string> | null {
+    if (typeof result === 'string') {
+        try {
+            result = JSON.parse(result) as unknown;
+        } catch {
+            return null;
+        }
+    }
     if (!result || typeof result !== 'object') return null;
-    const maybeAnswers = (result as any).answers;
+    const maybeAnswers = (result as { answers?: unknown }).answers;
     if (!maybeAnswers || typeof maybeAnswers !== 'object' || Array.isArray(maybeAnswers)) return null;
 
     const answers: Record<string, string> = {};
     for (const [key, value] of Object.entries(maybeAnswers as Record<string, unknown>)) {
         if (typeof value === 'string') {
             answers[key] = value;
+        } else if (Array.isArray(value) && value.every((entry) => typeof entry === 'string')) {
+            answers[key] = value.join(', ');
         }
     }
     return answers;

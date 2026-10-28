@@ -1,4 +1,8 @@
 import * as React from 'react';
+import { normalizeSessionListBackgroundWorkAttentionMode, type SessionListBackgroundWorkAttentionMode } from '@/sync/domains/session/listing/sessionListBackgroundWorkAttention';
+import { useShallow } from 'zustand/react/shallow';
+import { storage } from '@/sync/domains/state/storage';
+import { projectSessionArchivesToListViewData, readSessionArchiveOperationsForServers } from '@/sync/domains/session/listing/sessionArchiveState';
 import { TokenStorage } from '@/auth/storage/tokenStorage';
 import { SessionListViewItem, useLocalSetting, useOpenApprovalSessionIds, useSessionListViewData, useSessionListViewDataByServerId, useSessionOrganizationProjection, useSetting } from '@/sync/domains/state/storage';
 import { buildSessionListShellViewItemSignature } from '@/sync/store/hooks';
@@ -6,14 +10,21 @@ import { resolveNextSessionRuntimePresentationFreshnessAtMs } from '@/sync/domai
 import { resolveSessionListSourceData } from '@/sync/domains/session/listing/sessionListPresentation';
 import { computeVisibleSessionListIndex } from '@/sync/domains/session/listing/computeVisibleSessionListIndex';
 import { isSessionListWorkingPlacementReason } from '@/sync/domains/session/listing/placement/sessionListPlacementProjection';
-import { buildSessionListIndexFromViewData } from '@/sync/domains/session/listing/sessionListIndex';
+import {
+    areSessionListIndexItemsEqual,
+    buildSessionListIndexFromViewData,
+    buildSessionListIndexItemFromViewItem,
+    type SessionListIndexItem,
+} from '@/sync/domains/session/listing/sessionListIndex';
 import { buildSessionListViewDataFromIndex } from '@/sync/domains/session/listing/sessionListViewDataFromIndex';
 import { applySessionFoldersToSessionListViewData } from '@/sync/domains/session/listing/sessionListViewData';
 import {
+    areSessionListGroupOrderMapsEqual,
     normalizeSessionListGroupOrderV1ForSource,
     normalizeSessionListGroupOrderV1ForStructuralSource,
 } from '@/sync/domains/session/listing/sessionListOrderingStateV1';
 import {
+    areSessionWorkspaceOrderMapsEqual,
     normalizeSessionWorkspaceOrderV1ForSource,
     type SessionWorkspaceOrderV1,
 } from '@/sync/domains/session/listing/sessionWorkspaceOrderStateV1';
@@ -38,7 +49,10 @@ import {
 } from '@/sync/domains/session/listing/sessionListOrderingRules';
 import type { SessionListStorageFilter } from '@/sync/domains/session/sessionStorageKind';
 import { normalizeSessionFolders } from '@/sync/domains/session/folders';
-import type { SessionAttentionStandingPolicy } from '@/sync/domains/session/organization/attentionStanding';
+import {
+    resolveNextSessionAttentionReminderWakeAtMs,
+    type SessionAttentionStandingPolicy,
+} from '@/sync/domains/session/organization/attentionStanding';
 import { buildSessionOrganizationListViewState } from '@/sync/domains/session/organization/viewState';
 import { getServerProfileById } from '@/sync/domains/server/serverProfiles';
 import { fetchAndApplySessionFolderAssignments } from '@/sync/ops/sessionOrganization';
@@ -46,6 +60,7 @@ import { useFeatureEnabled } from '@/hooks/server/useFeatureEnabled';
 import { useResolvedActiveServerSelection } from '@/hooks/server/useEffectiveServerSelection';
 import { useSessionAttentionStandingInputs } from './useSessionAttentionStandingInputs';
 import { useSessionListRuntimeNowMs, useSessionListRuntimeWake } from './sessionListRuntimeClock';
+import { syncPerformanceTelemetry } from '@/sync/runtime/syncPerformanceTelemetry';
 
 const EMPTY_SESSION_LIST_GROUP_ORDER: Readonly<Record<string, ReadonlyArray<string> | undefined>> = Object.freeze({});
 const EMPTY_SESSION_WORKSPACE_ORDER: SessionWorkspaceOrderV1 = Object.freeze({});
@@ -72,6 +87,7 @@ type SessionListDataState = Readonly<{
     sessionAttentionStandingPolicy: SessionAttentionStandingPolicy;
     sessionListAttentionPromotionMode: SessionListAttentionPromotionMode;
     sessionListWorkingPlacementMode: SessionListWorkingPlacementMode;
+    backgroundWorkAttentionMode: SessionListBackgroundWorkAttentionMode;
     sessionListFolderSortModeV1: SessionListFolderSortModeV1;
     sessionListOrderingModeV1: SessionListOrderingModeV1;
     sessionListSectionModeV1: SessionListOrderingSectionMode;
@@ -212,6 +228,7 @@ function buildVisibleSessionListIndexForState(
                 standingPolicy: state.sessionAttentionStandingPolicy,
             }
             : DISABLED_ATTENTION_PROMOTION_OPTIONS,
+        backgroundWorkAttentionMode: state.backgroundWorkAttentionMode,
         workingPlacement: state.sessionListWorkingPlacementMode !== 'off'
             ? {
                 mode: state.sessionListWorkingPlacementMode,
@@ -226,6 +243,11 @@ function buildVisibleSessionListIndexForState(
     return { sourceIndex, visibleIndex };
 }
 
+type VisibleSessionListBuild = Readonly<{
+    visible: SessionListViewItem[] | null;
+    visibleIndex: ReadonlyArray<SessionListIndexItem> | null;
+}>;
+
 function buildVisibleSessionListViewData(
     state: SessionListDataState,
     storageFilter: SessionListStorageFilter,
@@ -236,18 +258,23 @@ function buildVisibleSessionListViewData(
         nowMs?: number;
         previousVisible?: ReadonlyArray<SessionListViewItem> | null;
     }> = {},
-): SessionListViewItem[] | null {
-    if (!state.folderSource) return state.folderSource;
+): VisibleSessionListBuild {
+    if (!state.folderSource) {
+        return { visible: state.folderSource, visibleIndex: null };
+    }
 
     const indexResult = buildVisibleSessionListIndexForState(state, storageFilter, hideInactiveSessions, options);
-    if (!indexResult) return null;
+    if (!indexResult) return { visible: null, visibleIndex: null };
 
-    return buildSessionListViewDataFromIndex({
-        index: indexResult.visibleIndex,
-        source: state.folderSource,
-        sourceIndex: indexResult.sourceIndex,
-        previous: options.previousVisible,
-    });
+    return {
+        visible: buildSessionListViewDataFromIndex({
+            index: indexResult.visibleIndex,
+            source: state.folderSource,
+            sourceIndex: indexResult.sourceIndex,
+            previous: options.previousVisible,
+        }),
+        visibleIndex: indexResult.visibleIndex,
+    };
 }
 
 function buildSessionListSessionKey(item: Extract<SessionListViewItem, { type: 'session' }>): string | null {
@@ -268,10 +295,11 @@ function collectRetainedAttentionPlacements(params: Readonly<{
     for (const item of params.previousVisible) {
         if (item.type !== 'session') continue;
         if (item.groupKind !== 'attention' && !item.attentionPromotionReason) continue;
-        // Standing is the user's own instruction, so removing it must take
+        // Lasting standing is the user's own instruction, so removing it must take
         // effect immediately. Retention exists to stop a row the user is
         // READING from sliding away under them; retaining a standing row would
-        // instead pin it in the band until they navigate elsewhere.
+        // instead pin it in the band until they navigate elsewhere. Due reminders
+        // have their own reason and retain placement just like read acknowledgement.
         if (item.attentionPromotionReason === 'standing') continue;
         if (item.session.id !== activeSessionId) continue;
         const key = buildSessionListSessionKey(item);
@@ -317,8 +345,9 @@ function resolveNextVisibleSessionListRuntimeFreshnessAtMs(
 
 function useVisibleSessionListRuntimeNowMs(
     source: ReadonlyArray<SessionListViewItem> | null,
+    attentionStandingPolicy: SessionAttentionStandingPolicy,
     enabled: boolean,
-): number {
+): Readonly<{ runtimeNowMs: number; nextFreshnessAtMs: number | null }> {
     // Shared session-list runtime clock: group placement and per-row working
     // indicators must derive freshness from the same timestamp in the same
     // render cycle, so this hook subscribes to the canonical clock and only
@@ -326,18 +355,169 @@ function useVisibleSessionListRuntimeNowMs(
     // Inactive surfaces neither subscribe nor schedule wakes; their data is
     // frozen downstream, so ticking them would only churn renders.
     const runtimeNowMs = useSessionListRuntimeNowMs(enabled);
-    const nextFreshnessAtMs = React.useMemo(
-        () => (enabled ? resolveNextVisibleSessionListRuntimeFreshnessAtMs(source, runtimeNowMs) : null),
-        [enabled, source, runtimeNowMs],
+    const nextFreshnessAtMs = React.useMemo(() => {
+        if (!enabled) return null;
+        const runtimeAt = resolveNextVisibleSessionListRuntimeFreshnessAtMs(source, runtimeNowMs);
+        const reminderAt = resolveNextSessionAttentionReminderWakeAtMs(attentionStandingPolicy, runtimeNowMs);
+        return runtimeAt === null ? reminderAt : reminderAt === null ? runtimeAt : Math.min(runtimeAt, reminderAt);
+    },
+        [attentionStandingPolicy, enabled, source, runtimeNowMs],
     );
     useSessionListRuntimeWake(nextFreshnessAtMs, enabled);
-    return runtimeNowMs;
+    return React.useMemo(
+        () => ({ runtimeNowMs, nextFreshnessAtMs }),
+        [nextFreshnessAtMs, runtimeNowMs],
+    );
 }
 
 type VisibleSessionListComputation = Readonly<{
     visible: SessionListViewItem[] | null;
     buildWithHiddenFilter: (hideInactiveSessions: boolean) => SessionListViewItem[] | null;
+    retainedProjectionRecovered: boolean;
 }>;
+
+type RetainedVisibleSessionListProjection = Readonly<{
+    folderSource: SessionListViewItem[];
+    hideInactiveSessions: boolean;
+    pinnedSessionKeysV1: ReadonlyArray<string>;
+    sessionAttentionStandingPolicy: SessionAttentionStandingPolicy;
+    sessionListAttentionPromotionMode: SessionListAttentionPromotionMode;
+    sessionListWorkingPlacementMode: SessionListWorkingPlacementMode;
+    backgroundWorkAttentionMode: SessionListBackgroundWorkAttentionMode;
+    sessionListFolderSortModeV1: SessionListFolderSortModeV1;
+    sessionListOrderingModeV1: SessionListOrderingModeV1;
+    sessionListSectionModeV1: SessionListOrderingSectionMode;
+    selectionEnabled: boolean;
+    selectionAllowedServerIds: ReadonlyArray<string>;
+    selectionPresentation: SessionListDataState['selection']['presentation'];
+    normalizedGroupOrder: Readonly<Record<string, ReadonlyArray<string> | undefined>>;
+    normalizedWorkspaceOrder: SessionWorkspaceOrderV1;
+    storageFilter: SessionListStorageFilter;
+    retainedAttentionPlacements: ReadonlyArray<SessionListRetainedAttentionPlacement>;
+    retainedWorkingSessionKeys: ReadonlyArray<string>;
+    validUntilMs: number | null;
+}>;
+
+// The retained pane already owns the last rendered projection while the phone list is hidden.
+// Keep its validation facts attached to that array identity so a remount can recover the same
+// memoized result without keeping any list/store subscriptions alive behind a detail route.
+const retainedVisibleSessionListProjections = new WeakMap<
+    ReadonlyArray<SessionListViewItem>,
+    RetainedVisibleSessionListProjection
+>();
+
+function areStringListsEqual(
+    left: ReadonlyArray<string>,
+    right: ReadonlyArray<string>,
+): boolean {
+    if (left === right) return true;
+    if (left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index += 1) {
+        if (left[index] !== right[index]) return false;
+    }
+    return true;
+}
+
+function areRetainedAttentionPlacementsEqual(
+    left: ReadonlyArray<SessionListRetainedAttentionPlacement>,
+    right: ReadonlyArray<SessionListRetainedAttentionPlacement>,
+): boolean {
+    if (left === right) return true;
+    if (left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index += 1) {
+        if (left[index]?.key !== right[index]?.key || left[index]?.reason !== right[index]?.reason) return false;
+    }
+    return true;
+}
+
+function areRetainedSessionListSourcesEquivalent(
+    previous: ReadonlyArray<SessionListViewItem>,
+    next: ReadonlyArray<SessionListViewItem>,
+): boolean {
+    if (previous === next) return true;
+    if (previous.length !== next.length) return false;
+
+    for (let index = 0; index < previous.length; index += 1) {
+        const previousItem = previous[index];
+        const nextItem = next[index];
+        if (!previousItem || !nextItem || previousItem.type !== nextItem.type) return false;
+        if (previousItem === nextItem) continue;
+
+        // The list projection owns stable renderable objects. Folder/source
+        // transforms may rebuild their lightweight wrappers on remount, but a
+        // different renderable object must still flow through the normal
+        // projection path so every placement input is reconsidered.
+        if (
+            previousItem.type === 'session'
+            && nextItem.type === 'session'
+            && previousItem.session !== nextItem.session
+        ) {
+            return false;
+        }
+        if (buildSessionListShellViewItemSignature(previousItem) !== buildSessionListShellViewItemSignature(nextItem)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+function areAttentionStandingPoliciesEqual(
+    left: SessionAttentionStandingPolicy,
+    right: SessionAttentionStandingPolicy,
+): boolean {
+    if (left === right) return true;
+    if (left.defaultStanding !== right.defaultStanding) return false;
+    const leftKeys = Object.keys(left.overridesBySessionKey);
+    const rightKeys = Object.keys(right.overridesBySessionKey);
+    if (leftKeys.length !== rightKeys.length) return false;
+    for (const key of leftKeys) {
+        const leftValue = left.overridesBySessionKey[key];
+        const rightValue = right.overridesBySessionKey[key];
+        if (leftValue === rightValue) continue;
+        if (
+            typeof leftValue !== 'object'
+            || typeof rightValue !== 'object'
+            || leftValue.standing !== rightValue.standing
+            || leftValue.remindAt !== rightValue.remindAt
+            || leftValue.updatedAt !== rightValue.updatedAt
+        ) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function canReuseRetainedVisibleSessionListProjection(params: Readonly<{
+    cached: RetainedVisibleSessionListProjection | undefined;
+    state: SessionListDataState;
+    storageFilter: SessionListStorageFilter;
+    retainedAttentionPlacements: ReadonlyArray<SessionListRetainedAttentionPlacement>;
+    retainedWorkingSessionKeys: ReadonlyArray<string>;
+    nowMs: number;
+}>): boolean {
+    const cached = params.cached;
+    const folderSource = params.state.folderSource;
+    if (!cached || !folderSource || !areRetainedSessionListSourcesEquivalent(cached.folderSource, folderSource)) return false;
+    if (cached.validUntilMs !== null && params.nowMs >= cached.validUntilMs) return false;
+    return cached.hideInactiveSessions === params.state.hideInactiveSessions
+        && areStringListsEqual(cached.pinnedSessionKeysV1, params.state.pinnedSessionKeysV1)
+        && areAttentionStandingPoliciesEqual(cached.sessionAttentionStandingPolicy, params.state.sessionAttentionStandingPolicy)
+        && cached.sessionListAttentionPromotionMode === params.state.sessionListAttentionPromotionMode
+        && cached.sessionListWorkingPlacementMode === params.state.sessionListWorkingPlacementMode
+        && cached.backgroundWorkAttentionMode === params.state.backgroundWorkAttentionMode
+        && cached.sessionListFolderSortModeV1 === params.state.sessionListFolderSortModeV1
+        && cached.sessionListOrderingModeV1 === params.state.sessionListOrderingModeV1
+        && cached.sessionListSectionModeV1 === params.state.sessionListSectionModeV1
+        && cached.selectionEnabled === params.state.selection.enabled
+        && areStringListsEqual(cached.selectionAllowedServerIds, params.state.selection.allowedServerIds)
+        && cached.selectionPresentation === params.state.selection.presentation
+        && areSessionListGroupOrderMapsEqual(cached.normalizedGroupOrder, params.state.normalizedGroupOrder)
+        && areSessionWorkspaceOrderMapsEqual(cached.normalizedWorkspaceOrder, params.state.normalizedWorkspaceOrder)
+        && cached.storageFilter === params.storageFilter
+        && areRetainedAttentionPlacementsEqual(cached.retainedAttentionPlacements, params.retainedAttentionPlacements)
+        && areStringListsEqual(cached.retainedWorkingSessionKeys, params.retainedWorkingSessionKeys);
+}
 
 /**
  * Single owner of the visible session-list computation shared by
@@ -353,8 +533,14 @@ function useVisibleSessionListComputation(
     options: VisibleSessionListViewDataOptions,
 ): VisibleSessionListComputation {
     const surfaceDataActive = options.sessionListSurfaceDataActive !== false;
-    const runtimeNowMs = useVisibleSessionListRuntimeNowMs(state.folderSource, surfaceDataActive);
+    const runtimeClockState = useVisibleSessionListRuntimeNowMs(
+        state.folderSource,
+        state.sessionAttentionStandingPolicy,
+        surfaceDataActive,
+    );
+    const runtimeNowMs = runtimeClockState.runtimeNowMs;
     const previousVisibleRef = React.useRef<SessionListViewItem[] | null>(null);
+    const recoveredRetainedProjectionRef = React.useRef<SessionListViewItem[] | null>(null);
 
     const computation = React.useMemo<VisibleSessionListComputation>(() => {
         const previousVisible = resolvePreviousVisibleSessionListForRetention(
@@ -370,25 +556,120 @@ function useVisibleSessionListComputation(
             previousVisible,
             mode: state.sessionListWorkingPlacementMode,
         });
-        const buildWithHiddenFilter = (hideInactiveSessions: boolean) =>
+        const buildProjectionWithHiddenFilter = (hideInactiveSessions: boolean) =>
             buildVisibleSessionListViewData(state, storageFilter, hideInactiveSessions, {
                 retainedAttentionPlacements,
                 retainWorkingSessionKeys,
                 nowMs: runtimeNowMs,
                 previousVisible,
             });
+        const buildWithHiddenFilter = (hideInactiveSessions: boolean) =>
+            buildProjectionWithHiddenFilter(hideInactiveSessions).visible;
+        const isRetainedRemount = previousVisibleRef.current === null
+            && options.retainedSessionListViewData != null;
+        const isRetainedProjectionCandidate = previousVisible != null
+            && (
+                options.retainedSessionListViewData === previousVisible
+                || recoveredRetainedProjectionRef.current === previousVisible
+            );
+        const cachedProjection = isRetainedProjectionCandidate
+            ? retainedVisibleSessionListProjections.get(previousVisible)
+            : undefined;
+        const canReuseRetainedProjection = isRetainedProjectionCandidate && canReuseRetainedVisibleSessionListProjection({
+            cached: cachedProjection,
+            state,
+            storageFilter,
+            retainedAttentionPlacements,
+            retainedWorkingSessionKeys: retainWorkingSessionKeys,
+            nowMs: runtimeNowMs,
+        });
+        if (canReuseRetainedProjection) {
+            syncPerformanceTelemetry.count('sync.sessions.list.visible.retainedProjectionReused', {
+                items: previousVisible.length,
+            });
+            return {
+                visible: previousVisible as SessionListViewItem[],
+                buildWithHiddenFilter,
+                retainedProjectionRecovered: true,
+            };
+        }
+        if (isRetainedRemount) {
+            const sourceSemanticsChanged = cachedProjection && state.folderSource
+                ? !areRetainedSessionListSourcesEquivalent(cachedProjection.folderSource, state.folderSource)
+                : false;
+            syncPerformanceTelemetry.count('sync.sessions.list.visible.retainedProjectionMiss', {
+                cacheMissing: cachedProjection ? 0 : 1,
+                sourceSemanticsChanged: sourceSemanticsChanged ? 1 : 0,
+                runtimeExpired: cachedProjection?.validUntilMs !== null
+                    && cachedProjection?.validUntilMs !== undefined
+                    && runtimeNowMs >= cachedProjection.validUntilMs
+                    ? 1
+                    : 0,
+                otherInputsChanged: cachedProjection
+                    && !sourceSemanticsChanged
+                    && (cachedProjection.validUntilMs === null || runtimeNowMs < cachedProjection.validUntilMs)
+                    ? 1
+                    : 0,
+            });
+        }
+        const nextProjection = buildProjectionWithHiddenFilter(state.hideInactiveSessions);
         return {
             visible: reuseStableVisibleSessionListRows(
                 previousVisible,
-                buildWithHiddenFilter(state.hideInactiveSessions),
+                nextProjection.visible,
+                nextProjection.visibleIndex,
             ),
             buildWithHiddenFilter,
+            retainedProjectionRecovered: false,
         };
     }, [options.activeSessionId, options.retainedSessionListViewData, runtimeNowMs, state, storageFilter]);
 
     React.useEffect(() => {
         previousVisibleRef.current = computation.visible;
-    }, [computation.visible]);
+        recoveredRetainedProjectionRef.current = computation.retainedProjectionRecovered
+            ? computation.visible
+            : null;
+        if (!computation.visible || !state.folderSource) return;
+        const previousVisible = resolvePreviousVisibleSessionListForRetention(
+            previousVisibleRef.current,
+            options.retainedSessionListViewData,
+        );
+        retainedVisibleSessionListProjections.set(computation.visible, {
+            folderSource: state.folderSource,
+            hideInactiveSessions: state.hideInactiveSessions,
+            pinnedSessionKeysV1: state.pinnedSessionKeysV1,
+            sessionAttentionStandingPolicy: state.sessionAttentionStandingPolicy,
+            sessionListAttentionPromotionMode: state.sessionListAttentionPromotionMode,
+            sessionListWorkingPlacementMode: state.sessionListWorkingPlacementMode,
+            backgroundWorkAttentionMode: state.backgroundWorkAttentionMode,
+            sessionListFolderSortModeV1: state.sessionListFolderSortModeV1,
+            sessionListOrderingModeV1: state.sessionListOrderingModeV1,
+            sessionListSectionModeV1: state.sessionListSectionModeV1,
+            selectionEnabled: state.selection.enabled,
+            selectionAllowedServerIds: state.selection.allowedServerIds,
+            selectionPresentation: state.selection.presentation,
+            normalizedGroupOrder: state.normalizedGroupOrder,
+            normalizedWorkspaceOrder: state.normalizedWorkspaceOrder,
+            storageFilter,
+            retainedAttentionPlacements: collectRetainedAttentionPlacements({
+                previousVisible,
+                activeSessionId: options.activeSessionId,
+                mode: state.sessionListAttentionPromotionMode,
+            }),
+            retainedWorkingSessionKeys: collectRetainedWorkingSessionKeys({
+                previousVisible,
+                mode: state.sessionListWorkingPlacementMode,
+            }),
+            validUntilMs: runtimeClockState.nextFreshnessAtMs,
+        });
+    }, [
+        computation.visible,
+        options.activeSessionId,
+        options.retainedSessionListViewData,
+        runtimeClockState.nextFreshnessAtMs,
+        state,
+        storageFilter,
+    ]);
 
     return computation;
 }
@@ -448,43 +729,60 @@ function areVisibleSessionListRowsEquivalent(
  * `buildSessionListViewDataFromIndex` owns identity for rows whose index item and source
  * row are unchanged, which covers every row a normal push leaves alone; this pass only
  * has to catch the narrower case where a row was rebuilt around a *different but equal*
- * session object (a full source refresh), which identity cannot see. Rows the build
- * already reused short-circuit on the first `previousItem === nextItem` comparison, so
- * the signature scan runs for genuinely changed rows only.
+ * session object (a full source refresh), which identity cannot see. The build's visible
+ * index remains the authority for placement and hierarchy. Compare only candidate prior
+ * rows against that already-computed index instead of rebuilding two complete indices.
  */
 function reuseStableVisibleSessionListRows(
     previousVisible: ReadonlyArray<SessionListViewItem> | null | undefined,
     nextVisible: SessionListViewItem[] | null,
+    nextVisibleIndex: ReadonlyArray<SessionListIndexItem> | null,
 ): SessionListViewItem[] | null {
     if (previousVisible === nextVisible) {
         return nextVisible;
     }
-    if (!previousVisible || !nextVisible || previousVisible.length !== nextVisible.length) {
+    if (
+        !previousVisible
+        || !nextVisible
+        || previousVisible.length !== nextVisible.length
+        || !nextVisibleIndex
+        || nextVisibleIndex.length !== nextVisible.length
+    ) {
         return nextVisible;
     }
 
-    const previousIndex = buildSessionListIndexFromViewData(previousVisible);
-    const nextIndex = buildSessionListIndexFromViewData(nextVisible, previousIndex);
-    if (!previousIndex || !nextIndex || previousIndex.length !== nextIndex.length) {
-        return nextVisible;
-    }
-
-    let reusedAllRows = true;
+    let hasChangedRow = false;
     let reusedAnyRow = false;
-    const out = nextVisible.map((nextItem, index) => {
+    let reusedAllRows = true;
+    let out: SessionListViewItem[] | null = null;
+    for (let index = 0; index < nextVisible.length; index += 1) {
         const previousItem = previousVisible[index];
-        const canReuseIndex = previousIndex[index] != null && previousIndex[index] === nextIndex[index];
-        const canReuseItem = canReuseIndex && areVisibleSessionListRowsEquivalent(previousItem, nextItem);
-        if (canReuseItem && previousItem) {
+        const nextItem = nextVisible[index];
+        if (previousItem === nextItem) continue;
+        hasChangedRow = true;
+        const nextIndexItem = nextVisibleIndex[index];
+        if (
+            previousItem
+            && nextIndexItem
+            && areVisibleSessionListRowsEquivalent(previousItem, nextItem)
+            && areSessionListIndexItemsEqual(
+                buildSessionListIndexItemFromViewItem(previousItem),
+                nextIndexItem,
+            )
+        ) {
+            out ??= nextVisible.slice();
+            out[index] = previousItem;
             reusedAnyRow = true;
-            return previousItem;
+            continue;
         }
         reusedAllRows = false;
-        return nextItem;
-    });
+    }
+    if (!hasChangedRow) {
+        return previousVisible as SessionListViewItem[];
+    }
 
     if (reusedAllRows) return previousVisible as SessionListViewItem[];
-    return reusedAnyRow ? out : nextVisible;
+    return reusedAnyRow && out ? out : nextVisible;
 }
 
 function useSessionListDataState(
@@ -496,6 +794,7 @@ function useSessionListDataState(
     const openApprovalSessionIdList = useOpenApprovalSessionIds();
     const hideInactiveSessions = useSetting('hideInactiveSessions') === true;
     const sessionListWorkingPlacementMode = normalizeSessionListWorkingPlacementMode(useSetting('sessionListWorkingPlacementModeV1'));
+    const backgroundWorkAttentionMode = normalizeSessionListBackgroundWorkAttentionMode(useSetting('sessionListBackgroundWorkAttentionModeV1'));
     const sessionListFolderSortModeV1 = normalizeSessionListFolderSortModeV1(useLocalSetting('sessionListFolderSortModeV1'));
     const sessionListOrderingModeV1 = normalizeSessionListOrderingModeV1(useSetting('sessionListOrderingModeV1'));
     const sessionListSectionModeV1 = normalizeSessionListOrderingSectionMode(useSetting('sessionListSectionModeV1'));
@@ -522,17 +821,22 @@ function useSessionListDataState(
         ? selection.allowedServerIds
         : EMPTY_SELECTED_SESSION_LIST_SERVER_IDS;
     const dataByServerId = useSessionListViewDataByServerId(selectedServerIdsForCache);
+    const archiveOperations = storage(useShallow((state) => {
+        const serverIds = selection.enabled ? selection.allowedServerIds : [selection.activeServerId];
+        return readSessionArchiveOperationsForServers(state, serverIds);
+    }));
 
     const source = React.useMemo(() => {
-        return resolveSessionListSourceData({
+        return projectSessionArchivesToListViewData(resolveSessionListSourceData({
             enabled: selection.enabled,
             activeServerId: selection.activeServerId,
             activeData,
             byServerId: dataByServerId,
             selectedServerIds: selection.allowedServerIds,
-        });
+        }), archiveOperations, selection.activeServerId);
     }, [
         activeData,
+        archiveOperations,
         dataByServerId,
         selectedServerIdsKey,
         selection.activeServerId,
@@ -642,6 +946,7 @@ function useSessionListDataState(
         sessionAttentionStandingPolicy,
         sessionListAttentionPromotionMode,
         sessionListWorkingPlacementMode,
+        backgroundWorkAttentionMode,
         sessionListFolderSortModeV1,
         sessionListOrderingModeV1,
         sessionListSectionModeV1,
@@ -666,6 +971,7 @@ function useSessionListDataState(
         sessionAttentionStandingPolicy,
         sessionListAttentionPromotionMode,
         sessionListWorkingPlacementMode,
+        backgroundWorkAttentionMode,
         sessionListFolderSortModeV1,
         sessionListOrderingModeV1,
         sessionListSectionModeV1,

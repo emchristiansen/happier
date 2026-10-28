@@ -65,13 +65,34 @@ export function projectReleaseStatus(mode, env) {
   };
 
   if (mode === 'nightly') {
-    const item = (id, required, evidence, name, verified, recoveryHint) => ({
+    const decision = choice(env, 'NIGHTLY_DECISION', ['publish', 'already_current', 'blocked_ci']);
+    if (decision !== 'publish') {
+      const complete = decision === 'already_current';
+      const id = complete ? 'rolling_release_current' : 'source_ci_admission';
+      return summarizeReleaseStatus({
+        run: baseRun(env),
+        channel: 'dev',
+        sourceSha,
+        requestedSurfaces: [{ id, requested: true, required: true, evidence: 'verified' }],
+        surfaces: [{
+          id,
+          result: complete ? 'success' : 'failed',
+          identity: { sourceSha, verified: complete },
+          recoveryHint: complete ? { job: 'nightly_noop' } : { job: 'nightly_waiting_for_ci' },
+        }],
+      });
+    }
+    const desktopOriginRunId = Number(env.DESKTOP_ORIGIN_RUN_ID || env.RELEASE_RUN);
+    if (!Number.isSafeInteger(desktopOriginRunId) || desktopOriginRunId < 1) {
+      throw new Error('[release] desktop candidate origin run ID must be a positive safe integer');
+    }
+    const item = (id, required, evidence, name, verified, recoveryHint, identity = {}) => ({
       id,
       requested: true,
       required,
       evidence,
       result: evidence === 'accepted' && exact(name) ? 'accepted' : result(env, name),
-      identity: { sourceSha, verified },
+      identity: { sourceSha, verified, ...identity },
       recoveryHint,
     });
     const candidateItem = (id, product, name, versionName, resumeVerifiedName, recoveryHint) => ({
@@ -93,7 +114,7 @@ export function projectReleaseStatus(mode, env) {
       item('server_rolling_release', false, 'verified', 'SERVER_RESULT', promotedVerified('SERVER_RESULT'), { job: 'promote_server' }),
       item('ui_web_rolling_release', false, 'verified', 'UI_WEB_RESULT', promotedVerified('UI_WEB_RESULT'), { job: 'promote_ui_web' }),
       item('ui_mobile', false, 'accepted', 'MOBILE_RESULT', false, { job: 'ui_mobile' }),
-      item('ui_desktop', false, 'accepted', 'DESKTOP_RESULT', false, { job: 'ui_desktop' }),
+      item('ui_desktop', false, 'accepted', 'DESKTOP_RESULT', false, { job: 'ui_desktop' }, { candidateOriginRunId: desktopOriginRunId }),
       item('docker', false, 'accepted', 'DOCKER_RESULT', false, { job: 'docker' }),
       item('post_promotion_identity', false, 'verified', 'POST_PROMOTION_RESULT', exact('POST_PROMOTION_RESULT'), { job: 'verify_promoted' }),
     ];

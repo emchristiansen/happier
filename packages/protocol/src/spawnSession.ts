@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+import { SessionAuthoringTerminalV1Schema } from './sessionAuthoring/fieldCatalog.js';
+
 import {
   CONNECTED_SERVICE_UX_DIAGNOSTIC_ACTIONS,
   CONNECTED_SERVICE_UX_DIAGNOSTIC_CODES,
@@ -7,6 +9,11 @@ import {
   normalizeConnectedServiceUxDiagnosticV1,
   type ConnectedServiceUxDiagnosticV1,
 } from './connect/connectedServiceUxDiagnostics.js';
+
+// Integrated terminals are UI authoring choices, not daemon process launch modes.
+export const SpawnSessionTerminalSchema = SessionAuthoringTerminalV1Schema.extend({
+  mode: SessionAuthoringTerminalV1Schema.shape.mode.unwrap().exclude(['integrated']).optional(),
+}).strip();
 
 /** Fresh execution authority is bound to an exact user request and, when present, its durable revision. */
 export const SpawnSessionExecutionAuthorizationSchema = z.object({
@@ -42,6 +49,7 @@ export const SPAWN_SESSION_ERROR_CODES = {
   RESUME_UNSUPPORTED_ENCRYPTION_VARIANT: 'RESUME_UNSUPPORTED_ENCRYPTION_VARIANT',
   DIRECTORY_CREATE_FAILED: 'DIRECTORY_CREATE_FAILED',
   SPAWN_VALIDATION_FAILED: 'SPAWN_VALIDATION_FAILED',
+  EXISTING_SESSION_STATE_UNAVAILABLE: 'existing_session_state_unavailable',
   SPAWN_NO_PID: 'SPAWN_NO_PID',
   CHILD_EXITED_BEFORE_WEBHOOK: 'CHILD_EXITED_BEFORE_WEBHOOK',
   SESSION_WEBHOOK_TIMEOUT: 'SESSION_WEBHOOK_TIMEOUT',
@@ -62,6 +70,7 @@ export type SpawnSessionErrorCode = (typeof SPAWN_SESSION_ERROR_CODES)[keyof typ
  * result. Existing consumers that only read `errorCode`/`errorMessage` keep working unchanged.
  */
 export const SPAWN_SESSION_ERROR_DETAIL_KINDS = {
+  TERMINAL_HOST_UNAVAILABLE: 'terminal_host_unavailable',
   /**
    * A connected-service auth switch/resume fail-closed because the resumed session could not be
    * proven reachable in the materialized target before the vendor launched (K1 §2 gate). Surfaced
@@ -107,7 +116,15 @@ export type ConnectedServiceUxDiagnosticSpawnErrorDetail = Readonly<{
   uxDiagnostic: ConnectedServiceUxDiagnosticV1;
 }>;
 
+export const TerminalHostUnavailableSpawnErrorDetailSchema = z.object({
+  kind: z.literal(SPAWN_SESSION_ERROR_DETAIL_KINDS.TERMINAL_HOST_UNAVAILABLE),
+  host: z.enum(['herdr', 'zellij']),
+  reason: z.enum(['installation_unavailable', 'server_version_unsupported']),
+}).strict();
+export type TerminalHostUnavailableSpawnErrorDetail = z.infer<typeof TerminalHostUnavailableSpawnErrorDetailSchema>;
+
 export type SpawnSessionErrorDetail =
+  | TerminalHostUnavailableSpawnErrorDetail
   | ConnectedServiceResumeUnreachableSpawnErrorDetail
   | ConnectedServiceUxDiagnosticSpawnErrorDetail;
 
@@ -320,14 +337,17 @@ export function isConnectedServiceUxDiagnosticSpawnErrorDetail(
 }
 
 export function isSpawnSessionErrorDetail(value: unknown): value is SpawnSessionErrorDetail {
-  return isConnectedServiceResumeUnreachableSpawnErrorDetail(value)
+  return TerminalHostUnavailableSpawnErrorDetailSchema.safeParse(value).success
+    || isConnectedServiceResumeUnreachableSpawnErrorDetail(value)
     || isConnectedServiceUxDiagnosticSpawnErrorDetail(value);
 }
 
 export function normalizeSpawnSessionErrorDetail(value: unknown): SpawnSessionErrorDetail | undefined {
   const detail = asRecord(value);
   if (!detail) return undefined;
-  return normalizeConnectedServiceResumeUnreachableDetail(detail)
+  const terminalHost = TerminalHostUnavailableSpawnErrorDetailSchema.safeParse(detail);
+  return (terminalHost.success ? terminalHost.data : undefined)
+    ?? normalizeConnectedServiceResumeUnreachableDetail(detail)
     ?? normalizeConnectedServiceUxDiagnosticDetail(detail);
 }
 

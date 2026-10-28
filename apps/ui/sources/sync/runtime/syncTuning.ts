@@ -85,8 +85,6 @@ export type SyncTuning = Readonly<{
     messageCatchUpConcurrencyLimit: number;
     sessionListHydrationConcurrencyLimit: number;
     machineDisplayHydrationConcurrencyLimit: number;
-    machineDisplayEagerHydrationCount: number;
-    machineDisplayBackgroundHydrationMaxRows: number;
     machineDisplayBackgroundHydrationApplyBatchSize: number;
     feedItemsRetentionMaxCount: number;
     artifactHeadsRetentionMaxCount: number;
@@ -354,8 +352,6 @@ export function loadSyncTuning(opts?: {
         messageCatchUpConcurrencyLimit: 1,
         sessionListHydrationConcurrencyLimit: 4,
         machineDisplayHydrationConcurrencyLimit: 4,
-        machineDisplayEagerHydrationCount: 4,
-        machineDisplayBackgroundHydrationMaxRows: 0,
         machineDisplayBackgroundHydrationApplyBatchSize: 4,
         feedItemsRetentionMaxCount: 500,
         artifactHeadsRetentionMaxCount: 1000,
@@ -468,8 +464,6 @@ export function loadSyncTuning(opts?: {
         messageCatchUpConcurrencyLimit: readNumber(merged, 'messageCatchUpConcurrencyLimit', { min: 1, max: 10 }) ?? defaults.messageCatchUpConcurrencyLimit,
         sessionListHydrationConcurrencyLimit: readNumber(merged, 'sessionListHydrationConcurrencyLimit', { min: 1, max: 20 }) ?? defaults.sessionListHydrationConcurrencyLimit,
         machineDisplayHydrationConcurrencyLimit: readNumber(merged, 'machineDisplayHydrationConcurrencyLimit', { min: 1, max: 20 }) ?? defaults.machineDisplayHydrationConcurrencyLimit,
-        machineDisplayEagerHydrationCount: readNumber(merged, 'machineDisplayEagerHydrationCount', { min: 0, max: 200 }) ?? defaults.machineDisplayEagerHydrationCount,
-        machineDisplayBackgroundHydrationMaxRows: readNumber(merged, 'machineDisplayBackgroundHydrationMaxRows', { min: 0, max: 200 }) ?? defaults.machineDisplayBackgroundHydrationMaxRows,
         machineDisplayBackgroundHydrationApplyBatchSize: readNumber(merged, 'machineDisplayBackgroundHydrationApplyBatchSize', { min: 1, max: 20 }) ?? defaults.machineDisplayBackgroundHydrationApplyBatchSize,
         feedItemsRetentionMaxCount: readNumber(merged, 'feedItemsRetentionMaxCount', { min: 1, max: 10_000 }) ?? defaults.feedItemsRetentionMaxCount,
         artifactHeadsRetentionMaxCount: readNumber(merged, 'artifactHeadsRetentionMaxCount', { min: 1, max: 10_000 }) ?? defaults.artifactHeadsRetentionMaxCount,

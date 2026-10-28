@@ -1,7 +1,9 @@
 import type {
   DirectSessionTranscriptDeltaEphemeral,
   DirectTranscriptRawMessageV1,
+  DirectTranscriptTruncationReason,
 } from '@happier-dev/protocol';
+import { resolveDirectTranscriptContinuation } from '@happier-dev/protocol';
 
 import { dispatchActivityNotificationAsync } from '@/activity/notifications/dispatchActivityNotification';
 import { readCredentials, type Credentials } from '@/persistence';
@@ -19,6 +21,7 @@ export type DirectSessionTranscriptUpdate = Readonly<{
   fromCursor?: string | null;
   nextCursor?: string | null;
   truncated: boolean;
+  truncationReason?: DirectTranscriptTruncationReason;
 }>;
 
 export type DirectSessionTranscriptUpdateListener = (
@@ -108,6 +111,7 @@ export async function createManagedDirectSessionFollowLease(params: Readonly<{
           sessionId: params.sessionId,
           items: Array.from(update.items),
           truncated: update.truncated,
+          ...(update.truncationReason ? { truncationReason: update.truncationReason } : {}),
         };
         if (update.fromCursor !== undefined) {
           payload.fromCursor = update.fromCursor;
@@ -128,6 +132,10 @@ export async function createManagedDirectSessionFollowLease(params: Readonly<{
     }
 
     const items = Array.from(update.items);
+    // Cursor/control frames are forwarded above but are not observed transcript activity.
+    if (items.length === 0 || resolveDirectTranscriptContinuation(update) === 'source_discontinuity') {
+      return;
+    }
     const metadataContext = await resolveCachedMetadataWriteContext().catch(() => null);
     const observedProgress = deriveDirectSessionObservedProgress(items);
     const lastKnownActivityAtMs = observedProgress?.atMs ?? null;

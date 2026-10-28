@@ -17,7 +17,6 @@ import { codexAppServerCatalogControlAdapter } from '@/backends/codex/appServer/
 import { codexAppServerGoalControlAdapter } from '@/backends/codex/appServer/goalControl/codexAppServerGoalControlAdapter';
 import { codexAppServerUsageLimitRecoveryControlAdapter } from '@/backends/codex/appServer/usageLimitRecoveryControl/codexAppServerUsageLimitRecoveryControlAdapter';
 import { buildCodexRuntimeLocalHandoffMetadata } from '@/backends/codex/sessionHandoff/runtimeLocalMetadata';
-import { reconcileStableCodexHomesAtStartup } from '@/backends/codex/connectedServices/reconcileStableCodexHomes';
 import type { AgentCatalogEntry } from '../types';
 import type { ConnectedServiceCredentialLifecycleDescriptor } from '@/daemon/connectedServices/credentials/lifecycleTypes';
 import type { ConnectedServiceBindingsV1 } from '@happier-dev/protocol';
@@ -48,11 +47,6 @@ const codexConnectedServiceCredentialLifecycleDescriptor: ConnectedServiceCreden
     reason: 'diagnostic',
     authGeneration: currentTruth,
   }),
-  materializedHomeMaintenance: {
-    // Triage #4: stable codex homes are not refresh-target bound, so nothing else keeps their auth
-    // store format-valid or in sync with the store record. The startup reconcile owner drives this.
-    reconcileStableHomesAtStartup: reconcileStableCodexHomesAtStartup,
-  },
 };
 
 function resolveCodexProbeConnectedServicesIdentity(
@@ -91,11 +85,14 @@ export const agent = {
     await (await import('@/backends/codex/utils/resolveCodexNativeSessionLogPath'))
       .resolveCodexNativeSessionLogPath({ vendorResumeId }),
   getDirectSessionProviderOps: async () => (await import('@/backends/codex/directSessions/providerOps')).codexDirectSessionProviderOps,
+  getProviderAttachOps: async () => (await import('@/backends/codex/attach/providerAttachOps')).codexProviderAttachOps,
   getSessionGoalControlAdapter: async () => codexAppServerGoalControlAdapter,
   getSessionCatalogControlAdapter: async () => codexAppServerCatalogControlAdapter,
   getSessionUsageLimitRecoveryControlAdapter: async () => codexAppServerUsageLimitRecoveryControlAdapter,
   vendorResumeSupport: AGENTS_CORE.codex.resume.vendorResume,
   buildRuntimeLocalHandoffMetadata: buildCodexRuntimeLocalHandoffMetadata,
+  resolveExistingSessionHandoffState: async (params) =>
+    await (await import('./sessionHandoff/resolveExistingSessionHandoffState')).resolveExistingCodexSessionHandoffState(params),
   getVendorResumeSupport: async () => supportsCodexVendorResume,
   getAcpBackendFactory: async () => {
     const { createCodexAcpBackend } = await import('@/backends/codex/acp/backend');

@@ -1,14 +1,8 @@
 import {
   getActionSpec,
-  isApprovalRequiredByActionsSettings,
   listActionSpecs,
-  resolveActionApprovalRouting,
-  type AccountSettings,
   type ActionId,
-  type ActionSurfaces,
 } from '@happier-dev/protocol';
-
-import { isActionApprovalRequiredByEnv } from '@/settings/actionsSettings';
 
 import { getEquivalentActionIdForBuiltInTool } from './actionToolCatalog';
 
@@ -45,28 +39,17 @@ export function resolveHappierActionForMcpToolName(params: Readonly<{
   return getEquivalentActionIdForBuiltInTool(firstPartyToolName);
 }
 
-export function shouldSuppressProviderPermissionForHappierApproval(params: Readonly<{
+/**
+ * Whether this provider-facing tool call is only the transport wrapper for a
+ * known safe first-party Action. Admitting that wrapper does not admit the
+ * Action: the canonical Action executor still owns enablement and configured
+ * approval. Danger-classified and opaque Action calls stay with provider
+ * permission handling.
+ */
+export function isSafeFirstPartyHappierActionToolCall(params: Readonly<{
   toolName: string;
   input: unknown;
-  accountSettings?: Pick<AccountSettings, 'actionsSettingsV1'> | null;
-  surface: keyof ActionSurfaces;
-}>): Readonly<{ suppress: boolean; actionId: ActionId | null }> {
-  const actionId = resolveHappierActionForMcpToolName({
-    toolName: params.toolName,
-    input: params.input,
-  });
-  if (!actionId) return { suppress: false, actionId: null };
-
-  const settings = params.accountSettings?.actionsSettingsV1 ?? null;
-  const required = settings
-    ? isApprovalRequiredByActionsSettings(actionId, settings, { surface: params.surface })
-    : isActionApprovalRequiredByEnv(actionId, { surface: params.surface });
-  const routing = resolveActionApprovalRouting({
-    actionId,
-    spec: getActionSpec(actionId),
-    context: { surface: params.surface },
-    requiredByPolicy: required,
-  });
-
-  return { suppress: routing.required, actionId };
+}>): boolean {
+  const actionId = resolveHappierActionForMcpToolName(params);
+  return actionId !== null && getActionSpec(actionId).safety === 'safe';
 }

@@ -52,6 +52,7 @@ const DEFAULT_INPUT_STABILITY_DELAY_MS = 50;
  */
 const LIVENESS_INSPECTION_FRESHNESS_MS = 100;
 const DEFAULT_ACTION_TIMEOUT_MS = 15_000;
+export const DEFAULT_ZELLIJ_STARTUP_ACTION_TIMEOUT_MS = 60_000;
 const DEFAULT_LAUNCH_PANE_DISCOVERY_POLL_MS = 50;
 const DEFAULT_SESSION_DISCOVERY_ACTION_TIMEOUT_MS = 1_000;
 const MAX_LIVENESS_SCREEN_DUMP_CHARS = 2_000;
@@ -560,8 +561,8 @@ export async function disposeZellijSession(params: Readonly<{
     runnerPid: process.pid,
     callSite: 'integrations.zellij.adapter.dispose',
   };
-  const warn = (action: 'kill-session' | 'delete-session', error: unknown): void => {
-    logger.warn(`[zellij teardown] ${action} failed; continuing best-effort teardown`, {
+  const warn = (action: 'kill-session' | 'delete-session', _error: unknown): void => {
+    logger.infoFile(`[zellij teardown] ${action} failed; continuing best-effort teardown`, {
       action,
       actor: audit.actor,
       reason: audit.reason,
@@ -569,7 +570,7 @@ export async function disposeZellijSession(params: Readonly<{
       sessionId: audit.sessionId,
       runnerPid: audit.runnerPid,
       sessionName: params.sessionName,
-      error,
+      cleanupIncomplete: true,
     });
   };
   const recordAudit = (action: 'kill-session' | 'delete-session'): void => {
@@ -655,6 +656,7 @@ async function cleanupZellijSessionAndRethrowStartupError(params: Readonly<{
   env: Readonly<Record<string, string>>;
   sessionName: string;
   actionTimeoutMs: number;
+  cleanupActionTimeoutMs?: number;
   error: unknown;
 }>): Promise<never> {
   const startupError = normalizeZellijStartupError({
@@ -662,12 +664,12 @@ async function cleanupZellijSessionAndRethrowStartupError(params: Readonly<{
     sessionName: params.sessionName,
     actionTimeoutMs: params.actionTimeoutMs,
   });
-  await disposeZellijSession({
+  const cleanup = await disposeZellijSession({
     actions: params.actions,
     zellijBinary: params.zellijBinary,
     env: params.env,
     sessionName: params.sessionName,
-    actionTimeoutMs: params.actionTimeoutMs,
+    actionTimeoutMs: params.cleanupActionTimeoutMs ?? params.actionTimeoutMs,
     audit: {
       actor: 'zellij.adapter',
       reason: 'startup-cleanup',
@@ -676,6 +678,19 @@ async function cleanupZellijSessionAndRethrowStartupError(params: Readonly<{
       callSite: 'integrations.zellij.adapter.startupCleanup',
     },
   });
+  if (isTerminalHostStartupError(startupError)) {
+    throw new TerminalHostStartupError({
+      hostKind: startupError.hostKind,
+      reason: startupError.reason,
+      message: startupError.message,
+      diagnostics: startupError.diagnostics,
+      cause: startupError,
+      launchFailure: {
+        launchDisposition: cleanup.killCompleted ? 'stopped' : 'unconfirmed',
+        cleanupIncomplete: !cleanup.killCompleted || !cleanup.deleteCompleted,
+      },
+    });
+  }
   throw startupError;
 }
 
@@ -930,6 +945,7 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
   pasteMaxBytes?: number;
   inputStabilityDelayMs?: number;
   actionTimeoutMs?: number;
+  startupActionTimeoutMs?: number;
   promptSubmitVerification?: TerminalPromptSubmitVerificationPolicy | undefined;
   prepareSocketDir?: ((socketDir: string) => Promise<void>) | undefined;
   inspectSocketPresence?: InspectZellijSessionSocketPresence | undefined;
@@ -938,6 +954,9 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
   const prepareSocketDir = params.prepareSocketDir ?? prepareZellijSocketDir;
   const inspectSocketPresence = params.inspectSocketPresence ?? inspectZellijSessionSocketPresence;
   const actionTimeoutMs = Math.max(1, Math.trunc(params.actionTimeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS));
+  const startupActionTimeoutMs = Math.max(1, Math.trunc(
+    params.startupActionTimeoutMs ?? params.actionTimeoutMs ?? DEFAULT_ZELLIJ_STARTUP_ACTION_TIMEOUT_MS,
+  ));
   const pasteMaxBytes = Math.max(0, Math.trunc(params.pasteMaxBytes ?? resolveZellijActionPasteSafeBytes()));
   const promptSubmitVerification = params.promptSubmitVerification;
   const env: Readonly<Record<string, string>> = {
@@ -1103,6 +1122,9 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
 
   const createOrAttachHost: TerminalHostAdapter['createOrAttachHost'] = async (opts) => {
     await prepareSocketDir(env.ZELLIJ_SOCKET_DIR);
+    // Zellij panes inherit the server environment, not the later `run` client's environment.
+    // Use the same launch values when creating either kind of server and its command pane.
+    const launchEnv = { ...env, ...opts.spawnEnv };
     const launchStrategy = params.launchStrategy ?? { type: 'background' };
     let activeSessionName = opts.sessionName;
     let collisionMayBelongToAnotherRunner = false;
@@ -1110,11 +1132,11 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
       if (launchStrategy.type === 'background') {
         const attachCreateBackground = () => actions.attachCreateBackground({
           zellijBinary: params.zellijBinary,
-          env,
+          env: launchEnv,
           sessionName: activeSessionName,
           cwd: opts.workingDirectory,
           ...(params.defaultShell ? { defaultShell: params.defaultShell } : {}),
-          timeoutMs: actionTimeoutMs,
+          timeoutMs: startupActionTimeoutMs,
         });
         let result = await attachCreateBackground();
         if (
@@ -1126,7 +1148,7 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
             const panes = await actions.listPanes({
               zellijBinary: params.zellijBinary,
               env: sessionEnv(env, activeSessionName),
-              timeoutMs: actionTimeoutMs,
+              timeoutMs: startupActionTimeoutMs,
             });
             collisionConfirmedDead = isZellijCollisionSessionConfirmedDead(panes);
           } catch (error) {
@@ -1165,7 +1187,7 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
           const startupError = createZellijStartupActionFailedError({
             action: 'attach',
             sessionName: activeSessionName,
-            actionTimeoutMs,
+            actionTimeoutMs: startupActionTimeoutMs,
             cmd: buildZellijAttachCreateBackgroundCmd({
               zellijBinary: params.zellijBinary,
               sessionName: activeSessionName,
@@ -1181,18 +1203,19 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
             zellijBinary: params.zellijBinary,
             env,
             sessionName: activeSessionName,
-            actionTimeoutMs,
+            actionTimeoutMs: startupActionTimeoutMs,
+            cleanupActionTimeoutMs: actionTimeoutMs,
             error: startupError,
           });
         }
       } else {
         await launchStrategy.launchClient({
           zellijBinary: params.zellijBinary,
-          env,
+          env: launchEnv,
           sessionName: activeSessionName,
           cwd: opts.workingDirectory,
           ...(params.defaultShell ? { defaultShell: params.defaultShell } : {}),
-          timeoutMs: actionTimeoutMs,
+          timeoutMs: startupActionTimeoutMs,
         });
       }
     } catch (error) {
@@ -1202,7 +1225,8 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
         zellijBinary: params.zellijBinary,
         env,
         sessionName: activeSessionName,
-        actionTimeoutMs,
+        actionTimeoutMs: startupActionTimeoutMs,
+        cleanupActionTimeoutMs: actionTimeoutMs,
         error,
       });
     }
@@ -1214,7 +1238,7 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
           zellijBinary: params.zellijBinary,
           env,
           sessionName: activeSessionName,
-          actionTimeoutMs,
+          actionTimeoutMs: startupActionTimeoutMs,
         })).flatMap((pane) => {
           const paneId = resolveTerminalPaneActionId(pane);
           return paneId === null ? [] : [paneId];
@@ -1226,7 +1250,8 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
         zellijBinary: params.zellijBinary,
         env,
         sessionName: activeSessionName,
-        actionTimeoutMs,
+        actionTimeoutMs: startupActionTimeoutMs,
+        cleanupActionTimeoutMs: actionTimeoutMs,
         error,
       });
     }
@@ -1240,14 +1265,11 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
         try {
           runResult = await actions.runCommand({
             zellijBinary: params.zellijBinary,
-            env: {
-              ...env,
-              ...opts.spawnEnv,
-            },
+            env: launchEnv,
             sessionName: activeSessionName,
             cwd: opts.workingDirectory,
             command: opts.spawnArgv,
-            timeoutMs: actionTimeoutMs,
+            timeoutMs: startupActionTimeoutMs,
           });
         } catch (error) {
           return cleanupZellijSessionAndRethrowStartupError({
@@ -1255,7 +1277,8 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
             zellijBinary: params.zellijBinary,
             env,
             sessionName: activeSessionName,
-            actionTimeoutMs,
+            actionTimeoutMs: startupActionTimeoutMs,
+            cleanupActionTimeoutMs: actionTimeoutMs,
             error,
           });
         }
@@ -1265,11 +1288,12 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
             zellijBinary: params.zellijBinary,
             env,
             sessionName: activeSessionName,
-            actionTimeoutMs,
+            actionTimeoutMs: startupActionTimeoutMs,
+            cleanupActionTimeoutMs: actionTimeoutMs,
             error: createZellijStartupActionFailedError({
               action: 'run',
               sessionName: activeSessionName,
-              actionTimeoutMs,
+              actionTimeoutMs: startupActionTimeoutMs,
               cmd: buildZellijRunCommandCmd({
                 zellijBinary: params.zellijBinary,
                 sessionName: activeSessionName,
@@ -1288,14 +1312,11 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
         }
         detachedCommandHandle = await actions.startCommandDetached({
           zellijBinary: params.zellijBinary,
-          env: {
-            ...env,
-            ...opts.spawnEnv,
-          },
+          env: launchEnv,
           sessionName: activeSessionName,
           cwd: opts.workingDirectory,
           command: opts.spawnArgv,
-          timeoutMs: actionTimeoutMs,
+          timeoutMs: startupActionTimeoutMs,
         });
       }
       let launchedPane: { paneId: string; panes: readonly ZellijPane[] };
@@ -1307,7 +1328,7 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
           sessionName: activeSessionName,
           paneIdFromRun,
           preExistingPaneIds,
-          actionTimeoutMs,
+          actionTimeoutMs: startupActionTimeoutMs,
         });
       } finally {
         detachedCommandHandle?.dispose();
@@ -1321,7 +1342,7 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
         preExistingPaneIds,
         initialPanes: launchedPane.panes,
         expectedCommandFragments,
-        actionTimeoutMs,
+        actionTimeoutMs: startupActionTimeoutMs,
       });
       const currentPaneId = resolvePostCleanupCommandPaneId({
         previousPaneId: paneId,
@@ -1348,7 +1369,8 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
         zellijBinary: params.zellijBinary,
         env,
         sessionName: activeSessionName,
-        actionTimeoutMs,
+        actionTimeoutMs: startupActionTimeoutMs,
+        cleanupActionTimeoutMs: actionTimeoutMs,
         error,
       });
     }
@@ -1515,12 +1537,14 @@ export function createZellijTerminalHostAdapter(params: Readonly<{
         // Prompt staging/Enter is a separate terminal operation from the completed paste/write.
         // Give it its own bounded clock so a loaded host cannot consume the submission budget.
         const submissionDeadline = createTerminalHostDeadline(
-          input.scheduling.timeoutMs ?? actionTimeoutMs,
+          injectionTimeoutMs,
         );
         failurePhase = 'after_enter_unknown';
         duplicateRisk = 'likely';
         const submission = await runTerminalPromptSubmission({
           promptText: textToWrite,
+          signal: input.signal,
+          resolveDeliveryState: input.resolveDeliveryState,
           ...(promptSubmitVerification?.shouldVerifyAfterSubmit(textToWrite)
             ? {
               verifyStagedBeforeSubmit: async ({ promptText, remainingTimeoutMs }) => {

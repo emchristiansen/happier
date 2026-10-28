@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { resolve as resolveMetro, type ResolutionContext } from 'metro-resolver';
 
 const require = createRequire(import.meta.url);
 
@@ -67,6 +69,79 @@ async function loadMetroConfigWithSentryFactory(
 }
 
 describe('metro.config.js (web)', () => {
+    it.each(['ios', 'android', 'web'])('resolves React runtime peers from the app on %s despite nested copies', (platform) => {
+        const uiDir = getUiDir();
+        const config = loadMetroConfig();
+        const fixture = realpathSync(mkdtempSync(join(tmpdir(), 'happier-metro-peers-')));
+        try {
+            // Real filesystem boundary and real Metro resolver: nested packages reproduce
+            // Yarn's hoisted native dependencies carrying their own runtime peers.
+            for (const name of ['react', 'react-dom', 'react-native', 'unrelated-peer']) {
+                const root = join(fixture, 'node_modules', name);
+                mkdirSync(root, { recursive: true });
+                writeFileSync(join(root, 'package.json'), JSON.stringify({ name, main: 'index.js' }));
+                writeFileSync(join(root, 'index.js'), 'module.exports = {};');
+                if (name === 'react') writeFileSync(join(root, 'jsx-runtime.js'), 'module.exports = {};');
+                if (name === 'react-dom') writeFileSync(join(root, 'client.js'), 'module.exports = {};');
+            }
+            const context: ResolutionContext = {
+                ...config.resolver,
+                allowHaste: false,
+                assetExts: new Set(config.resolver.assetExts),
+                customResolverOptions: Object.create(null),
+                dev: true,
+                mainFields: config.resolver.resolverMainFields,
+                nodeModulesPaths: config.resolver.nodeModulesPaths ?? [],
+                originModulePath: join(fixture, 'index.js'),
+                preferNativePlatform: platform !== 'web',
+                resolveRequest: resolveMetro,
+                doesFileExist: existsSync,
+                fileSystemLookup(filePath) {
+                    if (!existsSync(filePath)) return { exists: false };
+                    return { exists: true, type: statSync(filePath).isDirectory() ? 'd' : 'f', realPath: realpathSync(filePath) };
+                },
+                getPackage(filePath) {
+                    return existsSync(filePath) ? JSON.parse(readFileSync(filePath, 'utf8')) : null;
+                },
+                getPackageForModule(filePath) {
+                    for (let dir = dirname(filePath); dirname(dir) !== dir; dir = dirname(dir)) {
+                        const manifest = join(dir, 'package.json');
+                        if (existsSync(manifest)) return { rootPath: dir, packageRelativePath: relative(dir, filePath), packageJson: JSON.parse(readFileSync(manifest, 'utf8')) };
+                        if (dir.endsWith('node_modules')) break;
+                    }
+                    return null;
+                },
+                resolveAsset: () => null,
+                resolveHasteModule: () => null,
+                resolveHastePackage: () => null,
+                redirectModulePath: (modulePath) => modulePath,
+                unstable_logWarning: (message) => { throw new Error(message); },
+            };
+            const appRequire = createRequire(join(uiDir, 'package.json'));
+            expect(resolveMetro(context, 'react', platform)).toEqual({
+                type: 'sourceFile', filePath: join(fixture, 'node_modules', 'react', 'index.js'),
+            });
+            for (const name of ['react', 'react/jsx-runtime', ...(platform === 'web' ? ['react-dom', 'react-dom/client'] : ['react-native'])]) {
+                expect(config.resolver.resolveRequest(context, name, platform)).toEqual({
+                    type: 'sourceFile', filePath: realpathSync(appRequire.resolve(name)),
+                });
+            }
+            if (platform !== 'web') {
+                const subpath = 'react-native/Libraries/Utilities/Platform';
+                // Preserve the installed package's exports behavior, including its priority
+                // over platform suffixes, rather than resolving this private file with Node.
+                expect(config.resolver.resolveRequest(context, subpath, platform)).toEqual(
+                    resolveMetro({ ...context, originModulePath: join(uiDir, 'index.ts') }, subpath, platform),
+                );
+            }
+            expect(config.resolver.resolveRequest(context, 'unrelated-peer', platform)).toEqual({
+                type: 'sourceFile', filePath: join(fixture, 'node_modules', 'unrelated-peer', 'index.js'),
+            });
+        } finally {
+            rmSync(fixture, { recursive: true, force: true });
+        }
+    });
+
     it('blocks generated CLI runner snapshots without hiding CLI source', () => {
         const uiDir = getUiDir();
         const repoRoot = resolve(uiDir, '..', '..');

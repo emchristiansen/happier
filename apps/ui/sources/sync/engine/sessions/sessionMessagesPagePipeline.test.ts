@@ -70,6 +70,50 @@ describe('runSessionMessagesPagePipeline', () => {
         syncPerformanceTelemetry.reset();
     });
 
+    it.each(['rejected', 'unresolved'] as const)('does not certify or consume a %s encrypted page and retries the same rows', async (failure) => {
+        const message = buildEncryptedApiMessage({ id: 'm101', seq: 101 });
+        const received = new Map<string, Map<string, number>>();
+        const applied: NormalizedMessage[] = [];
+        let materializedSeq = 100;
+        let appliedIdsAtCommit: string[] = [];
+        let failDecryption = true;
+        const params: Parameters<typeof runSessionMessagesPagePipeline>[0] = {
+            sessionId: 's1',
+            purpose: 'newer',
+            page: { direction: 'newer', requestPath: '/v1/sessions/s1/messages?afterSeq=100', scope: 'main' },
+            lifecyclePolicy: 'suppress',
+            getSessionEncryption: () => ({
+                decryptMessages: async (messages) => {
+                    if (failDecryption) {
+                        if (failure === 'rejected') throw new Error('Decryption unavailable');
+                        return messages.map(() => null);
+                    }
+                    return messages.map((row) => buildTextContent(row));
+                },
+            }),
+            request: async () => new Response(JSON.stringify({ messages: [message], nextAfterSeq: null })),
+            sessionReceivedMessages: received,
+            applyMessages: (_sessionId, messages) => { applied.push(...messages); },
+            onMessagesPage: (page) => {
+                appliedIdsAtCommit = applied.map((row) => row.id);
+                materializedSeq = page.messages[0].seq;
+            },
+            log: { log: () => {} },
+        };
+
+        await expect(runSessionMessagesPagePipeline(params)).rejects.toThrow();
+        expect(materializedSeq).toBe(100);
+        expect(received.get('s1')?.has('m101') ?? false).toBe(false);
+        expect(applied).toEqual([]);
+
+        failDecryption = false;
+        await runSessionMessagesPagePipeline(params);
+        expect(materializedSeq).toBe(101);
+        expect(appliedIdsAtCommit).toEqual(['m101']);
+        expect(received.get('s1')?.get('m101')).toBe(message.updatedAt);
+        expect(applied.map((row) => row.id)).toEqual(['m101']);
+    });
+
     it('preserves older-page decrypt order, sidechain metadata, and pre-apply normalized callback semantics', async () => {
         const newest = buildEncryptedApiMessage({ id: 'm100', seq: 100 });
         const oldest = buildEncryptedApiMessage({ id: 'm99', seq: 99 });
@@ -131,6 +175,26 @@ describe('runSessionMessagesPagePipeline', () => {
                 nextBeforeSeq: 98,
             },
         });
+    });
+
+    it('repairs only selected identities without applying or consuming neighboring page rows', async () => {
+        const selected = buildEncryptedApiMessage({ id: 'selected', seq: 15 });
+        const neighbor = buildEncryptedApiMessage({ id: 'neighbor', seq: 9000 });
+        const received = new Map<string, Map<string, number>>();
+        const result = await runSessionMessagesPagePipeline({
+            sessionId: 's1',
+            purpose: 'newer',
+            page: { direction: 'newer', requestPath: '/v1/sessions/s1/messages?afterSeq=14', scope: 'all' },
+            lifecyclePolicy: 'suppress',
+            messageIds: new Set(['selected']),
+            getSessionEncryption: () => ({ decryptMessages: async (messages) => messages.map((row) => buildTextContent(row)) }),
+            request: async () => new Response(JSON.stringify({ messages: [selected, neighbor], nextAfterSeq: null })),
+            sessionReceivedMessages: received,
+            applyMessages: () => {},
+            log: { log: () => {} },
+        });
+        expect(result.appliedMessageIds).toEqual(['selected']);
+        expect([...received.get('s1')!.keys()]).toEqual(['selected']);
     });
 
     it('preserves authenticated transcript-observation metadata on normalized page messages', async () => {

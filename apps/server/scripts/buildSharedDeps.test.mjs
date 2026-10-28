@@ -30,6 +30,10 @@ test('server shared prerequisite adapter passes its package root and caller envi
   assert.deepEqual(result, { ok: true, built: [], skipped: [] });
 });
 
+test('server build delegates generated-client preparation to the canonical postinstall owner', () => {
+  assert.match(packageJson.scripts.prebuild, /\bpostinstall:real\b/);
+});
+
 test('server lifecycle retains shared runtime preparation and schema verification for executing tests', () => {
   assert.match(packageJson.scripts.pretest, /\bbuild:shared\b/);
   assert.match(packageJson.scripts.pretest, /\bschema:sync:check\b/);

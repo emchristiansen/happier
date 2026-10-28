@@ -2,9 +2,210 @@ import { describe, expect, it } from 'vitest';
 
 import { GENERIC_CONTINUATION_RESUME_PROMPT } from '@/daemon/connectedServices/continuation/continuationResumePrompt';
 import type { RawJSONLines } from '../types';
+import { createClaudeUnifiedInputArbiter } from './createClaudeUnifiedInputArbiter';
+import { createClaudeUnifiedHookLifecycleBridge } from './createClaudeUnifiedHookLifecycleBridge';
+import { doesClaudeUnifiedPromptBatchMatchAcceptedTranscript } from './acceptedPromptDeliveryIdentity';
 import { createClaudeUnifiedAcceptedPromptTranscriptDiscovery } from './acceptedPromptTranscriptDiscovery';
 
 describe('createClaudeUnifiedAcceptedPromptTranscriptDiscovery', () => {
+  // Claude Code 2.1.302, isolated native probe with respondToBashCommands:false:
+  // caveat -> bash input -> bash output share promptId and link through parentUuid.
+  function shellRows(command = ' echo hi') {
+    const common = { type: 'user', promptId: 'shell-prompt', sessionId: 'shell-session', timestamp: new Date(2_050).toISOString() } as const;
+    return {
+      caveat: { ...common, uuid: 'shell-caveat', isMeta: true,
+        message: { role: 'user', content: '<local-command-caveat>The command output goes directly to the user.</local-command-caveat>' } } satisfies RawJSONLines,
+      input: { ...common, uuid: 'shell-input', parentUuid: 'shell-caveat',
+        message: { role: 'user', content: `<bash-input>${command}</bash-input>` } } satisfies RawJSONLines,
+      output: { ...common, uuid: 'shell-output', parentUuid: 'shell-input',
+        message: { role: 'user', content: '<bash-stdout>hi\n</bash-stdout><bash-stderr></bash-stderr>' } } satisfies RawJSONLines,
+    };
+  }
+
+  it.each([' echo hi', 'echo hi'])('accepts exact native bash input and completes a local command once (%j)', (command) => {
+    const completed: string[] = [];
+    const consumed: RawJSONLines[] = [];
+    const discovery = createClaudeUnifiedAcceptedPromptTranscriptDiscovery({
+      acceptedPromptWindowMs: 5_000, nowMs: () => 2_000,
+      onControlCommandConsumed: (message) => { consumed.push(message); },
+      onAttemptLocalCommandCompleted: ({ acceptedPromptId }) => { completed.push(acceptedPromptId); },
+    });
+    const id = discovery.recordAcceptedPrompt({ message: `!${command}`, deliveryIdentity: { localIds: ['shell-local-id'] } });
+    const rows = shellRows(command);
+    discovery.observeControlCommandTranscript(rows.caveat);
+    discovery.observeControlCommandTranscript(rows.input);
+    discovery.observeControlCommandTranscript(rows.output);
+    expect(completed).toEqual([]);
+    const match = discovery.findMatchingTranscript([rows.input]);
+    expect(match).toMatchObject({ acceptedPromptId: id, deliveryIdentity: { localIds: ['shell-local-id'] } });
+    expect(match && discovery.consumeAcceptedPromptMatch(match)).toBe(true);
+    expect(completed).toEqual([id]);
+    discovery.observeControlCommandTranscript(rows.output);
+    expect(completed).toEqual([id]);
+    expect(discovery.findMatchingTranscript([rows.input])).toBeNull();
+    expect(consumed).not.toContain(rows.input);
+    expect(consumed).not.toContain(rows.output);
+  });
+
+  it.each(['inference', 'unrelated_caveat', 'sidechain_caveat', 'peer_caveat'] as const)(
+    'keeps shell completion on provider lifecycle without its own main-chain caveat (%s)', (scenario) => {
+      const completed: string[] = [];
+      const discovery = createClaudeUnifiedAcceptedPromptTranscriptDiscovery({
+        acceptedPromptWindowMs: 5_000, nowMs: () => 2_000,
+        onAttemptLocalCommandCompleted: ({ acceptedPromptId }) => { completed.push(acceptedPromptId); },
+      });
+      discovery.recordAcceptedPrompt({ message: '! echo hi', deliveryIdentity: { localIds: ['shell-local-id'] } });
+      const rows = shellRows();
+      if (scenario === 'unrelated_caveat') discovery.observeControlCommandTranscript({ ...rows.caveat, uuid: 'another-command-caveat' });
+      if (scenario === 'sidechain_caveat') discovery.observeControlCommandTranscript({ ...rows.caveat, isSidechain: true });
+      if (scenario === 'peer_caveat') discovery.observeControlCommandTranscript({ ...rows.caveat, origin: { kind: 'peer' } });
+      const match = discovery.findMatchingTranscript([rows.input]);
+      expect(match).not.toBeNull();
+      expect(match && discovery.consumeAcceptedPromptMatch(match)).toBe(true);
+      discovery.observeControlCommandTranscript(rows.output);
+      expect(completed).toEqual([]);
+    },
+  );
+
+  it.each(['sidechain', 'peer'] as const)('rejects foreign bash input as primary delivery evidence (%s)', (origin) => {
+    const discovery = createClaudeUnifiedAcceptedPromptTranscriptDiscovery({ acceptedPromptWindowMs: 5_000, nowMs: () => 2_000 });
+    discovery.recordAcceptedPrompt({ message: '! echo hi', deliveryIdentity: { localIds: ['shell-local-id'] } });
+    const rows = shellRows();
+    const input = origin === 'sidechain' ? { ...rows.input, isSidechain: true } : { ...rows.input, origin: { kind: 'peer' } };
+    expect(discovery.observeControlCommandTranscript(input)).toBe(false);
+    expect(discovery.findMatchingTranscript([input])).toBeNull();
+  });
+
+  it('does not accept a meta shell row as human delivery evidence', () => {
+    const discovery = createClaudeUnifiedAcceptedPromptTranscriptDiscovery({ acceptedPromptWindowMs: 5_000, nowMs: () => 2_000 });
+    discovery.recordAcceptedPrompt({ message: '! echo hi', deliveryIdentity: { localIds: ['shell-local-id'] } });
+    expect(discovery.findMatchingTranscript([{ ...shellRows().input, isMeta: true }])).toBeNull();
+  });
+
+  it.each(['unrelated_parent', 'sidechain', 'peer'] as const)('does not let foreign shell output complete a local attempt (%s)', (origin) => {
+    const completed: string[] = [];
+    const discovery = createClaudeUnifiedAcceptedPromptTranscriptDiscovery({
+      acceptedPromptWindowMs: 5_000, nowMs: () => 2_000,
+      onAttemptLocalCommandCompleted: ({ acceptedPromptId }) => { completed.push(acceptedPromptId); },
+    });
+    discovery.recordAcceptedPrompt({ message: '! echo hi', deliveryIdentity: { localIds: ['shell-local-id'] } });
+    const rows = shellRows();
+    discovery.observeControlCommandTranscript(rows.caveat);
+    const match = discovery.findMatchingTranscript([rows.input]);
+    expect(match && discovery.consumeAcceptedPromptMatch(match)).toBe(true);
+    const output = origin === 'unrelated_parent' ? { ...rows.output, parentUuid: 'another-shell-input' }
+      : origin === 'sidechain' ? { ...rows.output, isSidechain: true }
+        : { ...rows.output, origin: { kind: 'peer' } };
+    discovery.observeControlCommandTranscript(output);
+    expect(completed).toEqual([]);
+  });
+
+  it.each(['early_output', 'long_output_before_acceptance', 'long_output_after_acceptance'] as const)(
+    'settles shell delivery and allows the following prompt after %s', async (timing) => {
+    let nowMs = 2_000;
+    const injected: string[] = [];
+    const accepted: string[] = [];
+    let completed = 0;
+    let completion: Promise<void> | undefined;
+    let bridge: ReturnType<typeof createClaudeUnifiedHookLifecycleBridge> | undefined;
+    const discovery = createClaudeUnifiedAcceptedPromptTranscriptDiscovery({
+      acceptedPromptWindowMs: 5_000, nowMs: () => nowMs,
+      onAttemptLocalCommandCompleted: () => { completion = bridge?.settleAttemptLocalCommandCompleted(); return completion; },
+    });
+    const arbiter = createClaudeUnifiedInputArbiter({
+      nowMs: () => nowMs, quietPeriodMs: 0,
+      injectPrompt: async (batch) => {
+        injected.push(batch.message);
+        if (batch.message === '! echo hi') {
+          // File-follow evidence may precede completion of the terminal write.
+          const rows = shellRows();
+          discovery.observeControlCommandTranscript(rows.caveat);
+          discovery.observeControlCommandTranscript(rows.input);
+          if (timing === 'early_output') discovery.observeControlCommandTranscript(rows.output);
+        }
+        return { status: 'injected', at: 2_000, bytesWritten: batch.message.length };
+      },
+      onProviderAcceptancePending: (batch) => { discovery.recordAcceptedPrompt({ message: batch.message,
+        deliveryIdentity: { localIds: batch.userMessageLocalIds ?? [] } }); },
+      onPromptAccepted: (batch) => {
+        discovery.consumeAcceptedPromptByBatch(batch);
+        accepted.push(...(batch.userMessageLocalIds ?? []));
+      },
+    });
+    bridge = createClaudeUnifiedHookLifecycleBridge({
+      subscribeClaudeSessionHooks: () => () => undefined,
+      arbiter, completionQuiescenceMs: 0,
+      onReady: () => { completed += 1; },
+    });
+    try {
+      arbiter.observeLifecycle({ type: 'output', observedAtMs: 2_000 });
+      await arbiter.enqueueUiMessage({ message: '! echo hi', origin: { kind: 'ui_pending' }, userMessageLocalIds: ['shell-local-id'] });
+      await arbiter.drainWhenSafe();
+      await arbiter.enqueueUiMessage({ message: 'ordinary next prompt', origin: { kind: 'ui_pending' }, userMessageLocalIds: ['next-local-id'] });
+      await arbiter.drainWhenSafe();
+      expect(injected).toEqual(['! echo hi']);
+      const rows = shellRows();
+      discovery.observeControlCommandTranscript(rows.caveat);
+      discovery.observeControlCommandTranscript(rows.input);
+      if (timing === 'long_output_before_acceptance') {
+        nowMs = 90_000;
+        discovery.observeControlCommandTranscript({ ...rows.output, timestamp: new Date(nowMs).toISOString() });
+      }
+      const match = discovery.findMatchingTranscript([rows.input]);
+      expect(match).not.toBeNull();
+      expect(await arbiter.confirmPromptAcceptedByProviderIf((batch) => Boolean(match && doesClaudeUnifiedPromptBatchMatchAcceptedTranscript({ batch, match })))).toBe(true);
+      if (timing === 'long_output_after_acceptance') nowMs = 90_000;
+      const output = { ...rows.output, timestamp: new Date(nowMs).toISOString() };
+      discovery.observeControlCommandTranscript(output);
+      discovery.observeControlCommandTranscript(output);
+      await completion;
+      await arbiter.drainWhenSafe();
+      expect(accepted).toEqual(['shell-local-id']);
+      expect(completed).toBe(1);
+      expect(injected).toEqual(['! echo hi', 'ordinary next prompt']);
+    } finally {
+      bridge.dispose();
+      await arbiter.dispose();
+    }
+  });
+
+  it.each(['before_output', 'after_output'] as const)('retains a long-running local slash command accepted %s', (acceptanceTiming) => {
+    let nowMs = 2_000;
+    const completed: string[] = [];
+    const discovery = createClaudeUnifiedAcceptedPromptTranscriptDiscovery({
+      acceptedPromptWindowMs: 5_000, nowMs: () => nowMs,
+      onAttemptLocalCommandCompleted: ({ acceptedPromptId }) => { completed.push(acceptedPromptId); },
+    });
+    const id = discovery.recordAcceptedPrompt({ message: '/model opus', deliveryIdentity: { localIds: ['long-model'] } });
+    const command = { type: 'user', uuid: 'long-model-command', timestamp: new Date(nowMs).toISOString(),
+      message: { role: 'user', content: '<command-name>/model</command-name><command-args>opus</command-args>' } } satisfies RawJSONLines;
+    const match = discovery.findMatchingTranscript([command]);
+    expect(match).not.toBeNull();
+    if (acceptanceTiming === 'before_output') expect(match && discovery.consumeAcceptedPromptMatch(match)).toBe(true);
+    nowMs = 90_000;
+    const output = { type: 'user', uuid: 'long-model-output', parentUuid: command.uuid, timestamp: new Date(nowMs).toISOString(),
+      message: { role: 'user', content: '<local-command-stdout>Model updated</local-command-stdout>' } } satisfies RawJSONLines;
+    discovery.observeControlCommandTranscript(output);
+    if (acceptanceTiming === 'after_output') {
+      expect(completed).toEqual([]);
+      expect(match && discovery.consumeAcceptedPromptMatch(match)).toBe(true);
+    }
+    expect(completed).toEqual([id]);
+    discovery.observeControlCommandTranscript(output);
+    expect(completed).toEqual([id]);
+  });
+
+  it('never treats native peer content as delivery of an accepted human prompt', () => {
+    const discovery = createClaudeUnifiedAcceptedPromptTranscriptDiscovery({ acceptedPromptWindowMs: 5_000, nowMs: () => 2_000 });
+    discovery.recordAcceptedPrompt({ message: 'same visible text', acceptedAtMs: 1_000 });
+    const peer = { type: 'user', uuid: 'native-peer', sessionId: 'recipient', timestamp: new Date(1_100).toISOString(),
+      origin: { kind: 'peer', from: 'uds:/tmp/sender.sock', name: 'Sender' },
+      message: { content: 'same visible text' } } satisfies RawJSONLines;
+    expect(discovery.findMatchingTranscript([peer])).toBeNull();
+    expect(discovery.consumeAcceptedPromptTranscriptEcho(peer)).toBe(false);
+    expect(discovery.findMatchingTranscript([{ ...peer, uuid: 'human-prompt', origin: { kind: 'human' } }])).not.toBeNull();
+  });
+
   it('retains one exact authenticated hook echo identity after the accepted batch correlation retires', () => {
     const discovery = createClaudeUnifiedAcceptedPromptTranscriptDiscovery({
       acceptedPromptWindowMs: 5_000,
@@ -34,8 +235,13 @@ describe('createClaudeUnifiedAcceptedPromptTranscriptDiscovery', () => {
       sessionId: 'accepted-hook-session-id',
       message: { role: 'user', content: 'same visible text' },
     } satisfies RawJSONLines;
+    discovery.recordAcceptedPrompt({
+      message: 'same visible text', deliveryIdentity: { localIds: ['later-identical-prompt'] },
+    });
+    expect(discovery.findMatchingTranscript([exactEcho])).toBeNull();
     expect(discovery.consumeAcceptedPromptTranscriptEcho(exactEcho)).toBe(true);
     expect(discovery.consumeAcceptedPromptTranscriptEcho(exactEcho)).toBe(false);
+    expect(discovery.findMatchingTranscript([exactEcho])).toBeNull();
     expect(discovery.consumeAcceptedPromptTranscriptEcho({
       ...exactEcho,
       uuid: 'independent-same-text-user-row',
@@ -1128,13 +1334,15 @@ describe('createClaudeUnifiedAcceptedPromptTranscriptDiscovery', () => {
       acceptedAtMs: 10_000,
       deliveryIdentity: { localIds: ['first-identical-episode'] },
     });
-    discovery.recordAcceptedPrompt({
-      message: prompt,
-      acceptedAtMs: 10_001,
-      deliveryIdentity: { localIds: ['second-identical-episode'] },
-    });
 
     for (const timestampMs of [10_250, 10_750]) {
+      if (timestampMs === 10_750) {
+        discovery.recordAcceptedPrompt({
+          message: prompt,
+          acceptedAtMs: 10_001,
+          deliveryIdentity: { localIds: ['second-identical-episode'] },
+        });
+      }
       expect(discovery.findMatchingTranscript([{
         type: 'queue-operation',
         operation: 'enqueue',
@@ -1465,7 +1673,86 @@ describe('createClaudeUnifiedAcceptedPromptTranscriptDiscovery', () => {
     } satisfies RawJSONLines])).toBe(true);
   });
 
-  it('returns structured transcript evidence and binds identical text in FIFO order', () => {
+  it('retires discarded correlation through the arbiter before matching an identical replacement', async () => {
+    const discovery = createClaudeUnifiedAcceptedPromptTranscriptDiscovery({ acceptedPromptWindowMs: 5_000, nowMs: () => 10_000 });
+    let retired = false;
+    const prompt = 'identical replacement after discard';
+    const accepted: string[] = [];
+    const arbiter = createClaudeUnifiedInputArbiter({
+      nowMs: () => 10_000, quietPeriodMs: 0,
+      injectPrompt: async () => ({ status: 'failed' as const, reason: 'timeout' as const,
+        phase: 'after_write_before_enter' as const, duplicateRisk: 'possible' as const, recoverable: true }),
+      onInjectionFailure: async () => ({ action: 'claimed_pending_delivery' as const }),
+      resolvePromptDeliveryState: () => retired ? 'retired' : 'pending',
+      onProviderAcceptancePending: (batch) => { discovery.recordAcceptedPrompt({
+        message: batch.message, deliveryIdentity: { localIds: batch.userMessageLocalIds ?? [] },
+      }); },
+      onPromptAccepted: (batch) => { accepted.push(...(batch.userMessageLocalIds ?? [])); },
+      onPromptDeliveryRetired: (batch) => { discovery.forgetRetiredPromptByBatch(batch); },
+    });
+    try {
+      arbiter.observeLifecycle({ type: 'turn_state', state: 'idle', observedAtMs: 10_000 });
+      arbiter.observeLifecycle({ type: 'output', observedAtMs: 10_000 });
+      await arbiter.enqueueUiMessage({ message: prompt, origin: { kind: 'ui_pending' }, userMessageLocalIds: ['discarded'] });
+      await arbiter.drainWhenSafe();
+      expect(arbiter.snapshot().terminalCustodyCount).toBe(1);
+      retired = true;
+      await arbiter.drainWhenSafe();
+      discovery.recordAcceptedPrompt({ message: prompt, deliveryIdentity: { localIds: ['replacement'] } });
+      const match = discovery.claimMatchingTranscript([{
+        type: 'user', uuid: 'replacement-row', timestamp: new Date(10_100).toISOString(),
+        message: { role: 'user', content: prompt },
+      }]);
+      expect(match?.deliveryIdentity).toEqual({ localIds: ['replacement'] });
+      expect(accepted).toEqual([]);
+    } finally { await arbiter.dispose(); }
+  });
+
+  it.each(['user', 'native_queue'] as const)('does not infer a Pending identity from identical unresolved attempts (%s)', (evidenceKind) => {
+    let now = 10_000;
+    const discovery = createClaudeUnifiedAcceptedPromptTranscriptDiscovery({ acceptedPromptWindowMs: 5_000, nowMs: () => now });
+    const prompt = 'same text after an ambiguous write';
+    discovery.recordAcceptedPrompt({
+      message: prompt,
+      acceptedAtMs: 9_000,
+      deliveryIdentity: { localIds: ['ambiguous-predecessor'] },
+    });
+    discovery.recordAcceptedPrompt({
+      message: prompt,
+      acceptedAtMs: 10_000,
+      deliveryIdentity: { localIds: ['replacement-attempt'] },
+    });
+    const row = {
+      type: 'user', uuid: 'only-provider-row', promptId: 'provider-generated-id',
+      timestamp: new Date(10_100).toISOString(),
+      message: { role: 'user', content: prompt },
+    } satisfies RawJSONLines;
+
+    const sessionId = 'abababab-abab-4bab-8bab-abababababab';
+    const rows = evidenceKind === 'user' ? [row] : [
+      { type: 'queue-operation', operation: 'enqueue', sessionId, content: prompt, timestamp: new Date(10_050).toISOString() },
+      { type: 'queue-operation', operation: 'remove', sessionId, content: prompt, timestamp: new Date(10_075).toISOString() },
+      { type: 'attachment', uuid: 'only-queued-row', parentUuid: 'queued-parent', isSidechain: false, sessionId, timestamp: new Date(10_100).toISOString(),
+        attachment: { type: 'queued_command', prompt, commandMode: 'prompt', origin: { kind: 'human' } } },
+    ];
+    expect(discovery.findMatchingTranscript(rows)).toBeNull();
+    expect(discovery.claimMatchingTranscript(rows)).toBeNull();
+    // Retiring one candidate cannot turn already ambiguous evidence into proof for its neighbor.
+    expect(discovery.consumeAcceptedPromptByBatch({
+      message: prompt, userMessageLocalIds: ['ambiguous-predecessor'],
+    })).toBe(true);
+    now = 30_001;
+    expect(discovery.claimMatchingTranscript(rows)).toBeNull();
+    const freshRows = rows.map((entry) => ({ ...entry,
+      ...('uuid' in entry ? { uuid: `${entry.uuid}-fresh` } : {}),
+      timestamp: new Date(Date.parse(entry.timestamp) + 1_000).toISOString(),
+    }));
+    expect(discovery.claimMatchingTranscript(freshRows)).toEqual(expect.objectContaining({
+      deliveryIdentity: { localIds: ['replacement-attempt'] },
+    }));
+  });
+
+  it('returns structured transcript evidence for sequential identical prompts', () => {
     const prompt = 'repeat this exact prompt';
     const discovery = createClaudeUnifiedAcceptedPromptTranscriptDiscovery({
       acceptedPromptWindowMs: 5_000,
@@ -1477,11 +1764,6 @@ describe('createClaudeUnifiedAcceptedPromptTranscriptDiscovery', () => {
       acceptedAtMs: 10_000,
       deliveryIdentity: { localIds: ['first-local'], userMessageSeq: 11 },
     });
-    discovery.recordAcceptedPrompt({
-      message: prompt,
-      acceptedAtMs: 10_010,
-      deliveryIdentity: { localIds: ['second-local'], userMessageSeq: 12 },
-    });
 
     const first = discovery.claimMatchingTranscript([{
       type: 'user',
@@ -1490,6 +1772,11 @@ describe('createClaudeUnifiedAcceptedPromptTranscriptDiscovery', () => {
       timestamp: new Date(10_100).toISOString(),
       message: { role: 'user', content: prompt },
     } satisfies RawJSONLines]);
+    discovery.recordAcceptedPrompt({
+      message: prompt,
+      acceptedAtMs: 10_010,
+      deliveryIdentity: { localIds: ['second-local'], userMessageSeq: 12 },
+    });
     const second = discovery.claimMatchingTranscript([{
       type: 'user',
       uuid: 'provider-user-second',
@@ -1560,13 +1847,13 @@ describe('createClaudeUnifiedAcceptedPromptTranscriptDiscovery', () => {
       acceptedAtMs: 10_000,
       deliveryIdentity: { localIds: ['first-local'], userMessageSeq: 31 },
     });
+
+    const first = discovery.claimMatchingTranscript([transcriptRow]);
     discovery.recordAcceptedPrompt({
       message: prompt,
       acceptedAtMs: 10_010,
       deliveryIdentity: { localIds: ['second-local'], userMessageSeq: 32 },
     });
-
-    const first = discovery.claimMatchingTranscript([transcriptRow]);
     const duplicate = discovery.claimMatchingTranscript([transcriptRow]);
 
     expect(first).toEqual(expect.objectContaining({

@@ -2,6 +2,8 @@ import * as React from 'react';
 import { act } from 'react-test-renderer';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { renderScreen } from '@/dev/testkit';
+import type { AgentId } from '@/agents/catalog/catalog';
+import type { ProviderLocalAuthLaunch } from '@/agents/providers/shared/providerLocalAuthPlugin';
 import type { Machine } from '@/sync/domains/state/storageTypes';
 import { installSettingsViewCommonModuleMocks } from '../../settingsViewTestHelpers';
 
@@ -30,17 +32,14 @@ const clearTerminalMock = vi.fn();
 const requestRestartMock = vi.fn();
 const retryConnectMock = vi.fn();
 const dismissDetectedUrlMock = vi.fn();
+const useMachineTerminalSessionMock = vi.fn((_params: unknown) => createTerminalSessionMock());
 
 type EmbeddedTerminalPaneMockProps = Readonly<Record<string, unknown>>;
 type ProviderAuthenticationTerminalPaneProps = Readonly<{
-    providerId: 'claude';
+    providerId: AgentId;
     machineId: 'machine-1';
     machineHomeDir: '/Users/tester';
-    authLaunch: Readonly<{
-        kind: 'primary';
-        initialCommand: 'claude';
-        initialInput: '/login\r';
-    }>;
+    authLaunch: ProviderLocalAuthLaunch;
     onRequestClose: () => void;
 }>;
 
@@ -84,7 +83,7 @@ vi.mock('@/components/terminal/embedded/EmbeddedTerminalPane', () => ({
 }));
 
 vi.mock('@/hooks/machine/useMachineTerminalSession', () => ({
-    useMachineTerminalSession: () => createTerminalSessionMock(),
+    useMachineTerminalSession: (params: unknown) => useMachineTerminalSessionMock(params),
 }));
 
 vi.mock('@/utils/sessions/machineUtils', () => ({
@@ -101,6 +100,7 @@ describe('ProviderAuthenticationTerminalPane', () => {
         requestRestartMock.mockReset();
         retryConnectMock.mockReset();
         dismissDetectedUrlMock.mockReset();
+        useMachineTerminalSessionMock.mockClear();
     });
 
     it('re-sends provider initial input after a reconnect cycle', () => {
@@ -130,6 +130,27 @@ describe('ProviderAuthenticationTerminalPane', () => {
 
             expect(onInputMock).toHaveBeenCalledTimes(2);
             expect(onInputMock).toHaveBeenLastCalledWith('/login\r');
+
+            await screen.unmount();
+        });
+    });
+
+    it('forwards a first-party Happier CLI auth launch as a typed daemon intent', () => {
+        return providerAuthenticationTerminalPaneModulePromise.then(async (module) => {
+            const { ProviderAuthenticationTerminalPane } = module;
+            const screen = await renderScreen(<ProviderAuthenticationTerminalPane
+                {...createTestProps()}
+                providerId="agy"
+                authLaunch={{
+                    kind: 'primary',
+                    launch: { kind: 'happier_cli', args: ['agy', 'auth', 'login'] },
+                }}
+            />);
+
+            expect(useMachineTerminalSessionMock).toHaveBeenLastCalledWith(expect.objectContaining({
+                launch: { kind: 'happier_cli', args: ['agy', 'auth', 'login'] },
+                initialCommand: null,
+            }));
 
             await screen.unmount();
         });

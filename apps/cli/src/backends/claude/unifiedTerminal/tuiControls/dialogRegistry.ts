@@ -253,7 +253,7 @@ export const CLAUDE_UNIFIED_RECOGNIZED_DIALOG_REGISTRY: readonly ClaudeUnifiedRe
           'confirm',
           target ? `Switch to ${target}` : 'Change effort',
           'Apply the effort-level change in Claude.',
-          resolveSelectionAnswer(state, '1', [/^yes\b.*(?:switch|change)/iu]),
+          resolveSelectionAnswer(state, '1', [/^yes\b.*(?:switch|change)/iu, /^switch\b/iu]),
         ),
         option('cancel', 'Keep current effort', 'Dismiss the effort-level change.', resolveSelectionAnswer(state, '2', [/^no\b/iu, /^keep\b/iu, /^cancel\b/iu])),
       ];

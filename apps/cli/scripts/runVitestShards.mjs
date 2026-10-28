@@ -41,7 +41,7 @@ export function resolveVitestShardRange(env, shardCount) {
   return { start, end, part, parts };
 }
 
-export function resolveVitestIsolationPlan(configPath) {
+export function resolveVitestIsolationPlan(configPath, { part = 1, parts = 1 } = {}) {
   if (typeof configPath !== 'string' || basename(configPath) !== 'vitest.config.ts') {
     return { shardExcludes: [], runs: [] };
   }
@@ -59,7 +59,10 @@ export function resolveVitestIsolationPlan(configPath) {
   const claudeSignalCleanupFile = 'src/backends/claude/sdk/query.signalCleanup.test.ts';
   const codexAppServerClientFile = 'src/backends/codex/appServer/client/createCodexAppServerClient.test.ts';
   const processRunStateFile = 'src/daemon/processRunState.test.ts';
+  const daemonStartSyncOwnershipFile = 'src/daemon/startSyncOwnership.test.ts';
+  const nonInteractiveAuthFile = 'src/commands/auth.nonInteractiveBoth.test.ts';
   const durableMutationOutboxFile = 'src/api/session/sessionClient.durableMutationOutbox.test.ts';
+  const ephemeralExecutionRunPromptFile = 'src/agent/executionRuns/runEphemeralExecutionRunTextPrompt.test.ts';
   return {
     shardExcludes: [
       daemonServiceFile,
@@ -76,7 +79,10 @@ export function resolveVitestIsolationPlan(configPath) {
       claudeSignalCleanupFile,
       codexAppServerClientFile,
       processRunStateFile,
+      daemonStartSyncOwnershipFile,
+      nonInteractiveAuthFile,
       durableMutationOutboxFile,
+      ephemeralExecutionRunPromptFile,
     ],
     runs: [
       { file: daemonServiceFile, testNamePattern: 'runDaemonServiceCliCommand (?:allows|expands|prefers|resolves|restarts|restores|sets|treats)\\b' },
@@ -98,8 +104,11 @@ export function resolveVitestIsolationPlan(configPath) {
       { file: claudeSignalCleanupFile, testNamePattern: '.*' },
       { file: codexAppServerClientFile, testNamePattern: '.*' },
       { file: processRunStateFile, testNamePattern: '.*' },
+      { file: daemonStartSyncOwnershipFile, testNamePattern: '.*' },
+      { file: nonInteractiveAuthFile, testNamePattern: '.*' },
       { file: durableMutationOutboxFile, testNamePattern: '.*' },
-    ],
+      { file: ephemeralExecutionRunPromptFile, testNamePattern: '.*' },
+    ].filter((_, index) => index % parts === part - 1),
   };
 }
 
@@ -160,9 +169,7 @@ async function main(argv) {
   const shardCount = resolveVitestShardCount(process.env, configPath);
   const workerArgs = resolveVitestWorkerArgs(process.env, configPath);
   const shardRange = resolveVitestShardRange(process.env, shardCount);
-  const isolationPlan = shardRange.part === 1
-    ? resolveVitestIsolationPlan(configPath)
-    : { shardExcludes: resolveVitestIsolationPlan(configPath).shardExcludes, runs: [] };
+  const isolationPlan = resolveVitestIsolationPlan(configPath, shardRange);
   const sizeMb = resolveMaxOldSpaceSizeMb(process.env);
   const nodeOptions = upsertMaxOldSpaceSize(process.env.NODE_OPTIONS, sizeMb);
 

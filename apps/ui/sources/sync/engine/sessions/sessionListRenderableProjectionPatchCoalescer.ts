@@ -1,6 +1,6 @@
 import {
     applySessionListRenderablePatch,
-    isSessionListRenderablePatchNoop,
+    areSessionListRenderablesEqual,
     type SessionListRenderableSession,
 } from '@/sync/domains/session/listing/sessionListRenderable';
 import { syncPerformanceTelemetry } from '@/sync/runtime/syncPerformanceTelemetry';
@@ -36,6 +36,12 @@ function countBatchEntries<Payload>(batch: QueuedProjectionPatchBatch<Payload>):
     return batch.reduce((total, [, entries]) => total + entries.length, 0);
 }
 
+function countQueuedEntries<Payload>(queuedBySession: ReadonlyMap<string, readonly QueuedProjectionPatch<Payload>[]>): number {
+    let count = 0;
+    for (const entries of queuedBySession.values()) count += entries.length;
+    return count;
+}
+
 export function createSessionListRenderableProjectionPatchCoalescer<Payload>(params: Readonly<{
     getConfig: () => SessionListRenderableProjectionPatchCoalescerConfig;
     readRenderable: (sessionId: string) => SessionListRenderableSession | undefined;
@@ -48,6 +54,7 @@ export function createSessionListRenderableProjectionPatchCoalescer<Payload>(par
     enqueue: (sessionId: string, payload: Payload, options?: QueueOptions) => void;
     flushAll: () => void;
     dropSessionIds: (sessionIds: readonly string[]) => void;
+    reset: () => void;
 }> {
     const queuedBySession = new Map<string, QueuedProjectionPatch<Payload>[]>();
     const leadingWindowExpiresAtBySession = new Map<string, number>();
@@ -83,7 +90,7 @@ export function createSessionListRenderableProjectionPatchCoalescer<Payload>(par
             }
 
             let simulatedRenderable = renderable;
-            let finalPatch: Partial<Omit<SessionListRenderableSession, 'id'>> | null = null;
+            let hasPatch = false;
             for (const entry of entries) {
                 if (!entry.shouldContinue()) {
                     skippedEntries += 1;
@@ -93,18 +100,16 @@ export function createSessionListRenderableProjectionPatchCoalescer<Payload>(par
                     renderable: simulatedRenderable,
                     payload: entry.payload,
                 });
-                finalPatch = {
-                    ...(finalPatch ?? {}),
-                    ...patch,
-                };
+                hasPatch = true;
                 simulatedRenderable = applySessionListRenderablePatch(simulatedRenderable, patch);
             }
 
-            if (finalPatch && !isSessionListRenderablePatchNoop(renderable, finalPatch)) {
-                patches.push({ sessionId, patch: finalPatch });
+            if (hasPatch && !areSessionListRenderablesEqual(renderable, simulatedRenderable)) {
+                const { id: _id, ...patch } = simulatedRenderable;
+                patches.push({ sessionId, patch });
                 continue;
             }
-            if (finalPatch) {
+            if (hasPatch) {
                 noopSessions += 1;
             } else {
                 noPatchSessions += 1;
@@ -113,7 +118,7 @@ export function createSessionListRenderableProjectionPatchCoalescer<Payload>(par
 
         const suppressedSessions = missingRenderableSessions + noPatchSessions + noopSessions;
         if (suppressedSessions > 0 || skippedEntries > 0) {
-            syncPerformanceTelemetry.count('sync.socket.sessions.projectionPatch.coalesce.suppressed', {
+            syncPerformanceTelemetry.countLazy('sync.socket.sessions.projectionPatch.coalesce.suppressed', () => ({
                 sessions: batch.length,
                 entries: countBatchEntries(batch),
                 appliedSessions: patches.length,
@@ -122,7 +127,7 @@ export function createSessionListRenderableProjectionPatchCoalescer<Payload>(par
                 skippedEntries,
                 noPatchSessions,
                 noopSessions,
-            });
+            }));
         }
 
         if (patches.length === 0) return;
@@ -202,6 +207,12 @@ export function createSessionListRenderableProjectionPatchCoalescer<Payload>(par
         });
     }
 
+    function reset(): void {
+        clearFlushTimer();
+        queuedBySession.clear();
+        leadingWindowExpiresAtBySession.clear();
+    }
+
     function enqueue(sessionId: string, payload: Payload, options?: QueueOptions): void {
         if (sessionId.length === 0) return;
 
@@ -217,6 +228,8 @@ export function createSessionListRenderableProjectionPatchCoalescer<Payload>(par
             entries: 1,
             windowMs,
             maxBatchSize,
+            deferLeading: options?.deferLeadingPatch === true ? 1 : 0,
+            forceImmediate: options?.forceImmediate === true ? 1 : 0,
         });
 
         if (!config.enabled || windowMs <= 0) {
@@ -238,12 +251,12 @@ export function createSessionListRenderableProjectionPatchCoalescer<Payload>(par
             leadingWindowExpiresAtBySession.set(sessionId, nowMs + windowMs);
             if (options?.deferLeadingPatch === true) {
                 upsertQueued(sessionId, entry);
-                syncPerformanceTelemetry.count('sync.socket.sessions.projectionPatch.coalesce.queued', {
+                syncPerformanceTelemetry.countLazy('sync.socket.sessions.projectionPatch.coalesce.queued', () => ({
                     sessions: queuedBySession.size,
-                    entries: Array.from(queuedBySession.values()).reduce((total, entries) => total + entries.length, 0),
+                    entries: countQueuedEntries(queuedBySession),
                     windowMs,
                     maxBatchSize,
-                });
+                }));
                 scheduleFlush(windowMs);
                 return;
             }
@@ -252,12 +265,12 @@ export function createSessionListRenderableProjectionPatchCoalescer<Payload>(par
         }
 
         upsertQueued(sessionId, entry);
-        syncPerformanceTelemetry.count('sync.socket.sessions.projectionPatch.coalesce.queued', {
+        syncPerformanceTelemetry.countLazy('sync.socket.sessions.projectionPatch.coalesce.queued', () => ({
             sessions: queuedBySession.size,
-            entries: Array.from(queuedBySession.values()).reduce((total, entries) => total + entries.length, 0),
+            entries: countQueuedEntries(queuedBySession),
             windowMs,
             maxBatchSize,
-        });
+        }));
 
         if (queuedBySession.size >= maxBatchSize) {
             applyBatch(takeQueuedBatch(maxBatchSize), 'sync.socket.sessions.projectionPatch.coalesce.flush');
@@ -272,5 +285,6 @@ export function createSessionListRenderableProjectionPatchCoalescer<Payload>(par
         enqueue,
         flushAll,
         dropSessionIds,
+        reset,
     };
 }

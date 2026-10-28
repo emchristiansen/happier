@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { SpawnSessionTerminalSchema } from '@happier-dev/protocol/spawnSession';
 import {
   AcpConfigOptionOverridesV1Schema,
   AgentRuntimeDescriptorV1Schema,
@@ -36,14 +37,7 @@ const SpawnBackendTargetSchema = z.union([
     backendId: z.string().trim().min(1),
   }),
 ]);
-export const SpawnSessionTerminalSchema = z.object({
-  mode: z.enum(['plain', 'tmux', 'windows_terminal', 'windows_console']).optional(),
-  tmux: z.object({
-    sessionName: z.string().optional(),
-    isolated: z.boolean().optional(),
-    tmpDir: z.union([z.string(), z.null()]).optional(),
-  }).optional(),
-});
+export { SpawnSessionTerminalSchema };
 
 export { SpawnSessionExecutionAuthorizationSchema };
 

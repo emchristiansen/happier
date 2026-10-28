@@ -8,6 +8,7 @@
  */
 
 import os from 'node:os';
+import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
 import { resolve } from 'node:path';
 
 import {
@@ -30,6 +31,7 @@ import packageJson from '../../../package.json';
 import type { TerminalRuntimeFlags } from '@/terminal/runtime/terminalRuntimeFlags';
 import { buildTerminalMetadataFromRuntimeFlags } from '@/terminal/runtime/terminalMetadata';
 import { resolveRequestedSessionDirectory } from './resolveRequestedSessionDirectory';
+import { readSessionNativeEnvironment, type SessionNativeEnvironment } from './sessionNativeEnvironment';
 import {
     HAPPIER_SESSION_CONNECTED_SERVICES_BINDINGS_ENV_KEY,
     parseSessionConnectedServicesBindingsJson,
@@ -56,6 +58,8 @@ export type BackendFlavor = string;
 export interface CreateSessionMetadataOptions {
     /** Backend flavor (claude, codex, gemini) */
     flavor: BackendFlavor;
+    /** Provider-selected non-secret native directory overrides for later resume. */
+    nativeAgentEnvironment?: SessionNativeEnvironment;
     /** Machine ID for server identification */
     machineId: string;
     /** Working directory for the session (defaults to process.cwd()). */
@@ -180,7 +184,9 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
         machineId: opts.machineId,
         agentPath: sessionPath,
     });
+    const nativeAgentEnvironmentV1 = readSessionNativeEnvironment(opts.nativeAgentEnvironment);
     const metadataBase: Metadata = {
+        ...(nativeAgentEnvironmentV1 ? { nativeAgentEnvironmentV1 } : {}),
         path: sessionPath,
         host: os.hostname(),
         version: packageJson.version,
@@ -195,6 +201,7 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
         happyToolsDir: resolve(projectPath(), 'tools', 'unpacked'),
         startedFromDaemon: opts.startedBy === 'daemon',
         hostPid: process.pid,
+        hostProcessInstanceFingerprint: readProcessInstanceFingerprintSync(process.pid) ?? undefined,
         sessionLogPath: logger.getLogPath(),
         startedBy: opts.startedBy || 'terminal',
         lifecycleState: 'running',

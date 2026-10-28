@@ -96,7 +96,7 @@ import { normalizeStackNameOrNull } from './utils/stack/names.mjs';
 import { runOrchestratedGuidedAuthFlow } from './utils/auth/orchestrated_stack_auth_flow.mjs';
 import { assertExpoWebappBundlesOrThrow } from './utils/auth/stack_guided_login.mjs';
 import { applyAuthForceEnv, resolveAuthForceFlag } from './utils/auth/auth_force_flag.mjs';
-import { createStepPrinter } from './utils/cli/progress.mjs';
+import { createStepPrinter } from '@happier-dev/cli-common/output';
 import { getVerbosityLevel } from './utils/cli/verbosity.mjs';
 import { applyBindModeToEnv, resolveBindModeFromArgs } from './utils/net/bind_mode.mjs';
 import { getTodayYmd } from './utils/time/get_today_ymd.mjs';

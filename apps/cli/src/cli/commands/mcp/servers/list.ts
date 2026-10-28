@@ -5,6 +5,7 @@ import { readMcpServersSettingsFromAccountSettings } from '@/mcp/servers/readMcp
 import { loadFreshMcpAccountSettingsContext } from '../loadFreshMcpAccountSettingsContext';
 
 import type { McpCommandDeps } from '../deps';
+import { cmd, fail } from '@happier-dev/cli-common/output';
 
 function summarizeMcpServersForJson(settings: ReturnType<typeof readMcpServersSettingsFromAccountSettings>): unknown {
   const bindingCountByServerId = new Map<string, number>();
@@ -34,7 +35,7 @@ export async function cmdMcpServersList(
       await printJsonEnvelope({ ok: false, kind: 'mcp_servers_list', error: { code: 'not_authenticated' } }, { exitCode: 1 });
       return;
     }
-    console.error(chalk.red('Error:'), 'Not authenticated. Run "happier auth login" first.');
+    console.error(fail(`Not signed in. Run ${cmd('happier auth login')} first.`));
     process.exitCode = 1;
     return;
   }

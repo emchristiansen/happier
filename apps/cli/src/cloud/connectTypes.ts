@@ -1,5 +1,6 @@
 import type { CatalogAgentId } from '@/backends/types';
 import type { CloudConnectTargetStatus, CloudVendorKey } from '@happier-dev/agents';
+import type { ConnectedServiceId } from '@happier-dev/protocol';
 
 export type { CloudConnectTargetStatus, CloudVendorKey };
 
@@ -21,6 +22,7 @@ export type CloudConnectAuthenticateOptions = Readonly<{
 
 export type CloudConnectTarget = Readonly<{
   id: ConnectTargetId;
+  aliases?: readonly string[];
   displayName: string;
   vendorDisplayName: string;
   vendorKey: ConnectedAccountVendorKey;
@@ -32,5 +34,8 @@ export type CloudConnectTarget = Readonly<{
    */
   status: CloudConnectTargetStatus;
   authenticate: (opts?: CloudConnectAuthenticateOptions) => Promise<unknown>;
+  importServiceId?: ConnectedServiceId;
+  importSources?: readonly Readonly<{ id: string; label: string }>[];
+  importCredentials?: (opts: Readonly<{ source: string; signal?: AbortSignal }>) => Promise<unknown>;
   postConnect?: (oauth: unknown) => void;
 }>;

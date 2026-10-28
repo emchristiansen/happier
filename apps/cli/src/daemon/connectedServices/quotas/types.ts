@@ -37,6 +37,7 @@ export type ConnectedServiceQuotaFetcher = Readonly<{
     now: number;
     idempotencyKey: string;
     providerCreditId?: string;
+    providerLimitIds?: ReadonlyArray<string>;
     signal: AbortSignal;
   }>) => Promise<ConnectedServiceQuotaRecoveryCreditConsumeOutcome>;
 }>;

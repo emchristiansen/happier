@@ -48,7 +48,7 @@ export function classifyOpenCodeUsageLimitError(params: Readonly<{
       retryAfterMs: retry.retryAfterMs,
       resetAtMs: retry.resetAtMs,
       quotaScope: 'account',
-      providerLimitId: 'free_tier_limit',
+      providerLimitId: null,
       action: null,
     };
   }
@@ -61,7 +61,7 @@ export function classifyOpenCodeUsageLimitError(params: Readonly<{
     retryAfterMs: retry.retryAfterMs,
     resetAtMs: retry.resetAtMs,
     quotaScope: readString(metadata.workspace) ? 'workspace' : 'account',
-    providerLimitId: readString(metadata.limitName ?? metadata.limit_name) ?? 'account_rate_limit',
+    providerLimitId: readString(metadata.limitName ?? metadata.limit_name),
     action: actionUrl ? { kind: 'open_url', url: actionUrl } : null,
   };
 }

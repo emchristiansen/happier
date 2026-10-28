@@ -32,6 +32,21 @@ import {
 import type { ThemeProfileMode, ThemeProfilesLocalStateV1 } from '@/theme/profiles/themeProfileTypes';
 import type { LocalSettings } from '@/sync/domains/settings/localSettings';
 import { Icon } from '@/components/ui/icons/Icon';
+import { isNativeBlurAvailable } from '@/components/ui/glass/blurMaterial';
+import {
+    LOADING_INDICATOR_STYLE_LABEL_KEYS,
+    LoadingIndicatorStylePreview,
+} from '@/components/settings/appearance/LoadingIndicatorStylePreview';
+import { loadingIndicatorTimingControls } from '@/components/ui/feedback/activitySpinner/dotSpinnerStyles';
+import {
+    isLoadingIndicatorStyleId,
+    LOADING_INDICATOR_PAUSE_IDS,
+    LOADING_INDICATOR_SPEED_IDS,
+    LOADING_INDICATOR_STYLE_IDS,
+    LoadingIndicatorPauseIdSchema,
+    LoadingIndicatorSpeedIdSchema,
+    normalizeLoadingIndicatorStyleId,
+} from '@/sync/domains/settings/registry/local/loadingIndicatorStyleSetting';
 
 const UI_FONT_SCALE_PRESETS = {
     xxsmall: 0.8,
@@ -81,13 +96,19 @@ export default React.memo(function AppearanceSettingsScreen() {
     const panelsSupported = Platform.OS === 'web' || deviceType === 'tablet';
     const [avatarStyle, setAvatarStyle] = useSettingMutable('avatarStyle');
     const [showFlavorIcons, setShowFlavorIcons] = useSettingMutable('showFlavorIcons');
+    const [showChatCodeBlockWrapControls, setShowChatCodeBlockWrapControls] = useSettingMutable('showChatCodeBlockWrapControls');
+    const [wrapChatCodeBlocks, setWrapChatCodeBlocks] = useSettingMutable('wrapChatCodeBlocks');
     const [themePreference, setThemePreference] = useLocalSettingMutable('themePreference');
     const [themeProfiles, setThemeProfiles] = useLocalSettingMutable('themeProfiles');
     const [uiFontScale, setUiFontScale] = useLocalSettingMutable('uiFontScale');
     const [uiItemDensity, setUiItemDensity] = useLocalSettingMutable('uiItemDensity');
+    const [loadingIndicatorStyle, setLoadingIndicatorStyle] = useLocalSettingMutable('loadingIndicatorStyle');
+    const [loadingIndicatorSpeed, setLoadingIndicatorSpeed] = useLocalSettingMutable('loadingIndicatorSpeed');
+    const [loadingIndicatorPause, setLoadingIndicatorPause] = useLocalSettingMutable('loadingIndicatorPause');
     const [uiContentWidthMode, setUiContentWidthMode] = useLocalSettingMutable('uiContentWidthMode');
     const [uiMultiPanePanelsEnabled, setUiMultiPanePanelsEnabled] = useLocalSettingMutable('uiMultiPanePanelsEnabled');
     const [uiBackdropBlurEnabled, setUiBackdropBlurEnabled] = useLocalSettingMutable('uiBackdropBlurEnabled');
+    const [hapticsEnabled, setHapticsEnabled] = useLocalSettingMutable('hapticsEnabled');
     const [detailsPaneTabsBehavior, setDetailsPaneTabsBehavior] = useLocalSettingMutable('detailsPaneTabsBehavior');
     const [tabBarGitBadgeMode, setTabBarGitBadgeMode] = useSettingMutable('tabBarGitBadgeMode');
     const [tabBarFriendsBadgeEnabled, setTabBarFriendsBadgeEnabled] = useSettingMutable('tabBarFriendsBadgeEnabled');
@@ -106,6 +127,9 @@ export default React.memo(function AppearanceSettingsScreen() {
     const [openContentWidthMenu, setOpenContentWidthMenu] = React.useState(false);
     const [openDetailsTabsMenu, setOpenDetailsTabsMenu] = React.useState(false);
     const [openAvatarStyleMenu, setOpenAvatarStyleMenu] = React.useState(false);
+    const [openLoadingIndicatorMenu, setOpenLoadingIndicatorMenu] = React.useState(false);
+    const [openLoadingIndicatorSpeedMenu, setOpenLoadingIndicatorSpeedMenu] = React.useState(false);
+    const [openLoadingIndicatorPauseMenu, setOpenLoadingIndicatorPauseMenu] = React.useState(false);
     const [openGitBadgeMenu, setOpenGitBadgeMenu] = React.useState(false);
     const [openTabBarSizeMenu, setOpenTabBarSizeMenu] = React.useState(false);
     const [openGlassBlurMenu, setOpenGlassBlurMenu] = React.useState(false);
@@ -148,6 +172,24 @@ export default React.memo(function AppearanceSettingsScreen() {
             icon: <AvatarStylePreviewIcon styleId={option.id} />,
         }));
     }, []);
+
+    const loadingIndicatorMenuItems = React.useMemo(() => {
+        return LOADING_INDICATOR_STYLE_IDS.map((styleId) => ({
+            id: styleId,
+            title: t(LOADING_INDICATOR_STYLE_LABEL_KEYS[styleId]),
+            icon: <LoadingIndicatorStylePreview styleId={styleId} />,
+        }));
+    }, []);
+
+    const loadingIndicatorSpeedMenuItems = React.useMemo(() => LOADING_INDICATOR_SPEED_IDS.map((id) => ({
+        id,
+        title: t(`settingsAppearance.loadingIndicatorSpeedOptions.${id}`),
+    })), []);
+
+    const loadingIndicatorPauseMenuItems = React.useMemo(() => LOADING_INDICATOR_PAUSE_IDS.map((id) => ({
+        id,
+        title: t(`settingsAppearance.loadingIndicatorPauseOptions.${id}`),
+    })), []);
 
     const gitBadgeMenuItems = React.useMemo((): readonly DropdownMenuItem[] => {
         return [
@@ -276,6 +318,10 @@ export default React.memo(function AppearanceSettingsScreen() {
 
     // Ensure we have a valid style for display, defaulting to gradient for unknown values
     const displayStyle = normalizeAvatarStyleId(avatarStyle);
+    const displayLoadingIndicatorStyle = normalizeLoadingIndicatorStyleId(loadingIndicatorStyle);
+    // A timing choice the chosen style ignores stays visible but disabled, and says why once: the
+    // Classic Ring's note on Speed also covers the Pause row beneath it.
+    const loadingIndicatorTiming = loadingIndicatorTimingControls(displayLoadingIndicatorStyle);
     
     // Language display
     const getLanguageDisplayText = () => {
@@ -391,6 +437,35 @@ export default React.memo(function AppearanceSettingsScreen() {
                 />
             </ItemGroup>
 
+            <ItemGroup title={t('settingsAppearance.chatCodeBlocks.title')}>
+                <Item
+                    title={t('settingsAppearance.chatCodeBlocks.showWrapControls')}
+                    subtitle={t('settingsAppearance.chatCodeBlocks.showWrapControlsDescription')}
+                    rightElement={
+                        <Switch
+                            testID="settings-appearance-showChatCodeBlockWrapControls-switch"
+                            accessibilityLabel={t('settingsAppearance.chatCodeBlocks.showWrapControls')}
+                            value={showChatCodeBlockWrapControls}
+                            onValueChange={setShowChatCodeBlockWrapControls}
+                        />
+                    }
+                    showChevron={false}
+                />
+                <Item
+                    title={t('settingsAppearance.chatCodeBlocks.wrapByDefault')}
+                    subtitle={t('settingsAppearance.chatCodeBlocks.wrapByDefaultDescription')}
+                    rightElement={
+                        <Switch
+                            testID="settings-appearance-wrapChatCodeBlocks-switch"
+                            accessibilityLabel={t('settingsAppearance.chatCodeBlocks.wrapByDefault')}
+                            value={wrapChatCodeBlocks}
+                            onValueChange={setWrapChatCodeBlocks}
+                        />
+                    }
+                    showChevron={false}
+                />
+            </ItemGroup>
+
             {/* Layout */}
             <ItemGroup title={t('settingsAppearance.display')} footer={t('settingsAppearance.displayDescription')}>
                 <DropdownMenu
@@ -466,6 +541,25 @@ export default React.memo(function AppearanceSettingsScreen() {
                 />
             </ItemGroup>
 
+            {(Platform.OS === 'ios' || Platform.OS === 'android') && (
+                <ItemGroup title={t('settingsAppearance.feedback')}>
+                    <Item
+                        testID="settings-appearance-haptics"
+                        title={t('settingsAppearance.haptics')}
+                        subtitle={t('settingsAppearance.hapticsDescription')}
+                        icon={<Icon name="device-mobile" size={29} color={theme.colors.accent.blue} />}
+                        rightElement={
+                            <Switch
+                                testID="settings-appearance-haptics-switch"
+                                value={hapticsEnabled !== false}
+                                onValueChange={setHapticsEnabled}
+                            />
+                        }
+                        showChevron={false}
+                    />
+                </ItemGroup>
+            )}
+
             {/* Style */}
             <ItemGroup title={t('settingsAppearance.avatarStyle')}>
                 <DropdownMenu
@@ -501,6 +595,77 @@ export default React.memo(function AppearanceSettingsScreen() {
                             onValueChange={setShowFlavorIcons}
                         />
                     }
+                />
+            </ItemGroup>
+
+            {/* Loading indicator */}
+            <ItemGroup title={t('settingsAppearance.loadingIndicator')} footer={t('settingsAppearance.loadingIndicatorFooter')}>
+                <DropdownMenu
+                    open={openLoadingIndicatorMenu}
+                    onOpenChange={setOpenLoadingIndicatorMenu}
+                    variant="selectable"
+                    search={false}
+                    selectedId={displayLoadingIndicatorStyle}
+                    showCategoryTitles={false}
+                    matchTriggerWidth={true}
+                    connectToTrigger={true}
+                    rowKind="item"
+                    itemTrigger={{
+                        title: t('settingsAppearance.loadingIndicatorStyle'),
+                        subtitle: t('settingsAppearance.loadingIndicatorDescription'),
+                        icon: <LoadingIndicatorStylePreview styleId={displayLoadingIndicatorStyle} />,
+                        showSelectedSubtitle: false,
+                        itemProps: { testID: 'settings-appearance-loadingIndicator-select' },
+                    }}
+                    items={loadingIndicatorMenuItems}
+                    onSelect={(itemId) => {
+                        if (!isLoadingIndicatorStyleId(itemId)) return;
+                        setLoadingIndicatorStyle(itemId);
+                    }}
+                />
+                <DropdownMenu
+                    open={openLoadingIndicatorSpeedMenu && loadingIndicatorTiming.speed}
+                    onOpenChange={setOpenLoadingIndicatorSpeedMenu}
+                    variant="selectable"
+                    search={false}
+                    selectedId={loadingIndicatorSpeed}
+                    showCategoryTitles={false}
+                    matchTriggerWidth={true}
+                    connectToTrigger={true}
+                    rowKind="item"
+                    itemTrigger={{
+                        title: t('settingsAppearance.loadingIndicatorSpeed'),
+                        subtitle: loadingIndicatorTiming.speed
+                            ? t('settingsAppearance.loadingIndicatorSpeedDescription')
+                            : t('settingsAppearance.loadingIndicatorSpeedUnavailable'),
+                        icon: <Icon name="speedometer" size={29} color={theme.colors.accent.indigo} />,
+                        showSelectedSubtitle: false,
+                        itemProps: { testID: 'settings-appearance-loadingIndicatorSpeed-select', disabled: !loadingIndicatorTiming.speed },
+                    }}
+                    items={loadingIndicatorSpeedMenuItems}
+                    onSelect={(itemId) => setLoadingIndicatorSpeed(LoadingIndicatorSpeedIdSchema.parse(itemId))}
+                />
+                <DropdownMenu
+                    open={openLoadingIndicatorPauseMenu && loadingIndicatorTiming.pause}
+                    onOpenChange={setOpenLoadingIndicatorPauseMenu}
+                    variant="selectable"
+                    search={false}
+                    selectedId={loadingIndicatorPause}
+                    showCategoryTitles={false}
+                    matchTriggerWidth={true}
+                    connectToTrigger={true}
+                    rowKind="item"
+                    itemTrigger={{
+                        title: t('settingsAppearance.loadingIndicatorPause'),
+                        subtitle: loadingIndicatorTiming.pause || !loadingIndicatorTiming.speed
+                            ? t('settingsAppearance.loadingIndicatorPauseDescription')
+                            : t('settingsAppearance.loadingIndicatorPauseUnavailable'),
+                        icon: <Icon name="hourglass" size={29} color={theme.colors.accent.purple} />,
+                        showSelectedSubtitle: false,
+                        itemProps: { testID: 'settings-appearance-loadingIndicatorPause-select', disabled: !loadingIndicatorTiming.pause },
+                    }}
+                    items={loadingIndicatorPauseMenuItems}
+                    onSelect={(itemId) => setLoadingIndicatorPause(LoadingIndicatorPauseIdSchema.parse(itemId))}
                 />
             </ItemGroup>
 
@@ -556,7 +721,8 @@ export default React.memo(function AppearanceSettingsScreen() {
                     }
                     showChevron={false}
                 />
-                {glassBlurEnabled ? (
+                {/* Intensity only tunes a real blur; Android glass is an unblurred tint. */}
+                {glassBlurEnabled && (Platform.OS === 'web' || isNativeBlurAvailable()) ? (
                     <DropdownMenu
                         open={openGlassBlurMenu}
                         onOpenChange={setOpenGlassBlurMenu}

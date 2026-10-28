@@ -3,6 +3,7 @@ import { View } from 'react-native';
 import { useUnistyles } from 'react-native-unistyles';
 
 import type { CodeEditorHandle } from '@/components/ui/code/editor/codeEditorTypes';
+import { usePublishCodeEditorHandle } from '@/components/ui/code/editor/usePublishCodeEditorHandle';
 import { CommandMenu } from '@/components/ui/commandMenu';
 import { LinkBubble } from '@/components/ui/linkBubble';
 import { MarkdownEditor, type MarkdownEditorSurfaceRef } from '@/components/ui/markdown/editor/MarkdownEditor';
@@ -87,6 +88,7 @@ function RichMarkdownEditorPanelImpl(props: Readonly<{
 }>) {
     const { theme } = useUnistyles();
     const surfaceRef = React.useRef<MarkdownEditorSurfaceRef | null>(null);
+    const publishEditorHandle = usePublishCodeEditorHandle(props.editorRef);
 
     // Split the leading YAML frontmatter off the document. The editor only ever
     // sees `body`; `frontmatter` is shown read-only and re-prepended on every
@@ -104,16 +106,15 @@ function RichMarkdownEditorPanelImpl(props: Readonly<{
     // file-edit machine reads it for save (else save would DROP the frontmatter).
     const setSurfaceRef = React.useCallback((instance: MarkdownEditorSurfaceRef | null) => {
         surfaceRef.current = instance;
-        const parentRef = props.editorRef as React.MutableRefObject<CodeEditorHandle | null>;
         if (!instance) {
-            parentRef.current = null;
+            publishEditorHandle(null);
             return;
         }
-        parentRef.current = {
+        publishEditorHandle({
             getValue: () => reattachFrontMatter(frontmatterRef.current, instance.getValue()),
             flushPendingChange: () => instance.flushPendingChange(),
-        };
-    }, [props.editorRef]);
+        });
+    }, [publishEditorHandle]);
 
     // Reattach frontmatter to the body-only markdown the surface emits before it
     // flows up to the host (keeps the host's tracked text + dirty state correct).

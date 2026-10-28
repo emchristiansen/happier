@@ -151,7 +151,10 @@ vi.mock('@/sync/api/account/apiVendorTokens', () => ({
     disconnectVendorToken: vi.fn(async () => {}),
 }));
 
-vi.mock('@/sync/domains/profiles/profile', () => ({
+// Partial: the real module also owns `profileDefaults`, which the storage store reads while it is
+// being constructed. A factory-only mock silently drops it and breaks store creation.
+vi.mock('@/sync/domains/profiles/profile', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@/sync/domains/profiles/profile')>(),
     getDisplayName: () => 'Test User',
     getAvatarUrl: () => null,
     getBio: () => '',

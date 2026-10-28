@@ -69,6 +69,12 @@ const FEATURE_CATALOG_DEFINITION = {
     dependencies: ['connectedServices'],
     representation: 'server',
   },
+  'connectedServices.quotaRecoveryCreditDetails': {
+    description: 'Typed reset display facts in provider account usage plain-write metadata.',
+    defaultFailMode: 'fail_closed',
+    dependencies: ['connectedServices.quotas'],
+    representation: 'server',
+  },
   'connectedServices.accountGroups': {
     description: 'Connected service account groups and member management APIs.',
     defaultFailMode: 'fail_closed',
@@ -85,6 +91,24 @@ const FEATURE_CATALOG_DEFINITION = {
     description: 'Opt-in banked quota reset spending after account pool exhaustion.',
     defaultFailMode: 'fail_closed',
     dependencies: ['connectedServices.accountFallback', 'connectedServices.quotas'],
+    representation: 'server',
+  },
+  'connectedServices.autoDisablePlanInvalid': {
+    description: 'Opt-in automatic pool-member disable after a model-entitlement failure.',
+    defaultFailMode: 'fail_closed',
+    dependencies: ['connectedServices.accountFallback'],
+    representation: 'server',
+  },
+  'connectedServices.poolQuotaLimitSelection': {
+    description: 'Provider-limit-aware quota selection for connected service account pools.',
+    defaultFailMode: 'fail_closed',
+    dependencies: ['connectedServices.accountFallback', 'connectedServices.quotas'],
+    representation: 'server',
+  },
+  'connectedServices.poolExpiryFirst': {
+    description: 'Expiry-first selection strategy for connected service account pools.',
+    defaultFailMode: 'fail_closed',
+    dependencies: ['connectedServices.accountGroups'],
     representation: 'server',
   },
   channelBridges: {
@@ -281,6 +305,12 @@ const FEATURE_CATALOG_DEFINITION = {
   },
   'encryption.accountOptOut': {
     description: 'Per-account encryption opt-out toggle support.',
+    defaultFailMode: 'fail_closed',
+    dependencies: ['encryption.plaintextStorage'],
+    representation: 'server',
+  },
+  'encryption.plaintextMachine': {
+    description: 'Typed plain Machine metadata, daemon state, and RPC support.',
     defaultFailMode: 'fail_closed',
     dependencies: ['encryption.plaintextStorage'],
     representation: 'server',

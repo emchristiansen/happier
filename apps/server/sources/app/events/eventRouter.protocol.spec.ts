@@ -173,6 +173,7 @@ describe("eventRouter payloads (protocol container)", () => {
                 latestTurnId: "turn-1",
                 latestTurnStatus: "completed",
                 latestTurnStatusObservedAt: 456,
+                rollbackEligibleTurnStarts: [3, 7],
                 runtimeActivityState: "active",
                 runtimeActivityRevision: 6,
                 runtimeActivityActiveCount: 2,
@@ -196,6 +197,7 @@ describe("eventRouter payloads (protocol container)", () => {
         expect((payload.body as any).latestTurnId).toBe("turn-1");
         expect((payload.body as any).latestTurnStatus).toBe("completed");
         expect((payload.body as any).latestTurnStatusObservedAt).toBe(456);
+        expect((payload.body as any).rollbackEligibleTurnStarts).toEqual([3, 7]);
         expect((payload.body as any).runtimeActivityActiveCount).toBe(2);
         expect((payload.body as any).runtimeActivityObservedAt).toBe(500);
         expect((payload.body as any).meaningfulActivityAt).toBe(999);

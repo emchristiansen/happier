@@ -13,6 +13,7 @@ import {
 import type { LoadedLinkedDirectSession } from '@/api/directSessions/takeover/loadLinkedDirectSession';
 import type { DirectTranscriptRawMessageV1 } from '@happier-dev/protocol';
 import { getDirectSessionProviderOps } from '@/backends/catalog';
+import { DirectSessionsProviderUnavailableError } from '@/backends/directSessions/providerOps';
 import { adoptDirectSessionMediaForImport } from './adoptDirectSessionMediaForImport';
 import {
   loadDirectSessionTranscriptItems,
@@ -50,7 +51,13 @@ async function loadDirectTranscriptPage(params: Readonly<{
   maxBytes: number;
   maxItems: number;
 }>): Promise<DirectTranscriptImportPage> {
-  return await (await getDirectSessionProviderOps(params.linked.providerId)).pageTranscript({
+  const providerOps = await getDirectSessionProviderOps(params.linked.providerId);
+  if (!providerOps.pageTranscript) {
+    throw new DirectSessionsProviderUnavailableError(
+      `Agent '${params.linked.providerId}' does not expose a readable transcript for this source.`,
+    );
+  }
+  return await providerOps.pageTranscript({
     source: params.linked.source,
     remoteSessionId: params.linked.remoteSessionId,
     direction: 'older',
@@ -62,10 +69,12 @@ async function loadDirectTranscriptPage(params: Readonly<{
 
 async function loadAllDirectTranscriptItems(params: Readonly<{
   linked: LoadedLinkedDirectSession;
+  signal?: AbortSignal;
 }>): Promise<DirectTranscriptRawMessageV1[]> {
   const pageMaxBytes = resolvePageMaxBytes();
   const pageMaxItems = resolvePageMaxItems();
   return await loadDirectSessionTranscriptItems({
+    signal: params.signal,
     readPage: async (cursor) => await loadDirectTranscriptPage({
       linked: params.linked,
       cursor,
@@ -101,20 +110,25 @@ export async function importDirectSessionTranscript(params: Readonly<{
   credentials: Credentials;
   sessionId: string;
   workingDirectory?: string;
+  signal?: AbortSignal;
+  onProgress?: (progress: Readonly<{ importedCount: number; totalCount: number }>) => void;
 }>): Promise<Readonly<{ importedCount: number }>> {
-  const items = await loadAllDirectTranscriptItems({ linked: params.linked });
+  const items = await loadAllDirectTranscriptItems({ linked: params.linked, signal: params.signal });
   let importedCount = 0;
+  params.onProgress?.({ importedCount, totalCount: items.length });
   const workingDirectory = typeof params.workingDirectory === 'string' && params.workingDirectory.trim().length > 0
     ? params.workingDirectory.trim()
     : params.linked.sessionPath;
 
   for (const item of items) {
+    params.signal?.throwIfAborted();
     const raw = await adoptDirectSessionMediaForImport({
       raw: item.raw,
       sessionId: params.sessionId,
       messageLocalId: item.localId ?? item.id,
       workingDirectory,
     });
+    params.signal?.throwIfAborted();
     const content = buildStoredMessageContent({
       rawSession: params.linked.rawSession,
       credentials: params.credentials,
@@ -133,7 +147,9 @@ export async function importDirectSessionTranscript(params: Readonly<{
       }),
     });
     importedCount += 1;
+    params.onProgress?.({ importedCount, totalCount: items.length });
   }
 
+  params.signal?.throwIfAborted();
   return { importedCount };
 }

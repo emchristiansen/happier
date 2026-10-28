@@ -31,6 +31,7 @@ for (const { subcommand, scriptName } of [
             ...process.env,
             MINISIGN_SECRET_KEY: 'untrusted comment: minisign encrypted secret key\nRWQpH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1vH1',
             MINISIGN_PASSPHRASE: 'x',
+            HAPPIER_RELEASE_PUBLISHED_VERSIONS_JSON: JSON.stringify({ github: {}, npm: {} }),
           },
           encoding: 'utf8',
           stdio: ['ignore', 'pipe', 'pipe'],

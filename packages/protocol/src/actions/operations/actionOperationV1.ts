@@ -171,10 +171,10 @@ export type ActionOperationSnapshotV1 = z.infer<typeof ActionOperationSnapshotV1
 export const ActionOperationRevisionEphemeralV1Schema = z.object({
   type: z.literal('action-operation-updated'),
   machineId: ActionOperationIdentifierSchema,
-  content: z.object({
-    t: z.literal('encrypted'),
-    c: z.string().trim().min(1),
-  }).strict(),
+  content: z.discriminatedUnion('t', [
+    z.object({ t: z.literal('encrypted'), c: z.string().trim().min(1) }).strict(),
+    z.object({ t: z.literal('plain'), v: ActionOperationSnapshotV1Schema }).strict(),
+  ]),
 }).strict();
 export type ActionOperationRevisionEphemeralV1 = z.infer<typeof ActionOperationRevisionEphemeralV1Schema>;
 

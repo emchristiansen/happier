@@ -3,6 +3,36 @@ export type ExecutionRunTimeoutError = Error & Readonly<{
   livenessProbe?: unknown;
 }>;
 
+export type ExecutionRunInteractionUnavailableError = Error & Readonly<{
+  executionRunErrorCode: 'execution_run_interaction_unavailable';
+}>;
+
+export const EXECUTION_RUN_SEND_OUTCOME_UNKNOWN_CODE = 'execution_run_send_outcome_unknown' as const;
+export const EXECUTION_RUN_SEND_OUTCOME_UNKNOWN_MESSAGE =
+  'The input may have been accepted before the provider request failed';
+
+export type ExecutionRunSendOutcomeUnknownError = Error & Readonly<{
+  executionRunErrorCode: typeof EXECUTION_RUN_SEND_OUTCOME_UNKNOWN_CODE;
+}>;
+
+export function createExecutionRunSendOutcomeUnknownError(): ExecutionRunSendOutcomeUnknownError {
+  const error = new Error(EXECUTION_RUN_SEND_OUTCOME_UNKNOWN_MESSAGE) as ExecutionRunSendOutcomeUnknownError;
+  Object.assign(error, {
+    executionRunErrorCode: EXECUTION_RUN_SEND_OUTCOME_UNKNOWN_CODE,
+  });
+  return error;
+}
+
+export function createExecutionRunInteractionUnavailableError(): ExecutionRunInteractionUnavailableError {
+  const error = new Error(
+    'Execution run permission approval is required, but no response route is available',
+  ) as ExecutionRunInteractionUnavailableError;
+  Object.assign(error, {
+    executionRunErrorCode: 'execution_run_interaction_unavailable' as const,
+  });
+  return error;
+}
+
 export function createExecutionRunTimeoutError(params: Readonly<{
   timeoutMs: number;
   errorCode: string;

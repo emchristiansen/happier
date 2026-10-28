@@ -43,60 +43,52 @@ export function applyReachableTargetsToSessionListRenderables(
         return params.sessions;
     }
 
-    let changed = false;
-    const nextSessions = Object.fromEntries(
-        Object.entries(params.sessions).map(([sessionId, session]) => {
-            const sessionRecord = sessionRecords[sessionId];
-            if (!sessionRecord) {
-                return [sessionId, session];
-            }
+    let nextSessions: Record<string, SessionListRenderableSession> | null = null;
+    for (const sessionId in params.sessions) {
+        if (!Object.prototype.hasOwnProperty.call(params.sessions, sessionId)) continue;
+        const session = params.sessions[sessionId];
+        const sessionRecord = sessionRecords[sessionId];
+        if (!sessionRecord) continue;
 
-            const metadata = sessionRecord.metadata ?? null;
-            const project = params.getProjectForSession?.(sessionId) ?? null;
-            const target = resolveSessionDisplayTarget({
-                sessionActive: sessionRecord.active === true,
-                sessionMachineId: resolveSessionMachineId(metadata),
-                sessionPath: normalizeNonEmptyString(metadata?.path),
-                projectMachineId: normalizeNonEmptyString(project?.key?.machineId),
-                projectPath: normalizeNonEmptyString(project?.key?.path),
-                machines,
-            });
+        const metadata = sessionRecord.metadata ?? null;
+        const project = params.getProjectForSession?.(sessionId) ?? null;
+        const target = resolveSessionDisplayTarget({
+            sessionActive: sessionRecord.active === true,
+            sessionMachineId: resolveSessionMachineId(metadata),
+            sessionPath: normalizeNonEmptyString(metadata?.path),
+            projectMachineId: normalizeNonEmptyString(project?.key?.machineId),
+            projectPath: normalizeNonEmptyString(project?.key?.path),
+            machines,
+        });
 
-            if (!target || !session.metadata) {
-                return [sessionId, session];
-            }
+        if (!target || !session.metadata) continue;
 
-            const targetMachine = machineRecords[target.machineId];
-            const nextMetadata = {
+        const targetMachine = machineRecords[target.machineId];
+        const nextHomeDir = normalizeNonEmptyString(targetMachine?.metadata?.homeDir) ?? session.metadata.homeDir ?? null;
+        const nextHost = normalizeNonEmptyString(targetMachine?.metadata?.host) ?? session.metadata.host ?? null;
+
+        const metadataChanged =
+            target.machineId !== session.metadata.machineId
+            || target.basePath !== session.metadata.path
+            || nextHomeDir !== (session.metadata.homeDir ?? null)
+            || nextHost !== (session.metadata.host ?? null);
+
+        if (!metadataChanged) continue;
+
+        nextSessions ??= { ...params.sessions };
+        nextSessions[sessionId] = {
+            ...session,
+            metadata: {
                 ...session.metadata,
                 machineId: target.machineId,
                 path: target.basePath,
-                homeDir: normalizeNonEmptyString(targetMachine?.metadata?.homeDir) ?? session.metadata.homeDir ?? null,
-                host: normalizeNonEmptyString(targetMachine?.metadata?.host) ?? session.metadata.host ?? null,
-            };
+                homeDir: nextHomeDir,
+                host: nextHost,
+            },
+        };
+    }
 
-            const metadataChanged =
-                nextMetadata.machineId !== session.metadata.machineId
-                || nextMetadata.path !== session.metadata.path
-                || (nextMetadata.homeDir ?? null) !== (session.metadata.homeDir ?? null)
-                || (nextMetadata.host ?? null) !== (session.metadata.host ?? null);
-
-            if (!metadataChanged) {
-                return [sessionId, session];
-            }
-
-            changed = true;
-            return [
-                sessionId,
-                {
-                    ...session,
-                    metadata: nextMetadata,
-                },
-            ];
-        }),
-    ) as Record<string, SessionListRenderableSession>;
-
-    return changed ? nextSessions : params.sessions;
+    return nextSessions ?? params.sessions;
 }
 
 export function buildSessionListViewDataWithServerScope(params: {

@@ -61,9 +61,9 @@ vi.mock('../waitForRegexInFile', () => ({
 
 import {
     resolveCliTerminalConnectOwnershipLeasesDir,
-    sanitizeCliTerminalConnectEnv,
     startCliAuthLoginForTerminalConnect,
 } from './cliTerminalConnect';
+import { sanitizeCliTestEnv } from '../process/cliTestEnv';
 import { spawnDetachedTestProcess } from '../process/testSpawn';
 
 afterEach(() => {
@@ -98,9 +98,9 @@ function deriveServerIdFromUrl(url: string): string {
     return `env_${(h >>> 0).toString(16)}`;
 }
 
-describe('sanitizeCliTerminalConnectEnv', () => {
+describe('sanitizeCliTestEnv', () => {
     it('strips ambient server-selection overrides while preserving unrelated harness env', () => {
-        const sanitized = sanitizeCliTerminalConnectEnv({
+        const sanitized = sanitizeCliTestEnv({
             PATH: '/usr/bin',
             HAPPIER_ACTIVE_SERVER_ID: 'ambient-server',
             HAPPIER_DAEMON_SERVICE_INSTANCE_ID: 'ambient-instance',

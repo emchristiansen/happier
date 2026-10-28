@@ -1,4 +1,7 @@
-import type { ProviderAccountUsageSnapshotV1 } from '@happier-dev/protocol';
+import {
+  isConnectedServiceQuotaObservationFresh,
+  type ProviderAccountUsageSnapshotV1,
+} from '@happier-dev/protocol';
 
 export type QuotaLifecycleEvidenceRejectionReason =
   | 'generation_mismatch'
@@ -44,11 +47,11 @@ export function canDriveQuotaLifecycleEdge(input: Readonly<{
   }
 
   const fetchedAtMs = input.snapshot.fetchedAtMs;
-  const staleAtMs = fetchedAtMs + input.snapshot.staleAfterMs;
-  if (
-    input.nowMs > staleAtMs
-    || input.nowMs - fetchedAtMs > input.quotaFreshnessMs
-  ) {
+  if (!isConnectedServiceQuotaObservationFresh({
+    observedAtMs: fetchedAtMs,
+    nowMs: input.nowMs,
+    maxAgeMs: Math.min(input.snapshot.staleAfterMs, input.quotaFreshnessMs),
+  })) {
     return { ok: false, reason: 'stale' };
   }
 

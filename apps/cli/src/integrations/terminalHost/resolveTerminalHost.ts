@@ -14,6 +14,20 @@ export function resolveTerminalHost(params: Readonly<{
 }>): TerminalHostResolution {
   const { preference, platform, adapters } = params;
 
+  if (preference === 'herdr') {
+    if (platform.os === 'win32') {
+      return {
+        status: 'disabled',
+        reason: 'herdr_attach_unsupported_on_windows',
+        message: 'Herdr direct terminal attach is unavailable on native Windows; use WSL2.',
+      };
+    }
+    if (!adapters.herdr) {
+      return { status: 'disabled', reason: 'herdr_unavailable', message: 'A supported Herdr installation is required.' };
+    }
+    return { status: 'resolved', adapter: adapters.herdr, reason: 'herdr_forced' };
+  }
+
   if (preference === 'tmux') {
     if (platform.os === 'win32') {
       return {

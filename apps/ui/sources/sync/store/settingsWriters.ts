@@ -6,8 +6,8 @@ import { getSyncSingleton } from '@/sync/runtime/getSyncSingleton';
 import type { SettingsAnalyticsSource } from '@/track/settingsAnalytics/types';
 import { getStorage } from '@/sync/domains/state/storageStore';
 
-function applyLocalSettingsFromStore(delta: Partial<LocalSettings>, source: SettingsAnalyticsSource): void {
-  getStorage().getState().applyLocalSettings(delta, { source });
+export function applyLocalSettingsFromUi(delta: Partial<LocalSettings>): void {
+  getStorage().getState().applyLocalSettings(delta, { source: 'ui' satisfies SettingsAnalyticsSource });
 }
 
 export function useApplySettings(): (delta: Partial<Settings>) => void {
@@ -22,6 +22,6 @@ export function applySystemSettings(delta: Partial<Settings>): void {
 
 export function useApplyLocalSettings(): (delta: Partial<LocalSettings>) => void {
   return React.useCallback((delta: Partial<LocalSettings>) => {
-    applyLocalSettingsFromStore(delta, 'ui');
+    applyLocalSettingsFromUi(delta);
   }, []);
 }

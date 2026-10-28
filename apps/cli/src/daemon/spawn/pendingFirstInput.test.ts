@@ -34,7 +34,7 @@ describe('pending first input handoff', () => {
       'Pending first input local id must not be blank',
     );
   });
-  it('coalesces concurrent readiness callbacks into one durable first-input commit', async () => {
+  it('commits the fresh runtime bootstrap as one urgent durable input', async () => {
     const env: NodeJS.ProcessEnv = {
       [HAPPIER_DAEMON_PENDING_FIRST_INPUT_ENV_KEY]: serializePendingFirstInputForEnv({
         text: 'only once',
@@ -49,6 +49,12 @@ describe('pending first input handoff', () => {
     const first = committer.commit({ enqueueSessionUserMessage });
     const duplicate = committer.commit({ enqueueSessionUserMessage });
     expect(enqueueSessionUserMessage).toHaveBeenCalledOnce();
+    expect(enqueueSessionUserMessage).toHaveBeenCalledWith({
+      text: 'only once',
+      localId: 'spawn-first:concurrent',
+      meta: { source: 'ui', sentFrom: 'cli' },
+      requestedAction: { v: 1, kind: 'send_now' },
+    });
     expect(committer.hasPendingInput).toBe(true);
 
     release();

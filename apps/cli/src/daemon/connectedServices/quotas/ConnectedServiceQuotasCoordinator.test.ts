@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   buildProviderAccountUsageRecordId,
+  buildRecoveryCreditConsumeIdempotencyKey,
   accountSettingsParse,
   buildConnectedServiceCredentialRecord,
   ConnectedServiceQuotaSnapshotV1Schema,
@@ -16,14 +17,18 @@ import type {
   ProviderAccountUsageSnapshotV1,
 } from '@happier-dev/protocol';
 import { randomBytes } from 'node:crypto';
+import { sealLegacyConnectedServiceQuotaSnapshotFixtureCiphertext } from '@happier-dev/protocol/testing/accountScopedCipherFixtures';
 
 import type { Credentials } from '@/persistence';
+import { logger } from '@/ui/logger';
 import { dispatchConnectedServiceAutomaticQuotaResetNotificationAsync } from '../notifications/dispatchConnectedServiceQuotaLifecycleNotification';
 import { createOpenAiCodexQuotaFetcher } from '@/backends/codex/connectedServices/quotaFetcher';
+import { createClaudeSubscriptionQuotaFetcher } from '@/backends/claude/connectedServices/quotaFetcher';
 import { invalidateConnectedServiceAccountMode } from '@/cloud/connectedServices/resolveConnectedServiceAccountMode';
 import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '../connectedServiceChildEnvironment';
 import { ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore } from '../accountGroups/quotas/ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore';
 import { createProviderAccountUsageStore } from '../accountUsage/store';
+import { computeConnectedServiceAccessTokenFingerprint } from '../refresh/credentialFreshness/tokenFingerprint';
 import { CLAUDE_SUBSCRIPTION_OAUTH_SCOPE } from '../descriptors/connectedAccountDescriptors';
 import { ConnectedServiceQuotasCoordinator } from './ConnectedServiceQuotasCoordinator';
 import type { RuntimeAccountIdentityProbeResult } from './identity/runtimeAccountIdentityTypes';
@@ -304,13 +309,243 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     invalidateConnectedServiceAccountMode();
   });
 
+  it.each([
+    ['plain', undefined, true, false],
+    ['e2ee', undefined, true, false],
+    ['plain', 'org-other', false, false],
+    ['plain', 'org-work', false, false],
+    ['plain', 'org-work', false, true],
+  ] as const)('refreshes legacy Claude quota and validates current credential scope (%s, %s, fetch=%s, credentialUnavailable=%s)', async (mode, organizationId, expectedFetch, credentialUnavailable) => {
+    const now = 1_000_000;
+    const secret = new Uint8Array(32).fill(9);
+    const credentials = { token: 'happy-token', encryption: { type: 'legacy', secret } } satisfies Credentials;
+    const snapshot = {
+      ...buildQuotaSnapshotFixture({ serviceId: 'claude-subscription', profileId: 'work', now, remainingPct: 90 }),
+      activeAccountId: 'acct-user',
+      ...(organizationId ? { providerOrganizationId: organizationId } : {}),
+    };
+    const record = buildConnectedServiceCredentialRecord({
+      now, serviceId: 'claude-subscription', profileId: 'work', kind: 'oauth', expiresAt: now + 60_000,
+      oauth: { accessToken: 'access', refreshToken: 'refresh', idToken: null, scope: CLAUDE_SUBSCRIPTION_OAUTH_SCOPE,
+        tokenType: null, providerAccountId: 'acct-user', providerEmail: null,
+        raw: { claudeAiOauth: { organizationUuid: 'org-work' } } },
+    });
+    const metadata = { fetchedAt: now, staleAfterMs: snapshot.staleAfterMs, status: 'ok' as const };
+    const api = {
+      getAccountEncryptionMode: async () => mode,
+      listConnectedServiceProfiles: async () => ({ serviceId: 'claude-subscription', profiles: [{ profileId: 'work', status: 'connected' }] }),
+      getConnectedServiceQuotaSnapshotPlain: async () => ({ content: { t: 'plain', v: snapshot }, metadata }),
+      getConnectedServiceQuotaSnapshotSealed: async () => ({
+        sealed: { format: 'account_scoped_v1', ciphertext: sealLegacyConnectedServiceQuotaSnapshotFixtureCiphertext({
+          material: { type: 'legacy', secret }, payload: snapshot,
+          randomBytes: (length) => randomBytes(length),
+        }) }, metadata,
+      }),
+      getConnectedServiceCredentialPlain: async () => {
+        if (credentialUnavailable) throw new Error('credential transport unavailable');
+        return { content: { t: 'plain', v: record } };
+      },
+      getConnectedServiceCredentialSealed: async () => ({
+        sealed: { format: 'account_scoped_v1', ciphertext: sealAccountScopedBlobCiphertext({
+          kind: 'connected_service_credential', material: { type: 'legacy', secret }, payload: record,
+          randomBytes: (length) => randomBytes(length),
+        }) },
+      }),
+    } as unknown as QuotaApi;
+    const fetchQuota = vi.fn(async () => { throw new ConnectedServiceQuotaFetchError('offline', { quotaFetchErrorCode: 'network' }); });
+    const accountUsageStore = createProviderAccountUsageStore();
+    const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
+    const source = { serviceId: 'claude-subscription', profileId: 'work', bindingKind: 'profile' } as const;
+    const groupSource = { ...source, bindingKind: 'group_member', groupId: 'team', groupGeneration: 1 } as const;
+    const otherSource = { ...source, profileId: 'other' };
+    const oldRecordKey = {
+      providerId: 'claude', accountSubjectId: 'acct-user', subjectKind: 'account',
+      quotaScope: 'organization', quotaScopeId: 'org-other',
+    } as const;
+    const oldUsage = ProviderAccountUsageSnapshotV1Schema.parse({
+      v: 1, recordKey: oldRecordKey, recordId: buildProviderAccountUsageRecordId(oldRecordKey), providerId: 'claude',
+      accountSubject: { kind: 'providerSubject', id: 'acct-user' }, observedAtMs: now, fetchedAtMs: now,
+      staleAfterMs: snapshot.staleAfterMs, source: 'providerHttp', confidence: 'confirmed', meters: snapshot.meters,
+    });
+    const currentRecordKey = { ...oldRecordKey, quotaScopeId: 'org-work' };
+    const currentUsage = { ...oldUsage, recordKey: currentRecordKey, recordId: buildProviderAccountUsageRecordId(currentRecordKey) };
+    const currentGroupSource = { ...groupSource, groupId: 'current-team' };
+    if (organizationId === 'org-other') {
+      accountUsageStore.recordSnapshot(oldUsage, { sources: [groupSource, otherSource] });
+      accountUsageStore.recordSnapshot(currentUsage, { sources: [source, currentGroupSource] });
+      runtimeQuotaSnapshots.recordSnapshot({ serviceId: source.serviceId, profileId: 'work', groupId: 'team', snapshot });
+      runtimeQuotaSnapshots.recordSnapshot({ serviceId: source.serviceId, profileId: 'work', groupId: 'current-team',
+        snapshot: { ...snapshot, providerOrganizationId: 'org-work' } });
+    } else if (credentialUnavailable) {
+      accountUsageStore.recordSnapshot(currentUsage, { sources: [source, groupSource, otherSource] });
+      runtimeQuotaSnapshots.recordSnapshot({ serviceId: source.serviceId, profileId: 'work', groupId: 'team',
+        snapshot: { ...snapshot, fetchedAt: now - 30_000,
+          meters: [{ ...snapshot.meters[0]!, utilizationPct: 5, remainingPct: 95 }] } });
+      runtimeQuotaSnapshots.recordSnapshot({ serviceId: source.serviceId, profileId: 'work', groupId: 'team', snapshot });
+      expect(runtimeQuotaSnapshots.getRecentBurn({ serviceId: source.serviceId, profileId: 'work', groupId: 'team' })).not.toBeNull();
+    }
+    const coordinator = new ConnectedServiceQuotasCoordinator({
+      api, credentials, accountUsageStore, runtimeQuotaSnapshots, quotaFetchers: [{ serviceId: 'claude-subscription', fetch: fetchQuota }],
+      now: () => now, randomBytes: (length) => randomBytes(length), discoveryEnabled: true,
+    });
+
+    await coordinator.tickOnce();
+
+    expect(fetchQuota).toHaveBeenCalledTimes(expectedFetch ? 1 : 0);
+    expect(accountUsageStore.listSnapshots()).toEqual(organizationId === 'org-other'
+      ? expect.arrayContaining([oldUsage, currentUsage]) : credentialUnavailable ? [currentUsage] : []);
+    if (organizationId === 'org-other') {
+      expect(accountUsageStore.resolveBySource(source)).toEqual(currentUsage);
+      expect(accountUsageStore.resolveBySource(groupSource)).toBeNull();
+      expect(accountUsageStore.resolveBySource(otherSource)).toEqual(oldUsage);
+      expect(accountUsageStore.resolveBySource(currentGroupSource)).toEqual(currentUsage);
+      expect(runtimeQuotaSnapshots.getSnapshot({ serviceId: source.serviceId, groupId: 'team', profileId: 'work' }))
+        .toMatchObject({ providerOrganizationId: 'org-work' });
+    } else if (credentialUnavailable) {
+      expect(accountUsageStore.resolveBySource(source)).toEqual(currentUsage);
+      expect(accountUsageStore.resolveBySource(groupSource)).toEqual(currentUsage);
+      expect(runtimeQuotaSnapshots.getSnapshot({ serviceId: source.serviceId, groupId: 'team', profileId: 'work' })).toEqual(snapshot);
+      expect(runtimeQuotaSnapshots.getRecentBurn({ serviceId: source.serviceId, profileId: 'work', groupId: 'team' })).not.toBeNull();
+    } else {
+      expect(runtimeQuotaSnapshots.getSnapshot({ serviceId: source.serviceId, groupId: 'team', profileId: 'work' })).toBeNull();
+    }
+  });
+
+  it('reuses verified current-token local usage with unknown organization and refreshes after token replacement', async () => {
+    let now = 1_000_000;
+    let currentAccessToken = 'access-a';
+    let credentialUnavailable = false;
+    // The default file logger is the diagnostic output boundary for failed credential reads.
+    const diagnosticSink = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
+    const credentials = { token: 'happy-token', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) } } satisfies Credentials;
+    const buildRecord = () => buildConnectedServiceCredentialRecord({
+      now, serviceId: 'claude-subscription', profileId: 'work', kind: 'oauth', expiresAt: now + 3_600_000,
+      oauth: { accessToken: currentAccessToken, refreshToken: 'refresh', idToken: null, scope: CLAUDE_SUBSCRIPTION_OAUTH_SCOPE,
+        tokenType: null, providerAccountId: 'acct-user', providerEmail: 'user@example.com', raw: {} },
+    });
+    const api = {
+      getAccountEncryptionMode: async () => 'plain',
+      getConnectedServiceQuotaSnapshotPlain: async () => null,
+      getConnectedServiceQuotaSnapshotSealed: async () => null,
+      getConnectedServiceCredentialPlain: async () => {
+        if (credentialUnavailable) throw new Error('Credential read unavailable');
+        return { content: { t: 'plain', v: buildRecord() } };
+      },
+      registerProviderAccountUsageSnapshotPlain: async () => {},
+    } as unknown as QuotaApi;
+    const providerRequests: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request) => {
+      providerRequests.push(String(url));
+      return new Response(JSON.stringify({ five_hour: { utilization: 20, resets_at: new Date(now + 300_000).toISOString() } }), { status: 200 });
+    }));
+    const accountUsageStore = createProviderAccountUsageStore();
+    const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
+    const coordinator = new ConnectedServiceQuotasCoordinator({ api, credentials, accountUsageStore, runtimeQuotaSnapshots,
+      quotaFetchers: [createClaudeSubscriptionQuotaFetcher({ staleAfterMs: 60_000 })], now: () => now, randomBytes,
+    });
+    coordinator.registerSpawnTarget({ pid: 123, connectedServicesBindingsRaw: {
+      v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', profileId: 'work' } },
+    } });
+    await coordinator.tickOnce();
+    expect(runtimeQuotaSnapshots.getSnapshotEntry({ serviceId: 'claude-subscription', profileId: 'work' })?.verifiedCredentialFingerprint)
+      .toBe(computeConnectedServiceAccessTokenFingerprint('access-a'));
+    expect(providerRequests.filter((url) => url.endsWith('/api/oauth/usage'))).toHaveLength(1);
+    expect(accountUsageStore.resolveBySource({ serviceId: 'claude-subscription', profileId: 'work', bindingKind: 'profile' })).toBeNull();
+    now += 120_000;
+    await coordinator.tickOnce();
+    expect(providerRequests.filter((url) => url.endsWith('/api/oauth/usage'))).toHaveLength(1);
+    const acceptedEntry = runtimeQuotaSnapshots.getSnapshotEntry({ serviceId: 'claude-subscription', profileId: 'work' });
+    credentialUnavailable = true;
+    now += 1;
+    await coordinator.tickOnce();
+    expect(runtimeQuotaSnapshots.getSnapshotEntry({ serviceId: 'claude-subscription', profileId: 'work' })).toEqual(acceptedEntry);
+    expect(diagnosticSink.mock.calls.some(([, details]) => typeof details === 'object' && details !== null
+      && 'code' in details && details.code === 'quota_credential_lookup_unavailable'
+      && 'serviceId' in details && details.serviceId === 'claude-subscription'
+      && 'profileId' in details && details.profileId === 'work')).toBe(true);
+    credentialUnavailable = false;
+    now += 1;
+    await coordinator.tickOnce();
+    expect(providerRequests.filter((url) => url.endsWith('/api/oauth/usage'))).toHaveLength(1);
+    currentAccessToken = 'access-c';
+    now += 1;
+    await coordinator.tickOnce();
+    expect(providerRequests.filter((url) => url.endsWith('/api/oauth/usage'))).toHaveLength(2);
+  });
+
+  it('uses the qualified local observation budget when the released plaintext relay projection omits organization', async () => {
+    let now = 1_000_000;
+    let organizationId = 'org-a';
+    const credentials = {
+      token: 'happy-token', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
+    } satisfies Credentials;
+    // Server v0.2.16 (22ac8263cfdbcdb845441b9044ff18199cf7652e),
+    // providerAccountUsage/projections.ts: the released quota view omits organization scope.
+    const releasedQuotaView = {
+      content: { t: 'plain', v: {
+        v: 1, serviceId: 'claude-subscription', profileId: 'work', fetchedAt: now, staleAfterMs: 60_000,
+        planLabel: 'Pro', accountLabel: 'user@example.com', providerId: 'claude', activeAccountId: 'acct-user',
+        fetchedAtMs: now, staleAtMs: now + 60_000, source: 'provider_api', confidence: 'exact', meters: [],
+      } },
+      metadata: { fetchedAt: now, staleAfterMs: 60_000, status: 'ok', refreshRequestedAt: 0 },
+    };
+    const api = {
+      getAccountEncryptionMode: async () => 'plain',
+      getConnectedServiceQuotaSnapshotPlain: async () => releasedQuotaView,
+      getConnectedServiceQuotaSnapshotSealed: async () => null,
+      getConnectedServiceCredentialPlain: async () => ({ content: { t: 'plain', v: buildConnectedServiceCredentialRecord({
+        now, serviceId: 'claude-subscription', profileId: 'work', kind: 'oauth', expiresAt: now + 3_600_000,
+        oauth: { accessToken: `access-${organizationId}`, refreshToken: 'refresh', idToken: null,
+          scope: CLAUDE_SUBSCRIPTION_OAUTH_SCOPE, tokenType: null, providerAccountId: 'acct-user', providerEmail: 'user@example.com',
+          raw: { claudeAiOauth: { organizationUuid: organizationId } } },
+      }) } }),
+      registerProviderAccountUsageSnapshotPlain: async () => {},
+    } as unknown as QuotaApi;
+    const providerRequests: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request) => {
+      providerRequests.push(String(url));
+      return new Response(JSON.stringify({ five_hour: { utilization: 20, resets_at: new Date(now + 300_000).toISOString() } }), { status: 200 });
+    }));
+    const accountUsageStore = createProviderAccountUsageStore();
+    const coordinator = new ConnectedServiceQuotasCoordinator({
+      api, credentials, accountUsageStore, quotaFetchers: [createClaudeSubscriptionQuotaFetcher({ staleAfterMs: 60_000 })],
+      now: () => now, randomBytes,
+    });
+    coordinator.registerSpawnTarget({ pid: 123, connectedServicesBindingsRaw: {
+      v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', profileId: 'work' } },
+    } });
+    await coordinator.tickOnce();
+    const source = { serviceId: 'claude-subscription', profileId: 'work', bindingKind: 'profile' } as const;
+    expect(accountUsageStore.resolveBySource(source)?.recordKey).toMatchObject({ quotaScope: 'organization', quotaScopeId: 'org-a' });
+    expect(providerRequests.filter((url) => url.endsWith('/api/oauth/usage'))).toHaveLength(1);
+
+    const requestsAfterFirstObservation = providerRequests.length;
+    now += 120_000;
+    await coordinator.tickOnce();
+    expect(providerRequests.filter((url) => url.endsWith('/api/oauth/usage'))).toHaveLength(1);
+
+    expect(providerRequests).toHaveLength(requestsAfterFirstObservation);
+
+    organizationId = 'org-b';
+    now += 1;
+    await coordinator.tickOnce();
+    expect(providerRequests.filter((url) => url.endsWith('/api/oauth/usage'))).toHaveLength(2);
+    expect(providerRequests.some((url) => url.endsWith('/api/oauth/profile'))).toBe(false);
+    expect(accountUsageStore.resolveBySource(source)?.recordKey).toMatchObject({ quotaScope: 'organization', quotaScopeId: 'org-b' });
+
+    now += 1;
+    releasedQuotaView.metadata.refreshRequestedAt = now;
+    await coordinator.tickOnce();
+    expect(providerRequests.filter((url) => url.endsWith('/api/oauth/usage'))).toHaveLength(3);
+  });
+
   it('skips quota bridge fetches for known reconnect-required profiles', async () => {
     let now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
 
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
@@ -367,11 +602,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('fetches and uploads plaintext provider-account usage snapshots for plaintext accounts', async () => {
     let now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
-      encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
-    if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
+      encryption: null,
+    } satisfies Credentials;
 
     const record = buildConnectedServiceCredentialRecord({
       now,
@@ -437,6 +671,79 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     expect((api as any).registerProviderAccountUsageSnapshotPlain).toHaveBeenCalledTimes(1);
   });
 
+  it('refreshes a persisted quota snapshot whose capture time is in the future', async () => {
+    const now = 1_000_000;
+    const credentials = {
+      token: 'happy-token',
+      encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
+    } satisfies Credentials;
+    const record = buildConnectedServiceCredentialRecord({
+      now,
+      serviceId: 'openai-codex',
+      profileId: 'work',
+      kind: 'oauth',
+      expiresAt: now + 60_000,
+      oauth: {
+        accessToken: 'access',
+        refreshToken: 'refresh',
+        idToken: null,
+        scope: null,
+        tokenType: null,
+        providerAccountId: 'acct',
+        providerEmail: 'user@example.com',
+      },
+    });
+    const poisoned = buildQuotaSnapshotFixture({
+      serviceId: 'openai-codex',
+      profileId: 'work',
+      now: now + 600_000,
+      remainingPct: 0,
+    });
+    const api = {
+      getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
+      getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => ({
+        content: { t: 'plain' as const, v: poisoned },
+        metadata: {
+          fetchedAt: poisoned.fetchedAt,
+          staleAfterMs: poisoned.staleAfterMs,
+          status: 'ok' as const,
+        },
+      })),
+      getConnectedServiceCredentialPlain: vi.fn(async () => ({ content: { t: 'plain' as const, v: record } })),
+      registerProviderAccountUsageSnapshotPlain: vi.fn(async () => {}),
+      getConnectedServiceQuotaSnapshotSealed: vi.fn(async () => null),
+      getConnectedServiceCredentialSealed: vi.fn(async () => null),
+      registerProviderAccountUsageSnapshotSealed: vi.fn(async () => {}),
+    } as unknown as QuotaApi;
+    const fetcher: ConnectedServiceQuotaFetcher = {
+      serviceId: 'openai-codex',
+      fetch: vi.fn(async () => buildQuotaSnapshotFixture({
+        serviceId: 'openai-codex',
+        profileId: 'work',
+        now,
+        remainingPct: 80,
+      })),
+    };
+    const coordinator = new ConnectedServiceQuotasCoordinator({
+      api,
+      credentials,
+      quotaFetchers: [fetcher],
+      now: () => now,
+      randomBytes: (length: number) => randomBytes(length),
+    });
+    coordinator.registerSpawnTarget({
+      pid: 123,
+      connectedServicesBindingsRaw: {
+        v: 1,
+        bindingsByServiceId: { 'openai-codex': { source: 'connected', profileId: 'work' } },
+      },
+    });
+
+    await coordinator.tickOnce();
+
+    expect(fetcher.fetch).toHaveBeenCalledTimes(1);
+  });
+
   it('consumes recovery credits through the quota fetcher and persists a refreshed plaintext snapshot', async () => {
     let now = 1_000_000;
     const accountUsageStore = createProviderAccountUsageStore();
@@ -444,10 +751,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
       recordInBandSnapshot: vi.fn(async () => ({ status: 'enqueued' as const, enqueue: 'accepted' as const })),
     };
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const record = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -695,7 +1002,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
       expect(sendToAllDevicesAsync).not.toHaveBeenCalled();
       return;
     }
-    const idempotencyKey = `connected-service-quota-recovery-credit:v1:openai-codex:work:${inventory === 'concrete' ? 'credit:earlier' : `aggregate:${now}`}`;
+    const idempotencyKey = buildRecoveryCreditConsumeIdempotencyKey({
+      serviceId: 'openai-codex', profileId: 'work', sourceSnapshotFetchedAtMs: now,
+      ...(inventory === 'concrete' ? { providerCreditId: 'earlier' } : {}),
+    });
     expect(result).toMatchObject({ ok: true, receipt: { idempotencyKey, status: 'consumed' } });
     await coordinator.consumeRecoveryCreditForProfile({
       serviceId: 'openai-codex', profileId: 'work', idempotencyKey,
@@ -745,10 +1055,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('does not refresh near-expiry OAuth credentials before recovery credit consumption', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const staleRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -832,10 +1142,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('does not refresh or retry recovery credit consumption after a provider auth failure', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const staleRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -968,8 +1278,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
       fetchedAt += 60_000;
       expect(await coordinator.consumeAvailableRecoveryCreditForProfile(request)).toEqual(first);
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      await coordinator.consumeRecoveryCreditForProfile({ ...request, idempotencyKey: 'manual-selected', providerCreditId: 'next-credit' });
-      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(await coordinator.consumeRecoveryCreditForProfile({
+        ...request, idempotencyKey: 'manual-selected-new-observation', providerCreditId: 'next-credit',
+      })).toEqual(first);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     }
   });
 
@@ -977,10 +1289,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     vi.useFakeTimers();
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const record = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -1061,10 +1373,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('keeps stale useful quota data when a disabled fetcher returns quota_unknown', async () => {
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const record = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'claude-subscription',
@@ -1079,6 +1391,7 @@ describe('ConnectedServiceQuotasCoordinator', () => {
         tokenType: null,
         providerAccountId: 'acct',
         providerEmail: 'user@example.com',
+        raw: { claudeAiOauth: { organizationUuid: 'org-work' } },
       },
     });
     const staleUsefulSnapshot: ConnectedServiceQuotaSnapshotV1 = {
@@ -1089,6 +1402,8 @@ describe('ConnectedServiceQuotasCoordinator', () => {
       staleAfterMs: 1_000,
       planLabel: 'Max',
       accountLabel: 'user@example.com',
+      activeAccountId: 'acct',
+      providerOrganizationId: 'org-work',
       meters: [
         {
           meterId: 'five_hour',
@@ -1173,10 +1488,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('isolates provider fetch failures so one provider does not break another usage display update', async () => {
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const claudeRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'claude-subscription',
@@ -1305,10 +1620,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('records fetched quota snapshots under the credential provider account when the provider omits active account id', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const record = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'claude-subscription',
@@ -1323,6 +1638,7 @@ describe('ConnectedServiceQuotasCoordinator', () => {
         tokenType: null,
         providerAccountId: 'claude-provider-account',
         providerEmail: 'claude@example.com',
+        raw: { claudeAiOauth: { organizationUuid: 'org-work' } },
       },
     });
     const api = {
@@ -1336,12 +1652,12 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     } as unknown as QuotaApi;
     const fetcher: ConnectedServiceQuotaFetcher = {
       serviceId: 'claude-subscription',
-      fetch: vi.fn(async ({ record: inputRecord }: FetchArgs) => buildQuotaSnapshotFixture({
+      fetch: vi.fn(async ({ record: inputRecord }: FetchArgs) => ({ ...buildQuotaSnapshotFixture({
         serviceId: inputRecord.serviceId,
         profileId: inputRecord.profileId,
         now,
         remainingPct: 72,
-      })),
+      }), providerOrganizationId: 'org-work' })),
     };
     const coordinator = new ConnectedServiceQuotasCoordinator({
       api,
@@ -1384,10 +1700,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('routes polling quota snapshot writes through daemon server work', async () => {
     let now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const record = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -1470,10 +1786,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('defers polling quota work when the account-mode probe errors', async () => {
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
 
     const record = buildConnectedServiceCredentialRecord({
@@ -1546,10 +1862,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('fetches and uploads sealed quota snapshots for active bindings', async () => {
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
 
     const record = buildConnectedServiceCredentialRecord({
@@ -1668,10 +1984,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('does not source-link provider-account usage when the fetched provider account differs from the credential profile', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
 
     const record = buildConnectedServiceCredentialRecord({
@@ -1752,10 +2068,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('uses resolved group active profiles from child selections when registering spawn targets', async () => {
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
 
     const record = buildConnectedServiceCredentialRecord({
@@ -1852,10 +2168,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('prefers the active group selection over the fallback binding profile after switches', async () => {
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
 
     const activeRecord = buildConnectedServiceCredentialRecord({
@@ -1957,10 +2273,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('asks the auth-group switch coordinator to re-evaluate an active group after refreshing its active profile quota', async () => {
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
 
     const activeRecord = buildConnectedServiceCredentialRecord({
       now,
@@ -2170,10 +2486,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
     const accountUsageStore = createProviderAccountUsageStore();
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const activeRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -2420,10 +2736,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
       }),
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const activeRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -2650,10 +2966,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
       }),
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const activeRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -2829,10 +3145,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
       }),
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const activeRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -2968,10 +3284,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('suppresses proactive soft-threshold switching when target eligibility cannot be resolved', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const activeRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -3079,10 +3395,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('suppresses proactive soft-threshold switching when runtime quota evidence is unhydrated', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const activeRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -3181,10 +3497,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('does not use stale legacy target snapshots before delegating selection to the coordinator', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const activeRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -3538,10 +3854,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('records polling snapshots as canonical account usage before evaluating proactive switching', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const accountUsageStore = createProviderAccountUsageStore();
     const accountUsagePersistence = {
       recordInBandSnapshot: vi.fn(async () => ({ status: 'enqueued' as const, enqueue: 'accepted' as const })),
@@ -3718,10 +4034,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
         resetsAt: now + 600_000,
       }),
     });
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const activeRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -3835,10 +4151,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
       remainingPct: 90,
       resetsAt: now + 600_000,
     }));
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const activeRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -3939,10 +4255,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('does not require per-session recovery permission for the canonical proactive group switch', async () => {
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const activeRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -4052,10 +4368,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('uses the canonical reported session id for proactive soft-threshold policy guards', async () => {
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const activeRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'claude-subscription',
@@ -4070,6 +4386,7 @@ describe('ConnectedServiceQuotasCoordinator', () => {
         tokenType: 'Bearer',
         providerAccountId: 'acct',
         providerEmail: 'user@example.com',
+        raw: { claudeAiOauth: { organizationUuid: 'org-work' } },
       },
     });
     const softSwitchEligibility = createSoftSwitchEligibilityFixture({
@@ -4096,6 +4413,7 @@ describe('ConnectedServiceQuotasCoordinator', () => {
         staleAfterMs: 300_000,
         planLabel: 'Pro',
         accountLabel: 'user@example.com',
+        providerOrganizationId: 'org-work',
         meters: [
           {
             meterId: 'monthly',
@@ -4182,10 +4500,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('keeps proactive soft-threshold switching active without per-session recovery permission', async () => {
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const activeRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -4296,10 +4614,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('deduplicates proactive soft-threshold quota fetches while applying to every session sharing the same group and active profile', async () => {
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const activeRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -4444,10 +4762,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('coalesces proactive soft-threshold checks onto canonical truth for one shared group', async () => {
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const records = new Map(['active-a', 'active-b'].map((profileId) => [profileId, buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -4586,10 +4904,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
         resetsAt: now + 600_000,
       }),
     });
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const activeRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -4696,10 +5014,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('defers quota probes and proactive switch attempts while the local-server storm gate is closed', async () => {
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -4772,10 +5090,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     });
     const runtimeQuotaSnapshots = softSwitchEligibility.runtimeQuotaSnapshots;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
 
     const activeRecord = buildConnectedServiceCredentialRecord({
       now,
@@ -4891,10 +5209,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('fails closed after proving siblings when recipient generation apply is unavailable', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -5002,10 +5320,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('does not fan out through stale snapshot identity whose active profile no longer matches the group binding', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -5087,10 +5405,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('fans out runtime usage-limit reports through the exact source identity index', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -5165,10 +5483,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('fans out runtime usage-limit reports through the supplied exact source account after the source session already switched', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -5286,10 +5604,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('still consumes committed group truth when exact source account identity is unavailable for same-account attribution', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -5420,10 +5738,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
       } | null>;
     }>) => {
       const now = 1_000_000;
-      const credentials: Credentials = {
+      const credentials = {
         token: 'happy-token',
         encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-      };
+      } satisfies Credentials;
       const api = {
         getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
         getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -5576,10 +5894,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('applies warmed direct-live-capable same-account siblings immediately when runtime reconciliation reports an active provider turn', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -5694,10 +6012,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('fans out a broker-indirection (daemon-authoritative) sibling WITHOUT a live probe instead of silently stranding it', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -5801,10 +6119,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('seeds exact runtime account identity from connected-service spawn selection before quota snapshots arrive', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -5900,10 +6218,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('seeds exact runtime account identity from direct registry spawn selection writes', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -5985,10 +6303,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('keeps exact hot-apply runtime identity authoritative when a group session spawn env still names the previous profile', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -6097,10 +6415,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('fails closed when provisional spawn identity cannot be re-proven by live runtime identity', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -6235,10 +6553,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
     for (const testCase of cases) {
       const now = 1_000_000;
-      const credentials: Credentials = {
+      const credentials = {
         token: 'happy-token',
         encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-      };
+      } satisfies Credentials;
       const api = {
         getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
         getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -6455,10 +6773,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('repairs stale expected profile and generation from exact runtime identity before fanout', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -6557,10 +6875,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('suppresses stale expected-state candidates when exact runtime account identity mismatches', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -6648,10 +6966,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('proves shared group auth-surface siblings from registry bindings without runtime probes', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -6730,10 +7048,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('does not create a second generation consumer when durable consumption is unavailable', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -6837,10 +7155,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('fans out runtime usage-limit reports for shared auth surfaces without source provider account ids', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -6906,10 +7224,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('uses runtime failure source generation for shared auth-surface registry fanout when the source target is absent', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -6991,10 +7309,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('excludes shared group auth-surface siblings outside the source generation with registry diagnostics', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -7078,10 +7396,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('applies a committed same-account generation to an exact live idle sibling', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -7191,10 +7509,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('applies committed group truth to every live group member even when provider-account proof differs', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -7271,10 +7589,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     const resetAtMs = now + 600_000;
     const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
     const accountUsageStore = createProviderAccountUsageStore();
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const memberStates = new Map<string, Record<string, unknown>>([
       ['primary', {
         quotaExhaustedUntilMs: resetAtMs,
@@ -7452,10 +7770,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('suppresses same-account exhaustion fanout unless the provider strategy opts into exact account proof', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -7531,10 +7849,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('invalidates a sibling runtime account identity before same-account fanout so stale proof is not reused', async () => {
     let now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -7625,10 +7943,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('invalidates runtime account identity on pid transfer before same-account fanout', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -7709,10 +8027,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('coalesces duplicate same-account exhaustion fanout for the same provider account and reset bucket', async () => {
     let now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -7818,10 +8136,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('does not coalesce a same-account exhaustion fanout until there is a proven sibling candidate', async () => {
     let now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -7910,10 +8228,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('does not coalesce same-account exhaustion fanout across independent groups', async () => {
     let now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -8005,10 +8323,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('exposes fresh quota snapshots as central quota_probe_fresh proof without account-adoption proof', () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -8075,10 +8393,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000_000);
     const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const getConnectedServiceCredentialPlain = vi.fn((input: Readonly<{
       profileId: string;
       signal?: AbortSignal;
@@ -8157,10 +8475,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     vi.setSystemTime(1_000_000);
     try {
       const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
-      const credentials: Credentials = {
+      const credentials = {
         token: 'happy-token',
         encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-      };
+      } satisfies Credentials;
       const acquireConnectedServiceRefreshLease = vi.fn((input: Readonly<{ signal?: AbortSignal }>) => (
         new Promise<Readonly<{ acquired: boolean; leaseUntil: number }>>((resolve) => {
           input.signal?.addEventListener('abort', () => resolve({ acquired: false, leaseUntil: 0 }), { once: true });
@@ -8530,10 +8848,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     const now = 1_000_000;
     const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const record = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -8679,10 +8997,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     const resetAtMs = now + 500_000;
     const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const buildRecord = (profileId: string) => buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -8902,14 +9220,14 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   });
 
   it('emits quota blocked/recovered lifecycle transitions from live account-usage group-state changes', async () => {
-    const now = Date.parse('2026-06-11T10:00:00.000Z');
+    let now = Date.parse('2026-06-11T10:00:00.000Z');
     const resetAtMs = now + 500_000;
     const accountUsageStore = createProviderAccountUsageStore();
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const group = {
       v: 1,
       serviceId: 'openai-codex',
@@ -9042,12 +9360,13 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     });
     expect(onQuotaLifecycleTransition).toHaveBeenCalledTimes(1);
 
+    now += 1_000;
     const backupRecovered = buildProviderAccountUsageSnapshotFixture({
       serviceId: 'openai-codex',
       groupId: 'team',
       profileId: 'backup',
       groupGeneration: 4,
-      now: now + 1_000,
+      now,
       remainingPct: 80,
       resetsAt: now + 700_000,
     });
@@ -9205,10 +9524,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('does not emit quota lifecycle transitions when every group member is auth-invalid', async () => {
     const now = Date.parse('2026-06-11T10:00:00.000Z');
     const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
 
     const group = {
       v: 1,
@@ -9284,10 +9603,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     const now = 1_000_000;
     const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
 
     const existingSnapshot: ConnectedServiceQuotaSnapshotV1 = {
       v: 1,
@@ -9355,10 +9674,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     const now = 1_000_000;
     const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
     const accountUsageStore = createProviderAccountUsageStore();
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const snapshot: ConnectedServiceQuotaSnapshotV1 = {
       v: 1,
       serviceId: 'openai-codex',
@@ -9433,10 +9752,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('derives a non-ok metadata status when all meters are unavailable', async () => {
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
 
     const record = buildConnectedServiceCredentialRecord({
@@ -9525,10 +9844,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('supports profile ids that contain ":"', async () => {
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
 
     const record = buildConnectedServiceCredentialRecord({
@@ -9606,10 +9925,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('polls quota/account-usage with broker-owned access only and does not expose refresh tokens to fetchers', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const staleRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -9698,10 +10017,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('does not refresh OAuth credentials when quota polling sees a provider auth failure', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const staleRecord = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -9781,10 +10100,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('keeps quota 403 failures retryable and triggers a credential refresh probe instead of needs-reauth', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const record = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'claude-subscription',
@@ -9866,10 +10185,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('keeps provider-specific error codes retryable unless the fetcher marks reconnect required', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const record = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'claude-subscription',
@@ -9884,6 +10203,7 @@ describe('ConnectedServiceQuotasCoordinator', () => {
         tokenType: null,
         providerAccountId: 'acct',
         providerEmail: 'user@example.com',
+        raw: { claudeAiOauth: { organizationUuid: 'org-work' } },
       },
     });
     const api = {
@@ -9946,10 +10266,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('keeps transient unrecovered quota 401 failures retryable before reconnect escalation', async () => {
     let now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const record = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'claude-subscription',
@@ -9964,6 +10284,7 @@ describe('ConnectedServiceQuotasCoordinator', () => {
         tokenType: null,
         providerAccountId: 'acct',
         providerEmail: 'user@example.com',
+        raw: { claudeAiOauth: { organizationUuid: 'org-work' } },
       },
     });
     const api = {
@@ -10039,10 +10360,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('escalates repeated unrecovered quota 401 failures after the quota backoff retry window', async () => {
     let now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const record = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'claude-subscription',
@@ -10057,6 +10378,7 @@ describe('ConnectedServiceQuotasCoordinator', () => {
         tokenType: null,
         providerAccountId: 'acct',
         providerEmail: 'user@example.com',
+        raw: { claudeAiOauth: { organizationUuid: 'org-work' } },
       },
     });
     const api = {
@@ -10101,29 +10423,44 @@ describe('ConnectedServiceQuotasCoordinator', () => {
       },
     });
 
-    for (const advanceMs of [0, 10_000, 20_000, 40_000, 60_000]) {
+    for (const advanceMs of [
+      0,
+      10_000,
+      20_000,
+      40_000,
+      60_000,
+      60_000,
+      60_000,
+      60_000,
+      60_000,
+      60_000,
+      60_000,
+      60_000,
+      60_000,
+      60_000,
+    ]) {
       now += advanceMs;
       await coordinator.tickOnce();
     }
 
-    expect(refreshConnectedServiceCredentialForQuota).toHaveBeenCalledTimes(1);
+    expect(refreshConnectedServiceCredentialForQuota).toHaveBeenCalledTimes(10);
     expect(refreshConnectedServiceCredentialForQuota).toHaveBeenLastCalledWith({
       serviceId: 'claude-subscription',
       profileId: 'work',
       force: true,
       reason: 'auth_failure',
     });
-    expect(api.updateConnectedServiceCredentialHealth).toHaveBeenCalledTimes(5);
-    expect(api.updateConnectedServiceCredentialHealth).toHaveBeenNthCalledWith(5, {
+    expect(api.updateConnectedServiceCredentialHealth).toHaveBeenCalledTimes(14);
+    expect(api.updateConnectedServiceCredentialHealth).toHaveBeenNthCalledWith(14, {
       serviceId: 'claude-subscription',
       profileId: 'work',
       expectedCredentialRevision: 'csr_abcdefghijklmnopqrstuv',
       health: {
         v: 1,
-        status: 'refresh_failed_retryable',
-        reconnectRequired: false,
-        lastRefreshAttemptAt: 1_130_000,
-        lastRefreshFailureAt: 1_130_000,
+        status: 'needs_reauth',
+        reconnectRequired: true,
+        lastRefreshAttemptAt: 1_670_000,
+        lastRefreshFailureAt: 1_670_000,
         lastRefreshFailureKind: 'provider_401',
         providerHttpStatus: 401,
       },
@@ -10132,10 +10469,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('does not overwrite successful quota-triggered refresh health with the stale quota failure', async () => {
     let now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const record = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'claude-subscription',
@@ -10150,6 +10487,7 @@ describe('ConnectedServiceQuotasCoordinator', () => {
         tokenType: null,
         providerAccountId: 'acct',
         providerEmail: 'user@example.com',
+        raw: { claudeAiOauth: { organizationUuid: 'org-work' } },
       },
     });
     const refreshedRecord = buildConnectedServiceCredentialRecord({
@@ -10166,6 +10504,7 @@ describe('ConnectedServiceQuotasCoordinator', () => {
         tokenType: null,
         providerAccountId: 'acct',
         providerEmail: 'user@example.com',
+        raw: { claudeAiOauth: { organizationUuid: 'org-work' } },
       },
     });
     const updateConnectedServiceCredentialHealth = vi.fn<
@@ -10235,10 +10574,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('latches needs_reauth and stops probing when the refresh probe proves reconnect is required', async () => {
     let now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const record = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -10325,10 +10664,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('latches needs_reauth when the quota fetcher marks the auth failure reconnect-required', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const record = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'claude-subscription',
@@ -10405,10 +10744,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('does not poison credential health when the quota endpoint is missing with 404', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const record = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -10472,10 +10811,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('uses provider Retry-After quota errors as binding backoff', async () => {
     let now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const record = buildConnectedServiceCredentialRecord({
       now,
       serviceId: 'openai-codex',
@@ -10534,10 +10873,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     vi.useFakeTimers();
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
 
     const record = buildConnectedServiceCredentialRecord({
@@ -10612,10 +10951,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     const now = 1_000_000;
 
     const machineKey = new Uint8Array(32).fill(7);
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'dataKey', publicKey: new Uint8Array(32).fill(1), machineKey },
-    };
+    } satisfies Credentials;
 
     const record = buildConnectedServiceCredentialRecord({
       now,
@@ -10699,10 +11038,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('forces a refresh when the server reports refreshRequestedAt newer than fetchedAt', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
 
     const record = buildConnectedServiceCredentialRecord({
@@ -10766,10 +11105,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('honors a refresh request for an inactive profile between discovery passes', async () => {
     let now = 1_000_000;
     let refreshRequestedAt: number | undefined;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
 
     const record = buildConnectedServiceCredentialRecord({
@@ -10844,10 +11183,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('retries inactive-profile discovery on the next tick after a transient list failure', async () => {
     let now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const listConnectedServiceProfiles = vi.fn()
       .mockRejectedValueOnce(new Error('transient'))
       .mockResolvedValueOnce({
@@ -10887,10 +11226,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     vi.useFakeTimers();
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
 
     const record = buildConnectedServiceCredentialRecord({
@@ -10961,10 +11300,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('skips fetching when the server snapshot is still fresh', async () => {
     const now = 1_000_000;
-	    const credentials: Credentials = {
+	    const credentials = {
 	      token: 'happy-token',
 	      encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-	    };
+	    } satisfies Credentials;
 	    if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
 
 	    const existingSnapshot: SealedQuotaSnapshotResponse = {
@@ -11159,10 +11498,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('backs off instead of fetching provider quotas when lease acquisition fails', async () => {
     let now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
 
     const record = buildConnectedServiceCredentialRecord({
       now,
@@ -11242,10 +11581,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('does not throw when the fetcher fails', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
 
     const record = buildConnectedServiceCredentialRecord({
@@ -11310,10 +11649,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('applies a failure backoff window per binding', async () => {
     let now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
 
     const record = buildConnectedServiceCredentialRecord({
@@ -11393,10 +11732,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('applies failure backoff even when refreshRequestedAt remains newer than fetchedAt', async () => {
     let now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
 
     const record = buildConnectedServiceCredentialRecord({
@@ -11475,10 +11814,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
   it('can discover connected profiles when enabled', async () => {
     const now = 1_000_000;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
 
     const record = buildConnectedServiceCredentialRecord({
@@ -11556,10 +11895,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('queues in-band quota observations and persists provider-account usage without invoking provider polling', async () => {
     let now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -11626,10 +11965,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('rejects in-band quota snapshots whose embedded service id does not match the write key', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -11671,10 +12010,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('does not persist unchanged in-band quota snapshots every five seconds by default', async () => {
     let now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -11733,10 +12072,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('keeps a server refresh marker material after a background read so the next in-band snapshot persists', async () => {
     let now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const makeSnapshot = (fetchedAt: number): ConnectedServiceQuotaSnapshotV1 => ({
       v: 1,
       serviceId: 'openai-codex',
@@ -11835,10 +12174,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('moves in-band quota persistence to the hydrated account scope after credentials gain a JWT', async () => {
     let now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: '',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -11899,10 +12238,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('coalesces in-band quota snapshots and flushes the latest payload', async () => {
     let now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const writtenRemaining: number[] = [];
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
@@ -11975,10 +12314,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     const now = 1_000_000;
     let connected = false;
     let accountMode: 'plain' | 'e2ee' = 'plain';
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => accountMode),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -12022,10 +12361,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('defers in-band quota persistence when account mode is unknown at flush time', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => {
         throw new Error('mode unavailable');
@@ -12071,10 +12410,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     vi.setSystemTime(0);
     let now = 1_000_000;
     let modeUnavailable = true;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => {
         if (modeUnavailable) throw new Error('mode unavailable');
@@ -12134,10 +12473,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('does not resolve account mode when daemon server work gate defers persistence', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -12190,10 +12529,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('reports quota persistence flush timeout so pending server work can survive shutdown', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -12260,10 +12599,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     vi.useFakeTimers();
     const now = 1_000_000;
     const accountMode = createDeferred<'plain'>();
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => await accountMode.promise),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -12309,10 +12648,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),
@@ -12391,10 +12730,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
 
   it('does not mirror server-work owned write attempt counters from the latest-work scheduler', async () => {
     const now = 1_000_000;
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     const api = {
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceQuotaSnapshotPlain: vi.fn(async () => null),

@@ -1,10 +1,17 @@
+import { createServerUrlComparableKey } from '@happier-dev/protocol';
 import type { PublicReleaseRingId } from '@happier-dev/release-runtime/releaseRings';
 
 import type { InstalledDaemonServiceEntry } from './discoverInstalledDaemonServiceEntries';
 import type { DaemonServiceMode, DaemonServiceTargetMode } from './plan';
-import { resolveHappierHomeDirComparableKey } from '@/daemon/ownership/happierHomeDirComparableKey';
+import { happierHomeDirsMatch, resolveHappierHomeDirComparableKey } from '@/daemon/ownership/happierHomeDirComparableKey';
 
 export type DaemonServiceInstallStrategy = 'require-explicit' | 'add' | 'replace-ring' | 'replace-all';
+
+/** The relay a daemon service serves: its server profile id and relay URL, each when known. */
+export type DaemonServiceRelay = Readonly<{
+  serverId: string | null;
+  serverUrl: string | null;
+}>;
 
 export type DaemonServiceInstallTarget = Readonly<{
   platform: InstalledDaemonServiceEntry['platform'];
@@ -13,6 +20,15 @@ export type DaemonServiceInstallTarget = Readonly<{
   ring: PublicReleaseRingId | null;
   instanceId: string | null;
   happierHomeDir: string | null;
+  /** The server profile a pinned target serves (its `HAPPIER_ACTIVE_SERVER_ID`); absent = unknown. */
+  activeServerId?: string | null;
+  /** The relay URL a pinned target serves; absent = unknown. */
+  serverUrl?: string | null;
+  /**
+   * The relay this home's default-following service currently serves (the persisted active
+   * profile). Absent/`null` = unknown, which keeps a same-ring default-following service competing.
+   */
+  defaultFollowingServer?: DaemonServiceRelay | null;
 }>;
 
 export type DaemonServiceInstallConflictPlan = Readonly<{
@@ -23,7 +39,7 @@ export type DaemonServiceInstallConflictPlan = Readonly<{
   servicesToRemove: readonly InstalledDaemonServiceEntry[];
 }>;
 
-function matchesTarget(service: InstalledDaemonServiceEntry, target: DaemonServiceInstallTarget): boolean {
+export function daemonServiceMatchesInstallTarget(service: InstalledDaemonServiceEntry, target: DaemonServiceInstallTarget): boolean {
   if (service.platform !== target.platform) {
     return false;
   }
@@ -33,7 +49,7 @@ function matchesTarget(service: InstalledDaemonServiceEntry, target: DaemonServi
   if (service.targetMode !== target.targetMode) {
     return false;
   }
-  if (resolveHappierHomeDirComparableKey(service.happierHomeDir) !== resolveHappierHomeDirComparableKey(target.happierHomeDir)) {
+  if (!happierHomeDirsMatch(service.happierHomeDir, target.happierHomeDir)) {
     return false;
   }
   if (target.targetMode === 'default-following') {
@@ -54,7 +70,7 @@ function resolveTupleKey(service: InstalledDaemonServiceEntry): string {
 }
 
 function isCompetingService(service: InstalledDaemonServiceEntry, target: DaemonServiceInstallTarget): boolean {
-  if (matchesTarget(service, target)) {
+  if (daemonServiceMatchesInstallTarget(service, target)) {
     return false;
   }
   if (service.platform !== target.platform) {
@@ -66,16 +82,74 @@ function isCompetingService(service: InstalledDaemonServiceEntry, target: Daemon
   if (service.serverId === target.instanceId) {
     return true;
   }
-  return service.releaseChannel === target.ring;
+  // Daemons are per relay: a pinned target competes on its ring only with a service for the same
+  // relay, and with any service whose relay is unknown.
+  if (service.releaseChannel !== target.ring) {
+    return false;
+  }
+  const serviceRelay = resolveServiceRelay(service, target);
+  return serviceRelay === null || daemonServiceRelaysMayMatch(serviceRelay, {
+    serverId: target.activeServerId ?? null,
+    serverUrl: target.serverUrl ?? null,
+  });
+}
+
+function resolveServiceRelay(
+  service: InstalledDaemonServiceEntry,
+  target: DaemonServiceInstallTarget,
+): DaemonServiceRelay | null {
+  if (service.targetMode === 'pinned') {
+    return resolvePinnedDaemonServiceRelay(service);
+  }
+  // A default-following service serves its own home's persisted active profile; only the
+  // target home's is known here.
+  const sameHome = happierHomeDirsMatch(service.happierHomeDir, target.happierHomeDir);
+  return sameHome ? target.defaultFollowingServer ?? null : null;
+}
+
+/** The relay a pinned service serves: its baked `HAPPIER_ACTIVE_SERVER_ID` (else its unit id) and relay URL. */
+export function resolvePinnedDaemonServiceRelay(service: Readonly<{
+  serverId: string;
+  activeServerId?: string | null;
+  relayUrl?: string | null;
+}>): DaemonServiceRelay {
+  return {
+    serverId: service.activeServerId ?? service.serverId,
+    serverUrl: service.relayUrl ?? null,
+  };
+}
+
+function resolveComparableRelayKey(serverUrl: string | null): string | null {
+  const value = String(serverUrl ?? '').trim();
+  if (!value) return null;
+  try {
+    return createServerUrlComparableKey(value) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The one "may these serve the same relay?" rule for daemon services (install conflicts and
+ * background-service repair): same profile id (same lifecycle directory) or same relay URL key.
+ * Unknown on both facts counts as the same, so an unidentifiable service is never treated as
+ * serving another relay.
+ */
+export function daemonServiceRelaysMayMatch(left: DaemonServiceRelay, right: DaemonServiceRelay): boolean {
+  const leftId = String(left.serverId ?? '').trim() || null;
+  const rightId = String(right.serverId ?? '').trim() || null;
+  const leftKey = resolveComparableRelayKey(left.serverUrl);
+  const rightKey = resolveComparableRelayKey(right.serverUrl);
+  const idsKnown = leftId !== null && rightId !== null;
+  const keysKnown = leftKey !== null && rightKey !== null;
+  if ((idsKnown && leftId === rightId) || (keysKnown && leftKey === rightKey)) {
+    return true;
+  }
+  return !idsKnown && !keysKnown;
 }
 
 function isForeignHomeConflict(service: InstalledDaemonServiceEntry, target: DaemonServiceInstallTarget): boolean {
-  const serviceHomeDir = resolveHappierHomeDirComparableKey(service.happierHomeDir);
-  const targetHomeDir = resolveHappierHomeDirComparableKey(target.happierHomeDir);
-  if (serviceHomeDir === null || targetHomeDir === null) {
-    return true;
-  }
-  return serviceHomeDir !== targetHomeDir;
+  return !happierHomeDirsMatch(service.happierHomeDir, target.happierHomeDir);
 }
 
 function isReplaceAllAllowedForeignHomeCleanup(
@@ -104,7 +178,7 @@ export function resolveDaemonServiceInstallConflictPlan(params: Readonly<{
     }
   }
 
-  const exactTargetExists = params.services.some((service) => matchesTarget(service, params.target));
+  const exactTargetExists = params.services.some((service) => daemonServiceMatchesInstallTarget(service, params.target));
   const competingServices = params.services.filter((service) =>
     isCompetingService(service, params.target) || duplicateTupleKeys.has(resolveTupleKey(service)),
   );

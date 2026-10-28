@@ -10,7 +10,7 @@ function makeSignal(overrides: Partial<AuthSignalsForProfile>): AuthSignalsForPr
     hasCredentials: true,
     isExpired: false,
     machineRegistered: true,
-    credentialEvidence: 'active-store',
+    credentialEvidence: 'inspected-store',
     isActive: true,
     reachability: 'verified',
     ...overrides,

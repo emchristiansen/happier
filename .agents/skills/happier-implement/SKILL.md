@@ -59,6 +59,8 @@ Smallest coherent does not mean smallest diff. Update every materially affected 
 
 Before adding a protocol, registry, table, state machine, gate, lease, generation, fallback, cache, or parallel path, name the approved requirement, reproduced failure, external contract, or reachable risk it serves. Apply the deletion test. If the mechanism only adds concepts while required behavior survives without it, do not build it.
 
+Treat every timeout, retry count, quota, request/body or collection-size cap, truncation threshold, and similar guard as an owner-level product decision. Search for the containing operation's canonical deadline or resource boundary first and reuse it; do not add a shorter phase-local cutoff or guessed "safe" number. If no real contract or measured resource failure requires a bound, add none. When one is required, keep its derivation beside the owner, preserve valid data when paging or explicit incompleteness can do so safely, make activation observable, and prove both the rejecting/timeout case and valid behavior beyond the previously tempting arbitrary cutoff.
+
 ## 5. Shape execution for throughput
 
 Use direct implementation for tightly coupled work and `.agents/skills/decompose-gates` for meaningful independent responsibilities. For repeated units with an unproven shared assumption, apply that skill's concurrency ramp: gate only dependent replication, keep independent work moving, and skip the ramp when prior evidence or a deterministic tool already proves the unit shape.

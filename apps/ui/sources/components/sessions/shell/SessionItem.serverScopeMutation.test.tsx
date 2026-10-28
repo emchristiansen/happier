@@ -2,7 +2,7 @@ import React from 'react';
 import { act } from 'react-test-renderer';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { pressTestInstanceAsync, renderScreen, standardCleanup } from '@/dev/testkit';
+import { createSessionFixture, pressTestInstanceAsync, renderScreen, standardCleanup } from '@/dev/testkit';
 import { createSessionItemTestRowModel, installSessionShellCommonModuleMocks } from './sessionShellTestHelpers';
 import {
     SESSION_ACTION_ARCHIVE_ID,
@@ -270,18 +270,18 @@ describe('SessionItem server-scoped mutations', () => {
         );
 
         expect(modalConfirmSpy).toHaveBeenCalledWith(
-            'sessionInfo.archiveSession',
-            'sessionInfo.archiveSessionConfirm',
+            'sessionInfo.stopSession',
+            'sessionInfo.stopSessionConfirm',
             {
                 cancelText: 'common.cancel',
-                confirmText: 'sessionInfo.archiveSession',
+                confirmText: 'sessionInfo.stopSession',
                 destructive: true,
             },
         );
         expect(modalAlertSpy).not.toHaveBeenCalled();
 
         expect(stopSpy).toHaveBeenCalledWith('sess_1', { serverId: 'server_a' });
-        expect(archiveSpy).toHaveBeenCalledWith('sess_1', { serverId: 'server_a' });
+        expect(archiveSpy).toHaveBeenCalledWith('sess_1', { serverId: 'server_a', signal: expect.any(AbortSignal) });
     });
 
     it('archives inactive sessions using server scope when serverId is provided', async () => {
@@ -331,15 +331,7 @@ describe('SessionItem server-scoped mutations', () => {
             'session swipe action',
         );
 
-        expect(modalConfirmSpy).toHaveBeenCalledWith(
-            'sessionInfo.archiveSession',
-            'sessionInfo.archiveSessionConfirm',
-            {
-                cancelText: 'common.cancel',
-                confirmText: 'sessionInfo.archiveSession',
-                destructive: true,
-            },
-        );
+        expect(modalConfirmSpy).not.toHaveBeenCalled();
         expect(modalAlertSpy).not.toHaveBeenCalled();
 
         expect(archiveSpy).toHaveBeenCalledWith('sess_2', { serverId: 'server_b' });
@@ -401,11 +393,11 @@ describe('SessionItem server-scoped mutations', () => {
         );
 
         expect(modalConfirmSpy).toHaveBeenCalledWith(
-            'sessionInfo.archiveSession',
-            'sessionInfo.archiveSessionConfirm',
+            'sessionInfo.stopSession',
+            'sessionInfo.stopSessionConfirm',
             {
                 cancelText: 'common.cancel',
-                confirmText: 'sessionInfo.archiveSession',
+                confirmText: 'sessionInfo.stopSession',
                 destructive: true,
             },
         );
@@ -413,7 +405,7 @@ describe('SessionItem server-scoped mutations', () => {
         expect(stopSpy).toHaveBeenCalledWith('sess_stale_inactive', { serverId: 'server_b' });
         expect(archiveSpy).toHaveBeenCalledTimes(2);
         expect(archiveSpy).toHaveBeenNthCalledWith(1, 'sess_stale_inactive', { serverId: 'server_b' });
-        expect(archiveSpy).toHaveBeenNthCalledWith(2, 'sess_stale_inactive', { serverId: 'server_b' });
+        expect(archiveSpy).toHaveBeenNthCalledWith(2, 'sess_stale_inactive', { serverId: 'server_b', signal: expect.any(AbortSignal) });
     });
 
     it('archives active sessions from the swipe action when hidden inactive sessions are enabled', async () => {
@@ -465,18 +457,18 @@ describe('SessionItem server-scoped mutations', () => {
         );
 
         expect(modalConfirmSpy).toHaveBeenCalledWith(
-            'sessionInfo.archiveSession',
-            'sessionInfo.archiveSessionConfirm',
+            'sessionInfo.stopSession',
+            'sessionInfo.stopSessionConfirm',
             {
                 cancelText: 'common.cancel',
-                confirmText: 'sessionInfo.archiveSession',
+                confirmText: 'sessionInfo.stopSession',
                 destructive: true,
             },
         );
         expect(modalAlertSpy).not.toHaveBeenCalled();
 
         expect(stopSpy).toHaveBeenCalledWith('sess_3', { serverId: 'server_c' });
-        expect(archiveSpy).toHaveBeenCalledWith('sess_3', { serverId: 'server_c' });
+        expect(archiveSpy).toHaveBeenCalledWith('sess_3', { serverId: 'server_c', signal: expect.any(AbortSignal) });
     });
 
     it('offers an archive action for active sessions in the more menu and stops before archiving', async () => {
@@ -531,18 +523,18 @@ describe('SessionItem server-scoped mutations', () => {
         });
 
         expect(modalConfirmSpy).toHaveBeenCalledWith(
-            'sessionInfo.archiveSession',
-            'sessionInfo.archiveSessionConfirm',
+            'sessionInfo.stopSession',
+            'sessionInfo.stopSessionConfirm',
             {
                 cancelText: 'common.cancel',
-                confirmText: 'sessionInfo.archiveSession',
+                confirmText: 'sessionInfo.stopSession',
                 destructive: true,
             },
         );
         expect(modalAlertSpy).not.toHaveBeenCalled();
 
         expect(stopSpy).toHaveBeenCalledWith('sess_active_archive', { serverId: 'server_d' });
-        expect(archiveSpy).toHaveBeenCalledWith('sess_active_archive', { serverId: 'server_d' });
+        expect(archiveSpy).toHaveBeenCalledWith('sess_active_archive', { serverId: 'server_d', signal: expect.any(AbortSignal) });
     });
 
     it('does not expose archive for active shared-admin sessions owned by another user', async () => {
@@ -829,62 +821,6 @@ describe('SessionItem server-scoped mutations', () => {
         )).toBe(false);
     });
 
-    it('groups folder move targets under one submenu item', async () => {
-        const session = {
-            id: 'sess_folder_menu',
-            seq: 2,
-            lastViewedSessionSeq: 2,
-            createdAt: 1,
-            updatedAt: 1,
-            active: false,
-            activeAt: 1,
-            archivedAt: null,
-            metadata: null,
-            metadataVersion: 1,
-            agentState: null,
-            agentStateVersion: 1,
-            thinking: false,
-            thinkingAt: 0,
-            presence: 1,
-        } as any;
-
-        const screen = await renderScreen(
-            <SessionItem
-                session={session}
-                serverId="server_d"
-                serverName="Server D"
-                showServerBadge={true}
-                selected={false}
-                isFirst={true}
-                isLast={true}
-                isSingle={true}
-                variant="default"
-                compact={false}
-                folderMoveMenuItems={[
-                    { id: 'move-to-folder:null', title: 'Workspace root' },
-                    { id: 'move-to-folder:folder_a', title: 'Folder A' },
-                ]}
-                onSelectFolderMoveMenuItem={vi.fn()}
-                nativeContextMenuOpen={true}
-                onNativeContextMenuOpenChange={vi.fn()}
-            />,
-        );
-
-        const contextMenus = screen.root.findAll((node: any) => node.type === 'ContextMenu');
-        const moreMenu = contextMenus.find((node: any) =>
-            Array.isArray(node.props?.items) && node.props.items.some((item: any) => item?.id === SESSION_ACTION_MOVE_TO_FOLDER_ID),
-        );
-        expect(moreMenu).toBeTruthy();
-
-        const moveItem = moreMenu!.props.items.find((item: any) => item?.id === SESSION_ACTION_MOVE_TO_FOLDER_ID);
-        expect(moveItem?.title).toBe('sessionsList.moveToFolder');
-        expect(moveItem?.submenu?.items).toEqual([
-            expect.objectContaining({ id: 'move-to-folder:null' }),
-            expect.objectContaining({ id: 'move-to-folder:folder_a' }),
-        ]);
-        expect(moreMenu!.props.items.some((item: any) => item?.id === 'move-to-folder:folder_a')).toBe(false);
-    });
-
     it('uses the move sheet action when an accessible move fallback is provided', async () => {
         const session = {
             id: 'sess_move_sheet',
@@ -918,10 +854,6 @@ describe('SessionItem server-scoped mutations', () => {
                 isSingle={true}
                 variant="default"
                 compact={false}
-                folderMoveMenuItems={[
-                    { id: 'move-to-folder:null', title: 'Workspace root' },
-                    { id: 'move-to-folder:folder_a', title: 'Folder A' },
-                ]}
                 onMoveToFolder={onMoveToFolder}
                 onMoveToWorkspaceRoot={onMoveToWorkspaceRoot}
                 nativeContextMenuOpen={true}
@@ -997,17 +929,17 @@ describe('SessionItem server-scoped mutations', () => {
         );
 
         expect(modalConfirmSpy).toHaveBeenCalledWith(
-            'sessionInfo.archiveSession',
-            'sessionInfo.archiveSessionConfirm',
+            'sessionInfo.stopSession',
+            'sessionInfo.stopSessionConfirm',
             {
                 cancelText: 'common.cancel',
-                confirmText: 'sessionInfo.archiveSession',
+                confirmText: 'sessionInfo.stopSession',
                 destructive: true,
             },
         );
         expect(modalAlertSpy).not.toHaveBeenCalled();
 
         expect(stopSpy).toHaveBeenCalledWith('sess_4', { serverId: 'server_d' });
-        expect(archiveSpy).toHaveBeenCalledWith('sess_4', { serverId: 'server_d' });
+        expect(archiveSpy).toHaveBeenCalledWith('sess_4', { serverId: 'server_d', signal: expect.any(AbortSignal) });
     });
 });

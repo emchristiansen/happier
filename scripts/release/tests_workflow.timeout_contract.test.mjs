@@ -27,6 +27,8 @@ test('tests workflow keeps slow CI jobs above the observed timeout floor', async
     /name:\s*UI E2E \(Playwright\)[\s\S]*?timeout-minutes:\s*120\b/,
     'UI E2E job should reserve enough time to finish the slow multi-session Playwright scenarios on GitHub-hosted runners',
   );
+  assert.match(uiE2eJob, /shard:\s*\$\{\{ fromJSON\(inputs\.ui_e2e_specs != ''/);
+
   assert.match(
     uiUnitJob,
     /name:\s*UI Unit Tests[\s\S]*?timeout-minutes:\s*120\b/,

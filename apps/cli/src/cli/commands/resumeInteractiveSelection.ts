@@ -4,42 +4,17 @@ import type { AccountSettings } from '@happier-dev/protocol';
 import type { Credentials } from '@/persistence';
 import type { CliSessionRowModel } from '@/cli/output/session/buildCliSessionRowModel';
 import { buildCliSessionRowModel } from '@/cli/output/session/buildCliSessionRowModel';
-import type { RawSessionListRow } from '@/session/transport/http/sessionsHttp';
+import type { fetchSessionsPage, RawSessionListRow } from '@/session/transport/http/sessionsHttp';
 import type { SessionActionSelectorRow } from '@/ui/ink/SessionActionSelector';
+import { buildAttachSelectionModel, buildAttachSelectionModelFromSessions, formatAttachIneligibilityFooter } from './attachInteractiveSelection';
 
-/**
- * Sister to `attachInteractiveSelection.ts`, scoped tightly to the resume
- * flow per the reviewer's correction:
- *
- * - Resume is for *stopped, non-system* sessions that vendor-resume can
- *   pick up. We surface stopped non-resumable sessions as disabled-with-
- *   reason rows (same idiom as attach), instead of collapsing every
- *   ineligible row into "No resumable sessions found".
- * - Active sessions don't belong in this list at all — they're attachable
- *   territory. Instead of mixing them in, we surface them as a footer
- *   summary ("N session(s) running; use happier attach") so the user
- *   doesn't lose track of them.
- *
- * The split keeps each command's selector focused on one mental model
- * (attach=running, resume=stopped) while still using the same selector
- * primitive and the same disabled-with-reason rendering.
- */
+/** The stopped-session constituent of the combined resume/attach picker. */
 
-type FetchSessionsPageFn = (params: {
-  token: string;
-  cursor?: string;
-  limit?: number;
-  activeOnly?: boolean;
-  archivedOnly?: boolean;
-}) => Promise<{
-  sessions: RawSessionListRow[];
-  nextCursor: string | null;
-  hasNext: boolean;
-}>;
+type FetchSessionsPageFn = typeof fetchSessionsPage;
 
 export type ResumeIneligibilityCategory =
   | 'archived'
-  | 'still_active'                // not used in selector (hidden via "stopped only"), but kept for the footer math
+  | 'still_active'                // excluded from stopped rows; counted for the standalone footer
   | 'vendor_resume_not_supported' // agent has no vendor resume capability
   | 'vendor_resume_id_missing'    // metadata is incomplete
   | 'experimental_disabled'        // backend gated by account settings
@@ -59,6 +34,52 @@ export type ResumeSelectionModel = Readonly<{
   rows: SessionActionSelectorRow[];
   hint: ResumeSelectionFooterHint;
 }>;
+
+type ContinueSelectionParams = Parameters<typeof buildAttachSelectionModel>[0] & Readonly<{
+  accountSettings: AccountSettings;
+}>;
+
+export async function buildContinueSelectionModel(params: ContinueSelectionParams): Promise<Readonly<{
+  rows: SessionActionSelectorRow[];
+  probeSessionIdFn?: (sessionId: string) => Promise<{ reachable: boolean; reason?: string }>;
+  footerHint: string | null;
+}>> {
+  const [recentPage, activePage] = await Promise.all([
+    params.fetchSessionsPageFn({ token: params.credentials.token, limit: 200 }),
+    params.fetchSessionsPageFn({ token: params.credentials.token, limit: 200, activeOnly: true }),
+  ]);
+  // Keep both discovery windows: older running sessions may not be in the recent
+  // page. Active-feed membership wins an overlapping stopped observation so a
+  // running session cannot also be offered for vendor resume.
+  const sessionsById = new Map(recentPage.sessions.map((session) => [session.id, session]));
+  for (const session of activePage.sessions) sessionsById.set(session.id, session);
+  const sessions = [...sessionsById.values()];
+  const stopped = buildResumeSelectionModelFromSessions({
+    ...params,
+    sessions: sessions.filter((session) => session.active !== true),
+  });
+  const running = await buildAttachSelectionModelFromSessions({
+    ...params,
+    sessions: sessions.filter((session) => session.active === true),
+  });
+  const rows = [
+    ...running.rows.map((row) => ({ ...row, annotation: row.annotation ?? (row.disabled ? null : 'running') })),
+    ...stopped.rows.map((row) => ({ ...row, annotation: row.annotation ?? (row.disabled ? null : 'stopped') })),
+  ];
+  rows.sort((a, b) => {
+    if (a.disabled !== b.disabled) return a.disabled ? 1 : -1;
+    return b.updatedAt - a.updatedAt;
+  });
+  const footerHint = [
+    formatAttachIneligibilityFooter(running.hint),
+    formatResumeSelectionFooter({ ...stopped.hint, activeRunningCount: 0 }),
+  ].filter((value): value is string => Boolean(value)).join(' ');
+  return {
+    rows,
+    probeSessionIdFn: running.probeSessionIdFn,
+    footerHint: footerHint || null,
+  };
+}
 
 function classifyResumeIneligibility(rowModel: CliSessionRowModel): ResumeIneligibilityCategory {
   if (rowModel.archivedAt !== null) return 'archived';
@@ -127,12 +148,20 @@ export async function buildResumeSelectionModel(params: Readonly<{
   fetchSessionsPageFn: FetchSessionsPageFn;
 }>): Promise<ResumeSelectionModel> {
   const page = await params.fetchSessionsPageFn({ token: params.credentials.token, limit: 200 });
+  return buildResumeSelectionModelFromSessions({ ...params, sessions: page.sessions });
+}
+
+function buildResumeSelectionModelFromSessions(params: Readonly<
+  Omit<Parameters<typeof buildResumeSelectionModel>[0], 'fetchSessionsPageFn'> & {
+    sessions: readonly RawSessionListRow[];
+  }
+>): ResumeSelectionModel {
   const rows: SessionActionSelectorRow[] = [];
   let activeRunningCount = 0;
   let ineligibleCount = 0;
   let resumableCount = 0;
 
-  for (const rawSession of page.sessions) {
+  for (const rawSession of params.sessions) {
     const rowModel = buildCliSessionRowModel({
       credentials: params.credentials,
       rawSession,

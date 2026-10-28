@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { AGY_OAUTH_CLIENT_ID, AGY_OAUTH_CLIENT_SECRET, AGY_OAUTH_TOKEN_URL, AGY_OAUTH_SCOPES } from "@happier-dev/agents";
 import tweetnacl from "tweetnacl";
 
 import { decodeBase64, encodeBase64, openBoxBundle, BOX_BUNDLE_PUBLIC_KEY_BYTES } from "@happier-dev/protocol";
@@ -10,6 +11,8 @@ import {
     exchangeConnectedServiceOauthTokens,
 } from "./exchangeConnectedServiceOauthTokens";
 import { createEnvReset } from "../../../testkit/env";
+
+afterEach(() => { vi.unstubAllEnvs(); });
 
 function buildRecipientPublicKeyB64Url(): string {
     const bytes = new Uint8Array(BOX_BUNDLE_PUBLIC_KEY_BYTES).fill(7);
@@ -32,6 +35,95 @@ function buildJwt(payload: Record<string, unknown>): string {
 
 describe("exchangeConnectedServiceOauthTokens", () => {
     const resetOauthExchangeEnv = createEnvReset();
+
+    it.each([false, true])("seals Antigravity tokens and selected-token identity using its registered issuer (legacy-looking overrides: %s)", async (withOverrides) => {
+        if (withOverrides) {
+            vi.stubEnv('HAPPIER_CONNECTED_SERVICES_ANTIGRAVITY_OAUTH_CLIENT_ID', 'machine-client');
+            vi.stubEnv('HAPPIER_CONNECTED_SERVICES_ANTIGRAVITY_OAUTH_CLIENT_SECRET', 'machine-client-secret');
+            vi.stubEnv('HAPPIER_CONNECTED_SERVICES_ANTIGRAVITY_OAUTH_TOKEN_URL', 'https://machine-issuer.example.test/token');
+        }
+        const recipient = buildRecipientKeyPair();
+        let tokenRequest: Readonly<{ url: string; body: URLSearchParams }> | undefined;
+        const fetcher = vi.fn<typeof fetch>(async (input, init) => {
+            if (String(input).endsWith('/userinfo')) {
+                expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer agy-access');
+                return Response.json({ sub: 'google-account-a', email: 'account-a@example.test' });
+            }
+            const body = new URLSearchParams(String(init?.body));
+            tokenRequest = { url: String(input), body };
+            expect(body.get('redirect_uri')).toBe('https://antigravity.google/oauth-callback');
+            expect(body.get('code_verifier')).toBe('verifier');
+            return Response.json({ access_token: 'agy-access', refresh_token: 'agy-refresh', expires_in: 3600, scope: 'scope', token_type: 'Bearer' });
+        });
+        const result = await exchangeConnectedServiceOauthTokens({
+            serviceId: 'antigravity', publicKeyB64Url: recipient.publicKeyB64Url,
+            code: 'code', verifier: 'verifier', redirectUri: 'https://antigravity.google/oauth-callback', now: 1000, fetcher,
+        });
+        expect(tokenRequest?.url).toBe(AGY_OAUTH_TOKEN_URL);
+        expect(tokenRequest?.body.get('client_id')).toBe(AGY_OAUTH_CLIENT_ID);
+        expect(tokenRequest?.body.get('client_secret')).toBe(AGY_OAUTH_CLIENT_SECRET);
+        const opened = openBoxBundle({ bundle: decodeBase64(result.bundleB64Url, 'base64url'), recipientSecretKeyOrSeed: recipient.secretKey });
+        expect(opened).toBeTruthy();
+        expect(JSON.parse(new TextDecoder().decode(opened!))).toMatchObject({
+            serviceId: 'antigravity', accessToken: 'agy-access', refreshToken: 'agy-refresh',
+            providerEmail: 'account-a@example.test', providerAccountId: 'google-account-a', expiresAt: 3601000,
+        });
+    });
+
+    it.each([
+        [undefined, AGY_OAUTH_SCOPES.join(' ')],
+        ['https://www.googleapis.com/auth/userinfo.email', 'https://www.googleapis.com/auth/userinfo.email'],
+    ])('seals effective grants from a known Antigravity authorization exchange (%s)', async (scope, expectedScope) => {
+        const recipient = buildRecipientKeyPair();
+        const fetcher = vi.fn<typeof fetch>(async (input) => String(input).endsWith('/userinfo')
+            ? Response.json({ sub: 'account-a' })
+            : Response.json({ access_token: 'access', refresh_token: 'refresh', ...(scope === undefined ? {} : { scope }) }));
+        const result = await exchangeConnectedServiceOauthTokens({
+            serviceId: 'antigravity', publicKeyB64Url: recipient.publicKeyB64Url,
+            code: 'code', verifier: 'verifier', redirectUri: 'https://antigravity.google/oauth-callback', now: 1000, fetcher,
+        });
+        const opened = openBoxBundle({ bundle: decodeBase64(result.bundleB64Url, 'base64url'), recipientSecretKeyOrSeed: recipient.secretKey });
+        expect(JSON.parse(new TextDecoder().decode(opened!)).scope).toBe(expectedScope);
+    });
+
+    it("rejects an unregistered Antigravity redirect before contacting Google", async () => {
+        const fetcher = vi.fn<typeof fetch>();
+        await expect(exchangeConnectedServiceOauthTokens({
+            serviceId: 'antigravity', publicKeyB64Url: buildRecipientPublicKeyB64Url(),
+            code: 'code', verifier: 'verifier', redirectUri: 'http://localhost:54545/oauth2callback', now: 1000, fetcher,
+        })).rejects.toMatchObject({ errorCode: 'connect_oauth_exchange_failed' });
+        expect(fetcher).not.toHaveBeenCalled();
+    });
+
+    it.each([401, 503])("handles Antigravity userinfo status %i honestly", async (status) => {
+        const recipient = buildRecipientKeyPair();
+        const fetcher = vi.fn<typeof fetch>(async (input) => String(input).endsWith('/userinfo')
+            ? new Response('', { status })
+            : Response.json({ access_token: 'agy-access', refresh_token: 'agy-refresh' }));
+        const exchange = exchangeConnectedServiceOauthTokens({
+            serviceId: 'antigravity', publicKeyB64Url: recipient.publicKeyB64Url,
+            code: 'code', verifier: 'verifier', redirectUri: 'https://antigravity.google/oauth-callback', now: 1000, fetcher,
+        });
+        if (status === 401) {
+            await expect(exchange).rejects.toMatchObject({ errorCode: 'connect_oauth_exchange_failed' });
+        } else {
+            const result = await exchange;
+            const opened = openBoxBundle({ bundle: decodeBase64(result.bundleB64Url, 'base64url'), recipientSecretKeyOrSeed: recipient.secretKey });
+            expect(JSON.parse(new TextDecoder().decode(opened!))).toMatchObject({ providerEmail: null, providerAccountId: null });
+        }
+    });
+
+    it.each([
+        [{ error: 'invalid_grant' }, 400, 'connect_oauth_invalid_grant'],
+        [{ error: 'invalid_client' }, 401, 'connect_oauth_invalid_client'],
+        [{ access_token: 'agy-access' }, 200, 'connect_oauth_missing_refresh_token'],
+    ] as const)("preserves Antigravity OAuth error classification for %j", async (body, status, errorCode) => {
+        await expect(exchangeConnectedServiceOauthTokens({
+            serviceId: 'antigravity', publicKeyB64Url: buildRecipientPublicKeyB64Url(),
+            code: 'code', verifier: 'verifier', redirectUri: 'https://antigravity.google/oauth-callback', now: 1000,
+            fetcher: async () => Response.json(body, { status }),
+        })).rejects.toMatchObject({ errorCode });
+    });
 
     it("rejects openai api-key service oauth exchange", async () => {
         await expect(exchangeConnectedServiceOauthTokens({

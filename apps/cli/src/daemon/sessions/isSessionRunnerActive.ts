@@ -78,18 +78,24 @@ async function classifyLockPresence(params: {
   });
 }
 
-async function classifyTrackedSessionPresence(params: {
-  sessionId: string;
+export async function classifyTrackedSessionRunnerPresence(params: {
   tracked: TrackedSession;
-  readProcessRunState: ReadProcessRunState;
+  readProcessRunState?: ReadProcessRunState;
   getProcessCommandHash?: SessionRunnerProcessCommandHashReader;
   getProcessInstanceFingerprint?: SessionRunnerProcessInstanceFingerprintReader;
 }): Promise<SessionRunnerProcessPresence> {
-  if (!trackedSessionMatchesSessionId(params.tracked, params.sessionId)) return 'absent';
-
+  // A Windows Terminal dispatcher can exit before the runner reports. Its
+  // lifetime is not evidence of runner absence; the existing startup finalizer
+  // owns failure/timeout until a correlated runner identity is available.
+  if (params.tracked.hostedTerminal?.mode === 'windows_terminal'
+    && params.tracked.startupCustody
+    && !params.tracked.sessionRunnerPid
+    && !params.tracked.happySessionMetadataFromLocalWebhook
+    && params.tracked.stopRequestedAtMs === undefined) return 'unknown';
   const childPid = typeof params.tracked.childProcess?.pid === 'number' ? params.tracked.childProcess.pid : null;
-  const pidToCheck = childPid ?? params.tracked.pid;
-  const runState = await params.readProcessRunState(pidToCheck).catch(() => null);
+  const pidToCheck = params.tracked.sessionRunnerPid ?? childPid ?? params.tracked.pid;
+  const readProcessRunState = params.readProcessRunState ?? readProcessRunStateDefault;
+  const runState = await readProcessRunState(pidToCheck).catch(() => null);
   return await classifyStoredProcessPresence({
     storedProcessCommandHash: params.tracked.processCommandHash,
     storedProcessInstanceFingerprint: params.tracked.processInstanceFingerprint,
@@ -115,8 +121,8 @@ export async function isSessionRunnerActive(params: Readonly<{
   const readLockStatus = params.readSessionRunnerLockStatus ?? readSessionRunnerLockStatus;
 
   for (const tracked of params.trackedSessions) {
-    if (await classifyTrackedSessionPresence({
-      sessionId,
+    if (!trackedSessionMatchesSessionId(tracked, sessionId)) continue;
+    if (await classifyTrackedSessionRunnerPresence({
       tracked,
       readProcessRunState,
       getProcessCommandHash: params.getProcessCommandHash,
@@ -159,7 +165,10 @@ export type SessionRunnerServiceabilityProbe =
 export type SessionRunnerResumeDecision =
   | Readonly<{ action: 'spawn' }>
   | Readonly<{ action: 'adopt' }>
-  | Readonly<{ action: 'wait_for_exit'; reason: 'runtime_terminating' }>
+  | Readonly<{
+      action: 'wait_for_exit';
+      reason: 'runtime_terminating' | 'rpc_method_unavailable' | 'rpc_failed';
+    }>
   | Readonly<{ action: 'replace'; reason: 'publisher_lost'; target: MatchedLostPublisherRunner }>
   | Readonly<{ action: 'fence'; reason: string }>;
 
@@ -214,8 +223,12 @@ export function resolveSessionRunnerResumeDecision(probe: SessionRunnerServiceab
   if (probe.state === 'runner_absent') return { action: 'spawn' };
   if (probe.state === 'runner_unknown') return { action: 'fence', reason: probe.reason };
   if (probe.control.state === 'servable') return { action: 'adopt' };
-  if (probe.control.state === 'recoverable_unservable' && probe.control.reason === 'runtime_terminating') {
-    return { action: 'wait_for_exit', reason: 'runtime_terminating' };
+  if (
+    probe.control.reason === 'runtime_terminating'
+    || probe.control.reason === 'rpc_method_unavailable'
+    || probe.control.reason === 'rpc_failed'
+  ) {
+    return { action: 'wait_for_exit', reason: probe.control.reason };
   }
   // Only the exact local runner's own positive report proves it can never claim Pending input again.
   // A missing, failed, malformed, foreign or unbindable report stays a fence and never implies replacement.
@@ -225,42 +238,40 @@ export function resolveSessionRunnerResumeDecision(probe: SessionRunnerServiceab
   return { action: 'fence', reason: probe.control.reason };
 }
 
-export async function probeSessionRunnerServiceability(params: Readonly<{
+type SessionRunnerPresenceProbeParams = Readonly<{
   sessionId: string;
   trackedSessions: Iterable<TrackedSession>;
-  probeCapability: () => Promise<SessionRunnerServiceability>;
   /** This daemon's machine identity; without it no lost-publisher report can bind to a local runner. */
   localMachineId?: string;
   readProcessRunState?: ReadProcessRunState;
   getProcessCommandHash?: SessionRunnerProcessCommandHashReader;
   getProcessInstanceFingerprint?: SessionRunnerProcessInstanceFingerprintReader;
   readSessionRunnerLockStatus?: (args: { sessionId: string }) => Promise<SessionRunnerLockStatus>;
-}>): Promise<SessionRunnerServiceabilityProbe> {
+}>;
+
+export type SessionRunnerPresenceProbe =
+  | Readonly<{ state: 'runner_present' }>
+  | Exclude<SessionRunnerServiceabilityProbe, Readonly<{ state: 'runner_present' }>>;
+
+/** Presence admission without performing or inventing a capability RPC result. */
+export async function probeSessionRunnerPresence(
+  params: SessionRunnerPresenceProbeParams,
+): Promise<SessionRunnerPresenceProbe> {
   const sessionId = normalizeSessionId(params.sessionId);
   const matchingTracked = Array.from(params.trackedSessions)
     .filter((tracked) => trackedSessionMatchesSessionId(tracked, sessionId));
   const readProcessRunState = params.readProcessRunState ?? readProcessRunStateDefault;
   const readLockStatus = params.readSessionRunnerLockStatus ?? readSessionRunnerLockStatus;
-  const getProcessInstanceFingerprint = params.getProcessInstanceFingerprint ?? readProcessInstanceFingerprintSync;
 
   for (const tracked of matchingTracked) {
-    const presence = await classifyTrackedSessionPresence({
-      sessionId,
+    const presence = await classifyTrackedSessionRunnerPresence({
       tracked,
       readProcessRunState,
       getProcessCommandHash: params.getProcessCommandHash,
       getProcessInstanceFingerprint: params.getProcessInstanceFingerprint,
     });
     if (presence === 'present') {
-      return {
-        state: 'runner_present',
-        control: bindLostPublisherReport(await params.probeCapability(), () => resolveSoleTrackedRunnerIncarnation({
-          tracked,
-          matchingTrackedCount: matchingTracked.length,
-          localMachineId: params.localMachineId,
-          getProcessInstanceFingerprint,
-        })),
-      };
+      return { state: 'runner_present' };
     }
     if (presence !== 'absent') {
       return { state: 'runner_unknown', reason: 'runner_presence_unproven' };
@@ -275,11 +286,44 @@ export async function probeSessionRunnerServiceability(params: Readonly<{
     readSessionRunnerLockStatus: readLockStatus,
   });
   if (lockPresence === 'present') {
-    // A lock-only runner is not tracked, so a session Stop cannot signal it: never a replacement target.
-    return { state: 'runner_present', control: bindLostPublisherReport(await params.probeCapability(), () => null) };
+    return { state: 'runner_present' };
   }
   if (lockPresence === 'absent' || lockPresence === 'recoverable_stopped') {
     return { state: 'runner_absent' };
   }
   return { state: 'runner_unknown', reason: 'runner_presence_unproven' };
+}
+
+export async function probeSessionRunnerServiceability(params: SessionRunnerPresenceProbeParams & Readonly<{
+  probeCapability: () => Promise<SessionRunnerServiceability>;
+}>): Promise<SessionRunnerServiceabilityProbe> {
+  const trackedSessions = Array.from(params.trackedSessions);
+  const presence = await probeSessionRunnerPresence({ ...params, trackedSessions });
+  if (presence.state !== 'runner_present') return presence;
+  const matchingTracked = trackedSessions.filter((tracked) =>
+    trackedSessionMatchesSessionId(tracked, normalizeSessionId(params.sessionId)));
+  const control = await params.probeCapability();
+  const tracked = matchingTracked.length === 1 ? matchingTracked[0] : null;
+  // Lock-only presence cannot turn an absent or unproven tracked process into
+  // a replacement target. Reconfirm the tracked identity after the RPC.
+  const trackedPresence = tracked && control.state === 'recoverable_unservable' && control.reason === 'publisher_lost'
+    ? await classifyTrackedSessionRunnerPresence({
+      tracked,
+      readProcessRunState: params.readProcessRunState,
+      getProcessCommandHash: params.getProcessCommandHash,
+      getProcessInstanceFingerprint: params.getProcessInstanceFingerprint,
+    })
+    : null;
+  return {
+    ...presence,
+    control: bindLostPublisherReport(control, () => {
+      if (!tracked || trackedPresence !== 'present') return null;
+      return resolveSoleTrackedRunnerIncarnation({
+        tracked,
+        matchingTrackedCount: matchingTracked.length,
+        localMachineId: params.localMachineId,
+        getProcessInstanceFingerprint: params.getProcessInstanceFingerprint ?? readProcessInstanceFingerprintSync,
+      });
+    }),
+  };
 }

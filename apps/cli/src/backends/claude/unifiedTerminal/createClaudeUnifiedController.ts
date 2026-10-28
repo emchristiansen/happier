@@ -134,11 +134,15 @@ export function createClaudeUnifiedController(opts: Readonly<{
         throw new ClaudeUnifiedTerminalHostDeadError(liveness);
       }
       try {
+        // Start host/readiness safety observation before awaiting provider-observer installation.
+        // Transcript setup can legitimately wait on provider-owned state; it must not make the
+        // bounded terminal readiness/dialog path unreachable while the provider is stuck before
+        // SessionStart. Pending input remains closed until the provider observers finish installing.
+        startSupervised(opts.transcriptBridge);
         if (opts.observerBridge) {
           await Promise.resolve(opts.observerBridge.start({ abortSignal: abortController.signal }));
         }
         if (disposed) return;
-        startSupervised(opts.transcriptBridge);
         startSupervised(opts.pendingQueuePump);
       } catch (error) {
         await dispose().catch(() => undefined);

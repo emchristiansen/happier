@@ -1,4 +1,3 @@
-import type { ClientConnection } from "@/app/events/eventRouter";
 import { log } from "@/utils/logging/log";
 import type { Socket } from "socket.io";
 
@@ -14,7 +13,6 @@ export const RELEASED_UI_V0_2_1_SESSION_END_STALE_WINDOW_MS = 10 * 60 * 1_000;
 export function registerReleasedUiV021SessionEndSocketEvent(params: Readonly<{
     socket: Socket;
     accountId: string;
-    connection: Extract<ClientConnection, { connectionType: "user-scoped" }>;
     now?: () => number;
 }>): void {
     const now = params.now ?? Date.now;
@@ -31,7 +29,6 @@ export function registerReleasedUiV021SessionEndSocketEvent(params: Readonly<{
                 accountId: params.accountId,
                 sessionId: sid,
                 observedAt,
-                connection: params.connection,
             });
         })().catch((error) => {
             log(

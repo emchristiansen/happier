@@ -19,6 +19,8 @@ export type RunSessionHandoffUiFlowArgs = Readonly<{
     targetMachineId: string;
     targetPath?: string;
     targetSessionStorageMode?: 'direct' | 'persisted';
+    stateTransfer?: 'transfer' | 'existing';
+    onExistingStateUnavailable?: () => void;
     workspaceTransfer?: SessionHandoffWorkspaceTransfer;
     context: ActionExecutorContext;
 }>;
@@ -97,6 +99,11 @@ export async function runSessionHandoffUiFlow(
             }
             if (result.ok) {
                 return result;
+            }
+            if (args.stateTransfer === 'existing' && result.errorCode === 'existing_session_state_unavailable' && args.onExistingStateUnavailable) {
+                closeProgressModal();
+                args.onExistingStateUnavailable();
+                return { ok: false, handled: true };
             }
             if (!progressPresentation.isAttached()) {
                 return { ok: false, handled: true };

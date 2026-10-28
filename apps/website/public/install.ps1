@@ -21,6 +21,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Resolve 8.3 TEMP names once before any process files reach the FileSystem provider.
+$InstallerTempDir = (Get-Item -LiteralPath ([System.IO.Path]::GetTempPath())).FullName
+
 if ($WithDaemon.IsPresent -and $WithoutDaemon.IsPresent) {
   throw "Specify either -WithDaemon or -WithoutDaemon, not both."
 }
@@ -409,8 +412,8 @@ function Test-InstallerRichHeaderAvailable {
   try {
     return (
       -not [Console]::IsOutputRedirected -and
-      [Console]::WindowWidth -ge 58 -and
-      [Console]::WindowHeight -ge 12
+      [Console]::WindowWidth -ge 76 -and
+      [Console]::WindowHeight -ge 16
     )
   }
   catch {
@@ -418,29 +421,58 @@ function Test-InstallerRichHeaderAvailable {
   }
 }
 
+function Test-InstallerBrailleArtAvailable {
+  # The planet is drawn with Braille glyphs. The legacy console host has no font
+  # fallback for them; Windows Terminal (WT_SESSION) and hosts that identify
+  # themselves (TERM_PROGRAM, e.g. VS Code) do. Mirrors supportsBrailleArt() in
+  # packages/cli-common/src/output/planet.ts, which setup uses after this handoff.
+  return [bool]($env:WT_SESSION -or $env:TERM_PROGRAM)
+}
+
 function Write-InstallerHeader {
-  if (-not (Test-InstallerRichHeaderAvailable)) {
+  if (-not (Test-InstallerRichHeaderAvailable) -or -not (Test-InstallerBrailleArtAvailable)) {
     Write-Host "Happier"
-    Write-Host "Secure installer"
+    Write-Host "Start coding anywhere. Continue anywhere."
     Write-Host "Download -> Verify -> Install"
     Write-Host ""
     $script:InstallerHeaderShown = $true
     return
   }
 
+  # BEGIN GENERATED PLANET
   $rows = @(
-    "          3443",
-    "       343333334",
-    "     433221112334",
-    "    43211000112334",
-    "    32100000011233",
-    "    32100000112334",
-    "     321111223344",
-    "       33223344",
-    "          3344"
+    "            $([char]0x2801)$([char]0x2804)$([char]0x2801)$([char]0x2804)$([char]0x2801)$([char]0x2804)$([char]0x2801)         ",
+    "        $([char]0x2801)$([char]0x2804)$([char]0x2805)$([char]0x2885)$([char]0x2895)$([char]0x2885)$([char]0x28d5)$([char]0x2885)$([char]0x2895)$([char]0x2885)$([char]0x2885)$([char]0x2885)$([char]0x2805)$([char]0x2804)$([char]0x2801)     ",
+    "      $([char]0x2801)$([char]0x2804)$([char]0x2895)$([char]0x28b5)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28df)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28fd)$([char]0x28ff)$([char]0x28f5)$([char]0x28f5)$([char]0x2885)$([char]0x2805)$([char]0x2804)$([char]0x2801)   ",
+    "      $([char]0x2801)$([char]0x2815)$([char]0x289c)$([char]0x28f5)$([char]0x28ff)$([char]0x28ff)$([char]0x28fd)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28df)$([char]0x28bf)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28b7)$([char]0x2885)$([char]0x2805)$([char]0x2804)$([char]0x2801) ",
+    "      $([char]0x2801)$([char]0x2895)$([char]0x289d)$([char]0x28b5)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28b7)$([char]0x2895)$([char]0x2805)$([char]0x2801)$([char]0x2804)",
+    "      $([char]0x2801)$([char]0x2805)$([char]0x289d)$([char]0x28bd)$([char]0x28bf)$([char]0x28ff)$([char]0x28df)$([char]0x28fd)$([char]0x28ff)$([char]0x28fd)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28fd)$([char]0x28f7)$([char]0x28ff)$([char]0x28df)$([char]0x28ff)$([char]0x28df)$([char]0x2885)$([char]0x2805)$([char]0x2804)",
+    "      $([char]0x2801)$([char]0x2805)$([char]0x2815)$([char]0x28ad)$([char]0x28bf)$([char]0x28ff)$([char]0x28ff)$([char]0x28bf)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x2895)$([char]0x2805)$([char]0x2805)",
+    "        $([char]0x2801)$([char]0x2891)$([char]0x2889)$([char]0x28bd)$([char]0x28b7)$([char]0x28f7)$([char]0x28ff)$([char]0x28bf)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28fd)$([char]0x28ff)$([char]0x28ff)$([char]0x289f)$([char]0x2805)$([char]0x2805)$([char]0x2804)",
+    "        $([char]0x2801)$([char]0x2805)$([char]0x2815)$([char]0x2899)$([char]0x28bd)$([char]0x28bd)$([char]0x28bf)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28df)$([char]0x28ff)$([char]0x289f)$([char]0x2815)$([char]0x2805)$([char]0x2801) ",
+    "          $([char]0x2801)$([char]0x2805)$([char]0x281c)$([char]0x289d)$([char]0x289d)$([char]0x28bd)$([char]0x28bf)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x28ff)$([char]0x289f)$([char]0x281d)$([char]0x2805)$([char]0x2801)$([char]0x2805)$([char]0x2801) ",
+    "            $([char]0x2801)$([char]0x2801)$([char]0x2811)$([char]0x2815)$([char]0x2815)$([char]0x281d)$([char]0x281d)$([char]0x281d)$([char]0x2815)$([char]0x2805)$([char]0x2801)$([char]0x2805)$([char]0x2801) $([char]0x2801) ",
+    "                $([char]0x2801)$([char]0x2801)$([char]0x2801)$([char]0x2801)$([char]0x2801) $([char]0x2801)     ",
+    "                            "
   )
-  $labels = @("Happier", "Secure installer", "Download -> Verify -> Install", "", "", "", "", "", "")
-  $colors = @("Yellow", "Yellow", "Red", "Red", "Magenta", "Magenta", "Cyan", "Cyan", "Blue")
+  $rgbRows = @(
+    "            $([char]27)[38;2;143;109;59m$([char]0x2801)$([char]27)[38;2;158;120;63m$([char]0x2804)$([char]27)[38;2;144;110;59m$([char]0x2801)$([char]27)[38;2;157;120;63m$([char]0x2804)$([char]27)[38;2;143;109;59m$([char]0x2801)$([char]27)[38;2;152;116;61m$([char]0x2804)$([char]27)[38;2;139;106;58m$([char]0x2801)         $([char]27)[0m",
+    "        $([char]27)[38;2;153;114;63m$([char]0x2801)$([char]27)[38;2;182;130;73m$([char]0x2804)$([char]27)[38;2;181;134;71m$([char]0x2805)$([char]27)[38;2;206;151;78m$([char]0x2885)$([char]27)[38;2;211;157;78m$([char]0x2895)$([char]27)[38;2;216;173;92m$([char]0x2885)$([char]27)[38;2;222;172;89m$([char]0x28d5)$([char]27)[38;2;216;162;79m$([char]0x2885)$([char]27)[38;2;203;153;76m$([char]0x2895)$([char]27)[38;2;198;149;74m$([char]0x2885)$([char]27)[38;2;186;140;71m$([char]0x2885)$([char]27)[38;2;175;132;68m$([char]0x2885)$([char]27)[38;2;160;121;64m$([char]0x2805)$([char]27)[38;2;158;120;63m$([char]0x2804)$([char]27)[38;2;141;108;58m$([char]0x2801)     $([char]27)[0m",
+    "      $([char]27)[38;2;160;103;71m$([char]0x2801)$([char]27)[38;2;203;123;87m$([char]0x2804)$([char]27)[38;2;199;137;87m$([char]0x2895)$([char]27)[38;2;184;158;101m$([char]0x28b5)$([char]27)[38;2;220;194;121m$([char]0x28ff)$([char]27)[38;2;239;220;139m$([char]0x28ff)$([char]27)[38;2;252;232;145m$([char]0x28ff)$([char]0x28df)$([char]27)[38;2;254;234;145m$([char]0x28ff)$([char]27)[38;2;253;232;144m$([char]0x28ff)$([char]27)[38;2;255;232;142m$([char]0x28ff)$([char]27)[38;2;253;222;132m$([char]0x28fd)$([char]27)[38;2;247;209;118m$([char]0x28ff)$([char]27)[38;2;241;198;108m$([char]0x28f5)$([char]27)[38;2;223;171;87m$([char]0x28f5)$([char]27)[38;2;196;147;74m$([char]0x2885)$([char]27)[38;2;172;130;67m$([char]0x2805)$([char]27)[38;2;165;125;65m$([char]0x2804)$([char]27)[38;2;144;110;59m$([char]0x2801)   $([char]27)[0m",
+    "      $([char]27)[38;2;203;113;91m$([char]0x2801)$([char]27)[38;2;76;63;41m$([char]0x2815)$([char]27)[38;2;149;118;64m$([char]0x289c)$([char]27)[38;2;188;148;74m$([char]0x28f5)$([char]27)[38;2;230;187;95m$([char]0x28ff)$([char]27)[38;2;247;205;105m$([char]0x28ff)$([char]27)[38;2;253;214;111m$([char]0x28fd)$([char]27)[38;2;255;221;119m$([char]0x28ff)$([char]27)[38;2;255;225;124m$([char]0x28ff)$([char]27)[38;2;255;227;129m$([char]0x28ff)$([char]27)[38;2;255;229;134m$([char]0x28ff)$([char]27)[38;2;255;231;137m$([char]0x28df)$([char]27)[38;2;255;233;142m$([char]0x28bf)$([char]27)[38;2;255;232;140m$([char]0x28ff)$([char]27)[38;2;254;228;137m$([char]0x28ff)$([char]27)[38;2;248;207;116m$([char]0x28ff)$([char]27)[38;2;222;164;82m$([char]0x28b7)$([char]27)[38;2;194;145;73m$([char]0x2885)$([char]27)[38;2;170;129;66m$([char]0x2805)$([char]27)[38;2;159;121;63m$([char]0x2804)$([char]27)[38;2;142;108;58m$([char]0x2801) $([char]27)[0m",
+    "      $([char]27)[38;2;39;31;28m$([char]0x2801)$([char]27)[38;2;92;58;38m$([char]0x2895)$([char]27)[38;2;143;90;48m$([char]0x289d)$([char]27)[38;2;188;116;54m$([char]0x28b5)$([char]27)[38;2;211;134;59m$([char]0x28ff)$([char]27)[38;2;237;155;64m$([char]0x28ff)$([char]27)[38;2;250;169;68m$([char]0x28ff)$([char]27)[38;2;251;175;69m$([char]0x28ff)$([char]27)[38;2;254;182;71m$([char]0x28ff)$([char]27)[38;2;253;186;75m$([char]0x28ff)$([char]27)[38;2;255;192;79m$([char]0x28ff)$([char]27)[38;2;255;196;82m$([char]0x28ff)$([char]27)[38;2;255;200;87m$([char]0x28ff)$([char]27)[38;2;255;204;92m$([char]0x28ff)$([char]27)[38;2;255;208;97m$([char]0x28ff)$([char]27)[38;2;255;211;103m$([char]0x28ff)$([char]27)[38;2;254;207;106m$([char]0x28ff)$([char]27)[38;2;231;165;92m$([char]0x28b7)$([char]27)[38;2;192;135;76m$([char]0x2895)$([char]27)[38;2;171;124;69m$([char]0x2805)$([char]27)[38;2;152;116;62m$([char]0x2801)$([char]27)[38;2;144;107;60m$([char]0x2804)$([char]27)[0m",
+    "      $([char]27)[38;2;38;27;28m$([char]0x2801)$([char]27)[38;2;69;38;35m$([char]0x2805)$([char]27)[38;2;125;59;46m$([char]0x289d)$([char]27)[38;2;168;77;52m$([char]0x28bd)$([char]27)[38;2;201;94;55m$([char]0x28bf)$([char]27)[38;2;220;104;56m$([char]0x28ff)$([char]27)[38;2;241;118;56m$([char]0x28df)$([char]27)[38;2;245;124;54m$([char]0x28fd)$([char]27)[38;2;245;129;53m$([char]0x28ff)$([char]27)[38;2;248;134;54m$([char]0x28fd)$([char]27)[38;2;248;139;54m$([char]0x28ff)$([char]27)[38;2;249;145;55m$([char]0x28ff)$([char]27)[38;2;249;149;56m$([char]0x28ff)$([char]27)[38;2;253;155;58m$([char]0x28fd)$([char]27)[38;2;253;159;60m$([char]0x28f7)$([char]27)[38;2;254;168;66m$([char]0x28ff)$([char]27)[38;2;254;178;74m$([char]0x28df)$([char]27)[38;2;253;186;91m$([char]0x28ff)$([char]27)[38;2;212;133;88m$([char]0x28df)$([char]27)[38;2;179;115;77m$([char]0x2885)$([char]27)[38;2;159;107;69m$([char]0x2805)$([char]27)[38;2;145;97;64m$([char]0x2804)$([char]27)[0m",
+    "      $([char]27)[38;2;26;21;27m$([char]0x2801)$([char]27)[38;2;44;25;36m$([char]0x2805)$([char]27)[38;2;79;34;49m$([char]0x2815)$([char]27)[38;2;113;43;63m$([char]0x28ad)$([char]27)[38;2;150;53;72m$([char]0x28bf)$([char]27)[38;2;175;61;78m$([char]0x28ff)$([char]27)[38;2;196;69;78m$([char]0x28ff)$([char]27)[38;2;214;77;74m$([char]0x28bf)$([char]27)[38;2;219;80;73m$([char]0x28ff)$([char]27)[38;2;224;84;69m$([char]0x28ff)$([char]27)[38;2;224;87;66m$([char]0x28ff)$([char]27)[38;2;228;92;63m$([char]0x28ff)$([char]27)[38;2;233;97;61m$([char]0x28ff)$([char]27)[38;2;237;103;60m$([char]0x28ff)$([char]27)[38;2;240;109;59m$([char]0x28ff)$([char]27)[38;2;242;117;60m$([char]0x28ff)$([char]27)[38;2;245;130;64m$([char]0x28ff)$([char]27)[38;2;249;155;78m$([char]0x28ff)$([char]27)[38;2;214;117;95m$([char]0x28ff)$([char]27)[38;2;176;101;81m$([char]0x2895)$([char]27)[38;2;158;95;73m$([char]0x2805)$([char]27)[38;2;143;88;67m$([char]0x2805)$([char]27)[0m",
+    "        $([char]27)[38;2;38;25;44m$([char]0x2801)$([char]27)[38;2;47;31;65m$([char]0x2891)$([char]27)[38;2;74;37;82m$([char]0x2889)$([char]27)[38;2;83;40;99m$([char]0x28bd)$([char]27)[38;2;93;42;108m$([char]0x28b7)$([char]27)[38;2;104;45;115m$([char]0x28f7)$([char]27)[38;2;126;48;114m$([char]0x28ff)$([char]27)[38;2;145;50;106m$([char]0x28bf)$([char]27)[38;2;150;51;106m$([char]0x28ff)$([char]27)[38;2;160;53;101m$([char]0x28ff)$([char]27)[38;2;168;56;97m$([char]0x28ff)$([char]27)[38;2;179;60;94m$([char]0x28ff)$([char]27)[38;2;188;66;91m$([char]0x28ff)$([char]27)[38;2;195;75;89m$([char]0x28fd)$([char]27)[38;2;210;92;89m$([char]0x28ff)$([char]27)[38;2;227;127;97m$([char]0x28ff)$([char]27)[38;2;198;93;96m$([char]0x289f)$([char]27)[38;2;172;86;85m$([char]0x2805)$([char]27)[38;2;150;78;75m$([char]0x2805)$([char]27)[38;2;134;70;69m$([char]0x2804)$([char]27)[0m",
+    "        $([char]27)[38;2;20;23;34m$([char]0x2801)$([char]27)[38;2;22;28;46m$([char]0x2805)$([char]27)[38;2;26;39;75m$([char]0x2815)$([char]27)[38;2;32;50;106m$([char]0x2899)$([char]27)[38;2;33;57;126m$([char]0x28bd)$([char]27)[38;2;36;65;149m$([char]0x28bd)$([char]27)[38;2;38;65;157m$([char]0x28bf)$([char]27)[38;2;42;70;171m$([char]0x28ff)$([char]27)[38;2;47;67;169m$([char]0x28ff)$([char]27)[38;2;54;65;166m$([char]0x28ff)$([char]27)[38;2;61;61;159m$([char]0x28ff)$([char]27)[38;2;72;60;151m$([char]0x28ff)$([char]27)[38;2;85;61;143m$([char]0x28ff)$([char]27)[38;2;106;68;135m$([char]0x28df)$([char]27)[38;2;147;89;125m$([char]0x28ff)$([char]27)[38;2;190;95;108m$([char]0x289f)$([char]27)[38;2;170;69;92m$([char]0x2815)$([char]27)[38;2;151;64;82m$([char]0x2805)$([char]27)[38;2;140;65;74m$([char]0x2801) $([char]27)[0m",
+    "          $([char]27)[38;2;21;28;44m$([char]0x2801)$([char]27)[38;2;22;32;54m$([char]0x2805)$([char]27)[38;2;25;47;87m$([char]0x281c)$([char]27)[38;2;26;56;108m$([char]0x289d)$([char]27)[38;2;28;68;136m$([char]0x289d)$([char]27)[38;2;30;76;152m$([char]0x28bd)$([char]27)[38;2;33;88;178m$([char]0x28bf)$([char]27)[38;2;35;91;185m$([char]0x28ff)$([char]27)[38;2;38;95;191m$([char]0x28ff)$([char]27)[38;2;45;99;191m$([char]0x28ff)$([char]27)[38;2;61;106;185m$([char]0x28ff)$([char]27)[38;2;91;106;165m$([char]0x289f)$([char]27)[38;2;143;86;125m$([char]0x281d)$([char]27)[38;2;137;65;103m$([char]0x2805)$([char]27)[38;2;136;61;91m$([char]0x2801)$([char]27)[38;2;116;54;81m$([char]0x2805)$([char]27)[38;2;119;52;75m$([char]0x2801) $([char]27)[0m",
+    "            $([char]27)[38;2;18;23;38m$([char]0x2801)$([char]27)[38;2;17;28;55m$([char]0x2801)$([char]27)[38;2;17;32;68m$([char]0x2811)$([char]27)[38;2;17;34;75m$([char]0x2815)$([char]27)[38;2;18;41;92m$([char]0x2815)$([char]27)[38;2;22;52;115m$([char]0x281d)$([char]27)[38;2;31;64;126m$([char]0x281d)$([char]27)[38;2;74;80;147m$([char]0x281d)$([char]27)[38;2;89;78;129m$([char]0x2815)$([char]27)[38;2;98;63;118m$([char]0x2805)$([char]27)[38;2;104;61;108m$([char]0x2801)$([char]27)[38;2;89;54;95m$([char]0x2805)$([char]27)[38;2;94;53;88m$([char]0x2801) $([char]27)[38;2;91;49;77m$([char]0x2801) $([char]27)[0m",
+    "                $([char]27)[38;2;53;68;156m$([char]0x2801)$([char]27)[38;2;57;65;146m$([char]0x2801)$([char]27)[38;2;60;62;134m$([char]0x2801)$([char]27)[38;2;61;59;123m$([char]0x2801)$([char]27)[38;2;62;55;113m$([char]0x2801) $([char]27)[38;2;64;51;98m$([char]0x2801)     $([char]27)[0m",
+    "                            $([char]27)[0m"
+  )
+  # END GENERATED PLANET
+  $center = [int][Math]::Floor(($rows.Count - 1) / 2)
+  $colors = @("Yellow", "Red", "Magenta", "Cyan", "Blue")
   $useColor = -not $env:NO_COLOR
   $supportsVirtualTerminal = $false
   try {
@@ -449,27 +481,34 @@ function Write-InstallerHeader {
   catch {}
 
   for ($index = 0; $index -lt $rows.Count; $index++) {
-    $paddedRow = $rows[$index].PadRight(24)
-    if ($useColor) {
-      Write-Host $paddedRow -NoNewline -ForegroundColor $colors[$index]
+    $label = ""
+    if ($index -eq ($center - 1)) { $label = "Happier" }
+    elseif ($index -eq $center) { $label = "Start coding anywhere. Continue anywhere." }
+    elseif ($index -eq ($center + 2)) { $label = "Download -> Verify -> Install" }
+    if ($useColor -and $supportsVirtualTerminal -and ($env:COLORTERM -in @("truecolor", "24bit") -or $env:WT_SESSION)) {
+      Write-Host $rgbRows[$index] -NoNewline
+    }
+    elseif ($useColor) {
+      $colorIndex = [int][Math]::Floor($index * $colors.Count / $rows.Count)
+      Write-Host $rows[$index] -NoNewline -ForegroundColor $colors[$colorIndex]
     }
     else {
-      Write-Host $paddedRow -NoNewline
+      Write-Host $rows[$index] -NoNewline
     }
 
-    if ($labels[$index]) {
-      Write-Host "    " -NoNewline
-      if ($index -eq 0 -and $useColor) {
+    if ($label) {
+      Write-Host "   " -NoNewline
+      if ($index -eq ($center - 1) -and $useColor) {
         if ($supportsVirtualTerminal) {
           $escape = [char]27
-          Write-Host "$($escape)[1m$($labels[$index])$($escape)[0m"
+          Write-Host "$($escape)[1m$label$($escape)[0m"
         }
         else {
-          Write-Host $labels[$index] -ForegroundColor White
+          Write-Host $label -ForegroundColor White
         }
       }
       else {
-        Write-Host $labels[$index]
+        Write-Host $label
       }
     }
     else {
@@ -485,10 +524,7 @@ function Write-InstallerStage {
     [Parameter(Mandatory = $true)] [string] $Name
   )
 
-  if ((Test-InstallerRichHeaderAvailable) -and -not $env:NO_COLOR) {
-    Write-Host ("[{0}]" -f $Name) -ForegroundColor Cyan
-    return
-  }
+  # The terminal's own foreground stays readable on dark and light backgrounds.
   Write-Host ("[{0}]" -f $Name)
 }
 
@@ -739,6 +775,22 @@ function Stop-InstallerProcessTree {
   }
 }
 
+function Remove-InstallerTemporaryFiles {
+  param (
+    [Parameter(Mandatory = $true)] [string[]] $Paths
+  )
+
+  foreach ($path in $Paths) {
+    try {
+      # Direct .NET deletion avoids short-name provider enumeration failures.
+      [System.IO.File]::Delete($path)
+    }
+    catch {
+      # Best-effort cleanup must not replace the command's result (e.g. a locked file).
+    }
+  }
+}
+
 function Invoke-InstallerCommandWithDaemonServiceContextCapturingOutputWithTimeout {
   param (
     [Parameter(Mandatory = $true)] [string] $CliPath,
@@ -753,8 +805,8 @@ function Invoke-InstallerCommandWithDaemonServiceContextCapturingOutputWithTimeo
   $previousDaemonServiceChannel = $env:HAPPIER_DAEMON_SERVICE_CHANNEL
   $previousInstallerDaemonServiceStrategy = $env:HAPPIER_INSTALLER_DAEMON_SERVICE_STRATEGY
   $runToken = [System.Guid]::NewGuid().ToString("N")
-  $stdoutPath = Join-Path $env:TEMP "happier-pre-install-$runToken.stdout.log"
-  $stderrPath = Join-Path $env:TEMP "happier-pre-install-$runToken.stderr.log"
+  $stdoutPath = Join-Path $InstallerTempDir "happier-pre-install-$runToken.stdout.log"
+  $stderrPath = Join-Path $InstallerTempDir "happier-pre-install-$runToken.stderr.log"
 
   try {
     $channelLabel = if ($Channel -eq "publicdev") { "dev" } else { $Channel }
@@ -772,6 +824,9 @@ function Invoke-InstallerCommandWithDaemonServiceContextCapturingOutputWithTimeo
     }
 
     $process = Start-Process -FilePath $CliPath -ArgumentList $CommandArgs -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -WindowStyle Hidden
+    # Windows PowerShell 5.1 needs a cached handle to retain redirected exit codes.
+    # https://github.com/PowerShell/PowerShell/issues/5421
+    $null = $process.Handle
     $completed = $process.WaitForExit($timeoutMs)
     if (-not $completed) {
       Stop-InstallerProcessTree -Process $process
@@ -797,8 +852,7 @@ function Invoke-InstallerCommandWithDaemonServiceContextCapturingOutputWithTimeo
     }
   }
   finally {
-    Remove-Item -Path $stdoutPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $stderrPath -Force -ErrorAction SilentlyContinue
+    Remove-InstallerTemporaryFiles -Paths @($stdoutPath, $stderrPath)
 
     if ($null -eq $previousHomeDir) {
       Remove-Item Env:HAPPIER_HOME_DIR -ErrorAction SilentlyContinue
@@ -902,18 +956,18 @@ function Get-InstalledBackgroundServiceInventory {
     if ($doctorPreflightResult.ExitCode -eq 0 -and $preflightJsonIsSupported -and -not $preflightLooksLikePlainReport) {
       $payload = $preflightOutput | ConvertFrom-Json
       $propertyNames = @($payload.PSObject.Properties.Name)
-      $entries = if ($propertyNames -contains 'entries') { @($payload.entries) } elseif ($propertyNames -contains 'existingServices') { @($payload.existingServices) } else { @() }
-      $services = if ($propertyNames -contains 'services') { @($payload.services) } elseif ($propertyNames -contains 'existingServices') { @($payload.existingServices) } else { @() }
+      $entries = @(if ($propertyNames -contains 'entries') { $payload.entries } elseif ($propertyNames -contains 'existingServices') { $payload.existingServices })
+      $services = @(if ($propertyNames -contains 'services') { $payload.services } elseif ($propertyNames -contains 'existingServices') { $payload.existingServices })
       if ($entries.Count -gt 0 -or $services.Count -gt 0 -or $propertyNames -contains 'existingServices' -or $propertyNames -contains 'entries' -or $propertyNames -contains 'services') {
         return @{
           Supported = $true
           RepairSupported = $true
-          Entries = $entries
+          Entries = @(if ($entries.Count -gt 0) { $entries } else { $services })
           Services = $services
           DaemonStatus = if ($propertyNames -contains 'daemonStatus') { $payload.daemonStatus } else { $null }
           DaemonRunning = if ($propertyNames -contains 'daemonRunning') { $payload.daemonRunning } else { $null }
           DefaultFollowingMatchesSelectedReleaseChannel = if ($propertyNames -contains 'defaultFollowingMatchesSelectedReleaseChannel') { $payload.defaultFollowingMatchesSelectedReleaseChannel } else { $null }
-          Relays = if ($propertyNames -contains 'relays') { @($payload.relays) } else { @() }
+          Relays = @(if ($propertyNames -contains 'relays') { $payload.relays })
           Payload = $payload
         }
       }
@@ -946,13 +1000,13 @@ function Get-InstalledBackgroundServiceInventory {
     }
     $payload = $serviceListResult.Output | ConvertFrom-Json
     $propertyNames = @($payload.PSObject.Properties.Name)
-    $entries = if ($propertyNames -contains 'entries') { @($payload.entries) } else { @() }
-    $services = if ($propertyNames -contains 'services') { @($payload.services) } else { @() }
+    $entries = @(if ($propertyNames -contains 'entries') { $payload.entries })
+    $services = @(if ($propertyNames -contains 'services') { $payload.services })
     if ($entries.Count -gt 0 -or $services.Count -gt 0 -or $propertyNames -contains 'entries' -or $propertyNames -contains 'services') {
       return @{
         Supported = $true
         RepairSupported = $false
-        Entries = $entries
+        Entries = @(if ($entries.Count -gt 0) { $entries } else { $services })
         Services = $services
         DaemonStatus = $null
         DaemonRunning = $null
@@ -991,7 +1045,7 @@ function Get-InstalledBackgroundServiceInventory {
 
 function Test-BackgroundServiceInventoryHasDefaultFollowing {
   param (
-    [Parameter(Mandatory = $true)] [object[]] $Entries
+    [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Entries
   )
 
   return @($Entries | Where-Object { $_.targetMode -eq 'default-following' }).Count -gt 0
@@ -999,7 +1053,7 @@ function Test-BackgroundServiceInventoryHasDefaultFollowing {
 
 function Get-BackgroundServiceDefaultFollowingChannel {
   param (
-    [Parameter(Mandatory = $true)] [object[]] $Entries
+    [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Entries
   )
 
   $entry = @($Entries | Where-Object { $_.targetMode -eq 'default-following' } | Select-Object -First 1)
@@ -1012,7 +1066,7 @@ function Get-BackgroundServiceDefaultFollowingChannel {
 
 function Test-BackgroundServiceInventoryHasMatchingDefaultFollowing {
   param (
-    [Parameter(Mandatory = $true)] [object[]] $Entries,
+    [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Entries,
     [Parameter()] $DefaultFollowingMatchesSelectedReleaseChannel = $null
   )
 
@@ -1065,21 +1119,21 @@ function Invoke-BackgroundServiceInstallCompatibly {
   }
 
   if (Test-InstallerCommandLooksUnsupported -Output $installResult.Output) {
-    $legacyInstallResult = Invoke-NativeCommandCapturingOutput {
+    $installResult = Invoke-NativeCommandCapturingOutput {
       Invoke-InstallerCommandWithDaemonServiceContext -CliPath $CliPath -CommandArgs @("service", "install") -HomeDir $DaemonServiceStateHomeDir
     }
-    if ($legacyInstallResult.ExitCode -eq 0) {
+    if ($installResult.ExitCode -eq 0) {
       return @{
         Ok = $true
-        Output = $legacyInstallResult.Output
+        Output = $installResult.Output
       }
-    }
-    return @{
-      Ok = $false
-      Output = $legacyInstallResult.Output
     }
   }
 
+  # Keep diagnostics out of the success pipeline that carries the result object.
+  if (-not [string]::IsNullOrWhiteSpace([string]$installResult.Output)) {
+    [Console]::Error.WriteLine([string]$installResult.Output)
+  }
   return @{
     Ok = $false
     Output = $installResult.Output
@@ -1106,6 +1160,9 @@ function Invoke-DoctorRepairIfSupported {
       Output = $repairResult.Output
     }
   }
+  if (-not [string]::IsNullOrWhiteSpace([string]$repairResult.Output)) {
+    [Console]::Error.WriteLine([string]$repairResult.Output)
+  }
   return @{
     Status = 'failed'
     Output = $repairResult.Output
@@ -1114,7 +1171,7 @@ function Invoke-DoctorRepairIfSupported {
 
 function Resolve-ExistingBackgroundServiceInstallStrategy {
   param (
-    [Parameter(Mandatory = $true)] [object[]] $Entries,
+    [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Entries,
     [Parameter()] $DefaultFollowingMatchesSelectedReleaseChannel = $null
   )
 
@@ -1304,7 +1361,9 @@ function Write-PostInstallGetStarted {
   if (-not $script:PostInstallSetupIsDone) {
     Write-Host ("  {0,-20} {1}" -f "$CliName setup", "Connect this computer and sign in")
   }
-  Write-Host ("  {0,-20} {1}" -f $CliName, "Start a session")
+  Write-Host "  In the app, browser or phone: New session"
+  Write-Host "  Choose this computer and a project. Keep this computer running."
+  Write-Host ("  {0,-20} {1}" -f $CliName, "Start from this terminal")
   Write-Host ("  {0,-20} {1}" -f "$CliName status", "Check this computer's connection")
 }
 
@@ -1555,34 +1614,62 @@ function Copy-OrDownloadInstallerAsset {
   Invoke-InstallerWebRequestWithRetry -Uri $Source -Headers $GitHubHeaders -OutFile $DestinationPath
 }
 
-function Test-InstallerTransientWebException {
+function Test-InstallerWebExceptionStatus {
   param (
-    [Parameter(Mandatory = $true)] [System.Management.Automation.ErrorRecord] $ErrorRecord
+    [Parameter(Mandatory = $true)] [System.Management.Automation.ErrorRecord] $ErrorRecord,
+    [Parameter(Mandatory = $true)] [int[]] $StatusCode
   )
 
-  $retryableStatusCodes = @(404, 502, 503, 504)
   $exception = $ErrorRecord.Exception
-  $statusCode = $null
+  $actualStatusCode = $null
   if ($exception -and $exception.Response -and $exception.Response.StatusCode) {
     try {
-      $statusCode = [int]$exception.Response.StatusCode
+      $actualStatusCode = [int]$exception.Response.StatusCode
     }
     catch {
-      $statusCode = $null
+      $actualStatusCode = $null
     }
   }
-  if ($null -ne $statusCode -and $retryableStatusCodes -contains $statusCode) {
+  if ($null -ne $actualStatusCode -and $StatusCode -contains $actualStatusCode) {
     return $true
   }
 
   $message = if ($exception) { [string]$exception.Message } else { [string]$ErrorRecord }
-  foreach ($code in $retryableStatusCodes) {
+  foreach ($code in $StatusCode) {
     if ($message -match "(^|\D)$code(\D|$)") {
       return $true
     }
   }
 
   return $false
+}
+
+function Test-InstallerTransientWebException {
+  param (
+    [Parameter(Mandatory = $true)] [System.Management.Automation.ErrorRecord] $ErrorRecord
+  )
+
+  $retryableStatusCodes = @(404, 502, 503, 504)
+  return Test-InstallerWebExceptionStatus -ErrorRecord $ErrorRecord -StatusCode $retryableStatusCodes
+}
+
+# GitHub rejects an expired or revoked token with 401 even for public releases, so a rejected
+# credential drops the token and the caller retries anonymously. Transient failures keep it.
+function Remove-InstallerGitHubTokenAfterFailure {
+  param (
+    [hashtable] $Headers,
+    [Parameter(Mandatory = $true)] [System.Management.Automation.ErrorRecord] $ErrorRecord
+  )
+
+  if (-not $Headers -or -not $Headers.ContainsKey("Authorization")) {
+    return $false
+  }
+  if (-not (Test-InstallerWebExceptionStatus -ErrorRecord $ErrorRecord -StatusCode 401)) {
+    return $false
+  }
+  Write-Warning "GitHub rejected GITHUB_TOKEN/HAPPIER_GITHUB_TOKEN (401); retrying without the token." -WarningAction Continue
+  $Headers.Remove("Authorization")
+  return $true
 }
 
 function Invoke-InstallerWebRequestWithRetry {
@@ -1611,6 +1698,10 @@ function Invoke-InstallerWebRequestWithRetry {
         return Invoke-WebRequest @params
       }
       catch {
+        if (Remove-InstallerGitHubTokenAfterFailure -Headers $Headers -ErrorRecord $_) {
+          $attempt -= 1
+          continue
+        }
         if ($attempt -ge $retryDelaysMs.Length -or -not (Test-InstallerTransientWebException -ErrorRecord $_)) {
           throw
         }
@@ -1639,6 +1730,10 @@ function Invoke-InstallerRestMethodWithRetry {
       return Invoke-RestMethod @params
     }
     catch {
+      if (Remove-InstallerGitHubTokenAfterFailure -Headers $Headers -ErrorRecord $_) {
+        $attempt -= 1
+        continue
+      }
       if ($attempt -ge $retryDelaysMs.Length -or -not (Test-InstallerTransientWebException -ErrorRecord $_)) {
         throw
       }
@@ -2236,10 +2331,10 @@ function Invoke-InstallerPayloadPromotionWithTimeout {
 
   $timeoutMs = Resolve-InstallerPayloadPromotionTimeoutMs
   $runToken = [System.Guid]::NewGuid().ToString("N")
-  $runnerBinaryPath = Join-Path $env:TEMP "happier-payload-promotion-$runToken.exe"
-  $runnerScriptPath = Join-Path $env:TEMP "happier-payload-promotion-$runToken.ps1"
-  $stdoutPath = Join-Path $env:TEMP "happier-payload-promotion-$runToken.stdout.log"
-  $stderrPath = Join-Path $env:TEMP "happier-payload-promotion-$runToken.stderr.log"
+  $runnerBinaryPath = Join-Path $InstallerTempDir "happier-payload-promotion-$runToken.exe"
+  $runnerScriptPath = Join-Path $InstallerTempDir "happier-payload-promotion-$runToken.ps1"
+  $stdoutPath = Join-Path $InstallerTempDir "happier-payload-promotion-$runToken.stdout.log"
+  $stderrPath = Join-Path $InstallerTempDir "happier-payload-promotion-$runToken.stderr.log"
 
   $escapeSingleQuotedLiteral = {
     param([string] $Value)
@@ -2289,8 +2384,11 @@ finally {
     Set-Content -Path $runnerScriptPath -Value $runnerScript -Encoding utf8
 
     $powerShellExecutablePath = Resolve-InstallerPowerShellExecutablePath
-    $process = Start-Process -FilePath $powerShellExecutablePath -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runnerScriptPath) -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -WindowStyle Hidden
+    $process = Start-Process -FilePath $powerShellExecutablePath -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ('"{0}"' -f $runnerScriptPath)) -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -WindowStyle Hidden
 
+    # Windows PowerShell 5.1 needs a cached handle to retain redirected exit codes.
+    # https://github.com/PowerShell/PowerShell/issues/5421
+    $null = $process.Handle
     $completed = $process.WaitForExit($timeoutMs)
     if (-not $completed) {
       Stop-InstallerProcessTree -Process $process
@@ -2313,10 +2411,7 @@ finally {
     }
   }
   finally {
-    Remove-Item -Path $runnerBinaryPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $runnerScriptPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $stdoutPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $stderrPath -Force -ErrorAction SilentlyContinue
+    Remove-InstallerTemporaryFiles -Paths @($runnerBinaryPath, $runnerScriptPath, $stdoutPath, $stderrPath)
   }
 }
 
@@ -2343,20 +2438,25 @@ function Ensure-Minisign {
   $extractDir = Join-Path $TempRoot "minisign-extract"
   New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
   Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
-  $osArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+  # Windows PowerShell 5.1 can return $null for RuntimeInformation::OSArchitecture,
+  # so fall back to the OS-reported architecture (W6432 is set for 32-bit hosts on 64-bit Windows).
+  $osArchitecture = [string][System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+  if (-not $osArchitecture) {
+    $osArchitecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { [string]$env:PROCESSOR_ARCHITECTURE }
+  }
   $archiveArchitecture = switch ($osArchitecture) {
     "X64" { "x86_64" }
+    "AMD64" { "x86_64" }
     "Arm64" { "aarch64" }
     default { throw "Unsupported Windows architecture for bundled minisign: $osArchitecture" }
   }
   $exePath = Join-Path (Join-Path (Join-Path $extractDir "minisign-win64") $archiveArchitecture) "minisign.exe"
-  if (-not (Test-Path $exePath -PathType Leaf)) {
+  if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
     throw "Failed to locate the $archiveArchitecture minisign.exe in the bootstrap archive."
   }
-  $exe = Get-Item $exePath
+  $exe = Get-Item -LiteralPath $exePath
 
   try {
-    $LASTEXITCODE = 1
     & $exe.FullName -v *> $null
     if ($LASTEXITCODE -ne 0) {
       throw "Downloaded minisign executable failed its version probe (exit $LASTEXITCODE)."
@@ -2366,21 +2466,16 @@ function Ensure-Minisign {
     Write-Warning "Downloaded minisign binary is not compatible with this system."
     Write-Host "Installing minisign with winget..."
     $wingetInstallResult = Invoke-NativeCommandCapturingOutput {
-      winget install --id jedisct1.minisign --source winget --accept-source-agreements --accept-package-agreements
+      winget install --id jedisct1.minisign --accept-source-agreements --accept-package-agreements
+    }
+    if ($wingetInstallResult.ExitCode -ne 0) {
+      throw "Unable to install minisign via winget. $($wingetInstallResult.Output)"
     }
     $installedMinisign = Resolve-MinisignExecutablePath
     if ($installedMinisign) {
-      $installedProbeResult = Invoke-NativeCommandCapturingOutput {
-        & $installedMinisign -v
-      }
-      if ($installedProbeResult.ExitCode -eq 0) {
-        return $installedMinisign
-      }
+      return $installedMinisign
     }
-    if ($wingetInstallResult.ExitCode -ne 0) {
-      throw "Unable to install minisign via winget (exit $($wingetInstallResult.ExitCode)). $($wingetInstallResult.Output)"
-    }
-    throw "winget installed minisign, but a compatible minisign.exe was not found on PATH or in standard WinGet locations."
+    throw "winget installed minisign, but minisign.exe was not found on PATH or in standard WinGet locations."
   }
 
   return $exe.FullName
@@ -2400,7 +2495,7 @@ function Resolve-MinisignPublicKey {
   Invoke-InstallerWebRequestWithRetry -Uri $MinisignPubKeyUrl -OutFile $TargetPath
 }
 
-$tag = if ($Channel -eq "preview") { "cli-preview" } elseif ($Channel -eq "publicdev") { "cli-dev" } else { "cli-stable" }
+$tag = if ($Version) { "cli-v$Version" } elseif ($Channel -eq "preview") { "cli-preview" } elseif ($Channel -eq "publicdev") { "cli-dev" } else { "cli-stable" }
 Write-InstallerHeader
 Write-InstallerStage -Name "Download"
 if (-not $ReleaseAssetsDir) {
@@ -2421,20 +2516,36 @@ if (-not $ReleaseAssetsDir) {
 else {
   $release = $null
 }
-$assetPattern = Resolve-InstallerRequestedVersionPattern -Prefix "happier-v" -Suffix "-windows-x64.tar.gz"
 $checksumsPattern = Resolve-InstallerRequestedVersionPattern -Prefix "checksums-happier-v" -Suffix ".txt"
-$signaturePattern = Resolve-InstallerRequestedVersionPattern -Prefix "checksums-happier-v" -Suffix ".txt.minisig"
-$asset = Resolve-InstallerAsset -Release $release -Pattern $assetPattern
 $checksumsAsset = Resolve-InstallerAsset -Release $release -Pattern $checksumsPattern
-$signatureAsset = Resolve-InstallerAsset -Release $release -Pattern $signaturePattern
-if (-not $asset) {
-  throw "Unable to locate Windows x64 binary on release tag $tag."
-}
 if (-not $checksumsAsset) {
   throw "Unable to locate checksum asset on release tag $tag."
 }
+
+$checksumsName = [string]$checksumsAsset.Name
+$resolvedVersion = $checksumsName -replace '^checksums-happier-v', '' -replace '\.txt$', ''
+if (-not $resolvedVersion -or $resolvedVersion -eq $checksumsName) {
+  throw "Failed to infer release version from checksum asset: $checksumsName"
+}
+$resolvedVersionPattern = [Regex]::Escape($resolvedVersion)
+$signaturePattern = "^checksums-happier-v${resolvedVersionPattern}\.txt\.minisig$"
+$signatureAsset = Resolve-InstallerAsset -Release $release -Pattern $signaturePattern
 if (-not $signatureAsset) {
   throw "Unable to locate minisign signature asset on release tag $tag."
+}
+
+$assetPattern = if (-not $Version -and ($Channel -eq "stable" -or $Channel -eq "preview")) {
+  '^happier-windows-x64\.tar\.gz$'
+}
+else {
+  "^happier-v${resolvedVersionPattern}-windows-x64\.tar\.gz$"
+}
+$asset = Resolve-InstallerAsset -Release $release -Pattern $assetPattern
+if (-not $asset -and -not $Version -and ($Channel -eq "stable" -or $Channel -eq "preview")) {
+  $asset = Resolve-InstallerAsset -Release $release -Pattern "^happier-v${resolvedVersionPattern}-windows-x64\.tar\.gz$"
+}
+if (-not $asset) {
+  throw "Unable to locate Windows x64 binary on release tag $tag."
 }
 
 $script:PostInstallRunStatus = 0
@@ -2452,15 +2563,16 @@ try {
 
   Write-InstallerStage -Name "Verify"
   $assetName = [string]$asset.Name
+  $checksumAssetName = "happier-v$resolvedVersion-windows-x64.tar.gz"
   $expectedSha = $null
   foreach ($line in (Get-Content -Path $checksumsPath)) {
-    if ($line -match '^([a-fA-F0-9]{64})\s{2}(.+)$' -and $matches[2] -eq $assetName) {
+    if ($line -match '^([a-fA-F0-9]{64})\s{2}(.+)$' -and $matches[2] -eq $checksumAssetName) {
       $expectedSha = $matches[1].ToLowerInvariant()
       break
     }
   }
   if (-not $expectedSha) {
-    throw "Failed to resolve checksum for $assetName"
+    throw "Failed to resolve checksum for $checksumAssetName"
   }
   $actualSha = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
   if ($expectedSha -ne $actualSha) {
@@ -2486,10 +2598,7 @@ try {
   New-Item -ItemType Directory -Path $extractDir | Out-Null
   $tarPath = Resolve-TarExecutablePath
   & $tarPath -xzf $archivePath -C $extractDir
-  $version = $assetName -replace '^happier-v', '' -replace '-windows-x64\.tar\.gz$', ''
-  if (-not $version -or $version -eq $assetName) {
-    throw "Failed to infer release version from asset name: $assetName"
-  }
+  $version = $resolvedVersion
   $payloadRoot = Join-Path $extractDir "happier-v$version-windows-x64"
   if (-not (Test-Path $payloadRoot)) {
     throw "Failed to locate extracted payload root: $payloadRoot"
@@ -2539,6 +2648,11 @@ try {
   if ($LegacyBinDir -ne $BinDir) {
     Remove-Item -Path (Join-Path $LegacyBinDir "happier.exe") -Force -ErrorAction SilentlyContinue
   }
+
+  # New terminals and the background service must read the same credentials.
+  # Persist the resolved state home, which may differ from the binary install dir.
+  [Environment]::SetEnvironmentVariable("HAPPIER_HOME_DIR", $DaemonServiceStateHomeDir, [EnvironmentVariableTarget]::User)
+  $env:HAPPIER_HOME_DIR = $DaemonServiceStateHomeDir
 
   if ($NoPathUpdate -ne "1") {
     $userPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::User)

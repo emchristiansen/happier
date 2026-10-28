@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -29,6 +29,7 @@ import { materializeClaudeConnectedServiceRuntimeAuthSelection } from './materia
 import { CLAUDE_CODE_RECOMMENDED_OAUTH_SCOPE } from './nativeAuth/claudeCodeCredentialScopes';
 import { resolveClaudeConnectedServiceStableConfigDir } from './resolveClaudeConnectedServiceStableAuthDir';
 import { resolveClaudeConnectedServiceSwitchContinuity } from './resolveClaudeConnectedServiceSwitchContinuity';
+import { verifyResumeReachableClaude } from './verifyResumeReachableClaude';
 
 // Genuine server transport boundary: the provider materializer may consult persisted session
 // metadata when tracked continuity metadata is incomplete. This composition test keeps that
@@ -60,6 +61,7 @@ describe('Claude shared-group switch continuity', () => {
   const temporaryDirectories: string[] = [];
 
   beforeEach(() => {
+    mockFetchSessionByIdCompat.mockClear();
     if (originalPlatformDescriptor) {
       Object.defineProperty(process, 'platform', { ...originalPlatformDescriptor, value: 'linux' });
     }
@@ -72,6 +74,68 @@ describe('Claude shared-group switch continuity', () => {
     await Promise.all(temporaryDirectories.splice(0).map(
       async (directory) => await rm(directory, { recursive: true, force: true }),
     ));
+  });
+
+  it.each([false, true])('prepares an inactive account-change target without dry-run writes (dryRun=%s)', async (dryRun) => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-claude-inactive-continuity-'));
+    temporaryDirectories.push(root);
+    const projectDir = join(root, 'project');
+    const homeDir = join(root, 'home');
+    const activeServerDir = join(root, 'server');
+    const vendorResumeId = 'inactive-claude-session';
+    const source = join(root, 'old-home', 'projects', 'project', `${vendorResumeId}.jsonl`);
+    await mkdir(join(root, 'old-home', 'projects', 'project'), { recursive: true });
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(source, '{}\n');
+    const metadata = { path: projectDir, claudeSessionId: vendorResumeId, claudeTranscriptPath: source };
+    const binding = (profileId: string): ConnectedServiceBindingsV1 => ({
+      v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'profile', profileId } },
+    });
+    const nextBindings = binding('next');
+    const record = buildConnectedServiceCredentialRecord({
+      now: 1_000, serviceId: 'claude-subscription', profileId: 'next', kind: 'oauth', expiresAt: 2_000,
+      oauth: { accessToken: 'synthetic-access', refreshToken: 'synthetic-refresh', idToken: null,
+        scope: CLAUDE_CODE_RECOMMENDED_OAUTH_SCOPE, tokenType: 'Bearer', providerAccountId: 'synthetic', providerEmail: null },
+    });
+    const credentials = { token: 'synthetic-account-token', encryption: { type: 'legacy', secret: new Uint8Array(32) } } satisfies Credentials;
+    const api = { getConnectedServiceAuthGroup: async () => null,
+      listConnectedServiceProfiles: async () => ({ serviceId: 'claude-subscription' as const,
+      profiles: [{ profileId: 'next', status: 'connected' as const }] }) };
+    const result = await switchSessionConnectedServiceAuth({
+      dryRun,
+      core: createConnectedServiceSessionAuthSwitchCore({ locks: new ConnectedServiceSessionAuthSwitchLockRegistry() }),
+      getChildren: () => [], api,
+      resolveInactiveSession: async () => ({ agentId: 'claude', connectedServices: binding('old'),
+        connectedServiceMaterializationIdentityV1: { v: 1, id: 'csm_inactive', createdAtMs: 0 }, vendorResumeId,
+        cwd: projectDir, metadata, candidatePersistedSessionFile: source }),
+      materializeRuntimeAuthSelection: async (input) => await materializeClaudeConnectedServiceRuntimeAuthSelection({
+        credentials, api: api as unknown as ApiClient, activeServerDir, input,
+        baseSelection: { serviceId: 'claude-subscription', binding: nextBindings.bindingsByServiceId['claude-subscription'],
+          profileId: 'next', record, credentialRevision: NEW_CREDENTIAL_REVISION },
+        processEnv: { HOME: homeDir, CLAUDE_CONFIG_DIR: join(homeDir, '.claude') },
+      }),
+      resolveContinuity: async (input) => {
+        const context = resolveTrackedConnectedServiceSwitchContinuityContext({
+          agentId: input.agentId, baseDir: activeServerDir, tracked: input.tracked,
+          connectedServiceMaterializationIdentityV1: input.connectedServiceMaterializationIdentityV1,
+          vendorResumeId: input.vendorResumeId, cwd: projectDir, runtimeAuthSelection: input.runtimeAuthSelection,
+        });
+        const reachable = await verifyResumeReachableClaude({ vendorResumeId, processEnv: context.targetMaterializedEnv ?? {}, targetStrict: true });
+        return reachable.ok ? { mode: 'restart_rematerialize' } : { mode: 'unsupported', reason: 'provider_session_state_unavailable_for_resume', errorCode: 'provider_session_state_unavailable_for_resume' };
+      },
+      persistSessionBindings: async () => {}, emitSessionEvent: async () => {},
+      restartSession: async () => { throw new Error('inactive session must not restart'); },
+      hotApply: async () => { throw new Error('inactive session must not hot-apply'); },
+      registerHotApplyTargets: () => { throw new Error('inactive session has no hot-apply target'); },
+      request: { sessionId: 'inactive', agentId: 'claude', bindings: nextBindings },
+    } satisfies SwitchSessionConnectedServiceAuthInput);
+    if (dryRun) {
+      expect(result.ok).toBe(false);
+      expect(await stat(activeServerDir).catch(() => null)).toBeNull();
+    } else {
+      expect(result).toMatchObject({ ok: true, action: 'metadata_updated' });
+    }
+    expect(mockFetchSessionByIdCompat).not.toHaveBeenCalled();
   });
 
   it('hot-applies an exact same-group shared-home rewrite when spawn request env predates materialization', async () => {

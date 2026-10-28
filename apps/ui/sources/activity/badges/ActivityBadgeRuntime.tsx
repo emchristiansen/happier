@@ -6,7 +6,7 @@ import { useActiveServerSnapshot } from '@/hooks/server/useActiveServerSnapshot'
 import { useChangelog } from '@/hooks/inbox/useChangelog';
 import { useUpdates } from '@/hooks/inbox/useUpdates';
 import {
-    useFriendRequests,
+    useFriendRequestCount,
     useLocalSetting,
 } from '@/sync/domains/state/storage';
 import { serverFetch } from '@/sync/http/client';
@@ -41,15 +41,17 @@ async function fetchServerBadgeCount(): Promise<number | null> {
 function canUseServerBadgeSnapshot(options: ActivityBadgeSessionOptions): boolean {
     return options.showUnread
         && options.showPendingPermissionRequests
-        && options.showPendingUserActionRequests;
+        && options.showPendingUserActionRequests
+        && !options.showQueuedUserInput;
 }
 
 export function ActivityBadgeRuntime(): React.ReactElement | null {
-    const friendRequests = useFriendRequests();
+    const friendRequestCount = useFriendRequestCount();
     const activityBadgesEnabled = useLocalSetting('activityBadgesEnabled');
     const activityBadgeShowUnread = useLocalSetting('activityBadgeShowUnread');
     const activityBadgeShowPendingPermissionRequests = useLocalSetting('activityBadgeShowPendingPermissionRequests');
     const activityBadgeShowPendingUserActionRequests = useLocalSetting('activityBadgeShowPendingUserActionRequests');
+    const activityBadgeShowQueuedUserInput = useLocalSetting('activityBadgeShowQueuedUserInput');
     const activityBadgeShowFriendRequestsInboxCount = useLocalSetting('activityBadgeShowFriendRequestsInboxCount');
     const activityBadgeShowDesktopNonNumericDot = useLocalSetting('activityBadgeShowDesktopNonNumericDot');
     const activeServer = useActiveServerSnapshot();
@@ -65,9 +67,11 @@ export function ActivityBadgeRuntime(): React.ReactElement | null {
             activityBadgeShowPendingPermissionRequests !== false,
         showPendingUserActionRequests:
             activityBadgeShowPendingUserActionRequests !== false,
+        showQueuedUserInput: activityBadgeShowQueuedUserInput !== false,
     }), [
         activityBadgeShowPendingPermissionRequests,
         activityBadgeShowPendingUserActionRequests,
+        activityBadgeShowQueuedUserInput,
         activityBadgeShowUnread,
     ]);
 
@@ -78,7 +82,7 @@ export function ActivityBadgeRuntime(): React.ReactElement | null {
         friendRequestCount:
             activityBadgeShowFriendRequestsInboxCount === false
                 ? 0
-                : friendRequests.length,
+                : friendRequestCount,
         hasNonNumericInboxAttention:
             activityBadgeShowDesktopNonNumericDot !== false &&
             (updateAvailable || changelogHasUnread),

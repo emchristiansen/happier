@@ -9,7 +9,8 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '..', '..');
 
-test('immutable release audit retries a transient download reset without re-uploading', () => {
+for (const downloadError of ['read: connection reset by peer', 'unexpected end of JSON input']) {
+test(`immutable release audit retries a failed download without re-uploading: ${downloadError}`, () => {
   const tmp = fs.mkdtempSync(resolve(os.tmpdir(), 'happier-publish-release-audit-retry-'));
   const binDir = resolve(tmp, 'bin');
   fs.mkdirSync(binDir, { recursive: true });
@@ -28,7 +29,11 @@ const path = require('node:path');
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(ghLog)}, \`gh \${args.join(' ')}\\n\`);
 
-if (args[0] === 'release' && args[1] === 'view' && args.includes('--json')) {
+if (args[0] === 'release' && args[1] === 'view' && args.includes('isDraft')) {
+  process.stdout.write('false');
+  process.exit(0);
+}
+if (args[0] === 'release' && args[1] === 'view' && args.includes('assets')) {
   process.stdout.write('asset.txt\\n');
   process.exit(0);
 }
@@ -37,7 +42,7 @@ if (args[0] === 'release' && args[1] === 'download') {
   const count = Number(fs.readFileSync(${JSON.stringify(downloadCount)}, 'utf8')) + 1;
   fs.writeFileSync(${JSON.stringify(downloadCount)}, String(count));
   if (count === 1) {
-    process.stderr.write('read: connection reset by peer\\n');
+    process.stderr.write(${JSON.stringify(downloadError + '\n')});
     process.exit(1);
   }
   const destination = args[args.indexOf('--dir') + 1];
@@ -89,3 +94,4 @@ process.exit(0);
   );
   assert.equal(log.match(/gh release upload server-v0\.2\.10-dev\.test /g)?.length ?? 0, 0);
 });
+}

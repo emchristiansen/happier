@@ -237,3 +237,20 @@ export class AbortError extends Error {
         this.name = 'AbortError'
     }
 }
+
+export class ClaudeNativeProviderExitUnverifiedError extends Error {
+    readonly code = 'claude_native_provider_exit_unverified'
+
+    constructor() {
+        super('Claude launcher exited without verified native provider termination')
+        this.name = 'ClaudeNativeProviderExitUnverifiedError'
+    }
+}
+
+export function hasUnverifiedProviderTermination(error: unknown): boolean {
+    if (error instanceof ClaudeNativeProviderExitUnverifiedError) return true;
+    if (error && typeof error === 'object' && 'code' in error
+        && error.code === 'process_tree_termination_incomplete') return true;
+    return error instanceof AggregateError
+        && error.errors.some(hasUnverifiedProviderTermination);
+}

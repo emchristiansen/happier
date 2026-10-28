@@ -1,3 +1,4 @@
+import { isSessionOwnedActivityUnobserved } from '../attention/deriveSessionRuntimePresentationState';
 import type { Message } from '@/sync/domains/messages/messageTypes';
 
 import { deriveExecutionRunSubagents } from './executionRuns/deriveExecutionRunSubagents';
@@ -7,8 +8,8 @@ import type { SessionSubagent, SessionSubagentActiveExecutionRunState } from './
 
 function sortSubagents(subagents: readonly SessionSubagent[]): readonly SessionSubagent[] {
     return [...subagents].sort((left, right) => {
-        const leftRunning = left.status === 'running' ? 0 : 1;
-        const rightRunning = right.status === 'running' ? 0 : 1;
+        const leftRunning = left.isActive !== false && left.status === 'running' ? 0 : 1;
+        const rightRunning = right.isActive !== false && right.status === 'running' ? 0 : 1;
         if (leftRunning !== rightRunning) return leftRunning - rightRunning;
 
         const leftUpdated = left.timestamps.updatedAtMs ?? 0;
@@ -22,6 +23,7 @@ function sortSubagents(subagents: readonly SessionSubagent[]): readonly SessionS
 export function deriveSessionSubagents(params: Readonly<{
     session: Readonly<{ metadata?: Readonly<{ flavor?: unknown }> | null }>;
     messages: readonly Message[];
+    runtimeLostSinceMs?: number | null;
     activeExecutionRuns?: readonly SessionSubagentActiveExecutionRunState[];
 }>): readonly SessionSubagent[] {
     const flavor = typeof (params.session as any)?.metadata?.flavor === 'string'
@@ -51,5 +53,8 @@ export function deriveSessionSubagents(params: Readonly<{
         ...executionRuns,
         ...providerSubagents,
         ...genericSubagentSidechains,
-    ]);
+    ].map((subagent) => subagent.kind !== 'execution_run' && subagent.status === 'running'
+        && isSessionOwnedActivityUnobserved(params.runtimeLostSinceMs, subagent.timestamps.updatedAtMs)
+        ? { ...subagent, status: 'unknown' as const }
+        : subagent));
 }

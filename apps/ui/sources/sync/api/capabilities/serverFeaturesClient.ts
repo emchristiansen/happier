@@ -21,16 +21,38 @@ const TTL_ERROR_TIMEOUT_MS = 5 * 1000;
 const TTL_ERROR_RESPONSE_STATUS_MS = 30 * 1000;
 
 const FORCE_COOLDOWN_ENDPOINT_MISSING_MS = 60 * 1000;
+// This bounds the shared network attempt so a permanently hung fetch cannot
+// poison every later caller. Individual callers may use a shorter wait budget,
+// but never own or cancel this shared attempt.
+const REQUEST_ATTEMPT_TIMEOUT_MS = 60 * 1000;
 
 export type ServerFeaturesSnapshot =
     | Readonly<{ status: 'ready'; features: ServerFeatures }>
     | Readonly<{ status: 'unsupported'; reason: 'endpoint_missing' | 'invalid_payload' }>
-    | Readonly<{ status: 'error'; reason: 'network' | 'timeout' | 'response_status' }>;
+    | Readonly<{ status: 'error'; reason: 'network' | 'timeout' | 'response_status'; httpStatus?: number }>;
+
+function isServerFeaturesProbeRetryable(snapshot: ServerFeaturesSnapshot): boolean {
+    if (snapshot.status !== 'error') return false;
+    if (snapshot.reason === 'network' || snapshot.reason === 'timeout') return true;
+    return snapshot.reason === 'response_status' && snapshot.httpStatus !== undefined
+        && (snapshot.httpStatus === 408 || snapshot.httpStatus === 429 || snapshot.httpStatus >= 500);
+}
 
 const cache = new AsyncTtlCache<ServerFeaturesSnapshot>({
     successTtlMs: TTL_READY_MS,
     errorTtlMs: TTL_ERROR_NETWORK_MS,
 });
+const snapshotListeners = new Set<() => void>();
+const transientRetryAtByCacheKey = new Map<string, number>();
+
+function notifyServerFeaturesSnapshotChanged(): void {
+    for (const listener of snapshotListeners) listener();
+}
+
+export function subscribeServerFeaturesSnapshot(listener: () => void): () => void {
+    snapshotListeners.add(listener);
+    return () => snapshotListeners.delete(listener);
+}
 
 function isEndpointMissing(status: number): boolean {
     return status === 404 || status === 405 || status === 501;
@@ -62,6 +84,26 @@ function getForceCooldownMs(snapshot: ServerFeaturesSnapshot): number {
         return FORCE_COOLDOWN_ENDPOINT_MISSING_MS;
     }
     return 0;
+}
+
+function writeSnapshot(
+    cacheKey: string,
+    snapshot: ServerFeaturesSnapshot,
+): ServerFeaturesSnapshot {
+    if (isServerFeaturesProbeRetryable(snapshot)) {
+        const previous = cache.get(cacheKey);
+        if (previous?.kind === 'success' && previous.value.status === 'ready') {
+            const retryDelayMs = getCacheTtlMs(snapshot);
+            cache.setSuccess(cacheKey, previous.value, { ttlMs: retryDelayMs });
+            transientRetryAtByCacheKey.set(cacheKey, Date.now() + retryDelayMs);
+            notifyServerFeaturesSnapshotChanged();
+            return previous.value;
+        }
+    }
+    transientRetryAtByCacheKey.delete(cacheKey);
+    cache.setSuccess(cacheKey, snapshot, { ttlMs: getCacheTtlMs(snapshot) });
+    notifyServerFeaturesSnapshotChanged();
+    return snapshot;
 }
 
 function getCacheKey(serverId?: string): string {
@@ -100,7 +142,7 @@ async function getServerFeaturesSnapshotWithRetry(
     remainingSwitchAbortRetries: number,
 ): Promise<ServerFeaturesSnapshot> {
     const force = params?.force ?? false;
-    const timeoutMs = params?.timeoutMs ?? 800;
+    const requestTimeoutMs = REQUEST_ATTEMPT_TIMEOUT_MS;
     const cacheKey = getCacheKey(params?.serverId);
     const requestedServerId = String(params?.serverId ?? '').trim();
     const activeSnapshot = getActiveServerSnapshot();
@@ -141,8 +183,7 @@ async function getServerFeaturesSnapshotWithRetry(
 
         if (isExplicitServerRequest && !explicitServerUrl) {
             const value: ServerFeaturesSnapshot = { status: 'error', reason: 'network' };
-            cache.setSuccess(cacheKey, value, { ttlMs: getCacheTtlMs(value) });
-            return value;
+            return writeSnapshot(cacheKey, value);
         }
 
         let remainingRetries = remainingSwitchAbortRetries;
@@ -152,7 +193,7 @@ async function getServerFeaturesSnapshotWithRetry(
         // eslint-disable-next-line no-constant-condition
         while (true) {
             const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
 
             try {
                 let response: Response;
@@ -166,7 +207,7 @@ async function getServerFeaturesSnapshotWithRetry(
                                 method: 'GET',
                                 signal: controller.signal,
                             },
-                            timeoutMs,
+                            timeoutMs: requestTimeoutMs,
                         })
                         : await serverFetch(
                             '/v1/features',
@@ -209,23 +250,20 @@ async function getServerFeaturesSnapshotWithRetry(
                     }
 
                     const value: ServerFeaturesSnapshot = { status: 'error', reason: timedOut ? 'timeout' : 'network' };
-                    cache.setSuccess(cacheKey, value, { ttlMs: getCacheTtlMs(value) });
-                    return value;
+                    return writeSnapshot(cacheKey, value);
                 }
 
                 if (!response.ok) {
                     const value: ServerFeaturesSnapshot = isEndpointMissing(response.status)
                         ? { status: 'unsupported', reason: 'endpoint_missing' }
-                        : { status: 'error', reason: 'response_status' };
-                    cache.setSuccess(cacheKey, value, { ttlMs: getCacheTtlMs(value) });
-                    return value;
+                        : { status: 'error', reason: 'response_status', httpStatus: response.status };
+                    return writeSnapshot(cacheKey, value);
                 }
 
                 const contentType = String(response.headers?.get?.('content-type') ?? '').toLowerCase();
                 if (contentType && !contentType.includes('application/json') && !contentType.includes('+json')) {
                     const value: ServerFeaturesSnapshot = { status: 'unsupported', reason: 'invalid_payload' };
-                    cache.setSuccess(cacheKey, value, { ttlMs: getCacheTtlMs(value) });
-                    return value;
+                    return writeSnapshot(cacheKey, value);
                 }
 
                 let payload: unknown;
@@ -233,15 +271,13 @@ async function getServerFeaturesSnapshotWithRetry(
                     payload = await response.json();
                 } catch {
                     const value: ServerFeaturesSnapshot = { status: 'unsupported', reason: 'invalid_payload' };
-                    cache.setSuccess(cacheKey, value, { ttlMs: getCacheTtlMs(value) });
-                    return value;
+                    return writeSnapshot(cacheKey, value);
                 }
 
                 const parsed = parseServerFeatures(payload);
                 if (!parsed) {
                     const value: ServerFeaturesSnapshot = { status: 'unsupported', reason: 'invalid_payload' };
-                    cache.setSuccess(cacheKey, value, { ttlMs: getCacheTtlMs(value) });
-                    return value;
+                    return writeSnapshot(cacheKey, value);
                 }
 
                 persistServerIdentityCapability({
@@ -249,8 +285,7 @@ async function getServerFeaturesSnapshotWithRetry(
                     serverUrl: explicitServerUrl ?? activeSnapshot.serverUrl,
                 });
                 const value: ServerFeaturesSnapshot = { status: 'ready', features: parsed };
-                cache.setSuccess(cacheKey, value, { ttlMs: getCacheTtlMs(value) });
-                return value;
+                return writeSnapshot(cacheKey, value);
             } finally {
                 clearTimeout(timer);
             }
@@ -263,7 +298,28 @@ export async function getServerFeaturesSnapshot(params?: {
     force?: boolean;
     serverId?: string;
 }): Promise<ServerFeaturesSnapshot> {
-    return await getServerFeaturesSnapshotWithRetry(params, 2);
+    const request = getServerFeaturesSnapshotWithRetry(params, 2);
+    const waitBudgetMs = params?.timeoutMs;
+    if (typeof waitBudgetMs !== 'number' || !Number.isFinite(waitBudgetMs) || waitBudgetMs <= 0) {
+        return await request;
+    }
+
+    return await new Promise<ServerFeaturesSnapshot>((resolve, reject) => {
+        let settled = false;
+        const finish = (snapshot: ServerFeaturesSnapshot) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(snapshot);
+        };
+        const timer = setTimeout(() => finish({ status: 'error', reason: 'timeout' }), waitBudgetMs);
+        void request.then(finish, (error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(error);
+        });
+    });
 }
 
 export function getCachedServerFeaturesSnapshot(params?: { serverId?: string }): ServerFeaturesSnapshot | null {
@@ -272,6 +328,25 @@ export function getCachedServerFeaturesSnapshot(params?: { serverId?: string }):
     return cached?.kind === 'success' ? cached.value : null;
 }
 
+export function getServerFeaturesSnapshotRetryDelayMs(params: {
+    serverId?: string;
+    snapshot: ServerFeaturesSnapshot;
+}): number | null {
+    const cacheKey = getCacheKey(params.serverId);
+    const transientRetryAt = transientRetryAtByCacheKey.get(cacheKey);
+    if (transientRetryAt !== undefined) {
+        return Math.max(0, transientRetryAt - Date.now());
+    }
+    if (params.snapshot.status !== 'error') return null;
+    const cached = cache.get(cacheKey);
+    if (cached?.kind !== 'success' || cached.value !== params.snapshot) {
+        return getCacheTtlMs(params.snapshot);
+    }
+    return Math.max(0, cached.expiresAt - Date.now());
+}
+
 export function resetServerFeaturesClientForTests(): void {
     cache.clear();
+    transientRetryAtByCacheKey.clear();
+    notifyServerFeaturesSnapshotChanged();
 }

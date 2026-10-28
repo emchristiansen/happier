@@ -15,6 +15,12 @@ describe('text/i18n', () => {
         expect(tLoose('tabs.inbox')).toBe(en.tabs.inbox);
     });
 
+    it('uses the Antigravity product name for the agy backend', () => {
+        expect(en.settingsProviders.plugins.agy.title).toBe('Antigravity');
+        expect(en.agentInput.agent.agy).toBe('Antigravity');
+        expect(en.profiles.aiBackend.agySubtitleExperimental).toBe('Antigravity CLI (experimental)');
+    });
+
     it('reports missing keys without throwing', () => {
         expect(hasTranslation('tabs.inbox')).toBe(true);
         expect(hasTranslation('not.a.real.key')).toBe(false);

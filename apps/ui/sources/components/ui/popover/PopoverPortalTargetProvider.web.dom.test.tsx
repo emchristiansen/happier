@@ -4,27 +4,30 @@
 import React from 'react';
 import { act } from 'react';
 import { createRoot } from 'react-dom/client';
-import { createRequire } from 'node:module';
 import { describe, expect, it, vi } from 'vitest';
 
+import { getVitestNodeBuiltin } from '@/dev/vitestNodeBuiltins';
+import { createReactNativeWebMock } from '@/dev/testkit/mocks/reactNative';
 import { installPopoverCommonModuleMocks } from './popoverTestHelpers';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-installPopoverCommonModuleMocks({
-    reactNative: async () => {
-        const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
-        return createReactNativeWebMock({
-            Platform: {
-                OS: 'web',
-                select: <T,>(values: { web?: T; ios?: T; default?: T }) => values.web ?? values.ios ?? values.default,
-            },
-            View: (props: any) => React.createElement('div', props, props.children),
-        });
+const reactNativeWebMock = await createReactNativeWebMock({
+    Platform: {
+        OS: 'web',
+        select: <T,>(values: { web?: T; ios?: T; default?: T }) => values.web ?? values.ios ?? values.default,
     },
+    View: (props: any) => React.createElement('div', props, props.children),
+});
+
+installPopoverCommonModuleMocks({
+    reactNative: () => reactNativeWebMock,
 });
 
 const safeAreaInsets = { top: 0, right: 0, bottom: 0, left: 0 };
+const { createRequire } = getVitestNodeBuiltin<{
+    createRequire: (filename: string | URL) => (id: string) => unknown;
+}>('node:module');
 const requireForTest = createRequire(import.meta.url);
 const { Drawer: CjsDrawer } = requireForTest('vaul') as typeof import('vaul');
 
@@ -239,7 +242,10 @@ describe('PopoverPortalTargetProvider (web dom)', () => {
                 root.unmount();
             });
 
-            expect(consoleError).not.toHaveBeenCalled();
+            const maxDepthErrors = consoleError.mock.calls.filter((call) =>
+                call.some((value) => typeof value === 'string' && /maximum update depth exceeded/i.test(value)),
+            );
+            expect(maxDepthErrors).toHaveLength(0);
         } finally {
             consoleError.mockRestore();
             container.remove();

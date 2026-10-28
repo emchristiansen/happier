@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DirectTranscriptRawMessageV1 } from '@happier-dev/protocol';
+import { createManagedDirectSessionFollowLease } from './createManagedDirectSessionFollowLease';
 
 const {
   dispatchActivityNotificationAsyncMock,
@@ -47,6 +48,7 @@ type TranscriptUpdate = Readonly<{
   fromCursor?: string | null;
   nextCursor?: string | null;
   truncated: boolean;
+  truncationReason?: 'page_limit' | 'source_discontinuity';
 }>;
 
 type TranscriptUpdateListener = (update: TranscriptUpdate) => void | Promise<void>;
@@ -97,8 +99,7 @@ describe('createManagedDirectSessionFollowLease', () => {
     });
   });
 
-  it('emits direct-session transcript delta updates from provider follow updates', async () => {
-    const { createManagedDirectSessionFollowLease } = await import('./createManagedDirectSessionFollowLease');
+  it.each([true, false])('emits direct-session transcript page-limit metadata with legacy truncated=%s', async (truncated) => {
     const listeners: TranscriptUpdateListener[] = [];
     const emitDirectSessionTranscriptUpdate = vi.fn();
 
@@ -129,7 +130,8 @@ describe('createManagedDirectSessionFollowLease', () => {
       items: new Set([directMessage]),
       fromCursor: 'cursor-1',
       nextCursor: 'cursor-2',
-      truncated: false,
+      truncated,
+      truncationReason: 'page_limit',
     });
 
     expect(emitDirectSessionTranscriptUpdate).toHaveBeenCalledWith({
@@ -138,12 +140,12 @@ describe('createManagedDirectSessionFollowLease', () => {
       items: [directMessage],
       fromCursor: 'cursor-1',
       nextCursor: 'cursor-2',
-      truncated: false,
+      truncated,
+      truncationReason: 'page_limit',
     });
   });
 
   it('swallows transcript delta emit failures and keeps provider lease cleanup idempotent', async () => {
-    const { createManagedDirectSessionFollowLease } = await import('./createManagedDirectSessionFollowLease');
     const listeners: TranscriptUpdateListener[] = [];
     const release = vi.fn(async () => {});
     const unsubscribe = vi.fn();
@@ -185,8 +187,39 @@ describe('createManagedDirectSessionFollowLease', () => {
     expect(release).toHaveBeenCalledTimes(1);
   });
 
+  it('forwards discontinuity control frames without running background message side effects', async () => {
+    const listeners: TranscriptUpdateListener[] = [];
+    const emitDirectSessionTranscriptUpdate = vi.fn();
+    await createManagedDirectSessionFollowLease({
+      sessionId: 'sess-managed-follow',
+      reason: 'background_follow',
+      acquireProviderFollowLease: async () => ({
+        release: async () => {},
+        subscribeToTranscriptUpdates: (listener: TranscriptUpdateListener) => {
+          listeners.push(listener);
+          return () => {};
+        },
+      }),
+      emitDirectSessionTranscriptUpdate,
+      shouldProcessBackgroundFollowEffects: () => true,
+    });
+
+    await listeners[0]?.({
+      items: [directMessage],
+      fromCursor: 'stale-cursor',
+      nextCursor: 'replacement-tail',
+      truncated: true,
+      truncationReason: 'source_discontinuity',
+    });
+
+    expect(emitDirectSessionTranscriptUpdate).toHaveBeenCalledTimes(1);
+    expect(readCredentialsMock).not.toHaveBeenCalled();
+    expect(fetchSessionByIdMock).not.toHaveBeenCalled();
+    expect(updateSessionMetadataWithRetryMock).not.toHaveBeenCalled();
+    expect(dispatchActivityNotificationAsyncMock).not.toHaveBeenCalled();
+  });
+
   it('updates observed progress for detached background-follow transcript updates', async () => {
-    const { createManagedDirectSessionFollowLease } = await import('./createManagedDirectSessionFollowLease');
     const listeners: TranscriptUpdateListener[] = [];
 
     const lease = await createManagedDirectSessionFollowLease({
@@ -242,7 +275,6 @@ describe('createManagedDirectSessionFollowLease', () => {
   });
 
   it('dispatches ready notifications for detached background-follow assistant previews', async () => {
-    const { createManagedDirectSessionFollowLease } = await import('./createManagedDirectSessionFollowLease');
     const listeners: TranscriptUpdateListener[] = [];
 
     await createManagedDirectSessionFollowLease({
@@ -282,7 +314,6 @@ describe('createManagedDirectSessionFollowLease', () => {
   });
 
   it('suppresses detached metadata and ready notifications while background-follow effects are disabled', async () => {
-    const { createManagedDirectSessionFollowLease } = await import('./createManagedDirectSessionFollowLease');
     const listeners: TranscriptUpdateListener[] = [];
     const emitDirectSessionTranscriptUpdate = vi.fn(async () => {});
 

@@ -23,6 +23,20 @@ type QuotaDescriptorModule = Readonly<{
 describe('createClaudeSubscriptionQuotaFetcher', () => {
   const claudeCodeScope = 'user:inference user:profile user:sessions:claude_code user:mcp_servers user:file_upload';
 
+  it('preserves the attested credential organization without a second profile request', async () => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request) => new Response(JSON.stringify({ five_hour: { utilization: 40 } }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const record = buildConnectedServiceCredentialRecord({
+      now: 1_000, serviceId: 'claude-subscription', profileId: 'work', kind: 'oauth',
+      oauth: { accessToken: 'at', refreshToken: 'rt', idToken: null, scope: claudeCodeScope,
+        tokenType: null, providerAccountId: 'user-1', providerEmail: null,
+        raw: { claudeAiOauth: { organizationUuid: 'org-team' } } },
+    });
+    const snapshot = await createClaudeSubscriptionQuotaFetcher().fetch({ record, now: 1_000, signal: new AbortController().signal });
+    expect(snapshot).toMatchObject({ providerId: 'claude', activeAccountId: 'user-1', providerOrganizationId: 'org-team' });
+    expect(fetchMock.mock.calls.every(([url]) => !String(url).endsWith('/profile'))).toBe(true);
+  });
+
   it('does not claim exact quota support for setup-token credentials', async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
@@ -135,7 +149,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
       headers: expect.objectContaining({
         Authorization: 'Bearer at',
         'anthropic-beta': 'oauth-2025-04-20',
-        'User-Agent': expect.stringMatching(/^claude-code\/[0-9][a-zA-Z0-9._+-]*$/u),
+        'User-Agent': expect.stringMatching(/^claude-cli\/[0-9][a-zA-Z0-9._+-]* \(external, cli\)$/u),
       }),
     }));
   });
@@ -174,7 +188,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
 
     const snapshot = await fetcher.fetch({ record, now, signal: new AbortController().signal });
     expect(snapshot?.meters.find((meter) => meter.meterId === 'five_hour')?.utilizationPct).toBe(20);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('fetches and parses Claude subscription oauth usage into a quota snapshot', async () => {
@@ -341,6 +355,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
 
     const snapshot = await fetcher.fetch({ record, now, signal: new AbortController().signal });
     expect(snapshot?.meters.find((meter) => meter.meterId === 'seven_day_fable')).toMatchObject({
+      windowDurationMs: 604_800_000,
       label: 'Weekly (Fable)',
       utilizationPct: 61,
       resetsAt: Date.parse('2026-02-24T00:00:00Z'),
@@ -396,6 +411,19 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
               surface: null,
             },
           },
+          {
+            kind: 'weekly_scoped',
+            group: 'weekly',
+            percent: 31,
+            resets_at: '2026-07-07T19:59:59.748308+00:00',
+            scope: {
+              model: {
+                id: null,
+                display_name: 'Opus',
+              },
+              surface: null,
+            },
+          },
         ],
       }),
     }));
@@ -425,11 +453,21 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
 
     const snapshot = await fetcher.fetch({ record, now, signal: new AbortController().signal });
     expect(snapshot?.meters.find((meter) => meter.meterId === 'seven_day_fable')).toMatchObject({
+      providerLimitId: 'seven_day_fable',
       label: 'Weekly (Fable)',
       utilizationPct: 22,
       resetsAt: Date.parse('2026-07-07T19:59:59.748308+00:00'),
       status: 'ok',
+      details: { rawScope: 'weekly_scoped', modelDisplayName: 'Fable' },
     });
+    expect(snapshot?.meters.find((meter) => meter.meterId === 'seven_day_fable')).not.toHaveProperty('modelId');
+    expect(snapshot?.meters.find((meter) => meter.meterId === 'seven_day_opus')).toMatchObject({
+      providerLimitId: 'seven_day_opus',
+      label: 'Weekly (Opus)',
+      utilizationPct: 31,
+      details: { rawScope: 'weekly_scoped', modelDisplayName: 'Opus' },
+    });
+    expect(snapshot?.meters.find((meter) => meter.meterId === 'seven_day_opus')).not.toHaveProperty('modelId');
     expect(snapshot?.meters.find((meter) => meter.meterId === 'five_hour')).toMatchObject({
       utilizationPct: 63,
     });
@@ -742,7 +780,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
       if (!url.includes('/anthropic/oauth/usage')) {
         throw new Error(`Unexpected URL in test: ${url}`);
       }
-      usageCalls += 1;
+      if (!url.includes('?')) usageCalls += 1;
       const auth = (() => {
         const headers: unknown =
           init && typeof init === 'object' && 'headers' in init ? (init as { headers?: unknown }).headers : undefined;
@@ -912,7 +950,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
       if (!url.includes('/anthropic/oauth/usage')) {
         throw new Error(`Unexpected URL in test: ${url}`);
       }
-      usageCalls += 1;
+      if (!url.includes('?')) usageCalls += 1;
       if (usageCalls === 1) {
         return {
           ok: false,

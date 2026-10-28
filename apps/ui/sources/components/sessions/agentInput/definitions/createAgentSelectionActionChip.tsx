@@ -19,26 +19,17 @@ const AGENT_CHIP_LOGO_SLOT_STYLE = {
 
 export function createAgentSelectionActionChip(params: Readonly<{
     anchorRef: React.RefObject<ViewInstance | null>;
-    agentId: AgentId;
+    agentId: AgentId | null;
     tint: string;
     showLabel: boolean;
     label: string;
     chipStyle: (pressed: boolean) => any;
     textStyle: any;
     onPress: () => void;
-    /**
-     * The reader is reaching for this chip.
-     *
-     * Hover, focus and press-in all mean the same thing here, and all three are
-     * wired because no single one covers every host: a pointer hovers, a keyboard
-     * focuses, and a finger only ever presses. Opening the picker asks the Session's
-     * machine what it can continue with, and that question is worth starting while
-     * the pointer is still travelling.
-     */
     onIntent?: () => void;
 }>): React.ReactNode {
     const testID = 'agent-input-agent-chip';
-    const iconScale = getAgentPickerIconScale(params.agentId);
+    const iconScale = params.agentId ? getAgentPickerIconScale(params.agentId) : 1;
     return (
         <Pressable
             ref={params.anchorRef}

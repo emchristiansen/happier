@@ -139,6 +139,34 @@ describe('createActionExecutor connected-services selection', () => {
     );
   });
 
+  it('normalizes the global native shorthand to an explicit account-default opt-out', async () => {
+    const executionRunStart = vi.fn(async () => ({ runId: 'run_1', callId: 'call_1', sidechainId: 'call_1' }));
+    const executor = createActionExecutor(createDeps({ executionRunStart }));
+
+    const res = await executor.execute(
+      'execution.run.start',
+      {
+        sessionId: 's1',
+        intent: 'delegate',
+        backendTarget: { kind: 'builtInAgent', agentId: 'pi' },
+        instructions: 'Do the thing with native Pi auth.',
+        permissionMode: 'workspace_write',
+        retentionPolicy: 'ephemeral',
+        runClass: 'bounded',
+        ioMode: 'request_response',
+        connectedServices: 'native',
+      },
+      { defaultSessionId: 's1' },
+    );
+
+    expect(res.ok).toBe(true);
+    expect(executionRunStart).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({ connectedServices: null }),
+      undefined,
+    );
+  });
+
   it('forwards a mixed bare-default + explicit selection: explicit pins + bare defaults threaded to the run-start owner (RO-F5)', async () => {
     const executionRunStart = vi.fn(async () => ({ runId: 'run_1', callId: 'call_1', sidechainId: 'call_1' }));
     const executor = createActionExecutor(createDeps({ executionRunStart }));

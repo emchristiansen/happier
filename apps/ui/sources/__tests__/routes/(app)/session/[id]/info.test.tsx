@@ -4,14 +4,18 @@ import { act } from 'react-test-renderer';
 
 import { flushHookEffects, renderScreen, standardCleanup } from '@/dev/testkit';
 import { createExpoRouterMock } from '@/dev/testkit/mocks/router';
-import { createStorageModuleMock } from '@/dev/testkit/mocks/storage';
+import { createStorageModuleStub, createStorageStoreProxy } from '@/dev/testkit/mocks/storage';
+import { setActiveServerId, upsertServerProfile } from '@/sync/domains/server/serverProfiles';
 import type { LocalSettings } from '@/sync/domains/settings/localSettings';
+import { settingsDefaults } from '@/sync/domains/settings/settings';
+import { ActionsSettingsV1Schema } from '@happier-dev/protocol';
 import { clearTempData, peekTempData, type NewSessionData } from '@/utils/sessions/tempDataStore';
 import { installSessionRouteCommonModuleMocks } from './sessionRouteTestHelpers';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 let mockSessionId = 'session-1';
+const realStorageRef = vi.hoisted(() => ({ current: null as typeof import('@/sync/domains/state/storageStore')['storage'] | null }));
 let mockServerId: string | undefined;
 let mockSession: any = null;
 let isDataReady = true;
@@ -41,7 +45,6 @@ const sessionDeleteSpy = vi.fn(async () => ({ success: true }));
 const modalAlertSpy = vi.fn();
 const modalConfirmSpy = vi.fn(async () => true);
 const modalPromptSpy = vi.fn(async () => 'urgent, review');
-const applySessionListRenderablePatchesSpy = vi.fn();
 const createDefaultActionExecutorSpy = vi.fn<(options: unknown) => unknown>();
 const completeSessionForkNavigationSpy = vi.fn<(params: unknown) => Promise<void>>(async () => undefined);
 const setPinnedSessionKeysV1Spy = vi.fn();
@@ -55,6 +58,7 @@ const sessionOrganizationOps = vi.hoisted(() => ({
     sessionSetAttentionStandingWithServerScope: vi.fn(async () => ({ success: true })),
 }));
 let hideInactiveSessions = false;
+let actionsSettings = settingsDefaults.actionsSettingsV1;
 let sessionListAttentionPromotionMode: string | null = null;
 let pinnedSessionKeysV1: unknown = null;
 let sessionTagsV1: unknown = null;
@@ -162,15 +166,14 @@ installSessionRouteCommonModuleMocks({
             },
         }).module;
     },
-    storageModule: async (importOriginal) =>
-        createStorageModuleMock({
-            importOriginal,
-            overrides: {
-                storage: {
-                    getState: () => ({
-                        applySessionListRenderablePatches: applySessionListRenderablePatchesSpy,
-                    }),
-                } as any,
+    storageModule: async () => {
+        const store = createStorageStoreProxy(() => {
+            if (!realStorageRef.current) throw new Error('Real storage must be initialized before rendering');
+            return realStorageRef.current;
+        });
+        return createStorageModuleStub({
+                storage: store,
+                getStorage: () => store,
                 useSession: (sessionId: string) => useSessionSpy(sessionId),
                 useIsDataReady: () => isDataReady,
                 useLocalSetting: <K extends keyof LocalSettings>(name: K): LocalSettings[K] => {
@@ -207,8 +210,8 @@ installSessionRouteCommonModuleMocks({
                     }
                     return [null, vi.fn()];
                 },
-            },
-        }),
+        });
+    },
 });
 
 vi.mock('@expo/vector-icons', () => ({
@@ -297,15 +300,6 @@ vi.mock('@/auth/storage/tokenStorage', () => ({
     TokenStorage: {
         getCredentialsForServerUrl: vi.fn(async () => ({ token: 'token' })),
     },
-}));
-vi.mock('@/sync/domains/server/serverProfiles', () => ({
-    resolveServerProfileScopeId: (profile: { id: string; serverIdentityId?: string | null }) => (
-        profile.serverIdentityId ?? profile.id
-    ),
-    getServerProfileById: (serverId: string) => ({
-        id: serverId,
-        serverUrl: 'https://server.example.test',
-    }),
 }));
 vi.mock('@/sync/ops/sessionFolders', () => ({
     setSessionFolderAssignment: setSessionFolderAssignmentSpy,
@@ -414,8 +408,19 @@ vi.mock('@/sync/domains/profiles/profileUtils', () => ({ resolveProfileById: () 
 vi.mock('@/components/profiles/profileDisplay', () => ({ getProfileDisplayName: () => 'profile' }));
 vi.mock('@/components/ui/layout/layout', () => ({ layout: { screenPaddingHorizontal: 16 } }));
 
+const { storage } = await import('@/sync/domains/state/storageStore');
+realStorageRef.current = storage;
+const { default: Screen } = await import('@/app/(app)/session/[id]/info');
+
 describe('/session/[id]/info', () => {
     beforeEach(() => {
+        for (const serverId of ['server-1', 'server-b', 'server-cache-info', 'server_preferred_info', 'server_reactive_info']) {
+            upsertServerProfile({ serverUrl: `https://${serverId}` });
+        }
+        setActiveServerId('server-1');
+        storage.setState(storage.getInitialState(), true);
+        actionsSettings = settingsDefaults.actionsSettingsV1;
+        storage.getState().applySettingsLocal({ actionsSettingsV1: actionsSettings });
         mockSessionId = 'session-1';
         mockServerId = undefined;
         mockSession = null;
@@ -520,7 +525,7 @@ describe('/session/[id]/info', () => {
     });
 
     async function renderInfoScreen() {
-        const Screen = (await import('@/app/(app)/session/[id]/info')).default;
+        storage.getState().applySettingsLocal({ actionsSettingsV1: actionsSettings });
         return renderScreen(<Screen />);
     }
 
@@ -595,7 +600,6 @@ describe('/session/[id]/info', () => {
             metadata: {},
         };
 
-        const Screen = (await import('@/app/(app)/session/[id]/info')).default;
         const screen = await renderScreen(<Screen />);
         expect(createDefaultActionExecutorSpy).toHaveBeenCalledTimes(1);
 
@@ -670,7 +674,6 @@ describe('/session/[id]/info', () => {
             metadata: {},
         };
 
-        const Screen = (await import('@/app/(app)/session/[id]/info')).default;
         const screen = await renderScreen(<Screen />);
         useSessionStatusSpy.mockClear();
 
@@ -703,7 +706,6 @@ describe('/session/[id]/info', () => {
             metadata: {},
         };
 
-        const Screen = (await import('@/app/(app)/session/[id]/info')).default;
         const screen = await renderScreen(<Screen />);
         expect(itemListRenderSpy).toHaveBeenCalled();
         itemListRenderSpy.mockClear();
@@ -752,7 +754,7 @@ describe('/session/[id]/info', () => {
         const executorOptions = createDefaultActionExecutorSpy.mock.calls[0]?.[0] as any;
         expect(executorOptions?.openSession).toEqual(expect.any(Function));
 
-        await executorOptions.openSession('child-session');
+        await act(async () => { await executorOptions.openSession('child-session'); });
 
         expect(completeSessionForkNavigationSpy).toHaveBeenCalledWith({
             childSessionId: 'child-session',
@@ -762,7 +764,7 @@ describe('/session/[id]/info', () => {
         });
 
         const helperParams = completeSessionForkNavigationSpy.mock.calls[0]?.[0] as any;
-        helperParams.navigate('next-child');
+        await act(async () => { helperParams.navigate('next-child'); });
         expect(routerNavigateSpy).toHaveBeenCalledWith('/session/next-child?serverId=server-b', expect.any(Object));
     });
 
@@ -1359,7 +1361,7 @@ describe('/session/[id]/info', () => {
         expect(sessionOrganizationOps.setSessionPin).toHaveBeenCalledWith({
             credentials: { token: 'token' },
             serverId: 'server-b',
-            serverUrl: 'https://server.example.test',
+            serverUrl: 'https://server-b',
             sessionId: 'session-1',
             pinned: true,
         });
@@ -1374,7 +1376,7 @@ describe('/session/[id]/info', () => {
         expect(sessionOrganizationOps.setSessionTagAssignments).toHaveBeenCalledWith({
             credentials: { token: 'token' },
             serverId: 'server-b',
-            serverUrl: 'https://server.example.test',
+            serverUrl: 'https://server-b',
             sessionId: 'session-1',
             tags: ['urgent', 'review'],
         });
@@ -1554,7 +1556,7 @@ describe('/session/[id]/info', () => {
         expect(sessionOrganizationOps.setSessionFolderAssignment).toHaveBeenCalledWith(expect.objectContaining({
             credentials: { token: 'token' },
             serverId: 'server-1',
-            serverUrl: 'https://server.example.test',
+            serverUrl: 'https://server-1',
             sessionId: 'session-1',
             folderId: 'folder-1',
         }));
@@ -1946,15 +1948,7 @@ describe('/session/[id]/info', () => {
         const screen = await renderInfoScreen();
         await screen.pressByTestIdAsync('sessionInfo.archiveSession');
 
-        expect(modalConfirmSpy).toHaveBeenCalledWith(
-            'sessionInfo.archiveSession',
-            'sessionInfo.archiveSessionConfirm',
-            {
-                cancelText: 'common.cancel',
-                confirmText: 'sessionInfo.archiveSession',
-                destructive: true,
-            },
-        );
+        expect(modalConfirmSpy).not.toHaveBeenCalled();
         expect(modalAlertSpy).not.toHaveBeenCalled();
 
         expect(sessionArchiveSpy).toHaveBeenCalledWith('session-1', { serverId: 'server-b' });
@@ -1968,6 +1962,21 @@ describe('/session/[id]/info', () => {
             router: expect.any(Object),
             fallbackHref: '/',
         });
+    });
+
+    it('keeps the info screen open when configurable archive confirmation is cancelled', async () => {
+        actionsSettings = ActionsSettingsV1Schema.parse({ v: 1, actions: {
+            'session.archive': { approvalRequiredSurfaces: ['ui_button'] },
+        } });
+        modalConfirmSpy.mockResolvedValueOnce(false);
+        mockSession = {
+            id: 'session-1', active: false, accessLevel: null,
+            createdAt: 1, updatedAt: 1, seq: 1, metadata: {}, archivedAt: null,
+        };
+        const screen = await renderInfoScreen();
+        await screen.pressByTestIdAsync('sessionInfo.archiveSession');
+        expect(sessionArchiveSpy).not.toHaveBeenCalled();
+        expect(safeRouterBackSpy).not.toHaveBeenCalled();
     });
 
     it('stops and retries archiving when an inactive session is still active server-side', async () => {
@@ -2069,7 +2078,7 @@ describe('/session/[id]/info', () => {
         expect(modalConfirmSpy).toHaveBeenCalledTimes(1);
 
         expect(sessionStopSpy).toHaveBeenCalledWith('session-1', { serverId: 'server-b' });
-        expect(sessionArchiveSpy).toHaveBeenCalledWith('session-1', { serverId: 'server-b' });
+        expect(sessionArchiveSpy).toHaveBeenCalledWith('session-1', { serverId: 'server-b', signal: expect.any(AbortSignal) });
         expect(safeRouterBackSpy).toHaveBeenCalledTimes(2);
     });
 
@@ -2090,6 +2099,28 @@ describe('/session/[id]/info', () => {
 
         expect(screen.findByTestId('sessionInfo.stopSession')?.props.loading).toBe(true);
         expect(screen.findByTestId('sessionInfo.archiveSession')?.props.loading).toBe(true);
+    });
+
+    it('reflects an archive started elsewhere and prevents another stop or archive', async () => {
+        mockServerId = 'server-b';
+        setSessionOwnerServer('server-b');
+        mockSession = {
+            id: 'session-1', active: true, accessLevel: null,
+            createdAt: 1, updatedAt: 1, seq: 1, metadata: {}, archivedAt: null,
+        };
+        const operation = storage.getState().beginSessionArchive('session-1', 'server-b');
+        if (!operation) throw new Error('Expected archive admission');
+        try {
+            const screen = await renderInfoScreen();
+            expect(screen.findByTestId('sessionInfo.stopSession')?.props.disabled).toBe(true);
+            expect(screen.findByTestId('sessionInfo.archiveSession')?.props.loading).toBe(true);
+            await screen.pressByTestIdAsync('sessionInfo.archiveSession');
+            expect(sessionStopSpy).not.toHaveBeenCalled();
+            expect(sessionArchiveSpy).not.toHaveBeenCalled();
+            expect(safeRouterBackSpy).not.toHaveBeenCalled();
+        } finally {
+            await act(async () => { storage.getState().finishSessionArchive(operation); });
+        }
     });
 
     it('does not offer archive for active shared sessions even when the viewer has admin access', async () => {

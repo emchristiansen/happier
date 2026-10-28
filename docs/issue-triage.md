@@ -61,7 +61,24 @@ No stage label means no correction has been proven at any of those boundaries. A
 
 For an open issue whose complete correction becomes integrated and verified on canonical `dev`, the handling agent must include `stage:source` in its next authorized GitHub mutation. Under exact authorization, include it in the complete preview; under a standing grant that covers labels for the issue set, apply and report it without another prompt. Do not silently leave a proven correction outside the release queue. Omit the mutation only when the issue is already at the same or a higher verified stage, or when the evidence-backed disposition establishes that no correction exists to release. If GitHub mutation authority has not been granted, report the pending label proposal rather than applying it or treating the lifecycle as complete.
 
-The release workflows own normal advancement. Before binding a candidate they snapshot only the open issue stages proven by the selected source topology: a current-`dev` nightly snapshots source, `dev` → `preview` snapshots source/dev, `preview` → `main` snapshots preview, direct `dev` → `main` snapshots source/dev, and the coordinated `dev` → preview + main path snapshots source/dev once. After the existing post-promotion verification succeeds, they re-read each snapshotted issue and advance only issues that remain open at the expected earlier stage. The coordinated path advances its snapshot directly to stable only after both channel releases succeed:
+### Source verification and handoff decision
+
+For `stage:source`, verification means the complete issue correction is integrated on canonical `dev` and applicable deciding regression, integration, or source evidence establishes the corrected contract, with no known material defect remaining in that correction. For a 0.2 correction, also complete its required 0.3 disposition. This label records source availability; it does not certify every CI lane, physical platform, release artifact, or reporter confirmation.
+
+Keep required validation obligations and report failed, skipped, or unavailable checks accurately. A broader typecheck that cannot start because executor capacity is unavailable, or native QA that requires an unavailable external runtime, is a disclosed validation gap. Such unavailability alone must not withhold `stage:source` when the deciding correction evidence already holds, and applying the label does not mark that check passed or the whole implementation `VERIFIED_COMPLETE`. A check that reveals a material defect in the correction, missing deciding evidence, a partial fix, or an unmerged change still prevents claiming the complete correction is verified in source.
+
+Choose `needs:*` separately by the next substantive human action. To retain `needs:maintainer`, complete the sentence `The maintainer must now ___` with a concrete review, diagnosis, product decision, implementation, or engineering correction. Waiting for executor capacity, routine certification, a release, or eventual closure does not satisfy that test. Once the correction is integrated and verified, the normal authorized transition is to add `stage:source` and remove `needs:maintainer`; use `needs:reporter` only when an explicit request makes external evidence or confirmation the next human input.
+
+| Observed state | Stage proposal | Handoff proposal |
+| --- | --- | --- |
+| Complete correction integrated; deciding evidence passes; awaiting release | Add `stage:source` | Remove `needs:maintainer`; no `needs:*` |
+| Same correction; broader check cannot start because capacity/runtime is unavailable | Add `stage:source`; disclose the unrun check | Remove `needs:maintainer` unless a separate substantive action remains |
+| Same correction; reporter explicitly asked to retry after their channel receives it | Add `stage:source` | Add `needs:reporter`; remove `needs:maintainer` |
+| Partial or unmerged correction, missing deciding evidence, or known material defect | Do not claim a new verified source stage | Retain `needs:maintainer` for the named outstanding action |
+
+Preserve an existing higher verified `stage:*` instead of downgrading it. These are disposition rules, not new mutation authority: apply the exact or bounded standing authorization rules below and in `.agents/skills/happier-github-ops`; without authority, include the complete label proposal in the handoff.
+
+The release workflows own normal advancement. Before binding a candidate they snapshot only the open issue stages proven by the selected source topology: a current-`dev` nightly snapshots source, `dev` → `preview` snapshots source/dev, `preview` → `main` snapshots preview, direct `dev` → `main` snapshots source/dev, and the coordinated `dev` → preview + main path snapshots source/dev/preview once. After post-promotion verification and canonical terminal channel completion succeed, they re-read each snapshotted issue and advance only issues that remain open at the expected earlier stage. The coordinated path records the highest completed channel: production completion advances to stable; preview completion alone advances source/dev issues to preview. Failure of the other channel does not erase verified availability:
 
 ```text
 ordinary current-dev nightly: stage:source  -> stage:dev
@@ -69,7 +86,22 @@ preview release:             stage:dev     -> stage:preview
 stable release:              stage:preview -> stage:stable
 ```
 
-Issues labeled after a snapshot wait for the next matching release. Failed or dry-run releases move nothing. A nightly resume or a manually selected non-`dev` source also moves nothing because its older candidate cannot safely represent the current source queue. Reconciliation is idempotent, preserves unrelated labels, tolerates an add-before-remove partial retry, and skips closed issues or issues whose stage was manually changed. It never comments, closes, reopens, assigns, or edits other fields.
+Issues labeled after a snapshot wait for the next matching release. Failed channels and dry-run releases move nothing. Standalone desktop or store retries do not establish canonical channel completion and cannot advance stages. A nightly resume or a manually selected non-`dev` source also moves nothing because its older candidate cannot safely represent the current source queue. Reconciliation is idempotent, preserves unrelated labels, tolerates an add-before-remove partial retry, and skips closed issues or issues whose stage was manually changed. It never comments, closes, reopens, assigns, or edits other fields.
+
+The pinned-candidate release-control follow-up bounds normal release snapshots
+to the exact candidate's cumulative commit ancestry, intersected
+with the still-open stage queue. Only issues named in a correction commit's
+`Refs`, `Fixes`, `Closes` or `Resolves` line qualify; qualified references must
+name this repository and identify the current complete correction. References older than the target branch tip still qualify,
+including when a partial release already promoted that branch. Later dev commits
+and issues without a candidate reference remain queued. Any issue referenced by
+newer work between the candidate and the bound current dev source also stays
+queued: an older partial reference cannot prove the complete correction.
+Candidates outside canonical dev ancestry fail closed. Missing provenance is
+reported explicitly. A manually applied stage label does not replace candidate
+inclusion evidence. The combined release captures eligibility once before either
+channel promotes. Current-dev nightlies retain their existing whole-queue contract.
+This follow-up is not available until its workflow controls are integrated.
 
 This also covers a channel bypass: a preview release can move a still-`stage:source` issue directly to `stage:preview`, and an authorized direct `dev` → `main` release can move any snapshotted earlier-stage issue to `stage:stable`. Higher-channel availability subsumes the skipped lower channel; it does not require a synthetic lower-channel release.
 
@@ -132,7 +164,7 @@ The directive form is generic:
 
 The initial allowlist is deliberately limited to `needs:*`, `type:*`, and `priority:*`. The workflow rejects malformed directives, a label requested for both addition and removal, a result containing both `needs:*` labels, labels absent from the live repository, and protected families such as `stage:*`, `source:*`, `roadmap`, `ai-triage`, milestones, assignments, and disposition labels. Add and remove operations are incremental and idempotent; the workflow never replaces the complete label set.
 
-Agent-authored comments continue to require the exact or bounded standing authority in `.agents/skills/happier-github-ops` and should keep the `needs:*` label change conceptually separate from the public text. Hidden directives are primarily a manual saved-reply affordance, and they must not be appended after an agent comment's final `cc: @<local-gh-login>` line.
+Agent-authored comments continue to require the exact or bounded standing authority in `.agents/skills/happier-github-ops` and should keep the `needs:*` label change conceptually separate from the public text. Hidden directives are primarily a manual saved-reply affordance, and they must not be appended after an agent comment's final `_Posted on behalf of @<local-gh-login>._` line.
 
 The workflow's job-scoped token is a second narrow pre-authorized exception to the interactive authorization rule. It authorizes only the three transitions above. Editing this policy or broadening its allowlist is a production behavior change and requires the normal repository review and test gates.
 
@@ -144,9 +176,9 @@ Use the `v0.3` milestone for issues intentionally targeted to the 0.3 release/ro
 
 Respond as a grateful project collaborator, not a status bot. If the thread does not already contain a project thank-you, thank the author naturally for taking the time to report the issue. When a report or comment contributed a useful reproduction detail, diagnostic insight, or fix direction, name that contribution and how it helped. Do not repeat a ceremonial thank-you in every update, and do not let appreciation imply that an unverified diagnosis has been accepted.
 
-Every agent-authored public issue comment ends with a standalone `cc: @<local-gh-login>` line. Resolve that login with the machine's ordinary authenticated `gh` account (`gh api user --jq .login`), never with bot-authenticated `yarn ghops`. Under exact authorization, resolve it before the mutation preview; under standing authorization, resolve it immediately before posting. `ghops` remains the transport for issue reads and authorized writes; it is not the maintainer identity to mention. Do not hardcode a username or substitute the repository owner, operating-system user, Git author, or bot. If the local login cannot be resolved, ask the user to authenticate or explicitly supply the mention target before posting.
+Every agent-authored public issue comment ends with the standalone line `_Posted on behalf of @<local-gh-login>._` Resolve that login with the machine's ordinary authenticated `gh` account (`gh api user --jq .login`), never with bot-authenticated `yarn ghops`. Under exact authorization, resolve it before the mutation preview; under standing authorization, resolve it immediately before posting. `ghops` remains the transport for issue reads and authorized writes; it is not the human identity the attribution names. Do not hardcode a username or substitute the repository owner, operating-system user, Git author, or transport account. If the local login cannot be resolved, ask the user to authenticate or explicitly supply the attribution target before posting.
 
-The direct mention keeps the local maintainer participating in the conversation. Under exact authorization it must be part of the complete previewed comment; under standing authorization it remains required in the generated comment without a per-comment preview. Do not infer that an earlier mention or subscription makes the line optional. This does not apply to issue bodies or the release workflows' label-only reconciliation.
+The attribution makes the human authorization behind the transported comment explicit, while its direct mention keeps the local maintainer participating in the conversation. Under exact authorization it must be part of the complete previewed comment; under standing authorization it remains required in the generated comment without a per-comment preview. Do not infer that an earlier mention or subscription makes the line optional. This does not apply to issue bodies or the release workflows' label-only reconciliation.
 
 Base the public response on the reporter's stated channel and the relevant component versions:
 

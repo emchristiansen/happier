@@ -74,6 +74,7 @@ describe('createTmuxTerminalHostAdapter', () => {
       success: true,
       sessionName: 'happy',
       windowName: 'claude.1',
+      windowId: '@7',
     });
     const adapter = createTmuxTerminalHostAdapter({ tmux });
 
@@ -87,7 +88,7 @@ describe('createTmuxTerminalHostAdapter', () => {
     expect(handle).toMatchObject({
       kind: 'tmux',
       sessionName: 'happy',
-      paneId: 'claude.1',
+      paneId: '@7',
       attachMetadata: {
         attachStrategy: 'terminal_host',
         topology: 'exclusive',
@@ -117,6 +118,30 @@ describe('createTmuxTerminalHostAdapter', () => {
       socketDir: '/tmp/happier-tmux-root',
     })).toEqual({ TMUX_TMPDIR: '/tmp/happier-tmux-root' });
     expect(resolveTmuxCommandEnvironmentForHostHandle(TMUX_HANDLE)).toBeUndefined();
+  });
+
+  it('targets an immutable tmux window id without a mutable session-name prefix', async () => {
+    const tmux = new TmuxUtilities();
+    const executeTmuxCommand = vi.spyOn(tmux, 'executeTmuxCommand').mockResolvedValue({
+      returncode: 0,
+      stdout: '0|12345|codex\n',
+      stderr: '',
+      command: [],
+    });
+    const adapter = createTmuxTerminalHostAdapter({ tmux });
+
+    await expect(adapter.evaluateLiveness({
+      ...TMUX_HANDLE,
+      paneId: '@7',
+    })).resolves.toMatchObject({ paneAlive: true });
+
+    expect(executeTmuxCommand).toHaveBeenCalledWith([
+      'display-message',
+      '-p',
+      '-t',
+      '@7',
+      '#{pane_dead}|#{pane_pid}|#{pane_current_command}',
+    ]);
   });
 
   it('adopts an existing live tmux host without spawning a new window', async () => {
@@ -232,7 +257,7 @@ describe('createTmuxTerminalHostAdapter', () => {
       stderr: '',
       command: [...args],
     }));
-    const captureCurrentInput = vi.spyOn(tmux, 'captureCurrentInput').mockResolvedValue([
+    vi.spyOn(tmux, 'captureCurrentInput').mockResolvedValue([
       'Please run /login · API Error: 401 Invalid authentication credentials',
       '❯ continue',
       '▶▶ auto mode on',
@@ -246,7 +271,7 @@ describe('createTmuxTerminalHostAdapter', () => {
           text: 'continue',
           multiline: false,
           origin: { kind: 'ui_pending', nonce: 'nonce-single-line-stuck' },
-          scheduling: {},
+          scheduling: { timeoutMs: 250 },
         },
       ),
     ).resolves.toMatchObject({
@@ -257,9 +282,7 @@ describe('createTmuxTerminalHostAdapter', () => {
 
     expect(executeTmuxCommand.mock.calls.map((call) => call[0]).filter((args) => args[0] === 'send-keys')).toEqual([
       ['send-keys', '-t', 'happy:claude.1', 'C-m'],
-      ['send-keys', '-t', 'happy:claude.1', 'C-m'],
     ]);
-    expect(captureCurrentInput).toHaveBeenCalledTimes(3);
   });
 
   it('waits for the Claude composer to stage the exact prompt before sending Enter', async () => {
@@ -585,7 +608,7 @@ describe('createTmuxTerminalHostAdapter', () => {
     ]);
   });
 
-  it('retries Enter when the current composer marker has footer rows below it', async () => {
+  it('waits for the current composer marker with footer rows to clear', async () => {
     const tmux = new TmuxUtilities();
     const executeTmuxCommand = vi.spyOn(tmux, 'executeTmuxCommand').mockImplementation(async (args) => ({
       returncode: 0,
@@ -627,7 +650,6 @@ describe('createTmuxTerminalHostAdapter', () => {
     ).resolves.toMatchObject({ status: 'injected' });
 
     expect(executeTmuxCommand.mock.calls.map((call) => call[0]).filter((args) => args[0] === 'send-keys')).toEqual([
-      ['send-keys', '-t', 'happy:claude.1', 'C-m'],
       ['send-keys', '-t', 'happy:claude.1', 'C-m'],
     ]);
   });

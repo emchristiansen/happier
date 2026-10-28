@@ -26,7 +26,7 @@ function baseV2State(overrides: Partial<SharedManagedOpenCodeServerState> = {}):
 
 describe('resolveOpenCodeManagedServerIdentity', () => {
   it('normalizes shared state into an identity with a stable, deterministic generation key', () => {
-    const state = baseV2State({ logPath: '/logs/opencode-managed-servers/a.log' });
+    const state = baseV2State({ logPath: '/logs/opencode-managed-servers/a.log', apiGeneration: 'v2' });
     const identity = resolveOpenCodeManagedServerIdentity(state);
 
     expect(identity.baseUrl).toBe(state.baseUrl);
@@ -38,6 +38,7 @@ describe('resolveOpenCodeManagedServerIdentity', () => {
     expect(identity.activeServerDir).toBe(state.activeServerDir);
     expect(identity.daemonInstanceId).toBe(state.daemonInstanceId);
     expect(identity.logPath).toBe('/logs/opencode-managed-servers/a.log');
+    expect(identity.apiGeneration).toBe('v2');
     expect(identity.generationKey).toMatch(/^[0-9a-f]{64}$/);
 
     // Deterministic for the same state.

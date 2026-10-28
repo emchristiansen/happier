@@ -11,13 +11,25 @@ export const ExecutionRunCompletionV1Schema = z.object({
 
 export type ExecutionRunCompletionV1 = z.infer<typeof ExecutionRunCompletionV1Schema>;
 
+function buildExecutionRunCompletionText(completion: ExecutionRunCompletionV1): string {
+  const summary = completion.summary?.trim();
+  return [
+    '<happier_execution_run_notification>',
+    'This is an automated background-run notification from Happier, not a user message.',
+    `Run ID: ${completion.runId}`,
+    `Status: ${completion.status}`,
+    ...(summary ? ['', 'Final result:', summary] : []),
+    '</happier_execution_run_notification>',
+  ].join('\n');
+}
+
 export function buildExecutionRunCompletionInputV1(value: ExecutionRunCompletionV1): Readonly<{
   text: string;
   meta: Record<string, unknown>;
 }> {
   const completion = ExecutionRunCompletionV1Schema.parse(value);
   return {
-    text: `<happier_execution_run_completion v="1">\n${JSON.stringify(completion)}\n</happier_execution_run_completion>`,
+    text: buildExecutionRunCompletionText(completion),
     meta: {
       source: 'execution_run',
       sentFrom: 'happier',

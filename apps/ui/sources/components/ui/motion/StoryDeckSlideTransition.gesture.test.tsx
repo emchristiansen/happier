@@ -10,10 +10,6 @@ vi.mock('react-native', async () => {
     return createReactNativeWebMock();
 });
 
-vi.mock('@/hooks/ui/useReducedMotionPreference', () => ({
-    useReducedMotionPreference: () => false,
-}));
-
 const reanimatedControls = vi.hoisted(() => ({
     fireSpringCallback: false,
 }));
@@ -80,7 +76,33 @@ function renderItem(index: number, _role: 'previous' | 'current' | 'next'): Reac
     return <Text testID={`card-${index}`}>{`card ${index}`}</Text>;
 }
 
+function MeasuredCard({ index }: Readonly<{ index: number }>) {
+    const [width, setWidth] = React.useState(0);
+    return (
+        <View testID={`card-${index}`} onLayout={(event) => setWidth(event.nativeEvent.layout.width)}>
+            <Text testID={`width-${index}`}>{width}</Text>
+        </View>
+    );
+}
+
 describe('StoryDeckSlideTransition (carousel adapter)', () => {
+    it('retains the incoming card state when its index becomes current', async () => {
+        const { StoryDeckSlideTransition } = await import('./StoryDeckSlideTransition');
+        const props = {
+            itemCount: 3,
+            renderItem: (index: number) => <MeasuredCard index={index} />,
+            onCommitNext: () => {},
+            onCommitPrevious: () => {},
+        };
+        const screen = await renderScreen(<StoryDeckSlideTransition {...props} activeIndex={0} />);
+        fireLayout(screen.findByTestId('card-1'), 320);
+        expect(screen.findByTestId('width-1')?.props.children).toBe(320);
+
+        await screen.update(<StoryDeckSlideTransition {...props} activeIndex={1} />);
+
+        expect(screen.findByTestId('width-1')?.props.children).toBe(320);
+    });
+
     it('renders previous, current, and next slots when not at bounds', async () => {
         const { StoryDeckSlideTransition } = await import('./StoryDeckSlideTransition');
         const screen = await renderScreen(

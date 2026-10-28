@@ -178,7 +178,7 @@ test('server runtime version allocation runs before workspace dependencies are i
   }
 });
 
-test('authorized server finalizer control scripts load without installed workspace dependencies', () => {
+test('pre-install server finalizer preparation scripts load without workspace dependencies', () => {
   const fixtureDir = mkdtempSync(join(tmpdir(), 'happier-server-finalizer-preinstall-'));
   const loaderPath = join(fixtureDir, 'reject-workspace-imports.mjs');
   writeFileSync(
@@ -207,11 +207,6 @@ test('authorized server finalizer control scripts load without installed workspa
       path: resolve(repoRoot, 'scripts', 'pipeline', 'release', 'publish-manifests.mjs'),
       args: [],
       expectedFailure: /--product is required/,
-    },
-    {
-      path: resolve(repoRoot, 'scripts', 'pipeline', 'release', 'verify-artifacts.mjs'),
-      args: ['--artifacts-dir', fixtureDir],
-      expectedFailure: /no checksums file found/,
     },
   ];
 

@@ -24,7 +24,11 @@ const IGNORED_UNTRANSLATED_KEYS = new Set([
     'settingsSession.handoff.includeIgnoredMode.globsPlaceholder',
     'connectedServices.detail.prompts.accessTokenPlaceholder',
     'connectedServices.serviceNames.github',
+    // Provider product name, shared across locales.
+    'connectedServices.serviceNames.antigravity',
     'deps.installable.githubCli.title',
+    // Product name, shared across locales.
+    'deps.installable.difftastic.title',
     'newSession.githubCliBanner.title',
     'files.markdown',
     'settingsSession.sessionCreation.modalModeSimpleTitle',
@@ -50,6 +54,12 @@ const IGNORED_UNTRANSLATED_KEYS = new Set([
     'settingsSession.sessionList.workingIndicatorSpinnerTitle',
     'settingsSession.sessionList.identityDisplayAvatarTitle',
     'settingsSession.transcript.messageActions.template.placeholder',
+    // Release channel names, the installer's own `--channel` vocabulary (R11/RV-9). Stable is
+    // translated where the language has a word for it; Preview and Dev read as channel names.
+    'machine.thisComputer.cliChannelPreview',
+    'machine.thisComputer.cliChannelDev',
+    // The product name of Happier's own command line (R13 (e) Updates rows).
+    'updates.happierCliTitle',
     // Literal terminal multiplexer executable names.
     'settingsProviders.plugins.claude.fields.claudeUnifiedTerminalHost.options.tmux.title',
     'settingsProviders.plugins.claude.fields.claudeUnifiedTerminalHost.options.zellij.title',
@@ -60,11 +70,17 @@ const IGNORED_UNTRANSLATED_KEYS_BY_LOCALE: Readonly<Record<string, ReadonlySet<s
         'settingsSession.sessionList.headerIdentityDisplayAvatarTitle',
     ]),
     it: new Set([
+        // "Offline" is the standard Italian status word for a disconnected machine.
+        'updates.offline',
+        // "Feedback" is an established Italian loanword used for user feedback.
+        'settingsAppearance.feedback',
         // "File" is the standard Italian computing noun, not an untranslated fallback.
         'notifications.activity.requestLabels.file',
         'settingsSession.sessionList.headerIdentityDisplayAvatarTitle',
     ]),
     pt: new Set([
+        // "Offline" is the standard Portuguese status word for a disconnected machine.
+        'updates.offline',
         'agentInput.suggestionGroups.plugins',
         'automations.form.schedule.manualTitle',
         'settingsSession.sessionList.headerIdentityDisplayAvatarTitle',
@@ -76,6 +92,9 @@ const IGNORED_UNTRANSLATED_KEYS_BY_LOCALE: Readonly<Record<string, ReadonlySet<s
     //   and true cognates that are simply the same word (Actions, Options, Description, Sources).
     // A key here is a decision, not a gap; translating one of them would make the UI read worse.
     fr: new Set([
+        'machine.thisComputer.cliChannelStable',
+        // "Machine" is the French word for a computer here, not an untranslated fallback.
+        'updates.sections.machine',
         'agentInput.acp.modeSectionTitle',
         'agentInput.acp.optionsSectionTitle',
         'agentInput.actionMenu.title',
@@ -175,6 +194,8 @@ const IGNORED_UNTRANSLATED_KEYS_BY_LOCALE: Readonly<Record<string, ReadonlySet<s
         'connectedServices.serviceNames.openaiCodex',
         'connectionStatus.labels.socket',
         'deps.installable.githubCli.title',
+        // "Stable" is the standard French release-channel label too.
+        'settingsProviders.plugins.opencode.fields.opencodeCliGeneration.options.stable.title',
         'devVoiceQa.actionsTitle',
         'devVoiceQa.configurationTitle',
         'devVoiceQa.promptLabel',
@@ -466,13 +487,18 @@ const IGNORED_UNTRANSLATED_KEYS_BY_LOCALE: Readonly<Record<string, ReadonlySet<s
     ]),
     // These locales use the same spelling for this label.
     ca: new Set([
+        // "Context" is the Catalan word.
+        'agentInput.context.badgeLabel',
         'agentInput.suggestionGroups.sessions',
         'automations.form.schedule.manualTitle',
+        // "Errors" is the Catalan plural of "error", not an untranslated fallback.
+        'inbox.errors',
         'message.runtimeConfigOutcomeKeyModel',
         'session.agentActivity.screenTitle',
         'settingsSession.sessionList.headerIdentityDisplayAvatarTitle',
     ]),
-    pl: new Set(['message.runtimeConfigOutcomeKeyModel']),
+    // "Offline" is the standard Polish status word for a disconnected machine.
+    pl: new Set(['message.runtimeConfigOutcomeKeyModel', 'updates.offline']),
     // German keeps these identical to English on purpose, in the same three groups French does:
     //   product, provider and preset nouns (Happier, Codex, tmux, model ids, theme names),
     //   the English technical vocabulary German developers actually speak and which the ratified
@@ -485,6 +511,10 @@ const IGNORED_UNTRANSLATED_KEYS_BY_LOCALE: Readonly<Record<string, ReadonlySet<s
     // German noun is spelled. A key here is a decision, not a gap — translating one would make
     // the UI read worse, not better.
     de: new Set([
+        'machine.thisComputer.cliChannelStable',
+        // "Updates" and "Offline" are the German words for these, not untranslated fallbacks.
+        'updates.title',
+        'updates.offline',
         'agentInput.mode.build',
         'agentInput.mode.plan',
         'agentInput.suggestionGroups.plugins',

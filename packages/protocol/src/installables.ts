@@ -10,6 +10,11 @@ import {
   GH_GITHUB_REPO,
   GH_INSTALLABLE_KEY,
 } from './providers/github/installables.js';
+import {
+  AGY_ACP_SERVER_DEP_ID,
+  AGY_ACP_SERVER_VERSION,
+  INSTALLABLE_KEYS as AGY_INSTALLABLE_KEYS,
+} from './providers/agy/installables.js';
 
 export {
   CODEX_ACP_DEP_ID,
@@ -17,11 +22,16 @@ export {
   GH_BINARY_NAME,
   GH_DEP_ID,
   GH_GITHUB_REPO,
+  AGY_ACP_SERVER_DEP_ID,
+  AGY_ACP_SERVER_VERSION,
 };
 
 export const INSTALLABLE_KEYS = {
   CODEX_ACP: CODEX_INSTALLABLE_KEYS.CODEX_ACP,
   GH: GH_INSTALLABLE_KEY,
+  AGY_ACP_SERVER: AGY_INSTALLABLE_KEYS.AGY_ACP_SERVER,
+  LOCAL_EMBEDDINGS: 'local-embeddings',
+  DIFFTASTIC: 'difftastic',
 } as const;
 
 export type InstallableKey = typeof INSTALLABLE_KEYS[keyof typeof INSTALLABLE_KEYS];
@@ -29,6 +39,7 @@ export type InstallableKey = typeof INSTALLABLE_KEYS[keyof typeof INSTALLABLE_KE
 export type InstallableKind = 'dep';
 export type InstallableSourceKind =
   | 'github_release_binary'
+  | 'pinned_archive'
   | 'managed_package'
   | 'vendor_recipe'
   | 'manual_only';
@@ -63,10 +74,34 @@ const OPTIONAL_TOOL_POLICY: InstallableDefaultPolicy = { autoInstallWhenNeeded: 
 
 export const INSTALLABLES_CATALOG = [
   {
+    key: INSTALLABLE_KEYS.LOCAL_EMBEDDINGS,
+    kind: 'dep',
+    capabilityId: 'dep.local-embeddings',
+    sourceKind: 'pinned_archive',
+    defaultPolicy: { autoInstallWhenNeeded: true, autoUpdateMode: 'off' },
+    experimental: false,
+  },
+  {
+    key: INSTALLABLE_KEYS.DIFFTASTIC,
+    kind: 'dep',
+    capabilityId: 'dep.difftastic',
+    sourceKind: 'pinned_archive',
+    defaultPolicy: { autoInstallWhenNeeded: true, autoUpdateMode: 'off' },
+    experimental: false,
+  },
+  {
     key: INSTALLABLE_KEYS.CODEX_ACP,
     kind: 'dep',
     capabilityId: CODEX_ACP_DEP_ID,
     sourceKind: 'github_release_binary',
+    defaultPolicy: DEFAULT_POLICY,
+    experimental: true,
+  },
+  {
+    key: INSTALLABLE_KEYS.AGY_ACP_SERVER,
+    kind: 'dep',
+    capabilityId: AGY_ACP_SERVER_DEP_ID,
+    sourceKind: 'pinned_archive',
     defaultPolicy: DEFAULT_POLICY,
     experimental: true,
   },

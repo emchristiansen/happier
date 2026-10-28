@@ -79,18 +79,46 @@ export function isKnownUnavailableOpenCodeModel(params: Readonly<{
   return getKnownUnavailableOpenCodeModel(params) !== null;
 }
 
-export function modelSupportsToolCalls(raw: unknown, providerIdHint?: string): boolean {
+/**
+ * Shared eligibility for discovery, selection, and compaction. OpenCode supports text models
+ * without tool calling, so tool support must not change membership between those consumers.
+ * Missing inventory preserves custom-model selection; known retired models remain excluded.
+ */
+export function isOpenCodeModelSelectable(model: Readonly<{
+  providerID: string;
+  modelID: string;
+  modelRecord?: unknown;
+}>): boolean {
+  const providerID = normalizeString(model.providerID);
+  const modelID = normalizeString(model.modelID);
+  if (!providerID || !modelID) return false;
+  if (isKnownUnavailableOpenCodeModel({ providerID, modelID })) return false;
+  return modelIsActive(model.modelRecord) && modelSupportsTextInput(model.modelRecord);
+}
+
+export function modelIsActive(raw: unknown): boolean {
+  const rec = asRecord(raw);
+  if (!rec) return true;
+  const status = normalizeString(rec.status);
+  return !status || status === 'active';
+}
+
+export function modelSupportsTextInput(raw: unknown): boolean {
+  const rec = asRecord(raw);
+  if (!rec) return true;
+  const capabilities = asRecord(rec.capabilities);
+  if (!capabilities) return true;
+  const input = capabilities.input;
+  if (Array.isArray(input)) return input.some((value) => normalizeString(value) === 'text');
+  const inputRecord = asRecord(input);
+  return !inputRecord || inputRecord.text !== false;
+}
+
+/** V2 has no `capabilities.reasoning`; a non-empty `variants` list is the released equivalent. */
+export function modelSupportsReasoningVariants(raw: unknown): boolean {
   const rec = asRecord(raw);
   if (!rec) return false;
-  const providerID = normalizeString(providerIdHint) || normalizeString(rec.providerID);
-  const modelID = normalizeString(rec.id);
-  if (providerID && modelID && isKnownUnavailableOpenCodeModel({ providerID, modelID })) return false;
-  const status = normalizeString(rec.status);
-  if (status && status !== 'active') return false;
   const capabilities = asRecord(rec.capabilities);
-  if (!capabilities) return false;
-  if (capabilities.toolcall !== true) return false;
-  const input = asRecord(capabilities.input);
-  if (input && input.text === false) return false;
-  return true;
+  if (capabilities?.reasoning === true) return true;
+  return Array.isArray(rec.variants) && rec.variants.length > 0;
 }

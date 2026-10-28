@@ -1,7 +1,8 @@
-import { agent, RequestError } from '@agentclientprotocol/sdk';
+import { agent, RequestError, type ClientContext } from '@agentclientprotocol/sdk';
 import { describe, expect, it } from 'vitest';
 
 import { createAcpClientConnection } from '../createAcpClientConnection';
+import { AcpAgentPeer } from '../AcpAgentPeer';
 
 const objectParams = { parse: (value: unknown) => value };
 
@@ -17,6 +18,34 @@ function createConnection(testAgent: ReturnType<typeof agent>) {
 }
 
 describe('AcpAgentPeer', () => {
+  it('preserves non-extensible SDK transport errors without a provider classifier', async () => {
+    const failure = Object.preventExtensions(new Error('SDK transport unavailable'));
+    const context = { request: async () => { throw failure; } } satisfies Pick<ClientContext, 'request'>;
+    // SDK boundary fixture: this outgoing operation uses only request; unrelated SDK session builders are absent.
+    const peer = new AcpAgentPeer(context as unknown as ClientContext, new AbortController().signal);
+    await expect(peer.loadSession({ sessionId: 'missing', cwd: '/tmp', mcpServers: [] }))
+      .rejects.toBe(failure);
+    expect(failure).not.toHaveProperty('authenticationSetupFailure');
+  });
+
+  it('owns the standard ACP list, close, and delete session methods', async () => {
+    const observed: string[] = [];
+    const testAgent = agent({ name: 'peer-session-controls-agent' })
+      .onRequest('session/list', () => { observed.push('list'); return { sessions: [], nextCursor: null }; })
+      .onRequest('session/close', () => { observed.push('close'); return {}; })
+      .onRequest('session/delete', () => { observed.push('delete'); return {}; });
+    const connection = createConnection(testAgent);
+    try {
+      await connection.peer.listSessions({ cwd: '/tmp' });
+      await connection.peer.closeSession({ sessionId: 'session-1' });
+      await connection.peer.deleteSession({ sessionId: 'session-1' });
+      expect(observed).toEqual(['list', 'close', 'delete']);
+    } finally {
+      connection.close();
+      await connection.closed;
+    }
+  });
+
   it('cancels an outgoing extension request and rejects promptly when its signal aborts', async () => {
     let observedCancellation = false;
     let resolveStarted: (() => void) | null = null;

@@ -124,15 +124,27 @@ For the full workflow, see [Session handoff](/sessions/session-handoff).
 
 The root Session screen also contains the defaults that control how app-started sessions can later be continued from a terminal.
 
-### tmux integration
+### Terminal host for new sessions
 
-Enable **tmux integration** when you want supported sessions to start inside `tmux`.
+Choose whether supported app-started sessions use no terminal host, `tmux`, zellij, or Herdr. A per-machine override can replace the account default. Herdr and automatic presentation of supported server-backed sessions are available in Happier CLI 0.2.16 and later, including stable releases. Herdr selection requires an updated app as well as the CLI on the target machine.
 
-Use this on machines where:
+In development builds, machine details shows **Override account default**. With it off,
+new sessions inherit the account choice; the effective host remains visible. Turning it
+on selects a host for that machine only. It does not disable the account preference.
 
-- `tmux` is installed,
-- you want to start from the app first, then later run `happier attach <session-id>` from a shell,
-- you want providers such as **Claude** or **Codex** to reopen inside the same tmux-backed local host.
+When `tmux` is selected, its session name, isolated-server option, and temporary directory
+remain account defaults that a machine override can replace.
+
+New sessions with a meaningful terminal surface start in the selected host. This includes server-backed Codex and OpenCode sessions: their native TUI starts against the same provider session Happier is driving. Headless runtimes such as ACP stay headless and do not receive an invented terminal UI.
+
+Resuming an inactive session from the app or taking over an external session uses that account’s current terminal preferences, including overrides for the target machine. Changing the preference does not move a session that is already running to another host.
+
+Use a terminal host when you want sessions to appear in that host immediately and remain locally attachable. Select **None** when you want supported sessions to stay in their normal background/server-backed presentation until you attach. Herdr requires a supported local Herdr installation and is unavailable as an attach host on native Windows.
+
+A missing supported Herdr/Zellij installation or an older running
+Herdr server produces a terminal-host setup message rather than an agent error. Install
+or update the host and restart its server on the selected machine, or choose another
+terminal host. Your session draft is kept while you correct the setup.
 
 ### Windows remote session mode
 

@@ -58,6 +58,11 @@ describe('attention standing in the visible session list index', () => {
                     seq: 4,
                     lastViewedSessionSeq: 4,
                     hasUnreadMessages: false,
+                    active: true,
+                    activeAt: now - 600_000,
+                    presence: 'online',
+                    latestTurnStatus: 'in_progress',
+                    latestTurnStatusObservedAt: now - 600_000,
                     updatedAt: now - 5_000,
                     meaningfulActivityAt: now - 5_000,
                 }),
@@ -82,6 +87,7 @@ describe('attention standing in the visible session list index', () => {
             presentation: { enabled: false, presentation: 'grouped', selectedServerIds: [] },
             attentionPromotion: { mode: 'global', standingPolicy },
             workingPlacement: { mode: 'global' },
+            retainWorkingSessionKeys: ['s1:standing'],
             nowMs: now,
         })!;
 

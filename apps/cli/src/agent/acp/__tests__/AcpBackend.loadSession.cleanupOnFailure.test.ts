@@ -71,6 +71,123 @@ function writeFakeAcpAgentScript(params: { dir: string }): string {
 }
 
 describe('AcpBackend loadSession cleanup on failure', () => {
+  it('rejects session/load when configured catalog policy is false', async () => {
+    await withTempDir('happier-acp-load-static-false-', async (dir) => {
+      const scriptPath = writeAcpTestAgentScript({
+        dir,
+        fileName: 'fake-acp-static-false.mjs',
+        source: `
+          import readline from 'node:readline';
+          const rl = readline.createInterface({ input: process.stdin });
+          const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+          rl.on('line', (line) => {
+            const request = JSON.parse(line);
+            if (request.method === 'initialize') {
+              send({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: 1, authMethods: [], agentCapabilities: { loadSession: true } } });
+              return;
+            }
+            send({ jsonrpc: '2.0', id: request.id, error: { code: -32603, message: 'session RPC must not be called' } });
+          });
+        `,
+      });
+      const backend = new AcpBackend({
+        agentName: 'configured-test', cwd: dir, command: process.execPath, args: [scriptPath], declaredSessionLoadSupport: false,
+      });
+      try {
+        await expect(backend.loadSession('resume-1')).rejects.toThrow(/does not support session\/load/);
+      } finally {
+        await backend.dispose();
+      }
+    });
+  }, 20_000);
+
+  it('requires configured catalog load support to be negotiated before session/load', async () => {
+    await withTempDir('happier-acp-load-capability-', async (dir) => {
+      const scriptPath = writeAcpTestAgentScript({
+        dir,
+        fileName: 'fake-acp-no-load-capability.mjs',
+        source: `
+          import readline from 'node:readline';
+          const rl = readline.createInterface({ input: process.stdin });
+          const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+          rl.on('line', (line) => {
+            const request = JSON.parse(line);
+            if (request.method === 'initialize') {
+              send({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: 1, authMethods: [] } });
+              return;
+            }
+            send({ jsonrpc: '2.0', id: request.id, error: { code: -32603, message: 'session RPC must not be called' } });
+          });
+        `,
+      });
+      const backend = new AcpBackend({
+        agentName: 'configured-test',
+        cwd: dir,
+        command: process.execPath,
+        args: [scriptPath],
+        declaredSessionLoadSupport: true,
+      });
+
+      try {
+        await expect(backend.loadSession('resume-1')).rejects.toThrow(/did not negotiate loadSession/);
+      } finally {
+        await backend.dispose();
+      }
+    });
+  }, 20_000);
+
+  it('loads exactly once when configured catalog and initialize both support session/load', async () => {
+    await withTempDir('happier-acp-load-once-', async (dir) => {
+      const scriptPath = writeAcpTestAgentScript({
+        dir,
+        fileName: 'fake-acp-load-capability.mjs',
+        source: `
+          import readline from 'node:readline';
+          const rl = readline.createInterface({ input: process.stdin });
+          const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+          let loadCount = 0;
+          rl.on('line', (line) => {
+            const request = JSON.parse(line);
+            if (request.method === 'initialize') {
+              send({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: 1, authMethods: [], agentCapabilities: { loadSession: true } } });
+              return;
+            }
+            if (request.method === 'session/load') {
+              loadCount += 1;
+              send({
+                jsonrpc: '2.0',
+                id: request.id,
+                result: {
+                  sessionId: request.params.sessionId,
+                  modes: {
+                    currentModeId: String(loadCount),
+                    availableModes: [{ id: String(loadCount), name: 'Loaded once' }],
+                  },
+                },
+              });
+              return;
+            }
+            send({ jsonrpc: '2.0', id: request.id, error: { code: -32603, message: 'session/new must not be called' } });
+          });
+        `,
+      });
+      const backend = new AcpBackend({
+        agentName: 'configured-test',
+        cwd: dir,
+        command: process.execPath,
+        args: [scriptPath],
+        declaredSessionLoadSupport: true,
+      });
+
+      try {
+        await expect(backend.loadSession('resume-1')).resolves.toEqual({ sessionId: 'resume-1' });
+        expect(backend.getSessionModeState()?.currentModeId).toBe('1');
+      } finally {
+        await backend.dispose();
+      }
+    });
+  }, 20_000);
+
   it('captures transcript replay notifications emitted during session/load before live generation filtering', async () => {
     await withTempDir('happier-acp-load-replay-', async (dir) => {
       const scriptPath = writeAcpTestAgentScript({

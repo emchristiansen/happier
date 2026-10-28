@@ -34,6 +34,17 @@ describe('buildHappierCliInstallCommand', () => {
         expect(buildHappierCliInstallCommand({ appVariant, distTagOverride: null })).toBe('curl -fsSL https://happier.dev/install | bash');
     });
 
+    it('uses the dev installer and shim when the app release identity resolves to dev', () => {
+        expect(buildHappierCliInstallCommand({
+            appVariant: 'preview',
+            channelOverride: 'dev',
+        })).toBe('curl -fsSL https://happier.dev/install | bash -s -- --channel dev');
+        expect(buildHappierCliCommandName({
+            appVariant: 'preview',
+            channelOverride: 'dev',
+        })).toBe('hdev');
+    });
+
     it('uses the preview CLI shim for preview-channel manual commands', () => {
         expect(buildHappierCliCommandName({ appVariant: 'preview' })).toBe('hprev');
         expect(buildHappierCliCommandName({ appVariant: 'development' })).toBe('hprev');

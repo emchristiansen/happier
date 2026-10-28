@@ -1,3 +1,4 @@
+import { requireEncryptedSessionContext } from '@/session/transport/encryption/sessionEncryptionContext';
 import { decodeBase64, decrypt } from '@/api/encryption';
 import { fetchEncryptedTranscriptPageAfterSeq, fetchEncryptedTranscriptPageLatest } from '@/api/session/fetchEncryptedTranscriptWindow';
 import {
@@ -90,11 +91,12 @@ export function isMemoryArtifactDecryptedRow(value: unknown): boolean {
 function tryDecryptTranscriptEnvelope(params: Readonly<{
     content: { t: 'encrypted'; c: string } | { t: 'plain'; v: unknown };
     encryptionMode: SessionStoredContentEncryptionMode;
-    encryptionKey: Uint8Array;
-    encryptionVariant: 'legacy' | 'dataKey';
+    encryptionKey: Uint8Array | null;
+    encryptionVariant: 'legacy' | 'dataKey' | 'plain';
 }>): unknown | null {
     if (params.content.t === 'plain') return params.content.v;
     try {
+        requireEncryptedSessionContext(params);
         return decrypt(
             params.encryptionKey,
             params.encryptionVariant,
@@ -114,8 +116,8 @@ export async function detectSessionTurnActivity(params: Readonly<{
     token: string;
     sessionId: string;
     encryptionMode: SessionStoredContentEncryptionMode;
-    encryptionKey: Uint8Array;
-    encryptionVariant: 'legacy' | 'dataKey';
+    encryptionKey: Uint8Array | null;
+    encryptionVariant: 'legacy' | 'dataKey' | 'plain';
     afterSeqExclusive?: number;
     sessionProjection?: unknown;
     transcriptFetchTimeoutMs?: number;
@@ -196,8 +198,8 @@ export async function detectSessionTurnInFlight(params: Readonly<{
     token: string;
     sessionId: string;
     encryptionMode: SessionStoredContentEncryptionMode;
-    encryptionKey: Uint8Array;
-    encryptionVariant: 'legacy' | 'dataKey';
+    encryptionKey: Uint8Array | null;
+    encryptionVariant: 'legacy' | 'dataKey' | 'plain';
     afterSeqExclusive?: number;
     sessionProjection?: unknown;
     transcriptFetchTimeoutMs?: number;

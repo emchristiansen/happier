@@ -1,9 +1,39 @@
 import { describe, expect, it } from 'vitest';
 
 import type { Metadata } from '@/api/types';
-import { maybeUpdateOpenCodeSessionIdMetadata } from './opencodeSessionIdMetadata';
+import { createTestMetadata } from '@/testkit/backends/sessionMetadata';
+import { readOpenCodeSessionRuntimeHandleFromMetadata } from '@happier-dev/agents';
+import { maybeUpdateOpenCodeSessionIdMetadata, type OpenCodeSessionMetadataPublicationState } from './opencodeSessionIdMetadata';
 
 describe('maybeUpdateOpenCodeSessionIdMetadata', () => {
+  it('publishes one selected affinity tuple to ordinary and direct projections and clears it on context changes', async () => {
+    const lastPublished: OpenCodeSessionMetadataPublicationState = {
+      sessionId: null, backendMode: null, serverBaseUrl: null, serverBaseUrlExplicit: false,
+    };
+    let metadata = createTestMetadata({ flavor: 'opencode', machineId: 'machine-current' });
+    const publish = async (fingerprint: string | null, backendMode: 'server' | 'acp' = 'server', explicit = false) => {
+      await maybeUpdateOpenCodeSessionIdMetadata({
+        getOpenCodeSessionId: () => 'same-native-session', backendMode,
+        managedServerLaunchFingerprint: fingerprint, serverBaseUrlExplicit: explicit,
+        serverBaseUrl: explicit ? 'https://remote.example.test' : null, transcriptStorage: 'direct', lastPublished,
+        updateHappySessionMetadata: (updater) => { metadata = updater(metadata); },
+      });
+    };
+    await publish('a'.repeat(64));
+    expect(readOpenCodeSessionRuntimeHandleFromMetadata(metadata).managedServerLaunchFingerprint).toBe('a'.repeat(64));
+    expect(metadata.directSessionV1?.agentRuntimeDescriptorV1).toEqual(metadata.agentRuntimeDescriptorV1);
+    expect(metadata.opencodeServerBaseUrl).toBeUndefined();
+    await publish('b'.repeat(64));
+    expect(readOpenCodeSessionRuntimeHandleFromMetadata(metadata).managedServerLaunchFingerprint).toBe('b'.repeat(64));
+    expect(metadata.directSessionV1?.agentRuntimeDescriptorV1).toEqual(metadata.agentRuntimeDescriptorV1);
+    await publish('b'.repeat(64), 'server', true);
+    expect(readOpenCodeSessionRuntimeHandleFromMetadata(metadata).managedServerLaunchFingerprint).toBeNull();
+    await publish('b'.repeat(64), 'acp');
+    expect(readOpenCodeSessionRuntimeHandleFromMetadata(metadata).managedServerLaunchFingerprint).toBeNull();
+    expect(metadata.directSessionV1).toBeUndefined();
+    await publish(null);
+    expect(readOpenCodeSessionRuntimeHandleFromMetadata(metadata).managedServerLaunchFingerprint).toBeNull();
+  });
   it('no-ops when session id is missing', async () => {
     const lastPublished = {
       sessionId: null as string | null,

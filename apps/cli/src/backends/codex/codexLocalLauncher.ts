@@ -17,6 +17,8 @@ import { resolveCodexCliInvocation } from './utils/resolveCodexCliInvocation';
 import { delay } from '@/utils/time';
 import { resolveConfiguredCodexHome } from './utils/resolveConfiguredCodexHome';
 import { configuration } from '@/configuration';
+import { findConnectedServiceChildSelection } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
+import { bootstrapCodexTuiHome } from './appServer/bootstrapCodexTuiHome';
 
 import { CodexRolloutMirror } from './localControl/codexRolloutMirror';
 import { discoverCodexRolloutFileOnce } from './localControl/rolloutDiscovery';
@@ -389,6 +391,16 @@ export async function codexLocalLauncher<TMode>(opts: {
     });
 
     const interactive = Boolean(process.stdout.isTTY && process.stdin.isTTY);
+    const childEnv = buildCodexTuiChildEnv();
+    if (findConnectedServiceChildSelection(childEnv, 'openai-codex')) {
+      // Unlike shared control, this native TUI owns a separate disk-auth
+      // process. Initialize its home before exposing cold SQLite/skill state.
+      await bootstrapCodexTuiHome({
+        cwd: opts.path,
+        processEnv: childEnv,
+        codexArgs: opts.codexArgs ?? [],
+      });
+    }
     let bufferedStderr = '';
     const maxBufferedStderrChars = 16_000;
     if (!await opts.session.waitForProviderInputAdmission(new AbortController().signal)) {
@@ -396,7 +408,7 @@ export async function codexLocalLauncher<TMode>(opts: {
     }
     child = spawn(invocation.command, invocation.args, {
       cwd: opts.path,
-      env: buildCodexTuiChildEnv(),
+      env: childEnv,
       stdio: interactive ? 'inherit' : 'pipe',
       windowsHide: true,
       windowsVerbatimArguments: invocation.windowsVerbatimArguments,

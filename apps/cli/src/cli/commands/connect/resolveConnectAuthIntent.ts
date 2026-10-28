@@ -44,6 +44,13 @@ export function resolveConnectAuthIntent(params: Readonly<{
     return { kind: 'oauth', serviceId: 'gemini' };
   }
 
+  if (params.targetId === 'agy') {
+    if (params.options.setupToken || params.options.apiKey) {
+      throw new Error('--setup-token/--api-key is not supported for Antigravity personal accounts. Use the provider OAuth flow instead.');
+    }
+    return { kind: 'oauth', serviceId: 'antigravity' };
+  }
+
   if (params.targetId !== 'claude') {
     throw new Error(`Unsupported connect target: ${params.targetId}`);
   }

@@ -6,6 +6,7 @@ import type { ChatListItem } from '@/components/sessions/chatListItems';
 import { buildTranscriptTurnsCached, isTranscriptTurnsBuildCacheComplete } from './buildTranscriptTurns';
 import type { TranscriptTurnUnitListItem, TranscriptTurnUnitSourceItem } from './buildTranscriptTurnUnits';
 import { buildTranscriptTurnUnits } from './buildTranscriptTurnUnits';
+import { resolveTranscriptViewportAnchorIndex } from '../viewport/entryRestore/transcriptViewportAnchorResolution';
 
 function userMessage(id: string, createdAt: number, seq?: number): UserTextMessage {
     return {
@@ -87,6 +88,32 @@ function collapsedAlways(): boolean {
 }
 
 describe('buildTranscriptTurnUnits', () => {
+    it('preserves tool row identities when filling a history gap splits their group', () => {
+        const chronological: Message[] = [toolMessage('old-question', 1), agentMessage('gap-text', 2), toolMessage('recent-1', 3), toolMessage('recent-2', 4)];
+        const messagesById = indexMessages(chronological);
+        const build = (cache: Parameters<typeof buildTranscriptTurnsCached>[0]['cache'], ids: string[]) => buildTranscriptTurnsCached({
+            cache, messageIdsOldestFirst: ids, messagesById,
+            groupToolCalls: true, toolCallsGroupStrategy: 'consecutive_tools',
+        });
+        const before = build(null, ['old-question', 'recent-1', 'recent-2']);
+        const after = build(before, chronological.map((message) => message.id));
+        const units = (turns: typeof before.turns) => buildTranscriptTurnUnits({
+            items: turns.map((turn) => ({ kind: 'turn' as const, id: turn.id, turn })),
+            getMessageById: lookupIn(messagesById), isGroupExpanded: expandedAlways, collapsedPreviewCount: 2,
+        });
+        const beforeTools = units(before.turns).filter((item) => item.kind === 'tool-group-tool');
+        const afterTools = units(after.turns).filter((item) => item.kind === 'tool-group-tool');
+        expect(afterTools.map((item) => item.id)).toEqual(beforeTools.map((item) => item.id));
+        expect(new Set(units(after.turns).map((item) => item.id)).size).toBe(units(after.turns).length);
+        const afterRows = units(after.turns);
+        const restoredIndex = resolveTranscriptViewportAnchorIndex({
+            anchor: { itemId: 'toolCalls:turn:old-question:old-question#tool:recent-2', messageId: 'recent-2', seq: null },
+            items: afterRows,
+        });
+        expect(restoredIndex).not.toBeNull();
+        expect(restoredIndex === null ? null : afterRows[restoredIndex]).toMatchObject({ kind: 'tool-group-tool', toolMessageId: 'recent-2' });
+    });
+
     it('passes non-turn, non-group items through unchanged by reference', () => {
         const forkDivider: ChatListItem = {
             kind: 'fork-divider',
@@ -156,8 +183,8 @@ describe('buildTranscriptTurnUnits', () => {
             'msg:u1',
             'msg:a1',
             'toolCalls:turn:u1:t1#header',
-            'toolCalls:turn:u1:t1#tool:t1',
-            'toolCalls:turn:u1:t1#tool:t2',
+            'msg:t1',
+            'msg:t2',
             'toolCalls:turn:u1:t1#footer',
         ]);
     });
@@ -295,7 +322,7 @@ describe('buildTranscriptTurnUnits', () => {
             },
             {
                 kind: 'tool-group-tool',
-                id: `${groupId}#tool:t1`,
+                id: `msg:t1`,
                 groupId,
                 toolMessageId: 't1',
                 toolMessageIds: ['t1', 't2', 't3'],
@@ -305,7 +332,7 @@ describe('buildTranscriptTurnUnits', () => {
             },
             {
                 kind: 'tool-group-tool',
-                id: `${groupId}#tool:t2`,
+                id: `msg:t2`,
                 groupId,
                 toolMessageId: 't2',
                 toolMessageIds: ['t1', 't2', 't3'],
@@ -315,7 +342,7 @@ describe('buildTranscriptTurnUnits', () => {
             },
             {
                 kind: 'tool-group-tool',
-                id: `${groupId}#tool:t3`,
+                id: `msg:t3`,
                 groupId,
                 toolMessageId: 't3',
                 toolMessageIds: ['t1', 't2', 't3'],
@@ -357,8 +384,8 @@ describe('buildTranscriptTurnUnits', () => {
         expect(result.map((item) => item.id)).toEqual([
             `${groupId}#header`,
             `${groupId}#expand`,
-            `${groupId}#tool:t3`,
-            `${groupId}#tool:t4`,
+            `msg:t3`,
+            `msg:t4`,
             `${groupId}#footer`,
         ]);
         expect(result[0]).toMatchObject({ kind: 'tool-group-header', expanded: false, hiddenCount: 2 });
@@ -393,9 +420,8 @@ describe('buildTranscriptTurnUnits', () => {
             isGroupExpanded: collapsedAlways,
             collapsedPreviewCount: 0,
         });
-        expect(noTail.map((item) => item.kind)).toEqual(['tool-group-header', 'tool-group-expand', 'tool-group-footer']);
+        expect(noTail.map((item) => item.kind)).toEqual(['tool-group-header', 'tool-group-footer']);
         expect(noTail[0]).toMatchObject({ hiddenCount: 3 });
-        expect(noTail[1]).toMatchObject({ hiddenCount: 3 });
 
         const negative = buildTranscriptTurnUnits({
             items,
@@ -403,7 +429,7 @@ describe('buildTranscriptTurnUnits', () => {
             isGroupExpanded: collapsedAlways,
             collapsedPreviewCount: -4,
         });
-        expect(negative.map((item) => item.kind)).toEqual(['tool-group-header', 'tool-group-expand', 'tool-group-footer']);
+        expect(negative.map((item) => item.kind)).toEqual(['tool-group-header', 'tool-group-footer']);
 
         const fractional = buildTranscriptTurnUnits({
             items,
@@ -435,8 +461,8 @@ describe('buildTranscriptTurnUnits', () => {
 
         expect(result.map((item) => item.id)).toEqual([
             `${groupId}#header`,
-            `${groupId}#tool:t1`,
-            `${groupId}#tool:t2`,
+            `msg:t1`,
+            `msg:t2`,
             `${groupId}#footer`,
         ]);
         expect(result[0]).toMatchObject({ kind: 'tool-group-header', expanded: false, hiddenCount: 0 });
@@ -482,11 +508,11 @@ describe('buildTranscriptTurnUnits', () => {
 
         expect(result.map((item) => item.id)).toEqual([
             'toolCalls:turn:x:t1#header',
-            'toolCalls:turn:x:t1#tool:t1',
+            'msg:t1',
             'toolCalls:turn:x:t1#footer',
             'msg:a1',
             'toolCalls:turn:x:t2#header',
-            'toolCalls:turn:x:t2#tool:t2',
+            'msg:t2',
             'toolCalls:turn:x:t2#footer',
         ]);
     });
@@ -625,9 +651,9 @@ describe('buildTranscriptTurnUnits', () => {
         // The single new row is the new tool, inserted before the footer.
         expect(afterIds).toEqual([
             'toolCalls:turn:x:t1#header',
-            'toolCalls:turn:x:t1#tool:t1',
-            'toolCalls:turn:x:t1#tool:t2',
-            'toolCalls:turn:x:t1#tool:t3',
+            'msg:t1',
+            'msg:t2',
+            'msg:t3',
             'toolCalls:turn:x:t1#footer',
         ]);
     });
@@ -650,20 +676,20 @@ describe('buildTranscriptTurnUnits', () => {
         expect(before.map((item) => item.id)).toEqual([
             'toolCalls:turn:x:t1#header',
             'toolCalls:turn:x:t1#expand',
-            'toolCalls:turn:x:t1#tool:t3',
-            'toolCalls:turn:x:t1#tool:t4',
+            'msg:t3',
+            'msg:t4',
             'toolCalls:turn:x:t1#footer',
         ]);
         expect(after.map((item) => item.id)).toEqual([
             'toolCalls:turn:x:t1#header',
             'toolCalls:turn:x:t1#expand',
-            'toolCalls:turn:x:t1#tool:t4',
-            'toolCalls:turn:x:t1#tool:t5',
+            'msg:t4',
+            'msg:t5',
             'toolCalls:turn:x:t1#footer',
         ]);
         // The surviving tail row keeps the exact same id in both builds.
-        expect(before.map((item) => item.id)).toContain('toolCalls:turn:x:t1#tool:t4');
-        expect(after.map((item) => item.id)).toContain('toolCalls:turn:x:t1#tool:t4');
+        expect(before.map((item) => item.id)).toContain('msg:t4');
+        expect(after.map((item) => item.id)).toContain('msg:t4');
         const expandBefore = before.find((item) => item.kind === 'tool-group-expand');
         const expandAfter = after.find((item) => item.kind === 'tool-group-expand');
         expect(expandBefore?.id).toBe(expandAfter?.id);
@@ -692,7 +718,7 @@ describe('buildTranscriptTurnUnits', () => {
 
         const collapsedToolIds = collapsed.flatMap((item) => item.kind === 'tool-group-tool' ? [item.id] : []);
         const expandedToolIds = expanded.flatMap((item) => item.kind === 'tool-group-tool' ? [item.id] : []);
-        expect(collapsedToolIds).toEqual(['toolCalls:turn:x:t1#tool:t3']);
+        expect(collapsedToolIds).toEqual(['msg:t3']);
         // The collapsed preview-tail row has the SAME id as its expanded body row.
         expect(expandedToolIds).toContain(collapsedToolIds[0]!);
     });
@@ -744,13 +770,13 @@ describe('buildTranscriptTurnUnits', () => {
             expect(afterIds).toContain(id);
         }
         // The merged group kept the sticky id, so t2/t3 rows kept their exact keys...
-        expect(afterIds).toContain('toolCalls:turn:t2:t2#tool:t2');
-        expect(afterIds).toContain('toolCalls:turn:t2:t2#tool:t3');
+        expect(afterIds).toContain('msg:t2');
+        expect(afterIds).toContain('msg:t3');
         // ...and the prepended tool appears as a NEW row above t2 under the same group id.
-        const t1Index = afterIds.indexOf('toolCalls:turn:t2:t2#tool:t1');
-        const t2Index = afterIds.indexOf('toolCalls:turn:t2:t2#tool:t2');
+        const t1Index = afterIds.indexOf('msg:t1');
+        const t2Index = afterIds.indexOf('msg:t2');
         expect(t1Index).toBeGreaterThanOrEqual(0);
-        expect(beforeIds).not.toContain('toolCalls:turn:t2:t2#tool:t1');
+        expect(beforeIds).not.toContain('msg:t1');
         expect(t1Index).toBeLessThan(t2Index);
     });
 });

@@ -47,6 +47,7 @@ function createDeps(overrides: Partial<BugReportCommandDependencies> = {}): BugR
     searchSimilarIssues: async () => ({ issues: [] }),
     isInteractiveTerminal: () => false,
     promptInput: async () => '',
+    writeExportFile: async () => {},
     ...overrides,
   };
 }

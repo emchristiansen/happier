@@ -14,7 +14,10 @@ import { useAllSessions, useSessionListViewDataByServerId, useSessionOrganizatio
 import type { Session } from '@/sync/domains/state/storageTypes';
 import type { SessionListRenderableSession } from '@/sync/domains/session/listing/sessionListRenderable';
 import { getSessionAvatarId, getSessionName, getSessionSubtitle } from '@/utils/sessions/sessionUtils';
-import { sessionUnarchiveWithServerScope } from '@/sync/ops';
+import { executeSessionAction } from '@/components/sessions/actions/sessionActionExecution';
+import { createSessionActionTarget } from '@/components/sessions/actions/sessionActionContext';
+import { SESSION_ACTION_UNARCHIVE_ID } from '@/components/sessions/actions/sessionActionIds';
+import { fireAndForget } from '@/utils/system/fireAndForget';
 import { sync } from '@/sync/sync';
 import { Icon } from '@/components/ui/icons/Icon';
 import { useIsFocused } from '@react-navigation/native';
@@ -267,23 +270,13 @@ export default function ArchivedSessionsScreen() {
             ? session.serverId.trim()
             : null;
 
-        Modal.alert(
-            t('sessionInfo.unarchiveSession'),
-            t('sessionInfo.unarchiveSessionConfirm'),
-            [
-                { text: t('common.cancel'), style: 'cancel' },
-                {
-                    text: t('sessionInfo.unarchiveSession'),
-                    style: 'default',
-                    onPress: async () => {
-                        const result = await sessionUnarchiveWithServerScope(session.id, { serverId });
-                        if (!result.success) {
-                            Modal.alert(t('common.error'), result.message || t('sessionInfo.failedToUnarchiveSession'));
-                        }
-                    },
-                },
-            ],
-        );
+        fireAndForget(executeSessionAction({
+            actionId: SESSION_ACTION_UNARCHIVE_ID,
+            target: createSessionActionTarget({ session, serverId, isConnected: true }),
+        }), {
+            tag: 'ArchivedSessions.unarchive',
+            onError: (error) => Modal.alert(t('common.error'), error instanceof Error ? error.message : t('sessionInfo.failedToUnarchiveSession')),
+        });
     }, []);
 
     const renderItem = React.useCallback(

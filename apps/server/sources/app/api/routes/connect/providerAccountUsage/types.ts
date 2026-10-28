@@ -1,5 +1,7 @@
 import type {
     ConnectedServiceQuotaSnapshotV1,
+    ConnectedServiceQuotaRecoveryCreditDetailsByIdV1,
+    ProviderAccountSubscriptionV1,
     ConnectedServiceUsageSourceV1,
     ProviderAccountUsageRecordId,
     ProviderAccountUsageRecordKeyV1,
@@ -11,6 +13,8 @@ export type ProviderAccountUsagePayloadMode = "plain_json_v1" | "sealed_account_
 export type ProviderAccountUsageStatus = "ok" | "unavailable" | "estimated" | "error" | "refresh_requested";
 export type ProviderAccountUsageRecordMetadata = Readonly<{
     materialFingerprint?: string;
+    subscription?: ProviderAccountSubscriptionV1;
+    recoveryCreditDetails?: ConnectedServiceQuotaRecoveryCreditDetailsByIdV1;
 }>;
 
 export type UpsertProviderAccountUsageRecordParams = Readonly<{

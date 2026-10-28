@@ -404,6 +404,11 @@ function isPersistedReplica(value: unknown): value is PersistedReplica {
     return Boolean(candidate.address && candidate.localRawDocument && Array.isArray(candidate.pendingFieldMutations));
 }
 
+// The new-session list projection reads only newSession replicas; other kinds never change it.
+function isNewSessionListAddress(address: SessionDraftAddressV1): boolean {
+    return address.kind === 'newSession';
+}
+
 function normalizeNewSessionDraftId(value: unknown): string | null {
     const parsed = SessionDraftAddressV1Schema.safeParse({ kind: 'newSession', draftId: value });
     return parsed.success && parsed.data.kind === 'newSession' ? parsed.data.draftId : null;
@@ -549,8 +554,9 @@ export class SessionDraftRepository {
         const state = this.scopeStates.get(scopeKey);
         if (!state || Boolean(state.persistenceError) === failed) return;
         state.persistenceError = failed;
-        this.newListProjectionCache.delete(scopeKey);
-        this.notifyBatch(scope, [...state.replicas.values()].map((replica) => replica.address));
+        const addresses = [...state.replicas.values()].map((replica) => replica.address);
+        if (addresses.some(isNewSessionListAddress)) this.newListProjectionCache.delete(scopeKey);
+        this.notifyBatch(scope, addresses);
     }
 
     private async flushStorage(scope: SessionDraftRepositoryScope): Promise<void> {
@@ -568,16 +574,17 @@ export class SessionDraftRepository {
     }
 
     private notify(scope: SessionDraftRepositoryScope, address: SessionDraftAddressV1): void {
-        const listenerKey = this.replicaListenerKey(scope, address);
-        for (const listener of this.listeners.get(listenerKey) ?? []) listener();
-        for (const listener of this.listListeners.get(this.scopeKey(scope)) ?? []) listener();
+        this.notifyBatch(scope, [address]);
     }
 
     private notifyBatch(scope: SessionDraftRepositoryScope, addresses: Iterable<SessionDraftAddressV1>): void {
+        let newSessionListChanged = false;
         for (const address of addresses) {
             const listenerKey = this.replicaListenerKey(scope, address);
             for (const listener of this.listeners.get(listenerKey) ?? []) listener();
+            newSessionListChanged ||= isNewSessionListAddress(address);
         }
+        if (!newSessionListChanged) return;
         for (const listener of this.listListeners.get(this.scopeKey(scope)) ?? []) listener();
     }
 
@@ -615,7 +622,7 @@ export class SessionDraftRepository {
 
     private writeReplica(scope: SessionDraftRepositoryScope, replica: PersistedReplica): void {
         this.getScopeState(scope).replicas.set(canonicalSessionDraftAddressV1(replica.address), replica);
-        this.newListProjectionCache.delete(this.scopeKey(scope));
+        if (isNewSessionListAddress(replica.address)) this.newListProjectionCache.delete(this.scopeKey(scope));
         if (this.recordMutation(scope, replica.address)) return;
         this.persist(scope);
         this.notify(scope, replica.address);
@@ -637,7 +644,7 @@ export class SessionDraftRepository {
             && state.ordinaryEntryDraftId === address.draftId;
         if (clearedOrdinaryEntryPointer) state.ordinaryEntryDraftId = null;
         if (!deleted && !clearedOrdinaryEntryPointer) return;
-        this.newListProjectionCache.delete(this.scopeKey(scope));
+        if (deleted && isNewSessionListAddress(address)) this.newListProjectionCache.delete(this.scopeKey(scope));
         if (deleted && this.recordMutation(scope, address)) return;
         this.persist(scope);
         if (deleted) this.notify(scope, address);
@@ -956,29 +963,30 @@ export class SessionDraftRepository {
         return true;
     }
 
-    async deleteSessionDraft(params: Readonly<{ scope: SessionDraftRepositoryScope; address: SessionDraftAddressV1 }>): Promise<void> {
+    async deleteSessionDraft(params: Readonly<{ scope: SessionDraftRepositoryScope; address: SessionDraftAddressV1 }>): Promise<boolean> {
         if (this.storage.prepare) await this.storage.prepare();
         const replica = this.readReplica(params.scope, params.address);
-        if (!replica) return;
+        if (!replica) return false;
         const runtime = this.syncRuntime(params.scope);
         if (!runtime) {
-            if (this.runtime.syncEnabled) return;
+            if (this.runtime.syncEnabled) return false;
             this.deleteReplica(params.scope, params.address);
             if (this.storage.flush) await this.flushStorage(params.scope);
-            return;
+            return true;
         }
         const result = await runtime.transport.mutate({
             address: params.address,
             expectedRevision: replica.baseRevision,
             content: null,
         });
-        if (!this.isCurrentRuntime(runtime)) return;
+        if (!this.isCurrentRuntime(runtime)) return false;
         if (result.status === 'updated') {
             this.deleteReplica(params.scope, params.address);
         } else {
             await this.materializeExact(params.scope, params.address);
         }
         if (this.storage.flush) await this.flushStorage(params.scope);
+        return result.status === 'updated';
     }
 
     flushSessionDraft(params: Readonly<{ scope: SessionDraftRepositoryScope; address: SessionDraftAddressV1 }>): Promise<SessionDraftFlushResult> {
@@ -1243,6 +1251,7 @@ export class SessionDraftRepository {
                 remoteDocument = await this.openRequiredDocument(runtime, response.record);
             } catch (error) {
                 if (!this.isCurrentRuntime(runtime)) return;
+                if (isSessionDraftContextUnavailableError(error)) throw error;
                 this.writeLatestReplicaStatus(scope, address, 'error');
                 throw error;
             }

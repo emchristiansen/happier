@@ -177,11 +177,6 @@
             10 ratings is also below the threshold at which Google shows stars at
             all. Add it only once real, visible, user-submitted reviews live on
             this page.
-          * Google Play. play.google.com/store/apps/details?id=dev.happier answers
-            HTTP 404 (verified) — there is no listing. A downloadUrl to a 404 is a
-            broken-link signal and misleads the 762 Android visitors PostHog saw in
-            90 days. The Android build is therefore declared against its real
-            artifact, the GitHub release APK.
           * FAQPage. Google restricted FAQ rich results to authoritative
             government/health sites in 2023 and deprecated the feature outright on
             2026-05-07 — the markup is no longer used for search results at all,
@@ -217,7 +212,8 @@
                             "https://github.com/happier-dev",
                             "https://github.com/happier-dev/happier",
                             "https://discord.gg/W6Pb8KuHfg",
-                            "https://apps.apple.com/us/app/happier-claude-codex-opencode/id6758554297"
+                            "https://apps.apple.com/us/app/happier-claude-codex-opencode/id6758554297",
+                            "https://play.google.com/store/apps/details?id=dev.happier.app"
                         ]
                     },
                     {
@@ -235,7 +231,7 @@
                         "alternateName": "Happier: Claude Codex OpenCode",
                         "applicationCategory": "DeveloperApplication",
                         "applicationSubCategory": "AI coding agent client",
-                        "operatingSystem": "iOS 15.1+, macOS, Windows, Linux, Web",
+                        "operatingSystem": "iOS 15.1+, Android, macOS, Windows, Linux, Web",
                         "url": "https://happier.dev/",
                         "downloadUrl": "https://happier.dev/#get-started",
                         "installUrl": "https://happier.dev/#get-started",
@@ -271,8 +267,8 @@
                         "name": "Happier for Android",
                         "applicationCategory": "DeveloperApplication",
                         "operatingSystem": "Android",
-                        "url": "https://github.com/happier-dev/happier/releases",
-                        "downloadUrl": "https://github.com/happier-dev/happier/releases/download/ui-mobile-stable/happier-android.apk",
+                        "url": "https://play.google.com/store/apps/details?id=dev.happier.app",
+                        "downloadUrl": "https://play.google.com/store/apps/details?id=dev.happier.app",
                         "isAccessibleForFree": true,
                         "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
                         "publisher": { "@id": "https://happier.dev/#org" }

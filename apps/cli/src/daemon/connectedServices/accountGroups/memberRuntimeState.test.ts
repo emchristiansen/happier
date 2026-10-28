@@ -15,20 +15,59 @@ import {
 } from './memberRuntimeState';
 
 describe('buildObservedFailureMemberRuntimeState', () => {
-  it('cools down a plan-incompatible permission failure as plan unavailable without requiring reauthentication', () => {
+  it('cools down an unsupported ChatGPT model for 24 hours without blocking other models', () => {
     expect(buildObservedFailureMemberRuntimeState({
       existing: null,
       policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, cooldownMs: 45_000 },
-      reason: 'permission_denied',
+      reason: 'plan',
       limitCategory: 'plan_invalid',
+      quotaScope: 'model',
+      providerLimitId: 'gpt-5.6-sol',
       retryAtMs: null,
       planType: null,
       observedAtMs: 1_000,
     })).toEqual({
-      lastFailureKind: 'permission_denied',
+      lastFailureKind: 'plan',
+      lastFailureCode: 'model_not_entitled',
       lastObservedAtMs: 1_000,
-      planUnavailableUntilMs: 46_000,
+      modelUnavailableUntilMsByModelId: {
+        'gpt-5.6-sol': 86_401_000,
+      },
     });
+  });
+
+  it('marks the exact model-entitlement failure for persistent disable when the pool opts in', () => {
+    expect(buildObservedFailureMemberRuntimeState({
+      existing: null,
+      policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, autoDisablePlanInvalidAccounts: true },
+      reason: 'plan',
+      limitCategory: 'plan_invalid',
+      quotaScope: 'model',
+      providerLimitId: 'gpt-5.6-sol',
+      retryAtMs: null,
+      planType: null,
+      observedAtMs: 1_000,
+    })).toMatchObject({
+      autoDisabledReason: 'model_not_entitled',
+      lastFailureCode: 'model_not_entitled',
+    });
+  });
+
+  it('gives generic plan-invalid failures a 24-hour account cooldown without auto-disabling', () => {
+    const state = buildObservedFailureMemberRuntimeState({
+      existing: null,
+      policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, autoDisablePlanInvalidAccounts: true },
+      reason: 'permission_denied',
+      limitCategory: 'plan_invalid',
+      quotaScope: 'provider',
+      providerLimitId: null,
+      retryAtMs: null,
+      planType: null,
+      observedAtMs: 1_000,
+    });
+
+    expect(state).toMatchObject({ planUnavailableUntilMs: 86_401_000 });
+    expect(state).not.toHaveProperty('autoDisabledReason');
   });
 });
 
@@ -332,5 +371,29 @@ describe('reconcileMemberRuntimeStateWithPositiveEvidence', () => {
       rateLimitedUntilMs: 10_000,
       validationBlockedUntilMs: 10_000,
     });
+  });
+
+  it('lets current quota evidence supersede a failure timestamp poisoned by a future clock', () => {
+    expect(reconcileMemberRuntimeStateWithFreshQuotaEvidence({
+      state: {
+        lastFailureKind: 'usage_limit',
+        lastObservedAtMs: 100_000,
+        quotaExhaustedUntilMs: 200_000,
+      },
+      quotaSnapshot: {
+        capturedAtMs: 10_000,
+        effectiveMeterId: 'weekly',
+        effectiveRemainingPercent: 80,
+        meters: [{
+          meterId: 'weekly',
+          limitCategory: 'usage_limit',
+          remainingPct: 80,
+          resetAtMs: null,
+          providerLimitId: 'weekly',
+        }],
+      },
+      policy: DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1,
+      nowMs: 10_000,
+    })).toEqual({});
   });
 });

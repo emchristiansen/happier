@@ -29,6 +29,11 @@ any machine, without wondering whether it will restart something mid-session.
   whether an update is waiting, and whether a running daemon was built from a
   different version than the CLI you just invoked.
 
+Agent readiness is a separate final check. Confirm that at least one agent CLI
+runs on this computer, then complete that agent's own authentication. A healthy
+account, relay registration and background service make the computer
+reachable; they do not by themselves make it ready to code.
+
 It reports 27 distinct problems in those areas. Most are things you would never
 guess at: a background service left over from a channel you switched away from,
 two startup entries fighting over the same relay, a daemon still running from an

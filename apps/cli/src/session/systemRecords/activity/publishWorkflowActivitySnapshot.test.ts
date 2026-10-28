@@ -53,6 +53,45 @@ function runSnapshotWithAgents(params: Readonly<{ runId: string }>): SessionWork
 }
 
 describe('createWorkflowActivityPublisher', () => {
+  it('does not republish unchanged committed headlines on failed record retries, and publishes recovery', async () => {
+    let available = false;
+    const commitRecord = vi.fn<CommitRecord>(async () => {
+      if (!available) throw createHttpStatusError(500, 'Unavailable');
+    });
+    const writeHeadlines = vi.fn<WriteHeadlines>(async () => {});
+    let timestamp = 1000;
+    const publisher = createWorkflowActivityPublisher({
+      commitRecord, writeHeadlines, backendId: 'claude', now: () => timestamp++,
+    });
+    const input = { snapshots: new Map([['a', runSnapshot({ runId: 'a' })]]), changedRunIds: ['a'] };
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      expect((await publisher.publish(input)).failedRunIds).toEqual(['a']);
+    }
+    expect(writeHeadlines).toHaveBeenCalledTimes(1);
+    expect(writeHeadlines.mock.calls[0]?.[0].workflow.activeRuns).toEqual([]);
+
+    available = true;
+    await publisher.publish(input);
+    expect(writeHeadlines).toHaveBeenCalledTimes(2);
+    expect(writeHeadlines.mock.calls[1]?.[0].workflow.activeRuns[0]).toMatchObject({ runId: 'a', recordRevision: '1' });
+  });
+
+  it('retries a failed headline write even when the committed record has not changed', async () => {
+    const commitRecord = vi.fn<CommitRecord>(async () => {});
+    const writeHeadlines = vi.fn<WriteHeadlines>()
+      .mockRejectedValueOnce(createHttpStatusError(503, 'Unavailable'))
+      .mockResolvedValue(undefined);
+    const publisher = createWorkflowActivityPublisher({ commitRecord, writeHeadlines, backendId: 'claude' });
+    const input = { snapshots: new Map([['a', runSnapshot({ runId: 'a' })]]), changedRunIds: ['a'] };
+
+    await expect(publisher.publish(input)).rejects.toMatchObject({ response: { status: 503 } });
+    await publisher.publish(input);
+    expect(commitRecord).toHaveBeenCalledTimes(1);
+    expect(writeHeadlines).toHaveBeenCalledTimes(2);
+    expect(writeHeadlines.mock.calls[1]?.[0].workflow.activeRuns[0]).toMatchObject({ runId: 'a' });
+  });
+
   it('writes the durable record FIRST, then the headline SECOND', async () => {
     const order: string[] = [];
     const commitRecord = vi.fn<CommitRecord>(async () => { order.push('record'); });

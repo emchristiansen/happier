@@ -1,6 +1,6 @@
 import { InvalidateSync } from "@/utils/sync";
 import { RawJSONLines } from "../types";
-import { parseClaudeTaskNotificationXml } from '../taskNotifications/claudeTaskNotificationXml';
+import { createClaudeTaskNotificationToolResultProjector, readClaudeTaskLifecycleEnvelope } from '../taskNotifications/claudeTaskLifecycleEnvelope';
 import { dirname, join } from "node:path";
 import { watch, type FSWatcher } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
@@ -16,7 +16,7 @@ import { createEventShapeLoggerForLog } from '@/diagnostics/eventShapeForLog';
 import { buildClaudeJsonlMessageKey } from './claudeJsonlMessageKey';
 import { createJsonlFollowController, type JsonlFollowController } from '@/agent/localControl/jsonlFollowController';
 import type { JsonlFollowerMetricEvent } from '@/agent/localControl/jsonlFollowMetrics';
-import { INTERNAL_CLAUDE_EVENT_TYPES } from './internalClaudeEventTypes';
+import { providers } from '@happier-dev/agents';
 import { parseRawJsonLinesObject } from './parseRawJsonLines';
 import { isClaudeInternalTranscriptMessage } from './isClaudeInternalTranscriptMessage';
 import {
@@ -69,6 +69,8 @@ export async function createSessionScanner(opts: {
     initialProcessedMessageKeys?: Iterable<string>
     /** Replay initial transcript rows instead of treating the whole file as already processed. */
     replayInitialMessages?: boolean
+    /** Byte boundary captured before resume baseline loading; later initial-snapshot rows are live. */
+    initialLiveTranscriptStartOffsetBytes?: number
     /**
      * Replay-coverage cutoff (Lane N4): one-time session SNAPSHOT rows older than this timestamp
      * (or without a parseable timestamp) are marked processed without being emitted — they
@@ -164,7 +166,7 @@ export async function createSessionScanner(opts: {
     let projectDirWatcher: FSWatcher | null = null;
     let watchedProjectDir: string | null = null;
     let processedMessageKeys = new Set<string>(opts.initialProcessedMessageKeys ?? []);
-    const taskToolUseIdByAgentId = new Map<string, string>();
+    const taskNotificationProjector = createClaudeTaskNotificationToolResultProjector();
     let invalidate: (() => void) | null = null;
     const discoveredSessions = new Set<string>();
     const resetReplaySuppressorBySession = new Map<string, ClaudeJsonlResetReplaySuppressor>();
@@ -174,6 +176,10 @@ export async function createSessionScanner(opts: {
     const trustedRawTranscriptSessionIds = new Set<string>();
     if (opts.sessionId) trustedRawTranscriptSessionIds.add(opts.sessionId);
     let closed = false;
+    const initialLiveTranscriptStartOffsets = new Map<string, number>();
+    if (opts.sessionId && opts.initialLiveTranscriptStartOffsetBytes !== undefined) {
+        initialLiveTranscriptStartOffsets.set(opts.sessionId, opts.initialLiveTranscriptStartOffsetBytes);
+    }
 
     function observeRawJsonlValue(
         value: unknown,
@@ -319,6 +325,10 @@ export async function createSessionScanner(opts: {
                 // the scanner binding after classification completes.
                 if (!isMainSessionAllowed(sessionId)) continue;
                 trustRawTranscriptSession(sessionId);
+                // Discovery excludes files present at startup. This newly created, exactly
+                // identified main transcript is live from its first row; import it in order
+                // before allowing its prompt evidence to settle Pending.
+                initialLiveTranscriptStartOffsets.set(sessionId, 0);
                 opts.onDiscoveredMainSession?.({ filePath, sessionId });
             }
             discoveredSessions.add(sessionId);
@@ -382,88 +392,13 @@ export async function createSessionScanner(opts: {
         },
     });
 
-    function isTaskNotificationUserText(message: RawJSONLines): boolean {
-        if (message.type !== 'user') return false;
-        if ((message as any).isSidechain === true) return false;
-        const content = (message as any)?.message?.content;
-        if (typeof content !== 'string') return false;
-        return /^\s*<task-notification>/i.test(content);
-    }
-
-    function extractTaskNotification(payload: string): Readonly<{
-        taskId: string;
-        toolUseId: string | null;
-        status: string | null;
-        result: string;
-    }> | null {
-        const parsed = parseClaudeTaskNotificationXml(payload);
-        if (!parsed?.taskId || !parsed.result) return null;
-        return {
-            taskId: parsed.taskId,
-            toolUseId: parsed.toolUseId,
-            status: parsed.status,
-            result: parsed.result,
-        };
-    }
-
-    function observeTaskToolResultMapping(message: RawJSONLines): void {
-        if (message.type !== 'user') return;
-        const toolUseResult = (message as any).toolUseResult;
-        if (!toolUseResult || typeof toolUseResult !== 'object') return;
-        const agentId =
-            typeof (toolUseResult as any).agentId === 'string' ? String((toolUseResult as any).agentId).trim() : '';
-        if (!agentId) return;
-
-        const content = (message as any)?.message?.content;
-        if (!Array.isArray(content)) return;
-        for (const item of content) {
-            if (!item || typeof item !== 'object') continue;
-            if ((item as any).type !== 'tool_result') continue;
-            const toolUseId = readNonBlankOpaqueIdentifier((item as any).tool_use_id) ?? '';
-            if (!toolUseId) continue;
-            taskToolUseIdByAgentId.set(agentId, toolUseId);
-        }
-    }
-
     type TaskNotificationAction = { type: 'rewrite'; message: RawJSONLines } | { type: 'drop' };
 
     function rewriteTaskNotificationToToolResult(message: RawJSONLines): TaskNotificationAction | null {
-        if (!isTaskNotificationUserText(message)) return null;
-        const content = String((message as any).message.content ?? '');
-        const parsed = extractTaskNotification(content);
-        if (!parsed) return { type: 'drop' };
-
-        const toolUseId = parsed.toolUseId ?? taskToolUseIdByAgentId.get(parsed.taskId) ?? null;
-        if (!toolUseId) {
-            // If we can't map the task-id to a Task tool_use, drop it to avoid transcript spam.
-            return { type: 'drop' };
-        }
-
-        return { type: 'rewrite', message: {
-            ...(message as any),
-            isMeta: true,
-            origin: {
-                ...((message as any).origin && typeof (message as any).origin === 'object'
-                    ? (message as any).origin
-                    : {}),
-                kind: 'task-notification',
-                taskId: parsed.taskId,
-                toolUseId,
-                ...(parsed.status ? { status: parsed.status } : {}),
-            },
-            type: 'user',
-            message: {
-                role: 'user',
-                content: [
-                    {
-                        type: 'tool_result',
-                        tool_use_id: toolUseId,
-                        content: [{ type: 'text', text: parsed.result }],
-                        is_error: false,
-                    },
-                ],
-            },
-        } as any };
+        if (message.isSidechain === true) return null;
+        const fact = readClaudeTaskLifecycleEnvelope(message);
+        const projected = taskNotificationProjector.project(message);
+        return projected ? { type: 'rewrite', message: projected } : fact?.subtype === 'task_notification' ? { type: 'drop' } : null;
     }
 
     // If the caller already knows the transcript path for the initial session,
@@ -483,7 +418,7 @@ export async function createSessionScanner(opts: {
         let messages = await readClaudeSessionJsonlMessages({
             sessionFilePath: getSessionFilePath(opts.sessionId),
             logLabel: 'SESSION_SCANNER',
-            onJsonValue: (value) => observeReplayableRawJsonlValueForTrustedSession(
+            onJsonValue: opts.replayInitialMessages ? undefined : (value) => observeReplayableRawJsonlValueForTrustedSession(
                 opts.sessionId!,
                 value,
                 initialReplayOpts,
@@ -493,7 +428,7 @@ export async function createSessionScanner(opts: {
         for (let m of messages) {
             // Observe history for sidechain import + task-notification mapping, even when we do not replay history.
             try {
-                observeTaskToolResultMapping(m);
+                if (!opts.replayInitialMessages) taskNotificationProjector.project(m);
                 subagentCollector.observe(m as any);
                 teamInboxCollector.observe(m as any);
             } catch (err) {
@@ -527,9 +462,10 @@ export async function createSessionScanner(opts: {
     }
 
     function parseClaudeJsonlValue(value: unknown): RawJSONLines | null {
-        const type = typeof (value as any)?.type === 'string' ? String((value as any).type) : '';
-        if (type && INTERNAL_CLAUDE_EVENT_TYPES.has(type)) return null;
         const parsed = parseRawJsonLinesObject(value);
+        const type = parsed?.type ?? (typeof (value as any)?.type === 'string' ? String((value as any).type) : '');
+        if (providers.claude.isClaudeInternalEventType(type)
+            && readClaudeTaskLifecycleEnvelope(value)?.subtype !== 'task_notification') return null;
         return parsed ? normalizeClaudeToolUseNamesInRawJsonLines(parsed) : null;
     }
 
@@ -558,13 +494,13 @@ export async function createSessionScanner(opts: {
             return false;
         }
         try {
-            observeTaskToolResultMapping(file);
             subagentCollector.observe(file as any);
             teamInboxCollector.observe(file as any);
         } catch (err) {
             logger.debug('[SESSION_SCANNER] Failed observing message:', err);
         }
-        if (isClaudeInternalTranscriptMessage(file)) {
+        if (isClaudeInternalTranscriptMessage(file)
+            && (file.isSidechain === true || readClaudeTaskLifecycleEnvelope(file)?.subtype !== 'task_notification')) {
             return false;
         }
         const key = messageKey(file);
@@ -633,27 +569,31 @@ export async function createSessionScanner(opts: {
             suppressBeforeMs: opts.replaySuppressRowsBeforeMs ?? null,
             suppressSideEffects: true,
         };
-        const sessionMessages = await readClaudeSessionJsonlMessages({
+        const liveStartOffsetBytes = initialLiveTranscriptStartOffsets.get(session);
+        const rows: Array<Readonly<{ value: unknown; lineStartOffsetBytes: number }>> = [];
+        await readClaudeSessionJsonlMessages({
             sessionFilePath: getSessionFilePath(session),
             logLabel: 'SESSION_SCANNER',
-            onJsonValue: (value) => observeReplayableRawJsonlValueForTrustedSession(
-                session,
-                value,
-                replayOpts,
-            ),
+            onJsonValue: (value, source) => { rows.push({ value, ...source }); },
         });
         if (closed) return startOffsetBytes;
         let skipped = 0;
         let sent = 0;
-        for (const file of sessionMessages) {
+        for (const row of rows) {
             if (!isMainSessionAllowed(session)) break;
-            if (await processSessionMessage(normalizeClaudeToolUseNamesInRawJsonLines(file), replayOpts)) sent += 1;
+            // Leave startup appends to the one live follower, beginning at the captured boundary.
+            // It observes raw queue evidence only after prior visible messages have committed.
+            if (liveStartOffsetBytes !== undefined && row.lineStartOffsetBytes >= liveStartOffsetBytes) continue;
+            observeReplayableRawJsonlValueForTrustedSession(session, row.value, replayOpts);
+            const parsed = parseClaudeJsonlValue(row.value);
+            if (parsed && await processSessionMessage(parsed, replayOpts)) sent += 1;
             else skipped += 1;
         }
-        if (sessionMessages.length > 0) {
-            logger.debug(`[SESSION_SCANNER] Session ${session}: found=${sessionMessages.length}, skipped=${skipped}, sent=${sent}`);
+        if (rows.length > 0) {
+            logger.debug(`[SESSION_SCANNER] Session ${session}: found=${rows.length}, skipped=${skipped}, sent=${sent}`);
         }
-        return startOffsetBytes;
+        initialLiveTranscriptStartOffsets.delete(session);
+        return liveStartOffsetBytes === undefined ? startOffsetBytes : Math.min(startOffsetBytes, liveStartOffsetBytes);
     }
 
     async function ensureSessionFollower(session: string): Promise<void> {

@@ -326,28 +326,28 @@ export async function collectBugReportDiagnosticsArtifacts(
       if (credentialsToken) {
         diagnosticsCollection.serverDiagnostics = { status: 'skipped', detail: 'server diagnostics endpoint unavailable' };
         const lines = resolveBugReportServerDiagnosticsLines(input.contextWindowMs);
-        const response = await withAbortTimeout(6_000, async (signal) =>
-          await fetch(`${normalizeBaseUrl(input.serverUrl)}/v1/diagnostics/bug-report-snapshot?lines=${lines}`, {
+        await withAbortTimeout(6_000, async (signal) => {
+          const response = await fetch(`${normalizeBaseUrl(input.serverUrl)}/v1/diagnostics/bug-report-snapshot?lines=${lines}`, {
             method: 'GET',
             headers: {
               Authorization: `Bearer ${credentialsToken}`,
             },
             signal,
-          }),
-        );
-        if (response.ok) {
-          pushBugReportArtifact(artifacts, {
-            filename: 'server-diagnostics.json',
-            sourceKind: 'server',
-            contentType: 'application/json',
-            content: await response.text(),
-          }, limits);
-          diagnosticsCollection.serverDiagnostics = { status: 'collected' };
-        } else if (response.status === 404) {
-          diagnosticsCollection.serverDiagnostics = { status: 'skipped', detail: 'server diagnostics endpoint disabled (404)' };
-        } else {
-          diagnosticsCollection.serverDiagnostics = { status: 'error', detail: `server responded with status ${response.status}` };
-        }
+          });
+          if (response.ok) {
+            pushBugReportArtifact(artifacts, {
+              filename: 'server-diagnostics.json',
+              sourceKind: 'server',
+              contentType: 'application/json',
+              content: await response.text(),
+            }, limits);
+            diagnosticsCollection.serverDiagnostics = { status: 'collected' };
+          } else if (response.status === 404) {
+            diagnosticsCollection.serverDiagnostics = { status: 'skipped', detail: 'server diagnostics endpoint disabled (404)' };
+          } else {
+            diagnosticsCollection.serverDiagnostics = { status: 'error', detail: `server responded with status ${response.status}` };
+          }
+        });
       }
     } catch (error) {
       diagnosticsCollection.serverDiagnostics = { status: 'error', detail: formatDiagnosticsCollectionError(error) };

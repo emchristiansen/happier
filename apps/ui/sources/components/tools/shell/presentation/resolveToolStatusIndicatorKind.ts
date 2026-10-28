@@ -8,6 +8,8 @@ export type ToolStatusIndicatorKind =
     | 'error'
     | 'none';
 
+const resultFailureByResultRoot = new WeakMap<object, boolean>();
+
 function parseStructuredResultText(value: string): unknown | null {
     const trimmed = value.trim();
     if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return null;
@@ -66,15 +68,26 @@ function hasStructuredResultFailure(value: unknown, depth = 0): boolean {
 
 function hasToolResultFailure(tool: ToolCall): boolean {
     const result = tool.result;
-    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    if (!result || typeof result !== 'object') {
         return hasStructuredResultFailure(result);
     }
-    const record = result as Record<string, unknown>;
-    const toolUseResult = record.tool_use_result;
-    if (typeof toolUseResult === 'string' && toolUseResult.trim().toLowerCase().startsWith('error:')) {
-        return true;
+
+    const cached = resultFailureByResultRoot.get(result);
+    if (cached !== undefined) return cached;
+
+    let hasFailure = false;
+    if (!Array.isArray(result)) {
+        const record = result as Record<string, unknown>;
+        const toolUseResult = record.tool_use_result;
+        hasFailure = typeof toolUseResult === 'string'
+            && toolUseResult.trim().toLowerCase().startsWith('error:');
     }
-    return hasStructuredResultFailure(result);
+    if (!hasFailure) hasFailure = hasStructuredResultFailure(result);
+
+    // Published tool results are immutable projections: updates replace the result root.
+    // Keying that root avoids reparsing unchanged output while letting obsolete payloads be collected.
+    resultFailureByResultRoot.set(result, hasFailure);
+    return hasFailure;
 }
 
 export function resolveToolStatusIndicatorKind(tool: ToolCall): ToolStatusIndicatorKind {

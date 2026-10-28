@@ -1,3 +1,4 @@
+import { normalizeSessionMessageContentForStorage } from "@/app/session/normalizeSessionMessageContentForStorage";
 import { markSessionParticipantsChanged, type SessionParticipantCursor } from "@/app/session/changeTracking/markSessionParticipantsChanged";
 import { db } from "@/storage/db";
 import { inTx, isTransactionAcquisitionUnavailableError, type Tx } from "@/storage/inTx";
@@ -53,6 +54,7 @@ import {
     type SessionTurnStoredRow,
 } from "./turns/parseSessionTurnState";
 import { hasCurrentSessionScopedMachineAccessInTx } from "@/app/api/socket/sessionScopedBinding";
+import { loadSessionRollbackEligibleTurnStartsInTx } from "./turns/sessionRollbackEligibilityProjection";
 
 type ParticipantCursor = SessionParticipantCursor;
 
@@ -187,7 +189,7 @@ export function resolveReadyProjectionEventType(params: Readonly<{
         : undefined;
 }
 
-function selectSessionActivityBadgeInputs() {
+export function selectSessionActivityBadgeInputs() {
     return {
         seq: true,
         // Not a badge input: `resolveSessionUnreadSinceWrite` decides the edge against the *stored*
@@ -571,6 +573,7 @@ export type ReassertSessionLatestTurnStatusResult =
         lastRuntimeIssue: SessionRuntimeIssueV1 | null;
         participantCursors: ParticipantCursor[];
         badgeAttentionChanged: boolean;
+        rollbackEligibleTurnStarts?: number[];
     }
     | { ok: false; error: "invalid-params" | "forbidden" | "session-not-found" | "internal" };
 
@@ -988,18 +991,21 @@ export async function createSessionMessage(
         return { ok: false, error: "invalid-params" };
     }
 
-    const content = "content" in params ? params.content : ciphertext ? ({ t: "encrypted", c: ciphertext } satisfies PrismaJson.SessionMessageContent) : null;
+    const rawContent = "content" in params ? params.content : ciphertext ? ({ t: "encrypted", c: ciphertext } satisfies PrismaJson.SessionMessageContent) : null;
 
-    if (!sessionId || !actorUserId || !content) {
+    if (!sessionId || !actorUserId || !rawContent) {
         return { ok: false, error: "invalid-params" };
     }
 
-    if (content.t === "encrypted" && (!content.c || typeof content.c !== "string")) {
+    if (rawContent.t === "encrypted" && (!rawContent.c || typeof rawContent.c !== "string")) {
         return { ok: false, error: "invalid-params" };
     }
-    if (content.t === "plain" && !("v" in content)) {
+    if (rawContent.t === "plain" && !("v" in rawContent)) {
         return { ok: false, error: "invalid-params" };
     }
+
+    const content = normalizeSessionMessageContentForStorage(rawContent);
+    if (!content) return { ok: false, error: "invalid-params" };
 
     const resolveRoleForStorageMode = (storageMode: "e2ee" | "plain") =>
         resolveSessionMessageRole({
@@ -1846,6 +1852,17 @@ async function applySessionTurnMutationWithOwnerAccess(params: {
             markParticipants: true,
         });
 
+        const rollbackEligibleTurnStarts = result.didApply
+            && (
+                params.sessionTurnMutation.action === "mark_rollback_eligible"
+                || params.sessionTurnMutation.action === "mark_rolled_back"
+            )
+            ? await loadSessionRollbackEligibleTurnStartsInTx(
+                tx,
+                params.sessionTurnMutation.sessionId,
+            )
+            : undefined;
+
         return {
             ok: true,
             didApply: result.didApply,
@@ -1857,6 +1874,7 @@ async function applySessionTurnMutationWithOwnerAccess(params: {
             lastRuntimeIssue: result.lastRuntimeIssue,
             participantCursors: result.participantCursors,
             badgeAttentionChanged: result.badgeAttentionChanged,
+            ...(rollbackEligibleTurnStarts !== undefined ? { rollbackEligibleTurnStarts } : {}),
         };
     });
 }
@@ -1944,6 +1962,133 @@ export async function updateSessionReadCursor(params: {
     };
 }
 
+async function applySessionReadCursorOperationInTx(params: Readonly<{
+    tx: Tx;
+    actorUserId: string;
+    sessionId: string;
+    operation: SessionReadCursorOperation;
+    initialSessionSeq?: number;
+    latestMainMessageSeq?: number | null;
+}>): Promise<ApplySessionReadCursorOperationResult> {
+    const access = await ensureSessionEditAccess(params.tx, {
+        actorUserId: params.actorUserId,
+        sessionId: params.sessionId,
+    });
+    if (!access.ok) {
+        return { ok: false, error: access.error };
+    }
+
+    const session = await params.tx.session.findUnique({
+        where: { id: params.sessionId },
+        select: selectSessionActivityBadgeInputs(),
+    });
+    if (!session) {
+        return { ok: false, error: "session-not-found" };
+    }
+
+    const finalSessionSeq = normalizeReadSeq(session.seq) ?? 0;
+    const conservativeMainMessageSeq = params.operation.kind === "mark-unread"
+        && typeof params.initialSessionSeq === "number"
+        && finalSessionSeq > params.initialSessionSeq
+        ? finalSessionSeq
+        : params.latestMainMessageSeq ?? null;
+    const readableSessionSeq = params.operation.kind === "mark-unread" && session.lastViewedSessionSeq !== null
+        ? resolveManualUnreadReadableSessionSeq(conservativeMainMessageSeq, session)
+        : undefined;
+    const resolved = resolveSessionReadCursorOperation({
+        sessionSeq: session.seq,
+        readableSessionSeq,
+        currentLastViewedSessionSeq: session.lastViewedSessionSeq,
+        operation: params.operation,
+    });
+    const nextCursor = resolved.nextLastViewedSessionSeq;
+    if (!resolved.didChange || typeof nextCursor !== "number") {
+        return {
+            ok: true,
+            lastViewedSessionSeq: nextCursor,
+            participantCursors: [],
+            badgeAttentionChanged: false,
+            didChange: false,
+            readState: resolved.readState,
+        };
+    }
+
+    const { count } = await params.tx.session.updateMany({
+        where: params.operation.kind === "mark-unread"
+            ? {
+                id: params.sessionId,
+                lastViewedSessionSeq: { gt: nextCursor },
+            }
+            : {
+                id: params.sessionId,
+                OR: [{ lastViewedSessionSeq: { lt: nextCursor } }, { lastViewedSessionSeq: null }],
+            },
+        data: {
+            lastViewedSessionSeq: nextCursor,
+            ...resolveSessionUnreadSinceWrite({
+                stored: session,
+                after: toSessionUnreadInputs(session, { lastViewedSessionSeq: nextCursor }),
+                now: new Date(),
+            }),
+        },
+    });
+
+    if (count === 0) {
+        const fresh = await params.tx.session.findUnique({
+            where: { id: params.sessionId },
+            select: {
+                seq: true,
+                lastViewedSessionSeq: true,
+            },
+        });
+        if (!fresh) {
+            return { ok: false, error: "session-not-found" };
+        }
+        const readStateSeq = params.operation.kind === "mark-unread" && typeof readableSessionSeq === "number"
+            ? readableSessionSeq
+            : fresh.seq;
+        return {
+            ok: true,
+            lastViewedSessionSeq: fresh.lastViewedSessionSeq ?? null,
+            participantCursors: [],
+            badgeAttentionChanged: false,
+            didChange: false,
+            readState: resolveSessionReadState(readStateSeq, fresh.lastViewedSessionSeq),
+        };
+    }
+
+    const participantCursors = await markSessionParticipantsChanged({
+        tx: params.tx,
+        sessionId: params.sessionId,
+    });
+    return {
+        ok: true,
+        lastViewedSessionSeq: nextCursor,
+        participantCursors,
+        badgeAttentionChanged: didSessionActivityBadgeContributionChange(
+            toSessionActivityBadgeInputs(session),
+            {
+                ...toSessionActivityBadgeInputs(session),
+                lastViewedSessionSeq: nextCursor,
+            },
+        ),
+        didChange: true,
+        readState: resolved.readState,
+    };
+}
+
+/** Applies the canonical mark-read mutation inside a caller-owned transaction. */
+export async function markSessionReadInTx(params: Readonly<{
+    tx: Tx;
+    actorUserId: string;
+    sessionId: string;
+}>): Promise<ApplySessionReadCursorOperationResult> {
+    return await applySessionReadCursorOperationInTx({
+        ...params,
+        operation: { kind: "mark-read" },
+    });
+}
+
 export async function applySessionReadCursorOperation(params: {
     actorUserId: string;
     sessionId: string;
@@ -1978,107 +2123,14 @@ export async function applySessionReadCursorOperation(params: {
             latestMainMessageSeq = await findLatestUnreadAffectingMainTranscriptMessageSeq(sessionId);
         }
 
-        return await inTx(async (tx) => {
-            const access = await ensureSessionEditAccess(tx, { actorUserId, sessionId });
-            if (!access.ok) {
-                return { ok: false, error: access.error };
-            }
-
-            const session = await tx.session.findUnique({
-                where: { id: sessionId },
-                select: selectSessionActivityBadgeInputs(),
-            });
-            if (!session) {
-                return { ok: false, error: "session-not-found" };
-            }
-
-            const finalSessionSeq = normalizeReadSeq(session.seq) ?? 0;
-            const conservativeMainMessageSeq = operation.kind === "mark-unread"
-                && typeof initialSessionSeq === "number"
-                && finalSessionSeq > initialSessionSeq
-                ? finalSessionSeq
-                : latestMainMessageSeq ?? null;
-            const readableSessionSeq = operation.kind === "mark-unread" && session.lastViewedSessionSeq !== null
-                ? resolveManualUnreadReadableSessionSeq(conservativeMainMessageSeq, session)
-                : undefined;
-            const resolved = resolveSessionReadCursorOperation({
-                sessionSeq: session.seq,
-                readableSessionSeq,
-                currentLastViewedSessionSeq: session.lastViewedSessionSeq,
-                operation,
-            });
-            const nextCursor = resolved.nextLastViewedSessionSeq;
-            if (!resolved.didChange || typeof nextCursor !== "number") {
-                return {
-                    ok: true,
-                    lastViewedSessionSeq: nextCursor,
-                    participantCursors: [],
-                    badgeAttentionChanged: false,
-                    didChange: false,
-                    readState: resolved.readState,
-                };
-            }
-
-            const { count } = await tx.session.updateMany({
-                where: operation.kind === "mark-unread"
-                    ? {
-                        id: sessionId,
-                        lastViewedSessionSeq: { gt: nextCursor },
-                    }
-                    : {
-                        id: sessionId,
-                        OR: [{ lastViewedSessionSeq: { lt: nextCursor } }, { lastViewedSessionSeq: null }],
-                    },
-                data: {
-                    lastViewedSessionSeq: nextCursor,
-                    ...resolveSessionUnreadSinceWrite({
-                        stored: session,
-                        after: toSessionUnreadInputs(session, { lastViewedSessionSeq: nextCursor }),
-                        now: new Date(),
-                    }),
-                },
-            });
-
-            if (count === 0) {
-                const fresh = await tx.session.findUnique({
-                    where: { id: sessionId },
-                    select: {
-                        seq: true,
-                        lastViewedSessionSeq: true,
-                    },
-                });
-                if (!fresh) {
-                    return { ok: false, error: "session-not-found" };
-                }
-                const readStateSeq = operation.kind === "mark-unread" && typeof readableSessionSeq === "number"
-                    ? readableSessionSeq
-                    : fresh.seq;
-                return {
-                    ok: true,
-                    lastViewedSessionSeq: fresh.lastViewedSessionSeq ?? null,
-                    participantCursors: [],
-                    badgeAttentionChanged: false,
-                    didChange: false,
-                    readState: resolveSessionReadState(readStateSeq, fresh.lastViewedSessionSeq),
-                };
-            }
-
-            const participantCursors = await markSessionParticipantsChanged({ tx, sessionId });
-            return {
-                ok: true,
-                lastViewedSessionSeq: nextCursor,
-                participantCursors,
-                badgeAttentionChanged: didSessionActivityBadgeContributionChange(
-                    toSessionActivityBadgeInputs(session),
-                    {
-                        ...toSessionActivityBadgeInputs(session),
-                        lastViewedSessionSeq: nextCursor,
-                    },
-                ),
-                didChange: true,
-                readState: resolved.readState,
-            };
-        });
+        return await inTx(async (tx) => await applySessionReadCursorOperationInTx({
+            tx,
+            actorUserId,
+            sessionId,
+            operation,
+            initialSessionSeq,
+            latestMainMessageSeq,
+        }));
     } catch {
         return { ok: false, error: "internal" };
     }

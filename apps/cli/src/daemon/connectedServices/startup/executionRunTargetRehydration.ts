@@ -1,4 +1,5 @@
 import type { CatalogAgentId } from '@/backends/types';
+import { ExecutionRunRetentionPolicySchema, type ExecutionRunRetentionPolicy } from '@happier-dev/protocol';
 import type { ConnectedServiceRuntimeRegistry } from '../runtimeRegistry/registry';
 import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '../connectedServiceChildEnvironment';
 import { ExecutionRunConnectedServicesLaunchV1Schema } from '../runsBridge/contract';
@@ -9,6 +10,7 @@ type CandidateMarker = Readonly<{
   pid: number;
   status: unknown;
   finishedAtMs?: unknown;
+  retentionPolicy?: unknown;
   executionRunConnectedServicesLaunchV1?: unknown;
 }>;
 
@@ -27,6 +29,7 @@ export async function rehydrateLiveExecutionRunRuntimeTargets(input: Readonly<{
     pid: number;
     agentId: CatalogAgentId;
     materializedRoot: string;
+    retentionPolicy?: ExecutionRunRetentionPolicy | null;
   }>) => boolean;
 }>): Promise<Readonly<{ registeredRunIds: string[]; inactiveRunIds: string[] }>> {
   const markers = typeof input.markers === 'function' ? await input.markers() : input.markers;
@@ -64,6 +67,10 @@ export async function rehydrateLiveExecutionRunRuntimeTargets(input: Readonly<{
       pid: marker.pid,
       agentId: launch.agentId,
       materializedRoot: launch.materializedRoot,
+      retentionPolicy: (() => {
+        const parsed = ExecutionRunRetentionPolicySchema.safeParse(marker.retentionPolicy);
+        return parsed.success ? parsed.data : null;
+      })(),
     })) {
       inactiveRunIds.push(marker.runId);
       continue;

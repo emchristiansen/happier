@@ -15,10 +15,37 @@ export type ClaudeInFlightSteerCapabilityPublisher = Readonly<{
   dispose: () => void;
 }>;
 
+type ClaudeInFlightSteerCapabilitySession = Readonly<{
+  updateAgentState: (updater: (current: AgentState) => AgentState) => Promise<void> | void;
+}>;
+
+export function publishClaudeInFlightSteerBackendUnsupported(opts: Readonly<{
+  session: ClaudeInFlightSteerCapabilitySession;
+  nowMs?: (() => number) | undefined;
+}>): void {
+  const stateAt = (opts.nowMs ?? Date.now)();
+  updateAgentStateBestEffort(
+    opts.session,
+    (currentState) => ({
+      ...currentState,
+      capabilities: {
+        ...(currentState.capabilities && typeof currentState.capabilities === 'object' ? currentState.capabilities : {}),
+        inFlightSteer: false,
+        inFlightSteerSupported: false,
+        inFlightSteerAvailable: false,
+        inFlightSteerUnavailableReason: 'backend_unsupported',
+        inFlightSteerStateAt: stateAt,
+      },
+    }),
+    '[claude]',
+    'in_flight_steer_backend_unsupported',
+  );
+}
+
 /**
- * Publishes the Claude Unified steer-availability snapshot (lane P, O-design Seam A) into
- * `agentState.capabilities` so the UI's delivery decision can stop pretending a non-steerable send
- * was delivered. Consumes the evaluator's de-duplicated tee and:
+ * Publishes a steer-capable Claude runtime's live availability snapshot (lane P, O-design Seam A)
+ * into `agentState.capabilities` so the UI can select the exact in-flight delivery action. Consumes
+ * the evaluator's de-duplicated tee and:
  *
  * - maps unavailable → `turn_settling` when the CANONICAL turn (N2 probe) is no longer active —
  *   one turn-truth owner, no second turn-state source;
@@ -27,7 +54,7 @@ export type ClaudeInFlightSteerCapabilityPublisher = Readonly<{
  * - stamps `inFlightSteerStateAt` so the UI can ignore stale snapshots.
  */
 export function createClaudeInFlightSteerCapabilityPublisher(opts: Readonly<{
-  session: { updateAgentState: (updater: (current: AgentState) => AgentState) => Promise<void> | void };
+  session: ClaudeInFlightSteerCapabilitySession;
   /** N2 canonical-turn probe; absent counts as active (fail-closed toward unsafe_window). */
   isCanonicalTurnActive?: (() => boolean) | undefined;
   nowMs?: (() => number) | undefined;
@@ -68,6 +95,8 @@ export function createClaudeInFlightSteerCapabilityPublisher(opts: Readonly<{
         ...currentState,
         capabilities: {
           ...(currentState.capabilities && typeof currentState.capabilities === 'object' ? currentState.capabilities : {}),
+          inFlightSteer: true,
+          inFlightSteerSupported: true,
           inFlightSteerAvailable: snapshot.available,
           inFlightSteerUnavailableReason: reason,
           inFlightSteerStateAt: stateAt,

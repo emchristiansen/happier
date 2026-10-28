@@ -8,7 +8,7 @@ import { Text } from '@/components/ui/text/Text';
 import { Typography } from '@/constants/Typography';
 import type { ConnectedServiceQuotaMeterV1 } from '@happier-dev/protocol';
 
-import { clampQuotaPct, deriveQuotaUtilizationPct } from '@/sync/domains/connectedServices/deriveQuotaUtilizationPct';
+import { deriveQuotaMeterValues } from '@/sync/domains/connectedServices/deriveQuotaUtilizationPct';
 import { formatResetCountdown, isResetCountdownOutdated, type ResetCountdownFormatter } from '@/sync/domains/connectedServices/formatResetCountdown';
 import { resolveQuotaTone } from '@/sync/domains/connectedServices/resolveQuotaTone';
 import { t } from '@/text';
@@ -57,10 +57,7 @@ export const ConnectedServiceQuotaMeterRow = React.memo(function ConnectedServic
   const { theme } = useUnistyles();
   const styles = stylesheet;
 
-  const utilization = deriveQuotaUtilizationPct(props.meter);
-  const remaining = typeof props.meter.remainingPct === 'number' && Number.isFinite(props.meter.remainingPct)
-    ? clampQuotaPct(props.meter.remainingPct)
-    : utilization === null ? null : clampQuotaPct(100 - utilization);
+  const { remainingPct: remaining, used, limit } = deriveQuotaMeterValues(props.meter);
   const remainingText = remaining === null ? '—' : `${Math.round(remaining)}%`;
   // An elapsed reset boundary means the snapshot predates its own reset — fall back to the plain
   // remaining label instead of composing the nonsense phrase "resets in outdated".
@@ -75,8 +72,8 @@ export const ConnectedServiceQuotaMeterRow = React.memo(function ConnectedServic
   const tone = resolveQuotaTone(remaining);
 
   const usageText =
-    typeof props.meter.used === 'number' && typeof props.meter.limit === 'number'
-      ? t('connectedServices.quota.usageCount', { used: props.meter.used, limit: props.meter.limit })
+    typeof used === 'number' && typeof limit === 'number'
+      ? t('connectedServices.quota.usageCount', { used, limit })
       : null;
 
   const subtitle = (

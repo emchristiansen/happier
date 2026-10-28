@@ -13,7 +13,7 @@ import { resolveComposerSelectionRestore } from './composerSelectionRestore';
 import { COMPOSER_SURFACE_RADIUS } from './composerContentInset';
 import { Typography } from '@/constants/Typography';
 import type { PermissionMode, ModelMode } from '@/sync/domains/permissions/permissionTypes';
-import { findModelOptionForEffectiveModelId, getModelOptionsForSession, supportsFreeformModelSelectionForSession, type ModelOption } from '@/sync/domains/models/modelOptions';
+import { findModelOptionForEffectiveModelId, getModelOptionsForSession, type ModelOption, type SessionModelOptionsContext } from '@/sync/domains/models/modelOptions';
 import { describeEffectiveModelMode } from '@/sync/domains/models/describeEffectiveModelMode';
 import { Modal } from '@/modal';
 import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
@@ -24,7 +24,6 @@ import {
     getPermissionModeOptionsForSession,
 } from '@/sync/domains/permissions/permissionModeOptions';
 import { describeEffectivePermissionMode } from '@/sync/domains/permissions/describeEffectivePermissionMode';
-import { readSessionModelsState } from '@/sync/domains/sessionControl/readSessionControlMetadata';
 import { hapticsLight, hapticsError } from '@/components/ui/theme/haptics';
 import { type ShakeInstance } from '@/components/ui/feedback/Shaker';
 import { StatusDot } from '@/components/ui/status/StatusDot';
@@ -34,7 +33,6 @@ import { applySuggestion } from '@/components/autocomplete/applySuggestion';
 import { findActiveWord, type ActiveWord } from '@/components/autocomplete/findActiveWord';
 import { resolveComposerSuggestionKind } from '@/components/autocomplete/composerSuggestionKinds';
 import type { ComposerSuggestionKindId } from '@/components/autocomplete/composerSuggestionGrammar';
-import { type ModelPickerProbeState } from '@/components/model/ModelPickerOverlay';
 import type { OptionPickerProbeState } from '@/components/sessions/pickers/OptionPickerOverlay';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import {
@@ -50,7 +48,8 @@ import { t } from '@/text';
 
 import { Metadata } from '@/sync/domains/state/storageTypes';
 import { getProfileEnvironmentVariables, type AIBackendProfile } from '@/sync/domains/profiles/profileCompatibility';
-import { DEFAULT_AGENT_ID, getAgentBehavior, getAgentCore, resolveAgentIdFromFlavor, type AgentId } from '@/agents/catalog/catalog';
+import { DEFAULT_AGENT_ID, getAgentBehavior, getAgentCore, type AgentId } from '@/agents/catalog/catalog';
+import { resolveAgentIdFromSessionMetadata } from '@happier-dev/agents';
 import { AgentIcon } from '@/agents/registry/AgentIcon';
 // From the registry rather than the catalog facade: this narrows an id the picker
 // supplied, which is the same check the send control's presentation resolver makes.
@@ -85,6 +84,7 @@ import { resolveContextWindowTokens } from './resolveContextWarningWindowTokens'
 import { shouldRenderPermissionChip } from './permissionChipVisibility';
 import { AgentInputContentPopover, type AgentInputContentPopoverConfig } from './components/AgentInputContentPopover';
 import { AgentInputEngineDetail } from './components/AgentInputEngineDetail';
+import { AgentInputModelDiscoveryDetail, type AgentInputModelDetailState, type SessionModelDiscoveryContext } from './components/AgentInputModelDiscoveryDetail';
 import { AgentInputContextUsageBadge } from './components/AgentInputContextUsageBadge';
 import { AgentInputProviderUsageBadge } from './components/AgentInputProviderUsageBadge';
 import { mergeOptionPickerProbes } from '@/components/sessions/pickers/mergeOptionPickerProbes';
@@ -112,7 +112,7 @@ import { useRenderedAgentInputControlRows } from './controls/useRenderedAgentInp
 import { buildAgentInputSelectionOverlayViewModel } from './selection/buildAgentInputSelectionOverlayViewModel';
 import { useAgentInputSelectionAnchors } from './selection/useAgentInputSelectionAnchors';
 import { useAgentInputSelectionOverlayController } from './selection/useAgentInputSelectionOverlayController';
-import { computeSessionModePickerControl } from '@/sync/domains/sessionControl/sessionModeControl';
+import { computeSessionModePickerControl, getSessionModePickerOptions, resolveRequestedSessionModeIdForMetadata } from '@/sync/domains/sessionControl/sessionModeControl';
 import {
     computeSessionConfigOptionControls,
     computeSessionConfigOptionControlsForProvider,
@@ -276,13 +276,14 @@ interface AgentInputProps {
     /**
      * Optional: show a probe/loading state + refresh control in the ACP mode picker.
      */
-    acpSessionModeOptionsOverrideProbe?: ModelPickerProbeState;
+    acpSessionModeOptionsOverrideProbe?: OptionPickerProbeState;
     acpConfigOptionsOverride?: ReadonlyArray<SessionConfigOption>;
-    acpConfigOptionsOverrideProbe?: ModelPickerProbeState;
+    acpConfigOptionsOverrideProbe?: OptionPickerProbeState;
     acpConfigOptionOverridesOverride?: AcpConfigOptionOverridesV1 | null;
     onSessionConfigOptionChange?: (configId: string, valueId: SessionConfigOptionValueId) => void;
     modelMode?: ModelMode;
-    onModelModeChange?: (mode: ModelMode) => void;
+    onModelModeChange?: (mode: ModelMode, modelOptionsContext?: SessionModelOptionsContext) => void;
+    modelDiscoveryContext?: () => SessionModelDiscoveryContext;
     /**
      * Optional override for model picker options.
      *
@@ -293,7 +294,7 @@ interface AgentInputProps {
      * Optional: show a probe/loading state + refresh control in the model picker.
      * Intended for preflight (no-session) flows that dynamically probe models.
      */
-    modelOptionsOverrideProbe?: ModelPickerProbeState;
+    modelOptionsOverrideProbe?: OptionPickerProbeState;
     metadata?: Metadata | null;
     /** Whether the existing session runtime is active. Omit for pre-session composers. */
     sessionActive?: boolean;
@@ -321,6 +322,7 @@ interface AgentInputProps {
         cacheCreation: number;
         cacheRead: number;
         contextSize: number;
+        contextSizeIsReported?: boolean;
         contextWindowTokens?: number;
     };
     providerUsageGauge?: ConnectedServiceQuotaGaugeViewModel | null;
@@ -342,18 +344,7 @@ interface AgentInputProps {
     composeAgentPickerOptions?: (
         currentAgentOptions: ReadonlyArray<AgentInputChipPickerOption>,
     ) => ReadonlyArray<AgentInputChipPickerOption>;
-    /**
-     * The Agent picker opened or closed. Lets a caller defer work that is only
-     * worth doing once the user is actually choosing an Agent — a live capability
-     * probe, for instance — instead of on every composer mount.
-     */
-    /**
-     * The reader is reaching for the Agent chip — hover, focus, or press-in.
-     *
-     * Fired before the picker opens so the Session's machine can be asked about
-     * continuation support while the pointer is still travelling, rather than on
-     * every Session view.
-     */
+    /** One descriptor-level signal shared by direct and overflow picker entry points. */
     onAgentPickerIntent?: () => void;
     onAgentPickerVisibilityChange?: (visible: boolean) => void;
     agentPickerSelectedOptionId?: string | null;
@@ -1271,53 +1262,27 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
             updateLayoutHeight(setComposerAttentionHeightPx, 0);
         }
     }, [hasComposerAttentionRequests]);
-    const agentId: AgentId = resolveAgentIdFromFlavor(props.metadata?.flavor) ?? props.agentType ?? DEFAULT_AGENT_ID;
-    const lastNonEmptySessionModelOptionsRef = React.useRef<readonly ModelOption[] | null>(null);
-    React.useEffect(() => {
-        lastNonEmptySessionModelOptionsRef.current = null;
-    }, [agentId, props.sessionId]);
-
-    const sessionModelsState = React.useMemo(() => {
-        if (props.modelOptionsOverride) return { hasSessionModelsState: false, availableCount: 0 };
-        const raw = readSessionModelsState(props.metadata ?? null);
-        const provider = typeof raw?.provider === 'string' ? raw.provider.trim() : '';
-        if (!provider || provider !== agentId) return { hasSessionModelsState: false, availableCount: 0 };
-        const available = Array.isArray(raw?.availableModels) ? raw.availableModels : [];
-        return { hasSessionModelsState: true, availableCount: available.length };
-    }, [agentId, props.metadata, props.modelOptionsOverride]);
-
-    const baseModelOptions = React.useMemo(() => {
-        if (props.modelOptionsOverride) return props.modelOptionsOverride;
-        return getModelOptionsForSession(agentId, props.metadata ?? null);
-    }, [agentId, props.metadata, props.modelOptionsOverride]);
-
+    const sessionAgentId = resolveAgentIdFromSessionMetadata(props.metadata);
+    const agentId: AgentId = sessionAgentId ?? props.agentType ?? DEFAULT_AGENT_ID;
+    const armedComposerTarget = resolveArmedComposerContinuation({
+        armedContinuationTarget: props.armedContinuationTarget,
+    });
+    // Outbound controls describe the armed Agent; runtime status stays with the running Agent.
+    const armedAgentId = armedComposerTarget && isAgentId(armedComposerTarget.agentId)
+        ? armedComposerTarget.agentId
+        : null;
+    const engineChipAgentId = armedAgentId ?? props.agentType ?? agentId;
+    // Existing Sessions may need a policy default while their identity is unavailable.
+    // That default is not evidence for a brand; new-session selection and armed targets are.
+    const engineChipMarkAgentId = armedComposerTarget
+        ? armedAgentId
+        : props.sessionId && !sessionAgentId ? null : engineChipAgentId;
+    const displayedAgentLabel = engineChipMarkAgentId ? props.agentLabel : t('status.unknown');
+    const permissionMetadata = armedComposerTarget ? null : props.metadata ?? null;
     const modelOptions = React.useMemo(() => {
-        if (props.modelOptionsOverride) return baseModelOptions;
-        if (sessionModelsState.hasSessionModelsState && sessionModelsState.availableCount === 0) {
-            const sticky = lastNonEmptySessionModelOptionsRef.current;
-            if (sticky && sticky.length > 0) return sticky;
-        }
-        return baseModelOptions;
-    }, [baseModelOptions, props.modelOptionsOverride, sessionModelsState.availableCount, sessionModelsState.hasSessionModelsState]);
-
-    const sessionModelOptionsProbe = React.useMemo<ModelPickerProbeState | null>(() => {
-        if (props.modelOptionsOverride) return null;
-        if (!sessionModelsState.hasSessionModelsState) return null;
-        if (sessionModelsState.availableCount > 0) return null;
-        const phase: ModelPickerProbeState['phase'] = lastNonEmptySessionModelOptionsRef.current ? 'refreshing' : 'loading';
-        return { phase };
-    }, [props.modelOptionsOverride, sessionModelsState.availableCount, sessionModelsState.hasSessionModelsState]);
-
-    React.useEffect(() => {
-        if (props.modelOptionsOverride) return;
-        if (!sessionModelsState.hasSessionModelsState) {
-            lastNonEmptySessionModelOptionsRef.current = null;
-            return;
-        }
-        if (sessionModelsState.availableCount > 0 && modelOptions.length > 0) {
-            lastNonEmptySessionModelOptionsRef.current = modelOptions;
-        }
-    }, [modelOptions, props.modelOptionsOverride, sessionModelsState.availableCount, sessionModelsState.hasSessionModelsState]);
+        if (props.modelOptionsOverride) return props.modelOptionsOverride;
+        return getModelOptionsForSession(agentId, props.metadata ?? null, { selectedModelId: props.modelMode });
+    }, [agentId, props.metadata, props.modelMode, props.modelOptionsOverride]);
 
     // Profile data
     const profiles = useSetting('profiles');
@@ -1347,26 +1312,31 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
                 return 'user-circle';
             }, []);
 
-    const supportsExactContextUsageBadge = React.useMemo(
-        () => getAgentBehavior(agentId).sessionUsage?.supportsExactContextUsageBadge !== false,
+    const contextUsageBadge = React.useMemo(
+        () => getAgentBehavior(agentId).sessionUsage?.contextUsageBadge ?? 'derived',
         [agentId],
     );
 
     const contextWindowTokens = React.useMemo(
         () => (
-            supportsExactContextUsageBadge
+            contextUsageBadge !== 'hidden'
                 ? resolveContextWindowTokens({ agentId, metadata: props.metadata ?? null, usageData: props.usageData })
                 : null
         ),
-        [agentId, props.metadata, props.usageData, supportsExactContextUsageBadge],
+        [agentId, props.metadata, props.usageData, contextUsageBadge],
     );
 
-    const contextUsageState = supportsExactContextUsageBadge && (
-        (props.usageData && typeof props.usageData.contextSize === 'number')
-        || props.alwaysShowContextSize === true
-    )
+    // See `AgentUiBehavior.sessionUsage.contextUsageBadge`: a derived badge follows any usage record
+    // (or the always-show setting before one arrives); a reported-only badge needs the producer's
+    // explicit context size.
+    const contextSizeForBadge = contextUsageBadge === 'derived'
+        ? (props.usageData || props.alwaysShowContextSize === true ? props.usageData?.contextSize ?? 0 : null)
+        : contextUsageBadge === 'reportedOnly' && props.usageData?.contextSizeIsReported === true
+            ? props.usageData.contextSize
+            : null;
+    const contextUsageState = contextSizeForBadge !== null
         ? getContextUsageState(
-            props.usageData?.contextSize ?? 0,
+            contextSizeForBadge,
             props.alwaysShowContextSize ?? false,
             contextWindowTokens,
         )
@@ -1380,6 +1350,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
     const agentInputHistoryScope = useSetting('agentInputHistoryScope');
     const agentInputActionBarLayout = useSetting('agentInputActionBarLayout');
     const agentInputChipDensity = useSetting('agentInputChipDensity');
+    const showUsageGaugeLabels = useSetting('sessionUsageGaugeLabels') === true;
     const sessionPermissionModeApplyTiming = useSetting('sessionPermissionModeApplyTiming');
     const isGlassComposer = isGlassComposerSurface({ setting: useSetting('composerSurfaceStyle') });
 
@@ -1878,6 +1849,10 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         // to the composer-view anchor — the "menu appears at the top of the composer,
         // then jumps on the next keystroke" report.
         enabled: isInputFocused && !props.disabled,
+        // Only the command menu consumes the rect, and it can only open over an active `@`/`/`
+        // word. Web skips its per-keystroke mirror-div measurement otherwise and measures before
+        // paint in the commit the word activates; native ignores this and keeps D38 above.
+        demanded: activeWord !== null,
     });
     const commandMenuAnchor: CommandMenuAnchor = React.useMemo(
         () => resolveAgentInputCommandMenuAnchor(caretRect, composerAnchorRef),
@@ -1896,8 +1871,8 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
     }, [props.maxPanelHeight, screenHeight]);
 
             const permissionModeOptions = React.useMemo(() => {
-                return getPermissionModeOptionsForSession(agentId, props.metadata ?? null);
-            }, [agentId, props.metadata]);
+                return getPermissionModeOptionsForSession(engineChipAgentId, permissionMetadata);
+            }, [engineChipAgentId, permissionMetadata]);
 
         const permissionModeOrder = React.useMemo(() => {
             return permissionModeOptions.map((o) => o.value);
@@ -1905,12 +1880,12 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
 
     const effectivePermissionPolicy = React.useMemo(() => {
                 return describeEffectivePermissionMode({
-                    agentType: agentId,
+                    agentType: engineChipAgentId,
                     selectedMode: props.permissionMode ?? 'default',
-                metadata: props.metadata ?? null,
+                metadata: permissionMetadata,
                 applyTiming: sessionPermissionModeApplyTiming ?? 'immediate',
             });
-    }, [agentId, props.metadata, props.permissionMode, sessionPermissionModeApplyTiming]);
+    }, [engineChipAgentId, permissionMetadata, props.permissionMode, sessionPermissionModeApplyTiming]);
 
     const effectiveModelPolicy = React.useMemo(() => {
         return describeEffectiveModelMode({
@@ -1968,16 +1943,6 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         return effectiveModelPolicy.notes;
     }, [effectiveModelPolicy.notes, props.sessionActive]);
 
-    const canEnterCustomModel = React.useMemo(() => {
-        return supportsFreeformModelSelectionForSession(agentId, props.metadata ?? null);
-    }, [agentId, props.metadata]);
-
-    const submitCustomModel = React.useCallback((value: string) => {
-        const normalized = value.trim();
-        if (!normalized) return;
-        props.onModelModeChange?.(normalized);
-    }, [props.onModelModeChange]);
-
     const preflightAcpSessionModeOptions = React.useMemo(() => {
         const raw = props.acpSessionModeOptionsOverride;
         if (!Array.isArray(raw) || raw.length === 0) return null;
@@ -2004,20 +1969,27 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         const selected = typeof props.acpSessionModeSelectedIdOverride === 'string'
             ? props.acpSessionModeSelectedIdOverride.trim()
             : '';
-        const effectiveId = selected || 'default';
-        const opt = preflightAcpSessionModeOptions?.find((o) => o.id === effectiveId) ?? null;
+        const pickerOptions = preflightAcpSessionModeOptions
+            ? getSessionModePickerOptions(preflightAcpSessionModeOptions, agentId)
+            : [];
+        const effectiveId = selected || (pickerOptions.some((option) => option.id === '') ? '' : 'default');
+        const opt = pickerOptions.find((option) => option.id === effectiveId) ?? null;
         return { id: effectiveId, name: opt?.name ?? (effectiveId === 'default' ? t('common.default') : effectiveId) };
-    }, [preflightAcpSessionModeOptions, props.acpSessionModeSelectedIdOverride]);
+    }, [agentId, preflightAcpSessionModeOptions, props.acpSessionModeSelectedIdOverride]);
     const sessionModeOptionsOverrideProbe = props.acpSessionModeOptionsOverrideProbe ?? null;
     const acpConfigOptionsOverrideProbe = props.acpConfigOptionsOverrideProbe ?? null;
 
     const sessionModeChipControl = React.useMemo(() => {
-        if (!props.onAcpSessionModeChange) return null;
+        if (armedComposerTarget || !props.onAcpSessionModeChange) return null;
         if (sessionModePickerControl) {
+            const clearOption = sessionModePickerControl.isExplicitOverride ? undefined
+                : getSessionModePickerOptions(sessionModePickerControl.options, agentId).find((option) =>
+                    resolveRequestedSessionModeIdForMetadata(sessionModePickerControl, option.id) === '');
             return {
                 options: sessionModePickerControl.options,
                 selectedId: (
-                    sessionModePickerControl.requestedModeId
+                    clearOption?.id
+                    ?? sessionModePickerControl.requestedModeId
                     ?? sessionModePickerControl.effectiveModeId
                     ?? 'default'
                 ),
@@ -2035,6 +2007,8 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         }
         return null;
     }, [
+        agentId,
+        armedComposerTarget,
         preflightAcpSessionModeEffective.id,
         preflightAcpSessionModeEffective.name,
         preflightAcpSessionModeOptions,
@@ -2044,19 +2018,12 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
 
     const sessionModePickerOptions = React.useMemo<ReadonlyArray<AgentInputChipPickerOption>>(() => {
         if (!sessionModeChipControl) return [];
-        const optionsById = new Map(sessionModeChipControl.options.map((option) => [option.id, option]));
-        const uniqueIds = Array.from(
-            new Set([
-                'default',
-                ...sessionModeChipControl.options.map((option) => option.id).filter((id) => id && id !== 'default'),
-            ]),
-        );
-        return uniqueIds.map((id) => ({
-            id,
-            label: optionsById.get(id)?.name ?? (id === 'default' ? t('common.default') : id),
-            subtitle: optionsById.get(id)?.description,
+        return getSessionModePickerOptions(sessionModeChipControl.options, agentId).map((option) => ({
+            id: option.id,
+            label: option.name,
+            subtitle: option.description,
         }));
-    }, [sessionModeChipControl]);
+    }, [agentId, sessionModeChipControl]);
 
     const shouldRenderSessionModeChip = React.useMemo(() => {
         return shouldRenderChipForOptions({
@@ -2072,20 +2039,16 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
 
     const sessionModeChipInteraction = React.useMemo(() => {
         if (!sessionModeChipControl) return null;
-        const selectableOptionIds = Array.from(new Set(
-            sessionModeChipControl.options
-                .map((option) => option.id?.trim?.() ?? option.id)
-                .filter((id): id is string => typeof id === 'string' && id.length > 0),
-        ));
+        const selectableOptionIds = sessionModePickerOptions.map((option) => option.id);
         return resolveChipOptionInteraction({
             currentOptionId: sessionModeChipControl.selectedId,
             selectableOptionIds,
             cycleMaxOptions: DEFAULT_OPTION_CHIP_CYCLE_MAX_OPTIONS,
         });
-    }, [sessionModeChipControl]);
+    }, [sessionModeChipControl, sessionModePickerOptions]);
 
     const acpConfigOptionControls = React.useMemo(() => {
-        if (!props.onSessionConfigOptionChange) return null;
+        if (armedComposerTarget || !props.onSessionConfigOptionChange) return null;
         if (props.acpConfigOptionsOverride) {
             return computeSessionConfigOptionControlsForProvider({
                 providerId: agentId,
@@ -2098,6 +2061,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         return computeSessionConfigOptionControls({ agentId, metadata: props.metadata ?? null });
     }, [
         agentId,
+        armedComposerTarget,
         modelOptions.length,
         props.acpConfigOptionsOverride,
         props.acpConfigOptionOverridesOverride,
@@ -2106,72 +2070,11 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         sessionModeChipControl,
     ]);
 
-    const selectedModelForControls = React.useMemo(() => {
-        return findModelOptionForEffectiveModelId(modelOptions, effectiveModelPolicy.selectedModelId);
-    }, [effectiveModelPolicy.selectedModelId, modelOptions]);
-
-    const selectedModelOptionControls = React.useMemo(() => {
-        if (!props.onSessionConfigOptionChange) return null;
-        const selectedModel = selectedModelForControls;
-        if (!selectedModel) return null;
-        const baseControls = selectedModel.modelOptions?.length
-            ? computeSessionConfigOptionControlsFromOverride({
-                agentId,
-                configOptions: selectedModel.modelOptions,
-                overrides: props.acpConfigOptionOverridesOverride?.overrides ?? null,
-            }) ?? []
-            : [];
-        // Extended-context (e.g. Claude `[1m]`) is a MODEL-ID VARIANT, not a config option:
-        // the toggle is synthesized here and routed through the model-override pipeline.
-        if (selectedModel.extendedContextModelId && props.onModelModeChange) {
-            const extendedSelected = effectiveModelPolicy.selectedModelId === selectedModel.extendedContextModelId;
-            const value = extendedSelected ? 'true' : 'false';
-            baseControls.push({
-                option: {
-                    id: EXTENDED_CONTEXT_MODEL_TOGGLE_OPTION_ID,
-                    name: t('agentInput.model.extendedContextToggleLabel'),
-                    description: t('agentInput.model.extendedContextToggleDescription'),
-                    type: 'boolean',
-                    currentValue: value,
-                },
-                effectiveValue: value,
-                isPending: false,
-            });
-        }
-        return baseControls.length > 0 ? baseControls : null;
-    }, [
-        agentId,
-        effectiveModelPolicy.selectedModelId,
-        selectedModelForControls,
-        props.acpConfigOptionOverridesOverride,
-        props.onSessionConfigOptionChange,
-        props.onModelModeChange,
-    ]);
-
-    const handleSelectModelOptionValue = React.useCallback((configId: string, valueId: SessionConfigOptionValueId) => {
-        if (configId === EXTENDED_CONTEXT_MODEL_TOGGLE_OPTION_ID) {
-            const selectedModel = selectedModelForControls;
-            if (!selectedModel?.extendedContextModelId) return;
-            hapticsLight();
-            props.onModelModeChange?.(valueId === 'true' ? selectedModel.extendedContextModelId : selectedModel.value);
-            return;
-        }
-        hapticsLight();
-        props.onSessionConfigOptionChange?.(configId, valueId);
-    }, [props.onSessionConfigOptionChange, props.onModelModeChange, selectedModelForControls]);
     const hasSettingsAcpConfigSection = Boolean(acpConfigOptionControls);
-
-    const shouldShowModelOptionDescriptions = React.useMemo(() => {
-        return modelOptions.some((option) => {
-            if (option.value === 'default') return false;
-            return typeof option.description === 'string' && option.description.trim().length > 0;
-        });
-    }, [modelOptions]);
 
     const unifiedEnginePickerProbe = React.useMemo<OptionPickerProbeState | undefined>(() => {
         return mergeOptionPickerProbes([
             props.modelOptionsOverrideProbe ?? null,
-            sessionModelOptionsProbe ?? null,
             props.agentPickerProbe ?? null,
             sessionModeOptionsOverrideProbe ?? null,
             acpConfigOptionsOverrideProbe ?? null,
@@ -2181,82 +2084,141 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         props.agentPickerProbe,
         props.modelOptionsOverrideProbe,
         sessionModeOptionsOverrideProbe,
-        sessionModelOptionsProbe,
     ]);
 
-    const renderResolvedEngineDetail = React.useCallback((surfaceVariant: 'carded' | 'plain' = 'carded') => (
-        <AgentInputEngineDetail
-            modelOptions={modelOptions.map((option) => ({
-                value: option.value,
-                label: option.label,
-                ...(appliedModelPresentation?.optionValue === option.value
-                    ? {
-                        trailingStatusIcon: (
-                            <Icon
-                                name={appliedModelPresentation.iconName}
-                                size={16}
-                                color={theme.colors.text.secondary}
-                            />
-                        ),
-                        accessibilityLabel: appliedModelPresentation.summary,
-                    }
-                    : {}),
-                description:
-                    option.value === 'default'
-                    && shouldShowModelOptionDescriptions
-                    && (typeof option.description !== 'string' || option.description.trim().length === 0)
-                        ? t('agentInput.model.configureInCli')
-                        : option.description,
-                ...(option.modelOptions ? { modelOptions: option.modelOptions } : {}),
-            }))}
-            selectedModelId={effectiveModelPolicy.selectedModelId}
-            modelSummary={appliedModelPresentation?.summary
-                ? `${appliedModelPresentation.summary} · ${modelApplyTiming}`
-                : modelApplyTiming}
-            modelNotes={modelNotes}
-            modelEmptyText={t('agentInput.model.configureInCli')}
-            canEnterCustomModel={canEnterCustomModel}
-            // Keep a single refresh affordance in the model section, but wire it to refresh all
-            // probe surfaces that feed the engine popover (CLI detection, models, modes/config).
-            modelProbe={unifiedEnginePickerProbe}
-            onSelectModel={(value) => {
-                hapticsLight();
-                props.onModelModeChange?.(value);
-            }}
-            onSubmitCustomValue={canEnterCustomModel ? submitCustomModel : undefined}
-            selectedModelOptionControls={selectedModelOptionControls}
-            onSelectModelOptionValue={props.onSessionConfigOptionChange ? handleSelectModelOptionValue : undefined}
-            configControls={acpConfigOptionControls}
-            onSelectConfigValue={
-                props.onSessionConfigOptionChange
-                    ? (configId, valueId) => {
-                        hapticsLight();
-                        props.onSessionConfigOptionChange?.(configId, valueId);
-                    }
-                    : undefined
+    const renderResolvedEngineDetail = React.useCallback(({ modelOptions, modelOptionsContext, probe, canEnterCustomModel }: AgentInputModelDetailState) => {
+        const selectModel = (value: string) => {
+            if (modelOptionsContext) props.onModelModeChange?.(value, modelOptionsContext);
+            else props.onModelModeChange?.(value);
+        };
+        const selectedModelForControls = findModelOptionForEffectiveModelId(modelOptions, effectiveModelPolicy.selectedModelId);
+
+        const selectedModelOptionControls = (() => {
+            if (!props.onSessionConfigOptionChange) return null;
+            const selectedModel = selectedModelForControls;
+            if (!selectedModel) return null;
+            const baseControls = selectedModel.modelOptions?.length
+                ? computeSessionConfigOptionControlsFromOverride({
+                    agentId,
+                    configOptions: selectedModel.modelOptions,
+                    overrides: props.acpConfigOptionOverridesOverride?.overrides ?? null,
+                }) ?? []
+                : [];
+            // Extended-context (e.g. Claude `[1m]`) is a MODEL-ID VARIANT, not a config option:
+            // the toggle is synthesized here and routed through the model-override pipeline.
+            if (selectedModel.extendedContextModelId && props.onModelModeChange) {
+                const extendedSelected = effectiveModelPolicy.selectedModelId === selectedModel.extendedContextModelId;
+                const value = extendedSelected ? 'true' : 'false';
+                baseControls.push({
+                    option: {
+                        id: EXTENDED_CONTEXT_MODEL_TOGGLE_OPTION_ID,
+                        name: t('agentInput.model.extendedContextToggleLabel'),
+                        description: t('agentInput.model.extendedContextToggleDescription'),
+                        type: 'boolean',
+                        currentValue: value,
+                    },
+                    effectiveValue: value,
+                    isPending: false,
+                });
             }
-            sectionOrder={['model', 'config']}
-            surfaceVariant={surfaceVariant}
-        />
-    ), [
+            return baseControls.length > 0 ? baseControls : null;
+        })();
+
+        const handleSelectModelOptionValue = (configId: string, valueId: SessionConfigOptionValueId) => {
+            if (configId === EXTENDED_CONTEXT_MODEL_TOGGLE_OPTION_ID) {
+                const selectedModel = selectedModelForControls;
+                if (!selectedModel?.extendedContextModelId) return;
+                hapticsLight();
+                selectModel(valueId === 'true' ? selectedModel.extendedContextModelId : selectedModel.value);
+                return;
+            }
+            hapticsLight();
+            props.onSessionConfigOptionChange?.(configId, valueId);
+        };
+
+        const shouldShowModelOptionDescriptions = (() => {
+            return modelOptions.some((option) => {
+                if (option.value === 'default') return false;
+                return typeof option.description === 'string' && option.description.trim().length > 0;
+            });
+        })();
+
+
+        return (
+            <AgentInputEngineDetail
+                modelOptions={modelOptions.map((option) => ({
+                    value: option.value,
+                    label: option.label,
+                    ...(appliedModelPresentation?.optionValue === option.value
+                        ? {
+                            trailingStatusIcon: (
+                                <Icon
+                                    name={appliedModelPresentation.iconName}
+                                    size={16}
+                                    color={theme.colors.text.secondary}
+                                />
+                            ),
+                            accessibilityLabel: appliedModelPresentation.summary,
+                        }
+                        : {}),
+                    description:
+                        option.value === 'default'
+                        && shouldShowModelOptionDescriptions
+                        && (typeof option.description !== 'string' || option.description.trim().length === 0)
+                            ? t('agentInput.model.configureInCli')
+                            : option.description,
+                    ...(option.modelOptions ? { modelOptions: option.modelOptions } : {}),
+                }))}
+                selectedModelId={effectiveModelPolicy.selectedModelId}
+                modelSummary={appliedModelPresentation?.summary
+                    ? `${appliedModelPresentation.summary} · ${modelApplyTiming}`
+                    : modelApplyTiming}
+                modelNotes={modelNotes}
+                modelEmptyText={t('agentInput.model.configureInCli')}
+                canEnterCustomModel={canEnterCustomModel}
+                // Keep a single refresh affordance in the model section, but wire it to refresh all
+                // probe surfaces that feed the engine popover (CLI detection, models, modes/config).
+                modelProbe={mergeOptionPickerProbes([unifiedEnginePickerProbe, probe])}
+                onSelectModel={(value) => {
+                    hapticsLight();
+                    selectModel(value);
+                }}
+                onSubmitCustomValue={canEnterCustomModel ? (value) => {
+                    const normalized = value.trim();
+                    if (normalized) selectModel(normalized);
+                } : undefined}
+                selectedModelOptionControls={selectedModelOptionControls}
+                onSelectModelOptionValue={props.onSessionConfigOptionChange ? handleSelectModelOptionValue : undefined}
+                configControls={acpConfigOptionControls}
+                onSelectConfigValue={
+                    props.onSessionConfigOptionChange
+                        ? (configId, valueId) => {
+                            hapticsLight();
+                            props.onSessionConfigOptionChange?.(configId, valueId);
+                        }
+                        : undefined
+                }
+                sectionOrder={['model', 'config']}
+                surfaceVariant="carded"
+            />
+        );
+    }, [
+        agentId,
         acpConfigOptionControls,
-        canEnterCustomModel,
+        props.acpConfigOptionOverridesOverride,
         effectiveModelPolicy.selectedModelId,
         modelNotes,
-        modelOptions,
+        modelApplyTiming,
         appliedModelPresentation,
         unifiedEnginePickerProbe,
-        shouldShowModelOptionDescriptions,
         props.onSessionConfigOptionChange,
         props.onModelModeChange,
-        submitCustomModel,
-        selectedModelOptionControls,
-        handleSelectModelOptionValue,
         theme.colors.text.secondary,
     ]);
 
     const hasInternalAgentPickerOptions = Boolean(
-        props.agentType
+        !armedComposerTarget
+        && props.agentType
         && (props.onModelModeChange || hasSettingsAcpConfigSection),
     );
 
@@ -2264,17 +2226,17 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         props.agentType
             ? {
                 id: `engine:${props.agentType}`,
-                label: props.agentLabel ?? t(getAgentCore(props.agentType).displayNameKey),
+                label: displayedAgentLabel ?? t(getAgentCore(props.agentType).displayNameKey),
                 icon: (
                     <AgentIcon
-                        agentId={props.agentType}
+                        agentId={engineChipMarkAgentId}
                         size={12}
-                        style={{ transform: [{ scale: getAgentPickerIconScale(props.agentType) }] }}
+                        style={{ transform: [{ scale: engineChipMarkAgentId ? getAgentPickerIconScale(engineChipMarkAgentId) : 1 }] }}
                     />
                 ),
             }
             : null
-    ), [props.agentLabel, props.agentType]);
+    ), [displayedAgentLabel, engineChipMarkAgentId, props.agentType]);
 
     const internalAgentPickerOptions = React.useMemo<ReadonlyArray<AgentInputChipPickerOption>>(() => {
         if (!hasInternalAgentPickerOptions || !props.agentType || !currentAgentPickerRow) return [];
@@ -2282,9 +2244,24 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
             ...currentAgentPickerRow,
             deferRenderDetailContent: true,
             deferredDetailContentCacheKey: `session-engine:${props.agentType}`,
-            renderDetailContent: () => renderResolvedEngineDetail('carded'),
+            renderDetailContent: () => (
+                <AgentInputModelDiscoveryDetail
+                    agentId={agentId}
+                    metadata={props.metadata ?? null}
+                    modelOptions={modelOptions}
+                    selectedModelId={effectiveModelPolicy.selectedModelId}
+                    discovery={props.modelOptionsOverride ? undefined : props.modelDiscoveryContext}
+                    renderDetail={renderResolvedEngineDetail}
+                />
+            ),
         }];
     }, [
+        agentId,
+        effectiveModelPolicy.selectedModelId,
+        modelOptions,
+        props.metadata,
+        props.modelOptionsOverride,
+        props.modelDiscoveryContext,
         currentAgentPickerRow,
         hasInternalAgentPickerOptions,
         props.agentType,
@@ -2326,6 +2303,10 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
     }, [agentPickerOptions, props.agentPickerSelectedOptionId]);
 
     const hasAgentPickerOptions = agentPickerOptions.length > 0;
+    // A deferred picker is still an available surface before its detail rows
+    // arrive. Keeping this descriptor separate from loaded options lets the first
+    // interaction open the owner that requested those rows.
+    const hasAgentPickerSurface = hasAgentPickerOptions || props.onAgentPickerIntent !== undefined;
     const composerKeyboardLayout = useComposerKeyboardLayoutContext();
 
     const {
@@ -2369,7 +2350,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         hasResumePopover: Boolean(props.resumePopover),
         hasProfilePopover: Boolean(props.profilePopover),
         hasEnvVarsPopover: Boolean(props.envVarsPopover),
-        hasAgentPickerOptions,
+        hasAgentPickerOptions: hasAgentPickerSurface,
         retainKeyboardLift: composerKeyboardLayout?.retainKeyboardLift,
     });
     const {
@@ -2410,8 +2391,9 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
     }, [onAgentPickerVisibilityChange, showAgentPicker]);
 
     const effectivePermissionLabel = React.useMemo(() => {
-        return getPermissionModeLabelForAgentType(agentId, effectivePermissionPolicy.effectiveMode);
-    }, [agentId, effectivePermissionPolicy.effectiveMode]);
+        return effectivePermissionPolicy.nativeModeLabel
+            ?? getPermissionModeLabelForAgentType(engineChipAgentId, effectivePermissionPolicy.effectiveMode);
+    }, [engineChipAgentId, effectivePermissionPolicy.effectiveMode, effectivePermissionPolicy.nativeModeLabel]);
 
     const activeStatusBadge = React.useMemo(() => (
         activeStatusBadgeKey
@@ -2420,8 +2402,8 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
     ), [activeStatusBadgeKey, props.statusBadges]);
 
     const permissionChipLabel = React.useMemo(() => {
-        return getPermissionModeBadgeLabelForAgentType(agentId, effectivePermissionPolicy.effectiveMode);
-    }, [agentId, effectivePermissionPolicy.effectiveMode]);
+        return getPermissionModeBadgeLabelForAgentType(engineChipAgentId, effectivePermissionPolicy.effectiveMode);
+    }, [engineChipAgentId, effectivePermissionPolicy.effectiveMode]);
 
     const showPermissionChip = Boolean(props.onPermissionModeChange || props.onPermissionClick);
     const hasProfile = Boolean(props.onProfileClick || props.profilePopover);
@@ -2439,9 +2421,10 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         handleResumePress,
     } = useAgentInputCoreControlHandlers({
         agentType: props.agentType,
-        agentLabel: props.agentLabel,
-        hasAgentPickerOptions,
+        agentLabel: displayedAgentLabel,
+        hasAgentPickerOptions: hasAgentPickerSurface,
         onAgentClick: props.onAgentClick,
+        onAgentPickerIntent: props.onAgentPickerIntent,
         onPermissionModeChange: props.onPermissionModeChange,
         onPermissionClick: props.onPermissionClick,
         sessionModeChipInteraction,
@@ -2460,32 +2443,6 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         closeSelectionOverlay,
         toggleSelectionOverlay,
     });
-    /**
-     * The armed Agent switch, as the composer is presenting it right now.
-     *
-     * One owner, shared with the send control, so the chip and the button cannot
-     * name different Agents: the picker showing a checkmark on Sonnet 4.6 while
-     * the chip still read GPT 5.6 Sol is the defect this removes. The chip reads
-     * the arm itself — selection is the arming, so it changes with the rail rather
-     * than waiting for a keystroke — while the button additionally requires that
-     * pressing it would take the switch.
-     */
-    const armedComposerTarget = resolveArmedComposerContinuation({
-        armedContinuationTarget: props.armedContinuationTarget,
-    });
-    /**
-     * The mark on the engine chip: the armed Agent while one is armed, otherwise
-     * the Agent running this Session.
-     *
-     * Scoped to the chip on purpose. `agentId` above still resolves the RUNNING
-     * Agent, because permission modes, model options and session modes are facts
-     * about what is running — only this one control is about what runs next.
-     */
-    const engineChipAgentId: AgentId = (
-        armedComposerTarget && isAgentId(armedComposerTarget.agentId)
-            ? armedComposerTarget.agentId
-            : agentId
-    );
     const engineChipLabel = React.useMemo(() => {
         // Selection IS the selection. An armed target with a model chosen names
         // that model; an armed target still on the Agent's own defaults names the
@@ -2493,8 +2450,9 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         if (armedComposerTarget) {
             return armedComposerTarget.modelLabel ?? armedComposerTarget.label;
         }
+        if (!engineChipMarkAgentId) return t('status.unknown');
         return hasAgentPickerOptions ? selectedModelLabel : resolvedAgentLabel;
-    }, [armedComposerTarget, hasAgentPickerOptions, resolvedAgentLabel, selectedModelLabel]);
+    }, [armedComposerTarget, engineChipMarkAgentId, hasAgentPickerOptions, resolvedAgentLabel, selectedModelLabel]);
     const hasRecipient = React.useMemo(() => {
         return (props.extraActionChips ?? []).some((chip) => chip.controlId === 'recipient');
     }, [props.extraActionChips]);
@@ -2640,6 +2598,17 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
     }, [canStopFromComposer, handleComposerAbortShortcut, handleComposerFocusShortcut]);
     useKeyboardShortcutHandlers(keyboardShortcutHandlers);
 
+    // Identity-stable handlers: these feed the action-menu and control-row memos, which an inline
+    // arrow would invalidate on every keystroke render.
+    const handleStopFromComposer = React.useCallback(() => {
+        void handleAbortPress();
+    }, [handleAbortPress]);
+    const handleToggleExtraChipCollapsedPopover = React.useCallback((chipKey: string) => {
+        toggleSelectionOverlay('collapsedExtra', 'chip', chipKey);
+    }, [toggleSelectionOverlay]);
+    const blurComposerInput = React.useCallback(() => {
+        inputRef.current?.blur();
+    }, []);
     const {
         handleActionMenuPress,
         actionMenuActions,
@@ -2658,13 +2627,14 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         machinePopover: props.machinePopover,
         pathPopover: props.pathPopover,
         resumePopover: props.resumePopover,
-        hasAgentPickerOptions,
+        hasAgentPickerOptions: hasAgentPickerSurface,
         onAgentClick: props.onAgentClick,
+        onAgentPickerIntent: props.onAgentPickerIntent,
         actionBarIsCollapsed,
         hasAnyActions,
         tint: theme.colors.composer.chipTint,
         // The engine control names what runs NEXT, so it follows the armed target.
-        agentId: engineChipAgentId,
+        agentId: engineChipMarkAgentId,
         profileLabel,
         profileIcon,
         envVarsCount: props.envVarsCount,
@@ -2691,9 +2661,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         onResumeClick: handleResumePress,
         onFileViewerPress: props.onFileViewerPress,
         canStop: canStopFromComposer,
-        onStop: () => {
-            void handleAbortPress();
-        },
+        onStop: handleStopFromComposer,
         hasProfile,
         hasEnvVars,
         hasAgent,
@@ -2706,9 +2674,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         layout: effectiveActionBarLayout,
         chips: props.extraActionChips,
         overlayAnchorRef,
-        onToggleExtraChipCollapsedPopover: (chipKey) => {
-            toggleSelectionOverlay('collapsedExtra', 'chip', chipKey);
-        },
+        onToggleExtraChipCollapsedPopover: handleToggleExtraChipCollapsedPopover,
         themeTint: theme.colors.composer.chipTint,
         showChipLabels,
         showAutoHideChipLabels,
@@ -2741,7 +2707,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         envVarsCount: props.envVarsCount,
         onEnvVarsPress: handleEnvVarsPress,
         // The engine chip names what runs NEXT, so it follows the armed target.
-        agentId: engineChipAgentId,
+        agentId: engineChipMarkAgentId,
         hasAgentSelection: hasAgent,
         agentChipAnchorRef,
         agentLabel: resolvedAgentLabel,
@@ -2756,7 +2722,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         currentPath: props.currentPath,
         resumeChipAnchorRef,
         onResumePress: handleResumePress,
-        blurInput: () => inputRef.current?.blur(),
+        blurInput: blurComposerInput,
         resumeSessionId: props.resumeSessionId,
         resumeIsChecking: props.resumeIsChecking,
         onAbort: props.onAbort,
@@ -3224,7 +3190,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
                     permissionChipAnchorRef={permissionChipAnchorRef}
                     onPermissionPopoverRequestClose={closePermissionPopover}
                     onPermissionSelect={handlePermissionSelect}
-                    agentId={agentId}
+                    agentId={engineChipAgentId}
                     permissionModeOptions={permissionModeOptions}
                     effectivePermissionMode={effectivePermissionPolicy.effectiveMode}
                     effectivePermissionLabel={effectivePermissionLabel}
@@ -3382,10 +3348,11 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
                                 return (
                                     <>
                                         {showContextGauge && contextUsageState ? (
-                                            <AgentInputContextUsageBadge state={contextUsageState} />
+                                            <AgentInputContextUsageBadge showLabels={showUsageGaugeLabels} state={contextUsageState} />
                                         ) : null}
                                         {showProviderGauge && props.providerUsageGauge ? (
                                             <AgentInputProviderUsageBadge
+                                                showLabels={showUsageGaugeLabels}
                                                 viewModel={props.providerUsageGauge}
                                                 marginLeft={showContextGauge ? 8 : 0}
                                                 onRecoveryCreditPress={props.onProviderUsageRecoveryCreditPress}

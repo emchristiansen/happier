@@ -36,43 +36,13 @@ export type ConnectedServiceMaterializedHomeStalenessInput = Readonly<{
 }>;
 
 /**
- * Startup format+freshness reconcile of a provider's STABLE materialized homes (triage #4 systemic
- * leg). Historical writer regressions left malformed auth stores on disk (e.g. epoch-millis
- * `last_refresh` in codex homes) that nothing ever revisited, because stable homes are not part of
- * the refresh-target freshness net. At daemon startup the provider validates each stable home's
- * store and rewrites it from the CURRENT store record via its own canonical writer when malformed
- * or stale, so historical poison can never persist.
- */
-export type ConnectedServiceStableHomeReconcileResult = Readonly<{
-  scanned: number;
-  rewritten: number;
-}>;
-
-/**
- * ONE provider-owned home-maintenance surface (RR-9 + triage #4). Both the refresh coordinator's
- * live-staleness probe and the startup stable-home reconcile hang off this single descriptor field
- * so there is exactly one place a provider contributes home maintenance, not two.
+ * Provider-owned live-home staleness probe consumed by the refresh coordinator.
  */
 export type ConnectedServiceMaterializedHomeMaintenance = Readonly<{
   /** RR-9: is a live materialized home stale vs the owning credential? Absent ⇒ never stale. */
   hasStaleMaterializedHomeForBinding?: (
     input: ConnectedServiceMaterializedHomeStalenessInput,
   ) => Promise<boolean>;
-  /**
-   * Triage #4: format+freshness-reconcile this provider's stable homes at daemon startup and on the
-   * scheduled cadence. The provider enumerates its own on-disk homes and rewrites (via its canonical
-   * writer) any home whose auth store is malformed OR whose access-token fingerprint no longer
-   * matches the current store record. The daemon supplies the store-record resolver (it owns the
-   * api/credentials); the provider must fail CLOSED — never clobber a home it cannot source.
-   */
-  reconcileStableHomesAtStartup?: (input: Readonly<{
-    activeServerDir: string;
-    now: number;
-    resolveStoreCredentialRecordForProfile: (binding: Readonly<{
-      serviceId: ConnectedServiceId;
-      profileId: string;
-    }>) => Promise<ConnectedServiceCredentialRecordV1 | null>;
-  }>) => Promise<ConnectedServiceStableHomeReconcileResult>;
 }>;
 
 export type ConnectedServiceRefreshReason =
@@ -188,8 +158,7 @@ export type ConnectedServiceCredentialStorageCleanup = Readonly<{
  * - `runtimeAuthApply` — central switch/fanout policy for in-turn direct-live eligibility
  *   and exact runtime identity/auth-mode requirements.
  * - `credentialStorageCleanup` — materialized/group-home cleanup schedulers.
- * - `materializedHomeMaintenance` — refresh coordinator live-staleness probe (RR-9) + startup
- *   stable-home reconcile (triage #4); the ONE provider-owned home-maintenance surface.
+ * - `materializedHomeMaintenance` — refresh coordinator live-staleness probe (RR-9).
  */
 export type ConnectedServiceCredentialLifecycleDescriptor = Readonly<{
   providerId: CatalogAgentId;

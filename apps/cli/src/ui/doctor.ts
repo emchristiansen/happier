@@ -6,6 +6,7 @@
  */
 
 import chalk from 'chalk'
+import { banner, createStepPrinter, fail, neutral, ok, sectionTitle, warn } from '@happier-dev/cli-common/output';
 import { configuration } from '@/configuration'
 import { readSettings, readCredentials } from '@/persistence'
 import { checkIfDaemonRunningAndCleanupStaleState } from '@/daemon/controlClient'
@@ -16,6 +17,7 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import packageJson from '../../package.json'
 import { buildDoctorSnapshot, type DoctorSnapshot } from '@/ui/doctorSnapshot'
+import { formatAccountIdentity, formatRelayHost } from '@/auth/describeSignedInIdentity'
 import { formatDoctorLocalRelayLines } from '@/ui/doctorLocalRelays'
 import {
     buildDoctorRuntimeDiagnostics,
@@ -174,57 +176,73 @@ export function shouldShowGlobalProcessInventory(filter: 'all' | 'daemon'): bool
     return filter === 'all';
 }
 
+/**
+ * Which relay this computer's daemon is for and which account it is signed in as, in the same
+ * words `happier auth status` uses, so a person can compare them with the app (plan R17).
+ */
+export function formatDaemonIdentityLines(status: NonNullable<DoctorSnapshot['daemonStatus']>): string[] {
+    const account = formatAccountIdentity({
+        accountLabel: status.auth.accountLabel ?? null,
+        accountId: status.auth.validatedAccountId ?? null,
+    });
+    return [
+        `  Relay: ${formatRelayHost(status.server.serverUrl)}`,
+        ...(account ? [`  Account: ${account}`] : []),
+    ];
+}
+
 export async function runDoctorCommand(filter?: 'all' | 'daemon'): Promise<void> {
     // Default to 'all' if no filter specified
     if (!filter) {
         filter = 'all';
     }
 
+    console.log(`\n${banner(filter === 'daemon' ? 'Happier daemon' : 'Happier CLI doctor')}\n`);
+
     let snapshot: DoctorSnapshot | null = null;
     try {
-        snapshot = await buildDoctorSnapshot();
+        snapshot = await createStepPrinter().run('Inspecting this computer', buildDoctorSnapshot, () => 'Inspected this computer');
     } catch {
         snapshot = null;
     }
-    
-    console.log(chalk.bold.cyan('\n🩺 Happier CLI Doctor\n'));
+    console.log('');
 
     // For 'all' filter, show everything. For 'daemon', only show daemon-related info
     if (filter === 'all') {
         let cleanupOwnershipSummary: ReturnType<typeof renderDoctorCleanupOwnershipSummary> | null = null;
 
         // Version and basic info
-        console.log(chalk.bold('📋 Basic Information'));
-        console.log(`Happier CLI Version: ${chalk.green(packageJson.version)}`);
-        console.log(`Platform: ${chalk.green(process.platform)} ${process.arch}`);
+        console.log(sectionTitle('Basic information'));
+        console.log(`Happier CLI Version: ${String(packageJson.version)}`);
+        console.log(`Platform: ${String(process.platform)} ${process.arch}`);
         const runtimeDiagnostics = buildDoctorRuntimeDiagnostics();
-        console.log(`Runtime: ${chalk.green(formatDoctorRuntimeLabel(runtimeDiagnostics))}`);
+        console.log(`Runtime: ${String(formatDoctorRuntimeLabel(runtimeDiagnostics))}`);
         if (runtimeDiagnostics.runtime !== 'node' && runtimeDiagnostics.nodeCompatibilityVersion) {
-            console.log(`Node compatibility: ${chalk.green(runtimeDiagnostics.nodeCompatibilityVersion)}`);
+            console.log(`Node compatibility: ${String(runtimeDiagnostics.nodeCompatibilityVersion)}`);
         }
         console.log('');
 
         // Daemon spawn diagnostics
-        console.log(chalk.bold('🔧 Daemon Spawn Diagnostics'));
-        console.log(`Project Root: ${chalk.blue(runtimeDiagnostics.projectRoot)}`);
-        console.log(`Wrapper Script: ${chalk.blue(formatDoctorSpawnPathLabel(runtimeDiagnostics.wrapperPath))}`);
-        console.log(`CLI Entrypoint: ${chalk.blue(formatDoctorSpawnPathLabel(runtimeDiagnostics.cliEntrypointPath))}`);
+        console.log(sectionTitle('Daemon spawn diagnostics'));
+        console.log(`Project Root: ${String(runtimeDiagnostics.projectRoot)}`);
+        console.log(`Wrapper Script: ${String(formatDoctorSpawnPathLabel(runtimeDiagnostics.wrapperPath))}`);
+        console.log(`CLI Entrypoint: ${String(formatDoctorSpawnPathLabel(runtimeDiagnostics.cliEntrypointPath))}`);
         if (runtimeDiagnostics.wrapperExists !== null) {
-            console.log(`Wrapper Exists: ${runtimeDiagnostics.wrapperExists ? chalk.green('✓ Yes') : chalk.red('❌ No')}`);
+            console.log(`Wrapper Exists: ${runtimeDiagnostics.wrapperExists ? ok('Yes') : fail('No')}`);
         }
         if (runtimeDiagnostics.cliEntrypointExists !== null) {
-            console.log(`CLI Exists: ${runtimeDiagnostics.cliEntrypointExists ? chalk.green('✓ Yes') : chalk.red('❌ No')}`);
+            console.log(`CLI Exists: ${runtimeDiagnostics.cliEntrypointExists ? ok('Yes') : fail('No')}`);
         }
         console.log('');
 
 		        // Configuration
-		        console.log(chalk.bold('⚙️  Configuration'));
-		        console.log(`Happier Home: ${chalk.blue(configuration.happyHomeDir)}`);
-		        console.log(`Relay URL: ${chalk.blue(configuration.serverUrl)}`);
-		        console.log(`Logs Dir: ${chalk.blue(configuration.logsDir)}`);
+		        console.log(sectionTitle('Configuration'));
+		        console.log(`Happier Home: ${String(configuration.happyHomeDir)}`);
+		        console.log(`Relay URL: ${String(configuration.serverUrl)}`);
+		        console.log(`Logs Dir: ${String(configuration.logsDir)}`);
 
         // Environment
-        console.log(chalk.bold('\n🌍 Environment Variables'));
+        console.log(`\n${sectionTitle('Environment variables')}`);
         const env = getEnvironmentInfo();
         console.log(`HAPPIER_HOME_DIR: ${env.HAPPIER_HOME_DIR ? chalk.green(env.HAPPIER_HOME_DIR) : chalk.gray('not set')}`);
         console.log(`HAPPIER_SERVER_URL: ${env.HAPPIER_SERVER_URL ? chalk.green(env.HAPPIER_SERVER_URL) : chalk.gray('not set')}`);
@@ -234,18 +252,18 @@ export async function runDoctorCommand(filter?: 'all' | 'daemon'): Promise<void>
 
 		        // Connections summary (relay/account/relay profiles)
 		        if (snapshot) {
-		            console.log(chalk.bold('\n🧭 Connections'));
-		            console.log(`Resolved relay profile ID: ${chalk.green(snapshot.server.activeServerId)}`);
-		            console.log(`Resolved relay URL: ${chalk.blue(snapshot.server.serverUrl)}`);
+		            console.log(`\n${sectionTitle('Connections')}`);
+		            console.log(`Resolved relay profile ID: ${String(snapshot.server.activeServerId)}`);
+		            console.log(`Resolved relay URL: ${String(snapshot.server.serverUrl)}`);
 	            if (snapshot.accountId) {
-	                console.log(`Account: ${chalk.green(snapshot.accountId)}`);
+	                console.log(`Account: ${String(snapshot.accountId)}`);
 	            } else {
 	                console.log(`Account: ${chalk.gray('(unknown)')}`);
 	            }
 
 		            const settingsActive = snapshot.settings.activeServerId;
 		            if (settingsActive && settingsActive !== snapshot.server.activeServerId) {
-		                console.log(chalk.yellow(`⚠️  settings.json activeServerId (${settingsActive}) differs from resolved relay profile ID (${snapshot.server.activeServerId})`));
+		                console.log(warn(`settings.json activeServerId (${settingsActive}) differs from resolved relay profile ID (${snapshot.server.activeServerId})`));
 		            }
 
 		            if (snapshot.settings.servers.length > 0) {
@@ -278,32 +296,32 @@ export async function runDoctorCommand(filter?: 'all' | 'daemon'): Promise<void>
         // Settings
         try {
             const settings = await readSettings();
-            console.log(chalk.bold('\n📄 Settings (settings.json):'));
+            console.log(`\n${sectionTitle('Settings')} ${chalk.gray('(settings.json)')}`);
             console.log(chalk.gray(JSON.stringify(redactSettingsForDisplay(settings), null, 2)));
         } catch (error) {
-            console.log(chalk.bold('\n📄 Settings:'));
-            console.log(chalk.red('❌ Failed to read settings'));
+            console.log(`\n${sectionTitle('Settings')}`);
+            console.log(fail('Failed to read settings'));
         }
 
         // Authentication status
-        console.log(chalk.bold('\n🔐 Authentication'));
+        console.log(`\n${sectionTitle('Authentication')}`);
         try {
             const credentials = await readCredentials();
             if (credentials) {
-                console.log(chalk.green('✓ Authenticated (credentials found)'));
+                console.log(ok('Authenticated (credentials found)'));
                 if (snapshot?.accountId) {
                     console.log(`  Account: ${chalk.green(snapshot.accountId)}`);
                 }
             } else {
-                console.log(chalk.yellow('⚠️  Not authenticated (no credentials)'));
+                console.log(warn('Not authenticated (no credentials)'));
             }
         } catch (error) {
-            console.log(chalk.red('❌ Error reading credentials'));
+            console.log(fail('Error reading credentials'));
         }
     }
 
     // Daemon status - shown for both 'all' and 'daemon' filters
-    console.log(chalk.bold('\n🤖 Daemon Status'));
+    console.log(`\n${sectionTitle('Daemon status')}`);
     let cleanupOwnershipSummary: DoctorCleanupOwnershipSummary | null = null;
     let cleanupOwnershipSummarySource: Readonly<{
         ownerLabel: string;
@@ -313,6 +331,9 @@ export async function runDoctorCommand(filter?: 'all' | 'daemon'): Promise<void>
         const snapshotDaemonStatus = snapshot?.daemonStatus;
 
         if (snapshotDaemonStatus) {
+            for (const line of formatDaemonIdentityLines(snapshotDaemonStatus)) {
+                console.log(line);
+            }
             const daemon = snapshotDaemonStatus.daemon;
             const serviceManaged = daemon.serviceManaged ?? null;
             const ownerLabel = formatDaemonOwnerLabel({
@@ -323,7 +344,7 @@ export async function runDoctorCommand(filter?: 'all' | 'daemon'): Promise<void>
             });
 
             if (daemon.running) {
-                console.log(chalk.green('✓ Daemon is running'));
+                console.log(ok('Daemon is running'));
                 if (daemon.pid) {
                     console.log(`  PID: ${daemon.pid}`);
                 }
@@ -353,14 +374,14 @@ export async function runDoctorCommand(filter?: 'all' | 'daemon'): Promise<void>
                     serviceManaged,
                 };
             } else {
-                console.log(chalk.red('❌ Daemon is not running'));
+                console.log(neutral('Daemon is not running'));
             }
         } else {
             const isRunning = await checkIfDaemonRunningAndCleanupStaleState();
             const state = await readDaemonState();
 
             if (isRunning && state) {
-            console.log(chalk.green('✓ Daemon is running'));
+            console.log(ok('Daemon is running'));
             console.log(`  PID: ${state.pid}`);
             console.log(`  Started: ${new Date(state.startedAt).toLocaleString()}`);
             console.log(`  CLI Version: ${state.startedWithCliVersion}`);
@@ -397,15 +418,15 @@ export async function runDoctorCommand(filter?: 'all' | 'daemon'): Promise<void>
                 serviceManaged: resolveDaemonStartupSourceServiceManagedState(state.startupSource, state.serviceLabel),
             };
             } else if (state && !isRunning) {
-                console.log(chalk.yellow('⚠️  Daemon state exists but process not running (stale)'));
+                console.log(warn('Daemon state exists but process not running (stale)'));
             } else {
-                console.log(chalk.red('❌ Daemon is not running'));
+                console.log(neutral('Daemon is not running'));
             }
 
             // Show daemon state file
             if (state) {
-                console.log(chalk.bold('\n📄 Daemon State:'));
-                console.log(chalk.blue(`Location: ${configuration.daemonStateFile}`));
+                console.log(`\n${sectionTitle('Daemon state')}`);
+                console.log(`Location: ${configuration.daemonStateFile}`);
                 console.log(chalk.gray(JSON.stringify(redactDaemonStateForDisplay(state), null, 2)));
             }
         }
@@ -414,7 +435,7 @@ export async function runDoctorCommand(filter?: 'all' | 'daemon'): Promise<void>
             // All Happier processes
             const allProcesses = await findAllHappyProcesses();
             if (allProcesses.length > 0) {
-                console.log(chalk.bold('\n🔍 All Happier CLI Processes'));
+                console.log(`\n${sectionTitle('All Happier CLI processes')}`);
 
                 // Group by type
                 const grouped = allProcesses.reduce((groups, process) => {
@@ -426,55 +447,52 @@ export async function runDoctorCommand(filter?: 'all' | 'daemon'): Promise<void>
                 // Display each group
                 Object.entries(grouped).forEach(([type, processes]) => {
                     const typeLabels: Record<string, string> = {
-                        'current': '📍 Current Process',
-                        'daemon': '🤖 Daemon',
-                        'daemon-version-check': '🔍 Daemon Version Check (stuck)',
-                        'daemon-spawned-session': '🔗 Daemon-Spawned Sessions',
-                        'user-session': '👤 User Sessions',
-                        'dev-daemon': '🛠️  Dev Daemon',
-                        'dev-daemon-version-check': '🛠️  Dev Daemon Version Check (stuck)',
-                        'dev-session': '🛠️  Dev Sessions',
-                        'dev-doctor': '🛠️  Dev Doctor',
-                        'dev-related': '🛠️  Dev Related',
-                        'doctor': '🩺 Doctor',
-                        'unknown': '❓ Unknown'
+                        'current': 'Current process',
+                        'daemon': 'Daemon',
+                        'daemon-version-check': 'Daemon version check (stuck)',
+                        'daemon-spawned-session': 'Daemon-spawned sessions',
+                        'user-session': 'User sessions',
+                        'dev-daemon': 'Dev daemon',
+                        'dev-daemon-version-check': 'Dev daemon version check (stuck)',
+                        'dev-session': 'Dev sessions',
+                        'dev-doctor': 'Dev doctor',
+                        'dev-related': 'Dev related',
+                        'doctor': 'Doctor',
+                        'unknown': 'Unknown'
                     };
 
-                    console.log(chalk.blue(`\n${typeLabels[type] || type}:`));
+                    console.log(`\n${typeLabels[type] || type}`);
                     processes.forEach(({ pid, command }) => {
-                        const color = type === 'current' ? chalk.green :
-                            type.startsWith('dev') ? chalk.cyan :
-                                type.includes('daemon') ? chalk.blue : chalk.gray;
-                        console.log(`  ${color(`PID ${pid}`)}: ${chalk.gray(command)}`);
+                        console.log(`  PID ${pid}  ${chalk.gray(command)}`);
                     });
                 });
             } else {
-                console.log(chalk.red('❌ No happier processes found'));
+                console.log(fail('No happier processes found'));
             }
 
             if (allProcesses.length > 1) { // More than just current process
-                console.log(chalk.bold('\n💡 Process Management'));
+                console.log(`\n${sectionTitle('Process management')}`);
                 console.log(chalk.gray('To clean up runaway processes: happier doctor clean'));
             }
 
             const cleanupSummary = cleanupOwnershipSummary;
             if (cleanupSummary !== null) {
                 const renderedCleanupSummary = cleanupSummary as DoctorCleanupOwnershipSummary;
-                console.log(chalk.bold(`\n🧹 ${renderedCleanupSummary.title}`));
+                console.log(`\n${sectionTitle(renderedCleanupSummary.title)}`);
                 renderedCleanupSummary.lines.forEach((line: string, index: number) => {
                     console.log(index === 0 ? line : chalk.gray(line));
                 });
             }
         }
     } catch (error) {
-        console.log(chalk.red('❌ Error checking daemon status'));
+        console.log(fail('Error checking daemon status'));
     }
 
     if (filter === 'all' && cleanupOwnershipSummarySource) {
         cleanupOwnershipSummary = renderDoctorCleanupOwnershipSummary(cleanupOwnershipSummarySource);
         const summary = cleanupOwnershipSummary;
         if (summary !== null) {
-            console.log(chalk.bold(`\n🧹 ${summary.title}`));
+            console.log(`\n${sectionTitle(summary.title)}`);
             summary.lines.forEach((line, index) => {
                 console.log(index === 0 ? line : chalk.gray(line));
             });
@@ -483,7 +501,7 @@ export async function runDoctorCommand(filter?: 'all' | 'daemon'): Promise<void>
 
     // Log files - only show for 'all' filter
     if (filter === 'all') {
-        console.log(chalk.bold('\n📝 Log Files'));
+        console.log(`\n${sectionTitle('Log files')}`);
 
         // Get ALL log files
         const allLogs = getLogFiles(configuration.logsDir);
@@ -495,7 +513,7 @@ export async function runDoctorCommand(filter?: 'all' | 'daemon'): Promise<void>
 
             // Show regular logs (max 10)
             if (regularLogs.length > 0) {
-                console.log(chalk.blue('\nRecent Logs:'));
+                console.log('\nRecent logs');
                 const logsToShow = regularLogs.slice(0, 10);
                 logsToShow.forEach(({ file, path, modified }) => {
                     console.log(`  ${chalk.green(file)} - ${modified.toLocaleString()}`);
@@ -508,7 +526,7 @@ export async function runDoctorCommand(filter?: 'all' | 'daemon'): Promise<void>
 
             // Show daemon logs (max 5)
             if (daemonLogs.length > 0) {
-                console.log(chalk.blue('\nDaemon Logs:'));
+                console.log('\nDaemon logs');
                 const daemonLogsToShow = daemonLogs.slice(0, 5);
                 daemonLogsToShow.forEach(({ file, path, modified }) => {
                     console.log(`  ${chalk.green(file)} - ${modified.toLocaleString()}`);
@@ -525,10 +543,11 @@ export async function runDoctorCommand(filter?: 'all' | 'daemon'): Promise<void>
         }
 
         // Support and bug reports
-        console.log(chalk.bold('\n🐛 Support & Bug Reports'));
-        console.log(`Report issues: ${chalk.blue('https://github.com/happier-dev/happier/issues')}`);
-        console.log(`Documentation: ${chalk.blue('https://app.happier.dev')}`);
+        console.log(`\n${sectionTitle('Support and bug reports')}`);
+        console.log(`Report issues: ${String('https://github.com/happier-dev/happier/issues')}`);
+        console.log(`Documentation: ${String('https://cloud.happier.dev')}`);
     }
 
-    console.log(chalk.green('\n✅ Doctor diagnosis complete!\n'));
+    if (filter === 'all') console.log(`\n${ok('Diagnosis complete')}\n`);
+    else console.log('');
 }

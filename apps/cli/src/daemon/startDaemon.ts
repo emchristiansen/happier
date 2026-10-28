@@ -1,3 +1,4 @@
+import { matchesCurrentQuotaObservationCredential } from './connectedServices/quotas/proof/quotaProbeFreshProof';
 import fs from 'fs/promises';
 import os from 'os';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -15,7 +16,7 @@ import { readSessionArchiveState } from '@/session/services/readSessionArchiveSt
 import { createBackoff } from '@/utils/time';
 import { serializeAxiosErrorForLog } from '@/api/client/serializeAxiosErrorForLog';
 import { ensureMachineRegistered } from '@/api/machine/ensureMachineRegistered';
-import { ensureSessionMachineAccessKeyBinding } from '@/api/session/ensureSessionMachineAccessKeyBinding';
+import { reconcileRecoveredSessionMachineControl } from './sessions/reconcileRecoveredSessionMachineControl';
 import { isRpcMethodNotAvailableError } from '@happier-dev/protocol/rpcErrors';
 import { callSessionRpc } from '@/session/transport/rpc/sessionRpc';
 import { resolveSessionTransportContext } from '@/session/services/resolveSessionTransportContext';
@@ -25,6 +26,11 @@ import {
 } from './sessions/pendingQueueWake';
 import { publishSessionPendingQueueWake } from './sessions/publishSessionPendingQueueWake';
 import { retryRuntimeAuthLimitAfterReset } from './connectedServices/runtimeAuth/retryRuntimeAuthLimitAfterReset';
+import { checkRuntimeAuthUsageLimitRecovery } from './connectedServices/runtimeAuth/checkRuntimeAuthUsageLimitRecovery';
+import { isCurrentUsageLimitRecoverySource } from './connectedServices/runtimeAuth/isCurrentUsageLimitRecoveryCredential';
+import { continueSessionAfterUsageLimitReset } from './connectedServices/continuation/continueSessionAfterUsageLimitReset';
+import { buildRuntimeAuthUsageLimitRecoveryMetadataUpdater } from './connectedServices/runtimeAuth/projection/connectedServiceRuntimeAuthRecoveryUsageLimitMetadata';
+import { SessionUsageLimitRecoveryV1Schema } from '@happier-dev/protocol';
 import { createRuntimeAuthRecoverySchedulerForDaemon } from './connectedServices/runtimeAuth/createRuntimeAuthRecoverySchedulerForDaemon';
 import { projectTemporaryThrottleRecoveryMetadata } from './connectedServices/runtimeAuth/projection/temporaryThrottleRecoveryMetadata';
 import { deriveConnectedServiceBrokerRefreshToken } from './connectedServices/broker/brokerRefreshCapabilityToken';
@@ -42,6 +48,7 @@ import {
   SpawnSessionRunnerAcceptanceHooks,
 } from '@/rpc/handlers/registerSessionHandlers';
 import { resolveCanonicalCodexBackendMode } from '@/rpc/handlers/codexBackendMode';
+import { buildTrackedSpawnOptions, resolveDaemonTerminalPresentation } from '@/daemon/spawnHooks';
 import { logger } from '@/ui/logger';
 import { authAndSetupMachineIfNeeded } from '@/ui/auth';
 import { configuration, reloadConfiguration } from '@/configuration';
@@ -66,11 +73,11 @@ import {
   resolveConnectedServiceSwitchContinuity,
   resolveAgentCliSubcommand,
   resolveCatalogAgentId,
-  hasTerminalAttachmentControlDescriptorThroughCatalog,
+  resolveTerminalAttachmentControlDescriptorStatusThroughCatalog,
   notifyTerminalAttachmentRetiredThroughCatalog,
 } from '@/backends/catalog';
 import { CATALOG_AGENT_IDS } from '@/backends/types';
-import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
+import { processInstanceFingerprintMatches, readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
 import {
   writeDaemonStateIfLockOwned,
   writeConnectedServiceBrokerState,
@@ -108,6 +115,7 @@ import { resolveDaemonServiceCliRuntimeFromEnv } from '@/daemon/service/cli';
 import { forceStopKnownDaemonPid, isDaemonRunningCurrentlyInstalledHappyVersion, resolveDaemonSpawnSessionByNonce, stopDaemon } from './controlClient';
 import { startDaemonControlServer } from './controlServer';
 import { resolveTrackedSessionCatalogAgentId } from './sessions/resolveTrackedSessionCatalogAgentId';
+import { extractResumeIdFromCommand } from './sessions/extractResumeIdFromCommand';
 import { activatePendingSessionRuntime } from './sessions/activatePendingInactiveSession';
 import {
   recoverPendingSessionActivations,
@@ -128,7 +136,8 @@ import {
   resolveClaudeEndpointRecoverySpawnOptions,
 } from './sessions/claudeEndpointStateEnv';
 import { HAPPIER_CLAUDE_ENDPOINT_STATE_ENV_KEY } from '@/backends/claude/endpointRecovery/claudeEndpointArtifacts';
-import { createOnHappySessionWebhook } from './sessions/onHappySessionWebhook';
+import { buildTerminalAttachmentMetadataFromHostHandle } from '@/agent/runtime/terminal/attachmentMetadata';
+import { adoptReportedHappySessionId, adoptReportedSessionRunnerIdentity, correlateTrackedSessionReport, createOnHappySessionWebhook } from './sessions/onHappySessionWebhook';
 import { applyTrackedSessionTurnLifecycle } from './sessions/applyTrackedSessionTurnLifecycle';
 import { connectedServiceTurnLifecycleContinue } from './connectedServices/connectedServiceTurnLifecycleContract';
 import { resolveSessionRuntimeSnapshot } from './sessions/runtimeSnapshot/resolveSessionRuntimeSnapshot';
@@ -140,6 +149,9 @@ import { publishOrphanedStartupSessionEnds } from './sessions/publishOrphanedSta
 import {
   resolveDisconnectedTerminalHostResumeGate,
   superviseDisconnectedTerminalHostCandidate,
+  superviseTrackedOptionalTerminalPresentation,
+  resolveTrackedSessionTerminalHostExitCandidate,
+  shouldRetainTrackedTerminalHostExitMarker,
   type DisconnectedTerminalHostCandidate,
   type DisconnectedTerminalHostSupervisionResult,
 } from './sessions/disconnectedTerminalHostSupervision';
@@ -165,7 +177,9 @@ import { waitForTrackedRunnerProcessesExit } from './sessions/waitForTrackedRunn
 import { readProcessRunState } from './processRunState';
 import { resolveSpawnWebhookResult } from './sessions/resolveSpawnWebhookResult';
 import {
+  classifyTrackedSessionRunnerPresence,
   isSessionRunnerActive as isSessionRunnerActiveInDaemon,
+  probeSessionRunnerPresence,
   probeSessionRunnerServiceability as probeSessionRunnerServiceabilityInDaemon,
   resolveSessionRunnerResumeDecision,
   type MatchedLostPublisherRunner,
@@ -179,7 +193,7 @@ import {
   readDaemonRestartVerifyPollMs,
   readDaemonRestartVerifyTimeoutMs,
 } from './startupWaitDefaults';
-import { reapSameHomeDaemonOrphansBeforeStart } from './multiDaemon';
+import { reapCurrentLifecycleDaemonOrphansBeforeStart } from './multiDaemon';
 import {
   createSessionRunnerRespawnManager,
   type SessionRunnerRespawnTerminalReason,
@@ -203,10 +217,11 @@ import {
 import {
   getPreferredHostName,
   initialMachineMetadata,
-  refreshMachineMetadataForCurrentDaemon,
 } from './machine/metadata';
+import { readCliUpdateFactsForThisCli } from '@/cli/runtime/update/cliUpdateFacts';
+import { createCliUpdateMetadataPublisher, type CliUpdateMetadataPublisher } from './machine/cliUpdateMetadataPublisher';
 import { createDaemonShutdownController } from './lifecycle/shutdown';
-import { buildTmuxSpawnConfig, buildTmuxWindowEnv } from './platform/tmux/spawnConfig';
+import { buildHostedRunnerSpawnConfig, buildTmuxSpawnConfig, buildTmuxWindowEnv } from './platform/tmux/spawnConfig';
 export { buildTmuxSpawnConfig, buildTmuxWindowEnv } from './platform/tmux/spawnConfig';
 import {
   migrateTrackedSessionProcessesOutOfDaemonServiceCgroup,
@@ -232,6 +247,8 @@ import {
   resolveWindowsTerminalWindowName,
 } from './platform/windows/windowsHostedSessionRuntime';
 import { SPAWN_SESSION_ERROR_CODES } from '@/rpc/handlers/registerSessionHandlers';
+import { resolveTerminalHostLaunchFailure, resolveTerminalHostUnavailableSpawnErrorDetail } from '@/integrations/terminalHost/errors';
+import { prepareHerdrTerminalContext } from '@/terminal/runtime/prepareHerdrTerminalContext';
 import {
   clearSessionMarkerConnectedServiceRestartIntent,
   readSessionMarkerForPid,
@@ -255,7 +272,6 @@ import { resolveDaemonDiagnosticSubsystemGates } from './startup/diagnosticSubsy
 import { createDaemonEventLoopStallMonitor } from './diagnostics/daemonEventLoopStallMonitor';
 import { resolveStartDaemonMachinePreflightDecision } from './startup/machinePreflightDecision';
 import { waitForSessionWebhook } from './spawn/waitForSessionWebhook';
-import { settlePendingSpawnBeforeWebhook } from './spawn/settlePendingSpawnBeforeWebhook';
 import { resolveSpawnChildEnvironment } from './spawn/resolveSpawnChildEnvironment';
 import { buildSpawnChildProcessEnv } from './spawn/buildSpawnChildProcessEnv';
 import { resolveStackProcessKindOverrideForSessionSpawn } from './spawn/resolveStackProcessKindOverrideForSessionSpawn';
@@ -395,6 +411,7 @@ import {
   type ConnectedServiceSwitchTarget,
 } from './connectedServices/sessionAuthSwitch/connectedServiceSwitchDeferralQueue';
 import { requestPlannedRunnerRestart } from './plannedRunnerRestart/requestPlannedRunnerRestart';
+import { createRestartCompletionWaiters } from './plannedRunnerRestart/completionWaiters';
 import type { PlannedRunnerRestartNotSignaledReason } from './plannedRunnerRestart/types';
 import {
   summarizeSessionRunnerEndpoint,
@@ -402,7 +419,9 @@ import {
   restartSessionRunnerOnCurrentRuntime,
   type RestartSessionRunnerCompletion,
 } from './plannedRunnerRestart/restartSessionRunnerOnCurrentRuntime';
+import { restartStaleSessionRunnersAfterDaemonStart } from './plannedRunnerRestart/restartStaleRunnersAfterDaemonStart';
 import { resolveCurrentSessionRunnerLaunchIdentity } from './sessionRunnerRuntime/resolveRunnerEntrypointIdentity';
+import { shouldRefreshSessionRunnerResumeIdentity } from './sessionRunnerRuntime/resolveRestartEligibility';
 import { resolveSessionRunnerRuntimeState } from './sessionRunnerRuntime/resolveRuntimeState';
 import { resolveSessionRunnerActivityDisabledReason as resolveSessionRunnerActivityDisabledReasonFromReaders } from './sessionRunnerRuntime/resolveActivityDisabledReason';
 import { setOpenCodeConnectedServiceInFlightTurnProvider } from './connectedServices/sessionAuthSwitch/openCodeConnectedServiceInFlightTurnRegistry';
@@ -435,6 +454,7 @@ import {
   type ConnectedServiceMaterializationIdentityV1,
   type RestartSessionRunnerRequestV1,
   type SessionRunnerRestartDisabledReason,
+  SessionTerminalMetadataSchema,
   writeProviderAccountUsageRecordIdToMetadata,
   type SessionContinuationRecoveryIdentityV1,
   type SessionContinuationResumePromptModeV1,
@@ -448,13 +468,26 @@ import type { RuntimeAccountIdentitySelectionInput } from './connectedServices/q
 import { decodeJwtPayload } from '@/cloud/decodeJwtPayload';
 import { parseBooleanEnv, resolveConnectedServicesProviderStateSharingPolicyV1, type AccountSettings, type BackendTargetRefV1, type ConnectedServiceId } from '@happier-dev/protocol';
 import type { CatalogAgentId, ConnectedServiceSwitchEffectiveBinding } from '@/backends/types';
-import { readTerminalAttachmentInfo, writeTerminalAttachmentInfo } from '@/terminal/attachment/terminalAttachmentInfo';
+import {
+  createTerminalAttachmentId,
+  matchesLegacyTerminalAttachmentSnapshot,
+  readTerminalAttachmentInfo,
+  readTerminalAttachmentState,
+  terminalAttachmentMatchesTerminal,
+  writeTerminalAttachmentInfo,
+} from '@/terminal/attachment/terminalAttachmentInfo';
+import { executeTerminalHostDisposition } from '@/terminal/attachment/terminalHostDisposition';
 import { bindSpawnedTmuxTerminalAttachment } from './sessions/bindSpawnedTmuxTerminalAttachment';
+import { bindSpawnedTerminalHostAttachment } from './sessions/bindSpawnedTerminalHostAttachment';
+import type { TerminalHostHandle } from '@/integrations/terminalHost/_types';
 import { normalizeAccountSettingsVersionHint } from '@/settings/accountSettings/accountSettingsVersion';
 import { refreshAccountSettingsForMinimumVersion } from '@/settings/accountSettings/refreshAccountSettingsForMinimumVersion';
 import { warmActiveAccountSettingsSnapshotBestEffort } from '@/settings/accountSettings/warmActiveAccountSettingsSnapshot';
 import { getActiveAccountSettingsSnapshot } from '@/settings/accountSettings/activeAccountSettingsSnapshot';
-import { fetchSessionByIdCompat, fetchSessionsPage, type RawSessionRecord } from '@/session/transport/http/sessionsHttp';
+import { isBackendEnabledByAccountSettings } from '@/settings/backendEnabled';
+import { resolveConfiguredAcpBackendFromAccountSettings } from '@/agent/acp/catalog/configured/resolveConfiguredAcpBackendFromAccountSettings';
+import { fetchSessionByIdCompat, type RawSessionRecord } from '@/session/transport/http/sessionsHttp';
+import { listRetainedConnectedServiceMaterializationIdentityIds } from './connectedServices/materialize/cleanup/listRetainedConnectedServiceMaterializationIdentityIds';
 import { updateSessionMetadataWithRetry } from '@/session/metadata/updateSessionMetadataWithRetry';
 import { persistExplicitSessionStopUsageLimitRecoveryCancellation } from '@/session/usageLimitRecoveryControls/persistUsageLimitRecoveryFieldDurably';
 import { UsageLimitRecoveryScheduler } from './connectedServices/usageLimitRecovery/UsageLimitRecoveryScheduler';
@@ -516,7 +549,6 @@ import { resolveCurrentCodexRuntimeAuthFailureSource } from './connectedServices
 import { resolveRuntimeAuthFailureSourceProfile } from './connectedServices/runtimeAuth/resolveRuntimeAuthFailureSourceProfile';
 import { resolveConnectedServiceGroupMemberByProviderAccountId } from './connectedServices/shared/resolveConnectedServiceGroupMemberByProviderAccountId';
 import { readCredentialAccountIdentity } from './connectedServices/quotas/coordinator/support';
-import { startConnectedServiceStableHomeReconcileScheduler } from './connectedServices/startup/stableHomeReconcile';
 import { tryDecryptSessionMetadata } from '@/session/transport/encryption/sessionEncryptionContext';
 import { sendSessionMessage } from '@/session/services/sendSessionMessage';
 
@@ -771,43 +803,17 @@ function resolveConnectedServiceRestartProcessGroupPid(tracked: TrackedSession):
     : null;
 }
 
-async function listRetainedConnectedServiceMaterializationIdentityIds(params: Readonly<{
-  credentials: Credentials;
-}>): Promise<ReadonlySet<string>> {
-  const retained = new Set<string>();
-  let cursor: string | undefined;
-  const seenCursors = new Set<string>();
-  for (let page = 0; page < 50; page += 1) {
-    const result = await fetchSessionsPage({
-      token: params.credentials.token,
-      ...(cursor ? { cursor } : {}),
-      limit: 200,
-    });
-    for (const rawSession of result.sessions as ReadonlyArray<RawSessionRecord>) {
-      const metadata = tryDecryptSessionMetadata({
-        credentials: params.credentials,
-        rawSession,
-      });
-      const identity = readConnectedServiceMaterializationIdentityV1(
-        metadata?.connectedServiceMaterializationIdentityV1,
-      );
-      if (identity) retained.add(identity.id);
-    }
-    if (!result.hasNext || !result.nextCursor) break;
-    if (seenCursors.has(result.nextCursor)) break;
-    seenCursors.add(result.nextCursor);
-    cursor = result.nextCursor;
-  }
-  return retained;
-}
-
 async function resumeInactiveSessionWhenUsageLimitReady(params: Readonly<{
   spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
   fallbackMachineId: string;
+  credentials: Credentials;
+  customResumePrompt?: string | null;
   sessionId: string;
   rawSession: RawSessionRecord;
   metadata: Record<string, unknown>;
 }>): Promise<boolean> {
+  const recovery = SessionUsageLimitRecoveryV1Schema.safeParse(params.metadata.sessionUsageLimitRecoveryV1);
+  if (!recovery.success) return false;
   const spawnOptions = buildInactiveUsageLimitResumeSpawnOptions({
     sessionId: params.sessionId,
     fallbackMachineId: params.fallbackMachineId,
@@ -815,8 +821,20 @@ async function resumeInactiveSessionWhenUsageLimitReady(params: Readonly<{
     metadata: params.metadata,
   });
   if (!spawnOptions) return false;
-  const result = await params.spawnSession(spawnOptions);
-  return result.type === 'success';
+  const result = await continueSessionAfterUsageLimitReset({
+    ...params, recovery: recovery.data, nowMs: Date.now(),
+    isCurrent: async () => {
+      const fresh = await fetchSessionByIdCompat({ token: params.credentials.token, sessionId: params.sessionId });
+      if (!fresh || fresh.archivedAt != null) return false;
+      const metadata = tryDecryptSessionMetadata({ credentials: params.credentials, rawSession: fresh });
+      const current = SessionUsageLimitRecoveryV1Schema.safeParse(metadata?.sessionUsageLimitRecoveryV1);
+      return current.success && current.data.status !== 'cancelled' && current.data.status !== 'exhausted'
+        && current.data.issueFingerprint === recovery.data.issueFingerprint
+        && current.data.armedAtMs === recovery.data.armedAtMs;
+    },
+    ensureRuntime: async () => (await params.spawnSession(spawnOptions)).type === 'success',
+  });
+  return result.status === 'continued';
 }
 
 /**
@@ -856,7 +874,7 @@ async function resolvePersistedConnectedServiceSwitchSessionMetadata(params: Rea
   const attachContext = await resolveExistingSessionAttachContext({
     token,
     sessionId: params.sessionId,
-    agent: params.agentId,
+    backendTarget: { kind: 'builtInAgent', agentId: params.agentId },
     credentials: params.credentials,
   }).catch(() => null);
   return attachContext?.ok ? attachContext.metadata : null;
@@ -970,14 +988,14 @@ async function publishTerminalControlServiceability(params: Readonly<{
     happyHomeDir: params.happyHomeDir,
     sessionId: params.sessionId,
   });
-  if (attachmentBeforeFetch?.version !== 2 || attachmentBeforeFetch.attachmentId !== params.attachmentId) return false;
+  if (!attachmentBeforeFetch || attachmentBeforeFetch.version === 1 || attachmentBeforeFetch.attachmentId !== params.attachmentId) return false;
   const rawSession = await fetchSessionByIdCompat({ token: params.credentials.token, sessionId: params.sessionId });
   if (!rawSession) return false;
   const attachmentBeforeUpdate = await readTerminalAttachmentInfo({
     happyHomeDir: params.happyHomeDir,
     sessionId: params.sessionId,
   });
-  if (attachmentBeforeUpdate?.version !== 2 || attachmentBeforeUpdate.attachmentId !== params.attachmentId) return false;
+  if (!attachmentBeforeUpdate || attachmentBeforeUpdate.version === 1 || attachmentBeforeUpdate.attachmentId !== params.attachmentId) return false;
   await updateSessionMetadataWithRetry({
     token: params.credentials.token,
     credentials: params.credentials,
@@ -1008,7 +1026,7 @@ async function publishCurrentTerminalControlServiceability(params: Readonly<{
     happyHomeDir: params.happyHomeDir,
     sessionId: params.sessionId,
   });
-  if (attachment?.version !== 2) return false;
+  if (!attachment || attachment.version === 1) return false;
   return await publishTerminalControlServiceability({
     ...params,
     attachmentId: attachment.attachmentId,
@@ -1157,26 +1175,9 @@ export function resolveConnectedServiceContinuationOriginId(input: Readonly<{
   return reportId || null;
 }
 
-type ContinueAfterRuntimeAuthSwitch = (input: Readonly<{
-  sessionId: string;
-  attemptId: string;
-  action: 'hot_applied' | 'restart_requested';
-  switchReason?: ConnectedServiceSessionAuthSwitchReason;
-}>) => Promise<void>;
-
-type ReconcileCurrentRuntimeAuthTarget = (input: Readonly<{
-  sessionId: string;
-  serviceId: ConnectedServiceId;
-  groupId: string;
-}>) => Promise<boolean>;
-
-export async function continueAfterSupersededRuntimeAuthFailure(input: Readonly<{
+export function isSupersededRuntimeAuthFailure(input: Readonly<{
   result: unknown;
-  sessionId: string;
-  interruptedOriginId?: string | null;
-  continueAfterRuntimeAuthSwitch: ContinueAfterRuntimeAuthSwitch;
-  reconcileCurrentRuntimeAuthTarget?: ReconcileCurrentRuntimeAuthTarget;
-}>): Promise<boolean> {
+}>): boolean {
   if (
     !input.result
     || typeof input.result !== 'object'
@@ -1189,32 +1190,6 @@ export async function continueAfterSupersededRuntimeAuthFailure(input: Readonly<
     )
   ) {
     return false;
-  }
-  const interruptedOriginId = input.interruptedOriginId?.trim() ?? '';
-  let currentTargetSettled = false;
-  if (
-    input.reconcileCurrentRuntimeAuthTarget
-    && 'serviceId' in input.result
-    && 'groupId' in input.result
-    && typeof input.result.serviceId === 'string'
-    && typeof input.result.groupId === 'string'
-  ) {
-    const serviceId = ConnectedServiceIdSchema.safeParse(input.result.serviceId);
-    const groupId = input.result.groupId.trim();
-    if (serviceId.success && groupId) {
-      currentTargetSettled = await input.reconcileCurrentRuntimeAuthTarget({
-        sessionId: input.sessionId,
-        serviceId: serviceId.data,
-        groupId,
-      });
-    }
-  }
-  if (currentTargetSettled && interruptedOriginId) {
-    await input.continueAfterRuntimeAuthSwitch({
-      sessionId: input.sessionId,
-      attemptId: interruptedOriginId,
-      action: 'hot_applied',
-    });
   }
   return true;
 }
@@ -1399,13 +1374,13 @@ function resolveCliSubcommandFromBackendTarget(target: BackendTargetRefV1 | unde
   return resolveAgentCliSubcommand(readBuiltInCatalogAgentIdFromBackendTarget(target));
 }
 
-async function applyAlreadyRunningExistingSessionRuntimeSnapshot(params: Readonly<{
+async function refreshTrackedSessionsRuntimeSnapshot(params: Readonly<{
   sessionId: string;
   incomingOptions: SpawnSessionOptions;
-  pidToTrackedSession: Map<number, TrackedSession>;
+  trackedSessions: ReadonlyArray<TrackedSession>;
   credentials: Credentials;
 }>): Promise<void> {
-  const trackedSessions = Array.from(params.pidToTrackedSession.values())
+  const trackedSessions = params.trackedSessions
     .filter((tracked) => tracked.happySessionId === params.sessionId);
 
   if (trackedSessions.length < 1) return;
@@ -1417,9 +1392,8 @@ async function applyAlreadyRunningExistingSessionRuntimeSnapshot(params: Readonl
   const attachContext = await resolveExistingSessionAttachContext({
     token: tokenForFetch,
     sessionId: params.sessionId,
-    agent: params.incomingOptions.backendTarget?.kind === 'builtInAgent'
-      ? params.incomingOptions.backendTarget.agentId
-      : 'customAcp',
+    backendTarget: params.incomingOptions.backendTarget
+      ?? { kind: 'builtInAgent', agentId: resolveCatalogAgentId(null) },
     credentials: effectiveCredentials,
   });
 
@@ -1679,6 +1653,12 @@ function mapExistingSessionAttachFailureToSpawnError(reason: import('./sessionEn
         errorCode: SPAWN_SESSION_ERROR_CODES.RESUME_MISSING_ENCRYPTION_KEY,
         errorMessage: 'Failed to open session encryption key for resume.',
       };
+    case 'clientE2eeRequired':
+      return {
+        type: 'error',
+        errorCode: SPAWN_SESSION_ERROR_CODES.INVALID_REQUEST,
+        errorMessage: 'This daemon requires end-to-end encryption and will not attach to a plaintext session.',
+      };
   }
 }
 
@@ -1779,17 +1759,17 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         ? [ownership.owner.state.pid]
         : [];
     try {
-      const orphanReapResult = await reapSameHomeDaemonOrphansBeforeStart({
+      const orphanReapResult = await reapCurrentLifecycleDaemonOrphansBeforeStart({
         preservePids: preservedOwnerPids,
       });
       if (
         orphanReapResult.stoppedPids.length > 0
         || orphanReapResult.failedPids.length > 0
       ) {
-        logger.debug('[DAEMON RUN] Same-home daemon orphan reap complete', orphanReapResult);
+        logger.debug('[DAEMON RUN] Lifecycle-scope daemon orphan reap complete', orphanReapResult);
       }
     } catch (error) {
-      logger.warn('[DAEMON RUN] Same-home daemon orphan reap failed', error);
+      logger.warn('[DAEMON RUN] Lifecycle-scope daemon orphan reap failed', error);
     }
 
     const credentialsGate = await waitForInitialCredentials({
@@ -1852,15 +1832,13 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           });
           return group?.members ?? null;
         },
-        resolveProviderAccountId: async (profileId) => {
+        resolveProviderAccountIdentity: async (profileId) => {
           const resolved = await resolveConnectedServiceCredentialsWithRevisions({
             credentials,
             api,
             bindings: [{ serviceId: serviceId.data, profileId }],
           }).then((byServiceId) => byServiceId.get(serviceId.data) ?? null);
-          return resolved
-            ? readCredentialAccountIdentity(resolved.record)?.providerAccountId ?? null
-            : null;
+          return resolved ? readCredentialAccountIdentity(resolved.record) : null;
         },
       });
     };
@@ -1955,7 +1933,6 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         resume: () => void;
       }> | null = null;
       let connectedServiceQuotasCoordinator: ConnectedServiceQuotasCoordinator | null = null;
-      let connectedServiceStableHomeReconcileHandle: Readonly<{ stop: () => void }> | null = null;
       const connectedServiceRuntimeRegistry = new ConnectedServiceRuntimeRegistry();
       const connectedServiceRuntimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
       const providerAccountUsageStore = createProviderAccountUsageStore();
@@ -2105,6 +2082,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       };
       const connectedServiceGroupHomeCleanupScheduler = new ConnectedServiceGroupHomeCleanupScheduler({
         activeServerDir: configuration.activeServerDir,
+        runtimeRegistry: connectedServiceRuntimeRegistry,
         hasLiveTarget: ({ serviceId, groupId, agentId }) => getCurrentChildren().some((tracked) => {
           const trackedAgentId = resolveTrackedSessionCatalogAgentId(tracked);
           if (trackedAgentId !== agentId) return false;
@@ -2118,6 +2096,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       });
       const connectedServiceMaterializedHomeCleanupScheduler = new ConnectedServiceMaterializedHomeCleanupScheduler({
         baseDir: connectedServicesMaterializationBaseDir,
+        runtimeRegistry: connectedServiceRuntimeRegistry,
         nowMs: () => Date.now(),
         rootTtlMs: resolvePositiveIntEnv(
           process.env.HAPPIER_CONNECTED_SERVICES_MATERIALIZED_HOME_TTL_MS,
@@ -2135,7 +2114,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           return readTrackedConnectedServiceMaterializationIdentityId(tracked) === materializationIdentityId;
         }),
         listRetainedIdentityIds: async () =>
-          await listRetainedConnectedServiceMaterializationIdentityIds({ credentials }),
+          await listRetainedConnectedServiceMaterializationIdentityIds({ credentials, baseDir: connectedServicesMaterializationBaseDir }),
       });
       let connectedServiceQuotasLoopHandle: ConnectedServiceQuotasLoopHandle | null = null;
       let connectedServiceMaterializedHomeCleanupLoopHandle: Readonly<{
@@ -2160,6 +2139,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       let apiMachineForSessions: ApiMachineClient | null = null;
       let automationWorker: AutomationWorkerHandle | null = null;
       let memoryWorker: MemoryWorkerHandle | null = null;
+      let cliUpdateMetadataPublisher: CliUpdateMetadataPublisher | null = null;
       let apiMachine: ApiMachineClient | null = null;
       const eventLoopStallMonitor = createDaemonEventLoopStallMonitor({
         getActiveRpcOperations: () => apiMachineForSessions?.getActiveRpcHandlerExecutions() ?? [],
@@ -2182,31 +2162,90 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         const resolveAcceptedExistingSessionStartup = async (
           sessionId: string,
           requestedSpawnNonce: string | undefined,
+          backendTarget: BackendTargetRefV1,
         ): Promise<SpawnSessionResult | null> => {
-          for (const [pid, tracked] of pidToTrackedSession) {
-            const trackedExistingSessionId = typeof tracked.spawnOptions?.existingSessionId === 'string'
-              ? tracked.spawnOptions.existingSessionId.trim()
-              : '';
-            if (
-              tracked.startedBy !== 'daemon'
-              || tracked.pid !== pid
-              || trackedExistingSessionId !== sessionId
-              || !pidToAwaiter.has(pid)
-            ) {
-              continue;
+          const isPendingDaemonChild = (tracked: TrackedSession): boolean =>
+            tracked.startedBy === 'daemon'
+            && pidToTrackedSession.get(tracked.pid) === tracked
+            && pidToAwaiter.has(tracked.pid)
+            && tracked.reportMarkerCustody?.retiring !== true;
+          const matchesSession = (tracked: TrackedSession): boolean =>
+            tracked.happySessionId?.trim() === sessionId
+            || tracked.spawnOptions?.existingSessionId?.trim() === sessionId;
+          const resolveTrackedStartup = async (): Promise<SpawnSessionResult | null> => {
+            for (const tracked of pidToTrackedSession.values()) {
+              if (!isPendingDaemonChild(tracked) || !matchesSession(tracked) || tracked.stopRequestedAtMs !== undefined) continue;
+              const presence = await classifyTrackedSessionRunnerPresence({ tracked });
+              // OS reads can overlap webhook completion, retirement or wrapper promotion.
+              if (presence !== 'present' || !isPendingDaemonChild(tracked) || !matchesSession(tracked)
+                || tracked.stopRequestedAtMs !== undefined) continue;
+              return {
+                type: 'success',
+                sessionId,
+                runnerAcceptance: resolveExistingRunnerAcceptance({
+                  requestedSpawnNonce,
+                  trackedSpawnNonces: [tracked.spawnOptions?.spawnNonce],
+                }),
+              };
             }
-            const runState = await readProcessRunState(pid).catch(() => null);
-            if (runState !== 'servable') continue;
+            return null;
+          };
+          const knownStartup = await resolveTrackedStartup();
+          if (knownStartup) return knownStartup;
+          const isUnboundFreshChild = (tracked: TrackedSession): boolean =>
+            isPendingDaemonChild(tracked)
+            && !tracked.spawnOptions?.existingSessionId?.trim()
+            && (!tracked.happySessionId?.trim() || /^PID-\d+$/.test(tracked.happySessionId.trim()));
+          if (!Array.from(pidToTrackedSession.values()).some(isUnboundFreshChild)) return null;
+          const knownPresence = await probeSessionRunnerPresence({ sessionId, trackedSessions: pidToTrackedSession.values() });
+          if (knownPresence.state !== 'runner_absent') return null;
+
+          // A session row can be published before its creating child receives the ID,
+          // claims its runner lock and reports the webhook. Resolve only that fresh-child
+          // gap through the existing metadata/encryption owner; never wait on unrelated children.
+          const attachContext = await resolveExistingSessionAttachContext({
+            token: credentials.token,
+            credentials,
+            sessionId,
+            backendTarget,
+          });
+          if (!attachContext.ok) {
+            logger.warn('[DAEMON RUN] Unable to verify a pending fresh session owner', { sessionId, reason: attachContext.reason });
+            return mapExistingSessionAttachFailureToSpawnError(attachContext.reason);
+          }
+          const metadata = attachContext.metadata;
+          const pid = metadata?.hostPid;
+          if (!metadata || metadata.machineId !== machineId || metadata.startedBy !== 'daemon'
+            || (metadata.happyHomeDir && metadata.happyHomeDir !== configuration.happyHomeDir)
+            || typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) return null;
+          const terminal = SessionTerminalMetadataSchema.safeParse(metadata.terminal);
+          const tracked = correlateTrackedSessionReport({
+            pidToTrackedSession,
+            pidToAwaiter,
+            pid,
+            metadata: { startedBy: 'daemon', ...(terminal.success ? { terminal: terminal.data } : {}) },
+          });
+          if (!tracked || !isUnboundFreshChild(tracked)) return null;
+          // The row's PID can outlive its process. Verify the creating runner's generation,
+          // not a wrapper's generation, before binding an otherwise unknown Session id.
+          const expectedFingerprint = readNonEmptyMetadataString(metadata.hostProcessInstanceFingerprint);
+          const currentFingerprint = readProcessInstanceFingerprintSync(pid);
+          if (!expectedFingerprint || !currentFingerprint) {
+            logger.warn('[DAEMON RUN] Refusing unproven fresh session ownership', { sessionId, pid });
             return {
-              type: 'success',
-              sessionId,
-              runnerAcceptance: resolveExistingRunnerAcceptance({
-                requestedSpawnNonce,
-                trackedSpawnNonces: [tracked.spawnOptions?.spawnNonce],
-              }),
+              type: 'error',
+              errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
+              errorMessage: 'The existing session runtime could not be verified. Retry resume after its startup completes.',
             };
           }
-          return null;
+          if (!processInstanceFingerprintMatches(expectedFingerprint, currentFingerprint)) return null;
+          adoptReportedSessionRunnerIdentity(tracked, pid, currentFingerprint);
+          const presence = await classifyTrackedSessionRunnerPresence({ tracked });
+          if (presence === 'absent' || !isUnboundFreshChild(tracked)) return null;
+          // Identity is learned here; readiness, marker promotion and acceptance completion
+          // still belong to the webhook. Unknown/stopped owners go through normal fencing.
+          adoptReportedHappySessionId(tracked, sessionId);
+          return await resolveTrackedStartup();
         };
 
         const spawnRecentSuccessTtlMs = resolvePositiveIntEnv(
@@ -2267,18 +2306,25 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             await flushProviderAccountUsagePersistenceForShutdown();
 	            await flushDaemonServerWorkForShutdown();
             const initialInFlightSpawns = pidToAwaiter.size;
+            // A signalled planned restart has stopped its runner; let its replacement spawn within
+            // the same drain budget instead of exiting with the session left without a runner.
+            const hasPendingRunnerRestarts = () => sessionRunnerRestartCompletionWaiters.hasPending();
             const hasPendingRpcRequests = apiMachineForSessions !== null;
-            if (initialInFlightSpawns === 0 && !hasPendingRpcRequests) return;
+            if (initialInFlightSpawns === 0 && !hasPendingRunnerRestarts() && !hasPendingRpcRequests) return;
 
             logger.debug('[DAEMON RUN] Shutdown requested with in-flight work; deferring shutdown', {
               inFlightSpawns: initialInFlightSpawns,
+              pendingRunnerRestarts: hasPendingRunnerRestarts(),
               pendingRpcDrainEnabled: hasPendingRpcRequests,
               graceMs: shutdownSpawnDrainGraceMs,
               pollMs: shutdownSpawnDrainPollMs,
             });
 
             const start = Date.now();
-            while (pidToAwaiter.size > 0 && Date.now() - start < shutdownSpawnDrainGraceMs) {
+            while (
+              (pidToAwaiter.size > 0 || hasPendingRunnerRestarts())
+              && Date.now() - start < shutdownSpawnDrainGraceMs
+            ) {
               // eslint-disable-next-line no-await-in-loop
               await new Promise((resolve) => setTimeout(resolve, shutdownSpawnDrainPollMs));
             }
@@ -2377,7 +2423,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               happyHomeDir: configuration.happyHomeDir,
               sessionId,
             });
-            if (attachment?.version !== 2) return false;
+            if (!attachment || attachment.version === 1) return false;
             const evidence = resolveRunnerTerminalControlServiceabilityEvidence({
               probe,
               attachmentId: attachment.attachmentId,
@@ -2397,6 +2443,17 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             });
             return false;
           }
+        };
+        const publishTrackedTerminalControlServiceability = async (tracked: TrackedSession): Promise<void> => {
+          await publishReportedTerminalControlServiceability({
+            tracked,
+            readTerminalAttachmentInfo: async (sessionId) => await readTerminalAttachmentInfo({
+              happyHomeDir: configuration.happyHomeDir,
+              sessionId,
+            }),
+            probeSessionRunnerServiceability,
+            publishSessionRunnerControlServiceability,
+          });
         };
         const stopSessionInFlightBySessionId = new Map<string, Readonly<{
           intent: DaemonSessionStopIntent['kind'];
@@ -2451,7 +2508,6 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             await waitForExistingSessionExitIfStopRequested({
               sessionId,
               pidToTrackedSession,
-              isSessionRunnerActive,
               timeoutMs: configuration.daemonStopSessionWaitForExitMs,
               pollIntervalMs: configuration.daemonStopSessionWaitForExitPollIntervalMs,
               trackedPids,
@@ -2721,6 +2777,17 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
 
         logger.debug('[DAEMON RUN] Running startup session reattach scan');
         const startupReattachResult = await reattachTrackedSessionsFromMarkers({ pidToTrackedSession, credentials });
+        for (const tracked of pidToTrackedSession.values()) {
+          if (!tracked.reattachedFromDiskMarker) continue;
+          try {
+            await publishTrackedTerminalControlServiceability(tracked);
+          } catch (error) {
+            logger.warn('[DAEMON RUN] Failed to recover reattached terminal control serviceability', {
+              sessionId: tracked.happySessionId,
+              error: serializeAxiosErrorForLog(error),
+            });
+          }
+        }
         const pendingSessionMachineAccessBindingIds = new Set(startupReattachResult.recoveredLiveSessionIds ?? []);
         let sessionMachineAccessBindingReconcileInFlight: Promise<void> | null = null;
         const reconcileSessionMachineAccessBindings = async (): Promise<void> => {
@@ -2731,22 +2798,23 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           }
 
           sessionMachineAccessBindingReconcileInFlight = (async () => {
-            const liveSessionIds = new Set(
-              getCurrentChildren()
-                .map((tracked) => tracked.happySessionId?.trim())
-                .filter((sessionId): sessionId is string => Boolean(sessionId)),
-            );
+            const liveSessionsById = new Map<string, TrackedSession>();
+            for (const tracked of getCurrentChildren()) {
+              const sessionId = tracked.happySessionId?.trim();
+              if (sessionId) liveSessionsById.set(sessionId, tracked);
+            }
             for (const sessionId of pendingSessionMachineAccessBindingIds) {
-              if (!liveSessionIds.has(sessionId)) {
+              const tracked = liveSessionsById.get(sessionId);
+              if (!tracked) {
                 pendingSessionMachineAccessBindingIds.delete(sessionId);
                 continue;
               }
               try {
-                await ensureSessionMachineAccessKeyBinding({
-                  serverUrl: configuration.apiServerUrl,
-                  token: credentials.token,
+                await reconcileRecoveredSessionMachineControl({
+                  credentials,
                   sessionId,
                   machineId,
+                  runnerPid: tracked.sessionRunnerPid ?? tracked.pid,
                 });
                 pendingSessionMachineAccessBindingIds.delete(sessionId);
               } catch (error) {
@@ -2838,54 +2906,63 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           if (disconnectedTerminalHostSupervisionInFlight) return disconnectedTerminalHostSupervisionInFlight;
           disconnectedTerminalHostSupervisionInFlight = (async () => {
             const terminalHostAdapters = await loadTerminalHostAdapters();
-            const results = await Promise.all(disconnectedTerminalHostCandidates.map(async (candidate) => {
-              const observedAt = nextTerminalControlServiceabilityObservation();
-              return {
-                candidate,
-                observedAt,
-                result: await superviseDisconnectedTerminalHostCandidate({
+            let candidatesToSupervise = [...disconnectedTerminalHostCandidates];
+            while (candidatesToSupervise.length > 0) {
+              const results = await Promise.all(candidatesToSupervise.map(async (candidate) => {
+                const observedAt = nextTerminalControlServiceabilityObservation();
+                return {
                   candidate,
-                  terminalHostAdapters,
-                  probeSessionServiceability: async (sessionId) => await probeSessionRunnerServiceability(sessionId),
-                  retireExactTerminalControlServiceability: async ({ sessionId, attachmentInfo }) => {
-                    return await retireTerminalControlServiceabilityForCurrentAccount({
-                      sessionId,
-                      attachmentId: attachmentInfo.attachmentId,
-                      terminalMode: attachmentInfo.terminal.mode ?? attachmentInfo.handle.kind,
+                  observedAt,
+                  result: await superviseDisconnectedTerminalHostCandidate({
+                    candidate,
+                    terminalHostAdapters,
+                    probeSessionServiceability: async (sessionId) => await probeSessionRunnerServiceability(sessionId),
+                    retireExactTerminalControlServiceability: async ({ sessionId, attachmentInfo }) => {
+                      return await retireTerminalControlServiceabilityForCurrentAccount({
+                        sessionId,
+                        attachmentId: attachmentInfo.attachmentId,
+                        terminalMode: attachmentInfo.terminal.mode ?? attachmentInfo.handle.kind,
+                      });
+                    },
+                  }),
+                };
+              }));
+              for (const { candidate, observedAt, result } of results) {
+                if (!disconnectedTerminalHostCandidates.some((current) => (
+                  current.sessionId === candidate.sessionId && current.attachmentId === candidate.attachmentId
+                ))) continue;
+                disconnectedTerminalHostResultsBySessionId.set(candidate.sessionId, result);
+                if (result.state === 'servable' || result.state === 'recoverable_unservable' || result.state === 'unknown') {
+                  try {
+                    await publishTerminalControlServiceability({
+                      credentials,
+                      happyHomeDir: configuration.happyHomeDir,
+                      sessionId: candidate.sessionId,
+                      attachmentId: candidate.attachmentId,
+                      state: result.state === 'servable' ? 'servable' : result.state === 'recoverable_unservable' ? 'recoverable_unservable' : 'unknown',
+                      observedAt,
+                      ...('reason' in result ? { reason: result.reason } : {}),
                     });
-                  },
-                }),
-              };
-            }));
-            for (const { candidate, observedAt, result } of results) {
-              disconnectedTerminalHostResultsBySessionId.set(candidate.sessionId, result);
-              if (result.state === 'servable' || result.state === 'recoverable_unservable' || result.state === 'unknown') {
-                try {
-                  await publishTerminalControlServiceability({
-                    credentials,
-                    happyHomeDir: configuration.happyHomeDir,
-                    sessionId: candidate.sessionId,
-                    attachmentId: candidate.attachmentId,
-                    state: result.state === 'servable' ? 'servable' : result.state === 'recoverable_unservable' ? 'recoverable_unservable' : 'unknown',
-                    observedAt,
-                    ...('reason' in result ? { reason: result.reason } : {}),
-                  });
-                } catch (error) {
-                  logger.debug('[DAEMON RUN] Failed to publish terminal control serviceability', {
-                    sessionId: candidate.sessionId,
-                    error: serializeAxiosErrorForLog(error),
-                  });
+                  } catch (error) {
+                    logger.debug('[DAEMON RUN] Failed to publish terminal control serviceability', {
+                      sessionId: candidate.sessionId,
+                      error: serializeAxiosErrorForLog(error),
+                    });
+                  }
                 }
+                if (result.state !== 'stopped' || terminalizedDisconnectedTerminalHostIds.has(candidate.attachmentId)) continue;
+                terminalizedDisconnectedTerminalHostIds.add(candidate.attachmentId);
+                orphanedDeadDaemonSessions.push({
+                  sessionId: candidate.sessionId,
+                  pid: candidate.pid,
+                  ...(candidate.activeTurnId ? { activeTurnId: candidate.activeTurnId } : {}),
+                });
               }
-              if (result.state !== 'stopped' || terminalizedDisconnectedTerminalHostIds.has(candidate.attachmentId)) continue;
-              terminalizedDisconnectedTerminalHostIds.add(candidate.attachmentId);
-              orphanedDeadDaemonSessions.push({
-                sessionId: candidate.sessionId,
-                pid: candidate.pid,
-                ...(candidate.activeTurnId ? { activeTurnId: candidate.activeTurnId } : {}),
-              });
+              await publishStartupOrphanedSessionEnds(apiMachine);
+              candidatesToSupervise = disconnectedTerminalHostCandidates.filter((candidate) => (
+                  !disconnectedTerminalHostResultsBySessionId.has(candidate.sessionId)
+              ));
             }
-            await publishStartupOrphanedSessionEnds(apiMachine);
           })().catch((error) => {
             logger.debug('[DAEMON RUN] Disconnected terminal-host supervision failed (non-fatal)', error);
           }).finally(() => {
@@ -2924,6 +3001,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           const migratedTrackedSessionProcesses = await migrateTrackedSessionProcessesOutOfDaemonServiceCgroup({
             trackedSessions: pidToTrackedSession.values(),
             daemonPid: process.pid,
+            startupSource,
           });
           if (migratedTrackedSessionProcesses.length > 0) {
             logger.debug('[DAEMON RUN] Moved reattached session runner process(es) out of the daemon service cgroup', {
@@ -2988,15 +3066,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               // reattachment before serving broker-backed provider requests.
               registerConnectedServiceTrackedSessionTargets(tracked);
             }
-            await publishReportedTerminalControlServiceability({
-              tracked,
-              readTerminalAttachmentInfo: async (sessionId) => await readTerminalAttachmentInfo({
-                happyHomeDir: configuration.happyHomeDir,
-                sessionId,
-              }),
-              probeSessionRunnerServiceability,
-              publishSessionRunnerControlServiceability,
-            });
+            await publishTrackedTerminalControlServiceability(tracked);
           },
         });
         const resolveCanonicalTrackedSessionId = (pid: number): string => {
@@ -3034,14 +3104,64 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             ) {
               continue;
             }
+            const ownsTrackedRunner = () => pidToTrackedSession.get(pid) === tracked
+              && tracked.pid === pid && tracked.startedBy === 'daemon'
+              && normalizeSpawnNonceForAck(tracked.spawnOptions?.spawnNonce) === spawnNonce;
             const runState = await readProcessRunState(pid).catch(() => null);
-            if (runState !== 'servable') continue;
+            if (runState !== 'servable' || !ownsTrackedRunner()) continue;
             const result = buildSpawnAcceptedResult({
               pid,
               spawnNonce,
             });
             result.runnerAcceptance = 'same_request_runner';
             daemonSpawnAttemptRegistry.rememberAccepted({ spawnNonce, result });
+            const sessionId = result.sessionId;
+            if (!sessionId) return result;
+            const ownsReadyRunner = () => ownsTrackedRunner()
+              && resolveCanonicalTrackedSessionId(pid) === sessionId
+              && !tracked.startupCustody
+              && !shutdownInitiated && typeof tracked.stopRequestedAtMs !== 'number'
+              && tracked.reportMarkerCustody?.retiring !== true;
+            const markerMatchesRunner = (marker: Awaited<ReturnType<typeof readSessionMarkerForPid>>) => Boolean(
+              marker && marker.pid === pid && marker.happySessionId === sessionId
+              && marker.happyHomeDir === configuration.happyHomeDir
+              && marker.startedBy !== 'terminal'
+              && normalizeSpawnNonceForAck(marker.respawn?.spawnNonce) === spawnNonce
+              && (!marker.processInstanceFingerprint || marker.processInstanceFingerprint === tracked.processInstanceFingerprint)
+              && (!marker.processCommandHash || marker.processCommandHash === tracked.processCommandHash)
+            );
+            const marker = await readSessionMarkerForPid(pid);
+            if (!ownsReadyRunner() || !markerMatchesRunner(marker)) return result;
+            const readAttachment = () => readTerminalAttachmentState({ happyHomeDir: configuration.happyHomeDir, sessionId });
+            const attachmentMatchesRunner = (attachment: Awaited<ReturnType<typeof readAttachment>>) => {
+              if (attachment.status === 'unreadable') return false;
+              const terminal = tracked.hostedTerminal ?? tracked.happySessionMetadataFromLocalWebhook?.terminal;
+              if (terminal?.controlServiceabilityV1?.retired === true) return false;
+              const actualTerminalMode = terminal?.mode ?? tracked.spawnOptions?.terminal?.mode;
+              const needsAttachment = actualTerminalMode !== 'plain' && (
+                actualTerminalMode !== undefined || !tracked.childProcess || Boolean(tracked.tmuxSessionId)
+              );
+              if (!needsAttachment) return true;
+              const publishedId = tracked.publishedTerminalControlServiceabilityAttachmentId;
+              if (attachment.status !== 'present' || !terminal) return false;
+              return terminalAttachmentMatchesTerminal(attachment.info, terminal, publishedId);
+            };
+            const attachment = await readAttachment();
+            if (!ownsReadyRunner() || !attachmentMatchesRunner(attachment)) return result;
+            // Acceptance prevents duplicate launch. Readiness additionally needs
+            // committed hosting evidence that still belongs to this runner after RPC.
+            const probe = await probeSessionRunnerServiceability(sessionId);
+            if (probe.state !== 'runner_present' || probe.control.state !== 'servable' || !ownsReadyRunner()) return result;
+            const [currentMarker, currentAttachment] = await Promise.all([readSessionMarkerForPid(pid), readAttachment()]);
+            const attachmentUnchanged = attachment.status === 'present'
+              ? currentAttachment.status === 'present' && (attachment.info.version === 1
+                ? currentAttachment.info.version === 1 && matchesLegacyTerminalAttachmentSnapshot(currentAttachment.info, attachment.info)
+                : currentAttachment.info.version !== 1 && currentAttachment.info.attachmentId === attachment.info.attachmentId)
+              : currentAttachment.status === attachment.status;
+            if (ownsReadyRunner() && markerMatchesRunner(marker) && markerMatchesRunner(currentMarker)
+              && attachmentUnchanged && attachmentMatchesRunner(attachment) && attachmentMatchesRunner(currentAttachment)) {
+              daemonSpawnAttemptRegistry.settle(spawnNonce, { type: 'success', sessionId });
+            }
             return result;
           }
           return null;
@@ -3057,7 +3177,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               ...params.spawnOptions,
               directory: params.directory,
             },
-            { encryptionMaterial: credentials.encryption },
+            { encryptionMaterial: credentials.encryption ?? undefined },
           );
           if (!respawn) {
             throw new Error(`Could not persist accepted spawn custody for PID ${params.pid}`);
@@ -3158,7 +3278,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 const delegatesExactClaudeRunnerAbsenceToRecovery =
                   normalizedOptions.backendTarget?.kind === 'builtInAgent'
                   && normalizedOptions.backendTarget.agentId === 'claude'
-                  && disconnectedHostCandidate.controlDescriptorAvailable === true
+                  && disconnectedHostCandidate.controlDescriptorStatus === 'available'
                   && supervision?.state === 'recoverable_unservable'
                   && supervision.reason === 'runner_absent';
                 if (resumeGate.action === 'fence' && !delegatesExactClaudeRunnerAbsenceToRecovery) {
@@ -3170,13 +3290,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   return {
                     type: 'error',
                     errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
-                    errorMessage: 'This session has a preserved terminal host that cannot be controlled safely. Stop the session, then Resume again to launch a fresh host.',
+                    errorMessage: 'This session has a preserved terminal host that cannot be controlled safely. Reconnect to the original terminal host and retry Resume, or Stop the session if that action is available before resuming on a fresh host.',
                   };
                 }
               }
               const acceptedExistingSessionStartup = await resolveAcceptedExistingSessionStartup(
                 normalizedExistingSessionId,
                 normalizedOptions.spawnNonce,
+                normalizedOptions.backendTarget ?? { kind: 'builtInAgent', agentId: resolveCatalogAgentId(null) },
               );
               if (acceptedExistingSessionStartup) {
                 logger.debug('[DAEMON RUN] Rejoining accepted existing-session launch while its exact child awaits the session webhook', {
@@ -3276,7 +3397,6 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   await waitForExistingSessionExitIfStopRequested({
                     sessionId: normalizedExistingSessionId,
                     pidToTrackedSession,
-                    isSessionRunnerActive,
                     timeoutMs: configuration.daemonSpawnExistingSessionWaitForExitMs,
                     pollIntervalMs: configuration.daemonSpawnExistingSessionWaitForExitPollIntervalMs,
                   });
@@ -3321,10 +3441,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                       .map((tracked) => tracked.spawnOptions?.spawnNonce),
                   });
                   logger.debug(`[DAEMON RUN] Resume requested for ${normalizedExistingSessionId}, but session is already running`);
-                  await applyAlreadyRunningExistingSessionRuntimeSnapshot({
+                  await refreshTrackedSessionsRuntimeSnapshot({
                     sessionId: normalizedExistingSessionId,
                     incomingOptions: normalizedOptions,
-                    pidToTrackedSession,
+                    trackedSessions: Array.from(pidToTrackedSession.values()),
                     credentials,
                   });
                   pendingSessionMachineAccessBindingIds.add(normalizedExistingSessionId);
@@ -3377,11 +3497,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     });
                   }
                   await publishSessionRunnerControlServiceability(normalizedExistingSessionId, serviceabilityAfterWait);
-                  return {
+                  const result = {
                     type: 'success',
                     sessionId: normalizedExistingSessionId,
                     runnerAcceptance,
-                  };
+                  } satisfies Extract<SpawnSessionResult, { type: 'success' }>;
+                  daemonSpawnAttemptRegistry.rememberAccepted({ spawnNonce: normalizedOptions.spawnNonce, result });
+                  daemonSpawnAttemptRegistry.settle(normalizedOptions.spawnNonce ?? '', result);
+                  return result;
                 }
               }
             }
@@ -3453,7 +3576,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   const attachContext = await resolveExistingSessionAttachContext({
                     token: tokenForFetch,
                     sessionId: normalizedExistingSessionId,
-                    agent: backendTarget?.kind === 'builtInAgent' ? backendTarget.agentId : 'customAcp',
+                    backendTarget: backendTarget ?? { kind: 'builtInAgent', agentId: catalogAgentId },
                     credentials: effectiveCredentials,
                   });
 
@@ -3496,6 +3619,34 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 modelId = normalizedOptions.modelId;
                 modelUpdatedAt = normalizedOptions.modelUpdatedAt;
                 effectiveResume = typeof resume === 'string' ? resume.trim() : '';
+              }
+
+              // A terminal restart can give one vendor conversation a new Happier
+              // identity. Per-Happier-id admission above cannot see that sibling.
+              if (effectiveResume) {
+                for (const tracked of pidToTrackedSession.values()) {
+                  if (tracked.happySessionId === normalizedExistingSessionId) continue;
+                  const trackedResume = tracked.vendorResumeId ?? tracked.spawnOptions?.resume
+                    // Terminal registration can precede its provider-id report.
+                    ?? extractResumeIdFromCommand(tracked.processCommand ?? '');
+                  if (trackedResume !== effectiveResume) continue;
+                  const trackedTarget = tracked.spawnOptions?.backendTarget;
+                  const sameTarget = backendTarget?.kind === 'configuredAcpBackend'
+                    ? trackedTarget?.kind === 'configuredAcpBackend' && trackedTarget.backendId === backendTarget.backendId
+                    : trackedTarget?.kind !== 'configuredAcpBackend' && resolveTrackedSessionCatalogAgentId(tracked) === catalogAgentId;
+                  if (!sameTarget) continue;
+                  const presence = await classifyTrackedSessionRunnerPresence({ tracked });
+                  if (presence === 'absent') continue;
+                  logger.warn('[DAEMON RUN] Refusing a second entry for an existing provider conversation', {
+                    sessionId: normalizedExistingSessionId || null,
+                    existingSessionId: tracked.happySessionId,
+                    presence,
+                  });
+                  return {
+                    type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.INVALID_REQUEST,
+                    errorMessage: 'This conversation already has another session runner. Open its existing session, or stop that runner before resuming.',
+                  };
+                }
               }
 
               const nativeSpawnSelection = resolveAgentNativeSpawnDefinitiveRejection({
@@ -3595,15 +3746,33 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 };
               }
 
-              // Only gate vendor resume. Happy-session reconnect (existingSessionId) is supported for all agents.
-              if (effectiveResume) {
-                if (backendTarget?.kind === 'configuredAcpBackend') {
+              // Configured ACP resume is catalog-declared policy plus ACP initialize negotiation.
+              // Never turn an inactive resume into a fresh provider session when either proof is absent.
+              if (backendTarget?.kind === 'configuredAcpBackend' && (effectiveResume || normalizedExistingSessionId)) {
+                const accountSettings = getActiveAccountSettingsSnapshot()?.settings as Record<string, unknown> | undefined;
+                const configuredBackend = accountSettings
+                  ? resolveConfiguredAcpBackendFromAccountSettings(accountSettings, backendTarget.backendId)
+                  : null;
+                const supportsConfiguredResume = Boolean(
+                  configuredBackend?.capabilities.supportsLoadSession
+                  && accountSettings
+                  && isBackendEnabledByAccountSettings({ backendTarget, settings: accountSettings }),
+                );
+                if (!supportsConfiguredResume) {
                   return {
                     type: 'error',
                     errorCode: SPAWN_SESSION_ERROR_CODES.RESUME_NOT_SUPPORTED,
                     errorMessage: `Resume is not supported for configured ACP backend '${backendTarget.backendId}'.`,
                   };
                 }
+                if (normalizedExistingSessionId && !effectiveResume) {
+                  return {
+                    type: 'error',
+                    errorCode: SPAWN_SESSION_ERROR_CODES.RESUME_NOT_SUPPORTED,
+                    errorMessage: `Configured ACP backend '${backendTarget.backendId}' cannot resume because its matching provider session ID is missing.`,
+                  };
+                }
+              } else if (effectiveResume) {
                 const vendorResumeSupport = await getVendorResumeSupport(
                   catalogAgentId,
                 );
@@ -3633,6 +3802,16 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               let spawnResourceCleanupOnExit: (() => void) | null = null;
               let spawnResourceCleanupArmed = false;
               let sessionAttachCleanup: (() => Promise<void>) | null = null;
+              const cleanupSessionAttachResources = async (primaryError?: unknown): Promise<void> => {
+                const cleanup = sessionAttachCleanup;
+                sessionAttachCleanup = null;
+                try { await cleanup?.(); } catch (cleanupError) {
+                  if (primaryError !== undefined) {
+                    throw new AggregateError([primaryError, cleanupError], 'Session launch failed with incomplete attach-file cleanup', { cause: primaryError });
+                  }
+                  throw cleanupError;
+                }
+              };
 
               const ensuredDirectory = await ensureSessionDirectory({
                 directory: resolvedDirectory,
@@ -3648,9 +3827,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
 
                 const cleanupSpawnResources = () => {
                   if (spawnResourceCleanupOnFailure && !spawnResourceCleanupArmed) {
-                    spawnResourceCleanupOnFailure();
+                    const cleanup = spawnResourceCleanupOnFailure;
                     spawnResourceCleanupOnFailure = null;
                     spawnResourceCleanupOnExit = null;
+                    cleanup();
                   }
                 };
 
@@ -3783,11 +3963,15 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                       processEnv: process.env,
                       credentialRefreshService: connectedServiceRefreshCoordinator,
                       vendorResumeId: effectiveResume || null,
+                      existingSessionMetadata: existingSessionPersistedMetadata,
                       resumeReachabilityRequired: spawnSharedStateContinuityRequested,
-                      candidatePersistedSessionFile: resolveConnectedServiceCandidatePersistedSessionFile(
-                        catalogAgentId,
-                        existingSessionPersistedMetadata,
-                      ),
+                      sessionStateMode: normalizedOptions.handoffStateTransfer,
+                      candidatePersistedSessionFile: normalizedOptions.handoffStateTransfer === 'existing'
+                        ? null
+                        : resolveConnectedServiceCandidatePersistedSessionFile(
+                            catalogAgentId,
+                            existingSessionPersistedMetadata,
+                          ),
                     });
                     if (repairedMissingMaterializationIdentity && normalizedExistingSessionId) {
                       try {
@@ -3891,6 +4075,12 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 };
                 const sessionChildProcessEnv: NodeJS.ProcessEnv = { ...process.env };
                 delete sessionChildProcessEnv[HAPPIER_CLAUDE_ENDPOINT_STATE_ENV_KEY];
+                const childServerSelectionEnv = {
+                  activeServerId: configuration.activeServerId,
+                  canonicalServerUrl: configuration.serverUrl,
+                  apiServerUrl: configuration.apiServerUrl,
+                  webappUrl: configuration.webappUrl,
+                };
 
                 const spawnEnvironment = await resolveSpawnChildEnvironment({
                   options: { ...effectiveSpawnOptionsBase, directory: resolvedDirectory },
@@ -3901,6 +4091,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   logInfo: (message) => logger.info(message),
                   logWarn: (message) => logger.warn(message),
                   connectedServiceAuth,
+                  existingSessionMetadata: existingSessionPersistedMetadata,
                 });
                 spawnResourceCleanupOnFailure = spawnEnvironment.cleanupOnFailure;
                 spawnResourceCleanupOnExit = spawnEnvironment.cleanupOnExit;
@@ -3913,36 +4104,61 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   };
                 }
                 const extraEnv = spawnEnvironment.expandedEnvironmentVariables;
-                const extraEnvForChild = spawnEnvironment.extraEnvForChild;
+                const downgradeLegacyImplicitTmuxRequest = shouldDowngradeLegacyImplicitTmuxRequest({
+                  terminal: normalizedOptions.terminal,
+                  backendTarget,
+                });
+                const terminalRequest = resolveTerminalRequestFromSpawnOptions({
+                  happyHomeDir: configuration.happyHomeDir,
+                  terminal: downgradeLegacyImplicitTmuxRequest ? undefined : normalizedOptions.terminal,
+                  environmentVariables: extraEnv,
+                });
+                const selectedHost = terminalRequest.requested === 'tmux'
+                  || terminalRequest.requested === 'zellij'
+                  || terminalRequest.requested === 'herdr'
+                  ? terminalRequest.requested
+                  : null;
+                const terminalPresentation = selectedHost
+                  ? resolveDaemonTerminalPresentation({
+                    hooks: daemonSpawnHooks,
+                    host: selectedHost,
+                    agentId: catalogAgentId,
+                    configuredAcpBackend: backendTarget?.kind === 'configuredAcpBackend',
+                    existingSessionId: normalizedExistingSessionId,
+                    accountSettings: getActiveAccountSettingsSnapshot()?.settings ?? null,
+                    runtimeSelection: {
+                      experimentalCodexAcp,
+                      codexBackendMode,
+                      agentRuntimeDescriptorV1,
+                      directory: resolvedDirectory,
+                      environmentVariables: extraEnv,
+                    },
+                    processEnv: { ...sessionChildProcessEnv, ...spawnEnvironment.extraEnvForChild },
+                  })
+                  : null;
+                // Resolve the selected host in the daemon's terminal context, before
+                // provider authentication can replace the child's configuration root.
+                // The same admitted endpoint serves hosted runners and optional clients.
+                const admittedHerdrContext = terminalRequest.requested === 'herdr' && terminalPresentation?.kind !== 'none'
+                  ? await prepareHerdrTerminalContext({ sessionName: terminalRequest.herdr.sessionName,
+                    existingSessionId: normalizedExistingSessionId || undefined })
+                  : null;
+                const extraEnvForChild = {
+                  ...spawnEnvironment.extraEnvForChild,
+                  ...(terminalPresentation?.childEnv ?? {}),
+                };
                 const materializationDiagnostics = spawnEnvironment.materializationDiagnostics;
                 const trackedSessionEnvironmentVariables = buildTrackedSessionRespawnEnvironmentVariables({
                   expandedEnvironmentVariables: extraEnv,
                   extraEnvForChild,
                 });
-                const {
-                  existingSessionAttachPayload: _existingSessionAttachPayload,
-                  initialTranscriptAfterSeq: _initialTranscriptAfterSeq,
-                  executionAuthorization: _executionAuthorization,
-                  initialGoal: _initialGoal,
-                  ...trackedSpawnOptionsBase
-                } = effectiveSpawnOptionsBase;
-                const trackedSpawnOptions: SpawnSessionOptions = {
-                  ...trackedSpawnOptionsBase,
-                  ...(trackedSessionEnvironmentVariables
-                    ? { environmentVariables: trackedSessionEnvironmentVariables }
-                    : {}),
-                  ...(materializationDiagnostics ? { materializationDiagnostics } : {}),
-                };
+                const trackedSpawnOptions = buildTrackedSpawnOptions({
+                  options: effectiveSpawnOptionsBase,
+                  environmentVariables: trackedSessionEnvironmentVariables,
+                  materializationDiagnostics,
+                  terminalPresentation: terminalPresentation ?? undefined,
+                });
 
-            const downgradeLegacyImplicitTmuxRequest = shouldDowngradeLegacyImplicitTmuxRequest({
-              terminal: normalizedOptions.terminal,
-              backendTarget,
-            });
-            const terminalRequest = resolveTerminalRequestFromSpawnOptions({
-              happyHomeDir: configuration.happyHomeDir,
-              terminal: downgradeLegacyImplicitTmuxRequest ? undefined : normalizedOptions.terminal,
-              environmentVariables: extraEnv,
-            });
             let sessionAttachFilePath: string | null = null;
             if (normalizedExistingSessionId) {
               if (!sessionAttachPayload) {
@@ -3988,8 +4204,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             };
 
             const tmuxRequested = terminalRequest.requested === 'tmux';
-            const tmuxAvailable = tmuxRequested ? await isTmuxAvailable() : false;
-            let useTmux = tmuxAvailable && tmuxRequested;
+            const tmuxRunnerRequested = tmuxRequested && terminalPresentation?.kind === 'runner';
+            const tmuxAvailable = tmuxRunnerRequested ? await isTmuxAvailable() : false;
+            let useTmux = tmuxAvailable && tmuxRunnerRequested;
 
             const tmuxSessionName = tmuxRequested ? terminalRequest.tmux.sessionName : undefined;
             const tmuxTmpDir = tmuxRequested ? terminalRequest.tmux.tmpDir : null;
@@ -4000,7 +4217,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
 
             let tmuxFallbackReason: string | null = null;
 
-            if (!tmuxAvailable && tmuxRequested) {
+            if (!tmuxAvailable && tmuxRunnerRequested) {
               tmuxFallbackReason = 'tmux is not available on this machine';
               logger.debug('[DAEMON RUN] tmux requested but tmux is not available; falling back to regular spawning');
             }
@@ -4010,10 +4227,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 await acceptanceHooks.onBeforeRunnerLaunchAccepted();
               } catch (error) {
                 cleanupSpawnResources();
-                if (sessionAttachCleanup) {
-                  await sessionAttachCleanup();
-                  sessionAttachCleanup = null;
-                }
+                await cleanupSessionAttachResources(error);
                 return {
                   type: 'error',
                   errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_FAILED,
@@ -4028,6 +4242,174 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               preferWindowsPackagedBinary: true,
               liveRunnerSnapshotFingerprints,
               ...(runtimeDecision ? { runtimeDecision } : {}),
+            };
+            const sessionControlArgs = buildHappySessionControlArgs({
+              resume: effectiveResume,
+              existingSessionId: normalizedExistingSessionId,
+              backendTarget,
+              permissionMode,
+              permissionModeUpdatedAt,
+              agentModeId,
+              agentModeUpdatedAt,
+              modelId,
+              modelUpdatedAt,
+            });
+
+            let observedSpawnExit: Parameters<typeof onChildExited>[1] | null = null;
+            let runnerWebhookCompletion: ReturnType<typeof waitForSessionWebhook> | undefined;
+            const exitedBeforeFinalizationResult = (): Extract<SpawnSessionResult, { type: 'error' }> => ({
+              type: 'error',
+              errorCode: SPAWN_SESSION_ERROR_CODES.CHILD_EXITED_BEFORE_WEBHOOK,
+              errorMessage: 'Child process exited before session startup was finalized',
+            });
+            // Launch adapters own process creation; every accepted runner has the same daemon custody.
+            const registerAcceptedRunner = async (
+              trackedSession: TrackedSession,
+              actualSpawnOptions: SpawnSessionOptions,
+              createWebhookCompletion: () => ReturnType<typeof waitForSessionWebhook>,
+            ): Promise<Readonly<{ acceptedResult: SpawnSessionResult; webhookCompletion: Promise<SpawnSessionResult> }>> => {
+              const pid = trackedSession.pid;
+              pidToTrackedSession.set(pid, trackedSession);
+              if (spawnResourceCleanupOnExit) {
+                spawnResourceCleanupByPid.set(pid, spawnResourceCleanupOnExit);
+                spawnResourceCleanupArmed = true;
+              }
+              if (sessionAttachCleanup) {
+                sessionAttachCleanupByPid.set(pid, sessionAttachCleanup);
+                sessionAttachCleanup = null;
+              }
+              // Arm before the first asynchronous custody write: a fast child's exact
+              // report must use the same finalization callback as every later report.
+              const webhookCompletion = createWebhookCompletion();
+              runnerWebhookCompletion = webhookCompletion;
+              try {
+                await persistAcceptedSpawnMarker({
+                  pid,
+                  spawnOptions: actualSpawnOptions,
+                  directory: resolvedDirectory,
+                  existingSessionId: normalizedExistingSessionId,
+                });
+              } catch (error) {
+                const currentPid = webhookCompletion.getCurrentPid();
+                const timeout = pidToSpawnWebhookTimeout.get(currentPid);
+                if (timeout) clearTimeout(timeout);
+                pidToSpawnWebhookTimeout.delete(currentPid);
+                pidToAwaiter.delete(currentPid);
+                const resolveSpawn = pidToSpawnResultResolver.get(currentPid);
+                pidToSpawnResultResolver.delete(currentPid);
+                resolveSpawn?.({ type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_FAILED,
+                  errorMessage: 'Accepted runner custody could not be persisted' });
+                throw error;
+              }
+              // Explicit resume supersedes Stop for every host. A stopped session cannot reach
+              // this registration through automatic respawn, which the manager already suppresses.
+              if (normalizedExistingSessionId) {
+                sessionRunnerRespawnManager.clearStopRequested(normalizedExistingSessionId);
+              }
+              if (connectedServiceAuth && effectiveConnectedServicesBindings) {
+                registerConnectedServiceRuntimeTargetForDaemon({
+                  runtimeRegistry: connectedServiceRuntimeRegistry,
+                  pid: webhookCompletion.getCurrentPid(),
+                  agentId: catalogAgentId,
+                  sessionId: connectedServiceAuthSessionId,
+                  connectedServicesBindingsRaw: effectiveConnectedServicesBindings,
+                  connectedServiceSelectionsEnv: connectedServiceAuth.env,
+                  materializationKey,
+                  connectedServiceMaterializationIdentityV1: normalizedOptions.connectedServiceMaterializationIdentityV1,
+                  sessionDirectory: resolvedDirectory,
+                  runtimeAccountIdentitySelections: connectedServiceAuth.runtimeAccountIdentitySelections,
+                  onRegisteredTarget: clearMemberRuntimeStateWithSuccessfulSpawnEvidence,
+                });
+              }
+              const acceptedResult = buildSpawnAcceptedResult({
+                pid: webhookCompletion.getCurrentPid(),
+                spawnNonce: trackedSpawnOptions.spawnNonce,
+                fallbackSessionId: normalizedExistingSessionId,
+              });
+              daemonSpawnAttemptRegistry.rememberAccepted({
+                spawnNonce: trackedSpawnOptions.spawnNonce,
+                result: acceptedResult,
+              });
+              return { acceptedResult, webhookCompletion };
+            };
+
+            // Host-specific binding/publication finishes before the common exact-session wake.
+            const monitorRunnerWebhook = (params: {
+              pid: number;
+              logLabel: string;
+              completion: Promise<SpawnSessionResult>;
+              onSuccess?: (result: Extract<SpawnSessionResult, { type: 'success' }>) => Promise<void>;
+            }): Promise<void> => {
+              return params.completion.then(async (result) => {
+                let resolved = resolveSpawnWebhookResult({
+                  pid: params.pid,
+                  result,
+                  pidToTrackedSession,
+                  warn: (message) => logger.warn(message),
+                });
+                if (resolved.type === 'success' && observedSpawnExit) resolved = exitedBeforeFinalizationResult();
+                if (resolved.type === 'success' && params.onSuccess) {
+                  try {
+                    await params.onSuccess(resolved);
+                  } catch (error) {
+                    logger.warn(`[DAEMON RUN] Failed to finalize spawned terminal attachment for PID ${params.pid} (${params.logLabel})`);
+                    resolved = {
+                      type: 'error',
+                      errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_FAILED,
+                      errorMessage: error instanceof Error ? error.message : String(error),
+                    };
+                  }
+                }
+                if (resolved.type === 'error' && resolved.errorCode === SPAWN_SESSION_ERROR_CODES.SESSION_WEBHOOK_TIMEOUT) {
+                  logger.debug(`[DAEMON RUN] Session webhook timeout for PID ${params.pid} (${params.logLabel})`);
+                }
+                if (resolved.type === 'success' && observedSpawnExit) resolved = exitedBeforeFinalizationResult();
+                daemonSpawnAttemptRegistry.settle(trackedSpawnOptions.spawnNonce ?? '', resolved);
+                await nudgeAttachedExistingSessionPendingQueue({
+                  requestedExistingSessionId: normalizedExistingSessionId,
+                  credentials,
+                  isShutdownRequested: () => shutdownInitiated,
+                  resolved,
+                });
+              }).catch((error) => {
+                logger.warn(`[DAEMON RUN] Session webhook monitor failed for PID ${params.pid} (${params.logLabel}): ${error instanceof Error ? error.message : String(error)}`);
+                daemonSpawnAttemptRegistry.settle(trackedSpawnOptions.spawnNonce ?? '', {
+                  type: 'error',
+                  errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
+                  errorMessage: error instanceof Error ? error.message : String(error),
+                });
+              });
+            };
+            const armRunnerWebhookFinalization = (
+              registration: ReturnType<typeof registerAcceptedRunner>,
+              params: Omit<Parameters<typeof monitorRunnerWebhook>[0], 'completion'>,
+            ): void => {
+              const finalization = registration.then(({ webhookCompletion }) => monitorRunnerWebhook({
+                ...params, completion: webhookCompletion,
+              }), () => undefined);
+              const tracked = pidToTrackedSession.get(params.pid);
+              if (!tracked) throw new Error('Accepted runner tracking is unavailable');
+              const completion = runnerWebhookCompletion;
+              if (!completion) throw new Error('Accepted runner waiter is unavailable');
+              const custody: NonNullable<TrackedSession['startupCustody']> = { finalization, promotePid: completion.promotePid, observeExit: (exit) => {
+                observedSpawnExit = exit;
+                const currentPid = completion.getCurrentPid();
+                const resolveSpawn = pidToSpawnResultResolver.get(currentPid);
+                const timeout = pidToSpawnWebhookTimeout.get(currentPid);
+                if (timeout) clearTimeout(timeout);
+                pidToSpawnResultResolver.delete(currentPid);
+                pidToSpawnWebhookTimeout.delete(currentPid);
+                pidToAwaiter.delete(currentPid);
+                resolveSpawn?.({ type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.CHILD_EXITED_BEFORE_WEBHOOK,
+                  errorMessage: `Child process exited before session startup was finalized (pid=${params.pid})` });
+              } };
+              tracked.startupCustody = custody;
+              void finalization.then(() => {
+                if (tracked.startupCustody === custody) delete tracked.startupCustody;
+                for (const current of pidToTrackedSession.values()) {
+                  if (current.startupCustody === custody) delete current.startupCustody;
+                }
+              });
             };
 
             if (useTmux && tmuxSessionName !== undefined) {
@@ -4075,21 +4457,15 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     agent: agentSubcommand,
                     directory: resolvedDirectory,
                     extraEnv: extraEnvForChildWithMessage,
+                    startingMode: terminalPresentation?.startingMode ?? 'remote',
+                    processEnv: sessionChildProcessEnv,
+                    homeDir: configuration.happyHomeDir,
+                    serverSelectionEnv: childServerSelectionEnv,
                     tmuxCommandEnv,
                     launchOptions: runnerLaunchOptions,
                     extraArgs: [
                       ...terminalRuntimeArgs,
-                  ...buildHappySessionControlArgs({
-                    resume: effectiveResume,
-                    existingSessionId: normalizedExistingSessionId,
-                    backendTarget,
-                    permissionMode,
-                    permissionModeUpdatedAt,
-                    agentModeId,
-                    agentModeUpdatedAt,
-                    modelId,
-                    modelUpdatedAt,
-                  }),
+                  ...sessionControlArgs,
                     ],
                   });
               const tmux = new TmuxUtilities(resolvedTmuxSessionName, tmuxCommandEnv);
@@ -4139,13 +4515,20 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
 
             // Resolve the actual tmux session name used (important when sessionName was empty/undefined)
             const tmuxSession = tmuxResult.sessionName ?? (resolvedTmuxSessionName || 'happy');
+            const tmuxTrackedSpawnOptions = buildTrackedSpawnOptions({
+              options: trackedSpawnOptions,
+              actualTerminal: {
+                mode: 'tmux',
+                tmux: { sessionName: tmuxSession, isolated: terminalRequest.requested === 'tmux' && terminalRequest.tmux.isolated, tmpDir: tmuxTmpDir },
+              },
+            });
 
                 // Create a tracked session for tmux windows - now we have the real PID!
                 const trackedSession: TrackedSession = {
                   startedBy: 'daemon',
                   happySessionId: normalizedExistingSessionId || undefined,
                   pid: tmuxPid, // Real PID from tmux -P flag
-                  spawnOptions: trackedSpawnOptions,
+                  spawnOptions: tmuxTrackedSpawnOptions,
                   tmuxSessionId: tmuxResult.sessionId,
                   tmuxTmpDir: typeof tmuxTmpDir === 'string' && tmuxTmpDir.trim().length > 0 ? tmuxTmpDir.trim() : undefined,
                   vendorResumeId: effectiveResume || undefined,
@@ -4155,112 +4538,56 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     : `Spawned new session in tmux session '${tmuxSession}'. Use 'tmux attach -t ${tmuxSession}' to view the session.`
                 };
 
-                // Add to tracking map so webhook can find it later
-              pidToTrackedSession.set(tmuxPid, trackedSession);
-              await persistAcceptedSpawnMarker({
+            const registration = registerAcceptedRunner(trackedSession, tmuxTrackedSpawnOptions,
+              () => waitForSessionWebhook({
                 pid: tmuxPid,
-                spawnOptions: trackedSpawnOptions,
-                directory: resolvedDirectory,
-                existingSessionId: normalizedExistingSessionId,
-              });
-              if (connectedServiceAuth && effectiveConnectedServicesBindings) {
-                registerConnectedServiceRuntimeTargetForDaemon({
-                  runtimeRegistry: connectedServiceRuntimeRegistry,
-                  pid: tmuxPid,
-                  agentId: catalogAgentId,
-                  sessionId: connectedServiceAuthSessionId,
-                  connectedServicesBindingsRaw: effectiveConnectedServicesBindings,
-                  connectedServiceSelectionsEnv: connectedServiceAuth.env,
-                  materializationKey,
-                  // RD-MAT-6: keep refresh-driven rematerialization on the live identity root and
-                  // the session's working directory (workspace-trust projection target).
-                  connectedServiceMaterializationIdentityV1: normalizedOptions.connectedServiceMaterializationIdentityV1,
-                  sessionDirectory: resolvedDirectory,
-                  runtimeAccountIdentitySelections: connectedServiceAuth.runtimeAccountIdentitySelections,
-                  onRegisteredTarget: clearMemberRuntimeStateWithSuccessfulSpawnEvidence,
-                });
-              }
-                if (spawnResourceCleanupOnExit) {
-                  spawnResourceCleanupByPid.set(tmuxPid, spawnResourceCleanupOnExit);
-                  spawnResourceCleanupArmed = true;
-                }
-                if (sessionAttachCleanup) {
-                  sessionAttachCleanupByPid.set(tmuxPid, sessionAttachCleanup);
-                  sessionAttachCleanup = null;
-                }
-
-            const acceptedResult = buildSpawnAcceptedResult({
-              pid: tmuxPid,
-              spawnNonce: trackedSpawnOptions.spawnNonce,
-              fallbackSessionId: normalizedExistingSessionId,
-            });
-            // Preserve fast acknowledgement; the durable Pending row and server event own delivery.
-            logger.debug(`[DAEMON RUN] Waiting for session webhook for PID ${tmuxPid} (tmux)`);
-            const webhookCompletion = waitForSessionWebhook({
-              pid: tmuxPid,
-              pidToAwaiter,
+                pidToAwaiter,
                 pidToSpawnResultResolver,
                 pidToSpawnWebhookTimeout,
                 timeoutErrorMessage: `Session webhook timeout for PID ${tmuxPid} (tmux)`,
                 onTimeout: () => {
                   logger.debug(`[DAEMON RUN] Session webhook timeout for PID ${tmuxPid} (tmux)`);
-                  // No exit-code channel exists on this path; the webhook is the only outcome.
                   tmuxLaunchOutcomeLog.webhookTimedOut();
                 },
-              onSuccess: (completedSession) => {
-                logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook (tmux)`);
-              },
-            }).then(async (result) => {
-              const resolved = resolveSpawnWebhookResult({
-                pid: tmuxPid,
-                result,
-                pidToTrackedSession,
-                warn: (message) => logger.warn(message),
-              });
-              if (resolved.type === 'success' && resolved.sessionId) {
+                onSuccess: (completedSession) => {
+                  logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook (tmux)`);
+                },
+              }));
+            // Preserve fast acknowledgement; the durable Pending row and server event own delivery.
+            logger.debug(`[DAEMON RUN] Waiting for session webhook for PID ${tmuxPid} (tmux)`);
+            armRunnerWebhookFinalization(registration, {
+              pid: tmuxPid,
+              logLabel: 'tmux',
+              onSuccess: async (resolved) => {
+                if (!resolved.sessionId) return;
                 tmuxLaunchOutcomeLog.sessionBound(resolved.sessionId);
                 await bindSpawnedTmuxTerminalAttachment({
                   happyHomeDir: configuration.happyHomeDir,
                   sessionId: resolved.sessionId,
                   tmuxSessionName: tmuxSession,
-                  tmuxWindowName: tmuxResult.windowName ?? windowName,
+                  tmuxWindowId: tmuxResult.windowId ?? '',
                   ...(tmuxTmpDir ? { tmuxTmpDir } : {}),
                   disposeUnboundHost: async () => {
-                    const target = `${tmuxSession}:${tmuxResult.windowName ?? windowName}`;
+                    const target = tmuxResult.windowId ?? '';
                     if (!await tmux.killWindow(target)) {
                       throw new Error(`Failed to dispose unbound tmux window ${target}`);
                     }
                   },
                 });
-              }
-              daemonSpawnAttemptRegistry.settle(trackedSpawnOptions.spawnNonce ?? '', resolved);
-              const nudgeResult = await nudgeAttachedExistingSessionPendingQueue({
-                requestedExistingSessionId: normalizedExistingSessionId,
-                credentials,
-                isShutdownRequested: () => shutdownInitiated,
-                resolved,
-              });
-              if (nudgeResult.type === 'error') {
-                logger.warn(`[DAEMON RUN] Pending queue wake failed after webhook for PID ${tmuxPid} (tmux): ${nudgeResult.errorMessage}`);
-              }
-              return nudgeResult;
-            }).catch((error) => {
-              logger.warn(`[DAEMON RUN] Session webhook monitor failed for PID ${tmuxPid} (tmux): ${error instanceof Error ? error.message : String(error)}`);
-              const result = {
-                type: 'error' as const,
-                errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
-                errorMessage: error instanceof Error ? error.message : String(error),
-              };
-              daemonSpawnAttemptRegistry.settle(trackedSpawnOptions.spawnNonce ?? '', result);
-              return result;
+              },
             });
-            daemonSpawnAttemptRegistry.rememberAccepted({
-              spawnNonce: trackedSpawnOptions.spawnNonce,
-              result: acceptedResult,
-            });
-            void webhookCompletion;
+            const { acceptedResult } = await registration;
             return acceptedResult;
               } else {
+                if (tmuxResult.launchDisposition !== 'not_started' || tmuxResult.cleanupIncomplete) {
+                  // Preserve launch inputs while an already-submitted command may
+                  // still consume them. The report path can identify a live runner.
+                  return {
+                    type: 'error',
+                    errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_FAILED,
+                    errorMessage: 'Tmux runner launch could not be safely completed. Inspect tmux before retrying; no fallback runner was started.',
+                  };
+                }
                 tmuxFallbackReason = tmuxResult.error ?? 'tmux spawn failed';
                 logger.debug(`[DAEMON RUN] Failed to spawn in tmux: ${tmuxResult.error}, falling back to regular spawning`);
                 useTmux = false;
@@ -4274,11 +4601,20 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           const agentCommand = resolveCliSubcommandFromBackendTarget(backendTarget);
               const args = [
                 agentCommand,
-                '--happy-starting-mode', 'remote',
+                '--happy-starting-mode', terminalPresentation?.startingMode ?? 'remote',
                 '--started-by', 'daemon'
               ];
 
-              if (tmuxRequested) {
+              if (selectedHost && (terminalPresentation?.kind === 'provider' || terminalPresentation?.kind === 'provider_attach')) {
+                args.push('--happy-terminal-mode', 'plain', '--happy-terminal-requested', selectedHost);
+                if (terminalRequest.requested === 'herdr' && admittedHerdrContext) args.push(
+                  '--happy-herdr-session-name', admittedHerdrContext.herdrSessionName,
+                  '--happy-herdr-socket-path', admittedHerdrContext.herdrSocketPath);
+                if (terminalRequest.requested === 'tmux') {
+                  args.push('--happy-tmux-target', terminalRequest.tmux.sessionName);
+                  if (terminalRequest.tmux.tmpDir) args.push('--happy-tmux-tmpdir', terminalRequest.tmux.tmpDir);
+                }
+              } else if (tmuxRunnerRequested) {
                 const reason = tmuxFallbackReason ?? 'tmux was not used';
                 args.push(
                   '--happy-terminal-mode',
@@ -4290,73 +4626,37 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 );
               }
 
-              args.push(...buildHappySessionControlArgs({
-                resume: effectiveResume,
-                existingSessionId: normalizedExistingSessionId,
-                backendTarget,
-                permissionMode,
-                permissionModeUpdatedAt,
-                agentModeId,
-                agentModeUpdatedAt,
-                modelId,
-                modelUpdatedAt,
-              }));
+              args.push(...sessionControlArgs);
               const windowsLaunchMode = resolveWindowsRemoteSessionConsoleMode({
                 platform: process.platform,
                 requested: normalizedOptions.windowsRemoteSessionLaunchMode ?? normalizedOptions.windowsRemoteSessionConsole,
                 env: process.env,
               });
 
-              const waitForWindowsHostedSession = async (params: {
+              const waitForHostedRunnerSession = async (params: {
                 pid: number;
                 logLabel: string;
                 terminal: NonNullable<Metadata['terminal']>;
+                handle?: TerminalHostHandle;
+                disposeUnboundHost?: () => Promise<void>;
               }): Promise<SpawnSessionResult> => {
-                if (sessionAttachCleanup) {
-                  sessionAttachCleanupByPid.set(params.pid, sessionAttachCleanup);
-                  sessionAttachCleanup = null;
-                }
-
+                const hostedTrackedSpawnOptions = buildTrackedSpawnOptions({
+                  options: trackedSpawnOptions,
+                  actualTerminal: {
+                    ...(trackedSpawnOptions.terminal?.mode === params.terminal.mode ? trackedSpawnOptions.terminal : {}),
+                    mode: params.terminal.mode,
+                  },
+                });
                 const trackedSession: TrackedSession = {
                   startedBy: 'daemon',
                   happySessionId: normalizedExistingSessionId || undefined,
                   pid: params.pid,
-                  spawnOptions: trackedSpawnOptions,
+                  spawnOptions: hostedTrackedSpawnOptions,
                   vendorResumeId: effectiveResume || undefined,
                   hostedTerminal: params.terminal,
                   directoryCreated,
                   message: directoryCreated ? `The path '${resolvedDirectory}' did not exist. We created a new folder and spawned a new session there.` : undefined,
                 };
-                pidToTrackedSession.set(params.pid, trackedSession);
-                await persistAcceptedSpawnMarker({
-                  pid: params.pid,
-                  spawnOptions: trackedSpawnOptions,
-                  directory: resolvedDirectory,
-                  existingSessionId: normalizedExistingSessionId,
-                });
-                if (connectedServiceAuth && effectiveConnectedServicesBindings) {
-                  registerConnectedServiceRuntimeTargetForDaemon({
-                    runtimeRegistry: connectedServiceRuntimeRegistry,
-                    pid: params.pid,
-                    agentId: catalogAgentId,
-                    sessionId: connectedServiceAuthSessionId,
-                    connectedServicesBindingsRaw: effectiveConnectedServicesBindings,
-                    connectedServiceSelectionsEnv: connectedServiceAuth.env,
-                    materializationKey,
-                    // RD-MAT-6: keep refresh-driven rematerialization on the live identity root and
-                    // the session's working directory (workspace-trust projection target).
-                    connectedServiceMaterializationIdentityV1: normalizedOptions.connectedServiceMaterializationIdentityV1,
-                    sessionDirectory: resolvedDirectory,
-                    runtimeAccountIdentitySelections: connectedServiceAuth.runtimeAccountIdentitySelections,
-                    onRegisteredTarget: clearMemberRuntimeStateWithSuccessfulSpawnEvidence,
-                  });
-                }
-
-                if (spawnResourceCleanupOnExit) {
-                  spawnResourceCleanupByPid.set(params.pid, spawnResourceCleanupOnExit);
-                  spawnResourceCleanupArmed = true;
-                }
-
                 const pollMsRaw = typeof process.env.HAPPIER_DAEMON_VISIBLE_CONSOLE_EXIT_POLL_MS === 'string'
                   ? process.env.HAPPIER_DAEMON_VISIBLE_CONSOLE_EXIT_POLL_MS.trim()
                   : '';
@@ -4365,47 +4665,41 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
 
                 logger.debug(`[DAEMON RUN] Waiting for session webhook for PID ${params.pid} (${params.logLabel})`);
 
-                const acceptedResult = buildSpawnAcceptedResult({
-                  pid: params.pid,
-                  spawnNonce: trackedSpawnOptions.spawnNonce,
-                  fallbackSessionId: normalizedExistingSessionId,
-                });
-                daemonSpawnAttemptRegistry.rememberAccepted({
-                  spawnNonce: trackedSpawnOptions.spawnNonce,
-                  result: acceptedResult,
-                });
-
-                const webhookCompletion = waitForVisibleConsoleSessionWebhook({
-                  pid: params.pid,
-                  pollMs,
-                  pidToAwaiter,
-                  pidToSpawnResultResolver,
-                  pidToSpawnWebhookTimeout,
-                  onChildExited,
-                }).then(async (result) => {
-                  const resolved = resolveSpawnWebhookResult({
+                const registration: ReturnType<typeof registerAcceptedRunner> = registerAcceptedRunner(trackedSession, hostedTrackedSpawnOptions,
+                  () => waitForVisibleConsoleSessionWebhook({
                     pid: params.pid,
-                    result,
-                    pidToTrackedSession,
-                    warn: (message) => logger.warn(message),
-                  });
-                  daemonSpawnAttemptRegistry.settle(trackedSpawnOptions.spawnNonce ?? '', resolved);
-                  if (resolved.type === 'success') {
+                    pollMs,
+                    pidToAwaiter,
+                    pidToSpawnResultResolver,
+                    pidToSpawnWebhookTimeout,
+                    onChildExited,
+                  }));
+                armRunnerWebhookFinalization(registration, {
+                  pid: params.pid,
+                  logLabel: params.logLabel,
+                  onSuccess: async (resolved) => {
                     logger.debug(
                       `[DAEMON RUN] Session ${resolved.sessionId} fully spawned with webhook (${params.logLabel})`,
                     );
                     const resolvedSessionId =
                       typeof resolved.sessionId === 'string' ? resolved.sessionId.trim() : '';
                     if (resolvedSessionId) {
-                      try {
+                      if (params.handle && params.disposeUnboundHost) {
+                        await bindSpawnedTerminalHostAttachment({
+                          happyHomeDir: configuration.happyHomeDir,
+                          sessionId: resolvedSessionId,
+                          handle: params.handle,
+                          disposeUnboundHost: params.disposeUnboundHost,
+                        });
+                      }
+                      if (!params.handle || !params.disposeUnboundHost) {
                         await writeTerminalAttachmentInfo({
                           happyHomeDir: configuration.happyHomeDir,
                           sessionId: resolvedSessionId,
                           terminal: params.terminal,
                         });
-                      } catch (error) {
-                        logger.debug('[DAEMON RUN] Failed to persist Windows terminal attachment info', error);
                       }
+                      if (observedSpawnExit) return;
                       try {
                         await publishCurrentTerminalControlServiceability({
                           credentials,
@@ -4420,38 +4714,139 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                         });
                       }
                     }
-                  } else if (
-                    resolved.type === 'error' &&
-                    resolved.errorCode === SPAWN_SESSION_ERROR_CODES.SESSION_WEBHOOK_TIMEOUT
-                  ) {
-                    logger.debug(`[DAEMON RUN] Session webhook timeout for PID ${params.pid} (${params.logLabel})`);
-                  }
-                }).catch((error) => {
-                  logger.warn(`[DAEMON RUN] Session webhook monitor failed for PID ${params.pid} (${params.logLabel}): ${error instanceof Error ? error.message : String(error)}`);
-                  daemonSpawnAttemptRegistry.settle(trackedSpawnOptions.spawnNonce ?? '', {
-                    type: 'error',
-                    errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
-                    errorMessage: error instanceof Error ? error.message : String(error),
-                  });
+                  },
                 });
-                void webhookCompletion;
+                const { acceptedResult } = await registration;
                 return acceptedResult;
               };
 
               const buildWindowsHostedLaunchEnv = (launchSpec: ReturnType<typeof buildHappyCliSubprocessLaunchSpec>) =>
                 buildSpawnChildProcessEnv({
+                  homeDir: configuration.happyHomeDir,
                   processEnv: sessionChildProcessEnv,
                   extraEnv: {
                     ...extraEnvForChildWithMessage,
                     ...(launchSpec.env ?? {}),
                   },
-                  serverSelectionEnv: {
-                    activeServerId: configuration.activeServerId,
-                    canonicalServerUrl: configuration.serverUrl,
-                    apiServerUrl: configuration.apiServerUrl,
-                    webappUrl: configuration.webappUrl,
-                  },
+                  serverSelectionEnv: childServerSelectionEnv,
                 });
+
+              const launchRunnerInTerminalHost = async (params: Readonly<{
+                host: 'zellij' | 'herdr';
+                sessionName: string;
+                startingMode: 'local' | 'remote';
+              }>): Promise<SpawnSessionResult> => {
+                const adapter = params.host === 'herdr'
+                  ? (await createDefaultTerminalHostRegistry({
+                    herdrSessionName: admittedHerdrContext?.herdrSessionName,
+                    herdrSocketPath: admittedHerdrContext?.herdrSocketPath,
+                  })).herdr
+                  : (await loadTerminalHostAdapters())[params.host];
+                const displayName = params.host === 'zellij' ? 'Zellij' : 'Herdr';
+                if (!adapter) {
+                  cleanupSpawnResources();
+                  await cleanupSessionAttachResources(new Error(`${displayName} installation unavailable`));
+                  return {
+                    type: 'error',
+                    errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_FAILED,
+                    errorMessage: `${displayName} hosting requires a supported ${displayName} installation on this machine.`,
+                    errorDetail: { kind: 'terminal_host_unavailable', host: params.host, reason: 'installation_unavailable' },
+                  };
+                }
+                const attachmentId = createTerminalAttachmentId();
+                const { commandTokens, childEnv } = await buildHostedRunnerSpawnConfig({
+                  host: params.host,
+                  launchId: createSessionLaunchId(),
+                  agent: agentCommand,
+                  directory: resolvedDirectory,
+                  extraEnv: extraEnvForChildWithMessage,
+                  startingMode: params.startingMode,
+                  processEnv: sessionChildProcessEnv,
+                  homeDir: configuration.happyHomeDir,
+                  serverSelectionEnv: childServerSelectionEnv,
+                  launchOptions: runnerLaunchOptions,
+                  extraArgs: [
+                    '--happy-terminal-mode', params.host,
+                    '--happy-terminal-requested', params.host,
+                    ...(params.host === 'herdr'
+                      ? ['--happy-herdr-session-name', admittedHerdrContext?.herdrSessionName ?? params.sessionName,
+                        ...(admittedHerdrContext ? ['--happy-herdr-socket-path', admittedHerdrContext.herdrSocketPath] : [])]
+                      : []),
+                    '--happy-terminal-attachment-id', attachmentId,
+                    ...sessionControlArgs,
+                  ],
+                });
+                let handle: TerminalHostHandle | null = null;
+                try {
+                  const createdHandle = await adapter.createOrAttachHost({
+                    sessionName: params.sessionName,
+                    workingDirectory: resolvedDirectory,
+                    spawnArgv: commandTokens,
+                    spawnEnv: childEnv,
+                    isolatedEnv: true,
+                  });
+                  handle = { ...createdHandle, attachmentId };
+                  const liveness = await adapter.evaluateLiveness(handle);
+                  if (!liveness.panePid) throw new Error(`${displayName} did not report the launched runner PID`);
+                  const terminal = buildTerminalAttachmentMetadataFromHostHandle(handle);
+                  if (!terminal) throw new Error(`${displayName} did not report a complete terminal attachment`);
+                  return await waitForHostedRunnerSession({
+                    pid: liveness.panePid,
+                    logLabel: displayName,
+                    terminal,
+                    handle,
+                    disposeUnboundHost: async () => await adapter.dispose(handle!),
+                  });
+                } catch (error) {
+                  let launchFailure = resolveTerminalHostLaunchFailure(error);
+                  let safeToDiscardInputs = launchFailure !== null && launchFailure.launchDisposition !== 'unconfirmed';
+                  if (handle) {
+                    try {
+                      await adapter.dispose(handle);
+                      safeToDiscardInputs = true;
+                    } catch {
+                      safeToDiscardInputs = false;
+                    }
+                  }
+                  let failure = error;
+                  if (safeToDiscardInputs) {
+                    try {
+                      cleanupSpawnResources();
+                      await cleanupSessionAttachResources();
+                    } catch (cleanupError) {
+                      failure = new AggregateError([error, cleanupError], 'Terminal host runner launch failed with incomplete cleanup', { cause: error });
+                      launchFailure = { launchDisposition: launchFailure?.launchDisposition ?? 'stopped', cleanupIncomplete: true };
+                    }
+                  }
+                  logger.infoFile('[DAEMON RUN] Terminal host runner launch failed', {
+                    host: params.host,
+                    launchDisposition: safeToDiscardInputs ? launchFailure?.launchDisposition ?? 'stopped' : 'unconfirmed',
+                    cleanupIncomplete: !safeToDiscardInputs || launchFailure?.cleanupIncomplete === true || failure !== error,
+                  });
+                  return {
+                    type: 'error',
+                    errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_FAILED,
+                    errorMessage: `${displayName} runner launch failed. Check ${displayName} before retrying: ${failure instanceof Error ? failure.message : String(failure)}`,
+                    errorDetail: resolveTerminalHostUnavailableSpawnErrorDetail(error),
+                  };
+                }
+              };
+
+              if (terminalRequest.requested === 'zellij' && terminalPresentation?.kind === 'runner') {
+                return await launchRunnerInTerminalHost({
+                  host: 'zellij',
+                  sessionName: `happier-${agentCommand}-${Date.now()}`,
+                  startingMode: terminalPresentation.startingMode ?? 'local',
+                });
+              }
+
+              if (terminalRequest.requested === 'herdr' && terminalPresentation?.kind === 'runner') {
+                return await launchRunnerInTerminalHost({
+                  host: 'herdr',
+                  sessionName: admittedHerdrContext?.herdrSessionName ?? terminalRequest.herdr.sessionName,
+                  startingMode: terminalPresentation.startingMode ?? 'local',
+                });
+              }
 
               if (windowsLaunchMode === 'windows_terminal' || windowsLaunchMode === 'console') {
                 const windowsTerminalIdentity = buildWindowsTerminalWindowIdentity({
@@ -4485,10 +4880,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   if (!started.ok) {
                     logger.debug('[DAEMON RUN] Failed to spawn visible Windows console session', { error: started.errorMessage });
                     cleanupSpawnResources();
-                    if (sessionAttachCleanup) {
-                      await sessionAttachCleanup();
-                      sessionAttachCleanup = null;
-                    }
+                    await cleanupSessionAttachResources(new Error(started.errorMessage));
                     return {
                       type: 'error',
                       errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_FAILED,
@@ -4497,7 +4889,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   }
 
                   logger.debug(`[DAEMON RUN] Spawned visible-console session with PID ${started.pid}`);
-                  return await waitForWindowsHostedSession({
+                  return await waitForHostedRunnerSession({
                     pid: started.pid,
                     logLabel: params.requested === 'windows_terminal' ? 'windows console fallback' : 'visible console',
                     terminal: buildWindowsHostedTerminalAttachment({
@@ -4529,7 +4921,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
 
                   if (started.ok) {
                     logger.debug(`[DAEMON RUN] Spawned Windows Terminal session with PID ${started.pid}`);
-                    return await waitForWindowsHostedSession({
+                    return await waitForHostedRunnerSession({
                       pid: started.pid,
                       logLabel: 'windows terminal',
                       terminal: buildWindowsHostedTerminalAttachment({
@@ -4556,14 +4948,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
 
                   // NOTE: sessionId is reserved for future Happy session resume; we currently ignore it.
               const childProcessEnv = buildSpawnChildProcessEnv({
+                homeDir: configuration.happyHomeDir,
                 processEnv: sessionChildProcessEnv,
                 extraEnv: extraEnvForChildWithMessage,
-                serverSelectionEnv: {
-                  activeServerId: configuration.activeServerId,
-                  canonicalServerUrl: configuration.serverUrl,
-                  apiServerUrl: configuration.apiServerUrl,
-                  webappUrl: configuration.webappUrl,
-                },
+                serverSelectionEnv: childServerSelectionEnv,
               });
               const spawnOptions = {
                 cwd: resolvedDirectory,
@@ -4609,10 +4997,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   spawnResourceCleanupOnFailure = null;
                   spawnResourceCleanupOnExit = null;
                 }
-                if (sessionAttachCleanup) {
-                  await sessionAttachCleanup();
-                  sessionAttachCleanup = null;
-                }
+                await cleanupSessionAttachResources(new Error('Failed to spawn Happier process - no PID returned'));
                 return {
                   type: 'error',
                 errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_NO_PID,
@@ -4642,78 +5027,48 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 startupSource,
                 logDebug: (message, context) => logger.debug(message, context),
               });
-              if (sessionAttachCleanup) {
-                sessionAttachCleanupByPid.set(happyProcess.pid, sessionAttachCleanup);
-                sessionAttachCleanup = null;
-              }
-
+              const regularTrackedSpawnOptions = buildTrackedSpawnOptions({
+                options: trackedSpawnOptions,
+                ...(terminalPresentation?.kind === 'provider' || terminalPresentation?.kind === 'provider_attach'
+                  ? {} : { actualTerminal: { mode: 'plain' as const } }),
+              });
                   const trackedSession: TrackedSession = {
                     startedBy: 'daemon',
                     happySessionId: normalizedExistingSessionId || undefined,
                     pid: happyProcess.pid,
                     childProcess: happyProcess,
-                    spawnOptions: trackedSpawnOptions,
+                    spawnOptions: regularTrackedSpawnOptions,
                     vendorResumeId: effectiveResume || undefined,
                     directoryCreated,
                     message: directoryCreated ? `The path '${resolvedDirectory}' did not exist. We created a new folder and spawned a new session there.` : undefined
                   };
 
-          pidToTrackedSession.set(happyProcess.pid, trackedSession);
-          await persistAcceptedSpawnMarker({
-            pid: happyProcess.pid,
-            spawnOptions: trackedSpawnOptions,
-            directory: resolvedDirectory,
-            existingSessionId: normalizedExistingSessionId,
-          });
-          // Clear any stale stop request on an explicit (re)spawn/resume of this session, so a later
-          // GENUINE crash of a resumed-after-stop session can respawn. The per-session stop flag is
-          // otherwise never cleared (clearStopRequested had no caller), which silently vetoed the
-          // respawn forever — see the exit-143 crash RCA. A user-stopped session never reaches this
-          // path via the respawn manager (its respawn is suppressed), so clearing here is safe.
-          if (normalizedExistingSessionId) {
-            sessionRunnerRespawnManager.clearStopRequested(normalizedExistingSessionId);
-          }
-          if (connectedServiceAuth && effectiveConnectedServicesBindings) {
-            registerConnectedServiceRuntimeTargetForDaemon({
-              runtimeRegistry: connectedServiceRuntimeRegistry,
-              pid: happyProcess.pid,
-              agentId: catalogAgentId,
-              sessionId: connectedServiceAuthSessionId,
-              connectedServicesBindingsRaw: effectiveConnectedServicesBindings,
-              connectedServiceSelectionsEnv: connectedServiceAuth.env,
-              materializationKey,
-              // RD-MAT-6: keep refresh-driven rematerialization on the live identity root and
-              // the session's working directory (workspace-trust projection target).
-              connectedServiceMaterializationIdentityV1: normalizedOptions.connectedServiceMaterializationIdentityV1,
-              sessionDirectory: resolvedDirectory,
-              runtimeAccountIdentitySelections: connectedServiceAuth.runtimeAccountIdentitySelections,
-              onRegisteredTarget: clearMemberRuntimeStateWithSuccessfulSpawnEvidence,
-            });
-          }
-          if (spawnResourceCleanupOnExit) {
-            spawnResourceCleanupByPid.set(happyProcess.pid, spawnResourceCleanupOnExit);
-            spawnResourceCleanupArmed = true;
-          }
+          const registration: ReturnType<typeof registerAcceptedRunner> = registerAcceptedRunner(trackedSession, regularTrackedSpawnOptions,
+            () => {
+              const completion = waitForSessionWebhook({
+              pid: happyProcess.pid!,
+              pidToAwaiter,
+              pidToSpawnResultResolver,
+              pidToSpawnWebhookTimeout,
+              timeoutErrorMessage: `Session webhook timeout for PID ${happyProcess.pid}`,
+              onTimeout: () => {
+                logger.debug(`[DAEMON RUN] Session webhook timeout for PID ${happyProcess.pid}`);
+                childLaunchOutcomeLog.webhookTimedOut({ processRunning: !childProcessKnownGone() });
+              },
+              onSuccess: (completedSession) => {
+                logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook`);
+              },
+              });
 
           happyProcess.on('exit', (code, signal) => {
             logger.debug(`[DAEMON RUN] Child PID ${happyProcess.pid} exited with code ${code}, signal ${signal}`);
             if (happyProcess.pid) {
-              const settledPendingLaunch = settlePendingSpawnBeforeWebhook({
-                pid: happyProcess.pid,
-                pidToAwaiter,
-                pidToSpawnResultResolver,
-                pidToSpawnWebhookTimeout,
-                result: {
-                  type: 'error',
-                  errorCode: SPAWN_SESSION_ERROR_CODES.CHILD_EXITED_BEFORE_WEBHOOK,
-                  errorMessage: `Child process exited before session webhook (pid=${happyProcess.pid}, code=${code ?? 'null'}, signal=${signal ?? 'null'})`,
-                },
-              });
-              // Only a still-pending launch failed; an ordinary session end is not a failed launch.
-              if (settledPendingLaunch) {
+              // Observe only; canonical startup custody still owns settlement.
+              if (pidToSpawnResultResolver.has(happyProcess.pid)) {
                 childLaunchOutcomeLog.childExitedBeforeWebhook({ code, signal });
               }
-              void onChildExited(happyProcess.pid, { reason: 'process-exited', code, signal }).catch((error) => {
+              const exit = { reason: 'process-exited', code, signal };
+              void onChildExited(happyProcess.pid, exit).catch((error) => {
                 logger.warn('[DAEMON RUN] Failed to complete child-exit lifecycle after process exit', { pid: happyProcess.pid, error });
               });
             }
@@ -4722,82 +5077,27 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           happyProcess.on('error', (error) => {
             logger.debug(`[DAEMON RUN] Child process error:`, error);
             if (happyProcess.pid) {
-              const settledPendingLaunch = settlePendingSpawnBeforeWebhook({
-                pid: happyProcess.pid,
-                pidToAwaiter,
-                pidToSpawnResultResolver,
-                pidToSpawnWebhookTimeout,
-                result: {
-                  type: 'error',
-                  errorCode: SPAWN_SESSION_ERROR_CODES.CHILD_EXITED_BEFORE_WEBHOOK,
-                  errorMessage: `Child process error before session webhook (pid=${happyProcess.pid})`,
-                },
-              });
-              if (settledPendingLaunch) {
+              if (pidToSpawnResultResolver.has(happyProcess.pid)) {
                 childLaunchOutcomeLog.childErrorBeforeWebhook(error);
               }
-              void onChildExited(happyProcess.pid, { reason: 'process-error', code: null, signal: null }).catch((error) => {
+              const exit = { reason: 'process-error', code: null, signal: null };
+              void onChildExited(happyProcess.pid, exit).catch((error) => {
                 logger.warn('[DAEMON RUN] Failed to complete child-exit lifecycle after process error', { pid: happyProcess.pid, error });
               });
             }
           });
-
-          const acceptedResult = buildSpawnAcceptedResult({
-            pid: happyProcess.pid,
-            spawnNonce: trackedSpawnOptions.spawnNonce,
-            fallbackSessionId: normalizedExistingSessionId,
-          });
+              return completion;
+            });
           // The durable Pending row survives process startup and owns provider delivery.
           logger.debug(`[DAEMON RUN] Waiting for session webhook for PID ${happyProcess.pid}`);
-              const webhookCompletion = waitForSessionWebhook({
-                pid: happyProcess.pid!,
-                pidToAwaiter,
-                pidToSpawnResultResolver,
-                pidToSpawnWebhookTimeout,
-                timeoutErrorMessage: `Session webhook timeout for PID ${happyProcess.pid}`,
-                onTimeout: () => {
-                  logger.debug(`[DAEMON RUN] Session webhook timeout for PID ${happyProcess.pid}`);
-                  childLaunchOutcomeLog.webhookTimedOut({ processRunning: !childProcessKnownGone() });
-                },
-                onSuccess: (completedSession) => {
-                  logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook`);
+          armRunnerWebhookFinalization(registration, {
+            pid: happyProcess.pid,
+            logLabel: 'regular',
+            onSuccess: async (resolved) => {
+              if (resolved.sessionId) childLaunchOutcomeLog.sessionBound(resolved.sessionId);
             },
-          }).then(async (result) => {
-            const resolved = resolveSpawnWebhookResult({
-              pid: happyProcess.pid!,
-              result,
-              pidToTrackedSession,
-              warn: (message) => logger.warn(message),
-            });
-            if (resolved.type === 'success' && resolved.sessionId) {
-              childLaunchOutcomeLog.sessionBound(resolved.sessionId);
-            }
-            daemonSpawnAttemptRegistry.settle(trackedSpawnOptions.spawnNonce ?? '', resolved);
-            const nudgeResult = await nudgeAttachedExistingSessionPendingQueue({
-              requestedExistingSessionId: normalizedExistingSessionId,
-              credentials,
-              isShutdownRequested: () => shutdownInitiated,
-              resolved,
-            });
-            if (nudgeResult.type === 'error') {
-              logger.warn(`[DAEMON RUN] Pending queue wake failed after webhook for PID ${happyProcess.pid}: ${nudgeResult.errorMessage}`);
-            }
-            return nudgeResult;
-          }).catch((error) => {
-            logger.warn(`[DAEMON RUN] Session webhook monitor failed for PID ${happyProcess.pid}: ${error instanceof Error ? error.message : String(error)}`);
-            const result = {
-              type: 'error' as const,
-              errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
-              errorMessage: error instanceof Error ? error.message : String(error),
-            };
-            daemonSpawnAttemptRegistry.settle(trackedSpawnOptions.spawnNonce ?? '', result);
-            return result;
           });
-          daemonSpawnAttemptRegistry.rememberAccepted({
-            spawnNonce: trackedSpawnOptions.spawnNonce,
-            result: acceptedResult,
-          });
-          void webhookCompletion;
+          const { acceptedResult } = await registration;
           return acceptedResult;
         }
 
@@ -4808,21 +5108,28 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           errorMessage: 'Unexpected error in session spawning'
         };
               } catch (error) {
-                if (spawnResourceCleanupOnFailure && !spawnResourceCleanupArmed) {
-                  spawnResourceCleanupOnFailure();
-                  spawnResourceCleanupOnFailure = null;
-              spawnResourceCleanupOnExit = null;
-            }
-            if (sessionAttachCleanup) {
-              await sessionAttachCleanup();
-              sessionAttachCleanup = null;
-            }
-                const errorMessage = error instanceof Error ? error.message : String(error);
-                logger.debug('[DAEMON RUN] Failed to spawn session:', error);
+                let failure = error;
+                try {
+                  if (spawnResourceCleanupOnFailure && !spawnResourceCleanupArmed) {
+                    const cleanup = spawnResourceCleanupOnFailure;
+                    spawnResourceCleanupOnFailure = null;
+                    spawnResourceCleanupOnExit = null;
+                    cleanup();
+                  }
+                } catch (cleanupError) {
+                  logger.infoFile('[DAEMON RUN] Spawn resource cleanup incomplete (spawn_resource_cleanup_incomplete)');
+                  failure = new AggregateError([failure, cleanupError], 'Session launch failed with incomplete resource cleanup', { cause: failure });
+                }
+                try { await cleanupSessionAttachResources(); } catch (cleanupError) {
+                  failure = new AggregateError([failure, cleanupError], 'Session launch failed with incomplete attach-file cleanup', { cause: failure });
+                }
+                const errorMessage = failure instanceof Error ? failure.message : String(failure);
+                logger.debug('[DAEMON RUN] Failed to spawn session:', failure);
                     return {
                       type: 'error',
                     errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_FAILED,
-                      errorMessage: `Failed to spawn session: ${errorMessage}`
+                      errorMessage: `Failed to spawn session: ${errorMessage}`,
+                      errorDetail: resolveTerminalHostUnavailableSpawnErrorDetail(error),
                     };
                   }
               }));
@@ -5005,12 +5312,15 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           60_000,
           { min: 1_000, max: 10 * 60_000 },
         );
-        type SessionRunnerRestartCompletionWaiter = Readonly<{
-          settle: (completion: RestartSessionRunnerCompletion) => void;
-        }>;
-        const sessionRunnerRestartCompletionWaiters = new Map<string, SessionRunnerRestartCompletionWaiter>();
-        const sessionRunnerRestartCompletionKey = (sessionId: string, previousPid: number): string =>
-          `${sessionId}\u0000${previousPid}`;
+        // Restart exit watches span the whole completion window and each probe spawns a process listing, so
+        // poll at most twice a second; sub-second exit detection is well inside the restart UI budget.
+        const sessionRunnerRestartExitPollIntervalMs = Math.max(
+          configuration.daemonSpawnExistingSessionWaitForExitPollIntervalMs,
+          500,
+        );
+        const sessionRunnerRestartCompletionWaiters = createRestartCompletionWaiters({
+          timeoutMs: sessionRunnerRestartCompletionTimeoutMs,
+        });
         const buildSessionRunnerRestartTerminalCompletion = (
           reason: SessionRunnerRespawnTerminalReason,
           detail?: string,
@@ -5032,69 +5342,6 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             return { ok: false, status: 'partial_failure', diagnostics };
           }
           return { ok: false, status: 'spawn_failed', diagnostics };
-        };
-        const settleSessionRunnerRestartCompletion = (
-          sessionId: string,
-          previousPid: number,
-          completion: RestartSessionRunnerCompletion,
-        ): void => {
-          const key = sessionRunnerRestartCompletionKey(sessionId, previousPid);
-          const waiter = sessionRunnerRestartCompletionWaiters.get(key);
-          if (!waiter) return;
-          sessionRunnerRestartCompletionWaiters.delete(key);
-          waiter.settle(completion);
-        };
-        const createSessionRunnerRestartCompletionWaiter = (
-          sessionId: string,
-          previousPid: number,
-        ): Readonly<{
-          promise: Promise<RestartSessionRunnerCompletion>;
-          cancel: () => void;
-        }> => {
-          const key = sessionRunnerRestartCompletionKey(sessionId, previousPid);
-          let resolved = false;
-          let resolveCompletion!: (completion: RestartSessionRunnerCompletion) => void;
-          const promise = new Promise<RestartSessionRunnerCompletion>((resolve) => {
-            resolveCompletion = resolve;
-          });
-          const timer = setTimeout(() => {
-            settleSessionRunnerRestartCompletion(sessionId, previousPid, {
-              ok: false,
-              status: 'partial_failure',
-              diagnostics: {
-                respawnTerminalReason: 'timeout',
-                timeoutMs: sessionRunnerRestartCompletionTimeoutMs,
-              },
-            });
-          }, sessionRunnerRestartCompletionTimeoutMs) as NodeJS.Timeout & { unref?: () => void };
-          timer.unref?.();
-          const settle = (completion: RestartSessionRunnerCompletion) => {
-            if (resolved) return;
-            resolved = true;
-            clearTimeout(timer);
-            resolveCompletion(completion);
-          };
-          const existing = sessionRunnerRestartCompletionWaiters.get(key);
-          existing?.settle({
-            ok: false,
-            status: 'partial_failure',
-            diagnostics: { respawnTerminalReason: 'superseded_waiter' },
-          });
-          sessionRunnerRestartCompletionWaiters.set(key, { settle });
-          return {
-            promise,
-            cancel: () => {
-              if (resolved) return;
-              resolved = true;
-              clearTimeout(timer);
-              sessionRunnerRestartCompletionWaiters.delete(key);
-              resolveCompletion({
-                ok: false,
-                status: 'partial_failure',
-                diagnostics: { respawnTerminalReason: 'cancelled_before_signal' },
-              });
-            },
-          };
         };
         const connectedServiceRestartAmplificationGuard = createConnectedServiceSessionRestartAmplificationGuard();
         const sessionRunnerRespawnManager = createSessionRunnerRespawnManager({
@@ -5122,7 +5369,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               '[DAEMON RUN] Failed to clear connected-service restart intent after respawn success',
             );
             const next = getCurrentChildren().find((child) => child.happySessionId === sessionId) ?? null;
-            settleSessionRunnerRestartCompletion(sessionId, previousPid, {
+            sessionRunnerRestartCompletionWaiters.settle(sessionId, previousPid, {
               ok: true,
               ...(next ? { next: summarizeSessionRunnerEndpoint(next) } : {}),
             });
@@ -5139,7 +5386,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               previousPid,
               '[DAEMON RUN] Failed to clear connected-service restart intent after terminal respawn suppression',
             );
-            settleSessionRunnerRestartCompletion(
+            sessionRunnerRestartCompletionWaiters.settle(
               sessionId,
               previousPid,
               buildSessionRunnerRestartTerminalCompletion(reason, detail),
@@ -5184,6 +5431,19 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         ): SessionRunnerRestartDisabledReason | null => resolveSessionRunnerActivityDisabledReasonFromReaders(sessionId, {
           isTurnInProgress: (id) => connectedServiceTurnDeferralQueue.isTurnInFlight(id),
         });
+        const readSessionRunnerServerRuntimeActivity = async (sessionId: string) => {
+          try {
+            const effectiveCredentials = (await readCredentials().catch(() => null)) ?? credentials;
+            return await fetchSessionByIdCompat({ token: effectiveCredentials.token, sessionId });
+          } catch (error) {
+            logger.warn('[DAEMON RUN] Session runner restart skipped: server runtime activity unreadable', {
+              sessionId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            throw error;
+          }
+        };
+        const isDaemonShuttingDown = (): boolean => shutdownInitiated || connectedServiceQuotaProducersQuiesced;
 
         const normalizeSwitchTarget = (input: Readonly<{
           serviceId?: string | null;
@@ -5201,6 +5461,20 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           ...(input.credentialRevision === undefined ? {} : { credentialRevision: input.credentialRevision }),
         });
 
+        const observePlannedRunnerRetirement = (tracked: TrackedSession, sessionId: string): void => {
+          if (tracked.childProcess) return;
+          void waitForExistingSessionExitIfStopRequested({
+            sessionId,
+            pidToTrackedSession,
+            timeoutMs: sessionRunnerRestartCompletionTimeoutMs,
+            pollIntervalMs: sessionRunnerRestartExitPollIntervalMs,
+            trackedPids: [tracked.pid],
+            onExitObserved: (pid, exit) => onChildExited(pid, exit),
+          }).catch((error) => {
+            logger.warn('[DAEMON RUN] Failed to observe planned runner restart exit for reattached session', error);
+          });
+        };
+
         const requestConnectedServiceRestartWithDeferral = async (input: Readonly<{
           sessionId: string;
           tracked: TrackedSession;
@@ -5216,107 +5490,92 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         }>): Promise<Readonly<{ signaled: boolean; notSignaledReason?: PlannedRunnerRestartNotSignaledReason }>> => {
           // K5:gated_restart connected-service restarts route through the generic planned runner
           // restart primitive, preserving deferral, stale-owner checks, PID reservation, and respawn.
-          const completionWaiter = input.awaitPreviousRunnerRetirement
-            ? createSessionRunnerRestartCompletionWaiter(input.sessionId, input.tracked.pid)
-            : null;
-          try {
-            const restart = await requestPlannedRunnerRestart({
-              sessionId: input.sessionId,
-              tracked: input.tracked,
-              reason: 'connected_service_switch',
-              deferral: {
-                kind: 'connected_service_switch',
-                source: input.source,
-                policy: input.policy,
-                target: input.target,
-                turnDeferralQueue: connectedServiceTurnDeferralQueue,
-              },
-              restartRequestedPids: connectedServicesRestartRequestedPids,
-              pidToTrackedSession,
-              canSignal: async () => {
-                 if (shutdownInitiated) return false;
-                 if (input.shouldSignal && !await input.shouldSignal()) return false;
-                 if (shutdownInitiated) return false;
-                 return resolveSessionRunnerActivityDisabledReason(input.sessionId) ?? true;
-               },
-              requestSignal: async ({ shouldSignal, onSignalFailure, onProcessAlreadyMissing }) =>
-                // K5:gated_restart raw signal is owned by planned runner restart deferral/reservation.
-                await requestConnectedServiceSessionRestartSignal({
-                  pid: input.tracked.pid,
-                  processGroupPid: resolveConnectedServiceRestartProcessGroupPid(input.tracked),
-                  delayMs: input.restartSignalDelayMs,
-                  shouldSignal,
-                  isShutdownRequested: () => shutdownInitiated,
-                  restartDiagnostic: input.restartDiagnostic,
-                  recordRestartDiagnostic: recordConnectedServiceRestartDiagnostic,
-                  restartAmplificationGuard: connectedServiceRestartAmplificationGuard,
-                  onSignalFailure,
-                  onProcessAlreadyMissing,
-                }),
-              observeProcessMissing: (tracked) => {
-                if (observeConnectedServiceRestartProcessMissing) {
-                  void observeConnectedServiceRestartProcessMissing(tracked).catch((error) => {
-                    logger.warn('[DAEMON RUN] Failed to stage connected-service restart process exit', { pid: tracked.pid, error });
-                  });
-                } else {
-                  logger.warn('[DAEMON RUN] Connected-service restart process was already missing before exit observer was ready');
-                }
-              },
-              clearRestartIntentForPid: (pid) => {
-                clearConnectedServiceRestartIntentForPid(
-                  pid,
-                  '[DAEMON RUN] Failed to clear connected-service restart intent after skipped or failed signal',
-                );
-              },
-              onSignalFailureLogMessage: input.onSignalFailureLogMessage,
-              logDebug: (message, payload) => logger.debug(message, payload),
-              logWarn: (message, payload) => logger.warn(message, payload),
-            });
-            if (shouldEmitConnectedServiceRestartRequestedSessionEvent({
-              owner: input.transcriptEventOwner,
-              signaled: restart.signaled,
-            })) {
-              void commitConnectedServiceAccountSwitchSessionEvent({
-                credentials,
-                sessionId: input.sessionId,
-                event: buildConnectedServiceRestartRequestedSessionEvent(input.restartDiagnostic),
-              }).catch((error) => {
-                logger.debug('[DAEMON RUN] Connected-service restart transcript event failed (non-fatal)', error);
-              });
-            }
-            if (!completionWaiter) return restart;
-            if (!restart.signaled) {
-              throw Object.assign(
-                new Error(`connected_service_restart_not_signaled:${restart.notSignaledReason ?? 'unknown'}`),
-                { code: 'connected_service_restart_not_signaled', retryable: true },
+          const restart = await requestPlannedRunnerRestart({
+            completionWaiters: sessionRunnerRestartCompletionWaiters,
+            awaitCompletion: input.awaitPreviousRunnerRetirement,
+            observeRunnerRetirement: observePlannedRunnerRetirement,
+            sessionId: input.sessionId,
+            tracked: input.tracked,
+            reason: 'connected_service_switch',
+            deferral: {
+              kind: 'connected_service_switch',
+              source: input.source,
+              policy: input.policy,
+              target: input.target,
+              turnDeferralQueue: connectedServiceTurnDeferralQueue,
+            },
+            restartRequestedPids: connectedServicesRestartRequestedPids,
+            pidToTrackedSession,
+            canSignal: async () => {
+              if (shutdownInitiated) return false;
+              if (input.shouldSignal && !await input.shouldSignal()) return false;
+              if (shutdownInitiated) return false;
+              return resolveSessionRunnerActivityDisabledReason(input.sessionId) ?? true;
+            },
+            isShuttingDown: isDaemonShuttingDown,
+            requestSignal: async ({ shouldSignal, onSignalFailure, onProcessAlreadyMissing }) =>
+              // K5:gated_restart raw signal is owned by planned runner restart deferral/reservation.
+              await requestConnectedServiceSessionRestartSignal({
+                pid: input.tracked.pid,
+                processGroupPid: resolveConnectedServiceRestartProcessGroupPid(input.tracked),
+                delayMs: input.restartSignalDelayMs,
+                shouldSignal,
+                isShutdownRequested: () => shutdownInitiated,
+                restartDiagnostic: input.restartDiagnostic,
+                recordRestartDiagnostic: recordConnectedServiceRestartDiagnostic,
+                restartAmplificationGuard: connectedServiceRestartAmplificationGuard,
+                onSignalFailure,
+                onProcessAlreadyMissing,
+              }),
+            observeProcessMissing: (tracked) => {
+              if (observeConnectedServiceRestartProcessMissing) {
+                void observeConnectedServiceRestartProcessMissing(tracked).catch((error) => {
+                  logger.warn('[DAEMON RUN] Failed to stage connected-service restart process exit', { pid: tracked.pid, error });
+                });
+              } else {
+                logger.warn('[DAEMON RUN] Connected-service restart process was already missing before exit observer was ready');
+              }
+            },
+            clearRestartIntentForPid: (pid) => {
+              clearConnectedServiceRestartIntentForPid(
+                pid,
+                '[DAEMON RUN] Failed to clear connected-service restart intent after skipped or failed signal',
               );
-            }
-            if (!input.tracked.childProcess && configuration.daemonSpawnExistingSessionWaitForExitMs > 0) {
-              void waitForExistingSessionExitIfStopRequested({
-                sessionId: input.sessionId,
-                pidToTrackedSession,
-                isSessionRunnerActive,
-                timeoutMs: configuration.daemonSpawnExistingSessionWaitForExitMs,
-                pollIntervalMs: configuration.daemonSpawnExistingSessionWaitForExitPollIntervalMs,
-                trackedPids: [input.tracked.pid],
-                onExitObserved: (pid, exit) => onChildExited(pid, exit),
-              }).catch((error) => {
-                logger.debug('[DAEMON RUN] Failed to observe connected-service runner retirement for a reattached session', error);
-              });
-            }
-            const completion = await completionWaiter.promise;
-            if (!doesRestartCompletionProvePreviousRunnerRetired(completion)) {
-              const reason = completion.ok ? 'unknown' : completion.diagnostics?.respawnTerminalReason;
-              throw Object.assign(
-                new Error(`connected_service_previous_runner_retirement_unproven:${String(reason ?? 'unknown')}`),
-                { code: 'connected_service_previous_runner_retirement_unproven', retryable: true },
-              );
-            }
-            return restart;
-          } catch (error) {
-            completionWaiter?.cancel();
-            throw error;
+            },
+            onRestartSignaled: () => {
+              if (shouldEmitConnectedServiceRestartRequestedSessionEvent({
+                owner: input.transcriptEventOwner,
+                signaled: true,
+              })) {
+                void commitConnectedServiceAccountSwitchSessionEvent({
+                  credentials,
+                  sessionId: input.sessionId,
+                  event: buildConnectedServiceRestartRequestedSessionEvent(input.restartDiagnostic),
+                }).catch((error) => {
+                  logger.debug('[DAEMON RUN] Connected-service restart transcript event failed (non-fatal)', error);
+                });
+              }
+            },
+            onSignalFailureLogMessage: input.onSignalFailureLogMessage,
+            logDebug: (message, payload) => logger.debug(message, payload),
+            logWarn: (message, payload) => logger.warn(message, payload),
+          });
+          if (!input.awaitPreviousRunnerRetirement) return restart;
+          if (!restart.signaled) {
+            throw Object.assign(
+              new Error(`connected_service_restart_not_signaled:${restart.notSignaledReason ?? 'unknown'}`),
+              { code: 'connected_service_restart_not_signaled', retryable: true },
+            );
           }
+          const completion = restart.completion;
+          if (!completion || !doesRestartCompletionProvePreviousRunnerRetired(completion)) {
+            const reason = completion?.ok ? 'unknown' : completion?.diagnostics?.respawnTerminalReason;
+            throw Object.assign(
+              new Error(`connected_service_previous_runner_retirement_unproven:${String(reason ?? 'unknown')}`),
+              { code: 'connected_service_previous_runner_retirement_unproven', retryable: true },
+            );
+          }
+          return restart;
         };
 
         const requestVersionRuntimeRefreshWithDeferral = async (input: Readonly<{
@@ -5326,67 +5585,42 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           signaled: boolean;
           notSignaledReason?: PlannedRunnerRestartNotSignaledReason;
           completion?: RestartSessionRunnerCompletion;
-        }>> => {
-          const completionWaiter = createSessionRunnerRestartCompletionWaiter(input.sessionId, input.tracked.pid);
-          try {
-            const restart = await requestPlannedRunnerRestart({
-              sessionId: input.sessionId,
-              tracked: input.tracked,
-              reason: 'version_runtime_refresh',
-              deferral: { kind: 'none' },
-              restartRequestedPids: connectedServicesRestartRequestedPids,
-              pidToTrackedSession,
-              canSignal: () => resolveSessionRunnerActivityDisabledReason(input.sessionId) ?? true,
-              requestSignal: async ({ shouldSignal, onSignalFailure, onProcessAlreadyMissing }) =>
-                // K5:gated_restart version refresh uses the planned restart primitive without
-                // connected-service deferral/target metadata; this call is only the signal adapter.
-                await requestConnectedServiceSessionRestartSignal({
-                  pid: input.tracked.pid,
-                  processGroupPid: resolveConnectedServiceRestartProcessGroupPid(input.tracked),
-                  delayMs: 0,
-                  shouldSignal,
-                  onSignalFailure,
-                  onProcessAlreadyMissing,
-                }),
-              observeProcessMissing: (tracked) => {
-                if (observeConnectedServiceRestartProcessMissing) {
-                  void observeConnectedServiceRestartProcessMissing(tracked).catch((error) => {
-                    logger.warn('[DAEMON RUN] Failed to stage planned runner restart process exit', { pid: tracked.pid, error });
-                  });
-                } else {
-                  logger.warn('[DAEMON RUN] Planned session runner restart process was already missing before exit observer was ready');
-                }
-              },
-              onSignalFailureLogMessage: '[DAEMON RUN] Failed to restart session runner for version refresh',
-              logDebug: (message, payload) => logger.debug(message, payload),
-              logWarn: (message, payload) => logger.warn(message, payload),
-            });
-            if (!restart.signaled) {
-              completionWaiter.cancel();
-              return restart;
-            }
-            if (!input.tracked.childProcess && configuration.daemonSpawnExistingSessionWaitForExitMs > 0) {
-              void waitForExistingSessionExitIfStopRequested({
-                sessionId: input.sessionId,
-                pidToTrackedSession,
-                isSessionRunnerActive,
-                timeoutMs: configuration.daemonSpawnExistingSessionWaitForExitMs,
-                pollIntervalMs: configuration.daemonSpawnExistingSessionWaitForExitPollIntervalMs,
-                trackedPids: [input.tracked.pid],
-                onExitObserved: (pid, exit) => onChildExited(pid, exit),
-              }).catch((error) => {
-                logger.debug('[DAEMON RUN] Failed to observe planned runner restart exit for reattached session', error);
+        }>> => await requestPlannedRunnerRestart({
+          completionWaiters: sessionRunnerRestartCompletionWaiters,
+          awaitCompletion: true,
+          observeRunnerRetirement: observePlannedRunnerRetirement,
+          sessionId: input.sessionId,
+          tracked: input.tracked,
+          reason: 'version_runtime_refresh',
+          deferral: { kind: 'none' },
+          restartRequestedPids: connectedServicesRestartRequestedPids,
+          pidToTrackedSession,
+          canSignal: () => resolveSessionRunnerActivityDisabledReason(input.sessionId) ?? true,
+          isShuttingDown: isDaemonShuttingDown,
+          requestSignal: async ({ shouldSignal, onSignalFailure, onProcessAlreadyMissing }) =>
+            // K5:gated_restart version refresh uses the planned restart primitive without
+            // connected-service deferral/target metadata; this call is only the signal adapter.
+            await requestConnectedServiceSessionRestartSignal({
+              pid: input.tracked.pid,
+              processGroupPid: resolveConnectedServiceRestartProcessGroupPid(input.tracked),
+              delayMs: 0,
+              shouldSignal,
+              onSignalFailure,
+              onProcessAlreadyMissing,
+            }),
+          observeProcessMissing: (tracked) => {
+            if (observeConnectedServiceRestartProcessMissing) {
+              void observeConnectedServiceRestartProcessMissing(tracked).catch((error) => {
+                logger.warn('[DAEMON RUN] Failed to stage planned runner restart process exit', { pid: tracked.pid, error });
               });
+            } else {
+              logger.warn('[DAEMON RUN] Planned session runner restart process was already missing before exit observer was ready');
             }
-            return {
-              ...restart,
-              completion: await completionWaiter.promise,
-            };
-          } catch (error) {
-            completionWaiter.cancel();
-            throw error;
-          }
-        };
+          },
+          onSignalFailureLogMessage: '[DAEMON RUN] Failed to restart session runner for version refresh',
+          logDebug: (message, payload) => logger.debug(message, payload),
+          logWarn: (message, payload) => logger.warn(message, payload),
+        });
         const verifyConnectedServiceAccountAdoption = createSessionConnectedServiceAccountAdoptionVerifier();
 
         /**
@@ -5658,7 +5892,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 void refreshSessionMarkerRespawn({
                   pid: switchTracked.pid,
                   spawnOptions: switchTracked.spawnOptions,
-                  encryptionMaterial: credentials.encryption,
+                  encryptionMaterial: credentials.encryption ?? undefined,
                 }).catch((error) => {
                   logger.debug('[DAEMON RUN] Failed to refresh session marker after hot-applied auth switch', error);
                 });
@@ -5787,12 +6021,11 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             }
             connectedServiceRestartAmplificationGuard.transferPid(fromPid, toPid);
           },
-          shouldPreserveSessionMarkerOnExit: ({ pid, trackedSession }) => {
+          shouldPreserveSessionMarkerOnExit: async ({ pid, trackedSession }) => {
             if (connectedServicesRestartRequestedPids.has(pid)) return true;
-            const terminal = trackedSession.happySessionMetadataFromLocalWebhook?.terminal
-              ?? trackedSession.hostedTerminal;
-            return Boolean(trackedSession.publishedTerminalControlServiceabilityAttachmentId)
-              || Boolean(terminal?.mode && terminal.mode !== 'plain');
+            return await shouldRetainTrackedTerminalHostExitMarker({
+              tracked: trackedSession, happyHomeDir: configuration.happyHomeDir,
+            });
           },
           onFinalTrackedSessionExitStaged: async ({ pid, trackedSession }) => {
             if (connectedServicesRestartRequestedPids.has(pid)) return;
@@ -5814,31 +6047,46 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               });
               throw error;
             });
-            if (attachmentInfo?.version !== 2) {
-              if (
-                trackedSession.publishedTerminalControlServiceabilityAttachmentId
-                || (terminal?.mode && terminal.mode !== 'plain')
-              ) {
-                throw new Error('terminal_attachment_unavailable_after_runner_exit');
+            const borrowedAttachmentId = trackedSession.publishedTerminalControlServiceabilityAttachmentLifecycle === 'borrowed'
+              ? trackedSession.publishedTerminalControlServiceabilityAttachmentId
+              : attachmentInfo?.version === 3
+                && (!trackedSession.publishedTerminalControlServiceabilityAttachmentId
+                  || trackedSession.publishedTerminalControlServiceabilityAttachmentId === attachmentInfo.attachmentId)
+                ? attachmentInfo.attachmentId
+                : undefined;
+            if (borrowedAttachmentId) {
+              const terminalMode = attachmentInfo?.version === 3 && attachmentInfo.attachmentId === borrowedAttachmentId
+                ? attachmentInfo.terminal.mode
+                : terminal?.mode;
+              if (terminalMode && terminalMode !== 'plain') {
+                await retireTerminalControlServiceabilityForCurrentAccount({
+                  sessionId,
+                  attachmentId: borrowedAttachmentId,
+                  terminalMode,
+                });
+              }
+              if (attachmentInfo?.version === 3 && attachmentInfo.attachmentId === borrowedAttachmentId) {
+                const disposition = await executeTerminalHostDisposition({
+                  happyHomeDir: configuration.happyHomeDir,
+                  sessionId,
+                  expectedAttachmentId: borrowedAttachmentId,
+                  intent: { kind: 'release_borrowed_host', reason: 'provider_exit' },
+                });
+                if (disposition.status !== 'retired') {
+                  throw new Error('borrowed_terminal_attachment_retirement_failed');
+                }
               }
               return;
             }
-
-            const agentId = resolveTrackedSessionCatalogAgentId(trackedSession);
-            const controlDescriptorAvailable = await hasTerminalAttachmentControlDescriptorThroughCatalog(agentId, {
-              happyHomeDir: configuration.happyHomeDir,
-              sessionId,
-              attachmentId: attachmentInfo.attachmentId,
-            }).catch(() => false);
-            registerDisconnectedTerminalHostCandidate({
-              sessionId,
-              pid,
-              ...(trackedSession.activeTurnId ? { activeTurnId: trackedSession.activeTurnId } : {}),
-              happyHomeDir: configuration.happyHomeDir,
-              attachmentId: attachmentInfo.attachmentId,
-              handle: attachmentInfo.handle,
-              controlDescriptorAvailable,
+            const candidate = await resolveTrackedSessionTerminalHostExitCandidate({
+              tracked: trackedSession, pid, happyHomeDir: configuration.happyHomeDir, attachmentInfo,
             });
+            if (!candidate) return;
+            registerDisconnectedTerminalHostCandidate(candidate);
+            await superviseStartupDisconnectedTerminalHosts();
+            if (disconnectedTerminalHostResultsBySessionId.get(sessionId)?.state === 'stopped') {
+              await retireDisconnectedTerminalHostCandidate({ sessionId, attachmentId: candidate.attachmentId });
+            }
           },
             });
         const onChildExited = async (pid: number, exit: { reason: string; code: number | null; signal: string | null }) => {
@@ -5939,14 +6187,25 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           // The executing owner retains exclusion until its own operation unwinds.
           connectedServiceSessionAuthSwitchCore.clearSession(normalizedSessionId);
           const operation = Promise.resolve().then(async (): Promise<StopSessionResult> => {
+            const stopStartedAtMs = Date.now();
             sessionRunnerRespawnManager.markStopRequested(normalizedSessionId, { reason: 'daemon_stop_session', requestedAtMs: Date.now() });
             if (intent.kind === 'explicit_stop') {
               await supersedeAutomaticRecoveryForExplicitStop(normalizedSessionId);
             }
             physicallyRetiredTerminalAttachmentIdBySessionId.delete(normalizedSessionId);
+            logger.infoFile('[DAEMON STOP] Recovery cancellation completed', {
+              sessionId: normalizedSessionId,
+              elapsedMs: Date.now() - stopStartedAtMs,
+            });
             const trackedStopResult = intent.kind === 'replace_runner_incarnation'
               ? await stopSessionCore(normalizedSessionId, { exactRunner: intent.exactRunner })
               : await stopSessionCore(normalizedSessionId);
+            logger.infoFile('[DAEMON STOP] Physical stop owner completed', {
+              sessionId: normalizedSessionId,
+              elapsedMs: Date.now() - stopStartedAtMs,
+              status: trackedStopResult.status,
+              ...(trackedStopResult.status === 'incomplete' ? { reason: trackedStopResult.reason } : {}),
+            });
             const physicallyRetiredAttachmentId = physicallyRetiredTerminalAttachmentIdBySessionId.get(normalizedSessionId);
             physicallyRetiredTerminalAttachmentIdBySessionId.delete(normalizedSessionId);
             if (isTerminalHostPhysicallyRetiredStopResult(trackedStopResult) && physicallyRetiredAttachmentId) {
@@ -6144,9 +6403,13 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           });
         };
 
-        const authorizeRuntimeAuthFailureSourceForSession = async ({ sessionId, classification, recoveryInvocationSource }:
-          Pick<Parameters<typeof authorizeConnectedServiceRuntimeAuthFailureSource>[0],
-            'sessionId' | 'classification' | 'recoveryInvocationSource'>) => {
+        const authorizeRuntimeAuthFailureForSession = async (input: Readonly<{
+          sessionId: string;
+          classification: ConnectedServiceRuntimeFailureClassification | null;
+          recoveryInvocationSource?: 'scheduler_retry';
+        }>) => {
+          const { sessionId, classification } = input;
+
           const runtimeAuthApply = classification
             ? await resolveRuntimeAuthApplyForFailureSource({
                 sessionId,
@@ -6154,10 +6417,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               })
             : null;
           return await authorizeConnectedServiceRuntimeAuthFailureSource({
+            recoveryInvocationSource: input.recoveryInvocationSource,
             getChildren: getCurrentChildren,
             sessionId,
             classification,
-            recoveryInvocationSource,
             resolveDurableSessionForRuntimeAuthRecovery: async ({ sessionId: durableSessionId, classification: durableClassification }) =>
               await resolveDurableConnectedServiceRuntimeAuthRecoverySession({
                 credentials,
@@ -6595,45 +6858,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             recoveryInvocationSource: input.source,
             classification: input.classification,
           });
-          if (await continueAfterSupersededRuntimeAuthFailure({
+          if (isSupersededRuntimeAuthFailure({
             result,
-            sessionId: input.sessionId,
-            interruptedOriginId,
-            continueAfterRuntimeAuthSwitch,
-            reconcileCurrentRuntimeAuthTarget: async ({ sessionId, serviceId, groupId }) => {
-              const target = connectedServiceRuntimeRegistry.getBySessionId(sessionId);
-              if (!target) return false;
-              const registration: ConnectedServiceRuntimeTargetRegistration = {
-                key: { kind: 'session', pid: target.pid },
-                target,
-              };
-              if (
-                !connectedServiceRuntimeRegistry.isCurrentTargetRegistration(registration)
-                || !target.activeBindings.some((binding) => (
-                  binding.serviceId === serviceId && binding.groupId === groupId
-                ))
-              ) return false;
-              await enqueueConnectedServiceRuntimeTargetRegistrationReconciliation(registration, true);
-              const currentTarget = connectedServiceRuntimeRegistry.getBySessionId(sessionId);
-              if (!currentTarget) return false;
-              const snapshot = latestConnectedServiceProjectionSnapshot;
-              const group = snapshot?.groups.find((candidate) => (
-                candidate.serviceId === serviceId && candidate.groupId === groupId
-              )) ?? null;
-              if (!group?.activeProfileId) return false;
-              const credentialBoundary = snapshot?.resolveCredentialBoundary(serviceId, group.activeProfileId);
-              if (credentialBoundary?.status !== 'present') return false;
-              return currentTarget.activeBindings.some((binding) => (
-                binding.serviceId === serviceId
-                && binding.groupId === groupId
-                && binding.profileId === group.activeProfileId
-                && binding.generation === group.generation
-                && (
-                  credentialBoundary.credentialRevision === null
-                  || binding.credentialRevision === credentialBoundary.credentialRevision
-                )
-              ));
-            },
           })) {
             return result;
           }
@@ -6769,6 +6995,65 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             5,
             { min: 1, max: 25 },
           ),
+          continueAfterUsageLimitReset: async (intent) => {
+            const rawSession = await fetchSessionByIdCompat({ token: credentials.token, sessionId: intent.sessionId });
+            if (!rawSession) throw new Error('usage_limit_recovery_session_unavailable');
+            const storedMetadata = tryDecryptSessionMetadata({ credentials, rawSession });
+            const project = buildRuntimeAuthUsageLimitRecoveryMetadataUpdater({ intent });
+            if (!storedMetadata || !project) return { status: 'recovery_superseded', reason: 'usage_limit_recovery_source_unavailable' };
+            const metadata = project(storedMetadata);
+            const recovery = SessionUsageLimitRecoveryV1Schema.safeParse(metadata.sessionUsageLimitRecoveryV1);
+            if (!recovery.success) return { status: 'recovery_superseded', reason: 'usage_limit_recovery_source_unavailable' };
+            const recoveryKey = buildRuntimeAuthRecoveryKey(intent);
+            const isCurrentRecovery = () => {
+              const current = runtimeAuthRecoveryScheduler?.readByKey(recoveryKey);
+              if (!current || current.attemptId !== intent.attemptId
+                || current.status === 'cancelled' || current.status === 'exhausted' || current.status === 'recovered'
+                || current.classification.resetsAtMs !== intent.classification.resetsAtMs
+                || (current.resumePromptMode ?? 'standard') !== (intent.resumePromptMode ?? 'standard')) return false;
+              return true;
+            };
+            const isCurrent = async () => {
+              const binding = connectedServiceRuntimeRegistry.getBySessionId(intent.sessionId)
+                ?.activeBindings.find((candidate) => candidate.serviceId === intent.serviceId);
+              if (binding && (binding.profileId !== intent.profileId || binding.groupId !== intent.groupId)) return false;
+              const hasLiveRunner = Boolean(connectedServiceRuntimeRegistry.getBySessionId(intent.sessionId)
+                || getCurrentChildren().some((child) => child.happySessionId === intent.sessionId));
+              return await isCurrentUsageLimitRecoverySource({
+                classification: intent.classification, isCurrentRecovery,
+                resolveCredential: async () => {
+                  if (!intent.profileId) return null;
+                  const serviceId = ConnectedServiceIdSchema.parse(intent.serviceId);
+                  const credential = (await resolveConnectedServiceCredentialsWithRevisions({
+                    credentials, api, bindings: [{ serviceId, profileId: intent.profileId }],
+                  })).get(serviceId);
+                  return credential ? { record: credential.record,
+                    credentialRevision: credential.revisionSemantics === 'revisioned' ? credential.credentialRevision : null } : null;
+                },
+                ...(hasLiveRunner ? { authorizeLiveSource: async () => {
+                  const authorization = await authorizeRuntimeAuthFailureForSession({
+                    sessionId: intent.sessionId, classification: intent.classification, recoveryInvocationSource: 'scheduler_retry',
+                  });
+                  return authorization.status === 'authorized' || authorization.status === 'current_credential_revision';
+                } } : {}),
+              });
+            };
+            const spawnOptions = buildInactiveUsageLimitResumeSpawnOptions({
+              sessionId: intent.sessionId, fallbackMachineId: machineId, rawSession, metadata,
+            });
+            const result = await continueSessionAfterUsageLimitReset({
+              credentials, sessionId: intent.sessionId, rawSession, metadata, recovery: recovery.data,
+              customResumePrompt: readContinuationCustomResumePrompt(getActiveAccountSettingsSnapshot()?.settings ?? null),
+              nowMs: Date.now(), isCurrent,
+              ensureRuntime: async () => Boolean(spawnOptions && (await spawnSession(spawnOptions)).type === 'success'),
+            });
+            if (result.status === 'continued') return { ok: true, status: 'continuation_enqueued' };
+            if (result.status === 'runtime_unavailable') return { status: 'daemon_lifecycle_unavailable' };
+            if (result.status === 'suppressed' || result.status === 'disabled') {
+              return { status: 'continuation_cancelled', reason: `usage_limit_continuation_${result.status}` };
+            }
+            return { status: 'recovery_superseded', reason: `usage_limit_continuation_${result.status}` };
+          },
           recover: handleConnectedServiceRuntimeAuthRecovery,
           readLimitResetCustomResumePrompt: () => readContinuationCustomResumePrompt(getActiveAccountSettingsSnapshot()?.settings ?? null),
           retryAfterLimitReset: async (retry) => await retryRuntimeAuthLimitAfterReset({
@@ -6779,7 +7064,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             readCredentials,
             spawnSession,
             switchCore: connectedServiceSessionAuthSwitchCore,
-            authorizeSource: () => authorizeRuntimeAuthFailureSourceForSession({ sessionId: retry.sessionId,
+            authorizeSource: () => authorizeRuntimeAuthFailureForSession({ sessionId: retry.sessionId,
               classification: retry.classification, recoveryInvocationSource: 'scheduler_retry' }),
           }),
           gate: ({ intent }) => {
@@ -6866,6 +7151,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         sessionDirectory: params.sessionDirectory ?? null,
         connectedServicesBindingsRaw: params.connectedServicesBindingsRaw,
         materializationKey: params.materializationKey,
+        ...(params.previousMaterializedRoot ? { previousMaterializedRoot: params.previousMaterializedRoot } : {}),
         activeServerDir: configuration.activeServerDir,
         baseDir: connectedServicesMaterializationBaseDir,
         credentials,
@@ -6878,12 +7164,13 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         credentialRefreshService: connectedServiceRefreshCoordinator,
       }),
       runtimeRegistry: connectedServiceRuntimeRegistry,
-      createAdoptedRootCleanup: ({ materializedRoot, materializationKey, agentId }) => {
+      createAdoptedRootCleanup: ({ materializedRoot, materializationKey, agentId, retentionPolicy }) => {
         return createAdoptedExecutionRunRootCleanup({
           materializationBaseDir: connectedServicesMaterializationBaseDir,
           materializedRoot,
           materializationKey,
           agentId,
+          retentionPolicy,
           removeRoot: async (root) => await fs.rm(root, { recursive: true, force: true }),
         });
       },
@@ -6912,6 +7199,26 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       return agentId as CatalogAgentId;
     };
 
+    const refreshTrackedSessionRuntimeSnapshotForPlannedRestart = async (input: Readonly<{
+      sessionId: string;
+      tracked: TrackedSession;
+    }>): Promise<void> => {
+      if (!input.tracked.spawnOptions) return;
+      try {
+        await refreshTrackedSessionsRuntimeSnapshot({
+          sessionId: input.sessionId,
+          incomingOptions: input.tracked.spawnOptions,
+          trackedSessions: [input.tracked],
+          credentials,
+        });
+      } catch (error) {
+        logger.warn('[DAEMON RUN] Failed to refresh session runtime snapshot before planned restart', {
+          sessionId: input.sessionId,
+          error,
+        });
+      }
+    };
+
     // Start control server
     const { port: controlPort, stop: stopControlServer } = await startDaemonControlServer({
       getChildren: getCurrentChildren,
@@ -6920,7 +7227,12 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       stopSession,
       prepareStopSession: prepareStopSessionForDaemonStop,
       spawnSession,
-      resolveSpawnSessionByNonce: async (spawnNonce) => daemonSpawnAttemptRegistry.resolve(spawnNonce),
+      resolveSpawnSessionByNonce: async (spawnNonce) => {
+        const resolved = daemonSpawnAttemptRegistry.resolve(spawnNonce);
+        if (resolved.status === 'success' || resolved.status === 'error') return resolved;
+        await resolveTrackedSpawnByNonce(spawnNonce);
+        return daemonSpawnAttemptRegistry.resolve(spawnNonce);
+      },
       requestShutdown: () => requestShutdown('happier-cli'),
       beforeShutdown,
       onHappySessionWebhook,
@@ -6933,6 +7245,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           materializationKey: input.materializationKey,
           connectedServicesBindingsRaw: input.connectedServicesBindingsRaw,
           sessionDirectory: input.sessionDirectory ?? null,
+          ...(input.previousMaterializedRoot ? { previousMaterializedRoot: input.previousMaterializedRoot } : {}),
           ...(input.sessionId ? { sessionId: input.sessionId } : {}),
         });
       },
@@ -6952,6 +7265,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             currentIdentity: resolveCurrentSessionRunnerLaunchIdentity(),
             requestRestart: requestVersionRuntimeRefreshWithDeferral,
             resolveActivityDisabledReason: resolveSessionRunnerActivityDisabledReason,
+            refreshTrackedSessionRuntimeSnapshot: refreshTrackedSessionRuntimeSnapshotForPlannedRestart,
+            readServerRuntimeActivity: readSessionRunnerServerRuntimeActivity,
           });
         return RestartSessionRunnerResultV1Schema.parse(result);
       },
@@ -6964,11 +7279,19 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           trackedSessions: getCurrentChildren(),
           requestRestart: requestVersionRuntimeRefreshWithDeferral,
           resolveActivityDisabledReason: resolveSessionRunnerActivityDisabledReason,
+          refreshTrackedSessionRuntimeSnapshot: refreshTrackedSessionRuntimeSnapshotForPlannedRestart,
+          readServerRuntimeActivity: readSessionRunnerServerRuntimeActivity,
         });
         return RestartAllSessionRunnersResultV1Schema.parse(result);
       },
       handleSessionRunnerStatusGet: async (request) => {
         const tracked = getCurrentChildren().find((child) => child.happySessionId === request.sessionId) ?? null;
+        if (shouldRefreshSessionRunnerResumeIdentity(tracked)) {
+          await refreshTrackedSessionRuntimeSnapshotForPlannedRestart({
+            sessionId: request.sessionId,
+            tracked,
+          });
+        }
         return resolveSessionRunnerRuntimeState({
           sessionId: request.sessionId,
           tracked,
@@ -7069,6 +7392,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             vendorResumeId,
             cwd: inactiveCwd,
             candidatePersistedSessionFile: inactiveCandidatePersistedSessionFile,
+            persistedSessionMetadata: inactivePersistedSessionMetadata,
           }) => {
             const persistedSessionMetadata = tracked
               ? await resolvePersistedConnectedServiceSwitchSessionMetadata({
@@ -7076,7 +7400,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   sessionId,
                   agentId,
                 })
-              : null;
+              : inactivePersistedSessionMetadata ?? null;
             const continuityContext = resolveTrackedConnectedServiceSwitchContinuityContext({
               agentId,
               baseDir: connectedServicesMaterializationBaseDir,
@@ -7200,7 +7524,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               void refreshSessionMarkerRespawn({
                 pid: tracked.pid,
                 spawnOptions: tracked.spawnOptions,
-                encryptionMaterial: credentials.encryption,
+                encryptionMaterial: credentials.encryption ?? undefined,
               }).catch((error) => {
                 logger.debug('[DAEMON RUN] Failed to refresh session marker after hot-applied auth switch', error);
               });
@@ -7252,7 +7576,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         return resultWithDiagnostics;
       },
       handleConnectedServiceRuntimeAuthFailure: handleConnectedServiceRuntimeAuthRecovery,
-      authorizeConnectedServiceRuntimeAuthFailure: authorizeRuntimeAuthFailureSourceForSession,
+      authorizeConnectedServiceRuntimeAuthFailure: authorizeRuntimeAuthFailureForSession,
       resolveConnectedServiceRuntimeAuthResumePromptMode: async ({ classification, explicit }) =>
         await resolveContinuationResumePromptMode({
           credentials,
@@ -7263,19 +7587,31 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       runtimeAuthRecoveryScheduler: runtimeAuthRecoveryScheduler ?? undefined,
       handleConnectedServiceTurnLifecycle: async (input) => {
         const lifecycleObservedAtMs = Date.now();
+        // A starting turn must be visible to restart gates before the awaited marker write; turn
+        // ends are recorded once the marker is settled, before any slower recovery cleanup, so a
+        // pending or failed cleanup cannot leave the session looking busy.
+        const isTurnStart = input.event === 'prompt_or_steer' || input.event === 'task_started';
+        if (isTurnStart) {
+          connectedServiceTurnDeferralQueue.recordTurnLifecycleEvent({
+            sessionId: input.sessionId,
+            event: input.event,
+          });
+        }
         const trackedTurnResult = await applyTrackedSessionTurnLifecycle({
           trackedSessions: getCurrentChildren(),
           sessionId: input.sessionId,
           event: input.event,
           ...(input.turnId ? { turnId: input.turnId } : {}),
         });
+        if (!isTurnStart) {
+          connectedServiceTurnDeferralQueue.recordTurnLifecycleEvent({
+            sessionId: input.sessionId,
+            event: input.event,
+          });
+        }
         if (trackedTurnResult.status === 'recorded') {
           await temporaryThrottleRecoveryScheduler.recordTurnLifecycle({ ...input, observedAtMs: lifecycleObservedAtMs });
         }
-        connectedServiceTurnDeferralQueue.recordTurnLifecycleEvent({
-          sessionId: input.sessionId,
-          event: input.event,
-        });
         // REV-1: failTurn emits `assistant_message_end` too — a FAILED turn (the
         // usage-limit interruption itself) is not provider-activity proof and must
         // not clear the recovery intents the failure report just armed.
@@ -7336,16 +7672,15 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           if (!group) return null;
           const profileId = await resolveConnectedServiceGroupMemberByProviderAccountId({
             providerAccountId: candidate.providerAccountId,
+            providerOrganizationId: candidate.providerOrganizationId,
             members: group.members,
-            resolveProviderAccountId: async (memberProfileId) => {
+            resolveProviderAccountIdentity: async (memberProfileId) => {
               const resolved = await resolveConnectedServiceCredentialsWithRevisions({
                 credentials,
                 api,
                 bindings: [{ serviceId: candidate.serviceId, profileId: memberProfileId }],
               }).then((byServiceId) => byServiceId.get(candidate.serviceId) ?? null);
-              return resolved
-                ? readCredentialAccountIdentity(resolved.record)?.providerAccountId ?? null
-                : null;
+              return resolved ? readCredentialAccountIdentity(resolved.record) : null;
             },
           });
           return profileId ? { profileId, groupGeneration: group.generation } : null;
@@ -7356,9 +7691,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             api,
             bindings: [{ serviceId: candidate.serviceId, profileId: candidate.profileId }],
           }).then((byServiceId) => byServiceId.get(candidate.serviceId) ?? null);
-          return record?.kind === 'oauth'
-            && record.oauth.providerAccountId === candidate.providerAccountId
-            && computeConnectedServiceAccessTokenFingerprint(record.oauth.accessToken) === candidate.credentialFingerprint;
+          return matchesCurrentQuotaObservationCredential({ record, ...candidate });
         },
         resolveCurrentGroupGenerationForProfile: async (candidate) => {
           const currentBinding = connectedServiceRuntimeRegistry
@@ -7564,7 +7897,6 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         true,
       );
       const restartAfterAuthUpdated = createConnectedServicesAuthUpdatedRestartHandler({
-            restartRequestedPids: connectedServicesRestartRequestedPids,
             pidToTrackedSession,
             restartEnabled: restartOnAuthUpdate,
             resolveLifecycleDescriptor: resolveConnectedServiceCredentialLifecycleDescriptor,
@@ -7594,9 +7926,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 routedThroughGatedPrimitive: true,
               });
               // K5:gated_restart refresh/reconnect restart deferred until turn boundary,
-              // reachability re-verified at respawn (no raw mid-turn SIGTERM). The canonical planned
-              // owner alone reserves and releases restart intent. A joined or cancelled caller's own
-              // { signaled: false } result does not authorize cleanup of another owner's reservation.
+              // reachability re-verified at respawn (no raw mid-turn SIGTERM). The canonical
+              // planned owner alone admits requests, reserves the pid, and observes retirement.
+              // A joined/cancelled caller cannot release another owner's reservation.
               return await requestConnectedServiceRestartWithDeferral({
                 sessionId: signalParams.sessionId ?? signalParams.tracked.happySessionId ?? '',
                 tracked: signalParams.tracked,
@@ -7754,34 +8086,13 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       connectedServiceRefreshCoordinator = refreshStartup.coordinator;
       connectedServiceRefreshLoopHandle = refreshStartup.loopHandle;
 
-      // Triage #4 systemic leg: format+freshness-reconcile stable provider homes (e.g. codex
-      // homes, which are not refresh-target bound and otherwise drift stale/malformed) at startup
-      // and on a coarse cadence, provider-owned via the lifecycle-descriptor home-maintenance hook.
-      if (parseBooleanEnv(process.env.HAPPIER_CONNECTED_SERVICES_STABLE_HOME_RECONCILE_ENABLED, true)) {
-        connectedServiceStableHomeReconcileHandle = startConnectedServiceStableHomeReconcileScheduler({
-          activeServerDir: configuration.activeServerDir,
-          api,
-          credentials,
-          intervalMs: resolvePositiveIntEnv(
-            process.env.HAPPIER_CONNECTED_SERVICES_STABLE_HOME_RECONCILE_INTERVAL_MS,
-            15 * 60_000,
-            { min: 60_000, max: 6 * 60 * 60_000 },
-          ),
-          onError: (error) => {
-            logger.debug('[DAEMON RUN] Connected services stable-home reconcile failed (non-fatal)', error);
-          },
-        });
-      }
-
       const connectedServicesQuotasEnabled = await resolveConnectedServicesQuotasDaemonEnabled({
         env: process.env,
         serverUrl: configuration.serverUrl,
-        timeoutMs: 1500,
       });
       connectedServicesSubscriptionEnabled = await resolveConnectedServicesQuotasDaemonEnabled({
         env: process.env,
         serverUrl: configuration.serverUrl,
-        timeoutMs: 1500,
         featureId: 'connectedServices.subscription',
       });
       const quotaGroupFreshnessMs = resolvePositiveIntEnv(
@@ -7911,6 +8222,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   credentials,
                   store: providerAccountUsageStore,
                   nowMs: Date.now(),
+                  resolveCurrentProviderAccountIdentityForSource: async (source) => {
+                    const record = await resolveConnectedServiceCredentials({
+                      credentials,
+                      api,
+                      bindings: [{ serviceId: source.serviceId, profileId: source.profileId }],
+                    }).then((records) => records.get(source.serviceId) ?? null);
+                    return record ? readCredentialAccountIdentity(record) : null;
+                  },
                 })
               ).hydration,
               createCoordinator: () => new ConnectedServiceQuotasCoordinator({
@@ -8210,16 +8529,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 if (!consumer) throw new Error('durable_generation_consumer_unavailable');
                 return await consumer.consume(input);
               },
-              refreshConnectedServiceCredentialForQuota: async (input: Readonly<{
-                serviceId: ConnectedServiceId;
-                profileId: string;
-                force: boolean;
-              }>) =>
-                connectedServiceRefreshCoordinator?.refreshConnectedServiceCredentialForQuota({
-                  serviceId: input.serviceId,
-                  profileId: input.profileId,
-                  force: input.force,
-                }) ?? null,
+              refreshConnectedServiceCredentialForQuota: async (input) =>
+                connectedServiceRefreshCoordinator?.refreshConnectedServiceCredentialForQuota(input) ?? null,
               now: () => Date.now(),
               randomBytes: (length) => randomBytes(length),
               }),
@@ -8592,7 +8903,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               automationWorker = startAutomationWorker({
                 token: credentials.token,
                 machineId,
-                encryption: credentials.encryption,
+                encryption: credentials.encryption ?? undefined,
                 spawnSession,
               });
             }
@@ -8636,6 +8947,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     connectedServiceProjectionEpoch += 1;
                   }
                   latestConnectedServiceProjectionSnapshot = projectionSnapshot;
+                  if (isInitialProjection || projectionDelta.changedCredentialBoundaries.length > 0) {
+                    const readyCredentials = isInitialProjection
+                      ? projectionSnapshot.credentials
+                      : projectionDelta.changedCredentialBoundaries;
+                    connectedServiceQuotasLoopHandle?.wake(readyCredentials
+                      .filter(credential => credential.boundary.status === 'present')
+                      .map(({ serviceId, profileId }) => ({ serviceId, profileId, bindingKind: 'profile' as const })));
+                  }
                   const projectionRegistrations = connectedServiceRuntimeRegistry.listTargetRegistrations();
                   // Changed projection scopes are owned by the global reconcilers below. The
                   // registration sweep is only for an unchanged replay, where a late/re-registered
@@ -8722,6 +9041,31 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 stopSession,
                 isSessionActive: isSessionAlreadyRunning,
                 loadLocalSessionMetadata: loadLocalSessionMetadataForHandoff,
+                resolveExistingStateEnvironment: async ({ sessionId, metadata, targetPath }) => {
+                  const agentId = resolveCatalogAgentId(resolveAgentIdFromSessionMetadata(metadata));
+                  const materialized = await resolveConnectedServiceAuthForSpawn({
+                    agentId,
+                    sessionDirectory: targetPath,
+                    connectedServicesBindingsRaw: metadata.connectedServices,
+                    materializationKey: sessionId,
+                    connectedServiceMaterializationIdentityV1: readConnectedServiceMaterializationIdentityV1(
+                      metadata.connectedServiceMaterializationIdentityV1,
+                    ),
+                    activeServerDir: configuration.activeServerDir,
+                    baseDir: connectedServicesMaterializationBaseDir,
+                    credentials,
+                    api,
+                    accountUsageStore: providerAccountUsageStore,
+                    runtimeQuotaSnapshots: connectedServiceRuntimeQuotaSnapshots,
+                    sessionId,
+                    accountSettings: getActiveAccountSettingsSnapshot()?.settings ?? null,
+                    processEnv: process.env,
+                    credentialRefreshService: connectedServiceRefreshCoordinator,
+                    sessionStateMode: 'existing',
+                    existingSessionMetadata: metadata,
+                  });
+                  return { ...process.env, ...materialized?.env };
+                },
                 requestShutdown: () => {
                   void beforeShutdown().finally(() => requestShutdown('happier-app'));
                 },
@@ -8758,10 +9102,15 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     }
                   : {}),
               }, {
+                checkRuntimeAuthUsageLimitRecovery: async (input) => await checkRuntimeAuthUsageLimitRecovery({
+                  scheduler: runtimeAuthRecoveryScheduler, ...input,
+                }),
                 resumeInactiveSessionWhenUsageLimitReady: async ({ sessionId, rawSession, metadata }) =>
                   await resumeInactiveSessionWhenUsageLimitReady({
                     spawnSession,
                     fallbackMachineId: machineId,
+                    credentials,
+                    customResumePrompt: readContinuationCustomResumePrompt(getActiveAccountSettingsSnapshot()?.settings ?? null),
                     sessionId,
                     rawSession,
                     metadata,
@@ -8912,7 +9261,22 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 });
               });
 
-              let didRefreshMachineMetadata = false;
+              // Daemon-owned metadata, K5 CLI update facts included: published on every (re)connect
+              // and whenever an update attempt records its end (a failure before activation, or a
+              // manual daemon the update did not restart) — a restarted daemon publishes on connect.
+              cliUpdateMetadataPublisher?.stop();
+              cliUpdateMetadataPublisher = createCliUpdateMetadataPublisher({
+                updateMachineMetadata: async (handler) => await connectedApiMachine.updateMachineMetadata(handler),
+                fallbackMetadata: () => (machine.metadata ?? {}) as Partial<MachineMetadata>,
+                preferredHost,
+                readFacts: readCliUpdateFactsForThisCli,
+                onError: (message, error) => logger.warn(message, error),
+              });
+              cliUpdateMetadataPublisher.watch({
+                channel: configuration.publicReleaseRing,
+                processEnv: { ...process.env, HAPPIER_HOME_DIR: configuration.happyHomeDir },
+              });
+              const publishDaemonMetadata = cliUpdateMetadataPublisher.publish;
               connectedApiMachine.connect({
                 takeover: takeoverRequested,
                 onConnect: async () => {
@@ -8940,14 +9304,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     });
                   }
 
-                  if (didRefreshMachineMetadata) return;
-                  didRefreshMachineMetadata = true;
-                  // Keep machine metadata fresh without clobbering user-provided fields (e.g. displayName) that may exist.
-                  await connectedApiMachine.updateMachineMetadata((metadata) => {
-                    const base = (metadata ?? machine.metadata ?? {}) as Partial<MachineMetadata>;
-                    return refreshMachineMetadataForCurrentDaemon(base, preferredHost);
-                  }).catch((error) => {
-                    didRefreshMachineMetadata = false;
+                  // Keep machine metadata fresh without clobbering user-provided fields (e.g. displayName)
+                  // on every (re)connect — a no-op write when nothing changed.
+                  await publishDaemonMetadata().catch((error) => {
                     logger.warn('[DAEMON RUN] Failed to refresh machine metadata on reconnect', error);
                   });
                 },
@@ -8957,6 +9316,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 },
                 onMachineReplaced: () => {
                   logger.warn('[DAEMON RUN] Machine identity was replaced on the server; shutting down');
+                  requestShutdown('happier-app');
+                },
+                onContentKeyChanged: () => {
+                  logger.warn('[DAEMON RUN] Machine content key changed; shutting down. Restart the daemon to load the current machine.');
                   requestShutdown('happier-app');
                 },
               });
@@ -9033,6 +9396,21 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       sessionAttachCleanupByPid,
       getApiMachineForSessions: () => apiMachineForSessions,
       onChildExited,
+      onTrackedSessionHealthy: async (tracked) => {
+        await superviseTrackedOptionalTerminalPresentation({
+          tracked, happyHomeDir: configuration.happyHomeDir,
+          isCurrent: () => pidToTrackedSession.get(tracked.pid) === tracked
+            && !shutdownInitiated && typeof tracked.stopRequestedAtMs !== 'number'
+            && tracked.reportMarkerCustody?.retiring !== true,
+          loadTerminalHostAdapters,
+          probeSessionServiceability: probeSessionRunnerServiceability,
+          retireExactTerminalControlServiceability: async ({ sessionId, attachmentInfo }) =>
+            await retireTerminalControlServiceabilityForCurrentAccount({
+              sessionId, attachmentId: attachmentInfo.attachmentId,
+              terminalMode: attachmentInfo.terminal.mode ?? attachmentInfo.handle.kind,
+            }),
+        });
+      },
       controlPort,
       fileState,
       currentCliVersion: configuration.currentCliVersion,
@@ -9109,10 +9487,6 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         connectedServiceRefreshLoopHandle.stop();
         connectedServiceRefreshLoopHandle = null;
       }
-      if (connectedServiceStableHomeReconcileHandle) {
-        connectedServiceStableHomeReconcileHandle.stop();
-        connectedServiceStableHomeReconcileHandle = null;
-      }
       if (connectedServiceQuotasLoopHandle) {
         await connectedServiceQuotasLoopHandle.stop();
         connectedServiceQuotasLoopHandle = null;
@@ -9155,21 +9529,24 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       if (automationWorker) {
         automationWorker.stop();
       }
+      cliUpdateMetadataPublisher?.stop();
       if (memoryWorker) {
         memoryWorker.stop();
       }
 
       // Best-effort cleanup for provider-managed background processes (e.g. shared OpenCode server).
       // Important: do not tear down shared provider background processes while session runners are still
-      // tracked by this daemon. Some harnesses stop the daemon while externally-started sessions are
-      // still live (e.g. in-flight provider tests). Killing the shared OpenCode server in that state
-      // can wedge or abort those sessions mid-turn.
+      // tracked by this daemon. Runner admission precedes durable marker persistence, so a tracked
+      // startup runner may not yet appear in the managed-server custody scan. Some harnesses also
+      // stop the daemon while externally-started sessions remain live.
       if (pidToTrackedSession.size === 0) {
         try {
-          const { stopSharedManagedOpenCodeServerFromEnvBestEffort } = await import('@/backends/opencode/server/sharedManagedServer');
-          await stopSharedManagedOpenCodeServerFromEnvBestEffort();
+          const { stopSharedManagedOpenCodeServerFromEnvBestEffort, resolveManagedOpenCodeDaemonOwnerIdFromState } = await import('@/backends/opencode/server/sharedManagedServer');
+          await stopSharedManagedOpenCodeServerFromEnvBestEffort({
+            daemonInstanceId: resolveManagedOpenCodeDaemonOwnerIdFromState(fileState, configuration.activeServerId),
+          });
         } catch {
-          // best-effort only
+          logger.warn('[DAEMON RUN] Provider-managed server cleanup failed during shutdown');
         }
       }
 
@@ -9186,6 +9563,21 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         };
 
     logger.debug('[DAEMON RUN] Daemon started successfully, waiting for shutdown request');
+
+    // Startup reattach and every restart dependency are ready here; the pass logs and contains
+    // its own failures, so it must not delay or abort waiting for shutdown.
+    void restartStaleSessionRunnersAfterDaemonStart({
+      readSettings: () => readSettings(),
+      isShuttingDown: () => shutdownInitiated || connectedServiceQuotaProducersQuiesced,
+      resolveCurrentIdentity: resolveCurrentSessionRunnerLaunchIdentity,
+      trackedSessions: getCurrentChildren,
+      requestRestart: requestVersionRuntimeRefreshWithDeferral,
+      resolveActivityDisabledReason: resolveSessionRunnerActivityDisabledReason,
+      refreshTrackedSessionRuntimeSnapshot: refreshTrackedSessionRuntimeSnapshotForPlannedRestart,
+      readServerRuntimeActivity: readSessionRunnerServerRuntimeActivity,
+      logDebug: (message, payload) => logger.debug(message, payload),
+      logWarn: (message, payload) => logger.warn(message, payload),
+    });
 
     // Wait for shutdown request
     const shutdownRequest = await resolvesWhenShutdownRequested;

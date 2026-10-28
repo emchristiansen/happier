@@ -4,12 +4,18 @@ import {
   type AuthenticateResponse,
   type CancelNotification,
   type ClientContext,
+  type CloseSessionRequest,
+  type CloseSessionResponse,
+  type DeleteSessionRequest,
+  type DeleteSessionResponse,
   type ForkSessionRequest,
   type ForkSessionResponse,
   type InitializeRequest,
   type InitializeResponse,
   type LoadSessionRequest,
   type LoadSessionResponse,
+  type ListSessionsRequest,
+  type ListSessionsResponse,
   type NewSessionRequest,
   type NewSessionResponse,
   type PromptRequest,
@@ -24,6 +30,8 @@ import {
   trimBugReportTextToMaxBytes,
 } from '@happier-dev/protocol';
 
+import type { AcpClientConnectionOptions } from './types';
+
 const ACP_ERROR_DIAGNOSTIC_MAX_BYTES = 16_384;
 
 function cloneErrorWithSanitizedData(
@@ -32,6 +40,7 @@ function cloneErrorWithSanitizedData(
 ): Error & { data: Record<string, unknown> } {
   const descriptors = Object.getOwnPropertyDescriptors(error);
   delete descriptors.data;
+  delete descriptors.authenticationSetupFailure;
   const clone = Object.create(Object.getPrototypeOf(error)) as Error & { data: Record<string, unknown> };
   Object.defineProperties(clone, descriptors);
   Object.defineProperty(clone, 'data', {
@@ -47,6 +56,7 @@ export class AcpAgentPeer {
   constructor(
     private readonly context: ClientContext,
     private readonly connectionSignal: AbortSignal,
+    private readonly isAuthenticationSetupFailure?: AcpClientConnectionOptions['isAuthenticationSetupFailure'],
   ) {}
 
   private assertActive(): void {
@@ -65,6 +75,10 @@ export class AcpAgentPeer {
         const dataRecord = data && typeof data === 'object' && !Array.isArray(data)
           ? data as Record<string, unknown>
           : null;
+        const authenticationSetupFailure = this.isAuthenticationSetupFailure?.({
+          code: 'code' in error ? error.code : undefined,
+          data,
+        }) === true;
         const details = dataRecord
           ? dataRecord.details
           : undefined;
@@ -102,6 +116,16 @@ export class AcpAgentPeer {
             ACP_ERROR_DIAGNOSTIC_MAX_BYTES,
           );
         }
+        if (authenticationSetupFailure) {
+          if (!Object.isExtensible(safeError)
+            || Object.getOwnPropertyDescriptor(safeError, 'authenticationSetupFailure')?.configurable === false) {
+            safeError = cloneErrorWithSanitizedData(safeError, sanitizedDetails ? { details: sanitizedDetails } : {});
+          }
+          Object.defineProperty(safeError, 'authenticationSetupFailure', {
+            configurable: true,
+            value: true,
+          });
+        }
         failure = safeError;
       }
       throw failure;
@@ -127,6 +151,25 @@ export class AcpAgentPeer {
     this.assertActive();
     return this.requestWithDiagnostics(
       () => this.context.request(methods.agent.session.load, params),
+    ).then((response) => response ?? {});
+  }
+
+  listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+    this.assertActive();
+    return this.requestWithDiagnostics(() => this.context.request(methods.agent.session.list, params));
+  }
+
+  deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+    this.assertActive();
+    return this.requestWithDiagnostics(
+      () => this.context.request(methods.agent.session.delete, params),
+    ).then((response) => response ?? {});
+  }
+
+  closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+    this.assertActive();
+    return this.requestWithDiagnostics(
+      () => this.context.request(methods.agent.session.close, params),
     ).then((response) => response ?? {});
   }
 

@@ -22,12 +22,12 @@
  * The circumvention question, answered rather than dodged: an ad blocker blocks
  * trackers because trackers track people. This one does not — no cookie, no
  * localStorage, no client identifier, no person profile, no session replay, no
- * IP retention. The signal that means "this human refuses" is Do Not Track and
- * Global Privacy Control, and those are honoured before init in
+ * IP retention. The browser signal that means "this human refuses" is Global
+ * Privacy Control, and it is honoured before init in
  * src/analytics/analytics.ts (posthog-js cannot honour them in cookieless mode —
  * see the note there). A proxy that recovers blocked *aggregate* measurement
  * while obeying the explicit refusal signals is a defensible line; one that also
- * ignored DNT/GPC would not be.
+ * ignored GPC would not be.
  *
  * NOT in the request path of anything that matters: if this fails, the site
  * still renders and the installer still downloads. Only measurement is lost.

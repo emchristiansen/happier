@@ -17,6 +17,13 @@ class FakeSession {
     rpcHandlerManager = new FakeRpcHandlerManager();
     agentState: any = { requests: {}, completedRequests: {} };
 
+    async updateAgentStateRequestSettlement(updater: Parameters<FakeSession['updateAgentState']>[0]): Promise<void> {
+
+      await this.updateAgentState(updater);
+
+    }
+
+
     updateAgentState(updater: any) {
         this.agentState = updater(this.agentState);
         return this.agentState;
@@ -33,10 +40,7 @@ class TestPermissionHandler extends BasePermissionHandler {
     }
 
     request(toolCallId: string, toolName: string, input: unknown): Promise<PermissionResult> {
-        return new Promise<PermissionResult>((resolve, reject) => {
-            this.pendingRequests.set(toolCallId, { resolve, reject, toolName, input });
-            this.addPendingRequestToState(toolCallId, toolName, input);
-        });
+        return this.requestPermissionDecision(toolCallId, toolName, input);
     }
 }
 

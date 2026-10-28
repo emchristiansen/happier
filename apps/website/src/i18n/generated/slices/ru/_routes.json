@@ -4,8 +4,7 @@
   "faq",
   "features",
   "navigation",
-  "pageProse",
-  "providers"
+  "pageProse"
  ],
  "agents": [
   "agents",
@@ -107,6 +106,10 @@
  ],
  "enterprise": [
   "enterprise",
+  "navigation",
+  "pageProse"
+ ],
+ "download": [
   "navigation",
   "pageProse"
  ]

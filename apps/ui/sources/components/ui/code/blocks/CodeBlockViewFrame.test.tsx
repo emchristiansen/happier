@@ -7,7 +7,7 @@ import { installCodeBlockCommonModuleMocks } from './codeBlockTestHelpers';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
-const setStringAsyncSpy = vi.fn<(text: string) => Promise<void>>(async (_text) => {});
+const setStringAsyncSpy = vi.fn<(text: string) => Promise<boolean>>(async (_text) => true);
 const alertSpy = vi.fn();
 
 installCodeBlockCommonModuleMocks({
@@ -27,21 +27,16 @@ vi.mock('expo-clipboard', () => ({
     setStringAsync: (text: string) => setStringAsyncSpy(text),
 }));
 
-vi.mock('@/sync/store/hooks', () => ({
-    useLocalSetting: () => 1,
-}));
-
-function mockPlatform(os: 'android' | 'web') {
-    installCodeBlockCommonModuleMocks({
-        reactNative: async () => {
-            const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
-            return createReactNativeWebMock({
-                Platform: {
-                    OS: os,
-                    select: (options: any) => options?.[os] ?? options?.default ?? options?.native ?? options?.ios ?? options?.android,
-                },
-            });
-        },
+function mockPlatform(os: 'android' | 'ios' | 'web') {
+    // doMock (not the hoisted helper mock) so each test's platform survives vi.resetModules().
+    vi.doMock('react-native', async () => {
+        const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
+        return createReactNativeWebMock({
+            Platform: {
+                OS: os,
+                select: (options: any) => options?.[os] ?? options?.default ?? options?.native ?? options?.ios ?? options?.android,
+            },
+        });
     });
 }
 
@@ -50,19 +45,51 @@ describe('CodeBlockViewFrame', () => {
         vi.resetModules();
     });
 
-    it('uses a gesture-handler ScrollView on Android so horizontal code block drags win nested gesture negotiation', async () => {
+    it('uses the platform ScrollView on Android so horizontal code drags share native nested scrolling with the transcript list', async () => {
         mockPlatform('android');
         const { CodeBlockViewFrame } = await import('./CodeBlockViewFrame');
 
-        let tree!: renderer.ReactTestRenderer;
-        tree = (await renderScreen(<CodeBlockViewFrame code={'x'} language={null} wrap={false} showCopyButton={false}>
+        const screen = await renderScreen(<CodeBlockViewFrame code={'x'} language={null} wrap={false} showCopyButton={false}>
                     <React.Fragment>child</React.Fragment>
-                </CodeBlockViewFrame>)).tree;
+                </CodeBlockViewFrame>);
 
-        const scrollView = tree.findByType('GestureHandlerScrollView');
-        expect(scrollView.props.horizontal).toBe(true);
-        expect(scrollView.props.nestedScrollEnabled).toBe(true);
-        expect(scrollView.props.disallowInterruption).toBe(true);
+        expect(screen.findAllByType('GestureHandlerScrollView' as any)).toHaveLength(0);
+        const scrollViews = screen.findAllByType('ScrollView' as any);
+        expect(scrollViews).toHaveLength(1);
+        expect(scrollViews[0]!.props.horizontal).toBe(true);
+        expect(scrollViews[0]!.props.nestedScrollEnabled).toBe(true);
+    });
+
+    it('keeps the gesture-handler ScrollView on iOS', async () => {
+        mockPlatform('ios');
+        const { CodeBlockViewFrame } = await import('./CodeBlockViewFrame');
+
+        const screen = await renderScreen(<CodeBlockViewFrame code={'x'} language={null} wrap={false} showCopyButton={false}>
+                    <React.Fragment>child</React.Fragment>
+                </CodeBlockViewFrame>);
+
+        const scrollViews = screen.findAllByType('GestureHandlerScrollView' as any);
+        expect(scrollViews).toHaveLength(1);
+        expect(scrollViews[0]!.props.horizontal).toBe(true);
+        expect(scrollViews[0]!.props.disallowInterruption).toBe(true);
+    });
+
+    it('keeps native code selection on Android only when there is no copy button to replace it', async () => {
+        for (const [showCopyButton, expectedSelectable] of [[true, false], [false, true]] as const) {
+            vi.resetModules();
+            mockPlatform('android');
+            const { CodeBlockViewFrame } = await import('./CodeBlockViewFrame');
+            const { Text } = await import('@/components/ui/text/Text');
+
+            const screen = await renderScreen(
+                <CodeBlockViewFrame code={'x'} language={null} wrap={false} showCopyButton={showCopyButton}>
+                    <Text selectable>const x = 1;</Text>
+                </CodeBlockViewFrame>,
+            );
+
+            const codeText = screen.findAllByType('Text' as any).find((node) => node.props.children === 'const x = 1;');
+            expect(codeText?.props.selectable, `showCopyButton=${showCopyButton}`).toBe(expectedSelectable);
+        }
     });
 
     it('forwards scrollTestID when wrap is false (stable E2E locator)', async () => {
@@ -138,5 +165,27 @@ describe('CodeBlockViewFrame', () => {
 
         const iconAfter = tree.findByType('Icon') as any;
         expect(iconAfter.props.name).toBe('check');
+    });
+
+    it('keeps the copy affordance ready to retry when the platform refuses a write', async () => {
+        setStringAsyncSpy.mockResolvedValueOnce(false);
+        mockPlatform('web');
+        const { CodeBlockViewFrame } = await import('./CodeBlockViewFrame');
+        const screen = await renderScreen(
+            <CodeBlockViewFrame code="hello" wrap showCopyButton>
+                <React.Fragment>child</React.Fragment>
+            </CodeBlockViewFrame>,
+        );
+
+        const button = screen.tree.findByProps({ accessibilityLabel: 'common.copy' });
+        await pressTestInstanceAsync(button, 'common.copy');
+        expect(screen.tree.findByType('Icon').props.name).toBe('copy');
+
+        await pressTestInstanceAsync(button, 'common.copy');
+        expect(screen.tree.findByType('Icon').props.name).toBe('check');
+
+        setStringAsyncSpy.mockResolvedValueOnce(false);
+        await pressTestInstanceAsync(button, 'common.copy');
+        expect(screen.tree.findByType('Icon').props.name).toBe('copy');
     });
 });

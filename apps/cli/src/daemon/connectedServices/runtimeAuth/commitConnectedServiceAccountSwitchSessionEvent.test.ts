@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import axios from 'axios';
+import { ConnectedServiceIdSchema } from '@happier-dev/protocol';
 
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 
@@ -61,8 +62,11 @@ describe('commitConnectedServiceAccountSwitchSessionEvent', () => {
       },
     });
 
+    const sessionUrl = new URL(String(getSpy.mock.calls[0]?.[0]));
+    expect(sessionUrl.pathname).toBe('/v2/sessions/sess-1');
+    expect(JSON.parse(sessionUrl.searchParams.get('happierConnectedServices') ?? 'null')).toEqual(ConnectedServiceIdSchema.options);
     expect(getSpy).toHaveBeenCalledWith(
-      expect.stringMatching(/\/v2\/sessions\/sess-1$/),
+      sessionUrl.href,
       expect.objectContaining({
         headers: expect.objectContaining({ Authorization: 'Bearer token-1' }),
       }),

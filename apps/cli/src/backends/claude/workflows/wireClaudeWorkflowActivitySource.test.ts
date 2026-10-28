@@ -25,8 +25,13 @@ function workflowToolUse(id: string, name: string) {
 }
 
 describe('wireClaudeWorkflowActivitySource', () => {
-  beforeEach(() => { vi.useFakeTimers(); });
-  afterEach(() => { vi.useRealTimers(); });
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.stubEnv('HAPPIER_SESSION_MUTATION_OUTBOX_BASE_RETRY_MS', '500');
+    vi.stubEnv('HAPPIER_SESSION_MUTATION_OUTBOX_MAX_RETRY_MS', '30000');
+    vi.stubEnv('HAPPIER_SESSION_MUTATION_OUTBOX_JITTER_MS', '0');
+  });
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); });
 
   it('writes the headline into metadata under the canonical key and commits a plain record', async () => {
     let metadata: Metadata = {
@@ -185,10 +190,15 @@ describe('wireClaudeWorkflowActivitySource', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(metadata).not.toHaveProperty('sessionWorkflowActivityHeadlineV1');
 
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(499);
+    expect(metadataAttempts).toBe(1);
+    expect(metadata).not.toHaveProperty('sessionWorkflowActivityHeadlineV1');
+    await vi.advanceTimersByTimeAsync(1);
 
-    expect(metadataAttempts).toBeGreaterThanOrEqual(2);
+    expect(metadataAttempts).toBe(2);
     expect(metadata).toHaveProperty('sessionWorkflowActivityHeadlineV1');
+    expect(metadata).toHaveProperty('sessionAgentActivityHeadlineV1');
+    source.dispose();
   });
 
   it('does not reconcile an active startup run before its transcript observer is ready', async () => {

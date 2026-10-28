@@ -165,6 +165,14 @@ describe('session record coercion carries the server-materialized unread entry f
         expect(parsed?.session.unreadSince).toBe(UNREAD_SINCE_MS);
     });
 
+    it('normalizes a nullable rollback projection to absence', () => {
+        const parsed = parseCompatSessionByIdResponse({
+            session: rawSessionRow({ rollbackEligibleTurnStarts: null }),
+        });
+
+        expect(parsed?.session.rollbackEligibleTurnStarts).toBeUndefined();
+    });
+
     it('coerces a row from a server that does not send unreadSince to null', async () => {
         const request = v2ListRequest([rawSessionRow()]);
 
@@ -185,6 +193,18 @@ describe('session record coercion carries the server-materialized unread entry f
         const page = await fetchSessionListPageCompat({ request, token: 'token', limit: 50 });
 
         expect(page.sessions[0]?.unreadSince).toBeNull();
+    });
+
+    it('normalizes a legacy null rollback eligibility projection to absent', () => {
+        const current = parseCompatSessionByIdResponse({
+            session: rawSessionRow({ rollbackEligibleTurnStarts: [1, 3] }),
+        });
+        const parsed = parseCompatSessionByIdResponse({
+            session: rawSessionRow({ rollbackEligibleTurnStarts: null }),
+        });
+
+        expect(current?.session.rollbackEligibleTurnStarts).toEqual([1, 3]);
+        expect(parsed?.session.rollbackEligibleTurnStarts).toBeUndefined();
     });
 
     it('KEYSTONE: rebuilds a carrier for every field the protocol record schema declares', async () => {

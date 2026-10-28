@@ -1,9 +1,8 @@
 import * as React from 'react';
 
-import { getAgentCore, type AgentId } from '@/agents/catalog/catalog';
+import { resolveBuiltInAgentTitle } from '@/agents/backendCatalog/getResolvedBackendCatalogEntries';
 import { useEnabledAgentIds } from '@/agents/hooks/useEnabledAgentIds';
 import { useExecutionRunsBackendsForSession } from '@/hooks/server/useExecutionRunsBackendsForSession';
-import { t } from '@/text';
 
 import {
     buildSessionActionFieldOptionsResolver,
@@ -11,7 +10,7 @@ import {
 } from './sessionActionFieldOptions';
 
 function resolveAgentLabel(agentId: string): string {
-    return t(getAgentCore(agentId as AgentId).displayNameKey);
+    return resolveBuiltInAgentTitle(agentId) ?? agentId;
 }
 
 /** The card's resolver: the full paint, including the snapshot-derived `disabled` flags. */

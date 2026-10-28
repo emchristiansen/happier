@@ -520,8 +520,9 @@ vi.mock('@/utils/platform/responsive', () => ({
     useIsTablet: () => false,
 }));
 vi.mock('@/hooks/session/useDraft', () => ({
-    useDraft: (_sessionId: string, value: string, onChange: (next: string) => void) => {
-        draftHookState.valuesBySessionId.set(_sessionId, value);
+    useDraft: (_sessionId: string, textStore: { getPrompt: () => string; setPrompt: (next: string) => void }) => {
+        const onChange = textStore.setPrompt;
+        draftHookState.valuesBySessionId.set(_sessionId, textStore.getPrompt());
         return {
         clearDraft: () => {
             draftHookState.valuesBySessionId.set(_sessionId, '');
@@ -669,10 +670,9 @@ vi.mock('@/sync/domains/permissions/permissionModeApply', () => ({
 vi.mock('@/sync/domains/sessionControl/sessionModeControl', () => ({
     supportsSessionModeOverrides: () => false,
 }));
-vi.mock('@/sync/domains/session/control/localControlSwitch', () => ({
+vi.mock('@/sync/domains/session/control/localControlSwitch', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/sync/domains/session/control/localControlSwitch')>()),
     shouldRenderChatTimelineForSession: () => true,
-    shouldRequestRemoteControl: () => false,
-    shouldRequestRemoteControlAfterPendingEnqueue: () => false,
 }));
 vi.mock('@/sync/runtime/time', () => ({
     nowServerMs: () => 0,
@@ -1226,7 +1226,7 @@ describe('SessionView (sendMessage resumeInactive pendingQueue)', () => {
         await screen.unmount();
     });
 
-    it('retries the exact durable row after terminal activation failure', async () => {
+    it('retries an online terminal activation failure through the canonical resume action', async () => {
         const row = durablePendingRow('failed-row', 'enqueue');
         pendingMessagesState.current = { messages: [row], discarded: [], isLoaded: true };
         sessionStateOverrides.current = {
@@ -1240,6 +1240,10 @@ describe('SessionView (sendMessage resumeInactive pendingQueue)', () => {
                 failureCode: 'runtime_start_failed',
             },
         };
+        resumeSessionSpy.mockImplementationOnce(async () => {
+            publishLiveSessionState.current?.({ resumingAt: Date.now() });
+            return { type: 'success' as const };
+        });
         const screen = await renderSessionView();
 
         expect(screen.findByTestId('session-pendingActivation')).toBeTruthy();
@@ -1247,13 +1251,11 @@ describe('SessionView (sendMessage resumeInactive pendingQueue)', () => {
 
         await screen.pressByTestIdAsync('session-pendingActivation-retry');
 
-        expect(updatePendingRequestedActionSpy).toHaveBeenCalledWith(
-            's1',
-            'failed-row',
-            { v: 1, kind: 'enqueue' },
-            { resumeWhenAvailable: true },
-        );
+        expect(resumeSessionSpy).toHaveBeenCalledTimes(1);
+        expect(updatePendingRequestedActionSpy).not.toHaveBeenCalled();
         expect(sendPendingMessageNowSpy).not.toHaveBeenCalled();
+        expect(findAgentInput(screen).props.connectionStatus?.text).toBe('session.resuming');
+        expect(screen.findAllByTestId('session-pendingActivation')).toHaveLength(0);
 
         await screen.unmount();
     });

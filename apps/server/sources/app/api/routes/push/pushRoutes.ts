@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { type Fastify } from "../../types";
+import { eventRouter } from "@/app/events/eventRouter";
 import { db } from "@/storage/db";
 import { redactSentryLogAttributes } from "@/app/monitoring/sentryLogRedaction";
 
@@ -110,9 +111,14 @@ export function pushRoutes(app: Fastify) {
 
     // Get Push Tokens API
     app.get('/v1/push-tokens', {
+        schema: { querystring: z.object({ suppressIfComputerFocused: z.enum(['0', '1']).optional() }) },
         preHandler: app.authenticate
     }, async (request, reply) => {
         const userId = request.userId;
+
+        if (request.query.suppressIfComputerFocused === '1' && await eventRouter.hasFocusedComputerUi(userId)) {
+            return reply.send({ tokens: [], suppressedByFocusedComputer: true });
+        }
 
         try {
             const tokens = await db.accountPushToken.findMany({

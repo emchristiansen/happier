@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { Decryptor, Encryptor } from './encryptor';
+import { SecretBoxEncryption, type Decryptor, type Encryptor } from './encryptor';
+import { decodeBase64 } from '@/encryption/base64';
 import { EncryptionCache } from './encryptionCache';
 import { SessionEncryption } from './sessionEncryption';
 
@@ -21,6 +22,24 @@ function createBase64Decryptor(
 }
 
 describe('SessionEncryption metadata in-flight dedupe', () => {
+    it('writes a released-UI-safe Herdr projection and hydrates canonical metadata after encryption', async () => {
+        const metadata = {
+            path: '/repo', host: 'machine', name: 'renamed',
+            terminal: {
+                mode: 'herdr', requested: 'herdr',
+                herdr: { sessionName: 'work', socketPath: '/tmp/herdr.sock', terminalId: 'term_123' },
+            },
+        } as const;
+        const crypto = new SecretBoxEncryption(new Uint8Array(32));
+        const sessionEncryption = new SessionEncryption('session-1', crypto, new EncryptionCache());
+        const encrypted = await sessionEncryption.encryptMetadata(metadata);
+        const [wire] = await crypto.decrypt([decodeBase64(encrypted, 'base64')]);
+        expect(wire).toMatchObject({
+            name: 'renamed',
+            terminal: { mode: 'plain', hostKind: 'herdr', requested: 'plain', requestedHostKind: 'herdr' },
+        });
+        await expect(sessionEncryption.decryptMetadata(2, encrypted)).resolves.toEqual(metadata);
+    });
     it('shares concurrent metadata decrypts for the same session version and ciphertext', async () => {
         const metadata = { path: '/repo', host: 'machine' };
         let releaseDecrypt: () => void = () => {};

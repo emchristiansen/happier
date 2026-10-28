@@ -231,6 +231,7 @@ model TerminalAuthRequest {
     id                String   @id @default(cuid())
     publicKey         String   @unique
     supportsV2        Boolean  @default(false)
+    supportsTokenOnly Boolean  @default(false)
     claimSecretHash   String?
     claimedAt         DateTime?
     response          String?
@@ -260,6 +261,7 @@ model AuthPairingSession {
     account             Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
     secretHash          String
     requestedPublicKey  String?
+    supportsCredentialVariants Boolean @default(false)
     requestedDeviceLabel String?
     requestedAt         DateTime?
     expiresAt           DateTime
@@ -527,6 +529,8 @@ model SessionAttentionStanding {
     accountId String
     sessionId String
     standing  Boolean
+    remindAt  DateTime?
+    standingBeforeReminder Boolean?
     createdAt DateTime @default(now())
     updatedAt DateTime @updatedAt
 
@@ -535,6 +539,7 @@ model SessionAttentionStanding {
 
     @@unique([accountId, sessionId])
     @@index([accountId, standing])
+    @@index([accountId, remindAt])
     @@index([sessionId])
 }
 

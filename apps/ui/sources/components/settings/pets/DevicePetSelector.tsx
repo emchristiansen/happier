@@ -72,6 +72,12 @@ export function DevicePetSelector(props: DevicePetSelectorProps): React.ReactEle
         return resolveFallbackTileWidthStyle(columns);
     }, [columns, tileWidth]);
 
+    // RN Web's onLayout rounds to offsetWidth. Let CSS size web tiles inside the
+    // actual content box, so a fractional pane cannot wrap an otherwise fitting row.
+    const webTileWidthStyle: StyleProp<ViewStyle> = Platform.OS === 'web'
+        ? { width: `calc((100% - ${DEVICE_PET_TILE_GAP * (columns - 1)}px) / ${columns})` as ViewStyle['width'] }
+        : null;
+
     return (
         <View
             testID={gridTestID}
@@ -84,7 +90,7 @@ export function DevicePetSelector(props: DevicePetSelectorProps): React.ReactEle
                         key={tile.key}
                         companionSizeScale={companionSizeScale}
                         tile={tile}
-                        widthStyle={tileWidth != null ? { width: tileWidth } : fallbackTileWidthStyle}
+                        widthStyle={webTileWidthStyle ?? (tileWidth != null ? { width: tileWidth } : fallbackTileWidthStyle)}
                     />
                 ))}
             </View>

@@ -43,7 +43,7 @@ For compatibility-sensitive changes, run a **provenance attack** using `.agents/
 Check the deliverable against the patterns that read as skill and aren't (`docs/agent-craft.md` §8). The highest-frequency ones:
 
 - **Thoroughness theater** — exhaustive coverage of what was easy to check, presented as coverage of the risk. Where are the "if I'm wrong, it's here" spots in the report?
-- **Green tests as proof** — green means "didn't break what we previously thought to check", not "correct". A test you have never seen fail proves nothing; break the behavior and watch it go red.
+- **Green tests as proof** — green means "didn’t break what we previously thought to check", not "correct". Check that the regression assertion has applicable meaningful RED evidence; use the testing skill’s sensitivity check when it does not, rather than repeating every prior mutation.
 - **Defensive over-engineering** — fallbacks for impossible states are unexamined uncertainty made permanent, and future split-brains.
 - **Silent recovery** — an error worked around and not mentioned discards the most informative event of the session.
 - **Uniform hedging** — everything marked uncertain so nothing can be wrong; commit where the evidence commits.
@@ -54,7 +54,7 @@ Schedule adversarial review with the work at the boundary defined by root `AGENT
 
 - The author runs this compact self-attack in place before every non-trivial handoff and when a hypothesis changes. It creates no separate reviewer, workspace, report, approval gate, or durable status update; mention only changes it caused and unresolved risk in the normal handoff.
 - Formal independent review is normally batched at the fewest substantial integrated boundaries needed by the approved plan, plus explicit user-requested reviews and high-risk schema/data/security/user-visible/release triggers—not every lane, commit, gate, or microchange.
-- The reviewer is different from the author at those gates. Its brief is to refute: attempt the failure the author says cannot happen and re-measure rather than re-read.
+- The reviewer is different from the author at those gates. Its brief is to refute: independently exercise the decision-material high-risk claims, inspect applicable primary evidence for the rest, and follow root validation-reuse rules rather than automatically repeating all suites.
 - Advisory review may inspect moving work. Before a boundary or ship verdict, reconcile only decision-material observations affected by concurrent changes. After accepted fixes, review the finding delta and affected corridor; repeat a full independent attack only when the approved contract, architecture, scope, boundary, or risk materially changed.
 
 ## Output

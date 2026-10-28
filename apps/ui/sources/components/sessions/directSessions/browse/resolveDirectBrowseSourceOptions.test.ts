@@ -89,6 +89,46 @@ describe('resolveDirectBrowseSourceOptions', () => {
         ]);
     });
 
+    /**
+     * ACP `session/list` yields resume-only candidates: Happier can start a new session from one,
+     * but it cannot link, follow, take over, or read the transcript of the agent-owned session. The
+     * resume-id picker must therefore offer it while the link/open browse list must not.
+     */
+    it('offers ACP session listing to the resume-id picker only, never to the link/open browse list', async () => {
+        const { listDirectBrowseProviderIds, resolveDirectBrowseSourceOptions } = await directBrowseModulePromise;
+        const { canBrowseDirectSessions, resolveDirectBrowseLockedSource } = await import('./resolveDirectBrowseLockedSourceOption');
+
+        expect(listDirectBrowseProviderIds()).toEqual(['codex', 'claude', 'opencode', 'pi']);
+
+        expect(canBrowseDirectSessions('kimi')).toBe(true);
+        expect(canBrowseDirectSessions('fx')).toBe(true);
+        // Built-in ACP agent that does not declare session listing.
+        expect(canBrowseDirectSessions('droid')).toBe(false);
+
+        expect(resolveDirectBrowseSourceOptions({
+            providerId: 'kimi',
+            profile: null,
+            settings: { connectedServicesProfileLabelByKey: {} },
+            directory: '/work/repo',
+        })).toEqual([
+            expect.objectContaining({ key: 'acp:sessionList', source: { kind: 'acpSessionList', cwd: '/work/repo' } }),
+        ]);
+
+        // The selected directory scopes the ACP listing filter.
+        expect(resolveDirectBrowseLockedSource({
+            providerId: 'kimi',
+            profile: null,
+            settings: { connectedServicesProfileLabelByKey: {} },
+            directory: '/other/repo',
+        })).toEqual({ kind: 'acpSessionList', cwd: '/other/repo' });
+
+        expect(resolveDirectBrowseLockedSource({
+            providerId: 'kimi',
+            profile: null,
+            settings: { connectedServicesProfileLabelByKey: {} },
+        })).toEqual({ kind: 'acpSessionList' });
+    });
+
     it('resolves provider-owned link ensure extras through registered browse behavior', async () => {
         const { resolveDirectBrowseLinkEnsureRequestExtras } = await directBrowseModulePromise;
 

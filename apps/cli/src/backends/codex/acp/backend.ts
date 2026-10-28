@@ -12,6 +12,7 @@ import { resolveCodexApiKeyAuthMethodId } from '@/backends/codex/cli/auth/readCo
 import type { PermissionMode } from '@/api/types';
 import { CodexAcpTransport } from './transport';
 import { readPositiveIntEnv } from '@/utils/readPositiveIntEnv';
+import { withCodexNativeStartupLock } from '../utils/withCodexNativeStartupLock';
 
 export interface CodexAcpBackendOptions extends AgentFactoryOptions {
   mcpServers?: Record<string, McpServerConfig>;
@@ -58,6 +59,9 @@ export function createCodexAcpBackend(options: CodexAcpBackendOptions): CodexAcp
     command: spawn.command,
     args: spawn.args,
     env: options.env,
+    withProcessStartup: async (initialize, signal) => await withCodexNativeStartupLock(
+      resolveCodexAcpInitTimeoutMs(spawn), initialize, signal,
+    ),
     mcpServers: options.mcpServers,
     permissionHandler: options.permissionHandler,
     transportHandler: new CodexAcpTransport(

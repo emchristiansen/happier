@@ -12,6 +12,7 @@ import {
   type OpenCodeBackendMode,
 } from '../providerSettings/definitions/opencode.js';
 import {
+  buildOpenCodeRuntimeDescriptorProviderExtra,
   readOpenCodeRuntimeDescriptorProviderExtra,
 } from './opencodeRuntimeDescriptorExtra.js';
 
@@ -50,6 +51,7 @@ type SharedRuntimeDescriptorByProviderId = {
     vendorSessionId: string | null;
     serverBaseUrl: string | null;
     serverBaseUrlExplicit: boolean;
+    managedServerLaunchFingerprint: string | null;
   }>;
   pi: Readonly<{
     providerId: 'pi';
@@ -156,6 +158,7 @@ export function buildOpenCodeAgentRuntimeDescriptor(params: Readonly<{
   vendorSessionId?: string | null;
   serverBaseUrl?: string | null;
   serverBaseUrlExplicit?: boolean;
+  managedServerLaunchFingerprint?: string | null;
 }>): Readonly<{
   v: 1;
   providerId: 'opencode';
@@ -173,6 +176,7 @@ export function buildOpenCodeAgentRuntimeDescriptor(params: Readonly<{
         vendorSessionId?: string;
         serverBaseUrl?: string;
         serverBaseUrlExplicit?: true;
+        managedServerLaunchFingerprint?: string;
       };
   };
 };
@@ -193,13 +197,9 @@ export function buildOpenCodeAgentRuntimeDescriptor(params: Readonly<{
       providerExtra: {
         owner: 'opencode',
         schemaId: 'opencode.agentRuntimeDescriptorExtra',
-        v: 1,
-        runtimeHandle: {
-          backendMode: params.backendMode,
-          ...(vendorSessionId ? { vendorSessionId } : {}),
-          ...(serverBaseUrl ? { serverBaseUrl } : {}),
-          ...(serverBaseUrl && serverBaseUrlExplicit ? { serverBaseUrlExplicit: true } : {}),
-        },
+        ...buildOpenCodeRuntimeDescriptorProviderExtra({
+          ...params, vendorSessionId, serverBaseUrl, serverBaseUrlExplicit,
+        }),
       },
     },
   };
@@ -296,6 +296,7 @@ export function readSessionMetadataRuntimeDescriptor(
         vendorSessionId: providerExtra?.vendorSessionId ?? normalizeTrimmedString(provider.vendorSessionId),
         serverBaseUrl: providerExtra?.serverBaseUrl ?? normalizeOpenCodeServerBaseUrl(provider.serverBaseUrl),
         serverBaseUrlExplicit: providerExtra?.serverBaseUrlExplicit ?? normalizeOpenCodeServerBaseUrlExplicit(provider.serverBaseUrlExplicit),
+        managedServerLaunchFingerprint: providerExtra?.managedServerLaunchFingerprint ?? null,
       };
     }
     case 'pi': {

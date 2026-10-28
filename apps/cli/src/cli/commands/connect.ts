@@ -4,7 +4,7 @@ import { ApiClient } from '@/api/api';
 import type { CloudConnectTarget, CloudConnectTargetStatus } from '@/cloud/connectTypes';
 import { AGENTS } from '@/backends/catalog';
 import { promptInput } from '@/terminal/prompts/promptInput';
-import { buildConnectedServiceCredentialRecord, type ConnectedServiceId } from '@happier-dev/protocol';
+import { buildConnectedServiceCredentialRecord, supportsConnectedServiceOperation, type ConnectedServiceId } from '@happier-dev/protocol';
 
 import type { CommandContext } from '@/cli/commandRegistry';
 import { buildConnectedAccountOauthCredentialRecord } from '@/daemon/connectedServices/descriptors/buildConnectedAccountCredentialRecord';
@@ -14,6 +14,10 @@ import { formatConnectStatusLines, type ConnectStatusServiceListing, type Connec
 import { resolveConnectAuthIntent } from './connect/resolveConnectAuthIntent';
 import { resolveConnectTargetServiceIds } from './connect/resolveConnectTargetServiceIds';
 import { storeConnectedServiceCredentialForAccount } from '@/cloud/connectedServices/storeConnectedServiceCredentialForAccount';
+import { runConnectedServiceImport } from '@/cloud/connectedServices/connectedServiceImport';
+import { observeServerFeaturesSnapshot } from '@/features/serverFeaturesClient';
+import { resolveServerHttpBaseUrl } from '@/api/client/serverHttpBaseUrl';
+import { fail, info, neutral, ok, sectionTitle, warn } from '@happier-dev/cli-common/output';
 
 /**
  * Handle connect subcommand.
@@ -29,8 +33,9 @@ export async function handleConnectCommand(args: string[]): Promise<void> {
     const allTargets = await loadConnectTargets({ includeExperimental: true });
     const visibleTargets = includeExperimental ? allTargets : allTargets.filter((t) => t.status === 'wired');
 
-    const targetById = new Map<string, CloudConnectTarget>(allTargets.map((t) => [t.id, t] as const));
-    const visibleTargetById = new Map<string, CloudConnectTarget>(visibleTargets.map((t) => [t.id, t] as const));
+    const targetById = new Map<string, CloudConnectTarget>(allTargets.flatMap((target) =>
+      [target.id, ...target.aliases ?? []].map((name) => [name.toLowerCase(), target] as const),
+    ));
 
     if (!subcommand || subcommand === 'help' || subcommand === '--help' || subcommand === '-h') {
         showConnectHelp(visibleTargets, { includeExperimental });
@@ -50,9 +55,10 @@ export async function handleConnectCommand(args: string[]): Promise<void> {
       return;
     }
 
-    const visibleTarget = visibleTargetById.get(normalized);
+    const target = targetById.get(normalized);
+    const visibleTarget = target && (includeExperimental || target.status === 'wired') ? target : undefined;
     if (!visibleTarget) {
-      const hiddenTarget = targetById.get(normalized);
+      const hiddenTarget = target;
       if (hiddenTarget && hiddenTarget.status === 'experimental' && !includeExperimental) {
         console.error(chalk.yellow(`Connect target '${hiddenTarget.id}' is experimental and not enabled by default.`));
         console.error(chalk.gray(`Run: happier connect --all ${hiddenTarget.id}`));
@@ -90,6 +96,7 @@ ${targetLines}
   happier connect help         Show this help message
   happier connect --all ...    Include experimental providers
   happier connect <target> --profile <id>      Store under a specific profile (default: default)
+  happier connect <target> --import --source <id>  Import a native login on this machine
   happier connect <target> --paste             Headless mode: paste redirect URL
   happier connect <target> --device            Use device-code auth (Codex)
   happier connect codex --api-key              Store an OpenAI API key
@@ -113,7 +120,7 @@ ${chalk.bold('Examples:')}
 ${chalk.bold('Notes:')} 
   • You must be authenticated with Happier first (run 'happier auth login')
   • Credentials are encrypted and stored securely in Happier cloud
-  • You can manage your stored keys at app.happier.dev
+  • You can manage your stored keys at cloud.happier.dev
   ${opts.includeExperimental ? '' : '• Some providers are experimental; use --all to show them'}
 `);
 }
@@ -124,12 +131,12 @@ function formatTargetLine(target: CloudConnectTarget): string {
 }
 
 async function handleConnectVendor(target: CloudConnectTarget, options: ConnectParsedOptions): Promise<void> {
-    console.log(chalk.bold(`\n🔌 Connecting ${target.vendorDisplayName} to Happier cloud\n`));
+    console.log(`\n${sectionTitle(`Connecting ${target.vendorDisplayName} to Happier cloud`)}\n`);
 
     // Check if authenticated
     const credentials = await readCredentials();
     if (!credentials) {
-        console.log(chalk.yellow('⚠️  Not authenticated with Happier'));
+        console.log(warn('Not authenticated with Happier'));
         console.log(chalk.gray('  Please run "happier auth login" first'));
         process.exit(1);
     }
@@ -137,12 +144,41 @@ async function handleConnectVendor(target: CloudConnectTarget, options: ConnectP
     // Create API client
     const api = await ApiClient.create(credentials);
 
+    if (options.import) {
+      if (!target.importServiceId) {
+        throw Object.assign(new Error('This provider does not declare native credential import.'), { code: 'unsupported' });
+      }
+      const account = { api, credentials };
+      const discovery = await runConnectedServiceImport({ request: { op: 'discover', serviceId: target.importServiceId }, account });
+      if (!discovery.ok) throw Object.assign(new Error(discovery.error), { code: discovery.errorCode });
+      if (discovery.op !== 'discover') throw new Error('Unexpected native import discovery result.');
+      const source = options.source ?? (discovery.sources.length === 1 ? discovery.sources[0]?.id : null);
+      if (!source) throw Object.assign(new Error(`Choose a native source with --source (${discovery.sources.map((candidate) => candidate.id).join(', ')}).`), { code: 'unsupported_source' });
+      const imported = await runConnectedServiceImport({ request: { op: 'import', serviceId: target.importServiceId, profileId: options.profileId, source }, account });
+      if (!imported.ok) throw Object.assign(new Error(imported.error), { code: imported.errorCode });
+      console.log(ok(`${target.displayName} native login imported into ${options.profileId}`));
+      process.exit(0);
+    }
+
     const now = Date.now();
     let postConnectPayload: unknown | null = null;
 
     const record = await (async () => {
       const authIntent = resolveConnectAuthIntent({ targetId: target.id, options });
       const serviceId: ConnectedServiceId = authIntent.serviceId;
+      // Released services remain available on older servers without a probe.
+      // New services require admission before acquiring or prompting for credentials.
+      if (!supportsConnectedServiceOperation(null, serviceId)) {
+        const snapshot = await observeServerFeaturesSnapshot({
+          serverUrl: resolveServerHttpBaseUrl(),
+          token: credentials.token,
+        });
+        if (snapshot.status !== 'ready' || !supportsConnectedServiceOperation(snapshot.features, serviceId)) {
+          throw Object.assign(new Error(`This server has not confirmed support for connected service '${serviceId}'. Upgrade the server or retry when it is reachable.`), {
+            code: 'connected_service_unsupported',
+          });
+        }
+      }
       if (authIntent.kind === 'token') {
         const promptLabel =
           authIntent.tokenKind === 'setup-token'
@@ -187,14 +223,14 @@ async function handleConnectVendor(target: CloudConnectTarget, options: ConnectP
       });
     })();
 
-    console.log(`🚀 Registering ${target.displayName} credential with relay (${record.serviceId}/${options.profileId})`);
+    console.log(info(`Registering ${target.displayName} credential with relay (${record.serviceId}/${options.profileId})`));
     await storeConnectedServiceCredentialForAccount({
       api,
       credentials,
       record,
     });
 
-    console.log(`✅ ${target.displayName} credential registered with relay`);
+    console.log(ok(`${target.displayName} credential registered with relay`));
     if (postConnectPayload !== null) {
       target.postConnect?.(postConnectPayload);
     }
@@ -208,12 +244,12 @@ async function handleConnectStatus(
     targets: ReadonlyArray<CloudConnectTarget>,
     params: Readonly<{ profileFilter: string | null }>,
 ): Promise<void> {
-    console.log(chalk.bold('\n🔌 Connection Status\n'));
+    console.log(`\n${sectionTitle('Connection status')}\n`);
 
     // Check if authenticated
     const credentials = await readCredentials();
     if (!credentials) {
-        console.log(chalk.yellow('⚠️  Not authenticated with Happier'));
+        console.log(warn('Not authenticated with Happier'));
         console.log(chalk.gray('  Please run "happier auth login" first'));
         process.exit(1);
     }
@@ -265,7 +301,7 @@ export async function handleConnectCliCommand(context: CommandContext): Promise<
   try {
     await handleConnectCommand(context.args.slice(1));
   } catch (error) {
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     if (process.env.DEBUG) {
       console.error(error);
     }

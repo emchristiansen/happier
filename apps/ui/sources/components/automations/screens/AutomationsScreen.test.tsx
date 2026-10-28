@@ -1,6 +1,7 @@
 import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+    createDeferred,
     findTestInstanceByTypeContainingText,
     flushHookEffects,
     invokeTestInstanceHandler,
@@ -177,5 +178,27 @@ describe('AutomationsScreen', () => {
         await pressTestInstanceAsync(card);
         expect(navigateWithBlurOnWebSpy).toHaveBeenCalled();
         expect(routerPushSpy).toHaveBeenCalledWith('/automations/a1');
+    });
+
+    it('keeps the hydrated automation list visible while the mount refresh is pending', async () => {
+        const refresh = createDeferred<void>();
+        syncSpies.refreshAutomations.mockImplementationOnce(() => refresh.promise);
+        automationsState.list = [{
+            id: 'a1',
+            name: 'Nightly',
+            description: null,
+            enabled: true,
+            schedule: { kind: 'interval', everyMs: 900_000, scheduleExpr: null },
+            nextRunAt: Date.now() + 60_000,
+        }];
+        const { AutomationsScreen } = await import('./AutomationsScreen');
+
+        const screen = await renderScreen(React.createElement(AutomationsScreen));
+
+        expect(syncSpies.refreshAutomations).toHaveBeenCalledTimes(1);
+        expect(findTestInstanceByTypeContainingText(screen.tree, 'Pressable', 'Nightly')).toBeTruthy();
+
+        refresh.resolve();
+        await flushHookEffects();
     });
 });

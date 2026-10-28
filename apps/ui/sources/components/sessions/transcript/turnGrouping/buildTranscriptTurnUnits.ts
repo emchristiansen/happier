@@ -41,7 +41,7 @@ export type TranscriptToolGroupUnitItem =
     }
     | {
         kind: 'tool-group-tool';
-        id: string; // `${groupId}#tool:${toolMessageId}` — SAME id whether the row is a collapsed preview-tail row or an expanded body row
+        id: string; // `msg:${toolMessageId}` — stable across regrouping and expansion
         groupId: string;
         toolMessageId: string;
         toolMessageIds: string[]; // full group membership (for expansion-state checks)
@@ -153,7 +153,7 @@ function appendToolGroupUnits(params: Readonly<{
         ...capMetadataFields,
     });
 
-    if (!expanded && hiddenCount > 0) {
+    if (!expanded && params.collapsedPreviewCount > 0 && hiddenCount > 0) {
         params.output.push({
             kind: 'tool-group-expand',
             id: `${params.groupId}#expand`,
@@ -171,7 +171,8 @@ function appendToolGroupUnits(params: Readonly<{
             ?? params.groupItemMetadata;
         params.output.push({
             kind: 'tool-group-tool',
-            id: `${params.groupId}#tool:${toolMessageId}`,
+            // This row renders one message; regrouping must not replace its list identity.
+            id: `msg:${toolMessageId}`,
             groupId: params.groupId,
             toolMessageId,
             toolMessageIds,

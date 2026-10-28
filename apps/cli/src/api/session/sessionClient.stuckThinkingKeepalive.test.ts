@@ -74,6 +74,8 @@ describe('ApiSessionClient stuck-thinking keepalive guard', () => {
 
   it('self-heals a thinking keepalive that stays latched against a terminal turn status', async () => {
     const client = await createClient({ latestTurnStatus: 'completed' });
+    const localPresence = vi.fn();
+    client.on('local-presence', localPresence);
 
     // First tick: a fresh turn's status update can lag its thinking flip, so a brief window is tolerated.
     client.keepAlive(true, 'remote');
@@ -87,6 +89,7 @@ describe('ApiSessionClient stuck-thinking keepalive guard', () => {
     vi.setSystemTime(16_000);
     client.keepAlive(true, 'remote');
     expect(readPresenceThinking(client)).toBe(false);
+    expect(localPresence.mock.calls.map(([presence]) => presence.thinking)).toEqual([true, true, false]);
   });
 
   it('keeps republishing thinking while the turn status is still active', async () => {
@@ -97,6 +100,16 @@ describe('ApiSessionClient stuck-thinking keepalive guard', () => {
     client.keepAlive(true, 'remote');
 
     expect(readPresenceThinking(client)).toBe(true);
+  });
+
+  it('notifies local terminal integrations when the session closes', async () => {
+    const client = await createClient({});
+    const onClosed = vi.fn();
+    client.on('local-closed', onClosed);
+
+    await client.close();
+
+    expect(onClosed).toHaveBeenCalledTimes(1);
   });
 
   it('keeps a new local turn thinking when its best-effort status record has not displaced a stale terminal snapshot', async () => {

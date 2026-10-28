@@ -1,4 +1,7 @@
 import {
+  projectSessionMetadataForWire,
+  buildBackendTargetKey,
+  type BackendTargetRefV1,
   SESSION_AGENT_TRANSITION_DIVIDER_MESSAGE,
   SESSION_AGENT_TRANSITION_DIVIDER_SIDECAR_KEY,
   SessionAgentTransitionDividerV1Schema,
@@ -19,7 +22,6 @@ import {
 import {
   projectCurrentAgentSessionView,
   resolveAgentIdFromSessionMetadata,
-  resolvePermissionIntentFromSessionMetadata,
   type AgentId,
 } from '@happier-dev/agents';
 
@@ -33,8 +35,10 @@ import { resolveCliFeatureDecisionForServer } from '@/features/featureDecisionSe
 import type { Credentials } from '@/persistence';
 import { resolveTrustedSessionAttachmentLocalImagePaths } from '@/session/attachments/resolveTrustedSessionAttachmentLocalImagePaths';
 import { admitSessionUserMessageToPendingQueue } from '@/session/services/admitSessionUserMessage';
+import { resolveSessionMessagePermissionIntent } from '@/session/services/resolveSessionMessagePermissionIntent';
 import { requestInactiveSessionResume } from '@/session/services/requestInactiveSessionResume';
 import { requestSessionStop } from '@/session/services/requestSessionStop';
+import { resolveSessionUserMessageRequestedAction } from '@/session/services/resolveSessionUserMessageRequestedAction';
 import { resolveSessionTransportContext } from '@/session/services/resolveSessionTransportContext';
 import {
   resolveSessionAgentSpawnConnectedServicesDefaults,
@@ -51,6 +55,9 @@ import { commitSessionAgentTransitionCutover } from '@/session/transport/http/se
 import { fetchSessionByIdCompat } from '@/session/transport/http/sessionsHttp';
 import { resolveSessionControlStopTimeoutMs } from '@/session/transport/shared/sessionTimeouts';
 import { logger } from '@/ui/logger';
+import { resolveSessionPersistedRuntimeIdentity } from '@/daemon/sessions/runtimeSnapshot/buildInactiveSessionResumeSpawnOptions';
+import { resolveConfiguredAcpBackendFromAccountSettings } from '@/agent/acp/catalog/configured/resolveConfiguredAcpBackendFromAccountSettings';
+import { materializeConfiguredAcpEnvironment } from '@/agent/acp/catalog/configured/materializeConfiguredAcpEnvironment';
 
 import {
   captureDepartingAgentNativeResumeRecord,
@@ -149,6 +156,8 @@ function buildDividerContent(params: Readonly<{
   dividerLocalId: string;
   fromAgentId: string;
   toAgentId: string;
+  fromBackendTarget?: BackendTargetRefV1;
+  toBackendTarget?: BackendTargetRefV1;
   /**
    * The transcript cutoff the activation brief was built from, `0` when the
    * pass carried nothing over.
@@ -186,6 +195,8 @@ function buildDividerContent(params: Readonly<{
     v: 1,
     fromAgentId: params.fromAgentId,
     toAgentId: params.toAgentId,
+    ...(params.fromBackendTarget ? { fromBackendTarget: params.fromBackendTarget } : {}),
+    ...(params.toBackendTarget ? { toBackendTarget: params.toBackendTarget } : {}),
     sourceCutoffSeqInclusive: params.sourceCutoffSeqInclusive,
     ...(params.returningAgentLastSeenSeqInclusive === null
       ? {}
@@ -241,11 +252,12 @@ function buildDividerContent(params: Readonly<{
 async function applyTargetConnectedServiceBinding(params: Readonly<{
   credentials: Credentials;
   targetAgentId: AgentId;
+  backendTarget: BackendTargetRefV1;
   targetMetadata: Record<string, unknown>;
 }>): Promise<void> {
   const resolved = await resolveSessionAgentSpawnConnectedServicesDefaults({
     credentials: params.credentials,
-    backendTarget: { kind: 'builtInAgent', agentId: params.targetAgentId },
+    backendTarget: params.backendTarget,
   }).catch((error: unknown) => {
     logger.debug('[AGENT TRANSITION] Target connected-service default unavailable', {
       agentId: params.targetAgentId,
@@ -276,17 +288,24 @@ async function admitInputAndActivateTarget(params: Readonly<{
   mode: SessionStoredContentEncryptionMode;
   ctx: Parameters<typeof encryptSessionPayload>[0]['ctx'];
   sanitizedMeta: ReturnType<typeof sanitizeSessionUserMessageSendMeta>;
-  /** The committed target current view — the source of permission intent and the resume basis. */
+  /** The committed target current view — the permission fallback and resume basis. */
   targetMetadata: Record<string, unknown>;
   /** Proof that the target current view is committed; the source of every arm here. */
   committed: SessionAgentTransitionCurrentViewCommitted;
 }>): Promise<SessionAgentTransitionResultV1> {
   const { committed, localId, request } = params;
 
-  // Permission intent is Session-global safety intent, carried across the
-  // transition rather than reset. `default` is the same fallback the ordinary
-  // send path uses when metadata declares none.
-  const permissionIntent = resolvePermissionIntentFromSessionMetadata(params.targetMetadata)?.intent ?? 'default';
+  // The frozen user input may carry a newer Session-global permission choice
+  // that has not been published yet (`next_prompt`). The ordinary message
+  // intent owner keeps it authoritative; older inputs still use the committed
+  // post-stop metadata, rather than a stale preflight snapshot.
+  const permission = resolveSessionMessagePermissionIntent({
+    permissionModeOverride: typeof request.input.meta.permissionMode === 'string'
+      ? request.input.meta.permissionMode
+      : undefined,
+    decryptedMetadata: params.targetMetadata,
+  });
+  if (!permission.ok) return committed.committed('input_rejected');
   const admission = await admitSessionUserMessageToPendingQueue({
     credentials: params.credentials,
     sessionId: request.sessionId,
@@ -295,7 +314,8 @@ async function admitInputAndActivateTarget(params: Readonly<{
     localId,
     text: request.input.text,
     meta: params.sanitizedMeta,
-    permissionIntent,
+    permissionIntent: permission.permissionIntent,
+    requestedAction: resolveSessionUserMessageRequestedAction({ deliveryIntent: 'runtime_bootstrap' }),
     ...(request.selection.modelId ? { modelId: request.selection.modelId } : {}),
   });
   if (admission.status === 'unconfirmed') {
@@ -371,6 +391,8 @@ async function readDividerEvidence(params: Readonly<{
   expected: Readonly<{
     fromAgentId: string;
     toAgentId: string;
+    fromBackendTarget?: BackendTargetRefV1;
+    toBackendTarget?: BackendTargetRefV1;
   }>;
 }>): Promise<DividerEvidence> {
   const outcome = await findTranscriptEncryptedMessageByLocalIdV2({
@@ -450,6 +472,10 @@ async function reconcileAlreadyTargetedSession(params: Readonly<{
     expected: {
       fromAgentId: request.expectedCurrentAgentId,
       toAgentId: params.targetAgentId,
+      ...(request.expectedCurrentBackendTarget?.kind === 'configuredAcpBackend'
+        ? { fromBackendTarget: request.expectedCurrentBackendTarget } : {}),
+      ...(request.selection.backendTarget?.kind === 'configuredAcpBackend'
+        ? { toBackendTarget: request.selection.backendTarget } : {}),
     },
   });
 
@@ -489,6 +515,24 @@ export async function runSessionAgentTransition(params: Readonly<{
   const localId = readPendingLocalId(request.input.localId);
   // No usable correlation id, so the transition was never dispatched at all.
   if (!localId) return rejectUndispatchedSessionAgentTransition('unsupported_operation');
+
+  // Generic user-message metadata is an opaque wire record. Validate an
+  // explicitly authored permission through the existing intent owner before
+  // any source effect; absence preserves the incumbent metadata fallback.
+  if (Object.prototype.hasOwnProperty.call(request.input.meta, 'permissionMode')) {
+    const permissionModeOverride = request.input.meta.permissionMode;
+    if (typeof permissionModeOverride !== 'string' || permissionModeOverride.trim().length === 0) {
+      return rejectUndispatchedSessionAgentTransition('unsupported_operation');
+    }
+    try {
+      resolveSessionMessagePermissionIntent({ permissionModeOverride, decryptedMetadata: null });
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'invalid_arguments') {
+        return rejectUndispatchedSessionAgentTransition('unsupported_operation');
+      }
+      throw error;
+    }
+  }
 
   // One effect ledger per invocation. The handle in scope is the proof of how
   // far the transition got, and it is the ONLY source of result arms. This tree
@@ -541,14 +585,26 @@ export async function runSessionAgentTransition(params: Readonly<{
 
   const currentAgentId = resolveAgentIdFromSessionMetadata(metadata);
   if (!currentAgentId) return effects.rejected('unsupported_operation');
+  const currentIdentity = resolveSessionPersistedRuntimeIdentity(metadata);
+  if (!currentIdentity) return effects.rejected('unsupported_operation');
+  if (currentIdentity.backendTarget.kind === 'configuredAcpBackend'
+    && request.expectedCurrentAgentId === 'customAcp' && !request.expectedCurrentBackendTarget) {
+    return effects.rejected('stale_selection');
+  }
+  const currentBackendTargetKey = buildBackendTargetKey(currentIdentity.backendTarget);
+  const expectedBackendTarget = request.expectedCurrentBackendTarget
+    ?? { kind: 'builtInAgent' as const, agentId: request.expectedCurrentAgentId };
 
-  // The target is resolved BEFORE the currentness comparison, because a Session
-  // that already IS the target is not a stale client view — it is this
-  // operation's own committed cutover seen again (section 7.5).
-  const resolvedTarget = resolveSessionContinuationTargetAgent(request.selection);
-  if (resolvedTarget.type === 'resolved' && currentAgentId === resolvedTarget.targetAgentId) {
+  // Currentness is a committed metadata fact. A configured definition removed
+  // after cutover cannot turn a retry into an untouched-source rejection.
+  const accountSettings = readAccountSettings();
+  const resolvedTarget = resolveSessionContinuationTargetAgent(request.selection, accountSettings);
+  const requestedTarget = request.selection.backendTarget?.kind === 'configuredAcpBackend'
+    ? request.selection.backendTarget
+    : resolvedTarget.type === 'resolved' ? resolvedTarget.backendTarget : null;
+  if (requestedTarget && currentBackendTargetKey === buildBackendTargetKey(requestedTarget)) {
     // Only a request that also EXPECTED the target is a genuine no-op.
-    if (request.expectedCurrentAgentId === resolvedTarget.targetAgentId) {
+    if (buildBackendTargetKey(expectedBackendTarget) === currentBackendTargetKey) {
       return effects.rejected('same_target');
     }
     return await reconcileAlreadyTargetedSession({
@@ -559,7 +615,7 @@ export async function runSessionAgentTransition(params: Readonly<{
       ctx: sessionTarget.ctx,
       workspacePath,
       committedMetadata: metadata,
-      targetAgentId: resolvedTarget.targetAgentId,
+      targetAgentId: currentAgentId,
       effects,
     });
   }
@@ -567,10 +623,17 @@ export async function runSessionAgentTransition(params: Readonly<{
   // A stale client view invalidates the request whatever the target turns out to
   // be, and it is the more actionable answer, so it is decided before target
   // resolution can shadow it with `target_unavailable`.
-  if (currentAgentId !== request.expectedCurrentAgentId) return effects.rejected('stale_selection');
+  if (currentAgentId !== request.expectedCurrentAgentId || buildBackendTargetKey(expectedBackendTarget) !== currentBackendTargetKey) return effects.rejected('stale_selection');
   if (resolvedTarget.type !== 'resolved') return effects.rejected('target_unavailable');
   const sourceAgentId = currentAgentId;
   const targetAgentId: AgentId = resolvedTarget.targetAgentId;
+  const targetBackendTarget = resolvedTarget.backendTarget;
+  const configuredBackend = targetBackendTarget.kind === 'configuredAcpBackend' && accountSettings
+    ? resolveConfiguredAcpBackendFromAccountSettings(accountSettings, targetBackendTarget.backendId) : null;
+  if (configuredBackend && accountSettings) {
+    try { materializeConfiguredAcpEnvironment({ backend: configuredBackend, accountSettings, credentials: params.credentials }); }
+    catch { return effects.rejected('target_unavailable'); }
+  }
 
   // Sanitize the exact submitted input through the canonical owner before any
   // effect, so a rejected mention/attachment fails with the source untouched.
@@ -618,7 +681,7 @@ export async function runSessionAgentTransition(params: Readonly<{
   // at this instant — the version check above just proved the preflight bytes
   // are still the committed ones — so this is where a later return to it becomes
   // possible. It never gates the transition and never takes an exit.
-  await captureDepartingAgentNativeResumeRecord({
+  if (currentIdentity.backendTarget.kind === 'builtInAgent') await captureDepartingAgentNativeResumeRecord({
     store: localAgentNativeResumeRecordStore,
     sessionId: request.sessionId,
     sourceAgentId,
@@ -707,7 +770,8 @@ export async function runSessionAgentTransition(params: Readonly<{
   // the CAS can no longer refuse a transition that committed its own cutover
   // during the stop window (section 7.3 — a concurrent second transition loses
   // the current-target or metadata-version check).
-  if (resolveAgentIdFromSessionMetadata(stoppedMetadata) !== sourceAgentId) {
+  const stoppedIdentity = resolveSessionPersistedRuntimeIdentity(stoppedMetadata);
+  if (!stoppedIdentity || buildBackendTargetKey(stoppedIdentity.backendTarget) !== currentBackendTargetKey) {
     return stopped.sourceStopped('cutover_conflict');
   }
 
@@ -715,7 +779,7 @@ export async function runSessionAgentTransition(params: Readonly<{
   // inversion is a stated risk spot — choosing a narrower context bound and only
   // then discovering that native return is unavailable omits history the fresh
   // target needs, and nothing in the result would say so.
-  const nativeReturn = await resolveAgentNativeReturnIdentity({
+  const nativeReturn = targetBackendTarget.kind === 'configuredAcpBackend' ? null : await resolveAgentNativeReturnIdentity({
     store: localAgentNativeResumeRecordStore,
     sessionId: request.sessionId,
     targetAgentId,
@@ -768,6 +832,8 @@ export async function runSessionAgentTransition(params: Readonly<{
       dividerLocalId,
       fromAgentId: sourceAgentId,
       toAgentId: targetAgentId,
+      ...(currentIdentity.backendTarget.kind === 'configuredAcpBackend' ? { fromBackendTarget: currentIdentity.backendTarget } : {}),
+      ...(targetBackendTarget.kind === 'configuredAcpBackend' ? { toBackendTarget: targetBackendTarget } : {}),
       // The exact post-stop upper bound U that this pass observed. A no-dialog
       // brief leaves the seed absent, but its divider still records U rather
       // than rewriting a non-empty transcript head as zero.
@@ -805,6 +871,8 @@ export async function runSessionAgentTransition(params: Readonly<{
       nativeResumeId: nativeReturn?.identity.vendorResumeId ?? null,
       target: {
         agentId: targetAgentId,
+        backendTarget: targetBackendTarget,
+        ...(configuredBackend ? { backendTitle: configuredBackend.title } : {}),
         ...(request.selection.modelId ? { modelId: request.selection.modelId } : {}),
         ...(request.selection.acpSessionModeId ? { sessionModeId: request.selection.acpSessionModeId } : {}),
         ...(request.selection.sessionConfigOptionOverrides
@@ -832,6 +900,7 @@ export async function runSessionAgentTransition(params: Readonly<{
     await applyTargetConnectedServiceBinding({
       credentials: params.credentials,
       targetAgentId,
+      backendTarget: targetBackendTarget,
       targetMetadata,
     });
     const outcome = await commitSessionAgentTransitionCutover({
@@ -843,7 +912,7 @@ export async function runSessionAgentTransition(params: Readonly<{
         metadataCiphertext: encryptStoredSessionPayload({
           mode: sessionTarget.mode,
           ctx: sessionTarget.ctx,
-          payload: targetMetadata,
+          payload: projectSessionMetadataForWire(targetMetadata),
         }),
         expectedAgentStateVersion: source.agentStateVersion,
         agentStateCiphertext: null,
@@ -875,13 +944,15 @@ export async function runSessionAgentTransition(params: Readonly<{
     const refreshedMetadata = refreshed
       ? asRecord(tryDecryptSessionMetadata({ credentials: params.credentials, rawSession: refreshed }))
       : null;
+    const refreshedIdentity = refreshedMetadata ? resolveSessionPersistedRuntimeIdentity(refreshedMetadata) : null;
     if (
       !refreshed
       || !refreshedMetadata
+      || !refreshedIdentity
       // The version moved BECAUSE a concurrent transition committed, or the
       // Session was archived. Re-sealing this operation's target view over
       // either would silently revert it.
-      || resolveAgentIdFromSessionMetadata(refreshedMetadata) !== sourceAgentId
+      || buildBackendTargetKey(refreshedIdentity.backendTarget) !== currentBackendTargetKey
       || (refreshed as { archivedAt?: unknown }).archivedAt != null
     ) {
       return stopped.sourceStopped('cutover_conflict');

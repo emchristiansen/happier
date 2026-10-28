@@ -8,7 +8,7 @@ import {
     SessionListSelectionProvider,
     useSessionListSelectionActions,
 } from './selection/SessionListSelectionContext';
-import { SESSION_ACTION_RENAME_ID } from '@/components/sessions/actions/sessionActionIds';
+import { SESSION_ACTION_PIN_ID, SESSION_ACTION_RENAME_ID, SESSION_ACTION_UNPIN_ID } from '@/components/sessions/actions/sessionActionIds';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -53,18 +53,18 @@ vi.mock('@/hooks/session/useNavigateToSession', () => ({
 const modalPromptSpy = vi.fn(async () => null as string | null);
 const sessionRenameSpy = vi.fn(async () => ({ success: true }));
 const openSessionForkStrategyFlowSpy = vi.fn();
+const sessionForkFlowModuleLoadedSpy = vi.fn();
 
 vi.mock('@/hooks/server/useFeatureEnabled', () => ({
     useFeatureEnabled: () => false,
 }));
 
-vi.mock('@/components/sessions/fork/openSessionForkStrategyFlow', () => ({
-    openSessionForkStrategyFlow: (...args: unknown[]) => openSessionForkStrategyFlowSpy(...args),
-}));
-
-vi.mock('@/utils/platform/deferOnWeb', () => ({
-    deferOnWeb: (callback: () => void) => callback(),
-}));
+vi.mock('@/components/sessions/fork/openSessionForkStrategyFlow', () => {
+    sessionForkFlowModuleLoadedSpy();
+    return {
+        openSessionForkStrategyFlow: (...args: unknown[]) => openSessionForkStrategyFlowSpy(...args),
+    };
+});
 
 function hasRenameMenuItem(items: unknown): boolean {
     if (!Array.isArray(items)) return false;
@@ -243,7 +243,6 @@ describe('SessionItem context menu press suppression', () => {
                 variant="default"
                 compact={false}
                 forkActionContext={{
-                    settings: {},
                     replayEnabled: true,
                     executionRunsEnabled: false,
                 }}
@@ -260,6 +259,7 @@ describe('SessionItem context menu press suppression', () => {
             title: 'sessionInfo.forkSession',
             subtitle: undefined,
         });
+        await vi.waitFor(() => expect(sessionForkFlowModuleLoadedSpy).toHaveBeenCalledTimes(1));
 
         await act(async () => {
             await dropdown.props.onSelect('session.fork');
@@ -620,48 +620,50 @@ describe('SessionItem context menu press suppression', () => {
         expect(screen.tree.root.findAllByType('Swipeable' as React.ElementType)).toHaveLength(0);
     });
 
-    it('disables row long-press actions on Android while the hotfix is active', async () => {
+    it('pins and unpins an Android session from its long-press menu without navigating', async () => {
         platformOs = 'android';
 
-        const session = {
+        const session = createSessionFixture({
             id: 'sess_3',
-            seq: 1,
-            createdAt: 1,
-            updatedAt: 1,
             active: true,
-            activeAt: 1,
             metadata: null,
-            metadataVersion: 1,
-            agentState: null,
-            agentStateVersion: 1,
-            thinking: false,
-            thinkingAt: 0,
-            presence: 'online',
-        } as any;
+        });
 
-        const onNativeContextMenuOpenChange = vi.fn();
+        function PinnableSession() {
+            const [pinned, setPinned] = React.useState(false);
+            return (
+                <SessionItem
+                    session={session}
+                    selected={false}
+                    isFirst={true}
+                    isLast={true}
+                    isSingle={true}
+                    pinned={pinned}
+                    onTogglePinned={() => setPinned((current) => !current)}
+                />
+            );
+        }
 
-        const screen = await renderScreen(
-            <SessionItem
-                session={session}
-                selected={false}
-                isFirst={true}
-                isLast={true}
-                isSingle={true}
-                variant="default"
-                compact={false}
-                nativeInlineDragEnabled={false}
-                nativeContextMenuOpen={false}
-                onNativeContextMenuOpenChange={onNativeContextMenuOpenChange}
-            />,
-        );
-
+        const screen = await renderScreen(<PinnableSession />);
         const itemPressable = screen.findByProps({ testID: 'session-list-item-sess_3' });
-        expect(itemPressable.props.onLongPress).toBeUndefined();
+        expect(itemPressable.props.onLongPress).toEqual(expect.any(Function));
+
+        for (const actionId of [SESSION_ACTION_PIN_ID, SESSION_ACTION_UNPIN_ID]) {
+            await act(async () => { itemPressable.props.onLongPress(); });
+            const menu = screen.findByType('DropdownMenu' as React.ElementType);
+            expect(menu.props.items).toEqual(expect.arrayContaining([expect.objectContaining({ id: actionId })]));
+            await act(async () => { await pressTestInstanceAsync(itemPressable, 'session list item'); });
+            expect(navigateToSessionSpy).not.toHaveBeenCalled();
+            await act(async () => { menu.props.onSelect(actionId); });
+            expect(screen.tree.root.findAllByType('DropdownMenu' as React.ElementType)).toHaveLength(0);
+        }
+
+        await act(async () => { itemPressable.props.onLongPress(); });
+        expect(screen.findByType('DropdownMenu' as React.ElementType).props.items)
+            .toEqual(expect.arrayContaining([expect.objectContaining({ id: SESSION_ACTION_PIN_ID })]));
     });
 
-    it('opens the rename prompt after the native context menu close turn', async () => {
-        vi.useFakeTimers();
+    it('closes the native context menu before delegating the rename selection', async () => {
         modalPromptSpy.mockResolvedValueOnce('Renamed Session');
 
         const session = createSessionFixture({
@@ -695,13 +697,6 @@ describe('SessionItem context menu press suppression', () => {
         });
 
         expect(onNativeContextMenuOpenChange).toHaveBeenCalledWith(false);
-        expect(modalPromptSpy).not.toHaveBeenCalled();
-
-        await act(async () => {
-            vi.advanceTimersByTime(0);
-            await Promise.resolve();
-        });
-
         expect(modalPromptSpy).toHaveBeenCalledTimes(1);
         expect(sessionRenameSpy).toHaveBeenCalledWith('sess_rename', 'Renamed Session', { serverId: 'server_a' });
     });

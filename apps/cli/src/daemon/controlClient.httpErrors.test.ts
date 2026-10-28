@@ -80,6 +80,125 @@ describe('daemon control client (HTTP error responses)', () => {
     }
   });
 
+  it('uses authenticated daemon control when the caller cannot observe the daemon PID namespace', async () => {
+    let observedToken: string | undefined;
+    const server = http.createServer((req, res) => {
+      observedToken = req.headers['x-happier-daemon-token'] as string | undefined;
+      res.statusCode = 200;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ children: [{ pid: 42, metadata: null }] }));
+    });
+
+    try {
+      const { port } = await listen(server);
+      tmpHomeDir = await createTempDir('happier-daemon-client-pid-namespace-');
+      envScope.patch({ HAPPIER_HOME_DIR: tmpHomeDir });
+      reloadConfiguration();
+      writeDaemonState({
+        pid: 987_654_321,
+        httpPort: port,
+        startedAt: Date.now(),
+        startedWithCliVersion: 'test',
+        controlToken: 'test-token',
+      });
+
+      await expect(controlClient.listDaemonSessions()).resolves.toEqual([{ pid: 42, metadata: null }]);
+      expect(observedToken).toBe('test-token');
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('rejects session listing when there is no daemon instead of returning an empty inventory', async () => {
+    tmpHomeDir = await createTempDir('happier-daemon-list-no-state-');
+    envScope.patch({ HAPPIER_HOME_DIR: tmpHomeDir });
+    reloadConfiguration();
+
+    await expect(controlClient.listDaemonSessions()).rejects.toThrow('No daemon running');
+  });
+
+  it('rejects session listing when daemon control returns an HTTP failure', async () => {
+    const server = http.createServer((_req, res) => {
+      res.statusCode = 503;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ error: 'control unavailable' }));
+    });
+
+    try {
+      const { port } = await listen(server);
+      tmpHomeDir = await createTempDir('happier-daemon-list-http-error-');
+      envScope.patch({ HAPPIER_HOME_DIR: tmpHomeDir });
+      reloadConfiguration();
+      writeDaemonState({
+        pid: process.pid,
+        httpPort: port,
+        startedAt: Date.now(),
+        startedWithCliVersion: 'test',
+        controlToken: 'test-token',
+      });
+
+      const { handleDaemonCliCommand } = await import('@/cli/commands/daemon');
+      await expect(handleDaemonCliCommand({
+        args: ['daemon', 'list'],
+        rawArgv: [],
+        terminalRuntime: null,
+      })).rejects.toThrow('HTTP 503');
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('reports a running daemon from authenticated control when its PID is hidden from this pid namespace', async () => {
+    const server = http.createServer((req, res) => {
+      const authorized = req.headers['x-happier-daemon-token'] === 'test-token';
+      res.statusCode = authorized ? 200 : 401;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify(authorized ? { status: 'ok' } : {}));
+    });
+
+    try {
+      const { port } = await listen(server);
+      tmpHomeDir = await createTempDir('happier-daemon-inspect-pid-namespace-');
+      envScope.patch({ HAPPIER_HOME_DIR: tmpHomeDir });
+      reloadConfiguration();
+      writeDaemonState({
+        pid: 987_654_321,
+        httpPort: port,
+        startedAt: Date.now(),
+        startedWithCliVersion: 'test',
+        controlToken: 'test-token',
+      });
+
+      await expect(controlClient.inspectDaemonRunningStateAndCleanupStaleState()).resolves.toMatchObject({
+        status: 'running',
+        state: { pid: 987_654_321, httpPort: port },
+      });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('keeps a hidden PID with no authenticated control answer as not running', async () => {
+    tmpHomeDir = await createTempDir('happier-daemon-inspect-pid-dead-');
+    envScope.patch({ HAPPIER_HOME_DIR: tmpHomeDir });
+    reloadConfiguration();
+    const server = http.createServer((_req, res) => {
+      res.statusCode = 200;
+      res.end('{}');
+    });
+    const { port } = await listen(server);
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    writeDaemonState({
+      pid: 987_654_321,
+      httpPort: port,
+      startedAt: Date.now(),
+      startedWithCliVersion: 'test',
+      controlToken: 'test-token',
+    });
+
+    await expect(controlClient.inspectDaemonRunningStateAndCleanupStaleState()).resolves.toEqual({ status: 'not-running' });
+  });
+
   it('does not manufacture a wall-clock abort signal for lifecycle-owned local requests', async () => {
     const server = http.createServer((_req, res) => {
       res.statusCode = 200;

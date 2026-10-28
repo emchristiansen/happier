@@ -2,7 +2,7 @@ import * as React from 'react';
 import { Pressable, View } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
-import type { SessionAgentTransitionBriefPreviewV1 } from '@happier-dev/protocol';
+import type { BackendTargetRefV1, SessionAgentTransitionBriefPreviewV1 } from '@happier-dev/protocol';
 
 import { announceAccessibilityMessage } from '@/components/ui/accessibility/announceAccessibilityMessage';
 import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
@@ -41,6 +41,8 @@ export type AgentTransitionHandedOverContextModalProps = CustomModalInjectedProp
     /** The boundary's two Agents, exactly as the divider records them. */
     sourceAgentId: string;
     targetAgentId: string;
+    sourceBackendTarget?: BackendTargetRefV1;
+    targetBackendTarget?: BackendTargetRefV1;
     /** Scrolls this Session's transcript to the last message the brief could include. */
     onJumpToCutoff: (() => void) | null;
 }>;
@@ -73,6 +75,8 @@ export function AgentTransitionHandedOverContextModal(
         sourceAgentId,
         sourceCutoffSeqInclusive,
         targetAgentId,
+        sourceBackendTarget,
+        targetBackendTarget,
     } = props;
     const [attempt, setAttempt] = React.useState(0);
     const [state, setState] = React.useState<HandedOverContextState>({ kind: 'loading' });
@@ -94,6 +98,8 @@ export function AgentTransitionHandedOverContextModal(
             returningAgentLastSeenSeqInclusive,
             sourceAgentId,
             targetAgentId,
+            ...(sourceBackendTarget ? { sourceBackendTarget } : {}),
+            ...(targetBackendTarget ? { targetBackendTarget } : {}),
         })
             .catch((): SessionAgentTransitionBriefPreviewQueryV1 => ({ status: 'indeterminate' }))
             .then((query) => {
@@ -112,6 +118,8 @@ export function AgentTransitionHandedOverContextModal(
         sourceAgentId,
         sourceCutoffSeqInclusive,
         targetAgentId,
+        sourceBackendTarget,
+        targetBackendTarget,
     ]);
 
     const retry = React.useCallback(() => setAttempt((value) => value + 1), []);

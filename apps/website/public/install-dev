@@ -4,6 +4,7 @@ set -euo pipefail
 CHANNEL="${HAPPIER_CHANNEL:-dev}"
 PRODUCT="${HAPPIER_PRODUCT:-cli}"
 INSTALL_DIR="${HAPPIER_INSTALL_DIR:-$HOME/.happier}"
+STATE_HOME_DIR="${HAPPIER_HOME_DIR:-${INSTALL_DIR}}"
 BIN_DIR="${HAPPIER_BIN_DIR:-$HOME/.local/bin}"
 WITH_DAEMON="${HAPPIER_WITH_DAEMON-}"
 WITH_DAEMON_EXPLICIT=0
@@ -52,7 +53,12 @@ if supports_color; then
   COLOR_DIM=$'\033[2m'
   COLOR_GREEN=$'\033[32m'
   COLOR_YELLOW=$'\033[33m'
-  COLOR_CYAN=$'\033[36m'
+  COLOR_RED=$'\033[31m'
+  if [[ "${COLORTERM:-}" == "truecolor" || "${COLORTERM:-}" == "24bit" ]]; then
+    COLOR_GOLD=$'\033[38;2;214;162;74m'
+  else
+    COLOR_GOLD=$'\033[38;5;179m'
+  fi
   COLOR_ART_YELLOW=$'\033[93m'
   COLOR_ART_RED=$'\033[91m'
   COLOR_ART_MAGENTA=$'\033[95m'
@@ -64,7 +70,8 @@ else
   COLOR_DIM=""
   COLOR_GREEN=""
   COLOR_YELLOW=""
-  COLOR_CYAN=""
+  COLOR_RED=""
+  COLOR_GOLD=""
   COLOR_ART_YELLOW=""
   COLOR_ART_RED=""
   COLOR_ART_MAGENTA=""
@@ -77,7 +84,7 @@ say() {
 }
 
 info() {
-  say "${COLOR_CYAN}$*${COLOR_RESET}"
+  say "${COLOR_GOLD}•${COLOR_RESET} $*"
 }
 
 success() {
@@ -125,37 +132,74 @@ installer_terminal_is_wide() {
   if [[ ! "${columns}" =~ ^[0-9]+$ ]] || [[ "${columns}" == "0" ]]; then
     columns="80"
   fi
-  [[ "${columns:-0}" =~ ^[0-9]+$ ]] && [[ "${columns}" -ge 58 ]]
+  [[ "${columns:-0}" =~ ^[0-9]+$ ]] && [[ "${columns}" -ge 76 ]]
 }
 
 INSTALLER_WELCOME_SHOWN="0"
+# BEGIN GENERATED PLANET
 HAPPIER_INSTALLER_ART_ROWS=(
-  '          3443'
-  '       343333334'
-  '     433221112334'
-  '    43211000112334'
-  '    32100000011233'
-  '    32100000112334'
-  '     321111223344'
-  '       33223344'
-  '          3344'
+  '            ⠁⠄⠁⠄⠁⠄⠁         '
+  '        ⠁⠄⠅⢅⢕⢅⣕⢅⢕⢅⢅⢅⠅⠄⠁     '
+  '      ⠁⠄⢕⢵⣿⣿⣿⣟⣿⣿⣿⣽⣿⣵⣵⢅⠅⠄⠁   '
+  '      ⠁⠕⢜⣵⣿⣿⣽⣿⣿⣿⣿⣟⢿⣿⣿⣿⢷⢅⠅⠄⠁ '
+  '      ⠁⢕⢝⢵⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢷⢕⠅⠁⠄'
+  '      ⠁⠅⢝⢽⢿⣿⣟⣽⣿⣽⣿⣿⣿⣽⣷⣿⣟⣿⣟⢅⠅⠄'
+  '      ⠁⠅⠕⢭⢿⣿⣿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢕⠅⠅'
+  '        ⠁⢑⢉⢽⢷⣷⣿⢿⣿⣿⣿⣿⣿⣽⣿⣿⢟⠅⠅⠄'
+  '        ⠁⠅⠕⢙⢽⢽⢿⣿⣿⣿⣿⣿⣿⣟⣿⢟⠕⠅⠁ '
+  '          ⠁⠅⠜⢝⢝⢽⢿⣿⣿⣿⣿⢟⠝⠅⠁⠅⠁ '
+  '            ⠁⠁⠑⠕⠕⠝⠝⠝⠕⠅⠁⠅⠁ ⠁ '
+  '                ⠁⠁⠁⠁⠁ ⠁     '
+  '                            '
 )
+HAPPIER_INSTALLER_ART_RGB_ROWS=(
+  $'            \033[38;2;143;109;59m⠁\033[38;2;158;120;63m⠄\033[38;2;144;110;59m⠁\033[38;2;157;120;63m⠄\033[38;2;143;109;59m⠁\033[38;2;152;116;61m⠄\033[38;2;139;106;58m⠁         \033[0m'
+  $'        \033[38;2;153;114;63m⠁\033[38;2;182;130;73m⠄\033[38;2;181;134;71m⠅\033[38;2;206;151;78m⢅\033[38;2;211;157;78m⢕\033[38;2;216;173;92m⢅\033[38;2;222;172;89m⣕\033[38;2;216;162;79m⢅\033[38;2;203;153;76m⢕\033[38;2;198;149;74m⢅\033[38;2;186;140;71m⢅\033[38;2;175;132;68m⢅\033[38;2;160;121;64m⠅\033[38;2;158;120;63m⠄\033[38;2;141;108;58m⠁     \033[0m'
+  $'      \033[38;2;160;103;71m⠁\033[38;2;203;123;87m⠄\033[38;2;199;137;87m⢕\033[38;2;184;158;101m⢵\033[38;2;220;194;121m⣿\033[38;2;239;220;139m⣿\033[38;2;252;232;145m⣿⣟\033[38;2;254;234;145m⣿\033[38;2;253;232;144m⣿\033[38;2;255;232;142m⣿\033[38;2;253;222;132m⣽\033[38;2;247;209;118m⣿\033[38;2;241;198;108m⣵\033[38;2;223;171;87m⣵\033[38;2;196;147;74m⢅\033[38;2;172;130;67m⠅\033[38;2;165;125;65m⠄\033[38;2;144;110;59m⠁   \033[0m'
+  $'      \033[38;2;203;113;91m⠁\033[38;2;76;63;41m⠕\033[38;2;149;118;64m⢜\033[38;2;188;148;74m⣵\033[38;2;230;187;95m⣿\033[38;2;247;205;105m⣿\033[38;2;253;214;111m⣽\033[38;2;255;221;119m⣿\033[38;2;255;225;124m⣿\033[38;2;255;227;129m⣿\033[38;2;255;229;134m⣿\033[38;2;255;231;137m⣟\033[38;2;255;233;142m⢿\033[38;2;255;232;140m⣿\033[38;2;254;228;137m⣿\033[38;2;248;207;116m⣿\033[38;2;222;164;82m⢷\033[38;2;194;145;73m⢅\033[38;2;170;129;66m⠅\033[38;2;159;121;63m⠄\033[38;2;142;108;58m⠁ \033[0m'
+  $'      \033[38;2;39;31;28m⠁\033[38;2;92;58;38m⢕\033[38;2;143;90;48m⢝\033[38;2;188;116;54m⢵\033[38;2;211;134;59m⣿\033[38;2;237;155;64m⣿\033[38;2;250;169;68m⣿\033[38;2;251;175;69m⣿\033[38;2;254;182;71m⣿\033[38;2;253;186;75m⣿\033[38;2;255;192;79m⣿\033[38;2;255;196;82m⣿\033[38;2;255;200;87m⣿\033[38;2;255;204;92m⣿\033[38;2;255;208;97m⣿\033[38;2;255;211;103m⣿\033[38;2;254;207;106m⣿\033[38;2;231;165;92m⢷\033[38;2;192;135;76m⢕\033[38;2;171;124;69m⠅\033[38;2;152;116;62m⠁\033[38;2;144;107;60m⠄\033[0m'
+  $'      \033[38;2;38;27;28m⠁\033[38;2;69;38;35m⠅\033[38;2;125;59;46m⢝\033[38;2;168;77;52m⢽\033[38;2;201;94;55m⢿\033[38;2;220;104;56m⣿\033[38;2;241;118;56m⣟\033[38;2;245;124;54m⣽\033[38;2;245;129;53m⣿\033[38;2;248;134;54m⣽\033[38;2;248;139;54m⣿\033[38;2;249;145;55m⣿\033[38;2;249;149;56m⣿\033[38;2;253;155;58m⣽\033[38;2;253;159;60m⣷\033[38;2;254;168;66m⣿\033[38;2;254;178;74m⣟\033[38;2;253;186;91m⣿\033[38;2;212;133;88m⣟\033[38;2;179;115;77m⢅\033[38;2;159;107;69m⠅\033[38;2;145;97;64m⠄\033[0m'
+  $'      \033[38;2;26;21;27m⠁\033[38;2;44;25;36m⠅\033[38;2;79;34;49m⠕\033[38;2;113;43;63m⢭\033[38;2;150;53;72m⢿\033[38;2;175;61;78m⣿\033[38;2;196;69;78m⣿\033[38;2;214;77;74m⢿\033[38;2;219;80;73m⣿\033[38;2;224;84;69m⣿\033[38;2;224;87;66m⣿\033[38;2;228;92;63m⣿\033[38;2;233;97;61m⣿\033[38;2;237;103;60m⣿\033[38;2;240;109;59m⣿\033[38;2;242;117;60m⣿\033[38;2;245;130;64m⣿\033[38;2;249;155;78m⣿\033[38;2;214;117;95m⣿\033[38;2;176;101;81m⢕\033[38;2;158;95;73m⠅\033[38;2;143;88;67m⠅\033[0m'
+  $'        \033[38;2;38;25;44m⠁\033[38;2;47;31;65m⢑\033[38;2;74;37;82m⢉\033[38;2;83;40;99m⢽\033[38;2;93;42;108m⢷\033[38;2;104;45;115m⣷\033[38;2;126;48;114m⣿\033[38;2;145;50;106m⢿\033[38;2;150;51;106m⣿\033[38;2;160;53;101m⣿\033[38;2;168;56;97m⣿\033[38;2;179;60;94m⣿\033[38;2;188;66;91m⣿\033[38;2;195;75;89m⣽\033[38;2;210;92;89m⣿\033[38;2;227;127;97m⣿\033[38;2;198;93;96m⢟\033[38;2;172;86;85m⠅\033[38;2;150;78;75m⠅\033[38;2;134;70;69m⠄\033[0m'
+  $'        \033[38;2;20;23;34m⠁\033[38;2;22;28;46m⠅\033[38;2;26;39;75m⠕\033[38;2;32;50;106m⢙\033[38;2;33;57;126m⢽\033[38;2;36;65;149m⢽\033[38;2;38;65;157m⢿\033[38;2;42;70;171m⣿\033[38;2;47;67;169m⣿\033[38;2;54;65;166m⣿\033[38;2;61;61;159m⣿\033[38;2;72;60;151m⣿\033[38;2;85;61;143m⣿\033[38;2;106;68;135m⣟\033[38;2;147;89;125m⣿\033[38;2;190;95;108m⢟\033[38;2;170;69;92m⠕\033[38;2;151;64;82m⠅\033[38;2;140;65;74m⠁ \033[0m'
+  $'          \033[38;2;21;28;44m⠁\033[38;2;22;32;54m⠅\033[38;2;25;47;87m⠜\033[38;2;26;56;108m⢝\033[38;2;28;68;136m⢝\033[38;2;30;76;152m⢽\033[38;2;33;88;178m⢿\033[38;2;35;91;185m⣿\033[38;2;38;95;191m⣿\033[38;2;45;99;191m⣿\033[38;2;61;106;185m⣿\033[38;2;91;106;165m⢟\033[38;2;143;86;125m⠝\033[38;2;137;65;103m⠅\033[38;2;136;61;91m⠁\033[38;2;116;54;81m⠅\033[38;2;119;52;75m⠁ \033[0m'
+  $'            \033[38;2;18;23;38m⠁\033[38;2;17;28;55m⠁\033[38;2;17;32;68m⠑\033[38;2;17;34;75m⠕\033[38;2;18;41;92m⠕\033[38;2;22;52;115m⠝\033[38;2;31;64;126m⠝\033[38;2;74;80;147m⠝\033[38;2;89;78;129m⠕\033[38;2;98;63;118m⠅\033[38;2;104;61;108m⠁\033[38;2;89;54;95m⠅\033[38;2;94;53;88m⠁ \033[38;2;91;49;77m⠁ \033[0m'
+  $'                \033[38;2;53;68;156m⠁\033[38;2;57;65;146m⠁\033[38;2;60;62;134m⠁\033[38;2;61;59;123m⠁\033[38;2;62;55;113m⠁ \033[38;2;64;51;98m⠁     \033[0m'
+  $'                            \033[0m'
+)
+# END GENERATED PLANET
 
 print_installer_welcome() {
   INSTALLER_WELCOME_SHOWN="1"
   if installer_has_tty_output && [[ "${TERM:-}" != "dumb" ]] && installer_terminal_is_wide; then
-    printf '%s%-24s%s    %sHappier%s\n' "${COLOR_ART_YELLOW}" "${HAPPIER_INSTALLER_ART_ROWS[0]}" "${COLOR_RESET}" "${COLOR_BOLD}" "${COLOR_RESET}"
-    printf '%s%-24s%s    Secure installer\n' "${COLOR_ART_YELLOW}" "${HAPPIER_INSTALLER_ART_ROWS[1]}" "${COLOR_RESET}"
-    printf '%s%-24s%s    Download -> Verify -> Install\n' "${COLOR_ART_RED}" "${HAPPIER_INSTALLER_ART_ROWS[2]}" "${COLOR_RESET}"
-    printf '%s%-24s%s\n' "${COLOR_ART_RED}" "${HAPPIER_INSTALLER_ART_ROWS[3]}" "${COLOR_RESET}"
-    printf '%s%-24s%s\n' "${COLOR_ART_MAGENTA}" "${HAPPIER_INSTALLER_ART_ROWS[4]}" "${COLOR_RESET}"
-    printf '%s%-24s%s\n' "${COLOR_ART_MAGENTA}" "${HAPPIER_INSTALLER_ART_ROWS[5]}" "${COLOR_RESET}"
-    printf '%s%-24s%s\n' "${COLOR_ART_CYAN}" "${HAPPIER_INSTALLER_ART_ROWS[6]}" "${COLOR_RESET}"
-    printf '%s%-24s%s\n' "${COLOR_ART_CYAN}" "${HAPPIER_INSTALLER_ART_ROWS[7]}" "${COLOR_RESET}"
-    printf '%s%-24s%s\n' "${COLOR_ART_BLUE}" "${HAPPIER_INSTALLER_ART_ROWS[8]}" "${COLOR_RESET}"
+    local index=0
+    local center=$(( (${#HAPPIER_INSTALLER_ART_ROWS[@]} - 1) / 2 ))
+    local row_color=""
+    for ((index=0; index<${#HAPPIER_INSTALLER_ART_ROWS[@]}; index++)); do
+      case $(( index * 5 / ${#HAPPIER_INSTALLER_ART_ROWS[@]} )) in
+        0) row_color="${COLOR_ART_YELLOW}" ;;
+        1) row_color="${COLOR_ART_RED}" ;;
+        2) row_color="${COLOR_ART_MAGENTA}" ;;
+        3) row_color="${COLOR_ART_CYAN}" ;;
+        *) row_color="${COLOR_ART_BLUE}" ;;
+      esac
+      if supports_color && [[ "${COLORTERM:-}" == "truecolor" || "${COLORTERM:-}" == "24bit" ]]; then
+        printf '%s' "${HAPPIER_INSTALLER_ART_RGB_ROWS[index]}"
+      else
+        printf '%s%s%s' "${row_color}" "${HAPPIER_INSTALLER_ART_ROWS[index]}" "${COLOR_RESET}"
+      fi
+      if [[ "${index}" -eq $((center - 1)) ]]; then
+        printf '   %sHappier%s' "${COLOR_BOLD}" "${COLOR_RESET}"
+      elif [[ "${index}" -eq "${center}" ]]; then
+        printf '   Start coding anywhere. Continue anywhere.'
+      elif [[ "${index}" -eq $((center + 2)) ]]; then
+        printf '   Download -> Verify -> Install'
+      fi
+      printf '\n'
+    done
   else
     say "${COLOR_BOLD}Happier${COLOR_RESET}"
-    say "Secure installer"
+    say "Start coding anywhere. Continue anywhere."
     say "Download -> Verify -> Install"
   fi
   echo
@@ -166,7 +210,7 @@ installer_phase() {
 }
 
 installer_step_pending_symbol() {
-  printf '%s' "${COLOR_CYAN}..${COLOR_RESET}"
+  printf '%s' '..'
 }
 
 installer_step_success_symbol() {
@@ -174,39 +218,83 @@ installer_step_success_symbol() {
 }
 
 installer_step_failure_symbol() {
-  printf '%s' "${COLOR_YELLOW}x${COLOR_RESET}"
+  printf '%s' "${COLOR_RED}x${COLOR_RESET}"
+}
+
+# Step rows match the CLI step printer (packages/cli-common/src/output/progress.ts):
+# a gold Braille spinner while the step runs, then "✓ label  1.2s" or a red "x label".
+# Without an animating terminal they stay plain "- [..]" / "- [✓]" lines.
+INSTALLER_SPINNER_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+
+# Tenths of a second. bash < 5 (macOS /bin/bash) has no EPOCHREALTIME, so it counts whole seconds.
+installer_now_tenths() {
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    local whole="${EPOCHREALTIME%[.,]*}"
+    local fraction="${EPOCHREALTIME#*[.,]}"
+    printf '%s' "$((whole * 10 + 10#${fraction:0:1}))"
+    return 0
+  fi
+  printf '%s' "$((SECONDS * 10))"
+}
+
+installer_step_elapsed() {
+  local tenths=$(($(installer_now_tenths) - $1))
+  printf '  %s%s.%ss%s' "${COLOR_DIM}" "$((tenths / 10))" "$((tenths % 10))" "${COLOR_RESET}"
+}
+
+# Launch in the caller shell so printf -v assigns its PID variable on Bash 3.2 too.
+# Monitor mode gives the background step its own group without changing later CLI handoff.
+installer_start_step_group() {
+  local result_var="$1"
+  shift
+  set -m
+  "$@" &
+  local process_group_pid=$!
+  set +m
+  printf -v "${result_var}" '%s' "${process_group_pid}"
+}
+
+# Each step has its own process group. Background descendants can preserve ignored SIGINT
+# (macOS curl does), so Ctrl-C cancels the whole step group with SIGTERM. Callers clear
+# the trap (trap - INT) once the step has finished.
+installer_stop_step_on_interrupt() {
+  trap "kill -TERM -- -$1 2>/dev/null || true; printf '\\n' >&2; exit 130" INT
+}
+
+# Animates a background step until it exits, then prints its outcome row and returns its status.
+installer_animate_step() {
+  local label="$1"
+  local step_pid="$2"
+  local started="$3"
+  local frame_index=0
+  installer_stop_step_on_interrupt "${step_pid}"
+  while kill -0 "${step_pid}" 2>/dev/null; do
+    local frame="${INSTALLER_SPINNER_FRAMES[$((frame_index % ${#INSTALLER_SPINNER_FRAMES[@]}))]}"
+    printf '\r\033[2K%s %s' "${COLOR_GOLD}${frame}${COLOR_RESET}" "${label}" >&2
+    frame_index=$((frame_index + 1))
+    sleep 0.08
+  done
+
+  local status=0
+  wait "${step_pid}" || status=$?
+  trap - INT
+  if [[ "${status}" -eq 0 ]]; then
+    printf '\r\033[2K%s %s%s\n' "$(installer_step_success_symbol)" "${label}" "$(installer_step_elapsed "${started}")" >&2
+  else
+    printf '\r\033[2K%s %s\n' "$(installer_step_failure_symbol)" "${label}" >&2
+  fi
+  return "${status}"
+}
+
+# Successful steps suppress tool chatter, but recovery warnings remain visible.
+replay_installer_step_warnings() {
+  sed -n '/^WARNING: /p' "$1" >&2
 }
 
 run_installer_step() {
   local label="$1"
   shift
 
-  if ! installer_should_animate; then
-    local tmp_output=""
-    if [[ -n "${TMP_DIR:-}" ]]; then
-      tmp_output="${TMP_DIR}/installer-step.$$.log"
-    else
-      tmp_output="$(mktemp)"
-    fi
-    say "- [..] ${label}"
-    if "$@" >"${tmp_output}" 2>&1; then
-      say "- [ok] ${label}"
-      if [[ "${VERBOSE_MODE}" == "1" ]] && [[ -s "${tmp_output}" ]]; then
-        cat "${tmp_output}"
-      fi
-      rm -f "${tmp_output}" >/dev/null 2>&1 || true
-      return 0
-    fi
-    say "- [x] ${label}"
-    if [[ -s "${tmp_output}" ]]; then
-      cat "${tmp_output}" >&2
-    fi
-    rm -f "${tmp_output}" >/dev/null 2>&1 || true
-    return 1
-  fi
-
-  local spinner_frames=('|' '/' '-' '\')
-  local frame_index=0
   local tmp_output=""
   if [[ -n "${TMP_DIR:-}" ]]; then
     tmp_output="${TMP_DIR}/installer-step.$$.log"
@@ -214,32 +302,38 @@ run_installer_step() {
     tmp_output="$(mktemp)"
   fi
 
-  "$@" >"${tmp_output}" 2>&1 &
-  local step_pid=$!
-
-  while kill -0 "${step_pid}" 2>/dev/null; do
-    local frame="${spinner_frames[$((frame_index % ${#spinner_frames[@]}))]}"
-    printf '\r- [%s] %s' "${COLOR_CYAN}${frame}${COLOR_RESET}" "${label}" >&2
-    frame_index=$((frame_index + 1))
-    sleep 0.12
-  done
-
   local status=0
-  if wait "${step_pid}"; then
-    status=0
+  if installer_should_animate; then
+    local started
+    started="$(installer_now_tenths)"
+    local step_pid
+    installer_start_step_group step_pid "$@" >"${tmp_output}" 2>&1
+    installer_animate_step "${label}" "${step_pid}" "${started}" || status=$?
   else
-    status=$?
+    say "- [$(installer_step_pending_symbol)] ${label}"
+    # A job, not "$@" || …: errexit is ignored inside a command tested by ||/if, so a failing
+    # command in the step (a rejected signature) would not fail it. The animated path does the same.
+    local step_pid
+    installer_start_step_group step_pid "$@" >"${tmp_output}" 2>&1
+    installer_stop_step_on_interrupt "${step_pid}"
+    wait "${step_pid}" || status=$?
+    trap - INT
+    if [[ "${status}" -eq 0 ]]; then
+      say "- [$(installer_step_success_symbol)] ${label}"
+    else
+      say "- [$(installer_step_failure_symbol)] ${label}"
+    fi
   fi
+
   if [[ "${status}" -eq 0 ]]; then
-    printf '\r- [%s] %s\n' "$(installer_step_success_symbol)" "${label}" >&2
     if [[ "${VERBOSE_MODE}" == "1" ]] && [[ -s "${tmp_output}" ]]; then
       cat "${tmp_output}"
+    else
+      replay_installer_step_warnings "${tmp_output}"
     fi
     rm -f "${tmp_output}" >/dev/null 2>&1 || true
     return 0
   fi
-
-  printf '\r- [%s] %s\n' "$(installer_step_failure_symbol)" "${label}" >&2
   if [[ -s "${tmp_output}" ]]; then
     cat "${tmp_output}" >&2
   fi
@@ -262,47 +356,37 @@ capture_installer_step_output() {
     tmp_error="$(mktemp)"
   fi
 
-  if ! installer_should_animate; then
-    say "- [..] ${label}"
-    if "$@" >"${tmp_output}" 2>"${tmp_error}"; then
-      say "- [ok] ${label}"
-      printf -v "${__resultvar}" '%s' "$(cat "${tmp_output}")"
-      if [[ "${VERBOSE_MODE}" == "1" ]] && [[ -s "${tmp_error}" ]]; then
-        cat "${tmp_error}" >&2
-      fi
-      rm -f "${tmp_output}" "${tmp_error}" >/dev/null 2>&1 || true
-      return 0
+  local status=0
+  if installer_should_animate; then
+    local started
+    started="$(installer_now_tenths)"
+    local step_pid
+    installer_start_step_group step_pid "$@" >"${tmp_output}" 2>"${tmp_error}"
+    installer_animate_step "${label}" "${step_pid}" "${started}" || status=$?
+  else
+    say "- [$(installer_step_pending_symbol)] ${label}"
+    local step_pid
+    installer_start_step_group step_pid "$@" >"${tmp_output}" 2>"${tmp_error}"
+    installer_stop_step_on_interrupt "${step_pid}"
+    wait "${step_pid}" || status=$?
+    trap - INT
+    if [[ "${status}" -eq 0 ]]; then
+      say "- [$(installer_step_success_symbol)] ${label}"
+    else
+      say "- [$(installer_step_failure_symbol)] ${label}" >&2
     fi
-    say "- [x] ${label}" >&2
-    cat "${tmp_error}" >&2
-    rm -f "${tmp_output}" "${tmp_error}" >/dev/null 2>&1 || true
-    return 1
   fi
 
-  local spinner_frames=('|' '/' '-' '\')
-  local frame_index=0
-
-  "$@" >"${tmp_output}" 2>"${tmp_error}" &
-  local step_pid=$!
-
-  while kill -0 "${step_pid}" 2>/dev/null; do
-    local frame="${spinner_frames[$((frame_index % ${#spinner_frames[@]}))]}"
-    printf '\r- [%s] %s' "${COLOR_CYAN}${frame}${COLOR_RESET}" "${label}" >&2
-    frame_index=$((frame_index + 1))
-    sleep 0.12
-  done
-
-  if wait "${step_pid}"; then
-    printf '\r- [%s] %s\n' "$(installer_step_success_symbol)" "${label}" >&2
+  if [[ "${status}" -eq 0 ]]; then
     printf -v "${__resultvar}" '%s' "$(cat "${tmp_output}")"
     if [[ "${VERBOSE_MODE}" == "1" ]] && [[ -s "${tmp_error}" ]]; then
       cat "${tmp_error}" >&2
+    else
+      replay_installer_step_warnings "${tmp_error}"
     fi
     rm -f "${tmp_output}" "${tmp_error}" >/dev/null 2>&1 || true
     return 0
   fi
-
-  printf '\r- [%s] %s\n' "$(installer_step_failure_symbol)" "${label}" >&2
   if [[ -s "${tmp_error}" ]]; then
     cat "${tmp_error}" >&2
   fi
@@ -416,8 +500,9 @@ json_lookup_asset_url() {
       matched="${url}"
       matched_sort_key="${sort_key}"
     fi
-  done < <(printf '%s' "$json" | tr '{},' '\n\n\n' | awk -v re="$name_regex" '
+  done < <(printf '%s' "$json" | tr '{},' '\n\n\n' | HAPPIER_INSTALLER_AWK_ASSET_REGEX="$name_regex" awk '
     BEGIN {
+      re = ENVIRON["HAPPIER_INSTALLER_AWK_ASSET_REGEX"]
       in_assets = 0
       name = ""
     }
@@ -520,6 +605,33 @@ validate_requested_install_version() {
     return 1
   fi
   return 0
+}
+
+# Only rejected credentials trigger anonymous fallback. Buffer each response so a
+# failed transfer cannot leave partial metadata in the caller's next retry.
+curl_auth() {
+  local response=""
+  local status=0
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    if response="$(curl -fsSL --show-error --write-out $'\n%{http_code}' \
+      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      "$@")"; then
+      printf '%s' "${response%$'\n'*}"
+      return 0
+    else
+      status=$?
+    fi
+    if [[ "${response##*$'\n'}" != "401" ]]; then
+      return "${status}"
+    fi
+    echo "WARNING: GitHub rejected GITHUB_TOKEN/HAPPIER_GITHUB_TOKEN (401); retrying without the token..." >&2
+  fi
+  if response="$(curl -fsSL --show-error "$@")"; then
+    printf '%s' "${response}"
+  else
+    return $?
+  fi
 }
 
 fetch_release_metadata_with_retry() {
@@ -1111,10 +1223,9 @@ invoke_installer_command_with_daemon_service_context() {
   local channel_label=""
   channel_label="$(display_channel_label "${CHANNEL}")"
   local installer_strategy="${HAPPIER_INSTALLER_DAEMON_SERVICE_STRATEGY:-}"
-  local state_home_dir="${HAPPIER_HOME_DIR:-${INSTALL_DIR}}"
 
   local -a env_cmd=(env
-    "HAPPIER_HOME_DIR=${state_home_dir}"
+    "HAPPIER_HOME_DIR=${STATE_HOME_DIR}"
     "HAPPIER_PUBLIC_RELEASE_CHANNEL=${channel_label}"
     "HAPPIER_DAEMON_SERVICE_CHANNEL=${channel_label}"
     ${installer_strategy:+"HAPPIER_INSTALLER_DAEMON_SERVICE_STRATEGY=${installer_strategy}"}
@@ -1225,7 +1336,7 @@ run_background_service_install_compatibly() {
     install_output="$(cat "${tmp_output}" 2>/dev/null || true)"
   fi
 
-  printf '%s' "${install_output}" >&2
+  printf '%s\n' "${install_output}" >&2
   rm -f "${tmp_output}" >/dev/null 2>&1 || true
   return 1
 }
@@ -1461,9 +1572,8 @@ installer_has_controlling_tty() {
   if [[ ! -t 0 && ! -t 1 && ! -t 2 ]]; then
     return 1
   fi
-  if exec 3<>/dev/tty 2>/dev/null; then
-    exec 3>&-
-    exec 3<&-
+  # Keep the probe's descriptors and stderr redirection out of the parent shell.
+  if (exec 3<>/dev/tty) 2>/dev/null; then
     return 0
   fi
   return 1
@@ -1558,6 +1668,14 @@ resolve_existing_background_service_install_strategy() {
 resolve_release_tag() {
   local product="$1"
   local channel="$2"
+  local version="${3:-}"
+  if [[ -n "${version}" ]]; then
+    case "${product}" in
+      cli|server|stack) echo "${product}-v${version}" ;;
+      *) return 1 ;;
+    esac
+    return
+  fi
   local suffix=""
   suffix="$(rolling_suffix_for_channel "${channel}")" || return 1
   case "${product}" in
@@ -1625,39 +1743,29 @@ action_version() {
   local tag=""
   local default_version_regex=""
   default_version_regex="$(default_release_asset_version_regex "${CHANNEL}")"
-  local asset_regex="^happier-v${default_version_regex}-${os}-${arch}[.]tar[.]gz$"
   local version_prefix="happier-v"
+  local checksums_prefix="checksums-happier-v"
   if [[ "${PRODUCT}" == "server" ]]; then
-    asset_regex="^happier-server-v${default_version_regex}-${os}-${arch}[.]tar[.]gz$"
     version_prefix="happier-server-v"
+    checksums_prefix="checksums-happier-server-v"
   fi
   if [[ "${PRODUCT}" == "stack" ]]; then
-    asset_regex="^hstack-v${default_version_regex}-${os}-${arch}[.]tar[.]gz$"
     version_prefix="hstack-v"
+    checksums_prefix="checksums-hstack-v"
   fi
+  local checksums_regex="^${checksums_prefix}${default_version_regex}[.]txt$"
   if [[ -n "${INSTALL_VERSION}" ]]; then
     local requested_version_regex=""
     requested_version_regex="$(escape_regex_literal "${INSTALL_VERSION}")"
-    asset_regex="^${version_prefix}${requested_version_regex}-${os}-${arch}[.]tar[.]gz$"
+    checksums_regex="^${checksums_prefix}${requested_version_regex}[.]txt$"
   fi
-  tag="$(resolve_release_tag "${PRODUCT}" "${CHANNEL}")" || {
+  tag="$(resolve_release_tag "${PRODUCT}" "${CHANNEL}" "${INSTALL_VERSION}")" || {
     echo "Unsupported product/channel combination: ${PRODUCT}/${CHANNEL}" >&2
     return 1
   }
 
   local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${tag}"
   info "Fetching ${tag} release metadata..."
-  curl_auth() {
-    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-      curl -fsSL \
-        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        "$@"
-      return
-    fi
-    curl -fsSL "$@"
-  }
-
   local release_json=""
   if [[ -z "${RELEASE_ASSETS_DIR}" ]]; then
     if ! release_json="$(fetch_release_metadata_with_retry "${api_url}")"; then
@@ -1665,19 +1773,35 @@ action_version() {
       return 1
     fi
   fi
-  local asset_source=""
-  asset_source="$(resolve_release_asset_source "${release_json}" "${asset_regex}" || true)"
-  if [[ -z "${asset_source}" ]]; then
+  local checksums_source=""
+  checksums_source="$(resolve_release_asset_source "${release_json}" "${checksums_regex}" || true)"
+  if [[ -z "${checksums_source}" ]]; then
     echo "Unable to locate release assets for ${os}-${arch} on tag ${tag}." >&2
     return 1
   fi
-  local asset_name=""
-  asset_name="$(basename "${asset_source}")"
+  local checksums_name=""
+  checksums_name="$(basename "${checksums_source}")"
   local version=""
-  version="${asset_name#${version_prefix}}"
-  version="${version%-${os}-${arch}.tar.gz}"
-  if [[ -z "${version}" || "${version}" == "${asset_name}" ]]; then
-    echo "Failed to infer release version from asset name: ${asset_name}" >&2
+  version="${checksums_name#"${checksums_prefix}"}"
+  version="${version%.txt}"
+  if [[ -z "${version}" || "${version}" == "${checksums_name}" ]]; then
+    echo "Failed to infer release version from checksum asset: ${checksums_name}" >&2
+    return 1
+  fi
+  local version_regex=""
+  version_regex="$(escape_regex_literal "${version}")"
+  local versioned_asset_regex="^${version_prefix}${version_regex}-${os}-${arch}[.]tar[.]gz$"
+  local asset_source=""
+  if [[ -z "${INSTALL_VERSION}" && ( "${CHANNEL}" == "stable" || "${CHANNEL}" == "preview" ) ]]; then
+    local rolling_prefix="${version_prefix%v}"
+    local rolling_asset_regex="^${rolling_prefix}${os}-${arch}[.]tar[.]gz$"
+    asset_source="$(resolve_release_asset_source "${release_json}" "${rolling_asset_regex}" || true)"
+  fi
+  if [[ -z "${asset_source}" ]]; then
+    asset_source="$(resolve_release_asset_source "${release_json}" "${versioned_asset_regex}" || true)"
+  fi
+  if [[ -z "${asset_source}" ]]; then
+    echo "Unable to locate release assets for ${os}-${arch} on tag ${tag}." >&2
     return 1
   fi
 
@@ -2135,7 +2259,9 @@ print_post_install_get_started() {
   if [[ "${POST_INSTALL_SETUP_IS_DONE}" != "1" ]]; then
     printf '  %-20s %s\n' "${cli_name} setup" "Connect this computer and sign in"
   fi
-  printf '  %-20s %s\n' "${cli_name}" "Start a session"
+  say "  In the app, browser or phone: New session"
+  say "  Choose this computer and a project. Keep this computer running."
+  printf '  %-20s %s\n' "${cli_name}" "Start from this terminal"
   printf '  %-20s %s\n' "${cli_name} status" "Check this computer's connection"
 }
 
@@ -2207,18 +2333,20 @@ ensure_minisign() {
   local os="$(detect_os)"
   local asset=""
   local expected_sha=""
-  local url_base="https://github.com/jedisct1/minisign/releases/download/${minisign_version}"
 
   if [[ "${os}" == "linux" ]]; then
     asset="minisign-${minisign_version}-linux.tar.gz"
     expected_sha="9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73"
   elif [[ "${os}" == "darwin" ]]; then
+    # 0.12's macOS binary is arm64-only; 0.11 is universal (x86_64 + arm64).
+    minisign_version="0.11"
     asset="minisign-${minisign_version}-macos.zip"
-    expected_sha="89000b19535765f9cffc65a65d64a820f433ef6db8020667f7570e06bf6aac63"
+    expected_sha="e7c410ae8b8960d7087392472b040bda9b2f307c76df0384ac37f9ad103fc893"
   else
     return 1
   fi
 
+  local url_base="https://github.com/jedisct1/minisign/releases/download/${minisign_version}"
   local archive_path="${TMP_DIR}/${asset}"
   curl -fsSL "${url_base}/${asset}" -o "${archive_path}"
   local actual_sha
@@ -2294,9 +2422,9 @@ write_minisign_public_key() {
 
 verify_archive_checksum() {
   local expected_sha=""
-  expected_sha="$(grep -E "  $(basename "${ASSET_SOURCE}")$" "${CHECKSUMS_PATH}" | awk '{print $1}' | head -n 1)"
+  expected_sha="$(grep -F "  ${CHECKSUM_ASSET_NAME}" "${CHECKSUMS_PATH}" | awk '{print $1}' | head -n 1)"
   if [[ -z "${expected_sha}" ]]; then
-    echo "Failed to resolve checksum for $(basename "${ASSET_SOURCE}")" >&2
+    echo "Failed to resolve checksum for ${CHECKSUM_ASSET_NAME}" >&2
     return 1
   fi
   local actual_sha=""
@@ -2316,7 +2444,10 @@ verify_release_signature() {
     return 1
   fi
   write_minisign_public_key "${PUBKEY_PATH}"
-  "${MINISIGN_BIN}" -Vm "${CHECKSUMS_PATH}" -x "${SIG_PATH}" -p "${PUBKEY_PATH}" >/dev/null
+  if ! "${MINISIGN_BIN}" -Vm "${CHECKSUMS_PATH}" -x "${SIG_PATH}" -p "${PUBKEY_PATH}" >/dev/null; then
+    echo "minisign could not verify the release signature." >&2
+    return 1
+  fi
   say "minisign verification passed."
 }
 
@@ -2385,8 +2516,8 @@ append_path_hint() {
   local export_line="export PATH=\"${BIN_DIR}:\$PATH\""
   local home_export_line=""
   local default_install_dir="${HOME}/.happier"
-  if [[ "${INSTALL_DIR}" != "${default_install_dir}" ]]; then
-    home_export_line="export HAPPIER_HOME_DIR=\"${INSTALL_DIR}\""
+  if [[ "${STATE_HOME_DIR}" != "${default_install_dir}" ]]; then
+    home_export_line="export HAPPIER_HOME_DIR=\"${STATE_HOME_DIR}\""
   fi
   local rc_files=()
   case "${shell_name}" in
@@ -2467,7 +2598,6 @@ fi
 
 TAG=""
 DEFAULT_VERSION_REGEX="$(default_release_asset_version_regex "${CHANNEL}")"
-ASSET_REGEX="^happier-v${DEFAULT_VERSION_REGEX}-${OS}-${ARCH}[.]tar[.]gz$"
 CHECKSUMS_REGEX="^checksums-happier-v${DEFAULT_VERSION_REGEX}[.]txt$"
 SIG_REGEX="^checksums-happier-v${DEFAULT_VERSION_REGEX}[.]txt[.]minisig$"
 EXE_NAME="happier"
@@ -2476,7 +2606,6 @@ VERSION_PREFIX="happier-v"
 CHECKSUMS_PREFIX="checksums-happier-v"
 
 if [[ "${PRODUCT}" == "server" ]]; then
-  ASSET_REGEX="^happier-server-v${DEFAULT_VERSION_REGEX}-${OS}-${ARCH}[.]tar[.]gz$"
   CHECKSUMS_REGEX="^checksums-happier-server-v${DEFAULT_VERSION_REGEX}[.]txt$"
   SIG_REGEX="^checksums-happier-server-v${DEFAULT_VERSION_REGEX}[.]txt[.]minisig$"
   EXE_NAME="happier-server"
@@ -2486,7 +2615,6 @@ if [[ "${PRODUCT}" == "server" ]]; then
 fi
 
 if [[ "${PRODUCT}" == "stack" ]]; then
-  ASSET_REGEX="^hstack-v${DEFAULT_VERSION_REGEX}-${OS}-${ARCH}[.]tar[.]gz$"
   CHECKSUMS_REGEX="^checksums-hstack-v${DEFAULT_VERSION_REGEX}[.]txt$"
   SIG_REGEX="^checksums-hstack-v${DEFAULT_VERSION_REGEX}[.]txt[.]minisig$"
   EXE_NAME="hstack"
@@ -2497,12 +2625,11 @@ fi
 
 if [[ -n "${INSTALL_VERSION}" ]]; then
   REQUESTED_VERSION_REGEX="$(escape_regex_literal "${INSTALL_VERSION}")"
-  ASSET_REGEX="^${VERSION_PREFIX}${REQUESTED_VERSION_REGEX}-${OS}-${ARCH}[.]tar[.]gz$"
   CHECKSUMS_REGEX="^${CHECKSUMS_PREFIX}${REQUESTED_VERSION_REGEX}[.]txt$"
   SIG_REGEX="^${CHECKSUMS_PREFIX}${REQUESTED_VERSION_REGEX}[.]txt[.]minisig$"
 fi
 
-TAG="$(resolve_release_tag "${PRODUCT}" "${CHANNEL}")" || {
+TAG="$(resolve_release_tag "${PRODUCT}" "${CHANNEL}" "${INSTALL_VERSION}")" || {
   echo "Unsupported product/channel combination: ${PRODUCT}/${CHANNEL}" >&2
   exit 1
 }
@@ -2511,19 +2638,6 @@ print_installer_welcome
 installer_phase "Download"
 
 API_URL="https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${TAG}"
-curl_auth() {
-  local -a curl_args
-  curl_args=(-fsSL --show-error)
-  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    curl "${curl_args[@]}" \
-      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-      -H "X-GitHub-Api-Version: 2022-11-28" \
-      "$@"
-    return
-  fi
-  curl "${curl_args[@]}" "$@"
-}
-
 RELEASE_JSON=""
 if [[ -z "${RELEASE_ASSETS_DIR}" ]]; then
   if ! capture_installer_step_output "Fetching ${TAG} release metadata" RELEASE_JSON fetch_release_metadata_with_retry "${API_URL}"; then
@@ -2538,25 +2652,34 @@ if [[ -z "${RELEASE_ASSETS_DIR}" ]]; then
   fi
 fi
 
-ASSET_SOURCE="$(resolve_release_asset_source "${RELEASE_JSON}" "${ASSET_REGEX}" || true)"
-if [[ -z "${ASSET_SOURCE}" ]]; then
+CHECKSUMS_SOURCE="$(resolve_release_asset_source "${RELEASE_JSON}" "${CHECKSUMS_REGEX}" || true)"
+if [[ -z "${CHECKSUMS_SOURCE}" ]]; then
   echo "Unable to locate release assets for ${OS}-${ARCH} on tag ${TAG}." >&2
   exit 1
 fi
-
-ASSET_NAME="$(basename "${ASSET_SOURCE}")"
-VERSION="${ASSET_NAME#${VERSION_PREFIX}}"
-VERSION="${VERSION%-${OS}-${ARCH}.tar.gz}"
-if [[ -z "${VERSION}" || "${VERSION}" == "${ASSET_NAME}" ]]; then
-  echo "Failed to infer release version from asset name: ${ASSET_NAME}" >&2
+CHECKSUMS_NAME="$(basename "${CHECKSUMS_SOURCE}")"
+VERSION="${CHECKSUMS_NAME#"${CHECKSUMS_PREFIX}"}"
+VERSION="${VERSION%.txt}"
+if [[ -z "${VERSION}" || "${VERSION}" == "${CHECKSUMS_NAME}" ]]; then
+  echo "Failed to infer release version from checksum asset: ${CHECKSUMS_NAME}" >&2
   exit 1
 fi
 
-CHECKSUMS_REGEX="^${CHECKSUMS_PREFIX}${VERSION}[.]txt$"
-SIG_REGEX="^${CHECKSUMS_PREFIX}${VERSION}[.]txt[.]minisig$"
-CHECKSUMS_SOURCE="$(resolve_release_asset_source "${RELEASE_JSON}" "${CHECKSUMS_REGEX}" || true)"
+VERSION_REGEX="$(escape_regex_literal "${VERSION}")"
+CHECKSUM_ASSET_NAME="${VERSION_PREFIX}${VERSION}-${OS}-${ARCH}.tar.gz"
+VERSIONED_ASSET_REGEX="^${VERSION_PREFIX}${VERSION_REGEX}-${OS}-${ARCH}[.]tar[.]gz$"
+ASSET_SOURCE=""
+if [[ -z "${INSTALL_VERSION}" && ( "${CHANNEL}" == "stable" || "${CHANNEL}" == "preview" ) ]]; then
+  ROLLING_PREFIX="${VERSION_PREFIX%v}"
+  ROLLING_ASSET_REGEX="^${ROLLING_PREFIX}${OS}-${ARCH}[.]tar[.]gz$"
+  ASSET_SOURCE="$(resolve_release_asset_source "${RELEASE_JSON}" "${ROLLING_ASSET_REGEX}" || true)"
+fi
+if [[ -z "${ASSET_SOURCE}" ]]; then
+  ASSET_SOURCE="$(resolve_release_asset_source "${RELEASE_JSON}" "${VERSIONED_ASSET_REGEX}" || true)"
+fi
+SIG_REGEX="^${CHECKSUMS_PREFIX}${VERSION_REGEX}[.]txt[.]minisig$"
 SIG_SOURCE="$(resolve_release_asset_source "${RELEASE_JSON}" "${SIG_REGEX}" || true)"
-if [[ -z "${CHECKSUMS_SOURCE}" || -z "${SIG_SOURCE}" ]]; then
+if [[ -z "${ASSET_SOURCE}" || -z "${SIG_SOURCE}" ]]; then
   echo "Unable to locate release assets for ${OS}-${ARCH} on tag ${TAG}." >&2
   exit 1
 fi
@@ -2751,7 +2874,7 @@ if [[ "${PRODUCT}" == "cli" && "${WITH_DAEMON}" == "1" ]]; then
           repair_status=$?
           if [[ "${repair_status}" == "2" ]]; then
             info "Setting up automatic startup (user-mode)..."
-            if ! run_background_service_install_compatibly "${DISPLAY_SHIM_PATH}" >/dev/null 2>&1; then
+            if ! run_background_service_install_compatibly "${DISPLAY_SHIM_PATH}"; then
               echo "Warning: background service install failed. You can retry manually:" >&2
               echo "  ${install_command}" >&2
             fi
@@ -2767,7 +2890,7 @@ if [[ "${PRODUCT}" == "cli" && "${WITH_DAEMON}" == "1" ]]; then
         ;;
       add)
         info "Setting up automatic startup (additional service, user-mode)..."
-        if ! run_background_service_install_compatibly "${DISPLAY_SHIM_PATH}" >/dev/null 2>&1; then
+        if ! run_background_service_install_compatibly "${DISPLAY_SHIM_PATH}"; then
           echo "Warning: background service install failed. You can retry manually:" >&2
           echo "  ${install_command}" >&2
         fi
@@ -2802,7 +2925,7 @@ if [[ "${PRODUCT}" == "cli" && "${WITH_DAEMON}" == "1" ]]; then
         fi
         if [[ "${skip_background_service_install}" != "1" ]]; then
           info "Setting up automatic startup (user-mode)..."
-          if ! run_background_service_install_compatibly "${DISPLAY_SHIM_PATH}" >/dev/null 2>&1; then
+          if ! run_background_service_install_compatibly "${DISPLAY_SHIM_PATH}"; then
             echo "Warning: background service install failed. You can retry manually:" >&2
             echo "  ${install_command}" >&2
           fi

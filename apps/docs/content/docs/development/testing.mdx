@@ -5,6 +5,15 @@ description: Test tiers, how to run them locally, and how they are gated in CI/r
 
 ## Test tiers (repo-wide model)
 
+The release-control follow-up adds notes-only selection to the existing CI
+planner. A protected-branch push changing only `apps/ui/CHANGELOG.md` validates
+the final commit's note projections and their contracts, and verifies full
+source CI for its unchanged preceding source. The completed check still names
+the final child SHA. If that baseline evidence is unavailable or insufficient,
+CI runs the complete source lane set. Versions, manifests, lockfiles, native
+configuration and generated runtime files do not qualify. This shortcut becomes
+available after the workflow follow-up is integrated.
+
 We use these lanes consistently across scripts and GitHub Actions.
 
 ### 1) Unit
@@ -101,6 +110,8 @@ Browser-driven end-to-end tests against the Expo web UI, using the same server-l
 ```bash
 yarn test:e2e:ui
 ```
+
+The command above runs the full browser suite. In the current `dev` CI configuration, ordinary push/PR browser checks select self-contained `@smoke` journeys. The nightly Extended DB workflow and explicitly selected UI E2E in manual/release validation run the full suite unless specific spec paths are supplied.
 
 Notes:
 - These tests run Playwright against `expo start --web` and require Playwright browsers to be installed (see Playwright install docs).
@@ -204,7 +215,7 @@ Notes:
 ### 7b) Package-local-only lanes
 
 These lanes are intentionally not exposed as canonical root scripts:
-- CLI slow lane: `yarn --cwd apps/cli test:slow`
+- CLI slow lane: `yarn test:cli:slow`
 - Website tests: package-local only under `apps/website`
 - Release runtime tests: `yarn --cwd packages/release-runtime test`
 - Stack unit/integration/native real-integration lanes: `yarn --cwd apps/stack test:unit`, `yarn --cwd apps/stack test:integration`, and the guarded real-integration files in `apps/stack`
@@ -260,7 +271,7 @@ yarn test:db-contract:docker
 ### CLI (`apps/cli`)
 - Unit: `yarn --cwd apps/cli test:unit`
 - Integration: `yarn --cwd apps/cli test:integration`
-- Slow-only lane: `yarn --cwd apps/cli test:slow`
+- Slow-only lane: `yarn test:cli:slow`
 
 ### Server (`apps/server`)
 - Unit: `yarn --cwd apps/server test:unit`
@@ -376,8 +387,11 @@ Default gate includes:
 - Release contracts (release/workflow/install/signing guards)
 - Daemon integration E2E (`CLI + Server (light/sqlite) E2E`)
 - Core E2E fast (sqlite)
+- UI E2E smoke (`@smoke`, when selected by the changed paths)
 
 The daemon integration E2E job is intentionally separate from app unit/integration lanes because it verifies cross-package boot/auth/daemon behavior against a real light server process.
+
+CLI unit tests and the import-cycle guard run even when the shared CLI build fails. The unit harness uses workspace sources and does not require CLI `dist`; integration, slow, and dist-admission checks require the downloaded build. The CI summary reports the build failure as the cause when binary consumers are skipped.
 
 ### On-demand provider contracts
 
@@ -392,9 +406,11 @@ Workflow: `CI — Provider Contracts` (`.github/workflows/providers-contracts.ym
 
 Workflow: `CI — Stress Tests` (`.github/workflows/stress-tests.yml`)
 
-### Nightly extended DB matrix
+### Nightly full E2E and extended DB
 
-Workflow: `CI — Extended DB Matrix` (`.github/workflows/extended-db-tests.yml`)
+Workflow: `Nightly — full E2E + extended DB` (`.github/workflows/extended-db-tests.yml`)
+
+Its current `dev` schedule also runs the full UI E2E suite across 12 shards.
 
 ## Contributor guidance
 

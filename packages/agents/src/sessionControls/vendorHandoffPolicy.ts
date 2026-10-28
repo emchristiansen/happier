@@ -23,6 +23,12 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
+export function supportsExistingSessionHandoffState(agentId: AgentId | null | undefined): boolean {
+  if (!agentId) return false;
+  const handoff = AGENTS_CORE[agentId].handoff;
+  return 'existingState' in handoff && handoff.existingState === true;
+}
+
 function isBackendDisabledByAccountSettings(agentId: AgentId, accountSettings: Record<string, unknown> | null): boolean {
   const backendEnabledByTargetKey = accountSettings?.backendEnabledByTargetKey;
   const backendEnabledByTargetKeyRecord = asRecord(backendEnabledByTargetKey);

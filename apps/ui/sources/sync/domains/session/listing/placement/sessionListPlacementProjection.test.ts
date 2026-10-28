@@ -92,25 +92,44 @@ describe('projectSessionListPlacement', () => {
         });
     });
 
-    it('places background activity in Working ahead of Ready after the foreground turn completed', () => {
+    it('keeps unread completed turns working until background work settles, with optional unread promotion', () => {
         const nowMs = 10_000;
+        const backgroundActiveCompletedTurn = {
+            active: true,
+            activeAt: nowMs - 180_000,
+            presence: 'online' as const,
+            thinking: false,
+            thinkingAt: 0,
+            latestTurnStatus: 'completed' as const,
+            latestTurnStatusObservedAt: nowMs - 2_000,
+            lastRuntimeIssue: null,
+            runtimeActivityState: 'active' as const,
+            runtimeActivityActiveCount: 1,
+            runtimeActivityObservedAt: nowMs - 1_000,
+            runtimeActivityRevision: 1,
+        };
 
         expect(projectSessionListPlacement({
             nowMs,
-            session: makeSession({
-                active: true,
-                activeAt: nowMs - 180_000,
-                presence: 'online',
-                thinking: false,
-                thinkingAt: 0,
-                latestTurnStatus: 'completed',
-                latestTurnStatusObservedAt: nowMs - 2_000,
-                lastRuntimeIssue: null,
-                runtimeActivityState: 'active',
-                runtimeActivityActiveCount: 1,
-                runtimeActivityObservedAt: nowMs - 1_000,
-                runtimeActivityRevision: 1,
-            }),
+            session: makeSession(backgroundActiveCompletedTurn),
+        }).kind).toBe('working');
+        expect(projectSessionListPlacement({
+            nowMs,
+            backgroundWorkAttentionMode: 'showUnread',
+            session: makeSession(backgroundActiveCompletedTurn),
+        }).kind).toBe('unread');
+        expect(projectSessionListPlacement({
+            nowMs,
+            backgroundWorkAttentionMode: 'keepWorkingUnread',
+            session: makeSession(backgroundActiveCompletedTurn),
+        }).kind).toBe('working');
+        expect(projectSessionListPlacement({
+            nowMs,
+            session: makeSession({ ...backgroundActiveCompletedTurn, runtimeActivityState: 'idle', runtimeActivityActiveCount: 0 }),
+        }).kind).toBe('ready');
+        expect(projectSessionListPlacement({
+            nowMs,
+            session: makeSession({ ...backgroundActiveCompletedTurn, lastViewedSessionSeq: 1 }),
         })).toEqual({
             kind: 'working',
             timestamp: null,
@@ -140,6 +159,7 @@ describe('projectSessionListPlacement', () => {
                 runtimeActivityActiveCount: 1,
                 runtimeActivityObservedAt: nowMs - 3_600_000,
                 runtimeActivityRevision: 1,
+                lastViewedSessionSeq: 1,
             }),
         });
 
@@ -173,6 +193,23 @@ describe('projectSessionListPlacement', () => {
         });
 
         expect(placement.kind).not.toBe('working');
+    });
+
+    it.each(['active', 'unknown'] as const)('does not call an unread completed turn ready when background activity is %s after disconnection', (runtimeActivityState) => {
+        expect(projectSessionListPlacement({
+            nowMs: 1_000_000,
+            session: makeSession({
+                active: false,
+                presence: 1,
+                latestTurnStatus: 'completed',
+                latestReadyEventSeq: 4,
+                lastViewedSessionSeq: 1,
+                hasUnreadMessages: true,
+                runtimeActivityState,
+                runtimeActivityActiveCount: 1,
+                runtimeActivityObservedAt: 1,
+            }),
+        }).kind).toBe('unread');
     });
 
     it.each([
@@ -285,6 +322,28 @@ describe('projectSessionListPlacement', () => {
             timestamp: 2_000,
             retainedWorking: false,
             explicitStanding: false,
+        });
+    });
+
+    it('keeps blocked-delivery ordering stable across unrelated transport updates', () => {
+        const previous = makeSession({
+            pendingBlockedCount: 1,
+            pendingRequestObservedAt: null,
+            meaningfulActivityAt: 1_500,
+            createdAt: 100,
+            updatedAt: 2_000,
+            hasPendingUserActionRequests: false,
+            hasPendingPermissionRequests: false,
+        });
+        const next = { ...previous, updatedAt: 3_000 };
+
+        expect(projectSessionListPlacement({ nowMs: 10_000, session: previous })).toMatchObject({
+            kind: 'action_required',
+            timestamp: 1_500,
+        });
+        expect(projectSessionListPlacement({ nowMs: 10_000, session: next })).toMatchObject({
+            kind: 'action_required',
+            timestamp: 1_500,
         });
     });
 

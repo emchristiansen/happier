@@ -2,16 +2,18 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { killProcessTree, spawnProc } from '../proc/proc.mjs';
+import { killProcessTree, runCaptureResult, spawnProc } from '../proc/proc.mjs';
 import { fetchHappierHealth } from '../server/server.mjs';
 import {
   buildMutagenProjectArgs,
   isEquivalentMutagenProject,
   isMutagenProjectOwnedBy,
+  loadSiblingMutagenOwner,
   renderMutagenProject,
   resolveMutagenSessionName,
 } from './mutagen_project.mjs';
 import {
+  DEFAULT_REMOTE_STACK_STARTUP_TIMEOUT_MS,
   buildRemoteBootstrapCommand,
   buildRemoteStackCommand,
   buildRemoteStackStopCommand,
@@ -21,6 +23,13 @@ import {
   buildSshForwardArgs,
   buildSshWorkerArgs,
 } from './remote_commands.mjs';
+
+export function resolveRemoteServerReadyTimeoutMs(env = process.env) {
+  const configured = Number.parseInt(String(env.HAPPIER_STACK_SERVER_READY_TIMEOUT_MS ?? ''), 10);
+  return Number.isFinite(configured) && configured >= 1_000
+    ? configured
+    : DEFAULT_REMOTE_STACK_STARTUP_TIMEOUT_MS;
+}
 
 export function resolveDefaultRemoteServerPort({
   localServerPort,
@@ -45,9 +54,8 @@ export function resolveDefaultRemoteExpoPort({
 }
 
 async function defaultRunProcess({ label, command, args, env }) {
-  const child = spawnProc(label, command, args, env);
-  const result = await child.completion;
-  return result;
+  const result = await runCaptureResult(command, args, { env, streamLabel: label });
+  return { ...result, code: result.exitCode };
 }
 
 function defaultSpawnProcess({ label, command, args, env }) {
@@ -65,8 +73,7 @@ async function defaultWaitForProcess(child) {
 }
 
 async function defaultWaitForServerReady({ url, env = process.env, signal } = {}) {
-  const configured = Number.parseInt(String(env.HAPPIER_STACK_SERVER_READY_TIMEOUT_MS ?? ''), 10);
-  const timeoutMs = Number.isFinite(configured) && configured >= 1_000 ? configured : 120_000;
+  const timeoutMs = resolveRemoteServerReadyTimeoutMs(env);
   const deadline = Date.now() + timeoutMs;
   while (!signal?.aborted && Date.now() < deadline) {
     if ((await fetchHappierHealth(url)).ok) return;
@@ -137,12 +144,12 @@ async function prepareOpenSsh({ targets, mutagenDir, env }) {
   for (const executable of ['ssh', 'scp']) {
     await writeFile(
       join(opensshDir, executable),
-      `#!/bin/sh\nexec /usr/bin/${executable} -F ${shellQuote(configPath)} -o ControlMaster=no "$@"\n`,
+      `#!/bin/sh\nexec /usr/bin/${executable} -F ${shellQuote(configPath)} -o ControlMaster=no -o ControlPath=none "$@"\n`,
       { mode: 0o700 },
     );
   }
   return {
-    sshArgs: ['-F', configPath, '-o', 'ControlMaster=no'],
+    sshArgs: ['-F', configPath, '-o', 'ControlMaster=no', '-o', 'ControlPath=none'],
     mutagenEnv: { ...env, MUTAGEN_SSH_PATH: opensshDir },
   };
 }
@@ -201,10 +208,15 @@ export async function startStackDevTargets(
     ...env,
     HAPPIER_STACK_PROCESS_KIND: 'infra',
   };
-  const mutagenDir = join(stackBaseDir, 'mutagen');
-  const mutagenDataDir = join(mutagenDir, 'data');
-  const projectFile = join(mutagenDir, 'mutagen.yml');
-  const openSsh = await prepareOpenSsh({ targets: synchronizedTargets, mutagenDir, env });
+  const siblingOwner = await loadSiblingMutagenOwner(sourceDir);
+  const sharedRuntime = siblingOwner?.resolveRuntime({ stackBaseDir, sourceDir, env });
+  const mutagenDir = sharedRuntime?.mutagenDir ?? join(stackBaseDir, 'mutagen');
+  const mutagenDataDir = sharedRuntime?.dataDir ?? join(mutagenDir, 'data');
+  const projectFile = sharedRuntime?.projectFile ?? join(mutagenDir, 'mutagen.yml');
+  const sessionNameForTarget = siblingOwner?.resolveSessionName ?? resolveMutagenSessionName;
+  const openSsh = siblingOwner
+    ? { sshArgs: ['-F', join(sharedRuntime.opensshDir, 'config')], mutagenEnv: sharedRuntime.env }
+    : await prepareOpenSsh({ targets: synchronizedTargets, mutagenDir, env });
   const {
     HAPPIER_STACK_PROCESS_KIND: _inheritedStackProcessKind,
     ...mutagenServiceBaseEnv
@@ -218,7 +230,7 @@ export async function startStackDevTargets(
     ...mutagenEnv,
     HAPPIER_STACK_PROCESS_KIND: 'infra',
   };
-  await mkdir(mutagenDataDir, { recursive: true });
+  if (!siblingOwner) await mkdir(mutagenDataDir, { recursive: true });
 
     const workersByTarget = new Map();
     const tunnelsByTarget = new Map();
@@ -236,6 +248,7 @@ export async function startStackDevTargets(
     resolveCloseRequested = resolve;
   });
   const releaseProjectIfOwned = async (action) => {
+    if (siblingOwner) return;
     const contents = await readFile(projectFile, 'utf8').catch(() => null);
     if (!isMutagenProjectOwnedBy(contents, instanceId)) return;
     await runProcess({
@@ -246,54 +259,72 @@ export async function startStackDevTargets(
     });
   };
   try {
-    requireSuccessful(
-      await runProcess({ label: 'mutagen', command: 'mutagen', args: ['version'], env: mutagenEnv }),
-      'Mutagen preflight',
-    );
+    if (siblingOwner) {
+      // Adapt the canonical generated project, without taking its lifecycle.
+      // Names alone cannot prove that the borrowed mirror has the same endpoints.
+      const project = await readFile(projectFile, 'utf8');
+      for (const target of synchronizedTargets) {
+        const endpoints = `  ${sessionNameForTarget(target.name)}:\n    alpha: ${JSON.stringify(String(sourceDir))}\n    beta: ${JSON.stringify(`${target.ssh}:${target.repoDir}`)}\n`;
+        if (!project.includes(endpoints)) {
+          throw new Error(`[dev-targets] shared synchronization endpoints do not match ${target.name}; configure the sibling sync owner first`);
+        }
+      }
+      const borrowed = await siblingOwner.ensureProject({
+        stackBaseDir, sourceDir, targets: synchronizedTargets, ownerId: instanceId, borrowOnly: true, env,
+      }, { runProcess });
+      if (borrowed.unhealthyTargets.size > 0) {
+        throw new Error(`[dev-targets] shared synchronization is unavailable: ${[...borrowed.unhealthyTargets].map(([name, state]) => `${name} (${state})`).join(', ')}`);
+      }
+    } else {
+      requireSuccessful(
+        await runProcess({ label: 'mutagen', command: 'mutagen', args: ['version'], env: mutagenEnv }),
+        'Mutagen preflight',
+      );
 
-    const desiredProject = renderMutagenProject({ sourceDir, targets: synchronizedTargets, ownerId: instanceId });
-    const existingProject = await readFile(projectFile, 'utf8').catch(() => null);
-    const canResumeProject = isEquivalentMutagenProject(existingProject, desiredProject);
-    await writeFile(projectFile, desiredProject, 'utf8');
+      const desiredProject = renderMutagenProject({ sourceDir, targets: synchronizedTargets, ownerId: instanceId });
+      const existingProject = await readFile(projectFile, 'utf8').catch(() => null);
+      const canResumeProject = isEquivalentMutagenProject(existingProject, desiredProject);
+      await writeFile(projectFile, desiredProject, 'utf8');
 
-    let resumedProject = false;
-    if (canResumeProject) {
-      const resumeResult = await runProcess({
-        label: 'mutagen',
-        command: 'mutagen',
-        args: buildMutagenProjectArgs('resume', projectFile),
-        env: mutagenEnv,
-      });
-      resumedProject = resumeResult?.code === 0;
-    }
-    if (!resumedProject) {
-      await runProcess({
-        label: 'mutagen',
-        command: 'mutagen',
-        args: buildMutagenProjectArgs('terminate', projectFile),
-        env: mutagenEnv,
-      });
+      let resumedProject = false;
+      if (canResumeProject) {
+        const resumeResult = await runProcess({
+          label: 'mutagen',
+          command: 'mutagen',
+          args: buildMutagenProjectArgs('resume', projectFile),
+          env: mutagenEnv,
+        });
+        resumedProject = resumeResult?.code === 0;
+      }
+      if (!resumedProject) {
+        await runProcess({
+          label: 'mutagen',
+          command: 'mutagen',
+          args: buildMutagenProjectArgs('terminate', projectFile),
+          env: mutagenEnv,
+        });
+        requireSuccessful(
+          await runProcess({
+            label: 'mutagen',
+            command: 'mutagen',
+            args: buildMutagenProjectArgs('start', projectFile),
+            env: mutagenEnv,
+          }),
+          'Mutagen project start',
+        );
+        projectCreated = true;
+      }
+      projectStarted = true;
       requireSuccessful(
         await runProcess({
           label: 'mutagen',
           command: 'mutagen',
-          args: buildMutagenProjectArgs('start', projectFile),
+          args: buildMutagenProjectArgs('list', projectFile),
           env: mutagenEnv,
         }),
-        'Mutagen project start',
+        'Mutagen project status',
       );
-      projectCreated = true;
     }
-    projectStarted = true;
-    requireSuccessful(
-      await runProcess({
-        label: 'mutagen',
-        command: 'mutagen',
-        args: buildMutagenProjectArgs('list', projectFile),
-        env: mutagenEnv,
-      }),
-      'Mutagen project status',
-    );
     monitorWorker = spawnProcess({
       label: 'mutagen',
       command: 'mutagen',
@@ -301,7 +332,7 @@ export async function startStackDevTargets(
         'sync',
         'monitor',
         '--long',
-        ...synchronizedTargets.map((target) => resolveMutagenSessionName(target.name)),
+        ...synchronizedTargets.map((target) => sessionNameForTarget(target.name)),
       ],
       env: mutagenMonitorEnv,
     });
@@ -423,24 +454,28 @@ export async function startStackDevTargets(
             `${target.name} directory bootstrap`,
           );
           beginPhase('sync');
-          requireSuccessful(
-            await runProcess({
-              label: `remote:${target.name}`,
-              command: 'mutagen',
-              args: ['sync', 'resume', resolveMutagenSessionName(target.name)],
-              env: mutagenEnv,
-            }),
-            `${target.name} Mutagen resume`,
-          );
-          requireSuccessful(
-            await runProcess({
-              label: `remote:${target.name}`,
-              command: 'mutagen',
-              args: ['sync', 'flush', resolveMutagenSessionName(target.name)],
-              env: mutagenEnv,
-            }),
-            `${target.name} Mutagen initial flush`,
-          );
+          if (siblingOwner) {
+            await siblingOwner.flush({ target, env: mutagenEnv }, runProcess === defaultRunProcess ? {} : { runProcess });
+          } else {
+            requireSuccessful(
+              await runProcess({
+                label: `remote:${target.name}`,
+                command: 'mutagen',
+                args: ['sync', 'resume', sessionNameForTarget(target.name)],
+                env: mutagenEnv,
+              }),
+              `${target.name} Mutagen resume`,
+            );
+            requireSuccessful(
+              await runProcess({
+                label: `remote:${target.name}`,
+                command: 'mutagen',
+                args: ['sync', 'flush', sessionNameForTarget(target.name)],
+                env: mutagenEnv,
+              }),
+              `${target.name} Mutagen initial flush`,
+            );
+          }
           if (!deferCompanionPreparation) {
             await prepareRemoteServices();
           }
@@ -542,8 +577,11 @@ export async function startStackDevTargets(
           tunnelsByTarget.set(target.name, tunnel);
         }
         if (!services.server) {
-          requireSuccessful(
-            await runProcess({
+          const readinessDeadline = Date.now() + resolveRemoteServerReadyTimeoutMs(env);
+          let readinessAttempt = 0;
+          let readinessResult;
+          do {
+            readinessResult = await runProcess({
               label: `remote:${target.name}`,
               command: 'ssh',
               args: [
@@ -554,7 +592,19 @@ export async function startStackDevTargets(
                 buildRemoteForwardProbeCommand(target, { remoteServerPort }),
               ],
               env: infraEnv,
-            }),
+            });
+            if (readinessResult?.code === 0 || tunnel.exitCode != null || Date.now() >= readinessDeadline) {
+              break;
+            }
+            readinessAttempt += 1;
+            const retryOutcome = await Promise.race([
+              waitForRetry({ attempt: readinessAttempt, delayMs: 5_000, target }).then(() => 'retry'),
+              closeRequested.then(() => 'close'),
+            ]);
+            if (retryOutcome === 'close' || closed) return null;
+          } while (!closed);
+          requireSuccessful(
+            readinessResult,
             `${target.name} reverse tunnel readiness`,
           );
         }

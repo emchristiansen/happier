@@ -56,6 +56,18 @@ function classifyCodexLoginStartError(error: unknown): CodexDirectLiveAuthApplyR
   return { applied: false, reason: 'live_hot_auth_failed' };
 }
 
+export async function applyCodexAppServerChatGptAuthTokens(params: Readonly<{
+  client: CodexDirectLiveAuthApplyInput['client'];
+  accessToken: string;
+  chatgptAccountId: string;
+}>): Promise<void> {
+  await params.client.request('account/login/start', {
+    type: 'chatgptAuthTokens',
+    accessToken: params.accessToken,
+    chatgptAccountId: params.chatgptAccountId,
+  });
+}
+
 export async function applyCodexDirectLiveAppServerAuth(
   params: CodexDirectLiveAuthApplyInput,
 ): Promise<CodexDirectLiveAuthApplyResult> {
@@ -97,8 +109,8 @@ export async function applyCodexDirectLiveAppServerAuth(
 
   const record = requireConnectedServiceOauthCredentialRecord(params.candidate);
   try {
-    await params.client.request('account/login/start', {
-      type: 'chatgptAuthTokens',
+    await applyCodexAppServerChatGptAuthTokens({
+      client: params.client,
       accessToken: record.oauth.accessToken,
       chatgptAccountId: accountId,
     });

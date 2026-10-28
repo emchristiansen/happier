@@ -18,6 +18,31 @@ function toToolResultUpdate(c: Readonly<{
     };
 }
 
+/** AgentState creates permission-only mirrors with no transcript call identity. */
+export function resolveSidechainPermissionMirror(state: ReducerState, toolUseId: string): string | null {
+    const messageId = state.toolIdToMessageId.get(toolUseId);
+    const message = messageId ? state.messages.get(messageId) : null;
+    return message?.realID == null && message?.tool?.permission ? messageId ?? null : null;
+}
+
+/** Explicit scope selects its child; an unscoped result requires one current sidechain owner. */
+export function resolveSidechainToolMessage(state: ReducerState, toolUseId: string, explicitSidechainId?: string): Readonly<{ messageId: string; sidechainId: string }> | null {
+    const candidate = state.sidechainToolIdToMessageId.get(toolUseId);
+    if (!candidate && !explicitSidechainId) return null;
+    let owner: string | null = null;
+    let ownerSidechainId: string | null = null;
+    for (const [sidechainId, sidechain] of state.sidechains) {
+        if (explicitSidechainId && sidechainId !== explicitSidechainId) continue;
+        for (const message of sidechain) {
+            if (message.tool?.id !== toolUseId) continue;
+            if (owner && owner !== message.id) return null;
+            owner = message.id;
+            ownerSidechainId = sidechainId;
+        }
+    }
+    return owner && ownerSidechainId ? { messageId: owner, sidechainId: ownerSidechainId } : null;
+}
+
 export function runToolResultsPhase(params: Readonly<{
     state: ReducerState;
     nonSidechainMessages: TracedMessage[];
@@ -35,7 +60,9 @@ export function runToolResultsPhase(params: Readonly<{
                 const c = content;
                 if (c.type === 'tool-result') {
                     // Find the message containing this tool
-                    let messageId = state.toolIdToMessageId.get(c.tool_use_id);
+                    const mainMessageId = state.toolIdToMessageId.get(c.tool_use_id);
+                    const sidechain = mainMessageId ? null : resolveSidechainToolMessage(state, c.tool_use_id);
+                    const messageId = mainMessageId ?? sidechain?.messageId;
                     if (!messageId) {
                         const toolResult = toToolResultUpdate(c);
                         bufferOrphanToolResult({
@@ -64,6 +91,10 @@ export function runToolResultsPhase(params: Readonly<{
                         meta: msg.meta,
                         changed,
                     });
+                    if (sidechain) {
+                        const parentId = state.toolIdToMessageId.get(sidechain.sidechainId);
+                        if (parentId) changed.add(parentId);
+                    }
                 }
             }
         }

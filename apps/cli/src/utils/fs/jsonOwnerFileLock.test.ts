@@ -176,6 +176,33 @@ afterEach(() => {
 });
 
 describe('withJsonOwnerFileLock', () => {
+  it('cancels lock acquisition without disturbing the active owner', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-owner-lock-cancel-'));
+    const lockPath = join(root, 'owner.lock');
+    let releaseOwner = () => {};
+    let markEntered = () => {};
+    const entered = new Promise<void>(resolve => { markEntered = resolve; });
+    const released = new Promise<void>(resolve => { releaseOwner = resolve; });
+    const owner = withJsonOwnerFileLock({ lockPath, timeoutMs: 1_000, staleAfterMs: 1_000, errorCode: 'lock_timeout' }, async () => {
+      markEntered();
+      await released;
+    });
+    try {
+      await entered;
+      const originalOwner = await readFile(lockPath, 'utf8');
+      const controller = new AbortController();
+      controller.abort();
+      await expect(withJsonOwnerFileLock({
+        lockPath, timeoutMs: 100, staleAfterMs: 1_000, errorCode: 'lock_timeout', signal: controller.signal,
+      }, async () => { throw new Error('Cancelled contender acquired the lock'); })).rejects.toMatchObject({ name: 'AbortError' });
+      expect(await readFile(lockPath, 'utf8')).toBe(originalOwner);
+    } finally {
+      releaseOwner();
+      await owner;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('reads the exact Remote HEAD predecessor artifact and preserves live, fresh-dead, malformed, and missing owners', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'happier-json-owner-lock-predecessor-'));
     const acquiredAt = '1970-01-01T00:00:01.000Z';
@@ -910,7 +937,7 @@ await withJsonOwnerFileLock({
       }), 'utf8');
       await expect(withJsonOwnerFileLock({
         lockPath: deadLockPath,
-        timeoutMs: 200,
+        timeoutMs: 1_000,
         staleAfterMs: 1,
         errorCode: 'dead_lock_timeout',
         pollIntervalMs: 2,
@@ -926,7 +953,7 @@ await withJsonOwnerFileLock({
       await writeFile(reusedLockPath, ambiguousRaw, 'utf8');
       await expect(withJsonOwnerFileLock({
         lockPath: reusedLockPath,
-        timeoutMs: 200,
+        timeoutMs: 1_000,
         staleAfterMs: 1,
         errorCode: 'reused_pid_lock_timeout',
         pollIntervalMs: 2,

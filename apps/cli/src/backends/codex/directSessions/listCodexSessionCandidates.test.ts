@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, symlink, writeFile, utimes } from 'node:fs/pr
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { beforeAll, afterEach, describe, expect, it, vi } from 'vitest';
 
 import { buildCodexAgentRuntimeDescriptorV1 } from '@happier-dev/protocol';
 import { waitForCondition } from '@/testkit/async/waitFor';
@@ -15,6 +15,14 @@ import {
 } from '@/backends/codex/appServer/testkit/fakeCodexAppServer';
 
 import { listCodexSessionCandidates } from './listCodexSessionCandidates';
+
+// As in native-history tests, keep fixture startup locks out of the live OS user's home.
+const startupHome = vi.hoisted(() => ({ path: '' }));
+vi.mock('node:os', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  return { ...actual, userInfo: () => ({ ...actual.userInfo(), homedir: startupHome.path || actual.userInfo().homedir }) };
+});
+beforeAll(async () => { startupHome.path = await mkdtemp(join(tmpdir(), 'codex-list-startup-test-')); });
 
 function sessionMetaLine(payload: Record<string, unknown>): string {
   return `${JSON.stringify({ type: 'session_meta', payload })}\n`;
@@ -29,6 +37,9 @@ function createDirectSessionsEnv(codexHome: string, overrides: NodeJS.ProcessEnv
     overrides.HAPPIER_CODEX_APP_SERVER_BIN ?? join(codexHome, 'missing-codex-app-server-binary'),
     {
       CODEX_HOME: codexHome,
+      // These cases test complete listing, including the real fsync-backed startup lock.
+      // Use the fixture's existing RPC budget; the timeout case overrides it explicitly.
+      HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_LIST_TIMEOUT_MS: '2000',
       ...overrides,
     },
   );
@@ -107,6 +118,126 @@ describe('listCodexSessionCandidates', () => {
     expect(second.nextCursor).toBeNull();
   });
 
+  it('uses session_meta.id when a continuation rollout filename contains a composite id', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-list-composite-rollout-id-'));
+    const codexHome = join(root, 'codex-home');
+    const sessionsDir = join(codexHome, 'sessions');
+    await mkdir(sessionsDir, { recursive: true });
+
+    const threadId = 'aaaaaaaa-1111-1111-1111-111111111111';
+    const continuationId = 'bbbbbbbb-2222-2222-2222-222222222222';
+    const regularRollout = join(sessionsDir, `rollout-2026-01-01T00-00-00-${threadId}.jsonl`);
+    const continuationRollout = join(sessionsDir, `rollout-2026-01-02T00-00-00-${threadId}_${continuationId}.jsonl`);
+
+    await writeFile(
+      regularRollout,
+      sessionMetaLine({ id: threadId, timestamp: '2026-01-01T00:00:00.000Z', cwd: '/repo/composite' })
+        + responseItemLine({ type: 'message', role: 'user', content: [{ type: 'text', text: 'initial' }] }),
+      'utf8',
+    );
+    await writeFile(
+      continuationRollout,
+      sessionMetaLine({ id: threadId, timestamp: '2026-01-02T00:00:00.000Z', cwd: '/repo/composite' })
+        + responseItemLine({ type: 'message', role: 'assistant', content: [{ type: 'text', text: 'continued' }] }),
+      'utf8',
+    );
+    await utimes(regularRollout, new Date('2026-01-01T00:00:00.000Z'), new Date('2026-01-01T00:00:00.000Z'));
+    await utimes(continuationRollout, new Date('2026-01-02T00:00:00.000Z'), new Date('2026-01-02T00:00:00.000Z'));
+
+    const result = await listCodexSessionCandidates({
+      source: { kind: 'codexHome', home: 'user' },
+      env: createDirectSessionsEnv(codexHome),
+      activeServerDir: join(root, 'servers', 'cloud'),
+      limit: 10,
+    });
+
+    expect(result.candidates.map((candidate) => candidate.remoteSessionId)).toEqual([threadId]);
+    expect(result.candidates[0]?.details).toEqual(expect.objectContaining({ cwd: '/repo/composite' }));
+  });
+
+  it('omits a noncanonical rollout candidate when neither its filename nor metadata identifies a thread UUID', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-list-unresolved-rollout-id-'));
+    const codexHome = join(root, 'codex-home');
+    const sessionsDir = join(codexHome, 'sessions');
+    await mkdir(sessionsDir, { recursive: true });
+
+    const rollout = join(sessionsDir, 'rollout-2026-01-02T00-00-00-unresolved_suffix.jsonl');
+    await writeFile(rollout, `${JSON.stringify({ type: 'response_item', payload: { type: 'message' } })}\n`, 'utf8');
+    await utimes(rollout, new Date('2026-01-02T00:00:00.000Z'), new Date('2026-01-02T00:00:00.000Z'));
+
+    const result = await listCodexSessionCandidates({
+      source: { kind: 'codexHome', home: 'user' },
+      env: createDirectSessionsEnv(codexHome),
+      activeServerDir: join(root, 'servers', 'cloud'),
+      limit: 10,
+    });
+
+    expect(result.candidates).toEqual([]);
+  });
+
+  it('uses the thread UUID from a composite filename when session metadata is unreadable', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-list-composite-rollout-no-meta-'));
+    const codexHome = join(root, 'codex-home');
+    const sessionsDir = join(codexHome, 'sessions');
+    await mkdir(sessionsDir, { recursive: true });
+
+    const threadId = 'aaaaaaaa-1111-1111-1111-111111111111';
+    const continuationId = 'bbbbbbbb-2222-2222-2222-222222222222';
+    const rollout = join(sessionsDir, `rollout-2026-01-02T00-00-00-${threadId}_${continuationId}.jsonl`);
+    await writeFile(rollout, responseItemLine({ type: 'message', role: 'assistant' }), 'utf8');
+    await utimes(rollout, new Date('2026-01-02T00:00:00.000Z'), new Date('2026-01-02T00:00:00.000Z'));
+
+    const result = await listCodexSessionCandidates({
+      source: { kind: 'codexHome', home: 'user' },
+      env: createDirectSessionsEnv(codexHome),
+      activeServerDir: join(root, 'servers', 'cloud'),
+      limit: 10,
+    });
+
+    expect(result.candidates.map((candidate) => candidate.remoteSessionId)).toEqual([threadId]);
+  });
+
+  it('searches metadata-resolved IDs in full mode even when another rollout filename matches', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-list-resolved-id-search-'));
+    const codexHome = join(root, 'codex-home');
+    const sessionsDir = join(codexHome, 'sessions');
+    await mkdir(sessionsDir, { recursive: true });
+
+    const searchTerm = 'aaaa';
+    const searchId = 'aaaa0000-1111-1111-1111-111111111111';
+    const otherId = 'aaaaaaaa-2222-2222-2222-222222222222';
+    const filenameMatch = join(sessionsDir, `rollout-2026-01-02T00-00-00-${otherId}.jsonl`);
+    const metadataMatch = join(sessionsDir, 'rollout-2026-01-01T00-00-00-opaque-suffix.jsonl');
+    await writeFile(
+      filenameMatch,
+      sessionMetaLine({ id: otherId, timestamp: '2026-01-02T00:00:00.000Z', cwd: '/repo/filename-match' })
+        + responseItemLine({ type: 'message', role: 'user', content: [{ type: 'text', text: 'different session' }] }),
+      'utf8',
+    );
+    await writeFile(
+      metadataMatch,
+      sessionMetaLine({ id: searchId, timestamp: '2026-01-01T00:00:00.000Z', cwd: '/repo/metadata-match' })
+        + responseItemLine({ type: 'message', role: 'user', content: [{ type: 'text', text: 'target session' }] }),
+      'utf8',
+    );
+    await utimes(filenameMatch, new Date('2026-01-02T00:00:00.000Z'), new Date('2026-01-02T00:00:00.000Z'));
+    await utimes(metadataMatch, new Date('2026-01-01T00:00:00.000Z'), new Date('2026-01-01T00:00:00.000Z'));
+
+    const result = await listCodexSessionCandidates({
+      source: { kind: 'codexHome', home: 'user' },
+      env: createDirectSessionsEnv(codexHome),
+      activeServerDir: join(root, 'servers', 'cloud'),
+      limit: 10,
+      searchTerm,
+      searchMode: 'full',
+    });
+
+    expect(result.candidates.map((candidate) => candidate.remoteSessionId)).toEqual(expect.arrayContaining([searchId, otherId]));
+    expect(result.candidates).toHaveLength(2);
+    expect(result.candidates.find((candidate) => candidate.remoteSessionId === searchId)?.details)
+      .toEqual(expect.objectContaining({ cwd: '/repo/metadata-match' }));
+  });
+
   it('does not read rollout metadata for sessions outside the requested page when no search term is provided', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-list-page-only-'));
     const codexHome = join(root, 'codex-home');
@@ -116,19 +247,32 @@ describe('listCodexSessionCandidates', () => {
     const newestSessionId = 'aaaaaaaa-1111-1111-1111-111111111111';
     const middleSessionId = 'bbbbbbbb-1111-1111-1111-111111111111';
     const oldestSessionId = 'cccccccc-1111-1111-1111-111111111111';
+    const offPageContinuationThreadId = 'dddddddd-1111-1111-1111-111111111111';
+    const offPageContinuationTurnId = 'eeeeeeee-1111-1111-1111-111111111111';
 
     const newest = join(sessionsDir, `rollout-2026-01-03T00-00-00-${newestSessionId}.jsonl`);
     const middle = join(sessionsDir, `rollout-2026-01-02T00-00-00-${middleSessionId}.jsonl`);
     const oldest = join(sessionsDir, `rollout-2026-01-01T00-00-00-${oldestSessionId}.jsonl`);
+    const offPageContinuation = join(
+      sessionsDir,
+      `rollout-2025-12-31T00-00-00-${offPageContinuationThreadId}_${offPageContinuationTurnId}.jsonl`,
+    );
 
     await writeFile(newest, sessionMetaLine({ id: newestSessionId, timestamp: '2026-01-03T00:00:00.000Z', cwd: '/repo/newest' }), 'utf8');
     await writeFile(middle, sessionMetaLine({ id: middleSessionId, timestamp: '2026-01-02T00:00:00.000Z', cwd: '/repo/middle' }), 'utf8');
     await writeFile(oldest, sessionMetaLine({ id: oldestSessionId, timestamp: '2026-01-01T00:00:00.000Z', cwd: '/repo/oldest' }), 'utf8');
+    await writeFile(
+      offPageContinuation,
+      sessionMetaLine({ id: offPageContinuationThreadId, timestamp: '2025-12-31T00:00:00.000Z', cwd: '/repo/off-page-continuation' }),
+      'utf8',
+    );
 
     await utimes(newest, new Date('2026-01-03T00:00:00.000Z'), new Date('2026-01-03T00:00:00.000Z'));
     await utimes(middle, new Date('2026-01-02T00:00:00.000Z'), new Date('2026-01-02T00:00:00.000Z'));
     await utimes(oldest, new Date('2026-01-01T00:00:00.000Z'), new Date('2026-01-01T00:00:00.000Z'));
+    await utimes(offPageContinuation, new Date('2025-12-31T00:00:00.000Z'), new Date('2025-12-31T00:00:00.000Z'));
 
+    let offPageContinuationMetadataOpened = false;
     vi.doMock('node:fs/promises', async (importOriginal) => {
       const actual = await importOriginal<typeof import('node:fs/promises')>();
       return {
@@ -136,6 +280,10 @@ describe('listCodexSessionCandidates', () => {
         open: async (filePath: Parameters<typeof actual.open>[0], ...args: Parameters<typeof actual.open> extends [any, ...infer Rest] ? Rest : never) => {
           if (String(filePath).includes(oldestSessionId)) {
             throw new Error('sentinel rollout metadata should not be opened for first-page listing');
+          }
+          if (String(filePath).includes(offPageContinuationThreadId)) {
+            offPageContinuationMetadataOpened = true;
+            throw new Error('sentinel continuation metadata should not be opened to derive its filename ID');
           }
           return actual.open(filePath, ...args);
         },
@@ -160,6 +308,7 @@ describe('listCodexSessionCandidates', () => {
       }),
     ]);
     expect(first.nextCursor).toBeTruthy();
+    expect(offPageContinuationMetadataOpened).toBe(false);
   });
 
   it('matches search terms against surfaced session titles', async () => {
@@ -383,42 +532,6 @@ describe('listCodexSessionCandidates', () => {
     ]);
   });
 
-  it('keeps app-server candidates when a healthy cold process responds within the default budget', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-list-cold-app-server-'));
-    const codexHome = join(root, 'codex-home');
-    await mkdir(codexHome, { recursive: true });
-    const sessionId = 'cold-app-server-session';
-    const fakeAppServer = await writeFakeCodexAppServerScript({
-      dir: root,
-      bodyLines: [
-        'for await (const line of rl) {',
-        '  if (!line.trim()) continue;',
-        '  const msg = JSON.parse(line);',
-        '  if (msg.method === "initialize") {',
-        '    process.stdout.write(JSON.stringify({ id: msg.id, result: { serverInfo: { name: "fake", version: "0.0.0" } } }) + "\\n");',
-        '    continue;',
-        '  }',
-        '  if (msg.method === "initialized") continue;',
-        '  if (msg.method === "thread/list") {',
-        '    await new Promise((resolve) => setTimeout(resolve, 400));',
-        `    process.stdout.write(JSON.stringify({ id: msg.id, result: { data: [{ id: ${JSON.stringify(sessionId)}, updatedAt: 1736000100, cwd: "/repo/cold", name: "Cold app-server title" }], nextCursor: null } }) + "\\n");`,
-        '  }',
-        '}',
-      ],
-    });
-
-    const result = await listCodexSessionCandidates({
-      source: { kind: 'codexHome', home: 'user' },
-      env: createDirectSessionsEnv(codexHome, { HAPPIER_CODEX_APP_SERVER_BIN: fakeAppServer }),
-      activeServerDir: join(root, 'servers', 'cloud'),
-      limit: 10,
-    });
-
-    expect(result.candidates).toEqual([
-      expect.objectContaining({ remoteSessionId: sessionId, title: 'Cold app-server title' }),
-    ]);
-  });
-
   it('derives rollout fallback candidates from the earliest rollout and omits unverified app-server backend mode', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-list-rollout-fallback-'));
     const codexHome = join(root, 'codex-home');
@@ -541,7 +654,7 @@ describe('listCodexSessionCandidates', () => {
 
     const result = await listCodexSessionCandidates({
       source: { kind: 'codexHome', home: 'connectedService', connectedServiceId: 'svc_1' },
-      env: createCodexAppServerProcessEnv(fakeAppServer, { CODEX_HOME: firstHome }),
+      env: createDirectSessionsEnv(firstHome, { HAPPIER_CODEX_APP_SERVER_BIN: fakeAppServer }),
       activeServerDir,
       limit: 10,
     });
@@ -918,7 +1031,7 @@ describe('dedicated private native domain listing and takeover boundary', () => 
     await expect(getCodexDirectSessionActivity({ source, activeServerDir: join(root, 'server'), remoteSessionId: 'private_thread' }))
       .rejects.toThrow('private native domain');
     await expect(codexDirectSessionProviderOps.resolveTakeoverSpawnOptions!({
-      sessionId: 'ordinary-session', linked: {
+      sessionId: 'ordinary-session', transcriptStorage: 'direct', linked: {
         source, remoteSessionId: 'private_thread', sessionPath: '/repo', providerId: 'codex', machineId: 'fixture-machine',
         codexBackendMode: 'appServer', metadata: {},
         rawSession: { id: 'ordinary-session', seq: 0, createdAt: 0, updatedAt: 0, active: false, activeAt: 0,

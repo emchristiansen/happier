@@ -1,6 +1,7 @@
+import { requireEncryptedSessionContext } from '@/session/transport/encryption/sessionEncryptionContext';
 import chalk from 'chalk';
 
-import { readCredentials, type Credentials } from '@/persistence';
+import { readCredentials, readSettings, type Credentials } from '@/persistence';
 import { createSessionAttachFile } from '@/daemon/sessionAttachFile';
 import { AGENTS } from '@/backends/catalog';
 import type { CatalogAgentId } from '@/backends/types';
@@ -13,17 +14,26 @@ import type { AccountSettings, ConnectedServiceBindingsV1 } from '@happier-dev/p
 import {
   accountSettingsParse,
   ConnectedServiceBindingsV1Schema,
+  SessionTerminalMetadataSchema,
 } from '@happier-dev/protocol';
 import { canUseInkSelector, runSessionActionSelector } from '@/ui/ink/runSessionActionSelector';
 import { buildCliSessionRowModel } from '@/cli/output/session/buildCliSessionRowModel';
-import { buildResumeSelectionModel, formatResumeSelectionFooter } from '@/cli/commands/resumeInteractiveSelection';
+import { buildContinueSelectionModel } from '@/cli/commands/resumeInteractiveSelection';
 import { RESUME_COMMAND_USAGE } from '@/cli/commandSurfaceManifest';
+import { handleAttachCommand } from '@/cli/commands/attach';
+import { readTerminalAttachmentInfo } from '@/terminal/attachment/terminalAttachmentInfo';
+import { probeSessionRunnerPresence } from '@/daemon/sessions/isSessionRunnerActive';
+import { evaluateCliSessionAttachEligibility } from '@/session/attach/evaluateCliSessionAttachEligibility';
+import { configuration } from '@/configuration';
+import { isTmuxAvailable } from '@/integrations/tmux';
+import { hostname } from 'node:os';
 import {
   overlayDirectConnectedServiceEnvironment,
   resolveDirectConnectedServiceEnvironment,
 } from '@/cli/connectedServices/resolveDirectConnectedServiceEnvironment';
 
 import type { CommandContext, CommandHandler } from '@/cli/commandRegistry';
+import { fail, neutral, warn } from '@happier-dev/cli-common/output';
 
 type FetchSessionByIdFn = (params: { token: string; sessionId: string }) => Promise<RawSessionRecord | null>;
 type FetchSessionsPageFn = (params: { token: string; cursor?: string; limit?: number; activeOnly?: boolean; archivedOnly?: boolean }) => Promise<{
@@ -59,24 +69,30 @@ function readConnectedServicesFromSessionMetadata(
   return parsed.success ? parsed.data : null;
 }
 
-async function selectResumableSessionId(params: Readonly<{
+async function selectContinuableSessionId(params: Readonly<{
   credentials: Credentials;
   accountSettings: AccountSettings;
   fetchSessionsPageFn: FetchSessionsPageFn;
 }>): Promise<ResumableSessionSelection> {
-  const model = await buildResumeSelectionModel({
+  const settings = await readSettings();
+  const model = await buildContinueSelectionModel({
     credentials: params.credentials,
     accountSettings: params.accountSettings,
     fetchSessionsPageFn: params.fetchSessionsPageFn,
+    currentMachineId: typeof settings.machineId === 'string' && settings.machineId.trim() ? settings.machineId.trim() : null,
+    currentMachineHost: hostname(),
+    readTerminalAttachmentInfoFn: readTerminalAttachmentInfo,
+    isTmuxAvailableFn: isTmuxAvailable,
   });
 
   if (model.rows.length === 0) return { type: 'none' };
 
   const selection = await runSessionActionSelector({
-    title: 'Resume a session',
-    actionVerb: 'resume',
+    title: 'Continue a session',
+    actionVerb: 'continue',
     rows: model.rows,
-    footerHint: formatResumeSelectionFooter(model.hint),
+    footerHint: model.footerHint,
+    onProbe: model.probeSessionIdFn,
   });
   return selection.type === 'selected' ? selection : { type: 'cancelled' };
 }
@@ -93,7 +109,8 @@ export async function handleResumeCommand(
     resolveAgentHandlerFn?: (agentId: CatalogAgentId) => Promise<CommandHandler>;
     chdirFn?: (nextDir: string) => void;
     canUseInkSelectorFn?: () => boolean;
-    selectResumableSessionIdFn?: typeof selectResumableSessionId;
+    selectContinuableSessionIdFn?: typeof selectContinuableSessionId;
+    attachDeps?: Parameters<typeof handleAttachCommand>[1];
   }>,
 ): Promise<void> {
   const hasHelpFlag = argv.some((arg) => {
@@ -103,7 +120,7 @@ export async function handleResumeCommand(
   if (hasHelpFlag) {
     console.log(RESUME_COMMAND_USAGE);
     console.log('');
-    console.log('Resumes an inactive session (vendor-resume) from the CLI.');
+    console.log('Attaches to a running session, or resumes a stopped session when supported.');
     return;
   }
 
@@ -114,11 +131,11 @@ export async function handleResumeCommand(
   const resolveAgentHandlerFn = deps?.resolveAgentHandlerFn ?? resolveAgentHandler;
   const chdirFn = deps?.chdirFn ?? ((nextDir: string) => process.chdir(nextDir));
   const canUseInkSelectorFn = deps?.canUseInkSelectorFn ?? canUseInkSelector;
-  const selectResumableSessionIdFn = deps?.selectResumableSessionIdFn ?? selectResumableSessionId;
+  const selectContinuableSessionIdFn = deps?.selectContinuableSessionIdFn ?? selectContinuableSessionId;
 
   const credentials = await readCredentialsFn();
   if (!credentials) {
-    console.error(chalk.yellow('⚠️  Not authenticated with Happier'));
+    console.error(warn('Not authenticated with Happier'));
     console.error(chalk.gray('  Please run "happier auth login" first'));
     process.exit(1);
   }
@@ -131,30 +148,30 @@ export async function handleResumeCommand(
   let sessionIdOrPrefix = rawInput;
   if (isInteractive) {
     if (!canUseInkSelectorFn()) {
-      console.error(chalk.red('Error:'), 'Interactive resume is not available (raw TTY mode not supported).');
+      console.error(fail('Interactive session selection is not available (raw TTY mode not supported).'));
       console.log('');
-      console.log('Hint: run `happier session list --resumable` and then `happier resume <session-id>`.');
+      console.log('Hint: run `happier session list` and then `happier resume <session-id>`.');
       process.exit(1);
     }
 
-    const selected = await selectResumableSessionIdFn({
+    const selected = await selectContinuableSessionIdFn({
       credentials,
       accountSettings,
       fetchSessionsPageFn,
     });
     if (selected.type === 'cancelled') {
-      console.log(chalk.blue('Resume cancelled'));
+      console.log(neutral('Continue cancelled'));
       return;
     }
     if (selected.type === 'none') {
-      console.log('No resumable sessions found.');
+      console.log('No sessions available to continue from here.');
       return;
     }
     sessionIdOrPrefix = selected.sessionId;
   }
 
   if (!sessionIdOrPrefix) {
-    console.error(chalk.red('Error:'), 'Missing session ID.');
+    console.error(fail('Missing session ID.'));
     console.log('');
     console.log('Usage: happier resume <sessionId>');
     process.exit(1);
@@ -182,8 +199,41 @@ export async function handleResumeCommand(
   if (rowModel.archivedAt !== null) {
     throw new Error('Session is archived and cannot be resumed.');
   }
-  if (rowModel.active === true) {
-    throw new Error('Session is already active and cannot be resumed.');
+  const savedTerminal = SessionTerminalMetadataSchema.safeParse(sessionMetadata?.terminal);
+  const inheritedTerminal = deps?.terminalRuntime;
+  const inheritedHerdrMatchesSavedPane = inheritedTerminal?.mode === 'herdr'
+    && savedTerminal.success && savedTerminal.data.mode === 'herdr'
+    && Boolean(savedTerminal.data.herdr?.paneId?.trim())
+    && inheritedTerminal.herdrPaneId === savedTerminal.data.herdr?.paneId
+    && inheritedTerminal.herdrSocketPath === savedTerminal.data.herdr?.socketPath
+    && inheritedTerminal.herdrSessionName === savedTerminal.data.herdr?.sessionName;
+  // Herdr's deferred resume can arrive before relay activity has expired. The
+  // inherited pane is only placement: auth, runner custody and provider admission
+  // still own this same-session continuation. Unknown/present never imply absence.
+  const resumeInInheritedHerdrPane = inheritedHerdrMatchesSavedPane
+    && (await probeSessionRunnerPresence({ sessionId: rawSession.id, trackedSessions: [] })).state === 'runner_absent';
+  let openRestorationCandidate = false;
+  if (rowModel.active !== true && !resumeInInheritedHerdrPane) {
+    const settings = await (deps?.attachDeps?.readSettingsFn ?? readSettings)();
+    const eligibility = await evaluateCliSessionAttachEligibility({
+      credentials, rawSession,
+      currentMachineId: typeof settings.machineId === 'string' ? settings.machineId.trim() || null : null,
+      currentMachineHost: hostname(),
+      localAttachmentInfo: await (deps?.attachDeps?.readTerminalAttachmentInfoFn ?? readTerminalAttachmentInfo)({
+        happyHomeDir: configuration.happyHomeDir, sessionId: rawSession.id,
+      }),
+      insideTmux: Boolean(process.env.TMUX),
+      currentTmuxSocketPath: typeof process.env.TMUX === 'string' ? process.env.TMUX.split(',')[0]?.trim() || null : null,
+    });
+    openRestorationCandidate = eligibility.eligible && eligibility.attachStrategy === 'terminal_host';
+  }
+  if ((rowModel.active === true || openRestorationCandidate) && !resumeInInheritedHerdrPane) {
+    await handleAttachCommand([rawSession.id], {
+      ...deps?.attachDeps,
+      readCredentialsFn: async () => credentials,
+      fetchSessionByIdFn: async () => rawSession,
+    });
+    return;
   }
 
   const directory = rowModel.path;
@@ -211,6 +261,7 @@ export async function handleResumeCommand(
       ? { v: 2, encryptionMode: 'plain' }
       : (() => {
         const ctx = resolveSessionEncryptionContextFromCredentials(credentials, rawSession);
+  requireEncryptedSessionContext(ctx);
         return {
           v: 2 as const,
           encryptionMode: 'e2ee' as const,
@@ -261,6 +312,8 @@ export async function handleResumeCommand(
     if (!handlerCompleted) {
       connectedServiceEnv?.cleanupOnFailure?.();
     }
+    // The file owner records incomplete cleanup by default. Retain the provider's
+    // original failure rather than replacing it with this nonfatal retirement error.
     await attach.cleanup().catch(() => {});
     throw error;
   } finally {
@@ -283,7 +336,7 @@ export async function handleResumeCliCommand(context: CommandContext): Promise<v
       rawArgv: context.rawArgv,
     });
   } catch (error) {
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     if (process.env.DEBUG) {
       console.error(error);
     }

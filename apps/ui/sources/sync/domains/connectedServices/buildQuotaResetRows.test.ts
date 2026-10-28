@@ -14,6 +14,24 @@ const DAY = 24 * 60 * 60 * 1000;
 const NOW = 100 * DAY;
 
 describe('buildQuotaResetRows', () => {
+    it('attaches presentation details by credit id without changing the available balance authority', () => {
+        const details = {
+            saved: { remainingCount: 2, appliesToProviderLimitIds: ['five_hour', 'seven_day'], unavailableReason: 'paused' as const },
+            live: { remainingCount: 0, appliesToProviderLimitIds: [], unavailableReason: 'cooldown' as const },
+        };
+        const rows = buildQuotaResetRows(ConnectedServiceQuotaRecoveryCreditsV1Schema.parse({
+            kind: 'usage_limit_resets', availableCount: 1,
+            credits: [
+                { kind: 'usage_limit_reset', status: 'unknown', providerCreditId: 'saved' },
+                { kind: 'usage_limit_reset', status: 'available', providerCreditId: 'live' },
+            ],
+        }), NOW, formatter, details);
+        expect(rows).toEqual([
+            expect.objectContaining({ key: 'live', canUse: true, consumableCreditId: 'live', details: details.live }),
+            expect.objectContaining({ key: 'saved', canUse: false, consumableCreditId: null, details: details.saved }),
+        ]);
+    });
+
     it('returns no rows when there are no available credits', () => {
         expect(buildQuotaResetRows(null, NOW, formatter)).toEqual([]);
         expect(buildQuotaResetRows(undefined, NOW, formatter)).toEqual([]);
@@ -50,6 +68,49 @@ describe('buildQuotaResetRows', () => {
             countdownLabel: 'in 2d',
         });
         expect(rows[0]?.key).toBeTruthy();
+    });
+
+    it('shows saved identified grants without making an unavailable balance actionable', () => {
+        const rows = buildQuotaResetRows(ConnectedServiceQuotaRecoveryCreditsV1Schema.parse({
+            kind: 'usage_limit_resets', availableCount: 0, totalCount: 5,
+            credits: [{
+                kind: 'usage_limit_reset', status: 'unknown', providerCreditId: 'saved',
+                title: 'Claude promotional reset',
+                description: '2 resets saved. Applies to weekly limits. Not usable now.',
+                appliesToProviderLimitId: 'seven_day', expiresAtMs: NOW + DAY,
+            }],
+        }), NOW, formatter);
+        expect(rows).toEqual([expect.objectContaining({
+            key: 'saved', consumableCreditId: null, canUse: false, isAggregate: false,
+            title: 'Claude promotional reset',
+            description: '2 resets saved. Applies to weekly limits. Not usable now.',
+            countdownLabel: 'in 1d',
+        })]);
+    });
+
+    it('keeps saved grants separate from available detail and aggregate capacity', () => {
+        const rows = buildQuotaResetRows(ConnectedServiceQuotaRecoveryCreditsV1Schema.parse({
+            kind: 'usage_limit_resets', availableCount: 2, totalCount: 6,
+            credits: [
+                { kind: 'usage_limit_reset', status: 'unknown', providerCreditId: 'saved' },
+                { kind: 'usage_limit_reset', status: 'available', providerCreditId: 'live' },
+            ],
+        }), NOW, formatter);
+        expect(rows.filter((row) => row.canUse).map((row) => row.consumableCreditId)).toEqual(['live', null]);
+        expect(rows.filter((row) => !row.canUse)).toEqual([expect.objectContaining({ key: 'saved', consumableCreditId: null })]);
+    });
+
+    it('does not show expired or unidentified unknown grants or infer saved grants from historical total', () => {
+        const rows = buildQuotaResetRows(ConnectedServiceQuotaRecoveryCreditsV1Schema.parse({
+            kind: 'usage_limit_resets', availableCount: 0, totalCount: 9,
+            credits: [
+                { kind: 'usage_limit_reset', status: 'unknown', providerCreditId: 'expired', expiresAtMs: NOW },
+                { kind: 'usage_limit_reset', status: 'unknown' },
+                { kind: 'usage_limit_reset', status: 'available', providerCreditId: 'stale' },
+                { kind: 'usage_limit_reset', status: 'redeemed', providerCreditId: 'used' },
+            ],
+        }), NOW, formatter);
+        expect(rows).toEqual([]);
     });
 
     it('builds per-credit rows keyed and gated on providerCreditId', () => {

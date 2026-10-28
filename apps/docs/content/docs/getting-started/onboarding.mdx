@@ -7,7 +7,9 @@ Happier always follows the same high-level flow:
 
 1. **Choose a Relay** (Happier Cloud is recommended to start; self-hosting is optional).
 2. **Sign in / create an account** on that Relay.
-3. **Use the desktop app as your control panel** (recommended; the web UI is best for status/management).
+3. **Use the desktop app or web client as your control panel.** Both can start
+   and drive sessions; desktop can also install and manage the local background
+   service.
 4. **Get a machine ready**:
    - **This computer**: configure the local background service from the app.
    - **Remote machine**: bootstrap it over SSH from the app.
@@ -18,7 +20,7 @@ Happier always follows the same high-level flow:
 ### Option A — Hosted (recommended to start)
 You use Happier Cloud as your Relay.
 
-1. Open the desktop app (recommended) or web app (status/management only).
+1. Open the desktop app (recommended for local setup) or web app.
 2. Choose **Happier Cloud** when the app asks you which Relay to use. It is a
    deliberate choice, not a migration of an account from another Relay.
 3. Sign in.
@@ -51,7 +53,7 @@ You run your own Relay (remote machine, LAN box, or even your own computer), but
    - Any machine (managed service): install the CLI, then run `happier relay host install --mode system` (or remote: `happier relay host install --ssh user@host --mode system`)
    - Docker: see [Deployment → Docker](/self-hosting/docker).
 
-2. Open the desktop app (recommended) or web UI (status/management only) and choose that Relay.
+2. Open the desktop app or web UI and choose that Relay.
    - Some installers print one-click links/QRs that prefill the Relay URL.
    - Otherwise, open the app and add/select it in **Relay settings**.
 
@@ -89,7 +91,7 @@ happier daemon service install
 You install both the Relay and the background service on one box.
 
 1. Install the stack (for example via `hstack setup-from-source --profile=selfhost` or the Proxmox “devbox” option).
-2. Open the desktop app (recommended) or web UI (status/management only) and choose that Relay (use the printed configure-server link/QR if available).
+2. Open the desktop app or web UI and choose that Relay (use the printed configure-server link/QR if available).
 3. Sign in / create an account.
 4. In the app, use `/setup` → **Set up this computer** if you are on that machine, or set up the box over SSH if you are operating it remotely.
 5. If the Relay is local/self-hosted, optionally enable private access so phones and other devices can reach it without exposing it publicly.
@@ -116,17 +118,19 @@ happier --server company daemon start
 
 ### CLI: run multiple daemons on one machine (one per Relay)
 
+Requires Happier 0.2.13 or later. Update earlier versions before following this recipe.
+
 ```bash
-happier --server personal daemon service install
-happier --server company daemon service install
+happier --server personal daemon service install --instance personal
+happier --server company daemon service install --instance company
 ```
 
 Then verify (cross-platform):
 
 ```bash
 happier daemon status --all
-happier --server personal daemon service status
-happier --server company daemon service status
+happier --server personal daemon service status --instance personal
+happier --server company daemon service status --instance company
 ```
 
 For complete profile/switching behavior and CLI reference, see [Features → Multi-server](/accounts/multi-server).

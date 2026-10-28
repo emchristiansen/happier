@@ -28,6 +28,19 @@ export const CLAUDE_PROVIDER_SETTINGS_PLUGIN: ProviderSettingsPlugin = {
     ],
     uiSections: [
         {
+            id: 'claudeModelDiscovery',
+            title: { key: 'settingsProviders.plugins.claude.sections.claudeModelDiscovery.title' },
+            footer: { key: 'settingsProviders.plugins.claude.sections.claudeModelDiscovery.footer' },
+            fields: [
+                {
+                    key: 'claudeDynamicModelProbeEnabled',
+                    kind: 'boolean',
+                    title: { key: 'settingsProviders.plugins.claude.fields.claudeDynamicModelProbeEnabled.title' },
+                    subtitle: { key: 'settingsProviders.plugins.claude.fields.claudeDynamicModelProbeEnabled.subtitle' },
+                },
+            ],
+        },
+        {
             id: 'claudeUnifiedTerminal',
             featureId: 'providers.claude.unifiedTerminal',
             title: { key: 'settingsProviders.plugins.claude.sections.claudeUnifiedTerminal.title' },
@@ -115,6 +128,12 @@ export const CLAUDE_PROVIDER_SETTINGS_PLUGIN: ProviderSettingsPlugin = {
             title: { key: 'settingsProviders.plugins.claude.sections.claudeCodeExperiments.title' },
             footer: { key: 'settingsProviders.plugins.claude.sections.claudeCodeExperiments.footer' },
             fields: [
+                {
+                    key: 'claudeCodeIncludeInNativeHistory',
+                    kind: 'boolean',
+                    title: { key: 'settingsProviders.plugins.claude.fields.claudeCodeIncludeInNativeHistory.title' },
+                    subtitle: { key: 'settingsProviders.plugins.claude.fields.claudeCodeIncludeInNativeHistory.subtitle' },
+                },
                 {
                     key: 'claudeCodeExperimentalAgentTeamsEnabled',
                     kind: 'boolean',

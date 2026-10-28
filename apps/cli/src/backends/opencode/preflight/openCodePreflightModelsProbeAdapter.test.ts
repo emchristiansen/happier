@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { existsSync } from 'node:fs';
@@ -57,6 +57,18 @@ function writeFakeOpenCodeModelsJavaScriptEntrypoint(dir: string, stdoutLines: R
   return writeExecutableShimSync({ dir, fileName: 'opencode.js', contents });
 }
 
+function writeFakeOpenCodeV2ModelsJavaScriptEntrypoint(dir: string, response: unknown): string {
+  const contents = [
+    `const { writeFileSync } = require('node:fs');`,
+    `const { join } = require('node:path');`,
+    `const args = process.argv.slice(2);`,
+    `writeFileSync(join(${JSON.stringify(dir)}, 'invoked-v2.txt'), args.join(' '));`,
+    `if (args[0] !== 'api' || args[1] !== 'get' || args[2] !== '/api/model' || !args.includes('--standalone')) process.exit(2);`,
+    `process.stdout.write(${JSON.stringify(JSON.stringify(response))});`,
+  ].join('\n');
+  return writeExecutableShimSync({ dir, fileName: 'opencode.js', contents });
+}
+
 describe('openCodePreflightModelsProbeAdapter', () => {
   let tempDir: string | null = null;
 
@@ -65,6 +77,86 @@ describe('openCodePreflightModelsProbeAdapter', () => {
       rmSync(tempDir, { recursive: true, force: true });
       tempDir = null;
     }
+  });
+
+  it.each([
+    { models: [] },
+    { models: [{ id: 'image-only', providerID: 'example', capabilities: { input: ['image'] } }] },
+  ])('preserves an authoritative catalog with no selectable models ($models)', async ({ models }) => {
+    tempDir = makeTempDir('happier-opencode-preflight-empty-');
+    const fakeOpenCode = writeFakeOpenCodeV2ModelsJavaScriptEntrypoint(tempDir, { data: models });
+    const raw = await openCodePreflightModelsProbeAdapter.probeModelsRaw?.({
+      cwd: tempDir,
+      timeoutMs: 2_000,
+      processEnv: { ...process.env, HAPPIER_OPENCODE_PATH: fakeOpenCode },
+    });
+    expect(raw).toEqual([]);
+  });
+
+  it('reads rich model metadata from the released OpenCode V2 model API command', async () => {
+    tempDir = makeTempDir('happier-opencode-preflight-models-v2-');
+    const fakeOpenCode = writeFakeOpenCodeV2ModelsJavaScriptEntrypoint(tempDir, {
+      location: { directory: tempDir },
+      data: [
+        {
+          id: 'gpt-5.4',
+          modelID: 'gpt-5.4',
+          providerID: 'openai',
+          name: 'GPT-5.4',
+          family: 'gpt-5.4',
+          status: 'active',
+          enabled: true,
+          capabilities: { tools: true, input: ['text', 'image'], output: ['text'] },
+          variants: [{ id: 'low' }, { id: 'high' }],
+          limit: { context: 400000, output: 128000 },
+        },
+        {
+          id: 'no-tools',
+          modelID: 'no-tools',
+          providerID: 'openai',
+          name: 'No Tools',
+          status: 'active',
+          enabled: true,
+          capabilities: { tools: false, input: ['text'], output: ['text'] },
+          variants: [],
+          limit: { context: 100000, output: 10000 },
+        },
+      ],
+    });
+
+    process.env.PATH = '/usr/bin:/bin';
+    process.env.HAPPIER_OPENCODE_PATH = fakeOpenCode;
+
+    const raw = await openCodePreflightModelsProbeAdapter.probeModelsRaw?.({
+      cwd: tempDir,
+      timeoutMs: 2_000,
+      backendTarget: undefined,
+      accountSettings: null,
+    });
+
+    expect(readFileSync(join(tempDir, 'invoked-v2.txt'), 'utf8'))
+      .toBe(`api get /api/model --standalone --param location[directory]=${tempDir}`);
+    expect(raw).toEqual([{
+      id: 'openai/gpt-5.4',
+      name: 'GPT-5.4',
+      description: 'gpt-5.4',
+      contextWindowTokens: 400000,
+      modelOptions: [{
+        id: 'reasoning_effort',
+        name: 'Thinking',
+        type: 'select',
+        currentValue: 'high',
+        options: [
+          { value: 'low', name: 'Low' },
+          { value: 'high', name: 'High' },
+        ],
+      }],
+    }, {
+      id: 'openai/no-tools',
+      name: 'No Tools',
+      description: 'openai',
+      contextWindowTokens: 100000,
+    }]);
   });
 
   it('includes a model-scoped Thinking option derived from OpenCode model variants when reasoning is supported', async () => {
@@ -137,6 +229,62 @@ describe('openCodePreflightModelsProbeAdapter', () => {
         description: 'gpt-4o',
       },
     ]);
+  });
+
+  it('includes nested OpenRouter model ids from verbose output', async () => {
+    tempDir = makeTempDir('happier-opencode-preflight-models-nested-');
+    const fakeOpenCode = writeFakeOpenCodeModelsBinary(tempDir, [
+      'opencode/gpt-5',
+      '{"id":"gpt-5","providerID":"opencode","name":"GPT-5","status":"active","capabilities":{"toolcall":true}}',
+      'openrouter/deepseek/deepseek-v4-flash-0731',
+      '{"id":"deepseek/deepseek-v4-flash-0731","providerID":"openrouter","name":"DeepSeek V4 Flash","status":"active","capabilities":{"toolcall":true}}',
+      'openrouter/~anthropic/claude-opus-latest',
+      '{"id":"~anthropic/claude-opus-latest","providerID":"openrouter","name":"Claude Opus Latest","status":"active","capabilities":{"toolcall":true}}',
+    ]);
+
+    process.env.PATH = '/usr/bin:/bin';
+    process.env.HAPPIER_OPENCODE_PATH = fakeOpenCode;
+
+    const raw = await openCodePreflightModelsProbeAdapter.probeModelsRaw?.({
+      cwd: tempDir,
+      timeoutMs: 2_000,
+      backendTarget: undefined,
+      accountSettings: null,
+    });
+
+    expect(raw).toEqual([
+      { id: 'opencode/gpt-5', name: 'GPT-5', description: 'opencode' },
+      {
+        id: 'openrouter/deepseek/deepseek-v4-flash-0731',
+        name: 'DeepSeek V4 Flash',
+        description: 'openrouter',
+      },
+      {
+        id: 'openrouter/~anthropic/claude-opus-latest',
+        name: 'Claude Opus Latest',
+        description: 'openrouter',
+      },
+    ]);
+  });
+
+  it('rejects a partial verbose inventory when a header disagrees with its record identity', async () => {
+    tempDir = makeTempDir('happier-opencode-preflight-models-identity-');
+    const fakeOpenCode = writeFakeOpenCodeModelsBinary(tempDir, [
+      'opencode/gpt-5',
+      '{"id":"gpt-5","providerID":"opencode","name":"GPT-5","status":"active","capabilities":{"toolcall":true}}',
+      'openrouter/incorrect/model-id',
+      '{"id":"deepseek/deepseek-v4-flash-0731","providerID":"openrouter","name":"DeepSeek V4 Flash","status":"active","capabilities":{"toolcall":true}}',
+    ]);
+
+    process.env.PATH = '/usr/bin:/bin';
+    process.env.HAPPIER_OPENCODE_PATH = fakeOpenCode;
+
+    await expect(openCodePreflightModelsProbeAdapter.probeModelsRaw?.({
+      cwd: tempDir,
+      timeoutMs: 2_000,
+      backendTarget: undefined,
+      accountSettings: null,
+    })).resolves.toBeNull();
   });
 
   it('reads contextWindowTokens from OpenCode limit.context provider metadata', async () => {

@@ -226,7 +226,7 @@ describe('ApiSessionClient message commit queue', () => {
     await client.close();
   });
 
-  it('requests reconnect when message commits queue while disconnected', async () => {
+  it('leaves reconnect timing with an already-active supervisor when message commits queue while disconnected', async () => {
     vi.resetModules();
     supervisorStartCount = 0;
     sessionSocketStub = createApiSessionSocketStub({
@@ -247,7 +247,8 @@ describe('ApiSessionClient message commit queue', () => {
 
     client.sendAgentMessage('claude' as any, { type: 'message', message: 'FAKE_CLAUDE_OK_2' } as any);
 
-    await expect.poll(() => supervisorStartCount).toBeGreaterThan(0);
+    await flushMicrotasks();
+    expect(supervisorStartCount).toBe(0);
   });
 
   it('redacts socket commit errors before logging', async () => {
@@ -440,6 +441,67 @@ describe('ApiSessionClient message commit queue', () => {
     secondBestEffort.resolve();
     await expect(requiredCommit).resolves.toBeUndefined();
     await expect(secondBestEffortCommit).resolves.toBeUndefined();
+  }, 60_000);
+
+  it('serializes cumulative same-localId required snapshots without dropping the terminal update', async () => {
+    vi.resetModules();
+    supervisorStartCount = 0;
+    const delayedSocket = createDelayedSocketStub();
+    sessionSocketStub = delayedSocket;
+    userSocketStub = createApiSessionSocketStub({ connected: true, emitWithAckResult: { ok: true } });
+
+    const { ApiSessionClient } = await import('./sessionClient');
+    const client = new ApiSessionClient('tok', createPlainSessionFixture({ id: 's1' }));
+    const localId = 'cumulative-segment-1';
+    const streamingCommit = client.sendAgentMessageCommitted(
+      'codex',
+      { type: 'message', message: 'partial' },
+      {
+        localId,
+        meta: { happierStreamSegmentV1: { segmentState: 'streaming' } },
+      },
+    );
+
+    await vi.waitFor(() => {
+      expect(delayedSocket.state.pendingResolvers).toHaveLength(1);
+    });
+    const terminalCommit = client.sendAgentMessageCommitted(
+      'codex',
+      { type: 'message', message: 'partial plus final' },
+      {
+        localId,
+        meta: { happierStreamSegmentV1: { segmentState: 'complete' } },
+      },
+    );
+    await flushMicrotasks();
+    expect(delayedSocket.emitWithAck.mock.calls.filter(([event]) => event === 'message')).toHaveLength(1);
+
+    delayedSocket.resolveNext({ ok: true, id: 'm1', seq: 1, localId });
+    await vi.waitFor(() => {
+      expect(delayedSocket.emitWithAck.mock.calls.filter(([event]) => event === 'message')).toHaveLength(2);
+    });
+    const messageCalls = delayedSocket.emitWithAck.mock.calls.filter(([event]) => event === 'message');
+    expect(messageCalls[1]?.[1]).toMatchObject({
+      localId,
+      message: {
+        t: 'plain',
+        v: {
+          content: {
+            type: 'acp',
+            provider: 'codex',
+            data: { type: 'message', message: 'partial plus final' },
+          },
+          meta: {
+            happierStreamSegmentV1: { segmentState: 'complete' },
+          },
+        },
+      },
+    });
+
+    delayedSocket.resolveNext({ ok: true, id: 'm1', seq: 1, localId });
+    await expect(streamingCommit).resolves.toBeUndefined();
+    await expect(terminalCommit).resolves.toBeUndefined();
+    expect(delayedSocket.state.maxInFlight).toBe(1);
   }, 60_000);
 
   it('records committed user message seqs from commit acks', async () => {

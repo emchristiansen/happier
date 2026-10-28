@@ -1,3 +1,4 @@
+import { isClaudeSidechainRuntimeEvidence } from '../utils/sessionHookAttribution';
 import type { ConnectedServiceLimitCategoryV1 } from '@happier-dev/protocol';
 
 import { parseProviderResetAt, parseProviderTimestampMs } from '@/daemon/connectedServices/quotas/normalization';
@@ -22,6 +23,7 @@ export type NormalizedProviderUsageLimitDetailsV1 = Readonly<{
   action: null;
   connectedService: null;
   sourceProviderAccountId?: string | null;
+  sourceProviderOrganizationId?: string | null;
   /**
    * Set when the evidence row was imported from a subagent transcript (`isSidechain: true`).
    * Sidechain limits are real account-level evidence (quota snapshots may consume them) but
@@ -123,6 +125,8 @@ function containsRateLimitEvidence(value: unknown): boolean {
   if (!isRecord(value)) return false;
   return [
     value.error,
+    value.errors,
+    value.result,
     value.code,
     value.type,
     value.kind,
@@ -143,6 +147,8 @@ function containsClaudeUsageLimitEvidence(value: unknown): boolean {
   if (!isRecord(value)) return false;
   return [
     value.error,
+    value.errors,
+    value.result,
     value.code,
     value.type,
     value.kind,
@@ -220,6 +226,8 @@ function containsTransientThrottleEvidence(value: unknown): boolean {
   if (!isRecord(value)) return false;
   return [
     value.error,
+    value.errors,
+    value.result,
     value.code,
     value.type,
     value.kind,
@@ -243,6 +251,8 @@ function containsProviderCapacityEvidence(value: unknown): boolean {
   if (!isRecord(value)) return false;
   return [
     value.error,
+    value.errors,
+    value.result,
     value.code,
     value.type,
     value.kind,
@@ -258,25 +268,12 @@ function containsProviderCapacityEvidence(value: unknown): boolean {
 function readSyntheticProviderLimitId(records: readonly Record<string, unknown>[]): string | undefined {
   if (records.some(containsProviderCapacityEvidence)) return 'server_overloaded';
   if (records.some(containsTransientThrottleEvidence)) return 'transient';
-  for (const names of [
-    ['providerLimitId', 'provider_limit_id', 'limit', 'limitType', 'limit_type'],
-    ['code', 'error', 'type', 'kind'],
-  ] as const) {
-    for (const record of records) {
-      for (const name of names) {
-        const text = readString(record[name]);
-        if (!text) continue;
-        if (containsRateLimitEvidence(text)) return 'rate_limit';
-        if (
-          name === 'providerLimitId' ||
-          name === 'provider_limit_id' ||
-          name === 'limit' ||
-          name === 'limitType' ||
-          name === 'limit_type'
-        ) {
-          return text;
-        }
-      }
+  // An error code identifies the rejection, not the exhausted allowance. Unknown
+  // allowance identity must remain unknown so selected pool limits do not exclude it.
+  for (const record of records) {
+    for (const name of ['providerLimitId', 'provider_limit_id', 'limit', 'limitType', 'limit_type']) {
+      const text = readString(record[name]);
+      if (text) return text;
     }
   }
   return undefined;
@@ -339,8 +336,7 @@ function mapSyntheticClaudeApiErrorToUsageDetails(record: Record<string, unknown
   const timing = resolveClaudeUsageLimitResetTiming(record, Date.now());
   const resetAtMs = readSyntheticResetAtMs(records) ?? timing.resetAtMs;
   const retryAfterMs = readSyntheticRetryAfterMs(records) ?? timing.retryAfterMs;
-  const providerLimitId = readSyntheticProviderLimitId(records)
-    ?? (status === 429 ? 'rate_limit' : undefined);
+  const providerLimitId = readSyntheticProviderLimitId(records);
 
   return {
     v: 1,
@@ -393,7 +389,6 @@ export function mapClaudeStopFailureErrorToUsageDetails(
     retryAfterMs: null,
     quotaScope: 'account',
     recoverability: 'wait',
-    providerLimitId: 'rate_limit',
     planType: null,
     utilization: null,
     overage: null,
@@ -466,8 +461,14 @@ function markSidechainSourcedUsageDetails(
   record: Record<string, unknown> | null,
   details: NormalizedProviderUsageLimitDetailsV1 | null,
 ): NormalizedProviderUsageLimitDetailsV1 | null {
-  if (!details || record?.isSidechain !== true) return details;
+  if (!details || !isClaudeSidechainRuntimeEvidence(record)) return details;
   return { ...details, sourcedFromSidechain: true };
+}
+
+/** Availability telemetry does not establish that the parent operation failed. */
+export function mapClaudeProviderFailureToUsageDetails(event: unknown): NormalizedProviderUsageLimitDetailsV1 | null {
+  if (!isRecord(event) || isClaudeSidechainRuntimeEvidence(event)) return null;
+  return mapSyntheticClaudeApiErrorToUsageDetails(event);
 }
 
 export function mapClaudeRateLimitEventToUsageDetails(event: unknown): NormalizedProviderUsageLimitDetailsV1 | null {
@@ -520,27 +521,78 @@ export function mapClaudeRateLimitEventToUsageDetails(event: unknown): Normalize
   });
 }
 
-export function mapClaudeRateLimitEventToQuotaEvidence(event: unknown): NormalizedProviderUsageLimitDetailsV1 | null {
-  const record = isRecord(event) ? event : null;
-  if (record?.type !== 'rate_limit_event') return null;
-  const info = isRecord(record.rate_limit_info) ? record.rate_limit_info : null;
-  if (!info) return null;
-  const status = readString(info.status);
-  if (status !== 'allowed' && status !== 'allowed_warning') return null;
-  const utilization = readUtilizationPercent(info.utilization);
-  if (utilization === null) return null;
-  const rateLimitType = readString(info.rateLimitType ?? info.rate_limit_type);
+/**
+ * Claude reports a unified window's usage as the fraction of the window used — 0-1, above 1 once
+ * usage runs past the cap. Rounded to one decimal percent, as Claude's own statusline does.
+ */
+function readUnifiedWindowUsedPercent(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  return Math.max(0, Math.min(100, Math.round(value * 1000) / 10));
+}
+
+function buildPassiveQuotaEvidence(input: Readonly<{
+  providerLimitId: string | null;
+  utilization: number;
+  resetAtMs: number | null;
+}>): NormalizedProviderUsageLimitDetailsV1 {
   return {
     v: 1,
-    resetAtMs: readTimestampMs(info.resetsAt ?? info.resets_at),
+    resetAtMs: input.resetAtMs,
     retryAfterMs: null,
     quotaScope: 'account',
     recoverability: 'wait',
-    ...(rateLimitType ? { providerLimitId: rateLimitType } : {}),
+    ...(input.providerLimitId ? { providerLimitId: input.providerLimitId } : {}),
     planType: null,
-    utilization,
+    utilization: input.utilization,
     overage: null,
     action: null,
     connectedService: null,
   };
+}
+
+/**
+ * Every usage window a Claude `rate_limit_event` reports, one entry per window, whatever its
+ * status. Current Claude Code reports every window under `rate_limit_info.unifiedWindows` and
+ * leaves the top-level `utilization` unset; older builds only carry the surfaced window's
+ * top-level `utilization`.
+ */
+export function readClaudeRateLimitEventWindows(event: unknown): readonly NormalizedProviderUsageLimitDetailsV1[] {
+  const record = isRecord(event) ? event : null;
+  if (record?.type !== 'rate_limit_event') return [];
+  const info = isRecord(record.rate_limit_info) ? record.rate_limit_info : null;
+  if (!info) return [];
+
+  const unifiedWindows = isRecord(info.unifiedWindows) ? info.unifiedWindows : {};
+  const windowEvidence = Object.entries(unifiedWindows).flatMap(([windowId, window]) => {
+    if (!isRecord(window)) return [];
+    const utilization = readUnifiedWindowUsedPercent(window.utilization);
+    if (utilization === null) return [];
+    return [buildPassiveQuotaEvidence({
+      providerLimitId: windowId,
+      utilization,
+      resetAtMs: readTimestampMs(window.resetsAt),
+    })];
+  });
+  if (windowEvidence.length > 0) return windowEvidence;
+
+  const utilization = readUtilizationPercent(info.utilization);
+  if (utilization === null) return [];
+  return [buildPassiveQuotaEvidence({
+    providerLimitId: readString(info.rateLimitType ?? info.rate_limit_type),
+    utilization,
+    resetAtMs: readTimestampMs(info.resetsAt ?? info.resets_at),
+  })];
+}
+
+/** Availability is quota evidence even when an optional allowance is rejected. */
+export function mapClaudeRateLimitEventToQuotaEvidence(event: unknown): readonly NormalizedProviderUsageLimitDetailsV1[] {
+  const record = isRecord(event) ? event : null;
+  if (record && record.type !== 'rate_limit_event' && isClaudeSidechainRuntimeEvidence(record)) {
+    const details = mapSyntheticClaudeApiErrorToUsageDetails(record);
+    return details ? [{ ...details, sourcedFromSidechain: true }] : [];
+  }
+  const info = isRecord(record?.rate_limit_info) ? record.rate_limit_info : null;
+  const status = readString(info?.status);
+  return status === 'allowed' || status === 'allowed_warning' || status === 'rejected'
+    ? readClaudeRateLimitEventWindows(event) : [];
 }

@@ -32,7 +32,7 @@ describe('classifyRelayDrift', () => {
         })).toMatchObject({
             status: 'daemon_url_mismatch',
             repairAction: {
-                kind: 'connectBackgroundServiceToActiveRelay',
+                kind: 'setupThisComputer',
             },
         });
     });
@@ -45,7 +45,7 @@ describe('classifyRelayDrift', () => {
         })).toMatchObject({
             status: 'daemon_not_configured',
             repairAction: {
-                kind: 'connectBackgroundServiceToActiveRelay',
+                kind: 'setupThisComputer',
             },
         });
     });
@@ -58,7 +58,7 @@ describe('classifyRelayDrift', () => {
         })).toMatchObject({
             status: 'daemon_needs_auth',
             repairAction: {
-                kind: 'connectBackgroundServiceToActiveRelay',
+                kind: 'setupThisComputer',
             },
         });
     });
@@ -72,7 +72,7 @@ describe('classifyRelayDrift', () => {
         })).toMatchObject({
             status: 'daemon_not_installed',
             repairAction: {
-                kind: 'connectBackgroundServiceToActiveRelay',
+                kind: 'setupThisComputer',
             },
         });
     });
@@ -87,9 +87,51 @@ describe('classifyRelayDrift', () => {
         })).toMatchObject({
             status: 'daemon_not_running',
             repairAction: {
-                kind: 'connectBackgroundServiceToActiveRelay',
+                kind: 'setupThisComputer',
             },
         });
+    });
+
+    it('flags a daemon paired to a different account than the app (F7)', () => {
+        // Same relay, healthy service, valid credentials — for someone else's account. The app
+        // cannot see that machine's sessions and the gate will not repoint it silently, so with
+        // nothing said here the settings row claimed the daemon was "likely alive" and the only
+        // thing that re-offered setup was a relaunch.
+        expect(classifyRelayDrift({
+            activeRelayUrl: 'https://relay.example.test',
+            daemonRelayUrl: 'https://relay.example.test',
+            daemonAccountId: 'acct_daemon',
+            appAccountId: 'acct_app',
+            daemonNeedsAuth: false,
+            daemonServiceInstalled: true,
+            daemonRunning: true,
+        })).toMatchObject({
+            status: 'daemon_account_mismatch',
+            repairAction: { kind: 'setupThisComputer' },
+        });
+    });
+
+    it('stays aligned when the app and the daemon are on the same account, or the app has none (F7)', () => {
+        expect(classifyRelayDrift({
+            activeRelayUrl: 'https://relay.example.test',
+            daemonRelayUrl: 'https://relay.example.test',
+            daemonAccountId: 'acct_app',
+            appAccountId: 'acct_app',
+            daemonNeedsAuth: false,
+            daemonServiceInstalled: true,
+            daemonRunning: true,
+        })).toMatchObject({ status: 'aligned' });
+
+        // Signed out, or a relay whose account the app does not know: nothing to contradict.
+        expect(classifyRelayDrift({
+            activeRelayUrl: 'https://relay.example.test',
+            daemonRelayUrl: 'https://relay.example.test',
+            daemonAccountId: 'acct_daemon',
+            appAccountId: null,
+            daemonNeedsAuth: false,
+            daemonServiceInstalled: true,
+            daemonRunning: true,
+        })).toMatchObject({ status: 'aligned' });
     });
 });
 

@@ -326,13 +326,6 @@ async function beginRuntimeAuthRecoveryIntake(input: Readonly<{
   }
 }
 
-function isCanonicalSessionId(value: unknown): value is string {
-  if (typeof value !== 'string') return false;
-  const normalized = value.trim();
-  if (!normalized) return false;
-  return !/^PID-\d+$/.test(normalized);
-}
-
 function safeTokenEquals(provided: string, expected: string): boolean {
   const hashA = createHash('sha256').update(provided).digest();
   const hashB = createHash('sha256').update(expected).digest();
@@ -407,10 +400,11 @@ export function createDaemonControlApp({
     pid: number;
     materializationKey: string;
     connectedServicesBindingsRaw: unknown;
+    previousMaterializedRoot?: string;
     sessionDirectory?: string | null;
     sessionId?: string;
   }>) => Promise<ExecutionRunConnectedServiceMaterializeResponseWire>;
-  // Run-end lifecycle: unregister the run's runtime target + clean its run-scoped materialized root.
+  // Run-end lifecycle: unregister the runtime target and clean only disposable run materialization.
   handleExecutionRunConnectedServiceRelease?: (input: Readonly<{
     runId: string;
     pid: number;
@@ -1623,6 +1617,7 @@ export function createDaemonControlApp({
       pid: request.body.pid,
       materializationKey: request.body.materializationKey,
       connectedServicesBindingsRaw: request.body.connectedServicesBindingsRaw,
+      ...(request.body.previousMaterializedRoot ? { previousMaterializedRoot: request.body.previousMaterializedRoot } : {}),
       sessionDirectory: request.body.sessionDirectory ?? null,
       ...(request.body.sessionId ? { sessionId: request.body.sessionId } : {}),
     });
@@ -1630,7 +1625,8 @@ export function createDaemonControlApp({
   });
 
   // Run-end lifecycle for the run-materialization bridge: unregister the run's runtime target and
-  // clean its run-scoped materialized root. Best-effort semantics on the caller side; the handler
+  // clean only disposable run materialization. Durable provider homes are retained. Best-effort
+  // semantics on the caller side; the handler
   // itself never tears down a target owned by a different materialization.
   typed.post(EXECUTION_RUN_CONNECTED_SERVICE_RELEASE_PATH, {
     schema: {
@@ -1949,30 +1945,23 @@ export function createDaemonControlApp({
             ...(resolved.errorDetail ? { errorDetail: resolved.errorDetail } : {}),
           };
         }
-        if (resolved.status === 'pending') {
-          return {
-            success: true as const,
-            status: 'pending' as const,
-          };
+        if (resolved.status === 'unsupported') {
+          logger.warn('[CONTROL SERVER] Canonical spawn nonce resolution is unsupported; readiness remains pending', {
+            spawnNonce, reason: 'unsupported',
+          });
+          return { success: true as const, status: 'pending' as const };
         }
+        return { success: true as const, status: resolved.status };
       } catch (error) {
-        logger.warn('[CONTROL SERVER] Canonical spawn nonce resolution failed; falling back to tracked children', {
+        logger.warn('[CONTROL SERVER] Canonical spawn nonce resolution failed; readiness remains pending', {
           spawnNonce,
           error: readSafeDaemonControlErrorDiagnostic(error),
         });
+        return { success: true as const, status: 'pending' as const };
       }
     }
 
     const matches = getChildren().filter((child) => child.spawnOptions?.spawnNonce === spawnNonce);
-    const successMatch = matches.find((child) => isCanonicalSessionId(child.happySessionId));
-    if (successMatch && isCanonicalSessionId(successMatch.happySessionId)) {
-      return {
-        success: true as const,
-        status: 'success' as const,
-        sessionId: successMatch.happySessionId.trim(),
-      };
-    }
-
     if (matches.length > 0) {
       return {
         success: true as const,
@@ -2303,6 +2292,7 @@ export function startDaemonControlServer({
     pid: number;
     materializationKey: string;
     connectedServicesBindingsRaw: unknown;
+    previousMaterializedRoot?: string;
     sessionDirectory?: string | null;
     sessionId?: string;
   }>) => Promise<ExecutionRunConnectedServiceMaterializeResponseWire>;

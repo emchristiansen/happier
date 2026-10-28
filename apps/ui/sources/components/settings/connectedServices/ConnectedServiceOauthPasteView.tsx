@@ -9,7 +9,8 @@ import { ItemList } from '@/components/ui/lists/ItemList';
 import { Text, TextInput } from '@/components/ui/text/Text';
 import { Modal } from '@/modal';
 import { useAuth } from '@/auth/context/AuthContext';
-import { exchangeConnectedServiceOauthViaProxy } from '@/sync/api/account/apiConnectedServicesV2';
+import { assertConnectedServiceOperationSupported } from '@/sync/api/account/connectedServiceOperationSupport';
+import { useServerFeaturesRuntimeSnapshot } from '@/sync/domains/features/featureDecisionRuntime';
 import { generateOauthState, generatePkceCodes, parseOauthCallbackUrl } from '@/utils/auth/oauthCore';
 import { fireAndForget } from '@/utils/system/fireAndForget';
 import { t } from '@/text';
@@ -17,18 +18,16 @@ import { openExternalUrl } from '@/utils/url/openExternalUrl';
 
 import {
   ConnectedServiceIdSchema,
-  encodeBase64,
+  supportsConnectedServiceOperation,
   type ConnectedServiceId,
 } from '@happier-dev/protocol';
 
 import { getConnectedServiceOauthAdapter } from '@/sync/domains/connectedServices/oauth/connectedServiceOauthAdapters';
-import { buildOauthRecordFromProxyPayload, parseConnectedServiceOauthProxyBundle } from '@/sync/domains/connectedServices/oauth/connectedServiceOauthProxyBundle';
 import { resolveConnectedServiceOauthPasteCopy } from './oauth/resolveConnectedServiceOauthPasteCopy';
 import { resolveConnectedServiceOauthErrorMessage } from './oauth/resolveConnectedServiceOauthErrorMessage';
 import { storeConnectedServiceCredentialWithIdentityConfirmation } from './storeConnectedServiceCredentialWithIdentityConfirmation';
 import { runConnectedServiceCredentialStoredEffects } from './runConnectedServiceCredentialStoredEffects';
 import { Icon } from '@/components/ui/icons/Icon';
-import { createConnectedServiceOauthExchangeKeyPair } from '@/sync/domains/connectedServices/oauth/createConnectedServiceOauthExchangeKeyPair';
 
 function asStringParam(value: unknown): string {
   if (Array.isArray(value)) return typeof value[0] === 'string' ? value[0] : '';
@@ -45,6 +44,12 @@ export const ConnectedServiceOauthPasteView = React.memo(function ConnectedServi
   const auth = useAuth();
   const parsedServiceId = ConnectedServiceIdSchema.safeParse(asStringParam(props.serviceId).trim());
   const serviceId: ConnectedServiceId | null = parsedServiceId.success ? parsedServiceId.data : null;
+  const serverFeatures = useServerFeaturesRuntimeSnapshot({
+    enabled: serviceId !== null && !supportsConnectedServiceOperation(null, serviceId),
+  });
+  const operationSupported = serviceId !== null && supportsConnectedServiceOperation(
+    serverFeatures.status === 'ready' ? serverFeatures.features : null, serviceId,
+  );
   const profileId = asStringParam(props.profileId).trim();
   const adapter = React.useMemo(() => (serviceId ? getConnectedServiceOauthAdapter(serviceId) : null), [serviceId]);
   const copy = React.useMemo(() => (serviceId ? resolveConnectedServiceOauthPasteCopy(serviceId) : null), [serviceId]);
@@ -54,10 +59,6 @@ export const ConnectedServiceOauthPasteView = React.memo(function ConnectedServi
   const [busy, setBusy] = React.useState(false);
   const [redirectUrlInput, setRedirectUrlInput] = React.useState('');
   const [didShowOpenInstructions, setDidShowOpenInstructions] = React.useState(false);
-  const keyPairRef = React.useRef<ReturnType<typeof createConnectedServiceOauthExchangeKeyPair> | null>(null);
-  if (!keyPairRef.current) {
-    keyPairRef.current = createConnectedServiceOauthExchangeKeyPair();
-  }
 
   React.useEffect(() => {
     let cancelled = false;
@@ -89,45 +90,33 @@ export const ConnectedServiceOauthPasteView = React.memo(function ConnectedServi
   };
 
   const handlePaste = React.useCallback(async () => {
-    if (!serviceId || !adapter || !pkce || !state || !profileId) return;
+    if (!operationSupported || !serviceId || !adapter || !pkce || !state || !profileId) return;
     const pastedUrl = redirectUrlInput.trim();
     if (!pastedUrl) return;
+    let exchangeAttempted = false;
     setBusy(true);
     try {
-      const parsed = parseOauthCallbackUrl({ url: pastedUrl, redirectUri });
+      await assertConnectedServiceOperationSupported(serviceId);
+      const parsed = parseOauthCallbackUrl({ url: pastedUrl, redirectUri, allowRawAuthorizationCode: adapter.allowRawAuthorizationCode });
       if (parsed.error) throw new Error(`OAuth error: ${parsed.error}`);
       const code = parsed.code ?? '';
-      const returnedState = parsed.state ?? '';
+      // Raw manual codes return no state. The opted-in provider verifies this
+      // exact attempt's PKCE; structured callback responses still return state.
+      const returnedState = parsed.rawAuthorizationCode ? state : parsed.state ?? '';
       if (!code) throw new Error('Missing code');
       if (!returnedState) throw new Error(copy?.missingStateError ?? t('connectedServices.oauthPaste.errors.missingState'));
       if (returnedState !== state) throw new Error(t('connectedServices.oauthPaste.errors.stateMismatch'));
 
       const credentials = ensureCredentials();
-      const now = Date.now();
-      const publicKeyB64Url = encodeBase64(keyPairRef.current!.publicKey, 'base64url');
-
-      const exchanged = await exchangeConnectedServiceOauthViaProxy(credentials, {
-        serviceId,
-        publicKey: publicKeyB64Url,
+      exchangeAttempted = true;
+      const record = await adapter.exchangeAuthorizationCodeForRecord({
+        credentials,
+        profileId,
         code,
         verifier: pkce.verifier,
         redirectUri,
         state: returnedState,
-      });
-
-      const payload = parseConnectedServiceOauthProxyBundle({
-        bundleB64Url: exchanged.bundle,
-        recipientSecretKey: keyPairRef.current!.secretKey,
-      });
-      if (payload.serviceId !== serviceId) {
-        throw new Error('OAuth bundle service mismatch');
-      }
-
-      const record = buildOauthRecordFromProxyPayload({
-        now,
-        serviceId,
-        profileId,
-        payload,
+        now: Date.now(),
       });
 
       const stored = await storeConnectedServiceCredentialWithIdentityConfirmation(
@@ -143,6 +132,16 @@ export const ConnectedServiceOauthPasteView = React.memo(function ConnectedServi
       );
       props.onDone();
     } catch (e: unknown) {
+      if (exchangeAttempted) {
+        // The provider may have consumed this one-use code before the failure.
+        setRedirectUrlInput('');
+        setState('');
+        setPkce(null);
+        setDidShowOpenInstructions(false);
+        const nextPkce = await generatePkceCodes();
+        setState(generateOauthState());
+        setPkce(nextPkce);
+      }
       const message = resolveConnectedServiceOauthErrorMessage(
         e,
         t('connectedServices.oauthPaste.alerts.failedToConnect'),
@@ -154,11 +153,17 @@ export const ConnectedServiceOauthPasteView = React.memo(function ConnectedServi
     } finally {
       setBusy(false);
     }
-  }, [adapter, auth.credentials, copy?.missingStateError, pkce, profileId, props, redirectUri, serviceId, state, redirectUrlInput]);
+  }, [adapter, auth.credentials, copy?.missingStateError, operationSupported, pkce, profileId, props, redirectUri, serviceId, state, redirectUrlInput]);
 
   const handleOpenAuthorization = React.useCallback(() => {
-    if (!authorizationUrl) return;
+    if (!operationSupported || !serviceId || !authorizationUrl) return;
     fireAndForget((async () => {
+      try {
+        await assertConnectedServiceOperationSupported(serviceId);
+      } catch (error) {
+        await Modal.alert(t('common.error'), resolveConnectedServiceOauthErrorMessage(error, t('connectedServices.oauthPaste.alerts.failedToConnect')));
+        return;
+      }
       if (!didShowOpenInstructions) {
         setDidShowOpenInstructions(true);
         await Modal.alertAsync(
@@ -175,7 +180,7 @@ export const ConnectedServiceOauthPasteView = React.memo(function ConnectedServi
         );
       }
     })(), { tag: 'ConnectedServiceOauthPasteView.openAuthorizationUrl' });
-  }, [authorizationUrl, copy?.connectWebDescription, copy?.pasteRedirectUrlPromptBody, didShowOpenInstructions]);
+  }, [authorizationUrl, copy?.connectWebDescription, copy?.pasteRedirectUrlPromptBody, didShowOpenInstructions, operationSupported, serviceId]);
 
   if (!serviceId || !profileId || !adapter) {
     return (
@@ -210,7 +215,7 @@ export const ConnectedServiceOauthPasteView = React.memo(function ConnectedServi
               testID="connectedServices.oauthPaste.openAuthorizationButton"
               size="normal"
               title={t('connectedServices.oauthPaste.openAuthorizationUrl')}
-              disabled={!authorizationUrl}
+              disabled={!operationSupported || !authorizationUrl}
               onPress={handleOpenAuthorization}
             />
           </View>
@@ -222,7 +227,7 @@ export const ConnectedServiceOauthPasteView = React.memo(function ConnectedServi
         </View>
       </ItemGroup>
 
-      <ItemGroup title={t('connectedServices.oauthPaste.pasteRedirectUrl')}>
+      <ItemGroup title={copy?.pasteRedirectUrlTitle ?? t('connectedServices.oauthPaste.pasteRedirectUrl')}>
         <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
           <Text style={{ color: theme.colors.text.secondary, marginBottom: 8 }}>
             {copy?.pasteRedirectUrlPromptBody ?? t('connectedServices.oauthPaste.pasteRedirectUrlPromptBody')}
@@ -241,7 +246,7 @@ export const ConnectedServiceOauthPasteView = React.memo(function ConnectedServi
             testID="connectedServices.oauthPaste.validateRedirectButton"
             size="normal"
             title={busy ? t('connectedServices.oauthPaste.working') : t('common.continue')}
-            disabled={busy || !redirectUrlInput.trim()}
+            disabled={!operationSupported || busy || !redirectUrlInput.trim()}
             onPress={busy ? undefined : handlePaste}
           />
           <View style={{ marginTop: 8 }}>

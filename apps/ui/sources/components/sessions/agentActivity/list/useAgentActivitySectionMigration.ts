@@ -93,7 +93,7 @@ function reconcileMigrations(
 
     for (const entry of entries) {
         present.add(entry.id);
-        const target = resolveAgentActivitySectionId(entry.status);
+        const target = resolveAgentActivitySectionId(entry.status, entry.isActive);
         const drawn = state.drawn.get(entry.id);
 
         // A row nobody has seen yet has nowhere to travel from: it adopts its real section at once.

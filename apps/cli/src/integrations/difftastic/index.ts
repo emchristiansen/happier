@@ -3,9 +3,13 @@
  */
 
 import { spawn } from 'child_process';
+import { existsSync } from 'node:fs';
 import { join, resolve } from 'path';
-import { platform, arch } from 'os';
+import { platform } from 'os';
 import { projectPath } from '@/projectPath';
+import { INSTALLABLE_KEYS } from '@happier-dev/protocol';
+import { ensureOptionalRuntime } from '@/installables/runtime/optionalRuntimeInstallables';
+import { resolveCliRuntimeAssetPath } from '@/runtime/assets/resolveCliRuntimeAssetPath';
 
 export interface DifftasticResult {
     exitCode: number
@@ -20,10 +24,14 @@ export interface DifftasticOptions {
 /**
  * Get the platform-specific binary path
  */
-function getBinaryPath(): string {
+async function getBinaryPath(): Promise<string> {
     const platformName = platform();
     const binaryName = platformName === 'win32' ? 'difft.exe' : 'difft';
-    return resolve(join(projectPath(), 'tools', 'unpacked', binaryName));
+    const bundled = resolveCliRuntimeAssetPath('tools', 'unpacked', binaryName);
+    if (existsSync(bundled)) return bundled;
+    const projectBinary = resolve(join(projectPath(), 'tools', 'unpacked', binaryName));
+    if (existsSync(projectBinary)) return projectBinary;
+    return await ensureOptionalRuntime(INSTALLABLE_KEYS.DIFFTASTIC);
 }
 
 /**
@@ -32,8 +40,8 @@ function getBinaryPath(): string {
  * @param options - Options for difftastic execution
  * @returns Promise with exit code, stdout and stderr
  */
-export function run(args: string[], options?: DifftasticOptions): Promise<DifftasticResult> {
-    const binaryPath = getBinaryPath();
+export async function run(args: string[], options?: DifftasticOptions): Promise<DifftasticResult> {
+    const binaryPath = await getBinaryPath();
     
     return new Promise((resolve, reject) => {
         const child = spawn(binaryPath, args, {
@@ -60,7 +68,7 @@ export function run(args: string[], options?: DifftasticOptions): Promise<Diffta
 
         child.on('close', (code) => {
             resolve({
-                exitCode: code || 0,
+                exitCode: typeof code === 'number' ? code : -1,
                 stdout,
                 stderr
             });

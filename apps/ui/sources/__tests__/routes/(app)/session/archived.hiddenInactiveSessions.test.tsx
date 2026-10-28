@@ -1,7 +1,9 @@
 import React from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { renderScreen } from '@/dev/testkit';
+import { pressTestInstanceAsync, renderScreen } from '@/dev/testkit';
+import { settingsDefaults } from '@/sync/domains/settings/settings';
+import { ActionsSettingsV1Schema } from '@happier-dev/protocol';
 import { createStorageStoreMock } from '@/dev/testkit/mocks/storage';
 import { createTextModuleMock } from '@/dev/testkit/mocks/text';
 
@@ -106,6 +108,7 @@ vi.mock('@/sync/domains/state/storage', async (importOriginal) => {
         importOriginal,
         overrides: {
             storage: createStorageStoreMock({
+                settings: settingsDefaults,
                 sessions: {},
                 machines: {},
             }),
@@ -135,10 +138,13 @@ vi.mock('@/sync/domains/state/storage', async (importOriginal) => {
 });
 
 import { Modal } from '@/modal';
+import { storage } from '@/sync/domains/state/storage';
 import { sessionUnarchiveWithServerScope } from '@/sync/ops';
 
 describe('Archived sessions route', () => {
     beforeEach(() => {
+        storage.getState().settings = settingsDefaults;
+        vi.mocked(Modal.confirm).mockClear();
         mockNavigateToSession.mockReset();
         capturedSectionListProps = null;
         modalMock.alert.mockReset();
@@ -508,13 +514,26 @@ describe('Archived sessions route', () => {
         const screen = await renderScreen(<Screen />);
         const unarchiveButton = screen.root.find((node: any) => node.props?.accessibilityLabel === 'sessionInfo.unarchiveSession');
 
-        unarchiveButton.props.onPress();
+        await pressTestInstanceAsync(unarchiveButton, 'unarchive session');
 
-        expect(Modal.alert).toHaveBeenCalledTimes(1);
-        const [, , buttons] = (Modal.alert as any).mock.calls[0];
-        const confirm = (buttons as any[]).find((button) => button?.text === 'sessionInfo.unarchiveSession');
-        await confirm.onPress();
+        expect(Modal.alert).not.toHaveBeenCalled();
+        expect(Modal.confirm).not.toHaveBeenCalled();
 
         expect(sessionUnarchiveWithServerScope).toHaveBeenCalledWith('archived-1', { serverId: 'server-archived' });
+    });
+
+    it('does not unarchive when Ask first is configured and cancelled', async () => {
+        storage.getState().settings = { ...settingsDefaults, actionsSettingsV1: ActionsSettingsV1Schema.parse({
+            v: 1, actions: { 'session.unarchive': { approvalRequiredSurfaces: ['ui_button'] } },
+        }) };
+        vi.mocked(Modal.confirm).mockResolvedValueOnce(false);
+        mockSessions.all = [{ id: 'archived-1', active: false, archivedAt: 123,
+            updatedAt: 20, metadata: { name: 'Archived Session', path: '/tmp/archived' }, serverId: 'server-archived' }];
+        const Screen = (await import('@/app/(app)/session/archived')).default;
+        const screen = await renderScreen(<Screen />);
+        const button = screen.root.find((node) => node.props.accessibilityLabel === 'sessionInfo.unarchiveSession');
+        await pressTestInstanceAsync(button, 'unarchive session');
+        expect(Modal.confirm).toHaveBeenCalled();
+        expect(sessionUnarchiveWithServerScope).not.toHaveBeenCalled();
     });
 });

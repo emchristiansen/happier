@@ -1,4 +1,5 @@
 import type { ClaudeRemoteRunnerKind } from '../remote/claudeRemoteDispatch';
+import { isReplaySdkMessage } from '../remote/runtimeActivityEvidence';
 
 import type { ClaudeWorkflowActivitySource } from './claudeWorkflowActivitySource';
 
@@ -24,5 +25,7 @@ export function routeClaudeSdkMessageToWorkflowSource(params: Readonly<{
   workflowActivitySource: ClaudeWorkflowActivitySource | null;
 }>): void {
   if (params.runnerKind !== 'agentSdk' && params.runnerKind !== 'legacy') return;
-  params.workflowActivitySource?.observeTranscriptMessage(params.message);
+  params.workflowActivitySource?.observeTranscriptMessage(params.message, {
+    historicalReplay: isReplaySdkMessage(params.message),
+  });
 }

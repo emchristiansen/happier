@@ -83,6 +83,31 @@ function subagentSeenByBothSides(toolUseId: string, overrides?: Partial<AgentAct
 }
 
 describe('deriveAgentActivityEntries', () => {
+    it('uses a newer explicit local terminal result over an older running headline', () => {
+        const seen = subagentSeenByBothSides('toolu_1', { status: 'succeeded', endedAtMs: 3_000 });
+        const merged = deriveAgentActivityEntries({ headline: makeHeadline([seen.headline]), local: [seen.local] });
+        expect(merged.entries[0]?.status).toBe('succeeded');
+        expect(deriveAgentActivityCounts(merged.entries.map(toAgentActivityCountable)).live).toBe(0);
+    });
+
+    it('does not claim lost process-owned work is running, including unloaded headline entries', () => {
+        const seen = subagentSeenByBothSides('toolu_1');
+        const merged = deriveAgentActivityEntries({
+            headline: makeHeadline([seen.headline]),
+            local: [localEntry({ id: 'execution_run:independent', kind: 'execution_run' })],
+            runtimeLostSinceMs: 4_000,
+        });
+        expect(merged.entries.find((entry) => entry.id === seen.headline.entryId)?.status).toBe('unknown');
+        expect(merged.entries.find((entry) => entry.id === 'execution_run:independent')?.status).toBe('running');
+        expect(deriveAgentActivityCounts(merged.entries.map(toAgentActivityCountable)).live).toBe(1);
+    });
+
+    it('preserves newer child evidence beyond the runtime loss instant', () => {
+        const seen = subagentSeenByBothSides('toolu_1', { updatedAtMs: 5_000 });
+        expect(deriveAgentActivityEntries({
+            headline: makeHeadline([seen.headline]), local: [seen.local], runtimeLostSinceMs: 4_000,
+        }).entries[0]?.status).toBe('running');
+    });
     describe('the cross-source join', () => {
         // THE keystone. The CLI names this agent `workflow_agent:implicit:agent-activity:toolu_1`;
         // the UI derives the same Task as `subagent_sidechain:toolu_1`. A merge keyed on the entry id

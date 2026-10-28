@@ -26,6 +26,7 @@ export {
 } from './_types';
 
 export { SelectionList } from './SelectionList';
+export { SelectionListSectionHeader } from './SelectionListSectionHeader';
 export { resolvePopoverSelectionListHeightBehavior } from './resolvePopoverSelectionListHeightBehavior';
 export {
     DrillDownChevron,

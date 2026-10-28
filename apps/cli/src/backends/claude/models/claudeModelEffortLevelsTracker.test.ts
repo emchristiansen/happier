@@ -38,8 +38,10 @@ const effortCapabilities = (tiers: readonly string[]): AnthropicModelEntry['capa
   },
 });
 
-const createTracker = (): ReturnType<typeof createClaudeModelEffortLevelsTracker> =>
-  createClaudeModelEffortLevelsTracker({ resolveTimeoutMs: () => 1_000 });
+const createTracker = (
+  accountSettings?: Readonly<Record<string, unknown>> | null,
+): ReturnType<typeof createClaudeModelEffortLevelsTracker> =>
+  createClaudeModelEffortLevelsTracker({ resolveTimeoutMs: () => 1_000, accountSettings });
 
 beforeEach(() => {
   fetchAnthropicModelsMock.mockReset();
@@ -60,6 +62,19 @@ afterEach(() => {
 });
 
 describe('createClaudeModelEffortLevelsTracker', () => {
+  it('does not dynamically discover effort tiers when the account setting disables model probing', async () => {
+    fetchAnthropicModelsMock.mockResolvedValue([
+      { id: 'claude-opus-9', displayName: 'Opus 9', capabilities: effortCapabilities(['low', 'high']) },
+    ]);
+    const tracker = createTracker({ claudeDynamicModelProbeEnabled: false });
+
+    await tracker.refresh('claude-opus-9');
+
+    expect(tracker.getLevels()).toEqual([]);
+    expect(readClaudeCodeNativeCredentialMock).not.toHaveBeenCalled();
+    expect(fetchAnthropicModelsMock).not.toHaveBeenCalled();
+  });
+
   it('reports the tiers a discovered model declares', async () => {
     fetchAnthropicModelsMock.mockResolvedValue([
       { id: 'claude-opus-9', displayName: 'Opus 9', capabilities: effortCapabilities(['low', 'high', 'xhigh']) },

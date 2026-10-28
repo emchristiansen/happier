@@ -4,6 +4,41 @@ import { z } from 'zod';
 import { getActionSpec } from './actions/actionSpecs.js';
 import { SESSION_AGENT_TRANSITION_VECTORS as V } from './sessionAgentTransitionVectors.js';
 import { SessionForkRpcParamsSchema } from './sessionFork.js';
+import { AcpConfigOptionOverridesV1Schema } from './sessionMetadata/metadataOverridesV1.js';
+import { SessionAgentTransitionSelectionV1Schema } from './sessionAgentTransition.js';
+
+// Published CLI stable 0.2.15 and preview 0.2.15-preview.1 linux-x64.json
+// both pin 22ac8263cfdbcdb845441b9044ff18199cf7652e. This is the selection
+// reader from that immutable source's sessionAgentTransition.ts, not a schema
+// derived from the current reader. Retire when these strict peers are unsupported.
+const ReleasedTransitionSelectionSchema = z.object({
+  v: z.literal(1),
+  agentId: z.string().trim().min(1).max(128),
+  modelId: z.string().trim().min(1).max(256).optional(),
+  providerConnectionId: z.string().trim().min(1).max(128).nullable().optional(),
+  acpSessionModeId: z.string().trim().min(1).max(128).nullable().optional(),
+  sessionConfigOptionOverrides: AcpConfigOptionOverridesV1Schema.optional(),
+}).strict().superRefine((selection, ctx) => {
+  if (selection.providerConnectionId == null) return;
+  if (typeof selection.modelId === 'string' && selection.modelId.length > 0) return;
+  ctx.addIssue({ code: 'custom', path: ['modelId'], message: 'modelId is required when providerConnectionId is set.' });
+});
+
+describe('compat — configured target selections and released inspection readers', () => {
+  it('keeps built-in selections readable while refusing exact configured identity', () => {
+    const builtIn = { v: 1, agentId: 'claude' };
+    const configured = { v: 1, agentId: 'customAcp', backendTarget: { kind: 'configuredAcpBackend', backendId: 'b' } };
+    expect(ReleasedTransitionSelectionSchema.safeParse(builtIn).success).toBe(true);
+    expect(SessionAgentTransitionSelectionV1Schema.safeParse(builtIn).success).toBe(true);
+    expect(SessionAgentTransitionSelectionV1Schema.safeParse(configured).success).toBe(true);
+    expect(ReleasedTransitionSelectionSchema.safeParse(configured).success).toBe(false);
+    // The released batch reader has an array of that strict selection. One
+    // unsupported row rejects the whole request; clients must partition it.
+    const releasedBatch = z.object({ v: z.literal(1), sourceSessionId: z.string().trim().min(1), selections: z.array(ReleasedTransitionSelectionSchema).min(1) }).strict();
+    expect(releasedBatch.safeParse({ v: 1, sourceSessionId: 's', selections: [builtIn, configured] }).success).toBe(false);
+    expect(releasedBatch.safeParse({ v: 1, sourceSessionId: 's', selections: [builtIn] }).success).toBe(true);
+  });
+});
 
 /**
  * Section 6.7 compatibility directions for the predecessor tree.

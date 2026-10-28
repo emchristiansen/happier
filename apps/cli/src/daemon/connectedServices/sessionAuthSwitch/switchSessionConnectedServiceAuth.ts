@@ -284,7 +284,9 @@ export type SessionConnectedServiceRuntimeAuthSelectionMaterializerMode = 'apply
 
 export type SessionConnectedServiceRuntimeAuthSelectionMaterializerInput = Readonly<{
   mode: SessionConnectedServiceRuntimeAuthSelectionMaterializerMode;
-  tracked: TrackedSession;
+  tracked: TrackedSession | null;
+  cwd?: string | null;
+  persistedSessionMetadata?: Record<string, unknown> | null;
   sessionId: string;
   agentId: CatalogAgentId;
   serviceId: ConnectedServiceId;
@@ -352,6 +354,7 @@ export type SwitchSessionConnectedServiceAuthInput = Readonly<{
     cwd?: string | null;
     /** Persisted vendor session-file hint (provider-derived by the caller) — reachability fast path. */
     candidatePersistedSessionFile?: string | null;
+    metadata?: Record<string, unknown> | null;
   }> | null>;
   api: ConnectedServiceProfilesApi;
   resolveContinuity(input: Readonly<{
@@ -364,13 +367,14 @@ export type SwitchSessionConnectedServiceAuthInput = Readonly<{
     previousBindings: ConnectedServiceBindingsV1;
     normalizedBindings: ConnectedServiceBindingsV1;
     runtimeAuthSelection?: unknown;
+    persistedSessionMetadata?: Record<string, unknown> | null;
     connectedServiceMaterializationIdentityV1?: ConnectedServiceMaterializationIdentityV1 | null;
     vendorResumeId?: string | null;
     /**
      * For an INACTIVE switch (tracked=null) the daemon adapter cannot read cwd/target root from a
      * tracked session, so the switch forwards the inactive session's working directory and persisted
-     * session-file hint here. The adapter uses them (plus the deterministic reconstructed materialized
-     * root) to prove shared-state resume reachability instead of fail-closing a resumable session.
+     * session-file hint here. Preparation supplies the post-switch target; persisted metadata supplies
+     * the previous runtime's state source without inventing a tracked process.
      */
     cwd?: string | null;
     candidatePersistedSessionFile?: string | null;
@@ -1448,7 +1452,9 @@ function verificationFailureResult(input: Readonly<{
 
 async function maybeMaterializeRuntimeAuthSelection(input: Readonly<{
   materializeRuntimeAuthSelection: SwitchSessionConnectedServiceAuthInput['materializeRuntimeAuthSelection'];
-  tracked: TrackedSession;
+  tracked: TrackedSession | null;
+  cwd?: string | null;
+  persistedSessionMetadata?: Record<string, unknown> | null;
   sessionId: string;
   agentId: CatalogAgentId;
   serviceId: ConnectedServiceId;
@@ -1466,6 +1472,8 @@ async function maybeMaterializeRuntimeAuthSelection(input: Readonly<{
   const materialized = await input.materializeRuntimeAuthSelection({
     mode: input.mode,
     tracked: input.tracked,
+    ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
+    ...(input.persistedSessionMetadata === undefined ? {} : { persistedSessionMetadata: input.persistedSessionMetadata }),
     sessionId: input.sessionId,
     agentId: input.agentId,
     serviceId: input.serviceId,
@@ -1986,6 +1994,32 @@ export async function switchSessionConnectedServiceAuth(
         for (const serviceId of changedServiceIds) {
           const next = nextByServiceId.get(serviceId);
           if (!next) continue;
+          const runtimeAuthSelection = await maybeMaterializeRuntimeAuthSelection({
+            materializeRuntimeAuthSelection: input.materializeRuntimeAuthSelection,
+            tracked: null,
+            cwd: inactive.cwd,
+            persistedSessionMetadata: inactive.metadata,
+            sessionId: input.request.sessionId,
+            agentId: inactive.agentId,
+            serviceId,
+            previous: previousByServiceId.get(serviceId) ?? null,
+            next,
+            previousBindings,
+            normalizedBindings: normalized.normalized,
+            groupMetadataByServiceId: normalized.groupMetadataByServiceId,
+            mode: input.dryRun ? 'preflight' : 'apply',
+            groupSwitchTriggerReason: input.groupSwitchTriggerReason,
+            ...(input.expectedCredentialRevisionByServiceId?.[serviceId] === undefined ? {} : {
+              expectedCredentialRevision: input.expectedCredentialRevisionByServiceId[serviceId],
+            }),
+          });
+          await awaitRuntimeAuthCredentialWriteCommitted(runtimeAuthSelection);
+          const blockingDiagnostics = readRuntimeAuthSelectionBlockingMaterializationDiagnostics(runtimeAuthSelection);
+          if (blockingDiagnostics.length > 0) {
+            return buildRuntimeAuthMaterializationFailureResult({
+              agentId: inactive.agentId, serviceId, next, diagnostics: blockingDiagnostics, diagnosticSource,
+            });
+          }
           const continuity = await observeConnectedServiceAuthStage({
             sessionId: input.request.sessionId,
             bindings: [{
@@ -2002,14 +2036,16 @@ export async function switchSessionConnectedServiceAuth(
             next,
             previousBindings,
             normalizedBindings: normalized.normalized,
+            persistedSessionMetadata: inactive.metadata,
+            ...(runtimeAuthSelection === null || runtimeAuthSelection === undefined ? {} : { runtimeAuthSelection }),
             ...(connectedServiceMaterializationIdentityV1
               ? { connectedServiceMaterializationIdentityV1 }
               : {}),
             ...(typeof inactive.vendorResumeId === 'string' && inactive.vendorResumeId.trim()
               ? { vendorResumeId: inactive.vendorResumeId.trim() }
               : {}),
-            // Inactive switch (tracked=null): forward the session cwd + persisted hint so the daemon
-            // adapter can reconstruct the target materialized root and prove resume reachability.
+            // Inactive switches use the same prepared target as tracked switches, with source context
+            // from the authoritative inactive-session metadata read.
             ...(typeof inactive.cwd === 'string' && inactive.cwd.trim()
               ? { cwd: inactive.cwd.trim() }
               : {}),
@@ -2031,6 +2067,10 @@ export async function switchSessionConnectedServiceAuth(
           continuityProofDiagnostics ??= continuity.diagnostics ?? null;
         }
 
+        if (input.dryRun) {
+          return { ok: true, action: 'metadata_updated', normalizedBindings: normalized.normalized,
+            continuityByServiceId, warnings, ...spreadContinuityProofDiagnostics(continuityProofDiagnostics) };
+        }
         try {
           await input.persistSessionBindings?.({
             sessionId: input.request.sessionId,

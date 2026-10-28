@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -33,6 +33,129 @@ function createDescriptor(params: Readonly<{
 }
 
 describe('applyConnectedServiceStateSharingDescriptor', () => {
+  it('keeps unchanged copied config and shared links in place across repeated preparation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-state-sharing-repeat-'));
+    const sourceRoot = join(root, 'source');
+    const targetRoot = join(root, 'target');
+    try {
+      await mkdir(join(sourceRoot, 'sessions'), { recursive: true });
+      await mkdir(join(sourceRoot, 'skills'), { recursive: true, mode: 0o700 });
+      await writeFile(join(sourceRoot, 'config.toml'), 'model = "same"\n');
+      await writeFile(join(sourceRoot, 'settings.json'), '{}\n');
+      await writeFile(join(sourceRoot, 'skills', 'review.md'), '# Review\n');
+      const input = {
+        descriptor: createDescriptor({
+          configEntries: [{ path: 'config.toml', mode: 'copied' }, { path: 'skills', mode: 'copied' }, { path: 'settings.json', mode: 'linked' }],
+          stateEntries: [{ path: 'sessions', mode: 'linked' }],
+        }),
+        nativeSourceContext: { sourceRoot, sourceEnv: {} },
+        target: { targetMaterializedRoot: targetRoot, targetMaterializedEnv: {} },
+        configMode: 'copied', requestedStateMode: 'shared', effectiveStateMode: 'shared', cwd: root,
+      } as const;
+      const first = await applyConnectedServiceStateSharingDescriptor(input);
+      expect((await lstat(join(targetRoot, 'skills'))).mode & 0o777).toBe((await lstat(join(sourceRoot, 'skills'))).mode & 0o777);
+      const configPath = join(targetRoot, 'config.toml');
+      const skillPath = join(targetRoot, 'skills', 'review.md');
+      await utimes(configPath, 1234, 1234);
+      await utimes(skillPath, 1234, 1234);
+      const before = await Promise.all([lstat(configPath), lstat(skillPath), lstat(join(targetRoot, 'sessions')), lstat(join(targetRoot, 'settings.json'))]);
+      await applyConnectedServiceStateSharingDescriptor({ ...input, existingManifest: first.manifest });
+      const after = await Promise.all([lstat(configPath), lstat(skillPath), lstat(join(targetRoot, 'sessions')), lstat(join(targetRoot, 'settings.json'))]);
+      expect(after.map((entry) => entry.ino)).toEqual(before.map((entry) => entry.ino));
+      expect(after.slice(0, 2).map((entry) => entry.mtimeMs)).toEqual(before.slice(0, 2).map((entry) => entry.mtimeMs));
+      expect((await readdir(targetRoot)).filter((entry) => entry.includes('.local-'))).toEqual([]);
+      await writeFile(join(sourceRoot, 'config.toml'), 'model = "updated"\n');
+      await rm(join(sourceRoot, 'skills', 'review.md'));
+      await writeFile(join(sourceRoot, 'skills', 'new.md'), '# New\n');
+      await applyConnectedServiceStateSharingDescriptor({ ...input, existingManifest: first.manifest });
+      await expect(readFile(configPath, 'utf8')).resolves.toBe('model = "updated"\n');
+      expect(await readdir(join(targetRoot, 'skills'))).toEqual(['new.md']);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, true])('preserves real isolated state recorded by an earlier manifest and imports it before sharing (self-source: %s)', async (selfSource) => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-state-sharing-private-'));
+    const sourceRoot = join(root, 'source');
+    const targetRoot = join(root, 'target');
+    try {
+      await mkdir(join(sourceRoot, 'sessions'), { recursive: true });
+      await mkdir(join(targetRoot, 'sessions'), { recursive: true });
+      await writeFile(join(targetRoot, 'sessions', 'private.jsonl'), '{"id":"private"}\n');
+      const input = {
+        descriptor: createDescriptor({ stateEntries: [{ path: 'sessions', mode: 'linked' }] }),
+        nativeSourceContext: { sourceRoot: selfSource ? targetRoot : sourceRoot, sourceEnv: {} },
+        target: { targetMaterializedRoot: targetRoot, targetMaterializedEnv: {} },
+        configMode: 'isolated', requestedStateMode: 'isolated', effectiveStateMode: 'isolated', cwd: root,
+        existingManifest: {
+          v: 1, requestedStateMode: 'shared', effectiveStateMode: 'shared', lastSyncAtMs: 0,
+          configEntries: [], stateEntries: ['sessions'], sessionFileMappings: [], diagnostics: [],
+        },
+      } as const;
+      const isolated = await applyConnectedServiceStateSharingDescriptor(input);
+      await expect(readFile(join(targetRoot, 'sessions', 'private.jsonl'), 'utf8')).resolves.toBe('{"id":"private"}\n');
+      await applyConnectedServiceStateSharingDescriptor({
+        ...input, requestedStateMode: 'shared', effectiveStateMode: 'shared', existingManifest: isolated.manifest,
+        nativeSourceContext: { sourceRoot, sourceEnv: {} },
+        sessionImportRoots: [{ sourceRoot: join(targetRoot, 'sessions'), destinationRoot: join(sourceRoot, 'sessions') }],
+      });
+      await expect(readFile(join(sourceRoot, 'sessions', 'private.jsonl'), 'utf8')).resolves.toBe('{"id":"private"}\n');
+      expect((await lstat(join(targetRoot, 'sessions'))).isSymbolicLink()).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves private state visible when the native shared source does not exist', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-state-sharing-missing-source-'));
+    const sourceRoot = join(root, 'source');
+    const targetRoot = join(root, 'target');
+    try {
+      await mkdir(join(targetRoot, 'sessions'), { recursive: true });
+      await writeFile(join(targetRoot, 'sessions', 'private.jsonl'), '{"id":"private"}\n');
+      const result = await applyConnectedServiceStateSharingDescriptor({
+        descriptor: createDescriptor({ stateEntries: [{ path: 'sessions', mode: 'linked' }] }),
+        nativeSourceContext: { sourceRoot, sourceEnv: {} },
+        target: { targetMaterializedRoot: targetRoot, targetMaterializedEnv: {} },
+        configMode: 'isolated', requestedStateMode: 'shared', effectiveStateMode: 'shared', cwd: root,
+      });
+      await expect(readFile(join(targetRoot, 'sessions', 'private.jsonl'), 'utf8')).resolves.toBe('{"id":"private"}\n');
+      expect((await readdir(targetRoot)).filter((name) => name.startsWith('sessions.local-'))).toEqual([]);
+      expect(result.manifest.stateEntries).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('normalizes Windows-joined relative entry names before descriptor matching and materialization', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-state-sharing-relative-separators-'));
+    const sourceRoot = join(root, 'source');
+    const targetRoot = join(root, 'target');
+    try {
+      await mkdir(join(sourceRoot, 'skills', 'review'), { recursive: true });
+      await mkdir(join(sourceRoot, 'sessions', 'project'), { recursive: true });
+      await writeFile(join(sourceRoot, 'skills', 'review', 'SKILL.md'), '# Review\n');
+      await writeFile(join(sourceRoot, 'sessions', 'project', 'session.jsonl'), '{"id":"shared"}\n');
+      const result = await applyConnectedServiceStateSharingDescriptor({
+        descriptor: createDescriptor({
+          configEntries: [{ path: 'skills', mode: 'copied' }],
+          stateEntries: [{ path: 'sessions/project', mode: 'linked' }],
+        }),
+        nativeSourceContext: { sourceRoot, sourceEnv: {} },
+        target: { targetMaterializedRoot: targetRoot, targetMaterializedEnv: {} },
+        configEntryNames: ['skills\\review'], stateEntryNames: ['sessions\\project'],
+        configMode: 'copied', requestedStateMode: 'shared', effectiveStateMode: 'shared', cwd: root,
+      });
+      await expect(readFile(join(targetRoot, 'skills', 'review', 'SKILL.md'), 'utf8')).resolves.toBe('# Review\n');
+      await expect(readFile(join(targetRoot, 'sessions', 'project', 'session.jsonl'), 'utf8')).resolves.toBe('{"id":"shared"}\n');
+      expect(result.manifest.configEntries).toEqual(['skills/review']);
+      expect(result.manifest.stateEntries).toEqual(['sessions/project']);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('materializes descriptor entries and emits extended manifest metadata', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-state-sharing-descriptor-'));
     const sourceRoot = join(root, 'source');
@@ -161,6 +284,7 @@ describe('applyConnectedServiceStateSharingDescriptor', () => {
         join(sourceRoot, 'config.toml'),
         [
           'model = "gpt-5.3-codex"',
+          'model_context_window = 9223372036854775807',
           'cli_auth_credentials_store = "keyring"',
           '',
           '[features]',
@@ -205,6 +329,7 @@ describe('applyConnectedServiceStateSharingDescriptor', () => {
       expect(stat.isSymbolicLink()).toBe(false);
       const transformed = await readFile(join(targetRoot, 'config.toml'), 'utf8');
       expect(transformed).toContain('cli_auth_credentials_store = "file"');
+      expect(transformed).toContain('model_context_window = 9223372036854775807');
       expect(transformed).not.toContain('cli_auth_credentials_store = "keyring"');
     } finally {
       await rm(root, { recursive: true, force: true });

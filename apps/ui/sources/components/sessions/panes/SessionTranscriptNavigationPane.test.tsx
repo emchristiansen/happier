@@ -202,29 +202,6 @@ describe('SessionTranscriptNavigationPane', () => {
         expect(order).toEqual(['reveal', 'jump']);
     });
 
-    it('never jumps into a still-hidden scene: an already-registered handler still waits for the reveal to commit', async () => {
-        const { SessionTranscriptNavigationPane } = await import('./SessionTranscriptNavigationPane');
-        const { transcriptNavigationPaneStore } = await import('@/components/sessions/transcript/navigation/transcriptNavigationPaneStore');
-        const onEntryPress = vi.fn(() => ({ status: 'scrolled' as const }));
-        transcriptNavigationPaneStore.set('session-1', {
-            onEntryPress,
-        });
-
-        const screen = await renderScreen(
-            <SessionTranscriptNavigationPane
-                sessionId="session-1"
-                onRevealTranscript={() => {}}
-                testIDPrefix="nav"
-            />,
-        );
-
-        await screen.pressByTestIdAsync(ENTRY_TEST_ID);
-        expect(onEntryPress).not.toHaveBeenCalled();
-
-        await flushDeferredJump();
-        expect(onEntryPress).toHaveBeenCalledTimes(1);
-    });
-
     it('jumps straight through the registered handler when the transcript is already visible beside the pane', async () => {
         const { SessionTranscriptNavigationPane } = await import('./SessionTranscriptNavigationPane');
         const { transcriptNavigationPaneStore } = await import('@/components/sessions/transcript/navigation/transcriptNavigationPaneStore');

@@ -109,6 +109,25 @@ describe('shouldPersistQuotaSnapshot', () => {
     })).toEqual({ persist: false, reason: 'stale' });
   });
 
+  it('lets a current observation replace a future-dated persisted snapshot', () => {
+    const nowMs = 1_000_000;
+    expect(shouldPersistQuotaSnapshot({
+      previous: {
+        snapshot: buildSnapshot({ fetchedAt: nowMs + 60_000 }),
+        fingerprint: 'poisoned',
+        status: 'ok',
+        fetchedAt: nowMs + 60_000,
+      },
+      incoming: {
+        snapshot: buildSnapshot({ fetchedAt: nowMs }),
+        fingerprint: 'current',
+        status: 'ok',
+      },
+      minFreshnessRefreshMs: 60_000,
+      nowMs,
+    })).toEqual({ persist: true, reason: 'clock_recovered' });
+  });
+
   it('persists a fresh snapshot that clears a server refresh marker', () => {
     expect(shouldPersistQuotaSnapshot({
       previous: {

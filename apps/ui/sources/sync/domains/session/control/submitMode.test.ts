@@ -257,6 +257,7 @@ describe('chooseSubmitMode', () => {
         expect(chooseSubmitMode({
             configuredMode: 'agent_queue',
             session: {
+                active: true,
                 presence: 'online',
                 agentStateVersion: 1,
                 agentState: {
@@ -278,6 +279,7 @@ describe('chooseSubmitMode', () => {
         expect(chooseSubmitMode({
             configuredMode: 'agent_queue',
             session: {
+                active: true,
                 presence: 'online',
                 agentStateVersion: 1,
                 agentState: {
@@ -671,9 +673,9 @@ describe('decideSessionMessageDelivery — non-steerable payload honesty (lane P
         expect(decision.reason).toBe('busy_steer_immediate');
     });
 
-    it('keeps an occupied Claude Unified steer slot on the durable steer-if-active action', () => {
+    it.each(['agent_queue', 'server_pending'] as const)('honors busy steering with %s delivery while the steer slot is occupied', (configuredMode) => {
         const decision = decideSessionMessageDelivery({
-            configuredMode: 'agent_queue',
+            configuredMode,
             busySteerSendPolicy: 'steer_immediately',
             session: steerableBusySession({
                 agentState: {
@@ -691,6 +693,19 @@ describe('decideSessionMessageDelivery — non-steerable payload honesty (lane P
 
         expect(decision.mode).toBe('server_pending');
         expect(decision.requestedAction).toEqual({ v: 1, kind: 'steer_if_active' });
+        expect(decideSessionMessageDelivery({
+            configuredMode,
+            explicitMode: 'server_pending',
+            busySteerSendPolicy: 'steer_immediately',
+            session: steerableBusySession(),
+            nowMs: now,
+        }).requestedAction).toEqual({ v: 1, kind: 'enqueue' });
+        expect(decideSessionMessageDelivery({
+            configuredMode,
+            busySteerSendPolicy: 'server_pending',
+            session: steerableBusySession(),
+            nowMs: now,
+        }).requestedAction).toEqual({ v: 1, kind: 'enqueue' });
     });
 
     it('keeps a temporarily unavailable supported steer on the durable steer-if-active action', () => {

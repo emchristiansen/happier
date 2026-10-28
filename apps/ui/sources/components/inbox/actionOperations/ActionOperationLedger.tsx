@@ -6,10 +6,15 @@ import type { ActionOperationSnapshotV1 } from '@happier-dev/protocol';
 import { ActivitySpinner, iconMatchedSpinnerSize } from '@/components/ui/feedback/ActivitySpinner';
 import { Icon, ICON_SIZE } from '@/components/ui/icons/Icon';
 import { Item } from '@/components/ui/lists/Item';
-import { ItemGroup } from '@/components/ui/lists/ItemGroup';
+import {
+    ItemGroupRowPositionProvider,
+    useItemGroupRowPosition,
+} from '@/components/ui/lists/ItemGroupRowPosition';
 import { Text } from '@/components/ui/text/Text';
+import { ListSection } from '@/components/ui/lists/ListSection';
 import { useNowMs } from '@/hooks/time/useNowMs';
 import { t } from '@/text';
+import { isActionOperationCancellationRequested } from '@/sync/domains/actionOperations/actionOperationSelectors';
 import { actionOperationReentry } from '@/sync/domains/actionOperations/actionOperationReentry';
 
 import {
@@ -33,6 +38,23 @@ export type ActionOperationLedgerProps = Readonly<{
     canDismissOperation?: (operation: ActionOperationSnapshotV1) => boolean;
     onDismissOperation?: (operationId: string) => void;
     onClearRecent?: () => void;
+}>;
+
+export type ActionOperationRowsProps = Readonly<{
+    operations: readonly ActionOperationSnapshotV1[];
+    observationForOperation?: (operation: ActionOperationSnapshotV1) => ActionOperationObservationPresentation;
+    contextForOperation?: (operation: ActionOperationSnapshotV1) => string | null;
+    onOpenOperation: (operationId: string) => void;
+    nowMs?: number;
+    onCancelOperation?: (operationId: string) => Promise<void> | void;
+    canDismissOperation?: (operation: ActionOperationSnapshotV1) => boolean;
+    onDismissOperation?: (operationId: string) => void;
+    /** Inbox admits terminal failures that must remain explicitly dismissible. */
+    allowTerminalDismissal?: boolean;
+    /** Inbox moves status into the subtitle and omits Activity's status glyph. */
+    presentationMode?: 'activity' | 'inbox';
+    /** Supplied by ItemGroup when this row collection sits among sibling rows. */
+    showDivider?: boolean;
 }>;
 
 function statusLabel(status: ActionOperationPresentationStatus): string {
@@ -84,17 +106,25 @@ const ActionOperationRow = React.memo(function ActionOperationRow(props: Readonl
     onCancelOperation?: (operationId: string) => Promise<void> | void;
     canDismissOperation?: (operation: ActionOperationSnapshotV1) => boolean;
     onDismissOperation?: (operationId: string) => void;
+    allowTerminalDismissal?: boolean;
+    presentationMode?: 'activity' | 'inbox';
+    showDivider?: boolean;
 }>) {
     const { theme } = useUnistyles();
     const presentation = resolveActionOperationPresentation(props.operation, props.observation, props.nowMs);
     const status = statusLabel(presentation.status);
     const progress = [presentation.progressLabel, presentation.progressValue].filter(Boolean).join('  ');
-    const subtitle = [props.context, progress].filter(Boolean).join('\n');
-    const canDismiss = presentation.status === 'status_unavailable'
-        && !presentation.terminal
+    const subtitle = props.presentationMode === 'inbox'
+        ? [[status, props.context].filter(Boolean).join(' · '), progress].filter(Boolean).join('\n')
+        : [props.context, progress].filter(Boolean).join('\n');
+    const canDismiss = (
+        (presentation.status === 'status_unavailable' && !presentation.terminal)
+        || (props.allowTerminalDismissal === true && presentation.terminal)
+    )
         && props.canDismissOperation?.(props.operation) === true;
     const canStop = !canDismiss && !presentation.terminal && props.operation.cancellation === 'supported';
-    const [stopPending, setStopPending] = React.useState(false);
+    const [stopRequestPending, setStopPending] = React.useState(false);
+    const stopPending = stopRequestPending || isActionOperationCancellationRequested(props.operation);
     const [stopFailed, setStopFailed] = React.useState(false);
 
     const stop = React.useCallback((event?: GestureResponderEvent) => {
@@ -113,6 +143,7 @@ const ActionOperationRow = React.memo(function ActionOperationRow(props: Readonl
             title={props.operation.title}
             subtitle={subtitle}
             subtitleLines={3}
+            density="compact"
             detail={presentation.timeValue}
             icon={<Icon name={presentation.iconName} size={ICON_SIZE.md} color={theme.colors.text.secondary} />}
             rightElement={(
@@ -160,20 +191,62 @@ const ActionOperationRow = React.memo(function ActionOperationRow(props: Readonl
                             <Icon name="x" size={ICON_SIZE.sm} color={theme.colors.text.secondary} />
                         </Pressable>
                     ) : null}
-                    <View
-                        style={styles.statusAccessory}
-                        accessibilityLabel={status}
-                    >
-                        <ActionOperationStatusGlyph status={presentation.status} />
-                    </View>
+                    {props.presentationMode === 'activity' ? (
+                        <View style={styles.statusAccessory} accessibilityLabel={status}>
+                            <ActionOperationStatusGlyph status={presentation.status} />
+                        </View>
+                    ) : null}
                 </View>
             )}
+            rightElementOutsidePressable={true}
             keepChevronWithRightElement={true}
+            showDivider={props.showDivider}
             accessibilityLabel={`${props.operation.title}, ${status}`}
             accessibilityHint={t('inbox.actionOperations.openHint')}
             accessibilityState={{ busy: !presentation.terminal }}
             onPress={() => props.onOpenOperation(props.operation.operationId)}
         />
+    );
+});
+
+/**
+ * Canonical operation-row renderer shared by Activity's self-grouped ledger and
+ * Inbox's cross-domain sections. Keeping the row here prevents status, recovery,
+ * cancellation, dismissal, and accessibility behavior from drifting by surface.
+ */
+export const ActionOperationRows = React.memo(function ActionOperationRows(props: ActionOperationRowsProps) {
+    const runtimeNowMs = useNowMs(LEDGER_CLOCK_INTERVAL_MS);
+    const nowMs = props.nowMs ?? runtimeNowMs;
+    const parentRowPosition = useItemGroupRowPosition();
+    return (
+        <>
+            {props.operations.map((operation, index) => {
+                const isLast = index === props.operations.length - 1;
+                return (
+                    <ItemGroupRowPositionProvider
+                        key={operation.operationId}
+                        value={parentRowPosition ? {
+                            isFirst: parentRowPosition.isFirst && index === 0,
+                            isLast: parentRowPosition.isLast && isLast,
+                        } : null}
+                    >
+                        <ActionOperationRow
+                            operation={operation}
+                            observation={props.observationForOperation?.(operation) ?? 'available'}
+                            context={props.contextForOperation?.(operation) ?? null}
+                            nowMs={nowMs}
+                            onOpenOperation={props.onOpenOperation}
+                            onCancelOperation={props.onCancelOperation}
+                            canDismissOperation={props.canDismissOperation}
+                            onDismissOperation={props.onDismissOperation}
+                            allowTerminalDismissal={props.allowTerminalDismissal}
+                            presentationMode={props.presentationMode ?? 'activity'}
+                            showDivider={isLast ? props.showDivider : true}
+                        />
+                    </ItemGroupRowPositionProvider>
+                );
+            })}
+        </>
     );
 });
 
@@ -194,19 +267,16 @@ export const ActionOperationLedger = React.memo(function ActionOperationLedger(p
     );
 
     const renderRows = React.useCallback((operations: readonly ActionOperationSnapshotV1[]) => (
-        operations.map((operation) => (
-            <ActionOperationRow
-                key={operation.operationId}
-                operation={operation}
-                observation={props.observationForOperation?.(operation) ?? 'available'}
-                context={props.contextForOperation?.(operation) ?? null}
-                nowMs={nowMs}
-                onOpenOperation={props.onOpenOperation}
-                onCancelOperation={props.onCancelOperation}
-                canDismissOperation={props.canDismissOperation}
-                onDismissOperation={props.onDismissOperation}
-            />
-        ))
+        <ActionOperationRows
+            operations={operations}
+            observationForOperation={props.observationForOperation}
+            contextForOperation={props.contextForOperation}
+            nowMs={nowMs}
+            onOpenOperation={props.onOpenOperation}
+            onCancelOperation={props.onCancelOperation}
+            canDismissOperation={props.canDismissOperation}
+            onDismissOperation={props.onDismissOperation}
+        />
     ), [nowMs, props.canDismissOperation, props.contextForOperation, props.observationForOperation, props.onCancelOperation, props.onDismissOperation, props.onOpenOperation]);
 
     if (
@@ -226,37 +296,37 @@ export const ActionOperationLedger = React.memo(function ActionOperationLedger(p
     return (
         <View testID="action-operation-ledger">
             {sections.inProgress.length > 0 ? (
-                <ItemGroup title={t('inbox.actionOperations.sections.inProgress')}>
+                <ListSection namespace="inbox" id="operations-in-progress" title={t('inbox.actionOperations.sections.inProgress')}>
                     {renderRows(sections.inProgress)}
-                </ItemGroup>
+                </ListSection>
             ) : null}
             {sections.needsAttention.length > 0 ? (
-                <ItemGroup title={t('inbox.actionOperations.sections.needsAttention')}>
+                <ListSection namespace="inbox" id="operations-needs-attention" title={t('inbox.actionOperations.sections.needsAttention')}>
                     {renderRows(sections.needsAttention)}
-                </ItemGroup>
+                </ListSection>
             ) : null}
             {sections.recent.length > 0 ? (
-                <ItemGroup title={(
-                    <View style={styles.recentHeader}>
-                        <Text style={styles.recentHeaderTitle}>{t('inbox.actionOperations.sections.recent')}</Text>
-                        {props.onClearRecent ? (
-                            <Pressable
-                                testID="action-operation-clear-recent"
-                                accessibilityRole="button"
-                                onPress={props.onClearRecent}
-                                hitSlop={8}
-                                style={({ pressed }) => [
-                                    styles.clearRecentButton,
-                                    pressed ? styles.clearRecentButtonPressed : null,
-                                ]}
-                            >
-                                <Text style={styles.clearRecentText}>{t('inbox.actionOperations.clearRecent')}</Text>
-                            </Pressable>
-                        ) : null}
-                    </View>
-                )}>
+                <ListSection
+                    namespace="inbox"
+                    id="operations-recent"
+                    title={t('inbox.actionOperations.sections.recent')}
+                    headerAction={props.onClearRecent ? (
+                        <Pressable
+                            testID="action-operation-clear-recent"
+                            accessibilityRole="button"
+                            onPress={props.onClearRecent}
+                            hitSlop={8}
+                            style={({ pressed }) => [
+                                styles.clearRecentButton,
+                                pressed ? styles.clearRecentButtonPressed : null,
+                            ]}
+                        >
+                            <Text style={styles.clearRecentText}>{t('inbox.actionOperations.clearRecent')}</Text>
+                        </Pressable>
+                    ) : null}
+                >
                     {renderRows(sections.recent)}
-                </ItemGroup>
+                </ListSection>
             ) : null}
         </View>
     );
@@ -264,7 +334,6 @@ export const ActionOperationLedger = React.memo(function ActionOperationLedger(p
 
 const styles = StyleSheet.create((theme) => ({
     rowActions: {
-        minHeight: 44,
         flexDirection: 'row',
         alignItems: 'center',
         justifyContent: 'flex-end',
@@ -274,22 +343,10 @@ const styles = StyleSheet.create((theme) => ({
         alignItems: 'center',
         justifyContent: 'flex-end',
     },
-    recentHeader: {
-        minHeight: 20,
-        flexDirection: 'row',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        gap: 12,
-    },
-    recentHeaderTitle: {
-        color: theme.colors.text.secondary,
-        fontSize: 13,
-        textTransform: 'uppercase',
-    },
     clearRecentButton: {
-        minHeight: 28,
+        minHeight: 44,
         justifyContent: 'center',
-        paddingHorizontal: 4,
+        paddingLeft: 12,
     },
     clearRecentButtonPressed: {
         opacity: 0.62,

@@ -7,7 +7,6 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 
 import { normalizePublicReleaseChannel } from '../lib/public-release-rings.mjs';
-import { parseArtifactFilename } from '../lib/manifests.mjs';
 import { writeChecksumsFile } from '../lib/release-files.mjs';
 import { resolveArtifactVerifyExecution, resolveArtifactVerifyTarget } from './artifact-verify-target.mjs';
 import { getBinaryPublishProductSpec } from './product-specs.mjs';
@@ -85,8 +84,8 @@ export async function ensureCleanBinaryArtifactsDir(repoRoot, productSpec, opts)
 
 /**
  * Canonical admission and signing owner for a complete native artifact matrix.
- * Both Darwin notarization records are release artifacts and are covered by the
- * same checksum/minisign envelope as the five native archives.
+ * Darwin notarization records and optional component envelopes are release assets
+ * covered by the primary checksum/minisign envelope.
  */
 export async function finalizePreparedBinaryArtifacts(params) {
   const artifactsDir = path.resolve(params.artifactsDir);
@@ -98,19 +97,17 @@ export async function finalizePreparedBinaryArtifacts(params) {
   const targets = params.targets ?? params.productSpec.artifactTargets;
   const writeChecksums = params.writeChecksums ?? writeChecksumsFile;
   const signFile = params.signFile ?? maybeSignFile;
+  const componentProducts = params.productSpec.optionalComponentProducts ?? [];
+  const products = [params.productSpec.manifestProduct, ...componentProducts];
 
   const expectedManifestNames = params.manifestsDir
     ? [...targets.map((target) => `${target.os}-${target.arch}.json`), 'latest.json'].sort()
     : [];
   if (params.manifestsDir) {
-    const checksumsPath = path.join(
-      artifactsDir,
-      `checksums-${params.productSpec.manifestProduct}-v${version}.txt`,
-    );
-    await Promise.all([
-      rm(checksumsPath, { force: true }),
-      rm(`${checksumsPath}.minisig`, { force: true }),
-    ]);
+    await Promise.all(products.flatMap((product) => {
+      const checksumsPath = path.join(artifactsDir, `checksums-${product}-v${version}.txt`);
+      return [rm(checksumsPath, { force: true }), rm(`${checksumsPath}.minisig`, { force: true })];
+    }));
     const manifestsDir = path.resolve(params.manifestsDir);
     const manifestNames = (await readdir(manifestsDir)).sort();
     if (
@@ -137,17 +134,17 @@ export async function finalizePreparedBinaryArtifacts(params) {
     }
   }
 
-  const expectedArtifacts = targets.map((target) => ({
+  const expectedArtifacts = products.flatMap((product) => targets.map((target) => ({
     ...target,
-    name: `${params.productSpec.manifestProduct}-v${version}-${target.os}-${target.arch}.tar.gz`,
-  }));
+    name: `${product}-v${version}-${target.os}-${target.arch}.tar.gz`,
+  })));
   const preparedNames = (await readdir(artifactsDir)).sort();
   const expectedNames = new Set(expectedArtifacts.map((artifact) => artifact.name));
   const archiveNames = preparedNames
     .filter((name) => name.endsWith('.tar.gz'))
     .sort();
   for (const name of archiveNames) {
-    if (!parseArtifactFilename(name) || !expectedNames.has(name)) {
+    if (!expectedNames.has(name)) {
       throw new Error(`unexpected prepared artifact for ${params.productSpec.id} ${version}: ${name}`);
     }
   }
@@ -160,12 +157,13 @@ export async function finalizePreparedBinaryArtifacts(params) {
   }
 
   const evidenceSuffix = params.productSpec.notarizationEvidenceSuffix;
-  const expectedEvidenceNames = [
-    `darwin-arm64.${evidenceSuffix}.json`,
-    `darwin-x64.${evidenceSuffix}.json`,
-  ];
+  const evidenceSuffixes = [evidenceSuffix, ...componentProducts];
+  const expectedEvidenceNames = evidenceSuffixes.flatMap((suffix) => [
+    `darwin-arm64.${suffix}.json`,
+    `darwin-x64.${suffix}.json`,
+  ]).sort();
   const evidenceNames = preparedNames
-    .filter((name) => name.endsWith(`.${evidenceSuffix}.json`))
+    .filter((name) => evidenceSuffixes.some((suffix) => name.endsWith(`.${suffix}.json`)))
     .sort();
   const missingEvidenceNames = expectedEvidenceNames.filter((name) => !evidenceNames.includes(name));
   if (missingEvidenceNames.length > 0) {
@@ -211,6 +209,24 @@ export async function finalizePreparedBinaryArtifacts(params) {
     const metadata = await lstat(artifact.path);
     if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size < 1) {
       throw new Error(`prepared artifact must be a regular non-empty file: ${artifact.name}`);
+    }
+  }
+
+  for (const product of componentProducts) {
+    const componentChecksumsPath = await writeChecksums({
+      product,
+      version,
+      artifacts: artifacts.filter((artifact) => artifact.name.startsWith(`${product}-v`)
+        || artifact.name.endsWith(`.${product}.json`)),
+      outDir: artifactsDir,
+    });
+    const componentSignaturePath = await signFile({
+      path: componentChecksumsPath,
+      trustedComment: `${product} ${version} ${channel}`,
+    });
+    if (!componentSignaturePath) throw new Error(`prepared ${product} artifacts require a minisign signature`);
+    for (const assetPath of [componentChecksumsPath, componentSignaturePath]) {
+      artifacts.push({ name: path.basename(assetPath), path: assetPath, os: 'manifest', arch: product });
     }
   }
 

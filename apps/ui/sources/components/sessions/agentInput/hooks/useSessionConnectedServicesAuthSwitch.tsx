@@ -17,9 +17,11 @@ import {
     NewSessionConnectedServicesSelectionContent,
 } from '@/components/sessions/new/components/NewSessionConnectedServicesSelectionContent';
 import { resolveConnectedServiceDisplayName, resolveConnectedServiceShortName } from '@/components/settings/connectedServices/model/resolveConnectedServiceDisplayName';
-import { resolveConnectedServicesAuthLabel } from '@/components/settings/connectedServices/model/resolveConnectedServicesAuthLabel';
+import { resolveConnectedServicesAuthLabel, resolveConnectedServicesAuthWarningTranslationKey } from '@/components/settings/connectedServices/model/resolveConnectedServicesAuthLabel';
+import { ActionListSection } from '@/components/ui/lists/ActionListSection';
 import {
     resolveConnectedServiceUxDiagnosticPresentation,
+    resolveSessionConnectedServiceAuthSwitchErrorMessageKey,
     translateConnectedServiceUxDiagnosticBody,
     type ConnectedServiceUxDiagnosticPresentation,
 } from '@/components/sessions/connectedServices/diagnostics/connectedServiceUxDiagnostics';
@@ -32,7 +34,6 @@ import { useFeatureEnabled } from '@/hooks/server/useFeatureEnabled';
 import { Modal } from '@/modal';
 import {
     setSessionConnectedServiceAuthBinding,
-    type SessionConnectedServiceAuthSwitchErrorCode,
     type SessionConnectedServiceAuthSwitchResult as DaemonSessionConnectedServiceAuthSwitchResult,
 } from '@/sync/ops/connectedServices/sessionAuthSwitch';
 import {
@@ -43,9 +44,10 @@ import {
     buildConnectedServiceProfileOptionsByServiceId,
     isConnectedServiceProfileOptionSelectable,
     resolveAgentSupportedConnectedServiceIds,
+    resolveNewSessionConnectedServicesBindingsForAgent,
 } from '@/components/sessions/new/modules/connectedServicesNewSessionBindings';
 import { useProfile } from '@/sync/store/hooks';
-import { t, type TranslationKey } from '@/text';
+import { t } from '@/text';
 import {
     createManualAuthSwitchRestartSignal,
     resolveSessionIntentionalRestartState,
@@ -185,37 +187,6 @@ type SetBindingForServiceOptions = Readonly<{
     forceReapply?: boolean;
 }>;
 
-function resolveSessionConnectedServiceAuthSwitchErrorMessageKey(
-    errorCode: SessionConnectedServiceAuthSwitchErrorCode | undefined,
-): TranslationKey {
-    switch (errorCode) {
-        case 'group_generation_conflict':
-            return 'connectedServices.authSwitch.errors.groupGenerationConflict';
-        case 'provider_state_sharing_unavailable':
-            return 'connectedServices.authSwitch.errors.providerStateSharingUnavailable';
-        case 'profile_disconnected':
-            return 'connectedServices.authSwitch.errors.profileDisconnected';
-        case 'profile_missing':
-            return 'connectedServices.authSwitch.errors.profileMissing';
-        case 'group_missing':
-            return 'connectedServices.authSwitch.errors.groupMissing';
-        case 'metadata_update_failed':
-            return 'connectedServices.authSwitch.errors.metadataUpdateFailed';
-        case 'restart_failed':
-            return 'connectedServices.authSwitch.errors.restartFailed';
-        case 'hot_apply_failed':
-            return 'connectedServices.authSwitch.errors.hotApplyFailed';
-        case 'agent_mismatch':
-            return 'connectedServices.authSwitch.errors.agentMismatch';
-        case 'session_not_found':
-            return 'connectedServices.authSwitch.errors.sessionNotFound';
-        case 'unsupported_service':
-            return 'connectedServices.authSwitch.errors.unsupportedService';
-        default:
-            return 'connectedServices.authSwitch.switchFailed';
-    }
-}
-
 function readRecord(value: unknown): Record<string, unknown> | null {
     return value && typeof value === 'object' && !Array.isArray(value)
         ? value as Record<string, unknown>
@@ -279,7 +250,7 @@ function readBinding(value: unknown): ConnectedServicesServiceBinding | null {
     return null;
 }
 
-function readConnectedServicesBindingsFromMetadata(
+export function readConnectedServicesBindingsFromMetadata(
     metadata: unknown,
     agentId: string,
 ): Readonly<Record<string, ConnectedServicesServiceBinding | undefined>> {
@@ -326,7 +297,7 @@ function areServiceBindingsEqual(
         && left?.groupId === right?.groupId;
 }
 
-function buildSessionSwitchPayload(params: Readonly<{
+export function buildSessionConnectedServicesBindings(params: Readonly<{
     supportedServiceIds: ReadonlyArray<ConnectedServiceId>;
     bindingsByServiceId: Readonly<Record<string, ConnectedServicesServiceBinding | undefined>>;
 }>): ConnectedServiceBindingsV1 {
@@ -422,11 +393,14 @@ export function useSessionConnectedServicesAuthSwitch(params: Readonly<{
     machineId: string | null | undefined;
     serverId?: string | null;
     agentCore: ConnectedServicesAgentCore;
+    armedContinuationAgent?: Readonly<{ agentId: string; agentCore: ConnectedServicesAgentCore }> | null;
     sessionMetadata: unknown;
     settings: {
         connectedServicesProfileLabelByKey: Record<string, string | undefined>;
         connectedServicesDefaultProfileByServiceId: Record<string, string | undefined>;
         connectedServicesProviderStateSharingSettingsV1?: unknown;
+        connectedServicesDefaultAuthByAgentIdV1?: unknown;
+        connectedServicesAdditionalDefaultAuthByAgentIdV1?: unknown;
     };
     switchingDisabledReason: SessionConnectedServicesAuthSwitchDisabledReason | null;
     sessionActive?: boolean;
@@ -568,7 +542,7 @@ export function useSessionConnectedServicesAuthSwitch(params: Readonly<{
             setPartialApplicationNotice(null);
             setOptimisticBindingsByServiceId(nextBindings);
 
-            const bindings = buildSessionSwitchPayload({
+            const bindings = buildSessionConnectedServicesBindings({
                 supportedServiceIds: supportedConnectedServiceIds,
                 bindingsByServiceId: nextBindings,
             });
@@ -846,6 +820,7 @@ export function useSessionConnectedServicesAuthSwitch(params: Readonly<{
 
     const popoverContent = React.useCallback(({ requestClose, maxHeight }: AgentInputContentPopoverRenderArgs) => (
         <NewSessionConnectedServicesSelectionContent
+            launchTarget={{ machineId: params.machineId ?? null, serverId: params.serverId ?? null, agentId: params.agentId }}
             supportedServiceIds={supportedConnectedServiceIds}
             profileOptionsByServiceId={profileOptionsByServiceId}
             accountGroupOptionsByServiceId={accountGroupOptionsByServiceId}
@@ -872,6 +847,9 @@ export function useSessionConnectedServicesAuthSwitch(params: Readonly<{
     ), [
         accountGroupOptionsByServiceId,
         optimisticBindingsByServiceId,
+        params.agentId,
+        params.machineId,
+        params.serverId,
         params.settings.connectedServicesDefaultProfileByServiceId,
         profileOptionsByServiceId,
         resolveOptionAvailability,
@@ -882,6 +860,45 @@ export function useSessionConnectedServicesAuthSwitch(params: Readonly<{
     ]);
 
     const connectedServicesAuthChip = React.useMemo<AgentInputExtraActionChip | null>(() => {
+        if (params.armedContinuationAgent) {
+            const defaults = resolveNewSessionConnectedServicesBindingsForAgent({
+                ...params.armedContinuationAgent,
+                agentOptionState: null,
+                accountProfileConnectedServicesV2: accountProfile?.connectedServicesV2 ?? [],
+                settings: params.settings,
+                connectedServicesFeatureEnabled,
+                accountGroupsFeatureEnabled,
+            });
+            if (defaults.supportedConnectedServiceIds.length === 0) return null;
+            const label = resolveConnectedServicesAuthLabel({
+                supportedServiceIds: defaults.supportedConnectedServiceIds,
+                bindingsByServiceId: defaults.connectedServicesBindingsByServiceId,
+                profileOptionsByServiceId: defaults.connectedServiceProfileOptionsByServiceId,
+                accountGroupOptionsByServiceId: defaults.connectedServiceAccountGroupOptionsByServiceId,
+                accountGroupsEnabled: accountGroupsFeatureEnabled,
+                defaultProfileIdByServiceId: params.settings.connectedServicesDefaultProfileByServiceId,
+                bindingPresentation: 'requested',
+                resolveServiceTitle: (serviceId) => resolveConnectedServiceShortName(serviceId as ConnectedServiceId, t),
+                nativeLabel: t('connectedServices.authChip.nativeLabel'),
+                formatConnectedCountLabel: (count) => t('connectedServices.authChip.connectedCountLabel', { count }),
+            });
+            const warningKey = resolveConnectedServicesAuthWarningTranslationKey(label.warningCodes[0]);
+            return createConnectedServicesAuthActionChip({
+                key: 'session-connected-services-auth',
+                testID: 'session-connected-services-auth-chip',
+                label: label.label,
+                authSource: label.connectedCount > 0 ? 'connected' : 'native',
+                connectedCount: label.connectedCount,
+                popoverContent: () => <ActionListSection actions={[{
+                    id: 'armed-agent-auth-default',
+                    label: label.label,
+                    subtitle: warningKey ? t(warningKey) : undefined,
+                    disabled: true,
+                }]} />,
+                maxHeightCap: 560,
+                maxWidthCap: 560,
+            });
+        }
         if (supportedConnectedServiceIds.length === 0) return null;
         const label = resolveConnectedServicesAuthLabel({
             supportedServiceIds: supportedConnectedServiceIds,
@@ -905,6 +922,14 @@ export function useSessionConnectedServicesAuthSwitch(params: Readonly<{
             maxWidthCap: 560,
         });
     }, [
+        accountProfile,
+        accountGroupsFeatureEnabled,
+        connectedServicesFeatureEnabled,
+        params.armedContinuationAgent?.agentId,
+        params.armedContinuationAgent?.agentCore,
+        params.settings.connectedServicesDefaultAuthByAgentIdV1,
+        params.settings.connectedServicesAdditionalDefaultAuthByAgentIdV1,
+        params.settings.connectedServicesProfileLabelByKey,
         accountGroupOptionsByServiceId,
         labelProfileOptionsByServiceId,
         optimisticBindingsByServiceId,

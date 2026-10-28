@@ -12,7 +12,7 @@ import {
   reloadCreatedSessionFromNewSessionComposer,
   type CreatedSessionFromNewSessionComposer,
 } from '../../src/testkit/uiE2e/createSessionFromNewSessionComposer';
-import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
+import { fakeClaudeEchoResponseText, fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
 import { gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
 import { waitForDaemonMachineIdFromCliSettings } from '../../src/testkit/uiE2e/daemonMachineId';
 
@@ -427,11 +427,11 @@ test.describe('ui e2e: transcript viewport invariants', () => {
     return await waitForViewportTelemetryQuiescence(page);
   }
 
-  async function sendSeedPromptAndWaitForOk(page: Page, prompt: string, okNumber: number): Promise<void> {
+  async function sendSeedPromptAndWaitForEcho(page: Page, prompt: string): Promise<void> {
     const composer = page.locator('textarea[data-testid="session-composer-input"]:visible');
     await composer.fill(prompt);
     await composer.press('Enter');
-    await expect(page.getByText(`FAKE_CLAUDE_OK_${okNumber}`).first()).toBeVisible({ timeout: 180_000 });
+    await expect(page.getByText(fakeClaudeEchoResponseText(prompt)).first()).toBeVisible({ timeout: 180_000 });
   }
 
   test.beforeAll(async () => {
@@ -468,9 +468,6 @@ test.describe('ui e2e: transcript viewport invariants', () => {
       extraEnv: {
         HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys,providers.claude.unifiedTerminal',
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
       },
     });
 
@@ -493,7 +490,7 @@ test.describe('ui e2e: transcript viewport invariants', () => {
   });
 
   test('runtime guard: requestAnimationFrame ticks within 400ms (plan E10)', async ({ page }) => {
-    test.setTimeout(420_000);
+    test.setTimeout(180_000);
     if (!uiBaseUrl) throw new Error('missing ui fixtures');
 
     await gotoDomContentLoadedWithRetries(page, uiBaseUrl);
@@ -519,7 +516,7 @@ test.describe('ui e2e: transcript viewport invariants', () => {
   });
 
   test('seeds a session past the initial-fetch cap and viewport telemetry is readable', async ({ page }) => {
-    test.setTimeout(720_000);
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
     await installViewportTelemetryOverride(page);
@@ -539,6 +536,7 @@ test.describe('ui e2e: transcript viewport invariants', () => {
         HOME: cliHomeDir,
         HAPPIER_CLAUDE_PATH: fakeClaudePath,
         HAPPIER_E2E_FAKE_CLAUDE_LOG: fakeClaudeLogPath,
+        HAPPIER_E2E_FAKE_CLAUDE_SCENARIO: 'echo-user-text',
         HAPPIER_E2E_FAKE_CLAUDE_SESSION_ID: `fake-claude-session-${run.runId}`,
         HAPPIER_E2E_FAKE_CLAUDE_INVOCATION_ID: `fake-claude-invocation-${run.runId}`,
       },
@@ -556,12 +554,12 @@ test.describe('ui e2e: transcript viewport invariants', () => {
     sessionId = createdSession.sessionId;
 
     await expect(page.getByTestId('transcript-chat-list')).toHaveCount(1, { timeout: 120_000 });
-    await expect(page.getByText('FAKE_CLAUDE_OK_1').first()).toBeVisible({ timeout: 180_000 });
+    await expect(page.getByText(fakeClaudeEchoResponseText(seedMessageText(0, run.runId))).first()).toBeVisible({ timeout: 180_000 });
 
     // Each turn persists ~5 messages. With the test-only 12-message initial request and six-message
     // older pages, this leaves multiple real older pages after the bounded entry-fill phase.
     for (let i = 1; i <= SEED_TURN_COUNT; i += 1) {
-      await sendSeedPromptAndWaitForOk(page, seedMessageText(i, run.runId), i + 1);
+      await sendSeedPromptAndWaitForEcho(page, seedMessageText(i, run.runId));
     }
 
     // Infrastructure strictness: the dev-gated telemetry buffer must be readable and capturing.
@@ -603,7 +601,7 @@ test.describe('ui e2e: transcript viewport invariants', () => {
   }
 
   test('cold open: captures telemetry, bounded owner targets, lands at bottom (invariant A infra)', async ({ page }) => {
-    test.setTimeout(420_000);
+    test.setTimeout(180_000);
 
     const snapshot = await openSeededSessionColdAndSettle(page);
     expect(snapshot.droppedCount).toBe(0);
@@ -619,7 +617,7 @@ test.describe('ui e2e: transcript viewport invariants', () => {
   });
 
   test('cold open: bounded entry writes, only bottom-bound follow repins beyond (invariant A strict)', async ({ page }) => {
-    test.setTimeout(420_000);
+    test.setTimeout(180_000);
 
     const snapshot = await openSeededSessionColdAndSettle(page);
     expect(snapshot.droppedCount).toBe(0);
@@ -628,7 +626,7 @@ test.describe('ui e2e: transcript viewport invariants', () => {
   });
 
   test('manual scroll without pagination produces zero viewport writes (invariant E)', async ({ page }) => {
-    test.setTimeout(420_000);
+    test.setTimeout(180_000);
     if (!sessionId) throw new Error('missing seeded session fixtures');
 
     const olderPageRequests: string[] = [];
@@ -686,7 +684,7 @@ test.describe('ui e2e: transcript viewport invariants', () => {
   });
 
   test('warm reopen restores the anchor with one bounded entry transaction (invariant B)', async ({ page }) => {
-    test.setTimeout(420_000);
+    test.setTimeout(180_000);
     if (!uiBaseUrl || !sessionId || !accountSecretKeyFormatted) throw new Error('missing seeded session fixtures');
 
     await installViewportTelemetryOverride(page);
@@ -789,23 +787,15 @@ test.describe('ui e2e: transcript viewport invariants', () => {
   });
 
   test('exact-top older-page prepend preserves one keyed row exactly (invariants D/H)', async ({ page }) => {
-    test.setTimeout(420_000);
+    test.setTimeout(180_000);
     if (!sessionId) throw new Error('missing seeded session fixtures');
 
     const isOlderPageRequest = (url: string): boolean =>
       url.includes(`/v1/sessions/${sessionId}/messages?`) && url.includes('beforeSeq=');
 
-    let holdUserTriggeredOlderResponse = false;
-    let releaseUserTriggeredOlderResponse = () => {};
-    let userTriggeredOlderResponseGate = Promise.resolve();
-
-    // Keep the user-triggered response in flight until the loading overlay has been observed.
-    // A fixed delay races the request observer on loaded runners and can inspect the UI only after
-    // the response has already settled and the correctly transient overlay has disappeared.
+    // Delay older-page responses so the in-flight window (and the loading overlay) is observable.
     await page.route((url) => isOlderPageRequest(url.href), async (route) => {
-      if (holdUserTriggeredOlderResponse) {
-        await userTriggeredOlderResponseGate;
-      }
+      await new Promise((r) => setTimeout(r, 700));
       await route.continue();
     });
 
@@ -840,10 +830,6 @@ test.describe('ui e2e: transcript viewport invariants', () => {
     olderRequestCount = 0;
     olderRequestsSettled = 0;
     maxConcurrentOlderRequests = inFlightOlderRequests;
-    userTriggeredOlderResponseGate = new Promise<void>((resolve) => {
-      releaseUserTriggeredOlderResponse = resolve;
-    });
-    holdUserTriggeredOlderResponse = true;
     const beforeMetrics = await requireTranscriptScrollMetrics(page);
 
     // Scenario premise: at least one older page must still be unloaded, or the wheel below can
@@ -878,15 +864,10 @@ test.describe('ui e2e: transcript viewport invariants', () => {
       .toBeGreaterThan(0);
 
     // Invariant H: a user-triggered older load in flight shows the loading indicator.
-    try {
-      await expect(
-        page.getByTestId('transcript-older-load-progress-overlay'),
-        'invariant H: older-load progress overlay must be visible while the load is in flight',
-      ).toBeVisible({ timeout: 5_000 });
-    } finally {
-      releaseUserTriggeredOlderResponse();
-      holdUserTriggeredOlderResponse = false;
-    }
+    await expect(
+      page.getByTestId('transcript-older-load-progress-overlay'),
+      'invariant H: older-load progress overlay must be visible while the load is in flight',
+    ).toBeVisible({ timeout: 5_000 });
 
     await expect.poll(() => olderRequestsSettled, { timeout: 60_000 }).toBeGreaterThanOrEqual(1);
     await expect

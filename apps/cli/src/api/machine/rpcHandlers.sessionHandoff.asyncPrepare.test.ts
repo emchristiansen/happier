@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
 
+import { FeaturesResponseSchema, type ActionOperationSnapshotV1, type SessionHandoffPrepareTargetRequestV2 } from '@happier-dev/protocol';
 import { RPC_METHODS } from '@happier-dev/protocol/rpc';
 
 async function removeTestDirectory(path: string): Promise<void> {
@@ -26,6 +27,310 @@ function createDeferred<T>() {
 }
 
 describe('rpcHandlers (session handoff async prepare)', () => {
+  it('reports missing local authentication before an existing-state handoff instead of an unsupported peer', async () => {
+    const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-handoff-auth-admission-'));
+    let registration: Awaited<ReturnType<typeof import('./rpcHandlers')['registerMachineRpcHandlers']>> | undefined;
+    try {
+      vi.resetModules();
+      vi.doMock('@/configuration', async () => {
+        const actual = await vi.importActual<typeof import('@/configuration')>('@/configuration');
+        return { ...actual, configuration: { ...actual.configuration, activeServerId: 'cloud', activeServerDir,
+          privateKeyFile: join(activeServerDir, 'missing-access.key'), legacyPrivateKeyFile: join(activeServerDir, 'missing-legacy.key') } };
+      });
+      const { RpcHandlerManager } = await import('../rpc/RpcHandlerManager');
+      const { registerMachineRpcHandlers } = await import('./rpcHandlers');
+      const { readRpcErrorCode } = await import('@happier-dev/protocol/rpcErrors');
+      const manager = new RpcHandlerManager({ scopePrefix: 'local', encryptionKey: new Uint8Array(32), encryptionVariant: 'dataKey' });
+      let processMutationCount = 0;
+      registration = registerMachineRpcHandlers({ rpcHandlerManager: manager, handlers: {
+        // Only runner process adapters are replaced; credential reads and admission stay real.
+        spawnSession: async () => { processMutationCount += 1; return { type: 'success', sessionId: 'session-1' }; },
+        spawnSessionForHandoff: async () => { processMutationCount += 1; return { type: 'success', sessionId: 'session-1', runnerAcceptance: 'newly_accepted' }; },
+        stopSession: async () => { processMutationCount += 1; return true; },
+        requestShutdown: () => { processMutationCount += 1; },
+      } });
+      const error = await manager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_START, {
+        sessionId: 'session-1', sourceMachineId: 'source', targetMachineId: 'target',
+        sessionStorageMode: 'persisted', stateTransfer: 'existing',
+        preferredTransportStrategies: ['direct_peer'], negotiatedTransportStrategy: 'direct_peer',
+      }).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(Error);
+      expect(readRpcErrorCode(error)).toBe('not_authenticated');
+      expect(processMutationCount).toBe(0);
+    } finally {
+      await registration?.dispose();
+      vi.doUnmock('@/configuration');
+      vi.resetModules();
+      await removeTestDirectory(activeServerDir);
+    }
+  });
+
+  it('prepares existing-state through the native store without transfer and retains the mode across restart', async () => {
+    const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-handoff-existing-prepare-'));
+    const claudeHome = join(activeServerDir, 'claude-home');
+    const targetPath = join(activeServerDir, 'workspace');
+    const previousClaudeHome = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = claudeHome;
+    const transcriptPath = join(claudeHome, 'projects', 'existing-project', 'native-1.jsonl');
+    const transcript = '{"type":"user","message":{"role":"user","content":"preserved"}}\n';
+    try {
+      await mkdir(join(claudeHome, 'projects', 'existing-project'), { recursive: true });
+      await mkdir(targetPath);
+      await writeFile(transcriptPath, transcript);
+      vi.resetModules();
+      vi.doMock('@/configuration', async () => {
+        const actual = await vi.importActual<typeof import('@/configuration')>('@/configuration');
+        return { ...actual, configuration: { ...actual.configuration, activeServerDir } };
+      });
+      const { RpcHandlerManager } = await import('../rpc/RpcHandlerManager');
+      const { registerMachineSessionHandoffRpcHandlers } = await import('./rpcHandlers.sessionHandoff');
+      const { createSessionHandoffPrepareTargetJobStore } = await import('../../session/handoff/prepare/sessionHandoffPrepareTargetJobStore');
+      const metadata = { path: targetPath, flavor: 'claude', machineId: 'source', claudeSessionId: 'native-1' };
+      let environmentReady: Promise<void> | undefined;
+      let environmentRequested = false;
+      let removeNativeStateBeforeLaunch = false;
+      let runnerLaunches = 0;
+      let launchFailure: unknown;
+      const { resolveSpawnChildEnvironment } = await import('../../daemon/spawn/resolveSpawnChildEnvironment');
+      const createHandlers = () => {
+        const manager = new RpcHandlerManager({ scopePrefix: 'test', encryptionKey: new Uint8Array(32), encryptionVariant: 'dataKey', encryptionMode: 'plain' });
+        registerMachineSessionHandoffRpcHandlers({
+          rpcHandlerManager: manager,
+          loadSessionMetadata: async () => metadata,
+          probeHandoffCapability: async () => ({ protocolVersion: 2, existingState: true, atomicTargetResume: true, targetCleanup: true }),
+          // Runner launch is the process boundary; durable resume/confirm/commit stay real.
+          spawnSessionForHandoff: async (_options, hooks) => {
+            if (removeNativeStateBeforeLaunch) {
+              // Lose only the synthetic native transcript after real preparation has resolved it.
+              expect(await readFile(transcriptPath, 'utf8')).toBe(transcript);
+              await rm(transcriptPath);
+            }
+            const environment = await resolveSpawnChildEnvironment({
+              options: _options, existingSessionMetadata: metadata,
+              profileEnvironmentVariables: {}, daemonSpawnHooks: null, processEnv: process.env,
+              logDebug: () => {}, logInfo: () => {}, logWarn: () => {},
+            });
+            if (!environment.ok) {
+              launchFailure = { type: 'error', errorCode: environment.errorCode, errorMessage: environment.errorMessage };
+              return { type: 'error', errorCode: environment.errorCode, errorMessage: environment.errorMessage };
+            }
+            await hooks.onBeforeRunnerLaunchAccepted?.();
+            runnerLaunches += 1;
+            return { type: 'success', sessionId: 'session-1', runnerAcceptance: 'newly_accepted' };
+          },
+          stopSessionForHandoff: async () => 'already_inactive',
+          resolveExistingStateEnvironment: async () => {
+            environmentRequested = true;
+            await environmentReady;
+            return process.env;
+          },
+        });
+        return manager;
+      };
+      const manager = createHandlers();
+      const request = {
+        handoffId: 'existing-native', sessionId: 'session-1', sourceMachineId: 'source', targetMachineId: 'target',
+        stateTransfer: 'existing', sourceSessionStorageMode: 'persisted', targetPath,
+        negotiatedTransportStrategy: 'direct_peer', allowServerRoutedFallback: false, endpointCandidates: [],
+      } satisfies SessionHandoffPrepareTargetRequestV2;
+      await manager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_PREPARE_TARGET_V2, request);
+      let result: unknown;
+      await vi.waitFor(async () => {
+        result = await manager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_PREPARE_TARGET_RESULT_GET_V2, { handoffId: request.handoffId, sessionId: request.sessionId });
+        expect(result).toMatchObject({ remoteSessionId: 'native-1', status: { status: 'ready_for_cutover' } });
+      }, { timeout: 10_000 });
+      expect(result).toMatchObject({
+        status: { status: 'ready_for_cutover', progress: { current: { phaseDetail: 'ready_for_cutover' } } },
+      });
+      expect(await readFile(transcriptPath, 'utf8')).toBe(transcript);
+      const persisted = await createSessionHandoffPrepareTargetJobStore({ activeServerDir }).findByHandoffId(request.handoffId);
+      expect(persisted).toMatchObject({ existingStateSessionId: 'session-1', prepareTargetRequest: { stateTransfer: 'existing' } });
+      expect(await manager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_PREPARE_TARGET_RESULT_GET_V2, {
+        handoffId: request.handoffId, sessionId: 'different-session',
+      })).toMatchObject({ ok: false, errorCode: 'invalid_persisted_job' });
+      expect(await createHandlers().invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_PREPARE_TARGET_RESULT_GET_V2, { handoffId: request.handoffId, sessionId: request.sessionId })).toEqual(result);
+      const resumed = await manager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_TARGET_RESUME_V2, { handoffId: request.handoffId, sessionId: request.sessionId, attemptId: 'attempt-1' });
+      expect(resumed).toMatchObject({ disposition: 'started_for_handoff' });
+      await manager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_TARGET_CONFIRM_V2, { handoffId: request.handoffId, sessionId: request.sessionId, attemptId: 'attempt-1' });
+      expect(await manager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_COMMIT_V2, { handoffId: request.handoffId, sessionId: request.sessionId, attemptId: 'attempt-1', mode: 'target' })).toMatchObject({ status: { status: 'completed' } });
+      const store = createSessionHandoffPrepareTargetJobStore({ activeServerDir });
+      const { sessionId: _sessionId, ...restartRequest } = request;
+      await store.write({
+        jobId: 'prepare-existing-restart', handoffId: 'existing-restart', existingStateSessionId: request.sessionId,
+        createdAtMs: Date.now() - 10_000, updatedAtMs: Date.now() - 10_000,
+        prepareTargetRequest: { ...restartRequest, handoffId: 'existing-restart' },
+        status: { handoffId: 'existing-restart', status: 'pending', phase: 'staging_target', recoveryActions: [] },
+      });
+      const restarted = createHandlers();
+      await restarted.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_STATUS_GET, { handoffId: 'existing-restart' });
+      await vi.waitFor(async () => {
+        const job = await store.findByHandoffId('existing-restart');
+        if (job?.lastErrorMessage) throw new Error(job.lastErrorMessage);
+        expect(await restarted.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_PREPARE_TARGET_RESULT_GET_V2, { handoffId: 'existing-restart', sessionId: request.sessionId })).toMatchObject({ remoteSessionId: 'native-1', status: { status: 'ready_for_cutover' } });
+      }, { timeout: 10_000 });
+      expect(await readFile(transcriptPath, 'utf8')).toBe(transcript);
+      const cancelledEnvironment = createDeferred<void>();
+      environmentReady = cancelledEnvironment.promise;
+      environmentRequested = false;
+      const cancelledManager = createHandlers();
+      try {
+        await cancelledManager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_PREPARE_TARGET_V2, { ...request, handoffId: 'existing-cancelled' });
+        await vi.waitFor(() => expect(environmentRequested).toBe(true), { timeout: 10_000 });
+        expect(await cancelledManager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_ABORT_V2, {
+          handoffId: 'existing-cancelled', sessionId: 'different-session', reason: 'cancel',
+        })).toMatchObject({ ok: false, errorCode: 'invalid_persisted_job' });
+        expect(await cancelledManager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_ABORT_V2, {
+          handoffId: 'existing-cancelled', sessionId: request.sessionId, reason: 'cancel',
+        })).toMatchObject({ status: { status: 'aborted' } });
+      } finally {
+        cancelledEnvironment.resolve();
+      }
+      await vi.waitFor(async () => {
+        const cancelled = await store.findByHandoffId('existing-cancelled');
+        if (!cancelled) throw new Error('Cancelled prepare job is missing');
+        // Observe writer completion, not just the abort handler's immediate projection.
+        await expect(readFile(join(activeServerDir, 'session-handoff', 'prepare-target-jobs-staging',
+          cancelled.jobId, 'lease', 'lease.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+        expect(cancelled).toMatchObject({ status: { status: 'aborted' } });
+        expect(cancelled).not.toHaveProperty('prepareTargetResult');
+      }, { timeout: 10_000 });
+      environmentReady = undefined;
+      await rm(transcriptPath);
+      const deferredEnvironment = createDeferred<void>();
+      environmentReady = deferredEnvironment.promise;
+      const missingManager = createHandlers();
+      const missing = await missingManager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_PREPARE_TARGET_V2, { ...request, handoffId: 'existing-missing' });
+      expect(missing).not.toHaveProperty('resume');
+      deferredEnvironment.resolve();
+      await vi.waitFor(async () => {
+        const failed = await createSessionHandoffPrepareTargetJobStore({ activeServerDir }).findByHandoffId('existing-missing');
+        expect(failed).toMatchObject({ status: { status: 'awaiting_recovery' } });
+        expect(failed).not.toHaveProperty('prepareTargetResult');
+      }, { timeout: 10_000 });
+      const missingResult = await missingManager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_PREPARE_TARGET_RESULT_GET_V2, { handoffId: 'existing-missing', sessionId: request.sessionId });
+      expect(missingResult).toMatchObject({ ok: false, errorCode: 'existing_session_state_unavailable' });
+      expect(await createHandlers().invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_PREPARE_TARGET_RESULT_GET_V2, { handoffId: 'existing-missing', sessionId: request.sessionId })).toEqual(missingResult);
+      environmentReady = undefined;
+      expect(await missingManager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_PREPARE_TARGET_V2, { ...request, handoffId: 'existing-missing-immediate' })).toMatchObject({ ok: false, errorCode: 'existing_session_state_unavailable' });
+      const { createSessionHandoffCoordinator } = await import('../../session/handoff/orchestration/sessionHandoffCoordinator');
+      const { resolveExistingSessionHandoffEligibilityThroughCatalog } = await import('@/backends/catalog');
+      const { createActionOperationRunner } = await import('../../daemon/actionOperations/actionOperationRunner');
+      const { createActionOperationStore } = await import('../../daemon/actionOperations/actionOperationStore');
+      const { createTrackedSessionHandoffStart } = await import('../../daemon/actionOperations/trackedSessionHandoffStart');
+      const snapshots: ActionOperationSnapshotV1[] = [];
+      const operationStore = createActionOperationStore({ onRevision: (snapshot) => snapshots.push(snapshot) });
+      const trackedStart = createTrackedSessionHandoffStart({
+        runner: createActionOperationRunner({ store: operationStore }),
+        getScope: async () => ({ accountId: 'handoff-test-account', machineId: 'source' }),
+        startUntracked: async (payload) => missingManager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_START, payload),
+        coordinate: async (input, context, startSource) => {
+          const call = (method: string, payload: unknown) => missingManager.invokeLocal(method, payload);
+          const coordinator = createSessionHandoffCoordinator({
+            assertExistingStateSupported: async () => {
+              const eligibility = resolveExistingSessionHandoffEligibilityThroughCatalog(metadata);
+              if (!eligibility.eligible) throw new Error(eligibility.reasonCode);
+            },
+            probeSourceCapability: async () => call(RPC_METHODS.DAEMON_SESSION_HANDOFF_CAPABILITY_V2_GET, {}),
+            probeTargetCapability: async () => call(RPC_METHODS.DAEMON_SESSION_HANDOFF_CAPABILITY_V2_GET, {}),
+            startSource,
+            prepareTarget: async (payload) => call(RPC_METHODS.DAEMON_SESSION_HANDOFF_PREPARE_TARGET_V2, payload),
+            getTargetPrepareResult: async (payload) => call(RPC_METHODS.DAEMON_SESSION_HANDOFF_PREPARE_TARGET_RESULT_GET_V2, payload),
+            getTargetStatus: async (payload) => call(RPC_METHODS.DAEMON_SESSION_HANDOFF_STATUS_GET, payload),
+            resumeTarget: async (payload) => call(RPC_METHODS.DAEMON_SESSION_HANDOFF_TARGET_RESUME_V2, payload),
+            confirmTarget: async (payload) => call(RPC_METHODS.DAEMON_SESSION_HANDOFF_TARGET_CONFIRM_V2, payload),
+            commitTarget: async (payload) => call(RPC_METHODS.DAEMON_SESSION_HANDOFF_COMMIT_V2, payload),
+            cleanupSource: async (payload) => call(RPC_METHODS.DAEMON_SESSION_HANDOFF_COMMIT, payload),
+            abortTarget: async (payload) => call(RPC_METHODS.DAEMON_SESSION_HANDOFF_ABORT_V2, payload),
+            abortSource: async (payload) => call(RPC_METHODS.DAEMON_SESSION_HANDOFF_ABORT, payload),
+            bindTarget: async () => { throw new Error('A missing native session must not bind the target'); },
+            wait: async () => new Promise((resolve) => setTimeout(resolve, 0)),
+            readServerFeatures: async () => FeaturesResponseSchema.parse({ features: { sessions: { enabled: true, handoff: { enabled: true } } }, capabilities: {} }),
+            directPeerAvailable: false,
+            preferredTransportStrategies: input.preferredTransportStrategies,
+          });
+          return (await coordinator.admit(input)).execute(context);
+        },
+      });
+      await writeFile(transcriptPath, transcript);
+      removeNativeStateBeforeLaunch = true;
+      const launchesBeforeNativeLoss = runnerLaunches;
+      const admission = await trackedStart({
+        requestId: 'existing-launch-missing-composed', sessionId: request.sessionId,
+        sourceMachineId: request.sourceMachineId, targetMachineId: request.targetMachineId,
+        sessionStorageMode: 'persisted', stateTransfer: 'existing', preferredTransportStrategies: ['direct_peer'],
+      });
+      expect(admission).toHaveProperty('handoffId');
+      await vi.waitFor(() => expect(snapshots.at(-1)).toMatchObject({
+        state: 'failed', error: { errorCode: 'existing_session_state_unavailable', error: 'Claude existing native session is unreachable' },
+      }), { timeout: 10_000 });
+      expect(runnerLaunches).toBe(launchesBeforeNativeLoss);
+      const outputPath = process.env.HAPPIER_HANDOFF_FAILURE_TEST_OUTPUT;
+      if (outputPath) await writeFile(outputPath, JSON.stringify({ admission, terminal: snapshots.at(-1), prepareResult: missingResult, launchFailure }));
+    } finally {
+      if (previousClaudeHome === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previousClaudeHome;
+      vi.doUnmock('@/configuration');
+      vi.resetModules();
+      await removeTestDirectory(activeServerDir);
+    }
+  });
+  it('refuses an existing-state raw start before source stop when the peer lacks support', async () => {
+    const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-handoff-existing-admission-'));
+    try {
+      vi.resetModules();
+      vi.doMock('@/configuration', async () => {
+        const actual = await vi.importActual<typeof import('@/configuration')>('@/configuration');
+        return { ...actual, configuration: { ...actual.configuration, activeServerDir } };
+      });
+      const { RpcHandlerManager } = await import('../rpc/RpcHandlerManager');
+      const { registerMachineSessionHandoffRpcHandlers } = await import('./rpcHandlers.sessionHandoff');
+      const unmountedManager = new RpcHandlerManager({ scopePrefix: 'unmounted', encryptionKey: new Uint8Array(32), encryptionVariant: 'dataKey', encryptionMode: 'plain' });
+      registerMachineSessionHandoffRpcHandlers({ rpcHandlerManager: unmountedManager });
+      expect(await unmountedManager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_CAPABILITY_V2_GET, {}))
+        .toMatchObject({ protocolVersion: 2, existingState: false });
+      const rpcHandlerManager = new RpcHandlerManager({ scopePrefix: 'test', encryptionKey: new Uint8Array(32), encryptionVariant: 'dataKey', encryptionMode: 'plain' });
+      const stopSessionForHandoff = vi.fn(async () => 'stopped' as const);
+      let existingStateSupported = false;
+      registerMachineSessionHandoffRpcHandlers({
+        rpcHandlerManager,
+        loadSessionMetadata: async () => ({ path: '/repo', flavor: 'claude', machineId: 'source', claudeSessionId: 'native-1' }),
+        stopSessionForHandoff,
+        spawnSessionForHandoff: async () => ({ type: 'success', sessionId: 'session-1', runnerAcceptance: 'newly_accepted' }),
+        probeHandoffCapability: async () => ({ protocolVersion: 2, atomicTargetResume: true, targetCleanup: true, ...(existingStateSupported ? { existingState: true } : {}) }),
+      });
+      const result = await rpcHandlerManager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_START, {
+        sessionId: 'session-1', sourceMachineId: 'source', targetMachineId: 'target',
+        sessionStorageMode: 'persisted', stateTransfer: 'existing',
+        preferredTransportStrategies: ['direct_peer'], negotiatedTransportStrategy: 'direct_peer',
+      });
+      expect(result).toMatchObject({ ok: false, errorCode: 'upgrade_required' });
+      expect(stopSessionForHandoff).not.toHaveBeenCalled();
+      expect(await rpcHandlerManager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_PREPARE_TARGET_V2, {
+        handoffId: 'unadmitted-existing', sessionId: 'session-1', sourceMachineId: 'source', targetMachineId: 'target',
+        targetPath: '/repo', sourceSessionStorageMode: 'persisted', stateTransfer: 'existing',
+        negotiatedTransportStrategy: 'direct_peer', endpointCandidates: [],
+      })).toMatchObject({ ok: false, errorCode: 'upgrade_required' });
+      const { createSessionHandoffPrepareTargetJobStore } = await import('../../session/handoff/prepare/sessionHandoffPrepareTargetJobStore');
+      expect(await createSessionHandoffPrepareTargetJobStore({ activeServerDir }).findByHandoffId('unadmitted-existing')).toBeNull();
+      existingStateSupported = true;
+      const started = await rpcHandlerManager.invokeLocal(RPC_METHODS.DAEMON_SESSION_HANDOFF_START, {
+        sessionId: 'session-1', sourceMachineId: 'source', targetMachineId: 'target',
+        sessionStorageMode: 'persisted', stateTransfer: 'existing',
+        preferredTransportStrategies: ['direct_peer'], negotiatedTransportStrategy: 'direct_peer',
+      });
+      expect(started).toMatchObject({ handoffId: expect.any(String), targetPath: '/repo', endpointCandidates: [] });
+      if (!started || typeof started !== 'object' || !('handoffId' in started) || typeof started.handoffId !== 'string') throw new Error('Expected started handoff');
+      const { createSessionHandoffSourceExportStore } = await import('../../session/handoff/state/sessionHandoffSourceExportStore');
+      const record = await createSessionHandoffSourceExportStore({ activeServerDir }).load(started.handoffId);
+      expect(record).toMatchObject({ stateTransfer: 'existing', sessionId: 'session-1' });
+      expect(record).not.toHaveProperty('providerBundle');
+      expect(record).not.toHaveProperty('workspaceManifest');
+    } finally {
+      vi.doUnmock('@/configuration');
+      vi.resetModules();
+      await removeTestDirectory(activeServerDir);
+    }
+  });
   it('uses a durable lease so only one daemon instance restarts a persisted non-terminal prepare-target job (no double-import across processes)', async () => {
     const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-handoff-prepare-lease-liveness-'));
     const targetPath = await mkdtemp(join(tmpdir(), 'happier-handoff-prepare-lease-target-'));

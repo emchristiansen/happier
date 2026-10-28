@@ -12,11 +12,16 @@ import { QWEN_UI } from '@/agents/providers/qwen/ui';
 import { KIMI_UI } from '@/agents/providers/kimi/ui';
 import { KILO_UI } from '@/agents/providers/kilo/ui';
 import { KIRO_UI } from '@/agents/providers/kiro/ui';
+import { DEVIN_UI } from '@/agents/providers/devin/ui';
 import { CUSTOM_ACP_UI } from '@/agents/providers/customAcp/ui';
 import { PI_UI } from '@/agents/providers/pi/ui';
 import { COPILOT_UI } from '@/agents/providers/copilot/ui';
 import { CURSOR_UI } from '@/agents/providers/cursor/ui';
 import { GROK_UI } from '@/agents/providers/grok/ui';
+import { FX_UI } from '@/agents/providers/fx/ui';
+import { DROID_UI } from '@/agents/providers/droid/ui';
+import { CODEBUDDY_UI } from '@/agents/providers/codebuddy/ui';
+import { AGY_UI } from '@/agents/providers/agy/ui';
 
 export type AgentIconSvgXmlResolver = (
     theme: UnistylesThemes[keyof UnistylesThemes],
@@ -58,11 +63,16 @@ export const AGENTS_UI: Readonly<Record<AgentId, AgentUiConfig>> = Object.freeze
     kimi: KIMI_UI,
     kilo: KILO_UI,
     kiro: KIRO_UI,
+    devin: DEVIN_UI,
     customAcp: CUSTOM_ACP_UI,
     pi: PI_UI,
     copilot: COPILOT_UI,
     cursor: CURSOR_UI,
     grok: GROK_UI,
+    fx: FX_UI,
+    droid: DROID_UI,
+    codebuddy: CODEBUDDY_UI,
+    agy: AGY_UI,
 });
 
 export function getAgentIconSource(agentId: AgentId): ImageSourcePropType | null {

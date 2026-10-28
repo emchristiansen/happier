@@ -295,6 +295,7 @@ const acpCatalogTranslationExtension = {
     acpCatalogAuthParser: 'Parser dello stato',
     acpCatalogCapabilities: 'Funzionalità',
     acpCatalogTransportProfile: 'Profilo di trasporto',
+    acpCatalogSupportsLoadSession: 'Supporta la ripresa delle sessioni',
     acpCatalogSupportsModes: 'Supporta modalità',
     acpCatalogSupportsModels: 'Supporta modelli',
     acpCatalogSupportsConfigOptions: 'Supporta opzioni di configurazione',
@@ -479,6 +480,15 @@ const promptLibraryUxRefinementTranslationExtension = {
 
 const sessionHandoffTranslationExtensions = {
   it: {
+    transferSessionData: {
+      title: "Trasferisci i dati della sessione",
+      subtitle: "Copia la cronologia della conversazione di questa sessione sull’altro computer. Disattiva se è già presente.",
+      checking: "Verifica del supporto su entrambi i computer…",
+      agentRequiresTransfer: "Questo Agente richiede il trasferimento dei dati della sessione tra computer.",
+      updateRequired: "Aggiorna Happier su entrambi i computer per disattivare questa opzione.",
+      sessionMissing: "La cronologia di questa sessione non è sul computer di destinazione. Attiva «Trasferisci i dati della sessione» e riprova.",
+      workspaceRequiresTransfer: "Attiva «Trasferisci i dati della sessione» per copiare o sincronizzare i file dell’area di lavoro.",
+    },
     activeWarning: {
       title: 'Questa sessione è ancora in esecuzione qui',
       message: 'Il trasferimento fermerà questa sessione su questa macchina prima di trasferirla alla macchina selezionata.',
@@ -738,7 +748,9 @@ export const it: TranslationStructure = {
     emptyDescription: "Nessuna richiesta o aggiornamento in sospeso al momento.",
     approvals: "Approvazioni",
     permissions: "Permessi",
-    unreadSessions: "Sessioni non lette",
+    errors: "Errori",
+    markAllRead: "Segna tutto come letto",
+    openInbox: "Apri posta in arrivo",
     updates: "Attività",
     actionOperations: {
       sections: { inProgress: "In corso", needsAttention: "Richiede attenzione", recent: "Recenti" },
@@ -1183,6 +1195,10 @@ export const it: TranslationStructure = {
     moreActionsHint: "Apre un menu con altre azioni",
     cancel: "Annulla",
     close: "Chiudi",
+    minimizeWindow: "Riduci a icona la finestra",
+    maximizeWindow: "Ingrandisci la finestra",
+    restoreWindow: "Ripristina la finestra",
+    closeWindow: "Chiudi la finestra",
     dismissKeyboard: 'Nascondi tastiera',
       open: "Apri",
       done: "Fatto",
@@ -1326,8 +1342,8 @@ export const it: TranslationStructure = {
       anthropic: "Anthropic (Predefinito)",
       deepseek: "DeepSeek (Ragionamento)",
       zai: "Z.AI (GLM-4.6)",
-      minimax: "MiniMax (M3)",
-      minimaxCn: "MiniMax (M3, CN)",
+      minimax: "MiniMax (M3.1 Flash)",
+      minimaxCn: "MiniMax (M3.1 Flash, CN)",
       codex: "Codex (Predefinito)",
       openai: "OpenAI (GPT-5)",
       azureOpenai: "Azure OpenAI",
@@ -1495,9 +1511,14 @@ export const it: TranslationStructure = {
       geminiSubtitleExperimental: "Gemini CLI (sperimentale)",
       auggieSubtitle: "Auggie CLI",
       qwenSubtitleExperimental: "Qwen Code CLI (sperimentale)",
-      kimiSubtitleExperimental: "Kimi CLI (sperimentale)",
+      kimiSubtitleExperimental: "Kimi Code CLI (sperimentale)",
       kiloSubtitleExperimental: "Kilo CLI (sperimentale)",
       kiroSubtitleExperimental: "Kiro CLI (sperimentale)",
+      devinSubtitleExperimental: "Devin CLI (sperimentale)",
+      agySubtitleExperimental: "CLI Antigravity (sperimentale)",
+      fxSubtitleExperimental: "FX CLI (sperimentale)",
+      droidSubtitleExperimental: "Factory Droid CLI (sperimentale)",
+      codebuddySubtitleExperimental: "CodeBuddy Code CLI (sperimentale)",
       customAcpSubtitleExperimental: "CLI ACP personalizzata (sperimentale)",
       grokSubtitleExperimental: "Grok Build CLI (sperimentale)",
       piSubtitleExperimental: "Pi CLI (sperimentale)",
@@ -1632,6 +1653,7 @@ export const it: TranslationStructure = {
     working: "al lavoro...",
     workingRetained: "al lavoro, in attesa di aggiornamenti…",
     keptInAttention: "mantenuta in attenzione",
+    archiving: "archiviazione…",
     backgroundActive: ({ count }: { count: number }) => `${count} in esecuzione in background`,
     activityUnknown: "stato dell'attività non disponibile",
     readyForReview: "pronto per la revisione",
@@ -1646,6 +1668,11 @@ export const it: TranslationStructure = {
 
   connectionStatus: {
     title: "Connessione",
+    thisComputerConnectedTo: ({ relay }: { relay: string }) => `Questo computer è connesso a ${relay}`,
+    thisComputerRelayConnected: 'Connesso',
+    thisComputerRelayOffline: 'Non in linea',
+    thisComputerRelayNeedsAttention: 'Richiede attenzione',
+    thisComputerSetUpFor: ({ relay }: { relay: string }) => `Configurato per ${relay}`,
     labels: {
       server: "Server (servizio)",
       socket: "WebSocket",
@@ -1653,6 +1680,7 @@ export const it: TranslationStructure = {
       lastSync: "Ultima sincronizzazione",
       nextRetry: "Prossimo tentativo",
       lastError: "Ultimo errore",
+      thisComputer: 'Questo computer',
     },
   },
 
@@ -2807,6 +2835,19 @@ export const it: TranslationStructure = {
   },
 
   connectedServices: {
+    importAccounts: {
+        unknownResult: "Il risultato dell’importazione è sconosciuto. Aggiorna l’elenco degli account e verifica questo profilo prima di riprovare.",
+        title: "Importa un accesso esistente",
+        failed: "Impossibile importare l’accesso. Verifica di aver effettuato l’accesso sul computer selezionato, poi riprova.",
+        actionDescription: "Copia un accesso da una delle tue macchine",
+        description: "Copia l’accesso nel profilo crittografato. I token di rinnovo condivisi possono cambiare e l’app locale potrebbe richiedere un nuovo accesso.",
+        unsupported: "Importazione non disponibile. Scegli un’altra macchina o aggiorna la sua CLI.",
+        credentialsUnavailable: "Nessun accesso utilizzabile. Accedi nell’app locale e riprova.",
+        profileConflict: "Il profilo appartiene a un altro account o è cambiato durante l’importazione. Scegli un nuovo nome.",
+        reauthorizationRequired: "Accedi di nuovo nell’app locale e riprova.",
+        imported: "Accesso importato",
+        refreshFailed: "L’accesso è stato importato, ma l’elenco degli account non si è aggiornato. Riapri i servizi connessi.",
+    },
       subscription: {
           title: "Abbonamento",
           currentPeriod: "Periodo attuale",
@@ -2836,6 +2877,7 @@ export const it: TranslationStructure = {
       openai: "Chiave API OpenAI",
       anthropic: "Chiave API Anthropic",
       gemini: "Gemini di Google",
+      antigravity: 'Google Antigravity',
       github: "GitHub",
     },
     title: "Servizi connessi",
@@ -2858,6 +2900,7 @@ export const it: TranslationStructure = {
                 profileMissing: 'L’account connesso selezionato non è più disponibile. Aggiorna l’elenco degli account e scegline un altro.',
                 groupMissing: 'Il Pool di account selezionato non è più disponibile. Aggiorna l’elenco degli account e scegli un altro Pool.',
                 metadataUpdateFailed: 'La sessione non ha potuto salvare la nuova selezione di autenticazione. Riprova dopo il completamento della sincronizzazione.',
+                restartDisallowedByExecutionPolicy: 'Questa modifica dell’autenticazione richiede un riavvio non consentito mentre la sessione è in esecuzione. Arresta la sessione prima di modificarne l’autenticazione.',
                 restartFailed: 'Non è stato possibile riavviare la sessione con la nuova selezione di autenticazione. Arresta la sessione e riprova.',
                 hotApplyFailed: 'La sessione in esecuzione ha rifiutato la nuova selezione di autenticazione. Riavvia la sessione e riprova.',
                 agentMismatch: 'Questa selezione di autenticazione non corrisponde al backend della sessione.',
@@ -3039,6 +3082,7 @@ export const it: TranslationStructure = {
       },
     },
     quota: {
+      refreshing: "Aggiornamento dell’utilizzo…",
       loading: "Caricamento…",
       error: ({ message }: { message: string }) => `Errore: ${message}`,
       lastUpdated: ({ time }: { time: string }) =>
@@ -3086,6 +3130,21 @@ export const it: TranslationStructure = {
       resets: {
         use: "Usa",
         available: "Ripristino disponibile",
+        remainingCount: ({ count }: { count: number }) => `Ripristini salvati: ${count}`,
+        appliesTo: ({ limits }: { limits: string }) => `Si applica a: ${limits}`,
+        fiveHourLimit: "Limite di 5 ore",
+        weeklyLimit: "Limite settimanale",
+        unavailableReasons: {
+          paused: "In pausa",
+          cooldown: "In attesa del periodo di recupero",
+          ineligible: "Non idoneo",
+          not_selected: "Non selezionato",
+          provider_unavailable: "Provider non disponibile",
+          not_started: "Non ancora iniziato",
+          expired: "Scaduto",
+          consumed: "Già usato",
+          unknown: "Al momento non disponibile",
+        },
         rowLabel: ({ date, countdown }: { date: string; countdown: string }) => `Scade ${date} · ${countdown}`,
         now: "ora",
         inDays: ({ days }: { days: number }) => `tra ${days}g`,
@@ -3107,6 +3166,12 @@ export const it: TranslationStructure = {
       pasteRedirectUrlPromptBody:
         "Dopo aver completato OAuth, copia l’URL finale reindirizzato dalla barra degli indirizzi del browser e incollalo qui.",
       providerOverrides: {
+        antigravity: {
+          connectWebDescription: "Passaggio successivo: accedi con Google. Antigravity mostra un codice di autorizzazione da copiare.",
+          pasteRedirectUrlPromptBody: "1) Accedi con Google. 2) Copia il codice di autorizzazione mostrato su antigravity.google. 3) Incollalo qui sotto mantenendo aperto questo accesso.",
+          pasteRedirectUrlPlaceholder: "Incolla il codice di autorizzazione Antigravity",
+          pasteRedirectUrlTitle: "Incolla codice di autorizzazione",
+        },
         claudeSubscription: {
           connectWebDescription:
             "Passaggio successivo: accedi nella pagina che si apre. Claude potrebbe mostrare una stringa di codice invece di reindirizzare automaticamente.",
@@ -3192,6 +3257,7 @@ export const it: TranslationStructure = {
       addOauthProfileDeviceTitle: "Aggiungi con auth dispositivo",
       addOauthProfileDeviceSubtitle: "Consigliato per web/ambienti remoti",
       addOauthProfilePasteTitle: "Aggiungi con incolla reindirizzamento",
+      signInWithGoogle: 'Accedi con Google',
       addOauthProfilePasteSubtitle: "Flusso manuale di copia/incolla URL di reindirizzamento",
       addOauthProfileBrowserTitle: "Aggiungi con browser in-app",
       addOauthProfileBrowserSubtitle: "Usa un browser incorporato dove supportato",
@@ -3236,6 +3302,7 @@ export const it: TranslationStructure = {
       errors: {
         credentialReferencedByGroup: "Questo account è ancora usato da un Pool di account. Rimuovilo dal Pool e riprova.",
         credentialNotFound: "Questo account connesso è già stato rimosso.",
+        serviceUnsupportedServer: 'Questo relay non supporta questo servizio connesso. Aggiorna il relay per collegarlo.',
         credentialRequestFailed: "La richiesta dell'account connesso non è riuscita. Aggiorna i servizi connessi e riprova.",
         groupRequestFailed: "La richiesta del Pool di account non è riuscita. Aggiorna i servizi connessi e riprova.",
         generationConflict: "Questo Pool di account è cambiato prima del completamento dell'azione. Aggiorna i servizi connessi e riprova.",
@@ -3275,6 +3342,7 @@ export const it: TranslationStructure = {
         autoFallbackDisabled: "Fallback automatico disattivato",
         strategyPriority: "Ordine di priorità",
         strategyLeastLimited: "Meno limitato per primo",
+        strategyExpiryFirst: "Prima la quota in scadenza",
         strategyManual: "Cambio manuale",
         priority: ({ priority }: { priority: string }) => `Priorità ${priority}`,
         statusReady: "Pronto",
@@ -3293,6 +3361,7 @@ export const it: TranslationStructure = {
         memberPlanUnavailableUntil: ({ time }: { time: string }) => `Piano non disponibile fino a ${time}`,
         memberValidationBlockedUntil: ({ time }: { time: string }) => `Convalida bloccata fino a ${time}`,
         memberLastFailure: ({ reason }: { reason: string }) => `Ultimo problema: ${reason}`,
+        memberAutoDisabledModelNotEntitled: "Disattivato automaticamente: modello selezionato non disponibile",
         warningNoEnabledMembers: "Nessun membro abilitato è disponibile per il fallback.",
         warningNoFallbackMember: "Aggiungi o abilita un altro membro prima che il fallback automatico possa cambiare account.",
       },
@@ -3353,6 +3422,8 @@ export const it: TranslationStructure = {
         autoSwitchTitle: "Fallback automatico",
         autoQuotaResetTitle: "Usa automaticamente i reset della quota",
         autoQuotaResetSubtitle: "Consuma un reset disponibile solo quando nessun account del pool è pronto e la quota esaurita può essere ripristinata. Disattivato per impostazione predefinita.",
+        autoDisablePlanInvalidTitle: "Disattiva gli account che non possono usare il modello selezionato",
+        autoDisablePlanInvalidSubtitle: "Disattiva automaticamente un account del pool quando il suo piano non può usare il modello selezionato. Puoi riattivarlo manualmente. Disattivato per impostazione predefinita.",
         autoSwitchEnabledSubtitle: "Passa a un altro membro quando l'account attivo richiede recupero.",
         autoSwitchDisabledSubtitle: "Continua a usare il membro attivo finché non lo cambi manualmente.",
         strategyTitle: "Strategia di selezione",
@@ -3360,6 +3431,7 @@ export const it: TranslationStructure = {
         strategyPrioritySubtitle: "Prova prima i numeri di priorità più bassi.",
         strategyLeastLimitedTitle: "Meno limitato prima",
         strategyLeastLimitedSubtitle: "Preferisci il membro con più quota utilizzabile.",
+        strategyExpiryFirstSubtitle: "Preferisci la quota utilizzabile che si ripristina o scade prima, mantenendo un margine sufficiente.",
         strategyManualTitle: "Cambio manuale",
         strategyManualSubtitle: "Usa solo il membro attivo finché non viene cambiato manualmente.",
         softSwitchThresholdTitle: "Soglia di cambio leggero",
@@ -3422,6 +3494,18 @@ export const it: TranslationStructure = {
         noMembersTitle: "Nessun membro ancora",
         noMembersSubtitle: "Aggiungi un account connesso a questo Pool.",
         behaviorTitle: "Comportamento",
+        quotaLimitsTitle: "Limiti di utilizzo",
+        quotaLimitsAll: "Tutti i limiti segnalati",
+        quotaLimitsAllDescription: "Usa tutti i limiti segnalati dagli account abilitati del pool; i nuovi limiti vengono inclusi automaticamente.",
+        quotaLimitsRefreshing: ({ count }: { count: number }) => `Aggiornamento di ${count} account abilitati; l’elenco potrebbe essere incompleto.`,
+        quotaLimitsSelected: ({ count }: { count: number }) => `${count} ${count === 1 ? 'limite selezionato' : 'limiti selezionati'}`,
+        quotaLimitsUnavailable: "I limiti appaiono dopo l’aggiornamento degli account.",
+        quotaLimitsSearch: "Cerca limiti di utilizzo",
+        quotaLimitNotReportedWithId: ({ id }: { id: string }) => `Non segnalato attualmente da un account abilitato · ID provider: ${id}`,
+        quotaLimitProviderTitle: "Limite del provider",
+        quotaLimitDetails: ({ windowCount, windowSummary, accountCount, totalAccountCount }: { windowCount: number; windowSummary: string | null; accountCount: number; totalAccountCount: number }) => `${windowSummary ? `${windowSummary} · ` : windowCount > 1 ? `${windowCount} finestre · ` : ''}${accountCount} di ${totalAccountCount} account abilitati`,
+        quotaLimitModelDetails: ({ model, windowCount, windowSummary, accountCount, totalAccountCount }: { model: string; windowCount: number; windowSummary: string | null; accountCount: number; totalAccountCount: number }) => `${model} · ${windowSummary ? `${windowSummary} · ` : windowCount > 1 ? `${windowCount} finestre · ` : ''}${accountCount} di ${totalAccountCount} account abilitati`,
+        quotaLimitProviderDetails: ({ id, windowCount, windowSummary, accountCount, totalAccountCount }: { id: string; windowCount: number; windowSummary: string | null; accountCount: number; totalAccountCount: number }) => `${windowSummary ? `${windowSummary} · ` : windowCount > 1 ? `${windowCount} finestre · ` : ''}${accountCount} di ${totalAccountCount} account abilitati · ID: ${id}`,
         advancedTitle: "Avanzate",
         advancedSubtitle: "Regola quando e come questo Pool cambia account.",
                 manualApplyDivergenceTitle: "Cambiato sul server, non nelle sessioni attive",
@@ -3789,9 +3873,44 @@ export const it: TranslationStructure = {
 
   settingsDesktop: {
     title: 'Scrivania',
-    footer: 'Controlla le integrazioni desktop di Tauri su questo computer.',
-    startOnLoginTitle: 'Avvia all’accesso',
-    startOnLoginSubtitle: 'Avvia Happier automaticamente quando accedi a questo computer.',
+    footer: 'Controlla come si comporta Happier su questo computer.',
+    backgroundServiceTitle: 'Restare raggiungibile in background',
+    backgroundServiceSubtitle: 'Questo computer continua a rispondere dopo che esci da Happier, su ogni relay a cui è connesso: Happier si avvia all\u2019accesso e resta nella barra dei menu o nell\u2019area di notifica. Se lo disattivi, uscire da Happier arresta il servizio in background, e telefono e browser non potranno raggiungerlo finché non riapri l\u2019app.',
+    backgroundServiceUnknown: 'La riga di comando di Happier su questo computer non indica se il servizio in background si avvia all’accesso.',
+    backgroundServiceNotSetUp: 'Disponibile dopo aver configurato questo computer.',
+    backgroundServiceChangeFailed: 'La modifica non è andata a buon fine. Riprova.',
+    trayOpen: 'Apri Happier',
+    trayQuit: 'Esci da Happier',
+    trayQuitKeepServices: 'Esci da Happier (i servizi in background restano attivi)',
+    trayQuitStopServices: 'Esci da Happier e ferma i servizi in background',
+    trayOpenInHappier: 'Apri in Happier',
+    traySettings: 'Impostazioni…',
+    trayStartAtLogin: 'Avvia all’accesso',
+    trayStopAndQuit: 'Arresta i servizi in background ed esci',
+    trayStart: 'Avvia',
+    trayRestart: 'Riavvia',
+    trayStop: 'Arresta',
+    trayUserOwned: 'Configurato fuori da Happier',
+    trayChecking: 'Controllo dei servizi in background…',
+    trayReadFailed: 'Impossibile leggere i servizi in background',
+    trayIncomplete: 'Alcuni servizi in background non sono stati letti',
+    trayNoServices: 'Questo computer non è ancora configurato',
+    trayWorking: 'In corso…',
+    trayStopConfirmTitle: ({ relay }: { relay: string }) => `Arrestare il servizio in background di Happier per ${relay}?`,
+    trayStopConfirmBody: ({ relay }: { relay: string }) => `Le sessioni degli agenti in esecuzione su questo computer per ${relay} termineranno, e telefono e browser non potranno raggiungerlo lì finché non si riavvia.`,
+    trayStopAllConfirmTitle: 'Arrestare i servizi in background di Happier e uscire?',
+    trayStopAllConfirmBody: 'Le sessioni degli agenti in esecuzione su questo computer termineranno, e telefono e browser non potranno raggiungerlo finché non riapri Happier.',
+    trayStopConfirmAction: 'Arresta',
+    trayActionFailedTitle: 'Non è andato a buon fine',
+    trayLoginItemFailed: 'Impossibile aggiornare l’elemento di login di Happier',
+    traySessions: ({ count }: { count: string }) => `Sessioni: ${count}`,
+    closeStopTitle: 'Ci sono ancora sessioni agente in corso',
+    closeStopBody: 'Chiudere Happier arresta il servizio in background su questo computer e termina le sessioni in esecuzione qui.',
+    closeStopUnknownTitle: 'Arrestare il servizio in background?',
+    closeStopUnknownBody: 'Happier non vede quali sessioni sono in esecuzione su questo computer. Chiuderlo arresta il servizio in background e termina quelle attive.',
+    closeStopConfirm: 'Arresta comunque',
+    closeStopKeep: 'Lascialo in esecuzione',
+    closeStopFailedBody: 'Happier non è riuscito a fermare i servizi in background, quindi resta nella barra dei menu o nell’area di notifica, da dove puoi riprovare.',
   },
 
   settingsPets: {
@@ -3875,6 +3994,8 @@ export const it: TranslationStructure = {
   },
 
   settingsNotifications: {
+        mutePhoneWhenComputerFocusedTitle: "Silenzia il telefono quando il computer è attivo",
+        mutePhoneWhenComputerFocusedSubtitle: "Silenzia le notifiche Pronto e le richieste mentre una finestra di Happier su un computer ha il focus. Riprendono quando nessuna finestra su computer ha il focus.",
     badges: {
       title: "Badge su questo dispositivo",
       footer:
@@ -4296,6 +4417,10 @@ export const it: TranslationStructure = {
             claude: {
                 title: "Claude Code",
                 sections: {
+                    claudeModelDiscovery: {
+                        title: "Rilevamento dei modelli",
+                        footer: "Controlla se Happier chiede ad Anthropic quali modelli sono disponibili per l'account Claude selezionato."
+                    },
                     claudeUnifiedTerminal: {
                         title: "Runtime terminale unificato",
                         footer: "Quando è attivo, Happier invia i prompt alla stessa sessione terminale di Claude Code invece di avviare un runner Agent SDK separato."
@@ -4310,6 +4435,10 @@ export const it: TranslationStructure = {
                     }
                 },
                 fields: {
+                    claudeDynamicModelProbeEnabled: {
+                        title: "Rileva i modelli disponibili",
+                        subtitle: "Consente a Happier di interrogare Anthropic con l'account Claude selezionato. Disattiva questa opzione per usare il catalogo integrato di Happier senza leggere le credenziali native di Claude Code."
+                    },
                     claudeUnifiedTerminalEnabled: {
                         title: "Usa runtime terminale unificato",
                         subtitle: "Controlla Claude tramite la sessione terminale in modo che UI e terminale condividano una sola esecuzione di Claude Code."
@@ -4367,6 +4496,10 @@ export const it: TranslationStructure = {
                                 subtitle: "Rifiuta il prompt Claude corrente riacquisito per i workspace aperti da Happier."
                             }
                         }
+                    },
+                    claudeCodeIncludeInNativeHistory: {
+                        title: "Mostra le sessioni in Claude Code",
+                        subtitle: "Usa l’attribuzione Happier per le nuove sessioni Claude, incluse quelle Agent SDK. Disattivato mantiene le impostazioni predefinite."
                     },
                     claudeCodeExperimentalAgentTeamsEnabled: {
                         title: "Forza l’attivazione di Agent Teams",
@@ -4465,6 +4598,10 @@ export const it: TranslationStructure = {
             opencode: {
                 title: "OpenCode",
                 sections: {
+                    cliGeneration: {
+                        title: "Versione di OpenCode",
+                        footer: "Automatico preferisce opencode, ripiega su opencode2 e rileva l’API server dopo l’avvio. Stabile seleziona sempre opencode, ma rileva comunque V1 o V2. V2 preferisce opencode2 e altrimenti usa opencode con V2 selezionato. Gli strumenti MCP di Happier funzionano con V2 in modalità ACP; la sua API server non supporta ancora la registrazione MCP dinamica."
+                    },
                     backendMode: {
                         title: "Modalita backend",
                         footer: "La modalita server sblocca domande e fork nativo. La modalita ACP e un fallback legacy."
@@ -4475,6 +4612,15 @@ export const it: TranslationStructure = {
                     }
                 },
                 fields: {
+                    opencodeCliGeneration: {
+                        title: "Generazione CLI",
+                        subtitle: "Scegli quale comando OpenCode installato avvia Happier.",
+                        options: {
+                            auto: { title: "Automatico (consigliato)", subtitle: "Preferisce opencode e ripiega su opencode2." },
+                            stable: { title: "Stabile", subtitle: "Avvia sempre opencode e rileva l’API dopo l’avvio." },
+                            v2: { title: "V2", subtitle: "Preferisce opencode2; altrimenti avvia opencode con V2 selezionato." }
+                        }
+                    },
                     opencodeBackendMode: {
                         title: "Modalita backend OpenCode",
                         subtitle: "Scegli il backend di integrazione.",
@@ -4534,33 +4680,16 @@ export const it: TranslationStructure = {
                 title: "Kilo"
             },
             kimi: {
-                title: "Kimi",
-                sections: {
-                    compatibility: {
-                        title: "Compatibilità",
-                        footer: "Usa la modalità compatibilità solo in ambienti Linux/container in cui l'avvio di Kimi ACP si blocca."
-                    }
-                },
-                fields: {
-                    kimiAcpPythonSelector: {
-                        title: "Selettore stdio Python",
-                        subtitle: "Scegli come Happier avvia il ciclo stdio Python di Kimi ACP.",
-                        options: {
-                            auto: {
-                                title: "Automatico",
-                                subtitle: "Usa il selettore Python predefinito di Kimi."
-                            },
-                            poll: {
-                                title: "Modalità compatibilità",
-                                subtitle: "Usa poll() invece di epoll() per lo stdio di Kimi ACP."
-                            }
-                        }
-                    }
-                }
+                title: "Kimi"
             },
             kiro: {
                 title: "Kiro"
             },
+            devin: { title: "Devin" },
+            agy: { title: 'Antigravity' },
+            fx: { title: "FX" },
+            droid: { title: "Factory Droid" },
+            codebuddy: { title: "CodeBuddy" },
             grok: {
                 title: "Grok Build"
             },
@@ -4674,6 +4803,9 @@ export const it: TranslationStructure = {
       full: "Larghezza completa",
       fullDescription: "Usa la larghezza disponibile della finestra",
     },
+    feedback: "Risposta al tocco",
+    haptics: "Feedback aptico",
+    hapticsDescription: "Usa il feedback tattile per le azioni e il riordino su questo dispositivo.",
     backdropBlur: "Sfocatura sfondo",
     backdropBlurDescription:
       "Usa la sfocatura dello sfondo dietro modali e menu. Disattivala per migliorare le prestazioni del browser.",
@@ -4703,6 +4835,13 @@ export const it: TranslationStructure = {
     showLineNumbersInToolViews: "Mostra numeri di riga nelle viste strumenti",
     showLineNumbersInToolViewsDescription:
       "Mostra i numeri di riga nei diff delle viste strumenti",
+    chatCodeBlocks: {
+        title: 'Blocchi di codice della chat',
+        showWrapControls: 'Mostra i controlli di a capo',
+        showWrapControlsDescription: 'Mostra un pulsante di a capo su ogni blocco di codice della chat',
+        wrapByDefault: 'A capo automatico predefinito',
+        wrapByDefaultDescription: 'Manda a capo le righe lunghe nei blocchi di codice della chat, salvo scelta diversa per un blocco',
+    },
     wrapLinesInDiffs: "A capo nelle viste del codice",
     wrapLinesInDiffsDescription:
       "Manda a capo le righe lunghe nelle anteprime del codice e negli editor invece di scorrere orizzontalmente",
@@ -4726,6 +4865,51 @@ export const it: TranslationStructure = {
       labels: "Etichette",
       icons: "Solo icone",
     },
+    loadingIndicator: "Indicatore di caricamento",
+    loadingIndicatorStyle: "Stile",
+    loadingIndicatorDescription: "Come appaiono gli indicatori mentre il lavoro è in corso",
+    loadingIndicatorFooter: "Con Riduci movimento attivo, gli stili a punti restano fermi e sfumano dolcemente, e l'Anello classico smette di girare.",
+    loadingIndicatorOptions: {
+      wave: "Onda",
+      handwritten: "Scritto a mano",
+      buildAndRelease: "Costruisci e rilascia",
+      relay: "Staffetta",
+      twinStems: "Steli gemelli",
+      slowBreath: "Respiro lento",
+      starfield: "Campo stellare",
+      sweep: "Scansione",
+      radar: "Radar",
+      ripple: "Increspatura",
+      aurora: "Aurora",
+      hWave: "H · Onda",
+      hHandwritten: "H · Scritto a mano",
+      hBuildAndRelease: "H · Costruisci e rilascia",
+      hRelay: "H · Staffetta",
+      hTwinStems: "H · Steli gemelli",
+      hSlowBreath: "H · Respiro lento",
+      hStarfield: "H · Campo stellare",
+      hSweep: "H · Scansione",
+      hRadar: "H · Radar",
+      hRipple: "H · Increspatura",
+      hAurora: "H · Aurora",
+      classicRing: "Anello classico",
+    },
+    loadingIndicatorSpeed: "Velocità",
+    loadingIndicatorSpeedDescription: "Quanto velocemente la luce attraversa i punti",
+    loadingIndicatorSpeedOptions: {
+      slow: "Lenta",
+      normal: "Normale",
+      fast: "Veloce",
+    },
+    loadingIndicatorPause: "Pausa",
+    loadingIndicatorPauseDescription: "Quanto riposano i punti prima di ogni ciclo",
+    loadingIndicatorPauseOptions: {
+      none: "Nessuna",
+      short: "Breve",
+      long: "Lunga",
+    },
+    loadingIndicatorPauseUnavailable: "Questo stile si ripete senza pause.",
+    loadingIndicatorSpeedUnavailable: "L'anello classico gira al proprio ritmo fisso.",
     avatarStyle: "Stile avatar",
     avatarStyleDescription: "Scegli l'aspetto dell'avatar di sessione",
     avatarOptions: {
@@ -4947,6 +5131,8 @@ export const it: TranslationStructure = {
   },
 
   errors: {
+    machineRpcDecryptionFailed: "Impossibile decifrare i dati di questa macchina. Accedi con la chiave dell’account corrispondente e riprova.",
+    machineRpcContextUnavailable: "La connessione a questa macchina non è disponibile. Aggiorna le macchine e riprova.",
     networkError: "Si è verificato un errore di rete",
     serverError: "Si è verificato un errore del server",
     unknownError: "Si è verificato un errore sconosciuto",
@@ -5049,11 +5235,26 @@ export const it: TranslationStructure = {
     installed: "Installato",
     installLog: ({ path }: { path: string }) => `Log di installazione: ${path}`,
     installable: {
+        downloading: "Download in corso… Tocca per aggiornare.",
+        install: "Installa",
+        update: "Aggiorna",
+        reinstall: "Reinstalla",
+        localEmbeddings: {
+            title: "Runtime per embedding locali",
+            description: "Installa solo il runtime. Per la ricerca semantica offline, carica anche il modello locale selezionato mentre sei online.",
+        },
+        difftastic: {
+            title: "Difftastic",
+            description: "Installa Difftastic per confrontare il codice in base alla sintassi prima di passare offline.",
+        },
       codexResume: {
         title: "Server di ripresa Codex",
       },
       codexAcp: {
         title: "Adattatore Codex ACP",
+      },
+      agyAcpServer: {
+          title: "Server ACP di Agy",
       },
       githubCli: {
         title: "CLI GitHub",
@@ -5089,6 +5290,8 @@ export const it: TranslationStructure = {
   },
 
   newSession: {
+    terminalHostUnavailableTitle: "Host del terminale non disponibile",
+    terminalHostUnavailableBody: ({ host }: { host: string }) => `Installa o aggiorna ${host} e riavvia il suo server su questa macchina, oppure scegli un altro host del terminale. La bozza viene conservata.`,
     ...newSessionMcpTranslationExtension,
     ...acpCatalogTranslationExtension.newSession,
     // Used by new-session screen and launch flows
@@ -5378,6 +5581,18 @@ export const it: TranslationStructure = {
       description:
         "Questo installa un adattatore ACP sperimentale per Codex che supporta il caricamento/la ripresa dei thread.",
     },
+    agyAcpBanner: {
+        title: "Server ACP di Agy",
+        install: "Installa",
+        update: "Aggiorna",
+        reinstall: "Reinstalla",
+    },
+    agyAcpInstallModal: {
+        installTitle: "Installare il server ACP di Agy?",
+        updateTitle: "Aggiornare il server ACP di Agy?",
+        reinstallTitle: "Reinstallare il server ACP di Agy?",
+        description: "Questo installa il server ACP ufficiale e bloccato di Agy usato per le sessioni Agy. La CLI interattiva agy resta installata separatamente.",
+    },
         githubCliBanner: {
             title: 'GitHub CLI',
             install: 'Installa',
@@ -5534,6 +5749,8 @@ export const it: TranslationStructure = {
         statusPaused: "In pausa",
         statusComplete: "Completato",
         statusBudgetLimited: "Limitato dal budget",
+        budgetReachedBody: "Questo obiettivo ha raggiunto il budget di token. Rimuovi il budget per continuare.",
+        removeBudgetAndResume: "Rimuovi budget e continua",
         statusInterrupted: "Interrotto",
         tokenBudget: "Budget token",
         budgetProgress: ({ used, budget }: { used: string; budget: string }) => `${used} / ${budget}`,
@@ -5692,6 +5909,11 @@ export const it: TranslationStructure = {
         composerBanners: {
             showBannerAction: 'Mostra banner',
             hideBannerAction: 'Nascondi banner',
+	    },
+	    runnerRestartBackgroundWork: {
+	        title: 'Lavoro in background in corso',
+	        body: ({ count }: { count: number }) => `È in corso del lavoro in background (${count}). Il riavvio lo interromperà.`,
+	        confirmAction: 'Interrompi e riavvia',
 	    },
 	    staleRunner: {
 	      title: "La sessione è ancora in esecuzione su una CLI precedente",
@@ -6094,7 +6316,7 @@ export const it: TranslationStructure = {
         discarded: {
           title: "Messaggi scartati",
           subtitle:
-            "Questi messaggi non sono stati inviati all’agente (ad esempio passando da remoto a locale).",
+            "Questi messaggi non sono più in coda. La consegna potrebbe essere incerta; controlla la trascrizione prima di inviarli di nuovo.",
           label: "Scartato",
           removeConfirm: {
             title: "Rimuovere il messaggio scartato?",
@@ -6300,6 +6522,28 @@ export const it: TranslationStructure = {
     targetSession: "Sessione target",
     noTarget: "Nessuna sessione selezionata",
     clearTarget: "Cancella target",
+    errors: {
+        sendFailed: "Impossibile inviare il tuo messaggio alla sessione.",
+        sttFailed: "Impossibile trascrivere quello che hai detto. Riprova.",
+        sttTimeout: "Il riconoscimento vocale è scaduto. Controlla la connessione e riprova.",
+        sttAuthFailed: "Il riconoscimento vocale ha rifiutato la chiave API. Controlla la chiave e le sue restrizioni in Impostazioni → Voce.",
+        sttRateLimited: "Il riconoscimento vocale ha raggiunto il limite di richieste. Attendi un momento e riprova.",
+        missingSttBaseUrl: "Imposta l'URL del server di riconoscimento vocale in Impostazioni → Voce.",
+        missingSttApiKey: "Aggiungi una chiave API per il riconoscimento vocale in Impostazioni → Voce.",
+        recordingStartFailed: "Impossibile avviare il microfono. Verifica che nessun'altra app lo stia usando.",
+        recordingStopFailed: "Impossibile completare la registrazione. Riprova.",
+        deviceSttUnavailable: "Il riconoscimento vocale non è disponibile su questo dispositivo. Scegli un altro provider di riconoscimento vocale in Impostazioni → Voce.",
+        speechPermissionDenied: "L'accesso al microfono o al riconoscimento vocale è stato negato. Consentilo nelle impostazioni del dispositivo.",
+        deviceSttStartFailed: "Impossibile avviare il riconoscimento vocale. Riprova.",
+        localNeuralSttUnavailable: "Il riconoscimento vocale sul dispositivo non è disponibile in questa build. Scegli un altro provider di riconoscimento vocale in Impostazioni → Voce.",
+        localNeuralPackNotInstalled: "Scarica il modello vocale in Impostazioni → Voce.",
+        localNeuralSttStartFailed: "Impossibile avviare il riconoscimento vocale sul dispositivo. Riprova.",
+        localNeuralAudioCaptureFailed: "Il microfono si è interrotto inaspettatamente. Riprova.",
+        ttsFailed: "Impossibile riprodurre la risposta vocale. Controlla la sintesi vocale in Impostazioni → Voce.",
+        voiceAgentRequiresFeature: ({ feature }: { feature: string }) => `La modalità agente richiede di attivare «${feature}» in Impostazioni → Funzionalità.`,
+        voiceAgentUnavailable: "L'agente vocale non è disponibile su questo server.",
+        generic: "La voce ha riscontrato un problema.",
+    },
     a11y: {
       teleport: "Teletrasporta l’agente vocale",
       toggleActivity: "Mostra/nascondi attività vocale",
@@ -6389,6 +6633,14 @@ export const it: TranslationStructure = {
     removeServer: "Rimuovi Relay",
     removeServerConfirm: ({ name }: { name: string }) =>
       `Rimuovere "${name}" dai Relay salvati?`,
+    removeServerDisconnectsThisComputer: ({ name }: { name: string }) => `Questo computer si disconnetterà anche da "${name}" e le sessioni agente in esecuzione qui per quel relay si fermeranno.`,
+    removeServerMayDisconnectThisComputer: ({ name }: { name: string }) => `Se questo computer è connesso a "${name}", si disconnetterà anche lui e le sessioni agente in esecuzione qui per quel relay si fermeranno.`,
+    removeServerEndsSessions: ({ count }: { count: number }) => count === 1 ? 'Ora qui è in esecuzione 1 sessione agente.' : `Ora qui sono in esecuzione ${count} sessioni agente.`,
+    removeServerKeepsUserService: ({ name }: { name: string }) => `Il servizio in background di questo computer per "${name}" è stato configurato fuori da Happier, quindi resta com\u2019è.`,
+    removeServerDisconnectFailed: 'Questo computer non è riuscito a disconnettersi da questo relay, quindi il relay è stato mantenuto. Riprova.',
+    removeServerAnywayTitle: 'Rimuovere comunque?',
+    removeServerAnywayBody: ({ name }: { name: string }) => `Non è stato possibile controllare i servizi in background di questo computer, quindi un servizio per "${name}" potrebbe continuare a funzionare qui dopo la rimozione. Puoi rimuoverlo più tardi con la CLI di Happier.`,
+    removeServerAnywayConfirm: 'Rimuovi comunque',
     removeServerGroup: "Rimuovi gruppo di Relay",
     removeServerGroupConfirm: ({ name }: { name: string }) =>
       `Rimuovere "${name}" dai gruppi di Relay salvati?`,
@@ -6432,11 +6684,11 @@ export const it: TranslationStructure = {
       "Un gruppo di Relay deve includere almeno un Relay.",
     relayDrift: {
         bannerDifferentRelayTitle: 'Il tuo servizio in background è connesso a un altro Relay',
-        bannerDifferentRelayDescription: ({ activeRelayUrl, daemonRelayUrl }: { activeRelayUrl: string; daemonRelayUrl: string }) =>
-            `App: ${activeRelayUrl} · Servizio in background: ${daemonRelayUrl}`,
         bannerNeedsAuthTitle: 'Il tuo servizio in background deve accedere a questo Relay',
         bannerNeedsAuthDescription: ({ activeRelayUrl }: { activeRelayUrl: string }) =>
             `L’app sta usando ${activeRelayUrl}, ma il servizio in background ha ancora bisogno di approvazione o accesso.`,
+        bannerAccountMismatchTitle: 'Il tuo servizio in background ha eseguito l’accesso con un altro account',
+        bannerAccountMismatchDescription: ({ relay, account, appAccount }: { relay: string; account: string; appAccount: string }) => `Questo computer è connesso a ${relay} come ${account}, non come ${appAccount}.`,
         bannerNotConfiguredTitle: 'Il tuo servizio in background non è ancora connesso a questo Relay',
         bannerNotConfiguredDescription: ({ activeRelayUrl }: { activeRelayUrl: string }) =>
             `L’app sta usando ${activeRelayUrl}, ma questo computer non ha ancora terminato la connessione del servizio in background.`,
@@ -6447,11 +6699,13 @@ export const it: TranslationStructure = {
         bannerNotRunningDescription: ({ activeRelayUrl }: { activeRelayUrl: string }) =>
             `L’app sta usando ${activeRelayUrl}, ma il servizio in background è fermo e deve essere riavviato.`,
         repairAction: 'Connetti il servizio in background a questo Relay',
+        connectHereAction: 'Connetti qui questo computer',
+        connectedElsewhere: ({ relay }: { relay: string }) => `Questo computer è connesso a ${relay}.`,
+        connectedElsewhereAs: ({ relay, account }: { relay: string; account: string }) => `Questo computer è connesso a ${relay} come ${account}.`,
+        serviceConnectedElsewhere: ({ relay }: { relay: string }) => `Il servizio in background è connesso a ${relay}.`,
         progressTitle: 'Connessione del servizio in background a questo Relay in corso',
         progressStepPrepare: 'Prepara il servizio in background',
-        progressStepConfigureRelay: 'Aggiorna la connessione al Relay',
         progressStepAuthenticate: 'Completa accesso e approvazione',
-        progressStepFinish: 'Completa la riparazione',
         statusUnknown: 'Sconosciuto',
     },
     retention: {
@@ -6610,6 +6864,21 @@ export const it: TranslationStructure = {
             updated: 'Sort by last activity',
         },
     attentionSectionTitle: 'Richiede attenzione',
+    reminders: {
+      due: 'Promemoria attivo',
+      title: 'Ricordamelo', inOneHour: 'Tra 1 ora', inThreeHours: 'Tra 3 ore',
+      tomorrowMorning: 'Domani mattina', nextWeek: 'La prossima settimana', custom: 'Scegli data e ora…',
+      customTitle: 'Scegli data e ora', customMessage: 'Inserisci una data e un’ora locali',
+      customPlaceholder: '2026-09-08 09:00', futureTimeRequired: 'Scegli un orario futuro.',
+      dateLabel: 'Data', timeLabel: 'Ora', addToPresets: 'Aggiungi ai preset',
+      datePlaceholder: 'AAAA-MM-GG', hourLabel: 'h', minuteLabel: 'min',
+      setReminder: 'Imposta promemoria',
+      remove: 'Rimuovi promemoria',
+      presetPreviewUnavailable: 'Scegli un orario futuro valido per vedere l’anteprima.',
+      managePresets: 'Gestisci preset', managePresetsMessage: 'Rinomina, riordina o rimuovi i promemoria salvati.',
+      presetName: 'Nome del preset', movePresetUp: 'Sposta in alto', movePresetDown: 'Sposta in basso',
+      noPresets: 'Nessun preset salvato', noPresetsMessage: 'Salvane uno quando scegli un promemoria personalizzato.',
+    },
     workingSectionTitle: 'In lavorazione',
     hideInactiveSessions: 'Nascondi sessioni inattive',
     showInactiveSessions: 'Mostra sessioni inattive',
@@ -6627,6 +6896,7 @@ export const it: TranslationStructure = {
     browseSourceCodexConnectedServices: ({ service }: { service: string }) => `${service} servizi collegati`,
     browseSourceClaudeDefault: "Configurazione predefinita di Claude",
     browseSourceOpenCodeDefault: "Server OpenCode predefinito",
+    browseSourceAcpAgentSessions: "Sessioni dell'agente",
     browseSourcePiDefault: "Directory predefinita dell'agente Pi",
     browseCandidates: "Sessioni disponibili",
     browseNoMachines: "Non ci sono ancora macchine disponibili per le sessioni dirette.",
@@ -6641,6 +6911,10 @@ export const it: TranslationStructure = {
     browseLoadMore: "Carica altre sessioni",
     browseFailedToLoad: "Impossibile caricare le sessioni del provider.",
     browseLinkFailed: "Impossibile collegare la sessione del provider selezionata.",
+    deleteCandidateActionsAccessibilityLabel: ({ title }: { title: string }) => `Altre azioni per ${title}`,
+    deleteCandidateConfirmTitle: "Eliminare la sessione del provider?",
+    deleteCandidateConfirmMessage: ({ title, provider }: { title: string; provider: string }) => `Eliminare “${title}” da ${provider}? Questa azione non può essere annullata.`,
+    deleteCandidateFailed: "Impossibile eliminare la sessione del provider.",
   },
 
     workspacePresentation: {
@@ -6704,6 +6978,16 @@ export const it: TranslationStructure = {
     kiloSessionIdCopied: "ID sessione Kilo copiato negli appunti",
     kiroSessionId: "ID sessione Kiro",
     kiroSessionIdCopied: "ID sessione Kiro copiato negli appunti",
+    devinSessionId: "ID sessione Devin",
+    devinSessionIdCopied: "ID sessione Devin copiato negli appunti",
+    agySessionId: "ID sessione Agy",
+    agySessionIdCopied: "ID sessione Agy copiato negli appunti",
+    fxSessionId: "ID sessione FX",
+    fxSessionIdCopied: "ID sessione FX copiato negli appunti",
+    droidSessionId: "ID sessione Factory Droid",
+    codebuddySessionId: "ID sessione CodeBuddy",
+    droidSessionIdCopied: "ID sessione Factory Droid copiato negli appunti",
+    codebuddySessionIdCopied: "ID sessione CodeBuddy copiato negli appunti",
     customAcpSessionId: "ID sessione ACP personalizzata",
     grokSessionId: "ID sessione Grok",
     grokSessionIdCopied: "ID sessione Grok copiato negli appunti",
@@ -6919,6 +7203,8 @@ export const it: TranslationStructure = {
     permissionMode: {
       title: "MODALITÀ PERMESSI",
       effectiveLabel: ({ label }: { label: string }) => `Effettivo: ${label}`,
+      nativeModeOverrides: ({ mode }: { mode: string }) => `La modalità agente ${mode} ha priorità su questa impostazione dei permessi. Cancella la selezione di Modalità per usare i permessi.`,
+            usePermissionSetting: 'Usa l’impostazione dei permessi',
       default: "Predefinito",
       readOnly: "Sola lettura",
       acceptEdits: "Accetta modifiche",
@@ -6945,6 +7231,11 @@ export const it: TranslationStructure = {
       kimi: "Kimi",
       kilo: "Kilo",
       kiro: "Kiro",
+      devin: "Devin",
+      agy: 'Antigravity',
+      fx: "FX",
+      droid: "Factory Droid",
+      codebuddy: "CodeBuddy",
       customAcp: "ACP personalizzato",
       pi: "Pi",
       copilot: "Copilot",
@@ -7021,6 +7312,7 @@ export const it: TranslationStructure = {
     },
     context: {
       remaining: ({ percent }: { percent: number }) => `${percent}% restante`,
+      badgeLabel: "Contesto",
       windowTitle: "Finestra di contesto",
       usedDetail: ({
         percent,
@@ -7285,6 +7577,7 @@ export const it: TranslationStructure = {
       summaryEdits: ({ count }: { count: number }) =>
         `${count} ${plural({ count, singular: "modifica", plural: "modifiche" })}`,
     },
+    subAgentTitle: ({ label }: { label: string }) => `${label} Agente`,
     names: {
       task: "Attività",
       subAgent: "Sub-agente",
@@ -7373,6 +7666,8 @@ export const it: TranslationStructure = {
 	        copyPath: "Copia percorso",
 	        download: "Scarica",
 	        downloadAsZip: "Scarica come ZIP",
+	        openWith: 'Apri con',
+	        share: 'Condividi',
 	      },
 	      dropToUpload: "Trascina i file per caricare",
 	      rename: {
@@ -7639,6 +7934,9 @@ export const it: TranslationStructure = {
         `Modifiche non in stage (${count})`,
       // File viewer strings
       fileReadFailed: "Impossibile leggere il file",
+      androidFileActionsUnavailable: "Le azioni sui file Android non sono disponibili in questa versione dell’app. Aggiorna Happier e riprova.",
+      fileSharingUnavailable: "La condivisione dei file non è disponibile su questo dispositivo.",
+      fileCleanupFailed: "Impossibile rimuovere il file temporaneo",
       fileTooLargeToPreview: "Il file è troppo grande per l'anteprima",
       fileWriteFailed: "Impossibile scrivere il file",
     fileEditor: {
@@ -7717,6 +8015,7 @@ export const it: TranslationStructure = {
       loadingFile: ({ fileName }: { fileName: string }) =>
         `Caricamento ${fileName}...`,
         binaryFile: "File binario",
+        videoPreview: 'Anteprima video',
         imagePreviewTooLarge: "L'anteprima dell'immagine è troppo grande per essere visualizzata",
         sessionMedia: {
           generatedImageA11y: ({ name }: { name: string }) => `Apri immagine generata ${name}`,
@@ -8050,7 +8349,7 @@ export const it: TranslationStructure = {
         invalidActionSubtitle: "Questa azione non è più disponibile in questa build.",
         configureActionAccessibilityLabel: "Configura azione",
         approvalHelpTitle: "Modalità di approvazione",
-        approvalHelpBody: "“Chiedi prima” crea una richiesta di approvazione prima che questa azione venga eseguita da quella superficie. Per le sessioni AI, la richiesta resta nella superficie di approvazioni esistente e non attende in un modale. “Consentito” permette l’esecuzione da quella superficie senza una richiesta di approvazione.",
+        approvalHelpBody: "“Chiedi prima” richiede l’approvazione prima di eseguire questa azione da quella superficie. I controlli dell’app possono mostrare una finestra di conferma. Per le sessioni AI, la richiesta resta nella superficie di approvazioni esistente e non attende in un modale. “Consentito” permette l’esecuzione senza una richiesta di approvazione.",
         toolExposure: {
             title: "Esposizione strumento",
             footer: "Controlla se le azioni idonee compaiono come strumenti diretti o restano disponibili solo tramite individuazione delle azioni.",
@@ -8201,6 +8500,8 @@ export const it: TranslationStructure = {
     },
 
 settingsSession: {
+    terminalHostTitle: 'Host terminale per le nuove sessioni',
+    terminalHostNone: 'Nessun host terminale',
     newSessionDraftEntry: {
         title: 'Bozze di nuova sessione',
         footer: 'Scegli se Nuova sessione continua la bozza di questo dispositivo o ne apre una nuova.',
@@ -8221,6 +8522,14 @@ settingsSession: {
 	          workingStatusAnimatedTextTitle: 'Testo di lavoro animato',
 	          workingStatusAnimatedTextEnabledSubtitle: 'Alterna verbi di lavoro mentre una sessione è in esecuzione',
 	          workingStatusAnimatedTextDisabledSubtitle: 'Mostra un’etichetta fissa al lavoro... mentre una sessione è in esecuzione',
+	          backgroundWorkAttentionModeTitle: "Risposte non lette durante il lavoro in background",
+	          backgroundWorkAttentionModeSubtitle: "Scegli dove mostrare le risposte non lette mentre il lavoro in background continua. Le richieste rivolte a te richiedono comunque attenzione.",
+	          backgroundWorkAttentionKeepWorkingTitle: "Mantieni lo stato di lavorazione",
+	          backgroundWorkAttentionKeepWorkingSubtitle: "Mantieni lo stato di lavorazione e mostra un punto centrale blu per le risposte non lette",
+	          backgroundWorkAttentionKeepWorkingUnreadTitle: "Mostra lo stato non letto in In lavorazione",
+	          backgroundWorkAttentionKeepWorkingUnreadSubtitle: "Mantieni le sessioni in “In lavorazione” e mostra lo stato non letto finché non leggi la risposta",
+	          backgroundWorkAttentionShowUnreadTitle: "Sposta le sessioni non lette in Richiede attenzione",
+	          backgroundWorkAttentionShowUnreadSubtitle: "Sposta le sessioni con risposte non lette in Richiede attenzione mentre il lavoro in background continua",
 	          attentionPromotionModeTitle: 'Sessioni che richiedono attenzione',
 	          attentionPromotionModeSubtitle: 'Scegli dove appaiono le sessioni in attesa di te o pronte per la revisione',
 	          attentionPromotionModeOffTitle: 'Lascia nella posizione normale',
@@ -8229,6 +8538,8 @@ settingsSession: {
 	          attentionPromotionModeGlobalSubtitle: 'Mostra una sezione di attenzione sopra il resto',
 	          attentionPromotionModeWithinGroupsTitle: 'Sposta in cima al gruppo attuale',
 	          attentionPromotionModeWithinGroupsSubtitle: 'Mantieni le sessioni nella loro cartella o area di lavoro',
+	          reminderAutoClearOnOpenTitle: "Cancella i promemoria all’apertura",
+	          reminderAutoClearOnOpenSubtitle: "Disattiva per rimuovere manualmente i promemoria scaduti. Quelli futuri restano programmati.",
 	          attentionStandingDefaultTitle: 'Mantieni le sessioni in Richiede attenzione',
 	          attentionStandingDefaultEnabledSubtitle: 'Ogni sessione resta finché non la rimuovi',
 	          attentionStandingDefaultDisabledSubtitle: 'Mantieni le sessioni una alla volta',
@@ -8478,12 +8789,14 @@ settingsSession: {
       providerUsageGauge: {
         title: "Uso del provider",
         footer:
-          "Controlla l'indicatore di quota mostrato accanto al compositore quando è disponibile un uso affidabile del provider.",
+          "Scegli gli indicatori del compositore per tutti gli account. Rispettano i limiti selezionati in ogni pool. I preferiti aggiungono indicatori per l’account attivo.",
         visibilityTitle: "Mostra l'indicatore di uso del provider",
         visibilityEnabledSubtitle:
           "Mostra la quota restante del provider accanto al compositore quando disponibile.",
         visibilityHiddenSubtitle: "Nascondi la quota del provider dal compositore.",
-        windowTitle: "Finestra dell'indicatore",
+        windowTitle: "Finestre degli indicatori",
+        labelsTitle: 'Mostra le etichette di utilizzo',
+        labelsSubtitle: 'Etichetta gli indicatori di contesto e del provider.',
         windowMostConstrainedTitle: "Più vincolata",
         windowMostConstrainedSubtitle:
           "Mostra la finestra di quota affidabile con meno quota restante.",
@@ -8491,8 +8804,8 @@ settingsSession: {
         windowDailySubtitle: "Preferisci la finestra di quota giornaliera.",
         windowWeeklyTitle: "Settimanale",
         windowWeeklySubtitle: "Preferisci la finestra di quota settimanale.",
-        windowSessionTitle: "Sessione",
-        windowSessionSubtitle: "Preferisci la finestra di quota della sessione corrente.",
+        windowSessionTitle: "Finestra breve",
+        windowSessionSubtitle: "Mostra finestre brevi di quota, come un limite di cinque ore.",
         windowPrimaryTitle: "Primaria",
         windowPrimarySubtitle: "Preferisci la finestra di quota primaria del provider.",
         windowSecondaryTitle: "Secondaria",
@@ -9380,6 +9693,26 @@ settingsSession: {
           },
         },
       },
+      modelPackDownload: {
+        progress: ({ loaded, total }: { loaded: string; total: string }) => `${loaded} di ${total}`,
+        progressWithFiles: ({ loaded, total, filesDone, filesTotal }: { loaded: string; total: string; filesDone: number; filesTotal: number }) =>
+          `${loaded} di ${total} · ${filesDone} di ${filesTotal} file`,
+        progressAccessibilityLabel: "Avanzamento del download",
+        verifyingDetail: "Verifica in corso",
+        verifyingProgress: ({ verified, total, filesDone, filesTotal }: { verified: string; total: string; filesDone: number; filesTotal: number }) =>
+          `Verificati ${verified} di ${total} · ${filesDone} di ${filesTotal} file`,
+        verifyingAccessibilityLabel: "Avanzamento della verifica",
+        failedDetail: "Non riuscito",
+        failedSubtitle: "Impossibile preparare il modello. Tocca per riprovare.",
+        failedResumableSubtitle: ({ size }: { size: string }) => `Il download non è stato completato. ${size} sono stati conservati: tocca per riprendere.`,
+        incompleteDetail: "Incompleto",
+        incompleteSubtitle: ({ size }: { size: string }) => `${size} scaricati finora. Tocca per continuare.`,
+        discardSubtitle: "Elimina il download incompleto per liberare spazio.",
+        discardConfirmTitle: "Scartare il download incompleto?",
+        discardConfirmBody: ({ size }: { size: string }) => `Verranno eliminati i ${size} scaricati finora. Potrai scaricare di nuovo il modello in seguito.`,
+        insufficientStorage: ({ required, available }: { required: string; available: string }) =>
+            `Spazio libero insufficiente. Questo download richiede ${required}, ma ne sono liberi solo ${available}.`,
+      },
       localNeuralStt: {
         modelPack: {
           title: "Pacchetto modello",
@@ -9402,12 +9735,6 @@ settingsSession: {
           installedWithBuild: ({ build }: { build: string }) =>
             `Installato • ${build}`,
           notInstalled: "Non installato",
-        },
-        language: {
-          title: "Lingua",
-          subtitle: "Tag lingua BCP-47 opzionale.",
-          promptTitle: "Lingua",
-          promptBody: "Inserisci un tag lingua BCP-47 (es. en, en-US).",
         },
         alerts: {
           downloadFailedTitle: "Download non riuscito",
@@ -9442,6 +9769,8 @@ settingsSession: {
           enableTitle: "Abilita mani libere",
           silenceTitle: "Timeout silenzio (ms)",
           minSpeechTitle: "Parlato minimo (ms)",
+          pushToTalkTitle: "Premi per parlare",
+          pushToTalkSubtitle: "Questo provider trascrive una registrazione completata: tocca di nuovo il microfono per inviare. Per il vivavoce scegli il riconoscimento vocale del dispositivo o quello neurale locale.",
         },
         customBackendIdSubtitle: "Inserisci un id backend personalizzato.",
         searchBackendsPlaceholder: "Cerca backend",
@@ -9699,8 +10028,7 @@ settingsSession: {
       sttProvider: "Provider STT",
       neuralStt: {
         title: "STT sul dispositivo",
-        webNotAvailableSubtitle:
-          "Non disponibile sul web. Usa STT del dispositivo, compatibile OpenAI o Gemini STT.",
+        webFallbackSubtitle: "Funziona solo nell’app mobile. Nel browser, la voce usa il riconoscimento vocale del browser.",
       },
       ttsBaseUrl: "URL base TTS",
       ttsBaseUrlTitle: "URL base TTS",
@@ -9840,6 +10168,10 @@ settingsSession: {
     logoutConfirm:
       "Sei sicuro di voler uscire? Assicurati di aver fatto il backup della tua chiave segreta!",
     encryptionUpdateFailed: "Impossibile aggiornare l’impostazione di crittografia",
+    requireE2ee: "Richiedi la crittografia end-to-end",
+    requireE2eeDescription: "Rifiuta impostazioni account e sessioni in chiaro su questo dispositivo e nei daemon sincronizzati.",
+    requireE2eeNeedsEncryptionTitle: "Abilita prima la crittografia",
+    requireE2eeNeedsEncryptionDescription: "Abilita la crittografia end-to-end per questo account prima di richiederla.",
     secretKeyMissing: "Chiave segreta non disponibile. Ripristina prima il tuo account.",
     restoreRequiredTitle: "Ripristino richiesto",
     restoreRequiredBody:
@@ -9866,15 +10198,128 @@ settingsSession: {
     pasteAuthUrl: "Incolla l'URL di autenticazione dal terminale",
   },
 
-  updateBanner: {
-    updateShort: "Aggiorna",
-    updateAvailable: "Aggiornamento disponibile",
-    pressToApply: "Premi per applicare l'aggiornamento",
-    whatsNew: "Novità",
-    seeLatest: "Vedi gli ultimi aggiornamenti e miglioramenti",
-    nativeUpdateAvailable: "Aggiornamento app disponibile",
-    tapToUpdateAppStore: "Tocca per aggiornare nell'App Store",
-    tapToUpdatePlayStore: "Tocca per aggiornare nel Play Store",
+  updates: {
+    title: "Aggiornamenti",
+    thisAppTitle: "Happier",
+    happierCliTitle: "Happier CLI",
+    sections: {
+      thisApp: "Questa app",
+      thisComputer: "Questo computer",
+      machine: "Macchina",
+    },
+    offline: "Offline",
+    pill: {
+      updates: ({ count }: { count: number }) => plural({ count, singular: "aggiornamento", plural: "aggiornamenti" }),
+      running: "Aggiornamento…",
+      ready: "Riavvia per aggiornare",
+      failed: "Aggiornamento non completato",
+      required: "Aggiornamento necessario",
+      completed: "Aggiornato",
+    },
+    a11y: {
+      pillAvailable: ({ count }: { count: number }) => plural({ count, singular: `Aggiornamenti, ${count} disponibile`, plural: `Aggiornamenti, ${count} disponibili` }),
+      pillRunning: "Aggiornamenti, aggiornamento in corso",
+      pillReady: "Aggiornamenti, riavvia per completare",
+      pillFailed: "Aggiornamenti, un aggiornamento non è stato completato",
+      pillRequired: "Aggiornamenti, aggiornamento necessario",
+      pillCompleted: "Aggiornamenti, completato",
+      rowOn: ({ title, where }: { title: string; where: string }) => `${title} su ${where}`,
+      actionOn: ({ action, title, where }: { action: string; title: string; where: string }) => `${action} ${title} su ${where}`,
+      progress: ({ percent }: { percent: number }) => `${percent} percento`,
+    },
+    summary: {
+      checking: "Ricerca aggiornamenti…",
+      available: ({ count }: { count: number }) => plural({ count, singular: "1 aggiornamento disponibile", plural: `${count} aggiornamenti disponibili` }),
+      updatingBatch: ({ done, total }: { done: number; total: number }) => `Aggiornamento ${Math.min(done + 1, total)} di ${total}…`,
+      updating: "Aggiornamento…",
+      keepWorking: "Puoi continuare a lavorare.",
+      ready: "Riavvia per completare l’aggiornamento di Happier",
+      failedCount: ({ count }: { count: number }) => plural({ count, singular: "1 aggiornamento non è stato completato", plural: `${count} aggiornamenti non sono stati completati` }),
+      notCheckedYet: "Non ancora controllato",
+      required: "È necessario un aggiornamento",
+      upToDate: "È tutto aggiornato",
+      unknown: "Non è stato possibile controllare alcune versioni",
+      unchecked: "Nessun aggiornamento noto",
+      uncheckedMeta: "Alcuni strumenti non sono ancora stati controllati.",
+      offline: "Alcune macchine sono offline",
+      checkedAt: ({ time }: { time: string }) => `Ultimo controllo: ${time}`,
+      upToDateDescription: "Happier, la sua riga di comando e i tuoi agenti sono aggiornati.",
+      unknownDescription: "Tutto ciò che è stato possibile controllare è aggiornato. Il resto verrà ricontrollato appena sarà raggiungibile.",
+      offlineDescription: "Tutto ciò che è raggiungibile è aggiornato. Le macchine offline verranno controllate quando torneranno disponibili.",
+    },
+    settingsSubtitle: {
+      upToDate: "Aggiornato",
+      available: ({ count }: { count: number }) => plural({ count, singular: "1 aggiornamento disponibile", plural: `${count} aggiornamenti disponibili` }),
+      running: "Aggiornamento…",
+      ready: "Riavvia per completare l’aggiornamento",
+      required: "È necessario un aggiornamento",
+      failed: "Un aggiornamento non è stato completato",
+      unknown: "Non è stato possibile controllare tutti gli aggiornamenti",
+      unchecked: "Alcuni strumenti non sono stati controllati",
+      offline: "Alcune macchine sono offline",
+      checking: "Ricerca aggiornamenti…",
+    },
+    action: {
+      update: "Aggiorna",
+      updateAll: "Aggiorna tutto",
+      restart: "Riavvia per aggiornare",
+      reload: "Ricarica",
+      storeIos: "Aggiorna nell’App Store",
+      storeAndroid: "Aggiorna su Google Play",
+      checkNow: "Cerca aggiornamenti",
+      stopAfterThis: "Interrompi dopo questo",
+      skipVersion: "Salta questa versione",
+      openUpdates: "Apri Aggiornamenti",
+      whatsNew: "Novità",
+      viewLog: "Visualizza log",
+    },
+    row: {
+      versionChange: ({ from, to }: { from: string; to: string }) => `${from} → ${to}`,
+      upToDateVersion: ({ version }: { version: string }) => `Aggiornato · ${version}`,
+      available: ({ version }: { version: string }) => `${version} disponibile`,
+      downloading: ({ version }: { version: string }) => `Download di ${version}`,
+      downloadingUpdate: "Download dell’aggiornamento",
+      updatingTo: ({ version }: { version: string }) => `Aggiornamento a ${version}…`,
+      updating: "Aggiornamento…",
+      restarting: "Riavvio…",
+      restartingService: "Riavvio del servizio in background…",
+      readyVersion: ({ version }: { version: string }) => `${version} è pronta`,
+      ready: "Aggiornamento pronto",
+      webNewBuild: "È pronta una versione più recente di Happier",
+      requiredApp: "Questa versione non è più supportata. Aggiorna per continuare a usare Happier.",
+      appCheckFailed: "Non è stato possibile cercare una versione più recente.",
+      appDownloadFailed: "Il download non è stato completato.",
+      appInstallFailed: "Non è stato possibile installare l’aggiornamento.",
+      latestUnknown: "Non è stato possibile cercare una versione più recente",
+      rolledBack: ({ kept, target }: { kept: string; target: string }) => `${target} non si è avviata su questa macchina, quindi resta alla ${kept}.`,
+      installedByYou: "Installato da te",
+      updateItYourWay: "Aggiornalo nello stesso modo in cui l’hai installato.",
+      offline: "Impossibile aggiornare offline",
+      skipped: ({ version }: { version: string }) => `${version} saltata`,
+      checking: "Controllo…",
+      failedGeneric: "L’aggiornamento non è stato completato. Riprova.",
+      remoteUnsupported: "Questa macchina non può aggiornare la riga di comando da remoto. Aggiornala direttamente sulla macchina.",
+      archiveExpandedByteLimit: "Il runtime scaricato supera il limite di dimensione per l’estrazione. Aggiorna Happier prima di riprovare.",
+      updateNotVerified: "L’aggiornamento è stato eseguito, ma la versione non è cambiata.",
+      rolledBackLocal: "L’aggiornamento non è partito, quindi questo computer è tornato alla versione precedente.",
+      smokeFailed: "La nuova versione non ha funzionato su questo computer, quindi non è cambiato nulla.",
+      waitingReconnect: "Installato, in attesa che questa macchina si riconnetta",
+      couldNotStart: ({ message }: { message: string }) => `Non è stato possibile avviare l’aggiornamento: ${message}`,
+      restartsService: 'Riavvia il servizio in background; le sessioni si riconnettono.',
+      alreadyCurrent: 'Già aggiornato',
+      anotherUpdateRunning: 'Su questa macchina è in corso un altro aggiornamento. Riprova quando sarà terminato.',
+      outcomeUnknown: 'Non è stato possibile confermare l’avvio dell’aggiornamento. Riprova per verificare.',
+      othersUpToDate: ({ count }: { count: number }) => plural({ count, singular: "Altro 1 aggiornato", plural: `Altri ${count} aggiornati` }),
+      waitingOffline: ({ count }: { count: number }) => plural({ count, singular: "1 aggiornamento in attesa che torni online", plural: `${count} aggiornamenti in attesa che torni online` }),
+    },
+    footer: "Gli aggiornamenti si installano su ogni macchina. Dopo un aggiornamento della riga di comando, Happier riavvia il servizio in background di quella macchina.",
+    tray: {
+      available: ({ count }: { count: number }) => `Aggiornamenti disponibili (${count})…`,
+      running: "Aggiornamento…",
+      ready: "Riavvia per aggiornare Happier",
+      required: "Aggiornamento necessario…",
+      failed: "Un aggiornamento non è stato completato…",
+    },
   },
 
   changelog: {
@@ -9913,7 +10358,7 @@ settingsSession: {
                         "tuisTitle": "Usa le tue TUI preferite",
                         "tuisBody": "Esegui Claude Code, Codex o OpenCode nella loro interfaccia terminale nativa. Happier la cattura e la sincronizza su ogni dispositivo.",
                         "inboxTitle": "Una inbox. Ogni sessione.",
-                        "inboxBody": "Tutte le approvazioni pendenti, richieste di permesso e attività non lette, da ogni sessione e macchina, in un unico posto.",
+                        "inboxBody": "Tutte le approvazioni pendenti, richieste di permesso e sessioni pronte per la revisione, da ogni macchina, in un unico posto.",
                         "mcpTitle": "Una configurazione MCP. Ogni provider.",
                         "mcpBody": "Definisci i server MCP una sola volta. Funzionano su tutti i backend, inclusi i provider che non supportano MCP nativamente.",
                         "controlTitle": "Accoda, guida, biforca, ripristina",
@@ -10258,6 +10703,8 @@ settingsSession: {
               startDaemon: ({ targetLabel }: { targetLabel: string }) =>
 
                   `Usa il flusso di configurazione desktop per riconnettere il servizio in background di ${targetLabel}. Apri i passaggi manuali solo se sei già su quel computer.`,
+              connectMachineElsewhere: ({ targetLabel }: { targetLabel: string }) => `Apri Happier sul computer che vuoi connettere a ${targetLabel}, oppure esegui lì i passaggi da terminale qui sotto.`,
+              startDaemonElsewhere: ({ targetLabel }: { targetLabel: string }) => `Apri Happier su quel computer per ricollegare il suo servizio in background a ${targetLabel}, oppure esegui lì i passaggi da terminale qui sotto.`,
 
               createSession: 'Avvia una nuova sessione con il pulsante + o dal tuo terminale.',
 
@@ -10364,6 +10811,94 @@ settingsSession: {
       },
 
 
+    setupSurface: {
+        acquisitionResolvingReleaseStatus: "Ricerca della versione della riga di comando di Happier.",
+        acquisitionDownloadingStatus: "Download della riga di comando di Happier.",
+        acquisitionVerifyingStatus: "Verifica del download.",
+        acquisitionUnpackingStatus: "Decompressione della riga di comando di Happier.",
+        acquisitionInstallingStatus: "Installazione della riga di comando di Happier.",
+        acquisitionFinalizingStatus: "Completamento dell’installazione della riga di comando.",
+        acquisitionCheckingCliStatus: "Controllo della riga di comando di Happier.",
+        acquisitionCheckingDaemonStatus: "Controllo del servizio in background.",
+        acquisitionReleaseFailed: "Happier non ha trovato la versione della riga di comando. Riprova.",
+        acquisitionDownloadFailed: "Il download della riga di comando non è stato completato. Riprova.",
+        acquisitionVerificationFailed: "Happier non ha potuto verificare il download. Riprova.",
+        acquisitionInstallFailed: "L’installazione della riga di comando non è stata completata. Riprova.",
+        acquisitionDownloadBytes: ({ received }: { received: string }) => `${received} scaricati`,
+        acquisitionDownloadBytesTotal: ({ received, total }: { received: string; total: string }) => `${received} di ${total} scaricati`,
+    checkingTitle: 'Controllo di questo computer',
+    checkingStatus: ({ relay }: { relay: string }) => `Stiamo guardando cosa ha già questo computer per ${relay}.`,
+    workingTitle: 'Configurazione di questo computer',
+    movingTitle: ({ relay }: { relay: string }) => `Spostamento di questo computer su ${relay}`,
+    stagePrepareStatus: 'Preparazione della riga di comando di Happier su questo computer.',
+    stageConnectStatus: ({ relay }: { relay: string }) => `Connessione di questo computer a ${relay}. Non devi fare nulla.`,
+    stageConnectStatusAs: ({ relay, account }: { relay: string; account: string }) => `Connessione di questo computer a ${relay} come ${account}. Non devi fare nulla.`,
+    stageServiceStatus: 'Installazione del servizio in background che mantiene raggiungibili le tue sessioni.',
+    stageServiceStartStatus: 'Avvio del servizio in background che mantiene raggiungibili le tue sessioni.',
+    stageServiceRestartStatus: 'Riavvio del servizio in background con le nuove impostazioni.',
+    stageVerifyStatus: ({ relay }: { relay: string }) => `Verifica che questo computer risponda su ${relay}.`,
+    blockedTitle: 'Configurazione interrotta',
+    blockedStatusFallback: 'La configurazione non è riuscita a completarsi. Il tuo account e le tue sessioni sono intatti.',
+    blockedServiceConflictStatus: 'Prima bisogna risolvere un altro servizio in background su questo computer. È rimasto com’era: apri Dettagli per vedere quale.',
+    blockedServiceManagerUnavailableStatus: 'Happier non può configurare il servizio in background su questo computer. Apri Dettagli per ricevere aiuto o continua con le altre macchine.',
+    blockedConsentDeclinedStatus: 'La configurazione si è fermata. Il servizio in background già presente è rimasto esattamente com’era.',
+    blockedAccountKeptStatus: 'La configurazione si è interrotta. Questo computer resta collegato all’account con cui ha effettuato l’accesso.',
+    blockedAccountChangedStatus: 'Questo computer ha effettuato l’accesso a un altro account durante la configurazione, che si è quindi interrotta prima dell’abbinamento. Riprova.',
+    blockedPairingDeclinedStatus: 'Questo computer non è stato approvato per la connessione. Il tuo account e le tue sessioni sono intatti.',
+    blockedPairingIncompleteStatus: 'La connessione di questo computer non è stata completata.',
+    blockedCliOutdatedStatus: 'La riga di comando di Happier su questo computer è più vecchia di quanto serva alla configurazione. Aggiorna Happier e riprova.',
+    blockedCliChannelOutdatedStatus: ({ channel }: { channel: string }) => `Questo computer usa la CLI ${channel}, più vecchia di quanto serva a questa app.`,
+    blockedCliChannelOutdatedVersionStatus: ({ channel, version }: { channel: string; version: string }) => `Questo computer usa la CLI ${channel}. La sua versione più recente, ${version}, è più vecchia di quanto serva a questa app.`,
+    blockedCliUnresponsiveStatus: 'La riga di comando di Happier ha smesso di rispondere.',
+        blockedCliUnavailableStatus: "Happier non ha potuto avviare la sua riga di comando su questo computer.",
+    blockedCliFailedStatus: 'Happier non è riuscito a finire di leggere la configurazione di questo computer.',
+    blockedStepStatus: ({ step }: { step: string }) => `Impossibile completare: ${step}`,
+    unreachableStatus: ({ relay }: { relay: string }) => `Questo computer non risponde ancora su ${relay}.`,
+    notConvergedStatus: ({ relay }: { relay: string }) => `Il servizio in background di questo computer non ha ancora finito di avviarsi per ${relay}.`,
+    canceledTitle: 'Configurazione annullata',
+    canceledStatus: 'Non è rimasto nulla a metà. Rieseguendo la configurazione si riparte da qui.',
+    stepOfTotal: ({ step, total }: { step: number; total: number }) => `Passo ${step} di ${total}`,
+    hideDetails: 'Nascondi i dettagli',
+    consentTitle: 'Sostituire il servizio in background di questo computer?',
+    consentBodyFallback: 'Su questo computer esiste già un servizio in background di Happier non gestito da questa app.',
+    consentServicesList: ({ services }: { services: string }) => `Servizi interessati: ${services}`,
+    consentConfirm: 'Sostituiscilo',
+    consentKeep: 'Mantieni il servizio esistente',
+    relayMoveTitle: 'Spostare il servizio in background su questo Relay?',
+    relayMoveBody: ({ relay }: { relay: string }) => `Il servizio in background di questo computer \u00e8 su un altro Relay. Spostarlo su ${relay}?`,
+    relayMoveConfirm: 'Spostalo',
+    relayMoveKeep: 'Lascialo com’è',
+    relayMoveAlways: 'Sposta sempre',
+    relayConnectToo: ({ relay }: { relay: string }) => `Collega anche a ${relay}`,
+    relayMoveBodyFromTo: ({ from, to }: { from: string; to: string }) => `Il servizio in background di questo computer è connesso a ${from}. Spostarlo su ${to}? Smetterà di rispondere su ${from}.`,
+    accountMoveTitle: ({ account }: { account: string }) => `Passare questo computer a ${account}?`,
+    accountMoveBody: ({ from, to, relay }: { from: string; to: string; relay: string }) => `Questo computer ha effettuato l’accesso a ${relay} come ${from}. Dopo il passaggio a ${to}, ${from} non raggiungerà più questo computer.`,
+    accountMoveBodyAcrossRelays: ({ from, fromRelay, to, toRelay }: { from: string; fromRelay: string; to: string; toRelay: string }) => `Questo computer ha effettuato l’accesso a ${fromRelay} come ${from}. Dopo il passaggio a ${to} su ${toRelay}, ${from} non raggiungerà più questo computer.`,
+    accountMoveConfirm: 'Passa',
+    consentTakeoverTitle: 'Lasciare che Happier gestisca qui il servizio in background?',
+    consentTakeoverConfirm: 'Subentra',
+    continueWithoutAction: 'Continua senza questo computer',
+    updateCliAction: 'Aggiorna',
+    cliChoiceTitle: ({ version }: { version: string }) => `La CLI di Happier ${version} è già installata`,
+    cliChoiceTitleUnknownVersion: 'La CLI di Happier è già installata',
+    cliChoiceBody: ({ path }: { path: string }) => `Si trova in ${path}. Happier può installare una propria copia, tenerla aggiornata e metterla per prima nel PATH, oppure puoi continuare a usare questa.`,
+    cliChoiceBodyOutdated: ({ path }: { path: string }) => `Si trova in ${path} ed è troppo vecchia per la configurazione. Happier può installare una propria copia aggiornata e metterla per prima nel PATH, oppure puoi tenere la tua e aggiornarla tu.`,
+    cliChoiceTitleMissing: 'La tua CLI di Happier non è più installata',
+    cliChoiceBodyMissing: ({ path }: { path: string }) => `Avevi scelto di tenere quella in ${path}, ma non c’è più. Happier può installare una propria copia e tenerla aggiornata, oppure puoi reinstallare la tua e continuare a usarla.`,
+    cliChoiceBodyKeepBlocked: ({ path, link }: { path: string; link: string }) => `Si trova in ${path}, ma i nuovi terminali eseguono prima la CLI di Happier tramite ${link}, che Happier non ha aggiunto. Lascia che la gestisca Happier, oppure rimuovi ${link} e riavvia la configurazione per tenere la tua.`,
+    cliChoiceNotNow: 'Non ora',
+    cliChoiceManage: 'Lascia che la gestisca Happier',
+    cliChoiceKeep: 'Tieni la mia',
+    blockedCliChoiceStatus: 'La configurazione si è fermata prima di modificare qualcosa. Scegli chi gestisce la riga di comando per continuare.',
+    blockedCliOwnOutdatedStatus: ({ command }: { command: string }) => `La tua riga di comando è troppo vecchia per la configurazione. Aggiornala con ${command}`,
+    blockedCliOwnOutdatedUnknownStatus: 'La tua riga di comando è troppo vecchia per la configurazione. Aggiornala dove l’hai installata.',
+    blockedCliOwnMissingStatus: 'La riga di comando che hai tenuto non è più installata. Reinstallala oppure lascia che sia Happier a gestire la riga di comando.',
+    cliTrustTitle: 'Approvare questa riga di comando?',
+    cliTrustBody: ({ command }: { command: string }) => `Happier non ha installato la riga di comando in ${command}. Approvarla le consente di leggere e scrivere le sessioni di questo account. Approva solo quella che hai messo tu.`,
+    cliTrustBodyUnknownCommand: 'Happier non ha installato questa riga di comando. Approvarla le consente di leggere e scrivere le sessioni di questo account. Approva solo quella che hai messo tu.',
+    cliTrustApprove: 'Approva',
+  },
+
   setupOnboarding: {
           screenTitle: 'Configura questo computer',
           webDesktopOnlyTitle: 'È richiesta l’app desktop',
@@ -10384,10 +10919,6 @@ settingsSession: {
     postAuthBody: 'Hai effettuato l’accesso. Continua con il flusso di configurazione locale per rendere questo computer pronto per il Relay selezionato.',
     controlPanelTitle: 'Riepilogo della prontezza',
     activeRelaySummaryTitle: 'Relay attivo',
-    thisComputerSummaryTitle: 'Questo computer',
-    nextActionSummaryTitle: 'Prossima azione',
-    thisComputerReady: 'Pronto per questo Relay',
-    nextActionReady: 'Crea la tua prima sessione o aggiungi un altro computer qui sotto.',
     resumeIntentTitle: 'Continua la configurazione su questo computer',
           resumeIntentBody: 'Accedi o crea un account per continuare a configurare questo computer per il Relay selezionato.',
     openSetupAction: 'Configura questo computer',
@@ -10446,6 +10977,45 @@ settingsSession: {
       unknown: "Sconosciuto",
       stopped: "Arrestato",
       likelyAlive: "Probabilmente attivo",
+    },
+    thisComputer: {
+        notSetUp: 'Questo computer non è ancora configurato.',
+        connectedAs: ({ relay, account }: { relay: string; account: string }) => `Connesso a ${relay} come ${account}.`,
+        cliTitle: 'Riga di comando',
+        cliManaged: ({ version }: { version: string }) => `Happier ${version}, installato da questa app`,
+        cliManagedOnChannel: ({ channel, version }: { channel: string; version: string }) => `CLI ${channel} ${version}, installato da questa app`,
+        cliChoiceManaged: 'Gestita da Happier',
+        cliChoiceOwn: ({ path }: { path: string }) => `La tua — ${path}`,
+        cliChoiceChange: 'Cambia chi gestisce la riga di comando',
+        cliOldCopyTitle: 'Vecchia riga di comando',
+        cliOldCopyRemove: ({ path, command }: { path: string; command: string }) => `Ancora installata in ${path}. Rimuovila con ${command}`,
+        cliOldCopyPath: ({ path }: { path: string }) => `Ancora installata in ${path}.`,
+        cliChannelStable: 'Stabile',
+        cliChannelPreview: 'Preview',
+        cliChannelDev: 'Dev',
+        cliManagedUnknownVersion: 'Installata da questa app',
+        cliFromPath: ({ version, path }: { version: string; path: string }) => `${version} da ${path}`,
+        updateCliTitle: 'Aggiorna la riga di comando',
+        updateCliAvailable: ({ version }: { version: string }) => `Happier ${version} è disponibile.`,
+        updateCliKept: ({ version, command }: { version: string; command: string }) => `Happier ${version} è disponibile. Aggiornala con ${command}`,
+        relayAccount: ({ account }: { account: string }) => `Accesso effettuato come ${account}`,
+        updatingCli: 'Aggiornamento della riga di comando',
+        cliNotManaged: 'Happier non ha installato questa riga di comando, quindi non la sostituirà.',
+        cliUpdateFailed: 'L’aggiornamento non è terminato. Riprova.',
+        cliUpdateRestartNotConverged: 'La riga di comando è stata aggiornata, ma il servizio in background esegue ancora la versione precedente. Riprova.',
+    },
+    cliPath: {
+      title: "Terminale",
+      footer: "Happier Desktop aggiunge o rimuove solo le voci PATH che ha creato; quelle scritte dall'installer della shell restano intatte.",
+      addTitle: "Aggiungi happier al PATH",
+      addSubtitle: "Rendi disponibile il comando happier nei nuovi terminali.",
+      removeTitle: "Rimuovi happier dal PATH",
+      removeSubtitle: "Rimuovi solo le voci PATH aggiunte da Happier Desktop.",
+      added: "Aggiunto. Apri un nuovo terminale per usare happier.",
+      alreadyPresent: "happier è già nel tuo PATH.",
+      existingCommand: ({ path }: { path: string }) => `Un altro happier in ${path} risponde già nel tuo terminale, quindi non è stato aggiunto nulla.`,
+      removed: "Le voci PATH aggiunte da Happier Desktop sono state rimosse.",
+      nothingToRemove: "Happier Desktop non ha aggiunto alcuna voce PATH.",
     },
     stopDaemon: "Arresta daemon",
     stopDaemonConfirmTitle: "Arrestare il daemon?",
@@ -10518,11 +11088,9 @@ settingsSession: {
     unknownPath: "percorso sconosciuto",
     previousSessionsTitle: "Sessioni precedenti (fino alle 5 più recenti)",
     tmux: {
-      overrideTitle: "Sovrascrivi le impostazioni tmux globali",
-      overrideEnabledSubtitle:
-        "Le impostazioni tmux personalizzate si applicano alle nuove sessioni su questa macchina.",
-      overrideDisabledSubtitle:
-        "Le nuove sessioni usano le impostazioni tmux globali.",
+      overrideTitle: "Sovrascrivi il valore dell’account",
+      overrideEnabledSubtitle: "Questa macchina usa un proprio host del terminale per le nuove sessioni.",
+      overrideDisabledSubtitle: "Le nuove sessioni ereditano l’host del terminale dell’account.",
       notDetectedSubtitle: "tmux non è rilevato su questa macchina.",
       notDetectedMessage:
         "tmux non è rilevato su questa macchina. Installa tmux e aggiorna il rilevamento.",
@@ -10576,6 +11144,7 @@ settingsSession: {
     providerStateSharingDegraded: "Condivisione stato provider applicata parzialmente",
     connectedServiceRuntimeAuthRecoveryRecovered: "Autenticazione provider recuperata",
     connectedServiceRuntimeAuthRecoveryCancelled: "Recupero autenticazione provider annullato",
+        connectedServiceRuntimeAuthRecoveryStopped: "Ripristino del provider interrotto; nessun nuovo tentativo automatico",
     runtimeConfigOutcomeAppliesBeforeNextMessage: "Verrà applicato prima del tuo prossimo messaggio",
     runtimeConfigOutcomeQueuedUntilReady: "In coda finché non è pronto",
     runtimeConfigOutcomeAlreadySet: "Già impostato",
@@ -10611,6 +11180,19 @@ settingsSession: {
     switchingToPersistedTakeover: "Presa in carico e importazione di questa sessione…",
     takeOverDirect: "Prendi in carico",
     takeOverPersist: "Prendi in carico + importa",
+    directImportPreparing: "Preparazione dell’importazione…",
+    directImportReading: "Lettura della cronologia…",
+    directImportImporting: "Importazione della cronologia…",
+    directImportStarting: "Avvio della sessione…",
+    directImportConverting: "Completamento della presa in carico…",
+    directImportCancelling: "Arresto dell’importazione…",
+    directImportCancelled: "Importazione fermata. La cronologia è conservata; puoi riprovare.",
+    directImportFailed: "Importazione non riuscita. La cronologia è conservata; puoi riprovare.",
+    directImportStatusUnavailable: "Avanzamento non disponibile. Riconnettiti o controlla di nuovo.",
+    directImportRequiresDaemonUpgrade: "Aggiorna Happier su questa macchina per importare sessioni con avanzamento e arresto.",
+    directImportStop: "Ferma importazione",
+    directImportCount: ({ count }: { count: number }) => `${count} messaggi importati`,
+    directImportCountWithTotal: ({ count, total }: { count: number; total: number }) => `${count} di ${total} messaggi importati`,
     directTakeoverDialogTitle: "Continuare questa sessione diretta in Happier?",
     directTakeoverDialogBody: "Scegli come vuoi che Happier prenda il controllo. Diretto continua a usare la trascrizione del provider. Importa porta la trascrizione in Happier.",
     directTakeoverDialogDirectTitle: "Prendi in carico",

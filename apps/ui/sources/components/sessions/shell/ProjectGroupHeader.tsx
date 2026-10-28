@@ -2,6 +2,8 @@ import React from 'react';
 import { Platform, Pressable, View } from 'react-native';
 import { Image } from 'expo-image';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
+import { GestureDetector } from 'react-native-gesture-handler';
+import type { UseSessionInlineDragResult } from './useSessionInlineDrag';
 
 import { DropdownMenu, type DropdownMenuItem } from '@/components/ui/forms/dropdown/DropdownMenu';
 import { Text } from '@/components/ui/text/Text';
@@ -18,6 +20,8 @@ const workspaceFaviconImageStyle = {
     height: WORKSPACE_FAVICON_SIZE,
     borderRadius: WORKSPACE_FAVICON_RADIUS,
 };
+
+const webReorderHandleStyle = { width: 24, height: 24 };
 
 const stylesheet = StyleSheet.create((theme) => ({
     section: {
@@ -110,12 +114,6 @@ const stylesheet = StyleSheet.create((theme) => ({
     hoverVisibleChevron: {
         opacity: 1,
     },
-    dragHandle: {
-        opacity: 0.72,
-    },
-    dragHandleActive: {
-        opacity: 1,
-    },
 }));
 
 export const ProjectGroupHeader = React.memo(function ProjectGroupHeader(props: Readonly<{
@@ -124,6 +122,9 @@ export const ProjectGroupHeader = React.memo(function ProjectGroupHeader(props: 
     workspaceLabelsV1: Record<string, string>;
     workspaceFaviconsEnabled?: boolean;
     workspaceMachineSubtitlesEnabled?: boolean;
+    dragHandleGesture?: UseSessionInlineDragResult['gesture'];
+    onMoveUp?: () => void;
+    onMoveDown?: () => void;
     onRenameWorkspace: (workspaceKey: string, currentLabel: string) => void;
     onResetWorkspaceName: (workspaceKey: string) => void;
     onCreateSession: () => void;
@@ -184,6 +185,8 @@ export const ProjectGroupHeader = React.memo(function ProjectGroupHeader(props: 
                 icon: <Icon name="pencil" size={16} color={actionIconColor} />,
             },
         ];
+        if (props.onMoveUp) items.push({ id: 'move-up', title: t('common.moveUp') });
+        if (props.onMoveDown) items.push({ id: 'move-down', title: t('common.moveDown') });
         if (hasCustomLabel) {
             items.push({
                 id: 'reset',
@@ -192,17 +195,21 @@ export const ProjectGroupHeader = React.memo(function ProjectGroupHeader(props: 
             });
         }
         return items;
-    }, [hasCustomLabel, actionIconColor, canCreateSession]);
+    }, [hasCustomLabel, actionIconColor, canCreateSession, props.onMoveUp, props.onMoveDown]);
 
     const handleMenuSelect = React.useCallback(async (itemId: string) => {
         if (itemId === 'add-folder') {
             await onAddFolder();
         } else if (itemId === 'rename') {
             onRenameWorkspace(workspaceKey, displayTitle);
+        } else if (itemId === 'move-up') {
+            props.onMoveUp?.();
+        } else if (itemId === 'move-down') {
+            props.onMoveDown?.();
         } else if (itemId === 'reset') {
             onResetWorkspaceName(workspaceKey);
         }
-    }, [workspaceKey, displayTitle, onAddFolder, onRenameWorkspace, onResetWorkspaceName]);
+    }, [workspaceKey, displayTitle, onAddFolder, onRenameWorkspace, onResetWorkspaceName, props.onMoveUp, props.onMoveDown]);
 
     const chevronColor = theme.colors.text.secondary;
     return (
@@ -269,27 +276,28 @@ export const ProjectGroupHeader = React.memo(function ProjectGroupHeader(props: 
                     ) : null}
                 </Pressable>
                 <View style={styles.trailingActions}>
-                    {showHoverActions && reorderHandleKey ? (
+                    {reorderHandleKey && props.dragHandleGesture ? (
+                        <GestureDetector gesture={props.dragHandleGesture}>
+                            <View
+                                style={[styles.actionButton, webReorderHandleStyle]}
+                                testID={`session-workspace-reorder-handle:${reorderHandleKey}`}
+                                accessible={false}
+                            >
+                                <Icon name="list" size={14} color={actionIconColor} />
+                            </View>
+                        </GestureDetector>
+                    ) : showHoverActions && reorderHandleKey ? (
                         <Pressable
                             style={styles.actionButton}
                             testID={`session-workspace-reorder-handle:${reorderHandleKey}`}
-                            onPress={(event) => {
-                                (event as any)?.stopPropagation?.();
-                            }}
-                            onHoverIn={isWeb ? () => setIsActionsHovered(true) : undefined}
-                            onHoverOut={isWeb ? () => setIsActionsHovered(false) : undefined}
                             accessible={false}
+                            onPress={(event) => event?.stopPropagation?.()}
                             hitSlop={8}
                         >
-                            <Icon
-                                name="list"
-                                size={14}
-                                color={actionIconColor}
-                                style={[styles.dragHandle, showHoverActions ? styles.dragHandleActive : null]}
-                            />
+                            <Icon name="list" size={14} color={actionIconColor} />
                         </Pressable>
                     ) : null}
-                    {showHoverActions && workspaceKey ? (
+                    {(showHoverActions || props.dragHandleGesture) && workspaceKey ? (
                         <DropdownMenu
                             open={menuOpen}
                             onOpenChange={setMenuOpen}
@@ -303,6 +311,7 @@ export const ProjectGroupHeader = React.memo(function ProjectGroupHeader(props: 
                             popoverPortalWebTarget="body"
                             trigger={({ toggle }) => (
                                 <Pressable
+                                    testID={`session-workspace-menu-trigger:${reorderHandleKey}`}
                                     style={styles.actionButton}
                                     onPress={(event) => {
                                         (event as any)?.stopPropagation?.();

@@ -1,6 +1,6 @@
 import * as React from 'react';
 import { ReactTestRenderer, act } from 'react-test-renderer';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { renderScreen } from '@/dev/testkit';
 import {
     connectedServicesModuleState,
@@ -70,7 +70,8 @@ const useProfileSpy = vi.fn(() => ({
         },
     ],
 }));
-vi.mock('@/sync/store/hooks', () => ({
+vi.mock('@/sync/store/hooks', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@/sync/store/hooks')>(),
     useProfile: () => useProfileSpy(),
     useSettings: () => ({
         connectedServicesDefaultProfileByServiceId: {},
@@ -90,11 +91,6 @@ vi.mock('@/components/ui/lists/ItemGroup', () => ({
 
 vi.mock('@/components/ui/lists/Item', () => ({
     Item: (props: any) => React.createElement('Item', props),
-}));
-
-vi.mock('@/sync/domains/connectedServices/connectedServiceRegistry', () => ({
-    CONNECTED_SERVICES_REGISTRY: [{ serviceId: 'openai-codex', connectCommand: 'happier connect codex', supportsOauth: true }],
-    getConnectedServiceRegistryEntry: (_serviceId: string) => ({ serviceId: 'openai-codex', connectCommand: 'happier connect codex', supportsOauth: true }),
 }));
 
 vi.mock('@/hooks/server/connectedServices/useConnectedServiceQuotaBadges', () => ({
@@ -134,7 +130,9 @@ function selectPickerOption(modalTree: ReactTestRenderer, optionId: string) {
 }
 
 describe('ConnectedServicesSettingsView', () => {
+    afterEach(() => { vi.unstubAllGlobals(); });
     beforeEach(() => {
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 404 })));
         settingsViewModalShowMock.mockClear();
         resetConnectedServicesCommonModuleMockState();
         connectedServicesModuleState.options.modal = async () => {
@@ -177,6 +175,16 @@ describe('ConnectedServicesSettingsView', () => {
 
         const items = tree.findAllByType('Item' as any);
         expect(items.length).toBe(0);
+    });
+
+    it('omits a new service from the relay connect picker until support is known', async () => {
+        useFeatureEnabledSpy.mockReturnValue(true);
+        useProfileSpy.mockReturnValue({ connectedServicesV2: [] });
+        const { ConnectedServicesSettingsView } = await import('./ConnectedServicesSettingsView');
+        const screen = await renderScreen(<ConnectedServicesSettingsView />);
+        const titles = screen.tree.findAllByType('Item' as never).map((item) => item.props.title);
+        expect(titles).not.toContain('connectedServices.serviceNames.antigravity');
+        expect(titles).toContain('connectedServices.serviceNames.openaiCodex');
     });
 
     it('opens the service detail flow for default-auth connect recovery actions', async () => {

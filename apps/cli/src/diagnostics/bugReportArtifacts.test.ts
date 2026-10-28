@@ -1,4 +1,5 @@
 import { basename } from 'node:path';
+import { createServer } from 'node:http';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
@@ -284,6 +285,41 @@ describe('collectBugReportDiagnosticsArtifacts', () => {
     }
 
     expect(urls.some((entry) => entry.includes('/v1/diagnostics/bug-report-snapshot?lines=50'))).toBe(true);
+  });
+
+  it('finishes diagnostics collection with an error when the server body stalls past its deadline', async () => {
+    readCredentialsMock.mockResolvedValueOnce({ token: 'token-value' });
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.write('{');
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    let guard: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('Expected a TCP listener');
+      const result = await Promise.race([
+        collectBugReportDiagnosticsArtifacts({
+          includeDiagnostics: true,
+          acceptedKinds: ['server', 'cli'],
+          maxArtifactBytes: 256_000,
+          serverUrl: `http://127.0.0.1:${address.port}`,
+          activeServerId: 'main',
+          rawArgs: [],
+        }),
+        new Promise<null>((resolve) => { guard = setTimeout(() => resolve(null), 7_000); }),
+      ]);
+      expect(result).not.toBeNull();
+      const context = result?.artifacts.find((entry) => entry.filename === 'cli-context.json');
+      expect(JSON.parse(String(context?.content ?? '{}'))).toMatchObject({
+        diagnosticsCollection: { serverDiagnostics: { status: 'error' } },
+      });
+      expect(result?.artifacts.some((entry) => entry.filename === 'server-diagnostics.json')).toBe(false);
+    } finally {
+      clearTimeout(guard);
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
   });
 
   it('treats server diagnostics 404 as skipped (disabled) instead of an error', async () => {

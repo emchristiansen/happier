@@ -19,7 +19,7 @@ export function isCursorModelConfigOption(option: SessionConfigOption): boolean 
 export function findCursorModelConfigOption(
   configOptions: ReadonlyArray<SessionConfigOption>,
 ): SessionConfigOption | undefined {
-  return configOptions.find((option) => isCursorModelConfigOption(option) && (option.options?.length ?? 0) > 0);
+  return configOptions.find((option) => isCursorModelConfigOption(option) && Array.isArray(option.options));
 }
 
 export function isCursorModeConfigOption(option: SessionConfigOption): boolean {

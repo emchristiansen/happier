@@ -103,6 +103,77 @@ describe("session attention standings on SQLite", () => {
         ).resolves.toBe(0);
     });
 
+    it("stores a reminder and atomically acknowledges the visible session", async () => {
+        const { accountId, sessionId } = await createAccountWithSession();
+        await db.session.update({
+            where: { id: sessionId },
+            data: { seq: 7, lastViewedSessionSeq: 2 },
+        });
+        const remindAt = Date.now() + 60_000;
+
+        const response = await createStandingRouteBuilder().invoke({
+            userId: accountId,
+            params: { sessionId },
+            body: { remindAt },
+        });
+
+        expect(response.reply.statusCode).toBe(200);
+        expect(response.response).toEqual({
+            standing: { sessionId, standing: false, remindAt, updatedAt: expect.any(Number) },
+        });
+        await expect(db.session.findUnique({
+            where: { id: sessionId },
+            select: { lastViewedSessionSeq: true },
+        })).resolves.toEqual({ lastViewedSessionSeq: 7 });
+    });
+
+    it("restores the exact prior standing override when a reminder is removed", async () => {
+        const route = createStandingRouteBuilder();
+        const kept = await createAccountWithSession();
+        const suppressed = await createAccountWithSession();
+        const reminderOnly = await createAccountWithSession();
+        const remindAt = Date.now() + 60_000;
+
+        await route.invoke({ userId: kept.accountId, params: { sessionId: kept.sessionId }, body: { standing: true } });
+        await route.invoke({ userId: kept.accountId, params: { sessionId: kept.sessionId }, body: { remindAt } });
+
+        const restored = await route.invoke({
+            userId: kept.accountId,
+            params: { sessionId: kept.sessionId },
+            body: { remindAt: null },
+        });
+        expect(restored.response).toEqual({
+            standing: { sessionId: kept.sessionId, standing: true, updatedAt: expect.any(Number) },
+        });
+        const repeatedRemoval = await route.invoke({
+            userId: kept.accountId,
+            params: { sessionId: kept.sessionId },
+            body: { remindAt: null },
+        });
+        expect(repeatedRemoval.response).toEqual({
+            standing: { sessionId: kept.sessionId, standing: true, updatedAt: expect.any(Number) },
+        });
+
+        await route.invoke({ userId: suppressed.accountId, params: { sessionId: suppressed.sessionId }, body: { standing: false } });
+        await route.invoke({ userId: suppressed.accountId, params: { sessionId: suppressed.sessionId }, body: { remindAt } });
+        const restoredSuppression = await route.invoke({
+            userId: suppressed.accountId,
+            params: { sessionId: suppressed.sessionId },
+            body: { remindAt: null },
+        });
+        expect(restoredSuppression.response).toEqual({
+            standing: { sessionId: suppressed.sessionId, standing: false, updatedAt: expect.any(Number) },
+        });
+
+        await route.invoke({ userId: reminderOnly.accountId, params: { sessionId: reminderOnly.sessionId }, body: { remindAt } });
+        const cleared = await route.invoke({
+            userId: reminderOnly.accountId,
+            params: { sessionId: reminderOnly.sessionId },
+            body: { remindAt: null },
+        });
+        expect(cleared.response).toEqual({ standing: null });
+    });
+
     it("returns standings in the snapshot only when the include flag is requested", async () => {
         const { accountId, sessionId } = await createAccountWithSession();
         await createStandingRouteBuilder().invoke({

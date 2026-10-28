@@ -62,13 +62,13 @@ describe('resolveAgentActivitySectionId', () => {
         }
     });
 
-    it('escalates nothing: the roster has two sections and neither is an attention claim', () => {
+    it('separates current work, idle handles and outcomes without making an attention claim', () => {
         // r4.0. The roster reports a WORK STATE. `waiting` is an agent stopped on a permission
         // prompt — still open work, so it sits under WORKING with its own glyph and status word.
         // `failed` is terminal, so it sits under FINISHED. Neither gets a section of its own: a
         // header that says NEEDS YOU spends the roster's one loud device on something the main
         // agent already handles, and a header that cries wolf stops being read.
-        expect([...AGENT_ACTIVITY_SECTION_IDS]).toEqual(['working', 'finished']);
+        expect([...AGENT_ACTIVITY_SECTION_IDS]).toEqual(['working', 'idle', 'finished']);
         const inProgress = AGENT_ACTIVITY_STATUSES_V1
             .filter((status) => resolveAgentActivitySectionId(status) === 'working');
         expect([...inProgress].sort())
@@ -100,7 +100,7 @@ describe('buildAgentActivitySectionModel', () => {
             ],
         });
         expect(model.sections.map((section) => section.id)).toEqual([
-            ...AGENT_ACTIVITY_SECTION_IDS,
+            'working', 'finished',
         ]);
         expect(idsOf(model.sections[0]!.entries)).toEqual(['blocked-on-me', 'live']);
         expect(idsOf(model.sections[1]!.entries)).toEqual(['done']);

@@ -37,7 +37,7 @@ function createStubBackend(): AgentBackend {
 
 /**
  * ER-CS LEG-5 integration slice: a codex-target execution run with a PROFILE selection ends up with
- * `CODEX_HOME` pointing at a run-scoped materialized root containing that profile's auth store with an
+ * `CODEX_HOME` pointing at the stable account home containing that profile's auth store with an
  * RFC 3339 `last_refresh` (the canonical writer contract), threaded through the REAL daemon
  * materializer → runs bridge (registration included) → createExecutionRunBackend isolation merge.
  */
@@ -120,12 +120,12 @@ describe('execution run connected services (integration: codex profile -> run CO
       sessionDirectory: '/tmp/workspace',
     });
 
-    // The run home is a run-scoped materialized root (under the run's baseDir, not the source home).
+    // Runs use the same account home as sessions, never the user's native login.
     expect(env.CODEX_HOME).toBeDefined();
-    expect(env.CODEX_HOME.startsWith(baseDir)).toBe(true);
+    expect(env.CODEX_HOME).toBe(join(activeServerDir, 'daemon', 'connected-services', 'homes', 'openai-codex', 'work', 'codex', 'codex-home'));
     expect(env.CODEX_HOME).not.toBe(sourceCodexHome);
 
-    // The profile's auth store landed in the run root with the pinned RFC 3339 last_refresh contract.
+    // The account's auth store retains the pinned RFC 3339 last_refresh contract.
     const auth = JSON.parse(await readFile(join(env.CODEX_HOME, 'auth.json'), 'utf8'));
     expect(auth.access_token).toBe('access-work');
     expect(auth.account_id).toBe('acct-work');

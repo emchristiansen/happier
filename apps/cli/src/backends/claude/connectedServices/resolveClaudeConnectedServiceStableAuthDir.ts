@@ -4,8 +4,7 @@ import type { ConnectedServiceId } from '@happier-dev/protocol';
 
 import type { ConnectedServiceResolvedSelection } from '@/daemon/connectedServices/materialize/materializeConnectedServicesForSpawn';
 import {
-  resolveConnectedServiceGroupHomeDir,
-  resolveConnectedServiceHomeDir,
+  resolveConnectedServiceSelectionHomeDir,
 } from '@/daemon/connectedServices/homes/resolveConnectedServiceHomeDir';
 
 export type ClaudeConnectedServiceId = 'claude-subscription' | 'anthropic';
@@ -33,19 +32,11 @@ export function resolveClaudeConnectedServiceStableRootDir(params: Readonly<{
 }>): string | null {
   const serviceId = readClaudeConnectedServiceId(params.serviceId);
   if (!serviceId) return null;
-  return params.selection?.kind === 'group'
-    ? resolveConnectedServiceGroupHomeDir({
-        activeServerDir: params.activeServerDir,
-        serviceId,
-        groupId: params.selection.groupId,
-        agentId: 'claude',
-      })
-    : resolveConnectedServiceHomeDir({
-        activeServerDir: params.activeServerDir,
-        serviceId,
-        profileId: params.selection?.kind === 'profile' ? params.selection.profileId : params.fallbackProfileId,
-        agentId: 'claude',
-      });
+  return resolveConnectedServiceSelectionHomeDir({
+    ...params,
+    serviceId,
+    agentId: 'claude',
+  });
 }
 
 export function resolveClaudeConnectedServiceStableConfigDir(params: Readonly<{

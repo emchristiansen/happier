@@ -31,4 +31,21 @@ describe('initialMachineMetadata', () => {
 
     expect(refreshMachineMetadataForCurrentDaemon(current, current.host)).toBe(current);
   });
+
+  it('publishes the daemon\'s CLI update facts (K5) and keeps them when nothing changed', () => {
+    const cliUpdate = {
+      currentVersion: '0.2.13',
+      latestVersion: '0.2.14',
+      channel: 'stable' as const,
+      installSource: 'managed' as const,
+      updateCommand: 'happier self update',
+      canUpdateRemotely: true,
+      lastUpdate: { targetVersion: '0.2.13', outcome: 'succeeded' as const, at: 10, message: null },
+    };
+    const refreshed = refreshMachineMetadataForCurrentDaemon(initialMachineMetadata, initialMachineMetadata.host, cliUpdate);
+    expect(refreshed.cliUpdate).toEqual(cliUpdate);
+    expect(refreshMachineMetadataForCurrentDaemon(refreshed, refreshed.host, { ...cliUpdate })).toBe(refreshed);
+    expect(refreshMachineMetadataForCurrentDaemon(refreshed, refreshed.host, { ...cliUpdate, latestVersion: '0.2.15' }).cliUpdate?.latestVersion)
+      .toBe('0.2.15');
+  });
 });

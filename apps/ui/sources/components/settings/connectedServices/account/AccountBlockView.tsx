@@ -32,7 +32,7 @@ import type { ConnectedServiceCredentialHealthStatusV1, ConnectedServiceId } fro
 import type { ProviderAccountSubscriptionV1 } from '@happier-dev/protocol';
 import { t } from '@/text';
 
-import { resolveAccountCapacityRings, type AccountUsageRow } from './accountBlockModel';
+import { type AccountUsageRow, type CapacityRingDatum } from './accountBlockModel';
 import { ConnectedServiceCapacityAvatar, CONNECTED_SERVICE_GAUGE_BOX, CONNECTED_SERVICE_GAUGE_SIZE } from '../ConnectedServiceCapacityAvatar';
 import { Icon } from '@/components/ui/icons/Icon';
 
@@ -60,6 +60,7 @@ export type AccountBlockQuotaView = Readonly<{
     planLabel: string | null;
     usageRows: ReadonlyArray<AccountUsageRow>;
     capacityPct: number | null;
+    capacityRings: ReadonlyArray<CapacityRingDatum>;
     resetRows: ReadonlyArray<QuotaResetRow>;
     resetAvailableCount: number;
     pinnedMeterIds: ReadonlyArray<string>;
@@ -247,6 +248,9 @@ const stylesheet = StyleSheet.create((theme) => ({
         fontSize: 13,
         flexShrink: 1,
     },
+    resetDetails: {
+        flex: 1,
+    },
     useAction: {
         color: theme.colors.text.link,
         fontWeight: '600',
@@ -283,12 +287,25 @@ function formatResetExpiryDate(expiresAtMs: number): string {
 
 function resolveResetRowLabel(row: QuotaResetRow): string {
     if (row.expiresAtMs == null) {
-        return t('connectedServices.account.resets.available');
+        return row.canUse ? t('connectedServices.account.resets.available') : t('common.unavailable');
     }
     return t('connectedServices.account.resets.rowLabel', {
         date: formatResetExpiryDate(row.expiresAtMs),
         countdown: row.countdownLabel ?? '',
     });
+}
+
+function resolveResetLimitLabel(providerLimitId: string): string {
+    if (providerLimitId === 'five_hour') return t('connectedServices.account.resets.fiveHourLimit');
+    if (providerLimitId === 'seven_day') return t('connectedServices.account.resets.weeklyLimit');
+    return providerLimitId;
+}
+
+function resolveResetUnavailableLabel(row: QuotaResetRow): string {
+    const reason = row.details?.unavailableReason;
+    return reason
+        ? t(`connectedServices.account.resets.unavailableReasons.${reason}`)
+        : t('common.unavailable');
 }
 
 function resolveSubscriptionStatusLabel(subscription: ProviderAccountSubscriptionV1): string {
@@ -363,7 +380,7 @@ export const AccountBlockView = React.memo<AccountBlockViewProps>((props) => {
     // One concentric ring per usage limit (most-constrained outermost); the center
     // number is the overall capacity. No brand glyph/dot — every row here is the
     // same provider, so the logo would be noise.
-    const capacityRings = resolveAccountCapacityRings(quota?.usageRows ?? []);
+    const capacityRings = quota?.capacityRings ?? [];
     // A first snapshot that is still loading (no cached value yet) must read as
     // "loading" on the gauge, not as an empty "no usage" ring. This mirrors the
     // body skeleton's `loading && !hasSnapshot` signal so the avatar and body agree.
@@ -420,8 +437,14 @@ export const AccountBlockView = React.memo<AccountBlockViewProps>((props) => {
     // The calm meta line (collapsed only): muted resets + pools counts. Per-limit
     // usage now reads from the avatar's concentric capacity rings.
     const poolsCount = poolLabels.length;
+    const refreshStatus = quota?.isRefreshing ? (
+        <Text testID={`${testID}:refresh-status`} style={styles.metaCountText} accessibilityLiveRegion="polite">
+            {t('connectedServices.quota.refreshing')}
+        </Text>
+    ) : null;
     const renderMetaLine = () => (
         <View style={styles.metaRow}>
+            {refreshStatus}
             {quota && quota.resetAvailableCount > 0 ? (
                 <View testID={`${testID}:resets`} style={styles.metaCount}>
                     <Icon name="arrow-clockwise" size={11} color={theme.colors.text.tertiary} />
@@ -614,7 +637,7 @@ export const AccountBlockView = React.memo<AccountBlockViewProps>((props) => {
                 accessibilityLabel={props.title}
                 title={titleNode}
                 subtitle={identitySubtitle}
-                subtitleAccessory={!state.expanded ? renderMetaLine() : undefined}
+                subtitleAccessory={state.expanded ? refreshStatus : renderMetaLine()}
                 subtitleLines={1}
                 leftElement={leadingIcon}
                 iconBoxSize={CONNECTED_SERVICE_GAUGE_BOX}
@@ -682,14 +705,16 @@ export const AccountBlockView = React.memo<AccountBlockViewProps>((props) => {
                                             />
                                     </Pressable>
                                 </View>
-                                <MeterBar
-                                    testID={`${testID}:meter:${row.meterId}`}
-                                    tone={row.tone}
-                                    // Remaining-first fill: matches the row's "% left" label and the
-                                    // capacity rings (battery model — see accountBlockModel).
-                                    fillFraction={row.remaining}
-                                    caption={row.detailLabel}
-                                />
+                                {row.remaining !== null ? (
+                                    <MeterBar
+                                        testID={`${testID}:meter:${row.meterId}`}
+                                        tone={row.tone}
+                                        // Remaining-first fill: matches the row's "% left" label and the
+                                        // capacity rings (battery model — see accountBlockModel).
+                                        fillFraction={row.remaining}
+                                        caption={row.detailLabel}
+                                    />
+                                ) : <Text style={styles.subscriptionMeta}>{row.detailLabel}</Text>}
                             </View>
                         </ItemGroupColumn>
                     ))}
@@ -698,7 +723,7 @@ export const AccountBlockView = React.memo<AccountBlockViewProps>((props) => {
 
             {quota.resetRows.length > 0 ? (
                 <ItemSection testID={`${testID}:resets`} caption={t('connectedServices.account.resetsCaption')}>
-                    {!quota.canConsume ? (
+                    {!quota.canConsume && quota.resetRows.some((row) => row.canUse) ? (
                         // Explain WHY "Use" is inert (the reachable disabled cause is
                         // no resolvable target machine) instead of a silent dead button.
                         <ItemGroupColumn span={2}>
@@ -708,13 +733,40 @@ export const AccountBlockView = React.memo<AccountBlockViewProps>((props) => {
                         </ItemGroupColumn>
                     ) : null}
                     {quota.resetRows.map((row) => {
-                        const rowPending = quota.consumeRecoveryCreditPendingTarget !== null
+                        const rowPending = row.canUse && quota.consumeRecoveryCreditPendingTarget !== null
                             && quota.consumeRecoveryCreditPendingTarget.providerCreditId === row.consumableCreditId;
                         const useDisabled = !row.canUse || !quota.canConsume || quota.consumeRecoveryCreditPending;
+                        const remainingCountLabel = row.details
+                            ? t('connectedServices.account.resets.remainingCount', { count: row.details.remainingCount })
+                            : null;
                         return (
                             <ItemGroupColumn key={row.key}>
                                 <View testID={`${testID}:reset-row:${row.key}`} style={styles.resetRow}>
-                                    <Text style={styles.resetLabel} numberOfLines={2}>{resolveResetRowLabel(row)}</Text>
+                                    <View style={styles.resetDetails}>
+                                        <Text
+                                            testID={row.details && !row.title ? `${testID}:reset-count:${row.key}` : undefined}
+                                            style={styles.resetLabel}
+                                        >{row.title ?? remainingCountLabel ?? resolveResetRowLabel(row)}</Text>
+                                        {(row.title || row.details) && row.expiresAtMs != null ? (
+                                            <Text style={styles.resetLabel}>{resolveResetRowLabel(row)}</Text>
+                                        ) : null}
+                                        {row.description ? <Text style={styles.resetLabel}>{row.description}</Text> : null}
+                                        {row.details && row.title ? (
+                                            <Text testID={`${testID}:reset-count:${row.key}`} style={styles.resetLabel}>
+                                                {remainingCountLabel}
+                                            </Text>
+                                        ) : null}
+                                        {row.details && row.details.appliesToProviderLimitIds.length > 0 ? (
+                                            <Text testID={`${testID}:reset-applies-to:${row.key}`} style={styles.resetLabel}>
+                                                {t('connectedServices.account.resets.appliesTo', {
+                                                    limits: row.details.appliesToProviderLimitIds.map(resolveResetLimitLabel).join(' · '),
+                                                })}
+                                            </Text>
+                                        ) : null}
+                                        {!row.canUse && (row.title || row.expiresAtMs != null || row.details) ? (
+                                            <Text testID={`${testID}:reset-unavailable:${row.key}`} style={styles.resetLabel}>{resolveResetUnavailableLabel(row)}</Text>
+                                        ) : null}
+                                    </View>
                                     <Pressable
                                         testID={`${testID}:reset-use:${row.key}`}
                                         disabled={useDisabled}

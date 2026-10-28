@@ -3,7 +3,7 @@ import { parseArgs } from './utils/cli/args.mjs';
 import { printResult, wantsHelp, wantsJson } from './utils/cli/cli.mjs';
 import { isTty } from './utils/cli/wizard.mjs';
 import { getVerbosityLevel } from './utils/cli/verbosity.mjs';
-import { createStepPrinter, runCommandLogged } from './utils/cli/progress.mjs';
+import { createStepPrinter, runCommandLogged } from '@happier-dev/cli-common/output';
 import { assertCliPrereqs } from './utils/cli/prereqs.mjs';
 import { decidePrAuthPlan } from './utils/auth/guided_pr_auth.mjs';
 import { findAnyCredentialPathInCliHome } from './utils/auth/credentials_paths.mjs';

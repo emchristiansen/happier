@@ -1,113 +1,55 @@
 import React from 'react';
-import { describe, expect, it, vi } from 'vitest';
-import { renderScreen } from '@/dev/testkit';
-import { installCodeBlockCommonModuleMocks } from './codeBlockTestHelpers';
+import { act, type ReactTestInstance } from 'react-test-renderer';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { Platform } from 'react-native';
+import * as Clipboard from 'expo-clipboard';
+import { renderScreen, standardCleanup } from '@/dev/testkit';
+import { storage } from '@/sync/domains/state/storage';
+import { CodeBlockView } from './CodeBlockView';
 
+function isTextSurface(node: ReactTestInstance): boolean {
+    for (let parent = node.parent; parent; parent = parent.parent) {
+        const hostType: unknown = parent.type;
+        if (hostType === 'Text') return false;
+    }
+    return true;
+}
 
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-const syntaxSpy = vi.fn((..._args: any[]) => ({
-    mode: 'simple',
-    language: 'typescript',
-    maxBytes: 1_000,
-    maxLines: 1_000,
-    maxLineLength: 1_000,
-}));
-
-vi.mock('@/components/ui/code/highlighting/useCodeSyntaxHighlighting', () => ({
-    useCodeSyntaxHighlighting: (...args: any[]) => syntaxSpy(...args),
-}));
-
-const simpleSpy = vi.fn();
-vi.mock('@/components/ui/media/SimpleSyntaxHighlighter', () => ({
-    SimpleSyntaxHighlighter: (props: any) => {
-        simpleSpy(props);
-        return React.createElement('SimpleSyntaxHighlighter', props);
-    },
-}));
-
-vi.mock('@/components/ui/code/blocks/CodeBlockViewFrame', () => ({
-    CodeBlockViewFrame: ({ children, ...props }: any) => React.createElement('CodeBlockViewFrame', props, children),
-}));
-
-vi.mock('@/components/ui/text/Text', () => ({
-    Text: ({ children, ...props }: any) => React.createElement('Text', props, children),
-}));
-
-vi.mock('@/constants/Typography', () => ({
-    Typography: {
-        mono: () => ({ fontFamily: 'mono' }),
-    },
-}));
-
-installCodeBlockCommonModuleMocks({
-    reactNative: async () => {
-        const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
-        return createReactNativeWebMock({
-            View: (props: any) => React.createElement('View', props, props.children),
-            Text: (props: any) => React.createElement('Text', props, props.children),
-            Pressable: (props: any) => React.createElement('Pressable', props, props.children),
-        });
-    },
-    unistyles: async () => {
-        const { createUnistylesMock } = await import('@/dev/testkit/mocks/unistyles');
-        return createUnistylesMock({
-            theme: { colors: { text: '#111' } },
-        });
-    },
+const originalPlatform = Platform.OS;
+afterEach(() => {
+    standardCleanup();
+    Object.defineProperty(Platform, 'OS', { configurable: true, value: originalPlatform });
+    vi.restoreAllMocks();
 });
 
 describe('CodeBlockView (native)', () => {
-    it('renders SimpleSyntaxHighlighter when within budget and enabled', async () => {
-        syntaxSpy.mockImplementation(() => ({
-            mode: 'simple',
-            language: 'typescript',
-            maxBytes: 100,
-            maxLines: 100,
-            maxLineLength: 100,
-        }));
-        simpleSpy.mockClear();
+    it.each(['ios', 'android'] as const)('preserves large multiline code and copy with platform-appropriate selection on %s', async (platform) => {
+        Object.defineProperty(Platform, 'OS', { configurable: true, value: platform });
+        storage.getState().applySettingsLocal({ filesDiffSyntaxHighlightingMode: 'off' });
+        // Mirrors the reproduced Debug shape: many lines plus a very wide serialized message.
+        const lines = ['{', ...Array.from({ length: 5_985 }, (_, i) => `  "message${i}": "${i === 100 ? 'x'.repeat(17_214) : 'content'}",`), '}', ''];
+        const code = lines.join('\n');
+        const copy = vi.spyOn(Clipboard, 'setStringAsync').mockResolvedValue(true);
+        const screen = await renderScreen(<CodeBlockView code={code} showCopyButton scrollTestID="debug-code" />);
+        const scroll = screen.findByTestId('debug-code')!;
+        const texts = scroll.findAllByType('Text').filter(isTextSurface);
 
-        const { CodeBlockView } = await import('./CodeBlockView');
-
-        const screen = await renderScreen(React.createElement(CodeBlockView, { code: 'const x = 1;', language: 'typescript' }));
-
-        expect(simpleSpy).toHaveBeenCalledTimes(1);
-        expect(screen.findAllByType('SimpleSyntaxHighlighter' as any)).toHaveLength(1);
+        expect(texts).toHaveLength(lines.length);
+        expect(texts.map(node => node.props.children).join('\n')).toBe(code);
+        expect(texts.every(node => node.props.selectable === (platform !== 'android'))).toBe(true);
+        await act(async () => { await screen.findByProps({ accessibilityLabel: 'Copy' }).props.onPress(); });
+        expect(copy).toHaveBeenCalledWith(code);
     });
 
-    it('falls back to plain Text when code exceeds the byte budget', async () => {
-        syntaxSpy.mockImplementation(() => ({
-            mode: 'simple',
-            language: 'typescript',
-            maxBytes: 5,
-            maxLines: 100,
-            maxLineLength: 100,
-        }));
-        simpleSpy.mockClear();
-
-        const { CodeBlockView } = await import('./CodeBlockView');
-
-        const screen = await renderScreen(React.createElement(CodeBlockView, { code: 'const x = 1;', language: 'typescript' }));
-
-        expect(simpleSpy).toHaveBeenCalledTimes(0);
-        const textNodes = screen.findAllByType('Text' as any);
-        expect(textNodes.some((n) => n.props.children === 'const x = 1;')).toBe(true);
-    });
-
-    it('forwards scrollTestID to CodeBlockViewFrame (stable E2E locator)', async () => {
-        const { CodeBlockView } = await import('./CodeBlockView');
-
-        const screen = await renderScreen(
-            React.createElement(CodeBlockView, {
-                code: 'const x = 1;',
-                language: 'typescript',
-                scrollTestID: 'markdown-code-block-scroll',
-            }),
-        );
-
-        const frames = screen.findAllByType('CodeBlockViewFrame' as any);
-        expect(frames).toHaveLength(1);
-        expect(frames[0]!.props.scrollTestID).toBe('markdown-code-block-scroll');
+    it('preserves blank lines and tokens when syntax highlighting is enabled', async () => {
+        Object.defineProperty(Platform, 'OS', { configurable: true, value: 'ios' });
+        storage.getState().applySettingsLocal({ filesDiffSyntaxHighlightingMode: 'simple' });
+        const lines = ['const x = 1;', '', '// comment', ''];
+        const screen = await renderScreen(<CodeBlockView code={lines.join('\r\n')} language="typescript" scrollTestID="highlighted-code" />);
+        const scroll = screen.findByTestId('highlighted-code')!;
+        const outerTexts = scroll.findAllByType('Text').filter(isTextSurface);
+        expect(outerTexts).toHaveLength(lines.length);
+        expect(outerTexts[0]!.findAllByType('Text').some(node => node.props.children === 'const')).toBe(true);
+        expect(outerTexts.map(node => node.findAllByType('Text').filter(text => typeof text.props.children === 'string').map(text => text.props.children).join(''))).toEqual(lines);
     });
 });

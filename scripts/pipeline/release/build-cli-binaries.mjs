@@ -2,7 +2,7 @@
 
 // @ts-check
 
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { mkdir, rm } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -10,6 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import {
   CLI_STACK_TARGETS,
   buildCliBinaryArtifactPayload,
+  buildCliOptionalComponentArtifactPayload,
   normalizeChannel,
   packagePreparedTargetBinary,
   parseArgs,
@@ -20,6 +21,7 @@ import {
   maybeSignFile,
   writeChecksumsFile,
 } from './lib/binary-release.mjs';
+import { CLI_OPTIONAL_COMPONENT_PRODUCTS } from './publishing/product-specs.mjs';
 
 export function resolveReleaseTempCleanupTimeoutMs(env = process.env) {
   const raw = String(env.HAPPIER_RELEASE_TEMP_CLEANUP_TIMEOUT_MS ?? '').trim();
@@ -91,6 +93,23 @@ async function main() {
       outDir,
     });
     artifacts.push(artifact);
+    for (const componentId of CLI_OPTIONAL_COMPONENT_PRODUCTS) {
+      const componentStageDir = join(tempDir, `${componentId}-v${version}-${target.os}-${target.arch}`);
+      await buildCliOptionalComponentArtifactPayload({ repoRoot, payloadDir: componentStageDir, target, componentId });
+      artifacts.push(await packagePreparedTargetBinary({
+        product: componentId, version, target, stageDir: componentStageDir, outDir,
+      }));
+    }
+  }
+
+  for (const product of CLI_OPTIONAL_COMPONENT_PRODUCTS) {
+    const componentChecksums = await writeChecksumsFile({
+      product, version, artifacts: artifacts.filter((artifact) => artifact.name.startsWith(`${product}-v`)), outDir,
+    });
+    const componentSignature = await maybeSignFile({ path: componentChecksums, trustedComment: `${product} ${version} ${channel}` });
+    for (const assetPath of [componentChecksums, componentSignature].filter(Boolean)) {
+      artifacts.push({ name: basename(assetPath), path: assetPath, os: 'manifest', arch: product });
+    }
   }
 
   const checksumsPath = await writeChecksumsFile({

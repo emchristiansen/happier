@@ -1,4 +1,5 @@
 import { io } from 'socket.io-client';
+import { ConnectedServiceIdSchema, CONNECTED_SERVICE_READER_SUPPORT_SOCKET_AUTH_FIELD } from '@happier-dev/protocol';
 
 import { canonicalizeServerUrl } from '@/sync/domains/server/url/serverUrlCanonical';
 import { resolveSocketIoTransports } from '@/sync/runtime/socketIoTransports';
@@ -19,6 +20,7 @@ type SocketLike = Readonly<{
     on: (event: string, cb: (...args: any[]) => void) => void;
     off: (event: string, cb: (...args: any[]) => void) => void;
     timeout: (ms: number) => { emitWithAck: (event: string, payload: any) => Promise<unknown> };
+    emitWithAck: (event: string, payload: any) => Promise<unknown>;
     emit: (event: string, payload: any) => void;
 }>;
 
@@ -163,6 +165,7 @@ export function createServerScopedRpcSocketPool(overrides?: Partial<Deps>): Read
             return io(params.serverUrl, {
                 path: '/v1/updates/',
                 auth: {
+                    [CONNECTED_SERVICE_READER_SUPPORT_SOCKET_AUTH_FIELD]: ConnectedServiceIdSchema.options,
                     token: params.token,
                     clientType: 'user-scoped' as const,
                     clientPurpose: 'scoped-rpc' as const,
@@ -325,6 +328,7 @@ export function createServerScopedRpcSocketPool(overrides?: Partial<Deps>): Read
 
         return {
             timeout: (ms: number) => entry.socket.timeout(ms),
+            emitWithAck: (event: string, payload: any) => entry.socket.emitWithAck(event, payload),
             emit: (event: string, payload: any) => entry.socket.emit(event, payload),
             disconnect: () => releaseOnce(),
         };

@@ -24,7 +24,10 @@ test('pipeline npm release script supports dev channel prerelease versions in dr
         ],
         {
             cwd: repoRoot,
-            env: { ...process.env },
+            env: {
+                ...process.env,
+                HAPPIER_RELEASE_PUBLISHED_VERSIONS_JSON: JSON.stringify({ github: {}, npm: {} }),
+            },
             encoding: 'utf8',
             stdio: ['ignore', 'pipe', 'pipe'],
             timeout: 30_000,

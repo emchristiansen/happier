@@ -13,6 +13,7 @@ import {
 } from '../process/processOwnershipLease';
 import { spawnLoggedProcess, type SpawnedProcess } from '../process/spawnProcess';
 import { resolveCliTestLaunchSpec, shouldUseCliSourceEntrypoint } from '../process/cliLaunchSpec';
+import { sanitizeCliTestEnv } from '../process/cliTestEnv';
 import { DEFAULT_CLI_DIST_BUILD_TIMEOUT_MS } from '../process/cliDist';
 import { terminateProcessTreeByPid } from '../process/processTree';
 import { resolveDaemonSessionMarkerDirs } from './sessionMarkerDirs';
@@ -111,7 +112,7 @@ async function listServerDaemonStateCandidates(happyHomeDir: string): Promise<Ar
   }
 }
 
-export async function readDaemonState(happyHomeDir: string): Promise<DaemonState | null> {
+export async function readDaemonState(happyHomeDir: string, opts?: { excludePid?: number }): Promise<DaemonState | null> {
   const activeServerId = await resolveActiveServerIdFromSettings(happyHomeDir);
   const candidates: string[] = [];
   if (activeServerId) candidates.push(perServerDaemonStatePath(happyHomeDir, activeServerId));
@@ -119,7 +120,7 @@ export async function readDaemonState(happyHomeDir: string): Promise<DaemonState
 
   for (const candidate of candidates) {
     const state = await readDaemonStateFromPath(candidate);
-    if (state) return state;
+    if (state && state.pid !== opts?.excludePid) return state;
   }
 
   // Fallback: if settings.json is stale/mismatched, find the newest per-server daemon state.
@@ -128,16 +129,16 @@ export async function readDaemonState(happyHomeDir: string): Promise<DaemonState
   perServerStates.sort((a, b) => b.mtimeMs - a.mtimeMs);
   for (const candidate of perServerStates) {
     const state = await readDaemonStateFromPath(candidate.path);
-    if (state) return state;
+    if (state && state.pid !== opts?.excludePid) return state;
   }
   return null;
 }
 
-export async function waitForDaemonState(happyHomeDir: string, opts?: { timeoutMs?: number }): Promise<DaemonState> {
+export async function waitForDaemonState(happyHomeDir: string, opts?: { timeoutMs?: number; excludePid?: number }): Promise<DaemonState> {
   const timeoutMs = opts?.timeoutMs ?? 30_000;
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    const state = await readDaemonState(happyHomeDir);
+    const state = await readDaemonState(happyHomeDir, opts);
     if (state && state.httpPort > 0 && state.pid > 0) return state;
     await new Promise((r) => setTimeout(r, 100));
   }
@@ -306,8 +307,8 @@ async function waitForReplacementDaemonState(
   const timeoutMs = opts?.timeoutMs ?? 45_000;
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    const state = await readDaemonState(happyHomeDir);
-    if (state && state.httpPort > 0 && state.pid > 0 && state.pid !== originalPid) {
+    const state = await readDaemonState(happyHomeDir, { excludePid: originalPid });
+    if (state && state.httpPort > 0 && state.pid > 0) {
       try {
         process.kill(state.pid, 0);
         return state;
@@ -573,6 +574,7 @@ export type StartedDaemon = {
   state: DaemonState;
   proc: SpawnedProcess;
   stop: () => Promise<void>;
+  restart: () => Promise<StartedDaemon>;
 };
 
 export function resolveTestDaemonOwnershipLeasesDir(rootDir: string = repoRootDir()): string {
@@ -580,7 +582,7 @@ export function resolveTestDaemonOwnershipLeasesDir(rootDir: string = repoRootDi
 }
 
 export function sanitizeDaemonEnvForSpawn(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const sanitized = { ...env };
+  const sanitized = sanitizeCliTestEnv(env);
   // Source-entrypoint E2E runs must not inherit a stack's pinned-dist fast path.
   if (shouldUseCliSourceEntrypoint(sanitized)) {
     sanitized.HAPPIER_CLI_SUBPROCESS_PREFER_TSX = '1';
@@ -596,12 +598,6 @@ export function sanitizeDaemonEnvForSpawn(env: NodeJS.ProcessEnv): NodeJS.Proces
   delete sanitized.HAPPY_SESSION_ATTACH_FILE;
   delete sanitized.HAPPIER_STACK_TOOL_TRACE_FILE;
   delete sanitized.HAPPY_STACK_TOOL_TRACE_FILE;
-  // Test harness must not inherit host daemon/server selection overrides.
-  // These can force a different active server id than the seeded test credentials
-  // and cause false auth-gated daemon startup failures in non-interactive continuity lanes.
-  delete sanitized.HAPPIER_ACTIVE_SERVER_ID;
-  delete sanitized.HAPPIER_DAEMON_SERVICE_INSTANCE_ID;
-  delete sanitized.HAPPIER_DAEMON_SERVICE_SERVER_URL;
   if (sanitized.HAPPIER_DISABLE_CAFFEINATE === undefined || sanitized.HAPPIER_DISABLE_CAFFEINATE === '') {
     sanitized.HAPPIER_DISABLE_CAFFEINATE = '1';
   }
@@ -691,6 +687,9 @@ export async function startTestDaemon(params: {
     stopDaemonFromHomeDir(params.happyHomeDir).catch(() => {}),
     baseDiagnostics,
   );
+  // A stopped daemon can leave its state file behind. Readiness for this
+  // launch must come from the new process, including after a restart.
+  const previousState = await readDaemonState(params.happyHomeDir);
 
   const proc = spawnLoggedProcess({
     command: cliLaunchSpec.command,
@@ -727,12 +726,12 @@ export async function startTestDaemon(params: {
     state = await runDaemonStartupPhase(
       'waitForDaemonState',
       Promise.race([
-        waitForDaemonState(params.happyHomeDir, { timeoutMs: startupTimeoutMs }),
+        waitForDaemonState(params.happyHomeDir, { timeoutMs: startupTimeoutMs, excludePid: previousState?.pid }),
         new Promise<DaemonState>((resolveState, rejectState) => {
           proc.child.once('exit', (code, signal) => {
             void (async () => {
               try {
-                const exitedState = await waitForDaemonState(params.happyHomeDir, { timeoutMs: exitStateGraceTimeoutMs });
+                const exitedState = await waitForDaemonState(params.happyHomeDir, { timeoutMs: exitStateGraceTimeoutMs, excludePid: previousState?.pid });
                 resolveState(exitedState);
               } catch {
                 const detail = signal ? `signal=${String(signal)}` : `code=${String(code)}`;
@@ -759,13 +758,18 @@ export async function startTestDaemon(params: {
     throw e;
   }
 
+  const stop = async () => {
+    await stopDaemonFromHomeDir(params.happyHomeDir).catch(() => {});
+    await proc.stop().catch(() => {});
+  };
   return {
     happyHomeDir: params.happyHomeDir,
     state,
     proc,
-    stop: async () => {
-      await stopDaemonFromHomeDir(params.happyHomeDir).catch(() => {});
-      await proc.stop().catch(() => {});
+    stop,
+    restart: async () => {
+      await stop();
+      return await startTestDaemon(params);
     },
   };
 }

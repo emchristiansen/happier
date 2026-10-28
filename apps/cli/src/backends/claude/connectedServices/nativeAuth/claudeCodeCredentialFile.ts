@@ -1,5 +1,4 @@
-import { randomUUID } from 'node:crypto';
-import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import type { ConnectedServiceCredentialRecordV1 } from '@happier-dev/protocol';
@@ -111,8 +110,9 @@ export function parseClaudeCodeCredentialFile(value: unknown): ClaudeCodeCredent
 
 export async function readClaudeCodeNativeCredentialFile(
   claudeConfigDir: string,
+  options?: Readonly<{ signal?: AbortSignal }>,
 ): Promise<ClaudeCodeNativeCredentialFileReadResult | null> {
-  return await readClaudeCodeNativeCredentialFilePath(resolveClaudeCodeCredentialsFilePath(claudeConfigDir));
+  return await readClaudeCodeNativeCredentialFilePath(resolveClaudeCodeCredentialsFilePath(claudeConfigDir), options);
 }
 
 export async function readClaudeCodeNativeCredential(params: Readonly<{
@@ -120,12 +120,15 @@ export async function readClaudeCodeNativeCredential(params: Readonly<{
   homeDir?: string | null | undefined;
   username?: string | null | undefined;
   diagnosticContext?: ClaudeCodeCredentialDiagnosticContext | undefined;
+  signal?: AbortSignal;
 }>): Promise<ClaudeCodeNativeCredentialReadResult | null> {
+  params.signal?.throwIfAborted();
   if (process.platform === 'darwin') {
     const keychain = await readClaudeCodeMacOsKeychainCredentialWithMetadata({
       claudeConfigDir: params.claudeConfigDir,
       homeDir: params.homeDir,
       username: params.username,
+      signal: params.signal,
     });
     if (keychain) {
       const result: ClaudeCodeNativeCredentialReadResult = {
@@ -140,7 +143,7 @@ export async function readClaudeCodeNativeCredential(params: Readonly<{
       return result;
     }
   }
-  const file = await readClaudeCodeNativeCredentialFile(params.claudeConfigDir);
+  const file = await readClaudeCodeNativeCredentialFile(params.claudeConfigDir, { signal: params.signal });
   const result = file ? { ...file, source: 'file' as const } : null;
   logCredentialRead({
     diagnosticContext: params.diagnosticContext,
@@ -151,12 +154,15 @@ export async function readClaudeCodeNativeCredential(params: Readonly<{
 
 async function readClaudeCodeNativeCredentialFilePath(
   credentialPath: string,
+  options?: Readonly<{ signal?: AbortSignal }>,
 ): Promise<ClaudeCodeNativeCredentialFileReadResult | null> {
+  options?.signal?.throwIfAborted();
   try {
     const [contents, stats] = await Promise.all([
-      readFile(credentialPath, 'utf8'),
+      readFile(credentialPath, { encoding: 'utf8', signal: options?.signal }),
       stat(credentialPath),
     ]);
+    options?.signal?.throwIfAborted();
     const payload = readClaudeCodeNativeCredentialPayload(JSON.parse(contents));
     if (!payload) return null;
     return {
@@ -164,6 +170,7 @@ async function readClaudeCodeNativeCredentialFilePath(
       updatedAtMs: stats.mtimeMs,
     };
   } catch {
+    options?.signal?.throwIfAborted();
     return null;
   }
 }
@@ -343,7 +350,6 @@ async function writeClaudeCodeCredentialsFileUnchecked(params: Readonly<{
   claudeConfigDir: string;
   payload: ClaudeCodeNativeCredentialPayload;
 }>): Promise<'written' | 'unchanged'> {
-  const tempPath = join(params.claudeConfigDir, `.credentials.${randomUUID()}.tmp`);
   const payload = stripClaudeCodeCredentialFileRefreshToken(params.payload);
   const current = await readClaudeCodeNativeCredentialFilePath(params.credentialPath);
   if (
@@ -357,6 +363,10 @@ async function writeClaudeCodeCredentialsFileUnchecked(params: Readonly<{
     await repairClaudeCodeCredentialsFileMode(params.credentialPath);
     return 'unchanged';
   }
+  // The OS creates an invocation-owned scratch directory on the destination filesystem.
+  // Interrupted or otherwise colliding temp entries must not force replacement of the live home.
+  const tempDir = await mkdtemp(join(params.claudeConfigDir, '.credentials-'));
+  const tempPath = join(tempDir, 'credentials.json');
   try {
     await writeFile(tempPath, `${JSON.stringify(payload)}\n`, { mode: 0o600 });
     if (process.platform !== 'win32') {
@@ -367,9 +377,8 @@ async function writeClaudeCodeCredentialsFileUnchecked(params: Readonly<{
       await chmod(params.credentialPath, 0o600);
     }
     return 'written';
-  } catch (error) {
-    await rm(tempPath, { force: true }).catch(() => {});
-    throw error;
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
   }
 }
 

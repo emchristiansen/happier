@@ -77,6 +77,6 @@ describe('TmuxUtilities tmux subprocess environment', () => {
 
         const call = getLastSpawnCall();
         expect(call).not.toBeNull();
-        expect(call!.args).toEqual(['send-keys', '-t', 'happy:claude.1', '-l', '--', 'queued prompt']);
+        expect(call!.args).toEqual(['-u', 'send-keys', '-t', 'happy:claude.1', '-l', '--', 'queued prompt']);
     });
 });

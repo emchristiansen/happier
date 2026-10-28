@@ -1,6 +1,12 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { existsSync } from 'node:fs';
+import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { captureConsoleText, captureStdoutJsonOutput } from '@/testkit/logger/captureOutput';
+import { applyEnvValues, restoreEnvValues, snapshotEnvValues } from '@/testkit/env/envSnapshot';
+import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
 
 const {
   evaluateCurrentDaemonOwnerMock,
@@ -385,5 +391,117 @@ describe('handleDaemonCliCommand session runner restart controls', () => {
       status: 'dry_run_restartable',
       sessionId: 'sess_1',
     }));
+  });
+
+  describe('--on-update', () => {
+    const envBackup = snapshotEnvValues(['HAPPIER_HOME_DIR']);
+    let homeDir = '';
+
+    beforeEach(async () => {
+      homeDir = await createTempDir('happier-cli-runner-on-update-');
+      applyEnvValues({ HAPPIER_HOME_DIR: homeDir });
+      vi.resetModules();
+    });
+
+    afterEach(async () => {
+      restoreEnvValues(envBackup);
+      await removeTempDir(homeDir);
+    });
+
+    async function runDaemonCommand(args: string[]): Promise<string> {
+      const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+        throw new Error(`exit:${code ?? ''}`);
+      }) as never);
+      try {
+        const { handleDaemonCliCommand } = await import('./daemon');
+        await handleDaemonCliCommand({ args, rawArgv: ['happier', ...args], terminalRuntime: null });
+        return 'returned';
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      } finally {
+        exitSpy.mockRestore();
+      }
+    }
+
+    async function readPersistedSettings(): Promise<Record<string, unknown>> {
+      return JSON.parse(await readFile(join(homeDir, 'settings.json'), 'utf8')) as Record<string, unknown>;
+    }
+
+    it('persists the opt-in without contacting the daemon', async () => {
+      const output = captureStdoutJsonOutput();
+      let outcome: string;
+      try {
+        outcome = await runDaemonCommand(['daemon', 'restart-session-runners', '--on-update', 'on', '--json']);
+      } finally {
+        output.restore();
+      }
+
+      expect(outcome).toBe('exit:0');
+      expect(await readPersistedSettings()).toEqual(expect.objectContaining({ restartSessionRunnersOnUpdate: true }));
+      expect(output.json()).toEqual({ ok: true, restartSessionRunnersOnUpdate: true });
+      expect(restartAllDaemonSessionRunnersMock).not.toHaveBeenCalled();
+      expect(requestDaemonSessionRunnerRestartMock).not.toHaveBeenCalled();
+    }, 60_000);
+
+    it('turns the opt-in back off', async () => {
+      const output = captureConsoleText();
+      try {
+        expect(await runDaemonCommand(['daemon', 'restart-session-runners', '--on-update', 'on'])).toBe('exit:0');
+        expect(await runDaemonCommand(['daemon', 'restart-session-runners', '--on-update', 'off'])).toBe('exit:0');
+      } finally {
+        output.restore();
+      }
+
+      expect(await readPersistedSettings()).toEqual(expect.objectContaining({ restartSessionRunnersOnUpdate: false }));
+      expect(restartAllDaemonSessionRunnersMock).not.toHaveBeenCalled();
+    }, 60_000);
+
+    it('rejects a value other than on or off without touching settings', async () => {
+      const output = captureStdoutJsonOutput();
+      let outcome: string;
+      try {
+        outcome = await runDaemonCommand(['daemon', 'restart-session-runners', '--on-update', 'maybe', '--json']);
+      } finally {
+        output.restore();
+      }
+
+      expect(outcome).toBe('exit:1');
+      expect(output.json()).toEqual(expect.objectContaining({ ok: false, error: 'invalid_on_update_value' }));
+      expect(existsSync(join(homeDir, 'settings.json'))).toBe(false);
+      expect(restartAllDaemonSessionRunnersMock).not.toHaveBeenCalled();
+    }, 60_000);
+
+    it('rejects --on-update combined with restart flags instead of silently ignoring them', async () => {
+      const output = captureStdoutJsonOutput();
+      let outcome: string;
+      try {
+        outcome = await runDaemonCommand(['daemon', 'restart-session-runners', '--on-update', 'on', '--dry-run', '--json']);
+      } finally {
+        output.restore();
+      }
+
+      expect(outcome).toBe('exit:1');
+      expect(output.json()).toEqual(expect.objectContaining({ ok: false, error: 'on_update_conflicting_options' }));
+      expect(existsSync(join(homeDir, 'settings.json'))).toBe(false);
+      expect(restartAllDaemonSessionRunnersMock).not.toHaveBeenCalled();
+    }, 60_000);
+
+    it('reports a settings write failure as a structured error', async () => {
+      // A non-empty directory where settings.json belongs makes the real settings write fail.
+      await mkdir(join(homeDir, 'settings.json'));
+      await writeFile(join(homeDir, 'settings.json', 'occupied'), 'x');
+      const output = captureStdoutJsonOutput();
+      let outcome: string;
+      try {
+        outcome = await runDaemonCommand(['daemon', 'restart-session-runners', '--on-update', 'on', '--json']);
+      } finally {
+        output.restore();
+        // The settings writer's best-effort chmod can strip the directory's search bit.
+        await chmod(join(homeDir, 'settings.json'), 0o700);
+      }
+
+      expect(outcome).toBe('exit:1');
+      expect(output.json()).toEqual(expect.objectContaining({ ok: false, error: 'settings_update_failed' }));
+    }, 60_000);
   });
 });

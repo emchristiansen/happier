@@ -17,6 +17,13 @@ class FakeSession {
     return this.agentState;
   }
 
+  async updateAgentStateRequestSettlement(updater: Parameters<FakeSession['updateAgentState']>[0]): Promise<void> {
+
+    await this.updateAgentState(updater);
+
+  }
+
+
   updateAgentState(updater: any) {
     this.agentState = updater(this.agentState);
     return this.agentState;
@@ -32,14 +39,15 @@ describe('createProviderEnforcedPermissionHandler', () => {
       alwaysAutoApproveToolNameIncludes: ['geminireasoning'],
     });
 
-    expect((handler as any).alwaysAutoApproveToolNameIncludes).toContain('geminireasoning');
+    await expect(handler.handleToolCall('safe-extension', 'geminireasoning', {}))
+      .resolves.toEqual({ decision: 'approved' });
     await expect(handler.handleToolCall('safe-1', 'think', {})).resolves.toEqual({ decision: 'approved' });
 
     const pending = handler.handleToolCall('pending-1', 'Edit', {});
     expect(session.agentState.requests['pending-1']).toBeTruthy();
-    const pendingReq = (handler as any).pendingRequests.get('pending-1');
-    expect(pendingReq).toBeTruthy();
-    pendingReq?.resolve({ decision: 'denied' });
+    const respond = session.rpcHandlerManager.handlers.get('permission');
+    if (!respond) throw new Error('Permission RPC was not registered');
+    await respond({ id: 'pending-1', approved: false, decision: 'denied' });
     await expect(pending).resolves.toEqual({ decision: 'denied' });
   });
 });

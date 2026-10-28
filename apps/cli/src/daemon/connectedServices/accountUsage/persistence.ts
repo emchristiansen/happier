@@ -1,5 +1,7 @@
 import {
   ConnectedServiceUsageSourceV1Schema,
+  compareConnectedServiceQuotaObservationRecency,
+  isConnectedServiceQuotaObservationAtOrBeforeNow,
   ProviderAccountUsageRecordIdSchema,
   ProviderAccountUsageSnapshotV1Schema,
   sealProviderAccountUsageSnapshot,
@@ -10,7 +12,7 @@ import {
   type SealedProviderAccountUsageSnapshotV1,
 } from '@happier-dev/protocol';
 
-import type { Credentials } from '@/persistence';
+import { requireEncryptionCredentials, type Credentials } from '@/persistence';
 
 import { createConnectedServiceQuotaPersistenceScheduler } from '../quotas/createConnectedServiceQuotaPersistenceScheduler';
 import {
@@ -62,10 +64,20 @@ type ProviderAccountUsagePersistencePayload = Readonly<{
   materialState: ProviderAccountUsagePersistenceMaterialState;
 }>;
 
+export type ProviderAccountUsageInBandSnapshotOptions = Readonly<{
+  source?: ConnectedServiceUsageSourceV1;
+  sources?: readonly ConnectedServiceUsageSourceV1[];
+  /**
+   * Called once a write for this record lands on the server, including on a retry. Not called
+   * when nothing was queued (`already_persisted`) or when the queued write is dropped unrun.
+   */
+  onPersisted?: () => void;
+}>;
+
 export type ProviderAccountUsagePersistenceScheduler = Readonly<{
   recordInBandSnapshot(
     snapshot: ProviderAccountUsageSnapshotV1,
-    options?: Readonly<{ source?: ConnectedServiceUsageSourceV1; sources?: readonly ConnectedServiceUsageSourceV1[] }>,
+    options?: ProviderAccountUsageInBandSnapshotOptions,
   ): Promise<
     | Readonly<{ status: 'enqueued'; enqueue: 'accepted' | 'coalesced' }>
     | Readonly<{ status: 'already_persisted'; reason: string }>
@@ -110,7 +122,7 @@ function sourcePersistenceKey(source: ConnectedServiceUsageSourceV1 | undefined)
 }
 
 function normalizePersistenceSources(
-  options: Readonly<{ source?: ConnectedServiceUsageSourceV1; sources?: readonly ConnectedServiceUsageSourceV1[] }> | undefined,
+  options: ProviderAccountUsageInBandSnapshotOptions | undefined,
 ): readonly (ConnectedServiceUsageSourceV1 | undefined)[] {
   const sources = [
     ...(options?.source ? [options.source] : []),
@@ -130,9 +142,23 @@ function shouldPersistProviderAccountUsageSnapshot(input: Readonly<{
   previous: ProviderAccountUsagePersistenceMaterialState | null;
   next: ProviderAccountUsagePersistenceMaterialState;
   minFreshnessMs: number;
+  nowMs: number;
 }>): Readonly<{ persist: boolean; reason: string }> {
+  if (!isConnectedServiceQuotaObservationAtOrBeforeNow({
+    observedAtMs: input.next.fetchedAt,
+    nowMs: input.nowMs,
+  })) return { persist: false, reason: 'future' };
   if (!input.previous) return { persist: true, reason: 'first_snapshot' };
-  if (input.next.fetchedAt < input.previous.fetchedAt) return { persist: false, reason: 'stale' };
+  const recency = compareConnectedServiceQuotaObservationRecency({
+    existingObservedAtMs: input.previous.fetchedAt,
+    incomingObservedAtMs: input.next.fetchedAt,
+    nowMs: input.nowMs,
+  });
+  if (recency === 'incoming_older') return { persist: false, reason: 'stale' };
+  if (!isConnectedServiceQuotaObservationAtOrBeforeNow({
+    observedAtMs: input.previous.fetchedAt,
+    nowMs: input.nowMs,
+  })) return { persist: true, reason: 'clock_recovered' };
   if (input.next.status !== input.previous.status) return { persist: true, reason: 'status' };
   if (input.next.fingerprint !== input.previous.fingerprint) return { persist: true, reason: 'fingerprint' };
   if (input.next.fetchedAt - input.previous.fetchedAt >= input.minFreshnessMs) {
@@ -202,6 +228,7 @@ export function createProviderAccountUsagePersistenceScheduler(params: Readonly<
       throw new Error('Provider account usage sealed persistence requires credentials and randomBytes');
     }
 
+    requireEncryptionCredentials(params.credentials);
     const material = params.credentials.encryption.type === 'legacy'
       ? { type: 'legacy' as const, secret: params.credentials.encryption.secret }
       : { type: 'dataKey' as const, machineKey: params.credentials.encryption.machineKey };
@@ -220,14 +247,33 @@ export function createProviderAccountUsagePersistenceScheduler(params: Readonly<
     stateByPersistenceKey.set(_key, payload.materialState);
   }
 
+  // Confirmation callbacks of queued writes. Any write that lands for a key proves its record
+  // exists, so it releases every callback waiting on that key. A failed write is retried (or kept
+  // for a later flush), so its callbacks stay pending; they are dropped only with the payload.
+  const persistedCallbacksByKey = new Map<string, Array<() => void>>();
+  function releasePersistedCallbacks(key: string): void {
+    const callbacks = persistedCallbacksByKey.get(key);
+    persistedCallbacksByKey.delete(key);
+    for (const callback of callbacks ?? []) callback();
+  }
+
   const scheduler = createConnectedServiceQuotaPersistenceScheduler<string, ProviderAccountUsagePersistencePayload>({
-    run: persistPayload,
+    run: async (key, payload) => {
+      await persistPayload(key, payload);
+      releasePersistedCallbacks(key);
+    },
     maxConcurrent: 2,
     minKeyIntervalMs: 0,
     maxKeys: 500,
     maxKeyAgeMs: 60 * 60_000,
     maxPendingPayloadAgeMs: 10 * 60_000,
     now: params.now,
+    onEvent: (event) => {
+      // The pending write was discarded (expired or evicted) and will never run.
+      if (event.type === 'suppressed' && (event.reason === 'pending_payload_stale' || event.reason === 'max_keys')) {
+        persistedCallbacksByKey.delete(event.key);
+      }
+    },
   });
 
   return {
@@ -246,12 +292,21 @@ export function createProviderAccountUsagePersistenceScheduler(params: Readonly<
       let accepted = false;
       let coalesced = false;
       let lastSuppressionReason = 'unchanged';
+      const onPersisted = options?.onPersisted;
+      let confirmed = false;
+      // One observation may queue a write per source; it is confirmed by the first that lands.
+      const confirmOnce = (): void => {
+        if (confirmed) return;
+        confirmed = true;
+        onPersisted?.();
+      };
       for (const source of normalizePersistenceSources(options)) {
         const persistenceKey = `${snapshot.recordId}\u0000${sourcePersistenceKey(source)}`;
         const decision = shouldPersistProviderAccountUsageSnapshot({
           previous: stateByPersistenceKey.get(persistenceKey) ?? null,
           next: materialState,
           minFreshnessMs,
+          nowMs: normalizeNonNegativeInteger(params.now()),
         });
         if (!decision.persist) {
           lastSuppressionReason = decision.reason;
@@ -271,6 +326,12 @@ export function createProviderAccountUsagePersistenceScheduler(params: Readonly<
         if (enqueue.type === 'suppressed') {
           throw new Error(`provider_account_usage_persistence_${enqueue.reason}`);
         }
+        if (onPersisted) {
+          persistedCallbacksByKey.set(persistenceKey, [
+            ...(persistedCallbacksByKey.get(persistenceKey) ?? []),
+            confirmOnce,
+          ]);
+        }
       }
       if (accepted || coalesced) {
         return { status: 'enqueued', enqueue: accepted ? 'accepted' : 'coalesced' };
@@ -278,6 +339,9 @@ export function createProviderAccountUsagePersistenceScheduler(params: Readonly<
       return { status: 'already_persisted', reason: lastSuppressionReason };
     },
     flush: async (timeoutMs) => await scheduler.flushAll(timeoutMs),
-    dispose: () => scheduler.dispose(),
+    dispose: () => {
+      persistedCallbacksByKey.clear();
+      scheduler.dispose();
+    },
   };
 }

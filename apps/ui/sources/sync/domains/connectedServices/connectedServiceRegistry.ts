@@ -13,6 +13,7 @@ export type ConnectedServiceRegistryEntry = Readonly<{
    * When omitted or length <= 1, the UI uses the generic "Add OAuth profile" action.
    */
   oauthAddActionModes?: ReadonlyArray<'device' | 'paste' | 'browser'>;
+  oauthAddActionTitleKey?: 'connectedServices.detail.signInWithGoogle';
   supportsToken?: boolean;
   tokenKind?: 'access-token' | 'api-key' | 'setup-token';
   tokenSetupUrl?: string;
@@ -52,6 +53,14 @@ export const CONNECTED_SERVICES_REGISTRY: readonly ConnectedServiceRegistryEntry
     connectCommand: 'happier connect gemini',
     supportsOauth: true,
     oauthAddActionModes: ['paste', 'browser'],
+  },
+  {
+    serviceId: 'antigravity',
+    connectCommand: 'happier connect antigravity',
+    supportsOauth: true,
+    oauthAddActionModes: ['paste'],
+    oauthAddActionTitleKey: 'connectedServices.detail.signInWithGoogle',
+    supportsToken: false,
   },
   {
     serviceId: 'github',

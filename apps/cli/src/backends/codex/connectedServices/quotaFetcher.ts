@@ -14,6 +14,7 @@ import { isRecord, normalizeNonEmptyString, normalizePct, resolveConnectedServic
 import { parseRetryAfterHeader } from '@/daemon/connectedServices/quotas/normalization';
 import { createOpenAiCodexSubscriptionFetcher } from './subscriptionFetcher';
 import { normalizeCodexQuotaWindows } from './codexQuotaWindows';
+import { mapCodexRateLimitPayloadToQuotaMeters } from './mapCodexRateLimitSnapshot';
 
 const RESET_AT_PLAUSIBILITY_FLOOR_TOLERANCE_MS = 24 * 60 * 60_000;
 
@@ -290,7 +291,15 @@ export function createOpenAiCodexQuotaFetcher(params?: Readonly<{
         planLabel,
         accountLabel: resolveAccountLabel(record),
         ...(recoveryCredits ? { recoveryCredits } : {}),
-        meters: normalizeCodexQuotaWindows(rateLimit, now, normalizePct, normalizeWindowResetAtMs),
+        meters: [
+          ...normalizeCodexQuotaWindows(rateLimit, now, normalizePct, normalizeWindowResetAtMs),
+          ...mapCodexRateLimitPayloadToQuotaMeters({
+            additional_rate_limits: data.additional_rate_limits,
+          }, now, {
+            legacyPrimary: { meterId: 'session', label: 'Session' },
+            legacySecondary: { meterId: 'weekly', label: 'Weekly' },
+          }),
+        ],
       };
     },
   };

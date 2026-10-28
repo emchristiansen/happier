@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest';
 
 import {
     applyTailDiscontinuityOlderPage,
+    applyTailDiscontinuityOpaqueOlderPage,
+    applyTailDiscontinuityOpaqueForwardPage,
     openTailDiscontinuityFromSnapshot,
+    openTailDiscontinuityFromOpaqueSnapshot,
 } from './sessionMessagesTailDiscontinuity';
 
 describe('openTailDiscontinuityFromSnapshot', () => {
@@ -12,7 +15,7 @@ describe('openTailDiscontinuityFromSnapshot', () => {
             prefixMaxSeq: 410,
             snapshotMinSeq: 1951,
         });
-        expect(record).toEqual({ prefixMaxSeq: 410, walkCursor: 1951 });
+        expect(record).toEqual({ kind: 'seq', prefixMaxSeq: 410, walkCursor: 1951 });
     });
 
     it('does not open on a contiguous or overlapping snapshot', () => {
@@ -50,7 +53,7 @@ describe('openTailDiscontinuityFromSnapshot', () => {
             prefixMaxSeq: 2600,
             snapshotMinSeq: 5000,
         });
-        expect(second).toEqual({ prefixMaxSeq: 410, walkCursor: 5000 });
+        expect(second).toEqual({ kind: 'seq', prefixMaxSeq: 410, walkCursor: 5000 });
     });
 
     it('keeps the open record when a later snapshot is contiguous with the island', () => {
@@ -68,15 +71,90 @@ describe('openTailDiscontinuityFromSnapshot', () => {
     });
 });
 
+describe('opaque tail discontinuity', () => {
+    const open = () => openTailDiscontinuityFromOpaqueSnapshot({
+        prev: null,
+        prefixMessageIds: ['source-prefix'],
+        prefixMaterializedMessageIds: ['old-tool', 'old-text'],
+        snapshotMessageIds: ['source-result', 'source-tail'],
+        snapshotMaterializedMessageIds: ['old-tool', 'tail-text'],
+        nextCursor: 'older-tail',
+    })!;
+
+    it('reveals later visible forward rows after an absorbed snapshot without changing the recovery walk', () => {
+        const gap = openTailDiscontinuityFromOpaqueSnapshot({
+            prev: null, prefixMessageIds: ['old-source'], prefixMaterializedMessageIds: ['old-tool'],
+            snapshotMessageIds: ['absorbed-result'], snapshotMaterializedMessageIds: ['old-tool'], nextCursor: 'older-gap',
+        })!;
+        expect(applyTailDiscontinuityOpaqueForwardPage({ prev: gap, pageMaterializedMessageIds: ['old-tool'] })).toBe(gap);
+        const revealed = applyTailDiscontinuityOpaqueForwardPage({ prev: gap, pageMaterializedMessageIds: ['old-tool', 'new-text', 'new-text'] });
+        expect(revealed).toEqual({ ...gap, boundaryMessageIds: ['new-text'] });
+        expect(applyTailDiscontinuityOpaqueForwardPage({ prev: revealed, pageMaterializedMessageIds: ['later-text'] })).toBe(revealed);
+    });
+
+    it('keeps source overlap separate from an absorbed materialized tool row', () => {
+        const gap = open();
+        expect(gap.boundaryMessageIds).toEqual(['tail-text']);
+        const advanced = applyTailDiscontinuityOpaqueOlderPage({
+            prev: gap,
+            pageMessageIds: ['source-other-result'],
+            pageMaterializedMessageIds: ['old-tool'],
+            nextCursor: 'older-middle',
+        });
+        expect(advanced).toMatchObject({ walkCursor: 'older-middle', boundaryMessageIds: ['tail-text'] });
+        expect(applyTailDiscontinuityOpaqueOlderPage({
+            prev: advanced!, pageMessageIds: ['source-prefix'], pageMaterializedMessageIds: ['old-text'], nextCursor: 'original-prefix',
+        })).toBeNull();
+    });
+
+    it('preserves the original prefix across stacked islands and terminal missing history', () => {
+        const first = open();
+        const stacked = openTailDiscontinuityFromOpaqueSnapshot({
+            prev: first,
+            prefixMessageIds: ['source-tail'],
+            prefixMaterializedMessageIds: ['old-tool', 'old-text', 'tail-text'],
+            snapshotMessageIds: ['source-new-tail'],
+            snapshotMaterializedMessageIds: ['new-tail'],
+            nextCursor: 'older-new-tail',
+        })!;
+        expect(stacked).toMatchObject({ prefixMessageIds: ['source-prefix'], prefixMaterializedMessageIds: ['old-tool', 'old-text'], boundaryMessageIds: ['new-tail'] });
+        const terminal = applyTailDiscontinuityOpaqueOlderPage({
+            prev: stacked, pageMessageIds: [], pageMaterializedMessageIds: [], nextCursor: null,
+        });
+        expect(terminal).toMatchObject({ walkCursor: null, boundaryMessageIds: ['new-tail'], prefixMessageIds: ['source-prefix'] });
+    });
+
+    it('does not publish progress from a repeated opaque cursor unless source overlap proves the bridge', () => {
+        const gap = open();
+        expect(applyTailDiscontinuityOpaqueOlderPage({
+            prev: gap, pageMessageIds: ['source-tail'], pageMaterializedMessageIds: ['tail-text'], nextCursor: gap.walkCursor,
+        })).toBe(gap);
+        expect(applyTailDiscontinuityOpaqueOlderPage({
+            prev: gap, pageMessageIds: ['source-prefix'], pageMaterializedMessageIds: ['old-text'], nextCursor: gap.walkCursor,
+        })).toBeNull();
+    });
+
+    it('does not open on source overlap and does not invent a boundary for invisible snapshot rows', () => {
+        expect(openTailDiscontinuityFromOpaqueSnapshot({
+            prev: null, prefixMessageIds: ['same'], prefixMaterializedMessageIds: ['same-row'],
+            snapshotMessageIds: ['same', 'new'], snapshotMaterializedMessageIds: ['same-row', 'new-row'], nextCursor: 'older',
+        })).toBeNull();
+        expect(openTailDiscontinuityFromOpaqueSnapshot({
+            prev: null, prefixMessageIds: ['old'], prefixMaterializedMessageIds: ['old-row'],
+            snapshotMessageIds: ['invisible'], snapshotMaterializedMessageIds: [], nextCursor: 'older',
+        })).toMatchObject({ boundaryMessageIds: [] });
+    });
+});
+
 describe('applyTailDiscontinuityOlderPage', () => {
-    const record = { prefixMaxSeq: 410, walkCursor: 1951 } as const;
+    const record = { kind: 'seq', prefixMaxSeq: 410, walkCursor: 1951 } as const;
 
     it('advances the walk cursor from a fetched older page', () => {
         expect(applyTailDiscontinuityOlderPage({
             prev: record,
             pageMinSeq: 1801,
             nextBeforeSeq: 1801,
-        })).toEqual({ prefixMaxSeq: 410, walkCursor: 1801 });
+        })).toEqual({ kind: 'seq', prefixMaxSeq: 410, walkCursor: 1801 });
     });
 
     it('prefers the server cursor when it is provided and lower', () => {
@@ -84,7 +162,7 @@ describe('applyTailDiscontinuityOlderPage', () => {
             prev: record,
             pageMinSeq: 1810,
             nextBeforeSeq: 1801,
-        })).toEqual({ prefixMaxSeq: 410, walkCursor: 1801 });
+        })).toEqual({ kind: 'seq', prefixMaxSeq: 410, walkCursor: 1801 });
     });
 
     it('closes when the walk bridges the prefix', () => {

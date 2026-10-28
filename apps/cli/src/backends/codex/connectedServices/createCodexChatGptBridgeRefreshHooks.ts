@@ -8,7 +8,6 @@ import {
   type CodexChatGptAuthTokensRefreshResponse,
   type CodexChatGptAuthTokensRefreshSelection,
 } from './codexChatGptAuthTokensRefreshBridgeContract';
-import { materializeCodexChatGptRefreshBridgeSelection } from './materializeCodexChatGptRefreshBridgeSelection';
 import type { ConnectedServiceChildSelection } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 
 /**
@@ -35,7 +34,7 @@ function toCodexChatGptAuthTokensRefreshSelection(
 /**
  * CS-FIX-1: the Codex ChatGPT bridge-refresh hook. It owns the Codex-specific bits the generic
  * skeleton delegates — the ChatGPT selection/profile mapping, the `chatgptPlanType`/`chatgptAccountId`
- * response shape, and the post-rotation home rematerialization fallback — while the shared
+ * response shape — while the shared
  * orchestration stays in `ConnectedServiceRefreshCoordinator.refreshServiceTokensForBridge`.
  */
 export function createCodexChatGptBridgeRefreshHooks(input: Readonly<{
@@ -59,10 +58,11 @@ export function createCodexChatGptBridgeRefreshHooks(input: Readonly<{
       return {
         kind: 'adoptable',
         accessToken,
-        buildResponse: () => ({
+        buildResponse: (selection) => ({
           accessToken,
           chatgptAccountId: providerAccountId,
           chatgptPlanType: input.chatgptPlanType,
+          ...(selection ? { selection: toCodexChatGptAuthTokensRefreshSelection(selection) } : {}),
           ...(source.revisionSemantics === 'revisioned'
             ? { credentialRevision: source.credentialRevision }
             : {}),
@@ -72,25 +72,18 @@ export function createCodexChatGptBridgeRefreshHooks(input: Readonly<{
     finalizeRefreshedResponse: async ({ selection, credential, credentialRevision }) => {
       const codexSelection = toCodexChatGptAuthTokensRefreshSelection(selection);
       const profileId = resolveCodexChatGptAuthTokensRefreshProfileId(codexSelection);
-      const rematerializedTargets = await capabilities.rematerializeTargets({
+      await capabilities.rematerializeTargets({
         serviceId: 'openai-codex',
         profileId,
       });
-      if (rematerializedTargets.length === 0) {
-        await materializeCodexChatGptRefreshBridgeSelection({
-          selection: codexSelection,
-          record: credential,
-          activeServerDir: capabilities.activeServerDir,
-          baseDir: capabilities.baseDir,
-          accountSettings: capabilities.accountSettings,
-          processEnv: capabilities.processEnv,
-        });
-      }
+      // The bridge is authorized by a live registry target. An empty distribution may mean that
+      // current group truth rejected this captured selection; it never authorizes another writer.
       return {
         accessToken: credential.oauth.accessToken,
         chatgptAccountId: credential.oauth.providerAccountId,
         chatgptPlanType: input.chatgptPlanType,
         credentialRevision,
+        selection: codexSelection,
       };
     },
   };

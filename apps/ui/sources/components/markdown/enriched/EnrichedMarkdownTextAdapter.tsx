@@ -7,6 +7,7 @@ import { normalizeMarkdownLinkUrl, openMarkdownLinkUrl, sanitizeEnrichedMarkdown
 import { useEnrichedMarkdownRuntimeStatus } from './preloadEnrichedMarkdownRuntime';
 import { resolveEnrichedMarkdownFlavor } from './resolveEnrichedMarkdownFlavor';
 import { useEnrichedMarkdownStyle } from './useEnrichedMarkdownStyle';
+import { useNativeTextSelectable } from '@/components/ui/text/nativeTextSelection';
 import type { MarkdownRenderingProfile } from '../rendering/MarkdownRenderingProfile';
 import {
     resolveStreamingTextRevealConfig,
@@ -88,6 +89,7 @@ type EnrichedMarkdownTextAdapterProps = Readonly<{
 
 export const EnrichedMarkdownTextAdapter = React.memo((props: EnrichedMarkdownTextAdapterProps) => {
     const runtimeStatus = useEnrichedMarkdownRuntimeStatus();
+    const selectable = useNativeTextSelectable(props.selectable);
     const styleBundle = useEnrichedMarkdownStyle({
         profile: props.profile,
         textStyle: props.textStyle,
@@ -174,7 +176,7 @@ export const EnrichedMarkdownTextAdapter = React.memo((props: EnrichedMarkdownTe
             containerStyle={containerStyle}
             md4cFlags={md4cFlags}
             onLinkPress={handleLinkPress}
-            selectable={props.selectable}
+            selectable={selectable}
             allowTrailingMargin={false}
             flavor={flavor}
         />

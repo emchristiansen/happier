@@ -4,18 +4,8 @@ import { getAgentStaticModels } from '@happier-dev/agents';
 import { getResolvedBackendCatalogEntries } from '@/agents/backendCatalog/getResolvedBackendCatalogEntries';
 import { storage } from '@/sync/domains/state/storage';
 import { getActiveServerSnapshot } from '@/sync/domains/server/serverRuntime';
-import { machineCapabilitiesInvoke } from '@/sync/ops/capabilities';
-import {
-  readDynamicModelProbeCache,
-  runDynamicModelProbeDedupe,
-  writeDynamicModelProbeCacheError,
-  writeDynamicModelProbeCacheSuccess,
-  writeDynamicModelProbeCacheTransientSuccess,
-} from '@/sync/domains/models/dynamicModelProbeCache';
+import { discoverMachineModels } from '@/sync/ops/modelDiscovery';
 import { buildDynamicModelProbeCacheKey } from '@/sync/domains/models/dynamicModelProbeCacheKey';
-import { parsePreflightModelListFromProbeModelsResult } from '@/sync/domains/models/parsePreflightModelListFromProbeModelsResult';
-import type { PreflightModelList } from '@/sync/domains/models/modelOptions';
-import type { CapabilityId } from '@/sync/api/capabilities/capabilitiesProtocol';
 import { readNonBlankSessionControlIdentifier } from '@/sync/domains/sessionControl/opaqueIdentifiers';
 
 type AgentModelCatalogItem = Readonly<{
@@ -176,6 +166,7 @@ export async function listAgentModelsForVoiceTool(params: Readonly<{
     };
   }
 
+  let discoveryFailed = false;
   const machineId = normalizeId(params.machineId);
   if (machineId) {
     const serverId = normalizeId(getActiveServerSnapshot()?.serverId) || null;
@@ -186,125 +177,35 @@ export async function listAgentModelsForVoiceTool(params: Readonly<{
       cwd: null,
     });
 
-    const nowMs = Date.now();
-    const cacheEntry = cacheKey ? readDynamicModelProbeCache(cacheKey) : null;
-    const cached = cacheEntry?.kind === 'success' ? cacheEntry.value : null;
-    const cachedCanPersist = cacheEntry?.kind === 'success' && cacheEntry.cacheable !== false;
-    if (cached && nowMs >= 0 && nowMs < cacheEntry!.expiresAt) {
-      const dynamic = cached.availableModels.map((m) => ({
-        modelId: String(m.id),
-        label: String(m.name),
-        ...(typeof m.description === 'string' ? { description: m.description } : {}),
-      }));
-
-      const withDefault = [{ modelId: 'default', label: 'Default' }, ...dynamic.filter((m) => m.modelId !== 'default')];
-      const items = dedupeOpaqueModelCatalogItems(withDefault);
-
-      return {
-        agentId,
+    if (cacheKey && core.model.dynamicProbe !== 'static-only') {
+      const entry = await discoverMachineModels({
+        cacheKey,
+        agentType: agentId,
         machineId,
-        items: limit ? items.slice(0, limit) : items,
-        supportsFreeform: cached.supportsFreeform === true,
-        source: 'preflight' as const,
-      };
-    }
-
-    if (cacheKey) {
-      const attempt = await runDynamicModelProbeDedupe<Readonly<{
-        list: PreflightModelList;
-        cacheable: boolean;
-      }> | null>(cacheKey, async () => {
-        const capabilityId: CapabilityId = `cli.${agentId}`;
-        const res = await machineCapabilitiesInvoke(
-          machineId,
-          {
-            id: capabilityId,
-            method: 'probeModels',
-            params: {
-              timeoutMs: 15_000,
-              ...(backendTarget ? { backendTarget } : {}),
-            },
-          },
-          { ...(serverId ? { serverId } : {}) },
-        );
-
-        if (!res.supported) return null;
-        if (!res.response.ok) return null;
-
-        const list = parsePreflightModelListFromProbeModelsResult(res.response.result);
-        if (!list) return null;
-        const result = res.response.result;
-        const source = result && typeof result === 'object' && !Array.isArray(result)
-          ? (typeof (result as Record<string, unknown>).source === 'string' ? (result as Record<string, unknown>).source : null)
-          : null;
-        const cacheable = source !== 'static';
-        return { list, cacheable };
+        serverId,
+        backendTarget: backendTarget ?? { kind: 'builtInAgent', agentId },
+        capabilityParams: { timeoutMs: 15_000 },
       });
-
-      const commitNowMs = Date.now();
-      const list = attempt?.list ?? null;
-      if (list && attempt?.cacheable !== false) {
-        writeDynamicModelProbeCacheSuccess(cacheKey, list, commitNowMs);
-        const dynamic = list.availableModels.map((m) => ({
-          modelId: String(m.id),
-          label: String(m.name),
-          ...(typeof m.description === 'string' ? { description: m.description } : {}),
+      discoveryFailed = entry?.kind === 'error' || (entry?.kind === 'success' && entry.errorUpdatedAt !== undefined);
+      if (entry?.kind === 'success') {
+        const dynamic = entry.value.availableModels.map((model) => ({
+          modelId: model.id,
+          label: model.name,
+          ...(model.description ? { description: model.description } : {}),
         }));
-
-        const withDefault = [{ modelId: 'default', label: 'Default' }, ...dynamic.filter((m) => m.modelId !== 'default')];
-        const items = dedupeOpaqueModelCatalogItems(withDefault);
-
+        const items = dedupeOpaqueModelCatalogItems([
+          { modelId: 'default', label: 'Default' },
+          ...dynamic.filter((model) => model.modelId !== 'default'),
+        ]);
         return {
           agentId,
           machineId,
           items: limit ? items.slice(0, limit) : items,
-          supportsFreeform: list.supportsFreeform === true,
+          supportsFreeform: entry.value.supportsFreeform === true,
           source: 'preflight' as const,
+          ...(discoveryFailed ? { refreshError: true } : {}),
         };
       }
-
-      if (list && attempt?.cacheable === false && !cached) {
-        writeDynamicModelProbeCacheTransientSuccess(cacheKey, list, commitNowMs);
-        writeDynamicModelProbeCacheError(cacheKey, commitNowMs);
-        const dynamic = list.availableModels.map((m) => ({
-          modelId: String(m.id),
-          label: String(m.name),
-          ...(typeof m.description === 'string' ? { description: m.description } : {}),
-        }));
-        const withDefault = [{ modelId: 'default', label: 'Default' }, ...dynamic.filter((m) => m.modelId !== 'default')];
-        const items = dedupeOpaqueModelCatalogItems(withDefault);
-
-        return {
-          agentId,
-          machineId,
-          items: limit ? items.slice(0, limit) : items,
-          supportsFreeform: list.supportsFreeform === true,
-          source: 'preflight' as const,
-        };
-      }
-
-      if (cached) {
-        if (cachedCanPersist) {
-          writeDynamicModelProbeCacheSuccess(cacheKey, cached, commitNowMs);
-        }
-        const dynamic = cached.availableModels.map((m) => ({
-          modelId: String(m.id),
-          label: String(m.name),
-          ...(typeof m.description === 'string' ? { description: m.description } : {}),
-        }));
-        const withDefault = [{ modelId: 'default', label: 'Default' }, ...dynamic.filter((m) => m.modelId !== 'default')];
-        const items = dedupeOpaqueModelCatalogItems(withDefault);
-
-        return {
-          agentId,
-          machineId,
-          items: limit ? items.slice(0, limit) : items,
-          supportsFreeform: cached.supportsFreeform === true,
-          source: 'preflight' as const,
-        };
-      }
-
-      writeDynamicModelProbeCacheError(cacheKey, commitNowMs);
     }
   }
 
@@ -322,5 +223,6 @@ export async function listAgentModelsForVoiceTool(params: Readonly<{
     items: limit ? items.slice(0, limit) : items,
     supportsFreeform: core.model.supportsFreeform === true,
     source: 'static' as const,
+    ...(discoveryFailed ? { refreshError: true } : {}),
   };
 }

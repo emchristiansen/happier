@@ -11,7 +11,7 @@ import { getProjectPath } from "./utils/path";
 import { getClaudeSystemPrompt } from "./utils/systemPrompt";
 import { restoreStdinBestEffort } from "@/ui/ink/restoreStdinBestEffort";
 import { isClaudeCliJavaScriptFile, resolveClaudeCliPath } from "./utils/resolveClaudeCliPath";
-import { stripNestedSessionDetectionEnv } from "@/utils/processEnv/stripNestedSessionDetectionEnv";
+import { prepareClaudeSubprocessEnv } from "@/backends/claude/spawn/buildClaudeSubprocessEnv";
 import { ensureClaudeJsRuntimeExecutable } from "./utils/ensureClaudeJsRuntimeExecutable";
 import { resolveClaudeConfigDirOverride } from "./utils/resolveClaudeConfigDirOverride";
 import { resolveClaudeConfigDirEnvOverlay } from "./utils/resolveClaudeConfigDirEnvOverlay";
@@ -21,9 +21,8 @@ import { resolveWindowsCommandInvocation, type CommandInvocation } from '@happie
 import { resolveCliRuntimeAssetPath } from '@/runtime/assets/resolveCliRuntimeAssetPath';
 import { HAPPIER_BASE_SYSTEM_PROMPT_V1 } from '@happier-dev/protocol';
 import { configuration } from '@/configuration';
-import { isolateClaudeRuntimeAuthEnv } from './spawn/isolateClaudeRuntimeAuthEnv';
+import { isNativeProcessExited, isProviderInLauncher } from '../../../scripts/native_process_exit.cjs';
 import { logClaudeRuntimeAuthEnvDiagnostic } from './spawn/logClaudeRuntimeAuthEnvDiagnostic';
-import { HAPPIER_SPAWN_EXPLICIT_ENV_KEYS_JSON_ENV_VAR } from '@/daemon/spawn/spawnExplicitEnvKeysMarker';
 import { claudeCliFlagCanConsumeNextArg } from './cli/flagArity';
 import {
     buildClaudePermissionModeLaunchSettings,
@@ -86,6 +85,7 @@ export async function claudeLocal(opts: {
     sessionId: string | null,
     path: string,
     onSessionFound: (id: string) => void,
+    onProcessExit?: (result: Readonly<{ providerStopped: boolean }>) => void,
     onThinkingChange?: (thinking: boolean) => void,
     onLifecycleGapDetected?: ((event: Readonly<{
         source: 'fd3_fetch_fallback',
@@ -112,6 +112,7 @@ export async function claudeLocal(opts: {
     /** Effective session prompt text for new sessions; falls back to Claude-specific provider behavior blocks. */
     systemPromptText?: string | null,
 }): Promise<string | null> {
+    if (opts.abort.aborted) return opts.sessionId;
 
     const processEnv = withCurrentHappierSessionId(process.env, opts.happierSessionId ?? '');
     const claudeConfigDir = resolveClaudeConfigDirOverride(processEnv);
@@ -425,19 +426,17 @@ export async function claudeLocal(opts: {
             // Note: Local mode uses global Claude installation with --session-id flag
             // Launcher only intercepts fetch for thinking state tracking
             const env = withCurrentHappierSessionId(
-                stripNestedSessionDetectionEnv({
-                    ...processEnv,
-                    // Keep behavior consistent with our wrapper script.
-                    DISABLE_AUTOUPDATER: '1',
-                    ...resolveClaudeConfigDirEnvOverlay(processEnv),
-                    ...(opts.envOverlay ?? {}),
+                prepareClaudeSubprocessEnv({
+                    baseEnv: processEnv,
+                    envOverlay: {
+                        // Keep behavior consistent with our wrapper script.
+                        DISABLE_AUTOUPDATER: '1',
+                        ...resolveClaudeConfigDirEnvOverlay(processEnv),
+                        ...(opts.envOverlay ?? {}),
+                    },
                 }),
                 opts.happierSessionId ?? '',
             );
-            isolateClaudeRuntimeAuthEnv(env);
-            // Internal daemon→CLI marker used for strict env filtering in Agent SDK remote mode.
-            // Never forward it into the Claude Code subprocess environment.
-            delete env[HAPPIER_SPAWN_EXPLICIT_ENV_KEYS_JSON_ENV_VAR];
             logClaudeRuntimeAuthEnvDiagnostic({
                 logPrefix: 'ClaudeLocal',
                 sessionId: opts.sessionId,
@@ -471,13 +470,29 @@ export async function claudeLocal(opts: {
                 ? { command: nodeExecutable!, args: [claudeCliPath, ...args] }
                 : resolveWindowsCommandInvocation({ command: resolvedClaudeCliPath, args, env });
 
+            // Runtime discovery and MCP materialization above can yield after cancellation.
+            if (opts.abort.aborted) {
+                r();
+                return;
+            }
             const child = spawn(invocation.command, invocation.args, {
-                stdio: shouldUseNodeLauncher ? ['inherit', 'inherit', 'inherit', 'pipe'] : ['inherit', 'inherit', 'inherit', 'ignore'],
+                stdio: shouldUseNodeLauncher ? ['inherit', 'inherit', 'inherit', 'pipe', 'ipc'] : ['inherit', 'inherit', 'inherit', 'ignore'],
                 cwd: opts.path,
                 env,
                 windowsHide: true,
                 ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
             });
+            let nativeExited = false;
+            let providerInLauncher = false;
+            if (shouldUseNodeLauncher) {
+                child.on('message', (message: unknown) => {
+                    if (isNativeProcessExited(message)) nativeExited = true;
+                    if (isProviderInLauncher(message)) providerInLauncher = true;
+                });
+            }
+            const processChannelClosed = shouldUseNodeLauncher && child.connected
+                ? new Promise<void>(resolve => { child.once('disconnect', resolve); })
+                : Promise.resolve();
 
             // Prefer a graceful shutdown path when the launcher is aborted (mode switching, UI takeover).
             // Node's `signal:` AbortSignal option would immediately SIGTERM the child; that can leave
@@ -606,10 +621,7 @@ export async function claudeLocal(opts: {
                     updateThinking(false);
                 });
             }
-            child.on('error', (error) => {
-                // Ignore
-            });
-            child.on('exit', (code, signal) => {
+            const cleanupAbort = () => {
                 if (abortListenerAttached) {
                     try {
                         opts.abort.removeEventListener('abort', abortListener);
@@ -619,24 +631,48 @@ export async function claudeLocal(opts: {
                     abortListenerAttached = false;
                 }
                 clearAbortTimers();
+            };
+            child.on('error', (error) => {
+                if (child.pid) {
+                    // A failed signal can emit an error for a running child. Keep owning it until exit.
+                    logger.infoFile('[ClaudeLocal] Child process error while awaiting exit', error);
+                    return;
+                }
+                // A failed spawn has no PID and need not emit exit.
+                cleanupAbort();
+                reject(error);
+            });
+            child.on('exit', async (code, signal) => {
+                cleanupAbort();
+                try {
+                    await processChannelClosed;
+                    const observedExit = Number.isInteger(code) || (typeof signal === 'string' && signal.length > 0);
+                    opts.onProcessExit?.({ providerStopped: nativeExited || (observedExit && (shouldUseNodeLauncher
+                        ? providerInLauncher
+                        : invocation.command === resolvedClaudeCliPath)) });
 
-                if (abortTeardownRequested) {
-                    // Normal termination due to programmatic abort teardown (switching modes / UI takeover).
-                    // Do not treat exit codes as fatal while aborting: vendor CLIs sometimes exit with non-zero
-                    // after SIGINT/SIGTERM even when shutdown is intentional.
-                    r();
-                } else if (signal) {
-                    reject(new Error(`Process terminated with signal: ${signal}`));
-                } else if (code !== 0 && code !== null) {
-                    // Non-zero exit code - propagate it
-                    reject(new ExitCodeError(code));
-                } else {
-                    r();
+                    if (abortTeardownRequested) {
+                        // Normal termination due to programmatic abort teardown (switching modes / UI takeover).
+                        // Do not treat exit codes as fatal while aborting: vendor CLIs sometimes exit with non-zero
+                        // after SIGINT/SIGTERM even when shutdown is intentional.
+                        r();
+                    } else if (signal) {
+                        reject(new Error(`Process terminated with signal: ${signal}`));
+                    } else if (code !== 0 && code !== null) {
+                        // Non-zero exit code - propagate it
+                        reject(new ExitCodeError(code));
+                    } else {
+                        r();
+                    }
+                } catch (error) {
+                    reject(error);
                 }
             });
         });
     } finally {
-        await materializedMcpConfig?.cleanup();
+        // File retirement is nonfatal to the completed provider outcome. Its owner
+        // records incomplete cleanup by default; do not mask an existing turn error.
+        await materializedMcpConfig?.cleanup().catch(() => undefined);
         process.stdin.resume();
         clearStopThinkingTimeout();
         activeFetchIds.clear();

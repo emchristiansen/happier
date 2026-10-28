@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createExpoRouterMock } from '@/dev/testkit/mocks/router';
 import { flushHookEffects, renderScreen } from '@/dev/testkit';
 import { installSessionRouteCommonModuleMocks } from './sessionRouteTestHelpers';
+import { measureScreenContentBottom, PublishBottomChromeHeight } from './testUtils/bottomChromeViewport';
+import { SessionCockpitChromeRegistryProvider } from '@/components/workspaceCockpit/session/SessionCockpitChromeRegistry';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -103,6 +105,21 @@ describe('session agent transcript route', () => {
                 scope: { kind: 'sidechain', sessionId: 'session-1', sidechainId: 'wf/a1' },
             }),
         );
+    });
+
+    it('keeps the imported transcript viewport above changing bottom chrome', async () => {
+        const render = (height: number) => (
+            <SessionCockpitChromeRegistryProvider>
+                <PublishBottomChromeHeight height={height} />
+                <SessionAgentTranscriptScreen />
+            </SessionCockpitChromeRegistryProvider>
+        );
+        const screen = await renderScreen(render(94));
+        for (const height of [94, 121, 0]) {
+            await screen.update(render(height));
+            const frame = screen.findByTestId('session-agent-transcript-screen')!;
+            expect(measureScreenContentBottom(frame.props.style, 700)).toBe(700 - height);
+        }
     });
 
     it('falls back to the invalid-link surface without a sidechain id and for a missing session', async () => {

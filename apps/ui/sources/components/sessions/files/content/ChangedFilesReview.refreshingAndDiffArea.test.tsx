@@ -2,6 +2,7 @@ import * as React from 'react';
 import { act } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Platform } from 'react-native';
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 import { flushHookEffects, pressTestInstance, pressTestInstanceAsync, renderScreen, standardCleanup } from '@/dev/testkit';
 import { installFilesContentCommonModuleMocks } from './filesContentTestHelpers';
 import { toTestIdSafeValue } from '@/utils/ui/toTestIdSafeValue';
@@ -1017,7 +1018,7 @@ describe('ChangedFilesReview', () => {
         await flushReviewEffects();
 
         expect(screen.findAllByType('CodeLinesView' as any).length).toBeGreaterThan(0);
-        expect(screen.findAllByType('ActivityIndicator' as any).length).toBe(0);
+        expect(screen.findAllByType(ActivitySpinner).length).toBe(0);
 
         await screen.update(await buildChangedFilesReviewElement({
             snapshot: { ...snapshot, fetchedAt: snapshot.fetchedAt + 1 },
@@ -1028,13 +1029,13 @@ describe('ChangedFilesReview', () => {
 
         // Effect starts a refresh but keeps previous diff visible (no loading spinner).
         expect(screen.findAllByType('CodeLinesView' as any).length).toBeGreaterThan(0);
-        expect(screen.findAllByType('ActivityIndicator' as any).length).toBe(0);
+        expect(screen.findAllByType(ActivitySpinner).length).toBe(0);
 
         await act(async () => {
             pendingRefreshResolve?.({ success: true, diff: buildUnifiedDiff('src/a.ts'), error: null });
         });
         await flushReviewEffects();
-        expect(screen.findAllByType('ActivityIndicator' as any).length).toBe(0);
+        expect(screen.findAllByType(ActivitySpinner).length).toBe(0);
         expect(screen.findAllByType('CodeLinesView' as any).length).toBeGreaterThan(0);
     });
 
@@ -1097,7 +1098,7 @@ describe('ChangedFilesReview', () => {
             await flushReviewEffects();
 
             expect(sessionScmDiffFileSpy).toHaveBeenCalledTimes(2);
-            expect(screen.findAllByType('ActivityIndicator' as any).length).toBe(0);
+            expect(screen.findAllByType(ActivitySpinner).length).toBe(0);
         } finally {
             nowSpy.mockRestore();
         }

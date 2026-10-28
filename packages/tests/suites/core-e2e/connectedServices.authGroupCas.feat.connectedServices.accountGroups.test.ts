@@ -353,7 +353,7 @@ describe('core e2e: connected-service auth group CAS', () => {
     });
     expect(readString(afterStaleRuntimeState, 'activeProfileId')).toBe('standby');
     expect(readNumber(afterStaleRuntimeState, 'generation')).toBe(2);
-    expect(afterStaleRuntimeState.state).toEqual({});
+    expect(afterStaleRuntimeState.state).toEqual(daemonBGroup.state);
   });
 
   it('publishes committed active-profile truth to both UI and daemon account projections', async () => {

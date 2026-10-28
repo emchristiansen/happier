@@ -15,6 +15,7 @@ import { useSessionRouteServerScope, type SessionRouteServerScope } from '@/hook
 import { useHydrateSessionForRoute } from '@/hooks/session/useHydrateSessionForRoute';
 import { useSessionRealtimeTranscriptConsumer } from '@/hooks/session/useSessionRealtimeTranscriptConsumer';
 import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
+import { useSessionCockpitBottomChromeHeight } from '@/components/workspaceCockpit/session/SessionCockpitChromeRegistry';
 import { isSessionRouteHydrationMissing } from '@/sync/domains/session/sessionRouteHydrationState';
 import {
     createSessionMessageDetailsStyles,
@@ -90,6 +91,7 @@ function SessionMessageRouteLoaded(props: {
     routeScope: SessionRouteServerScope;
 }) {
     const router = useRouter();
+    const bottomChromeHeight = useSessionCockpitBottomChromeHeight();
     const session = useSession(props.sessionId);
     const { isLoaded: messagesLoaded } = useSessionTranscriptIds(props.sessionId);
     const resolvedMessageId = useResolvedSessionMessageRouteId(props.sessionId, props.messageId);
@@ -254,7 +256,7 @@ function SessionMessageRouteLoaded(props: {
                     options={toolScreenOptions}
                 />
             )}
-            <View style={styles.routeContent}>
+            <View style={{ ...styles.routeContent, paddingBottom: bottomChromeHeight }}>
                 <Deferred>
                     <SessionMessageDetailsView
                         message={message}

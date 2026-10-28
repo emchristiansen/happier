@@ -116,7 +116,6 @@ vi.mock('react-native-unistyles', async () => {
         theme: {
             colors: {
                 surface: '#fff',
-                text: '#111',
                 textSecondary: '#666',
                 textLink: '#06f',
                 divider: '#ddd',
@@ -750,7 +749,19 @@ describe('MachinePathBrowserModal', () => {
         const confirmAfter = screen.findByTestId(PATH_BROWSER_CONFIRM_TEST_ID);
         expect(confirmAfter?.props.disabled).toBe(true);
 
-        await screen.pressByTestIdAsync('dropdown-option-create-folder');
+        const selectionFrames: FrameRequestCallback[] = [];
+        vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+            selectionFrames.push(callback);
+            return selectionFrames.length;
+        });
+        try {
+            act(() => screen.pressByTestId('dropdown-option-create-folder'));
+            expect(machineCreateDirectoryMock).not.toHaveBeenCalled();
+            act(() => selectionFrames.shift()?.(0));
+        } finally {
+            vi.unstubAllGlobals();
+        }
+        await flushHookEffects({ cycles: 2, turns: 2 });
 
         expect(machineCreateDirectoryMock).toHaveBeenCalledWith(
             'machine-1',
@@ -778,7 +789,19 @@ describe('MachinePathBrowserModal', () => {
         });
 
         await waitForTestId(screen, 'dropdown-option-create-folder');
-        await screen.pressByTestIdAsync('dropdown-option-create-folder');
+        const selectionFrames: FrameRequestCallback[] = [];
+        vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+            selectionFrames.push(callback);
+            return selectionFrames.length;
+        });
+        try {
+            act(() => screen.pressByTestId('dropdown-option-create-folder'));
+            expect(machineCreateDirectoryMock).not.toHaveBeenCalled();
+            act(() => selectionFrames.shift()?.(0));
+        } finally {
+            vi.unstubAllGlobals();
+        }
+        await flushHookEffects({ cycles: 2, turns: 2 });
 
         expect(machineCreateDirectoryMock).toHaveBeenCalledWith(
             'machine-1',

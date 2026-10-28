@@ -15,6 +15,7 @@ import type {
 import type { AgentState, Metadata, Session } from '@/api/types';
 import { configuration } from '@/configuration';
 import { createOfflineSessionStub } from '@/api/offline/offlineSessionStub';
+import { claimSessionRunnerOwnership } from '@/daemon/sessionRunnerLock';
 import { connectionState, startOfflineReconnection } from '@/api/offline/serverConnectionErrors';
 
 /**
@@ -103,6 +104,7 @@ export function setupOfflineReconnection(opts: SetupOfflineReconnectionOptions):
             onReconnected: async () => {
                 const resp = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
                 if (!resp) throw new Error('Server unavailable');
+                await claimSessionRunnerOwnership(resp.id);
                 const realSession = api.sessionSyncClient(
                     resp,
                     opts.runtimeActivity,

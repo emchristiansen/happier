@@ -12,7 +12,7 @@ describe('useSessionRowActionMenu', () => {
         standardCleanup();
     });
 
-    it('dispatches leading menu item selections before shared session actions', async () => {
+    it('dispatches contextual menu item selections through their owning handler', async () => {
         const session: SessionListRenderableSession = {
             id: 'session_1',
             active: false,
@@ -58,10 +58,9 @@ describe('useSessionRowActionMenu', () => {
             isNativeMobile: false,
             setContextMenuOpen: vi.fn(),
             openTagsMenuFromContext: vi.fn(),
-            deferredContextActionDelayMs: 0,
         }));
 
-        expect(hook.getCurrent().moreMenuItems.map((item) => item.id).at(0)).toBe('session.copyDebugInformation');
+        expect(hook.getCurrent().moreMenuItems.some((item) => item.id === 'session.copyDebugInformation')).toBe(true);
 
         await act(async () => {
             await hook.getCurrent().handleMoreMenuSelect('session.copyDebugInformation');

@@ -30,6 +30,7 @@ import { handleAuthCommand } from '../auth';
 import { handleDaemonCliCommand } from '../daemon';
 
 import { runRelayHostSubcommand } from './host';
+import { info } from '@happier-dev/cli-common/output';
 
 type RelaySetJsonResult = Readonly<{
   serverId: string;
@@ -299,7 +300,7 @@ async function cmdAuth(args: string[]): Promise<void> {
       ?? getReleaseRingPublicLabel(resolveManagedCliReleaseChannelSync({ processEnv: process.env, argv: process.argv }).ringId);
     throw new Error(await buildMissingLocalRelayError(targetChannel));
   }
-  console.log(chalk.cyan(`→ Using local ${match.channel} relay at ${match.url}`));
+  console.log(info(`Using local ${match.channel} relay at ${match.url}`));
 
   await cmdUse(['--local', ...rest.filter((a) => a !== '--local')], { silent: true });
 
@@ -318,7 +319,7 @@ async function cmdStartDaemon(args: string[]): Promise<void> {
       ?? getReleaseRingPublicLabel(resolveManagedCliReleaseChannelSync({ processEnv: process.env, argv: process.argv }).ringId);
     throw new Error(await buildMissingLocalRelayError(targetChannel));
   }
-  console.log(chalk.cyan(`→ Using local ${match.channel} relay at ${match.url}`));
+  console.log(info(`Using local ${match.channel} relay at ${match.url}`));
 
   await cmdUse(['--local', ...args.filter((a) => a !== '--local')], { silent: true });
 

@@ -16,6 +16,11 @@ const ConfiguredAcpBackendTargetSchema = z.object({
 export const BackendTargetRefSchema = z.union([BuiltInAgentTargetSchema, ConfiguredAcpBackendTargetSchema]);
 export type BackendTargetRefV1 = z.infer<typeof BackendTargetRefSchema>;
 
+/** The 0.2 catalog placeholder identifies transport; a configured target keeps its own reference. */
+export function matchesBackendTargetAgentId(target: BackendTargetRefV1, agentId: string): boolean {
+  return agentId === (target.kind === 'builtInAgent' ? target.agentId : 'customAcp');
+}
+
 export const BackendTargetKeySchema = z.string().regex(/^(agent|acpBackend):.+$/, 'Invalid backend target key');
 export type BackendTargetKey = z.infer<typeof BackendTargetKeySchema>;
 

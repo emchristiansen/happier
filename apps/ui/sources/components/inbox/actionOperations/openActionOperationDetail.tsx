@@ -105,6 +105,7 @@ export function openActionOperationDetail(operationId: string): string | null {
         const target = actionOperationReentry.resolve(operation);
         if (target.kind === 'origin') {
             target.open();
+            acknowledgeActionOperationPresented(operation);
             return null;
         }
         if (target.kind === 'new_session') {
@@ -118,6 +119,7 @@ export function openActionOperationDetail(operationId: string): string | null {
                     actionOperationId: target.operationId,
                 },
             } as never);
+            acknowledgeActionOperationPresented(operation);
             return null;
         }
         if (target.kind === 'session') {

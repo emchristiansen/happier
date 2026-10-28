@@ -9,10 +9,12 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { buildRollingReleaseEditArgs } from './lib/gh-release-commands.mjs';
-
-const DEFAULT_RELEASE_UPLOAD_RETRIES = 3;
-const DEFAULT_RELEASE_UPLOAD_RETRY_DELAY_MS = 2_000;
-const DEFAULT_RELEASE_TRANSFER_TIMEOUT_MS = 10 * 60_000;
+import {
+  downloadReleaseAssetWithRetry,
+  formatExecError,
+  isTransientReleaseTransferError,
+  resolveReleaseAssetTransferPolicy,
+} from './lib/release-asset-transfer.mjs';
 
 function fail(message) {
   console.error(message);
@@ -71,57 +73,11 @@ function parseBool(value, name) {
 }
 
 /**
- * @param {string} name
- * @param {number} defaultValue
- * @returns {number}
- */
-function readPositiveIntegerEnv(name, defaultValue) {
-  const raw = String(process.env[name] ?? '').trim();
-  if (!raw) return defaultValue;
-  const parsed = Number.parseInt(raw, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    fail(`${name} must be a positive integer (got: ${raw || '<empty>'})`);
-  }
-  return parsed;
-}
-
-/**
  * @param {number} ms
  */
 function sleepSync(ms) {
   const buf = new SharedArrayBuffer(4);
   Atomics.wait(new Int32Array(buf), 0, 0, ms);
-}
-
-/**
- * @param {unknown} err
- * @returns {string}
- */
-function formatExecError(err) {
-  if (err instanceof Error) {
-    const stderr = 'stderr' in err ? String(err.stderr ?? '') : '';
-    const stdout = 'stdout' in err ? String(err.stdout ?? '') : '';
-    return `${stderr}\n${stdout}\n${err.message}`;
-  }
-  return String(err);
-}
-
-/**
- * @param {unknown} err
- * @returns {boolean}
- */
-function isTransientReleaseTransferError(err) {
-  const raw = formatExecError(err);
-  return (
-    /release not found/i.test(raw)
-    || /404/i.test(raw)
-    || /ETIMEDOUT/i.test(raw)
-    || /ECONNRESET/i.test(raw)
-    || /connection reset by peer/i.test(raw)
-    || /socket hang up/i.test(raw)
-    || /Service Unavailable/i.test(raw)
-    || /\b50[234]\b/.test(raw)
-  );
 }
 
 /**
@@ -181,11 +137,14 @@ async function fileSha256(filePath) {
   return hash.digest('hex');
 }
 
-async function assertRemoteAssetMatches({ tag, repo, name, expectedPath, env, timeoutMs, retries, retryDelayMs }) {
+/** @param {{ tag: string; repo: string; name: string; expectedPath: string; env: Record<string, string>; policy: ReturnType<typeof resolveReleaseAssetTransferPolicy> }} input */
+async function assertRemoteAssetMatches({ tag, repo, name, expectedPath, env, policy }) {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'happier-immutable-release-audit-'));
   try {
-    for (let attempt = 1; attempt <= retries; attempt += 1) {
-      try {
+    await downloadReleaseAssetWithRetry({
+      name,
+      policy,
+      download: (timeoutMs) => {
         run('gh', [
           'release', 'download', tag,
           '--repo', repo,
@@ -193,15 +152,8 @@ async function assertRemoteAssetMatches({ tag, repo, name, expectedPath, env, ti
           '--dir', scratch,
           '--clobber',
         ], { env, timeoutMs });
-        break;
-      } catch (err) {
-        if (isTransientReleaseTransferError(err) && attempt < retries) {
-          sleepSync(retryDelayMs);
-          continue;
-        }
-        throw err;
-      }
-    }
+      },
+    });
     const downloadedPath = path.join(scratch, name);
     if (!fs.existsSync(downloadedPath)) {
       fail(`Immutable release audit did not download expected asset: ${name}`);
@@ -337,6 +289,48 @@ function ensureImmutableTagViaGithubApi(params) {
   return true;
 }
 
+/**
+ * Keep the GitHub Release object's target metadata aligned with its rolling tag.
+ * `gh release edit --target` cannot accept the raw commit SHA used by the release
+ * pipeline, so this exact-SHA mutation belongs at the same GitHub API boundary as
+ * the rolling tag update.
+ *
+ * @param {{ repo: string; tag: string; sha: string; env: Record<string, string>; dryRun: boolean }} params
+ */
+function updateRollingReleaseTargetViaGithubApi(params) {
+  const releaseId = run(
+    'gh',
+    ['api', `repos/${params.repo}/releases/tags/${params.tag}`, '--jq', '.id'],
+    { env: params.env, dryRun: params.dryRun },
+  ).trim();
+  if (!releaseId && !params.dryRun) {
+    fail(`GitHub Release ${params.tag} does not exist after it was created.`);
+  }
+
+  const targetReleaseId = releaseId || '{release-id}';
+  /** @type {unknown} */
+  let mutationError;
+  try {
+    run(
+      'gh',
+      ['api', '-X', 'PATCH', `repos/${params.repo}/releases/${targetReleaseId}`, '-f', `target_commitish=${params.sha}`],
+      { env: params.env, dryRun: params.dryRun },
+    );
+  } catch (error) {
+    mutationError = error;
+  }
+
+  if (params.dryRun) return;
+  const actualTarget = run(
+    'gh',
+    ['api', `repos/${params.repo}/releases/${targetReleaseId}`, '--jq', '.target_commitish'],
+    { env: params.env },
+  ).trim();
+  if (actualTarget === params.sha) return;
+  if (mutationError) throw mutationError;
+  fail(`GitHub Release ${params.tag} targets ${actualTarget || '<empty>'}, expected ${params.sha}.`);
+}
+
 async function main() {
   const { values } = parseArgs({
     options: {
@@ -370,6 +364,9 @@ async function main() {
   const generateNotes = parseBool(values['generate-notes'], '--generate-notes');
   const clobber = parseBool(values.clobber, '--clobber');
   const pruneAssets = parseBool(values['prune-assets'], '--prune-assets');
+  if (!rollingTag && (clobber || pruneAssets)) {
+    fail('Immutable version releases forbid --clobber true and --prune-assets true.');
+  }
   const notes = String(values.notes ?? '');
   const releaseMessage = String(values['release-message'] ?? '');
   const dryRun = values['dry-run'] === true;
@@ -386,18 +383,8 @@ async function main() {
   }
 
   const ghToken = String(process.env.GH_TOKEN ?? '').trim();
-  const uploadRetries = readPositiveIntegerEnv(
-    'HAPPIER_PIPELINE_GH_RELEASE_UPLOAD_RETRIES',
-    DEFAULT_RELEASE_UPLOAD_RETRIES,
-  );
-  const uploadRetryDelayMs = readPositiveIntegerEnv(
-    'HAPPIER_PIPELINE_GH_RELEASE_UPLOAD_RETRY_DELAY_MS',
-    DEFAULT_RELEASE_UPLOAD_RETRY_DELAY_MS,
-  );
-  const transferTimeoutMs = readPositiveIntegerEnv(
-    'HAPPIER_PIPELINE_GH_RELEASE_TRANSFER_TIMEOUT_MS',
-    DEFAULT_RELEASE_TRANSFER_TIMEOUT_MS,
-  );
+  const transferPolicy = resolveReleaseAssetTransferPolicy();
+  const { retries: uploadRetries, retryDelayMs: uploadRetryDelayMs, timeoutMs: transferTimeoutMs } = transferPolicy;
   /** @type {Record<string, string>} */
   const ghEnv = {};
   if (repo) ghEnv.GH_REPO = repo;
@@ -468,6 +455,13 @@ async function main() {
     releaseExists = false;
   }
 
+  let immutableDraft = !rollingTag;
+  if (!rollingTag && releaseExists && !dryRun) {
+    immutableDraft = parseBool(run('gh', [
+      'release', 'view', tag, '--repo', repo, '--json', 'isDraft', '--jq', '.isDraft',
+    ], { env: ghEnv }).trim(), 'GitHub Release isDraft');
+  }
+
   if (!releaseExists) {
     if (!tagEnsured && !dryRun) {
       fail(`Cannot create release ${tag}: tag ref could not be ensured.`);
@@ -475,7 +469,7 @@ async function main() {
     if (generateNotes && !approvedReleaseBody) {
       run(
         'gh',
-        ['release', 'create', tag, ...prereleaseFlag, '--title', title, '--generate-notes'],
+        ['release', 'create', tag, ...prereleaseFlag, ...(!rollingTag ? ['--draft'] : []), '--title', title, '--generate-notes'],
         { env: ghEnv, dryRun },
       );
     } else {
@@ -483,10 +477,14 @@ async function main() {
       if (!body) fail('notes or release_message is required when generate_notes=false');
       run(
         'gh',
-        ['release', 'create', tag, ...prereleaseFlag, '--title', title, '--notes', body],
+        ['release', 'create', tag, ...prereleaseFlag, ...(!rollingTag ? ['--draft'] : []), '--title', title, '--notes', body],
         { env: ghEnv, dryRun },
       );
     }
+  }
+
+  if (rollingTag && repo) {
+    updateRollingReleaseTargetViaGithubApi({ repo, tag, sha, env: ghEnv, dryRun });
   }
 
   // Update rolling release notes with commit summary.
@@ -563,9 +561,6 @@ async function main() {
   }
 
   if (!rollingTag) {
-    if (clobber || pruneAssets) {
-      fail('Immutable version releases forbid --clobber true and --prune-assets true.');
-    }
     const localByName = new Map();
     for (const spec of uploadSpecs) {
       const name = path.basename(spec);
@@ -587,6 +582,13 @@ async function main() {
     if (unexpected.length > 0) {
       fail(`Immutable release contains unexpected pre-existing asset(s): ${unexpected.join(', ')}`);
     }
+    const existing = new Set(existingAssetNames);
+    if (!immutableDraft) {
+      const missing = [...localByName.keys()].filter((name) => !existing.has(name));
+      if (missing.length > 0) {
+        fail(`Published immutable release is missing authorized asset(s): ${missing.join(', ')}. Refusing to mutate it.`);
+      }
+    }
     if (!dryRun) {
       for (const name of existingAssetNames) {
         await assertRemoteAssetMatches({
@@ -595,13 +597,10 @@ async function main() {
           name,
           expectedPath: /** @type {string} */ (localByName.get(name)),
           env: ghEnv,
-          timeoutMs: transferTimeoutMs,
-          retries: uploadRetries,
-          retryDelayMs: uploadRetryDelayMs,
+          policy: transferPolicy,
         });
       }
     }
-    const existing = new Set(existingAssetNames);
     for (const [name, spec] of localByName) {
       if (existing.has(name)) continue;
       let uploaded = false;
@@ -632,11 +631,13 @@ async function main() {
           name,
           expectedPath,
           env: ghEnv,
-          timeoutMs: transferTimeoutMs,
-          retries: uploadRetries,
-          retryDelayMs: uploadRetryDelayMs,
+          policy: transferPolicy,
         });
       }
+    }
+    // The complete asset set stays private until every remote byte has passed the audit.
+    if (immutableDraft) {
+      run('gh', ['release', 'edit', tag, '--repo', repo, '--draft=false'], { env: ghEnv, dryRun });
     }
     return;
   }

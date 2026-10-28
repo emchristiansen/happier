@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { createHappierMetaEnvelopeSchema } from '../structuredMessages/HappierMetaEnvelope.js';
 
 import { createSentFromSchema } from '../sentFrom.js';
 import { createSessionPermissionModeSchema } from '../sessionMetadata/sessionPermissionModes.js';
@@ -17,9 +18,16 @@ const SESSION_USER_MESSAGE_DELIVERY_INTENTS = new Set<SessionUserMessageDelivery
 ]);
 
 export const SESSION_USER_MESSAGE_DELIVERY_INTENT_META_KEY = 'happierDeliveryIntentV1';
+export const SESSION_TOOL_ANSWER_DELIVERY_KIND = 'tool-answer-delivery.v1';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+export function isSessionToolAnswerDeliveryMeta(meta: unknown): boolean {
+  if (!isRecord(meta)) return false;
+  const happier = meta.happier;
+  return isRecord(happier) && happier.kind === SESSION_TOOL_ANSWER_DELIVERY_KIND;
 }
 
 export function readSessionUserMessageDeliveryIntentMeta(
@@ -67,12 +75,7 @@ export function createSessionMessageMetaSchema(zod: typeof z) {
       allowedTools: zod.array(zod.string()).nullable().optional(),
       disallowedTools: zod.array(zod.string()).nullable().optional(),
       displayText: zod.string().optional(),
-      happier: zod
-        .object({
-          kind: zod.string(),
-          payload: zod.unknown(),
-        })
-        .optional(),
+      happier: createHappierMetaEnvelopeSchema(zod).optional(),
     })
     .passthrough();
 }

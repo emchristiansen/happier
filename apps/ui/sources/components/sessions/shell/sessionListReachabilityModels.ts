@@ -19,8 +19,16 @@ export type SessionListReachabilityModels = Readonly<{
 type SessionListReachabilityCacheEntry = Readonly<{
     display: SessionReachableDisplay;
     machineKey: string;
-    machinesById: Readonly<Record<string, MachineDisplayRenderable>>;
+    machineDisplaySignature: string;
     session: Extract<SessionListViewItem, { type: 'session' }>['session'];
+    workspaceLabelsV1: Readonly<Record<string, string>>;
+}>;
+
+type RetainedSessionListReachabilityModels = Readonly<{
+    entriesByKey: Map<string, SessionListReachabilityCacheEntry>;
+    machineDisplaySignature: string;
+    models: SessionListReachabilityModels;
+    previousKeys: readonly string[];
     workspaceLabelsV1: Readonly<Record<string, string>>;
 }>;
 
@@ -34,6 +42,29 @@ const EMPTY_REACHABILITY_MODELS: SessionListReachabilityModels = {
     reachableSessionDisplayByKey: new Map<string, SessionReachableDisplay>(),
     hasMultipleMachines: false,
 };
+
+// Phone navigation can remount the list while its retained item projection remains alive.
+// Keying the existing reachability cache by that owned projection lets the next hook instance
+// recover the same derived model without a second  O(all sessions) pass. Weak ownership keeps
+// the entry bounded by the retained list itself.
+const retainedReachabilityModelsByItems = new WeakMap<
+    ReadonlyArray<SessionListViewItem>,
+    RetainedSessionListReachabilityModels
+>();
+
+function areStringRecordsEqual(
+    previous: Readonly<Record<string, string>>,
+    next: Readonly<Record<string, string>>,
+): boolean {
+    if (previous === next) return true;
+    const previousKeys = Object.keys(previous);
+    const nextKeys = Object.keys(next);
+    if (previousKeys.length !== nextKeys.length) return false;
+    for (const key of previousKeys) {
+        if (previous[key] !== next[key]) return false;
+    }
+    return true;
+}
 
 export function createSessionListReachabilityModelsCache(): SessionListReachabilityModelsCache {
     return {
@@ -51,6 +82,18 @@ function resolveReachableDisplayRowKey(item: Extract<SessionListViewItem, { type
 
 function resolveMachineKey(display: SessionReachableDisplay): string {
     return display.machineId ?? display.machineLabel ?? '';
+}
+
+function buildReachabilityMachineDisplaySignature(machines: Readonly<Record<string, MachineDisplayRenderable>>): string {
+    // Display target resolution follows replacement links; workspace presentation reads
+    // names and home directories. Presence/heartbeat timestamps affect neither. Keep
+    // this cache key local to display derivation, not the machine's live status projection.
+    return JSON.stringify(Object.keys(machines).sort().map((key) => {
+        const machine = machines[key];
+        return [key, machine.id, machine.replacedByMachineId ?? null,
+            machine.metadata?.displayName ?? null, machine.metadata?.host ?? null,
+            machine.metadata?.homeDir ?? null];
+    }));
 }
 
 function buildSessionReachableDisplay(input: Readonly<{
@@ -87,17 +130,17 @@ function buildSessionReachableDisplay(input: Readonly<{
 function canReuseReachabilityEntry(input: Readonly<{
     cached: SessionListReachabilityCacheEntry | undefined;
     item: Extract<SessionListViewItem, { type: 'session' }>;
-    machinesById: Readonly<Record<string, MachineDisplayRenderable>>;
+    machineDisplaySignature: string;
     workspaceLabelsV1: Readonly<Record<string, string>>;
 }>): input is Readonly<{
     cached: SessionListReachabilityCacheEntry;
     item: Extract<SessionListViewItem, { type: 'session' }>;
-    machinesById: Readonly<Record<string, MachineDisplayRenderable>>;
+    machineDisplaySignature: string;
     workspaceLabelsV1: Readonly<Record<string, string>>;
 }> {
     return input.cached != null
         && input.cached.session === input.item.session
-        && input.cached.machinesById === input.machinesById
+        && input.cached.machineDisplaySignature === input.machineDisplaySignature
         && input.cached.workspaceLabelsV1 === input.workspaceLabelsV1;
 }
 
@@ -128,11 +171,25 @@ export function buildSessionListReachabilityModels(input: Readonly<{
     const items = input.items;
     if (!items || items.length === 0) {
         if (input.cache) {
-            input.cache.entriesByKey.clear();
+            input.cache.entriesByKey = new Map();
             input.cache.previousKeys = [];
             input.cache.previousModels = EMPTY_REACHABILITY_MODELS;
         }
         return EMPTY_REACHABILITY_MODELS;
+    }
+
+    const machineDisplaySignature = buildReachabilityMachineDisplaySignature(input.machinesById);
+    const retained = retainedReachabilityModelsByItems.get(items);
+    if (
+        input.cache
+        && retained
+        && retained.machineDisplaySignature === machineDisplaySignature
+        && areStringRecordsEqual(retained.workspaceLabelsV1, input.workspaceLabelsV1)
+    ) {
+        input.cache.entriesByKey = retained.entriesByKey;
+        input.cache.previousKeys = retained.previousKeys;
+        input.cache.previousModels = retained.models;
+        return retained.models;
     }
 
     const reachableSessionDisplayByKey = new Map<string, SessionReachableDisplay>();
@@ -147,7 +204,7 @@ export function buildSessionListReachabilityModels(input: Readonly<{
         const canReuse = canReuseReachabilityEntry({
             cached,
             item,
-            machinesById: input.machinesById,
+            machineDisplaySignature,
             workspaceLabelsV1: input.workspaceLabelsV1,
         });
         const entry: SessionListReachabilityCacheEntry = canReuse && cached
@@ -161,7 +218,7 @@ export function buildSessionListReachabilityModels(input: Readonly<{
                 return {
                     display: result.display,
                     machineKey: result.machineKey,
-                    machinesById: input.machinesById,
+                    machineDisplaySignature,
                     session: item.session,
                     workspaceLabelsV1: input.workspaceLabelsV1,
                 } satisfies SessionListReachabilityCacheEntry;
@@ -175,7 +232,7 @@ export function buildSessionListReachabilityModels(input: Readonly<{
 
     if (reachableSessionDisplayByKey.size === 0) {
         if (input.cache) {
-            input.cache.entriesByKey.clear();
+            input.cache.entriesByKey = new Map();
             input.cache.previousKeys = [];
             input.cache.previousModels = EMPTY_REACHABILITY_MODELS;
         }
@@ -203,6 +260,13 @@ export function buildSessionListReachabilityModels(input: Readonly<{
         if (nextCacheEntriesByKey) input.cache.entriesByKey = nextCacheEntriesByKey;
         input.cache.previousKeys = nextKeys;
         input.cache.previousModels = models;
+        retainedReachabilityModelsByItems.set(items, {
+            entriesByKey: input.cache.entriesByKey,
+            machineDisplaySignature,
+            models,
+            previousKeys: nextKeys,
+            workspaceLabelsV1: input.workspaceLabelsV1,
+        });
     }
 
     return models;

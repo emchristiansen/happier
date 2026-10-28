@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { DeferredApiSessionClient } from '@/agent/runtime/startup/DeferredApiSessionClient';
 import { resolveClaudeRemoteLaunchErrorDisposition } from './claudeRemoteLauncher';
 import { ClaudeResumeSessionUnavailableError } from './remote/sessionStartPlan';
+import { ClaudeNativeProviderExitUnverifiedError } from './sdk/types';
 
 describe('Claude remote launch error disposition', () => {
   it('does not surface an Agent SDK child exit after runtime termination has started', () => {
@@ -16,7 +17,44 @@ describe('Claude remote launch error disposition', () => {
     expect(resolveClaudeRemoteLaunchErrorDisposition({
       exitReason: null,
       runtimeTerminationStarted: false,
+      error: new Error('Ordinary provider failure'),
     })).toBe('surface');
+  });
+
+  it.each([
+    ['direct', Object.assign(new Error('Owned process termination could not be verified'), {
+      code: 'process_tree_termination_incomplete',
+    })],
+    ['wrapped', new AggregateError([
+      new Error('Provider runtime failed'),
+      Object.assign(new Error('Owned process termination could not be verified'), {
+        code: 'process_tree_termination_incomplete',
+      }),
+    ], 'Provider runtime failed with incomplete cleanup')],
+  ] as const)('stops replacement admission after %s owned cleanup failure, including mode switches', (_label, error) => {
+    for (const exitReason of [null, 'switch'] as const) {
+      expect(resolveClaudeRemoteLaunchErrorDisposition({
+        exitReason,
+        runtimeTerminationStarted: false,
+        error,
+      })).toBe('preserve-resume-and-exit');
+    }
+  });
+
+  it.each([
+    ['direct', new ClaudeNativeProviderExitUnverifiedError()],
+    ['wrapped', new AggregateError([
+      new Error('Provider runtime failed'),
+      new ClaudeNativeProviderExitUnverifiedError(),
+    ], 'Provider exit remains unverified')],
+  ] as const)('stops replacement admission after %s unverified native provider exit, including mode switches', (_label, error) => {
+    for (const exitReason of [null, 'switch'] as const) {
+      expect(resolveClaudeRemoteLaunchErrorDisposition({
+        exitReason,
+        runtimeTerminationStarted: false,
+        error,
+      })).toBe('preserve-resume-and-exit');
+    }
   });
 
   it('preserves launcher-owned switch and exit teardown', () => {

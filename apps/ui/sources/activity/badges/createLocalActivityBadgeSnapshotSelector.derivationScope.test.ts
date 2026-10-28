@@ -15,6 +15,7 @@ const SELECTOR_PARAMS = {
         showUnread: true,
         showPendingPermissionRequests: true,
         showPendingUserActionRequests: true,
+        showQueuedUserInput: true,
     },
 } as const;
 
@@ -161,7 +162,7 @@ describe('createLocalActivityBadgeSnapshotSelector derivation scope', () => {
         })).count).toBe(1);
     });
 
-    it('expires a stale runtime signal without an input change', () => {
+    it('keeps live pending attention without an input change past the runtime staleness window', () => {
         const observedAtMs = 1_000_000;
         const dateNow = vi.spyOn(Date, 'now').mockReturnValue(observedAtMs);
         const renderable = {
@@ -201,6 +202,6 @@ describe('createLocalActivityBadgeSnapshotSelector derivation scope', () => {
             sessionListRenderables: { 'pending-row': renderable },
             sessionMessages: { other: createSessionMessages(1) },
             delta,
-        })).count).toBe(0);
+        })).count).toBe(1);
     });
 });

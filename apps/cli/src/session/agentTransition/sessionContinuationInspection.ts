@@ -1,7 +1,12 @@
 import {
   type SessionAgentTransitionSelectionV1,
+  type SessionContinuationInspectionBatchRequestV1,
+  type SessionContinuationInspectionBatchResultV1,
   type SessionContinuationInspectionRequestV1,
   type SessionContinuationInspectionV1,
+  buildBackendTargetKey,
+  SessionAgentTransitionSelectionV1Schema,
+  type BackendTargetRefV1,
 } from '@happier-dev/protocol';
 import {
   resolveAgentNativeSpawnDefinitiveRejection,
@@ -11,6 +16,10 @@ import {
 
 import { isAuthenticationError } from '@/api/client/httpStatusError';
 import { CATALOG_AGENT_IDS } from '@/backends/types';
+import { resolveConfiguredAcpBackendFromAccountSettings } from '@/agent/acp/catalog/configured/resolveConfiguredAcpBackendFromAccountSettings';
+import { materializeConfiguredAcpEnvironment } from '@/agent/acp/catalog/configured/materializeConfiguredAcpEnvironment';
+import { getActiveAccountSettingsSnapshot } from '@/settings/accountSettings/activeAccountSettingsSnapshot';
+import { resolveSessionPersistedRuntimeIdentity } from '@/daemon/sessions/runtimeSnapshot/buildInactiveSessionResumeSpawnOptions';
 import type { Credentials } from '@/persistence';
 import { tryDecryptSessionMetadata } from '@/session/transport/encryption/sessionEncryptionContext';
 import { fetchSessionByIdCompat } from '@/session/transport/http/sessionsHttp';
@@ -62,7 +71,7 @@ export type SessionContinuationTargetSupport =
   | Readonly<{ type: 'unsupported'; code: 'same_target' | 'target_unavailable' }>;
 
 export type SessionContinuationTargetResolution =
-  | Readonly<{ type: 'resolved'; targetAgentId: AgentId }>
+  | Readonly<{ type: 'resolved'; targetAgentId: AgentId; backendTarget: BackendTargetRefV1 }>
   | Readonly<{ type: 'unavailable' }>;
 
 /**
@@ -79,7 +88,9 @@ export type SessionContinuationTargetResolution =
  */
 export function resolveSessionContinuationTargetAgent(
   selection: SessionAgentTransitionSelectionV1,
+  accountSettings: Readonly<Record<string, unknown>> | null = getActiveAccountSettingsSnapshot()?.settings ?? null,
 ): SessionContinuationTargetResolution {
+  if (!SessionAgentTransitionSelectionV1Schema.safeParse(selection).success) return { type: 'unavailable' };
   // `providerConnectionId` has no representation anywhere in this tree. The
   // contract requires an explicit rejection rather than a silent drop, because
   // silently dropping it would bind the target to the wrong account.
@@ -88,9 +99,19 @@ export function resolveSessionContinuationTargetAgent(
   const agentId = selection.agentId.trim();
   if (!(CATALOG_AGENT_IDS as readonly string[]).includes(agentId)) return { type: 'unavailable' };
   if (agentId === 'customAcp') {
-    // A configured ACP target's create/resume/context contract is unproven, so
-    // in-place switching to one is excluded in V1.
-    return { type: 'unavailable' };
+    const backendTarget = selection.backendTarget;
+    if (backendTarget?.kind !== 'configuredAcpBackend' || !accountSettings) return { type: 'unavailable' };
+    const backend = resolveConfiguredAcpBackendFromAccountSettings(accountSettings, backendTarget.backendId);
+    if (!backend
+      || (accountSettings.backendEnabledByTargetKey as Readonly<Record<string, unknown>> | undefined)?.[buildBackendTargetKey(backendTarget)] === false) {
+      return { type: 'unavailable' };
+    }
+    if ((selection.acpSessionModeId != null && backend.capabilities.supportsModes === 'no')
+      || (selection.modelId != null && selection.modelId !== 'default' && backend.capabilities.supportsModels === 'no')
+      || (selection.sessionConfigOptionOverrides != null && backend.capabilities.supportsConfigOptions === 'no')) {
+      return { type: 'unavailable' };
+    }
+    return { type: 'resolved', targetAgentId: 'customAcp', backendTarget };
   }
   const targetAgentId = agentId as AgentId;
   if (!resolveAgentNativeSpawnDefinitiveRejection({
@@ -99,7 +120,7 @@ export function resolveSessionContinuationTargetAgent(
   }).ok) {
     return { type: 'unavailable' };
   }
-  return { type: 'resolved', targetAgentId };
+  return { type: 'resolved', targetAgentId, backendTarget: { kind: 'builtInAgent', agentId: targetAgentId } };
 }
 
 /**
@@ -111,12 +132,15 @@ export function resolveSessionContinuationTargetAgent(
 export function evaluateSessionContinuationTargetSupport(params: Readonly<{
   selection: SessionAgentTransitionSelectionV1;
   sourceAgentId: string;
+  sourceBackendTarget?: BackendTargetRefV1;
+  accountSettings?: Readonly<Record<string, unknown>> | null;
 }>): SessionContinuationTargetSupport {
-  const resolved = resolveSessionContinuationTargetAgent(params.selection);
+  const resolved = resolveSessionContinuationTargetAgent(params.selection, params.accountSettings);
   if (resolved.type === 'unavailable') {
     return { type: 'unsupported', code: 'target_unavailable' };
   }
-  if (resolved.targetAgentId === params.sourceAgentId) {
+  const sourceBackendTarget = params.sourceBackendTarget ?? { kind: 'builtInAgent', agentId: params.sourceAgentId };
+  if (buildBackendTargetKey(resolved.backendTarget) === buildBackendTargetKey(sourceBackendTarget)) {
     return { type: 'unsupported', code: 'same_target' };
   }
   return { type: 'supported', targetAgentId: resolved.targetAgentId };
@@ -126,9 +150,28 @@ export async function inspectSessionContinuation(params: Readonly<{
   credentials: Credentials;
   request: SessionContinuationInspectionRequestV1;
 }>): Promise<SessionContinuationInspectionV1> {
+  const result = await inspectSessionContinuations({
+    credentials: params.credentials,
+    request: {
+      v: 1,
+      sourceSessionId: params.request.sourceSessionId,
+      selections: [params.request.selection],
+    },
+  });
+  return result.inspections[0] ?? { type: 'unavailable', reason: 'unsupported_session' };
+}
+
+type SessionContinuationSource =
+  | Readonly<{ type: 'available'; sourceAgentId: string; sourceBackendTarget: BackendTargetRefV1 }>
+  | Readonly<{ type: 'unavailable'; reason: 'unsupported_session' }>;
+
+async function loadSessionContinuationSource(params: Readonly<{
+  credentials: Credentials;
+  sourceSessionId: string;
+}>): Promise<SessionContinuationSource> {
   const rawSession = await fetchSessionByIdCompat({
     token: params.credentials.token,
-    sessionId: params.request.sourceSessionId,
+    sessionId: params.sourceSessionId,
   }).catch((error: unknown) => {
     if (isAuthenticationError(error)) throw error;
     return null;
@@ -145,6 +188,7 @@ export async function inspectSessionContinuation(params: Readonly<{
   const record = metadata as Record<string, unknown>;
   const workspacePath = typeof record.path === 'string' ? record.path.trim() : '';
   const sourceAgentId = resolveAgentIdFromSessionMetadata(record);
+  const sourceIdentity = resolveSessionPersistedRuntimeIdentity(record);
   // Deliberately NOT gated on the Session's recorded machine. A machine id is a
   // PROXY for "can this Session be continued here", and the components that
   // actually know already answer it: the stop owner finds no local process and
@@ -154,16 +198,23 @@ export async function inspectSessionContinuation(params: Readonly<{
   // directions — it refused a Session a user had legitimately moved to this
   // host, while still admitting a same-id Session whose vendor conversation was
   // long gone — so it removed real capability to prevent nothing.
-  const transitionableSession = Boolean(workspacePath)
-    && sourceAgentId !== null
-    && hasCanonicalHostedTranscript(record);
-  if (!transitionableSession) {
+  if (!workspacePath || !sourceAgentId || !sourceIdentity || !hasCanonicalHostedTranscript(record)) {
     return { type: 'unavailable', reason: 'unsupported_session' };
   }
 
+  return { type: 'available', sourceAgentId, sourceBackendTarget: sourceIdentity.backendTarget };
+}
+
+function inspectSessionContinuationSelection(params: Readonly<{
+  source: SessionContinuationSource;
+  selection: SessionAgentTransitionSelectionV1;
+}>): SessionContinuationInspectionV1 {
+  if (params.source.type === 'unavailable') return params.source;
+
   const support = evaluateSessionContinuationTargetSupport({
-    selection: params.request.selection,
-    sourceAgentId: sourceAgentId as string,
+    selection: params.selection,
+    sourceAgentId: params.source.sourceAgentId,
+    sourceBackendTarget: params.source.sourceBackendTarget,
   });
   if (support.type === 'unsupported' && support.code === 'target_unavailable') {
     return { type: 'unavailable', reason: 'target_unavailable' };
@@ -175,5 +226,32 @@ export async function inspectSessionContinuation(params: Readonly<{
     // `same_target` is reported as available-but-not-a-transition: the picker
     // shows the current Agent as selected rather than as an error.
     sameSessionTransition: support.type === 'supported',
+  };
+}
+
+export async function inspectSessionContinuations(params: Readonly<{
+  credentials: Credentials;
+  request: SessionContinuationInspectionBatchRequestV1;
+}>): Promise<SessionContinuationInspectionBatchResultV1> {
+  const source = await loadSessionContinuationSource({
+    credentials: params.credentials,
+    sourceSessionId: params.request.sourceSessionId,
+  });
+  const accountSettings = getActiveAccountSettingsSnapshot()?.settings ?? null;
+  return {
+    v: 1,
+    inspections: params.request.selections.map((selection) => {
+      if (source.type === 'unavailable') return source;
+      if (selection.backendTarget?.kind === 'configuredAcpBackend') {
+        const backend = accountSettings && resolveConfiguredAcpBackendFromAccountSettings(accountSettings, selection.backendTarget.backendId);
+        if (!backend || !accountSettings) return { type: 'unavailable', reason: 'target_unavailable' } as const;
+        try {
+          materializeConfiguredAcpEnvironment({ backend, accountSettings, credentials: params.credentials });
+        } catch {
+          return { type: 'unavailable', reason: 'target_unavailable' } as const;
+        }
+      }
+      return inspectSessionContinuationSelection({ source, selection });
+    }),
   };
 }

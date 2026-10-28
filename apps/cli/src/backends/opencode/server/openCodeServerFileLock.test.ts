@@ -16,13 +16,20 @@ async function pathExists(path: string): Promise<boolean> {
 }
 
 describe('withOpenCodeServerFileLock', () => {
-  it('defaults the lock timeout to the larger managed-server startup timeout when unset', () => {
+  it('defaults the lock timeout beyond the canonical managed-server startup deadline', () => {
     expect(resolveOpenCodeServerLockTimeoutMsFromEnv({
       HAPPIER_OPENCODE_SERVER_START_TIMEOUT_MS: '30000',
-    })).toBe(30_000);
+    })).toBe(35_000);
     expect(resolveOpenCodeServerLockTimeoutMsFromEnv({
-      HAPPIER_OPENCODE_SERVER_START_TIMEOUT_MS: '15000',
-    })).toBe(20_000);
+      HAPPIER_OPENCODE_SERVER_START_TIMEOUT_MS: '120000',
+    })).toBe(125_000);
+    expect(resolveOpenCodeServerLockTimeoutMsFromEnv({})).toBe(125_000);
+  });
+
+  it('honors explicit lock timeouts longer than the former 60 second cap', () => {
+    expect(resolveOpenCodeServerLockTimeoutMsFromEnv({
+      HAPPIER_OPENCODE_SERVER_LOCK_TIMEOUT_MS: '300000',
+    })).toBe(300_000);
   });
 
   it('removes a lock left behind by a dead pid and proceeds', async () => {

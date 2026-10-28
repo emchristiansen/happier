@@ -20,6 +20,7 @@ const readline = require('node:readline');
 const { createHash, randomUUID } = require('node:crypto');
 const { resolveClaudeProjectId } = require('../testkit/claudeProjectId.cjs');
 const {
+  fakeClaudeEchoResponseText,
   findArgValue,
   mergeMcpServers,
   parseHookForwarderCommand,
@@ -51,6 +52,7 @@ const inputFormat = findArgValue(argv, '--input-format');
 const isStreamJson = outputFormat === 'stream-json';
 const isSdkStreamJson = isStreamJson && inputFormat === 'stream-json';
 const hasPrint = argv.includes('--print');
+const replayUserMessages = argv.includes('--replay-user-messages');
 const mode = isSdkStreamJson ? 'sdk' : 'local';
 const scenario = process.env.HAPPIER_E2E_FAKE_CLAUDE_SCENARIO || process.env.HAPPY_E2E_FAKE_CLAUDE_SCENARIO || '';
 const localActiveTurnEnabled = ['1', 'true', 'yes'].includes(
@@ -148,11 +150,13 @@ function inspectNativeOauthContract() {
   const hasCredentialFile = fs.existsSync(credentialsPath);
   const hasAccessToken = typeof claudeAiOauth?.accessToken === 'string' && claudeAiOauth.accessToken.length > 0;
   const hasRefreshToken = typeof claudeAiOauth?.refreshToken === 'string' && claudeAiOauth.refreshToken.length > 0;
+  // Agent SDK auth leases intentionally materialize access-only native credentials.
+  const allowAccessOnly = process.env.HAPPIER_E2E_FAKE_CLAUDE_ALLOW_ACCESS_ONLY_NATIVE_OAUTH === '1';
   const ok =
     hasClaudeConfigDirEnv &&
     hasCredentialFile &&
     hasAccessToken &&
-    hasRefreshToken &&
+    (hasRefreshToken || allowAccessOnly) &&
     missingScopes.length === 0 &&
     !hasOauthEnvToken &&
     !hasSetupEnvToken;
@@ -459,6 +463,7 @@ safeAppendJsonl(logPath, {
   pid: process.pid,
   ts: Date.now(),
   cwd: process.cwd(),
+  claudeConfigDir: resolveClaudeConfigDir(),
   argv,
   mcpConfigs,
   mergedMcpServers,
@@ -825,8 +830,57 @@ async function runSdkStreamUntilEof() {
       emitSdk(createSystemInitMessage());
     }
 
+    // Like Claude, --replay-user-messages acknowledges the accepted stdin prompt by echoing
+    // its uuid on stdout; Happier settles the Pending prompt only on that acknowledgment.
+    if (replayUserMessages && typeof msg?.uuid === 'string') {
+      const echo = {
+        type: 'user',
+        message: msg.message,
+        parent_tool_use_id: null,
+        session_id: sessionId,
+        uuid: msg.uuid,
+        isReplay: true,
+      };
+      process.stdout.write(`${JSON.stringify(echo)}\n`);
+      safeAppendJsonl(logPath, { type: 'sdk_stdout', invocationId, ts: Date.now(), messageType: 'user', messageSubtype: 'replay' });
+    }
+
     const now = Date.now();
     turn += 1;
+
+    // Persist the first rejection in the existing log so a restarted SDK child
+    // accepts the continuation for the same provider session.
+    if (scenario === 'usage-limit-once') {
+      const previous = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '';
+      if (!previous.includes('"type":"sdk_usage_limit"')) {
+        const resetAtMs = now + Number(process.env.HAPPIER_E2E_FAKE_CLAUDE_RESET_DELAY_MS || '8000');
+        safeAppendJsonl(logPath, { type: 'sdk_usage_limit', invocationId, sessionId, resetAtMs, ts: now });
+        emitSdk({
+          type: 'rate_limit_event',
+          rate_limit_info: { status: 'rejected', rateLimitType: 'five_hour', resetsAt: resetAtMs / 1000, utilization: 1 },
+          uuid: randomUUID(),
+          session_id: sessionId,
+        });
+        // The failed parent result carries its own supported pipe-epoch reset evidence.
+        // The preceding availability event can describe an unrelated optional allowance.
+        const failureText = `Claude AI usage limit reached|${Math.floor(resetAtMs / 1000)}`;
+        emitSdk({ ...createResultSuccess(), subtype: 'error_during_execution', is_error: true, errors: [failureText], result: failureText });
+        continue;
+      }
+      const acceptSignal = process.env.HAPPIER_E2E_FAKE_CLAUDE_CONTINUATION_ACCEPT_SIGNAL;
+      // The recipe owns this phase's budget; do not leave a failed assertion's SDK child waiting forever.
+      const acceptTimeoutMs = Number(process.env.HAPPIER_E2E_FAKE_CLAUDE_CONTINUATION_ACCEPT_TIMEOUT_MS);
+      if (acceptSignal && (!Number.isFinite(acceptTimeoutMs) || acceptTimeoutMs <= 0)) {
+        throw new Error('continuation_accept_signal_timeout_not_configured');
+      }
+      const acceptDeadline = Date.now() + acceptTimeoutMs;
+      while (acceptSignal && !fs.existsSync(acceptSignal)) {
+        const remainingMs = acceptDeadline - Date.now();
+        if (remainingMs <= 0) throw new Error(`continuation_accept_signal_timeout:${acceptTimeoutMs}`);
+        await new Promise((resolveWait) => setTimeout(resolveWait, Math.min(20, remainingMs)));
+      }
+      safeAppendJsonl(logPath, { type: 'sdk_continuation_accepted', invocationId, sessionId, ts: Date.now() });
+    }
 
     if (scenario === 'runtime-activity-staged' && stagedRuntimeActivityTaskId === null) {
       stagedRuntimeActivityTaskId = `runtime_activity_${turn}`;
@@ -834,6 +888,8 @@ async function runSdkStreamUntilEof() {
         type: 'system',
         subtype: 'task_started',
         task_id: stagedRuntimeActivityTaskId,
+        task_type: 'local_agent',
+        is_backgrounded: true,
         status: 'running',
         description: 'staged runtime activity',
         uuid: randomUUID(),
@@ -1302,6 +1358,12 @@ async function runSdkStreamUntilEof() {
       ]);
 
       emitSdk(assistant);
+      emitSdk(createResultSuccess());
+      continue;
+    }
+
+    if (scenario === 'echo-user-text') {
+      emitSdk(createAssistantMessage([{ type: 'text', text: fakeClaudeEchoResponseText(promptText) }]));
       emitSdk(createResultSuccess());
       continue;
     }

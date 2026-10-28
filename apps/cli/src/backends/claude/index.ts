@@ -121,6 +121,8 @@ export const agent = {
       .hasClaudeEndpointDescriptorForSession(params),
   vendorResumeSupport: AGENTS_CORE.claude.resume.vendorResume,
   buildRuntimeLocalHandoffMetadata: buildClaudeRuntimeLocalHandoffMetadata,
+  resolveExistingSessionHandoffState: async (params) =>
+    await (await import('./sessionHandoff/resolveExistingSessionHandoffState')).resolveExistingClaudeSessionHandoffState(params),
   needsAccountSettingsForProbes: true,
   resolveModelsProbeVariant: ({ connectedServices }) => {
     const binding = connectedServices?.bindingsByServiceId?.['claude-subscription'];

@@ -22,12 +22,66 @@ vi.mock('@/agents/catalog/catalog', () => ({
     getAgentCore: () => ({ displayNameKey: 'agents.codex' }),
     getAgentBehavior: (agentId: string) => ({
         sessionUsage: {
-            supportsExactContextUsageBadge: agentId !== 'codex' && agentId !== 'gemini',
+            contextUsageBadge: agentId === 'gemini' ? 'hidden' : agentId === 'codex' ? 'reportedOnly' : 'derived',
         },
     }),
 }));
 
 describe('useAgentInputActionMenuControls', () => {
+    it('opens the collapsed Agent picker when Agent options are available', async () => {
+        const onAgentPickerIntent = vi.fn();
+        const hook = await renderHook(() => {
+            const controller = useAgentInputSelectionOverlayController({
+                shouldRenderSessionModeChip: false,
+                canChangePermission: false,
+                hasMachinePopover: false,
+                hasPathPopover: false,
+                hasResumePopover: false,
+                hasProfilePopover: false,
+                hasEnvVarsPopover: false,
+                hasAgentPickerOptions: true,
+                extraActionChips: [],
+            });
+            return {
+                ...controller,
+                ...useAgentInputActionMenuControls({
+                    showActionMenu: true,
+                    setShowActionMenu: vi.fn(),
+                    closeSelectionOverlay: controller.closeSelectionOverlay,
+                    openSelectionOverlay: controller.openSelectionOverlay,
+                    resetSelectionOverlays: controller.resetSelectionOverlays,
+                    inputRef: { current: { blur: vi.fn() } } as React.RefObject<{ blur?: () => void } | null>,
+                    hasAgentPickerOptions: true,
+                    onAgentPickerIntent,
+                    actionBarIsCollapsed: true,
+                    hasAnyActions: true,
+                    tint: '#fff',
+                    agentId: 'codex' as never,
+                    agentType: 'codex' as never,
+                    profileLabel: null,
+                    profileIcon: 'person-outline',
+                    openCollapsedOptionsPopover: () => {},
+                    sessionModeLabel: null,
+                    sessionModeChipInteraction: null,
+                    shouldExposeSessionModeAction: false,
+                    canStop: false,
+                    onStop: () => {},
+                    hasProfile: false,
+                    hasEnvVars: false,
+                    hasAgent: true,
+                }),
+            };
+        });
+
+        await act(async () => {
+            hook.getCurrent().actionMenuActions.find((action) => action.id === 'agent')?.onPress?.();
+        });
+
+        expect(hook.getCurrent().activeSelectionOverlay).toEqual({ id: 'agent', anchor: 'actionMenu' });
+        expect(onAgentPickerIntent).toHaveBeenCalledTimes(1);
+        await hook.unmount();
+    });
+
     it('opens the shared path popover from the collapsed action menu path item', async () => {
         const onPathClick = vi.fn();
 

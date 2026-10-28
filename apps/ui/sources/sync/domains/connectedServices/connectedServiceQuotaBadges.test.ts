@@ -54,6 +54,15 @@ describe('computeConnectedServiceQuotaSummaryBadges', () => {
     expect(badges[1]?.text).toBe('Session 90%');
   });
 
+  it('keeps an unavailable pinned meter nonnumeric even when it reports zero remaining', () => {
+    const snapshot: ConnectedServiceQuotaSnapshotV1 = { v: 1, serviceId: 'antigravity', profileId: 'work',
+      fetchedAt: 1, staleAfterMs: 1000, planLabel: null, accountLabel: null, meters: [{
+        meterId: 'disabled', label: 'Disabled', used: 100, limit: 100, remainingPct: 0,
+        unit: 'count', utilizationPct: 100, resetsAt: null, status: 'unavailable', details: {},
+      }] };
+    expect(computeConnectedServiceQuotaSummaryBadges({ snapshot, pinnedMeterIds: ['disabled'] }))
+      .toEqual([{ meterId: 'disabled', text: '—' }]);
+  });
   it('keeps a placeholder badge when a pinned meter is missing', () => {
     const snapshot: ConnectedServiceQuotaSnapshotV1 = {
       v: 1,

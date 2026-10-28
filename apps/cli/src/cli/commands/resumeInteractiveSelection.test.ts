@@ -5,7 +5,7 @@ import type { Credentials } from '@/persistence';
 import type { RawSessionListRow } from '@/session/transport/http/sessionsHttp';
 import { accountSettingsParse } from '@happier-dev/protocol';
 
-import { buildResumeSelectionModel, formatResumeSelectionFooter } from './resumeInteractiveSelection';
+import { buildContinueSelectionModel, buildResumeSelectionModel, formatResumeSelectionFooter } from './resumeInteractiveSelection';
 
 /**
  * Pin down the resume selector behaviour:
@@ -191,6 +191,60 @@ describe('buildResumeSelectionModel', () => {
     expect(model.rows).toHaveLength(0);
     expect(model.hint.ineligibleCount).toBe(0);
     expect(model.hint.resumableCount).toBe(0);
+  });
+});
+
+describe('buildContinueSelectionModel', () => {
+  it.each([true, false])('reconciles recent active=%s with the active feed without losing older running sessions or stopped eligibility', async (recentActive) => {
+    const { credentials, encryptionSecret } = buildLegacyCredentials();
+    const active = buildEncryptedSessionListRow({
+      sessionId: 'sid-active',
+      agentId: 'claude',
+      active: true,
+      encryptionSecret,
+      metadata: {
+        host: 'local-host',
+        machineId: 'machine-local',
+        path: '/p',
+        flavor: 'claude',
+        terminal: { mode: 'tmux', requested: 'tmux', tmux: { target: 'happy:active' } },
+      },
+    });
+    const stopped = buildEncryptedSessionListRow({
+      sessionId: 'sid-stopped',
+      agentId: 'claude',
+      active: false,
+      encryptionSecret,
+      metadata: { host: 'local-host', path: '/p', flavor: 'claude', claudeSessionId: 'vendor-id' },
+    });
+    const recentVersion = { ...active, active: recentActive };
+    const olderActive = { ...active, id: 'sid-older-active', updatedAt: active.updatedAt - 1000 };
+    const missingVendorId = buildEncryptedSessionListRow({
+      sessionId: 'sid-no-vendor-id',
+      agentId: 'claude',
+      active: false,
+      encryptionSecret,
+      metadata: { host: 'local-host', path: '/p', flavor: 'claude' },
+    });
+    const model = await buildContinueSelectionModel({
+      credentials,
+      accountSettings: accountSettingsParse({}),
+      currentMachineId: 'machine-local',
+      currentMachineHost: 'local-host',
+      fetchSessionsPageFn: async ({ activeOnly }) => ({
+        sessions: activeOnly ? [active, olderActive] : [recentVersion, stopped, missingVendorId],
+        nextCursor: null,
+        hasNext: false,
+      }),
+      readTerminalAttachmentInfoFn: async () => null,
+      isTmuxAvailableFn: async () => true,
+    });
+
+    expect(model.rows.map((row) => row.sessionId)).toEqual(['sid-active', 'sid-stopped', 'sid-older-active', 'sid-no-vendor-id']);
+    expect(model.rows.find((row) => row.sessionId === 'sid-active')).toMatchObject({ disabled: false, annotation: 'running' });
+    expect(model.rows.find((row) => row.sessionId === 'sid-stopped')).toMatchObject({ disabled: false, annotation: 'stopped' });
+    expect(model.rows.find((row) => row.sessionId === 'sid-no-vendor-id')).toMatchObject({ disabled: true });
+    expect(model.footerHint).toMatch(/1 session can't be resumed/i);
   });
 });
 

@@ -1,4 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
 
 import { createSessionMetadata } from './createSessionMetadata';
 import { HAPPIER_SESSION_CONNECTED_SERVICES_BINDINGS_ENV_KEY } from './sessionConnectedServicesBindingsEnv';
@@ -7,6 +9,36 @@ const HAPPIER_SESSION_CONNECTED_SERVICE_MATERIALIZATION_IDENTITY_ENV_KEY =
     'HAPPIER_SESSION_CONNECTED_SERVICE_MATERIALIZATION_IDENTITY_V1_JSON';
 
 describe('createSessionMetadata', () => {
+    it('captures only the non-secret native account directories for later resume', () => {
+        vi.stubEnv('CLAUDE_CONFIG_DIR', '/accounts/ambient');
+        try {
+            const nativeAgentEnvironment = { CLAUDE_CONFIG_DIR: '/accounts/claude-b',
+                ANTHROPIC_API_KEY: 'must-not-be-persisted' };
+            const { metadata } = createSessionMetadata({ flavor: 'claude', machineId: 'machine-1',
+                startedBy: 'terminal', nativeAgentEnvironment });
+            expect(metadata).toMatchObject({ nativeAgentEnvironmentV1: {
+                CLAUDE_CONFIG_DIR: '/accounts/claude-b',
+            } });
+            expect(Reflect.get(metadata, 'nativeAgentEnvironmentV1')).not.toHaveProperty('ANTHROPIC_API_KEY');
+            expect(createSessionMetadata({ flavor: 'codex', machineId: 'machine-1' }).metadata)
+                .not.toHaveProperty('nativeAgentEnvironmentV1');
+        } finally {
+            vi.unstubAllEnvs();
+        }
+    });
+
+    it('publishes the creating process generation alongside its PID for safe startup association', () => {
+        const fingerprint = readProcessInstanceFingerprintSync(process.pid);
+        expect(fingerprint).not.toBeNull();
+        const { metadata } = createSessionMetadata({
+            flavor: 'claude', machineId: 'machine-1', startedBy: 'daemon',
+        });
+        expect(metadata).toMatchObject({
+            hostPid: process.pid,
+            hostProcessInstanceFingerprint: fingerprint,
+        });
+    });
+
     it('does not seed legacy messageQueueV1 metadata', () => {
         const { metadata } = createSessionMetadata({
             flavor: 'claude',

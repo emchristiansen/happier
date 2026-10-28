@@ -1,134 +1,93 @@
 import * as React from 'react';
 import { Linking, Platform } from 'react-native';
-import { useRouter } from 'expo-router';
 
+import { desktopUpdater } from '@/desktop/updates/desktopUpdater';
 import { useDesktopUpdater } from '@/desktop/updates/useDesktopUpdater';
-import { useChangelog } from '@/hooks/inbox/useChangelog';
 import { useUpdates } from '@/hooks/inbox/useUpdates';
 import { useNativeUpdateStatus } from '@/hooks/ui/useNativeUpdate';
-import {
-    useReleaseNotesLauncher,
-    useReleaseNotesUnread,
-} from '@/changelog/releaseNotes';
-import { tLoose } from '@/text';
+import { t } from '@/text';
+import { isTauriDesktop } from '@/utils/platform/tauri';
 
-import { buildAppUpdateStatusModel } from './buildAppUpdateStatusModel';
+import { buildAppUpdateItem, type AppUpdateItemModel } from './items/buildAppUpdateItem';
 import { useWebUiDeploymentFreshness } from './useWebUiDeploymentFreshness';
 
-export function useAppUpdateStatus() {
-    const router = useRouter();
+export type AppUpdateStatus = Readonly<{
+    model: AppUpdateItemModel;
+    /** When the app's last successful check settled (ms); `null` when it has none to report. */
+    checkedAt: number | null;
+    /** Runs the row's action: Update (download), Restart to update, Retry, Reload, open the store. */
+    run: () => Promise<void>;
+    /** The explicit "Check for updates". */
+    checkNow: () => Promise<void>;
+    /** "Skip this version" — the desktop app only; keyed to the offered version. */
+    skipVersion: (() => void) | null;
+}>;
+
+/**
+ * The "This app" producer (R13 (e)): one classification (`buildAppUpdateItem`) over the app's
+ * update owners, each of which is a shared single-flight store — mounting this in several surfaces
+ * never starts a second check.
+ */
+export function useAppUpdateStatus(): AppUpdateStatus {
     const nativeUpdateStatus = useNativeUpdateStatus();
     const nativeUpdateUrl = nativeUpdateStatus?.updateUrl ?? null;
+    const nativeRequired = nativeUpdateStatus?.required === true;
     const desktop = useDesktopUpdater();
     const ota = useUpdates();
-    const changelog = useChangelog();
-    const releaseNotes = useReleaseNotesUnread();
-    const releaseNotesLauncher = useReleaseNotesLauncher();
     const webUi = useWebUiDeploymentFreshness();
+    const otaDownloadProgress = typeof ota.downloadProgress === 'number' ? ota.downloadProgress : null;
 
-    const model = React.useMemo(
-        () => buildAppUpdateStatusModel({
-            platformOs: Platform.OS,
-            nativeUpdateUrl,
-            nativeUpdateRequired: nativeUpdateStatus?.required === true,
-            nativeMinimumAppVersion: nativeUpdateStatus?.minimumAppVersion ?? null,
-            webUi: { updateAvailable: webUi.updateAvailable },
-            desktop: {
-                status: desktop.status,
-                availableVersion: desktop.availableVersion,
-                error: desktop.error,
-            },
-            ota: {
-                isUpdatePending: ota.isUpdatePending,
-            },
-            releaseNotes: {
-                hasUnread: releaseNotes.hasUnread,
-            },
-            changelog: {
-                hasUnread: changelog.hasUnread,
-            },
-            t: tLoose,
-        }),
-        [
-            changelog.hasUnread,
-            desktop.availableVersion,
-            desktop.error,
-            desktop.status,
-            nativeUpdateUrl,
-            nativeUpdateStatus?.required,
-            nativeUpdateStatus?.minimumAppVersion,
-            ota.isUpdatePending,
-            releaseNotes.hasUnread,
-            webUi.updateAvailable,
-        ],
-    );
-
-    const runPrimaryAction = React.useCallback(async () => {
-        if (!model.visible || model.actionDisabled) {
-            return;
-        }
-
-        if (model.kind === 'native-store') {
-            if (!nativeUpdateUrl) {
-                return;
-            }
-            const supported = await Linking.canOpenURL(nativeUpdateUrl);
-            if (supported) {
-                await Linking.openURL(nativeUpdateUrl);
-            }
-            return;
-        }
-
-        if (model.kind === 'desktop') {
-            if (desktop.status === 'error') {
-                await desktop.refresh();
-                return;
-            }
-            await desktop.startInstall();
-            return;
-        }
-
-        if (model.kind === 'web-ui') {
-            webUi.reload();
-            return;
-        }
-
-        if (model.kind === 'ota') {
-            await ota.reloadApp();
-            return;
-        }
-
-        if (model.kind === 'release-notes') {
-            const opened = releaseNotesLauncher.open();
-            if (opened) return;
-            // Fall through to changelog if the modal could not open (manifest gone, etc.)
-        }
-
-        router.push('/changelog');
-        setTimeout(() => {
-            changelog.markAsRead();
-        }, 1000);
-    }, [
-        changelog,
+    const model = React.useMemo(() => buildAppUpdateItem({
+        platformOs: Platform.OS,
+        desktopHost: isTauriDesktop(),
+        title: t('updates.thisAppTitle'),
+        native: { updateUrl: nativeUpdateUrl, required: nativeRequired },
+        webUiUpdateAvailable: webUi.updateAvailable,
         desktop,
-        model,
-        nativeUpdateUrl,
-        ota,
-        releaseNotesLauncher,
-        router,
-        webUi,
-    ]);
+        ota: {
+            isDownloading: ota.isDownloading === true,
+            downloadProgress: otaDownloadProgress,
+            isUpdatePending: ota.isUpdatePending === true,
+        },
+    }), [desktop, nativeRequired, nativeUpdateUrl, ota.isDownloading, ota.isUpdatePending, otaDownloadProgress, webUi.updateAvailable]);
 
-    const dismiss = React.useCallback(() => {
-        if (!model.visible || model.kind !== 'desktop') {
-            return;
+    const reloadOta = ota.reloadApp;
+    const checkOta = ota.checkForUpdates;
+    const reloadWeb = webUi.reload;
+    const run = React.useCallback(async () => {
+        const { channel, item } = model;
+        if (item.action.kind !== 'run') return;
+        switch (channel) {
+            case 'native-store': {
+                if (!nativeUpdateUrl) return;
+                if (await Linking.canOpenURL(nativeUpdateUrl)) await Linking.openURL(nativeUpdateUrl);
+                return;
+            }
+            case 'web-ui':
+                reloadWeb();
+                return;
+            case 'ota':
+                await reloadOta();
+                return;
+            case 'desktop':
+                if (item.action.verb === 'restart') return desktopUpdater.install();
+                if (item.action.verb === 'retry') return desktopUpdater.retry();
+                return desktopUpdater.download();
+            case 'none':
+                return;
         }
-        desktop.dismiss();
-    }, [desktop, model]);
+    }, [model, nativeUpdateUrl, reloadOta, reloadWeb]);
 
-    return {
+    const checkNow = React.useCallback(async () => {
+        await Promise.all([desktopUpdater.check({ force: true }), checkOta()]);
+    }, [checkOta]);
+
+    const skippable = model.channel === 'desktop' && model.item.state === 'available' && !model.item.skipped;
+    return React.useMemo(() => ({
         model,
-        runPrimaryAction,
-        dismiss,
-    };
+        checkedAt: desktop.checkedAt,
+        run,
+        checkNow,
+        skipVersion: skippable ? desktopUpdater.skipVersion : null,
+    }), [checkNow, desktop.checkedAt, model, run, skippable]);
 }

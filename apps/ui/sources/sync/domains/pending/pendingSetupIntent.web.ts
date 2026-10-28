@@ -1,7 +1,7 @@
 import { getActiveServerAccountScope } from '@/sync/domains/scope/activeServerAccountScope';
 import { serverAccountScopedStorageKey, type ServerAccountScope } from '@/sync/domains/scope/serverAccountScope';
 import { readStorageScopeFromEnv, scopedStorageId } from '@/utils/system/storageScope';
-import { fromRecord, toRecord, type PendingSetupIntent } from './pendingSetupIntent.shared';
+import { emitPendingSetupIntentChanged, fromRecord, fromSerializedRecord, toRecord, type PendingSetupIntent } from './pendingSetupIntent.shared';
 import {
     getActivePendingServerUrl,
     isPendingServerUrlActive,
@@ -31,8 +31,7 @@ function readRecord(storage: Storage, key: string): PendingSetupIntent | null {
     try {
         const raw = storage.getItem(key);
         if (!raw) return null;
-        const parsed = JSON.parse(raw) as unknown;
-        const record = fromRecord(parsed);
+        const record = fromSerializedRecord(raw);
         if (!record) {
             storage.removeItem(key);
             return null;
@@ -57,12 +56,13 @@ export function setPendingSetupIntent(value: PendingSetupIntent): void {
             storage.setItem(serverAccountScopedStorageKey(STORAGE_KEY_PREFIX, activeScope), JSON.stringify(record));
             const serverScopedKey = resolveActiveServerScopedKey();
             if (serverScopedKey) storage.removeItem(serverScopedKey);
-            return;
+        } else {
+            storage.setItem(pendingServerScopedKey(STORAGE_KEY_SERVER_PREFIX, serverUrl), JSON.stringify(record));
         }
-        storage.setItem(pendingServerScopedKey(STORAGE_KEY_SERVER_PREFIX, serverUrl), JSON.stringify(record));
     } catch {
         // ignore storage failures
     }
+    emitPendingSetupIntentChanged();
 }
 
 export function getPendingSetupIntent(): PendingSetupIntent | null {
@@ -90,14 +90,16 @@ export function clearPendingSetupIntent(): void {
             storage.removeItem(serverScopedKey);
         }
         const raw = storage.getItem(STORAGE_KEY);
-        if (!raw) return;
-        const record = fromRecord(JSON.parse(raw) as unknown);
-        if (!record || !record.relayUrl || isPendingServerUrlActive(record.relayUrl)) {
-            storage.removeItem(STORAGE_KEY);
+        if (raw) {
+            const record = fromRecord(JSON.parse(raw) as unknown);
+            if (!record || !record.relayUrl || isPendingServerUrlActive(record.relayUrl)) {
+                storage.removeItem(STORAGE_KEY);
+            }
         }
     } catch {
         // ignore storage failures
     }
+    emitPendingSetupIntentChanged();
 }
 
 export function migratePendingSetupIntentScopes(

@@ -26,8 +26,10 @@ type ToolContext = Readonly<{
 }>;
 
 export type CodexAppServerStreamUpdate =
+    | Readonly<{ type: 'provider-user-text'; itemId: string; clientId: string | null; text: string }>
     | Readonly<{ type: 'assistant-text-delta'; itemId: string; text: string }>
     | Readonly<{ type: 'assistant-text-final'; itemId: string; text: string }>
+    | Readonly<{ type: 'async-user-input-request'; itemId: string; text: string; questions: unknown[] }>
     | Readonly<{ type: 'assistant-raw-final'; itemId: string | null; text: string }>
     | Readonly<{ type: 'session-media'; itemId: string; media: SessionMediaSource[] }>
     | Readonly<{ type: 'reasoning-delta'; itemId: string; text: string }>
@@ -144,7 +146,7 @@ function readToolContextFromItem(item: RecordLike): ToolContext | null {
         return {
             toolKind: 'command',
             name: 'CodexBash',
-            input: omitKeys(item, ['id', 'itemId', 'type', 'itemType', 'stderr', 'stdout', 'exitCode', 'exit_code', 'status', 'success', 'error']),
+            input: omitKeys(item, ['id', 'itemId', 'type', 'itemType', 'stderr', 'stdout', 'aggregatedOutput', 'aggregated_output', 'exitCode', 'exit_code', 'durationMs', 'status', 'success', 'error']),
         };
     }
 
@@ -176,6 +178,9 @@ function readToolResultOutput(item: RecordLike, itemType: string | null, input?:
         ? Object.keys(input as RecordLike)
         : [];
     const output = omitKeys(item, ['id', 'itemId', 'type', 'itemType', ...inputKeys]);
+    if (itemType === 'commandexecution' && typeof output.aggregatedOutput === 'string') {
+        return { ...omitKeys(output, ['aggregatedOutput']), stdout: output.stdout ?? output.aggregatedOutput };
+    }
     return itemType === 'mcptoolcall' && 'result' in item ? extractMcpToolCallResultOutput(item.result) : output;
 }
 
@@ -247,6 +252,18 @@ export function createCodexAppServerStreamEventBridge(): Readonly<{
             if (notification.method === 'item/started') {
                 const item = readItem(params);
                 if (item) {
+                    if (readItemType(item) === 'usermessage') {
+                        const itemId = readItemId(item);
+                        const text = readCodexMessageContentText(item.content);
+                        if (itemId && text) {
+                            return [{
+                                type: 'provider-user-text',
+                                itemId,
+                                clientId: readString(item.clientId) ?? readString(item.client_id),
+                                text,
+                            }];
+                        }
+                    }
                     const reviewModeUpdate = readReviewModeUpdate(item, 'started');
                     if (reviewModeUpdate) return [reviewModeUpdate];
 
@@ -296,6 +313,10 @@ export function createCodexAppServerStreamEventBridge(): Readonly<{
 
             if (itemType === 'agentmessage' || itemType === 'plan') {
                 const text = readText(item, ['text', 'message']) ?? readCodexMessageContentText(item.content);
+                const questions = readQuestions(item);
+                if (itemType === 'agentmessage' && item.delivery === 'async' && questions && questions.length > 0) {
+                    return text ? [{ type: 'async-user-input-request', itemId, text, questions }] : [];
+                }
                 return text ? [{ type: 'assistant-text-final', itemId, text }] : [];
             }
 

@@ -90,13 +90,35 @@ class AnimatedValue {
     setValue(value: number) {
         this._value = value;
     }
-    interpolate() {
-        return this as any;
+    interpolate(config?: AnimatedInterpolationConfig): any {
+        return new AnimatedInterpolation(this, config);
     }
     __getValue() {
         return this._value;
     }
 }
+
+type AnimatedInterpolationConfig = Readonly<{ inputRange: readonly number[]; outputRange: readonly (number | string)[] }>;
+
+/** Reads its parent's value, and keeps what it maps so a test can see what drives a style. */
+class AnimatedInterpolation extends AnimatedValue {
+    constructor(readonly parent: AnimatedValue, readonly config: AnimatedInterpolationConfig | undefined) {
+        super(parent._value);
+    }
+    override __getValue() {
+        return this.parent.__getValue();
+    }
+}
+
+/**
+ * A native-driven loop as the stub sees it. Tests never tick frames, so what they CAN observe is
+ * which loops a component left running: started loops land here and stopped ones leave.
+ */
+export type AnimatedLoopMock = Readonly<{ animation: unknown }>;
+
+export const animatedLoops = new Set<AnimatedLoopMock>();
+
+type AnimationStub = { start: (cb?: (result: { finished: boolean }) => void) => void; stop: () => void };
 
 export const Animated = {
     Value: AnimatedValue as any,
@@ -115,11 +137,23 @@ export const Animated = {
             cb?.({ finished: true });
         },
     }),
+    sequence: (_steps: readonly AnimationStub[]): AnimationStub => ({
+        start: (cb) => cb?.({ finished: true }),
+        stop: () => {},
+    }),
+    loop: (animation: AnimationStub): AnimationStub => {
+        const handle: AnimatedLoopMock = { animation };
+        return {
+            start: () => { animatedLoops.add(handle); },
+            stop: () => { animatedLoops.delete(handle); },
+        };
+    },
     View: 'Animated.View' as any,
 } as const;
 
 export const Easing = {
     linear: () => 0,
+    ease: () => 0,
     bezier: () => () => 0,
     out: (fn: any) => fn,
     inOut: (fn: any) => fn,

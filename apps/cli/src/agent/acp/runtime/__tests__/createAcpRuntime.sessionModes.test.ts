@@ -572,7 +572,10 @@ describe('createAcpRuntime (session modes)', () => {
     expect(calls).toEqual(['start', 'config:mode:plan', 'drain']);
   });
 
-  it('applies explicit startup mode overrides before deferred pending queue drain', async () => {
+  it.each([
+    { provider: 'cursor', modeId: 'plan', expected: 'config:mode:plan' },
+    { provider: 'agy', modeId: 'auto_edit', expected: 'mode:auto_edit' },
+  ] as const)('applies $provider explicit startup mode overrides before deferred pending queue drain', async ({ provider, modeId, expected }) => {
     const calls: string[] = [];
     const backend = createFakeAcpRuntimeBackend({
       async startSession() {
@@ -582,13 +585,16 @@ describe('createAcpRuntime (session modes)', () => {
       async setSessionConfigOption(_sessionId: string, configId: string, value: unknown) {
         calls.push(`config:${configId}:${String(value)}`);
       },
+      async setSessionMode(_sessionId: string, value: string) {
+        calls.push(`mode:${value}`);
+      },
     });
     const { session } = createSessionClientWithMetadata({
       initialMetadata: createTestMetadata(),
     });
 
     const runtime = createAcpRuntime({
-      provider: 'cursor',
+      provider,
       directory: '/tmp',
       session,
       messageBuffer: new MessageBuffer(),
@@ -597,7 +603,7 @@ describe('createAcpRuntime (session modes)', () => {
       onThinkingChange: () => {},
       ensureBackend: async () => backend,
       startupOverrides: {
-        mode: { modeId: 'plan' },
+        mode: { modeId },
       },
       pendingQueue: {
         drainAfterStartOrLoad: true,
@@ -613,7 +619,7 @@ describe('createAcpRuntime (session modes)', () => {
     await runtime.startOrLoad({ deferPendingDrain: true });
     await runtime.drainPendingAfterStartOrLoad();
 
-    expect(calls).toEqual(['start', 'config:mode:plan', 'drain']);
+    expect(calls).toEqual(['start', expected, 'drain']);
   });
 
   it('rejects setSessionMode before the ACP runtime has started', async () => {

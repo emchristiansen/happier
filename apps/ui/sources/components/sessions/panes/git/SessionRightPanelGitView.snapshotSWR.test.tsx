@@ -36,7 +36,6 @@ installSessionDetailsPanelCommonModuleMocks({
                 dark: false,
                 colors: {
                     textSecondary: '#666',
-                    text: '#111',
                 },
             },
         });

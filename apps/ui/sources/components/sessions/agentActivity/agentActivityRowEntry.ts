@@ -27,6 +27,8 @@ export type AgentActivityRowEntry = Readonly<{
     /** Stable across recomputes; the handle every callback is keyed by. */
     id: string;
     status: AgentActivityStatusV1;
+    /** False means an available retained handle has no current work. */
+    isActive?: boolean;
     /** Raw producer title. Blank/whitespace falls back inside `resolveAgentActivityTitle`. */
     title: string;
     /**

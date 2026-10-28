@@ -528,6 +528,11 @@ test('monorepo port prints an actionable summary in non-json mode when patches f
 
   assert.ok(out.includes('port complete with failures'), `expected failure summary in stdout\n${out}`);
   assert.ok(out.includes('feat: update hello'), `expected failed patch subject in stdout\n${out}`);
+  // Piped output uses the canonical step printer's linear mode, one line per step state.
+  assert.match(out, /^- \[\.\.\] Formatting patches/m, `expected a running step line\n${out}`);
+  assert.match(out, /^- \[✓\] Formatted patches/m, `expected a completed step line\n${out}`);
+  assert.match(out, /^- \[x\] Applied patches into apps\/cli\/.*failed=1/m, `expected a failed apply step\n${out}`);
+  assert.ok(!out.includes('[monorepo] Formatting'), `expected no legacy progress prefix\n${out}`);
 });
 
 test('monorepo port works via bin/hstack.mjs entrypoint (CLI registry end-to-end)', async (t) => {

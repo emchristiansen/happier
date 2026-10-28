@@ -105,10 +105,7 @@ function shouldGuardMachineRpcDirectWithTransferPolicy(machineMethod: string): b
 async function resolveTransferPolicyAllowsMachineRpcDirect(sessionId: string): Promise<boolean> {
     try {
         const serverId = resolvePreferredServerIdForSessionId(sessionId);
-        const serverFeatures = await getReadyServerFeatures({
-            timeoutMs: 500,
-            serverId,
-        });
+        const serverFeatures = await getReadyServerFeatures({ serverId });
 
         // Fail closed for guarded methods: if we cannot evaluate policy, we must not attempt
         // `machine_rpc_direct` and risk bypassing server transfer restrictions.

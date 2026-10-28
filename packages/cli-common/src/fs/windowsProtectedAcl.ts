@@ -49,7 +49,12 @@ const WINDOWS_ACL_COMMAND_PATHS = Object.freeze({
   'icacls.exe': ['icacls.exe'],
   'powershell.exe': ['WindowsPowerShell', 'v1.0', 'powershell.exe'],
 } satisfies Readonly<Record<string, readonly string[]>>);
+const WINDOWS_ACL_POWERSHELL_ERROR_POLICY = [
+  '$ErrorActionPreference = "Stop"',
+  'trap { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }',
+].join('\n');
 const WINDOWS_ACL_INSPECTION_SCRIPT = [
+  WINDOWS_ACL_POWERSHELL_ERROR_POLICY,
   '& {',
   'param([string]$Path)',
   '$acl = Get-Acl -LiteralPath $Path -ErrorAction Stop',
@@ -69,6 +74,17 @@ const WINDOWS_ACL_INSPECTION_SCRIPT = [
   '  rules = $rules',
   '} | ConvertTo-Json -Depth 5 -Compress',
   '} ',
+].join('\n');
+const WINDOWS_ACL_APPLY_SCRIPT = [
+  WINDOWS_ACL_POWERSHELL_ERROR_POLICY,
+  '& {',
+  'param([string]$Path, [string]$Sid, [string]$SystemSid, [string]$Kind)',
+  '$acl = Get-Acl -LiteralPath $Path -ErrorAction Stop',
+  '$inheritance = if ($Kind -eq "directory") { "OICI" } else { "" }',
+  '$sddl = "D:P(A;$inheritance;FA;;;$Sid)(A;$inheritance;FA;;;$SystemSid)"',
+  '$acl.SetSecurityDescriptorSddlForm($sddl, [System.Security.AccessControl.AccessControlSections]::Access)',
+  'Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop',
+  '}',
 ].join('\n');
 
 function readEnvironmentValueCaseInsensitive(env: NodeJS.ProcessEnv, name: string): string | null {
@@ -107,11 +123,20 @@ function commandFailure(command: string, result: WindowsProtectedAclCommandResul
   );
 }
 
+function resolveWindowsProtectedAclCommandEnvironment(command: string, nativeCommand: string): NodeJS.ProcessEnv | undefined {
+  if (command !== 'powershell.exe') return undefined;
+  // Both command runners must load modules from the selected Windows
+  // PowerShell installation, regardless of the launching shell's version.
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'psmodulepath'));
+  return { ...env, PSModulePath: win32.join(win32.dirname(nativeCommand), 'Modules') };
+}
+
 function defaultRunCommand(command: string, args: readonly string[]): Promise<WindowsProtectedAclCommandResult> {
   const nativeCommand = resolveWindowsProtectedAclCommand(command);
   return new Promise((resolve, reject) => {
     execFile(nativeCommand, [...args], {
       encoding: 'utf8',
+      env: resolveWindowsProtectedAclCommandEnvironment(command, nativeCommand),
       windowsHide: true,
       maxBuffer: 1024 * 1024,
     }, (error, stdout, stderr) => {
@@ -132,6 +157,7 @@ function defaultRunCommandSync(command: string, args: readonly string[]): Window
   const nativeCommand = resolveWindowsProtectedAclCommand(command);
   const result = spawnSync(nativeCommand, [...args], {
     encoding: 'utf8',
+    env: resolveWindowsProtectedAclCommandEnvironment(command, nativeCommand),
     windowsHide: true,
     maxBuffer: 1024 * 1024,
   });
@@ -153,12 +179,12 @@ function parseCurrentUserSid(stdout: string): string {
   return match[0];
 }
 
-function parseWindowsAclSnapshot(stdout: string): WindowsAclSnapshot {
+function parseWindowsAclSnapshot(result: WindowsProtectedAclCommandResult): WindowsAclSnapshot {
   let value: unknown;
   try {
-    value = JSON.parse(stdout);
+    value = JSON.parse(result.stdout);
   } catch {
-    throw new Error('Windows protected ACL verification returned invalid JSON');
+    throw new Error(`Windows protected ACL verification returned invalid JSON (stderr ${JSON.stringify(summarizeCommandStderr(result.stderr))})`);
   }
   if (typeof value !== 'object' || value === null) {
     throw new Error('Windows protected ACL verification returned an invalid snapshot');
@@ -187,11 +213,12 @@ function parseWindowsAclSnapshot(stdout: string): WindowsAclSnapshot {
   return candidate as WindowsAclSnapshot;
 }
 
-function verifyWindowsAclSnapshot(snapshot: WindowsAclSnapshot, currentUserSid: string): void {
+function verifyWindowsAclSnapshot(snapshot: WindowsAclSnapshot, currentUserSid: string, path: string): void {
   if (snapshot.ownerSid !== currentUserSid) throw new Error('Windows protected path has an unexpected owner SID');
   if (!snapshot.protected) throw new Error('Windows protected path still inherits ACL entries');
   if (snapshot.reparsePoint) throw new Error('Windows protected path must not be a reparse point');
-  if (snapshot.rules.length !== 2) throw new Error('Windows protected path has unexpected ACL entries');
+  const details = `path=${JSON.stringify(path)}, rules=${JSON.stringify(snapshot.rules)}`;
+  if (snapshot.rules.length !== 2) throw new Error(`Windows protected path has unexpected ACL entries (${details})`);
 
   const expectedSids = new Set([currentUserSid, LOCAL_SYSTEM_SID]);
   for (const rule of snapshot.rules) {
@@ -201,21 +228,14 @@ function verifyWindowsAclSnapshot(snapshot: WindowsAclSnapshot, currentUserSid: 
       || rule.inherited
       || rule.rights !== 'FullControl'
     ) {
-      throw new Error('Windows protected path has an unsafe ACL entry');
+      throw new Error(`Windows protected path has an unsafe ACL entry (${details})`);
     }
   }
-  if (expectedSids.size !== 0) throw new Error('Windows protected path is missing a required ACL entry');
+  if (expectedSids.size !== 0) throw new Error(`Windows protected path is missing a required ACL entry (${details})`);
 }
 
 function applyArgs(input: Readonly<{ path: string; kind: WindowsProtectedPathKind }>, sid: string): string[] {
-  const inheritance = input.kind === 'directory' ? '(OI)(CI)' : '';
-  return [
-    input.path,
-    '/inheritancelevel:r',
-    '/grant:r',
-    `*${sid}:${inheritance}F`,
-    `*${LOCAL_SYSTEM_SID}:${inheritance}F`,
-  ];
+  return ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_ACL_APPLY_SCRIPT, input.path, sid, LOCAL_SYSTEM_SID, input.kind];
 }
 
 function inspectionArgs(path: string): string[] {
@@ -237,13 +257,13 @@ export function createWindowsProtectedAclBoundary(params: Readonly<{
   const verify = async (input: Readonly<{ path: string; kind: WindowsProtectedPathKind }>) => {
     const sid = await resolveSid();
     const result = await runChecked('powershell.exe', inspectionArgs(input.path));
-    verifyWindowsAclSnapshot(parseWindowsAclSnapshot(result.stdout), sid);
+    verifyWindowsAclSnapshot(parseWindowsAclSnapshot(result), sid, input.path);
   };
   return Object.freeze({
     async applyAndVerify(input) {
       const sid = await resolveSid();
       await runChecked('icacls.exe', [input.path, '/setowner', `*${sid}`]);
-      await runChecked('icacls.exe', applyArgs(input, sid));
+      await runChecked('powershell.exe', applyArgs(input, sid));
       await verify(input);
     },
     verify,
@@ -266,13 +286,13 @@ export function createWindowsProtectedAclBoundarySync(params: Readonly<{
   const verify = (input: Readonly<{ path: string; kind: WindowsProtectedPathKind }>) => {
     const sid = resolveSid();
     const result = runChecked('powershell.exe', inspectionArgs(input.path));
-    verifyWindowsAclSnapshot(parseWindowsAclSnapshot(result.stdout), sid);
+    verifyWindowsAclSnapshot(parseWindowsAclSnapshot(result), sid, input.path);
   };
   return Object.freeze({
     applyAndVerify(input) {
       const sid = resolveSid();
       runChecked('icacls.exe', [input.path, '/setowner', `*${sid}`]);
-      runChecked('icacls.exe', applyArgs(input, sid));
+      runChecked('powershell.exe', applyArgs(input, sid));
       verify(input);
     },
     verify,

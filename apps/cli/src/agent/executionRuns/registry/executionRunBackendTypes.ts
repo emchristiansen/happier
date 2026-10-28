@@ -1,4 +1,4 @@
-import type { AgentBackend } from '@/agent/core/AgentBackend';
+import type { AgentBackend, McpServerConfig } from '@/agent/core/AgentBackend';
 import type { AcpPermissionHandler } from '@/agent/acp/AcpBackend';
 import type { AcpConfigOptionOverridesV1 } from '@happier-dev/protocol';
 
@@ -25,6 +25,8 @@ export type ExecutionRunBackendFactoryOptions = Readonly<{
   sessionConfigOptionOverrides?: AcpConfigOptionOverridesV1;
   permissionMode: string;
   accountSettings?: Readonly<Record<string, unknown>> | null;
+  /** Lazily resolves the run's canonical, memoized Happier MCP server set. */
+  resolveMcpServers?: () => Promise<Record<string, McpServerConfig>>;
   permissionHandler: AcpPermissionHandler;
   start?: ExecutionRunBackendStartContext | null;
   isolation?: ExecutionRunBackendIsolation;

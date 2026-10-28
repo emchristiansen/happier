@@ -4,6 +4,7 @@ import { Platform, useWindowDimensions } from 'react-native';
 import { resolveMultiPaneDeviceType } from '@/components/appShell/panes/layout/resolveMultiPaneDeviceType';
 import { useLocalSetting } from '@/sync/domains/state/storage';
 import { useDeviceType } from '@/utils/platform/responsive';
+import { usePaneContentWidth } from '@/components/appShell/panes/PaneActionRailContext';
 
 import {
     canLayoutDockSessionPane,
@@ -25,7 +26,9 @@ import {
  * One reading, used in both directions.
  */
 export function useSessionOpenLayout(): SessionOpenLayout {
-    const { width: containerWidthPx } = useWindowDimensions();
+    const { width: windowWidthPx } = useWindowDimensions();
+    const paneContentWidthPx = usePaneContentWidth();
+    const containerWidthPx = paneContentWidthPx ?? windowWidthPx;
     const rawDeviceType = useDeviceType();
     // `AppPaneScopeHost` — the authority that decides whether a pane is drawn at all — treats web as
     // `tablet` so a narrow browser window still gets overlay panes.

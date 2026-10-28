@@ -188,6 +188,8 @@ export type RuntimeAuthRecoverySchedulerDeps = Readonly<{
   }>) => Promise<unknown>;
   readLimitResetCustomResumePrompt?: () => string | null;
   retryAfterLimitReset?: (input: RuntimeAuthLimitResetRetryInput) => Promise<RuntimeAuthLimitResetRetryResult>;
+  /** Compatibility for callers without the durable exact-trial retry owner. */
+  continueAfterUsageLimitReset?: (intent: RuntimeAuthRecoveryIntent) => Promise<unknown>;
   gate?: (input: Readonly<{ sessionId: string; intent: RuntimeAuthRecoveryIntent }>) => DurableRecoveryGateResult;
   recordDiagnostic?: (event: RuntimeAuthRecoveryDiagnostic) => void;
   durableStore?: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent>;
@@ -223,6 +225,7 @@ const DEFAULT_RUNTIME_AUTH_RECOVERY_DEGRADED_BACKOFF_MS = 60_000;
 const DEFAULT_RUNTIME_AUTH_RECOVERY_MAX_COALESCED_REPLAYS = 12;
 const RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR = 'recovery_unproven_awaiting_provider_outcome';
 const RUNTIME_AUTH_LIMIT_RESET_RETRY_CLAIMED = 'limit_reset_retry_claimed';
+const USAGE_LIMIT_CONTINUATION_PROOF_WAIT_ERROR = 'usage_limit_continuation_awaiting_provider_outcome';
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === 'object' && value !== null;
@@ -969,7 +972,9 @@ function hasExplicitRuntimeAuthRecoveryEpochChange(
     && previousSourceKey.length > 0
     && typeof nextSourceKey === 'string'
     && nextSourceKey.length > 0
-    && previousSourceKey !== nextSourceKey;
+    && previousSourceKey !== nextSourceKey
+    || Boolean(next.classification.runtimeIssueFingerprint
+      && previous.classification.runtimeIssueFingerprint !== next.classification.runtimeIssueFingerprint);
 }
 
 function mergeRuntimeAuthRecoveryIntent(
@@ -1010,11 +1015,21 @@ function mergeRuntimeAuthRecoveryIntent(
     && (incoming.classification.kind === 'usage_limit' || incoming.classification.kind === 'rate_limit')
     ? { ...incomingWithTrial, limitResetRetryCount: Math.max(previous.limitResetRetryCount, incoming.limitResetRetryCount ?? 0) }
     : incomingWithTrial;
-  const sameEvidence = hasSameRuntimeAuthRecoveryEvidence(previous, next);
+  // Older observations cannot erase a current accepted issue association.
+  const classification = previous.classification.runtimeIssueFingerprint
+    && !next.classification.runtimeIssueFingerprint
+    && isSameRuntimeFailureClassification(
+      { ...previous.classification, runtimeIssueFingerprint: undefined },
+      { ...next.classification, runtimeIssueFingerprint: undefined },
+    )
+    ? { ...next.classification, runtimeIssueFingerprint: previous.classification.runtimeIssueFingerprint }
+    : next.classification;
+  const sameEvidence = hasSameRuntimeAuthRecoveryEvidence(previous, { ...next, classification });
   if (!sameEvidence && hasExplicitRuntimeAuthRecoveryEpochChange(previous, next)) return next;
   if (!sameEvidence && previous.status !== 'checking' && previous.status !== 'resumed_awaiting_proof') return next;
   return {
     ...next,
+    classification,
     v: 2,
     attemptId: previous.attemptId ?? next.attemptId,
     // This merge branch retains the previous attempt identity. Its resolved
@@ -1100,6 +1115,8 @@ function isSameRuntimeFailureClassification(
     && left.sourceKey === right.sourceKey
     && left.providerAccountUsageRecordId === right.providerAccountUsageRecordId
     && left.sourceProviderAccountId === right.sourceProviderAccountId
+    && left.runtimeIssueFingerprint === right.runtimeIssueFingerprint
+    && left.sourceProviderOrganizationId === right.sourceProviderOrganizationId
     && left.failingAccessTokenFingerprint === right.failingAccessTokenFingerprint
     && left.planType === right.planType
     && left.source === right.source;
@@ -1323,6 +1340,18 @@ export class RuntimeAuthRecoveryScheduler {
       && deps.providerOutcomePendingWaitMs > 0
       ? Math.trunc(deps.providerOutcomePendingWaitMs)
       : null;
+    const canContinueProfileLimit = (intent: RuntimeAuthRecoveryIntent): boolean => {
+      const resetAtMs = intent.classification.resetsAtMs;
+      return !deps.retryAfterLimitReset && Boolean(deps.continueAfterUsageLimitReset)
+        && intent.groupId === null && intent.classification.kind === 'usage_limit'
+        && typeof resetAtMs === 'number' && Number.isFinite(resetAtMs)
+        && resetAtMs <= deps.nowMs();
+    };
+    // A due profile continuation keeps its own bounded admission/proof lifecycle.
+    // Observing a generic repair's proof must not suppress that first admission or
+    // replace an admitted continuation's existing retry deadline.
+    const observeProofWithoutRecovery = (intent: RuntimeAuthRecoveryIntent): boolean =>
+      isUntargetedProviderOutcomeProofWait(intent) && !canContinueProfileLimit(intent);
     this.scheduler = new DurableBackoffRecoveryScheduler<RuntimeAuthRecoveryIntent>({
       nowMs: deps.nowMs,
       baseBackoffMs: deps.baseBackoffMs,
@@ -1341,7 +1370,7 @@ export class RuntimeAuthRecoveryScheduler {
         : intent.attemptCount,
       // Proof observations do not run recovery attempts. The durable scheduler
       // treats zero as no attempt ceiling; targeted recovery keeps its budget.
-      getMaxAttempts: (intent) => isUntargetedProviderOutcomeProofWait(intent)
+      getMaxAttempts: (intent) => observeProofWithoutRecovery(intent)
         ? 0
         : deps.retryAfterLimitReset && isRuntimeAuthLimitResetIntent(intent)
           ? intent.maxAttempts
@@ -1349,7 +1378,7 @@ export class RuntimeAuthRecoveryScheduler {
             ? Number.MAX_SAFE_INTEGER
             : intent.maxAttempts,
       observeBeforeEffectClaim: (intent) => {
-        if (!isUntargetedProviderOutcomeProofWait(intent)) return null;
+        if (!observeProofWithoutRecovery(intent)) return null;
         const retryAtMs = this.providerOutcomePendingWaitMs === null
           ? deps.nowMs() + this.baseBackoffMs
           : deps.nowMs() + this.providerOutcomePendingWaitMs;
@@ -1387,7 +1416,7 @@ export class RuntimeAuthRecoveryScheduler {
           ...(trial ? { limitResetRetryCount: trial.retryCount, limitResetTrial: trial } : {}),
           lastError: limitResetRetryDue
             ? RUNTIME_AUTH_LIMIT_RESET_RETRY_CLAIMED
-            : isUntargetedProviderOutcomeProofWait(intent)
+            : observeProofWithoutRecovery(intent)
               ? RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR
               : intent.lastError,
         };
@@ -1458,7 +1487,7 @@ export class RuntimeAuthRecoveryScheduler {
         next,
         reason,
       }),
-      recover: async (intent) => {
+      recover: async (intent, context) => {
         try {
           // A handed-off trial waits for its real outcome, never another prompt.
           // Transactional stores observe this before the claim; retain the same
@@ -1530,13 +1559,30 @@ export class RuntimeAuthRecoveryScheduler {
               intent: { ...intent, limitResetTrial: undefined, status: 'resumed_awaiting_proof', pendingTargetProfileId: null, pendingTargetGeneration: null },
             };
           }
-          const result = await deps.recover({
-            sessionId: intent.sessionId,
-            switchesThisTurn: intent.switchesThisTurn,
-            classification: intent.classification,
-            resumePromptMode: readResumePromptMode(intent.resumePromptMode),
-            source: 'scheduler_retry',
-          });
+          const dueProfileLimit = canContinueProfileLimit(intent);
+          const awaitingContinuation = dueProfileLimit && Boolean(deps.continueAfterUsageLimitReset)
+            && intent.lastError === USAGE_LIMIT_CONTINUATION_PROOF_WAIT_ERROR;
+          // An elapsed profile limit needs a provider retry, not another evaluation
+          // of the historic failure as an action-required credential problem.
+          const result = dueProfileLimit && deps.continueAfterUsageLimitReset
+            ? awaitingContinuation
+              // Pending already owns this turn. Refresh the bounded proof wait without
+              // replaying admission or attaching again while that turn is in flight.
+              ? { ok: true, status: 'continuation_enqueued' }
+              : await deps.continueAfterUsageLimitReset(intent)
+            : await deps.recover({
+              sessionId: intent.sessionId,
+              switchesThisTurn: intent.switchesThisTurn,
+              classification: intent.classification,
+              resumePromptMode: readResumePromptMode(intent.resumePromptMode),
+              source: 'scheduler_retry',
+            });
+          const continuationResult = readSwitchAttemptResult(result);
+          if (continuationResult?.status === 'continuation_cancelled') {
+            const reason = readString(continuationResult.reason) ?? 'usage_limit_continuation_cancelled';
+            return { status: 'terminal', lastError: reason,
+              intent: buildTerminalRuntimeAuthIntent({ intent, nowMs: deps.nowMs(), terminalReason: reason }) };
+          }
           if (isRuntimeAuthRecoverySuccess(result)) return { status: 'success' };
           const supersededReason = readRuntimeAuthRecoverySupersededReason(result);
           if (supersededReason) {
@@ -1594,13 +1640,17 @@ export class RuntimeAuthRecoveryScheduler {
             // additionally bounded by maxCoalescedReplays when the target profile
             // keeps changing under the same durable recovery.
             const coalescedReplayCount = intent.coalescedReplayCount ?? 0;
-            const rollbackAttempt = coalescedReplay && coalescedReplayCount < this.maxCoalescedReplays;
+            const rollbackAttempt = (awaitingContinuation && context.reason === 'manual')
+              || (switchResultForHandoff?.status !== 'continuation_enqueued'
+                && coalescedReplay && coalescedReplayCount < this.maxCoalescedReplays);
             return {
               status: 'wait',
-              exhaustOnMaxAttempt: pendingTarget !== null
+              exhaustOnMaxAttempt: switchResultForHandoff?.status === 'continuation_enqueued'
+                || pendingTarget !== null
                 || intent.pendingTargetProfileId != null
                 || intent.pendingTargetGeneration != null,
-              lastError: RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR,
+              lastError: switchResultForHandoff?.status === 'continuation_enqueued'
+                ? USAGE_LIMIT_CONTINUATION_PROOF_WAIT_ERROR : RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR,
               intent: {
                 ...intent,
                 status: 'resumed_awaiting_proof',
@@ -1611,7 +1661,10 @@ export class RuntimeAuthRecoveryScheduler {
               },
               ...(this.providerOutcomePendingWaitMs === null
                 ? {}
-                : { nextRetryAtMs: deps.nowMs() + this.providerOutcomePendingWaitMs }),
+                : { nextRetryAtMs: awaitingContinuation && context.reason === 'manual'
+                  && intent.nextRetryAtMs !== null
+                  ? intent.nextRetryAtMs
+                  : deps.nowMs() + this.providerOutcomePendingWaitMs }),
             };
           }
           // Degraded daemon-lifecycle / endpoint-unavailable outcomes are non-terminal: keep the
@@ -1970,15 +2023,18 @@ export class RuntimeAuthRecoveryScheduler {
     this.scheduler.dispose();
   }
 
-  async wake(input: Readonly<{ sessionId: string; reason: 'timer' | 'manual' }>): Promise<Readonly<{ status: string }>> {
+  async wake(input: Readonly<{ sessionId: string; reason: 'timer' | 'manual'; attemptId?: string; resumePromptMode?: 'standard' | 'off' | 'custom' }>): Promise<Readonly<{ status: string }>> {
     const intents = this.readForSession(input.sessionId).filter((intent) => (
       isPendingRuntimeAuthRecoveryStatus(intent.status)
+      && (input.attemptId === undefined || intent.attemptId === input.attemptId)
     ));
     if (intents.length === 0) return { status: 'inactive' };
     if (intents.length === 1) {
       return await this.wakeByKey({
         recoveryKey: buildRecoveryKeyForIntent(intents[0]!),
         reason: input.reason,
+        resumePromptMode: input.resumePromptMode,
+        ...(input.attemptId !== undefined ? { attemptId: input.attemptId } : {}),
       });
     }
     const results = [];
@@ -1986,6 +2042,8 @@ export class RuntimeAuthRecoveryScheduler {
       results.push(await this.wakeByKey({
         recoveryKey: buildRecoveryKeyForIntent(intent),
         reason: input.reason,
+        resumePromptMode: input.resumePromptMode,
+        ...(input.attemptId !== undefined ? { attemptId: input.attemptId } : {}),
       }));
     }
     if (results.some((result) => result.status === 'succeeded')) return { status: 'succeeded' };
@@ -1996,10 +2054,25 @@ export class RuntimeAuthRecoveryScheduler {
     return { status: 'inactive' };
   }
 
-  async wakeByKey(input: Readonly<{ recoveryKey: string; reason: 'timer' | 'manual' }>): Promise<Readonly<{ status: string }>> {
+  async wakeByKey(input: Readonly<{ recoveryKey: string; reason: 'timer' | 'manual'; attemptId?: string; resumePromptMode?: 'standard' | 'off' | 'custom' }>): Promise<Readonly<{ status: string }>> {
+    if (input.resumePromptMode !== undefined && input.attemptId !== undefined) {
+      const current = this.readByKeyPassive(input.recoveryKey);
+      if (!current) return { status: 'inactive' };
+      // A claimed continuation keeps its selected prompt; manual checks coalesce with that turn.
+      if (current.status === 'waiting') {
+        await this.scheduler.upsertConditionallyByKey({
+          sessionId: current.sessionId, recoveryKey: input.recoveryKey,
+          intent: { ...current, resumePromptMode: input.resumePromptMode },
+          expectedCurrent: (intent) => intent.attemptId === input.attemptId && intent.status === 'waiting',
+          merge: (intent, next) => ({ ...intent, resumePromptMode: next.resumePromptMode }),
+          requireUnclaimed: true,
+        });
+      }
+    }
     return await this.scheduler.wakeByKey({
       recoveryKey: input.recoveryKey,
       reason: input.reason,
+      ...(input.attemptId !== undefined ? { expectedCurrent: (intent: RuntimeAuthRecoveryIntent) => intent.attemptId === input.attemptId } : {}),
     });
   }
 

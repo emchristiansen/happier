@@ -8,11 +8,20 @@ describe('probeSessionRunnerServiceability', () => {
     expect(resolveSessionRunnerResumeDecision({ state: 'runner_present', control: { state: 'servable' } })).toEqual({ action: 'adopt' });
     expect(resolveSessionRunnerResumeDecision({
       state: 'runner_present', control: { state: 'recoverable_unservable', reason: 'rpc_method_unavailable' },
-    })).toEqual({ action: 'fence', reason: 'rpc_method_unavailable' });
+    })).toEqual({ action: 'wait_for_exit', reason: 'rpc_method_unavailable' });
+    expect(resolveSessionRunnerResumeDecision({
+      state: 'runner_present', control: { state: 'unknown', reason: 'rpc_failed' },
+    })).toEqual({ action: 'wait_for_exit', reason: 'rpc_failed' });
     expect(resolveSessionRunnerResumeDecision({
       state: 'runner_present', control: { state: 'recoverable_unservable', reason: 'runtime_terminating' },
     })).toEqual({ action: 'wait_for_exit', reason: 'runtime_terminating' });
     expect(resolveSessionRunnerResumeDecision({ state: 'runner_absent' })).toEqual({ action: 'spawn' });
+    expect(resolveSessionRunnerResumeDecision({
+      state: 'runner_unknown', reason: 'runner_presence_unproven',
+    })).toEqual({ action: 'fence', reason: 'runner_presence_unproven' });
+    expect(resolveSessionRunnerResumeDecision({
+      state: 'runner_present', control: { state: 'unknown', reason: 'no_token' },
+    })).toEqual({ action: 'fence', reason: 'no_token' });
   });
   describe('lost publisher replacement binding', () => {
     const localRunner = { machineId: 'machine-1', pid: 456, processInstanceFingerprint: 'linux-proc:456' };
@@ -202,6 +211,25 @@ describe('probeSessionRunnerServiceability', () => {
 });
 
 describe('isSessionRunnerActive', () => {
+  it.each(['servable', 'stopped', 'reused'] as const)('checks a reported runner after its launcher exits: %s', async (state) => {
+    const tracked: TrackedSession = {
+      pid: 12345,
+      sessionRunnerPid: 23456,
+      happySessionId: 'sess_runner',
+      startedBy: 'daemon',
+      processInstanceFingerprint: 'linux-proc:same',
+    };
+    const active = await isSessionRunnerActive({
+      sessionId: 'sess_runner',
+      trackedSessions: [tracked],
+      readProcessRunState: async pid => pid === 12345 ? 'dead' : state === 'stopped' ? 'stopped' : 'servable',
+      getProcessCommandHash: async () => null,
+      getProcessInstanceFingerprint: () => state === 'reused' ? 'linux-proc:new' : 'linux-proc:same',
+      readSessionRunnerLockStatus: async () => ({ ok: false, reason: 'not_found' }),
+    });
+    expect(active).toBe(state === 'servable');
+  });
+
   it('returns false for empty session id', async () => {
     const res = await isSessionRunnerActive({ sessionId: '   ', trackedSessions: [] });
     expect(res).toBe(false);

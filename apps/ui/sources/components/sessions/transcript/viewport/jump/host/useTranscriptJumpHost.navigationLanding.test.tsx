@@ -141,6 +141,7 @@ function buildDeps(overrides: Readonly<{
         executeViewportCommandWithAnimation: vi.fn(() => true),
         forkedTranscriptEnabled: false,
         hasMoreOlderRef: createRef<boolean | null>(false),
+        observeOlderLoadResult: () => {},
         invalidateViewportAnchorCapture: vi.fn(),
         isLoaded: true,
         isPinnedRef: createRef(false),

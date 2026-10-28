@@ -8,6 +8,18 @@ import { Session } from './session';
 import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import type { EnhancedMode } from './loop';
 import { getProjectPath } from './utils/path';
+import { PermissionHandler } from './utils/permissionHandler';
+import { syncClaudePermissionModeFromMetadata } from './utils/syncPermissionModeFromMetadata';
+import { createClaudeUnifiedTerminalMetadataModeApplier } from './unifiedTerminal/metadataRuntimeModeApplier';
+import { createClaudeUnifiedRuntimeControlBridge } from './unifiedTerminal/runtimeControlIntegration';
+import { createClaudeUnifiedTuiControlController } from './unifiedTerminal/tuiControls/controller';
+import { createFakeControlPort } from './unifiedTerminal/tuiControls/fakeControlPort';
+import { createClaudeSettingsGuard } from './unifiedTerminal/tuiControls/settingsGuard';
+import { DEFAULT_CLAUDE_TUI_CONTROL_TIMINGS } from './unifiedTerminal/tuiControls/types';
+import { claudeRemoteAgentSdk } from './remote/claudeRemoteAgentSdk';
+import { buildInactiveSessionResumeSpawnOptions } from '@/daemon/sessions/runtimeSnapshot/buildInactiveSessionResumeSpawnOptions';
+import type { RawSessionRecord } from '@/session/transport/http/sessionsHttp';
+import { startAnthropicSseBoundary } from './sdk/anthropicSseBoundary.testkit';
 import type {
   SessionRuntimeActivityContributionHandle,
 } from '@/session/runtimeActivity/types';
@@ -47,7 +59,8 @@ function createSessionClientStub(overrides?: Partial<SessionClientPort>): Sessio
     discardPendingMessageQueueV2All: vi.fn(async () => 0),
     discardCommittedMessageLocalIds: vi.fn(async () => 0),
     updateMetadata: vi.fn(),
-    updateAgentState: vi.fn(),
+    updateAgentStateRequestSettlement: vi.fn(async () => {}),
+      updateAgentState: vi.fn(),
     sendSessionDeath: vi.fn(),
     flush: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
@@ -213,6 +226,83 @@ function createTempClaudeTranscript(
 }
 
 describe('Session', () => {
+  it('synchronizes the accepted Session permission intent instead of stale metadata and ignores absent intent', async () => {
+    let metadata = createMetadataStub({ permissionMode: 'safe-yolo', permissionModeUpdatedAt: 10 });
+    const session = createSession(createSessionClientStub({ getMetadataSnapshot: () => metadata }));
+    session.lastPermissionMode = 'yolo';
+    session.lastPermissionModeUpdatedAt = 20;
+    const handler = new PermissionHandler(session);
+    try {
+      expect(syncClaudePermissionModeFromMetadata({ session, permissionHandler: handler })).toBe('yolo');
+      expect(session.lastPermissionModeUpdatedAt).toBe(20);
+      await expect(handler.handleToolCall('Write', { file_path: '/tmp/example.txt', content: 'x' }, {
+        permissionMode: 'default',
+      }, { signal: new AbortController().signal, toolUseId: 'current-session-permission-write' })).resolves.toMatchObject({ behavior: 'allow' });
+      metadata = createMetadataStub();
+      expect(syncClaudePermissionModeFromMetadata({ session, permissionHandler: handler })).toBeNull();
+    } finally {
+      handler.dispose();
+      session.cleanup();
+    }
+  });
+
+  it('applies unified-compatible remote-launcher permission controls after the approval watcher already adopted the same update', async () => {
+    const metadata = createMetadataStub({ permissionMode: 'safe-yolo', permissionModeUpdatedAt: 20 });
+    // The network broadcast reaches the approval watcher before the idle provider consumer.
+    let broadcast: ((updated: boolean) => void) | undefined;
+    const session = createSession(createSessionClientStub({
+      getMetadataSnapshot: () => metadata,
+      waitForMetadataUpdate: (signal) => new Promise<boolean>((resolve) => {
+        broadcast = resolve;
+        signal?.addEventListener('abort', () => resolve(false), { once: true });
+      }),
+    }));
+    session.lastPermissionMode = 'default';
+    session.lastPermissionModeUpdatedAt = 10;
+    const handler = new PermissionHandler(session);
+    const configDir = mkdtempSync(join(tmpdir(), 'claude-metadata-permission-'));
+    writeFileSync(join(configDir, 'settings.json'), '{}', 'utf8');
+    const idle = ['╭─────╮', '│ >   │', '╰─────╯', '  ? for shortcuts'].join('\n');
+    const accept = ['╭─────╮', '│ >   │', '╰─────╯', '  ⏵⏵ accept edits on (shift+tab to cycle)'].join('\n');
+    const port = createFakeControlPort({ captures: [idle, accept] });
+    const controller = createClaudeUnifiedTuiControlController({
+      port,
+      featureEnabled: true,
+      settingsGuard: createClaudeSettingsGuard({ configDir }),
+      wait: async () => undefined,
+      timings: DEFAULT_CLAUDE_TUI_CONTROL_TIMINGS,
+      nowMs: () => 1000,
+    });
+    const currentMode: EnhancedMode = { permissionMode: 'default', claudeUnifiedTerminalEnabled: true };
+    const bridge = createClaudeUnifiedRuntimeControlBridge({
+      controller,
+      emitRuntimeConfigOutcome: () => {},
+      startupMode: currentMode,
+    });
+    const applyMetadata = createClaudeUnifiedTerminalMetadataModeApplier({
+      getCurrentMode: () => currentMode,
+      getApplier: () => bridge.applyOutOfBand,
+    });
+    try {
+      broadcast?.(true);
+      await vi.waitFor(() => expect(session.lastPermissionModeUpdatedAt).toBe(20));
+      // The retained unified-compatible remote-launcher callback uses this helper and applier.
+      // Current direct-unified entry uses a separate permission bridge and is exempt.
+      const updated = syncClaudePermissionModeFromMetadata({ session, permissionHandler: handler });
+      if (updated) await applyMetadata(updated);
+      expect(port.sentKeys).toEqual(['ShiftTab']);
+
+      const repeated = syncClaudePermissionModeFromMetadata({ session, permissionHandler: handler });
+      if (repeated) await applyMetadata(repeated);
+      expect(port.sentKeys).toEqual(['ShiftTab']);
+    } finally {
+      handler.dispose();
+      await bridge.dispose();
+      session.cleanup();
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
   it('owns unavailable group truth from runtime control registration through cleanup', async () => {
     const unregister = vi.fn();
     const registerSessionRuntimeControls = vi.fn((
@@ -336,8 +426,7 @@ describe('Session', () => {
       session.onSessionFound('sess_critical', hookWithTranscript(transcript.transcriptPath));
 
       const drained = session.drainCriticalMetadataWrites({ timeoutMs: 500 });
-      await Promise.resolve();
-      expect(client.updateMetadata).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(client.updateMetadata).toHaveBeenCalledTimes(1));
 
       let didDrain = false;
       void drained.then(() => {
@@ -439,7 +528,7 @@ describe('Session', () => {
     }
   });
 
-  it('notifies sessionFound callbacks with transcriptPath when provided', () => {
+  it('notifies sessionFound callbacks with transcriptPath when provided', async () => {
     const transcript = createTempClaudeTranscript('sess_1');
     let metadata: Metadata = createMetadataStub();
 
@@ -456,7 +545,7 @@ describe('Session', () => {
       session.addSessionFoundCallback((info) => events.push(info));
 
       session.onSessionFound('sess_1', hookWithTranscript(transcript.transcriptPath));
-
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
       expect(metadata.claudeSessionId).toBe('sess_1');
       expect(metadata.claudeTranscriptPath).toBe(transcript.transcriptPath);
       expect(events).toEqual([{ sessionId: 'sess_1', transcriptPath: transcript.transcriptPath }]);
@@ -558,7 +647,7 @@ describe('Session', () => {
     }
   });
 
-  it('persists an initial Claude-reported session id before its transcript is reachable', async () => {
+  it('keeps a fresh Claude session id provisional until its transcript is reachable', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'happier-claude-session-'));
     vi.stubEnv('CLAUDE_CONFIG_DIR', tempDir);
     const transcriptDir = join(tempDir, 'projects', 'project-a');
@@ -590,26 +679,60 @@ describe('Session', () => {
       session.onSessionFound('sess_missing_initial', hookWithTranscript(transcriptPath));
       await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
 
-      expect(updateMetadata).toHaveBeenCalledTimes(1);
-      expect(metadata).toEqual(expect.objectContaining({
-        claudeSessionId: 'sess_missing_initial',
-      }));
+      expect(metadata.claudeSessionId).toBeUndefined();
       expect(metadata.claudeTranscriptPath).toBeUndefined();
-      expect(reportSessionMetadataToDaemon).toHaveBeenCalledWith({
-        sessionId: 'happy-session-1',
-        metadata: expect.objectContaining({
-          claudeSessionId: 'sess_missing_initial',
-        }),
-      });
+      expect(reportSessionMetadataToDaemon).not.toHaveBeenCalled();
       expect(session.sessionId).toBe('sess_missing_initial');
       expect(session.transcriptPath).toBe(transcriptPath);
+
+      writeFileSync(transcriptPath, '', 'utf8');
+      session.onSessionFound('sess_missing_initial', hookWithTranscript(transcriptPath));
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
+      expect(metadata.claudeSessionId).toBeUndefined();
+
+      writeClaudeTranscriptInit(transcriptPath, 'sess_missing_initial');
+      session.onSessionFound('sess_missing_initial', hookWithTranscript(transcriptPath));
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
+      expect(metadata.claudeSessionId).toBe('sess_missing_initial');
+      expect(metadata.claudeTranscriptPath).toBe(transcriptPath);
+      expect(reportSessionMetadataToDaemon).toHaveBeenCalledWith({
+        sessionId: 'happy-session-1', metadata,
+      });
     } finally {
       session.cleanup();
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
 
-  it('persists a changed Claude-reported session id and clears stale transcript metadata until the new transcript is reachable', async () => {
+  it.each([
+    { hook_event_name: 'SessionEnd' },
+    { hookEventName: 'SessionEnd' },
+    { hook_event_name: 'Stop' },
+    { hook_event_name: 'UserPromptSubmit' },
+  ])('keeps lifecycle hooks from replacing the native resume identity: %j', async (event) => {
+    const session = createSession(createSessionClientStub(), ['--resume', 'sess_reachable']);
+    const transcriptPath = '/tmp/sess_reachable.jsonl';
+    session.transcriptPath = transcriptPath;
+    const discoveredSessions: string[] = [];
+    session.addSessionFoundCallback((info) => discoveredSessions.push(info.sessionId));
+
+    try {
+      session.onSessionFound('sess_missing', {
+        ...event,
+        transcript_path: '/tmp/sess_missing.jsonl',
+      });
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
+      session.consumeOneTimeFlags();
+
+      expect(session.sessionId).toBe('sess_reachable');
+      expect(session.transcriptPath).toBe(transcriptPath);
+      expect(discoveredSessions).toEqual([]);
+    } finally {
+      session.cleanup();
+    }
+  });
+
+  it('preserves the established resume identity while a changed Claude session remains provisional', async () => {
     let metadata: Metadata = createMetadataStub({
       startedBy: 'daemon',
       claudeSessionId: 'sess_reachable',
@@ -650,22 +773,14 @@ describe('Session', () => {
     });
 
     try {
-      session.onSessionFound('sess_missing', hookWithTranscript('/tmp/sess_missing.jsonl'));
+      session.onSessionFound('sess_missing', { ...hookWithTranscript('/tmp/sess_missing.jsonl'), hook_event_name: 'SessionStart' });
       await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
 
-      expect(updateMetadata).toHaveBeenCalledTimes(1);
-      expect(metadata).toEqual(expect.objectContaining({
-        claudeSessionId: 'sess_missing',
-      }));
-      expect(metadata).not.toHaveProperty('claudeTranscriptPath');
-      expect(metadata).not.toHaveProperty('claudeLastAssistantUuid');
-      expect(metadata).not.toHaveProperty('directSessionV1');
-      expect(reportSessionMetadataToDaemon).toHaveBeenCalledWith({
-        sessionId: 'happy-session-1',
-        metadata: expect.objectContaining({
-          claudeSessionId: 'sess_missing',
-        }),
-      });
+      expect(metadata.claudeSessionId).toBe('sess_reachable');
+      expect(metadata.claudeTranscriptPath).toBe('/tmp/sess_reachable.jsonl');
+      expect(metadata.claudeLastAssistantUuid).toBe('asst_stale');
+      expect(metadata.directSessionV1?.remoteSessionId).toBe('sess_reachable');
+      expect(reportSessionMetadataToDaemon).not.toHaveBeenCalled();
       expect(session.sessionId).toBe('sess_missing');
       expect(session.transcriptPath).toBe('/tmp/sess_missing.jsonl');
     } finally {
@@ -710,17 +825,9 @@ describe('Session', () => {
       session.onSessionFound('sess_candidate', hookWithTranscript(transcriptPath));
       await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
 
-      expect(updateMetadata).toHaveBeenCalledTimes(1);
-      expect(metadata).toEqual(expect.objectContaining({
-        claudeSessionId: 'sess_candidate',
-      }));
-      expect(metadata).not.toHaveProperty('claudeTranscriptPath');
-      expect(reportSessionMetadataToDaemon).toHaveBeenCalledWith({
-        sessionId: 'happy-session-1',
-        metadata: expect.objectContaining({
-          claudeSessionId: 'sess_candidate',
-        }),
-      });
+      expect(metadata.claudeSessionId).toBe('sess_reachable');
+      expect(metadata.claudeTranscriptPath).toBe('/tmp/sess_reachable.jsonl');
+      expect(reportSessionMetadataToDaemon).not.toHaveBeenCalled();
       expect(session.sessionId).toBe('sess_candidate');
       expect(session.transcriptPath).toBe(transcriptPath);
     } finally {
@@ -761,17 +868,9 @@ describe('Session', () => {
       session.onSessionFound('sess_candidate', hookWithTranscript(transcript.transcriptPath));
       await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
 
-      expect(updateMetadata).toHaveBeenCalledTimes(1);
-      expect(metadata).toEqual(expect.objectContaining({
-        claudeSessionId: 'sess_candidate',
-      }));
-      expect(metadata).not.toHaveProperty('claudeTranscriptPath');
-      expect(reportSessionMetadataToDaemon).toHaveBeenCalledWith({
-        sessionId: 'happy-session-1',
-        metadata: expect.objectContaining({
-          claudeSessionId: 'sess_candidate',
-        }),
-      });
+      expect(metadata.claudeSessionId).toBe('sess_reachable');
+      expect(metadata.claudeTranscriptPath).toBe('/tmp/sess_reachable.jsonl');
+      expect(reportSessionMetadataToDaemon).not.toHaveBeenCalled();
       expect(session.sessionId).toBe('sess_candidate');
       expect(session.transcriptPath).toBe(transcript.transcriptPath);
     } finally {
@@ -817,17 +916,9 @@ describe('Session', () => {
       session.onSessionFound('sess_candidate', hookWithTranscript(transcriptPath));
       await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
 
-      expect(updateMetadata).toHaveBeenCalledTimes(1);
-      expect(metadata).toEqual(expect.objectContaining({
-        claudeSessionId: 'sess_candidate',
-      }));
-      expect(metadata).not.toHaveProperty('claudeTranscriptPath');
-      expect(reportSessionMetadataToDaemon).toHaveBeenCalledWith({
-        sessionId: 'happy-session-1',
-        metadata: expect.objectContaining({
-          claudeSessionId: 'sess_candidate',
-        }),
-      });
+      expect(metadata.claudeSessionId).toBe('sess_reachable');
+      expect(metadata.claudeTranscriptPath).toBe('/tmp/sess_reachable.jsonl');
+      expect(reportSessionMetadataToDaemon).not.toHaveBeenCalled();
     } finally {
       session.cleanup();
       rmSync(tempDir, { recursive: true, force: true });
@@ -872,17 +963,9 @@ describe('Session', () => {
       session.onSessionFound('sess_candidate', hookWithTranscript(transcriptPath));
       await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
 
-      expect(updateMetadata).toHaveBeenCalledTimes(1);
-      expect(metadata).toEqual(expect.objectContaining({
-        claudeSessionId: 'sess_candidate',
-      }));
-      expect(metadata).not.toHaveProperty('claudeTranscriptPath');
-      expect(reportSessionMetadataToDaemon).toHaveBeenCalledWith({
-        sessionId: 'happy-session-1',
-        metadata: expect.objectContaining({
-          claudeSessionId: 'sess_candidate',
-        }),
-      });
+      expect(metadata.claudeSessionId).toBe('sess_reachable');
+      expect(metadata.claudeTranscriptPath).toBe('/tmp/sess_reachable.jsonl');
+      expect(reportSessionMetadataToDaemon).not.toHaveBeenCalled();
       expect(session.sessionId).toBe('sess_candidate');
       expect(session.transcriptPath).toBe(transcriptPath);
     } finally {
@@ -942,7 +1025,7 @@ describe('Session', () => {
     }
   });
 
-  it('persists id-only Claude-reported session ids without trusting a native transcript path before the file exists', async () => {
+  it('keeps id-only Claude discoveries provisional before the native transcript exists', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'happier-claude-session-'));
     vi.stubEnv('CLAUDE_CONFIG_DIR', tempDir);
     const transcriptPath = join(getProjectPath('/tmp', tempDir), 'sess_legacy_early.jsonl');
@@ -972,16 +1055,9 @@ describe('Session', () => {
       session.onSessionFound('sess_legacy_early');
       await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
 
-      expect(metadata).toEqual(expect.objectContaining({
-        claudeSessionId: 'sess_legacy_early',
-      }));
+      expect(metadata.claudeSessionId).toBeUndefined();
       expect(metadata.claudeTranscriptPath).toBeUndefined();
-      expect(reportSessionMetadataToDaemon).toHaveBeenCalledWith({
-        sessionId: 'happy-session-1',
-        metadata: expect.objectContaining({
-          claudeSessionId: 'sess_legacy_early',
-        }),
-      });
+      expect(reportSessionMetadataToDaemon).not.toHaveBeenCalled();
       expect(session.transcriptPath).toBe(transcriptPath);
     } finally {
       session.cleanup();
@@ -1047,16 +1123,16 @@ describe('Session', () => {
     mkdirSync(transcriptDir, { recursive: true });
     const transcriptPath = join(transcriptDir, 'sess_large_scanned.jsonl');
     const rows = [
-      { type: 'last-prompt', leafUuid: 'leaf-uuid', sessionId: 'sess_large_scanned' },
-      { type: 'mode', mode: 'normal', sessionId: 'sess_large_scanned' },
+      { type: 'queue-operation', operation: 'dequeue', sessionId: 'sess_large_scanned' },
       {
-        type: 'assistant',
+        type: 'user',
         sessionId: 'sess_large_scanned',
         message: {
-          role: 'assistant',
+          role: 'user',
           content: 'x'.repeat(128 * 1024),
         },
       },
+      { type: 'assistant', sessionId: 'sess_large_scanned', message: { role: 'assistant', content: 'done' } },
     ];
     writeFileSync(
       transcriptPath,
@@ -1101,9 +1177,169 @@ describe('Session', () => {
         }),
       });
       expect(session.transcriptPath).toBe(transcriptPath);
+
+      // A matching long first record must not conceal a contradictory identity later in the file.
+      metadata = createMetadataStub({ startedBy: 'daemon' });
+      writeFileSync(transcriptPath, `${[...rows, { type: 'assistant', sessionId: 'foreign' }].map(row => JSON.stringify(row)).join('\n')}\n`);
+      session.onSessionFound('sess_large_scanned');
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
+      expect(metadata.claudeSessionId).toBeUndefined();
+
+      writeFileSync(transcriptPath, `${rows.map(row => JSON.stringify(row)).join('\n')}\n{"type":"assistant"`);
+      session.onSessionFound('sess_large_scanned');
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
+      expect(metadata.claudeSessionId).toBeUndefined();
     } finally {
       session.cleanup();
       rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['matching', 'missing', 'empty', 'mismatched'] as const)('publishes only established SDK identities at successful turn completion: %s', async proof => {
+    const root = mkdtempSync(join(tmpdir(), 'happier-claude-sdk-identity-'));
+    vi.stubEnv('CLAUDE_CONFIG_DIR', root);
+    const id = 'sdk-established';
+    const transcriptPath = join(root, 'projects', 'exact-hook-project', `${id}.jsonl`);
+    mkdirSync(join(root, 'projects', 'exact-hook-project'), { recursive: true });
+    let metadata = createMetadataStub({ machineId: 'machine', flavor: 'claude' });
+    const client = createSessionClientStub({ updateMetadata: async updater => { metadata = updater(metadata); } });
+    const session = createSession(client);
+    let finish!: () => void;
+    const done = new Promise<null>(resolve => { finish = () => resolve(null); });
+    let sent = false;
+    // The SDK is an external process boundary; the Session and runner logic beneath it are real.
+    const createQuery = ((params: { options: { hooks: { SessionStart: Array<{ hooks: Array<(input: unknown) => Promise<unknown>> }> } } }) => ({
+      async *[Symbol.asyncIterator]() {
+        await params.options.hooks.SessionStart[0].hooks[0]({ session_id: id, transcript_path: transcriptPath });
+        yield { type: 'system', subtype: 'init', session_id: id };
+        expect(metadata.claudeSessionId).toBeUndefined();
+        if (proof === 'empty') writeFileSync(transcriptPath, '');
+        if (proof === 'matching' || proof === 'mismatched') {
+          const sessionId = proof === 'matching' ? id : 'foreign';
+          writeFileSync(transcriptPath, `${[
+            { type: 'user', sessionId, message: { role: 'user', content: 'hello' } },
+            { type: 'assistant', sessionId, message: { role: 'assistant', content: 'done' } },
+          ].map(row => JSON.stringify(row)).join('\n')}\n`);
+        }
+        yield { type: 'result', subtype: 'success', session_id: id, result: 'done' };
+        await done;
+      },
+      close() { finish(); },
+    })) as unknown as NonNullable<Parameters<typeof claudeRemoteAgentSdk>[0]['createQuery']>;
+    try {
+      await claudeRemoteAgentSdk({
+        sessionId: null, transcriptPath: null, path: '/tmp', claudeExecutablePath: '/tmp/claude',
+        nextMessage: async () => {
+          if (sent) return done;
+          sent = true;
+          return { message: 'hello', mode: { permissionMode: 'default', claudeRemoteAgentSdkEnabled: true } };
+        },
+        canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+        isAborted: () => false, onMessage: () => {}, onReady: finish,
+        onSessionFound: session.onSessionFound, createQuery,
+      });
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
+      expect(metadata.claudeSessionId).toBe(proof === 'matching' ? id : undefined);
+      const spawn = buildInactiveSessionResumeSpawnOptions({
+        sessionId: client.sessionId,
+        rawSession: {
+          id: client.sessionId, active: false, machineId: 'machine', path: '/tmp',
+          seq: 0, createdAt: 0, updatedAt: 0, activeAt: 0,
+          metadata: '{}', metadataVersion: 0, agentState: null, agentStateVersion: 0, dataEncryptionKey: null,
+        } satisfies RawSessionRecord,
+        metadata,
+      });
+      expect(spawn?.resume).toBe(proof === 'matching' ? id : undefined);
+    } finally {
+      finish();
+      session.cleanup();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(Boolean(process.env.HAPPIER_TEST_NATIVE_CLAUDE_PATH))('publishes the actual native SDK identity after a completed first turn for inactive resume', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'happier-native-session-identity-'));
+    const boundary = await startAnthropicSseBoundary();
+    vi.stubEnv('CLAUDE_CONFIG_DIR', root);
+    vi.stubEnv('CLAUDECODE', undefined);
+    vi.stubEnv('ANTHROPIC_BASE_URL', boundary.url);
+    vi.stubEnv('ANTHROPIC_API_KEY', 'local-test-key');
+    vi.stubEnv('ANTHROPIC_AUTH_TOKEN', undefined);
+    vi.stubEnv('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', '1');
+    let metadata = createMetadataStub({ machineId: 'machine', flavor: 'claude' });
+    const client = createSessionClientStub({ updateMetadata: async updater => { metadata = updater(metadata); } });
+    const session = createSession(client);
+    let finish!: () => void;
+    const done = new Promise<null>(resolve => { finish = () => resolve(null); });
+    let sent = false;
+    let nativeId: string | undefined;
+    let completed = false;
+    try {
+      await claudeRemoteAgentSdk({
+        sessionId: null, transcriptPath: null, path: '/tmp',
+        claudeExecutablePath: process.env.HAPPIER_TEST_NATIVE_CLAUDE_PATH,
+        nextMessage: async () => {
+          if (sent) return done;
+          sent = true;
+          return { message: 'hello owner control', mode: {
+            permissionMode: 'default', model: 'claude-sonnet-4-6',
+            claudeRemoteAgentSdkEnabled: true, claudeRemoteSettingSourcesV2: [],
+          } };
+        },
+        canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+        isAborted: () => false,
+        onMessage: message => {
+          if (message.type === 'system' && message.subtype === 'init' && typeof message.session_id === 'string') {
+            nativeId = message.session_id;
+            expect(metadata.claudeSessionId).toBeUndefined();
+          }
+          if (message.type === 'result') {
+            expect(message.subtype).toBe('success');
+            completed = true;
+          }
+        },
+        onReady: finish, onSessionFound: session.onSessionFound,
+      });
+      await session.drainCriticalMetadataWrites();
+      expect(completed).toBe(true);
+      expect(nativeId).toBeTruthy();
+      expect(metadata.claudeSessionId).toBe(nativeId);
+      expect(metadata.claudeTranscriptPath).toBe(join(getProjectPath('/tmp', root), `${nativeId}.jsonl`));
+      expect(buildInactiveSessionResumeSpawnOptions({
+        sessionId: client.sessionId,
+        rawSession: {
+          id: client.sessionId, active: false, machineId: 'machine', path: '/tmp',
+          seq: 0, createdAt: 0, updatedAt: 0, activeAt: 0,
+          metadata: '{}', metadataVersion: 0, agentState: null, agentStateVersion: 0, dataEncryptionKey: null,
+        } satisfies RawSessionRecord,
+        metadata,
+      })?.resume).toBe(nativeId);
+    } finally {
+      finish();
+      session.cleanup();
+      await boundary.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not let earlier paged proof overwrite a newer Claude session observation', async () => {
+    const transcript = createTempClaudeTranscript('older');
+    const newerPath = join(transcript.configDir, 'projects', 'project-a', 'newer.jsonl');
+    writeFileSync(transcript.transcriptPath, `${Array.from({ length: 5000 }, () => JSON.stringify({
+      type: 'assistant', sessionId: 'older', message: { content: 'x'.repeat(300) },
+    })).join('\n')}\n`);
+    writeClaudeTranscriptInit(newerPath, 'newer');
+    let metadata = createMetadataStub();
+    const session = createSession(createSessionClientStub({ updateMetadata: updater => { metadata = updater(metadata); } }));
+    try {
+      session.onSessionFound('older', hookWithTranscript(transcript.transcriptPath));
+      session.onSessionFound('newer', hookWithTranscript(newerPath));
+      await session.drainCriticalMetadataWrites();
+      expect(metadata.claudeSessionId).toBe('newer');
+      expect(metadata.claudeTranscriptPath).toBe(newerPath);
+    } finally {
+      session.cleanup();
+      rmSync(transcript.tempDir, { recursive: true, force: true });
     }
   });
 
@@ -1117,6 +1353,7 @@ describe('Session', () => {
       startedBy: 'daemon',
       claudeSessionId: 'sess_reachable',
       claudeTranscriptPath: '/tmp/sess_reachable.jsonl',
+      claudeLastAssistantUuid: 'previous-session-anchor',
     });
     const reportSessionMetadataToDaemon = vi.fn(async () => {});
     const updateMetadata = vi.fn(async (updater: (metadata: Metadata) => Metadata) => {
@@ -1142,21 +1379,22 @@ describe('Session', () => {
     try {
       session.onSessionFound('sess_delayed', hookWithTranscript(transcriptPath));
       await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
-      expect(updateMetadata).toHaveBeenCalledTimes(1);
       expect(metadata).toEqual(expect.objectContaining({
-        claudeSessionId: 'sess_delayed',
+        claudeSessionId: 'sess_reachable',
       }));
-      expect(metadata.claudeTranscriptPath).toBeUndefined();
+      expect(metadata.claudeTranscriptPath).toBe('/tmp/sess_reachable.jsonl');
+      expect(metadata.claudeLastAssistantUuid).toBe('previous-session-anchor');
 
       writeClaudeTranscriptInit(transcriptPath, 'sess_delayed');
       session.onSessionFound('sess_delayed', hookWithTranscript(transcriptPath));
       await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
 
-      expect(updateMetadata).toHaveBeenCalledTimes(2);
+      expect(updateMetadata).toHaveBeenCalledTimes(1);
       expect(metadata).toEqual(expect.objectContaining({
         claudeSessionId: 'sess_delayed',
         claudeTranscriptPath: transcriptPath,
       }));
+      expect(metadata.claudeLastAssistantUuid).toBeUndefined();
       expect(reportSessionMetadataToDaemon).toHaveBeenCalledWith({
         sessionId: 'happy-session-1',
         metadata: expect.objectContaining({
@@ -1170,7 +1408,7 @@ describe('Session', () => {
     }
   });
 
-  it('publishes direct-session metadata when transcript storage is direct', () => {
+  it('publishes direct-session metadata when transcript storage is direct', async () => {
     const transcript = createTempClaudeTranscript('sess_1', { projectId: 'proj-a' });
     vi.stubEnv('HAPPIER_TRANSCRIPT_STORAGE', 'direct');
     vi.stubEnv('CLAUDE_CONFIG_DIR', transcript.configDir);
@@ -1186,7 +1424,7 @@ describe('Session', () => {
 
     try {
       session.onSessionFound('sess_1', hookWithTranscript(transcript.transcriptPath));
-
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
       expect(metadata.directSessionV1).toMatchObject({
         v: 1,
         providerId: 'claude',
@@ -1201,7 +1439,7 @@ describe('Session', () => {
     }
   });
 
-  it('does not carry over transcriptPath when sessionId changes and hook lacks transcriptPath', () => {
+  it('does not carry over transcriptPath when sessionId changes and hook lacks transcriptPath', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'happier-claude-session-'));
     vi.stubEnv('CLAUDE_CONFIG_DIR', tempDir);
     const transcriptDir = join(tempDir, 'projects', 'project-a');
@@ -1225,7 +1463,7 @@ describe('Session', () => {
       session.onSessionFound('sess_1', hookWithTranscript('/tmp/sess_1.jsonl'));
       session.onSessionFound('sess_2');
       session.onSessionFound('sess_2', hookWithTranscript(sess2TranscriptPath));
-
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
       expect(metadata.claudeSessionId).toBe('sess_2');
       expect(events).toEqual([
         { sessionId: 'sess_1', transcriptPath: '/tmp/sess_1.jsonl' },
@@ -1238,14 +1476,14 @@ describe('Session', () => {
     }
   });
 
-  it('clears stored assistant resume anchor when Claude session id changes', () => {
+  it('clears stored assistant resume anchor when Claude session id changes', async () => {
     const transcript = createTempClaudeTranscript('sess_1');
     const client = createSessionClientStub();
     const session = createSession(client);
 
     try {
       session.onSessionFound('sess_1', hookWithTranscript(transcript.transcriptPath));
-
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
       expect(client.updateMetadata).toHaveBeenCalled();
       const updater = vi.mocked(client.updateMetadata).mock.calls[0]?.[0];
       expect(typeof updater).toBe('function');
@@ -1265,7 +1503,7 @@ describe('Session', () => {
     }
   });
 
-  it('clears stored assistant resume anchor when known Claude transcript path changes', () => {
+  it('clears stored assistant resume anchor when known Claude transcript path changes', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'happier-claude-session-'));
     vi.stubEnv('CLAUDE_CONFIG_DIR', tempDir);
     const firstTranscriptPath = join(tempDir, 'projects', 'project-a', 'sess_1.jsonl');
@@ -1279,10 +1517,11 @@ describe('Session', () => {
 
     try {
       session.onSessionFound('sess_1', hookWithTranscript(firstTranscriptPath));
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
       vi.mocked(client.updateMetadata).mockClear();
 
       session.onSessionFound('sess_1', hookWithTranscript(secondTranscriptPath));
-
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
       expect(client.updateMetadata).toHaveBeenCalled();
       const updater = vi.mocked(client.updateMetadata).mock.calls[0]?.[0];
       expect(typeof updater).toBe('function');

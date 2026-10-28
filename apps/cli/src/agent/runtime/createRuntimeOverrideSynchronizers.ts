@@ -6,6 +6,7 @@ import { logger } from '@/ui/logger';
 
 type AcpRuntimeOverrideTarget = {
   setSessionMode: (modeId: string) => Promise<void>;
+  clearSessionModeOverride?: () => Promise<void>;
   setSessionConfigOption: (configId: string, valueId: string) => Promise<void>;
   setSessionModel: (modelId: string) => Promise<void>;
 };
@@ -26,7 +27,7 @@ export function createRuntimeOverrideSynchronizers(params: Readonly<{
   ) => void;
 }>): {
   syncFromMetadata: () => void;
-  flushPendingAfterStart: () => Promise<void>;
+  flushPendingAfterStart: () => Promise<boolean>;
   rebindSession: (session: RuntimeOverrideSession) => Promise<void>;
 } {
   const publishTombstoneSupport = async (session: RuntimeOverrideSession): Promise<void> => {
@@ -84,10 +85,10 @@ export function createRuntimeOverrideSynchronizers(params: Readonly<{
     },
   };
 
-  async function flushPendingAfterStart(): Promise<void> {
-      await modeSync.flushPendingAfterStart();
-      if (!await modelSync.flushPendingAfterStartWithOutcome()) return;
-      await configOptionSync.flushPendingAfterStart();
+  async function flushPendingAfterStart(): Promise<boolean> {
+    if (!await modeSync.flushPendingAfterStartWithOutcome()) return false;
+    if (!await modelSync.flushPendingAfterStartWithOutcome()) return false;
+    return await configOptionSync.flushPendingAfterStartWithOutcome();
   }
 }
 

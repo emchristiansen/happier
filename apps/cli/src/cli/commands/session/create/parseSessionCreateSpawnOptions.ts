@@ -2,7 +2,7 @@ import {
   AcpConfigOptionOverridesV1Schema,
   AgentRuntimeDescriptorV1Schema,
   ConnectedServiceBindingsV1Schema,
-  SESSION_PERMISSION_MODES,
+  SESSION_PERMISSION_INTENT_INPUTS,
   SessionMcpSelectionV1Schema,
   parseSessionPermissionModeAlias,
   type SpawnConfigOptionValue,
@@ -36,8 +36,8 @@ export const SESSION_CREATE_USAGE = [
   '  [--path <path>] [--backend <backend-target>]',
   '  [--title <title>] [--tag <tag>]',
   '  [--prompt <text>|--message <text>]',
-  `  [--model <model-id>] [--permission-mode <${SESSION_PERMISSION_MODES.join('|')}>]`,
-  '    Aliases include read_only, ro, safe, full-access, accept-edits, and bypass-permissions.',
+  `  [--model <model-id>] [--permission-mode <${SESSION_PERMISSION_INTENT_INPUTS.join('|')}>]`,
+  '    Compatible aliases include read-only, workspace_write, safe-yolo, accept-edits, and bypass-permissions.',
   '  [--mode <agent-mode-id>] [--config-option <id=value>]',
   '  [--reasoning-effort <value>] [--ultracode]',
   '  [--config-overrides-json <json>] [--launch-profile <profile-id>]',
@@ -199,7 +199,7 @@ export function parseSessionCreateSpawnOptions(argv: readonly string[]): ParsedS
   const permissionMode = permissionModeRaw ? parseSessionPermissionModeAlias(permissionModeRaw) : null;
   if (permissionModeRaw && !permissionMode) {
     throw new Error(
-      `Invalid --permission-mode "${permissionModeRaw}". Expected one of: ${SESSION_PERMISSION_MODES.join(', ')}.`,
+      `Invalid --permission-mode "${permissionModeRaw}". Expected one of: ${SESSION_PERMISSION_INTENT_INPUTS.join(', ')}.`,
     );
   }
   const agentModeId = readOpaqueFlagValue(argv, '--mode') ?? '';

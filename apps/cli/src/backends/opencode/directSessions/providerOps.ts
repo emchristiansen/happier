@@ -30,11 +30,12 @@ export const openCodeDirectSessionProviderOps: DirectSessionProviderOps = {
       tailCursor: res.tailCursor ?? null,
       hasMore: res.hasMore,
       truncated: res.truncated === true,
+      ...(res.truncationReason ? { truncationReason: res.truncationReason } : {}),
     };
   },
   readAfterTranscript: async ({ source, remoteSessionId, cursor, maxBytes, maxItems }) => {
     const res = await readAfterOpenCodeTranscript({ source, remoteSessionId, cursor, maxBytes, maxItems });
-    return { items: res.items, nextCursor: res.nextCursor ?? null, truncated: res.truncated === true };
+    return { ...res, nextCursor: res.nextCursor ?? null, truncated: res.truncated === true };
   },
   acquireFollowLease: async ({ source, remoteSessionId }) => createPollingDirectSessionFollowLease({
     readAfterTranscript: ({ cursor, maxBytes, maxItems }) =>

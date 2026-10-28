@@ -28,7 +28,7 @@ describe('sessionControl.sessionsHttp URL encoding', () => {
     await expect(fetchSessionById({ token: 't', sessionId })).resolves.toBeNull();
 
     expect(getSpy).toHaveBeenCalledWith(
-      `http://server.example.test/v2/sessions/${encoded}`,
+      expect.stringContaining(`http://server.example.test/v2/sessions/${encoded}?happierConnectedServices=`),
       expect.any(Object),
     );
   });
@@ -56,4 +56,3 @@ describe('sessionControl.sessionsHttp URL encoding', () => {
     expect(postSpy.mock.calls[0]?.[0]).toBe(`http://server.example.test/v2/sessions/${encoded}/messages`);
   });
 });
-

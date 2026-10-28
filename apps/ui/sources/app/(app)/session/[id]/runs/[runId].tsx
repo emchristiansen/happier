@@ -3,6 +3,7 @@ import { Pressable, View } from 'react-native';
 import { Stack, useLocalSearchParams, useNavigation, useRouter } from 'expo-router';
 import { useUnistyles } from 'react-native-unistyles';
 import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
+import { useSessionCockpitBottomChromeHeight } from '@/components/workspaceCockpit/session/SessionCockpitChromeRegistry';
 
 import {
     SessionExecutionRunDetailsView,
@@ -25,6 +26,7 @@ function normalizeParam(value: unknown): string | null {
 
 export default function SessionRunDetailsScreen() {
     const { theme } = useUnistyles();
+    const bottomChromeHeight = useSessionCockpitBottomChromeHeight();
     const router = useRouter();
     const navigation = useNavigation();
     const params = useLocalSearchParams();
@@ -86,7 +88,7 @@ export default function SessionRunDetailsScreen() {
     }), [headerLeft, headerRight, runId]);
 
     return (
-        <View style={{ flex: 1, backgroundColor: theme.colors.background?.canvas ?? theme.colors.surface.base }}>
+        <View style={{ flex: 1, paddingBottom: bottomChromeHeight, backgroundColor: theme.colors.background?.canvas ?? theme.colors.surface.base }}>
             <Stack.Screen options={screenOptions} />
             {!hydrateReady && !hydrateMissing ? (
                 <ActivitySpinner size="small" color={theme.colors.text.secondary} />

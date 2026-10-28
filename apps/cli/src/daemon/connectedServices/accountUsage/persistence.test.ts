@@ -51,7 +51,11 @@ type PersistenceModule = Readonly<{
   }>): Readonly<{
     recordInBandSnapshot(
       snapshot: ProviderAccountUsageSnapshotV1,
-      options?: Readonly<{ source?: ConnectedServiceUsageSourceV1; sources?: readonly ConnectedServiceUsageSourceV1[] }>,
+      options?: Readonly<{
+        source?: ConnectedServiceUsageSourceV1;
+        sources?: readonly ConnectedServiceUsageSourceV1[];
+        onPersisted?: () => void;
+      }>,
     ): Promise<
       | Readonly<{ status: 'enqueued'; enqueue: 'accepted' | 'coalesced' }>
       | Readonly<{ status: 'already_persisted'; reason: string }>
@@ -227,6 +231,95 @@ describe('provider account usage persistence', () => {
         status: 'already_persisted',
         reason: 'unchanged',
       });
+    } finally {
+      scheduler.dispose();
+    }
+  });
+
+  it('confirms a queued in-band write once the server accepts it', async () => {
+    const module = await loadPersistenceModule();
+    expect(module).not.toBeNull();
+    const serverWrite: { accept: (() => void) | null } = { accept: null };
+    const scheduler = module!.createProviderAccountUsagePersistenceScheduler({
+      api: {
+        getAccountEncryptionMode: async () => 'plain',
+        registerProviderAccountUsageSnapshotPlain: () => new Promise<void>((resolve) => { serverWrite.accept = resolve; }),
+      },
+      now: () => 1_000,
+      fingerprintKey: new Uint8Array(32).fill(9),
+    });
+    const onPersisted = vi.fn();
+    try {
+      await expect(scheduler.recordInBandSnapshot(createSnapshot(), { onPersisted }))
+        .resolves.toEqual({ status: 'enqueued', enqueue: 'accepted' });
+      await vi.waitFor(() => expect(serverWrite.accept).not.toBeNull());
+      expect(onPersisted).not.toHaveBeenCalled();
+
+      serverWrite.accept?.();
+      await scheduler.flush(1_000);
+      expect(onPersisted).toHaveBeenCalledOnce();
+    } finally {
+      scheduler.dispose();
+    }
+  });
+
+  it('confirms a queued in-band write that lands on a retry after the server first fails', async () => {
+    const module = await loadPersistenceModule();
+    expect(module).not.toBeNull();
+    let attempts = 0;
+    const scheduler = module!.createProviderAccountUsagePersistenceScheduler({
+      api: {
+        getAccountEncryptionMode: async () => 'plain',
+        registerProviderAccountUsageSnapshotPlain: async () => {
+          attempts += 1;
+          if (attempts === 1) throw new Error('server unavailable');
+        },
+      },
+      now: () => 1_000,
+      fingerprintKey: new Uint8Array(32).fill(9),
+    });
+    const onPersisted = vi.fn();
+    try {
+      await scheduler.recordInBandSnapshot(createSnapshot(), { onPersisted });
+      await vi.waitFor(async () => {
+        await scheduler.flush(1_000);
+        expect(attempts).toBeGreaterThanOrEqual(2);
+      }, { timeout: 10_000 });
+      expect(onPersisted).toHaveBeenCalledOnce();
+    } finally {
+      scheduler.dispose();
+    }
+  });
+
+  it('does not let a future-dated observation suppress a later current persistence write', async () => {
+    const module = await loadPersistenceModule();
+    expect(module).not.toBeNull();
+    const api = {
+      getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
+      registerProviderAccountUsageSnapshotPlain: vi.fn(async () => {}),
+    };
+    const scheduler = module!.createProviderAccountUsagePersistenceScheduler({
+      api,
+      now: () => 10_000,
+      fingerprintKey: new Uint8Array(32).fill(9),
+      minFreshnessMs: 60_000,
+    });
+    const future = { ...createSnapshot(), fetchedAtMs: 100_000, observedAtMs: 100_000 };
+    const current = { ...createSnapshot(), fetchedAtMs: 10_000, observedAtMs: 10_000 };
+    try {
+      await expect(scheduler.recordInBandSnapshot(future)).resolves.toEqual({
+        status: 'already_persisted',
+        reason: 'future',
+      });
+      await expect(scheduler.recordInBandSnapshot(current)).resolves.toEqual({
+        status: 'enqueued',
+        enqueue: 'accepted',
+      });
+      await scheduler.flush(1_000);
+      expect(api.registerProviderAccountUsageSnapshotPlain).toHaveBeenCalledTimes(1);
+      expect(api.registerProviderAccountUsageSnapshotPlain).toHaveBeenCalledWith(expect.objectContaining({
+        metadata: expect.objectContaining({ fetchedAt: 10_000 }),
+      }));
     } finally {
       scheduler.dispose();
     }

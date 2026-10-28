@@ -1,5 +1,8 @@
 import { z } from 'zod';
 
+import { ActionOperationSnapshotV1Schema } from '../actions/operations/actionOperationV1.js';
+import { SpawnSessionTerminalSchema } from '../spawnSession.js';
+
 import { AgentRuntimeDescriptorV1Schema } from '../sessionMetadata/agentRuntimeDescriptorV1.js';
 import { CODEX_BACKEND_MODES } from '../providers/codex/backendMode.js';
 import { AgentProviderIdV1Schema } from '../providers/agentProviderIdsV1.js';
@@ -60,13 +63,42 @@ const DirectSessionsPiAgentDirSourceSchema = z
   })
   .passthrough();
 
+/**
+ * Generic source for agents whose ACP server advertises `session/list`. It carries no provider
+ * identity and no filesystem location: candidates are produced by the agent itself over ACP and are
+ * resume-only. `cwd` is the optional ACP working-directory filter and must be absolute.
+ */
+const DirectSessionsAcpSessionListSourceSchema = z
+  .object({
+    kind: z.literal('acpSessionList'),
+    cwd: z.string().min(1).max(10_000).nullish(),
+  })
+  .passthrough();
+
 export const DirectSessionsSourceSchema = z.discriminatedUnion('kind', [
   DirectSessionsCodexHomeSourceSchema,
   DirectSessionsClaudeConfigSourceSchema,
   DirectSessionsOpenCodeServerSourceSchema,
   DirectSessionsPiAgentDirSourceSchema,
+  DirectSessionsAcpSessionListSourceSchema,
 ]);
 export type DirectSessionsSource = z.infer<typeof DirectSessionsSourceSchema>;
+
+/**
+ * Negotiates only the generic ACP `session/list` browse source. This capability is intentionally
+ * resume-only and grants no transcript, follow, takeover, terminal, or writer authority.
+ */
+export const DirectSessionsAcpSessionListCapabilityRequestSchema = z.object({}).strict();
+export type DirectSessionsAcpSessionListCapabilityRequest = z.infer<typeof DirectSessionsAcpSessionListCapabilityRequestSchema>;
+
+export const DirectSessionsAcpSessionListCapabilityResponseSchema = z.object({
+  ok: z.literal(true),
+  capability: z.literal('acp_session_list_v1'),
+  protocolVersion: z.literal(1),
+  sourceKind: z.literal('acpSessionList'),
+  resumeOnly: z.literal(true),
+}).strict();
+export type DirectSessionsAcpSessionListCapabilityResponse = z.infer<typeof DirectSessionsAcpSessionListCapabilityResponseSchema>;
 
 export const DirectSessionsSearchModeSchema = z.enum(['fast', 'full']);
 export type DirectSessionsSearchMode = z.infer<typeof DirectSessionsSearchModeSchema>;
@@ -91,6 +123,9 @@ export const DirectSessionsCandidatesListResponseSchema = z.union([
       candidates: z.array(z.lazy(() => DirectSessionCandidateV1Schema)),
       nextCursor: z.string().min(1).nullish(),
       searchIncomplete: z.boolean().optional(),
+      capabilities: z.object({
+        deleteCandidate: z.boolean(),
+      }).optional(),
     })
     .passthrough(),
   z
@@ -102,6 +137,26 @@ export const DirectSessionsCandidatesListResponseSchema = z.union([
     .passthrough(),
 ]);
 export type DirectSessionsCandidatesListResponse = z.infer<typeof DirectSessionsCandidatesListResponseSchema>;
+
+export const DirectSessionCandidateDeleteRequestSchema = z
+  .object({
+    machineId: z.string().min(1),
+    providerId: DirectSessionsProviderIdSchema,
+    source: DirectSessionsSourceSchema,
+    remoteSessionId: z.string().min(1).max(2000),
+  })
+  .passthrough();
+export type DirectSessionCandidateDeleteRequest = z.infer<typeof DirectSessionCandidateDeleteRequestSchema>;
+
+export const DirectSessionCandidateDeleteResponseSchema = z.union([
+  z.object({ ok: z.literal(true), deleted: z.literal(true) }).passthrough(),
+  z.object({
+    ok: z.literal(false),
+    errorCode: z.enum(['invalid_request', 'machine_offline', 'provider_unavailable', 'internal_error']),
+    error: z.string().min(1),
+  }).passthrough(),
+]);
+export type DirectSessionCandidateDeleteResponse = z.infer<typeof DirectSessionCandidateDeleteResponseSchema>;
 
 export const DirectSessionLinkEnsureRequestSchema = z
   .object({
@@ -301,6 +356,10 @@ export const DirectTranscriptPageRequestSchema = z
   .passthrough();
 export type DirectTranscriptPageRequest = z.infer<typeof DirectTranscriptPageRequestSchema>;
 
+// Keep `truncated` for released readers; only a page limit permits adjacent continuation.
+export const DirectTranscriptTruncationReasonSchema = z.enum(['page_limit', 'source_discontinuity']);
+export type DirectTranscriptTruncationReason = z.infer<typeof DirectTranscriptTruncationReasonSchema>;
+
 export const DirectTranscriptPageResponseSchema = z.union([
   z
     .object({
@@ -310,8 +369,18 @@ export const DirectTranscriptPageResponseSchema = z.union([
       tailCursor: z.string().min(1).nullish(),
       hasMore: z.boolean(),
       truncated: z.boolean().optional(),
+      truncationReason: DirectTranscriptTruncationReasonSchema.optional(),
     })
-    .passthrough(),
+    .passthrough()
+    .superRefine((value, ctx) => {
+      if (value.truncationReason === 'page_limit' && typeof value.nextCursor !== 'string') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'page-limit transcript continuation requires a next cursor',
+          path: ['nextCursor'],
+        });
+      }
+    }),
   z
     .object({
       ok: z.literal(false),
@@ -335,6 +404,14 @@ export const DirectTranscriptReadAfterRequestSchema = z
   .passthrough();
 export type DirectTranscriptReadAfterRequest = z.infer<typeof DirectTranscriptReadAfterRequestSchema>;
 
+export function resolveDirectTranscriptContinuation(params: Readonly<{
+  truncated?: boolean;
+  truncationReason?: DirectTranscriptTruncationReason;
+}>): 'complete' | DirectTranscriptTruncationReason {
+  // Explicit facts are authoritative; providers retain their released boolean semantics.
+  return params.truncationReason ?? (params.truncated === true ? 'source_discontinuity' : 'complete');
+}
+
 export const DirectTranscriptReadAfterResponseSchema = z.union([
   z
     .object({
@@ -342,8 +419,18 @@ export const DirectTranscriptReadAfterResponseSchema = z.union([
       items: z.array(DirectTranscriptRawMessageV1Schema),
       nextCursor: z.string().min(1).nullish(),
       truncated: z.boolean(),
+      truncationReason: DirectTranscriptTruncationReasonSchema.optional(),
     })
-    .passthrough(),
+    .passthrough()
+    .superRefine((value, ctx) => {
+      if (value.truncationReason === 'page_limit' && typeof value.nextCursor !== 'string') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'page-limit transcript continuation requires a next cursor',
+          path: ['nextCursor'],
+        });
+      }
+    }),
   z
     .object({
       ok: z.literal(false),
@@ -354,11 +441,18 @@ export const DirectTranscriptReadAfterResponseSchema = z.union([
 ]);
 export type DirectTranscriptReadAfterResponse = z.infer<typeof DirectTranscriptReadAfterResponseSchema>;
 
+export const DIRECT_SESSION_TAKEOVER_ACTION_IDS = Object.freeze({
+  direct: 'session.direct.takeover',
+  persisted: 'session.direct.takeover_persist',
+} as const);
+
 export const DirectSessionTakeoverRequestSchema = z
   .object({
     machineId: z.string().min(1),
     sessionId: z.string().min(1),
     forceStop: z.boolean().optional(),
+    requestId: z.string().trim().min(1).optional(),
+    terminal: SpawnSessionTerminalSchema.optional(),
   })
   .passthrough();
 export type DirectSessionTakeoverRequest = z.infer<typeof DirectSessionTakeoverRequestSchema>;
@@ -380,6 +474,8 @@ export const DirectSessionTakeoverPersistRequestSchema = z
     machineId: z.string().min(1),
     sessionId: z.string().min(1),
     forceStop: z.boolean().optional(),
+    requestId: z.string().trim().min(1).optional(),
+    terminal: SpawnSessionTerminalSchema.optional(),
   })
   .passthrough();
 export type DirectSessionTakeoverPersistRequest = z.infer<typeof DirectSessionTakeoverPersistRequestSchema>;
@@ -395,3 +491,14 @@ export const DirectSessionTakeoverPersistResponseSchema = z.union([
     .passthrough(),
 ]);
 export type DirectSessionTakeoverPersistResponse = z.infer<typeof DirectSessionTakeoverPersistResponseSchema>;
+
+// Start acknowledges the same daemon-local Action Operation observed via list/get/cancel.
+export const DirectSessionTakeoverPersistStartResponseSchema = z.union([
+  z.object({ ok: z.literal(true), operation: ActionOperationSnapshotV1Schema }),
+  z.object({
+    ok: z.literal(false),
+    errorCode: z.enum(['invalid_request', 'machine_offline', 'provider_unavailable', 'internal_error']),
+    error: z.string().min(1),
+  }),
+]);
+export type DirectSessionTakeoverPersistStartResponse = z.infer<typeof DirectSessionTakeoverPersistStartResponseSchema>;

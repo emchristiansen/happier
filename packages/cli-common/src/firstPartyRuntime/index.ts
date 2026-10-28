@@ -41,6 +41,14 @@ export {
   writeDefaultManagedReleaseChannel,
 } from './defaultReleaseChannelState.js';
 export {
+  readHappierCliChoiceSync,
+  resolveHappierCliChoiceStatePath,
+  writeHappierCliChoice,
+} from './happierCliChoice.js';
+export type { HappierCliChoice } from './happierCliChoice.js';
+export { describeHappierCliOrigin } from './happierCliOrigin.js';
+export type { HappierCliOrigin } from './happierCliOrigin.js';
+export {
   DAEMON_SERVICE_MANAGED_CLI_RELEASE_CHANNEL_ENV_KEYS,
   STANDARD_MANAGED_CLI_RELEASE_CHANNEL_ENV_KEYS,
   resolveManagedCliReleaseChannel,
@@ -55,20 +63,14 @@ export type {
 } from './resolveManagedCliReleaseChannel.js';
 export {
   prepareFirstPartyComponentPayloadFromGitHubRelease,
+  resolveFirstPartyComponentRelease,
 } from './prepareFirstPartyComponentPayloadFromGitHubRelease.js';
 export type {
   FirstPartyReleaseArtifactSource,
   PreparedFirstPartyComponentPayload,
+  ResolvedFirstPartyComponentRelease,
 } from './prepareFirstPartyComponentPayloadFromGitHubRelease.js';
-export {
-  resolveCliBinaryAssetBundleFromReleaseAssets,
-} from './releaseAssetBundle.js';
-export type {
-  ReleaseAsset,
-  ReleaseAssetBundle,
-} from './releaseAssetBundle.js';
 export { extractReleasePayloadRootFromArchive } from './extractReleasePayloadRootFromArchive.js';
-export { removeRuntimePayloadPath } from './copyRuntimePayloadTree.js';
 
 export { listInstalledVersionIdsNewestFirst } from './listInstalledVersionIdsNewestFirst.js';
 export { installVersionedPayload } from './installVersionedPayload.js';
@@ -78,8 +80,31 @@ export type { FirstPartyPayloadPromotionResult } from './promoteVersionedPayload
 export { pruneRetainedVersions } from './pruneRetainedVersions.js';
 export type { FirstPartyPruneRetainedVersionsResult } from './pruneRetainedVersions.js';
 
-export { rollbackVersionedPayload } from './rollbackVersionedPayload.js';
-export type { FirstPartyRollbackResult } from './rollbackVersionedPayload.js';
+export {
+  FirstPartyPayloadMutationLockError,
+  withFirstPartyActivationLock,
+  withFirstPartyPayloadMutationLock,
+} from './withFirstPartyPayloadMutationLock.js';
+export {
+  ManagedCliUpdateError,
+  readLastCliUpdateResult,
+  runManagedCliUpdate,
+  watchLastCliUpdateResult,
+} from './runManagedCliUpdate.js';
+export type {
+  ManagedCliUpdateParams,
+  ManagedCliUpdateResult,
+  ManagedCliUpdateRestart,
+} from './runManagedCliUpdate.js';
+
+export {
+  formatPinnedDaemonServiceRestartCommand,
+  planServiceDaemonsRestartAfterCliUpdate,
+} from './serviceDaemonsToRestartAfterCliUpdate.js';
+export type {
+  ServiceDaemonBeforeCliUpdate,
+  ServiceDaemonsRestartAfterCliUpdatePlan,
+} from './serviceDaemonsToRestartAfterCliUpdate.js';
 
 export { syncInstalledFirstPartyShims } from './syncInstalledFirstPartyShims.js';
 export type { SyncInstalledFirstPartyShimsResult } from './syncInstalledFirstPartyShims.js';
@@ -111,6 +136,8 @@ export {
   resolveServerMigrationsEnabled,
   resolvePrismaSqliteDatabaseUrlOptionsFromEnv,
   resolveServerLightSqliteDatabaseUrlOptionsFromEnv,
+  resolvePrismaSqliteDatabaseFilePath,
+  readPrismaSqliteConnectionParams,
 } from './selfHostServerEnv.js';
 export type { PrismaSqliteDatabaseUrlOptions, SelfHostServerMigrationPlan } from './selfHostServerEnv.js';
 
@@ -120,8 +147,26 @@ export {
   relocateServerRuntimeArtifactClosure,
   resolveManagedServerRuntimePaths,
   resolveServerRuntimeExecutableNames,
-  resolveServerRuntimePrismaEngineFileName,
   resolveServerRuntimePayloadRootFromBinaryPath,
 } from './serverRuntimeArtifactLayout.js';
 
 export { installOrUpdateRelayRuntimeLocal } from './relayRuntimeInstall.js';
+
+export {
+  HAPPIER_DESKTOP_PATH_MARKER_LINE,
+  HAPPIER_DESKTOP_WINDOWS_PATH_MOVES_VARIABLE,
+  HAPPIER_DESKTOP_WINDOWS_PATH_PROVENANCE_VARIABLE,
+  ensureHappierCliPathExposure,
+  removeHappierCliPathExposure,
+  renderHappierCliPathExportLine,
+  resolveForeignHappierCli,
+  resolveHappierCliSearchPath,
+  resolveTerminalHappierCli,
+} from './ensureHappierCliPathExposure.js';
+export type {
+  HappierCliPathExposureResult,
+  HappierCliPathRemovalResult,
+  TerminalHappierCli,
+} from './ensureHappierCliPathExposure.js';
+export { FirstPartyAcquisitionError, readAcquisitionFailureCause, redactAcquisitionDiagnostic } from './acquisitionProgress.js';
+export type { FirstPartyAcquisitionOptions } from './acquisitionProgress.js';

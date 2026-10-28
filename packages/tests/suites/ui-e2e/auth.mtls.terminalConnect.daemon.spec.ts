@@ -89,9 +89,6 @@ test.describe('ui e2e: mTLS login + terminal connect', () => {
         HAPPIER_FEATURE_AUTH_UI__AUTO_REDIRECT_ENABLED: '1',
         HAPPIER_FEATURE_AUTH_UI__AUTO_REDIRECT_PROVIDER_ID: 'mtls',
 
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
       },
     });
 
@@ -127,7 +124,7 @@ test.describe('ui e2e: mTLS login + terminal connect', () => {
   });
 
   test('logs in via mTLS, approves terminal connect, and daemon becomes online', async ({ page }) => {
-    test.setTimeout(600_000);
+    test.setTimeout(180_000);
     if (!server) throw new Error('missing server fixture');
     if (!uiBaseUrl) throw new Error('missing ui base url');
     if (!proxyBaseUrl) throw new Error('missing proxy base url');

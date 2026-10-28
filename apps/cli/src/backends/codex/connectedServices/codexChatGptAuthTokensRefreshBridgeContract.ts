@@ -34,6 +34,7 @@ export const CodexChatGptAuthTokensRefreshResponseSchema = z.object({
   chatgptPlanType: z.string().nullable(),
   credentialRevision: ConnectedServiceCredentialRevisionV1Schema.optional(),
   selectionEpoch: z.number().int().nonnegative().optional(),
+  selection: CodexChatGptAuthTokensRefreshSelectionSchema.optional(),
 });
 
 export type CodexChatGptAuthTokensRefreshResponse =

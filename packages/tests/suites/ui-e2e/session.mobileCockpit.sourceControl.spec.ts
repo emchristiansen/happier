@@ -37,9 +37,6 @@ test.describe('ui e2e: mobile session cockpit source control', () => {
       extraEnv: {
         HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys',
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
         HAPPIER_E2E_PROVIDER_USE_SERVER_SOURCE_ENTRYPOINT: '1',
       },
     });
@@ -66,7 +63,7 @@ test.describe('ui e2e: mobile session cockpit source control', () => {
   });
 
   test('moves between Files, Git, Review, details, and Chat through the default phone cockpit', async ({ page }) => {
-    test.setTimeout(900_000);
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
     await page.setViewportSize({ width: 390, height: 844 });

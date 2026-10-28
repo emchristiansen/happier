@@ -1,145 +1,80 @@
 import * as React from 'react';
 
-import { getDefaultSystemTaskRunner, useSystemTaskSnapshot } from '@/components/systemTasks';
-import { usePrimaryMachineFromActiveSelection } from '@/components/settings/server/hooks/usePrimaryMachineFromActiveSelection';
-import { readCachedMachineDoctorSnapshot } from '@/components/settings/systemStatus/cache/machineDoctorSnapshotCache';
+import { getDefaultSystemTaskRunner } from '@/components/systemTasks';
+import { useThisComputerSetupTask } from '@/components/systemTasks/useThisComputerSetupTask';
+import { presentSetupServiceConsent } from '@/setup/presentSetupServiceConsent';
+import { presentUnmanagedCliConsent } from '@/setup/presentUnmanagedCliConsent';
+import { presentRelayReconciliationConsent } from '@/setup/presentRelayReconciliationConsent';
+import { useDesktopLocalInspection } from '@/setup/useDesktopLocalInspection';
+import { isTauriDesktop } from '@/utils/platform/tauri';
+import { getActiveServerAccountScope } from '@/sync/domains/scope/activeServerAccountScope';
 import { getActiveServerSnapshot } from '@/sync/domains/server/serverProfiles';
-import { toServerUrlDisplay } from '@/sync/domains/server/url/serverUrlDisplay';
 import { upsertActivateAndSwitchServer } from '@/sync/domains/server/activeServerSwitch';
 import { useAuth } from '@/auth/context/AuthContext';
 import { Modal } from '@/modal';
 import { t } from '@/text';
-import { classifyRelayDrift, createRelayUrlComparableKeySafe, resolveKnownRelayEquivalentUrl } from '@/sync/domains/server/relayDrift/relayDriftModel';
-import { buildRelayDriftRepairSystemTaskSpec } from '@/sync/domains/server/relayDrift/relayDriftSystemTask';
-import { resolveWebappUrlFromServerUrl } from '@/sync/domains/server/url/resolveWebappUrlFromServerUrl';
 import type { RelayDriftBanner } from './relayDriftTypes';
+import { useRelayDriftSummary } from './useRelayDriftSummary';
 
-function readAppSameOriginRelayUrl(): string | null {
-    const currentOrigin = typeof window !== 'undefined'
-        ? window.location?.origin
-        : (globalThis as typeof globalThis & { location?: { origin?: string } }).location?.origin;
-    const normalizedOrigin = typeof currentOrigin === 'string' ? currentOrigin.trim() : '';
-    return normalizedOrigin || null;
-}
-
-function resolveDoctorLocalRelayCandidate(params: Readonly<{
-    activeRelayUrl: string;
-    doctorSnapshot: ReturnType<typeof readCachedMachineDoctorSnapshot>;
-}>): string | null {
-    const doctorServer = params.doctorSnapshot?.snapshot.server;
-    if (!doctorServer) {
-        return null;
-    }
-
-    const activeRelayKey = createRelayUrlComparableKeySafe(params.activeRelayUrl);
-    if (!activeRelayKey) {
-        return null;
-    }
-    const doctorPublicRelayKey = createRelayUrlComparableKeySafe(doctorServer.publicServerUrl);
-    const doctorServerUrl = typeof doctorServer.serverUrl === 'string' ? doctorServer.serverUrl.trim() : '';
-    const knownPair = doctorPublicRelayKey
-        ? resolveKnownRelayEquivalentUrl({
-            activeRelayUrl: params.activeRelayUrl,
-            daemonRelayUrl: doctorServerUrl,
-            daemonAlternateRelayUrls: [doctorServer.publicServerUrl],
-        })
-        : null;
-    if (knownPair) {
-        return knownPair;
-    }
-
-    const appSameOriginRelayKey = createRelayUrlComparableKeySafe(readAppSameOriginRelayUrl());
-    const candidates = [doctorServer.serverUrl, doctorServer.webappUrl];
-    for (const candidate of candidates) {
-        const normalizedCandidate = typeof candidate === 'string' ? candidate.trim() : '';
-        if (!normalizedCandidate) continue;
-        const candidateKey = createRelayUrlComparableKeySafe(normalizedCandidate);
-        if (!candidateKey || candidateKey === activeRelayKey) continue;
-        if (!doctorPublicRelayKey && appSameOriginRelayKey && appSameOriginRelayKey === candidateKey) {
-            return normalizedCandidate;
-        }
-    }
-
-    return null;
-}
-
+/**
+ * The drift summary plus its one repair: the same explicit-target executor every other caller
+ * starts (SB6), through the coordinator — which asks before an ACCOUNT move (D1).
+ */
 export function useRelayDriftBanner(): RelayDriftBanner | null {
     const auth = useAuth();
-    const primaryMachineId = usePrimaryMachineFromActiveSelection();
+    const summary = useRelayDriftSummary();
     const activeServerSnapshot = getActiveServerSnapshot();
     const runner = React.useMemo(() => getDefaultSystemTaskRunner(), []);
-    const [repairTaskId, setRepairTaskId] = React.useState<string | null>(null);
-    const [isRepairStarting, setIsRepairStarting] = React.useState(false);
-    const repairTaskSnapshot = useSystemTaskSnapshot(runner, repairTaskId);
+    const desktop = isTauriDesktop();
+    useDesktopLocalInspection(desktop);
     const isRepairUnavailable = runner.mode === 'unavailable';
 
-    const cachedDoctorSnapshot = React.useMemo(() => {
-        if (!primaryMachineId || !activeServerSnapshot.serverId) {
-            return null;
-        }
-        return readCachedMachineDoctorSnapshot({
-            serverId: activeServerSnapshot.serverId,
-            machineId: primaryMachineId,
-        });
-    }, [activeServerSnapshot.serverId, primaryMachineId]);
+    // The account this repair is for, read from the same owner the executor spec is built from, so
+    // the app never approves a pairing bound to a different account (INV2).
+    const expectedAccountId = getActiveServerAccountScope()?.accountId ?? null;
+    const setupTask = useThisComputerSetupTask({
+        runner,
+        ...(expectedAccountId
+            ? {
+                authRequestApproval: {
+                    expectedRelayUrl: activeServerSnapshot.serverUrl,
+                    expectedAccountId,
+                    serverId: activeServerSnapshot.serverId,
+                },
+            }
+            : {}),
+        onServiceConsentRequired: presentSetupServiceConsent,
+        onUnmanagedCliConsentRequired: presentUnmanagedCliConsent,
+        // Keep the explicit drift action self-contained. The account/relay consent presenter is
+        // part of this surface's user action; loading it through a deferred chunk made a native
+        // click fail with an unhandled "Load failed" while leaving the banner unchanged.
+        confirm: presentRelayReconciliationConsent,
+    });
+    const repairTaskSnapshot = setupTask.activeTaskSnapshot;
+    const isRepairStarting = setupTask.isStarting;
 
-    const activeWebappUrl = resolveWebappUrlFromServerUrl(activeServerSnapshot.serverUrl);
-    const activeLocalRelayUrl = React.useMemo(() => {
-        if (typeof activeServerSnapshot.activeLocalRelayUrl === 'string' && activeServerSnapshot.activeLocalRelayUrl.trim().length > 0) {
-            return activeServerSnapshot.activeLocalRelayUrl.trim();
-        }
-
-        const doctorLocalRelayUrl = resolveDoctorLocalRelayCandidate({
-            activeRelayUrl: activeServerSnapshot.serverUrl,
-            doctorSnapshot: cachedDoctorSnapshot,
-        });
-        if (doctorLocalRelayUrl) {
-            return doctorLocalRelayUrl;
-        }
-
-        const appSameOriginRelayUrl = readAppSameOriginRelayUrl();
-        if (!appSameOriginRelayUrl) {
-            return null;
-        }
-
-        if (createRelayUrlComparableKeySafe(appSameOriginRelayUrl) === createRelayUrlComparableKeySafe(activeServerSnapshot.serverUrl)) {
-            return null;
-        }
-
-        return appSameOriginRelayUrl;
-    }, [activeServerSnapshot.activeLocalRelayUrl, activeServerSnapshot.serverUrl, cachedDoctorSnapshot]);
+    const setupStart = setupTask.start;
     const handleStartRepair = React.useCallback(async () => {
         if (isRepairUnavailable || isRepairStarting || (repairTaskSnapshot != null && repairTaskSnapshot.result == null)) {
             return;
         }
-
-        setIsRepairStarting(true);
+        // Repair is the same explicit-target executor every other caller starts (SB6), sequenced
+        // by the one desktop-side owner, which asks first when the move is an account move (D1).
         try {
-            const taskId = await runner.start(buildRelayDriftRepairSystemTaskSpec({
-                activeRelayUrl: activeServerSnapshot.serverUrl,
-                activeWebappUrl,
-                activeLocalRelayUrl,
-            }));
-            setRepairTaskId(taskId);
-        } finally {
-            setIsRepairStarting(false);
+            await setupStart();
+        } catch {
+            // The task hook retains the start error so the banner can render a recoverable status.
+            // Do not leak an unhandled promise rejection from a button press.
         }
-    }, [
-        activeServerSnapshot.serverUrl,
-        activeLocalRelayUrl,
-        activeWebappUrl,
-        isRepairUnavailable,
-        isRepairStarting,
-        repairTaskSnapshot,
-        runner,
-    ]);
+    }, [isRepairStarting, isRepairUnavailable, repairTaskSnapshot, setupStart]);
 
+    const cancelRepair = setupTask.cancel;
     const handleCancelRepair = React.useCallback(() => {
-        if (!repairTaskId || !repairTaskSnapshot || repairTaskSnapshot.result) {
+        if (!repairTaskSnapshot || repairTaskSnapshot.result) {
             return;
         }
-        void runner.cancel(repairTaskId);
-    }, [repairTaskId, repairTaskSnapshot, runner]);
+        cancelRepair();
+    }, [cancelRepair, repairTaskSnapshot]);
 
     const switchToServerUrl = React.useCallback(async (serverUrl: string) => {
         const normalized = String(serverUrl ?? '').trim();
@@ -160,67 +95,27 @@ export function useRelayDriftBanner(): RelayDriftBanner | null {
     }, [auth]);
 
     return React.useMemo(() => {
-        const daemonSnapshot = cachedDoctorSnapshot?.snapshot.daemonStatus;
-        const daemonServer = daemonSnapshot?.server;
-        const daemonAuth = daemonSnapshot?.auth;
-        const daemonService = daemonSnapshot?.service;
-        const classification = classifyRelayDrift({
-            activeRelayUrl: activeServerSnapshot.serverUrl,
-            activeLocalRelayUrl,
-            daemonRelayUrl: daemonServer?.serverUrl ?? cachedDoctorSnapshot?.snapshot.server.serverUrl ?? null,
-            daemonAlternateRelayUrls: [
-                daemonServer?.publicServerUrl ?? cachedDoctorSnapshot?.snapshot.server.publicServerUrl ?? null,
-            ],
-            daemonAccountId: daemonAuth?.accountId ?? cachedDoctorSnapshot?.snapshot.accountId ?? null,
-            daemonNeedsAuth: daemonAuth?.needsAuth,
-            daemonServiceInstalled: daemonService?.installed,
-            daemonRunning: daemonService?.running,
-        });
-
-        if (classification.status === 'aligned' || classification.repairAction == null) {
+        if (!summary) {
             return null;
         }
-
-        const daemonRelayUrl = daemonServer?.serverUrl ?? cachedDoctorSnapshot?.snapshot.server.serverUrl ?? null;
-        const activeRelayLabel = toServerUrlDisplay(activeServerSnapshot.serverUrl);
-        const daemonRelayLabel = daemonRelayUrl ? toServerUrlDisplay(daemonRelayUrl) : null;
-
-        const description = classification.status === 'daemon_url_mismatch'
-            ? t('server.relayDrift.bannerDifferentRelayDescription', {
-                activeRelayUrl: activeRelayLabel,
-                daemonRelayUrl: daemonRelayLabel ?? t('server.relayDrift.statusUnknown'),
-            })
-            : classification.status === 'daemon_not_installed'
-                ? t('server.relayDrift.bannerNotInstalledDescription', { activeRelayUrl: activeRelayLabel })
-                : classification.status === 'daemon_not_running'
-                    ? t('server.relayDrift.bannerNotRunningDescription', { activeRelayUrl: activeRelayLabel })
-            : classification.status === 'daemon_needs_auth'
-                ? t('server.relayDrift.bannerNeedsAuthDescription', { activeRelayUrl: activeRelayLabel })
-                : t('server.relayDrift.bannerNotConfiguredDescription', { activeRelayUrl: activeRelayLabel });
-
+        const daemonRelayUrl = summary.daemonRelayUrl;
         return {
             kind: 'warning',
-            title: classification.status === 'daemon_url_mismatch'
-                ? t('server.relayDrift.bannerDifferentRelayTitle')
-                : classification.status === 'daemon_not_installed'
-                    ? t('server.relayDrift.bannerNotInstalledTitle')
-                    : classification.status === 'daemon_not_running'
-                        ? t('server.relayDrift.bannerNotRunningTitle')
-                : classification.status === 'daemon_needs_auth'
-                    ? t('server.relayDrift.bannerNeedsAuthTitle')
-                    : t('server.relayDrift.bannerNotConfiguredTitle'),
-            description,
-            actionLabel: classification.status === 'daemon_needs_auth'
-                ? t('common.authenticate')
-                : t('server.relayDrift.repairAction'),
+            title: summary.title,
+            description: summary.description,
+            actionLabel: summary.actionLabel,
             ...(isRepairUnavailable
                 ? {
                     actionDisabled: true,
                     actionHint: t('settings.systemTaskBridgeUnavailable'),
                 }
+                : setupTask.startError
+                    ? { actionHint: t('settings.systemTaskStartFailed') }
+                : repairTaskSnapshot?.result?.ok === false
+                    ? { actionHint: repairTaskSnapshot.result.error.message }
                 : {}),
             onPress: handleStartRepair,
-            ...(classification.status === 'daemon_url_mismatch' && daemonRelayUrl
+            ...(daemonRelayUrl
                 ? {
                     secondaryActionLabel: t('server.switchToServer'),
                     onSecondaryPress: () => switchToServerUrl(daemonRelayUrl),
@@ -231,14 +126,13 @@ export function useRelayDriftBanner(): RelayDriftBanner | null {
             onCancelRepair: handleCancelRepair,
         } satisfies RelayDriftBanner;
     }, [
-        activeServerSnapshot.serverUrl,
-        activeLocalRelayUrl,
-        cachedDoctorSnapshot,
         handleCancelRepair,
         handleStartRepair,
         isRepairUnavailable,
         isRepairStarting,
         repairTaskSnapshot,
+        summary,
         switchToServerUrl,
+        setupTask.startError,
     ]);
 }

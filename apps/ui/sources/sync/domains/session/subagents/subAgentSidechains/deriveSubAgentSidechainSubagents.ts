@@ -1,3 +1,4 @@
+import { compareTranscriptMessagesOldestFirst } from '@/sync/domains/messages/transcriptOrdering';
 import type { Message, ToolCallMessage } from '@/sync/domains/messages/messageTypes';
 import { resolveToolTranscriptSidechainId } from '@/components/tools/shell/views/resolveToolTranscriptSidechainId';
 import { buildToolCallMessageRouteId } from '@/sync/domains/messages/messageRouteIds';
@@ -10,7 +11,7 @@ import {
 import type { SessionSubagent, SessionSubagentNativeRef } from '../types';
 import { resolveSubAgentSidechainProviderLabel } from './resolveSubAgentSidechainProviderLabel';
 import { isGenericSubAgentToolName } from '@happier-dev/protocol/tools/v2';
-import { isClaudeAsyncAgentLaunchToolResult } from '@happier-dev/protocol';
+import { isClaudeAsyncAgentLaunchToolResult, normalizeClaudeActivityStatusSignal, readClaudeAgentSdkProviderTaskStatus } from '@happier-dev/protocol';
 import { resolvePendingPermissionRouteForSubAgentTool } from './resolvePendingPermissionRouteForSubAgentTool';
 
 function readNonEmptyString(value: unknown): string | null {
@@ -119,31 +120,27 @@ function deriveCompletionOnlyNativeRef(nativeSubagent: Record<string, unknown>):
  * after it started. `isClaudeAsyncAgentLaunchToolResult` is the shared owner of that question, so
  * this row and the CLI's activity headline cannot disagree about it.
  *
- * A failed launch is still a failure: the exception is bounded to a non-error completion.
+ * Launch acknowledgements cannot hide a failed call. Explicit interruption is cancellation,
+ * including when a transport represents its terminal result as a tool error.
  *
- * `unavailable` is the reducer's record that the session process hosting this agent is gone
- * (`markRunningToolsUnavailable`). A subagent runs inside that process, so this is an outcome, not
- * an ambiguity: it reads `cancelled` — the same answer RULING-14 already gives a workflow agent
- * through `terminalizeRunAgents`, and for the same reason (cut off, not failed). Letting it fall
- * through to `unknown` made the roster tell two different stories about one event depending only on
- * whether a second agent existed to produce a headline, and spent `unknown` — reserved for a
- * genuinely ambiguous source — on a mapped one.
- *
- * An execution run answers the same question with `unknown` on purpose
- * (`deriveTranscriptExecutionRunStatus`) and that difference is not drift: its status has another
- * authority (the run record, still reachable through `activeExecutionRuns`) that may yet resolve
- * it. A sidechain subagent has no such authority — the transcript is all there is.
+ * `unavailable` records lost observation, including synthesized runtime interruption. It cannot
+ * establish cancellation or success, so it projects `unknown` until explicit evidence arrives.
  */
 function deriveSubAgentStatus(
     toolMessage: ToolCallMessage,
     completionOnlyNativeSubagent: Record<string, unknown> | null,
 ): SessionSubagent['status'] {
-    if (toolMessage.tool.state === 'completed') {
-        return isClaudeAsyncAgentLaunchToolResult(toolMessage.tool.result) ? 'running' : 'succeeded';
+    if (toolMessage.tool.state === 'completed' || toolMessage.tool.state === 'error') {
+        const status = normalizeClaudeActivityStatusSignal(readClaudeAgentSdkProviderTaskStatus(toolMessage.tool.result));
+        if (status === 'cancelled') return 'cancelled';
+        if (toolMessage.tool.state === 'completed') {
+            if (isClaudeAsyncAgentLaunchToolResult(toolMessage.tool.result)) return 'running';
+            return 'succeeded';
+        }
     }
     if (toolMessage.tool.state === 'error') return 'failed';
     if (toolMessage.tool.state === 'running') return 'running';
-    if (toolMessage.tool.state === 'unavailable') return 'cancelled';
+    if (toolMessage.tool.state === 'unavailable') return 'unknown';
     return 'unknown';
 }
 
@@ -209,8 +206,7 @@ export function deriveSubAgentSidechainSubagents(params: Readonly<{
     flavor?: string | null;
     excludedSidechainIds?: ReadonlySet<string>;
 }>): readonly SessionSubagent[] {
-    const subagents: SessionSubagent[] = [];
-    const seenIds = new Set<string>();
+    const subagents = new Map<string, { message: ToolCallMessage; subagent: SessionSubagent }>();
     const providerLabel = resolveSubAgentSidechainProviderLabel(params.flavor);
 
     for (const message of params.messages) {
@@ -235,8 +231,8 @@ export function deriveSubAgentSidechainSubagents(params: Readonly<{
             : rawToolId.trim();
         const correlationId = sidechainId ?? (toolId || toolMessage.id);
         const id = `subagent_sidechain:${correlationId}`;
-        if (seenIds.has(id)) continue;
-        seenIds.add(id);
+        const previous = subagents.get(id);
+        if (previous && compareTranscriptMessagesOldestFirst(previous.message, toolMessage) >= 0) continue;
 
         const defaultToolMessageRouteId = completionOnlyNativeSubagent
             ? buildCompletionOnlyToolRouteId(toolMessage)
@@ -251,7 +247,7 @@ export function deriveSubAgentSidechainSubagents(params: Readonly<{
         const nativeSubtitle = completionOnlyNativeSubagent
             ? readCompletionOnlySubtitle(completionOnlyNativeSubagent)
             : null;
-        subagents.push({
+        subagents.set(id, { message: toolMessage, subagent: {
             id,
             kind: 'subagent_sidechain',
             status: deriveSubAgentStatus(toolMessage, completionOnlyNativeSubagent),
@@ -280,8 +276,8 @@ export function deriveSubAgentSidechainSubagents(params: Readonly<{
             timestamps: completionOnlyNativeSubagent
                 ? deriveCompletionOnlyTimestamps(toolMessage, completionOnlyNativeSubagent)
                 : deriveSidechainTimestamps(toolMessage),
-        });
+        } });
     }
 
-    return subagents;
+    return Array.from(subagents.values(), (entry) => entry.subagent);
 }

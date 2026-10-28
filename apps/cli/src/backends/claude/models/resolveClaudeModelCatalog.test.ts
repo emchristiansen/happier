@@ -33,6 +33,7 @@ const envKeys = [
   'ANTHROPIC_OAUTH_TOKEN',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'ANTHROPIC_BASE_URL',
+  'HAPPIER_CLAUDE_DYNAMIC_MODEL_PROBE_ENABLED',
 ] as const;
 let envScope = createEnvKeyScope(envKeys);
 
@@ -65,6 +66,44 @@ afterEach(() => {
 });
 
 describe('resolveClaudeModelCatalog', () => {
+  it('uses only the static catalog when the Claude account setting disables dynamic discovery', async () => {
+    readClaudeCodeNativeCredentialMock.mockResolvedValue({
+      payload: { claudeAiOauth: { accessToken: 'sk-ant-oat01-native-account', scopes: [] } },
+      updatedAtMs: 0,
+      source: 'file',
+    });
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-explicit-key';
+    fetchAnthropicModelsMock.mockResolvedValue([{ id: 'claude-account-only', displayName: 'Account only' }]);
+
+    const resolution = await resolveClaudeModelCatalogResolution({
+      timeoutMs: 1_000,
+      accountSettings: { claudeDynamicModelProbeEnabled: false },
+    });
+
+    expect(resolution.source).toBe('static');
+    expect(readClaudeCodeNativeCredentialMock).not.toHaveBeenCalled();
+    expect(fetchAnthropicModelsMock).not.toHaveBeenCalled();
+  });
+
+  it('uses only the static catalog when the CLI environment disables Claude dynamic discovery', async () => {
+    readClaudeCodeNativeCredentialMock.mockResolvedValue({
+      payload: { claudeAiOauth: { accessToken: 'sk-ant-oat01-native-account', scopes: [] } },
+      updatedAtMs: 0,
+      source: 'file',
+    });
+    process.env.HAPPIER_CLAUDE_DYNAMIC_MODEL_PROBE_ENABLED = '0';
+    fetchAnthropicModelsMock.mockResolvedValue([{ id: 'claude-account-only', displayName: 'Account only' }]);
+
+    const resolution = await resolveClaudeModelCatalogResolution({
+      timeoutMs: 1_000,
+      accountSettings: { claudeDynamicModelProbeEnabled: true },
+    });
+
+    expect(resolution.source).toBe('static');
+    expect(readClaudeCodeNativeCredentialMock).not.toHaveBeenCalled();
+    expect(fetchAnthropicModelsMock).not.toHaveBeenCalled();
+  });
+
   it('uses a successful response as membership authority and enriches matching rows without overriding API facts', async () => {
     process.env.ANTHROPIC_API_KEY = 'sk-ant-key';
     fetchAnthropicModelsMock.mockResolvedValue([
@@ -163,7 +202,7 @@ describe('resolveClaudeModelCatalog', () => {
 
     const resolution = await resolveClaudeModelCatalogResolution({ timeoutMs: 1_000 });
 
-    expect(resolution).toEqual({ models: [], source: 'dynamic' });
+    expect(resolution).toEqual({ models: [], source: 'dynamic', observedAt: expect.any(Number) });
   });
 
   it('serves a cached catalog and never substitutes ambient auth for a selected account', async () => {
@@ -313,8 +352,8 @@ describe('resolveClaudeModelCatalog', () => {
     });
 
     expect(first).toEqual(expect.objectContaining({ source: 'dynamic' }));
-    expect(stale).toEqual(first);
-    expect(staleDuringFailureCooldown).toEqual(first);
+    expect(stale).toEqual({ ...first, refreshError: true });
+    expect(staleDuringFailureCooldown).toEqual(stale);
     expect(stale.models.map((model) => model.id)).toEqual(['claude-opus-9']);
     expect(fetchAnthropicModelsMock).toHaveBeenCalledTimes(2);
   });
@@ -345,7 +384,7 @@ describe('resolveClaudeModelCatalog', () => {
       nowMs: () => currentTimeMs,
     });
 
-    expect(staleAccountA).toEqual(accountA);
+    expect(staleAccountA).toEqual({ ...accountA, refreshError: true });
     expect(staleAccountA.models.map((model) => model.id)).toEqual(['claude-account-a']);
     expect(fetchAnthropicModelsMock).toHaveBeenCalledTimes(3);
   });
@@ -366,7 +405,7 @@ describe('resolveClaudeEffortLevelsFromModelDescriptor', () => {
 
   it('returns no tiers for a model without an effort control', () => {
     expect(resolveClaudeEffortLevelsFromModelDescriptor(null)).toEqual([]);
-    expect(resolveClaudeEffortLevelsFromModelDescriptor({ id: 'x', name: 'X' })).toEqual([]);
+    expect(resolveClaudeEffortLevelsFromModelDescriptor({})).toEqual([]);
   });
 });
 

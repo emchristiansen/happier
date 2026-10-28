@@ -181,7 +181,8 @@ describe('ScmCommitComposerCard', () => {
             />
         )).tree;
 
-        expect(screen.findAllByType('ActivityIndicator')).toHaveLength(1);
+        const { ActivitySpinner } = await import('@/components/ui/feedback/ActivitySpinner');
+        expect(screen.findAllByType(ActivitySpinner)).toHaveLength(1);
         expect(screen.findAll((node) => node.props?.children === 'Refreshing repository status...')).toHaveLength(0);
     });
 

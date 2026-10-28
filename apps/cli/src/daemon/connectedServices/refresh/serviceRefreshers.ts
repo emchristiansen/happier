@@ -6,6 +6,7 @@ import type { ConnectedServiceOauthCredentialRawMetadata } from '@happier-dev/pr
 import { readSafeOauthProviderErrorCode } from '@/cloud/safeOauthProviderError';
 import { resolveConnectedAccountOauthConfig } from '@/daemon/connectedServices/descriptors/connectedAccountDescriptors';
 import type { ConnectedServiceRefreshFailureCategory } from '@/daemon/connectedServices/credentials/lifecycleTypes';
+import { logger } from '@/ui/logger';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -13,10 +14,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 export const CONNECTED_SERVICE_OAUTH_REFRESH_FETCH_TIMEOUT_MS = 120_000;
 
-function buildRefreshAbortSignal(): AbortSignal | undefined {
-  return typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+export function buildRefreshAbortSignal(containingSignal?: AbortSignal): AbortSignal | undefined {
+  const timeout = typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
     ? AbortSignal.timeout(CONNECTED_SERVICE_OAUTH_REFRESH_FETCH_TIMEOUT_MS)
     : undefined;
+  return containingSignal && timeout ? AbortSignal.any([containingSignal, timeout]) : containingSignal ?? timeout;
 }
 
 function classifyProviderRefreshFailure(params: Readonly<{
@@ -104,7 +106,10 @@ export async function refreshConnectedAccountOauthTokens(params: Readonly<{
   serviceId: ConnectedServiceId;
   refreshToken: string;
   now: number;
+  signal?: AbortSignal;
+  expectedProviderAccountId?: string | null;
 }>): Promise<ConnectedAccountOauthRefreshResult> {
+  params.signal?.throwIfAborted();
   const config = resolveConnectedAccountOauthConfig(params.serviceId, process.env);
   const request = buildRefreshRequestBody({
     refreshTokenBody: config.refreshTokenBody,
@@ -118,9 +123,10 @@ export async function refreshConnectedAccountOauthTokens(params: Readonly<{
       method: 'POST',
       headers: request.headers,
       body: request.body,
-      signal: buildRefreshAbortSignal(),
+      signal: buildRefreshAbortSignal(params.signal),
     });
   } catch {
+    params.signal?.throwIfAborted();
     throw new ConnectedServiceOauthRefreshError({
       serviceId: params.serviceId,
       category: 'network_error',
@@ -172,16 +178,19 @@ export async function refreshConnectedAccountOauthTokens(params: Readonly<{
   // CS-FIX-4: provider identity extraction lives in the provider's descriptor hook, not a
   // serviceId branch here — the central refresher stays pure config mapping.
   const refreshResponseIdentity = config.extractRefreshResponseIdentity?.({ idToken, payload: data }) ?? {};
+  let profileIdentity: typeof refreshResponseIdentity = {};
   let raw: ConnectedServiceOauthCredentialRawMetadata | null | undefined;
   if (config.resolveRefreshCredentialEvidence) {
     let evidence: Awaited<ReturnType<typeof config.resolveRefreshCredentialEvidence>> | undefined;
     try {
       evidence = await config.resolveRefreshCredentialEvidence({
         accessToken,
+        expectedProviderAccountId: params.expectedProviderAccountId,
         fetcher: fetch,
-        signal: buildRefreshAbortSignal(),
+        signal: buildRefreshAbortSignal(params.signal),
       });
     } catch {
+      params.signal?.throwIfAborted();
       evidence = undefined;
     }
     if (evidence?.status === 'rejected') {
@@ -196,8 +205,19 @@ export async function refreshConnectedAccountOauthTokens(params: Readonly<{
         detail: 'refreshed_access_token_rejected',
       });
     }
+    if (evidence?.status === 'identity_mismatch') {
+      throw new ConnectedServiceOauthRefreshError({ serviceId: params.serviceId, category: 'unknown',
+        status: null, providerErrorCode: 'provider_account_mismatch', detail: 'refreshed_access_token_identity_mismatch' });
+    }
     // Missing entitlement evidence must not turn a successful token rotation into a failure.
-    raw = evidence?.status === 'accepted' ? evidence.raw : undefined;
+    raw = evidence?.status === 'accepted' ? evidence.raw : null;
+    if (evidence?.status !== 'accepted') {
+      logger.infoFile('[WARN] Connected-service refresh profile evidence unavailable; provider context metadata cleared.');
+    }
+    if (evidence?.status === 'accepted') profileIdentity = {
+      ...(evidence.providerAccountId ? { providerAccountId: evidence.providerAccountId } : {}),
+      ...(evidence.providerEmail ? { providerEmail: evidence.providerEmail } : {}),
+    };
   }
   return {
     accessToken,
@@ -206,6 +226,7 @@ export async function refreshConnectedAccountOauthTokens(params: Readonly<{
     scope: readTrimmedString(data.scope),
     tokenType: readTrimmedString(data.token_type),
     ...refreshResponseIdentity,
+    ...profileIdentity,
     ...(raw !== undefined ? { raw } : {}),
     expiresAt,
   };

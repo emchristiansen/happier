@@ -69,10 +69,6 @@ vi.mock('@/components/navigation/Header', () => ({
         ),
 }));
 
-vi.mock('@/components/ui/feedback/AppUpdateStatusTag', () => ({
-    AppUpdateStatusTag: (props: Record<string, unknown>) => React.createElement('AppUpdateStatusTag', props),
-}));
-
 vi.mock('@/hooks/server/useAutomationsSupport', () => ({
     useAutomationsSupport: () => ({ enabled: automationsSupportState.enabled }),
 }));
@@ -126,13 +122,11 @@ describe('HomeHeader automations button', () => {
         });
     });
 
-    it('uses a compact update tag in the mobile logo slot', async () => {
+    it('keeps the logo in the header slot while nothing needs updating (no Updates entry at zero)', async () => {
         const { HomeHeader } = await import('./HomeHeader');
 
         const screen = await renderScreen(<HomeHeader />);
-        const updateTag = screen.tree.findByType('AppUpdateStatusTag' as never);
 
-        expect(updateTag.props.labelVariant).toBe('short');
-        expect(updateTag.props.fallback).toBeTruthy();
+        expect(screen.tree.findAll((node) => node.props?.testID === 'home-header-updates-pill')).toHaveLength(0);
     });
 });

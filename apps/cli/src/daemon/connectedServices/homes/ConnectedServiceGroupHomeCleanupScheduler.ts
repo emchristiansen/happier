@@ -7,6 +7,7 @@ import { ConnectedServiceIdSchema, type ConnectedServiceId } from '@happier-dev/
 import { resolveConnectedServiceCredentialLifecycleDescriptor } from '@/backends/catalog';
 import type { CatalogAgentId } from '@/backends/types';
 import type { ConnectedServiceCredentialLifecycleDescriptor } from '../credentials/lifecycleTypes';
+import type { ConnectedServiceRuntimeRegistry } from '../runtimeRegistry/registry';
 import {
   createPendingPathCleanupQueue,
   type PendingPathCleanupRetryExhaustedEvent,
@@ -111,6 +112,7 @@ export class ConnectedServiceGroupHomeCleanupScheduler {
 
   constructor(private readonly deps: Readonly<{
     activeServerDir: string;
+    runtimeRegistry?: ConnectedServiceRuntimeRegistry;
     hasLiveTarget(input: Readonly<{
       serviceId: ConnectedServiceId;
       groupId: string;
@@ -207,6 +209,15 @@ export class ConnectedServiceGroupHomeCleanupScheduler {
     return null;
   }
 
+  private hasLiveTarget(target: GroupHomeTarget): boolean {
+    return this.deps.runtimeRegistry?.listTargets().some((runtimeTarget) => (
+      runtimeTarget.agentId === target.agentId
+      && runtimeTarget.activeBindings.some((binding) => (
+        binding.serviceId === target.serviceId && binding.groupId === target.groupId
+      ))
+    )) === true || this.deps.hasLiveTarget(target);
+  }
+
   async scheduleDeletedGroupCleanup(input: Readonly<{
     serviceId: ConnectedServiceId;
     groupId: string;
@@ -218,7 +229,7 @@ export class ConnectedServiceGroupHomeCleanupScheduler {
       groupId: input.groupId,
       agentId: input.agentId,
     });
-    if (this.deps.hasLiveTarget(input)) {
+    if (this.hasLiveTarget(input)) {
       this.cleanupQueue.setPending(targetKey(input), { ...input, path });
       return { cleaned: false, pending: true, path };
     }
@@ -271,7 +282,7 @@ export class ConnectedServiceGroupHomeCleanupScheduler {
         return authority?.status === 'exists';
       },
       shouldKeepPending: async (target) => {
-        if (this.deps.hasLiveTarget(target)) return true;
+        if (this.hasLiveTarget(target)) return true;
         const authority = await this.resolveDeletionAuthority(target);
         return authority?.status === 'unknown';
       },

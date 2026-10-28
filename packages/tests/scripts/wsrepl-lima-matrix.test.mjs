@@ -2,22 +2,20 @@ import nodeTest from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, writeFile, chmod, readdir, stat, realpath, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
 
+import { createLimaTestEnv, limaGuestExec } from '../../../apps/stack/scripts/testkit/core/lima_guest_harness.mjs';
+
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
-if (process.env.WSREPL_QA_HOST_DIRECT_PEER_VM_CONNECTIVITY_CHECK === undefined) {
-  // Unit tests run with stubbed limactl shell that can execute commands on the host; disable any
-  // real TCP connectivity probes by default to keep the suite deterministic and fast.
-  process.env.WSREPL_QA_HOST_DIRECT_PEER_VM_CONNECTIVITY_CHECK = '0';
-}
-
-if (process.env.WSREPL_QA_SKIP_HOST_PROVIDER_INSTALL === undefined) {
-  process.env.WSREPL_QA_SKIP_HOST_PROVIDER_INSTALL = '1';
-}
+const testEnv = {
+  ...createLimaTestEnv(),
+  WSREPL_QA_HOST_DIRECT_PEER_VM_CONNECTIVITY_CHECK: '0',
+  WSREPL_QA_SKIP_HOST_PROVIDER_INSTALL: '1',
+};
 
 const test = (name, options, fn) => {
   if (typeof options === 'function') {
@@ -713,7 +711,8 @@ test('macos wsrepl lima matrix wrapper defaults Playwright to headless (supports
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
       "    # Run guest commands in a minimal PATH so they don't accidentally pick up the host's stub happier binary.",
-      '    exec env PATH=/usr/bin:/bin "$@"',
+      '    export PATH=/usr/bin:/bin',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -742,7 +741,7 @@ test('macos wsrepl lima matrix wrapper defaults Playwright to headless (supports
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     // Ensure the runner forces headless-by-default even if the caller has an ambient override.
     HAPPIER_QA_HEADLESS: '0',
     HAPPIER_FEATURE_MACHINES_TRANSFER_SERVER_ROUTED__MAX_BYTES: '4096',
@@ -750,7 +749,7 @@ test('macos wsrepl lima matrix wrapper defaults Playwright to headless (supports
     HAPPIER_MACHINE_TRANSFER_DIRECT_PEER_SERVER_ENABLED: '',
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_SKIP_HOST_PROVIDER_INSTALL: '',
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
@@ -1073,7 +1072,8 @@ test('macos wsrepl lima matrix wrapper fails closed when host daemon does not st
       '  shell)',
       '    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec env PATH=/usr/bin:/bin "$@"',
+      '    export PATH=/usr/bin:/bin',
+      limaGuestExec,
       '    ;;',
       '  start|stop|list)',
       '    exit 0',
@@ -1089,10 +1089,10 @@ test('macos wsrepl lima matrix wrapper fails closed when host daemon does not st
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
     HAPPIER_QA_STACK_NAME: 'stack-test',
@@ -1263,7 +1263,8 @@ test('macos wsrepl lima matrix wrapper fails closed when host daemon does not st
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec env PATH=/usr/bin:/bin "$@"',
+      '    export PATH=/usr/bin:/bin',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -1276,7 +1277,7 @@ test('macos wsrepl lima matrix wrapper fails closed when host daemon does not st
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HAPPIER_FEATURE_MACHINES_TRANSFER_DIRECT_PEER__ENABLED: '',
     HAPPIER_MACHINE_TRANSFER_DIRECT_PEER_SERVER_ENABLED: '',
     HOME: homeDir,
@@ -1469,7 +1470,8 @@ test('macos wsrepl lima matrix wrapper configures unique guest direct-peer ports
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec env PATH=/usr/bin:/bin LIMA_INSTANCE="$instance" "$@"',
+      '    export PATH=/usr/bin:/bin LIMA_INSTANCE="$instance"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -1482,7 +1484,7 @@ test('macos wsrepl lima matrix wrapper configures unique guest direct-peer ports
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HAPPIER_FEATURE_MACHINES_TRANSFER_DIRECT_PEER__ENABLED: '',
     HAPPIER_MACHINE_TRANSFER_DIRECT_PEER_SERVER_ENABLED: '',
     HOME: homeDir,
@@ -1701,7 +1703,8 @@ test('macos wsrepl lima matrix wrapper fails closed when Playwright does not pro
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec env PATH=/usr/bin:/bin "$@"',
+      '    export PATH=/usr/bin:/bin',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -1714,10 +1717,10 @@ test('macos wsrepl lima matrix wrapper fails closed when Playwright does not pro
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
     HAPPIER_QA_STACK_NAME: 'stack-test',
@@ -1917,7 +1920,8 @@ test('macos wsrepl lima matrix wrapper normalizes nonzero Playwright runner exit
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec env PATH=/usr/bin:/bin "$@"',
+      '    export PATH=/usr/bin:/bin',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -1939,10 +1943,10 @@ test('macos wsrepl lima matrix wrapper normalizes nonzero Playwright runner exit
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
     HAPPIER_QA_STACK_NAME: 'stack-test',
@@ -1980,6 +1984,7 @@ test('macos wsrepl lima matrix wrapper defaults host happier source to stack run
   const binDir = join(root, 'bin');
   const homeDir = join(root, 'home');
   const reportDir = join(root, 'reports');
+  const failedReportDir = join(root, 'reports-failed');
   const logDir = join(root, 'logs');
   const limaHome = join(homeDir, '.lima');
 
@@ -2102,13 +2107,18 @@ test('macos wsrepl lima matrix wrapper defaults host happier source to stack run
       'EOF',
       '    exit 0',
       '    ;;',
-      '  stop|start|list|info)',
+      '  start)',
+      '    if [[ "${WSREPL_QA_TEST_FAIL_VM_START:-0}" == "1" ]]; then exit 41; fi',
+      '    exit 0',
+      '    ;;',
+      '  stop|list|info)',
       '    exit 0',
       '    ;;',
       '  shell)',
       '    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec env PATH="$HOME/.happier/bin:/usr/bin:/bin" "$@"',
+      '    export PATH="$HOME/.happier/bin:/usr/bin:/bin"',
+      limaGuestExec,
       '    ;;',
       '  copy)',
       '    # No-op copy in this test (guest autoupdate is skipped).',
@@ -2171,10 +2181,10 @@ test('macos wsrepl lima matrix wrapper defaults host happier source to stack run
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: [binDir, '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(delimiter),
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_STACK_NAME: stackName,
     HAPPIER_QA_SESSION_ID: 'sess_default_source_1',
@@ -2195,6 +2205,20 @@ test('macos wsrepl lima matrix wrapper defaults host happier source to stack run
 
   const resolved = JSON.parse(await readFile(join(reportDir, 'daemon', 'host.happier.resolve.json'), 'utf8'));
   assert.equal(resolved.hostHappierKind, 'stack_runtime');
+
+  const failed = spawnSync('bash', [scriptPath, 'happy-wsrepl'], {
+    cwd: root,
+    env: {
+      ...env,
+      WSREPL_QA_OUTPUT_DIR: failedReportDir,
+      WSREPL_QA_FORCE_VM_RECONFIGURE: '1',
+      WSREPL_QA_TEST_FAIL_VM_START: '1',
+    },
+    encoding: 'utf8',
+  });
+  assert.equal(failed.status, 41, `expected VM start failure to propagate\nstdout:\n${failed.stdout}\nstderr:\n${failed.stderr}`);
+  const failedSummary = JSON.parse(await readFile(join(failedReportDir, 'summary.json'), 'utf8'));
+  assert.equal(failedSummary.failureStage, 'ensure_vm');
 });
 
 test('macos wsrepl lima matrix watchdog probes daemon status using stack-scoped cli home', async () => {
@@ -2401,7 +2425,8 @@ test('macos wsrepl lima matrix watchdog probes daemon status using stack-scoped 
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec env PATH=/usr/bin:/bin "$@"',
+      '    export PATH=/usr/bin:/bin',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -2414,10 +2439,10 @@ test('macos wsrepl lima matrix watchdog probes daemon status using stack-scoped 
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_ACCESS_KEY_PATH: accessKeyPath,
     HAPPIER_QA_STACK_NAME: 'stack-test',
@@ -2615,7 +2640,8 @@ test('macos wsrepl lima matrix watchdog ignores transient "Daemon is not running
       '  shell)',
       '    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec env PATH=/usr/bin:/bin "$@"',
+      '    export PATH=/usr/bin:/bin',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -2628,10 +2654,10 @@ test('macos wsrepl lima matrix watchdog ignores transient "Daemon is not running
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),
@@ -2805,7 +2831,7 @@ test('macos wsrepl lima matrix wrapper fails closed when Playwright harness writ
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -2818,10 +2844,10 @@ test('macos wsrepl lima matrix wrapper fails closed when Playwright harness writ
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_STACK_NAME: 'stack-test',
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),
@@ -3029,7 +3055,7 @@ test('macos wsrepl lima matrix wrapper fails closed when Playwright runner does 
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -3042,10 +3068,10 @@ test('macos wsrepl lima matrix wrapper fails closed when Playwright runner does 
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_STACK_NAME: 'stack-test',
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),
@@ -3245,7 +3271,7 @@ test('macos wsrepl lima matrix wrapper can derive host server url from stack.run
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -3258,10 +3284,10 @@ test('macos wsrepl lima matrix wrapper can derive host server url from stack.run
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_STACK_NAME: 'stack-test',
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -3431,7 +3457,7 @@ test('macos wsrepl lima matrix wrapper supports multiple VM args and writes per-
       '    # Simulate a reachable shell but no guest happier binary.',
       '    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -3444,10 +3470,10 @@ test('macos wsrepl lima matrix wrapper supports multiple VM args and writes per-
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'stack_runtime',
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -3584,7 +3610,7 @@ test('macos wsrepl lima matrix wrapper prefers WSREPL_QA_LARGE_REPO_PATH for HAP
       '  shell)',
       '    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -3597,10 +3623,10 @@ test('macos wsrepl lima matrix wrapper prefers WSREPL_QA_LARGE_REPO_PATH for HAP
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
     WSREPL_QA_LARGE_REPO_PATH: largeRepoDir,
@@ -3762,7 +3788,7 @@ test('macos wsrepl lima matrix wrapper retries Playwright once when fatal.json r
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -3775,10 +3801,10 @@ test('macos wsrepl lima matrix wrapper retries Playwright once when fatal.json r
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_STACK_NAME: 'stack-test',
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -3904,7 +3930,7 @@ test('macos wsrepl lima matrix wrapper prefers the stack runtime CLI inferred fr
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -3963,10 +3989,10 @@ test('macos wsrepl lima matrix wrapper prefers the stack runtime CLI inferred fr
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_SESSION_ID: 'sess_test_2',
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_2', strategy: 'sync_changes' }]),
@@ -4144,7 +4170,7 @@ test('macos wsrepl lima matrix wrapper restarts the guest daemon with HAPPIER_SE
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -4157,10 +4183,10 @@ test('macos wsrepl lima matrix wrapper restarts the guest daemon with HAPPIER_SE
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -4293,7 +4319,7 @@ test('macos wsrepl lima matrix wrapper uses stack CLI home dir + active server i
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -4306,10 +4332,10 @@ test('macos wsrepl lima matrix wrapper uses stack CLI home dir + active server i
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -4451,7 +4477,7 @@ test('macos wsrepl lima matrix wrapper prefers server-scoped stack credentials o
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -4464,10 +4490,10 @@ test('macos wsrepl lima matrix wrapper prefers server-scoped stack credentials o
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -4601,7 +4627,7 @@ test('macos wsrepl lima matrix wrapper still uses stack CLI home dir + active se
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -4614,10 +4640,10 @@ test('macos wsrepl lima matrix wrapper still uses stack CLI home dir + active se
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -4756,10 +4782,10 @@ test('macos wsrepl lima matrix wrapper seeds host daemon access.key from stack c
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -4956,10 +4982,10 @@ test('macos wsrepl lima matrix wrapper preserves the canonical host machine id w
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const hostHomeRel = 'isolated-host-home';
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -5098,10 +5124,10 @@ test('macos wsrepl lima matrix wrapper fails closed when WSREPL_QA_HOST_HOME_REL
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -5267,10 +5293,10 @@ test('macos wsrepl lima matrix wrapper advances the host direct-peer bind port w
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -5430,10 +5456,10 @@ test('macos wsrepl lima matrix wrapper prefers the wrapper-selected host direct-
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -5591,7 +5617,7 @@ test('macos wsrepl lima matrix wrapper advances the host direct-peer bind port w
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
     PATH: `${binDir}:/usr/bin:/bin`,
@@ -5796,8 +5822,8 @@ test('macos wsrepl lima matrix wrapper surfaces playwright fatal hint in summary
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
-    PATH: `${binDir}:${process.env.PATH || ''}`,
+    ...testEnv,
+    PATH: `${binDir}:${testEnv.PATH}`,
     HOME: homeDir,
     LIMA_HOME: limaHome,
     WSREPL_QA_OUTPUT_DIR: reportDir,
@@ -5950,7 +5976,7 @@ test('macos wsrepl lima matrix wrapper does not require a source machine id for 
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -5963,10 +5989,10 @@ test('macos wsrepl lima matrix wrapper does not require a source machine id for 
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
 	    LIMA_HOME: limaHome,
-	    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+	    PATH: `${binDir}:${testEnv.PATH}`,
 	    WSREPL_QA_OUTPUT_DIR: reportDir,
 	    HAPPIER_QA_STACK_NAME: 'stack-test',
 	    WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
@@ -6142,7 +6168,7 @@ test('macos wsrepl lima matrix wrapper polls daemon status until host machine id
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -6155,10 +6181,10 @@ test('macos wsrepl lima matrix wrapper polls daemon status until host machine id
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
 	    LIMA_HOME: limaHome,
-	    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+	    PATH: `${binDir}:${testEnv.PATH}`,
 	    WSREPL_QA_OUTPUT_DIR: reportDir,
 	    WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
 	    HAPPIER_QA_SESSION_PATH: root,
@@ -6331,7 +6357,7 @@ test('macos wsrepl lima matrix wrapper skips host machineId polling when WSREPL_
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -6344,10 +6370,10 @@ test('macos wsrepl lima matrix wrapper skips host machineId polling when WSREPL_
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
     HAPPIER_QA_SESSION_PATH: root,
@@ -6476,7 +6502,7 @@ test('macos wsrepl lima matrix wrapper can discover stack credentials from the m
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -6489,10 +6515,10 @@ test('macos wsrepl lima matrix wrapper can discover stack credentials from the m
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -6657,7 +6683,7 @@ test('macos wsrepl lima matrix wrapper derives host server url from the most-rec
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -6670,10 +6696,10 @@ test('macos wsrepl lima matrix wrapper derives host server url from the most-rec
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -6860,7 +6886,7 @@ test('macos wsrepl lima matrix wrapper resolves stack cli home from explicit HAP
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -6873,10 +6899,10 @@ test('macos wsrepl lima matrix wrapper resolves stack cli home from explicit HAP
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
     HAPPIER_SERVER_URL: `http://127.0.0.1:${desiredServerPort}`,
@@ -6983,7 +7009,7 @@ test('macos wsrepl lima matrix wrapper enforces a hard timeout for the playwrigh
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -6996,10 +7022,10 @@ test('macos wsrepl lima matrix wrapper enforces a hard timeout for the playwrigh
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH || ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_SESSION_ID: 'sess_timeout_1',
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),
@@ -7163,7 +7189,7 @@ test('macos wsrepl lima matrix wrapper runs the autoupdate payload builder from 
       '  shell)',
       '    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  copy)',
       '    recursive=0',
@@ -7199,10 +7225,10 @@ test('macos wsrepl lima matrix wrapper runs the autoupdate payload builder from 
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
     HAPPIER_QA_SESSION_ID: 'sess_autoupdate_cwd_1',
@@ -7336,7 +7362,7 @@ test('macos wsrepl lima matrix wrapper fails closed when guest wsrepl build mark
       '  shell)',
       '    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  start|stop|info|list)',
       '    exit 0',
@@ -7352,10 +7378,10 @@ test('macos wsrepl lima matrix wrapper fails closed when guest wsrepl build mark
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -7556,7 +7582,7 @@ test('macos wsrepl lima matrix wrapper can autoupdate guest happier to match the
       '  shell)',
       '    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  copy)',
       '    recursive=0',
@@ -7593,10 +7619,10 @@ test('macos wsrepl lima matrix wrapper can autoupdate guest happier to match the
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
     HAPPIER_QA_SESSION_ID: 'sess_test_auto',
@@ -7765,7 +7791,7 @@ test('macos wsrepl lima matrix writes vm-happier build log when guest autoupdate
       '  shell)',
       '    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  copy)',
       '    exit 0',
@@ -7781,10 +7807,10 @@ test('macos wsrepl lima matrix writes vm-happier build log when guest autoupdate
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
     HAPPIER_QA_SESSION_ID: 'sess_test_autoupdate_build_fail',
@@ -7975,7 +8001,8 @@ test('macos wsrepl lima matrix wrapper keeps the host daemon alive while autoupd
       '  shell)',
       '    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec env PATH=/usr/bin:/bin "$@"',
+      '    export PATH=/usr/bin:/bin',
+      limaGuestExec,
       '    ;;',
       '  copy)',
       '    recursive=0',
@@ -8011,10 +8038,10 @@ test('macos wsrepl lima matrix wrapper keeps the host daemon alive while autoupd
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
     HAPPIER_QA_SESSION_ID: 'sess_autoupdate_watchdog_1',
@@ -8243,7 +8270,8 @@ test('macos wsrepl lima matrix watchdog restarts the host daemon when status rep
       '  shell)',
       '    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec env PATH=/usr/bin:/bin "$@"',
+      '    export PATH=/usr/bin:/bin',
+      limaGuestExec,
       '    ;;',
       '  copy)',
       '    recursive=0',
@@ -8279,10 +8307,10 @@ test('macos wsrepl lima matrix watchdog restarts the host daemon when status rep
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
     HAPPIER_QA_SESSION_ID: 'sess_watchdog_dead_pid_1',
@@ -8478,7 +8506,7 @@ test('macos wsrepl lima matrix wrapper autoupdate mode does not fail closed when
       '  shell)',
       '    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  start|stop|info|list)',
       '    exit 0',
@@ -8517,10 +8545,10 @@ test('macos wsrepl lima matrix wrapper autoupdate mode does not fail closed when
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -8707,7 +8735,7 @@ test('macos wsrepl lima matrix wrapper autoupdate mode installs even when guest 
       '  shell)',
       '    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  copy)',
       '    recursive=0',
@@ -8743,10 +8771,10 @@ test('macos wsrepl lima matrix wrapper autoupdate mode installs even when guest 
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_SESSION_ID: 'sess_test_auto_always',
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),
@@ -8847,7 +8875,7 @@ test('macos wsrepl lima matrix wrapper autoupdate mode does not require a preins
       '  shell)',
       '    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  copy)',
       '    recursive=0',
@@ -8883,10 +8911,10 @@ test('macos wsrepl lima matrix wrapper autoupdate mode does not require a preins
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_SESSION_ID: 'sess_test_auto_no_happier',
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),
@@ -8983,7 +9011,8 @@ test('macos wsrepl lima matrix wrapper autoupdate mode installs the current payl
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
       '    guest_home="${HOME}/guest-homes/${instance}"',
       '    mkdir -p "$guest_home"',
-      '    exec env HOME="$guest_home" LIMA_INSTANCE="$instance" "$@"',
+      '    export HOME="$guest_home" LIMA_INSTANCE="$instance"',
+      limaGuestExec,
       '    ;;',
       '  copy)',
       '    recursive=0',
@@ -9019,10 +9048,10 @@ test('macos wsrepl lima matrix wrapper autoupdate mode installs the current payl
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_SESSION_ID: 'sess_test_auto_multi_vm',
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),
@@ -9172,7 +9201,7 @@ test('macos wsrepl lima matrix wrapper can derive HAPPIER_QA_STEPS_JSON from hos
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -9185,10 +9214,10 @@ test('macos wsrepl lima matrix wrapper can derive HAPPIER_QA_STEPS_JSON from hos
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_SESSION_ID: 'sess_test_2',
     // Intentionally omit HAPPIER_QA_STEPS_JSON; wrapper should derive it from these ids.
@@ -9239,6 +9268,13 @@ test('macos wsrepl lima matrix wrapper default vm machine name pattern is substr
   await mkdir(reportDir, { recursive: true });
   await mkdir(logDir, { recursive: true });
 
+  const probeLog = join(logDir, 'guest-connectivity-probe');
+  await writeScript(join(binDir, 'nc'), [
+    '#!/bin/bash',
+    `if [[ "$1 $2 $3" == "-z -w 2" && "$*" == *host.lima.internal* ]]; then printf "%s\\n" "$*" >> ${JSON.stringify(probeLog)}; fi`,
+    'exit 1',
+  ].join('\n') + '\n');
+
   const nodeLog = join(logDir, 'node.log');
 
   const unamePath = join(binDir, 'uname');
@@ -9284,7 +9320,7 @@ test('macos wsrepl lima matrix wrapper default vm machine name pattern is substr
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -9297,10 +9333,10 @@ test('macos wsrepl lima matrix wrapper default vm machine name pattern is substr
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_SESSION_ID: 'sess_test_3',
     // Intentionally omit WSREPL_QA_VM_MACHINE_NAME_PATTERN; wrapper should derive it from VM name.
@@ -9321,6 +9357,8 @@ test('macos wsrepl lima matrix wrapper default vm machine name pattern is substr
 
   assert.equal(res.status, 0, `expected exit 0\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
 
+  assert.equal(await fileExists(probeLog), false, 'disabled guest connectivity checks must not probe the host');
+
   const meta = await readPlaywrightMetaFromReportRoot(reportDir);
   const stepsJson = JSON.parse(meta.stepsJson);
   assert.deepEqual(stepsJson, [
@@ -9328,6 +9366,14 @@ test('macos wsrepl lima matrix wrapper default vm machine name pattern is substr
     { targetMachineId: 'machine_host_1', strategy: 'transfer_snapshot' },
     { targetMachineId: 'machine_vm_1', strategy: 'sync_changes' },
   ]);
+
+  const enabled = spawnSync('bash', [scriptPath, 'happy-wsrepl'], {
+    cwd: root,
+    env: { ...env, WSREPL_QA_HOST_DIRECT_PEER_VM_CONNECTIVITY_CHECK: '1' },
+    encoding: 'utf8',
+  });
+  assert.equal(enabled.status, 0, enabled.stderr);
+  assert.equal(await fileExists(probeLog), true, 'explicitly enabled guest connectivity checks still run');
 });
 
 test('macos wsrepl lima matrix wrapper retries host daemon start on transient failures', async () => {
@@ -9479,10 +9525,10 @@ test('macos wsrepl lima matrix wrapper retries host daemon start on transient fa
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
     HAPPIER_QA_SESSION_ID: 'sess_host_retry_1',
@@ -9684,7 +9730,7 @@ test('macos wsrepl lima matrix wrapper rebuilds the CLI when host daemon status 
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
 	  const env = {
-	    ...process.env,
+	    ...testEnv,
 	    HOME: homeDir,
 	    LIMA_HOME: limaHome,
 	    // Ensure we exercise the wrapper's `worktree_node` fallback (no real `happier` on PATH),
@@ -9865,7 +9911,7 @@ test('macos wsrepl lima matrix wrapper fails closed when host daemon status stay
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
     PATH: `${binDir}:/usr/bin:/bin`,
@@ -10031,7 +10077,7 @@ test('macos wsrepl lima matrix wrapper seeds server-routed max-bytes env for the
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
     PATH: `${binDir}:/usr/bin:/bin`,
@@ -10154,7 +10200,7 @@ test('macos wsrepl lima matrix wrapper fails closed when guest wsrepl build mark
       '  shell)',
       '    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec "$@"',
+      limaGuestExec,
       '    ;;',
       '  start|stop|list|info|copy)',
       '    exit 0',
@@ -10170,10 +10216,10 @@ test('macos wsrepl lima matrix wrapper fails closed when guest wsrepl build mark
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
     HAPPIER_QA_SESSION_ID: 'sess_marker_mismatch_1',
@@ -10219,10 +10265,10 @@ test('macos wsrepl lima matrix wrapper fails fast when HAPPIER_QA_SESSION_PATH i
   const missingPath = join(root, 'does-not-exist');
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_SESSION_ID: 'sess_test_3',
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),
@@ -10407,7 +10453,8 @@ test('macos wsrepl lima matrix wrapper prefers default large-repo fixture under 
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec env PATH=/usr/bin:/bin "$@"',
+      '    export PATH=/usr/bin:/bin',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -10420,10 +10467,10 @@ test('macos wsrepl lima matrix wrapper prefers default large-repo fixture under 
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_STACK_NAME: 'stack-test',
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),
@@ -10570,7 +10617,8 @@ test('macos wsrepl lima matrix wrapper writes a nonzero summary status when term
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec env PATH=/usr/bin:/bin "$@"',
+      '    export PATH=/usr/bin:/bin',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -10583,10 +10631,10 @@ test('macos wsrepl lima matrix wrapper writes a nonzero summary status when term
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),
     HAPPIER_UI_URL: 'http://localhost:19000/?server=http%3A%2F%2Flocalhost%3A53288',
@@ -10739,7 +10787,8 @@ test('macos wsrepl lima matrix wrapper leaves a top-level summary.json even when
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec env PATH=/usr/bin:/bin "$@"',
+      '    export PATH=/usr/bin:/bin',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -10752,10 +10801,10 @@ test('macos wsrepl lima matrix wrapper leaves a top-level summary.json even when
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),
     HAPPIER_QA_SESSION_PATH: sessionDir,
@@ -10799,6 +10848,11 @@ test('macos wsrepl lima matrix wrapper records early-abort failure metadata befo
   await mkdir(homeDir, { recursive: true });
   await mkdir(reportDir, { recursive: true });
 
+  // Reach the injected date failure without depending on host installations.
+  for (const command of ['limactl', 'node']) {
+    await writeScript(join(binDir, command), '#!/bin/bash\nexit 0\n');
+  }
+
   const datePath = join(binDir, 'date');
   await writeFile(
     datePath,
@@ -10825,10 +10879,10 @@ test('macos wsrepl lima matrix wrapper records early-abort failure metadata befo
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
   };
 
@@ -11016,7 +11070,8 @@ test('macos wsrepl lima matrix wrapper can force host happier source to worktree
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec env PATH=/usr/bin:/bin "$@"',
+      '    export PATH=/usr/bin:/bin',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -11029,10 +11084,10 @@ test('macos wsrepl lima matrix wrapper can force host happier source to worktree
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_STACK_NAME: 'stack-test',
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),
@@ -11276,7 +11331,8 @@ test('macos wsrepl lima matrix wrapper defaults host happier source to PATH when
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    exec env PATH=/usr/bin:/bin "$@"',
+      '    export PATH=/usr/bin:/bin',
+      limaGuestExec,
       '    ;;',
       '  *)',
       '    exit 0',
@@ -11289,10 +11345,10 @@ test('macos wsrepl lima matrix wrapper defaults host happier source to PATH when
 
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
-    ...process.env,
+    ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    PATH: `${binDir}:${testEnv.PATH}`,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_STACK_NAME: 'stack-test',
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),

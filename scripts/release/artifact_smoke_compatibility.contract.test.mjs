@@ -82,3 +82,16 @@ test('artifact smoke eligibility skips non-binary tarballs that do not encode a 
     },
   );
 });
+
+test('component archives are smoke eligible only on their native target', () => {
+  for (const product of ['happier-memory-runtime', 'happier-difftastic']) {
+    assert.equal(resolveReleaseArtifactSmokeEligibility({
+      archiveName: `${product}-v1.2.3-linux-x64.tar.gz`,
+      runner: { platform: 'linux', arch: 'x64' },
+    }).eligible, true);
+    assert.equal(resolveReleaseArtifactSmokeEligibility({
+      archiveName: `${product}-v1.2.3-windows-x64.tar.gz`,
+      runner: { platform: 'linux', arch: 'x64' },
+    }).eligible, false);
+  }
+});

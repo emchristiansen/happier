@@ -419,4 +419,120 @@ describe('handleConnectedServiceRuntimeAuthFailure', () => {
       },
     });
   });
+
+  it('re-applies the current generation when a scheduled usage-limit retry has fresh post-reset quota', async () => {
+    const commitSwitch = vi.fn();
+    const applyGeneration = vi.fn(async () => {});
+    const currentState: ConnectedServiceAuthGroupSwitchState = {
+      serviceId: 'openai-codex',
+      groupId: 'main',
+      activeProfileId: 'primary',
+      generation: 7,
+      runtimeStateRevision: 1,
+      credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+      policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'priority', autoSwitch: true },
+      members: [
+        { profileId: 'primary', priority: 1, createdAtMs: 1, enabled: true },
+      ],
+      memberStatesByProfileId: new Map([
+        ['primary', {
+          quotaSnapshot: {
+            capturedAtMs: 20_000,
+            effectiveRemainingPercent: 100,
+            windows: [],
+          },
+        }],
+      ]),
+    };
+    const switchCoordinator = new ConnectedServiceAuthGroupSwitchCoordinator({
+      leases: new InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry(),
+      nowMs: () => 20_000,
+      quotaFreshnessMs: 60_000,
+      loadState: async () => currentState,
+      commitSwitch,
+      applyGeneration,
+    });
+
+    await expect(handleConnectedServiceRuntimeAuthFailure({
+      sessionId: 'session-1',
+      selection: {
+        kind: 'group',
+        serviceId: 'openai-codex',
+        groupId: 'main',
+        activeProfileId: 'primary',
+      },
+      classification: {
+        kind: 'usage_limit',
+        limitCategory: 'usage_limit',
+        serviceId: 'openai-codex',
+        profileId: 'primary',
+        groupId: 'main',
+        resetsAtMs: 10_000,
+        planType: null,
+        rateLimits: null,
+        source: 'structured_provider_error',
+      },
+      switchesThisTurn: 0,
+      switchCoordinator,
+      allowCurrentProfileRetry: true,
+    })).resolves.toMatchObject({
+      status: 'switch_attempted',
+      result: {
+        status: 'observed_generation',
+        activeProfileId: 'primary',
+        generation: 7,
+      },
+    });
+
+    expect(commitSwitch).not.toHaveBeenCalled();
+    expect(applyGeneration).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'session-1',
+      activeProfileId: 'primary',
+      generation: 7,
+    }));
+  });
+
+  it('does not retry the current member after reset without fresh positive quota proof', async () => {
+    const switchCoordinator = new ConnectedServiceAuthGroupSwitchCoordinator({
+      leases: new InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry(),
+      nowMs: () => 20_000,
+      quotaFreshnessMs: 1_000,
+      loadState: async () => ({
+        serviceId: 'openai-codex',
+        groupId: 'main',
+        activeProfileId: 'primary',
+        generation: 7,
+        runtimeStateRevision: 0,
+        policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'priority', autoSwitch: true },
+        members: [{ profileId: 'primary', priority: 1, createdAtMs: 1, enabled: true }],
+        memberStatesByProfileId: new Map([['primary', {
+          quotaSnapshot: { capturedAtMs: 10_000, effectiveRemainingPercent: 100, windows: [] },
+        }]]),
+      }),
+      commitSwitch: async () => { throw new Error('must not advance the generation'); },
+      applyGeneration: async () => { throw new Error('must not re-apply without current proof'); },
+    });
+
+    await expect(handleConnectedServiceRuntimeAuthFailure({
+      sessionId: 'session-1',
+      selection: { kind: 'group', serviceId: 'openai-codex', groupId: 'main', activeProfileId: 'primary' },
+      classification: {
+        kind: 'usage_limit',
+        limitCategory: 'usage_limit',
+        serviceId: 'openai-codex',
+        profileId: 'primary',
+        groupId: 'main',
+        resetsAtMs: 10_000,
+        planType: null,
+        rateLimits: null,
+        source: 'structured_provider_error',
+      },
+      switchesThisTurn: 0,
+      switchCoordinator,
+      allowCurrentProfileRetry: true,
+    })).resolves.toMatchObject({
+      status: 'switch_attempted',
+      result: { status: 'no_eligible_member', generation: 7 },
+    });
+  });
 });

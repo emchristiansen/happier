@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, symlink, utimes, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -11,6 +11,35 @@ import { verifyResumeReachableClaude } from './verifyResumeReachableClaude';
 
 const PROJECT_DIR_NAME = '-Users-leeroy-Documents-Development-happier-remote-dev';
 const VENDOR_RESUME_ID = '4b9434a8-b115-4363-851a-f39fff76a94b';
+
+describe('syncClaudeConnectedServiceHome durable account-local projects', () => {
+  it('retains sibling private sessions across refresh, then adopts them before linking shared projects', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-claude-durable-projects-'));
+    const targetDir = join(root, 'account');
+    const sourceDir = join(root, 'native');
+    const sourceEnv = { HOME: root, CLAUDE_CONFIG_DIR: sourceDir };
+    const projectDir = join(targetDir, 'projects', PROJECT_DIR_NAME);
+    try {
+      await mkdir(projectDir, { recursive: true });
+      await mkdir(join(sourceDir, 'projects'), { recursive: true });
+      await writeFile(join(projectDir, `${VENDOR_RESUME_ID}.jsonl`), '{"type":"assistant","text":"private"}\n');
+      await writeFile(join(projectDir, 'sibling.jsonl'), '{"type":"assistant","text":"sibling"}\n');
+      for (let pass = 0; pass < 2; pass += 1) {
+        await syncClaudeConnectedServiceHome({ sourceEnv, targetDir, sharingPolicyOverride: { configMode: 'copied', stateMode: 'isolated' } });
+        await expect(readFile(join(projectDir, 'sibling.jsonl'), 'utf8')).resolves.toContain('sibling');
+        await expect(verifyResumeReachableClaude({ vendorResumeId: VENDOR_RESUME_ID, processEnv: { ...sourceEnv, CLAUDE_CONFIG_DIR: targetDir } })).resolves.toMatchObject({ ok: true });
+      }
+      await syncClaudeConnectedServiceHome({ sourceEnv, targetDir, sharingPolicyOverride: { configMode: 'copied', stateMode: 'shared' } });
+      await expect(readFile(join(sourceDir, 'projects', PROJECT_DIR_NAME, 'sibling.jsonl'), 'utf8')).resolves.toContain('sibling');
+      const projectsLink = await lstat(join(targetDir, 'projects'));
+      await syncClaudeConnectedServiceHome({ sourceEnv, targetDir, sharingPolicyOverride: { configMode: 'copied', stateMode: 'shared' } });
+      expect((await lstat(join(targetDir, 'projects'))).ino).toBe(projectsLink.ino);
+      await expect(verifyResumeReachableClaude({ vendorResumeId: VENDOR_RESUME_ID, processEnv: { ...sourceEnv, CLAUDE_CONFIG_DIR: targetDir } })).resolves.toMatchObject({ ok: true });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
 
 async function makeSelfSourceHome(): Promise<Readonly<{ homeDir: string; targetDir: string; ambientDir: string }>> {
   const homeDir = await mkdtemp(join(tmpdir(), 'happier-claude-sync-home-'));

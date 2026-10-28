@@ -96,7 +96,7 @@ describe('useServerSettingsServerProfileActions (remove server)', () => {
         const actions = await renderHook(() =>
             useServerSettingsServerProfileActions({
                 authStatusByServerId: {},
-                onSwitchServerById: vi.fn(async () => {}),
+                onSelectServerById: vi.fn(async () => {}),
                 onAfterSignedOutSwitch: vi.fn(),
                 setRevision: setRevision as any,
             }),
@@ -117,7 +117,7 @@ describe('useServerSettingsServerProfileActions (remove server)', () => {
             publicKeyB64Url: 'abc123',
             serverUrl: 'https://wrong.example.test',
         };
-        const onSwitchServerById = vi.fn(async () => {});
+        const onSelectServerById = vi.fn(async () => {});
         const setRevision = vi.fn();
         const profile = {
             id: 'server-correct',
@@ -132,7 +132,7 @@ describe('useServerSettingsServerProfileActions (remove server)', () => {
         const actions = await renderHook(() =>
             useServerSettingsServerProfileActions({
                 authStatusByServerId: { 'server-correct': 'signedIn' },
-                onSwitchServerById,
+                onSelectServerById,
                 onAfterSignedOutSwitch: vi.fn(),
                 setRevision: setRevision as any,
             }),
@@ -141,11 +141,11 @@ describe('useServerSettingsServerProfileActions (remove server)', () => {
         await actions.onSwitchServer(profile);
 
         expect(pendingTerminalConnectMock.retarget).toHaveBeenCalledWith('https://correct.example.test');
-        expect(onSwitchServerById).toHaveBeenCalledWith('server-correct');
+        expect(onSelectServerById).toHaveBeenCalledWith('server-correct');
     });
 
     it('switches identity-backed profiles by canonical scope id', async () => {
-        const onSwitchServerById = vi.fn(async () => {});
+        const onSelectServerById = vi.fn(async () => {});
         const setRevision = vi.fn();
         const profile = {
             id: 'localhost-18829',
@@ -161,7 +161,7 @@ describe('useServerSettingsServerProfileActions (remove server)', () => {
         const actions = await renderHook(() =>
             useServerSettingsServerProfileActions({
                 authStatusByServerId: { srv_identity_a: 'signedIn' },
-                onSwitchServerById,
+                onSelectServerById,
                 onAfterSignedOutSwitch: vi.fn(),
                 setRevision: setRevision as any,
             }),
@@ -169,6 +169,6 @@ describe('useServerSettingsServerProfileActions (remove server)', () => {
 
         await actions.onSwitchServer(profile);
 
-        expect(onSwitchServerById).toHaveBeenCalledWith('srv_identity_a');
+        expect(onSelectServerById).toHaveBeenCalledWith('srv_identity_a');
     });
 });

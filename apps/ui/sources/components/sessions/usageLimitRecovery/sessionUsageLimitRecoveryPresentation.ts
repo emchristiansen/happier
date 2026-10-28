@@ -1,8 +1,10 @@
-import type {
-    ConnectedServiceQuotaRecoveryCreditsV1,
-    PrimaryTurnStatusV1,
-    SessionRuntimeIssueV1,
-    SessionUsageLimitRecoveryV1,
+import {
+    buildUsageLimitIssueFingerprint,
+    isSessionUsageLimitRecoveryForIssue,
+    type ConnectedServiceQuotaRecoveryCreditsV1,
+    type PrimaryTurnStatusV1,
+    type SessionRuntimeIssueV1,
+    type SessionUsageLimitRecoveryV1,
 } from '@happier-dev/protocol';
 
 import type { AgentInputStatusBadgeTone } from '@/components/sessions/agentInput/agentInputContracts';
@@ -212,9 +214,10 @@ function shouldSurfaceRecoveryIssue(params: Readonly<{
     // `runtimeWorking` only proves the runtime is live and ticking thinking/in-progress signals; it is
     // NOT proof that the provider accepted the recovered state or moved to a fresh quota. An unproven,
     // in-progress recovery (waiting-for-reset / provider-outcome-waiting / action-required / exhausted)
-    // must stay visible even while the runtime resumes "working" after a local switch. Only genuine
-    // provider activity after the issue (`hasActivityAfterRuntimeIssue`) proves the recovery resolved.
-    if (params.hasActivityAfterRuntimeIssue === true && params.latestTurnStatus !== 'cancelled') return false;
+    // must stay visible even while the runtime resumes "working" after a local switch. Provider
+    // activity only proves recovery once the current lifecycle has advanced to an in-progress turn;
+    // terminal text emitted by the failed turn (including the provider's own limit notice) does not.
+    if (params.hasActivityAfterRuntimeIssue === true && params.latestTurnStatus === 'in_progress') return false;
     if (
         params.latestTurnStatus != null
         && params.latestTurnStatus !== 'failed'
@@ -262,18 +265,6 @@ function appendRecoveryCreditSummaryBody(params: Readonly<{
             count: params.summary.availableCount,
         });
     return `${params.body}\n${creditBody}`;
-}
-
-function buildIssueFingerprint(issue: SessionRuntimeIssueV1): string {
-    return [
-        'usage-limit',
-        issue.provider ?? 'provider',
-        issue.providerTurnId ?? 'unknown-turn',
-        String(issue.occurredAt),
-        issue.usageLimit?.resetAtMs === null || issue.usageLimit?.resetAtMs === undefined
-            ? 'no-reset'
-            : String(issue.usageLimit.resetAtMs),
-    ].join(':');
 }
 
 function buildAction(
@@ -432,6 +423,10 @@ function shouldOfferCheckNowSecondary(params: Readonly<{
 export function buildSessionUsageLimitRecoveryPresentation(
     params: PresentationParams,
 ): SessionUsageLimitRecoveryPresentation | null {
+    if (isUsageLimitIssue(params.issue) && params.recovery
+        && !isSessionUsageLimitRecoveryForIssue(params.issue, params.recovery)) {
+        params = { ...params, recovery: null };
+    }
     if (!params.featureEnabled || !shouldSurfaceRecoveryIssue(params)) return null;
 
     if (isTemporaryThrottleIssue(params.issue)) {
@@ -444,7 +439,7 @@ export function buildSessionUsageLimitRecoveryPresentation(
             ? buildAction('cancel', 'session.usageLimitRecovery.stopRetrying', 'session-usageLimit-recovery-cancel', params.translate)
             : buildAction('retry_temporary_throttle', 'session.usageLimitRecovery.retryTemporaryThrottleAction', 'session-usageLimit-recovery-retryTemporaryThrottle', params.translate);
         return {
-            issueFingerprint: recovery?.issueFingerprint ?? buildIssueFingerprint(params.issue),
+            issueFingerprint: recovery?.issueFingerprint ?? buildUsageLimitIssueFingerprint(params.issue),
             armedAtMs: recovery?.armedAtMs ?? params.issue.occurredAt,
             banner: {
                 testID: 'session-usageLimit-recovery', title: params.translate('session.usageLimitRecovery.overloadTitle'),
@@ -505,7 +500,7 @@ export function buildSessionUsageLimitRecoveryPresentation(
     });
 
     return {
-        issueFingerprint: params.recovery?.issueFingerprint ?? buildIssueFingerprint(params.issue),
+        issueFingerprint: params.recovery?.issueFingerprint ?? buildUsageLimitIssueFingerprint(params.issue),
         armedAtMs: params.recovery?.armedAtMs ?? params.issue.occurredAt,
         ...(params.recovery?.runtimeAuthRecoveryAttemptId
             ? { runtimeAuthRecoveryAttemptId: params.recovery.runtimeAuthRecoveryAttemptId }
@@ -540,6 +535,10 @@ export function buildSessionUsageLimitRecoveryPresentation(
 export function buildSessionUsageLimitStatusBadgePresentation(
     params: Omit<PresentationParams, 'rememberedMode'>,
 ): SessionUsageLimitStatusBadgePresentation | null {
+    if (isUsageLimitIssue(params.issue) && params.recovery
+        && !isSessionUsageLimitRecoveryForIssue(params.issue, params.recovery)) {
+        params = { ...params, recovery: null };
+    }
     if (!params.featureEnabled || !shouldSurfaceRecoveryIssue(params)) return null;
 
     const resetAtMs = readResetAtMs(params.issue, params.recovery);

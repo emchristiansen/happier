@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -53,6 +53,23 @@ test('admits the signed desktop envelope through the same canonical inspector', 
     });
     assert.equal(inspected.product, 'ui-desktop');
     assert.equal(inspected.version, '1.2.3');
+  } finally {
+    await rm(current.directory, { recursive: true, force: true });
+  }
+});
+
+test('admits exact CLI component checksum envelopes only when bound by the main envelope', async () => {
+  const current = await fixture();
+  const name = 'checksums-happier-memory-runtime-v1.2.3-preview.4.txt';
+  try {
+    for (const asset of [name, `${name}.minisig`]) {
+      await writeFile(join(current.directory, asset), 'component envelope');
+      await appendFile(join(current.directory, 'checksums-happier-v1.2.3-preview.4.txt'), `${'b'.repeat(64)}  ${asset}\n`);
+    }
+    const inspected = await inspectImmutableReleaseCandidate(current);
+    assert.ok(inspected.assetNames.includes(name));
+    await writeFile(join(current.directory, 'checksums-happier-difftastic-v1.2.3-preview.4.txt'), 'unsigned');
+    await assert.rejects(inspectImmutableReleaseCandidate(current), /unsigned|file set/);
   } finally {
     await rm(current.directory, { recursive: true, force: true });
   }

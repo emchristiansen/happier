@@ -80,6 +80,7 @@ describe('applySessions nested React updates', () => {
                         showUnread: true,
                         showPendingPermissionRequests: true,
                         showPendingUserActionRequests: true,
+                        showQueuedUserInput: true,
                     },
                 });
                 useSessionListViewData();

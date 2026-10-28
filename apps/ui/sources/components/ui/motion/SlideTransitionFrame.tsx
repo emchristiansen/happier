@@ -10,8 +10,8 @@
  *
  * Each layer is wrapped in an `Animated.View` whose style is computed via
  * `useAnimatedStyle` calling the worklet-safe `resolveSlideLayerStyle`. Optionally
- * overlaid with a per-layer `SlideTransitionBlurLayer` (web → CSS filter; native →
- * BlurView via animated intensity) when `blur === true`.
+ * overlaid with a per-layer `SlideTransitionBlurLayer` (web → CSS filter; iOS →
+ * BlurView via animated intensity; Android → none) when `blur === true`.
  *
  * Reduced motion: blur layer is not mounted at all (zero cost).
  */
@@ -52,6 +52,7 @@ export function SlideTransitionFrame(props: SlideTransitionFrameProps): React.Re
         <View style={[stylesheet.container, props.style]} testID={props.testID}>
             {props.previous != null ? (
                 <SlideTransitionLayer
+                    key={props.previousKey ?? 'previous'}
                     role="previous"
                     progress={props.progress}
                     distance={distance}
@@ -66,6 +67,7 @@ export function SlideTransitionFrame(props: SlideTransitionFrameProps): React.Re
                 </SlideTransitionLayer>
             ) : null}
             <SlideTransitionLayer
+                key={props.currentKey ?? 'current'}
                 role="current"
                 progress={props.progress}
                 distance={distance}
@@ -80,6 +82,7 @@ export function SlideTransitionFrame(props: SlideTransitionFrameProps): React.Re
             </SlideTransitionLayer>
             {props.next != null ? (
                 <SlideTransitionLayer
+                    key={props.nextKey ?? 'next'}
                     role="next"
                     progress={props.progress}
                     distance={distance}

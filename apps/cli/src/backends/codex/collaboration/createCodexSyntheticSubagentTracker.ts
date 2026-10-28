@@ -1,6 +1,8 @@
 import type { ACPMessageData } from '@/api/session/sessionMessageTypes';
 import {
     buildCodexSyntheticSubagentToolCall,
+    resolveCodexSubagentOccurrenceId,
+    type SubagentMetadata,
     buildCodexSyntheticSubagentToolResult,
 } from './buildCodexSyntheticSubagentToolMessages';
 
@@ -17,28 +19,21 @@ type SessionLike = Readonly<{
     ) => Promise<unknown>;
 }>;
 
-type SubagentThreadState = Readonly<{
+type SubagentOccurrenceState = Readonly<{
     rootToolCallSent: boolean;
     rootToolResultSent: boolean;
-}>;
-
-type SubagentMetadata = Readonly<{
-    threadId: string;
-    prompt?: string | null;
-    nickname?: string | null;
-    role?: string | null;
 }>;
 
 export function createCodexSyntheticSubagentTracker(params: Readonly<{
     session: SessionLike;
 }>) {
-    const stateByThreadId = new Map<string, SubagentThreadState>();
+    const stateByOccurrenceId = new Map<string, SubagentOccurrenceState>();
 
     const ensureStarted = async (
         metadata: SubagentMetadata,
         opts?: Readonly<{ localId: string }>,
     ): Promise<void> => {
-        const current = stateByThreadId.get(metadata.threadId);
+        const current = stateByOccurrenceId.get(resolveCodexSubagentOccurrenceId(metadata));
         if (current?.rootToolCallSent) return;
 
         const body = buildCodexSyntheticSubagentToolCall(metadata);
@@ -47,24 +42,24 @@ export function createCodexSyntheticSubagentTracker(params: Readonly<{
         } else {
             params.session.sendAgentMessage('codex', body);
         }
-        stateByThreadId.set(metadata.threadId, {
+        stateByOccurrenceId.set(resolveCodexSubagentOccurrenceId(metadata), {
             rootToolCallSent: true,
             rootToolResultSent: current?.rootToolResultSent ?? false,
         });
     };
 
     const finalize = async (
-        metadata: Readonly<{ threadId: string; status: 'completed' | 'interrupted' }>,
+        metadata: Readonly<{ threadId: string; providerTurnId?: string | null; status: 'completed' | 'failed' | 'interrupted'; error?: string }>,
         opts?: Readonly<{ localId: string }>,
     ): Promise<void> => {
-        const current = stateByThreadId.get(metadata.threadId);
+        const current = stateByOccurrenceId.get(resolveCodexSubagentOccurrenceId(metadata));
         if (!current?.rootToolCallSent) {
             if (opts) {
                 throw new Error(`Exact Codex subagent result is missing its started occurrence: ${metadata.threadId}`);
             }
-            await ensureStarted({ threadId: metadata.threadId });
+            await ensureStarted(metadata);
         }
-        const latest = stateByThreadId.get(metadata.threadId);
+        const latest = stateByOccurrenceId.get(resolveCodexSubagentOccurrenceId(metadata));
         if (latest?.rootToolResultSent) return;
 
         const body = buildCodexSyntheticSubagentToolResult(metadata);
@@ -73,7 +68,7 @@ export function createCodexSyntheticSubagentTracker(params: Readonly<{
         } else {
             params.session.sendAgentMessage('codex', body);
         }
-        stateByThreadId.set(metadata.threadId, {
+        stateByOccurrenceId.set(resolveCodexSubagentOccurrenceId(metadata), {
             rootToolCallSent: true,
             rootToolResultSent: true,
         });
@@ -83,8 +78,8 @@ export function createCodexSyntheticSubagentTracker(params: Readonly<{
         ensureStarted,
         finalize,
 
-        hasStarted(threadId: string): boolean {
-            return stateByThreadId.get(threadId)?.rootToolCallSent === true;
+        hasStarted(threadId: string, providerTurnId?: string | null): boolean {
+            return stateByOccurrenceId.get(resolveCodexSubagentOccurrenceId({ threadId, providerTurnId }))?.rootToolCallSent === true;
         },
     };
 }

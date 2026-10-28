@@ -112,6 +112,9 @@ export async function probeAgentConfigOptionsBestEffort(params: {
   connectedServices?: ConnectedServiceBindingsV1 | null;
   processEnv?: NodeJS.ProcessEnv;
   connectedServiceSelectionCacheKey?: string | null;
+  signal?: AbortSignal;
+  deadlineAt?: number;
+  onNativeCleanup?: import('./catalogProbeLifecycle').RegisterNativeCatalogCleanup;
 }): Promise<ProbedAgentConfigOptionsResult> {
   const nowMs = Date.now();
   const cwd = typeof params.cwd === 'string' && params.cwd.trim().length > 0 ? params.cwd.trim() : process.cwd();
@@ -138,7 +141,8 @@ export async function probeAgentConfigOptionsBestEffort(params: {
   const cached = agentConfigOptionsProbeCache.get(cacheKey);
   if (cached?.kind === 'success' && agentConfigOptionsProbeCache.isFresh(cached, nowMs)) return cached.value;
 
-  return await agentConfigOptionsProbeCache.runDedupe(cacheKey, async () => {
+  const runProbe = async () => {
+    params.signal?.throwIfAborted();
     const cached2 = agentConfigOptionsProbeCache.get(cacheKey);
     const nowMs2 = Date.now();
     if (cached2?.kind === 'success' && agentConfigOptionsProbeCache.isFresh(cached2, nowMs2)) return cached2.value;
@@ -157,6 +161,9 @@ export async function probeAgentConfigOptionsBestEffort(params: {
           backendTarget: params.backendTarget,
           cwd,
           timeoutMs,
+          deadlineAt: params.deadlineAt,
+          signal: params.signal,
+          onNativeCleanup: params.onNativeCleanup,
           profileId,
           accountSettings: params.accountSettings ?? null,
           credentials: params.credentials ?? null,
@@ -195,5 +202,6 @@ export async function probeAgentConfigOptionsBestEffort(params: {
 
     agentConfigOptionsProbeCache.setSuccess(cacheKey, fallback, { nowMs: nowMs2, ttlMs: PROBE_CONFIG_OPTIONS_SUCCESS_TTL_MS });
     return fallback;
-  });
+  };
+  return params.signal ? await runProbe() : await agentConfigOptionsProbeCache.runDedupe(cacheKey, runProbe);
 }

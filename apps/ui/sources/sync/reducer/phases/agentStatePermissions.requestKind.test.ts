@@ -3,6 +3,36 @@ import { createReducer } from '../reducer';
 import { runAgentStatePermissionsPhase } from './agentStatePermissions';
 
 describe('runAgentStatePermissionsPhase (request kind)', () => {
+  it('projects persisted structured answers onto the original completed question', () => {
+    const state = createReducer();
+    const changed = new Set<string>();
+    const requestId = 'codex-question-1';
+    const questions = [
+      { header: 'Question 1', question: 'Pick one', options: [], multiSelect: false },
+      { header: 'Question 2', question: 'Add context', options: [], multiSelect: false },
+    ];
+    const request = { tool: 'AskUserQuestion', kind: 'user_action' as const, arguments: { questions }, createdAt: 100 };
+    runAgentStatePermissionsPhase({
+      state, agentState: { controlledByUser: null, requests: { [requestId]: request }, completedRequests: null },
+      incomingToolIds: new Set<string>(), changed, allocateId: () => 'question-message', enableLogging: false,
+    });
+    runAgentStatePermissionsPhase({
+      state,
+      agentState: {
+        controlledByUser: null, requests: {},
+        completedRequests: { [requestId]: {
+          ...request, completedAt: 200, status: 'approved',
+          structuredAnswersV1: { 'Pick one': ['Option B'], 'Add context': ['lorem ipsum'] },
+        } },
+      },
+      incomingToolIds: new Set<string>(), changed, allocateId: () => 'unexpected', enableLogging: false,
+    });
+
+    expect(state.messages.get('question-message')?.tool?.result).toEqual({
+      answers: { 'Pick one': 'Option B', 'Add context': 'lorem ipsum' },
+    });
+  });
+
   it('retires a completed source-owned question and preserves its submitted answer', () => {
     const state = createReducer();
     const changed = new Set<string>();

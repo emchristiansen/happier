@@ -48,9 +48,6 @@ test.describe('ui e2e: thinking markdown rendering', () => {
       extraEnv: {
         HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys,providers.claude.unifiedTerminal',
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
       },
     });
 
@@ -74,8 +71,8 @@ test.describe('ui e2e: thinking markdown rendering', () => {
     await server?.stop().catch(() => {});
   });
 
-  test('renders streamed thinking markdown with stable whitespace and inline-code styles', async ({ page }) => {
-    test.setTimeout(540_000);
+  test('renders streamed thinking markdown with stable whitespace and inline-code styles', { tag: "@smoke" }, async ({ page }) => {
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
     await page.setViewportSize({ width: 1440, height: 900 });

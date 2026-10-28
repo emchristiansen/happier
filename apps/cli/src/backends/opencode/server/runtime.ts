@@ -1,3 +1,4 @@
+import { buildUsageLimitIssueFingerprint } from '@happier-dev/protocol';
 import { randomUUID } from 'node:crypto';
 import type { McpServerConfig } from '@/agent';
 import type { ProviderEnforcedPermissionHandler } from '@/agent/permissions/ProviderEnforcedPermissionHandler';
@@ -25,14 +26,16 @@ import {
 } from '@/agent/runtime/providerPromptSubmission';
 import { createEventShapeLoggerForLog } from '@/diagnostics/eventShapeForLog';
 import type { DrainPendingOptions, DrainPendingResult } from '@/agent/runtime/sessionInput/types';
+import type { InFlightSteerPromptOptions } from '@/agent/runtime/permission/bindPermissionModeQueue';
 
 import type { OpenCodeGlobalEvent, OpenCodeModelRef, OpenCodePermissionRequest, OpenCodeQuestionRequest, OpenCodeSession } from './types';
 import {
   createOpenCodeServerRuntimeClient,
+  OpenCodeServerCommandUnsupportedError,
   type OpenCodeGlobalEventDelivery,
   type OpenCodeServerRuntimeClient,
 } from './client';
-import { extractOpenCodeTextHistoryItems, importOpenCodeTextHistoryCommitted } from './openCodeSessionMessageImport';
+import { extractOpenCodeTextHistoryItems, importOpenCodeTextHistoryCommitted, reconcileOpenCodeCommittedHistoryIdentities } from './openCodeSessionMessageImport';
 import { extractOpenCodeTaskChildSessionId, importOpenCodeTaskSidechainBestEffort } from './openCodeTaskSidechainImport';
 import { createOpenCodeTranscriptStreamBridge } from './openCodeTranscriptStreamBridge';
 import { asRecord, normalizeString, normalizeStringArray } from './openCodeParsing';
@@ -42,9 +45,14 @@ import {
   resolveOpenCodeRuntimeAuthSelection,
 } from '../connectedServices/createOpenCodeConnectedServiceRuntimeAuthAdapter';
 import { extractOpenCodeSessionMessageId, parseOpenCodeToolPart } from './openCodeMessageParsing';
-import { canonicalizeOpenCodeConfiguredMcpToolName } from './openCodeMcpToolNames';
 import {
-  isKnownUnavailableOpenCodeModel,
+  buildOpenCodeSessionScopedPermissionRuleset,
+  canonicalizeOpenCodeConfiguredMcpToolName,
+  projectOpenCodeSessionMcpServers,
+} from './openCodeMcpToolNames';
+import {
+  isOpenCodeModelSelectable,
+  modelSupportsReasoningVariants,
   parseOpenCodeModelId,
   resolveOpenCodeDefaultProviderIdFromModelId,
 } from './openCodeModelParsing';
@@ -64,7 +72,6 @@ import {
   resolveOpenCodeUserMessageIdFromMetadata,
   upsertOpenCodeUserMessageIdInMetadata,
 } from './openCodeUserMessageIds';
-import { buildOpenCodeSessionPermissionRuleset } from '@/backends/openCodeFamily/permission/openCodeFamilyPermissionPolicy';
 import { resolvePreferredChangeTitleToolNameForProvider } from '@/agent/prompting/coding/providerToolAliasRegistry';
 import { extractOpenCodeFileDiff } from '../utils/extractOpenCodeFileDiff';
 import { readOpenCodeSessionRuntimeHandleFromMetadata } from '../utils/opencodeSessionAffinity';
@@ -101,6 +108,8 @@ import {
   readOpenCodeNestedRecord,
   readOpenCodeTimestampMs,
 } from '../transcriptProjection/openCodeProjectionParsing';
+import { buildOpenCodePromptParts } from './promptParts';
+import { normalizeAvailableCommands, publishSlashCommandsToMetadata } from '@/agent/acp/commands/publishSlashCommands';
 
 function mergeSessionWorkStateIntoMetadata(
   metadata: Metadata,
@@ -242,6 +251,7 @@ export function createOpenCodeServerRuntime(params: {
   }>;
 }, deps: OpenCodeServerRuntimeDeps = {}) {
   const provider: ACPProvider = 'opencode';
+  const mcpProjection = projectOpenCodeSessionMcpServers(params.session.sessionId, params.mcpServers);
   const createClient = deps.createClient ?? createOpenCodeServerRuntimeClient;
   const env = params.env ?? process.env;
   let connectedBrokerPreflight: Promise<OpenCodeBrokerReadiness> | null = null;
@@ -270,16 +280,17 @@ export function createOpenCodeServerRuntime(params: {
         ? Object.assign(error, { runtimeAuthClassification })
         : { ...(asRecord(error) ?? {}), runtimeAuthClassification }
       : error;
-    if (runtimeAuthClassification) {
+    const reportFailure = (classification = runtimeAuthClassification): void => {
+      if (!classification) return;
       void reportConnectedServiceRuntimeAuthFailureToDaemon({
         sessionId: params.session.sessionId,
         switchesThisTurn: 0,
-        classification: runtimeAuthClassification,
+        classification,
         logPrefix: '[opencode]',
       }).then((recoveryReport) => {
         projectConnectedServiceRuntimeAuthRecoveryReport({
           report: recoveryReport,
-          classification: runtimeAuthClassification,
+          classification,
           sendGenericStatusMessage: (message) => {
             params.session.sendSessionEvent({ type: 'message', message });
             return true;
@@ -291,16 +302,25 @@ export function createOpenCodeServerRuntime(params: {
           },
         });
       });
-    }
+    };
+    let acceptedFailure = false;
     void surfacePrimarySessionRuntimeIssue({
       cause,
       provider,
       providerTurnId,
       error: errorWithClassification,
       session: params.session,
+      suppressUntrustedDuplicate: true,
+      onFailureTurn: ({ issue }) => {
+        acceptedFailure = true;
+        reportFailure(runtimeAuthClassification
+          ? { ...runtimeAuthClassification, runtimeIssueFingerprint: buildUsageLimitIssueFingerprint(issue) } : null);
+      },
     }).catch((surfaceError) => {
       logger.debug('[opencode] Failed to persist primary session runtime issue (non-fatal)', surfaceError);
     });
+    // An idle provider diagnostic has no accepted failed-turn witness; retain diagnostic coalescing.
+    if (!acceptedFailure) reportFailure();
   };
 
   let client: OpenCodeServerRuntimeClient | null = null;
@@ -337,18 +357,20 @@ export function createOpenCodeServerRuntime(params: {
   const configOverrides: Record<string, unknown> = {};
   let omitCustomMessageIdForResumedSession = false;
   let ensuredMcpServersForDirectory = false;
+  let currentMcpDirectory = params.directory;
   let mcpServerRegistrationInFlight: Promise<void> | null = null;
   let mcpServerRegistrationRerunRequested = false;
-  const ensuredMcpServerNames = new Set<string>();
-  const requiredMcpServerName = params.happierMcpAdmission.kind === 'required'
-    ? 'happier'
+  const registeredMcpServers: Array<{ directory: string; name: string }> = [];
+  const requiresHappierMcpServer = params.happierMcpAdmission.kind === 'required';
+  const requiredMcpServerName = requiresHappierMcpServer
+    ? mcpProjection.requiredHappierServerName
     : null;
   let requiredMcpServerReadiness = {
     deferred: createDeferred<RequiredMcpServerReadinessOutcome>(),
   };
   if (
-    requiredMcpServerName
-    && !Object.prototype.hasOwnProperty.call(params.mcpServers, requiredMcpServerName)
+    requiresHappierMcpServer
+    && !requiredMcpServerName
   ) {
     requiredMcpServerReadiness.deferred.resolve({
       status: 'failed',
@@ -438,11 +460,11 @@ export function createOpenCodeServerRuntime(params: {
   }>();
 
   const resolveSessionPermissionRuleset = (): ReadonlyArray<{ permission: string; pattern: string; action: 'ask' | 'allow' | 'deny' }> =>
-    buildOpenCodeSessionPermissionRuleset(params.getPermissionMode?.() ?? 'default');
+    buildOpenCodeSessionScopedPermissionRuleset(params.getPermissionMode?.() ?? 'default', mcpProjection);
 
   const partTypeByPartKey = new Map<string, string>();
   const suppressedLivePartKeys = new Set<string>();
-  const suppressedLiveMessageKeys = new Set<string>();
+  const liveMessageProjectionByKey = new Map<string, 'assistant' | 'user' | 'suppressed'>();
   const toolCallSentByCallId = new Set<string>();
   const toolResultSentByCallId = new Set<string>();
   const observedToolPartByCallKey = new Map<string, NonNullable<ReturnType<typeof parseOpenCodeToolPart>>>();
@@ -454,7 +476,7 @@ export function createOpenCodeServerRuntime(params: {
 
   const suppressLiveMessageProjection = (remoteSessionId: string, messageId: string): void => {
     if (!remoteSessionId || !messageId) return;
-    suppressedLiveMessageKeys.add(buildLiveMessageKey(remoteSessionId, messageId));
+    liveMessageProjectionByKey.set(buildLiveMessageKey(remoteSessionId, messageId), 'suppressed');
     pendingInlinePartSnapshotsByMessagePartKey.delete(`${remoteSessionId}:${messageId}:reasoning`);
     pendingInlinePartSnapshotsByMessagePartKey.delete(`${remoteSessionId}:${messageId}:text`);
     discardSuppressedLiveMessageStream?.(remoteSessionId, messageId);
@@ -469,7 +491,7 @@ export function createOpenCodeServerRuntime(params: {
     const normalizedTool = toolRaw.trim();
     const toolLower = normalizedTool.toLowerCase();
     const canonicalMcpToolName =
-      canonicalizeOpenCodeConfiguredMcpToolName(normalizedTool, params.mcpServers);
+      canonicalizeOpenCodeConfiguredMcpToolName(normalizedTool, mcpProjection);
     return canonicalMcpToolName ?? (toolLower === 'grep' ? 'search' : normalizedTool);
   };
 
@@ -747,15 +769,15 @@ export function createOpenCodeServerRuntime(params: {
     serverConnectedDeferred.resolve();
   };
 
-  const isActivePromptTurn = (turn: Deferred<void>, targetSessionId: string): boolean =>
-    turnDeferred === turn && turnPromptActive && sessionId === targetSessionId;
+  const isActiveSubmission = (turn: Deferred<void>, targetSessionId: string): boolean =>
+    turnDeferred === turn && sessionId === targetSessionId;
 
   const waitForServerConnectedBeforePrompt = async (
     turn: Deferred<void>,
     targetSessionId: string,
   ): Promise<boolean> => {
     for (;;) {
-      if (!isActivePromptTurn(turn, targetSessionId)) return false;
+      if (!isActiveSubmission(turn, targetSessionId)) return false;
       const expectedGenerationKey = readCurrentServerConnectedGenerationKey();
       if (serverConnectedGenerationKey === expectedGenerationKey) return true;
 
@@ -772,16 +794,40 @@ export function createOpenCodeServerRuntime(params: {
     }
   };
 
-  const publishDynamicSessionOptionsBestEffort = () => {
-    void (async () => {
+  const resolveNativeCommand = async (text: string) => {
+    const match = /^\s*\/([^\s]+)(?:\s([\s\S]*))?$/u.exec(text);
+    if (!match) return null;
+    const c = await ensureClient();
+    const details = normalizeAvailableCommands(await c.appCommands());
+    publishSlashCommandsToMetadata({ session: params.session, details });
+    const command = match[1]!;
+    return details.some((detail) => detail.command === command)
+      ? { command, arguments: match[2] ?? '' }
+      : null;
+  };
+
+  const publishDynamicSessionOptionsBestEffort = (): Promise<void> => {
+    return (async () => {
       if (!sessionId) return;
       const c = await ensureClient();
 
-      const [config, agents, providers] = await Promise.all([
+      const [config, agents, providers, commands] = await Promise.all([
         c.globalConfigGet().catch(() => ({})),
-        c.agentsList().catch(() => []),
-        c.providersList().catch(() => []),
+        c.agentsList().catch(() => {
+          logger.infoFile('[OpenCodeServer] Mode discovery failed; retaining the last available mode list');
+          return null;
+        }),
+        c.providersList().catch(() => {
+          logger.infoFile('[OpenCodeServer] Model discovery failed; retaining the last available model list');
+          return null;
+        }),
+        c.appCommands().catch(() => {
+          logger.infoFile('[OpenCodeServer] Command discovery failed; retaining the last available command list');
+          return null;
+        }),
       ]);
+
+      if (commands !== null) publishSlashCommandsToMetadata({ session: params.session, details: normalizeAvailableCommands(commands) });
 
       const defaultModelId = typeof (config as any)?.model === 'string' ? String((config as any).model).trim() : '';
       const includedProviders = (Array.isArray(providers) ? providers : []).filter((p) => {
@@ -802,16 +848,11 @@ export function createOpenCodeServerRuntime(params: {
         for (const key of keys) {
           const modelRec = modelsRec[key];
           const modelId = normalizeString(asRecord(modelRec)?.id) || key;
-          if (isKnownUnavailableOpenCodeModel({ providerID: providerId, modelID: modelId })) continue;
-          const modelStatus = normalizeString(asRecord(modelRec)?.status);
-          if (modelStatus && modelStatus !== 'active') continue;
-          const capabilities = asRecord((asRecord(modelRec) as any)?.capabilities);
-          const input = capabilities ? asRecord((capabilities as any)?.input) : null;
-          if (input && (input as any).text === false) continue;
+          if (!isOpenCodeModelSelectable({ providerID: providerId, modelID: modelId, modelRecord: modelRec })) continue;
           const fullId = `${providerId}/${modelId}`;
           const name = normalizeString(asRecord(modelRec)?.name) || modelId;
           const description = normalizeString(asRecord(modelRec)?.family) || '';
-          const supportsReasoning = capabilities ? capabilities.reasoning === true : false;
+          const supportsReasoning = modelSupportsReasoningVariants(modelRec);
           const contextWindowTokens = readContextWindowTokensFromModelRecord(asRecord(modelRec) ?? {});
           const modelOptions: SessionModelEntry['modelOptions'] | null = supportsReasoning
             ? (buildOpenCodeThinkingModelOptionsFromVariants((asRecord(modelRec) as any)?.variants, variantCandidate) as SessionModelEntry['modelOptions'])
@@ -826,8 +867,14 @@ export function createOpenCodeServerRuntime(params: {
         }
       }
 
+      // Released `Agent.Info` separates the switchable `id` from the display `name`; V1 published
+      // only `name`, so it remains the fallback identity.
       const availableModes = (Array.isArray(agents) ? agents : [])
-        .map((a) => ({ id: normalizeString((a as any)?.name), name: normalizeString((a as any)?.name), description: normalizeString((a as any)?.description) }))
+        .map((a) => ({
+          id: normalizeString((a as any)?.id) || normalizeString((a as any)?.name),
+          name: normalizeString((a as any)?.name) || normalizeString((a as any)?.id),
+          description: normalizeString((a as any)?.description),
+        }))
         .filter((a) => a.id && a.name)
         .map((a) => ({ id: a.id, name: a.name, ...(a.description ? { description: a.description } : {}) }));
 
@@ -839,43 +886,49 @@ export function createOpenCodeServerRuntime(params: {
         (selectedModelId && availableModelIds.has(selectedModelId) ? selectedModelId : '')
         || (defaultModelId && availableModelIds.has(defaultModelId) ? defaultModelId : '')
         || availableModels[0]?.id
-        || '';
-      currentContextWindowTokens =
-        availableModels.find((model) => model.id === currentModelId)?.contextWindowTokens ?? null;
+        || selectedModelId || defaultModelId || 'default';
+      if (providers !== null) {
+        currentContextWindowTokens =
+          availableModels.find((model) => model.id === currentModelId)?.contextWindowTokens ?? null;
+      }
       const snapshot = await params.session.ensureMetadataSnapshot({ timeoutMs: 60_000 }).catch(() => null);
       if (!snapshot) return;
 
       const updatedAt = Date.now();
       await params.session.updateMetadata((prev) => ({
         ...prev,
-        sessionModesV1: {
-          v: 1,
-          provider,
-          updatedAt,
-          currentModeId,
-          availableModes,
-        },
-        acpSessionModesV1: {
-          v: 1,
-          provider,
-          updatedAt,
-          currentModeId,
-          availableModes,
-        },
-        sessionModelsV1: {
-          v: 1,
-          provider,
-          updatedAt,
-          currentModelId,
-          availableModels,
-        },
-        acpSessionModelsV1: {
-          v: 1,
-          provider,
-          updatedAt,
-          currentModelId,
-          availableModels,
-        },
+        ...(agents !== null ? {
+          sessionModesV1: {
+            v: 1 as const,
+            provider,
+            updatedAt,
+            currentModeId,
+            availableModes,
+          },
+          acpSessionModesV1: {
+            v: 1 as const,
+            provider,
+            updatedAt,
+            currentModeId,
+            availableModes,
+          },
+        } : {}),
+        ...(providers !== null ? {
+          sessionModelsV1: {
+            v: 1 as const,
+            provider,
+            updatedAt,
+            currentModelId,
+            availableModels,
+          },
+          acpSessionModelsV1: {
+            v: 1 as const,
+            provider,
+            updatedAt,
+            currentModelId,
+            availableModels,
+          },
+        } : {}),
       }));
     })().catch((error) => {
       logger.debug('[OpenCodeServer] Failed publishing session options metadata (non-fatal)', error);
@@ -920,12 +973,7 @@ export function createOpenCodeServerRuntime(params: {
       for (const [modelKey, modelValue] of Object.entries(models)) {
         const model = asRecord(modelValue);
         const modelID = normalizeString(model?.id) || modelKey;
-        if (isKnownUnavailableOpenCodeModel({ providerID: providerId, modelID })) continue;
-        const status = normalizeString(model?.status);
-        if (status && status !== 'active') continue;
-        const capabilities = asRecord(model?.capabilities);
-        const input = capabilities ? asRecord(capabilities.input) : null;
-        if (input && input.text === false) continue;
+        if (!isOpenCodeModelSelectable({ providerID: providerId, modelID, modelRecord: model })) continue;
         return {
           providerID: providerId,
           modelID: normalizeString(model?.id) || modelKey,
@@ -934,26 +982,6 @@ export function createOpenCodeServerRuntime(params: {
     }
 
     throw new Error('OpenCode server compactContext requires an active model');
-  };
-
-  const modelIsSelectable = (model: Readonly<{
-    providerID: string;
-    modelID: string;
-    modelRecord?: unknown;
-  }>): boolean => {
-    const providerID = normalizeString(model.providerID);
-    const modelID = normalizeString(model.modelID);
-    if (!providerID || !modelID) return false;
-    if (isKnownUnavailableOpenCodeModel({ providerID, modelID })) return false;
-
-    const record = asRecord(model.modelRecord);
-    if (!record) return true;
-    const status = normalizeString(record.status);
-    if (status && status !== 'active') return false;
-    const capabilities = asRecord(record.capabilities);
-    const input = capabilities ? asRecord(capabilities.input) : null;
-    if (input && input.text === false) return false;
-    return true;
   };
 
   const findModelForProvider = (
@@ -968,7 +996,7 @@ export function createOpenCodeServerRuntime(params: {
     const providerInfo = providers.find((providerRecord) => normalizeString(providerRecord.id) === normalizedProviderId);
     const models = asRecord(providerInfo?.models);
     if (!models) {
-      return modelIsSelectable({ providerID: normalizedProviderId, modelID: normalizedModelId })
+      return isOpenCodeModelSelectable({ providerID: normalizedProviderId, modelID: normalizedModelId })
         ? { providerID: normalizedProviderId, modelID: normalizedModelId }
         : null;
     }
@@ -977,7 +1005,7 @@ export function createOpenCodeServerRuntime(params: {
       ?? Object.values(models).find((candidate) => normalizeString(asRecord(candidate)?.id) === normalizedModelId);
     if (!modelRecord) return null;
     const resolvedModelId = normalizeString(asRecord(modelRecord)?.id) || normalizedModelId;
-    return modelIsSelectable({ providerID: normalizedProviderId, modelID: resolvedModelId, modelRecord })
+    return isOpenCodeModelSelectable({ providerID: normalizedProviderId, modelID: resolvedModelId, modelRecord })
       ? { providerID: normalizedProviderId, modelID: resolvedModelId }
       : null;
   };
@@ -1023,7 +1051,7 @@ export function createOpenCodeServerRuntime(params: {
 
     const parsed = parseOpenCodeModelId(trimmed);
     if (parsed) {
-      if (!modelIsSelectable(parsed)) return null;
+      if (!isOpenCodeModelSelectable(parsed)) return null;
       return options.validateQualifiedModel === true
         ? await validateQualifiedModelAgainstProviderInventory(parsed)
         : parsed;
@@ -1048,7 +1076,7 @@ export function createOpenCodeServerRuntime(params: {
     if (matches.length === 1) return matches[0];
 
     if (defaultProviderId) {
-      return modelIsSelectable({ providerID: defaultProviderId, modelID: trimmed })
+      return isOpenCodeModelSelectable({ providerID: defaultProviderId, modelID: trimmed })
         ? { providerID: defaultProviderId, modelID: trimmed }
         : null;
     }
@@ -1092,92 +1120,32 @@ export function createOpenCodeServerRuntime(params: {
 
   let scheduleAuthoritativeRequestInventoryRefresh: () => void = () => {};
 
-  const handleUntrustedObservation = (evt: OpenCodeGlobalEvent): Promise<void> | void => {
-    const type = normalizeString(evt.payload.type);
-    const props = asRecord(evt.payload.properties);
-
-    if (type === 'message.updated') {
-      const info = asRecord(props?.info);
-      if (!info) return;
-      const observedSessionId = normalizeString(info.sessionID);
-      if (!turnPromptActive) {
-        if (sessionId && observedSessionId === sessionId) {
-          // The event is only a content-free invalidation. The inventory reader remains the
-          // authority for externally authored transcript rows.
-          scheduleExternalSessionTranscriptProjection();
-        }
-        return;
-      }
-      if (!isExactCurrentTurnAssistantObservation(info)) return;
-      return handleEvent(evt);
-    }
-
-    if (
-      type === 'message.part.updated'
-      || type === 'message.part.created'
-      || type === 'message.part.delta'
-    ) {
-      if (!turnPromptActive) return;
-      const part = type === 'message.part.delta' ? props : asRecord(props?.part);
-      if (!part) return;
-      const observedSessionId = normalizeString(part.sessionID);
-      const messageId = normalizeString(part.messageID);
-      if (!observedSessionId || !messageId) return;
-      if (observedSessionId === sessionId) {
-        if (!isCurrentTurnObservationMessageId(messageId)) return;
-        return handleEvent(evt);
-      }
-      // A child session is admitted only after the current parent turn's Task tool established the
-      // exact sidechain mapping. Old or unrelated global-bus frames therefore remain inert.
-      if (resolveSidechainIdForRemoteSession(observedSessionId)) {
-        return handleEvent(evt);
-      }
-      return;
-    }
-
-    if (type === 'todo.updated') {
-      const observedSessionId = normalizeString(props?.sessionID)
-        || normalizeString(asRecord(props?.session)?.id);
-      if (!observedSessionId || observedSessionId === sessionId) {
-        // The SSE frame is a wake-up only; the inventory reader remains authoritative.
-        publishNativeTodosWorkStateBestEffort();
-      }
-      return;
-    }
-
-    if (type === 'question.asked' || type === 'permission.asked') {
-      const observedSessionId = normalizeString(props?.sessionID);
-      if (
-        observedSessionId
-        && (observedSessionId === sessionId || sidechainIdByRemoteSessionId.has(observedSessionId))
-      ) {
-        // GlobalBus can replay the original event shape after reconnect. Treat it only as a wake:
-        // the provider's current pending-request lists are the authority for content and liveness.
-        scheduleAuthoritativeRequestInventoryRefresh();
-      }
-    }
-  };
-
   const attachSubscriptionIfNeeded = async (): Promise<void> => {
     if (subscriptionAbort) return;
     const c = await ensureClient();
     const controller = new AbortController();
     subscriptionAbort = controller;
+    let acceptedConnectionBoundarySeen = false;
 
     void c.subscribeGlobalEvents({
+      sessionId,
       signal: controller.signal,
       onEvent: (evt, delivery: OpenCodeGlobalEventDelivery) => {
         const eventType = normalizeString(evt.payload.type);
         if (delivery.provenance === 'connection-boundary' && eventType !== 'server.connected') {
           return;
         }
+        const isInitialConnectionBoundary = delivery.provenance === 'connection-boundary'
+          && eventType === 'server.connected'
+          && !acceptedConnectionBoundarySeen;
+        if (delivery.provenance === 'connection-boundary' && eventType === 'server.connected') {
+          acceptedConnectionBoundarySeen = true;
+        }
         const eventSequence = nextProviderEventSequence + 1;
         nextProviderEventSequence = eventSequence;
         const processEvent = (): Promise<void> | void => {
           try {
-            return delivery.provenance === 'untrusted-observation'
-              ? handleUntrustedObservation(evt)
-              : handleEvent(evt);
+            return handleEvent(evt, { reconcileTranscriptOnConnect: !isInitialConnectionBoundary });
           } catch (error) {
             logger.debug('[OpenCodeServer] Failed handling event (non-fatal)', error);
           }
@@ -1225,6 +1193,7 @@ export function createOpenCodeServerRuntime(params: {
   };
 
   let currentThinking = false;
+  let providerObservedBusy = false;
   let pendingEventWork: Promise<void> | null = null;
   let nextProviderEventSequence = 0;
   let completedProviderEventSequence = 0;
@@ -1344,17 +1313,21 @@ export function createOpenCodeServerRuntime(params: {
     retryBackoffUntilMs = null;
     firstGenericRetryAtMs = null;
     genericRetryNoticeSentForTurn = false;
-    sidechainIdByRemoteSessionId.clear();
-    sidechainStreamSeenBySidechainId.clear();
-    pendingTaskSidechainImportsBySidechainId.clear();
     pendingTaskChildSessionDiscoveryCallKeys.clear();
-    accumulatedTextByPartKey.clear();
-    pendingInlinePartSnapshotsByMessagePartKey.clear();
-    partTypeByPartKey.clear();
-    suppressedLivePartKeys.clear();
-    suppressedLiveMessageKeys.clear();
-    toolCallSentByCallId.clear();
-    toolResultSentByCallId.clear();
+    // Native child sessions belong to the runtime, not the parent foreground turn.
+    // Preserve their projection/dedupe state across completion, cancellation and new turns.
+    const clearForegroundEntries = (entries: Map<string, unknown> | Set<string>): void => {
+      for (const key of entries.keys()) {
+        if (![...sidechainIdByRemoteSessionId.keys()].some((id) => key.startsWith(`${id}:`))) entries.delete(key);
+      }
+    };
+    clearForegroundEntries(accumulatedTextByPartKey);
+    clearForegroundEntries(pendingInlinePartSnapshotsByMessagePartKey);
+    clearForegroundEntries(partTypeByPartKey);
+    clearForegroundEntries(suppressedLivePartKeys);
+    clearForegroundEntries(liveMessageProjectionByKey);
+    clearForegroundEntries(toolCallSentByCallId);
+    clearForegroundEntries(toolResultSentByCallId);
     if (turnControlAbort) {
       try {
         turnControlAbort.abort();
@@ -1531,14 +1504,15 @@ export function createOpenCodeServerRuntime(params: {
       try {
         const c = await ensureClient();
         const statuses = await c.sessionStatusList();
-        resetControlPlaneFailures('status');
         const map = statuses && typeof statuses === 'object' && !Array.isArray(statuses)
           ? (statuses as Record<string, unknown>)
           : null;
         const rec = map ? map[sessionId] : null;
         const statusType = normalizeString(asRecord(rec)?.type);
         status = statusType || (rec == null ? 'missing' : 'unknown');
+        if (statusType === 'idle' || (map && rec == null)) providerObservedBusy = false;
         if (statusType === 'busy') {
+          providerObservedBusy = true;
           statusPollBusySeen = true;
           refreshActivityFromFinalTurnLivenessProbe();
           return {
@@ -1570,7 +1544,6 @@ export function createOpenCodeServerRuntime(params: {
           };
         }
       } catch (error) {
-        maybeAbortTurnOnControlPlaneFailure('status', error);
         status = 'error';
         statusError = extractOpenCodeErrorText(error) ?? String(error);
       }
@@ -1639,13 +1612,15 @@ export function createOpenCodeServerRuntime(params: {
     turnStartSeqInclusive = params.session.getLastObservedMessageSeq?.() ?? 0;
   };
 
-  const resolveTurn = () => {
+  const resolveTurn = (options?: Readonly<{ preserveProviderWork?: boolean }>) => {
     if (!turnDeferred) return;
     const d = turnDeferred;
     turnDeferred = null;
     turnInFlight = false;
-    resetTurnEventState();
-    beginFreshTurnChangeCollection();
+    if (!options?.preserveProviderWork) {
+      resetTurnEventState();
+      beginFreshTurnChangeCollection();
+    }
     d.resolve();
   };
 
@@ -1799,18 +1774,6 @@ export function createOpenCodeServerRuntime(params: {
     return Math.max(60_000, Math.min(3_600_000, configured));
   })();
 
-  const controlPlaneMaxConsecutiveFailures = (() => {
-    const raw = Number.parseInt(String(env.HAPPIER_OPENCODE_SERVER_CONTROL_POLL_MAX_CONSECUTIVE_FAILURES ?? ''), 10);
-    const configured = Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : 3;
-    return Math.max(1, Math.min(100, configured));
-  })();
-
-  const controlPlaneFailureGraceMs = (() => {
-    const raw = Number.parseInt(String(env.HAPPIER_OPENCODE_SERVER_CONTROL_POLL_FAILURE_GRACE_MS ?? ''), 10);
-    const configured = Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : 10_000;
-    return Math.max(250, Math.min(300_000, configured));
-  })();
-
   const statusPollEnabled = (() => {
     const raw = normalizeEnvVar(env.HAPPIER_OPENCODE_SERVER_STATUS_POLL_ENABLED);
     if (!raw) return true;
@@ -1829,45 +1792,6 @@ export function createOpenCodeServerRuntime(params: {
     const configured = Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : 15_000;
     return Math.max(25, Math.min(300_000, configured));
   })();
-
-  type ControlPlaneFailureKind = 'status';
-  type ControlPlaneFailureState = { count: number; firstFailureAtMs: number | null };
-
-  const controlPlaneFailures: Record<ControlPlaneFailureKind, ControlPlaneFailureState> = {
-    status: { count: 0, firstFailureAtMs: null },
-  };
-
-  const resetControlPlaneFailures = (kind: ControlPlaneFailureKind) => {
-    controlPlaneFailures[kind].count = 0;
-    controlPlaneFailures[kind].firstFailureAtMs = null;
-  };
-
-  const maybeAbortTurnOnControlPlaneFailure = (kind: ControlPlaneFailureKind, error: unknown) => {
-    if (!turnDeferred) return;
-    if (!turnPromptActive) return;
-
-    const state = controlPlaneFailures[kind];
-    const nowMs = Date.now();
-    if (state.firstFailureAtMs == null) {
-      state.firstFailureAtMs = nowMs;
-      state.count = 0;
-    }
-    state.count += 1;
-
-    const exceededConsecutive = state.count >= controlPlaneMaxConsecutiveFailures;
-    const exceededGrace = Number.isFinite(nowMs) && state.firstFailureAtMs != null
-      ? nowMs - state.firstFailureAtMs >= controlPlaneFailureGraceMs
-      : false;
-
-    if (!exceededConsecutive && !exceededGrace) return;
-
-    setThinking(false);
-    const terminalMarkerId = ensureActiveLifecycleMarkerId();
-    void flushAndClearStreamWriters({ reason: 'abort', interruptedReason: 'control_plane_failure' }).finally(() => {
-      surfaceOpenCodeRuntimeFailure('stream_error', error, terminalMarkerId);
-    });
-    rejectTurn(error ?? new Error('OpenCode control-plane polling failed'));
-  };
 
   const shouldTreatMessageIdAsTurnActivity = (messageID: string): boolean => {
     if (!turnPromptActive) return false;
@@ -1929,9 +1853,11 @@ export function createOpenCodeServerRuntime(params: {
     let statuses: unknown;
     try {
       statuses = await c.sessionStatusList();
-      resetControlPlaneFailures('status');
     } catch (error) {
-      maybeAbortTurnOnControlPlaneFailure('status', error);
+      logger.debug('[OpenCodeServer] best-effort status fallback failed; waiting for SSE or the inactivity guard', {
+        sessionId,
+        error,
+      });
       return;
     }
     const map = statuses && typeof statuses === 'object' && !Array.isArray(statuses) ? (statuses as any as Record<string, unknown>) : null;
@@ -1943,6 +1869,7 @@ export function createOpenCodeServerRuntime(params: {
     // that the turn had activity (or we observed it as busy at least once).
     const missingImpliesIdle = rec == null && (statusPollBusySeen || turnActivitySeen);
     if (statusType === 'busy') {
+      providerObservedBusy = true;
       statusPollBusySeen = true;
       clearIdleWithoutTerminalAssistantTimer();
       markOpenCodeSessionActive();
@@ -1953,6 +1880,7 @@ export function createOpenCodeServerRuntime(params: {
       return;
     }
     if (statusType !== 'idle' && !missingImpliesIdle) return;
+    providerObservedBusy = false;
     idleSignalSeen = true;
     idleSignalSeenViaControlPlane = true;
     settleThinkingOnOpenCodeIdleSignal();
@@ -2076,7 +2004,40 @@ export function createOpenCodeServerRuntime(params: {
     return turnStreamKey;
   };
 
-  const sidechainIdByRemoteSessionId = new Map<string, string>();
+  const sidechainIdByRemoteSessionId = new Map<string, Readonly<{ sidechainId: string }>>();
+  const completedBackgroundTaskCallKeys = new Set<string>();
+  const backgroundTaskByRemoteSessionId = new Map<string, NonNullable<ReturnType<typeof parseOpenCodeToolPart>>>();
+
+  const retireNativeChildAttention = (remoteSessionId: string): void => {
+    // The permission owner already persists the exact native session linkage in request input.
+    const requests = params.session.getAgentStateSnapshot?.()?.requests ?? {};
+    for (const [requestId, request] of Object.entries(requests)) {
+      if (asRecord(request.arguments)?.sessionId !== remoteSessionId) continue;
+      params.permissionHandler.cancelPendingRequest(requestId, 'OpenCode child ended');
+    }
+  };
+
+  const settleNativeChild = async (remoteSessionId: string, error?: unknown): Promise<void> => {
+    const sidechainId = sidechainIdByRemoteSessionId.get(remoteSessionId)?.sidechainId;
+    if (!sidechainId) return;
+    // Retire before awaiting so duplicate terminal frames cannot publish twice.
+    sidechainIdByRemoteSessionId.delete(remoteSessionId);
+    retireNativeChildAttention(remoteSessionId);
+    const task = backgroundTaskByRemoteSessionId.get(remoteSessionId);
+    backgroundTaskByRemoteSessionId.delete(remoteSessionId);
+    if (task) completedBackgroundTaskCallKeys.add(buildOpenCodeToolCallKey(task.sessionID, task.callID));
+    await flushStreamWritersForSidechainBoundary(sidechainId);
+    if (!task) return;
+    const parentSidechainId = resolveSidechainIdForRemoteSession(task.sessionID);
+    params.session.sendAgentMessage(provider, {
+      type: 'tool-result', callId: task.callID, id: randomUUID(),
+      output: { status: error ? (isAbortLikeError(error) ? 'cancelled' : 'failed') : 'completed',
+        ...(error ? { error: extractOpenCodeErrorText(error) || 'OpenCode child failed' } : {}),
+        metadata: asRecord(task.state.metadata) ?? {} },
+      ...(error ? { isError: true } : {}),
+      ...(parentSidechainId ? { sidechainId: parentSidechainId } : {}),
+    });
+  };
   const sidechainStreamSeenBySidechainId = new Set<string>();
   const pendingTaskSidechainImportsBySidechainId = new Map<string, Promise<void>>();
   const pendingTaskChildSessionDiscoveryCallKeys = new Set<string>();
@@ -2084,7 +2045,7 @@ export function createOpenCodeServerRuntime(params: {
   const resolveSidechainIdForRemoteSession = (remoteSessionId: string): string | null => {
     if (!remoteSessionId) return null;
     if (remoteSessionId === sessionId) return null;
-    return sidechainIdByRemoteSessionId.get(remoteSessionId) ?? null;
+    return sidechainIdByRemoteSessionId.get(remoteSessionId)?.sidechainId ?? null;
   };
 
   const markObservedTextHistoryItems = (items: ReadonlyArray<{ messageId: string }>): void => {
@@ -2109,6 +2070,9 @@ export function createOpenCodeServerRuntime(params: {
   //   completion evidence (so partial in-progress assistant text is never committed).
   let passiveTranscriptProjectionInFlight = false;
   let passiveTranscriptProjectionRerunRequested = false;
+  // A restored controller must reconcile committed identities before treating older native rows
+  // as external. Failed reads stay pending for the existing idle/reconnect projection owner.
+  let externalHistoryReconciliationPending = false;
 
   const buildSettledExternalTranscriptItems = (rawMessages: unknown[]): ReturnType<typeof extractOpenCodeTextHistoryItems> => {
     const settledMessageIds = new Set<string>();
@@ -2147,27 +2111,75 @@ export function createOpenCodeServerRuntime(params: {
       do {
         passiveTranscriptProjectionRerunRequested = false;
         if (!sessionId || turnPromptActive) return;
+        const projectionSessionId: string = sessionId;
         const c = await ensureClient();
+        if (turnPromptActive || sessionId !== projectionSessionId) return;
         // Ownership: only this session's OpenCode session id and its discovered sidechains.
         const ownedSessions: Array<Readonly<{ remoteSessionId: string; sidechainId: string | null }>> = [
-          { remoteSessionId: sessionId, sidechainId: null },
-          ...Array.from(sidechainIdByRemoteSessionId.entries()).map(([remoteSessionId, sidechainId]) => ({
+          { remoteSessionId: projectionSessionId, sidechainId: null },
+          ...Array.from(sidechainIdByRemoteSessionId.entries()).map(([remoteSessionId, child]) => ({
             remoteSessionId,
-            sidechainId,
+            sidechainId: child.sidechainId,
           })),
         ];
         for (const owned of ownedSessions) {
           let raw: unknown;
           try {
-            raw = await c.sessionMessagesList({ sessionId: owned.remoteSessionId });
+            raw = c.sessionMessagesListRaw
+              ? await c.sessionMessagesListRaw({ sessionId: owned.remoteSessionId })
+              : await c.sessionMessagesList({ sessionId: owned.remoteSessionId });
+            if (!Array.isArray(raw)) throw new Error('OpenCode session message inventory was malformed');
           } catch (error) {
+            logger.infoFile('[OpenCodeServer] opencode_passive_transcript_projection_failed', { phase: 'history_read' });
             logger.debug('[OpenCodeServer] passive transcript projection: list failed (non-fatal)', {
               sessionId: owned.remoteSessionId,
               error,
             });
             continue;
           }
-          const items = buildSettledExternalTranscriptItems(Array.isArray(raw) ? raw : []);
+          // A live prompt can acquire ownership while the passive HTTP inventory is in flight.
+          if (turnPromptActive || sessionId !== projectionSessionId) return;
+          if (externalHistoryReconciliationPending && owned.sidechainId === null) {
+            const historicalItems = extractOpenCodeTextHistoryItems(raw);
+            let baseline;
+            try {
+              baseline = await params.session.fetchCommittedTranscriptIdentitySnapshot();
+            } catch (error) {
+              logger.infoFile('[OpenCodeServer] opencode_history_reconciliation_incomplete', { reason: 'baseline_read_failed' });
+              logger.debug('[OpenCodeServer] Failed reading committed history identities (non-fatal)', error);
+              return;
+            }
+            if (turnPromptActive || sessionId !== projectionSessionId) return;
+            const reconciliation = reconcileOpenCodeCommittedHistoryIdentities({ baseline,
+              metadata: params.session.getMetadataSnapshot(), remoteSessionId: projectionSessionId, items: historicalItems });
+            for (const messageId of reconciliation.observedMessageIds) observedRemoteTextMessageIds.add(messageId);
+            if (!reconciliation.complete) {
+              // Missing legacy identities cannot prove absence. Suppress only the historical rows
+              // present in this snapshot; later new native turns still use the ordinary importer.
+              markObservedTextHistoryItems(historicalItems);
+              logger.infoFile('[OpenCodeServer] opencode_history_reconciliation_incomplete', {
+                reason: 'unproven_committed_identities', unmappedUsers: reconciliation.unmappedUsers,
+                unmappedAgents: reconciliation.unmappedAgents, baselineComplete: baseline.complete,
+              });
+              params.session.sendSessionEvent({ type: 'message', message:
+                'Some earlier OpenCode messages could not be reconciled safely because their saved message identities are incomplete. New messages will continue to sync.' });
+            }
+            externalHistoryReconciliationPending = false;
+          }
+          if (owned.sidechainId) {
+            const latest = [...raw].reverse().map((entry) => asRecord(asRecord(entry)?.info) ?? asRecord(entry))
+              .find((info) => info?.role === 'assistant' || info?.role === 'idle');
+            if (latest?.role === 'idle' && latest.outcome === 'succeeded') await settleNativeChild(owned.remoteSessionId);
+            else if (latest?.role === 'idle' && (latest.outcome === 'failed' || latest.outcome === 'interrupted')) {
+              const error = new Error(`OpenCode child ${latest.outcome}`);
+              if (latest.outcome === 'interrupted') error.name = 'AbortError';
+              await settleNativeChild(owned.remoteSessionId, error);
+            } else if (latest && asRecord(latest.time)?.completed !== undefined
+              && (latest.error || classifyOpenCodeAssistantCompletion(latest).kind === 'terminal_success')) {
+              await settleNativeChild(owned.remoteSessionId, latest.error);
+            }
+          }
+          const items = buildSettledExternalTranscriptItems(raw);
           if (items.length === 0) continue;
           await importOpenCodeTextHistoryCommitted({
             session: params.session,
@@ -2181,6 +2193,7 @@ export function createOpenCodeServerRuntime(params: {
         }
       } while (passiveTranscriptProjectionRerunRequested);
     } catch (error) {
+      logger.infoFile('[OpenCodeServer] opencode_passive_transcript_projection_failed', { phase: 'history_commit' });
       logger.debug('[OpenCodeServer] passive transcript projection failed (non-fatal)', error);
     } finally {
       passiveTranscriptProjectionInFlight = false;
@@ -2290,6 +2303,9 @@ export function createOpenCodeServerRuntime(params: {
   const getStreamKeyForMessage = (remoteSessionId: string, messageID: string): string => {
     const normalized = typeof messageID === 'string' ? messageID.trim() : '';
     if (!normalized) return ensureTurnStreamKey();
+    if (remoteSessionId !== sessionId && resolveSidechainIdForRemoteSession(remoteSessionId)) {
+      return `opencode:child:${JSON.stringify([remoteSessionId, normalized])}`;
+    }
     const sessionPart = remoteSessionId ? `:ses:${remoteSessionId}` : '';
     return `${ensureTurnStreamKey()}${sessionPart}:msg:${normalized}`;
   };
@@ -2328,6 +2344,10 @@ export function createOpenCodeServerRuntime(params: {
 
   const enableDurableCommitsForLiveMessageProjection = (remoteSessionId: string, messageID: string): void => {
     if (!remoteSessionId || !messageID) return;
+    const messageKey = buildLiveMessageKey(remoteSessionId, messageID);
+    const projection = liveMessageProjectionByKey.get(messageKey);
+    if (projection === 'user' || projection === 'suppressed') return;
+    liveMessageProjectionByKey.set(messageKey, 'assistant');
     transcriptStreamBridge.enableDurableCommitsForStream(buildTranscriptStreamArgsForMessage(remoteSessionId, messageID));
   };
 
@@ -2710,7 +2730,7 @@ export function createOpenCodeServerRuntime(params: {
     targetSessionId: string,
   ): Promise<OpenCodeBrokerReadiness | null> => {
     for (;;) {
-      if (!isActivePromptTurn(turn, targetSessionId)) return null;
+      if (!isActiveSubmission(turn, targetSessionId)) return null;
       const preflightGenerationKey = readCurrentServerConnectedGenerationKey();
       const outcome = await Promise.race([
         ensureConnectedBrokerPreflight().then(
@@ -2726,7 +2746,7 @@ export function createOpenCodeServerRuntime(params: {
       if (outcome.type === 'turn_rejected') throw outcome.error;
       if (outcome.type === 'turn_resolved') return null;
       if (outcome.type === 'readiness_rejected') throw outcome.error;
-      if (!isActivePromptTurn(turn, targetSessionId)) return null;
+      if (!isActiveSubmission(turn, targetSessionId)) return null;
 
       const serverReadyForPrompt = await waitForServerConnectedBeforePrompt(turn, targetSessionId);
       if (!serverReadyForPrompt) return null;
@@ -2773,12 +2793,14 @@ export function createOpenCodeServerRuntime(params: {
   });
 
   const sendDelta = (delta: string, remoteSessionId: string, messageID: string, sidechainId: string | null) => {
-    markTurnActivity();
+    if (!sidechainId && shouldTreatMessageIdAsTurnActivity(messageID)) markTurnActivity();
     if (sidechainId) sidechainStreamSeenBySidechainId.add(sidechainId);
     if (!sidechainId && sessionId && remoteSessionId === sessionId) {
-      turnStreamedAssistantMessageIds.add(messageID);
-      turnLiveKnownAssistantMessageIds.add(messageID);
-      turnAssistantTranscriptActivitySeen = true;
+      if (shouldTreatMessageIdAsTurnActivity(messageID)) {
+        turnStreamedAssistantMessageIds.add(messageID);
+        turnLiveKnownAssistantMessageIds.add(messageID);
+        turnAssistantTranscriptActivitySeen = true;
+      }
       observedRemoteTextMessageIds.add(messageID);
     }
     transcriptStreamBridge.appendAssistantDelta({
@@ -2792,7 +2814,7 @@ export function createOpenCodeServerRuntime(params: {
 
   const sendThinkingDelta = (delta: string, remoteSessionId: string, messageID: string, sidechainId: string | null) => {
     if (!delta) return;
-    markTurnActivity();
+    if (!sidechainId && shouldTreatMessageIdAsTurnActivity(messageID)) markTurnActivity();
     if (sidechainId) sidechainStreamSeenBySidechainId.add(sidechainId);
     transcriptStreamBridge.appendThinkingDelta({
       deltaText: delta,
@@ -2837,7 +2859,7 @@ export function createOpenCodeServerRuntime(params: {
         messageId: messageID,
         sidechainId,
       });
-      markTurnActivity();
+      if (!sidechainId && shouldTreatMessageIdAsTurnActivity(messageID)) markTurnActivity();
       if (sidechainId) sidechainStreamSeenBySidechainId.add(sidechainId);
       return;
     }
@@ -2852,10 +2874,10 @@ export function createOpenCodeServerRuntime(params: {
       sendDelta(deltaOut, remoteSessionId, messageID, sidechainId);
       return;
     }
-    markTurnActivity();
+    if (!sidechainId && shouldTreatMessageIdAsTurnActivity(messageID)) markTurnActivity();
     if (sidechainId) sidechainStreamSeenBySidechainId.add(sidechainId);
     if (!sidechainId && sessionId && remoteSessionId === sessionId) {
-      turnStreamedAssistantMessageIds.add(messageID);
+      if (shouldTreatMessageIdAsTurnActivity(messageID)) turnStreamedAssistantMessageIds.add(messageID);
       observedRemoteTextMessageIds.add(messageID);
     }
     transcriptStreamBridge.overrideAssistantText({
@@ -2926,14 +2948,14 @@ export function createOpenCodeServerRuntime(params: {
       return;
     }
 
-    markTurnActivity();
+    if (!sidechainId) markTurnActivity();
     if (sidechainId) sidechainStreamSeenBySidechainId.add(sidechainId);
 
-    if (turnPromptActive) {
+    if (!sidechainId && turnPromptActive) {
       turnLiveKnownToolCallKeys.add(callKey);
     }
-    foregroundToolTracker.observeToolPart({ part, source: 'live' });
-    if (!isTerminalStatus) {
+    if (!sidechainId) foregroundToolTracker.observeToolPart({ part, source: 'live' });
+    if (!sidechainId && !isTerminalStatus) {
       markOpenCodeSessionActive();
     }
     const messageID = part.messageID;
@@ -2943,18 +2965,24 @@ export function createOpenCodeServerRuntime(params: {
     const isChangeTitleTool =
       toolLower === preferredOpenCodeChangeTitleToolName.toLowerCase() || isChangeTitleToolNameAlias(toolLower);
     if (isChangeTitleTool) {
-      if (isTerminalStatus) settleThinkingAfterProviderWorkUpdate();
+      if (!sidechainId && isTerminalStatus) settleThinkingAfterProviderWorkUpdate();
       return;
     }
 
     // Task sidechains must be registered without awaiting, because SSE consumers do not await
     // event handlers and related child-session events (questions/deltas) can arrive immediately.
-    if (toolLower === 'task') {
+    if (toolLower === 'task' || toolLower === 'subagent') {
       const metadata = asRecord(part.state.metadata) ?? {};
       const outputText = normalizeString(part.state.output);
       const remoteSessionId = extractOpenCodeTaskChildSessionId({ output: outputText, metadata });
-      if (remoteSessionId && remoteSessionId !== sessionId) {
-        sidechainIdByRemoteSessionId.set(remoteSessionId, callId);
+      if (remoteSessionId && remoteSessionId !== sessionId && !completedBackgroundTaskCallKeys.has(callKey)) {
+        if (sidechainIdByRemoteSessionId.get(remoteSessionId)?.sidechainId !== callId) {
+          sidechainIdByRemoteSessionId.set(remoteSessionId, { sidechainId: callId });
+        }
+        if (metadata.background === true || asRecord(part.state.input)?.background === true
+          || (metadata.status === 'running' && status === 'completed')) {
+          backgroundTaskByRemoteSessionId.set(remoteSessionId, part);
+        }
         pendingTaskChildSessionDiscoveryCallKeys.delete(callKey);
       } else if (isTerminalStatus) {
         pendingTaskChildSessionDiscoveryCallKeys.delete(callKey);
@@ -2996,7 +3024,10 @@ export function createOpenCodeServerRuntime(params: {
       );
     }
 
-    if (isTerminalStatus && !toolResultSentByCallId.has(callKey)) {
+    const isBackgroundLaunch = (toolLower === 'task' || toolLower === 'subagent') && status === 'completed'
+      && (asRecord(part.state.metadata)?.background === true || asRecord(part.state.metadata)?.status === 'running')
+      && extractOpenCodeTaskChildSessionId({ output: normalizeString(part.state.output), metadata: part.state.metadata });
+    if (isTerminalStatus && !isBackgroundLaunch && !toolResultSentByCallId.has(callKey)) {
       toolResultSentByCallId.add(callKey);
       if (status === 'completed') {
         const output = {
@@ -3026,7 +3057,7 @@ export function createOpenCodeServerRuntime(params: {
           { meta },
         );
 
-        if (toolLower === 'task') {
+        if (toolLower === 'task' || toolLower === 'subagent') {
           const remoteSessionId = extractOpenCodeTaskChildSessionId({ output: output.output, metadata: output.metadata });
           if (remoteSessionId) {
             if (!pendingTaskSidechainImportsBySidechainId.has(callId)) {
@@ -3049,6 +3080,7 @@ export function createOpenCodeServerRuntime(params: {
                   { localId: randomUUID(), meta: { importedFrom: 'acp-sidechain', remoteSessionId, sidechainId: callId } },
                 );
               })().catch((error) => {
+                logger.infoFile('[OpenCodeServer] opencode_task_sidechain_import_failed', { phase: 'history_import' });
                 logger.debug('[OpenCodeServer] Failed to import Task sidechain (non-fatal)', error);
               });
 
@@ -3076,7 +3108,7 @@ export function createOpenCodeServerRuntime(params: {
         );
       }
     }
-    if (isTerminalStatus) settleThinkingAfterProviderWorkUpdate();
+    if (!sidechainId && isTerminalStatus) settleThinkingAfterProviderWorkUpdate();
   };
 
   const trackPendingTurnToolForwardingWork = (work: Promise<void>): Promise<void> => {
@@ -3089,6 +3121,8 @@ export function createOpenCodeServerRuntime(params: {
 
   const handleQuestionAsked = async (req: OpenCodeQuestionRequest) => {
     if (req.sessionID !== sessionId && !sidechainIdByRemoteSessionId.has(req.sessionID)) return;
+    const child = sidechainIdByRemoteSessionId.get(req.sessionID);
+    const questionIsStillCurrent = () => !child || sidechainIdByRemoteSessionId.get(req.sessionID) === child;
 
     const rejectionKey = `${req.sessionID}\u0000${req.id}`;
     const rejectionKeysForOwningTurn = pendingFailClosedQuestionRejectionKeys ?? new Set<string>();
@@ -3100,10 +3134,13 @@ export function createOpenCodeServerRuntime(params: {
       return;
     }
 
-    setThinking(false);
-    idleSignalSeen = false;
-    idleSignalSeenViaControlPlane = false;
-    if (turnPromptActive) markTurnActivity();
+    const isParentRequest = req.sessionID === sessionId;
+    if (isParentRequest) {
+      setThinking(false);
+      idleSignalSeen = false;
+      idleSignalSeenViaControlPlane = false;
+      if (turnPromptActive) markTurnActivity();
+    }
 
     const questions = req.questions
       .map((q) => (asRecord(q) ?? null))
@@ -3115,9 +3152,10 @@ export function createOpenCodeServerRuntime(params: {
       return;
     }
 
-    params.session.sendAgentMessage(provider, { type: 'task_started', id: ensureActiveLifecycleMarkerId() });
+    if (isParentRequest) params.session.sendAgentMessage(provider, { type: 'task_started', id: ensureActiveLifecycleMarkerId() });
 
     const askUserQuestionInput = {
+      ...(child ? { sessionId: req.sessionID } : {}),
       questions: questions.map((q) => ({
         question: normalizeString(q.question),
         header: normalizeString(q.header),
@@ -3135,6 +3173,29 @@ export function createOpenCodeServerRuntime(params: {
           // OpenCode represents some freeform prompts as a single “type now” option with a `locations` field,
           // but Happier’s AskUserQuestion should treat these as typed answers (not a real selection).
           const hasLocations = Array.isArray((q as any).locations);
+          // Released V2 `custom: true` alongside options projects an explicit `freeform` marker
+          // (options plus free-text escape hatch). Preserve it verbatim: the existing hint/location
+          // heuristics must not strip a producer-declared freeform capability.
+          const incomingFreeformRaw = (q as any).freeform;
+          const hasExplicitFreeform =
+            incomingFreeformRaw === true ||
+            (incomingFreeformRaw !== false &&
+              incomingFreeformRaw !== null &&
+              incomingFreeformRaw !== undefined &&
+              typeof incomingFreeformRaw === 'object' &&
+              !Array.isArray(incomingFreeformRaw));
+          if (hasExplicitFreeform) {
+            const freeformRecord = asRecord(incomingFreeformRaw) ?? {};
+            const placeholder = normalizeString(freeformRecord.placeholder);
+            const description = normalizeString(freeformRecord.description);
+            return {
+              options,
+              freeform: {
+                ...(placeholder ? { placeholder } : {}),
+                ...(description ? { description } : {}),
+              },
+            };
+          }
           const hintOption = options.find((opt) => looksLikeFreeformQuestionHintLabel(opt.label)) ?? null;
           const isSingleOptionHint = options.length === 1 && hintOption !== null;
 
@@ -3168,11 +3229,12 @@ export function createOpenCodeServerRuntime(params: {
       })),
     };
 
-    turnAwaitingUserResponseCount += 1;
+    if (isParentRequest) turnAwaitingUserResponseCount += 1;
     let decision: Awaited<ReturnType<typeof params.permissionHandler.handleToolCall>>;
     try {
       decision = await params.permissionHandler.handleToolCall(req.id, 'AskUserQuestion', askUserQuestionInput);
     } catch (error) {
+      if (!questionIsStillCurrent()) return;
       logger.debug('[OpenCodeServer] question handler threw; rejecting question request (fail-closed)', {
         requestId: req.id,
         sessionId: req.sessionID,
@@ -3195,8 +3257,9 @@ export function createOpenCodeServerRuntime(params: {
       }
       return;
     } finally {
-      turnAwaitingUserResponseCount = Math.max(0, turnAwaitingUserResponseCount - 1);
+      if (isParentRequest) turnAwaitingUserResponseCount = Math.max(0, turnAwaitingUserResponseCount - 1);
     }
+    if (!questionIsStillCurrent()) return;
     if (decision.decision === 'approved' || decision.decision === 'approved_for_session' || decision.decision === 'approved_execpolicy_amendment') {
       const answersByKey = decision.answers;
       const answers = answersByKey && typeof answersByKey === 'object' && !Array.isArray(answersByKey) ? answersByKey : {};
@@ -3218,10 +3281,15 @@ export function createOpenCodeServerRuntime(params: {
 
   const handlePermissionAsked = async (req: OpenCodePermissionRequest) => {
     if (req.sessionID !== sessionId && !sidechainIdByRemoteSessionId.has(req.sessionID)) return;
-    setThinking(false);
-    idleSignalSeen = false;
-    idleSignalSeenViaControlPlane = false;
-    if (turnPromptActive) markTurnActivity();
+    const child = sidechainIdByRemoteSessionId.get(req.sessionID);
+    const permissionIsStillCurrent = () => !child || sidechainIdByRemoteSessionId.get(req.sessionID) === child;
+    const isParentRequest = req.sessionID === sessionId;
+    if (isParentRequest) {
+      setThinking(false);
+      idleSignalSeen = false;
+      idleSignalSeenViaControlPlane = false;
+      if (turnPromptActive) markTurnActivity();
+    }
 
     const mode = params.getPermissionMode?.() ?? 'default';
     const c = await ensureClient();
@@ -3238,7 +3306,8 @@ export function createOpenCodeServerRuntime(params: {
     let decision: Awaited<ReturnType<typeof params.permissionHandler.handleToolCall>>;
     try {
       const resolved = await resolvePermissionAskedToolBridge(req);
-      turnAwaitingUserResponseCount += 1;
+      if (!permissionIsStillCurrent()) return;
+      if (isParentRequest) turnAwaitingUserResponseCount += 1;
       try {
         decision = await params.permissionHandler.handleToolCall(
           resolved.localRequestId,
@@ -3246,9 +3315,10 @@ export function createOpenCodeServerRuntime(params: {
           resolved.toolInput,
         );
       } finally {
-        turnAwaitingUserResponseCount = Math.max(0, turnAwaitingUserResponseCount - 1);
+        if (isParentRequest) turnAwaitingUserResponseCount = Math.max(0, turnAwaitingUserResponseCount - 1);
       }
     } catch (error) {
+      if (!permissionIsStillCurrent()) return;
       logger.debug('[OpenCodeServer] permission handler threw; rejecting permission request (fail-closed)', {
         requestId: req.id,
         permission: req.permission,
@@ -3268,6 +3338,8 @@ export function createOpenCodeServerRuntime(params: {
       }
       return;
     }
+
+    if (!permissionIsStillCurrent()) return;
 
     if (decision.decision === 'approved_for_session') {
       // Happier owns "always allow" persistence and scope. Always reply "once" to OpenCode so
@@ -3394,7 +3466,9 @@ export function createOpenCodeServerRuntime(params: {
     const eventSessionId = normalizeString(rec.sessionID)
       || normalizeString(rec.sessionId)
       || normalizeString(asRecord(rec.session)?.id);
-    if (!eventSessionId || eventSessionId !== sessionId) return true;
+    const nativeChildSidechainId = sidechainIdByRemoteSessionId.get(eventSessionId)?.sidechainId;
+    if (!eventSessionId || (eventSessionId !== sessionId && !nativeChildSidechainId)) return true;
+    if (eventSessionId !== sessionId && !type.startsWith('session.next.tool.')) return true;
 
     if (type === 'session.next.retried') {
       const errorRecord = asRecord(rec.error);
@@ -3412,7 +3486,32 @@ export function createOpenCodeServerRuntime(params: {
     }
 
     if (type.startsWith('session.next.tool.')) {
-      if (!turnPromptActive) return true;
+      // Released V2 subagent calls use native tool frames, not V1 message.part frames.
+      // Feed their state into the same ToolPart owner before the foreground-only guard.
+      const nativeCallId = normalizeString(rec.id);
+      const existing = nativeCallId ? observedToolPartByCallKey.get(buildOpenCodeToolCallKey(eventSessionId, nativeCallId)) : null;
+      const nativeToolName = normalizeString(rec.name) || existing?.tool || '';
+      if (nativeCallId && nativeToolName && (nativeChildSidechainId || nativeToolName === 'subagent' || nativeToolName === 'task')) {
+        const status = type.endsWith('.success') ? 'completed' : type.endsWith('.failed') ? 'error' : 'running';
+        const content = Array.isArray(rec.content) ? rec.content : [];
+        const output = content.map((entry) => asRecord(entry)).filter((entry) => entry?.type === 'text')
+          .map((entry) => typeof entry?.text === 'string' ? entry.text : '').join('\n');
+        const part = parseOpenCodeToolPart({
+          type: 'tool', sessionID: eventSessionId, messageID: rec.assistantMessageID,
+          callID: nativeCallId, tool: nativeToolName,
+          state: { status, input: rec.input ?? existing?.state.input ?? {},
+            metadata: rec.metadata ?? existing?.state.metadata,
+            output, ...(rec.error ? { error: extractOpenCodeErrorText(rec.error) } : {}) },
+        });
+        if (part) {
+          const work = sendToolFromPart(part, nativeChildSidechainId ?? null, turnChangeCollectorEpoch, { source: 'provider-live-subscription' });
+          void trackPendingTurnToolForwardingWork(work).catch((error) => {
+            logger.infoFile('[OpenCodeServer] opencode_native_subagent_tool_forwarding_failed');
+            logger.debug('[OpenCodeServer] native subagent tool forwarding failed', error);
+          });
+        }
+      }
+      if (nativeChildSidechainId || !turnPromptActive) return true;
       const callId = normalizeString(rec.callID)
         || normalizeString(rec.callId)
         || normalizeString(rec.toolCallID)
@@ -3443,13 +3542,30 @@ export function createOpenCodeServerRuntime(params: {
       return true;
     }
 
-    if (!turnPromptActive) return true;
-
     if (
       type.startsWith('session.next.text.')
       || type.startsWith('session.next.reasoning.')
       || type.startsWith('session.next.step.')
     ) {
+      const assistantMessageId = normalizeString(rec.assistantMessageID);
+      if (assistantMessageId) {
+        noteAssistantMessageIdForActiveTurn(assistantMessageId);
+        if (type.startsWith('session.next.text.') || type.startsWith('session.next.reasoning.')) {
+          enableDurableCommitsForLiveMessageProjection(eventSessionId, assistantMessageId);
+          flushPendingInlineSnapshotsForMessage({ remoteSessionId: eventSessionId, messageID: assistantMessageId });
+        }
+      }
+      const partId = type.startsWith('session.next.text.')
+        ? normalizeString(rec.textID)
+        : type.startsWith('session.next.reasoning.')
+          ? normalizeString(rec.reasoningID)
+          : '';
+      if (partId && assistantMessageId) {
+        partTypeByPartKey.set(
+          `${eventSessionId}:${partId}`,
+          type.startsWith('session.next.reasoning.') ? 'reasoning' : 'text',
+        );
+      }
       markTurnActivity();
       return true;
     }
@@ -3457,7 +3573,10 @@ export function createOpenCodeServerRuntime(params: {
     return false;
   };
 
-  const handleEvent = (evt: OpenCodeGlobalEvent): Promise<void> | void => {
+  const handleEvent = (
+    evt: OpenCodeGlobalEvent,
+    options: Readonly<{ reconcileTranscriptOnConnect?: boolean }> = {},
+  ): Promise<void> | void => {
     const payload = evt.payload;
     const type = normalizeString(payload.type);
     const props = payload.properties;
@@ -3465,10 +3584,23 @@ export function createOpenCodeServerRuntime(params: {
 
     if (type === 'server.connected') {
       markServerConnected();
-      // Origin-agnostic catch-up after (re)connect: mirror any external (e.g. TUI-authored) turns
-      // that landed while disconnected. Idempotent via the dedupe gate + deterministic import ids.
-      scheduleExternalSessionTranscriptProjection();
-      return refreshLiveKnownOpenCodeStateFromControlPlaneBestEffort();
+      if (options.reconcileTranscriptOnConnect !== false) {
+        // Origin-agnostic catch-up after reconnect: mirror external (e.g. TUI-authored) turns that
+        // landed while disconnected. The initial owned-session attach is already anchored at the
+        // durable tail and resume import has its own owner, so it must not launch a second import.
+        scheduleExternalSessionTranscriptProjection();
+      }
+      // Inventory snapshots can precede V2 plugin settlement; reconnect also catches missed
+      // invalidations. Return the publication work to the existing event sequencing owner.
+      return Promise.all([
+        refreshLiveKnownOpenCodeStateFromControlPlaneBestEffort(),
+        publishDynamicSessionOptionsBestEffort(),
+      ]).then(() => {});
+    }
+
+    if (type === 'model.updated' || type === 'provider.updated' || type === 'agent.updated') {
+      if (evt.directory && evt.directory !== currentMcpDirectory) return;
+      return publishDynamicSessionOptionsBestEffort();
     }
 
     const compactionEvent = mapOpenCodeCompactionEventToAgentMessage(evt, sessionId);
@@ -3483,11 +3615,29 @@ export function createOpenCodeServerRuntime(params: {
             lifecycleId: manualCompaction.lifecycleId,
             trigger: 'manual',
           });
+          // The delayed V2 ended/failed event settles the async admission left open by
+          // compactContext; release the manual lifecycle so liveness does not stick.
+          if (activeManualCompaction === manualCompaction) {
+            activeManualCompaction = null;
+          }
         }
         return;
       }
       sendContextCompactionEvent(compactionEvent);
       return;
+    }
+
+    const eventRecord = asRecord(props);
+    const childSessionId = normalizeString(eventRecord?.sessionID);
+    if (childSessionId && childSessionId !== sessionId && sidechainIdByRemoteSessionId.has(childSessionId)) {
+      const outcome = eventRecord?.executionOutcome;
+      if (outcome === 'succeeded') return settleNativeChild(childSessionId);
+      if (outcome === 'failed') return settleNativeChild(childSessionId, eventRecord?.error ?? new Error('OpenCode child failed'));
+      if (outcome === 'interrupted' && eventRecord?.interruptionReason !== 'shutdown') {
+        const error = new Error('OpenCode child interrupted');
+        error.name = 'AbortError';
+        return settleNativeChild(childSessionId, error);
+      }
     }
 
     if (handleSessionNextGuardEvent(type, props)) return;
@@ -3505,7 +3655,21 @@ export function createOpenCodeServerRuntime(params: {
       const info = asRecord(asRecord(props)?.info);
       if (!info) return;
       const infoSessionId = normalizeString(info.sessionID);
-      if (!infoSessionId || infoSessionId !== sessionId) return;
+      if (!infoSessionId) return;
+      if (infoSessionId !== sessionId) {
+        if (!sidechainIdByRemoteSessionId.has(infoSessionId)) return;
+        const childMessageId = normalizeString(info.id);
+        if (classifyOpenCodeMessageForProjection(info).kind !== 'assistant_transcript') return;
+        if (childMessageId) {
+          enableDurableCommitsForLiveMessageProjection(infoSessionId, childMessageId);
+          flushPendingInlineSnapshotsForMessage({ remoteSessionId: infoSessionId, messageID: childMessageId });
+        }
+        const completed = asRecord(info.time)?.completed;
+        if (completed !== undefined && (info.error || classifyOpenCodeAssistantCompletion(info).kind === 'terminal_success')) {
+          return settleNativeChild(infoSessionId, info.error);
+        }
+        return;
+      }
       const projection = classifyOpenCodeMessageForProjection(info);
       const infoMessageId = projection.messageId || normalizeString(info.id);
       // Origin-agnostic projection (S2): a message materialized for this session while no Happier
@@ -3520,12 +3684,18 @@ export function createOpenCodeServerRuntime(params: {
         scheduleExternalSessionTranscriptProjection();
       }
       if (projection.kind === 'user_transcript' && infoMessageId) {
+        liveMessageProjectionByKey.set(buildLiveMessageKey(infoSessionId, infoMessageId), 'user');
+        pendingInlinePartSnapshotsByMessagePartKey.delete(`${infoSessionId}:${infoMessageId}:text`);
+        pendingInlinePartSnapshotsByMessagePartKey.delete(`${infoSessionId}:${infoMessageId}:reasoning`);
         noteUserMessageIdForActiveTurn(infoMessageId);
       }
       if (infoMessageId && (projection.kind === 'compaction_internal' || projection.kind === 'ignored_internal')) {
         suppressLiveMessageProjection(infoSessionId, infoMessageId);
       } else if (infoMessageId && projection.kind === 'assistant_transcript') {
-        enableDurableCommitsForLiveMessageProjection(infoSessionId, infoMessageId);
+        const knownLiveAssistant = liveMessageProjectionByKey.get(buildLiveMessageKey(infoSessionId, infoMessageId)) === 'assistant';
+        if (!isPrePromptMessageId(infoMessageId) || knownLiveAssistant || classifyOpenCodeAssistantCompletion(info).kind !== 'terminal_success') {
+          enableDurableCommitsForLiveMessageProjection(infoSessionId, infoMessageId);
+        }
       }
       if (infoMessageId && (
         projection.kind === 'assistant_transcript'
@@ -3575,7 +3745,7 @@ export function createOpenCodeServerRuntime(params: {
       if (partID && partType) partTypeByPartKey.set(`${sessionID}:${partID}`, partType);
       const maybeTool = parseOpenCodeToolPart(part);
       if (maybeTool) {
-        if (turnPromptActive) {
+        if (!sidechainId && turnPromptActive) {
           idleSignalSeen = false;
           idleSignalSeenViaControlPlane = false;
         }
@@ -3615,9 +3785,16 @@ export function createOpenCodeServerRuntime(params: {
         noteUserMessageIdForActiveTurn(messageID);
         return;
       }
-      if (turnPromptActive && inlineText && messageID) {
+      const providerAssistant = liveMessageProjectionByKey.get(buildLiveMessageKey(sessionID, messageID)) === 'assistant';
+      if (!turnPromptActive && inlineText && messageID && !providerAssistant) {
+        if (!liveMessageProjectionByKey.has(buildLiveMessageKey(sessionID, messageID))) {
+          queuePendingInlinePartSnapshot({ text: inlineText, partType, remoteSessionId: sessionID, messageID, sidechainId });
+        }
+        return;
+      }
+      if ((turnPromptActive || providerAssistant) && inlineText && messageID) {
         if (sessionID === sessionId) {
-          if (!shouldTreatInlineSnapshotMessageIdAsTurnActivity(messageID)) {
+          if (!providerAssistant && !shouldTreatInlineSnapshotMessageIdAsTurnActivity(messageID)) {
             if (turnUserMessageId && messageID === turnUserMessageId) {
               queuePendingInlinePartSnapshot({
                 text: inlineText,
@@ -3632,8 +3809,10 @@ export function createOpenCodeServerRuntime(params: {
         } else if (!sidechainId) {
           return;
         }
-        idleSignalSeen = false;
-        idleSignalSeenViaControlPlane = false;
+        if (!sidechainId) {
+          idleSignalSeen = false;
+          idleSignalSeenViaControlPlane = false;
+        }
         applyInlinePartTextSnapshot({
           text: inlineText,
           partType,
@@ -3657,25 +3836,34 @@ export function createOpenCodeServerRuntime(params: {
       const partID = normalizeString(rec.partID);
       const delta = normalizeString(rec.delta);
       if (!messageID || !partID || !delta) return;
-      const partType = partTypeByPartKey.get(`${sessionID}:${partID}`) ?? '';
+      // A producer that already knows the part kind states it, so a live delta never has to wait
+      // for the `*.started` frame that would otherwise register the kind.
+      const partType = normalizeString(rec.partType) || partTypeByPartKey.get(`${sessionID}:${partID}`) || '';
+      const providerAssistant = liveMessageProjectionByKey.get(buildLiveMessageKey(sessionID, messageID)) === 'assistant';
+      if (!turnPromptActive && sessionID === sessionId && !providerAssistant) {
+        if (!liveMessageProjectionByKey.has(buildLiveMessageKey(sessionID, messageID))) {
+          const key = `${sessionID}:${messageID}:${partType === 'reasoning' ? 'reasoning' : 'text'}`;
+          const pendingText = pendingInlinePartSnapshotsByMessagePartKey.get(key)?.text ?? '';
+          queuePendingInlinePartSnapshot({ text: pendingText + delta, partType, remoteSessionId: sessionID, messageID, sidechainId });
+        }
+        return;
+      }
       const accumulationKey = `${sessionID}:${messageID}:${partType === 'reasoning' ? 'reasoning' : 'text'}`;
       const accumulated = accumulatedTextByPartKey.get(accumulationKey) ?? '';
       const nextAccumulated = delta.startsWith(accumulated) ? delta : accumulated + delta;
       accumulatedTextByPartKey.set(accumulationKey, nextAccumulated);
       if (
         suppressedLivePartKeys.has(buildLivePartKey(sessionID, partID))
-        || suppressedLiveMessageKeys.has(buildLiveMessageKey(sessionID, messageID))
+        || liveMessageProjectionByKey.get(buildLiveMessageKey(sessionID, messageID)) === 'suppressed'
         || (sessionID === sessionId && compactionInProgress && !sidechainId)
       ) {
         suppressLivePartProjection(sessionID, partID, messageID);
         return;
       }
       if (sessionID === sessionId) {
-        if (!shouldTreatMessageIdAsTurnActivity(messageID)) return;
-      } else {
-        if (!turnPromptActive) return;
+        if (!providerAssistant && !shouldTreatMessageIdAsTurnActivity(messageID)) return;
       }
-      if (turnPromptActive) {
+      if (!sidechainId && turnPromptActive) {
         idleSignalSeen = false;
         idleSignalSeenViaControlPlane = false;
       }
@@ -3740,6 +3928,7 @@ export function createOpenCodeServerRuntime(params: {
       const statusRec = asRecord(rec.status);
       const statusType = normalizeString(statusRec?.type);
       if (statusType === 'busy') {
+        providerObservedBusy = true;
         clearIdleWithoutTerminalAssistantTimer();
         setThinking(true);
         markOpenCodeSessionActive();
@@ -3749,10 +3938,14 @@ export function createOpenCodeServerRuntime(params: {
         return;
       }
       if (statusType === 'idle') {
+        providerObservedBusy = false;
         if (turnPromptActive) {
           idleSignalSeen = true;
           idleSignalSeenViaControlPlane = false;
           void maybeResolveTurnOnIdleSignal();
+        } else {
+          settleThinkingOnOpenCodeIdleSignal();
+          return flushAndClearStreamWriters({ reason: 'turn-end' }).then(() => scheduleExternalSessionTranscriptProjection());
         }
         settleThinkingOnOpenCodeIdleSignal();
       }
@@ -3764,10 +3957,14 @@ export function createOpenCodeServerRuntime(params: {
       if (!rec) return;
       const sessionID = normalizeString(rec.sessionID);
       if (!sessionID || sessionID !== sessionId) return;
+      providerObservedBusy = false;
       if (turnPromptActive) {
         idleSignalSeen = true;
         idleSignalSeenViaControlPlane = false;
         void maybeResolveTurnOnIdleSignal();
+      } else {
+        settleThinkingOnOpenCodeIdleSignal();
+        return flushAndClearStreamWriters({ reason: 'turn-end' }).then(() => scheduleExternalSessionTranscriptProjection());
       }
       settleThinkingOnOpenCodeIdleSignal();
       return;
@@ -3832,6 +4029,7 @@ export function createOpenCodeServerRuntime(params: {
   };
 
   const resetRuntimeState = () => {
+    providerObservedBusy = false;
     turnDeferred = null;
     turnInFlight = false;
     resetTurnEventState();
@@ -3844,7 +4042,7 @@ export function createOpenCodeServerRuntime(params: {
     requiredMcpServerReadiness = {
       deferred: createDeferred<RequiredMcpServerReadinessOutcome>(),
     };
-    if (!Object.prototype.hasOwnProperty.call(params.mcpServers, requiredMcpServerName)) {
+    if (!mcpProjection.requiredHappierServerName) {
       requiredMcpServerReadiness.deferred.resolve({
         status: 'failed',
         error: new Error('required Happier MCP server configuration is missing'),
@@ -3854,7 +4052,7 @@ export function createOpenCodeServerRuntime(params: {
 
   const registerMcpServersForCurrentDirectoryBestEffort = async (): Promise<void> => {
     if (ensuredMcpServersForDirectory) return;
-    if (!params.mcpServers || Object.keys(params.mcpServers).length === 0) return;
+    if (mcpProjection.registrations.length === 0) return;
     const requiredReadinessForRegistration = requiredMcpServerReadiness;
     let c: OpenCodeServerRuntimeClient;
     try {
@@ -3869,9 +4067,10 @@ export function createOpenCodeServerRuntime(params: {
       throw error;
     }
     let hadFailures = false;
-    for (const [name, cfg] of Object.entries(params.mcpServers)) {
-      const serverName = typeof name === 'string' ? name.trim() : '';
-      if (!serverName) continue;
+    const registrationDirectory = currentMcpDirectory;
+    for (const registration of mcpProjection.registrations) {
+      const serverName = registration.projectedName;
+      const cfg = registration.config;
       const cmd = typeof cfg?.command === 'string' ? cfg.command.trim() : '';
       if (!cmd) {
         if (
@@ -3895,6 +4094,7 @@ export function createOpenCodeServerRuntime(params: {
 
       try {
         const registrationStatus = await c.mcpAdd({
+          directory: registrationDirectory,
           name: serverName,
           config: {
             type: 'local',
@@ -3909,7 +4109,11 @@ export function createOpenCodeServerRuntime(params: {
             `OpenCode MCP server "${serverName}" returned status "${registrationStatus.status}"${detail}`,
           );
         }
-        ensuredMcpServerNames.add(serverName);
+        if (!registeredMcpServers.some((entry) => (
+          entry.directory === registrationDirectory && entry.name === serverName
+        ))) {
+          registeredMcpServers.push({ directory: registrationDirectory, name: serverName });
+        }
         if (
           serverName === requiredMcpServerName
           && requiredMcpServerReadiness === requiredReadinessForRegistration
@@ -3959,9 +4163,9 @@ export function createOpenCodeServerRuntime(params: {
     turn: Deferred<void>,
     targetSessionId: string,
   ): Promise<RequiredMcpServerReadinessOutcome | null> => {
-    if (!requiredMcpServerName) return { status: 'ready' };
+    if (!requiresHappierMcpServer) return { status: 'ready' };
     for (;;) {
-      if (!isActivePromptTurn(turn, targetSessionId)) return null;
+      if (!isActiveSubmission(turn, targetSessionId)) return null;
       const readiness = requiredMcpServerReadiness;
       const outcome = await Promise.race([
         readiness.deferred.promise.then((result) => ({ type: 'readiness' as const, result })),
@@ -3973,7 +4177,7 @@ export function createOpenCodeServerRuntime(params: {
 
       if (outcome.type === 'turn_rejected') throw outcome.error;
       if (outcome.type === 'turn_resolved') return null;
-      if (!isActivePromptTurn(turn, targetSessionId)) return null;
+      if (!isActiveSubmission(turn, targetSessionId)) return null;
       if (readiness !== requiredMcpServerReadiness || outcome.result.status === 'superseded') {
         continue;
       }
@@ -3999,12 +4203,16 @@ export function createOpenCodeServerRuntime(params: {
     await pendingQueue.drainPending(drainOptions);
   };
 
-  const preferredOpenCodeChangeTitleToolName = resolvePreferredChangeTitleToolNameForProvider('opencode');
+  const preferredOpenCodeChangeTitleToolName = resolvePreferredChangeTitleToolNameForProvider('opencode', {
+    openCodeMcpClientName: mcpProjection.requiredHappierServerName,
+  });
   return {
     getSessionId: () => sessionId,
+    getManagedServerIdentity: () => client?.getManagedServerIdentity() ?? null,
     shouldResumeAfterPermissionModeChange: () => true,
-    supportsInFlightSteer: () => false,
-    isTurnInFlight: () => turnInFlight,
+    supportsInFlightSteer: () => client?.supportsInFlightSteer() === true,
+    isProviderNativeCommand: async (prompt: string) => (await resolveNativeCommand(prompt)) !== null,
+    isTurnInFlight: () => turnInFlight || providerObservedBusy,
     probeTurnLiveness: probeFinalTurnLivenessBeforeDeadlockAbort,
 
     beginTurn(): void {
@@ -4032,7 +4240,6 @@ export function createOpenCodeServerRuntime(params: {
 
     async startOrLoad(opts: { resumeId?: string | null } = {}): Promise<string> {
       invalidateMcpServersForCurrentDirectory();
-      await attachSubscriptionIfNeeded();
       const c = await ensureClient();
 
       scheduleMcpServersForCurrentDirectoryBestEffort();
@@ -4049,6 +4256,8 @@ export function createOpenCodeServerRuntime(params: {
             if (c.setDirectoryOverride(sessionDirectory)) {
               resetServerConnectedReadiness();
             }
+            currentMcpDirectory = sessionDirectory;
+            params.session.setRuntimeWorkingDirectory(sessionDirectory);
           } catch {
             // non-fatal
           }
@@ -4056,6 +4265,7 @@ export function createOpenCodeServerRuntime(params: {
           scheduleMcpServersForCurrentDirectoryBestEffort();
         }
         await c.sessionUpdate({ sessionId: sessionId!, permission: [...resolveSessionPermissionRuleset()] as unknown[] });
+        await attachSubscriptionIfNeeded();
         publishDynamicSessionOptionsBestEffort();
         publishNativeTodosWorkStateBestEffort();
         const snapshot = params.session.getMetadataSnapshot();
@@ -4065,20 +4275,16 @@ export function createOpenCodeServerRuntime(params: {
           (existingVendorSessionId && existingVendorSessionId === resumeId) ||
           Boolean(marker && typeof marker === 'object' && (marker as any).v === 1 && String((marker as any).remoteSessionId ?? '') === resumeId);
         if (shouldSkipHistoryImport) {
-          try {
-            const raw = await c.sessionMessagesList({ sessionId: resumeId });
-            markObservedTextHistoryItems(extractOpenCodeTextHistoryItems(Array.isArray(raw) ? raw : []));
-          } catch {
-            // non-fatal
-          }
+          externalHistoryReconciliationPending = true;
+          await projectExternalSessionMessagesBestEffort();
         }
 
         // Best-effort: import remote history into a fresh Happier session when resuming. This powers
         // the provider contract scenario `acp_resume_fresh_session_imports_history`.
         void (async () => {
           try {
-            // If we're resuming inside an existing Happier session that already has an OpenCode sessionId,
-            // do not import remote history again (avoids transcript duplication and resume flakiness).
+            // Existing Happier sessions reconcile through the settled passive owner above. Fresh
+            // Happier sessions retain the explicit full native-history import contract.
             if (shouldSkipHistoryImport) {
               return;
             }
@@ -4116,12 +4322,15 @@ export function createOpenCodeServerRuntime(params: {
           if (c.setDirectoryOverride(createdDirectory)) {
             resetServerConnectedReadiness();
           }
+          currentMcpDirectory = createdDirectory;
+          params.session.setRuntimeWorkingDirectory(createdDirectory);
         } catch {
           // non-fatal
         }
         invalidateMcpServersForCurrentDirectory();
         scheduleMcpServersForCurrentDirectoryBestEffort();
       }
+      await attachSubscriptionIfNeeded();
       publishDynamicSessionOptionsBestEffort();
       publishNativeTodosWorkStateBestEffort();
       await drainPendingAfterStartOrLoad();
@@ -4135,13 +4344,59 @@ export function createOpenCodeServerRuntime(params: {
       await this.sendPromptWithMeta?.({ text: prompt, localId: resumeBackfillLocalId });
     },
 
+    async steerPrompt(
+      prompt: string,
+      identity?: InFlightSteerPromptOptions & Readonly<{ onProviderPromptAccepted?: () => void }>,
+    ): Promise<void> {
+      const promptSessionId = sessionId;
+      const activeTurn = turnDeferred;
+      if (!promptSessionId || (!turnInFlight && !providerObservedBusy)) {
+        throw new Error('OpenCode in-flight steer requires an active turn');
+      }
+      const c = await ensureClient();
+      if (!c.supportsInFlightSteer()) {
+        throw new Error('OpenCode server dialect does not support in-flight steer');
+      }
+
+      const nativeCommand = await resolveNativeCommand(prompt);
+      const localIds = [...new Set([
+        ...(identity?.localId === undefined ? [] : [identity.localId]),
+        ...(identity?.localIds ?? []),
+      ].map(readNonBlankOpaqueIdentifier).filter((value): value is string => value !== null))];
+      const messageId = !nativeCommand && localIds.length === 1
+        ? (await resolveOrCreateUserMessageId(localIds[0] ?? null)) ?? undefined
+        : undefined;
+      const parts = await buildOpenCodePromptParts({
+        cwd: params.directory,
+        text: nativeCommand ? '' : (typeof prompt === 'string' ? prompt : ''),
+        metadata: identity?.metadata,
+      });
+
+      if (turnDeferred !== activeTurn || sessionId !== promptSessionId || (!turnInFlight && !providerObservedBusy)) {
+        throw new Error('OpenCode active turn ended before in-flight steer delivery');
+      }
+      if (messageId) observedRemoteTextMessageIds.add(messageId);
+      if (nativeCommand) {
+        await c.sessionCommand({ sessionId: promptSessionId, ...nativeCommand, parts: [...parts], delivery: 'steer' });
+      } else {
+        await c.sessionPromptAsync({
+          sessionId: promptSessionId,
+          ...(messageId ? { messageId } : {}),
+          parts: [...parts],
+          delivery: 'steer',
+        });
+      }
+      identity?.onProviderPromptAccepted?.();
+    },
+
     async sendPromptWithMeta(paramsWithMeta: ProviderPromptWithMeta): Promise<void> {
       const promptSessionId = sessionId;
       if (!promptSessionId) throw new Error('OpenCode server session was not started');
       const c = await ensureClient();
       const effectiveText = typeof paramsWithMeta.text === 'string' ? paramsWithMeta.text : '';
 
-      const shouldOmitCustomMessageId = omitCustomMessageIdForResumedSession === true;
+      const nativeCommand = await resolveNativeCommand(effectiveText);
+      const shouldOmitCustomMessageId = nativeCommand !== null || omitCustomMessageIdForResumedSession === true;
       const messageID = shouldOmitCustomMessageId
         ? undefined
         : (await resolveOrCreateUserMessageId(paramsWithMeta.localId ?? null)) ?? undefined;
@@ -4153,7 +4408,7 @@ export function createOpenCodeServerRuntime(params: {
       // Attach a handler immediately so Node does not treat the rejection as unhandled.
       void turnDeferred.promise.catch(() => undefined);
       const thisTurnDeferred = turnDeferred;
-      turnPromptActive = true;
+      turnPromptActive = nativeCommand === null;
       turnActivitySeen = false;
       turnLastActivityAtMs = Date.now();
       managedServerTurnSupervisor?.captureTurnStartGeneration();
@@ -4215,6 +4470,43 @@ export function createOpenCodeServerRuntime(params: {
         throw error;
       }
 
+      if (nativeCommand) {
+        try {
+          if (promptOptions.config) {
+            throw new ProviderPromptSubmissionRejectedBeforeEffectError('provider_rejected_before_acceptance', new Error('OpenCode native commands do not support legacy prompt config fields'));
+          }
+          const parts = await buildOpenCodePromptParts({ cwd: params.directory, text: '', metadata: paramsWithMeta.meta });
+          await Promise.race([
+            c.sessionCommand({ sessionId: promptSessionId, ...nativeCommand, agent, model, ...(promptOptions.variant ? { variant: promptOptions.variant } : {}), parts: [...parts] }),
+            thisTurnDeferred.promise,
+          ]);
+          await paramsWithMeta.onProviderPromptSubmitted?.();
+          paramsWithMeta.onProviderPromptAccepted?.();
+          // V2 acknowledges callback completion, which can start a child session or no prompt.
+          // Any generated inference is observed by the existing native session status/transcript owner.
+          if (turnDeferred === thisTurnDeferred) {
+            params.session.sendAgentMessage(provider, { type: 'task_complete', id: ensureActiveLifecycleMarkerId() });
+            resolveTurn({ preserveProviderWork: true });
+          }
+          if (!providerObservedBusy) setThinking(false);
+          return;
+        } catch (error) {
+          const failure = error instanceof OpenCodeServerCommandUnsupportedError
+            ? new ProviderPromptSubmissionRejectedBeforeEffectError('provider_rejected_before_acceptance', error)
+            : error;
+          if (!turnDeferred) throw failure;
+          setThinking(false);
+          await flushAndClearStreamWriters({ reason: 'abort', interruptedReason: 'native_command_error' });
+          if (isAbortLikeError(failure)) {
+            params.session.sendAgentMessage(provider, { type: 'turn_aborted', id: ensureActiveLifecycleMarkerId() });
+          } else {
+            surfaceOpenCodeRuntimeFailure('stream_error', failure);
+          }
+          rejectTurn(failure);
+          throw failure;
+        }
+      }
+
       const controlAbort = new AbortController();
       turnControlAbort = controlAbort;
       const deadlockGuardLoop = runTurnDeadlockGuard(controlAbort.signal).catch((error) => {
@@ -4226,7 +4518,7 @@ export function createOpenCodeServerRuntime(params: {
         // Abort handling (runtime.cancel) will reject the turn; do not attempt to send another prompt.
         await awaitPreDispatchTurnSettlement(thisTurnDeferred, 'control abort fired before prompt_async');
       }
-      if (!isActivePromptTurn(thisTurnDeferred, promptSessionId)) {
+      if (!isActiveSubmission(thisTurnDeferred, promptSessionId)) {
         await awaitPreDispatchTurnSettlement(thisTurnDeferred, 'active prompt turn ended before prompt_async');
       }
 
@@ -4251,18 +4543,26 @@ export function createOpenCodeServerRuntime(params: {
         turnPrePromptMessageIdsAll = null;
       }
 
-      if (!isActivePromptTurn(thisTurnDeferred, promptSessionId)) {
+      if (!isActiveSubmission(thisTurnDeferred, promptSessionId)) {
         await awaitPreDispatchTurnSettlement(thisTurnDeferred, 'active prompt turn ended before prompt_async');
       }
 
       try {
+        const promptProjection = buildOpenCodePromptParts({
+          cwd: params.directory,
+          text: effectiveText,
+          metadata: paramsWithMeta.meta,
+        });
+        const promptParts = Array.isArray(promptProjection)
+          ? promptProjection
+          : await promptProjection;
         const promptAsyncPromise = c.sessionPromptAsync({
           sessionId: promptSessionId,
           messageId: messageID,
           agent,
           model,
           ...promptOptions,
-          parts: [{ type: 'text', text: effectiveText }],
+          parts: [...promptParts],
         });
         const promptAsyncOutcome = await Promise.race([
           promptAsyncPromise.then(
@@ -4302,6 +4602,7 @@ export function createOpenCodeServerRuntime(params: {
         rejectTurn(error);
         throw error;
       }
+      void publishDynamicSessionOptionsBestEffort();
       await paramsWithMeta.onProviderPromptSubmitted?.();
       paramsWithMeta.onProviderPromptAccepted?.();
       if (shouldOmitCustomMessageId && !turnUserMessageId) {
@@ -4313,7 +4614,7 @@ export function createOpenCodeServerRuntime(params: {
         });
         if (
           vendorAssignedUserMessageId
-          && isActivePromptTurn(thisTurnDeferred, promptSessionId)
+          && isActiveSubmission(thisTurnDeferred, promptSessionId)
         ) {
           turnUserMessageId = vendorAssignedUserMessageId;
           noteUserMessageIdForActiveTurn(vendorAssignedUserMessageId);
@@ -4419,9 +4720,17 @@ export function createOpenCodeServerRuntime(params: {
         providerSessionId: sessionId,
       });
 
+      let retainManualCompactionForDelayedEvent = false;
       try {
         await c.sessionSummarize({ sessionId, model, auto: false });
-        if (!manualCompaction.terminalObserved) {
+        // Released V2 `POST /api/session/:id/compact` durably admits a `SessionInbox.Compaction`
+        // request (`protocol session.ts session.compact`) and runs it at the next step boundary;
+        // the HTTP return is admission, not completion. The real lifecycle is
+        // `session.compaction.started|ended|failed`. Emitting completed here would falsely
+        // complete before the provider runs, so the manual lifecycle stays open for the delayed
+        // event. V1 `summarize` is synchronous, so its HTTP return stays the completion signal.
+        const v2AsyncAdmission = c.supportsInFlightSteer();
+        if (!v2AsyncAdmission && !manualCompaction.terminalObserved) {
           sendContextCompactionEvent({
             type: 'context-compaction',
             phase: 'completed',
@@ -4431,6 +4740,9 @@ export function createOpenCodeServerRuntime(params: {
             lifecycleId: manualCompaction.lifecycleId,
             providerSessionId: sessionId,
           });
+        }
+        if (v2AsyncAdmission && !manualCompaction.terminalObserved) {
+          retainManualCompactionForDelayedEvent = true;
         }
       } catch (error) {
         if (!manualCompaction.terminalObserved) {
@@ -4451,16 +4763,26 @@ export function createOpenCodeServerRuntime(params: {
         rejectTurn(error);
         throw error;
       } finally {
-        if (activeManualCompaction === manualCompaction) {
-          activeManualCompaction = null;
+        // V2 async admission keeps the manual lifecycle open for the delayed ended/failed
+        // event; clearing here would orphan the real completion and falsely idle the turn.
+        if (
+          retainManualCompactionForDelayedEvent &&
+          !manualCompaction.terminalObserved &&
+          activeManualCompaction === manualCompaction
+        ) {
+          // Keep activeManualCompaction and compactionInProgress for the event owner.
+        } else {
+          if (activeManualCompaction === manualCompaction) {
+            activeManualCompaction = null;
+          }
+          compactionInProgress = false;
         }
-        compactionInProgress = false;
       }
     },
 
     flushTurn(): void {
       turnInFlight = false;
-      setThinking(false);
+      if (!providerObservedBusy) setThinking(false);
     },
 
     async cancel(): Promise<void> {
@@ -4514,6 +4836,14 @@ export function createOpenCodeServerRuntime(params: {
       resetServerConnectedReadiness();
       setThinking(false);
       sessionId = null;
+      const childSessionIds = Array.from(sidechainIdByRemoteSessionId.keys());
+      sidechainIdByRemoteSessionId.clear();
+      for (const childSessionId of childSessionIds) retireNativeChildAttention(childSessionId);
+      backgroundTaskByRemoteSessionId.clear();
+      completedBackgroundTaskCallKeys.clear();
+      sidechainStreamSeenBySidechainId.clear();
+      pendingTaskSidechainImportsBySidechainId.clear();
+      externalHistoryReconciliationPending = false;
       foregroundToolTracker.resetForProviderSession(null);
       selectedAgent = null;
       selectedModel = null;
@@ -4522,16 +4852,23 @@ export function createOpenCodeServerRuntime(params: {
       omitCustomMessageIdForResumedSession = false;
       suppressSessionErrorAbortNotificationForSessionId = null;
       for (const key of Object.keys(configOverrides)) delete configOverrides[key];
+      // OpenCode owns MCP registrations per directory and server name. Because another Happier
+      // session cannot replace this session's projected names, teardown removes only registrations
+      // that this runtime successfully established.
       invalidateMcpServersForCurrentDirectory();
       mcpServerRegistrationRerunRequested = false;
-      if (ensuredMcpServerNames.size > 0) {
-        try {
-          const c = await ensureClient();
-          const names = [...ensuredMcpServerNames];
-          ensuredMcpServerNames.clear();
-          await Promise.all(names.map(async (name) => await c.mcpDisconnect({ name }).catch(() => {})));
-        } catch {
-          ensuredMcpServerNames.clear();
+      const registrationInFlight = mcpServerRegistrationInFlight;
+      if (registrationInFlight) await registrationInFlight;
+      if (client) {
+        for (const registration of registeredMcpServers.splice(0)) {
+          try {
+            await client.mcpDisconnect(registration);
+          } catch (error) {
+            logger.debug('[OpenCodeServer] Failed to disconnect session-scoped MCP server (non-fatal)', {
+              ...registration,
+              error,
+            });
+          }
         }
       }
       if (subscriptionAbort) {
@@ -4554,6 +4891,10 @@ export function createOpenCodeServerRuntime(params: {
 
     async setSessionMode(modeId: string): Promise<void> {
       const trimmed = typeof modeId === 'string' ? modeId.trim() : '';
+      if (sessionId && trimmed) {
+        const c = await ensureClient();
+        await c.sessionSetAgent({ sessionId, agent: trimmed });
+      }
       selectedAgent = trimmed.length > 0 ? trimmed : null;
       publishDynamicSessionOptionsBestEffort();
     },
@@ -4562,11 +4903,15 @@ export function createOpenCodeServerRuntime(params: {
       const normalizedId = typeof configId === 'string' ? configId.trim() : '';
       if (!normalizedId) return;
       if (normalizedId === 'reasoning_effort') {
-        if (value === null) {
-          delete configOverrides.variant;
-          return;
+        const variant = value === null ? '' : typeof value === 'string' ? value.trim() : String(value).trim();
+        if (sessionId) {
+          const c = await ensureClient();
+          await c.sessionSetModel({
+            sessionId,
+            ...(selectedModel ? { model: selectedModel } : {}),
+            ...(variant ? { variant } : {}),
+          });
         }
-        const variant = typeof value === 'string' ? value.trim() : String(value ?? '').trim();
         if (!variant) {
           delete configOverrides.variant;
           return;
@@ -4589,7 +4934,13 @@ export function createOpenCodeServerRuntime(params: {
         publishDynamicSessionOptionsBestEffort();
         return;
       }
-      selectedModel = await resolveModelOverride(trimmed);
+      const nextModel = await resolveModelOverride(trimmed);
+      if (sessionId && nextModel) {
+        const c = await ensureClient();
+        const variant = typeof configOverrides.variant === 'string' ? configOverrides.variant.trim() : '';
+        await c.sessionSetModel({ sessionId, model: nextModel, ...(variant ? { variant } : {}) });
+      }
+      selectedModel = nextModel;
       selectedModelWasQualifiedOverride = parseOpenCodeModelId(trimmed) !== null;
       publishDynamicSessionOptionsBestEffort();
     },

@@ -60,6 +60,17 @@ describe('permissionProfile', () => {
                     sandbox_approval: true,
                 }),
             },
+            approvalsReviewer: 'auto_review',
+            sandbox: 'workspace-write',
+        });
+
+        expect(buildCodexAppServerLegacyPermissionParams({
+            permissionMode: 'acceptEdits',
+            directory: '/repo',
+            target: 'thread',
+            managedScalarFallback: true,
+        })).toMatchObject({
+            approvalPolicy: 'on-request',
             approvalsReviewer: 'user',
             sandbox: 'workspace-write',
         });

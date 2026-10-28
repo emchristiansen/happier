@@ -41,6 +41,12 @@ const syncSpies = vi.hoisted(() => ({
     refreshProfile: vi.fn(),
 }));
 
+const quotaSnapshotsState = vi.hoisted(() => ({
+    snapshotsByKey: {} as Record<string, unknown>,
+    loadingByKey: {} as Record<string, boolean>,
+    requestedProfiles: [] as ReadonlyArray<Readonly<{ serviceId: string; profileId: string }>>,
+}));
+
 const authState = vi.hoisted(() => ({
     credentials: { token: 't', secret: Buffer.from(new Uint8Array(32).fill(3)).toString('base64url') } as
         | { token: string; secret: string }
@@ -237,6 +243,18 @@ vi.mock('@/sync/sync', () => ({
     sync: { refreshProfile: syncSpies.refreshProfile },
 }));
 
+vi.mock('@/hooks/server/connectedServices/useConnectedServiceQuotaSnapshots', () => ({
+    useConnectedServiceQuotaSnapshots: (profiles: ReadonlyArray<Readonly<{ serviceId: string; profileId: string }>>) => {
+        quotaSnapshotsState.requestedProfiles = profiles;
+        return {
+            snapshotsByKey: quotaSnapshotsState.snapshotsByKey,
+            loadingByKey: quotaSnapshotsState.loadingByKey,
+            refreshAll: vi.fn(),
+            isRefreshing: false,
+        };
+    },
+}));
+
 vi.mock('@/sync/api/account/apiConnectedServiceAuthGroupsV3', () => authGroupApiSpies);
 
 
@@ -373,6 +391,13 @@ function findMembersDropdown(screen: Awaited<ReturnType<typeof renderPoolDetail>
         .find((node) => node.props.closeOnSelect === false);
 }
 
+function findQuotaLimitsDropdown(screen: Awaited<ReturnType<typeof renderPoolDetail>>) {
+    return screen.tree.root
+        .findAllByType('DropdownMenu' as never)
+        .find((node) => (node.props.items as ReadonlyArray<{ testID?: string }> | undefined)
+            ?.some((item) => item.testID?.startsWith('connected-services-pool-detail:quota-limits:option:')));
+}
+
 /**
  * Drives the membership multi-select the way a user does: open the menu, toggle
  * the given profiles, then close it — which is what commits the batch.
@@ -447,6 +472,23 @@ beforeEach(() => {
         connectedServiceGroupSession({ id: 'session-owner', machineId: 'machine-1', groupId: 'primary' }),
     ];
     authState.credentials = { token: 't', secret: Buffer.from(new Uint8Array(32).fill(3)).toString('base64url') };
+    quotaSnapshotsState.snapshotsByKey = {
+        'openai-codex/work': {
+            v: 1,
+            serviceId: 'openai-codex',
+            profileId: 'work',
+            fetchedAt: 1,
+            staleAfterMs: 60_000,
+            planLabel: null,
+            accountLabel: null,
+            meters: [
+                { meterId: 'standard:primary', providerLimitId: 'standard', label: 'Standard · Primary', used: null, limit: null, unit: 'unknown', utilizationPct: 10, resetsAt: null, status: 'ok', details: {} },
+                { meterId: 'spark:primary', providerLimitId: 'spark', label: 'Spark · Primary', used: null, limit: null, unit: 'unknown', utilizationPct: 20, resetsAt: null, status: 'ok', details: {} },
+            ],
+        },
+    };
+    quotaSnapshotsState.loadingByKey = {};
+    quotaSnapshotsState.requestedProfiles = [];
     authoritativeGroupState.groups = [createAuthoritativeGroup()];
     authGroupApiSpies.listConnectedServiceAuthGroupsV3.mockReset();
     authGroupApiSpies.listConnectedServiceAuthGroupsV3.mockImplementation(async () => authoritativeGroupState.groups);
@@ -1108,6 +1150,26 @@ describe('PoolDetailView', () => {
         expect(modalSpies.alert).not.toHaveBeenCalled();
     });
 
+    it('offers expiry-first only on supporting servers and saves the explicit choice', async () => {
+        const screen = await renderPoolDetail();
+        const dropdown = findDropdown(screen, 'connected-services-pool-detail:strategy');
+        if (!dropdown) throw new Error('Strategy control is missing');
+        expect(dropdown.props.items.map((item: { id: string }) => item.id)).toContain('expiry_first');
+        await act(async () => {
+            dropdown.props.onSelect('expiry_first');
+            await flushAsyncHandlers();
+        });
+        expect(authGroupApiSpies.patchConnectedServiceAuthGroupV3).toHaveBeenCalledWith(
+            expect.anything(), expect.objectContaining({ patch: expect.objectContaining({ policy: { strategy: 'expiry_first' } }) }),
+        );
+        featureEnabledById.set('connectedServices.poolExpiryFirst', false);
+        const unsupported = await renderPoolDetail();
+        const unsupportedDropdown = findDropdown(unsupported, 'connected-services-pool-detail:strategy');
+        if (!unsupportedDropdown) throw new Error('Strategy control is missing');
+        expect(unsupportedDropdown.props.items.map((item: { id: string }) => item.id))
+            .not.toContain('expiry_first');
+    });
+
     it('surfaces every Behavior control including the two previously-hidden knobs', async () => {
         const screen = await renderPoolDetail();
         await expandAdvanced(screen);
@@ -1149,6 +1211,162 @@ describe('PoolDetailView', () => {
         featureEnabledById.set('connectedServices.autoQuotaReset', false);
         const screen = await renderPoolDetail();
         expect(screen.findByTestId('connected-services-pool-detail:auto-quota-reset:toggle')).toBeNull();
+    });
+
+    it('authors a selected provider allowance only when the server advertises pool quota selection', async () => {
+        featureEnabledById.set('connectedServices.poolQuotaLimitSelection', true);
+        const screen = await renderPoolDetail();
+        const dropdown = findQuotaLimitsDropdown(screen);
+        expect(dropdown).toBeTruthy();
+
+        await act(async () => {
+            dropdown?.props.onOpenChange?.(true);
+            await flushAsyncHandlers();
+        });
+        await act(async () => {
+            findQuotaLimitsDropdown(screen)?.props.onSelect?.('standard');
+            await flushAsyncHandlers();
+        });
+        await act(async () => {
+            findQuotaLimitsDropdown(screen)?.props.onOpenChange?.(false);
+            await flushAsyncHandlers();
+        });
+
+        expect(authGroupApiSpies.patchConnectedServiceAuthGroupV3).toHaveBeenCalledWith(
+            expect.objectContaining({ token: 't' }),
+            {
+                serviceId: 'openai-codex',
+                groupId: 'primary',
+                patch: {
+                    policy: { quotaLimitSelection: { mode: 'selected', providerLimitIds: ['standard'] } },
+                    expectedGeneration: 2,
+                },
+            },
+        );
+    });
+
+    it('marks all-limit evidence as partial while pool account quotas are still loading', async () => {
+        featureEnabledById.set('connectedServices.poolQuotaLimitSelection', true);
+        quotaSnapshotsState.loadingByKey = { 'openai-codex/backup': true };
+
+        const screen = await renderPoolDetail();
+
+        expect(textSpies.translate).toHaveBeenCalledWith(
+            'connectedServices.pools.detail.quotaLimitsRefreshing',
+            { count: 1 },
+        );
+        expect(findQuotaLimitsDropdown(screen)?.props.items[0]).toEqual(expect.objectContaining({
+            id: ' ',
+            subtitle: expect.any(String),
+        }));
+    });
+
+    it('builds quota-limit choices only from enabled pool members', async () => {
+        const base = createAuthoritativeGroup();
+        authoritativeGroupState.groups = [createAuthoritativeGroup({
+            members: base.members.map((member) => member.profileId === 'backup'
+                ? { ...member, enabled: false }
+                : member),
+        })];
+
+        await renderPoolDetail();
+
+        expect(quotaSnapshotsState.requestedProfiles).toEqual([expect.objectContaining({
+            serviceId: 'openai-codex',
+            profileId: 'work',
+        })]);
+    });
+
+    it('hides provider allowance selection against an older server', async () => {
+        featureEnabledById.set('connectedServices.poolQuotaLimitSelection', false);
+        const screen = await renderPoolDetail();
+        expect(findQuotaLimitsDropdown(screen)).toBeUndefined();
+    });
+
+    it('does not turn deselecting the final custom allowance into an implicit all-limits policy', async () => {
+        featureEnabledById.set('connectedServices.poolQuotaLimitSelection', true);
+        const base = createAuthoritativeGroup();
+        authoritativeGroupState.groups = [createAuthoritativeGroup({
+            policy: {
+                ...base.policy,
+                quotaLimitSelection: { mode: 'selected', providerLimitIds: ['standard'] },
+            },
+        })];
+        const screen = await renderPoolDetail();
+
+        await act(async () => {
+            findQuotaLimitsDropdown(screen)?.props.onOpenChange?.(true);
+            await flushAsyncHandlers();
+        });
+        await act(async () => {
+            findQuotaLimitsDropdown(screen)?.props.onSelect?.('standard');
+            await flushAsyncHandlers();
+        });
+        await act(async () => {
+            findQuotaLimitsDropdown(screen)?.props.onOpenChange?.(false);
+            await flushAsyncHandlers();
+        });
+
+        expect(authGroupApiSpies.patchConnectedServiceAuthGroupV3).not.toHaveBeenCalled();
+    });
+
+    it('offers an explicit return from a custom allowance selection to all limits', async () => {
+        featureEnabledById.set('connectedServices.poolQuotaLimitSelection', true);
+        const base = createAuthoritativeGroup();
+        authoritativeGroupState.groups = [createAuthoritativeGroup({
+            policy: {
+                ...base.policy,
+                quotaLimitSelection: { mode: 'selected', providerLimitIds: ['standard'] },
+            },
+        })];
+        const screen = await renderPoolDetail();
+
+        await act(async () => {
+            findQuotaLimitsDropdown(screen)?.props.onOpenChange?.(true);
+            await flushAsyncHandlers();
+        });
+        await act(async () => {
+            findQuotaLimitsDropdown(screen)?.props.onSelect?.(' ');
+            await flushAsyncHandlers();
+        });
+        await act(async () => {
+            findQuotaLimitsDropdown(screen)?.props.onOpenChange?.(false);
+            await flushAsyncHandlers();
+        });
+
+        expect(authGroupApiSpies.patchConnectedServiceAuthGroupV3).toHaveBeenCalledWith(
+            expect.objectContaining({ token: 't' }),
+            {
+                serviceId: 'openai-codex',
+                groupId: 'primary',
+                patch: {
+                    policy: { quotaLimitSelection: { mode: 'all', providerLimitIds: [] } },
+                    expectedGeneration: 2,
+                },
+            },
+        );
+    });
+
+    it('offers automatic disable for model-entitlement failures only with server support', async () => {
+        featureEnabledById.set('connectedServices.autoDisablePlanInvalid', true);
+        const screen = await renderPoolDetail();
+        const toggle = screen.findByTestId('connected-services-pool-detail:auto-disable-plan-invalid:toggle');
+        expect(toggle).toBeTruthy();
+        expect(toggle?.props.value).toBe(false);
+        await act(async () => {
+            toggle?.props.onValueChange(true);
+            await flushAsyncHandlers();
+        });
+        expect(authGroupApiSpies.patchConnectedServiceAuthGroupV3).toHaveBeenCalledWith(
+            expect.objectContaining({ token: 't' }),
+            { serviceId: 'openai-codex', groupId: 'primary', patch: { policy: { autoDisablePlanInvalidAccounts: true }, expectedGeneration: 2 } },
+        );
+    });
+
+    it('does not offer automatic plan-invalid disable against an older server', async () => {
+        featureEnabledById.set('connectedServices.autoDisablePlanInvalid', false);
+        const screen = await renderPoolDetail();
+        expect(screen.findByTestId('connected-services-pool-detail:auto-disable-plan-invalid:toggle')).toBeNull();
     });
 
     it('does not offer quota-reset spending for a provider without banked resets', async () => {

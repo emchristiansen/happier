@@ -1,6 +1,6 @@
 import type { Metadata } from '@/api/types';
-import type { SessionTurnLifecycle } from '@/agent/runtime/session/turn/types';
-import type { SessionRuntimeIssueV1 } from '@happier-dev/protocol';
+import type { FailTurnInput, SessionTurnLifecycle } from '@/agent/runtime/session/turn/types';
+import type { SessionRuntimeIssueV1, SessionTurnsProjectionV1 } from '@happier-dev/protocol';
 import {
     buildCodexAppServerRollbackEvidenceSet,
     resolveCodexAppServerRollbackPlan,
@@ -217,10 +217,12 @@ export function createCodexAppServerSessionTurnTracker(params: Readonly<{
     const upsertInProgressSessionTurnEvidence = (
         turnId: string,
         transcriptAnchors: CodexAppServerSessionTurnTranscriptAnchors,
+        providerTurnId?: string | null,
     ): void => {
         applyLocalSessionTurnEvidenceMutation((current, timestamp) => {
             const nextEntry: CodexAppServerRollbackEvidenceEntry = {
                 turnId,
+                ...(providerTurnId ? { providerTurnId } : {}),
                 status: 'in_progress',
                 startedAt: timestamp,
                 updatedAt: timestamp,
@@ -235,6 +237,7 @@ export function createCodexAppServerSessionTurnTracker(params: Readonly<{
                 entries: hasExistingEntry
                     ? current.entries.map((entry) => entry.turnId === turnId ? {
                         ...entry,
+                        ...(providerTurnId ? { providerTurnId } : {}),
                         updatedAt: timestamp,
                         transcriptAnchors: {
                             ...(entry.transcriptAnchors ?? {}),
@@ -280,7 +283,7 @@ export function createCodexAppServerSessionTurnTracker(params: Readonly<{
                         provider: CODEX_AGENT_ID,
                         transcriptAnchors,
                     });
-                    upsertInProgressSessionTurnEvidence(activeTurnId, transcriptAnchors);
+                    upsertInProgressSessionTurnEvidence(activeTurnId, transcriptAnchors, providerTurnId);
                 } catch (error) {
                     params.onMetadataWriteError?.(error);
                 }
@@ -305,7 +308,7 @@ export function createCodexAppServerSessionTurnTracker(params: Readonly<{
                     providerThreadId: params.getProviderThreadId(),
                     updatedAt: timestamp,
                     entries: current.entries.map((entry) => entry.turnId === activeTurnId
-                        ? { ...entry, turnId: providerTurnId, updatedAt: timestamp }
+                        ? { ...entry, turnId: providerTurnId, providerTurnId, updatedAt: timestamp }
                         : entry),
                 }));
             }
@@ -368,6 +371,37 @@ export function createCodexAppServerSessionTurnTracker(params: Readonly<{
             pendingStartAnchorResolution = null;
         },
 
+        hydrateFromSessionTurns(projection: SessionTurnsProjectionV1): void {
+            sessionTurnEvidence = buildCodexAppServerRollbackEvidenceSet({
+                sessionId: projection.sessionId,
+                backendId: CODEX_APP_SERVER_BACKEND_ID,
+                agentId: CODEX_AGENT_ID,
+                ...(params.getProviderThreadId() ? { providerThreadId: params.getProviderThreadId()! } : {}),
+                ...(projection.latestTurnId ? { currentTurnId: projection.latestTurnId } : {}),
+                updatedAt: projection.updatedAt,
+                entries: boundEntries(projection.turns.flatMap((turn) => (
+                    turn.provider === CODEX_AGENT_ID
+                    && turn.rollback?.state === 'eligible'
+                    && turn.status === 'completed'
+                        ? [{
+                            turnId: turn.turnId,
+                            ...(turn.providerTurnId ? { providerTurnId: turn.providerTurnId } : {}),
+                            status: turn.status,
+                            startedAt: turn.startedAt,
+                            updatedAt: turn.updatedAt,
+                            ...(turn.terminalAt !== undefined ? { terminalAt: turn.terminalAt } : {}),
+                            ...(turn.transcriptAnchors ? { transcriptAnchors: turn.transcriptAnchors } : {}),
+                            rollback: turn.rollback,
+                        }]
+                        : []
+                ))),
+                recentMutationIds: [],
+            });
+            activeTurn = null;
+            activeTurnGeneration += 1;
+            pendingStartAnchorResolution = null;
+        },
+
         async beginTurn(paramsForTurn: Readonly<{
             turnId: string | null;
             startUserMessageLocalId?: string | null;
@@ -423,7 +457,7 @@ export function createCodexAppServerSessionTurnTracker(params: Readonly<{
                         activeTurn = { kind: 'unavailable', turnId: null, providerTurnId, startUserMessageSeq, startSeqInclusive: resolvedStartSeqInclusive };
                         return;
                     }
-                    upsertInProgressSessionTurnEvidence(sessionTurnId, transcriptAnchors);
+                    upsertInProgressSessionTurnEvidence(sessionTurnId, transcriptAnchors, providerTurnId);
                     activeTurn = { kind: 'tracked', turnId: sessionTurnId, providerTurnId };
                 } catch (error) {
                     params.onMetadataWriteError?.(error);
@@ -435,7 +469,7 @@ export function createCodexAppServerSessionTurnTracker(params: Readonly<{
                 activeTurn = { kind: 'unavailable', turnId: null, providerTurnId, startUserMessageSeq, startSeqInclusive: resolvedStartSeqInclusive };
                 return;
             }
-            upsertInProgressSessionTurnEvidence(providerTurnId, transcriptAnchors);
+            upsertInProgressSessionTurnEvidence(providerTurnId, transcriptAnchors, providerTurnId);
             activeTurn = { kind: 'tracked', turnId: providerTurnId, providerTurnId };
         },
 
@@ -472,6 +506,7 @@ export function createCodexAppServerSessionTurnTracker(params: Readonly<{
                         applyLocalSessionTurnEvidenceMutation((current, timestamp) => {
                             const nextEntry: CodexAppServerRollbackEvidenceEntry = {
                                 turnId: sessionTurnId,
+                                providerTurnId: nextTurnId,
                                 status: 'in_progress',
                                 startedAt: timestamp,
                                 updatedAt: timestamp,
@@ -495,6 +530,7 @@ export function createCodexAppServerSessionTurnTracker(params: Readonly<{
                 applyLocalSessionTurnEvidenceMutation((current, timestamp) => {
                     const nextEntry: CodexAppServerRollbackEvidenceEntry = {
                         turnId: nextTurnId,
+                        providerTurnId: nextTurnId,
                         status: 'in_progress',
                         startedAt: timestamp,
                         updatedAt: timestamp,
@@ -523,7 +559,7 @@ export function createCodexAppServerSessionTurnTracker(params: Readonly<{
                         providerThreadId: params.getProviderThreadId(),
                         updatedAt: timestamp,
                         entries: current.entries.map((entry) => entry.turnId === previousTurnId
-                            ? { ...entry, updatedAt: timestamp }
+                            ? { ...entry, providerTurnId: nextTurnId, updatedAt: timestamp }
                             : entry),
                     }));
                     activeTurn = { kind: 'tracked', turnId: previousTurnId, providerTurnId: nextTurnId };
@@ -537,7 +573,7 @@ export function createCodexAppServerSessionTurnTracker(params: Readonly<{
                 providerThreadId: params.getProviderThreadId(),
                 updatedAt: timestamp,
                 entries: current.entries.map((entry) => entry.turnId === previousTurnId
-                    ? { ...entry, turnId: nextTurnId, updatedAt: timestamp }
+                    ? { ...entry, turnId: nextTurnId, providerTurnId: nextTurnId, updatedAt: timestamp }
                     : entry),
             }));
             activeTurn = { kind: 'tracked', turnId: nextTurnId, providerTurnId: nextTurnId };
@@ -732,6 +768,7 @@ export function createCodexAppServerSessionTurnTracker(params: Readonly<{
         async failActiveTurn(paramsForFailure: Readonly<{
             endSeqInclusive: number | null;
             issue?: SessionRuntimeIssueV1 | null;
+            onFailureTurn?: FailTurnInput['onFailureTurn'];
         }>): Promise<void> {
             await drainStartAnchorResolution();
             if (!activeTurn || activeTurn.kind !== 'tracked') {
@@ -764,6 +801,7 @@ export function createCodexAppServerSessionTurnTracker(params: Readonly<{
                         provider: CODEX_AGENT_ID,
                         ...(activeTurn.providerTurnId ? { providerTurnId: activeTurn.providerTurnId } : {}),
                         ...(paramsForFailure.issue ? { issue: paramsForFailure.issue } : {}),
+                        ...(paramsForFailure.onFailureTurn ? { onFailureTurn: paramsForFailure.onFailureTurn } : {}),
                     });
                 } catch (error) {
                     params.onMetadataWriteError?.(error);
@@ -772,8 +810,12 @@ export function createCodexAppServerSessionTurnTracker(params: Readonly<{
             activeTurn = null;
         },
 
-        resolveRollbackPlan(target: SessionRollbackTarget): CodexAppServerRollbackPlan | null {
-            return resolveCodexAppServerRollbackPlan({ target, sessionTurnEvidence: readRollbackPlanningEvidence() });
+        resolveRollbackPlan(target: SessionRollbackTarget, lastObservedMessageSeq?: number | null): CodexAppServerRollbackPlan | null {
+            return resolveCodexAppServerRollbackPlan({
+                target,
+                sessionTurnEvidence: readRollbackPlanningEvidence(),
+                lastObservedMessageSeq,
+            });
         },
 
         async markRolledBack(rollbackPlan: CodexAppServerRollbackPlan): Promise<void> {

@@ -20,10 +20,63 @@ describe('memoryWorker', () => {
   });
 
   afterEach(async () => {
+    vi.doUnmock('@huggingface/transformers');
     restoreEnvValues(envBackup);
     vi.resetModules();
     if (homeDir) await removeTempDir(homeDir);
   });
+
+  it.each([false, true])('exposes the worker while cold inference initializes (disable while pending: %s)', async (disableWhilePending) => {
+    let finishInitialization = () => {};
+    let initializationStarted = () => {};
+    let initializationFinished = () => {};
+    const transformerEnvironment = { cacheDir: '' };
+    const pending = new Promise<void>((resolve) => { finishInitialization = resolve; });
+    const started = new Promise<void>((resolve) => { initializationStarted = resolve; });
+    const finished = new Promise<void>((resolve) => { initializationFinished = resolve; });
+    // Transformers is the native/model-loading boundary; worker/provider lifecycle stays real.
+    vi.doMock('@huggingface/transformers', () => ({
+      env: transformerEnvironment,
+      pipeline: async () => {
+        initializationStarted();
+        await pending;
+        await mkdir(transformerEnvironment.cacheDir, { recursive: true });
+        await writeFile(join(transformerEnvironment.cacheDir, 'model.bin'), 'downloaded fixture');
+        initializationFinished();
+        return async () => ({ data: new Float32Array([1, 0]), dims: [1, 2] });
+      },
+    }));
+    const { writeMemorySettingsToDisk } = await import('@/settings/memorySettings');
+    await writeMemorySettingsToDisk({ v: 1, enabled: true, indexMode: 'deep', embeddings: { mode: 'preset', presetId: 'balanced' } });
+    const { startMemoryWorker } = await import('./memoryWorker');
+    const starting = startMemoryWorker({ credentials: { token: 't', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(1) } }, machineId: 'machine_1' });
+    const worker = await Promise.race([
+      starting,
+      started.then(() => new Promise<null>((resolve) => setImmediate(() => resolve(null)))),
+    ]);
+    try {
+      expect(worker, 'Daemon must be able to register memory RPC while inference is pending').not.toBeNull();
+      expect(worker?.getEmbeddingsDiagnostics()).toMatchObject({ runtimeState: 'downloading' });
+      if (disableWhilePending) {
+        await writeMemorySettingsToDisk({ v: 1, enabled: false, indexMode: 'deep', deleteOnDisable: true });
+        await worker?.reloadSettings();
+      }
+      finishInitialization();
+      if (disableWhilePending) {
+        await finished;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(worker?.getEmbeddingsDiagnostics()).toMatchObject({ runtimeState: 'unavailable', usingFallback: false });
+        await vi.waitFor(async () => {
+          await expect(stat(join(transformerEnvironment.cacheDir, 'model.bin'))).rejects.toBeTruthy();
+        });
+      } else {
+        await vi.waitFor(() => expect(worker?.getEmbeddingsDiagnostics()).toMatchObject({ runtimeState: 'ready', usingFallback: false }));
+      }
+    } finally {
+      finishInitialization();
+      (await starting).stop();
+    }
+  }, 60_000);
 
   it('creates the tier-1 sqlite DB when enabled', async () => {
     const { writeMemorySettingsToDisk } = await import('@/settings/memorySettings');
@@ -122,6 +175,112 @@ describe('memoryWorker', () => {
     });
 
     worker.stop();
+  });
+
+  it('reuses a failed embeddings resolution across background ticks but retries on explicit use and settings reload', async () => {
+    vi.useFakeTimers();
+    const argvBackup = process.argv.slice();
+    let publishInventory = () => {};
+    const inventoryReady = new Promise<void>((resolve) => { publishInventory = resolve; });
+    const fetchSessionsPage = vi.fn(async () => {
+      await inventoryReady;
+      return {
+        sessions: [{ id: 'sess-1', createdAt: 1_000, updatedAt: 2_000, activeAt: 0 }],
+        nextCursor: null,
+        hasNext: false,
+      };
+    });
+    const pipeline = vi.fn(async () => {
+      throw new Error('permanent local embeddings failure');
+    });
+    try {
+      vi.doMock('@huggingface/transformers', () => ({ env: {}, pipeline }));
+      vi.doMock('@/session/transport/http/sessionsHttp', () => ({
+        fetchSessionsPage,
+        fetchSessionById: async () => ({}),
+      }));
+      vi.doMock('@/session/replay/fetchEncryptedTranscriptMessages', () => ({
+        fetchEncryptedTranscriptMessagesPage: async () => ({
+          messages: [],
+          hasMore: false,
+          nextBeforeSeq: null,
+          nextAfterSeq: null,
+        }),
+      }));
+      process.argv = ['node', 'happier', 'daemon', 'start-sync'];
+      vi.doMock('@/configuration', async () => {
+        const actual = await vi.importActual<typeof import('@/configuration')>('@/configuration');
+        return {
+          ...actual,
+          configuration: { ...actual.configuration, isDaemonProcess: true },
+        };
+      });
+
+      const { writeMemorySettingsToDisk } = await import('@/settings/memorySettings');
+      const {
+        resetActiveAccountSettingsSnapshotForTests,
+        setActiveAccountSettingsSnapshot,
+      } = await import('@/settings/accountSettings/activeAccountSettingsSnapshot');
+      const { accountSettingsParse } = await import('@happier-dev/protocol');
+      resetActiveAccountSettingsSnapshotForTests();
+      await writeMemorySettingsToDisk({
+        v: 1,
+        enabled: true,
+        indexMode: 'deep',
+        backfillPolicy: 'new_only',
+        worker: {
+          tickIntervalMs: 500,
+          inventoryRefreshIntervalMs: 5_000,
+          maxSessionsPerTick: 1,
+          sessionListPageLimit: 10,
+        },
+        embeddings: { mode: 'preset', presetId: 'balanced' },
+      });
+
+      const { startMemoryWorker } = await import('./memoryWorker');
+      const worker = await startMemoryWorker({
+        credentials: { token: 't', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(1) } },
+        machineId: 'machine_1',
+        deps: { fetchDecryptedTranscriptPageAfterSeq: async () => [] },
+      });
+      try {
+        await vi.waitFor(() => expect(pipeline).toHaveBeenCalledTimes(1));
+        await vi.waitFor(() => expect(fetchSessionsPage).toHaveBeenCalledTimes(1));
+        publishInventory();
+        await fetchSessionsPage.mock.results[0]!.value;
+        await vi.advanceTimersByTimeAsync(2_500);
+        expect(pipeline).toHaveBeenCalledTimes(1);
+
+        setActiveAccountSettingsSnapshot({
+          source: 'cache',
+          settings: accountSettingsParse({}),
+          settingsVersion: 1,
+          loadedAtMs: Date.now(),
+          settingsSecretsReadKeys: [],
+        });
+        await vi.waitFor(() => expect(pipeline).toHaveBeenCalledTimes(2));
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(pipeline).toHaveBeenCalledTimes(2);
+
+        await worker.ensureUpToDate('sess-1');
+        expect(pipeline).toHaveBeenCalledTimes(3);
+        await vi.advanceTimersByTimeAsync(1_500);
+        expect(pipeline).toHaveBeenCalledTimes(3);
+
+        await worker.reloadSettings();
+        await vi.waitFor(() => expect(pipeline).toHaveBeenCalledTimes(4));
+      } finally {
+        publishInventory();
+        worker.stop();
+        resetActiveAccountSettingsSnapshotForTests();
+      }
+    } finally {
+      vi.doUnmock('@/configuration');
+      vi.doUnmock('@/session/transport/http/sessionsHttp');
+      vi.doUnmock('@/session/replay/fetchEncryptedTranscriptMessages');
+      process.argv = argvBackup;
+      vi.useRealTimers();
+    }
   });
 
   it('deletes DBs when disabled with deleteOnDisable=true', async () => {

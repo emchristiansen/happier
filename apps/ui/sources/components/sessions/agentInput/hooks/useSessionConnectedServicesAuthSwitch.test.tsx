@@ -135,6 +135,8 @@ function renderChipPopover(
     });
 }
 
+const { useSessionConnectedServicesAuthSwitch } = await import('./useSessionConnectedServicesAuthSwitch');
+
 describe('useSessionConnectedServicesAuthSwitch', () => {
     beforeEach(() => {
         profileState.current = {
@@ -235,6 +237,43 @@ describe('useSessionConnectedServicesAuthSwitch', () => {
 
         expect(renderedChip.props.testID).toBe('session-connected-services-auth-chip');
         expect(renderedChip.props.dataSet?.authSource).toBe('connected');
+        await hook.unmount();
+    });
+
+    it.each(['work', 'missing-profile', null])('previews the armed Agent literal default without offering source auth changes (%s)', async (profileId) => {
+        const hook = await renderHook(() => useSessionConnectedServicesAuthSwitch({
+            sessionId: 'session-1',
+            agentId: 'codex',
+            agentCore: AGENTS_CORE.codex,
+            machineId: 'machine-1',
+            sessionMetadata: { connectedServices: { v: 1, bindingsByServiceId: {
+                'openai-codex': { source: 'connected', selection: 'profile', profileId: 'happier' },
+            } } },
+            armedContinuationAgent: { agentId: 'claude', agentCore: {
+                ...AGENTS_CORE.claude,
+                connectedServices: { supportedServiceIds: ['anthropic'] },
+            } },
+            settings: {
+                connectedServicesProfileLabelByKey: { 'anthropic/work': 'Work' },
+                connectedServicesDefaultProfileByServiceId: {},
+                connectedServicesDefaultAuthByAgentIdV1: { v: 1, bindingsByAgentId: {
+                    claude: { v: 1, bindingsByServiceId: {
+                        anthropic: profileId === null ? { source: 'native' } : { source: 'connected', selection: 'profile', profileId },
+                    } },
+                } },
+            },
+            switchingDisabledReason: null,
+        }));
+        const chip = hook.getCurrent().connectedServicesAuthChip;
+        expect(chip?.collapsedContentPopover?.label).toBe(profileId === null
+            ? 'connectedServices.authChip.nativeLabel'
+            : `Anthropic: ${profileId === 'work' ? 'Work' : profileId}`);
+        const content = renderChipPopover(chip?.collapsedContentPopover?.renderContent) as React.ReactElement<{
+            actions: readonly { disabled?: boolean; onPress?: () => void }[];
+        }>;
+        expect(content.props.actions).toEqual([expect.objectContaining({ disabled: true })]);
+        expect(content.props.actions[0].onPress).toBeUndefined();
+        expect(setSessionConnectedServiceAuthBindingMock).not.toHaveBeenCalled();
         await hook.unmount();
     });
 
@@ -2022,6 +2061,61 @@ describe('useSessionConnectedServicesAuthSwitch', () => {
             rematerializeServiceId: 'openai-codex',
         }));
 
+        await hook.unmount();
+    });
+
+    it('explains a restart policy refusal and restores the current authentication selection', async () => {
+        setSessionConnectedServiceAuthBindingMock.mockResolvedValueOnce({
+            ok: false,
+            errorCode: 'restart_disallowed_by_execution_policy',
+            diagnostics: { failurePhase: 'continuity', attemptedAction: 'restart_requested', retryable: true },
+        });
+        const hook = await renderHook(() => useSessionConnectedServicesAuthSwitch({
+            sessionId: 'session-1',
+            agentId: 'claude',
+            machineId: 'machine-1',
+            serverId: 'server-1',
+            agentCore: {
+                id: 'claude',
+                connectedServices: {
+                    supportedServiceIds: ['anthropic'],
+                    sessionAuthSwitch: { continuityMode: 'restart_same_home' },
+                },
+            },
+            sessionMetadata: {
+                connectedServices: { v: 1, bindingsByServiceId: { anthropic: { source: 'native' } } },
+            },
+            settings: {
+                connectedServicesProfileLabelByKey: {},
+                connectedServicesDefaultProfileByServiceId: {},
+            },
+            switchingDisabledReason: null,
+            sessionActive: true,
+        }));
+        type PopoverProps = {
+            setBindingForService: (serviceId: string, binding: unknown) => void;
+            bindingsByServiceId: Record<string, unknown>;
+        };
+        const popover = renderChipPopover(
+            hook.getCurrent().connectedServicesAuthChip?.collapsedContentPopover?.renderContent,
+        ) as React.ReactElement<PopoverProps>;
+
+        await act(async () => {
+            popover.props.setBindingForService('anthropic', {
+                source: 'connected', selection: 'group', groupId: 'team', profileId: 'work',
+            });
+        });
+
+        expect(modalAlertMock).toHaveBeenCalledWith(
+            'common.error',
+            'connectedServices.authSwitch.errors.restartDisallowedByExecutionPolicy',
+        );
+        const restoredPopover = renderChipPopover(
+            hook.getCurrent().connectedServicesAuthChip?.collapsedContentPopover?.renderContent,
+        ) as React.ReactElement<PopoverProps>;
+        expect(restoredPopover.props.bindingsByServiceId.anthropic).toEqual({ source: 'native' });
+        expect(hook.getCurrent().actionableState).toBeNull();
+        expect(routerPushMock).not.toHaveBeenCalled();
         await hook.unmount();
     });
 

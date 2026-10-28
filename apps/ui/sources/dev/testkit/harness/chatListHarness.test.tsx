@@ -191,6 +191,7 @@ describe('chatListHarness', () => {
         const tuning = syncModule.sync.getSyncTuning();
         const defaults = loadSyncTuning();
 
+        expect(syncModule.sync.getSessionTailDiscontinuityOlderAvailability('session-1')).toBe(false);
         expect(tuning.transcriptMaxTurnEntriesPerListItem).toBe(defaults.transcriptMaxTurnEntriesPerListItem);
         expect(tuning.transcriptMountSettleQuiescentWindowMs).toBe(defaults.transcriptMountSettleQuiescentWindowMs);
 

@@ -7,6 +7,7 @@ import {
     ConnectedServiceAuthGroupListResponseV1Schema,
     ConnectedServiceAuthGroupMemberStateV1Schema,
     ConnectedServiceAuthGroupResponseV1Schema,
+    ConnectedServiceAuthGroupReaderCapabilitiesQueryV1Schema,
     ConnectedServiceAuthGroupStateV1Schema,
     ConnectedServiceAuthGroupV1Schema,
     ConnectedServiceIdSchema,
@@ -25,6 +26,8 @@ export const AuthGroupServiceParamsSchema = z.object({
 export const AuthGroupMemberParamsSchema = AuthGroupParamsSchema.extend({
     profileId: ConnectedServiceProfileIdSchema,
 });
+
+export const AuthGroupReaderCapabilitiesQuerySchema = ConnectedServiceAuthGroupReaderCapabilitiesQueryV1Schema;
 
 export const ConnectedServiceAuthGroupStateSchema = ConnectedServiceAuthGroupStateV1Schema;
 export const ConnectedServiceAuthGroupMemberStateSchema = ConnectedServiceAuthGroupMemberStateV1Schema;
@@ -57,19 +60,20 @@ export const UpdateAuthGroupMemberBodySchema = z
     .object({
         priority: z.number().int().optional(),
         enabled: z.boolean().optional(),
+        state: ConnectedServiceAuthGroupMemberStateV1Schema.removeDefault().optional(),
         expectedGeneration: z.number().int().nonnegative().optional(),
+        expectedRuntimeStateRevision: z.number().int().nonnegative().optional(),
     })
     .strict();
 
-export const DeleteAuthGroupMemberQuerySchema = z
-    .object({
+export const DeleteAuthGroupMemberQuerySchema = AuthGroupReaderCapabilitiesQuerySchema
+    .extend({
         expectedGeneration: z.preprocess((value) => {
             if (typeof value !== "string") return value;
             const trimmed = value.trim();
             return trimmed.length > 0 ? Number(trimmed) : value;
         }, z.number().int().nonnegative().optional()),
-    })
-    .strict();
+    });
 
 export const ActiveProfileBodySchema = z
     .object({

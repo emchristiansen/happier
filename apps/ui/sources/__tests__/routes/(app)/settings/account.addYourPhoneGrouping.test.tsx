@@ -57,7 +57,7 @@ installSessionSettingsEntryModuleMocks({
 });
 
 vi.mock('expo-clipboard', () => ({
-    setStringAsync: vi.fn(async () => {}),
+    setStringAsync: vi.fn(async () => true),
 }));
 
 vi.mock('expo-image', () => ({
@@ -96,7 +96,8 @@ vi.mock('@/sync/domains/state/storageStore', () => ({
     storage: () => vi.fn(),
 }));
 
-vi.mock('@/sync/domains/profiles/profile', () => ({
+vi.mock('@/sync/domains/profiles/profile', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@/sync/domains/profiles/profile')>(),
     getDisplayName: () => null,
 }));
 

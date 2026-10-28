@@ -1,6 +1,7 @@
 import {
     DEFAULT_PETS_CAPABILITIES,
     DEFAULT_SESSION_CAPABILITIES,
+    RELEASED_CONNECTED_SERVICE_IDS,
     type FeaturesResponse as RootLayoutFeatures,
 } from '@happier-dev/protocol';
 
@@ -60,6 +61,7 @@ const BASE_ROOT_LAYOUT_FEATURES: RootLayoutFeatures = {
             keylessAccounts: { enabled: false },
         },
         encryption: {
+            plaintextMachine: { enabled: false },
             plaintextStorage: { enabled: false },
             accountOptOut: { enabled: false },
         },
@@ -86,9 +88,13 @@ const BASE_ROOT_LAYOUT_FEATURES: RootLayoutFeatures = {
             enabled: true,
             quotas: { enabled: true },
             subscription: { enabled: false },
+            quotaRecoveryCreditDetails: { enabled: false },
             accountGroups: { enabled: false },
             accountFallback: { enabled: false },
             autoQuotaReset: { enabled: false },
+            autoDisablePlanInvalid: { enabled: false },
+            poolQuotaLimitSelection: { enabled: false },
+            poolExpiryFirst: { enabled: false },
         },
         updates: {
             ota: { enabled: true },
@@ -156,7 +162,7 @@ const BASE_ROOT_LAYOUT_FEATURES: RootLayoutFeatures = {
         },
     },
     capabilities: {
-        connectedServices: { credentialDelete: { revisionGuard: false } },
+        connectedServices: { credentialDelete: { revisionGuard: false }, credentialWrite: { revisionGuard: false }, supportedServiceIds: [...RELEASED_CONNECTED_SERVICE_IDS] },
         bugReports: {
             providerUrl: 'https://reports.happier.dev',
             defaultIncludeDiagnostics: true,

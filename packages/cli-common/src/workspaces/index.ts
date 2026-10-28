@@ -78,6 +78,7 @@ export function sanitizeBundledPackageJson(raw: any): any {
     module,
     types,
     exports,
+    imports,
     dependencies,
     peerDependencies,
     optionalDependencies,
@@ -93,6 +94,7 @@ export function sanitizeBundledPackageJson(raw: any): any {
     module,
     types,
     exports,
+    ...(imports === undefined ? {} : { imports }),
     dependencies: stripInternalBundledWorkspaceDependencies(dependencies),
     peerDependencies,
     optionalDependencies: stripInternalBundledWorkspaceDependencies(optionalDependencies),
@@ -363,6 +365,7 @@ function copyBundledWorkspacePackageContents(params: Readonly<{
   collectNonDistPackageEntryTargets(params.rawPackageJson?.module, files);
   collectNonDistPackageEntryTargets(params.rawPackageJson?.types, files);
   collectNonDistPackageEntryTargets(params.rawPackageJson?.exports, files);
+  collectNonDistPackageEntryTargets(params.rawPackageJson?.imports, files);
   for (const f of files) {
     copyIfExists(resolve(params.srcDir, f), resolve(params.tempDir, f));
   }
@@ -473,7 +476,7 @@ function collectExternalRuntimeDepNamesFromPackageJson(packageJson: any): Readon
   return [...required, ...optional];
 }
 
-function resolveInstalledPackage(params: Readonly<{ require: NodeRequire; packageName: string }>): Readonly<{
+export function resolveInstalledPackage(params: Readonly<{ require: NodeRequire; packageName: string }>): Readonly<{
   packageDir: string;
   packageJsonPath: string;
   packageJson: any;
@@ -545,18 +548,42 @@ function vendorRuntimeDependencyTree(params: Readonly<{
   resolveFromPackageJsonPath?: string;
   destNodeModulesDir: string;
   visited?: Set<string>;
+  excludeRootDependencies?: readonly string[];
 }>): void {
   const pkgJson = readJson(params.packageJsonPath);
-  const roots = collectExternalRuntimeDepNamesFromPackageJson(pkgJson);
+  const roots = [...collectExternalRuntimeDepNamesFromPackageJson(pkgJson)];
   const require = createRequire(pathToFileURL(params.resolveFromPackageJsonPath ?? params.packageJsonPath).href);
+
+  let transformersCommonRequire: NodeRequire | undefined;
+  if (
+    pkgJson?.name === '@huggingface/transformers'
+    && pkgJson?.version === '3.8.1'
+    && !roots.some((dep) => dep.name === 'onnxruntime-common')
+  ) {
+    // 3.8.1's dist/transformers.node.mjs imports Common without declaring it. Yarn's
+    // hoisted install masks the missing edge, but our isolated runtime tree cannot.
+    // Resolve it from ONNX Node, whose declared version is compatible with this entrypoint;
+    // ONNX Web has a different Common version and retains its own dependency tree.
+    // Remove this upstream metadata correction when a supported Transformers version
+    // declares the direct dependency (or no longer imports it).
+    const nodeRuntime = resolveInstalledPackage({ require, packageName: 'onnxruntime-node' });
+    transformersCommonRequire = createRequire(pathToFileURL(nodeRuntime.packageJsonPath).href);
+    roots.push({ name: 'onnxruntime-common', optional: false });
+  }
 
   const visited = params.visited ?? new Set<string>();
   mkdirSync(params.destNodeModulesDir, { recursive: true });
 
   for (const dep of roots) {
+    // The host may acquire a dependency separately at runtime. Do not carry this
+    // omission into child trees: another package can still import the same name.
+    if (params.excludeRootDependencies?.includes(dep.name)) continue;
     let resolved: Readonly<{ packageDir: string; packageJsonPath: string }>;
     try {
-      resolved = resolveInstalledPackage({ require, packageName: dep.name });
+      resolved = resolveInstalledPackage({
+        require: dep.name === 'onnxruntime-common' ? transformersCommonRequire ?? require : require,
+        packageName: dep.name,
+      });
     } catch (error) {
       if (dep.optional) continue;
       throw error;
@@ -581,6 +608,7 @@ export function vendorBundledPackageRuntimeDependencies(params: Readonly<{
   srcPackageJsonPath: string;
   resolveFromPackageJsonPath?: string;
   destPackageDir: string;
+  excludeRootDependencies?: readonly string[];
 }>): void {
   if (!existsSync(params.srcPackageJsonPath)) {
     throw new Error(`Missing package.json: ${params.srcPackageJsonPath}`);
@@ -602,6 +630,7 @@ export function vendorBundledPackageRuntimeDependencies(params: Readonly<{
         packageJsonPath: params.srcPackageJsonPath,
         resolveFromPackageJsonPath: params.resolveFromPackageJsonPath,
         destNodeModulesDir: tempNodeModulesDir,
+        excludeRootDependencies: params.excludeRootDependencies,
       });
     },
   });

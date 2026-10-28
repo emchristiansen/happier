@@ -92,6 +92,9 @@ describe('createAcpRuntime (configOptions)', () => {
 
     expect(getMetadata().acpConfigOptionsV1?.configOptions).toHaveLength(1);
 
+    backend.emit({ type: 'event', name: 'config_options_update', payload: {} });
+    expect(getMetadata().acpConfigOptionsV1?.configOptions).toHaveLength(1);
+
     backend.emit({
       type: 'event',
       name: 'config_options_update',

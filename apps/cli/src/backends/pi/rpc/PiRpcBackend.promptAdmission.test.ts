@@ -26,7 +26,7 @@ type PiRpcBackendWithPromptAdmission = PiRpcBackend & {
 
 function makeFakePiRpcProcessScript(
   dir: string,
-  scenario: 'ack-before-turn' | 'ack-after-timeout-during-compaction' | 'command-without-turn' | 'command-ack-before-turn' | 'command-state-unknown-before-turn' | 'negative-ack-then-turn' | 'response-loss' | 'turn-before-ack',
+  scenario: 'ack-before-turn' | 'ack-after-timeout-during-compaction' | 'command-without-turn' | 'command-ack-before-turn' | 'command-state-unknown-before-turn' | 'negative-ack-then-turn' | 'response-loss' | 'slash-turn-with-hanging-command-discovery' | 'turn-before-ack',
 ): string {
   const scriptPath = join(dir, `fake-pi-rpc-${scenario}.js`);
   const observedPromptsPath = join(dir, 'observed-prompts.jsonl');
@@ -74,6 +74,7 @@ rl.on('line', (line) => {
       });
       break;
     case 'get_commands':
+      if (scenario === 'slash-turn-with-hanging-command-discovery') break;
       out({
         id: command.id,
         type: 'response',
@@ -90,6 +91,12 @@ rl.on('line', (line) => {
       break;
     case 'prompt':
       fs.appendFileSync(${JSON.stringify(observedPromptsPath)}, JSON.stringify(command.message) + '\\n');
+      if (scenario === 'slash-turn-with-hanging-command-discovery') {
+        out({ id: command.id, type: 'response', command: command.type, success: true });
+        setTimeout(() => out({ type: 'agent_start' }), 10);
+        setTimeout(() => out({ type: 'agent_end' }), 40);
+        break;
+      }
       if (scenario === 'command-without-turn') {
         out({ id: command.id, type: 'response', command: command.type, success: true });
         break;
@@ -202,6 +209,19 @@ describe('PiRpcBackend prompt admission', () => {
     const submission = backend.sendPromptWithAdmission(sessionId, '/goal fix authentication');
 
     await expect(submission.admission).resolves.toEqual({ status: 'accepted' });
+    await expect(submission.completion).resolves.toBeUndefined();
+  });
+
+  it('does not delay an accepted slash-command turn on hanging command discovery', async () => {
+    const { backend, sessionId } = await startBackend('slash-turn-with-hanging-command-discovery');
+
+    const submission = backend.sendPromptWithAdmission(sessionId, '/unknown run this prompt');
+    const admission = await Promise.race([
+      submission.admission,
+      new Promise<'blocked'>((resolve) => setTimeout(() => resolve('blocked'), 5_000)),
+    ]);
+
+    expect(admission).toEqual({ status: 'accepted' });
     await expect(submission.completion).resolves.toBeUndefined();
   });
 

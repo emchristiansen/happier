@@ -1,5 +1,7 @@
 import { buildHappyCliSubprocessLaunchSpec, type HappyCliSubprocessLaunchOptions } from '@/utils/spawnHappyCLI';
 import type { CatalogAgentId } from '@/backends/types';
+import { buildSpawnChildProcessEnv, DAEMON_DECIDED_CHILD_ENV_KEYS } from '../../spawn/buildSpawnChildProcessEnv';
+import type { HappierRuntimeServerContext } from '@/utils/env/resolveHappierRuntimeContextEnv';
 import { buildCgroupSelfMigratingHappyCliLaunchSpec } from '../linux/buildCgroupSelfMigratingHappyCliLaunchSpec';
 import type { SessionLaunchPlacementIntent } from '../linux/observeSessionLaunchPlacement';
 import type { SessionLaunchId } from '../linux/sessionLaunchId';
@@ -35,17 +37,26 @@ export function buildTmuxWindowEnv(
   return { ...filteredDaemonEnv, ...extraEnv };
 }
 
-export async function buildTmuxSpawnConfig(params: {
+type HostedRunnerSpawnParams = {
   launchId: SessionLaunchId;
   agent: TmuxSpawnAgentId;
   directory: string;
   extraEnv: Record<string, string>;
+  startingMode?: 'local' | 'remote';
   tmuxCommandEnv?: Record<string, string>;
   extraArgs?: string[];
   launchOptions?: HappyCliSubprocessLaunchOptions;
-}): Promise<{
+  processEnv?: NodeJS.ProcessEnv;
+  homeDir?: string;
+  serverSelectionEnv?: HappierRuntimeServerContext;
+};
+
+export async function buildHostedRunnerSpawnConfig(params: HostedRunnerSpawnParams & Readonly<{
+  host: 'tmux' | 'zellij' | 'herdr';
+}>): Promise<{
   commandTokens: string[];
   tmuxEnv: Record<string, string>;
+  childEnv: Record<string, string>;
   tmuxCommandEnv: Record<string, string>;
   directory: string;
   placement: SessionLaunchPlacementIntent;
@@ -53,16 +64,36 @@ export async function buildTmuxSpawnConfig(params: {
   const args = [
     params.agent,
     '--happy-starting-mode',
-    'remote',
+    params.startingMode ?? 'remote',
     '--started-by',
     'daemon',
     ...(params.extraArgs ?? []),
   ];
 
   const launchSpec = buildHappyCliSubprocessLaunchSpec(args, params.launchOptions);
-  const tmuxEnv = buildTmuxWindowEnv(process.env, { ...params.extraEnv, ...(launchSpec.env ?? {}) });
+  const processEnv = params.processEnv ?? process.env;
+  const extraEnv = { ...params.extraEnv, ...(launchSpec.env ?? {}) };
+  // tmux's server environment may be stale; empty values explicitly mask inherited keys.
+  const childEnv = buildSpawnChildProcessEnv({
+    processEnv,
+    extraEnv,
+    homeDir: params.homeDir,
+    serverSelectionEnv: params.serverSelectionEnv,
+  });
+  const daemonDecidedEnv = Object.fromEntries(
+    DAEMON_DECIDED_CHILD_ENV_KEYS.map((key) => [key, childEnv[key] ?? '']),
+  );
+  const tmuxEnv = buildTmuxWindowEnv(processEnv, { ...extraEnv, ...daemonDecidedEnv });
+  const fullChildEnv = {
+    ...Object.fromEntries(Object.entries(childEnv).filter((entry): entry is [string, string] => typeof entry[1] === 'string')),
+    ...daemonDecidedEnv,
+  };
   const launchPlan = process.platform === 'linux'
-    ? await buildCgroupSelfMigratingHappyCliLaunchSpec({ launchId: params.launchId, launchSpec, environment: tmuxEnv })
+    ? await buildCgroupSelfMigratingHappyCliLaunchSpec({
+      launchId: params.launchId,
+      launchSpec,
+      environment: params.host === 'tmux' ? tmuxEnv : fullChildEnv,
+    })
     : null;
   const effectiveLaunchSpec = launchPlan?.launchSpec ?? launchSpec;
   const placement: SessionLaunchPlacementIntent = launchPlan?.placement
@@ -78,8 +109,13 @@ export async function buildTmuxSpawnConfig(params: {
   return {
     commandTokens,
     tmuxEnv: { ...tmuxEnv, ...(effectiveLaunchSpec.env ?? {}) },
+    childEnv: { ...fullChildEnv, ...(effectiveLaunchSpec.env ?? {}) },
     tmuxCommandEnv,
     directory: params.directory,
     placement,
   };
+}
+
+export async function buildTmuxSpawnConfig(params: HostedRunnerSpawnParams) {
+  return await buildHostedRunnerSpawnConfig({ ...params, host: 'tmux' });
 }

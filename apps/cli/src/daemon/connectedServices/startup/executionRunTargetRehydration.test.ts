@@ -1,5 +1,11 @@
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
+import { resolveConnectedServiceMaterializedRootDir } from '../materialize/resolveConnectedServiceMaterializedRootDir';
+import { createAdoptedExecutionRunRootCleanup } from '../runsBridge/createAdoptedExecutionRunRootCleanup';
+import { createExecutionRunConnectedServicesBridge } from '../runsBridge/materializeConnectedServicesForRun';
 import { ConnectedServiceRuntimeRegistry } from '../runtimeRegistry/registry';
 import { rehydrateLiveExecutionRunRuntimeTargets } from './executionRunTargetRehydration';
 
@@ -28,6 +34,48 @@ const launch = {
 };
 
 describe('rehydrateLiveExecutionRunRuntimeTargets', () => {
+  it('preserves adopted resumable and unknown legacy homes while cleaning explicitly ephemeral homes', async () => {
+    const sandbox = await mkdtemp(join(tmpdir(), 'happier-adopted-run-retention-'));
+    try {
+      const base = join(sandbox, 'materialized');
+      for (const retentionPolicy of ['resumable', 'ephemeral', undefined, 'invalid']) {
+        const runId = `run-${retentionPolicy ?? 'legacy'}`;
+        const runKey = `execution_run:${runId}`;
+        const root = resolveConnectedServiceMaterializedRootDir({ baseDir: base, agentId: 'codex', materializationKey: runKey });
+        const historyPath = join(root, 'codex-home', 'sessions', 'rollout.jsonl');
+        await mkdir(join(root, 'codex-home', 'sessions'), { recursive: true });
+        await writeFile(historyPath, 'private retained run history\n');
+        const registry = new ConnectedServiceRuntimeRegistry();
+        const bridge = createExecutionRunConnectedServicesBridge({
+          resolveAuthForSpawn: async () => { throw new Error('Passive adoption must not materialize'); },
+          runtimeRegistry: registry,
+          createAdoptedRootCleanup: (input) => createAdoptedExecutionRunRootCleanup({
+            ...input,
+            materializationBaseDir: base,
+            removeRoot: async (path) => await rm(path, { recursive: true, force: true }),
+          }),
+        });
+
+        expect(await rehydrateLiveExecutionRunRuntimeTargets({
+          markers: [{ runId, happySessionId: 'session-1', pid: 4321, status: 'running', retentionPolicy,
+            executionRunConnectedServicesLaunchV1: { ...launch, runKey, materializedRoot: root } }],
+          runtimeRegistry: registry,
+          proveRunnerLive: async () => true,
+          adoptCleanup: bridge.adoptLiveMaterialization,
+        })).toEqual({ registeredRunIds: [runId], inactiveRunIds: [] });
+        expect(await bridge.release({ runId, materializationKey: runKey, pid: 4321 })).toEqual({ released: true });
+        expect(registry.listTargets()).toEqual([]);
+        if (retentionPolicy === 'ephemeral') {
+          await expect(stat(root)).rejects.toMatchObject({ code: 'ENOENT' });
+        } else {
+          expect(await readFile(historyPath, 'utf8')).toBe('private retained run history\n');
+        }
+      }
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
   it('passively re-registers only an exact demonstrably-live launch record', async () => {
     const registry = new ConnectedServiceRuntimeRegistry();
     const launchWork = vi.fn();
@@ -65,6 +113,7 @@ describe('rehydrateLiveExecutionRunRuntimeTargets', () => {
       pid: 4321,
       agentId: 'codex',
       materializedRoot: '/managed/materialized/execution_run_one',
+      retentionPolicy: null,
     });
   });
 

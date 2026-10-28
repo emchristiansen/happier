@@ -41,6 +41,23 @@ Important:
 - npm installs expose the npm dist-tags (`@latest` and `@next`).
 - The rolling `dev` lane is installer-managed (`install-dev` / `hdev`), not a separate npm dist-tag.
 
+### Homebrew (coming soon)
+
+<Callout type="warn" title="Not published yet">
+The Homebrew formula is prepared but its tap is not public yet, so this command does not work
+today. Use the installer above until this notice is gone.
+</Callout>
+
+On macOS 13 (Ventura) or later and on Linux, the stable CLI will install from Happier's own tap:
+
+```bash
+brew install happier-dev/tap/happier
+```
+
+The formula installs the same signed release payload the installer does, into Homebrew's prefix,
+and links `happier` onto your `PATH`. It has no `brew services` entry: the background service is
+still set up by the CLI itself (`happier setup`, or `happier service install`).
+
 ## Updates
 
 How you update depends on how you installed the CLI:
@@ -48,6 +65,30 @@ How you update depends on how you installed the CLI:
 - **Installer install**: run the lane-specific command (`happier`, `hprev`, or `hdev`) with `self check` / `self update` (or rerun the matching installer endpoint). Installer installs keep the full CLI payload under `~/.happier/cli/current` and refresh the selected lane shim for you.
 - Stable is `~/.happier/cli/current`; preview/dev use `~/.happier/cli-preview/current` and `~/.happier/cli-dev/current`.
 - **npm install**: `npm install -g @happier-dev/cli@latest` (or `@next` for preview). npm does not currently expose a separate public `dev` dist-tag.
+- **Homebrew install** (once published): `brew upgrade happier`. `happier self update` recognises a Homebrew install and prints that command instead of replacing Homebrew's copy.
+
+### Using the desktop app with a CLI you installed yourself
+
+In the current development build (unreleased), when the desktop app sets up this computer and finds
+a `happier` it did not install (npm, Homebrew or a manual copy), it asks once, naming that CLI's
+version and path:
+
+- **Let Happier manage it** — the app installs its own CLI, puts it first on your `PATH` for new
+  terminals, and moves the background service to it. Your old copy is left in place; Settings ›
+  This computer › Command line shows the command that removes it (for example
+  `npm uninstall -g @happier-dev/cli` or `brew uninstall <formula>`). The app never runs it for you.
+- **Keep my own** — the app installs nothing and adds nothing to your `PATH`; the app, the
+  background service and your terminal all use your CLI. Updating it stays with you (for example
+  `npm install -g @happier-dev/cli@latest`). If it is too old for setup, the app says so and names
+  that command instead of replacing it.
+
+The answer applies to every Happier app on this computer. Change it any time in Settings › This
+computer › Command line. You are asked again only if the CLI you kept disappears or becomes too old
+for setup; if it disappears, the app asks before installing anything in its place.
+
+On Windows, a `happier` on the system-wide `Path` (for example from a machine-wide Node.js install)
+still runs first in new terminals after **Let Happier manage it**, because Windows puts the system
+`Path` ahead of yours. Remove that copy with the command Settings shows.
 
 The CLI can also show periodic update notices in TTY sessions; disable with:
 
@@ -57,19 +98,27 @@ HAPPIER_CLI_UPDATE_CHECK=0
 
 Full matrix (all apps/assets): [Updates](/releases/updates).
 
+## Set up a coding agent
+
+The upcoming 0.2 setup flow offers installable agents from Happier's catalog
+when none is available. Choose one or **Skip for now**. Skipping completes the
+machine connection, but a computer with no agent is not coding-ready. Installing
+an agent only makes its CLI available; complete that agent's own authentication
+separately before starting a session.
+
 ## Authenticate
 
 ```bash
 happier auth login
 ```
 
-`happier auth login` prints both web and mobile connection options (URLs).
-By default it prints a single QR code for the mobile deep link, plus the web URL as a fallback.
+`happier auth login` asks whether to approve with a web browser or the mobile app.
+The browser path prints its terminal-connect URL; the mobile path prints a QR code and deep link.
 When using self-hosted servers, run login against the correct server profile (see below).
 
 Recommended first-run flow:
 
-- Use the mobile app path first (QR/deep link) to sign in/create account and approve terminal connection.
+- Choose the approval method available on the device where you already use Happier.
 - If you already use Happier on another device, sign in with that same account.
 - If you open a terminal-connect link while logged out, Happier routes you through sign in and then returns you to terminal approval automatically.
 
@@ -141,15 +190,20 @@ treated as a rejected sign-in or a reason to sign in somewhere else.
 <Callout type="info">
   The current 0.2 checkout has the refreshed setup presentation; it is not part
   of the public 0.2.11 installer. Wide terminals place the planet beside the
-  setup choices, slowly growing and shrinking while you choose. Use the arrow
-  keys to select and Enter to continue; letter shortcuts remain available.
-  Narrow terminals use a compact text layout. On a capable terminal, set
-  `HAPPIER_NO_ANIMATION=1` to keep the branded output static. `NO_COLOR`
+  setup choices, drawn in Braille dots. It rises into view, turns briefly and
+  comes to rest, then keeps breathing slowly; once you move the selection it
+  dims so the choices lead. Terminals that report a light background through
+  `COLORFGBG` get the light planet. On Windows the planet needs a host that can
+  draw Braille characters, such as Windows Terminal; the legacy console uses the
+  compact text layout. Use the arrow keys to select and Enter to continue;
+  letter shortcuts remain available. Narrow terminals use a compact text layout.
+  On a capable terminal, set `HAPPIER_NO_ANIMATION=1` to keep the branded
+  output static. `NO_COLOR`
   disables colour, while `TERM=dumb` and non-interactive output suppress cursor
   animation and decorative art automatically.
 </Callout>
 
-On capable terminals, the corresponding installer introduces Happier with a static numeric planet
+On capable terminals, the corresponding installer introduces Happier with a static Braille planet
 and groups its work into Download, Verify, and Install. It retains detailed
 failure output and hands over to setup without repeating the welcome. Colours
 use your terminal's capabilities; its font and background remain yours.
@@ -323,9 +377,9 @@ Important notes:
 - tmux and other terminal-host attach flows work only for sessions that are still owned by the current machine.
 - You must target the same Happier account/server profile that owns the session.
 
-Attach strategy depends on the provider:
+Attach strategy depends on the provider and terminal host:
 
-- Some providers use Happier's `tmux`-backed attach flow.
+- Terminal-hosted sessions reconnect to their existing `tmux`, zellij, or Herdr terminal.
 - OpenCode uses a provider-native attach flow for server-backed sessions.
 
 For OpenCode, the supported reattach command is still `happier attach <session-id>`. Do not rely on a raw vendor `opencode attach ...` command as your normal Happier workflow.
@@ -333,14 +387,29 @@ For OpenCode, the supported reattach command is still `happier attach <session-i
 Supported attach styles include:
 
 - **tmux-backed sessions** on machines where tmux is enabled
+- **zellij- and Herdr-hosted sessions** on supported macOS and Linux machines
 - **Windows Terminal** or **Console** hosted sessions on Windows
 - **provider-native attach** for supported provider sessions such as OpenCode
 
 For the full workflow, see [Features → Attach to a running session](/sessions/attach-to-session).
 
-## Resume an inactive session
+In Happier CLI 0.2.16 and later, including stable releases, `happier herdr` opens Herdr from the terminal. Happier requires a stable Herdr release, version `0.9.2` or newer, for both the executable and the running server. If you are already inside a Herdr pane, use Herdr's pane controls instead of starting a nested client.
 
-If a Happier session is inactive but still vendor-resumable, you can resume it directly from the CLI.
+Herdr's saved Happier resume command retains the original local Happier home and relay profile. It also uses the session's release-channel command (`happier`, `hprev`, or `hdev`), rather than always invoking `happier`.
+
+`happier resume <session-id>` can reopen a preserved local Herdr pane after its controller has stopped, including after a Herdr restart. Opening the pane starts its saved resume command; it is not confirmation that the Happier session has reconnected. Live or unverified controllers keep the existing admission checks. A session resumed in a foreground shell is borrowed: stopping Happier preserves that pane rather than assuming its former ownership.
+
+If a shared controller survives the Herdr restart, attaching inside its restored
+pane can rebind a verified native client to that same conversation with managed
+status. **Detach terminal** then closes only the native client and preserves the
+restored shell and pane. The saved release-channel command must be available in
+the shell; otherwise invoke that CLI's `attach <session-id>` there yourself.
+
+Cold restoration verifies the original Herdr namespace before starting it; it never substitutes another server with the same name. If a stopped server uses a custom socket whose saved namespace cannot be located, reopen that original server and retry. Attachment to an already-running custom socket remains supported.
+
+## Continue a session
+
+`happier resume` attaches to a running, attachable session or resumes a stopped, vendor-resumable session.
 
 ### Interactive selector
 
@@ -348,7 +417,7 @@ If a Happier session is inactive but still vendor-resumable, you can resume it d
 happier resume
 ```
 
-In a supported TTY, Happier shows an interactive picker of resumable inactive sessions.
+In a supported TTY, Happier shows running sessions you can attach to and stopped sessions you can resume in one picker.
 
 ### Resume by id
 
@@ -361,8 +430,9 @@ You can use a full session id or an unambiguous prefix.
 Important behavior:
 
 - resume is strict: if the provider resume fails, Happier errors instead of starting a fresh session
-- archived or already-active sessions cannot be resumed
-- the command restores the session working directory before launching the provider again
+- active sessions use the existing attach flow; an attachment failure does not launch a second agent
+- archived sessions cannot be continued
+- for stopped sessions, the command restores the working directory before launching the agent again
 
 For the full user guide and the meaning of “resumable”, see [Features → Resume inactive sessions](/sessions/session-resume).
 
@@ -406,7 +476,8 @@ Optional targeting:
 happier session create --path /path/to/repo --backend <backend-target-key> --tag <tag>
 ```
 
-`--backend` expects a **backend target key** (not a short name). Common forms:
+`--backend` accepts a **backend target key**, or a built-in agent name such as
+`opencode` as shorthand for `agent:opencode`. Common forms:
 
 ```bash
 # Built-in catalog agent
@@ -447,7 +518,7 @@ happier session set-model <session-id> <model-id>
 happier session set-permission-mode <session-id> <mode>
 ```
 
-`<mode>` accepts common aliases (for example `ask`, `default`, `yolo`). Use `--json` to script and see the normalized `permissionMode` value.
+Prefer `read_only`, `default`, `auto`, or `yolo` for `<mode>`. Older aliases such as `read-only`, `safe-yolo`, `workspace_write`, `acceptEdits`, and `bypassPermissions` remain accepted. Use `--json` to script and see the compatible normalized `permissionMode` value.
 
 ### Session id prefixes
 
@@ -487,10 +558,14 @@ Execution runs are the structured “run” layer for multi-step flows in a sess
 
 ```bash
 happier session run list <session-id>
-happier session run start <session-id> --intent <intent> --backend <backend-target-key>
+happier session run start <session-id> --intent <intent> --backend <backend-target-key> --permission-mode auto
 happier session run send <session-id> <run-id> "message"
 happier session run stop <session-id> <run-id>
 ```
+
+Execution-run permission input uses the same preferred `read_only`, `default`,
+`auto`, and `yolo` vocabulary. Compatible responses and stored run state retain
+the established `read_only` / `workspace_write` wire projection.
 
 ## External MCP control surface
 

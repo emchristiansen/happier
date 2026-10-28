@@ -111,24 +111,17 @@ describe('pendingSetupIntent', () => {
         expect(getPendingSetupIntent()).toBeNull();
     });
 
-    it('round-trips a dismissed onboarding marker', async () => {
-        const { clearPendingSetupIntent, getPendingSetupIntent, setPendingSetupIntent } = await importFresh();
+    it('reads a marker persisted as dismissed by an older build as no intent at all', async () => {
+        // The phase was removed because nothing ever distinguished it from absence; a record an
+        // older build wrote must therefore read as absence rather than as an unknown state.
+        const { fromRecord } = await import('./pendingSetupIntent.shared');
 
-        await activateServerAccount('https://relay.example.test', 'account-a');
-        setPendingSetupIntent({
-            branch: 'thisComputer',
-            phase: 'dismissed',
-            relayUrl: 'https://relay.example.test/',
-        });
-
-        expect(getPendingSetupIntent()).toEqual({
+        expect(fromRecord({
             branch: 'thisComputer',
             phase: 'dismissed',
             relayUrl: 'https://relay.example.test',
-        });
-
-        clearPendingSetupIntent();
-        expect(getPendingSetupIntent()).toBeNull();
+            createdAtMs: Date.now(),
+        })).toBeNull();
     });
 
     it('round-trips a remote machine resume intent', async () => {

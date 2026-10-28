@@ -146,13 +146,14 @@ export const AgentActivityRow = React.memo((props: AgentActivityRowProps) => {
     );
 
     const accessibilityState = React.useMemo(() => ({
-        busy: status === 'running',
+        busy: entry.isActive !== false && status === 'running',
         ...(props.disclosure != null ? { expanded: props.disclosure === 'expanded' } : null),
-    }), [props.disclosure, status]);
+    }), [entry.isActive, props.disclosure, status]);
 
     const leftElement = (
         <AgentActivityStatusSlot
             status={status}
+            isActive={entry.isActive}
             size={AGENT_STATUS_GLYPH_PX[density]}
             // A stale row stops claiming liveness with everything it has, not just its clock: a
             // spinner turning next to a frozen number reads as a broken clock rather than as an
@@ -244,7 +245,7 @@ export const AgentActivityRow = React.memo((props: AgentActivityRowProps) => {
                 // clock carries its own name in the time slot instead.
                 accessibilityLabel={t('session.agentActivity.row.a11yLabel', {
                     title,
-                    status: resolveAgentActivityStatusWord(status),
+                    status: resolveAgentActivityStatusWord(status, entry.isActive),
                 })}
                 accessibilityState={accessibilityState}
                 density={props.density}

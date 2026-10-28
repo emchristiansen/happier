@@ -2,6 +2,7 @@ import chalk from 'chalk';
 
 import type { CommandContext } from '@/cli/commandRegistry';
 import { printJsonEnvelope, wantsJson } from '@/cli/output/jsonEnvelope';
+import { fail } from '@happier-dev/cli-common/output';
 
 function usage(): string {
   return [
@@ -45,7 +46,7 @@ export async function handlePluginsCompatibilityCliCommand(context: CommandConte
     return;
   }
 
-  console.error(chalk.red('Error:'), `Plugin command '${subcommand}' is not supported by this Happier version`);
+  console.error(fail(`Plugin command '${subcommand}' is not supported by this Happier version`));
   console.log(usage());
   process.exitCode = 1;
 }

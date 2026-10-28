@@ -4,6 +4,7 @@ import {
     normalizeOpenCodeServerBaseUrl,
     readOpenCodeSessionAffinityFromMetadata,
     normalizeOpenCodeBackendMode,
+    normalizeOpenCodeCliGeneration,
 } from '@happier-dev/agents';
 import { getActiveServerSnapshot } from '@/sync/domains/server/serverRuntime';
 import { resolveOpenCodeBrowseSourceOptions } from '@/agents/providers/opencode/directSessions/resolveOpenCodeBrowseSourceOptions';
@@ -41,6 +42,10 @@ function buildOpenCodeEnvironmentVariables(opts: {
     const backendMode = sessionAffinity.backendMode
         ?? normalizeOpenCodeBackendMode(opts.settings?.opencodeBackendMode);
     base.HAPPIER_OPENCODE_BACKEND_MODE = backendMode;
+    const cliGeneration = normalizeOpenCodeCliGeneration(opts.settings?.opencodeCliGeneration);
+    if (cliGeneration !== 'auto') {
+        base.HAPPIER_OPENCODE_CLI_GENERATION = cliGeneration;
+    }
 
     const sessionServerBaseUrl = sessionAffinity.serverBaseUrlExplicit ? sessionAffinity.serverBaseUrl : null;
     const targetServerId = typeof opts.newSessionOptions?.targetServerId === 'string'

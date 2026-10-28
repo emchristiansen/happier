@@ -1,10 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createStore } from 'zustand/vanilla';
+import { createSessionFixture } from '@/dev/testkit/fixtures/sessionFixtures';
 
 import { syncPerformanceTelemetry } from '@/sync/runtime/syncPerformanceTelemetry';
 import { createMessagesDomain } from './messages';
+import type { NormalizedMessage } from '../../typesRaw';
+import type { Message } from '@/sync/domains/messages/messageTypes';
 
 function createHarness(initial: any) {
-    let state: any = {
+    const state: any = {
         sessions: {},
         sessionListRenderables: {},
         sessionListViewData: null,
@@ -17,13 +21,10 @@ function createHarness(initial: any) {
         ...initial,
     };
 
-    const get = () => state;
-    const set = (updater: any) => {
-        const next = typeof updater === 'function' ? updater(state) : updater;
-        state = { ...state, ...next };
-    };
-
-    const domain = createMessagesDomain({ get, set } as any);
+    const store = createStore<typeof state>(() => state);
+    const get = store.getState;
+    const domain = createMessagesDomain({ get, set: store.setState });
+    store.setState({ ...domain, ...initial });
     return { get, domain };
 }
 
@@ -45,6 +46,80 @@ beforeEach(() => {
 });
 
 describe('messages domain: ordering', () => {
+    it('preserves an explicit no-thinking projection without rescanning historical messages on apply', () => {
+        const { get, domain } = createHarness({});
+        const history = Array.from({ length: 400 }, (_, index): NormalizedMessage => ({
+            id: `history-${index}`,
+            seq: index + 1,
+            localId: null,
+            createdAt: index + 1,
+            isSidechain: false,
+            role: 'agent',
+            content: [{ type: 'text', text: `history ${index}`, uuid: `history-${index}`, parentUUID: null }],
+        }));
+        domain.applyMessages('s1', history);
+        expect(get().sessionMessages.s1.latestThinkingMessageId).toBeNull();
+        let historicalVisits = 0;
+        const storedMessages: Record<string, Message> = get().sessionMessages.s1.messagesById;
+        for (const message of Object.values(storedMessages)) {
+            Object.defineProperty(message, 'transcriptObservationProvenance', {
+                configurable: true,
+                enumerable: true,
+                get() {
+                    historicalVisits += 1;
+                    return undefined;
+                },
+            });
+        }
+
+        domain.applyMessages('s1', [{
+            id: 'next', seq: 401, localId: null, createdAt: 401,
+            isSidechain: false, role: 'agent', content: [{ type: 'text', text: 'next', uuid: 'next', parentUUID: null }],
+        }]);
+
+        expect(get().sessionMessages.s1.latestThinkingMessageId).toBeNull();
+        expect(get().sessionMessages.s1.messageIdsOldestFirst).toHaveLength(401);
+        expect(historicalVisits).toBe(0);
+    });
+
+    it('recovers the thinking projection when a legacy stored entry omits it', () => {
+        const { get, domain } = createHarness({});
+        domain.applyMessages('s1', [{
+            id: 'thinking', seq: 1, localId: null, createdAt: 1, isSidechain: false,
+            role: 'agent', content: [{ type: 'thinking', thinking: 'working', uuid: 'thinking', parentUUID: null }],
+        }]);
+        const thinkingId: unknown = get().sessionMessages.s1.latestThinkingMessageId;
+        expect(typeof thinkingId).toBe('string');
+        delete get().sessionMessages.s1.latestThinkingMessageId;
+
+        domain.applyMessages('s1', [{
+            id: 'next', seq: 2, localId: null, createdAt: 2,
+            isSidechain: false, role: 'agent', content: [{ type: 'text', text: 'next', uuid: 'next', parentUUID: null }],
+        }]);
+
+        expect(get().sessionMessages.s1.latestThinkingMessageId).toBe(thinkingId);
+    });
+
+    it('projects deferred completed questions when paging reaches the beginning, even with no final rows', () => {
+        const session = createSessionFixture({
+            id: 's1', agentStateVersion: 1,
+            agentState: { completedRequests: { question: {
+                tool: 'AskUserQuestion', arguments: { questions: [] }, createdAt: 100,
+                completedAt: 200, status: 'approved', answers: { choice: 'yes' },
+            } } },
+        });
+        const { get, domain } = createHarness({ sessions: { s1: session } });
+        domain.applyMessages('s1', []);
+        expect(get().sessionMessages.s1.messageIdsOldestFirst).toEqual([]);
+        domain.markSessionMessagesHistoryStartLoaded('s1');
+        const entry = get().sessionMessages.s1;
+        expect(entry.messageIdsOldestFirst).toHaveLength(1);
+        expect(entry.messagesById[entry.messageIdsOldestFirst[0]]).toMatchObject({ tool: { result: { answers: { choice: 'yes' } } } });
+        const previous = get();
+        domain.markSessionMessagesHistoryStartLoaded('s1');
+        expect(get()).toBe(previous);
+    });
+
     it('keeps an already-loaded transcript entry referentially stable when marked loaded again', () => {
         const { get, domain } = createHarness({});
 

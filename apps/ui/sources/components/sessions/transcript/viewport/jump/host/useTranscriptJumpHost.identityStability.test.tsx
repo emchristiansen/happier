@@ -55,6 +55,7 @@ function createStableMembers() {
         executeViewportCommand: vi.fn(() => true),
         executeViewportCommandWithAnimation: vi.fn(() => true),
         hasMoreOlderRef: createRef<boolean | null>(true),
+        observeOlderLoadResult: () => {},
         handleNativeRestoreIndexFailure: vi.fn(() => false),
         invalidateViewportAnchorCapture: vi.fn(),
         itemsRef: createRef([]),

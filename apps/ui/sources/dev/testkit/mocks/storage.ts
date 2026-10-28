@@ -84,6 +84,7 @@ export function createStorageModuleStub<TOverrides extends object>(overrides: TO
     const allSessionListRenderables = [] as ReturnType<StorageModule['useAllSessionListRenderables']>;
     const allAttentionSessions = [] as ReturnType<StorageModule['useAllSessionsForAttention']>;
     const allAttentionSessionListRenderables = [] as ReturnType<StorageModule['useAllSessionListRenderablesForAttention']>;
+    const sessionListViewDataByServerId = {} as ReturnType<StorageModule['useSessionListViewDataByServerId']>;
     const sessionOrganizationProjection = {
         schemaVersion: null,
         version: null,
@@ -173,6 +174,7 @@ export function createStorageModuleStub<TOverrides extends object>(overrides: TO
             sessionRpcAvailable: false,
         }),
         useAllMachines: () => allMachines,
+        useFirstVisibleMachineId: () => null,
         useLaunchSelectionMachines: () => launchSelectionMachines,
         useMachineDisplayById: () => machineDisplayById,
         useMachineCliDetectionTarget: () => ({
@@ -180,9 +182,11 @@ export function createStorageModuleStub<TOverrides extends object>(overrides: TO
             isOnline: false,
         }),
         useAllSessions: () => allSessions,
+        useFriendRequestCount: () => 0,
         useAllSessionListRenderables: () => allSessionListRenderables,
         useAllSessionsForAttention: () => allAttentionSessions,
         useAllSessionListRenderablesForAttention: () => allAttentionSessionListRenderables,
+        useSessionListViewDataByServerId: () => sessionListViewDataByServerId,
         useSessionOrganizationProjection: () => sessionOrganizationProjection,
         useMachine: () => null,
         useIsDataReady: () => true,
@@ -306,6 +310,17 @@ export function createReactiveStorageStoreMock(
     return create<StorageState>()(() => snapshot);
 }
 
+/** Acquire the real store after a facade mock returns, avoiding a cyclic async mock factory. */
+export function createStorageStoreProxy(
+    readStore: () => UseBoundStore<StoreApi<StorageState>>,
+): UseBoundStore<StoreApi<StorageState>> {
+    // The callable and every store API delegate to the actual store at this test boundary.
+    const callable = ((...args: unknown[]) => Reflect.apply(readStore(), undefined, args)) as UseBoundStore<StoreApi<StorageState>>;
+    return new Proxy(callable, {
+        get: (_target, property) => Reflect.get(readStore(), property),
+    });
+}
+
 export function createStorageStoreStub(
     readState: () => Partial<StorageState>,
 ): UseBoundStore<StoreApi<StorageState>> {
@@ -332,6 +347,7 @@ function createStorageStateSnapshot(state: Partial<StorageState>): StorageState 
         sessions: {},
         sessionListRenderables: {},
         sessionMessages: {},
+        sessionLastViewed: {},
         profile: testkitProfileDefaults,
         machines: {},
         machineDisplayById: {},

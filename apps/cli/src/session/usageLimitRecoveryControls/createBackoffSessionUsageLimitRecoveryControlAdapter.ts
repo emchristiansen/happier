@@ -1,6 +1,7 @@
+import { buildUsageLimitIssueFingerprint } from '@happier-dev/protocol';
 import {
   SESSION_USAGE_LIMIT_RECOVERY_METADATA_KEY,
-  SessionUsageLimitRecoveryV1Schema,
+  readSessionUsageLimitRecoveryForIssue,
   type ConnectedServiceId,
   type SessionRuntimeIssueV1,
   type SessionUsageLimitRecoveryV1,
@@ -40,13 +41,21 @@ function readNonNegativeIntegerFromEnv(
   return Number.isFinite(parsed) && parsed >= 0 ? Math.trunc(parsed) : defaultValue;
 }
 
-function readRecoveryIntent(metadata: MetadataRecord): SessionUsageLimitRecoveryV1 | null {
-  const parsed = SessionUsageLimitRecoveryV1Schema.safeParse(metadata[SESSION_USAGE_LIMIT_RECOVERY_METADATA_KEY]);
-  return parsed.success ? parsed.data : null;
-}
-
 function isPendingRecoveryIntentStatus(status: SessionUsageLimitRecoveryV1['status']): boolean {
   return status === 'waiting' || status === 'armed' || status === 'checking';
+}
+
+function normalizePersistedNativeSelection(
+  intent: SessionUsageLimitRecoveryV1 | null,
+  issue: SessionRuntimeIssueV1 | null,
+  metadata: MetadataRecord,
+): SessionUsageLimitRecoveryV1 | null {
+  if (!intent || !issue || intent.runtimeAuthRecoveryAttemptId
+    || (!isPendingRecoveryIntentStatus(intent.status) && intent.status !== 'paused') || intent.selectedAuth.kind !== 'profile'
+    || intent.selectedAuth.profileId !== issue.usageLimit?.connectedService?.profileId) return intent;
+  const selection = resolveUsageLimitRecoverySelectedAuthFromIssue({ issue,
+    requiredConnectedServiceId: intent.selectedAuth.serviceId, connectedServices: metadata.connectedServices ?? null });
+  return selection?.kind === 'native' ? { ...intent, selectedAuth: selection } : intent;
 }
 
 /**
@@ -74,21 +83,6 @@ function readLatestUsageLimitIssue(input: Readonly<{
     return null;
   }
   return issue;
-}
-
-function buildUsageLimitIssueFingerprint(input: Readonly<{
-  issue: SessionRuntimeIssueV1;
-  providerId: string;
-}>): string {
-  return [
-    'usage-limit',
-    input.issue.provider ?? input.providerId,
-    input.issue.providerTurnId ?? 'unknown-turn',
-    String(input.issue.occurredAt),
-    input.issue.usageLimit?.resetAtMs === null || input.issue.usageLimit?.resetAtMs === undefined
-      ? 'no-reset'
-      : String(input.issue.usageLimit.resetAtMs),
-  ].join(':');
 }
 
 function resolveFallbackNextCheckAtMs(params: Readonly<{
@@ -134,6 +128,7 @@ function buildRecoveryIntentFromLatestUsageLimitIssue(params: Readonly<{
   maxAttempts: number;
   nowMs: number;
   resumePromptMode?: 'standard' | 'off' | 'custom';
+  connectedServices?: unknown;
 }>): SessionUsageLimitRecoveryV1 {
   const usageLimit = params.issue.usageLimit;
   const timing = usageLimit
@@ -146,10 +141,7 @@ function buildRecoveryIntentFromLatestUsageLimitIssue(params: Readonly<{
   const intent: SessionUsageLimitRecoveryV1 = {
     v: 1,
     status: 'waiting',
-    issueFingerprint: buildUsageLimitIssueFingerprint({
-      issue: params.issue,
-      providerId: params.providerId,
-    }),
+    issueFingerprint: buildUsageLimitIssueFingerprint(params.issue, params.providerId),
     armedAtMs: params.issue.occurredAt,
     resetAtMs: timing.resetAtMs,
     nextCheckAtMs: timing.nextCheckAtMs,
@@ -160,6 +152,7 @@ function buildRecoveryIntentFromLatestUsageLimitIssue(params: Readonly<{
     selectedAuth: resolveUsageLimitRecoverySelectedAuthFromIssue({
       issue: params.issue,
       defaultNativeServiceId: params.defaultNativeServiceId,
+      connectedServices: params.connectedServices ?? null,
     }) ?? { kind: 'native' },
   };
 
@@ -230,8 +223,8 @@ export function createBackoffSessionUsageLimitRecoveryControlAdapter(options: Re
   providerId: string;
   fallbackBackoffEnvKey: string;
   maxAttemptsEnvKey: string;
-  defaultFallbackBackoffMs: number;
-  defaultMaxAttempts: number;
+  defaultFallbackBackoffMs?: number;
+  defaultMaxAttempts?: number;
   defaultNativeServiceId?: ConnectedServiceId | null;
   issueProviderFilter?: string | null;
   nowMs?: () => number;
@@ -248,7 +241,9 @@ export function createBackoffSessionUsageLimitRecoveryControlAdapter(options: Re
         providerId: options.providerId,
         issueProviderFilter: options.issueProviderFilter ?? null,
       });
-      const persistedIntent = readRecoveryIntent(params.metadata);
+      const persistedIntent = normalizePersistedNativeSelection(readSessionUsageLimitRecoveryForIssue(
+        params.metadata[SESSION_USAGE_LIMIT_RECOVERY_METADATA_KEY], latestIssue, options.providerId,
+      ), latestIssue, params.metadata);
       if (isPersistedIntentSupersededByTurnCompletion({
         intent: persistedIntent,
         latestTurnStatus: params.rawSession.latestTurnStatus,
@@ -269,7 +264,7 @@ export function createBackoffSessionUsageLimitRecoveryControlAdapter(options: Re
       const fallbackBackoffMs = readNonNegativeIntegerFromEnv(
         processEnv,
         options.fallbackBackoffEnvKey,
-        options.defaultFallbackBackoffMs,
+        options.defaultFallbackBackoffMs ?? 600_000,
       );
       const intent = persistedIntent && persistedIntent.status !== 'cancelled'
         ? persistedIntent
@@ -282,10 +277,11 @@ export function createBackoffSessionUsageLimitRecoveryControlAdapter(options: Re
             maxAttempts: readNonNegativeIntegerFromEnv(
               processEnv,
               options.maxAttemptsEnvKey,
-              options.defaultMaxAttempts,
+              options.defaultMaxAttempts ?? 3,
             ),
             nowMs: now,
             resumePromptMode: params.resumePromptMode,
+            connectedServices: params.metadata.connectedServices ?? null,
           })
           : null;
       if (!intent) {

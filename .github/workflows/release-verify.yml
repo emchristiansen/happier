@@ -136,6 +136,20 @@ jobs:
         with:
           node-version: 22.x
 
+      - name: Enable trusted control Yarn
+        working-directory: .release-control
+        run: bash scripts/ci/corepack-prepare-yarn-with-retry.sh
+
+      - name: Install trusted verification dependencies
+        working-directory: .release-control
+        env:
+          YARN_PRODUCTION: 'false'
+          npm_config_production: 'false'
+          HAPPIER_INSTALL_SCOPE: protocol,agents,release-runtime,cli-common
+          HAPPIER_UI_VENDOR_WEB_ASSETS: '0'
+          ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+        run: bash scripts/ci/yarn-install-with-retry.sh --frozen-lockfile --ignore-engines --network-timeout 600000 --prefer-offline --non-interactive
+
       - name: Install minisign from trusted control bytes
         uses: ./.release-control/.github/actions/bootstrap-minisign
 
@@ -265,6 +279,7 @@ jobs:
     with:
       select_jobs_explicitly: true
       run_ui: false
+      run_shared_packages: false
       run_server: false
       run_cli: false
       run_stack: false
@@ -280,6 +295,7 @@ jobs:
       installers_source: ${{ inputs.candidate_cli_version != '' && 'published-tag' || 'published-channel' }}
       installers_ref: ${{ inputs.candidate_cli_version != '' && format('cli-v{0}', inputs.candidate_cli_version) || '' }}
       run_binary_smoke: ${{ fromJSON(needs.resolve_validation_profile.outputs.run_binary_smoke) }}
+      run_build_smoke: false
       run_cli_update_continuity: ${{ fromJSON(needs.resolve_validation_profile.outputs.run_cli_update_continuity) }}
       cli_update_to_source: ${{ inputs.candidate_cli_version != '' && 'published-tag' || 'local-build' }}
       cli_update_to_ref: ${{ inputs.candidate_cli_version != '' && format('cli-v{0}', inputs.candidate_cli_version) || '.' }}

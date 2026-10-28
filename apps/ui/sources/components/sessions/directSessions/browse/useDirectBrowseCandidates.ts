@@ -73,6 +73,7 @@ export function useDirectBrowseCandidates(params: Readonly<{
     const [loadingMore, setLoadingMore] = React.useState(false);
     const [searchAugmenting, setSearchAugmenting] = React.useState(false);
     const [error, setError] = React.useState<string | null>(null);
+    const [canDeleteCandidates, setCanDeleteCandidates] = React.useState(false);
 
     const loadGenerationRef = React.useRef(0);
 
@@ -118,6 +119,7 @@ export function useDirectBrowseCandidates(params: Readonly<{
                 if (!append) {
                     setCandidates([]);
                     setNextCursor(null);
+                    setCanDeleteCandidates(false);
                 }
                 return false;
             }
@@ -140,6 +142,7 @@ export function useDirectBrowseCandidates(params: Readonly<{
             } else {
                 setNextCursor(result.nextCursor ?? null);
             }
+            setCanDeleteCandidates(result.capabilities?.deleteCandidate === true);
             setError(null);
             return true;
         };
@@ -176,6 +179,7 @@ export function useDirectBrowseCandidates(params: Readonly<{
             if (!append) {
                 setCandidates([]);
                 setNextCursor(null);
+                setCanDeleteCandidates(false);
             }
         } finally {
             if (loadGenerationRef.current === currentGeneration) {
@@ -198,6 +202,10 @@ export function useDirectBrowseCandidates(params: Readonly<{
         await loadCandidates({ cursor: nextCursor, append: true });
     }, [loadCandidates, loadingMore, nextCursor]);
 
+    const removeCandidate = React.useCallback((remoteSessionId: string) => {
+        setCandidates((current) => current.filter((candidate) => candidate.remoteSessionId !== remoteSessionId));
+    }, []);
+
     return {
         candidates,
         nextCursor,
@@ -205,6 +213,8 @@ export function useDirectBrowseCandidates(params: Readonly<{
         loadingMore,
         searchAugmenting,
         error,
+        canDeleteCandidates,
         loadMore,
+        removeCandidate,
     } as const;
 }

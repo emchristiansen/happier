@@ -172,9 +172,6 @@ vi.mock('@/sync/domains/server/serverProfiles', () => ({
     getActiveServerId: () => 'server-a',
 }));
 
-vi.mock('@/sync/domains/settings/terminalSettings', () => {
-    return { resolveTerminalSpawnOptions: () => ({}) };
-});
 vi.mock('@/sync/domains/session/spawn/windowsRemoteSessionLaunchMode', () => ({
     readMachineWindowsRemoteSessionLaunchMode: () => undefined,
     resolveEffectiveWindowsRemoteSessionLaunchMode: () => ({ mode: 'visible' }),

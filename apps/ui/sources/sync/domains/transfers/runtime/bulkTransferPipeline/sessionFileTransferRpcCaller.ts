@@ -66,10 +66,7 @@ export function createSessionFileTransferRpcCaller(params: Readonly<{
         ): Promise<TResponse> => {
             const machineTarget = readMachineControlTargetForSession(params.sessionId);
             const serverId = resolvePreferredServerIdForSessionId(params.sessionId);
-            const serverFeatures = await getReadyServerFeatures({
-                timeoutMs: 500,
-                serverId,
-            });
+            const serverFeatures = await getReadyServerFeatures({ serverId });
             const sessionRpcAvailable = canUseSessionRpc(params.sessionId);
 
             const preferredRoute = resolveSessionFileTransferRouteAvailability({

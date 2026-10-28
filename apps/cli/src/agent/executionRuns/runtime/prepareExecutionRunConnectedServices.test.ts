@@ -648,6 +648,33 @@ describe('prepareExecutionRunConnectedServices', () => {
     expect(materializeInput.connectedServicesBindingsRaw).toEqual(mergedSelection);
   });
 
+  it('treats canonical null as an explicit native opt-out without resolving account defaults', async () => {
+    const resolveSessionSpawnDefaults = vi.fn(async () => ({
+      connectedServices: {
+        v: 1 as const,
+        bindingsByServiceId: {
+          'openai-codex': { source: 'connected' as const, selection: 'profile' as const, profileId: 'team' },
+        },
+      },
+    }));
+    const materializeViaDaemon = vi.fn();
+
+    const prepared = await prepareExecutionRunConnectedServices({
+      backendTarget: { kind: 'builtInAgent', agentId: 'pi' },
+      connectedServices: null,
+      credentials: CREDENTIALS,
+      cwd: '/tmp/workspace',
+      sessionId: 'session-1',
+      materializeViaDaemon,
+      releaseViaDaemon: vi.fn(async () => true),
+      resolveSessionSpawnDefaults,
+    });
+
+    expect(prepared).toBeNull();
+    expect(resolveSessionSpawnDefaults).not.toHaveBeenCalled();
+    expect(materializeViaDaemon).not.toHaveBeenCalled();
+  });
+
   it('RO-F5: fails closed (typed) when a bare default token has no stored connected default', async () => {
     const materialize = vi.fn(async (input: unknown) => materialized(input, { CODEX_HOME: '/x' }));
     await expect(

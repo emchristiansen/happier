@@ -1,3 +1,4 @@
+import { isSessionOwnedActivityUnobserved } from '../attention/deriveSessionRuntimePresentationState';
 import {
     isTerminalAgentActivityStatus,
     type SessionAgentActivityHeadlineV1,
@@ -20,10 +21,8 @@ import type {
  *
  * Four invariants, each of which has a way of failing quietly:
  *
- * - **INV-1** the headline owns EXISTENCE and STATUS. A local source may add detail — the activity
- *   preview, the sidechain, the terminal instant — and may not overrule what state the work is in.
- *   Disagreement is counted, never reconciled: silently averaging two authorities is how a roster
- *   ends up telling two stories on two surfaces. One bounded exception, at `resolveMergedStatus`.
+ * - **INV-1** the headline owns existence and published status. Newer explicit local completion
+ *   reconciles older nonterminal claims, and runtime loss changes observation to unknown.
  * - **INV-2** neither side is dropped. Local-without-headline renders (the headline lags, or the
  *   backend publishes none at all); headline-without-local renders with `detailState: 'unloaded'`
  *   (the transcript page holding it has not arrived — the exact case R-3 exists for).
@@ -71,26 +70,27 @@ function isDevBuild(): boolean {
     return typeof __DEV__ !== 'undefined' && __DEV__;
 }
 
-/**
- * The status a joined entry ends up with.
- *
- * INV-1 with ONE narrow exception, and the exception is not a softening of the rule — it is the rule
- * applied to a fact the headline structurally cannot hold. `waiting` is not a lifecycle state the CLI
- * competes for; it is the local observation that a permission prompt is on screen and a PERSON is the
- * blocker. The CLI never sees that prompt, so it publishes `running`, and deferring to it would leave
- * the one status that escalates unable to escalate — the composer would never fill for the case
- * R-7 exists for.
- *
- * It is bounded on both sides: only `waiting` may win, and only over a non-terminal headline status.
- * A finished agent is not waiting on anybody, and painting it as attention would send a person to a
- * row they cannot act on.
- */
 function resolveMergedStatus(
-    headlineStatus: AgentActivityEntry['status'],
-    localStatus: AgentActivityEntry['status'],
+    headline: AgentActivityHeadlineEntry,
+    local: AgentActivityLocalEntry,
 ): AgentActivityEntry['status'] {
-    if (localStatus === 'waiting' && !isTerminalAgentActivityStatus(headlineStatus)) return 'waiting';
-    return headlineStatus;
+    if (!isTerminalAgentActivityStatus(headline.status)) {
+        if (isTerminalAgentActivityStatus(local.status) && local.endedAtMs != null
+            && local.endedAtMs >= (headline.updatedAtMs ?? 0)) return local.status;
+        if (local.status === 'waiting') return 'waiting';
+    }
+    return headline.status;
+}
+
+/** Independently owned execution runs retain their own status authority. */
+export function reconcileAgentActivityEntryObservation(
+    entry: AgentActivityEntry,
+    runtimeLostSinceMs: number | null | undefined,
+): AgentActivityEntry {
+    if (entry.kind === 'execution_run' || isTerminalAgentActivityStatus(entry.status)
+        || entry.status === 'unknown'
+        || !isSessionOwnedActivityUnobserved(runtimeLostSinceMs, entry.updatedAtMs)) return entry;
+    return { ...entry, status: 'unknown' };
 }
 
 function mergeEvidenceInstant(
@@ -131,6 +131,7 @@ function toLocalOnlyEntry(entry: AgentActivityLocalEntry): AgentActivityEntry {
         id: entry.id,
         kind: entry.kind,
         status: entry.status,
+        ...(entry.isActive !== undefined ? { isActive: entry.isActive } : {}),
         title: entry.title,
         metaDetail: entry.metaDetail ?? null,
         startedAtMs: entry.startedAtMs ?? null,
@@ -156,7 +157,8 @@ function toMergedEntry(
         // source that surface happened to see first.
         id: headline.id,
         kind: headline.kind,
-        status: resolveMergedStatus(headline.status, local.status),
+        status: resolveMergedStatus(headline, local),
+        ...(local.isActive !== undefined ? { isActive: local.isActive } : {}),
         // The local title is the live one — it tracks the tool call as it is edited and is not
         // clamped by the headline's transport bound — so it wins when it says something.
         title: local.title.trim().length > 0 ? local.title : headline.title,
@@ -179,6 +181,7 @@ export function deriveAgentActivityEntries(params: Readonly<{
     /** The older count-only key, used only when the unified one is absent (PLAN §5.2). */
     workflowHeadline?: SessionWorkflowActivityHeadlineV1 | null;
     local: readonly AgentActivityLocalEntry[];
+    runtimeLostSinceMs?: number | null;
 }>): AgentActivityMergeResult {
     // Exactly one headline source. Both are projected from the SAME committed run snapshots, so
     // reading both would list every run twice.
@@ -221,7 +224,7 @@ export function deriveAgentActivityEntries(params: Readonly<{
         // Counted only when the headline actually overruled the local source. The `waiting` overlay
         // above is a designed resolution, not a producer bug, and folding it in here would bury the
         // signal this diagnostic exists to surface.
-        if (match.status !== local.status && resolveMergedStatus(match.status, local.status) === match.status) {
+        if (match.status !== local.status && resolveMergedStatus(match, local) === match.status) {
             statusDivergenceCount += 1;
             if (collectDivergences) {
                 divergences.push({
@@ -240,7 +243,7 @@ export function deriveAgentActivityEntries(params: Readonly<{
     }
 
     return {
-        entries,
+        entries: entries.map((entry) => reconcileAgentActivityEntryObservation(entry, params.runtimeLostSinceMs)),
         headlineSource,
         diagnostics: {
             statusDivergenceCount,
@@ -275,6 +278,7 @@ export function toAgentActivityCountable(entry: AgentActivityEntry): AgentActivi
                 ? 'backgroundTask'
                 : 'subagent',
         status: entry.status,
+        ...(entry.isActive !== undefined ? { isActive: entry.isActive } : {}),
         parentId: entry.parentId ?? null,
         runId: entry.runId ?? null,
         liveAgentComplement: entry.liveAgentComplement ?? null,

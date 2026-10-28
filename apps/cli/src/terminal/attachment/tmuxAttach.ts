@@ -1,12 +1,12 @@
 import { spawn } from 'node:child_process';
 
-import chalk from 'chalk';
 
 import { isTmuxAvailable, normalizeExitCode } from '@/integrations/tmux';
 
 import { createTerminalAttachPlan } from './terminalAttachPlan';
 import { createTmuxSingleWindowAttachPlan } from './tmuxSingleWindowAttachPlan';
 import type { TerminalAttachmentInfo } from './terminalAttachmentInfo';
+import { fail } from '@happier-dev/cli-common/output';
 
 function spawnTmux(params: {
   args: string[];
@@ -41,7 +41,7 @@ export async function runTmuxAttach(params: {
 }>): Promise<number> {
   const isTmuxAvailableFn = deps?.isTmuxAvailableFn ?? isTmuxAvailable;
   if (!(await isTmuxAvailableFn())) {
-    console.error(chalk.red('Error:'), 'tmux is not available on this machine.');
+    console.error(fail('tmux is not available on this machine.'));
     return 1;
   }
 
@@ -58,11 +58,11 @@ export async function runTmuxAttach(params: {
   });
 
   if (plan.type === 'not-attachable') {
-    console.error(chalk.red('Error:'), plan.reason);
+    console.error(fail(plan.reason));
     return 1;
   }
   if (plan.type !== 'tmux') {
-    console.error(chalk.red('Error:'), 'Session does not use tmux attach.');
+    console.error(fail('Session does not use tmux attach.'));
     return 1;
   }
 
@@ -80,7 +80,7 @@ export async function runTmuxAttach(params: {
   });
 
   if (selectExit !== 0) {
-    console.error(chalk.red('Error:'), `Failed to select tmux window (${plan.target}).`);
+    console.error(fail(`Failed to select tmux window (${plan.target}).`));
     return selectExit;
   }
 

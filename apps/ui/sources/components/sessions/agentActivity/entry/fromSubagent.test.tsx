@@ -2,6 +2,10 @@ import * as React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { renderScreen } from '@/dev/testkit';
+import { ExecutionRunPublicStateSchema } from '@happier-dev/protocol';
+import { ExecutionRunRow } from '@/components/sessions/runs/ExecutionRunRow';
+import { SessionExecutionRunInfoCard } from '@/components/sessions/runs/details/SessionExecutionRunInfoCard';
+import { t } from '@/text';
 import type { SessionSubagent } from '@/sync/domains/session/subagents/types';
 
 vi.mock('react-native', async () => {
@@ -22,8 +26,99 @@ import type { Message, ToolCallMessage } from '@/sync/domains/messages/messageTy
 import { deriveExecutionRunSubagents } from '@/sync/domains/session/subagents/executionRuns/deriveExecutionRunSubagents';
 
 import { resolveAgentActivityEntryFromSubagent } from './fromSubagent';
+import { deriveAgentActivityEntries, toAgentActivityCountable } from '@/sync/domains/session/agentActivity/deriveAgentActivityEntries';
+import { deriveAgentActivityCounts } from '@/sync/domains/session/agentActivity/deriveAgentActivityCounts';
+import { toLocalAgentActivityEntry } from '@/sync/domains/session/agentActivity/sources/fromSessionSubagents';
+import { buildAgentActivitySectionModel } from '../list/agentActivitySectionModel';
 
 const STARTED_AT = Date.parse('2026-05-12T00:00:00.000Z');
+
+describe('retained execution-run current work', () => {
+    it('keeps idle handles sendable while only the busy sibling counts and spins, then reopens work on send', async () => {
+        const messages: readonly ToolCallMessage[] = ['idle', 'busy'].map((runId) => ({
+            kind: 'tool-call', id: `message-${runId}`, localId: null, createdAt: STARTED_AT,
+            tool: {
+                id: `tool-${runId}`, name: 'SubAgentRun', state: 'completed',
+                input: { runId, intent: 'delegate', runClass: 'long_lived', ioMode: 'streaming' },
+                result: { runId, status: 'succeeded' },
+                createdAt: STARTED_AT, startedAt: STARTED_AT, completedAt: STARTED_AT + 1_000,
+                description: null,
+            }, children: [],
+        }));
+        const project = (turnInFlight: boolean) => {
+            const subagents = deriveExecutionRunSubagents({ messages, activeExecutionRuns: [
+                { runId: 'idle', status: 'running', runClass: 'long_lived', turnInFlight },
+                { runId: 'busy', status: 'running', runClass: 'long_lived', turnInFlight: true },
+            ] });
+            const rows = subagents.map((subagent) => resolveAgentActivityEntryFromSubagent({ subagent }));
+            const merged = deriveAgentActivityEntries({ headline: null, local: subagents.map((subagent, i) =>
+                toLocalAgentActivityEntry({ subagent, projection: rows[i]! })) });
+            return { subagents, rows, counts: deriveAgentActivityCounts(merged.entries.map(toAgentActivityCountable)) };
+        };
+        const idle = project(false);
+        expect(idle.subagents[0]).toMatchObject({ status: 'running', isActive: false, capabilities: { canSend: true, canStop: true } });
+        expect(idle.counts.live).toBe(1);
+        expect(buildAgentActivitySectionModel({ entries: idle.rows }).sections.map((section) => [section.id, section.entries.map((row) => row.id)]))
+            .toEqual([['working', ['execution_run:busy']], ['idle', ['execution_run:idle']]]);
+
+        const { AgentActivityRow } = await import('../row/AgentActivityRow');
+        const { ActivitySpinner } = await import('@/components/ui/feedback/ActivitySpinner');
+        const screen = await renderScreen(<AgentActivityRow entry={idle.rows[0]!} onPress={() => {}} testID="idle-row" />);
+        expect(screen.findAllHostsByTestId('idle-row').some((host) => host.props.accessibilityState?.busy === false)).toBe(true);
+        expect(screen.findAllHostsByTestId('idle-row:elapsed')).toHaveLength(0);
+        expect(screen.tree.findAllByType(ActivitySpinner)).toHaveLength(0);
+
+        expect(project(true).counts.live).toBe(2);
+        expect(project(false).counts.live).toBe(1);
+    });
+
+    it('keeps permission attention separate from idle work counts and still counts a failed run', () => {
+        const failedMessage: ToolCallMessage = {
+            kind: 'tool-call', id: 'failed-message', localId: null, createdAt: STARTED_AT,
+            tool: {
+                id: 'failed-tool', name: 'SubAgentRun', state: 'completed',
+                input: { runId: 'failed', intent: 'delegate', runClass: 'long_lived', ioMode: 'streaming' },
+                result: { runId: 'failed', status: 'failed' },
+                createdAt: STARTED_AT, startedAt: STARTED_AT, completedAt: STARTED_AT + 1_000,
+                description: null,
+            }, children: [],
+        };
+        const subagents = deriveExecutionRunSubagents({ messages: [failedMessage], activeExecutionRuns: [
+            { runId: 'idle', status: 'running', runClass: 'long_lived', turnInFlight: false },
+            { runId: 'busy', status: 'running', runClass: 'long_lived', turnInFlight: true },
+        ] });
+        const local = subagents.map((subagent) => toLocalAgentActivityEntry({
+            subagent,
+            projection: resolveAgentActivityEntryFromSubagent({
+                subagent, hasPendingPermission: subagent.runRef?.runId === 'idle',
+            }),
+        }));
+        expect(local.find((entry) => entry.runId === 'idle')).toMatchObject({ status: 'waiting', isActive: false });
+        const merged = deriveAgentActivityEntries({ headline: null, local });
+        expect(deriveAgentActivityCounts(merged.entries.map(toAgentActivityCountable))).toMatchObject({ live: 1, failed: 1 });
+    });
+
+    it('keeps missing turn evidence conservative and bounded runs active even when false is supplied', () => {
+        const subagents = deriveExecutionRunSubagents({ messages: [], activeExecutionRuns: [
+            { runId: 'legacy', status: 'running', runClass: 'long_lived' },
+            { runId: 'bounded', status: 'running', runClass: 'bounded', turnInFlight: false },
+        ] });
+        expect(subagents.map((subagent) => subagent.isActive)).toEqual([true, true]);
+    });
+
+    it('shows idle current work in the direct run row and run details', async () => {
+        const run = ExecutionRunPublicStateSchema.parse({
+            runId: 'idle', callId: 'call-idle', sidechainId: 'sidechain-idle', intent: 'delegate',
+            backendTarget: { kind: 'builtInAgent', agentId: 'codex' }, permissionMode: 'default',
+            retentionPolicy: 'ephemeral', runClass: 'long_lived', ioMode: 'streaming', status: 'running',
+            turnInFlight: false, startedAtMs: STARTED_AT,
+        });
+        const row = await renderScreen(<ExecutionRunRow run={run} />);
+        const card = await renderScreen(<SessionExecutionRunInfoCard run={run} />);
+        expect(JSON.stringify(row.tree.toJSON())).toContain(t('diagnosis.machineRuns.idle'));
+        expect(JSON.stringify(card.tree.toJSON())).toContain(t('diagnosis.machineRuns.idle'));
+    });
+});
 
 function makeSubagent(overrides: Partial<SessionSubagent> = {}): SessionSubagent {
     return {

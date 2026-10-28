@@ -5,6 +5,7 @@
  * Handles tool permission requests, responses, and state management.
  */
 
+import { isExecutionRunPermissionRequestId } from '@/agent/executionRuns/runtime/runScopedExecutionPermissionHandler';
 import { isDeepStrictEqual } from 'node:util';
 import { logger } from "@/lib";
 import type { SDKAssistantMessage, SDKMessage, SDKUserMessage } from "../sdk";
@@ -27,11 +28,12 @@ import { cloneStringKeyedRecordToNullProto } from '@/api/session/agentStateRecor
 import type { Metadata } from '@/api/types';
 import { resolveAgentRequestKind } from '@/agent/permissions/requestKind';
 import { isToolAllowedForSession } from '@/agent/permissions/permissionToolIdentifier';
-import { shouldSuppressProviderPermissionForHappierApproval } from '@/agent/tools/happierTools/resolveHappierActionForMcpToolName';
+import {
+    isSafeFirstPartyHappierActionToolCall,
+} from '@/agent/tools/happierTools/resolveHappierActionForMcpToolName';
 import { applyAllowedToolsToAllowlist, applyUpdatedPermissionsToAllowlist, seedAllowlistFromCompletedRequests } from '@/agent/permissions/applyPermissionAllowlistUpdates';
 import {
     AgentStateRequestStore,
-    hasPermissionResponseClaimV1,
     type AgentStateOutstandingRequest,
 } from '@/agent/permissions/agentStateRequestStore';
 import {
@@ -316,7 +318,7 @@ export class PermissionHandler {
         this.applyPermissionResponse({ id: toolCallId, approved: true, structuredAnswersV1: opts?.answers });
     }
 
-    private tryHandlePermissionRpc(message: PermissionResponse): boolean {
+    private async tryHandlePermissionRpc(message: PermissionResponse): Promise<boolean> {
         const id = typeof message?.id === 'string' ? message.id : '';
         if (!id) {
             return false;
@@ -344,7 +346,13 @@ export class PermissionHandler {
                 })
                 : undefined;
 
-        this.applyPermissionResponse({ ...message, ...(structuredAnswersV1 ? { structuredAnswersV1 } : {}) }, context);
+        const response = { ...message, ...(structuredAnswersV1 ? { structuredAnswersV1 } : {}) };
+        const completed = await this.permissionCoordinator.completeRpcResponse({
+            context,
+            completion: this.buildPermissionCompletion(response, context),
+            onAdmitted: () => this.recordPermissionResponse(response, context),
+        });
+        if (!completed) return false;
         return true;
     }
 
@@ -371,7 +379,6 @@ export class PermissionHandler {
                 }),
             }),
             completeRequest: (params) => this.agentStateRequestStore.completeRequest(params),
-            cancelAllRequests: (params) => this.cancelRemoteOutstandingRequests(params.reason),
             hasOutstandingRequest: (requestId) => this.readOutstandingRemoteRequest(requestId) !== null,
             isOutstandingRequestClaimed: (requestId) => {
                 const rawRequest = (this.session.client as any).getAgentStateSnapshot?.()?.requests?.[requestId] ?? null;
@@ -384,6 +391,7 @@ export class PermissionHandler {
 
     private readOutstandingRemoteRequest(id: string): AgentStateOutstandingRequest | null {
         try {
+            if (isExecutionRunPermissionRequestId(id)) return null;
             const outstanding = this.agentStateRequestStore.readOutstandingRequest(id);
             if (!outstanding) return null;
             const snapshot = (this.session.client as any).getAgentStateSnapshot?.() ?? null;
@@ -393,38 +401,6 @@ export class PermissionHandler {
         } catch {
             return null;
         }
-    }
-
-    private cancelRemoteOutstandingRequests(reason: string): void {
-        updateAgentStateBestEffort(
-            this.session.client,
-            (currentState) => {
-                const requests = cloneStringKeyedRecordToNullProto(currentState.requests);
-                const completedRequests = cloneStringKeyedRecordToNullProto(currentState.completedRequests);
-                const now = Date.now();
-
-                for (const [id, request] of Object.entries(requests)) {
-                    if (isRequestOwnedOutsideRemotePermissionHandler(request)) continue;
-                    if (hasPermissionResponseClaimV1(request)) continue;
-                    delete requests[id];
-                    const completedEntry = { ...(request && typeof request === 'object' ? request : {}) } as Record<string, unknown>;
-                    completedEntry.completedAt = now;
-                    completedEntry.status = 'canceled';
-                    completedEntry.reason = reason;
-                    completedEntry.decision = 'abort';
-                    completedRequests[id] = completedEntry as never;
-                    this.agentStateRequestStore.markPermissionRequestCompletedBestEffort(id);
-                }
-
-                return {
-                    ...currentState,
-                    requests,
-                    completedRequests,
-                };
-            },
-            '[Claude]',
-            'cancel_remote_permission_requests',
-        );
     }
 
     private applyPermissionResponseSideEffects(params: {
@@ -477,10 +453,16 @@ export class PermissionHandler {
 
         const completion = this.buildPermissionCompletion(message, context);
 
-        if (!this.permissionCoordinator.completeResponse({ context, completion })) {
-            logger.debug('[Claude] Permission response did not complete an outstanding request');
-            return;
-        }
+        this.permissionCoordinator.completeResponse({
+            context,
+            completion,
+            onAdmitted: () => this.recordPermissionResponse(message, context),
+        });
+    }
+
+
+    private recordPermissionResponse(message: PermissionResponse, context: PermissionRequestCoordinatorContext): void {
+        const id = message.id;
 
         if (this.isToolTraceEnabled()) {
             recordToolTraceEvent({
@@ -700,12 +682,7 @@ export class PermissionHandler {
 
         if (
             !isInteractiveTool(toolName)
-            && shouldSuppressProviderPermissionForHappierApproval({
-                toolName,
-                input: rewrittenInput,
-                accountSettings: this.session.accountSettings ?? null,
-                surface: 'session_agent',
-            }).suppress
+            && isSafeFirstPartyHappierActionToolCall({ toolName, input: rewrittenInput })
         ) {
             return { behavior: 'allow', updatedInput: rewrittenInput as Record<string, unknown> };
         }
@@ -969,8 +946,28 @@ export class PermissionHandler {
             decision?: 'abort';
         },
     ): void {
-        this.pendingRequestMetadata.clear();
-        this.permissionCoordinator.cancelAll(reason);
+        const pendingSnapshot = [...this.pendingRequestMetadata.entries()];
+        // Resumed Agent-state requests have no coordinator waiter. Retire that
+        // source-owned subset through the same exact, durable settlement owner.
+        const requests = this.session.client.getAgentStateSnapshot?.()?.requests ?? {};
+        const stateOnlyRequestIds = Object.keys(requests).filter((requestId) => (
+            this.permissionCoordinator.getResponseContext(requestId)?.correlation === 'agent_state'
+        ));
+        if (stateOnlyRequestIds.length > 0) {
+            void this.agentStateRequestStore.cancelAllRequests({
+                reason: _opts?.completedReason ?? reason,
+                decision: _opts?.decision ?? 'abort',
+                requestIds: stateOnlyRequestIds,
+                shouldCancel: (request) => !isRequestOwnedOutsideRemotePermissionHandler(request),
+            }).catch(() => undefined); // The store reports admission failures on the default file log.
+        }
+        void this.permissionCoordinator.cancelAll(reason).then(() => {
+            for (const [requestId, pending] of pendingSnapshot) {
+                if (this.pendingRequestMetadata.get(requestId) === pending) {
+                    this.pendingRequestMetadata.delete(requestId);
+                }
+            }
+        }).catch(() => logger.infoFile('[Claude] Cancellation request settlement admission failed'));
     }
 
     async abortPendingRequestsAndFlush(reason: string = 'Aborted by user'): Promise<void> {

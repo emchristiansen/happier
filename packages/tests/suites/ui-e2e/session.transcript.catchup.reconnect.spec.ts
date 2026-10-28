@@ -11,7 +11,7 @@ import {
   createSessionFromNewSessionComposer,
   reloadCreatedSessionFromNewSessionComposer,
 } from '../../src/testkit/uiE2e/createSessionFromNewSessionComposer';
-import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
+import { fakeClaudeEchoResponseText, fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
 import { gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
 import { runCliJson } from '../../src/testkit/uiE2e/cliJson';
 import { ensureAccountReadyForConnect } from '../../src/testkit/uiE2e/ensureAccountReadyForConnect';
@@ -187,9 +187,6 @@ test.describe('ui e2e: transcript reconnect catch-up', () => {
       extraEnv: {
         HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys,providers.claude.unifiedTerminal',
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
       },
     });
 
@@ -225,6 +222,7 @@ test.describe('ui e2e: transcript reconnect catch-up', () => {
   });
 
   test('uses snapshot tail reset when pinned and defers forward loading when mid-history', async ({ page }) => {
+    // CI 36709793378: this journey passed in 204s; retain its longer test budget.
     test.setTimeout(540_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
@@ -272,6 +270,7 @@ test.describe('ui e2e: transcript reconnect catch-up', () => {
         HAPPIER_DISABLE_CAFFEINATE: '1',
         HAPPIER_VARIANT: 'dev',
         HAPPIER_CLAUDE_PATH: fakeClaudePath,
+        HAPPIER_E2E_FAKE_CLAUDE_SCENARIO: 'echo-user-text',
         HAPPIER_E2E_FAKE_CLAUDE_LOG: fakeClaudeLogPath,
         HAPPIER_E2E_FAKE_CLAUDE_SESSION_ID: `fake-claude-session-${run.runId}`,
         HAPPIER_E2E_FAKE_CLAUDE_INVOCATION_ID: `fake-claude-invocation-${run.runId}`,
@@ -348,9 +347,14 @@ test.describe('ui e2e: transcript reconnect catch-up', () => {
     // Create enough content to allow scroll-unpin.
     await expect(page.getByTestId('session-composer-input')).toHaveCount(1, { timeout: 120_000 });
     for (let i = 0; i < 80; i++) {
-      await page.getByTestId('session-composer-input').fill(`seed ${i}`);
-      await page.getByTestId('session-composer-input').press('Enter');
-      await page.waitForTimeout(100);
+      const prompt = `seed ${i}`;
+      await page.getByTestId('session-composer-input').fill(prompt);
+      const send = page.getByTestId('session-composer-send');
+      await expect(send).toBeEnabled();
+      await send.click();
+      // Finish each real turn before starting the next; a fixed delay can leave
+      // queued input and in-flight transcript growth when the scroll assertions begin.
+      await expect(page.getByText(fakeClaudeEchoResponseText(prompt)).first()).toBeVisible({ timeout: 60_000 });
     }
 
     const transcript = page.getByTestId('transcript-chat-list');

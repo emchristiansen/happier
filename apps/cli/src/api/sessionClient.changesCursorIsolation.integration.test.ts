@@ -34,6 +34,7 @@ vi.mock('@/ui/logger', () => ({
   logger: {
     debug: vi.fn(),
     debugLargeJson: vi.fn(),
+    infoFile: vi.fn(),
   },
 }));
 

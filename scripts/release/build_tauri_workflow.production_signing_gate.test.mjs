@@ -53,6 +53,41 @@ test('Tauri source metadata rejects malicious versions before publishing workflo
     assert.notEqual(result.status, 0, 'malicious package version must fail source admission');
     assert.match(result.stderr, /canonical semantic version/, 'failure should identify the rejected version contract');
     assert.equal(fs.existsSync(join(fixtureRoot, 'tauri-version-injection')), false);
+
+    fs.writeFileSync(join(fixtureRoot, 'apps', 'ui', 'package.json'), JSON.stringify({ version: '1.2.3' }));
+    const resumed = spawnSync('bash', ['-c', renderedRun], {
+      cwd: fixtureRoot,
+      env: { ...process.env, PATH: `${join(fixtureRoot, 'bin')}:${process.env.PATH ?? ''}`,
+        SOURCE_REF: 'a'.repeat(40), RELEASE_ENVIRONMENT: 'dev', RELEASE_MESSAGE: 'Recovery',
+        RETRY_VERSION: '', RESUME_RUN_ID: '35700904820', RELEASE_RUN_NUMBER: '337',
+        GITHUB_RUN_NUMBER: '999', GITHUB_OUTPUT: join(fixtureRoot, 'github-output') },
+      encoding: 'utf8',
+    });
+    assert.equal(resumed.status, 0, resumed.stderr);
+    assert.match(fs.readFileSync(join(fixtureRoot, 'github-output'), 'utf8'), /^build_version=1\.2\.3-dev\.337$/m);
+    const forwarded = (sourceSha) => spawnSync('bash', ['-c', renderedRun], {
+      cwd: fixtureRoot,
+      env: { ...process.env, PATH: `${join(fixtureRoot, 'bin')}:${process.env.PATH ?? ''}`,
+        SOURCE_REF: 'a'.repeat(40), RELEASE_ENVIRONMENT: 'preview', RELEASE_MESSAGE: 'Recovery',
+        RETRY_VERSION: '', RESUME_RUN_ID: '', RESUME_SOURCE_SHA: sourceSha, RELEASE_RUN_NUMBER: '337',
+        GITHUB_RUN_NUMBER: '999', GITHUB_OUTPUT: join(fixtureRoot, 'forwarded-output') }, encoding: 'utf8',
+    });
+    assert.equal(forwarded('a'.repeat(40)).status, 0);
+    assert.notEqual(forwarded('c'.repeat(40)).status, 0, 'forwarded admission cannot reuse artifacts for a different candidate source');
+    for (const [environment, retryVersion, expectedVersion] of [['dev', '', '1.2.3-dev.999'], ['production', '1.2.2', '1.2.3']]) {
+      const output = join(fixtureRoot, `${environment}-output`);
+      const fresh = spawnSync('bash', ['-c', renderedRun], {
+        cwd: fixtureRoot,
+        env: { ...process.env, PATH: `${join(fixtureRoot, 'bin')}:${process.env.PATH ?? ''}`,
+          SOURCE_REF: 'a'.repeat(40), RELEASE_ENVIRONMENT: environment, RELEASE_MESSAGE: 'Release',
+          RETRY_VERSION: retryVersion, RESUME_RUN_ID: '', RELEASE_RUN_NUMBER: '999',
+          GITHUB_RUN_NUMBER: '999', GITHUB_OUTPUT: output },
+        encoding: 'utf8',
+      });
+      assert.equal(fresh.status, 0, fresh.stderr);
+      assert.ok(fs.readFileSync(output, 'utf8').includes(`build_version=${expectedVersion}\n`));
+      assert.ok(fs.readFileSync(output, 'utf8').includes(`retry_version=${retryVersion}\n`));
+    }
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -325,6 +360,27 @@ test('build-tauri retries transient rustup toolchain downloads in build and fina
   }
 });
 
+test('Tauri finalization prepares the bundled WebKit without changing the native candidate build', async () => {
+  const workflow = parse(await readFile(workflowPath, 'utf8'));
+  const actionPath = './.github/actions/install-tauri-linux-dependencies';
+  const buildStep = workflow.jobs.build.steps.find((step) => step.uses === actionPath);
+  assert.notEqual(buildStep?.with?.['bundled-webkit'], 'true');
+  const steps = workflow.jobs.finalize.steps;
+  const sdkIndex = steps.findIndex((step) => step.uses === actionPath);
+  assert.equal(steps[sdkIndex]?.with?.['bundled-webkit'], 'true');
+  assert.ok(sdkIndex < steps.findIndex((step) => step.name === 'Install trusted finalizer dependencies'));
+
+  const action = parse(await loadFile('.github/actions/install-tauri-linux-dependencies/action.yml'));
+  const cache = action.runs.steps.find((step) => step.id === 'webkit-cache');
+  assert.ok(cache?.uses?.startsWith('actions/cache@'));
+  assert.equal(cache.with['restore-keys'], undefined);
+  assert.match(cache.with.key, /jammy.*x64/);
+  assert.match(cache.with.key, /prepare-tauri-webkit/);
+  const installation = action.runs.steps.find((step) => step.name === 'Prepare and install bundled WebKit SDK');
+  assert.ok(installation.run.indexOf('prepare-tauri-webkit.sh') < installation.run.indexOf('sudo cp -a'));
+
+});
+
 test('Tauri build and trusted finalizer share the complete Linux bundling dependency owner', async () => {
   const workflow = parse(await readFile(workflowPath, 'utf8'));
   const actionPath = './.github/actions/install-tauri-linux-dependencies';
@@ -338,7 +394,7 @@ test('Tauri build and trusted finalizer share the complete Linux bundling depend
   }
 
   const action = parse(await readFile(new URL('../../.github/actions/install-tauri-linux-dependencies/action.yml', import.meta.url), 'utf8'));
-  const installScript = String(action?.runs?.steps?.[0]?.run ?? '');
+  const installScript = String(action?.runs?.steps?.find((step) => step.name === 'Install native and packaging dependencies')?.run ?? '');
   for (const packageName of [
     'build-essential',
     'pkg-config',
@@ -362,6 +418,14 @@ test('Tauri build and trusted finalizer share the complete Linux bundling depend
   );
   assert.doesNotMatch(installScript, /apt-cache\s+show/, 'the action must not probe stale apt metadata itself');
   assert.doesNotMatch(installScript, /sudo apt-get\s+(?:update|install)/, 'the action must not bypass the bounded apt owner');
+
+  // Installed @tauri-apps/cli 2.12.1: tauri-bundler prepare_tools caches this
+  // exact basename. A different basename leaves the verified upstream tool unused.
+  assert.match(
+    installScript,
+    /linuxdeploy_path="\$\{linuxdeploy_dir\}\/linuxdeploy-07333c6-x86_64\.AppImage"/,
+    "the verified linuxdeploy must occupy the installed Tauri CLI cache entry",
+  );
 
   const curlCommand = installScript.match(/curl[\s\S]*?linuxdeploy-x86_64\.AppImage" \\\n\s+-o "\$\{linuxdeploy_path\}"/)?.[0] ?? '';
   assert.match(curlCommand, /--connect-timeout\s+\d+/, 'linuxdeploy download should bound connection establishment');
@@ -429,12 +493,61 @@ test('candidate code is isolated from Tauri and Apple private signing authority'
   assert.match(String(candidateBuild?.run ?? ''), /--secrets-source env/);
 
   const candidateUpload = build.steps.find((step) => step?.name === 'Upload desktop candidate');
-  assert.equal(candidateUpload?.with?.name, 'tauri-candidate-${{ matrix.platform_key }}');
+  assert.equal(candidateUpload?.with?.name, 'tauri-candidate-${{ inputs.environment }}-${{ matrix.platform_key }}');
   assert.doesNotMatch(JSON.stringify(build.steps), /Upload updater assets artifact/);
 
   assert.equal(finalize?.permissions?.contents, 'read');
   assert.equal(finalize?.environment, 'release-shared');
   assert.deepEqual(finalize?.needs, ['resolve_source', 'build']);
+  assert.match(finalize.if, /!cancelled\(\)/);
+  assert.match(finalize.if, /needs\.resolve_source\.result == 'success'/);
+  assert.match(finalize.if, /needs\.build\.result == 'skipped'/);
+  assert.match(build.if, /needs\.resolve_source\.outputs\.build_needed == 'true'/);
+  assert.equal(build.strategy.matrix, '${{ fromJSON(needs.resolve_source.outputs.build_matrix) }}');
+  assert.equal(finalize.strategy.matrix, '${{ fromJSON(needs.resolve_source.outputs.finalize_matrix) }}');
+  // These job conditions use the shared JavaScript/Actions boolean-expression subset.
+  const admits = (job, needs, cancelled = false, inputs = { preparation_only: false, use_prepared: false }) => Function('needs', 'cancelled', 'inputs', `return ${job.if.slice(3, -2)}`)(needs, () => cancelled, inputs);
+  for (const [buildNeeded, buildResult] of [['true', 'success'], ['false', 'skipped']]) {
+    const needs = { resolve_source: { result: 'success', outputs: { build_needed: buildNeeded, finalize_needed: 'true', retry_version: '' } }, build: { result: buildResult } };
+    assert.equal(admits(build, needs), buildNeeded === 'true');
+    assert.equal(admits(finalize, needs), true, 'all reused unsigned candidates still require finalization');
+    assert.equal(admits(finalize, needs, false, { preparation_only: true }), false, 'preparation must not sign');
+    assert.equal(admits(build, needs, false, { use_prepared: true }), false, 'admitted same-run preparation must not compile twice');
+    assert.equal(admits(finalize, { ...needs, resolve_source: { result: 'success', outputs: { finalize_needed: 'false', retry_version: '' } } }), false,
+      'already-finalized candidates must never enter signing again');
+    assert.equal(admits(finalize, needs, true), false);
+    assert.equal(admits(finalize, { ...needs, build: { result: 'failure' } }), false);
+    assert.equal(admits(finalize, { ...needs, resolve_source: { result: 'failure', outputs: {} } }), false);
+    assert.equal(admits(finalize, { ...needs, resolve_source: { result: 'success', outputs: { retry_version: '1.2.2' } } }), false);
+  }
+  const resume = parsed.jobs.resolve_resume;
+  assert.equal(resume.uses, './.github/workflows/resolve-release-resume.yml');
+  const resolveInputs = (inputs) => Object.fromEntries(Object.entries(resume.with).map(([key, value]) => [key,
+    typeof value === 'string' && value.startsWith('${{')
+      ? Function('inputs', 'format', `return ${value.slice(3, -2)}`)(inputs, (pattern, name) => pattern.replace('{0}', name))
+      : value,
+  ]));
+  const source = 'a'.repeat(40);
+  for (const [workflow, environment, operation, artifact] of [
+    ['release-preview-and-production.yml', 'production', 'rel_exact', 'happier-release-status'],
+    ['nightly-dev.yml', 'dev', '', 'happier-release-status'],
+    ['release.yml', 'production', 'rel_exact', 'happier-release-status'],
+    ['release-preview-and-production.yml', 'preview', 'rel_exact', 'happier-release-status-preview'],
+  ]) {
+    assert.deepEqual(resolveInputs({ resume_run_id: '123', resume_workflow: workflow, resume_operation_id: operation, environment, source_ref: source }), {
+      origin_run_id: '123', expected_workflow: `.github/workflows/${workflow}`, expected_channel: environment,
+      expected_source_sha: source, expected_operation_id: operation, status_artifact_name: artifact,
+    });
+  }
+  assert.equal(resolveInputs({ resume_run_id: '123', environment: 'dev', source_ref: source }).expected_workflow, '.github/workflows/nightly-dev.yml');
+  assert.equal(parsed.on.workflow_dispatch.inputs.resume_workflow.default, 'nightly-dev.yml');
+  assert.deepEqual(parsed.on.workflow_dispatch.inputs.resume_workflow.options, ['nightly-dev.yml', 'release.yml', 'release-preview-and-production.yml']);
+  const download = finalize.steps.find((step) => step.name === 'Download and verify admitted desktop candidate');
+  assert.equal(download.if, "${{ matrix.artifact_id != '' }}");
+  assert.equal(download.env.ARTIFACT_ID, '${{ matrix.artifact_id }}');
+  assert.equal(download.env.ARTIFACT_DIGEST, '${{ matrix.artifact_digest }}');
+  assert.match(download.run, /resolve-release-resume\.mjs[\s\S]*--mode download/);
+  assert.ok(finalize.steps.indexOf(download) < finalize.steps.findIndex((step) => step.name === 'Validate and materialize desktop candidate'));
   const trustedCheckout = finalize.steps.find((step) => step?.name === 'Checkout trusted workflow control bytes');
   assert.equal(trustedCheckout?.with?.repository, '${{ job.workflow_repository }}');
   assert.equal(trustedCheckout?.with?.ref, '${{ job.workflow_sha }}');
@@ -466,12 +579,12 @@ test('candidate code is isolated from Tauri and Apple private signing authority'
   assert.match(String(nonMacSigner?.run ?? ''), /tauri-sign-updater-artifacts/);
 
   const finalizedUpload = finalize.steps.find((step) => step?.name === 'Upload finalized updater assets');
-  assert.equal(finalizedUpload?.with?.name, 'tauri-updates-${{ matrix.platform_key }}');
+  assert.equal(finalizedUpload?.with?.name, 'tauri-updates-${{ inputs.environment }}-${{ matrix.platform_key }}');
 
   assert.equal(prepareAssets?.permissions?.contents, 'read');
   const prepareCheckout = prepareAssets.steps.find((step) => step?.uses === 'actions/checkout@11d5960a326750d5838078e36cf38b85af677262');
   assert.equal(prepareCheckout?.with?.repository, '${{ job.workflow_repository }}');
   assert.equal(prepareCheckout?.with?.ref, '${{ job.workflow_sha }}');
   assert.equal(prepareCheckout?.with?.['persist-credentials'], false);
-  assert.deepEqual(prepareAssets?.needs, ['resolve_source', 'finalize']);
+  assert.deepEqual(prepareAssets?.needs, ['resolve_source', 'finalize', 'reuse_finalized']);
 });

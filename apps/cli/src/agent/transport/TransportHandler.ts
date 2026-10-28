@@ -261,6 +261,12 @@ export interface TransportHandler {
   ): string | null | undefined;
 
   /**
+   * Native providers that route child approvals through the root session own the requesting
+   * tool's settlement. Session-scoped permissions must not mutate or cancel a foreground turn.
+   */
+  getPermissionRequestScope?(): 'session' | 'turn';
+
+  /**
    * Optional provider-owned admission policy for ACP tool updates. The generic lifecycle remains
    * responsible for merging, deduplicating, finalizing, and publishing every admitted update.
    * Returning false drops only this provider notification.

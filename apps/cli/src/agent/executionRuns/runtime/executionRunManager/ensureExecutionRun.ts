@@ -1,9 +1,8 @@
-import type { AgentBackend } from '@/agent/core/AgentBackend';
 import type { ExecutionRunController, ExecutionRunVoiceAgentController } from '@/agent/executionRuns/controllers/types';
 import { VoiceAgentManager } from '@/agent/voice/agent/VoiceAgentManager';
 import type { ExecutionRunState } from '@/agent/executionRuns/runtime/executionRunTypes';
 import type { ExecutionBudgetRegistry } from '@/daemon/executionBudget/ExecutionBudgetRegistry';
-import { resumeBackendControllerForResumableRun } from '@/agent/executionRuns/runtime/resumeBackendController';
+import { resumeBackendControllerForResumableRun, type ResumedExecutionRunBackend } from '@/agent/executionRuns/runtime/resumeBackendController';
 import type { ACPProvider } from '@/api/session/sessionMessageTypes';
 import type { AcpSendFn } from '@/agent/acp/bridge/acpSessionForwarding';
 import type { StreamedTranscriptWriterSession } from '@/api/session/streamedTranscriptWriter';
@@ -19,12 +18,13 @@ export async function ensureExecutionRun(args: Readonly<{
   controllers: Map<string, ExecutionRunController>;
   budgetRegistry: ExecutionBudgetRegistry | null;
   /** Async backend factory owning launch rehydration; see resumeBackendControllerForResumableRun. */
-  createBackend: () => Promise<AgentBackend>;
+  createBackend: () => Promise<ResumedExecutionRunBackend>;
+  isSessionClosing?: () => boolean;
   sendAcp: AcpSendFn;
   parentProvider: ACPProvider;
   streamedTranscriptSession: StreamedTranscriptWriterSession | null;
   getNowMs: () => number;
-  writeActivityMarker: (runId: string, nowMs: number, opts?: Readonly<{ force?: boolean }>) => Promise<void>;
+  writeActivityMarker: (runId: string, nowMs: number, opts?: Readonly<{ force?: boolean; resumed?: boolean }>) => Promise<void>;
   admitRuntimeActivity: (runId: string) => Promise<void>;
   rollbackRuntimeActivityAfterFailedAdmission: (reason: string) => Promise<void>;
   terminalRuntimeActivityAfterFailedAdmission: (runId: string, reason: string) => Promise<void>;
@@ -135,7 +135,7 @@ export async function ensureExecutionRun(args: Readonly<{
         voiceAgentConfig: config,
       });
 
-      await args.writeActivityMarker(args.runId, args.getNowMs(), { force: true });
+      await args.writeActivityMarker(args.runId, args.getNowMs(), { force: true, resumed: true });
       return { ok: true };
     } catch (e: any) {
       args.runs.set(args.runId, run);
@@ -161,6 +161,7 @@ export async function ensureExecutionRun(args: Readonly<{
     controllers: args.controllers,
     budgetRegistry: args.budgetRegistry,
     createBackend: args.createBackend,
+    isSessionClosing: args.isSessionClosing,
     sendAcp: args.sendAcp,
     parentProvider: args.parentProvider,
     streamedTranscriptSession: args.streamedTranscriptSession,
@@ -176,6 +177,5 @@ export async function ensureExecutionRun(args: Readonly<{
     },
   });
   if (!resumed.ok) return resumed;
-  await args.writeActivityMarker(args.runId, args.getNowMs(), { force: true });
   return { ok: true };
 }

@@ -15,6 +15,8 @@ import type { CLIAvailability } from '@/hooks/auth/useCLIDetection';
 import type { UseMachineEnvPresenceResult } from '@/hooks/machine/useMachineEnvPresence';
 import { prefetchMachineCapabilities } from '@/hooks/server/useMachineCapabilitiesCache';
 import { CAPABILITIES_REQUEST_NEW_SESSION } from '@/capabilities/requests';
+import type { InstallableDepDataLike, InstallableRegistryEntry } from '@/capabilities/installablesRegistry';
+import type { CapabilityDetectResult } from '@/sync/api/capabilities/capabilitiesProtocol';
 import { buildCliAvailabilityProbeState } from '@/components/sessions/new/modules/buildCliAvailabilityProbeState';
 import { getSecretSatisfaction } from '@/utils/secrets/secretSatisfaction';
 import type { SecretChoiceByProfileIdByEnvVarName } from '@/utils/secrets/secretRequirementApply';
@@ -96,7 +98,11 @@ export function useNewSessionWizardProps(params: Readonly<{
     sessionOnlySecretValueByProfileIdByEnvVarName: SecretChoiceByProfileIdByEnvVarName;
 
     // Installable deps
-    wizardInstallableDeps: Array<{ entry: any; depStatus: any }>;
+    wizardInstallableDeps: ReadonlyArray<{
+        entry: InstallableRegistryEntry;
+        depStatus: InstallableDepDataLike | null;
+        detectResult: CapabilityDetectResult | null;
+    }>;
     selectedMachineCapabilities: { status: any };
 
     // Agent section
@@ -300,7 +306,7 @@ export function useNewSessionWizardProps(params: Readonly<{
         if (!params.selectedMachineId) return [];
         if (params.wizardInstallableDeps.length === 0) return [];
 
-        return params.wizardInstallableDeps.map(({ entry, depStatus }) => ({
+        return params.wizardInstallableDeps.map(({ entry, depStatus, detectResult }) => ({
             machineId: params.selectedMachineId!,
             serverId: params.targetServerId,
             enabled: true,
@@ -309,6 +315,7 @@ export function useNewSessionWizardProps(params: Readonly<{
             depTitle: entry.title,
             depIconName: entry.iconName as any,
             depStatus,
+            detectResult,
             capabilitiesStatus: params.selectedMachineCapabilities.status,
             installLabels: {
                 install: tNoParams(entry.installLabels.installKey),

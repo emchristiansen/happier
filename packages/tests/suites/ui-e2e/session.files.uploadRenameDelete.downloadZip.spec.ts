@@ -10,7 +10,6 @@ import { startCliAuthLoginForTerminalConnect, type StartedCliTerminalConnect } f
 import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
 import { gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
 import { acknowledgeTerminalConnectSuccessIfPresent } from '../../src/testkit/uiE2e/acknowledgeTerminalConnectSuccessIfPresent';
-import { clickScopedButtonByTestIdOrRole } from '../../src/testkit/uiE2e/clickScopedButtonByTestIdOrRole';
 import { spawnSessionFromDaemon } from '../../src/testkit/uiE2e/spawnSessionFromDaemon';
 import { toTestIdSafeValue } from '../../src/testkit/uiE2e/testIdSafeValue';
 import { waitForInitialAppUi } from '../../src/testkit/uiE2e/waitForInitialAppUi';
@@ -207,9 +206,6 @@ test.describe('ui e2e: Files upload + rename/delete + download (+ zip)', () => {
       extraEnv: {
         HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys',
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
         HAPPIER_E2E_PROVIDER_SKIP_SERVER_SHARED_DEPS_BUILD: '1',
         HAPPIER_E2E_PROVIDER_SKIP_SERVER_GENERATE: '1',
         HAPPIER_E2E_PROVIDER_USE_SERVER_SOURCE_ENTRYPOINT: '1',
@@ -229,8 +225,8 @@ test.describe('ui e2e: Files upload + rename/delete + download (+ zip)', () => {
     await server?.stop().catch(() => {});
   });
 
-  test('uploads file, renames, downloads, deletes, and downloads folder zip', async ({ page }) => {
-    test.setTimeout(420_000);
+  test('uploads file, renames, downloads, deletes, and downloads folder zip', { tag: "@smoke" }, async ({ page }) => {
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
     const browserDiagnostics = collectBrowserDiagnostics({ page });
@@ -321,14 +317,11 @@ test.describe('ui e2e: Files upload + rename/delete + download (+ zip)', () => {
       await expect(rightPaneLocator(page)).toHaveCount(1, { timeout: 60_000 });
 
       const rightPane = rightPaneLocator(page);
-      await clickScopedButtonByTestIdOrRole({
-        scope: rightPane,
-        testId: 'session-rightpanel-tab:files',
-        roleName: 'Files',
-        timeoutMs: 180_000,
-      });
-
-      await expect(rightPane.getByTestId('session-rightpanel-surface-files')).toHaveCount(1, { timeout: 120_000 });
+      const filesSurface = rightPane.getByTestId('session-rightpanel-surface-files');
+      if (!(await filesSurface.isVisible())) {
+        await page.getByTestId('session-action-rail:files').click();
+      }
+      await expect(filesSurface).toBeVisible({ timeout: 120_000 });
       await selectRepositoryAllFiles({ rightPane, timeoutMs: 120_000 });
       try {
         await expectFilesToolbarPrimaryOrOverflowAction(rightPane, 'repository-tree-upload', 180_000);

@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { Platform, Pressable, View } from 'react-native';
+import { Platform, View } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 import { FrozenSubtree } from '@/components/ui/performance/FrozenSubtree';
@@ -15,12 +15,15 @@ import { SessionGitSurface } from '@/components/sessions/panes/surfaces/SessionG
 import { SessionTerminalSurface } from '@/components/sessions/panes/surfaces/SessionTerminalSurface';
 import { SessionTranscriptNavigationPane } from '@/components/sessions/panes/SessionTranscriptNavigationPane';
 import { useSessionFileDetailsOpener } from '@/components/sessions/panes/useSessionFileDetailsOpener';
-import { useSessionAgentActivity } from '@/hooks/session/useSessionAgentActivity';
-import type { UseDirectSessionRuntimeResult } from '@/components/sessions/model/useDirectSessionRuntime';
 import { useSessionTerminalAvailability } from '@/components/sessions/terminal/useSessionTerminalAvailability';
 import { t } from '@/text';
 import { resolveOptionalSessionScreenTestId, useSessionScreenTestIdsEnabled } from '../shell/sessionScreenTestIds';
-import { Icon, type IconName } from '@/components/ui/icons/Icon';
+import { Icon } from '@/components/ui/icons/Icon';
+import { resolveSessionHeaderActionTargetPx } from '@/components/sessions/actions/sessionHeaderIconMetrics';
+
+import { usePaneActionRail } from '@/components/appShell/panes/PaneActionRailContext';
+import { getSessionRightPanelTabs, type SessionRightTabId as RightTabId } from './sessionRightPanelTabs';
+import { useSessionRunningAgentCount } from './useSessionRunningAgentCount';
 
 export type SessionRightPanelProps = Readonly<{
     sessionId: string;
@@ -33,8 +36,6 @@ export type SessionRightPanelProps = Readonly<{
      */
     onRequestClose?: () => void;
 }>;
-
-type RightTabId = 'git' | 'files' | 'navigation' | 'agents' | 'terminal';
 
 const stylesheet = StyleSheet.create((theme) => ({
     container: {
@@ -66,12 +67,6 @@ const stylesheet = StyleSheet.create((theme) => ({
     },
 }));
 
-const COUNT_ONLY_DIRECT_SESSION_RUNTIME: UseDirectSessionRuntimeResult = Object.freeze({
-    directSessionLink: null,
-    status: null,
-    refreshNow: async () => null,
-});
-
 export const SessionRightPanel = React.memo((props: SessionRightPanelProps) => {
     const styles = stylesheet;
     const { theme } = useUnistyles();
@@ -84,19 +79,8 @@ export const SessionRightPanel = React.memo((props: SessionRightPanelProps) => {
         serverId: props.serverId ?? null,
     });
     const sessionScreenTestIdsEnabled = useSessionScreenTestIdsEnabled();
-    // The Agents tab is the one tab whose contents can change while you are looking at another tab,
-    // so it is the one tab that needs to say so from the bar. It reads the SAME activity counts as
-    // the session header's glyph and the composer badge — a tab badge that disagreed with the pane
-    // behind it would be worse than no badge (R-8).
-    const agentActivityCounts = useSessionAgentActivity({
-        sessionId: props.sessionId,
-        // The direct-session runtime is stubbed on purpose. The roster uses it only to decide
-        // whether execution runs are CONTROLLABLE, which is a capability of a row and not of a
-        // count; letting this host create a real one attaches a second sub-second direct-session
-        // poll per session to draw a badge.
-        directSessionRuntime: COUNT_ONLY_DIRECT_SESSION_RUNTIME,
-    }).counts;
-    const runningAgentCount = agentActivityCounts.live;
+    const externalRail = usePaneActionRail();
+    const hideHeader = externalRail && props.presentation !== 'screen';
     const terminalTabAvailable = terminalAvailability.sidebarTabAvailable;
     const closeButtonAtStart = props.presentation === 'screen' && Platform.OS !== 'web';
     const rawActiveTab = (scopeState?.right.activeTabId as RightTabId | null) ?? 'git';
@@ -120,40 +104,15 @@ export const SessionRightPanel = React.memo((props: SessionRightPanelProps) => {
         }
     }, [pane, scopeState?.right.activeTabId, scopeState?.right.isOpen, terminalTabAvailable]);
 
-    const rightPanelTabs = React.useMemo((): ReadonlyArray<SegmentedTab<RightTabId>> => {
-        // Icons, not words. Four labels cost a full text row in a pane this narrow, and the
-        // labels survive as the accessible name and the hover tooltip.
-        const glyph = (name: IconName) => (
-            <Icon name={name} size={SEGMENTED_TAB_ICON_SIZE_PX} color={theme.colors.text.secondary} />
-        );
-        const base: SegmentedTab<RightTabId>[] = [
-            { id: 'git', label: t('session.rightPanel.tabs.git'), icon: glyph('git-branch') },
-            { id: 'files', label: t('common.files'), icon: glyph('folder') },
-            { id: 'navigation', label: t('session.transcriptNavigation.title'), icon: glyph('list-bullets') },
-            {
-                id: 'agents',
-                label: t('session.subagents.panel.title'),
-                icon: glyph('robot'),
-                // Running agents only. A tab badge is a live indicator, and a session that finished
-                // an agent an hour ago has nothing for the user to go and look at — the same rule
-                // the session header's agent count already follows.
-                badgeCount: runningAgentCount,
-                accessibilityLabel: runningAgentCount > 0
-                    ? t('session.subagents.panel.tabWithRunningCount', { count: runningAgentCount })
-                    : undefined,
-            },
-        ];
-        if (terminalTabAvailable) {
-            base.push({ id: 'terminal', label: t('settings.terminal'), icon: glyph('terminal') });
-        }
-        return base;
-    }, [runningAgentCount, terminalTabAvailable, theme.colors.text.secondary]);
-
     const closeButton = (
         <IconAction
             testID={resolveOptionalSessionScreenTestId(sessionScreenTestIdsEnabled, 'session-rightpanel-close')}
             onPress={props.onRequestClose ?? pane.closeRight}
             accessibilityLabel={closeButtonAtStart ? t('common.back') : t('common.close')}
+            style={{
+                width: resolveSessionHeaderActionTargetPx(),
+                height: resolveSessionHeaderActionTargetPx(),
+            }}
         >
             <Icon name={closeButtonAtStart ? 'caret-left' : 'x'} size={16} color={theme.colors.text.secondary} />
         </IconAction>
@@ -161,18 +120,19 @@ export const SessionRightPanel = React.memo((props: SessionRightPanelProps) => {
 
     return (
         <View style={styles.container}>
-            <View style={styles.header}>
+            {!hideHeader ? <View style={styles.header}>
                 {closeButtonAtStart ? closeButton : null}
                 <View style={styles.segmentedContainer}>
-                    <SegmentedTabBar
-                        tabs={rightPanelTabs}
-                        activeTabId={activeTab}
+                    <SessionRightPanelTabBar
+                        sessionId={props.sessionId}
+                        terminalAvailable={terminalTabAvailable}
+                        activeTab={activeTab}
                         onSelectTab={setActiveTab}
                         testIDPrefix={resolveOptionalSessionScreenTestId(sessionScreenTestIdsEnabled, 'session-rightpanel-tab') ?? undefined}
                     />
                 </View>
                 {closeButtonAtStart ? null : closeButton}
-            </View>
+            </View> : null}
             <View style={styles.body}>
                 <View style={{ flex: 1, minHeight: 0, minWidth: 0, position: 'relative' }}>
                     <RightTabSurface
@@ -232,6 +192,24 @@ export const SessionRightPanel = React.memo((props: SessionRightPanelProps) => {
             </View>
         </View>
     );
+});
+
+const SessionRightPanelTabBar = React.memo((props: Readonly<{
+    sessionId: string;
+    terminalAvailable: boolean;
+    activeTab: RightTabId;
+    onSelectTab: (tabId: RightTabId) => void;
+    testIDPrefix?: string;
+}>) => {
+    const { theme } = useUnistyles();
+    const runningAgentCount = useSessionRunningAgentCount(props.sessionId);
+    const tabs = React.useMemo((): ReadonlyArray<SegmentedTab<RightTabId>> => (
+        getSessionRightPanelTabs(props.terminalAvailable, runningAgentCount).map((tab) => ({
+            ...tab,
+            icon: <Icon name={tab.icon} size={SEGMENTED_TAB_ICON_SIZE_PX} color={theme.colors.text.secondary} />,
+        }))
+    ), [props.terminalAvailable, runningAgentCount, theme.colors.text.secondary]);
+    return <SegmentedTabBar tabs={tabs} activeTabId={props.activeTab} onSelectTab={props.onSelectTab} testIDPrefix={props.testIDPrefix} />;
 });
 
 const PaneLoadingFallback = React.memo((props: Readonly<{ color: string }>) => {

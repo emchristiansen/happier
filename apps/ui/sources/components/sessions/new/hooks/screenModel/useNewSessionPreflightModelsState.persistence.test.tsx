@@ -141,6 +141,20 @@ describe('useNewSessionPreflightModelsState (persistence)', () => {
     expect(latestPreflightModelsAfterReload).toEqual(latestPreflightModels);
   });
 
+  it('hydrates an authoritative empty catalog across app restarts', async () => {
+    const cache = await import('@/sync/domains/models/dynamicModelProbeCache');
+    cache.resetDynamicModelProbeCacheForTests();
+    const key = buildDynamicModelProbeCacheKey({
+      machineId: 'empty-machine', targetKey: 'agent:codex', serverId: 'server-1', cwd: '/repo',
+    })!;
+    cache.writeDynamicModelProbeCacheSuccess(key, { availableModels: [], supportsFreeform: false });
+    vi.resetModules();
+    const reloaded = await import('@/sync/domains/models/dynamicModelProbeCache');
+    expect(reloaded.readDynamicModelProbeCache(key)).toMatchObject({
+      kind: 'success', value: { availableModels: [], supportsFreeform: false },
+    });
+  });
+
   it('does not persist static fallback probe results across module reloads', async () => {
     vi.resetModules();
     resetDynamicModelProbeCacheForTests();

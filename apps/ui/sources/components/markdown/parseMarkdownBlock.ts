@@ -110,6 +110,28 @@ function trimPipeArtifacts(cells: string[]): string[] {
     return result;
 }
 
+// GFM: `\|` is a literal pipe inside a cell (code spans included); every other `|` delimits a cell.
+function splitTableRowCells(line: string): string[] {
+    const cells: string[] = [];
+    let current = '';
+    for (let index = 0; index < line.length; index++) {
+        const char = line[index];
+        if (char === '\\' && line[index + 1] === '|') {
+            current += '|';
+            index++;
+            continue;
+        }
+        if (char === '|') {
+            cells.push(current.trim());
+            current = '';
+            continue;
+        }
+        current += char;
+    }
+    cells.push(current.trim());
+    return trimPipeArtifacts(cells);
+}
+
 function parseTableAlignment(separatorCell: string): MarkdownTableAlignment {
     const cell = separatorCell.trim();
     const startsWithColon = cell.startsWith(':');
@@ -145,17 +167,13 @@ function parseTable(lines: string[], startIndex: number, options: ParseMarkdownB
 
     // Extract header cells from the first line, trimming only leading/trailing pipe artifacts
     const headerLine = tableLines[0].trim();
-    const headers = trimPipeArtifacts(
-        headerLine.split('|').map(cell => cell.trim())
-    );
+    const headers = splitTableRowCells(headerLine);
 
     if (headers.length === 0) {
         return { table: null, nextIndex: startIndex };
     }
 
-    const separatorCells = trimPipeArtifacts(
-        separatorLine.split('|').map(cell => cell.trim())
-    );
+    const separatorCells = splitTableRowCells(separatorLine);
     const alignments = headers.map((_, columnIndex) =>
         parseTableAlignment(separatorCells[columnIndex] ?? '')
     );
@@ -165,9 +183,7 @@ function parseTable(lines: string[], startIndex: number, options: ParseMarkdownB
     for (let i = 2; i < tableLines.length; i++) {
         const rowLine = tableLines[i].trim();
         if (rowLine.startsWith('|')) {
-            let rowCells = trimPipeArtifacts(
-                rowLine.split('|').map(cell => cell.trim())
-            );
+            const rowCells = splitTableRowCells(rowLine);
 
             // Pad row to match header count (handles rows with fewer cells)
             while (rowCells.length < headers.length) {
@@ -187,6 +203,11 @@ function parseTable(lines: string[], startIndex: number, options: ParseMarkdownB
     }, options, startIndex, index);
 
     return { table, nextIndex: index };
+}
+
+/** Only a complete, dedicated option line is an interactive choice. */
+export function readMarkdownOption(line: string): string | null {
+    return line.trim().match(/^<option>(.*?)<\/option>$/)?.[1] ?? null;
 }
 
 export function parseMarkdownBlock(markdown: string, options: ParseMarkdownBlockOptions = {}) {
@@ -248,18 +269,22 @@ export function parseMarkdownBlock(markdown: string, options: ParseMarkdownBlock
         }
 
         // Options block
-        if (trimmed.startsWith('<options>')) {
-            let items: string[] = [];
+        const hasOptionsWrapper = trimmed.startsWith('<options>');
+        const firstOption = readMarkdownOption(line);
+        if (hasOptionsWrapper || firstOption !== null) {
+            const items: string[] = firstOption === null ? [] : [firstOption];
             while (index < lines.length) {
                 const nextLine = lines[index];
                 if (nextLine.trim() === '</options>') {
                     index++;
                     break;
                 }
-                // Extract content from <option> tags
-                const optionMatch = nextLine.match(/<option>(.*?)<\/option>/);
-                if (optionMatch) {
-                    items.push(optionMatch[1]);
+                const option = readMarkdownOption(nextLine);
+                if (option !== null) {
+                    items.push(option);
+                } else if (!hasOptionsWrapper) {
+                    // Continuations have no enclosing block to delimit unrelated prose.
+                    break;
                 }
                 index++;
             }

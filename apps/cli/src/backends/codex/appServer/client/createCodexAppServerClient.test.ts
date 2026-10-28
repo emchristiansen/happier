@@ -1,5 +1,6 @@
 import { mkdir, readFile, readlink, writeFile } from 'node:fs/promises';
 import { connect, createServer, type Socket } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import * as childProcess from 'node:child_process';
@@ -7,6 +8,7 @@ import { EventEmitter, once } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 
 import { describe, expect, it, vi } from 'vitest';
+import { WebSocketServer } from 'ws-node';
 
 import { waitForCondition } from '@/testkit/async/waitFor';
 import { createDeferred } from '@/testkit/async/deferred';
@@ -18,6 +20,7 @@ import {
 import { HAPPIER_SPAWN_EXPLICIT_ENV_KEYS_JSON_ENV_VAR } from '@/daemon/spawn/spawnExplicitEnvKeysMarker';
 
 import { createCodexAppServerClient, type CodexAppServerPrivateIoEvent, type CodexAppServerPrivateIoOwner } from './createCodexAppServerClient';
+import * as codexUnixWebSocket from './createCodexUnixWebSocket';
 import {
     createCodexAppServerProcessEnv,
     createCodexAppServerTestEnvScope,
@@ -103,6 +106,35 @@ async function createSdkProcessBoundary(options: Readonly<{
 }
 
 describe('createCodexAppServerClient', () => {
+    it.each([
+        { kind: 'daemonProxy' as const },
+        { kind: 'unixWebSocket' as const, socketPath: '/unopened-private-test.sock' },
+    ])('[private-io] refuses an unqualified $kind transport before opening it', async (transport) => {
+        const events: CodexAppServerPrivateIoEvent[] = [];
+        const flush = vi.fn(async () => {});
+        // OS process/socket boundaries throw before an unsafe implementation can open either.
+        const spawn = vi.mocked(childProcess.spawn);
+        const originalSpawn = spawn.getMockImplementation();
+        spawn.mockClear();
+        spawn.mockImplementation(() => { throw new Error('Unexpected private transport process launch'); });
+        const connect = vi.spyOn(codexUnixWebSocket, 'createCodexUnixWebSocket')
+            .mockImplementation(() => { throw new Error('Unexpected private transport socket connection'); });
+        try {
+            await expect(createCodexAppServerClient({
+                processEnv: { HAPPIER_CODEX_APP_SERVER_BIN: process.execPath },
+                transport,
+                io: { kind: 'private', owner: { capture: event => { events.push(event); }, flush } },
+            })).rejects.toMatchObject({ name: 'CodexAppServerPrivateIoError' });
+            expect(spawn).not.toHaveBeenCalled();
+            expect(connect).not.toHaveBeenCalled();
+            expect(events).toEqual([expect.objectContaining({ kind: 'failure', operation: 'construction' })]);
+            expect(flush).toHaveBeenCalledOnce();
+        } finally {
+            connect.mockRestore();
+            if (originalSpawn) spawn.mockImplementation(originalSpawn);
+        }
+    });
+
     it.skipIf(process.platform !== 'linux')('[private-sdk-descriptors] denies both held socket endpoints to the actual native child and its descendant', async () => {
         await withTempDir('happier-sdk-descriptor-custody-', async (root) => {
             const server = createServer();
@@ -862,6 +894,154 @@ describe('createCodexAppServerClient', () => {
         expect(drained.at(-1)).toEqual({ kind: 'close', code: 1, signal: null });
     });
 
+    it('serializes native initialization for shared SQLite state without serializing ongoing clients', async () => {
+        await withTempDir('happier-codex-app-server-native-startup-', async (root) => {
+            await mkdir(join(root, 'sqlite'), { recursive: true });
+            const fakeAppServer = await writeFakeCodexAppServerScript({
+                dir: root,
+                importLines: ['import { mkdir, rm } from "node:fs/promises";', 'import { join } from "node:path";'],
+                setupLines: [
+                    'const nativeStartup = join(process.env.CODEX_SQLITE_HOME, "native-startup");',
+                ],
+                bodyLines: [
+                    'for await (const line of rl) {',
+                    '  if (!line.trim()) continue;',
+                    '  const msg = JSON.parse(line);',
+                    '  if (msg.method === "initialize") {',
+                    '    try { await mkdir(nativeStartup); } catch (error) {',
+                    '      process.stdout.write(JSON.stringify({ id: msg.id, error: { code: -32000, message: error.code } }) + "\\n");',
+                    '      continue;',
+                    '    }',
+                    '    await new Promise(resolve => setTimeout(resolve, 100));',
+                    '    await rm(nativeStartup, { recursive: true });',
+                    '    process.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + "\\n");',
+                    '  } else if (msg.method === "test/ping") {',
+                    '    process.stdout.write(JSON.stringify({ id: msg.id, result: { pong: true } }) + "\\n");',
+                    '  }',
+                    '}',
+                ],
+            });
+            const clients: Awaited<ReturnType<typeof createCodexAppServerClient>>[] = [];
+            const spawn = vi.mocked(childProcess.spawn);
+            const originalSpawn = spawn.getMockImplementation();
+            if (!originalSpawn) throw new Error('Expected the OS spawn observer');
+            const stderr: string[] = [];
+            spawn.mockImplementation((...args) => {
+                const child = originalSpawn(...args);
+                child.stderr?.on('data', chunk => { stderr.push(String(chunk)); });
+                return child;
+            });
+            try {
+                const outcomes = await Promise.allSettled(['account-a', 'account-b'].map(async (home) => {
+                    const client = await createCodexAppServerClient({
+                        initializeRequestOptions: { timeoutMs: 2_000 },
+                        processEnv: createCodexAppServerProcessEnv(fakeAppServer, {
+                            CODEX_HOME: join(root, home), CODEX_SQLITE_HOME: join(root, 'sqlite'),
+                        }),
+                    });
+                    clients.push(client);
+                    return client;
+                }));
+                expect({ failures: outcomes.flatMap(outcome => outcome.status === 'rejected' ? [outcome.reason] : []), stderr })
+                    .toEqual({ failures: [], stderr: [] });
+                await expect(Promise.all(clients.map(client => client.request('test/ping'))))
+                    .resolves.toEqual([{ pong: true }, { pong: true }]);
+            } finally {
+                await Promise.all(clients.map(client => client.dispose()));
+                spawn.mockImplementation(originalSpawn);
+            }
+        });
+    });
+
+    it('uses the Codex daemon proxy transport without starting another app-server', async () => {
+        await withTempDir('happier-codex-app-server-client-daemon-proxy-', async (root) => {
+            const fakeAppServer = await writeFakeCodexAppServerScript({
+                dir: root,
+                bodyLines: [
+                    'for await (const line of rl) {',
+                    '  if (!line.trim()) continue;',
+                    '  const msg = JSON.parse(line);',
+                    '  if (msg.method === "initialize") {',
+                    '    process.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + "\\n");',
+                    '    continue;',
+                    '  }',
+                    '  if (msg.method === "thread/loaded/list") {',
+                    '    process.stdout.write(JSON.stringify({ id: msg.id, result: { data: ["thread-1"] } }) + "\\n");',
+                    '  }',
+                    '}',
+                ],
+            });
+            const spawn = vi.mocked(childProcess.spawn);
+            spawn.mockClear();
+            const client = await createCodexAppServerClient({
+                processEnv: createCodexAppServerProcessEnv(fakeAppServer),
+                transport: { kind: 'daemonProxy' },
+            });
+            try {
+                await expect(client.request('thread/loaded/list')).resolves.toEqual({ data: ['thread-1'] });
+                expect(spawn.mock.calls[0]?.[1]).toEqual([
+                    fakeAppServer,
+                    'app-server',
+                    'proxy',
+                ]);
+                expect(spawn.mock.calls[0]?.[2]).toEqual(expect.objectContaining({
+                    stdio: ['pipe', 'pipe', 'pipe'],
+                }));
+            } finally {
+                await client.dispose();
+            }
+        });
+    });
+
+    it('speaks JSON-RPC over the shared app-server Unix WebSocket', async () => {
+        await withTempDir('codex-ws-', async (root) => {
+            const socketPath = process.platform === 'win32'
+                ? `\\\\.\\pipe\\happier-codex-test-${process.pid}-${Date.now()}`
+                : join(root, 'app-server.sock');
+            const httpServer = createHttpServer();
+            const webSocketServer = new WebSocketServer({
+                server: httpServer,
+                // Codex's tungstenite endpoint closes the handshake when clients offer
+                // permessage-deflate, so keep this fixture aligned with that real boundary.
+                verifyClient: (info, done) => done(info.req.headers['sec-websocket-extensions'] === undefined),
+            });
+            webSocketServer.on('connection', (socket) => {
+                socket.on('message', (payload) => {
+                    if (!Buffer.isBuffer(payload)) return;
+                    const message = JSON.parse(payload.toString('utf8')) as { id?: number; method?: string };
+                    if (message.method === 'initialize') {
+                        socket.send(JSON.stringify({ id: message.id, result: {} }));
+                    } else if (message.method === 'test/ping') {
+                        socket.send(JSON.stringify({ id: message.id, result: { pong: true } }));
+                    }
+                });
+            });
+            await new Promise<void>((resolve, reject) => {
+                httpServer.once('error', reject);
+                httpServer.listen(socketPath, resolve);
+            });
+
+            const spawn = vi.mocked(childProcess.spawn);
+            spawn.mockClear();
+            const client = await createCodexAppServerClient({
+                transport: { kind: 'unixWebSocket', socketPath },
+            });
+            try {
+                await expect(client.request('test/ping')).resolves.toEqual({ pong: true });
+                expect(spawn).not.toHaveBeenCalled();
+            } finally {
+                await client.dispose();
+                await new Promise<void>((resolve, reject) => {
+                    webSocketServer.close((error?: Error): void => {
+                        if (error) reject(error);
+                        else resolve();
+                    });
+                });
+                await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+            }
+        }, process.platform === 'win32' ? undefined : '/tmp');
+    });
+
     it('settles pending requests and reports stdin failure without an uncaught stream error', async () => {
         await withTempDir('happier-codex-app-server-client-stdin-error-', async (root) => {
             const fakeAppServer = await writeFakeCodexAppServerScript({
@@ -1423,7 +1603,7 @@ describe('createCodexAppServerClient', () => {
         });
     });
 
-    it('uses the startup RPC timeout for slow thread/start requests', async () => {
+    it('keeps side-effecting thread/start alive past the startup RPC timeout', async () => {
         await withTempDir('happier-codex-app-server-client-thread-start-timeout-', async (root) => {
             const fakeAppServer = await writeFakeCodexAppServerScript({
                 dir: root,
@@ -1450,7 +1630,7 @@ describe('createCodexAppServerClient', () => {
             const client = await createCodexAppServerClient({
                 processEnv: createCodexAppServerProcessEnv(fakeAppServer, {
                     HAPPIER_CODEX_APP_SERVER_RPC_TIMEOUT_MS: '250',
-                    HAPPIER_CODEX_APP_SERVER_STARTUP_RPC_TIMEOUT_MS: '5000',
+                    HAPPIER_CODEX_APP_SERVER_STARTUP_RPC_TIMEOUT_MS: '250',
                 }),
             });
 

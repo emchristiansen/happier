@@ -14,7 +14,11 @@ interface CreateEncryptedRpcTestClientOptions {
 
 export interface EncryptedRpcTestClient {
   manager: RpcHandlerManager;
-  call<TResponse, TRequest>(method: string, request: TRequest): Promise<TResponse>;
+  call<TResponse, TRequest>(
+    method: string,
+    request: TRequest,
+    transport?: Readonly<{ requestId?: string; timeoutMs?: number }>,
+  ): Promise<TResponse>;
 }
 
 export function createEncryptedRpcTestClient(
@@ -32,11 +36,17 @@ export function createEncryptedRpcTestClient(
   });
   options.registerHandlers(manager);
 
-  const call = async <TResponse, TRequest>(method: string, request: TRequest): Promise<TResponse> => {
+  const call = async <TResponse, TRequest>(
+    method: string,
+    request: TRequest,
+    transport?: Readonly<{ requestId?: string; timeoutMs?: number }>,
+  ): Promise<TResponse> => {
     const encryptedParams = encodeBase64(encrypt(encryptionKey, encryptionVariant, request));
     const rpcRequest: RpcRequest = {
       method: `${options.scopePrefix}:${method}`,
       params: encryptedParams,
+      ...(transport?.requestId ? { requestId: transport.requestId } : {}),
+      ...(typeof transport?.timeoutMs === 'number' ? { timeoutMs: transport.timeoutMs } : {}),
     };
     const encryptedResponse = await manager.handleRequest(rpcRequest);
     return decrypt(encryptionKey, encryptionVariant, decodeBase64(encryptedResponse)) as TResponse;

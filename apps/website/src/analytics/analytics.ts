@@ -68,6 +68,31 @@ let started = false;
 let loading = false;
 let client: PostHog | null = null;
 
+export type AnalyticsStatus =
+    | 'loading'
+    | 'active'
+    | 'opted-out'
+    | 'browser-refused'
+    | 'unavailable';
+
+let status: AnalyticsStatus = 'loading';
+const statusListeners = new Set<() => void>();
+
+function setAnalyticsStatus(next: AnalyticsStatus): void {
+    if (status === next) return;
+    status = next;
+    for (const listener of statusListeners) listener();
+}
+
+export function getAnalyticsStatus(): AnalyticsStatus {
+    return status;
+}
+
+export function subscribeAnalyticsStatus(listener: () => void): () => void {
+    statusListeners.add(listener);
+    return () => statusListeners.delete(listener);
+}
+
 /**
  * Imported from `../i18n/locales` (the pure registry) rather than `../i18n`
  * (which exports React components): analytics boots before React does, and
@@ -84,7 +109,14 @@ function readLocale(): string {
 
 /** True when analytics is live in this page load. Events no-op otherwise. */
 export function isAnalyticsActive(): boolean {
-    return started;
+    return status === 'active';
+}
+
+function captureBlockStatus(): Extract<AnalyticsStatus, 'opted-out' | 'browser-refused'> | null {
+    const nav = navigator as Navigator & { globalPrivacyControl?: boolean };
+    if (nav.globalPrivacyControl === true) return 'browser-refused';
+    if (readOptOut()) return 'opted-out';
+    return null;
 }
 
 /**
@@ -108,13 +140,7 @@ export function isAnalyticsActive(): boolean {
  */
 export function shouldCapture(): boolean {
     if (typeof window === 'undefined' || typeof navigator === 'undefined') return false;
-
-    const nav = navigator as Navigator & { globalPrivacyControl?: boolean };
-    if (nav.globalPrivacyControl === true) return false;
-
-    if (readOptOut()) return false;
-
-    return true;
+    return captureBlockStatus() === null;
 }
 
 /** Reads the visitor's stored refusal. Storage failures mean "not opted out". */
@@ -146,16 +172,29 @@ export function optOut(): void {
         /* private mode: the in-page kill switch below still applies */
     }
     client?.set_config({ before_send: () => null });
-    started = false;
+    setAnalyticsStatus('opted-out');
 }
 
-/** Re-enable analytics. Takes effect on the next page load. */
+/** Re-enable analytics immediately when the browser permits it. */
 export function optIn(): void {
     try {
         window.localStorage.removeItem(OPT_OUT_STORAGE_KEY);
     } catch {
         /* nothing to clear */
     }
+    if (typeof window === 'undefined' || typeof navigator === 'undefined') return;
+    const blocked = captureBlockStatus();
+    if (blocked) {
+        setAnalyticsStatus(blocked);
+        return;
+    }
+    if (client && started) {
+        client.set_config({ before_send: undefined });
+        setAnalyticsStatus('active');
+        return;
+    }
+    setAnalyticsStatus('loading');
+    initAnalytics();
 }
 
 /**
@@ -186,11 +225,16 @@ function applyUrlOptOut(): void {
  */
 export function initAnalytics(): void {
     if (started || loading) return;
-    if (import.meta.env.SSR) return;
+    if (typeof window === 'undefined' || typeof navigator === 'undefined') return;
     applyUrlOptOut();
-    if (!shouldCapture()) return;
+    const blocked = captureBlockStatus();
+    if (blocked) {
+        setAnalyticsStatus(blocked);
+        return;
+    }
 
     if (!POSTHOG_KEY) {
+        setAnalyticsStatus('unavailable');
         // Loud, but only in the browser console — a missing key must never take
         // the marketing page down. The production build already refuses to
         // produce this artifact (assertAnalyticsKey in vite.config.ts).
@@ -204,12 +248,17 @@ export function initAnalytics(): void {
         return;
     }
 
+    setAnalyticsStatus('loading');
     loading = true;
     void import('posthog-js/dist/module.slim.no-external')
         .then(({ default: posthog }) => {
             loading = false;
             // The visitor may have opted out while the lazy chunk was loading.
-            if (!shouldCapture()) return;
+            const delayedBlock = captureBlockStatus();
+            if (delayedBlock) {
+                setAnalyticsStatus(delayedBlock);
+                return;
+            }
             client = posthog;
             posthog.init(POSTHOG_KEY, {
         // --- where ---------------------------------------------------------
@@ -252,6 +301,7 @@ export function initAnalytics(): void {
         // --- shape ------------------------------------------------------------
                 loaded: () => {
                     started = true;
+                    setAnalyticsStatus('active');
                 },
                 sanitize_properties: (properties, _eventName) => ({
                     ...properties,
@@ -266,9 +316,11 @@ export function initAnalytics(): void {
                 }),
             });
             started = true;
+            setAnalyticsStatus('active');
         })
         .catch((error: unknown) => {
             loading = false;
+            setAnalyticsStatus('unavailable');
             console.error('[analytics] failed to load PostHog', error);
         });
 }
@@ -281,7 +333,7 @@ export function initAnalytics(): void {
  * events.test.ts enforces that.
  */
 export function track(event: string, properties?: Record<string, unknown>): void {
-    if (!started) return;
+    if (status !== 'active') return;
     client?.capture(event, properties);
 }
 

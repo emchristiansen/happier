@@ -3,6 +3,7 @@ import { serverFetch } from '@/sync/http/client';
 import { HappyError } from '@/utils/errors/errors';
 import { backoff } from '@/utils/timing/time';
 import { createConnectedServiceApiError } from './connectedServiceApiError';
+import { assertConnectedServiceOperationSupported } from './connectedServiceOperationSupport';
 
 import {
   assertConnectedServiceCredentialRecordBinding,
@@ -40,6 +41,7 @@ export async function registerConnectedServiceCredentialPlain(
     reconnect?: Readonly<{ allowProviderIdentityChange?: boolean }>;
   } & ConnectedServiceCredentialPlainWriteRevisionBoundary>,
 ): Promise<ConnectedServiceCredentialRevisionBoundaryV1> {
+    await assertConnectedServiceOperationSupported(params.serviceId);
     const response = await serverFetch(
       `/v3/connect/${encodeURIComponent(params.serviceId)}/profiles/${encodeURIComponent(params.profileId)}/credential`,
       {

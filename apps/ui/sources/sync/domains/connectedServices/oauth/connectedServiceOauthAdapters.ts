@@ -14,6 +14,7 @@ import { createConnectedServiceOauthExchangeKeyPair } from './createConnectedSer
 
 import { buildClaudeSubscriptionAuthorizationUrl, CLAUDE_SUBSCRIPTION_OAUTH } from './claudeSubscriptionOauth';
 import { buildGeminiAuthorizationUrl, GEMINI_OAUTH } from './geminiOauth';
+import { buildAntigravityAuthorizationUrl, ANTIGRAVITY_OAUTH } from './antigravityOauth';
 import { buildOpenAiCodexAuthorizationUrl, OPENAI_CODEX_OAUTH } from './openAiCodexOauth';
 
 export type ConnectedServiceOauthAddMethod = 'device' | 'paste' | 'browser';
@@ -22,6 +23,8 @@ export type ConnectedServiceOauthMode = 'device' | 'paste' | 'embedded';
 export type ConnectedServiceOauthAdapter = Readonly<{
   serviceId: ConnectedServiceId;
   defaultRedirectUri: string;
+  /** Manual code-only paste is protected by this attempt's PKCE at Google. */
+  allowRawAuthorizationCode?: true;
   buildAuthorizationUrl: (params: Readonly<{
     redirectUri: string;
     state: string;
@@ -131,6 +134,15 @@ const CLAUDE_SUBSCRIPTION_ADAPTER: ConnectedServiceOauthAdapter = Object.freeze(
 });
 
 const ADAPTERS_BY_SERVICE_ID: Readonly<Partial<Record<ConnectedServiceId, ConnectedServiceOauthAdapter>>> = Object.freeze({
+  antigravity: Object.freeze<ConnectedServiceOauthAdapter>({
+    serviceId: 'antigravity',
+    allowRawAuthorizationCode: ANTIGRAVITY_OAUTH.allowRawAuthorizationCode,
+    defaultRedirectUri: ANTIGRAVITY_OAUTH.defaultRedirectUri,
+    buildAuthorizationUrl: buildAntigravityAuthorizationUrl,
+    exchangeAuthorizationCodeForRecord: async (params) => exchangeOauthViaProxy({
+      ...params, serviceId: 'antigravity',
+    }),
+  }),
   'openai-codex': OPENAI_CODEX_ADAPTER,
   gemini: GEMINI_ADAPTER,
   'claude-subscription': CLAUDE_SUBSCRIPTION_ADAPTER,

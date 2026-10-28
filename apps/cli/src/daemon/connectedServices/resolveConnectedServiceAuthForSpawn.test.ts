@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,8 +9,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   buildProviderAccountUsageRecordId,
+  ConnectedServiceAuthGroupPolicyV1Schema,
   sealAccountScopedBlobCiphertext,
   type ConnectedServiceCredentialRecordV1,
+  type ConnectedServiceAuthGroupV1,
   type ProviderAccountUsageRecordKeyV1,
   type ProviderAccountUsageSnapshotV1,
 } from '@happier-dev/protocol';
@@ -31,7 +33,7 @@ import {
 import type { ConnectedServicesMaterializationDiagnostic } from './materialize/providerMaterializerTypes';
 import type { ConnectedServiceCredentialRefreshResult } from './refresh/ConnectedServiceRefreshCoordinator';
 import { resolveClaudeCodeCredentialsFilePath } from '@/backends/claude/connectedServices/nativeAuth/claudeCodeCredentialFile';
-import { normalizeMaterializationKeyForPath } from './materialize/normalizeMaterializationKeyForPath';
+import { resolveConnectedServiceSelectionHomeDir } from './homes/resolveConnectedServiceHomeDir';
 
 const { spawnSpy } = vi.hoisted(() => ({
   spawnSpy: vi.fn(),
@@ -44,10 +46,6 @@ vi.mock('node:child_process', async (importOriginal) => {
     spawn: spawnSpy,
   };
 });
-
-function resolveCodexHomeForMaterialization(baseDir: string, materializationKey: string): string {
-  return join(baseDir, normalizeMaterializationKeyForPath(materializationKey), 'codex', 'codex-home');
-}
 
 async function readClaudeCodeNativeCredential(claudeConfigDir: string): Promise<Record<string, unknown>> {
   return JSON.parse(await readFile(resolveClaudeCodeCredentialsFilePath(claudeConfigDir), 'utf8')) as Record<string, unknown>;
@@ -64,7 +62,7 @@ function createSealedCredentialServer(input: Readonly<{
   credentialRevision?: string;
 }>) {
   const encryption = input.credentials.encryption;
-  if (encryption.type !== 'legacy') throw new Error('test fixture expected legacy encryption');
+  if (encryption?.type !== 'legacy') throw new Error('test fixture expected legacy encryption');
   let record = input.record;
   let credentialRevision = input.credentialRevision ?? null;
   return {
@@ -218,10 +216,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -625,10 +623,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -716,10 +714,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -823,10 +821,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -915,10 +913,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -1002,10 +1000,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -1078,10 +1076,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -1169,10 +1167,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -1255,10 +1253,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -1420,10 +1418,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -1519,10 +1517,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -1553,16 +1551,6 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
         refreshWindowMs: 60_000,
       },
     }));
-    const switchBeforeTurn = vi.fn(async () => ({
-      status: 'observed_generation' as const,
-      activeProfileId: 'primary',
-      generation: 7,
-    }));
-    const switchAfterClassifiedFailure = vi.fn(async () => ({
-      status: 'switched' as const,
-      activeProfileId: 'backup',
-      generation: 8,
-    }));
     const getConnectedServiceCredentialSealed = vi.fn(async (params: { serviceId: string; profileId: string }) => {
       const ciphertext = ciphertextByProfileId.get(params.profileId);
       if (params.serviceId !== 'openai-codex' || !ciphertext) return null;
@@ -1577,15 +1565,17 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       };
     });
 
-    const api = {
-      getConnectedServiceAuthGroup: async () => ({
+    let activeProfileId = 'primary';
+    let generation = 7;
+    const getConnectedServiceAuthGroup = async (): Promise<ConnectedServiceAuthGroupV1> => ({
         v: 1,
         serviceId: 'openai-codex',
         groupId: 'main',
         displayName: null,
-        activeProfileId: 'primary',
-        generation: 7,
-        policy: {
+        activeProfileId,
+        generation,
+        runtimeStateRevision: 0,
+        policy: ConnectedServiceAuthGroupPolicyV1Schema.parse({
           v: 1,
           strategy: 'priority',
           autoSwitch: true,
@@ -1595,7 +1585,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
             accountChanged: true,
             refreshFailure: true,
           },
-        },
+        }),
         state: { v: 1 },
         members: [
           {
@@ -1623,11 +1613,28 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
         ],
         createdAt: 1,
         updatedAt: 1,
-      }),
+      });
+    const updateConnectedServiceAuthGroupActiveProfile = vi.fn(async (input: { activeProfileId: string; expectedGeneration: number }) => {
+      expect(input.expectedGeneration).toBe(generation);
+      activeProfileId = input.activeProfileId;
+      generation += 1;
+      return await getConnectedServiceAuthGroup();
+    });
+    const api = {
+      getConnectedServiceAuthGroup,
+      updateConnectedServiceAuthGroupActiveProfile,
       getConnectedServiceCredentialSealed,
     } as unknown as ApiClient;
+    const coordinator = createDaemonConnectedServiceAuthGroupSwitchCoordinator({
+      api: api as Parameters<typeof createDaemonConnectedServiceAuthGroupSwitchCoordinator>[0]['api'],
+      runtimeQuotaSnapshots: new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore(),
+      quotaFreshnessMs: 60_000,
+      nowMs: () => now,
+      resolveCurrentCredentialRevision: async () => 'csr_testcredentialrevision',
+      restartSession: async () => {},
+    });
 
-    await expect(resolveConnectedServiceAuthForSpawn({
+    const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
       agentId: 'codex',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -1647,11 +1654,11 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       api,
       nowMs: () => now,
       sessionId: 'session-1',
-      authGroupSwitchCoordinator: { switchBeforeTurn, switchAfterClassifiedFailure },
+      authGroupSwitchCoordinator: coordinator,
       credentialRefreshService: {
         refreshConnectedServiceCredentialForSpawnPreflight,
       },
-    })).resolves.not.toBeNull();
+    });
 
     expect(refreshConnectedServiceCredentialForSpawnPreflight).toHaveBeenCalledWith({
       serviceId: 'openai-codex',
@@ -1660,15 +1667,13 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     expect(getConnectedServiceCredentialSealed).toHaveBeenCalledWith(expect.objectContaining({
       profileId: 'backup',
     }));
-    expect(switchBeforeTurn).not.toHaveBeenCalled();
-    expect(switchAfterClassifiedFailure).toHaveBeenCalledTimes(1);
-    expect(switchAfterClassifiedFailure).toHaveBeenCalledWith({
-      sessionId: 'session-1',
-      serviceId: 'openai-codex',
-      groupId: 'main',
-      reason: 'refresh_failed',
-      observedProfileId: 'primary',
-    });
+    expect(await getConnectedServiceAuthGroup()).toMatchObject({ activeProfileId: 'backup', generation: 8 });
+    expect(updateConnectedServiceAuthGroupActiveProfile).toHaveBeenCalledWith(expect.objectContaining({
+      activeProfileId: 'backup', expectedGeneration: 7, switchReason: 'refresh_failed',
+    }));
+    expect(connectedServiceAuth).not.toBeNull();
+    const auth = JSON.parse(await readFile(join(connectedServiceAuth!.env.CODEX_HOME, 'auth.json'), 'utf8'));
+    expect(auth.access_token).toBe('backup-access');
   });
 
   it('surfaces reconnect-required when active credential refresh fails instead of consulting group fallback', async () => {
@@ -1692,10 +1697,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
         providerEmail: null,
       },
     });
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -1847,10 +1852,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -2073,10 +2078,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -2271,10 +2276,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -2529,10 +2534,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -2706,10 +2711,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -2889,10 +2894,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
 
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
@@ -2933,7 +2938,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
 
     expect(connectedServiceAuth).not.toBeNull();
     expect(connectedServiceAuth!.env.CODEX_HOME).toBe(
-      resolveCodexHomeForMaterialization(baseDir, 'session-1'),
+      join(resolveConnectedServiceSelectionHomeDir({
+        activeServerDir, serviceId: 'openai-codex', agentId: 'codex', fallbackProfileId: 'work',
+        selection: { kind: 'profile', profileId: 'work' },
+      }), 'codex-home'),
     );
     const auth = JSON.parse(await readFile(join(connectedServiceAuth!.env.CODEX_HOME, 'auth.json'), 'utf8'));
     expect(auth.access_token).toBe('access');
@@ -2960,10 +2968,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(8) },
-    };
+    } satisfies Credentials;
 
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
@@ -3019,7 +3027,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
 
     expect(connectedServiceAuth).not.toBeNull();
     expect(connectedServiceAuth!.env.CODEX_HOME).toBe(
-      resolveCodexHomeForMaterialization(baseDir, 'session-1'),
+      join(resolveConnectedServiceSelectionHomeDir({
+        activeServerDir, serviceId: 'openai-codex', agentId: 'codex', fallbackProfileId: 'backup',
+        selection: { kind: 'group', groupId: 'main' },
+      }), 'codex-home'),
     );
     const auth = JSON.parse(await readFile(join(connectedServiceAuth!.env.CODEX_HOME, 'auth.json'), 'utf8'));
     expect(auth.access_token).toBe('backup-access');
@@ -3029,10 +3040,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     const baseDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-test-'));
     const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-server-test-'));
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(8) },
-    };
+    } satisfies Credentials;
 
     const api = {
       getConnectedServiceAuthGroup: async () => ({
@@ -3068,7 +3079,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     expect((api as unknown as { getConnectedServiceCredentialSealed: ReturnType<typeof vi.fn> }).getConnectedServiceCredentialSealed).not.toHaveBeenCalled();
   });
 
-  it('switches exhausted group active profile before materializing spawn auth', async () => {
+  it.each([false, true])('switches exhausted group active profile before materializing spawn auth (superseded before write: %s)', async (supersededBeforeWrite) => {
     const baseDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-test-'));
     const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-server-test-'));
 
@@ -3105,10 +3116,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
 
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
@@ -3127,57 +3138,17 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       randomBytes: (length) => randomBytes(length),
     });
 
-    const updateConnectedServiceAuthGroupActiveProfile = vi.fn(async () => ({
-      v: 1,
-      serviceId: 'openai-codex',
-      groupId: 'main',
-      displayName: null,
-      activeProfileId: 'backup',
-      generation: 8,
-      policy: { v: 1, strategy: 'least_limited', autoSwitch: true },
-      state: { v: 1 },
-      members: [
-        {
-          v: 1,
-          serviceId: 'openai-codex',
-          groupId: 'main',
-          profileId: 'primary',
-          enabled: true,
-          priority: 1,
-          state: { v: 1, quotaExhaustedUntilMs: 5_000 },
-          createdAt: 1,
-          updatedAt: 1,
-        },
-        {
-          v: 1,
-          serviceId: 'openai-codex',
-          groupId: 'main',
-          profileId: 'backup',
-          enabled: true,
-          priority: 2,
-          state: { v: 1 },
-          createdAt: 2,
-          updatedAt: 2,
-        },
-      ],
-      createdAt: 1,
-      updatedAt: 1,
-    }));
-    const switchBeforeTurn = vi.fn(async () => ({
-      status: 'switched' as const,
-      activeProfileId: 'backup',
-      generation: 8,
-    }));
-
-    const api = {
-      getConnectedServiceAuthGroup: async () => ({
+    let activeProfileId = 'primary';
+    let generation = 7;
+    const getConnectedServiceAuthGroup = async (): Promise<ConnectedServiceAuthGroupV1> => ({
         v: 1,
         serviceId: 'openai-codex',
         groupId: 'main',
         displayName: null,
-        activeProfileId: 'primary',
-        generation: 7,
-        policy: { v: 1, strategy: 'least_limited', autoSwitch: true },
+        activeProfileId,
+        generation,
+        runtimeStateRevision: 0,
+        policy: ConnectedServiceAuthGroupPolicyV1Schema.parse({ v: 1, strategy: 'least_limited', autoSwitch: true }),
         state: { v: 1 },
         members: [
           {
@@ -3205,7 +3176,15 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
         ],
         createdAt: 1,
         updatedAt: 1,
-      }),
+      });
+    const updateConnectedServiceAuthGroupActiveProfile = vi.fn(async (input: { activeProfileId: string; expectedGeneration: number }) => {
+      expect(input.expectedGeneration).toBe(generation);
+      activeProfileId = input.activeProfileId;
+      generation += 1;
+      return await getConnectedServiceAuthGroup();
+    });
+    const api = {
+      getConnectedServiceAuthGroup,
       updateConnectedServiceAuthGroupActiveProfile,
       getConnectedServiceCredentialSealed: async (params: { serviceId: string; profileId: string }) => {
         const { serviceId, profileId } = params;
@@ -3216,6 +3195,11 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
         } as const;
         const sealedCiphertext = ciphertextByProfileId[profileId as keyof typeof ciphertextByProfileId];
         if (!sealedCiphertext) return null;
+        if (supersededBeforeWrite && profileId === 'backup') {
+          // Another client commits a selection while the credential GET is in flight.
+          activeProfileId = 'primary';
+          generation += 1;
+        }
         return {
           sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
           metadata: { kind: 'oauth', providerEmail: null, providerAccountId: `${profileId}-acct`, expiresAt: null },
@@ -3223,16 +3207,34 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     } as unknown as ApiClient;
 
-    const resolveWithCoordinator = resolveConnectedServiceAuthForSpawn as unknown as (
-      params: Parameters<typeof resolveConnectedServiceAuthForSpawn>[0] & {
-        authGroupSwitchCoordinator: Readonly<{
-          switchBeforeTurn: typeof switchBeforeTurn;
-        }>;
-        sessionId: string;
+    const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
+    runtimeQuotaSnapshots.recordSnapshot({
+      serviceId: 'openai-codex', groupId: 'main', profileId: 'backup',
+      snapshot: {
+        v: 1, serviceId: 'openai-codex', profileId: 'backup', fetchedAt: 1_000, staleAfterMs: 60_000,
+        planLabel: null, accountLabel: null,
+        meters: [{
+          meterId: 'monthly', label: 'Monthly', used: null, limit: null, unit: 'unknown',
+          utilizationPct: 40, remainingPct: 60, resetsAt: 5_000, status: 'ok', details: {},
+        }],
       },
-    ) => ReturnType<typeof resolveConnectedServiceAuthForSpawn>;
-
-    const connectedServiceAuth = await resolveWithCoordinator({
+    });
+    const coordinator = createDaemonConnectedServiceAuthGroupSwitchCoordinator({
+      api: api as Parameters<typeof createDaemonConnectedServiceAuthGroupSwitchCoordinator>[0]['api'],
+      runtimeQuotaSnapshots,
+      quotaFreshnessMs: 60_000,
+      nowMs: () => 1_000,
+      resolveCurrentCredentialRevision: async () => 'csr_testcredentialrevision',
+      restartSession: async () => {},
+    });
+    const targetHome = join(resolveConnectedServiceSelectionHomeDir({
+      activeServerDir, serviceId: 'openai-codex', agentId: 'codex', fallbackProfileId: 'primary',
+      selection: { kind: 'group', groupId: 'main' },
+    }), 'codex-home');
+    const existingAuth = JSON.stringify({ access_token: 'existing-access' });
+    await mkdir(targetHome, { recursive: true });
+    await writeFile(join(targetHome, 'auth.json'), existingAuth);
+    const resolution = resolveConnectedServiceAuthForSpawn({
       agentId: 'codex',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -3250,22 +3252,29 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       baseDir,
       credentials,
       api,
-      runtimeQuotaSnapshots: new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore(),
+      runtimeQuotaSnapshots,
       quotaFreshnessMs: 60_000,
       nowMs: () => 1_000,
       sessionId: 'session-1',
-      authGroupSwitchCoordinator: { switchBeforeTurn },
+      authGroupSwitchCoordinator: coordinator,
     });
 
-    expect(switchBeforeTurn).toHaveBeenCalledWith({
-      sessionId: 'session-1',
-      serviceId: 'openai-codex',
-      groupId: 'main',
-      reason: 'usage_limit',
-      observedProfileId: 'primary',
-    });
-    expect(updateConnectedServiceAuthGroupActiveProfile).not.toHaveBeenCalled();
+    if (supersededBeforeWrite) {
+      await expect(resolution).rejects.toMatchObject({
+        name: 'ConnectedServiceSpawnMaterializationError',
+        diagnostics: [expect.objectContaining({ code: 'codex_connected_service_generation_superseded' })],
+      });
+      await expect(readFile(join(targetHome, 'auth.json'), 'utf8')).resolves.toBe(existingAuth);
+      expect((await getConnectedServiceAuthGroup()).generation).toBeGreaterThan(8);
+      return;
+    }
+    const connectedServiceAuth = await resolution;
+    expect(updateConnectedServiceAuthGroupActiveProfile).toHaveBeenCalledWith(expect.objectContaining({
+      activeProfileId: 'backup', expectedGeneration: 7, switchReason: 'usage_limit',
+    }));
+    expect(await getConnectedServiceAuthGroup()).toMatchObject({ activeProfileId: 'backup', generation: 8 });
     expect(connectedServiceAuth).not.toBeNull();
+    expect(connectedServiceAuth!.env.CODEX_HOME).toBe(targetHome);
     const auth = JSON.parse(await readFile(join(connectedServiceAuth!.env.CODEX_HOME, 'auth.json'), 'utf8'));
     expect(auth.access_token).toBe('backup-access');
   });
@@ -3307,10 +3316,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(12) },
-    };
+    } satisfies Credentials;
 
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
@@ -3330,16 +3339,19 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     });
 
     let groupReads = 0;
-    const getConnectedServiceAuthGroup = vi.fn(async () => {
+    const getConnectedServiceAuthGroup = vi.fn(async (): Promise<ConnectedServiceAuthGroupV1> => {
       groupReads += 1;
       return {
         v: 1,
         serviceId: 'openai-codex',
         groupId: 'main',
         displayName: null,
-        activeProfileId: groupReads === 1 ? 'primary' : 'backup',
-        generation: groupReads === 1 ? 7 : 8,
-        policy: { v: 1, strategy: 'least_limited', autoSwitch: true },
+        // The spawn read and coordinator GET both capture stale primary truth; a peer's
+        // committed selection becomes visible on the authoritative reread after selection.
+        activeProfileId: groupReads <= 2 ? 'primary' : 'backup',
+        generation: groupReads <= 2 ? 7 : 8,
+        runtimeStateRevision: 0,
+        policy: ConnectedServiceAuthGroupPolicyV1Schema.parse({ v: 1, strategy: 'least_limited', autoSwitch: true }),
         state: { v: 1 },
         members: [
           {
@@ -3360,7 +3372,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
             profileId: 'backup',
             enabled: true,
             priority: 2,
-            state: { v: 1 },
+            state: groupReads <= 2 ? { v: 1, quotaExhaustedUntilMs: 5_000 } : { v: 1 },
             createdAt: 2,
             updatedAt: 2,
           },
@@ -3369,17 +3381,12 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
         updatedAt: 1,
       };
     });
-    const switchBeforeTurn = vi.fn(async () => ({
-      status: 'no_eligible_member' as const,
-      generation: 7,
-      retryAtMs: null,
-      excluded: [
-        { profileId: 'backup', reason: 'quota_unknown' as const },
-      ],
-    }));
-
+    const updateConnectedServiceAuthGroupActiveProfile = vi.fn(async () => {
+      throw new Error('Stale quota evidence must not commit another selection');
+    });
     const api = {
       getConnectedServiceAuthGroup,
+      updateConnectedServiceAuthGroupActiveProfile,
       getConnectedServiceCredentialSealed: async (params: { serviceId: string; profileId: string }) => {
         const { serviceId, profileId } = params;
         if (serviceId !== 'openai-codex') return null;
@@ -3396,16 +3403,17 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     } as unknown as ApiClient;
 
-    const resolveWithCoordinator = resolveConnectedServiceAuthForSpawn as unknown as (
-      params: Parameters<typeof resolveConnectedServiceAuthForSpawn>[0] & {
-        authGroupSwitchCoordinator: Readonly<{
-          switchBeforeTurn: typeof switchBeforeTurn;
-        }>;
-        sessionId: string;
-      },
-    ) => ReturnType<typeof resolveConnectedServiceAuthForSpawn>;
-
-    const connectedServiceAuth = await resolveWithCoordinator({
+    const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
+    const coordinator = createDaemonConnectedServiceAuthGroupSwitchCoordinator({
+      api: api as Parameters<typeof createDaemonConnectedServiceAuthGroupSwitchCoordinator>[0]['api'],
+      runtimeQuotaSnapshots,
+      quotaFreshnessMs: 60_000,
+      nowMs: () => 1_000,
+      resolveCurrentCredentialRevision: async () => 'csr_testcredentialrevision',
+      restartSession: async () => {},
+    });
+    const switchBeforeTurn = vi.spyOn(coordinator, 'switchBeforeTurn');
+    const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
       agentId: 'codex',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -3423,21 +3431,19 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       baseDir,
       credentials,
       api,
-      runtimeQuotaSnapshots: new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore(),
+      runtimeQuotaSnapshots,
       quotaFreshnessMs: 60_000,
       nowMs: () => 1_000,
       sessionId: 'session-1',
-      authGroupSwitchCoordinator: { switchBeforeTurn },
+      authGroupSwitchCoordinator: coordinator,
     });
 
-    expect(switchBeforeTurn).toHaveBeenCalledWith({
-      sessionId: 'session-1',
-      serviceId: 'openai-codex',
-      groupId: 'main',
-      reason: 'usage_limit',
-      observedProfileId: 'primary',
+    await expect(switchBeforeTurn.mock.results[0]?.value).resolves.toMatchObject({
+      status: 'no_eligible_member', generation: 7,
+      excluded: expect.arrayContaining([expect.objectContaining({ profileId: 'backup', reason: 'quota_exhausted' })]),
     });
-    expect(getConnectedServiceAuthGroup).toHaveBeenCalledTimes(2);
+    expect(updateConnectedServiceAuthGroupActiveProfile).not.toHaveBeenCalled();
+    expect(await getConnectedServiceAuthGroup()).toMatchObject({ activeProfileId: 'backup', generation: 8 });
     expect(connectedServiceAuth?.connectedServicesBindings.bindingsByServiceId['openai-codex']).toEqual({
       source: 'connected',
       selection: 'group',
@@ -3484,10 +3490,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(18) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -3647,10 +3653,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(18) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -3813,10 +3819,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(19) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -4089,10 +4095,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(23) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }
@@ -4379,10 +4385,10 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'happy-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(10) },
-    };
+    } satisfies Credentials;
     if (credentials.encryption.type !== 'legacy') {
       throw new Error('test fixture expected legacy encryption');
     }

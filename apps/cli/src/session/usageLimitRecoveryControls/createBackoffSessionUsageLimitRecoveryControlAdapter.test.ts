@@ -88,6 +88,40 @@ function createAdapter() {
 }
 
 describe('createBackoffSessionUsageLimitRecoveryControlAdapter', () => {
+  it('checks the current failure instead of reusing an earlier issue reset', async () => {
+    const params = createParams();
+    const issue = params.rawSession.lastRuntimeIssue!;
+    const result = await createAdapter().checkNow?.({
+      ...params,
+      rawSession: { ...params.rawSession, lastRuntimeIssue: { ...issue, occurredAt: 1_700_000_100_000,
+        usageLimit: { ...issue.usageLimit!, resetAtMs: 1_700_000_160_000 },
+      } },
+      metadata: { sessionUsageLimitRecoveryV1: createWaitingIntent() },
+    });
+    expect(result).toMatchObject({ status: 'waiting', metadata: { sessionUsageLimitRecoveryV1: {
+      issueFingerprint: 'usage-limit:codex:turn-1:1700000100000:1700000160000',
+      armedAtMs: 1_700_000_100_000, resetAtMs: 1_700_000_160_000,
+    } } });
+  });
+
+  it('uses the shared fallback policy when a provider supplies no overrides', async () => {
+    const params = createParams();
+    params.rawSession.lastRuntimeIssue!.usageLimit!.resetAtMs = null;
+    const adapter = createBackoffSessionUsageLimitRecoveryControlAdapter({
+      providerId: 'codex',
+      fallbackBackoffEnvKey: 'HAPPIER_TEST_FALLBACK_BACKOFF_MS',
+      maxAttemptsEnvKey: 'HAPPIER_TEST_MAX_ATTEMPTS',
+      nowMs: () => 1_700_000_000_000,
+      processEnv: {},
+    });
+    expect(await adapter.checkNow?.(params)).toMatchObject({
+      status: 'waiting',
+      metadata: { sessionUsageLimitRecoveryV1: {
+        nextCheckAtMs: 1_700_000_600_000,
+        maxAttempts: 3,
+      } },
+    });
+  });
   it('clears a persisted pending intent instead of declaring ready when the latest turn completed normally', async () => {
     const adapter = createAdapter();
 

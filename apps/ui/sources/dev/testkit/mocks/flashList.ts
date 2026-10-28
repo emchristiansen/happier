@@ -4,6 +4,7 @@ type CapturingFlashListMockOptions = {
     componentName?: string;
     itemWrapperName?: string;
     renderItems?: boolean;
+    memoizeItems?: boolean;
     refHandle?: unknown;
 };
 
@@ -21,9 +22,20 @@ type CreateCapturingListMockOptions = CapturingFlashListMockOptions & {
     itemWrapperName: string;
 };
 
+// Mirror the external engines' item/extraData/renderer invalidation contract when requested.
+const MemoizedCapturedListItem = React.memo(function MemoizedCapturedListItem(props: Readonly<{
+    item: unknown;
+    index: number;
+    extraData: unknown;
+    renderItem?: (input: Readonly<{ item: unknown; index: number }>) => React.ReactNode;
+}>) {
+    return React.useMemo(() => props.renderItem?.({ item: props.item, index: props.index }) ?? null,
+        [props.item, props.index, props.extraData, props.renderItem]);
+});
+
 function renderListComponent(
     props: any,
-    options: Pick<CreateCapturingListMockOptions, 'componentName' | 'itemWrapperName' | 'renderItems'>,
+    options: Pick<CreateCapturingListMockOptions, 'componentName' | 'itemWrapperName' | 'renderItems' | 'memoizeItems'>,
 ) {
     const renderAuxiliaryComponent = (component: any) => {
         if (!component) return null;
@@ -39,7 +51,9 @@ function renderListComponent(
                 const key = typeof props.keyExtractor === 'function'
                     ? props.keyExtractor(item, index)
                     : item?.id ?? String(index);
-                const child = typeof props.renderItem === 'function'
+                const child = options.memoizeItems
+                    ? React.createElement(MemoizedCapturedListItem, { item, index, extraData: props.extraData, renderItem: props.renderItem })
+                    : typeof props.renderItem === 'function'
                     ? props.renderItem({ item, index })
                     : null;
                 return React.createElement(options.itemWrapperName, { key }, child);
@@ -79,6 +93,7 @@ export function createCapturingFlashListMock(
             componentName,
             itemWrapperName,
             renderItems: options.renderItems,
+            memoizeItems: options.memoizeItems,
         });
     });
 
@@ -108,6 +123,7 @@ export function createCapturingFlatListMock(
             componentName,
             itemWrapperName,
             renderItems: options.renderItems,
+            memoizeItems: options.memoizeItems,
         });
     };
 

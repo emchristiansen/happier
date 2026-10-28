@@ -13,15 +13,36 @@ const styles = StyleSheet.create((theme) => ({
         top: -3,
         right: -8,
         backgroundColor: theme.colors.status.error,
-        borderRadius: 6.5,
+        borderRadius: 999,
         minWidth: 13,
-        height: 13,
+        minHeight: 13,
         paddingHorizontal: 3,
         justifyContent: 'center',
         alignItems: 'center',
     },
+    countBadgeCompact: {
+        minWidth: 8,
+        minHeight: 8,
+        paddingHorizontal: 2,
+        right: -6,
+    },
+    compactText: {
+        fontSize: 7,
+        lineHeight: 8,
+    },
+    diffChipCompact: {
+        minHeight: 8,
+        paddingHorizontal: 2,
+        gap: 1,
+    },
     countBadgeNeutral: {
         backgroundColor: theme.colors.accent.blue,
+    },
+    countBadgeNeutralCompact: {
+        backgroundColor: theme.colors.surface.elevated,
+    },
+    countTextNeutralCompact: {
+        color: theme.colors.text.secondary,
     },
     countText: {
         color: theme.colors.button.primary.tint,
@@ -45,9 +66,9 @@ const styles = StyleSheet.create((theme) => ({
         flexDirection: 'row',
         alignItems: 'center',
         gap: 2,
-        height: 12,
+        minHeight: 12,
         paddingHorizontal: 3,
-        borderRadius: 6,
+        borderRadius: 999,
         backgroundColor: theme.colors.surface.base,
         borderWidth: StyleSheet.hairlineWidth,
         borderColor: theme.colors.border.default,
@@ -88,6 +109,7 @@ type TabBadgeProps =
     | Readonly<{ variant: 'dot'; style?: StyleProp<ViewStyle>; testID?: string }>
     | Readonly<{
         variant: 'count';
+        size?: 'default' | 'compact';
         value: number;
         max?: number;
         tone?: TabBadgeCountTone;
@@ -96,6 +118,7 @@ type TabBadgeProps =
     }>
     | Readonly<{
         variant: 'diff';
+        size?: 'default' | 'compact';
         added: number;
         removed: number;
         modifiedCount: number;
@@ -119,11 +142,12 @@ export function TabBadge(props: TabBadgeProps): React.ReactElement {
                 testID={props.testID}
                 style={[
                     styles.countBadge,
-                    props.tone === 'neutral' ? styles.countBadgeNeutral : null,
+                    props.size === 'compact' ? styles.countBadgeCompact : null,
+                    props.tone === 'neutral' ? (props.size === 'compact' ? styles.countBadgeNeutralCompact : styles.countBadgeNeutral) : null,
                     props.style ?? null,
                 ]}
             >
-                <Text style={styles.countText}>{formatBadgeCount(props.value, props.max)}</Text>
+                <Text style={[styles.countText, props.size === 'compact' ? styles.compactText : null, props.size === 'compact' && props.tone === 'neutral' ? styles.countTextNeutralCompact : null]}>{formatBadgeCount(props.value, props.max)}</Text>
             </View>
         );
     }
@@ -131,18 +155,18 @@ export function TabBadge(props: TabBadgeProps): React.ReactElement {
     const max = props.max ?? 999;
     const showLines = props.added > 0 || props.removed > 0;
     return (
-        <View testID={props.testID} style={props.style ? [styles.diffChip, props.style] : styles.diffChip}>
+        <View testID={props.testID} style={[styles.diffChip, props.size === 'compact' ? styles.diffChipCompact : null, props.style]}>
             {showLines ? (
                 <>
                     {props.added > 0 ? (
-                        <Text style={styles.diffAdded}>{`+${formatBadgeCount(props.added, max)}`}</Text>
+                        <Text style={[styles.diffAdded, props.size === 'compact' ? styles.compactText : null]}>{`+${formatBadgeCount(props.added, max)}`}</Text>
                     ) : null}
                     {props.removed > 0 ? (
-                        <Text style={styles.diffRemoved}>{`−${formatBadgeCount(props.removed, max)}`}</Text>
+                        <Text style={[styles.diffRemoved, props.size === 'compact' ? styles.compactText : null]}>{`−${formatBadgeCount(props.removed, max)}`}</Text>
                     ) : null}
                 </>
             ) : (
-                <Text style={styles.diffModified}>{formatBadgeCount(props.modifiedCount, max)}</Text>
+                <Text style={[styles.diffModified, props.size === 'compact' ? styles.compactText : null]}>{formatBadgeCount(props.modifiedCount, max)}</Text>
             )}
         </View>
     );

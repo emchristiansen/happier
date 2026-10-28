@@ -64,17 +64,7 @@ A lane owns its analysis, implementation, focused tests, relevant validation, co
 
 ## 5. Execute every unit through `happier-implement`
 
-Apply the complete workflow in `.agents/skills/happier-implement` to each execution unit:
-
-- derive required observable truths and outermost deciding evidence from the approved plan;
-- discover the current canonical owner and affected corridor;
-- use scope-preserving solution economy inside the complete approved outcome;
-- implement through a consumed path with meaningful TDD;
-- migrate/remove approved duplicate, bypass, legacy, and split-brain paths;
-- validate affected neighboring behavior and required live surfaces;
-- resolve uncertainty through evidence rather than skipping work;
-- use efficient generators, codemods, and deterministic tools when they reduce omissions and turns;
-- perform compact author self-review before handoff.
+Apply `.agents/skills/happier-implement` to each execution unit, using the approved requirements as its outcome and evidence contract. Validate at the earliest tier that consumes the changed behavior, batching shared package/runtime setup under root **Validation** without dropping a material obligation.
 
 The plan remains authoritative. Use best judgment only for details it intentionally leaves open. Do not reduce required integration, migration, removals, compatibility, UX, platform support, testing, or validation.
 
@@ -90,7 +80,7 @@ After compaction or resume, reread the plan pivot and mutable execution state on
 
 ## 7. Monitor, integrate, and review at usable boundaries
 
-Let healthy long-running agents and commands reach terminal state. Prefer completion notifications, background sessions, or bounded terminal waits over busy polling. A timeout is not a failure; inspect current state.
+Follow root **Efficient execution and uncertainty resolution** for notification/wait selection, task-local reuse of operation handles, and resume-before-replace recovery. A pending wait may be continued without new evidence; restarting work or repeating equivalent failed attempts requires a changed prerequisite or a materially different evidence path.
 
 As lanes finish, inspect their diffs and deciding evidence sufficiently for integration, update material state, and dispatch newly ready work. Reuse the same lane for context-local corrections when practical. Steer or reassign only for evidence of stall, wrong scope, missing context, repeated failure without new information, or an actual collision.
 

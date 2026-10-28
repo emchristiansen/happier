@@ -130,6 +130,7 @@ printf '[{"filename":"%s"}]\\n' "$name-$version.tgz"
             env: {
                 ...process.env,
                 PATH: `${fakeBinDir}:${process.env.PATH ?? ''}`,
+                HAPPIER_RELEASE_PUBLISHED_VERSIONS_JSON: JSON.stringify({ github: {}, npm: {} }),
             },
             stdio: ['ignore', 'pipe', 'pipe'],
             encoding: 'utf8',

@@ -67,6 +67,7 @@ import { resolveToolRowPinAction } from '@/components/sessions/transcript/toolCa
 import type { TranscriptRollbackAction } from '@/sync/domains/sessionRollback/rollbackUiSupport';
 import type { PersistedSessionMessagePinV1 } from '@/sync/domains/messages/pins/sessionMessagePins';
 import { setClipboardStringSafe } from '@/utils/ui/clipboard';
+import { useTemporaryCopyFeedback } from '@/components/ui/copy/useTemporaryCopyFeedback';
 import { settingsDefaults } from '@/sync/domains/settings/settings';
 import { useStreamingTextSmoothing } from '@/components/sessions/transcript/streaming/useStreamingTextSmoothing';
 import { readStreamSegmentMetaV1 } from '@/sync/reducer/helpers/streamSegmentMeta';
@@ -505,7 +506,7 @@ function UserTextBlock(props: {
   forkCommon: TranscriptForkCommon;
   messageDisplayCommon: TranscriptMessageDisplayCommon;
 }) {
-  const [isMessageHovered, setIsMessageHovered] = React.useState(false);
+  const { isHovered: isMessageHovered, hoverProps } = useRowActionHoverHost();
   const [isCopyButtonHovered, setIsCopyButtonHovered] = React.useState(false);
   const [isActionRowFocused, setIsActionRowFocused] = React.useState(false);
   const handleActionsFocus = React.useCallback(() => setIsActionRowFocused(true), []);
@@ -678,14 +679,7 @@ function UserTextBlock(props: {
   // not inside a chat bubble background, and without echoing displayText fallback.
   if (isStructuredOnly) {
     return (
-      <Pressable
-        {...(isWeb
-          ? {
-              onHoverIn: () => setIsMessageHovered(true),
-              onHoverOut: () => setIsMessageHovered(false),
-            }
-          : null)}
-      >
+      <View {...hoverProps}>
         <View
           style={[styles.structuredUserMessageContainer, props.historical ? styles.historicalMessageContainer : null]}
         >
@@ -799,19 +793,12 @@ function UserTextBlock(props: {
             />
           </MessageActionRow>
         </View>
-      </Pressable>
+      </View>
     );
   }
 
   return (
-    <Pressable
-      {...(isWeb
-        ? {
-            onHoverIn: () => setIsMessageHovered(true),
-            onHoverOut: () => setIsMessageHovered(false),
-          }
-        : null)}
-    >
+    <View {...hoverProps}>
       <View
         style={[styles.userMessageContainer, props.historical ? styles.historicalMessageContainer : null]}
       >
@@ -843,7 +830,7 @@ function UserTextBlock(props: {
                 interaction={props.interaction}
                 onJumpToAnchor={handleJumpToAnchor}
               />
-              <MarkdownView markdown={renderedMarkdownText} onOptionPress={handleOptionPress} onOptionLongPress={handleOptionLongPress} onLinkPress={handleMarkdownLinkPress} selectable={true} profile="transcript" textStyle={styles.transcriptMarkdownText} />
+              <MarkdownView codeBlockStateKey={JSON.stringify([props.sessionId, props.message.id])} markdown={renderedMarkdownText} onOptionPress={handleOptionPress} onOptionLongPress={handleOptionLongPress} onLinkPress={handleMarkdownLinkPress} selectable={true} profile="transcript" textStyle={styles.transcriptMarkdownText} />
               {sessionMediaInlineImages.length > 0 ? (
                 <SessionMediaInlineImages
                   sessionId={props.sessionId}
@@ -945,7 +932,7 @@ function UserTextBlock(props: {
           </MessageActionRow>
         </View>
       </View>
-    </Pressable>
+    </View>
   );
 }
 
@@ -971,7 +958,7 @@ function AgentTextBlock(props: {
   forkCommon: TranscriptForkCommon;
   messageDisplayCommon: TranscriptMessageDisplayCommon;
 }) {
-  const [isMessageHovered, setIsMessageHovered] = React.useState(false);
+  const { isHovered: isMessageHovered, hoverProps } = useRowActionHoverHost();
   const [isCopyButtonHovered, setIsCopyButtonHovered] = React.useState(false);
   const [isActionRowFocused, setIsActionRowFocused] = React.useState(false);
   const handleActionsFocus = React.useCallback(() => setIsActionRowFocused(true), []);
@@ -1249,14 +1236,7 @@ function AgentTextBlock(props: {
   });
 
   return (
-    <Pressable
-      {...(isWeb
-        ? {
-            onHoverIn: () => setIsMessageHovered(true),
-            onHoverOut: () => setIsMessageHovered(false),
-          }
-        : null)}
-    >
+    <View {...hoverProps}>
       <TranscriptJumpAttention
         sessionId={props.sessionId}
         routeMessageId={buildMessageRouteId(props.message)}
@@ -1337,6 +1317,7 @@ function AgentTextBlock(props: {
               shouldRenderStreamingMarkdown ? (
                 <MarkdownView
                   markdown={streamingMarkdownText}
+                  codeBlockStateKey={JSON.stringify([props.sessionId, props.message.id])}
                   agentTexMath
                   onOptionPress={handleOptionPress}
                   onOptionLongPress={handleOptionLongPress}
@@ -1360,6 +1341,7 @@ function AgentTextBlock(props: {
               ) : (
                 <MarkdownView
                   markdown={markdown}
+                  codeBlockStateKey={JSON.stringify([props.sessionId, props.message.id])}
                   agentTexMath
                   onOptionPress={handleOptionPress}
                   onOptionLongPress={handleOptionLongPress}
@@ -1462,7 +1444,7 @@ function AgentTextBlock(props: {
           />
         </MessageActionRow>
       </TranscriptJumpAttention>
-    </Pressable>
+    </View>
   );
 }
 
@@ -1574,8 +1556,8 @@ function ForkMessageButton(props: {
 
 function CopyMessageButton(props: { markdown: string; testID?: string; invertedActionsLayout?: boolean; onHoverIn?: () => void; onHoverOut?: () => void }) {
   const { theme } = useUnistyles();
-  const [copied, setCopied] = React.useState(false);
-  const resetTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const { markCopied, isCopied, clearCopiedFeedback } = useTemporaryCopyFeedback();
+  const copied = isCopied();
   const hitSlop = Platform.OS === 'web' ? undefined : 15;
 
   const markdown = props.markdown || '';
@@ -1587,29 +1569,16 @@ function CopyMessageButton(props: { markdown: string; testID?: string; invertedA
     try {
       const ok = await setClipboardStringSafe(markdown);
       if (!ok) {
+        clearCopiedFeedback();
         Modal.alert(t('common.error'), t('items.failedToCopyToClipboard'));
         return;
       }
-      setCopied(true);
-
-      if (resetTimer.current) {
-        clearTimeout(resetTimer.current);
-      }
-      resetTimer.current = setTimeout(() => {
-        setCopied(false);
-      }, 1200);
+      markCopied();
     } catch (error) {
+      clearCopiedFeedback();
       Modal.alert(t('common.error'), t('items.failedToCopyToClipboard'));
     }
-  }, [isCopyable, markdown]);
-
-  React.useEffect(() => {
-    return () => {
-      if (resetTimer.current) {
-        clearTimeout(resetTimer.current);
-      }
-    };
-  }, []);
+  }, [clearCopiedFeedback, isCopyable, markCopied, markdown]);
 
   if (!isCopyable) {
     return null;

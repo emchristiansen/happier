@@ -18,9 +18,12 @@ import { ApiMachineClient } from './apiMachine';
 import { decodeBase64, encodeBase64, encrypt, decrypt } from './encryption';
 import { PushNotificationClient } from './pushNotifications';
 import { configuration } from '@/configuration';
+import { assertSessionEncryptionModeAllowedByEffectiveClientRequirement } from '@/settings/accountSettings/resolveEffectiveClientEncryptionRequirement';
 import { Credentials } from '@/persistence';
 
-import { resolveMachineEncryptionContext, resolveSessionEncryptionContext } from './client/encryptionKey';
+import { resolveSessionEncryptionContext } from './client/encryptionKey';
+import { resolveMachineRegistrationContent, resolvePublishedMachineContent } from './machine/resolveMachineRegistrationContent';
+import { decodeMachineStoredContent, encodeMachineStoredContent } from './machine/machineStoredContent';
 import { openSessionDataEncryptionKey } from './client/openSessionDataEncryptionKey';
 import { serializeAxiosErrorForLog } from './client/serializeAxiosErrorForLog';
 import { logServerEndpointFailure } from './client/serverEndpointFailureLog';
@@ -36,6 +39,7 @@ import {
   type ConnectedServiceCredentialSealedResponse,
 } from './connectedServices/connectedServiceCredentialApi';
 import { resolveConnectedServicesServerApiTimeoutMs } from './connectedServices/serverApiTimeout';
+import { fetchServerFeaturesSnapshot } from '@/features/serverFeaturesClient';
 import {
   ConnectedServiceQuotaApiError,
   createConnectedServiceQuotaApiError,
@@ -47,9 +51,14 @@ import {
   shouldTreatGetOrCreateSessionErrorAsOffline,
 } from './client/offlineErrors';
 import {
+  normalizeSessionMetadataForRead,
+  projectSessionMetadataForWire,
+  withConnectedServiceReaderSupport,
   buildProviderAccountUsageRecordId,
   CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER,
+  CONNECTED_SERVICE_AUTH_GROUP_SWITCH_REASON_HEADER,
   CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE,
+  appendConnectedServiceAuthGroupReaderCapabilities,
   ConnectedServiceAuthGroupErrorResponseV1Schema,
   ConnectedServiceAuthGroupResponseV1Schema,
   ConnectedServiceCredentialHealthV1Schema,
@@ -65,12 +74,14 @@ import {
   SealedConnectedServiceQuotaSnapshotV1Schema,
   SealedProviderAccountUsageSnapshotV1Schema,
   StoredJsonContentEnvelopeSchema,
-  splitProviderAccountUsageSubscription,
+  splitProviderAccountUsageSupplementalFacets,
+  readServerEnabledBit,
   PROVIDER_ACCOUNT_SUBSCRIPTION_ACCEPT,
 } from '@happier-dev/protocol';
 import type {
   ConnectedServiceCredentialRecordV1,
   ConnectedServiceAuthGroupV1,
+  ConnectedServiceAuthGroupMemberStateV1,
   ConnectedServiceAuthGroupRuntimeStatePatchRequestV1,
   ConnectedServiceCredentialHealthV1,
   ConnectedServiceCredentialHealthStatusV1,
@@ -407,16 +418,20 @@ export class ApiClient {
     metadata: Metadata,
     state: AgentState | null
   }): Promise<Session | null> {
-    const { encryptionKey, encryptionVariant, dataEncryptionKey } = resolveSessionEncryptionContext(this.credential);
-    const sessionsUrl = `${resolveServerHttpBaseUrl()}/v1/sessions`;
+    const sessionsUrl = withConnectedServiceReaderSupport(`${resolveServerHttpBaseUrl()}/v1/sessions`);
 
     const serverBaseUrl = resolveServerHttpBaseUrl();
     const { desiredSessionEncryptionMode, serverSupportsFeatureSnapshot } = await resolveSessionCreateEncryptionMode({
       token: this.credential.token,
       serverBaseUrl,
-      featuresTimeoutMs: 800,
-      accountTimeoutMs: 10_000,
+      featuresTimeoutMs: configuration.sessionControlHttpTimeoutMs,
+      accountTimeoutMs: configuration.sessionControlHttpTimeoutMs,
     });
+    const encryptionContext = desiredSessionEncryptionMode === 'e2ee' ? resolveSessionEncryptionContext(this.credential) : null;
+    const encryptSessionPayload = (value: unknown): string => {
+      if (!encryptionContext) throw new Error('Session encryption material is unavailable');
+      return encodeBase64(encrypt(encryptionContext.encryptionKey, encryptionContext.encryptionVariant, value));
+    };
 
     const resolvePositiveIntEnv = (raw: string | undefined, fallback: number, bounds: { min: number; max: number }): number => {
       const value = (raw ?? '').trim();
@@ -449,12 +464,12 @@ export class ApiClient {
       try {
         const metadataPayload =
           desiredSessionEncryptionMode === 'plain'
-            ? JSON.stringify(opts.metadata)
-            : encodeBase64(encrypt(encryptionKey, encryptionVariant, opts.metadata));
+            ? JSON.stringify(projectSessionMetadataForWire(opts.metadata))
+            : encryptSessionPayload(projectSessionMetadataForWire(opts.metadata));
         const agentStatePayload =
           desiredSessionEncryptionMode === 'plain'
             ? (opts.state ? JSON.stringify(opts.state) : null)
-            : (opts.state ? encodeBase64(encrypt(encryptionKey, encryptionVariant, opts.state)) : null);
+            : (opts.state ? encryptSessionPayload(opts.state) : null);
 
         const response = await axios.post<CreateSessionResponse>(
           sessionsUrl,
@@ -465,8 +480,8 @@ export class ApiClient {
             dataEncryptionKey:
               desiredSessionEncryptionMode === 'plain'
                 ? null
-                : dataEncryptionKey
-                  ? encodeBase64(dataEncryptionKey)
+                : encryptionContext?.dataEncryptionKey
+                  ? encodeBase64(encryptionContext.dataEncryptionKey)
                   : null,
             ...(serverSupportsFeatureSnapshot ? { encryptionMode: desiredSessionEncryptionMode } : {}),
           },
@@ -484,11 +499,14 @@ export class ApiClient {
 
       const sessionEncryptionMode: 'e2ee' | 'plain' =
         (raw as any)?.encryptionMode === 'plain' ? 'plain' : 'e2ee';
+      assertSessionEncryptionModeAllowedByEffectiveClientRequirement(sessionEncryptionMode);
 
       // Prefer the session's published data key, but keep backward compatibility with
       // older sessions that have no dataEncryptionKey (machineKey-as-session-key fallback).
-      let sessionEncryptionKey = encryptionKey;
-      if (sessionEncryptionMode === 'e2ee' && this.credential.encryption.type === 'dataKey') {
+      const readEncryptionContext = sessionEncryptionMode === 'e2ee' ? encryptionContext ?? resolveSessionEncryptionContext(this.credential) : null;
+      let sessionEncryptionKey = readEncryptionContext?.encryptionKey;
+      const encryptionVariant = readEncryptionContext?.encryptionVariant;
+      if (sessionEncryptionMode === 'e2ee' && this.credential.encryption?.type === 'dataKey') {
         const serverEncryptedDataKeyRaw = (raw as any).dataEncryptionKey;
         const opened = openSessionDataEncryptionKey({
           credential: this.credential,
@@ -502,17 +520,21 @@ export class ApiClient {
         }
         sessionEncryptionKey = opened ?? this.credential.encryption.machineKey;
       }
+      const decryptSessionPayload = (value: string): unknown => {
+        if (!sessionEncryptionKey || !encryptionVariant) throw new Error('Session encryption material is unavailable');
+        return decrypt(sessionEncryptionKey, encryptionVariant, decodeBase64(value));
+      };
 
-	      const metadata =
+	      const metadata = normalizeSessionMetadataForRead<Metadata>(
 	        sessionEncryptionMode === 'plain'
 	          ? JSON.parse(String(raw.metadata ?? 'null'))
-	          : decrypt(sessionEncryptionKey, encryptionVariant, decodeBase64(raw.metadata));
+	          : decryptSessionPayload(raw.metadata));
 	      const agentState =
 	        !raw.agentState
 	          ? null
 	          : sessionEncryptionMode === 'plain'
 	            ? JSON.parse(String(raw.agentState))
-	            : decrypt(sessionEncryptionKey, encryptionVariant, decodeBase64(raw.agentState));
+	            : decryptSessionPayload(raw.agentState);
 
 	      if (sessionEncryptionMode === 'plain') {
 	        return {
@@ -527,6 +549,7 @@ export class ApiClient {
 	        };
 	      }
 
+	      if (!sessionEncryptionKey || !encryptionVariant) throw new Error('Session encryption material is unavailable');
 	      return {
 	        id: raw.id,
 	        seq: raw.seq,
@@ -582,27 +605,24 @@ export class ApiClient {
     timeoutMs?: number,
     registrationIdentity?: MachineRegistrationIdentity,
   }): Promise<Machine> {
-    const { encryptionKey, encryptionVariant, dataEncryptionKey } = resolveMachineEncryptionContext(this.credential);
+    const timeoutMs = typeof opts.timeoutMs === 'number' && Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0 ? Math.floor(opts.timeoutMs) : 60_000;
+    const registrationContent = await resolveMachineRegistrationContent({ credentials: this.credential, machineId: opts.machineId, timeoutMs });
     const registrationIdentity = opts.registrationIdentity
       ? MachineRegistrationIdentitySchema.parse(opts.registrationIdentity)
-      : await this.resolveMachineRegistrationIdentity(opts.machineId);
+      : await this.resolveMachineRegistrationIdentity(opts.machineId, registrationContent.context.encryptionVariant !== 'plain');
     const machinesUrl = `${resolveServerHttpBaseUrl()}/v1/machines`;
 
     // Create machine
     try {
-      const timeoutMs =
-        typeof opts.timeoutMs === 'number' && Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
-          ? Math.floor(opts.timeoutMs)
-          : 60_000;
       const response = await axios.post(
         machinesUrl,
         {
           id: opts.machineId,
-          metadata: encodeBase64(encrypt(encryptionKey, encryptionVariant, opts.metadata)),
-          daemonState: opts.daemonState ? encodeBase64(encrypt(encryptionKey, encryptionVariant, opts.daemonState)) : undefined,
-          dataEncryptionKey: dataEncryptionKey ? encodeBase64(dataEncryptionKey) : undefined,
+          metadata: encodeMachineStoredContent(registrationContent.context, opts.metadata),
+          daemonState: opts.daemonState ? encodeMachineStoredContent(registrationContent.context, opts.daemonState) : undefined,
+          dataEncryptionKey: registrationContent.dataEncryptionKey ?? undefined,
           contentPublicKey:
-            this.credential.encryption.type === 'dataKey'
+            registrationContent.context.encryptionVariant !== 'plain' && this.credential.encryption?.type === 'dataKey'
               ? encodeBase64(this.credential.encryption.publicKey)
               : undefined,
           ...(registrationIdentity
@@ -653,13 +673,14 @@ export class ApiClient {
       }
 
       // Return decrypted machine like we do for sessions
+      const content = resolvePublishedMachineContent(this.credential, raw.dataEncryptionKey, registrationContent.accountMode);
       const machine: Machine = {
         id: raw.id,
-        encryptionKey: encryptionKey,
-        encryptionVariant: encryptionVariant,
-        metadata: raw.metadata ? decrypt(encryptionKey, encryptionVariant, decodeBase64(raw.metadata)) : null,
+        publishedDataEncryptionKey: content.dataEncryptionKey,
+        ...content.context,
+        metadata: raw.metadata ? decodeMachineStoredContent(content.context, raw.metadata) : null,
         metadataVersion: raw.metadataVersion || 0,
-        daemonState: raw.daemonState ? decrypt(encryptionKey, encryptionVariant, decodeBase64(raw.daemonState)) : null,
+        daemonState: raw.daemonState ? decodeMachineStoredContent(content.context, raw.daemonState) : null,
         daemonStateVersion: raw.daemonStateVersion || 0,
       };
       return machine;
@@ -707,12 +728,12 @@ export class ApiClient {
     }
   }
 
-  private async resolveMachineRegistrationIdentity(machineId: string): Promise<MachineRegistrationIdentity | undefined> {
+  private async resolveMachineRegistrationIdentity(machineId: string, encrypted = true): Promise<MachineRegistrationIdentity | undefined> {
     if (!configuration.installationIdentityFile) return undefined;
     const identity = await resolveMachineRegistrationIdentity({
       machineId,
       token: this.credential.token,
-      contentPublicKey: this.credential.encryption.type === 'dataKey'
+      contentPublicKey: encrypted && this.credential.encryption?.type === 'dataKey'
         ? this.credential.encryption.publicKey
         : undefined,
     });
@@ -757,7 +778,9 @@ export class ApiClient {
     if (attach && attach.existingSessionId.trim() !== session.id) {
       throw new Error('Existing-session input admission requires the exact attached session identity');
     }
-    return new ApiSessionClient(this.credential.token, session, runtimeActivity, attach
+    return new ApiSessionClient(this.credential.token, session, runtimeActivity, {
+      permissionRequestPushSender: this.pushClient,
+    }, attach
       ? attach.requestArchivedSessionCleanup ?? (async () => ({ kind: 'unavailable' as const }))
       : undefined);
   }
@@ -775,6 +798,7 @@ export class ApiClient {
   ): ApiMachineClient {
     return new ApiMachineClient(this.credential.token, machine, ownershipMetadata, {
       connectedAccounts: this.createConnectedAccountCredentialResolver(),
+      connectedServiceImportAccount: { api: this, credentials: this.credential },
     });
   }
 
@@ -839,6 +863,7 @@ export class ApiClient {
       kind: 'oauth' | 'token';
       providerEmail?: string | null;
       providerAccountId?: string | null;
+      providerOrganizationId?: string | null;
       expiresAt?: number | null;
     };
     expectedCredentialRevision?: ConnectedServiceCredentialRevisionV1 | null;
@@ -1016,6 +1041,7 @@ export class ApiClient {
     activeProfileId: string;
     expectedGeneration: number;
     overrideRuntimeCooldown?: boolean;
+    switchReason?: string;
   }): Promise<ConnectedServiceAuthGroupV1> {
     const expectedGeneration = assertConnectedServiceExpectedGeneration(
       params.expectedGeneration,
@@ -1027,7 +1053,7 @@ export class ApiClient {
 
     try {
       const response = await axios.post(
-        `${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/active-profile`,
+        appendConnectedServiceAuthGroupReaderCapabilities(`${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/active-profile`),
         {
           profileId: params.activeProfileId,
           expectedGeneration,
@@ -1038,6 +1064,7 @@ export class ApiClient {
             'Authorization': `Bearer ${this.credential.token}`,
             'Content-Type': 'application/json',
             [CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER]: CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE,
+            ...(params.switchReason ? { [CONNECTED_SERVICE_AUTH_GROUP_SWITCH_REASON_HEADER]: params.switchReason } : {}),
           },
           timeout: resolveConnectedServicesServerApiTimeoutMs(),
         },
@@ -1091,7 +1118,7 @@ export class ApiClient {
 
     try {
       const response = await axios.patch(
-        `${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/runtime-state`,
+        appendConnectedServiceAuthGroupReaderCapabilities(`${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/runtime-state`),
         {
           ...(expectedGeneration === undefined ? {} : { expectedGeneration }),
           ...(expectedRuntimeStateRevision === undefined ? {} : { expectedRuntimeStateRevision }),
@@ -1156,7 +1183,7 @@ export class ApiClient {
 
     try {
       const response = await axios.post(
-        `${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/members`,
+        appendConnectedServiceAuthGroupReaderCapabilities(`${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/members`),
         {
           profileId: params.profileId,
           ...(params.priority === undefined ? {} : { priority: params.priority }),
@@ -1202,7 +1229,9 @@ export class ApiClient {
     profileId: string;
     priority?: number;
     enabled?: boolean;
+    state?: ConnectedServiceAuthGroupMemberStateV1;
     expectedGeneration: number;
+    expectedRuntimeStateRevision?: number;
   }): Promise<ConnectedServiceAuthGroupV1> {
     const expectedGeneration = assertConnectedServiceExpectedGeneration(
       params.expectedGeneration,
@@ -1215,11 +1244,15 @@ export class ApiClient {
 
     try {
       const response = await axios.patch(
-        `${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/members/${profileId}`,
+        appendConnectedServiceAuthGroupReaderCapabilities(`${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/members/${profileId}`),
         {
           ...(params.priority === undefined ? {} : { priority: params.priority }),
           ...(params.enabled === undefined ? {} : { enabled: params.enabled }),
+          ...(params.state === undefined ? {} : { state: params.state }),
           expectedGeneration,
+          ...(params.expectedRuntimeStateRevision === undefined
+            ? {}
+            : { expectedRuntimeStateRevision: params.expectedRuntimeStateRevision }),
         },
         {
           headers: {
@@ -1243,6 +1276,13 @@ export class ApiClient {
         const parsed = ConnectedServiceAuthGroupErrorResponseV1Schema.safeParse(error.response.data);
         if (parsed.success && parsed.data.error === 'connect_group_generation_conflict' && parsed.data.generation !== undefined) {
           throw new ConnectedServiceAuthGroupGenerationConflictError(parsed.data.generation);
+        }
+        if (
+          parsed.success
+          && parsed.data.error === 'connect_group_runtime_state_revision_conflict'
+          && parsed.data.runtimeStateRevision !== undefined
+        ) {
+          throw new ConnectedServiceAuthGroupRuntimeStateRevisionConflictError(parsed.data.runtimeStateRevision);
         }
       }
       logServerEndpointFailure({
@@ -1271,7 +1311,7 @@ export class ApiClient {
 
     try {
       const response = await axios.delete(
-        `${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/members/${profileId}`,
+        appendConnectedServiceAuthGroupReaderCapabilities(`${serverUrl}/v3/connect/${serviceId}/groups/${groupId}/members/${profileId}`),
         {
           headers: {
             'Authorization': `Bearer ${this.credential.token}`,
@@ -1717,17 +1757,24 @@ export class ApiClient {
   }): Promise<void> {
     const serverUrl = resolveServerHttpBaseUrl();
     const recordId = ProviderAccountUsageRecordIdSchema.parse(params.recordId);
-    const { snapshot, subscription } = splitProviderAccountUsageSubscription(
+    const { snapshot, subscription, recoveryCreditDetails } = splitProviderAccountUsageSupplementalFacets(
       ProviderAccountUsageSnapshotV1Schema.parse(params.content.v),
     );
     const source = params.source ? ConnectedServiceUsageSourceV1Schema.parse(params.source) : undefined;
+    const serverFeatures = recoveryCreditDetails ? await fetchServerFeaturesSnapshot({ serverUrl }) : undefined;
+    const includeRecoveryCreditDetails = serverFeatures?.status === 'ready'
+      && readServerEnabledBit(serverFeatures.features, 'connectedServices.quotaRecoveryCreditDetails') === true;
 
     try {
       const response = await axios.post(
         `${serverUrl}/v3/connect/provider-account-usage/${encodeURIComponent(recordId)}`,
         {
           content: { t: 'plain', v: snapshot },
-          metadata: { ...params.metadata, ...(subscription ? { subscription } : {}) },
+          metadata: {
+            ...params.metadata,
+            ...(subscription ? { subscription } : {}),
+            ...(includeRecoveryCreditDetails ? { recoveryCreditDetails } : {}),
+          },
           ...(source ? { source } : {}),
         },
         {
@@ -1876,8 +1923,12 @@ export class ApiClient {
       }
 
       const baseSnapshot = ProviderAccountUsageSnapshotV1Schema.safeParse(contentParsed.data.v);
-      const snapshotParsed = baseSnapshot.success && rawRecord.subscription !== undefined
-        ? ProviderAccountUsageSnapshotV1Schema.safeParse({ ...baseSnapshot.data, subscription: rawRecord.subscription })
+      const snapshotParsed = baseSnapshot.success && (rawRecord.subscription !== undefined || rawRecord.recoveryCreditDetails !== undefined)
+        ? ProviderAccountUsageSnapshotV1Schema.safeParse({
+          ...baseSnapshot.data,
+          ...(rawRecord.subscription !== undefined ? { subscription: rawRecord.subscription } : {}),
+          ...(rawRecord.recoveryCreditDetails !== undefined ? { recoveryCreditDetails: rawRecord.recoveryCreditDetails } : {}),
+        })
         : baseSnapshot;
       if (!snapshotParsed.success || snapshotParsed.data.recordId !== recordId) {
         throw createConnectedServiceQuotaProtocolError(

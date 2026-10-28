@@ -76,6 +76,27 @@ describe('AskUserQuestionView capability reactivity', () => {
         }));
     });
 
+    it('shows structured answers on the completed question card', async () => {
+        const { AskUserQuestionView } = await import('./AskUserQuestionView');
+        const tool = makeToolCall({
+            name: 'AskUserQuestion',
+            state: 'completed',
+            input: { questions: [
+                { header: 'Question 1', question: 'Pick one', multiSelect: false, options: [{ label: 'Option B', description: '' }] },
+                { header: 'Question 2', question: 'Add context', multiSelect: false, options: [], freeform: {} },
+            ] },
+            result: JSON.stringify({ status: 'answered', answers: { 'Pick one': ['Option B'], 'Add context': ['lorem ipsum'] } }),
+        });
+        const screen = await renderScreen(React.createElement(
+            AskUserQuestionView,
+            makeToolViewProps(tool, { sessionId: 's1' }),
+        ));
+
+        expect(screen.getTextContent()).toContain('Option B');
+        expect(screen.getTextContent()).toContain('lorem ipsum');
+        expect(screen.getTextContent()).not.toContain('Question 1:-');
+    });
+
     it('recovers an unsafe selection when structured-answer support arrives without remounting', async () => {
         const { AskUserQuestionView } = await import('./AskUserQuestionView');
         const tool: ToolCall = makeToolCall({

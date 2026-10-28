@@ -402,6 +402,11 @@ export const ConnectedServiceRuntimeAuthRecoveryTranscriptStatusV1Schema = z.enu
 export type ConnectedServiceRuntimeAuthRecoveryTranscriptStatusV1 =
   z.infer<typeof ConnectedServiceRuntimeAuthRecoveryTranscriptStatusV1Schema>;
 
+/** The existing V1 `cancelled` carrier also represents non-retrying policy outcomes. */
+export function isConnectedServiceRuntimeAuthRecoveryCancellation(reason: string | null | undefined): boolean {
+  return !reason || reason === 'usage_limit_recovery_cancelled' || reason === 'runtime_auth_recovery_cancelled';
+}
+
 const CONNECTED_SERVICE_SWITCH_ATTEMPT_V2_FIELDS = [
   'attemptedContinuityMode',
   'outcomeAction',

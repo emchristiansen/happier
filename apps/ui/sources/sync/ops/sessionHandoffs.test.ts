@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { completeSessionHandoff as completeConnectedAccountHandoff } from './sessionHandoffs';
 
 const machineRpcWithServerScopeMock = vi.hoisted(() => vi.fn());
 const handoffV2ControlRpcMock = vi.hoisted(() => vi.fn());
@@ -213,6 +214,26 @@ describe('sessionHandoffs ops', () => {
             sessions: {},
             applySessions: (...args: unknown[]) => storageApplySessionsMock(...args),
         });
+    });
+
+    it('refuses an unsupported connected account before stopping the handoff source', async () => {
+        getServerFeaturesSnapshotMock.mockResolvedValue({
+            status: 'ready',
+            features: { features: {
+                sessions: { enabled: true, handoff: { enabled: true, serverRoutedTransfer: { enabled: true } } },
+                machines: { enabled: true, transfer: { enabled: true, directPeer: { enabled: true } } },
+            }, capabilities: {} },
+        });
+        machineRpcWithServerScopeMock.mockResolvedValue({ ok: false, errorCode: 'unsupported', error: 'Unsupported' });
+        await completeConnectedAccountHandoff({
+            sessionId: 'sess-import', sourceMachineId: 'machine_source', targetMachineId: 'machine_target',
+            sessionStorageMode: 'direct', preferredTransportStrategies: ['direct_peer', 'server_routed_stream'],
+            sourceStartRetry: { timeoutMs: 0, intervalMs: 0 },
+            sourceMetadata: { flavor: 'claude', path: '/repo', host: 'source', machineId: 'machine_source', claudeSessionId: 'native-session',
+                connectedServices: { v: 1, bindingsByServiceId: { antigravity: { source: 'connected', profileId: 'work' } } },
+            },
+        });
+        expect(machineRpcWithServerScopeMock.mock.calls.some(([request]) => request.method === 'daemon.sessionHandoff.start')).toBe(false);
     });
 
     it('routes startSessionHandoff through server-scoped machine rpc with the source machine id', async () => {

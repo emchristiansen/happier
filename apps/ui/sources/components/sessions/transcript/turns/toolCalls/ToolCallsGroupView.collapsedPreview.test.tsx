@@ -396,7 +396,7 @@ describe('ToolCallsGroupView (collapsed preview)', () => {
         expect(screen.findAllByTestId('transcript-tool-calls-preview-more')).toHaveLength(1);
     });
 
-    it('renders no previews when count is 0', async () => {
+    it('renders only an expandable header when collapsed previews are off', async () => {
         collapsedPreviewCount = 0;
 
         const toolMessages = [
@@ -404,16 +404,17 @@ describe('ToolCallsGroupView (collapsed preview)', () => {
             createToolCallMessageFixture({ id: 'm2', createdAt: 2 }),
         ];
 
-        const screen = await renderToolCallsGroupView({
-            toolMessages,
-            setExpanded: vi.fn(),
-        });
+        const setExpanded = vi.fn();
+        const screen = await renderToolCallsGroupView({ toolMessages, setExpanded });
 
         const previews = screen.findAllByTestId('transcript-tool-calls-preview-row');
         expect(previews).toHaveLength(0);
 
         const moreRows = screen.findAllByTestId('transcript-tool-calls-preview-more');
-        expect(moreRows).toHaveLength(1);
+        expect(moreRows).toHaveLength(0);
+        expect(screen.findAllByTestId('transcript-tool-calls-tool-row')).toHaveLength(0);
+        await screen.pressByTestIdAsync('transcript-tool-calls-header');
+        expect(setExpanded).toHaveBeenCalledWith(true);
     });
 
     it('clamps preview count to 15', async () => {
@@ -445,7 +446,10 @@ describe('ToolCallsGroupView (collapsed preview)', () => {
             setExpanded: vi.fn(),
         });
 
-        const spinner = screen.findAllByType('ActivityIndicator' as any)[0];
+        // The header owns which color its spinner gets; how the spinner draws it depends on the
+        // user's loading indicator style.
+        const { ActivitySpinner } = await import('@/components/ui/feedback/ActivitySpinner');
+        const spinner = screen.findAllByType(ActivitySpinner)[0];
         expect(spinner?.props?.color).toBe('#555555');
     });
 
@@ -470,7 +474,7 @@ describe('ToolCallsGroupView (collapsed preview)', () => {
         expect(setExpanded).toHaveBeenCalledWith(true);
     });
 
-    it('does not request expansion when tapping the header while collapsed and hidden rows remain', async () => {
+    it('also expands from the header when collapsed previews are enabled', async () => {
         collapsedPreviewCount = 1;
 
         const toolMessages = [
@@ -485,9 +489,8 @@ describe('ToolCallsGroupView (collapsed preview)', () => {
             setExpanded,
         });
 
-        const header = screen.findByTestId('transcript-tool-calls-header');
-        expect(header?.props.onPress).toBeUndefined();
-        expect(setExpanded).not.toHaveBeenCalled();
+        await screen.pressByTestIdAsync('transcript-tool-calls-header');
+        expect(setExpanded).toHaveBeenCalledWith(true);
     });
 
     it('does not pass nested tool message ids when tool navigation is disabled', async () => {

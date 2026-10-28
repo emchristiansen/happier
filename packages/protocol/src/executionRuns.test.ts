@@ -6,7 +6,9 @@ import {
   ExecutionRunPublicStateSchema,
   ExecutionRunSendRequestSchema,
   ExecutionRunStartRequestSchema,
+  ExecutionRunStartResponseSchema,
   ExecutionRunTransportErrorCodeSchema,
+  isExecutionRunActive,
 } from './executionRuns.js';
 import { EphemeralTaskKindSchema } from './ephemeralTasks.js';
 import { ReviewFindingSchema } from './reviews/ReviewFinding.js';
@@ -21,6 +23,14 @@ import { ParticipantMessageV1Schema } from './structuredMessages/participantMess
 import { KNOWN_CANONICAL_TOOL_NAMES_V2 } from './tools/v2/names.js';
 
 describe('executionRuns protocol', () => {
+  it('separates idle retained handles from bounded work and unobserved running turns', () => {
+    expect(isExecutionRunActive({ status: 'running', runClass: 'long_lived', turnInFlight: false })).toBe(false);
+    expect(isExecutionRunActive({ status: 'running', runClass: 'long_lived', turnInFlight: true })).toBe(true);
+    expect(isExecutionRunActive({ status: 'running', runClass: 'bounded', turnInFlight: false })).toBe(true);
+    expect(isExecutionRunActive({ status: 'running', runClass: 'long_lived' })).toBe(true);
+    expect(isExecutionRunActive({ status: 'running', turnInFlight: false })).toBe(true);
+    expect(isExecutionRunActive({ status: 'cancelled', runClass: 'long_lived', turnInFlight: true })).toBe(false);
+  });
   it('parses supported intents', () => {
     expect(ExecutionRunIntentSchema.parse('review')).toBe('review');
     expect(ExecutionRunIntentSchema.parse('voice_agent')).toBe('voice_agent');
@@ -58,6 +68,42 @@ describe('executionRuns protocol', () => {
       status: 'succeeded',
       startedAtMs: now,
     })).toThrow();
+  });
+
+  it('projects only privacy-bounded requested launch configuration', () => {
+    const requestedConfiguration = {
+      modelId: 'meta/muse-spark-1.3-contributor',
+      reasoningEffort: 'xhigh',
+      apiToken: 'must-not-survive',
+    };
+    const base = {
+      runId: 'run_1',
+      callId: 'subagent_run_1',
+      sidechainId: 'subagent_run_1',
+    };
+
+    expect(ExecutionRunStartResponseSchema.parse({
+      ...base,
+      requestedConfiguration,
+    }).requestedConfiguration).toEqual({
+      modelId: 'meta/muse-spark-1.3-contributor',
+      reasoningEffort: 'xhigh',
+    });
+    expect(ExecutionRunPublicStateSchema.parse({
+      ...base,
+      intent: 'delegate',
+      backendTarget: { kind: 'builtInAgent', agentId: 'pi' },
+      permissionMode: 'safe-yolo',
+      retentionPolicy: 'ephemeral',
+      runClass: 'bounded',
+      ioMode: 'request_response',
+      status: 'running',
+      startedAtMs: 1,
+      requestedConfiguration,
+    }).requestedConfiguration).toEqual({
+      modelId: 'meta/muse-spark-1.3-contributor',
+      reasoningEffort: 'xhigh',
+    });
   });
 
   it('validates start request', () => {
@@ -460,6 +506,7 @@ describe('executionRuns protocol', () => {
     expect(ExecutionRunTransportErrorCodeSchema.parse('execution_run_stream_not_found')).toBe('execution_run_stream_not_found');
     expect(ExecutionRunTransportErrorCodeSchema.parse('execution_run_busy')).toBe('execution_run_busy');
     expect(ExecutionRunTransportErrorCodeSchema.parse('execution_run_failed')).toBe('execution_run_failed');
+    expect(ExecutionRunTransportErrorCodeSchema.parse('execution_run_send_outcome_unknown')).toBe('execution_run_send_outcome_unknown');
     expect(ExecutionRunTransportErrorCodeSchema.parse('execution_run_budget_exceeded')).toBe('execution_run_budget_exceeded');
     expect(ExecutionRunTransportErrorCodeSchema.parse('execution_run_protocol_unsupported')).toBe('execution_run_protocol_unsupported');
     expect(ExecutionRunTransportErrorCodeSchema.parse('execution_run_target_unavailable')).toBe('execution_run_target_unavailable');

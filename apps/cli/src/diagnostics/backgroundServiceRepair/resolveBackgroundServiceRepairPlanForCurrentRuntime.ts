@@ -35,6 +35,7 @@ export async function resolveBackgroundServiceRepairPlanForCurrentRuntime(params
     currentReleaseChannel: runtime.channel,
     currentHappierHomeDir: runtime.happierHomeDir,
     currentServerId: runtime.instanceId,
+    currentServerUrl: runtime.publicServerUrl,
     preferredMode: params.preferredMode,
     services,
   });

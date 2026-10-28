@@ -6,6 +6,7 @@ import { DiffProcessor } from './utils/diffProcessor';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { logger } from '@/ui/logger';
+import { isConditionalPendingSteerClaim } from '@happier-dev/protocol';
 import { resolveHasTTY } from '@/ui/tty/resolveHasTTY';
 import { Credentials } from '@/persistence';
 import type { Metadata, UserMessage } from '@/api/types';
@@ -49,7 +50,7 @@ import {
     createSessionProviderInputConsumer,
     type SessionProviderInputConsumerSession,
 } from '@/agent/runtime/sessionInput/SessionProviderInputConsumer';
-import type { SessionProviderInputConsumer } from '@/agent/runtime/sessionInput/types';
+import type { MessageBatch, SessionProviderInputConsumer } from '@/agent/runtime/sessionInput/types';
 import {
     resolveRuntimeAwarePendingForegroundSteerability,
     resolveSessionPendingQueueDeliveryTiming,
@@ -85,7 +86,23 @@ import { normalizePermissionModeToIntent, resolvePermissionModeUpdatedAtFromMess
 import { publishCodexSessionIdMetadata } from './utils/codexSessionIdMetadata';
 import { createCodexAcpRuntime } from './acp/runtime';
 import { createCodexAppServerRuntime, CodexBoundSteerUnavailableError, type CodexBoundSteerContext } from './appServer/runtime';
+import { createCodexSharedAppServer } from './appServer/createCodexSharedAppServer';
+import {
+    createCodexAppServerDaemonProxyClient,
+    shouldUseCodexAppServerDaemonProxy,
+} from './appServer/daemon/codexAppServerDaemonTransport';
+import { createCodexSharedLocalControl } from './localControl/createCodexSharedLocalControl';
+import { hasHostedAttachedTerminalPresentation } from '@/agent/localControl/createAttachedTerminalSupervisor';
+import { resolveCodexSharedControlSupport } from './localControl/resolveCodexSharedControlSupport';
+import {
+    removeCodexSharedControlEndpoint,
+    writeCodexSharedControlEndpoint,
+} from './localControl/codexSharedControlEndpoint';
 import { isCodexAppServerTerminalOwnedGroupRecoveryClassification } from './appServer/recovery/terminalGroupRecovery';
+import {
+    readCodexRuntimeAuthClassification as readRuntimeAuthClassification,
+    createCodexRuntimeAuthFailureTurnHook,
+} from './connectedServices/classifyCodexConnectedServiceAuthFailure';
 import {
     createCodexAcpProviderInputOutcomeBridge,
     createCodexAppServerProviderInputOutcomeBridge,
@@ -93,7 +110,11 @@ import {
     type CodexAppServerProviderInputOutcomeBridge,
 } from './appServer/codexAppServerProviderInputOutcome';
 import { reportSessionToDaemonIfRunning } from '@/agent/runtime/startupSideEffects';
-import { isCodexAppServerSteerRejectedBeforeEffectError } from './appServer/appServerCompatibility';
+import {
+    isCodexAppServerInvalidRequestForMethodError,
+    isCodexAppServerSteerRejectedBeforeEffectError,
+    isCodexAppServerNoActiveTurnToSteerError,
+} from './appServer/appServerCompatibility';
 import { rememberCodexUsageLimitRecoveryPreference } from './appServer/rememberCodexUsageLimitRecoveryPreference';
 import { resolveConfiguredCodexHome } from './utils/resolveConfiguredCodexHome';
 import { buildCodexAppServerConfigOverrides } from './appServer/buildCodexAppServerConfigOverrides';
@@ -109,7 +130,7 @@ import { initializeBackendRunSession } from '@/agent/runtime/initializeBackendRu
 import { initializeBackendApiContext } from '@/agent/runtime/initializeBackendApiContext';
 import { codexLocalLauncher, type CodexLauncherResult } from './codexLocalLauncher';
 import { sendReadyWithPushNotification } from '@/agent/runtime/sendReadyWithPushNotification';
-import { resolveProviderPromptFailureDeliveryReason } from '@/agent/runtime/providerPromptSubmission';
+import { resolveProviderPromptFailureDeliveryReason, type ProviderTurnCompletionResult } from '@/agent/runtime/providerPromptSubmission';
 import { getActiveAccountSettingsSnapshot } from '@/settings/accountSettings/activeAccountSettingsSnapshot';
 import { getSessionNotificationTitle } from '@/agent/runtime/readyNotificationContext';
 import { resolveReadyNotificationAssistantText } from '@/agent/runtime/readyNotificationAssistantText';
@@ -190,32 +211,6 @@ import {
 	import { resolveCodexRequestedDirectory } from './utils/resolveCodexRequestedDirectory';
 import { readDaemonInitialGoalFromEnv } from '@/agent/runtime/sessionInitialGoal';
 import { withCurrentHappierSessionId } from '@/agent/runtime/session/currentSessionIdEnv';
-
-function isRuntimeAuthFailureClassification(value: unknown): value is ConnectedServiceRuntimeFailureClassification {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-    const record = value as Record<string, unknown>;
-    if (typeof record.kind !== 'string') return false;
-    if (typeof record.serviceId !== 'string') return false;
-    if (typeof record.profileId !== 'string' && record.profileId !== null) return false;
-    if (typeof record.groupId !== 'string' && record.groupId !== null) return false;
-    if (typeof record.resetsAtMs !== 'number' && record.resetsAtMs !== null) return false;
-    if (typeof record.planType !== 'string' && record.planType !== null) return false;
-    if (
-        record.source !== 'structured_provider_error'
-        && record.source !== 'stable_provider_message'
-        && record.source !== 'provider_runtime_marker'
-    ) {
-        return false;
-    }
-    return true;
-}
-
-function readRuntimeAuthClassification(error: unknown): ConnectedServiceRuntimeFailureClassification | null {
-    if (!error || typeof error !== 'object' || Array.isArray(error)) return null;
-    const record = error as Record<string, unknown>;
-    const classification = record.runtimeAuthClassification ?? null;
-    return isRuntimeAuthFailureClassification(classification) ? classification : null;
-}
 
 function readRuntimeAuthClassificationLogField(
     classification: Record<string, unknown>,
@@ -380,6 +375,33 @@ export function createCodexPendingInputBoundSteerHandler(opts: Readonly<{
     };
 }
 
+function formatCodexResumeFailure(params: Readonly<{
+    backendLabel: 'app-server' | 'ACP';
+    resumeId: string;
+    cause: unknown;
+    localToRemote: boolean;
+}>): string {
+    const { backendLabel, resumeId, cause, localToRemote } = params;
+    const activeWriter = backendLabel === 'app-server'
+        && isCodexAppServerInvalidRequestForMethodError(cause, 'thread/resume')
+        && cause instanceof Error
+        && /\bthread\s+\S+\s+already has an active writer\b/i.test(cause.message);
+    const guidance = activeWriter
+        ? 'Another Codex process is already writing to this thread. Happier cannot resume it through a separate app-server while that writer is active. Continue in the original Codex session. To share control of a new session, start a new session in Happier and run `happier attach` on the same machine.'
+        : `ensure Codex ${backendLabel} can run${localToRemote ? ' reliably' : ''} on this machine, then retry${localToRemote ? ' switching to remote' : ''}.`;
+    const reason = formatErrorForUi(cause);
+    return localToRemote
+        ? `Failed to switch this Codex session from local → remote.\n` +
+          `Reason: could not resume the remote Codex ${backendLabel} session (${resumeId}).\n` +
+          `Details: ${reason}\n` +
+          `${activeWriter ? 'What to do' : 'Fix'}: ${guidance}\n` +
+          `Note: Happier refuses to start a new remote Codex session during a local→remote switch, because it would fork the conversation.`
+        : `Failed to resume this Codex ${backendLabel} session (${resumeId}).\n` +
+          `Reason: ${reason}\n` +
+          `${activeWriter ? 'What to do' : 'Fix'}: ${guidance}\n` +
+          `Note: Happier refuses to start a new Codex session when --resume was requested.`;
+}
+
 /** Main entry point for the codex command with ink UI. */
 export async function runCodex(opts: {
     credentials: Credentials;
@@ -469,7 +491,7 @@ export async function runCodex(opts: {
         clearGoal?: () => Promise<unknown>;
         listVendorPlugins?: () => Promise<unknown>;
         listSkills?: () => Promise<unknown>;
-        flushTurn: () => Promise<void>;
+        flushTurn: () => Promise<void | ProviderTurnCompletionResult>;
         rollbackConversation: (request: import('@happier-dev/protocol').SessionRollbackRpcParams) => Promise<import('@happier-dev/protocol').SessionRollbackRpcResult>;
     }>;
     //
@@ -655,10 +677,17 @@ export async function runCodex(opts: {
         experimentalCodexAcpEnabledByDefault: isExperimentalCodexAcpEnabled(),
     });
     const experimentalCodexAcpEnabled = codexBackendMode === 'acp';
+    const useCodexAppServerDaemonProxy = codexBackendMode === 'appServer'
+        && shouldUseCodexAppServerDaemonProxy(process.env);
     const localControlBackend = codexBackendMode === 'acp' || codexBackendMode === 'appServer'
         ? codexBackendMode
         : null;
     const localControlEnabled = localControlBackend !== null;
+    const codexSharedControlSupport = codexBackendMode === 'appServer' && !useCodexAppServerDaemonProxy
+        ? await resolveCodexSharedControlSupport({ cwd: requestedDirectory, processEnv: process.env })
+        : { ok: false as const, reason: 'unsupported-version' as const };
+    const useCodexSharedControl = codexSharedControlSupport.ok;
+    const hasHostedTerminal = useCodexSharedControl && hasHostedAttachedTerminalPresentation(opts.terminalRuntime);
 
     const localControlState: {
         experimentalCodexAcpEnabled: boolean;
@@ -673,12 +702,14 @@ export async function runCodex(opts: {
         experimentalCodexAcpEnabled: () => localControlState.experimentalCodexAcpEnabled,
         localControlBackend: () => localControlState.localControlBackend,
         hasTtyForLocal,
+        hasHostedTerminal,
     });
 
     let mode: 'local' | 'remote' = resolveCodexStartingMode({
         explicitStartingMode: opts.startingMode,
         startedBy: startedByForLocalControl,
         hasTtyForLocal,
+        hasHostedTerminal,
         localControlEnabled,
 	    });
 	    let localModeFallbackMessage: string | null = null;
@@ -730,6 +761,7 @@ export async function runCodex(opts: {
 
     const shouldFastStartLocal =
         mode === 'local' &&
+        !useCodexSharedControl &&
         startedByForLocalControl === 'cli' &&
         (typeof opts.existingSessionId !== 'string' || !opts.existingSessionId.trim()) &&
         !resumeIdFromArgs;
@@ -969,6 +1001,7 @@ export async function runCodex(opts: {
         existingSessionId: opts.existingSessionId,
         requestArchivedSessionCleanup: () => archivedSessionCleanup(),
         uiLogPrefix: '[codex]',
+        terminalAgentLabel: 'codex',
         startupMetadataOverrides: createStartupMetadataOverrides(opts),
         metadataKeysToUnsetOnAttach: codexBackendMode === 'acp'
             ? undefined
@@ -1093,6 +1126,8 @@ export async function runCodex(opts: {
     // Late-initialized when a remote Codex runtime is enabled; referenced by the user-message binding for in-flight steering.
     let codexAcpRuntime: ReturnType<typeof createCodexAcpRuntime> | null = null;
     let codexAppServerRuntime: ReturnType<typeof createCodexAppServerRuntime> | null = null;
+    let codexSharedAppServer: Awaited<ReturnType<typeof createCodexSharedAppServer>> | null = null;
+    let codexSharedLocalControl: ReturnType<typeof createCodexSharedLocalControl> | null = null;
     let providerInputConsumer: SessionProviderInputConsumer<EnhancedMode, string> | null = null;
     const pendingExactSteerTurnIdByLocalId = new Map<string, CodexPendingExactSteerTurnBinding>();
     let boundSteerDispatchAbortController = new AbortController();
@@ -1239,6 +1274,10 @@ export async function runCodex(opts: {
         const special = parseSpecialCommand(text);
         const runtime = getCodexRemoteRuntime();
         const pendingProviderAction = info?.pendingProviderAction;
+        const isConditionalSteer = isConditionalPendingSteerClaim({
+            requestedAction: info?.pendingRequestedAction,
+            providerAction: pendingProviderAction,
+        });
         const hasActiveProviderTurn = runtime
             ? (runtime.hasActiveProviderTurn?.() ?? runtime.isTurnInFlight())
             : false;
@@ -1385,12 +1424,9 @@ export async function runCodex(opts: {
                         });
                         return;
                     }
-                    if (pendingProviderAction === 'steer') {
+                    if (isConditionalSteer) {
                         await blockProviderPromptDeliveryBeforeAcceptance({
-                            localIds,
-                            reason: 'steering_unavailable',
-                            userMessageSeq,
-                            providerEffect: 'none',
+                            localIds, reason: 'steering_unavailable', userMessageSeq, providerEffect: 'none',
                         });
                         return;
                     }
@@ -1402,26 +1438,23 @@ export async function runCodex(opts: {
                         userMessageSeq,
                         userMessageLocalIds: localIds,
                         providerAcceptancePending: info?.providerAcceptancePending === true,
+                        ...(pendingProviderAction ? { pendingProviderAction: 'send' as const, prioritize: true } : {}),
+                        ...(info?.pendingRequestedAction ? { pendingRequestedAction: info.pendingRequestedAction } : {}),
                     });
                 }
             })();
             return;
         }
 
-        if (
-            pendingProviderAction === 'steer'
-        ) {
+        if (isConditionalSteer) {
             const localIds = normalizeProviderPromptLocalIds([message.localId ?? null]);
             await blockProviderPromptDeliveryBeforeAcceptance({
                 localIds,
-                reason: 'steering_unavailable',
-                userMessageSeq,
-                providerEffect: 'none',
+                reason: 'steering_unavailable', userMessageSeq, providerEffect: 'none',
             });
             if (boundSteer && localIds.length === 1 && pendingExactSteerTurnIdByLocalId.get(localIds[0]) === boundSteer.binding) pendingExactSteerTurnIdByLocalId.delete(localIds[0]);
             return;
         }
-
         pushMessageToQueueWithSpecialCommands({
             queue: messageQueue,
             message: text,
@@ -1430,7 +1463,8 @@ export async function runCodex(opts: {
             userMessageSeq,
             userMessageLocalIds: normalizeProviderPromptLocalIds([message.localId ?? null]),
             providerAcceptancePending: info?.providerAcceptancePending === true,
-            pendingProviderAction,
+            pendingProviderAction: pendingProviderAction === 'steer' ? 'send' : pendingProviderAction,
+            ...(info?.pendingRequestedAction ? { pendingRequestedAction: info.pendingRequestedAction } : {}),
             prioritize: pendingProviderAction !== undefined,
         });
     };
@@ -1455,7 +1489,7 @@ export async function runCodex(opts: {
 
     const keepAliveInterval = startSessionHeartbeatLoop({
         getThinking: () => thinking,
-        getMode: () => mode,
+        getMode: () => codexSharedLocalControl?.resolveKeepAliveMode() ?? mode,
         keepAlive: (nextThinking, nextMode) => session.keepAlive(nextThinking, nextMode),
     });
     const turnAssistantPreviewTracker = createTurnAssistantPreviewTracker();
@@ -1467,7 +1501,8 @@ export async function runCodex(opts: {
         cleanupRunResourcesPromise ??= (async () => {
             quotaSnapshotDeliveryOutbox.clearSession(session.sessionId);
             await closeProviderInputAdmission();
-            await cleanupCodexRunResources({
+            try {
+                await cleanupCodexRunResources({
                 session,
                 reconnectionHandle,
                 client,
@@ -1480,13 +1515,24 @@ export async function runCodex(opts: {
                 messageBuffer,
                 logDebug: (message, error) => logger.debug(message, error),
                 logActiveHandles,
-            });
+                });
+            } finally {
+                await codexSharedLocalControl?.dispose();
+                if (codexSharedAppServer) {
+                    await removeCodexSharedControlEndpoint({
+                        happyHomeDir: configuration.happyHomeDir,
+                        sessionId: session.sessionId,
+                        expectedEndpoint: codexSharedAppServer.endpoint,
+                    });
+                }
+                await codexSharedAppServer?.dispose();
+            }
         })();
         return cleanupRunResourcesPromise;
     };
 
     let resumeIdFromLocalControl: string | null = null;
-    if (mode === 'local') {
+    if (mode === 'local' && !useCodexSharedControl) {
         const localResult = await (localLauncherPromise ??
             codexLocalLauncher<EnhancedMode>({
                 path: workspaceDirFromMetadata ?? requestedDirectory,
@@ -1519,6 +1565,7 @@ export async function runCodex(opts: {
             assistantPreviewText: resolveReadyNotificationAssistantText({
                 includeMessageText: includeAssistantPreviewText,
                 explicitAssistantText: turnAssistantPreviewTracker.getPreview(),
+                turnResult: context?.turnResult,
                 session,
                 turnToken: context?.turnToken ?? null,
                 startSeqExclusive: context?.startSeqExclusive ?? null,
@@ -1826,7 +1873,11 @@ export async function runCodex(opts: {
             await handleAbort();
         },
         onSwitchToLocal: async () => {
-            await requestSwitchToLocalIfSupported();
+            if (codexSharedLocalControl) {
+                await codexSharedLocalControl.switchToLocal();
+            } else {
+                await requestSwitchToLocalIfSupported();
+            }
         },
     });
 
@@ -1835,7 +1886,7 @@ export async function runCodex(opts: {
         messageBuffer.addMessage(message, 'status');
     }
 
-    const localRemoteSwitchController = createLocalRemoteModeController({
+    const localRemoteSwitchController = useCodexSharedControl ? null : createLocalRemoteModeController({
         session,
         getThinking: () => thinking,
         resolveLocalSwitchAvailability,
@@ -1847,7 +1898,7 @@ export async function runCodex(opts: {
 
     // Register the remote switch handler before any remote-mode awaits so a session that becomes
     // externally visible during startup can still fail closed instead of returning "method not available".
-    localRemoteSwitchController.registerRemoteSwitchHandler();
+    localRemoteSwitchController?.registerRemoteSwitchHandler();
 
     //
     // Start Context 
@@ -1888,7 +1939,10 @@ export async function runCodex(opts: {
     mcpServers = happierBridge.mcpServers;
     if (useCodexAppServer) {
         codexAppServerConfigOverrides = buildCodexAppServerConfigOverrides(mcpServers, {
+            codexArgs: opts.codexArgs,
             happierSessionId: codexProviderProcessEnv.HAPPIER_SESSION_ID,
+            happierMcpToolCallTimeoutMs: configuration.codexHappierMcpToolCallTimeoutMs,
+            processEnv: codexAppServerProcessEnv,
         });
     }
     const resolveFreshSessionSystemPrompt = async (baseOverride?: string | null): Promise<string> =>
@@ -1996,6 +2050,42 @@ export async function runCodex(opts: {
         providerInputDispatchDrain = inputConsumer.closeProviderInputAdmissionAndWaitForDispatches();
     }
 
+    const reportRuntimeAuthFailure = async (
+        classification: ConnectedServiceRuntimeFailureClassification,
+        failure?: Readonly<{ error: unknown }>,
+    ) => {
+        const report = await reportConnectedServiceRuntimeAuthFailureToDaemon({
+            sessionId: session.sessionId,
+            switchesThisTurn: 0,
+            classification,
+            logPrefix: '[Codex]',
+        });
+        let emitted = projectConnectedServiceRuntimeAuthRecoveryReport({
+            report,
+            classification,
+            addStatusMessage: (message) => {
+                messageBuffer.addMessage(message, 'status');
+            },
+            sendGenericStatusMessage: (message) => {
+                session.sendSessionEvent({ type: 'message', message });
+            },
+            commitTypedProjection: (projection) => {
+                if (projection.transcriptEvent) {
+                    session.sendSessionEvent(projection.transcriptEvent);
+                    return true;
+                }
+                return false;
+            },
+        }).emitted;
+        if (!emitted && failure) {
+            const message = `Codex process error: ${formatErrorForUi(failure.error)}`;
+            messageBuffer.addMessage(message, 'status');
+            session.sendSessionEvent({ type: 'message', message });
+            emitted = true;
+        }
+        return { report, emitted };
+    };
+
     if (useCodexAcp) {
         codexAcpRuntime = createCodexAcpRuntime({
             directory,
@@ -2009,6 +2099,9 @@ export async function runCodex(opts: {
             onThinkingChange: (value) => { thinking = value; },
             pendingQueueDrainMaxPopPerWake,
             providerInputConsumer: inputConsumer as SessionProviderInputConsumer<unknown, unknown>,
+            onTurnFailure: createCodexRuntimeAuthFailureTurnHook(async (classification, error) => {
+                await reportRuntimeAuthFailure(classification, { error });
+            }),
         });
         try {
             publishInFlightSteerCapability({ session, runtime: codexAcpRuntime });
@@ -2016,13 +2109,43 @@ export async function runCodex(opts: {
             logger.debug('[codex] Failed to publish in-flight steer capability (non-fatal)', e);
         }
     } else if (useCodexAppServer) {
+        if (useCodexSharedControl) {
+            codexSharedAppServer = await createCodexSharedAppServer({
+                directory,
+                processEnv: codexAppServerProcessEnv,
+                configOverrides: codexAppServerConfigOverrides,
+            });
+            await writeCodexSharedControlEndpoint({
+                happyHomeDir: configuration.happyHomeDir,
+                sessionId: session.sessionId,
+                endpoint: codexSharedAppServer.endpoint,
+            });
+        }
+        const initialConnectedServiceRuntimeIdentity = resolveCodexInitialConnectedServiceRuntimeIdentity(codexAppServerProcessEnv, session);
         codexAppServerRuntime = createCodexAppServerRuntime({
             directory,
             activeServerDir: configuration.activeServerDir,
             daemonStatePath: configuration.daemonStateFile,
             processEnv: codexAppServerProcessEnv,
             configOverrides: codexAppServerConfigOverrides,
-            initialConnectedServiceRuntimeIdentity: resolveCodexInitialConnectedServiceRuntimeIdentity(codexAppServerProcessEnv, session),
+            ...(useCodexAppServerDaemonProxy
+                ? {
+                    createClient: async () => {
+                        const daemonProxyClient = await createCodexAppServerDaemonProxyClient({
+                            cwd: directory,
+                            processEnv: codexAppServerProcessEnv,
+                        });
+                        daemonProxyClient.onExit(() => {
+                            terminationHandlers.requestTermination({ kind: 'exit', code: 0 });
+                        });
+                        return daemonProxyClient;
+                    },
+                }
+                : codexSharedAppServer
+                    ? { createClient: codexSharedAppServer.createClient }
+                    : {}),
+            initialConnectedServiceRuntimeIdentity,
+            initializeChatGptAuthTokens: !useCodexAppServerDaemonProxy,
             session,
             transcriptSession: createCurrentSessionTranscriptPort(() => session),
             onThinkingChange: (value) => { thinking = value; },
@@ -2054,30 +2177,7 @@ export async function runCodex(opts: {
                 });
             },
             onUsageLimitGroupRecovery: async ({ classification }) => {
-                const recoveryReport = await reportConnectedServiceRuntimeAuthFailureToDaemon({
-                    sessionId: session.sessionId,
-                    switchesThisTurn: 0,
-                    classification,
-                    logPrefix: '[Codex]',
-                });
-                projectConnectedServiceRuntimeAuthRecoveryReport({
-                    report: recoveryReport,
-                    classification,
-                    addStatusMessage: (message) => {
-                        messageBuffer.addMessage(message, 'status');
-                    },
-                    sendGenericStatusMessage: (message) => {
-                        session.sendSessionEvent({ type: 'message', message });
-                    },
-                    commitTypedProjection: (projection) => {
-                        if (projection.transcriptEvent) {
-                            session.sendSessionEvent(projection.transcriptEvent);
-                            return true;
-                        }
-                        return false;
-                    },
-                });
-                return recoveryReport;
+                return (await reportRuntimeAuthFailure(classification)).report;
             },
             onConnectedServiceAuthGenerationApplied: ({ selection }) => {
                 const previousSelection = liveAppliedCodexRefreshSelection;
@@ -2122,29 +2222,7 @@ export async function runCodex(opts: {
                             credentialHealthStatus?: string;
                         }> : undefined,
                     );
-                    const recoveryReport = await reportConnectedServiceRuntimeAuthFailureToDaemon({
-                        sessionId: session.sessionId,
-                        switchesThisTurn: 0,
-                        classification,
-                        logPrefix: '[Codex]',
-                    });
-                    projectConnectedServiceRuntimeAuthRecoveryReport({
-                        report: recoveryReport,
-                        classification,
-                        addStatusMessage: (message) => {
-                            messageBuffer.addMessage(message, 'status');
-                        },
-                        sendGenericStatusMessage: (message) => {
-                            session.sendSessionEvent({ type: 'message', message });
-                        },
-                        commitTypedProjection: (projection) => {
-                            if (projection.transcriptEvent) {
-                                session.sendSessionEvent(projection.transcriptEvent);
-                                return true;
-                            }
-                            return false;
-                        },
-                    });
+                    await reportRuntimeAuthFailure(classification);
                     throw attachRuntimeAuthClassificationToError(error, classification);
                 }
             },
@@ -2294,19 +2372,11 @@ export async function runCodex(opts: {
     }
 
     let first = true;
+    let wasCreated = false;
+    let sharedThreadNeedsSystemPrompt = false;
 
 	    try {
-		        let wasCreated = false;
-	            let pending: {
-                    message: string;
-                    mode: EnhancedMode;
-                    isolate: boolean;
-                    hash: string;
-                    maxUserMessageSeq?: number | null;
-                    userMessageLocalIds?: readonly string[] | null;
-                    providerAcceptancePending?: boolean;
-                    pendingProviderAction?: import('@/agent/runtime/modeMessageQueue').PendingProviderAction;
-                } | null = null;
+	            let pending: MessageBatch<EnhancedMode, string> | null = null;
 
 	        const codexRemoteRuntimeForSync = getCodexRemoteRuntime();
 	        const modelSync =
@@ -2444,9 +2514,47 @@ export async function runCodex(opts: {
 	            },
 	        });
 
+        let sharedLocalControlStarted = false;
+        if (useCodexSharedControl) {
+            if (!codexSharedAppServer || !codexAppServerRuntime) {
+                throw new Error('Codex shared local control requires an initialized shared app-server runtime');
+            }
+            codexSharedLocalControl = createCodexSharedLocalControl({
+                startingMode: startedInLocalMode ? 'local' : 'remote',
+                getSession: () => session,
+                getSessionId: async () => {
+                    if (!wasCreated) {
+                        if (storedSessionIdForResume) return null;
+                        await seedCodexAppServerOverridesBeforeStartOrLoad();
+                        await codexAppServerRuntime!.startOrLoad({
+                            ...consumeInitialGoalForStartOrLoad(startOrLoadAbortController.signal),
+                        });
+                        wasCreated = true;
+                        sharedThreadNeedsSystemPrompt = true;
+                        await codexAppServerRuntime!.prepareThreadForCliAttach();
+                        await sessionModeSync?.flushPendingAfterStart();
+                        await configOptionSync?.flushPendingAfterStart();
+                        await modelSync?.flushPendingAfterStart();
+                        codexAppServerDaemonReportReadiness.resolve?.();
+                        codexAppServerDaemonReportReadiness.resolve = null;
+                    }
+                    return await codexAppServerRuntime!.prepareThreadForCliAttach();
+                },
+                directory,
+                endpoint: codexSharedAppServer.endpoint,
+                processEnv: codexAppServerProcessEnv,
+                terminalRuntime: opts.terminalRuntime,
+                mountRemoteUi: () => remoteTerminalUi!.mount(),
+                unmountRemoteUi: () => remoteTerminalUi!.unmount(),
+            });
+            // Shared attachment changes only the visible control surface. Happier retains the
+            // app-server connection and remains writable while the TUI is attached.
+            mode = 'remote';
+        }
+
         while (!shouldExit) {
-            if (mode === 'local') {
-                await localRemoteSwitchController.publishModeState('local');
+            if (mode === 'local' && !useCodexSharedControl) {
+                await localRemoteSwitchController!.publishModeState('local');
                 const localPass = await runCodexLocalModePass<EnhancedMode>({
                     session,
                     messageQueue,
@@ -2470,7 +2578,9 @@ export async function runCodex(opts: {
                 continue;
             }
 
-            await localRemoteSwitchController.publishModeState('remote');
+            if (!useCodexSharedControl) {
+                await localRemoteSwitchController!.publishModeState('remote');
+            }
             requestedSwitchToLocal = false;
             startOrLoadAbortController = new AbortController();
             switchToLocalBarrier = createSwitchToLocalBarrier();
@@ -2514,17 +2624,12 @@ export async function runCodex(opts: {
                             void startOrLoadPromise.catch(() => undefined);
                         } else {
                             await invalidateTrackedNativeReturnOnMismatch(e);
-                            const reason = formatErrorForUi(e);
-                            const message = isStrictLocalControl
-                                ? `Failed to switch this Codex session from local → remote.\n` +
-                                  `Reason: could not resume the remote Codex ${remoteResumeBackendLabel} session (${resumeId}).\n` +
-                                  `Details: ${reason}\n` +
-                                  `Fix: ensure Codex ${remoteResumeBackendLabel} can run reliably on this machine, then retry switching to remote.\n` +
-                                  `Note: Happier refuses to start a new remote Codex session during a local→remote switch, because it would fork the conversation.`
-                                : `Failed to resume this Codex ${remoteResumeBackendLabel} session (${resumeId}).\n` +
-                                  `Reason: ${reason}\n` +
-                                  `Fix: ensure Codex ${remoteResumeBackendLabel} can run on this machine, then retry.\n` +
-                                  `Note: Happier refuses to start a new Codex session when --resume was requested.`;
+                            const message = formatCodexResumeFailure({
+                                backendLabel: remoteResumeBackendLabel,
+                                resumeId,
+                                cause: e,
+                                localToRemote: isStrictLocalControl,
+                            });
                             await failStrictCodexResume(message, e);
                         }
                     }
@@ -2595,19 +2700,15 @@ export async function runCodex(opts: {
                 }
             }
 
+            if (codexSharedLocalControl && !sharedLocalControlStarted) {
+                sharedLocalControlStarted = true;
+                await codexSharedLocalControl.onAfterStart();
+            }
+
         while (!shouldExit && !requestedSwitchToLocal) {
             logActiveHandles('loop-top');
             // Get next batch; respect mode boundaries like Claude
-            let message: {
-                message: string;
-                mode: EnhancedMode;
-                isolate: boolean;
-                hash: string;
-                maxUserMessageSeq?: number | null;
-                userMessageLocalIds?: readonly string[] | null;
-                providerAcceptancePending?: boolean;
-                pendingProviderAction?: import('@/agent/runtime/modeMessageQueue').PendingProviderAction;
-            } | null = pending;
+            let message: MessageBatch<EnhancedMode, string> | null = pending;
                 pending = null;
                 if (!message) {
                     // Capture the current signal to distinguish idle-abort from queue close
@@ -2657,7 +2758,7 @@ export async function runCodex(opts: {
                 permissionHandler.reset();
                 diffProcessor.reset();
                 thinking = false;
-                session.keepAlive(thinking, 'remote');
+                session.keepAlive(thinking, codexSharedLocalControl?.resolveKeepAliveMode() ?? 'remote');
 
                 messageBuffer.addMessage('Session reset.', 'status');
                 emitReadyIfIdle({
@@ -2743,6 +2844,17 @@ export async function runCodex(opts: {
                     const canUseInFlightSteerForQueuedMessage =
                         (message.pendingProviderAction === 'steer' || message.pendingProviderAction === undefined)
                         && (codexRuntime.canSteerPrompt ? codexRuntime.canSteerPrompt() : codexRuntime.isTurnInFlight());
+                    const isConditionalSteer = isConditionalPendingSteerClaim({
+                        requestedAction: message.pendingRequestedAction,
+                        providerAction: message.pendingProviderAction,
+                    });
+                    if (isConditionalSteer && !canUseInFlightSteerForQueuedMessage) {
+                        await blockProviderPromptDeliveryBeforeAcceptance({
+                            localIds, reason: 'steering_unavailable',
+                            userMessageSeq: message.maxUserMessageSeq ?? null, providerEffect: 'none',
+                        });
+                        continue;
+                    }
                     if (wasCreated && useCodexAppServer && specialCommand.type === null && canUseInFlightSteerForQueuedMessage) {
                         if (shouldLogAcpDebug) {
                             logger.debug('[CodexAppServer] steerPrompt begin for queued message while turn is in flight');
@@ -2769,13 +2881,16 @@ export async function runCodex(opts: {
                             if (!isCodexAppServerSteerRejectedBeforeEffectError(error)) {
                                 throw error;
                             }
-                            await blockProviderPromptDeliveryBeforeAcceptance({
-                                localIds,
-                                reason: 'steering_unavailable',
-                                userMessageSeq: message.maxUserMessageSeq ?? null,
-                                providerEffect: 'none',
-                            });
-                            continue;
+                            if (isConditionalSteer) {
+                                await blockProviderPromptDeliveryBeforeAcceptance({
+                                    localIds, reason: 'steering_unavailable',
+                                    userMessageSeq: message.maxUserMessageSeq ?? null, providerEffect: 'none',
+                                });
+                                continue;
+                            }
+                            // The provider proved that the steer had no effect. Deliver the same
+                            // prompt through the ordinary turn path without cancelling a turn.
+                            didAttemptProviderSend = false;
                         }
                     }
                     codexRuntime.beginTurn();
@@ -2827,17 +2942,12 @@ export async function runCodex(opts: {
                                 const isStrictLocalControl = storedSessionIdFromLocalControl === true;
                                 const isStrict = isStrictExplicit || isStrictLocalControl || nativeIdentityMismatch;
                                 if (isStrict) {
-                                    const reason = formatErrorForUi(e);
-                                    const message = isStrictLocalControl
-                                        ? `Failed to switch this Codex session from local → remote.\n` +
-                                          `Reason: could not resume the remote Codex ${remoteResumeBackendLabel} session (${resumeId}).\n` +
-                                          `Details: ${reason}\n` +
-                                          `Fix: ensure Codex ${remoteResumeBackendLabel} can run reliably on this machine, then retry switching to remote.\n` +
-                                          `Note: Happier refuses to start a new remote Codex session during a local→remote switch, because it would fork the conversation.`
-                                        : `Failed to resume this Codex ${remoteResumeBackendLabel} session (${resumeId}).\n` +
-                                          `Reason: ${reason}\n` +
-                                          `Fix: ensure Codex ${remoteResumeBackendLabel} can run on this machine, then retry.\n` +
-                                          `Note: Happier refuses to start a new Codex session when --resume was requested.`;
+                                    const message = formatCodexResumeFailure({
+                                        backendLabel: remoteResumeBackendLabel,
+                                        resumeId,
+                                        cause: e,
+                                        localToRemote: isStrictLocalControl,
+                                    });
                                     await failStrictCodexResume(message, e);
                                 }
 
@@ -2911,6 +3021,9 @@ export async function runCodex(opts: {
                         await sessionModeSync?.flushPendingAfterStart();
                         await configOptionSync?.flushPendingAfterStart();
                         await modelSync?.flushPendingAfterStart();
+                        if (sharedLocalControlStarted) {
+                            await codexSharedLocalControl?.onSessionSwap(session);
+                        }
                     }
 
                     if (specialCommand.type === 'compact') {
@@ -2947,7 +3060,7 @@ export async function runCodex(opts: {
                             modelSync,
                         });
                     }
-                    const systemPromptText = startedFreshSessionForTurn
+                    const systemPromptText = startedFreshSessionForTurn || sharedThreadNeedsSystemPrompt
                         ? await resolveFreshSessionSystemPrompt(
                             resolveAppendSystemPromptBaseOverride(message.mode),
                         )
@@ -2998,6 +3111,7 @@ export async function runCodex(opts: {
                             await codexRuntime.sendPrompt(promptForProvider, promptOptions);
                         }
                     });
+                    sharedThreadNeedsSystemPrompt = false;
                     // A prompt call that returned without throwing is itself unambiguous delivery
                     // evidence, for the seams that publish no earlier acceptance. Idempotent, so
                     // it is a no-op once the acceptance edge above already retired the seed.
@@ -3044,7 +3158,7 @@ export async function runCodex(opts: {
                     });
 
                     thinking = true;
-                    session.keepAlive(thinking, 'remote');
+                    session.keepAlive(thinking, codexSharedLocalControl?.resolveKeepAliveMode() ?? 'remote');
                     didAttemptProviderSend = true;
                     const startResponse = await dispatchProviderInputOrThrow(async () => await mcpClient.startSession(
                         startConfig,
@@ -3063,7 +3177,7 @@ export async function runCodex(opts: {
                     first = false;
                 } else {
                     thinking = true;
-                    session.keepAlive(thinking, 'remote');
+                    session.keepAlive(thinking, codexSharedLocalControl?.resolveKeepAliveMode() ?? 'remote');
                     didAttemptProviderSend = true;
                     const response = await dispatchProviderInputOrThrow(async () => await mcpClient.continueSession(
                         providerPromptText,
@@ -3120,7 +3234,7 @@ export async function runCodex(opts: {
                     // Do not clear session state here; the next user message should continue on the
                     // existing session if possible.
                 } else {
-                    const runtimeAuthClassification = readRuntimeAuthClassification(error);
+                    let runtimeAuthClassification = readRuntimeAuthClassification(error);
                     let runtimeAuthRecoveryStatusEmitted = false;
                     if (runtimeAuthClassification) {
                         const appServerTerminalOwnsRecovery = useCodexAppServer
@@ -3141,35 +3255,26 @@ export async function runCodex(opts: {
                                 ? getCodexRemoteRuntime()
                                 : null;
                             if (runtime) {
+                                if (useCodexAcp) {
+                                    await codexAcpRuntime?.failTurn(error);
+                                }
                                 // The exact provider turn has already failed. Publish its terminal
                                 // boundary before Connected Services attempts refresh/switch/continuation
                                 // so recovery cannot wait on the turn that is waiting on recovery.
-                                await runtime.flushTurn();
+                                const turnResult = await runtime.flushTurn();
+                                if (turnResult) {
+                                    readyTurnContext = {
+                                        turnToken: readyTurnContext?.turnToken ?? null,
+                                        startSeqExclusive: readyTurnContext?.startSeqExclusive ?? null,
+                                        turnResult,
+                                    };
+                                }
                                 providerTurnSettledBeforeRuntimeAuthRecovery = true;
+                                runtimeAuthClassification = readRuntimeAuthClassification(error) ?? runtimeAuthClassification;
                             }
-                            const recoveryReport = await reportConnectedServiceRuntimeAuthFailureToDaemon({
-                                sessionId: session.sessionId,
-                                switchesThisTurn: 0,
-                                classification: runtimeAuthClassification,
-                                logPrefix: '[Codex]',
-                            });
-                            runtimeAuthRecoveryStatusEmitted = projectConnectedServiceRuntimeAuthRecoveryReport({
-                                report: recoveryReport,
-                                classification: runtimeAuthClassification,
-                                addStatusMessage: (message) => {
-                                    messageBuffer.addMessage(message, 'status');
-                                },
-                                sendGenericStatusMessage: (message) => {
-                                    session.sendSessionEvent({ type: 'message', message });
-                                },
-                                commitTypedProjection: (projection) => {
-                                    if (projection.transcriptEvent) {
-                                        session.sendSessionEvent(projection.transcriptEvent);
-                                        return true;
-                                    }
-                                    return false;
-                                },
-                            }).emitted;
+                            runtimeAuthRecoveryStatusEmitted = useCodexAcp && Boolean(runtimeAuthClassification.runtimeIssueFingerprint)
+                                ? true
+                                : (await reportRuntimeAuthFailure(runtimeAuthClassification)).emitted;
                         }
                     } else {
                         logger.warn('Error in codex session:', error);
@@ -3205,7 +3310,14 @@ export async function runCodex(opts: {
                     && hasActiveAppServerProviderTurn;
                 if (useCodexAcp || useCodexAppServer) {
                     if (!preserveActiveAppServerTurn && !providerTurnSettledBeforeRuntimeAuthRecovery) {
-                        await remoteRuntime?.flushTurn();
+                        const turnResult = await remoteRuntime?.flushTurn();
+                        if (turnResult) {
+                            readyTurnContext = {
+                                turnToken: readyTurnContext?.turnToken ?? null,
+                                startSeqExclusive: readyTurnContext?.startSeqExclusive ?? null,
+                                turnResult,
+                            };
+                        }
                     }
                 }
                 if (useCodexAcp) {
@@ -3214,14 +3326,14 @@ export async function runCodex(opts: {
 
                 if (preserveActiveAppServerTurn) {
                     thinking = true;
-                    session.keepAlive(thinking, 'remote');
+                    session.keepAlive(thinking, codexSharedLocalControl?.resolveKeepAliveMode() ?? 'remote');
                 } else {
                     // Reset permission handler, reasoning processor, and diff processor
                     permissionHandler.reset();
                     diffProcessor.flushTurn();
                     diffProcessor.reset();
                     thinking = false;
-                    session.keepAlive(thinking, 'remote');
+                    session.keepAlive(thinking, codexSharedLocalControl?.resolveKeepAliveMode() ?? 'remote');
                     const drainResult = !shouldExit
                         ? await inputConsumer.drainPending({
                             reason: 'codex-finalizer',

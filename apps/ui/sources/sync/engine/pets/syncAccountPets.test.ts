@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fetchAndApplyAccountPets } from './syncAccountPets';
 
 const listAccountPetsMock = vi.hoisted(() => vi.fn());
-const isRuntimeFeatureEnabledMock = vi.hoisted(() => vi.fn());
+const resolveRuntimeFeatureDecisionOrThrowMock = vi.hoisted(() => vi.fn());
 const getActiveServerSnapshotMock = vi.hoisted(() => vi.fn(() => ({ serverId: 'server-pets' })));
 
 vi.mock('@/sync/api/pets/apiAccountPets', () => ({
@@ -11,7 +11,7 @@ vi.mock('@/sync/api/pets/apiAccountPets', () => ({
 }));
 
 vi.mock('@/sync/domains/features/featureDecisionInputs', () => ({
-    isRuntimeFeatureEnabled: isRuntimeFeatureEnabledMock,
+    resolveRuntimeFeatureDecisionOrThrow: resolveRuntimeFeatureDecisionOrThrowMock,
 }));
 
 vi.mock('@/sync/domains/server/serverRuntime', () => ({
@@ -21,10 +21,10 @@ vi.mock('@/sync/domains/server/serverRuntime', () => ({
 describe('fetchAndApplyAccountPets', () => {
     beforeEach(() => {
         listAccountPetsMock.mockReset();
-        isRuntimeFeatureEnabledMock.mockReset();
+        resolveRuntimeFeatureDecisionOrThrowMock.mockReset();
         getActiveServerSnapshotMock.mockClear();
 
-        isRuntimeFeatureEnabledMock.mockResolvedValue(true);
+        resolveRuntimeFeatureDecisionOrThrowMock.mockResolvedValue({ state: 'enabled' });
         listAccountPetsMock.mockResolvedValue([
             {
                 accountPetId: 'pet-1',
@@ -51,7 +51,7 @@ describe('fetchAndApplyAccountPets', () => {
     });
 
     it('does not fetch account pets when pets sync is disabled by the active server', async () => {
-        isRuntimeFeatureEnabledMock.mockResolvedValue(false);
+        resolveRuntimeFeatureDecisionOrThrowMock.mockResolvedValue({ state: 'disabled' });
         const applyAccountPets = vi.fn();
         const applyAccountPetsForScope = vi.fn();
 
@@ -62,10 +62,9 @@ describe('fetchAndApplyAccountPets', () => {
             applyAccountPetsForScope,
         });
 
-        expect(isRuntimeFeatureEnabledMock).toHaveBeenCalledWith({
+        expect(resolveRuntimeFeatureDecisionOrThrowMock).toHaveBeenCalledWith({
             featureId: 'pets.sync',
             serverId: 'server-pets',
-            timeoutMs: 400,
         });
         expect(listAccountPetsMock).not.toHaveBeenCalled();
         expect(applyAccountPets).not.toHaveBeenCalled();
@@ -89,5 +88,29 @@ describe('fetchAndApplyAccountPets', () => {
         expect(applyAccountPetsForScope).toHaveBeenCalledWith(scope, [
             expect.objectContaining({ accountPetId: 'pet-1' }),
         ]);
+    });
+
+    it('propagates an unknown feature decision without clearing account pets', async () => {
+        const error = Object.assign(new Error('feature state unavailable'), {
+            name: 'RuntimeFeatureDecisionUnavailableError',
+            retryable: true,
+        });
+        resolveRuntimeFeatureDecisionOrThrowMock.mockRejectedValue(error);
+        const applyAccountPets = vi.fn();
+        const applyAccountPetsForScope = vi.fn();
+
+        await expect(fetchAndApplyAccountPets({
+            credentials: { accessToken: 'token' } as any,
+            readScope: () => null,
+            applyAccountPets,
+            applyAccountPetsForScope,
+        })).rejects.toMatchObject({
+            name: 'RuntimeFeatureDecisionUnavailableError',
+            retryable: true,
+        });
+
+        expect(listAccountPetsMock).not.toHaveBeenCalled();
+        expect(applyAccountPets).not.toHaveBeenCalled();
+        expect(applyAccountPetsForScope).not.toHaveBeenCalled();
     });
 });

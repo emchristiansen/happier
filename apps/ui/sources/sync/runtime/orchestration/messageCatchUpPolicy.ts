@@ -19,6 +19,7 @@ export function decideMessageCatchUpPolicy(input: Readonly<{
     offlineForMs: number;
     hasAcceptedLocalPending?: boolean;
     hasExplicitTailProbe?: boolean;
+    hasDeferredNewer?: boolean;
     thresholds: MessageCatchUpThresholds;
 }>): MessageCatchUpDecision {
     const thresholds = input.thresholds;
@@ -28,6 +29,12 @@ export function decideMessageCatchUpPolicy(input: Readonly<{
     }
     if (!input.isSessionVisible) {
         return { kind: 'do_nothing' };
+    }
+
+    // An exhausted page/probe is stronger evidence than a session-shell hint. Keep
+    // detached readers deferred; explicit live-tail intent resumes at the latest page.
+    if (input.hasDeferredNewer === true) {
+        return { kind: input.isPinned ? 'tail_reset_latest_page' : 'defer_forward_loading' };
     }
 
     const materializedMaxSeq = Math.max(0, Math.trunc(input.materializedMaxSeq));

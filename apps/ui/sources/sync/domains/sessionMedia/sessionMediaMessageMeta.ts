@@ -70,6 +70,7 @@ function parseSessionMediaEnvelope(envelope: HappierMetaEnvelope | null): Readon
     inlineImages: readonly SessionMediaInlineImageSummary[];
     unavailableMedia: readonly SessionMediaUnavailableSummary[];
 }> {
+    if (envelope === null) return { inlineImages: [], unavailableMedia: [] };
     const parsed = SessionMediaMessageMetaEnvelopeV1Schema.safeParse(envelope);
     if (!parsed.success) return { inlineImages: [], unavailableMedia: [] };
     return {

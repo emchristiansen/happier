@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { createStore } from 'zustand/vanilla';
 import type { SessionOrganizationSnapshot } from '@happier-dev/protocol';
 
 import {
@@ -13,16 +14,9 @@ import {
 
 type State = SessionOrganizationDomain;
 
-function createHarness(): {
-    get: () => State;
-} {
-    let state = {} as State;
-    const get = () => state;
-    const set = (updater: (draft: State) => Partial<State>) => {
-        state = { ...state, ...updater(state) };
-    };
-    state = createSessionOrganizationDomain({ get, set } as any);
-    return { get };
+function createHarness() {
+    const store = createStore<State>((set, get) => createSessionOrganizationDomain({ set, get }));
+    return { get: store.getState, subscribe: store.subscribe };
 }
 
 function emptySnapshot(input: Partial<SessionOrganizationSnapshot> = {}): SessionOrganizationSnapshot {
@@ -41,6 +35,62 @@ function emptySnapshot(input: Partial<SessionOrganizationSnapshot> = {}): Sessio
 }
 
 describe('createSessionOrganizationDomain', () => {
+    it.each([{ failureOrder: [0, 1] }, { failureOrder: [1, 0] }])('restores the due reminder when both overlapping writes fail in order $failureOrder', ({ failureOrder }) => {
+        const harness = createHarness();
+        const original = { sessionId: 's1', standing: true, remindAt: 1000, updatedAt: 1 };
+        harness.get().applySessionOrganizationSnapshot('srv-a', emptySnapshot({ attentionStandings: [original] }));
+        const writes = [
+            harness.get().setSessionAttentionStandingOptimistic('srv-a', 's1', { sessionId: 's1', standing: true, updatedAt: 2 }),
+            harness.get().setSessionAttentionStandingOptimistic('srv-a', 's1', { sessionId: 's1', standing: true, remindAt: 2000, updatedAt: 3 }),
+        ];
+        for (const index of failureOrder) harness.get().rollbackSessionOrganizationOptimistic(writes[index]!);
+        expect(harness.get().sessionOrganizationAttentionStandingsBySessionKey['srv-a:s1']).toEqual(original);
+        expect(harness.get().sessionOrganizationOptimisticRecords).toEqual({});
+    });
+
+    it('preserves a newer confirmed reminder when an unrelated write and an older pending clear fail', () => {
+        const harness = createHarness();
+        harness.get().applySessionOrganizationSnapshot('srv-a', emptySnapshot({
+            attentionStandings: [{ sessionId: 's1', standing: false, remindAt: 1000, updatedAt: 1 }],
+        }));
+        const clear = harness.get().setSessionAttentionStandingOptimistic('srv-a', 's1', { sessionId: 's1', standing: false, updatedAt: 2 });
+        const unrelated = harness.get().setSessionPinOptimistic('srv-a', 's2', { sessionId: 's2', pinnedAt: 3, sortKey: null });
+        const latest = { sessionId: 's1', standing: false, remindAt: 2000, updatedAt: 4 };
+        const replacement = harness.get().setSessionAttentionStandingOptimistic('srv-a', 's1', latest);
+        harness.get().confirmSessionAttentionStandingOptimistic(replacement, 's1', latest);
+        harness.get().rollbackSessionOrganizationOptimistic(unrelated);
+        expect(harness.get().sessionOrganizationAttentionStandingsBySessionKey['srv-a:s1']).toEqual(latest);
+        harness.get().rollbackSessionOrganizationOptimistic(clear);
+        expect(harness.get().sessionOrganizationAttentionStandingsBySessionKey['srv-a:s1']).toEqual(latest);
+    });
+
+    it('does not publish unchanged loading, error, assignment, or ignored reconciliation state', () => {
+        const harness = createHarness();
+        harness.get().setSessionOrganizationLoading('srv-a', false);
+        harness.get().setSessionOrganizationError('srv-a', null);
+        harness.get().applySessionOrganizationSnapshot('srv-a', emptySnapshot({ version: 2 }));
+        harness.get().applySessionFolderAssignments('srv-a', [{ sessionId: 's1', folderId: null }]);
+        const before = harness.get();
+        let notifications = 0;
+        const unsubscribe = harness.subscribe(() => { notifications += 1; });
+        harness.get().setSessionFolderAssignmentsLoading('srv-a', false);
+        harness.get().setSessionOrganizationError('srv-a', null);
+        harness.get().applySessionFolderAssignments('srv-a', [{ sessionId: 's1', folderId: null }]);
+        harness.get().applySessionOrganizationSnapshot('srv-a', emptySnapshot({ version: 1 }));
+        harness.get().reconcileSessionOrganizationFolderDelete('srv-a', ['missing'], null);
+        harness.get().reconcileSessionOrganizationTagDelete('srv-a', 'missing');
+        harness.get().rollbackSessionOrganizationOptimistic('missing');
+        harness.get().commitSessionOrganizationOptimistic('missing');
+        expect(harness.get()).toBe(before);
+        expect(notifications).toBe(0);
+
+        harness.get().setSessionOrganizationLoading('srv-a', true);
+        expect(harness.get().sessionOrganizationLoadingByServerId['srv-a']).toBe(true);
+        expect(harness.get().sessionFolderAssignmentsLoadingByServerId['srv-a']).toBe(true);
+        expect(notifications).toBe(1);
+        unsubscribe();
+    });
+
     it('keeps known sessions known when a full snapshot drops their folder assignment', () => {
         const harness = createHarness();
         harness.get().applySessionOrganizationSnapshot('srv-a', emptySnapshot({
@@ -243,6 +293,20 @@ describe('createSessionOrganizationDomain', () => {
         expect(harness.get().sessionOrganizationAttentionStandingsBySessionKey).toEqual({
             [buildSessionOrganizationServerKey('srv-a', 's1')]: { sessionId: 's1', standing: true, updatedAt: 5 },
         });
+    });
+
+    it('rebases a pending replacement on the confirmed reminder clear before rollback', () => {
+        const harness = createHarness();
+        harness.get().applySessionOrganizationSnapshot('srv-a', emptySnapshot({
+            attentionStandings: [{ sessionId: 's1', standing: false, remindAt: 1000, updatedAt: 1 }],
+        }));
+        const clear = harness.get().setSessionAttentionStandingOptimistic('srv-a', 's1', { sessionId: 's1', standing: false, updatedAt: 2 });
+        const replacement = harness.get().setSessionAttentionStandingOptimistic('srv-a', 's1', { sessionId: 's1', standing: false, remindAt: 2000, updatedAt: 3 });
+        harness.get().confirmSessionAttentionStandingOptimistic(clear, 's1', { sessionId: 's1', standing: true, updatedAt: 4 });
+        expect(harness.get().sessionOrganizationAttentionStandingsBySessionKey['srv-a:s1']?.remindAt).toBe(2000);
+        harness.get().rollbackSessionOrganizationOptimistic(replacement);
+        expect(harness.get().sessionOrganizationAttentionStandingsBySessionKey['srv-a:s1'])
+            .toEqual({ sessionId: 's1', standing: true, updatedAt: 4 });
     });
 
     it('clears attention standings for one server without touching another server', () => {

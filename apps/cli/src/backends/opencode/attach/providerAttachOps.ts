@@ -30,5 +30,5 @@ export const openCodeProviderAttachOps: ProviderAttachOps = {
     };
   },
   probeReachability: async ({ metadata }) => await probeOpenCodeProviderAttachReachability({ metadata }),
-  runAttach: async ({ sessionId, metadata }) => await runOpenCodeProviderAttach({ sessionId, metadata }),
+  runAttach: runOpenCodeProviderAttach,
 };

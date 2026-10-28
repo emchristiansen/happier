@@ -12,6 +12,7 @@ import {
 } from './pushNotificationsConfig'
 import {
     collectExpoPushTokensMarkedUnregistered,
+    getExpoErrorCode,
     PUSH_NOTIFICATION_ANDROID_CHANNEL_IDS,
     PUSH_NOTIFICATION_CATEGORY_IDS,
 } from '@happier-dev/protocol'
@@ -29,9 +30,7 @@ interface AccountActivityBadgeSnapshotResponse {
 }
 
 function isExpoMessageTooBig(result: unknown): boolean {
-    if (!result || typeof result !== 'object' || !('details' in result)) return false
-    const details = result.details
-    return !!details && typeof details === 'object' && 'error' in details && details.error === 'MessageTooBig'
+    return getExpoErrorCode(result) === 'MessageTooBig'
 }
 
 function normalizeClientServerUrl(raw: unknown): string | null {
@@ -109,7 +108,7 @@ export class PushNotificationClient {
     /**
      * Fetch all push tokens for the authenticated user
      */
-    async fetchPushTokens(): Promise<PushToken[]> {
+    async fetchPushTokens(options?: Readonly<{ suppressIfComputerFocused?: boolean }>): Promise<PushToken[]> {
         const debugPush = isPushDebugEnabled()
         const nowMs = Date.now()
         if (this.pushTokenFetchFailureCooldownUntilMs > nowMs) {
@@ -123,7 +122,7 @@ export class PushNotificationClient {
         }
         try {
             const response = await axios.get<{ tokens: PushToken[] }>(
-                `${this.baseUrl}/v1/push-tokens`,
+                `${this.baseUrl}/v1/push-tokens${options?.suppressIfComputerFocused === true ? '?suppressIfComputerFocused=1' : ''}`,
                 {
                     headers: {
                         'Authorization': `Bearer ${this.token}`,
@@ -220,10 +219,11 @@ export class PushNotificationClient {
      * Send push notification via Expo Push API with retry
      * @param messages - Array of push messages to send
      */
-    async sendPushNotifications(messages: ExpoPushMessage[]): Promise<Readonly<{ invalidTokens: ReadonlyArray<string> }>> {
+    async sendPushNotifications(messages: ExpoPushMessage[]): Promise<Readonly<{ invalidTokens: ReadonlyArray<string>; invalidCredentials: boolean }>> {
         const debugPush = isPushDebugEnabled()
         if (debugPush) logger.debug(`Sending ${messages.length} push notifications`)
         const invalidTokens = new Set<string>()
+        let invalidCredentials = false
 
         // Filter out invalid push tokens
         const validMessages = messages.filter(message => {
@@ -235,7 +235,7 @@ export class PushNotificationClient {
 
         if (validMessages.length === 0) {
             if (debugPush) logger.debug('No valid Expo push tokens found')
-            return { invalidTokens: [] }
+            return { invalidTokens: [], invalidCredentials: false }
         }
 
         // Create chunks to respect Expo's rate limits
@@ -276,6 +276,7 @@ export class PushNotificationClient {
                     }
 
                     const oversizedMessages = new Set<ExpoPushMessage>()
+                    const invalidCredentialMessages = new Set<ExpoPushMessage>()
                     let ticketOffset = 0
                     for (const message of retryChunk) {
                         const targetCount = Array.isArray(message.to) ? message.to.length : 1
@@ -284,6 +285,10 @@ export class PushNotificationClient {
                         if (tickets.some((ticket) => isExpoMessageTooBig(ticket)
                             || (ticket.status === 'ok' && isExpoMessageTooBig(receipts?.[ticket.id])))) {
                             oversizedMessages.add(message)
+                        }
+                        if (tickets.some((ticket) => getExpoErrorCode(ticket) === 'InvalidCredentials'
+                            || (ticket.status === 'ok' && getExpoErrorCode(receipts?.[ticket.id]) === 'InvalidCredentials'))) {
+                            invalidCredentialMessages.add(message)
                         }
                     }
                     if (oversizedMessages.size > 0) {
@@ -309,6 +314,14 @@ export class PushNotificationClient {
                     }
                     
                     retryChunk = retryChunk.filter((message) => !oversizedMessages.has(message))
+                    if (invalidCredentialMessages.size > 0) {
+                        invalidCredentials = true
+                        retryChunk = retryChunk.filter((message) => !invalidCredentialMessages.has(message))
+                        logger.infoFile('[PUSH] Expo rejected push notification credentials', {
+                            error: 'InvalidCredentials',
+                            count: invalidCredentialMessages.size,
+                        })
+                    }
 
                     // Log any errors but don't throw
                     const errors = ticketChunk.filter(ticket => ticket.status === 'error')
@@ -350,8 +363,8 @@ export class PushNotificationClient {
             }
         }
 
-        if (debugPush) logger.debug(`Push notifications sent successfully`)
-        return { invalidTokens: [...invalidTokens] }
+        if (debugPush && !invalidCredentials) logger.debug(`Push notifications sent successfully`)
+        return { invalidTokens: [...invalidTokens], invalidCredentials }
     }
 
     /**
@@ -360,14 +373,14 @@ export class PushNotificationClient {
      * @param body - Notification body
      * @param data - Additional data to send with the notification
      */
-    async sendToAllDevicesAsync(title: string, body: string, data?: Record<string, any>): Promise<void> {
+    async sendToAllDevicesAsync(title: string, body: string, data?: Record<string, any>, options?: Readonly<{ suppressIfComputerFocused?: boolean }>): Promise<void> {
         const debugPush = isPushDebugEnabled()
         if (debugPush) logger.debug(`[PUSH] sendToAllDevicesAsync called with title: "${title}", body: "${body}"`);
 
         try {
             // Fetch all push tokens
             if (debugPush) logger.debug('[PUSH] Fetching push tokens...')
-            const tokens = await this.fetchPushTokens()
+            const tokens = await this.fetchPushTokens(options)
             if (debugPush) logger.debug(`[PUSH] Fetched ${tokens.length} push tokens`)
 
             // Log token details for debugging
@@ -409,6 +422,9 @@ export class PushNotificationClient {
             if (debugPush) logger.debug(`[PUSH] Sending ${messages.length} push notifications...`)
             const sendResult = await this.sendPushNotifications(messages)
             await this.deletePushTokens(sendResult.invalidTokens)
+            if (sendResult.invalidCredentials) {
+                throw new Error('Expo push failed: InvalidCredentials. Check the app\'s FCM V1 or APNs credentials in Expo.')
+            }
             if (debugPush) logger.debug('[PUSH] Push notifications sent successfully')
         } catch (error) {
             logger.debug('[PUSH] Error sending to all devices:', serializeAxiosErrorForLog(error))
@@ -416,7 +432,7 @@ export class PushNotificationClient {
         }
     }
 
-    sendToAllDevices(title: string, body: string, data?: Record<string, any>): void {
-        void this.sendToAllDevicesAsync(title, body, data).catch(() => {});
+    sendToAllDevices(title: string, body: string, data?: Record<string, any>, options?: Readonly<{ suppressIfComputerFocused?: boolean }>): void {
+        void this.sendToAllDevicesAsync(title, body, data, options).catch(() => {});
     }
 }
