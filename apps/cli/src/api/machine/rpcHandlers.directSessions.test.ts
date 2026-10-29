@@ -60,6 +60,7 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.unstubAllEnvs();
+    vi.stubEnv('CLAUDE_CONFIG_DIR', undefined);
   });
 
   it('takes over a direct claude session using provider cwd and config dir', async () => {
