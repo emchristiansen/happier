@@ -113,12 +113,20 @@ fn pointer_refresh_is_due(since_last_refresh: Option<Duration>) -> bool {
 /// cadence that still lets the menu catch a daemon that stopped on its own within a minute.
 pub const LINUX_STATUS_TIMER_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The single native reader's admission and settlement while tray-only. An overlapping action
-/// retains one follow-up read; pointer and timer demand never queue another read.
+#[derive(Default)]
+enum StatusReadPhase {
+    #[default]
+    Idle,
+    CurrentInterval,
+    PriorInterval,
+}
+
+/// One reader across tray-only intervals. Leaving invalidates its observation without releasing
+/// its reservation; re-entry and actions retain one fresh read after it settles.
 #[derive(Default)]
 pub struct StatusReadState {
-    read_in_flight: bool,
-    pending_after_action: bool,
+    phase: StatusReadPhase,
+    pending_refresh: bool,
 }
 
 impl StatusReadState {
@@ -133,31 +141,50 @@ impl StatusReadState {
             self.leave();
             return false;
         }
-        if self.read_in_flight && trigger == StatusReadTrigger::AfterAction {
-            self.pending_after_action = true;
+        let read_in_flight = !matches!(self.phase, StatusReadPhase::Idle);
+        if read_in_flight
+            && matches!(
+                trigger,
+                StatusReadTrigger::AfterAction | StatusReadTrigger::EnteredMenuBar
+            )
+        {
+            self.pending_refresh = true;
         }
         if !should_start_status_read(
             trigger,
             menu_bar_mode,
-            self.read_in_flight,
+            read_in_flight,
             since_last_read,
             last_read_failed,
         ) {
             return false;
         }
-        self.read_in_flight = true;
+        self.phase = StatusReadPhase::CurrentInterval;
         true
     }
 
-    /// Returns whether the worker has another read to perform.
+    /// Checked under the lifecycle lock through publication, not just when the task returns.
+    pub fn may_publish(&self, menu_bar_mode: bool) -> bool {
+        menu_bar_mode && matches!(self.phase, StatusReadPhase::CurrentInterval)
+    }
+
+    /// Returns whether the same worker owns a fresh read for the current interval.
     pub fn finish(&mut self, menu_bar_mode: bool) -> bool {
-        let pending = std::mem::take(&mut self.pending_after_action);
-        self.read_in_flight = menu_bar_mode && pending;
-        self.read_in_flight
+        let follow_up = menu_bar_mode && std::mem::take(&mut self.pending_refresh);
+        self.pending_refresh = false;
+        self.phase = if follow_up {
+            StatusReadPhase::CurrentInterval
+        } else {
+            StatusReadPhase::Idle
+        };
+        follow_up
     }
 
     pub fn leave(&mut self) {
-        self.pending_after_action = false;
+        if !matches!(self.phase, StatusReadPhase::Idle) {
+            self.phase = StatusReadPhase::PriorInterval;
+        }
+        self.pending_refresh = false;
     }
 }
 
@@ -212,6 +239,58 @@ mod status_read_tests {
         assert!(reads.request(StatusReadTrigger::EnteredMenuBar, true, None, false));
         assert!(!reads.request(StatusReadTrigger::AfterAction, true, None, false));
         assert!(!reads.finish(false));
+        assert!(!reads.finish(true));
+    }
+
+    #[test]
+    fn reentry_before_old_completion_preserves_a_fresh_observation() {
+        let mut reads = StatusReadState::default();
+        assert!(reads.request(StatusReadTrigger::EnteredMenuBar, true, None, false));
+        assert!(reads.may_publish(true));
+        reads.leave();
+        assert!(!reads.may_publish(false));
+        assert!(!reads.request(StatusReadTrigger::EnteredMenuBar, true, None, false));
+        assert!(
+            !reads.may_publish(true),
+            "old rows cannot replace newer web observations"
+        );
+        assert!(
+            reads.finish(true),
+            "re-entry needs its own current observation"
+        );
+        assert!(
+            reads.may_publish(true),
+            "the reserved follow-up belongs to this interval"
+        );
+        assert!(!reads.request(StatusReadTrigger::Timer, true, None, false));
+        assert!(!reads.finish(true), "only one entry follow-up is retained");
+        assert!(!reads.may_publish(true));
+    }
+
+    #[test]
+    fn old_completion_before_reentry_releases_the_reader_without_publishing() {
+        let mut reads = StatusReadState::default();
+        assert!(reads.request(StatusReadTrigger::EnteredMenuBar, true, None, false));
+        reads.leave();
+        assert!(!reads.may_publish(false));
+        assert!(!reads.finish(false));
+        assert!(reads.request(StatusReadTrigger::EnteredMenuBar, true, None, false));
+        assert!(reads.may_publish(true));
+        assert!(!reads.finish(true));
+    }
+
+    #[test]
+    fn leaving_again_abandons_entry_and_action_demand_but_not_the_reservation() {
+        let mut reads = StatusReadState::default();
+        assert!(reads.request(StatusReadTrigger::EnteredMenuBar, true, None, false));
+        reads.leave();
+        assert!(!reads.request(StatusReadTrigger::EnteredMenuBar, true, None, false));
+        assert!(!reads.request(StatusReadTrigger::AfterAction, true, None, false));
+        reads.leave();
+        assert!(!reads.may_publish(true));
+        assert!(!reads.finish(false));
+        assert!(reads.request(StatusReadTrigger::EnteredMenuBar, true, None, false));
+        assert!(reads.may_publish(true));
         assert!(!reads.finish(true));
     }
 

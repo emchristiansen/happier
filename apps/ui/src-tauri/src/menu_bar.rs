@@ -140,7 +140,12 @@ fn activate(app: &AppHandle) {
     let Some(state) = app.try_state::<MenuBarState>() else {
         return;
     };
-    state.active.store(true, Ordering::SeqCst);
+    {
+        let Ok(_inner) = state.inner.lock() else {
+            return;
+        };
+        state.active.store(true, Ordering::SeqCst);
+    }
     #[cfg(target_os = "macos")]
     if let Err(error) = app.set_activation_policy(tauri::ActivationPolicy::Accessory) {
         log::warn!("failed to hide the Dock icon for menu-bar mode: {error}");
@@ -156,12 +161,15 @@ pub fn leave(app: &AppHandle) {
     let Some(state) = app.try_state::<MenuBarState>() else {
         return;
     };
-    if !state.active.swap(false, Ordering::SeqCst) {
-        return;
-    }
-    if let Ok(mut inner) = state.inner.lock() {
+    {
+        let Ok(mut inner) = state.inner.lock() else {
+            return;
+        };
+        if !state.active.swap(false, Ordering::SeqCst) {
+            return;
+        }
         inner.status_read.leave();
-    };
+    }
     #[cfg(target_os = "macos")]
     {
         // Window creation runs off the event handler, but NSApplication icon updates must still
@@ -514,64 +522,90 @@ fn read_status(app: &AppHandle, trigger: StatusReadTrigger) {
     }
     let app = app.clone();
     std::thread::spawn(move || loop {
-        // Reopening can happen after a follow-up was reserved but before this iteration runs.
-        if !is_active(&app) {
-            if let Some(state) = app.try_state::<MenuBarState>() {
-                if let Ok(mut inner) = state.inner.lock() {
-                    inner.status_read.finish(false);
+        {
+            let Some(state) = app.try_state::<MenuBarState>() else {
+                return;
+            };
+            let Ok(mut inner) = state.inner.lock() else {
+                return;
+            };
+            let active = state.active.load(Ordering::SeqCst);
+            if !inner.status_read.may_publish(active) {
+                // An old reservation may not have started yet. Discard it and drain only the
+                // current entry/action demand, keeping this as the one reader.
+                if !inner.status_read.finish(active) {
+                    return;
                 }
+                inner.last_refresh_started = Some(Instant::now());
             }
-            return;
         }
         let outcome = run_service_task(&app, "daemon.service.status.v1", &[]);
         let failed = !matches!(outcome, NativeTaskOutcome::Succeeded(Some(_)));
-        // A read that finished after the window came back is stale beside the web UI's rows.
-        if is_active(&app) {
-            match outcome {
-                NativeTaskOutcome::Succeeded(Some(data)) => {
-                    let projected = read_service_status(&data);
-                    crate::tray::update_model(&app, |model| {
-                        model.services = projected.services;
-                        model.notice = None;
-                        model.start_at_login = projected
-                            .autostart
-                            .map(|mode| mode == AutostartMode::AtLogin);
-                    });
-                    crate::autostart::follow_login_start_setting(&app, projected.autostart);
+        let (settled, follow_up) = std::sync::mpsc::sync_channel(1);
+        let publish_app = app.clone();
+        // Native menu construction can use the main thread. Publish there, with the lifecycle
+        // lock held, so neither leave/re-entry nor a queued old result can cross this check.
+        let publication = app.run_on_main_thread(move || {
+            let Some(state) = publish_app.try_state::<MenuBarState>() else {
+                return;
+            };
+            let Ok(mut inner) = state.inner.lock() else {
+                return;
+            };
+            let active = state.active.load(Ordering::SeqCst);
+            if inner.status_read.may_publish(active) {
+                match outcome {
+                    NativeTaskOutcome::Succeeded(Some(data)) => {
+                        let projected = read_service_status(&data);
+                        crate::tray::update_model(&publish_app, |model| {
+                            model.services = projected.services;
+                            model.notice = None;
+                            model.start_at_login = projected
+                                .autostart
+                                .map(|mode| mode == AutostartMode::AtLogin);
+                        });
+                        crate::autostart::follow_login_start_setting(
+                            &publish_app,
+                            projected.autostart,
+                        );
+                    }
+                    NativeTaskOutcome::Succeeded(None) | NativeTaskOutcome::Failed { .. } => {
+                        let reason = match &outcome {
+                            NativeTaskOutcome::Failed { code, message } => {
+                                log::warn!("menu-bar status read failed ({code}): {message}");
+                                failure_message(&outcome)
+                            }
+                            _ => None,
+                        };
+                        crate::tray::update_model(&publish_app, |model| {
+                            model.services = ServiceList::Failed;
+                            model.notice = reason;
+                        });
+                    }
                 }
-                NativeTaskOutcome::Succeeded(None) | NativeTaskOutcome::Failed { .. } => {
-                    // Said in the menu ("Couldn't read background services" and the reason), and
-                    // retried the next time the menu is about to open.
-                    let reason = match &outcome {
-                        NativeTaskOutcome::Failed { code, message } => {
-                            log::warn!("menu-bar status read failed ({code}): {message}");
-                            failure_message(&outcome)
-                        }
-                        _ => None,
-                    };
-                    crate::tray::update_model(&app, |model| {
-                        model.services = ServiceList::Failed;
-                        model.notice = reason;
-                    });
+                inner.last_read_failed = failed;
+            }
+            // An invalidated result changes neither the model nor the current retry state.
+            let next = inner.status_read.finish(active);
+            if next {
+                inner.last_refresh_started = Some(Instant::now());
+            }
+            let _ = settled.send(next);
+        });
+        if let Err(error) = publication {
+            log::warn!("failed to schedule menu-bar status publication: {error}");
+            if let Some(state) = app.try_state::<MenuBarState>() {
+                if let Ok(mut inner) = state.inner.lock() {
+                    inner.status_read.finish(false);
+                    inner.last_read_failed = true;
                 }
             }
-        }
-        let Some(state) = app.try_state::<MenuBarState>() else {
-            return;
-        };
-        let Ok(mut inner) = state.inner.lock() else {
-            return;
-        };
-        inner.last_read_failed = failed;
-        // Keep the read reserved through publication, then drain the one action obligation on
-        // this worker. Pointer/timer demand cannot overtake it or add another status thread.
-        if !inner
-            .status_read
-            .finish(state.active.load(Ordering::SeqCst))
-        {
             return;
         }
-        inner.last_refresh_started = Some(Instant::now());
+        // Only this background reader waits; the main thread never waits for the worker.
+        if !follow_up.recv().unwrap_or(false) {
+            return;
+        }
     });
 }
 
