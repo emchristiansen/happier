@@ -63,6 +63,27 @@ describe('openCodeV2Forms released contract', () => {
     expect(answer.__proto__).toEqual(['x']);
   });
 
+  it('preserves prototype-name freeform strings through answer serialization', () => {
+    const projection = projectOpenCodeV2Form({
+      id: 'frm_freeform', sessionID: 'ses_1',
+      fields: [
+        { key: 'plain', type: 'string', title: 'Plain' },
+        { key: 'custom', type: 'multiselect', title: 'Custom', custom: true,
+          options: [{ value: 'a', label: 'A' }] },
+        { key: 'declared', type: 'string', title: 'Declared',
+          options: [{ value: 'own-value', label: 'toString' }] },
+      ],
+    });
+    expect(projection).not.toBeNull();
+    const answer = buildOpenCodeV2FormAnswer(
+      projection!.bindings, [['toString'], ['constructor', '__proto__', 'A'], ['toString']],
+      projection!.hiddenBindings,
+    );
+    expect(JSON.parse(JSON.stringify(answer))).toEqual({
+      plain: 'toString', custom: ['constructor', '__proto__', 'a'], declared: 'own-value',
+    });
+  });
+
   it('projects custom-with-options as options plus freeform instead of unrepresentable', () => {
     const projection = projectOpenCodeV2Form({
       id: 'frm_1',

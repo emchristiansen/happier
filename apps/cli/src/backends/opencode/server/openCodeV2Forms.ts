@@ -14,7 +14,7 @@ export type OpenCodeV2FormFieldBinding = Readonly<{
   key: string;
   type: OpenCodeV2FormFieldType;
   /** Maps the label Happier surfaced back to the upstream option value. */
-  optionValueByLabel: Readonly<Record<string, string>>;
+  optionValueByLabel: ReadonlyMap<string, string>;
   /** True when the field is not asked interactively and only its default may be submitted. */
   hidden: boolean;
   /** Present only when the field declares one; used for hidden fields and unanswered prompts. */
@@ -162,7 +162,7 @@ export function projectOpenCodeV2Form(rawForm: unknown): OpenCodeV2FormProjectio
     const binding: OpenCodeV2FormFieldBinding = {
       key,
       type,
-      optionValueByLabel: Object.fromEntries(options.map((option) => [option.label, option.value])),
+      optionValueByLabel: new Map(options.map((option) => [option.label, option.value])),
       hidden: field.hidden === true,
       ...(defaultValue === undefined ? {} : { defaultValue }),
       when,
@@ -217,7 +217,7 @@ function coerceAnswerValue(
   binding: OpenCodeV2FormFieldBinding,
   labels: readonly string[],
 ): string | number | boolean | string[] | null {
-  const resolve = (label: string): string => binding.optionValueByLabel[label] ?? label;
+  const resolve = (label: string): string => binding.optionValueByLabel.get(label) ?? label;
   if (binding.type === 'multiselect') {
     // Preserve exact string values including "" and whitespace; an empty label list is
     // unanswered and falls back to the declared default via the caller.

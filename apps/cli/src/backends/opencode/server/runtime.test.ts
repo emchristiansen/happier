@@ -1,8 +1,10 @@
 import { buildUsageLimitIssueFingerprint } from '@happier-dev/protocol';
 import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import * as fsPromises from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -54,6 +56,12 @@ import type { OpenCodeGlobalEvent } from './types';
 import { ProviderEnforcedPermissionHandler } from '@/agent/permissions/ProviderEnforcedPermissionHandler';
 import { createMutableApiSessionClientFixture } from '@/testkit/backends/sessionFixtures';
 import type { AgentState } from '@/api/types';
+
+// Keep the real filesystem by default; individual image tests can pause the open boundary.
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return { ...actual, open: vi.fn(actual.open) };
+});
 
 const mockNotifyDaemonConnectedServiceRuntimeAuthFailure = vi.hoisted(() => vi.fn(async () => ({})));
 const mockQueryDaemonOpenCodeBrokerLoadHandshake = vi.hoisted(() => vi.fn());
@@ -1319,6 +1327,93 @@ describe('createOpenCodeServerRuntime', () => {
       await runtime.reset().catch(() => {});
     }
   });
+
+  it.each([
+    { kind: 'ordinary', cancel: true }, { kind: 'native', cancel: true },
+    { kind: 'ordinary', cancel: false }, { kind: 'native', cancel: false },
+  ])(
+    'keeps $kind image dispatch bound to its live turn (cancel=$cancel)',
+    async ({ kind, cancel }) => {
+      const cwd = await mkdtemp(join(tmpdir(), 'opencode-cancelled-image-'));
+      const uploadPath = '.happier/uploads/messages/cancelled/screen.png';
+      const imagePath = join(cwd, uploadPath);
+      const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+      await mkdir(dirname(imagePath), { recursive: true });
+      await writeFile(imagePath, bytes);
+      let releaseImage!: () => void;
+      const imageMayOpen = new Promise<void>((resolve) => { releaseImage = resolve; });
+      let startedImage!: () => void;
+      const imageStarted = new Promise<void>((resolve) => { startedImage = resolve; });
+      const { open: realOpen } = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+      // Hold the real filesystem boundary; projection, hash checks and runtime stay real.
+      const openSpy = vi.mocked(fsPromises.open).mockImplementation(async (path, flags, mode) => {
+        if (path === imagePath) { startedImage(); await imageMayOpen; }
+        return realOpen(path, flags, mode);
+      });
+      const client = createFakeClient();
+      client.appCommands.mockResolvedValue([{ name: 'review' }]);
+      const runtime = createOpenCodeServerRuntime({
+        directory: cwd, session: createFakeSession(), messageBuffer: new MessageBuffer(), mcpServers: {},
+        permissionHandler: createFakePermissionHandler() as unknown as ProviderEnforcedPermissionHandler,
+        onThinkingChange: vi.fn(),
+      }, { createClient: async () => client });
+      let oldPrompt: Promise<void> | undefined;
+      let successor: Promise<void> | undefined;
+      try {
+        await runtime.startOrLoad({});
+        await client.__emit({ directory: cwd, payload: { type: 'server.connected', properties: {} } });
+        runtime.beginTurn();
+        oldPrompt = runtime.sendPromptWithMeta({
+          text: kind === 'native' ? '/review' : 'Inspect the image',
+          meta: {
+            happier: { kind: 'attachments.v1', payload: { attachments: [{
+              path: uploadPath, mimeType: 'image/png', sizeBytes: bytes.byteLength,
+              sha256: createHash('sha256').update(bytes).digest('hex'),
+            }] } },
+            happierStructuredInputV1: { v: 1, imageInputs: [{
+              id: 'image-1', kind: 'localImage', path: uploadPath, mimeType: 'image/png',
+              provenance: { kind: 'sessionAttachmentUpload' },
+            }] },
+          },
+        });
+        void oldPrompt.catch(() => undefined);
+        await imageStarted;
+        expect(client.sessionPromptAsync).not.toHaveBeenCalled();
+        expect(client.sessionCommand).not.toHaveBeenCalled();
+        if (!cancel) {
+          releaseImage();
+          const method = kind === 'native' ? client.sessionCommand : client.sessionPromptAsync;
+          await expect.poll(() => method.mock.calls.length).toBe(1);
+          expect(method.mock.calls[0]?.[0].parts).toContainEqual({
+            type: 'file', mime: 'image/png', filename: 'screen.png',
+            url: `data:image/png;base64,${bytes.toString('base64')}`,
+          });
+          if (kind === 'ordinary') {
+            await emitTerminalAssistantAndIdle(client, { messageId: 'msg_valid_image' });
+          }
+          await expect(oldPrompt).resolves.toBeUndefined();
+          return;
+        }
+        await runtime.cancel();
+        runtime.beginTurn();
+        successor = runtime.sendPrompt('Uncancelled successor');
+        void successor.catch(() => undefined);
+        await expect.poll(() => client.sessionPromptAsync.mock.calls.length).toBe(1);
+        releaseImage();
+        await expect(oldPrompt).rejects.toThrow('OpenCode session aborted');
+        expect(client.sessionPromptAsync).toHaveBeenCalledTimes(1);
+        expect(client.sessionCommand).not.toHaveBeenCalled();
+        await emitTerminalAssistantAndIdle(client, { messageId: 'msg_after_cancelled_image' });
+        await expect(successor).resolves.toBeUndefined();
+      } finally {
+        releaseImage();
+        await runtime.reset().catch(() => undefined);
+        await oldPrompt?.catch(() => undefined);
+        await successor?.catch(() => undefined);
+        openSpy.mockImplementation(realOpen);
+      }
+    },
+  );
 
   it('rejects when the turn resolves before the prompt is dispatched to OpenCode', async () => {
     const client = createFakeClient({ emitServerConnectedOnSubscribe: false });

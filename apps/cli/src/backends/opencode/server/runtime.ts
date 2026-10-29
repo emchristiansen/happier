@@ -4476,6 +4476,9 @@ export function createOpenCodeServerRuntime(params: {
             throw new ProviderPromptSubmissionRejectedBeforeEffectError('provider_rejected_before_acceptance', new Error('OpenCode native commands do not support legacy prompt config fields'));
           }
           const parts = await buildOpenCodePromptParts({ cwd: params.directory, text: '', metadata: paramsWithMeta.meta });
+          if (!isActiveSubmission(thisTurnDeferred, promptSessionId)) {
+            await awaitPreDispatchTurnSettlement(thisTurnDeferred, 'active prompt turn ended during command preparation');
+          }
           await Promise.race([
             c.sessionCommand({ sessionId: promptSessionId, ...nativeCommand, agent, model, ...(promptOptions.variant ? { variant: promptOptions.variant } : {}), parts: [...parts] }),
             thisTurnDeferred.promise,
@@ -4494,7 +4497,7 @@ export function createOpenCodeServerRuntime(params: {
           const failure = error instanceof OpenCodeServerCommandUnsupportedError
             ? new ProviderPromptSubmissionRejectedBeforeEffectError('provider_rejected_before_acceptance', error)
             : error;
-          if (!turnDeferred) throw failure;
+          if (!isActiveSubmission(thisTurnDeferred, promptSessionId)) throw failure;
           setThinking(false);
           await flushAndClearStreamWriters({ reason: 'abort', interruptedReason: 'native_command_error' });
           if (isAbortLikeError(failure)) {
@@ -4556,6 +4559,9 @@ export function createOpenCodeServerRuntime(params: {
         const promptParts = Array.isArray(promptProjection)
           ? promptProjection
           : await promptProjection;
+        if (!isActiveSubmission(thisTurnDeferred, promptSessionId)) {
+          await awaitPreDispatchTurnSettlement(thisTurnDeferred, 'active prompt turn ended during prompt preparation');
+        }
         const promptAsyncPromise = c.sessionPromptAsync({
           sessionId: promptSessionId,
           messageId: messageID,
@@ -4589,7 +4595,7 @@ export function createOpenCodeServerRuntime(params: {
           throw promptAsyncOutcome.error;
         }
       } catch (error) {
-        if (!turnDeferred) {
+        if (!isActiveSubmission(thisTurnDeferred, promptSessionId)) {
           throw error;
         }
         setThinking(false);
