@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, symlinkSync, watch, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -7,6 +7,7 @@ import type { runCommandCapture } from '@happier-dev/cli-common/process';
 import { installProviderCli } from '@happier-dev/cli-common/providers';
 
 import { cliCapability as claudeCliCapability } from '@/backends/claude/cli/capability';
+import { createDeferred } from '@/testkit/async/deferred';
 import { applyEnvValues, restoreEnvValues, snapshotEnvValues } from '@/testkit/env/envSnapshot';
 import { createTempDirSync, removeTempDirSync } from '@/testkit/fs/tempDir';
 
@@ -17,8 +18,10 @@ const SCOPED_ENV_KEYS = ['HOME', 'USERPROFILE', 'PATH', 'HAPPIER_HOME_DIR', 'HAP
 function writeClaudeVersion(dir: string, version: string, options: { startupSeconds?: number } = {}): string {
   const path = join(dir, version);
   mkdirSync(dir, { recursive: true });
-  const startup = options.startupSeconds ? `sleep ${options.startupSeconds}\n` : '';
-  writeFileSync(path, `#!/bin/sh\n${startup}echo "${version} (Claude Code)"\n`, { mode: 0o755 });
+  // Use the test runtime directly: the deliberately minimal fixture PATH may not contain sleep.
+  writeFileSync(path, `#!${process.execPath}
+setTimeout(() => process.stdout.write(${JSON.stringify(`${version} (Claude Code)\n`)}), ${(options.startupSeconds ?? 0) * 1_000});
+`, { mode: 0o755 });
   return path;
 }
 
@@ -80,6 +83,63 @@ describe.skipIf(process.platform === 'win32')('withProviderCliUpdates with the r
     await expect(cap.detect({ request: { id: 'cli.claude' }, context: await detectContext() }))
       .resolves.toMatchObject({ version: '2.1.283' });
   });
+
+  it('does not cache an old ordinary snapshot completed after update verification', async () => {
+    const held = join(root, 'hold-next-tmux');
+    const claimed = join(root, 'tmux-held');
+    const release = join(root, 'release-tmux');
+    writeFileSync(held, '');
+    writeFileSync(join(home, '.local', 'bin', 'tmux'), `#!${process.execPath}
+const fs = require('node:fs');
+const root = ${JSON.stringify(root)};
+const held = ${JSON.stringify(held)};
+const claimed = ${JSON.stringify(claimed)};
+const release = ${JSON.stringify(release)};
+if (fs.existsSync(held)) {
+  let finished = false;
+  const finish = () => {
+    if (finished || !fs.existsSync(release)) return;
+    finished = true;
+    watcher.close();
+    process.stdout.write('tmux 3.4\\n');
+  };
+  const watcher = fs.watch(root, finish);
+  fs.renameSync(held, claimed);
+  finish();
+} else {
+  process.stdout.write('tmux 3.4\\n');
+}
+`, { mode: 0o755 });
+    const runCommand: typeof runCommandCapture = async () => {
+      const next = writeClaudeVersion(versionsDir, '2.1.283');
+      rmSync(launcher);
+      symlinkSync(next, launcher);
+      return { kind: 'exited', status: 0, signal: null, stdout: '', stderr: '' };
+    };
+    const cap = withProviderCliUpdates(claudeCliCapability, 'claude', {
+      fetchLatestVersion: async () => ({ latestVersion: null, heldVersion: null }),
+      installProviderCli: (params) => installProviderCli({ ...params, logDir: join(root, 'logs'), deps: { runCommand } }),
+    });
+    const holding = createDeferred();
+    const watcher = watch(root, () => { if (existsSync(claimed)) holding.resolve(); });
+    const oldSnapshot = detectContext();
+    try {
+      // CLI versions are read before tmux, so this snapshot owns V1 but cannot publish yet.
+      await holding.promise;
+      await expect(cap.invoke!({ method: 'install', params: { intent: 'update', allowVendorRecipeExecution: true } }))
+        .resolves.toMatchObject({ ok: true, result: { previousVersion: '2.1.282', version: '2.1.283' } });
+      writeFileSync(release, '');
+      await expect(cap.detect({ request: { id: 'cli.claude' }, context: await oldSnapshot }))
+        .resolves.toMatchObject({ version: '2.1.282' });
+      // The late old caller may receive V1, but it must not replace the post-update cache.
+      await expect(cap.detect({ request: { id: 'cli.claude' }, context: await detectContext() }))
+        .resolves.toMatchObject({ version: '2.1.283' });
+    } finally {
+      writeFileSync(release, '');
+      watcher.close();
+      await oldSnapshot;
+    }
+  }, 20_000);
 
   it('verifies an update whose new executable needs over a second to print its version', async () => {
     // Observed: the managed Copilot launcher (node) takes 0.8–1.2 s for `--version` on a warm,
