@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildLaunchdPlistXml, renderSystemdServiceUnit, renderWindowsScheduledTaskWrapperPs1 } from '@happier-dev/cli-common/service';
 import { withConfiguredDaemonTestHome, writeDaemonSettingsFixture } from '@/daemon/testkit/fakeDaemonLifecycle.testkit';
 import { createEnvKeyScope } from '@/testkit/env/envScope';
@@ -147,6 +147,11 @@ function scheduleDelayedOwnerWriteOnce(
 
 describe('runDaemonServiceCliCommand', () => {
   let envScope = createEnvKeyScope(SCOPED_ENV_KEYS);
+
+  beforeEach(() => {
+    // Most installed definitions below follow the default relay; pinned cases opt in explicitly.
+    envScope.patch({ HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following' });
+  });
 
   afterEach(() => {
     envScope.restore();

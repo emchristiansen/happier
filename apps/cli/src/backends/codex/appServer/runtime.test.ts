@@ -3535,6 +3535,7 @@ describe('createCodexAppServerRuntime', () => {
         let shouldBlockMetadataWrites = false;
         const sessionTurnLifecycle = createSessionTurnLifecycleTestDouble();
         const session = {
+            waitForProviderInputAdmission: creationScopeInputAdmission,
             updateMetadata: vi.fn(async () => {
                 if (shouldBlockMetadataWrites) await blockedMetadataWrite;
             }),
@@ -4459,12 +4460,13 @@ describe('createCodexAppServerRuntime', () => {
         await activeTurn;
     });
 
-    it('returns an unconfirmed steer to Pending custody when its provider turn ends without a user-message echo', async () => {
+    it('reports an unconfirmed steer as uncertain when its provider turn ends without a user-message echo', async () => {
         const { root } = await createRuntimeFixture(
             'happier-codex-app-server-runtime-steer-without-user-echo-',
             { omitSteerUserMessageEcho: true },
         );
         const undeliverablePrompts: Array<Readonly<{ localIds?: readonly string[] | null }>> = [];
+        const uncertainPrompts: Array<Readonly<{ localIds?: readonly string[] | null; userMessageSeq: number | null }>> = [];
         const runtime = createCodexAppServerRuntime({
             directory: root,
             onThinkingChange: vi.fn(),
@@ -4472,6 +4474,9 @@ describe('createCodexAppServerRuntime', () => {
         });
         runtime.setOnUndeliverablePrompts((prompts) => {
             undeliverablePrompts.push(...prompts);
+        });
+        runtime.setOnPromptsEffectMayHaveOccurred((prompts) => {
+            uncertainPrompts.push(...prompts);
         });
 
         await runtime.startOrLoad({});
@@ -4488,9 +4493,11 @@ describe('createCodexAppServerRuntime', () => {
         });
         await activeTurn;
 
-        expect(undeliverablePrompts).toContainEqual(expect.objectContaining({
+        expect(uncertainPrompts).toEqual([{
             localIds: ['pending-steer-without-echo'],
-        }));
+            userMessageSeq: 288,
+        }]);
+        expect(undeliverablePrompts).toEqual([]);
     });
 
     it('materializes a woken head steer during a genuinely active turn and leaves its FIFO neighbor queued', async () => {
