@@ -423,9 +423,21 @@ async function daemonPost(path: string, body?: any, options: DaemonPostOptions =
   try {
     process.kill(state.pid, 0);
   } catch (error) {
-    const errorMessage = 'Daemon is not running, file is stale';
-    logger.debug(`[CONTROL CLIENT] ${errorMessage}`);
-    return { error: errorMessage };
+    // A namespace-hidden PID is not absence. Use the existing authenticated
+    // liveness owner before sending control, within this request's budget.
+    const hiddenPidLiveness = (error as NodeJS.ErrnoException | null)?.code === 'ESRCH' && state.controlToken
+      ? await settleUnlessAborted(probeDaemonAuthenticatedControl({
+          pid: state.pid,
+          httpPort: state.httpPort,
+          controlToken: state.controlToken,
+          timeoutMs: resolveDaemonPingTimeoutMs(),
+        }), signal).catch(() => 'unreachable' as const)
+      : 'unreachable';
+    if (hiddenPidLiveness !== 'running') {
+      const errorMessage = 'Daemon is not running, file is stale';
+      logger.debug(`[CONTROL CLIENT] ${errorMessage}`);
+      return { error: errorMessage };
+    }
   }
 
   try {
