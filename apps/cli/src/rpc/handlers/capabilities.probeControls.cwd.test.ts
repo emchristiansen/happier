@@ -92,17 +92,18 @@ function expectObservedControls(response: unknown, method: ProbeMethod): void {
 }
 
 describe('capabilities.invoke control probes through the real catalog and native process', () => {
+  // Assert budget propagation with room for native startup; expiry is tested before spawn below.
   it.each(methods)('%s preserves cwd and spends preparation from the containing deadline', async (method) => {
     await withProbeFixture(async ({ cwd, capturePath, invoke }) => {
-      expectObservedControls(await invoke(method, { timeoutMs: 1234 }), method);
-      expect(JSON.parse(await readFile(capturePath, 'utf8'))).toMatchObject({ cwd, rpcTimeoutMs: 1034 });
+      expectObservedControls(await invoke(method, { timeoutMs: 12_345 }), method);
+      expect(JSON.parse(await readFile(capturePath, 'utf8'))).toMatchObject({ cwd, rpcTimeoutMs: 12_145 });
     });
   });
 
   it.each(methods)('%s falls back to the closest existing directory', async (method) => {
     await withProbeFixture(async ({ cwd, capturePath, invoke }) => {
-      expectObservedControls(await invoke(method, { cwd: join(cwd, 'missing', 'child'), timeoutMs: 1234 }), method);
-      expect(JSON.parse(await readFile(capturePath, 'utf8'))).toMatchObject({ cwd, rpcTimeoutMs: 1034 });
+      expectObservedControls(await invoke(method, { cwd: join(cwd, 'missing', 'child'), timeoutMs: 12_345 }), method);
+      expect(JSON.parse(await readFile(capturePath, 'utf8'))).toMatchObject({ cwd, rpcTimeoutMs: 12_145 });
     });
   });
 
@@ -132,8 +133,8 @@ describe('capabilities.invoke control probes through the real catalog and native
   it('uses an explicit runtime-kind override over the fetched account settings', async () => {
     await withProbeFixture(async ({ capturePath, invoke, setSettings }) => {
       setSettings({ codexBackendMode: 'mcp' });
-      expectObservedControls(await invoke('probeModels', { runtimeKindOverride: 'appServer', timeoutMs: 1234 }), 'probeModels');
-      expect(JSON.parse(await readFile(capturePath, 'utf8'))).toMatchObject({ rpcTimeoutMs: 1034 });
+      expectObservedControls(await invoke('probeModels', { runtimeKindOverride: 'appServer', timeoutMs: 12_345 }), 'probeModels');
+      expect(JSON.parse(await readFile(capturePath, 'utf8'))).toMatchObject({ rpcTimeoutMs: 12_145 });
     });
   });
 

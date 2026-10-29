@@ -216,13 +216,14 @@ describe('ExecutionRunManager process lifecycle', () => {
         const cancelled = await start({ runClass: 'bounded', instructions: 'HOLD_PROCESS_TURN' });
         await expect.poll(async () => (await children[2]?.backend.probeTurnLiveness())?.activeProviderTurn, { timeout: 10_000 }).toBe(true);
         await expect(manager.stop(cancelled.runId)).resolves.toEqual({ ok: true });
-        await expect.poll(async () => isProcessAlive(await children[2]!.readPid())).toBe(false);
+        // Stop acknowledges independently of disposal; discovery has no one-second bound.
+        await expect.poll(async () => isProcessAlive(await children[2]!.readPid()), { timeout: 10_000 }).toBe(false);
         expect(manager.get(cancelled.runId)?.status).toBe('cancelled');
         expect(isProcessAlive(parkedPid)).toBe(true);
         expect((await primary.backend.probeTurnLiveness()).activeProviderTurn).toBe(true);
 
         await expect(manager.stop(parked.runId)).resolves.toEqual({ ok: true });
-        await expect.poll(() => isProcessAlive(parkedPid)).toBe(false);
+        await expect.poll(() => isProcessAlive(parkedPid), { timeout: 10_000 }).toBe(false);
         expect(isProcessAlive(primaryPid)).toBe(true);
       } finally {
         await Promise.all(runs.map(async (runId) => {
@@ -268,7 +269,7 @@ describe('ExecutionRunManager process lifecycle', () => {
         expect(resumedPid).not.toBe(initialPid);
         expect(isProcessAlive(resumedPid)).toBe(true);
         await manager.stop(started.runId);
-        await expect.poll(() => isProcessAlive(resumedPid)).toBe(false);
+        await expect.poll(() => isProcessAlive(resumedPid), { timeout: 10_000 }).toBe(false);
       } finally {
         await manager.stop(started.runId);
         await manager.waitForTerminal(started.runId);
