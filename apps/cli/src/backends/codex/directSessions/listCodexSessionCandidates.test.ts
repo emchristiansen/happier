@@ -15,6 +15,7 @@ import {
 } from '@/backends/codex/appServer/testkit/fakeCodexAppServer';
 
 import { listCodexSessionCandidates } from './listCodexSessionCandidates';
+import { readCodexAppServerStartupRpcTimeoutMs } from '@/backends/codex/appServer/client/codexAppServerRpcTimeout';
 
 // As in native-history tests, keep fixture startup locks out of the live OS user's home.
 const startupHome = vi.hoisted(() => ({ path: '' }));
@@ -37,9 +38,12 @@ function createDirectSessionsEnv(codexHome: string, overrides: NodeJS.ProcessEnv
     overrides.HAPPIER_CODEX_APP_SERVER_BIN ?? join(codexHome, 'missing-codex-app-server-binary'),
     {
       CODEX_HOME: codexHome,
-      // These cases test complete listing, including the real fsync-backed startup lock.
-      // Use the fixture's existing RPC budget; the timeout case overrides it explicitly.
-      HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_LIST_TIMEOUT_MS: '2000',
+      // Complete fake-provider listings include the real startup lock and subprocess lifecycle.
+      // Use the canonical startup budget; individual RPCs retain the fixture RPC budget.
+      // Rollout-only and explicit timeout cases keep their independent bounded-read inputs.
+      HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_LIST_TIMEOUT_MS: overrides.HAPPIER_CODEX_APP_SERVER_BIN
+        ? String(readCodexAppServerStartupRpcTimeoutMs(overrides))
+        : '2000',
       ...overrides,
     },
   );
