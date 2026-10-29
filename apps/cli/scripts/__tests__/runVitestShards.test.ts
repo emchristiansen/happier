@@ -95,6 +95,24 @@ describe('runVitestShards', () => {
     );
   });
 
+  it.each([
+    ['src/daemon/service/cli.test.ts', 'runDaemonServiceCliCommand renders background service start and stop as timed steps'],
+    ['src/daemon/service/cli.test.ts', 'runDaemonServiceCliCommand starts a stopped linux service that runs another CLI as it is instead of switching it to the managed CLI'],
+    ['src/daemon/service/cli.test.ts', 'runDaemonServiceCliCommand preserves a running Windows service across install and retry'],
+    ['src/daemon/service/cli.test.ts', 'runDaemonServiceCliCommand runs nothing when starting the healthy darwin service that already owns the running daemon'],
+    ['src/daemon/service/cli.test.ts', 'runDaemonServiceCliCommand lets the installed definition outrank the inherited autostart env, and the flag outrank both'],
+    ['src/daemon/service/cli.test.ts', 'runDaemonServiceCliCommand after "Keep my own" reports a service that runs the managed CLI as a switch to the kept CLI, never as drift (R13)'],
+    ['src/daemon/service/cli.test.ts', 'runDaemonServiceCliCommand allows an existing named case'],
+    ['src/daemon/service/cli.test.ts', 'runDaemonServiceCliCommand rejects an existing named case'],
+    ['src/daemon/service/cli.test.ts', 'a newly named suite selects a newly named case\nwith another line'],
+    ['src/api/machine/rpcHandlers.sessionHandoff.test.ts', 'rpcHandlers (session handoff) aborts an existing named case'],
+    ['src/api/machine/rpcHandlers.sessionHandoff.test.ts', 'rpcHandlers (session handoff) waits for an existing named case'],
+    ['src/api/machine/rpcHandlers.sessionHandoff.test.ts', 'a newly named suite selects a future handoff case'],
+  ])('selects exactly one isolated run for %s: %s', (file, name) => {
+    const runs = resolveVitestIsolationPlan('vitest.config.ts').runs.filter((run) => run.file === file);
+    expect(runs.filter((run) => new RegExp(run.testNamePattern).test(name))).toHaveLength(1);
+  });
+
   it.each([2, 3, 32])('distributes every isolated run exactly once across %i CI parts', (parts) => {
     const fullPlan = resolveVitestIsolationPlan('vitest.config.ts');
     const plans = Array.from({ length: parts }, (_, index) => resolveVitestIsolationPlan(

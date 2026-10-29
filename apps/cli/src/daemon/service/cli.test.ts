@@ -154,11 +154,13 @@ describe('runDaemonServiceCliCommand', () => {
     stopDaemonMock.mockReset();
     restartDaemonAndWaitMock.mockReset();
     vi.restoreAllMocks();
+    vi.doUnmock('node:fs');
     vi.doUnmock('node:child_process');
     vi.doUnmock('./commandExistsInPath');
     vi.doUnmock('@/daemon/controlClient');
     vi.doUnmock('@/daemon/restartDaemonAndWait');
     vi.doUnmock('@/daemon/waitForDaemonRunningWithinBudget');
+    vi.unmock('node:fs');
     vi.unmock('node:child_process');
     vi.unmock('./commandExistsInPath');
     vi.unmock('@/daemon/controlClient');
@@ -1420,6 +1422,7 @@ describe('runDaemonServiceCliCommand', () => {
       envScope.patch({
         HAPPIER_HOME_DIR: happierHomeDir,
         HAPPIER_DAEMON_SERVICE_PLATFORM: 'linux',
+        HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
         HAPPIER_DAEMON_SERVICE_USER_HOME_DIR: homeDir,
         HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR: happierHomeDir,
         HAPPIER_DAEMON_SERVICE_OWNERSHIP_WAIT_TIMEOUT_MS: '120',
@@ -3126,6 +3129,7 @@ describe('runDaemonServiceCliCommand', () => {
       const baseEnv = {
         HAPPIER_HOME_DIR: happierHomeDir,
         HAPPIER_DAEMON_SERVICE_PLATFORM: 'linux',
+        HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
         HAPPIER_DAEMON_SERVICE_USER_HOME_DIR: homeDir,
         HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR: happierHomeDir,
         HAPPIER_DAEMON_SERVICE_NODE_PATH: '/usr/local/bin/happier',
@@ -3337,6 +3341,7 @@ describe('runDaemonServiceCliCommand', () => {
       envScope.patch({
         HAPPIER_HOME_DIR: happierHomeDir,
         HAPPIER_DAEMON_SERVICE_PLATFORM: 'linux',
+        HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
         HAPPIER_DAEMON_SERVICE_USER_HOME_DIR: homeDir,
         HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR: happierHomeDir,
         HAPPIER_DAEMON_SERVICE_CHANNEL: 'stable',
@@ -3346,6 +3351,16 @@ describe('runDaemonServiceCliCommand', () => {
         PATH: '/usr/bin',
       });
       vi.resetModules();
+      // The fixture owns its user service directory, not the host's system inventory.
+      vi.doMock('node:fs', async (importOriginal) => {
+        const actual = await importOriginal<typeof import('node:fs')>();
+        return {
+          ...actual,
+          readdirSync: (...args: Parameters<typeof actual.readdirSync>) => (
+            args[0] === '/etc/systemd/system' ? [] : actual.readdirSync(...args)
+          ),
+        };
+      });
 
       const { runDaemonServiceCliCommand, resolveDaemonServiceCliRuntimeFromEnv, resolveDaemonServicePaths } = await loadCliModule();
       // The managed copy is still on disk, and this computer chose "Keep my own".

@@ -41,6 +41,14 @@ export function resolveVitestShardRange(env, shardCount) {
   return { start, end, part, parts };
 }
 
+function buildCompleteIsolatedRuns(file, patterns) {
+  return [
+    ...patterns.map((testNamePattern) => ({ file, testNamePattern })),
+    // Keep the final fresh process exhaustive when a case or describe is renamed.
+    { file, testNamePattern: `^(?![\\s\\S]*(?:${patterns.join('|')}))[\\s\\S]*$` },
+  ];
+}
+
 export function resolveVitestIsolationPlan(configPath, { part = 1, parts = 1 } = {}) {
   if (typeof configPath !== 'string' || basename(configPath) !== 'vitest.config.ts') {
     return { shardExcludes: [], runs: [] };
@@ -85,13 +93,15 @@ export function resolveVitestIsolationPlan(configPath, { part = 1, parts = 1 } =
       ephemeralExecutionRunPromptFile,
     ],
     runs: [
-      { file: daemonServiceFile, testNamePattern: 'runDaemonServiceCliCommand (?:allows|expands|prefers|resolves|restarts|restores|sets|treats)\\b' },
-      { file: daemonServiceFile, testNamePattern: 'runDaemonServiceCliCommand (?:defaults|fails|plans|refreshes|reports|stops|supports|uses)\\b' },
-      { file: daemonServiceFile, testNamePattern: 'runDaemonServiceCliCommand (?:builds|includes|keeps|passes|rejects|respects|scopes|uninstalls)\\b' },
-      { file: sessionHandoffFile, testNamePattern: '^rpcHandlers \\(session handoff\\) (?:aborts|acknowledges|applies|claims|classifies|delegates|does|durably)\\b' },
-      { file: sessionHandoffFile, testNamePattern: '^rpcHandlers \\(session handoff\\) (?:fails|keeps)\\b' },
-      { file: sessionHandoffFile, testNamePattern: '^rpcHandlers \\(session handoff\\) (?:maps|normalizes|omits|passes|persists|prefers|propagates|publishes|recovers|registers|rejects|retries)\\b' },
-      { file: sessionHandoffFile, testNamePattern: '^rpcHandlers \\(session handoff\\) (?:returns|reuses|serves|starts|stops|surfaces|tracks|uses|waits)\\b' },
+      ...buildCompleteIsolatedRuns(daemonServiceFile, [
+        'runDaemonServiceCliCommand (?:allows|expands|prefers|resolves|restarts|restores|sets|treats)\\b',
+        'runDaemonServiceCliCommand (?:defaults|fails|plans|refreshes|reports|stops|supports|uses)\\b',
+      ]),
+      ...buildCompleteIsolatedRuns(sessionHandoffFile, [
+        '^rpcHandlers \\(session handoff\\) (?:aborts|acknowledges|applies|claims|classifies|delegates|does|durably)\\b',
+        '^rpcHandlers \\(session handoff\\) (?:fails|keeps)\\b',
+        '^rpcHandlers \\(session handoff\\) (?:maps|normalizes|omits|passes|persists|prefers|propagates|publishes|recovers|registers|rejects|retries)\\b',
+      ]),
       { file: unifiedTranscriptBridgeFile, testNamePattern: '.*' },
       { file: sessionScannerFile, testNamePattern: '.*' },
       { file: codexAppServerRuntimeFile, testNamePattern: '.*' },
