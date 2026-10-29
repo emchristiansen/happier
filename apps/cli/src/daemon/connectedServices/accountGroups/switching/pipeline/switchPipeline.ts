@@ -274,6 +274,7 @@ export function isReasonEnabled(policy: ConnectedServiceAuthGroupPolicyV1, reaso
       return policy.switchOn.usageLimit;
     case 'auth_expired':
     case 'permission_denied':
+    case 'plan':
       return policy.switchOn.authExpired;
     case 'refresh_failed':
       return policy.switchOn.refreshFailure || policy.switchOn.authExpired;

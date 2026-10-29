@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   buildProviderAccountUsageRecordId,
+  ConnectedServiceAuthGroupV1Schema,
   type ConnectedServiceAuthGroupV1,
   type ProviderAccountUsageRecordKeyV1,
   type ProviderAccountUsageSnapshotV1,
@@ -11,6 +12,8 @@ import { mapCommittedGenerationApplyResult } from '../accountGroups/generation/m
 import { buildConnectedServiceAuthGroupCommittedGenerationFact } from '../sessionAuthSwitch/connectedServiceAuthSwitchOutcome';
 import { DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1 } from '../accountGroups/selection/selectConnectedServiceAuthGroupCandidate';
 import { createDaemonConnectedServiceAuthGroupSwitchCoordinator } from './createDaemonConnectedServiceAuthGroupSwitchCoordinator';
+import { classifyCodexConnectedServiceAuthFailure } from '@/backends/codex/connectedServices/classifyCodexConnectedServiceAuthFailure';
+import { handleConnectedServiceRuntimeAuthFailure } from './handleConnectedServiceRuntimeAuthFailure';
 
 function group(activeProfileId: string, generation: number): ConnectedServiceAuthGroupV1 {
   return {
@@ -152,6 +155,94 @@ function createTestDaemonConnectedServiceAuthGroupSwitchCoordinator(
 }
 
 describe('createDaemonConnectedServiceAuthGroupSwitchCoordinator', () => {
+  it.each([
+    ['allowed', 'switched'],
+    ['auth_disabled', 'switch_reason_disabled'],
+    ['auto_disabled', 'auto_switch_disabled'],
+    ['recovery_off', 'auto_switch_disabled'],
+    ['wait_only', 'no_eligible_member'],
+    ['turn_budget', 'switch_limit_reached'],
+    ['hour_budget', 'switch_limit_reached'],
+    ['no_alternate', 'no_eligible_member'],
+  ] as const)('recovers classified model entitlement failures with %s policy', async (control, expected) => {
+    let current = group('primary', 1);
+    current = {
+      ...current,
+      policy: {
+        ...current.policy,
+        autoSwitch: control !== 'auto_disabled',
+        recoveryMode: control === 'recovery_off' ? 'off' : control === 'wait_only' ? 'wait_until_reset' : 'switch_then_resume',
+        switchOn: { ...current.policy.switchOn, authExpired: control !== 'auth_disabled' },
+        maxSwitchesPerTurn: control === 'turn_budget' ? 0 : 10,
+        maxSwitchesPerSessionHour: control === 'hour_budget' ? 0 : 10,
+      },
+      members: current.members.map((member) => ({
+        ...member,
+        enabled: member.profileId !== 'backup' || control !== 'no_alternate',
+      })),
+    };
+    const api = {
+      getConnectedServiceAuthGroup: vi.fn(async () => current),
+      updateConnectedServiceAuthGroupRuntimeState: vi.fn(async (input: Parameters<NonNullable<TestCoordinatorParams['api']['updateConnectedServiceAuthGroupRuntimeState']>>[0]) => {
+        current = ConnectedServiceAuthGroupV1Schema.parse({
+          ...current,
+          runtimeStateRevision: current.runtimeStateRevision + 1,
+          members: current.members.map((member) => ({
+            ...member,
+            state: input.memberStates?.find((update) => update.profileId === member.profileId)?.state ?? member.state,
+          })),
+        });
+        return current;
+      }),
+      updateConnectedServiceAuthGroupActiveProfile: vi.fn(async ({ activeProfileId }: { activeProfileId: string }) => {
+        current = ConnectedServiceAuthGroupV1Schema.parse({ ...current, activeProfileId, generation: current.generation + 1 });
+        return current;
+      }),
+    };
+    const restartSession = vi.fn(async () => {});
+    const coordinator = createTestDaemonConnectedServiceAuthGroupSwitchCoordinator({
+      api,
+      runtimeQuotaSnapshots: new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore(),
+      quotaFreshnessMs: 60_000,
+      nowMs: () => 1_000,
+      restartSession,
+    });
+    const recover = (profileId: string, modelId: string) => {
+      const classification = classifyCodexConnectedServiceAuthFailure({
+        providerErrorPath: true,
+        error: { error: { type: 'invalid_request_error', message: `The '${modelId}' model is not supported when using Codex with a ChatGPT account.` } },
+        serviceId: 'openai-codex', profileId, groupId: 'main',
+      });
+      expect(classification).toMatchObject({ kind: 'plan', quotaScope: 'model', providerLimitId: modelId });
+      return handleConnectedServiceRuntimeAuthFailure({
+        classification,
+        selection: { kind: 'group', serviceId: 'openai-codex', groupId: 'main', activeProfileId: profileId },
+        switchesThisTurn: 0,
+        switchCoordinator: coordinator,
+      });
+    };
+
+    await expect(recover('primary', 'model-M')).resolves.toMatchObject({
+      status: 'switch_attempted', result: { status: expected },
+    });
+    if (control === 'allowed') {
+      expect(current.activeProfileId).toBe('backup');
+      await expect(recover('backup', 'model-M')).resolves.toMatchObject({
+        status: 'switch_attempted', result: { status: 'no_eligible_member' },
+      });
+      expect(current.members.every((member) => member.state.modelUnavailableUntilMsByModelId?.['model-M'] === 86_401_000)).toBe(true);
+      expect(api.updateConnectedServiceAuthGroupActiveProfile).toHaveBeenCalledTimes(1);
+      // Model-specific exclusions must not block an otherwise eligible model.
+      await expect(recover('backup', 'model-N')).resolves.toMatchObject({
+        status: 'switch_attempted', result: { status: 'switched', activeProfileId: 'primary' },
+      });
+      expect(restartSession).toHaveBeenCalledTimes(2);
+    } else {
+      expect(api.updateConnectedServiceAuthGroupActiveProfile).not.toHaveBeenCalled();
+      expect(restartSession).not.toHaveBeenCalled();
+    }
+  });
+
   it('loads group state, commits the selected member, and requests a session restart for rematerialization', async () => {
     const backupRevision = 'csr_abcdefghijklmnopqrstuv';
     const api = {

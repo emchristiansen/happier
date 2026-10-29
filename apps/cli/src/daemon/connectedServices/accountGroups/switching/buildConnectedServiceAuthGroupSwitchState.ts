@@ -1,4 +1,4 @@
-import type { ConnectedServiceAuthGroupV1, ConnectedServiceCredentialHealthStatusV1 } from '@happier-dev/protocol';
+import { ConnectedServiceAuthGroupMemberStateV1Schema, type ConnectedServiceAuthGroupV1, type ConnectedServiceCredentialHealthStatusV1 } from '@happier-dev/protocol';
 
 import { ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore } from '../quotas/ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore';
 import {
@@ -46,6 +46,12 @@ export function mergePersistedMemberRuntimeState(
 ): ConnectedServiceAuthGroupMemberRuntimeState {
   const record = readRecord(persistedState);
   if (!record) return runtimeState ?? {};
+  const modelState = ConnectedServiceAuthGroupMemberStateV1Schema.safeParse({
+    modelUnavailableUntilMsByModelId: record.modelUnavailableUntilMsByModelId,
+  });
+  const modelUnavailableUntilMsByModelId = modelState.success
+    ? modelState.data.modelUnavailableUntilMsByModelId
+    : undefined;
   const persistedLastFailureKind = readString(record.lastFailureKind);
   const persistedProviderResetsAtMs = readNonNegativeNumber(record.providerResetsAtMs);
   const runtimeProviderResetsAtMs = readNonNegativeNumber(runtimeState?.providerResetsAtMs);
@@ -67,6 +73,7 @@ export function mergePersistedMemberRuntimeState(
       : runtimeProviderResetsAtMs;
   return {
     ...(runtimeState ?? {}),
+    ...(modelUnavailableUntilMsByModelId === undefined ? {} : { modelUnavailableUntilMsByModelId }),
     ...(readCredentialHealthStatus(record.credentialHealthStatus) ? { credentialHealthStatus: readCredentialHealthStatus(record.credentialHealthStatus) } : {}),
     cooldownUntilMs: readNonNegativeNumber(record.cooldownUntilMs),
     exhaustedUntilMs: readNonNegativeNumber(record.exhaustedUntilMs),

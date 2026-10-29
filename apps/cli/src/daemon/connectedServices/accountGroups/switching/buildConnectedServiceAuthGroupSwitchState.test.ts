@@ -37,6 +37,26 @@ function groupWithPersistedState(state: ConnectedServiceAuthGroupV1['members'][n
 }
 
 describe('buildConnectedServiceAuthGroupSwitchState', () => {
+  it('retains canonical model-specific cooldowns when rebuilding persisted state', () => {
+    const switchState = buildConnectedServiceAuthGroupSwitchState({
+      group: groupWithPersistedState({ modelUnavailableUntilMsByModelId: { 'model-M': 86_401_000 } }),
+      runtimeQuotaSnapshots: new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore(),
+      nowMs: 1_000,
+    });
+    expect(switchState.memberStatesByProfileId.get('primary')?.modelUnavailableUntilMsByModelId)
+      .toEqual({ 'model-M': 86_401_000 });
+  });
+
+  it.each([undefined, { 'model-M': -1 }, { 'model-M': '86401000' }])(
+    'does not replace runtime model cooldowns with invalid or absent persisted evidence: %j',
+    (persisted) => {
+      expect(mergePersistedMemberRuntimeState({
+        modelUnavailableUntilMsByModelId: { 'model-N': 2_000 },
+      }, { modelUnavailableUntilMsByModelId: persisted }).modelUnavailableUntilMsByModelId)
+        .toEqual({ 'model-N': 2_000 });
+    },
+  );
+
   it('preserves the failure-associated reset boundary when a healthy snapshot reports the next window', () => {
     expect(mergePersistedMemberRuntimeState({
       providerResetsAtMs: 20_000,
