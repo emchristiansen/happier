@@ -15,7 +15,8 @@ export async function waitForOpenCodeServerHealth(params: {
   while (Date.now() < deadline) {
     if (params.signal?.aborted) throw new Error('Aborted while waiting for OpenCode server health');
     try {
-      const request = async (path: string): Promise<Response | null> => {
+      const request = async (path: string): Promise<boolean> => {
+        if (params.signal?.aborted || Date.now() >= deadline) return false;
         const ctrl = new AbortController();
         const onAbort = () => ctrl.abort();
         params.signal?.addEventListener('abort', onAbort, { once: true });
@@ -28,26 +29,26 @@ export async function waitForOpenCodeServerHealth(params: {
         timer.unref?.();
         try {
           const headers = path.startsWith('/api/') ? params.v2Headers ?? params.headers : params.headers;
-          return await fetch(`${params.baseUrl}${path}`, {
+          const response = await fetch(`${params.baseUrl}${path}`, {
             signal: ctrl.signal,
             ...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
-          }).catch(() => null);
+          });
+          if (!response.ok) return false;
+          const body: unknown = await response.json();
+          return isOpenCodeServerReadyResponse(path, body);
+        } catch {
+          return false;
         } finally {
           clearTimeout(timer);
           params.signal?.removeEventListener('abort', onAbort);
         }
-      };
-      const isHealthy = async (path: string, response: Response | null): Promise<boolean> => {
-        if (!response?.ok) return false;
-        const body = await response.json().catch(() => null) as unknown;
-        return isOpenCodeServerReadyResponse(path, body);
       };
       const paths = params.apiGeneration === 'v2'
           ? OPEN_CODE_V2_READINESS_PATHS
           : OPEN_CODE_AUTO_READINESS_PATHS;
       let healthy = false;
       for (const path of paths) {
-        if (await isHealthy(path, await request(path))) {
+        if (await request(path)) {
           healthy = true;
           params.onReady?.(path.startsWith('/api/') ? 'v2' : 'auto');
           break;
@@ -57,7 +58,8 @@ export async function waitForOpenCodeServerHealth(params: {
     } catch {
       // ignore and retry until deadline
     }
-    await new Promise((r) => setTimeout(r, params.pollIntervalMs));
+    if (params.signal?.aborted) throw new Error('Aborted while waiting for OpenCode server health');
+    await new Promise((r) => setTimeout(r, Math.min(params.pollIntervalMs, Math.max(0, deadline - Date.now()))));
   }
   throw new Error(`Timed out waiting for OpenCode server health after ${params.timeoutMs}ms`);
 }
