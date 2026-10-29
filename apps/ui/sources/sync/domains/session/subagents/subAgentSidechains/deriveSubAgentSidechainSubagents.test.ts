@@ -237,14 +237,9 @@ describe('deriveSubAgentSidechainSubagents — an async launch acknowledgement i
     });
 
     it('reports a subagent with lost observation as unknown', () => {
-        // RULING-14 (terminal state on process death) already answers this for a workflow agent —
-        // `terminalizeRunAgents` resolves it to `cancelled`, never `failed`: an agent that produced
-        // no result while its host went away was cut off, it did not fail. A plain subagent is the
-        // same agent seen without a run around it, so it must read the same. Answering `unknown`
-        // here made the roster say two different things about one event depending only on whether a
-        // second agent happened to exist (below two, no headline is published and this local answer
-        // is the only one), and `unknown` is reserved for a genuinely ambiguous source rather than
-        // used as the fallback for a mapped one.
+        // Lost observation establishes neither cancellation nor success. An unavailable tool
+        // therefore leaves the agent unknown without claiming a finish instant; explicit terminal
+        // evidence is required to resolve its outcome.
         const message = createAsyncLaunchedSubAgentMessage(JSON.stringify(ASYNC_LAUNCH_ACKNOWLEDGEMENT));
         message.tool.state = 'unavailable';
         message.tool.completedAt = 4_000;

@@ -401,22 +401,26 @@ export async function getOrCreateSessionByTag(params: Readonly<{
     serverBaseUrl: serverUrl,
   });
 
-  const { encryptionKey, encryptionVariant, dataEncryptionKey } = resolveSessionEncryptionContext(params.credentials);
+  const encryptionContext = desiredSessionEncryptionMode === 'e2ee' ? resolveSessionEncryptionContext(params.credentials) : null;
+  const encryptSessionPayload = (value: unknown): string => {
+    if (!encryptionContext) throw new Error('Session encryption material is unavailable');
+    return encodeBase64(encrypt(encryptionContext.encryptionKey, encryptionContext.encryptionVariant, value));
+  };
 
   const metadataPayload =
     desiredSessionEncryptionMode === 'plain'
       ? JSON.stringify(projectSessionMetadataForWire(params.metadata))
-      : encodeBase64(encrypt(encryptionKey, encryptionVariant, projectSessionMetadataForWire(params.metadata)));
+      : encryptSessionPayload(projectSessionMetadataForWire(params.metadata));
   const agentStatePayload =
     desiredSessionEncryptionMode === 'plain'
       ? (params.agentState ? JSON.stringify(params.agentState) : null)
-      : (params.agentState ? encodeBase64(encrypt(encryptionKey, encryptionVariant, params.agentState)) : null);
+      : (params.agentState ? encryptSessionPayload(params.agentState) : null);
 
   const dataEncryptionKeyPayload =
     desiredSessionEncryptionMode === 'plain'
       ? null
-      : dataEncryptionKey
-        ? encodeBase64(dataEncryptionKey)
+      : encryptionContext?.dataEncryptionKey
+        ? encodeBase64(encryptionContext.dataEncryptionKey)
         : null;
 
   const response = await axios.post(withConnectedServiceReaderSupport(`${serverUrl}/v1/sessions`), {
