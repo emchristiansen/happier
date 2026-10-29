@@ -326,6 +326,7 @@ describe('claudeRemote', () => {
 
   it('forwards the resolved Claude config dir override into the remote launcher env', async () => {
     mockQuery.mockReturnValue(messageStream(resultMessage()));
+    vi.stubEnv('CLAUDE_CONFIG_DIR', '');
     vi.stubEnv('HAPPIER_CLAUDE_CONFIG_DIR', '/tmp/happier-claude-config');
     vi.unstubAllGlobals();
 

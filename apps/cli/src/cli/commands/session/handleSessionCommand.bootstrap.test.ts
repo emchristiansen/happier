@@ -46,11 +46,12 @@ describe('handleSessionCommand account settings bootstrap', () => {
     });
     let settingsReads = 0;
     const get = httpGet.mockImplementation(async (url: string) => {
-      if (String(url).endsWith('/v2/account/settings')) {
+      const pathname = new URL(String(url)).pathname;
+      if (pathname === '/v2/account/settings') {
         settingsReads += 1;
         return { status: 200, data: { content: { t: 'plain', v: { schemaVersion: 6 } }, version: 4 } };
       }
-      if (String(url).endsWith('/v2/sessions')) {
+      if (pathname === '/v2/sessions') {
         return { status: 200, data: { sessions: [], nextCursor: null, hasNext: false } };
       }
       throw new Error(`Unexpected test HTTP request: ${String(url)}`);
@@ -74,7 +75,7 @@ describe('handleSessionCommand account settings bootstrap', () => {
     const result = await runList(Date.now() - 300_001);
     expect(result.settingsReads).toBe(1);
     expect(result.active).toMatchObject({ settingsVersion: 4, source: 'network' });
-    expect(result.get.mock.calls.map(([url]) => String(url).split('/').slice(-2).join('/')))
+    expect(result.get.mock.calls.map(([url]) => new URL(String(url)).pathname.split('/').slice(-2).join('/')))
       .toEqual(['account/settings', 'v2/sessions']);
   });
 
