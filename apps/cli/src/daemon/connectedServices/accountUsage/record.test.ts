@@ -118,6 +118,49 @@ function createConnectedServiceGroupSnapshot(
 }
 
 describe('recordProviderAccountUsageSnapshotForSession', () => {
+  it('does not publish a new record suppressed as future, then confirms real current storage', async () => {
+    const { recordProviderAccountUsageSnapshotForSession } = await import('./record');
+    const { createProviderAccountUsageStore } = await import('./store');
+    const { createProviderAccountUsagePersistenceScheduler } = await import('./persistence');
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(10_000);
+    const store = createProviderAccountUsageStore();
+    const serverRecords = new Set<string>();
+    const write = vi.fn(async ({ recordId }: { recordId: string }) => { serverRecords.add(recordId); });
+    const persistence = createProviderAccountUsagePersistenceScheduler({
+      api: { getAccountEncryptionMode: async () => 'plain', registerProviderAccountUsageSnapshotPlain: write },
+      now: () => 10_000,
+      fingerprintKey: new Uint8Array(32).fill(9),
+    });
+    const publishRecordId = vi.fn(async ({ recordId }: { recordId: string }) => {
+      expect(serverRecords.has(recordId)).toBe(true);
+    });
+    const record = (snapshot: ProviderAccountUsageSnapshotV1) => recordProviderAccountUsageSnapshotForSession({
+      getChildren: () => [{ happySessionId: 'sess_1' }],
+      store, persistence, publishRecordId, sessionId: 'sess_1', snapshot,
+    });
+    try {
+      const future = { ...createSnapshot(), observedAtMs: 100_000, fetchedAtMs: 100_000 };
+      await expect(record(future)).resolves.toMatchObject({ status: 'snapshot_advanced', persisted: false });
+      await persistence.flush(1_000);
+      expect(write).not.toHaveBeenCalled();
+      expect(publishRecordId).not.toHaveBeenCalled();
+
+      const current = { ...createSnapshot(), observedAtMs: 10_000, fetchedAtMs: 10_000 };
+      await expect(record(current)).resolves.toMatchObject({ status: 'snapshot_advanced', persisted: false });
+      await persistence.flush(1_000);
+      await vi.waitFor(() => expect(publishRecordId).toHaveBeenCalledOnce());
+      expect(write).toHaveBeenCalledOnce();
+
+      // Only a successful prior write justifies an immediate durable reference.
+      await expect(record(current)).resolves.toMatchObject({ status: 'duplicate', persisted: true });
+      expect(write).toHaveBeenCalledOnce();
+      expect(publishRecordId).toHaveBeenCalledTimes(2);
+    } finally {
+      persistence.dispose();
+      clock.mockRestore();
+    }
+  });
+
   it('records latest state, forwards explicit source context, queues persistence, and waits for confirmed persistence before metadata refs', async () => {
     const module = await loadRecordModule();
     expect(module).not.toBeNull();

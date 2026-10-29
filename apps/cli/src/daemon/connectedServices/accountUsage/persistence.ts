@@ -69,7 +69,7 @@ export type ProviderAccountUsageInBandSnapshotOptions = Readonly<{
   sources?: readonly ConnectedServiceUsageSourceV1[];
   /**
    * Called once a write for this record lands on the server, including on a retry. Not called
-   * when nothing was queued (`already_persisted`) or when the queued write is dropped unrun.
+   * when nothing was queued (`already_persisted` or `suppressed`) or when the queued write is dropped unrun.
    */
   onPersisted?: () => void;
 }>;
@@ -80,7 +80,8 @@ export type ProviderAccountUsagePersistenceScheduler = Readonly<{
     options?: ProviderAccountUsageInBandSnapshotOptions,
   ): Promise<
     | Readonly<{ status: 'enqueued'; enqueue: 'accepted' | 'coalesced' }>
-    | Readonly<{ status: 'already_persisted'; reason: string }>
+    | Readonly<{ status: 'already_persisted'; reason: 'stale' | 'unchanged' }>
+    | Readonly<{ status: 'suppressed'; reason: 'future' }>
   >;
   flush(timeoutMs: number): Promise<unknown>;
   dispose(): void;
@@ -143,7 +144,10 @@ function shouldPersistProviderAccountUsageSnapshot(input: Readonly<{
   next: ProviderAccountUsagePersistenceMaterialState;
   minFreshnessMs: number;
   nowMs: number;
-}>): Readonly<{ persist: boolean; reason: string }> {
+}>): Readonly<
+  | { persist: true; reason: 'first_snapshot' | 'clock_recovered' | 'status' | 'fingerprint' | 'freshness' }
+  | { persist: false; reason: 'future' | 'stale' | 'unchanged' }
+> {
   if (!isConnectedServiceQuotaObservationAtOrBeforeNow({
     observedAtMs: input.next.fetchedAt,
     nowMs: input.nowMs,
@@ -291,7 +295,7 @@ export function createProviderAccountUsagePersistenceScheduler(params: Readonly<
       };
       let accepted = false;
       let coalesced = false;
-      let lastSuppressionReason = 'unchanged';
+      let lastSuppressionReason: 'future' | 'stale' | 'unchanged' | null = null;
       const onPersisted = options?.onPersisted;
       let confirmed = false;
       // One observation may queue a write per source; it is confirmed by the first that lands.
@@ -335,6 +339,12 @@ export function createProviderAccountUsagePersistenceScheduler(params: Readonly<
       }
       if (accepted || coalesced) {
         return { status: 'enqueued', enqueue: accepted ? 'accepted' : 'coalesced' };
+      }
+      if (lastSuppressionReason === 'future') {
+        return { status: 'suppressed', reason: lastSuppressionReason };
+      }
+      if (lastSuppressionReason === null) {
+        throw new Error('provider_account_usage_persistence_missing_decision');
       }
       return { status: 'already_persisted', reason: lastSuppressionReason };
     },

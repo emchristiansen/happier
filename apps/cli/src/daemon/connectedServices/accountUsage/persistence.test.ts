@@ -59,6 +59,7 @@ type PersistenceModule = Readonly<{
     ): Promise<
       | Readonly<{ status: 'enqueued'; enqueue: 'accepted' | 'coalesced' }>
       | Readonly<{ status: 'already_persisted'; reason: string }>
+      | Readonly<{ status: 'suppressed'; reason: 'future' }>
     >;
     flush(timeoutMs: number): Promise<unknown>;
     dispose(): void;
@@ -308,7 +309,7 @@ describe('provider account usage persistence', () => {
     const current = { ...createSnapshot(), fetchedAtMs: 10_000, observedAtMs: 10_000 };
     try {
       await expect(scheduler.recordInBandSnapshot(future)).resolves.toEqual({
-        status: 'already_persisted',
+        status: 'suppressed',
         reason: 'future',
       });
       await expect(scheduler.recordInBandSnapshot(current)).resolves.toEqual({
