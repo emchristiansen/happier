@@ -402,6 +402,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
     groupId: string;
     loaded: ConnectedServiceAuthGroupSwitchState;
     reason?: string;
+    providerLimitId?: string | null;
     observedProfileId?: string | null;
     trigger: ConnectedServiceAuthGroupSwitchPipelineTrigger;
     lease: Extract<LeaseAcquireResult, { kind: 'owner' }>;
@@ -432,6 +433,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
       policy: observed.policy,
       members: observed.members,
       memberStatesByProfileId: observed.memberStatesByProfileId,
+      providerLimitId: input.providerLimitId,
     });
     if (!isProfileEligibleForObservedGeneration({
       profileId: observedActiveProfileId,
@@ -624,6 +626,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
           groupId: input.groupId,
           loaded,
           reason: input.reason,
+          providerLimitId: input.providerLimitId,
           observedProfileId: input.observedProfileId,
           trigger: 'classified_failure',
           lease: input.lease,
@@ -961,14 +964,18 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
     }
     const lease = this.deps.leases.acquire(input);
     if (lease.kind === 'loser') {
+      const recheckModelEligibility = trigger === 'classified_failure'
+        && input.quotaScope === 'model'
+        && Boolean(input.providerLimitId?.trim());
       let observed: LeaseCompletion;
       try {
-        observed = await lease.waitForOwner();
+        observed = await lease.waitForOwner({ requireOwnerFinished: recheckModelEligibility });
       } catch (error) {
         const failedProfileId = normalizeProfileId(input.observedProfileId);
         if (
           !(error instanceof ConnectedServiceAuthGroupSwitchLeaseExpiredError)
           || !failedProfileId
+          || recheckModelEligibility
         ) {
           throw error;
         }
@@ -998,6 +1005,10 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
             credentialRevision: current.credentialRevision ?? null,
           },
         });
+      }
+      if (recheckModelEligibility) {
+        // A peer's model may differ; re-enter only after its lease is released.
+        return await this.runSwitchPipeline(input, trigger);
       }
       if (!shouldApplyLeaseCompletion(observed)) {
         // A committed generation is shared group truth; a rejected decision is
@@ -1092,6 +1103,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
             members: loaded.members,
             memberStatesByProfileId: loaded.memberStatesByProfileId,
             allowCurrentProfileRetry: input.allowCurrentProfileRetry === true,
+            providerLimitId: input.providerLimitId,
           });
           if (
             currentLoadedActiveProfileId
@@ -1192,6 +1204,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
             members: loaded.members,
             memberStatesByProfileId: loaded.memberStatesByProfileId,
             allowCurrentProfileRetry,
+            providerLimitId: input.providerLimitId,
           });
           if (isProfileEligibleForObservedGeneration({
             profileId: loadedActiveProfileId,
@@ -1528,6 +1541,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
             groupId: input.groupId,
             loaded: commitLoaded,
             reason: input.reason,
+            providerLimitId: input.providerLimitId,
             ...(trigger === 'classified_failure' ? { observedProfileId: input.observedProfileId } : {}),
             trigger,
             lease,
@@ -1554,6 +1568,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
               state: commitLoaded,
               activeProfileId: commitSelectionActiveProfileId,
               reason: input.reason,
+              providerLimitId: input.providerLimitId,
             });
             if (!retrySelected.selected) {
               const result: ConnectedServiceAuthGroupSwitchResult = retrySelected.reason === 'manual_strategy'
