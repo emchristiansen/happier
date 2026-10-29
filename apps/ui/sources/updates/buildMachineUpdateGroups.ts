@@ -9,7 +9,7 @@ import { t } from '@/text';
 import { buildAgentCliUpdateItem, buildInstallableUpdateItem, buildProbeFailedItem } from './items/buildMachineUpdateItems';
 import type { UpdateItem } from './items/updateItem';
 import { readCapabilityResultData } from './machineCapabilitySnapshots';
-import { observeMachineUpdateRun, type useMachineUpdateRuns } from './machineUpdateRuns';
+import { observeMachineUpdateRun, signatureOfAgentUpdateFacts, type useMachineUpdateRuns } from './machineUpdateRuns';
 import { buildRemoteMachineUpdateFacts, type RemoteMachineUpdateFacts } from './remoteCliUpdateItems';
 
 export type UpdatesGroup = Readonly<{
@@ -50,13 +50,16 @@ function buildMachineRows(params: Readonly<{
             }));
             continue;
         }
+        const data = readCapabilityResultData(params.snapshot, capabilityId);
         const row = buildAgentCliUpdateItem({
             machineId: params.machineId,
             agentId,
             title: t(getAgentCore(agentId as AgentId).displayNameKey),
             online: params.online,
-            data: readCapabilityResultData(params.snapshot, buildAgentCliCapabilityId(agentId)),
-            task: observeMachineUpdateRun(params.runs, `${params.machineId}:agent:${agentId}`),
+            data,
+            task: observeMachineUpdateRun(params.runs, `${params.machineId}:agent:${agentId}`, {
+                agentFactsSignature: signatureOfAgentUpdateFacts(params.snapshot, capabilityId),
+            }),
         });
         if (row) rows.push(row);
     }

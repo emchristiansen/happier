@@ -24,6 +24,10 @@ vi.mock('@/sync/ops', () => ({
 import type { UpdateItem } from './items/updateItem';
 import * as runs from './machineUpdateRuns';
 import { buildRemoteCliUpdateItem } from './items/buildMachineUpdateItems';
+import { buildMachineUpdateGroups } from './buildMachineUpdateGroups';
+import { buildUpdatesSummary, planUpdateAll } from './items/buildUpdatesSummary';
+import type { Machine } from '@/sync/domains/state/storageTypes';
+import { getMachineCapabilitiesSnapshot, prefetchMachineCapabilities } from '@/hooks/server/useMachineCapabilitiesCache';
 
 const remoteCli: UpdateItem = {
     id: 'studio:happier-cli',
@@ -280,6 +284,60 @@ describe('runMachineItemUpdate — a remote CLI update is started, then observed
             alreadyCurrent: true,
         });
         expect(runs.readUnseenUpdateCompletions(accountA).size).toBe(0);
+    });
+
+    it('an already-current run yields to a later newer release through the shared update groups', async () => {
+        const machineId = 'already-current-release';
+        const claude: UpdateItem = { ...remoteCli, id: `${machineId}:agent:claude`, machineId, subject: { kind: 'agent-cli', agentId: 'claude' }, title: 'Claude' };
+        const check = async (version: string, latestVersion: string, checkedAt: number) => {
+            rpc.detect.mockImplementation(async () => ({ supported: true, response: { protocolVersion: 1, results: {
+                'cli.claude': { ok: true, checkedAt, data: { available: true, version, latestVersion, updateSupported: true } },
+            } } }));
+            await prefetchMachineCapabilities({ machineId, serverId: accountA.serverId, request: {
+                bypassCache: true, requests: [{ id: 'cli.claude', params: { includeLatestVersion: true } }],
+            } });
+        };
+        await check('2.1.281', '2.1.283', 1);
+        rpc.detect.mockImplementation(async () => ({ supported: true, response: { protocolVersion: 1, results: {} } }));
+        rpc.invoke.mockImplementation(async () => ({
+            supported: true,
+            response: { ok: true, result: { alreadyCurrent: true, version: '2.1.283', latestVersion: '2.1.283' } },
+        }));
+        await runs.runMachineItemUpdate(claude, { scope: accountA });
+        await advance(0);
+        const build = () => buildMachineUpdateGroups({
+            machines: [{ id: machineId, active: true, activeAt: Date.now(), metadata: { host: machineId } } as Machine],
+            thisMachineId: machineId, thisComputerItem: null,
+            runs: runs.readMachineUpdateRuns(accountA.serverId),
+            snapshots: new Map([[machineId, getMachineCapabilitiesSnapshot(machineId, accountA.serverId)]]),
+            installables: [],
+        }).groups.flatMap((group) => group.items);
+        const stale = build();
+        expect(stale.find((item) => item.id === claude.id)).toMatchObject({ currentVersion: '2.1.283', state: 'upToDate', action: { kind: 'none' } });
+        expect(buildUpdatesSummary(stale).actionableCount).toBe(0);
+        expect(planUpdateAll(stale).total).toBe(0);
+        // An ordinary installed-version detect carries the cached latest check; it is not Check now.
+        rpc.detect.mockImplementation(async () => ({ supported: true, response: { protocolVersion: 1, results: {
+            'cli.claude': { ok: true, checkedAt: 1.5, data: { available: true, version: '2.1.281', updateSupported: true } },
+        } } }));
+        await prefetchMachineCapabilities({ machineId, serverId: accountA.serverId, request: {
+            bypassCache: true, requests: [{ id: 'cli.claude' }],
+        } });
+        expect(build().find((item) => item.id === claude.id)).toMatchObject({ currentVersion: '2.1.283', state: 'upToDate' });
+        await check('2.1.283', '2.1.284', 2);
+        const refreshed = build();
+        expect(refreshed.find((item) => item.id === claude.id)).toMatchObject({
+            currentVersion: '2.1.283', state: 'available', action: { kind: 'run', verb: 'update' },
+        });
+        expect(buildUpdatesSummary(refreshed).actionableCount).toBe(1);
+        expect(planUpdateAll(refreshed).total).toBe(1);
+        // A later check can also discover an externally changed installation; no permanent version floor.
+        await check('2.1.280', '2.1.282', 3);
+        expect(build().find((item) => item.id === claude.id)).toMatchObject({
+            currentVersion: '2.1.280', state: 'available', action: { kind: 'run', verb: 'update' },
+        });
+        expect(rpc.invoke).toHaveBeenCalledTimes(1);
+        rpc.detect.mockImplementation(async () => ({ supported: true, response: { protocolVersion: 1, results: {} } }));
     });
 
     it('reopening adopts the pending batch and Stop prevents the remaining update through the real executor', async () => {

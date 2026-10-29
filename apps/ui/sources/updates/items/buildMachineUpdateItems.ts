@@ -27,6 +27,8 @@ export type UpdateRunObservation = Readonly<{
     logPath?: string | null;
     /** The last run found the tool already current (nothing to install). */
     alreadyCurrent?: boolean;
+    /** Installed version confirmed by that result, while its overridden cache facts are retained. */
+    alreadyCurrentVersion?: string | null;
 }>;
 
 /** The command that updates a Happier CLI whose daemon predates K5 facts (0.2 `self update` is POSIX-only). */
@@ -233,7 +235,7 @@ export function buildAgentCliUpdateItem(params: Readonly<{
         machineId: params.machineId,
         subject: { kind: 'agent-cli', agentId: params.agentId },
         title: params.title,
-        currentVersion: readString(data.version),
+        currentVersion: params.task.alreadyCurrent ? params.task.alreadyCurrentVersion ?? readString(data.version) : readString(data.version),
         latestVersion: readString(data.latestVersion),
     });
     // K6 old-daemon rule: Update only when the daemon says `updateSupported: true` — an older one

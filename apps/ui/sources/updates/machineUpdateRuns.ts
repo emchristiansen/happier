@@ -2,7 +2,7 @@ import * as React from 'react';
 
 import { getInstallablesRegistryEntries } from '@/capabilities/installablesRegistry';
 import { buildMachineUpdateFactsRequest } from '@/capabilities/requests';
-import { prefetchMachineCapabilities } from '@/hooks/server/useMachineCapabilitiesCache';
+import { getMachineCapabilitiesSnapshot, prefetchMachineCapabilities, type MachineCapabilitiesSnapshot } from '@/hooks/server/useMachineCapabilitiesCache';
 import { buildAgentCliCapabilityId } from '@/capabilities/agentCliCapabilityId';
 import { machineCapabilitiesInvoke } from '@/sync/ops';
 import { MACHINE_RPC_POLL_INTERVAL_MS } from '@/sync/ops/machineRpcPollInterval';
@@ -14,6 +14,7 @@ import type { UpdateItem, UpdateItemStep } from './items/updateItem';
 import type { UpdateRunObservation } from './items/buildMachineUpdateItems';
 import { recordUpdateCompleted } from './updateCompletions';
 import { planUpdateAll } from './items/buildUpdatesSummary';
+import { readCapabilityResultData } from './machineCapabilitySnapshots';
 
 export type UpdateAllProgress = Readonly<{ done: number; total: number; stopping: boolean }>;
 
@@ -130,7 +131,7 @@ type RunRecord =
     | Readonly<{ status: 'accepted'; baseline: string }>
     | Readonly<{ status: 'finished' }>
     /** The runtime found the tool already current: nothing ran, and it is not an "Updated". */
-    | Readonly<{ status: 'alreadyCurrent' }>;
+    | Readonly<{ status: 'alreadyCurrent'; version: string | null; agentFactsSignature: string | null }>;
 
 type RunRecords = ReadonlyMap<string, RunRecord>;
 
@@ -181,16 +182,31 @@ const IDLE: UpdateRunObservation = { running: false, step: null, errorMessage: n
 export function observeMachineUpdateRun(
     runs: RunRecords,
     itemId: string,
-    options: Readonly<{ step?: UpdateItemStep; lastUpdateSignature?: string }> = {},
+    options: Readonly<{ step?: UpdateItemStep; lastUpdateSignature?: string; agentFactsSignature?: string }> = {},
 ): UpdateRunObservation {
     const record = runs.get(itemId);
     if (!record || record.status === 'finished') return IDLE;
     if (record.status === 'running') return { running: true, step: options.step ?? 'installing', errorMessage: null };
     if (record.status === 'failed') return { running: false, step: null, errorMessage: record.message, logPath: record.logPath ?? null };
-    if (record.status === 'alreadyCurrent') return { running: false, step: null, errorMessage: null, alreadyCurrent: true };
+    if (record.status === 'alreadyCurrent') {
+        // The updater's answer overrides only the facts it just superseded, not a later check.
+        if (record.agentFactsSignature !== null && options.agentFactsSignature !== undefined
+            && options.agentFactsSignature !== record.agentFactsSignature) return IDLE;
+        return { running: false, step: null, errorMessage: null, alreadyCurrent: true, alreadyCurrentVersion: record.version };
+    }
     return record.baseline === (options.lastUpdateSignature ?? '')
         ? { running: true, step: 'reconnecting', errorMessage: null }
         : IDLE;
+}
+
+/** The cache preserves latestVersionCheckedAt across detects that did not ask for latest. */
+export function signatureOfAgentUpdateFacts(snapshot: MachineCapabilitiesSnapshot | null, capabilityId: string): string {
+    const data = readCapabilityResultData(snapshot, capabilityId);
+    const probe = snapshot?.response.results[capabilityId as keyof typeof snapshot.response.results];
+    // The first cache snapshot is not merged: its latest check uses the probe's own timestamp.
+    const latestCheckedAt = data?.latestVersionCheckedAt
+        ?? (data && Object.prototype.hasOwnProperty.call(data, 'latestVersion') ? probe?.checkedAt ?? null : null);
+    return JSON.stringify([data?.version ?? null, data?.latestVersion ?? null, latestCheckedAt]);
 }
 
 export function signatureOfLastUpdate(lastUpdate: unknown): string {
@@ -370,9 +386,17 @@ export async function runMachineItemUpdate(
             });
             return;
         }
-        const outcome = result.response.result as { alreadyCurrent?: unknown } | null | undefined;
+        const outcome = result.response.result as { alreadyCurrent?: unknown; version?: unknown } | null | undefined;
         if (outcome?.alreadyCurrent === true) {
-            setRecord(serverId, item.id, { status: 'alreadyCurrent' });
+            setRecord(serverId, item.id, {
+                status: 'alreadyCurrent',
+                version: typeof outcome.version === 'string' && outcome.version.trim() ? outcome.version.trim() : null,
+                agentFactsSignature: subject.kind === 'agent-cli'
+                    ? signatureOfAgentUpdateFacts(
+                        getMachineCapabilitiesSnapshot(machineId, serverId), buildAgentCliCapabilityId(subject.agentId as AgentId),
+                    )
+                    : null,
+            });
             return;
         }
         setRecord(serverId, item.id, { status: 'finished' });
