@@ -1430,7 +1430,7 @@ describe('runCodex CodexACP resume behavior', () => {
     expect(outcome).toMatchObject({ ok: false });
   });
 
-  it.each(['fresh', 'resumed'] as const)('sends configured instructions only when owed after shared local attachment (%s)', async (lifecycle) => {
+  it.each(['fresh', 'resumed', 'accepted-failed', 'before-acceptance-failed'] as const)('sends configured instructions only when owed after shared local attachment (%s)', async (lifecycle) => {
     if (lifecycle === 'resumed') mockAttachedSessionMetadata({ codexSessionId: 'shared-fresh', codexBackendMode: 'appServer' });
     resolveCodexSharedControlSupportSpy.mockResolvedValueOnce({ ok: true, version: '0.153.4' });
     resolveRunnerMcpServersSpy.mockResolvedValueOnce({
@@ -1461,8 +1461,15 @@ describe('runCodex CodexACP resume behavior', () => {
       if (method === 'turn/start') {
         nativePrompts.push(params);
         const id = `turn-${++turnCount}`;
+        if (turnCount === 1 && lifecycle === 'before-acceptance-failed') {
+          throw new Error('synthetic refusal before turn acceptance');
+        }
+        const failed = turnCount === 1 && lifecycle === 'accepted-failed';
         setImmediate(() => { void notifications.get('turn/completed')?.({
-          threadId: 'shared-fresh', turn: { id, status: 'completed' },
+          threadId: 'shared-fresh', turn: {
+            id, status: failed ? 'failed' : 'completed',
+            ...(failed ? { error: { message: 'synthetic failure after turn acceptance' } } : {}),
+          },
         }); });
         return { turn: { id } };
       }
@@ -1512,10 +1519,12 @@ describe('runCodex CodexACP resume behavior', () => {
         ...(lifecycle === 'resumed' ? { existingSessionId: 'existing-123', resume: 'shared-fresh' } : {}),
       });
       expect(nativePrompts).toHaveLength(2);
-      expect(nativePrompts[0]).toMatchObject({ input: [{ type: 'text', text: lifecycle === 'fresh'
+      expect(nativePrompts[0]).toMatchObject({ input: [{ type: 'text', text: lifecycle !== 'resumed'
         ? expect.stringContaining('configured shared-session instructions') : 'ordinary message 1' }] });
       expect(nativePrompts[0]).toMatchObject({ input: [{ type: 'text', text: expect.stringContaining('ordinary message 1') }] });
-      expect(nativePrompts[1]).toMatchObject({ input: [{ type: 'text', text: 'ordinary message 2' }] });
+      expect(nativePrompts[1]).toMatchObject({ input: [{ type: 'text', text: lifecycle === 'before-acceptance-failed'
+        ? expect.stringContaining('configured shared-session instructions') : 'ordinary message 2' }] });
+      expect(nativePrompts[1]).toMatchObject({ input: [{ type: 'text', text: expect.stringContaining('ordinary message 2') }] });
     } finally {
       vi.mocked(modeController.createLocalRemoteModeController).mockImplementation(previousModeController);
       vi.mocked(promptModule.resolveEffectiveCodingPromptText).mockImplementation(previousPromptResolver);

@@ -3088,7 +3088,11 @@ export async function runCodex(opts: {
                     if (useCodexAppServer && localIds.length > 0) {
                         armedAppServerReplaySeedRetirement = {
                             localIds,
-                            retire: retireReplaySeedOnConfirmedDelivery,
+                            retire: () => {
+                                // Initial instructions are delivered on acceptance, even if the turn later fails.
+                                sharedThreadNeedsSystemPrompt = false;
+                                retireReplaySeedOnConfirmedDelivery();
+                            },
                         };
                     }
                     await dispatchProviderInputOrThrow(async () => {
