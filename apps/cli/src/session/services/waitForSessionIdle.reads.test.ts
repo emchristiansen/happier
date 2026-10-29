@@ -40,7 +40,7 @@ async function harness(params: {
   const sessionReads: number[] = [];
   const transcriptReads: number[] = [];
   httpGet.mockImplementation(async (url: string) => {
-    if (String(url).endsWith(`/v2/sessions/${sessionId}`)) {
+    if (new URL(String(url)).pathname === `/v2/sessions/${sessionId}`) {
       sessionReads.push(Date.now());
       if (params.serviceMs) await new Promise((resolve) => setTimeout(resolve, params.serviceMs));
       return { status: 200, data: { session: await (params.readSession?.(sessionReads.length) ?? session({ latestTurnStatus: socketCompleted ? 'completed' : 'in_progress' })) } };
