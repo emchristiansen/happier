@@ -1980,6 +1980,31 @@ await parallel([
     expect(run?.toolCalls).toBe(14);
   });
 
+  it.each([
+    { label: 'stale earlier progress', retainEarlierProgress: true },
+    { label: 'no earlier progress', retainEarlierProgress: false },
+  ])('preserves native terminal workflow usage with $label', ({ retainEarlierProgress }) => {
+    const tracker = createClaudeWorkflowActivityTracker({
+      backendId: 'claude',
+      getCurrentClaudeSessionId: () => 'claude-session-1',
+    });
+    let updatedAt = 1000;
+    for (const value of loadFixtureLines('dynamic-workflow-three-phases.jsonl')) {
+      if (value && typeof value === 'object' && 'subtype' in value && value.subtype === 'task_progress') {
+        // The later progress row repeats the terminal totals and would conceal their loss.
+        if (!retainEarlierProgress || !('uuid' in value) || value.uuid !== 'uuid_5') continue;
+      }
+      tracker.observe(value, { updatedAt: updatedAt++ });
+    }
+
+    expect(tracker.getRunSnapshot('toolu_wf')).toMatchObject({
+      status: 'complete',
+      tokensUsed: 120500,
+      toolCalls: 14,
+      timeUsedSeconds: 18.75,
+    });
+  });
+
   it('does not fabricate a workflow from the real plain-task fixture (single subagent)', () => {
     const tracker = createClaudeWorkflowActivityTracker({
       backendId: 'claude',

@@ -742,7 +742,9 @@ function parseTaskNotificationMessage(message: Record<string, unknown>): TaskLif
     ...(parsed.knownOnly ? { knownOnly: true } : {}),
     ...(summary ? { summary } : {}),
     ...(resultPreview ? { resultPreview } : {}),
-    usage: {},
+    usage: message.type === 'system' && message.subtype === 'task_notification'
+      ? readUsageMetrics(message.usage)
+      : {},
     ...(parsed.sourceSessionId ? { sourceSessionId: parsed.sourceSessionId } : {}),
     ...(parsed.uuid ? { uuid: parsed.uuid } : {}),
   };
