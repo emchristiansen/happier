@@ -177,6 +177,99 @@ describe('desktop app updater (one owner for every surface)', () => {
         expect(hook.getCurrent()?.phase).toBe('installing');
     });
 
+    it('keeps a download bound to the offer selected after a pending check settles', async () => {
+        let finishCheck!: () => void;
+        const checked = new Promise<void>((resolve) => { finishCheck = resolve; });
+        let finishDownload!: () => void;
+        const downloaded = new Promise<void>((resolve) => { finishDownload = resolve; });
+        let checks = 0;
+        let offered = '1.2.0';
+        let packageVersion: string | null = null;
+        let installed: string | null = null;
+        const invoke = vi.fn(async (command: string) => {
+            if (command === 'desktop_fetch_update') {
+                if (++checks > 1) { await checked; offered = '1.3.0'; }
+                return offer(offered);
+            }
+            if (command === 'desktop_download_update') {
+                const captured = offered; // The adapter captures its Update before awaiting bytes.
+                await downloaded;
+                packageVersion = captured;
+                return true;
+            }
+            if (command === 'desktop_install_update') { installed = packageVersion; return true; }
+            throw new Error(`unexpected ${command}`);
+        });
+        installDesktop(invoke);
+        store = createDesktopUpdaterStore();
+        await store.check({ force: true });
+        const checking = store.check({ force: true });
+        expect(store.getSnapshot()).toMatchObject({ version: '1.2.0', phase: 'available', refreshing: true });
+        const downloading = store.download();
+        await settle();
+        finishCheck();
+        await checking;
+        await settle();
+        finishDownload();
+        await downloading;
+        expect(store.getSnapshot()).toMatchObject({ phase: 'ready', version: '1.3.0' });
+        expect(packageVersion).toBe('1.3.0');
+        await store.install();
+        expect(installed).toBe('1.3.0');
+        expect(checks).toBe(2);
+    });
+
+    it('does not install a formerly ready package after a pending check replaces its offer', async () => {
+        let finishCheck!: () => void;
+        const checked = new Promise<void>((resolve) => { finishCheck = resolve; });
+        let checks = 0;
+        const invoke = vi.fn(async (command: string) => {
+            if (command === 'desktop_fetch_update') {
+                if (++checks === 1) return offer('1.2.0', { downloaded: true });
+                await checked;
+                return offer('1.3.0');
+            }
+            if (command === 'desktop_install_update') return true;
+            throw new Error(`unexpected ${command}`);
+        });
+        installDesktop(invoke);
+        store = createDesktopUpdaterStore();
+        await store.check({ force: true });
+        const checking = store.check({ force: true });
+        const installing = store.install();
+        await settle();
+        finishCheck();
+        await Promise.all([checking, installing]);
+        expect(invoke.mock.calls.filter(([command]) => command === 'desktop_install_update')).toHaveLength(0);
+        expect(store.getSnapshot()).toMatchObject({ phase: 'available', version: '1.3.0' });
+    });
+
+    it.each([false, true])('rechecks the download action after a pending check: failed=%s', async (fails) => {
+        let finishCheck!: () => void;
+        const checked = new Promise<void>((resolve) => { finishCheck = resolve; });
+        let checks = 0;
+        const invoke = vi.fn(async (command: string) => {
+            if (command === 'desktop_fetch_update') {
+                if (++checks === 1) return offer('1.2.0');
+                await checked;
+                if (fails) throw new Error('offline');
+                return null;
+            }
+            if (command === 'desktop_download_update') return true;
+            throw new Error(`unexpected ${command}`);
+        });
+        installDesktop(invoke);
+        store = createDesktopUpdaterStore();
+        await store.check({ force: true });
+        const checking = store.check({ force: true });
+        const downloading = store.download();
+        await settle();
+        finishCheck();
+        await Promise.all([checking, downloading]);
+        expect(invoke.mock.calls.filter(([command]) => command === 'desktop_download_update')).toHaveLength(fails ? 1 : 0);
+        expect(store.getSnapshot()).toMatchObject(fails ? { phase: 'ready', version: '1.2.0' } : { phase: 'upToDate', version: null });
+    });
+
     it('names which step failed instead of carrying the raw error, and Retry repeats that step', async () => {
         let downloadAttempts = 0;
         const invoke = vi.fn(async (command: string) => {

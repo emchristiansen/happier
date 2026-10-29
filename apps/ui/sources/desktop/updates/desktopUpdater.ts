@@ -206,6 +206,8 @@ export function createDesktopUpdaterStore(): DesktopUpdaterStore {
     };
 
     const download = (): Promise<void> => {
+        // A pending check owns the adapter's offer until it settles. Re-read that offer afterwards.
+        if (checkInFlight) return checkInFlight.then(download);
         if (!isEnabled() || !snapshot.version || actionInFlight) return actionInFlight ?? Promise.resolve();
         const version = snapshot.version;
         patch({ phase: 'downloading', downloadPercent: null, failure: null });
@@ -240,7 +242,10 @@ export function createDesktopUpdaterStore(): DesktopUpdaterStore {
     };
 
     const install = (): Promise<void> => {
+        if (checkInFlight) return checkInFlight.then(install);
         if (!isEnabled() || actionInFlight) return actionInFlight ?? Promise.resolve();
+        // The check may have replaced the package whose Restart action was pressed.
+        if (snapshot.phase !== 'ready' && !(snapshot.phase === 'failed' && snapshot.failure === 'install')) return Promise.resolve();
         patch({ phase: 'installing', failure: null });
         actionInFlight = (async () => {
             try {
