@@ -5,7 +5,7 @@ import { requireEncryptionCredentials, type Credentials } from '@/persistence';
 
 import axios from 'axios';
 
-import { configuration } from '@/configuration';
+import { getAccountEncryptionMode } from '@/api/connectedServices/connectedServiceCredentialApi';
 import { serializeAxiosErrorForLog } from '@/api/client/serializeAxiosErrorForLog';
 import { logger } from '@/ui/logger';
 import { decryptAccountSettingsCiphertext } from '@/settings/accountSettingsClient';
@@ -95,7 +95,12 @@ async function parseSettingsFromContent(params: Readonly<{
   credentials: Credentials;
 }>): Promise<{ raw: AccountSettingsPersistedObject; envelopeKind: 'plain' | 'encrypted' }> {
   if (!params.content) {
-    return { raw: {}, envelopeKind: 'encrypted' };
+    // No stored envelope exists yet; key custody does not authorize a storage mode.
+    const mode = await getAccountEncryptionMode({ token: params.credentials.token });
+    if (mode === 'unknown') {
+      throw new Error('Cannot determine account encryption mode for initial settings');
+    }
+    return { raw: {}, envelopeKind: mode === 'plain' ? 'plain' : 'encrypted' };
   }
 
   if (params.content.t === 'plain') {
