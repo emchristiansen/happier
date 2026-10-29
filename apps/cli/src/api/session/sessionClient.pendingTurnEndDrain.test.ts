@@ -1,5 +1,6 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import axios from 'axios';
+import type { ManagedConnectionSupervisor } from '@happier-dev/connection-supervisor';
 import { readFileSync } from 'node:fs';
 
 import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
@@ -79,6 +80,8 @@ vi.mock('socket.io-client', () => ({
   io: () => { throw new Error('Unconfigured offline socket'); },
 }));
 
+// These composed regressions keep the real supervisor and pending wire parser; only sockets/HTTP are offline.
+let useRealSupervisorAndPendingTransport = false;
 const clients: import('./sessionClient').ApiSessionClient[] = [];
 const providerInputOutcomeObservers = new WeakMap<object, SessionProviderInputOutcomeObserver>();
 
@@ -135,14 +138,18 @@ vi.mock('./sockets', () => ({
 vi.mock('./connection/createSessionSocketTransport', () => ({
   createSessionSocketTransport: () => {
     if (!sessionSocketStub) throw new Error('Missing session socket stub');
+    const socket = sessionSocketStub;
     return {
       socket: sessionSocketStub as any,
       transport: {
-        connect: async () => {},
-        disconnect: async () => {},
-        destroy: async () => {},
-        isConnected: () => sessionSocketStub?.connected === true,
-        onConnected: () => () => {},
+        connect: async () => { socket.connect(); },
+        disconnect: async () => { socket.disconnect(); },
+        destroy: async () => { socket.removeAllListeners(); },
+        isConnected: () => socket.connected === true,
+        onConnected: (listener: () => void) => {
+          socket.on('connect', listener);
+          return () => { socket.off('connect', listener); };
+        },
         onDisconnected: () => () => {},
         onError: () => () => {},
       },
@@ -186,20 +193,28 @@ let supervisorOnConnected: (() => Promise<void> | void) | null = null;
 let supervisorConnectedPromise: Promise<void> | null = null;
 const supervisorReportProbeResultMock = vi.fn();
 
-vi.mock('@happier-dev/connection-supervisor', () => ({
-  DEFAULT_MANAGED_CONNECTION_POLICY: {},
-  createManagedConnectionSupervisor: (params: { createTransport: () => unknown; onConnected?: () => Promise<void> | void }) => ({
+vi.mock('@happier-dev/connection-supervisor', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@happier-dev/connection-supervisor')>();
+  return {
+  ...actual,
+  createManagedConnectionSupervisor: (params: Parameters<typeof actual.createManagedConnectionSupervisor>[0]) => useRealSupervisorAndPendingTransport
+    ? actual.createManagedConnectionSupervisor(params)
+    : ({
     start: async () => {
       params.createTransport();
-      supervisorOnConnected = params.onConnected ?? null;
-      supervisorConnectedPromise = Promise.resolve(params.onConnected?.());
+      supervisorOnConnected = () => params.onConnected?.({ state: {
+        phase: 'online', reason: null, attempt: 0, nextRetryAt: null,
+        lastConnectedAt: null, lastDisconnectedAt: null, lastErrorMessage: null,
+      } });
+      supervisorConnectedPromise = Promise.resolve(supervisorOnConnected());
       await supervisorConnectedPromise;
     },
     stop: async () => {},
     getState: () => ({ phase: supervisorPhase }),
     reportProbeResult: supervisorReportProbeResultMock,
   }),
-}));
+  };
+});
 
 const catchUpMock = vi.fn(async (_opts?: unknown) => {});
 
@@ -219,8 +234,12 @@ vi.mock('./pendingQueueV2Transport', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./pendingQueueV2Transport')>();
   return {
     ...actual,
-    materializeNextPendingQueueV2Message: (...args: unknown[]) => materializeNextMock(...args),
-    resolveAcceptedPendingQueueV2Delivery: (...args: unknown[]) => resolveAcceptedPendingDeliveryMock(...args),
+    materializeNextPendingQueueV2Message: (...args: Parameters<typeof actual.materializeNextPendingQueueV2Message>) => useRealSupervisorAndPendingTransport
+      ? actual.materializeNextPendingQueueV2Message(...args)
+      : materializeNextMock(...args),
+    resolveAcceptedPendingQueueV2Delivery: (...args: Parameters<typeof actual.resolveAcceptedPendingQueueV2Delivery>) => useRealSupervisorAndPendingTransport
+      ? actual.resolveAcceptedPendingQueueV2Delivery(...args)
+      : resolveAcceptedPendingDeliveryMock(...args),
     blockPendingQueueV2Delivery: (...args: unknown[]) => blockPendingDeliveryMock(...args),
     listPendingQueueV2ProviderDeliveryLocalIdsFromServer: (...args: unknown[]) => listProviderDeliveryLocalIdsMock(...args),
     listPendingQueueV2DeliveryStatusesFromServer: (...args: unknown[]) => listDeliveryStatusesMock(...args),
@@ -411,6 +430,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
   }, 120_000);
 
   beforeEach(() => {
+    useRealSupervisorAndPendingTransport = false;
     for (const key of ['HAPPIER_SERVER_URL', 'HAPPIER_LOCAL_SERVER_URL', 'HAPPIER_PUBLIC_SERVER_URL', 'HAPPIER_WEBAPP_URL']) {
       vi.stubEnv(key, offlineBoundary.origin);
     }
@@ -2378,6 +2398,93 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       await supervisorOnConnected();
     };
 
+    const realSupervisor = (client: Awaited<ReturnType<typeof createClient>>) =>
+      (client as unknown as { sessionConnectionSupervisor: ManagedConnectionSupervisor }).sessionConnectionSupervisor;
+    const currentEpoch = (client: Awaited<ReturnType<typeof createClient>>) =>
+      (client as unknown as { sessionConnectionEpoch: number }).sessionConnectionEpoch;
+    const waitForNewPublisher = async (client: Awaited<ReturnType<typeof createClient>>, previousEpoch: number) => {
+      await waitUntil(() => currentEpoch(client) > previousEpoch && realSupervisor(client).getState().phase === 'online');
+      await waitForCurrentPendingInputContract(client);
+    };
+
+    it('requests a real supervised reconnect for a current publisher refusal', async () => {
+      useRealSupervisorAndPendingTransport = true;
+      const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 }, {
+        sessionSocketEmitWithAck: (event) => event === 'pending-materialize-next' ? { ok: false, error: 'forbidden' } : undefined,
+      });
+      await waitForCurrentPendingInputContract(client);
+      const epoch = currentEpoch(client);
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toEqual({ type: 'publisher_lost' });
+      // No manual onConnected call: the real supervisor must disconnect, retry and reconnect.
+      await waitForNewPublisher(client, epoch);
+      expect(sessionSocketStub?.disconnect).toHaveBeenCalledTimes(1);
+      expect(sessionSocketStub?.connect).toHaveBeenCalledTimes(2);
+      await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
+    });
+
+    it('keeps a newer real supervised generation when an old publisher refusal arrives late', async () => {
+      useRealSupervisorAndPendingTransport = true;
+      const ack = createDeferred<unknown>();
+      const requested = createDeferred<void>();
+      const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 }, {
+        sessionSocketEmitWithAck: (event) => {
+          if (event !== 'pending-materialize-next') return undefined;
+          requested.resolve();
+          return ack.promise;
+        },
+      });
+      await waitForCurrentPendingInputContract(client);
+      const epoch = currentEpoch(client);
+      const pending = client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+      await requested.promise;
+      const supervisor = realSupervisor(client);
+      supervisor.reportProbeResult?.({ status: 'retry_later', reason: 'probe_failed' }, supervisor.captureProbeReportScope?.());
+      await waitForNewPublisher(client, epoch);
+      const scope = supervisor.captureProbeReportScope?.();
+      ack.resolve({ ok: false, error: 'forbidden' });
+      await expect(pending).resolves.toEqual({ type: 'retryable_transport' });
+      expect(supervisor.captureProbeReportScope?.()).toEqual(scope);
+      expect(supervisor.getState().phase).toBe('online');
+      expect(sessionSocketStub?.disconnect).toHaveBeenCalledTimes(1);
+      expect(sessionSocketStub?.connect).toHaveBeenCalledTimes(2);
+      await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
+    });
+
+    it('reconnects through the real supervisor to settle an already accepted provider input', async () => {
+      useRealSupervisorAndPendingTransport = true;
+      const localId = 'real-supervised-settlement';
+      let settlementCalls = 0;
+      const materialized = createProviderDeliveryMaterializeResult(localId);
+      const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 }, {
+        sessionSocketEmitWithAck: (event) => {
+          if (event === 'pending-materialize-next') return { ok: true, ...materialized, message: { ...materialized.message, requestedAction: { v: 1, kind: 'send_now' }, providerAction: 'send' } };
+          if (event === 'pending-delivery-accepted-v1') {
+            settlementCalls += 1;
+            return settlementCalls === 1 ? { ok: false, error: 'forbidden' } : {
+              ok: true, didResolve: true, pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 3,
+              message: { id: 'committed-real-supervised', seq: 10, localId, messageRole: 'user', content: materialized.message.content, createdAt: 1000, updatedAt: 1000 },
+            };
+          }
+          return undefined;
+        },
+      });
+      await waitForCurrentPendingInputContract(client);
+      const delivered = vi.fn();
+      client.onUserMessage((message) => {
+        delivered(message);
+        confirmProviderInputAccepted(client, localId);
+      });
+      listDeliveryStatusesMock.mockResolvedValue([{ localId, status: 'delivering' }]);
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toMatchObject({ type: 'materialized', localId });
+      expect(delivered).toHaveBeenCalledTimes(1);
+      await waitUntil(() => settlementCalls === 2 && !client.hasCanonicalPendingProviderInputDelivery(localId));
+      expect(sessionSocketStub?.connect).toHaveBeenCalledTimes(2);
+      expect(delivered).toHaveBeenCalledTimes(1);
+      await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
+    });
+
     it('reconnects once, then stops materializing and reports publisher_lost until a new publisher claim', async () => {
       const client = await createClient({
         latestTurnStatus: 'completed',
@@ -2392,6 +2499,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
         .resolves.toEqual({ type: 'publisher_lost' });
       expect(supervisorReportProbeResultMock).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({ status: 'retry_later' }),
+        undefined, // This legacy state-machine double has no generation capture; real-owner cases above do.
       );
       // A refusal on the same connection while the reconnect is pending is not a second episode.
       await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
@@ -2439,6 +2547,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       await waitUntil(() => supervisorReportProbeResultMock.mock.calls.length === 1);
       expect(supervisorReportProbeResultMock).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({ status: 'retry_later' }),
+        undefined, // This legacy state-machine double has no generation capture; real-owner cases above do.
       );
       expect(warningSpy).toHaveBeenCalledWith('[pendingQueue] accepted provider settlement remains unresolved', expect.objectContaining({
         sessionId: 's1', localId: 'settle-forbidden-reclaimed', attempt: 1, retryAfterMs: null, willRetry: false,

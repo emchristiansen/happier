@@ -1857,7 +1857,7 @@ export class ApiSessionClient extends EventEmitter {
                 status: 'retry_later',
                 reason: 'probe_failed',
                 errorMessage: 'Pending materialization lost session publisher status',
-            });
+            }, this.sessionConnectionSupervisor?.captureProbeReportScope?.());
             return;
         }
         if (recovery.state === 'reclaimed' && sessionConnectionEpoch >= recovery.sessionConnectionEpoch) {
