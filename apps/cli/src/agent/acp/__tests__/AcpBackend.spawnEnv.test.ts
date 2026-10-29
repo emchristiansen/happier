@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -17,7 +17,7 @@ afterEach(() => {
   envScope.restore();
 });
 
-function writeEnvCapturingAcpAgentScript(params: { dir: string }): string {
+function writeEnvCapturingAcpAgentScript(params: { dir: string; exitAfterSession?: boolean }): string {
   const source = `
     const { writeFileSync } = require('node:fs');
     const decoder = new TextDecoder();
@@ -70,6 +70,7 @@ function writeEnvCapturingAcpAgentScript(params: { dir: string }): string {
 
         if (method === 'session/new') {
           respondOk(id, { sessionId: 'test-session' });
+          if (${params.exitAfterSession === true}) setImmediate(() => process.exit(0));
           continue;
         }
 
@@ -180,6 +181,52 @@ describe('AcpBackend spawn environment', () => {
       expect(cleanup).toHaveBeenCalledTimes(1);
       await backend.dispose();
       expect(cleanup).toHaveBeenCalledTimes(1);
+    });
+  }, 20_000);
+
+  it('cleans late preparation without spawning after disposal completes', async () => {
+    await withTempDir('happier-acp-retired-preparation-', async (dir) => {
+      const capturePath = join(dir, 'late-spawn.json');
+      const scriptPath = writeEnvCapturingAcpAgentScript({ dir, exitAfterSession: true });
+      let releasePreparation!: () => void;
+      const preparationGate = new Promise<void>((resolve) => { releasePreparation = resolve; });
+      let markPreparationEntered!: () => void;
+      const preparationEntered = new Promise<void>((resolve) => { markPreparationEntered = resolve; });
+      const cleanup = vi.fn(async () => {});
+      const backend = new AcpBackend({
+        agentName: 'test',
+        cwd: dir,
+        command: process.execPath,
+        args: [scriptPath],
+        env: { HAPPIER_ACP_ENV_CAPTURE_PATH: capturePath },
+        prepareProcessLaunch: async () => {
+          markPreparationEntered();
+          await preparationGate;
+          return { cleanup };
+        },
+      });
+      // Observe rejection immediately so the controlled disposal cannot create an unhandled rejection.
+      const start = backend.startSession().then(
+        () => ({ kind: 'started' as const }),
+        (error: unknown) => ({ kind: 'failed' as const, error }),
+      );
+      try {
+        await preparationEntered;
+        await backend.dispose();
+        expect(cleanup).not.toHaveBeenCalled();
+        releasePreparation();
+        const result = await start;
+        expect(result.kind).toBe('failed');
+        if (result.kind === 'failed') expect(result.error).toMatchObject({ name: 'AbortError' });
+        expect(existsSync(capturePath)).toBe(false);
+        expect(cleanup).toHaveBeenCalledTimes(1);
+        await backend.dispose();
+        expect(cleanup).toHaveBeenCalledTimes(1);
+      } finally {
+        releasePreparation();
+        await start;
+        await backend.dispose();
+      }
     });
   }, 20_000);
 

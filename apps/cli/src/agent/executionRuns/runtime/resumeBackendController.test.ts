@@ -179,7 +179,7 @@ describe('resumeBackendControllerForResumableRun', () => {
     expect(terminalRuntimeActivityAfterFailedAdmission).toHaveBeenCalledWith(run.runId, 'execution_run_resume_failed');
   });
 
-  it('accepts backend events emitted during the serialized resume load before controller installation', async () => {
+  it('accepts backend events emitted during the serialized resume load with the controller already installed', async () => {
     let handler: AgentMessageHandler | null = null;
     const sendAcp = vi.fn();
     const backend: AgentBackend = {

@@ -1180,6 +1180,8 @@ export class AcpBackend implements AgentBackend {
     negotiatedSessionLoadSupport: boolean;
     negotiatedSessionCapabilities: NegotiatedAcpSessionCapabilities;
   }> {
+    if (this.disposed) throw makeAbortError('Backend disposed');
+
     logger.debug(`[AcpBackend] Starting process + initializing connection (op=${params.operationId})`);
 
     if (this.process || this.connection) {
@@ -1194,6 +1196,9 @@ export class AcpBackend implements AgentBackend {
     try {
       const preparedLaunch = await this.options.prepareProcessLaunch?.();
       this.processLaunchCleanup = preparedLaunch?.cleanup ?? null;
+      // Preparation may return resources after disposal has already completed. Hand them
+      // to the existing failure cleanup before any process or connection can be acquired.
+      if (this.disposed) throw makeAbortError('Backend disposed during process launch preparation');
 
       // Spawn the ACP agent process.
       // Use cross-spawn so Windows quoting/.cmd resolution is handled safely without joining args.
