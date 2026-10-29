@@ -37,12 +37,16 @@ export function createTaskLimiter(limit: number): TaskLimiter {
             return;
         }
         await new Promise<void>((resolve) => waiters.push(resolve));
-        activeCount += 1;
     };
 
     const release = (): void => {
-        activeCount -= 1;
-        waiters.shift()?.();
+        const next = waiters.shift();
+        if (next) {
+            // Transfer the occupied slot before the waiter's continuation runs.
+            next();
+        } else {
+            activeCount -= 1;
+        }
     };
 
     return {
