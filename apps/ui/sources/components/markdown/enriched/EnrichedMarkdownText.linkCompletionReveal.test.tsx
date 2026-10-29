@@ -3,7 +3,6 @@ import React, { act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { describe, expect, it } from 'vitest';
 
-import { getVitestNodeBuiltin } from '@/dev/vitestNodeBuiltins';
 import { sanitizeEnrichedMarkdownLinkTargets } from './enrichedMarkdownLinkHandling';
 import { preprocessStreamingMarkdown } from '../streaming/preprocessStreamingMarkdown';
 
@@ -16,13 +15,6 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 const REVEAL_SELECTOR = '[data-happier-enriched-markdown-reveal="text"]';
 const LINK_LABEL = 'zlink-006';
-const { resolve } = getVitestNodeBuiltin<{
-    resolve: (...paths: string[]) => string;
-}>('node:path');
-const { pathToFileURL } = getVitestNodeBuiltin<{
-    pathToFileURL: (path: string) => URL;
-}>('node:url');
-
 type WebEnrichedMarkdownTextModule = Readonly<{
     EnrichedMarkdownText: React.ComponentType<{
         markdown: string;
@@ -34,23 +26,13 @@ type WebParseMarkdownModule = Readonly<{
     preloadMarkdownRuntime: () => Promise<void>;
 }>;
 
-// This suite runs under jsdom (a real DOM is the whole point), where `import.meta.url`
-// is an http: document URL the ESM loader refuses. Resolve the patched package from the
-// Vitest project root instead, exactly as `vitest.config.ts` resolves its own aliases.
-function patchedPackageModuleUrl(relativePath: string): string {
-    return pathToFileURL(
-        resolve(process.cwd(), 'node_modules/react-native-enriched-markdown', relativePath),
-    ).href;
-}
-
+// Literal imports let Vitest resolve and transform the real patched package under jsdom.
 async function loadPatchedWebEnrichedMarkdownText(): Promise<WebEnrichedMarkdownTextModule> {
-    const moduleUrl = patchedPackageModuleUrl('src/web/EnrichedMarkdownText.tsx');
-    return import(/* @vite-ignore */ moduleUrl) as Promise<WebEnrichedMarkdownTextModule>;
+    return import('../../../../node_modules/react-native-enriched-markdown/src/web/EnrichedMarkdownText.tsx');
 }
 
 async function loadPatchedWebParseMarkdown(): Promise<WebParseMarkdownModule> {
-    const moduleUrl = patchedPackageModuleUrl('src/web/parseMarkdown.ts');
-    return import(/* @vite-ignore */ moduleUrl) as Promise<WebParseMarkdownModule>;
+    return import('../../../../node_modules/react-native-enriched-markdown/src/web/parseMarkdown.ts');
 }
 
 /**
