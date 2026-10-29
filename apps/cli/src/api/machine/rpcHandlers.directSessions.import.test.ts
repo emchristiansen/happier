@@ -36,6 +36,7 @@ describe('direct-session import operation', () => {
   beforeEach(async () => {
     root = await createTempDir('direct-import-operation-');
     vi.stubEnv('HAPPIER_HOME_DIR', root);
+    vi.stubEnv('CLAUDE_CONFIG_DIR', undefined);
     vi.stubEnv('HAPPIER_CLAUDE_CONFIG_DIR', root);
     await mkdir(join(root, 'projects', 'project'), { recursive: true });
     await writeFile(join(root, 'projects', 'project', 'native.jsonl'), [
