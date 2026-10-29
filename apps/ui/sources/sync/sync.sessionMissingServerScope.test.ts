@@ -1,4 +1,4 @@
-import { getServerFetchUrl, matchServerFetchUrl } from '@/dev/testkit/mocks/serverFetch';
+import { createServerFetchWithReachabilityProbe, getServerFetchUrl, matchServerFetchUrl } from '@/dev/testkit/mocks/serverFetch';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TranscriptRowShellItem } from '@/components/sessions/transcript/measurement/transcriptRowShellSignature';
 
@@ -521,6 +521,103 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
             limit: '150',
         });
         expectHeaderValue(runtimeFetchMock.mock.calls[1]?.[1]?.headers, 'Authorization', `Bearer ${ownerToken}`);
+    });
+
+    it.each(['active', 'scoped'] as const)('coalesces overlapping Pending refreshes through the real Sync boundary (%s owner)', async (owner) => {
+        const sessionId = `coalesced_pending_${owner}`;
+        const active = upsertServerProfile({ serverUrl: 'https://pending-active.example', name: 'Active' });
+        const scoped = upsertServerProfile({ serverUrl: 'https://pending-owner.example', name: 'Owner' });
+        setActiveServerId(active.id, { scope: 'device' });
+        storage.getState().activateProfileScope({ serverId: active.id, accountId: 'active-account' });
+        resolvePreferredServerIdForSessionIdMock.mockReturnValue(owner === 'active' ? undefined : scoped.id);
+        getCredentialsForServerUrlMock.mockResolvedValue({ token: buildTokenWithSub('owner-account'), secret: 'owner-secret' });
+        createEncryptionFromAuthCredentialsMock.mockResolvedValue({});
+        storage.getState().applySessions([{ ...createSession(sessionId), encryptionMode: 'plain' } as Session]);
+        const gate = createDeferred<void>();
+        const response = () => Response.json({ pending: [{
+            localId: 'coalesced-row', content: { t: 'plain', v: { role: 'user', content: { type: 'text', text: 'one authoritative read' } } },
+            requestedAction: { v: 1, kind: 'enqueue' }, status: 'queued', position: 0, createdAt: 100, updatedAt: 100,
+        }] });
+        const transport = vi.fn(async () => { await gate.promise; return response(); });
+        requestMock.mockImplementation(transport);
+        runtimeFetchMock.mockImplementation(createServerFetchWithReachabilityProbe((input) =>
+            getServerFetchUrl(input).pathname === `/v2/sessions/${sessionId}/pending`
+                ? transport() : Promise.resolve(Response.json(buildServerFeaturesResponse()))));
+        const pending = await import('./engine/pending/pendingQueueV2');
+        const refresh = vi.spyOn(pending, 'fetchAndApplyPendingMessagesV2');
+        const { sync } = await import('./sync');
+        const originalEncryption = sync.encryption;
+        const { Encryption } = await import('./encryption/encryption');
+        sync.encryption = await Encryption.create(new Uint8Array(32).fill(7));
+        const completions: Promise<void>[] = [];
+        const track = (completion: Promise<void>) => {
+            void completion.catch(() => {}); // The original promise is awaited in cleanup, including errors.
+            completions.push(completion);
+        };
+        try {
+            track(sync.fetchPendingMessages(sessionId));
+            await vi.waitFor(() => expect(transport).toHaveBeenCalledTimes(1));
+            track(sync.fetchPendingMessages(sessionId));
+            // Observe both real helper entries before releasing HTTP; no stable callback fixture
+            // is passed in place of the wrappers that production Sync constructs.
+            await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+        } finally {
+            gate.resolve();
+            await Promise.all(completions);
+            refresh.mockRestore();
+            sync.encryption = originalEncryption;
+        }
+        expect(transport).toHaveBeenCalledTimes(1);
+        expect(storage.getState().sessionPending[sessionId]?.messages.map((message) => message.text)).toEqual(['one authoritative read']);
+    });
+
+    it.each(['active generation', 'scoped credential'] as const)('starts a fresh Pending read when its %s retires', async (retiredOwner) => {
+        const sessionId = `retired_pending_${retiredOwner.replaceAll(' ', '_')}`;
+        const active = upsertServerProfile({ serverUrl: 'https://retired-active.example', name: 'Active' });
+        const scoped = upsertServerProfile({ serverUrl: 'https://retired-owner.example', name: 'Owner' });
+        setActiveServerId(active.id, { scope: 'device' });
+        storage.getState().activateProfileScope({ serverId: active.id, accountId: 'active-account' });
+        resolvePreferredServerIdForSessionIdMock.mockReturnValue(retiredOwner === 'active generation' ? undefined : scoped.id);
+        const token = buildTokenWithSub('owner-account');
+        getCredentialsForServerUrlMock.mockResolvedValue({ token, secret: 'owner-secret' });
+        createEncryptionFromAuthCredentialsMock.mockResolvedValue({});
+        storage.getState().applySessions([{ ...createSession(sessionId), encryptionMode: 'plain' } as Session]);
+        const gate = createDeferred<void>();
+        const response = (text: string) => Response.json({ pending: [{
+            localId: 'current-row', content: { t: 'plain', v: { role: 'user', content: { type: 'text', text } } },
+            requestedAction: { v: 1, kind: 'enqueue' }, status: 'queued', position: 0, createdAt: 100, updatedAt: 100,
+        }] });
+        const transport = vi.fn(async () => response('current read'));
+        transport.mockImplementationOnce(async () => { await gate.promise; return response('retired read'); });
+        requestMock.mockImplementation(transport);
+        runtimeFetchMock.mockImplementation(createServerFetchWithReachabilityProbe((input) =>
+            getServerFetchUrl(input).pathname === `/v2/sessions/${sessionId}/pending`
+                ? transport() : Promise.resolve(Response.json(buildServerFeaturesResponse()))));
+        const { sync } = await import('./sync');
+        const originalEncryption = sync.encryption;
+        const { Encryption } = await import('./encryption/encryption');
+        sync.encryption = await Encryption.create(new Uint8Array(32).fill(7));
+        const oldRead = sync.fetchPendingMessages(sessionId);
+        void oldRead.catch(() => {}); // Cleanup still awaits the original completion.
+        try {
+            await vi.waitFor(() => expect(transport).toHaveBeenCalledTimes(1));
+            if (retiredOwner === 'active generation') {
+                // A genuine profile-generation change, even when the same account/server returns.
+                setActiveServerId(scoped.id, { scope: 'device' });
+                setActiveServerId(active.id, { scope: 'device' });
+            } else {
+                // Same account, new credential-bound transport; account equality alone is insufficient.
+                getCredentialsForServerUrlMock.mockResolvedValue({ token: token.replace(/sig$/, 'rotated-signature'), secret: 'owner-secret' });
+            }
+            await sync.fetchPendingMessages(sessionId);
+            expect(transport).toHaveBeenCalledTimes(2);
+            expect(storage.getState().sessionPending[sessionId]?.messages.map((message) => message.text)).toEqual(['current read']);
+        } finally {
+            gate.resolve();
+            await oldRead;
+            sync.encryption = originalEncryption;
+        }
+        expect(storage.getState().sessionPending[sessionId]?.messages.map((message) => message.text)).toEqual(['current read']);
     });
 
     it('fetches pending messages through the preferred owner server when the owner is not active', async () => {

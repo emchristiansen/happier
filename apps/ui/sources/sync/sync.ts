@@ -156,12 +156,33 @@ type LoadOlderMessagesOptions = Readonly<{
 
 class PendingOutboxSessionNotHydratedError extends Error {}
 
+type PendingQueueRequestBinding =
+    | Readonly<{ scope: 'active'; serverGeneration: number; request: typeof apiSocket.request }>
+    | Readonly<{ scope: 'scoped'; serverUrl: string; token: string }>;
+
+function arePendingQueueRequestBindingsEqual(left: PendingQueueRequestBinding, right: PendingQueueRequestBinding): boolean {
+    if (left.scope === 'active') {
+        return right.scope === 'active'
+            && left.serverGeneration === right.serverGeneration
+            && left.request === right.request;
+    }
+    return right.scope === 'scoped' && left.serverUrl === right.serverUrl && left.token === right.token;
+}
+
 type ResolvedPendingQueueOwnerContext = Readonly<{
     outboxScope: ServerAccountScope;
     request: (path: string, init?: RequestInit) => Promise<Response>;
+    requestBinding: PendingQueueRequestBinding;
     enqueueEncryption: PendingQueueEncryption;
     readEncryption: PendingQueueReadEncryption;
 }>;
+
+type PendingQueueRefreshOwner = {
+    readonly generation: number;
+    readonly context: ResolvedPendingQueueOwnerContext;
+    readonly isOutboxScopeCurrent: () => Promise<boolean>;
+    users: number;
+};
 
 export type LoadTargetWindowMessagesTarget =
     | Readonly<{ kind: 'seq'; seq: number }>
@@ -978,6 +999,7 @@ class Sync {
       private resumeInFlight: Promise<void> | null = null;
       private changesCatchUpQueuedAfterResume = false;
       private pendingOutboxRearmInFlightByScope = new Map<string, Promise<void>>();
+      private pendingQueueRefreshOwners = new Map<string, PendingQueueRefreshOwner>();
       private readonly usesPersistentDesktopSync = isTauriDesktop();
       private isForeground = this.usesPersistentDesktopSync || AppState.currentState === 'active';
       public encryptionCache = new EncryptionCache();
@@ -2049,6 +2071,7 @@ class Sync {
         this.deferredWebVisibilityTeardown = null;
         this.stopJsThreadLagTelemetryRuntime();
         this.serverScopeGeneration += 1;
+        this.pendingQueueRefreshOwners.clear();
         this.flushPendingSettingsForCurrentScopeNow();
         this.flushSessionMaterializedMaxSeq();
         this.clearActiveAccountSettingsScope();
@@ -3626,6 +3649,7 @@ class Sync {
         ) {
             return;
         }
+        const generation = this.serverScopeGeneration;
         const ownerContext = await this.resolvePendingQueueOwnerContext(sessionId);
         const outboxScope = ownerContext.outboxScope;
         if (
@@ -3638,13 +3662,54 @@ class Sync {
         for (const localId of replayLocalIds) {
             this.schedulePendingOutboxOperationRetry({ sessionId, localId, outboxScope });
         }
-        await fetchAndApplyPendingMessagesV2({
-            sessionId,
-            encryption: ownerContext.readEncryption,
-            request: ownerContext.request,
-            outboxScope,
-            isOutboxScopeCurrent: () => this.isPendingQueueOwnerScopeCurrent(sessionId, outboxScope),
-        });
+        if (generation !== this.serverScopeGeneration) return;
+        const refreshOwner = this.acquirePendingQueueRefreshOwner(sessionId, ownerContext, generation);
+        try {
+            await fetchAndApplyPendingMessagesV2({
+                sessionId,
+                encryption: ownerContext.readEncryption,
+                request: refreshOwner.context.request,
+                outboxScope,
+                isOutboxScopeCurrent: refreshOwner.isOutboxScopeCurrent,
+            });
+        } finally {
+            refreshOwner.users -= 1;
+            if (refreshOwner.users === 0 && this.pendingQueueRefreshOwners.get(sessionId) === refreshOwner) {
+                this.pendingQueueRefreshOwners.delete(sessionId);
+            }
+        }
+    }
+
+    private acquirePendingQueueRefreshOwner(
+        sessionId: string,
+        context: ResolvedPendingQueueOwnerContext,
+        generation: number,
+    ): PendingQueueRefreshOwner {
+        const existing = this.pendingQueueRefreshOwners.get(sessionId);
+        if (existing && existing.generation === generation
+            && areServerAccountScopesEqual(existing.context.outboxScope, context.outboxScope)
+            && arePendingQueueRequestBindingsEqual(existing.context.requestBinding, context.requestBinding)) {
+            existing.users += 1;
+            return existing;
+        }
+        // Retain callbacks only for overlapping reads of this transport/scope lifetime. The
+        // Pending owner still decides whether version, transcript, encryption or local writes
+        // demand a separate read. A newly allocated wrapper alone is not a new transport.
+        const isCurrent = (): boolean => this.pendingQueueRefreshOwners.get(sessionId) === owner
+            && this.serverScopeGeneration === generation
+            && (context.requestBinding.scope !== 'active'
+                || (getActiveServerSnapshot().generation === context.requestBinding.serverGeneration
+                    && apiSocket.request === context.requestBinding.request));
+        const owner: PendingQueueRefreshOwner = {
+            generation,
+            context,
+            users: 1,
+            isOutboxScopeCurrent: async () => isCurrent()
+                && await this.isPendingQueueOwnerScopeCurrent(sessionId, context.outboxScope)
+                && isCurrent(),
+        };
+        this.pendingQueueRefreshOwners.set(sessionId, owner);
+        return owner;
     }
 
     private rearmPendingOutboxForActiveScope = (): Promise<void> => {
@@ -4423,6 +4488,7 @@ class Sync {
             };
             return {
                 outboxScope: expectedActiveScope,
+                requestBinding: { scope: 'active', serverGeneration: getActiveServerSnapshot().generation, request: apiSocket.request },
                 request: ownPendingRequest(async (path, init) => {
                     assertCapturedActiveScope();
                     const response = await apiSocket.request(path, init);
@@ -4442,6 +4508,7 @@ class Sync {
             };
             return {
                 outboxScope: route.outboxScope,
+                requestBinding: { scope: 'active', serverGeneration: getActiveServerSnapshot().generation, request: apiSocket.request },
                 request: ownPendingRequest(async (path, init) => {
                     // apiSocket is dynamically bound to the active account. Fence immediately
                     // before entering it, then fence again before any caller applies completion.
@@ -4465,6 +4532,7 @@ class Sync {
         } satisfies PendingQueueEncryption & PendingQueueReadEncryption;
         return {
             outboxScope: route.outboxScope,
+            requestBinding: { scope: 'scoped', serverUrl: route.context.targetServerUrl, token: route.context.token },
             request: ownPendingRequest(createSessionRequestForResolvedServerScope({
                 context: route.context,
                 activeRequest: async () => {
