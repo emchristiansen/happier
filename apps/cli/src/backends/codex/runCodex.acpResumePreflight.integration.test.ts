@@ -1430,6 +1430,98 @@ describe('runCodex CodexACP resume behavior', () => {
     expect(outcome).toMatchObject({ ok: false });
   });
 
+  it.each(['fresh', 'resumed'] as const)('sends configured instructions only when owed after shared local attachment (%s)', async (lifecycle) => {
+    if (lifecycle === 'resumed') mockAttachedSessionMetadata({ codexSessionId: 'shared-fresh', codexBackendMode: 'appServer' });
+    resolveCodexSharedControlSupportSpy.mockResolvedValueOnce({ ok: true, version: '0.153.4' });
+    resolveRunnerMcpServersSpy.mockResolvedValueOnce({
+      happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() }, mcpServers: {},
+    });
+    const startingMode = await import('./utils/resolveCodexStartingMode');
+    vi.mocked(startingMode.resolveCodexStartingMode).mockReturnValueOnce('local');
+    const support = await import('./localControl/createLocalControlSupportResolver');
+    const actualSupport = await vi.importActual<typeof support>('./localControl/createLocalControlSupportResolver');
+    vi.mocked(support.createCodexLocalControlSupportResolver).mockImplementationOnce(actualSupport.createCodexLocalControlSupportResolver);
+    const modeController = await import('@/agent/localControl/createLocalRemoteModeController');
+    const actualModeController = await vi.importActual<typeof modeController>('@/agent/localControl/createLocalRemoteModeController');
+    const previousModeController = vi.mocked(modeController.createLocalRemoteModeController).getMockImplementation()!;
+    vi.mocked(modeController.createLocalRemoteModeController).mockImplementation(actualModeController.createLocalRemoteModeController);
+    const promptModule = await import('@/agent/prompting/coding/resolveEffectiveCodingPrompt');
+    const actualPrompt = await vi.importActual<typeof promptModule>('@/agent/prompting/coding/resolveEffectiveCodingPrompt');
+    const previousPromptResolver = vi.mocked(promptModule.resolveEffectiveCodingPromptText).getMockImplementation()!;
+    vi.mocked(promptModule.resolveEffectiveCodingPromptText).mockImplementation(actualPrompt.resolveEffectiveCodingPromptText);
+
+    const notifications = new Map<string, (params: unknown) => void | Promise<void>>();
+    const nativePrompts: unknown[] = [];
+    let turnCount = 0;
+    const nativeRequest = vi.fn(async (method: string, params?: unknown) => {
+      if (method === 'thread/start' || method === 'thread/resume' || method === 'thread/read') return { thread: { id: 'shared-fresh', turns: [] } };
+      if (method === 'thread/name/set') return {};
+      if (method === 'collaborationMode/list' || method === 'model/list') return { data: [] };
+      if (method === 'thread/goal/get') return { goal: null };
+      if (method === 'turn/start') {
+        nativePrompts.push(params);
+        const id = `turn-${++turnCount}`;
+        setImmediate(() => { void notifications.get('turn/completed')?.({
+          threadId: 'shared-fresh', turn: { id, status: 'completed' },
+        }); });
+        return { turn: { id } };
+      }
+      throw new Error(`Unconfigured synthetic provider request: ${method}`);
+    });
+    // Only the native RPC transport and foreground terminal process are synthetic.
+    const nativeClient = {
+      request: nativeRequest, notify: async () => {}, dispose: async () => {}, onExit: () => () => {},
+      registerRequestHandler: () => () => {},
+      registerNotificationHandler: (method: string, handler: (params: unknown) => void | Promise<void>) => {
+        notifications.set(method, handler); return () => { notifications.delete(method); };
+      },
+    };
+    createCodexSharedAppServerSpy.mockImplementationOnce(async () => ({
+      endpoint: 'unix:///tmp/happier-codex-test/private/app-server.sock',
+      createClient: async () => nativeClient, dispose: sharedAppServerDisposeSpy,
+    }));
+    const actualRuntime = await vi.importActual<typeof import('./appServer/runtime')>('./appServer/runtime');
+    createCodexAppServerRuntimeSpy.mockImplementationOnce((params) =>
+      actualRuntime.createCodexAppServerRuntime({ ...params, processEnv: {} }),
+    );
+    let attached = false;
+    const attach = vi.fn(async () => { attached = true; return true; });
+    const actualSharedControl = await vi.importActual<typeof import('./localControl/createCodexSharedLocalControl')>('./localControl/createCodexSharedLocalControl');
+    createCodexSharedLocalControlSpy.mockImplementationOnce((params) =>
+      actualSharedControl.createCodexSharedLocalControl({ ...params, supervisor: {
+        isAttached: () => attached, attach,
+        detach: async () => { attached = false; }, dispose: async () => { attached = false; },
+      } }),
+    );
+    let inputCount = 0;
+    sessionInputConsumerWaitForNextInputImpl = async (opts) => {
+      if (++inputCount > 2) return null;
+      expect(attached).toBe(true);
+      expect(attach).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'shared-fresh' }));
+      if (!lastOnUserMessageHandler) throw new Error('Ordinary message handler missing');
+      await lastOnUserMessageHandler({
+        content: { text: `ordinary message ${inputCount}` }, localId: `shared-message-${inputCount}`,
+        meta: { appendSystemPrompt: 'configured shared-session instructions' },
+      }, { seq: inputCount });
+      return await opts.messageQueue.waitForMessagesAndGetAsString();
+    };
+    try {
+      const { runCodex } = await import('./runCodex');
+      await runCodex({ credentials: { token: 'test' } as Credentials, startedBy: 'terminal',
+        startingMode: 'local', codexBackendMode: 'appServer', permissionMode: 'default', permissionModeUpdatedAt: 1,
+        ...(lifecycle === 'resumed' ? { existingSessionId: 'existing-123', resume: 'shared-fresh' } : {}),
+      });
+      expect(nativePrompts).toHaveLength(2);
+      expect(nativePrompts[0]).toMatchObject({ input: [{ type: 'text', text: lifecycle === 'fresh'
+        ? expect.stringContaining('configured shared-session instructions') : 'ordinary message 1' }] });
+      expect(nativePrompts[0]).toMatchObject({ input: [{ type: 'text', text: expect.stringContaining('ordinary message 1') }] });
+      expect(nativePrompts[1]).toMatchObject({ input: [{ type: 'text', text: 'ordinary message 2' }] });
+    } finally {
+      vi.mocked(modeController.createLocalRemoteModeController).mockImplementation(previousModeController);
+      vi.mocked(promptModule.resolveEffectiveCodingPromptText).mockImplementation(previousPromptResolver);
+    }
+  });
+
   it('keeps fresh app-server session registration lazy without opening a provider thread', async () => {
     resolveRunnerMcpServersSpy.mockImplementationOnce(async () => ({
       happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() },

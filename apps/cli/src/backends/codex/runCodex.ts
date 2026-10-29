@@ -3060,7 +3060,8 @@ export async function runCodex(opts: {
                             modelSync,
                         });
                     }
-                    const systemPromptText = startedFreshSessionForTurn || sharedThreadNeedsSystemPrompt
+                    const needsSystemPrompt = startedFreshSessionForTurn || sharedThreadNeedsSystemPrompt;
+                    const systemPromptText = needsSystemPrompt
                         ? await resolveFreshSessionSystemPrompt(
                             resolveAppendSystemPromptBaseOverride(message.mode),
                         )
@@ -3068,7 +3069,7 @@ export async function runCodex(opts: {
                     const providerDispatch = await resolveProviderDispatch();
                     const promptForProvider = buildCodexAcpPromptForFreshSession({
                         prompt: providerDispatch.text,
-                        startedFreshSession: startedFreshSessionForTurn,
+                        startedFreshSession: needsSystemPrompt,
                         systemPromptText,
                     });
                     didAttemptProviderSend = true;
