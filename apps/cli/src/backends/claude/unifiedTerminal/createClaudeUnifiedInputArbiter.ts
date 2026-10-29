@@ -699,10 +699,10 @@ export function createClaudeUnifiedInputArbiter<Mode = unknown>(opts: Readonly<{
       for (const entry of terminalCustody) {
         if (matcher(entry.batch)) matchingBatches.add(entry.batch);
       }
-      if (optsOverride.evidence !== 'prompt_submit') {
-        for (const entry of submittedSteerAcceptances) {
-          if (matcher(entry.batch)) matchingBatches.add(entry.batch);
-        }
+      // A submit hook cannot accept a steer, but that live steer still competes for
+      // the hook's identity with a later identical new-turn prompt.
+      for (const entry of submittedSteerAcceptances) {
+        if (matcher(entry.batch)) matchingBatches.add(entry.batch);
       }
       for (const batch of queue) {
         if (matcher(batch)) matchingBatches.add(batch);

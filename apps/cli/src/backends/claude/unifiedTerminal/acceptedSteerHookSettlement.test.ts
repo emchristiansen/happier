@@ -3,9 +3,102 @@ import { describe, expect, it, vi } from 'vitest';
 import type { SessionHookData } from '../utils/startHookServer';
 import { createClaudeUnifiedHookLifecycleBridge } from './createClaudeUnifiedHookLifecycleBridge';
 import { createClaudeUnifiedInputArbiter } from './createClaudeUnifiedInputArbiter';
+import { createClaudeUnifiedInFlightSteerEvaluator } from './createClaudeUnifiedInFlightSteerEvaluator';
+import { createClaudeUnifiedPromptInjector } from './createClaudeUnifiedPromptInjector';
+import { runTerminalPromptSubmission, resolveTerminalPromptSubmissionFailureReason } from '@/integrations/terminalHost/promptSubmitVerification';
 import { createClaudeUnifiedAcceptedPromptTranscriptDiscovery } from './acceptedPromptTranscriptDiscovery';
 
 describe('accepted steer hook settlement', () => {
+
+  it.each([
+    ['staging', true], ['submitted', true],
+    ['staging', false], ['submitted', false],
+  ] as const)('retains an unresolved steer as a hook identity competitor (%s, identical text: %s)', async (hookPhase, identicalText) => {
+    let hook: ((data: SessionHookData) => void) | undefined;
+    const acceptedLocalIds: string[] = [];
+    const enteredTexts: string[] = [];
+    let injectionCount = 0;
+    const firstText = 'an unresolved native steer';
+    const secondText = identicalText ? firstText : 'a distinct new turn';
+    const wiring = createClaudeUnifiedInFlightSteerEvaluator({
+      hostAdapter: {
+        captureInputState: async () => ({
+          stable: true, currentInput: '● Reading files\n✶ Forging… (42s · esc to interrupt)', observedAt: 10_000,
+        }),
+      },
+      handle: {
+        kind: 'tmux', sessionName: 'delayed-steer-hook', paneId: '%1',
+        attachMetadata: { attachStrategy: 'terminal_host', topology: 'shared', locality: 'same_machine', liveProbe: 'required' },
+      },
+      telemetry: { emit: () => {} },
+    });
+    const delayedHook = () => {
+      if (!hook) throw new Error('Claude session hook subscription was not registered');
+      hook({ hook_event_name: 'UserPromptSubmit', session_id: 'same-claude-session', prompt: firstText });
+    };
+    const injector = createClaudeUnifiedPromptInjector({
+      // Terminal capture, Enter and hook delivery are the external boundary; correlation and
+      // submission remain real, including resolveDeliveryState before Enter.
+      inputInjection: {
+        hostKind: 'tmux',
+        injectUserPrompt: async input => {
+          const isSecond = ++injectionCount === 2;
+          const result = await runTerminalPromptSubmission({
+            promptText: input.text,
+            resolveDeliveryState: input.resolveDeliveryState,
+            verifyStagedBeforeSubmit: async () => {
+              if (isSecond && hookPhase === 'staging') delayedHook();
+              return true;
+            },
+            submitEnter: async () => { enteredTexts.push(input.text); return 'success'; },
+          });
+          return result.success
+            ? { status: 'injected', at: 10_000, bytesWritten: input.text.length }
+            : { status: 'failed', reason: resolveTerminalPromptSubmissionFailureReason(result.reason), phase: result.phase, duplicateRisk: result.duplicateRisk, recoverable: true };
+        },
+      },
+    });
+    const arbiter = createClaudeUnifiedInputArbiter({
+      quietPeriodMs: 0,
+      evaluateInFlightSteer: wiring.evaluateInFlightSteer,
+      injectPrompt: injector.injectPrompt,
+      resolvePromptDeliveryState: () => 'pending',
+      onPromptInjected: wiring.observeInjectedPrompt,
+      onPromptAccepted: batch => { acceptedLocalIds.push(...(batch.userMessageLocalIds ?? [])); },
+    });
+    const bridge = createClaudeUnifiedHookLifecycleBridge({
+      subscribeClaudeSessionHooks: callback => { hook = callback; return () => { hook = undefined; }; },
+      arbiter, completionQuiescenceMs: 0,
+    });
+    try {
+      bridge.start({ abortSignal: new AbortController().signal });
+      arbiter.observeLifecycle({ type: 'turn_state', state: 'running' });
+      arbiter.observeLifecycle({ type: 'output' });
+      await arbiter.enqueueUiMessage({
+        message: firstText, origin: { kind: 'ui_pending' }, pendingProviderAction: 'steer', userMessageLocalIds: ['steer-A'],
+      });
+      await arbiter.drainWhenSafe();
+      expect(arbiter.snapshot()).toMatchObject({ queuedCount: 1, terminalCustodyCount: 0, providerAcceptancePendingCount: 0 });
+      arbiter.observeLifecycle({ type: 'turn_state', state: 'idle' });
+      await arbiter.enqueueUiMessage({ message: secondText, origin: { kind: 'ui_pending' }, userMessageLocalIds: ['turn-B'] });
+      await arbiter.drainWhenSafe();
+      if (hookPhase === 'submitted') delayedHook();
+      // The old steer hook proves neither row's consumption, and must never skip B's Enter.
+      expect(enteredTexts).toEqual([firstText, secondText]);
+      expect(acceptedLocalIds).toEqual([]);
+      expect(arbiter.snapshot()).toMatchObject({ queuedCount: 2, providerAcceptancePendingCount: 1 });
+      // Exact transcript identity can still settle either live row independently.
+      await expect(arbiter.confirmPromptAcceptedByProviderIf(batch => batch.userMessageLocalIds?.[0] === 'steer-A')).resolves.toBe(true);
+      expect(acceptedLocalIds).toEqual(['steer-A']);
+      await expect(arbiter.confirmPromptAcceptedByProviderIf(batch => batch.userMessageLocalIds?.[0] === 'turn-B')).resolves.toBe(true);
+      expect(acceptedLocalIds).toEqual(['steer-A', 'turn-B']);
+    } finally {
+      bridge.dispose();
+      wiring.dispose();
+      await arbiter.dispose();
+    }
+  });
+
   it.each(['idle', 'running'] as const)('uses an early submit hook as acceptance only for a new turn (injection state: %s)', async (turnState) => {
     let hook: ((data: SessionHookData) => void) | undefined;
     const accepted: string[] = [];
