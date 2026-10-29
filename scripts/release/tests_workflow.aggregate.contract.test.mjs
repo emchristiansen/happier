@@ -6,7 +6,6 @@ import { spawnSync } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import YAML from 'yaml';
-import { resolveVitestShardRange } from '../../apps/cli/scripts/runVitestShards.mjs';
 
 import {
   resolveVitestShardCount,
