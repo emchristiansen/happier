@@ -89,11 +89,12 @@ describe('probeSessionRunnerServiceability', () => {
   });
 
   it('never replaces a runner that is healthy, unprobeable or still recovering', () => {
-    // A healthy runner is adopted, and an unprobeable one stays fenced; neither is replaced.
+    // A healthy runner is adopted; an RPC failure waits for exit within the bounded wait.
+    // Neither permits replacement, and a persistently live runner stays fenced after timeout.
     expect(resolveSessionRunnerResumeDecision({ state: 'runner_present', control: { state: 'servable' } })).toEqual({ action: 'adopt' });
     expect(resolveSessionRunnerResumeDecision({
       state: 'runner_present', control: { state: 'unknown', reason: 'rpc_failed' },
-    })).toEqual({ action: 'fence', reason: 'rpc_failed' });
+    })).toEqual({ action: 'wait_for_exit', reason: 'rpc_failed' });
     expect(resolveSessionRunnerResumeDecision({
       state: 'runner_present', control: { state: 'recoverable_unservable', reason: 'malformed_response' },
     })).toEqual({ action: 'fence', reason: 'malformed_response' });
