@@ -46,8 +46,16 @@ function readTtlFromEnv(): number {
 
 const ttlMs = readTtlFromEnv();
 const pendingSetupIntentListeners = new Set<() => void>();
-let cachedSerializedRecord: string | null = null;
-let cachedSerializedRecordSnapshot: PendingSetupIntent | null = null;
+type ParsedPendingSetupIntent = Readonly<{
+    createdAtMs: number;
+    snapshot: PendingSetupIntent;
+}>;
+
+let cachedSerializedRecord: (ParsedPendingSetupIntent & Readonly<{ serialized: string }>) | null = null;
+
+function isExpired(createdAtMs: number): boolean {
+    return Date.now() - createdAtMs > ttlMs;
+}
 
 /** Notifies subscribers that a writer changed the persisted intent (both storage variants call it). */
 export function subscribePendingSetupIntent(listener: () => void): () => void {
@@ -65,26 +73,28 @@ export function emitPendingSetupIntentChanged(): void {
 
 /**
  * Parses a serialized record into a referentially stable snapshot: the same bytes yield the same
- * object, so `useSyncExternalStore` readers do not re-render on every read.
+ * object while valid, so `useSyncExternalStore` readers do not re-render on every read.
  */
 export function fromSerializedRecord(serialized: string | null | undefined): PendingSetupIntent | null {
     if (!serialized) {
         cachedSerializedRecord = null;
-        cachedSerializedRecordSnapshot = null;
         return null;
     }
-    if (serialized === cachedSerializedRecord && cachedSerializedRecordSnapshot) {
-        return cachedSerializedRecordSnapshot;
+    if (serialized === cachedSerializedRecord?.serialized) {
+        if (!isExpired(cachedSerializedRecord.createdAtMs)) {
+            return cachedSerializedRecord.snapshot;
+        }
+        cachedSerializedRecord = null;
+        return null;
     }
-    let parsed: PendingSetupIntent | null;
+    let parsed: ParsedPendingSetupIntent | null;
     try {
-        parsed = fromRecord(JSON.parse(serialized) as unknown);
+        parsed = parseRecord(JSON.parse(serialized) as unknown);
     } catch {
         parsed = null;
     }
-    cachedSerializedRecord = parsed ? serialized : null;
-    cachedSerializedRecordSnapshot = parsed;
-    return parsed;
+    cachedSerializedRecord = parsed ? { ...parsed, serialized } : null;
+    return parsed?.snapshot ?? null;
 }
 
 function normalizeRelayUrl(raw: string | null | undefined): string | null {
@@ -125,19 +135,26 @@ export function toRecord(value: PendingSetupIntent): PendingSetupIntentRecord | 
 }
 
 export function fromRecord(value: unknown): PendingSetupIntent | null {
+    return parseRecord(value)?.snapshot ?? null;
+}
+
+function parseRecord(value: unknown): ParsedPendingSetupIntent | null {
     if (!value || typeof value !== 'object') return null;
     const record = value as Record<string, unknown>;
     const createdAtMs = Number(record.createdAtMs ?? 0);
     if (!Number.isFinite(createdAtMs) || createdAtMs <= 0) return null;
-    if (Date.now() - createdAtMs > ttlMs) return null;
+    if (isExpired(createdAtMs)) return null;
     if (record.branch === 'thisComputer') {
         if (record.phase !== 'pre_auth' && record.phase !== 'awaiting_auth' && record.phase !== 'post_auth') {
             return null;
         }
         return {
-            branch: 'thisComputer',
-            phase: record.phase,
-            relayUrl: normalizeRelayUrl(record.relayUrl as string | null | undefined),
+            createdAtMs,
+            snapshot: {
+                branch: 'thisComputer',
+                phase: record.phase,
+                relayUrl: normalizeRelayUrl(record.relayUrl as string | null | undefined),
+            },
         };
     }
     if (record.branch === 'remoteMachine') {
@@ -145,10 +162,13 @@ export function fromRecord(value: unknown): PendingSetupIntent | null {
             return null;
         }
         return {
-            branch: 'remoteMachine',
-            phase: record.phase,
-            relayUrl: normalizeRelayUrl(record.relayUrl as string | null | undefined),
-            machineId: normalizeMachineId(record.machineId as string | null | undefined),
+            createdAtMs,
+            snapshot: {
+                branch: 'remoteMachine',
+                phase: record.phase,
+                relayUrl: normalizeRelayUrl(record.relayUrl as string | null | undefined),
+                machineId: normalizeMachineId(record.machineId as string | null | undefined),
+            },
         };
     }
     return null;

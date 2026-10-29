@@ -40,6 +40,37 @@ describe('pendingSetupIntent', () => {
         const { clearPendingSetupIntent } = await importFresh();
         clearPendingSetupIntent();
         vi.restoreAllMocks();
+        vi.unstubAllEnvs();
+    });
+
+    it.each([
+        ['default', undefined, 24 * 60 * 60 * 1000],
+        ['configured', '1000', 1000],
+    ] as const)('expires a warmed setup intent after its %s TTL without changing persisted bytes', async (_label, configuredTtl, ttl) => {
+        vi.stubEnv('EXPO_PUBLIC_PENDING_SETUP_INTENT_TTL_MS', configuredTtl);
+        const now = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+        const createdAt = Date.now();
+        const { clearPendingSetupIntent, setPendingSetupIntent, getPendingSetupIntent } = await importFresh();
+        await activateServerAccount('https://setup-expiry.example.test', 'account-a');
+        clearPendingSetupIntent();
+        setPendingSetupIntent({
+            branch: 'remoteMachine',
+            phase: 'awaiting_auth',
+            relayUrl: 'https://setup-expiry.example.test',
+            machineId: 'machine-expiry',
+        });
+
+        now.mockReturnValue(createdAt + 1);
+        const snapshot = getPendingSetupIntent();
+        expect(snapshot).not.toBeNull();
+        now.mockReturnValue(createdAt + ttl);
+        expect(getPendingSetupIntent()).toBe(snapshot);
+
+        now.mockReturnValue(createdAt + ttl + 1);
+        expect(getPendingSetupIntent()).toBeNull();
+        // Expiry removes the persisted record; moving the clock back cannot revive it.
+        now.mockReturnValue(createdAt + 1);
+        expect(getPendingSetupIntent()).toBeNull();
     });
 
     it('round-trips and clears a pending setup intent payload', async () => {
