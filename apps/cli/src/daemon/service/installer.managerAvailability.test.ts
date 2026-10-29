@@ -23,6 +23,7 @@ describe('service manager availability before mutation', () => {
   it('returns a structured missing-manager error from the real JSON start command', async () => {
     await withConfiguredDaemonTestHome({ prefix: 'service-manager-start-json-', env: {
       PATH: '', HAPPIER_DAEMON_SERVICE_PLATFORM: 'linux', HAPPIER_DAEMON_SERVICE_CHANNEL: 'stable',
+      HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
       HAPPIER_DAEMON_SERVICE_UID: '123', HAPPIER_DAEMON_SERVICE_NODE_PATH: process.execPath,
       HAPPIER_DAEMON_SERVICE_ENTRY_PATH: process.argv[1],
     } }, async ({ homeDir }) => {
@@ -74,6 +75,7 @@ describe('service manager availability before mutation', () => {
   it.each(['start', 'restart'] as const)('preserves a drifted definition before %s with no manager', async (action) => {
     await withConfiguredDaemonTestHome({ prefix: 'service-manager-drift-', env: {
       PATH: '', HAPPIER_DAEMON_SERVICE_PLATFORM: 'linux', HAPPIER_DAEMON_SERVICE_CHANNEL: 'stable',
+      HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
       HAPPIER_DAEMON_SERVICE_UID: '123', HAPPIER_DAEMON_SERVICE_NODE_PATH: process.execPath,
       HAPPIER_DAEMON_SERVICE_ENTRY_PATH: process.argv[1],
     } }, async ({ homeDir }) => {
