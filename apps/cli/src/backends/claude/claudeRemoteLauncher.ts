@@ -431,6 +431,7 @@ export async function claudeRemoteLauncher(
     let staticControl: RemoteModeStaticControl | null = null;
     // Handle abort
     let exitReason: 'switch' | 'exit' | null = null;
+    let providerTerminationUnverified = false;
     let abortController: AbortController | null = null;
     let abortFuture: Future<void> | null = null;
     let turnInterrupt: (() => Promise<void>) | null = null;
@@ -2228,6 +2229,9 @@ export async function claudeRemoteLauncher(
                     runtimeTerminationStarted,
                 });
 
+                // Refusing replacement does not prove that the native query and its tasks ended.
+                providerTerminationUnverified ||= hasUnverifiedProviderTermination(e);
+
                 const errorDisposition = resolveClaudeRemoteLaunchErrorDisposition({
                     exitReason,
                     runtimeTerminationStarted,
@@ -2364,14 +2368,18 @@ export async function claudeRemoteLauncher(
         goalWorkStateSource.finalizeInterruptedGoalOnShutdown();
 
         // RULING-14: workflow runs, their agents and their `Task` children all live INSIDE the
-        // Claude query, so this teardown is the observation that they are over — resolve them
+        // Claude query. When provider termination is verified, resolve them
         // (`stopped`/`interrupted` + `cancelled` agents, never `failed`) before draining, exactly as
         // the goal source does three lines above. Without this a run and its agents stay painted as
         // live forever. Happier execution runs are untouched: they own their own backend and query,
         // genuinely outlive this process, and are answered by their pid-backed marker registry.
+        // An unverified native exit retains the last observed workflow state; still flush real
+        // journal observations, but do not manufacture stopped runs or cancelled agents.
         if (workflowActivitySource) {
             try {
-                workflowActivitySource.finalizeInterruptedActivityOnShutdown();
+                if (!providerTerminationUnverified) {
+                    workflowActivitySource.finalizeInterruptedActivityOnShutdown();
+                }
             } catch (error) {
                 logger.debug('[remote]: failed to resolve interrupted Claude workflow activity (non-fatal)', error);
             }

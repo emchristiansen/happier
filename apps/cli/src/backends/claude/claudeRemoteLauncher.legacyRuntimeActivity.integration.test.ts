@@ -386,6 +386,57 @@ describe.sequential('claudeRemoteLauncher legacy Runtime Activity subscriber', (
     }
   });
 
+  it.each([false, true])('preserves workflow uncertainty unless provider exit is verified (verified=%s)', async (verified) => {
+    const { session } = createHarness();
+    const transcriptDir = await mkdtemp(join(tmpdir(), 'claude-workflow-exit-proof-'));
+    session.transcriptPath = join(transcriptDir, 'claude-current.jsonl');
+    await writeFile(session.transcriptPath, JSON.stringify({ type: 'user', uuid: 'previous-prompt', sessionId: 'claude-current',
+      message: { role: 'user', content: 'previous prompt' } }) + '\n');
+    await session.client.updateMetadata(metadata => ({ ...metadata, flavor: 'claude', claudeSessionId: 'claude-current' }));
+    const snapshots: SessionWorkflowRunSnapshotV1[] = [];
+    Object.assign(session.client, {
+      getStoredContentEncryptionContext: () => ({ mode: 'plain' }),
+      upsertSessionSystemRecord: async (record: { content: { t: string; v?: SessionWorkflowRunSnapshotV1 } }) => {
+        if (record.content.t === 'plain' && record.content.v?.agents) snapshots.push(record.content.v);
+      },
+    });
+    mockClaudeRemote.mockImplementation(actualClaudeRemote.claudeRemote);
+    mockQuery.mockImplementation((params: {
+      onMessageReceived?: (row: unknown) => void;
+      onProcessExited?: (event: { signal: null; nativeExited: boolean; processTreeStopped: boolean }) => Promise<void>;
+    }) => ({
+      async *[Symbol.asyncIterator]() {
+        // Only the SDK process boundary is replaced. The remote owner, launch disposition,
+        // workflow tracker, durable record projection and shutdown finalizer are real.
+        for (const row of completedNativeChildTranscript('claude-current')) {
+          params.onMessageReceived?.(row);
+          yield row;
+        }
+        await vi.waitFor(() => expect(snapshots.at(-1)?.status).toBe('complete'));
+        session.onClaudeSessionHook({ hook_event_name: 'SubagentStart', agent_id: 'native-a', session_id: 'claude-current' });
+        await vi.waitFor(() => expect(snapshots.at(-1)?.agents.find(agent => agent.id === 'a')?.status).toBe('active'));
+        session.queue.close();
+        await params.onProcessExited?.({ signal: null, nativeExited: verified, processTreeStopped: false });
+      },
+    }));
+    session.queue.push('hello', { permissionMode: 'default', claudeRemoteAgentSdkEnabled: false, claudeUnifiedTerminalEnabled: false },
+      { userMessageLocalId: 'workflow-exit-proof' });
+    try {
+      await expect(claudeRemoteLauncher(session)).resolves.toBe('exit');
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(snapshots.at(-1)?.status).toBe(verified ? 'stopped' : 'active');
+      expect(snapshots.at(-1)?.agents.find(agent => agent.id === 'a')?.status).toBe(verified ? 'cancelled' : 'active');
+      if (!verified) {
+        expect(session.client.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'message', message: expect.stringContaining('without verified native provider termination'),
+        }));
+      }
+    } finally {
+      await session.cleanup();
+      await rm(transcriptDir, { recursive: true, force: true });
+    }
+  });
+
   it.each(['matching cache', 'cached predecessor'] as const)('rebuilds cold SDK workflow aliases beyond the history tail before admitting an authenticated resume (%s)', async (identity) => {
     const activity = createSessionRuntimeActivity('supported');
     let published: SessionRuntimeActivitySnapshot = { state: 'unknown', activeCount: 0 };
