@@ -535,9 +535,9 @@ export async function updateAuthGroupMemberAndBumpGenerationInTx(tx: Tx, params:
         ? group.activeProfileId
         : resolveFirstEnabledMemberProfileId(nextMembers);
     const changesActiveProfile = group.activeProfileId !== nextActiveProfileId;
-    const clearAutomaticDisableState = params.state === undefined && params.enabled === true
+    const clearAutomaticDisableState: AuthGroupMemberState | null = params.state === undefined && params.enabled === true
         && member.enabled === false
-        && (() => {
+        ? (() => {
             if (!member.stateJson) return null;
             try {
                 const state = ConnectedServiceAuthGroupMemberStateSchema.parse(JSON.parse(member.stateJson));
@@ -547,7 +547,8 @@ export async function updateAuthGroupMemberAndBumpGenerationInTx(tx: Tx, params:
             } catch {
                 return null;
             }
-        })();
+        })()
+        : null;
     const nextMemberState = params.state ?? clearAutomaticDisableState;
     const nextMemberStateJson = nextMemberState ? JSON.stringify(nextMemberState) : null;
     const changesRuntimeState = nextMemberState !== null

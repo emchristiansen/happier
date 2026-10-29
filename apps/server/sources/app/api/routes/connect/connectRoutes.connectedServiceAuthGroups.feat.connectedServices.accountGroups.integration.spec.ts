@@ -1549,6 +1549,61 @@ describe("connectRoutes connected service auth groups (integration)", () => {
         expect(rejected.json()).toEqual({ error: "connect_group_active_profile_not_member" });
     });
 
+    it.each([
+        { label: "changed priority", initiallyEnabled: true, patch: { priority: 42 }, changed: true },
+        { label: "unchanged priority", initiallyEnabled: true, patch: { priority: 10 }, changed: false },
+        { label: "disable", initiallyEnabled: true, patch: { enabled: false }, changed: true },
+        { label: "already enabled", initiallyEnabled: true, patch: { enabled: true }, changed: false },
+        { label: "already disabled", initiallyEnabled: false, patch: { enabled: false }, changed: false },
+        { label: "re-enable unrelated quota state", initiallyEnabled: false, patch: { enabled: true }, changed: true },
+        { label: "empty patch", initiallyEnabled: true, patch: {}, changed: false },
+    ])("preserves member runtime state during metadata-only $label", async ({ label, initiallyEnabled, patch, changed }) => {
+        const user = await createAccount(`pk-groups-runtime-preserved-${label}`);
+        await createConnectedProfile(user.id, "openai-codex", "work");
+        const app = await createReadyApp();
+        const created = await app.inject({
+            method: "POST",
+            url: "/v3/connect/openai-codex/groups",
+            headers: authHeaders(user.id),
+            payload: { groupId: "codex-main", members: [{ profileId: "work", priority: 10, enabled: initiallyEnabled }] },
+        });
+        expect(created.statusCode).toBe(200);
+        const state = { quotaExhaustedUntilMs: Date.now() + 3_600_000, lastFailureKind: "usage_limit" };
+        const stateJson = JSON.stringify(state);
+        const memberKey = { accountId: user.id, vendor: "openai-codex", groupId: "codex-main", profileId: "work" };
+        await db.connectedServiceAuthGroupMember.update({
+            where: { accountId_vendor_groupId_profileId: memberKey },
+            data: { stateJson },
+        });
+        await db.connectedServiceAuthGroup.update({
+            where: { accountId_vendor_groupId: { accountId: user.id, vendor: "openai-codex", groupId: "codex-main" } },
+            data: { runtimeStateRevision: 4 },
+        });
+        const cursorBefore = await readAccountChangeCursor(user.id);
+        emitUpdate.mockClear();
+
+        const updated = await app.inject({
+            method: "PATCH",
+            url: "/v3/connect/openai-codex/groups/codex-main/members/work",
+            headers: authHeaders(user.id),
+            payload: { expectedGeneration: 0, ...patch },
+        });
+        expect(updated.statusCode).toBe(200);
+        expect(updated.json().group).toMatchObject({
+            generation: changed ? 1 : 0,
+            runtimeStateRevision: 4,
+            members: [expect.objectContaining({ profileId: "work", state, ...patch })],
+        });
+        expect(await db.connectedServiceAuthGroupMember.findUnique({
+            where: { accountId_vendor_groupId_profileId: memberKey },
+            select: { stateJson: true },
+        })).toEqual({ stateJson });
+        if (!changed) {
+            expect(await readAccountChangeCursor(user.id)).toBe(cursorBefore);
+            expect(emitUpdate).not.toHaveBeenCalled();
+        }
+    });
+
     it("bumps generation for member additions, updates, and non-active removals", async () => {
         const user = await createAccount("pk-groups-members");
         await createConnectedProfile(user.id, "openai-codex", "work");
