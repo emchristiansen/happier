@@ -222,6 +222,90 @@ describe('createCoalescedWorkflowActivityPublisher', () => {
     expect(records.filter((record) => record.runId === 'a')).toHaveLength(5);
   });
 
+  it.each(['status', 'roster'] as const)('keeps committed %s fields while another run publishes during retry backoff', async (change) => {
+    const active: SessionWorkflowRunSnapshotV1 = {
+      ...runSnapshot('a'),
+      agents: [{ id: 'first', title: 'First agent', status: 'active', updatedAt: 1000 }],
+    };
+    const snapshots = new Map([['a', active]]);
+    const records: SessionWorkflowRunSnapshotV1[] = [];
+    const attempts: SessionWorkflowRunSnapshotV1[] = [];
+    const headlines: SessionActivityHeadlineBundle[] = [];
+    let available = true;
+    const publisher = createWorkflowActivityPublisher({
+      backendId: 'claude',
+      commitRecord: async (snapshot) => {
+        attempts.push(snapshot);
+        if (snapshot.runId === 'a' && !available) throw createHttpStatusError(503, 'Unavailable');
+        records.push(snapshot);
+      },
+      writeHeadlines: (bundle) => { headlines.push(bundle); },
+    });
+    const scheduler = createCoalescedWorkflowActivityPublisher({ publisher, getSnapshots: () => snapshots });
+    const notify = (runId: string) => scheduler.notify({ changedRunIds: [runId], startedRunIds: [], terminalRunIds: [], statusChangedRunIds: [runId] });
+    try {
+      notify('a');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(records[0]).toMatchObject({ runId: 'a', recordRevision: '1', status: 'active', totalAgents: 1 });
+
+      available = false;
+      const candidate: SessionWorkflowRunSnapshotV1 = change === 'status'
+        ? { ...active, status: 'complete', completedAgents: 1, updatedAt: 2000, agents: [{ ...active.agents[0]!, status: 'complete', completedAt: 2000, updatedAt: 2000 }] }
+        : { ...active, totalAgents: 2, updatedAt: 2000, agents: [...active.agents, { id: 'second', title: 'Second agent', status: 'active', updatedAt: 2000 }] };
+      snapshots.set('a', candidate);
+      notify('a');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(attempts.filter((snapshot) => snapshot.runId === 'a')).toHaveLength(2);
+      snapshots.set('b', runSnapshot('b'));
+      notify('b');
+      await vi.advanceTimersByTimeAsync(0);
+      const duringBackoff = headlines.at(-1)!;
+      expect(records.map((snapshot) => snapshot.runId)).toEqual(['a', 'b']);
+      expect(attempts.filter((snapshot) => snapshot.runId === 'a')).toHaveLength(2);
+      expect(duringBackoff.workflow.activeRuns.find((run) => run.runId === 'b')).toMatchObject({ recordRevision: '1' });
+      expect(duringBackoff.workflow.activeRuns.find((run) => run.runId === 'a')).toMatchObject({ status: 'active', totalAgents: 1, completedAgents: 0, recordRevision: '1' });
+      expect(duringBackoff.agentActivity.activeEntries.filter((entry) => entry.runId === 'a')).toEqual(expect.arrayContaining([
+        expect.objectContaining({ entryId: 'workflow_run:a', status: 'running', recordRevision: '1' }),
+        expect.objectContaining({ entryId: 'workflow_agent:a:first', status: 'running' }),
+      ]));
+      expect(duringBackoff.agentActivity.activeEntries.filter((entry) => entry.runId === 'a')).toHaveLength(2);
+
+      available = true;
+      await vi.advanceTimersByTimeAsync(499);
+      expect(attempts.filter((snapshot) => snapshot.runId === 'a')).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(records.at(-1)).toMatchObject({ ...candidate, recordRevision: '2' });
+      const recovered = headlines.at(-1)!;
+      expect([...recovered.workflow.activeRuns, ...(recovered.workflow.recentRuns ?? [])].find((run) => run.runId === 'a')).toMatchObject({ status: candidate.status, totalAgents: candidate.totalAgents, recordRevision: '2' });
+      expect([...recovered.agentActivity.activeEntries, ...(recovered.agentActivity.recentEntries ?? [])].find((entry) => entry.entryId === 'workflow_run:a')).toMatchObject({ recordRevision: '2' });
+    } finally {
+      scheduler.dispose();
+    }
+  });
+
+  it('refreshes committed ordering timestamps while another run publishes without rewriting the record', async () => {
+    const active: SessionWorkflowRunSnapshotV1 = { ...runSnapshot('a'), agents: [{ id: 'first', title: 'First agent', status: 'active', updatedAt: 1000 }] };
+    const snapshots = new Map([['a', active]]);
+    const records: SessionWorkflowRunSnapshotV1[] = [];
+    const headlines: SessionActivityHeadlineBundle[] = [];
+    const publisher = createWorkflowActivityPublisher({ backendId: 'claude', commitRecord: async (snapshot) => { records.push(snapshot); }, writeHeadlines: (bundle) => { headlines.push(bundle); } });
+    const scheduler = createCoalescedWorkflowActivityPublisher({ publisher, getSnapshots: () => snapshots });
+    const notify = (runId: string) => scheduler.notify({ changedRunIds: [runId], startedRunIds: [runId], terminalRunIds: [], statusChangedRunIds: [] });
+    try {
+      notify('a');
+      await vi.advanceTimersByTimeAsync(0);
+      snapshots.set('a', { ...active, updatedAt: 3000, agents: [{ ...active.agents[0]!, updatedAt: 3000 }] });
+      snapshots.set('b', runSnapshot('b'));
+      notify('b');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(records.filter((snapshot) => snapshot.runId === 'a')).toHaveLength(1);
+      expect(headlines.at(-1)!.workflow.activeRuns.find((run) => run.runId === 'a')).toMatchObject({ updatedAt: 3000, recordRevision: '1' });
+      expect(headlines.at(-1)!.agentActivity.activeEntries.find((entry) => entry.entryId === 'workflow_agent:a:first')).toMatchObject({ updatedAt: 3000, status: 'running' });
+    } finally {
+      scheduler.dispose();
+    }
+  });
+
   it('flush leaves failed durable writes on the delayed retry path instead of retrying in a tight loop', async () => {
     let available = false;
     const records: SessionWorkflowRunSnapshotV1[] = [];

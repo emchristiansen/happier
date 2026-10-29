@@ -78,11 +78,11 @@ type CommittedRunState = Readonly<{
   /** The snapshot whose durable record is committed. Owns `recordRevision`. */
   snapshot: SessionWorkflowRunSnapshotV1;
   /**
-   * The newest projected snapshot for this run, used for DISPLAY fields only.
+   * The newest projected snapshot with the same material state as the committed record.
    *
-   * Mirrors what the workflow headline already does for unchanged runs: display can move ahead of
-   * the last durable write, the record pointer cannot. Keeping it lets the agent-activity entries
-   * (which read `agents[]`) stay as fresh as the run headline's counts, from one shared value.
+   * Ordering timestamps can move ahead without another durable write. Status, counts and roster
+   * remain backed by the committed revision, including while a material update awaits retry.
+   * Both headlines use this same projection.
    */
   display: SessionWorkflowRunSnapshotV1;
   headline: SessionWorkflowRunHeadlineV1;
@@ -216,13 +216,14 @@ export function createWorkflowActivityPublisher(params: Readonly<{
       if (!input.snapshots.has(runId)) committedByRun.delete(runId);
     }
 
-    // For unchanged runs that already committed, refresh their headline projection from the latest
-    // snapshot WITHOUT advancing recordRevision/recordUpdatedAt (display fields like status order may
-    // shift), but only when the committed revision still matches — otherwise keep the committed entry.
+    // Omission from this drain's changed ids can mean a dirty run is waiting for its retry deadline.
+    // Refresh ordering clocks only when the latest snapshot still matches the committed material
+    // state; a pending status/count/roster change must wait for its durable write.
     for (const [runId, snapshot] of input.snapshots) {
       if (changed.has(runId)) continue;
       const committed = committedByRun.get(runId);
       if (!committed) continue;
+      if (isWorkflowRunSnapshotMaterialChange(committed.snapshot, snapshot)) continue;
       const refreshedSnapshot: SessionWorkflowRunSnapshotV1 = {
         ...snapshot,
         recordRevision: committed.snapshot.recordRevision,
