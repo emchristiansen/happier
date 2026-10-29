@@ -80,6 +80,17 @@ export function shouldVerifyStackServerProfileReconciliation(homeDir) {
   );
 }
 
+function profileEndpointMatches(actual, expected) {
+  // Match the CLI's normalizeUrlOrThrow serialization before it persists endpoints.
+  // Server identity keys are broader than endpoint equality; keep paths and queries distinct.
+  const serialize = (value) => new URL(value).toString().replace(/\/+$/, '');
+  try {
+    return serialize(actual) === serialize(expected);
+  } catch {
+    return false;
+  }
+}
+
 export function assertStackServerProfileReconciled({
   homeDir,
   serverId,
@@ -103,9 +114,9 @@ export function assertStackServerProfileReconciled({
   else if (!rawProfile || typeof rawProfile !== 'object') reason = `profile ${expectedId} was not written`;
   else if (!profile) reason = `profile ${expectedId} is incomplete`;
   else if (profile.id !== expectedId) reason = `profile ${expectedId} has a different identity`;
-  else if (profile.serverUrl !== expectedInternalUrl) reason = 'relay URL was not updated';
-  else if ((profile.localServerUrl ?? profile.serverUrl) !== expectedInternalUrl) reason = 'local relay URL was not updated';
-  else if (profile.webappUrl !== expectedPublicUrl) reason = 'web app URL was not updated';
+  else if (!profileEndpointMatches(profile.serverUrl, expectedInternalUrl)) reason = 'relay URL was not updated';
+  else if (!profileEndpointMatches(profile.localServerUrl ?? profile.serverUrl, expectedInternalUrl)) reason = 'local relay URL was not updated';
+  else if (!profileEndpointMatches(profile.webappUrl, expectedPublicUrl)) reason = 'web app URL was not updated';
 
   if (!reason) return;
   const error = new Error(

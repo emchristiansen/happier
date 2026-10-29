@@ -39,3 +39,18 @@ test('assertStackServerProfileReconciled rejects a profile whose split local URL
     { code: 'ESTACKCLIPROFILERECONCILIATION', message: /local relay URL was not updated/ },
   );
 });
+
+test('assertStackServerProfileReconciled rejects a different webapp query after URL serialization', (t) => {
+  const fixture = createTempFixtureSync(t, { prefix: 'hstack-profile-stale-webapp-' });
+  writeCliSettings(fixture, { serverUrl: internalServerUrl, webappUrl: 'https://example.com/console?account=other' });
+
+  assert.throws(
+    () => assertStackServerProfileReconciled({
+      homeDir: fixture.root,
+      serverId,
+      internalServerUrl,
+      publicServerUrl: 'https://EXAMPLE.com:443/console?account=expected',
+    }),
+    { code: 'ESTACKCLIPROFILERECONCILIATION', message: /web app URL was not updated/ },
+  );
+});
