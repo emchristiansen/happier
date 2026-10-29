@@ -105,7 +105,9 @@ async function withOwnedLockfile<T>(params: Readonly<{
       if (current !== null && (current.pid === process.pid || isProcessAlive(current.pid))) {
         throw await busy();
       }
-      await rm(lockfilePath, { force: true });
+      // A missing or unreadable holder is not authority to unlink: a normal acquirer may
+      // create its live lock after this read. Exclusive creation below decides that race.
+      if (current !== null) await rm(lockfilePath, { force: true });
       if (!(await tryCreateLockfile(lockfilePath, content))) {
         throw await busy();
       }

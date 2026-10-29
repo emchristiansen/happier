@@ -5,12 +5,14 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
- * The file system is real; only `rm` of the lock file itself is gated, to hold two reclaimers of
- * the same stale lock at the exact interleaving that used to let the second delete the first's
- * fresh lock.
+ * The file system is real. Gates delay lock removal or delivery of a completed lock read to
+ * exercise competing stale reclaimers and a late reclaimer racing a normal fresh acquisition.
+ * No lock decision or acquisition result is mocked.
  */
 const gate = vi.hoisted(() => ({
   lockfilePath: '',
+  readPath: '',
+  afterRead: null as ((missing: boolean) => Promise<void>) | null,
   /** The first removal proceeds once this settles. */
   firstMayProceed: null as Promise<void> | null,
   signalSecondArrived: () => {},
@@ -23,6 +25,17 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   let lockRemovalCalls = 0;
   return {
     ...actual,
+    readFile: vi.fn(async (...args: Parameters<typeof actual.readFile>) => {
+      let content;
+      try {
+        content = await actual.readFile(...args);
+      } catch (error) {
+        if (String(args[0]) === gate.readPath) await gate.afterRead?.(true);
+        throw error;
+      }
+      if (String(args[0]) === gate.readPath) await gate.afterRead?.(false);
+      return content;
+    }),
     rm: vi.fn(async (...args: Parameters<typeof actual.rm>) => {
       if (gate.lockfilePath && String(args[0]) === gate.lockfilePath) {
         lockRemovalCalls += 1;
@@ -50,6 +63,8 @@ describe('withFirstPartyPayloadMutationLock', () => {
   });
   afterEach(async () => {
     gate.lockfilePath = '';
+    gate.readPath = '';
+    gate.afterRead = null;
     gate.firstMayProceed = null;
     gate.secondMayProceed = null;
     await rm(homeDir, { recursive: true, force: true });
@@ -100,5 +115,64 @@ describe('withFirstPartyPayloadMutationLock', () => {
     expect(results.find((result) => result.status === 'rejected')).toMatchObject({
       reason: { code: 'FIRST_PARTY_PAYLOAD_MUTATION_IN_PROGRESS' },
     });
+  });
+
+  it("does not let a late stale reclaimer remove a normal acquirer's live lock", async () => {
+    const layout = resolveFirstPartyInstallLayout({ componentId: 'happier-cli', processEnv: { HAPPIER_HOME_DIR: homeDir } });
+    const lockfilePath = `${layout.installRoot}.mutation.lock`;
+    await writeFile(lockfilePath, JSON.stringify({ pid: DEAD_PID, acquiredAt: 1 }));
+    const deferred = () => {
+      let resolve: () => void = () => {};
+      const promise = new Promise<void>((settle) => { resolve = settle; });
+      return { promise, resolve };
+    };
+    const staleRead = deferred();
+    const letStaleReadReturn = deferred();
+    const missingRead = deferred();
+    const letMissingReadReturn = deferred();
+    const normalEntered = deferred();
+    const lateSettled = deferred();
+    let firstRead = true;
+    let holdMissing = false;
+    gate.readPath = lockfilePath;
+    gate.afterRead = async (missing) => {
+      if (firstRead) {
+        firstRead = false;
+        staleRead.resolve();
+        await letStaleReadReturn.promise;
+      } else if (missing && holdMissing) {
+        holdMissing = false;
+        missingRead.resolve();
+        await letMissingReadReturn.promise;
+      }
+    };
+
+    let running = 0;
+    let maxConcurrent = 0;
+    const mutate = async (hold: Promise<void>) => {
+      running += 1;
+      maxConcurrent = Math.max(maxConcurrent, running);
+      normalEntered.resolve();
+      await hold;
+      running -= 1;
+    };
+    // A keeps a stale snapshot while B reclaims, completes and releases the real lock.
+    const late = withFirstPartyPayloadMutationLock({ layout, operation: () => mutate(Promise.resolve()) })
+      .finally(() => lateSettled.resolve());
+    const lateResult = Promise.allSettled([late]);
+    await staleRead.promise;
+    await withFirstPartyPayloadMutationLock({ layout, operation: async () => {} });
+    holdMissing = true;
+    letStaleReadReturn.resolve();
+    await missingRead.promise;
+    // C acquires normally after A's guarded missing read, before A can continue.
+    const normal = withFirstPartyPayloadMutationLock({ layout, operation: () => mutate(lateSettled.promise) });
+    const normalResult = Promise.allSettled([normal]);
+    await normalEntered.promise;
+    letMissingReadReturn.resolve();
+    const [lateResults, normalResults] = await Promise.all([lateResult, normalResult]);
+    expect(maxConcurrent).toBe(1);
+    expect(lateResults[0]).toMatchObject({ status: 'rejected', reason: { code: 'FIRST_PARTY_PAYLOAD_MUTATION_IN_PROGRESS' } });
+    expect(normalResults[0].status).toBe('fulfilled');
   });
 });
