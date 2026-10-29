@@ -232,7 +232,7 @@ describe('metro.config.js (web)', () => {
 
             expect(resolved).toEqual({
                 type: 'sourceFile',
-                filePath: generatedWorkletPath,
+                filePath: realpathSync(generatedWorkletPath),
             });
         } finally {
             rmSync(generatedWorkletPath, { force: true });
@@ -284,20 +284,22 @@ describe('metro.config.js (web)', () => {
     it('does not watch generated Worklets Bundle Mode modules by default', () => {
         const uiDir = getUiDir();
         const config = loadMetroConfig({ HAPPIER_UI_WORKLETS_BUNDLE_MODE: '0' });
+        const workletsPackageRoot = dirname(require.resolve('react-native-worklets/package.json', { paths: [uiDir] }));
 
         expect(config.watchFolders).toEqual(expect.not.arrayContaining([
-            join(uiDir, 'node_modules/react-native-worklets/__generatedWorklets'),
-            join(uiDir, 'node_modules/react-native-worklets/.worklets'),
+            join(workletsPackageRoot, '__generatedWorklets'),
+            join(workletsPackageRoot, '.worklets'),
         ]));
     });
 
     it('watches generated Worklets Bundle Mode modules when explicitly enabled', () => {
         const uiDir = getUiDir();
         const config = loadMetroConfig({ HAPPIER_UI_WORKLETS_BUNDLE_MODE: '1' });
+        const workletsPackageRoot = dirname(require.resolve('react-native-worklets/package.json', { paths: [uiDir] }));
 
         expect(config.watchFolders).toEqual(expect.arrayContaining([
-            join(uiDir, 'node_modules/react-native-worklets/__generatedWorklets'),
-            join(uiDir, 'node_modules/react-native-worklets/.worklets'),
+            join(workletsPackageRoot, '__generatedWorklets'),
+            join(workletsPackageRoot, '.worklets'),
         ]));
     });
 
