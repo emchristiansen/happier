@@ -133,6 +133,7 @@ describe('daemonServiceInventory', () => {
                 HAPPIER_DAEMON_SERVICE_USER_HOME_DIR: homeDir,
                 HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR: join(homeDir, '.happier'),
                 HAPPIER_DAEMON_SERVICE_CHANNEL: 'stable',
+                HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
             });
             vi.resetModules();
 

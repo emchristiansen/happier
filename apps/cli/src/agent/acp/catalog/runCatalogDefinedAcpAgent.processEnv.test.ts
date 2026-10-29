@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ApiClient } from '@/api/api';
 import type { AgentState } from '@/api/types';
@@ -17,7 +17,10 @@ import { PendingQueueMaterializationAuthError } from '@/agent/runtime/sessionInp
 import { runCatalogDefinedAcpAgent } from './runCatalogDefinedAcpAgent';
 import { runConfiguredAcpBackend } from './configured/runConfiguredAcpBackend';
 
-const env = createEnvKeyScope(['HAPPIER_KIRO_PATH', 'HAPPIER_SESSION_ID', 'HAPPIER_ACP_ENV_CAPTURE_PATH']);
+const env = createEnvKeyScope(['HAPPIER_KIRO_PATH', 'HAPPIER_SESSION_ID', 'HAPPIER_ACP_ENV_CAPTURE_PATH', 'HAPPIER_DAEMON_PENDING_FIRST_INPUT']);
+beforeEach(() => {
+  env.patch({ HAPPIER_DAEMON_PENDING_FIRST_INPUT: undefined });
+});
 afterEach(() => {
   vi.restoreAllMocks();
   env.restore();

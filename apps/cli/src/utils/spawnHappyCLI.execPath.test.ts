@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { withTempDir } from '@/testkit/fs/tempDir';
 import {
   createSpawnHappyCliEnvScope,
@@ -10,6 +11,12 @@ import {
 
 describe('spawnHappyCLI runtime executable selection', () => {
   const envScope = createSpawnHappyCliEnvScope();
+  const runtimeEnvScope = createEnvKeyScope(['HAPPIER_JS_RUNTIME_PATH', 'HAPPIER_NODE_PATH']);
+
+  beforeEach(() => {
+    runtimeEnvScope.patch({ HAPPIER_JS_RUNTIME_PATH: undefined, HAPPIER_NODE_PATH: undefined });
+    envScope.patch({ HAPPIER_MANAGED_NODE_BIN: undefined });
+  });
   const originalGlobalBun = (globalThis as typeof globalThis & { Bun?: unknown }).Bun;
   const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
 
@@ -18,6 +25,7 @@ describe('spawnHappyCLI runtime executable selection', () => {
     vi.resetModules();
     vi.restoreAllMocks();
     envScope.restore();
+    runtimeEnvScope.restore();
 
     if (originalGlobalBun === undefined) {
       delete (globalThis as typeof globalThis & { Bun?: unknown }).Bun;
