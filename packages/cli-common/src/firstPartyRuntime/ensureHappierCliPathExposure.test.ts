@@ -68,6 +68,33 @@ posixOnly('ensureHappierCliPathExposure (POSIX shell profiles)', () => {
         expect(renderHappierCliPathExportLine(binDir)).toBe(template.replace('${BIN_DIR}', binDir));
     });
 
+    it.each([
+        'price$cash',
+        'double"quote',
+        "single'quote",
+        'back\\slash',
+        'backtick`printf EXPANDED`',
+        'sub$(printf EXPANDED)',
+    ])('keeps literal PATH bytes, deduplication and removal for %s', async (directory) => {
+        const homeDir = await createHome();
+        const binDir = join(homeDir, directory, 'bin');
+        const processEnv = { HOME: homeDir, SHELL: '/bin/sh' };
+        const profile = join(homeDir, '.profile');
+        const original = '# existing fixture content\n';
+        await writeFile(profile, original);
+        await expect(ensureHappierCliPathExposure({ binDir, processEnv })).resolves.toMatchObject({ changed: true, failure: null });
+        await expect(ensureHappierCliPathExposure({ binDir, processEnv })).resolves.toMatchObject({ changed: false, failure: null });
+        // A non-login shell reads only the generated disposable profile. The original PATH still expands.
+        // The deliberately unescaped substitutions would run only the harmless printf builtin.
+        const { execFileSync } = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+        const observed = execFileSync('/bin/sh', ['-c', ". \"$1\"; printf '%s' \"$PATH\"", 'profile-fixture', profile], {
+            env: { PATH: '/original/one:/original/two', cash: 'EXPANDED' }, encoding: 'utf8',
+        });
+        expect(observed).toBe(`${binDir}:/original/one:/original/two`);
+        await expect(removeHappierCliPathExposure({ processEnv })).resolves.toEqual({ removed: true, failure: null });
+        expect(await readFile(profile, 'utf8')).toBe(original);
+    });
+
     it('appends the marked export line once and treats a second call as a no-op', async () => {
         const homeDir = await createHome();
         const binDir = join(homeDir, '.happier', 'bin');
@@ -130,6 +157,17 @@ posixOnly('ensureHappierCliPathExposure (POSIX shell profiles)', () => {
 
         const removedAgain = await removeHappierCliPathExposure({ processEnv });
         expect(removedAgain).toEqual({ removed: false, failure: null });
+    });
+
+    it('still removes marked legacy export lines containing literal backslashes', async () => {
+        const homeDir = await createHome();
+        const profile = join(homeDir, '.profile');
+        const legacyLine = 'export PATH="/home/example/back\\slash/bin:$PATH"';
+        const original = `${legacyLine}\n# retained user content\n`;
+        await writeFile(profile, `${original}\n${HAPPIER_DESKTOP_PATH_MARKER_LINE}\n${legacyLine}\n`);
+
+        await expect(removeHappierCliPathExposure({ processEnv: { HOME: homeDir } })).resolves.toEqual({ removed: true, failure: null });
+        expect(await readFile(profile, 'utf8')).toBe(original);
     });
 
     it('removes profiles written under a previous shell and keeps an unmarked identical line', async () => {
@@ -436,6 +474,44 @@ describe('Windows user PATH transport', () => {
         execFileMock.mockReset();
     });
 
+    it('round trips an absent user PATH through adding and removing the sole Desktop entry', async () => {
+        setPlatform('win32');
+        const binDir = 'C:\\Users\\example\\.happier\\bin';
+        const processEnv = { SystemRoot: 'C:\\Windows' };
+        let userPath: string | null = null;
+        let provenance: string | null = null;
+        const written: string[] = [];
+        execFileMock.mockImplementation((_command, args, options, callback) => {
+            const script = args[args.length - 1] ?? '';
+            if (script.includes('ConvertTo-Json')) {
+                callback(null, JSON.stringify({ userPath, userPathKind: 'ExpandString', provenance, moves: null }), '');
+                return;
+            }
+            // Qualify the generated child transport without pretending to execute Windows registry writes.
+            const transported = options.env?.HAPPIER_PATH_USER_PATH_JSON;
+            expect(typeof transported).toBe('string');
+            expect(transported).not.toBe('');
+            const decoded = JSON.parse(transported ?? 'null') as { userPath: string };
+            expect(typeof decoded.userPath).toBe('string');
+            expect(script).toContain('ConvertFrom-Json');
+            expect(script).toContain("if (-not $UserPathJson) { throw 'HAPPIER_PATH_USER_PATH_JSON is not set.' }");
+            expect(script).toContain("$Payload.PSObject.Properties.Name -contains 'userPath'");
+            expect(script).toContain('$Payload.userPath -isnot [string]');
+            expect(script.indexOf('ConvertFrom-Json')).toBeLessThan(script.indexOf('OpenSubKey'));
+            expect(script.indexOf('$Payload.userPath -isnot [string]')).toBeLessThan(script.indexOf('OpenSubKey'));
+            expect(script).not.toContain('if (-not $UserPath)');
+            userPath = decoded.userPath;
+            provenance = options.env?.HAPPIER_PATH_PROVENANCE_VALUE || null;
+            written.push(userPath);
+            callback(null, '', '');
+        });
+        await expect(ensureHappierCliPathExposure({ binDir, processEnv })).resolves.toMatchObject({ changed: true, failure: null });
+        await expect(removeHappierCliPathExposure({ processEnv })).resolves.toEqual({ removed: true, failure: null });
+        expect(written).toEqual([binDir, '']);
+        expect(userPath).toBe('');
+        expect(provenance).toBeNull();
+    });
+
     it('carries the whole user PATH through the child environment, never as -Command argv', async () => {
         setPlatform('win32');
         const binDir = 'C:\\Users\\example\\.happier\\bin';
@@ -470,7 +546,7 @@ describe('Windows user PATH transport', () => {
         const [, , writeOptions] = execFileMock.mock.calls[1] ?? [];
         expect(writeOptions?.env).toEqual(expect.objectContaining({
             SystemRoot: 'C:\\Windows',
-            HAPPIER_PATH_USER_PATH: `${binDir};${userPath}`,
+            HAPPIER_PATH_USER_PATH_JSON: JSON.stringify({ userPath: `${binDir};${userPath}` }),
             HAPPIER_PATH_VALUE_KIND: 'ExpandString',
             HAPPIER_PATH_PROVENANCE_NAME: HAPPIER_DESKTOP_WINDOWS_PATH_PROVENANCE_VARIABLE,
             HAPPIER_PATH_PROVENANCE_VALUE: binDir,
@@ -504,7 +580,7 @@ describe('Windows user PATH transport', () => {
             }
         }
         expect(writeOptions?.env).toEqual(expect.objectContaining({
-            HAPPIER_PATH_USER_PATH: `${npmDir};${binDir}`,
+            HAPPIER_PATH_USER_PATH_JSON: JSON.stringify({ userPath: `${npmDir};${binDir}` }),
             HAPPIER_PATH_MOVES_NAME: HAPPIER_DESKTOP_WINDOWS_PATH_MOVES_VARIABLE,
             HAPPIER_PATH_MOVES_VALUE: '',
         }));

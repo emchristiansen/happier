@@ -48,10 +48,17 @@ export const HAPPIER_DESKTOP_WINDOWS_PATH_PROVENANCE_VARIABLE = 'HAPPIER_DESKTOP
  */
 export const HAPPIER_DESKTOP_WINDOWS_PATH_MOVES_VARIABLE = 'HAPPIER_DESKTOP_PATH_MOVES';
 
+// Keep recognizing earlier marked lines, including their literal backslashes, while also
+// recognizing quotes escaped by the current writer. Unmarked user/installer lines stay untouched.
 const DESKTOP_EXPORT_LINE_PATTERN = /^export PATH="[^"\n]+:\$PATH"$/u;
+const ESCAPED_DESKTOP_EXPORT_LINE_PATTERN = /^export PATH="(?:[^"\\\n]|\\[\\$`"])+:\$PATH"$/u;
+
+function escapeShellDoubleQuotedLiteral(value: string): string {
+  return value.replace(/[\\"$`]/gu, '\\$&');
+}
 
 export function renderHappierCliPathExportLine(binDir: string): string {
-  return `export PATH="${binDir}:$PATH"`;
+  return `export PATH="${escapeShellDoubleQuotedLiteral(binDir)}:$PATH"`;
 }
 
 export function resolveHappierCliShellProfilePlan(params: Readonly<{
@@ -293,7 +300,7 @@ async function ensurePosixProfileExposure(params: Readonly<{
 
   return {
     changed,
-    shellReloadHint: changed ? `Open a new terminal, or run: source "${plan.reloadFile}"` : null,
+    shellReloadHint: changed ? `Open a new terminal, or run: source "${escapeShellDoubleQuotedLiteral(plan.reloadFile)}"` : null,
     failure: failures.length > 0 ? `Could not update shell profile ${failures.join('; ')}` : null,
     existingCommand: null,
   };
@@ -306,7 +313,8 @@ function stripDesktopCreatedLines(content: string): Readonly<{ content: string; 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index] ?? '';
     const next = lines[index + 1];
-    if (line.trim() === HAPPIER_DESKTOP_PATH_MARKER_LINE && next !== undefined && DESKTOP_EXPORT_LINE_PATTERN.test(next.trim())) {
+    if (line.trim() === HAPPIER_DESKTOP_PATH_MARKER_LINE && next !== undefined
+      && (DESKTOP_EXPORT_LINE_PATTERN.test(next.trim()) || ESCAPED_DESKTOP_EXPORT_LINE_PATTERN.test(next.trim()))) {
       if (kept.length > 0 && kept[kept.length - 1] === '') {
         // Drop the separator blank line the append wrote in front of the marker.
         kept.pop();
@@ -465,7 +473,7 @@ type WindowsUserEnvironmentSnapshot = Readonly<{
  */
 const WINDOWS_SCRIPT_ENV = {
   provenanceName: 'HAPPIER_PATH_PROVENANCE_NAME',
-  userPath: 'HAPPIER_PATH_USER_PATH',
+  userPathJson: 'HAPPIER_PATH_USER_PATH_JSON',
   valueKind: 'HAPPIER_PATH_VALUE_KIND',
   provenanceValue: 'HAPPIER_PATH_PROVENANCE_VALUE',
   movesName: 'HAPPIER_PATH_MOVES_NAME',
@@ -497,14 +505,18 @@ const WINDOWS_READ_USER_ENVIRONMENT_SCRIPT = [
 // new terminals see both values.
 const WINDOWS_WRITE_USER_ENVIRONMENT_SCRIPT = [
   '& {',
-  `$UserPath = $env:${WINDOWS_SCRIPT_ENV.userPath}`,
+  `$UserPathJson = $env:${WINDOWS_SCRIPT_ENV.userPathJson}`,
   `$Kind = $env:${WINDOWS_SCRIPT_ENV.valueKind}`,
   `$ProvenanceName = $env:${WINDOWS_SCRIPT_ENV.provenanceName}`,
   `$Provenance = $env:${WINDOWS_SCRIPT_ENV.provenanceValue}`,
   `$MovesName = $env:${WINDOWS_SCRIPT_ENV.movesName}`,
   `$Moves = $env:${WINDOWS_SCRIPT_ENV.movesValue}`,
-  // Refuse to write rather than clear the user PATH if the value did not arrive.
-  `if (-not $UserPath) { throw '${WINDOWS_SCRIPT_ENV.userPath} is not set.' }`,
+  // An empty PATH is a valid removal result. A nonempty JSON envelope distinguishes it from
+  // missing child-environment transport, which must still refuse before touching the registry.
+  `if (-not $UserPathJson) { throw '${WINDOWS_SCRIPT_ENV.userPathJson} is not set.' }`,
+  '$Payload = ConvertFrom-Json -InputObject $UserPathJson -ErrorAction Stop',
+  "if ($null -eq $Payload -or -not ($Payload.PSObject.Properties.Name -contains 'userPath') -or $Payload.userPath -isnot [string]) { throw 'Unexpected user PATH payload shape.' }",
+  '$UserPath = $Payload.userPath',
   "$key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)",
   "if (-not $key) { $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment') }",
   "$valueKind = if ($Kind -eq 'String') { [Microsoft.Win32.RegistryValueKind]::String } else { [Microsoft.Win32.RegistryValueKind]::ExpandString }",
@@ -577,7 +589,7 @@ async function writeWindowsUserEnvironment(processEnv: NodeJS.ProcessEnv, value:
   moves: string | null;
 }>): Promise<void> {
   await runWindowsPowerShell(processEnv, WINDOWS_WRITE_USER_ENVIRONMENT_SCRIPT, {
-    [WINDOWS_SCRIPT_ENV.userPath]: value.userPath,
+    [WINDOWS_SCRIPT_ENV.userPathJson]: JSON.stringify({ userPath: value.userPath }),
     [WINDOWS_SCRIPT_ENV.valueKind]: value.userPathKind,
     [WINDOWS_SCRIPT_ENV.provenanceName]: HAPPIER_DESKTOP_WINDOWS_PATH_PROVENANCE_VARIABLE,
     [WINDOWS_SCRIPT_ENV.provenanceValue]: value.provenance ?? '',
