@@ -16,6 +16,8 @@ const SCOPED_ENV_KEYS = [
   'HAPPIER_HOME_DIR',
   'HAPPIER_BACKEND_CLI_SOURCE_PREFERENCES_JSON',
   'HAPPIER_CLAUDE_PATH',
+  'CLAUDE_CONFIG_DIR',
+  'HAPPIER_CLAUDE_CONFIG_DIR',
   'HAPPIER_CODEX_PATH',
   'HAPPIER_OPENCODE_PATH',
   'HAPPIER_PI_PATH',
@@ -70,9 +72,14 @@ describe('detectCliSnapshotOnDaemonPath', () => {
     mkdirSync(process.env.PATH!, { recursive: true });
     setEnv('HAPPIER_BACKEND_CLI_SOURCE_PREFERENCES_JSON', undefined);
     setEnv('HAPPIER_CLAUDE_PATH', undefined);
+    setEnv('CLAUDE_CONFIG_DIR', undefined);
+    setEnv('HAPPIER_CLAUDE_CONFIG_DIR', undefined);
     setEnv('HAPPIER_CODEX_PATH', undefined);
     setEnv('HAPPIER_OPENCODE_PATH', undefined);
     setEnv('HAPPIER_PI_PATH', undefined);
+    setEnv('HAPPIER_JS_RUNTIME_PATH', undefined);
+    setEnv('HAPPIER_MANAGED_NODE_BIN', undefined);
+    setEnv('HAPPIER_NODE_PATH', undefined);
     setEnv('PI_CODING_AGENT_DIR', undefined);
   });
 
@@ -627,13 +634,10 @@ describe('detectCliSnapshotOnDaemonPath', () => {
     async () => {
       const binDir = join(workDir, 'bin');
       mkdirSync(binDir, { recursive: true });
-      const claudePath = makeExecutableShim({
+      const claudePath = writeExecutableShimSync({
         dir: binDir,
-        name: 'claude',
-        stdout: [
-          '/bin/sleep 1',
-          'echo "2.0.70 (Claude Code)"',
-        ].join('\n'),
+        fileName: 'claude',
+        contents: `#!${process.execPath}\nsetTimeout(() => console.log("2.0.70 (Claude Code)"), 1000);\n`,
       });
       const credentialsDir = join(homeDir, '.claude');
       mkdirSync(credentialsDir, { recursive: true });

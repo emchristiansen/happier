@@ -2630,12 +2630,13 @@ describe('createCliActionDeps session controls', () => {
       const pendingLists = [...params.pendingLists];
       mocks.axiosGet.mockImplementation(async (...args: unknown[]) => {
         const url = String(args[0]);
-        if (url.endsWith('/v2/sessions/sess_1/pending')) {
+        const pathname = new URL(url).pathname;
+        if (pathname.endsWith('/v2/sessions/sess_1/pending')) {
           const next = pendingLists.shift();
           if (next instanceof Error || (next && typeof next === 'object' && 'isAxiosError' in next)) throw next;
           return { status: 200, data: next };
         }
-        if (url.endsWith('/v2/sessions/sess_1')) {
+        if (pathname.endsWith('/v2/sessions/sess_1')) {
           if (params.sessionError) throw params.sessionError;
           return { status: 200, data: { session: params.session } };
         }
