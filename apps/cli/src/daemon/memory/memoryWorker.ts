@@ -177,7 +177,7 @@ export async function startMemoryWorker(params: Readonly<{
     requestedSettings: MemorySettingsV1,
   ): Promise<EmbeddingsProviderResolution | null> => {
     const embeddings = resolveOperationalMemoryEmbeddingsSettings(requestedSettings.embeddings);
-    if (!embeddings?.enabled || !embeddings.providerConfig || !embeddings.providerKind || !embeddings.modelId) {
+    if (!requestedSettings.enabled || !embeddings?.enabled || !embeddings.providerConfig || !embeddings.providerKind || !embeddings.modelId) {
       embeddingsDiagnostics = buildUnavailableMemoryEmbeddingsDiagnostics(requestedSettings.embeddings);
       return null;
     }
@@ -238,7 +238,7 @@ export async function startMemoryWorker(params: Readonly<{
   };
 
   const retryEmbeddingsAfterExternalStateChange = (failureMessage: string): void => {
-    if (stopped) return;
+    if (stopped || !settings.enabled) return;
     embeddingsResolutionEpoch = null;
     void refreshEmbeddingsDiagnostics().catch((error: unknown) => {
       if (stopped) return;

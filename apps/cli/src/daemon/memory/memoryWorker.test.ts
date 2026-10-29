@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { applyEnvValues, restoreEnvValues, snapshotEnvValues } from '@/testkit/env/envSnapshot';
 import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
 import type { Credentials } from '@/persistence';
+import type { OptionalRuntimeKey } from '@/installables/runtime/optionalRuntimeInstallables';
 
 describe('memoryWorker', () => {
   const envBackup = snapshotEnvValues(['HAPPIER_HOME_DIR', 'HAPPIER_SERVER_URL', 'HAPPIER_WEBAPP_URL']);
@@ -58,7 +59,7 @@ describe('memoryWorker', () => {
       expect(worker, 'Daemon must be able to register memory RPC while inference is pending').not.toBeNull();
       expect(worker?.getEmbeddingsDiagnostics()).toMatchObject({ runtimeState: 'downloading' });
       if (disableWhilePending) {
-        await writeMemorySettingsToDisk({ v: 1, enabled: false, indexMode: 'deep', deleteOnDisable: true });
+        await writeMemorySettingsToDisk({ ...worker!.getSettings(), enabled: false, deleteOnDisable: true });
         await worker?.reloadSettings();
       }
       finishInitialization();
@@ -75,6 +76,82 @@ describe('memoryWorker', () => {
     } finally {
       finishInitialization();
       (await starting).stop();
+    }
+  }, 60_000);
+
+  it.each([
+    { trigger: 'account', state: 'persisted-disabled' },
+    { trigger: 'runtime', state: 'persisted-disabled' },
+    { trigger: 'account', state: 'disabled-after-enable' },
+    { trigger: 'runtime', state: 'disabled-after-enable' },
+    { trigger: 'account', state: 'enabled' },
+    { trigger: 'runtime', state: 'enabled' },
+  ] as const)('admits $trigger embedding retries only while memory is enabled ($state)', async ({ trigger, state }) => {
+    const pipeline = vi.fn(async () => { throw new Error('fixture embeddings initialization declined'); });
+    vi.doMock('@huggingface/transformers', () => ({ env: {}, pipeline }));
+    const runtimeListeners = new Set<(key: OptionalRuntimeKey) => void>();
+    vi.doMock('@/installables/runtime/optionalRuntimeInstallables', async (importOriginal) => ({
+      ...await importOriginal<typeof import('@/installables/runtime/optionalRuntimeInstallables')>(),
+      subscribeOptionalRuntimeInstallSuccess: (listener: (key: OptionalRuntimeKey) => void) => {
+        runtimeListeners.add(listener);
+        return () => { runtimeListeners.delete(listener); };
+      },
+    }));
+    const { INSTALLABLE_KEYS, accountSettingsParse } = await import('@happier-dev/protocol');
+    const { commitActiveAccountSettingsSnapshot, resetActiveAccountSettingsSnapshotForTests } = await import('@/settings/accountSettings/activeAccountSettingsSnapshot');
+    const { writeMemorySettingsToDisk } = await import('@/settings/memorySettings');
+    resetActiveAccountSettingsSnapshotForTests();
+    const publishAccountVersion = (version: number) => commitActiveAccountSettingsSnapshot({
+      source: 'network', settings: accountSettingsParse({}), settingsVersion: version,
+      loadedAtMs: Date.now(), settingsSecretsReadKeys: [], scopeKey: 'memory-worker-fixture',
+    });
+    publishAccountVersion(1);
+    await writeMemorySettingsToDisk({
+      v: 1, enabled: state !== 'persisted-disabled', indexMode: 'deep',
+      deleteOnDisable: true, embeddings: { mode: 'preset', presetId: 'balanced' },
+    });
+    const { configuration } = await import('@/configuration');
+    const { startMemoryWorker } = await import('./memoryWorker');
+    const worker = await startMemoryWorker({
+      credentials: { token: 't', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(1) } },
+      machineId: 'machine_1', deps: { fetchDecryptedTranscriptPageAfterSeq: async () => [] },
+    });
+    try {
+      if (state !== 'persisted-disabled') {
+        await vi.waitFor(() => expect(worker.getEmbeddingsDiagnostics().runtimeState).toBe('error'));
+        expect(pipeline).toHaveBeenCalledTimes(1);
+      }
+      if (state === 'disabled-after-enable') {
+        await writeMemorySettingsToDisk({ ...worker.getSettings(), enabled: false });
+        await worker.reloadSettings();
+      }
+      expect(worker.getSettings().embeddings).toMatchObject({ mode: 'preset', presetId: 'balanced' });
+      const previousCalls = pipeline.mock.calls.length;
+      expect(runtimeListeners.size).toBe(1);
+      if (trigger === 'account') {
+        expect(publishAccountVersion(2).didCommit).toBe(true);
+      } else {
+        for (const listener of runtimeListeners) listener(INSTALLABLE_KEYS.LOCAL_EMBEDDINGS);
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (state === 'enabled') {
+        await vi.waitFor(() => expect(pipeline).toHaveBeenCalledTimes(previousCalls + 1));
+      } else {
+        expect(pipeline).toHaveBeenCalledTimes(previousCalls);
+        expect(worker.getEmbeddingsDiagnostics()).toMatchObject({ runtimeState: 'unavailable', usingFallback: false });
+        expect(worker.getWorkerStatus?.().state).toBe('disabled');
+        await expect(stat(join(configuration.activeServerDir, 'memory'))).rejects.toBeTruthy();
+      }
+      const settledCalls = pipeline.mock.calls.length;
+      worker.stop();
+      expect(runtimeListeners.size).toBe(0);
+      expect(publishAccountVersion(3).didCommit).toBe(true);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(pipeline).toHaveBeenCalledTimes(settledCalls);
+    } finally {
+      worker.stop();
+      resetActiveAccountSettingsSnapshotForTests();
+      vi.doUnmock('@/installables/runtime/optionalRuntimeInstallables');
     }
   }, 60_000);
 
