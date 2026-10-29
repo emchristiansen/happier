@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { withTempDir } from '@/testkit/fs/tempDir';
@@ -21,6 +21,14 @@ describe('claude sdk query executable resolution', () => {
     'HAPPIER_SPAWN_EXPLICIT_ENV_KEYS_JSON',
   ] as const;
   let envScope = createEnvKeyScope(envKeys);
+
+  beforeEach(() => {
+    envScope.patch({
+      HAPPIER_JS_RUNTIME_PATH: undefined,
+      HAPPIER_MANAGED_NODE_BIN: undefined,
+      HAPPIER_NODE_PATH: undefined,
+    });
+  });
 
   function setBunRuntime(enabled: boolean): void {
     if (enabled) {

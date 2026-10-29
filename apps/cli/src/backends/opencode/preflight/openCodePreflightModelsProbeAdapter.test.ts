@@ -8,6 +8,7 @@ import { existsSync } from 'node:fs';
 
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { writeExecutableShimSync } from '@/testkit/fs/executableShim';
+import { buildPosixShellCommand } from '@/utils/posixShellCommand';
 
 import { openCodePreflightModelsProbeAdapter } from './openCodePreflightModelsProbeAdapter';
 
@@ -38,9 +39,7 @@ function writeFakeOpenCodeModelsBinary(dir: string, stdoutLines: ReadonlyArray<s
     : [
         '#!/bin/sh',
         `printf '%s' invoked > "${join(dir, 'invoked.txt')}"`,
-        "cat <<'EOF'",
-        output,
-        'EOF',
+        buildPosixShellCommand(['printf', '%s\n', output]),
         'exit 0',
       ].join('\n');
   return writeExecutableShimSync({ dir, fileName, contents });
