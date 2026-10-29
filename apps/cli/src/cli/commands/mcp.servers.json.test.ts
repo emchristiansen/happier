@@ -1,3 +1,6 @@
+import { resolve as resolvePath, join, parse as parsePath } from 'node:path';
+import { configuration } from '@/configuration';
+import { bootstrapAccountSettingsContext } from '@/settings/accountSettings/bootstrapAccountSettingsContext';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { Credentials } from '@/persistence';
@@ -123,6 +126,88 @@ describe.sequential('happier mcp servers --json', () => {
       expect.objectContaining({ mode: 'blocking', refresh: 'force' }),
     ]);
     expect(exitCode).toBe(0);
+  });
+
+  it.each(['network', 'cache'] as const)('projects one named declaration and canonical bindings from %s settings', async (source) => {
+    const directory = resolvePath('synthetic-mcp-root');
+    const child = join(directory, 'child');
+    const serverId = configuration.activeServerId;
+    const credentials: Credentials = {
+      token: `header.${Buffer.from(JSON.stringify({ sub: 'account-one' })).toString('base64url')}.signature`,
+      encryption: createCredentialsStub().encryption,
+    };
+    const mcp = McpServersSettingsV1Schema.parse({
+      servers: [
+        { id: 'factory-id', name: 'factory-memory', transport: 'stdio',
+          stdio: { command: '/old/basic-memory', args: ['mcp'] }, env: {}, createdAt: 1, updatedAt: 1 },
+        { id: 'other-id', name: 'other-server', transport: 'stdio',
+          stdio: { command: '/other', args: [] }, env: {}, createdAt: 1, updatedAt: 1 },
+      ],
+      bindings: [
+        { id: 'all', serverId: 'factory-id', enabled: true, target: { t: 'allMachines' }, createdAt: 1, updatedAt: 1 },
+        { id: 'machine', serverId: 'factory-id', enabled: true, target: { t: 'machine', machineId: 'machine-one' },
+          overrides: { stdio: { command: '/bridge', args: ['http://127.0.0.1:18467/mcp'] } }, createdAt: 1, updatedAt: 1 },
+        { id: 'workspace', serverId: 'factory-id', enabled: false,
+          target: { t: 'workspace', machineId: 'machine-one', workspaceRoot: directory }, createdAt: 1, updatedAt: 1 },
+        { id: 'nested', serverId: 'factory-id', enabled: true,
+          target: { t: 'workspace', machineId: 'machine-one', workspaceRoot: child },
+          overrides: { stdio: { args: ['nested'] } }, createdAt: 1, updatedAt: 1 },
+        { id: 'other-machine', serverId: 'factory-id', enabled: true,
+          target: { t: 'machine', machineId: 'machine-two' }, createdAt: 1, updatedAt: 1 },
+        { id: 'unrelated', serverId: 'other-id', enabled: true, target: { t: 'allMachines' }, createdAt: 1, updatedAt: 1 },
+      ],
+    });
+    const write = vi.fn();
+    const launch = vi.fn();
+    const ensureMachineId = vi.fn();
+    const cacheWrites: unknown[] = [];
+    const { parsed } = await runJsonMcpCommand(['servers', 'list', '--name', 'factory-memory', '--details', '--dir', directory, '--json'], {
+      readCredentials: async () => credentials,
+      readSettings: async () => ({ schemaVersion: 6, onboardingCompleted: true,
+        machineIdByServerIdByAccountId: { [serverId]: { 'account-one': 'machine-one' } } }),
+      bootstrapAccountSettingsContext: (params) => bootstrapAccountSettingsContext({ ...params, deps: {
+        resolveCachePath: () => join(directory, `synthetic-${source}-cache`),
+        readCache: async () => source === 'cache'
+          ? { version: 2, cachedAt: 1, settingsContent: { t: 'plain', v: { mcpServersSettingsV1: mcp } }, settingsVersion: 37 }
+          : null,
+        fetchFromServer: async () => {
+          if (source === 'cache') throw new Error('synthetic transport unavailable');
+          return { settingsContent: { t: 'plain', v: { mcpServersSettingsV1: mcp } }, settingsVersion: 37 };
+        },
+        writeCache: async (_path, value) => { cacheWrites.push(value); },
+        applySideEffects: () => {},
+      } }),
+      updateAccountSettingsV2WithRetry: write,
+      probeMcpStdioServerTools: launch,
+      ensureMachineIdForCredentials: ensureMachineId,
+    } satisfies Partial<McpCommandDeps>);
+    if (source === 'cache') {
+      expect(parsed.ok).toBe(false);
+      expect(parsed.data).toBeUndefined();
+    } else {
+      expect(parsed).toMatchObject({ ok: true });
+      expect(parsed.data).toMatchObject({
+        settingsVersion: 37, source: 'network', accountId: 'account-one', machineId: 'machine-one',
+        server: { id: 'factory-id', name: 'factory-memory', transport: 'stdio',
+          stdio: { command: '/old/basic-memory', args: ['mcp'] } },
+      });
+      expect(parsed.data?.bindings).toEqual(mcp.bindings.slice(0, 5).map((binding) => ({
+        id: binding.id, serverId: binding.serverId, enabled: binding.enabled, target: binding.target,
+        ...(binding.overrides?.stdio ? { overrides: { stdio: binding.overrides.stdio } } : {}),
+      })));
+      expect(parsed.data?.effective).toEqual(expect.arrayContaining([
+        { directory, serverId: 'factory-id', bindingId: 'workspace', enabled: false,
+          stdio: { command: '/old/basic-memory', args: ['mcp'] } },
+        { directory: child, serverId: 'factory-id', bindingId: 'nested', enabled: true,
+          stdio: { command: '/old/basic-memory', args: ['nested'] } },
+        { directory: parsePath(directory).root, serverId: 'factory-id', bindingId: 'machine', enabled: true,
+          stdio: { command: '/bridge', args: ['http://127.0.0.1:18467/mcp'] } },
+      ]));
+      expect(cacheWrites).toHaveLength(1);
+    }
+    expect(write).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
+    expect(ensureMachineId).not.toHaveBeenCalled();
   });
 
   it('prints a mcp_servers_add JSON envelope and adds a stdio server', async () => {

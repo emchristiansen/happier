@@ -15,7 +15,7 @@ function isHelpToken(value: string): boolean {
 
 function printMcpUsage(): void {
   console.log('happier mcp serve [--session <session-id>]');
-  console.log('happier mcp servers list [--dir <path>] [--json]');
+  console.log('happier mcp servers list [--name <name>] [--details --json] [--dir <path>] [--json]');
   console.log('happier mcp servers add --name <name> --transport stdio --command <cmd> [--arg <arg>] [--json]');
   console.log('happier mcp servers bind --mcp-server <name|id> --all-machines [--json]');
   console.log('happier mcp servers unbind --binding-id <id> [--json]');
@@ -24,7 +24,7 @@ function printMcpUsage(): void {
 }
 
 function printMcpServersUsage(): void {
-  console.log('happier mcp servers list [--dir <path>] [--json]');
+  console.log('happier mcp servers list [--name <name>] [--details --json] [--dir <path>] [--json]');
   console.log('happier mcp servers add --name <name> --transport stdio --command <cmd> [--arg <arg>] [--json]');
   console.log('happier mcp servers bind --mcp-server <name|id> --all-machines [--json]');
   console.log('happier mcp servers unbind --binding-id <id> [--json]');

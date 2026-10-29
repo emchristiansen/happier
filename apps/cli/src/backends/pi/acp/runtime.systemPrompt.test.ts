@@ -253,9 +253,9 @@ describe('Pi ACP runtime spawn system prompt', () => {
   });
 
   it('fails session startup when the required input bridge cannot be materialized', async () => {
-    // Point the bridge materializer at a regular file: every mkdir/write under it
-    // throws ENOTDIR, so the runtime's best-effort bridge resolution fails and the
-    // spawn must fall back to delivering the complete prompt itself.
+    // A regular file prevents the required bridge directory from being materialized.
+    // Startup must fail before backend construction, preserving the bridge-owned
+    // input observations and ordered prompt contract.
     const notADir = createTempDirSync('happier-pi-bridge-notadir-');
     const agentDir = join(notADir, 'agent-file');
     writeFileSync(agentDir, 'not a directory', 'utf8');
