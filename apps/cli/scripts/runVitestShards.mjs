@@ -67,10 +67,10 @@ export function resolveVitestIsolationPlan(configPath, { part = 1, parts = 1 } =
   const claudeSignalCleanupFile = 'src/backends/claude/sdk/query.signalCleanup.test.ts';
   const codexAppServerClientFile = 'src/backends/codex/appServer/client/createCodexAppServerClient.test.ts';
   const processRunStateFile = 'src/daemon/processRunState.test.ts';
-  const daemonStartSyncOwnershipFile = 'src/daemon/startSyncOwnership.test.ts';
-  const nonInteractiveAuthFile = 'src/commands/auth.nonInteractiveBoth.test.ts';
+  const daemonStartSyncOwnershipFile = 'src/cli/commands/daemon.startSyncOwnership.test.ts';
+  const nonInteractiveAuthFile = 'src/ui/auth.nonInteractiveBoth.test.ts';
   const durableMutationOutboxFile = 'src/api/session/sessionClient.durableMutationOutbox.test.ts';
-  const ephemeralExecutionRunPromptFile = 'src/agent/executionRuns/runEphemeralExecutionRunTextPrompt.test.ts';
+  const ephemeralExecutionRunPromptFile = 'src/agent/executionRuns/runtime/runEphemeralExecutionRunTextPrompt.test.ts';
   return {
     shardExcludes: [
       daemonServiceFile,

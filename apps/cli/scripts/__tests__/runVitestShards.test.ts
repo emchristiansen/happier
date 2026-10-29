@@ -1,3 +1,5 @@
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -66,10 +68,10 @@ describe('runVitestShards', () => {
   it('runs reset-heavy suites in bounded fresh processes', () => {
     const plan = resolveVitestIsolationPlan('vitest.config.ts');
     const resetHeavyFiles = [
-      'src/daemon/startSyncOwnership.test.ts',
-      'src/commands/auth.nonInteractiveBoth.test.ts',
+      'src/cli/commands/daemon.startSyncOwnership.test.ts',
+      'src/ui/auth.nonInteractiveBoth.test.ts',
       'src/api/session/sessionClient.durableMutationOutbox.test.ts',
-      'src/agent/executionRuns/runEphemeralExecutionRunTextPrompt.test.ts',
+      'src/agent/executionRuns/runtime/runEphemeralExecutionRunTextPrompt.test.ts',
     ];
 
     expect(plan.shardExcludes).toEqual(expect.arrayContaining(resetHeavyFiles));
@@ -87,6 +89,11 @@ describe('runVitestShards', () => {
       shardExcludes: [],
       runs: [],
     });
+  });
+
+  it('selects existing files for each isolated unit run', () => {
+    const files = [...new Set(resolveVitestIsolationPlan('vitest.config.ts').runs.map(run => run.file))];
+    expect(files.filter(file => !existsSync(fileURLToPath(new URL(`../../${file}`, import.meta.url))))).toEqual([]);
   });
 
   it('parses --config path from argv', () => {
