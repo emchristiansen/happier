@@ -16,6 +16,7 @@ const ENV_KEYS = [
   'HAPPIER_HOME_DIR',
   'HAPPIER_SERVER_URL',
   'HAPPIER_DAEMON_SERVICE_PLATFORM',
+  'HAPPIER_DAEMON_SERVICE_TARGET_MODE',
   'HAPPIER_DAEMON_SERVICE_USER_HOME_DIR',
   'HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR',
 ] as const;
@@ -58,6 +59,7 @@ function installManagedServiceUnit(): string {
     '[Service]',
     'ExecStart=/opt/happier/happier daemon start-sync',
     'Environment=HAPPIER_DAEMON_STARTUP_SOURCE=background-service',
+    'Environment=HAPPIER_DAEMON_SERVICE_TARGET_MODE=default-following',
     `Environment=HAPPIER_HOME_DIR=${configuration.happyHomeDir}`,
     '',
   ].join('\n'));
@@ -119,6 +121,7 @@ describe('readDaemonStatusSnapshot runtimeConvergence', () => {
       HAPPIER_HOME_DIR: tmpHomeDir!,
       HAPPIER_SERVER_URL: params.relayUrl,
       HAPPIER_DAEMON_SERVICE_PLATFORM: 'linux',
+      HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
       HAPPIER_DAEMON_SERVICE_USER_HOME_DIR: tmpHomeDir!,
       HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR: tmpHomeDir!,
     });

@@ -5,6 +5,7 @@ import { stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { PassThrough } from 'node:stream';
 import { logger } from '@/ui/logger';
+import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { claudeLocal } from './claudeLocal';
 
 async function withPlatform<T>(platform: NodeJS.Platform, run: () => Promise<T>): Promise<T> {
@@ -533,12 +534,12 @@ describe('claudeLocal --continue handling', () => {
     });
 
     it('should prefer the managed node override for JS launchers when configured', async () => {
-        const previousManagedNode = process.env.HAPPIER_MANAGED_NODE_BIN;
+        const runtimeEnv = createEnvKeyScope(['HAPPIER_JS_RUNTIME_PATH', 'HAPPIER_MANAGED_NODE_BIN']);
         const overrideDir = mkdtempSync(join(tmpdir(), 'happier-claude-local-managed-node-'));
         const overridePath = join(overrideDir, process.platform === 'win32' ? 'managed-node.cmd' : 'managed-node');
         writeFileSync(overridePath, process.platform === 'win32' ? '@echo off\r\n' : '#!/bin/sh\n', 'utf8');
         if (process.platform !== 'win32') chmodSync(overridePath, 0o755);
-        process.env.HAPPIER_MANAGED_NODE_BIN = overridePath;
+        runtimeEnv.patch({ HAPPIER_JS_RUNTIME_PATH: undefined, HAPPIER_MANAGED_NODE_BIN: overridePath });
         mockClaudeFindLastSession.mockReturnValue(null);
 
         try {
@@ -554,8 +555,7 @@ describe('claudeLocal --continue handling', () => {
             expect(mockSpawn.mock.calls[0]?.[0]).toBe(overridePath);
         } finally {
             rmSync(overrideDir, { recursive: true, force: true });
-            if (typeof previousManagedNode === 'string') process.env.HAPPIER_MANAGED_NODE_BIN = previousManagedNode;
-            else delete process.env.HAPPIER_MANAGED_NODE_BIN;
+            runtimeEnv.restore();
         }
     });
 
