@@ -10,7 +10,7 @@ async function writeKiloAuthListShim(dir: string, output: string): Promise<strin
     dir,
     fileName: process.platform === 'win32' ? 'kilo.cmd' : 'kilo',
     contents: process.platform === 'win32'
-      ? `@echo off\r\necho ${output}\r\nexit /b 0\r\n`
+      ? `@echo off\r\n${output.split(/\r?\n/).map((line) => `echo ${line}`).join('\r\n')}\r\nexit /b 0\r\n`
       : `#!/bin/sh\nprintf '%s\\n' '${output}'\n`,
   });
 }
