@@ -1410,8 +1410,8 @@ describe('materializeConnectedServicesForSpawn', () => {
 });
 
 
-describe('Codex home promotion preserves runtime custody', () => {
-  it('retains runtime file identities while honoring removed configuration and credential-owned entries', async () => {
+describe('Codex home materialization preserves runtime custody', () => {
+  it.each(['account', 'probe'] as const)('retains runtime file identities in the %s home while respecting its ownership', async (purpose) => {
     const baseDir = await mkdtemp(join(tmpdir(), 'codex-runtime-base-'));
     const activeServerDir = await mkdtemp(join(tmpdir(), 'codex-runtime-server-'));
     const sourceCodexHome = await mkdtemp(join(tmpdir(), 'codex-runtime-source-'));
@@ -1420,9 +1420,20 @@ describe('Codex home promotion preserves runtime custody', () => {
     });
     const params = {
       agentId: 'codex' as const, materializationKey: 'runtime-session', activeServerDir, baseDir,
+      ...(purpose === 'probe' ? {
+        materializationPurpose: 'probe' as const,
+        connectedServiceMaterializationIdentityV1: { v: 1 as const, id: 'csm_runtime_probe', createdAtMs: 1 },
+      } : {}),
       recordsByServiceId: new Map([['openai-codex' as const, record]]),
       processEnv: { CODEX_HOME: sourceCodexHome, HOME: sourceCodexHome },
-      accountSettings: { connectedServicesProviderStateSharingSettingsV1: { v: 1 as const, providers: { codex: { configMode: 'isolated' as const, stateMode: 'isolated' as const } } } },
+      accountSettings: {
+        connectedServicesProviderStateSharingSettingsV1: {
+          v: 1 as const,
+          defaults: { configMode: 'linked' as const, stateMode: 'isolated' as const },
+          byAgentId: { codex: { configMode: 'isolated' as const, stateMode: 'isolated' as const } },
+          acknowledgedRisksByAgentId: {},
+        },
+      },
     };
     const first = await materializeConnectedServicesForSpawn(params);
     const home = first!.env.CODEX_HOME!;
@@ -1435,7 +1446,13 @@ describe('Codex home promotion preserves runtime custody', () => {
     await writeFile(join(home, 'accounts', 'stale.json'), 'synthetic stale owned data');
     await materializeConnectedServicesForSpawn(params);
     expect((await stat(lockPath)).ino).toBe(before.ino);
-    await expect(lstat(join(home, 'AGENTS.md'))).rejects.toMatchObject({ code: 'ENOENT' });
-    await expect(lstat(join(home, 'accounts', 'stale.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    if (purpose === 'probe') {
+      await expect(lstat(join(home, 'AGENTS.md'))).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(lstat(join(home, 'accounts', 'stale.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    } else {
+      // Stable account homes retain native-owned files; only disposable probes are replaced.
+      await expect(readFile(join(home, 'AGENTS.md'), 'utf8')).resolves.toBe('stale config omitted by stage');
+      await expect(readFile(join(home, 'accounts', 'stale.json'), 'utf8')).resolves.toBe('synthetic stale owned data');
+    }
   });
 });
