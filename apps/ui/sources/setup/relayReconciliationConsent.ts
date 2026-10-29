@@ -259,11 +259,12 @@ export function daemonMovesToAnotherRelay(input: Readonly<{
  */
 export type KeptBackgroundServiceIdentity = Readonly<{ relayKey: string; accountId: string | null }>;
 
-export function identifyKeptBackgroundService(inspection: DesktopLocalInspection): KeptBackgroundServiceIdentity | null {
+export function identifyKeptBackgroundService(inspection: DesktopLocalInspection, target: DesktopSetupExpectation): KeptBackgroundServiceIdentity | null {
     if (inspection.status !== 'resolved') {
         return null;
     }
-    const facts = inspection.facts;
+    const facts = resolveThisComputerService(inspection, target)?.facts;
+    if (!facts) return null;
     const relayKey = facts.server.comparableKey ?? createRelayUrlComparableKeySafe(facts.server.serverUrl);
     return relayKey ? { relayKey, accountId: facts.auth.validatedAccountId } : null;
 }
@@ -280,6 +281,6 @@ export function keptBackgroundServiceApplies(input: Readonly<{
     if (!input.kept || !daemonContradictsTarget(input)) {
         return false;
     }
-    const current = identifyKeptBackgroundService(input.inspection);
+    const current = identifyKeptBackgroundService(input.inspection, input.target);
     return current !== null && current.relayKey === input.kept.relayKey && current.accountId === input.kept.accountId;
 }

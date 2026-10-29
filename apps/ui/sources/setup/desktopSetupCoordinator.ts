@@ -682,7 +682,7 @@ export function createDesktopSetupCoordinator(deps: Readonly<{
             return request.offerConnectToo ? 'pinned' : null;
         }
         if (answer === 'keep') {
-            const kept = identifyKeptBackgroundService(ambient);
+            const kept = identifyKeptBackgroundService(ambient, target);
             if (kept) rememberKeptBackgroundService(kept);
             return null;
         }

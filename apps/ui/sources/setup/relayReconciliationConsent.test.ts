@@ -380,13 +380,13 @@ describe('keptBackgroundServiceApplies (D5)', () => {
     const elsewhere = resolved({ serverUrl: 'https://old.relay.test', validatedAccountId: 'acct_other' });
 
     it('holds for the daemon the user chose to keep while it still contradicts the app', () => {
-        const kept = identifyKeptBackgroundService(elsewhere);
+        const kept = identifyKeptBackgroundService(elsewhere, TARGET);
         expect(kept).not.toBeNull();
         expect(keptBackgroundServiceApplies({ inspection: elsewhere, target: TARGET, kept })).toBe(true);
     });
 
     it('stops holding once the daemon is somewhere else, or signed in as someone else', () => {
-        const kept = identifyKeptBackgroundService(elsewhere);
+        const kept = identifyKeptBackgroundService(elsewhere, TARGET);
         expect(keptBackgroundServiceApplies({
             inspection: resolved({ serverUrl: 'https://third.relay.test', validatedAccountId: 'acct_other' }),
             target: TARGET,
@@ -401,12 +401,12 @@ describe('keptBackgroundServiceApplies (D5)', () => {
 
     it('never holds for a daemon that is already the app\'s', () => {
         const ours = resolved({ serverUrl: 'https://new.relay.test' });
-        expect(keptBackgroundServiceApplies({ inspection: ours, target: TARGET, kept: identifyKeptBackgroundService(ours) })).toBe(false);
+        expect(keptBackgroundServiceApplies({ inspection: ours, target: TARGET, kept: identifyKeptBackgroundService(ours, TARGET) })).toBe(false);
     });
 
     it('holds for nothing when nothing was kept or nothing is known', () => {
         expect(keptBackgroundServiceApplies({ inspection: elsewhere, target: TARGET, kept: null })).toBe(false);
-        expect(identifyKeptBackgroundService({ status: 'pending' })).toBeNull();
+        expect(identifyKeptBackgroundService({ status: 'pending' }, TARGET)).toBeNull();
     });
 });
 
@@ -429,6 +429,24 @@ describe('one daemon per relay: a pinned service is this computer on its relay',
             serving: 'pinned' as const,
             actions: [],
         })),
+    });
+
+    it('records pinned service Keep under the service the question names', () => {
+        const inspection = withPinned([pinnedOnNewRelay({ validatedAccountId: 'acct_p1' })]);
+        expect(identifyKeptBackgroundService(inspection, MOVE_TARGET)).toEqual({ relayKey: 'https://new.relay.test', accountId: 'acct_p1' });
+    });
+
+    it('reuses pinned service Keep while that exact service is unchanged', () => {
+        const inspection = withPinned([pinnedOnNewRelay({ validatedAccountId: 'acct_p1' })]);
+        expect(keptBackgroundServiceApplies({ inspection, target: MOVE_TARGET, kept: { relayKey: 'https://new.relay.test', accountId: 'acct_p1' } })).toBe(true);
+    });
+
+    it('does not record pinned service Keep by guessing from an unreadable service', () => {
+        const inspection: DesktopLocalInspection = {
+            status: 'resolved', facts: facts(), pinnedServices: [], pinnedServicesComplete: false,
+            pinnedServicesUnreadable: ['https://new.relay.test'],
+        };
+        expect(identifyKeptBackgroundService(inspection, MOVE_TARGET)).toBeNull();
     });
 
     it('moves nothing and asks nothing when the app relay already has its own service here', () => {

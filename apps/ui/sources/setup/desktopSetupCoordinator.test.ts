@@ -967,6 +967,43 @@ describe('desktopSetupCoordinator', () => {
         /** Bootstrap's row for relay B: its own pinned service serves it (D11-2). */
         const relayBServedByPinned = [{ relayUrl: RELAY_B, state: 'connected', appManaged: true, serving: 'pinned', actions: ['restart', 'stop'] }];
 
+        it.each([
+            { label: 'unchanged pinned service', pinnedAccount: 'acct_p1', defaultAccount: 'acct_app', questions: 1 },
+            { label: 'changed pinned account', pinnedAccount: 'acct_p3', defaultAccount: 'acct_app', questions: 2 },
+            { label: 'unrelated default account change', pinnedAccount: 'acct_p1', defaultAccount: 'acct_default_other', questions: 1 },
+        ])('binds pinned service Keep to its consent target: $label', async ({ pinnedAccount, defaultAccount, questions }) => {
+            const inspection = (pinnedId: string, defaultId: string) => ({
+                ...AMBIENT_RESULT,
+                data: {
+                    ...AMBIENT_RESULT.data,
+                    auth: { ...AMBIENT_RESULT.data.auth, accountId: defaultId, validatedAccountId: defaultId },
+                    pinnedServices: { complete: true, coexistence: true, services: [{
+                        ...pinnedOnRelayB,
+                        auth: { ...pinnedOnRelayB.auth, accountId: pinnedId, validatedAccountId: pinnedId },
+                    }], unreadable: [] },
+                    serviceRows: relayBServedByPinned,
+                },
+            });
+            resolveWith(inspection('acct_p1', 'acct_app'));
+            appOnRelayB();
+            const { desktopSetupCoordinator } = await importCoordinator();
+            const confirm = vi.fn(async () => 'keep' as const);
+            const startExecutor = vi.fn(async (_spec: SystemTaskSpec) => 'task_setup_1');
+            mocks.rememberKept.mockImplementation((identity) => { mocks.kept = identity as typeof mocks.kept; });
+            try {
+                await desktopSetupCoordinator.inspect();
+                await expect(desktopSetupCoordinator.reconcile({ start: startExecutor, confirm })).resolves.toBeNull();
+                expect(confirm).toHaveBeenCalledWith(expect.objectContaining({ kind: 'account', fromAccountLabel: 'acct_p1' }));
+                resolveWith(inspection(pinnedAccount, defaultAccount));
+                await desktopSetupCoordinator.inspect({ fresh: true });
+                await expect(desktopSetupCoordinator.reconcile({ start: startExecutor, confirm })).resolves.toBeNull();
+                expect(confirm).toHaveBeenCalledTimes(questions);
+                expect(startExecutor).not.toHaveBeenCalled();
+            } finally {
+                mocks.rememberKept.mockImplementation(() => {});
+            }
+        });
+
         it('offers "connect too" beside the move when the executor can give the relay its own service', async () => {
             resolveWith({ ...AMBIENT_RESULT, data: { ...AMBIENT_RESULT.data, pinnedServices: { complete: true, coexistence: true, services: [], unreadable: [] } } });
             const { desktopSetupCoordinator } = await importCoordinator();
