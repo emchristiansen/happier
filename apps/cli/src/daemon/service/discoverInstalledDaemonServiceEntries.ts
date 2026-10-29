@@ -179,7 +179,7 @@ function parseDarwinPlistValue(contents: string, key: string): string | null {
 }
 
 /** A `<true/>`/`<false/>` plist key, or `null` when the definition declares neither. */
-function parseDarwinPlistBoolean(contents: string, key: string): boolean | null {
+export function parseDarwinPlistBoolean(contents: string, key: string): boolean | null {
   const match = new RegExp(`<key>${key}</key>\\s*<(true|false)\\s*/>`, 'i').exec(contents);
   const value = String(match?.[1] ?? '').trim().toLowerCase();
   return value === 'true' ? true : value === 'false' ? false : null;

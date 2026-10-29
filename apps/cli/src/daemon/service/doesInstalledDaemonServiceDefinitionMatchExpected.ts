@@ -1,5 +1,7 @@
 import fs from 'node:fs';
 
+import { parseDarwinPlistBoolean } from './discoverInstalledDaemonServiceEntries';
+
 /**
  * Semantic equivalence check for darwin launchd plist service definitions.
  *
@@ -52,6 +54,9 @@ type PlistSignature = Readonly<{
   workingDirectory: string;
   stdoutPath: string;
   stderrPath: string;
+  runAtLoad: boolean | null;
+  keepAlive: boolean | null;
+  keepAliveConditions: Readonly<Record<string, string>>;
 }>;
 
 function compareServiceSignatures(a: PlistSignature, b: PlistSignature): boolean {
@@ -59,6 +64,8 @@ function compareServiceSignatures(a: PlistSignature, b: PlistSignature): boolean
   if (a.workingDirectory !== b.workingDirectory) return false;
   if (a.stdoutPath !== b.stdoutPath) return false;
   if (a.stderrPath !== b.stderrPath) return false;
+  if (a.runAtLoad !== b.runAtLoad || a.keepAlive !== b.keepAlive) return false;
+  if (!shallowEqualStringMap(a.keepAliveConditions, b.keepAliveConditions)) return false;
   if (!compareProgramArgumentsSemantically(a.programArguments, b.programArguments)) return false;
   // Drop PATH from both sides — it is populated from the caller's environment
   // and drifts per invocation (fnm shells, cwd node_modules/.bin cascades).
@@ -139,6 +146,9 @@ function extractPlistSignature(plistXml: string): PlistSignature | null {
     workingDirectory: extractPlistStringValue(plistXml, 'WorkingDirectory') ?? '',
     stdoutPath: extractPlistStringValue(plistXml, 'StandardOutPath') ?? '',
     stderrPath: extractPlistStringValue(plistXml, 'StandardErrorPath') ?? '',
+    runAtLoad: parseDarwinPlistBoolean(plistXml, 'RunAtLoad'),
+    keepAlive: parseDarwinPlistBoolean(plistXml, 'KeepAlive'),
+    keepAliveConditions: extractPlistDictStrings(plistXml, 'KeepAlive'),
   };
 }
 

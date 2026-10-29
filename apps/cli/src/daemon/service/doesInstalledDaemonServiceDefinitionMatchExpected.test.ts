@@ -129,6 +129,18 @@ describe('doesInstalledDaemonServiceDefinitionMatchExpected', () => {
     });
   });
 
+  it.each(['RunAtLoad', 'KeepAlive'] as const)('rejects a drifted %s trigger with unchanged launcher and environment', async (trigger) => {
+    await withTempDir('plist-trigger-drift-', async (dir) => {
+      const expectedContents = plist(PROGRAM_ARGS_SHIM, PATH_A);
+      const installed = trigger === 'RunAtLoad'
+        ? expectedContents.replace('<key>RunAtLoad</key>\n    <true/>', '<key>RunAtLoad</key>\n    <false/>')
+        : expectedContents.replace('<key>SuccessfulExit</key>\n      <false/>', '<key>SuccessfulExit</key>\n      <true/>');
+      expect(installed).not.toBe(expectedContents);
+      const installedPath = writePlistFile(dir, installed);
+      expect(doesInstalledDaemonServiceDefinitionMatchExpected({ installedPath, expectedContents })).toBe(false);
+    });
+  });
+
   it('returns false when the release channel env var differs', async () => {
     await withTempDir('plist-signature-', async (dir) => {
       const installedPath = writePlistFile(dir, plist(PROGRAM_ARGS_SHIM, PATH_A));
