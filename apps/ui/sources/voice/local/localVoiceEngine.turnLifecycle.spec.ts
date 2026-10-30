@@ -2,6 +2,9 @@ import { createRequire, Module } from 'node:module';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 
 import { TokenStorage } from '@/auth/storage/tokenStorage';
+import { createDeferred } from '@/dev/testkit/hooks/createDeferred';
+import { createVoiceSessionManager } from '@/voice/session/voiceSessionManager';
+import { getVoiceSessionSnapshot, setVoiceSessionSnapshot } from '@/voice/session/voiceSessionStore';
 import { createSessionFixture } from '@/dev/testkit/fixtures/sessionFixtures';
 import { createSessionMessagesFixture, createToolCallMessageFixture } from '@/dev/testkit/fixtures/transcriptFixtures';
 import { apiSocket } from '@/sync/api/session/apiSocket';
@@ -47,11 +50,15 @@ afterAll(() => {
 });
 
 const initialStorageState = storage.getState();
+const initialVoiceSessionSnapshot = getVoiceSessionSnapshot();
 const initialEncryption = Reflect.get(sync, 'encryption');
 const accountId = 'voice-turn-lifecycle-account';
 let submitMessage: MockInstance<typeof sync.submitMessage>;
 let rejectSubmission = false;
 let transcriptionRequests = 0;
+let pendingTranscription: Promise<Response> | null = null;
+let pendingWrite: Promise<void> | null = null;
+let pendingWrites = 0;
 
 let localVoiceEngine: typeof import('./localVoiceEngine');
 
@@ -114,11 +121,15 @@ describe('local voice engine turn lifecycle (direct session)', () => {
         vi.spyOn(TokenStorage, 'getCredentialsForServerUrl').mockResolvedValue({ token, secret: '' });
         rejectSubmission = false;
         transcriptionRequests = 0;
+        pendingTranscription = null;
+        pendingWrite = null;
+        pendingWrites = 0;
+        setVoiceSessionSnapshot(initialVoiceSessionSnapshot);
         vi.stubGlobal('fetch', vi.fn<typeof fetch>(async input => {
             const url = input instanceof Request ? input.url : String(input);
             if (url === 'https://stt.example.test/v1/audio/transcriptions') {
                 transcriptionRequests += 1;
-                return Response.json({ text: 'run the tests' });
+                return pendingTranscription ?? Response.json({ text: 'run the tests' });
             }
             if (!url.endsWith('/v1/features')) throw new Error(`Unexpected HTTP request: ${url}`);
             return Response.json({
@@ -142,6 +153,8 @@ describe('local voice engine turn lifecycle (direct session)', () => {
                 createdAt: 1, updatedAt: 1, discardedAt: null, discardedReason: null, authorAccountId: accountId,
                 requestedAction: body.requestedAction, messageRole: 'user', deliveryStatus: { status: 'queued' } };
             pendingRows.set(body.localId, row);
+            pendingWrites += 1;
+            if (pendingWrite) await pendingWrite;
             return Response.json({ didWrite: true, requestedAction: body.requestedAction, pending: row,
                 pendingCount: pendingRows.size, pendingVersion: pendingRows.size });
         });
@@ -159,6 +172,7 @@ describe('local voice engine turn lifecycle (direct session)', () => {
         vi.unstubAllGlobals();
         Reflect.set(sync, 'encryption', initialEncryption);
         storage.setState(initialStorageState, true);
+        setVoiceSessionSnapshot(initialVoiceSessionSnapshot);
     });
 
     it('speaks the final reply of the turn instead of thinking or interim text', async () => {
@@ -212,6 +226,55 @@ describe('local voice engine turn lifecycle (direct session)', () => {
         await turnPromise;
 
         expect(getLocalVoiceState()).toMatchObject({ status: 'idle', sessionId: null });
+    });
+
+    it.each(['text', 'empty', 'error'] as const)('does not submit or restore after hang-up during pending transcription (%s)', async (outcome) => {
+        configureDirectVoice({ autoSpeakReplies: false });
+        const transcription = createDeferred<Response>();
+        pendingTranscription = transcription.promise;
+        const { createLocalDirectVoiceAdapter } = await import('@/voice/adapters/localDirect/localDirectAdapter');
+        const adapter = createLocalDirectVoiceAdapter();
+        const manager = createVoiceSessionManager({
+            resolveActiveAdapterId: () => 'local_direct',
+            getAdapter: () => adapter,
+        });
+        await manager.toggle('s1');
+        const turnPromise = manager.toggle('s1');
+        await vi.waitFor(() => expect(transcriptionRequests).toBe(1));
+        expect(localVoiceEngine.getLocalVoiceState().status).toBe('transcribing');
+
+        await manager.stop('s1');
+        expect(manager.getSnapshot()).toMatchObject({ status: 'disconnected', sessionId: null });
+        if (outcome === 'error') transcription.reject(new Error('late transcription failure'));
+        else transcription.resolve(Response.json({ text: outcome === 'text' ? 'run the tests' : '' }));
+        await expect(turnPromise).resolves.toBeUndefined();
+
+        expect(submitMessage).not.toHaveBeenCalled();
+        expect(localVoiceEngine.getLocalVoiceState()).toMatchObject({ status: 'idle', sessionId: null, error: null });
+        expect(manager.getSnapshot()).toMatchObject({ status: 'disconnected', sessionId: null });
+    });
+
+    it('keeps a completed hang-up after an already submitted turn receives its acknowledgement', async () => {
+        configureDirectVoice({ autoSpeakReplies: false });
+        const acknowledgement = createDeferred<void>();
+        pendingWrite = acknowledgement.promise;
+        const { createLocalDirectVoiceAdapter } = await import('@/voice/adapters/localDirect/localDirectAdapter');
+        const adapter = createLocalDirectVoiceAdapter();
+        const manager = createVoiceSessionManager({
+            resolveActiveAdapterId: () => 'local_direct',
+            getAdapter: () => adapter,
+        });
+        await manager.toggle('s1');
+        const turnPromise = manager.toggle('s1');
+        await vi.waitFor(() => expect(pendingWrites).toBe(1));
+        await manager.stop('s1');
+        expect(manager.getSnapshot()).toMatchObject({ status: 'disconnected', sessionId: null });
+        acknowledgement.resolve(undefined);
+        await turnPromise;
+
+        expect(submitMessage).toHaveBeenCalledTimes(1);
+        expect(localVoiceEngine.getLocalVoiceState()).toMatchObject({ status: 'idle', sessionId: null });
+        expect(manager.getSnapshot()).toMatchObject({ status: 'disconnected', sessionId: null });
     });
 
     it('ignores a mic tap while the reply is pending instead of recording after the turn', async () => {

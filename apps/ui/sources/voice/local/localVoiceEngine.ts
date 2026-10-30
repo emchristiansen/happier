@@ -96,15 +96,20 @@ async function runVoiceTurnWithSendFailureHandling(
   sessionId: string,
   runner: (signal: AbortSignal) => Promise<void>,
 ): Promise<void> {
+  await runAbortableVoiceTurn(sessionId, (signal) => handleVoiceTurnSendFailure(sessionId, signal, runner));
+}
+
+async function handleVoiceTurnSendFailure(
+  sessionId: string,
+  signal: AbortSignal,
+  runner: (signal: AbortSignal) => Promise<void>,
+): Promise<void> {
+  if (signal.aborted) return;
   patchLocalVoiceState({ error: null });
-  let signal: AbortSignal | null = null;
   try {
-    await runAbortableVoiceTurn(sessionId, (turnSignal) => {
-      signal = turnSignal;
-      return runner(turnSignal);
-    });
+    await runner(signal);
   } catch (error) {
-    if (isAbortedVoiceTurnError(error) || (signal as AbortSignal | null)?.aborted) {
+    if (isAbortedVoiceTurnError(error) || signal.aborted) {
       return;
     }
     if (getLocalVoiceState().error) {
@@ -140,120 +145,131 @@ async function startRecording(sessionId: string): Promise<void> {
 }
 
 async function stopAndSendRecordedTurn(sessionId: string): Promise<void> {
-  if (!recorder) {
-    patchLocalVoiceState({ status: 'idle', sessionId, error: null });
-    return;
-  }
+  await runAbortableVoiceTurn(sessionId, async (signal) => {
+    if (!recorder) {
+      patchLocalVoiceState({ status: 'idle', sessionId, error: null });
+      return;
+    }
 
-  patchLocalVoiceState({ status: 'transcribing', error: null });
-  let uri: string | null = null;
-  try {
-    await recorder.stop();
-    uri = recorder.uri;
-  } catch {
+    const turnRecorder = recorder;
     recorder = null;
-    patchLocalVoiceState({ status: 'idle', sessionId, error: 'recording_stop_failed' });
-    return;
-  }
-  recorder = null;
-
-  if (!uri) {
-    patchLocalVoiceState({ status: 'idle', sessionId, error: null });
-    return;
-  }
-
-  const settings = storage.getState().settings as any;
-  let text: string | null = null;
-  try {
-    text = await transcribeRecordedAudioWithProvider({ uri, settings });
-  } catch (error) {
-    if (error instanceof MissingSttBaseUrlError) {
-      patchLocalVoiceState({ status: 'idle', sessionId, error: 'missing_stt_base_url' });
-      throw error;
+    patchLocalVoiceState({ status: 'transcribing', error: null });
+    let uri: string | null = null;
+    try {
+      await turnRecorder.stop();
+      if (signal.aborted) return;
+      uri = turnRecorder.uri;
+    } catch {
+      if (signal.aborted) return;
+      patchLocalVoiceState({ status: 'idle', sessionId, error: 'recording_stop_failed' });
+      return;
     }
-    if (error instanceof MissingGeminiApiKeyError) {
-      patchLocalVoiceState({ status: 'idle', sessionId, error: 'missing_stt_api_key' });
-      throw error;
+    if (!uri) {
+      patchLocalVoiceState({ status: 'idle', sessionId, error: null });
+      return;
     }
-    patchLocalVoiceState({ status: 'idle', sessionId, error: resolveSttFailureCode(error) });
-    return;
-  }
 
-  if (!text) {
-    patchLocalVoiceState({ status: 'idle', sessionId, error: null });
-    return;
-  }
+    const settings = storage.getState().settings as any;
+    let text: string | null = null;
+    try {
+      text = await transcribeRecordedAudioWithProvider({ uri, settings });
+      if (signal.aborted) return;
+    } catch (error) {
+      if (signal.aborted) return;
+      if (error instanceof MissingSttBaseUrlError) {
+        patchLocalVoiceState({ status: 'idle', sessionId, error: 'missing_stt_base_url' });
+        throw error;
+      }
+      if (error instanceof MissingGeminiApiKeyError) {
+        patchLocalVoiceState({ status: 'idle', sessionId, error: 'missing_stt_api_key' });
+        throw error;
+      }
+      patchLocalVoiceState({ status: 'idle', sessionId, error: resolveSttFailureCode(error) });
+      return;
+    }
 
-  await runVoiceTurnWithSendFailureHandling(sessionId, (signal) =>
-    sendVoiceTextTurnImpl({
-      sessionId,
-      settings,
-      userText: text,
-      playbackController,
-      voiceAgentSessions,
-      signal,
-    }),
-  );
+    if (!text) {
+      patchLocalVoiceState({ status: 'idle', sessionId, error: null });
+      return;
+    }
+
+    await handleVoiceTurnSendFailure(sessionId, signal, (signal) =>
+      sendVoiceTextTurnImpl({
+        sessionId,
+        settings,
+        userText: text,
+        playbackController,
+        voiceAgentSessions,
+        signal,
+      }),
+    );
+  });
 }
 
 async function stopDeviceSpeechRecognitionAndSend(sessionId: string): Promise<void> {
-  patchLocalVoiceState({ status: 'transcribing', error: null });
+  await runAbortableVoiceTurn(sessionId, async (signal) => {
+    patchLocalVoiceState({ status: 'transcribing', error: null });
 
-  const text = await deviceSttController.stop(sessionId);
-  if (!text) {
-    if (deviceSttController.isHandsFreeSession(sessionId) && isHandsFreeSttEnabled(storage.getState().settings)) {
-      await deviceSttController.start(sessionId);
+    const text = await deviceSttController.stop(sessionId);
+    if (signal.aborted) return;
+    if (!text) {
+      if (!signal.aborted && deviceSttController.isHandsFreeSession(sessionId) && isHandsFreeSttEnabled(storage.getState().settings)) {
+        await deviceSttController.start(sessionId);
+        return;
+      }
+      patchLocalVoiceState({ status: 'idle', sessionId, error: null });
       return;
     }
-    patchLocalVoiceState({ status: 'idle', sessionId, error: null });
-    return;
-  }
 
-  const settings = storage.getState().settings as any;
-  await runVoiceTurnWithSendFailureHandling(sessionId, (signal) =>
-    sendVoiceTextTurnImpl({
-      sessionId,
-      settings,
-      userText: text,
-      playbackController,
-      voiceAgentSessions,
-      signal,
-    }),
-  );
+    const settings = storage.getState().settings as any;
+    await handleVoiceTurnSendFailure(sessionId, signal, (signal) =>
+      sendVoiceTextTurnImpl({
+        sessionId,
+        settings,
+        userText: text,
+        playbackController,
+        voiceAgentSessions,
+        signal,
+      }),
+    );
 
-  if (deviceSttController.isHandsFreeSession(sessionId) && isHandsFreeSttEnabled(storage.getState().settings)) {
-    await deviceSttController.start(sessionId);
-  }
+    if (!signal.aborted && deviceSttController.isHandsFreeSession(sessionId) && isHandsFreeSttEnabled(storage.getState().settings)) {
+      await deviceSttController.start(sessionId);
+    }
+  });
 }
 
 async function stopSherpaSpeechRecognitionAndSend(sessionId: string): Promise<void> {
-  patchLocalVoiceState({ status: 'transcribing', error: null });
+  await runAbortableVoiceTurn(sessionId, async (signal) => {
+    patchLocalVoiceState({ status: 'transcribing', error: null });
 
-  const text = await sherpaSttController.stop(sessionId);
-  if (!text) {
-    if (sherpaSttController.isHandsFreeSession(sessionId) && isHandsFreeSttEnabled(storage.getState().settings)) {
-      await sherpaSttController.start(sessionId);
+    const text = await sherpaSttController.stop(sessionId);
+    if (signal.aborted) return;
+    if (!text) {
+      if (!signal.aborted && sherpaSttController.isHandsFreeSession(sessionId) && isHandsFreeSttEnabled(storage.getState().settings)) {
+        await sherpaSttController.start(sessionId);
+        return;
+      }
+      patchLocalVoiceState({ status: 'idle', sessionId, error: null });
       return;
     }
-    patchLocalVoiceState({ status: 'idle', sessionId, error: null });
-    return;
-  }
 
-  const settings = storage.getState().settings as any;
-  await runVoiceTurnWithSendFailureHandling(sessionId, (signal) =>
-    sendVoiceTextTurnImpl({
-      sessionId,
-      settings,
-      userText: text,
-      playbackController,
-      voiceAgentSessions,
-      signal,
-    }),
-  );
+    const settings = storage.getState().settings as any;
+    await handleVoiceTurnSendFailure(sessionId, signal, (signal) =>
+      sendVoiceTextTurnImpl({
+        sessionId,
+        settings,
+        userText: text,
+        playbackController,
+        voiceAgentSessions,
+        signal,
+      }),
+    );
 
-  if (sherpaSttController.isHandsFreeSession(sessionId) && isHandsFreeSttEnabled(storage.getState().settings)) {
-    await sherpaSttController.start(sessionId);
-  }
+    if (!signal.aborted && sherpaSttController.isHandsFreeSession(sessionId) && isHandsFreeSttEnabled(storage.getState().settings)) {
+      await sherpaSttController.start(sessionId);
+    }
+  });
 }
 
 export async function stopLocalVoiceAgent(sessionId: string): Promise<void> {
