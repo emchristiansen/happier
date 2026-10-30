@@ -491,6 +491,35 @@ test('macos wsrepl lima matrix wrapper defaults Playwright to headless (supports
   const guestDaemonLog = join(logDir, 'guest-daemon.log');
   const hostDirectPeerPort = await allocateFreeTcpPort();
 
+  // Keep runtime/account settings out of the fixture, while resolving only host
+  // shell/data tools from the maintained environment (including Nix store bins).
+  const resolvedTools = spawnSync('/bin/sh', ['-c', 'command -v bash; command -v python3; command -v mkdir; command -v awk; command -v grep; command -v sed; command -v find'], {
+    env: { PATH: process.env.PATH }, encoding: 'utf8',
+  });
+  assert.equal(resolvedTools.status, 0, resolvedTools.stderr);
+  const tools = await Promise.all(resolvedTools.stdout.trim().split('\n').map((tool) => realpath(tool)));
+  assert.equal(tools.length, 7);
+  const fixtureToolPath = [...new Set(tools.map((tool) => resolve(tool, '..')))].join(delimiter);
+  const fixturePath = `${binDir}:${fixtureToolPath}:${testEnv.PATH}`;
+  const pythonBoundary = join(root, 'python-boundary');
+  await mkdir(pythonBoundary);
+  await writeFile(join(pythonBoundary, 'sitecustomize.py'), [
+    'import socket',
+    'def fixture_connection_refused(*args, **kwargs):',
+    '    raise ConnectionRefusedError("fake fixture port is not listening")',
+    'socket.create_connection = fixture_connection_refused',
+    'socket.socket.connect = fixture_connection_refused',
+    'socket.socket.connect_ex = fixture_connection_refused',
+  ].join('\n') + '\n');
+  const guestBoundaryDir = join(root, 'guest-boundary');
+  await mkdir(guestBoundaryDir);
+  const curlScript = "#!/usr/bin/env bash\nprintf \"%s\\n\" '{}'\n";
+  await writeFile(join(binDir, 'curl'), curlScript);
+  await chmod(join(binDir, 'curl'), 0o755);
+  await writeFile(join(guestBoundaryDir, 'curl'), curlScript);
+  await chmod(join(guestBoundaryDir, 'curl'), 0o755);
+  const guestToolPath = `${guestBoundaryDir}:${fixtureToolPath}:${testEnv.PATH}`;
+
   const unamePath = join(binDir, 'uname');
   await writeFile(unamePath, ['#!/usr/bin/env bash', 'echo Darwin'].join('\n') + '\n', 'utf8');
   await chmod(unamePath, 0o755);
@@ -680,6 +709,7 @@ test('macos wsrepl lima matrix wrapper defaults Playwright to headless (supports
       '  "stepsJson": steps,',
       '}',
       'Path(out_dir, "meta.json").write_text(json.dumps(payload), encoding="utf-8")',
+      'Path(out_dir, "summary.json").write_text(json.dumps({"kind": "wsrepl_handoff_matrix_summary", "ok": True, "sessionId": sid_value}), encoding="utf-8")',
       'PY',
       `  printf "1" > ${JSON.stringify(join(homeDir, '.playwright-running'))}`,
       '  # Give the wrapper background watchdog time to run at least once.',
@@ -745,8 +775,8 @@ test('macos wsrepl lima matrix wrapper defaults Playwright to headless (supports
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
       "    # Run guest commands in a minimal PATH so they don't accidentally pick up the host's stub happier binary.",
-      '    export PATH=/usr/bin:/bin',
-      limaGuestExec,
+      '    export PATH=' + JSON.stringify(guestToolPath),
+      limaGuestExec.replace('exec /bin/bash --noprofile --norc', `exec ${JSON.stringify(tools[0])} --noprofile --norc`),
       '    ;;',
       '  *)',
       '    exit 0',
@@ -783,7 +813,8 @@ test('macos wsrepl lima matrix wrapper defaults Playwright to headless (supports
     HAPPIER_MACHINE_TRANSFER_DIRECT_PEER_SERVER_ENABLED: '',
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${testEnv.PATH}`,
+    PATH: fixturePath,
+    PYTHONPATH: pythonBoundary,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_SKIP_HOST_PROVIDER_INSTALL: '',
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
