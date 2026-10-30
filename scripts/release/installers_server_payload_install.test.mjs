@@ -15,10 +15,12 @@ async function sha256(path) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-test('install.sh (server) installs full payload tree and provides a channel-scoped shim that runs from the payload root', async () => {
+for (const pathComponent of ['ordinary', 'price$cash', 'quote"apostrophe\'back\\slash`tick']) {
+test(`install.sh (server) runs full payload from a literal install path (${pathComponent})`, async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'happier-installer-server-payload-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
   const binDir = join(root, 'bin');
-  const installDir = join(root, 'install');
+  const installDir = join(root, pathComponent, 'install');
   const outBinDir = join(root, 'out-bin');
   const fixtureDir = join(root, 'fixture');
 
@@ -147,9 +149,11 @@ printf '%s' '${releaseJson}'
   assert.equal(res.status, 0, `installer failed:\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}\n`);
 
   const shimPath = join(outBinDir, 'happier-server-dev');
-  const execRes = spawnSync('bash', ['-lc', `${JSON.stringify(shimPath)} 2>/dev/null`], { env, encoding: 'utf8' });
+  const execRes = spawnSync(shimPath, [], { env, encoding: 'utf8' });
   assert.equal(execRes.status, 0, `expected shim to execute the payload binary successfully:\n--- stdout ---\n${String(execRes.stdout ?? '')}\n--- stderr ---\n${String(execRes.stderr ?? '')}\n`);
   assert.match(String(execRes.stdout ?? ''), /prisma engine marker found/);
 
   await rm(root, { recursive: true, force: true });
 });
+
+}

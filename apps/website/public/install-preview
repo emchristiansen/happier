@@ -2454,6 +2454,12 @@ verify_release_signature() {
 PATH_CONFIG_UPDATED="0"
 PATH_RELOAD_FILE=""
 
+quote_shell_literal() {
+  local value="$1"
+  value="${value//\'/\'\\\'\'}"
+  printf "'%s'" "${value}"
+}
+
 append_path_hint() {
   if [[ "${NO_PATH_UPDATE}" == "1" ]]; then
     return
@@ -2469,8 +2475,10 @@ append_path_hint() {
       return
     fi
 
-    awk -v export_key="${export_key}" -v export_line="${export_line}" '
+    HAPPIER_INSTALLER_EXPORT_LINE="${export_line}" awk -v export_key="${export_key}" '
       BEGIN {
+        # -v interprets backslash escapes; ENVIRON preserves the rendered shell bytes.
+        export_line = ENVIRON["HAPPIER_INSTALLER_EXPORT_LINE"]
         replaced = 0
       }
       $0 ~ ("^[[:space:]]*export[[:space:]]+" export_key "=") {
@@ -2513,11 +2521,11 @@ append_path_hint() {
   }
   local shell_name
   shell_name="$(basename "${SHELL:-}")"
-  local export_line="export PATH=\"${BIN_DIR}:\$PATH\""
+  local export_line="export PATH=$(quote_shell_literal "${BIN_DIR}"):\"\$PATH\""
   local home_export_line=""
   local default_install_dir="${HOME}/.happier"
   if [[ "${STATE_HOME_DIR}" != "${default_install_dir}" ]]; then
-    home_export_line="export HAPPIER_HOME_DIR=\"${STATE_HOME_DIR}\""
+    home_export_line="export HAPPIER_HOME_DIR=$(quote_shell_literal "${STATE_HOME_DIR}")"
   fi
   local rc_files=()
   case "${shell_name}" in
@@ -2806,7 +2814,7 @@ else
     cat > "${INSTALL_SHIM_PATH}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-cd "${INSTALL_DIR}/${MANAGED_ROOT}/current"
+cd $(quote_shell_literal "${INSTALL_DIR}/${MANAGED_ROOT}/current")
 exec "./${EXE_NAME}" "\$@"
 EOF
     chmod +x "${INSTALL_SHIM_PATH}"

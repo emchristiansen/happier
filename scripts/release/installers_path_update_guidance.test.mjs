@@ -15,14 +15,16 @@ async function sha256(path) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
+for (const pathComponent of ['ordinary', 'price$cash', 'quote"apostrophe\'back\\slash`tick']) {
 for (const separateStateHome of [false, true]) {
-test(`install.sh updates bash rc + login files${separateStateHome ? ' with a separate data home' : ''} and prints a reload hint`, async () => {
+test(`install.sh updates bash rc + login files${separateStateHome ? ' with a separate data home' : ''} and prints a reload hint (${pathComponent})`, async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'happier-installer-path-hint-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
   const homeDir = join(root, 'home');
   const binDir = join(root, 'bin');
-  const installDir = join(root, 'install');
-  const stateHomeDir = separateStateHome ? join(root, 'data') : installDir;
-  const outBinDir = join(root, 'out-bin');
+  const installDir = join(root, pathComponent, 'install');
+  const stateHomeDir = separateStateHome ? join(root, pathComponent, 'data') : installDir;
+  const outBinDir = join(root, pathComponent, 'out-bin');
   const fixtureDir = join(root, 'fixture');
 
   await mkdir(homeDir, { recursive: true });
@@ -173,7 +175,7 @@ printf '%s' '${releaseJson}'
     ...process.env,
     HOME: homeDir,
     SHELL: '/bin/bash',
-    PATH: `${binDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
+    PATH: `${binDir}:${process.env.PATH ?? ''}`,
     HAPPIER_PRODUCT: 'cli',
     HAPPIER_INSTALL_DIR: installDir,
     HAPPIER_HOME_DIR: separateStateHome ? stateHomeDir : '',
@@ -188,14 +190,15 @@ printf '%s' '${releaseJson}'
   const stderr = String(res.stderr ?? '');
   assert.equal(res.status, 0, `installer failed:\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}\n`);
 
-  const exportLine = `export PATH="${outBinDir}:$PATH"`;
-  const homeExportLine = `export HAPPIER_HOME_DIR="${stateHomeDir}"`;
   const bashrc = await readFile(join(homeDir, '.bashrc'), 'utf8');
   const profile = await readFile(join(homeDir, '.profile'), 'utf8');
-  assert.ok(bashrc.includes(exportLine), 'expected installer to add PATH export to ~/.bashrc');
-  assert.ok(profile.includes(exportLine), 'expected installer to add PATH export to ~/.profile (login shells)');
-  assert.ok(bashrc.includes(homeExportLine), 'expected installer to refresh HAPPIER_HOME_DIR in ~/.bashrc');
-  assert.ok(profile.includes(homeExportLine), 'expected installer to refresh HAPPIER_HOME_DIR in ~/.profile');
+  for (const rcName of ['.bashrc', '.profile']) {
+    const loaded = spawnSync('bash', ['--noprofile', '--norc', '-c',
+      'set -eu; . "$1"; printf "%s\\0%s\\0" "$HAPPIER_HOME_DIR" "$PATH"',
+      'installer-profile-check', join(homeDir, rcName)], { env, encoding: 'utf8' });
+    assert.equal(loaded.status, 0, `profile ${rcName} must load literally: ${loaded.stderr}`);
+    assert.deepEqual(loaded.stdout.split('\0'), [stateHomeDir, `${outBinDir}:${env.PATH}`, '']);
+  }
   assert.equal((bashrc.match(/HAPPIER_HOME_DIR=/g) ?? []).length, 1, 'expected ~/.bashrc to keep a single HAPPIER_HOME_DIR export');
   assert.equal((profile.match(/HAPPIER_HOME_DIR=/g) ?? []).length, 1, 'expected ~/.profile to keep a single HAPPIER_HOME_DIR export');
   assert.ok(!bashrc.includes('/tmp/old-happier-home'), 'expected installer to remove stale ~/.bashrc HAPPIER_HOME_DIR exports');
@@ -212,6 +215,7 @@ printf '%s' '${releaseJson}'
 
   await rm(root, { recursive: true, force: true });
 });
+}
 }
 
 test('install.sh removes stale HAPPIER_HOME_DIR exports when reinstalling back to the default home', async () => {
@@ -356,7 +360,7 @@ printf '%s' '${releaseJson}'
     ...process.env,
     HOME: homeDir,
     SHELL: '/bin/bash',
-    PATH: `${binDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
+    PATH: `${binDir}:${process.env.PATH ?? ''}`,
     HAPPIER_PRODUCT: 'cli',
     HAPPIER_BIN_DIR: outBinDir,
     HAPPIER_INSTALL_DIR: '',
