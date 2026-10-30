@@ -1112,6 +1112,41 @@ describe('PierreDiffViewer (web)', () => {
         expect(fileDiffSpy.mock.calls.at(-1)?.[0].fileDiff).toBeTruthy();
     });
 
+    it.each(['git', 'headerless', 'headerless later file', 'paired header-like content'] as const)(
+        'preserves removed SQL comments as hunk content: %s', async (format) => {
+            fileDiffSpy.mockClear();
+            const { PierreDiffViewer } = await import('./PierreDiffViewer.web');
+            const newHeading = format === 'paired header-like content' ? '++ new heading' : '-- new heading';
+            const target = [
+                ...(format === 'git' ? ['diff --git a/schema.sql b/schema.sql'] : []),
+                '--- a/schema.sql',
+                '+++ b/schema.sql',
+                '@@ -1,2 +1,2 @@',
+                '--- old heading',
+                `+${newHeading}`,
+                ' SELECT 1;',
+                '',
+            ].join('\n');
+            const prefix = format === 'headerless later file'
+                ? '--- a/first.sql\n+++ b/first.sql\n@@ -1 +1 @@\n-old\n+new\n'
+                : '';
+            const onPressLine = vi.fn();
+            const screen = await renderScreen(<PierreDiffViewer mode="unified" filePath="schema.sql" unifiedDiff={prefix + target} onPressLine={onPressLine} />);
+            expect(screen.findAllByProps({ 'data-testid': 'pierre-diff-fallback' })).toHaveLength(0);
+            const file = fileDiffSpy.mock.calls.at(-1)?.[0]?.fileDiff;
+            expect(file?.deletionLines.join('')).toContain('-- old heading');
+            expect(file?.additionLines.join('')).toContain(newHeading);
+            expect(file?.deletionLines.join('')).toContain('SELECT 1;');
+            expect(file?.additionLines.join('')).toContain('SELECT 1;');
+            expect(file?.name).toContain('schema.sql');
+            const options = fileDiffSpy.mock.calls.at(-1)?.[0]?.options;
+            await renderer.act(async () => {
+                options.onLineClick({ type: 'diff-line', annotationSide: 'deletions', lineType: 'change-deletion', lineNumber: 1, lineElement: {}, numberElement: {}, numberColumn: false, event: {} });
+            });
+            expect(onPressLine).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'remove', oldLine: 1, renderCodeText: '-- old heading' }));
+        },
+    );
+
     it('sanitizes multi-file unified diffs to a single-file patch for Pierre', async () => {
         fileDiffSpy.mockClear();
         const { PierreDiffViewer } = await import('./PierreDiffViewer.web');

@@ -123,7 +123,7 @@ export function buildCodeLinesFromUnifiedDiff(params: Readonly<{
         const prefix = normalized.slice(0, 1);
         const codeText = normalized.slice(1);
 
-        if (prefix === '+' && !normalized.startsWith('+++')) {
+        if (prefix === '+') {
             let renderIntraLineDiffSegments: readonly IntraLineDiffSegment[] | null = null;
             if (intraLineEnabled && remainingIntraLinePairs > 0 && pendingRemovals.length > 0) {
                 const pending = pendingRemovals.shift()!;
@@ -180,7 +180,7 @@ export function buildCodeLinesFromUnifiedDiff(params: Readonly<{
             continue;
         }
 
-        if (prefix === '-' && !normalized.startsWith('---')) {
+        if (prefix === '-') {
             const line: CodeLine = {
                 id: `r:${i}`,
                 sourceIndex: i,
