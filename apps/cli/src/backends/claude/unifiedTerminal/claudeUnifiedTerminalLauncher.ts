@@ -1290,8 +1290,8 @@ export async function claudeUnifiedTerminalLauncher(
       }
       throw error;
     }).finally(() => {
-      // Runtime cleanup has drained its observers. Wrapper exit preserves a detached host and
-      // supplies no death proof; only a native-process observation or owned-host destruction does.
+      // Provider dispatch has settled. Wrapper exit preserves a detached host and supplies no
+      // death proof; finalization requires a native-process observation or owned-host destruction.
       if (providerExitObserved || ownedHostDestroyed) {
         transcriptProjector.finalizeInterruptedWorkOnShutdown();
       }
