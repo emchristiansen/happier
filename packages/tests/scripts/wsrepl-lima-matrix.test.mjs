@@ -3728,7 +3728,8 @@ test('macos wsrepl lima matrix wrapper prefers WSREPL_QA_LARGE_REPO_PATH for HAP
   assert.equal(summary.sessionPath, largeRepoDir, 'expected wrapper summary to record the resolved sessionPath (large repo override)');
 });
 
-test('macos wsrepl lima matrix wrapper retries Playwright once when fatal.json reports daemon RPC unavailable', async () => {
+for (const firstAttemptExit of [0, 1]) {
+  test(`macos wsrepl retry admits only the second attempt: first exit ${firstAttemptExit}`, async () => {
   const root = await mkdtemp(join(tmpdir(), 'hstack-macos-lima-wsrepl-matrix-retry-'));
   const binDir = join(root, 'bin');
   const homeDir = join(root, 'home');
@@ -3740,6 +3741,29 @@ test('macos wsrepl lima matrix wrapper retries Playwright once when fatal.json r
   await mkdir(homeDir, { recursive: true });
   await mkdir(reportDir, { recursive: true });
   await mkdir(logDir, { recursive: true });
+
+  // Keep runtime/account settings out of the fixture, while resolving only host
+  // shell/data tools from the maintained environment (including Nix store bins).
+  const resolvedTools = spawnSync('/bin/sh', ['-c', 'command -v bash; command -v python3; command -v mkdir; command -v awk; command -v grep; command -v sed; command -v find'], {
+    env: { PATH: process.env.PATH }, encoding: 'utf8',
+  });
+  assert.equal(resolvedTools.status, 0, resolvedTools.stderr);
+  const tools = await Promise.all(resolvedTools.stdout.trim().split('\n').map((tool) => realpath(tool)));
+  assert.equal(tools.length, 7);
+  const fixtureToolPath = [...new Set(tools.map((tool) => resolve(tool, '..')))].join(delimiter);
+  const fixturePath = `${binDir}:${fixtureToolPath}:${testEnv.PATH}`;
+  const pythonBoundary = join(root, 'python-boundary');
+  await mkdir(pythonBoundary);
+  await writeFile(join(pythonBoundary, 'sitecustomize.py'), [
+    'import socket',
+    'def fixture_connection_refused(*args, **kwargs):',
+    '    raise ConnectionRefusedError("fake fixture port is not listening")',
+    'socket.create_connection = fixture_connection_refused',
+    'socket.socket.connect = fixture_connection_refused',
+    'socket.socket.connect_ex = fixture_connection_refused',
+  ].join('\n') + '\n');
+  await writeScript(join(binDir, 'curl'), "#!/usr/bin/env bash\nprintf \"%s\\n\" '{}'\n");
+
 
   const nodeLog = join(logDir, 'node.log');
   const happierLog = join(logDir, 'happier.log');
@@ -3787,6 +3811,10 @@ test('macos wsrepl lima matrix wrapper retries Playwright once when fatal.json r
     'utf8',
   );
   await chmod(happierPath, 0o755);
+  const runtimeHappier = join(homeDir, '.happier', 'stacks', 'stack-test', 'runtime', 'current', 'cli', 'happier');
+  await mkdir(resolve(runtimeHappier, '..'), { recursive: true });
+  await writeFile(runtimeHappier, await readFile(happierPath));
+  await chmod(runtimeHappier, 0o755);
 
   const nodePath = join(binDir, 'node');
   await writeFile(
@@ -3810,13 +3838,20 @@ test('macos wsrepl lima matrix wrapper retries Playwright once when fatal.json r
       `  if [[ ! -f ${JSON.stringify(attemptMarker)} ]]; then`,
       `    echo "attempt-1" > ${JSON.stringify(attemptMarker)}`,
       '    mkdir -p "$out"',
-      '    printf "%s\\n" "{\\"uiHint\\":\\"Dialog Session handoff failed Daemon RPC is not available (RPC method not available).\\",\\"error\\":\\"stub\\"}" > "$out/fatal.json"',
+      '    printf "%s\\n" "{\\"ok\\":false,\\"uiHint\\":\\"Dialog Session handoff failed Daemon RPC is not available (RPC method not available).\\",\\"error\\":\\"stub\\"}" > "$out/fatal.json"',
       '    echo "stub fail" >&2',
-      '    exit 1',
+      '    exit "${WSREPL_QA_FIRST_ATTEMPT_EXIT}"',
       '  fi',
       '  mkdir -p "$out/steps/step-01"',
       '  printf "%s\\n" "{\\"ok\\":true}" > "$out/steps/step-01/result.json"',
-      '  printf "%s\\n" "{\\"kind\\":\\"stub\\",\\"outDir\\":\\"$out\\",\\"ok\\":true}" > "$out/meta.json"',
+      "  python3 - \"$out\" <<'PY'",
+      "import json, os, sys",
+      "from pathlib import Path",
+      "out = Path(sys.argv[1])",
+      "session = os.environ[\"HAPPIER_QA_SESSION_ID\"]",
+      "out.joinpath(\"meta.json\").write_text(json.dumps({\"kind\":\"stub\",\"sessionId\":session,\"stepsJson\":os.environ[\"HAPPIER_QA_STEPS_JSON\"]}))",
+      "out.joinpath(\"summary.json\").write_text(json.dumps({\"kind\":\"wsrepl_handoff_matrix_summary\",\"ok\":True,\"sessionId\":session}))",
+      "PY",
       '  echo "stub ok"',
       '  exit 0',
       'fi',
@@ -3861,7 +3896,8 @@ test('macos wsrepl lima matrix wrapper retries Playwright once when fatal.json r
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      limaGuestExec,
+      "    export PATH=" + JSON.stringify(fixturePath),
+      limaGuestExec.replace('exec /bin/bash --noprofile --norc', `exec ${JSON.stringify(tools[0])} --noprofile --norc`),
       '    ;;',
       '  *)',
       '    exit 0',
@@ -3877,7 +3913,9 @@ test('macos wsrepl lima matrix wrapper retries Playwright once when fatal.json r
     ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${testEnv.PATH}`,
+    PATH: fixturePath,
+    PYTHONPATH: pythonBoundary,
+    WSREPL_QA_FIRST_ATTEMPT_EXIT: String(firstAttemptExit),
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_STACK_NAME: 'stack-test',
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -3896,6 +3934,9 @@ test('macos wsrepl lima matrix wrapper retries Playwright once when fatal.json r
     encoding: 'utf8',
   });
 
+  await writeFile(join(reportDir, 'fixture.stdout'), res.stdout ?? '');
+  await writeFile(join(reportDir, 'fixture.stderr'), res.stderr ?? '');
+  assert.equal(res.error, undefined, `fixture spawn failed: ${res.error}`);
   assert.equal(res.status, 0, `expected exit 0\\nstdout:\\n${res.stdout}\\nstderr:\\n${res.stderr}`);
 
   const attempt1Dir = join(reportDir, 'playwright', 'attempt-01');
@@ -3905,6 +3946,9 @@ test('macos wsrepl lima matrix wrapper retries Playwright once when fatal.json r
 
   const summary = JSON.parse(await readFile(join(reportDir, 'summary.json'), 'utf8'));
   assert.equal(summary.status, 0);
+  assert.equal(summary.sessionId, 'sess_test_1');
+  assert.equal(summary.failureStage, null);
+  assert.equal(summary.failureReason, null);
   assert.equal(await realpath(summary.playwrightOutDir), await realpath(attempt2Dir));
 
   const happierOut = await readFile(happierLog, 'utf8');
@@ -3912,7 +3956,8 @@ test('macos wsrepl lima matrix wrapper retries Playwright once when fatal.json r
     happierOut.split('\n').filter((line) => line.includes('daemon start')).length >= 2,
     `expected daemon to be restarted before retry (got happier log: ${happierOut})`,
   );
-});
+  });
+}
 
 test('macos wsrepl lima matrix wrapper prefers the stack runtime CLI inferred from the UI url (no worktree yarn self-heal)', async () => {
   const root = await mkdtemp(join(tmpdir(), 'hstack-macos-lima-wsrepl-matrix-runtime-cli-'));

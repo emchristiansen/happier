@@ -4279,6 +4279,11 @@ fi
 
     PLAYWRIGHT_ATTEMPT=2
     PLAYWRIGHT_OUTDIR="${PLAYWRIGHT_ROOTDIR}/attempt-02"
+    # The first attempt's fatal record is retained in its own directory. It must
+    # not reject a separately owned, successful retry; new failures still win.
+    if [[ "${FAILURE_REASON}" == "playwright_fatal_json" ]]; then
+      FAILURE_REASON=""
+    fi
     playwright_status=0
     set +e
     run_playwright_attempt "${PLAYWRIGHT_OUTDIR}"
