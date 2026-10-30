@@ -66,6 +66,8 @@ import {
 
 let started = false;
 let loading = false;
+let optedOutInPage = false;
+let urlPreferenceApplied = false;
 let client: PostHog | null = null;
 
 export type AnalyticsStatus =
@@ -143,12 +145,23 @@ export function shouldCapture(): boolean {
     return captureBlockStatus() === null;
 }
 
-/** Reads the visitor's stored refusal. Storage failures mean "not opted out". */
+/** Reads this page's refusal before consulting persisted storage. */
 export function readOptOut(): boolean {
+    if (optedOutInPage) return true;
     try {
         return window.localStorage.getItem(OPT_OUT_STORAGE_KEY) === 'off';
     } catch {
         return false;
+    }
+}
+
+function storeOptOutPreference(optedOut: boolean): void {
+    optedOutInPage = optedOut;
+    try {
+        if (optedOut) window.localStorage.setItem(OPT_OUT_STORAGE_KEY, 'off');
+        else window.localStorage.removeItem(OPT_OUT_STORAGE_KEY);
+    } catch {
+        // An in-page refusal remains effective when persistence fails.
     }
 }
 
@@ -166,22 +179,14 @@ export function readOptOut(): boolean {
  * that you said no.
  */
 export function optOut(): void {
-    try {
-        window.localStorage.setItem(OPT_OUT_STORAGE_KEY, 'off');
-    } catch {
-        /* private mode: the in-page kill switch below still applies */
-    }
+    storeOptOutPreference(true);
     client?.set_config({ before_send: () => null });
     setAnalyticsStatus('opted-out');
 }
 
 /** Re-enable analytics immediately when the browser permits it. */
 export function optIn(): void {
-    try {
-        window.localStorage.removeItem(OPT_OUT_STORAGE_KEY);
-    } catch {
-        /* nothing to clear */
-    }
+    storeOptOutPreference(false);
     if (typeof window === 'undefined' || typeof navigator === 'undefined') return;
     const blocked = captureBlockStatus();
     if (blocked) {
@@ -205,10 +210,12 @@ export function optIn(): void {
  * want to click a widget on the page they are avoiding.
  */
 function applyUrlOptOut(): void {
+    if (urlPreferenceApplied) return;
+    urlPreferenceApplied = true;
     try {
         const value = new URLSearchParams(window.location.search).get('analytics');
         if (value === 'off') optOut();
-        else if (value === 'on') optIn();
+        else if (value === 'on') storeOptOutPreference(false);
     } catch {
         /* malformed query string */
     }
