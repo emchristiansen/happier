@@ -613,9 +613,11 @@ describe('Runtime Activity snapshot socket event on SQLite', () => {
     });
 
     it.each([
-        { sessionTimeoutMs: 35_000, thinkingUntilMs: 0, idleSpacingMs: 15_000 },
-        { sessionTimeoutMs: 60_000, thinkingUntilMs: 0, idleSpacingMs: 15_000 },
-        { sessionTimeoutMs: 20_000, thinkingUntilMs: 8_000, idleSpacingMs: 16_000 },
+        // Supported expiry settings outlast the 60s persistence interval; timeout.spec.ts
+        // separately verifies refusal of settings at or below that floor.
+        { sessionTimeoutMs: 75_000, thinkingUntilMs: 0, idleSpacingMs: 15_000 },
+        { sessionTimeoutMs: 90_000, thinkingUntilMs: 0, idleSpacingMs: 15_000 },
+        { sessionTimeoutMs: 80_000, thinkingUntilMs: 8_000, idleSpacingMs: 16_000 },
     ])('keeps released heartbeats reachable with a $sessionTimeoutMs ms presence expiry after thinking until $thinkingUntilMs ms', async ({ sessionTimeoutMs, thinkingUntilMs, idleSpacingMs }) => {
         process.env.HAPPIER_PRESENCE_SESSION_TIMEOUT_MS = String(sessionTimeoutMs);
         process.env.HAPPIER_PRESENCE_TIMEOUT_TICK_MS = '1000';
@@ -882,7 +884,7 @@ describe('Runtime Activity snapshot socket event on SQLite', () => {
 
     it.each([
         { sessionTimeoutMs: 600_000, retryCeilingMs: 60_000 },
-        { sessionTimeoutMs: 35_000, retryCeilingMs: 17_500 },
+        { sessionTimeoutMs: 75_000, retryCeilingMs: 37_500 },
     ])('bounds released alive retry backoff to $retryCeilingMs ms for a $sessionTimeoutMs ms presence expiry', async ({ sessionTimeoutMs, retryCeilingMs }) => {
         process.env.HAPPIER_PRESENCE_SESSION_TIMEOUT_MS = String(sessionTimeoutMs);
         process.env.HAPPIER_DB_TX_MAX_RETRIES = '0';
